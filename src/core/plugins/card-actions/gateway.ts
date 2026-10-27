@@ -34,7 +34,7 @@ export interface PluginCardActionGatewayOptions {
   resolvePluginIds(larkAppId: string): readonly string[];
   fallback?: (data: CardActionData, larkAppId: string) => unknown | Promise<unknown>;
   /** Host-computed operator authority forwarded to the plugin. Omitted = field not sent. */
-  resolvePrivileges?: (larkAppId: string, data: CardActionData) => PluginHostPrivileges;
+  resolvePrivileges?: (larkAppId: string, data: CardActionData) => PluginHostPrivileges | Promise<PluginHostPrivileges>;
   readRegistry?: () => PluginRegistryFile;
   readServiceState?: (pluginId: string) => PluginServiceState | undefined;
   readToken?: (pluginId: string) => string;
@@ -215,14 +215,14 @@ const resolveGatewayOptions = (
 const NO_PRIVILEGES: PluginHostPrivileges = Object.freeze({ canOperate: false, canTalk: false });
 
 /** A broken privilege resolver must degrade to "no authority", never to "skip the field". */
-const resolveCardActionPrivileges = (
+const resolveCardActionPrivileges = async (
   options: ResolvedPluginCardActionGatewayOptions,
   larkAppId: string,
   data: CardActionData,
-): PluginHostPrivileges | undefined => {
+): Promise<PluginHostPrivileges | undefined> => {
   if (!options.resolvePrivileges) return undefined;
   try {
-    const resolved = options.resolvePrivileges(larkAppId, data);
+    const resolved = await options.resolvePrivileges(larkAppId, data);
     return { canOperate: resolved.canOperate === true, canTalk: resolved.canTalk === true };
   } catch {
     return NO_PRIVILEGES;
@@ -240,7 +240,7 @@ const forwardPluginCardAction = async (
 ): Promise<PluginCardActionAck | undefined> => {
   const port = assertServicePort(options.readServiceState(record.id), record.id);
   const token = options.readToken(record.id);
-  const privileges = resolveCardActionPrivileges(options, larkAppId, data);
+  const privileges = await resolveCardActionPrivileges(options, larkAppId, data);
   const payload = JSON.stringify(buildPluginCardActionRequest(data, larkAppId, actionName, privileges));
   const bodyBytes = Buffer.byteLength(payload);
   if (bodyBytes > options.requestMaxBytes) throw new Error('plugin_card_action_request_too_large');

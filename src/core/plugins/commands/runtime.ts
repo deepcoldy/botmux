@@ -1,4 +1,4 @@
-import { getBot, loadBotConfigs } from '../../../bot-registry.js';
+import { getBot, loadBotConfigsCached } from '../../../bot-registry.js';
 import { readGlobalConfig } from '../../../global-config.js';
 import { t, type Locale } from '../../../i18n/index.js';
 import { resolveEffectivePluginIds } from '../effective.js';
@@ -7,7 +7,7 @@ import { createPluginCommandGateway } from './gateway.js';
 /**
  * Process-wide gateway for Lark slash commands contributed by plugins. Routing
  * and `/help` share it so both always read the same live registry + Bot
- * enablement; nothing is cached across messages.
+ * enablement; config parsing is cached by file contents, not by message.
  */
 export const pluginCommandGateway = createPluginCommandGateway({
   resolvePluginIds: (larkAppId) => resolveEffectivePluginIds(currentBotPluginConfig(larkAppId), readGlobalConfig()),
@@ -20,7 +20,7 @@ export const pluginCommandGateway = createPluginCommandGateway({
  */
 function currentBotPluginConfig(larkAppId: string): { plugins?: string[] } {
   try {
-    const fresh = loadBotConfigs().find(candidate => candidate.larkAppId === larkAppId);
+    const fresh = loadBotConfigsCached().find(candidate => candidate.larkAppId === larkAppId);
     if (fresh) return fresh;
   } catch {
     // Unreadable bots.json: fall back to the registered snapshot.

@@ -21,6 +21,7 @@ const depsWith = (overrides: Partial<PluginSlashCommandDeps> = {}) => {
     restrictedText: vi.fn(() => undefined),
     canTalk: vi.fn(() => true),
     canOperate: vi.fn(() => false),
+    onAdmitted: vi.fn(),
     execute: vi.fn(async () => ({ ok: true as const, reply: { kind: 'card' as const, card: { schema: '2.0' } } })),
     reply: vi.fn(async () => undefined),
     text: vi.fn((key: string) => `text:${key}`),
@@ -59,6 +60,31 @@ describe('runPluginSlashCommand', () => {
     await runPluginSlashCommand(input({ pluginId: null }), conflict);
     expect(conflict.reply).toHaveBeenCalledExactlyOnceWith('text:daemon.plugin_command_conflict', 'text');
 
-    for (const deps of [restricted, silenced, conflict]) expect(deps.execute).not.toHaveBeenCalled();
+    for (const deps of [restricted, silenced, conflict]) {
+      expect(deps.execute).not.toHaveBeenCalled();
+      expect(deps.onAdmitted).not.toHaveBeenCalled();
+    }
+  });
+
+  it('marks admission before executing even when delivery fails or the plugin times out', async () => {
+    const deps = depsWith({ reply: vi.fn(async () => { throw new Error('delivery failed'); }) });
+    deps.execute.mockImplementation(async () => {
+      expect(deps.onAdmitted).toHaveBeenCalledTimes(1);
+      return { ok: true, reply: { kind: 'card', card: { schema: '2.0' } } };
+    });
+    await expect(runPluginSlashCommand(input(), deps)).rejects.toThrow('delivery failed');
+    expect(deps.onAdmitted).toHaveBeenCalledTimes(1);
+
+    const failed = depsWith({ execute: vi.fn(async () => ({ ok: false, error: 'plugin_command_timeout' })) });
+    await runPluginSlashCommand(input(), failed);
+    expect(failed.onAdmitted).toHaveBeenCalledTimes(1);
+    expect(failed.onAdmitted.mock.invocationCallOrder[0]).toBeLessThan(failed.execute.mock.invocationCallOrder[0]);
+    expect(failed.reply).toHaveBeenCalledExactlyOnceWith('text:daemon.plugin_command_unavailable', 'text');
+  });
+
+  it('posts text replies as text rather than interactive cards', async () => {
+    const deps = depsWith({ execute: vi.fn(async () => ({ ok: true, reply: { kind: 'text', text: 'done' } })) });
+    await runPluginSlashCommand(input(), deps);
+    expect(deps.reply).toHaveBeenCalledExactlyOnceWith('done', 'text');
   });
 });

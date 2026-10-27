@@ -69,7 +69,7 @@ const safeLogField = (value: unknown, fallback = '?'): string => {
 const safeErrorCode = (error: unknown): string => {
   if (error instanceof Error && error.name === 'AbortError') return 'plugin_command_timeout';
   const message = error instanceof Error ? error.message : '';
-  if (/^(?:invalid_)?plugin_(?:command|card_action)_[a-z_]+(?::\d{3})?$/.test(message)) return message;
+  if (/^(?:invalid_)?plugin_(?:command|card_action)_[a-z_]+(?::\d{3})?$/.test(message)) return message.replace('plugin_card_action_', 'plugin_command_');
   if (/^(?:invalid_|unsafe_)?plugin_card_action_token/.test(message)) return 'plugin_command_token_unavailable';
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
   if (typeof code === 'string' && /^[A-Z0-9_]{1,40}$/.test(code)) return `transport_${code}`;

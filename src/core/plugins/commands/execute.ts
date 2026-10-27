@@ -22,6 +22,7 @@ export interface PluginSlashCommandDeps {
   restrictedText(): string | undefined;
   canTalk(): boolean;
   canOperate(): boolean;
+  onAdmitted(): void;
   execute: PluginCommandGateway['execute'];
   reply(content: string, msgType: 'text' | 'interactive'): Promise<unknown>;
   text(key: 'daemon.cmd_allowed_users_only' | 'daemon.plugin_command_conflict' | 'daemon.plugin_command_unavailable'): string;
@@ -49,6 +50,7 @@ export async function runPluginSlashCommand(input: PluginSlashCommandInput, deps
     await deps.reply(deps.text('daemon.plugin_command_conflict'), 'text');
     return;
   }
+  deps.onAdmitted();
   const outcome = await deps.execute(input.pluginId, {
     eventId: input.messageId,
     larkAppId: input.larkAppId,

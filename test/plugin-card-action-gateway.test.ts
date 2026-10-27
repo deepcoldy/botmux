@@ -151,7 +151,7 @@ describe('plugin card action gateway', () => {
   it('forwards host-computed privileges and degrades a failing resolver to no authority', async () => {
     const record = makeRecord('privileged', { actions: ['example.priv.submit'] });
     const request = vi.fn(async () => successResponse());
-    const dispatch = (resolvePrivileges: () => { canOperate: boolean; canTalk: boolean }) => createPluginCardActionGateway({
+    const dispatch = (resolvePrivileges: () => Promise<{ canOperate: boolean; canTalk: boolean }>) => createPluginCardActionGateway({
       resolvePluginIds: () => [record.id],
       readRegistry: () => registryOf(record),
       readServiceState: pluginId => onlineState(pluginId),
@@ -163,8 +163,8 @@ describe('plugin card action gateway', () => {
       action: { name: 'example.priv.submit', value: { canOperate: true } },
     }, 'cli_current');
 
-    await dispatch(() => ({ canOperate: true, canTalk: true }));
-    await dispatch(() => { throw new Error('registry down'); });
+    await dispatch(async () => ({ canOperate: true, canTalk: true }));
+    await dispatch(async () => { throw new Error('registry down'); });
     const bodies = request.mock.calls.map(call => JSON.parse(String(call[1].body)));
     expect(bodies[0].privileges).toEqual({ canOperate: true, canTalk: true });
     expect(bodies[1].privileges).toEqual({ canOperate: false, canTalk: false });

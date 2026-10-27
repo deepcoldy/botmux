@@ -9,6 +9,7 @@ import type {
   PluginRegistryFile,
   PluginServiceState,
 } from '../src/core/plugins/types.js';
+import { PLUGIN_COMMAND_REQUEST_MAX_BYTES, PLUGIN_COMMAND_RESPONSE_MAX_BYTES, PLUGIN_COMMAND_REPLY_TEXT_MAX } from '../src/core/plugins/commands/protocol.js';
 
 const makeRecord = (
   id: string,
@@ -63,12 +64,14 @@ const testLog = () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() });
 const gatewayWith = (
   records: InstalledPluginRecord[],
   request: (url: string, init: any) => Promise<Response>,
+  timeoutMs?: number,
 ) => createPluginCommandGateway({
   resolvePluginIds: () => records.map(record => record.id),
   readRegistry: () => registryOf(...records),
   readServiceState: pluginId => onlineState(pluginId),
   readToken: () => 'secret-token',
   request,
+  timeoutMs,
   log: testLog(),
 });
 
@@ -104,5 +107,60 @@ describe('plugin command gateway', () => {
     expect(await gatewayWith(nowConflicting, request).execute('work-ledger', invocation()))
       .toEqual({ ok: false, error: 'plugin_command_not_routable' });
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it('rejects oversized UTF-8 requests before any network call', async () => {
+    const request = vi.fn(async () => jsonResponse({ schemaVersion: 1 }));
+    expect(await gatewayWith(records, request).execute('work-ledger', {
+      ...invocation(), args: '界'.repeat(Math.ceil(PLUGIN_COMMAND_REQUEST_MAX_BYTES / 3)),
+    })).toEqual({ ok: false, error: 'plugin_command_request_too_large' });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('aborts timed-out requests without retrying', async () => {
+    const request = vi.fn((_url, init) => new Promise<Response>((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+    }));
+    expect(await gatewayWith(records, request, 5).execute('work-ledger', invocation()))
+      .toEqual({ ok: false, error: 'plugin_command_timeout' });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0][1].signal.aborted).toBe(true);
+  });
+
+  it('isolates redirects, HTTP failures and malformed JSON', async () => {
+    for (const status of [302, 503]) {
+      const response = new Response('private failure', { status });
+      const request = vi.fn(async () => response);
+      expect(await gatewayWith(records, request).execute('work-ledger', invocation())).toEqual({
+        ok: false, error: `plugin_command_${status === 302 ? 'redirect' : 'http_status'}:${status}`,
+      });
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(response.bodyUsed).toBe(true);
+    }
+    expect(await gatewayWith(records, async () => new Response('not JSON')).execute('work-ledger', invocation()))
+      .toEqual({ ok: false, error: 'invalid_plugin_command_response_json' });
+  });
+
+  it('limits both declared and streamed response bytes', async () => {
+    for (const response of [
+      new Response('{}', { headers: { 'content-length': String(PLUGIN_COMMAND_RESPONSE_MAX_BYTES + 1) } }),
+      new Response(' '.repeat(PLUGIN_COMMAND_RESPONSE_MAX_BYTES + 1)),
+    ]) {
+      expect(await gatewayWith(records, async () => response).execute('work-ledger', invocation()))
+        .toEqual({ ok: false, error: 'plugin_command_response_too_large' });
+    }
+  });
+
+  it('requires exactly one reply kind and bounds text without rejecting valid text', async () => {
+    const executeReply = (reply: unknown) => gatewayWith(records, async () => jsonResponse({ schemaVersion: 1, reply }))
+      .execute('work-ledger', invocation());
+    expect(await executeReply({ text: 'ok', card: {} }))
+      .toEqual({ ok: false, error: 'invalid_plugin_command_reply_shape' });
+    expect(await executeReply({}))
+      .toEqual({ ok: false, error: 'invalid_plugin_command_reply_shape' });
+    expect(await executeReply({ text: 'a'.repeat(PLUGIN_COMMAND_REPLY_TEXT_MAX + 1) }))
+      .toEqual({ ok: false, error: 'invalid_plugin_command_reply_text' });
+    const text = 'a'.repeat(PLUGIN_COMMAND_REPLY_TEXT_MAX);
+    expect(await executeReply({ text })).toEqual({ ok: true, reply: { kind: 'text', text } });
   });
 });

@@ -82,7 +82,7 @@ if (pluginId !== undefined) return { kind: 'plugin', cmd, content, pluginId };
 1. **准入**：插件指令按 `canTalk` 准入（与 `/sessions` 同级），未通过回复与 `/sessions` 相同的「仅允许的用户可用」文案；`grantRestrictedSlashCommandText` 照查（受限成员的命令限制对插件指令同样生效）。bot 发送方由路由 ① 处理。
 2. **不扣额度、不建会话**：与 `skipCharge` 的控制类消息一致；不调用 `enforceMessageQuotaForCliInput` 的扣费段，也不触发 `prompt.submit` 闸（不进 CLI）。
 3. **冲突**（`pluginId === null`）：回固定文案，结束。
-4. **转发**：POST 到插件服务（§5），超时或失败回固定文案「插件暂不可用」，不回退成普通消息、不转给 CLI。
+4. **转发**：三道准入闸通过后、调用插件前标记消息已接纳，再 POST 到插件服务（§5）。超时或失败回固定文案「插件暂不可用」，不回退成普通消息、不转给 CLI；回帖失败时不得提示用户重发，以免新 eventId 触发重复副作用。
 5. **回复**：把插件返回的 `reply` 发到当前锚点（`sessionReply(anchor, …)`）；新话题入口在话题群里即形成一个新话题，普通群里为普通回复。
 
 ## 5. HTTP 协议 v1（插件指令）
@@ -132,6 +132,9 @@ if (pluginId !== undefined) return { kind: 'plugin', cmd, content, pluginId };
 `/help` 末尾追加「插件指令」一节，列出当前 bot 有效插件的 `name — description`（实时读取，冲突项标注不可用）。内置 help 文案与顺序不变。
 
 ## 8. 影响面
+
+插件指令不额外豁免寻址规则：普通群 `mentionMode=always` 下仍需 @ 当前 bot。
+`commandTriggers` 命中插件指令时，仅用于免 @ 触发；插件路由优先，不应用 CLI 提示词模板，插件收到原始指令参数。
 
 | 范围 | 影响 |
 |---|---|

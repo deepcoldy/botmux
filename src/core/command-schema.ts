@@ -216,8 +216,8 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
 }
 
 /**
- * Commands `im/lark/event-dispatcher.ts` consumes before slash routing (each has
- * its own `tryHandle…` matcher). They are not in the table above, but a plugin
+ * Commands consumed before slash routing by `im/lark/event-dispatcher.ts` or
+ * the daemon's admitted entries. They are not in the table above, but a plugin
  * declaring one would never receive it.
  */
 const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([

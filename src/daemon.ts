@@ -782,6 +782,7 @@ import { resolveEffectivePluginIds } from './core/plugins/effective.js';
 import { pluginCommandGateway } from './core/plugins/commands/runtime.js';
 import type { PluginCommandTable } from './core/plugins/commands/gateway.js';
 import { runPluginSlashCommand } from './core/plugins/commands/execute.js';
+import { resolvePluginCardPrivileges } from './core/plugins/card-actions/privileges.js';
 import {
   buildCodexCompletionCard,
   buildCodexNotifierResultCard,
@@ -6433,6 +6434,7 @@ function warnPluginCommandsShadowedByPassthrough(larkAppId: string): void {
 
 /** Daemon wiring for a `kind: 'plugin'` route; admission order lives in `runPluginSlashCommand`. */
 async function executePluginSlashCommand(input: {
+  ctx: RoutingContext;
   decision: Extract<SlashRouteDecision, { kind: 'plugin' }>;
   larkAppId: string;
   chatId: string;
@@ -6471,6 +6473,7 @@ async function executePluginSlashCommand(input: {
       input.botSender,
     ),
     canOperate: () => canOperate(larkAppId, chatId, input.senderOpenId, input.teamTrustUnionId),
+    onAdmitted: () => markIngressAdmitted(input.ctx),
     execute: pluginCommandGateway.execute,
     reply: (content, msgType) => deps.sessionReply(anchor, content, msgType, larkAppId),
     text: key => tr(key, { cmd: decision.cmd }, locale),
@@ -7218,17 +7221,7 @@ const cardActionPluginGateway = createPluginCardActionGateway({
   fallback: (data, larkAppId) => handleCardAction(data, cardDeps, larkAppId),
   // Identity comes only from the SDK-verified envelope operator and the
   // callback context's chat; card values never feed this decision.
-  resolvePrivileges: (larkAppId, data) => {
-    const openId = typeof data.operator?.open_id === 'string' && data.operator.open_id ? data.operator.open_id : undefined;
-    const unionId = typeof data.operator?.union_id === 'string' && data.operator.union_id ? data.operator.union_id : undefined;
-    const rawChatId = (data.context as Record<string, unknown> | undefined)?.open_chat_id;
-    const chatId = typeof rawChatId === 'string' && rawChatId ? rawChatId : undefined;
-    if (!openId || !chatId) return { canOperate: false, canTalk: false };
-    return {
-      canOperate: canOperate(larkAppId, chatId, openId, unionId),
-      canTalk: evaluateTalk(larkAppId, chatId, openId, undefined, unionId).allowed,
-    };
-  },
+  resolvePrivileges: resolvePluginCardPrivileges,
 });
 
 const LEGACY_WORKFLOW_API_RETIRED = {
@@ -25540,6 +25533,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
   });
   if (slashDecision.kind === 'plugin') {
     await executePluginSlashCommand({
+      ctx,
       decision: slashDecision,
       larkAppId,
       chatId,
@@ -29200,6 +29194,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   }
   if (slashDecision && slashDecision.kind === 'plugin') {
     await executePluginSlashCommand({
+      ctx,
       decision: slashDecision,
       larkAppId,
       chatId: existingDs?.chatId ?? chatId ?? routingChatId,
