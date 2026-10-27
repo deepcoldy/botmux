@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
-import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast, tmuxSupportsRemainOnExitFailed, refreshTmuxVersion } from '../../setup/ensure-tmux.js';
+import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast, tmuxSupportsRemainOnExitFailed, refreshTmuxVersion, parseTmuxVersion, type TmuxVersion } from '../../setup/ensure-tmux.js';
 import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
 import { inheritBotEnv } from '../../core/env-policy.js';
 import { strictPaneCommand } from './strict-env.js';
@@ -107,6 +107,21 @@ export interface PipePaneDeathEvidence {
 
 const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
 const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
+
+/** Commands and option values are parsed by the tmux SERVER, which can be older
+ *  than the `tmux` on PATH: an upgraded binary leaves the running server on the
+ *  old one until it restarts. With no server on the socket the next one is
+ *  spawned from this client binary, so the client version stands. */
+function serverTmuxVersion(socketArgs: readonly string[], clientVersion: TmuxVersion | null): TmuxVersion | null {
+  try {
+    const out = execFileSync('tmux', [...socketArgs, 'display-message', '-p', '#{version}'], {
+      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, env: tmuxEnv(),
+    });
+    return parseTmuxVersion(String(out ?? '')) ?? clientVersion;
+  } catch {
+    return clientVersion;
+  }
+}
 /** After #{pane_dead} flips, #{pane_dead_status} is populated a beat later
  *  (`1:` → `1:77` observed on tmux 3.3a; the gap widens under a loaded server).
  *  The teardown read polls that long at most for the real status. */
@@ -1447,8 +1462,9 @@ export class TmuxPipeBackend implements SessionBackend {
     // unknown (a transient `tmux -V` timeout within the null TTL), re-ask once
     // rather than downgrading the whole session's exit-code channel on a
     // modern host. Still fail-closed if the fresh probe is unreadable.
-    let tmuxVersion = getTmuxVersionCached();
-    if (tmuxVersion === null) tmuxVersion = refreshTmuxVersion();
+    let clientVersion = getTmuxVersionCached();
+    if (clientVersion === null) clientVersion = refreshTmuxVersion();
+    const tmuxVersion = serverTmuxVersion(this.tmuxArgs, clientVersion);
     const newSessionAcceptsE = tmuxVersionAtLeast(tmuxVersion, 3, 2);
     // `remain-on-exit failed` exists only on tmux >= 3.2 (see
     // TMUX_REMAIN_ON_EXIT_FAILED). 3.1c/older reject it with "bad value", and
@@ -1667,7 +1683,7 @@ export class TmuxPipeBackend implements SessionBackend {
       // one created by an older build has no such option yet, and it must be
       // in place before the CLI can die. Idempotent. Skipped on tmux < 3.2,
       // where the value is rejected (see supportsRemainOnExitFailed).
-      if (tmuxSupportsRemainOnExitFailed(version)) {
+      if (tmuxSupportsRemainOnExitFailed(serverTmuxVersion(this.tmuxArgs, version))) {
         execSync(`${this.tmuxCmd} set-option -t ${t} remain-on-exit failed`, { stdio: 'ignore', env, timeout: 5000 });
       }
     } catch { /* session may not be ready yet — benign */ }
