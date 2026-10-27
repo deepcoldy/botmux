@@ -22,8 +22,8 @@
 8. 缺少目标应用的用户授权时，工具拒绝执行，并提示目标 Agent 通过 `botmux auth request` 为已验证的原请求者申请本次所需权限。授权链接绑定目标应用及其视角下的原用户，Agent 可在当前任务话题将链接提供给该真人，等待授权后重试；同一真人的后续回合可以完成等待，另一人的回合不能取得该请求结果或凭据。不会给派发机器人创建登录挑战，也不会回退到机器或 owner 身份。权限不匹配、授权失败或授权撤销时，通过该任务的 `botmux report --dispatch-root` 回报阻塞。
    目标访问拒绝、成员校验不可用（包括超过现有 2000 人分页上限）与个人未登录分别提示；校验不可用不要求重新登录。已被当前回合或精确恢复记录确证为真人的消息不查询委托存储，委托存储损坏只阻断需要从中取得身份的路径。
 
-9. `botmux send --mention <同机 Bot>` 交接同样附带委托（来源 Bot 的 `triggerUserAuth.delegateOnMention`，默认开，Dashboard「按触发人鉴权」里可关）。消息由 CLI 自己发出，所以分两步：发送前 CLI 调 `/api/dispatch-user/mention-prepare`，只传目标 Bot 的应用 ID 和群；来源 daemon 只在当前回合是真人直接触发时（定时任务、机器人消息、本身就是委托的回合都不算）写 pending 记录，目标限本机已配置的其它 Bot、限本会话所在群。发送后 CLI 调 `/api/dispatch-user/mention-bind`，daemon 向飞书取回这条消息，确认是本 Bot 在发送前登记之后发到该群的，才把记录绑定到这个消息 ID；校验不过或发送失败都撤销登记。交接消息可能在普通群顶层、引用回复或话题里，所以这类记录不写话题根，只绑定精确的消息 ID；`botmux dispatch` 的记录仍要求话题根一致。任何一步不成，消息照常发出，只是接收方这一轮没有委托身份。正文里写的 `@Bot`（被注入成真正 @ 的那种）与 `--mention` 同样算交接目标。交接被拒时，接收方提示里的 `--dispatch-root` 指向这条交接消息本身；它在 dispatch 回报登记里没有条目，`botmux report` 会按「未送达主编排」的公告发到群里，而不是回到发起方会话。
-10. 接收方每次按委托发布身份时记一条 `[dispatch-user:audit] receive`（来源 Bot、目标 Bot、union_id、会话、回合、工具、结果）；来源 daemon 在登记和绑定时各记一条 `mention-prepare` / `mention-bind`。
+9. `botmux send --mention <同机 Bot>` 交接同样附带委托（来源 Bot 的 `triggerUserAuth.delegateOnMention`，默认开，Dashboard「按触发人鉴权」里可关）。消息由 CLI 自己发出，所以分两步：发送前 CLI 调 `/api/dispatch-user/mention-prepare`，只传目标 Bot 的应用 ID 和群；来源 daemon 在当前回合是真人直接触发，或本回合已带有经验证的委托时写 pending 记录（定时任务、不带委托的机器人消息都不算）；后一种与 `botmux dispatch` 一致，按当前群重新检查原用户的访问权限，只能收窄工具，否则主编排收到一个 Bot 的回报后再 @ 下一个 Bot，原用户身份就会断掉，目标限本机已配置的其它 Bot、限本会话所在群。发送后 CLI 调 `/api/dispatch-user/mention-bind`，daemon 向飞书取回这条消息，确认是本 Bot 在发送前登记之后发到该群的，才把记录绑定到这个消息 ID；校验不过或发送失败都撤销登记。交接消息可能在普通群顶层、引用回复或话题里，所以这类记录不写话题根，只绑定精确的消息 ID；`botmux dispatch` 的记录仍要求话题根一致。任何一步不成，消息照常发出，只是接收方这一轮没有委托身份。正文里写的 `@Bot`（被注入成真正 @ 的那种）与 `--mention` 同样算交接目标。交接被拒时，接收方提示里的 `--dispatch-root` 指向这条交接消息本身；它在 dispatch 回报登记里没有条目，`botmux report` 会按「未送达主编排」的公告发到群里，而不是回到发起方会话。
+10. 接收方每次按委托发布身份时记一条 `[dispatch-user:audit] receive`（来源 Bot、目标 Bot、union_id、会话、回合、工具、结果）；来源 daemon 在登记和绑定时各记一条 `mention-prepare` / `mention-bind`，不签委托时记一条 `mention-prepare skipped` 及原因。
 
 ## 边界与取舍
 

@@ -47,10 +47,17 @@ function harness(options: {
   messageDetail?: unknown;
   /** Provider failures before the message becomes readable. */
   readFailures?: number;
+  /** This bot and the turn it is in (default: cli_source, a turn sent by a human). */
+  appId?: string;
+  turnId?: string;
+  /** Whether the delegated human still passes this chat's access checks. */
+  delegatedUserAllowed?: boolean;
 } = {}) {
-  const ds: any = { larkAppId: 'cli_source', chatId: 'oc_chat', session: { sessionId: 'source-session' },
-    managedTurnOrigin: { capability: CAP, turnId: 'om_human', dispatchAttempt: 1 },
-    activeInteractiveTurn: { turnId: 'om_human', caller: options.caller ?? human },
+  const appId = options.appId ?? 'cli_source';
+  const turnId = options.turnId ?? 'om_human';
+  const ds: any = { larkAppId: appId, chatId: 'oc_chat', session: { sessionId: 'source-session' },
+    managedTurnOrigin: { capability: CAP, turnId, dispatchAttempt: 1 },
+    activeInteractiveTurn: { turnId, caller: options.caller ?? human },
   };
   let body: any = {};
   let readFailures = options.readFailures ?? 0;
@@ -58,19 +65,24 @@ function harness(options: {
     if (readFailures-- > 0) throw new Error('get message: 230002 message not found');
     return options.messageDetail ?? {
       items: [{ message_id: messageId, chat_id: 'oc_chat', create_time: String(Date.now()),
-        sender: { id: 'cli_source', id_type: 'app_id', sender_type: 'app' } }],
+        sender: { id: appId, id_type: 'app_id', sender_type: 'app' } }],
     };
   });
   const logger = { info: vi.fn(), warn: vi.fn() };
   const scope: any = {
     readJsonBody: async () => body,
     findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
-    authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => false, selfDaemonLarkAppId: 'cli_source',
+    authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => false, selfDaemonLarkAppId: appId,
     jsonRes: (_res: unknown, status: number, value: any) => ({ status, value }),
-    getBot: () => ({ config: { larkAppId: 'cli_source',
+    // The daemon's own lookup of a delegation already bound to this turn's message.
+    dispatchUserForTurn: (session: any, turn: string) => resolveDispatchUser({
+      dataDir, secret, appId: session.larkAppId, chatId: session.chatId, turnId: turn, waitMs: 0 }),
+    targetUserForDelegation: vi.fn(async (_session: unknown, user: any) =>
+      options.delegatedUserAllowed === false ? undefined : user.openId),
+    getBot: () => ({ config: { larkAppId: appId,
       triggerUserAuth: 'triggerUserAuth' in options ? options.triggerUserAuth : { enabled: true, tools: ['bytedcli'] } } }),
     delegatesOnMention,
-    loadBotConfigsCached: () => (options.localBots ?? ['cli_source', 'cli_target']).map(larkAppId => ({ larkAppId })),
+    loadBotConfigsCached: () => (options.localBots ?? ['cli_source', 'cli_target', 'cli_third']).map(larkAppId => ({ larkAppId })),
     authorityForDispatch, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
     resolveUnionIdFromOpenId: vi.fn(async () => 'on_alice'),
     registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser,
@@ -79,7 +91,7 @@ function harness(options: {
   };
   const routes = new Function('scope', 'with (scope) { ' + code + '; return { prepare, bind }; }')(scope);
   const call = (handler: (req: unknown, res: unknown) => Promise<any>, next: Record<string, unknown>) => {
-    body = { sessionId: 'source-session', originCapability: CAP, originTurnId: 'om_human', originDispatchAttempt: 1, ...next };
+    body = { sessionId: 'source-session', originCapability: CAP, originTurnId: turnId, originDispatchAttempt: 1, ...next };
     return handler({}, {});
   };
   return {
@@ -123,9 +135,65 @@ describe('mention handoff: prepare', () => {
     expect(() => store()).toThrow();
   });
 
+  it('logs why a handoff carried no sender', async () => {
+    const h = harness({ caller: { senderType: 'bot', requestLarkAppId: 'cli_source', requestUserOpenId: 'ou_bot' } });
+    await h.prepare();
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining('mention-prepare skipped source=cli_source chat=oc_chat reason=no_direct_human'));
+  });
+
   it('refuses a caller that cannot prove the live turn', async () => {
     const h = harness();
     expect(await h.prepare({ originCapability: 'd'.repeat(64) })).toMatchObject({ status: 403 });
+  });
+});
+
+describe('mention handoff: a delegated turn hands the same person on', () => {
+  const peerBot = { senderType: 'bot', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_source_bot' };
+  // Hop 1: a human asks cli_source, which @-mentions cli_target in om_handoff.
+  async function firstHop(tools = ['bytedcli']) {
+    const h = harness({ triggerUserAuth: { enabled: true, tools } });
+    const { value: { deliveryId } } = await h.prepare();
+    await h.bind({ deliveryId, messageId: 'om_handoff' });
+  }
+
+  it('re-signs the inherited sender when the delegated bot @-mentions the next one', async () => {
+    await firstHop();
+    // Hop 2: cli_target, in the turn started by om_handoff (sent by a bot), @-mentions cli_third.
+    const h = harness({ appId: 'cli_target', turnId: 'om_handoff', caller: peerBot,
+      triggerUserAuth: { enabled: true, tools: ['bytedcli', 'lark-cli'] } });
+    const prepared = await h.prepare({ targetAppIds: ['cli_third'] });
+    expect(prepared).toMatchObject({ status: 200, value: { ok: true, delegated: true, targetAppIds: ['cli_third'] } });
+    // Same person, issued by the original app, never widened beyond the inherited tools.
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)).toMatchObject({
+      sourceAppId: 'cli_target', sourceTurnId: 'om_handoff', targetAppIds: ['cli_third'],
+      authority: { appId: 'cli_source', openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'] },
+    });
+    expect(await h.bind({ deliveryId: prepared.value.deliveryId, messageId: 'om_handoff_2' }))
+      .toEqual({ status: 200, value: { ok: true, bound: true } });
+    expect((await receive({ appId: 'cli_third', turnId: 'om_handoff_2' }))?.authority)
+      .toMatchObject({ openId: 'ou_alice', tools: ['bytedcli'] });
+  });
+
+  it('signs nothing when the inherited person no longer passes this chat\'s checks', async () => {
+    await firstHop();
+    const h = harness({ appId: 'cli_target', turnId: 'om_handoff', caller: peerBot, delegatedUserAllowed: false });
+    expect(await h.prepare({ targetAppIds: ['cli_third'] }))
+      .toEqual({ status: 200, value: { ok: true, delegated: false, reason: 'delegated_caller_not_allowed' } });
+  });
+
+  it('signs nothing when this bot shares no tool with the inherited delegation', async () => {
+    await firstHop(['bytedcli']);
+    const h = harness({ appId: 'cli_target', turnId: 'om_handoff', caller: peerBot,
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'] } });
+    expect(await h.prepare({ targetAppIds: ['cli_third'] }))
+      .toEqual({ status: 200, value: { ok: true, delegated: false, reason: 'no_shared_tool' } });
+  });
+
+  it('a bot turn whose message carries no delegation still hands on nobody', async () => {
+    await firstHop();
+    const h = harness({ appId: 'cli_target', turnId: 'om_unrelated', caller: peerBot });
+    expect(await h.prepare({ targetAppIds: ['cli_third'] }))
+      .toEqual({ status: 200, value: { ok: true, delegated: false, reason: 'no_direct_human' } });
   });
 });
 
