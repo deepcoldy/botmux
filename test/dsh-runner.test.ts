@@ -5,7 +5,7 @@
  * Run: pnpm vitest run test/dsh-runner.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -792,20 +792,20 @@ ${PROFILE_MODEL.trim().split('\n').map(line => `    ${line}`).join('\n')}
     expect(readLog(h).some(entry => entry.initialize || entry.argv)).toBe(false);
   });
 
-  it.each([
-    { FAKE_DSH_CONFIG_ERROR: 'query-secret-must-not-be-logged', FAKE_DSH_CONFIG: PROFILE_MODEL },
-    { FAKE_DSH_CONFIG: 'not-an-entry-list' },
-    { FAKE_DSH_CONFIG: '- config: [yaml-secret-must-not-be-logged' },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: !!js process.env.PROVIDER') },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('model: deepseek-v4-1-flash-1017', 'model: !!js process.env.MODEL') },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: ""') },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: 42') },
-    { FAKE_DSH_CONFIG: '- id: agent-default-model\n  config: !!js process.env.MODEL_CONFIG' },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('    provider: flatkey', '    __jsExpr: process.env.MODEL_CONFIG\n    provider: flatkey') },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: true\n  name:') },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: !!js process.env.DISABLED\n  name:') },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL + PROFILE_MODEL },
-  ])('fails before SDK initialization when the profile cannot be resolved: %j', async env => {
+  it.each<[NodeJS.ProcessEnv, string]>([
+    [{ FAKE_DSH_CONFIG_ERROR: 'query-secret-must-not-be-logged', FAKE_DSH_CONFIG: PROFILE_MODEL }, 'dsh --dump-config failed (exit 2)'],
+    [{ FAKE_DSH_CONFIG: 'not-an-entry-list' }, 'expected a literal YAML entry list'],
+    [{ FAKE_DSH_CONFIG: '- config: [yaml-secret-must-not-be-logged' }, 'invalid YAML'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: !!js process.env.PROVIDER') }, 'agent-default-model.provider must be'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('model: deepseek-v4-1-flash-1017', 'model: !!js process.env.MODEL') }, 'agent-default-model.model must be'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: ""') }, 'agent-default-model.provider must be'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: 42') }, 'agent-default-model.provider must be'],
+    [{ FAKE_DSH_CONFIG: '- id: agent-default-model\n  config: !!js process.env.MODEL_CONFIG' }, 'agent-default-model.config must be a literal mapping'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('    provider: flatkey', '    __jsExpr: process.env.MODEL_CONFIG\n    provider: flatkey') }, 'agent-default-model.config must be a literal mapping'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: true\n  name:') }, 'agent-default-model or its group is disabled'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: !!js process.env.DISABLED\n  name:') }, 'agent-default-model or its group is disabled'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL + PROFILE_MODEL }, 'duplicate agent-default-model entries'],
+  ])('fails before SDK initialization when the profile cannot be resolved: %j', async (env, reason) => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
     writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
     h = spawnRunner('happy', [], env, home);
@@ -814,6 +814,23 @@ ${PROFILE_MODEL.trim().split('\n').map(line => `    ${line}`).join('\n')}
     expect(h.child.exitCode).toBe(1);
     expect(readLog(h).some(entry => entry.initialize || entry.argv)).toBe(false);
     expect(h.stdout + h.stderr).not.toContain('secret-must-not-be-logged');
-    expect(h.stdout + h.stderr).toContain('dsh');
+    expect(h.stdout + h.stderr).toContain(reason);
+  });
+
+  it('prints a command that reproduces the failed configuration query', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    h = spawnRunner('happy', ['--dsh-profile', 'custom-profile', '--bridge-patch', `${home}/it's overlay.yml`], {
+      DSH_HOME: join(home, 'custom dsh'), FAKE_DSH_CONFIG_ERROR: 'query failed',
+    }, home);
+    await waitFor(() => h!.child.exitCode !== null, { label: 'configuration failure' });
+    const command = /run this to see the error: (.+)/.exec(h.stderr)?.[1];
+    expect(command).toBeDefined();
+
+    // Without the runner's DSH_HOME, the printed command must carry everything itself.
+    const { DSH_HOME: _, ...ambient } = process.env;
+    const rerunLog = join(home, 'rerun.jsonl');
+    spawnSync('sh', ['-c', command!], { cwd: tmpdir(), env: { ...ambient, FAKE_DSH_LOG: rerunLog } });
+    const { argv, dshHome } = readLog(h).find(entry => entry.dump).dump;
+    expect(readJsonLines(rerunLog).find(entry => entry.dump)?.dump).toMatchObject({ argv, dshHome });
   });
 });

@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseDocument } from 'yaml';
 
@@ -42,6 +42,20 @@ function modelField(config: Record<string, unknown>, key: 'provider' | 'model', 
   return value.trim();
 }
 
+function shellQuote(value: string): string {
+  return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** DSH may rename the legacy file between any check and the read. */
+function readIfPresent(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
 function findDefaultModels(entries: unknown, parentEnabled = true): Array<{ entry: Record<string, unknown>; enabled: boolean }> {
   if (!Array.isArray(entries) || entries.some(entry => !isRecord(entry))) {
     throw new Error('dsh --dump-config: expected a literal YAML entry list');
@@ -77,7 +91,12 @@ export function resolveDshModel(options: {
   });
   if (result.error || result.status !== 0) {
     const reason = (result.error as NodeJS.ErrnoException | undefined)?.code ?? result.signal ?? `exit ${result.status}`;
-    throw new Error(`dsh --dump-config failed (${reason}); check the selected profile with dsh --dump-config`);
+    // The child's output stays hidden; the exact query lets the operator see it locally.
+    const command = [
+      ...(options.env.DSH_HOME?.trim() ? [`DSH_HOME=${shellQuote(options.dshHome)}`] : []),
+      ...[options.dshBin, ...options.launchArgs, '--dump-config'].map(shellQuote),
+    ].join(' ');
+    throw new Error(`dsh --dump-config failed (${reason}); run this to see the error: ${command}`);
   }
 
   const entries = readConfigYaml(result.stdout, '--dump-config');
@@ -106,9 +125,9 @@ export function resolveDshModel(options: {
   // Preserve the legacy file's explicit choices while it exists. Old DSH reads
   // them at runtime; new DSH imports them during boot, after --dump-config.
   // Once DSH renames the file to .imported, only the composed profile applies.
-  const settingsPath = join(options.dshHome, 'settings.yaml');
-  if (existsSync(settingsPath)) {
-    const settings = readConfigYaml(readFileSync(settingsPath, 'utf8'), 'settings.yaml') ?? {};
+  const legacyText = readIfPresent(join(options.dshHome, 'settings.yaml'));
+  if (legacyText !== undefined) {
+    const settings = readConfigYaml(legacyText, 'settings.yaml') ?? {};
     if (!isRecord(settings)) throw new Error('dsh settings.yaml: expected a mapping');
     const legacy = settings['agent-default-model'];
     if (legacy !== undefined) {
