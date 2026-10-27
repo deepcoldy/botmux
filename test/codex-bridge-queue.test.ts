@@ -1951,3 +1951,34 @@ describe('CodexBridgeQueue + bridge-fallback gate (type-ahead suppression window
     expect(emitDecisions(q, [])).toEqual([{ turnId: 't2', suppressed: false }]);
   });
 });
+
+describe('CodexBridgeQueue provisional task_started corroboration', () => {
+  it('reports a provisional claim as started once its own user record corroborates it', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    const started: string[] = [];
+    q.setTurnStartObserver(turn => started.push(turn.turnId));
+    q.mark('t1', 'hello there', 0);
+    q.ingest([startedEv('native-1', 's1', 100)]);
+    expect(started).toEqual([]);
+    q.ingest([{ ...userEv('hello there', 'u1', 90_000), sourceTurnId: 'native-1' }]);
+    expect(started).toEqual(['t1']);
+  });
+
+  it('routes the terminal to the corroborated turn when a lost earlier mark held the provisional claim', () => {
+    let now = 5_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('lost', 'first message lost', 0);
+    q.mark('t2', 'second message', 500);
+    q.ingest([
+      startedEv('native-1', 's1', 1_000),
+      { ...userEv('second message', 'u1', 1_100), sourceTurnId: 'native-1', sourceMessageId: 'msg-2' },
+      { ...asstEv('answer two', 'a1', 2_000), sourceTurnId: 'native-1' },
+    ]);
+    now = 15 * 60_000;
+    expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['lost']);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't2', finalText: 'answer two' }),
+    ]);
+    expect(q.hasBlockingTurn()).toBe(false);
+  });
+});

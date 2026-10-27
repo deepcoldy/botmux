@@ -40,6 +40,7 @@ import { errorMessage } from './utils/error-message.js';
 import { createRunnerTerminal } from './runner-common.js';
 import { parseArgs, MAX_TURN_TIMEOUT_MS, type Args } from './dsh-runner-args.js';
 import { appendPendingNotification } from './dsh-runner-pending.js';
+import { resolveDshModel } from './dsh-runner-config.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
@@ -60,7 +61,6 @@ const MAX_TURN_DURATION_MULTIPLIER = 4;
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
-const DEFAULT_MODEL = 'deepseek-v4-flash';
 const DEFAULT_MAX_TOKENS = 49152;
 
 /** Default dsh profile name used when none is specified. The profile lives
@@ -191,20 +191,6 @@ function parsePromptMessageId(result: unknown): string {
     throw new Error(`dsh protocol error: session/prompt returned no message id: ${JSON.stringify(result)}`);
   }
   return result.messageId;
-}
-
-/** Native dsh config resolved from ~/.dsh (profile + settings.yaml + .credentials.yaml).
- *  The runner spawns `dsh --profile <name>`; the dsh CLI composes the full plugin tree
- *  from dsh-base bundles + the profile's cordis.patch.yml. */
-interface NativeDshConfig {
-  /** Profile name under ~/.dsh/profiles/ (passed to `dsh --profile`). */
-  profileName: string;
-  /** Provider route for SDK initialize. */
-  provider: string;
-  /** Model for SDK initialize (argv --model > settings.yaml > default). */
-  model: string;
-  /** Credentials injected into the runtime's environment (env wins on conflict). */
-  credentials: Record<string, string>;
 }
 
 function dshHomeDir(): string {
@@ -359,41 +345,6 @@ function loadCredentials(): Record<string, string> {
   return out;
 }
 
-/** Resolve the profile name, provider, model, and credentials.
- *
- *  Precedence:
- *  1. --dsh-profile (default "botmux") — profile name under ~/.dsh/profiles/.
- *  2. Provider & model from ~/.dsh/settings.yaml for the initialize RPC.
- *  3. Credentials from ~/.dsh/.credentials.yaml. */
-function resolveNativeDshConfig(): NativeDshConfig {
-  const profileName = args.dshProfile?.trim() || DEFAULT_DSH_PROFILE;
-
-  // Ensure the profile directory exists and dependencies are installed.
-  ensureProfileDir(profileName, args.dshBin);
-
-  // Resolve provider & model from ~/.dsh/settings.yaml for the initialize RPC.
-  //    The plugin composition is managed entirely by the profile's cordis.patch.yml.
-  const settingsPath = join(dshHomeDir(), 'settings.yaml');
-  let provider = 'deepseek-official';
-  let settingsModel = '';
-  if (existsSync(settingsPath)) {
-    const settings = parseYamlDocument(readFileSync(settingsPath, 'utf8')) as unknown;
-    const s = isRecord(settings) ? settings : {};
-    const defaultModel = isRecord(s['agent-default-model']) ? s['agent-default-model'] : {};
-    provider = typeof defaultModel.provider === 'string' && defaultModel.provider
-      ? defaultModel.provider
-      : provider;
-    settingsModel = typeof defaultModel.model === 'string' ? defaultModel.model : '';
-  }
-
-  return {
-    profileName,
-    provider,
-    model: args.model?.trim() || settingsModel || DEFAULT_MODEL,
-    credentials: loadCredentials(),
-  };
-}
-
 /** Map dsh's per-model-call usage onto botmux's four-bucket final usage.
  *  dsh reports cacheWriteTokens where botmux says cacheCreateTokens. The
  *  worker drops the whole usage unless every bucket is a non-negative
@@ -441,15 +392,13 @@ class DshJsonRpcClient {
 
   constructor(
     private readonly dshBin: string,
-    private readonly profileName: string,
+    private readonly launchArgs: string[],
     private readonly env: NodeJS.ProcessEnv,
     private readonly cwd: string,
   ) {}
 
   start(): void {
-    const dshArgs = ['--profile', this.profileName];
-    if (args.bridgePatch) dshArgs.push(`--patch=${args.bridgePatch}`);
-    this.child = spawn(this.dshBin, dshArgs, {
+    this.child = spawn(this.dshBin, this.launchArgs, {
       env: this.env,
       cwd: this.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -839,7 +788,8 @@ function handleInput(data: Buffer): void {
 }
 
 async function main(): Promise<void> {
-  const native = resolveNativeDshConfig();
+  const profileName = args.dshProfile?.trim() || DEFAULT_DSH_PROFILE;
+  ensureProfileDir(profileName, args.dshBin);
   // Sessions live under the native dsh home (~/.dsh/sessions/botmux/<id>),
   // not ~/.botmux — the adapter binds ~/.dsh into the sandbox.
   const sessionRoot = join(dshHomeDir(), 'sessions', 'botmux', args.sessionId);
@@ -848,15 +798,22 @@ async function main(): Promise<void> {
   // Credentials from ~/.dsh/.credentials.yaml fill gaps; the ambient
   // environment (bots.json env) wins on conflict, and the runner's
   // session/cwd always win.
-  client = new DshJsonRpcClient(args.dshBin, native.profileName, {
-    ...native.credentials,
+  const env: NodeJS.ProcessEnv = {
+    ...loadCredentials(),
     ...process.env,
     DSH_SESSION_ROOT: sessionRoot,
     DSH_CWD: cwd,
     ...(args.turnTimeoutMs !== undefined
       ? { BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)) }
       : {}),
-  }, cwd);
+  };
+  const launchArgs = ['--profile', profileName];
+  if (args.bridgePatch) launchArgs.push(`--patch=${args.bridgePatch}`);
+  const selection = resolveDshModel({
+    dshBin: args.dshBin, launchArgs, cwd, env, dshHome: dshHomeDir(), model: args.model,
+  });
+  process.stderr.write(`[botmux:dsh] ${JSON.stringify({ profile: profileName, ...selection })}\n`);
+  client = new DshJsonRpcClient(args.dshBin, launchArgs, env, cwd);
   client.onNotification = handleNotification;
   client.onExit = (code, signal) => {
     if (shuttingDown) return;
@@ -875,7 +832,7 @@ async function main(): Promise<void> {
 
   const initializeResult = await client.request<unknown>(
     'initialize',
-    { cwd, provider: native.provider, model: native.model, maxTokens: DEFAULT_MAX_TOKENS },
+    { cwd, provider: selection.provider, model: selection.model, maxTokens: DEFAULT_MAX_TOKENS },
     HANDSHAKE_TIMEOUT_MS,
   );
   const { serverInfo } = parseInitializeResult(initializeResult);

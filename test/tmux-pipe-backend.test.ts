@@ -67,6 +67,7 @@ import {
   tmuxLifecycleInitialDelayMs,
   setStartupTmuxRetrySleepForTests,
   buildPipePaneStartupError,
+  resolveReportedExitCode,
 } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { resetTmuxVersionCacheForTests, getTmuxVersionCached } from '../src/setup/ensure-tmux.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
@@ -1332,6 +1333,27 @@ describe('TmuxPipeBackend managed session', () => {
   });
 });
 
+describe('resolveReportedExitCode merges latched vs terminal death code', () => {
+  // observed = code captured when a probe confirmed the corpse
+  // terminal = code read at handlePaneExit teardown
+  // null = confirmed dead but no code seen; undefined = death never probe-confirmed.
+  it.each([
+    [77, null, 77],   // latched real code wins even if terminal starved
+    [77, 3, 77],     // a numeric latch is never overwritten by the terminal read
+    [null, 77, 77],  // probe latched code-less, terminal catches the late code
+    [undefined, 77, 77], // no probe capture; terminal code stands
+    [null, null, null],   // code-less (signal) death on both -> null -> caller uses sentinel 1
+    [undefined, null, null],
+  ] as const)('observed=%j terminal=%j -> %j', (observed, terminal, expected) => {
+    expect(resolveReportedExitCode(observed, terminal)).toBe(expected);
+  });
+
+  it('passes a real exit 0 through (does not collide with the sentinel-1 fallback)', () => {
+    expect(resolveReportedExitCode(0, 1)).toBe(0);
+    expect(resolveReportedExitCode(undefined, 0)).toBe(0);
+  });
+});
+
 describe('TmuxPipeBackend lifecycle watcher', () => {
   const isPaneProbe = (args: any) =>
     Array.isArray(args) && args.includes('display-message') && args.includes('#{pane_id}');
@@ -1405,6 +1427,57 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
       vi.advanceTimersByTime(10_000);
 
       expect(exits).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  // #2434: a dead-but-kept corpse still answers #{pane_id}; the watcher then
+  // reads #{pane_dead}:#{pane_dead_status} and confirms death. The real code
+  // (77) is captured AT THAT probe. If a deeply starved tmux is unreadable by
+  // the time handlePaneExit() does its terminal read (~13s later), the latched
+  // code must still be reported — not collapsed to the sentinel 1.
+  it('reports the real exit code latched when the pane was confirmed dead, even if the terminal read is starved', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      const DEAD_STATUS = '#{pane_dead}:#{pane_dead_status}';
+      // A watcher liveness probe reads pane_id FIRST then the death-status
+      // format; handlePaneExit()'s terminal read reads the death-status format
+      // WITHOUT a preceding pane_id. Distinguish them by the previous call:
+      //  - death-status right after a pane_id read (the probe): confirmed 1:77
+      //  - a standalone death-status read (terminal, no preceding pane_id):
+      //    starved/unreadable -> ''  (this is the #2434 starvation shape)
+      let lastWasPaneId = false;
+      const probeImpl = (_bin: any, args: any) => {
+        if (!Array.isArray(args) || !args.includes('display-message')) { lastWasPaneId = false; return '' as any; }
+        if (args.includes('#{pane_id}')) { lastWasPaneId = true; return '%1\n' as any; }
+        if (args.includes(DEAD_STATUS)) {
+          const afterPaneId = lastWasPaneId;
+          lastWasPaneId = false;
+          return afterPaneId ? '1:77\n' as any : '' as any;
+        }
+        lastWasPaneId = false;
+        return '' as any;
+      };
+
+      mockedExecFileSync.mockImplementation(probeImpl);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+
+      // Each watcher probe: pane_id OK + isPaneDead reads 1:77 -> 'missing'
+      // (corpse). Three back-to-back dead verdicts + final confirm trip exit.
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000 + 9_000);
+
+      // handlePaneExit() already ran with a starved terminal read (the
+      // standalone DEAD_STATUS call above returned ''); advance any tail timer.
+      vi.advanceTimersByTime(2_000);
+
+      // Latched 77 wins over the now-unreadable terminal read.
+      expect(exits).toEqual([[77, null]]);
     } finally {
       vi.useRealTimers();
       errSpy.mockRestore();
