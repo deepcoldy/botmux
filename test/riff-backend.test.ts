@@ -65,6 +65,29 @@ describe('RiffBackend', () => {
 
   const flush = () => new Promise((r) => setTimeout(r, 0));
 
+  it('refreshes the host-tools binding on follow-ups instead of reusing creation env', async () => {
+    let turn = 0;
+    const be = makeBackend({ hostToolsBinding: () => ({ url: 'https://host.example/api/riff-host-tools',
+      token: String(++turn).repeat(43), sessionId: 'session-1', turnId: `turn-${turn}` }) });
+    const decode = (prompt: string) => JSON.parse(Buffer.from(
+      /botmux riff-host-bind ([A-Za-z0-9_-]+)/.exec(prompt)![1]!, 'base64url').toString());
+    try {
+      be.write('first request');
+      await flush();
+      const first = JSON.parse(calls.find(c => c.url.includes('/api/task-execute'))!.init!.body as string);
+      expect(decode(first.config.userPrompt).turnId).toBe('turn-1');
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      be.write('second request');
+      await flush();
+      const second = JSON.parse(calls.find(c => c.url.includes('/api/task-follow-up'))!.init!.body as string);
+      expect(decode(second.prompt).turnId).toBe('turn-2');
+      expect(decode(second.prompt).token).not.toBe(decode(first.config.userPrompt).token);
+      resolvers.shift()!(taskResponse('task-2'));
+      await flush();
+    } finally { be.kill(); }
+  });
+
   describe('attachment multipart uploads', () => {
     let dir: string;
     let be: RiffBackend;

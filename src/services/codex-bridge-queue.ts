@@ -220,6 +220,16 @@ export class CodexBridgeQueue {
       && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId)) ?? null;
   }
 
+  /** A lost earlier mark can hold the provisional claim on a native turn whose
+   *  user record then started a later mark. The terminal belongs to that
+   *  corroborated turn; dropping it would leave it started without a final. */
+  private hasCorroboratedNativeTurn(ev: CodexBridgeEvent): boolean {
+    return !!ev.sourceTurnId && this.queue.some(turn => turn.started && turn.finalText === undefined
+      && !this.isProvisionalTaskStart(turn)
+      && turn.sourceTurnId === ev.sourceTurnId
+      && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId));
+  }
+
   private rollbackProvisionalTaskStart(turn: CodexPendingTurn, observedAtMs: number = this.now()): void {
     if (!this.isProvisionalTaskStart(turn)) return;
     turn.started = false;
@@ -791,6 +801,10 @@ export class CodexBridgeQueue {
           if (!provisional.sourceTurnId && ev.sourceTurnId) {
             provisional.sourceTurnId = ev.sourceTurnId;
           }
+          // Corroboration is the turn's own user record: the same evidence a
+          // direct start reports, so in-flight input is not re-delivered to a
+          // resumed CLI that already holds it.
+          try { this.turnStartObserver?.(provisional); } catch { /* observer only */ }
           return;
         }
         // In non-adopt mode an unmatched user record may only be transcript
@@ -941,7 +955,7 @@ export class CodexBridgeQueue {
         // turn must not settle the pending Lark mark. Roll back immediately;
         // the terminal is intentionally not buffered onto another turn.
         this.rollbackProvisionalTaskStart(provisional);
-        return;
+        if (!this.hasCorroboratedNativeTurn(ev)) return;
       }
       const target = this.targetForNativeEvent(ev);
       if (target) {
@@ -967,7 +981,7 @@ export class CodexBridgeQueue {
       const provisional = this.matchingProvisionalTaskStart(ev);
       if (provisional) {
         this.rollbackProvisionalTaskStart(provisional);
-        return;
+        if (!this.hasCorroboratedNativeTurn(ev)) return;
       }
       const target = this.targetForNativeEvent(ev);
       if (!target) {
