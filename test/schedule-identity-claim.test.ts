@@ -301,6 +301,27 @@ describe('claim card on a fire without identity', () => {
     expect(store.getClaimCard(APP, 'a1b2c3d4')?.messageId).toBe('om_card_2');
   });
 
+  it('reports a broken card store as a rejection, never by throwing into the turn being prepared', async () => {
+    const h = harness();
+    addTask({ ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    h.deps.getCard = () => { throw new Error('database is not open'); };
+    const task = authorityTask();
+    let restored!: Promise<void>;
+    let gap!: Promise<void>;
+    expect(() => {
+      restored = h.claims.noteIdentityRestored({
+        appId: APP, task, turnId: 'schedule:a1b2c3d4:00000001-0000-4000-8000-000000000000',
+        identity: { ok: true, openId: ALICE.open, unionId: ALICE.union, source: 'creator' },
+      });
+      gap = h.claims.noteIdentityGap({
+        appId: APP, task, turnId: 'schedule:a1b2c3d4:00000002-0000-4000-8000-000000000000', fireChatId: CHAT,
+        location: { kind: 'chat', chatId: CHAT }, gap: { ok: false, reason: 'no_creator' },
+      });
+    }).not.toThrow();
+    await expect(restored).rejects.toThrow('database is not open');
+    await expect(gap).rejects.toThrow('database is not open');
+  });
+
   it('keeps one card per task across a daemon restart', async () => {
     const h = harness();
     addTask();

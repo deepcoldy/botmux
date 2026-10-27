@@ -242,10 +242,12 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
   /** A scheduled turn of `task` found no usable identity: post the task's card,
    *  or refresh the pending one. A refresh that fails for any reason other than
    *  the card being gone is left for the next fire (no duplicate card); a
-   *  failed post rejects, and the caller logs it. */
-  function noteIdentityGap(input: ScheduleIdentityGapInput): Promise<void> {
+   *  failed post rejects, and the caller logs it. Async on purpose: any
+   *  failure, including a store read, must reach the caller as a rejection,
+   *  never as a synchronous throw into the turn that is being prepared. */
+  async function noteIdentityGap(input: ScheduleIdentityGapInput): Promise<void> {
     const { appId, task, turnId } = input;
-    if (deps.governedTools(appId).length === 0) return Promise.resolve();
+    if (deps.governedTools(appId).length === 0) return;
     return serialized(`${appId}:${task.id}`, async () => {
       const record = deps.getCard(appId, task.id);
       if (record?.lastTurnId === turnId) return;
@@ -294,15 +296,17 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
   /** A scheduled turn of `task` has a usable identity again. If the task's
    *  card is still asking for a claimant, turn it into what is now true —
    *  claimed, or resolved by the creator — instead of leaving it orange. Does
-   *  nothing (one record read) for the usual task that has no pending card. */
-  function noteIdentityRestored(input: {
+   *  nothing (one record read) for the usual task that has no pending card.
+   *  Async for the same reason as noteIdentityGap: this runs on every fire
+   *  that HAS an identity, and a broken card store must not fail that run. */
+  async function noteIdentityRestored(input: {
     appId: string;
     task: ScheduledTask;
     turnId: string;
     identity: Extract<ScheduledRunIdentity, { ok: true }>;
   }): Promise<void> {
     const { appId, task, turnId, identity } = input;
-    if (deps.getCard(appId, task.id)?.status !== 'pending') return Promise.resolve();
+    if (deps.getCard(appId, task.id)?.status !== 'pending') return;
     return serialized(`${appId}:${task.id}`, async () => {
       const record = deps.getCard(appId, task.id);
       if (record?.status !== 'pending') return;
