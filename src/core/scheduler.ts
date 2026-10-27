@@ -1427,6 +1427,19 @@ export function runTaskNow(id: string): boolean {
   return true;
 }
 
+/** Who the task runs as, read from where the scheduler holds it (the host
+ *  authority once enrolled, not the JSON projection), so a failed compound
+ *  edit can put it back exactly. */
+export function runAsIdentitySnapshot(
+  id: string,
+  appId?: string,
+): Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'> | undefined {
+  const task = runtimeTask(id, appId);
+  return task
+    ? { ownerOpenId: task.ownerOpenId, ownerUnionId: task.ownerUnionId, runAsClaim: task.runAsClaim }
+    : undefined;
+}
+
 /**
  * Whether an edit may record a new creator on this task. Not for a delegated
  * task: it runs as its delegation, never as a creator. Not for a task whose

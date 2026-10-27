@@ -34,6 +34,8 @@ import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store
 import { registerBot } from '../src/bot-registry.js';
 import { setDeploymentOwner } from '../src/services/deployment-identity.js';
 import { redactSchedulesForPublic } from '../src/dashboard/public-redact.js';
+import { createTaskWithOptionalPrecondition, updateTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
+import { schedulePreconditionPath } from '../src/services/schedule-precondition-store.js';
 import { config } from '../src/config.js';
 
 describe('platform tunnel peers', () => {
@@ -359,6 +361,76 @@ describe('taskAcceptsRecordedCreator', () => {
     store.updateTask(APP, 'd1d2d3d4', reown);
     expect(store.getRecord(APP, 'a1b2c3d4')).toMatchObject({ controlOpenId: 'ou_next', controlUnionId: 'on_next' });
     expect(store.getRecord(APP, 'd1d2d3d4')).toMatchObject({ controlOpenId: 'ou_delegate', controlUnionId: 'on_delegate' });
+  });
+});
+
+describe('a failed edit does not keep the new creator', () => {
+  const APP = 'cli_creator_rollback';
+  let dir: string;
+  let store: ScheduleAuthorityStore;
+  let previousDataDir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'creator-rollback-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = join(dir, 'data');
+    scheduleStore.setScheduleScope(APP);
+    store = ScheduleAuthorityStore.open(config.session.dataDir);
+    store.initializeApp(APP, []);
+    scheduler.setScheduleAuthorityStore(store);
+    scheduler.setOwnerFilter(APP, true);
+  });
+  afterEach(() => {
+    scheduleStore.__setScheduleStoreBeforeRenameTestHook(undefined);
+    scheduler.stopScheduler();
+    scheduler.setScheduleAuthorityStore(null);
+    store.close();
+    config.session.dataDir = previousDataDir;
+    scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('restores who the task runs as, its claim and control columns when the precondition step fails', () => {
+    const created = createTaskWithOptionalPrecondition({
+      name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
+      ownerOpenId: 'ou_first', ownerUnionId: 'on_first',
+    }, APP, 'printf 1');
+    const claim = { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: APP, claimedAt: '2026-10-27T02:00:00.000Z' };
+    expect(scheduler.claimTaskRunAs(created.id, APP, claim, null)).toMatchObject({ ok: true });
+    // Fail the protected-sidecar step after the task row has been written.
+    scheduleStore.__setScheduleStoreBeforeRenameTestHook(() => {
+      scheduleStore.__setScheduleStoreBeforeRenameTestHook(undefined);
+      rmSync(schedulePreconditionPath(APP, created.id), { force: true });
+    });
+    expect(() => updateTaskWithOptionalPrecondition(
+      created.id,
+      { prompt: 'edited', creator: { openId: 'ou_editor', unionId: 'on_editor' } },
+      APP,
+      { action: 'replace', source: { kind: 'inline', script: 'printf 0' } },
+    )).toThrow('staged protected record is missing');
+    const record = store.getRecord(APP, created.id)!;
+    expect(record.task).toMatchObject({ prompt: 'p', ownerOpenId: 'ou_first', ownerUnionId: 'on_first', runAsClaim: claim });
+    expect(record).toMatchObject({ controlOpenId: 'ou_first', controlUnionId: 'on_first' });
+  });
+
+  it('restores from the authority record even when the JSON projection lags behind it', () => {
+    const created = createTaskWithOptionalPrecondition({
+      name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
+    }, APP, 'printf 1');
+    const claim = { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: APP, claimedAt: '2026-10-27T02:00:00.000Z' };
+    scheduler.claimTaskRunAs(created.id, APP, claim, null);
+    // A projection refresh that failed: the claim exists only in the authority.
+    scheduleStore.projectAuthoritativeTask({ ...store.getRecord(APP, created.id)!.task, runAsClaim: undefined }, APP);
+    scheduleStore.__setScheduleStoreBeforeRenameTestHook(() => {
+      scheduleStore.__setScheduleStoreBeforeRenameTestHook(undefined);
+      rmSync(schedulePreconditionPath(APP, created.id), { force: true });
+    });
+    expect(() => updateTaskWithOptionalPrecondition(
+      created.id,
+      { prompt: 'edited', creator: { openId: 'ou_editor', unionId: 'on_editor' } },
+      APP,
+      { action: 'replace', source: { kind: 'inline', script: 'printf 0' } },
+    )).toThrow('staged protected record is missing');
+    expect(store.getRecord(APP, created.id)!.task.runAsClaim).toEqual(claim);
   });
 });
 
