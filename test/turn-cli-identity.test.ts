@@ -878,6 +878,10 @@ describe('target daemon consumes signed message authority', () => {
     await h.run();
     expect(h.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith(APP, 'on_alice');
     expect(identityBody('bytedcli', 'om_kickoff')).toContain('original-user');
+    // The receiving side records who the turn's tools will run as, and from whom.
+    expect(h.scopeValues.logger.info).toHaveBeenCalledWith(expect.stringMatching(
+      /^\[dispatch-user:audit\] receive source=cli_source target=cli_bot union=on_alice .*turn=om_kickoff .*tools=bytedcli .*result=delegated$/,
+    ));
   });
   it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
     const h = await targetHarness(options);
@@ -886,6 +890,9 @@ describe('target daemon consumes signed message authority', () => {
     const env = identityBody('bytedcli', 'om_kickoff');
     expect(env).not.toContain('must-not-leak');
     expect(env).toContain('report --dispatch-root om_root');
+    expect(h.scopeValues.logger.info).toHaveBeenCalledWith(expect.stringMatching(
+      /^\[dispatch-user:audit\] receive source=cli_source .*result=target_(access_denied|validation_unavailable)$/,
+    ));
   });
   it('never uses root binding for an unrelated later turn', async () => {
     const h = await targetHarness();

@@ -15,28 +15,20 @@
 import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { existsSync } from 'node:fs';
 import {
-  createBrowser,
-  createPage,
-  createAgent,
-  checkPrerequisites,
-  STORAGE_STATE_PATH,
   followUpMessage,
   expectedRecallMarker,
   sendMessage,
   typeThreadReply,
-  navigateToMessenger,
   openChat,
   openThreadForMessage,
   waitForReplyLine,
   reopenTopic,
   recordTextEvidence,
   scrollThreadToBottom,
-  closeSession,
   scrollConversation,
 } from './helpers.js';
-import { publishLabeledPageVideo } from './e2e-video.js';
+import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
 
 interface BrowserSession {
   browser: Browser;
@@ -46,28 +38,11 @@ interface BrowserSession {
 }
 
 async function openClaudeChat(): Promise<BrowserSession> {
-  checkPrerequisites();
-  if (!existsSync(STORAGE_STATE_PATH)) {
-    throw new Error('storageState.json not found. Run: bun run test:e2e-browser:setup');
-  }
-  const browser = await createBrowser();
-  const { context, page } = await createPage(browser);
-  const agent = createAgent(page);
-  await navigateToMessenger(page);
-  await openChat(page, agent, 'Claude');
-  return { browser, context, page, agent };
+  return openFeishuSession((page, agent) => openChat(page, agent, 'Claude'));
 }
 
 async function releaseBrowser(session: Partial<BrowserSession>): Promise<void> {
-  if (session.agent && session.page) await closeSession(session.agent, session.page);
-  await session.agent?.destroy();
-  await session.context?.close();
-  try {
-    await publishLabeledPageVideo(session.page);
-  } catch (error) {
-    console.error('Feishu video publish failed:', error);
-  }
-  await session.browser?.close();
+  await releaseFeishuSession(session, { closeBotSession: true, publishVideo: true });
 }
 
 /**

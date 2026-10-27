@@ -88,6 +88,7 @@ import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-st
 import {
   loadBotConfigAtIndex,
   loadBotConfigs,
+  loadBotConfigsCached,
   isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
@@ -550,7 +551,7 @@ import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-c
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
+import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
 import {
@@ -561,7 +562,7 @@ import { computeInputHash } from './utils/canonical-input-hash.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
 import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
-import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
+import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -4491,14 +4492,18 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   const reply = pickTurnReplyTarget(ds.session, turnId);
   let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;
   let delegationBlocked = false;
+  let delegationRecord: Awaited<ReturnType<typeof dispatchUserForTurn>>;
   try {
-    const delegation = await dispatchUserForTurn(ds, turnId);
+    const delegation = delegationRecord = await dispatchUserForTurn(ds, turnId);
     if (delegation) {
       // Keep a denial tied to the originating task even if contact/membership
       // lookup throws; never turn this back into "ask the peer bot to log in".
       delegatedIdentity = {
         credentialOpenId: delegation.authority.openId, unionId: delegation.authority.unionId,
-        tools: [], dispatchRoot: delegation.rootId,
+        tools: [],
+        // A top-level handoff has no thread; the handoff message itself is
+        // what a refusal report points back at.
+        dispatchRoot: delegation.rootId ?? delegation.messageId ?? turnId,
         denialReason: 'target_access_denied',
       };
       const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
@@ -4511,6 +4516,17 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     delegationBlocked = true;
     if (delegatedIdentity) delegatedIdentity.denialReason = 'target_validation_unavailable';
     logger.warn(`[dispatch-user] identity unavailable for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (delegatedIdentity) {
+    // Receiving side of a signed handoff (botmux dispatch or a --mention
+    // handoff): who this turn's tools will run as, and why if refused.
+    logger.info(
+      `[dispatch-user:audit] receive source=${delegationRecord?.sourceAppId ?? '-'} target=${ds.larkAppId} `
+      + `union=${delegationRecord?.authority.unionId ?? '-'} session=${ds.session.sessionId} turn=${turnId} `
+      + `target_user=${delegatedIdentity.targetOpenId ?? '-'} `
+      + `tools=${delegatedIdentity.tools.join(',') || '-'} root=${delegatedIdentity.dispatchRoot} `
+      + `result=${delegatedIdentity.denialReason ?? 'delegated'}`,
+    );
   }
   await publishTurnCliIdentity({
     botConfig,
@@ -7882,6 +7898,135 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
     }
     return jsonRes(res, 502, { ok: false, error: 'dispatch_delivery_failed', detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Authenticate a session-scoped handoff request the same way the dispatch
+ *  delivery route does: a host IPC caller or the live turn's capability. */
+function authorizeMentionHandoffRequest(req: IncomingMessage, body: any): DaemonSession | undefined {
+  const ds = typeof body?.sessionId === 'string' ? findActiveBySessionId(body.sessionId) : undefined;
+  const verified = authorizeSessionScopedIpc({
+    trustedHost: isTrustedHostIpcRequest(req), sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver, allowReceiver: false,
+    sessionId: typeof body?.sessionId === 'string' ? body.sessionId : '',
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: body?.originCapability,
+    claimedTurnId: body?.originTurnId,
+    claimedDispatchAttempt: body?.originDispatchAttempt,
+  });
+  return verified.ok && ds && ds.larkAppId === selfDaemonLarkAppId ? ds : undefined;
+}
+
+// `botmux send --mention <bot on this machine>` (D2). The CLI writes the
+// message itself, so the signed delegation is made in two steps around that
+// write: prepare registers a pending record (grants nothing; it only lets the
+// receiver wait), bind ties it to the exact message after checking that this
+// bot really posted it into the registered chat/thread. Who the human is comes
+// only from this daemon's live turn; the CLI names target bots, nothing else.
+// Any refusal here leaves the send itself untouched — the handoff simply
+// carries no sender, exactly as before this feature.
+ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
+  let body: any;
+  try { body = await readJsonBody(req, 4096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_handoff_body' }); }
+  const ds = authorizeMentionHandoffRequest(req, body);
+  if (!ds) return jsonRes(res, 403, { ok: false, error: 'dispatch_origin_unproven' });
+  const chatId = body?.chatId;
+  const targetAppIds = body?.targetAppIds;
+  if (typeof chatId !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(chatId)
+    || !Array.isArray(targetAppIds) || targetAppIds.length === 0 || targetAppIds.length > 16
+    || targetAppIds.some((id: unknown) => typeof id !== 'string' || !/^cli_[A-Za-z0-9_-]{1,128}$/.test(id))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_handoff' });
+  }
+  const skip = (reason: string) => jsonRes(res, 200, { ok: true, delegated: false, reason });
+  const bot = getBot(ds.larkAppId).config;
+  if (!delegatesOnMention(bot.triggerUserAuth)) return skip('delegate_on_mention_off');
+  // A handoff carries the sender only inside the chat this turn came from.
+  if (chatId !== ds.chatId) return skip('other_chat');
+  const local = new Set(loadBotConfigsCached().filter(cfg => !cfg.apiOnly).map(cfg => cfg.larkAppId));
+  const targets = [...new Set(targetAppIds as string[])]
+    .filter(appId => appId !== ds.larkAppId && local.has(appId));
+  if (targets.length === 0) return skip('no_local_bot');
+  const turnId = ds.managedTurnOrigin?.turnId;
+  if (!turnId) return skip('no_live_turn');
+  try {
+    const active = ds.activeInteractiveTurn;
+    // Only a person who sent THIS turn directly. A turn that is itself a
+    // delegation, a schedule or a bot-to-bot message has no sender to hand on.
+    const authority = await authorityForDispatch({
+      sourceAppId: ds.larkAppId,
+      caller: ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
+        : active?.turnId === turnId ? active.caller
+          : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
+      tools: bot.triggerUserAuth!.tools,
+      resolveUnionId: resolveUnionIdFromOpenId,
+    });
+    if (!authority) return skip('no_direct_human');
+    if (ds.managedTurnOrigin?.turnId !== turnId) {
+      return jsonRes(res, 409, { ok: false, error: 'dispatch_turn_changed' });
+    }
+    const pending = await registerPendingDispatchUser({
+      dataDir: config.session.dataDir,
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+      payload: {
+        sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
+        chatId, targetAppIds: targets, authority,
+      },
+    });
+    logger.info(
+      `[dispatch-user:audit] mention-prepare source=${ds.larkAppId} targets=${targets.join(',')} `
+      + `union=${authority.unionId} tools=${authority.tools.join(',')} turn=${turnId} chat=${chatId} `
+      + `delivery=${pending.payload.deliveryId}`,
+    );
+    return jsonRes(res, 200, { ok: true, delegated: true, deliveryId: pending.payload.deliveryId, targetAppIds: targets });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    logger.warn(`[dispatch-user:audit] mention-prepare failed source=${ds.larkAppId} chat=${chatId}: ${detail}`);
+    return jsonRes(res, 502, { ok: false, error: 'handoff_prepare_failed', detail });
+  }
+});
+
+ipcRoute('POST', DISPATCH_USER_MENTION_BIND_ROUTE, async (req, res) => {
+  let body: any;
+  try { body = await readJsonBody(req, 4096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_handoff_body' }); }
+  const ds = authorizeMentionHandoffRequest(req, body);
+  if (!ds) return jsonRes(res, 403, { ok: false, error: 'dispatch_origin_unproven' });
+  const deliveryId = body?.deliveryId;
+  const messageId = body?.messageId;
+  if (typeof deliveryId !== 'string' || !/^[0-9a-f-]{36}$/.test(deliveryId)
+    || (messageId !== undefined && (typeof messageId !== 'string' || !/^om_[A-Za-z0-9_-]{1,128}$/.test(messageId)))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_handoff' });
+  }
+  const dataDir = config.session.dataDir;
+  const secret = loadOrCreateDispatchReportBindingSecret(dataDir);
+  const pending = readPendingDispatchUser(dataDir, secret, deliveryId);
+  if (!pending || pending.sourceAppId !== ds.larkAppId || pending.sourceSessionId !== ds.session.sessionId) {
+    return jsonRes(res, 404, { ok: false, error: 'handoff_registration_missing' });
+  }
+  // The send failed (no message id): withdraw the registration.
+  if (!messageId) {
+    await dropPendingDispatchUser(dataDir, deliveryId);
+    return jsonRes(res, 200, { ok: true, bound: false });
+  }
+  try {
+    const detail = await readHandoffMessage(() => getMessageDetail(ds.larkAppId, messageId, { userCardContent: false }));
+    if (!handoffMessageMatches(detail, {
+      messageId, appId: ds.larkAppId, chatId: pending.chatId, issuedAt: pending.issuedAt,
+    })) {
+      await dropPendingDispatchUser(dataDir, deliveryId);
+      logger.warn(`[dispatch-user:audit] mention-bind refused source=${ds.larkAppId} message=${messageId} delivery=${deliveryId}: not this bot's handoff message`);
+      return jsonRes(res, 403, { ok: false, error: 'handoff_message_mismatch' });
+    }
+    await bindPendingDispatchUser({ dataDir, secret, deliveryId, messageId });
+    logger.info(
+      `[dispatch-user:audit] mention-bind source=${ds.larkAppId} targets=${pending.targetAppIds.join(',')} `
+      + `union=${pending.authority.unionId} turn=${pending.sourceTurnId} message=${messageId} delivery=${deliveryId}`,
+    );
+    return jsonRes(res, 200, { ok: true, bound: true });
+  } catch (error) {
+    await dropPendingDispatchUser(dataDir, deliveryId).catch(() => {});
+    return jsonRes(res, 502, { ok: false, error: 'handoff_bind_failed', detail: error instanceof Error ? error.message : String(error) });
   }
 });
 

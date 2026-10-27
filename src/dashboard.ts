@@ -8126,9 +8126,6 @@ listenWithProbe({
 
 // Federation: periodically push this deployment's bots + heartbeat to every hub
 // it has joined (best-effort; no-op when not federated). Keeps remote rosters fresh.
-// resilience-audit-allow: opt-in heartbeat only fires after joining a team;
-// permanent hub failure is surfaced on the team page (red "连接失败" pill),
-// not a silently-degraded mandatory capability.
 const federationSync = setInterval(() => {
   // sessionsProvider：顺带把本部署在各团队协作群里的会话裁剪行上报给团队 host
   // （hub 在 sync 响应里下发协作群清单，详见 syncAllMemberships）。
