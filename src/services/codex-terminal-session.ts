@@ -12,6 +12,17 @@ type Resolution =
 const bindings = new WeakMap<PtyHandle, { pid: number; sessionId: string }>();
 const pending = new WeakMap<PtyHandle, Promise<Resolution>>();
 
+/** Called only after an exact history match containing this write's random
+ * marker. Pin the proof to the submitting backend and its original process;
+ * a delayed receipt from a replaced process must not bind its successor. */
+export function bindCodexSessionFromCorrelatedInput(
+  terminal: PtyHandle, pid: number, sessionId: string,
+): boolean {
+  if (terminal.cliPid !== pid) return false;
+  bindings.set(terminal, { pid, sessionId: sessionId.toLowerCase() });
+  return true;
+}
+
 export function codexTerminalSessionIsBound(terminal: PtyHandle, sessionId: string): boolean {
   const binding = bindings.get(terminal);
   return binding !== undefined && binding.pid === terminal.cliPid

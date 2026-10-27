@@ -25879,6 +25879,23 @@ async function handleBotAdded(
     let groupJoinSender: ResolvedSender | undefined;
     let groupJoinTrustedCaller: TrustedCaller | undefined;
     let groupJoinGateMatched = false;
+    // bot.added carries an operator id, not a platform sender_type. Read bot/app
+    // evidence before any owner or turn-sender write: a known peer, or an
+    // identity-cache entry already typed app/bot, must not be recorded as the
+    // human who opened the session. A cache miss is not evidence either way, so
+    // an unknown operator keeps the existing human registration. This read does
+    // not call resolveSender — an undefined senderType would write "user" into
+    // the cache and manufacture the evidence we are refusing to invent.
+    const cachedOperator = operatorOpenId ? getIdentity(larkAppId, operatorOpenId) : undefined;
+    const operatorIsBot: true | undefined = operatorOpenId
+      && (isKnownPeerBot(config.session.dataDir, larkAppId, operatorOpenId)
+        || cachedOperator?.type === 'bot' || cachedOperator?.type === 'app')
+      ? true : undefined;
+    // App/bot operators get no human owner. trustedSessionController stamps
+    // every owner as senderType=user; leaving the field unset is what keeps
+    // that stamp off. lastCallerOpenId is the quote-chain caller for provenance
+    // and must not name the app either.
+    const humanOperatorOpenId = operatorIsBot ? undefined : operatorOpenId;
     if (!forced) {
       const groupJoinGate = await evaluatePromptGate('chat.bot_added', {
         larkAppId,
@@ -25912,14 +25929,9 @@ async function handleBotAdded(
       // contract). When gateRequired is true this branch is reached only after
       // a matching sync hook allowed, so gateMatched is necessarily true here.
       if (botCfg.autoStartOnGroupJoinGateRequired === true) {
-        // bot.added supplies an operator ID, not a platform sender_type. Read
-        // independent bot evidence before resolving any display name: even an
-        // undefined senderType makes resolveSender write "user" into the cache.
-        const cachedOperator = operatorOpenId ? getIdentity(larkAppId, operatorOpenId) : undefined;
-        const operatorIsBot: true | undefined = operatorOpenId
-          && (isKnownPeerBot(config.session.dataDir, larkAppId, operatorOpenId)
-            || cachedOperator?.type === 'bot' || cachedOperator?.type === 'app')
-          ? true : undefined;
+        // Display-name lookup stays inside the opt-in gate. resolveSender is
+        // only called once operatorIsBot is already true, and with senderType
+        // 'app', so it cannot write a human into the identity cache.
         if (operatorOpenId) {
           let name = cachedOperator?.name;
           if (operatorIsBot) {
@@ -25936,9 +25948,8 @@ async function handleBotAdded(
         }
         // Without bot evidence, caller deliberately has no senderType; it cannot
         // match a later platform-authenticated user via sameTrustedPrincipal.
-        // Owner continuity instead relies on trustedSessionController's separate
-        // user-typed owner, even for app operators. Turn privileges read caller,
-        // not controller; tightening the latter also requires migrating owner checks.
+        // A known app/bot is not the session owner, so there is no user-typed
+        // controller to confuse with this caller. Turn privileges read caller.
         groupJoinTrustedCaller = groupJoinSender?.openId === operatorOpenId
           ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, operatorIsBot)
           : undefined;
@@ -25996,8 +26007,8 @@ async function handleBotAdded(
     const session = sessionStore.createSession(chatId, anchor, title, chatType);
     const now = Date.now();
     session.larkAppId = larkAppId;
-    session.ownerOpenId = operatorOpenId;
-    session.lastCallerOpenId = operatorOpenId;
+    session.ownerOpenId = humanOperatorOpenId;
+    session.lastCallerOpenId = humanOperatorOpenId;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
     if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
@@ -26035,7 +26046,7 @@ async function handleBotAdded(
       } : {}),
       pendingSender: groupJoinSender,
       pendingTrustedCaller: groupJoinTrustedCaller,
-      ownerOpenId: operatorOpenId,
+      ownerOpenId: humanOperatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
       // 非 shared 路径的首轮 turn 身份（joinTurnId）；shared 路径由
@@ -26125,18 +26136,17 @@ async function handleBotAdded(
       sharedReplyRootId = undefined;
       void deleteMessage(larkAppId, messageId);
     };
-    // 首轮无真人入站消息，但 bot.added 事件本身携带操作人：把拉 bot 入群的
-    // 人登记为本轮 sender，schedule 等需要当前轮真人身份的命令（创建/管理
-    // 定时任务）据此归属到操作人，与 session.ownerOpenId 一致。
-    // isBot:false 是对 bot.added 操作人的直接断言（事件语义上操作人即拉群的
-    // 真人），不是身份解析结果；下游 schedule 管理路由还有 dashboard 管理员
-    // 名单硬门兜底。
-    // participantsIncomplete 让 --mention-back 保持既有安全方向（窗口不完整 →
-    // 要求显式 @），这条登记不改变回复时的 @ 行为。
-    const joinTurnSenderOpts = operatorOpenId
+    // 首轮无真人入站消息。没有应用/机器人证据时，仍把拉 bot 入群的操作人登记
+    // 为本轮 sender，schedule 等需要当前轮真人身份的命令据此归属，与
+    // session.ownerOpenId 一致。isBot:false 只覆盖「没有 bot/app 证据」的
+    // 操作人；已知 peer、或身份缓存已是 app/bot 的操作人走 humanOperatorOpenId
+    // 的空登记，避免 registryEntryProvesHumanSender 在回合结束后把机器人恢复
+    // 成真人发起人。participantsIncomplete 让 --mention-back 保持既有安全方向
+    // （窗口不完整 → 要求显式 @），这条登记不改变回复时的 @ 行为。
+    const joinTurnSenderOpts = humanOperatorOpenId
       ? {
-          senderOpenId: operatorOpenId,
-          participants: [{ openId: operatorOpenId, isBot: false }],
+          senderOpenId: humanOperatorOpenId,
+          participants: [{ openId: humanOperatorOpenId, isBot: false }],
           participantsIncomplete: true,
         }
       : {};
@@ -26220,7 +26230,7 @@ async function handleBotAdded(
       }
       ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
       armSharedReplyTarget();
-      startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title, prompt: promptBody, operatorOpenId });
+      startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title, prompt: promptBody, operatorOpenId: humanOperatorOpenId });
       return;
     }
 
@@ -28059,10 +28069,9 @@ async function handleThreadReplyAdmitted(
   // byte-for-byte the pre-#1348 shape. The worker reads the same switch, so a
   // message that is not diverted here is also not rejected there.
   // A join caller without senderType differs from a later authenticated user.
-  // The independent user-typed owner controller preserves that owner's continuity;
-  // if trustedSessionController is tightened, migrate this owner check with it.
-  // App operators retain the existing user-typed owner limitation: later bot
-  // messages do not match it, while downstream owner handling still takes user branches.
+  // The owner controller is user-typed only when join recorded a human operator.
+  // A known app/bot operator is not an owner, so it has no user-typed controller
+  // for a later bot message to miss, and owner handling does not take the user branch.
   const activePrincipalTurn = ds.activeInteractiveTurn;
   if (config.crossPrincipalInterruption
     && activePrincipalTurn

@@ -684,6 +684,37 @@ describe('TmuxPipeBackend remain-on-exit failed vs tmux version (v3.53.0 regress
       expect(hasFailedChain()).toBe(true);    // modern tmux → chain enabled
     } finally { be.kill(); }
   });
+
+  // createDetachedSession resolves the version once and applySessionOptions()
+  // runs at its end: the reapply MUST reuse that resolution. A second boundary
+  // resolve re-forces a `tmux -V` even inside the null TTL (the resolver
+  // refreshes on ANY null), so an unreadable tmux would pay the 3s probe
+  // timeout twice per session creation (~6s -> ~9s worst case) for a decision
+  // that is already known. One session = one boundary resolution.
+  it('resolves tmux -V exactly once per session creation when the probe stays unreadable', () => {
+    resetTmuxVersionCacheForTests();
+    let vCalls = 0;
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (args[0] === '-V') {
+        vCalls += 1;
+        throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+      }
+      if (args[0] === 'new-session') return '1234 $7 5678';
+      return '';
+    }) as typeof execFileSync);
+    // Prime a recent null (the shape a failed gate/self-check leaves behind).
+    expect(getTmuxVersionCached()).toBeNull();
+    expect(vCalls).toBe(1);
+
+    const be = new TmuxPipeBackend('bmx-roe-create-unreadable', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], spawnOpts())).not.toThrow();
+      // prime(1) + the single boundary resolve's forced re-probe(2); the
+      // end-of-creation option reapply must not resolve a third time.
+      expect(vCalls).toBe(2);
+      expect(hasFailedChain()).toBe(false);
+    } finally { be.kill(); }
+  });
 });
 
 // tmux parses commands and option values in the SERVER. After a package upgrade
@@ -1840,6 +1871,80 @@ describe('TmuxPipeBackend send failure handling', () => {
     expect(() => be.pasteText('hello')).not.toThrow();
     expect(exits).toEqual([[1, null]]);
   });
+
+  // handlePaneExit reap gate (#2408): the three-way verdict decides whether
+  // killDeadPaneRemnant runs. The pure resolvePaneDeath tests pin the verdict;
+  // these cases pin the WIRING — which verdicts actually issue kill-session.
+  // Entry is guardedSend (a paste whose pane probes authoritatively missing),
+  // no extra test seam is opened: handlePaneExit stays private.
+  const runReapCase = (opts: { owns: boolean; deathAnswer: string | 'unreadable' }) => {
+    const be = new TmuxPipeBackend('bmx-reap', { ownsSession: opts.owns });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((c, s) => exits.push([c, s]));
+    be.spawn('', [], spawnOpts());
+
+    const deathReads: number[] = [];
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      const a = Array.isArray(args) ? (args as string[]) : [];
+      if (a.includes('load-buffer') || a.includes('paste-buffer')) {
+        throw Object.assign(new Error('gone'), {
+          status: 1, signal: null, stderr: Buffer.from("can't find pane: bmx-reap"),
+        });
+      }
+      // The death probe is the display-message whose format carries the
+      // STATUS field; the liveness probe's bare '#{pane_dead}' and pane_id
+      // probes must be answered separately (mock split by args).
+      if (a.includes('display-message') && a.some(f => String(f).includes('#{pane_dead_status}'))) {
+        deathReads.push(Date.now());
+        if (opts.deathAnswer === 'unreadable') throw new Error('tmux client timeout');
+        return Buffer.from(opts.deathAnswer as string) as any;
+      }
+      // pane_id answers empty -> probePaneAddressability: 'empty pane id'
+      // -> authoritative missing; kill-session answers success.
+      return '' as any;
+    }) as typeof execFileSync);
+    mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+    expect(() => be.pasteText('x')).not.toThrow();
+    const killCalls = mockedExecFileSync.mock.calls
+      .filter(([, a]) => (a as string[]).includes('kill-session'));
+    return { exits, killCalls, deathReads };
+  };
+
+  it('handlePaneExit reaps the remnant ONCE when death is confirmed with a real code (77)', () => {
+    const { exits, killCalls, deathReads } = runReapCase({ owns: true, deathAnswer: '1:77' });
+    expect(killCalls).toHaveLength(1); // #2408 corpse would otherwise leak here
+    expect(exits).toEqual([[77, null]]);
+    expect(deathReads).toHaveLength(1); // a coded death is adopted without re-reads
+  });
+
+  it('handlePaneExit reaps ONCE after the bounded re-reads all stay unreadable (unknown)', () => {
+    const { exits, killCalls, deathReads } = runReapCase({ owns: true, deathAnswer: 'unreadable' });
+    expect(killCalls).toHaveLength(1); // unknown still reaps: the pane was already authoritatively missing
+    expect(exits).toEqual([[1, null]]); // no real code readable -> historic sentinel
+    expect(deathReads.length).toBeGreaterThan(1); // retried instead of giving up on the first unreadable read
+  });
+
+  it('handlePaneExit does NOT kill a pane tmux explicitly answers alive (defense-in-depth)', () => {
+    // No production path today lets an owned pane reach handlePaneExit while
+    // tmux answers '0:' (every caller already holds an authoritative missing);
+    // the real "CLI gone but pane alive" shape is an adopted CLI-pid ESRCH,
+    // whose backend has ownsSession=false and reaps nothing below. This case
+    // pins the guard itself: an explicit alive answer must never be killed.
+    const { exits, killCalls, deathReads } = runReapCase({ owns: true, deathAnswer: '0:' });
+    expect(killCalls).toHaveLength(0);
+    expect(exits).toEqual([[1, null]]); // teardown still proceeds with the fallback code
+    expect(deathReads).toHaveLength(1);
+  });
+
+  it('handlePaneExit never kill-sessions an adopted (user-owned) pane, even confirmed dead', () => {
+    // The adopt counterpart of the managed reap: the pane belongs to the
+    // user, botmux only observes it. Confirmed death still fires the exit,
+    // the kill-session guard must hold.
+    const { exits, killCalls } = runReapCase({ owns: false, deathAnswer: '1:77' });
+    expect(killCalls).toHaveLength(0);
+    expect(exits).toEqual([[77, null]]);
+  });
 });
 
 describe('TmuxPipeBackend.kill', () => {
@@ -2200,5 +2305,58 @@ describe('TmuxPipeBackend tmux version gating', () => {
       Array.isArray(args) && (args[0] === 'resize-window' || args[0] === 'resize-pane')
     ));
     expect(resizeCalls).toEqual([]);
+  });
+});
+
+// The reattach reapply of `remain-on-exit failed` (#2164, backfilled onto
+// sessions an older build created) must follow the SAME tmux >= 3.2 gate as
+// the new-session chain (#2418 regression). A pre-3.2 tmux rejects the value,
+// and a gate in the opposite direction (never reapplying) would silently lose
+// the crash exit-code channel on supported hosts — so both directions need an
+// assertion. The reattach path never builds a new-session argv, which is why
+// these assert on the string-form execSync calls, not newSessionArgs().
+describe('reattach remain-on-exit reapply vs tmux version', () => {
+  const roeReapplyCalls = (): string[] => mockedExecSync.mock.calls
+    .map(c => String(c[0]))
+    .filter(cmd => cmd.includes('set-option') && cmd.includes('remain-on-exit'));
+
+  it('skips the reattach remain-on-exit reapply on tmux 3.1c', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.1c\n' as any;
+      return '' as any;
+    }) as any);
+    const be = new TmuxPipeBackend('bmx-reattach-roe-old', { ownsSession: true, isReattach: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(roeReapplyCalls()).toEqual([]);
+  });
+
+  it('reapplies remain-on-exit failed on a reattach when tmux supports it (3.3a)', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.3a\n' as any;
+      return '' as any;
+    }) as any);
+    const be = new TmuxPipeBackend('bmx-reattach-roe-new', { ownsSession: true, isReattach: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(roeReapplyCalls().length).toBe(1);
+  });
+
+  it('re-probes tmux -V once at the reattach boundary after a cached null, then reapplies', () => {
+    resetTmuxVersionCacheForTests();
+    let vCalls = 0;
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') {
+        vCalls += 1;
+        if (vCalls === 1) throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+        return 'tmux 3.3a\n' as any;
+      }
+      return '' as any;
+    }) as any);
+    // A failed gate probe left a null inside the short TTL.
+    expect(getTmuxVersionCached()).toBeNull();
+    expect(vCalls).toBe(1);
+    const be = new TmuxPipeBackend('bmx-reattach-roe-reprobe', { ownsSession: true, isReattach: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(vCalls).toBe(2);
+    expect(roeReapplyCalls().length).toBe(1);
   });
 });

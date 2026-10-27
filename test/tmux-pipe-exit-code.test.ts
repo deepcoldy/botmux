@@ -175,7 +175,17 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
   let dir: string;
   let socket: string;
   const saved: Record<string, string | undefined> = {};
-  const tmux = (...args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+  // Per-call ceiling. Read-count bounding below answers "how many reads still
+  // saw nothing", but a single hung call blocks synchronously and never
+  // reaches the counter — without a spawnSync timeout one stuck display-message
+  // (or the two new-session setups in beforeEach) eats the whole 30s hook
+  // budget and the failure surfaces as the harder-to-read "Hook timed out".
+  // A normal tmux client answers in milliseconds; 5s only bites on a starved
+  // shard, and a timed-out call returns status=null, which the read loop below
+  // treats like resolvePaneDeath's `unknown` and retries.
+  const TMUX_CALL_TIMEOUT_MS = 5_000;
+  const tmux = (...args: string[]) =>
+    spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8', timeout: TMUX_CALL_TIMEOUT_MS });
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'tmux-corpse-'));
@@ -228,17 +238,42 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
    * must fail loudly rather than be accepted. Signal death, which legitimately
    * has no status, is covered by the other describe's `kill -9 $$` test.
    */
+  // REDUCES, does not eliminate, the starvation flake: read-count bounding is
+  // immune to the worker being descheduled (wall-clock keeps running during a
+  // stall, reads do not happen), but a shard starved hard enough that tmux
+  // spawns and the lifecycle watcher barely run still fails other ways — under
+  // a controlled 4-core / 12×yes load, both this version and the old wall-clock
+  // one went 7/8 green across 8 rounds each, and one round also failed the
+  // unrelated `forwards 77` production-path case. That residual is tracked in
+  // #2408, not here.
+  //
+  // BOUND BY READ COUNT, NOT WALL CLOCK. An absolute ~10s deadline lost a
+  // perfectly good `1:77` on a scheduler-starved shard: when the worker
+  // process isn't scheduled for >10s, the first display-message it gets to run
+  // AFTER the pause already reads `1:77` (tmux latches death server-side), but
+  // the wall clock had expired so the fixture rejected it (~1/9 under a
+  // 4-core / heavy load). tmux publishes status within ~500ms of death on a
+  // healthy server, so "N reads still see no status" is the meaningful failure
+  // signal regardless of how starvation stretches wall-time; under load the
+  // reads space themselves out. Measured wall-time of 240 reads under the same
+  // 4-core / 12×yes load: 13.8–14.5s nominal (vs ~6s unloaded) — plus the two
+  // new-session calls in beforeEach (each capped at TMUX_CALL_TIMEOUT_MS), so
+  // the 30s hook timeout stays the backstop with about half its headroom even
+  // starved. The vitest hook timeout (30s) is the absolute floor.
+  const DEAD_PANE_POLL_INTERVAL_MS = 25;
+  const DEAD_PANE_MAX_READS = 240; // ~6s nominal 25ms polling; far more wall-time under starvation
   const waitForDeadPane = async (name: string): Promise<{ dead: boolean; status: string }> => {
-    const deadline = Date.now() + 10_000;
-    for (;;) {
+    let last = { dead: false, status: '' };
+    for (let reads = 0; reads < DEAD_PANE_MAX_READS; reads += 1) {
       const out = tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}');
       const text = String(out.stdout ?? '').trim();
       const [dead, status] = text.split(':');
       const value = status ?? '';
+      last = { dead: dead === '1', status: value };
       if (dead === '1' && value !== '') return { dead: true, status: value };
-      if (Date.now() > deadline) return { dead: dead === '1', status: value };
-      await new Promise(r => setTimeout(r, 25));
+      await new Promise(r => setTimeout(r, DEAD_PANE_POLL_INTERVAL_MS));
     }
+    return last;
   };
 
   // 前提本身也要钉住，否则下面两条断言可能因为尸体早被回收而假绿。

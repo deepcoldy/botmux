@@ -82,6 +82,10 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Owned, prompt-injected Codex input may carry a fresh correlation marker.
+   * An exact post-write history match then proves ownership even when the OS
+   * sandbox prevents reading the CLI's open rollout file descriptors. */
+  correlateTranscript?: true;
   trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
