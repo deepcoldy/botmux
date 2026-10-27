@@ -13,6 +13,7 @@ import {
   parseTmuxVersion,
   tmuxSupportsRemainOnExitFailed,
   resolveTmuxVersionAtSessionBoundary,
+  serverTmuxVersion,
   getTmuxVersionCached,
   resetTmuxVersionCacheForTests,
   TMUX_REMAIN_ON_EXIT_FAILED,
@@ -207,5 +208,53 @@ describe('resolveTmuxVersionAtSessionBoundary', () => {
     });
     expect(getTmuxVersionCached()).toBeNull();
     expect(resolveTmuxVersionAtSessionBoundary()).toBeNull();
+  });
+});
+
+// The running SERVER parses commands and option values; the client binary on
+// PATH can be newer after an upgrade. serverTmuxVersion asks the server on the
+// given socket and only falls back to the client when no server answers (a
+// non-session command never starts one) or its answer is unparsable.
+describe('serverTmuxVersion', () => {
+  const emulate = (client: string | null, server: string | 'THROW' | 'GARBAGE') => {
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === '-V') {
+        if (client === null) throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+        return `${client}\n` as any;
+      }
+      if (Array.isArray(args) && args.includes('display-message')) {
+        if (server === 'THROW') throw Object.assign(new Error('no server'), { status: 1 });
+        if (server === 'GARBAGE') return 'no version here\n' as any;
+        return `${server}\n` as any;
+      }
+      return '' as any;
+    }) as typeof execFileSync);
+  };
+
+  it('trusts the running server over a newer client binary', () => {
+    emulate('tmux 3.5a', '3.1c');
+    expect(serverTmuxVersion(['-L', 'botmux'], { major: 3, minor: 5 })).toEqual({ major: 3, minor: 1 });
+  });
+
+  it('falls back to the client version when no server is on the socket (cold start)', () => {
+    emulate('tmux 3.3a', 'THROW');
+    expect(serverTmuxVersion([], { major: 3, minor: 3 })).toEqual({ major: 3, minor: 3 });
+  });
+
+  it('falls back to the client version on an unparsable server answer', () => {
+    emulate('tmux 3.4', 'GARBAGE');
+    expect(serverTmuxVersion([], { major: 3, minor: 4 })).toEqual({ major: 3, minor: 4 });
+  });
+
+  it('keeps null when neither server nor client can give a version', () => {
+    emulate(null, 'THROW');
+    expect(serverTmuxVersion([], null)).toBeNull();
+  });
+
+  it('sends the probe to the given socket, never the default server', () => {
+    emulate('tmux 3.5a', '3.5a');
+    serverTmuxVersion(['-L', 'botmux'], { major: 3, minor: 5 });
+    const probe = mockedExecFileSync.mock.calls.find(([, a]) => Array.isArray(a) && a.includes('#{version}'));
+    expect(probe?.[1].slice(0, 2)).toEqual(['-L', 'botmux']);
   });
 });

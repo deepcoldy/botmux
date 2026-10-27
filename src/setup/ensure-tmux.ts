@@ -216,6 +216,33 @@ export function resolveTmuxVersionAtSessionBoundary(): TmuxVersion | null {
 }
 
 /**
+ * Version of the tmux SERVER currently answering `socketArgs` (`[]` = the
+ * default server), as reported by `display-message -p '#{version}'`. Commands
+ * and option values are parsed by that server, which can be older than the
+ * `tmux` binary on PATH: a package upgrade leaves the shared server running the
+ * old process until it restarts (a daemon restart only reattaches).
+ *
+ * When no server is running on the socket, the command FAILS rather than
+ * starting one (non-new-session commands carry an implicit -N since tmux 2.5);
+ * the next server is spawned from this client binary, so the caller-supplied
+ * client version stands in that case — as it does on an unparsable answer or a
+ * bounded probe failure. Never throws.
+ */
+export function serverTmuxVersion(socketArgs: readonly string[], clientVersion: TmuxVersion | null): TmuxVersion | null {
+  try {
+    const out = execFileSync('tmux', [...socketArgs, 'display-message', '-p', '#{version}'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+      env: tmuxEnv(),
+    });
+    return parseTmuxVersion(String(out ?? '')) ?? clientVersion;
+  } catch {
+    return clientVersion;
+  }
+}
+
+/**
  * Child-process budgets for the worker-gate capability probe.
  *
  * These are fork+exec budgets, not tmux-work budgets: `tmux -V` answers in

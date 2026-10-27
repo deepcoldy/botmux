@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
-import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast, tmuxSupportsRemainOnExitFailed, resolveTmuxVersionAtSessionBoundary, parseTmuxVersion } from '../../setup/ensure-tmux.js';
+import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast, tmuxSupportsRemainOnExitFailed, resolveTmuxVersionAtSessionBoundary, serverTmuxVersion } from '../../setup/ensure-tmux.js';
 import type { TmuxVersion } from '../../setup/ensure-tmux.js';
 import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
 import { inheritBotEnv } from '../../core/env-policy.js';
@@ -109,20 +109,6 @@ export interface PipePaneDeathEvidence {
 const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
 const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
 
-/** Commands and option values are parsed by the tmux SERVER, which can be older
- *  than the `tmux` on PATH: an upgraded binary leaves the running server on the
- *  old one until it restarts. With no server on the socket the next one is
- *  spawned from this client binary, so the client version stands. */
-function serverTmuxVersion(socketArgs: readonly string[], clientVersion: TmuxVersion | null): TmuxVersion | null {
-  try {
-    const out = execFileSync('tmux', [...socketArgs, 'display-message', '-p', '#{version}'], {
-      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, env: tmuxEnv(),
-    });
-    return parseTmuxVersion(String(out ?? '')) ?? clientVersion;
-  } catch {
-    return clientVersion;
-  }
-}
 /** After #{pane_dead} flips, #{pane_dead_status} is populated a beat later
  *  (`1:` → `1:77` observed on tmux 3.3a; the gap widens under a loaded server).
  *  The teardown read polls that long at most for the real status. */
@@ -1657,14 +1643,16 @@ export class TmuxPipeBackend implements SessionBackend {
    * Apply idempotent per-session tmux options.
    *
    * `version` is the boundary resolution the caller already paid for: the
-   * fresh-creation path passes the createDetachedSession() result so the whole
-   * creation is ONE boundary resolution (a second resolve would force another
-   * `tmux -V` even inside the null TTL — on a host whose `-V` hangs that is an
-   * extra 3s per session start, for a decision already made). The reattach
-   * path (spawn() backfilling options onto a session an older build created)
-   * has no prior resolution, so it omits the argument and resolves here once.
+   * fresh-creation path passes the createDetachedSession() result (already
+   * server-aware) so the whole creation probes the running server ONCE — a
+   * second probe would add another up-to-2s wait whenever that server is
+   * unreachable, for a decision already made. The reattach path (spawn()
+   * backfilling options onto a session an older build created) has no prior
+   * resolution, so it omits the argument and asks the server once here.
    */
-  private applySessionOptions(version: TmuxVersion | null = resolveTmuxVersionAtSessionBoundary()): void {
+  private applySessionOptions(
+    version: TmuxVersion | null = serverTmuxVersion(this.tmuxArgs, resolveTmuxVersionAtSessionBoundary()),
+  ): void {
     const t = shellescape(this.paneTarget);
     const env = tmuxEnv();
     try {
@@ -1695,7 +1683,10 @@ export class TmuxPipeBackend implements SessionBackend {
       // REATTACHED session: one created by an older build has none yet, and it
       // must be in place before the CLI can die. Idempotent. Skipped on
       // tmux < 3.2, where the value is rejected (see supportsRemainOnExitFailed).
-      if (tmuxSupportsRemainOnExitFailed(serverTmuxVersion(this.tmuxArgs, version))) {
+      // `version` already reflects the RUNNING server (resolved by the caller
+      // or by the default above): the binary on PATH can be newer than the
+      // server still answering this socket.
+      if (tmuxSupportsRemainOnExitFailed(version)) {
         execSync(`${this.tmuxCmd} set-option -t ${t} remain-on-exit failed`, { stdio: 'ignore', env, timeout: 5000 });
       }
     } catch { /* session may not be ready yet — benign */ }
