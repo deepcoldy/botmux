@@ -9,6 +9,7 @@ import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as preconditionStore from '../src/services/schedule-precondition-store.js';
 import { createTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
+import { executeScheduledTaskWithPrecondition } from '../src/services/schedule-precondition-gate.js';
 
 const APP = 'cli_authority';
 let dataDir: string;
@@ -151,6 +152,33 @@ describe('scheduler host authority integration', () => {
         .toMatch(/fire input/);
       rmSync(dir, { recursive: true });
       expect(scheduler.scheduledWorkingDirSwapReason(task)).toMatch(/\(missing\)/);
+    });
+
+    it.each([
+      ['inline', { kind: 'inline', script: 'test -f package.json' }],
+      ['file', { kind: 'file', path: 'guard.sh' }],
+    ] as const)('refuses a swapped task before its %s precondition reads or runs anything', async (_kind, source) => {
+      const dir = realDir(`pre-${_kind}/sub`);
+      const task = scheduler.addTask({ ...params, id: `pre${_kind.slice(0, 5)}`.padEnd(8, '0'), workingDir: dir }, turn);
+      const gate = () => {
+        const deps = {
+          resolve: vi.fn(() => ({ kind: 'configured', enabled: true, source }) as never),
+          readFile: vi.fn(() => 'exit 0'),
+          run: vi.fn(async () => ({ decision: 'run' }) as never),
+        };
+        const execute = vi.fn(async () => undefined);
+        return { deps, execute, go: () => executeScheduledTaskWithPrecondition(task, APP, execute, deps) };
+      };
+      const ok = gate();
+      await ok.go();
+      expect(ok.deps.run).toHaveBeenCalledOnce();
+      swap(dir, realDir(`planted-${_kind}`));
+      const refused = gate();
+      await expect(refused.go()).rejects.toThrow(/schedule_working_dir_swapped/);
+      expect(refused.deps.resolve).not.toHaveBeenCalled();
+      expect(refused.deps.readFile).not.toHaveBeenCalled();
+      expect(refused.deps.run).not.toHaveBeenCalled();
+      expect(refused.execute).not.toHaveBeenCalled();
     });
 
     it('never re-checks host-created or legacy tasks, even at a symlinked path', () => {
