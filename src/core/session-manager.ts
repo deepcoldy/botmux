@@ -1,3 +1,5 @@
+import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
+import { canTalk } from '../im/lark/event-dispatcher.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { renderStewardHintBlock } from './decision-board/model.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
@@ -97,7 +99,7 @@ import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
-import { beginReplyTargetTurn } from './reply-target.js';
+import { beginReplyTargetTurn, pickTurnReplyTarget } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
   hasScheduleTopicTitleRuntimeTemplate,
@@ -3481,6 +3483,10 @@ export async function restoreActiveSessions(
         toReattach.push(ds);
         continue;
       }
+      if (deploymentContinuationCandidate(ds.session)) {
+        toReattach.push(ds);
+        continue;
+      }
       // A missing backing pane is NEVER an auto-close trigger for a managed
       // session. Whatever wiped the pane — a host reboot (whole multiplexer
       // server gone, every pane at once), the idle-worker sweeper reclaiming
@@ -3577,7 +3583,33 @@ export async function restoreActiveSessions(
           }
         : true;
       if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, { reattachLiveBackend: true });
-      else forkWorker(ds, prompt, resume);
+      else {
+        const candidate = deploymentContinuationCandidate(ds.session);
+        if (candidate && !recoverExactNonCodex) {
+          const caller = candidate.caller;
+          if (!canTalk(ds.larkAppId, ds.chatId, caller.requestUserOpenId, undefined,
+            caller.requestUserUnionId, ds.chatType)) return;
+          const claimed = claimDeploymentContinuation(ds.session, candidate,
+            previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+          if (!claimed) return;
+          ds.currentReplyTarget = { rootMessageId: pickTurnReplyTarget(ds.session, claimed.turnId)?.rootMessageId ?? ds.session.rootMessageId,
+            turnId: claimed.turnId, updatedAt: new Date().toISOString() };
+          ds.session.currentReplyTarget = { ...ds.currentReplyTarget };
+          let ipcAttempted = false;
+          const releaseUndispatchedClaim = () => {
+            if (!ipcAttempted && deploymentContinuationClaimCurrent(ds.session, claimed)) {
+              setDeploymentContinuation(ds.session, { ...claimed, state: 'running' },
+                previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+            }
+          };
+          try {
+            forkWorker(ds, '', { resume: true, onIpcDispatchAttempted: () => { ipcAttempted = true; } }, {
+              deploymentContinuation: claimed,
+              onAdmission: admission => { if (admission === 'rejected') releaseUndispatchedClaim(); },
+            });
+          } catch (error) { releaseUndispatchedClaim(); throw error; }
+        } else forkWorker(ds, prompt, resume);
+      }
     },
     RECOVERY_FORK_BATCH_SIZE,
     RECOVERY_FORK_DELAY_MS,

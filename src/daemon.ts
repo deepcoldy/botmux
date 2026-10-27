@@ -1,3 +1,4 @@
+import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
 import { createBotAdminUnionsPublisher } from './services/bot-admin-unions-store.js';
@@ -31083,6 +31084,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         return;
       }
       try {
+        const restored = ds.session.deploymentContinuation;
+        const caller = restored?.state === 'claimed' && restored.turnId === receipt.turnId
+          ? restored.caller : failedTurnCaller(ds, receipt.turnId);
+        const recorded = recordDeploymentContinuation(ds.session, receipt, {
+          caller, currentTurnId: ds.currentReplyTarget?.turnId,
+          workerGeneration: context.workerGeneration, rpc: ds.initConfig?.codexRpcInput === true,
+        }, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+        if (recorded && caller && restored?.state === 'claimed'
+          && ds.activeInteractiveTurn?.turnId !== receipt.turnId) {
+          setActiveInteractiveTurn(ds, receipt.turnId, { ...caller, source: 'failed_turn_recovery' });
+        }
+      } catch (error) {
+        logger.error(`[restart] Native task checkpoint could not be persisted: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      try {
         const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
         confirmNativeGroupContextInput({ appId: ds.larkAppId, chatId: ds.chatId, turnId: receipt.turnId,
           sessionId: ds.session.sessionId, nativeSessionId: receipt.nativeSessionId ?? knownNative, cliId,
@@ -31091,6 +31107,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
     async onTurnTerminal(ds, terminal, context) {
+      if (ds.session.deploymentContinuation?.state !== 'cancelled'
+        && ds.session.deploymentContinuation?.workerGeneration === context.workerGeneration) {
+        try { cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous), terminal.turnId); }
+        catch (error) { logger.error(`[restart] Could not retire task checkpoint: ${error instanceof Error ? error.message : String(error)}`); }
+      }
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
       // Queue ACKs do not prove consumption. Only a matching completed native
