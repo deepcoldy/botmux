@@ -99,6 +99,31 @@ describe('tmux servers', () => {
     });
   });
 
+  it('drops records whose names contain spaces or tabs instead of appending them to the previous variable', () => {
+    // tmux set-environment accepts these names; their values must not show up
+    // unmasked inside an ordinary variable.
+    const raw = [
+      'AAAA=harmless-value',
+      'AAAA B=sk-live-SPACENAME-abcdef',
+      'BBBB=harmless-b',
+      'BBBB\tC=sk-live-TABNAME',
+      'CCCC=harmless-c',
+      '-CCCC D',
+      '',
+    ].join('\n');
+
+    expect(parseTmuxShowEnvironmentOutput(raw)).toEqual({
+      AAAA: 'harmless-value',
+      BBBB: 'harmless-b',
+      CCCC: 'harmless-c',
+    });
+  });
+
+  it('joins an indented continuation line without "=" but cuts the value at one with "="', () => {
+    expect(parseTmuxShowEnvironmentOutput('JSONIND=a\n  "k": 1,\nb\n')).toEqual({ JSONIND: 'a\n  "k": 1,\nb' });
+    expect(parseTmuxShowEnvironmentOutput('JSONEQ=a\n  "m=2": 3,\nb\n')).toEqual({ JSONEQ: 'a' });
+  });
+
   it('lists the default server and the managed socket, marking where new managed sessions go', () => {
     expect(sessionEnvTmuxSockets()).toEqual([{ socket: null, managed: false }, { socket: 'botmux', managed: true }]);
   });
