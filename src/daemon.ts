@@ -931,7 +931,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
-import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer } from './services/codex-async-user-input.js';
+import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
@@ -9218,7 +9218,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {
-    const isCurrent = () => findActiveBySessionId(boundAsk.sessionId) === askSession
+    const isCurrent = () => !res.destroyed && findActiveBySessionId(boundAsk.sessionId) === askSession
       && askSession.worker === asyncWorker && !!asyncWorker && !asyncWorker.killed
       && askSession.session.workerGeneration === asyncGeneration
       && askSession.session.cliSessionId === asyncInput.threadId;
@@ -9257,9 +9257,9 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
             replyToName: asyncDocumentTarget.replyToName, turnId,
           };
         }
-        // Use the same accepted-input ledger and serial FIFO as human messages.
-        // A live turn is allowed to finish; its answer then starts a new turn in
-        // the SAME native thread, with its own Botmux delivery identity.
+        // Keep accepted-input durability and the answer's own reply identity.
+        // A correlated ordinary human answer may enter its original active
+        // native turn; completed/different targets retain the serial fallback.
         await noteTurnReceived(askSession, turnId, text, sender, turnId);
         if (!isCurrent()) return false;
         const trustedCaller = await trustedCallerForInboundTurn(
@@ -9269,8 +9269,19 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
           byType,
         );
         if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
+        const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, {
+          answerer: by, originalAnswerer: asyncCaller,
+          human: byType === false && trustedCaller?.senderType === 'user'
+            && trustedCaller.requestLarkAppId === boundAsk.larkAppId && trustedCaller.requestUserOpenId === by,
+          managedLark: !documentDelivery && asyncOriginTurn?.startsWith('om_') === true
+            && !askSession.adoptedFrom && !askSession.session.adoptedFrom && !askSession.session.vcMeetingReceiver
+            && larkTransportEnabled({ chatId: askSession.chatId, apiOnly: bot.config.apiOnly }),
+          cleanInputAccepted: codexAppCleanInputAcceptedForSession(askSession),
+        });
+        const steerable = steerTarget !== undefined && input.codexAppInput !== undefined;
+        if (steerable) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
         if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
-          trustedCaller })) return false;
+          trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) })) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
         rememberLastCliInput(askSession, text, input);
         markSessionActivity(askSession);

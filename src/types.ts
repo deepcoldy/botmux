@@ -1796,6 +1796,9 @@ export interface CodexAppAdditionalContextEntry {
  * validates/maps it; it never has to reverse-parse the legacy prompt. */
 export interface CodexAppTurnInput {
   text: string;
+  /** Host routing constraint for a correlated async answer; never forwarded
+   * as a native request parameter or used to grant steer authority. */
+  steerTargetTurnId?: string;
   additionalContext?: Record<string, CodexAppAdditionalContextEntry>;
   localImages?: Array<{
     path: string;
@@ -1871,12 +1874,10 @@ export interface CodexAppDispatchLedgerEntry {
   replyTargetSenderIsBot?: boolean;
   /** Exact output channel selected at acceptance. Undefined is legacy Lark. */
   deliverySink?: CodexAppDeliverySink;
-  /** Explicit positive: this turn was accepted from the plain-human-interactive
-   * path (real human sender, none of foreign-bot / substitute-trigger / v3-grill
-   * / message-listener / VC receiver / VC origin present). Only such a turn may
-   * `turn/steer` into an active Codex App turn instead of forcing a fresh serial
-   * turn/start. Missing/false ⇒ forced serial. restore/transfer/queued-activation
-   * COPY this flag, never recompute it. */
+  /** Explicit daemon steer grant from interactive admission or a correlated
+   * human answer. Async answers additionally retain their exact native target.
+   * Missing/false forces serial input. restore/transfer/queued-activation COPY
+   * the grant, never recompute it from text or the latest sender. */
   codexAppSteerable?: true;
   dispatchAttempt?: number;
   /** Admission-frozen LinkRef mode for this exact runner submission. */
