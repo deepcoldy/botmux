@@ -1,3 +1,6 @@
+import { canTalk } from '../im/lark/event-dispatcher.js';
+import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
+import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { listPendingAsks } from './ask-broker.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
@@ -11212,6 +11215,13 @@ export function sendWorkerSessionInput(
     && sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex') {
     cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
   }
+  if ((message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc'))
+    || message.type === 'raw_input' || message.type === 'inject_command') {
+    cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
+      deploymentContinuationAuthority(ds)?.turnId, true);
+  } else if (message.type === 'message') {
+    cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+  }
   const annotated = withTurnCaller(ds, message);
   if (bufferTransferInput(ds, annotated)) return true;
   const worker = ds.worker;
@@ -11372,6 +11382,7 @@ export function interruptExactWorkerTurn(
 ): Promise<ExactTurnInterruptResult> {
   const worker = ds.worker;
   if (!worker || worker.killed) return Promise.resolve({ ok: false, reason: 'no_worker' });
+  cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous), turnId, true);
   const requestId = randomUUID();
   return new Promise(resolve => {
     let settled = false;
@@ -12965,6 +12976,7 @@ export function sendWorkerInput(
     trustedCaller?: TrustedCaller;
   } = {},
 ): boolean {
+  cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
@@ -13715,6 +13727,7 @@ export interface WorkerAdmissionBlockedNotice {
   turnId?: string;
 }
 export type ForkWorkerOptions = {
+  deploymentContinuation?: import('../services/deployment-continuation.js').DeploymentContinuation;
   onAdmission?: (admission: WorkerForkAdmission) => void;
   /** Replace the direct provider reply when the caller owns a durable output lane. */
   onAdmissionBlocked?: (notice: WorkerAdmissionBlockedNotice) => void;
@@ -13936,6 +13949,13 @@ export function forkWorker(
     admissionReported = true;
     opts.onAdmission?.(admission);
   };
+  const continuationStillAllowed = (): boolean => {
+    const claim = opts.deploymentContinuation;
+    return !claim || (deploymentContinuationClaimCurrent(ds.session, claim)
+      && canTalk(ds.larkAppId, ds.chatId, claim.caller.requestUserOpenId, undefined,
+        claim.caller.requestUserUnionId, ds.chatType));
+  };
+  if (!continuationStillAllowed()) { reportAdmission('rejected'); return false; }
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
@@ -14044,6 +14064,8 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
+      // Deliberately do not replay opts.deploymentContinuation: a deferred
+      // device-isolation spawn cannot carry an earlier claim into a new owner.
       forkWorker(ds, promptInput, resumeOrTurnId);
     }
   })) {
@@ -14106,6 +14128,7 @@ export function forkWorker(
   } else {
     resume = resumeOrTurnId;
   }
+  if (prompt.length > 0) cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
   const initTrustedCaller = promptPayload.trustedCaller
     ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
       ? resumeOrTurnId.trustedCaller
@@ -15144,6 +15167,7 @@ export function forkWorker(
     // At-most-once (idempotency lease): ride the flag on the init message so the
     // worker tags the keyed init prompt no-replay (codex #776 round-7 #1).
     ...(initAtMostOnce ? { atMostOnce: true } : {}),
+    ...(opts.deploymentContinuation ? { deploymentContinuation: opts.deploymentContinuation } : {}),
     vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
     ...(initTrustedController ? { trustedController: initTrustedController } : {}),
@@ -15216,6 +15240,9 @@ export function forkWorker(
     sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted);
   } else {
     afterWorkerIpcBootstrap(worker, () => {
+      // Bootstrap may wait while a human stops or supersedes the task. A blank
+      // worker can still serve that new input, but must not inherit the claim.
+      if (!continuationStillAllowed()) delete initMsg.deploymentContinuation;
       onIpcDispatchAttempted?.();
       worker.send(initMsg);
     });
@@ -15991,6 +16018,20 @@ function setupWorkerHandlers(
         // a later terminal GC once no live structure names it (and always on
         // teardown); a small retention lag beats a fail-closed 77 window.
         collectSessionTurnGarbage(ds);
+        break;
+      }
+      case 'cancel_deployment_continuation': {
+        let ok = false;
+        if (ds.worker === worker && ds.workerGeneration === workerGeneration) {
+          try {
+            cancelDeploymentContinuation(ds.session,
+              previous => sessionStore.updateDeploymentContinuation(ds.session, previous), deploymentContinuationAuthority(ds)?.turnId, true);
+            ok = true;
+          } catch (error) {
+            logger.warn(`[restart] Manual input blocked: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        worker.send({ type: 'deployment_continuation_cancelled', requestId: msg.requestId, ok } satisfies DaemonToWorker);
         break;
       }
       case 'native_input_consumed': {

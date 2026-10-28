@@ -331,9 +331,11 @@ export class TmuxBackend {
    */
   static probeSessionForLaunch(name: string, socketName?: string): SessionProbe {
     const probe = TmuxBackend.classifyHasSession(name, true, socketName);
-    // A session whose pane is a KEPT CORPSE (`remain-on-exit failed`, set by
-    // TmuxPipeBackend for status reporting) answers has-session but has no live
-    // CLI. For LAUNCH selection — and only there — that must read 'missing', or
+    // A session whose pane is a KEPT CORPSE (a retaining `remain-on-exit` —
+    // `failed` on tmux >= 3.2, `on` on older/unknown builds — set by
+    // TmuxPipeBackend for status reporting) answers has-session but has no
+    // live CLI. For LAUNCH selection — and only there — that must read
+    // 'missing', or
     // the next generation would "reattach" to a dead pane. Deliberately not in
     // classifyHasSession: that is the generic existence probe used by dozens of
     // call sites (teardown verification, restore, read isolation), each of

@@ -855,7 +855,11 @@ export class CodexBridgeQueue {
       // Without a native message id retain the historical turn-level mirror
       // guard. A previously unseen message id is a genuine same-turn steer;
       // its fingerprint/freshness checks below still decide whether it starts.
+      // A task_started-only claim is not a corroborated user record. It must
+      // not hide the fingerprinted successor that actually owns this native
+      // turn when an older, missing input temporarily claimed the start.
       if (ev.sourceTurnId && !messageKey && this.queue.some(turn => turn.started
+        && !this.isProvisionalTaskStart(turn)
         && turn.sourceTurnId === ev.sourceTurnId)) return;
       // First decide whether this user event is a REAL turn-start: either it
       // matches the head pending Lark turn's fingerprint (and isn't tooOld),
