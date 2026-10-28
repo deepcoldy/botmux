@@ -13134,7 +13134,9 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined && isSerialGroupInput(ds, opts.trustedCaller)
+    ...(opts.dispatchAttempt === undefined
+      && (opts.trustedCaller?.source === 'schedule_creator'
+        || isSerialGroupInput(ds, opts.trustedCaller))
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
