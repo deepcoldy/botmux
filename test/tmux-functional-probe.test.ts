@@ -17,6 +17,7 @@ import {
   getTmuxVersionCached,
   resetTmuxVersionCacheForTests,
   TMUX_REMAIN_ON_EXIT_FAILED,
+  TMUX_VERSION_PROBE_TIMEOUT_MS,
 } from '../src/setup/ensure-tmux.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
@@ -302,5 +303,29 @@ describe('serverTmuxVersion', () => {
       return '' as any;
     }) as typeof execFileSync);
     expect(serverTmuxVersion([], { major: 3, minor: 3 })).toEqual({ major: 3, minor: 3 });
+  });
+
+  // The probe budget must be the same load-rated one the other version probes
+  // use, not a short ceiling. Under host load a SAME-version server answers
+  // slowly (0.93–4.45s measured at load ~4; a 3s budget blew at load ~70), so a
+  // 2s ceiling made the fail-closed timeout branch return null on a modern busy
+  // host and silently turned off the 77/127 crash-exit-code channel there.
+  // Real-binary check (3.3a server, a client wrapper delaying the probe 2.5s):
+  // a 2s budget read null (degraded); this budget reads {major:3,minor:3}.
+  // A mocked delay would only exercise Node's own timeout, not this decision,
+  // so the test pins the budget itself; shrinking it back below the load line
+  // must go red.
+  it('uses the load-rated version-probe budget, so a slow same-version server is not timed out to null', () => {
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (Array.isArray(args) && args.includes('display-message')) return '3.3a\n' as any;
+      return 'tmux 3.3a\n' as any;
+    }) as typeof execFileSync);
+    serverTmuxVersion(['-L', 'botmux'], { major: 3, minor: 3 });
+    const probe = mockedExecFileSync.mock.calls.find(([, a]) => Array.isArray(a) && a.includes('#{version}'));
+    const options = probe?.[2] as { timeout: number };
+    expect(options.timeout).toBe(TMUX_VERSION_PROBE_TIMEOUT_MS);
+    // The load measurements this budget was chosen for exceed 3s; anything
+    // shorter reintroduces the degradation on a busy modern host.
+    expect(TMUX_VERSION_PROBE_TIMEOUT_MS).toBeGreaterThan(3000);
   });
 });

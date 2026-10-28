@@ -245,7 +245,13 @@ export function serverTmuxVersion(socketArgs: readonly string[], clientVersion: 
     const out = execFileSync('tmux', [...socketArgs, 'display-message', '-p', '#{version}'], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
+      // Same budget as the other version probes (TMUX_VERSION_PROBE_TIMEOUT_MS):
+      // a loaded host delays a SAME-version server's answer by seconds (the
+      // gate's own measurements saw 0.93–4.45s at load ~4 and a blown 3s
+      // budget at load ~70). A shorter budget here would time out on a modern
+      // but busy server, and the fail-closed branch would then silence the
+      // 77/127 crash-exit-code channel on exactly those hosts.
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
       env: tmuxEnv(),
     });
     const parsed = parseTmuxVersion(String(out ?? ''));
