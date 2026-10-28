@@ -15,7 +15,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TmuxPipeBackend, resolvePaneDeath } from '../src/adapters/backend/tmux-pipe-backend.js';
@@ -24,6 +24,8 @@ import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
+let python3: string | undefined;
+try { python3 = execFileSync('which', ['python3'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
 
 /**
  * Backend 退出检测依赖它自己的生命周期轮询（1s 起步、缺会话要连续 3 次才
@@ -168,6 +170,61 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
     } finally {
       rmSandboxScratch(workdir);
     }
+  });
+
+  /**
+   * #2453: tmux publishes `pane_dead_status` only once it has reaped the pane
+   * process. On CI it sometimes never did — the pane process stayed a zombie
+   * child of the server for the rest of the test, the pane read `1:` (dead, no
+   * status) throughout, and a real `exit 3` / `127` came out as 1.
+   *
+   * This lab makes that state deterministic instead of load-dependent: the
+   * server is started with SIGCHLD blocked. tmux restores the signal mask it
+   * inherited when it daemonises, so it never learns a pane died and never
+   * reaps one — exactly the observed corpse, on every run.
+   */
+  describe.skipIf(!python3 || process.platform !== 'linux')('when the tmux server never reaps the pane process (#2453)', () => {
+    const BLOCK_SIGCHLD_THEN_EXEC =
+      'import os, signal, sys\n'
+      + 'signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})\n'
+      + 'os.execv(sys.argv[1], sys.argv[1:])\n';
+
+    beforeEach(() => {
+      // The backend's sessions join the server this keeper session starts.
+      const started = spawnSync(python3!, [
+        '-c', BLOCK_SIGCHLD_THEN_EXEC,
+        realTmux!, '-S', socket, '-f', '/dev/null', 'new-session', '-d', '-s', 'bmx-keeper', 'sleep 600',
+      ], { encoding: 'utf8', timeout: 5_000 });
+      expect(started.status).toBe(0);
+    });
+
+    // Without this the next two would pass vacuously on a server that reaps.
+    it('the lab server really leaves a dead pane unreaped and status-less', async () => {
+      tmux('new-session', '-d', '-s', 'bmx-unreaped', 'sh -c "exit 5"', ';', 'set-option', '-t', 'bmx-unreaped', 'remain-on-exit', 'on');
+      let line = '';
+      for (let reads = 0; reads < 200 && !line.startsWith('1:'); reads += 1) {
+        await new Promise(r => setTimeout(r, 25));
+        line = String(tmux('display-message', '-p', '-t', 'bmx-unreaped', '#{pane_dead}:#{pane_dead_status}:#{pane_pid}:#{pid}').stdout ?? '').trim();
+      }
+      // Give a reaping server ample time to publish; this one must not.
+      await new Promise(r => setTimeout(r, 1_000));
+      line = String(tmux('display-message', '-p', '-t', 'bmx-unreaped', '#{pane_dead}:#{pane_dead_status}:#{pane_pid}:#{pid}').stdout ?? '').trim();
+      const [dead, status, panePid, serverPid] = line.split(':');
+      expect({ dead, status }).toEqual({ dead: '1', status: '' });
+      const stat = readFileSync(`/proc/${panePid}/stat`, 'utf8');
+      const [state, ppid] = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      expect({ state, ppid }).toEqual({ state: 'Z', ppid: serverPid });
+    });
+
+    it('still forwards the real exit code', async () => {
+      expect(await runToExit('sleep 1.5; exit 3')).toEqual({ code: 3, signal: null });
+    });
+
+    it('keeps an unreaped signal death on the ordinary channel and reaps its remnant', async () => {
+      expect(await runToExit('sleep 1.5; kill -9 $$')).toEqual({ code: 1, signal: null });
+      const sessions = String(tmux('list-sessions', '-F', '#{session_name}').stdout ?? '').split('\n').filter(Boolean);
+      expect(sessions).toEqual(['bmx-keeper']);
+    });
   });
 });
 
@@ -488,5 +545,45 @@ describe('resolvePaneDeath three-way verdict: alive / dead / unknown', () => {
     let r2 = 0;
     const r1 = resolvePaneDeath('1:', () => glitch[Math.min(r2++, glitch.length - 1)]!, noSleep, OPTS);
     expect(r1).toEqual({ kind: 'dead', status: 127 });
+  });
+
+  // #2453: `1:` because tmux has not reaped the pane process. The kernel's
+  // record of that zombie is the same status tmux would publish, so it is
+  // taken at once instead of waiting on a tmux that may never look.
+  it('takes an unpublished exit code from the kernel for the pane and server pids on the line', () => {
+    let reads = 0;
+    const asked: Array<[number, number]> = [];
+    const r = resolvePaneDeath('1::4242:99', () => { reads += 1; return '1::4242:99'; }, noSleep, OPTS, (pane, server) => {
+      asked.push([pane, server]);
+      return { kind: 'exited', code: 3 };
+    });
+    expect(r).toEqual({ kind: 'dead', status: 3 });
+    expect(asked).toEqual([[4242, 99]]);
+    expect(reads).toBe(0);
+  });
+
+  it('resolves an unreaped signal death as status-less without polling', () => {
+    let reads = 0;
+    const r = resolvePaneDeath('1::4242:99', () => { reads += 1; return '1::4242:99'; }, noSleep, OPTS, () => ({ kind: 'signaled', signal: 9 }));
+    expect(r).toEqual({ kind: 'dead', status: null });
+    expect(reads).toBe(0);
+  });
+
+  it('keeps asking tmux while the kernel has nothing (process reaped or still exiting)', () => {
+    const lines = ['1::4242:99', '1::4242:99', '1:127:4242:99'];
+    let reads = 0;
+    let asked = 0;
+    const r = resolvePaneDeath('1::4242:99', () => lines[Math.min(++reads, lines.length - 1)]!, noSleep, OPTS, () => {
+      asked += 1;
+      return null;
+    });
+    expect(r).toEqual({ kind: 'dead', status: 127 });
+    expect(asked).toBe(2);
+  });
+
+  it('prefers a status tmux did publish, and never asks the kernel about a live pane', () => {
+    const kernel = () => { throw new Error('kernel must not be consulted'); };
+    expect(resolvePaneDeath('1:77:4242:99', () => '', noSleep, OPTS, kernel)).toEqual({ kind: 'dead', status: 77 });
+    expect(resolvePaneDeath('0::4242:99', () => '', noSleep, OPTS, kernel)).toEqual({ kind: 'alive' });
   });
 });;

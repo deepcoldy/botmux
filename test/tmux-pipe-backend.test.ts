@@ -1453,7 +1453,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
       const probeImpl = (_bin: any, args: any) => {
         if (!Array.isArray(args) || !args.includes('display-message')) { lastWasPaneId = false; return '' as any; }
         if (args.includes('#{pane_id}')) { lastWasPaneId = true; return '%1\n' as any; }
-        if (args.includes(DEAD_STATUS)) {
+        if (args.some((a: unknown) => String(a).startsWith(DEAD_STATUS))) {
           const afterPaneId = lastWasPaneId;
           lastWasPaneId = false;
           return afterPaneId ? '1:77\n' as any : '' as any;
