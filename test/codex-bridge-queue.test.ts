@@ -1964,17 +1964,17 @@ describe('CodexBridgeQueue provisional task_started corroboration', () => {
     expect(started).toEqual(['t1']);
   });
 
-  it('routes the terminal to the corroborated turn when a lost earlier mark held the provisional claim', () => {
+  it.each([undefined, 'msg-2'])('routes the terminal past a lost provisional claim (message id=%s)', sourceMessageId => {
     let now = 5_000;
     const q = new CodexBridgeQueue(() => now);
     q.mark('lost', 'first message lost', 0);
     q.mark('t2', 'second message', 500);
     q.ingest([
       startedEv('native-1', 's1', 1_000),
-      { ...userEv('second message', 'u1', 1_100), sourceTurnId: 'native-1', sourceMessageId: 'msg-2' },
+      { ...userEv('second message', 'u1', 1_100), sourceTurnId: 'native-1', sourceMessageId },
       { ...asstEv('answer two', 'a1', 2_000), sourceTurnId: 'native-1' },
     ]);
-    now = 15 * 60_000;
+    now += STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
     expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['lost']);
     expect(q.drainEmittable()).toEqual([
       expect.objectContaining({ turnId: 't2', finalText: 'answer two' }),
