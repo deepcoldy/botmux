@@ -130,6 +130,16 @@ describe('duration-balanced unit shards', () => {
     expect(plan[0]!.load).toBe(10 + 2 + 1 + 2 + 4 * 0.5);
   });
 
+  it('looks a collected file up in the table by its repo-relative path', () => {
+    // vitest hands in absolute module ids; the table is keyed by repo path. If
+    // the two stopped matching, every file would weigh the same and the split
+    // would silently fall back to counting files.
+    const names = Array.from({ length: 40 }, (_, i) => `test/f${String(i).padStart(2, '0')}.test.ts`);
+    const t = { files: Object.fromEntries(names.map((file, i) => [file, i === 0 ? 10_000 : 1])) };
+    const sizes = shardsOf(names, t, 4).map(shard => shard.length);
+    expect(sizes).toEqual([1, 13, 13, 13]);
+  });
+
   it('plans a path listed twice once', () => {
     const t = { files: { 'test/a.test.ts': 5, 'test/b.test.ts': 5 } };
     const plan = planShards(['test/a.test.ts', 'test/b.test.ts', 'test/a.test.ts'], t, 2);

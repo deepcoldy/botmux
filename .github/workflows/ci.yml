@@ -101,6 +101,8 @@ jobs:
       # Wrapper retries once only when every file already passed and vitest's
       # fork pool then reports "Worker exited unexpectedly" (teardown flake;
       # measured on this PR's first shard-3 run). A real failed file is not retried.
+      # With duration-balanced shards a full rerun no longer fits in the
+      # 20-minute limit (see the script), so that flake needs a real fix.
       - name: Unit tests (shard ${{ matrix.shard }}/4)
         run: node scripts/run-unit-shard.mjs ${{ matrix.shard }}/4
 

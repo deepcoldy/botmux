@@ -8,10 +8,13 @@
 // scripts/duration-shards.mjs) — it does not change isolate/forks. A
 // mid-file crash still shows `Test Files … failed` and is NOT retried.
 //
-// The retry reruns the whole shard (~400 files), not "the failed file":
+// The retry reruns the whole shard (~520 files), not "the failed file":
 // this flake class has zero failed files (that's the predicate). A
-// failed-file rerun would have nothing to run. Worst measured ~7m23s;
-// the job timeout is 20m.
+// failed-file rerun would have nothing to run. Since the shards were balanced
+// by duration (#2452) each one already spends 10–12 of the job's 20 minutes in
+// vitest, so a full rerun no longer fits: should this flake come back, the
+// retry ends in the job timeout instead of a green rerun. That is no worse
+// than not retrying, but it means the flake needs a root-cause fix.
 
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
