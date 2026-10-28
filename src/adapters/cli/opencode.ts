@@ -470,6 +470,51 @@ export interface OpenCodeLikeAdapterOptions {
   /** live 模型枚举的子命令参数（opencode / mimo 都是 `models` 纯文本列表）。 */
   modelListArgs: readonly string[];
   startupArgs?: readonly string[];
+  /**
+   * 该 CLI 的原生「自动放行」标志（如 opencode 的 `--auto`）。
+   *
+   * 托管态里 TUI 的权限确认没人看得见：turn 会静默卡在 `once/always/reject`
+   * 上直到有人在终端点一次。opencode 自带只放行「本来要 ask」的 `--auto`
+   * （显式 deny 仍生效），所以 `disableCliBypass` 未开时按其它 adapter
+   * （copilot `--allow-all-tools`、claude `--dangerously-skip-permissions`）
+   * 的既有约定带上它。
+   *
+   * 留空表示该 CLI 没有等价标志（mimo 就没有），保持原样不注入。
+   */
+  autoApproveArg?: string;
+  /**
+   * `autoApproveArg` 的最低可用版本（含）。给了就必须能证明版本够新才注入：
+   * 版本未知 / 解析不出来一律按「不支持」处理，保持旧 argv。
+   *
+   * opencode v1 的 `--auto` 是 1.17.12 才加的，老版本收到未知 flag 会打帮助并
+   * exit 1，而 daemon 的自动重启会把它放大成 crash-loop —— 比静默卡死更难查，
+   * 所以这里宁可不加也不赌。
+   */
+  autoApproveMinVersion?: string;
+}
+
+/**
+ * 版本门控：`>= min` 返回 true。版本未知 / 解析失败 / 主次版本缺失一律 false
+ * （= 当作不支持），调用方据此保持旧 argv。只比较 major.minor.patch，
+ * 允许 `v` 前缀和 `-beta.1` 这类预发布后缀。
+ */
+function versionAtLeast(version: string | undefined, min: string): boolean {
+  const parse = (value: string): number[] | null => {
+    const core = value.trim().replace(/^[^0-9]*/, '').split(/[-+]/, 1)[0];
+    const parts = core.split('.');
+    if (parts.length < 2) return null;
+    const nums = parts.map(part => (/^\d+$/.test(part) ? Number(part) : Number.NaN));
+    return nums.some(n => !Number.isFinite(n)) ? null : nums;
+  };
+  const have = parse(version ?? '');
+  const want = parse(min);
+  if (!have || !want) return false;
+  for (let i = 0; i < Math.max(have.length, want.length); i++) {
+    const a = have[i] ?? 0;
+    const b = want[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
 }
 
 export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runtime: OpenCodeLikeAdapterOptions): CliAdapter {
@@ -487,8 +532,17 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     authPaths: [...(runtime.authPaths ?? [runtime.dataRoot])],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model }) {
+    buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model, disableCliBypass, cliVersion }) {
       const args: string[] = [...(runtime.startupArgs ?? [])];
+      // 权限确认放行：不传 `--auto` 时，OpenCode 的默认 `ask`（V1 是
+      // external_directory / .env 等）会停在 TUI 里等确认，而飞书侧完全看不到，
+      // 整个 turn 静默卡死。`disableCliBypass` 显式打开时保持现状让人工把关；
+      // 声明了最低版本的 flag 还要版本够新（探测不到就不加，见
+      // autoApproveMinVersion）。
+      if (runtime.autoApproveArg && !disableCliBypass
+        && (!runtime.autoApproveMinVersion || versionAtLeast(cliVersion, runtime.autoApproveMinVersion))) {
+        args.push(runtime.autoApproveArg);
+      }
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
@@ -670,6 +724,8 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     // (package.json / node_modules) and exits on a read-only mount.
     authPaths: ['~/.local/share/opencode', '~/.config/opencode'],
     modelListArgs: ['models'],
+    autoApproveArg: '--auto',
+    autoApproveMinVersion: '1.17.12',
     modelChoices: CLI_MODEL_CHOICES['opencode'],
   });
 }
