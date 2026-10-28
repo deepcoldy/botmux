@@ -1,5 +1,6 @@
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
+import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { listPendingAsks } from './ask-broker.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
@@ -11216,7 +11217,7 @@ export function sendWorkerSessionInput(
   if ((message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc'))
     || message.type === 'raw_input' || message.type === 'inject_command') {
     cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
-      ds.activeInteractiveTurn?.turnId ?? ds.currentReplyTarget?.turnId, true);
+      deploymentContinuationAuthority(ds)?.turnId, true);
   } else if (message.type === 'message') {
     cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
   }
@@ -16023,7 +16024,7 @@ function setupWorkerHandlers(
         if (ds.worker === worker && ds.workerGeneration === workerGeneration) {
           try {
             cancelDeploymentContinuation(ds.session,
-              previous => sessionStore.updateDeploymentContinuation(ds.session, previous), ds.currentReplyTarget?.turnId, true);
+              previous => sessionStore.updateDeploymentContinuation(ds.session, previous), deploymentContinuationAuthority(ds)?.turnId, true);
             ok = true;
           } catch (error) {
             logger.warn(`[restart] Manual input blocked: ${error instanceof Error ? error.message : String(error)}`);

@@ -475,12 +475,18 @@ describe('stuck-warning card tui_keys handler', () => {
     expect(ds.tuiPromptProcessing).toBe(false);
   });
 
-  it.each([[false, false], [true, false], [false, true], [true, true]])('text input persists cancellation before IPC (disk failure=%s, before receipt=%s)', async (diskFailure, beforeReceipt) => {
+  it.each([false, true].flatMap(liveOrigin => [[false, false], [true, false], [false, true], [true, true]]
+    .map(([diskFailure, beforeReceipt]) => ({ liveOrigin, diskFailure, beforeReceipt }))))('text input persists cancellation before IPC: $liveOrigin/$diskFailure/$beforeReceipt', async ({ liveOrigin, diskFailure, beforeReceipt }) => {
     const ds = makeDs({ worker: { killed: false, connected: true, send: workerSend } as any, tuiPromptCardId: CARD_ID });
     const continuation = { state: 'claimed' as const, turnId: 'om_old', nativeSessionId: 'native', consumedAt: Date.now(),
       workerGeneration: 1, caller: { senderType: 'user' as const, requestUserOpenId: 'ou_test', requestLarkAppId: APP_ID } };
     Object.assign(ds.session, { cliId: 'codex', backendType: 'tmux', larkAppId: APP_ID, cliSessionId: 'native', workerGeneration: 1 });
     ds.activeInteractiveTurn = { turnId: 'om_old', caller: continuation.caller };
+    if (liveOrigin) {
+      ds.activeInteractiveTurn = undefined;
+      ds.managedTurnOrigin = { capability: 'live-origin', turnId: 'om_old', trustedCaller: continuation.caller };
+      ds.currentReplyTarget = { rootMessageId: ROOT_ID, turnId: 'om_stale', updatedAt: new Date().toISOString() };
+    }
     ds.session.deploymentContinuation = beforeReceipt ? undefined : continuation;
     const persist = vi.mocked(sessionStore.updateDeploymentContinuation);
     persist.mockImplementationOnce((row) => {

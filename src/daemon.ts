@@ -1,4 +1,5 @@
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
+import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
 import { createBotAdminUnionsPublisher } from './services/bot-admin-unions-store.js';
@@ -31085,12 +31086,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
       try {
         const restored = ds.session.deploymentContinuation;
+        const authority = deploymentContinuationAuthority(ds);
+        const restoresOriginalCaller = restored?.state === 'claimed' && restored.turnId === receipt.turnId
+          && authority?.turnId === restored.turnId
+          && authority.caller?.senderType === 'user'
+          && authority.caller.requestLarkAppId === restored.caller.requestLarkAppId
+          && authority.caller.requestUserOpenId === restored.caller.requestUserOpenId
+          && (authority.caller.source === undefined || authority.caller.source === 'failed_turn_recovery');
         const caller = restored?.state === 'claimed' && restored.turnId === receipt.turnId
-          ? restored.caller : failedTurnCaller(ds, receipt.turnId);
+          ? restoresOriginalCaller ? restored.caller : undefined
+          : authority?.caller ?? undefined;
         const recorded = recordDeploymentContinuation(ds.session, receipt, {
-          // Admission owns the live turn. A cold restore has only its claimed
-          // reply target until this receipt re-arms the recovered turn.
-          caller, currentTurnId: ds.activeInteractiveTurn?.turnId ?? ds.currentReplyTarget?.turnId,
+          caller, currentTurnId: authority?.turnId,
           workerGeneration: context.workerGeneration, rpc: ds.initConfig?.codexRpcInput === true,
         }, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
         if (recorded && caller && restored?.state === 'claimed'
