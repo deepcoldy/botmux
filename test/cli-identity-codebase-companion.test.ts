@@ -73,10 +73,10 @@ describe('companion publication', () => {
   });
 
   it('identityToolsFor adds codebase only when bytedcli is governed, without duplicates', () => {
-    expect(identityToolsFor(['bytedcli', 'bytedcli'])).toEqual(['bytedcli', 'codebase']);
+    expect(identityToolsFor(['bytedcli', 'bytedcli'])).toEqual(['bytedcli', 'codebase', 'ecop']);
     expect(identityToolsFor(['lark-cli'])).toEqual(['lark-cli']);
-    expect(identityToolsFor(['bytedcli'])).toEqual(['bytedcli', 'codebase']);
-    expect(identityToolsFor(['lark-cli', 'bytedcli'])).toEqual(['lark-cli', 'bytedcli', 'codebase']);
+    expect(identityToolsFor(['bytedcli'])).toEqual(['bytedcli', 'codebase', 'ecop']);
+    expect(identityToolsFor(['lark-cli', 'bytedcli'])).toEqual(['lark-cli', 'bytedcli', 'codebase', 'ecop']);
     expect(codebaseCompanionOf({ tool: 'bytedcli', cloudJwt: 'c', codeJwt: 'k', openId: 'ou' })).toEqual({ tool: 'codebase', codeJwt: 'k', openId: 'ou' });
   });
 });

@@ -36,6 +36,7 @@ Botmux 提供的短期 bot token。
 - 已绑定的机器**不再自动发起本机扫码**：拒绝消息直接给平台凭据页链接。`auto` 模式下显式的 `/login lark` / `/login bytedcli` 仍可走本机扫码作为兜底；`platform` 模式下它们也只给平台链接。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
 - **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。
+- **ecop 随 bytedcli**：`ecop` 包装器复用本轮 bytedcli 身份：single 模式读取当轮文件，proven 模式经已有进程证明通道取回内存凭证，证明失败不回退读文件；校验发送人、回合与 JWT 有效期，只向本次子进程注入 `USER_CLOUD_JWT`。需要 Node.js 22+ 和已安装的 ecop CLI；不新增平台授权或配置开关。隔离缓存位于 `ecop-runtime/<session>/<caller>/<environment>`，未授权或身份不一致直接拒绝。受管模式禁止覆盖 JWT、使用附身命令或另起 SSO；不要让 Agent 读取凭证、绕过入口或升级固定版本。`auth status` 只读缓存，实际身份应通过受管 `login --json` 的服务端用户信息验证。macOS scratch 模式尚未验证，不能据此声称可用。
 - 平台按「发送人与本机所有者至少同属一个团队」且「发送人已对该团队开启同意」签发；不满足时分别返回 `not_teammate` / `consent_missing`，botmux 原样告知发送人，不退回任何其他身份。
 - **绑定会话（`larkToolBinding` 默认开启）里的 `--as user` 同样会用平台凭据。** 自建 bot 应用的可用范围通常只有所有者本人，别人打开该应用的授权链接只会看到「你没有使用权限」，所以对他们来说平台是唯一可用的来源。取法：
   - `auto`：该人已有对本 bot 应用的授权就用它（所有者保留 bot 应用更多的权限）；没有则向平台申请，lark-cli 的用户调用改用平台应用的 app id 执行；机器未绑定平台时与以前一致。

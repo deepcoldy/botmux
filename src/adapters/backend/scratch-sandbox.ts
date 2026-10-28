@@ -522,7 +522,13 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   // Real-host passthrough carve-outs layered AFTER deny masks (later mount
   // wins). The outbox MUST stay host-real: the daemon watcher reads it without
   // any merged-tree awareness.
-  const carveTargets = new Set<string>([outbox]);
+  const writableCarves: string[] = [];
+  for (const raw of opts.writableCarvePaths ?? []) {
+    const p = canonical(raw);
+    if (!isAbsolute(p) || p === '/' || !existsSync(p)) continue;
+    if (!writableCarves.includes(p)) writableCarves.push(p);
+  }
+  const carveTargets = new Set<string>([outbox, ...writableCarves]);
 
   // ── bwrap argv ───────────────────────────────────────────────────────────
   const args: string[] = [];
@@ -659,6 +665,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
 
   // Outbox real-host passthrough (daemon watcher reads THIS dir).
   args.push('--bind', outbox, outbox);
+  // Current-session derived tool credentials; sibling caches stay masked.
+  for (const p of writableCarves) args.push('--bind', p, p);
   // Re-seal the deny dirs that host a nested carve AFTER the carve binds.
   for (const p of remountRo) args.push('--remount-ro', p);
 

@@ -884,6 +884,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // able to. Writable would let an agent publish its own identity.
   if (ctx.sessionId && larkTransport) {
     push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
+    // ECOP keeps derived credentials separate from the daemon-owned identity.
+    push([`${ctx.sessionDataDir}/ecop-runtime/${ctx.sessionId}`], 'readWrite', 'internal');
+    push([`${ctx.botmuxHome}/tools/ecop`], 'readOnly', 'internal');
   }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.

@@ -51,6 +51,8 @@ export interface ScratchSecrets {
   denyPaths: string[];
   /** Paths re-opened READ-ONLY inside an otherwise denied dir. */
   readOnlyCarvePaths: string[];
+  /** Only the current session may write its derived ECOP cache. */
+  writableCarvePaths?: string[];
 }
 
 // Trigger-user CLI identity lives in ONE per-session directory
@@ -76,6 +78,7 @@ function isDir(p: string): boolean {
 export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchSecrets {
   const out = new Set<string>();
   const readOnlyCarve = new Set<string>();
+  const writableCarve = new Set<string>();
   const homeDir = input.homeDir || osHomedir();
   const addFile = (p: string | undefined): void => {
     if (p && isFileOrLink(p)) out.add(p);
@@ -151,6 +154,14 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     // carve back READ-ONLY exactly this session's own files the governed CLI
     // / `botmux send` wrapper sources at runtime. Mirrors fs-policy's
     // per-session grants; never grant the parent.
+    const ecopRuntime = join(dataDir, 'ecop-runtime');
+    if (isDir(ecopRuntime)) {
+      out.add(ecopRuntime);
+      if (input.sessionId) {
+        const ownCache = join(ecopRuntime, input.sessionId);
+        if (isDir(ownCache)) writableCarve.add(ownCache);
+      }
+    }
     const cliIdentityDir = join(dataDir, CLI_IDENTITY_DIR);
     if (isDir(cliIdentityDir)) {
       out.add(cliIdentityDir);
@@ -175,7 +186,7 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     if (existsSync(p)) out.add(p);
   }
 
-  return { denyPaths: [...out], readOnlyCarvePaths: [...readOnlyCarve] };
+  return { denyPaths: [...out], readOnlyCarvePaths: [...readOnlyCarve], writableCarvePaths: [...writableCarve] };
 }
 
 /** Back-compat flat list (deny + ro-carve are all "secret-adjacent"); used by
