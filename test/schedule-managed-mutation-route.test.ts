@@ -135,6 +135,14 @@ describe('managed schedule mutation route', () => {
     expect(h.scheduler.removeTask).not.toHaveBeenCalled();
     expect(h.scheduler.disableTask).not.toHaveBeenCalled();
   });
+  it('refuses topic cleanup from a bot turn the receiving bot did not observe itself', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_controller' };
+    expect((await h.run()).status).toBe(403);
+    h.ds.activeInteractiveTurn.caller.requestLarkAppId = 'cli_target';
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler.removeTask).toHaveBeenCalledOnce();
+  });
   it.each(['pause', 'remove'])('still lets an administrator in the original topic %s a bot policy task', async action => {
     const h = botPolicyTaskInTopic(action, 'om_admin_turn');
     expect((await h.run()).status).toBe(200);
