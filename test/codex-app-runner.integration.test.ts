@@ -673,6 +673,56 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     expect(result.final.content).toContain('Selected model is at capacity');
     expect(result.finals).toHaveLength(1);
   });
+  it.each(['steer-capacity', 'steer-capacity-history'] as const)(
+    'carries the structured capacity code only on the steered group REAL final: %s', async behavior => {
+      // REGRESSION: a native capacity failure terminating a STEERED group settles
+      // through settleSteeredCompletion (canonical id) or
+      // reconcileSteeredGroupFromHistory (non-canonical id, history match). Both
+      // group paths must classify the terminal like the single-turn path.
+      // Without turn.failureCode there, the real final carries no errorCode: the
+      // worker omits turnFailed and the whole group — including parked HTTP steer
+      // members — settles as completed despite the failure text.
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-steer-capacity-'));
+      const fakeCodex = join(dir, 'fake-codex');
+      const logPath = join(dir, 'requests.jsonl');
+      copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+      chmodSync(fakeCodex, 0o755);
+      const control = new ControlCollector(dir);
+      await control.listen();
+      const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path);
+      const send = (text: string, replyTurnId: string) => {
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+          `legacy:${text}`,
+          { text, clientUserMessageId: replyTurnId },
+          replyTurnId,
+          true,
+        )}\r`);
+      };
+      try {
+        await waitFor(harness, () => control.states.some(state => state.busy === false));
+        send('root', 'om_sc_root');
+        await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+        send('follow', 'om_sc_follow');
+        await waitFor(harness, () => control.finals.length === 2
+          && control.states.filter(state => state.busy === false).length >= 2);
+        expect(control.finals).toEqual([
+          expect.objectContaining({ turnId: 'om_sc_root', content: '', disposition: 'steer_superseded' }),
+          expect.objectContaining({
+            turnId: 'om_sc_follow',
+            content: expect.stringContaining('Selected model is at capacity'),
+            errorCode: 'codex_capacity_exceeded',
+          }),
+        ]);
+        // The superseded member carries no failure code and the real final no
+        // supersede disposition.
+        expect(control.finals[0]).not.toHaveProperty('errorCode');
+        expect(control.finals[1]).not.toHaveProperty('disposition');
+      } finally {
+        await stopChild(harness.child);
+        await control.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap', 'live-steer'] as const)(
     'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
       resetAskBroker();

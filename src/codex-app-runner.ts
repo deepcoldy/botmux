@@ -1881,6 +1881,7 @@ function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void
     turn.knownAgentItemIds.clear();
   }
   turn.terminalCompletion = nativeTurn;
+  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
   if (typeof nativeTurn?.id === 'string' && nativeActiveTurnId === nativeTurn.id) {
     nativeActiveTurnId = undefined;
   }
@@ -1944,6 +1945,7 @@ async function reconcileSteeredGroupFromHistory(
       turn.itemText.clear();
       turn.knownAgentItemIds.clear();
       turn.terminalCompletion = matched;
+      turn.failureCode = codexAppTurnFailureCode(matched);
       // R4-B3: the matched turn is now the authoritative native identity for this
       // group — the final marker, native id, and usage drain must all key off
       // matched.id, not the stale pre-history canonical. Compare-and-clear the OLD
