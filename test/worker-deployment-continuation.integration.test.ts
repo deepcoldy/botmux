@@ -19,6 +19,8 @@ for (const scenario of ['unfinished', 'completed', 'manual'] as const) {
   const manual = scenario === 'manual';
   it.skipIf(backendType === 'tmux' && !tmuxAvailable)(`${backendType}: ${scenario} work at the first restored prompt`, async () => {
     const root = mkdtempSync(join(tmpdir(), 'deployment-worker-'));
+    // A private HOME must not enter zsh-newuser-install before the fake CLI.
+    writeFileSync(join(root, '.zshrc'), '# isolated worker test\n');
     // Unix-domain sockets have a much smaller path limit than HOME paths.
     const tmuxRoot = backendType === 'tmux' ? mkdtempSync('/tmp/bmx-dc-') : root;
     const dataDir = join(root, 'data'); mkdirSync(dataDir);
@@ -42,9 +44,14 @@ const fs = require('node:fs');
 const fd = fs.openSync(${JSON.stringify(transcript)}, 'a');
 fs.writeFileSync(${JSON.stringify(started)}, 'ready');
 process.stdin.setRawMode(true);
-let typed = '', recorded = false;
+let typed = '', recorded = false, cleared = false;
 process.stdin.on('data', data => {
   fs.appendFileSync(${JSON.stringify(input)}, data); typed += data.toString();
+  if (${manual} && !cleared && typed.includes('/clear') && typed.includes('\\r')) {
+    cleared = true;
+    process.stdout.write('\\x1b[2J\\x1b[HWorking...');
+    setTimeout(() => process.stdout.write(screen), 300);
+  }
   const match = typed.match(/\\x1b\\[200~([\\s\\S]*?)\\x1b\\[201~/);
   if (match && typed.includes('\\r') && !recorded) {
     recorded = true;
@@ -92,6 +99,7 @@ setInterval(() => {}, 1000);
       await wait(() => messages.some(message => message.type === 'prompt_ready'));
       if (manual) {
         await wait(() => existsSync(input) && readFileSync(input, 'utf8').includes('/clear'));
+        await wait(() => messages.filter(message => message.type === 'prompt_ready').length >= 2);
         await new Promise(resolve => setTimeout(resolve, 1000));
         expect(readFileSync(input, 'utf8')).toBe('/clear\r');
         expect(messages.some(message => message.type === 'native_input_consumed' && message.turnId === 'om_original')).toBe(false);
