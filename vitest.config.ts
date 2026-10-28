@@ -1,4 +1,17 @@
 import { defineConfig } from 'vitest/config';
+import { BaseSequencer, type TestSpecification } from 'vitest/node';
+import { selectShard } from './scripts/duration-shards.mjs';
+
+/**
+ * `--shard=i/N` (CI's unit matrix) splits by recorded duration instead of
+ * vitest's equal-file-count hash split; see scripts/duration-shards.mjs. Only
+ * the shard selection changes — ordering within a shard stays vitest's own.
+ */
+class DurationShardSequencer extends BaseSequencer {
+  override async shard(files: TestSpecification[]): Promise<TestSpecification[]> {
+    return selectShard(files, this.ctx.config);
+  }
+}
 
 /**
  * Two projects, two execution profiles:
@@ -21,6 +34,8 @@ export default defineConfig({
   test: {
     testTimeout: 60_000,
     hookTimeout: 360_000,
+    // Root-level on purpose: vitest builds one sequencer for the whole run.
+    sequence: { sequencer: DurationShardSequencer },
     projects: [
       {
         test: {

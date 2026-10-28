@@ -48,8 +48,10 @@ jobs:
   # NOT `needs: build` — waiting on tsc would serialize the start; a few files
   # spawn `dist/cli.js`, so each shard rebuilds (~45s) and starts immediately.
   # fail-fast is off so a red shard still lets the others report their wall.
-  # Four shards: with three, shard 2 regularly ran 19–20 of its 20 minutes and
-  # was cancelled at the limit on master. Split further instead of raising the
+  # Four shards, split by recorded per-file duration (vitest.config.ts →
+  # scripts/duration-shards.mjs; table test/shard-timings.json) rather than
+  # vitest's equal-file-count hash split, which left one shard at 19–20 of its
+  # 20 minutes while another finished in 9. Rebalance instead of raising the
   # limit, so the timeout keeps catching a genuinely hung shard.
   test:
     name: test (${{ matrix.shard }}/4)
