@@ -806,8 +806,10 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
-    prepareTriggerPresentation(target, willFork || !!(stableTurnId || loudTurnId
-      || req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId));
+    // Every accepted external input owns its generated turn, including quiet
+    // report follow-ups on an already-running worker. Keep its reply anchor
+    // independent of presentation and final-output suppression options.
+    prepareTriggerPresentation(target, true);
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
     const currentWorkerGeneration = Math.max(
       target.workerGeneration ?? 0,
@@ -1298,7 +1300,12 @@ async function triggerSessionTurnAdmitted(
       return {
         ok: false,
         triggerId,
-        errorCode: 'trigger_failed',
+        // Pre-delivery rejection: the session exists but cannot accept input
+        // yet (directory choice, first start, worktree setup, queue). A
+        // distinct code keeps this apart from the catch-all `trigger_failed`,
+        // which can also surface POST-delivery bookkeeping faults — callers
+        // use this code to prove input never reached a worker.
+        errorCode: 'session_not_runnable',
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
@@ -1569,7 +1576,7 @@ async function triggerSessionTurnAdmitted(
       const dispatchAttempt = prepareStableDispatch(target, false);
       armFinalOutputSuppression(target, dispatchAttempt);
       armLoudFinalSuppression(target);
-      const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
+      const accepted = sendWorkerInput(target, content, triggerId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
@@ -1722,6 +1729,7 @@ async function triggerSessionTurnAdmitted(
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
   if (hasReasoningControl && effectiveReasoningEffort
+      && bot.config.cliId !== 'traex'
       && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
     return {
       ok: false,

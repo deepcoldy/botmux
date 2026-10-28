@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/opencode-resume.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -219,6 +219,38 @@ describe('opencode initial prompt completion', () => {
     seedRunningToolPart(db, 'ses_target', current);
     expect(isOpenCodeInitialPromptComplete(1_000, 'ses_target')).toBe(false);
     db.close();
+  });
+});
+
+// The hidden-schedule-run gate (#1607) concludes "never delivered" only from a
+// store it actually read: a read that fails must say so, not look like "no row".
+describe('opencode initial prompt argv submission lookup', () => {
+  it('finds the prompt once its user row lands after the baseline', () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_argv' });
+    const adapter = createOpenCodeAdapter();
+    const baseline = adapter.captureInitialPromptArgSubmission!()!;
+    expect(adapter.findInitialPromptArgSubmission!(baseline, 'scheduled prompt')).toEqual({ submitted: false });
+
+    seedUserPart(db, 'ses_argv', 'scheduled prompt', baseline + 1);
+    expect(adapter.findInitialPromptArgSubmission!(baseline, 'scheduled prompt'))
+      .toEqual({ submitted: true, cliSessionId: 'ses_argv' });
+    db.close();
+  });
+
+  it('flags a store it could not read instead of reporting the prompt absent', () => {
+    const db = openDb();
+    const adapter = createOpenCodeAdapter();
+    const baseline = adapter.captureInitialPromptArgSubmission!()!;
+    db.close();
+
+    rmSync(opencodeDbPath());
+    expect(adapter.findInitialPromptArgSubmission!(baseline, 'scheduled prompt'))
+      .toEqual({ submitted: false, unreadable: true });
+
+    writeFileSync(opencodeDbPath(), 'not a sqlite database');
+    expect(adapter.findInitialPromptArgSubmission!(baseline, 'scheduled prompt'))
+      .toEqual({ submitted: false, unreadable: true });
   });
 });
 

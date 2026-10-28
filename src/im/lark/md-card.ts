@@ -36,6 +36,7 @@ import {
   replyCardHeadingElementId,
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
+import { buildReplyCardActionOverflow, buildReplyCardChromeRow, type ReplyCardActionBinding } from './reply-card-actions.js';
 import { buildCompletionProposalElement } from './completion-proposal-card.js';
 import { composeFinalCardSections } from './final-card-sections.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
@@ -152,6 +153,9 @@ export interface CardUsageSnapshot {
   tokens: {
     in: number;
     out: number;
+    /** Optional cumulative cache reads / writes, both subsets of `in`. */
+    cacheReadTokens?: number;
+    cacheCreateTokens?: number;
   } | null;
   /** Delta for the latest user turn (small, matches the CLI TUI's per-turn
    *  ↑↓). Null for dialects without per-turn tracking. Rendered on the live
@@ -460,7 +464,8 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
 
 /** Format usage as one segment shared by reply-card footers and the live
  * streaming card. The caller supplies native facts; this module only formats
- * them and never infers a context window or token count. Returns null when no
+ * them (it may derive ratios between supplied counts) and never infers a
+ * context window or token count. Returns null when no
  * valid native metric is available.
  *
  * `variant`:
@@ -469,7 +474,8 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
  *     dropped here (it lives on the streaming card / usage ledger). 上下文占用
  *     is the one glanceable "how full am I" metric worth keeping.
  *   - `'streaming'`: rich — context + `本轮 ↑X ↓Y`(per-turn delta, matches the
- *     CLI TUI) + `累计 ↑A ↓B`(session total). The live card has room and
+ *     CLI TUI) + `累计 ↑A ↓B`(session total) + `缓存命中 N%`(session cache
+ *     reads over the cache-inclusive prompt total). The live card has room and
  *     refreshes during execution. */
 /**
  * True when a context snapshot is at/over the compact threshold — the single
@@ -590,6 +596,26 @@ export function cardUsageFooterSegment(
       `${t('card.usage.total', undefined, locale)} `
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
+    // Session cache hit rate: cache reads over the cache-inclusive prompt total.
+    // Dialects without cache fields still fold to 0/0, which is "unknown", not
+    // "0% hit" — so require one of the counters to be present and non-negative,
+    // and some cache activity. A session whose cache is only written (a remote
+    // provider reporting cacheCreate alone, or a first-turn Claude prompt) thus
+    // honestly renders 0%.
+    const cacheReadRaw = usage.tokens.cacheReadTokens;
+    const cacheCreateRaw = usage.tokens.cacheCreateTokens;
+    const cacheRead = isNonNegativeFinite(cacheReadRaw) ? cacheReadRaw : undefined;
+    const cacheCreate = isNonNegativeFinite(cacheCreateRaw) ? cacheCreateRaw : undefined;
+    if (usage.tokens.in > 0
+      && (cacheRead !== undefined || cacheCreate !== undefined)
+      && ((cacheRead ?? 0) > 0 || (cacheCreate ?? 0) > 0)) {
+      // floor, not round: 99.6% must not read as "100%" (everything cached).
+      // Multiply before dividing: (read / in) * 100 lands at x.99999… in
+      // floating point for exact integer percentages (290000 / 1e6 → 28).
+      // Token counts are integers far below 2^53 / 100, so read * 100 is exact.
+      const pct = Math.min(100, Math.floor((cacheRead ?? 0) * 100 / usage.tokens.in));
+      parts.push(`${t('card.usage.cache_hit', undefined, locale)} ${pct}%`);
+    }
   }
   // Runtime identity is formatted separately by cardUsageRuntimeSegment. Keep
   // this function metric-only so callers can also render identity without usage.
@@ -699,6 +725,24 @@ export function cardModelFallbackNotice(
   }, locale);
 }
 
+function formatReplyDuration(durationMs: number, locale?: Locale): string {
+  // Round before splitting units so seconds never overflow into 60.0.
+  const tenths = Math.round(durationMs / 100);
+  if (tenths < 600) {
+    return t('card.duration_seconds', { seconds: (tenths / 10).toFixed(1) }, locale);
+  }
+  const hours = Math.floor(tenths / 36000);
+  const minutes = Math.floor((tenths % 36000) / 600);
+  const seconds = (tenths % 600) / 10;
+  const parts: string[] = [];
+  if (hours > 0) parts.push(t('card.duration_hours', { hours }, locale));
+  if (minutes > 0) parts.push(t('card.duration_minutes', { minutes }, locale));
+  if (seconds > 0) {
+    parts.push(t('card.duration_seconds', { seconds: seconds.toFixed(1) }, locale));
+  }
+  return parts.join(' ');
+}
+
 /** Build the one canonical footer shared by all Bot Session reply cards.
  * Ordering, i18n, the parser marker, grey styling, and recipient rendering live
  * here so direct sends and daemon fallbacks cannot drift apart. */
@@ -728,10 +772,10 @@ export function buildReplyCardFooter(opts: {
   const waitingMs = opts.presentation?.timing?.waitingDurationMs ?? opts.waitingDurationMs;
   const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
   if (hasWaiting) {
-    parts.push(t('card.waiting_duration', { seconds: (waitingMs / 1000).toFixed(1) }, opts.locale));
+    parts.push(t('card.waiting_duration', { duration: formatReplyDuration(waitingMs, opts.locale) }, opts.locale));
   }
   if (hasDuration) {
-    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
+    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { duration: formatReplyDuration(durationMs, opts.locale) }, opts.locale));
   }
   const recipientOpenIds = !policy.recipients ? [] : [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
@@ -777,21 +821,26 @@ export function buildReplyCardFooter(opts: {
   };
 }
 
-/** Compose the entire footer once: text, divider and optional voice action. */
+/** Compose the entire footer once: text, divider and optional voice/menu
+ * actions. Footer, voice and the per-bot reply-card action menu share one
+ * chrome row (stable id `botmux_reply_actions`) so the on-call button, long
+ * card degradation and group-context projection can locate them. */
 export function buildReplyCardFooterElements(
-  opts: Parameters<typeof buildReplyCardFooter>[0] & { voiceButton?: Record<string, unknown> },
+  opts: Parameters<typeof buildReplyCardFooter>[0] & {
+    voiceButton?: Record<string, unknown>;
+    actionMenu?: Record<string, unknown>;
+  },
 ): any[] {
   const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
   if (!policy.enabled) return [];
   const footer = buildReplyCardFooter(opts);
-  const voice = policy.voice ? opts.voiceButton : undefined;
-  if (!footer && !voice) return [];
-  return [{ tag: 'hr' }, ...(voice ? [{
-    tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'default', columns: [
-      { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [footer?.element ?? { tag: 'markdown', text_size: 'notation', content: ' ' }] },
-      { tag: 'column', width: 'auto', vertical_align: 'center', elements: [voice] },
-    ],
-  }] : [footer!.element])];
+  const controls: Array<Record<string, unknown>> = [];
+  if (policy.voice && opts.voiceButton) controls.push(opts.voiceButton);
+  if (opts.actionMenu) controls.push(opts.actionMenu);
+  if (!footer && controls.length === 0) return [];
+  return [{ tag: 'hr' }, ...(controls.length > 0
+    ? [buildReplyCardChromeRow({ footer, controls })]
+    : [footer!.element])];
 }
 
 /** Clone a caller-supplied schema-2 card and append the canonical reply
@@ -1583,6 +1632,8 @@ export function buildCanonicalFinalReplyCard(opts: {
   executionDurationMs?: number;
   waitingDurationMs?: number;
   presentation?: ReplyCardPresentation;
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
@@ -1595,6 +1646,9 @@ export function buildCanonicalFinalReplyCard(opts: {
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
+    ...(opts.cardActions
+      ? { actionMenu: buildReplyCardActionOverflow(opts.cardActions, opts.locale) }
+      : {}),
   });
   elements.push(...footerElements);
   const card = createReplyCard(elements);
@@ -1647,6 +1701,8 @@ export function buildContextualReplyCard(opts: {
   waitingDurationMs?: number;
   presentation?: ReplyCardPresentation;
   feedback?: { policy: FeedbackPolicy };
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const {
     title,
@@ -1697,6 +1753,9 @@ export function buildContextualReplyCard(opts: {
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     presentation: opts.presentation,
+    ...(opts.cardActions
+      ? { actionMenu: buildReplyCardActionOverflow(opts.cardActions, locale) }
+      : {}),
   });
   elements.push(...footerElements);
 

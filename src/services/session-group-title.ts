@@ -23,7 +23,7 @@ import { credentialIsolationRequired, deviceCredentialIsolationMarkerPath } from
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE } from '../platform/device-paths.js';
 import { cliConfigDirEnvKey } from '../core/cli-config-dir.js';
-import { botInjectedEnv, buildSessionChildEnv, type EnvPolicy } from '../core/env-policy.js';
+import { botOneShotEnv, type SessionEnvBotInput } from '../core/session-env-resolve.js';
 import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
 import { renameChat } from './groups-store.js';
 import {
@@ -59,6 +59,10 @@ export const ONE_SHOT_ARGV: Record<string, string[]> = {
   gemini: ['gemini', '-p'],
   antigravity: ['agy', '-p'],
   grok: ['grok', '-p'],
+  // pi / oh-my-pi share the same `-p`/`--print` non-interactive print mode —
+  // bare answer on stdout, no tools needed for a title.
+  pi: ['pi', '-p'],
+  'oh-my-pi': ['omp', '-p'],
 };
 
 /** One in-flight title job per chat — birth and the heal-on-activity path
@@ -101,11 +105,8 @@ export function resolveOneShotCommand(
   return { argv: [...template] };
 }
 
-export function buildOneShotEnv(botEnv: unknown, envPolicy?: EnvPolicy): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...buildSessionChildEnv(process.env, envPolicy),
-    ...botInjectedEnv(botEnv, envPolicy),
-  };
+export function buildOneShotEnv(bot: SessionEnvBotInput = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = botOneShotEnv(process.env, bot);
   // Never let the one-shot inherit a botmux session identity (redundant with
   // the marker scrub above, kept as an explicit invariant).
   delete env.BOTMUX_SESSION_ID;
@@ -255,7 +256,7 @@ export async function generateOneShotTitle(opts: {
   const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
 
   const runOnce = () => new Promise<string>((resolve, reject) => {
-    const env = { ...buildOneShotEnv(cfg.env, cfg.envPolicy), ...wrapperEnv, ...oneShotProfileEnv(cfg) };
+    const env = { ...buildOneShotEnv(cfg), ...wrapperEnv, ...oneShotProfileEnv(cfg) };
     const child = execFile(argv[0], [...argv.slice(1), prompt], {
       timeout: TITLE_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,

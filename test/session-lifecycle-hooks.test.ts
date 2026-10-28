@@ -118,6 +118,8 @@ import {
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { logger } from '../src/utils/logger.js';
+import { updateSession } from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -503,7 +505,8 @@ describe('worker-pool lifecycle hook integration', () => {
     const ds = makeDs({ worker });
     ds.session.cliId = 'remote-runner';
     ds.session.backendType = 'remote-runner';
-    const reconcile = vi.fn(() => true);
+    ds.suppressRecoveryCard = true;
+    const reconcile = vi.fn(async () => true);
     __testOnly_setupWorkerHandlers(ds, worker, {
       ready: true,
       failureNotified: false,
@@ -523,7 +526,7 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('disarms remote rebuild reconciliation after backend state is durable', async () => {
+  it('keeps remote rebuild reconciliation armed while canonical commit is pending', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });
     ds.session.cliId = 'remote-runner';
@@ -533,6 +536,7 @@ describe('worker-pool lifecycle hook integration', () => {
       provider: 'reference',
       generation: 2,
     };
+    ds.suppressRecoveryCard = true;
     const reconcile = vi.fn(() => true);
     const startupState = {
       ready: true,
@@ -553,8 +557,42 @@ describe('worker-pool lifecycle hook integration', () => {
     await flush();
 
     expect(ds.session.remoteBackendState?.generation).toBe(3);
-    expect(startupState.onRemoteBackendStartupExit).toBeUndefined();
+    expect(startupState.onRemoteBackendStartupExit).toBe(reconcile);
     expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it('retires an exited remote provider after canonical commit without replaying startup rollback', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.suppressRecoveryCard = undefined;
+    const reconcile = vi.fn(async () => true);
+    __testOnly_setupWorkerHandlers(ds, worker, {
+      ready: true,
+      failureNotified: false,
+      onRemoteBackendStartupExit: reconcile,
+    } as any);
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await flush();
+
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0]?.[1]).toEqual(expect.stringContaining('不支持重启'));
   });
 
   it('keeps remote rebuild reconciliation armed for the initial same-generation state replay', async () => {
@@ -574,7 +612,8 @@ describe('worker-pool lifecycle hook integration', () => {
       provider: 'reference',
       generation: 2,
     };
-    const reconcile = vi.fn(() => true);
+    ds.suppressRecoveryCard = true;
+    const reconcile = vi.fn(async () => true);
     const startupState = {
       ready: true,
       failureNotified: false,
@@ -607,6 +646,46 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(ds.worker).toBeNull();
     expect(sessionReply).not.toHaveBeenCalled();
   });
+
+  it.each(['preparing', 'uncertain'] as const)(
+    'keeps a latched mojo %s close fence when the provider exits (fence clearing is remote-runner-only)',
+    async phase => {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/repo',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker });
+      ds.session.cliId = 'mojo';
+      ds.session.backendType = 'mojo';
+      ds.remoteCloseState = { phase, requestId: 'mojo-close-req', taskId: 'sid-mojo' };
+      __testOnly_setupWorkerHandlers(ds, worker, {
+        ready: true,
+        failureNotified: false,
+      } as any);
+
+      worker.emit('message', {
+        type: 'claude_exit',
+        code: 1,
+        signal: null,
+      });
+      await flush();
+
+      // The dead provider worker is still retired, but the mojo close verdict
+      // must survive for durable journal reconciliation: clearing an in-flight
+      // fence on provider exit is deliberately scoped to remote-runner.
+      expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(ds.worker).toBeNull();
+      expect(ds.remoteCloseState).toEqual({
+        phase,
+        requestId: 'mojo-close-req',
+        taskId: 'sid-mojo',
+      });
+    },
+  );
 
   it('clears the persisted terminal port and Dashboard proxy state on worker exit', () => {
     const worker = makeFakeWorker();
@@ -700,6 +779,55 @@ describe('worker-pool lifecycle hook integration', () => {
       workerGeneration: 1,
       disposition: 'queued_removed',
     });
+  });
+
+  it('exit handler isolates sessionStore.updateSession failures without skipping reconciliation', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    // Simulate a durable row-persist failure (SQLite busy timeout, disk full).
+    // The crash vector: the daemon has no global uncaughtException trap, so a
+    // throwing exit handler would take down every other session.
+    vi.mocked(updateSession).mockImplementationOnce(() => {
+      throw new Error('database is locked (SQLITE_BUSY: busy timeout)');
+    });
+
+    // The emit must NOT throw — the narrow try/catch around the persistence
+    // write isolates the failure and logs it instead of propagating.
+    expect(() => worker.emit('exit', 1, null)).not.toThrow();
+    await flush();
+
+    // The persistence failure was logged at the narrow catch site.
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to persist worker exit generation'),
+    );
+    // Durable-exit reconciliation still ran exactly once despite the write failure.
+    expect(onWorkerExit).toHaveBeenCalledTimes(1);
+    expect(onWorkerExit).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ sessionId: 'sid-lifecycle-test', code: 1 }),
+    );
+    // The dashboard dormant-update and the session.exit lifecycle hook still
+    // fired exactly once: an active row's worker death publishes session.update
+    // (dormant) rather than session.exited (see worker-exit-dashboard-event.ts).
+    const dormantPublishes = dashboardEventBus.publish.mock.calls.filter(
+      ([event]) => (event as { type?: string; body?: { patch?: { status?: string } } })
+        .body?.patch?.status === 'dormant',
+    );
+    expect(dormantPublishes).toHaveLength(1);
+    expect(emitHookEventMock).toHaveBeenCalledWith(
+      'session.exit',
+      expect.objectContaining({ sessionId: 'sid-lifecycle-test', reason: 'exit_code_1' }),
+    );
   });
 });
 

@@ -240,6 +240,7 @@ describe('XPI switch — adoption semantics against the real authority', () => {
     })).toBe(true);
     expect(authority.identity()).toEqual({
       turnId: 'turn-b',
+      identityTurnId: 'turn-a',
       dispatchAttempt: 2,
       caller: A,
       controller: controllerA,

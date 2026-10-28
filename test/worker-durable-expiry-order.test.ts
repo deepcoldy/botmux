@@ -13,7 +13,7 @@ import { isRemoteBackendType } from '../src/core/persistent-backend.js';
 import { decideRestartFollowup, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
-type Restart = (reason: string, opts?: { immediate?: boolean; preservePending?: boolean }) => Promise<void>;
+type Restart = (reason: string, opts?: { immediate?: boolean; preservePending?: boolean; restartCause?: 'traex-auto-model' }) => Promise<void>;
 
 function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
   const timers: Array<() => unknown> = [];
@@ -44,11 +44,14 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
     CliSpawnSupersededError: class extends Error {},
     log: vi.fn(),
     revokeManagedTurnOriginForRestart: vi.fn(),
+    traexAutoModelController: { noteProcessExited: vi.fn() },
     stopOwnedSessionScope: vi.fn(),
     startScreenUpdates: vi.fn(),
     startStuckDetector: vi.fn(),
     adoptPendingLaunchConvergence: vi.fn(),
     codexRpcEligible: () => false,
+    traexAutoModelRuntimeEligible: () => false,
+    traexAutoModelSwitching: false,
     sandboxEnabled: () => false,
     prepareCodexNativeTitleGeneration: vi.fn(async () => {}),
     settleRestartAttemptOnReady: vi.fn(),
@@ -78,6 +81,13 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
 }
 
 describe('worker restart input fence', () => {
+  it('preserves the activity latch only for a capacity-model rotation', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    await h.restart('capacity rotation', { preservePending: true, restartCause: 'traex-auto-model' });
+    await h.runSpawnTimer();
+    expect(h.scope.traexAutoModelController.noteProcessExited).toHaveBeenCalledWith(true);
+  });
+
   it('keeps the input fence armed through teardown and spawn, then leaves the first flush to markPromptReady', async () => {
     const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
 
@@ -89,6 +99,7 @@ describe('worker restart input fence', () => {
 
     await h.runSpawnTimer();
     expect(h.scope.spawnCli).toHaveBeenCalledTimes(1);
+    expect(h.scope.traexAutoModelController.noteProcessExited).toHaveBeenCalledWith(false);
     expect(h.observed.fenceArmedDuringSpawn).toBe(true);
     expect(h.scope.cliRestartInProgress).toBe(false);
     // The replacement process exists but its prompt is not ready: no

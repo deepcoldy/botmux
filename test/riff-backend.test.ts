@@ -65,6 +65,29 @@ describe('RiffBackend', () => {
 
   const flush = () => new Promise((r) => setTimeout(r, 0));
 
+  it('refreshes the host-tools binding on follow-ups instead of reusing creation env', async () => {
+    let turn = 0;
+    const be = makeBackend({ hostToolsBinding: () => ({ url: 'https://host.example/api/riff-host-tools',
+      token: String(++turn).repeat(43), sessionId: 'session-1', turnId: `turn-${turn}` }) });
+    const decode = (prompt: string) => JSON.parse(Buffer.from(
+      /botmux riff-host-bind ([A-Za-z0-9_-]+)/.exec(prompt)![1]!, 'base64url').toString());
+    try {
+      be.write('first request');
+      await flush();
+      const first = JSON.parse(calls.find(c => c.url.includes('/api/task-execute'))!.init!.body as string);
+      expect(decode(first.config.userPrompt).turnId).toBe('turn-1');
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      be.write('second request');
+      await flush();
+      const second = JSON.parse(calls.find(c => c.url.includes('/api/task-follow-up'))!.init!.body as string);
+      expect(decode(second.prompt).turnId).toBe('turn-2');
+      expect(decode(second.prompt).token).not.toBe(decode(first.config.userPrompt).token);
+      resolvers.shift()!(taskResponse('task-2'));
+      await flush();
+    } finally { be.kill(); }
+  });
+
   describe('attachment multipart uploads', () => {
     let dir: string;
     let be: RiffBackend;
@@ -100,6 +123,13 @@ describe('RiffBackend', () => {
       { label: 'ordinary binary file', name: 'data.bin', bytes: Buffer.from([0, 1, 2, 255]), mime: 'application/octet-stream', tag: 'file' },
       { label: 'unknown bytes with an image extension', name: 'unknown.png', bytes: Buffer.from('not an image'), mime: 'application/octet-stream', tag: 'image' },
       { label: 'empty image', name: 'empty.jpg', bytes: Buffer.alloc(0), mime: 'application/octet-stream', tag: 'image' },
+      { label: 'JSON text', name: 'data.json', bytes: Buffer.from('{"ok":true}'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'TXT text', name: 'notes.txt', bytes: Buffer.from('text'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'LOG text', name: 'service.log', bytes: Buffer.from('log'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'Markdown text', name: 'README.md', bytes: Buffer.from('# title'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'CSV text', name: 'rows.csv', bytes: Buffer.from('a,b'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'YAML text', name: 'config.yaml', bytes: Buffer.from('a: b'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'YML text', name: 'config.yml', bytes: Buffer.from('a: b'), mime: 'application/octet-stream', tag: 'file' },
     ];
 
     describe.each(['task-execute', 'task-follow-up'])('%s', (endpoint) => {
@@ -117,16 +147,19 @@ describe('RiffBackend', () => {
         const upload = calls.find(c => c.url.endsWith(`/api/${endpoint}`));
         expect(upload).toBeDefined();
         expect(upload!.init?.body).toBeInstanceOf(FormData);
-        // Check the serialized header directly: Bun's multipart parser can
-        // infer a File's type from its name instead of preserving this header.
+        // Check serialized bytes directly: runtime multipart parsers may
+        // normalize headers or binary parts and mask wire-level regressions.
         const request = new Request(upload!.url, upload!.init);
-        const multipart = await request.clone().text();
-        expect(multipart).toContain(`\r\nContent-Type: ${mime}\r\n`);
+        const serialized = Buffer.from(await request.clone().arrayBuffer());
+        const multipart = serialized.toString('latin1');
+        const fileHeader = `filename="${name}"\r\nContent-Type: ${mime}\r\n\r\n`;
+        const fileHeaderOffset = multipart.indexOf(fileHeader);
+        expect(fileHeaderOffset).toBeGreaterThanOrEqual(0);
+        expect(multipart.toLowerCase()).not.toContain('charset=');
+        const contentOffset = fileHeaderOffset + Buffer.byteLength(fileHeader, 'latin1');
+        expect(serialized.subarray(contentOffset, contentOffset + bytes.length)).toEqual(bytes);
+        expect(serialized.subarray(contentOffset + bytes.length, contentOffset + bytes.length + 2).toString('latin1')).toBe('\r\n');
         const form = await request.formData();
-        const files = form.getAll('attachments') as File[];
-        expect(files).toHaveLength(1);
-        expect(files[0]!.name).toBe(name);
-        expect(Buffer.from(await files[0]!.arrayBuffer())).toEqual(bytes);
         const payload = JSON.parse(String(form.get('payload')));
         const prompt = endpoint === 'task-execute' ? payload.config.userPrompt : payload.prompt;
         expect(prompt).toContain('inspect this');

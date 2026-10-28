@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 
 const mocks = vi.hoisted(() => {
   const dataDir = `${process.env.TMPDIR ?? '/tmp'}/report-ipc-import-${process.pid}`;
@@ -34,6 +36,10 @@ import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { createDispatchReportBinding, dispatchReportBindingSecretPath } from '../src/core/dispatch-report-binding.js';
 import { loadOrCreateDashboardSecret } from '../src/dashboard/auth.js';
+import {
+  UNDELIVERED_REPORT_RELAY_REASON_TEXT,
+  type UndeliveredReportRelayReason,
+} from '../src/core/report-session-relay.js';
 
 const APP = 'cli_report_ipc';
 const CHAT = 'oc_report';
@@ -151,5 +157,194 @@ describe('report publication IPC', () => {
     expect(mocks.fetch.mock.calls.filter(call => call[1] === '/api/trigger')).toHaveLength(1);
     expect((await report({ delivery: 'publish-and-relay' })).body).toEqual(retry.body);
     expect(mocks.fetch.mock.calls.filter(call => call[1] === '/api/trigger')).toHaveLength(1);
+  });
+});
+
+describe('relay fallback publication (#2262)', () => {
+  const relayReport = (overrides: Record<string, unknown> = {}) =>
+    report({ delivery: 'relay', relayFallback: 'publish', explicitDispatchRoot: true, ...overrides });
+  const triggerCalls = () => mocks.fetch.mock.calls.filter(call => call[1] === '/api/trigger');
+  const rewriteBinding = (overrides: Record<string, unknown>) => {
+    const secret = loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(root));
+    writeFileSync(join(root, 'orchestrate-dispatch.json'), JSON.stringify({
+      om_dispatch: { orchAppId: 'cli_lead', orchSessionId: 'lead', reportBinding: createDispatchReportBinding(secret, {
+        dispatchRoot: 'om_dispatch', targetLarkAppId: 'cli_lead', targetSessionId: 'lead', sourceName: 'task',
+        issuedAt: new Date().toISOString(), ...overrides,
+      }) },
+    }));
+  };
+  /** The target daemon answers /api/trigger with this; other paths succeed. */
+  const targetAnswers = (status: number, body: Record<string, unknown>, sessions: unknown[] = []) => {
+    mocks.fetch.mockImplementation(async (_port: number, path: string) => new Response(JSON.stringify(
+      path === '/api/trigger' ? body : path === '/api/sessions' ? { sessions } : { ok: true },
+    ), { status: path === '/api/trigger' ? status : 200 }));
+  };
+  /** Markdown blocks of the published card, in display order. */
+  const publishedCardBlocks = (): string[] => {
+    const card = JSON.parse(mocks.reply.mock.calls.at(-1)![2] as string);
+    return (card.body.elements as Array<{ tag: string; content?: string }>)
+      .filter(element => element.tag === 'markdown').map(element => element.content ?? '');
+  };
+  const expectFallbackPublished = (
+    result: Awaited<ReturnType<typeof report>>,
+    reason: UndeliveredReportRelayReason,
+  ) => {
+    expect(result).toMatchObject({ status: 200, body: {
+      ok: true, publishedMessageId: 'om_reply',
+      publicationTarget: { mode: 'thread', rootMessageId: 'om_dispatch', chatId: CHAT },
+      relayFallback: { reason, published: true },
+    } });
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(mocks.reply).toHaveBeenCalledWith(APP, 'om_dispatch', expect.any(String), 'interactive', true,
+      expect.any(String), expect.objectContaining({ sessionId: 'source' }));
+    // The notice leads the card; the original report follows it unchanged.
+    const [notice, ...rest] = publishedCardBlocks();
+    expect(notice).toContain(`未送达主编排：${UNDELIVERED_REPORT_RELAY_REASON_TEXT[reason]}`);
+    expect(rest).toEqual(['Result', 'Done']);
+  };
+
+  it('publishes visibly when the orchestrator daemon is offline', async () => {
+    mocks.online.mockReturnValue(undefined);
+    expectFallbackPublished(await relayReport(), 'orchestrator_offline');
+    expect(triggerCalls()).toHaveLength(0);
+  });
+
+  it('publishes visibly when the listed orchestrator daemon refuses the connection', async () => {
+    const closed = createServer();
+    await new Promise<void>(done => closed.listen(0, '127.0.0.1', done));
+    const closedPort = (closed.address() as AddressInfo).port;
+    await new Promise<void>(done => closed.close(() => done()));
+    const actual = await vi.importActual<typeof import('../src/core/daemon-ipc-auth.js')>('../src/core/daemon-ipc-auth.js');
+    mocks.fetch.mockImplementation((_port: number, path: string, init: RequestInit) =>
+      actual.fetchDaemonIpc(closedPort, path, init, 'test-ipc-secret'));
+    expectFallbackPublished(await relayReport(), 'orchestrator_offline');
+  });
+
+  it('publishes visibly when the signed thread orchestrator session has closed', async () => {
+    rewriteBinding({ targetChatId: 'oc_lead', targetScope: 'thread' });
+    targetAnswers(404, { ok: false, errorCode: 'session_not_found', error: 'active session not found: lead' });
+    const result = await relayReport();
+    expectFallbackPublished(result, 'orchestrator_session_closed');
+    expect(result.body.relayFallback).toMatchObject({ relayStatus: 409, relayError: 'fallback_scope_unsupported' });
+  });
+
+  it('publishes visibly when a chat orchestrator closed without a unique successor', async () => {
+    rewriteBinding({ targetChatId: 'oc_lead', targetScope: 'chat' });
+    targetAnswers(404, { ok: false, errorCode: 'session_not_found' }, [
+      { sessionId: 'lead', larkAppId: 'cli_lead', chatId: 'oc_lead', scope: 'chat', status: 'closed' },
+    ]);
+    expectFallbackPublished(await relayReport(), 'orchestrator_session_closed');
+  });
+
+  it('publishes visibly when the orchestrator session is still waiting to start', async () => {
+    targetAnswers(500, { ok: false, errorCode: 'session_not_runnable',
+      error: 'target session lead is not runnable (pending_repo); preserving its opening prompt' });
+    expectFallbackPublished(await relayReport(), 'orchestrator_session_not_ready');
+  });
+
+  it('publishes visibly for a named dispatch root that is no longer registered, without touching any daemon', async () => {
+    writeFileSync(join(root, 'orchestrate-dispatch.json'), '{}');
+    expectFallbackPublished(await relayReport(), 'dispatch_target_gone');
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it('keeps an implicit dispatch root miss as a plain 404 for the CLI to place itself', async () => {
+    writeFileSync(join(root, 'orchestrate-dispatch.json'), '{}');
+    expect(await relayReport({ explicitDispatchRoot: undefined })).toEqual({
+      status: 404, body: { ok: false, error: 'dispatch_target_unavailable' },
+    });
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(journals()).toEqual([]);
+  });
+
+  it('returns the same relay receipt with or without the fallback opt-in when the orchestrator accepts it', async () => {
+    const withFallback = await relayReport();
+    const without = await report({ delivery: 'relay' });
+    expect(withFallback).toEqual(without);
+    expect(withFallback).toMatchObject({ status: 200, body: { ok: true, triggerId: 'trigger-report',
+      reportTarget: { sessionId: 'lead', larkAppId: 'cli_lead' } } });
+    expect(withFallback.body).not.toHaveProperty('relayFallback');
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(journals()).toEqual([]);
+  });
+
+  it('leaves relay failures unchanged for callers that did not opt in', async () => {
+    mocks.online.mockReturnValue(undefined);
+    expect(await report({ delivery: 'relay' })).toEqual({
+      status: 503, body: { ok: false, error: 'orchestrator_daemon_offline' },
+    });
+    mocks.online.mockReturnValue({ ipcPort: 19999 });
+    targetAnswers(500, { ok: false, errorCode: 'session_not_runnable', error: 'not runnable' });
+    const notReady = await report({ delivery: 'relay' });
+    expect(notReady.status).toBe(500);
+    expect(notReady.body).not.toHaveProperty('relayFallback');
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(journals()).toEqual([]);
+  });
+
+  it.each([
+    { name: 'bot not in chat', status: 403, body: { ok: false, errorCode: 'bot_not_in_chat', error: 'bot left' } },
+    { name: 'bad request', status: 400, body: { ok: false, errorCode: 'bad_request', error: 'apiOnly target' } },
+    { name: 'generic 500 trigger_failed (possibly post-delivery)', status: 500,
+      body: { ok: false, errorCode: 'trigger_failed', error: 'receipt persistence failed after worker acceptance' } },
+    { name: 'untyped 404', status: 404, body: { ok: false, error: 'active session not found: lead' } },
+  ])('does not publish for a relay failure it cannot prove undelivered: $name', async ({ status, body }) => {
+    targetAnswers(status, body);
+    const result = await relayReport();
+    expect(result.status).toBe(status);
+    expect(result.body).toMatchObject({ ok: false });
+    expect(result.body).not.toHaveProperty('relayFallback');
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(journals()).toEqual([]);
+  });
+
+  it.each([
+    { blockedBy: 'private_card', setup: () => { getBot(APP).config.privateCard = true; } },
+    { blockedBy: 'no_lark_transport', setup: () => { getBot(APP).config.apiOnly = true; } },
+    { blockedBy: 'prompt_injection', setup: () => { ds.session.promptInjection = 'none'; } },
+  ])('refuses the fallback with an explicit reason for $blockedBy', async ({ blockedBy, setup }) => {
+    setup();
+    mocks.online.mockReturnValue(undefined);
+    expect(await relayReport()).toEqual({ status: 503, body: {
+      ok: false, error: 'orchestrator_daemon_offline',
+      relayFallback: {
+        reason: 'orchestrator_offline', reasonText: UNDELIVERED_REPORT_RELAY_REASON_TEXT.orchestrator_offline,
+        relayStatus: 503, relayError: 'orchestrator_daemon_offline',
+        published: false, publicationError: 'report_publication_unavailable', blockedBy,
+      },
+    } });
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(mocks.send).not.toHaveBeenCalled();
+    expect(journals()).toEqual([]);
+  });
+
+  it('reports a failed fallback publication instead of claiming the report is visible', async () => {
+    mocks.online.mockReturnValue(undefined);
+    mocks.reply.mockRejectedValueOnce(Object.assign(new Error('withdrawn'), { name: 'MessageWithdrawnError' }));
+    expect(await relayReport()).toMatchObject({ status: 503, body: {
+      ok: false, error: 'orchestrator_daemon_offline',
+      relayFallback: { reason: 'orchestrator_offline', published: false, publicationError: 'report_publication_rejected' },
+    } });
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it('does not publish when the reporting turn changed while the relay was in flight', async () => {
+    mocks.fetch.mockImplementation(async (_port: number, path: string) => {
+      if (path === '/api/trigger') {
+        ds.managedTurnOrigin = { capability: 'd'.repeat(64), turnId: 'turn-next', dispatchAttempt: 1 };
+        return new Response(JSON.stringify({ ok: false, errorCode: 'session_not_runnable', error: 'not runnable' }), { status: 500 });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    const result = await relayReport();
+    expect(result.status).toBe(500);
+    expect(result.body.relayFallback).toMatchObject({ reason: 'orchestrator_session_not_ready', published: false });
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(journals()).toEqual([]);
+  });
+
+  it('replays the first fallback when the same report is retried in the same turn', async () => {
+    mocks.online.mockReturnValue(undefined);
+    const first = await relayReport();
+    mocks.online.mockReturnValue({ ipcPort: 19999 });
+    targetAnswers(500, { ok: false, errorCode: 'session_not_runnable', error: 'not runnable' });
+    const retry = await relayReport();
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(retry.body.publishedMessageId).toBe(first.body.publishedMessageId);
+    expect(retry.body.relayFallback).toMatchObject({ reason: 'orchestrator_session_not_ready', published: true });
   });
 });

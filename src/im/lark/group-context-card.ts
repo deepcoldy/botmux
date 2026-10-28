@@ -185,7 +185,7 @@ function optionButtons(node: CardNode): CardNode[] {
     && ['ask_select', 'ask_toggle'].includes(callbackValue(child)?.action));
 }
 
-const RUNTIME_ID = /^(?:botmux_turn_(?:status|usage|process|thinking|tools|control)(?:_\d+|_ask_\d+)?|botmux_turn_progress_\d+|botmux_feedback|botmux_oncall_group|botmux_reply_footer)$/;
+const RUNTIME_ID = /^(?:botmux_turn_(?:status|usage|process|thinking|tools|control)(?:_\d+|_ask_\d+)?|botmux_turn_progress_\d+|botmux_feedback|botmux_oncall_group|botmux_reply_footer|botmux_reply_actions)$/;
 
 function buttonLink(node: CardNode): string | undefined {
   const destinations = [node.url, node.multi_url?.url, node.multi_url?.pc_url, node.multi_url?.android_url, node.multi_url?.ios_url];

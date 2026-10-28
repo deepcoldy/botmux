@@ -28,10 +28,19 @@ It does not silently downgrade to pty; it **hard-gates**: when starting a new se
 # Interactive session list; attach directly after selecting
 botmux list
 
-# Manual attach (session name = bmx-<first 8 chars of sessionId>)
-tmux attach -t bmx-<first8>
+# Manual attach (session name = bmx-<first 8 chars of sessionId>, on botmux's own tmux server)
+tmux -L botmux attach -t bmx-<first8>
+tmux -L botmux ls            # list every managed session
 # Ctrl+B, D to detach, without affecting the running CLI
 ```
+
+### Why managed sessions are not on the default tmux server
+
+Sessions botmux manages run on a dedicated socket (`tmux -L botmux`) instead of sharing your default server. A stray `tmux kill-server` — typed in your terminal, or run by a bot inside its own pane — then only affects your own sessions on the default server, not every bot session at once. `TMUX_TMPDIR` is honoured as usual (the socket is `$TMUX_TMPDIR/tmux-<uid>/botmux`).
+
+- **Sessions created before upgrading** keep running on the default server (`tmux attach -t bmx-…` still works) and move to the dedicated socket the next time they have to be created again (CLI restart, cold resume). `botmux list`, the Web terminal and the Dashboard terminal page find each session where it is recorded.
+- **`/adopt` is unaffected**: it takes over panes you opened on your default server.
+- **To keep the old behaviour**, set `BOTMUX_TMUX_SOCKET=default` in `~/.botmux/.env`; new sessions then go back to the default server. Any other plain name (letters, digits, `_` `.` `-`) picks a different socket.
 
 Once you attach, what you see is a terminal exactly identical to your local development — and this is the key difference between botmux and "read-only output" approaches. The Lark topic, the Web terminal, and your local tmux all show the same process; see [Web Terminal](/en/web-terminal).
 

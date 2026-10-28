@@ -148,6 +148,7 @@ export function applySessionRowCommand(
     case 'worker-exited':
       if (row.pid !== command.pid) return { outcome: 'refused', reason: 'worker_changed' };
       row.pid = undefined;
+      row.pidProcStart = undefined;
       return { outcome: 'applied', released: {} };
   }
 }

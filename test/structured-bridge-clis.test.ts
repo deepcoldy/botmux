@@ -41,11 +41,13 @@ describe('structured-bridge-clis', () => {
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('ebsd');
   });
 
-  it('fallback treats cursor as adopt-only and antigravity as zero-prompt-only', () => {
-    expect(isStructuredBridgeFallbackActive('cursor')).toBe(false);
+  it('cursor is always-on and antigravity stays zero-prompt-only', () => {
+    // Plan B (#932): an ordinary botmux-spawned cursor gets the same
+    // send-marker-gated transcript harvest as codex.
+    expect(isStructuredBridgeFallbackActive('cursor')).toBe(true);
     expect(isStructuredBridgeFallbackActive('cursor', true)).toBe(true);
     expect(isStructuredBridgeFallbackActive('cursor', false, true)).toBe(true);
-    expect(isStructuredBridgeFallbackActive('cursor', false, false)).toBe(false);
+    expect(isStructuredBridgeFallbackActive('cursor', false, false)).toBe(true);
     expect(isStructuredBridgeFallbackActive('antigravity')).toBe(false);
     expect(isStructuredBridgeFallbackActive('antigravity', false, true)).toBe(true);
     expect(isStructuredBridgeFallbackActive('antigravity', false, false)).toBe(false);
@@ -57,12 +59,12 @@ describe('structured-bridge-clis', () => {
     expect(isStructuredBridgeFallbackActive('hermes')).toBe(true);
   });
 
-  it('exposes the zero-prompt structured capability without widening default transcript delivery', () => {
-    for (const id of ['cursor', 'antigravity']) {
-      expect(supportsZeroPromptStructuredBridge(id)).toBe(true);
-      // Default mode still expects these two to answer via `botmux send`.
-      expect(supportsTranscriptReplyDelivery(id)).toBe(false);
-    }
+  it('cursor supports ordinary transcript delivery; antigravity stays zero-prompt-only', () => {
+    expect(supportsZeroPromptStructuredBridge('cursor')).toBe(true);
+    expect(supportsTranscriptReplyDelivery('cursor')).toBe(true);
+    // antigravity: zero-prompt capability exists, ordinary delivery does not.
+    expect(supportsZeroPromptStructuredBridge('antigravity')).toBe(true);
+    expect(supportsTranscriptReplyDelivery('antigravity')).toBe(false);
     expect(supportsZeroPromptStructuredBridge('codex')).toBe(true);
     expect(supportsZeroPromptStructuredBridge('claude-code')).toBe(false);
     expect(supportsTranscriptReplyDelivery('claude-code')).toBe(true);

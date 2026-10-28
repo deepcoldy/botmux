@@ -15,6 +15,7 @@ const JSON_HEAD = { 'content-type': 'application/json' };
 const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = [
   ['PUT', '/api/bots/cli_a/working-dir-mode', '/api/bot-working-dir-mode', 'raw'],
   ['PUT', '/api/bots/cli_a/agent', '/api/bot-agent', 'raw'],
+  ['GET', '/api/bots/cli_a/codex-profiles', '/api/bot-codex-profiles', 'none'],
   ['PUT', '/api/bots/cli_a/skills', '/api/bot-skills', 'raw'],
   ['PUT', '/api/bots/cli_a/brand-label', '/api/bot-brand-label', 'raw'],
   ['PUT', '/api/bots/cli_a/reply-style', '/api/bot-reply-style', 'json'],
@@ -24,6 +25,8 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/cantalk-daemon-commands', '/api/bot-cantalk-daemon-commands', 'raw'],
   ['PUT', '/api/bots/cli_a/launch-shell', '/api/bot-launch-shell', 'raw'],
   ['PUT', '/api/bots/cli_a/oncall-group', '/api/bot-oncall-group', 'raw'],
+  ['PUT', '/api/bots/cli_a/steward', '/api/bot-steward', 'json'],
+  ['PUT', '/api/bots/cli_a/actor-owner-bindings', '/api/bot-actor-owner-bindings', 'raw'],
   ['PUT', '/api/bots/cli_a/feedback', '/api/bot-feedback', 'raw'],
   ['PUT', '/api/bots/cli_a/chats/oc_1/feedback', '/api/chat-feedback/oc_1', 'raw'],
   ['GET', '/api/bots/cli_a/feedback/effective', '/api/feedback-effective', 'none'],
@@ -60,6 +63,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/avatar', '/api/bot-avatar', 'raw'],
   ['PUT', '/api/bots/cli_a/max-live-workers', '/api/bot-max-live-workers', 'raw'],
   ['PUT', '/api/bots/cli_a/no-progress-notify', '/api/bot-no-progress-notify', 'raw'],
+  ['PUT', '/api/bots/cli_a/prompt-cache', '/api/bot-prompt-cache', 'raw'],
   ['PUT', '/api/bots/cli_a/idle-suspend-minutes', '/api/bot-idle-suspend-minutes', 'raw'],
   ['PUT', '/api/bots/cli_a/session-owner-reminder', '/api/bot-session-owner-reminder', 'raw'],
   ['GET', '/api/bots/cli_a/blocked-users', '/api/blocked-users', 'none'],
@@ -279,6 +283,19 @@ describe('handleDaemonProxyRoute: body-less and path-rewriting routes', () => {
       expect(out.proxyCalls).toEqual([{ appId: 'cli_a', path: upstream, init: { method: 'GET' } }]);
       expect(out.bodyConsumed).toBe(false);
     }
+  });
+
+  it('forwards a trigger-user-auth-status openId query and nothing else changes', async () => {
+    const out = await runProxyRoute({
+      method: 'GET',
+      url: '/api/bots/cli_a/trigger-user-auth-status?openId=ou_status_probe',
+    });
+    expect(out.proxyCalls).toEqual([{
+      appId: 'cli_a',
+      path: '/api/bot-trigger-user-auth-status?openId=ou_status_probe',
+      init: { method: 'GET' },
+    }]);
+    expect(out.bodyConsumed).toBe(false);
   });
 
   it('session-group-tag-status keeps the content-type header on GET, the other GETs do not', async () => {

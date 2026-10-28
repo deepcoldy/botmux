@@ -21,6 +21,7 @@ import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from 
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
+import { scheduledTaskRunAs } from './schedule-run-as.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
@@ -62,7 +63,7 @@ import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystem
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
-import { publishWorkingDirRecovery } from './working-dir-recovery.js';
+import { answerRestartWithoutWorkingDir, onlyUnstartedOpeningHolds, publishWorkingDirRecovery, reclaimUnstartedOpening } from './working-dir-recovery.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
@@ -145,6 +146,7 @@ import { isTeamBot } from '../services/team-bots-store.js';
 import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
+import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
 import { offerWorktreeCleanup, runWorktreeCleanupJob } from './worktree-cleanup-run.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 import { runGroupContextSlashCommand } from './group-context-command.js';
@@ -960,10 +962,14 @@ async function handleScheduleCommand(
       const display = task.parsed?.display ?? task.schedule;
       // Whose identity this task's turns run as. Worth a line of its own: with
       // it absent the task still runs, but identity-bound tools fail closed,
-      // and that is otherwise only discoverable at fire time.
-      const runAsStr = task.ownerUnionId
-        ? `\n   runAs: ${task.ownerOpenId ?? task.ownerUnionId}`
-        : '\n   runAs: —（无创建人身份，按身份鉴权的工具会 fail-closed）';
+      // and that is otherwise only discoverable at fire time. A claim from the
+      // claim card outranks the creator, so it is what this line shows.
+      const runAs = scheduledTaskRunAs(task, larkAppId ?? task.larkAppId ?? '');
+      const runAsStr = runAs?.source === 'claim'
+        ? `\n   runAs: ${runAs.openId}（认领于 ${new Date(runAs.claimedAt!).toLocaleString(timeLocale, { timeZone })}）`
+        : runAs
+          ? `\n   runAs: ${runAs.openId ?? runAs.unionId}`
+          : '\n   runAs: —（无创建人身份，按身份鉴权的工具会 fail-closed）';
       return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${runAsStr}${nextStr}${lastStr}`;
     });
     await sessionReply(rootId, `${t('schedule.list_header', { count: tasks.length }, loc)}\n\n${lines.join('\n\n')}`);
@@ -2769,6 +2775,15 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.restart.remote_unsupported', undefined, loc));
             break;
           }
+          // The session cannot start where it is (its working directory is
+          // gone, or only a first message waiting for one holds it): a restart
+          // would only be refused. Guide to a directory instead.
+          if (await answerRestartWithoutWorkingDir(ds, content => sessionReply(rootId, content), {
+            sessionReply: (rid, content, msgType) => sessionReply(rid, content, msgType),
+            lastRepoScan,
+          })) {
+            break;
+          }
           // Codex App: an accepted-but-unsettled dispatch still owns the turn
           // route. requestSessionRestart does not itself gate on dispatch
           // ownership, so reject here before the coordinator tears the worker
@@ -2846,6 +2861,17 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, loc));
           break;
         }
+        // Only a first message refused for its missing directory holds the
+        // session: no turn to wait for, the message waits for a directory.
+        // Point at `/repo <路径>`, which starts it there (as bare `/repo` does).
+        const replyOpeningNeedsRepo = () => sessionReply(
+          rootId,
+          t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc),
+        );
+        if (onlyUnstartedOpeningHolds(ds)) {
+          await replyOpeningNeedsRepo();
+          break;
+        }
         // Cheap preflight avoids creating a requested directory when the
         // current FIFO already makes the switch impossible.  The mutation
         // below repeats this check after draining peer admissions.
@@ -2870,7 +2896,7 @@ export async function handleCommand(
           );
           if (!current) return 'gone' as const;
           if (hasProtectedSessionMutationOwnership(current)) {
-            return 'pending' as const;
+            return onlyUnstartedOpeningHolds(current) ? 'opening_needs_repo' as const : 'pending' as const;
           }
           const suspended = !current.adoptedFrom
             && suspendWorker(current, 'working_dir_changed');
@@ -2882,6 +2908,10 @@ export async function handleCommand(
           sessionStore.updateSession(current.session);
           return 'switched' as const;
         });
+        if (switched === 'opening_needs_repo') {
+          await replyOpeningNeedsRepo();
+          break;
+        }
         if (switched === 'pending') {
           await sessionReply(
             rootId,
@@ -2945,6 +2975,17 @@ export async function handleCommand(
           break;
         }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
+        // A first message whose start was refused because the directory it fell
+        // back to is missing still holds the session; `/repo <路径>` picks the
+        // directory for it, like the recovery card (the no-card reply says so).
+        if (ds && !ds.pendingRepo && repoArg) reclaimUnstartedOpening(ds);
+        if (ds && !ds.pendingRepo && !repoArg && onlyUnstartedOpeningHolds(ds)) {
+          await sessionReply(
+            rootId,
+            t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc),
+          );
+          break;
+        }
         if (ds && !ds.pendingRepo
           && hasProtectedSessionMutationOwnership(ds)) {
           await sessionReply(
@@ -3097,6 +3138,7 @@ export async function handleCommand(
             const cardToWithdraw = current.repoCardMessageId;
             markRepoCardConsumed(current, cardToWithdraw);
             current.repoCardMessageId = undefined;
+            current.workingDirRecovery = undefined;
             return { current, cardToWithdraw };
           });
           if (!started) return false;
@@ -3365,6 +3407,7 @@ export async function handleCommand(
                 branch: branchArg,
                 slug,
               });
+              await recordCreatedWorktree(ds.larkAppId, creation);
             } catch (e) {
               await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, loc));
               break;
@@ -3675,6 +3718,13 @@ export async function handleCommand(
         const chatId = ds?.chatId ?? message.chatId ?? '';
         await handleDashboardCommand(message, dashboardArgs, rootId, chatId, deps, larkAppId);
         logger.info(`[${logTag}] Dashboard command handled (sub=${dashboardArgs.trim().split(/\s+/)[0] || 'overview'})`);
+        break;
+      }
+
+      case '/dash': {
+        const chatId = ds?.chatId ?? message.chatId ?? '';
+        await handleDashboardCommand(message, 'link', rootId, chatId, deps, larkAppId);
+        logger.info(`[${logTag}] Dashboard link command handled`);
         break;
       }
 
@@ -6228,6 +6278,7 @@ export async function handleCommand(
           t('help.quote', undefined, loc),
           t('help.sessions', undefined, loc),
           t('help.dashboard', undefined, loc),
+          t('help.dash', undefined, loc),
           t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),
           t('help.subscribe_doc', undefined, loc),

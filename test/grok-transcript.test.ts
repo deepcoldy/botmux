@@ -13,6 +13,7 @@ import {
   drainGrokUpdates,
   isGrokNarrationInterruption,
   matchGrokPromptAppend,
+  matchGrokPromptEnqueue,
   discoverGrokSessions,
   findGrokSessionByPid,
   grokSessionDirExists,
@@ -802,6 +803,83 @@ describe('matchGrokPromptAppend', () => {
     expect(matchGrokPromptAppend(path, 0, prompt, {
       preferSessionId: 'cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee',
     }).found).toBe(false);
+  });
+
+  it('matches the form Grok stores for bodies with tabs or CRLF', () => {
+    // Pasted body → stored prompt, measured identical on 1.0.5/1.0.13/1.0.67/1.0.70.
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const measured: Array<[pasted: string, stored: string]> = [
+      ['ab\tc\td', 'ab    c    d'],
+      ['\tleading tab', 'leading tab'],
+      ['crlf line1\r\nline2', 'crlf line1\n\nline2'],
+    ];
+    const path = writePromptHistory('/tmp/proj', measured.map(([, stored]) => promptHistoryLine(sid, stored)));
+    for (const [pasted] of measured) {
+      expect(matchGrokPromptAppend(path, 0, pasted)).toEqual({ found: true, cliSessionId: sid });
+    }
+    expect(matchGrokPromptAppend(path, 0, 'ab c d').found).toBe(false);
+  });
+});
+
+describe('matchGrokPromptEnqueue', () => {
+  const PID = 1740552;
+  let path: string;
+  beforeEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(join(ROOT, 'logs'), { recursive: true });
+    path = join(ROOT, 'logs', 'unified.jsonl');
+    writeFileSync(path, '');
+  });
+  afterEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  /** Line shape copied from a real 1.0.5 / 1.0.70 unified.jsonl. */
+  function logLine(o: { ts: string; pid?: number; msg?: string; len?: number; ver?: string }): string {
+    return JSON.stringify({
+      ts: o.ts, src: 'grok-pager', pid: o.pid ?? PID, ver: o.ver ?? '1.0.5', lvl: 'info',
+      msg: o.msg ?? 'prompt.enqueue', ...(o.len !== undefined ? { ctx: { len: o.len } } : {}),
+    }) + '\n';
+  }
+  const since = Date.parse('2026-10-25T05:05:45.500Z');
+
+  it('accepts the line Grok logs when a mid-turn follow-up is queued', () => {
+    // Real 1.0.5 capture: this body was queued behind a running turn and
+    // logged len 71 (UTF-8 bytes, tab expanded to four spaces) — while
+    // prompt_history only got it at dequeue, 23s later.
+    const body = '忙时追加：中文 CJK 内容 ✅ emoji\n第二行 second line\ttab';
+    const base = statSync(path).size;
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:45.760Z', len: 71 }));
+    appendFileSync(path, JSON.stringify({
+      ts: '2026-10-25T05:05:45.760Z', src: 'grok-pager', pid: PID, ver: '1.0.5', lvl: 'debug',
+      sid: '4431c06b-bdae-4380-af4b-e0ea01c11562', msg: 'prompt.drain_blocked',
+      ctx: { reason: 'turn_running', queue_depth: 1 },
+    }) + '\n');
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(true);
+  });
+
+  it('binds the receipt to this process, this body and this write', () => {
+    const body = 'second follow-up message ALPHA-7781 with some words'; // 51 bytes
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:40.000Z', len: 51 })); // before baseline
+    const base = statSync(path).size;
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:46.000Z', len: 51, pid: PID + 1 })); // sibling Grok
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:46.000Z', len: 52 })); // other body
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:45.000Z', len: 51 })); // earlier submit, flushed late
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:46.000Z', len: 51, msg: 'prompt.drain' }));
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(false);
+
+    appendFileSync(path, logLine({ ts: '2026-10-25T05:05:46.100Z', len: 51 }).slice(0, 40)); // torn tail
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(false);
+    appendFileSync(path, '\n' + logLine({ ts: '2026-10-25T05:05:46.200Z', len: 51 }));
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(true);
+  });
+
+  it('still finds the line after Grok trims the log below the baseline', () => {
+    const body = 'after trim';
+    appendFileSync(path, 'x'.repeat(4096) + '\n');
+    const base = statSync(path).size;
+    writeFileSync(path, logLine({ ts: '2026-10-25T05:05:46.000Z', len: Buffer.byteLength(body) }));
+    expect(matchGrokPromptEnqueue(path, base, body, { pid: PID, sinceMs: since })).toBe(true);
   });
 });
 

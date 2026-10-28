@@ -482,6 +482,25 @@ export function createAddBotsReconciler(deps: AddBotsReconcilerDeps): {
   return { reconcile };
 }
 
+/**
+ * 建群结果里顺带拉进来的管家（决策看板）：每个一行。失败不影响建群，只在这里说一声。
+ * 没有管家参与时结果里没有 stewardJoins，返回空数组。
+ */
+export function stewardJoinNotes(
+  stewardJoins: unknown,
+  bots: GroupBot[],
+): Array<{ larkAppId: string; kind: 'ok' | 'warn'; text: string }> {
+  if (!Array.isArray(stewardJoins)) return [];
+  return stewardJoins
+    .filter((s): s is { larkAppId: string; ok?: unknown; error?: unknown } => !!s && typeof s.larkAppId === 'string')
+    .map(s => {
+      const bot = botNameById(s.larkAppId, bots);
+      return s.ok === true
+        ? { larkAppId: s.larkAppId, kind: 'ok' as const, text: t('groups.stewardJoined', { bot }) }
+        : { larkAppId: s.larkAppId, kind: 'warn' as const, text: t('groups.stewardJoinFailed', { bot, error: String(s.error ?? 'unknown') }) };
+    });
+}
+
 export function roleProfileBootstrapStatus(
   profileId: string,
   messageId?: unknown,

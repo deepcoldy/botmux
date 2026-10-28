@@ -296,6 +296,47 @@ export function appendScheduleRunLog(
   });
 }
 
+/**
+ * Turn one recorded run into an error after the fact. A run is logged when its
+ * model turn is dispatched, before the CLI has taken the prompt; a hidden
+ * schedule run that later proves undelivered must not keep reading as
+ * dispatched. Multi-chat runs mark only `chatId`'s result. Returns false when
+ * the record is gone (trimmed history, deleted task).
+ */
+export function markScheduleRunLogFailed(
+  taskId: string,
+  runId: string,
+  failure: { errorCode: string; error: string; chatId?: string },
+  appId: string,
+  dataDir: string = config.session.dataDir,
+): boolean {
+  const path = scheduleRunLogPath(taskId, appId, dataDir);
+  if (!existsSync(dirname(path))) return false;
+  return withFileLockSync(path, () => {
+    const entries = readEntries(path, taskId);
+    const index = entries.findIndex(entry => entry.id === runId);
+    if (index < 0) return false;
+    const entry = entries[index]!;
+    const targetResults = entry.targetResults && failure.chatId
+      ? entry.targetResults.map(result => (result.chatId === failure.chatId
+        ? { chatId: result.chatId, outcome: 'error' as const, error: failure.error }
+        : result))
+      : entry.targetResults;
+    entries[index] = normalizeEntry({
+      ...entry,
+      outcome: 'error',
+      errorCode: failure.errorCode,
+      error: failure.error,
+      ...(targetResults ? { targetResults } : {}),
+    });
+    atomicWriteFileSync(path, serialize(entries), {
+      mode: 0o600,
+      followTargetSymlink: false,
+    });
+    return true;
+  });
+}
+
 /** Query one task's retained history, newest append first. */
 export function queryScheduleRunLogs(
   taskId: string,

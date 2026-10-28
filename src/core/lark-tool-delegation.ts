@@ -39,3 +39,10 @@ export function getLarkToolDelegation(dataDir: string, sessionId: string, turnId
 export function clearLarkToolDelegations(dataDir: string, sessionId: string): void {
   sessions.delete(sessionKey(dataDir, sessionId));
 }
+
+/** Turn ids with a remembered delegation in this session. Terminal identity GC
+ *  must retain their material while the in-memory record survives the 64-entry
+ *  cap; once it is evicted, fail-closed routes resolve to a refusal. */
+export function larkToolDelegationTurnIds(dataDir: string, sessionId: string): string[] {
+  return [...(sessions.get(sessionKey(dataDir, sessionId))?.keys() ?? [])];
+}

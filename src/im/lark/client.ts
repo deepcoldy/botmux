@@ -1600,13 +1600,15 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
   // raw user-token fetch — bypassing the boundary. A core-only bot has no
   // Feishu resource to download; refuse up front.
   assertLarkTransport(larkAppId, 'downloadMessageResource');
+  // Feishu downloads video bodies through the file endpoint.
+  const apiType = type === 'video' ? 'file' : type;
   const dir = dirname(savePath);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -1614,7 +1616,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
 
   // Try App Token first
   try {
-    await downloadWithAppToken(larkAppId, messageId, fileKey, type, savePath);
+    await downloadWithAppToken(larkAppId, messageId, fileKey, apiType, savePath);
     logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
     return;
   } catch (appErr: any) {
@@ -1666,7 +1668,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     );
   }
 
-  await downloadWithUserToken(userToken, messageId, fileKey, type, savePath, brand);
+  await downloadWithUserToken(userToken, messageId, fileKey, apiType, savePath, brand);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
@@ -3114,4 +3116,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   }
 
   return configured;
+}
+
+/** Current application only. Throws on missing scope/unknown membership. */
+export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  const response: any = await larkGet(getBotClient(larkAppId),
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+  if (response.code !== 0 && response.code !== undefined) throw larkApiError('check bot chat membership', response);
+  if (typeof response.data?.is_in_chat !== 'boolean') throw new Error('chat_membership_unknown');
+  return response.data.is_in_chat;
 }

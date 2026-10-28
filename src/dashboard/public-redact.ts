@@ -138,7 +138,7 @@ export function stripAllSchedulePreconditionMaterial(schedule: unknown): unknown
 }
 
 /** Drop `prompt` (business instructions), `workingDir` (repo/customer path),
- *  and every executable/authority-bearing precondition field from
+ *  the run-as identity fields, and every executable/authority-bearing precondition field from
  *  `/api/schedules` rows for anonymous visitors. The supported list projection
  *  may carry only `hasPrecondition` / `preconditionEnabled`; source/path/script/
  *  ref/hash are stripped defensively even though authenticated management rows
@@ -152,6 +152,11 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
     const {
       prompt: _prompt,
       workingDir: _workingDir,
+      // Who a task runs as is personal data. Rows never carry it; strip it from
+      // event patches too in case a write path ever includes it.
+      ownerOpenId: _ownerOpenId,
+      ownerUnionId: _ownerUnionId,
+      runAsClaim: _runAsClaim,
       ...rest
     } = projected as Record<string, unknown>;
     return rest;
@@ -270,6 +275,15 @@ function projectSessionEvent(type: string, body: unknown, isPrivate: SessionFiel
       ...eventBody,
       patch: omitSessionFields(eventBody.patch as Record<string, unknown>, isPrivate),
     };
+  }
+  // Defense in depth for a frame the SSE stream already drops for these
+  // audiences. `senderOpenId` is a new per-turn identity; `chatId` says which
+  // group just finished. Management never reaches this branch.
+  if (type === 'turn.finished') {
+    const projected = { ...eventBody };
+    delete projected.senderOpenId;
+    delete projected.chatId;
+    return projected;
   }
   return body;
 }

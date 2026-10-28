@@ -39,15 +39,17 @@ describe('Codex per-Bot reasoning effort', () => {
     expect(config?.reasoningEffort).toBeUndefined();
   });
 
-  it('preserves safe TraeX reasoning effort and rejects unsupported levels', () => {
+  it('preserves valid handwritten TraeX reasoning effort independently of static model support', () => {
     const configs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'traex-medium', larkAppSecret: 'secret', cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'medium' },
       { larkAppId: 'traex-xhigh', larkAppSecret: 'secret', cliId: 'traex', model: 'GPT-5.5', reasoningEffort: 'xhigh' },
-      { larkAppId: 'traex-invalid-pair', larkAppSecret: 'secret', cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'xhigh' },
+      { larkAppId: 'traex-static-table-lag', larkAppSecret: 'secret', cliId: 'traex', model: 'DeepSeek-V4-Pro', reasoningEffort: 'xhigh' },
+      { larkAppId: 'traex-invalid-syntax', larkAppSecret: 'secret', cliId: 'traex', reasoningEffort: 'extreme' },
     ]));
     expect(configs.find(config => config.larkAppId === 'traex-medium')?.reasoningEffort).toBe('medium');
     expect(configs.find(config => config.larkAppId === 'traex-xhigh')?.reasoningEffort).toBe('xhigh');
-    expect(configs.find(config => config.larkAppId === 'traex-invalid-pair')?.reasoningEffort).toBeUndefined();
+    expect(configs.find(config => config.larkAppId === 'traex-static-table-lag')?.reasoningEffort).toBe('xhigh');
+    expect(configs.find(config => config.larkAppId === 'traex-invalid-syntax')?.reasoningEffort).toBeUndefined();
   });
 
   it('preserves only valid TraeX backend variants', () => {

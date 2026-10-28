@@ -185,6 +185,8 @@ describe('read-isolation persistent-pane teardown', () => {
   // 状态机/执行器的真值表与顺序在 read-isolation.test.ts 有行为测试，这里守 worker 闭包里的接线：三态存活
   // 探测喂给状态机（unknown → 拒启）、kill 与 post-kill 探测针对重选前捕获的同一 target、只有权威 'missing'
   // 才算拆除成功，之后才重选后端。否则会围着一个可能仍存活、仍在旧围栏下的 pane 发布新一代（#899）。
+  // post-kill 探测走统一的 kill 后入口 probePaneAfterKill：只对 kill 刚让 tmux server 退出时的瞬时 unknown
+  // 有界重探，重探完仍 unknown 照样拒启（行为由 sandbox-relay-lifecycle 的注入用例守）。
   it('fails closed unless the exact captured stale target is proven gone before re-selection', () => {
     const start = workerSource.indexOf('evaluatePersistentPaneMigration({');
     const end = workerSource.indexOf('executePersistentPaneMigration(migration', start);
@@ -198,12 +200,28 @@ describe('read-isolation persistent-pane teardown', () => {
     expect(capture).not.toBeNull();
     const target = capture![1];
     const kill = block.indexOf(`killPersistentBackendTarget(${target}`, capture!.index);
-    const probe = block.indexOf(`probePersistentBackendTarget(${target})`, kill);
+    const probe = block.search(new RegExp(`probePaneAfterKill\\(\\w+, ${target}\\)`));
     const strict = block.indexOf("postKillProbe !== 'missing'", probe);
     const reselect = block.indexOf('selectedBackend = selectBackend();', strict);
     expect(kill).toBeGreaterThan(capture!.index!);
     expect(probe).toBeGreaterThan(kill);
     expect(strict).toBeGreaterThan(probe);
     expect(reselect).toBeGreaterThan(strict);
+  });
+
+  // 源码结构护栏(K2)：kill 后确认 pane 已消失的统一入口 probePaneAfterKill 里，zmx 必须走拥有式的
+  // probeOwnedZmxSession（完整 sessionId + 冻结 PID）；换成 target 级的 after-kill 探测会悄悄降级成按名字探测，
+  // 把同名的别家会话当成自己的（#2166）。入口是 spawnCli 里的闭包、CI 上也没有真实 zmx 运行时，没有行为 seam，
+  // 只能钉这条分支的接线；tmux 分支的行为由 sandbox-relay-lifecycle 的注入用例守。
+  it('keeps the owned ZMX probe in the shared post-kill entry', () => {
+    const start = workerSource.indexOf('const probePaneAfterKill = ');
+    expect(start).toBeGreaterThan(-1);
+    const entry = workerSource.slice(start, workerSource.indexOf('\n  );\n', start));
+    const zmxBranch = entry.indexOf("effectiveBackendType === 'zmx'");
+    const owned = entry.indexOf('probeOwnedZmxSession(', zmxBranch);
+    const afterKill = entry.indexOf('probePersistentBackendTargetAfterKill(');
+    expect(zmxBranch).toBeGreaterThan(-1);
+    expect(owned).toBeGreaterThan(zmxBranch);
+    expect(afterKill).toBeGreaterThan(owned);
   });
 });

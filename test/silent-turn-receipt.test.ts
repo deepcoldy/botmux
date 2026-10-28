@@ -443,12 +443,14 @@ describe('buildStreamingCard call sites all pass idleCardLabel', () => {
       const missing = calls
         // Accepted forms: the live-card resolver `streamCardLabel(ds)` (idle
         // label, or the background-task count while the main turn has ended),
-        // the idle-only `idleCardLabel(ds)` for frozen/limited cards, the
+        // its cached-state variant `cachedStreamCardLabel(ds)` (same, minus a
+        // count left behind by a worker that is gone), the idle-only
+        // `idleCardLabel(ds)` for frozen/limited cards, the
         // frozen-card resolver `frozenIdleLabel(frozen)`, or beginNewTurn's
         // pre-captured `previousIdleLabel` (captured before the session flags
         // are cleared). Legacy `silentIdleCardFlag(` / `.silentIdle` stay
         // accepted so an older call site is not flagged as a miss.
-        .filter(c => !/(?:streamCardLabel\(|idleCardLabel\(|frozenIdleLabel\(|previousIdleLabel\b|silentIdleCardFlag\(|\.silentIdle\b|\.idleLabel\b)/.test(c.args))
+        .filter(c => !/(?:streamCardLabel\(|cachedStreamCardLabel\(|idleCardLabel\(|frozenIdleLabel\(|previousIdleLabel\b|silentIdleCardFlag\(|\.silentIdle\b|\.idleLabel\b)/.test(c.args))
         .map(c => `${file}:${c.line}`);
       expect(missing).toEqual([]);
     });

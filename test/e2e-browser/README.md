@@ -26,7 +26,8 @@ Every `cases/*.yaml` file is a lane, run as the Midscene project
 `feishu-<file stem>`. Lanes run concurrently (`FEISHU_E2E_CONCURRENCY`,
 default 4); cases inside one lane run in order. A lane groups cases that must
 not overlap — `full-group.yaml` stays serial because its no-mention case
-asserts that no bot answered.
+asserts that no bot answered. The longest lane, `core-group-modes`, starts
+first (`LONG_LANES_FIRST` in `lanes.ts`); on CI a failed case runs once more.
 
 | Lane | Covers |
 |:--|:--|
@@ -106,9 +107,14 @@ The `Wait for the Feishu live slot` job (`scripts/feishu-live-queue.mjs`) hands
 out the slot first come first served: it waits while another run holds the slot
 or started waiting earlier, then lets this run's Feishu job start. Nothing is
 cancelled across branches — a GitHub `concurrency` group would cancel its
-pending job whenever a newer run arrived. A newer push to the same pull request
-does cancel that pull request's older run. A run that waits longer than the
-queue budget reports its Feishu cases as not run.
+pending job whenever a newer run arrived. A newer push to the same pull
+request, and merging or closing it, cancels that pull request's queued or
+running run: the closing event starts a run in the same concurrency group and
+every job in that closing run skips, so it never queues for the slot and no
+manual cancellation is needed. The results of a run cancelled this way are
+not produced; dispatch the workflow on the branch when you need a post-merge
+live result. A run that waits longer than the queue budget reports its Feishu
+cases as not run.
 
 Reports are published with `scripts/publish-gh-pages.sh`, shared with the docs
 deploy: each publish replaces its own directory and pushes the branch as a

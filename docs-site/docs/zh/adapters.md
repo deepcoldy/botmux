@@ -30,12 +30,17 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `traex` | TRAE CLI（traex） | 本地进程 | ✅ |
 | `mtr` | MTR | 本地进程 | |
 | `hermes` | Hermes | 本地进程 | |
+| `ebsd` | EBSD（需配置文件凭证，见 [配置说明](https://github.com/deepcoldy/botmux/blob/master/docs/ebsd.md)） | 本地进程 | |
+| `codem` | CodeM（见 [CodeM 说明](https://github.com/deepcoldy/botmux/blob/master/docs/codem.md)） | 本地进程 | ✅ |
+| `minimax` | MiniMax Code / mcode（见 [MiniMax Code 说明](https://github.com/deepcoldy/botmux/blob/master/docs/minimax-code.md)） | 本地进程 | ✅ |
 | `genius` | Genius | 本地进程 | ✅ |
 | `seed` | Seed（Claude Code fork） | 本地进程 | ✅ |
 | `relay` | Relay（Seed 新版） | 本地进程 | ✅ |
 | `mira` | Mira APP | API / 远端 | |
 | `mir` | Mir CLI（本地 mircli + MCP bridge） | 本地进程 | |
 | `riff` | riff | 云 Agent（API） | |
+| `mojo` | Mojo | API 驱动（宿主机执行/云沙箱） | |
+| `remote-runner` | 通用远端 Runner（见 [Remote Runner 说明](https://github.com/deepcoldy/botmux/blob/master/docs/remote-runner.md)） | 远端协议 | |
 | `dsh` | DeepSeek Harness（dsh CLI） | 本地进程（SDK JSON-RPC） | ✅ |
 
 > `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。

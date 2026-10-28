@@ -11,6 +11,11 @@ import {
   probeTmuxFunctionalWithRetry,
   classifyTmuxProbeFailure,
   parseTmuxVersion,
+  tmuxSupportsRemainOnExitFailed,
+  resolveTmuxVersionAtSessionBoundary,
+  getTmuxVersionCached,
+  resetTmuxVersionCacheForTests,
+  TMUX_REMAIN_ON_EXIT_FAILED,
 } from '../src/setup/ensure-tmux.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
@@ -135,5 +140,72 @@ describe('parseTmuxVersion', () => {
   it('returns null for unparseable output', () => {
     expect(parseTmuxVersion('garbage')).toBeNull();
     expect(parseTmuxVersion('')).toBeNull();
+  });
+});
+
+// #2164 v3.53.0 regression gate: `remain-on-exit failed` only exists on
+// tmux >= 3.2 (CHANGES, 3.1c -> 3.2). Sending it to 3.1c fails new-session
+// with "bad value: failed" and blocks every new session.
+describe('tmuxSupportsRemainOnExitFailed', () => {
+  it('is supported starting at the documented floor (3.2)', () => {
+    expect(TMUX_REMAIN_ON_EXIT_FAILED).toEqual({ major: 3, minor: 2 });
+  });
+
+  it.each([
+    ['tmux 3.3a', true],  // local dev box
+    ['tmux 3.2a', true],  // Ubuntu 22.04 shipped
+    ['tmux 3.2', true],
+    ['tmux 3.1c', false], // affected user machine — the regression
+    ['tmux 3.1a', false],
+    ['tmux 3.0', false],
+    ['tmux 2.9', false],
+  ])('tmux %j -> %s', (raw, expected) => {
+    expect(tmuxSupportsRemainOnExitFailed(parseTmuxVersion(raw))).toBe(expected);
+  });
+
+  it('treats an unknown/unreadable version as unsupported (never block session creation)', () => {
+    expect(tmuxSupportsRemainOnExitFailed(null)).toBe(false);
+    expect(tmuxSupportsRemainOnExitFailed(parseTmuxVersion('nonsense'))).toBe(false);
+  });
+});
+
+// Once-per-session boundary resolution shared by new-session argv, the
+// reattached-session option reapply and the worker self-check: a recent null
+// cache triggers exactly one fresh probe, so a transient `tmux -V` timeout
+// neither downgrades the session nor makes the startup log lie; a version that
+// stays unreadable is still null and every caller fails closed.
+describe('resolveTmuxVersionAtSessionBoundary', () => {
+  const versionProbeCount = () => mockedExecFileSync.mock.calls
+    .filter(([, args]) => Array.isArray(args) && args[0] === '-V').length;
+
+  beforeEach(() => resetTmuxVersionCacheForTests());
+
+  it('serves a known cached version and never re-probes', () => {
+    mockedExecFileSync.mockReturnValue('tmux 3.3a\n' as any);
+    expect(resolveTmuxVersionAtSessionBoundary()).toEqual({ major: 3, minor: 3 });
+    expect(resolveTmuxVersionAtSessionBoundary()).toEqual({ major: 3, minor: 3 });
+    expect(versionProbeCount()).toBe(1);
+  });
+
+  it('re-probes once when the cache holds a recent null, then uses the fresh answer', () => {
+    let attempts = 0;
+    mockedExecFileSync.mockImplementation(() => {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+      return 'tmux 3.3a\n' as any;
+    });
+    // Prime the short-lived null cache (the shape left by a failed gate probe).
+    expect(getTmuxVersionCached()).toBeNull();
+    expect(attempts).toBe(1);
+    expect(resolveTmuxVersionAtSessionBoundary()).toEqual({ major: 3, minor: 3 });
+    expect(attempts).toBe(2);
+  });
+
+  it('stays null when the boundary re-probe is also unreadable', () => {
+    mockedExecFileSync.mockImplementation(() => {
+      throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    });
+    expect(getTmuxVersionCached()).toBeNull();
+    expect(resolveTmuxVersionAtSessionBoundary()).toBeNull();
   });
 });

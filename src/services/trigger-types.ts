@@ -130,6 +130,7 @@ export type TriggerErrorCode =
   | 'rate_limited'
   | 'replay'
   | 'session_not_found'
+  | 'session_not_runnable'
   | 'target_required'
   | 'trigger_failed'
   | 'wait_timeout'

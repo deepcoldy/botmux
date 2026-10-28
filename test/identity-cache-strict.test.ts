@@ -26,7 +26,7 @@ describe('resolveVerifiedUserIdentity', () => {
     vi.clearAllMocks();
   });
 
-  it('resolves a platform owner union_id into target-app identity', async () => {
+  it('resolves a configured owner union_id into target-app identity', async () => {
     larkGet.mockResolvedValue({
       code: 0,
       data: {

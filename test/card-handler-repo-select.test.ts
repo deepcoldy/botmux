@@ -2608,6 +2608,132 @@ describe('repo select card — working-directory recovery', () => {
     expect(restoreDeletedWorktree).not.toHaveBeenCalled();
   });
 
+  describe('a first message whose start was refused (staged opening)', () => {
+    // The incident shape: the opening was staged for repo selection, left the
+    // picker (no projects → start directly) and forkWorker refused the missing
+    // directory. The session is no longer pendingRepo but its opening — queued,
+    // setup journal, start gate — still holds it.
+    const OPENING = '用一句话回答 1+1 等于几';
+
+    function makeRefusedOpeningDs(sessionOverrides: Record<string, unknown> = {}): DaemonSession {
+      const base = makeRecoveryDs();
+      return makeRecoveryDs({
+        initialStartPending: true,
+        pendingPrompt: OPENING,
+        pendingTurnId: 'om_opening',
+        session: {
+          ...base.session,
+          queued: true,
+          queuedPrompt: OPENING,
+          pendingRepoSetup: { mode: 'picker', linkRefMode: 'disabled', prompt: OPENING, turnId: 'om_opening' },
+          ...sessionOverrides,
+        } as any,
+      });
+    }
+
+    it('「使用此目录」 starts that message in the chosen directory instead of refusing', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-recovery-opening-'));
+      try {
+        const ds = makeRefusedOpeningDs();
+        const { deps, sessionReply } = makeDeps(ds);
+
+        await handleCardAction(makeManualEvent(dir), deps, APP_ID);
+
+        expect(repliedText(sessionReply)).not.toContain('待提交');
+        expect(forkWorker).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(forkWorker).mock.calls[0]![0]).toBe(ds);
+        expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![0]).toBe(OPENING);
+        expect(createSession).not.toHaveBeenCalled();
+        expect(ds.session.sessionId).toBe('uuid-old');
+        expect(ds.workingDir).toBe(dir);
+        expect(ds.pendingRepo).toBe(false);
+        expect(ds.workingDirRecovery).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('messages queued behind that opening ride along — the opening starts, the queue is kept', async () => {
+      const tail = [{ userPrompt: 'second message', turnId: 'om_second' }];
+      const ds = makeRefusedOpeningDs({ queuedActivationTail: tail });
+      const { deps, sessionReply } = makeDeps(ds);
+
+      await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+      expect(repliedText(sessionReply)).not.toContain('待提交');
+      expect(forkWorker).toHaveBeenCalledTimes(1);
+      expect(ds.workingDir).toBe('/repos/beta');
+      expect(ds.session.queuedActivationTail).toEqual(tail);
+    });
+
+    it('「重建 worktree」 rebuilds it and starts that message there', async () => {
+      const ds = makeRefusedOpeningDs();
+      const { deps, sessionReply } = makeDeps(ds);
+      vi.mocked(restoreDeletedWorktree).mockResolvedValue({ path: GONE, branch: 'wt/review-pr-1809', baseRef: 'wt/review-pr-1809' });
+
+      await handleCardAction(makeRebuildEvent(), deps, APP_ID);
+      await vi.waitFor(() => expect(forkWorker).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![0]).toBe(OPENING);
+      expect(ds.workingDir).toBe(GONE);
+      expect(ds.pendingRepo).toBe(false);
+      expect(repliedText(sessionReply)).not.toContain('待提交');
+      expect(repliedText(sessionReply)).toContain('这条消息开始在那里处理');
+    });
+
+    it('「重建 worktree」 on a session still waiting for its repo starts the message there too', async () => {
+      // The other refusal shape: the start came from the picker itself (e.g.
+      // 「直接开启会话」 into a missing default dir), so pendingRepo never cleared.
+      const base = makeRefusedOpeningDs();
+      const ds = makeRecoveryDs({ ...base, pendingRepo: true, initialStartPending: false });
+      const { deps, sessionReply } = makeDeps(ds);
+      vi.mocked(restoreDeletedWorktree).mockResolvedValue({ path: GONE, branch: 'wt/review-pr-1809', baseRef: 'wt/review-pr-1809' });
+
+      await handleCardAction(makeRebuildEvent(), deps, APP_ID);
+      await vi.waitFor(() => expect(forkWorker).toHaveBeenCalledTimes(1));
+
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe(GONE);
+      expect(repliedText(sessionReply)).not.toContain('待提交');
+    });
+
+    it('an activation actually in flight still blocks the switch', async () => {
+      const ds = makeRefusedOpeningDs({ queuedActivationPending: true });
+      const { deps, sessionReply } = makeDeps(ds);
+
+      await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+      expect(repliedText(sessionReply)).toContain('待提交');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
+      expect(ds.workingDir).toBe(GONE);
+    });
+
+    it('an unsettled principal-lane turn still blocks the switch', async () => {
+      const ds = makeRefusedOpeningDs({ principalLaneQueuedTurns: [{ turnId: 'om_lane' }] });
+      const { deps, sessionReply } = makeDeps(ds);
+
+      await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+      expect(repliedText(sessionReply)).toContain('待提交');
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('an ordinary repo card (not the recovery card) keeps the old refusal', async () => {
+      const ds = makeRefusedOpeningDs();
+      ds.workingDirRecovery = undefined;
+      const { deps, sessionReply } = makeDeps(ds);
+
+      await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+      expect(repliedText(sessionReply)).toContain('待提交');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
+    });
+  });
+
   it('toggling the worktree picker mode keeps the recovery form', async () => {
     const ds = makeRecoveryDs();
     const { deps, sessionReply } = makeDeps(ds);

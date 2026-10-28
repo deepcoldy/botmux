@@ -1,19 +1,21 @@
-import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   appendFileSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
+import { createBracketedPasteCollector } from './helpers/bracketed-paste-collector.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -33,7 +35,7 @@ afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   children.clear();
   for (const name of tmuxSessions) {
-    try { execFileSync('tmux', ['kill-session', '-t', `=${name}`], { stdio: 'ignore' }); } catch { /* already gone */ }
+    killWorkerTmuxSession(`=${name}`);
   }
   tmuxSessions.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
@@ -92,19 +94,16 @@ function rolloutTerminal(turnId: string): string {
 }
 
 function readSubmissions(path: string): Array<{ pid: number; text: string }> {
-  try {
-    return readFileSync(path, 'utf8')
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map(line => JSON.parse(line) as { pid: number; text: string });
-  } catch {
-    return [];
-  }
+  return readJsonLines<{ pid: number; text: string }>(path);
 }
 
 describe('TraeX transcript-terminal / PTY-readiness desync reproduction', () => {
-  it.each(['intentional restart', 'CLI crash'] as const)('accepts healthy type-ahead and never replays quarantined input after %s', async restartKind => {
+  it.each([
+    { restartKind: 'intentional restart', autoReselect: undefined },
+    { restartKind: 'CLI crash', autoReselect: undefined },
+    { restartKind: 'intentional restart', autoReselect: false },
+    { restartKind: 'intentional restart', autoReselect: true },
+  ] as const)('accepts healthy type-ahead and never replays quarantined input after $restartKind (auto=$autoReselect)', async ({ restartKind, autoReselect }) => {
     const botmuxSessionId = randomUUID();
     const root = mkdtempSync(join(tmpdir(), 'botmux-traex-desync-repro-'));
     tempDirs.add(root);
@@ -148,8 +147,6 @@ process.stdout.write(
 );
 }
 drawStartup();
-let input = '';
-let pasted = '';
 let submitCount = 0;
 let composerReleased = false;
 // A tmux pipe attaches after spawn; real TUIs redraw during initialization.
@@ -157,24 +154,7 @@ let composerReleased = false;
 for (const delay of [500, 1000]) {
   setTimeout(() => { if (submitCount === 0) drawStartup(); }, delay);
 }
-process.stdin.on('data', chunk => {
-  input += chunk;
-  while (true) {
-    const start = input.indexOf('\\x1b[200~');
-    if (start < 0) break;
-    const end = input.indexOf('\\x1b[201~', start + 6);
-    if (end < 0) break;
-    pasted = input.slice(start + 6, end);
-    input = input.slice(end + 6);
-  }
-  while (input.includes('\\r') || input.includes('\\n')) {
-    const cr = input.indexOf('\\r');
-    const lf = input.indexOf('\\n');
-    const at = cr < 0 ? lf : lf < 0 ? cr : Math.min(cr, lf);
-    input = input.slice(at + 1);
-    if (!pasted) continue;
-    const text = pasted;
-    pasted = '';
+const collectPaste = (${createBracketedPasteCollector.toString()})(text => {
     submitCount += 1;
     fs.appendFileSync(submissionsPath, JSON.stringify({ pid: process.pid, text }) + '\\n');
     if (submitCount <= 4) {
@@ -195,8 +175,8 @@ process.stdin.on('data', chunk => {
         '\\x1b[2J\\x1b[H⠋ Any second now…\\nQueued for next turn\\nContext 64% left\\n'
       );
     }
-  }
 });
+process.stdin.on('data', collectPaste);
 setInterval(() => {
   if (composerReleased || !fs.existsSync(releasePath)) return;
   composerReleased = true;
@@ -241,6 +221,8 @@ setInterval(() => {
       rootMessageId: 'om_root',
       workingDir: dataDir,
       cliId: 'traex',
+      ...(autoReselect !== undefined ? { traexAutoModel: { enabled: true,
+        models: ['GPT-6-Astra', 'backup'], queueTimeoutMs: 5_000, reselectPerTurn: autoReselect } } : {}),
       cliPathOverride: fakeTraex,
       cliSessionId: nativeSessionId,
       resume: true,
@@ -462,8 +444,11 @@ setInterval(() => {
     await waitFor(child, () => readSubmissions(submissionsPath).length >= 7, logs, 'fresh input on replacement generation');
     const afterRestart = readSubmissions(submissionsPath);
     expect(afterRestart).toHaveLength(7);
-    // Every generation refreshes the plugin catalogue on its first message.
-    expect(afterRestart[6]!.text).toBe(firstSubmission.text.replace(/^first prompt/, 'fresh input after recovery'));
+    // Auto exact resume keeps the delivered catalogue; ordinary TraeX retains
+    // its existing first-message refresh behavior after a process restart.
+    expect(afterRestart[6]!.text).toBe(autoReselect !== undefined
+      ? 'fresh input after recovery'
+      : firstSubmission.text.replace(/^first prompt/, 'fresh input after recovery'));
     expect(afterRestart[6]!.pid).not.toBe(recoveredSubmissions[5]!.pid);
   }, 60_000);
 });

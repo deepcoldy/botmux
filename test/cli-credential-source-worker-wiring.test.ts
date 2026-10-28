@@ -52,8 +52,15 @@ describe('credentialsSourceDir daemon → worker cold-spawn wiring', () => {
     expect(stamp).toBeGreaterThan(gate);
     const block = worker.slice(gate, stamp);
     expect(block).toContain('credentialSourceDir');
-    expect(block).toMatch(/postKillProbe !== 'missing'\)\s*\{\s*throw\b/);
-    expect(block).toMatch(/if \(willReattachPersistent\)\s*\{\s*throw\b/);
+    // Kill → confirmed missing → re-select lives in one closure, shared with the
+    // Codex App unauthenticated-pane gate (whose integration test runs it).
+    expect(block).toContain('retireSelectedPersistentPane(');
+    const helper = worker.indexOf('const retireSelectedPersistentPane = ');
+    expect(helper).toBeGreaterThan(-1);
+    expect(helper).toBeLessThan(gate);
+    const body = worker.slice(helper, gate);
+    expect(body).toMatch(/postKillProbe !== 'missing'\)\s*\{\s*throw\b/);
+    expect(body).toMatch(/if \(willReattachPersistent\)\s*\{\s*throw\b/);
     // The stamp is written only for a cold spawn.
     expect(worker.slice(stamp - 120, stamp)).toContain('if (!willReattachPersistent) {');
   });

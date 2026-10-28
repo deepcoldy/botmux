@@ -108,3 +108,26 @@ describe('codex-app adapter buildArgs — runner flags', () => {
     expect(args[i + 1]).toBe('priority');
   });
 });
+
+describe('Codex profile argv', () => {
+  it.each([
+    {}, { resume: true, resumeSessionId: 'native' },
+    { resume: true, resumeSessionId: 'native', forkSession: true },
+  ])('passes the profile before every subcommand: %j', extra => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, ...extra, codexProfile: 'withhooks', model: 'explicit', reasoningEffort: 'high' });
+    expect(args.slice(0, 2)).toEqual(['--profile', 'withhooks']);
+    expect(args.filter(x => x === '--profile')).toHaveLength(1);
+    expect(args).toContain('model_reasoning_effort="high"');
+  });
+  it('keeps a leading-hyphen profile a single value on resume', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, resume: true, resumeSessionId: 'native', codexProfile: '-selected' });
+    expect(args[0]).toBe('--profile=-selected');
+    expect(args).not.toContain('-selected');
+  });
+  it('rejects RPC viewer instead of silently dropping the profile', () => {
+    expect(() => createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, codexProfile: 'selected', remoteWsUrl: 'ws://localhost:9', remoteThreadId: 'thread' })).toThrow('RPC');
+  });
+  it('does not add an explicit profile for the default selection', () => {
+    expect(createCodexAdapter('/usr/bin/codex').buildArgs(BASE)).not.toContain('--profile');
+  });
+});

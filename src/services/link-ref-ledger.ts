@@ -306,6 +306,19 @@ export class LinkRefLedger {
     });
   }
 
+  listRegistered(key: LinkRefTurnKey): RegisteredLinkRef[] {
+    return this.retryBusy(() => {
+      this.requireTurn(key);
+      const rows = this.db.prepare(`
+        SELECT ref_id, original_url, source_type, source_id
+        FROM link_refs
+        WHERE app_id = ? AND session_id = ? AND turn_id = ? AND dispatch_attempt = ?
+        ORDER BY created_at_ms ASC, rowid ASC
+      `).all(...keyParams(key)) as LinkRow[];
+      return rows.map(toRegistered);
+    });
+  }
+
   savePendingDraft(key: LinkRefTurnKey, content: string): void {
     this.retryBusy(() => {
       this.requireTurn(key);

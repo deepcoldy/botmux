@@ -67,6 +67,66 @@ export function usesLarkToolBinding(config: {
   return config.larkToolBinding !== false;
 }
 
+/**
+ * Which identity publication model a spawn runs.
+ *
+ * - `proven`: the Linux managed entry proves its execution over the loopback
+ *   current-execution channel and receives the identity CONTENT in memory; no
+ *   token is written to disk. Requires the daemon loopback to be reachable
+ *   inside the sandbox, so network-isolated sandboxes (`--unshare-net`, or a
+ *   slirp policy that does not share host loopback) are excluded.
+ * - `single`: every other path (adopt / remote / external app-server /
+ *   workflow / non-Lark transport / non-Linux / loopback-isolated sandbox)
+ *   keeps the legacy single-snapshot file that is overwritten or removed on
+ *   every turn.
+ *
+ * SINGLE SOURCE OF TRUTH: the WORKER computes this from the actual spawn
+ * decision — resolveLocalSandboxMode (including the BOTMUX_SANDBOX operator
+ * override and remote-backend bypass) plus the spawn's real loopback
+ * reachability (resolveSpawnNetworkShape, the same facts that compile the
+ * bwrap/Seatbelt argv) — renders the wrapper from it and reports it to the
+ * daemon. The daemon consumes ONLY that report; it must not re-derive the
+ * sandbox or network side from frozen config or its own environment, or the
+ * two sides can silently pick different models for one session.
+ */
+export type IdentityStorageModel = 'single' | 'proven';
+
+export function resolveIdentityStorageModel(input: {
+  platform: NodeJS.Platform;
+  binding: boolean;
+  /** Whether a local sandbox actually wraps the spawn (worker spawn fact). */
+  sandboxEngaged: boolean;
+  /** Whether the daemon loopback is reachable inside the spawn (worker spawn
+   *  fact: false under --unshare-net and under a slirp policy). */
+  loopbackShared: boolean;
+}): IdentityStorageModel {
+  if (input.platform !== 'linux' || !input.binding) return 'single';
+  if (input.sandboxEngaged && !input.loopbackShared) return 'single';
+  return 'proven';
+}
+
+/** Structural half the daemon can check independently of the worker: proven
+ *  requires Linux and the managed lark-tool binding (adopt / remote / external
+ *  app-server / workflow / apiOnly / disabled transport are structurally
+ *  single). Sandbox engagement and loopback reachability are deliberately NOT
+ *  inputs here — they are spawn-time facts only the worker has. The daemon
+ *  uses this solely to fail closed when a worker reports `proven` for a
+ *  session whose structure cannot run proven (e.g. binding disabled after a
+ *  daemon restart with newer config). */
+export function identityBindingAllowsProven(input: {
+  platform: NodeJS.Platform;
+  sessionId: string;
+  larkAppId: string;
+  chatId: string;
+  apiOnly?: boolean;
+  adoptMode?: boolean;
+  existingAppServerEndpoint?: string;
+  backendType: import('../adapters/backend/types.js').BackendType;
+  larkToolBinding?: boolean;
+}): boolean {
+  return input.platform === 'linux' && usesLarkToolBinding(input);
+}
+
 /** Clean up managed lark-cli binding files and wrappers when binding is disabled. */
 export function cleanupLarkToolBinding(dataDir: string, sessionId: string): void {
   try {
@@ -167,8 +227,8 @@ export function hasLarkToolBinding(dataDir: string, sessionId: string): boolean 
 
 export function larkToolPrompt(appId: string, locale?: string): string {
   return locale === 'en'
-    ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user to act as the current user; botmux picks that person's authorization (their grant to this application, or their botmux platform authorization). To use a different application or profile, specify --profile <profile>. If authorization is missing, run botmux auth request --scope "<required scopes>" --json and pass the link or platform page it returns to the user. Do not repeat writes whose result is uncertain.`
-    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 以当前用户身份调用，用谁的哪份授权由 botmux 决定（该用户对本应用的授权，或其在 botmux 中心化平台的授权）；若需使用其他应用或 profile，可显式指定 --profile <profile>。缺授权时运行 botmux auth request --scope "<所需权限>" --json，把返回的链接或平台页面发给用户。不要重复执行结果尚不确定的写操作。`;
+    ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user to act as the current user; botmux picks that person's authorization (their grant to this application, or their botmux platform authorization). To use a different application or profile, specify --profile <profile>. When a read with --as user lacks a permission but the data is in a chat or document this bot can access (for example messages of a group the bot is in), retry that read with --as bot; never switch a write to --as bot. If the read also fails as bot, or the action must be done as the user, run botmux auth request --scope "<required scopes>" --json for the user's authorization and pass the link or platform page it returns to the user. Do not repeat writes whose result is uncertain.`
+    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 以当前用户身份调用，用谁的哪份授权由 botmux 决定（该用户对本应用的授权，或其在 botmux 中心化平台的授权）；若需使用其他应用或 profile，可显式指定 --profile <profile>。以 --as user 读取时缺权限、但数据在本机器人能访问的群或文档里（例如本机器人所在群的消息），改用 --as bot 重试这次读取；写操作不得改用 --as bot。bot 身份也读不到、或这件事必须以用户身份完成时，再运行 botmux auth request --scope "<所需权限>" --json 申请用户授权，把返回的链接或平台页面发给用户。不要重复执行结果尚不确定的写操作。`;
 }
 
 export function larkToolPromptFromEnv(

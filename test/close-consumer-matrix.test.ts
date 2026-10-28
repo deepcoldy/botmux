@@ -155,6 +155,12 @@ const CONSUMERS: Record<string, Rule> = {
       + 'the row back directly, so it cannot recursively wake a second provider.',
     count: 3,
   },
+  'core/session-manager.ts::reconcileStartedRemoteResumeExit::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'A provisional Remote Runner resume lost its provider before canonical activation. '
+      + 'The background wrapper logs refusals and residuals; durable control commits closed '
+      + 'only after the authoritative close is proven.',
+  },
   'core/session-manager.ts::spawnDashboardSession::closeSession': {
     category: 'impossible_by_invariant',
     why: 'Same scratch-placeholder eviction as resumeSession: no remote lineage.',
@@ -163,6 +169,13 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Scheduled-run teardown; a refusal leaves the row active and is logged by '
       + 'closeSession itself. No user surface at schedule time.',
+    count: 2,
+  },
+  'core/session-manager.ts::deliverOwnerBatchTurn::closeSession': {
+    category: 'background',
+    why: 'Decision-board batch delivery reclaims either a disposable scratch at the '
+      + 'steward anchor or its own candidate that lost the active-session CAS. No user '
+      + 'surface: a refusal leaves the row active and is logged by closeSession itself.',
     count: 2,
   },
   'core/failed-turn-recovery.ts::recoverFailedTurn::closeSessionForBackgroundCleanup': {

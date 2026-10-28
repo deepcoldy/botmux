@@ -1,6 +1,7 @@
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
+import { applyVcMeetingInviterPolicyPatch } from './services/vc-meeting-inviter-policy.js';
 import type { Duplex } from 'node:stream';
 import {
   readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync, statSync, createReadStream, realpathSync,
@@ -14,7 +15,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
-import { currentUpdateStrategy, replaceStandaloneBinary, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
+import { currentUpdateStrategy, replaceStandaloneBinary, applyStandaloneUpdate, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
@@ -104,8 +105,10 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
+import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { decisionBoardAccess, decisionBoardEntryRedirect, handleDecisionBoardApi } from './dashboard/decision-board-api.js';
 import { handleAgentProfilesApi } from './dashboard/agent-profiles-api.js';
 import {
   projectSessionEventForAudience,
@@ -132,6 +135,7 @@ import {
   resolveDashboardH5AuthConfig,
 } from './dashboard/h5-auth.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
+import { listLatestDiagnosticFiles } from './core/plugins/mcp/diagnostics-files.js';
 import {
   handlePluginResultAccess,
   resolvePluginResultViewerIdentity,
@@ -155,6 +159,7 @@ import {
 } from './dashboard/workbench-ticket.js';
 import { handleWorkbenchStandingLink } from './dashboard/standing-link.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
+import { signTerminalWakeProof } from './core/terminal-control-grant.js';
 import {
   centralViewLinkPath,
   mintTerminalViewCapability,
@@ -175,10 +180,11 @@ import {
   isKnownSelectionKey,
   buildModelChoicesResponse,
 } from './services/model-catalog.js';
+import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js';
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
-import { checkCliAvailability } from './setup/cli-availability.js';
+import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { applyGlobalSessionEnvOps, globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -203,13 +209,16 @@ import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-displ
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
+  fetchReleaseLatestVersion,
   fetchReleasesSince,
   fetchRollbackVersions,
   compareVersions,
   isCanonicalStableVersion,
   isNewerVersion,
+  mirrorFallbackRetryMs,
   type ChangelogResult,
   type RollbackVersionsResult,
+  type UpdateVersionSource,
 } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
 import { DEFAULT_OVERLOAD_THRESHOLDS } from './core/host-overload-alert.js';
@@ -334,7 +343,7 @@ import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './c
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -351,6 +360,7 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
+import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -879,6 +889,8 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // therefore through the liveness check above — so a raw view URL aimed at the
   // worker port or the daemon's own `/s/` proxy is refused by the worker.
   viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
+  // #2004: lets the daemon proxy wake a suspended session for a signed-in viewer.
+  wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
 });
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
   async (appId, row, options) => {
@@ -1115,6 +1127,9 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  /** Experimental, default OFF: reap tmux servers orphaned by a previous
+   *  daemon generation at daemon startup (automatic process kill). */
+  reapOrphanTmuxServers: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
@@ -1185,6 +1200,8 @@ interface ResolvedDashboardSettings {
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
    *  family, and the CLI authoring/run subcommands host-wide. */
   workflow: { enabled: boolean };
+  /** Machine-wide Claude Code prompt-cache default; null = not configured. */
+  promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退）。 */
   sessionCleanup: {
@@ -1406,6 +1423,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
           : {};
         // 「接收会议事件」开关。VC 对每个连着飞书的 bot 默认可用，`enabled: false`
         // 才是显式退出——所以打开时删掉这个 key 回到默认，而不是写 `enabled: true`。
+        applyVcMeetingInviterPolicyPatch(vc, patch.inviterManagementEnabled);
         if (patch.vcEnabled) delete vc.enabled;
         else vc.enabled = false;
         const consumer = (vc.meetingConsumer && typeof vc.meetingConsumer === 'object' && !Array.isArray(vc.meetingConsumer))
@@ -1746,6 +1764,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
+    reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: dashboard.hideCodexRateLimitModelNudge !== false,
@@ -1798,6 +1817,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       olderThanHours: resolveCleanupHours(global.sessionCleanup),
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
+    promptCache: global.promptCache ?? null,
     multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
@@ -2028,36 +2048,76 @@ let pendingLocalDevRestart: { dir: string; head: string } | undefined;
 const LATEST_TTL_MS = 30 * 60_000;
 const CHANGELOG_TTL_MS = 15 * 60_000;
 const FAILURE_TTL_MS = 60_000;
-type LatestVersionCache = { value: string | null; at: number; lookupOk: boolean };
+type LatestVersionCache = {
+  value: string | null;
+  source: UpdateVersionSource | null;
+  at: number;
+  ttlMs: number;
+  lookupOk: boolean;
+  releaseBacked: boolean;
+  fallbackStreak: number;
+};
 let latestVersionCache: LatestVersionCache | null = null;
-let latestVersionLookupInFlight: Promise<LatestVersionCache> | null = null;
+let latestVersionLookupInFlight: {
+  releaseBacked: boolean;
+  value: Promise<LatestVersionCache>;
+} | null = null;
 let changelogCache: { key: string; value: ChangelogResult; at: number } | null = null;
 let rollbackVersionCache: { current: string; value: RollbackVersionsResult; at: number } | null = null;
 let rollbackVersionLookupInFlight: { current: string; value: Promise<RollbackVersionsResult> } | null = null;
 
 async function cachedLatestVersion(force = false): Promise<LatestVersionCache> {
   const now = Date.now();
-  const ttl = latestVersionCache?.lookupOk ? LATEST_TTL_MS : FAILURE_TTL_MS;
-  if (!force && latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache;
+  const strategy = currentUpdateStrategy(botmuxInstallRoot());
+  const releaseBacked = strategy.kind === 'self-replace' || strategy.kind === 'install-release';
+  if (!force
+    && latestVersionCache?.releaseBacked === releaseBacked
+    && now - latestVersionCache.at < latestVersionCache.ttlMs) {
+    return latestVersionCache;
+  }
   // When forcing a refresh, don't piggy-back on an in-flight lookup that may
   // have started before the user asked for a refresh — start a fresh one so
   // the result reflects the current upstream state, not a stale query.
-  if (!force && latestVersionLookupInFlight) return latestVersionLookupInFlight;
+  if (!force && latestVersionLookupInFlight?.releaseBacked === releaseBacked) {
+    return latestVersionLookupInFlight.value;
+  }
 
   const lookup = (async () => {
-    const value = await fetchLatestVersion();
+    const result: { version: string | null; source: UpdateVersionSource | null } = releaseBacked
+      ? await fetchReleaseLatestVersion()
+      : {
+          version: await fetchLatestVersion(),
+          source: 'configured',
+        };
+    if (!result.version) result.source = null;
+    const fallbackStreak = result.source === 'configured-fallback'
+      ? latestVersionCache?.releaseBacked === releaseBacked
+        && latestVersionCache.source === 'configured-fallback'
+        ? latestVersionCache.fallbackStreak + (force ? 0 : 1)
+        : 1
+      : 0;
+    const ttlMs = !result.version
+      ? FAILURE_TTL_MS
+      : result.source === 'configured-fallback'
+        ? mirrorFallbackRetryMs(fallbackStreak)
+        : LATEST_TTL_MS;
     latestVersionCache = {
-      value: value ?? latestVersionCache?.value ?? null,
+      value: result.version ?? latestVersionCache?.value ?? null,
+      source: result.source ?? latestVersionCache?.source ?? null,
       at: Date.now(),
-      lookupOk: value !== null,
+      ttlMs,
+      lookupOk: result.version !== null,
+      releaseBacked,
+      fallbackStreak,
     };
     return latestVersionCache;
   })();
-  latestVersionLookupInFlight = lookup;
+  const inFlight = { releaseBacked, value: lookup };
+  latestVersionLookupInFlight = inFlight;
   try {
     return await lookup;
   } finally {
-    if (latestVersionLookupInFlight === lookup) latestVersionLookupInFlight = null;
+    if (latestVersionLookupInFlight === inFlight) latestVersionLookupInFlight = null;
   }
 }
 
@@ -2653,13 +2713,7 @@ function latestGatewayDiagnostics(): Map<string, unknown[]> {
   const root = join(config.session.dataDir, 'mcp-gateway');
   const byPlugin = new Map<string, unknown[]>();
   if (!existsSync(root)) return byPlugin;
-  let files: string[] = [];
-  try {
-    files = readdirSync(root)
-      .filter(file => file.endsWith('.json'))
-      .sort((a, b) => statSync(join(root, b)).mtimeMs - statSync(join(root, a)).mtimeMs)
-      .slice(0, 50);
-  } catch { return byPlugin; }
+  const files = listLatestDiagnosticFiles(root, 50);
   const seen = new Set<string>();
   for (const file of files) {
     try {
@@ -3019,7 +3073,13 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string }> {
+type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
+  'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
+  | 'modelBackendVariant' | 'reasoningEffort' | 'codexProfile' | 'serviceTier' | 'nativeSubagentRuntime'
+  | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir'
+>> & { cliId?: string };
+
+function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -3031,8 +3091,10 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       wrapperCli: b.wrapperCli,
       cliLaunchMode: b.cliLaunchMode,
       model: b.model,
+      traexAutoModel: b.traexAutoModel,
       modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
+      codexProfile: b.codexProfile ?? undefined,
       serviceTier: b.serviceTier,
       nativeSubagentRuntime: b.nativeSubagentRuntime,
       turnTimeoutMs: b.turnTimeoutMs,
@@ -3081,8 +3143,11 @@ async function configuredBotDefaultsRecoveryRows(
           wrapperCli: bot.wrapperCli,
           cliLaunchMode: bot.cliLaunchMode,
           model: bot.model,
+          traexAutoModel: bot.traexAutoModel,
+          codexRpcInput: bot.codexRpcInput,
           modelBackendVariant: bot.modelBackendVariant,
           reasoningEffort: bot.reasoningEffort,
+          codexProfile: bot.codexProfile ?? null,
           serviceTier: bot.serviceTier,
           nativeSubagentRuntime: bot.nativeSubagentRuntime,
           turnTimeoutMs: bot.turnTimeoutMs,
@@ -3092,11 +3157,9 @@ async function configuredBotDefaultsRecoveryRows(
         }, {
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
-          quotaFallbackBot: rawEntry?.quotaFallbackBot,
-          autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
-          // 离线行也要带上磁盘里的排版配置，否则 daemon 不在线时 Dashboard
-          // 会把已配置的竖放布局显示回 compact（payload 层 fail-soft 归一化）。
-          askOptionLayout: rawEntry?.askOptionLayout,
+          // 离线行也要带上磁盘里的保存值（如竖放排版、默认关的 larkToolBinding），
+          // 否则 daemon 不在线时 Dashboard 会把已保存的非默认态显示回默认态。
+          ...sparseOverridesFromRawBotConfig(rawEntry),
         });
         return {
           ...payload,
@@ -3110,12 +3173,12 @@ async function configuredBotDefaultsRecoveryRows(
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgentFields>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier'] }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string } {
+  ids: Map<string, string> | Map<string, ConfiguredBotAgentFields>,
+): T & ConfiguredBotAgentFields {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: ConfiguredBotAgentFields | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -3124,8 +3187,10 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
     model: bot.model || fallback?.model,
+    traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
     modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    codexProfile: bot.codexProfile ?? fallback?.codexProfile,
     serviceTier: bot.serviceTier || fallback?.serviceTier,
     nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
@@ -4231,6 +4296,21 @@ const server = createServer(async (req, res) => {
       workbenchIdentity: workbenchOnlyIdentity,
     });
 
+    // 决策看板事项链接的路径入口（飞书侧栏 AppLink 指向它）。只做跳转、不返回数据，所以放在
+    // 401 之前：已登录 → SPA 的 #/board/...；未登录且配了 H5 免登 → 先走飞书免登再回到这里；
+    // 其余交给 SPA 的登录层。用路径不用 #，是因为平台冷访问 SSO 只把 pathname+search 带进 next。
+    const boardEntry = req.method === 'GET' || req.method === 'HEAD'
+      ? decisionBoardEntryRedirect(url.pathname, {
+        signedIn: decisionBoardAccess(requestIdentity, canManageHost),
+        h5: dashboardH5AuthConfig,
+      })
+      : null;
+    if (boardEntry) {
+      res.writeHead(302, { location: boardEntry, 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
@@ -4867,6 +4947,7 @@ const server = createServer(async (req, res) => {
         ...(diskVersion ? { diskVersion } : {}),
         latest,
         versionLookupOk: latestResult.lookupOk,
+        latestSource: latestResult.source,
         behind: !!latest && isNewerVersion(latest, current),
         runningDaemons,
         ...(runningDaemonRestartHint ? { runningDaemonRestartHint } : {}),
@@ -4988,6 +5069,8 @@ const server = createServer(async (req, res) => {
         let blockedByRestart = false;
         let oldVersion = '';
         let newVersion = '';
+        let skipped: string | undefined;
+        let source: string | undefined;
         try {
           const latest = await cachedLatestVersion(false);
           if (!latest.value) {
@@ -4998,11 +5081,15 @@ const server = createServer(async (req, res) => {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
-            await replaceStandaloneBinary(newVersion, runStrategy.target, {
+            const result = await applyStandaloneUpdate(newVersion, {
+              currentVersion: oldVersion, target: runStrategy.target,
+            }, {
               onProgress: (progress) => {
                 binaryUpdateProgress = { version: newVersion, ...progress };
               },
             });
+            if (result.skipped) { skipped = result.reason; return; }
+            source = result.source;
             pendingBinaryRestart = { target: runStrategy.target, version: newVersion };
           }, { maxWaitMs: 2_000 });
         } catch (e) {
@@ -5013,10 +5100,15 @@ const server = createServer(async (req, res) => {
           binaryUpdateProgress = undefined;
         }
         if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        if (skipped) return jsonRes(res, 200, {
+          ok: true, oldVersion, newVersion: oldVersion, resolvedVersion: newVersion,
+          changed: false, restartRequired: false, skipped, manager: 'binary',
+        });
         return jsonRes(res, 200, {
           ok: true,
           oldVersion,
           newVersion,
+          source,
           // The swapped binary is on disk but THIS process still runs (and reports)
           // the old baked version, so `changed` cannot be derived by re-reading —
           // it is the version comparison that decided to update at all.
@@ -5708,6 +5800,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ─── 决策看板（管家 bot 的 daemon 是唯一写入方）──────────────────────────────
+    if (await handleDecisionBoardApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      proxyToDaemon,
+      readJsonBody,
+      bots: () => {
+        const online = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
+        return monitorBotConfigs().map(cfg => ({
+          larkAppId: cfg.larkAppId,
+          botName: online.get(cfg.larkAppId) || cfg.displayName || cfg.larkAppId,
+          ...(cfg.steward ? { steward: cfg.steward } : {}),
+          online: online.has(cfg.larkAppId),
+        }));
+      },
+    })) {
+      return;
+    }
+
     // ─── Agent 配置模板（agents.json）─────────────────────────────────────────
     // 不在 PUBLIC_READ_PATHS ⟹ 未认证已被 401；写操作在 handler 内另要 canManageHost。
     if (await handleAgentProfilesApi(req, res, url, {
@@ -5756,11 +5867,11 @@ const server = createServer(async (req, res) => {
           // Keep the all-options scan shell-free so opening the form remains
           // instant even when most of the 20+ CLIs are absent. The selected
           // option is checked again with shell/rc resolution on submit/save.
-          const availability = checkCliAvailability({
+          const availability = preliminaryCliAvailability({
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
             cliLaunchMode: o.cliLaunchMode,
-          }, { shellFallback: false });
+          });
           // 静态模型候选（shell-free）：live 不可用时的兜底；live 成功时由
           // /api/cli-options/models 返回 runtime 权威目录。staticModelChoices 自身 fail-soft，
           // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
@@ -5774,6 +5885,7 @@ const server = createServer(async (req, res) => {
             id: o.key,
             label: o.label,
             available: availability.available,
+            availabilityStatus: availability.status,
             command: availability.command,
             availabilityReason: availability.reason,
             ...(o.cliLaunchMode ? { cliLaunchMode: o.cliLaunchMode } : {}),
@@ -5793,6 +5905,22 @@ const server = createServer(async (req, res) => {
         // 不会把「没探测」误读成「探测结果是未登录」而把用户推去扫码。
         ...(webSession ? { webSession } : {}),
       });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/cli-options/availability') {
+      const key = (url.searchParams.get('key') ?? '').trim();
+      if (!isKnownSelectionKey(key)) {
+        return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
+      }
+      const appId = url.searchParams.get('bot')?.trim();
+      let botConfig: BotConfig | undefined;
+      try {
+        botConfig = appId ? getBot(appId).config ?? loadBotConfigs().find(bot => bot.larkAppId === appId) : undefined;
+      } catch {
+        botConfig = undefined;
+      }
+      const response = await cliAvailabilityResponse(key, botConfig, process.env);
+      return jsonRes(res, response.statusCode, response.body);
     }
 
     // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），
@@ -6418,7 +6546,7 @@ const server = createServer(async (req, res) => {
       if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
       const upstream = await proxyToDaemon(larkAppId, '/api/schedules', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: dashboardScheduleWriteHeaders(req, !!readPlatformBinding()),
         body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
@@ -6440,7 +6568,7 @@ const server = createServer(async (req, res) => {
       }
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}`, {
         method: 'PATCH',
-        headers: { 'content-type': 'application/json' },
+        headers: dashboardScheduleWriteHeaders(req, !!readPlatformBinding()),
         body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
@@ -6827,6 +6955,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, out.status, out.body);
       }
       if (req.method === 'PUT') {
+        if (!authed) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
         let parsed: unknown;
         try {
           parsed = await readJsonBody(req);
@@ -7223,35 +7352,7 @@ const server = createServer(async (req, res) => {
             return { ...botDefaultsPayload(d, undefined, `http_${r.status}`), botIndex: d.botIndex };
           }
           const j = await r.json() as any;
-          return { ...botDefaultsPayload({
-            ...d,
-            botName: d.botName ?? j.botName,
-            cliId: j.cliId || d.cliId,
-            // New daemons return explicit null for Official/no legacy path.
-            // Respect that instead of reviving a stale fallback descriptor;
-            // older daemons omit the fields and still use bots.json fallback.
-            cliRuntime: Object.prototype.hasOwnProperty.call(j, 'cliRuntime')
-              ? j.cliRuntime ?? undefined
-              : d.cliRuntime,
-            cliPathOverride: Object.prototype.hasOwnProperty.call(j, 'cliPathOverride')
-              ? j.cliPathOverride ?? undefined
-              : d.cliPathOverride,
-            wrapperCli: j.wrapperCli || d.wrapperCli,
-            cliLaunchMode: Object.prototype.hasOwnProperty.call(j, 'cliLaunchMode')
-              ? j.cliLaunchMode ?? undefined
-              : d.cliLaunchMode,
-            model: j.model || d.model,
-            modelBackendVariant: Object.prototype.hasOwnProperty.call(j, 'modelBackendVariant')
-              ? j.modelBackendVariant ?? undefined
-              : d.modelBackendVariant,
-            reasoningEffort: j.reasoningEffort || d.reasoningEffort,
-            serviceTier: j.serviceTier || d.serviceTier,
-            nativeSubagentRuntime: Object.prototype.hasOwnProperty.call(j, 'nativeSubagentRuntime')
-              ? j.nativeSubagentRuntime ?? undefined
-              : d.nativeSubagentRuntime,
-            turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
-            dshRuntime: typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime,
-          }, j), botIndex: d.botIndex };
+          return { ...botDefaultsPayload(mergeBotOncallFields(d, j), j), botIndex: d.botIndex };
         } catch (e: any) {
           return { ...botDefaultsPayload(d, undefined, e?.message ?? String(e)), botIndex: d.botIndex };
         }
@@ -7347,6 +7448,17 @@ const server = createServer(async (req, res) => {
     // /api/fs/list、/api/dsh/profiles、/api/feed-groups/*（以及 blocked-users / grants 三块之后的
     // vc-meeting、role-profiles、groups/*、GET /api/bots），它们的 path 与表内每一条都互斥，
     // 所以在此一次性匹配整张表与原先的穿插排布先后等价。新增穿插路由时别让它的 path 与表内条目重叠。
+    // 会话环境变量（全局层 / Bot 层 / 运行中会话实际环境 / tmux server 全局环境）。
+    // 原文查看与 tmux server 改动只给本机 owner（legacyAuthed），见 dashboard/session-env-api.ts。
+    if (await handleSessionEnvRoute(req, res, url, {
+      canReveal: legacyAuthed,
+      daemons: () => registry.list(),
+      proxyToDaemon,
+      readJsonBody: body => readJsonBody(body),
+      applyGlobalOps: ops => applyGlobalSessionEnvOps(ops),
+      jsonRes,
+    })) return;
+
     if (await handleDaemonProxyRoute(BOT_PROXY_ROUTES, req, res, url, daemonProxyDeps)) return;
 
     // GET  /api/bots/:appId/slash-commands — native Lark slash-command catalog.

@@ -23,7 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -632,7 +632,9 @@ export function makeSubmitFingerprint(content: string, len = 30): string | undef
  *  `sessionId` even though it rotates the on-disk jsonl. Callers that
  *  rely on this for rotation tracking must therefore treat a "matching
  *  sessionId" answer as "no spawn-time rotation observed", not "no
- *  rotation at all" — the latter requires fingerprint corroboration. */
+ *  rotation at all" — the latter requires fingerprint corroboration.
+ *  Claude Code 2.1.305/2.1.306 rewrite `sessionId` on `/clear` as well
+ *  (observed 2026-10-22: the record named the post-clear transcript). */
 export function claudePidStatePath(pid: number, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string {
   return join(dataDir, 'sessions', `${pid}.json`);
 }
@@ -655,6 +657,53 @@ function readProcStarttime(pid: number): string | null {
   }
 }
 
+/** Re-read delays for a pid-state record caught mid-rewrite. Claude rewrites
+ *  the record in place — never through a rename — on every state change,
+ *  including the busy→idle edge the worker judges a finished turn on:
+ *    - the native build opens it without O_TRUNC, writes, then ftruncates
+ *      (strace, 2.1.309): a record that shrinks reads as the new JSON followed
+ *      by the old record's tail until the ftruncate lands;
+ *    - a writer that truncates first (Node's writeFileSync: O_TRUNC → write)
+ *      leaves it empty until the write lands.
+ *  Either window lies between two consecutive syscalls of the writer and stays
+ *  open only while it waits to be scheduled again; 45ms of re-reads outlasts
+ *  that on a loaded host. Read once, such a record made the unread-turn check
+ *  tell the group a reply was lost that the next bridge tick delivered. */
+const PID_STATE_REREAD_DELAYS_MS = [5, 15, 25];
+
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+let pidStateRereadSleepFn: (ms: number) => void = sleepSyncMs;
+
+/** Test seam: the re-reads sleep SYNCHRONOUSLY, so a test cannot finish the
+ *  rewrite from a timer; it passes a sleep that does. Pass null to restore the
+ *  real sleep. */
+export function setClaudePidStateRereadSleepForTests(fn: ((ms: number) => void) | null): void {
+  pidStateRereadSleepFn = fn ?? sleepSyncMs;
+}
+
+/** The parsed pid-state record; undefined when there is none or it never
+ *  parses. Only a record that exists but does not parse is re-read: a missing
+ *  one is the common answer for a pid that is not Claude, polled every tick. */
+function readClaudePidState(path: string): unknown {
+  for (let attempt = 0; ; attempt++) {
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      return undefined;
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return undefined;
+      pidStateRereadSleepFn(PID_STATE_REREAD_DELAYS_MS[attempt]!);
+    }
+  }
+}
+
 /** Resolve Claude Code's authoritative current session id via
  *  ~/.claude/sessions/<pid>.json. Validates pid + sessionId UUID + cwd so a
  *  stale or unrelated pid file can't redirect us to the wrong jsonl. On Linux
@@ -663,12 +712,7 @@ function readProcStarttime(pid: number): string | null {
  *  fall back to fingerprint detection. */
 export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  let parsed: any;
-  try {
-    parsed = JSON.parse(readFileSync(claudePidStatePath(pid, dataDir), 'utf8'));
-  } catch {
-    return null;
-  }
+  const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
   if (!parsed || typeof parsed !== 'object') return null;
   if (parsed.pid !== pid) return null;
   if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return null;
@@ -1153,7 +1197,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection, promptCacheTtl }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1229,6 +1273,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // 跟上 5h/7d 窗口滚动；快照 10 min 陈旧自动失效（STATUSLINE_STALE_MS）。
       if (variant.id === 'claude-code') {
         inlineSettings.statusLine = { type: 'command', command: statuslineHookCommand(), refreshInterval: 60 };
+      }
+      // Prompt-cache lifetime (bots.json / config.json `promptCache.ttl`). Through a
+      // gateway Claude Code treats itself as an API-key client and asks for 5m;
+      // `promptCacheTtl` makes it request the lifetime the operator chose.
+      if (variant.id === 'claude-code' && promptCacheTtl) {
+        inlineSettings.promptCacheTtl = promptCacheTtl;
       }
       // claude-code 恒传 --settings（statusLine 总在）；其它 variant 仅在有内容（bypass
       // 键 / env）时才传，disableCliBypass 且无 env 下没东西可传就不传。
@@ -1637,6 +1687,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
       // 装了也是每轮空跑一个子进程）。
       userPromptSubmitCommand: variant.id === 'claude-code' ? userPromptHookCommand() : undefined,
+      // StopFailure 兜底（API 错误结束的回合不跑 Stop hook，transcript 跟丢时没人收口）：
+      // 同样写全局 settings.json。只给 claude-code：该事件在 Claude Code 2.1.x 实测存在，
+      // seed/relay 等共享 adapter 的 variant 未验证。
+      stopFailureCommand: variant.id === 'claude-code' ? claudeStopFailureHookCommand() : undefined,
     },
     // Claude Code 把 UserPromptSubmit 的 additionalContext 注入为不可见的
     // system-reminder（TUI transcript 不可见，仅落 JSONL）。codex 会渲染成可见的

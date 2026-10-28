@@ -32,6 +32,7 @@ export const LOCAL_CLI_IDS = [
   'oh-my-pi',
   'kimi',
   'grok',
+  'zcode',
 ] as const satisfies readonly CliId[];
 
 export type LocalCliId = typeof LOCAL_CLI_IDS[number];
@@ -58,6 +59,7 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'copilot': 'copilot --resume',
   'kimi': 'kimi --resume',
   'grok': 'grok --resume',
+  'zcode': 'zcode --resume',
 };
 
 type AdoptedMetadata = NonNullable<DaemonSession['adoptedFrom']> | NonNullable<DaemonSession['session']['adoptedFrom']>;
@@ -267,7 +269,12 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
     return fail('missing_attach_target', 'This session has no persistent backend attach target.');
   }
   if (backendType === 'tmux') {
-    return { ok: true, command: `tmux attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
+    // A session created after the dedicated socket lives on `-L <socketName>`;
+    // older rows (no socketName) stay on the default server.
+    const socket = target.backendType === 'tmux' && target.socketName !== undefined
+      ? ` -L ${shellQuote(target.socketName)}`
+      : '';
+    return { ok: true, command: `tmux${socket} attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
   }
   if (backendType === 'herdr') {
     if (target.backendType === 'herdr' && target.agentName) {

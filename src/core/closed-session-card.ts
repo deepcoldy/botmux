@@ -9,6 +9,8 @@ import { sessionAnchorId, storedSessionAnchorId, type DaemonSession } from './ty
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import type { Locale } from '../i18n/index.js';
+import { sessionWorktreeOffer } from './session-worktree-cleanup.js';
+import { closedCardWorktreeSection, type ClosedCardCleanupState } from '../im/lark/session-worktree-cleanup-card.js';
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -36,6 +38,9 @@ function replaceResumeExecutable(command: string, executable: string): string {
 export function buildClosedSessionCard(
   source: DaemonSession | Session,
   locale: Locale,
+  // 「清理 worktree」section state (#698): omitted → offer it when the working
+  // dir is a worktree botmux created; the click flow passes running / result.
+  worktreeCleanupState?: ClosedCardCleanupState,
 ): string {
   const live = 'session' in source ? source : undefined;
   const session = live?.session ?? (source as Session);
@@ -107,5 +112,10 @@ export function buildClosedSessionCard(
     // resuming reactivates the route but starts a FRESH session — the card
     // must not imply history is restored.
     !cliResumeCommand && resumeStartsFresh({ cliId: closedCliId, cliSessionId: session.cliSessionId }),
+    closedCardWorktreeSection(
+      worktreeCleanupState,
+      !worktreeCleanupState && sessionWorktreeOffer(session) !== undefined,
+      locale,
+    ),
   );
 }

@@ -28,6 +28,7 @@ import {
   normalizeLocalHomeLinks,
   REPLY_CARD_FOOTER_MARKER,
 } from '../src/im/lark/md-card.js';
+import type { CardUsageSnapshot } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
   return out.filter(e => e.tag === 'markdown');
@@ -1011,6 +1012,43 @@ describe('buildMarkdownCard', () => {
     expect(seg).toContain('本轮 ↑5K ↓1.2K');
     expect(seg).toContain('累计 ↑67.9K ↓123');
     expect(seg).not.toContain('上下文');
+  });
+
+  it('streaming variant appends the session cache hit rate after 累计', () => {
+    // Claude: in = input + cache_read + cache_create (cache-inclusive).
+    const usage = { context: null, tokens: { in: 1_000_000, out: 7_800, cacheReadTokens: 873_000, cacheCreateTokens: 120_000 } };
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming')).toBe('累计 ↑1M ↓7.8K · 缓存命中 87%');
+    expect(cardUsageFooterSegment(usage, 'en', 'streaming')).toBe('Total ↑1M ↓7.8K · Cache hit 87%');
+    // Footer variant stays context-only.
+    expect(cardUsageFooterSegment(usage, 'zh', 'footer')).toBeNull();
+  });
+
+  it('cache hit rate floors, shows 0% for write-only caches and hides without cache activity', () => {
+    const seg = (tokens: NonNullable<CardUsageSnapshot['tokens']>) =>
+      cardUsageFooterSegment({ context: null, tokens }, 'zh', 'streaming');
+    // Floor, so a nearly-full cache never reads as 100%.
+    expect(seg({ in: 1000, out: 10, cacheReadTokens: 996, cacheCreateTokens: 4 })).toBe('累计 ↑1K ↓10 · 缓存命中 99%');
+    expect(seg({ in: 1000, out: 10, cacheReadTokens: 1000 })).toBe('累计 ↑1K ↓10 · 缓存命中 100%');
+    // Cache written but never read is an honest 0%.
+    expect(seg({ in: 50_000, out: 100, cacheReadTokens: 0, cacheCreateTokens: 40_000 })).toBe('累计 ↑50K ↓100 · 缓存命中 0%');
+    // Codex reports cached reads only (no cache_creation field).
+    expect(seg({ in: 200_000, out: 900, cacheReadTokens: 150_000 })).toBe('累计 ↑200K ↓900 · 缓存命中 75%');
+    // A dialect with no cache fields folds to 0/0 — unknown, not 0%.
+    expect(seg({ in: 50_000, out: 100, cacheReadTokens: 0, cacheCreateTokens: 0 })).toBe('累计 ↑50K ↓100');
+    expect(seg({ in: 50_000, out: 100 })).toBe('累计 ↑50K ↓100');
+    // A remote provider reporting cacheCreate alone (no read field) still shows
+    // an honest 0% rather than hiding cache activity.
+    expect(seg({ in: 50_000, out: 100, cacheCreateTokens: 40_000 })).toBe('累计 ↑50K ↓100 · 缓存命中 0%');
+  });
+
+  it('cache hit rate keeps exact integer percentages under floating point', () => {
+    const seg = (tokens: NonNullable<CardUsageSnapshot['tokens']>) =>
+      cardUsageFooterSegment({ context: null, tokens }, 'zh', 'streaming');
+    // (read / in) * 100 lands on x.99999… for these exact integer ratios;
+    // multiplying first must keep them at 29% / 57% / 58%.
+    expect(seg({ in: 1_000_000, out: 100, cacheReadTokens: 290_000 })).toBe('累计 ↑1M ↓100 · 缓存命中 29%');
+    expect(seg({ in: 1_000_000, out: 100, cacheReadTokens: 570_000 })).toBe('累计 ↑1M ↓100 · 缓存命中 57%');
+    expect(seg({ in: 1_000_000, out: 100, cacheReadTokens: 580_000 })).toBe('累计 ↑1M ↓100 · 缓存命中 58%');
   });
 
   it('keeps the metric formatter runtime-free so the streaming renderer owns the tail', () => {

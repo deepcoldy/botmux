@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -14,6 +14,7 @@ import {
   resolveGatewayEnvironment,
 } from '../src/core/plugins/mcp/gateway.js';
 import { refreshSessionMcpRuntimeManifest } from '../src/core/plugins/mcp/session-runtime.js';
+import { pluginMcpToolTimeoutOptions } from '../src/core/plugins/mcp/runtime-options.js';
 import {
   sessionMcpGatewayPathRegex,
   sessionMcpGatewaySocketDir,
@@ -50,6 +51,137 @@ describe('plugin MCP Gateway', () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('applies a configured downstream tool timeout without changing the default', () => {
+    expect(pluginMcpToolTimeoutOptions(120_000)).toEqual({
+      timeout: 120_000,
+      maxTotalTimeout: 120_000,
+    });
+    expect(pluginMcpToolTimeoutOptions()).toEqual({});
+  });
+
+  it('enforces the session snapshot timeout across the real Gateway tool route', async () => {
+    installFixturePlugin('plugin-slow', 'slow');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'configured-timeout',
+      pluginIds: ['plugin-slow'],
+      pluginRuntime: { 'plugin-slow': { toolTimeoutMs: 100 } },
+      dataDir,
+    });
+    const gateway = new PluginMcpGateway(undefined, {
+      ...process.env,
+      BOTMUX_SESSION_ID: 'configured-timeout',
+      SESSION_DATA_DIR: dataDir,
+    });
+    const client = new Client({ name: 'gateway-timeout-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const startedAt = Date.now();
+    try {
+      await expect(client.callTool({
+        name: 'echo',
+        arguments: { delayMs: 2_000 },
+      })).rejects.toThrow(/timed out|-32001/i);
+      const elapsedMs = Date.now() - startedAt;
+      expect(elapsedMs).toBeGreaterThanOrEqual(75);
+      expect(elapsedMs).toBeLessThan(1_000);
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
+  it('keeps the downstream SDK default when the snapshot omits a timeout', async () => {
+    installFixturePlugin('plugin-slow', 'slow');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'default-timeout',
+      pluginIds: ['plugin-slow'],
+      dataDir,
+    });
+    const gateway = new PluginMcpGateway(undefined, {
+      ...process.env,
+      BOTMUX_SESSION_ID: 'default-timeout',
+      SESSION_DATA_DIR: dataDir,
+    });
+    const client = new Client({ name: 'gateway-default-timeout-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const result = await client.callTool({ name: 'echo', arguments: { delayMs: 150 } });
+      expect((result.content[0] as any).text).toContain('slow:echo');
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
+  it('does not let progress notifications extend a plugin call past its total timeout', async () => {
+    installFixturePlugin('plugin-progress', 'progress');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'progress-timeout',
+      pluginIds: ['plugin-progress'],
+      pluginRuntime: { 'plugin-progress': { toolTimeoutMs: 500 } },
+      dataDir,
+    });
+    const gateway = new PluginMcpGateway(undefined, {
+      ...process.env,
+      BOTMUX_SESSION_ID: 'progress-timeout',
+      SESSION_DATA_DIR: dataDir,
+    });
+    const client = new Client({ name: 'gateway-progress-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const startedAt = Date.now();
+    try {
+      await expect(client.callTool(
+        { name: 'echo', arguments: {}, _meta: { progressToken: 'progress-token' } },
+        undefined,
+        { timeout: 10_000 },
+      )).rejects.toThrow(/timed out|-32001/i);
+      const elapsedMs = Date.now() - startedAt;
+      expect(elapsedMs).toBeGreaterThanOrEqual(400);
+      expect(elapsedMs).toBeLessThan(1_500);
+    } finally {
+      await client.close().catch(() => undefined);
+      await gateway.close();
+    }
+  });
+
+  it('injects runtime env into only the configured plugin process', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    installFixturePlugin('plugin-b', 'beta');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'runtime-env-isolation',
+      pluginIds: ['plugin-a', 'plugin-b'],
+      pluginRuntime: { 'plugin-a': { env: { PRIVATE_MCP_TOKEN: 'runtime-token' } } },
+      dataDir,
+    });
+    const gateway = new PluginMcpGateway(undefined, {
+      ...process.env,
+      BOTMUX_SESSION_ID: 'runtime-env-isolation',
+      SESSION_DATA_DIR: dataDir,
+    });
+    const client = new Client({ name: 'gateway-runtime-env-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const withEnv = await client.callTool({ name: 'plugin-a__echo', arguments: {} });
+      expect((withEnv.content[0] as { text: string }).text).toContain('token=runtime-token');
+      const withoutEnv = await client.callTool({ name: 'plugin-b__echo', arguments: {} });
+      expect((withoutEnv.content[0] as { text: string }).text).toMatch(/token=$/);
+    } finally {
+      await client.close().catch(() => undefined);
+      await gateway.close();
+    }
   });
 
   function installFixturePlugin(pluginId: string, fixtureName: string, env?: Record<string, string>) {
@@ -581,6 +713,40 @@ describe('plugin MCP Gateway', () => {
     } finally {
       await client.close();
       rmSync(resolve('data', 'mcp-gateway', `${sessionId}.json`), { force: true });
+    }
+  });
+
+  it('prunes diagnostics older than the TTL when persisting, keeping the newest 50', async () => {
+    // 写侧接线：persistDiagnostics 落盘后顺手 prune 7 天前的旧快照、至少留 50。
+    const dir = join(home, '.botmux', 'data', 'mcp-gateway');
+    mkdirSync(dir, { recursive: true });
+    // 55 个超龄快照，seed-54 最新、seed-00 最旧；再加一个非 .json 文件，不能被碰。
+    for (let i = 0; i < 55; i += 1) {
+      const p = join(dir, `seed-${String(i).padStart(2, '0')}.json`);
+      writeFileSync(p, '{}\n');
+      const ageSeconds = 8 * 86400 - i; // seed-00 最旧
+      utimesSync(p, (Date.now() - ageSeconds * 1000) / 1000, (Date.now() - ageSeconds * 1000) / 1000);
+    }
+    writeFileSync(join(dir, 'notes.txt'), 'keep');
+
+    const sessionId = 'mcp-serve-prune-ttl';
+    const sessionFile = join(dir, `${sessionId}.json`);
+    const client = await connectMcpServe(sessionId);
+    try {
+      await vi.waitFor(() => expect(existsSync(sessionFile)).toBe(true));
+      // 56 个 .json（55 旧 + 当前会话）→ 删掉最旧 6 个，保留 50 个。
+      await vi.waitFor(() => {
+        const jsonCount = readdirSync(dir).filter(name => name.endsWith('.json')).length;
+        expect(jsonCount).toBe(50);
+      });
+      expect(existsSync(join(dir, 'seed-00.json'))).toBe(false);
+      expect(existsSync(join(dir, 'seed-05.json'))).toBe(false);
+      expect(existsSync(join(dir, 'seed-06.json'))).toBe(true);
+      expect(existsSync(join(dir, 'seed-54.json'))).toBe(true);
+      expect(existsSync(sessionFile)).toBe(true);
+      expect(existsSync(join(dir, 'notes.txt'))).toBe(true);
+    } finally {
+      await client.close();
     }
   });
 

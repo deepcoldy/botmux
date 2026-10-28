@@ -49,6 +49,13 @@ export interface CommandSpec {
    * `'talk'` = 有对话权限即可执行（`canRunDaemonCommand` 直接按 canTalk 判）。
    */
   readonly permission?: 'talk';
+  /**
+   * 群里免 @ 也能寻址本 bot（普通群、话题群、话题回复全部生效）。与用户配置的
+   * commandTriggers 不同，这是**内置白名单**，只给只读、无副作用、自带管理员闸的
+   * 控制命令开放（`/dash`）。dispatcher 只凭它放开群 @ 寻址，调用者仍需通过
+   * canTalk 入口闸，daemon 侧再按命令自身权限（canOperate 及命令内 owner 闸）结算。
+   */
+  readonly mentionless?: true;
   readonly sessionPolicy: CommandSessionPolicy;
   /**
    * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器，从不建会话。
@@ -167,6 +174,10 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: '/dashboard', sessionPolicy: 'sessionless', help: ['help.dashboard'],
   },
   {
+    name: '/dash', sessionPolicy: 'sessionless', mentionless: true, help: ['help.dash'],
+    notes: '等价于 `/dashboard link`：daemon 直接私信/临时卡返回管理首页链接，不建会话、不建 worktree。',
+  },
+  {
     name: '/sessions', sessionPolicy: 'sessionless', help: ['help.sessions'],
     special: 'sessions',
     notes: '授权在 canTalk 级（canTalkForGroupSessions），不是 canOperate',
@@ -242,3 +253,21 @@ export const MULTILINE_COMMANDS: Set<string> = new Set(
 export const ROUTE_SPECIAL_COMMANDS: ReadonlyMap<string, CommandSpecialHandler> = new Map(
   GLOBAL_COMMANDS.filter(s => s.special).flatMap(s => namesOf(s).map(n => [n, s.special!] as const)),
 );
+
+/** 群里免 @ 即可寻址本 bot 的内置保留命令（所有群形态；dispatcher 群闸消费）。 */
+export const MENTIONLESS_DAEMON_COMMANDS: ReadonlySet<string> = new Set(
+  GLOBAL_COMMANDS.filter(s => s.mentionless === true).flatMap(namesOf),
+);
+
+/**
+ * 一条已剥前导 @ 的斜杠文本是否属于内置免 @ 控制命令。
+ *
+ * 命令级白名单（{@link MENTIONLESS_DAEMON_COMMANDS}）之外，`/dashboard` 命令组里
+ * 只有 `link` 这一个无副作用、自带管理员闸的子命令免 @；其它子命令维持「必须 @」
+ * 的历史语义，避免非管理员裸发任何 `/dashboard xxx` 都在群里收到拒绝回执。
+ */
+export function isBuiltinMentionlessInvocation(cmd: string | undefined, rawText: string): boolean {
+  if (!cmd) return false;
+  if (MENTIONLESS_DAEMON_COMMANDS.has(cmd)) return true;
+  return cmd === '/dashboard' && /^\/dashboard\s+link\s*$/i.test(rawText.trim());
+}

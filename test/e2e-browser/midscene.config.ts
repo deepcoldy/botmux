@@ -2,7 +2,7 @@ import { defineNode, z } from '@midscene/test';
 import { defineTestProject } from '@midscene/test/config';
 import { runWithE2EVideoLabel } from './e2e-video.js';
 import { runWithReportScope, type ReportScopeContext } from './report-scope.js';
-import { laneProject, selectedCaseFiles } from './lanes.js';
+import { laneProject, laneStartOrder, selectedCaseFiles } from './lanes.js';
 import {
   FEISHU_PHASE_SCENARIOS,
   closeFeishuPhase,
@@ -117,11 +117,13 @@ export default defineTestProject({
     showStreamingOutputNode,
     closeNode,
   ],
-  projects: selectedCaseFiles(process.env.FEISHU_E2E_CASES).map((file) => ({
+  // The serial group-mode lane starts first (laneStartOrder): it is the
+  // longest lane, so it sets the job's length.
+  projects: laneStartOrder(selectedCaseFiles(process.env.FEISHU_E2E_CASES)).map((file) => ({
     name: laneProject(file),
-    // The group-mode lane runs 16 cases one after another in one shared group;
-    // a retry there doubles the slowest lane, so it reports first attempts.
-    retry: process.env.CI && !file.includes('group-modes') ? 1 : 0,
+    // A retry reruns only the failed case (Midscene retries per case), so one
+    // retry costs that case's few minutes, not the lane's.
+    retry: process.env.CI ? 1 : 0,
     files: { include: [file] },
   })),
 });

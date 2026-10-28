@@ -52,6 +52,13 @@ import {
 // their import path now that these helpers live in claude-transcript.ts.
 export { normaliseForFingerprint };
 
+/** How long the worker's provisional-exit watchdog waits for a fresh turn's
+ *  closing records when NO idle edge ever fires (a background task can keep
+ *  program-status `working`, and stale status keeps waiting). Same bound as
+ *  the idle-edge settle: closing records normally land ~90-140ms after the
+ *  terminal record. */
+export const PROVISIONAL_EXIT_WATCH_MS = 2_000;
+
 function assistantHasVisibleText(content: unknown): boolean {
   if (typeof content === 'string') return content.length > 0;
   if (!Array.isArray(content)) return false;
@@ -74,6 +81,9 @@ export interface BridgePendingTurn {
    * final message reads `end_turn` while the text block, an API error that cut
    * the stream and the Stop hooks may all still follow. See drainEmittable. */
   awaitingDurationMarker?: boolean;
+  /** Its `system/turn_duration` was read: the turn's last record. Anything the
+   *  assistant writes after it belongs to the next turn. */
+  closedByDurationMarker?: boolean;
   /** Structured execution result. This is independent from whether transcript
    * fallback text is visible or suppressed by a prior `botmux send`. */
   terminalOutcome?: Exclude<ClaudeTerminalOutcome, { status: 'rate_limited' }>;
@@ -145,8 +155,20 @@ export interface BridgePendingTurn {
    *  delivered fallback with an "interrupted by restart" notice so the user
    *  can tell a recovered partial answer from a live one. */
   restoredFromJournal?: boolean;
+  /** A turn carried out of an older transcript when an in-process rotation
+   *  was discovered (/clear, /resume, pid/fingerprint switch). Its missing
+   *  marker belongs to the old writer and can never arrive on the new file,
+   *  so releasing it must not teach the CURRENT generation it is marker-less. */
+  carriedAcrossGeneration?: boolean;
   /** Observed at least one non-error assistant event (including tool calls). */
   hasAssistantActivity?: boolean;
+  /** Per-turn monotonic counter bumped whenever a non-sidechain, non-error
+   *  assistant record is attributed to the turn while it is collecting. The
+   *  worker's no-idle watchdog snapshots it when arming and restarts its bound
+   *  whenever it grows: a final message flushed block-by-block seconds apart
+   *  (every block stamped with the terminal stop_reason) must be measured from
+   *  the LAST block ("transcript quiet 2s"), not from the first one. */
+  attributedActivitySeq?: number;
   /** Set on a Lark turn whose input Claude Code folded into the turn already
    *  running (a mid-turn system reminder) instead of starting its own. It has
    *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
@@ -258,25 +280,87 @@ export class BridgeTurnQueue {
    *  deep inside ingest() rather than at an explicit call boundary. */
   private droppedNeedingJournalClear: BridgePendingTurn[] = [];
   /** This transcript has shown it ends turns with `system/turn_duration`
-   *  (seen live, in absorbed history, or by the worker's baseline probe). Only
-   *  then is a stop_reason terminal held for that marker — a CLI that never
-   *  writes it keeps settling on the stop_reason alone. Survives clearPending:
-   *  it describes the CLI, not one generation's turns. */
+   *  (seen live, in absorbed history, or by the worker's baseline probe).
+   *  Survives clearPending: it describes the CLI, not one generation's turns. */
   private durationMarkerSeen = false;
+  /** An idle-edge wait for a turn's duration marker ran out before this
+   *  transcript ever showed one: the CLI most likely never writes it (older
+   *  Claude JSONL), so later turns settle on the stop_reason again instead of
+   *  each waiting out the bound. A marker read afterwards outranks this.
+   *  Survives clearPending for the same reason as durationMarkerSeen. */
+  private durationMarkerWaitExpired = false;
 
   /** Record that this transcript writes `system/turn_duration` markers. */
   noteDurationMarkerObserved(): void {
     this.durationMarkerSeen = true;
   }
 
+  /** The worker's bounded idle-edge wait for the head turn's close ran out. */
+  noteDurationMarkerWaitExpired(): void {
+    if (!this.durationMarkerSeen) this.durationMarkerWaitExpired = true;
+  }
+
+  /** Forget both verdicts for a NEW writer/transcript. clearPending() within
+   *  one CLI generation intentionally keeps them (the CLI did not change),
+   *  but a watcher teardown/fresh-empty start and an in-process transcript
+   *  rotation (/clear, /resume, pid-state, fingerprint switch) begin a new
+   *  generation: an `absent` learned from the old writer must not strip the
+   *  next session's first-turn protection. The baseline probe then re-proves
+   *  `seen` from the new file. */
+  resetDurationMarkerVerdicts(): void {
+    this.durationMarkerSeen = false;
+    this.durationMarkerWaitExpired = false;
+  }
+
+  /** Mark turns already STARTED in the generation that is ending as carried
+   *  across the rotation, so releasing them on the new file never teaches a
+   *  negative marker verdict. UNSTARTED marks are deliberately left untagged:
+   *  they have not bound a user record in the old file, so when the new file's
+   *  own user event starts them they are live turns of the new writer and must
+   *  keep its normal marker hold (including after a proven marker-present
+   *  history), not inherit the old writer's terminal-boundary exception. */
+  markPendingTurnsCarriedAcrossGeneration(): void {
+    for (const turn of this.queue) {
+      if (turn.started) turn.carriedAcrossGeneration = true;
+    }
+  }
+
+  /** True when a head turn is waiting for a duration marker while this
+   *  transcript has no marker verdict yet (a session's first turn). This is
+   *  the ONLY state the worker's provisional-exit watchdog may time out: a
+   *  transcript proven to write markers keeps waiting for the marker (an API
+   *  error can still follow a text record), and an idle-expired verdict
+   *  already settles on the stop_reason. */
+  isFreshHeadAwaitingMarker(turn: BridgePendingTurn): boolean {
+    // `!durationMarkerWaitExpired` needs no term of its own: with no marker
+    // seen yet, isAwaitingDurationMarker's (durationMarkerSeen || !waitExpired)
+    // gate reduces exactly to !durationMarkerWaitExpired.
+    return !this.durationMarkerSeen
+      && this.isAwaitingDurationMarker(turn);
+  }
   /** True while `turn` is held for its duration marker: its terminal so far is
-   *  a block-level stop_reason, the transcript is known to write the marker,
-   *  and no later turn has started collecting (a new turn start is itself the
-   *  boundary, and must never leave the head blocked behind it). */
+   *  a block-level stop_reason and no later turn has started collecting (a new
+   *  turn start is itself the boundary, and must never leave the head blocked
+   *  behind it). The hold does not need the marker to have been seen before:
+   *  the first turn of a session is cut by an API error as easily as any other.
+   *  Only a CLI shown not to write the marker (see durationMarkerWaitExpired)
+   *  settles on the stop_reason. */
   isAwaitingDurationMarker(turn: BridgePendingTurn): boolean {
-    return this.durationMarkerSeen
+    return (this.durationMarkerSeen || !this.durationMarkerWaitExpired)
       && turn.awaitingDurationMarker === true
       && turn === this.collecting;
+  }
+
+  /** True while the transcript is still writing `turn`: it started, it is the
+   *  turn collecting records, and nothing has closed it yet — no terminal
+   *  record was read, or it is held for its duration marker. Claude shows its
+   *  prompt (and its hooks report done) before the records that close a turn —
+   *  its final blocks, an API error that cut the stream, the marker — reach the
+   *  file, so the worker waits (bounded) on this at an idle edge before
+   *  settling from it. */
+  isTurnOpenAtIdle(turn: BridgePendingTurn): boolean {
+    if (!turn.started || turn !== this.collecting || turn.closedByDurationMarker) return false;
+    return !turn.terminalObserved || this.isAwaitingDurationMarker(turn);
   }
 
   /** Hand over (and forget) the turns dropped head-of-line since the last
@@ -461,6 +545,13 @@ export class BridgeTurnQueue {
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
+        // An assistant record after the collecting turn's duration marker opens
+        // the next turn, one that began without a meaningful user line (a
+        // `<task-notification>` wake-up). A live drain has emitted the closed
+        // turn by then; a batch spanning several turns — a rotation switch
+        // replaying what the bridge did not read — must not fold the next
+        // turn's reply into it.
+        if (this.collecting?.closedByDurationMarker) this.collecting = null;
         // Capture CronCreate calls with the topic anchor of the turn that is
         // running them: when the ack returns the task id, fires of that task
         // route back to THIS topic even if other topics receive messages
@@ -562,6 +653,8 @@ export class BridgeTurnQueue {
         }
         if (this.collecting) {
           this.collecting.hasAssistantActivity = true;
+          this.collecting.attributedActivitySeq
+            = (this.collecting.attributedActivitySeq ?? 0) + 1;
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
@@ -588,6 +681,7 @@ export class BridgeTurnQueue {
         if (this.collecting) {
           this.collecting.terminalObserved = true;
           this.collecting.awaitingDurationMarker = false;
+          if (isClaudeTurnDurationEvent(ev)) this.collecting.closedByDurationMarker = true;
           if (!this.collecting.rateLimited) {
             this.collecting.terminalOutcome ??= { status: 'completed' };
           }
@@ -903,11 +997,21 @@ export class BridgeTurnQueue {
     /** The CLI generation is ending (exit, kill, teardown): a duration marker
      *  still due will never be written, so a turn held for it is final now. */
     releaseHeldTerminals?: boolean;
+    /** Release ONLY the turn with this identity; stop before any other head.
+     *  Used by the no-idle watchdog, which has no idle guarantee and must not
+     *  settle a type-ahead turn that merely follows the bound one (a global
+     *  terminal-boundary drain would pop that follower even mid-tool). */
+    onlyTurn?: { turnId: string; dispatchAttempt?: number };
   } = {}): BridgePendingTurn[] {
     const out: BridgePendingTurn[] = [];
     while (this.queue.length > 0) {
       const head = this.queue[0];
       if (!head.started) break;
+      // Identity gate: a bounded caller (the no-idle watchdog) may release its
+      // own turn only, never a follower that became the head.
+      if (opts.onlyTurn
+        && (head.turnId !== opts.onlyTurn.turnId
+          || head.dispatchAttempt !== opts.onlyTurn.dispatchAttempt)) break;
       if (opts.explicitTerminalOnly && !head.terminalObserved) break;
       if (opts.requireExplicitTerminalForDurable
         && head.dispatchAttempt !== undefined
@@ -919,7 +1023,13 @@ export class BridgeTurnQueue {
       // nothing collecting, be synthesised as a local turn, and a stream that
       // died there would fail that local turn instead of this one — answer
       // text gone, failure unreported.
-      if (!opts.releaseHeldTerminals && this.isAwaitingDurationMarker(head)) break;
+      if (!opts.releaseHeldTerminals
+        && this.isAwaitingDurationMarker(head)
+        // A journal-restored turn's writer generation has ended: its marker is
+        // never coming, so an idle/terminal boundary releases it (a per-read
+        // drain still waits). It is settled without learning the wait-expired
+        // verdict, which belongs to a live CLI only.
+        && !(opts.terminalBoundary && (head.restoredFromJournal || head.carriedAcrossGeneration))) break;
       if (!opts.terminalBoundary && !head.terminalObserved && head.assistantUuids.length === 0) break;
       this.queue.shift();
       if (this.collecting === head) this.collecting = null;

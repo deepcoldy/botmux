@@ -1,10 +1,12 @@
-import type { BackendType } from '../adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget } from '../adapters/backend/types.js';
 import type { RiffBackendConfig } from '../adapters/backend/riff-backend.js';
 import { cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import {
   isSuspendableBackendType,
+  killPersistentBackendTarget,
   killPersistentSession,
   persistentSessionName,
+  probePersistentBackendTarget,
   probePersistentSession,
 } from './persistent-backend.js';
 
@@ -30,12 +32,18 @@ export interface ExplicitSessionBackingCleanupInput {
   /** Current authoritative config for the row's bot. Required only when the
    * row is frozen to Riff and still carries a remote task id. */
   riffConfig?: RiffBackendConfig;
+  /** The row's frozen backing target. A tmux session may live on the
+   * dedicated socket (`socketName`), which a name-only kill/probe on the
+   * default server would miss — and then report a live pane as destroyed. */
+  persistentBackendTarget?: PersistentBackendTarget;
 }
 
 export interface ExplicitSessionBackingCleanupDeps {
   cancelRiffTask?: typeof cancelRiffTaskById;
   killPersistent?: typeof killPersistentSession;
   probePersistent?: typeof probePersistentSession;
+  killTarget?: typeof killPersistentBackendTarget;
+  probeTarget?: typeof probePersistentBackendTarget;
 }
 
 /**
@@ -81,18 +89,32 @@ export async function cleanupExplicitSessionBacking(
     return { ok: true, kind: 'no_backing' };
   }
 
-  const name = persistentSessionName(input.backendType, input.sessionId);
+  // No production caller reaches this persistent branch today: the only one,
+  // prepareRiffExplicitClose (worker-pool.ts), returns early for non-Riff rows
+  // and Riff rows return above. It still addresses the frozen target, so a
+  // future caller cannot silently probe the default tmux server for a pane
+  // that lives on the dedicated socket.
+  const target = input.persistentBackendTarget?.backendType === input.backendType
+    ? input.persistentBackendTarget
+    : undefined;
+  const name = target?.sessionName ?? persistentSessionName(input.backendType, input.sessionId);
   const kill = deps.killPersistent ?? killPersistentSession;
   const probe = deps.probePersistent ?? probePersistentSession;
   try {
-    // ZMX destruction is identity-verified and refuses a name-only kill. Keep
-    // the established two-argument contract for the other backends.
-    if (input.backendType === 'zmx') kill(input.backendType, name, input.sessionId);
-    else kill(input.backendType, name);
-    // Backend kill helpers are intentionally idempotent and historically
-    // swallow command errors. Offline explicit abandon needs a stronger
-    // contract: only publish closed after a post-kill probe confirms absence.
-    const after = probe(input.backendType, name);
+    let after;
+    if (target) {
+      (deps.killTarget ?? killPersistentBackendTarget)(target, input.sessionId);
+      after = (deps.probeTarget ?? probePersistentBackendTarget)(target);
+    } else {
+      // ZMX destruction is identity-verified and refuses a name-only kill. Keep
+      // the established two-argument contract for the other backends.
+      if (input.backendType === 'zmx') kill(input.backendType, name, input.sessionId);
+      else kill(input.backendType, name);
+      // Backend kill helpers are intentionally idempotent and historically
+      // swallow command errors. Offline explicit abandon needs a stronger
+      // contract: only publish closed after a post-kill probe confirms absence.
+      after = probe(input.backendType, name);
+    }
     if (after !== 'missing') {
       return {
         ok: false,

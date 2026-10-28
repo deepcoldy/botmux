@@ -30,12 +30,17 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `traex` | TRAE CLI (traex) | local process | ✅ |
 | `mtr` | MTR | local process | |
 | `hermes` | Hermes | local process | |
+| `ebsd` | EBSD (requires credential files, see [guide](https://github.com/deepcoldy/botmux/blob/master/docs/ebsd.md)) | local process | |
+| `codem` | CodeM (see [CodeM guide](https://github.com/deepcoldy/botmux/blob/master/docs/codem.md)) | local process | ✅ |
+| `minimax` | MiniMax Code / mcode (see [MiniMax guide](https://github.com/deepcoldy/botmux/blob/master/docs/minimax-code.md)) | local process | ✅ |
 | `genius` | Genius | local process | ✅ |
 | `seed` | Seed (Claude Code fork) | local process | ✅ |
 | `relay` | Relay (new release of Seed) | local process | ✅ |
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
+| `mojo` | Mojo | API-driven (host execution / cloud sandbox) | |
+| `remote-runner` | Generic Remote Runner (see [protocol](https://github.com/deepcoldy/botmux/blob/master/docs/remote-runner.md)) | Remote protocol | |
 | `dsh` | DeepSeek Harness (dsh CLI) | local process (SDK JSON-RPC) | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.

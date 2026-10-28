@@ -37,9 +37,10 @@
  *     pending Lark fingerprint. In a worker-spawned CLI that's a Web
  *     terminal hand-typed input — the user is already looking at it, no
  *     reason to push it back to the Lark thread.
- *   - Non-adopt + send observed in window: suppress. The window is
- *     [turn.markTimeMs, nextBoundaryMs). Legacy markers only carry time,
- *     so any marker in the window still suppresses. Newer markers carry the
+ *   - Non-adopt + attributable send/report observed: suppress. New markers use
+ *     exact session + turn + dispatch-attempt identity (even when provider
+ *     completion crosses a timestamp boundary). Legacy markers use the bounded
+ *     [turn.markTimeMs, nextBoundaryMs) window. Newer markers also carry the
  *     normalized length of the explicit `botmux send` body. A marker tagged
  *     responseKind/replyCardResponseKind 'final' is an explicit final-answer
  *     delivery, so it suppresses the fallback UNCONDITIONALLY (regardless of
@@ -56,8 +57,10 @@
  *     nextBoundaryMs) — without that, a model that's still mid-tool-use
  *     for turn N+1 could leak a send credit into turn N's window.
  */
+import type { TurnTerminalCarrierKind } from '../core/types.js';
 import { normaliseForFingerprint } from './bridge-turn-queue.js';
 import { CODEX_RATE_LIMIT_ERROR_CODE } from './codex-transcript.js';
+import type { TurnSendKind } from './turn-send-ledger.js';
 
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
@@ -212,8 +215,18 @@ export function bridgePostText(finalText: string, adoptMode: boolean): string {
 
 export interface BridgeSendMarker {
   sentAtMs: number;
+  /** Owning worker session. Older markers omit this and remain window-gated. */
+  sessionId?: string;
   messageId?: string;
-  responseKind?: 'progress' | 'final' | 'auxiliary';
+  /** Non-Lark delivery receipt, for example a dispatch relay trigger id. */
+  deliveryId?: string;
+  /** Where the successful user-visible action went. */
+  deliveryKind?: 'current_session_send' | 'detoured_send' | 'dispatch_report';
+  targetChatId?: string;
+  targetRootMessageId?: string;
+  targetSessionId?: string;
+  dispatchRootId?: string;
+  responseKind?: TurnSendKind;
   turnId?: string;
   dispatchAttempt?: number;
   /** The last user-visible carrier left by this send. The daemon uses this
@@ -221,9 +234,9 @@ export interface BridgeSendMarker {
    *  in place, while files/voice/custom cards deliberately fall back to a
    *  separate compact terminal strip. Older markers omit the field and simply
    *  degrade to the live streaming-card terminal state. */
-  terminalCarrier?: 'standard_reply_card' | 'non_patchable';
+  terminalCarrier?: TurnTerminalCarrierKind;
   /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
-  replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
+  replyCardResponseKind?: TurnSendKind;
   /** The send is explicitly an interim side effect and must never stand in for
    * the turn's eventual final/failure delivery. Remote Runner outbound_message
    * uses this while ordinary historical `botmux send` keeps its old heuristic. */
@@ -241,6 +254,15 @@ export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'response
 }
 
 export interface BridgeGateInput {
+  /** Owning chat, when the caller knows it. A detour into another chat does
+   *  not replace the non-empty answer this conversation is waiting for. */
+  chatId?: string;
+  /** Owning topic root. Same-chat delivery into another root is still a
+   *  different conversation; same-chat top-level markers omit this field. */
+  rootMessageId?: string;
+  /** Owning BotMux session. The marker file is already per-session; retaining
+   *  this field also fails closed if a misplaced new-schema marker is read. */
+  sessionId?: string;
   /** Exact BotMux turn identity. Headless backends may not have a transcript
    * mark time, so a delivered final marker can still deduplicate by this
    * stronger correlation (including the durable dispatch attempt). */
@@ -268,6 +290,35 @@ export interface BridgeGateInput {
   /** Explicit transcript terminal semantics. Undefined preserves the
    * historical "assistant_final means completed" behavior. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
+}
+
+/** Build one gate input from the worker's exact source-turn identity.
+ *
+ * Both transcript queues and managed Codex App finals already own this tuple;
+ * centralising the projection keeps those production paths from accidentally
+ * falling back to timestamp-only attribution when their marker carries a
+ * turnId. Identity fields are applied last so caller payloads cannot override
+ * the source turn. */
+export function bridgeGateInputForTurn<
+  T extends Omit<BridgeGateInput,
+    'sessionId' | 'turnId' | 'dispatchAttempt' | 'chatId' | 'rootMessageId'>,
+>(
+  sessionId: string | undefined,
+  turn: { turnId: string; dispatchAttempt?: number },
+  input: T,
+  chatId?: string,
+  rootMessageId?: string,
+): BridgeGateInput & T {
+  return {
+    ...input,
+    ...(sessionId ? { sessionId } : {}),
+    ...(chatId ? { chatId } : {}),
+    ...(rootMessageId ? { rootMessageId } : {}),
+    turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined
+      ? { dispatchAttempt: turn.dispatchAttempt }
+      : {}),
+  };
 }
 
 const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
@@ -386,6 +437,74 @@ function markerSetDuplicatesFinal(markers: readonly BridgeSendMarker[], finalTex
   });
 }
 
+function markerMatchesSession(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  return !turn.sessionId || !marker.sessionId || marker.sessionId === turn.sessionId;
+}
+
+function markerMatchesExactTurn(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  return !!turn.turnId
+    && marker.turnId === turn.turnId
+    && marker.dispatchAttempt === turn.dispatchAttempt
+    && markerMatchesSession(turn, marker);
+}
+
+/** Whether this delivery can replace the non-empty answer expected here.
+ *
+ * A cross-chat / cross-thread delivery still explains an EMPTY terminal, but
+ * it must not consume this conversation's non-empty final or failure notice.
+ * Legacy markers predate routing metadata and retain their historical credit. */
+function markerCoversOwnThread(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  if (marker.deliveryKind === undefined) return true;
+  if (turn.chatId && marker.targetChatId && marker.targetChatId !== turn.chatId) {
+    return false;
+  }
+  if (marker.deliveryKind !== 'current_session_send'
+    && turn.rootMessageId && marker.targetRootMessageId
+    && marker.targetRootMessageId !== turn.rootMessageId) {
+    return false;
+  }
+  if (marker.deliveryKind === 'current_session_send') return true;
+  // A relay into this exact source session is this conversation's answer even
+  // when it has no independently-addressable Lark target.
+  if (!marker.targetChatId && marker.targetSessionId
+    && marker.targetSessionId === turn.sessionId) {
+    return true;
+  }
+  // Detours/reports elsewhere need positive same-chat proof. A supplied root
+  // was already checked above; an omitted root is the same chat's top level.
+  if (turn.chatId) return marker.targetChatId === turn.chatId;
+  return !marker.targetChatId
+    && !!marker.targetSessionId
+    && marker.targetSessionId === turn.sessionId;
+}
+
+/**
+ * Successful reply markers attributable to one structured turn.
+ *
+ * New-schema markers with a turn id must match the exact turn/attempt and may
+ * not borrow timestamp credit from a neighbouring turn. Exact identity is
+ * stronger than clock ordering, which covers provider/relay completion after a
+ * successor window opened. Legacy markers without a turn id retain the bounded
+ * time-window fallback for rolling-upgrade compatibility.
+ */
+export function attributableBridgeReplyMarkers(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+): BridgeSendMarker[] {
+  const lower = turn.markTimeMs;
+  const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
+  return markers.filter(marker => {
+    if (marker.terminalIndependent === true || !markerMatchesSession(turn, marker)) return false;
+    // Use exact identity only when BOTH sides carry a turn. A rolling-upgrade
+    // marker or an unmigrated caller keeps the bounded legacy time window.
+    if (marker.turnId !== undefined && turn.turnId !== undefined) {
+      return markerMatchesExactTurn(turn, marker);
+    }
+    return lower !== undefined && marker.sentAtMs >= lower && marker.sentAtMs < upper;
+  });
+}
+
 export function shouldSuppressBridgeEmit(
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,
@@ -409,19 +528,32 @@ export function shouldSuppressBridgeEmit(
   // attribution and survives provider completion latency / host recovery.
   // Keep the dispatch attempt in the identity so a stale durable retry cannot
   // suppress a later attempt of the same logical turn.
-  if (turn.turnId && markers.some(marker => marker.turnId === turn.turnId
-      && marker.dispatchAttempt === turn.dispatchAttempt
+  if (turn.turnId && markers.some(marker => markerMatchesExactTurn(turn, marker)
+      && markerCoversOwnThread(turn, marker)
       && marker.terminalIndependent !== true
       && isFinalBridgeSendMarker(marker)
       && (marker.replyCardResponseKind === undefined
         || marker.replyCardResponseKind === 'final'))) {
     return true;
   }
-  if (turn.markTimeMs === undefined) return false;
-  const lower = turn.markTimeMs;
-  const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper
-    && m.terminalIndependent !== true);
+  const attributable = attributableBridgeReplyMarkers(turn, nextBoundaryMs, markers);
+  // A successful detour still explains an EMPTY terminal. Only non-empty
+  // duplicate delivery is restricted to markers that reached this chat/root.
+  const hasVisibleFinal = turn.finalText !== undefined
+    && normaliseForFingerprint(turn.finalText).length > 0;
+  const inWindow = hasVisibleFinal
+    ? attributable.filter(marker => markerCoversOwnThread(turn, marker))
+    : attributable;
+  if (turn.markTimeMs === undefined) {
+    if (inWindow.length === 0) return false;
+    // Without a clock window, an exact unclassified/progress delivery proves
+    // only that an EMPTY completion already produced visible output. It must
+    // not swallow a later non-empty final. Explicit responseKind='final' was
+    // handled above and remains the sole headless non-empty dedup proof.
+    if (turn.finalText === undefined || normaliseForFingerprint(turn.finalText).length > 0) {
+      return false;
+    }
+  }
   // An explicit `botmux send --response-kind final` already delivered this
   // turn's final answer to Lark. The unified-reply path also writes
   // replyCardResponseKind='final'; the plain (non-unified) path writes only
@@ -482,19 +614,20 @@ export function shouldSuppressBridgeEmit(
 }
 
 /** Some structured CLIs can report a durable completed turn while their
- * terminal event carries no final text. If there was no explicit `botmux send`
- * in that turn window, silently completing leaves the Lark thread with no
+ * terminal event carries no final text. If there was no attributable successful
+ * `botmux send` / `botmux report`, silently completing leaves the Lark thread with no
  * visible outcome. Emit a diagnostic fallback only for that narrow case.
  *
  * Scope note (shared path): this gate feeds worker.ts:emitReadyCodexTurns,
  * which is shared by every structured-bridge CLI (Codex / Traex / Cursor /
- * Antigravity / Pi / Grok / Hermes / Mtr / Coco). In practice only two of
- * them can produce an empty-finalText `assistant_final` that reaches here:
+ * Antigravity / Pi / Grok / Hermes / Mtr / Coco). In practice these structured
+ * producers can emit an empty-finalText `assistant_final` that reaches here:
  *   - Traex — `task_complete` with an empty `last_agent_message`
  *     (terminalStatus undefined → treated as completed below);
+ *   - Pi — a completed stop/length terminal with empty text;
  *   - Grok  — `turn_completed` + stop_reason `end_turn` where the post-tool
  *     buffer is empty (terminalStatus 'completed').
- * The other six drainers drop empty text before enqueue (`if (!text) continue`),
+ * The other drainers drop empty text before enqueue (`if (!text) continue`),
  * so the fallback is unreachable for them.
  *
  * terminalStatus dependency: `undefined` is admitted as "completed" for
@@ -503,12 +636,10 @@ export function shouldSuppressBridgeEmit(
  * rather than as an empty `task_complete`. If that fork contract ever changes,
  * a cancelled turn could surface a spurious "completed but empty" diagnostic.
  *
- * Marker caveat: `shouldSuppressBridgeEmit` only sees `botmux send` markers, and
- * detoured sends (`--top-level` / `--into` / `--override-chat`) intentionally
- * write no marker (cli.ts shouldRecordBridgeMarker). A turn whose only visible
- * reply went out via such a send therefore still trips this diagnostic; the
- * user-facing string (i18n `worker.empty_final_completed`) is worded to account
- * for that case rather than asserting no send happened. */
+ * Successful current-session sends, exact-turn detours, and dispatch reports
+ * share the same marker journal. Unattributed manual detours intentionally do
+ * not earn suppression credit; a real worker turn remains fail-open when no
+ * exact identity or bounded legacy window proves the delivery. */
 export function shouldEmitEmptyCompletedBridgeFallback(
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,
@@ -572,9 +703,9 @@ export function shouldSuppressStructuredFallback(
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   return markers.some(marker => isFinalBridgeSendMarker(marker)
+    && markerMatchesExactTurn(turn, marker)
+    && markerCoversOwnThread(turn, marker)
     && typeof marker.messageId === 'string' && marker.messageId.trim().length > 0
-    && marker.turnId === turn.turnId
-    && marker.dispatchAttempt === turn.dispatchAttempt
     && marker.sentAtMs >= lower && marker.sentAtMs < upper
     && marker.terminalIndependent !== true
     && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final'));

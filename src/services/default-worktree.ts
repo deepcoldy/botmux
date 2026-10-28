@@ -44,6 +44,7 @@ import { buildEffectiveMojoConfig, normalizeMojoConfig } from '../adapters/backe
 import type { BackendType } from '../adapters/backend/types.js';
 import type { Session } from '../types.js';
 import { createRepoWorktree, createRepoWorktreeAndCommit, isGitWorkTree, pushWorktreeBranch, type WorktreeCreation } from './git-worktree.js';
+import { recordCreatedWorktree } from './botmux-worktree-store.js';
 import { worktreeSlugFromContextAI } from './worktree-slug-ai.js';
 import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/types.js';
@@ -234,6 +235,7 @@ export async function maybeCreateDefaultWorktree(
       : undefined;
     const creation = committed?.creation ?? await createRepoWorktree(baseDir, createOpts);
     logger.info(`[auto-worktree:${larkAppId}] ${baseDir} → ${creation.path} (branch ${creation.branch} from ${creation.baseRef})`);
+    await recordCreatedWorktree(larkAppId, creation);
     // riff：远程沙箱从 origin 克隆，本地新分支必须先推送才能被任务钉住。
     // 推送失败不阻塞（会话仍可用，riff 侧回退默认分支并在卡片注入告警）。
     const botCfg = getBot(larkAppId).config;

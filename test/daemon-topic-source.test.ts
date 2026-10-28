@@ -209,6 +209,20 @@ describe('daemon dispatch and report source topics', () => {
     expect(result.status).toBe(502); expect(result.body.error).toBe('TOPIC_SEND_BLOCKED');
     expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.fetchTarget).not.toHaveBeenCalled();
   });
+  it('does not publish a relay fallback into a withdrawn source topic either', async () => {
+    seedReportBinding(); unavailable = true;
+    mocks.fetchTarget.mockResolvedValue({ ok: false, status: 500,
+      json: async () => ({ ok: false, errorCode: 'session_not_runnable', error: 'not runnable' }) });
+    const fallback = { relayFallback: 'publish', explicitDispatchRoot: true };
+    const relayed = await invoke(REPORT_SESSION_RELAY_ROUTE, { dispatchRoot: 'om_source', content: 'result', ...fallback });
+    expect(relayed.status).toBe(502); expect(relayed.body.error).toBe('TOPIC_SEND_BLOCKED');
+    writeFileSync(join(root, 'orchestrate-dispatch.json'), '{}');
+    const missing = await invoke(REPORT_SESSION_RELAY_ROUTE, { dispatchRoot: 'om_source', content: 'result', ...fallback });
+    expect(missing.body.relayFallback).toMatchObject({ reason: 'dispatch_target_gone', published: false,
+      publicationError: 'report_publication_rejected' });
+    expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.fetchTarget).not.toHaveBeenCalled();
+  });
   it('does not add source queries under legacy policy', async () => {
     registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', topicUnavailablePolicy: 'legacy' });
     unavailable = true;

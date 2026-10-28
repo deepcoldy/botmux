@@ -209,7 +209,7 @@ export async function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContex
       errors.push({ kind: 'effort_invalid', arg: effortArg });
     } else if (!isConfigurableReasoningCliId(botCfg.cliId)) {
       errors.push({ kind: 'effort_unsupported_cli', ...(botCfg.cliId ? { cliId: botCfg.cliId } : {}) });
-    } else if (!cliModelSupportsReasoningEffort(botCfg.cliId, effectiveModel, effortArg)) {
+    } else if (botCfg.cliId !== 'traex' && !cliModelSupportsReasoningEffort(botCfg.cliId, effectiveModel, effortArg)) {
       errors.push({
         kind: 'effort_unsupported_model',
         effort: effortArg,

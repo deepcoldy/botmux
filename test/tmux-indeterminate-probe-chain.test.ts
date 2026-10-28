@@ -68,6 +68,7 @@ import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import type { SessionProbe } from '../src/adapters/backend/types.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
+import { takePaneLaunchFile } from './helpers/pane-launch.js';
 
 setStartupTmuxRetrySleepForTests(() => {});
 
@@ -337,7 +338,8 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
     });
     const newSession = mockedExecFileSync.mock.calls.find(c => (c[1] as string[]).includes('new-session'));
     expect(newSession).toBeDefined();
-    expect((newSession![1] as string[]).join(' ')).toContain('first user message');
+    // The CLI argv reaches the pane through its launch file, not the tmux command.
+    expect(takePaneLaunchFile(newSession![1] as string[]).body).toContain(`'first user message'`);
   });
 
   it('keeps the fresh-path invariant: a predicted-fresh create that collides throws (no duplicate swallowing)', () => {
