@@ -25,6 +25,17 @@ import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
+
+// The #2453 lab chains `remain-on-exit failed` into new-session; tmux < 3.2
+// rejects that value and no corpse is created, so the lab is modern-tmux only.
+let realTmuxSupportsFailed = false;
+try {
+  const v = String(execFileSync(realTmux!, ['-V'], { encoding: 'utf8', timeout: 3000 }));
+  const m = /tmux (\d+)\.(\d+)/.exec(v);
+  const major = m ? Number(m[1]) : 0;
+  const minor = m ? Number(m[2]) : 0;
+  realTmuxSupportsFailed = major > 3 || (major === 3 && minor >= 2);
+} catch { /* tmux missing: outer skipIf handles */ }
 let python3: string | undefined;
 try { python3 = execFileSync('which', ['python3'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
 
@@ -225,7 +236,8 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
    * inherited when it daemonises, so it never learns a pane died and never
    * reaps one — exactly the observed corpse, on every run.
    */
-  describe.skipIf(!python3 || process.platform !== 'linux')('when the tmux server never reaps the pane process (#2453)', () => {
+  // The lab uses remain-on-exit failed (modern tmux only); see realTmuxSupportsFailed.
+  describe.skipIf(!python3 || process.platform !== 'linux' || !realTmuxSupportsFailed)('when the tmux server never reaps the pane process (#2453)', () => {
     const BLOCK_SIGCHLD_THEN_EXEC =
       'import os, signal, sys\n'
       + 'signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})\n'
@@ -315,6 +327,8 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     // timeout even though the option below is set atomically. Exiting at once
     // makes the pane dead essentially at creation; the atomic chain still
     // guarantees remain-on-exit is in effect, so status 77 is recorded.
+    // Use `on` for the fixture so it also works on tmux <3.2; these corpse
+    // probes require a retained failed pane, independent of the option mode.
     // The option MUST be chained ATOMICALLY into new-session (`\; set-option`,
     // one server queue, in order) — the same way createDetachedSession does it.
     // It is per session and must target the corpse itself, not the neighbour
@@ -322,7 +336,7 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     tmux('new-session', '-d', '-s', 'bmx-live-one', 'sleep 60');
     tmux(
       'new-session', '-d', '-s', 'bmx-corpse', 'sh -c "exit 77"',
-      ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed',
+      ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'on',
     );
     // The corpse exits 77 at once, so its status must become known. A miss
     // means the corpse was not set up as intended; `seen` in the failure diff

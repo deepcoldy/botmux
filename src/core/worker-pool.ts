@@ -12964,7 +12964,7 @@ export function sendWorkerInput(
     durablePrimaryInbox?: true;
     /** A command handler may own its single rejection reply. */
     notifyRejection?: false;
-    /** Explicit positive steer authorization (plain-human-interactive only).
+    /** Explicit positive steer authorization (ordinary human input or a correlated human answer).
      * Persisted on the accepted ledger entry and forwarded to the worker so the
      * serial runner may steer this turn into an active one. */
     codexAppSteerable?: true;

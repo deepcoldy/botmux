@@ -175,6 +175,10 @@ function completeTurn(request) {
     return;
   }
   if (behavior.startsWith('async-user-input') && turnAttempt === 1) {
+    if (behavior === 'async-user-input-live-steer') {
+      activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+      groupClientIds = [request.params.clientUserMessageId ?? null];
+    }
     const item = { type: 'agentMessage', id: 'call_async_question', delivery: 'async', phase: 'final_answer',
       text: 'Which environment?\nPPE (Recommended) / Production', questions: [
         { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
@@ -199,6 +203,7 @@ function completeTurn(request) {
     }
     if (responseLast) respond(request.id, { turn: { id: turnId } });
     if (behavior === 'async-user-input-exit') { setTimeout(() => process.exit(1), 400); return; }
+    if (behavior === 'async-user-input-live-steer') return;
     setTimeout(() => {
       const status = behavior === 'async-user-input-interrupted' ? 'interrupted' : 'completed';
       notify('item/completed', { threadId, turnId,
@@ -596,6 +601,21 @@ function handle(request) {
     return;
   }
   if (request.method === 'turn/steer') {
+    if (behavior === 'async-user-input-live-steer') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expected turn is not active'); return;
+      }
+      const { threadId, turnId } = activeTurn;
+      groupClientIds.push(request.params.clientUserMessageId);
+      respond(request.id, { turnId });
+      notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed', itemsView: 'full', error: null,
+        items: [
+          ...groupClientIds.map((clientId, i) => ({ id: `user-${i}`, type: 'userMessage', clientId, content: [] })),
+          { id: 'answered-final', type: 'agentMessage', phase: 'final_answer', text: 'Answer incorporated before task finished' },
+        ] } });
+      activeTurn = undefined;
+      return;
+    }
     // THEIRS: explicit steer scenario drives a pending turn/start (activeTurn)
     // to completion after the 2nd steer. steer-started-first completes after 1.
     if (behavior === 'steer' || behavior === 'steer-started-first') {

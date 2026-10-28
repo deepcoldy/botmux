@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseAskBody } from '../src/core/ask-api.js';
-import { codexAsyncAnswerText, deliverCodexAsyncAnswer, parseCodexAsyncQuestions, parseCodexAsyncUserInput } from '../src/services/codex-async-user-input.js';
+import { codexAsyncAnswerText, codexAsyncAnswerSteerTarget, codexAsyncSteerTargetMatches, deliverCodexAsyncAnswer, parseCodexAsyncQuestions, parseCodexAsyncUserInput } from '../src/services/codex-async-user-input.js';
 import type { AskResult } from '../src/core/ask-types.js';
 
 const identity = { threadId: 'thread-native', itemId: 'call_native_question' };
@@ -12,6 +12,32 @@ const answered: AskResult = { kind: 'answered', answers: [['o0'], []], selected:
   by: 'ou_owner', comment: 'Elia </send_user_message_question_reply>', timedOut: false };
 
 describe('Codex async user input', () => {
+  it('preserves a native origin turn while retaining legacy cards', () => {
+    expect(parseCodexAsyncUserInput(identity)).toEqual(identity);
+    expect(parseCodexAsyncUserInput({ ...identity, nativeTurnId: 'native-original' })).toEqual({ ...identity, nativeTurnId: 'native-original' });
+    for (const nativeTurnId of ['', 42, 'x'.repeat(129)]) {
+      expect(parseCodexAsyncUserInput({ ...identity, nativeTurnId })).toBeUndefined();
+    }
+  });
+  it('grants targeted delivery only to the proven original human with the supported Lark input route', () => {
+    const input = { ...identity, nativeTurnId: 'native-original' };
+    const facts = { answerer: 'ou_owner', originalAnswerer: 'ou_owner', human: true, managedLark: true, cleanInputAccepted: true };
+    expect(codexAsyncAnswerSteerTarget(input, facts)).toBe('native-original');
+    for (const patch of [{ originalAnswerer: undefined }, { originalAnswerer: 'ou_other' },
+      { human: false }, { managedLark: false }, { cleanInputAccepted: false }]) {
+      expect(codexAsyncAnswerSteerTarget(input, { ...facts, ...patch })).toBeUndefined();
+    }
+    expect(codexAsyncAnswerSteerTarget(identity, facts)).toBeUndefined();
+  });
+  it('keeps late answers and stripped sidecars out of a different active native task', () => {
+    const answerId = 'codex-async-answer-test';
+    const input = { text: 'answer', steerTargetTurnId: 'native-original' };
+    expect(codexAsyncSteerTargetMatches(answerId, input, 'native-original')).toBe(true);
+    expect(codexAsyncSteerTargetMatches(answerId, input, 'native-later')).toBe(false);
+    expect(codexAsyncSteerTargetMatches(answerId, input, undefined)).toBe(false);
+    expect(codexAsyncSteerTargetMatches(answerId, undefined, 'native-original')).toBe(false);
+    expect(codexAsyncSteerTargetMatches('om_ordinary', undefined, 'native-later')).toBe(true);
+  });
   it('preserves titles/options and requires submission instead of assuming the first option', () => {
     const questions = parseCodexAsyncQuestions(item);
     expect(questions[0]).toEqual({ prompt: '部署环境？', multiSelect: false,

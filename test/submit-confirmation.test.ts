@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import {
   combineSubmitCurrentFences,
   decideSubmitConfirmationAction,
@@ -13,6 +14,68 @@ import {
 } from '../src/services/codex-bridge-queue.js';
 
 describe('decideSubmitConfirmationAction', () => {
+  it('keeps the worker structured head alive past verification grace after a weak-activity recheck', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const h = workerSubmitHarness();
+    try {
+      await h.flush();
+      expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+      expect(h.queue.hasPendingTurn('delivery', 1)).toBe(true);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.settlements[0]).toMatchObject({
+        action: { kind: 'suppress-active', evidence: 'pty-output' }, lifecycle: 'confirmed',
+      });
+      await vi.advanceTimersByTimeAsync(11_000);
+      const emit = vi.fn();
+      const terminal = vi.fn();
+      expect(pruneExpiredPreStartHeadsAndEmit(h.queue, emit, Date.now(), terminal)).toEqual([]);
+      expect(h.queue.hasPendingTurn('delivery', 1)).toBe(true);
+      expect(terminal).not.toHaveBeenCalled();
+      expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+    } finally {
+      h.submitFailureChains.clear();
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips a late worker adapter recheck once the exact structured head has already expired', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const h = workerSubmitHarness();
+    try {
+      await h.flush();
+      // A delayed callback can run after the 30s verification grace was pruned.
+      vi.setSystemTime(31_000);
+      expect(pruneExpiredPreStartHeadsAndEmit(h.queue, vi.fn(), Date.now()).map(t => t.turnId)).toEqual(['delivery']);
+      await vi.advanceTimersToNextTimerAsync();
+      expect(h.settlements[0]).toEqual({ stale: true, staleReason: 'attempt', lifecycle: 'unchanged' });
+      expect(h.recheck).not.toHaveBeenCalled();
+      expect(h.scope.persistCliSessionId).not.toHaveBeenCalled();
+      expect(h.scope.releaseInputDeliveryQuarantine).not.toHaveBeenCalled();
+    } finally {
+      h.submitFailureChains.clear();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not claim a deferred recheck was queued after an early terminal settled its chain', async () => {
+    vi.useFakeTimers();
+    const h = workerSubmitHarness();
+    const identity = { turnId: 'delivery', dispatchAttempt: 1, cliGeneration: 7 };
+    try {
+      h.submitFailureChains.observeTerminal(identity);
+      h.schedule('payload', h.recheck, 'history', 'delivery', undefined, 1, identity, 'failed', true);
+      expect(h.submitFailureChains.size()).toBe(0);
+      expect(h.scope.log.mock.calls.some(([message]: [string]) => message.includes('recheck queued'))).toBe(false);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.recheck).not.toHaveBeenCalled();
+    } finally {
+      h.submitFailureChains.clear();
+      vi.useRealTimers();
+    }
+  });
+
   it('notifies immediately when the adapter reports a hard failure reason', () => {
     expect(decideSubmitConfirmationAction({
       failureReason: 'unsupported submit key',
