@@ -257,4 +257,50 @@ describe('serverTmuxVersion', () => {
     const probe = mockedExecFileSync.mock.calls.find(([, a]) => Array.isArray(a) && a.includes('#{version}'));
     expect(probe?.[1].slice(0, 2)).toEqual(['-L', 'botmux']);
   });
+
+  // Real-binary failure (3.3a client vs a 3.1c server): the client prints the
+  // version and exits 0, but an inherited stdout pipe stays open, so
+  // execFileSync waits out the timeout and THROWS (code ETIMEDOUT, status 0)
+  // while err.stdout already holds the server's answer. The probe must rescue
+  // that stdout, not drop it and fail open onto the newer client.
+  it('rescues the server version from a timed-out call whose stdout already holds it', () => {
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.3a\n' as any;
+      if (Array.isArray(args) && args.includes('display-message')) {
+        throw Object.assign(new Error('ETIMEDOUT'), {
+          code: 'ETIMEDOUT', status: 0, signal: null, stdout: Buffer.from('3.1c\n'),
+        });
+      }
+      return '' as any;
+    }) as typeof execFileSync);
+    expect(serverTmuxVersion(['-L', 'botmux'], { major: 3, minor: 3 })).toEqual({ major: 3, minor: 1 });
+  });
+
+  // A timeout with NO readable answer is inconclusive about a possibly-old
+  // server: it must fail CLOSED (null, gates omit `failed`/`-e`), never fall
+  // back to a newer client that would re-send rejected values.
+  it('returns null (not the client) when the probe times out without any answer', () => {
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.5a\n' as any;
+      if (Array.isArray(args) && args.includes('display-message')) {
+        throw Object.assign(new Error('ETIMEDOUT'), {
+          code: 'ETIMEDOUT', status: 0, signal: null, stdout: Buffer.alloc(0),
+        });
+      }
+      return '' as any;
+    }) as typeof execFileSync);
+    expect(serverTmuxVersion(['-L', 'botmux'], { major: 3, minor: 5 })).toBeNull();
+  });
+
+  it('still falls back to the client on a FAST non-timeout failure (server not up yet)', () => {
+    // Distinct from a timeout: status is set, there is no ETIMEDOUT code.
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.3a\n' as any;
+      if (Array.isArray(args) && args.includes('display-message')) {
+        throw Object.assign(new Error('error connecting'), { code: undefined, status: 1, stdout: '' });
+      }
+      return '' as any;
+    }) as typeof execFileSync);
+    expect(serverTmuxVersion([], { major: 3, minor: 3 })).toEqual({ major: 3, minor: 3 });
+  });
 });
