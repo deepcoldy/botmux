@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
 import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
+import { parseVcMeetingPushEvent, VC_BOT_MEETING_INVITED_EVENT } from '../src/vc-agent/push-source.js';
+import { listChatMemberDisplays } from '../src/services/groups-store.js';
 
 const sentMessages = vi.hoisted(() => [] as Array<{ receiveId: string; msgType: string; content: string; uuid?: string }>);
 const patchedMessages = vi.hoisted(() => [] as Array<{ messageId: string; content: string }>);
@@ -964,11 +966,14 @@ describe('VC meeting daemon session lifecycle', () => {
     const inviter = 'ou_inviterA';
     const meetingNo = '191919191';
     const actualMeetingId = 'm_joined_191919191';
-    const invite = (who = inviter) => __vcMeetingAgentTest.handlePush({
-      larkAppId: APP_ID, kind: 'meeting_invited', eventType: 'vc.bot.meeting_invited_v1',
-      eventId: `evt_${who}`, meeting: { id: actualMeetingId, meetingNo, topic: 'inviter test' },
-      inviter: { openId: who, invitedAt: Date.now() }, raw: {},
-    });
+    const invite = (who = inviter, structured = true) => __vcMeetingAgentTest.handlePush(parseVcMeetingPushEvent({
+      larkAppId: APP_ID, kind: 'meeting_invited', eventType: VC_BOT_MEETING_INVITED_EVENT,
+      data: {
+        event_id: `evt_${who}`, meeting: { id: actualMeetingId, meeting_no: meetingNo, topic: 'inviter test' },
+        inviter: { id: structured ? { open_id: who, union_id: 'on_inviter', user_id: 'internal_user' } : who, user_type: 1 },
+        invite_time: String(Date.now()),
+      },
+    }));
     function configure(enabled?: boolean, fixedChat = false) {
       registerConsumerAgentBot();
       return registerBot({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code',
@@ -981,6 +986,78 @@ describe('VC meeting daemon session lifecycle', () => {
         },
       });
     }
+    it.each([true, false])('takes native invitations through membership and usable management authority (structured=%s)', async structured => {
+      configure(true);
+      await invite(inviter, structured);
+      expect(inviterAdds).toEqual([inviter]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({
+        inviterManagers: [{ openId: inviter, memberReady: true }],
+      });
+      expect((await selectConsumerAgentViaCard('Claude Loopy', inviter)).toast?.type).not.toBe('error');
+      expect(groupCreateCalls).toHaveLength(1);
+    });
+    it('does not add an inviter blocked while the dedicated group is being created', async () => {
+      vi.useFakeTimers();
+      const bot = configure(true);
+      groupCreateHolds.count = 1;
+      const started = invite();
+      for (let n = 0; n < 100 && !groupCreateHolds.resolvers.length; n++) await Promise.resolve();
+      expect(groupCreateHolds.resolvers).toHaveLength(1);
+      bot.resolvedBlockedUsers = [inviter];
+      groupCreateHolds.resolvers.shift()!();
+      await started;
+      expect(inviterAdds).toEqual([]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      expect((await selectConsumerAgentViaCard('Claude Loopy', inviter)).toast?.type).toBe('error');
+      bot.resolvedBlockedUsers = [];
+      vi.advanceTimersByTime(1);
+      await invite();
+      expect(inviterAdds).toEqual([inviter]);
+      expect(groupCreateCalls).toHaveLength(1);
+    });
+    it.each(['block', 'off'] as const)('rechecks %s after the membership read before adding an inviter', async change => {
+      vi.useFakeTimers();
+      const bot = configure(true);
+      let resumeRead!: () => void;
+      let readStarted!: () => void;
+      const hold = new Promise<void>(resolve => { resumeRead = resolve; });
+      const reading = new Promise<void>(resolve => { readStarted = resolve; });
+      vi.mocked(listChatMemberDisplays).mockImplementationOnce(async () => {
+        readStarted();
+        await hold;
+        return [];
+      });
+      const started = invite();
+      await reading;
+      if (change === 'block') bot.resolvedBlockedUsers = [inviter];
+      else bot.config.vcMeetingAgent!.inviterManagementEnabled = false;
+      resumeRead();
+      await started;
+      expect(inviterAdds).toEqual([]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      expect((await selectConsumerAgentViaCard('Claude Loopy', inviter)).toast?.type).toBe('error');
+    });
+    it('does not retry a persisted pending membership after the inviter is blocked and the daemon restarts', async () => {
+      vi.useFakeTimers();
+      const bot = configure(true);
+      inviterAddFailure.enabled = true;
+      await invite();
+      expect(inviterAdds).toEqual([inviter]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      inviterAddFailure.enabled = false;
+      bot.resolvedBlockedUsers = [inviter];
+      __vcMeetingAgentTest.reset();
+      __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+      __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+      __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
+      __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(APP_ID);
+      __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+      for (let n = 0; n < 100; n++) await Promise.resolve();
+      expect(inviterAdds).toEqual([inviter]);
+      expect(inviterMembers.has(inviter)).toBe(false);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      expect(groupCreateCalls).toHaveLength(1);
+    });
     it('keeps default/off behavior; no invitee membership write or management grant', async () => {
       configure();
       await invite();

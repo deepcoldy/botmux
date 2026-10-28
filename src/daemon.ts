@@ -10917,25 +10917,29 @@ async function synchronizeVcMeetingInviters(session: VcMeetingDaemonSession, cfg
   const pending = (session.inviterManagers ?? []).filter(g => !g.memberReady
     && g.policyEnabledAt === (currentPolicy().inviterManagementEnabledAt ?? 0));
   if (!pending.length) return;
+  const canSynchronize = (grant: VcMeetingInviterGrant): boolean => {
+    const policy = currentPolicy();
+    return !session.ended && session.listenerChatId === chatId && policy.inviterManagementEnabled === true
+      && grant.policyEnabledAt === (policy.inviterManagementEnabledAt ?? 0)
+      && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId);
+  };
   const work = (async () => {
     for (const grant of pending) {
       try {
-        if (session.ended || session.listenerChatId !== chatId || currentPolicy().inviterManagementEnabled !== true
-          || grant.policyEnabledAt !== (currentPolicy().inviterManagementEnabledAt ?? 0)) break;
+        if (!canSynchronize(grant)) continue;
         let members = await listChatMemberDisplays(session.larkAppId, chatId);
+        // A block/off-toggle/rebind can happen while the group or member read is
+        // in flight. Recheck before expanding visibility, not just at invitation.
+        if (!canSynchronize(grant)) continue;
         if (!members.some(m => m.openId === grant.openId && m.memberType !== 'bot')) {
           // Never expand an owner-selected/shared/preparation group's visibility.
           if (!session.listenerChatCreatedForMeeting) throw new Error('shared listener chat requires an existing membership');
-          if (session.ended || session.listenerChatId !== chatId || currentPolicy().inviterManagementEnabled !== true
-            || grant.policyEnabledAt !== (currentPolicy().inviterManagementEnabledAt ?? 0)) break;
           const added = await addUsersToChatByOpenId(session.larkAppId, chatId, [grant.openId]);
           if (added.invalidUserIds.length) throw new Error('inviter could not be added to listener chat');
           members = await listChatMemberDisplays(session.larkAppId, chatId);
           if (!members.some(m => m.openId === grant.openId && m.memberType !== 'bot')) throw new Error('listener membership not verified');
         }
-        // A rejoin may redirect the session to a preparation chat during an API call.
-        if (session.listenerChatId !== chatId || session.ended) break;
-        // Saving after an off-toggle is harmless: every use checks the live policy/epoch.
+        if (!canSynchronize(grant)) continue;
         grant.memberReady = true;
         persistVcMeetingRuntimeSession(session, cfg);
       } catch (err) {
@@ -18814,6 +18818,12 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
     if (!session) return;
     let inviterGrantUnavailable = cfg.inviterManagementEnabled === true;
     let inviterBlocked = false;
+    if (cfg.inviterManagementEnabled === true) {
+      const diagnostic = ctx.invitationDiagnostics;
+      logger.info(`[vc-agent] invitation identity meeting=${meeting.id} eventId=${ctx.eventId ?? '?'}`
+        + ` status=${diagnostic?.inviterStatus ?? (ctx.inviter ? 'resolved' : 'unavailable')}`
+        + ` idShape=${diagnostic?.inviterIdShape ?? 'unknown'} inviteTime=${diagnostic?.inviteTimeStatus ?? 'unknown'}`);
+    }
     if (ctx.inviter) {
       const grant = createVcMeetingInviterGrant(cfg, { ...ctx.inviter, eventId: ctx.eventId });
       if (grant && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) {
