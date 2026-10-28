@@ -36,6 +36,18 @@ describe('form schema and callback validation', () => {
     expect((body as any).questions[1].input).toMatchObject({ type: 'number', min: 0, required: true });
     expect(parsed[1]).not.toHaveProperty('defaultSelectedKeys');
   });
+  it('accepts 20 form questions but rejects 21 at both CLI and HTTP boundaries', () => {
+    // Count the complete mixed form, not just its input fields.
+    const twenty = [questions[1], ...Array.from({ length: 19 }, () => questions[0])];
+    expect(parseAskQuestionsFile(JSON.stringify(twenty))).toHaveLength(20);
+    expect(parseAskBody({ ...base, questions: twenty })).toHaveProperty('questions.length', 20);
+    const tooMany = [...twenty, questions[0]];
+    expect(parseAskQuestions(tooMany)).toBe('bad_input');
+    expect(() => parseAskQuestionsFile(JSON.stringify(tooMany))).toThrow();
+    expect(parseAskBody({ ...base, questions: tooMany })).toEqual({ error: 'bad_input' });
+    // The form limit must not tighten the legacy choice-only contract.
+    expect(parseAskQuestions(Array.from({ length: 21 }, () => questions[0]))).toHaveLength(21);
+  });
   it.each([
     { type: 'password' }, { type: 'text', min: 1 }, { type: 'number', min: 2, max: 1 },
     { type: 'text', required: 'yes' }, { type: 'text', maxLength: 0 }, { type: 'text', maxLength: 9000 },
@@ -90,6 +102,29 @@ describe('production broker and card callback', () => {
     expect(toggleAsk({ ...args(), questionIndex: 0, key: 'yes' })).toBe('stale');
     expect(_getPending(sent.askId)?.selections).toEqual([[], [], []]);
     expect(submitAskForm({ ...args(), values })).toBe('accepted'); await result;
+  });
+  it.each(['ask_select', 'ask_toggle', 'ask_submit'])('rejects a stale %s callback before grant escalation or form repaint', async action => {
+    const result = registerAsk(base); await vi.advanceTimersByTimeAsync(0);
+    // A permission change makes the card-layer guard observable independently
+    // of the broker's fallback: an obsolete control must not start a grant flow.
+    setCanTalkChecker(() => false);
+    const requestGrant = vi.fn();
+    const callback = { operator: { open_id: 'ou_requester' }, action: {
+      value: { action, ask_id: sent.askId, nonce: sent.nonce, question_index: '0', key: 'yes' },
+    } };
+    const stale = await handleAskCardAction({ ...callback, action: {
+      value: { ...callback.action.value, ask_id: 'missing-ask' },
+    } });
+    const response = await handleAskCardAction(callback, { requestGrant });
+    expect(response).toEqual(stale);
+    expect(response).toEqual({ toast: { type: 'warning', content: expect.any(String) } });
+    expect(requestGrant).not.toHaveBeenCalled();
+    expect(_getPending(sent.askId)).toMatchObject({ settled: false, selections: [[], [], []] });
+    setCanTalkChecker(() => true);
+    await handleAskCardAction({ operator: callback.operator, action: {
+      value: { action: 'ask_form_submit', ask_id: sent.askId, nonce: sent.nonce }, form_value: values,
+    } });
+    expect(await result).toMatchObject({ answers: [['no'], [], []], inputs: [null, '0.5', ' extra details '] });
   });
   it('does not settle invalid fields, then submits once with both kinds of answer', async () => {
     const result = registerAsk(base); await vi.advanceTimersByTimeAsync(0);

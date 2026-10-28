@@ -27,6 +27,8 @@ export function parseAskFormValues(questions: ReadonlyArray<AskQuestion>, raw: u
           || (q.input.min !== undefined && n < q.input.min) || (q.input.max !== undefined && n > q.input.max)) return null;
       }
       total += text.length;
+      // Defense in depth for direct callers: HTTP/CLI schemas already cap a
+      // form at 20 fields × 1000 characters, so they cannot reach this budget.
       if (total > 32768) return null;
       answers.push([]); inputs.push(present ? text : null);
     } else {
