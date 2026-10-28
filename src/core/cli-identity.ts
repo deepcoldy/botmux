@@ -1343,12 +1343,26 @@ export function findRealToolBinary(
 /**
  * `realpath` that tolerates a not-yet-created tail: resolve the deepest existing
  * ancestor and re-append the rest. Used to name a path the way a fresh bwrap
- * root will see it.
+ * root will see it. A relative path is returned as is: resolving it would
+ * silently anchor it to this process's cwd.
  */
 export function canonicalPathNearest(path: string): string {
+  if (!path.startsWith('/')) return path;
   try { return realpathSync(path); } catch { /* fall through to the parent */ }
   const parent = dirname(path);
   return parent === path ? path : join(canonicalPathNearest(parent), basename(path));
+}
+
+/**
+ * How a host path has to be written into a session's env or into a script the
+ * session runs. A sandboxed session (`canonicalPaths`) lives in a fresh bwrap
+ * root that only mounts canonical paths, so a symlinked home / data root
+ * (`/home/u` -> `/data00/home/u`) has no alias there: absolute paths are named
+ * by realpath. Everything else — unsandboxed sessions, relative paths, flags in
+ * a runner argv — is returned unchanged.
+ */
+export function sessionVisiblePath(path: string, canonicalPaths: boolean | undefined): string {
+  return canonicalPaths ? canonicalPathNearest(path) : path;
 }
 
 /** Install identity interception on the process that actually executes tools.
@@ -1385,11 +1399,7 @@ export function prepareTriggerUserCliEnv(
   }
   if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return [];
   const canonicalPaths = options?.canonicalPaths === true;
-  const inSessionPath = (p: string): string => {
-    if (!canonicalPaths || !p.startsWith('/')) return p;
-    try { return realpathSync(p); } catch { return p; }
-  };
-  if (canonicalPaths) sessionDataDir = canonicalPathNearest(sessionDataDir);
+  sessionDataDir = sessionVisiblePath(sessionDataDir, canonicalPaths);
   childEnv.SESSION_DATA_DIR = sessionDataDir;
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);
@@ -1403,7 +1413,7 @@ export function prepareTriggerUserCliEnv(
     const runner = moduleDir.endsWith('/src/core')
       ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../cli-identity-runner.ts')] }
       : resolveEntrySpawn('cli-identity-runner', resolve(moduleDir, '..'));
-    identityResolver = [inSessionPath(runner.command), ...runner.args.map(inSessionPath),
+    identityResolver = [...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths)),
       '--data-dir', sessionDataDir, '--session-id', sessionId, '--app-id', execution.appId,
       '--ipc-port', String(execution.ipcPort), '--tool'];
   }
@@ -1430,7 +1440,7 @@ export function prepareTriggerUserCliEnv(
         log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
         continue;
       }
-      const realInSession = inSessionPath(real);
+      const realInSession = sessionVisiblePath(real, canonicalPaths);
       installIdentityWrapper(wrapperDir, tool, realInSession, model, identityResolver);
       installedAny = true;
       log(`[trigger-user-auth] wrapping ${tool} -> ${realInSession}`);

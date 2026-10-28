@@ -7,7 +7,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { larkTransportEnabled } from './types.js';
 import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
-import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir } from './cli-identity.js';
+import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir, sessionVisiblePath } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 
@@ -207,14 +207,10 @@ export function prepareLarkToolEnv(input: {
   const runner = input.runner ?? (moduleDir.endsWith('/src/core')
     ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../lark-tool-runner.ts')] }
     : resolveEntrySpawn('lark-tool-runner', resolve(moduleDir, '..')));
-  const inSessionPath = (p: string): string => {
-    if (!input.canonicalPaths || !p.startsWith('/')) return p;
-    try { return realpathSync(p); } catch { return p; }
-  };
   const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
   atomicWriteFileSync(join(binDir, 'lark-cli'), [
     '#!/bin/sh', '# botmux managed lark-cli — application and caller are host-bound.',
-    `exec ${[inSessionPath(runner.command), ...runner.args.map(inSessionPath), '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
+    `exec ${[...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, input.canonicalPaths)), '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
   ].join('\n'), { mode: 0o755 });
   const { zdotdir, bashEnv } = installLoginShellPathShim(binDir);
   input.env.PATH = [binDir, ...(input.env.PATH ?? '').split(':').filter(p => p !== binDir)].join(':');

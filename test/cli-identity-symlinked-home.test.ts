@@ -8,14 +8,16 @@
  *
  * The fix names those paths by realpath for sandboxed sessions. It must NOT be
  * done by mounting the home alias: the end-to-end case below asserts the helper
- * runs while the rest of the home (an ssh key) stays invisible.
+ * runs while the rest of the home (an ssh key) stays invisible. The same rule
+ * covers the runner argv embedded in the trigger-user wrappers (proven model)
+ * and in the managed lark-cli wrapper.
  */
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
 import type { FsPolicy } from '../src/adapters/cli/fs-policy.js';
@@ -25,8 +27,10 @@ import {
   prepareTriggerUserCliEnv,
   publishActiveTurn,
   sessionIdentityBinDir,
+  sessionVisiblePath,
   writeSessionIdentity,
 } from '../src/core/cli-identity.js';
+import { prepareLarkToolEnv } from '../src/core/lark-tool-binding.js';
 
 const SESSION = 'sess-symlink-home';
 const HOST = 'code.example.test';
@@ -87,6 +91,30 @@ function prepare(canonicalPaths: boolean, model: 'single' | 'proven' = 'single')
     { canonicalPaths },
   );
   return env;
+}
+
+/**
+ * Managed lark-cli wrapper for this session, its runner reached through the
+ * alias. The stub runner only runs if its entry (the second argv slot) is
+ * readable, so inside a sandbox both the command AND the args have to be
+ * visible.
+ */
+function prepareLark(canonicalPaths: boolean): { env: NodeJS.ProcessEnv; wrapper: string } {
+  writeFileSync(join(layout.stubBin, 'lark-runner'), [
+    '#!/bin/sh',
+    '[ "$1" = --entry ] && [ -r "$2" ] || { echo "runner entry unreadable: $2" >&2; exit 7; }',
+    'shift 2',
+    'echo "lark-runner $*"',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  writeFileSync(join(layout.stubBin, 'lark-runner-entry.js'), '');
+  const viaAlias = join(layout.alias, '.local', 'bin');
+  const env: NodeJS.ProcessEnv = { PATH: '/usr/bin:/bin' };
+  prepareLarkToolEnv({
+    env, dataDir: layout.lexicalDataDir, sessionId: SESSION, appId: 'cli_test', canonicalPaths,
+    runner: { command: join(viaAlias, 'lark-runner'), args: ['--entry', join(viaAlias, 'lark-runner-entry.js')] },
+  });
+  return { env, wrapper: readFileSync(join(env.BOTMUX_IDENTITY_BIN!, 'lark-cli'), 'utf8') };
 }
 
 function sessionPaths(env: NodeJS.ProcessEnv): Record<string, string> {
@@ -155,6 +183,66 @@ describe('trigger-user identity paths on a symlinked home', () => {
     expect(canonicalPathNearest(join(layout.alias, '.botmux', 'data', 'not', 'yet')))
       .toBe(join(layout.canonicalDataDir, 'not', 'yet'));
   });
+
+  it('writes the proven-model runner by realpath even when the runtime is reached through a symlink', () => {
+    if (!linux) return;
+    // Node and Bun on Linux already report execPath by realpath (/proc/self/exe),
+    // so stand the runtime behind an alias the way a symlinked home would.
+    const runtime = realpathSync(process.execPath);
+    const runtimeAlias = join(layout.root, 'runtime-alias');
+    symlinkSync(dirname(runtime), runtimeAlias);
+    const saved = process.execPath;
+    process.execPath = join(runtimeAlias, basename(runtime));
+    // Both forms name the same directory, so read each wrapper before the next write.
+    const wrapperFor = (canonicalPaths: boolean) => {
+      prepare(canonicalPaths, 'proven');
+      return readFileSync(join(sessionIdentityBinDir(layout.canonicalDataDir, SESSION), 'bytedcli'), 'utf8');
+    };
+    let sandboxed: string, unsandboxed: string;
+    try {
+      sandboxed = wrapperFor(true);
+      unsandboxed = wrapperFor(false);
+    } finally {
+      process.execPath = saved;
+    }
+    expect(sandboxed).toContain(`__botmux_cred_body=$('${runtime}' `);
+    expect(sandboxed).not.toContain(runtimeAlias);
+    expect(unsandboxed).toContain(`__botmux_cred_body=$('${join(runtimeAlias, basename(runtime))}' `);
+  });
+});
+
+describe('sessionVisiblePath', () => {
+  it('names an absolute path by realpath only for sandboxed sessions', () => {
+    const viaAlias = join(layout.alias, '.local', 'bin', 'bytedcli');
+    expect(sessionVisiblePath(viaAlias, true)).toBe(join(layout.stubBin, 'bytedcli'));
+    expect(sessionVisiblePath(join(layout.alias, '.botmux', 'data', 'not', 'yet'), true))
+      .toBe(join(layout.canonicalDataDir, 'not', 'yet'));
+    expect(sessionVisiblePath(viaAlias, false)).toBe(viaAlias);
+    expect(sessionVisiblePath(viaAlias, undefined)).toBe(viaAlias);
+  });
+
+  it('leaves flags and relative paths of a runner argv untouched', () => {
+    // Resolving these would anchor them to the worker's cwd.
+    for (const arg of ['--import', '--no-warnings', 'relative/path', '']) {
+      expect(sessionVisiblePath(arg, true), arg).toBe(arg);
+    }
+    expect(canonicalPathNearest('relative/path')).toBe('relative/path');
+  });
+});
+
+describe('managed lark-cli wrapper on a symlinked home', () => {
+  it('names the runner command and args by realpath for sandboxed sessions', () => {
+    const { wrapper } = prepareLark(true);
+    expect(wrapper).toContain(
+      `exec '${join(layout.stubBin, 'lark-runner')}' '--entry' '${join(layout.stubBin, 'lark-runner-entry.js')}' '--binding' `);
+    expect(wrapper).not.toContain(layout.alias);
+  });
+
+  it('keeps the runner as given for unsandboxed sessions', () => {
+    const viaAlias = join(layout.alias, '.local', 'bin');
+    expect(prepareLark(false).wrapper).toContain(
+      `exec '${join(viaAlias, 'lark-runner')}' '--entry' '${join(viaAlias, 'lark-runner-entry.js')}' '--binding' `);
+  });
 });
 
 describe.skipIf(!canRunBwrap)('identity helper inside a bwrap root that only mounts canonical paths', () => {
@@ -216,6 +304,19 @@ describe.skipIf(!canRunBwrap)('identity helper inside a bwrap root that only mou
     expect(fixed.out.stderr).toBe('');
     expect(fixed.out.status).toBe(0);
     expect(fixed.out.stdout).toBe('x-access-token\nuser-jwt');
+  });
+
+  it('runs the managed lark-cli runner only when its argv is named by realpath', () => {
+    const lexical = prepareLark(false);
+    const broken = runInSandbox(lexical.env, `"${lexical.env.BOTMUX_IDENTITY_BIN}/lark-cli" --version`);
+    expect(broken.out.status).not.toBe(0);
+    expect(broken.out.stderr).toMatch(/not found|No such file/);
+
+    const { env } = prepareLark(true);
+    const fixed = runInSandbox(env, `"${env.BOTMUX_IDENTITY_BIN}/lark-cli" --version`);
+    expect(fixed.out.stderr).toBe('');
+    expect(fixed.out.status).toBe(0);
+    expect(fixed.out.stdout).toBe(`lark-runner --binding ${env.BOTMUX_LARK_TOOL_BINDING} -- --version\n`);
   });
 
   it('does not widen the readable set: the home root and ssh key stay invisible', () => {

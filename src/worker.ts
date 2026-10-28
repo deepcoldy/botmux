@@ -24125,7 +24125,7 @@ async function spawnCli(
           accessSync(cliAdapter.resolvedBin, fsConstants.X_OK);
           if (!process.env.SESSION_DATA_DIR) throw new Error('SESSION_DATA_DIR is unavailable');
           aidenCodexShimDir = installAidenCodexShim(
-            join(sessionIdentityBinDir(sandboxRequested ? canonicalPathNearest(process.env.SESSION_DATA_DIR) : process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
+            join(sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
           );
         } catch (e) {
           if (aidenCodexIdentityShellEnv) {
