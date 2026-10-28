@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -17,6 +18,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { prepareDirectSandbox, probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import { buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { ensureGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
@@ -64,6 +67,7 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
     mkdirSync(dataDir, { recursive: true });
     mkdirSync(project, { recursive: true });
     vi.stubEnv('HOME', home);
+    vi.stubEnv('TRAE_HOME', '');
     vi.stubEnv('SESSION_DATA_DIR', dataDir);
   });
 
@@ -76,9 +80,13 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
     rmSandboxScratch(root);
   });
 
-  it.each(['default', 'custom'] as const)(
-    'relays a session MCP through the trusted host without exposing descriptors in bwrap (%s data dir)',
-    async (dataDirMode) => {
+  it.each([
+    ['codex', 'default'], ['codex', 'custom'],
+    ['traex', 'default'], ['traex', 'custom'],
+    ['coco', 'default'], ['coco', 'custom'],
+  ] as const)(
+    'relays a session MCP through the trusted host without exposing descriptors in bwrap (%s, %s data dir)',
+    async (cliId, dataDirMode) => {
       if (dataDirMode === 'custom') {
         dataDir = join(root, 'custom-botmux-home', 'data');
         mkdirSync(dataDir, { recursive: true });
@@ -116,19 +124,21 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
       });
 
       const gatewayBin = join(home, '.botmux', 'bin', 'botmux');
-      const codexConfig = join(root, 'codex-config.toml');
+      const traeAdapter = cliId === 'traex' ? createTraexAdapter('/bin/traex')
+        : cliId === 'coco' ? createCocoAdapter('/bin/coco') : undefined;
+      const cliConfig = traeAdapter?.mcpGateway?.configPath ?? join(root, 'codex-config.toml');
       mkdirSync(join(home, '.botmux', 'bin'), { recursive: true });
       writeFileSync(gatewayBin, '#!/bin/sh\nexit 99\n');
       chmodSync(gatewayBin, 0o755);
-      const installReport = ensureGatewayEntry({
+      const installReport = ensureGatewayEntry(traeAdapter ?? {
         id: 'codex',
-        mcpGateway: { format: 'codex-toml', configPath: codexConfig },
+        mcpGateway: { format: 'codex-toml', configPath: cliConfig },
       }, {
         command: gatewayBin,
         args: ['mcp', 'serve'],
       });
       expect(installReport.state).toBe('installed');
-      const forwardedKeys = codexForwardedEnvKeys(codexConfig);
+      const forwardedKeys = codexForwardedEnvKeys(cliConfig);
 
       let gatewayHost: SessionMcpGatewayHost | null = null;
       let sandbox: ReturnType<typeof prepareDirectSandbox> = null;
@@ -155,7 +165,13 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
           workingDir: project,
           currentAppId: 'cli_test',
           botHome,
-          redirectedCliData: true,
+          redirectedCliData: cliId === 'codex',
+          readonlyRoots: [
+            // Match worker's dependency carve-out for symlinked worktrees.
+            realpathSync(resolve('node_modules')),
+            ...(traeAdapter?.sandboxReadonlyPaths?.() ?? []).map(path =>
+              path.startsWith('~/') ? join(home, path.slice(2)) : path),
+          ],
           execPaths: [dirname(process.execPath)],
           botmuxInstallRoot: resolve('.'),
           outbox,
@@ -198,6 +214,16 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
         expect(probe.error).toBeUndefined();
         expect(probe.status, probe.stderr).toBe(0);
 
+        if (traeAdapter) {
+          const configProbe = spawnSync(sandbox.bin, [
+            ...sandbox.args.slice(0, commandIndex + 1), '/bin/sh', '-c',
+            'test -r "$1" && ! (printf forbidden >> "$1")', 'verify-readonly-trae-config', cliConfig,
+          ], { cwd: project, env: { ...process.env, ...sandbox.env }, encoding: 'utf8', timeout: 10_000 });
+          expect(configProbe.error).toBeUndefined();
+          expect(configProbe.status, configProbe.stderr).toBe(0);
+          expect(readFileSync(cliConfig, 'utf8')).not.toContain('forbidden');
+        }
+
         const parentGatewayEnv: Record<string, string> = {
           [MCP_GATEWAY_SESSION_ENV]: sessionId,
           [MCP_GATEWAY_DATA_DIR_ENV]: dataDir,
@@ -223,7 +249,10 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
           stderr: 'pipe',
         });
         client = new Client({ name: 'sandbox-gateway-test', version: '1.0.0' });
-        await client.connect(transport);
+        let relayStderr = '';
+        transport.stderr?.on('data', chunk => { relayStderr += String(chunk); });
+        try { await client.connect(transport); }
+        catch (error) { throw new Error(`Gateway relay failed: ${relayStderr}`, { cause: error }); }
 
         expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
         const result = await client.callTool({ name: 'echo', arguments: { value: 1 } });

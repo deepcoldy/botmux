@@ -122,6 +122,11 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: '/login', sessionPolicy: 'default', help: ['help.login', 'help.login_status'],
   },
+  {
+    name: '/logout', sessionPolicy: 'sessionless', permission: 'talk',
+    help: ['help.logout'],
+    notes: '只撤销发送者自己的触发人凭据；撤销他人走 dashboard IPC',
+  },
   { name: '/adopt', sessionPolicy: 'default', help: ['help.adopt', 'help.adopt_pane', 'help.adopt_orca'] },
   {
     name: '/oncall', sessionPolicy: 'default',

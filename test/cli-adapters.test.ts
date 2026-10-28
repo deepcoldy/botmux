@@ -4688,7 +4688,12 @@ describe('traex/coco sandbox authPaths', () => {
     // silenced by exposing the done-markers READ-ONLY via sandboxReadonlyPaths.
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.mcpGateway).toEqual({
+      configPath: join(homedir(), '.trae', 'traecli.toml'),
+      format: 'codex-toml',
+    });
     expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      join(homedir(), '.trae', 'traecli.toml'),
       '~/.trae/.coco-rollouts-migrated',
       '~/.trae/.coco-migrated',
     ]);
@@ -4700,7 +4705,12 @@ describe('traex/coco sandbox authPaths', () => {
     // transcript bridge reads).
     const adapter = createCocoAdapter('/bin/coco');
     expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
+    expect(adapter.mcpGateway).toEqual({
+      configPath: join(homedir(), '.trae', 'traecli.toml'),
+      format: 'codex-toml',
+    });
     expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      join(homedir(), '.trae', 'traecli.toml'),
       '~/.trae/.coco-rollouts-migrated',
       '~/.trae/.coco-migrated',
     ]);

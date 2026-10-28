@@ -568,6 +568,11 @@ export const messages: Record<string, string> = {
   'cmd.status.waiting': 'idle',
   'cmd.status.fallback_no_session': 'No active session in this topic.\nDaemon active sessions: {count}\n{cliName}: v{version}',
   'cmd.login.no_credentials': '❌ Cannot read app credentials.',
+  'cmd.logout.ok': 'Your trigger-user authorization on this machine has been revoked. Later turns will not keep using those credentials; send /login when you want to authorize again.',
+  'cmd.logout.platform_note': 'The central-platform grant was not revoked — this process cannot revoke it. Revoke it on the platform credentials page: {url}',
+  'cmd.logout.platform_unbound': 'The central-platform grant was not revoked — this process cannot revoke it. This machine is not bound to a platform, so there is no credentials page to open.',
+  'cmd.logout.no_sender': 'Could not tell who sent /logout, so nothing was revoked.',
+  'cmd.logout.no_bot': 'This bot has no app configuration, so the authorization could not be revoked.',
   // Printed on stderr to whoever's command did not run: name whose
   // authorization is missing and how to supply it, or they just retry.
   // bytedcli uses ByteCloud SSO, a different identity provider from Feishu, so
@@ -1025,6 +1030,7 @@ export const messages: Record<string, string> = {
   'help.heading_login': '🔐 User OAuth:',
   'help.login': '/login              - Lark user OAuth (lets you download images etc. from third-party cards)',
   'help.login_status': '/login status       - Show auth status',
+  'help.logout': '/logout             - Revoke your own trigger-user authorization (local lark-cli / bytedcli login and this bot\'s user token)',
   'help.pair': '/pair <code>        - Bind a team-platform web login pairing code',
   'help.heading_workflow': '🧭 Workflow:',
   'help.workflow_run': '/workflow <goal>; /workflow run <name> [key=value ...] - Start ad-hoc or run a Saved Workflow',

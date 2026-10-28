@@ -42,6 +42,7 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
+import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-auth-epoch.js';
 
 /** Root under which each authorized person gets their own lark-cli HOME.
  *  Overridable for tests so a run never touches the real data dir. */
@@ -155,10 +156,15 @@ function larkCliDataDir(home: string): string {
  *  can expire — the call itself reports that). */
 export function hasLarkCliHome(openId: string): boolean {
   try {
+    const home = larkCliHomeFor(openId);
+    // Revoke bumps the epoch before deleting the HOME. A CLI that rewrites
+    // session files afterwards still fails this check until a new login stamps
+    // the current epoch. A missing stamp is valid only at epoch 0.
+    if (!cliAuthEpochAllows(openId, home)) return false;
     // A seeded-but-never-authorized HOME holds no per-person token yet; only a
     // real <appId>_<openId>.enc counts as "has logged in".
-    return existsSync(larkCliConfigPath(larkCliHomeFor(openId)))
-      && listUserTokenFiles(larkCliHomeFor(openId)).length > 0;
+    return existsSync(larkCliConfigPath(home))
+      && listUserTokenFiles(home).length > 0;
   } catch { return false; }
 }
 
@@ -177,6 +183,28 @@ export function describeLarkCliAuth(openId: string): {
     return { state: hasLarkCliHome(openId) ? 'authorized' : 'needs-login' };
   } catch {
     return { state: 'unknown' };
+  }
+}
+
+/** Forget one person's lark-cli HOME entirely. Issuer app homes are not here. */
+export function clearLarkCliAuth(openId: string): void {
+  try { rmSync(larkCliHomeFor(openId), { recursive: true, force: true }); }
+  catch { /* best-effort: absence is the desired state */ }
+}
+
+/**
+ * `lark-cli auth logout` revokes the refresh token server-side, then clears
+ * local users. Only when a HOME already exists — never mkdir one just to log
+ * out. Failure (missing binary, non-zero exit) is reported as false; the
+ * caller still deletes the local HOME.
+ */
+export async function logoutLarkCli(openId: string): Promise<boolean> {
+  try {
+    if (!isUsableOpenId(openId) || !existsSync(larkCliHomeFor(openId))) return false;
+    const result = await runAsUser(openId, ['auth', 'logout', '--json']);
+    return result.ok;
+  } catch {
+    return false;
   }
 }
 
@@ -392,6 +420,9 @@ export interface LarkCliLoginChallenge {
  * chat.
  */
 export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginChallenge | null> {
+  const epochAtStart = readCliAuthEpoch(openId);
+  const home = larkCliHomeFor(openId);
+  if (existsSync(home) && !cliAuthEpochAllows(openId, home)) clearLarkCliAuth(openId);
   if (!ensureBootstrapped(openId)) {
     logger.warn('[lark-cli-auth] cannot begin login: operator lark-cli has no app to seed from');
     return null;
@@ -416,6 +447,10 @@ export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginCha
     logger.warn(`[lark-cli-auth] could not start a login: ${stderr.trim() || stdout.trim() || 'no output'}`);
     return null;
   }
+  // A revoke (or a newer login) won while the CLI was running. Leave the HOME
+  // alone so that newer login is not deleted.
+  if (readCliAuthEpoch(openId) !== epochAtStart) return null;
+  stampCliAuthEpoch(openId, home);
   saveChallenge(openId, deviceCode, authUrl);
   return { authUrl };
 }

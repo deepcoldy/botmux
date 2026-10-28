@@ -566,6 +566,11 @@ export const messages: Record<string, string> = {
   'cmd.status.waiting': '等待中',
   'cmd.status.fallback_no_session': '当前话题没有活跃的会话。\nDaemon active sessions: {count}\n{cliName}: v{version}',
   'cmd.login.no_credentials': '❌ 无法获取应用凭证',
+  'cmd.logout.ok': '已撤销你在这台机器上的触发人授权。之后的轮次不会再使用这些凭证；需要时重新发送 /login。',
+  'cmd.logout.platform_note': '中心化平台上的授权这次没有撤销（本进程撤不掉平台 grant）。要撤销请打开平台凭据页：{url}',
+  'cmd.logout.platform_unbound': '中心化平台上的授权这次没有撤销（本进程撤不掉平台 grant）。本机尚未绑定平台，无法给出凭据页链接。',
+  'cmd.logout.no_sender': '无法确认是谁发送的 /logout，没有撤销任何授权。',
+  'cmd.logout.no_bot': '当前机器人没有可用的应用配置，无法撤销授权。',
   // 这几条走 stderr 给「命令没跑起来」的那个人看：必须说清是谁的授权缺了、
   // 以及怎么补。只说「拒绝」会让人反复重试同一条命令。
   // bytedcli 走 ByteCloud SSO，跟飞书是两个身份提供方，必须各授权一次。
@@ -1022,6 +1027,7 @@ export const messages: Record<string, string> = {
   'help.heading_login': '🔐 用户授权：',
   'help.login': '/login              - 飞书用户授权（可下载第三方卡片图片等）',
   'help.login_status': '/login status       - 查看授权状态',
+  'help.logout': '/logout             - 撤销你自己的触发人授权（本机 lark-cli / bytedcli 登录与该机器人的用户 token）',
   'help.pair': '/pair <配对码>      - 绑定团队平台网页登录配对码',
   'help.heading_workflow': '🧭 Workflow：',
   'help.workflow_run': '/workflow <目标>；/workflow run <名称> [key=value ...] - 即兴编排或运行 Saved Workflow',
