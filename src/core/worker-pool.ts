@@ -14945,6 +14945,15 @@ export function forkWorker(
       cliRuntime: agentCfg.cliRuntime,
       cliPathOverride: agentCfg.cliPathOverride,
     })),
+    // 已探测到的 CLI 版本，供 adapter 给「新版本才有的 flag」做门控（例如
+    // opencode v1 的 --auto 到 1.17.12 才落地）。没探测过就是 'unknown'，
+    // adapter 必须按「不支持」处理 —— 传未知 flag 会让老版本打帮助退出 1，
+    // 再被 daemon 的自动重启放大成 crash-loop。
+    cliVersion: getCurrentCliVersion(runtimeInstallationKey({
+      cliId: agentCfg.cliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    })),
     wrapperCli: agentCfg.wrapperCli,
     cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,
@@ -22092,6 +22101,12 @@ export function forkAdoptWorker(
     // Same live-read pattern as the primary init: adopt re-forks gate on the
     // adopted CLI id.
     noProgressNotify: isCodexAppCliId(adoptedCliId) ? botCfg.noProgressNotify : undefined,
+    // 同主 init：adopt 重新 fork 时带上已探测版本（按 adopt 的 CLI id 取）。
+    cliVersion: getCurrentCliVersion(runtimeInstallationKey({
+      cliId: adoptedCliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    })),
     codexRpcInput: resolveCodexRpcInput(adoptedCliId, botCfg.codexRpcInput, config.codexRpcInputDefault),
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
     // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited
