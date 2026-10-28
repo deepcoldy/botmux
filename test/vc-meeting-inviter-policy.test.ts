@@ -51,6 +51,49 @@ describe('native invitation identity extraction', () => {
   it.each([native, { event: native }, { data: { event: native } }])('extracts only a real human inviter, retaining event provenance', data => {
     expect(parse(data).inviter).toEqual({ openId: 'ou_inviter', invitedAt: now });
   });
+  const structured = { ...native, inviter: {
+    id: { open_id: 'ou_inviter', union_id: 'on_inviter', user_id: 'internal_user' },
+    user_type: 1, user_name: 'Untrusted display name',
+  } };
+  it.each([structured, { event: structured }, { data: { event: structured } }])(
+    'resolves native ID objects through the same time and membership gates', data => {
+      const parsed = parse(data);
+      expect(parsed.inviter).toEqual({ openId: 'ou_inviter', invitedAt: now });
+      const grant = createVcMeetingInviterGrant(policy, { ...parsed.inviter!, eventId: parsed.eventId }, now)!;
+      expect(grant.openId).toBe('ou_inviter');
+      expect(grant.memberReady).toBe(false);
+      expect(activeVcMeetingInviters(policy, [grant])).toEqual([]);
+      expect(parsed.invitationDiagnostics).toEqual({
+        inviterStatus: 'resolved', inviterIdShape: 'object', inviteTimeStatus: 'valid',
+      });
+    },
+  );
+  it.each([
+    { id: { user_id: 'ou_other', union_id: 'on_other' }, user_type: 1 },
+    { id: { open_id: 'on_other' }, user_type: 1 },
+    { id: { open_id: 123 }, user_type: 1 },
+    { id: { open_id: 'ou_bad_id' }, user_type: 1 },
+    { id: { open_id: ' ou_other ' }, user_type: 1 },
+    { id: { open_id: 'ou_other' }, user_type: '1' },
+    { id: { open_id: 'ou_other' }, user_type: 10 },
+    { id: ['ou_other'], user_type: 1 },
+  ])('does not substitute another identifier or coerce actor types: %j', inviter => {
+    const parsed = parse({ ...native, inviter, meeting: { ...native.meeting, host_user: { open_id: 'ou_host' } } });
+    expect(parsed.inviter).toBeUndefined();
+    expect(parsed.invitationDiagnostics?.inviterStatus).not.toBe('resolved');
+  });
+  it('reports missing identity and invalid time without retaining personal values in diagnostics', () => {
+    const missing = parse({ ...native, inviter: undefined });
+    expect(missing.invitationDiagnostics).toEqual({
+      inviterStatus: 'missing_inviter', inviterIdShape: 'missing', inviteTimeStatus: 'valid',
+    });
+    const invalid = parse({ ...structured, invite_time: 'invalid_private_value' });
+    expect(invalid.invitationDiagnostics).toEqual({
+      inviterStatus: 'resolved', inviterIdShape: 'object', inviteTimeStatus: 'invalid',
+    });
+    expect(invalid.inviter?.invitedAt).toBeUndefined();
+    expect(createVcMeetingInviterGrant(policy, { ...invalid.inviter!, eventId: invalid.eventId }, now)).toBeUndefined();
+  });
   const withoutInviteTime = { event_id: 'evt_no_time', inviter: native.inviter, meeting: native.meeting };
   it.each([
     { ...withoutInviteTime, header: { create_time: String(now) } },
