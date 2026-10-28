@@ -47,7 +47,7 @@ import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
-import { parseCodexAsyncQuestions, parseCodexAsyncUserInput } from './services/codex-async-user-input.js';
+import { parseCodexAsyncQuestions, parseCodexAsyncUserInput, codexAsyncSteerTargetMatches } from './services/codex-async-user-input.js';
 import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 
 type JsonObject = Record<string, any>;
@@ -164,7 +164,7 @@ interface QueuedInput {
    * marker as both PR's `turnId` and master's `replyTurnId`. */
   replyTurnId?: string;
   /** Explicit positive (from the daemon admission gate, decision A): this
-   * plain-human-interactive input may `turn/steer` into an already-active Codex
+   * authorized human input/answer may `turn/steer` into an already-active Codex
    * App turn. Missing/false ⇒ forced serial (starts its own turn only when the
    * runner is idle). Never inferred here — copied verbatim from the decoded
    * control line's `codexAppSteerable`. */
@@ -894,7 +894,7 @@ function cancelAsyncUserInputRequests(turnId?: string): void {
 }
 
 function handleAsyncUserInput(item: JsonObject, nativeTurnId: string, turn: ActiveTurn): void {
-  const identity = parseCodexAsyncUserInput({ threadId, itemId: item.id });
+  const identity = parseCodexAsyncUserInput({ threadId, itemId: item.id, nativeTurnId });
   if (!identity || generationFenced || seenAsyncQuestions.has(identity.itemId)) return;
   const current = client;
   const controller = new AbortController();
@@ -1795,6 +1795,13 @@ function inGroupMode(turn: ActiveTurn): boolean {
  * follow-up head explicitly authorized by the daemon admission gate. A Goal
  * root additionally requires its own matching steer to have been accepted.
  */
+function canSteerInputToNativeTurn(head: QueuedInput, nativeTurnId: string | undefined): boolean {
+  return head.codexAppSteerable === true
+    && codexAsyncSteerTargetMatches(head.replyTurnId, head.codexAppInput, nativeTurnId)
+    && (!head.codexAppInput?.steerTargetTurnId
+      || (!cleanInputUnsupported && supportsClientUserMessageId(detectedCodexVersion())));
+}
+
 function canSteer(turn: ActiveTurn, head: QueuedInput): boolean {
   return !generationFenced
     && !turn.completed
@@ -1807,7 +1814,8 @@ function canSteer(turn: ActiveTurn, head: QueuedInput): boolean {
     && turn.accepted !== undefined
     && turn.accepted.length > 0
     && turn.accepted[0].input.codexAppSteerable === true
-    && head.codexAppSteerable === true;
+    && canSteerInputToNativeTurn(head, turn.canonicalNativeTurnId)
+    && (!head.codexAppInput?.steerTargetTurnId || !!turn.accepted[0].clientUserMessageId);
 }
 
 /**
@@ -2174,6 +2182,12 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
 
 async function runTurn(message: QueuedInput): Promise<void> {
   const tid = await ensureThread();
+  // Native work can change while ensureThread awaits. A late answer must never
+  // turn into a steer of a different Goal/native turn at this boundary.
+  if (nativeActiveTurnId !== undefined && !canSteerInputToNativeTurn(message, nativeActiveTurnId)) {
+    queue.unshift(message);
+    return;
+  }
   // The botmux/Lark reply identity is the top-level replyTurnId (which already
   // fell back to the sidecar clientUserMessageId at decode time). This is the id
   // exposed on the final marker for reply routing; the app-server's native turn
@@ -2492,7 +2506,7 @@ async function drainQueue(): Promise<void> {
       // no-active-turn branch re-kicks drainQueue so the head starts its own
       // turn. Without this a special-sink / non-interactive input would be
       // silently merged into the Goal turn and its output mis-delivered.
-      if (nativeActiveTurnId !== undefined && queue[0].codexAppSteerable !== true) {
+      if (nativeActiveTurnId !== undefined && !canSteerInputToNativeTurn(queue[0], nativeActiveTurnId)) {
         break;
       }
       const next = queue.shift()!;
@@ -2530,7 +2544,7 @@ async function drainQueue(): Promise<void> {
       // and never wedges without an idle/ready edge.
       const parkedBehindGoal = queue.length > 0
         && nativeActiveTurnId !== undefined
-        && queue[0].codexAppSteerable !== true;
+        && !canSteerInputToNativeTurn(queue[0], nativeActiveTurnId);
       if (queue.length === 0 || parkedBehindGoal) {
         settleRunnerState();
       }
@@ -2628,7 +2642,7 @@ function enqueueLine(line: string): void {
           ? decoded.replyTurnId
           : codexAppInput?.clientUserMessageId;
         // Explicit positive only: the daemon admission gate (decision A) sets
-        // `true` solely for a plain-human-interactive turn. Any other value is
+        // `true` for an eligible human input or correlated answer. Any other value is
         // treated as absent → forced serial, never a silent steer authorization.
         const codexAppSteerable = decoded.codexAppSteerable === true;
         queue.push({

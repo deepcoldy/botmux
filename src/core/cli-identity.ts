@@ -31,7 +31,7 @@
  * call for zero benefit, since these files hold exactly a couple of opaque
  * values.
  */
-import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, type Dirent } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +42,7 @@ import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.j
 import { resolveEntrySpawn } from './self-spawn.js';
 import type { IdentityStorageModel } from './lark-tool-binding.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { isUsableOpenId } from '../utils/user-token.js';
 
 export type { IdentityStorageModel };
 
@@ -122,6 +123,111 @@ export function forgetProvenIdentityContent(
     delete tools[tool];
     if (Object.keys(tools).length === 0) turns.delete(turnId);
   }
+}
+
+function identityOpenIdLine(openId: string): string {
+  return `${OPEN_ID_VAR}=${shellSingleQuote(openId)}`;
+}
+
+function stampedOpenId(body: string): string | undefined {
+  const prefix = `${OPEN_ID_VAR}=`;
+  for (const line of body.split('\n')) {
+    if (!line.startsWith(prefix)) continue;
+    const quoted = line.slice(prefix.length);
+    if (quoted.length < 2 || !quoted.startsWith("'") || !quoted.endsWith("'")) return undefined;
+    return quoted.slice(1, -1).replaceAll("'\\''", "'");
+  }
+  return undefined;
+}
+
+function identityMatchesOpenId(body: string, openId: string): boolean {
+  return body.split('\n').includes(identityOpenIdLine(openId));
+}
+
+function dropMatchingEnvFiles(dir: string, openId: string): number {
+  let entries: Dirent[];
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+  let dropped = 0;
+  const bytedcliRemoved = new Set<string>();
+  for (const ent of entries) {
+    // A symlink can point outside this session tree. Never follow one.
+    if (ent.isSymbolicLink()) continue;
+    const path = join(dir, ent.name);
+    if (ent.isDirectory()) {
+      dropped += dropMatchingEnvFiles(path, openId);
+      continue;
+    }
+    if (!ent.isFile() || !ent.name.endsWith('.env')) continue;
+    let text: string;
+    try { text = readFileSync(path, 'utf8'); } catch { continue; }
+    if (!identityMatchesOpenId(text, openId)) continue;
+    try {
+      rmSync(path, { force: true });
+      dropped += 1;
+      if (ent.name === 'bytedcli.env') bytedcliRemoved.add(dir);
+    } catch { /* best-effort */ }
+  }
+  for (const parent of bytedcliRemoved) {
+    const companion = join(parent, `${CODEBASE_COMPANION_TOOL}.env`);
+    try {
+      const text = readFileSync(companion, 'utf8');
+      const stamped = stampedOpenId(text);
+      if (stamped !== undefined && stamped !== openId) continue;
+      rmSync(companion, { force: true });
+      dropped += 1;
+    } catch { /* already removed, or it names someone else and we kept it */ }
+  }
+  return dropped;
+}
+
+/**
+ * Drop published trigger-user identities stamped for `openId`.
+ *
+ * The same-principal wrapper keeps a credential when `BOTMUX_IDENTITY_OPEN_ID`
+ * still matches the live caller, so deleting the token store is not enough
+ * until the next publish overwrites the snapshot. Proven bodies live in this
+ * process; single-snapshot `.env` files live under the session data dir.
+ * Denial files have no open-id line and are left alone, except a codebase
+ * companion whose bytedcli body was just removed and which does not name a
+ * different person.
+ */
+export function dropPublishedIdentitiesForOpenId(sessionDataDir: string, openId: string): number {
+  if (!isUsableOpenId(openId)) return 0;
+  const wanted = new Set<string>();
+  try { wanted.add(realpathSync(sessionDataDir)); } catch { /* dir may be missing */ }
+  wanted.add(resolve(sessionDataDir));
+
+  let dropped = 0;
+  for (const key of [...provenIdentityContents.keys()]) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(key); } catch { continue; }
+    if (!Array.isArray(parsed) || typeof parsed[0] !== 'string' || !wanted.has(parsed[0])) continue;
+    const turns = provenIdentityContents.get(key);
+    if (!turns) continue;
+    for (const turnId of [...turns.keys()]) {
+      const tools = turns.get(turnId);
+      if (!tools) continue;
+      let removedBytedcli = false;
+      for (const tool of Object.keys(tools) as IdentityTool[]) {
+        const body = tools[tool];
+        if (typeof body !== 'string' || !identityMatchesOpenId(body, openId)) continue;
+        delete tools[tool];
+        dropped += 1;
+        if (tool === 'bytedcli') removedBytedcli = true;
+      }
+      if (removedBytedcli && typeof tools[CODEBASE_COMPANION_TOOL] === 'string') {
+        const stamped = stampedOpenId(tools[CODEBASE_COMPANION_TOOL]);
+        if (stamped === undefined || stamped === openId) {
+          delete tools[CODEBASE_COMPANION_TOOL];
+          dropped += 1;
+        }
+      }
+      if (Object.keys(tools).length === 0) turns.delete(turnId);
+    }
+    if (turns.size === 0) provenIdentityContents.delete(key);
+  }
+  dropped += dropMatchingEnvFiles(sessionIdentityDir(sessionDataDir), openId);
+  return dropped;
 }
 
 /**

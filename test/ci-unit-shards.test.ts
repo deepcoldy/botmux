@@ -43,9 +43,9 @@ describe('unit test shards in ci.yml', () => {
 
   it('divides the suite into the same N the matrix runs', () => {
     expect(shardJob.name).toBe(`test (\${{ matrix.shard }}/${count})`);
-    const unitSteps = (shardJob.steps ?? []).filter(step => step.run?.includes('run-unit-shard.mjs'));
+    const unitSteps = (shardJob.steps ?? []).filter(step => step.run?.includes('--shard='));
     expect(unitSteps).toHaveLength(1);
-    expect(unitSteps[0]!.run).toBe(`node scripts/run-unit-shard.mjs \${{ matrix.shard }}/${count}`);
+    expect(unitSteps[0]!.run).toBe(`bun run test -- --shard=\${{ matrix.shard }}/${count}`);
     expect(unitSteps[0]!.name).toBe(`Unit tests (shard \${{ matrix.shard }}/${count})`);
     // A red shard must not cancel the others: their walls are the evidence
     // for the next shard-count decision.

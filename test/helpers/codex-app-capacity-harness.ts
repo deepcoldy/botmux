@@ -21,7 +21,11 @@ export function appRecoveryHarness(config: Record<string, any> = {}, sessionOver
     ordinaryTurnRecoveryStillOwnsSession: () => true,
     parseScheduledTurnId: () => null, mintScheduledContinuationTurnId: () => undefined,
     isSilentScheduledTurn: () => false, armSilentScheduledTurn: vi.fn(), disarmSilentScheduledTurn: vi.fn(),
-    sessionStore: { updateSession: persist }, sendWorkerInput: send, forkWorker: send,
+    sessionStore: { updateSession: persist, updateDeploymentContinuation: vi.fn() }, sendWorkerInput: send, forkWorker: send,
+    // sendWorkerSessionInput also cancels any deployment continuation on stop /
+    // new input (#2442); these recovery tests have no continuation, so stub the
+    // authority as absent and the cancel as a no-op.
+    cancelDeploymentContinuation: vi.fn(), deploymentContinuationAuthority: () => undefined,
     callbacks: { prepareRawInputTurn: prepare }, notifyOrdinaryTurnRecoveryFailure: warn,
     tag: () => 'test', logger: { error: vi.fn() }, publishAttentionPatch: vi.fn(),
     localeForBot: () => 'zh', sessionCliDisplayName: () => 'Codex App', ordinaryTurnRecoveryWarning: () => 'failed',

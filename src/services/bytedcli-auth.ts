@@ -38,6 +38,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
 import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
+import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-auth-epoch.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
 const BYTEDCLI_HOME_ROOT = join(homedir(), '.botmux', 'data', 'bytedcli-home');
@@ -84,7 +85,11 @@ interface LoginObservation {
 }
 
 async function readLoginState(openId: string): Promise<LoginObservation> {
-  if (!existsSync(bytedcliHomeFor(openId))) return { authenticated: false };
+  const home = bytedcliHomeFor(openId);
+  if (!existsSync(home)) return { authenticated: false };
+  // A HOME rewritten after revoke has no matching stamp. Do not ask the CLI —
+  // its own session files are not authority once the epoch has moved.
+  if (!cliAuthEpochAllows(openId, home)) return { authenticated: false };
   const result = await runAsUser(openId, ['auth', 'status', '--json']);
   const envelope = parseEnvelope(result.stdout);
   const data = envelope?.data as Record<string, unknown> | undefined;
@@ -168,6 +173,23 @@ export async function describeBytedcliAuth(openId: string): Promise<{
 export function clearBytedcliAuth(openId: string): void {
   try { rmSync(bytedcliHomeFor(openId), { recursive: true, force: true }); }
   catch { /* best-effort: absence is the desired state */ }
+}
+
+/**
+ * Ask bytedcli to revoke this person's server-side login, if a HOME already
+ * exists. Never creates the directory: `runAsUser` would mkdir, and a logout
+ * of someone who never logged in must not leave an empty HOME behind.
+ * A missing binary or a non-zero exit is a failed attempt, not an exception —
+ * the caller still deletes the local HOME.
+ */
+export async function logoutBytedcli(openId: string): Promise<boolean> {
+  try {
+    if (!isUsableOpenId(openId) || !existsSync(bytedcliHomeFor(openId))) return false;
+    const result = await runAsUser(openId, ['auth', 'logout', '--json']);
+    return result.ok;
+  } catch {
+    return false;
+  }
 }
 
 export interface BytedcliResult {
@@ -321,6 +343,12 @@ export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginC
 }
 
 async function beginLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
+  const epochAtStart = readCliAuthEpoch(openId);
+  const home = bytedcliHomeFor(openId);
+  // A revoked HOME must not resume its old challenge. Clear it before login;
+  // a newer login that landed during this call is left alone below.
+  if (existsSync(home) && !cliAuthEpochAllows(openId, home)) clearBytedcliAuth(openId);
+
   const pending = pendingBytedcliLogin(openId);
   if (pending?.authUrl) return pending;
 
@@ -335,6 +363,10 @@ async function beginLogin(openId: string): Promise<BytedcliLoginChallenge | null
     logger.warn('[bytedcli-auth] could not start a login; provider failed or returned an invalid challenge');
     return null;
   }
+  // Epoch moved while the CLI ran: a revoke, or a newer login, won. Do not
+  // stamp or delete — the newer HOME may already be valid.
+  if (readCliAuthEpoch(openId) !== epochAtStart) return null;
+  stampCliAuthEpoch(openId, home);
   if (!saveChallenge(openId, completeToken, authUrl)) return null;
   return { authUrl, completeToken };
 }
@@ -436,5 +468,8 @@ async function mintJwts(openId: string): Promise<BytedcliJwts | null> {
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
   }
+  // Revoke may have landed while the CLI was minting. Drop the JWT we already
+  // hold so this turn cannot publish it.
+  if (!cliAuthEpochAllows(openId, bytedcliHomeFor(openId))) return null;
   return { cloudJwt, ...(codeJwt ? { codeJwt } : {}) };
 }

@@ -528,6 +528,16 @@ vi.mock('../src/core/command-discovery.js', () => ({
   listMcpServerNames: vi.fn(() => []),
 }));
 
+vi.mock('../src/services/revoke-trigger-user-auth.js', () => ({
+  revokeTriggerUserAuth: vi.fn(async () => ({
+    ok: true,
+    openId: 'ou_sender',
+    removed: { larkCli: false, bytedcli: false, userToken: false },
+    remoteLogout: { larkCli: 'skipped', bytedcli: 'skipped' },
+    identitiesDropped: 0,
+  })),
+}));
+
 vi.mock('../src/utils/user-token.js', () => ({
   generateAuthUrl: vi.fn(() => ({ authUrl: 'https://open.feishu.cn/auth/v1/test' })),
   getTokenStatus: vi.fn(() => 'User token: active'),
@@ -729,6 +739,7 @@ import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeF
 import { discoverAdoptableSessions, validateAdoptTarget } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { discoverSlashCommandsForAdapter } from '../src/core/command-discovery.js';
+import { revokeTriggerUserAuth } from '../src/services/revoke-trigger-user-auth.js';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -871,7 +882,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/context-sharing', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/dash', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/logout', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/context-sharing', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/dash', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -7053,6 +7064,59 @@ describe('handleCommand', () => {
       const deps = withPolicy({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }, true);
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
       expect(reply(deps)).not.toContain(PAGE);
+    });
+  });
+
+  describe('/logout', () => {
+    beforeEach(() => {
+      vi.mocked(revokeTriggerUserAuth).mockClear();
+    });
+
+    it('revokes only the sender, even when the text names someone else', async () => {
+      const deps = makeDeps();
+      await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout ou_other'), deps, LARK_APP_ID);
+      expect(revokeTriggerUserAuth).toHaveBeenCalledWith({
+        openId: 'ou_sender',
+        appId: 'app-1',
+        brand: 'feishu',
+        sessionDataDir: expect.any(String),
+      });
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent.length).toBeGreaterThan(0);
+      expect(replyContent).not.toContain('ou_other');
+    });
+
+    it('does not revoke when the sender id is unusable', async () => {
+      const deps = makeDeps();
+      await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout', { senderId: 'bad id' }), deps, LARK_APP_ID);
+      expect(revokeTriggerUserAuth).not.toHaveBeenCalled();
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent.length).toBeGreaterThan(0);
+    });
+
+    it('points at the platform credentials page when this bot takes platform grants', async () => {
+      const page = 'https://platform.example.test/credentials';
+      const previousGetBot = vi.mocked(getBot).getMockImplementation();
+      vi.mocked(platformCredentialsUrl).mockReturnValue(page);
+      vi.mocked(getBot).mockImplementation((() => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: 'app-1', larkAppSecret: 'secret-1', cliId: 'claude-code' as const,
+          workingDir: '~/projects', workingDirs: ['~/projects'],
+          triggerUserAuth: parseTriggerUserAuthConfig({
+            enabled: true, tools: ['lark-cli'], credentialSource: 'platform',
+          }) ?? undefined,
+        },
+      })) as any);
+      const deps = makeDeps();
+      try {
+        await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout'), deps, LARK_APP_ID);
+        const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(replyContent).toContain(t('cmd.logout.platform_note', { url: page }, 'zh'));
+      } finally {
+        vi.mocked(platformCredentialsUrl).mockReturnValue(null);
+        if (previousGetBot) vi.mocked(getBot).mockImplementation(previousGetBot);
+      }
     });
   });
 

@@ -52,7 +52,8 @@ import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
-import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { droppedReservedPerBotEnvKeys, sanitizePerBotEnv } from './core/per-bot-env.js';
+import { shouldWarnDroppedReservedEnv } from './core/dropped-env-warn-latch.js';
 import { botEnvLayer } from './core/session-env.js';
 import { normalizeDispatchLaunchPolicy } from './core/dispatch-launch-contract.js';
 import { normalizeEnvPolicy, type EnvPolicy } from './core/env-policy.js';
@@ -118,7 +119,7 @@ import {
   type TraexAutoModelConfig,
 } from './services/traex-auto-model.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
-import { cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
+import { cliConfigDirEnvKey, cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
 import { normalizeStewardConfig, type StewardConfig } from './core/decision-board/model.js';
 import type {
   VcMeetingConsumerAgentConfig,
@@ -3939,6 +3940,24 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
     const envPolicy = normalizeEnvPolicy(entry.envPolicy);
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
+    const droppedReservedEnv = droppedReservedPerBotEnvKeys(entry.env);
+    // Once per (bot, dropped-key set) per process: this parser runs on every turn
+    // via the uncached loadBotConfigs() lookups, and the config cannot change
+    // between reloads — see core/dropped-env-warn-latch.ts for the reset rules.
+    if (droppedReservedEnv.length > 0 && shouldWarnDroppedReservedEnv(entry.larkAppId, droppedReservedEnv)) {
+      // The hint names the field that ACTUALLY carries this CLI's profile dir.
+      // cliConfigDir only applies to clis for which cliConfigDirEnvKey() is set
+      // (claude-code → CLAUDE_CONFIG_DIR); a codex bot's CODEX_HOME has no
+      // cliConfigDir mapping, so pointing there would be a second silent failure.
+      const configDirKey = cliConfigDirEnvKey(entryCliId);
+      const cliHomeKeys = configDirKey && droppedReservedEnv.includes(configDirKey) ? [configDirKey] : [];
+      const cliHomeHint = cliHomeKeys.length > 0
+        ? `；要为该 bot 单独指定 CLI 配置目录，请改用顶层 cliConfigDir 字段（不要在 env 里写 ${cliHomeKeys.join(' / ')}）`
+        : '';
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] env 中的保留变量由 botmux 托管，已忽略且不会生效: ${droppedReservedEnv.join(' ')}${cliHomeHint}`,
+      );
+    }
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
     const envUnsetList = botEnvLayer({ env: entry.env, envUnset: entry.envUnset }).unset;
     const envUnset = envUnsetList.length > 0 ? envUnsetList : undefined;

@@ -32,6 +32,7 @@ function harness(interruptKey?: 'esc', backendType: 'pty' | 'tmux' = 'pty') {
     ? { sendSpecialKeys: (key: string) => { specialKeys.push(key); return true; } }
     : { write: (data: string) => { written.push(data); return true; } };
   const state: Record<string, any> = {
+    lastInitConfig: null,
     cliAdapter: interruptKey ? { id: 'zcode', interruptKey } : { id: 'codex' },
     backend,
     effectiveBackendType: backendType,

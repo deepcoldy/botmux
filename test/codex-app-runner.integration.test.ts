@@ -20,7 +20,7 @@ import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
-import { deliverCodexAsyncAnswer } from '../src/services/codex-async-user-input.js';
+import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from '../src/services/codex-async-user-input.js';
 import type { PendingAsk } from '../src/core/ask-types.js';
 import {
   CodexAppControlFinalAssembler,
@@ -673,7 +673,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     expect(result.final.content).toContain('Selected model is at capacity');
     expect(result.finals).toHaveLength(1);
   });
-  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap'] as const)(
+  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap', 'live-steer'] as const)(
     'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
       resetAskBroker();
       setCanTalkChecker(() => true);
@@ -686,6 +686,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       setCardDispatcher({ send: async ask => { cards.push(ask); return { messageId: 'om_async_card' }; } });
       const posts: any[] = [];
       const deliveries: string[] = [];
+      const answerTurnId = outcome === 'live-steer' ? 'codex-async-answer-live' : 'async-answer-turn';
       let responseClosed = false;
       let routeError: unknown;
       let harness!: Harness;
@@ -707,8 +708,11 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
               isCurrent: () => harness.child.exitCode === null,
               deliver: async text => {
                 deliveries.push(text);
+                const target = codexAsyncAnswerSteerTarget(input.asyncUserInput!, {
+                  answerer: 'ou_owner', originalAnswerer: 'ou_owner', human: true, managedLark: true, cleanInputAccepted: true,
+                });
                 harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(text,
-                  { text, clientUserMessageId: 'async-answer-turn' }, 'async-answer-turn')}\r`);
+                  { text, clientUserMessageId: answerTurnId, ...(target ? { steerTargetTurnId: target } : {}) }, answerTurnId, !!target)}\r`);
                 return true;
               },
             });
@@ -728,7 +732,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       });
       try {
         await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
-        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask and continue', undefined, 'om_async_input')}\r`);
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask and continue', outcome === 'live-steer' ? { text: 'Ask and continue', clientUserMessageId: 'om_async_input' } : undefined, 'om_async_input', outcome === 'live-steer')}\r`);
         if (outcome === 'limit') {
           await waitFor(harness, () => posts.some(p => p.asyncFailure === 'limit') && control.finals.length > 0);
           expect(cards).toHaveLength(32);
@@ -760,8 +764,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
           } else {
             // The model finishes independent work BEFORE the user answers;
             // the question remains live and did not leak into the final.
-            await waitFor(harness, () => control.finals.length > 0);
-            if (outcome === 'overlap') {
+            if (outcome === 'live-steer') {
+              expect(control.finals).toHaveLength(0);
+              expect(posts[0].asyncUserInput.nativeTurnId).toBe('turn-fake-1');
+            } else await waitFor(harness, () => control.finals.length > 0);
+            if (outcome === 'live-steer') {
+              // The fixture cannot finish until the answer enters turn/steer.
+            } else if (outcome === 'overlap') {
               expect(control.finals[0].content).toBe('Example: Which environment?\nPPE (Recommended) / Production END EXAMPLE\nIndependent work completed');
               // The final came over the control socket; stdout has its own pipe.
               await waitFor(harness, () => harness.stdout.includes('END EXAMPLE'));
@@ -781,6 +790,17 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             await waitFor(harness, () => control.finals.length >= 2);
             expect(deliveries).toHaveLength(1); expect(posts.filter(p => !p.asyncFailure)).toHaveLength(1);
             const starts = readRequests(logPath).filter(r => r.method === 'turn/start');
+            if (outcome === 'live-steer') {
+              expect(starts).toHaveLength(1);
+              const steer = readRequests(logPath).filter(r => r.method === 'turn/steer');
+              expect(steer).toHaveLength(1);
+              expect(steer[0].params.expectedTurnId).toBe('turn-fake-1');
+              expect(steer[0].params.input[0].text).toContain('call_async_question');
+              expect(steer[0].params.steerTargetTurnId).toBeUndefined();
+              expect(control.finals[0].disposition).toBe('steer_superseded');
+              expect(control.finals[1].content).toBe('Answer incorporated before task finished');
+              expect(control.finals[1].replyTurnId).toBe(answerTurnId);
+            } else {
             expect(starts).toHaveLength(2);
             expect(starts[1].params.threadId).toBe(starts[0].params.threadId);
             expect(starts[1].params.clientUserMessageId).toBe('async-answer-turn');
@@ -789,6 +809,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             expect(reply).toContain('call_async_question');
             expect(reply).toContain(outcome === 'selected' ? 'Production' : 'Use PPE and Elia');
             expect(control.finals[1].replyTurnId ?? control.finals[1].turnId).toBe('async-answer-turn');
+            }
           }
         }
         expect(routeError).toBeUndefined();
@@ -1325,7 +1346,11 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('does NOT steer a non-steerable input into an autonomous Goal; it waits and starts its own turn after the Goal completes (B3 gate)', async () => {
+  it.each([
+    { label: 'ordinary serial', id: 'om_b3_serial', steerable: false, target: undefined },
+    { label: 'late async answer', id: 'codex-async-answer-late', steerable: true, target: 'turn-fake-1' },
+    { label: 'async answer without metadata', id: 'codex-async-answer-missing', steerable: true, target: undefined },
+  ])('does NOT steer an unrelated input into an autonomous Goal: $label (B3 gate)', async entry => {
     // B3: only a daemon-authorized (codexAppSteerable) input may steer into an
     // active autonomous Goal continuation. A missing/false-flag input (a special
     // sink — HTTP wait / doc-comment / receiver — or any non-plain-interactive
@@ -1352,8 +1377,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
 
       // A NON-steerable follow-up arrives while the Goal is native-busy (no flag).
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('serial follow', {
-        text: 'serial follow', clientUserMessageId: 'om_b3_serial',
-      })}\r`);
+        text: 'serial follow', clientUserMessageId: entry.id,
+        ...(entry.target ? { steerTargetTurnId: entry.target } : {}),
+      }, entry.id, entry.steerable)}\r`);
 
       // /queue admissions omit the same positive flag. Two inputs must keep
       // their own turns and FIFO order, rather than merge into the active Goal.
@@ -1372,13 +1398,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       const starts = requests.filter(r => r.method === 'turn/start');
       expect(starts).toHaveLength(3);
       expect(starts[1].params).toMatchObject({
-        clientUserMessageId: 'om_b3_serial',
+        clientUserMessageId: entry.id,
         input: [{ type: 'text', text: 'serial follow', text_elements: [] }],
       });
       expect(starts[2].params.clientUserMessageId).toBe('om_b3_serial_2');
       expect(control.finals[2]).toMatchObject({ turnId: 'om_b3_serial_2' });
       // The follow-up's final is its own answer, not the Goal's autonomous text.
-      expect(control.finals[1]).toMatchObject({ turnId: 'om_b3_serial' });
+      expect(control.finals[1]).toMatchObject({ turnId: entry.id });
       expect(control.finals[1].content).not.toContain('autonomous goal text before Lark input');
     } finally {
       await stopChild(harness.child);

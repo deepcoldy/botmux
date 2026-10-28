@@ -3,6 +3,7 @@ import {
   findDisallowedCardCallback,
   type InteractiveCardCallbackPolicy,
 } from '../../card-callback-policy.js';
+import type { PluginHostPrivileges } from '../commands/protocol.js';
 
 export const PLUGIN_CARD_ACTION_SCHEMA_VERSION = 1 as const;
 export const PLUGIN_CARD_ACTION_REQUEST_MAX_BYTES = 256 * 1024;
@@ -29,6 +30,9 @@ export interface PluginCardActionRequest {
     option: unknown;
     formValue: Record<string, unknown>;
   };
+  /** Host-computed authority of `operator` in the callback's chat. Optional for
+   * schema v1 compatibility; absent identity yields all-false (fail closed). */
+  privileges?: PluginHostPrivileges;
 }
 
 export interface PluginCardActionToast {
@@ -66,6 +70,7 @@ export const buildPluginCardActionRequest = (
   data: CardActionData,
   larkAppId: string,
   actionName: string,
+  privileges?: PluginHostPrivileges,
 ): PluginCardActionRequest => {
   const operator = { ...(data.operator ?? {}) };
   const context = { ...(data.context ?? {}) };
@@ -87,6 +92,7 @@ export const buildPluginCardActionRequest = (
       option: data.action?.option ?? null,
       formValue: data.action?.form_value ?? {},
     },
+    ...(privileges ? { privileges: { ...privileges } } : {}),
   };
 };
 
