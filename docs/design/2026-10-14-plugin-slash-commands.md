@@ -83,7 +83,8 @@ if (pluginId !== undefined) return { kind: 'plugin', cmd, content, pluginId };
 2. **不扣额度、不建会话**：与 `skipCharge` 的控制类消息一致；不调用 `enforceMessageQuotaForCliInput` 的扣费段，也不触发 `prompt.submit` 闸（不进 CLI）。
 3. **冲突**（`pluginId === null`）：回固定文案，结束。
 4. **转发**：三道准入闸通过后、调用插件前标记消息已接纳，再 POST 到插件服务（§5）。超时或失败回固定文案「插件暂不可用」，不回退成普通消息、不转给 CLI；回帖失败时不得提示用户重发，以免新 eventId 触发重复副作用。
-5. **回复**：把插件返回的 `reply` 发到当前锚点（`sessionReply(anchor, …)`）；新话题入口在话题群里即形成一个新话题，普通群里为普通回复。
+5. **primary 模式**：插件指令不建持久会话，因此直接忽略，不执行插件、不回复也不标记准入。
+6. **回复**：把插件返回的 `reply` 发到当前锚点（`sessionReply(anchor, …)`）；新话题入口在话题群里即形成一个新话题，普通群里为普通回复。
 
 ## 5. HTTP 协议 v1（插件指令）
 
