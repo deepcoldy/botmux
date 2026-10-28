@@ -95,6 +95,7 @@ interface DashboardSettings {
     createEnabled: boolean;
     selfManageEnabled: boolean;
     grants: ScheduleBotGrant[];
+    ignoredCount: number;
     botOptions: ScheduleBotGrantBotOption[];
   };
   vcMeetingAgent: {
@@ -264,6 +265,9 @@ function parseSettings(s: any): DashboardSettings {
       createEnabled: s?.scheduleBotGrants?.createEnabled === true,
       selfManageEnabled: s?.scheduleBotGrants?.selfManageEnabled === true,
       grants: Array.isArray(s?.scheduleBotGrants?.grants) ? s.scheduleBotGrants.grants : [],
+      ignoredCount: Number.isSafeInteger(s?.scheduleBotGrants?.ignoredCount)
+        ? Math.max(0, s.scheduleBotGrants.ignoredCount)
+        : 0,
       botOptions: Array.isArray(s?.scheduleBotGrants?.botOptions) ? s.scheduleBotGrants.botOptions : [],
     },
     vcMeetingAgent: {
@@ -1077,6 +1081,7 @@ export function SettingsBody(props: {
           />
           <ScheduleBotGrantsEditor
             grants={settings.scheduleBotGrants.grants}
+            ignoredCount={settings.scheduleBotGrants.ignoredCount}
             botOptions={settings.scheduleBotGrants.botOptions}
             createEnabled={settings.scheduleBotGrants.createEnabled}
             disabled={dis || savingKey === 'scheduleBotGrants'}

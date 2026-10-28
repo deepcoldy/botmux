@@ -86,6 +86,13 @@ describe('ScheduleBotGrantsEditor', () => {
     expect(onSave).toHaveBeenCalledWith([{ ...team, id: 'other', chatIds: ['oc_other'] }]);
   });
 
+  it('warns that hand-edited grants it cannot show would be dropped by a save', () => {
+    const { renderer } = render({ grants: [team], ignoredCount: 2 });
+    expect(renderer.root.findAll(node => node.props['data-bot-grants-ignored'] === 2).length).toBeGreaterThan(0);
+    expect(render({ grants: [team] }).renderer.root.findAll(node => node.props['data-bot-grants-ignored'] !== undefined))
+      .toEqual([]);
+  });
+
   it('says grants have no effect while delegated creation is off', () => {
     const off = render({ grants: [team], createEnabled: false });
     expect(off.renderer.root.findAll(node => node.props['data-bot-grants-inactive']).length).toBeGreaterThan(0);

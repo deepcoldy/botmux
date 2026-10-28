@@ -18,6 +18,7 @@ import {
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
   writeScheduleBotGrantConfig,
+  ignoredScheduleBotGrantCount,
 } from '../src/global-config.js';
 import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
 
@@ -552,6 +553,8 @@ describe('global dashboard config', () => {
     ] } }));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().scheduleDelegation?.botGrants).toEqual([{ ...grant, targetAppIds: ['cli_target'] }]);
+    // The Dashboard is told how many hand-edited entries it cannot show.
+    expect(ignoredScheduleBotGrantCount()).toBe(3);
   });
   it('writes the Dashboard bot-grant entry without storing defaults or touching other delegation keys', () => {
     const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],

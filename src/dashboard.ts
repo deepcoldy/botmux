@@ -184,7 +184,7 @@ import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { applyGlobalSessionEnvOps, globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { applyGlobalSessionEnvOps, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -1183,6 +1183,8 @@ interface ResolvedDashboardSettings {
     createEnabled: boolean;
     selfManageEnabled: boolean;
     grants: ScheduleBotGrant[];
+    /** Hand-edited entries the reader dropped; a save would not keep them. */
+    ignoredCount: number;
     botOptions: Array<{ larkAppId: string; botName: string | null }>;
   };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
@@ -1823,6 +1825,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       createEnabled: global.scheduleDelegation?.createEnabled === true, // default OFF
       selfManageEnabled: global.scheduleDelegation?.selfManageEnabled === true, // default OFF
       grants: global.scheduleDelegation?.botGrants ?? [],
+      ignoredCount: ignoredScheduleBotGrantCount(),
       botOptions: scheduleBotGrantBotOptions(),
     },
     vcMeetingAgent: {

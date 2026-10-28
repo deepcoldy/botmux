@@ -1241,6 +1241,17 @@ export function writeHostOverloadAlertConfig(config: HostOverloadAlertGlobalConf
   return readGlobalConfig().hostOverloadAlert ?? {};
 }
 
+/** Hand-edited grants the reader drops (bad shape or a repeated id). The
+ *  Dashboard shows the count: saving its list writes back only valid grants. */
+export function ignoredScheduleBotGrantCount(): number {
+  const raw = readRawConfig().scheduleDelegation;
+  const list = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).botGrants
+    : undefined;
+  if (!Array.isArray(list)) return 0;
+  return list.length - (readGlobalConfig().scheduleDelegation?.botGrants?.length ?? 0);
+}
+
 /** Dashboard write for the bot-grant entry (`createEnabled`, `selfManageEnabled`,
  *  `botGrants`). A value equal to its default (off / empty) removes the key
  *  instead of being stored, an emptied block is dropped, and every other

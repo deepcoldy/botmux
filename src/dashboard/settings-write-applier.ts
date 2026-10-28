@@ -110,6 +110,7 @@ export interface ResolvedDashboardSettingsView {
     createEnabled: boolean;
     selfManageEnabled: boolean;
     grants: ScheduleBotGrant[];
+    ignoredCount?: number;
     botOptions?: Array<{ larkAppId: string; botName: string | null }>;
   };
   vcMeetingAgent: {

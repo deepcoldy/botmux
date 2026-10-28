@@ -69,6 +69,8 @@ export function scheduleBotGrantDraftProblem(
  */
 export function ScheduleBotGrantsEditor(props: {
   grants: ScheduleBotGrant[];
+  /** Hand-edited entries the server could not load; saving the list drops them. */
+  ignoredCount?: number;
   botOptions: ScheduleBotGrantBotOption[];
   createEnabled: boolean;
   disabled: boolean;
@@ -119,6 +121,11 @@ export function ScheduleBotGrantsEditor(props: {
       {props.grants.length > 0 && !props.createEnabled ? (
         <p className="hint-warn-inline" data-bot-grants-inactive>
           {tr('settings.scheduleBotGrantsInactive')}
+        </p>
+      ) : null}
+      {props.ignoredCount ? (
+        <p className="hint-warn-inline" data-bot-grants-ignored={props.ignoredCount}>
+          {tr('settings.scheduleBotGrantsIgnored', { n: props.ignoredCount })}
         </p>
       ) : null}
       {props.grants.length === 0 ? (
