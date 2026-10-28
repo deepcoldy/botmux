@@ -2378,11 +2378,20 @@ export function rememberLastCliInput(
     botCfg.codexAppCleanInput === true &&
     !ds.adoptedFrom
   );
-  if (keepCodexAppInput && normalized.codexAppInput) ds.lastCodexAppInput = normalized.codexAppInput;
+  // steerTargetTurnId is a one-shot host routing constraint for a correlated
+  // async answer: it may match only the still-running native turn that asked
+  // the question. Strip it before the sidecar is persisted, so a later
+  // retry_last_task / failed-turn replay cannot carry a stale target (replay
+  // has no steer grant anyway, but keeping it out of the stored shape makes
+  // that boundary explicit). The in-flight payload object is left untouched.
+  const replayCodexAppInput = keepCodexAppInput && normalized.codexAppInput
+    ? (({ steerTargetTurnId: _steerTargetTurnId, ...input }) => input)(normalized.codexAppInput)
+    : undefined;
+  if (replayCodexAppInput) ds.lastCodexAppInput = replayCodexAppInput;
   else delete ds.lastCodexAppInput;
   ds.session.lastUserPrompt = userPrompt;
   ds.session.lastCliInput = normalized.content;
-  if (keepCodexAppInput && normalized.codexAppInput) ds.session.lastCodexAppInput = normalized.codexAppInput;
+  if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
   ds.session.currentReplyTarget = ds.currentReplyTarget;
