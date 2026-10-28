@@ -1058,6 +1058,59 @@ describe('VC meeting daemon session lifecycle', () => {
       expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
       expect(groupCreateCalls).toHaveLength(1);
     });
+    it('does not let an inviter invalidated during the first sync wait abort a later valid inviter', async () => {
+      vi.useFakeTimers();
+      const bot = configure(true);
+      groupCreateHolds.count = 1;
+      const first = invite();
+      for (let n = 0; n < 100 && !groupCreateHolds.resolvers.length; n++) await Promise.resolve();
+      // The first inviter is blocked while group creation is in flight; the
+      // pending array for the next invitation's sync then contains both grants.
+      bot.resolvedBlockedUsers = [inviter];
+      groupCreateHolds.resolvers.shift()!();
+      await first;
+      expect(inviterAdds).toEqual([]);
+      await invite('ou_inviterC');
+      expect(inviterAdds).toEqual(['ou_inviterC']);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [
+        { openId: inviter, memberReady: false },
+        { openId: 'ou_inviterC', memberReady: true },
+      ] });
+      expect((await selectConsumerAgentViaCard('Claude Loopy', 'ou_inviterC')).toast?.type).not.toBe('error');
+    });
+    it('logs invitation diagnostics as status/shape enums without id values, names or payload', async () => {
+      configure(true);
+      const lines: string[] = [];
+      const spy = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
+        if (typeof chunk === 'string' && chunk.includes('invitation identity')) lines.push(chunk);
+        return true;
+      }) as never);
+      try {
+        await __vcMeetingAgentTest.handlePush(parseVcMeetingPushEvent({
+          larkAppId: APP_ID, kind: 'meeting_invited', eventType: VC_BOT_MEETING_INVITED_EVENT,
+          data: {
+            event_id: 'evt_log_probe',
+            meeting: { id: actualMeetingId, meeting_no: meetingNo, topic: 'diagnostic log probe' },
+            inviter: {
+              id: { open_id: 'ou_logprobe', union_id: 'on_logprobe', user_id: 'internal_logprobe' },
+              user_type: 1, user_name: 'Secret Logprobe Name',
+            },
+            invite_time: String(Date.now()),
+          },
+        }));
+      } finally {
+        spy.mockRestore();
+      }
+      const line = lines.join('\n');
+      expect(line).toContain('eventId=evt_log_probe');
+      expect(line).toContain('status=resolved');
+      expect(line).toContain('idShape=object');
+      expect(line).toContain('inviteTime=valid');
+      expect(line).not.toContain('ou_logprobe');
+      expect(line).not.toContain('on_logprobe');
+      expect(line).not.toContain('internal_logprobe');
+      expect(line).not.toContain('Secret Logprobe Name');
+    });
     it('keeps default/off behavior; no invitee membership write or management grant', async () => {
       configure();
       await invite();
