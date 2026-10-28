@@ -43,7 +43,7 @@ export function parseShardLogs(logs) {
       const file = FILE_LINE.exec(line);
       if (file) {
         const value = seconds(file[2], file[3]);
-        // A shard retried by run-unit-shard.mjs prints a file twice; keep the slower.
+        // Should a file appear twice in the logs, keep the slower reading.
         files[file[1]] = Math.max(files[file[1]] ?? 0, value);
         continue;
       }

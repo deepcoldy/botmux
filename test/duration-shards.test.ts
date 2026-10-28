@@ -173,7 +173,7 @@ describe('refreshing the timings table from CI logs', () => {
     '2026-10-27T21:06:47.7Z    Duration  9.89s (transform 1.00s, setup 500ms, import 1.50s, tests 4.61s, environment 78ms)',
   ].join('\n');
 
-  it('takes each file’s duration (the slower one if a retry printed it twice) and the per-file start-up cost', () => {
+  it('takes each file’s duration (the slower one if it appears twice) and the per-file start-up cost', () => {
     expect(parseShardLogs([log])).toEqual({
       files: { 'test/a.test.ts': 1.234, 'test/b.test.ts': 2.5, 'test/tiny.test.ts': 0.002 },
       perFileOverhead: 1,
