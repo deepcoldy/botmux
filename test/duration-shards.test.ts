@@ -130,6 +130,12 @@ describe('duration-balanced unit shards', () => {
     expect(plan[0]!.load).toBe(10 + 2 + 1 + 2 + 4 * 0.5);
   });
 
+  it('plans a path listed twice once', () => {
+    const t = { files: { 'test/a.test.ts': 5, 'test/b.test.ts': 5 } };
+    const plan = planShards(['test/a.test.ts', 'test/b.test.ts', 'test/a.test.ts'], t, 2);
+    expect(plan.map(shard => shard.files)).toEqual([['test/a.test.ts'], ['test/b.test.ts']]);
+  });
+
   it('keeps a file listed by two projects in one shard', () => {
     const specs = [spec('test/a.test.ts', 'unit'), spec('test/a.test.ts', 'e2e'), spec('test/b.test.ts'), spec('test/c.test.ts')];
     const t = { files: { 'test/a.test.ts': 5, 'test/b.test.ts': 5, 'test/c.test.ts': 5 } };
@@ -152,12 +158,16 @@ describe('refreshing the timings table from CI logs', () => {
     '2026-10-27T20:56:01.1Z  \x1b[32m✓\x1b[39m \x1b[30;46m unit \x1b[49;39m test/a.test.ts \x1b[2m(3 tests)\x1b[22m\x1b[33m 1234\x1b[2mms\x1b[22m\x1b[39m',
     '2026-10-27T20:56:02.1Z  ❯ unit  test/b.test.ts (5 tests | 1 failed | 1 skipped) 2.5s',
     '2026-10-27T20:56:03.1Z  ✓ unit  test/a.test.ts (3 tests) 900ms',
+    '2026-10-27T20:56:04.1Z  ✓ unit  test/tiny.test.ts (1 test) 2ms',
     '2026-10-27T21:06:47.7Z  Test Files  1 failed | 2 passed (3)',
     '2026-10-27T21:06:47.7Z    Duration  9.89s (transform 1.00s, setup 500ms, import 1.50s, tests 4.61s, environment 78ms)',
   ].join('\n');
 
   it('takes each file’s duration (the slower one if a retry printed it twice) and the per-file start-up cost', () => {
-    expect(parseShardLogs([log])).toEqual({ files: { 'test/a.test.ts': 1.234, 'test/b.test.ts': 2.5 }, perFileOverhead: 1 });
+    expect(parseShardLogs([log])).toEqual({
+      files: { 'test/a.test.ts': 1.234, 'test/b.test.ts': 2.5, 'test/tiny.test.ts': 0.002 },
+      perFileOverhead: 1,
+    });
   });
 
   it('overwrites measured files, keeps unmeasured ones, drops deleted ones', () => {
@@ -169,7 +179,9 @@ describe('refreshing the timings table from CI logs', () => {
     expect(next).toEqual({
       source: 'run 1',
       perFileOverhead: 1,
-      files: { 'test/a.test.ts': 1.23, 'test/b.test.ts': 2.5, 'test/kept.test.ts': 7 },
+      // A millisecond file is recorded as the smallest positive value, not 0
+      // (which the planner would read as unrecorded).
+      files: { 'test/a.test.ts': 1.23, 'test/b.test.ts': 2.5, 'test/kept.test.ts': 7, 'test/tiny.test.ts': 0.01 },
     });
   });
 });
