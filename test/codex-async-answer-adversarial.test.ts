@@ -270,6 +270,11 @@ describe('correlated async answer adversarial production probes', () => {
         senderType: 'user', requestLarkAppId: 'app', requestUserOpenId: 'ou_owner',
       });
       const pending = delivery(scope)('answer', 'ou_owner');
+      // Drain microtasks first: the extracted delivery closure registers its
+      // 20ms abort timer only after one/two internal awaits. Bun's fake-timer
+      // shim advances time BEFORE flushing microtasks, so advancing without
+      // this drain races the timer registration under `bun test` only.
+      await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(20);
       expect(res.destroyed).toBe(true);
       expect(await pending).toBe(false);
