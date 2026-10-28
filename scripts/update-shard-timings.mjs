@@ -63,9 +63,12 @@ export function parseShardLogs(logs) {
   return { files, perFileOverhead: overheadFiles ? overheadSeconds / overheadFiles : undefined };
 }
 
-// Hundredths of a second, but never 0: the planner reads 0 as "unrecorded"
-// and would weigh a measured millisecond file at the median instead.
-const round = value => Math.max(0.01, Math.round(value * 100) / 100);
+const roundHundredths = value => Math.round(value * 100) / 100;
+// A file's duration is never recorded as 0: the planner reads 0 as
+// "unrecorded" and would weigh a measured millisecond file at the median.
+// The per-file overhead is not clamped — 0 is a valid measurement there, and
+// 0.01 would add ~5s to every shard's planned load.
+const roundFileSeconds = value => Math.max(0.01, roundHundredths(value));
 
 /** New table: measured files overwrite, unmeasured keep their old value,
  *  entries for deleted test files go. Keys sorted so diffs stay reviewable. */
@@ -73,11 +76,11 @@ export function mergeShardTimings(previous, measured, { source, exists }) {
   const merged = { ...(previous?.files ?? {}), ...measured.files };
   const files = {};
   for (const file of Object.keys(merged).sort()) {
-    if (exists(file)) files[file] = round(merged[file]);
+    if (exists(file)) files[file] = roundFileSeconds(merged[file]);
   }
   return {
     source,
-    perFileOverhead: Math.round((measured.perFileOverhead ?? previous?.perFileOverhead ?? 0) * 100) / 100,
+    perFileOverhead: roundHundredths(measured.perFileOverhead ?? previous?.perFileOverhead ?? 0),
     files,
   };
 }

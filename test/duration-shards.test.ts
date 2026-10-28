@@ -194,4 +194,10 @@ describe('refreshing the timings table from CI logs', () => {
       files: { 'test/a.test.ts': 1.23, 'test/b.test.ts': 2.5, 'test/kept.test.ts': 7, 'test/tiny.test.ts': 0.01 },
     });
   });
+
+  it('records a near-zero per-file overhead as 0, not as the file floor', () => {
+    // Unlike a file's duration, an overhead of 0 is a real measurement.
+    const next = mergeShardTimings(undefined, { files: {}, perFileOverhead: 0.004 }, { source: 'run 2', exists: () => true });
+    expect(next.perFileOverhead).toBe(0);
+  });
 });
