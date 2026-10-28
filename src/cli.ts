@@ -7581,7 +7581,8 @@ ${SEND_HELP_BODY}
   quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
-  ask buttons --questions-file <file>   多题卡片，支持 defaultSelectedKeys 预选；底部提交，返回 JSON
+  ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
+  ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
@@ -16254,9 +16255,13 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
     if (!process.env.BOTMUX_SEND_RELAY) {
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
     }
+    // Versioned admission prevents an old daemon silently dropping the
+    // respondent restriction on a choice-only request. Never downgrade it.
+    const endpoint = body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
+      ? '/api/asks/form-v1' : '/api/asks';
     res = hostSecret
-      ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
-      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
+      ? await fetchDaemonIpc(daemon.ipcPort, endpoint, init, hostSecret)
+      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${endpoint}`, init);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -16325,6 +16330,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 
   const hasQuestionsFile = rest.some(arg => arg === '--questions-file' || arg.startsWith('--questions-file='));
   const questionsFile = argValue(rest, '--questions-file');
+  const answererOpenId = argValue(rest, '--answerer');
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
   const useJson = rest.includes('--json') || questionsFile !== undefined;
@@ -16335,6 +16341,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   let questions;
   let timeoutMs;
   try {
+    if (rest.some(a => a === '--answerer' || a.startsWith('--answerer='))
+      && (!answererOpenId || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(answererOpenId))) {
+      throw new AskArgsError('questions_invalid', '--answerer 需要当前应用下已核验的 ou_ 用户标识');
+    }
     if (hasQuestionsFile && (!questionsFile || rest.some(arg => arg === '--options' || arg.startsWith('--options=')) || multiSelect || positionalArgs.length)) {
       throw new AskArgsError('questions_invalid', '--questions-file 需要文件路径，且不能与 --options、--multi 或位置参数混用');
     }
@@ -16385,6 +16395,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     timeoutMs,
     // Stable invocation identity: reconnect without posting a second card.
     originKind: 'explicit',
+    ...(answererOpenId ? { answererOpenId } : {}),
     requestId: randomUUID(),
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
@@ -16427,6 +16438,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       // key，令 `selected` 的含义随选中数量漂移（违反公开契约）。
       selected: multiSelect || questions?.some(q => q.multiSelect) ? null : selected,
       answers: result.kind === 'answered' ? (result.answers as string[][]) : null,
+      ...(questions?.some(q => q.input) ? { inputs: result.kind === 'answered' ? [...result.inputs ?? questions.map(() => null)] : null } : {}),
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,
       timedOut: result.kind === 'timedOut',

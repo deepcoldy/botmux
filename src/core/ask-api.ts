@@ -30,6 +30,8 @@ export interface AskApiBody {
   originKind?: string;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
+  /** Optional narrowing only; never grants talk/approval authority. */
+  answererOpenId?: string;
   asyncFailure?: 'limit' | 'invalid_questions';
 }
 
@@ -49,6 +51,8 @@ export type AskApiBodyError =
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
+  | 'bad_input'
+  | 'bad_answererOpenId'
   | 'bad_inputMode'
   | 'bad_multiSelect'
   | 'bad_defaultSelectedKeys'
@@ -143,7 +147,12 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     return { error: 'bad_options' };
   }
 
+  if (r.answererOpenId !== undefined && (originKind !== 'explicit' || typeof r.answererOpenId !== 'string'
+    || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(r.answererOpenId))) return { error: 'bad_answererOpenId' };
+  // Native hooks keep their existing text-reply contract; only explicit CLI form asks opt in.
+  if (questions.some(q => q.input) && originKind !== 'explicit') return { error: 'bad_input' };
   const parsed: AskApiBody = {
+    ...(r.answererOpenId !== undefined ? { answererOpenId: r.answererOpenId as string } : {}),
     sessionId: r.sessionId,
     chatId: r.chatId,
     larkAppId: r.larkAppId,
