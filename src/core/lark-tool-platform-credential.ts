@@ -56,6 +56,10 @@ export interface ResolveBoundLarkUserCredentialInput {
   turnId?: string;
   /** Delegated (cross-bot dispatch) target rather than the turn's own sender. */
   delegated: boolean;
+  /** For a delegated target: the union_id from the verified dispatch record.
+   *  The platform is asked with it directly instead of looking {@link openId}
+   *  up again, which needs a contact API that may be unreachable. */
+  unionId?: string;
   /** The grant to the bot's own application for the given person, if any.
    *  Called with {@link openId} so the check and the credential cannot drift
    *  to different people. */
@@ -74,7 +78,7 @@ export async function resolveBoundLarkUserCredential(
   const platform = await resolvePlatformIdentity({
     botConfig: input.bot,
     tool: 'lark-cli',
-    openId: input.openId,
+    ...(input.unionId !== undefined ? { unionId: input.unionId } : { openId: input.openId }),
     sessionId: input.sessionId,
     ...(input.turnId ? { turnId: input.turnId } : {}),
   });

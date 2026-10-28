@@ -1300,7 +1300,12 @@ async function triggerSessionTurnAdmitted(
       return {
         ok: false,
         triggerId,
-        errorCode: 'trigger_failed',
+        // Pre-delivery rejection: the session exists but cannot accept input
+        // yet (directory choice, first start, worktree setup, queue). A
+        // distinct code keeps this apart from the catch-all `trigger_failed`,
+        // which can also surface POST-delivery bookkeeping faults — callers
+        // use this code to prove input never reached a worker.
+        errorCode: 'session_not_runnable',
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
@@ -1724,6 +1729,7 @@ async function triggerSessionTurnAdmitted(
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
   if (hasReasoningControl && effectiveReasoningEffort
+      && bot.config.cliId !== 'traex'
       && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
     return {
       ok: false,

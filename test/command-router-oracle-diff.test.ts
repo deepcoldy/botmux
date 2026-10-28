@@ -24,7 +24,7 @@ import {
 /** 设计 §10 的字母表：命令 / 子命令 / 透传 / 冷启动 / 未注册 / 多行豁免 / 占位符 / 中文 / latin / 引号 / 大小写。 */
 const ALPHABET = [
   '/cd', '/repo', 'wt', '/rename', '/sessions', '/card', '/cot', '/term', '/vc-auth',
-  '/context-sharing', '/effort', '/queue', '/resume',
+  '/context-sharing', '/effort', '/queue', '/resume', '/dash',
   '/compact', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
   '<pane>', '中文', 'latin', '"x y"', '/T',
 ];
@@ -109,6 +109,16 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
     && legacy.kind === 'forward' && legacy.reason === 'unknown_slash'
     && next.kind === 'daemon' && next.cmd === '/context-sharing'
     && next.sessionPolicy === 'sessionless',
+  // /dash（=/dashboard link）是新增的内置 sessionless daemon 命令，群里免 @ 寻址；
+  // 冻结 oracle 没有该命令，视为 unknown slash 转发。单行（含参数，如 `/dash /cd`）
+  // 归此条；多段（第二行非空）两侧解析器都判 discussion，不产生差分。用 content
+  // 精确等于归一化输入来约束，避免吸收其它命令的差分。
+  (input, legacy, next) =>
+    input.text.trim().toLowerCase().split(/\s+/)[0] === '/dash'
+    && legacy.kind === 'forward' && legacy.reason === 'unknown_slash'
+    && next.kind === 'daemon' && next.cmd === '/dash'
+    && next.content === input.text.trim()
+    && next.sessionPolicy === 'sessionless',
   // /resume 只在无会话时由 botmux 认领（恢复已关闭会话）；有会话时仍按未知命令转发给 CLI。
   (input, legacy, next) =>
     input.phase === 'none'
@@ -130,6 +140,12 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
     && legacy.kind === 'forward' && legacy.reason === 'discussion'
     && (next.kind === 'cascade' || next.kind === 'cascade_unsupported')
     && next.items.length >= 2 && next.items[0]!.kind === 'passthrough',
+  // 2026-10-14 插件斜杠指令（docs/design/2026-10-14-plugin-slash-commands.md）：当前 bot 有效插件
+  // 声明的指令，从 unknown_slash 转发改为 plugin 决策；内置/透传/特判命令永不被插件覆盖。
+  (input, legacy, next) =>
+    next.kind === 'plugin'
+    && input.pluginCommands?.has(next.cmd) === true
+    && legacy.kind === 'forward' && legacy.reason === 'unknown_slash',
 ];
 describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
   it('小字母表 × 长度 ≤ 3 × 入口 × 相位 × 透传配置 × 发送方：决策逐字相等', () => {
@@ -170,6 +186,49 @@ describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
     expect(mismatches, mismatches.join('\n')).toEqual([]);
     // 规模写死在断言里：别人缩字母表时会看见。
     expect(evaluated).toBeGreaterThan(2_000_000);
+  }, 120_000);
+
+  it('插件指令：只接管认不出的 /xxx，盖不住内置、透传与 bot 自定义透传', () => {
+    // /cd（内置）、/compact（固定透传）即使被插件声明也必须保持原判定；/foo 在「含自定义透传 /foo」
+    // 配置下按 bot 显式配置走透传，其余配置下归插件。scanner 在安装期已拒绝前两类声明，这里守运行时。
+    const pluginCommands = new Map<string, string | null>([
+      ['/foo', 'demo'], ['/cd', 'evil'], ['/compact', 'evil'], ['/effort', 'evil'],
+    ]);
+    const contexts: Array<{ context: 'new-topic' | 'thread'; phase: SessionPhase }> = [
+      { context: 'new-topic', phase: 'none' },
+      ...SESSION_PHASES.filter(p => p !== 'closed').map(phase => ({ context: 'thread' as const, phase })),
+    ];
+    const mismatches: string[] = [];
+    let pluginDecisions = 0;
+    for (const text of texts()) {
+      for (const { context, phase } of contexts) {
+        const oraclePhase = toOraclePhase(phase);
+        if (oraclePhase === null) continue;
+        for (const cfg of PASSTHROUGH_CONFIGS) {
+          const input: SlashRouteInput = {
+            text, context, phase, cliId: cfg.cliId,
+            passthrough: cfg.passthrough, coldStartPassthrough: cfg.coldStart,
+            senderIsBot: false, acceptSlashFromBots: true, pluginCommands,
+          };
+          const legacy = normalizeLegacy(legacySlashRoute({ ...input, phase: oraclePhase }));
+          const next = normalizeNext(classifySlash(input)) as SlashRouteDecision;
+          if (next.kind === 'plugin') {
+            pluginDecisions += 1;
+            if (next.cmd !== '/foo' || next.pluginId !== 'demo' || cfg.passthrough.has('/foo')) {
+              mismatches.push(`plugin shadowed ${JSON.stringify(text)} @${context}/${phase}/${cfg.name}`);
+            }
+          }
+          if (JSON.stringify(legacy) === JSON.stringify(next)) continue;
+          if (INTENTIONAL.some(rule => rule(input, legacy, next))) continue;
+          if (mismatches.length < 25) {
+            mismatches.push(`${JSON.stringify(text)} @${context}/${phase}/${cfg.name}\n  legacy=${JSON.stringify(legacy)}\n  next  =${JSON.stringify(next)}`);
+          }
+        }
+      }
+      if (mismatches.length >= 25) break;
+    }
+    expect(mismatches, mismatches.join('\n')).toEqual([]);
+    expect(pluginDecisions).toBeGreaterThan(1_000);
   }, 120_000);
 
   it('设计 §4/§13 的长形状作为定向用例（穷举够不到的 6–8 token）', () => {

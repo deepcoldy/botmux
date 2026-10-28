@@ -66,7 +66,36 @@ function makeCfg(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe('meeting inviter configuration', () => {
+  it.each([
+    [{}, undefined, undefined],
+    [{ inviterManagementEnabled: false }, false, undefined],
+    [{ inviterManagementEnabled: true, inviterManagementEnabledAt: 123 }, true, 123],
+    [{ inviterManagementEnabled: 'true', inviterManagementEnabledAt: '123' }, undefined, undefined],
+    [{ inviterManagementEnabled: 1, inviterManagementEnabledAt: -1 }, undefined, undefined],
+  ])('normalizes policy strictly without enabling old configurations: %#', async (vcMeetingAgent, enabled, epoch) => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ vcMeetingAgent })]));
+    expect(config.vcMeetingAgent?.inviterManagementEnabled).toBe(enabled);
+    expect(config.vcMeetingAgent?.inviterManagementEnabledAt).toBe(epoch);
+  });
+});
+
 describe('voice configuration', () => {
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' } }, { volcengine: null }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { mode: 'standard' } }, { volcengine: { mode: 'standard' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides, row %#', async (voice, expected) => {
+    const mod = await freshImport();
+    const configs = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ voice })]));
+    expect(configs[0]?.voice).toEqual(expected);
+  });
+
   it('preserves a MiniMax per-bot override', async () => {
     const mod = await freshImport();
     const [config] = mod.parseBotConfigsFromText(JSON.stringify([
@@ -457,7 +486,18 @@ describe('parseBotConfigsFromText — brand', () => {
     ]))).toThrow(/must exactly match cliRuntime\.executable/);
   });
 
-  it('rejects cliRuntime outside the plain Codex adapter contract', () => {
+  it('loads a named CodeM runtime with the Kimi adapter and exact path shadow', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codem-runtime-app', larkAppSecret: 's', cliId: 'kimi',
+      cliPathOverride: '/opt/bin/codem-wrapper',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper', update: { provider: 'none' } },
+    }]));
+    expect(cfg.cliId).toBe('kimi');
+    expect(cfg.cliRuntime).toMatchObject({ id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' });
+    expect(cfg.cliPathOverride).toBe('/opt/bin/codem-wrapper');
+  });
+
+  it('rejects cliRuntime outside supported adapter contracts', () => {
     const runtime = { id: 'vendor-codex', executable: 'vendor-codex' };
     expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'wrong-adapter-runtime-app',
@@ -653,6 +693,12 @@ describe('parseBotConfigsFromText — brand', () => {
       ]));
       expect(cfg.startupCommands).toBeUndefined();
     }
+  });
+
+  it('preserves explicit false listener-policy overrides for future meetings', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'a', larkAppSecret: 's',
+      vcMeetingAgent: { listenerPolicy: { rawMessages: false, finalSummary: true, allowSummarySharing: false } } }]));
+    expect(cfg.vcMeetingAgent?.listenerPolicy).toEqual({ rawMessages: false, finalSummary: true, allowSummarySharing: false });
   });
 
   it('normalizes vcMeetingAgent.realtimeVoice without enabling it by default', () => {

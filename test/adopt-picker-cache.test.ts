@@ -3,17 +3,19 @@
  * The cache exists so search / page re-renders of the picker card don't
  * re-shell-out to tmux; these pin the store / TTL / clear semantics.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 
 const discovery = vi.hoisted(() => ({
   tmux: vi.fn(() => []),
   zellij: vi.fn(() => []),
   orca: vi.fn(() => []),
+  exclude: vi.fn((sessions: unknown[]) => sessions),
+  enrich: vi.fn(async (sessions: unknown[]) => sessions),
 }));
 
 vi.mock('../src/core/session-discovery.js', () => ({
   discoverAdoptableSessions: discovery.tmux,
-  excludeOwnedHerdrAdoptTargets: (sessions: unknown[]) => sessions,
+  excludeOwnedHerdrAdoptTargets: discovery.exclude,
 }));
 
 vi.mock('../src/core/zellij-adopt-discovery.js', () => ({
@@ -22,6 +24,12 @@ vi.mock('../src/core/zellij-adopt-discovery.js', () => ({
 
 vi.mock('../src/core/orca-adopt-discovery.js', () => ({
   discoverAdoptableOrcaSessions: discovery.orca,
+}));
+
+// The default live-name enrichment shells out to herdr and reads ~/.claude;
+// tests that exercise it inject the real one with fakes (see below).
+vi.mock('../src/services/adopt-live-enrich.js', () => ({
+  enrichAdoptLiveSessions: discovery.enrich,
 }));
 
 import {
@@ -120,5 +128,143 @@ describe('adopt-picker candidates cache', () => {
 
     expect(discovery.tmux).toHaveBeenCalledWith('codex');
     expect(discovery.zellij).toHaveBeenCalledWith('codex');
+  });
+});
+
+describe('collectAdoptCandidates: live-name enrichment', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const herdrRow = (extra: Record<string, unknown> = {}) => ({
+    source: 'herdr', herdrSessionName: 'default', herdrTarget: 'w1:p1', herdrPaneId: 'w1:p1',
+    herdrWorkspaceId: 'w1', herdrTabId: 'w1:t1', cliId: 'claude-code', sessionId: 'sid-herdr',
+    cwd: '/work/demo', paneCols: 200, paneRows: 50, ...extra,
+  });
+
+  function settle<T>(p: Promise<T>) {
+    const state: { done: boolean; value?: T } = { done: false };
+    void p.then((value) => { state.done = true; state.value = value; });
+    return state;
+  }
+  async function flush(): Promise<void> {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  }
+  /** The real enrichment with a herdr that never answers. */
+  async function hungHerdrEnrichment() {
+    const { enrichAdoptLiveSessions } = await vi.importActual<typeof import('../src/services/adopt-live-enrich.js')>(
+      '../src/services/adopt-live-enrich.js',
+    );
+    const signals: AbortSignal[] = [];
+    const enrichLive = (sessions: any[], opts: { deadlineMs?: number }) => enrichAdoptLiveSessions(sessions, {
+      ...opts,
+      runHerdr: (_args, { signal }) => {
+        signals.push(signal);
+        return new Promise<string | undefined>(() => {});
+      },
+    });
+    return { enrichLive, signals };
+  }
+
+  it('enriches the final live list (owned panes already excluded) and passes the deadline through', async () => {
+    const mine = herdrRow({ herdrAgentName: 'demo-agent' });
+    const owned = herdrRow({ herdrPaneId: 'w1:p2', herdrTarget: 'w1:p2', herdrAgentName: 'botmux-owned' });
+    discovery.tmux.mockReturnValueOnce([mine, owned] as any);
+    discovery.exclude.mockImplementationOnce((sessions: any[]) => sessions.filter(s => s.herdrAgentName !== 'botmux-owned'));
+    const named = { ...mine, herdrTabLabel: '整理笔记', herdrTabAutoNamed: false };
+    discovery.enrich.mockClear();
+    discovery.enrich.mockImplementationOnce(async () => [named]);
+    const discoverResumable = vi.fn(async () => []);
+
+    const result = await collectAdoptCandidates(
+      'claude-code', undefined, new Map(), discoverResumable, 20, undefined, { deadlineMs: 1_234 },
+    );
+
+    expect(discovery.enrich).toHaveBeenCalledTimes(1);
+    expect(discovery.enrich).toHaveBeenCalledWith([mine], { deadlineMs: 1_234 });
+    expect(result.sessions).toEqual([named]);
+    // History dedup still uses the discovered live ids.
+    expect((discoverResumable.mock.calls[0] as unknown[])[4]).toEqual(new Set(['sid-herdr']));
+  });
+
+  it('runs the enrichment alongside history collection, not after it', async () => {
+    vi.useFakeTimers();
+    discovery.tmux.mockReturnValueOnce([herdrRow()] as any);
+    const discoverResumable = vi.fn(() => new Promise<any[]>(resolve => setTimeout(() => resolve([]), 600)));
+    const enrichLive = vi.fn((sessions: any[]) => new Promise<any[]>(resolve => setTimeout(() => resolve(sessions), 500)));
+
+    const state = settle(collectAdoptCandidates(
+      'claude-code', undefined, new Map(), discoverResumable, 20, undefined, { enrichLive },
+    ));
+    await vi.advanceTimersByTimeAsync(599);
+    await flush();
+    expect(state.done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    // 600 ms in total (the longer of the two), far from 600 + 500 serially.
+    expect(state.done).toBe(true);
+    expect(enrichLive).toHaveBeenCalledTimes(1);
+  });
+
+  it('end to end: slow history, hung herdr, callback deadline → back by the deadline, herdr aborted, entries as discovered', async () => {
+    vi.useFakeTimers();
+    const { enrichLive, signals } = await hungHerdrEnrichment();
+    const row = herdrRow();
+    discovery.tmux.mockReturnValueOnce([row] as any);
+    const discoverResumable = vi.fn(() => new Promise<any[]>(resolve => setTimeout(() => resolve([]), 2_400)));
+    const deadlineMs = Date.now() + 2_500;
+
+    const state = settle(collectAdoptCandidates(
+      'claude-code', undefined, new Map(), discoverResumable, 20, undefined, { deadlineMs, enrichLive },
+    ));
+    await vi.advanceTimersByTimeAsync(2_399);
+    await flush();
+    expect(state.done).toBe(false);
+    // The enrichment gave up long before: its 800 ms cap, not the deadline, bounded it.
+    expect(signals).toHaveLength(2);
+    expect(signals.every(s => s.aborted)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(state.done).toBe(true);
+    expect(Date.now()).toBeLessThanOrEqual(deadlineMs + 50);
+    expect(state.value!.sessions).toEqual([row]);
+  });
+
+  it('end to end: discovery ate the budget (under 100 ms left) → no herdr query at all', async () => {
+    vi.useFakeTimers();
+    const { enrichLive, signals } = await hungHerdrEnrichment();
+    const row = herdrRow();
+    const deadlineMs = Date.now() + 2_500;
+    // A slow synchronous pane scan: 2.41 s pass before discovery returns.
+    discovery.tmux.mockImplementationOnce((() => {
+      vi.advanceTimersByTime(2_410);
+      return [row];
+    }) as any);
+
+    const state = settle(collectAdoptCandidates(
+      'claude-code', undefined, new Map(), vi.fn(async () => []), 20, undefined, { deadlineMs, enrichLive },
+    ));
+    await flush();
+    expect(state.done).toBe(true);
+    expect(signals).toEqual([]);
+    expect(Date.now()).toBeLessThanOrEqual(deadlineMs + 50);
+    expect(state.value!.sessions).toEqual([row]);
+  });
+
+  it('without a deadline the enrichment budget is 800 ms', async () => {
+    vi.useFakeTimers();
+    const { enrichLive, signals } = await hungHerdrEnrichment();
+    discovery.tmux.mockReturnValueOnce([herdrRow()] as any);
+
+    const state = settle(collectAdoptCandidates(
+      'claude-code', undefined, new Map(), vi.fn(async () => []), 20, undefined, { enrichLive },
+    ));
+    await vi.advanceTimersByTimeAsync(799);
+    await flush();
+    expect(state.done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(state.done).toBe(true);
+    expect(signals.every(s => s.aborted)).toBe(true);
   });
 });

@@ -1,5 +1,7 @@
 import { matchingScheduleBotGrant } from '../src/core/schedule-bot-grant.js';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
@@ -9,6 +11,9 @@ import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/co
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
 import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
+
+// A real directory: capabilityScheduleWorkingDir realpaths both sides.
+const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
 
 const source = ts.createSourceFile(
   'daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true,
@@ -20,16 +25,25 @@ const route = source.statements.find(node => ts.isExpressionStatement(node)
 const handler = (route.expression as ts.CallExpression).arguments[2];
 const callerHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
   && node.name?.text === 'scheduleCallerForTurn');
+const workingDirHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'capabilityScheduleWorkingDir');
 const code = ts.transpileModule(`${callerHelper?.getText(source) ?? ''}
+${workingDirHelper?.getText(source) ?? ''}
 const handler = ${handler.getText(source)}`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
+
+/** The audit argument every direct (session-bound) create must carry: the
+ *  server-side live turn, never a body value. */
+const DIRECT_TURN = { directTurn: {
+  turnId: 'om_kickoff', maxTasksPerTurn: SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+} };
 
 function harness(overrides: Record<string, unknown> = {}) {
   const turnId = 'om_kickoff';
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
-    workingDir: '/repo',
+    workingDir: REPO,
     session: { sessionId: 'target-session', scope: 'thread', rootMessageId: 'om_root',
       replyTargets: { [turnId]: { rootMessageId: 'om_root' } } },
     workerGeneration: 7,
@@ -41,7 +55,7 @@ function harness(overrides: Record<string, unknown> = {}) {
   const body: any = {
     sessionId: 'target-session', originCapability: 'c'.repeat(64), originTurnId: turnId,
     task: { id: 'a1b2c3d4', name: 'poll', schedule: 'every 30m', prompt: 'check',
-      workingDir: '/repo', chatId: 'oc_chat', rootMessageId: 'om_root',
+      workingDir: REPO, chatId: 'oc_chat', rootMessageId: 'om_root',
       executionPosition: 'topic', larkAppId: 'cli_target' },
     ...overrides,
   };
@@ -49,9 +63,13 @@ function harness(overrides: Record<string, unknown> = {}) {
     task: { ...body.task, enabled: true, createdAt: '2026-09-28T00:00:00.000Z' } }));
   const scope: any = {
     readJsonBody: async () => body,
+    realpathSync, existsSync,
+    validateRoleLibraryPath: vi.fn((): { ok: boolean; resolvedPath?: string } => ({ ok: false })),
     findActiveBySessionId: () => ds,
     authorizeSessionScopedIpc,
-    isTrustedHostIpcRequest: () => false,
+    // The Remote Runner relay is a host re-exec that signs with the daemon
+    // secret; every other caller here is a capability-only (sandboxed) CLI.
+    isTrustedHostIpcRequest: () => body.remoteRunnerSessionTool === true,
     selfDaemonLarkAppId: 'cli_target',
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
     matchingScheduleBotGrant,
@@ -117,7 +135,21 @@ describe('delegated schedule add route', () => {
     });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
       ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
-    }));
+    }), DIRECT_TURN);
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a capability-only caller claiming the host Remote Runner relay', async () => {
+    const h = harness({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_user_target',
+    });
+    h.scope.readGlobalConfig = () => ({});
+    h.scope.isTrustedHostIpcRequest = () => false;
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_session_tool_host_required' },
+    });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
 
@@ -273,7 +305,205 @@ function directHumanHarness() {
   return h;
 }
 
+describe('until-done schedule creation', () => {
+  const untilDone = { deadline: '2026-11-20T00:00:00.000Z' };
+
+  it('passes until-done and notify settings from a direct human turn to addTask', async () => {
+    const h = directHumanHarness();
+    h.body.task.untilDone = untilDone;
+    h.body.task.notify = ['failing', 'expired'];
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      untilDone, notify: ['failing', 'expired'], ownerOpenId: 'ou_user_target',
+    }), DIRECT_TURN);
+  });
+
+  it('passes until-done settings from the host terminal to addTask', async () => {
+    const h = harness({ sessionId: '' });
+    h.scope.findActiveBySessionId = () => undefined;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    h.body.task.untilDone = { retryMinutes: 360 };
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      untilDone: { retryMinutes: 360 },
+    }));
+  });
+
+  it.each([
+    ['untilDone', untilDone],
+    ['notify', ['failing']],
+  ] as const)('keeps %s out of a bot-delegated grant', async (field, value) => {
+    const h = harness();
+    h.body.task[field] = value;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_scope_invalid' } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['untilDone', 'tomorrow'],
+    ['untilDone', { deadline: 20261120 }],
+    ['untilDone', { retryMinutes: '6h' }],
+    ['notify', 'failing'],
+    ['notify', [1]],
+  ] as const)('rejects malformed %s %j before any commit', async (field, value) => {
+    const h = directHumanHarness();
+    h.body.task[field] = value;
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'schedule_delegation_scope_invalid' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+});
+
 describe('direct schedule creation after the active-turn hint is cleared', () => {
+  it('canonicalizes every session-bound create before storing it (relay and in-session host CLI)', async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-canon-')));
+    const real = join(base, 'real');
+    mkdirSync(real);
+    const link = join(base, 'link');
+    symlinkSync(real, link);
+    // Remote Runner relay: the session records the lexical (symlinked) cwd.
+    const relay = directHumanHarness();
+    relay.ds.workingDir = link;
+    relay.body.remoteRunnerSessionTool = true;
+    relay.body.task.executionPosition = 'topic';
+    relay.body.task.rootMessageId = 'om_root';
+    relay.body.task.workingDir = link;
+    expect(await relay.run()).toMatchObject({ status: 201, value: { task: { workingDir: real } } });
+    // In-session CLI holding the host secret: no pin, still canonical.
+    const host = directHumanHarness();
+    host.scope.isTrustedHostIpcRequest = () => true;
+    host.body.task.workingDir = link;
+    expect(await host.run()).toMatchObject({ status: 201 });
+    expect(host.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ workingDir: real }), DIRECT_TURN);
+  });
+
+  it('refuses a session-bound create naming a missing directory with the existing codes', async () => {
+    const missing = join(REPO, 'does-not-exist');
+    const host = directHumanHarness();
+    host.scope.isTrustedHostIpcRequest = () => true;
+    host.body.task.workingDir = missing;
+    expect(await host.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    const relay = directHumanHarness();
+    relay.body.remoteRunnerSessionTool = true;
+    relay.body.task.workingDir = missing;
+    expect(await relay.run()).toMatchObject({ status: 403, value: { error: 'schedule_session_tool_scope_invalid' } });
+  });
+
+  it('accepts the canonical cwd and its descendants when the session records a symlinked path', async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-link-')));
+    const real = join(base, 'real');
+    mkdirSync(join(real, 'sub'), { recursive: true });
+    const link = join(base, 'link');
+    symlinkSync(real, link);
+    for (const requested of [real, join(real, 'sub'), join(link, 'sub')]) {
+      const h = directHumanHarness();
+      h.ds.workingDir = link; // lexical, as getSessionWorkingDir records it
+      h.body.task.workingDir = requested;
+      expect(await h.run()).toMatchObject({ status: 201 });
+      expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(
+        expect.objectContaining({ workingDir: realpathSync(requested) }), DIRECT_TURN);
+      expect(h.scope.validateRoleLibraryPath).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses a cwd entry that resolves outside the cwd, and a missing directory', async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-esc-')));
+    const cwd = join(base, 'cwd');
+    mkdirSync(cwd);
+    symlinkSync(base, join(cwd, 'up'));
+    for (const requested of [join(cwd, 'up'), join(cwd, 'missing')]) {
+      const h = directHumanHarness();
+      h.ds.workingDir = cwd;
+      h.body.task.workingDir = requested;
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+      expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+    }
+  });
+
+  it('counts against the live turn, ignoring any turn the body claims', async () => {
+    const h = directHumanHarness();
+    h.body.turnId = 'om_forged';
+    h.body.targetTurnId = 'om_forged';
+    h.body.task.targetTurnId = 'om_forged';
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask.mock.calls[0][1]).toEqual(DIRECT_TURN);
+  });
+
+  it('maps the per-turn direct limit to 403', async () => {
+    const h = directHumanHarness();
+    h.scope.scheduler.addTask = vi.fn(() => { throw new Error('schedule_direct_task_limit'); });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_direct_task_limit' } });
+  });
+
+  it('does not limit the host-terminal (sessionless) create', async () => {
+    const h = harness({ sessionId: '' });
+    h.scope.findActiveBySessionId = () => undefined;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask.mock.calls[0]).toHaveLength(1);
+  });
+
+  it('refuses a capability-only caller pinning the task outside its cwd and own role library', async () => {
+    const h = directHumanHarness();
+    h.body.task.workingDir = '/Users/ksher';
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    expect(h.scope.validateRoleLibraryPath).toHaveBeenCalledWith('/Users/ksher', undefined, 'cli_target');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('persists the resolved own-role-library path for a capability-only caller', async () => {
+    const h = directHumanHarness();
+    const roleDir = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-role-')));
+    h.body.task.workingDir = '~/botmux-roles/cli_target/shared/pm';
+    h.scope.validateRoleLibraryPath = vi.fn(() => ({ ok: true, resolvedPath: roleDir }));
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      workingDir: roleDir,
+    }), DIRECT_TURN);
+  });
+
+  it('lets the host pin any working directory', async () => {
+    const h = directHumanHarness();
+    const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-elsewhere-')));
+    h.body.task.workingDir = elsewhere;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ workingDir: elsewhere }), DIRECT_TURN);
+  });
+
+  it('refuses a capability-only p2p caller aiming at a chat the operator is not in', async () => {
+    const h = directHumanHarness();
+    h.ds.chatType = 'p2p';
+    h.body.task.chatId = 'oc_elsewhere';
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_someone_else']);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+    expect(h.scope.listChatMemberOpenIds).toHaveBeenCalledWith('cli_target', 'oc_elsewhere');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps a capability-only p2p caller free to schedule into its own chat', async () => {
+    const h = directHumanHarness();
+    h.ds.chatType = 'p2p';
+    h.scope.listChatMemberOpenIds = vi.fn(async () => []);
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.listChatMemberOpenIds).not.toHaveBeenCalled();
+  });
+
+  it.each(['om_current_topic', 'om_explicit_destination'])('keeps creator notifications in the current topic when executing in %s', async root => {
+    const h = directHumanHarness();
+    h.ds.scope = h.ds.session.scope = 'chat';
+    h.ds.session.rootMessageId = 'om_unrelated_first_message';
+    h.ds.session.replyTargets.om_kickoff.rootMessageId = 'om_current_topic';
+    h.ds.session.currentReplyTarget = { turnId: 'om_queued', rootMessageId: 'om_queued_topic' };
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = root;
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      rootMessageId: root, creatorRootMessageId: 'om_current_topic',
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      rootMessageId: root, creatorRootMessageId: 'om_current_topic',
+    }), DIRECT_TURN);
+  });
+
   it.each(['thread', 'chat'] as const)('uses the exact human sender in %s scope with delegation disabled', async scope => {
     const h = directHumanHarness();
     h.ds.scope = h.ds.session.scope = scope;
@@ -301,7 +531,7 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
     h.body.task.executionPosition = 'topic';
     h.body.task.rootMessageId = 'om_root';
     expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-      chatId: 'oc_chat', rootMessageId: 'om_root', workingDir: '/repo',
+      chatId: 'oc_chat', rootMessageId: 'om_root', workingDir: REPO,
     } } });
   });
 

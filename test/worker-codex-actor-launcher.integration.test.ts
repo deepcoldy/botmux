@@ -12,6 +12,7 @@ import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { resolveNodeExecutable, spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 
 const tmuxAvailable = process.platform === 'linux' && probeTmuxFunctional().ok;
@@ -72,13 +73,17 @@ async function runLauncherAttestationCase(
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 process.title = ${JSON.stringify(variant.leafName)};
-fs.writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify({launcher:process.ppid,native:process.pid}));
+// Publish complete markers atomically: existsSync in the parent must not
+// observe the empty file between open/truncate and write.
+fs.writeFileSync(${JSON.stringify(pidsFile + '.tmp')}, JSON.stringify({launcher:process.ppid,native:process.pid}));
+fs.renameSync(${JSON.stringify(pidsFile + '.tmp')}, ${JSON.stringify(pidsFile)});
 process.stdout.write('› Ask Codex to do anything\\r\\n  gpt-test · /tmp\\r\\n');
 const timer = setInterval(() => {
   if (!fs.existsSync(${JSON.stringify(toolRelease)})) return;
   clearInterval(timer);
   const peer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio:'ignore'});
-  fs.writeFileSync(${JSON.stringify(peerFile)}, String(peer.pid));
+  fs.writeFileSync(${JSON.stringify(peerFile + '.tmp')}, String(peer.pid));
+  fs.renameSync(${JSON.stringify(peerFile + '.tmp')}, ${JSON.stringify(peerFile)});
 }, 25);
 setInterval(() => {}, 1000);
 `);
@@ -160,11 +165,8 @@ exec '${node}' '${launcherScript}'
     ds.localProcessAttestation!.cliProcStart = 'stale';
     await expect(request()).resolves.toMatchObject({ ok: false, error: 'current_actor_unverified' });
   } finally {
-    if (worker && worker.exitCode === null && worker.signalCode === null) {
-      const exited = new Promise<void>(r => worker!.once('exit', () => r()));
-      worker.kill('SIGKILL');
-      await Promise.race([exited, new Promise(r => setTimeout(r, 2_000))]);
-    }
+    // Together with any tmux call it still has in flight: TMUX_TMPDIR goes below.
+    if (worker) await killProcessTree(worker);
     for (const pid of [peerPid, cliPids?.native, cliPids?.launcher]) {
       if (pid) try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
     }

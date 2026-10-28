@@ -132,7 +132,31 @@ export function parseVcMeetingPushEvent(input: {
   kind: VcMeetingPushEventKind;
   eventType: VcMeetingPushEventType;
 }): VcMeetingPushContext {
+  const body = eventBody(input.data);
+  const inviterId = getPath(body, 'inviter.id');
+  // Native VC actors also carry the app-scoped ID in an ID object. Do not use
+  // user_id/union_id (or a host/name fallback) as an open_id for authority.
+  const inviterOpenId = isRecord(inviterId) ? inviterId.open_id : inviterId;
+  const isInvitation = input.kind === 'meeting_invited' && input.eventType === VC_BOT_MEETING_INVITED_EVENT;
+  // Envelope creation time cannot prove when the invitation happened (e.g. delayed delivery).
+  const inviteTime = getPath(body, 'invite_time');
+  const invitedAt = parseTimeMs(inviteTime);
+  const invitationDiagnostics: VcMeetingPushContext['invitationDiagnostics'] = isInvitation ? {
+    inviterStatus: !isRecord(getPath(body, 'inviter')) ? 'missing_inviter'
+      : getPath(body, 'inviter.user_type') !== 1 ? 'invalid_user_type'
+      : inviterOpenId === undefined || inviterOpenId === null || inviterOpenId === '' ? 'missing_open_id'
+      : typeof inviterOpenId !== 'string' || !/^ou_[A-Za-z0-9]+$/.test(inviterOpenId) ? 'invalid_open_id'
+      : 'resolved',
+    inviterIdShape: inviterId === undefined || inviterId === null ? 'missing'
+      : typeof inviterId === 'string' ? 'string' : isRecord(inviterId) ? 'object' : 'other',
+    inviteTimeStatus: inviteTime === undefined || inviteTime === null || inviteTime === '' ? 'missing'
+      : invitedAt === undefined ? 'invalid' : 'valid',
+  } : undefined;
+  const inviter = invitationDiagnostics?.inviterStatus === 'resolved' && typeof inviterOpenId === 'string'
+    ? { openId: inviterOpenId, ...(invitedAt !== undefined ? { invitedAt } : {}) } : undefined;
   return {
+    ...(inviter ? { inviter } : {}),
+    ...(invitationDiagnostics ? { invitationDiagnostics } : {}),
     larkAppId: input.larkAppId,
     kind: input.kind,
     eventType: input.eventType,

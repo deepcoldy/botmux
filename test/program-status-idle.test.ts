@@ -295,6 +295,33 @@ describe('IdleDetector program status', () => {
     detector.dispose();
   });
 
+  it('re-publishes a terminal snapshot for a fallback still waiting after the boundary edge was dropped', () => {
+    // #2178: OSC reports idle before the SessionStart signal; the boundary
+    // republishes it while the worker's ready gate still holds, so the worker
+    // drops that edge and its post-hook fallback has to produce another one.
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.observeProgramStatus({ state: 'idle' });
+    detector.resetReadyEvidence();
+    expect(cb).toHaveBeenCalledTimes(2);
+    expect(detector.seedReadyEvidence()).toBe(true);
+    expect(cb).toHaveBeenCalledTimes(3);
+    expect(cb).toHaveBeenLastCalledWith('program-status');
+
+    // A child still working is not a prompt, however quiet the screen.
+    const busy = new IdleDetector(makeCli());
+    const busyCb = vi.fn();
+    busy.onIdle(busyCb);
+    busy.observeProgramStatus({ state: 'idle' });
+    busy.observeProgramStatus({ id: 'tool', state: 'working' });
+    busyCb.mockClear();
+    expect(busy.seedReadyEvidence()).toBe(false);
+    expect(busyCb).not.toHaveBeenCalled();
+    busy.dispose();
+    detector.dispose();
+  });
+
   it('preserves active working and blocked records across reset and does not arm fallback', () => {
     const detector = new IdleDetector(makeCli());
     const cb = vi.fn();

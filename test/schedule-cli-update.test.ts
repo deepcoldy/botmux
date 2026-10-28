@@ -62,6 +62,7 @@ async function managed(
   customize?: (proof: ManagedOriginAttestation, index: number) => void,
   managedTurnId = 'om_live',
   observedRequests?: Array<Record<string, unknown>>,
+  refuseWith?: string,
 ) {
   seedPersistedSessionRows(f.dataDir, app, { [sid]: {
     sessionId: sid, status: 'active', larkAppId: app, chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -78,6 +79,10 @@ async function managed(
       scheduleOperator: { ok: true } };
     calls++;
     customize?.(proof, calls);
+    if (refuseWith && (req.url === SCHEDULE_DELEGATED_ADD_ROUTE || req.url === SCHEDULE_MANAGED_MUTATE_ROUTE)) {
+      res.statusCode = 403;
+      return res.end(JSON.stringify({ ok: false, error: refuseWith }));
+    }
     if (req.url === SCHEDULE_DELEGATED_ADD_ROUTE) {
       if (proof.turnId !== managedTurnId) {
         res.statusCode = 409;
@@ -167,6 +172,62 @@ async function managed(
 }
 
 describe('schedule CLI prompt updates', () => {
+  it.each([
+    ['add', 'schedule_working_dir_forbidden', '当前工作目录'],
+    ['add', 'schedule_direct_task_limit', '已达上限'],
+    ['update', 'schedule_mutation_scope_forbidden', '本会话所在群'],
+    ['update', 'schedule_working_dir_forbidden', '当前工作目录'],
+  ] as const)('turns a sandbox %s refusal %s into actionable text', async (action, code, text) => {
+    const f = fixture();
+    await managed(f, undefined, 'om_live', undefined, code);
+    const result = action === 'add'
+      ? await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344'])
+      : await f.run(['update', f.task.id, '--prompt', 'changed']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain(text);
+    expect(result.output).not.toContain(code);
+  });
+
+  it.each(['--topic', '--follow-active'])('binds %s to the current topic in a reused chat session', async flag => {
+    const f = fixture();
+    await managed(f);
+    const rows = readPersistedSessionRows(f.dataDir, app);
+    rows[sid] = { ...rows[sid], scope: 'chat', rootMessageId: 'om_unrelated_first_message',
+      replyTargets: { om_live: { rootMessageId: 'om_current_topic', updatedAt: new Date().toISOString() } },
+      currentReplyTarget: { turnId: 'om_queued', rootMessageId: 'om_queued_topic', updatedAt: new Date().toISOString() },
+    };
+    seedPersistedSessionRows(f.dataDir, app, rows);
+    const result = await f.run(['add', '0 12 * * *', 'new task', flag, '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()['11223344']).toMatchObject({ executionPosition: 'topic', rootMessageId: 'om_current_topic' });
+  });
+
+  it.each(['missing', 'plain'])('refuses implicit --topic when the exact chat turn is %s', async mode => {
+    const f = fixture();
+    await managed(f);
+    const rows = readPersistedSessionRows(f.dataDir, app);
+    rows[sid] = { ...rows[sid], scope: 'chat', rootMessageId: 'om_unrelated_first_message',
+      replyTargets: mode === 'plain' ? { om_live: { updatedAt: new Date().toISOString() } } : {},
+      currentReplyTarget: { turnId: 'om_other', rootMessageId: 'om_other_topic', updatedAt: new Date().toISOString() },
+    };
+    seedPersistedSessionRows(f.dataDir, app, rows);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('话题下执行需要');
+    expect(f.read()['11223344']).toBeUndefined();
+    const explicit = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--root-msg-id', 'om_explicit', '--id', '11223344']);
+    expect(explicit.code, explicit.output).toBe(0);
+    expect(f.read()['11223344'].rootMessageId).toBe('om_explicit');
+  });
+
+  it('keeps the bound root for an ordinary thread session', async () => {
+    const f = fixture();
+    await managed(f);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()['11223344'].rootMessageId).toBe('om_root');
+  });
+
   it('documents both update inputs without requiring a configured bot', async () => {
     const f = fixture();
     const result = await f.run(['update', '--help']);

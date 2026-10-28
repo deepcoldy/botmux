@@ -67,6 +67,66 @@ export function usesLarkToolBinding(config: {
   return config.larkToolBinding !== false;
 }
 
+/**
+ * Which identity publication model a spawn runs.
+ *
+ * - `proven`: the Linux managed entry proves its execution over the loopback
+ *   current-execution channel and receives the identity CONTENT in memory; no
+ *   token is written to disk. Requires the daemon loopback to be reachable
+ *   inside the sandbox, so network-isolated sandboxes (`--unshare-net`, or a
+ *   slirp policy that does not share host loopback) are excluded.
+ * - `single`: every other path (adopt / remote / external app-server /
+ *   workflow / non-Lark transport / non-Linux / loopback-isolated sandbox)
+ *   keeps the legacy single-snapshot file that is overwritten or removed on
+ *   every turn.
+ *
+ * SINGLE SOURCE OF TRUTH: the WORKER computes this from the actual spawn
+ * decision — resolveLocalSandboxMode (including the BOTMUX_SANDBOX operator
+ * override and remote-backend bypass) plus the spawn's real loopback
+ * reachability (resolveSpawnNetworkShape, the same facts that compile the
+ * bwrap/Seatbelt argv) — renders the wrapper from it and reports it to the
+ * daemon. The daemon consumes ONLY that report; it must not re-derive the
+ * sandbox or network side from frozen config or its own environment, or the
+ * two sides can silently pick different models for one session.
+ */
+export type IdentityStorageModel = 'single' | 'proven';
+
+export function resolveIdentityStorageModel(input: {
+  platform: NodeJS.Platform;
+  binding: boolean;
+  /** Whether a local sandbox actually wraps the spawn (worker spawn fact). */
+  sandboxEngaged: boolean;
+  /** Whether the daemon loopback is reachable inside the spawn (worker spawn
+   *  fact: false under --unshare-net and under a slirp policy). */
+  loopbackShared: boolean;
+}): IdentityStorageModel {
+  if (input.platform !== 'linux' || !input.binding) return 'single';
+  if (input.sandboxEngaged && !input.loopbackShared) return 'single';
+  return 'proven';
+}
+
+/** Structural half the daemon can check independently of the worker: proven
+ *  requires Linux and the managed lark-tool binding (adopt / remote / external
+ *  app-server / workflow / apiOnly / disabled transport are structurally
+ *  single). Sandbox engagement and loopback reachability are deliberately NOT
+ *  inputs here — they are spawn-time facts only the worker has. The daemon
+ *  uses this solely to fail closed when a worker reports `proven` for a
+ *  session whose structure cannot run proven (e.g. binding disabled after a
+ *  daemon restart with newer config). */
+export function identityBindingAllowsProven(input: {
+  platform: NodeJS.Platform;
+  sessionId: string;
+  larkAppId: string;
+  chatId: string;
+  apiOnly?: boolean;
+  adoptMode?: boolean;
+  existingAppServerEndpoint?: string;
+  backendType: import('../adapters/backend/types.js').BackendType;
+  larkToolBinding?: boolean;
+}): boolean {
+  return input.platform === 'linux' && usesLarkToolBinding(input);
+}
+
 /** Clean up managed lark-cli binding files and wrappers when binding is disabled. */
 export function cleanupLarkToolBinding(dataDir: string, sessionId: string): void {
   try {

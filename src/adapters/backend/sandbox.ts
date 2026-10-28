@@ -36,6 +36,7 @@ import {
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
 import { isValidPluginId } from '../../core/plugins/ids.js';
+import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -284,13 +285,13 @@ function credentialOnlyRelayHandle(
  * Every flavour shares the tree layout `<data>/sandboxes/<sid>`: the relay
  * outbox for oncall / scratch / credential-only, the oncall deny-mask
  * mountpoints, the scratch COW overlay + upper (Linux) or clone (macOS). A
- * persistent backend (tmux / zellij / herdr / zmx) only DETACHES on worker exit:
- * its CLI keeps running against that tree (Linux panes hold the outbox bind by
- * inode; a scratch CLI's whole root/cwd lives in it), and the successor worker
+ * CLI that survives its worker (see {@link cliSurvivesWorkerExit}) keeps
+ * running against that tree (Linux panes hold the outbox bind by inode; a
+ * scratch CLI's whole root/cwd lives in it), and the successor worker
  * reattaches the same CLI and re-serves the relay. Deleting it there silently
  * breaks every later `botmux send` (or wipes a live scratch CLI's files). A PTY
- * CLI is a child of the worker and dies with it, so its tree is cleaned up as
- * before; a real close removes the tree for every backend. */
+ * CLI dies with the worker, so its tree is cleaned up as before; a real close
+ * removes the tree for every backend. */
 export function sandboxTreeSurvivesWorkerExit(input: {
   /** This CLI generation established a per-session tree (holds its cleanup). */
   ownsTree: boolean;
@@ -298,7 +299,7 @@ export function sandboxTreeSurvivesWorkerExit(input: {
   /** Present only when the CLI runs in a named persistent session. */
   persistentSessionName: string | null | undefined;
 }): boolean {
-  return input.ownsTree && !!input.persistentSessionName && input.backendType !== 'pty';
+  return input.ownsTree && cliSurvivesWorkerExit(input);
 }
 
 /** The relay outbox a LIVE Linux pane bound into its bwrap namespace BY INODE

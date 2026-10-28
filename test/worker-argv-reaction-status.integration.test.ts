@@ -1365,10 +1365,31 @@ setInterval(() => {}, 1_000);
     const dataDir = join(root, 'session');
     mkdirSync(dataDir, { recursive: true });
 
+    // The test, not a clock started at pane creation, moves the fake Pi
+    // between phases. Under CI load the worker can take longer to attach than
+    // any fixed busy window (5s on 2026-10-24); a pane that already settled
+    // before attach never emits output again, so no idle edge ever arrives.
+    // Printing Working... only after attach also makes it arrive as pane
+    // output, so quiescence really fires while the viewport shows it. It goes
+    // on the bottom row, where Pi draws it above its editor: the busy guard
+    // only reads the tail of the viewport.
+    const startBusy = join(root, 'start-busy');
+    const finishBusy = join(root, 'finish-busy');
     const fakePi = join(root, 'fake-pi');
     writeFileSync(fakePi, `#!/usr/bin/env node
-process.stdout.write('Working...\\n');
-setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[HDone without transcript final\\n'), 4_500);
+import('node:fs').then(({ existsSync }) => {
+  const after = (file, text, next) => {
+    const timer = setInterval(() => {
+      if (!existsSync(file)) return;
+      clearInterval(timer);
+      process.stdout.write(text);
+      next?.();
+    }, 25);
+  };
+  after(${JSON.stringify(startBusy)}, '\\x1b[999;1HWorking...', () => {
+    after(${JSON.stringify(finishBusy)}, '\\x1b[2J\\x1b[HDone without transcript final\\n');
+  });
+});
 setInterval(() => {}, 1_000);
 `);
     chmodSync(fakePi, 0o755);
@@ -1414,14 +1435,19 @@ setInterval(() => {}, 1_000);
       adoptPaneRows: 50,
     } satisfies DaemonToWorker);
 
-    const deadline = Date.now() + 3_500;
-    while (Date.now() < deadline) {
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
-    }
+    await waitForLog(child, logs, 'Adopt mode (tmux): observing', 20_000);
+    writeFileSync(startBusy, '');
+
+    // Quiescence fires while Working... is on screen: the adopt idle exit must
+    // defer, and the busy probe that takes over must keep deferring for as long
+    // as the marker stays (one probe interval is 3.5s).
+    await waitForLog(child, logs, 'adopt-idle: authoritative viewport still shows busy marker; deferring prompt ready');
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 4_500));
     expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
 
+    writeFileSync(finishBusy, '');
     await waitForPromptReady(child, messages, logs);
-  }, 15_000);
+  }, 50_000);
 
   it.skipIf(!tmuxAvailable)('publishes the adopted tmux pane CLI pid and start identity before prompt_ready', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-adopt-attest-'));

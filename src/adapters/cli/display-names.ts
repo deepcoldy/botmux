@@ -39,6 +39,8 @@ export const CLI_DISPLAY_NAMES: Readonly<Record<CliId, string>> = {
   'mojo': 'Mojo',
   'minimax': 'MiniMax Code',
   'remote-runner': 'Remote Runner',
+  'codem': 'CodeM',
+  'zcode': 'ZCode',
 };
 
 /** Display name for a possibly-unknown id (persisted / runtime-supplied). */

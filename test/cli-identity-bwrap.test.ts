@@ -25,7 +25,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
 import {
-  ensureSessionIdentityPlaceholders,
+  ensureSessionIdentityStorage,
   sessionIdentityBinDir,
   sessionIdentityPath,
   writeSessionIdentity,
@@ -84,10 +84,10 @@ function compileIdentityPolicy(): IdentityPolicyHarness {
   }
 
   const sessionId = 'sess-live';
-  ensureSessionIdentityPlaceholders(dataDir, sessionId, ['lark-cli', 'bytedcli']);
+  ensureSessionIdentityStorage(dataDir, sessionId, ['lark-cli', 'bytedcli'], 'single');
   const identityPath = writeSessionIdentity(dataDir, sessionId, {
     tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-first',
-  });
+  }, 'single');
   const sessionDir = sessionIdentityBinDir(dataDir, sessionId);
   const policy = buildFsPolicy({
     platform: 'linux',
@@ -191,7 +191,7 @@ describe.skipIf(!bwrapUsable())('bwrap persistent pane × trigger-user identity'
       await pollFor(() => existsSync(join(harness.ctlDir, 'ready')), 'sandbox reader ready');
       writeSessionIdentity(harness.dataDir, harness.sessionId, {
         tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-second',
-      });
+      }, 'single');
       expect(statSync(sessionIdentityPath(harness.dataDir, harness.sessionId, 'lark-cli')).ino)
         .not.toBe(firstInode);
       writeFileSync(join(harness.ctlDir, 'go'), '1');

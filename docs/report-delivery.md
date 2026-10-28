@@ -4,7 +4,7 @@ For locally registered dispatches, `botmux report --dispatch-root <om_seed>` sup
 
 | `--delivery` | Visible result | Source session |
 | --- | --- | --- |
-| `relay` (default) | Existing behavior | Receives the report |
+| `relay` (default) | Only when relay provably fails (see below) | Receives the report |
 | `publish` | Markdown card in the dispatch thread | Not triggered |
 | `publish-and-relay` | Markdown card in the dispatch thread | Receives the report and published message ID |
 
@@ -16,6 +16,21 @@ botmux report --dispatch-root om_seed --delivery publish-and-relay --publish-to 
 ```
 
 `botmux dispatch --bot-app <app_id> --result-delivery <mode> ...` puts the matching report command in the task instructions. The target must use default prompt injection. Zero-prompt sessions retain their automatic final-answer relay and reject explicit publication modes; standby and legacy/external bot dispatches do not support this option. The daemon also checks the live session's frozen prompt mode, so changing bot configuration does not bypass this boundary.
+
+## Relay fallback
+
+With the default `relay`, the report would otherwise be lost when the dispatching (orchestrator) session never receives it. In these cases the daemon publishes it in the dispatch thread instead:
+
+| Relay failure | Reason shown |
+| --- | --- |
+| Orchestrator daemon offline (no heartbeat, or the connection is refused) | 主编排不在线 |
+| Orchestrator session closed and no unique live successor | 主编排会话已关闭 |
+| Orchestrator session not runnable yet (waiting for a directory, first start, queued) | 主编排会话还没启动好 |
+| Explicit `--dispatch-root` with no registered dispatch | 派单目标已不在 |
+
+The card starts with `未送达主编排：<reason>`, followed by the original report. The command succeeds with `relayDelivered: false`, `relayFailure` and a one-line `notice`; the orchestrator is not notified. Private-card, API-only and zero-prompt sessions never publish: the command fails and its `notice` names the setting. A failed publication also fails the command with the reason. Retrying the same report in the same turn reuses the first fallback publication.
+
+Other relay failures fail as before: an unverifiable caller, a stale turn, a binding that does not verify, or an orchestrator that left its chat. An implicit dispatch root (no `--dispatch-root`) that is not registered is an ordinary report and keeps its normal placement.
 
 Status is independent of delivery. Pass `--status completed --progress 100` only when the task is actually complete; sending a report does not infer completion.
 

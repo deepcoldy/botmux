@@ -77,8 +77,14 @@ class BytedcliAuthUnavailableError extends Error {
   }
 }
 
-async function readLoginState(openId: string): Promise<boolean> {
-  if (!existsSync(bytedcliHomeFor(openId))) return false;
+interface LoginObservation {
+  authenticated: boolean;
+  /** Provider-reported login expiry, when `auth status` includes one. */
+  expiresAt?: string;
+}
+
+async function readLoginState(openId: string): Promise<LoginObservation> {
+  if (!existsSync(bytedcliHomeFor(openId))) return { authenticated: false };
   const result = await runAsUser(openId, ['auth', 'status', '--json']);
   const envelope = parseEnvelope(result.stdout);
   const data = envelope?.data as Record<string, unknown> | undefined;
@@ -92,11 +98,70 @@ async function readLoginState(openId: string): Promise<boolean> {
   if (!data.authenticated && sdk?.status && sdk.status !== 'need_login') {
     throw new BytedcliAuthUnavailableError('provider not ready');
   }
-  return data.authenticated;
+  const expiresAt = providerExpiry(data, sdk);
+  return { authenticated: data.authenticated, ...(expiresAt ? { expiresAt } : {}) };
+}
+
+/** ISO expiry from the status payload. Only the named expiry fields are read;
+ *  JWTs and other credential fields in the same object are ignored. */
+function providerExpiry(
+  data: Record<string, unknown>,
+  sdk: Record<string, unknown> | undefined,
+): string | undefined {
+  for (const source of sdk ? [sdk, data] : [data]) {
+    for (const key of ['expires_at', 'expiresAt'] as const) {
+      const iso = isoTimestamp(source[key]);
+      if (iso) return iso;
+    }
+  }
+  return undefined;
+}
+
+/** ECMAScript time values outside ±8.64e15 ms make `Date#toISOString` throw. */
+const MAX_DATE_MS = 8.64e15;
+
+function isoFromMs(ms: number): string | undefined {
+  // A provider clock (for example a nanosecond Unix time) must not be able to
+  // throw out of a status read. Login state is independent of that field.
+  if (!Number.isFinite(ms) || ms < 1_000_000_000_000 || ms > MAX_DATE_MS) return undefined;
+  return new Date(ms).toISOString();
+}
+
+function isoTimestamp(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const ms = value < 10_000_000_000 ? value * 1000 : value;
+    return isoFromMs(ms);
+  }
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 40) return undefined;
+  return isoFromMs(Date.parse(trimmed));
 }
 
 export async function hasBytedcliHome(openId: string): Promise<boolean> {
-  return await readLoginState(openId);
+  return (await readLoginState(openId)).authenticated;
+}
+
+/**
+ * This person's bytedcli login, for a status query.
+ *
+ * Does not start a login and does not create a HOME. `unknown` means the
+ * provider could not be asked (down, malformed, or a non-personal identity);
+ * an existing login is left untouched. No credential material is returned.
+ */
+export async function describeBytedcliAuth(openId: string): Promise<{
+  state: 'authorized' | 'needs-login' | 'unknown';
+  expiresAt?: string;
+}> {
+  try {
+    const login = await readLoginState(openId);
+    return {
+      state: login.authenticated ? 'authorized' : 'needs-login',
+      ...(login.expiresAt ? { expiresAt: login.expiresAt } : {}),
+    };
+  } catch {
+    return { state: 'unknown' };
+  }
 }
 
 /** Forget one person's bytedcli authorization entirely. */
@@ -300,7 +365,7 @@ export async function completeBytedcliLogin(
   if (ok && env?.status === 'success' && (state === 'success' || state === 'ok')) {
     // Completion is not authority until the isolated provider can use the login.
     try {
-      if (await readLoginState(openId)) {
+      if ((await readLoginState(openId)).authenticated) {
         clearChallenge(openId);
         return { state: 'authorized' };
       }
@@ -358,7 +423,7 @@ async function mintJwts(openId: string): Promise<BytedcliJwts | null> {
   if (challenge) {
     await completeBytedcliLogin(openId, challenge);
   }
-  if (!await readLoginState(openId)) return null;
+  if (!(await readLoginState(openId)).authenticated) return null;
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
   const cloudJwt = cloud.stdout.trim();
   if (!cloud.ok || !cloudJwt) {

@@ -80,6 +80,21 @@ describe('parseDebugModelsJson', () => {
 });
 
 describe('parseDebugModelCapabilitiesJson', () => {
+  it('exposes actual context variants and their reasoning limits without leaking backend routing keys', () => {
+    const result = parseDebugModelCapabilitiesJson(REAL_SHAPE([{
+      ...modelEntry('gpt-6-astra'), context_window: 272000,
+      business_metadata: { variants: {
+        standard_key: 'private__dev', max_key: 'private__max',
+        standard_context_window: 272000, max_context_window: 800000,
+        max_supported_reasoning_levels: [{ effort: 'high' }, { effort: 'xhigh' }],
+      } },
+    }]));
+    expect(result).toEqual([{ slug: 'gpt-6-astra', serviceTiers: [], contextWindow: 272000,
+      contextVariants: [{ id: 'standard', contextWindow: 272000 },
+        { id: 'max', contextWindow: 800000, reasoningEfforts: ['high', 'xhigh'] }] }]);
+    expect(JSON.stringify(result)).not.toContain('private__');
+  });
+
   it('保留 visibility=list 模型的 service_tiers id', () => {
     const out = parseDebugModelCapabilitiesJson(REAL_SHAPE([
       capabilityEntry('gpt-6.1-sol', ['priority']),

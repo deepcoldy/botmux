@@ -31,6 +31,24 @@ import type { CodexBridgeEvent } from './codex-transcript.js';
 import type { PendingCliInput } from '../utils/pending-input-queue.js';
 import { t } from '../i18n/index.js';
 
+/** Transient reason for one CLI restart; never stored in session config. */
+export type CliRestartCause = 'traex-auto-model';
+
+/** Only a planned TraeX continuation resuming the requested native session
+ *  may skip interruption scanning. Preferred-model resets without a queued
+ *  continuation and later crash recovery leave restartCause unset. */
+export function shouldSuppressRestartInterruptionScan(input: {
+  restartCause?: CliRestartCause;
+  cliId: string;
+  exactResumeSessionId?: string;
+  effectiveCliSessionId?: string;
+}): boolean {
+  return input.restartCause === 'traex-auto-model'
+    && input.cliId === 'traex'
+    && input.exactResumeSessionId !== undefined
+    && input.effectiveCliSessionId === input.exactResumeSessionId;
+}
+
 /** Bytes of transcript tail read at a resume. The scan only needs the end of
  *  the old process's life; a cut mid-turn still shows as an open turn (any
  *  non-final assistant record opens it). Bounded so a resume of a very long

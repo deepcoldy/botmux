@@ -6,6 +6,7 @@ import {
   shouldHealAbsentBaseline,
   sessionIdFromJsonlPath,
   pidRotationHistoryCutoffMs,
+  shouldRecordPidStateSessionId,
   PENDING_MARK_SKEW_MS,
 } from '../src/services/bridge-rotation-policy.js';
 import { splitTranscriptEventsByCutoff } from '../src/services/claude-transcript.js';
@@ -321,5 +322,31 @@ describe('pidRotationHistoryCutoffMs', () => {
     expect(split(cutoff, mark - PENDING_MARK_SKEW_MS, mark).live).toEqual([mark - PENDING_MARK_SKEW_MS, mark]);
     // A mark newer than the confirmation does not move the cutoff later.
     expect(pidRotationHistoryCutoffMs({ confirmedAtMs: confirmed, unstartedMarkTimesMs: [confirmed + 60_000] })).toBe(confirmed);
+  });
+});
+
+describe('shouldRecordPidStateSessionId', () => {
+  const base = { resumeSessionId: 'pre-clear', adopted: false };
+  const resumable = () => true;
+
+  it('records the conversation Claude moved to once its transcript holds one', () => {
+    expect(shouldRecordPidStateSessionId({ ...base, observedSessionId: 'post-clear', transcriptResumable: resumable })).toBe(true);
+  });
+
+  it('keeps the recorded id while the new conversation cannot be resumed yet', () => {
+    // A --fork-session child names its id before its file holds a conversation;
+    // resuming it now would make Claude exit with "No conversation found".
+    expect(shouldRecordPidStateSessionId({ ...base, observedSessionId: 'fork', transcriptResumable: () => false })).toBe(false);
+  });
+
+  it('records nothing, and reads no transcript, while Claude stays in the conversation a cold start resumes', () => {
+    let probed = 0;
+    const probe = () => { probed++; return true; };
+    expect(shouldRecordPidStateSessionId({ ...base, observedSessionId: base.resumeSessionId, transcriptResumable: probe })).toBe(false);
+    expect(probed).toBe(0);
+  });
+
+  it('records nothing for an adopted CLI, which botmux never relaunches', () => {
+    expect(shouldRecordPidStateSessionId({ ...base, adopted: true, observedSessionId: 'post-clear', transcriptResumable: resumable })).toBe(false);
   });
 });

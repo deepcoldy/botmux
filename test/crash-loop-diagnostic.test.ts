@@ -158,9 +158,9 @@ function makeDs(sessionId: string, worker: any): DaemonSession {
 
 const flush = () => new Promise<void>(r => setTimeout(r, 0));
 
-async function crashTimes(worker: any, n: number, canParkDiagnostic?: boolean) {
+async function crashTimes(worker: any, n: number, canParkDiagnostic?: boolean, code: number | null = 1) {
   for (let i = 0; i < n; i++) {
-    worker.emit('message', { type: 'claude_exit', code: 1, signal: null, canParkDiagnostic });
+    worker.emit('message', { type: 'claude_exit', code, signal: null, canParkDiagnostic });
   }
   await flush();
 }
@@ -231,7 +231,11 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     // env/model 未配 → 均为 null；larkToolBinding 默认开启 → 为 true；三分态 contract: true 启用 / null 明确清空 / undefined 保持），
     // 并标记 reason: 'cli_crash' 区分 operator 主动 restart；经 restart coordinator 发出，
     // 必带 attemptId（#1863：只有关联回执能放开 workerReady 栅栏）。
-    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), reason: 'cli_crash', env: null, model: null, larkToolBinding: true });
+    expect(worker.send).toHaveBeenCalledWith({
+      type: 'restart', attemptId: expect.any(String), reason: 'cli_crash',
+      env: null, envUnset: null, envFingerprint: expect.any(String), model: null, larkToolBinding: true,
+      codexRpcInput: false, traexAutoModel: null,
+    });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     // Survives daemon restart: lazy cold-resume + idle, restart counter reset.
@@ -358,6 +362,61 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(notice).toContain('exit code: 1');
     expect(notice).toContain('EARLY_FATAL_LINE');
     expect(notice).toContain('最近的 worker 输出（可能含死因）：');
+  });
+
+  // ─── 退出码语义（PR #2164） ───────────────────────────────────────────────
+  //
+  // 永久退出（身份 77 / 命令缺失 127）与「1 分钟内抖动 N 次」是两种不同的停止
+  // 原因。永久通道刻意跨 60s 窗口累计，两次崩溃可能相隔很久，所以卡片不能再说
+  // 「1 分钟内崩溃 N 次」——那句话在永久场景下是假话。
+  it('stops on a permanent exit code and says so, instead of claiming "N crashes in 1 minute"', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-permanent-exit', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    // 第一次永久退出给一次重启机会，第二次停止。
+    await crashTimes(worker, 2, true, 77);
+
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'restart', reason: 'cli_crash' }));
+    const notice = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    // 说明是确定性失败 + 退出码，且不再声称时间窗。
+    expect(notice).toContain('77');
+    expect(notice).not.toContain('1 分钟');
+  });
+
+  it('still uses the 1-minute window wording for an ordinary crash loop', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-window-budget', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashTimes(worker, 4, true);
+
+    const notice = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(notice).toContain('1 分钟');
+  });
+
+  // 恢复健康即清零：CLI 真的跑到可输入 prompt，说明此前那些崩溃不构成持续的
+  // 确定性故障。不清掉的话，一次历史 127 会让这条会话此后任何一次 127 都立即
+  // 放弃自动重启（评审实测隔 90 天仍如此）。
+  it('clears the crash-restart streak once the CLI reports ready again', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-ready-clears-streak', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+    expect(restartCounts.get('sid-ready-clears-streak')?.permanentCount).toBe(1);
+
+    // The CLI comes up for real.
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(restartCounts.has('sid-ready-clears-streak')).toBe(false);
+
+    // So the NEXT permanent exit gets its own fresh single chance instead of
+    // being killed on arrival by a stale streak.
+    worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'restart', reason: 'cli_crash' }));
   });
 
 });

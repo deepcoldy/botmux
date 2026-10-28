@@ -239,8 +239,13 @@ export interface CodexBridgeEvent {
    *     without starting, closing, or otherwise advancing the queue
    *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
    *     output) attributed to the collecting turn for the CoT message; it
-   *     never starts or closes a turn */
-  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
+   *     never starts or closes a turn
+   *   - 'input_queued' (Pi) says the CLI accepted the next input while busy
+   *     and holds it until its current work ends; the head keeps its place
+   *     instead of expiring, but is NOT started (the running work is not it)
+   *   - 'cli_settled' (Pi) says the CLI finished all queued work; a head
+   *     still held by it was not taken up and resumes its normal lease */
+  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot' | 'input_queued' | 'cli_settled';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
@@ -265,6 +270,10 @@ export interface CodexBridgeEvent {
    *  can use it to bind cosmetic/terminal events to the exact started turn
    *  instead of relying solely on whichever turn is currently collecting. */
   sourceTurnId?: string;
+  /** Identity of a genuine native user message. TRAE can accept several
+   * messages into one running turn; different message ids are real steering
+   * inputs, while mirrors of the same message must remain idempotent. */
+  sourceMessageId?: string;
   /** The transcript parser has positive evidence that this user record starts
    * a distinct native turn while an older id-less turn remains open. */
   preserveCollecting?: boolean;

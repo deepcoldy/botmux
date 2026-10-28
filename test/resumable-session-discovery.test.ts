@@ -7,6 +7,7 @@ import {
   discoverRolloutSessions,
   discoverAntigravitySessions,
   isBotmuxInjectedPrompt,
+  claudeFirstUserTurn,
 } from '../src/services/resumable-session-discovery.js';
 import { traexRolloutUserInputs, traexSessionIdFromRolloutPath } from '../src/services/traex-transcript.js';
 import { GOAL_COMMAND, GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
@@ -498,6 +499,27 @@ describe('discoverClaudeFamilySessions (Claude-family / Genius)', () => {
     const out = await discoverClaudeFamilySessions(dataDir, 10);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({ cliSessionId: 'skill-only-ai', cwd: '/work/demo', title: '修复登录页样式' });
+  });
+});
+
+describe('claudeFirstUserTurn (first-prompt rule shared with live /adopt titles)', () => {
+  const user = (content: unknown, extra: Record<string, unknown> = {}) =>
+    ({ type: 'user', message: { role: 'user', content }, ...extra });
+
+  it('keeps scanning past records that cannot be the first prompt', () => {
+    expect(claudeFirstUserTurn(user('a side question', { isSidechain: true }))).toBeUndefined();
+    expect(claudeFirstUserTurn({ type: 'assistant', message: { role: 'assistant', content: 'ok' } })).toBeUndefined();
+    expect(claudeFirstUserTurn(user([{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }]))).toBeUndefined();
+    expect(claudeFirstUserTurn(user('skill body expansion', { isMeta: true }))).toBeUndefined();
+    expect(claudeFirstUserTurn(user('<command-name>/clear</command-name>'))).toBeUndefined();
+    expect(claudeFirstUserTurn(user('<local-command-stdout></local-command-stdout>'))).toBeUndefined();
+  });
+
+  it('reports a botmux envelope as origin (isMeta turns too) and returns the real prompt trimmed but uncut', () => {
+    expect(claudeFirstUserTurn(user('<user_message>hi</user_message>'))).toEqual({ botmux: true });
+    expect(claudeFirstUserTurn(user('<user_message>hi</user_message>', { isMeta: true }))).toEqual({ botmux: true });
+    const long = 'fix the parser bug '.repeat(10).trim();
+    expect(claudeFirstUserTurn(user([{ type: 'text', text: `  ${long}\n` }]))).toEqual({ botmux: false, prompt: long });
   });
 });
 

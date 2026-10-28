@@ -9,6 +9,7 @@ import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import { countHerdrTabGroups, herdrTabGroupKey, joinLiveTitle } from '../../utils/live-title.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
@@ -27,6 +28,7 @@ import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
+import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -135,7 +137,7 @@ export function contextCompactThreshold(): number {
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
   { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
-  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm'] },
+  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm', 'trustSameOwnerBots'] },
 ];
 
 function configSelect(placeholder: string, initial: string, options: Array<{ text: string; value: string }>, value: Record<string, string>): any {
@@ -170,7 +172,7 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     text: {
       tag: 'lark_md',
       content: t('card.config.summary', {
-        cli: data.cliId, model: data.model ?? def, lang: data.lang ?? def, admins: data.admins,
+        cli: data.cliId, model: (data.model ? data.modelChoiceLabels?.[data.model] ?? data.model : def), lang: data.lang ?? def, admins: data.admins,
       }, locale),
     },
   });
@@ -183,8 +185,14 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   ];
   if (data.modelChoices.length > 0) {
     runSelects.push(configSelect('model', data.model ?? CONFIG_UNSET,
-      [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: m, value: m }))],
+      [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: data.modelChoiceLabels?.[m] ?? m, value: m }))],
       { action: 'config_set', field: 'model', ...locVal }));
+  }
+  if (data.reasoningEfforts && data.reasoningEfforts.length > 0) {
+    runSelects.push(configSelect(t('card.config.effort', undefined, locale),
+      data.reasoningEffort ?? CONFIG_UNSET,
+      [{ text: def, value: CONFIG_UNSET }, ...data.reasoningEfforts.map(level => ({ text: level, value: level }))],
+      { action: 'config_set', field: 'reasoningEffort', ...locVal }));
   }
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
@@ -204,6 +212,8 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     ],
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
+
+  if (data.cliId === 'zcode') elements.push({ tag: 'div', text: { tag: 'plain_text', content: locale === 'en' ? 'Model changes apply to new topics. Existing topics keep their own model and conversation.' : '模型修改对新话题生效；已有话题保留各自的模型和对话。' } });
 
   // ── 布尔开关分组 ─────────────────────────────────────────────────────────
   const onMap = new Map(data.booleans.map(b => [b.key, b.on]));
@@ -538,6 +548,19 @@ export function buildSessionCard(
  * The "▶️ 恢复会话" button still goes through botmux — it re-enables the
  * Lark bridge so future replies route back into this topic.
  */
+/**
+ * The closed card's worktree section (#698), present only when the session's
+ * working dir is a worktree botmux created. Absent → the card is byte-for-byte
+ * the legacy one. Present → the card is shareable-updatable so the click result
+ * can replace it in place.
+ */
+export interface ClosedCardWorktreeCleanup {
+  /** Markdown under the body: the offer, "checking…", or the click result. */
+  note: string;
+  /** Show the button: the offer, or a refusal the user can fix and retry. */
+  button: boolean;
+}
+
 export function buildSessionClosedCard(
   sessionId: string,
   rootId: string,
@@ -548,6 +571,7 @@ export function buildSessionClosedCard(
   locale?: Locale,
   runtimeDisplayName?: string,
   resumeStartsFresh?: boolean,
+  worktreeCleanup?: ClosedCardWorktreeCleanup,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
@@ -564,19 +588,37 @@ export function buildSessionClosedCard(
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
     dirLine;
-  const card = simpleCard({
-    title: t('card.status.session_closed', undefined, locale),
-    template: 'grey',
-    markdown: body,
-    buttons: [
-      callbackButton(
-        t('card.btn.resume_session', undefined, locale),
-        'primary',
-        { action: 'resume', ...actionBase },
-      ),
+  const resumeButton = callbackButton(
+    t('card.btn.resume_session', undefined, locale),
+    'primary',
+    { action: 'resume', ...actionBase },
+  );
+  if (!worktreeCleanup) {
+    return JSON.stringify(simpleCard({
+      title: t('card.status.session_closed', undefined, locale),
+      template: 'grey',
+      markdown: body,
+      buttons: [resumeButton],
+    }));
+  }
+  // The button carries only the session id: the directory is re-read from the
+  // session row and botmux's creation record on click, never from the card.
+  const buttons = worktreeCleanup.button
+    ? [resumeButton, callbackButton(
+        t('card.btn.cleanup_worktree', undefined, locale),
+        'default',
+        { action: CLEANUP_SESSION_WORKTREE_ACTION, root_id: rootId, session_id: sessionId },
+      )]
+    : [resumeButton];
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.status.session_closed', undefined, locale), 'grey'),
+    elements: [
+      { tag: 'markdown', content: body },
+      { tag: 'markdown', content: worktreeCleanup.note },
+      { tag: 'action', actions: buttons },
     ],
-  });
-  return JSON.stringify(card);
+    extraConfig: { update_multi: true },
+  }));
 }
 
 /** Parent-topic panel for `/fork <task>`. Links and live/closed state are
@@ -1378,6 +1420,9 @@ export interface RepoSelectRecovery {
   missingPath: string;
   /** Branch the deleted worktree had; absent → no rebuild button. */
   rebuildBranch?: string;
+  /** The session's first message has not started: choosing a directory starts
+   *  it there, so the card asks for a directory rather than a resend. */
+  opening?: boolean;
 }
 
 function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number, recovery?: RepoSelectRecovery): string {
@@ -1403,7 +1448,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
 
   const card = wideCard({
     header: recovery
-      ? cardHeaderTemplateFirst('orange', t('card.repo.recovery_title', undefined, locale))
+      ? cardHeaderTemplateFirst('orange', t(recovery.opening ? 'card.repo.recovery_title_opening' : 'card.repo.recovery_title', undefined, locale))
       : cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
     elements: [
       // Recovery: the missing directory + 「重建 worktree」take the top row. There
@@ -1418,7 +1463,13 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             width: 'auto',
             vertical_align: 'center',
             elements: [
-              larkMdDiv(t(recovery.rebuildBranch ? 'card.repo.recovery_missing' : 'card.repo.recovery_missing_no_rebuild', { path: escapeMd(recovery.missingPath) }, locale)),
+              larkMdDiv(t(
+                recovery.opening
+                  ? 'card.repo.recovery_missing_opening'
+                  : recovery.rebuildBranch ? 'card.repo.recovery_missing' : 'card.repo.recovery_missing_no_rebuild',
+                { path: escapeMd(recovery.missingPath) },
+                locale,
+              )),
             ],
           },
           ...(recovery.rebuildBranch ? [{
@@ -1612,7 +1663,11 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
         elements: [
           {
             tag: 'lark_md',
-            content: t(recovery ? 'card.repo.recovery_note' : 'card.repo.note', undefined, locale),
+            content: t(
+              recovery ? (recovery.opening ? 'card.repo.recovery_note_opening' : 'card.repo.recovery_note') : 'card.repo.note',
+              undefined,
+              locale,
+            ),
           },
         ],
       },
@@ -2872,7 +2927,8 @@ export interface AdoptPickerEntry {
   /** resume: the CLI's native title when the transcript has one, else the
    *  first real user prompt (see ResumableSession.title); live: backend /
    *  CLI display name (herdr pane label / Claude terminal title / TraeX native
-   *  title, see AdoptableSession.title and ZellijAdoptableSession.title) or the
+   *  title, see AdoptableSession.title and ZellijAdoptableSession.title; herdr
+   *  entries whose tab was found are named after it, see herdrTabTitle) or the
    *  Orca terminal title, else project (cwd basename). */
   title: string;
   /** cwd basename, shown compactly. */
@@ -2883,6 +2939,10 @@ export interface AdoptPickerEntry {
   sessionId?: string;
   /** live: tmux/zellij/herdr target label. */
   target?: string;
+  /** live herdr: workspace name shown ahead of `target` on the Location line. */
+  targetWorkspace?: string;
+  /** Search-only text, never rendered (live herdr: workspace and tab names). */
+  searchAliases?: string[];
   /** live: startedAt (uptime); resume: lastActivityAt. */
   timeMs?: number;
   /** One-based position among history candidates, for same-screen disambiguation. */
@@ -2914,6 +2974,25 @@ export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession | Orca
   return `live:${adoptTargetKey(s)}`;
 }
 
+/** Title of a live herdr entry named after its tab. Alone in the tab: pane
+ *  label > the tab's given name > native title (Claude: terminal title, else
+ *  first prompt) > the tab's default name. Sharing the tab with other entries
+ *  of this card: `<tab> · <pane label | native title | untitled>`. Undefined
+ *  unless the picker's enrichment found the tab; the caller then keeps the
+ *  discovery title exactly as before. */
+function herdrTabTitle(s: AdoptableSession, tabGroups: Map<string, number>, untitled: string): string | undefined {
+  if (s.source !== 'herdr' || !s.herdrTabLabel || s.herdrTabAutoNamed === undefined) return undefined;
+  const groupKey = herdrTabGroupKey(s);
+  const native = s.herdrNativeTitle ?? s.herdrFirstPrompt;
+  if ((groupKey ? tabGroups.get(groupKey) ?? 0 : 0) > 1) {
+    return joinLiveTitle(s.herdrTabLabel, s.herdrPaneLabel ?? native ?? untitled);
+  }
+  return s.herdrPaneLabel
+    ?? (s.herdrTabAutoNamed ? undefined : s.herdrTabLabel)
+    ?? native
+    ?? s.herdrTabLabel;
+}
+
 /** Fold both adopt sources into one uniform entry list. Live entries come
  *  first (they're the "act now" targets), resume entries after. Order is
  *  stable so pagination is deterministic across re-renders.
@@ -2927,8 +3006,11 @@ export function buildAdoptEntries(
   resumable: ResumableSession[],
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
+  locale?: Locale,
 ): AdoptPickerEntry[] {
   const customName = runtimeDisplayName?.trim();
+  const tabGroups = countHerdrTabGroups(sessions);
+  const untitledLive = t('card.adopt.untitled_live', undefined, locale);
   const live: AdoptPickerEntry[] = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
     const project = s.cwd.split('/').pop() || s.cwd;
@@ -2939,6 +3021,12 @@ export function buildAdoptEntries(
     if (isOrcaAdoptCandidate(s)) target = undefined;
     else if ('zellijPaneId' in s) target = `${s.zellijSession}/${s.zellijPaneId}`;
     else target = adoptTargetLabel(s);
+    // Only herdr / tmux entries carry herdr names; zellij and Orca never do.
+    const herdrLike = isOrcaAdoptCandidate(s) || zellij ? undefined : s;
+    const tabTitle = herdrLike ? herdrTabTitle(herdrLike, tabGroups, untitledLive) : undefined;
+    const workspace = herdrLike?.herdrWorkspaceLabel;
+    const tabName = herdrLike?.herdrTabAutoNamed !== undefined ? herdrLike.herdrTabLabel : undefined;
+    const aliases = [workspace, tabName].filter((a): a is string => !!a);
     return {
       key: adoptLiveKey(s),
       kind: 'live' as const,
@@ -2947,11 +3035,13 @@ export function buildAdoptEntries(
         : zellij ? 'Zellij' : s.source === 'herdr' ? 'Herdr' : 'tmux',
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title,
+      title: tabTitle ?? title,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,
       target,
+      ...(workspace ? { targetWorkspace: workspace } : {}),
+      ...(aliases.length > 0 ? { searchAliases: aliases } : {}),
       timeMs: s.startedAt,
     };
   });
@@ -2982,14 +3072,15 @@ export interface AdoptPickerState {
 const ADOPT_PICKER_PAGE_SIZE = 5;
 const ADOPT_SEARCH_FIELD = 'adopt_search_q';
 
-/** Case-insensitive substring over title / project / cwd / cliId / sessionId.
- *  Empty query matches everything. Includes sessionId so a user who knows the
- *  id can type it and jump straight to the entry. */
+/** Case-insensitive substring over title / project / cwd / cliId / sessionId /
+ *  target and the search-only aliases (herdr workspace / tab names, which the
+ *  title may not show). Empty query matches everything. Includes sessionId so a
+ *  user who knows the id can type it and jump straight to the entry. */
 function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefined): AdoptPickerEntry[] {
   const q = (query ?? '').trim().toLowerCase();
   if (!q) return entries;
   return entries.filter((e) => {
-    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target]
+    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target, ...(e.searchAliases ?? [])]
       .filter(Boolean)
       .join(' ')
       .toLowerCase();
@@ -3017,7 +3108,7 @@ export function buildAdoptSelectCard(
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
 ): string {
-  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName);
+  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName, locale);
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
   const selectedKey = state?.selectedKey;
@@ -3120,7 +3211,12 @@ export function buildAdoptSelectCard(
       `${labelDir}: ${inlineCode(e.cwd)}`,
     ];
     if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
-    if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: ${inlineCode(e.target)}`);
+    if (e.kind === 'live' && e.target) {
+      const target = inlineCode(e.target);
+      lines.push(`${labelTarget}: ${e.targetWorkspace
+        ? t('card.adopt.location_with_workspace', { workspace: escapeMd(e.targetWorkspace), target }, locale)
+        : target}`);
+    }
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({
       tag: 'interactive_container',

@@ -35,6 +35,14 @@ describe('worker IPC preload', () => {
     expect(handled).toHaveBeenCalledWith(init);
   });
 
+  it('acknowledges a board batch cold-start init (board: is part of the ordinary-turn family)', () => {
+    const host = new FakeIpcHost();
+    const init = { type: 'init', prompt: '【决策看板 · 批次 #3】', turnId: 'board:cli_s:3' };
+    installWorkerIpcPreload(host);
+    host.emit('message', init);
+    expect(host.send).toHaveBeenCalledWith({ type: 'turn_input_received', turnId: 'board:cli_s:3' });
+  });
+
   it('buffers non-ordinary init without forging a delivery receipt', () => {
     const host = new FakeIpcHost();
     const handled = vi.fn();

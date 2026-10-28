@@ -70,7 +70,11 @@ it('keeps authored rich text and all resource references while excluding resourc
   expect(f.capture(f.raw('om_post', 'post', content))).toBe(true);
   const input = f.store.read().inputs[0];
   expect(input.text).toBe('Design\ninspect only');
-  expect(input.attachments?.map(ref => ref.key)).toEqual(['img_key', 'file_key', 'preview_key', 'other_key', 'video_key']);
+  // A rich-text media node contributes its VIDEO body (file_key) instead of its
+  // poster thumbnail: the poster was the historical wrong download target (the
+  // model received a ~9KB cover JPEG named *.mp4). A poster-only media node
+  // still falls back to the image key, covered in the parser suite.
+  expect(input.attachments?.map(ref => ref.key)).toEqual(['img_key', 'file_key', 'video_key', 'other_key']);
   const imageOnly = { en_us: { content: [[{ tag: 'img', image_key: 'img_only' }]] } };
   expect(f.capture(f.raw('om_only', 'post', imageOnly))).toBe(true);
   expect(f.store.read().inputs[1].text).toBe('');

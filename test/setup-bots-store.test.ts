@@ -39,7 +39,7 @@ describe('writeBotsJsonAtomic', () => {
   });
 
   it('cleans up the tmp file after rename (only bots.json remains)', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_2' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_2', larkAppSecret: 's2' }]);
     expect(existsSync(botsPath + '.tmp')).toBe(false);
     expect(existsSync(botsPath)).toBe(true);
   });
@@ -63,12 +63,12 @@ describe('writeBotsJsonAtomic', () => {
     // 通过 spy fs.writeFileSync 监控 tmp 路径 — 简单版: 检查 bots.json.tmp 在
     // bots.json 同目录. 实现细节: 只要写完 + rename 完不出错, 同目录假设成立.
     // 这里跑一次 + 校验 bots.json 出现在 tmpDir, 间接保证 tmp 路径也在 tmpDir.
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_t' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_t', larkAppSecret: 's' }]);
     expect(existsSync(join(tmpDir, 'bots.json'))).toBe(true);
   });
 
   it('rejects a cloned next generation that would create a fallback cycle', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_safe' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_safe', larkAppSecret: 's' }]);
     const before = readFileSync(botsPath, 'utf8');
     expect(() => writeBotsJsonAtomic(botsPath, [
       { larkAppId: 'cli_a', quotaFallbackBot: { enabled: true, targetAppId: 'cli_b' } },
@@ -80,6 +80,7 @@ describe('writeBotsJsonAtomic', () => {
   it('rejects setup writes that retain Codex browser config after switching CLI', () => {
     const original = {
       larkAppId: 'cli_browser',
+      larkAppSecret: 's',
       cliId: 'codex-app',
       codexBrowser: { enabled: true, family: 'chrome' },
     };
@@ -94,10 +95,11 @@ describe('writeBotsJsonAtomic', () => {
   it('allows editing another bot when an unchanged legacy entry violates an invariant', () => {
     const legacyInvalid = {
       larkAppId: 'cli_legacy',
+      larkAppSecret: 's',
       cliId: 'claude-code',
       codexBrowser: { enabled: true, family: 'chrome' },
     };
-    const editable = { larkAppId: 'cli_editable', cliId: 'codex-app', lang: 'en' };
+    const editable = { larkAppId: 'cli_editable', larkAppSecret: 's', cliId: 'codex-app', lang: 'en' };
     writeFileSync(botsPath, JSON.stringify([legacyInvalid, editable], null, 2));
 
     expect(() => writeBotsJsonAtomic(botsPath, [legacyInvalid, { ...editable, lang: 'zh' }]))
@@ -117,7 +119,7 @@ describe('readBotsJsonOrEmpty', () => {
   });
 
   it('returns parsed array when file is valid', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'a' }, { larkAppId: 'b' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'a', larkAppSecret: 's' }, { larkAppId: 'b', larkAppSecret: 's' }]);
     expect(readBotsJsonOrEmpty(botsPath).map((b: any) => b.larkAppId)).toEqual(['a', 'b']);
   });
 });

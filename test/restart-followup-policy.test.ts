@@ -283,3 +283,31 @@ describe('decideUpgradeLaunchConvergence', () => {
     expect(decideUpgradeLaunchConvergence({ upgradeLaunch, current: { ...upgradeLaunch, model: 'per-message-refresh' }, restartRequested: undefined })).toBe(false);
   });
 });
+
+
+describe('Auto restart launch convergence', () => {
+  const pool = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 30_000,
+    modelSettings: { core: { reasoningEffort: 'high' as const } } };
+  it('preserves Auto policy and resolved model settings in the launch snapshot', () => {
+    const config = { model: 'core', traexAutoModel: pool, reasoningEffort: 'high', modelBackendVariant: 'max',
+      envUnset: ['HTTP_PROXY'], envFingerprint: 'stamp' } as any;
+    expect(restartLaunchSettings(config)).toMatchObject(config);
+  });
+  it.each([
+    { traexAutoModel: { ...pool, models: ['core', 'other'] } },
+    { traexAutoModel: { ...pool, modelSettings: { core: { reasoningEffort: 'xhigh' as const } } } },
+    { reasoningEffort: 'xhigh' }, { modelBackendVariant: 'standard' },
+    { envUnset: ['API_TOKEN'] }, { envFingerprint: 'new-stamp' },
+  ])('converges a folded request whose launch settings changed (%j)', change => {
+    const before = restartLaunchSettings({ model: 'core', traexAutoModel: pool, reasoningEffort: 'high',
+      modelBackendVariant: 'max', envUnset: ['HTTP_PROXY'], envFingerprint: 'stamp' } as any);
+    const requested = restartLaunchSettings({ ...before, ...change } as any);
+    expect(classifyMergedRestart({ windowLaunch: before, requested, convergencePending: false })).toBe('converge');
+    expect(decideRestartFollowup({ spawnedWorkingDir: '/w', currentWorkingDir: '/w', backendAlive: true,
+      spawnedLaunch: before, requestedLaunch: requested })).toEqual({ kind: 'launch-config', skipRestartBudget: true });
+  });
+  it('distinguishes explicit RPC false from inheritance, and ignores unset order', () => {
+    expect(sameRestartLaunchSettings({}, { codexRpcInput: false })).toBe(false);
+    expect(sameRestartLaunchSettings({ envUnset: ['A', 'B'] } as any, { envUnset: ['B', 'A'] } as any)).toBe(true);
+  });
+});

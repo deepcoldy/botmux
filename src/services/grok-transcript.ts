@@ -505,6 +505,14 @@ function normaliseNewlines(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+/** The text Grok's composer submits for pasted `text` (measured identical on
+ *  1.0.5 / 1.0.13 / 1.0.67 / 1.0.70): every tab becomes four spaces and every
+ *  `\r` becomes `\n`, so a CRLF turns into a blank line. prompt_history stores
+ *  this trimmed; the `prompt.enqueue` log line counts its UTF-8 bytes untrimmed. */
+export function grokComposerText(text: string): string {
+  return text.replace(/\t/g, '    ').replace(/\r/g, '\n');
+}
+
 /**
  * Scan the bucket-level prompt_history.jsonl from `fromByte` for a submit
  * whose `prompt` equals `expectedText` (modulo newline normalisation — the
@@ -512,8 +520,9 @@ function normaliseNewlines(text: string): string {
  * written at submit time for an IDLE composer ("even while a turn is
  * running" was verified on 0.2.93 but no longer holds on 1.0.5: a mid-turn
  * submit parks in grok's queue and appends only at DEQUEUE, the instant the
- * previous turn completes — so busy-turn verifies miss until then). Returns
- * the owning session id when found.
+ * previous turn completes — so busy-turn verifies miss until then; see
+ * {@link matchGrokPromptEnqueue} for that receipt). Returns the owning session
+ * id when found.
  *
  * Concurrent safety: the file is cwd-bucket shared. Two workers in the same
  * repo can append identical prompt text under different session_ids. Callers
@@ -541,6 +550,7 @@ export function matchGrokPromptAppend(
   } catch { return { found: false }; }
   const expected = normaliseNewlines(expectedText);
   const expectedTrimmed = expected.trim();
+  const expectedComposer = grokComposerText(expectedText).trim();
   const matches: Array<{ cliSessionId?: string }> = [];
   for (const line of buf.toString('utf8').split('\n')) {
     if (!line) continue;
@@ -549,8 +559,10 @@ export function matchGrokPromptAppend(
     if (typeof obj?.prompt !== 'string') continue;
     const got = normaliseNewlines(obj.prompt);
     // Exact match modulo newline normalisation; trim fallback tolerates the
-    // composer stripping leading/trailing whitespace on submit.
-    if (obj.prompt === expectedText || got === expected || got.trim() === expectedTrimmed) {
+    // composer stripping leading/trailing whitespace on submit; the composer
+    // form covers a body with tabs or CRLF, which Grok rewrites before storing.
+    if (obj.prompt === expectedText || got === expected || got.trim() === expectedTrimmed
+      || obj.prompt.trim() === expectedComposer) {
       const sid = typeof obj.session_id === 'string' && SESSION_UUID_RE.test(obj.session_id)
         ? obj.session_id
         : undefined;
@@ -580,6 +592,55 @@ export function matchGrokPromptAppend(
   }
   // Matched text but no session_id fields — confirm submit without rotation.
   return { found: true };
+}
+
+/** Grok trims its unified log by rewriting it. Once the file is shorter than
+ *  a write's baseline only its tail can hold that write's line. */
+const UNIFIED_LOG_SHRUNK_TAIL_BYTES = 1024 * 1024;
+
+/**
+ * Scan Grok's unified log from `fromByte` for the composer accepting this
+ * submit: a `prompt.enqueue` line from `pid` whose `ctx.len` is the UTF-8 byte
+ * length of {@link grokComposerText}(`expectedText`) and whose `ts` is not
+ * before `sinceMs`.
+ *
+ * Grok writes that line when Enter lands, idle or mid-turn (measured 1.0.5 –
+ * 1.0.70), whereas prompt_history and updates.jsonl record a queued follow-up
+ * only at dequeue. It is therefore the receipt for a busy-turn submit.
+ *
+ * The file is shared by every Grok process under GROK_HOME, so only an exact
+ * `pid` counts. A PID-namespaced sandbox logs its inner pid, which can collide
+ * across sandboxes: it never matches and the caller keeps relying on
+ * prompt_history. `sinceMs` rejects an earlier same-length submit whose line
+ * was flushed late.
+ */
+export function matchGrokPromptEnqueue(
+  path: string,
+  fromByte: number,
+  expectedText: string,
+  opts: { pid: number; sinceMs: number },
+): boolean {
+  if (!expectedText || !existsSync(path)) return false;
+  let size: number;
+  try { size = statSync(path).size; } catch { return false; }
+  const start = size < fromByte ? Math.max(0, size - UNIFIED_LOG_SHRUNK_TAIL_BYTES) : fromByte;
+  if (size <= start) return false;
+  const buf = Buffer.alloc(size - start);
+  try {
+    const fd = openSync(path, 'r');
+    try { readSync(fd, buf, 0, buf.length, start); } finally { closeSync(fd); }
+  } catch { return false; }
+  const expectedBytes = Buffer.byteLength(grokComposerText(expectedText), 'utf8');
+  for (const line of buf.toString('utf8').split('\n')) {
+    if (!line.includes('"prompt.enqueue"')) continue;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; } // partial tail — later poll re-reads
+    if (obj?.msg !== 'prompt.enqueue' || obj.pid !== opts.pid) continue;
+    if (obj.ctx?.len !== expectedBytes) continue;
+    const atMs = typeof obj.ts === 'string' ? Date.parse(obj.ts) : NaN;
+    if (Number.isFinite(atMs) && atMs >= opts.sinceMs) return true;
+  }
+  return false;
 }
 
 function looksLikeBotmuxPrompt(text: string): boolean {

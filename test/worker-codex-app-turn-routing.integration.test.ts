@@ -3,9 +3,7 @@ import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
-  existsSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,6 +13,7 @@ import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { codexAppControlStatePath } from '../src/utils/codex-app-control.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 
 // The worker inherits process.env, so its panes live on this server.
 const managedTmuxArgs = tmuxSocketArgs(preferredManagedTmuxSocket(process.env));
@@ -182,8 +181,7 @@ function waitFor(
 }
 
 function readRequests(path: string): Array<Record<string, any>> {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  return readJsonLines(path);
 }
 
 describe('Codex App worker queued-turn attribution', () => {

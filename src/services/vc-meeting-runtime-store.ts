@@ -1,3 +1,5 @@
+import { normalizeVcMeetingListenerPolicy, resolveVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './vc-meeting-listener-policy.js';
+import { isVcMeetingInviterGrant, type VcMeetingInviterGrant } from './vc-meeting-inviter-policy.js';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -58,6 +60,8 @@ export interface VcMeetingRuntimeSessionRecord {
   };
   listenerChatId: string;
   attentionTargetOpenId?: string;
+  inviterManagers?: VcMeetingInviterGrant[];
+  listenerChatCreatedForMeeting?: boolean;
   consumerMode?: 'pending' | 'listenOnly' | 'agent';
   selectedAgents: VcMeetingRuntimeSelectedAgent[];
   /** @deprecated Derived only when selectedAgents contains exactly one entry. */
@@ -74,6 +78,7 @@ export interface VcMeetingRuntimeSessionRecord {
   textOutputPolicy?: VcMeetingOutputPolicy;
   voiceOutputPolicy?: VcMeetingOutputPolicy;
   syncIntervalMs?: number;
+  listenerPolicy?: VcMeetingListenerPolicy;
   consumerSelectionExpiresAt?: number;
   consumerCardMessageId?: string;
   /** Durable fence set when the listener bot's own participant_left event is observed. */
@@ -520,6 +525,9 @@ function hasValidCurrentOptionalFields(r: Record<string, unknown>): boolean {
   ] as const) {
     if (hasOwnField(r, key) && (typeof r[key] !== 'string' || !r[key].trim())) return false;
   }
+  if (hasOwnField(r, 'inviterManagers') && (!Array.isArray(r.inviterManagers)
+    || !r.inviterManagers.every(isVcMeetingInviterGrant))) return false;
+  if (hasOwnField(r, 'listenerChatCreatedForMeeting') && typeof r.listenerChatCreatedForMeeting !== 'boolean') return false;
   for (const key of ['temporaryInstructionOpenIds', 'temporaryInstructionUnionIds'] as const) {
     if (hasOwnField(r, key) && !isCanonicalStoredIdList(r[key])) return false;
   }
@@ -587,6 +595,10 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
       ...(typeof m.topic === 'string' && m.topic.trim() ? { topic: m.topic.trim() } : {}),
     },
     listenerChatId: r.listenerChatId.trim(),
+    ...(r.listenerPolicy !== undefined ? { listenerPolicy: resolveVcMeetingListenerPolicy(normalizeVcMeetingListenerPolicy(r.listenerPolicy)) } : {}),
+    ...(Array.isArray(r.inviterManagers) && r.inviterManagers.every(isVcMeetingInviterGrant)
+      ? { inviterManagers: r.inviterManagers.map(g => ({ ...g })) } : {}),
+    ...(r.listenerChatCreatedForMeeting === true ? { listenerChatCreatedForMeeting: true } : {}),
     ...(typeof r.attentionTargetOpenId === 'string' && r.attentionTargetOpenId.trim()
       ? { attentionTargetOpenId: r.attentionTargetOpenId.trim() }
       : {}),
@@ -813,6 +825,8 @@ export function recordVcMeetingRuntimeSession(
     meeting: { id: string; meetingNo?: string; topic?: string };
     listenerChatId: string;
     attentionTargetOpenId?: string;
+    inviterManagers?: VcMeetingInviterGrant[];
+    listenerChatCreatedForMeeting?: boolean;
     consumerMode?: 'pending' | 'listenOnly' | 'agent';
     selectedAgents?: VcMeetingRuntimeSelectedAgent[];
     /** @deprecated Use selectedAgents. Accepted for the P0 daemon writer. */
@@ -827,6 +841,7 @@ export function recordVcMeetingRuntimeSession(
     textOutputPolicy?: VcMeetingOutputPolicy;
     voiceOutputPolicy?: VcMeetingOutputPolicy;
     syncIntervalMs?: number;
+    listenerPolicy?: VcMeetingListenerPolicy;
     consumerSelectionExpiresAt?: number;
     consumerCardMessageId?: string;
     listenerPresenceStale?: boolean;
@@ -876,6 +891,10 @@ export function recordVcMeetingRuntimeSession(
         ...(input.meeting.topic ? { topic: input.meeting.topic } : {}),
       },
       listenerChatId,
+      ...((prior ? prior.listenerPolicy : input.listenerPolicy) !== undefined
+        ? { listenerPolicy: resolveVcMeetingListenerPolicy(prior ? prior.listenerPolicy : input.listenerPolicy) } : {}),
+      ...(input.inviterManagers ? { inviterManagers: input.inviterManagers.map(g => ({ ...g })) } : {}),
+      ...(input.listenerChatCreatedForMeeting === true ? { listenerChatCreatedForMeeting: true } : {}),
       ...(input.attentionTargetOpenId ? { attentionTargetOpenId: input.attentionTargetOpenId } : {}),
       ...(input.consumerMode ? { consumerMode: input.consumerMode } : {}),
       selectedAgents,

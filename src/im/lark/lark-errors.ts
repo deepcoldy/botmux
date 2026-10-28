@@ -28,6 +28,8 @@ export const LARK_CODE_CONTACT_NO_SUCH_USER = 41012;
 /** Contact API：目标用户在本应用通讯录可见范围之外。 */
 export const LARK_CODE_CONTACT_NOT_VISIBLE = 41050;
 
+/** 消息 API 内部错误；合并转发请求 user_card_content 时可触发。 */
+export const LARK_CODE_MESSAGE_INTERNAL_ERROR = 2200;
 /** 目标消息已撤回。 */
 export const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
 /** 消息超出可编辑时限（仍存在，只是不能再 PATCH）。 */
@@ -38,6 +40,9 @@ export const LARK_CODE_MESSAGE_BEING_SENT = 230049;
 export const LARK_CODE_CHAT_RATE_LIMITED = 230020;
 /** 卡片内容被拒（含 ErrCode 200570 的无效图片 key 子类，见 card-image-fallback）。 */
 export const LARK_CODE_CARD_CONTENT_REJECTED = 230099;
+/** 消息内容超出长度上限（"The length of the message content reaches its limit."），
+ *  同一份内容重试永远发不出去。 */
+export const LARK_CODE_MESSAGE_CONTENT_TOO_LONG = 230025;
 /** ephemeral/v1/send 的目标是话题群 / thread 会话（临时卡片只支持普通 group）。 */
 export const LARK_CODE_EPHEMERAL_NOT_GROUP = 18053;
 

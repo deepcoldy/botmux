@@ -41,6 +41,22 @@ mcode 的 OAuth 账号键包含数据目录的原始路径。Linux 上 HOME 或�
 
 默认权限对应 ACP 的 `bypassPermissions`，`disableCliBypass: true` 时对应原生 `auto`（与原 exec 的 `full` / `smart` 一致）。模型和思考等级通过原生 `session/set_config_option` 配置，只接受 CLI 实际提供的选项，不支持时明确失败。Botmux 会话 fork 仍明确拒绝。
 
+### 单轮预算与压缩
+
+Dashboard 的机器人 Agent 设置支持 MiniMax Code 的「单轮总预算（分钟）」，保存到 `turnTimeoutMs` 并传入 runner 的 `--turn-timeout-ms`。**缺省不设置整轮时长上限**，正常长任务不再被 Botmux 在 10 分钟时中止；需要主动限制成本时可设为 60 分钟（`3600000`ms）。合法范围为 `1..2147483647` 毫秒，清空取消上限，修改其他设置保留原值。保存后在下一次会话拉起时生效，不会更新已运行 runner 的参数。
+
+只有显式配置才启用累计执行时间预算，模型输出、读代码、执行工具均不会续期；通过默认 ACP 传输等待真人选择或权限确认时暂停，作答后继续扣除剩余预算。耗尽提示明确给出预算上限，与主动中断和原生执行失败区分；预算耗尽本身不能证明无进展。中断后下一轮仍可按同一原生 Session ID 继续。
+
+这与 dsh、Codex App 的默认策略一致：把正常轮次的结束交给原生协议，不设置隐式的整轮倒计时。dsh 显式配置的 `turnTimeoutMs` 是可续期的静默超时并有 4 倍总时长上限；MiniMax 保留此前显式配置的**总预算**含义，界面分别说明，避免已有配置改变行为。Codex App 的常规无进展检测仅提示、不会取消任务；MiniMax 不把静默等同于失败，也不新增静默自动取消。ACP 初始化、恢复和配置请求仍有 30 秒响应超时；原生进程退出、协议错误、用户取消和关闭会话仍会回收进程并结束当前等待。
+
+兼容 exec 传输未配置时不向原生注入 `--timeout`；这只保证 Botmux 不强加整轮上限，原生版本或 Provider 自身的限制仍可能生效。exec 是单向非交互传输，没有接入 Ask/权限选择卡，不能套用 ACP 的真人等待暂停语义；显式预算同时传给原生 `--timeout`，按原生墙钟规则执行。需要真人交互时使用默认 ACP 传输。
+
+当前 framed runner 没有原生压缩接线：卡片不显示压缩按钮，旧卡片回调也会拒绝；手动斜杠命令不会走裸输入透传。普通消息和恢复仍使用结构化消息帧。需要使用原生 TUI 功能时，可在原数据目录下通过 `mcode --session <id>` 进入会话。
+
+![MiniMax 单轮预算设置](assets/minimax-turn-budget-settings.png)
+
+页面组件预览使用合成配置和本地模拟接口；截图不代表线上配置已经修改。
+
 ### 原生提问选择卡
 
 mcode 调用原生 `ask_user` 工具时，ACP 发出 `elicitation/create` 表单请求；runner 将其转换成现有 Botmux Ask 服务的问题，显示飞书选择卡。用户提交后按原始选项 ID 返回 ACP 响应，原生会话接着执行。纯选择题可批量展示；自由文本按字段分别收集；原生 Other 字段仅在选择 Other 时追问。单个允许 Other 的选择题也接受直接文字回复，多题文字不会被猜测分配到每个字段。可选项允许明确跳过。推荐项不会自动作答。
@@ -75,16 +91,26 @@ runner 忽略坏帧及非协议输入，后续合法消息仍可执行。输入�
 
 ## 验证
 
+MiniMax 的 final `errorCode` 会进入 worker 的真实终态：`turn_budget_exhausted` 与 `execution_failed` 为 `failed`，`cancelled` 为 `cancelled`。普通回复卡显示两类失败的错误码；主动取消通过既有停止状态收尾。HTTP 等待不会把错误诊断当成成功答案，异步结果保存原始失败码或 `interrupted` 状态；开启轮次结果查询时，`execution.errorCode` 保留原因。后续成功轮次不会继承前一轮的错误。
+
+![MiniMax 失败原因卡片本地预览](assets/minimax-failure-reasons.png)
+
+仓库的 **MiniMax native long task** 工作流每天 UTC 03:20 在主线自动执行，也可通过 Actions 的 **Run workflow** 对指定分支手动运行。它在隔离目录安装固定的 mcode 0.6.5，在 Node 与 Bun 两个 job 中各跑新建/恢复两条 610 秒探针，日志保留 14 天。合成 Provider 由测试自动创建，不需要真实模型账号。该工作流独立于普通 PR CI；普通测试不依赖安装 mcode。
+
 ```bash
 bun run test -- test/minimax-acp.test.ts test/minimax-user-input.test.ts test/minimax-acp-continuation.test.ts test/minimax-usage.test.ts test/sandbox.test.ts test/fs-policy.test.ts
 bun x vitest run --project unit test/minimax-runner.test.ts test/cli-adapters.test.ts test/cli-runner-compiled-entries.test.ts test/cli-id-roster-derivation.test.ts test/ipc-constrained-invocation.test.ts test/worker-app-runner-control-wiring.test.ts test/worker-pipe-initial-screen-order.test.ts test/runner-control-channel.test.ts test/constrained-invocation.test.ts test/model-only-print.test.ts
 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
+# 本地显式运行：真实 exec 默认预算的 610 秒边界探针
+BOTMUX_MCODE_LONG_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-exec-long.e2e.ts
 BOTMUX_MCODE_SANDBOX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
 BOTMUX_MCODE_TMUX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun run test:e2e -- test/minimax-tmux.e2e.ts
 bun run test -- test/pty-reader-compat.test.ts
 bun run test -- test/minimax-usage.test.ts
 bun run build
 ```
+
+显式设置 `BOTMUX_MCODE_LONG_E2E=1` 后，缺少 `BOTMUX_MCODE_E2E_BIN` 或原生 CLI 无法执行均会失败；未开启时仍跳过长测。Bun 原生测试入口为 `BOTMUX_MCODE_LONG_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun test ./test/minimax-exec-long.e2e.ts --timeout=750000`。
 
 原生测试使用隔离 HOME/数据目录及本地合成 OpenAI 服务，实际执行 Bash 写文件，检查 Shell owner 身份和第二轮原生历史。Linux 文件沙盒场景用真实 PTY 拉起 mcode，保持运行超过 90 秒，再验证同一会话恢复；Node 和 Bun 直接驱动均已通过。tmux 测试通过 daemon 使用的 `TmuxPipeBackend` 验证工具、owner、用量回传以及销毁并重建 runner 后按精确 ID 恢复历史，Node 和 Bun 均已通过。该测试仅销毁自己创建的唯一命名会话，不操作共享 tmux server 或其它会话。
 

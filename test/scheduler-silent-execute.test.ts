@@ -589,6 +589,21 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     expect(ds.silentScheduledTurns?.has(secondTurn)).toBe(true);
   });
 
+  it('a hidden run keeps the scheduler run it executes, and a re-fire hands it over with the turn', async () => {
+    // A hidden run that later proves undelivered rewrites exactly this run's
+    // execution-log record (#1607).
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion, undefined, { runId: 'run-first' });
+    const ds = active.get(sessionKey(taskAnchor, APP))!;
+    expect(ds.session.deferredScheduleRun?.runId).toBe('run-first');
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion, undefined, { runId: 'run-second' });
+    expect(ds.session.deferredScheduleRun?.runId).toBe('run-second');
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
+    expect(ds.session.deferredScheduleRun?.runId).toBeUndefined();
+  });
+
   it('live re-fire on the hidden session injects and re-hands materialization ownership', async () => {
     const active = new Map<string, DaemonSession>();
     const session: Session = {

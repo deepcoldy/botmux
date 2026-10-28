@@ -16,6 +16,7 @@ import type {
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
+import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -60,6 +61,22 @@ export interface GroupJoinContext {
   operatorOpenId?: string;
   gateMatched: boolean;
 }
+
+export type TurnTerminalCarrierKind = 'standard_reply_card' | 'non_patchable';
+
+/** Last user-visible output carrier observed for each in-flight turn. The
+ *  worker reconstructs explicit-send entries from the durable turn-sends
+ *  journal before publishing turn_terminal; daemon-owned fallback output is
+ *  recorded directly after Lark accepts it. Retained in a bounded map so a
+ *  duplicate terminal can safely retry after an unconfirmed provider error. */
+export type TurnTerminalCarrier = {
+  messageId: string;
+  kind: TurnTerminalCarrierKind;
+  /** Explicit send classification. `progress` / `auxiliary` are visible
+   *  interim output and must never be promoted to a completed-turn carrier.
+   *  Undefined is retained for rolling compatibility with older workers. */
+  responseKind?: TurnSendKind;
+};
 
 /** Core session state — IM-agnostic.
  *  IM-specific rendering state (ImRenderState) is stored separately
@@ -417,6 +434,10 @@ export interface DaemonSession {
    *  Entries outlive turn_terminal briefly to cover trailing worker events and
    *  are pruned by age/size when new silent turns are armed. */
   silentScheduledTurns?: Map<string, number>;
+  /** The hidden schedule run's turn whose prompt the worker reported the CLI
+   *  never recorded; its settlement reports the run instead of closing it
+   *  quietly. In-memory: a restart closes unmaterialized hidden runs anyway. */
+  deferredScheduleUndeliveredTurnId?: string;
   /** Turn-exact ids for loud external triggers whose connector opted into
    *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
    *  (the streaming card / start notice still show); keyed on the trigger turn
@@ -520,6 +541,10 @@ export interface DaemonSession {
    * until its next real idle edge.
    */
   idleSinceAt?: number;
+  /** Prompt-cache keep-alive bookkeeping for the current idle stretch
+   *  (core/prompt-cache-keepalive.ts). In-memory only; cleared by any real
+   *  turn or busy edge that is not a keep-alive. */
+  promptCacheKeepalive?: import('../services/prompt-cache-policy.js').PromptCacheKeepaliveState;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -543,14 +568,7 @@ export interface DaemonSession {
    *  journal before publishing turn_terminal; daemon-owned fallback output is
    *  recorded directly after Lark accepts it. Retained in a bounded map so a
    *  duplicate terminal can safely retry after an unconfirmed provider error. */
-  turnTerminalCarriers?: Map<string, {
-    messageId: string;
-    kind: 'standard_reply_card' | 'non_patchable';
-    /** Explicit send classification. `progress` / `auxiliary` are visible
-     *  interim output and must never be promoted to a completed-turn carrier.
-     *  Undefined is retained for rolling compatibility with older workers. */
-    responseKind?: 'progress' | 'final' | 'auxiliary';
-  }>;
+  turnTerminalCarriers?: Map<string, TurnTerminalCarrier>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -643,6 +661,8 @@ export interface DaemonSession {
   activeReasoningEffort?: string;
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
+  /** Undefined means no observation; null means native/default context. */
+  activeModelBackendVariant?: 'standard' | 'max' | null;
   /** Claude model fallback still in effect, reported by the worker from the
    *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
    *  without a live worker keeps the notice. Unlike the other runtime facts it
@@ -802,7 +822,9 @@ export interface DaemonSession {
     /** Unguessable Seatbelt pane/profile authority channel. */
     originChannelId?: string;
     turnId?: string;
+    identityTurnId?: string;
     dispatchAttempt?: number;
+    trustedCaller?: TrustedCaller | null;
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
@@ -813,6 +835,47 @@ export interface DaemonSession {
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
   };
+  /** Worker-reported identity storage decision for the CURRENT worker
+   *  generation. Only the worker knows the effective spawn shape (the
+   *  BOTMUX_SANDBOX override, remote-backend bypass, whether bwrap/Seatbelt
+   *  really engaged, and whether the daemon loopback is reachable inside the
+   *  spawn), so the daemon publishes identity material per this report instead
+   *  of deriving sandbox facts itself. Absent (nothing reported yet, or after a
+   *  daemon restart) is consumed fail-closed: publication uses the legacy
+   *  'single' shape and the proven content route refuses. `conflict` marks a
+   *  report the daemon's structural binding check cannot honor (e.g. binding
+   *  disabled after restart): identity publication is withheld on both models
+   *  until a live worker reports again. */
+  reportedIdentityModel?: {
+    model: import('./lark-tool-binding.js').IdentityStorageModel;
+    sandboxEngaged: boolean;
+    loopbackShared: boolean;
+    workerPid: number;
+    workerGeneration: number;
+    reportedAt: number;
+    conflict?: string;
+  };
+  /** Model used by the daemon's LAST actual identity publication for this
+   *  session (in-memory; absent before the first publish or after restart).
+   *  This — not the previous report value — is the flip baseline: after a
+   *  daemon restart the accept-time publication is written single before the
+   *  worker re-reports proven, and that must still count as a real flip even
+   *  though no prior report exists. */
+  lastPublishedIdentityModel?: import('./lark-tool-binding.js').IdentityStorageModel;
+  /** Last replay outcome of the identity-decision flip handler. A successful
+   *  replay moves the publication baseline (so identical reports stop
+   *  flipping); recording `ok:false` lets a later report of the OTHER model
+   *  heal the purge a failed attempt performed. */
+  lastIdentityDecisionRepublish?: {
+    model: import('./lark-tool-binding.js').IdentityStorageModel;
+    turnId: string;
+    ok: boolean;
+  };
+  /** Bounded set of turns the CURRENT worker generation has already sent
+   *  turn_terminal for. Refuses an identity-decision flip replay for a turn
+   *  that is over: a late spawn decision must not resurrect a terminal turn's
+   *  credentials or pin its proven material against GC. FIFO-trimmed. */
+  terminalIdentityTurnIds?: Set<string>;
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;

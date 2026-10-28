@@ -225,6 +225,43 @@ describe('zero injection with structured final reply adapters', () => {
   }
 });
 
+// Input submitted while Pi is busy is written to the session only when Pi
+// dequeues it; the extension records the acceptance at submit time instead.
+describe('pi turn-boundary extension: queued input marker', () => {
+  for (const [name, load] of [
+    ['typed twin', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.js')).default],
+    ['runtime source', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.mjs' as string)).default],
+  ] as const) {
+    it(`${name}: marks input Pi will queue, and nothing for idle input`, async () => {
+      const register = await load();
+      const handlers: Record<string, (event?: any) => any> = {};
+      const appendEntry = vi.fn();
+      register({ on: (event: string, handler: any) => { handlers[event] = handler; }, appendEntry } as any);
+      expect(handlers.input({ type: 'input', text: 'idle', source: 'interactive' })).toBeUndefined();
+      expect(appendEntry).not.toHaveBeenCalled();
+      handlers.input({ type: 'input', text: 'busy', source: 'interactive', streamingBehavior: 'steer' });
+      handlers.input({ type: 'input', text: 'later', source: 'interactive', streamingBehavior: 'followUp' });
+      expect(appendEntry.mock.calls).toEqual([
+        ['botmux-input-queued', { behavior: 'steer' }],
+        ['botmux-input-queued', { behavior: 'followUp' }],
+      ]);
+    });
+
+    it(`${name}: still registers every other handler when the input event is rejected`, async () => {
+      const register = await load();
+      const handlers: Record<string, (event?: any) => any> = {};
+      register({
+        on: (event: string, handler: any) => {
+          if (event === 'input') throw new Error('unknown event');
+          handlers[event] = handler;
+        },
+        appendEntry: vi.fn(),
+      } as any);
+      expect(Object.keys(handlers).sort()).toEqual(['agent_end', 'agent_settled', 'before_agent_start', 'session_start']);
+    });
+  }
+});
+
 describe('claude-code buildArgs', () => {
   it('zero injection omits Botmux system prompts and both plugin directories on fresh and resumed CLI launches', () => {
     for (const resume of [false, true]) {
@@ -276,6 +313,12 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('writes promptCacheTtl into --settings only when configured', () => {
+    const settingsOf = (args: string[]) => JSON.parse(args[args.indexOf('--settings') + 1]);
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false })).promptCacheTtl).toBeUndefined();
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false, promptCacheTtl: '1h' })).promptCacheTtl).toBe('1h');
+  });
+
   it('passes inline --settings that skips the dangerous-mode prompt', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false });
     const idx = args.indexOf('--settings');
@@ -299,6 +342,13 @@ describe('claude-code buildArgs', () => {
     expect(parsed.statusLine.type).toBe('command');
     expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
+  });
+
+  it('installs the StopFailure hook globally, next to the other botmux Claude hooks', () => {
+    // Claude ends API-error turns without running Stop hooks; this is the only
+    // structured signal botmux gets for them (see services/claude-stop-failure.ts).
+    expect(adapter.hookInstall?.format).toBe('claude-settings');
+    expect(adapter.hookInstall?.stopFailureCommand?.endsWith(' __claude-stop-failure-v1')).toBe(true);
   });
 
   it('ignores initialPrompt (not passed via args)', () => {

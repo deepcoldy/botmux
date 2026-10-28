@@ -69,6 +69,33 @@ describe('CLI plugin generation', () => {
     expect(existsSync(user)).toBe(true);
   });
 
+  it('suppresses an unchanged delivered Auto catalog while still refreshing snapshots and publishing removals', () => {
+    const source = join(home, 'skill-src', 'demo');
+    write(join(source, 'SKILL.md'), '---\nname: demo\ndescription: A demo\n---\n# Demo');
+    installLocalSkill(source, { link: false });
+    const opts = { sessionId: 'auto-catalog', bot: { larkAppId: 'app', skills: { include: ['skill:demo'] } },
+      dataDir, cliId: 'traex' as const, adapter: { id: 'traex' } as CliAdapter,
+      workingDir: join(home, 'proj'), prompt: 'first', replacesPriorGeneration: false };
+    const first = prepareCliPluginGeneration(opts);
+    expect(first.prompt).toContain('botmux_skills');
+    const same = prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true,
+      previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(same.prompt).toBe('');
+    expect(same.skillCatalog).toBeUndefined();
+    expect(same.deferredSkillCatalog).toBeUndefined();
+    expect(same.skillReadonlyRoots?.length).toBeGreaterThan(0);
+    expect(readSessionSkillManifest('auto-catalog')?.prioritySkills.map(skill => skill.name)).toEqual(['demo']);
+    const unchangedRealTurn = prepareCliPluginGeneration({ ...opts, prompt: 'next ask', replacesPriorGeneration: true,
+      previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(unchangedRealTurn.prompt).toBe('next ask');
+    const removed = prepareCliPluginGeneration({ ...opts, bot: { larkAppId: 'app' }, prompt: '',
+      replacesPriorGeneration: true, previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(removed.deferredSkillCatalog).toContain('Skills not listed here are no longer available');
+    expect(removed.skillCatalogFingerprint).not.toBe(first.skillCatalogFingerprint);
+    const ordinary = prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true });
+    expect(ordinary.deferredSkillCatalog).toContain('<botmux_skills_refresh>');
+  });
+
   it('replaces Skills and MCP plugin bindings when the same session starts a new CLI process', () => {
     const source = join(home, 'demo-source');
     write(join(source, 'package.json'), JSON.stringify({
@@ -92,9 +119,30 @@ describe('CLI plugin generation', () => {
     installLocalPlugin(source);
     const adapter = { id: 'codex' } as CliAdapter;
 
+    expect(() => prepareCliPluginGeneration({
+      sessionId: 'timeout-ceiling',
+      bot: { larkAppId: 'app', plugins: ['demo'], pluginRuntime: { demo: { toolTimeoutMs: 120_000 } } },
+      global: { plugins: [], mcpGatewayMaxToolTimeoutMs: 60_000 },
+      dataDir,
+      cliId: 'codex',
+      adapter,
+      workingDir: '/repo',
+      prompt: 'test',
+      replacesPriorGeneration: false,
+    })).toThrow('plugin_mcp_tool_timeout_exceeds_max:demo:120000:60000');
+
     const first = prepareCliPluginGeneration({
       sessionId: 'same-session',
-      bot: { larkAppId: 'app-1', plugins: ['demo'] },
+      bot: {
+        larkAppId: 'app-1',
+        plugins: ['demo'],
+        pluginRuntime: {
+          demo: {
+            env: { DEMO_PROFILE: 'test', DEMO_SOCKET: '/tmp/demo.sock' },
+            toolTimeoutMs: 120_000,
+          },
+        },
+      },
       global: { plugins: [] },
       dataDir,
       cliId: 'codex',
@@ -114,7 +162,12 @@ describe('CLI plugin generation', () => {
       pluginIds: ['demo'],
       entries: [{
         pluginId: 'demo',
-        server: { transport: 'stdio', command: ['./mcp/server.mjs'] },
+        toolTimeoutMs: 120_000,
+        server: {
+          transport: 'stdio',
+          command: ['./mcp/server.mjs'],
+          env: { DEMO_PROFILE: 'test', DEMO_SOCKET: '/tmp/demo.sock' },
+        },
       }],
     });
     if (!firstMcpRuntime) throw new Error('expected session MCP runtime manifest');

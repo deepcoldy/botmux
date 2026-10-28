@@ -365,6 +365,8 @@ describe('worker Codex session automatic upgrade', () => {
     await settleMicrotasks();
     expect(h.state.spawnCli).toHaveBeenCalledTimes(1);
     expect(h.state.replacementSpawnInProgress).toBe(true);
+    // restoreCfg('thread') strips both model and reasoningEffort so the same
+    // configuration upgrade resumes the native thread's own model / effort.
     expect(h.state.spawnCli).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'botmux-session', workingDir: '/project', cliId: 'codex',
       resume: true, cliSessionId: threadId, prompt: '', forkSession: false,
@@ -550,9 +552,10 @@ describe('worker Codex session automatic upgrade', () => {
 
   it('settles a folded restart the upgrade replacement satisfies, only after verification and without another pass', async () => {
     const h = harness();
-    // The upgrade replacement never passes a model; a session without one
-    // runs exactly what a plain /restart asks for.
+    // The upgrade replacement follows the native thread model and effort;
+    // neither override is present in this same-settings restart request.
     h.state.lastInitConfig.model = undefined;
+    h.state.lastInitConfig.reasoningEffort = undefined;
     const done = h.run();
     await untilSpawned(h, 1);
     h.state.foldRestartIntoWindow('folded-same-settings');
@@ -581,6 +584,8 @@ describe('worker Codex session automatic upgrade', () => {
   it.each([
     ['larkToolBinding', (cfg: any) => { cfg.larkToolBinding = false; }, { larkToolBinding: false }],
     ['model', (cfg: any) => { cfg.model = 'gpt-6-edited'; }, { model: 'gpt-6-edited' }],
+    ['reasoningEffort', (cfg: any) => { cfg.reasoningEffort = 'xhigh'; }, { reasoningEffort: 'xhigh' }],
+    ['modelBackendVariant', (cfg: any) => { cfg.modelBackendVariant = 'max'; }, { modelBackendVariant: 'max' }],
   ] as const)('converges a folded restart that changed %s after the upgrade snapshot with a pass that keeps the upgrade context', async (_field, edit, expected) => {
     const h = harness();
     h.state.lastInitConfig.model = undefined;

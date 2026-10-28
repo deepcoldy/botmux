@@ -30,6 +30,7 @@ import {
 import {
   buildActionItems,
   buildAgentItems,
+  buildBotDefaultsSectionItems,
   buildBotDefaultsTabItems,
   buildBotItems,
   buildPageItems,
@@ -267,6 +268,7 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
     ...buildActionItems(context),
     ...buildSettingItems(),
     ...buildBotDefaultsTabItems(),
+    ...buildBotDefaultsSectionItems(),
     ...buildPreferenceItems(context),
     ...buildBotItems(),
     ...buildPageItems(context.pages),

@@ -14,6 +14,10 @@ import {
   binaryProgressText,
 } from './update-action.js';
 import { ui } from './ui.js';
+import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
+import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
+import { PromptCacheEditor } from './prompt-cache-editor.js';
+import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
@@ -21,6 +25,8 @@ import {
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
+
+const GLOBAL_SESSION_ENV_SCOPE: SessionEnvScope = { kind: 'global' };
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -41,6 +47,7 @@ interface DashboardSettings {
   };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  reapOrphanTmuxServers: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
@@ -94,6 +101,7 @@ interface DashboardSettings {
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  promptCache: PromptCacheConfig | null;
   multiTopic: { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
@@ -131,6 +139,7 @@ interface CliRuntimeUpdateStatus {
 interface UpdateStatus {
   current: string;
   latest: string | null;
+  latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
   behind: boolean;
   cliBehind: boolean;
   cliUpdates: CliRuntimeUpdateStatus[];
@@ -201,6 +210,7 @@ function parseSettings(s: any): DashboardSettings {
     },
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
+    reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
@@ -263,6 +273,7 @@ function parseSettings(s: any): DashboardSettings {
         ? Math.floor(s.sessionCleanup.intervalMinutes)
         : 60,
     },
+    promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
     multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
@@ -807,7 +818,7 @@ function SettingsPage() {
   );
 }
 
-function SettingsBody(props: {
+export function SettingsBody(props: {
   settings: DashboardSettings;
   canWrite: boolean;
   bound: boolean;
@@ -828,7 +839,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -986,6 +997,13 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('autoUpgradeCodexSessions', value)}
           />
           <ToggleRow
+            title={tr('settings.reapOrphanTmuxServers')}
+            help={tr('settings.reapOrphanTmuxServersHelp')}
+            checked={settings.reapOrphanTmuxServers}
+            disabled={dis || savingKey === 'reapOrphanTmuxServers'}
+            onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
+          />
+          <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
             help={tr('settings.bypassCodexHookTrustHelp')}
             checked={settings.bypassCodexHookTrust}
@@ -1102,6 +1120,21 @@ function SettingsBody(props: {
               );
             }}
           />
+        </SettingsBlock>
+        <SettingsBlock id="settings-prompt-cache" title={tr('settings.sectionPromptCache')}>
+          <p className="settings-help">{tr('settings.promptCacheNote')}</p>
+          <PromptCacheEditor
+            scope="global"
+            value={settings.promptCache}
+            disabled={dis || savingKey === 'promptCache'}
+            onSave={next => props.onSave('promptCache', { promptCache: next }, s => ({ ...s, promptCache: next }))}
+          />
+        </SettingsBlock>
+      </SettingsGroup>
+      {/* 表格型区块：不进上面的瀑布流窄栏，单独一组占满宽度。 */}
+      <SettingsGroup className="settings-group-session-env">
+        <SettingsBlock id="settings-session-env" title={tr('sessionEnv.sectionTitle')}>
+          <SessionEnvEditor scope={GLOBAL_SESSION_ENV_SCOPE} />
         </SettingsBlock>
       </SettingsGroup>
       </SettingsModule>
@@ -1250,51 +1283,31 @@ function focusSettingsTarget(sectionId: string, fieldTitle: string | null): void
   window.setTimeout(() => target.classList.remove('palette-target-flash'), 2_400);
 }
 
-function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
+/** 导航按 SETTINGS_SECTIONS 生成：它的顺序就是页面区块的顺序，导航与区块一一对应。 */
+export function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
   const tr = props.tr;
-  const groups = [
-    {
-      label: tr('settings.moduleGeneral'),
-      items: [
-        { id: 'settings-access', label: tr('settings.sectionAccess') },
-        { id: 'settings-cards', label: tr('settings.sectionCards') },
-        { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
-        { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
-        { id: 'settings-overload', label: tr('settings.sectionHostOverloadAlert') },
-        { id: 'settings-whiteboard', label: tr('settings.sectionWhiteboard') },
-        { id: 'settings-repo-picker', label: tr('settings.sectionRepoPicker') },
-        { id: 'settings-schedule', label: tr('settings.sectionSchedule') },
-      ],
-    },
-    {
-      label: tr('settings.moduleMeeting'),
-      items: [
-        { id: 'settings-vc', label: tr('settings.sectionVcMeetingAgent') },
-      ],
-    },
-    {
-      label: tr('settings.moduleSystem'),
-      items: [
-        { id: 'settings-maintenance', label: tr('settings.sectionMaintenance') },
-        { id: 'settings-update', label: tr('settings.sectionUpdate') },
-      ],
-    },
-  ];
+  const groups: Array<{ module: string; items: SettingsSection[] }> = [];
+  for (const section of SETTINGS_SECTIONS) {
+    const last = groups[groups.length - 1];
+    if (last?.module === section.module) last.items.push(section);
+    else groups.push({ module: section.module, items: [section] });
+  }
   return (
     <nav className="settings-nav" aria-label={tr('settings.title')}>
       {groups.map(group => (
-        <div key={group.label} className="settings-nav-group">
-          <p className="settings-nav-group-label">{group.label}</p>
+        <div key={group.module} className="settings-nav-group">
+          <p className="settings-nav-group-label">{tr(group.module)}</p>
           {group.items.map(item => (
             <button
               key={item.id}
               type="button"
               className="settings-nav-link"
+              data-section={item.id}
               onClick={() => {
                 document.getElementById(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
               }}
             >
-              {item.label}
+              {tr(item.section)}
             </button>
           ))}
         </div>
@@ -2044,7 +2057,7 @@ function TraexPluginEditor(props: {
   );
 }
 
-function AutostartCard(props: {
+export function AutostartCard(props: {
   canWrite: boolean;
   state: AutostartState | null;
   loading: boolean;
@@ -2096,7 +2109,7 @@ function AutostartCard(props: {
   return <SettingsBlock id="settings-autostart" title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
 }
 
-function UpdateCard(props: {
+export function UpdateCard(props: {
   canWrite: boolean;
   status: UpdateStatus | null;
   statusError: string | null;
@@ -2218,10 +2231,15 @@ export function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) 
   );
 }
 
-function UpdateBadge(props: { status: UpdateStatus }) {
+export function UpdateBadge(props: { status: UpdateStatus }) {
   const tr = useT();
   const s = props.status;
   if (!s.latest) return <span className="hint-warn-inline">{tr('update.checkUnavailable')}</span>;
+  if (s.latestSource === 'configured-fallback') {
+    return s.behind
+      ? <span className="update-badge update-badge-new">{tr('update.mirrorNewAvailable', { version: `v${s.latest}` })}</span>
+      : <span className="update-badge update-badge-ok">{tr('update.mirrorUpToDate')}</span>;
+  }
   return s.behind
     ? <span className="update-badge update-badge-new">{tr('update.newAvailable', { version: `v${s.latest}` })}</span>
     : <span className="update-badge update-badge-ok">{tr('update.upToDate')}</span>;

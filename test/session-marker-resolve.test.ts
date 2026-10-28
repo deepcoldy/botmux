@@ -6,6 +6,7 @@ import {
   advanceAncestorSessionTurn,
   findAncestorSessionMarkerContext,
   findAuthenticatedAncestorSessionContext,
+  markerBelongsToLiveProcess,
   readProcessStartIdentity,
   resolveSessionContext,
 } from '../src/core/session-marker.js';
@@ -337,5 +338,31 @@ describe('resolveSessionContext()', () => {
     expect(step?.turnId).toBe('turn-2');
     expect(step?.trustedCaller).toEqual(callerB);
     expect(step?.steerPromotedTurn).toBe(true);
+  });
+});
+
+// A successor worker adopts the turn a reattached CLI's marker records, so the
+// marker must have been written for THIS live process of THIS session.
+describe('markerBelongsToLiveProcess()', () => {
+  const liveStart = readProcessStartIdentity(process.pid);
+  const marker = (body: Record<string, unknown>): string =>
+    JSON.stringify({ sessionId: 'sid', turnId: 'turn-1', ...body });
+
+  it('accepts the marker this session wrote for the live process', () => {
+    expect(liveStart).toBeTruthy();
+    expect(markerBelongsToLiveProcess(marker({ procStart: liveStart }), { sessionId: 'sid', procStart: liveStart }))
+      .toBe(true);
+  });
+
+  it('rejects a recycled PID leftover, another session, and a marker without a birth stamp', () => {
+    const live = { sessionId: 'sid', procStart: liveStart };
+    expect(markerBelongsToLiveProcess(marker({ procStart: '1' }), live)).toBe(false);
+    expect(markerBelongsToLiveProcess(marker({ procStart: liveStart, sessionId: 'other-sid' }), live)).toBe(false);
+    expect(markerBelongsToLiveProcess(marker({}), live)).toBe(false);
+    expect(markerBelongsToLiveProcess('sid', live)).toBe(false); // legacy plain-text marker
+  });
+
+  it('rejects an unstamped marker when the live birth time is unreadable too', () => {
+    expect(markerBelongsToLiveProcess(marker({}), { sessionId: 'sid', procStart: undefined })).toBe(false);
   });
 });

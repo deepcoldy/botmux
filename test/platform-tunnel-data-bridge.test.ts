@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { createServer, type Server as NetServer } from 'node:net';
+import { connect, createServer, type Server as NetServer, type Socket } from 'node:net';
 import { spawnSyncTsEvalWithRepoImports, isBunRuntime } from './helpers/ts-runner.js';
 import { bridgeDataChannel } from '../src/platform/tunnel-client.js';
 
@@ -37,8 +37,10 @@ import { bridgeDataChannel } from '../src/platform/tunnel-client.js';
 
 const servers: Array<NetServer | WebSocketServer> = [];
 const sockets: WebSocket[] = [];
+const hopSockets: Socket[] = [];
 afterEach(() => {
   for (const s of sockets.splice(0)) { try { s.terminate(); } catch { /* already gone */ } }
+  for (const s of hopSockets.splice(0)) s.destroy();
   for (const s of servers.splice(0)) { try { s.close(); } catch { /* already closed */ } }
 });
 
@@ -91,6 +93,33 @@ function clientTo(port: number): WebSocket {
   const c = new WebSocket(`ws://127.0.0.1:${port}`, { perMessageDeflate: false });
   sockets.push(c);
   return c;
+}
+
+/**
+ * A slow platform link: bridge → platform is forwarded at `bytesPerSec`, the
+ * reverse direction (where pongs travel) is not slowed. Plain TCP, so it holds
+ * under both runtimes — unlike pausing a `ws` server socket, which Bun ignores.
+ */
+async function startThrottledHop(targetPort: number, bytesPerSec: number): Promise<number> {
+  const srv = createServer((inbound) => {
+    const outbound = connect(targetPort, '127.0.0.1');
+    hopSockets.push(inbound, outbound);
+    inbound.on('data', (chunk) => {
+      inbound.pause();
+      outbound.write(chunk);
+      setTimeout(() => inbound.resume(), (chunk.length / bytesPerSec) * 1000);
+    });
+    outbound.on('data', (chunk) => inbound.write(chunk));
+    inbound.on('end', () => outbound.end());
+    outbound.on('end', () => inbound.end());
+    inbound.on('close', () => outbound.destroy());
+    outbound.on('close', () => inbound.destroy());
+    inbound.on('error', () => { /* torn down with the test */ });
+    outbound.on('error', () => { /* torn down with the test */ });
+  });
+  servers.push(srv);
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+  return (srv.address() as { port: number }).port;
 }
 
 describe('platform tunnel data bridge', () => {
@@ -264,6 +293,114 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
     expect(got.equals(payload)).toBe(true);
   }, 30_000);
 
+  it('holds a slow platform to the watermark and closes only once it has read everything', async () => {
+    // A pong proves the platform read what was sent BEFORE that ping, nothing
+    // more. While the gate waits it pings every few ms, so a slow platform has a
+    // queue of pings in flight; when every pong counted as "all caught up", the
+    // stale ones released the gate again and again (the bridge got the whole
+    // response out while the platform had read 4.6MB), and after the dashboard's
+    // FIN the bridge closed the channel long before the platform was done (#2295).
+    const TOTAL = 24 * 1024 * 1024;
+    const block = Buffer.alloc(256 * 1024, 0xcd);
+    const dash = createServer((s) => {
+      s.on('error', () => { /* bridge teardown */ });
+      let written = 0;
+      const pump = (): void => {
+        while (written < TOTAL) {
+          written += block.length;
+          if (!s.write(block)) { s.once('drain', pump); return; }
+        }
+        s.end();
+      };
+      pump();
+    });
+    servers.push(dash);
+    await new Promise<void>((r) => dash.listen(0, '127.0.0.1', () => r()));
+
+    let received = 0;
+    let platformClosed!: () => void;
+    const closed = new Promise<void>((r) => { platformClosed = r; });
+    const platform = new WebSocketServer({ port: 0, perMessageDeflate: false, maxPayload: 64 * 1024 * 1024 });
+    servers.push(platform);
+    await new Promise<void>((r) => platform.on('listening', () => r()));
+    platform.on('connection', (s) => {
+      sockets.push(s);
+      s.on('message', (m: RawData) => { received += toBuffer(m).length; });
+      s.on('close', () => platformClosed());
+    });
+
+    const winner = clientTo(await startThrottledHop((platform.address() as { port: number }).port, 16 * 1024 * 1024));
+    await new Promise<void>((r) => winner.once('open', () => r()));
+    // Measure what the production bridge hands to the socket against what the
+    // platform has read, and how much the platform had read when it closed.
+    let handed = 0;
+    let maxAhead = 0;
+    let receivedAtClose = -1;
+    const send = winner.send.bind(winner);
+    winner.send = ((data: Buffer, ...rest: unknown[]) => {
+      handed += data.length;
+      maxAhead = Math.max(maxAhead, handed - received);
+      return (send as (...a: unknown[]) => void)(data, ...rest);
+    }) as typeof winner.send;
+    const close = winner.close.bind(winner);
+    winner.close = ((...args: unknown[]) => {
+      receivedAtClose = received;
+      return (close as (...a: unknown[]) => void)(...args);
+    }) as typeof winner.close;
+    bridgeDataChannel(winner, (dash.address() as { port: number }).port);
+
+    await closed;
+    expect(received).toBe(TOTAL);
+    expect(receivedAtClose).toBe(TOTAL);
+    expect(maxAhead).toBeLessThan(TOTAL / 3);
+  }, 30_000);
+
+  // Node-only for the same reason as the case below: bun 1.4.3's `ws` server
+  // ignores `autoPong: false` and still answers with the original payload.
+  it.runIf(!isBunRuntime())('does not count a pong that carries no offset as a confirmation', async () => {
+    // A hop that answers pings itself without echoing the payload must not open
+    // the gate: such a pong proves nothing about what the platform has read.
+    const TOTAL = 24 * 1024 * 1024;
+    const block = Buffer.alloc(256 * 1024, 0xef);
+    const dash = createServer((s) => {
+      s.on('error', () => { /* bridge teardown */ });
+      let written = 0;
+      const pump = (): void => {
+        while (written < TOTAL) {
+          written += block.length;
+          if (!s.write(block)) { s.once('drain', pump); return; }
+        }
+        s.end();
+      };
+      pump();
+    });
+    servers.push(dash);
+    await new Promise<void>((r) => dash.listen(0, '127.0.0.1', () => r()));
+
+    let received = 0;
+    let answered = 0;
+    let settle!: () => void;
+    const settled = new Promise<void>((r) => { settle = r; });
+    const platform = new WebSocketServer({ port: 0, perMessageDeflate: false, autoPong: false });
+    servers.push(platform);
+    await new Promise<void>((r) => platform.on('listening', () => r()));
+    platform.on('connection', (s) => {
+      sockets.push(s);
+      s.on('message', (m: RawData) => { received += toBuffer(m).length; });
+      s.on('ping', () => { s.pong(Buffer.from('not-an-offset')); if (++answered === 10) settle(); });
+      s.on('close', () => settle());
+    });
+
+    const winner = clientTo((platform.address() as { port: number }).port);
+    await new Promise<void>((r) => winner.once('open', () => r()));
+    bridgeDataChannel(winner, (dash.address() as { port: number }).port);
+
+    // Ten unconfirmed probes later the bridge is still held at the watermark;
+    // had they counted, it would have pushed the whole response and closed.
+    await settled;
+    expect(received).toBeLessThan(TOTAL / 3);
+  }, 30_000);
+
   // The platform stand-in pauses the raw upgrade socket. That pause holds under
   // Node; Bun's `ws` server ignores it (documented above), so this case is the
   // Node-only half of the backpressure guard. The production bridge still runs
@@ -410,6 +547,7 @@ describe('platform tunnel data bridge — graceful shutdown shape', () => {
       const TOTAL = 24 * 1024 * 1024;
       const block = Buffer.alloc(256 * 1024, 0xab);
       let sent = 0;
+      let dashboardDone = false;
       const dash = net.createServer((s) => {
         s.on('error', () => {});
         const pump = () => {
@@ -418,25 +556,33 @@ describe('platform tunnel data bridge — graceful shutdown shape', () => {
             if (!s.write(block.subarray(0, n))) { s.once('drain', pump); return; }
           }
           s.end();
+          dashboardDone = true;
         };
         pump();
       });
       await new Promise((r) => dash.listen(0, '127.0.0.1', r));
       let recv = 0;
+      let closed = false;
       const wss = new WebSocketServer({ port: 0, perMessageDeflate: false, maxPayload: 64 * 1024 * 1024 });
       await new Promise((r) => wss.on('listening', r));
-      wss.on('connection', (s) => { s.on('message', (m) => { recv += (Buffer.isBuffer(m) ? m : Buffer.from(m)).length; }); });
+      wss.on('connection', (s) => {
+        s.on('message', (m) => { recv += (Buffer.isBuffer(m) ? m : Buffer.from(m)).length; });
+        s.on('close', () => { closed = true; });
+      });
       const winner = new WebSocket('ws://127.0.0.1:' + wss.address().port, { perMessageDeflate: false });
       await new Promise((r) => winner.on('open', r));
       bridgeDataChannel(winner, dash.address().port);
+      // Delivery is over when the bridge closes the channel: it does that once the
+      // dashboard has finished and the platform has confirmed every byte. Then
+      // count; a short count is a loss, not a slow run still on its way.
       const deadline = Date.now() + 25000;
-      while (recv < TOTAL && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
-      console.log('DELIVERED:' + recv + '/' + TOTAL);
+      while (!closed && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+      console.log('DELIVERED:' + recv + '/' + TOTAL + ' closed=' + closed + ' dashboardDone=' + dashboardDone + ' dashboardWritten=' + sent);
       process.exit(0);
     `;
     const r = spawnSyncTsEvalWithRepoImports(snippet, { encoding: 'utf-8', timeout: 60_000 });
     const stdout = String(r.stdout ?? '');
     const total = 24 * 1024 * 1024;
-    expect(stdout, `child stderr:\n${String(r.stderr ?? '')}`).toContain(`DELIVERED:${total}/${total}`);
+    expect(stdout, `child stderr:\n${String(r.stderr ?? '')}`).toContain(`DELIVERED:${total}/${total} closed=true`);
   }, 90_000);
 });

@@ -11,9 +11,11 @@
  *  - transferChatOwner error but getChatOwner confirms target → treated as success
  *    (Lark slow-ACK / 504 false-negative recovery)
  *  - sendMessage throw surfaces as `notifyError`, chatId still returned
+ *  - ensureBotCollaboration throw surfaces as `collaborationError`; owner
+ *    transfer, notify, oncall binding and kickoff still run
  *  - createChat throw bubbles up (caller decides exit code)
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const mockCreateChat = vi.fn();
 const mockTransferChatOwner = vi.fn();
@@ -37,10 +39,12 @@ const SHARE_LINK = 'https://applink.feishu.cn/client/chat/chatter/add_by_link?li
 const mockSendMessage = vi.fn();
 const mockListChatBotMembers = vi.fn();
 const mockResolveAllowedUsersWithMap = vi.fn();
+const mockResolveUnionIdStrict = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...args: any[]) => mockSendMessage(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   resolveAllowedUsersWithMap: (...args: any[]) => mockResolveAllowedUsersWithMap(...args),
+  resolveUnionIdFromOpenIdStrict: (...args: any[]) => mockResolveUnionIdStrict(...args),
 }));
 
 const mockBindOncall = vi.fn();
@@ -66,7 +70,13 @@ vi.mock('../src/services/feed-group-tagger.js', () => ({ addCreatedChatToFeedGro
 const mockLogoAvatar = vi.fn();
 vi.mock('../src/services/session-group-avatar.js', () => ({ applyLogoGroupAvatar: (...args: any[]) => mockLogoAvatar(...args) }));
 
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createGroupWithBots, transferGroupOwner } from '../src/services/group-creator.js';
+import { isStewardSilentJoin } from '../src/services/steward-auto-join.js';
+import { adminListFingerprint, writeBotAdminUnions } from '../src/services/bot-admin-unions-store.js';
+import { config } from '../src/config.js';
 
 const CREATOR = 'cli_creator_app';
 const OTHER_BOT = 'cli_other_bot';
@@ -551,12 +561,16 @@ describe('createGroupWithBots', () => {
     expect(result.kickoffError).toBeNull();
   });
 
-  it('establishes collaboration after peer invitation and before role/kickoff messages', async () => {
+  it('sets up collaboration after owner transfer and notify, and before role/kickoff messages', async () => {
     const events: string[] = [];
     mockCreateChat.mockResolvedValue({ chatId: 'oc_ordered', invalidBotIds: [], invalidUserIds: [] });
     mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) => {
       events.push(`invite:${ids.join(',')}`);
       return ids.map(id => ({ id, ok: true }));
+    });
+    mockTransferChatOwner.mockImplementation(async () => {
+      events.push('transfer');
+      return { ok: true };
     });
     mockListChatBotMembers.mockResolvedValue([
       { larkAppId: CREATOR, openId: 'ou_creator', mentionable: true },
@@ -564,84 +578,106 @@ describe('createGroupWithBots', () => {
     ]);
     mockReadRoleProfileEntry.mockReturnValue('creator role');
     mockSendMessage.mockImplementation(async (_app: string, _chatId: string, content: string) => {
-      events.push(content.includes('/role profile') ? 'role' : 'kickoff');
-      return content.includes('/role profile') ? 'om_role' : 'om_kickoff';
+      const kind = content.includes('/role profile') ? 'role'
+        : content.includes(`<at user_id="${USER_OPEN_ID}">`) ? 'notify'
+        : 'kickoff';
+      events.push(kind);
+      return `om_${kind}`;
     });
 
     const result = await createGroupWithBots({
       creatorLarkAppId: CREATOR,
       larkAppIds: [CREATOR, OTHER_BOT],
+      userOpenIds: [USER_OPEN_ID],
+      transferOwnerTo: USER_OPEN_ID,
+      notifyOwnerOpenId: USER_OPEN_ID,
       roleProfileId: 'collab-main',
       kickoffBotLarkAppId: OTHER_BOT,
       kickoffPrompt: 'Review PR 562',
-      ensureBotCollaboration: async (chatId, joinedBotAppIds, rejectedBotAppIds) => {
-        events.push(`grant:${chatId}:${joinedBotAppIds.join(',')}:rejected=${rejectedBotAppIds.join(',')}`);
+      ensureBotCollaboration: async (chatId, joinedBotAppIds) => {
+        events.push(`grant:${chatId}:${joinedBotAppIds.join(',')}`);
       },
     });
 
     expect(events).toEqual([
       `invite:${OTHER_BOT}`,
-      `grant:oc_ordered:${CREATOR},${OTHER_BOT}:rejected=`,
+      'transfer',
+      'notify',
+      `grant:oc_ordered:${CREATOR},${OTHER_BOT}`,
       'role',
       'kickoff',
     ]);
+    expect(result.collaborationError).toBeNull();
     expect(result.roleProfileBootstrapMessageId).toBe('om_role');
     expect(result.kickoffMessageId).toBe('om_kickoff');
   });
 
-  it('aborts cold-group initialization without role or kickoff when collaboration grant fails', async () => {
+  it('still hands the group to the owner, notifies, binds and kicks off when collaboration setup fails', async () => {
     mockCreateChat.mockResolvedValue({ chatId: 'oc_grant_failed', invalidBotIds: [], invalidUserIds: [] });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    mockBindOncall.mockResolvedValue({ ok: true, created: true });
+    mockListChatBotMembers.mockResolvedValue([
+      { larkAppId: OTHER_BOT, openId: 'ou_other', mentionable: true },
+    ]);
+    mockSendMessage.mockImplementation(async (_app: string, _chatId: string, content: string) =>
+      (content.includes('Review PR 562') ? 'om_kickoff' : 'om_notify'));
     const onChatCreated = vi.fn();
 
-    await expect(createGroupWithBots({
+    const result = await createGroupWithBots({
       creatorLarkAppId: CREATOR,
       larkAppIds: [CREATOR, OTHER_BOT],
-      roleProfileId: 'collab-main',
+      userOpenIds: [USER_OPEN_ID],
+      transferOwnerTo: USER_OPEN_ID,
+      notifyOwnerOpenId: USER_OPEN_ID,
+      bindWorkingDir: '/repo',
       kickoffBotLarkAppId: OTHER_BOT,
       kickoffPrompt: 'Review PR 562',
       onChatCreated,
       ensureBotCollaboration: async () => {
-        throw new Error('exact grant matrix unavailable');
+        throw new Error(`receiver daemon offline: ${OTHER_BOT}`);
       },
-    })).rejects.toThrow('exact grant matrix unavailable');
-
-    expect(onChatCreated).toHaveBeenCalledWith('oc_grant_failed');
-    expect(mockAddBotToChat).toHaveBeenCalled();
-    expect(mockGetChatShareLink).not.toHaveBeenCalled();
-    expect(mockReadRoleProfileEntry).not.toHaveBeenCalled();
-    expect(mockListChatBotMembers).not.toHaveBeenCalled();
-    expect(mockSendMessage).not.toHaveBeenCalled();
-  });
-
-  it('exposes rejected invitees to the strict preflight before any role or kickoff message', async () => {
-    mockCreateChat.mockResolvedValue({ chatId: 'oc_partial', invalidBotIds: [], invalidUserIds: [] });
-    mockAddBotToChat.mockResolvedValue([{ id: OTHER_BOT, ok: false, error: 'invalid_id' }]);
-    const ensureBotCollaboration = vi.fn(async (
-      _chatId: string,
-      _joinedBotAppIds: string[],
-      rejectedBotAppIds: string[],
-    ) => {
-      if (rejectedBotAppIds.length > 0) throw new Error('bot_invites_incomplete');
     });
 
-    await expect(createGroupWithBots({
+    expect(onChatCreated).toHaveBeenCalledWith('oc_grant_failed');
+    expect(result.chatId).toBe('oc_grant_failed');
+    expect(result.collaborationError).toBe(`receiver daemon offline: ${OTHER_BOT}`);
+    expect(result.shareLink).toBe(SHARE_LINK);
+    expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+    expect(result.transferError).toBeNull();
+    expect(result.notifyMessageId).toBe('om_notify');
+    expect(result.oncallBindings.map(b => b.larkAppId)).toEqual([CREATOR, OTHER_BOT]);
+    expect(result.kickoffMessageId).toBe('om_kickoff');
+    expect(result.kickoffError).toBeNull();
+  });
+
+  it('gives collaboration setup only the bots that joined and still finishes the owner steps when an invite was rejected', async () => {
+    const THIRD_BOT = 'cli_third_bot';
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_partial', invalidBotIds: [], invalidUserIds: [] });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+      ids.map(id => (id === OTHER_BOT ? { id, ok: false, error: 'invalid_id' } : { id, ok: true })));
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    mockSendMessage.mockResolvedValue('om_notify');
+    const ensureBotCollaboration = vi.fn(async () => {});
+
+    const result = await createGroupWithBots({
       creatorLarkAppId: CREATOR,
-      larkAppIds: [CREATOR, OTHER_BOT],
-      roleProfileId: 'collab-main',
+      larkAppIds: [CREATOR, OTHER_BOT, THIRD_BOT],
+      userOpenIds: [USER_OPEN_ID],
+      transferOwnerTo: USER_OPEN_ID,
+      notifyOwnerOpenId: USER_OPEN_ID,
       kickoffBotLarkAppId: OTHER_BOT,
       kickoffPrompt: 'Review PR 562',
       ensureBotCollaboration,
-    })).rejects.toThrow('bot_invites_incomplete');
+    });
 
-    expect(ensureBotCollaboration).toHaveBeenCalledWith(
-      'oc_partial',
-      [CREATOR],
-      [OTHER_BOT],
-    );
-    expect(mockGetChatShareLink).not.toHaveBeenCalled();
-    expect(mockReadRoleProfileEntry).not.toHaveBeenCalled();
-    expect(mockListChatBotMembers).not.toHaveBeenCalled();
-    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.invalidBotIds).toEqual([OTHER_BOT]);
+    expect(ensureBotCollaboration).toHaveBeenCalledWith('oc_partial', [CREATOR, THIRD_BOT]);
+    expect(result.collaborationError).toBeNull();
+    expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+    expect(result.notifyMessageId).toBe('om_notify');
+    // The kickoff target itself was rejected: reported, not attempted.
+    expect(result.kickoffError).toBe('invitee_rejected');
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('does not send kickoff when Lark rejected the target bot invite', async () => {
@@ -849,6 +885,186 @@ describe('createGroupWithBots', () => {
     expect(result.chatId).toBe('oc_mgr4');
     expect(result.managerError).toBe('permission_denied');
     expect(result.managersAdded).toEqual([]);
+  });
+  describe('拉新群时带上管家', () => {
+    // 不 mock 配置与快照：本机 bots.json 用 BOTS_CONFIG 指向临时文件，管家 owner 的 union_id
+    // 按管家 daemon 的发布格式写进数据目录（creator 进程只读这两样）。
+    const STEWARD = 'cli_steward';
+    const STEWARD_ADMINS = ['alice@example.com'];
+    const stewardBot = (steward: Record<string, unknown>) => ({
+      larkAppId: STEWARD, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: STEWARD_ADMINS, steward,
+    });
+    let botsDir: string;
+    const writeBots = (entries: Array<Record<string, unknown>>) =>
+      writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify(entries));
+
+    beforeEach(() => {
+      botsDir = mkdtempSync(join(tmpdir(), 'group-creator-steward-'));
+      process.env.BOTS_CONFIG = join(botsDir, 'bots.json');
+      writeBots([
+        { larkAppId: CREATOR, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [USER_OPEN_ID] },
+        stewardBot({ enabled: true, chatId: 'oc_steward_home' }),
+      ]);
+      writeBotAdminUnions(config.session.dataDir, STEWARD, {
+        fingerprint: adminListFingerprint(STEWARD_ADMINS), admins: ['on_alice'], exact: true, owner: 'on_alice', updatedAt: 1,
+      });
+      mockResolveUnionIdStrict.mockReset().mockImplementation(async (_app: string, openId: string) =>
+        (openId === USER_OPEN_ID ? { status: 'resolved', unionId: 'on_alice' } : { status: 'unavailable' }));
+      mockTransferChatOwner.mockResolvedValue({ ok: true });
+      mockBindOncall.mockResolvedValue({ ok: true, created: true });
+    });
+
+    afterEach(() => {
+      delete process.env.BOTS_CONFIG;
+      rmSync(botsDir, { recursive: true, force: true });
+    });
+
+    it('owner 在新群里：请求的 bot 进群后、群主转让前把管家加进来；管家不进协作授权 / oncall 绑定 / invalidBotIds', async () => {
+      mockCreateChat.mockResolvedValue({ chatId: 'oc_with_steward', invalidBotIds: [], invalidUserIds: [] });
+      const ensureBotCollaboration = vi.fn(async () => {});
+      const result = await createGroupWithBots({
+        creatorLarkAppId: CREATOR,
+        larkAppIds: [CREATOR, OTHER_BOT],
+        userOpenIds: [USER_OPEN_ID],
+        transferOwnerTo: USER_OPEN_ID,
+        bindWorkingDir: '/repo',
+        ensureBotCollaboration,
+      });
+      expect(mockAddBotToChat.mock.calls).toEqual([
+        [CREATOR, 'oc_with_steward', [OTHER_BOT]],
+        [CREATOR, 'oc_with_steward', [STEWARD]],
+      ]);
+      expect(mockAddBotToChat.mock.invocationCallOrder[1]!).toBeLessThan(mockTransferChatOwner.mock.invocationCallOrder[0]!);
+      expect(mockResolveUnionIdStrict).toHaveBeenCalledWith(CREATOR, USER_OPEN_ID);
+      expect(result.stewardJoins).toEqual([{ larkAppId: STEWARD, ok: true }]);
+      expect(result.invalidBotIds).toEqual([]);
+      expect(ensureBotCollaboration).toHaveBeenCalledWith('oc_with_steward', [CREATOR, OTHER_BOT]);
+      expect(mockBindOncall.mock.calls.map(c => c[0])).toEqual([CREATOR, OTHER_BOT]);
+      expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+      // 管家 daemon 看到这条标记就不跑入群动作（见 event-dispatcher 的 bot.added）。
+      expect(isStewardSilentJoin(config.session.dataDir, STEWARD, 'oc_with_steward')).toBe(true);
+    });
+
+    // 调用形状同 core/session-group-birth.ts：1 人 1 bot、不转群主、绑目录。
+    const sessionGroupBirth = (chatId: string) => {
+      mockCreateChat.mockResolvedValue({ chatId, invalidBotIds: [], invalidUserIds: [] });
+      return createGroupWithBots({
+        creatorLarkAppId: CREATOR,
+        larkAppIds: [CREATOR],
+        name: '新会话',
+        userOpenIds: [USER_OPEN_ID],
+        managerUserIds: [USER_OPEN_ID],
+        bindWorkingDir: '/repo',
+      });
+    };
+
+    it('私聊转出的会话群（1 人 1 bot）默认不带管家：不查身份、不写静默标记，保持免 @ 续话', async () => {
+      const result = await sessionGroupBirth('oc_session_group');
+      expect('stewardJoins' in result).toBe(false);
+      expect(mockAddBotToChat).not.toHaveBeenCalled();
+      expect(mockResolveUnionIdStrict).not.toHaveBeenCalled();
+      expect(isStewardSilentJoin(config.session.dataDir, STEWARD, 'oc_session_group')).toBe(false);
+    });
+
+    it('/fork --create、私聊里 /group 等同样只有 1 人 1 bot 的新群也默认不带；按实际进群的人和 bot 数判断', async () => {
+      const solo = async (chatId: string, extra: Record<string, unknown> = {}, invalidBotIds: string[] = []) => {
+        mockCreateChat.mockResolvedValue({ chatId, invalidBotIds: [], invalidUserIds: [] });
+        mockAddBotToChat.mockImplementation(async (_app: string, _chat: string, ids: string[]) =>
+          ids.map(id => (invalidBotIds.includes(id) ? { id, ok: false, error: 'invalid_id' } : { id, ok: true })));
+        return createGroupWithBots({ creatorLarkAppId: CREATOR, larkAppIds: [CREATOR], name: 'x', userOpenIds: [USER_OPEN_ID], transferOwnerTo: USER_OPEN_ID, ...extra });
+      };
+      expect('stewardJoins' in await solo('oc_fork')).toBe(false);
+      // 要了两个 bot 但另一个被飞书拒了：实际只有 1 人 1 bot，同样不带。
+      expect('stewardJoins' in await solo('oc_half', { larkAppIds: [CREATOR, OTHER_BOT] }, [OTHER_BOT])).toBe(false);
+      // 同一个人既按 open_id 又按 union_id 拉进来，仍算一个人。
+      expect('stewardJoins' in await solo('oc_same_person', { ownerUnionIds: ['on_alice'] })).toBe(false);
+      expect(mockResolveUnionIdStrict).not.toHaveBeenCalled();
+      // 群里不止一个人：不是单人群，照带。
+      expect((await solo('oc_two_people', { userOpenIds: [USER_OPEN_ID, 'ou_bob'] })).stewardJoins).toEqual([{ larkAppId: STEWARD, ok: true }]);
+    });
+
+    it('会议监听群（larkAppIds 为空 + 1 个目标用户）按单人群不带；issue 领取群单 bot 不带、多 bot 照带', async () => {
+      // 形状同 daemon.ts 的会议监听群：只有 creator 自己。
+      mockCreateChat.mockResolvedValue({ chatId: 'oc_vc_listener', invalidBotIds: [], invalidUserIds: [] });
+      const vc = await createGroupWithBots({
+        creatorLarkAppId: CREATOR, larkAppIds: [], name: '会议监听-x', userOpenIds: [USER_OPEN_ID],
+        transferOwnerTo: USER_OPEN_ID, notifyOwnerOpenId: USER_OPEN_ID,
+      });
+      expect('stewardJoins' in vc).toBe(false);
+      // 形状同 issue-claim-flow + issue-command-deps：creator + 认领 bot（+ 同伴 bot）、领取人、owner union_id。
+      const claim = (chatId: string, larkAppIds: string[]) => {
+        mockCreateChat.mockResolvedValue({ chatId, invalidBotIds: [], invalidUserIds: [] });
+        return createGroupWithBots({
+          creatorLarkAppId: CREATOR, larkAppIds, name: 'issue', bindWorkingDir: '/repo',
+          ownerUnionIds: ['on_alice'], userOpenIds: [USER_OPEN_ID],
+        });
+      };
+      expect('stewardJoins' in await claim('oc_claim_solo', [CREATOR])).toBe(false);
+      expect(mockAddBotToChat).not.toHaveBeenCalled();
+      expect((await claim('oc_claim_peers', [CREATOR, OTHER_BOT])).stewardJoins).toEqual([{ larkAppId: STEWARD, ok: true }]);
+    });
+
+    it('管家打开「只有你和一个 Bot 的群也带上管家」后，会话群、/fork 这类单人群也带（不绑目录）', async () => {
+      writeBots([stewardBot({ enabled: true, autoJoinSoloGroups: true })]);
+      const opted = await sessionGroupBirth('oc_session_opted');
+      expect(opted.stewardJoins).toEqual([{ larkAppId: STEWARD, ok: true }]);
+      expect(mockAddBotToChat.mock.calls).toEqual([[CREATOR, 'oc_session_opted', [STEWARD]]]);
+      expect(mockBindOncall.mock.calls.map(c => c[0])).toEqual([CREATOR]);
+      mockCreateChat.mockResolvedValue({ chatId: 'oc_fork_opted', invalidBotIds: [], invalidUserIds: [] });
+      const fork = await createGroupWithBots({
+        creatorLarkAppId: CREATOR, larkAppIds: [CREATOR], name: 'fork', userOpenIds: [USER_OPEN_ID], transferOwnerTo: USER_OPEN_ID,
+      });
+      expect(fork.stewardJoins).toEqual([{ larkAppId: STEWARD, ok: true }]);
+    });
+
+    it('加管家失败：群照建、群主照转，失败只写在 stewardJoins 里', async () => {
+      mockCreateChat.mockResolvedValue({ chatId: 'oc_steward_rejected', invalidBotIds: [], invalidUserIds: [] });
+      mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
+        ids.map(id => (id === STEWARD ? { id, ok: false, error: 'bot not visible to app (code: 232043)' } : { id, ok: true })));
+      const result = await createGroupWithBots({
+        creatorLarkAppId: CREATOR,
+        larkAppIds: [CREATOR, OTHER_BOT],
+        userOpenIds: [USER_OPEN_ID],
+        transferOwnerTo: USER_OPEN_ID,
+        notifyOwnerOpenId: USER_OPEN_ID,
+      });
+      expect(result.ok).toBe(true);
+      expect(result.chatId).toBe('oc_steward_rejected');
+      expect(result.invalidBotIds).toEqual([]);
+      expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+      expect(result.stewardJoins).toEqual([{ larkAppId: STEWARD, ok: false, error: 'bot not visible to app (code: 232043)' }]);
+      expect(isStewardSilentJoin(config.session.dataDir, STEWARD, 'oc_steward_rejected')).toBe(false);
+    });
+
+    it.each([
+      ['没开管家的部署', () => [{ larkAppId: OTHER_BOT, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['alice@example.com'] }]],
+      ['管家关着', () => [stewardBot({ enabled: false, chatId: 'oc_steward_home' })]],
+      ['关掉「拉新群时带上管家」', () => [stewardBot({ enabled: true, autoJoinNewGroups: false })]],
+    ])('%s：建群和原来一样，不查身份、不加管家、结果里没有 stewardJoins', async (_name, bots) => {
+      writeBots(bots());
+      mockCreateChat.mockResolvedValue({ chatId: 'oc_switch_off', invalidBotIds: [], invalidUserIds: [] });
+      const result = await createGroupWithBots({
+        creatorLarkAppId: CREATOR, larkAppIds: [CREATOR, OTHER_BOT], userOpenIds: [USER_OPEN_ID], transferOwnerTo: USER_OPEN_ID,
+      });
+      expect(mockAddBotToChat.mock.calls).toEqual([[CREATOR, 'oc_switch_off', [OTHER_BOT]]]);
+      expect(mockResolveUnionIdStrict).not.toHaveBeenCalled();
+      expect('stewardJoins' in result).toBe(false);
+    });
+
+    it('owner 不在新群里、或管家已经是要拉的 bot：不带', async () => {
+      mockCreateChat.mockResolvedValue({ chatId: 'oc_someone_else', invalidBotIds: [], invalidUserIds: [] });
+      const other = await createGroupWithBots({
+        creatorLarkAppId: CREATOR, larkAppIds: [CREATOR], userOpenIds: ['ou_bob'], transferOwnerTo: 'ou_bob',
+      });
+      expect('stewardJoins' in other).toBe(false);
+      mockCreateChat.mockResolvedValue({ chatId: 'oc_already', invalidBotIds: [], invalidUserIds: [] });
+      const already = await createGroupWithBots({
+        creatorLarkAppId: CREATOR, larkAppIds: [CREATOR, STEWARD], userOpenIds: [USER_OPEN_ID],
+      });
+      expect('stewardJoins' in already).toBe(false);
+      expect(mockAddBotToChat.mock.calls).toEqual([[CREATOR, 'oc_already', [STEWARD]]]);
+    });
   });
 });
 

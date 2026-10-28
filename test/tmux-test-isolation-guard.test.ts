@@ -7,6 +7,7 @@
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 
@@ -31,15 +32,67 @@ describe('privateTmuxEnv', () => {
 });
 
 describe('tmux test isolation guard', () => {
-  // 剥离 TMUX 的写法，或改用显式 -L / -S socket（显式 socket 不受 TMUX 影响）。
-  const ISOLATED = [
-    /privateTmuxEnv\(/,
-    /delete\s+[\w.]+\.TMUX\b/,
-    /delete\s+[\w.]+\[['"]TMUX['"]\]/,
-    /\bTMUX:\s*(?:''|""|undefined)/,
-    /['"]-L['"]\s*,/,
-    /['"]-S['"]\s*,/,
-  ];
+  // 隔离信号只看语法树：注释、字符串、模板文本里的同名字样一律不算数。
+  const mentions = (node: ts.Node, text: string): boolean =>
+    (ts.isIdentifier(node) && node.text === text)
+    || (ts.isPropertyAccessExpression(node) && node.name.text === text);
+
+  const isIsolated = (src: string): boolean => {
+    const sf = ts.createSourceFile('tmux-test.ts', src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    let found = false;
+    const visit = (node: ts.Node): void => {
+      if (found) return;
+      if (ts.isCallExpression(node) && mentions(node.expression, 'privateTmuxEnv')) found = true;
+      if (ts.isDeleteExpression(node)) {
+        const target = node.expression;
+        if (ts.isPropertyAccessExpression(target) && target.name.text === 'TMUX') found = true;
+        if (ts.isElementAccessExpression(target)
+          && ts.isStringLiteralLike(target.argumentExpression)
+          && target.argumentExpression.text === 'TMUX') found = true;
+      }
+      if (ts.isPropertyAssignment(node) && ts.isObjectLiteralExpression(node.parent)) {
+        const name = ts.isIdentifier(node.name) || ts.isStringLiteralLike(node.name) ? node.name.text : undefined;
+        const init = node.initializer;
+        if (name === 'TMUX'
+          && ((ts.isStringLiteralLike(init) && init.text === '')
+            || (ts.isIdentifier(init) && init.text === 'undefined'))) found = true;
+      }
+      if (ts.isStringLiteralLike(node) && (node.text === '-L' || node.text === '-S')) found = true;
+      if (!found) ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    return found;
+  };
+
+  it('ignores isolation signals that only appear in comments or strings', () => {
+    const spoofs = [
+      '// privateTmuxEnv(root)\nconst env = {};',
+      '// delete env.TMUX\nconst env = {};',
+      "// delete env['TMUX']\nconst env = {};",
+      "// TMUX: ''\nconst env = {};",
+      "// spawnSync('tmux', ['-L', sock, 'kill-server'])\nconst env = {};",
+      "// spawnSync('tmux', ['-S', sock, 'kill-server'])\nconst env = {};",
+      "/*\n  privateTmuxEnv(root)\n  delete env.TMUX\n  TMUX: ''\n*/\nconst env = {};",
+      'const s = "doc \\\n  privateTmuxEnv( nope";\nconst env = {};',
+      'const s = `\n  privateTmuxEnv( nope\n`;\nconst env = {};',
+    ];
+    for (const spoof of spoofs) expect(isIsolated(spoof), spoof).toBe(false);
+  });
+
+  it('still recognises real isolation code, including a call split across lines', () => {
+    const real = [
+      'const env = privateTmuxEnv(root);',
+      'const env = helpers.privateTmuxEnv(root);',
+      'const env = privateTmuxEnv\n  (root);',
+      'delete env.TMUX;',
+      "delete env['TMUX'];",
+      "const env = { TMUX: '' };",
+      'const env = { TMUX: undefined };',
+      "spawnSync('tmux', ['-L', sock, 'kill-server']);",
+      "spawnSync('tmux', ['-S', sock, 'kill-server']);",
+    ];
+    for (const code of real) expect(isIsolated(code), code).toBe(true);
+  });
 
   it('every test that kills a TMUX_TMPDIR-isolated tmux server strips the inherited TMUX', () => {
     const dir = join(process.cwd(), 'test');
@@ -51,7 +104,7 @@ describe('tmux test isolation guard', () => {
         if (!/\.(?:test\.)?[cm]?[jt]s$/.test(ent.name) || p.endsWith('tmux-test-isolation-guard.test.ts')) continue;
         const src = readFileSync(p, 'utf8');
         if (!src.includes('TMUX_TMPDIR') || !/['"]kill-server['"]/.test(src)) continue;
-        if (!ISOLATED.some(re => re.test(src))) offenders.push(p.slice(dir.length + 1));
+        if (!isIsolated(src)) offenders.push(p.slice(dir.length + 1));
       }
     };
     walk(dir);

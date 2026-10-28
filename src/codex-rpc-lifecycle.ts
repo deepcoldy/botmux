@@ -11,13 +11,10 @@ import {
 import type { DaemonToWorker } from './types.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
+export { RPC_CAPABLE_CLIS } from './services/codex-rpc-input-policy.js';
+import { RPC_CAPABLE_CLIS } from './services/codex-rpc-input-policy.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
-
-/** CLIs that expose the codex-family `app-server --listen` + `--remote resume`
- *  protocol the RPC engine drives. codex + traex are verified identical; coco
- *  diverges (--resume flag) and needs its own verification before inclusion. */
-export const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
 
 /** Retry cadence for native turn/completed → rollout visibility hydration.
  *  Total window is 11.55s: bounded, but intentionally aligned with the 12s
@@ -278,7 +275,24 @@ export async function orchestrateCodexRpcInit(
   runtime: CodexRpcRuntimeGates = {},
 ): Promise<RpcInitDecision> {
   const NONE: RpcInitDecision = { engaged: false, queuePrompt: false, abortSpawn: false };
-  if (!codexRpcEligible(cfg, runtime)) return NONE;
+  if (!codexRpcEligible(cfg, runtime)) {
+    // A saved RPC-off override must not reattach the old --remote viewer.
+    // Its previous app-server was owned by the old worker; replace only a
+    // positively identified remote pane, keeping native terminal panes intact.
+    if (cfg.codexRpcInput === false && RPC_CAPABLE_CLIS.has(cfg.cliId)
+      && cfg.backendType === 'tmux' && cfg.resume && cfg.cliSessionId
+      && !cfg.adoptMode && !cfg.existingAppServerEndpoint) {
+      const pane = fx.paneInfo(cfg.sessionId);
+      if (pane?.live && fx.paneIsRemote(pane.name)) {
+        if (!await fx.killVerify(pane.name)) {
+          fx.notify('RPC 输入已关闭，但无法替换旧 RPC 面板。请重试重启会话；尚未启动新的终端会话。');
+          return { ...NONE, abortSpawn: true };
+        }
+        fx.log('RPC input disabled: replaced the old --remote pane before terminal resume');
+      }
+    }
+    return NONE;
+  }
   const pane = fx.paneInfo(cfg.sessionId);
   if (!pane || !pane.live) {
     // Fresh session, or a resume whose pane didn't survive.
