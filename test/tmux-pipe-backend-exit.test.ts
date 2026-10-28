@@ -107,7 +107,7 @@ beforeAll(() => {
   fakeBinDir = mkdtempSync(join(tmpdir(), 'botmux-fake-tmux-'));
   const fake = join(fakeBinDir, 'tmux');
   // `pipe-pane` must succeed (exit 0) or spawn() throws before a fifo exists.
-  writeFileSync(fake, '#!/bin/sh\nexit 0\n');
+  writeFileSync(fake, '#!/bin/sh\nif [ "$1" = "-V" ]; then echo "tmux 3.2"; fi\nexit 0\n');
   chmodSync(fake, 0o755);
 
   // A tmux whose pipe-pane fails NON-retryably, so spawn() gives up at once
@@ -120,6 +120,7 @@ beforeAll(() => {
     failing,
     '#!/bin/sh\n'
     + 'case "$1" in\n'
+    + '  -V) echo "tmux 3.2"; exit 0 ;;\n'
     + "  pipe-pane) echo \"can't find pane: bmx-exit-fixture\" >&2; exit 1 ;;\n"
     + '  *) exit 0 ;;\n'
     + 'esac\n',

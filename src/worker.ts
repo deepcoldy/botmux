@@ -20170,7 +20170,7 @@ function resolveCliExtraArgs(): string[] {
 }
 
 /** One-shot guard for the tmux version / crash-exit-code degradation self-check. */
-let hasWarnedTmuxExitCodeDegradation = false;
+let hasLoggedTmuxVersionSelfCheck = false;
 
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
@@ -20596,25 +20596,23 @@ async function spawnCli(
       if (existingSessionUnknown) {
         log('tmux has-session probe returned no answer but the binary is on PATH (host load); biasing toward reattach instead of gating');
       }
-      // Startup self-check: report the tmux version ONCE per worker. On a tmux
-      // older than 3.2 (or an unreadable version) `remain-on-exit failed` is
-      // unavailable, so new sessions run with the pre-#2164 default: they
-      // always start, but the crash-restart policy cannot see 77/127 (it
-      // degrades to a generic exit). Warn that the deterministic-failure
-      // circuit breaker is off, without gating anything. The whole resolve is
-      // inside the one-shot guard: a successful answer warms the process
-      // cache for the session creation that follows, and a tmux whose `-V`
-      // hangs does not pay the probe cost on every later spawnCli. The log
-      // reflects the boundary resolution at THIS moment; if its re-probe also
-      // fails and a later creation's re-probe succeeds, that creation runs
-      // with the breaker enabled regardless of this one-shot line (a window
-      // narrowed to two consecutive failed probes, not closed entirely).
-      if (!hasWarnedTmuxExitCodeDegradation) {
-        // Ask the SERVER this session will use (the socket placement resolved
-        // above), not just `tmux -V`: a package upgrade can leave the old
-        // server running, and it is the server that accepts/rejects option
-        // values. With no server up yet the probe falls back to the client
-        // binary, which is exactly what will spawn that server.
+      // Startup self-check: report the tmux version ONCE per worker. The
+      // whole resolve is inside the one-shot guard: a successful answer warms
+      // the process cache for the session creation that follows, and a tmux
+      // whose `-V` hangs does not pay the probe cost on every later spawn.
+      // Ask the SERVER this session will use (the socket placement resolved
+      // above), not just `tmux -V`: a package upgrade can leave the old server
+      // running, and it is the server that accepts/rejects option values.
+      // With no server up yet the probe falls back to the client binary, which
+      // is exactly what will spawn that server.
+      //
+      // On tmux < 3.2 (or an unreadable version) `remain-on-exit failed` is
+      // unavailable and the backend uses `remain-on-exit on`, which ALSO
+      // retains a clean exit: the lifecycle watcher reads the real
+      // pane_dead_status (with a one-shot reaper nudge when libutempter loses
+      // SIGCHLD) and reaps the corpse, so deterministic crash exit codes
+      // (77/127) are reported there as well. The notice gates nothing.
+      if (!hasLoggedTmuxVersionSelfCheck) {
         const clientVersion = resolveTmuxVersionAtSessionBoundary();
         const tmuxVersion = serverTmuxVersion(tmuxSocketArgs(resolvedTmuxSocketName), clientVersion);
         const vlabel = tmuxVersion ? `${tmuxVersion.major}.${tmuxVersion.minor}` : 'unknown';
@@ -20625,9 +20623,9 @@ async function spawnCli(
         if (tmuxSupportsRemainOnExitFailed(tmuxVersion)) {
           log(`tmux backend: server version ${vlabel}${clientSuffix} — crash exit-code circuit breaker enabled (remain-on-exit failed supported)`);
         } else {
-          log(`tmux backend: server version ${vlabel}${clientSuffix} (< 3.2 or unknown) — "remain-on-exit failed" unsupported; new sessions start normally, but deterministic crash exit codes (77/127) are not reported, so the crash-restart circuit breaker is degraded to generic-exit handling`);
+          log(`tmux backend: server version ${vlabel}${clientSuffix} (< 3.2 or unknown) — "remain-on-exit failed" unsupported; using "remain-on-exit on": sessions start normally and real crash exit codes (77/127) are still read from the retained dead pane (the lifecycle watcher also reaps clean exits); the pipe-pane attach is guarded against the tmux 2.8 dead-pane server crash`);
         }
-        hasWarnedTmuxExitCodeDegradation = true;
+        hasLoggedTmuxVersionSelfCheck = true;
       }
     } else if (effectiveBackend === 'zellij') {
       // Like tmux, zellij's probe is a disposable background session, so a
