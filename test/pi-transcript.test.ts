@@ -638,3 +638,25 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(result.events[1].timestampMs).toBe(numTs + 1000);
   });
 });
+
+// Pi writes input it accepted while busy only once it dequeues it; the
+// extension's marker is the in-band evidence the turn is queued, and the
+// settle marker says Pi has finished every queued continuation.
+describe('drainPiTranscript: queued input and settle markers', () => {
+  it('surfaces the queued-input marker and the settle marker in file order', () => {
+    resetPiPendingTurnState();
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('first turn', '2026-08-03T05:13:39.000Z'),
+      assistantToolUse('2026-08-03T05:13:40.000Z'),
+      { type: 'custom', timestamp: '2026-08-03T05:13:41.000Z', customType: 'botmux-input-queued', data: { behavior: 'steer' } },
+      toolResult('done', '2026-08-03T05:13:50.000Z'),
+      userMsg('queued turn', '2026-08-03T05:13:50.001Z'),
+      assistantFinal('stop', 'answer', '2026-08-03T05:13:51.000Z'),
+      turnSettled('stop', '2026-08-03T05:13:52.000Z'),
+    ]);
+    const events = drainAll(path).filter(ev => ev.kind !== 'cot');
+    expect(events.map(ev => ev.kind)).toEqual(['user', 'input_queued', 'user', 'assistant_final', 'cli_settled']);
+    expect(events[1]).toMatchObject({ timestampMs: Date.parse('2026-08-03T05:13:41.000Z'), sourceSessionId: SESSION_ID });
+  });
+});

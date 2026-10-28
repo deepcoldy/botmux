@@ -127,7 +127,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
-import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
 import {
@@ -518,7 +518,7 @@ import {
 } from './services/group-collaboration-mode-store.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
-import { classifySlash, isCommandDecision, type CascadeItem } from './core/command-router.js';
+import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
@@ -780,6 +780,10 @@ import {
 import type { WorkflowDaemonMutation } from './workflows/v3/daemon-ipc-client.js';
 import type { SavedWorkflowActorContext } from './workflows/v3/library-service.js';
 import { resolveEffectivePluginIds } from './core/plugins/effective.js';
+import { pluginCommandGateway } from './core/plugins/commands/runtime.js';
+import type { PluginCommandTable } from './core/plugins/commands/gateway.js';
+import { runPluginSlashCommand } from './core/plugins/commands/execute.js';
+import { resolvePluginCardPrivileges } from './core/plugins/card-actions/privileges.js';
 import {
   buildCodexCompletionCard,
   buildCodexNotifierResultCard,
@@ -6413,6 +6417,71 @@ function canTalkForGroupSessions(
     : evaluateTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, memberUnionId, chatType).allowed;
 }
 
+/** Plugin command table for routing. Only `/…` text can route to a plugin, so
+ * ordinary messages skip the registry + bots.json read entirely. */
+function pluginCommandsForRouting(larkAppId: string, text: string): PluginCommandTable | undefined {
+  return text.trim().startsWith('/') ? pluginCommandGateway.table(larkAppId) : undefined;
+}
+
+/** A plugin command whose name the bot also passes through goes to the CLI
+ * (routing order, design §10 decision 2). Say so once at startup. */
+function warnPluginCommandsShadowedByPassthrough(larkAppId: string): void {
+  const passthrough = resolvePassthroughCommands(larkAppId);
+  for (const command of pluginCommandGateway.list(larkAppId)) {
+    if (!passthrough.has(command.name)) continue;
+    logger.warn(`[plugin-command] app=${larkAppId} command=${command.name} plugin=${command.pluginId ?? 'conflict'} shadowed by passthrough; it goes to the CLI`);
+  }
+}
+
+/** Daemon wiring for a `kind: 'plugin'` route; admission order lives in `runPluginSlashCommand`. */
+async function executePluginSlashCommand(input: {
+  ctx: RoutingContext;
+  decision: Extract<SlashRouteDecision, { kind: 'plugin' }>;
+  larkAppId: string;
+  chatId: string;
+  chatType: 'p2p' | 'group' | undefined;
+  anchor: string;
+  messageId: string;
+  senderOpenId: string | undefined;
+  senderUnionId: string | undefined;
+  teamTrustUnionId: string | undefined;
+  botSender: boolean;
+  deps: CommandHandlerDeps;
+}): Promise<void> {
+  if (coordinationModeIsPrimary()) return;
+  const { decision, larkAppId, chatId, anchor, deps } = input;
+  const locale = localeForBot(larkAppId);
+  await runPluginSlashCommand({
+    cmd: decision.cmd,
+    content: decision.content,
+    pluginId: decision.pluginId,
+    larkAppId,
+    chatId,
+    chatType: input.chatType,
+    anchor,
+    messageId: input.messageId,
+    senderOpenId: input.senderOpenId,
+    senderUnionId: input.senderUnionId,
+    locale,
+  }, {
+    restrictedText: () => grantRestrictedSlashCommandText(larkAppId, chatId, input.senderOpenId, decision.cmd),
+    canTalk: () => canTalkForGroupSessions(
+      larkAppId,
+      chatId,
+      input.senderOpenId,
+      input.teamTrustUnionId,
+      input.senderUnionId,
+      input.chatType,
+      input.botSender,
+    ),
+    canOperate: () => canOperate(larkAppId, chatId, input.senderOpenId, input.teamTrustUnionId),
+    onAdmitted: () => markIngressAdmitted(input.ctx),
+    execute: pluginCommandGateway.execute,
+    reply: (content, msgType) => deps.sessionReply(anchor, content, msgType, larkAppId),
+    text: key => tr(key, { cmd: decision.cmd }, locale),
+  });
+}
+
 // Dependencies passed to card-handler
 // v3 run-level progress is a best-effort IM projection. journal.ndjson remains
 // the only execution truth; the manager persists only Lark delivery state.
@@ -7171,6 +7240,9 @@ const cardActionPluginGateway = createPluginCardActionGateway({
     readGlobalConfig(),
   ),
   fallback: (data, larkAppId) => handleCardAction(data, cardDeps, larkAppId),
+  // Identity comes only from the SDK-verified envelope operator and the
+  // callback context's chat; card values never feed this decision.
+  resolvePrivileges: resolvePluginCardPrivileges,
 });
 
 const LEGACY_WORKFLOW_API_RETIRED = {
@@ -25489,7 +25561,25 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
     senderIsBot: senderIsBotForSlashGate,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
+    pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
   });
+  if (slashDecision.kind === 'plugin') {
+    await executePluginSlashCommand({
+      ctx,
+      decision: slashDecision,
+      larkAppId,
+      chatId,
+      chatType,
+      anchor,
+      messageId: parsed.messageId,
+      senderOpenId,
+      senderUnionId,
+      teamTrustUnionId,
+      botSender: senderIsBotForSlashGate,
+      deps: commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId }),
+    });
+    return true;
+  }
   // grant 限制闸对**认不出**的 `/xxx` 同样要查（改造前 parseSlashCommandInvocation 成功即查，
   // 与命令是否注册无关）：受限成员的 CLI 自定义斜杠命令不能绕过这道闸进 CLI。
   if (slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
@@ -29059,6 +29149,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       cascadeCapable: !!existingDs && !isRemoteBackendSession(existingDs)
         && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
       hasAttachments: resources.length > 0,
+      pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
     });
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
   // botmux 自己的命令（/close /status …）照常放行。正文项的重入自带 cascadeBodyReentry 标记。
@@ -29130,6 +29221,23 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       substitute: !!substituteTrigger,
     }).catch(err => {
       logger.error(`[${anchor.substring(0, 12)}] cascade failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return true;
+  }
+  if (slashDecision && slashDecision.kind === 'plugin') {
+    await executePluginSlashCommand({
+      ctx,
+      decision: slashDecision,
+      larkAppId,
+      chatId: existingDs?.chatId ?? chatId ?? routingChatId,
+      chatType,
+      anchor,
+      messageId: parsed.messageId,
+      senderOpenId,
+      senderUnionId,
+      teamTrustUnionId,
+      botSender: isBotSenderType || isForeignBotSender,
+      deps: commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId }),
     });
     return true;
   }
@@ -32509,6 +32617,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Normalize legacy document-native watches before restore can close their old sessions.
   if (!cfg.apiOnly) normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId);
+  warnPluginCommandsShadowedByPassthrough(cfg.larkAppId);
 
   // Restore active sessions from previous run
   const startupXpiQuarantineNotices = await restoreSessionsAndScheduleStartupRecovery({
