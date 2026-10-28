@@ -59,7 +59,8 @@ vi.mock('node:fs', () => {
   };
 });
 
-import { execSync, execFile, execFileSync, spawnSync } from 'node:child_process';
+import { execSync, execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { unlinkSync, createReadStream, openSync, closeSync, writeSync } from 'node:fs';
 import {
   TmuxPipeBackend,
@@ -1453,7 +1454,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
       const probeImpl = (_bin: any, args: any) => {
         if (!Array.isArray(args) || !args.includes('display-message')) { lastWasPaneId = false; return '' as any; }
         if (args.includes('#{pane_id}')) { lastWasPaneId = true; return '%1\n' as any; }
-        if (args.includes(DEAD_STATUS)) {
+        if (args.some((a: unknown) => String(a).startsWith(DEAD_STATUS))) {
           const afterPaneId = lastWasPaneId;
           lastWasPaneId = false;
           return afterPaneId ? '1:77\n' as any : '' as any;
@@ -1481,6 +1482,54 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     } finally {
       vi.useRealTimers();
       errSpy.mockRestore();
+    }
+  });
+
+  // #2453: the same probe-time latch when tmux never publishes a status
+  // because it has not reaped the pane process — the code then comes from the
+  // kernel's record of that unreaped child, read while the probe confirms the
+  // corpse. A real unreaped child stands in for the pane (python forks it and
+  // never waits), so the kernel read is real; the terminal read is starved, so
+  // only the probe-time capture can carry the 3.
+  const python3 = ['/usr/bin/python3', '/bin/python3'].find(path => existsSync(path));
+  it.skipIf(!python3 || process.platform !== 'linux')('latches a status tmux never published from the kernel at probe time (#2453)', async () => {
+    const parent = spawn(python3!, ['-c', [
+      'import os, sys, time',
+      'pid = os.fork()',
+      'if pid == 0: os._exit(3)',
+      'time.sleep(0.2)',
+      'print(pid, flush=True)',
+      'sys.stdin.read()',
+    ].join('\n')], { stdio: ['pipe', 'pipe', 'inherit'] });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const [chunk] = await once(parent.stdout!, 'data') as [Buffer];
+      // dead, no status, pane pid = the unreaped child, server pid = its parent
+      const corpse = `1::${String(chunk).trim()}:${parent.pid}\n`;
+      vi.useFakeTimers();
+      let lastWasPaneId = false;
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        if (!Array.isArray(args) || !args.includes('display-message')) { lastWasPaneId = false; return '' as any; }
+        if (args.includes('#{pane_id}')) { lastWasPaneId = true; return '%1\n' as any; }
+        if (args.some((a: unknown) => String(a).startsWith('#{pane_dead}:#{pane_dead_status}'))) {
+          const afterPaneId = lastWasPaneId;
+          lastWasPaneId = false;
+          return afterPaneId ? corpse as any : '' as any;
+        }
+        lastWasPaneId = false;
+        return '' as any;
+      }) as typeof execFileSync);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000 + 9_000 + 2_000);
+      expect(exits).toEqual([[3, null]]);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+      parent.stdin!.end();
+      await once(parent, 'close');
     }
   });
 

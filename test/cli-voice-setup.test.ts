@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { z } from 'zod';
 import { resolveBunExecutable, spawnNodeTsScript } from './helpers/ts-runner.js';
 import { invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
@@ -32,14 +33,19 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-function cli(runtime: 'node' | 'bun', args: string[], steps: Step[] = []): Promise<string> {
+/** The CLI's environment: everything under `dir`, nothing of the real user's. */
+function cliEnv(dir: string): Record<string, string | undefined> {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
     !key.startsWith('BOTMUX_') && key !== 'BOTS_CONFIG'));
-  Object.assign(env, {
-    HOME: home, USERPROFILE: home, BOTMUX_GLOBAL_CONFIG_FILE: config, BOTS_CONFIG: bots,
-    BOTMUX_NO_CLAIM: '1', XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache'),
-    PATH: join(home, 'bin'),
+  return Object.assign(env, {
+    HOME: dir, USERPROFILE: dir, BOTMUX_GLOBAL_CONFIG_FILE: join(dir, 'config.json'), BOTS_CONFIG: join(dir, 'bots.json'),
+    BOTMUX_NO_CLAIM: '1', XDG_CONFIG_HOME: join(dir, '.config'), XDG_CACHE_HOME: join(dir, '.cache'),
+    PATH: join(dir, 'bin'),
   });
+}
+
+function cli(runtime: 'node' | 'bun', args: string[], steps: Step[] = []): Promise<string> {
+  const env = cliEnv(home);
   const script = resolve('src/cli.ts');
   const bun = resolveBunExecutable();
   if (runtime === 'bun' && !bun) throw new Error('Bun is required for CLI verification');
@@ -88,6 +94,26 @@ function savedVoice() {
 }
 
 describe.each(['node', 'bun'] satisfies Array<'node' | 'bun'>)('real voice setup under %s', (runtime) => {
+  // `node --import tsx` transpiles the CLI's whole import graph on first use
+  // and caches it under TMPDIR. bun-test gives each test file its own TMPDIR,
+  // so the first node call in this file always started cold — measured about
+  // twice a warm call (12.7–13s vs 5–6.5s on two starved cores) — and that one
+  // call ran into cli()'s 15s kill (#2460). Pay the cold transpile once here,
+  // outside any per-call deadline; every timed call below then starts warm.
+  beforeAll(async () => {
+    if (runtime !== 'node') return;
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-voice-warm-'));
+    try {
+      writeFileSync(join(dir, 'config.json'), '{}');
+      writeFileSync(join(dir, 'bots.json'), '[]');
+      const child = spawnNodeTsScript(resolve('src/cli.ts'), ['voice', 'status'], { env: cliEnv(dir), stdio: 'ignore' });
+      const [code] = await once(child, 'close') as [number | null];
+      expect(code).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each([['1', 'standard'], ['agent-plan', 'agent-plan']])('saves explicit mode %s, preserves ASR, and hides the whole key in status', async (answer, mode) => {
     const output = await cli(runtime, [], volcengineSteps(answer));
     expect(output).toContain('已写入 voice 配置');

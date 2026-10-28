@@ -48,6 +48,7 @@ import {
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
+import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -113,6 +114,9 @@ const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
  *  The teardown read polls that long at most for the real status. */
 const PANE_DEATH_STATUS_POLL_MS = 50;
 const PANE_DEATH_STATUS_MAX_POLLS = 20; // ≈1s wall budget, matching the empirically-validated fixture grace
+/** The teardown/probe read. The pane and server pids let resolvePaneDeath ask
+ *  the kernel for a status tmux has not published (see unreaped-pane-exit). */
+const PANE_DEATH_FORMAT = '#{pane_dead}:#{pane_dead_status}:#{pane_pid}:#{pid}';
 
 /**
  * Three-way verdict for a pane probed at teardown / reattach time.
@@ -153,8 +157,8 @@ export function resolveReportedExitCode(
 
 /**
  * Resolve a pane's liveness + real exit status from raw
- * `#{pane_dead}:#{pane_dead_status}` lines, accounting for TWO ordering/load
- * gaps:
+ * `#{pane_dead}:#{pane_dead_status}[:#{pane_pid}:#{pid}]` lines, accounting
+ * for TWO ordering/load gaps:
  *
  *  1. tmux flips `#{pane_dead}` BEFORE `pane_dead_status` is visible
  *     (`1:` → `1:77` on tmux 3.3a; the gap widens under a loaded server).
@@ -166,9 +170,14 @@ export function resolveReportedExitCode(
  * Pure (read + wait injected) for deterministic unit tests:
  *  - `0:…` → alive immediately (never re-read, never reap);
  *  - `1:<code>` → dead with that code;
- *  - `1:` → dead with no status yet: poll up to `attempts` times for the
- *    code; an empty status at the deadline is a legitimate signal death and
- *    resolves to `{dead, status:null}` (we never invent a code);
+ *  - `1:` → dead with no status yet. tmux publishes the status only once it
+ *    has reaped the pane process; until then that process is a zombie child
+ *    of the server and the kernel holds its status, so `unreapedExit` (given
+ *    the line's pane and server pids) is asked first: an exit code is
+ *    returned at once, a signal death is `{dead, status:null}` at once.
+ *    Otherwise poll up to `attempts` times for the code; an empty status at
+ *    the deadline is a legitimate signal death and resolves to
+ *    `{dead, status:null}` (we never invent a code);
  *  - `''`/unparseable → unknown: poll up to `attempts` times for ANY decisive
  *    answer. Once death has been observed it latches (a later unreadable line
  *    or an impossible-looking `0:` cannot undo it — dead panes do not revive).
@@ -181,14 +190,16 @@ export function resolvePaneDeath(
     attempts: PANE_DEATH_STATUS_MAX_POLLS,
     intervalMs: PANE_DEATH_STATUS_POLL_MS,
   },
+  unreapedExit?: (panePid: number, serverPid: number) => UnreapedPaneExit | null,
 ): PaneDeathResolution {
   // One raw line classified three ways.
-  const classify = (line: string): { alive: true } | { code: string | null } | null => {
-    const [dead, status] = String(line ?? '').trim().split(':');
+  const classify = (line: string): { alive: true } | { code: string | null; pids: [number, number] } | null => {
+    const [dead, status, panePid, serverPid] = String(line ?? '').trim().split(':');
     if (dead === '0') return { alive: true }; // explicitly alive
     if (dead !== '1') return null; // '' / unparseable / tmux error → unreadable
     const s = (status ?? '').trim();
-    return { code: s.length > 0 ? s : null }; // dead; null = no status yet
+    // dead; null = no status yet
+    return { code: s.length > 0 ? s : null, pids: [Number(panePid), Number(serverPid)] };
   };
 
   let line = firstLine;
@@ -206,6 +217,8 @@ export function resolvePaneDeath(
         const parsed = Number.parseInt(v.code, 10);
         return { kind: 'dead', status: Number.isInteger(parsed) ? parsed : null };
       }
+      const kernel = unreapedExit?.(...v.pids) ?? null;
+      if (kernel) return { kind: 'dead', status: kernel.kind === 'exited' ? kernel.code : null };
     }
     // v === null (unreadable) and dead-without-status both loop: read again.
     if (i === opts.attempts) break;
@@ -937,7 +950,9 @@ export class TmuxPipeBackend implements SessionBackend {
    * The status read uses resolvePaneDeath's bounded wait for the
    * `1:` -> `1:<code>` publish gap, so the code is grabbed while the corpse is
    * fresh — handlePaneExit() then trusts observedDeathStatus rather than
-   * re-reading a corpse a starved tmux may no longer answer (#2434).
+   * re-reading a corpse a starved tmux may no longer answer (#2434). When the
+   * gap is tmux not having reaped the pane process at all, the code comes from
+   * the kernel's record of that zombie instead (#2453).
    */
   private capturePaneDeath(): boolean {
     const readLine = (): string => {
@@ -945,7 +960,7 @@ export class TmuxPipeBackend implements SessionBackend {
         return String(
           execFileSync(
             'tmux',
-            [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+            [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, PANE_DEATH_FORMAT],
             { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
           ) ?? '',
         ).trim();
@@ -953,7 +968,7 @@ export class TmuxPipeBackend implements SessionBackend {
         return ''; // unreadable -> resolvePaneDeath retains the prior observation
       }
     };
-    const verdict = resolvePaneDeath(readLine(), readLine, sleepSyncMs);
+    const verdict = resolvePaneDeath(readLine(), readLine, sleepSyncMs, undefined, readUnreapedPaneExit);
     if (verdict.kind !== 'dead') return false;
     if (this.observedDeathStatus === undefined || (this.observedDeathStatus === null && verdict.status !== null)) {
       this.observedDeathStatus = verdict.status;
@@ -1485,7 +1500,7 @@ export class TmuxPipeBackend implements SessionBackend {
         return String(
           execFileSync(
             'tmux',
-            [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+            [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, PANE_DEATH_FORMAT],
             { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
           ) ?? '',
         ).trim();
@@ -1495,8 +1510,10 @@ export class TmuxPipeBackend implements SessionBackend {
     };
     // resolvePaneDeath retries both ordering gaps: status published a beat
     // after death, AND an unreadable FIRST line (a transient tmux timeout),
-    // which used to be collapsed straight into "not dead".
-    return resolvePaneDeath(readLine(), readLine, sleepSyncMs);
+    // which used to be collapsed straight into "not dead". A status tmux has
+    // not published because it has not reaped the pane yet comes from the
+    // kernel instead (#2453).
+    return resolvePaneDeath(readLine(), readLine, sleepSyncMs, undefined, readUnreapedPaneExit);
   }
 
   /** Take down the corpse `remain-on-exit failed` left behind (and its session).
