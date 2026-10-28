@@ -162,7 +162,10 @@ describe('authenticated Codex App turn recovery', () => {
     expect(scope.adoptInitialActiveTurn).not.toHaveBeenCalled();
     expect(scope.publishSandboxRelayCapability).not.toHaveBeenCalled();
   });
-  it.each([null, undefined, 42, {}, [], '', false])('rejects a non-string or empty signed turn: %j', signedTurn => {
+  it.each([
+    { signedTurn: null }, { signedTurn: undefined }, { signedTurn: 42 },
+    { signedTurn: {} }, { signedTurn: [] }, { signedTurn: '' }, { signedTurn: false },
+  ])('rejects a non-string or empty signed turn: %j', ({ signedTurn }) => {
     const { scope, restore } = recoveryFixture();
     restore(signedTurn, { generation: 'g1', seq: 6 });
     expect(scope.adoptInitialActiveTurn).not.toHaveBeenCalled();
