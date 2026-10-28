@@ -13,6 +13,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
 
 const APP_ID = 'cli_test';
 const ROOT_ID = 'om_root';
@@ -64,6 +66,7 @@ vi.mock('../src/services/session-store.js', () => ({
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
+  updateDeploymentContinuation: vi.fn(),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
@@ -470,6 +473,35 @@ describe('stuck-warning card tui_keys handler', () => {
 
     expect(result).toMatchObject({ toast: { type: 'warning' } });
     expect(ds.tuiPromptProcessing).toBe(false);
+  });
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])('text input persists cancellation before IPC (disk failure=%s, before receipt=%s)', async (diskFailure, beforeReceipt) => {
+    const ds = makeDs({ worker: { killed: false, connected: true, send: workerSend } as any, tuiPromptCardId: CARD_ID });
+    const continuation = { state: 'claimed' as const, turnId: 'om_old', nativeSessionId: 'native', consumedAt: Date.now(),
+      workerGeneration: 1, caller: { senderType: 'user' as const, requestUserOpenId: 'ou_test', requestLarkAppId: APP_ID } };
+    Object.assign(ds.session, { cliId: 'codex', backendType: 'tmux', larkAppId: APP_ID, cliSessionId: 'native', workerGeneration: 1 });
+    ds.activeInteractiveTurn = { turnId: 'om_old', caller: continuation.caller };
+    ds.session.deploymentContinuation = beforeReceipt ? undefined : continuation;
+    const persist = vi.mocked(sessionStore.updateDeploymentContinuation);
+    persist.mockImplementationOnce((row) => {
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(row.deploymentContinuation).toEqual({ state: 'cancelled', turnId: 'om_old' });
+      if (diskFailure) throw new Error('disk unavailable');
+    });
+    const result = await handleCardAction(makeTuiTextEvent('new intent') as any,
+      makeDeps(new Map([[sessionKey(ROOT_ID, APP_ID), ds]])), APP_ID);
+    expect(persist).toHaveBeenCalledWith(ds.session, beforeReceipt ? undefined : continuation);
+    expect(workerSend).toHaveBeenCalledTimes(diskFailure ? 0 : 1);
+    if (diskFailure) {
+      expect(ds.session.deploymentContinuation).toBe(beforeReceipt ? undefined : continuation);
+      expect(ds.tuiPromptProcessing).toBe(false);
+      expect(result).toMatchObject({ toast: { type: 'warning' } });
+    } else {
+      expect(recordDeploymentContinuation(ds.session, { type: 'native_input_consumed', ordinaryInteractive: true,
+        turnId: 'om_old', proofKind: 'codex_history_match', nativeSessionId: 'native' },
+      { caller: continuation.caller, currentTurnId: 'om_old', workerGeneration: 1, rpc: false },
+      () => { throw new Error('cancelled receipt must not persist'); })).toBe(false);
+    }
   });
 
   it('does not render text input as processing when nothing was dispatched', async () => {

@@ -652,10 +652,10 @@ export interface Session {
   xpiSharedCwdQuarantine?: XpiSharedCwdQuarantine;
   /** Bounded notification receipts only; never authorizes execution/replay. */
   cliProgressNotices?: import('./services/cli-progress-notice.js').CliProgressNotice[];
-  /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
-   * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   /** Native-consumed ordinary task eligible for one cold restart continuation. */
   deploymentContinuation?: import('./services/deployment-continuation.js').DeploymentContinuationRecord;
+  /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
+   * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
   /**
    * Bounded, crash-recoverable proof that a durable-primary Inbox message

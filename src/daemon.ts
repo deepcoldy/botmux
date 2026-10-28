@@ -31088,7 +31088,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const caller = restored?.state === 'claimed' && restored.turnId === receipt.turnId
           ? restored.caller : failedTurnCaller(ds, receipt.turnId);
         const recorded = recordDeploymentContinuation(ds.session, receipt, {
-          caller, currentTurnId: ds.currentReplyTarget?.turnId,
+          // Admission owns the live turn. A cold restore has only its claimed
+          // reply target until this receipt re-arms the recovered turn.
+          caller, currentTurnId: ds.activeInteractiveTurn?.turnId ?? ds.currentReplyTarget?.turnId,
           workerGeneration: context.workerGeneration, rpc: ds.initConfig?.codexRpcInput === true,
         }, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
         if (recorded && caller && restored?.state === 'claimed'

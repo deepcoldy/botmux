@@ -10,7 +10,7 @@ import {
   deploymentContinuationTemplate, recordDeploymentContinuation,
 } from '../src/services/deployment-continuation.js';
 import { restartNoteInput, restartInterruptionNote } from '../src/services/restart-interruption.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
 let directory: string, previousDirectory: string, row: Session;
 const caller = { senderType: 'user' as const, requestUserOpenId: 'ou_sender', requestLarkAppId: 'app_test' };
@@ -117,6 +117,33 @@ it('real worker stop removes a queued restart note while preserving a newer inpu
   expect(scope.pendingMessages).toEqual([{ turnId: 'om_new', content: 'new request' }]);
   expect(scope.pendingRestartInterruption).toBeUndefined();
   expect(scope.lastWrittenCliInput).toBeUndefined();
+});
+
+it.each([
+  { type: 'raw_input', content: '/clear' },
+  { type: 'inject_command', command: '/new' },
+  { type: 'tui_text_input', keys: ['Enter'], text: 'manual reply' },
+])('$type retires restored work before the first prompt can deliver its note', async message => {
+  const newer = { turnId: 'om_new', content: 'new user intent' };
+  const scope: any = {
+    lastInitConfig: { deploymentContinuation: { turnId: 'om_old' } }, restoredDeploymentTurnId: 'om_old',
+    lastWrittenCliInput: { turnId: 'om_old' }, pendingRestartInterruption: { turnOpen: true, tasks: [] },
+    pendingMessages: [{ turnId: 'om_old', content: 'old note' }, newer], pendingInjections: [],
+    inflightInputs: { retireTurn: vi.fn() }, restartInterruptionScanBeforeMs: 1,
+    refreshHookReviewInputHold: vi.fn(), firstWriteLivenessConfirmed: false, cliRestartInProgress: true,
+    freshnessInputQueue: { enqueueRaw: vi.fn() }, flushPending: vi.fn(), log: vi.fn(),
+    flushPendingInjections: vi.fn(), handleTuiTextInput: vi.fn(async () => true),
+  };
+  scope.discardDeploymentContinuation = loadWorkerFunction('discardDeploymentContinuation', scope);
+  await loadWorkerMessageHandler(message.type, scope)(message);
+  expect(scope.lastInitConfig.deploymentContinuation).toBeUndefined();
+  expect(scope.lastWrittenCliInput).toBeUndefined();
+  expect(scope.pendingRestartInterruption).toBeUndefined();
+  expect(scope.pendingMessages).toEqual([newer]);
+  expect(scope.inflightInputs.retireTurn).toHaveBeenCalledWith('om_old');
+  // An ensuing prompt-ready edge cannot synthesize an old continuation.
+  loadWorkerFunction<() => void>('deliverRestartInterruptionNote', scope)();
+  expect(scope.pendingMessages).toEqual([newer]);
 });
 
 it('requires positive ordinary input evidence even when another owner receipt is unavailable', () => {

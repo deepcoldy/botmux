@@ -11214,10 +11214,10 @@ export function sendWorkerSessionInput(
     cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
   }
   if ((message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc'))
-    || message.type === 'raw_input') {
+    || message.type === 'raw_input' || message.type === 'inject_command') {
     cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
-      ds.currentReplyTarget?.turnId, true);
-  } else if (message.type === 'message' || message.type === 'inject_command') {
+      ds.activeInteractiveTurn?.turnId ?? ds.currentReplyTarget?.turnId, true);
+  } else if (message.type === 'message') {
     cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
   }
   const annotated = withTurnCaller(ds, message);
@@ -14062,6 +14062,8 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
+      // Deliberately do not replay opts.deploymentContinuation: a deferred
+      // device-isolation spawn cannot carry an earlier claim into a new owner.
       forkWorker(ds, promptInput, resumeOrTurnId);
     }
   })) {

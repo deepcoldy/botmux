@@ -29722,6 +29722,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'raw_input': {
+      discardDeploymentContinuation();
       if (/^\/(?:model|new|clear)\b/i.test(msg.content.trim())) {
         // An explicit native setting/session command takes precedence until
         // the next worker init; the pool must not undo a manual model choice.
@@ -30177,6 +30178,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'inject_command': {
+      discardDeploymentContinuation();
       // 唯一发送方是 /slash 路由的白名单 TUI 命令注入。cwd 移动不再走注入
       // （角色切换已改为 restart+updateWorkingDir 的 respawn），这里不接受
       // 任何 workingDir 改写——那会绕过 cd 路由的角色库硬校验。
@@ -30186,6 +30188,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_text_input': {
+      discardDeploymentContinuation();
       const wroteText = await handleTuiTextInput(msg.keys, msg.text);
       if (msg.cardMessageId) {
         send(wroteText
