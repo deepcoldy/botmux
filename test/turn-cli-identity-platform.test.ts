@@ -22,6 +22,7 @@ vi.mock('../src/utils/user-token.js', () => ({
 const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
 const beginBytedcliLogin = vi.fn(async () => ({ authUrl: 'https://cloud.example.test/local-bytedcli', completeToken: 'tok' }));
 vi.mock('../src/services/bytedcli-auth.js', () => ({
+  renewBytedcliJwts: vi.fn(async () => null),
   mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
   beginBytedcliLogin: (openId: string) => beginBytedcliLogin(openId),
 }));

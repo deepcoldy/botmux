@@ -31,6 +31,7 @@ vi.mock('../src/utils/user-token.js', () => ({
 // bytedcli shells out to the real CLI; here we control who is authorized.
 const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
 vi.mock('../src/services/bytedcli-auth.js', () => ({
+  renewBytedcliJwts: vi.fn(async () => null),
   mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
   beginBytedcliLogin: vi.fn(async () => ({
     authUrl: 'https://cloud.example.com/auth?state=auto',
