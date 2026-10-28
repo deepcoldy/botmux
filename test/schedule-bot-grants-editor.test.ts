@@ -7,6 +7,7 @@ vi.mock('../src/dashboard/web/confirm-modal.js', () => ({ confirm: vi.fn(async (
 import { ScheduleBotGrantsEditor, scheduleBotGrantDraftProblem } from '../src/dashboard/web/schedule-bot-grants-editor.js';
 import { confirm } from '../src/dashboard/web/confirm-modal.js';
 import { applySettingsWrite, type SettingsWriteApplierDeps } from '../src/dashboard/settings-write-applier.js';
+import { scheduleBotGrantsPayload } from '../src/dashboard/web/settings-page.js';
 import type { ScheduleBotGrant } from '../src/global-config.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -124,9 +125,26 @@ describe('scheduleBotGrantDraftProblem', () => {
     ];
     for (const [grant, others] of cases) {
       const write = vi.fn();
-      const result = await applySettingsWrite({ scheduleBotGrants: { grants: [...others, grant] } },
-        { writeScheduleBotGrantConfig: write, resolveDashboardSettings: () => ({}) } as unknown as SettingsWriteApplierDeps);
+      const result = await applySettingsWrite({ scheduleBotGrants: { grants: [...others, grant], baseGrants: others } },
+        { writeScheduleBotGrantConfig: write, resolveDashboardSettings: () => ({}),
+          readGlobalConfig: () => ({ scheduleDelegation: { botGrants: others } }) } as unknown as SettingsWriteApplierDeps);
       expect(scheduleBotGrantDraftProblem(grant, others) === null, JSON.stringify(grant)).toBe(result.ok);
     }
+  });
+});
+
+describe('scheduleBotGrantsPayload', () => {
+  it('sends the shown list as the base of a list write, so a stale page is refused', async () => {
+    const shown = [team];
+    const edited = [team, { ...team, id: 'second', chatIds: ['oc_other'] }];
+    const payload = scheduleBotGrantsPayload(shown, { grants: edited });
+    expect(payload).toEqual({ grants: edited, baseGrants: shown });
+    expect(scheduleBotGrantsPayload(shown, { createEnabled: true })).toEqual({ createEnabled: true });
+    const deps = (onDisk: ScheduleBotGrant[]) => ({ writeScheduleBotGrantConfig: vi.fn(), resolveDashboardSettings: () => ({}),
+      readGlobalConfig: () => ({ scheduleDelegation: { botGrants: onDisk } }) } as unknown as SettingsWriteApplierDeps);
+    expect((await applySettingsWrite({ scheduleBotGrants: payload }, deps(shown))).ok).toBe(true);
+    // Another tab removed `team` after this page loaded.
+    expect(await applySettingsWrite({ scheduleBotGrants: payload }, deps([])))
+      .toEqual({ ok: false, error: 'scheduleBotGrants_stale' });
   });
 });

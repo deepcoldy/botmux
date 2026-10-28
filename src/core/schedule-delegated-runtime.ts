@@ -43,15 +43,24 @@ async function revalidateController(
  * it can enter a worker queue. The returned task is deliberately anonymous as
  * a current actor; any allowed tool identity is published separately and only
  * for the exact scheduled turn. */
+/** A bot-policy task is checked against the current host grant before and
+ * again after the identity lookups, so revoking the grant while they are in
+ * flight still refuses this admission. */
+function assertBotGrantStillActive(
+  authority: ScheduleAuthorityRecord,
+  validateBotGrant: ((record: ScheduleAuthorityRecord) => void) | undefined,
+): void {
+  if (!authority.grantId?.startsWith('bot-policy:')) return;
+  if (!validateBotGrant) throw new Error('schedule bot grant validator unavailable');
+  validateBotGrant(authority);
+}
+
 export async function authorizeDelegatedScheduleRun(
   task: ScheduledTask,
   authority: ScheduleAuthorityRecord,
   deps: DelegatedScheduleRuntimeDependencies,
 ): Promise<AuthorizedDelegatedScheduleRun> {
-  if (authority.grantId?.startsWith('bot-policy:')) {
-    if (!deps.validateBotGrant) throw new Error('schedule bot grant validator unavailable');
-    deps.validateBotGrant(authority);
-  }
+  assertBotGrantStillActive(authority, deps.validateBotGrant);
   if (authority.kind !== 'delegated') throw new Error('schedule authority is not delegated');
   if (authority.state !== 'active') throw new Error(`schedule authority state is ${authority.state}`);
   if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
@@ -66,6 +75,7 @@ export async function authorizeDelegatedScheduleRun(
     throw new Error('delegated schedule credential identity is missing');
   }
   const targetOpenId = await revalidateController(task, authority, deps);
+  assertBotGrantStillActive(authority, deps.validateBotGrant);
   return { task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined }, targetOpenId };
 }
 
@@ -79,10 +89,7 @@ export async function authorizeScheduleSelfManage(
       targetChatId: string;
     },
 ): Promise<void> {
-  if (authority.grantId?.startsWith('bot-policy:')) {
-    if (!deps.validateBotGrant) throw new Error('schedule bot grant validator unavailable');
-    deps.validateBotGrant(authority);
-  }
+  assertBotGrantStillActive(authority, deps.validateBotGrant);
   const completedRunStillLive = authority.state === 'completed'
     && authority.task.enabled === false
     && authority.task.disabledReason === 'once_completed';
@@ -99,4 +106,5 @@ export async function authorizeScheduleSelfManage(
     throw new Error('schedule self-management is not allowed');
   }
   await revalidateController(authority.task, authority, deps, deps.targetChatId);
+  assertBotGrantStillActive(authority, deps.validateBotGrant);
 }

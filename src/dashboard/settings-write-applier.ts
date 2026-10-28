@@ -37,7 +37,7 @@ import {
   isCodexNotifierHookInstalled,
 } from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
-import { isScheduleBotGrant, overlappingScheduleBotGrants } from '../core/schedule-bot-grant.js';
+import { canonicalScheduleBotGrant, isScheduleBotGrant, overlappingScheduleBotGrants } from '../core/schedule-bot-grant.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
@@ -293,6 +293,7 @@ export type ApplySettingsWriteError =
   | 'invalid_scheduleBotGrants_grant'
   | 'scheduleBotGrants_duplicate_id'
   | 'scheduleBotGrants_overlap'
+  | 'scheduleBotGrants_stale'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -686,6 +687,15 @@ export async function applySettingsWrite(
       }
       if (overlappingScheduleBotGrants(grants).length > 0) {
         return { ok: false, error: 'scheduleBotGrants_overlap' };
+      }
+      // The list is written whole, so it must be based on what is on disk now:
+      // a page opened before another tab (or a hand edit) revoked a grant would
+      // otherwise write that grant straight back.
+      const base = incoming.baseGrants;
+      const onDisk = deps.readGlobalConfig().scheduleDelegation?.botGrants ?? [];
+      const canonical = (list: ScheduleBotGrant[]) => JSON.stringify(list.map(canonicalScheduleBotGrant));
+      if (!Array.isArray(base) || !base.every(isScheduleBotGrant) || canonical(base) !== canonical(onDisk)) {
+        return { ok: false, error: 'scheduleBotGrants_stale' };
       }
       next.botGrants = grants;
     }

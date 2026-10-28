@@ -1141,7 +1141,7 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
   it('writes the switches and the whole grant list through the bot-grant writer', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ scheduleBotGrants: {
-      createEnabled: true, selfManageEnabled: false, grants: [grant] } }, deps);
+      createEnabled: true, selfManageEnabled: false, grants: [grant], baseGrants: [] } }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({
       createEnabled: true, selfManageEnabled: false, botGrants: [grant] });
@@ -1150,7 +1150,7 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
 
   it('clears the list with an empty array', async () => {
     const deps = makeDeps();
-    expect((await applySettingsWrite({ scheduleBotGrants: { grants: [] } }, deps)).ok).toBe(true);
+    expect((await applySettingsWrite({ scheduleBotGrants: { grants: [], baseGrants: [] } }, deps)).ok).toBe(true);
     expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({ botGrants: [] });
   });
 
@@ -1172,15 +1172,30 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
 
   it('accepts grants that share a source but differ in chat or target', async () => {
     const deps = makeDeps();
-    const r = await applySettingsWrite({ scheduleBotGrants: { grants: [grant,
+    const r = await applySettingsWrite({ scheduleBotGrants: { baseGrants: [], grants: [grant,
       { ...grant, id: 'other-chat', chatIds: ['oc_other'] },
       { ...grant, id: 'other-target', targetAppIds: ['cli_c'] }] } }, deps);
     expect(r.ok).toBe(true);
   });
 
+  // A page that loaded before another tab (or a hand edit) revoked a grant
+  // must not write that grant back with its stale copy of the list.
+  it('refuses a list edited from a copy that is no longer what is on disk', async () => {
+    const other = { ...grant, id: 'other', chatIds: ['oc_other'] };
+    const deps = makeDeps({ readGlobalConfig: vi.fn(() => ({ scheduleDelegation: { botGrants: [grant] } })) });
+    for (const baseGrants of [[grant, other], [], undefined, ['team']]) {
+      expect(await applySettingsWrite({ scheduleBotGrants: { grants: [grant, other], baseGrants } }, deps))
+        .toEqual({ ok: false, error: 'scheduleBotGrants_stale' });
+    }
+    expect(deps.writeScheduleBotGrantConfig).not.toHaveBeenCalled();
+    // The same edit made on the current list goes through; the switches need no base.
+    expect((await applySettingsWrite({ scheduleBotGrants: { grants: [grant, other], baseGrants: [grant] } }, deps)).ok).toBe(true);
+    expect((await applySettingsWrite({ scheduleBotGrants: { createEnabled: false } }, deps)).ok).toBe(true);
+  });
+
   it('does not write the grants when another field of the same request is invalid', async () => {
     const deps = makeDeps();
-    const r = await applySettingsWrite({ scheduleBotGrants: { grants: [grant] }, repoPickerMode: 'bad' }, deps);
+    const r = await applySettingsWrite({ scheduleBotGrants: { grants: [grant], baseGrants: [] }, repoPickerMode: 'bad' }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_repoPickerMode' });
     expect(deps.writeScheduleBotGrantConfig).not.toHaveBeenCalled();
   });

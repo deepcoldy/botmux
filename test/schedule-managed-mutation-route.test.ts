@@ -98,6 +98,7 @@ describe('managed schedule mutation route', () => {
   it.each(['pause', 'remove'])('lets the owning bot %s its policy task in the original topic after a report', async action => {
     const h = harness(action, 'report:1');
     h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
     h.ds.session.rootMessageId = 'om_topic';
     Object.assign(h.record, { selfManage: true, state: 'paused', controlOpenId: 'ou_admin',
       controlUnionId: 'on_admin', runScopes: [], grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
@@ -109,6 +110,7 @@ describe('managed schedule mutation route', () => {
     expect((await h.run()).status).toBe(200);
     h.ds.session.rootMessageId = 'om_other';
     expect((await h.run()).status).toBe(403);
+    h.ds.scope = 'thread';
     h.ds.session.rootMessageId = 'om_topic';
     h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true } });
     expect((await h.run()).status).toBe(403);
@@ -118,6 +120,7 @@ describe('managed schedule mutation route', () => {
   // still manages the task through the current-human path.
   function botPolicyTaskInTopic(action: string, turnId: string) {
     const h = harness(action, turnId);
+    h.ds.scope = 'thread';
     h.ds.session.rootMessageId = 'om_topic';
     Object.assign(h.record, { selfManage: true, controlOpenId: 'ou_admin',
       controlUnionId: 'on_admin', runScopes: [], grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
@@ -135,6 +138,32 @@ describe('managed schedule mutation route', () => {
     expect(h.scheduler.removeTask).not.toHaveBeenCalled();
     expect(h.scheduler.disableTask).not.toHaveBeenCalled();
   });
+  // The topic is the one this turn runs in, computed as the delegated-add route
+  // computed it when it stored the task. In a chat-scope session the session
+  // anchor is only its first message, so it must not stand in for the topic.
+  it('in a chat-scope session, cleans up only the task of the thread the bot turn runs in', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    Object.assign(h.ds, { scope: 'chat' });
+    h.ds.session = { sessionId: 's1', rootMessageId: 'om_first',
+      replyTargets: { 'report:1': { rootMessageId: 'om_thread2', updatedAt: '2026-10-29T00:00:00.000Z' } } };
+    h.record.task.rootMessageId = 'om_first';
+    expect((await h.run()).status).toBe(403);
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+    h.record.task.rootMessageId = 'om_thread2';
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler.removeTask).toHaveBeenCalledOnce();
+  });
+  it('refuses topic cleanup when the grant is revoked while the controller is being checked', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.scope.resolveTargetAppOpenId = async () => {
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true } });
+      return { status: 'resolved', openId: 'ou_admin' };
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_self_manage_denied' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
   it('refuses topic cleanup from a bot turn the receiving bot did not observe itself', async () => {
     const h = botPolicyTaskInTopic('remove', 'report:1');
     h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_controller' };
@@ -151,6 +180,7 @@ describe('managed schedule mutation route', () => {
   it('rejects topic cleanup when its managed turn changes during authorization', async () => {
     const h = harness('remove', 'report:1');
     h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
     h.ds.session.rootMessageId = 'om_topic';
     Object.assign(h.record, { selfManage: true, grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
     h.record.task.rootMessageId = 'om_topic';
@@ -161,6 +191,7 @@ describe('managed schedule mutation route', () => {
   it.each(['update', 'resume', 'run'])('does not turn a bot policy cleanup grant into %s authority', async action => {
     const h = harness(action, 'report:1');
     h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
     h.ds.session.rootMessageId = 'om_topic';
     Object.assign(h.record, { selfManage: true, grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
     h.record.task.rootMessageId = 'om_topic';

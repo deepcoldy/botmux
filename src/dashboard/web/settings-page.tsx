@@ -548,7 +548,10 @@ function SettingsPage() {
       } catch { /* still offline: fall back to the pre-save snapshot */ }
       if (!mountedRef.current) return;
       if (!reconciled) setSettings(before);
-      const detail = e instanceof Error ? e.message : String(e);
+      const code = e instanceof Error ? e.message : String(e);
+      // Known error codes have a sentence; anything else is shown as is.
+      const known = tr(`settings.saveError.${code}`);
+      const detail = known === `settings.saveError.${code}` ? code : known;
       setSettingsMsg({
         text: reconciled
           ? `${tr('settings.saveReconciled')}: ${detail}`
@@ -837,6 +840,18 @@ function SettingsPage() {
   );
 }
 
+type ScheduleBotGrantsPatch = Partial<Pick<DashboardSettings['scheduleBotGrants'], 'createEnabled' | 'selfManageEnabled' | 'grants'>>;
+
+/** PUT body for the bot-grant entry. A list write names the list it was edited
+ *  from, so the server can refuse it (and the page re-reads) when that is no
+ *  longer what is on disk — e.g. another tab revoked a grant meanwhile. */
+export function scheduleBotGrantsPayload(
+  shown: ScheduleBotGrant[],
+  patch: ScheduleBotGrantsPatch,
+): ScheduleBotGrantsPatch & { baseGrants?: ScheduleBotGrant[] } {
+  return patch.grants ? { ...patch, baseGrants: shown } : patch;
+}
+
 export function SettingsBody(props: {
   settings: DashboardSettings;
   canWrite: boolean;
@@ -882,10 +897,10 @@ export function SettingsBody(props: {
       s => ({ ...s, hostOverloadAlert: { ...s.hostOverloadAlert, ...patch } }),
     );
   };
-  const saveScheduleBotGrants = (patch: Partial<Pick<DashboardSettings['scheduleBotGrants'], 'createEnabled' | 'selfManageEnabled' | 'grants'>>) => {
+  const saveScheduleBotGrants = (patch: ScheduleBotGrantsPatch) => {
     return props.onSave(
       'scheduleBotGrants',
-      { scheduleBotGrants: patch },
+      { scheduleBotGrants: scheduleBotGrantsPayload(settings.scheduleBotGrants.grants, patch) },
       s => ({ ...s, scheduleBotGrants: { ...s.scheduleBotGrants, ...patch } }),
     );
   };

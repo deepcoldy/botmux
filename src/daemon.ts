@@ -7935,8 +7935,12 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const humanAdminTurn = directScheduleSource || (dispatchCaller?.senderType === 'user'
       && !dispatchCaller.source && dispatchCaller.requestLarkAppId === ds.larkAppId
       && !!dispatchCaller.requestUserOpenId && adminOpenIds.includes(dispatchCaller.requestUserOpenId));
-    const botGrant = humanAdminTurn ? undefined
+    // The grant covers dispatches made in a granted chat into a granted chat.
+    // Someone who reaches the source bot elsewhere (a p2p chat, another group)
+    // does not get it by naming a granted chat with --chat-id.
+    const matchedGrant = humanAdminTurn ? undefined
       : matchingScheduleBotGrant(delegationPolicy, ds.larkAppId, targetAppIds, chatId);
+    const botGrant = matchedGrant?.chatIds.includes(ds.chatId) ? matchedGrant : undefined;
     const scheduleCreateDefaulted = body.suppressScheduleCreate !== true
       && body.delegateScheduleCreate !== true
       && (delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true || !!botGrant);
@@ -8356,6 +8360,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let credentialOpenId: string | undefined;
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
+  let botGrantHolds: (() => boolean) | undefined;
   const caller = scheduleCallerForTurn(ds, turnId);
   const directHuman = caller?.senderType === 'user'
     && !caller.source && caller.requestLarkAppId === ds.larkAppId;
@@ -8408,12 +8413,16 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       }
       const targetPolicy = readGlobalConfig().scheduleDelegation;
       if (capability.botGrantId) {
-        const grant = matchingScheduleBotGrant(targetPolicy, delegation.sourceAppId, [ds.larkAppId], ds.chatId);
-        if (!grant || grant.id !== capability.botGrantId
-          || grant.controllerUnionId !== delegation.authority.unionId
-          || capability.allowedRunScopes.length || delegation.authority.tools.length) {
-          return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
-        }
+        // Read the policy afresh each time: it is checked again after the
+        // identity lookups below, so a grant revoked meanwhile commits nothing.
+        botGrantHolds = () => {
+          const grant = matchingScheduleBotGrant(readGlobalConfig().scheduleDelegation,
+            delegation.sourceAppId, [ds.larkAppId], ds.chatId);
+          return !!grant && grant.id === capability.botGrantId
+            && grant.controllerUnionId === delegation.authority.unionId
+            && !capability.allowedRunScopes.length && !delegation.authority.tools.length;
+        };
+        if (!botGrantHolds()) return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
       }
       const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
       if (!targetTriggerPolicy?.enabled
@@ -8453,6 +8462,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation
       || ds.managedTurnOrigin.capability !== capability) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_delegation_turn_changed' });
+    }
+    if (botGrantHolds && !botGrantHolds()) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
     }
     const baseParams = {
       name: task.name.trim(),
@@ -8634,7 +8646,11 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     && caller.requestLarkAppId === ds.larkAppId && authority?.kind === 'delegated'
     && authority.grantId?.startsWith('bot-policy:') === true && authority.selfManage
     && authority.task.chatId === ds.chatId && !!authority.task.rootMessageId
-    && authority.task.rootMessageId === ds.session.rootMessageId
+    // The topic of this turn, computed exactly as the delegated-add route did
+    // when it stored the task's rootMessageId (not the session's first anchor,
+    // which in a chat-scope session is just its first message).
+    && authority.task.rootMessageId === (pickTurnReplyTarget(ds.session, turnId)?.rootMessageId
+      ?? ((ds.scope ?? ds.session.scope) === 'thread' ? ds.session.rootMessageId : undefined))
     && (action === 'pause' || action === 'remove');
   // A scheduled turn may close its own task: pause/remove, or `done` for an
   // until-done task reporting that the awaited work is finished.

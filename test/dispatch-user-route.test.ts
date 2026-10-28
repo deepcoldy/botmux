@@ -253,6 +253,7 @@ describe('dispatch user IPC end-to-end identity binding', () => {
   });
   it.each(['bot', 'report'])('issues host bot grants on %s-triggered turns without personal credentials', async kind => {
     const h = harness();
+    h.ds.chatId = 'oc_target';
     h.ds.activeInteractiveTurn = { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } };
     if (kind === 'report') h.ds.activeInteractiveTurn = undefined;
     h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
@@ -269,6 +270,7 @@ describe('dispatch user IPC end-to-end identity binding', () => {
   });
   it('does not accept a non-admin sponsor for a host bot grant', async () => {
     const h = harness();
+    h.ds.chatId = 'oc_target';
     h.ds.activeInteractiveTurn = { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } };
     h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
       botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
@@ -287,12 +289,79 @@ describe('dispatch user IPC end-to-end identity binding', () => {
           chatIds: ['oc_target'], controllerUnionId: 'on_sponsor' }] } : {}) } });
       h.scope.getDashboardAdminOpenIds = () => ['ou_alice', 'ou_sponsor'];
       h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_sponsor' }));
+      // The source turn runs inside the granted chat, so only the caller decides.
+      h.ds.chatId = 'oc_target';
     };
     const flags = {
       plain: {}, delegate: { delegateScheduleCreate: true }, 'no-delegate': { suppressScheduleCreate: true },
     } as const;
     const cells = (['plain', 'delegate', 'no-delegate'] as const)
       .flatMap(flag => [true, false].map(grant => [flag, grant] as const));
+
+    // Matching names the target chat; the grant also requires the dispatch to
+    // be made from a granted chat, so reaching the source bot elsewhere (here a
+    // p2p chat) and naming the granted chat with --chat-id gets nothing.
+    it('does not apply a grant to a dispatch made outside the granted chats', async () => {
+      const carol = { senderType: 'user', requestLarkAppId: 'cli_source',
+        requestUserOpenId: 'ou_carol', requestUserUnionId: 'on_carol' };
+      const explicit = harness({ delegateScheduleCreate: true });
+      withGrant(explicit, true);
+      Object.assign(explicit.ds, { chatId: 'oc_p2p_carol', chatType: 'p2p' });
+      explicit.ds.activeInteractiveTurn = { turnId: 'om_human', caller: carol };
+      expect(await explicit.run()).toMatchObject({ status: 403,
+        value: { error: 'schedule_delegation_source_operator_denied' } });
+      expect(explicit.send).not.toHaveBeenCalled();
+
+      const bot = harness();
+      withGrant(bot, true);
+      bot.ds.chatId = 'oc_other_group';
+      bot.ds.activeInteractiveTurn = { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } };
+      expect((await bot.run()).status).toBe(200);
+      expect(await read()).toBeUndefined();
+      expect(bot.scope.resolveTargetAppOpenId).not.toHaveBeenCalled();
+    });
+
+    // A bot turn may carry a person's delegation from upstream. The grant
+    // treats it like any other non-administrator turn: the dispatch is signed
+    // for the controller; `--no-delegate schedule:create` keeps the upstream
+    // person's immediate tools.
+    it('replaces an inherited delegation on a bot turn unless the dispatch opts out', async () => {
+      const upstream = { appId: 'cli_upstream', openId: 'ou_h', unionId: 'on_h', tools: ['bytedcli'] };
+      const botTurn = { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } };
+      const granted = harness();
+      withGrant(granted, true);
+      granted.ds.activeInteractiveTurn = botTurn;
+      granted.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: upstream }));
+      expect((await granted.run()).status).toBe(200);
+      const signed = await read();
+      expect(signed?.authority).toMatchObject({ openId: 'ou_sponsor', unionId: 'on_sponsor', tools: [] });
+      expect(granted.scope.dispatchUserForTurn).not.toHaveBeenCalled();
+
+      rmSync(join(dataDir, 'dispatch-user-delegations.json'), { force: true });
+      const optOut = harness({ suppressScheduleCreate: true });
+      withGrant(optOut, true);
+      optOut.ds.activeInteractiveTurn = botTurn;
+      optOut.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: upstream }));
+      expect((await optOut.run()).status).toBe(200);
+      const kept = await read();
+      expect(kept?.authority).toMatchObject({ appId: 'cli_upstream', openId: 'ou_h', unionId: 'on_h', tools: ['bytedcli'] });
+      expect(scheduleCreateCapabilities(kept!.authority)).toEqual([]);
+    });
+
+    // Host run scopes describe personal credentials a task may keep; a service
+    // grant carries none, so a source bot without those tools still qualifies.
+    it('does not require the source bot to hold the host run scopes for a service grant', async () => {
+      const h = harness();
+      withGrant(h, true);
+      const policy = h.scope.readGlobalConfig();
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: { ...policy.scheduleDelegation, runScopes: ['bytedcli'] } });
+      h.scope.getBot = () => ({ config: {} });
+      h.ds.activeInteractiveTurn = { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } };
+      expect((await h.run()).status).toBe(200);
+      expect(scheduleCreateCapabilities((await read())!.authority)).toEqual([
+        expect.objectContaining({ botGrantId: 'team', allowedRunScopes: [] }),
+      ]);
+    });
 
     it.each(cells)('keeps an administrator\'s own %s dispatch unchanged (grant configured: %s)', async (flag, grant) => {
       const h = harness(flags[flag]);

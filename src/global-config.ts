@@ -202,13 +202,15 @@ export interface ScheduleBotGrant {
 export interface ScheduleDelegationGlobalConfig {
   /** Explicit bot service grants. Default empty; effective only while
    *  `createEnabled` is on. A grant matches on source app, every target app and
-   *  chat — not on who drives the source turn. The dispatch route sets it aside
+   *  chat — not on who drives the source turn — and applies only to a dispatch
+   *  made from one of its chats into one of them. The dispatch route sets it aside
    *  only for a source-bot administrator's own turn, which keeps its own
    *  identity and rules. Every other turn in a granted chat gets it: bot,
    *  report and scheduled turns, and also any person who is not an
    *  administrator but can talk to the source bot there. Their dispatch is then
-   *  signed for `controllerUnionId` with no personal tool credentials, and
-   *  requests schedule:create unless it passes `--no-delegate schedule:create`. */
+   *  signed for `controllerUnionId` with no personal tool credentials (a bot
+   *  turn's inherited delegation included), and requests schedule:create
+   *  unless it passes `--no-delegate schedule:create`. */
   botGrants?: ScheduleBotGrant[];
   /** Allow schedule:create via a current human administrator or an explicit
    *  bot grant. Default off. Turning it off also stops later admission of
