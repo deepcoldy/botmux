@@ -1368,7 +1368,6 @@
     "test/role-profile-store.test.ts": 0.02,
     "test/role-resolver.test.ts": 1.99,
     "test/rollout-shared.test.ts": 0.02,
-    "test/run-unit-shard-retry.test.ts": 0.01,
     "test/runner-common.test.ts": 0.42,
     "test/runner-control-channel.test.ts": 0.01,
     "test/runner-input.test.ts": 0.69,

@@ -78,6 +78,8 @@ import { recordCreatedWorktree } from '../../services/botmux-worktree-store.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
+import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
+import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
@@ -178,6 +180,15 @@ export interface CardHandlerDeps {
       replyRootId?: string;
     },
   ) => void;
+  /** Signed single-use button. The handler admits the clicker and returns a
+   *  continuation that starts the turn after the card callback is acked. */
+  cardClickTurn?: (input: {
+    larkAppId: string;
+    operatorOpenId?: string;
+    operatorUnionId?: string;
+    payload?: string;
+    sig?: string;
+  }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
 /**
@@ -1548,6 +1559,28 @@ function buildMenuModelPickerCard(
   });
 }
 
+function cardClickTurnToastKey(reason: string): string {
+  switch (reason) {
+    case 'expired': return 'card.click_turn.expired';
+    case 'replayed': return 'card.click_turn.replayed';
+    case 'no_identity': return 'card.click_turn.no_identity';
+    case 'bot_or_app': return 'card.click_turn.bot_or_app';
+    case 'blocked': return 'card.click_turn.blocked';
+    case 'not_allowed': return 'card.click_turn.not_allowed';
+    case 'cannot_operate': return 'card.click_turn.cannot_operate';
+    case 'grant_blocked': return 'card.click_turn.grant_blocked';
+    case 'session_not_found': return 'card.action.session_gone';
+    case 'working_dir_mismatch': return 'card.click_turn.working_dir_mismatch';
+    case 'working_dir_required': return 'card.click_turn.working_dir_required';
+    case 'working_dir_missing': return 'card.click_turn.working_dir_missing';
+    case 'chat_type_mismatch': return 'card.click_turn.chat_type_mismatch';
+    case 'delivery_failed': return 'card.click_turn.delivery_failed';
+    case 'principal_lane': return 'card.click_turn.principal_lane';
+    case 'cross_principal': return 'card.click_turn.cross_principal';
+    default: return 'card.click_turn.rejected';
+  }
+}
+
 export async function handleCardAction(input: unknown, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
   const data = normalizeCardActionData(input);
   logCardActionDiagnostics('handler', input, data);
@@ -1996,6 +2029,35 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         if (cardMessageId) await updateMessage(larkAppId, cardMessageId, resultCard);
         else await sendUserMessage(larkAppId, operatorOpenId, resultCard, 'interactive');
       },
+    };
+  }
+
+  if (value?.action === 'card_click_turn' && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    if (!deps.cardClickTurn) {
+      return { toast: { type: 'error', content: t('card.click_turn.unavailable', undefined, loc) } };
+    }
+    const accepted = await deps.cardClickTurn({
+      larkAppId,
+      operatorOpenId,
+      operatorUnionId: typeof data?.operator?.union_id === 'string' ? data.operator.union_id : undefined,
+      payload: value.payload,
+      sig: value.sig,
+    });
+    if (!accepted.ok) {
+      return { toast: { type: 'error', content: t(cardClickTurnToastKey(accepted.reason), undefined, loc) } };
+    }
+    return {
+      toast: { type: 'info', content: t('card.click_turn.pending', undefined, loc) },
+      afterAck: () => accepted.run().then(async result => {
+        const failed = result && typeof result === 'object' && 'ok' in result && result.ok === false;
+        const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
+        try {
+          await sendMessage(larkAppId, accepted.chatId, t(key, undefined, loc), 'text');
+        } catch (err) {
+          logger.warn(`[card-click-turn] ${failed ? 'failure' : 'started'} notice failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }),
     };
   }
 
@@ -4151,6 +4213,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // Atomic IPC — worker handles keys + text in one flow to avoid race
       ds.tuiPromptProcessing = true;
       try {
+        // Persist cancellation before input, while retaining the IPC callback
+        // receipt that releases this card's processing claim on send failure.
+        cancelDeploymentContinuation(ds.session,
+          previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
+          deploymentContinuationAuthority(ds)?.turnId, true);
         await sendWorkerIpc(ds.worker, {
           type: 'tui_text_input',
           keys: inputKeys,

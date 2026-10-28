@@ -719,6 +719,86 @@ describe('TmuxPipeBackend remain-on-exit failed vs tmux version (v3.53.0 regress
   });
 });
 
+// tmux parses commands and option values in the SERVER. After a package upgrade
+// the shared server keeps running the old binary, so gating on the client's
+// `tmux -V` would still send `failed` / `-e` to a 3.1c server.
+describe('TmuxPipeBackend gates on the running tmux server version', () => {
+  function emulateMixed(client: string | null, server: string | null): void {
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (args[0] === '-V') {
+        if (client === null) throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+        return `${client}\n`;
+      }
+      if (args.includes('display-message') && args.includes('#{version}')) {
+        if (server === null) throw Object.assign(new Error('no server'), { status: 1 });
+        return `${server}\n`;
+      }
+      const cmd = args[0] === '-L' ? args[2] : args[0];
+      if (cmd === 'new-session') return TMUX_EMULATED_IDENTITY;
+      if (cmd === 'show-environment') return 'BOTMUX_CODEX_INSTANCE_BINDING=binding-a';
+      return '';
+    }) as typeof execFileSync);
+  }
+  const bindingOpts = () => ({ ...spawnOpts(), env: { ...spawnOpts().env, BOTMUX_CODEX_INSTANCE_BINDING: 'binding-a' } });
+  const roeReapplies = () => mockedExecSync.mock.calls.map(c => String(c[0])).filter(c => c.includes('remain-on-exit'));
+
+  beforeEach(() => resetTmuxVersionCacheForTests());
+
+  it('client 3.5a but server still 3.1c: no remain-on-exit failed, no -e', () => {
+    emulateMixed('tmux 3.5a', '3.1c');
+    const be = new TmuxPipeBackend('bmx-srv-old', { createSession: true, ownsSession: true, socketName: 'botmux' });
+    try {
+      expect(() => be.spawn('sleep', ['60'], bindingOpts())).not.toThrow();
+      expect(newSessionArgs()).not.toContain('remain-on-exit');
+      expect(newSessionArgs()).not.toContain('-e');
+      expect(roeReapplies()).toEqual([]);
+    } finally { be.kill(); }
+  });
+
+  it('client probe unreadable but server 3.5a: chains remain-on-exit failed and -e', () => {
+    emulateMixed(null, '3.5a');
+    const be = new TmuxPipeBackend('bmx-srv-new', { createSession: true, ownsSession: true, socketName: 'botmux' });
+    try {
+      expect(() => be.spawn('sleep', ['60'], bindingOpts())).not.toThrow();
+      expect(newSessionArgs()).toEqual(expect.arrayContaining(['remain-on-exit', 'failed', '-e']));
+    } finally { be.kill(); }
+  });
+
+  it('cold start (no server on the socket yet) falls back to the client version', () => {
+    emulateMixed('tmux 3.3a', null);
+    const be = new TmuxPipeBackend('bmx-srv-cold', { createSession: true, ownsSession: true, socketName: 'botmux' });
+    try {
+      expect(() => be.spawn('sleep', ['60'], spawnOpts())).not.toThrow();
+      expect(newSessionArgs()).toEqual(expect.arrayContaining(['remain-on-exit', 'failed']));
+    } finally { be.kill(); }
+  });
+
+  it('asks the server on the session socket, not the default server', () => {
+    emulateMixed('tmux 3.5a', '3.5a');
+    const be = new TmuxPipeBackend('bmx-srv-sock', { createSession: true, ownsSession: true, socketName: 'botmux' });
+    try {
+      be.spawn('sleep', ['60'], spawnOpts());
+      const probes = mockedExecFileSync.mock.calls
+        .map(([, a]) => a as string[])
+        .filter(a => a.includes('#{version}'));
+      expect(probes.length).toBeGreaterThan(0);
+      for (const a of probes) expect(a.slice(0, 2)).toEqual(['-L', 'botmux']);
+    } finally { be.kill(); }
+  });
+
+  it('probes the running server exactly once during session creation (option reapply reuses it)', () => {
+    emulateMixed('tmux 3.5a', '3.5a');
+    const be = new TmuxPipeBackend('bmx-srv-once', { createSession: true, ownsSession: true, socketName: 'botmux' });
+    try {
+      be.spawn('sleep', ['60'], spawnOpts());
+      const probes = mockedExecFileSync.mock.calls
+        .map(([, a]) => a as string[])
+        .filter(a => a.includes('#{version}'));
+      expect(probes).toHaveLength(1);
+    } finally { be.kill(); }
+  });
+});
+
 describe('TmuxPipeBackend server selection (dedicated socket)', () => {
   function everyTmuxCall(): string[] {
     const fileCalls = mockedExecFileSync.mock.calls
@@ -2392,6 +2472,19 @@ describe('reattach remain-on-exit reapply vs tmux version', () => {
     const be = new TmuxPipeBackend('bmx-reattach-roe-new', { ownsSession: true, isReattach: true });
     be.spawn('/bin/echo', [], spawnOpts());
     expect(roeReapplyCalls().length).toBe(1);
+  });
+
+  it('skips the reattach reapply when a new client binary meets an old server still on the socket', () => {
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.5a\n' as any;
+      if (Array.isArray(args) && args.includes('display-message') && args.includes('#{version}')) {
+        return '3.1c\n' as any;
+      }
+      return '' as any;
+    }) as any);
+    const be = new TmuxPipeBackend('bmx-reattach-roe-mixed', { ownsSession: true, isReattach: true, socketName: 'botmux' });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(roeReapplyCalls()).toEqual([]);
   });
 
   it('re-probes tmux -V once at the reattach boundary after a cached null, then reapplies', () => {

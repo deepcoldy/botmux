@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TmuxPipeBackend, resolvePaneDeath } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { readUnreapedPaneExit } from '../src/adapters/backend/unreaped-pane-exit.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 let realTmux: string | undefined;
@@ -32,6 +33,47 @@ try { python3 = execFileSync('which', ['python3'], { encoding: 'utf8' }).trim();
  * 判定），单例最坏 ~14s。给足余量且不靠固定 sleep。
  */
 const EXIT_TIMEOUT_MS = 45_000;
+
+type TmuxRun = (...args: string[]) => { stdout?: string | null };
+
+/**
+ * Wait until a pane is dead and its exit status is known; returns the status
+ * as text ('' only if it never became known) and what was last seen.
+ *
+ * tmux publishes `#{pane_dead_status}` only once it has reaped the pane's
+ * process. Until then the pane reads `1:` — dead, no status — and on CI tmux
+ * has gone the whole wait without reaping (#2459: 240 reads, 7.5s, `1:`
+ * throughout). Waiting for tmux longer cannot fix that. The status is already
+ * certain as soon as the process has exited: while it is an unreaped zombie of
+ * the server the kernel holds it, which is exactly what the backend reads in
+ * that case (#2457). So the wait ends on whichever arrives first, tmux's
+ * status or the kernel's, and stops depending on when tmux reaps.
+ *
+ * What is left to wait for is tmux noticing the pane died at all. That is
+ * bounded by READ COUNT, not wall clock: a descheduled test process does no
+ * reads, so starvation stretches the wait instead of failing it (240 reads
+ * measured 13.8–14.5s under a 4-core / 12×yes load, ~6s unloaded). Running out
+ * of reads therefore means something is wrong rather than slow, and `seen`
+ * says which: a pane that never died (`0:…`), a session that is gone (empty —
+ * remain-on-exit was not applied), or a dead pane whose process is neither
+ * reaped nor an unreaped zombie of this server.
+ */
+const DEAD_PANE_POLL_INTERVAL_MS = 25;
+const DEAD_PANE_MAX_READS = 240;
+async function waitForDeadPane(tmux: TmuxRun, name: string): Promise<{ dead: boolean; status: string; seen: string }> {
+  let seen = '';
+  for (let reads = 0; reads < DEAD_PANE_MAX_READS; reads += 1) {
+    seen = String(tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}:#{pane_pid}:#{pid}').stdout ?? '').trim();
+    const [dead, status = '', panePid, serverPid] = seen.split(':');
+    if (dead === '1') {
+      if (status !== '') return { dead: true, status, seen };
+      const kernel = readUnreapedPaneExit(Number(panePid), Number(serverPid));
+      if (kernel) return { dead: true, status: kernel.kind === 'exited' ? String(kernel.code) : '', seen: `${seen} kernel=${JSON.stringify(kernel)}` };
+    }
+    await new Promise(r => setTimeout(r, DEAD_PANE_POLL_INTERVAL_MS));
+  }
+  return { dead: seen.startsWith('1:'), status: '', seen };
+}
 
 describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code', () => {
   let dir: string;
@@ -220,6 +262,13 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
       expect(await runToExit('sleep 1.5; exit 3')).toEqual({ code: 3, signal: null });
     });
 
+    // #2459: the corpse fixture of the next describe waited for tmux to
+    // publish the status, and on CI tmux did not within the whole wait.
+    it('lets the corpse fixture learn the exit code tmux never publishes', async () => {
+      tmux('new-session', '-d', '-s', 'bmx-corpse', 'sh -c "exit 77"', ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed');
+      expect(await waitForDeadPane(tmux, 'bmx-corpse')).toMatchObject({ dead: true, status: '77' });
+    });
+
     it('keeps an unreaped signal death on the ordinary channel and reaps its remnant', async () => {
       expect(await runToExit('sleep 1.5; kill -9 $$')).toEqual({ code: 1, signal: null });
       const sessions = String(tmux('list-sessions', '-F', '#{session_name}').stdout ?? '').split('\n').filter(Boolean);
@@ -237,13 +286,13 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
   let dir: string;
   let socket: string;
   const saved: Record<string, string | undefined> = {};
-  // Per-call ceiling. Read-count bounding below answers "how many reads still
+  // Per-call ceiling. waitForDeadPane's read-count bound answers "how many reads still
   // saw nothing", but a single hung call blocks synchronously and never
   // reaches the counter — without a spawnSync timeout one stuck display-message
   // (or the two new-session setups in beforeEach) eats the whole 30s hook
   // budget and the failure surfaces as the harder-to-read "Hook timed out".
   // A normal tmux client answers in milliseconds; 5s only bites on a starved
-  // shard, and a timed-out call returns status=null, which the read loop below
+  // shard, and a timed-out call returns status=null, which waitForDeadPane
   // treats like resolvePaneDeath's `unknown` and retries.
   const TMUX_CALL_TIMEOUT_MS = 5_000;
   const tmux = (...args: string[]) =>
@@ -275,9 +324,10 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
       'new-session', '-d', '-s', 'bmx-corpse', 'sh -c "exit 77"',
       ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed',
     );
-    const deadStatus = await waitForDeadPane('bmx-corpse');
-    expect(deadStatus.dead).toBe(true);
-    expect(deadStatus.status).toBe('77');
+    // The corpse exits 77 at once, so its status must become known. A miss
+    // means the corpse was not set up as intended; `seen` in the failure diff
+    // shows how (see waitForDeadPane).
+    expect(await waitForDeadPane(tmux, 'bmx-corpse')).toMatchObject({ dead: true, status: '77' });
   });
 
   afterEach(() => {
@@ -288,55 +338,6 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     tmux('kill-server');
     rmSandboxScratch(dir);
   });
-
-  /**
-   * Wait until the pane is dead AND tmux has published its status.
-   *
-   * `#{pane_dead}` flips to 1 slightly BEFORE `#{pane_dead_status}` is readable
-   * (observed on tmux 3.3a: `1:` then `1:77` a moment later). This describe's
-   * setup corpse always exits 77 (immediately, with the option chained
-   * atomically into new-session), so a non-empty status MUST arrive — an empty
-   * one at the deadline means the corpse/option was not actually set up, which
-   * must fail loudly rather than be accepted. Signal death, which legitimately
-   * has no status, is covered by the other describe's `kill -9 $$` test.
-   */
-  // REDUCES, does not eliminate, the starvation flake: read-count bounding is
-  // immune to the worker being descheduled (wall-clock keeps running during a
-  // stall, reads do not happen), but a shard starved hard enough that tmux
-  // spawns and the lifecycle watcher barely run still fails other ways — under
-  // a controlled 4-core / 12×yes load, both this version and the old wall-clock
-  // one went 7/8 green across 8 rounds each, and one round also failed the
-  // unrelated `forwards 77` production-path case. That residual is tracked in
-  // #2408, not here.
-  //
-  // BOUND BY READ COUNT, NOT WALL CLOCK. An absolute ~10s deadline lost a
-  // perfectly good `1:77` on a scheduler-starved shard: when the worker
-  // process isn't scheduled for >10s, the first display-message it gets to run
-  // AFTER the pause already reads `1:77` (tmux latches death server-side), but
-  // the wall clock had expired so the fixture rejected it (~1/9 under a
-  // 4-core / heavy load). tmux publishes status within ~500ms of death on a
-  // healthy server, so "N reads still see no status" is the meaningful failure
-  // signal regardless of how starvation stretches wall-time; under load the
-  // reads space themselves out. Measured wall-time of 240 reads under the same
-  // 4-core / 12×yes load: 13.8–14.5s nominal (vs ~6s unloaded) — plus the two
-  // new-session calls in beforeEach (each capped at TMUX_CALL_TIMEOUT_MS), so
-  // the 30s hook timeout stays the backstop with about half its headroom even
-  // starved. The vitest hook timeout (30s) is the absolute floor.
-  const DEAD_PANE_POLL_INTERVAL_MS = 25;
-  const DEAD_PANE_MAX_READS = 240; // ~6s nominal 25ms polling; far more wall-time under starvation
-  const waitForDeadPane = async (name: string): Promise<{ dead: boolean; status: string }> => {
-    let last = { dead: false, status: '' };
-    for (let reads = 0; reads < DEAD_PANE_MAX_READS; reads += 1) {
-      const out = tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}');
-      const text = String(out.stdout ?? '').trim();
-      const [dead, status] = text.split(':');
-      const value = status ?? '';
-      last = { dead: dead === '1', status: value };
-      if (dead === '1' && value !== '') return { dead: true, status: value };
-      await new Promise(r => setTimeout(r, DEAD_PANE_POLL_INTERVAL_MS));
-    }
-    return last;
-  };
 
   // 前提本身也要钉住，否则下面两条断言可能因为尸体早被回收而假绿。
   it('the raw tmux answers still say the corpse session exists', () => {

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
@@ -104,7 +105,7 @@ import {
   type CliRestartCause,
   type InterruptedWork,
 } from './services/restart-interruption.js';
-import { saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
+import { isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -542,7 +543,7 @@ import type {
   SessionProbe,
   SessionShutdownDetachResult,
 } from './adapters/backend/types.js';
-import { tmuxEnv, probeTmuxFunctionalWithRetry, resolveTmuxVersionAtSessionBoundary, tmuxSupportsRemainOnExitFailed } from './setup/ensure-tmux.js';
+import { tmuxEnv, probeTmuxFunctionalWithRetry, resolveTmuxVersionAtSessionBoundary, serverTmuxVersion, tmuxSupportsRemainOnExitFailed } from './setup/ensure-tmux.js';
 import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { herdrConfigForSession } from './adapters/backend/types.js';
@@ -6929,6 +6930,7 @@ let pendingRestartInterruption: InterruptedWork | undefined;
 /** The last input written to the CLI: the turn a standalone restart note
  *  continues when nothing else is queued. */
 let lastWrittenCliInput: PendingCliInput | undefined;
+let restoredDeploymentTurnId: string | undefined;
 /** When this worker saw its previous CLI process end (exit callback, or its
  *  own teardown). Lets the scan tell the process's exit kills from a task
  *  stopped long before it (EXIT_KILL_MAX_LAG_MS). Unset in a new worker. */
@@ -6945,6 +6947,11 @@ const reportedInterruptedTaskIds = new Set<string>();
 function scanRestartInterruption(path: string, family: 'claude' | 'structured'): void {
   const beforeMs = restartInterruptionScanBeforeMs;
   if (beforeMs === undefined) return;
+  if (restoredDeploymentTurnId && (lastInitConfig?.cliId !== 'codex'
+    || codexGenerationSessionIdFromRolloutPath(path) !== lastInitConfig.deploymentContinuation?.nativeSessionId)) {
+    discardDeploymentContinuation();
+    return;
+  }
   restartInterruptionScanBeforeMs = undefined;
   let work: InterruptedWork;
   try {
@@ -6980,6 +6987,59 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
     `Previous CLI process left work unfinished: turnOpen=${work.turnOpen}, `
     + `backgroundTasks=[${work.tasks.map(task => task.taskId).join(', ')}]`,
   );
+}
+
+const deploymentCancellationReceipts = new Map<string, (ok: boolean) => void>();
+
+/** Web terminal writes bypass daemon input routing. Persist withdrawal before
+ * forwarding operator bytes through any terminal transport. */
+async function cancelDeploymentForTerminalInput(): Promise<boolean> {
+  if (lastInitConfig?.cliId !== 'codex' || effectiveBackendType !== 'tmux'
+    || lastInitConfig.adoptMode || lastInitConfig.codexRpcInput) return true;
+  discardDeploymentContinuation();
+  const requestId = randomBytes(16).toString('hex');
+  return new Promise(resolve => {
+    const timer = setTimeout(() => finish(false), 5_000);
+    const finish = (ok: boolean) => {
+      clearTimeout(timer); deploymentCancellationReceipts.delete(requestId); resolve(ok);
+    };
+    deploymentCancellationReceipts.set(requestId, finish);
+    send({ type: 'cancel_deployment_continuation', requestId });
+  });
+}
+
+function prepareDeploymentContinuationForSpawn(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>, reattached: boolean,
+): void {
+  if (restoredDeploymentTurnId && (!lastSpawnEffectiveResume || reattached
+    || cfg.deploymentContinuation?.nativeSessionId !== lastSpawnEffectiveCliSessionId)) {
+    discardDeploymentContinuation();
+  }
+  if (cfg.cliId !== 'codex' || cfg.adoptMode || cfg.codexRpcInput) return;
+  const restored = deploymentContinuationTemplate(cfg.deploymentContinuation, {
+    appId: cfg.larkAppId, nativeSessionId: lastSpawnEffectiveCliSessionId,
+    resumed: lastSpawnEffectiveResume, reattached,
+  });
+  if (restored && !lastWrittenCliInput) {
+    lastWrittenCliInput = restored;
+    restoredDeploymentTurnId = restored.turnId;
+  }
+}
+
+function discardDeploymentContinuation(): void {
+  const turnId = restoredDeploymentTurnId ?? lastInitConfig?.deploymentContinuation?.turnId;
+  if (!turnId) return;
+  if (turnId) {
+    for (let index = pendingMessages.length - 1; index >= 0; index--) {
+      if (pendingMessages[index].turnId === turnId) pendingMessages.splice(index, 1);
+    }
+    inflightInputs.retireTurn(turnId);
+  }
+  if (lastInitConfig) lastInitConfig.deploymentContinuation = undefined;
+  lastWrittenCliInput = undefined;
+  restoredDeploymentTurnId = undefined;
+  pendingRestartInterruption = undefined;
+  restartInterruptionScanBeforeMs = undefined;
 }
 
 /** First prompt of a resumed CLI: hand it the note and post the one notice.
@@ -13746,6 +13806,7 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
 }
 
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
+  if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
   // 中断类键按适配器归一。卡片「⏹ 停止」与 `/stop` 都硬编码发 ctrlc，但 ZCode
   // 单个 Ctrl+C 会退出整个进程（0.16.9 实测）——用户点「停止这一轮」却丢掉会话
   // 与上下文。适配器声明 interruptKey 时，中断类键一律走它，一处覆盖所有入口。
@@ -13882,6 +13943,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
+  if (lastInitConfig?.deploymentContinuation) discardDeploymentContinuation();
   // Adapters whose CLI treats Ctrl+C as "exit" and Escape as "interrupt",
   // instead of the usual opposite. See CliAdapter.interruptKey.
   const interruptKey: CriticalInterruptKey = cliAdapter?.interruptKey === 'esc' ? 'esc' : 'ctrlc';
@@ -20511,12 +20573,22 @@ async function spawnCli(
       // with the breaker enabled regardless of this one-shot line (a window
       // narrowed to two consecutive failed probes, not closed entirely).
       if (!hasWarnedTmuxExitCodeDegradation) {
-        const tmuxVersion = resolveTmuxVersionAtSessionBoundary();
+        // Ask the SERVER this session will use (the socket placement resolved
+        // above), not just `tmux -V`: a package upgrade can leave the old
+        // server running, and it is the server that accepts/rejects option
+        // values. With no server up yet the probe falls back to the client
+        // binary, which is exactly what will spawn that server.
+        const clientVersion = resolveTmuxVersionAtSessionBoundary();
+        const tmuxVersion = serverTmuxVersion(tmuxSocketArgs(resolvedTmuxSocketName), clientVersion);
         const vlabel = tmuxVersion ? `${tmuxVersion.major}.${tmuxVersion.minor}` : 'unknown';
+        // Surface the upgrade window explicitly: old server still answering
+        // the socket while a newer binary sits on PATH.
+        const clabel = clientVersion ? `${clientVersion.major}.${clientVersion.minor}` : 'unknown';
+        const clientSuffix = clabel !== vlabel ? ` (client binary on PATH: ${clabel})` : '';
         if (tmuxSupportsRemainOnExitFailed(tmuxVersion)) {
-          log(`tmux backend: server version ${vlabel} — crash exit-code circuit breaker enabled (remain-on-exit failed supported)`);
+          log(`tmux backend: server version ${vlabel}${clientSuffix} — crash exit-code circuit breaker enabled (remain-on-exit failed supported)`);
         } else {
-          log(`tmux backend: server version ${vlabel} (< 3.2 or unknown) — "remain-on-exit failed" unsupported; new sessions start normally, but deterministic crash exit codes (77/127) are not reported, so the crash-restart circuit breaker is degraded to generic-exit handling`);
+          log(`tmux backend: server version ${vlabel}${clientSuffix} (< 3.2 or unknown) — "remain-on-exit failed" unsupported; new sessions start normally, but deterministic crash exit codes (77/127) are not reported, so the crash-restart circuit breaker is degraded to generic-exit handling`);
         }
         hasWarnedTmuxExitCodeDegradation = true;
       }
@@ -24549,6 +24621,7 @@ async function spawnCli(
   cliOutlivesWorker = cliSurvivesWorkerExit({ backendType: effectiveBackendType, persistentSessionName });
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  prepareDeploymentContinuationForSpawn(cfg, actuallyReattachedPersistent);
   // A NEW process resuming the same conversation — not a re-attach, whose CLI
   // never stopped: the transcript bridge's baseline reads what the previous
   // process left unfinished. Codex App / remote runners keep their own
@@ -26636,6 +26709,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
               if (!authedClients.has(ws)) return;
+              const inputBackend = backend;
+              const inputLifetime = cliLifetimeNonce;
+              if (!await cancelDeploymentForTerminalInput()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
@@ -26718,6 +26795,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
+              const inputBackend = backend;
+              const inputLifetime = cliLifetimeNonce;
+              if (!await cancelDeploymentForTerminalInput()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
@@ -26826,6 +26907,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
+              const inputBackend = backend;
+              const inputLifetime = cliLifetimeNonce;
+              if (!await cancelDeploymentForTerminalInput()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
@@ -28757,6 +28842,9 @@ function acknowledgeNativeInputConsumed(
   inflightInputs.onTurnStarted(turnId);
   send({
     type: 'native_input_consumed', turnId, proofKind,
+    ...(lastWrittenCliInput?.turnId === turnId && isUnsentInputReplayable(lastWrittenCliInput)
+      && lastWrittenCliInput.trustedCaller?.senderType === 'user'
+      ? { ordinaryInteractive: true as const } : {}),
     ...(nativeSessionId ? { nativeSessionId } : {}),
     ...(nativeTurnId ? { nativeTurnId } : {}),
   });
@@ -29515,6 +29603,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
+      if (lastInitConfig?.deploymentContinuation || restoredDeploymentTurnId) discardDeploymentContinuation();
       // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
       // restart 那条通道相同，但这里管的是**崩溃 park 后由消息触发的恢复重启**：
       // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
@@ -29808,6 +29897,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'raw_input': {
+      discardDeploymentContinuation();
       if (/^\/(?:model|new|clear)\b/i.test(msg.content.trim())) {
         // An explicit native setting/session command takes precedence until
         // the next worker init; the pool must not undo a manual model choice.
@@ -30263,6 +30353,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'inject_command': {
+      discardDeploymentContinuation();
       // 唯一发送方是 /slash 路由的白名单 TUI 命令注入。cwd 移动不再走注入
       // （角色切换已改为 restart+updateWorkingDir 的 respawn），这里不接受
       // 任何 workingDir 改写——那会绕过 cd 路由的角色库硬校验。
@@ -30272,6 +30363,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_text_input': {
+      discardDeploymentContinuation();
       const wroteText = await handleTuiTextInput(msg.keys, msg.text);
       if (msg.cardMessageId) {
         send(wroteText
@@ -30426,6 +30518,11 @@ process.on('message', async (raw: unknown) => {
       // without a session restart.
       setDefaultLocale(msg.locale);
       log(`Locale → ${msg.locale}`);
+      break;
+    }
+
+    case 'deployment_continuation_cancelled': {
+      deploymentCancellationReceipts.get(msg.requestId)?.(msg.ok);
       break;
     }
 

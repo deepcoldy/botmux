@@ -285,6 +285,19 @@ describe('handleDaemonProxyRoute: body-less and path-rewriting routes', () => {
     }
   });
 
+  it('forwards a trigger-user-auth-status openId query and nothing else changes', async () => {
+    const out = await runProxyRoute({
+      method: 'GET',
+      url: '/api/bots/cli_a/trigger-user-auth-status?openId=ou_status_probe',
+    });
+    expect(out.proxyCalls).toEqual([{
+      appId: 'cli_a',
+      path: '/api/bot-trigger-user-auth-status?openId=ou_status_probe',
+      init: { method: 'GET' },
+    }]);
+    expect(out.bodyConsumed).toBe(false);
+  });
+
   it('session-group-tag-status keeps the content-type header on GET, the other GETs do not', async () => {
     const out = await runProxyRoute({ method: 'GET', url: '/api/bots/cli_a/session-group-tag-status' });
     expect(out.proxyCalls[0]!.init).toEqual({ method: 'GET', headers: JSON_HEAD });

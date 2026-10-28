@@ -98,13 +98,11 @@ jobs:
           bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun run build
-      # Wrapper retries once only when every file already passed and vitest's
-      # fork pool then reports "Worker exited unexpectedly" (teardown flake;
-      # measured on this PR's first shard-3 run). A real failed file is not retried.
-      # With duration-balanced shards a full rerun no longer fits in the
-      # 20-minute limit (see the script), so that flake needs a real fix.
+      # No rerun on failure: a shard spends 10–12 of its 20 minutes in vitest,
+      # so a second pass cannot finish anyway, and a flake must surface to be
+      # fixed rather than be retried away (#2464).
       - name: Unit tests (shard ${{ matrix.shard }}/4)
-        run: node scripts/run-unit-shard.mjs ${{ matrix.shard }}/4
+        run: bun run test -- --shard=${{ matrix.shard }}/4
 
   # One stable check name for the ruleset. Matrix names (`test (1/4)` …)
   # must not be required — they change if the shard count changes. This

@@ -276,6 +276,15 @@ function projectSessionEvent(type: string, body: unknown, isPrivate: SessionFiel
       patch: omitSessionFields(eventBody.patch as Record<string, unknown>, isPrivate),
     };
   }
+  // Defense in depth for a frame the SSE stream already drops for these
+  // audiences. `senderOpenId` is a new per-turn identity; `chatId` says which
+  // group just finished. Management never reaches this branch.
+  if (type === 'turn.finished') {
+    const projected = { ...eventBody };
+    delete projected.senderOpenId;
+    delete projected.chatId;
+    return projected;
+  }
   return body;
 }
 

@@ -17,6 +17,7 @@ import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLa
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
+import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -6359,6 +6360,7 @@ export async function handleCommand(
           '',
           t('help.list_slash', undefined, loc),
           t('help.help', undefined, loc),
+          ...renderPluginCommandHelp(helpAppId, loc),
         ];
         await sessionReply(rootId, help.join('\n'));
         break;

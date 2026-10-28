@@ -162,6 +162,24 @@ export function hasLarkCliHome(openId: string): boolean {
   } catch { return false; }
 }
 
+/**
+ * This person's lark-cli device-login state, for a status query.
+ *
+ * The per-person token file is encrypted, so expiry is not known here — only
+ * whether a login exists. Does not seed a HOME, start a device flow, or read
+ * the ciphertext.
+ */
+export function describeLarkCliAuth(openId: string): {
+  state: 'authorized' | 'needs-login' | 'unknown';
+} {
+  if (!isUsableOpenId(openId)) return { state: 'unknown' };
+  try {
+    return { state: hasLarkCliHome(openId) ? 'authorized' : 'needs-login' };
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
 function listUserTokenFiles(home: string): string[] {
   try {
     return readdirSync(larkCliDataDir(home)).filter(f => /^cli_[A-Za-z0-9]+_ou_[A-Za-z0-9]+\.enc$/.test(f));

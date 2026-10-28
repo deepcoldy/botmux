@@ -201,7 +201,22 @@ describe('Codex history match that lands before the lazily-created rollout', () 
     expect(run.consumed()).toEqual([expect.objectContaining({
       turnId: 'om_lazy', proofKind: 'codex_history_match', nativeSessionId: OWN_SID,
     })]);
+    // The deferred path must persist the session id exactly as the in-band one.
+    expect(run.messages).toContainEqual(expect.objectContaining({ type: 'cli_session_id', cliSessionId: OWN_SID }));
   }, 80_000);
+
+  it('never binds a deferred foreign-sid candidate even though that rollout is on disk', async () => {
+    // The history line arrives only after the in-band budget, so the candidate
+    // is carried through the deferred recheck. The foreign rollout is written
+    // to disk (resolvable by sid) but THIS observed process never holds it:
+    // the deferred path must still prove fd ownership and never bind.
+    const run = await startWorker(FOREIGN_SID, { historyDelayMs: 6_000 });
+    await new Promise(r => setTimeout(r, 2_500));
+    expect(run.child.exitCode).toBeNull();
+    expect(run.finals().map(m => m.content)).not.toContain('FOREIGN ROLLOUT REPLY');
+    expect(run.consumed()).toEqual([]);
+    expect(run.messages).not.toContainEqual(expect.objectContaining({ type: 'cli_session_id', cliSessionId: FOREIGN_SID }));
+  }, 60_000);
 
   it('never binds a history id the Codex process does not hold, even when its rollout exists', async () => {
     const run = await startWorker(FOREIGN_SID);

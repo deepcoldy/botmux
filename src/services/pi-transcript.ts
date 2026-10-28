@@ -75,6 +75,7 @@ import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { contentHasToolCall, messageContentText } from './pi-family-content.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import {
+  PI_INPUT_QUEUED_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_STOP_REASON_ERROR,
 } from '../adapters/cli/pi-turn-boundary-extension.js';
@@ -85,7 +86,10 @@ const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 export interface PiBridgeEvent {
   uuid: string;
   timestampMs: number;
-  kind: 'user' | 'assistant_final' | 'cot';
+  /** `input_queued` / `cli_settled` carry no text: Pi accepted an input it
+   *  will only persist after its current work, and Pi finished all queued
+   *  work. See CodexBridgeEvent for how the queue uses them. */
+  kind: 'user' | 'assistant_final' | 'cot' | 'input_queued' | 'cli_settled';
   text: string;
   cotEntries?: CodexCotEntry[];
   /** Best-effort terminal outcome carried by an `assistant_final` (attribution
@@ -432,6 +436,13 @@ export function resetPiPendingTurnState(path?: string): void {
   else piPendingTurnCache.delete(path);
 }
 
+/** Record time of a session line, falling back to now when absent or bad. */
+function piRecordTimestampMs(obj: any): number {
+  const rawTs = obj?.timestamp ?? obj?.message?.timestamp;
+  const ts = typeof rawTs === 'number' ? rawTs : typeof rawTs === 'string' ? Date.parse(rawTs) : NaN;
+  return Number.isFinite(ts) ? ts : Date.now();
+}
+
 /** True when a session record is the turn-boundary marker appended by
  *  `pi-turn-boundary-extension`. Kept structural (not a cast) because the file
  *  is written by another process and may predate the extension. */
@@ -517,8 +528,30 @@ export function drainPiTranscript(
     // closes. This is the ONLY place a held error becomes a user-visible
     // failure: `lastStopReason === 'error'` means the turn really ended that
     // way; anything else means Pi recovered and the held error is dropped.
+    // Input Pi accepted while busy: it is held in Pi's queue until the current
+    // work ends, so its user record can be minutes away (pi-turn-boundary-extension).
+    if (obj?.type === 'custom' && obj.customType === PI_INPUT_QUEUED_CUSTOM_TYPE) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs: piRecordTimestampMs(obj),
+        kind: 'input_queued',
+        text: '',
+        sourceSessionId: sessionId,
+      });
+      continue;
+    }
+
     const boundary = piTurnBoundaryStopReason(obj);
     if (boundary.present) {
+      // Pi drains queued input before settling, so anything still waiting on
+      // it at this marker was not taken up.
+      events.push({
+        uuid: `${path}:${lineStart}:settled`,
+        timestampMs: piRecordTimestampMs(obj),
+        kind: 'cli_settled',
+        text: '',
+        sourceSessionId: sessionId,
+      });
       // One marker proves the extension is live here; from now on the marker
       // (or the backstop) resolves holds, never a bare user record. Set before
       // the branch below so the session_start announcement counts too.

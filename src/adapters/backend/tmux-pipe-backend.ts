@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
-import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast, tmuxSupportsRemainOnExitFailed, resolveTmuxVersionAtSessionBoundary } from '../../setup/ensure-tmux.js';
+import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast, tmuxSupportsRemainOnExitFailed, resolveTmuxVersionAtSessionBoundary, serverTmuxVersion } from '../../setup/ensure-tmux.js';
 import type { TmuxVersion } from '../../setup/ensure-tmux.js';
 import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
 import { inheritBotEnv } from '../../core/env-policy.js';
@@ -109,6 +109,7 @@ export interface PipePaneDeathEvidence {
 
 const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
 const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
+
 /** After #{pane_dead} flips, #{pane_dead_status} is populated a beat later
  *  (`1:` → `1:77` observed on tmux 3.3a; the gap widens under a loaded server).
  *  The teardown read polls that long at most for the real status. */
@@ -1539,7 +1540,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // unknown (a transient `tmux -V` timeout within the null TTL), re-ask once
     // rather than downgrading the whole session's exit-code channel on a
     // modern host. Still fail-closed if the fresh probe is unreadable.
-    const tmuxVersion = resolveTmuxVersionAtSessionBoundary();
+    const tmuxVersion = serverTmuxVersion(this.tmuxArgs, resolveTmuxVersionAtSessionBoundary());
     const newSessionAcceptsE = tmuxVersionAtLeast(tmuxVersion, 3, 2);
     // `remain-on-exit failed` exists only on tmux >= 3.2 (see
     // TMUX_REMAIN_ON_EXIT_FAILED). 3.1c/older reject it with "bad value", and
@@ -1733,14 +1734,16 @@ export class TmuxPipeBackend implements SessionBackend {
    * Apply idempotent per-session tmux options.
    *
    * `version` is the boundary resolution the caller already paid for: the
-   * fresh-creation path passes the createDetachedSession() result so the whole
-   * creation is ONE boundary resolution (a second resolve would force another
-   * `tmux -V` even inside the null TTL — on a host whose `-V` hangs that is an
-   * extra 3s per session start, for a decision already made). The reattach
-   * path (spawn() backfilling options onto a session an older build created)
-   * has no prior resolution, so it omits the argument and resolves here once.
+   * fresh-creation path passes the createDetachedSession() result (already
+   * server-aware) so the whole creation probes the running server ONCE — a
+   * second probe would add another up-to-2s wait whenever that server is
+   * unreachable, for a decision already made. The reattach path (spawn()
+   * backfilling options onto a session an older build created) has no prior
+   * resolution, so it omits the argument and asks the server once here.
    */
-  private applySessionOptions(version: TmuxVersion | null = resolveTmuxVersionAtSessionBoundary()): void {
+  private applySessionOptions(
+    version: TmuxVersion | null = serverTmuxVersion(this.tmuxArgs, resolveTmuxVersionAtSessionBoundary()),
+  ): void {
     const t = shellescape(this.paneTarget);
     const env = tmuxEnv();
     try {
@@ -1771,6 +1774,9 @@ export class TmuxPipeBackend implements SessionBackend {
       // REATTACHED session: one created by an older build has none yet, and it
       // must be in place before the CLI can die. Idempotent. Skipped on
       // tmux < 3.2, where the value is rejected (see supportsRemainOnExitFailed).
+      // `version` already reflects the RUNNING server (resolved by the caller
+      // or by the default above): the binary on PATH can be newer than the
+      // server still answering this socket.
       if (tmuxSupportsRemainOnExitFailed(version)) {
         execSync(`${this.tmuxCmd} set-option -t ${t} remain-on-exit failed`, { stdio: 'ignore', env, timeout: 5000 });
       }

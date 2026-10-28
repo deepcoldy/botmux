@@ -111,6 +111,20 @@ describe('native Lark slash-command catalog', () => {
       .toBe('Close current session, kill CLI');
   });
 
+  it('appends enabled plugin commands after built-ins, skipping conflicts and built-in names', () => {
+    const catalog = buildAppSlashCommandCatalog({
+      pluginCommands: [
+        { name: '/work-bind', description: '查看/绑定本群的工作项', pluginId: 'work-ledger' },
+        { name: '/clash', description: '两个插件同名', pluginId: null },
+        { name: '/help', description: '插件抢内置名', pluginId: 'other' },
+      ],
+    });
+    const plugin = catalog.find(c => c.command === 'work-bind');
+    expect(plugin).toMatchObject({ source: 'botmux', description: { default_value: '查看/绑定本群的工作项' } });
+    expect(catalog.some(c => c.command === 'clash')).toBe(false);
+    expect(catalog.find(c => c.command === 'help')?.description.default_value).not.toBe('插件抢内置名');
+  });
+
   it('summarizes help lines defensively', () => {
     expect(summarizeHelpLine('/x  - 做一件事（细节），再做一件')).toBe('做一件事，再做一件');
     expect(summarizeHelpLine('/x <a> — do it (quietly); then more')).toBe('Do it');
