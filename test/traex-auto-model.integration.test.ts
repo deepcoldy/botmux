@@ -541,7 +541,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(interruptionNotices(f.messages)[0]).toMatchObject({ turnId: 'om_next' });
     expect(rows(f.submissions)[4].text).toContain(interruptionNote());
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core', 'core']);
-    expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toHaveLength(1);
+    expect(rows(f.submissions).filter(row => row.text.includes('next ask'))).toHaveLength(1);
   }, 100_000);
 
   it('keeps a follow-up arriving after exhaustion (but before the terminal) out of the degraded pane', async () => {

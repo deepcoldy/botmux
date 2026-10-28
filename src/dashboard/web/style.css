@@ -30556,6 +30556,14 @@ button.skills-issue-badge:hover {
   cursor: not-allowed;
 }
 .feedback-page { display: grid; gap: 16px; }
+.feedback-filter-fields { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.feedback-filter-fields label { display: grid; gap: 6px; min-width: 0; font-size: 12px; }
+.feedback-filter-fields input, .feedback-filter-fields select { box-sizing: border-box; width: 100%; min-height: 34px; padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); color: var(--fg); font: inherit; }
+.feedback-filter-fields select { max-width: 260px; }
+.feedback-presets { display: flex; flex-wrap: wrap; gap: 8px; }
+.feedback-filter-hint { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
+.feedback-page .panel h2 small { font-size: 11px; font-weight: normal; color: var(--muted); }
+@media (max-width: 700px) { .feedback-filter-fields > label { flex: 1 1 140px; } .feedback-filter-fields select { max-width: none; } .feedback-presets { flex-basis: 100%; } }
 .feedback-kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
 .feedback-kpis article { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
 .feedback-kpis span { color: var(--muted); font-size: 11px; }

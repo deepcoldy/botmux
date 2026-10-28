@@ -513,7 +513,7 @@ describe('claim card buttons', () => {
     expect(result.toast.content).toContain('无需认领');
     expect(authorityTask().runAsClaim).toBeUndefined();
     // The refreshed card says what is true now, with nothing left to click.
-    expect(text(result.card.data)).toContain(`创建人 <at id=${ALICE.open}></at> 已恢复权限`);
+    expect(text(result.card.data)).toContain(`按创建人 <at id=${ALICE.open}></at> 的身份执行`);
     expect(buttons(result.card.data)).toEqual([]);
     expect(store.getClaimCard(APP, 'a1b2c3d4')?.status).toBe('resolved');
   });
@@ -526,7 +526,7 @@ describe('claim card buttons', () => {
     h.tick();
     await h.fire();
     expect(h.updates.map(u => u.messageId)).toEqual(['om_card_1']);
-    expect(text(h.updates[0]!.card)).toContain('已恢复权限');
+    expect(text(h.updates[0]!.card)).toContain('无需认领');
     expect(buttons(h.updates[0]!.card)).toEqual([]);
     expect(store.getClaimCard(APP, 'a1b2c3d4')?.status).toBe('resolved');
     // Nothing more to do while the identity stays usable.
@@ -538,6 +538,26 @@ describe('claim card buttons', () => {
     h.tick();
     await h.fire();
     expect(h.sent.map(x => x.messageId)).toEqual(['om_card_1', 'om_card_2']);
+  });
+
+  it('settles a claimed card at the next fire once a recorded creator has replaced the claim', async () => {
+    const h = harness();
+    const card = await pending(h);
+    await h.click('schedule_identity_claim', card.card, ALICE, card.messageId);
+    expect(store.getClaimCard(APP, 'a1b2c3d4')?.status).toBe('claimed');
+    // A Dashboard edit by a Feishu-login person records them and drops the claim.
+    expect(scheduler.updateTask('a1b2c3d4', { prompt: 'edited', creator: { openId: BOB.open, unionId: BOB.union } }))
+      .toMatchObject({ ok: true });
+    h.tick();
+    await h.fire();
+    expect(h.updates.map(u => u.messageId)).toEqual([card.messageId]);
+    expect(text(h.updates[0]!.card)).toContain(`按创建人 <at id=${BOB.open}></at> 的身份执行`);
+    expect(buttons(h.updates[0]!.card)).toEqual([]);
+    expect(store.getClaimCard(APP, 'a1b2c3d4')?.status).toBe('resolved');
+    // A card that names the current claimant is left alone.
+    h.tick();
+    await h.fire();
+    expect(h.updates).toHaveLength(1);
   });
 
   it('a claimant who regains access keeps the task: the pending card settles and cannot be used to move it', async () => {

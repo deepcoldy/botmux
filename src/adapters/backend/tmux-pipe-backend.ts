@@ -133,6 +133,25 @@ export type PaneDeathResolution =
   | { kind: 'unknown' };
 
 /**
+ * Merge the exit code captured while a probe confirmed the corpse with the
+ * code read at terminal teardown.
+ *  - a real code latched at confirmation (number) always wins;
+ *  - otherwise a LATE real code from the terminal read is adopted even when
+ *    the probe latched null (death confirmed but its publish window ran past
+ *    the bounded wait under starvation) — discarding it is a 77 -> 1 doorway;
+ *  - null at BOTH (or undefined + null) = code-less signal death -> null, and
+ *    the caller falls back to the historic sentinel 1.
+ * 0 passes through as 0 (`0 ?? 1 === 0`); a clean exit 0 never leaves a corpse
+ * under remain-on-exit `failed`, so it is unreachable here but stays explicit.
+ */
+export function resolveReportedExitCode(
+  observed: number | null | undefined,
+  terminal: number | null,
+): number | null {
+  return typeof observed === 'number' ? observed : terminal;
+}
+
+/**
  * Resolve a pane's liveness + real exit status from raw
  * `#{pane_dead}:#{pane_dead_status}` lines, accounting for TWO ordering/load
  * gaps:
@@ -483,6 +502,16 @@ export class TmuxPipeBackend implements SessionBackend {
    * replayed to the next `onExit` registration.
    */
   private pendingExit: { code: number | null; signal: string | null } | null = null;
+  /**
+   * Real exit code captured AT THE MOMENT a lifecycle probe first confirms the
+   * pane is a kept corpse (`#{pane_dead}=1`). Capturing it there — while the
+   * corpse is fresh and `pane_dead_status` is most readable — is what makes a
+   * deep-scheduler-stall still report 77/127: by the time the N-miss sequence
+   * finishes (~13s) and handlePaneExit() reads status again, a starved tmux may
+   * no longer answer. null = a confirmed dead pane with no published code
+   * (signal death); undefined = death has not been confirmed by a probe yet.
+   */
+  private observedDeathStatus: number | null | undefined = undefined;
   private lifecycleTimer: NodeJS.Timeout | null = null;
   private lastUnknownProbeLogAt = 0;
   /** Debounce authoritative pane-missing replies. Probe timeouts / EMFILE /
@@ -898,21 +927,43 @@ export class TmuxPipeBackend implements SessionBackend {
     }
   }
 
-  /** True only when tmux explicitly flags this pane dead. Any inconclusive
-   *  answer (probe error, timeout, an option this tmux does not report) is
-   *  `false` — a liveness probe must never invent a death it cannot see. */
-  private isPaneDead(): boolean {
-    try {
-      const out = String(
-        execFileSync(
-          'tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}'],
-          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
-        ) ?? '',
-      ).trim();
-      return out === '1';
-    } catch {
-      return false;
+  /**
+   * Probe whether the pane is a kept corpse, and — when it is — capture the
+   * CLI's real exit code into observedDeathStatus the first time death is
+   * confirmed. Returns true only for an explicit `#{pane_dead}=1`; a transient
+   * unreadable answer returns false (never invent death) and never erases a
+   * status already captured (death latches).
+   *
+   * The status read uses resolvePaneDeath's bounded wait for the
+   * `1:` -> `1:<code>` publish gap, so the code is grabbed while the corpse is
+   * fresh — handlePaneExit() then trusts observedDeathStatus rather than
+   * re-reading a corpse a starved tmux may no longer answer (#2434).
+   */
+  private capturePaneDeath(): boolean {
+    const readLine = (): string => {
+      try {
+        return String(
+          execFileSync(
+            'tmux',
+            [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+            { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+          ) ?? '',
+        ).trim();
+      } catch {
+        return ''; // unreadable -> resolvePaneDeath retains the prior observation
+      }
+    };
+    const verdict = resolvePaneDeath(readLine(), readLine, sleepSyncMs);
+    if (verdict.kind !== 'dead') return false;
+    if (this.observedDeathStatus === undefined || (this.observedDeathStatus === null && verdict.status !== null)) {
+      this.observedDeathStatus = verdict.status;
     }
+    return true;
+  }
+
+  /** True only when a probe has confirmed the pane dead (and captured code). */
+  private isPaneDead(): boolean {
+    return this.capturePaneDeath();
   }
 
   private exitCopyModeIfNeeded(): void {
@@ -1364,7 +1415,17 @@ export class TmuxPipeBackend implements SessionBackend {
     // while it is dead, and `#{pane_dead_status}` is the only carrier of
     // 77/127 through tmux. Order matters — after the kill below there is no
     // pane left to ask.
+    // Prefer the exit code captured WHILE a probe first confirmed the corpse
+    // (observedDeathStatus): that read happened while the corpse was fresh and
+    // tmux responsive to it. Only if no probe ever confirmed death do we read
+    // here (e.g. reattach-corpse path or pid-death path). This is the #2434
+    // fix: under deep starvation this terminal read can come back unreadable
+    // ~13s after death, but the code was already latched at confirmation time.
     const death = this.readPaneDeath();
+    // Effective real code: the latched probe capture wins over a now-unreadable
+    // terminal read. observedDeathStatus: number = real code; null = confirmed
+    // dead, signal (no code); undefined = no probe ever confirmed death.
+    const observedCode = this.observedDeathStatus;
     this.teardownFifoReader();
     // We get here only after the lifecycle watcher's OWN authoritative miss
     // sequence (N consecutive misses + final confirm), so the owned pane is
@@ -1380,11 +1441,24 @@ export class TmuxPipeBackend implements SessionBackend {
     //  - alive: contradicting the watcher and theoretically unreachable; do
     //    not kill a live pane.
     if (death.kind !== 'alive') this.killDeadPaneRemnant();
-    // Only a confirmed-dead pane with a published status carries a real code.
-    // Both `unknown` and a status-less (signal) death fall back to the
-    // historic sentinel 1 — but the bounded re-reads make `unknown` rare, so a
-    // transient timeout no longer silently turns a real 77/127 into 1.
-    this.fireExit(death.kind === 'dead' ? (death.status ?? 1) : 1, null);
+    // Resolve the reported code from, in order:
+    //  1. a real code latched when a probe confirmed the corpse (survives later
+    //     starvation that makes the terminal read unreadable) — #2434;
+    //  2. a real code from this terminal read if no probe captured one;
+    //  3. historic sentinel 1 for unknown / status-less signal death.
+    const terminalCode = death.kind === 'dead' ? death.status : null;
+    // Merge the two observations of the dead pane's code:
+    //  - a real code latched when a probe first confirmed death wins (it was
+    //    read while the corpse was freshest);
+    //  - otherwise a LATE real code from this terminal read is still adopted,
+    //    even when the probe only latched `null` (death confirmed but its
+    //    1: -> 1:code publish window ran past the bounded wait under
+    //    starvation): discarding it would be a second 77 -> 1 doorway (#2434);
+    // Merge is delegated to the documented pure resolveReportedExitCode
+    // (number latch wins; otherwise a late terminal real code is adopted;
+    // code-less/null at both sides stays null -> sentinel 1 below).
+    const realCode = resolveReportedExitCode(observedCode, terminalCode);
+    this.fireExit(realCode ?? 1, null);
   }
 
   /**

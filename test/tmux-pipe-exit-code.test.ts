@@ -37,7 +37,12 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
   const saved: Record<string, string | undefined> = {};
   let seq = 0;
 
-  const tmux = (...args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+  // Per-call ceiling: a single hung tmux client blocks synchronously and never
+  // reaches any retry/read counter, so without it one stuck spawnSync eats the
+  // whole 30s hook budget and fails as the harder-to-read "Hook timed out".
+  // A normal client answers in milliseconds; 5s only bites on a starved shard.
+  const tmux = (...args: string[]) =>
+    spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8', timeout: 5_000 });
 
   /** One backend launch; resolves with the (code, signal) onExit reported. */
   const runToExit = async (script: string): Promise<{ code: number | null; signal: string | null }> => {

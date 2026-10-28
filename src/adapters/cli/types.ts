@@ -62,6 +62,10 @@ export type SubmitRecheckResult = boolean | {
   /** Positive native ownership of the matched record (see the Codex adapter).
    *  Absent means "submitted, but not proven to be THIS pane's conversation". */
   ownershipProven?: boolean;
+  /** Session id of a matched record whose ownership could not be proven yet
+   *  (see the Codex adapter). A candidate, never a binding: callers may use it
+   *  only after independently proving the observed CLI process owns it. */
+  unprovenCliSessionId?: string;
 };
 
 /** What the adapter can prove about a failed runner-protocol write.
@@ -461,6 +465,8 @@ export interface CliAdapter {
     cliSessionId?: string;
     /** Positive native ownership of the submit evidence; see SubmitRecheckResult. */
     ownershipProven?: boolean;
+    /** Not-yet-owned session id candidate; see SubmitRecheckResult. */
+    unprovenCliSessionId?: string;
     submissionDisposition?: RunnerSubmissionDisposition;
     /** Non-transient reason when the adapter knows submission is impossible
      *  without waiting for transcript confirmation (for example an unsupported

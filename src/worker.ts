@@ -80,7 +80,7 @@ import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-t
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
-import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
+import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
@@ -267,6 +267,7 @@ import {
   isCrossPrincipalInterruptionEnabled,
   isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
+  isRemoteAccessEnabled,
 } from './global-config.js';
 import {
   stopSessionScope,
@@ -365,6 +366,8 @@ import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { fileURLToPath } from 'node:url';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
+import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE } from './services/riff-host-tools.js';
+import { platformTerminalBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
 import { createServer as createNetServer, type Server as NetServer, type Socket } from 'node:net';
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
@@ -488,6 +491,7 @@ import {
   deriveRiffReposFromDirs,
   deriveRiffRepoFromWorkingDir,
   isValidRiffBaseUrl,
+  isValidRiffHostToolsUrl,
   isValidRiffJwtHome,
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
@@ -2712,6 +2716,7 @@ let lastAbortedCloseRequestId: string | null = null;
 let shutdownDetachRequestId: string | null = null;
 let shutdownDetachPhase: 'preparing' | 'prepared' | null = null;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
+const riffHostTools = new RiffHostTools();
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
 const authedClients = new WeakSet<WebSocket>();
@@ -7366,6 +7371,17 @@ let mtrBridgeBaselineDone = false;
  *  Codex's first user submit, but with some race delay after our submit
  *  returns. Cleared once attached. */
 let codexBridgePendingSessionId: string | undefined;
+/** Codex session id whose history line matched our submit before the pid
+ *  held its rollout open (the rollout is created lazily at that same submit).
+ *  Only a candidate: the poller binds it once the observed pid holds that
+ *  rollout, then treats the match as the owned evidence it now is. Lives only
+ *  as long as the bridge head of the turn that produced it. */
+let codexBridgeUnprovenSession: {
+  sessionId: string;
+  turnId?: string;
+  bridgeTurnId: string;
+  dispatchAttempt?: number;
+} | undefined;
 /** Adopt-only: PID of the externally-running Codex process. Used by the
  *  poller to fall back to /proc/<pid>/fd discovery when sessionId is
  *  unknown (e.g. discovery probe missed the rollout fd). */
@@ -10182,6 +10198,8 @@ function codexBridgeStartTimer(): void {
           codexAdoptPendingPid = undefined;
           const mode = codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty';
           codexBridgeAttach(path, mode);
+        } else if (!path) {
+          maybeBindUnprovenCodexSession();
         }
       }
       codexBridgeIngest();
@@ -10293,6 +10311,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     rolloutPath = antigravityRecoveryAttachPath(rolloutPath);
   }
   codexBridgeRolloutPath = rolloutPath;
+  codexBridgeUnprovenSession = undefined;
   codexSubagentLimitTracker.clear();
   if (structuredBridgeIs('codex')) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
@@ -10756,6 +10775,62 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   return owned;
 }
 
+/** writeInput found our exact submit in history.jsonl but could not prove the
+ *  session: Codex creates the rollout at that same submit and opens it from a
+ *  different task than the history append, so the line can be readable while
+ *  the pid holds no rollout yet (#2363). Dropping the id would leave a fresh
+ *  spawn with no other way to find its rollout. Keep it as a candidate while
+ *  the bridge is unbound; a bound bridge keeps its proven-only correction
+ *  path in codexBridgeNotifyCliSessionId. */
+function codexBridgeNoteUnprovenCliSessionId(
+  cliSessionId: string,
+  turn: { turnId?: string; bridgeTurnId?: string; dispatchAttempt?: number },
+): void {
+  if (!turn.bridgeTurnId || !codexBridgeFallbackActive() || !structuredBridgeIs('codex') || codexBridgeRolloutPath) return;
+  codexBridgeUnprovenSession = {
+    sessionId: cliSessionId,
+    turnId: turn.turnId,
+    bridgeTurnId: turn.bridgeTurnId,
+    dispatchAttempt: turn.dispatchAttempt,
+  };
+  log(`Codex history matched session ${cliSessionId} before pid ${currentCodexObservedPid() ?? '?'} held its rollout; waiting for ownership before attaching`);
+  if (!maybeBindUnprovenCodexSession()) codexBridgeStartTimer();
+}
+
+/** Bind the candidate once the observed pid holds its rollout open: the same
+ *  fd-membership proof writeInput applies, observed later. Until then nothing
+ *  is persisted or attached, so a foreign id (another pane's identical text)
+ *  is never bound. Returns true once the candidate is settled. */
+function maybeBindUnprovenCodexSession(): boolean {
+  const pending = codexBridgeUnprovenSession;
+  if (!pending) return false;
+  if (codexBridgeRolloutPath) {
+    codexBridgeUnprovenSession = undefined;
+    return true;
+  }
+  // It serves only the turn whose submit produced it. Once that head is gone
+  // (given up, or settled some other way) stop probing — fd enumeration is a
+  // synchronous lsof on macOS — and let the next submit bring its own proof.
+  if (!codexBridgeQueue.hasPendingTurn(pending.bridgeTurnId, pending.dispatchAttempt)) {
+    codexBridgeUnprovenSession = undefined;
+    log(`Dropped unproven Codex session ${pending.sessionId}: turn ${pending.bridgeTurnId} no longer awaits its transcript`);
+    return true;
+  }
+  const pid = currentCodexObservedPid();
+  if (!pid || !codexHistorySidIsOwned(pending.sessionId, findCodexRolloutSetByPid(pid))) return false;
+  const path = resolveFileBridgePath('codex', { sessionId: pending.sessionId });
+  if (!path) return false;
+  log(`Codex rollout ownership proven late: pid ${pid} holds session ${pending.sessionId}`);
+  persistCliSessionId(pending.sessionId);
+  // Now the exact owned history match writeInput would have reported.
+  if (codexHistoryMatchProvesConsumption()) {
+    acknowledgeNativeInputConsumed(pending.turnId, 'codex_history_match', pending.sessionId);
+  }
+  void syncFreshCodexNativeSessionTitle(pending.sessionId, codexRpcEngine);
+  codexBridgeAttach(path, codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty');
+  return true;
+}
+
 /** The pane process is a Codex-compatible native leaf when its OWN comm
  *  identifies as one. A direct standalone install lands here; only the npm
  *  launcher (comm `node`) and sandbox supervisors need descendant discovery. */
@@ -10841,6 +10916,8 @@ function traexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive()) return;
+  // A reported (proven) id supersedes any not-yet-owned history candidate.
+  codexBridgeUnprovenSession = undefined;
   if (codexBridgeRolloutPath) {
     // A Codex process can keep its parent and sibling-agent rollouts open at
     // the same time. Pre-submit pid discovery therefore may have attached an
@@ -12260,6 +12337,7 @@ function stopCodexBridge(): void {
   stopAllAntigravityCot();
   antigravityCotReaderSessionId = undefined;
   codexBridgePendingSessionId = undefined;
+  codexBridgeUnprovenSession = undefined;
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
   lastResolvedSandboxMode = undefined;
@@ -16031,6 +16109,7 @@ type VerifiableSubmissionResult = void | {
   submitted: boolean;
   cliSessionId?: string;
   ownershipProven?: boolean;
+  unprovenCliSessionId?: string;
   failureReason?: string;
   recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
 };
@@ -16068,6 +16147,11 @@ async function settleVerifiableSubmissionForJournal(
     // become a native input consumption receipt; a settled result must keep it.
     if (typeof recheck === 'object' && recheck && recheck.ownershipProven === true) {
       result.ownershipProven = true;
+    }
+    // A late match can still precede the lazily-created rollout; flushPending
+    // keeps the candidate exactly as it does for an in-band one (#2363).
+    if (typeof recheck === 'object' && recheck && typeof recheck.unprovenCliSessionId === 'string') {
+      result.unprovenCliSessionId = recheck.unprovenCliSessionId;
     }
     return true;
   } catch (err) {
@@ -17465,6 +17549,12 @@ function scheduleSubmitFailureNotify(
           persistCliSessionId(cliSessionId);
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
           void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
+        } else if (settlement.unprovenCliSessionId) {
+          // The confirmation above renewed this turn's lease, and the history
+          // line may still precede the lazily-created rollout (#2363).
+          codexBridgeNoteUnprovenCliSessionId(settlement.unprovenCliSessionId, {
+            turnId: turnIdentity?.turnId, bridgeTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt,
+          });
         }
         // A late exact history match is the same owned-log evidence as an
         // immediate one; other CLIs' rechecks stay on the terminal fallback.
@@ -18848,6 +18938,10 @@ async function flushPending(): Promise<void> {
         // Late-attach now so subsequent assistant_final events get
         // attributed to this turn.
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+      } else if (result?.unprovenCliSessionId && codexBridgeActive) {
+        codexBridgeNoteUnprovenCliSessionId(result.unprovenCliSessionId, {
+          turnId: item.turnId, bridgeTurnId, dispatchAttempt: item.dispatchAttempt,
+        });
       }
       // Exact owned history match: the model's own log holds this input.
       // Sent after any session id persistence so the daemon resolves the
@@ -20614,6 +20708,9 @@ async function spawnCli(
     if (!isValidRiffBaseUrl(riffCfg.baseUrl)) {
       throw new Error(`riff baseUrl 未配置或非法（需 http(s) URL，当前: ${JSON.stringify(riffCfg.baseUrl ?? null)}）——请在 dashboard 的 Riff 配置中填写`);
     }
+    if (riffCfg.hostToolsUrl !== undefined && !isValidRiffHostToolsUrl(riffCfg.hostToolsUrl)) {
+      throw new Error('riff hostToolsUrl 非法（需不含凭据、查询参数、片段、引号或空白的 http(s) URL，路径以 /api/riff-host-tools 结尾）——请检查 Riff 配置');
+    }
     if (riffCfg.sandboxCluster !== undefined && !isValidRiffSandboxCluster(riffCfg.sandboxCluster)) {
       throw new Error(`riff sandboxCluster 非法（仅支持 boe/cn，当前: ${JSON.stringify(riffCfg.sandboxCluster)}）——请在 dashboard 的 Riff 配置中重新选择`);
     }
@@ -20711,7 +20808,52 @@ async function spawnCli(
     // `riffCfg` is `cfg.backendConfig` already narrowed once at the top of this
     // riff-only branch — same object, so master's owner re-freeze above is
     // unaffected; keeping the typed alias avoids re-widening to the shared union.
-    riffBackendConfig = Object.assign({}, riffCfg, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
+    // The binding is minted when the exact turn is dispatched, including each
+    // follow-up (Riff only applies config.env at task creation).
+    if (!noTransport && !isWorkflowWorker()) mergedEnv.BOTMUX_RIFF_HOST_TOOLS = '1';
+    else delete mergedEnv.BOTMUX_RIFF_HOST_TOOLS;
+    delete mergedEnv.BOTMUX_RIFF_HOST_BINDING;
+    if (!noTransport && !isWorkflowWorker()) delete mergedEnv.BOTMUX_LARK_APP_SECRET;
+    riffBackendConfig = Object.assign({}, riffCfg, {
+      env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId,
+      hostToolsBinding: noTransport || isWorkflowWorker() ? undefined : () => {
+        const authority = activeTurnAuthority.identity();
+        if (!authority.turnId || !sessionId || noTransport || isWorkflowWorker()) return undefined;
+        const turnId = authority.turnId;
+        const attempt = authority.dispatchAttempt;
+        const observedBackend = backend;
+        // Riff has no local CLI PID. Its owning worker is the authenticated
+        // ancestor of host-tool children, and receives the normal rotating marker.
+        const markers = join(process.env.SESSION_DATA_DIR ?? config.session.dataDir, '.botmux-cli-pids');
+        mkdirSync(markers, { recursive: true });
+        bindCliPidMarker(join(markers, String(process.pid)), process.pid);
+        const address = httpServer?.address();
+        if (!address || typeof address === 'string') throw new Error('riff_host_endpoint_unavailable');
+        const publicBase = (isRemoteAccessEnabled() ? platformTerminalBaseUrl() : null) ?? publicReverseProxyBaseUrl();
+        const host = config.web.externalHost;
+        const url = riffCfg.hostToolsUrl?.replaceAll('{sessionId}', encodeURIComponent(sessionId)) ?? (publicBase
+          ? `${publicBase.replace(/\/$/, '')}/s/${sessionId}${RIFF_HOST_TOOLS_ROUTE}`
+          : `http://${host.includes(':') ? `[${host}]` : host}:${address.port}${RIFF_HOST_TOOLS_ROUTE}`);
+        if (!isValidRiffHostToolsUrl(url)) throw new Error('riff_host_endpoint_invalid');
+        const env: NodeJS.ProcessEnv = { ...process.env, BOTMUX_LARK_APP_ID: cfg.larkAppId, BOTMUX_CHAT_ID: cfg.chatId,
+          BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId, BOTMUX_SESSION_SCOPE: rootIsMessage ? 'thread' : 'chat',
+          BOTMUX_LINK_REF_TURN_MODE: currentBotmuxLinkRefMode };
+        delete env.BOTMUX_LARK_TOOL_BINDING;
+        if (cfg.larkToolBinding !== false) {
+          prepareLarkToolEnv({ env, dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+            sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+        }
+        const pinned = resolveChildBotsConfig(cfg.loadedBotsConfigPath, cfg.loadedBotsConfigProvenance);
+        if (pinned) env.BOTS_CONFIG = pinned;
+        return riffHostTools.bind(url, {
+          sessionId, turnId, dispatchAttempt: attempt,
+          dataDir: process.env.SESSION_DATA_DIR ?? config.session.dataDir, env, workingDir: cfg.workingDir,
+          isCurrent: () => backend === observedBackend && effectiveBackendType === 'riff'
+            && !fatalWorkerErrorPending && activeTurnAuthority.identity().turnId === turnId
+            && activeTurnAuthority.identity().dispatchAttempt === attempt,
+        });
+      },
+    });
     // 复用本地仓库+分支：多仓只认会话上的显式 stamp（仓库选择卡多选流按用户
     // 顺序写入 cfg.riffRepoDirs，首仓=primary）；否则仅对 workingDir 本身做单仓
     // 推导——绝不扫描任意非 git 目录的子目录（home/仓库集合目录会乱带仓库）。
@@ -23244,6 +23386,19 @@ async function spawnCli(
             + 'EPERM in this sandboxed session. Rename the per-bot dir to the appId; see docs/roles/deploy-runbook.md.');
         }
       } catch { /* diagnostics only — never block the spawn */ }
+    }
+    // Hard gate, independent of the diagnostic above (that one only runs when the
+    // subtree is missing). The own role-library subtree is readWrite, so a
+    // sandboxed agent can swap its workingDir (or an ancestor inside the subtree)
+    // for a symlink to `$HOME`; the next spawn — scheduled task fire, /cd respawn —
+    // would then canonicalize the link target and grant it readWrite. Refuse the
+    // spawn instead of confining to the wrong directory.
+    try {
+      assertWorkingDirStaysInRoleLibrary(cfg.workingDir, roleLibSubtree, cfg.larkAppId);
+    } catch (err) {
+      const msg = `[file-sandbox] refusing to start session ${cfg.sessionId}: ${(err as Error).message}`;
+      log(msg);
+      throw new Error(msg);
     }
 
     const fsPolicyCtx = {
@@ -26207,6 +26362,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         log(`Bad worker HTTP URL rejected: ${JSON.stringify(req.url ?? '')}`);
         res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end('Bad Request');
+        return;
+      }
+      // This endpoint has its own per-turn capability. A terminal read/write
+      // token never grants access to host tools, and tool tokens never grant
+      // terminal access.
+      if (url.pathname === RIFF_HOST_TOOLS_ROUTE) {
+        void riffHostTools.handle(req, res).catch(() => {
+          if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
+          res.end('{"error":"riff_host_unavailable"}');
+        });
         return;
       }
       const { hasRead, hasWrite, platformReadonly } = resolveTerminalAccessForReq(req, url);

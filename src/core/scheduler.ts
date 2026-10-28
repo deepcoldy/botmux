@@ -1,5 +1,6 @@
 import { Cron } from 'croner';
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import * as scheduleStore from '../services/schedule-store.js';
 import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
@@ -122,6 +123,30 @@ function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
   }
   const record = authorityStore.getRecord(effectiveAppId, id);
   return record?.state === 'revoked' ? undefined : record?.task;
+}
+
+/** Fire-time guard for tasks created through a live conversation turn.
+ *
+ * Every such task has a non-null authority `targetTurnId` (direct and
+ * delegated alike) and its workingDir was canonicalized before it was
+ * persisted; workingDir is immutable after creation (no update path writes it).
+ * So a stored value that no longer equals its own realpath can only mean the
+ * directory — or an ancestor the agent can write — was swapped for a symlink
+ * after creation, and spawning would grant the link target readWrite. Host
+ * (`!ds`) and legacy rows have no targetTurnId and are never re-checked, so a
+ * symlinked `$HOME` does not stop them. Reads the authority record, never the
+ * sandbox-writable JSON projection. Returns the refusal reason, or undefined. */
+export function scheduledWorkingDirSwapReason(task: ScheduledTask): string | undefined {
+  const appId = authorityAppId(task.larkAppId);
+  if (!authorityStore || !appId || !authorityStore.isInitialized(appId)) return;
+  const record = authorityStore.getRecord(appId, task.id);
+  if (!record?.targetTurnId) return;
+  const stored = record.task.workingDir;
+  let real: string | undefined;
+  try { real = realpathSync(stored); } catch { /* missing → refuse below */ }
+  if (real === stored && task.workingDir === stored) return;
+  return `schedule_working_dir_swapped: task ${task.id} workingDir ${stored} now resolves to `
+    + `${real ?? '(missing)'}${task.workingDir === stored ? '' : ` (fire input ${task.workingDir})`}`;
 }
 
 function project(task: ScheduledTask): ScheduledTask {
@@ -1148,8 +1173,16 @@ export function addTask(params: {
   untilDone?: UntilDoneConfigInput;
   /** Opt-in owner notifications. */
   notify?: ScheduleNotifyEvent[];
+}, audit?: {
+  /** Server-authoritative live turn that created this direct task (never from a
+   *  request body). Recorded in the authority row's target_turn_id column only —
+   *  not in the task JSON — and counted against maxTasksPerTurn. */
+  directTurn?: { turnId: string; maxTasksPerTurn: number };
 }): ScheduledTask {
   assertScheduleAuthorityAvailable();
+  if (audit?.directTurn && !(params.larkAppId && authorityStore?.isInitialized(params.larkAppId))) {
+    throw new Error('schedule_authority_unavailable');
+  }
   const targets = params.chatIds === undefined
     ? { chatId: params.chatId }
     : scheduleStore.normalizeScheduleChatTargets({
@@ -1240,7 +1273,7 @@ export function addTask(params: {
     reasoningEffort: params.reasoningEffort,
     ...untilDoneConfig,
   }, params.larkAppId && authorityStore?.isInitialized(params.larkAppId)
-    ? candidate => project(authorityStore!.createDirect(candidate))
+    ? candidate => project(authorityStore!.createDirect(candidate, audit?.directTurn))
     : undefined);
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
   return task;
@@ -1427,6 +1460,22 @@ export function runTaskNow(id: string): boolean {
   return true;
 }
 
+/**
+ * Whether an edit may record a new creator on this task. Not for a delegated
+ * task: it runs as its delegation, never as a creator. Not for a task whose
+ * creator was captured under another app either: that open_id belongs to the
+ * other app, and rewriting creatorLarkAppId would also move where its creator
+ * notices go.
+ */
+export function taskAcceptsRecordedCreator(id: string, appId?: string): boolean {
+  const effectiveAppId = authorityAppId(appId);
+  if (effectiveAppId && authorityStore?.isInitialized(effectiveAppId)
+    && authorityStore.getRecord(effectiveAppId, id)?.kind === 'delegated') return false;
+  const task = runtimeTask(id, appId);
+  if (!task) return false;
+  return !task.creatorLarkAppId || task.creatorLarkAppId === task.larkAppId;
+}
+
 export type ClaimTaskRunAsResult =
   | { ok: true; task: ScheduledTask; previous?: ScheduleRunAsClaim }
   | { ok: false; error: 'not_found' | 'stale' | 'already_claimant'; current?: ScheduleRunAsClaim };
@@ -1462,7 +1511,8 @@ export function claimTaskRunAs(
   }, appId);
   if (!task) return { ok: false, error: 'not_found' };
   if (refusal) return refusal;
-  publishScheduleTaskUpdated(id, { runAsClaim: claim });
+  // No dashboard event: schedule rows carry no identity fields, and the event
+  // stream also reaches anonymous public-read viewers.
   return { ok: true, task, ...(previous ? { previous } : {}) };
 }
 
@@ -1715,11 +1765,27 @@ export function updateTask(
     /** `''` / `null` clears the per-task model and falls back to the bot's. */
     model?: string | null;
     reasoningEffort?: ScheduleReasoningEffort | null;
+    /** The person who made this edit, already verified and checked against the
+     *  bot's access by the caller (Dashboard Feishu login). They become the
+     *  task's creator, and any claim from the claim card is dropped: the
+     *  claimant agreed to run the task as it was, not as edited. */
+    creator?: { openId: string; unionId: string };
   },
   options: { deferEvent?: boolean } = {},
-): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
+): {
+  ok: boolean;
+  error?: string;
+  deferredEventPatch?: Record<string, unknown>;
+  /** With `creator`: who the task ran as just before this edit, read inside
+   *  the same authority write, so a caller that must undo the edit can put
+   *  exactly that back. */
+  previousRunAs?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'>;
+} {
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
+  if (updates.creator && !taskAcceptsRecordedCreator(id, task.larkAppId)) {
+    return { ok: false, error: 'creator_not_recordable' };
+  }
 
   let calendar: string | undefined;
   try { calendar = updates.calendar === undefined ? task.calendar : normalizeCalendarBinding(updates.calendar); }
@@ -1914,13 +1980,25 @@ export function updateTask(
     patch.manualRunRequested = undefined;
   }
 
-  if (!mutateRuntimeTask(id, current => ({ ...current, ...patch }))) {
+  // Identity fields stay out of `patch`: it doubles as the dashboard event,
+  // which anonymous public-read viewers also receive.
+  const creatorPatch: Partial<ScheduledTask> = updates.creator
+    ? { ownerOpenId: updates.creator.openId, ownerUnionId: updates.creator.unionId, runAsClaim: undefined }
+    : {};
+  let previousRunAs: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'> | undefined;
+  if (!mutateRuntimeTask(id, current => {
+    if (updates.creator) {
+      previousRunAs = { ownerOpenId: current.ownerOpenId, ownerUnionId: current.ownerUnionId, runAsClaim: current.runAsClaim };
+    }
+    return { ...current, ...patch, ...creatorPatch };
+  })) {
     return { ok: false, error: 'not_found' };
   }
   const publishedPatch = { ...patch, ...eventPatch };
-  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
+  const identity = previousRunAs ? { previousRunAs } : {};
+  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch, ...identity };
   publishScheduleTaskUpdated(id, publishedPatch);
-  return { ok: true };
+  return { ok: true, ...identity };
 }
 
 /** Publish a task patch after a compound configuration operation has fully

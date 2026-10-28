@@ -62,12 +62,28 @@ Direct 定时任务沿用持久化的可信创建者。模型翻转后的重发�
 开着身份鉴权（`triggerUserAuth` 开且至少管一个工具）时，direct/legacy 定时任务到点若没有可用身份——没有记录创建人（早期任务、bot 轮次或平台创建），或创建人/认领人已过不了 `canOperate`——本次照常无身份执行（受管工具被拒），同时在任务所在群发一张认领卡片（任务绑定固定话题时回复在话题里）。卡片写明任务、需要认领的原因和提示词摘要。
 
 - **一个任务一张卡**：卡片记录存在 `schedule-authority.sqlite` 的 `schedule_identity_claim_cards` 表。待认领期间每次到点只原地更新这张卡；同一执行轮次的重发（重启恢复、身份模型切换重发）不算新的到点。已认领的卡在认领人失权后、或旧卡超出飞书可编辑期限/被撤回时才发新卡。卡片位置在发出时确定（绑定话题的任务回复在话题里，否则在群顶层），之后任务才建立话题（`task` 位置首次执行）时卡片不迁移。
-- **身份恢复时收敛**：到点时创建人或认领人重新过了 `canOperate`，仍在待认领状态的卡原地改成「已认领」或「创建人已恢复权限、无需认领」，不再挂着待认领。
+- **身份恢复时收敛**：到点时创建人或认领人重新过了 `canOperate`，仍在待认领状态的卡原地改成「已认领」或「现在按创建人的身份执行、无需认领」，不再挂着待认领。
 - **身份来源**：只取卡片回调的 `operator.open_id` / `operator.union_id`（缺 union_id 时用该 open_id 查通讯录），按钮 value 只带任务 id 和 `claim_rev`。认领写进 authority 记录里任务的 `runAsClaim`（并投影到 `schedules.json`），创建人字段不变。
 - **解析顺序**：`scheduledTaskRunAs` 统一为「认领人优先，否则创建人」，到点发布、失败续跑和工作流命令授权都经它；每次到点仍对其过 `canOperate`。
 - **权限**：认领、「改为我认领」、「重新执行」都要求点击人对本 Bot 过 `canOperate`，否则只回个人可见提示、不改状态。`claim_rev` 在 authority 写事务里做比较，旧卡或并发点击不会覆盖较新的认领。任务此刻已有可用身份（创建人或认领人恢复了权限）时，待认领卡上的「认领」只刷新卡片、不改运行身份；要换人只能在已认领卡上点「改为我认领」。「重新执行」与 `/schedule run` 同入口，暂停的任务、或此刻没有可用身份的任务都拒绝。
 - **审计**：每次点击记一行 `[schedule-claim] action=… outcome=… task=… chat=… operator_union=… operator_open=… at=…`；`/schedule list` 的 runAs 显示认领人与认领时间。
 - Delegated 任务不发卡（身份来自委托）。认领后改提示词不会让认领失效，与创建人语义一致。
+
+### Dashboard 新建 / 编辑定时任务时的创建人
+
+Dashboard 有两种进入方式，记的创建人不同：
+
+| 进入方式 | 能证明的身份 | 新建任务记为 | 编辑保存 |
+|---|---|---|---|
+| 本机 token 链接（`?t=` / 管理 cookie） | 只证明持有 token，不知道是谁 | bot owner（部署 owner 的 union_id 与该 bot 的名单解析对得上时一并记 union_id），与之前一致 | 创建人、认领都不变 |
+| 经中心平台访问（平台用飞书 SSO 登录） | 平台注入的 `X-Botmux-Actor` = 登录人的 union_id | 登录人 | 登录人成为创建人，之前的认领被清掉 |
+
+- 平台的 `X-Botmux-Actor` 只在「这条连接确实是平台隧道桥接进来的」时才采信：隧道把桥接连接的本地端口登记在 `platform/tunnel-peers`，Dashboard 按请求的对端地址和端口核对。本机直连自带的同名头一律忽略。
+- 平台在能直接连到本机 Dashboard 局域网端口时（心跳上报的 `directHosts`）会绕过隧道直连。这种连接和其它局域网客户端无法区分，所以同样**不记创建人**，按 token 登录处理；Dashboard 会记一行 `[schedule-creator] X-Botmux-Actor ignored: not a platform tunnel connection`。
+- 编辑清掉认领后，群里那张认领卡在下一次到点时改成「定时任务已不需要认领 · 现在按创建人 X 的身份执行」。
+- Dashboard 用自己的请求头把 union_id 交给任务所属 daemon（只认带受信宿主签名的请求）；daemon 用该 bot 的应用按 union_id 查 open_id，再过 `canOperate`，通过才写进 schedule authority（任务的 `ownerOpenId` / `ownerUnionId`，非委派任务的 control 列同步）。查不到或过不了时：新建按 token 登录处理，编辑不改创建人，都记 `[schedule-creator]` 日志。
+- 委派任务（身份来自委托），以及创建人记在别的应用下的任务（`creatorLarkAppId` 与执行 bot 不同），编辑时不改创建人。
+- 只有「新建」和「编辑保存」会记创建人；暂停、恢复、立即执行、删除不会。
 
 `auth request` 固定应用、授权用户及 scopes，`auth wait` 固定 requestId。隔离会话每次轮询读取当前执行 claim；服务端核对该执行与原授权用户。相同用户的后续执行可以接收完成的授权；其他用户开始执行时拒绝原请求。目标身份材料缺失是终态错误（`auth_identity_snapshot_missing`，同轮重试无效），材料存在但活动 turn 标记未翻转才保持 `pending`。
 

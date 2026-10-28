@@ -124,7 +124,9 @@ describe('owned Codex input when rollout fds are unavailable', () => {
     const result = await createCodexAdapter().writeInput(target, INPUT, { correlateTranscript: true });
     target.cliPid += 1;
     history(SID, target.text());
-    expect(await result?.recheck?.()).toEqual({ submitted: true });
+    // The replacement pid cannot own the rollout: the line comes back only as
+    // the non-binding candidate (#2401), and the terminal session stays unbound.
+    expect(await result?.recheck?.()).toEqual({ submitted: true, unprovenCliSessionId: SID });
     expect(codexTerminalSessionIsBound(target, SID)).toBe(false);
   });
 
@@ -139,7 +141,10 @@ describe('owned Codex input when rollout fds are unavailable', () => {
 
   it('keeps bare adopt/zero-prompt input unproven and byte-for-byte unchanged', async () => {
     const target = pane(text => history(SID, text));
-    expect(await createCodexAdapter().writeInput(target, INPUT)).toEqual({ submitted: true });
+    // No correlation context: input is untouched, and the matched history line
+    // comes back only as the non-binding candidate (#2401), never proven.
+    expect(await createCodexAdapter().writeInput(target, INPUT))
+      .toEqual({ submitted: true, unprovenCliSessionId: SID });
     expect(target.text()).toBe(INPUT);
     expect(codexTerminalSessionIsBound(target, SID)).toBe(false);
   });

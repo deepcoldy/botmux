@@ -110,7 +110,7 @@ export function remoteRunnerSessionToolArgs(
   }
 }
 
-function quotedAttachments(
+export function quotedAttachments(
   stdout: string,
   env: NodeJS.ProcessEnv,
 ): { stdout: string; attachments?: RemoteRunnerSessionToolAttachment[] } {

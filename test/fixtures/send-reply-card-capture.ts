@@ -47,6 +47,10 @@ const topicLookups = new Map<string, number>();
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
     data = { code: 0, data: {} };
+  } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_PATCH_CHAT_ID) {
+    const chatId = process.env.BOTMUX_TEST_PATCH_CHAT_ID;
+    data = { code: 0, data: { items: [{ message_id: 'om_patch',
+      ...(chatId === '__missing__' ? {} : { chat_id: chatId }), body: { content: '{}' } }] } };
   } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_TOPIC_STATE) {
     const state = process.env.BOTMUX_TEST_TOPIC_STATE;
     data = { code: 0, data: { items: state === 'missing' ? [] : [{

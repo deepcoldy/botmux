@@ -1,8 +1,9 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
+import { readFileSync, renameSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { roleLibrarySubtree, validateRoleLibraryPath } from '../src/core/role-library.js';
+import { assertWorkingDirStaysInRoleLibrary, roleLibrarySubtree, roleLibraryWorkingDirEscapes, validateRoleLibraryPath } from '../src/core/role-library.js';
 
 function setup() {
   const base = mkdtempSync(join(tmpdir(), 'rolelib-'));
@@ -216,5 +217,98 @@ describe('validateRoleLibraryPath + ownAppId（收窄到本 bot 自己的子树�
     const legacy = join(root, 'users', 'ou_x', '产品经理');
     expect(validateRoleLibraryPath(legacy, root))
       .toEqual({ ok: true, resolvedPath: realpathSync(legacy) });
+  });
+});
+
+
+describe('roleLibraryWorkingDirEscapes（worker spawn 前的软链接替换闸）', () => {
+  function lib() {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'rolelib-esc-')));
+    const lexicalSubtree = join(base, 'botmux-roles', 'cli_self');
+    const wd = join(lexicalSubtree, 'shared', 'default');
+    mkdirSync(wd, { recursive: true });
+    const home = join(base, 'home'); mkdirSync(home);
+    return { base, lexicalSubtree, subtreeReal: realpathSync(lexicalSubtree), wd, home };
+  }
+
+  it('子树正常、workingDir 是真目录 → 放行（含子树本身）', () => {
+    const { lexicalSubtree, subtreeReal, wd } = lib();
+    expect(roleLibraryWorkingDirEscapes(wd, subtreeReal, lexicalSubtree)).toBe(false);
+    expect(roleLibraryWorkingDirEscapes(lexicalSubtree, subtreeReal, lexicalSubtree)).toBe(false);
+  });
+
+  it('workingDir 被换成指向 $HOME 的链接 → 拒绝', () => {
+    const { lexicalSubtree, subtreeReal, wd, home } = lib();
+    renameSync(wd, `${wd}.moved`);
+    symlinkSync(home, wd);
+    expect(roleLibraryWorkingDirEscapes(wd, subtreeReal, lexicalSubtree)).toBe(true);
+  });
+
+  it('子树内的祖先被换成链接 → 拒绝', () => {
+    const { lexicalSubtree, subtreeReal, wd, home } = lib();
+    const shared = join(lexicalSubtree, 'shared');
+    renameSync(shared, `${shared}.moved`);
+    mkdirSync(join(home, 'default'));
+    symlinkSync(home, shared);
+    expect(roleLibraryWorkingDirEscapes(wd, subtreeReal, lexicalSubtree)).toBe(true);
+  });
+
+  it('子树内指向子树内另一处的链接 → 放行', () => {
+    const { lexicalSubtree, subtreeReal, wd } = lib();
+    const alias = join(lexicalSubtree, 'alias');
+    symlinkSync(wd, alias);
+    expect(roleLibraryWorkingDirEscapes(alias, subtreeReal, lexicalSubtree)).toBe(false);
+  });
+
+  it('workingDir 在子树内但已不存在 → fail-closed', () => {
+    const { lexicalSubtree, subtreeReal } = lib();
+    expect(roleLibraryWorkingDirEscapes(join(lexicalSubtree, 'gone'), subtreeReal, lexicalSubtree)).toBe(true);
+  });
+
+  it('库外路径（普通项目目录、库外的链接）不受影响', () => {
+    const { base, lexicalSubtree, subtreeReal, home } = lib();
+    const project = join(base, 'project'); mkdirSync(project);
+    const outsideLink = join(base, 'outside-link'); symlinkSync(home, outsideLink);
+    expect(roleLibraryWorkingDirEscapes(project, subtreeReal, lexicalSubtree)).toBe(false);
+    expect(roleLibraryWorkingDirEscapes(outsideLink, subtreeReal, lexicalSubtree)).toBe(false);
+    expect(roleLibraryWorkingDirEscapes(join(base, 'missing'), subtreeReal, lexicalSubtree)).toBe(false);
+  });
+
+  it('字面子树与 canonical 子树不同（$HOME 本身是链接）时按字面形态也能识别', () => {
+    const { base, subtreeReal, home } = lib();
+    const linkedBase = join(base, 'linked-home');
+    symlinkSync(join(base, 'botmux-roles'), linkedBase);
+    const lexicalSubtree = join(linkedBase, 'cli_self');
+    const wd = join(lexicalSubtree, 'shared', 'default');
+    expect(roleLibraryWorkingDirEscapes(wd, subtreeReal, lexicalSubtree)).toBe(false);
+    const real = join(subtreeReal, 'shared', 'default');
+    renameSync(real, `${real}.moved`);
+    symlinkSync(home, real);
+    expect(roleLibraryWorkingDirEscapes(wd, subtreeReal, lexicalSubtree)).toBe(true);
+  });
+
+  it('assertWorkingDirStaysInRoleLibrary：无子树时不适用，逃逸时抛错', () => {
+    const { subtreeReal, wd, home } = lib();
+    expect(() => assertWorkingDirStaysInRoleLibrary(wd, undefined, 'cli_self')).not.toThrow();
+    // 子树之外（真实 ~/botmux-roles 不含此临时目录）的路径照常放行
+    expect(() => assertWorkingDirStaysInRoleLibrary(home, subtreeReal, 'cli_self')).not.toThrow();
+    expect(() => assertWorkingDirStaysInRoleLibrary(wd, subtreeReal, 'cli_self')).not.toThrow();
+    renameSync(wd, `${wd}.moved`);
+    symlinkSync(home, wd);
+    expect(() => assertWorkingDirStaysInRoleLibrary(wd, subtreeReal, 'cli_self')).toThrow(/symlink swap/);
+  });
+
+  // 源码结构护栏(K3)：高危回归绊线（沙盒逃逸）。只能读源码：硬闸位于 worker.ts 的
+  // spawnCli 闭包内、没有导出 seam；纯函数行为由本 describe 其余用例覆盖，这条钉的是
+  // 接线——恰好一次、位于 buildFsPolicy 之前、失败必须 log 后 throw 而不能被吞。
+  it('worker 对每次沙盒 spawn、在 buildFsPolicy 之前无条件调用硬闸并拒绝启动', () => {
+    const src = readFileSync('src/worker.ts', 'utf8');
+    const call = '      assertWorkingDirStaysInRoleLibrary(cfg.workingDir, roleLibSubtree, cfg.larkAppId);\n';
+    const at = src.indexOf(call);
+    expect(at).toBeGreaterThan(0);
+    expect(src.indexOf(call, at + 1)).toBe(-1);
+    expect(src.indexOf('buildFsPolicy(fsPolicyCtx)')).toBeGreaterThan(at);
+    expect(src.slice(at - 20, at)).toMatch(/\n {4}try \{\n$/);
+    expect(src.slice(at, at + 300)).toMatch(/catch \(err\) \{[\s\S]*?log\(msg\);\s*throw new Error\(msg\);/);
   });
 });

@@ -293,10 +293,12 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
     });
   }
 
-  /** A scheduled turn of `task` has a usable identity again. If the task's
-   *  card is still asking for a claimant, turn it into what is now true —
-   *  claimed, or resolved by the creator — instead of leaving it orange. Does
-   *  nothing (one record read) for the usual task that has no pending card.
+  /** A scheduled turn of `task` has a usable identity. If the task's card no
+   *  longer says what is true — still asking for a claimant, or still naming a
+   *  claimant although the task now runs as its creator (a Dashboard edit
+   *  recorded a new creator and dropped the claim) — turn it into what is true:
+   *  claimed, or resolved by the creator. Does nothing (one record read) for
+   *  the usual task whose card, if any, is already current.
    *  Async for the same reason as noteIdentityGap: this runs on every fire
    *  that HAS an identity, and a broken card store must not fail that run. */
   async function noteIdentityRestored(input: {
@@ -306,10 +308,12 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
     identity: Extract<ScheduledRunIdentity, { ok: true }>;
   }): Promise<void> {
     const { appId, task, turnId, identity } = input;
-    if (deps.getCard(appId, task.id)?.status !== 'pending') return;
+    const stale = (record: ScheduleClaimCardRecord | undefined): record is ScheduleClaimCardRecord =>
+      record?.status === 'pending' || (record?.status === 'claimed' && identity.source === 'creator');
+    if (!stale(deps.getCard(appId, task.id))) return;
     return serialized(`${appId}:${task.id}`, async () => {
       const record = deps.getCard(appId, task.id);
-      if (record?.status !== 'pending') return;
+      if (!stale(record)) return;
       const claim = parseScheduleRunAsClaim(task.runAsClaim);
       const resolved = identity.source === 'claim' && claim
         ? { card: claimedCard(appId, task, claim), status: 'claimed' as const }

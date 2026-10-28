@@ -48,6 +48,12 @@ function emptyComposerFooter(terminal: PtyHandle): string | undefined {
   const footer = below.slice(0, 4).filter(row => row.trim());
   if (footer.length < 1 || footer.length > 2 || below.slice(4).some(row => row.trim())
     || /^\s*(?:(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b|│\s*(?:model|directory):\s*loading\b)/im.test(lines.join('\n'))) return undefined;
+  return codexNativeFooterRows(footer);
+}
+
+/** Validate the native one/two-row footer after the caller bounds its location. */
+export function codexNativeFooterRows(footer: string[]): string | undefined {
+  if (footer.length < 1 || footer.length > 2) return undefined;
   // The second footer row is the native hints/warning row. A warning-only row
   // is native too: when hints are hidden the warning is the only thing left in
   // that row. Codex degrades the notice by width: `\u26a0 N warnings \u00b7 f2
@@ -75,7 +81,8 @@ const THREAD_ID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 const THREAD_ID_OPENING_SEGMENT = new RegExp(`^(${THREAD_ID_PATTERN})(?:\\s([\\s\\S]*))?$`, 'i');
 const THREAD_ID_ANYWHERE = new RegExp(THREAD_ID_PATTERN, 'i');
 
-function statusLineSession(footer: string): string | undefined {
+/** Parse one complete native thread-id segment from an already bounded footer. */
+export function codexFooterSessionId(footer: string): string | undefined {
   // Read only the live footer: UUIDs in scrollback, pasted drafts, and old
   // /status cards are not evidence.
   const ids = footer
@@ -119,7 +126,7 @@ async function refresh(terminal: PtyHandle): Promise<Resolution> {
   try {
     const footer = emptyComposerFooter(terminal);
     if (footer !== undefined) {
-      const footerSessionId = statusLineSession(footer);
+      const footerSessionId = codexFooterSessionId(footer);
       if (footerSessionId && terminal.cliPid === pid) {
         bindings.set(terminal, { pid, sessionId: footerSessionId });
         return { kind: 'terminal', sessionId: footerSessionId };

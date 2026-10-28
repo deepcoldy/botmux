@@ -191,6 +191,78 @@ export function sessionEnvTmuxSockets(): Array<{ socket: string | null; managed:
     : [{ socket: null, managed: false }, { socket: preferred, managed: true }];
 }
 
+/** Parse `tmux show-environment [-g]` output, preserving multiline values.
+ *  Each record begins with `token=` (set) or `-token` (unset); any subsequent
+ *  physical lines that do not start with a new record belong to the value of
+ *  the previous record (joined with `\n`). Interior empty lines are kept; only
+ *  the terminating newline of the output is dropped.
+ *
+ *  Note on wire-format ambiguity: `tmux show-environment` does not offer a
+ *  NUL-delimited or structured format, so a record line cannot be told apart
+ *  from a value line. Any line of the form `token=...` (anything before the
+ *  first `=`, whether or not it is a valid variable name: `z=w`, `FOO=bar`, a
+ *  bare URL query such as `https://h/?a=b`) is read as a new record, and the
+ *  current value is cut at that line. Any line starting with `-` and holding no
+ *  `=` is read as an unset marker.
+ *
+ *  Records whose name is not representable (outside `ENV_NAME_RE`: hyphens,
+ *  dots, spaces, tabs) are dropped as record boundaries rather than appended to
+ *  the previous variable, whose value would otherwise show them unmasked.
+ *
+ *  Before/after the whitespace change: names may contain spaces or tabs (tmux
+ *  accepts them), so a whitespace-containing `token=...` line is now a record
+ *  boundary too. Previously such a line was joined to the value. As a result an
+ *  indented JSON line containing `=` (such as `  "m=2": 3,`) now cuts the value
+ *  at that line, where it used to be kept; an indented line without `=` is
+ *  still joined as before.
+ */
+export function parseTmuxShowEnvironmentOutput(output: string): Record<string, string> {
+  const vars: Record<string, string> = {};
+  let currentKey: string | null = null;
+
+  const lines = String(output).split('\n');
+  // Strip only the trailing empty line appended by tmux at the end of output;
+  // interior empty lines are part of multiline values.
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+
+  for (const line of lines) {
+    if (line === '') {
+      if (currentKey !== null) vars[currentKey] += '\n';
+      continue;
+    }
+
+    const eq = line.indexOf('=');
+
+    // `-NAME` marks an explicitly removed entry; it holds no value.
+    if (line.startsWith('-') && eq < 0) {
+      currentKey = null;
+      continue;
+    }
+
+    if (eq > 0) {
+      const key = line.slice(0, eq);
+      if (ENV_NAME_RE.test(key)) {
+        currentKey = key;
+        vars[key] = line.slice(eq + 1);
+      } else {
+        // Unrepresentable key name (hyphen, dot, space, tab...): a record
+        // boundary to drop, so it never bleeds into the preceding variable.
+        currentKey = null;
+      }
+      continue;
+    }
+
+    // Continuation line of a multiline value.
+    if (currentKey !== null) {
+      vars[currentKey] += `\n${line}`;
+    }
+  }
+
+  return vars;
+}
+
 /** `tmux show-environment -g`: the env a server froze when it started (plus later set-environment -g). */
 export function readTmuxServerGlobalEnv(socket: string | null): { found: boolean; vars: Record<string, string> } {
   let output: string;
@@ -204,16 +276,7 @@ export function readTmuxServerGlobalEnv(socket: string | null): { found: boolean
   } catch {
     return { found: false, vars: {} };
   }
-  const vars: Record<string, string> = {};
-  for (const line of String(output).split('\n')) {
-    // `-NAME` marks an explicitly removed entry; it holds no value.
-    if (!line || line.startsWith('-')) continue;
-    const eq = line.indexOf('=');
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq);
-    if (ENV_NAME_RE.test(key)) vars[key] = line.slice(eq + 1);
-  }
-  return { found: true, vars };
+  return { found: true, vars: parseTmuxShowEnvironmentOutput(output) };
 }
 
 export function tmuxServersEnvView(opts: SessionEnvViewOptions = {}): TmuxServerEnvView[] {
