@@ -150,6 +150,11 @@ function completeTurn(request) {
   // Exercise duplicate pre-response lifecycle notifications: the runner must
   // buffer one edge and must not misclassify a duplicate as autonomous work.
   if (responseLast) notify('turn/started', { threadId, turn: { id: turnId } });
+  if (behavior === 'capacity-error') {
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed',
+      error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } } });
+    return;
+  }
   if (request.params.outputSchema) {
     write({
       id: 9000 + turnAttempt,

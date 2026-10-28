@@ -567,7 +567,7 @@ function readRequests(logPath: string): Array<Record<string, any>> {
 
 async function exerciseRunner(opts: {
   version: string;
-  behavior?: 'success' | 'capability-error' | 'generic-error' | 'osc-injection' | 'empty-final' | 'start-response-last';
+  behavior?: 'success' | 'capability-error' | 'generic-error' | 'capacity-error' | 'osc-injection' | 'empty-final' | 'start-response-last';
   includeMissingImage?: boolean;
   includeSidecar?: boolean;
   turnCount?: number;
@@ -666,6 +666,13 @@ afterEach(async () => {
 // not a mask: a real regression fails all three attempts deterministically.
 // Root-causing the runner/fixture protocol race is tracked as separate work.
 describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
+  it('publishes capacity failure as a signed structured terminal rather than a successful reply', async () => {
+    const result = await exerciseRunner({ version: '0.162.1', behavior: 'capacity-error' });
+    expect(result.final.errorCode).toBe('codex_capacity_exceeded');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.final.content).toContain('Selected model is at capacity');
+    expect(result.finals).toHaveLength(1);
+  });
   it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap'] as const)(
     'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
       resetAskBroker();
