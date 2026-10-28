@@ -91,6 +91,22 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/ka
 
 ## 卡片按钮说明
 
+### 宿主机工具通道
+
+普通飞书 Riff 会话的 `botmux` 操作由所属 worker 的宿主机执行。沙箱只传递命令、正文和附件；发卡回执、反馈快照、完成事件、出站 Hook、定时任务、授权申请、问答等待和举手状态均保存在宿主机。每轮（包括追问）自动注入 `BOTMUX_RIFF_HOST_TOOLS=1 botmux riff-host-bind …` 引导，必须先执行再调用工具；绑定包含私密的当前轮次凭据，不要转发或粘贴到群里。后续工具调用同样使用 `BOTMUX_RIFF_HOST_TOOLS=1 botmux …`，兼容创建时尚未启用该环境变量的旧任务。仅有旧绑定文件不会接管普通 CLI 命令。
+
+支持 `send`（含图片/文件/自定义卡片和举手）、`ask`、`auth`、`schedule`、`history`、`quoted`、`bots list`、`project`、`board`（含附件）、`card patch`、`card stream open/write/snapshot/reanchor/finish`、`whiteboard status`、`tabs`、`top-notice`，以及已有 workflow 的查询/运行/启动/重试/取消/授权。`--content-file -` 支持从沙箱 stdin 上传内容；`send --voice/--card/--text` 保持原 CLI 的布尔参数语义，`--image/--file` 单数别名也可使用。其它白板操作及 `send --into/--chat-id` 等改投递目标的参数未开放。各命令原有的权限、功能开关及群/话题约束仍然生效；沙箱不能通过参数选择其它会话、应用、群聊或宿主机文件。`card patch` 必须核验消息属于当前群，查不到归属时拒绝修改；定时任务使用 worker 冻结的宿主工作目录，缺失时拒绝创建。`auth` 管理宿主机的授权申请与等待；沙箱里其它 CLI 如何使用用户授权仍由对应工具的凭证桥接负责，不会把用户 token 自动下发给沙箱。
+
+入口优先复用现有平台或 `BOTMUX_PUBLIC_URL` 的 `/s/<sessionId>/api/riff-host-tools` 转发；未配置公网入口时使用 worker 的 advertised 地址。若沙箱无法访问该地址，可在 `riff.hostToolsUrl` 配置转发到此 worker 的完整 HTTP(S) 地址（路径必须以 `/api/riff-host-tools` 结尾，支持 `{sessionId}` 占位符）。配置不能包含用户名/密码、查询参数、片段、引号、反斜杠、空白或控制字符；非法配置在 worker 启动时明确报错，不会先接受消息再静默失败。该入口使用独立的每轮凭据，通过 `x-riff-host-token` 请求头传递，终端的只读链接或操作 token 均不能调用它。客户端直接连接配置的入口，不跟随重定向，也不把凭据交给沙箱 HTTP 代理，因此转发地址须能从沙箱直达（可使用 IPv6）。
+
+POST 受理后以操作 ID 查询结果；相同 ID 和内容的重复请求不会再次执行。响应丢失只查询原操作，不能自动改为直连飞书重发；进程崩溃后没有确定回执的操作返回 unknown，由调用者核验。历史轮次回执在绑定和新操作时按 7 天及 1000 条上限清理；当前轮次与正在执行的回执不被淘汰，达到容量上限时拒绝新操作。会话关闭后，daemon 的启动/周期清理会回收无活跃引用的回执目录；保护集合或进程存活情况不明确时跳过回收。
+
+回执维护失败不会中断消息投递；目录无法枚举时按满额处理，拒绝新操作，已有回执继续用于幂等查询。绑定签发的其它异常会留下不含凭据的告警，任务仍会创建或追问，但本轮不注入宿主工具绑定，并在任务输出中报告工具不可用。不会恢复原始应用密钥、复用旧绑定或自动直连飞书重发。
+
+沙箱必须安装支持 `riff_host_tools_v1` 的同版本 botmux，可用 `botmux capabilities --json` 核对。Linux x64 编译版宿主机会提供受当前轮次凭据保护的同构建 CLI 下载，自动引导安装前校验 SHA-256；源码及其它平台部署仍需通过 npm 等方式提供兼容的 Linux CLI。升级后已有 Riff 会话在下一次追问时重新绑定。
+
+通道不开放宿主机管理员命令、任意 shell、跨会话投递、`preview` 或原始终端控制。Completion Proposal 的后端可恢复性检查维持原有规则，仍可能降级为文字；不会因工具桥接而自动开放。已有但从未在宿主机登记的历史反馈卡片需要另行核验并补登记，本改动不会按当前权限策略自动认领旧卡。
+
 | 按钮 | 作用 |
 |------|------|
 | 📖 显示输出 / 打开 Web 终端 | 任务日志页（状态行、进度、任务完成报告） |

@@ -200,6 +200,7 @@ function restoreUpdatedTaskRow(
   before: ScheduledTask,
   updates: ScheduleUpdateParams,
   appId: string,
+  identityBefore?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'>,
 ): void {
   const patch: Parameters<typeof scheduleStore.updateTask>[1] = {
     preconditionRef: before.preconditionRef,
@@ -229,9 +230,19 @@ function restoreUpdatedTaskRow(
     patch.chatIds = before.chatIds ?? null;
   }
   if (updates.topicTitle !== undefined) patch.topicTitle = before.topicTitle;
+  if (updates.model !== undefined) patch.model = before.model;
+  if (updates.reasoningEffort !== undefined) patch.reasoningEffort = before.reasoningEffort;
   scheduler.updateRuntimeTaskState(before.id, {
     ...patch,
     chatIds: patch.chatIds === null || patch.chatIds === undefined ? undefined : [...patch.chatIds],
+    // An edit that recorded a new creator also replaced who the task runs as
+    // and dropped its claim. A failed edit must not keep either. (The host
+    // authority re-derives a non-delegated task's control columns from these.)
+    ...(updates.creator && identityBefore ? {
+      ownerOpenId: identityBefore.ownerOpenId,
+      ownerUnionId: identityBefore.ownerUnionId,
+      runAsClaim: identityBefore.runAsClaim,
+    } : {}),
   }, appId);
 }
 
@@ -343,7 +354,7 @@ export function updateTaskWithOptionalPrecondition(
     // Restore only fields this operation could have changed; runtime status
     // may have advanced concurrently and must not be clobbered.
     try {
-      restoreUpdatedTaskRow(before, updates, appId);
+      restoreUpdatedTaskRow(before, updates, appId, updated.previousRunAs);
     } catch (rollbackError) {
       logRollbackFailure(id, 'task-row rollback after update failure', rollbackError);
     }

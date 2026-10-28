@@ -71,6 +71,22 @@ describe('resolveBoundLarkUserCredential', () => {
     expect(grantCalls).toHaveLength(0);
   });
 
+  it('delegated: asks the platform with the union_id from the dispatch and looks nobody up', async () => {
+    const lookups: string[] = [];
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => BINDING,
+      resolveUnionId: async (_app, openId) => { lookups.push(openId); throw new Error('contact API unavailable'); },
+      requestGrant: async (req) => { grantCalls.push(req); return granted; },
+    });
+    const result = await resolveBoundLarkUserCredential({
+      bot: bot({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }), openId: 'ou_target_person',
+      sessionId: 's-1', turnId: 'om_t', delegated: true, unionId: 'on_dispatch_person', botAppToken: async () => null,
+    });
+    expect(result).toEqual({ ok: true, appId: 'cli_platform', credential: 'platform-user-token', issuer: 'platform' });
+    expect(grantCalls.map(call => call.unionId)).toEqual(['on_dispatch_person']);
+    expect(lookups).toEqual([]);
+  });
+
   it('auto: a person with a bot-app grant keeps it and the platform is not asked', async () => {
     const { result, tokenFn } = resolve(bot({ enabled: true, tools: ['lark-cli'] }), 'bot-app-token');
     expect(await result).toEqual({ ok: true, appId: 'cli_bot', credential: 'bot-app-token' });

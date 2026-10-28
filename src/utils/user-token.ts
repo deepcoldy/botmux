@@ -290,6 +290,46 @@ function loadTokenForApp(
   return null;
 }
 
+function reportedExpiry(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || !Number.isFinite(Date.parse(trimmed))) return undefined;
+  return trimmed;
+}
+
+/**
+ * Whether this person has a usable legacy bot-app user token, plus the expiry
+ * times stored beside it.
+ *
+ * Strictly that person's file: an unusable open_id does not fall through to
+ * the unattributed per-app token, and the result never includes access or
+ * refresh token contents. A still-refreshable access token counts as
+ * authorized — the same rule as {@link getTokenStatus}.
+ */
+export function userTokenAuthState(
+  appId: string,
+  brand: Brand = 'feishu',
+  openId?: string,
+): { state: 'authorized' | 'needs-login' | 'unknown'; expiresAt?: string; refreshExpiresAt?: string } {
+  if (!isUsableOpenId(openId)) return { state: 'unknown' };
+  try {
+    const loaded = loadTokenForApp(appId, brand, openId);
+    if (!loaded) return { state: 'needs-login' };
+    const { token } = loaded;
+    const accessValid = isValid(token.expires_at);
+    const refreshValid = isValid(token.refresh_expires_at) || (!token.refresh_expires_at && !!token.refresh_token);
+    const expiresAt = reportedExpiry(token.expires_at);
+    const refreshExpiresAt = reportedExpiry(token.refresh_expires_at);
+    return {
+      state: accessValid || refreshValid ? 'authorized' : 'needs-login',
+      ...(expiresAt ? { expiresAt } : {}),
+      ...(refreshExpiresAt ? { refreshExpiresAt } : {}),
+    };
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
 /**
  * 这个 app 下所有已授权的人。用于 Dashboard 的「已授权 N 人」与 /login status。
  * 只读文件名与内容里的归属字段，**不返回任何 token 内容**。

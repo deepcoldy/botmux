@@ -35,7 +35,10 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { shellJoin } from '../src/core/cli-launch-mode.js';
 import {
+  botmuxInvocation,
   claudeStopFailureHookCommand,
   cursorUsageHookCommand,
   hookCommandParts,
@@ -81,13 +84,13 @@ describe('hook-command — compiled binary form', () => {
       cmd: process.execPath,
       args: ['hook', 'claude-code'],
     });
-    expect(hookCommandFor('claude-code')).toBe(`"${process.execPath}" hook claude-code`);
-    expect(sessionReadyHookCommand()).toBe(`"${process.execPath}" session-ready`);
-    expect(userPromptHookCommand()).toBe(`"${process.execPath}" user-prompt-hook`);
-    expect(claudeStopFailureHookCommand()).toBe(`"${process.execPath}" __claude-stop-failure-v1`);
+    expect(hookCommandFor('claude-code')).toBe(`'${process.execPath}' hook claude-code`);
+    expect(sessionReadyHookCommand()).toBe(`'${process.execPath}' session-ready`);
+    expect(userPromptHookCommand()).toBe(`'${process.execPath}' user-prompt-hook`);
+    expect(claudeStopFailureHookCommand()).toBe(`'${process.execPath}' __claude-stop-failure-v1`);
     // statusLine.command 走进程级 --settings，同样由 Claude 经 shell 执行。
-    expect(statuslineHookCommand()).toBe(`"${process.execPath}" statusline`);
-    expect(cursorUsageHookCommand()).toContain(`"${process.execPath}" __cursor-usage-v1`);
+    expect(statuslineHookCommand()).toBe(`'${process.execPath}' statusline`);
+    expect(cursorUsageHookCommand()).toContain(`'${process.execPath}' __cursor-usage-v1`);
     expect(nativeSubagentRuntimeHookCommand()).toMatch(
       /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,
     );
@@ -122,44 +125,77 @@ describe('hook-command — compiled binary form', () => {
   });
 });
 
-describe('hook-command — Node form stays byte-identical', () => {
-  it('keeps the dist/cli.js script path (Node cannot resolve the subcommand alone)', () => {
-    // Guard against "converging" the branches: verified that `node hook
-    // claude-code` without the script path fails with MODULE_NOT_FOUND, so this
-    // path must keep the argument.
-    const parts = hookCommandParts('claude-code');
+describe('hook-command — source and dist path contracts', () => {
+  it('passes the TypeScript CLI entry to Bun in a source checkout', () => {
+    const root = join(tmpdir(), 'botmux source fixture');
+    const moduleUrl = pathToFileURL(join(root, 'src', 'adapters', 'hook-command.ts')).href;
+    expect(botmuxInvocation(['zcode-session-hook'], false, moduleUrl, true)).toEqual({
+      cmd: process.execPath,
+      args: [join(root, 'src', 'cli.ts'), 'zcode-session-hook'],
+    });
+  });
+
+  it('passes the TypeScript CLI entry through tsx for a Node source checkout', () => {
+    const root = join(tmpdir(), 'botmux node source fixture');
+    const moduleUrl = pathToFileURL(join(root, 'src', 'adapters', 'hook-command.ts')).href;
+    const result = botmuxInvocation(['zcode-session-hook'], false, moduleUrl, false);
+    expect(result.cmd).toBe(process.execPath);
+    expect(result.args[0]).toBe('--import');
+    expect(result.args[1]).toMatch(/[/\\]tsx[/\\]/);
+    expect(result.args[2]).toBe(join(root, 'src', 'cli.ts'));
+    expect(result.args.slice(3)).toEqual(['zcode-session-hook']);
+  });
+
+  it('retains the JavaScript CLI entry in a compiled dist tree', () => {
+    const root = join(tmpdir(), 'botmux dist fixture');
+    const moduleUrl = pathToFileURL(join(root, 'dist', 'adapters', 'hook-command.js')).href;
+    expect(botmuxInvocation(['zcode-session-hook'], false, moduleUrl, false)).toEqual({
+      cmd: process.execPath,
+      args: [join(root, 'dist', 'cli.js'), 'zcode-session-hook'],
+    });
+  });
+});
+
+describe('hook-command — non-standalone form', () => {
+  it('keeps the dist/cli.js script path when invoked from a compiled JavaScript module', () => {
+    const moduleUrl = pathToFileURL(join(tmpdir(), 'botmux', 'dist', 'adapters', 'hook-command.js')).href;
+    const parts = botmuxInvocation(['hook', 'claude-code'], false, moduleUrl);
     expect(parts.cmd).toBe(process.execPath);
     expect(parts.args).toHaveLength(3);
     expect(parts.args[0]).toMatch(/[/\\]cli\.js$/);
     expect(parts.args.slice(1)).toEqual(['hook', 'claude-code']);
   });
 
-  it('quotes the executable and the script, but not the subcommand tokens', () => {
+  it('quotes every interpreter argument and leaves subcommand tokens separate', () => {
+    const parts = hookCommandParts('claude-code');
     const s = hookCommandFor('claude-code');
-    expect(s).toBe(`"${process.execPath}" "${hookCommandParts('claude-code').args[0]}" hook claude-code`);
-    // The trailing tokens are bare — callers must not re-split the string, but a
-    // shell has to see `hook` and the cliId as separate words.
+    const prefix = shellJoin([parts.cmd, ...parts.args.slice(0, -2)]);
+    expect(s).toBe(`${prefix} hook claude-code`);
+    // The trailing tokens are bare — callers must not re-split the string, but
+    // a shell has to see `hook` and the cliId as separate words.
     expect(s.endsWith(' hook claude-code')).toBe(true);
   });
 
-  it('session-ready, user-prompt-hook, and native runtime hook carry the script path too', () => {
-    const script = hookCommandParts('x').args[0];
-    expect(sessionReadyHookCommand()).toBe(`"${process.execPath}" "${script}" session-ready`);
-    expect(userPromptHookCommand()).toBe(`"${process.execPath}" "${script}" user-prompt-hook`);
-    expect(claudeStopFailureHookCommand()).toBe(`"${process.execPath}" "${script}" __claude-stop-failure-v1`);
-    expect(statuslineHookCommand()).toBe(`"${process.execPath}" "${script}" statusline`);
+  it('session-ready, user-prompt-hook, and native runtime hook carry the runtime entry', () => {
+    const parts = hookCommandParts('x');
+    const prefix = shellJoin([parts.cmd, ...parts.args.slice(0, -2)]);
+    expect(sessionReadyHookCommand()).toBe(`${prefix} session-ready`);
+    expect(userPromptHookCommand()).toBe(`${prefix} user-prompt-hook`);
+    expect(claudeStopFailureHookCommand()).toBe(`${prefix} __claude-stop-failure-v1`);
+    expect(statuslineHookCommand()).toBe(`${prefix} statusline`);
+
     expect(nativeSubagentRuntimeHookCommand()).toMatch(
       /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,
     );
-    expect(nativeSubagentRuntimeHookCommand()).not.toContain(script);
+    expect(nativeSubagentRuntimeHookCommand()).not.toContain(parts.args[0]);
   });
 
-  it('the two forms differ exactly by the script argument', () => {
-    const nodeForm = hookCommandParts('claude-code');
-    asCompiledBinary();
-    const binForm = hookCommandParts('claude-code');
-    // Same subcommand, one fewer argument — states the contract as a relation so
-    // a future edit to either branch alone breaks it.
+  it('the Node/dist and standalone forms differ exactly by the script argument', () => {
+    const moduleUrl = pathToFileURL(join(tmpdir(), 'botmux', 'dist', 'adapters', 'hook-command.js')).href;
+    const nodeForm = botmuxInvocation(['hook', 'claude-code'], false, moduleUrl, false);
+    const binForm = botmuxInvocation(['hook', 'claude-code'], true, moduleUrl, true);
+    // Node/dist has the cli.js script; standalone dispatches the same
+    // subcommand directly to the binary.
     expect(nodeForm.args).toHaveLength(binForm.args.length + 1);
     expect(nodeForm.args.slice(1)).toEqual(binForm.args);
   });

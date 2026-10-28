@@ -215,6 +215,26 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
   return BY_NAME.get(cmd.trim().toLowerCase());
 }
 
+/**
+ * Commands consumed before slash routing by `im/lark/event-dispatcher.ts` or
+ * the daemon's admitted entries. They are not in the table above, but a plugin
+ * declaring one would never receive it.
+ */
+const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([
+  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode',
+  '/substitute', '/reply-mode', '/workflow', '/template', '/invite',
+]);
+
+/**
+ * Every slash token Botmux itself owns: table names and aliases (including
+ * CLI-specific ones such as `/effort`), the topic-header commands and the
+ * pre-routing commands. Plugin commands may never claim one of these.
+ */
+export function isBuiltinSlashCommandName(cmd: string): boolean {
+  const key = cmd.trim().toLowerCase();
+  return BY_NAME.has(key) || FORCE_TOPIC_COMMANDS.has(key) || PRE_ROUTING_COMMANDS.has(key);
+}
+
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────
 
 /** 一条命令的 **CLI 限定值** 是否匹配当前会话 CLI：字符串精确相等，数组命中其一。

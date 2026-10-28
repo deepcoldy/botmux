@@ -360,6 +360,7 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
+import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -6545,7 +6546,7 @@ const server = createServer(async (req, res) => {
       if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
       const upstream = await proxyToDaemon(larkAppId, '/api/schedules', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: dashboardScheduleWriteHeaders(req, !!readPlatformBinding()),
         body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
@@ -6567,7 +6568,7 @@ const server = createServer(async (req, res) => {
       }
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}`, {
         method: 'PATCH',
-        headers: { 'content-type': 'application/json' },
+        headers: dashboardScheduleWriteHeaders(req, !!readPlatformBinding()),
         body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });

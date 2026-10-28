@@ -70,12 +70,24 @@ describe('plugin MCP Gateway installer', () => {
     expect(text).toContain('[mcp_servers.keep]');
     expect(text).toContain('[mcp_servers.botmux]');
     expect(text).toContain(`command = ${JSON.stringify(join(home, '.botmux', 'bin', 'botmux'))}`);
+    expect(text).toContain('tool_timeout_sec = 600');
     expect(text).toContain(
       `env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`,
     );
     expect(text.match(/\[mcp_servers\.botmux\]/g)).toHaveLength(1);
     expect(text).not.toContain('botmux plugin demo');
     expect(text).not.toContain('legacy-without-leading-marker');
+  });
+
+  it('writes the configured Gateway ceiling as the Codex outer timeout', () => {
+    const path = join(home, '.codex', 'config.toml');
+    const adapter = { id: 'codex', mcpGateway: { format: 'codex-toml' as const, configPath: path } };
+    expect(ensureGatewayEntry(adapter, {
+      command: join(home, '.botmux', 'bin', 'botmux'),
+      args: ['mcp', 'serve'],
+      maxToolTimeoutMs: 900_001,
+    }).state).toBe('installed');
+    expect(readFileSync(path, 'utf8')).toContain('tool_timeout_sec = 901');
   });
 
   it.each(['\n', '\r\n'])('preserves tables inserted before the gateway end marker (%j)', (newline) => {
@@ -191,6 +203,7 @@ describe('plugin MCP Gateway installer', () => {
       type: 'stdio',
       command: join(home, '.botmux', 'bin', 'botmux'),
       args: ['mcp', 'serve'],
+      timeout: 600_000,
       env: {
         [MCP_GATEWAY_OWNER_ENV]: '1',
         BOTMUX_SESSION_ID: '${BOTMUX_SESSION_ID:-}',

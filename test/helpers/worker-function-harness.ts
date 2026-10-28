@@ -58,3 +58,27 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   // eslint-disable-next-line no-new-func
   return new Function('scope', `with (scope) { ${transpiledWorkerFunction(name)}; return ${name}; }`)(proxy) as T;
 }
+
+/** Execute one real IPC case without starting the worker's process listeners. */
+export function loadWorkerMessageHandler(name: string, scope: Record<string, unknown>): (message: unknown) => Promise<void> {
+  const source = workerSourceFile();
+  let clause: ts.CaseClause | undefined;
+  function visit(node: ts.Node) {
+    if (ts.isSwitchStatement(node) && node.expression.getText(source) === 'msg.type') {
+      clause = node.caseBlock.clauses.find((item): item is ts.CaseClause =>
+        ts.isCaseClause(item) && ts.isStringLiteral(item.expression) && item.expression.text === name);
+    }
+    if (!clause) ts.forEachChild(node, visit);
+  }
+  visit(source);
+  if (!clause) throw new Error(`Missing worker IPC case: ${name}`);
+  const code = ts.transpileModule(`async function handle(msg: any) { switch (msg.type) { ${clause.getText(source)} } }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText;
+  const proxy = new Proxy(scope, {
+    has: (_target, key) => key !== Symbol.unscopables,
+    get: (target, key) => key in target ? target[key as string] : (globalThis as any)[key],
+    set: (target, key, value) => { target[key as string] = value; return true; },
+  });
+  return new Function('scope', `with (scope) { ${code}; return handle; }`)(proxy);
+}

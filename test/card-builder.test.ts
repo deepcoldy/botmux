@@ -804,6 +804,21 @@ describe('buildConfigCard', () => {
       ],
     });
 
+  it('offers the reasoning-effort selector when the bot CLI supports it', () => {
+    const without = parse(buildConfigCard(configData(null), 'zh'));
+    expect(allActions(without).some((a: any) => a.value?.field === 'reasoningEffort')).toBe(false);
+
+    const card = parse(buildConfigCard({
+      ...configData(null), reasoningEfforts: ['low', 'high', 'max'], reasoningEffort: 'max',
+    }, 'zh'));
+    const select = allActions(card).find((a: any) => a.value?.field === 'reasoningEffort');
+    expect(select).toBeTruthy();
+    expect(select.value).toMatchObject({ action: 'config_set', field: 'reasoningEffort' });
+    // Sentinel first = "clear and follow the CLI/model default".
+    expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', 'low', 'high', 'max']);
+    expect(select.initial_option).toBe('max');
+  });
+
   it('renders card-behaviour toggles', () => {
     const card = parse(buildConfigCard(configData(null), 'en'));
 

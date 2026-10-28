@@ -182,7 +182,7 @@ describe.skipIf(process.platform !== 'linux')('opening-turn identity survives th
     expect(decision.turnId).toBe('first-turn');
 
     // Run the REAL daemon flip handler against REAL identity storage, with a
-    // replay that republishes the opening turn the way refreshTurnCliIdentity
+    // replay that republishes the opening turn the way prepareTurnCliIdentity
     // does. Composition proves: purge plaintext → proven memory holds the
     // opening turn (what the proven cli-identity-runner then fetches).
     const flip = extractFlipHandler();
@@ -198,7 +198,7 @@ describe.skipIf(process.platform !== 'linux')('opening-turn identity survives th
       clearSingleIdentityArtifacts,
       forgetProvenIdentityContent,
       identityDecisionTurnIsLive: () => true,
-      refreshTurnCliIdentity: async (target: any, turnId: string) => {
+      prepareTurnCliIdentity: async (target: any, turnId: string) => {
         // Replay republishes the opening turn the accept-time single write
         // carried, now under proven.
         writeSessionIdentity(h.root, target.session.sessionId, {

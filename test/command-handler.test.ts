@@ -6507,6 +6507,33 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('Daily news');
     });
 
+    it('shows who each task runs as: the claimant first, then the creator, else none', async () => {
+      const base = {
+        schedule: '50 17 * * *',
+        parsed: { kind: 'cron' as const, expr: '50 17 * * *', display: '每日 17:50' },
+        prompt: 'Check AI news', workingDir: '~/projects', chatId: CHAT_ID, enabled: true,
+        createdAt: new Date().toISOString(), larkAppId: LARK_APP_ID,
+      };
+      vi.mocked(scheduleStore.listTasks).mockReturnValue([
+        { ...base, id: 'claimed1', name: 'Claimed', ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator',
+          runAsClaim: { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: LARK_APP_ID,
+            claimedAt: '2026-10-26T02:00:00.000Z' } },
+        { ...base, id: 'created1', name: 'Created', ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator' },
+        { ...base, id: 'nobody01', name: 'Nobody' },
+      ]);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(null);
+
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule list'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      const runAs = (id: string) => reply.split(`[${id}]`)[1]!.split('\n').find(line => line.includes('runAs:'));
+      expect(runAs('claimed1')).toMatch(/runAs: ou_claimant（认领于 .+）/);
+      expect(runAs('created1')).toContain('runAs: ou_creator');
+      expect(runAs('nobody01')).toContain('runAs: —');
+    });
+
     it('should remove a task by id', async () => {
       vi.mocked(scheduler.removeTask).mockReturnValue(true);
 

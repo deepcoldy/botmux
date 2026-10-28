@@ -62,7 +62,7 @@ describe('session application identity route', () => {
     vi.mocked(bots.getBot).mockReturnValue({ config: botConfig } as any);
     await publishTurnCliIdentity({ botConfig, sessionDataDir: dir, sessionId: 'tool-session',
       senderOpenId: 'ou_dispatch_bot', turnId: options.turnId ?? 'om_turn', delegatedIdentity: {
-        credentialOpenId: 'ou_source_human', targetOpenId: options.targetOpenId ?? 'ou_target_human',
+        credentialOpenId: 'ou_source_human', targetOpenId: options.targetOpenId ?? 'ou_target_human', unionId: 'on_source_human',
         tools: options.tools ?? ['lark-cli'], dispatchRoot: 'om_dispatch_root', denialReason: options.denialReason,
       } });
   }
@@ -413,6 +413,30 @@ describe('platform-issued user credentials in a bound session', () => {
     const response = await request('user');
     expect(await response.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
     expect(grants).toHaveLength(0);
+  });
+  it('serves a delegated human from the platform by the union_id in the dispatch, with the contact API down', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM,
+      resolveUnionId: async () => { throw new Error('contact API unavailable'); },
+      requestGrant: async req => {
+        grants.push(req);
+        return { ok: true, value: { tool: 'lark-cli', unionId: 'on_source_human', expiresAt: Date.now() + 3_600_000,
+          variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'delegated-platform-token' } } } as any;
+      },
+    });
+    session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
+    const botConfig = { ...platformBot('platform'), larkToolBinding: true } as any;
+    vi.mocked(bots.getBot).mockReturnValue({ config: botConfig } as any);
+    await publishTurnCliIdentity({ botConfig, sessionDataDir: dir, sessionId: 'tool-session',
+      senderOpenId: 'ou_dispatch_bot', turnId: 'om_turn', storageModel: 'proven', delegatedIdentity: {
+        credentialOpenId: 'ou_source_human', targetOpenId: 'ou_target_human', unionId: 'on_source_human',
+        tools: ['lark-cli'], dispatchRoot: 'om_dispatch_root',
+      } });
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ appId: 'cli_platform', credential: 'delegated-platform-token', issuer: 'platform' });
+    expect(grants.map(grant => grant.unionId)).toEqual(['on_source_human']);
   });
   it('platform mode ignores the bot-app grant', async () => {
     vi.mocked(bots.getBot).mockReturnValue({ config: platformBot('platform') } as any);

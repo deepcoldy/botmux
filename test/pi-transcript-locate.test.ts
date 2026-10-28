@@ -141,9 +141,11 @@ describe('Pi 1.3.0 transcript: one turn read by the late-attached bridge', () =>
     const answer = '已跑完，结论先给：**head 64b84e46 可以直接合**。';
     const path = writeSession('--root--', `2026-10-20T17-03-23-621Z_${SID}.jsonl`, pi130Turn('/root', '@Pure(pi) #1809 复审', answer));
     const events = drainPiTranscript(path, 0).events;
-    // The system prompt record, model/thinking changes, context_edit and the
-    // markers are not turn events; the retried error is not a failure.
-    expect(events.filter(ev => ev.kind !== 'cot').map(ev => ev.kind)).toEqual(['user', 'assistant_final']);
+    // The system prompt record, model/thinking changes and context_edit are
+    // not turn events, and the markers surface only as `cli_settled`
+    // lifecycle edges; the retried error is not a failure.
+    expect(events.filter(ev => ev.kind !== 'cot' && ev.kind !== 'cli_settled').map(ev => ev.kind))
+      .toEqual(['user', 'assistant_final']);
     const final = events.find(ev => ev.kind === 'assistant_final')!;
     expect(final.text).toBe(answer);
     expect(final.terminalStatus).toBeUndefined();

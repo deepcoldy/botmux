@@ -94,6 +94,11 @@ export interface CodexPendingTurn {
   /** Wall-clock millis when an authoritative adapter/history check confirmed
    *  the submit. Unverified writes deliberately leave this unset. */
   submitConfirmedAtMs?: number;
+  /** Local time the CLI reported it accepted this input while busy and is
+   *  holding it until its current work ends (`input_queued`). While set the
+   *  pre-start lease cannot expire: the user record is coming, just late.
+   *  Cleared when the turn starts or the CLI settles without taking it up. */
+  cliQueuedAtMs?: number;
   /** Wall-clock millis anchoring the bounded attribution-only lease for an
    *  unconfirmed mark. Unlike verification/confirmation leases, this never
    *  gates screen-ready or reports the CLI busy. */
@@ -218,6 +223,16 @@ export class CodexBridgeQueue {
     return this.queue.find(turn => this.isProvisionalTaskStart(turn)
       && turn.sourceTurnId === ev.sourceTurnId
       && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId)) ?? null;
+  }
+
+  /** A lost earlier mark can hold the provisional claim on a native turn whose
+   *  user record then started a later mark. The terminal belongs to that
+   *  corroborated turn; dropping it would leave it started without a final. */
+  private hasCorroboratedNativeTurn(ev: CodexBridgeEvent): boolean {
+    return !!ev.sourceTurnId && this.queue.some(turn => turn.started && turn.finalText === undefined
+      && !this.isProvisionalTaskStart(turn)
+      && turn.sourceTurnId === ev.sourceTurnId
+      && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId));
   }
 
   private rollbackProvisionalTaskStart(turn: CodexPendingTurn, observedAtMs: number = this.now()): void {
@@ -405,6 +420,9 @@ export class CodexBridgeQueue {
       // prune it — that would falsely release idle while the app-server is still
       // executing. Keep it until the terminal edge or explicit stop.
       if (head.rpcActive) break;
+      // The CLI holds this input in its own queue (input_queued); its user
+      // record will start it, or cli_settled restarts the lease.
+      if (head.cliQueuedAtMs !== undefined) break;
 
       // An authoritative adapter/history check can legitimately outlive the
       // shorter attribution lease. Do not prune under that in-flight await;
@@ -586,6 +604,7 @@ export class CodexBridgeQueue {
       if (turn.finalText !== undefined) return false;
       if (turn.started) return true;
       if (turn.rpcActive) return true;
+      if (turn.cliQueuedAtMs !== undefined) return true;
       const confirmed = turn.submitConfirmedAtMs !== undefined
         && nowMs - turn.submitConfirmedAtMs <= STRUCTURED_SUBMIT_START_GRACE_MS;
       const verifying = turn.submitVerificationStartedAtMs !== undefined
@@ -599,7 +618,8 @@ export class CodexBridgeQueue {
    *  lease expires. Started turns return undefined because their eventual
    *  assistant_final is the authoritative re-drive. */
   preStartLeaseRemainingMs(nowMs: number = this.now()): number | undefined {
-    if (this.queue.some(turn => ((turn.started && !this.isProvisionalTaskStart(turn)) || turn.rpcActive)
+    if (this.queue.some(turn => ((turn.started && !this.isProvisionalTaskStart(turn)) || turn.rpcActive
+      || turn.cliQueuedAtMs !== undefined)
       && turn.finalText === undefined)) return undefined;
     const activeRemaining = this.queue.flatMap(candidate => {
       if (candidate.finalText !== undefined) return [];
@@ -749,6 +769,30 @@ export class CodexBridgeQueue {
       this.collecting = next;
       return;
     }
+    if (ev.kind === 'input_queued') {
+      // One accepted input per marker, in submit order. Never starts the
+      // head: the work still running belongs to an earlier turn.
+      const next = this.queue.find(turn => !turn.started && turn.finalText === undefined
+        && turn.cliQueuedAtMs === undefined && !turn.rpcActive);
+      if (!next) return;
+      if (next.markTimeMs !== undefined
+        && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS) return;
+      next.cliQueuedAtMs = this.now();
+      return;
+    }
+    if (ev.kind === 'cli_settled') {
+      // Queued input is taken up before the CLI settles. A head still held
+      // here went back to the editor (abort) or was otherwise dropped, so its
+      // normal lease runs again from now.
+      const observedAtMs = this.now();
+      for (const turn of this.queue) {
+        if (turn.cliQueuedAtMs === undefined || turn.started || turn.finalText !== undefined) continue;
+        turn.cliQueuedAtMs = undefined;
+        if (turn.submitConfirmedAtMs !== undefined) turn.submitConfirmedAtMs = observedAtMs;
+        else turn.unconfirmedAttributionStartedAtMs = observedAtMs;
+      }
+      return;
+    }
     if (ev.kind === 'cot') {
       // Cosmetic thinking-timeline record. Only meaningful while a turn is
       // collecting; history replay / unmatched events are dropped (never
@@ -791,6 +835,10 @@ export class CodexBridgeQueue {
           if (!provisional.sourceTurnId && ev.sourceTurnId) {
             provisional.sourceTurnId = ev.sourceTurnId;
           }
+          // Corroboration is the turn's own user record: the same evidence a
+          // direct start reports, so in-flight input is not re-delivered to a
+          // resumed CLI that already holds it.
+          try { this.turnStartObserver?.(provisional); } catch { /* observer only */ }
           return;
         }
         // In non-adopt mode an unmatched user record may only be transcript
@@ -863,6 +911,7 @@ export class CodexBridgeQueue {
         next!.started = true;
         next!.submitVerificationStartedAtMs = undefined;
         next!.unconfirmedAttributionStartedAtMs = undefined;
+        next!.cliQueuedAtMs = undefined;
         next!.provisionalTaskStartedAtMs = undefined;
         next!.taskStartedRollbackAtMs = undefined;
         next!.sourceSessionId = ev.sourceSessionId;
@@ -941,7 +990,7 @@ export class CodexBridgeQueue {
         // turn must not settle the pending Lark mark. Roll back immediately;
         // the terminal is intentionally not buffered onto another turn.
         this.rollbackProvisionalTaskStart(provisional);
-        return;
+        if (!this.hasCorroboratedNativeTurn(ev)) return;
       }
       const target = this.targetForNativeEvent(ev);
       if (target) {
@@ -967,7 +1016,7 @@ export class CodexBridgeQueue {
       const provisional = this.matchingProvisionalTaskStart(ev);
       if (provisional) {
         this.rollbackProvisionalTaskStart(provisional);
-        return;
+        if (!this.hasCorroboratedNativeTurn(ev)) return;
       }
       const target = this.targetForNativeEvent(ev);
       if (!target) {

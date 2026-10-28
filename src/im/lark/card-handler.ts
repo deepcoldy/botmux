@@ -78,6 +78,8 @@ import { recordCreatedWorktree } from '../../services/botmux-worktree-store.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
+import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
+import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
@@ -120,6 +122,7 @@ import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../cor
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
+import { SCHEDULE_IDENTITY_ACTION_PREFIX } from './schedule-identity-claim-card.js';
 import {
   isLocalCliOpenCapable,
   isLocalCliOpenConfigured,
@@ -158,6 +161,9 @@ export interface CardHandlerDeps {
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** Codex 完成通知卡动作。事件存储、App 打开和会话接管由 daemon 单点持有。 */
   codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** 定时任务身份认领卡的「认领 / 改为我认领 / 重新执行」。authority 记录与调度器由
+   *  daemon 单点持有；操作人身份与 canOperate 在 core/schedule-identity-claim 里校验。 */
+  scheduleIdentityClaimCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
   /** 把 passthrough 命令（如 /compact）透传到仍存活的会话。由 daemon 接线到
@@ -174,6 +180,15 @@ export interface CardHandlerDeps {
       replyRootId?: string;
     },
   ) => void;
+  /** Signed single-use button. The handler admits the clicker and returns a
+   *  continuation that starts the turn after the card callback is acked. */
+  cardClickTurn?: (input: {
+    larkAppId: string;
+    operatorOpenId?: string;
+    operatorUnionId?: string;
+    payload?: string;
+    sig?: string;
+  }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
 /**
@@ -1544,6 +1559,28 @@ function buildMenuModelPickerCard(
   });
 }
 
+function cardClickTurnToastKey(reason: string): string {
+  switch (reason) {
+    case 'expired': return 'card.click_turn.expired';
+    case 'replayed': return 'card.click_turn.replayed';
+    case 'no_identity': return 'card.click_turn.no_identity';
+    case 'bot_or_app': return 'card.click_turn.bot_or_app';
+    case 'blocked': return 'card.click_turn.blocked';
+    case 'not_allowed': return 'card.click_turn.not_allowed';
+    case 'cannot_operate': return 'card.click_turn.cannot_operate';
+    case 'grant_blocked': return 'card.click_turn.grant_blocked';
+    case 'session_not_found': return 'card.action.session_gone';
+    case 'working_dir_mismatch': return 'card.click_turn.working_dir_mismatch';
+    case 'working_dir_required': return 'card.click_turn.working_dir_required';
+    case 'working_dir_missing': return 'card.click_turn.working_dir_missing';
+    case 'chat_type_mismatch': return 'card.click_turn.chat_type_mismatch';
+    case 'delivery_failed': return 'card.click_turn.delivery_failed';
+    case 'principal_lane': return 'card.click_turn.principal_lane';
+    case 'cross_principal': return 'card.click_turn.cross_principal';
+    default: return 'card.click_turn.rejected';
+  }
+}
+
 export async function handleCardAction(input: unknown, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
   const data = normalizeCardActionData(input);
   logCardActionDiagnostics('handler', input, data);
@@ -1995,6 +2032,35 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     };
   }
 
+  if (value?.action === 'card_click_turn' && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    if (!deps.cardClickTurn) {
+      return { toast: { type: 'error', content: t('card.click_turn.unavailable', undefined, loc) } };
+    }
+    const accepted = await deps.cardClickTurn({
+      larkAppId,
+      operatorOpenId,
+      operatorUnionId: typeof data?.operator?.union_id === 'string' ? data.operator.union_id : undefined,
+      payload: value.payload,
+      sig: value.sig,
+    });
+    if (!accepted.ok) {
+      return { toast: { type: 'error', content: t(cardClickTurnToastKey(accepted.reason), undefined, loc) } };
+    }
+    return {
+      toast: { type: 'info', content: t('card.click_turn.pending', undefined, loc) },
+      afterAck: () => accepted.run().then(async result => {
+        const failed = result && typeof result === 'object' && 'ok' in result && result.ok === false;
+        const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
+        try {
+          await sendMessage(larkAppId, accepted.chatId, t(key, undefined, loc), 'text');
+        } catch (err) {
+          logger.warn(`[card-click-turn] ${failed ? 'failure' : 'started'} notice failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }),
+    };
+  }
+
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data, { larkAppId });
   }
@@ -2043,6 +2109,17 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'error', content: 'Codex 完成通知处理器未启用' } };
     }
     return deps.codexNotifierCardAction(data, larkAppId);
+  }
+
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith(SCHEDULE_IDENTITY_ACTION_PREFIX) &&
+    larkAppId
+  ) {
+    if (!deps.scheduleIdentityClaimCardAction) {
+      return { toast: { type: 'error', content: t('scheduler.claim.toast_unsupported', undefined, localeForBot(larkAppId)) } };
+    }
+    return deps.scheduleIdentityClaimCardAction(data, larkAppId);
   }
 
   if (
@@ -4136,6 +4213,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // Atomic IPC — worker handles keys + text in one flow to avoid race
       ds.tuiPromptProcessing = true;
       try {
+        // Persist cancellation before input, while retaining the IPC callback
+        // receipt that releases this card's processing claim on send failure.
+        cancelDeploymentContinuation(ds.session,
+          previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
+          deploymentContinuationAuthority(ds)?.turnId, true);
         await sendWorkerIpc(ds.worker, {
           type: 'tui_text_input',
           keys: inputKeys,

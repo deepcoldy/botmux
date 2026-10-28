@@ -1440,6 +1440,29 @@ describe('async group message input contract', () => {
     });
 });
 
+
+describe('video hints through opening and follow-up prompts', () => {
+  const attachments = [{ type: 'video' as const, path: '/tmp/video.mp4', name: 'video.mp4' }];
+  it('uses Kimi ReadMediaFile on both opening and follow-up turns', () => {
+    const opening = buildNewTopicPrompt('看视频', 'video-sid', 'kimi', undefined, attachments, undefined, undefined, undefined, undefined, 'en');
+    const followUp = buildFollowUpContent('继续', 'video-sid', { cliId: 'kimi', locale: 'en', attachments });
+    for (const text of [opening, followUp]) {
+      expect(text).toContain('<video n="1" path="/tmp/video.mp4" />');
+      expect(text).toContain('Prefer ReadMediaFile');
+    }
+  });
+
+  it('does not inject Kimi-only tool names into another CLI', () => {
+    const opening = buildNewTopicPrompt('看视频', 'video-sid', 'codex', undefined, attachments, undefined, undefined, undefined, undefined, 'en');
+    const followUp = buildFollowUpContent('继续', 'video-sid', { cliId: 'codex', locale: 'en', attachments });
+    for (const text of [opening, followUp]) {
+      expect(text).toContain('<video n="1" path="/tmp/video.mp4" />');
+      expect(text).toContain('Prefer Read or');
+      expect(text).not.toContain('ReadMediaFile');
+    }
+  });
+});
+
 describe('senderTagHideEmail', () => {
   const sender = Object.freeze({ openId: 'ou_email_test', type: 'user' as const, name: 'Test User', email: 'sender@example.test' });
   afterEach(() => {

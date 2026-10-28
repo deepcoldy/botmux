@@ -31,14 +31,14 @@
  * call for zero benefit, since these files hold exactly a couple of opaque
  * values.
  */
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
-import { isCliIdentityPath } from '../utils/child-env.js';
+import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import type { IdentityStorageModel } from './lark-tool-binding.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
@@ -756,6 +756,13 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
   } catch { /* best-effort: absence is the desired state */ }
 }
 
+/** Second line of every wrapper {@link renderIdentityWrapper} writes. Also what
+ *  marks a file in the bin dir as ours to remove. */
+const IDENTITY_WRAPPER_MARKER = '# botmux trigger-user identity wrapper — generated, do not edit.';
+/** Every identity tool, derived from the exhaustive map so a new tool cannot be
+ *  left out of stale-wrapper cleanup. */
+const ALL_IDENTITY_TOOLS = Object.keys(IDENTITY_ENV_KEYS) as IdentityTool[];
+
 /**
  * The wrapper script for one tool.
  *
@@ -840,7 +847,7 @@ export function renderIdentityWrapper(
   ];
   return [
     '#!/bin/sh',
-    '# botmux trigger-user identity wrapper — generated, do not edit.',
+    IDENTITY_WRAPPER_MARKER,
     '# Loads the identity the daemon holds for the CURRENT turn, then execs the',
     '# real tool. Re-resolved on every invocation, which is what lets the acting',
     '# identity change without restarting the session.',
@@ -957,6 +964,49 @@ export function ensureSessionIdentityStorage(
 /** Whether the wrapper for `tool` is currently installed in `binDir`. */
 export function identityWrapperInstalled(binDir: string, tool: IdentityTool): boolean {
   return existsSync(join(binDir, tool));
+}
+
+/**
+ * Remove this session's identity wrappers for every tool `policy` does not
+ * govern, and report which were removed.
+ *
+ * The wrapper directory outlives the policy that created it: it is also the
+ * lark-cli binding's bin dir, which every bound session puts first on PATH
+ * whether or not trigger-user auth is on. A wrapper left there after the
+ * operator turns the policy off (or drops a tool from it) keeps intercepting
+ * the tool while the daemon, correctly, publishes nothing for it — so every
+ * call is refused, human turns and scheduled ones alike, until the session is
+ * closed. Off has to mean the tool runs exactly as it did before the policy.
+ *
+ * Called only when a worker spawns, like the install it undoes: a live
+ * worker's wrappers follow the policy it was spawned with (next-session
+ * semantics). Removing them mid-life would leave nothing to re-arm them if the
+ * policy were turned back on before a respawn — the tool would then run with
+ * the machine's own login while every turn still publishes an identity.
+ *
+ * Only files this module generated are touched (checked by content, not name):
+ * the lark-cli binding's own entry and anything else in the directory stay.
+ */
+export function removeUngovernedIdentityWrappers(
+  sessionDataDir: string,
+  sessionId: string,
+  policy: Pick<TriggerUserAuthConfig, 'enabled' | 'tools'> | null | undefined,
+): IdentityTool[] {
+  const governed = new Set(policy?.enabled ? identityToolsFor(policy.tools) : []);
+  const binDir = sessionIdentityBinDir(sessionDataDir, sessionId);
+  const removed: IdentityTool[] = [];
+  for (const tool of ALL_IDENTITY_TOOLS) {
+    if (governed.has(tool)) continue;
+    const path = join(binDir, tool);
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.size > 64 * 1024) continue;
+      if (readFileSync(path, 'utf8').split('\n', 2)[1] !== IDENTITY_WRAPPER_MARKER) continue;
+      rmSync(path, { force: true });
+      removed.push(tool);
+    } catch { /* absent or unreadable: nothing of ours is in the way */ }
+  }
+  return removed;
 }
 
 /**
@@ -1152,11 +1202,14 @@ export function installGitAskpass(
 }
 
 /**
- * Git config that forces an identity-bearing HTTPS path for `host`.
+ * The git `-c` content pairs that force an identity-bearing HTTPS path for
+ * `host`: a host-scoped credential helper plus two URL rewrites.
  *
- * Returned as `GIT_CONFIG_*` env entries rather than written to a config file:
- * they apply to this session's git only, leave the user's own `~/.gitconfig`
- * untouched, and vanish with the process.
+ * This array is the AUTHORITATIVE carrier of the turn's git identity: callers
+ * that forward env into a shell-wrapped pane must pass exactly these pairs
+ * (see SpawnOpts.gitConfigPairs) rather than scan the environment for numbered
+ * `GIT_CONFIG_*` entries, which an ambient layer can push past the authored
+ * set.
  *
  * Two settings, for two different escapes:
  *  - `credential.https://<host>.helper` binds the helper to that host alone, so
@@ -1166,21 +1219,101 @@ export function installGitAskpass(
  *    machine's key — the push lands under the host's identity and the whole
  *    attribution chain silently breaks.
  */
-export function gitIdentityConfigEnv(
+export function gitIdentityConfigPairs(
   askpassPath: string,
   host: string,
-): Record<string, string> {
-  const entries: Array<[string, string]> = [
+): Array<[string, string]> {
+  return [
     [`credential.https://${host}.helper`, `!f() { "${askpassPath}" "$@"; }; f`],
     [`url.https://${host}/.insteadOf`, `ssh://git@${host}/`],
     [`url.https://${host}/.insteadOf`, `git@${host}:`],
   ];
-  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(entries.length) };
-  entries.forEach(([key, value], i) => {
+}
+
+/**
+ * Encode {@link gitIdentityConfigPairs} as `GIT_CONFIG_*` env entries rather
+ * than writing a config file: they apply to this session's git only, leave the
+ * user's own `~/.gitconfig` untouched, and vanish with the process. Used by the
+ * direct-exec backends (PTY, env -i strict panes), which receive the child
+ * environment wholesale; the shell-wrapped backends instead rebuild the entries
+ * from the pair carrier.
+ */
+export function gitIdentityConfigEnv(
+  askpassPath: string,
+  host: string,
+): Record<string, string> {
+  return encodeGitConfigPairs(gitIdentityConfigPairs(askpassPath, host));
+}
+
+/**
+ * Encode turn-authored git `-c` pairs as the `GIT_CONFIG_*` env block
+ * (`GIT_CONFIG_COUNT` + contiguous 0..n-1 KEY/VALUE entries). The inverse of
+ * the pane-side rebuild in buildBotmuxEnvAssignments: direct-exec backends
+ * (PTY, env -i strict panes) consume the child environment wholesale, so the
+ * worker places exactly this encoded block there after wiping any ambient
+ * numbered git config entries.
+ */
+export function encodeGitConfigPairs(
+  pairs: ReadonlyArray<readonly [string, string]>,
+): Record<string, string> {
+  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(pairs.length) };
+  pairs.forEach(([key, value], i) => {
     env[`GIT_CONFIG_KEY_${i}`] = key;
     env[`GIT_CONFIG_VALUE_${i}`] = value;
   });
   return env;
+}
+
+/**
+ * Reset the whole git command-line config channel in a child environment to
+ * exactly the turn-authored `pairs`: every inherited
+ * GIT_CONFIG_COUNT/GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> is deleted first
+ * (nested CLIs and hooks share GIT_CONFIG_COUNT as an accumulator, so a
+ * spawned child can carry a pushed-up count and arbitrary high-index pairs),
+ * then the contiguous 0..n-1 block is published. With no authored pairs the
+ * channel is left empty rather than carrying an ambient count.
+ *
+ * This is the direct-exec counterpart of the shell pane carrier rebuild:
+ * PTY children and env -i strict panes inherit the environment wholesale, so
+ * the reset has to happen here, in the worker-built env.
+ */
+export function applyTurnGitConfigEnv(
+  env: NodeJS.ProcessEnv,
+  pairs: ReadonlyArray<readonly [string, string]>,
+): void {
+  for (const key of Object.keys(env)) {
+    if (key === 'GIT_CONFIG_COUNT' || GIT_CONFIG_PAIR_ENV_KEY.test(key)) delete env[key];
+  }
+  if (pairs.length) Object.assign(env, encodeGitConfigPairs(pairs));
+}
+
+/**
+ * The single wiring seam every CLI/engine spawn site must call to install the
+ * trigger-user identity: it prepares the wrapper env (PATH shim, askpass,
+ * wrappers) AND resets the git command-line config channel to the authored
+ * pair set in one step, returning that set so pane-style backends also carry
+ * it via SpawnOpts.gitConfigPairs.
+ *
+ * Keeping prepare + reset in ONE function is load-bearing: calling only
+ * prepareTriggerUserCliEnv leaves an inherited/pushed-up GIT_CONFIG_COUNT and
+ * ambient high-index pairs in the env (the field failure — git aborts or a
+ * foreign pair silently applies), which is what happened on the RPC
+ * app-server engineEnv path before it used this seam. Native-pane spawns,
+ * PTY, env -i strict panes and RPC app-servers all go through here.
+ */
+export function prepareTurnGitConfigEnv(
+  env: NodeJS.ProcessEnv,
+  sessionDataDir: string | undefined,
+  sessionId: string,
+  policy: TriggerUserAuthConfig | undefined,
+  log: (message: string) => void,
+  model: IdentityStorageModel,
+  execution?: { appId: string; ipcPort?: number },
+  options?: { canonicalPaths?: boolean },
+): Array<[string, string]> {
+  const pairs = prepareTriggerUserCliEnv(env, sessionDataDir, sessionId, policy, log, model, execution, options);
+  applyTurnGitConfigEnv(env, pairs);
+  return pairs;
 }
 
 /**
@@ -1222,7 +1355,12 @@ export function canonicalPathNearest(path: string): string {
  * Used before both native CLI and RPC app-server startup. In the proven model
  * no token is copied into the process environment or disk: the wrapper fetches
  * the current turn's identity from the daemon over the proven loopback channel
- * on each call; the single model keeps one daemon-written, turn-checked file. */
+ * on each call; the single model keeps one daemon-written, turn-checked file.
+ *
+ * Returns the git `-c` content pairs authored for THIS turn (empty when git
+ * attribution is not installed). Shell-wrapped backends must forward exactly
+ * that list via SpawnOpts.gitConfigPairs instead of reading GIT_CONFIG_* out
+ * of the environment. */
 export function prepareTriggerUserCliEnv(
   childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
@@ -1234,8 +1372,18 @@ export function prepareTriggerUserCliEnv(
    *  generated script must be the realpath or it is `not found` inside. Left
    *  off, nothing changes for unsandboxed sessions. */
   options?: { canonicalPaths?: boolean },
-): void {
-  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return;
+): Array<[string, string]> {
+  // Before anything else, including the early return below: a policy that is
+  // off now may have been on when this session last spawned.
+  if (sessionDataDir) {
+    try {
+      const removed = removeUngovernedIdentityWrappers(sessionDataDir, sessionId, policy);
+      if (removed.length) log(`[trigger-user-auth] removed wrappers no longer governed: ${removed.join(', ')}`);
+    } catch (e) {
+      log(`[trigger-user-auth] WARN could not remove ungoverned wrappers: ${(e as Error).message}`);
+    }
+  }
+  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return [];
   const canonicalPaths = options?.canonicalPaths === true;
   const inSessionPath = (p: string): string => {
     if (!canonicalPaths || !p.startsWith('/')) return p;
@@ -1245,6 +1393,8 @@ export function prepareTriggerUserCliEnv(
   childEnv.SESSION_DATA_DIR = sessionDataDir;
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);
+  // Turn-authored git -c pairs; returned to the caller for the pane carrier.
+  let gitConfigPairs: Array<[string, string]> = [];
   let identityResolver: string[] | undefined;
   if (model === 'proven' && process.platform === 'linux' && execution) {
     const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -1340,6 +1490,10 @@ export function prepareTriggerUserCliEnv(
         // breaks silently. Scoped via GIT_CONFIG_* env so the operator's own
         // ~/.gitconfig is never touched.
         if (policy.gitHost) {
+          gitConfigPairs = gitIdentityConfigPairs(askpass, policy.gitHost);
+          // Direct-exec backends (PTY, env -i strict panes) receive childEnv
+          // wholesale, so also publish the encoded entries there. The
+          // shell-wrapped backends rebuild them from the returned carrier.
           Object.assign(childEnv, gitIdentityConfigEnv(askpass, policy.gitHost));
           log(`[trigger-user-auth] git pushes to ${policy.gitHost} authenticate as the acting user`);
         } else {
@@ -1350,4 +1504,5 @@ export function prepareTriggerUserCliEnv(
       log(`[trigger-user-auth] WARN could not install the git credential helper: ${(e as Error).message}`);
     }
   }
+  return gitConfigPairs;
 }

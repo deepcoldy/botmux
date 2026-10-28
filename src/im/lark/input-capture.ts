@@ -18,11 +18,12 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
   if (parsed.senderType === 'app' || parsed.senderType === 'bot'
     || !parsed.senderId || knownBot(parsed.senderId)) return false;
   const attachments: CaptureAttachment[] = resources.map(resource => ({
-    messageId: resource.messageId ?? parsed.messageId, type: resource.type, key: resource.key,
+    messageId: resource.messageId ?? parsed.messageId, type: resource.type === 'video' ? 'media' : resource.type, key: resource.key,
   }));
   try {
     if (['audio', 'media'].includes(message.message_type)) {
-      attachments.push({ messageId: parsed.messageId, type: message.message_type, key: JSON.parse(message.content).file_key });
+      const key = JSON.parse(message.content).file_key;
+      if (!attachments.some(ref => ref.type === message.message_type && ref.key === key)) attachments.push({ messageId: parsed.messageId, type: message.message_type, key });
     }
     if (message.message_type === 'merge_forward') attachments.push({ messageId: parsed.messageId, type: 'merge_forward', key: parsed.messageId });
     if (message.message_type === 'post') {

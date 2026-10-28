@@ -27,6 +27,7 @@ import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
+import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -269,6 +270,8 @@ export interface GlobalConfig {
   skills?: GlobalSkillConfig;
   /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
   plugins?: string[];
+  /** Host-wide ceiling for per-plugin MCP tool calls. Missing defaults to 10 minutes. */
+  mcpGatewayMaxToolTimeoutMs?: number;
   /** 远程访问. When true (and this machine is bound to the central platform),
    *  session web-terminal links, Feishu card terminal buttons, and connector
    *  webhook URLs use the central-platform machine subdomain instead of local
@@ -912,6 +915,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (skills) out.skills = skills;
   const plugins = normalizePluginIdList(raw.plugins);
   if (plugins) out.plugins = plugins;
+  const mcpGatewayMaxToolTimeoutMs = normalizeMcpGatewayMaxToolTimeoutMs(raw.mcpGatewayMaxToolTimeoutMs);
+  if (mcpGatewayMaxToolTimeoutMs !== undefined) out.mcpGatewayMaxToolTimeoutMs = mcpGatewayMaxToolTimeoutMs;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
   // Lenient: keep any non-empty string. IANA validity is enforced on write and
   // re-checked in scheduleTimeZone() (invalid ⇒ falls back to the host zone),

@@ -24,6 +24,7 @@ const row = (sessionId: string, status: 'active' | 'closed') => ({
 function harness(data: string, own: string[] = []) {
   const sweepScratch = vi.fn(async () => [] as string[]);
   const sweepGateway = vi.fn(async () => [] as string[]);
+  const sweepRiffReceipts = vi.fn(async () => [] as string[]);
   const log = { info: vi.fn(), warn: vi.fn() };
   const sweep = createSessionRuntimeSweeper({
     dataDir: data,
@@ -31,9 +32,10 @@ function harness(data: string, own: string[] = []) {
     liveReferences: async () => new Set(),
     sweepScratch,
     sweepGateway,
+    sweepRiffReceipts,
     log,
   });
-  return { sweep, sweepScratch, sweepGateway, log };
+  return { sweep, sweepScratch, sweepGateway, sweepRiffReceipts, log };
 }
 
 describe('session runtime sweep (#1748)', () => {
@@ -41,13 +43,14 @@ describe('session runtime sweep (#1748)', () => {
     const data = dataDir();
     seedPersistedSessionRows(data, 'appA', { a1: row('a1', 'active'), a2: row('a2', 'closed') });
     seedPersistedSessionRows(data, 'appB', { b1: row('b1', 'active'), b2: row('b2', 'closed') });
-    const { sweep, sweepScratch, sweepGateway } = harness(data, ['mine-unflushed']);
+    const { sweep, sweepScratch, sweepGateway, sweepRiffReceipts } = harness(data, ['mine-unflushed']);
 
     await sweep();
 
     const expected = ['a1', 'b1', 'mine-unflushed'];
     expect([...(sweepScratch.mock.calls[0]?.[1] as Set<string>)].sort()).toEqual(expected);
     expect([...(sweepGateway.mock.calls[0]?.[1] as Set<string>)].sort()).toEqual(expected);
+    expect([...(sweepRiffReceipts.mock.calls[0]?.[1] as Set<string>)].sort()).toEqual(expected);
     expect(sweepScratch.mock.calls[0]?.[0]).toBe(data);
   });
 
@@ -56,12 +59,13 @@ describe('session runtime sweep (#1748)', () => {
     seedPersistedSessionRows(data, 'appB', { b1: row('b1', 'active') });
     mkdirSync(join(data, 'session-stores', 'appA'), { recursive: true });
     writeFileSync(join(data, 'session-stores', 'appA', 'sessions.db'), 'this is not a database');
-    const { sweep, sweepScratch, sweepGateway, log } = harness(data);
+    const { sweep, sweepScratch, sweepGateway, sweepRiffReceipts, log } = harness(data);
 
     await sweep();
 
     expect(sweepScratch).not.toHaveBeenCalled();
     expect(sweepGateway).not.toHaveBeenCalled();
+    expect(sweepRiffReceipts).not.toHaveBeenCalled();
     expect(log.warn).toHaveBeenCalledTimes(1);
   });
 

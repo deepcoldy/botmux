@@ -101,7 +101,17 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
   return env;
 }
 
-/** Explicit values still obey the mandatory CLI secret/session scrub. */
+/**
+ * Explicit values still obey the mandatory CLI secret/session scrub.
+ *
+ * This does NOT filter the git command-line config channel: a configured
+ * `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` passes
+ * through. Spawn paths that reach git must neutralize it afterwards —
+ * pane/PTY/strict do it in their own env builder, the identity-wrapped spawns
+ * and the RPC app-server via prepareTurnGitConfigEnv. Callers that hand this
+ * env to a direct git-running process without that step are known uncovered
+ * one-shot/probe paths (follow-up after #2203).
+ */
 export function botInjectedEnv(raw: unknown, policy?: EnvPolicy): Record<string, string> {
   const env = sanitizePerBotEnv(raw);
   return (policy?.mode === 'strict' ? redactChildEnv(env) : env) as Record<string, string>;
