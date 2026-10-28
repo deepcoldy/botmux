@@ -25,8 +25,9 @@
  * Keeping the directory lets `bytedcli` mint a fresh JWT per call and refresh
  * it internally; a person is only interrupted when the 3-week login really ends.
  *
- * So: nothing in this module holds a credential. It holds a path, and shells
- * out to `bytedcli` with `HOME` set to it. When a governed call finds no usable
+ * Credentials originate in that private HOME; a short-lived in-memory regional
+ * cache is cleared on logout and used only after a fresh personal-login check.
+ * The module shells out to `bytedcli` with `HOME` set to it. When a governed call finds no usable
  * login, Botmux starts the device flow automatically; after the person opens
  * that link, the next retry completes the saved challenge before minting JWTs.
  */
@@ -166,6 +167,10 @@ export async function describeBytedcliAuth(openId: string): Promise<{
 
 /** Forget one person's bytedcli authorization entirely. */
 export function clearBytedcliAuth(openId: string): void {
+  authEpochs.set(openId, authEpoch(openId) + 1);
+  minting.delete(openId);
+  renewing.delete(openId);
+  forgetRegionalJwts(openId);
   try { rmSync(bytedcliHomeFor(openId), { recursive: true, force: true }); }
   catch { /* best-effort: absence is the desired state */ }
 }
@@ -386,7 +391,24 @@ export interface BytedcliJwts {
   cloudJwt: string;
   /** Git pushes authenticate with this one, so commit attribution follows it. */
   codeJwt?: string;
+  /** ByteCloud JWTs for non-default regions, keyed by region. */
+  regionalCloudJwts?: BytedcliRegionalJwts;
 }
+
+/**
+ * ByteCloud JWTs are partition-scoped: the default (cn) token is rejected by
+ * i18n services with `invalid jwt token ... partition i18n`. Each entry names
+ * the region and one `--site` that mints its token; the wrapper maps every
+ * `--site` value onto these regions (see renderIdentityWrapper).
+ */
+export const BYTEDCLI_REGIONAL_SITES = [
+  // `--site i18n` itself was measured minting an i18nbd-region token.
+  ['i18n', 'i18n-tt'],
+  ['i18nbd', 'i18n-bd'],
+  ['tx', 'us-ttp'],
+] as const;
+export type BytedcliRegion = typeof BYTEDCLI_REGIONAL_SITES[number][0];
+export type BytedcliRegionalJwts = Partial<Record<BytedcliRegion, string>>;
 
 /**
  * Mint this person's JWTs for the current turn.
@@ -409,22 +431,134 @@ export interface BytedcliJwts {
  * the poll outcome, fall through and let the HOME / JWT read be the authority.
  */
 const minting = new Map<string, Promise<BytedcliJwts | null>>();
-
-export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
-  const existing = minting.get(openId);
-  if (existing) return existing;
-  const work = mintJwts(openId);
-  minting.set(openId, work);
-  try { return await work; } finally { minting.delete(openId); }
+const authEpochs = new Map<string, number>();
+// Epoch invalidation must not release the HOME's operation lock while an old
+// provider child can still write its SDK cache.
+const credentialWork = new Map<string, Promise<BytedcliJwts | null>>();
+function serializedCredentialWork(openId: string, run: () => Promise<BytedcliJwts | null>): Promise<BytedcliJwts | null> {
+  const previous = credentialWork.get(openId);
+  const work = (async () => { await previous?.catch(() => null); return await run(); })();
+  credentialWork.set(openId, work);
+  return work;
 }
 
-async function mintJwts(openId: string): Promise<BytedcliJwts | null> {
+function authEpoch(openId: string): number { return authEpochs.get(openId) ?? 0; }
+
+/**
+ * Regional JWTs reused while they keep at least half an hour of life. A fresh
+ * mint gains nothing earlier: bytedcli serves its own disk-cached token until
+ * that nears expiry, so re-asking every turn only adds CLI round trips — and
+ * stretches the window in which a turn's identity is not yet published. Reuse
+ * needs this turn's default mint to have just confirmed the login is live.
+ */
+const regionalJwtCache = new Map<string, { jwt: string; expiresAtMs: number }>();
+const REGIONAL_JWT_REUSE_MARGIN_MS = 30 * 60_000;
+
+function jwtClaims(jwt: string): { exp?: unknown; region?: unknown } | null {
+  try {
+    return JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+async function regionalCloudJwt(
+  openId: string, region: BytedcliRegion, site: string, forceRefresh = false, epoch = authEpoch(openId),
+): Promise<string | null> {
+  if (epoch !== authEpoch(openId)) return null;
+  const key = `${openId}\0${region}`;
+  const cached = regionalJwtCache.get(key);
+  if (!forceRefresh && cached && cached.expiresAtMs - Date.now() > REGIONAL_JWT_REUSE_MARGIN_MS) return cached.jwt;
+  regionalJwtCache.delete(key);
+  const result = await runAsUser(openId, [
+    '--site', site, 'auth', 'get-bytecloud-jwt-token', ...(forceRefresh ? ['--force-refresh'] : []),
+  ]);
+  if (epoch !== authEpoch(openId)) return null;
+  const jwt = result.ok ? result.stdout.trim() : '';
+  const claims = jwt && !/\s/.test(jwt) ? jwtClaims(jwt) : null;
+  // A token for another partition would only move the failure; keep the default.
+  if (!claims || claims.region !== region) {
+    logger.debug(`[bytedcli-auth] no ${region} ByteCloud JWT for ${openId}; that region keeps the default token`);
+    return null;
+  }
+  if (typeof claims.exp === 'number') regionalJwtCache.set(key, { jwt, expiresAtMs: claims.exp * 1_000 });
+  return jwt;
+}
+
+function forgetRegionalJwts(openId: string): void {
+  for (const key of regionalJwtCache.keys()) {
+    if (key.startsWith(`${openId}\0`)) regionalJwtCache.delete(key);
+  }
+}
+
+export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
+  const epoch = authEpoch(openId);
+  const existing = minting.get(openId);
+  if (existing) return existing;
+  const work = serializedCredentialWork(openId, async () =>
+    epoch === authEpoch(openId) ? await mintJwts(openId, epoch) : null);
+  minting.set(openId, work);
+  try { const result = await work; return epoch === authEpoch(openId) ? result : null; }
+  finally {
+    if (minting.get(openId) === work) minting.delete(openId);
+    if (credentialWork.get(openId) === work) credentialWork.delete(openId);
+  }
+}
+
+const renewing = new Map<string, Promise<BytedcliJwts | null>>();
+
+/**
+ * Force-refresh one person's ByteCloud JWTs for a turn that outlives them.
+ *
+ * Turn publication mints once, and a ByteCloud JWT lives ~2h, so a long job
+ * started by one turn would otherwise hit 401 mid-run. The login behind the
+ * JWT (~30 days) is unchanged; this only asks the SDK for a new access token.
+ * Null when no fresh default token could be obtained.
+ */
+export async function renewBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
+  const epoch = authEpoch(openId);
+  const existing = renewing.get(openId);
+  if (existing) return existing;
+  const work = serializedCredentialWork(openId, async () =>
+    epoch === authEpoch(openId) ? await renewJwts(openId, epoch) : null);
+  renewing.set(openId, work);
+  try { const result = await work; return epoch === authEpoch(openId) ? result : null; }
+  finally {
+    if (renewing.get(openId) === work) renewing.delete(openId);
+    if (credentialWork.get(openId) === work) credentialWork.delete(openId);
+  }
+}
+
+async function renewJwts(openId: string, epoch: number): Promise<BytedcliJwts | null> {
+  if (!(await readLoginState(openId)).authenticated || epoch !== authEpoch(openId)) return null;
+  const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token', '--force-refresh']);
+  if (epoch !== authEpoch(openId)) return null;
+  const cloudJwt = cloud.ok ? cloud.stdout.trim() : '';
+  if (!cloudJwt || /\s/.test(cloudJwt)) return null;
+  const code = await runAsUser(openId, ['auth', 'get-codebase-jwt-token']);
+  if (epoch !== authEpoch(openId)) return null;
+  const codeJwt = code.ok ? code.stdout.trim() : '';
+  const regionalCloudJwts: BytedcliRegionalJwts = {};
+  for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
+    const jwt = await regionalCloudJwt(openId, region, site, true, epoch);
+    if (epoch !== authEpoch(openId)) return null;
+    if (jwt) regionalCloudJwts[region] = jwt;
+  }
+  return {
+    cloudJwt,
+    ...(codeJwt && !/\s/.test(codeJwt) ? { codeJwt } : {}),
+    ...(Object.keys(regionalCloudJwts).length ? { regionalCloudJwts } : {}),
+  };
+}
+
+async function mintJwts(openId: string, epoch: number): Promise<BytedcliJwts | null> {
   const challenge = pendingBytedcliChallenge(openId);
   if (challenge) {
     await completeBytedcliLogin(openId, challenge);
   }
-  if (!(await readLoginState(openId)).authenticated) return null;
+  if (epoch !== authEpoch(openId) || !(await readLoginState(openId)).authenticated || epoch !== authEpoch(openId)) return null;
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
+  if (epoch !== authEpoch(openId)) return null;
   const cloudJwt = cloud.stdout.trim();
   if (!cloud.ok || !cloudJwt) {
     throw new BytedcliAuthUnavailableError('mint personal JWT');
@@ -432,9 +566,23 @@ async function mintJwts(openId: string): Promise<BytedcliJwts | null> {
   // The Codebase JWT is optional: without it lark/bytedcli calls still work and
   // only git attribution degrades, so a failure here must not deny the turn.
   const code = await runAsUser(openId, ['auth', 'get-codebase-jwt-token']);
+  if (epoch !== authEpoch(openId)) return null;
   const codeJwt = code.ok ? code.stdout.trim() : '';
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
   }
-  return { cloudJwt, ...(codeJwt ? { codeJwt } : {}) };
+  // Regional tokens are best-effort like the Codebase JWT: without one, that
+  // region's calls keep the default token. Minted one at a time — concurrent
+  // mints against the same HOME were measured returning another region's token.
+  const regionalCloudJwts: BytedcliRegionalJwts = {};
+  for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
+    const jwt = await regionalCloudJwt(openId, region, site, false, epoch);
+    if (epoch !== authEpoch(openId)) return null;
+    if (jwt) regionalCloudJwts[region] = jwt;
+  }
+  return {
+    cloudJwt,
+    ...(codeJwt ? { codeJwt } : {}),
+    ...(Object.keys(regionalCloudJwts).length ? { regionalCloudJwts } : {}),
+  };
 }

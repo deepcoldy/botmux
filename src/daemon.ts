@@ -558,6 +558,7 @@ import {
 } from './core/session-manager.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
+import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
@@ -32951,6 +32952,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const sessionRuntimeSweepTimer = setInterval(() => { void sweepSessionRuntimeDirs(); }, 30 * 60_000);
   sessionRuntimeSweepTimer.unref?.();
   void sweepSessionRuntimeDirs();
+  // A turn mints its bytedcli identity once, but ByteCloud JWTs live ~2h; keep
+  // long-running turns (nightly jobs, backfills) on fresh tokens of the same person.
+  const bytedcliRenewalTimer = setInterval(() => {
+    void renewExpiringBytedcliIdentities().catch(err =>
+      logger.warn(`[bytedcli-renewal] sweep failed: ${err?.message ?? err}`));
+  }, BYTEDCLI_RENEWAL_SWEEP_MS);
+  bytedcliRenewalTimer.unref?.();
 
   // v3 humanGate cold-attach: re-post pending gate cards + resume healed gates
   // for runs OWNED BY THIS BOT (codex blocker #1 — owner filter, mirrors
@@ -33493,6 +33501,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(grantExpirySweepTimer);
+    clearInterval(bytedcliRenewalTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
     // rows into this cache and persist them below. Extend it once here (the
@@ -33761,6 +33770,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(grantExpirySweepTimer);
+    clearInterval(bytedcliRenewalTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
