@@ -2,6 +2,17 @@ import type { AskQuestion } from './ask-types.js';
 
 export const hasAskForm = (questions: ReadonlyArray<AskQuestion>): boolean => questions.some(q => !!q.input);
 
+/** Count CHARACTERS (Unicode code points), matching the Feishu client's
+ *  `max_length` accounting. `string.length` counts UTF-16 code units, so a
+ *  surrogate-pair character (emoji / rare CJK) counts double and the daemon
+ *  would reject input the client accepted and let the user submit. */
+const charCount = (text: string): number => {
+  let n = 0;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  for (const _ of text) n += 1;
+  return n;
+};
+
 /** Untrusted callback values are validated against the registered questions,
  * never defaults or client-provided question/field definitions. */
 export function parseAskFormValues(questions: ReadonlyArray<AskQuestion>, raw: unknown): {
@@ -20,13 +31,13 @@ export function parseAskFormValues(questions: ReadonlyArray<AskQuestion>, raw: u
       const rawText = typeof value === 'string' ? value : '';
       const text = q.input.type === 'number' ? rawText.trim() : rawText;
       const present = text.trim().length > 0;
-      if ((!present && q.input.required !== false) || text.length > (q.input.maxLength ?? 1000)) return null;
+      if ((!present && q.input.required !== false) || charCount(text) > (q.input.maxLength ?? 1000)) return null;
       if (present && q.input.type === 'number') {
         const n = Number(text);
         if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text) || !Number.isFinite(n)
           || (q.input.min !== undefined && n < q.input.min) || (q.input.max !== undefined && n > q.input.max)) return null;
       }
-      total += text.length;
+      total += charCount(text);
       // Defense in depth for direct callers: HTTP/CLI schemas already cap a
       // form at 20 fields × 1000 characters, so they cannot reach this budget.
       if (total > 32768) return null;

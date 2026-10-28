@@ -70,6 +70,14 @@ describe('form schema and callback validation', () => {
     { q0: 'no', q1: 0.5 }, { q0: 'no', q1: '21' }, { q0: 'no', q1: '1', q2: 'x'.repeat(51) },
     { ...values, q99: 'extra' }, { ...values, q01: 'alias' },
   ])('rejects missing/invalid/unknown form values %j', values => expect(parseAskFormValues(questions, values)).toBeNull());
+  it('counts text length by code point, matching the client max_length character rule', () => {
+    const field = (maxLength: number): AskQuestion[] => [{ prompt: 'N', options: [], multiSelect: false, input: { type: 'text', maxLength } }];
+    const emoji1000 = '😀'.repeat(1000); // 1000 characters but 2000 UTF-16 units
+    expect(parseAskFormValues(field(1000), { q0: emoji1000 })?.inputs[0]).toBe(emoji1000);
+    expect(parseAskFormValues(field(1000), { q0: '😀'.repeat(1001) })).toBeNull();
+    expect(parseAskFormValues(field(1000), { q0: '汉'.repeat(1000) })).not.toBeNull();
+    expect(parseAskFormValues(field(1000), { q0: '汉'.repeat(1001) })).toBeNull();
+  });
   it('supports standalone text, optional fields and multiselect without inferred defaults', () => {
     const qs: AskQuestion[] = [{ prompt: 'Details', options: [], multiSelect: false, input: { type: 'text' } },
       { prompt: 'Checks', multiSelect: true, options: questions[0].options, defaultSelectedKeys: ['yes'] }];
