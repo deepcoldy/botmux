@@ -139,7 +139,7 @@ describe('normalizeDshCotMarker', () => {
   });
 
   it.each([
-    null, [], 'invalid', {}, new Date(),
+    null, [[]], 'invalid', {}, new Date(),
     Object.create({ entries: [thinking] }),
     { entries: [thinking], turnId: 'injected' },
     { entries: [] }, { entries: 'invalid' },
