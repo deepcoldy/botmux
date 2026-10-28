@@ -9112,7 +9112,7 @@ async function notifyAsyncAsk(ds: DaemonSession, root: string | null, turnId: st
   } catch (error) { logger.warn(`[ask:${ds.session.sessionId}] could not show async question notice: ${String(error)}`); }
 }
 
-ipcRoute('POST', '/api/asks', async (req, res) => {
+const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   let raw: unknown;
   try {
     raw = await readJsonBody<unknown>(req);
@@ -9283,8 +9283,8 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
-    ...((documentDelivery?.openId ?? asyncCaller)
-      ? { answererOpenId: documentDelivery?.openId ?? asyncCaller } : {}),
+    ...((documentDelivery?.openId ?? asyncCaller ?? boundAsk.answererOpenId)
+      ? { answererOpenId: documentDelivery?.openId ?? asyncCaller ?? boundAsk.answererOpenId } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the
     // authenticated session's FROZEN backend, not the client's origin string. A
     // PTY-backed session dies with the daemon, so its ask must NOT persist; only
@@ -9426,7 +9426,9 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   }
 
   return jsonRes(res, 200, result);
-});
+};
+ipcRoute('POST', '/api/asks', handleAskRequest);
+ipcRoute('POST', '/api/asks/form-v1', handleAskRequest);
 
 // ─── attention IPC route (internal: set needs-you state) ─────────────────────
 //

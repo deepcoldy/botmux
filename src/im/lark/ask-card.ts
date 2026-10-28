@@ -1,3 +1,5 @@
+import { hasAskForm } from '../../core/ask-form.js';
+import { buildAskFormElements } from './ask-form-elements.js';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,7 +12,7 @@ import type {
   PendingAsk,
 } from '../../core/ask-types.js';
 import { AskDispatchError } from '../../core/ask-types.js';
-import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
+import { getAskSnapshot, submitAsk, submitAskForm, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
@@ -27,8 +29,9 @@ export const ASK_SELECT_ACTION = 'ask_select';
 /** 新多问 Submit 动作（form 内提交按钮携带此 action）。 */
 export const ASK_SUBMIT_ACTION = 'ask_submit';
 
-/** 累积勾选动作。飞书会 silent-drop form + select_static，所以 v0.1.8 用按钮态。 */
+/** 旧 Card 1.0 的累积勾选动作；输入表单使用独立 Card 2.0 提交。 */
 export const ASK_TOGGLE_ACTION = 'ask_toggle';
+export const ASK_FORM_ACTION = 'ask_form_submit';
 
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
@@ -206,7 +209,7 @@ export function classifyAskDispatchError(err: unknown): { retryable: boolean; de
 }
 
 export function isAskCardAction(action?: string): boolean {
-  return action === ASK_SELECT_ACTION || action === ASK_SUBMIT_ACTION || action === ASK_TOGGLE_ACTION;
+  return action === ASK_SELECT_ACTION || action === ASK_SUBMIT_ACTION || action === ASK_TOGGLE_ACTION || action === ASK_FORM_ACTION;
 }
 
 export async function handleAskCardAction(
@@ -233,9 +236,18 @@ export async function handleAskCardAction(
   /** unauthorized 不再是死胡同：复用对话路径的授权卡向 owner 申请，toast 告诉点击者
    *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
   const outcomeResponse = (outcome: AskClickOutcome) =>
-    outcome === 'unauthorized'
+    outcome === 'unauthorized' && (!pending?.answererOpenId || pending.answererOpenId === by)
       ? escalateUnauthorized(askId, nonce, by, locale, deps)
       : toastForOutcome(outcome, locale);
+
+  if (action === ASK_FORM_ACTION) {
+    const outcome = submitAskForm({ askId, nonce, by, values: data.action?.form_value });
+    if (outcome !== 'accepted') return outcomeResponse(outcome);
+    const result = getAskSnapshot(askId)?.result;
+    return result ? settledCardResponse(askId, result) : undefined;
+  }
+  // Stale controls from another presentation cannot reset a user's form draft.
+  if (pending && hasAskForm(pending.questions)) return staleToast(locale);
 
   // 旧单选即答路径：按钮直接携带 key，调用 tryResolveAsk（单问单选便捷封装）。
   // accepted 时直接返回终态卡片，让飞书在回调响应里同步替换——不依赖 onSettle 异步 PATCH
@@ -361,8 +373,8 @@ function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArme
  *   - 单问单选：每个选项一个按钮，点击即 settle（旧 ask_select 语义）
  *   - 多问或多选：每个选项一个按钮用于累积勾选，最后用 Submit settle
  *
- * 注意：飞书服务端会 silent-drop `form` 内的 select_static / multi_select_static，
- * 所以这里只使用稳定的 `action` + `button` 结构。
+ * 旧 Card 1.0 选择卡保留稳定的 action + button 结构；
+ * 显式输入表单改用 Card 2.0 form，一次提交选项和输入。
  *
  * 已 settle 时：渲染状态摘要，展示每问的选中标签（answered），或超时/失效信息。
  */
@@ -458,6 +470,12 @@ function renderAskCardWithCap(
   promptCap: number,
 ): string {
   const locale = localeForBot(ask.larkAppId);
+  if (hasAskForm(ask.questions)) {
+    const capped = { ...ask, questions: ask.questions.map(q => ({ ...q, prompt: capPrompt(q.prompt, promptCap, locale) })) };
+    return JSON.stringify({ schema: '2.0', config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: 'botmux ask' }, template: result ? 'grey' : 'blue' },
+      body: { elements: buildAskFormElements(capped, locale, result, Math.min(300, promptCap)) } });
+  }
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
@@ -726,6 +744,8 @@ function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { 
     case 'toggled':
       // 累积勾选，不弹 toast
       return undefined;
+    case 'invalid_form':
+      return { toast: { type: 'warning', content: locale === 'en' ? 'Complete the required fields and check their formats; your draft is unchanged.' : '请补齐必填项并检查格式；已填内容保留，尚未提交。' } };
     case 'needs_empty_confirm':
       // 正常路径由 handleAskCardAction 提前拦成 arm 卡片响应，不会走到这里；
       // 兜底给个 warning toast，避免静默。
