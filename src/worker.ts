@@ -15191,8 +15191,16 @@ function restoreCodexAppAttestedTurn(
 ): void {
   if (currentBotmuxTurnId || !control || !codexAppRunnerProcessIdentity || codexAppCompletionAwaitingFinal
       || typeof signedTurnId !== 'string' || !signedTurnId
-      || !codexAppGenerationCommits.some(commit => commit.generation === control.generation
-        && control.seq > commit.committedThrough)) return;
+      || !codexAppControlProven || codexAppControlStateValue?.status !== 'active'
+      || codexAppControlStateValue.identities.length !== 1
+      || codexAppControlStateValue.identities[0].generation !== control.generation
+      || !Number.isSafeInteger(control.seq) || control.seq <= 0
+      || control.seq <= (codexAppGenerationCommits.find(
+        commit => commit.generation === control.generation,
+      )?.committedThrough ?? 0)) return;
+  // A generation's first native turn has no committed final yet. Its ACK
+  // high-water is zero, not an absent authentication proof: the live signed
+  // control generation above and exact durable reservation below prove that.
   const prepared = codexAppRecoveredDispatches.filter(entry => entry.state === 'prepared');
   const reservations = codexAppTurnDispatchQueue.recoveredPrefix();
   if (prepared.length !== 1 || reservations.length !== 1) return;

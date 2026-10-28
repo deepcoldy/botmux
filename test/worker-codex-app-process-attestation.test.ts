@@ -136,6 +136,8 @@ describe('authenticated Codex App turn recovery', () => {
     const scope: Record<string, any> = {
       currentBotmuxTurnId: undefined, codexAppRunnerProcessIdentity: { enginePid: 70 },
       codexAppCompletionAwaitingFinal: false,
+      codexAppControlProven: true,
+      codexAppControlStateValue: { status: 'active', identities: [{ generation: 'g1' }] },
       codexAppGenerationCommits: [{ generation: 'g1', committedThrough: 5 }],
       codexAppRecoveredDispatches: [entry],
       codexAppTurnDispatchQueue: { recoveredPrefix: () => [entry] },
@@ -154,6 +156,31 @@ describe('authenticated Codex App turn recovery', () => {
     }));
     expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
   });
+  it.each([1, 250])('restores an unfinished first turn with no committed final (sequence %i)', seq => {
+    const { scope, restore } = recoveryFixture();
+    scope.codexAppGenerationCommits = [];
+    restore('om_original', { generation: 'g1', seq });
+    expect(scope.adoptInitialActiveTurn).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'om_original' }));
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+  });
+  it.each(['unproven', 'missing-state', 'pending', 'multiple-identities', 'zero', 'negative', 'fractional', 'nan']) (
+    'does not infer authentication from an empty commit history: %s', reason => {
+      const { scope, restore } = recoveryFixture();
+      scope.codexAppGenerationCommits = [];
+      let seq = 1;
+      if (reason === 'unproven') scope.codexAppControlProven = false;
+      if (reason === 'missing-state') scope.codexAppControlStateValue = undefined;
+      if (reason === 'pending') scope.codexAppControlStateValue.status = 'pending';
+      if (reason === 'multiple-identities') scope.codexAppControlStateValue.identities.push({ generation: 'g2' });
+      if (reason === 'zero') seq = 0;
+      if (reason === 'negative') seq = -1;
+      if (reason === 'fractional') seq = 1.5;
+      if (reason === 'nan') seq = NaN;
+      restore('om_original', { generation: 'g1', seq });
+      expect(scope.adoptInitialActiveTurn).not.toHaveBeenCalled();
+      expect(scope.publishSandboxRelayCapability).not.toHaveBeenCalled();
+    },
+  );
   it.each(['dispatchId', 'turnId', 'dispatchAttempt'])('rejects a reservation with a mismatched %s', field => {
     const { entry, scope, restore } = recoveryFixture();
     scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [{ ...entry,
@@ -175,7 +202,7 @@ describe('authenticated Codex App turn recovery', () => {
     'ambiguous', 'reservation', 'callerless', 'bot', 'sender'])('does not recover ambiguous or unproven authority: %s', reason => {
     const { entry, scope, restore } = recoveryFixture();
     if (reason === 'active') scope.currentBotmuxTurnId = 'om_current';
-    if (reason === 'generation') scope.codexAppGenerationCommits = [];
+    if (reason === 'generation') scope.codexAppControlStateValue.identities[0].generation = 'g2';
     if (reason === 'old-sequence') scope.codexAppGenerationCommits[0].committedThrough = 6;
     if (reason === 'unfinished-final') scope.codexAppCompletionAwaitingFinal = true;
     if (reason === 'engine') scope.codexAppRunnerProcessIdentity = undefined;

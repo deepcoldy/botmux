@@ -2,7 +2,7 @@
 
 Codex App 的独立 runner 通过已认证的签名 state 上报原生 app-server 的 PID 与启动时间；worker 再核对本会话 backend 血缘及继承的 RPC stdin/stdout 管道，随后沿私有 IPC 发布引擎根。npm 的 Node 启动器不再造成跨轮工具被误判。接管旧 runner 时，只在签名通道认证后识别同一可执行文件、同一 session 的唯一 runner 及其直接启动的 RPC 子进程；歧义或无法证明时仍拒绝。普通 busy/idle 不重新快照正在执行的工具。引擎空闲退出后，runner 在新引擎投递原生轮次前发布签名的 `idle_restart` 边界；只有旧引擎已退出、没有待收尾 final 且新身份重新通过内核和 stdio 验证时，worker 才更新引擎根，不发布额外 prompt-ready。旧工具和旧代次不能获得新轮权限。
 
-worker 重建后，只有存活 runner 的签名代次匹配 daemon 持久 ACK 记录、签名序号越过原 ACK、引擎已证明，且 runner 签名的精确 reply turn 与 daemon 下发的唯一 prepared 记录及恢复队列匹配时，才恢复该记录中的真人轮次。新 runner 在原生 busy state 中上报 `activeReplyTurnId`；旧 runner 可沿已有 thinking 记录的签名 turn 恢复，单凭 busy 不足以恢复。真人来源必须由 daemon 冻结的普通交互标记和 sender 共同证明；不使用 PID marker、最新聊天发送人、callerless/机器人记录或有歧义的队列补身份。
+worker 重建后，只有存活 runner 已通过本次 challenge 且为唯一 active 签名代次、正整数签名序号越过该代次的 daemon 持久 ACK（首轮尚无完成记录时高水位为 0）、引擎已证明，且 runner 签名的精确 reply turn 与 daemon 下发的唯一 prepared 记录及恢复队列匹配时，才恢复该记录中的真人轮次。新 runner 在原生 busy state 中上报 `activeReplyTurnId`；旧 runner 可沿已有 thinking 记录的签名 turn 恢复，单凭 busy 不足以恢复。真人来源必须由 daemon 冻结的普通交互标记和 sender 共同证明；不使用 PID marker、最新聊天发送人、callerless/机器人记录或有歧义的队列补身份。
 
 `botmux execution current --json` 返回调用工具进程所属的当前执行。适用于本机 Linux 的普通消息与机器 Trigger；不要求该轮存在真人 caller 或已验证邮箱。
 
