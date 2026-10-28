@@ -79,6 +79,18 @@
 - 来源仍必须是宿主认证的 live turn，并遵守输出位置、协作准入及实际消息签名绑定。
   不要求该 turn 是人发起；主控的外部事件、机器人派单或 report 轮次均可命中。
   管理员授予的是来源机器人本身的调度能力，所以其可接受输入的对话/触发策略也应配置妥当。
+- 来源 Bot 管理员本人驱动的轮次（当前轮次，或重启后从回复登记恢复的轮次）不使用服务
+  授权：签名身份、即时工具委派和 schedule:create 规则与未配置 grant 时完全一致。普通
+  派单与 `--no-delegate schedule:create` 不带 schedule:create；`--delegate schedule:create`
+  走管理员本人的 v2 委托，capability 不带 `botGrantId`。
+- 匹配维度只有来源 app、全部目标 app 和群，不看是谁驱动了来源轮次。因此在已授权的群里，
+  任何能和来源 Bot 对话、但不是其管理员的真人，派单也会拿到服务授权：签名身份换成
+  `controllerUnionId` 对应的管理员，不带个人工具凭据，并默认请求 schedule:create，任务
+  控制人落成该管理员。这个人自己的即时工具委派在这次派单里不会带上；需要时单次加
+  `--no-delegate schedule:create`，派单按其本人身份和工具委派签发。配置 grant 前应确认
+  该群里哪些人能驱动来源 Bot。
+- 每次使用服务授权都会记一条 `[schedule-delegation:audit]` 日志，包含 grant id、实际
+  驱动轮次的来源类型与 open_id，以及签名身份（sponsor），可据此回溯任务的真实触发者。
 - 新能力不传递控制管理员的即时工具身份，`tools` 与持久 `runScopes` 均为空。
   它只解决 BotMux 调度；需要个人 API 凭据的查询仍按原工具身份策略单独授权，
   不会自动获得审批、合并或生产部署权限。
@@ -88,8 +100,10 @@
 - 权威任务记录的 grant_id 保存 `bot-policy` 来源和策略标识。后续派单使用主控自己
   当前的配置重新签发，不把上游 capability 当作可无限转授的凭证。
 - 开启 selfManageEnabled 后，服务授权任务可在自己的定时轮次中 pause/remove；
-  同一目标机器人还可在原群、原话题的后续轮次中 pause/remove 自己的此类任务，
-  包括已暂停任务。跨话题、旧任务、update/resume/run 均不因此放权。
+  同一目标机器人还可在原群、原话题后续的 **bot 轮次**（由机器人消息触发，如主控再次
+  派单）中 pause/remove 自己的此类任务，包括已暂停任务。同一话题里的真人不因此放权：
+  Bot 管理员照常经当前真人管理员路径管理，其他人返回 403。跨话题、旧任务、
+  update/resume/run 均不因此放权。
 - 已有 direct/legacy/旧 delegated 任务不自动升级，旧任务清理仍按其原授权处理。
 
 配置仅属于同一宿主信任域；跨部署不共享签名存储时不适用。PR 不修改实际团队授权

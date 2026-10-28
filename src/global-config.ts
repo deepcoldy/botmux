@@ -181,10 +181,9 @@ export interface SessionCleanupGlobalConfig {
   intervalMinutes?: number;
 }
 
-/** Host policy for delegating creation of persistent scheduled work across bots.
- * Creation is opt-in and independent from triggerUserAuth.  Disabling execution
- * is a separate emergency revocation switch so stopping new grants does not
- * silently change the meaning of already committed tasks. */
+/** Host service authority letting one bot request schedule:create for others,
+ * without a human administrator driving the turn. It conveys scheduling only:
+ * no personal tool credentials, no persistent run scopes. */
 export interface ScheduleBotGrant {
   /** Stable host-managed grant id; never supplied by a worker. */
   id: string;
@@ -195,10 +194,25 @@ export interface ScheduleBotGrant {
   controllerUnionId: string;
 }
 
+/** Host policy for delegating creation of persistent scheduled work across bots.
+ * Creation is opt-in and independent from triggerUserAuth.  Disabling execution
+ * is a separate emergency revocation switch so stopping new grants does not
+ * silently change the meaning of already committed tasks. */
 export interface ScheduleDelegationGlobalConfig {
-  /** Explicit bot service authority, including bot/report-triggered source turns. Default empty. */
+  /** Explicit bot service grants. Default empty; effective only while
+   *  `createEnabled` is on. A grant matches on source app, every target app and
+   *  chat — not on who drives the source turn. The dispatch route sets it aside
+   *  only for a source-bot administrator's own turn, which keeps its own
+   *  identity and rules. Every other turn in a granted chat gets it: bot,
+   *  report and scheduled turns, and also any person who is not an
+   *  administrator but can talk to the source bot there. Their dispatch is then
+   *  signed for `controllerUnionId` with no personal tool credentials, and
+   *  requests schedule:create unless it passes `--no-delegate schedule:create`. */
   botGrants?: ScheduleBotGrant[];
-  /** Allow schedule:create via a direct human or explicit bot grant. Default off. */
+  /** Allow schedule:create via a current human administrator or an explicit
+   *  bot grant. Default off. Turning it off also stops later admission of
+   *  already committed bot-grant tasks (their grant no longer matches);
+   *  `runEnabled` remains the one emergency stop for every delegated task. */
   createEnabled?: boolean;
   /** Allow already committed delegated schedules to run. Missing means on. */
   runEnabled?: boolean;

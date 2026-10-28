@@ -269,12 +269,91 @@ describe('dispatch user IPC end-to-end identity binding', () => {
   });
   it('does not accept a non-admin sponsor for a host bot grant', async () => {
     const h = harness();
+    h.ds.activeInteractiveTurn = { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } };
     h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
       botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
         chatIds: ['oc_target'], controllerUnionId: 'on_sponsor' }] } });
     h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_other' }));
     expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_controller_denied' } });
     expect(h.send).not.toHaveBeenCalled();
+  });
+  describe('host bot grant versus the person driving the source turn', () => {
+    // The sponsor resolves to a second, real administrator: had the grant
+    // replaced the dispatch, the signed record would carry ou_sponsor/on_sponsor
+    // and no tools instead of the caller's own identity.
+    const withGrant = (h: ReturnType<typeof harness>, grant: boolean) => {
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
+        ...(grant ? { botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+          chatIds: ['oc_target'], controllerUnionId: 'on_sponsor' }] } : {}) } });
+      h.scope.getDashboardAdminOpenIds = () => ['ou_alice', 'ou_sponsor'];
+      h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_sponsor' }));
+    };
+    const flags = {
+      plain: {}, delegate: { delegateScheduleCreate: true }, 'no-delegate': { suppressScheduleCreate: true },
+    } as const;
+    const cells = (['plain', 'delegate', 'no-delegate'] as const)
+      .flatMap(flag => [true, false].map(grant => [flag, grant] as const));
+
+    it.each(cells)('keeps an administrator\'s own %s dispatch unchanged (grant configured: %s)', async (flag, grant) => {
+      const h = harness(flags[flag]);
+      withGrant(h, grant);
+      expect((await h.run()).status).toBe(200);
+      const payload = await read();
+      expect(payload?.authority).toMatchObject({
+        appId: 'cli_source', openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'],
+      });
+      const caps = scheduleCreateCapabilities(payload!.authority);
+      if (flag === 'delegate') {
+        // schedule:create comes from the administrator's own v2 delegation.
+        expect(caps).toEqual([expect.objectContaining({ action: 'schedule:create', targetAppId: 'cli_target',
+          targetChatId: 'oc_target', allowSelfManage: true })]);
+        expect(caps[0].botGrantId).toBeUndefined();
+      } else {
+        expect(caps).toEqual([]);
+      }
+      expect(h.scope.resolveTargetAppOpenId).not.toHaveBeenCalled();
+    });
+
+    it('keeps an administrator\'s restored turn on their own identity too', async () => {
+      const h = harness();
+      withGrant(h, true);
+      h.ds.activeInteractiveTurn = undefined;
+      h.scope.pickTurnReplyTarget = () => ({ senderOpenId: 'ou_alice',
+        participants: [{ openId: 'ou_alice', isBot: false }] });
+      expect((await h.run()).status).toBe(200);
+      const payload = await read();
+      expect(payload?.authority).toMatchObject({ openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'] });
+      expect(scheduleCreateCapabilities(payload!.authority)).toEqual([]);
+    });
+
+    // The grant matches on app and chat only. A person who is not an
+    // administrator but can talk to the source bot there gets the service
+    // authority, exactly like a bot turn; opting out keeps their own tools.
+    it('gives a non-administrator the documented service authority, and their own tools on opt-out', async () => {
+      const carol = { senderType: 'user', requestLarkAppId: 'cli_source',
+        requestUserOpenId: 'ou_carol', requestUserUnionId: 'on_carol' };
+      const granted = harness();
+      withGrant(granted, true);
+      granted.ds.activeInteractiveTurn = { turnId: 'om_human', caller: carol };
+      expect((await granted.run()).status).toBe(200);
+      const signed = await read();
+      expect(signed?.authority).toMatchObject({ openId: 'ou_sponsor', unionId: 'on_sponsor', tools: [] });
+      expect(scheduleCreateCapabilities(signed!.authority)).toEqual([
+        expect.objectContaining({ botGrantId: 'team', allowedRunScopes: [], allowSelfManage: true }),
+      ]);
+      expect(granted.scope.logger.info).toHaveBeenCalledWith(expect.stringMatching(
+        /auto-attached schedule:create .*trigger=user:ou_carol grant=team signer=ou_sponsor /));
+
+      rmSync(join(dataDir, 'dispatch-user-delegations.json'), { force: true });
+      const optOut = harness({ suppressScheduleCreate: true });
+      withGrant(optOut, true);
+      optOut.ds.activeInteractiveTurn = { turnId: 'om_human', caller: carol };
+      expect((await optOut.run()).status).toBe(200);
+      const own = await read();
+      expect(own?.authority).toMatchObject({ openId: 'ou_carol', unionId: 'on_carol', tools: ['bytedcli'] });
+      expect(scheduleCreateCapabilities(own!.authority)).toEqual([]);
+      expect(optOut.scope.resolveTargetAppOpenId).not.toHaveBeenCalled();
+    });
   });
   it('can default schedule delegation by source orchestrator and honors one-shot opt-out', async () => {
     const enabled = harness();

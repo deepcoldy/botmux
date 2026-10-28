@@ -8742,19 +8742,22 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Persistent task-management actions are distinct from schedule:create.
-  // Pause/remove admission is decided by the daemon, which can also verify an
-  // explicit bot-policy task in its original topic. Other management actions
-  // still require current-human proof; a create grant alone is insufficient.
-  // Host-terminal administration authenticates
-  // to the owning daemon; neither path falls back to editing schedules.json.
+  // Persistent task-management actions are distinct from schedule:create; a
+  // create grant alone never authorizes them. Pause/remove (in any turn) and
+  // `done` (in the task's own scheduled turn) skip the local check and go to
+  // the owning daemon: only it can tell a scheduled self-manager or a bot turn
+  // cleaning up a bot-policy task in its original topic from a person, and it
+  // still requires the current human administrator from everyone else. Other
+  // actions need current-human proof here first. Host-terminal administration
+  // authenticates to the owning daemon; neither path falls back to editing
+  // schedules.json.
   const mutationSession = await detectCurrentSession();
+  const pauseOrRemove = ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
   const scheduledSelfManageCandidate = !!mutationSession?.turnId
     && mutationSession.turnId.startsWith('schedule:')
-    && ['remove', 'rm', 'delete', 'del', 'pause', 'disable', 'done'].includes(sub);
+    && (pauseOrRemove || sub === 'done');
   if (!trustedRemoteRunnerRelay
-      && sub !== 'update' && mutationSession && !scheduledSelfManageCandidate
-      && !['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub)) {
+      && sub !== 'update' && mutationSession && !scheduledSelfManageCandidate && !pauseOrRemove) {
     await detectAuthenticatedCurrentSession('operate');
   }
   const managedMutation = async (

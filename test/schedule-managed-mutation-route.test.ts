@@ -113,6 +113,33 @@ describe('managed schedule mutation route', () => {
     h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true } });
     expect((await h.run()).status).toBe(403);
   });
+  // Topic cleanup is the bot service authority's. A person in the same topic
+  // keeps the ordinary rules: a non-administrator is refused, an administrator
+  // still manages the task through the current-human path.
+  function botPolicyTaskInTopic(action: string, turnId: string) {
+    const h = harness(action, turnId);
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, controlOpenId: 'ou_admin',
+      controlUnionId: 'on_admin', runScopes: [], grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    Object.assign(h.record.task, { larkAppId: 'cli_target', rootMessageId: 'om_topic' });
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_controller', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_admin' }] } });
+    return h;
+  }
+  it.each(['pause', 'remove'])('refuses a non-administrator in the original topic who asks to %s a bot policy task', async action => {
+    const h = botPolicyTaskInTopic(action, 'om_member');
+    h.ds.activeInteractiveTurn.caller.requestUserOpenId = 'ou_member';
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+    expect(h.scheduler.disableTask).not.toHaveBeenCalled();
+  });
+  it.each(['pause', 'remove'])('still lets an administrator in the original topic %s a bot policy task', async action => {
+    const h = botPolicyTaskInTopic(action, 'om_admin_turn');
+    expect((await h.run()).status).toBe(200);
+    expect(action === 'pause' ? h.scheduler.disableTask : h.scheduler.removeTask).toHaveBeenCalledWith('a1b2c3d4');
+  });
   it('rejects topic cleanup when its managed turn changes during authorization', async () => {
     const h = harness('remove', 'report:1');
     h.ds.activeInteractiveTurn.caller.senderType = 'bot';

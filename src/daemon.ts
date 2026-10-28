@@ -7918,7 +7918,25 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const turnId = sourceTurnId;
     const active = ds.activeInteractiveTurn;
     const delegationPolicy = readGlobalConfig().scheduleDelegation;
-    const botGrant = matchingScheduleBotGrant(delegationPolicy, ds.larkAppId, targetAppIds, chatId);
+    const adminOpenIds = getDashboardAdminOpenIds(ds.larkAppId);
+    const directScheduleSource = !!active && active.turnId === turnId
+      && active.caller.senderType === 'user' && !active.caller.source
+      && !!active.caller.requestUserOpenId
+      && adminOpenIds.includes(active.caller.requestUserOpenId);
+    const dispatchCaller = !turnId ? undefined
+      : ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
+        : active?.turnId === turnId ? active.caller
+          : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
+    // A host bot grant stands in only for turns that no human administrator
+    // drives. An administrator's own dispatch (live, or restored from the reply
+    // registry) keeps their identity, their tool delegation and the ordinary
+    // schedule:create rules, exactly as if no grant matched. Every use of the
+    // grant below goes through this one value, so the rule cannot drift apart.
+    const humanAdminTurn = directScheduleSource || (dispatchCaller?.senderType === 'user'
+      && !dispatchCaller.source && dispatchCaller.requestLarkAppId === ds.larkAppId
+      && !!dispatchCaller.requestUserOpenId && adminOpenIds.includes(dispatchCaller.requestUserOpenId));
+    const botGrant = humanAdminTurn ? undefined
+      : matchingScheduleBotGrant(delegationPolicy, ds.larkAppId, targetAppIds, chatId);
     const scheduleCreateDefaulted = body.suppressScheduleCreate !== true
       && body.delegateScheduleCreate !== true
       && (delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true || !!botGrant);
@@ -7941,23 +7959,21 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     if (needsDelegation && !turnId) {
       return jsonRes(res, 403, { ok: false, error: 'dispatch_turn_unproven' });
     }
-    const directScheduleSource = !!active && active.turnId === turnId
-      && active.caller.senderType === 'user' && !active.caller.source
-      && !!active.caller.requestUserOpenId
-      && getDashboardAdminOpenIds(ds.larkAppId).includes(active.caller.requestUserOpenId);
     if (scheduleCreateRequested && !directScheduleSource && !botGrant) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_source_operator_denied' });
     }
-    const inherited = needsDelegation && turnId && !(scheduleCreateRequested && botGrant)
+    // The grant replaces the signed authority only when this dispatch asks for
+    // schedule:create; `--no-delegate schedule:create` keeps the caller's own
+    // immediate tool delegation.
+    const serviceGrant = scheduleCreateRequested ? botGrant : undefined;
+    const inherited = needsDelegation && turnId && !serviceGrant
       ? await dispatchUserForTurn(ds, turnId) : undefined;
     if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return jsonRes(res, 403, { ok: false, error: 'delegated_caller_not_allowed' });
     }
-    let authority = needsDelegation && turnId && !(scheduleCreateRequested && botGrant) ? await authorityForDispatch({
+    let authority = needsDelegation && turnId && !serviceGrant ? await authorityForDispatch({
       sourceAppId: ds.larkAppId,
-      caller: ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
-        : active?.turnId === turnId ? active.caller
-          : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
+      caller: dispatchCaller,
       inherited: inherited?.authority,
       tools,
       ...(scheduleCreateRequested ? {
@@ -7970,13 +7986,13 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       } : {}),
       resolveUnionId: resolveUnionIdFromOpenId,
     }) : undefined;
-    if (scheduleCreateRequested && botGrant) {
-      const sponsor = await resolveTargetAppOpenId(ds.larkAppId, botGrant.controllerUnionId);
+    if (serviceGrant) {
+      const sponsor = await resolveTargetAppOpenId(ds.larkAppId, serviceGrant.controllerUnionId);
       if (sponsor.status !== 'resolved' || !getDashboardAdminOpenIds(ds.larkAppId).includes(sponsor.openId)) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_controller_denied' });
       }
       // This service grant conveys scheduling only, never the sponsor's CLI credentials.
-      authority = botScheduleAuthority({ grant: botGrant, sourceOpenId: sponsor.openId,
+      authority = botScheduleAuthority({ grant: serviceGrant, sourceOpenId: sponsor.openId,
         targetAppIds, chatId, selfManage: delegationPolicy?.selfManageEnabled === true });
     }
     if (scheduleCreateRequested
@@ -8000,11 +8016,17 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           }, send,
         })
       : await send();
-    if (scheduleCreateDefaulted) {
+    if (scheduleCreateDefaulted || serviceGrant) {
+      // With a service grant the signer is the sponsor, not whoever drove the
+      // turn; record both so the task can be traced back to its real trigger.
+      const trigger = dispatchCaller?.source ?? dispatchCaller?.senderType ?? 'unknown';
       logger.info(
-        `[schedule-delegation:audit] auto-attached schedule:create source=${ds.larkAppId} `
-        + `turn=${turnId ?? 'unknown'} chat=${chatId} targets=${targetAppIds.join(',')} `
-        + `runScopes=${configuredScheduleRunScopes.join(',') || 'none'} `
+        `[schedule-delegation:audit] ${scheduleCreateDefaulted ? 'auto-attached' : 'attached'} schedule:create `
+        + `source=${ds.larkAppId} turn=${turnId ?? 'unknown'} `
+        + `trigger=${trigger}${dispatchCaller?.requestUserOpenId ? `:${dispatchCaller.requestUserOpenId}` : ''} `
+        + `grant=${serviceGrant?.id ?? 'none'} signer=${authority?.openId ?? 'none'} `
+        + `chat=${chatId} targets=${targetAppIds.join(',')} `
+        + `runScopes=${serviceGrant ? 'none' : configuredScheduleRunScopes.join(',') || 'none'} `
         + `selfManage=${delegationPolicy?.selfManageEnabled === true}`,
       );
     }
@@ -8605,7 +8627,11 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     }
     providerActorAdmin = true;
   }
-  const botPolicyTopicManager = !!ds && authority?.kind === 'delegated'
+  // Topic cleanup belongs to the bot service authority, so only a bot turn
+  // uses it. People keep the ordinary rules: an administrator manages the task
+  // through the current-human path above, anyone else in the topic is refused.
+  const botPolicyTopicManager = !!ds && caller?.senderType === 'bot'
+    && caller.requestLarkAppId === ds.larkAppId && authority?.kind === 'delegated'
     && authority.grantId?.startsWith('bot-policy:') === true && authority.selfManage
     && authority.task.chatId === ds.chatId && !!authority.task.rootMessageId
     && authority.task.rootMessageId === ds.session.rootMessageId
