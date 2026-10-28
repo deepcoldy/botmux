@@ -15,6 +15,8 @@ import {
 } from './update-action.js';
 import { ui } from './ui.js';
 import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
+import { ScheduleBotGrantsEditor, type ScheduleBotGrantBotOption } from './schedule-bot-grants-editor.js';
+import type { ScheduleBotGrant } from '../../global-config.js';
 import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
 import { PromptCacheEditor } from './prompt-cache-editor.js';
 import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
@@ -88,6 +90,13 @@ interface DashboardSettings {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
+  /** scheduleDelegation.createEnabled / selfManageEnabled / botGrants. */
+  scheduleBotGrants: {
+    createEnabled: boolean;
+    selfManageEnabled: boolean;
+    grants: ScheduleBotGrant[];
+    botOptions: ScheduleBotGrantBotOption[];
+  };
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -251,6 +260,12 @@ function parseSettings(s: any): DashboardSettings {
     },
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
     crossPrincipalInterruption: s?.crossPrincipalInterruption === true,
+    scheduleBotGrants: {
+      createEnabled: s?.scheduleBotGrants?.createEnabled === true,
+      selfManageEnabled: s?.scheduleBotGrants?.selfManageEnabled === true,
+      grants: Array.isArray(s?.scheduleBotGrants?.grants) ? s.scheduleBotGrants.grants : [],
+      botOptions: Array.isArray(s?.scheduleBotGrants?.botOptions) ? s.scheduleBotGrants.botOptions : [],
+    },
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
@@ -863,6 +878,13 @@ export function SettingsBody(props: {
       s => ({ ...s, hostOverloadAlert: { ...s.hostOverloadAlert, ...patch } }),
     );
   };
+  const saveScheduleBotGrants = (patch: Partial<Pick<DashboardSettings['scheduleBotGrants'], 'createEnabled' | 'selfManageEnabled' | 'grants'>>) => {
+    return props.onSave(
+      'scheduleBotGrants',
+      { scheduleBotGrants: patch },
+      s => ({ ...s, scheduleBotGrants: { ...s.scheduleBotGrants, ...patch } }),
+    );
+  };
   const repoModeOptions = useMemo(() => [
     { value: 'all' as const, label: tr('settings.repoPickerModeAll') },
     { value: 'repos' as const, label: tr('settings.repoPickerModeRepos') },
@@ -1036,6 +1058,29 @@ export function SettingsBody(props: {
             checked={settings.crossPrincipalInterruption}
             disabled={dis || savingKey === 'crossPrincipalInterruption'}
             onChange={value => saveBoolean('crossPrincipalInterruption', value)}
+          />
+          <ToggleRow
+            title={tr('settings.scheduleDelegationCreate')}
+            dataAction="toggle-schedule-delegation-create"
+            help={tr('settings.scheduleDelegationCreateHelp')}
+            checked={settings.scheduleBotGrants.createEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onChange={value => { void saveScheduleBotGrants({ createEnabled: value }); }}
+          />
+          <ToggleRow
+            title={tr('settings.scheduleDelegationSelfManage')}
+            dataAction="toggle-schedule-delegation-self-manage"
+            help={tr('settings.scheduleDelegationSelfManageHelp')}
+            checked={settings.scheduleBotGrants.selfManageEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onChange={value => { void saveScheduleBotGrants({ selfManageEnabled: value }); }}
+          />
+          <ScheduleBotGrantsEditor
+            grants={settings.scheduleBotGrants.grants}
+            botOptions={settings.scheduleBotGrants.botOptions}
+            createEnabled={settings.scheduleBotGrants.createEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onSave={grants => saveScheduleBotGrants({ grants })}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>

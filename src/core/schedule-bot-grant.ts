@@ -3,6 +3,32 @@ import type { ScheduleDelegationGlobalConfig, ScheduleBotGrant } from '../global
 import type { DispatchUserAuthority } from './dispatch-user-delegation.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
 
+/** Per-field rules of one bot grant, exported so the Dashboard editor can say
+ *  which field is wrong without restating them. */
+export const scheduleBotGrantFieldValid = {
+  id: (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value),
+  appId: (value: unknown): value is string => typeof value === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(value),
+  chatId: (value: unknown): value is string => typeof value === 'string' && /^oc_[A-Za-z0-9_-]{1,128}$/.test(value),
+  unionId: (value: unknown): value is string => typeof value === 'string' && /^on_[A-Za-z0-9_-]{1,128}$/.test(value),
+};
+
+/** Shape of one bot grant. The config reader, the Dashboard write route and
+ *  its editor all use it, so every door accepts exactly the same entries. */
+export function isScheduleBotGrant(raw: unknown): raw is ScheduleBotGrant {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const g = raw as Record<string, unknown>;
+  const valid = scheduleBotGrantFieldValid;
+  return valid.id(g.id) && valid.appId(g.sourceAppId) && valid.unionId(g.controllerUnionId)
+    && Array.isArray(g.targetAppIds) && g.targetAppIds.length > 0 && g.targetAppIds.every(valid.appId)
+    && Array.isArray(g.chatIds) && g.chatIds.length > 0 && g.chatIds.every(valid.chatId);
+}
+
+/** Known fields only, with repeated app/chat ids collapsed. */
+export function canonicalScheduleBotGrant(g: ScheduleBotGrant): ScheduleBotGrant {
+  return { id: g.id, sourceAppId: g.sourceAppId, controllerUnionId: g.controllerUnionId,
+    targetAppIds: [...new Set(g.targetAppIds)], chatIds: [...new Set(g.chatIds)] };
+}
+
 export function matchingScheduleBotGrant(
   policy: ScheduleDelegationGlobalConfig | undefined,
   sourceAppId: string, targetAppIds: readonly string[], chatId: string,
@@ -11,6 +37,20 @@ export function matchingScheduleBotGrant(
   const matches = (policy.botGrants ?? []).filter(g => g.sourceAppId === sourceAppId
     && g.chatIds.includes(chatId) && targetAppIds.every(id => g.targetAppIds.includes(id)));
   return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** Pairs of grant ids that would both match some dispatch: same source, a
+ *  shared chat and a shared target. Matching fails closed on that ambiguity,
+ *  so such grants would silently never apply; writers reject them instead. */
+export function overlappingScheduleBotGrants(grants: readonly ScheduleBotGrant[]): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  grants.forEach((a, i) => {
+    for (const b of grants.slice(i + 1)) {
+      if (a.sourceAppId === b.sourceAppId && a.chatIds.some(chat => b.chatIds.includes(chat))
+        && a.targetAppIds.some(target => b.targetAppIds.includes(target))) out.push([a.id, b.id]);
+    }
+  });
+  return out;
 }
 
 export function botScheduleAuthority(input: {

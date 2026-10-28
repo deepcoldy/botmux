@@ -17,6 +17,7 @@ import {
   readGlobalConfig,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  writeScheduleBotGrantConfig,
 } from '../src/global-config.js';
 import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
 
@@ -551,6 +552,33 @@ describe('global dashboard config', () => {
     ] } }));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().scheduleDelegation?.botGrants).toEqual([{ ...grant, targetAppIds: ['cli_target'] }]);
+  });
+  it('writes the Dashboard bot-grant entry without storing defaults or touching other delegation keys', () => {
+    const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],
+      chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+    const disk = () => JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh' }));
+    // Turning things off on a host that never had them leaves the file as it was.
+    writeScheduleBotGrantConfig({ createEnabled: false, selfManageEnabled: false, botGrants: [] });
+    expect(disk()).toEqual({ lang: 'zh' });
+
+    writeScheduleBotGrantConfig({ createEnabled: true, botGrants: [grant] });
+    expect(disk().scheduleDelegation).toEqual({ createEnabled: true,
+      botGrants: [{ ...grant, targetAppIds: ['cli_target'] }] });
+
+    // Hand-edited keys this entry does not own survive every write.
+    writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: {
+      ...disk().scheduleDelegation, runEnabled: false, runScopes: ['bytedcli'], futureKey: 1 } }));
+    writeScheduleBotGrantConfig({ selfManageEnabled: true });
+    writeScheduleBotGrantConfig({ createEnabled: false, botGrants: [] });
+    expect(disk().scheduleDelegation).toEqual({ selfManageEnabled: true, runEnabled: false,
+      runScopes: ['bytedcli'], futureKey: 1 });
+
+    // Back to every default: the whole block goes.
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', scheduleDelegation: { selfManageEnabled: true } }));
+    writeScheduleBotGrantConfig({ selfManageEnabled: false });
+    expect(disk()).toEqual({ lang: 'zh' });
+    expect(readGlobalConfig().scheduleDelegation).toBeUndefined();
   });
   it('keeps schedule delegation issuance and execution revocation independent', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({

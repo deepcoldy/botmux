@@ -25,6 +25,8 @@ import {
   setGlobalLocale,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  writeScheduleBotGrantConfig,
+  type ScheduleBotGrant,
   SESSION_CLEANUP_HOUR_OPTIONS,
   SESSION_CLEANUP_MIN_INTERVAL_MINUTES,
   type SessionCleanupGlobalConfig,
@@ -35,6 +37,7 @@ import {
   isCodexNotifierHookInstalled,
 } from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
+import { isScheduleBotGrant, overlappingScheduleBotGrants } from '../core/schedule-bot-grant.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
@@ -102,6 +105,13 @@ export interface ResolvedDashboardSettingsView {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
+  /** Cross-bot schedule delegation switches and host bot grants. */
+  scheduleBotGrants?: {
+    createEnabled: boolean;
+    selfManageEnabled: boolean;
+    grants: ScheduleBotGrant[];
+    botOptions?: Array<{ larkAppId: string; botName: string | null }>;
+  };
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -160,6 +170,8 @@ export interface SettingsWriteApplierDeps {
   writeCodexNotifierConfig: (config: import('../global-config.js').CodexNotifierGlobalConfig) => void;
   /** Replace known host-overload-alert fields while preserving future sibling keys. */
   writeHostOverloadAlertConfig: (config: import('../global-config.js').HostOverloadAlertGlobalConfig) => void;
+  /** Write the bot-grant entry; defaults are removed, other scheduleDelegation keys kept. */
+  writeScheduleBotGrantConfig: (patch: Parameters<typeof writeScheduleBotGrantConfig>[0]) => void;
   /** Atomic write of maintenance-level fields (autoUpdate / autoRestart). */
   mergeMaintenanceConfig: (patch: MaintenanceConfig) => MaintenanceConfig;
   /** Set global UI locale (null = clear). Fans out to daemons via IPC. */
@@ -208,6 +220,7 @@ export function defaultSettingsWriteApplierDeps(
     mergeGlobalConfig,
     writeCodexNotifierConfig,
     writeHostOverloadAlertConfig,
+    writeScheduleBotGrantConfig,
     mergeMaintenanceConfig,
     setGlobalLocale,
     parseMaintenancePatch,
@@ -273,6 +286,12 @@ export type ApplySettingsWriteError =
   | 'hostOverloadAlert_target_offline'
   | 'invalid_noVisibleOutputHint'
   | 'invalid_crossPrincipalInterruption'
+  | 'invalid_scheduleBotGrants'
+  | 'invalid_scheduleBotGrants_createEnabled'
+  | 'invalid_scheduleBotGrants_selfManageEnabled'
+  | 'invalid_scheduleBotGrants_grant'
+  | 'scheduleBotGrants_duplicate_id'
+  | 'scheduleBotGrants_overlap'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -640,6 +659,39 @@ export async function applySettingsWrite(
     hostOverloadAlertPatch = next;
   }
 
+  let scheduleBotGrantPatch: Parameters<typeof writeScheduleBotGrantConfig>[0] | undefined;
+  if ('scheduleBotGrants' in obj) {
+    const raw = obj.scheduleBotGrants;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_scheduleBotGrants' };
+    }
+    const incoming = raw as Record<string, unknown>;
+    const next: Parameters<typeof writeScheduleBotGrantConfig>[0] = {};
+    for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+      if (!(key in incoming)) continue;
+      if (typeof incoming[key] !== 'boolean') return { ok: false, error: `invalid_scheduleBotGrants_${key}` };
+      next[key] = incoming[key] as boolean;
+    }
+    if ('grants' in incoming) {
+      // Unlike the config reader, which drops a bad entry and keeps the rest,
+      // a Dashboard save is refused as a whole: the editor must not appear to
+      // keep a grant that would never apply.
+      const grants = incoming.grants;
+      if (!Array.isArray(grants) || !grants.every(isScheduleBotGrant)) {
+        return { ok: false, error: 'invalid_scheduleBotGrants_grant' };
+      }
+      if (new Set(grants.map(grant => grant.id)).size !== grants.length) {
+        return { ok: false, error: 'scheduleBotGrants_duplicate_id' };
+      }
+      if (overlappingScheduleBotGrants(grants).length > 0) {
+        return { ok: false, error: 'scheduleBotGrants_overlap' };
+      }
+      next.botGrants = grants;
+    }
+    if (Object.keys(next).length === 0) return { ok: false, error: 'invalid_scheduleBotGrants' };
+    scheduleBotGrantPatch = next;
+  }
+
   let touched = false;
   if (Object.keys(patch).length > 0) {
     deps.mergeDashboardConfig(patch);
@@ -890,6 +942,11 @@ export async function applySettingsWrite(
 
   if (hostOverloadAlertPatch) {
     deps.writeHostOverloadAlertConfig(hostOverloadAlertPatch);
+    touched = true;
+  }
+
+  if (scheduleBotGrantPatch) {
+    deps.writeScheduleBotGrantConfig(scheduleBotGrantPatch);
     touched = true;
   }
 

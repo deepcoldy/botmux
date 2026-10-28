@@ -31,6 +31,7 @@ const settings: Settings = {
   hostOverloadAlert: { enabled: false, targetBotAppId: null, enterLoadRatio: 1.5, enterMemUsedFrac: 0.9, botOptions: [], targetDaemonOnline: false },
   noVisibleOutputHint: false,
   crossPrincipalInterruption: false,
+  scheduleBotGrants: { createEnabled: false, selfManageEnabled: false, grants: [], botOptions: [] },
   vcMeetingAgent: { enabled: false },
   repoPickerMode: 'all',
   maintenance: {},

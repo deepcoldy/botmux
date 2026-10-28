@@ -71,6 +71,12 @@
 }
 ```
 
+- 配置入口是 Dashboard「全局设置 → 实验性配置」：「跨 Bot 委托创建定时任务」
+  （`createEnabled`）、「委托任务自管理」（`selfManageEnabled`）两个开关和「机器人调度
+  授权」列表（`botGrants`）。三项默认关闭/为空；保存成默认值时从 config.json 删除对应
+  键，scheduleDelegation 的其它键原样保留。手改 config.json 与 Dashboard 用同一套字段
+  校验；Dashboard 另外拒绝重复 id 和重叠授权（同一来源、共享群和目标的两条授权会让
+  匹配因歧义失效）。`botmux setup` 与 CLI 不提供这组配置。
 - 配置中的 app、群和 union_id 均须替换为已核验的真实身份；不使用跨应用复制的
   open_id。控制管理员仍须在来源、目标应用有管理权限，并满足目标群成员检查。
 - `--bot-app` 受管派单命中唯一授权时自动签发，无需每次添加 `--delegate`；

@@ -2808,7 +2808,7 @@ button.primary {
   min-width: 220px;
   max-width: 360px;
   padding: 10px 12px;
-  border-radius: var(--radius-md, 8px);
+  border-radius: var(--radius-md);
   background: var(--surface-raised, #1b1f2a);
   border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
@@ -19783,6 +19783,47 @@ form.dashboard-toolbar > input[type="text"]:focus {
   gap: 10px;
   min-width: 0;
   padding: 4px 0 2px;
+}
+.settings-page .settings-bot-grant-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.settings-page .settings-bot-grant {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+.settings-page .settings-bot-grant-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  font-size: 12px;
+}
+.settings-page .settings-bot-grant-main small {
+  color: var(--muted);
+  word-break: break-all;
+}
+.settings-page .settings-bot-grant .actions,
+.settings-page .settings-bot-grants > .actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.settings-page .settings-bot-grant-targets {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.settings-page .settings-bot-grant-form .bot-multi-select-list {
+  max-height: 180px;
 }
 .settings-page .settings-inline-link {
   border: 0;

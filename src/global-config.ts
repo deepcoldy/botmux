@@ -28,6 +28,7 @@ import type { LinkRefConfig } from './services/link-ref-types.js';
 import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
 import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
+import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -668,21 +669,10 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
     if (appIds.length > 0) out.defaultOnDispatchFromBotAppIds = appIds;
   }
   if (Array.isArray(value.botGrants)) {
-    const grants = value.botGrants.filter((raw): raw is ScheduleBotGrant => {
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
-      const g = raw as Record<string, unknown>;
-      return typeof g.id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(g.id)
-        && typeof g.sourceAppId === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(g.sourceAppId)
-        && typeof g.controllerUnionId === 'string' && /^on_[A-Za-z0-9_-]{1,128}$/.test(g.controllerUnionId)
-        && Array.isArray(g.targetAppIds) && g.targetAppIds.length > 0
-        && g.targetAppIds.every(id => typeof id === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(id))
-        && Array.isArray(g.chatIds) && g.chatIds.length > 0
-        && g.chatIds.every(id => typeof id === 'string' && /^oc_[A-Za-z0-9_-]{1,128}$/.test(id));
-    });
+    const grants = value.botGrants.filter(isScheduleBotGrant);
     // Ambiguous grant ids fail closed, rather than choosing an arbitrary scope.
     out.botGrants = grants.filter(g => grants.filter(other => other.id === g.id).length === 1)
-      .map(g => ({ id: g.id, sourceAppId: g.sourceAppId, controllerUnionId: g.controllerUnionId,
-        targetAppIds: [...new Set(g.targetAppIds)], chatIds: [...new Set(g.chatIds)] }));
+      .map(canonicalScheduleBotGrant);
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -1249,6 +1239,31 @@ export function writeHostOverloadAlertConfig(config: HostOverloadAlertGlobalConf
   delete existing.enterMemUsedFrac;
   mergeGlobalConfig({ hostOverloadAlert: { ...existing, ...config } as HostOverloadAlertGlobalConfig });
   return readGlobalConfig().hostOverloadAlert ?? {};
+}
+
+/** Dashboard write for the bot-grant entry (`createEnabled`, `selfManageEnabled`,
+ *  `botGrants`). A value equal to its default (off / empty) removes the key
+ *  instead of being stored, an emptied block is dropped, and every other
+ *  scheduleDelegation key on disk is left exactly as it was. */
+export function writeScheduleBotGrantConfig(patch: {
+  createEnabled?: boolean;
+  selfManageEnabled?: boolean;
+  botGrants?: ScheduleBotGrant[];
+}): ScheduleDelegationGlobalConfig | undefined {
+  const raw = readRawConfig();
+  const next = raw.scheduleDelegation && typeof raw.scheduleDelegation === 'object' && !Array.isArray(raw.scheduleDelegation)
+    ? { ...raw.scheduleDelegation as Record<string, unknown> }
+    : {};
+  for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+    if (patch[key] === true) next[key] = true;
+    else if (patch[key] === false) delete next[key];
+  }
+  if (patch.botGrants?.length) next.botGrants = patch.botGrants.map(canonicalScheduleBotGrant);
+  else if (patch.botGrants) delete next.botGrants;
+  mergeGlobalConfig({
+    scheduleDelegation: Object.keys(next).length > 0 ? next as ScheduleDelegationGlobalConfig : null,
+  });
+  return readGlobalConfig().scheduleDelegation;
 }
 
 /** Merge only the maintenance sub-config, preserving unknown sibling keys.
