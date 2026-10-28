@@ -4,9 +4,9 @@
 //
 // Measured on CI shard 3 (PR #1288): 416 files / 7374 tests green, then
 // `ChildProcess.emitUnexpectedExit` during teardown. Same shard reran green.
-// Sharding only slices the file list (sha1 of the path, then a contiguous
-// range) — it does not change isolate/forks. A mid-file crash still shows
-// `Test Files … failed` and is NOT retried.
+// Sharding only picks which files run (by recorded duration, see
+// scripts/duration-shards.mjs) — it does not change isolate/forks. A
+// mid-file crash still shows `Test Files … failed` and is NOT retried.
 //
 // The retry reruns the whole shard (~400 files), not "the failed file":
 // this flake class has zero failed files (that's the predicate). A
