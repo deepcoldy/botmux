@@ -99,6 +99,18 @@ function cursorBackgroundTaskNote(cliId: CliId | undefined, transcript: boolean,
   return [t(transcript ? 'ai.cursor.background_task_note_transcript' : 'ai.cursor.background_task_note', undefined, locale)];
 }
 
+/** ZCode-only interim-report line. ZCode emits nothing of its own mid-turn, so
+ *  a long task is indistinguishable from a hang unless the model says
+ *  something. The equivalent line used to live in the adapter's `systemHints`
+ *  array, which nothing reads — `buildBotmuxShellHints` is the only channel
+ *  that actually reaches the model, so the instruction has to be here.
+ *  Deliberately not transcript-only: in `send` mode the model needs `botmux
+ *  send` for the update, and in transcript mode the wording still holds. */
+function zcodeProgressReportNote(cliId: CliId | undefined, locale?: Locale): string[] {
+  if (cliId !== 'zcode') return [];
+  return [t('ai.zcode.progress_report', undefined, locale)];
+}
+
 export function buildBotmuxShellHints(
   locale?: Locale,
   noTransport?: boolean,
@@ -133,6 +145,7 @@ export function buildBotmuxShellHints(
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       ...cursorBackgroundTaskNote(cliId, true, locale),
+      ...zcodeProgressReportNote(cliId, locale),
       hiddenContextDefense(locale),
     ]
     : [
@@ -154,6 +167,7 @@ export function buildBotmuxShellHints(
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       ...cursorBackgroundTaskNote(cliId, false, locale),
+      ...zcodeProgressReportNote(cliId, locale),
       hiddenContextDefense(locale),
     ]).map(escapeXmlTagLikeTokens);
   if (whiteboardEnabled()) {

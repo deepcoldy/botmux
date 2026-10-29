@@ -22,9 +22,13 @@ import {
 } from '../services/claude-transcript.js';
 import { __resetCodexCompactionCountForTest, readCodexCompactionCount } from '../services/codex-compaction-count.js';
 import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
+import { readZcodeUsage } from '../services/zcode-usage.js';
+import { readZcodeSessionMarker, zcodeSessionDbPath } from '../services/zcode-session.js';
 import { readMinimaxUsage } from '../services/minimax-usage.js';
 import { readCursorUsage } from '../services/cursor-usage.js';
 import { cursorConfigDirForBot } from '../services/cursor-paths.js';
+import { getBot } from '../bot-registry.js';
+import { botOneShotEnv } from './session-env-resolve.js';
 import { config } from '../config.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -1346,7 +1350,66 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
   };
 }
 
+/** The same inheritance policy, global/bot overlay and removals as the CLI
+ *  child. Unknown/unregistered bot falls back to ambient: a read must not throw. */
+function resolveZcodeUsageEnv(larkAppId?: string): NodeJS.ProcessEnv {
+  if (!larkAppId) return process.env;
+  try {
+    const bot = getBot(larkAppId);
+    return botOneShotEnv(process.env, bot.config);
+  } catch {
+    return process.env;
+  }
+}
+
 function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
+  if (q.cliId === 'zcode') {
+    // ZCode keeps no transcript botmux can parse; its own `model_usage` ledger
+    // is the source of truth. The native id is persisted on the session after
+    // the first turn, and read back from the hook marker until then. The marker
+    // lives under the session data root, which is NOT always ~/.botmux/data:
+    // pass the same dir the worker writes it to or a custom SESSION_DATA_DIR
+    // silently loses usage and context.
+    const native = q.cliSessionId
+      || readZcodeSessionMarker(q.sessionId, { dataDir: config.session.dataDir })?.cliSessionId;
+    if (!native) return null;
+    // The worker resolves ZCODE_SESSION_DB_PATH / ZCODE_SESSION_DB from the
+    // bot's own env (worker.ts `zcodeResumeDbPath`); neither key is reserved,
+    // so a bot may legitimately point its ledger elsewhere. Reading the ledger
+    // through the ambient env alone would then find the session at spawn but
+    // show no tokens or model on the card, silently. Resolve both the path and
+    // the context-window config from the same per-bot env the worker uses.
+    const zcodeEnv = resolveZcodeUsageEnv(q.larkAppId);
+    const usage = readZcodeUsage(native, zcodeSessionDbPath(zcodeEnv), zcodeEnv);
+    if (!usage) return null;
+    const agg = newTokenUsageAggregate();
+    agg.inputTokens = usage.inputTokens;
+    agg.outputTokens = usage.outputTokens;
+    agg.cacheReadTokens = usage.cacheReadTokens;
+    agg.cacheCreateTokens = usage.cacheCreateTokens;
+    agg.turns = usage.turns;
+    agg.turnInputTokens = usage.turnInputTokens;
+    agg.turnOutputTokens = usage.turnOutputTokens;
+    if (usage.modelId) agg.model = usage.modelId;
+    if (usage.reasoningLevel) agg.reasoningEffort = usage.reasoningLevel;
+    // A request that failed is already excluded; the newest successful prompt
+    // size is the live context gauge. When the provider reported no token
+    // counts at all, omit context entirely — a `0/1M (0%)` reading would claim
+    // a measurement the CLI never made (the card then shows model/level only).
+    if (usage.hasTokenEvidence) {
+      const percentUsed = usage.contextWindow && usage.contextWindow > 0
+        ? Math.round(Math.max(0, Math.min(1, usage.contextUsed / usage.contextWindow)) * 100)
+        : undefined;
+      agg.latestContextUsage = {
+        usedTokens: usage.contextUsed,
+        ...(usage.contextWindow ? { windowTokens: usage.contextWindow } : {}),
+        ...(percentUsed !== undefined ? { percentUsed } : {}),
+      };
+    }
+    // `result` stays null: ZCode has no pricing entry and botmux does not write
+    // a cost ledger for it, so only context + this-turn deltas reach the card.
+    return { agg, result: null };
+  }
   if (q.cliId === 'aiden') {
     const sid = q.cliSessionId || q.sessionId;
     const checkpointPath = cachedTranscriptPathLookup(
@@ -1503,8 +1566,8 @@ function usageSnapshotFromRead(q: SessionTokenUsageQuery, read: UsageReadResult 
     // Grok exposes a stable user-facing primaryModelId in signals.json.
     // Keep other CLIs unchanged: Relay-family transcript model strings may
     // be internal routing codes and intentionally never surface on cards.
-    ...(q.cliId === 'grok' && agg?.model ? { model: agg.model } : {}),
-    ...(q.cliId === 'grok' && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode') && agg?.model ? { model: agg.model } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode') && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
     ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
   };
 }

@@ -454,7 +454,7 @@ describe('附件与批次投递状态', () => {
     const seed = db.prepare(`INSERT INTO board_files (app_id, id, seq, sha256, mime, bytes, name, uploader, created_at)
       VALUES (?, ?, ?, 'x', 'image/png', 1, ?, 'steward', ?)`);
     for (const id of ['zz', 'aa', 'mm', 'bb']) seed.run(APP, id, item.seq, `${id[0]}.png`, 1_000);
-    seed.run(OTHER, 'yy', other.seq, 'y.png', 1_000);
+    seed.run(OTHER, 'aa', other.seq, 'y.png', 1_000);
     seed.run(OTHER, 'cc', other.seq, 'c.png', 900);
     db.exec('PRAGMA user_version = 2;');
     db.close();
@@ -540,8 +540,8 @@ describe('附件与批次投递状态', () => {
     db.exec('BEGIN');
     for (let i = 0; i < TOTAL; i++) {
       const app = i % 2 === 0 ? APP : OTHER;
-      // 打乱 id 与写入顺序的对应关系，让并列组的 tie-break 真正被检验。
-      const id = `f${(i * 7919) % 104729}`;
+      // 打乱 id；两个看板共享 shared-file，但其看板内排名不同，守住回填 join 的 app_id 条件。
+      const id = i === 0 || i === 5 ? 'shared-file' : `f${(i * 7919) % 104729}`;
       // 每 4 行共享一个毫秒：并列组内的相对顺序只能由 id 决定。
       const createdAt = 1_700_000_000_000 + Math.floor(i / 4) * 3;
       seed.run(app, id, app === APP ? item.seq : other.seq, `${id}.png`, createdAt);
@@ -564,6 +564,7 @@ describe('附件与批次投递状态', () => {
     const raw = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
     const actual = raw.prepare('SELECT app_id, id, ord FROM board_files').all() as Array<{ app_id: string; id: string; ord: number }>;
     raw.close();
+    expect(expected.get(`${APP}\u0000shared-file`)).not.toBe(expected.get(`${OTHER}\u0000shared-file`));
     expect(actual).toHaveLength(TOTAL);
     for (const r of actual) {
       expect(r.ord).toBe(expected.get(`${r.app_id}\u0000${r.id}`));

@@ -40,7 +40,7 @@
 | 默认不存完整回答 | 已实现 | `responses` 只存 hash/ref；卡片快照只保留反馈区和 footer 结构；点击时优先从 Lark 回读原卡正文 |
 | worker turn 完成通知 | 已实现但有边界 | 持久化匹配 worker terminal + canonical delivery 的 `turn.completed`，支持 terminal-before-delivery 与 delivery-before-terminal、重复信号幂等；同 turn 多 delivery 各自产生 completion；无真实 worker turn 的主动 `botmux send` 不产生 completion event |
 | 标准 webhook 出口 | 已实现 | 已产生的 `turn.completed` 和每条 `feedback.revised` 可进入 durable outbox；HMAC、事件 ID、重试、重启恢复、SSRF 防护；无 destination 时仅落事件表 |
-| Dashboard 分析 | API 完整，页面基础 | 私有认证 API 支持覆盖率、正向率、三态趋势、原因、交付/出口失败、过滤与分页下钻；当前页面固定最近 30 天，显示 KPI、positive trend、原因和下钻，尚未暴露全量筛选控件和 progress trend |
+| Dashboard 分析 | API 完整，页面基础 | 私有认证 API 支持覆盖率、正向率、三态趋势、原因、交付/出口失败、过滤与分页下钻；页面支持日期范围、今天/最近 7/30 天快捷筛选和机器人筛选，显示 KPI、positive trend、原因和下钻，尚未暴露其余维度控件和 progress trend |
 | card-off 首期不支持 | 符合建议 | 反馈依赖 interactive card；不会为纯文本模式额外发反馈卡 |
 | nativeMessageId P1 | 未实现 | 当前使用 turnId + nativeSessionId + dispatchAttempt + contentHash/ref + platformMessageId；没有原生 assistant row ID |
 | 通用 card-action 注册表 | 未实现 | 反馈 handler 已在 core 接入，但分发仍非面向第三方插件的公开注册表 |
@@ -388,7 +388,9 @@ daemon 启动时恢复 stale claims，运行中也周期恢复；claim/settle �
 
 API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、model、CLI/version、Skill/version、workflow/task、status。SQL 使用参数绑定、限制最大时间范围，并通过 v7 索引支持常见维度。
 
-当前页面只暴露固定最近 30 天视图，展示 KPI、positive trend、原因、失败和分页下钻；尚未暴露 API 的全量筛选控件，也未可视化 progress/negative trend。
+页面默认查询包含今天的最近 30 个本地自然日，提供开始/结束日期、所有/单个机器人，以及今天、最近 7 天、最近 30 天快捷选择。修改日期或机器人后点击“查询”，快捷选择则立即应用。日期按浏览器本地时区解释，包含开始与结束当天，转换为 API 的 UTC `[from, to)` 范围，单次最多 366 天。趋势仍按 UTC 日期分组，页面标注 UTC。
+
+所有面板采用相同的回答投递时间和机器人条件，包括通过对应 delivery 关联的 Webhook 失败数；评价和 Webhook 事件可以晚于所选日期产生。这里筛选的是回答投递时间，不是会话创建时间或用户评价时间。切换条件清空旧明细和分页游标，旧请求迟到时不会覆盖新结果；加载更多复用已应用的条件，尚未提交的输入修改不会改变分页范围。尚未暴露 API 的其余维度筛选控件，也未可视化 progress/negative trend。
 
 未认证分析请求返回 401；下钻不返回完整回答、operator ID、comment、base card 或 secret。
 

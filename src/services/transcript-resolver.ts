@@ -315,6 +315,8 @@ function codexRolloutInHome(
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
   'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity', 'minimax',
+  // ZCode reports usage from its own ledger (services/zcode-usage.ts), not a transcript.
+  'zcode',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).

@@ -15,7 +15,7 @@
  *
  * Run: bun x vitest run --project unit test/schedule-missing-workdir-recovery.test.ts
  */
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cardVisibleText } from './helpers/card-visible-text.js';
 
 const mocks = vi.hoisted(() => {
@@ -142,7 +142,7 @@ import {
   executeScheduledTask,
   getSessionWorkingDir,
 } from '../src/core/session-manager.js';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
@@ -490,5 +490,103 @@ describe('decision board batch refused for a missing working directory', () => {
     const startedDs = mocks.started.mock.calls[0]![0] as DaemonSession;
     expect(startedDs.session.sessionId).toBe(ds.session.sessionId);
     expect(getSessionWorkingDir(startedDs)).toBe(chosen);
+  });
+});
+
+// Fire-time swap check (#2367 P1-1). A task created through a conversation turn
+// stores a canonical workingDir and carries a non-null authority targetTurnId.
+// If that directory is later swapped for a symlink (the agent owns the parent),
+// the fire must be refused before any session is chosen or spawned — otherwise
+// the worker would realpath the link and grant its target readWrite.
+describe('scheduled fire refused when a turn-created task\'s workingDir was swapped', () => {
+  let store: import('../src/services/schedule-authority-store.js').ScheduleAuthorityStore;
+  let scheduler: typeof import('../src/core/scheduler.js');
+  const turn = { directTurn: { turnId: 'om_creating_turn', maxTasksPerTurn: 64 } };
+
+  beforeEach(async () => {
+    const { ScheduleAuthorityStore } = await import('../src/services/schedule-authority-store.js');
+    scheduler = await import('../src/core/scheduler.js');
+    const { setScheduleScope } = await import('../src/services/schedule-store.js');
+    setScheduleScope(APP);
+    store = ScheduleAuthorityStore.open(mkdtempSync(join(tmpRoot, 'authority-')));
+    store.initializeApp(APP, []);
+    scheduler.setScheduleAuthorityStore(store);
+  });
+
+  afterEach(() => {
+    scheduler.setScheduleAuthorityStore(null);
+    store.close();
+  });
+
+  function realDir(prefix: string): string {
+    return realpathSync(mkdtempSync(join(tmpRoot, prefix)));
+  }
+
+  function create(workingDir: string, audit?: typeof turn, id = randomTaskId()): ScheduledTask {
+    return scheduler.addTask({
+      id, name: '每日告警汇总', schedule: 'every 30m', prompt: TASK_PROMPT, workingDir,
+      chatId: CHAT, chatType: 'group', larkAppId: APP, executionPosition: 'topic', rootMessageId: ROOT,
+    }, audit);
+  }
+
+  function randomTaskId(): string {
+    return Math.random().toString(16).slice(2, 10).padEnd(8, '0');
+  }
+
+  function swapToLink(dir: string, target: string): void {
+    renameSync(dir, `${dir}.moved`);
+    symlinkSync(target, dir);
+  }
+
+  it('refuses the fire after a swap and starts nothing', async () => {
+    const cwdChild = join(realDir('cwd-'), 'sub');
+    mkdirSync(cwdChild);
+    const task = create(cwdChild, turn);
+    swapToLink(cwdChild, realDir('home-'));
+
+    await expect(fire(task)).rejects.toThrow(/schedule_working_dir_swapped/);
+    expect(mocks.started).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it('refuses a swapped delegated task the same way', async () => {
+    const dir = join(realDir('deleg-'), 'sub');
+    mkdirSync(dir);
+    const result = scheduler.commitDelegatedTask({
+      params: { id: 'de1e9a7e', name: '每日告警汇总', schedule: 'every 30m', prompt: TASK_PROMPT, workingDir: dir,
+        chatId: CHAT, chatType: 'group', larkAppId: APP, executionPosition: 'topic', rootMessageId: ROOT },
+      grantId: 'grant-1', requestHash: 'hash-1',
+      control: { openId: OWNER, unionId: 'on_owner', credentialOpenId: OWNER, runScopes: [], selfManage: false },
+      sourceMessageId: 'om_src', sourceSessionId: 'src-session', targetTurnId: 'om_creating_turn',
+      targetGeneration: 1, maxTasksPerTurn: 64,
+    });
+    expect(result.ok).toBe(true);
+    swapToLink(dir, realDir('home-'));
+    await expect(fire((result as { task: ScheduledTask }).task)).rejects.toThrow(/schedule_working_dir_swapped/);
+    expect(mocks.started).not.toHaveBeenCalled();
+  });
+
+  it('fires an untouched turn-created task, including one in a role-library-style subtree', async () => {
+    const subtree = realDir('roles-');
+    const dir = join(subtree, 'shared', 'default');
+    mkdirSync(dir, { recursive: true });
+    const { roleLibraryWorkingDirEscapes } = await import('../src/core/role-library.js');
+    expect(roleLibraryWorkingDirEscapes(dir, subtree, subtree)).toBe(false);
+    await fire(create(dir, turn));
+    expect(mocks.started).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not re-check host-created tasks, even at a symlinked path', async () => {
+    const link = join(realDir('host-'), 'link');
+    symlinkSync(realDir('target-'), link);
+    await fire(create(link));
+    expect(mocks.started).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses when the fire input disagrees with the authority record', async () => {
+    const dir = realDir('auth-');
+    const task = create(dir, turn);
+    await expect(fire({ ...task, workingDir: realDir('projection-') })).rejects.toThrow(/schedule_working_dir_swapped/);
+    expect(mocks.started).not.toHaveBeenCalled();
   });
 });

@@ -139,6 +139,75 @@ describe('hasBytedcliHome — provider-owned login state', () => {
   });
 });
 
+describe('describeBytedcliAuth — status without credentials', () => {
+  it('reports needs-login when this person has no HOME and does not create one', async () => {
+    const mod = await fresh();
+    expect(await mod.describeBytedcliAuth(BOB)).toEqual({ state: 'needs-login' });
+    expect(existsSync(mod.bytedcliHomeFor(BOB))).toBe(false);
+    expect(statusCalls).toEqual([]);
+  });
+
+  it('returns provider expiry and drops every credential field', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    const expiresAt = '2030-01-01T00:00:00.000Z';
+    statuses.set(mod.bytedcliHomeFor(ALICE), {
+      code: 0,
+      stdout: envelope({
+        authenticated: true,
+        bytecloud_auth: { authType: 'user', expires_at: expiresAt },
+        access_token: 'cloud-jwt-must-not-leak',
+        jwt: 'header.payload.sig',
+      }),
+    });
+    const status = await mod.describeBytedcliAuth(ALICE);
+    expect(status).toEqual({ state: 'authorized', expiresAt });
+    expect(JSON.stringify(status)).not.toContain('cloud-jwt');
+    expect(JSON.stringify(status)).not.toContain('header.payload');
+  });
+
+  it('accepts a numeric expiry on the provider object', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    const expiresAt = '2030-06-01T00:00:00.000Z';
+    statuses.set(mod.bytedcliHomeFor(ALICE), {
+      code: 0,
+      stdout: envelope({
+        authenticated: true,
+        bytecloud_auth: { authType: 'user', expiresAt: Date.parse(expiresAt) },
+      }),
+    });
+    expect(await mod.describeBytedcliAuth(ALICE)).toEqual({ state: 'authorized', expiresAt });
+  });
+
+  it('ignores an out-of-range expiry and still treats the login as authorized', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    statuses.set(mod.bytedcliHomeFor(ALICE), {
+      code: 0,
+      stdout: envelope({
+        authenticated: true,
+        bytecloud_auth: { authType: 'user', expires_at: 1.75e18 },
+      }),
+    });
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(true);
+    expect(await mod.describeBytedcliAuth(ALICE)).toEqual({ state: 'authorized' });
+    replies = [{ code: 0, stdout: 'cloud.jwt.value\n' }, { code: 0, stdout: 'code.jwt.value\n' }];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
+      cloudJwt: 'cloud.jwt.value',
+      codeJwt: 'code.jwt.value',
+    });
+  });
+
+  it('maps a provider outage to unknown instead of clearing the login', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    statuses.set(mod.bytedcliHomeFor(ALICE), { code: 1, stderr: 'provider unavailable' });
+    expect(await mod.describeBytedcliAuth(ALICE)).toEqual({ state: 'unknown' });
+    await expect(mod.hasBytedcliHome(ALICE)).rejects.toThrow(/unavailable/);
+  });
+});
+
 describe('login — device code, in two steps', () => {
   it('returns the authorization link and remembers the resume token', async () => {
     const mod = await fresh();

@@ -93,6 +93,8 @@ export interface CurrentDeferredSubmitConfirmationSettlement {
   cliSessionId?: string;
   /** Positive native ownership reported by the recheck, when the adapter can prove it. */
   ownershipProven?: boolean;
+  /** Not-yet-owned session id candidate reported by the recheck (see SubmitRecheckResult). */
+  unprovenCliSessionId?: string;
   recheckError?: unknown;
   lifecycle: 'confirmed' | 'verification-finished' | 'unchanged';
 }
@@ -155,6 +157,7 @@ export async function settleDeferredSubmitConfirmation(
 
   let recheckSubmitted = false;
   let cliSessionId: string | undefined;
+  let unprovenCliSessionId: string | undefined;
   let ownershipProven = false;
   let recheckError: unknown;
   if (input.recheck) {
@@ -164,6 +167,9 @@ export async function settleDeferredSubmitConfirmation(
       ownershipProven = typeof result === 'object' && !!result && result.ownershipProven === true;
       cliSessionId = typeof result === 'object' && result && typeof result.cliSessionId === 'string'
         ? result.cliSessionId
+        : undefined;
+      unprovenCliSessionId = typeof result === 'object' && result && typeof result.unprovenCliSessionId === 'string'
+        ? result.unprovenCliSessionId
         : undefined;
     } catch (err) {
       recheckError = err;
@@ -199,6 +205,7 @@ export async function settleDeferredSubmitConfirmation(
     action,
     ...(cliSessionId ? { cliSessionId } : {}),
     ...(ownershipProven ? { ownershipProven: true } : {}),
+    ...(unprovenCliSessionId ? { unprovenCliSessionId } : {}),
     ...(recheckError !== undefined ? { recheckError } : {}),
     lifecycle,
   };

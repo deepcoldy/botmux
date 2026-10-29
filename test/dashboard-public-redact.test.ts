@@ -605,6 +605,16 @@ describe('redactSettingsForPublic', () => {
     expect(JSON.stringify(out)).not.toContain('secret');
   });
 
+  it('hides bot scheduling grants (chats and controller identity) from tokenless settings', () => {
+    const settings = { publicReadOnly: true, scheduleBotGrants: { createEnabled: true, selfManageEnabled: false,
+      grants: [{ id: 'team', sourceAppId: 'cli_a', targetAppIds: ['cli_b'], chatIds: ['oc_secret'],
+        controllerUnionId: 'on_controller' }], botOptions: [] } };
+    const out = redactSettingsForPublic(settings) as any;
+    expect(out.publicReadOnly).toBe(true);
+    expect('scheduleBotGrants' in out).toBe(false);
+    expect(JSON.stringify(out)).not.toMatch(/oc_secret|on_controller/);
+  });
+
   it('removes the complete notifier snapshot from tokenless settings', () => {
     const settings = {
       publicReadOnly: true,

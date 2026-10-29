@@ -52,7 +52,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ### 创建
 
 \`\`\`
-botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent] [--model <id>] [--reasoning-effort <level>]
+botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent] [--model <id>] [--reasoning-effort <level>] [--until-done [--deadline <time>] [--retry-every <duration>]] [--notify failing,expired]
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
@@ -91,6 +91,23 @@ botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触�
 在自己的 scheduled turn 内都可用 \`botmux schedule pause self\` 或
 \`botmux schedule remove self\` 停止自己。
 \`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
+
+### 跟进任务：等某件事发生后再做（--until-done）
+
+用户要你「等 X 之后再做 Y」「每天看一下，好了就处理」「某天之后去清理」时，建一个 \`--until-done\` 任务，不要在 prompt 里自己设计循环和停止条件：
+
+\`\`\`bash
+botmux schedule add "7 10 * * *" "PR #123 合入后，把集群切回 upstream 并清理临时 worktree" --until-done --deadline 2026-11-20 --silent
+botmux schedule add "2026-10-30T10:00" "删除升级前的备份目录" --until-done --retry-every 6h
+\`\`\`
+
+- 没做完：按计划继续执行；执行出错、daemon 停机错过的那次会自动补跑，不会悄悄跳过。一次性任务没做完时每隔 \`--retry-every\`（默认 1d）再执行。
+- 每次执行时 prompt 末尾会附上第几次执行、截止时间和收尾方法，prompt 里只写清「等什么、做什么」。
+- 做完：在这次执行里**先**运行 \`botmux schedule done self --note "<一句话结果>"\`，再发最终答复。任务关闭但保留记录，不要用 pause/remove 代替。
+- \`--deadline\`：到点做最后一次收尾执行（prompt 会注明），之后任务关闭为「已到期」。
+- \`--notify failing,expired\`：按需在创建任务的话题里 @ 创建人（连续失败 3 次 / 截止收尾时）；默认不通知。
+- \`botmux schedule list\` 显示每个任务的状态与执行账本（执行 / 跳过 / 失败 / 错过次数）。
+- 机器人代为创建的委托任务暂不支持 \`--until-done\`。
 
 如果任务需要先发送最终结果再删除自身，必须把两个动作合并到同一次发送：
 
@@ -1325,14 +1342,14 @@ humanGate：
 
 export const ASK_SKILL = `---
 name: botmux-ask
-description: 在当前飞书/Lark 会话里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，单题返回选中的 key，多题可用 --questions-file 返回 JSON；支持推荐项预选与整卡提交。
+description: 在当前飞书/Lark 会话里向用户发起阻塞式选择题或输入表单并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，单题返回选中的 key，多题可用 --questions-file 返回 JSON；支持推荐项预选、文本/数值输入和整卡提交。
 ---
 
 发送位置跟随真实会话：群级（chat）会话发到群顶层消息流（不进话题），话题级（thread）会话发到对应话题。群级会话允许没有 BOTMUX_ROOT_MESSAGE_ID；不要用项目卡或其他消息 ID 补填该变量。缺少身份变量时先核对当前会话，不猜测身份或发送位置。
 
 # botmux-ask — 阻塞式向用户提问
 
-当你需要用户在明确选项里做选择，并且后续步骤必须等用户回答后才能继续时，使用 \`botmux ask buttons\`。
+当任一任务阶段缺少必要决定或输入，无法从已有上下文或合法读取取得，且后续步骤必须等待答案时，使用 \`botmux ask buttons\`。
 
 是否需要用户选择或批准，由当前任务授权和具体操作规则决定。已有授权覆盖的常规文件修改、只读 API 查询和执行步骤应继续推进；具体流程明确要求重新确认时，遵循该要求。
 
@@ -1340,7 +1357,8 @@ description: 在当前飞书/Lark 会话里向用户发起阻塞式选择题并�
 
 - 具体操作规则要求批准，且当前授权尚未满足要求
 - 需求存在 2-6 个会实质改变目标、范围或影响的清晰分支，且无法依据已有要求确定，必须由用户选择
-- 你正在 shell / CLI 里执行任务，需要把用户选择赋给变量继续跑
+- 需要用户提供必要事实、文本或数值，或选择后补充说明；可独立回答的问题尽量合并一张卡
+- 你正在 shell / CLI 里执行任务，需要把用户答案赋给变量继续跑
 
 ## 不要用
 
@@ -1360,6 +1378,28 @@ description: 在当前飞书/Lark 会话里向用户发起阻塞式选择题并�
 \`\`\`
 
 每题的 \`defaultSelectedKeys\` 必须来自选项，单选最多一项；空数组表示无预选，也保留提交按钮。默认选择不是用户回答，必须等真人提交；超时或失效不能当作接受推荐。\`answers[i]\` 对应第 i 题。若用户文字回复，读取 \`comment\`，不得把未提交的推荐项混入答案。CLI 与 daemon 需同时升级才支持此功能。
+
+## 选项与输入一起提交
+
+混合表单沿用 \`--questions-file\`。含 \`input\` 的题填写空 \`options\` 和 \`multiSelect:false\`；不可同时设置 \`inputMode\` 或 \`defaultSelectedKeys\`。不必为了开放输入编造选项：表单可以只有输入题。
+
+\`\`\`json
+[
+  {"prompt":"接下来怎么处理？","multiSelect":false,"options":[{"key":"continue","label":"继续"},{"key":"pause","label":"暂不处理"}]},
+  {"prompt":"实际耗时（小时）","multiSelect":false,"options":[],"input":{"type":"number","min":0,"max":1000}},
+  {"prompt":"补充说明","multiSelect":false,"options":[],"input":{"type":"text","required":false,"maxLength":500,"placeholder":"可留空"}}
+]
+\`\`\`
+
+每次最多 20 题。\`input.type\` 为 \`text\` 或 \`number\`；\`required\` 默认 true，\`maxLength\` 为 1–1000、默认 1000，\`placeholder\` 最多100字符，\`min/max\` 仅用于数值。数值按有限十进制校验，结果保留字符串，业务单位和平台枚举仍由调用方验证。只为有依据的建议预选，不预填未知事实或高风险同意项。
+
+选项和输入留在客户端草稿，点击一次“提交并继续”才共同结算。表单单独发在原会话位置，不嵌入会持续刷新的进度卡；校验失败只提示错误，不重绘输入。未提交草稿不保证跨客户端或 daemon 重启保留。需要更长说明时，可在话题里写完整答案替代整张表单。
+
+成功 JSON 同时包含 \`answers\` 和 \`inputs\`，两者均按题目位置对应。例如上面的回答为 \`"answers":[["continue"],[],[]],"inputs":[null,"2.5","需要补充日志"]\`。选择题的 inputs 槽和空的选填输入为 null；输入题的 answers 槽为空数组。\`comment\` 仍表示话题文字替代整张表单，不能与未提交的预选/草稿拼接；超时或失效的 inputs 为 null。
+
+仅指定人可答时使用 \`--answerer ou_...\`，ID 必须来自当前应用下核验的实际答题人，不能取机器 owner 或跨应用复制。该参数只收紧已有可对话权限，不授予业务批准权，不替代官方登录/审批，不能覆盖文档等流程已有的更严格答题人限制。不指定时仍需核对结果 \`by\` 是否有权作出本次决定。
+
+CLI 能力 \`ask_form_v1\` 只表示本地 CLI 理解表单；CLI 和 daemon 都要支持。表单与指定答题人请求使用版本化入口，旧 daemon 会拒绝而不会静默忽略答题人限制。拒绝时保留缺项，不能自动降级丢掉输入/答题人限制，也不能自造原始回调卡绕过受管 Ask。
 
 ## Canonical 用法
 
@@ -1418,12 +1458,14 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 
 所有人类可读提示都在 stderr，调用方不要 parse stderr。
 
+回答后校验答题人、字段和当前任务状态，只补缺项或歧义；有效答案沿原任务继续，不再要求用户说“继续”。恢复前核对既有副作用，取消或范围修订优先。超时不是同意，交付尚缺内容和恢复方式，不假称仍在后台等待。
+
 等待真人回答期间，无输出是正常状态。必须复用原等待进程直到回答或 Ask 正常超时；禁止发送 Ctrl-C、kill、结束等待 cell 或另发相同问题来结束当前轮。Ctrl-C 不取消 Ask。连接暂时中断会按原请求身份重连；进程确实退出时，后台保留结果并在原会话空闲后接续。超时、传输错误和机器人回答不能当作真人批准。
 
 
 ## 选项规则
 
-- \`--options\` 必填，至少 2 项，逗号分隔
+- 不使用 \`--questions-file\` 时 \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
 - \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整

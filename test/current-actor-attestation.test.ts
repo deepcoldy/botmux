@@ -400,6 +400,27 @@ describe('daemon current actor attestation', () => {
       expect(attestCurrentTurnLoopbackPeer(input)).toMatchObject({ callerOpenId: 'ou_current', turnId: 'om_turn' });
     });
 
+    it('requires the App runner to attest its nested app-server before new tools can cross turns', async () => {
+      const { procRoot, ds, check, input } = fixture();
+      writeProc(procRoot, 95, 1, '950');
+      writeProc(procRoot, 100, 95, '1000');
+      ds.localProcessAttestation.cliPid = 95;
+      ds.localProcessAttestation.cliProcStart = '950';
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('95:950');
+      // The runner is the CLI entry; the persistent native engine below it
+      // must not be mistaken for a previous-turn tool.
+      expect(resolveDaemonCurrentExecution(input)).toBeNull();
+      ds.localProcessAttestation.enginePid = 100;
+      ds.localProcessAttestation.engineProcStart = '1000';
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified' });
+      await expect(check()).resolves.toMatchObject({ ok: true });
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('102:2000');
+      writeProc(procRoot, 103, 102, '3000');
+      await expect(check(103, '3000')).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      writeProc(procRoot, 100, 95, 'recycled');
+      expect(resolveDaemonCurrentExecution(input)).toBeNull();
+    });
+
     it.each([
       ['100', '/release/bin/claude'],
       ['101', '/another-release/codex-code-mode-host'],

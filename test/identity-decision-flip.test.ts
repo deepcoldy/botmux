@@ -53,7 +53,7 @@ function deps(overrides: Record<string, unknown> = {}) {
     identityDecisionTurnIsLive: vi.fn((d: any, turnId: string) =>
       d.session.status === 'active' && !!d.worker && !d.worker.killed
       && !d.terminalIdentityTurnIds?.has(turnId)),
-    refreshTurnCliIdentity: vi.fn(async () => {}),
+    prepareTurnCliIdentity: vi.fn(async () => {}),
     ...overrides,
   };
 }
@@ -69,9 +69,9 @@ async function testProductionLiveness(terminal: Set<string> | undefined, expectR
   } as any;
   await runHandler(ds, { model: 'proven', flipped: true, turnId: 'om_term' }, d);
   if (expectReplay) {
-    expect(d.refreshTurnCliIdentity).toHaveBeenCalledWith(ds, 'om_term');
+    expect(d.prepareTurnCliIdentity).toHaveBeenCalledWith(ds, 'om_term');
   } else {
-    expect(d.refreshTurnCliIdentity).not.toHaveBeenCalled();
+    expect(d.prepareTurnCliIdentity).not.toHaveBeenCalled();
   }
 }
 
@@ -80,11 +80,11 @@ describe('handleIdentityDecisionFlip', () => {
     const d = deps();
     await runHandler(sessionFixture(), { model: 'proven', flipped: false, turnId: 'om_open' }, d);
     expect(d.clearSingleIdentityArtifacts).not.toHaveBeenCalled();
-    expect(d.refreshTurnCliIdentity).not.toHaveBeenCalled();
+    expect(d.prepareTurnCliIdentity).not.toHaveBeenCalled();
 
     const d2 = deps();
     await runHandler(sessionFixture(), { model: 'proven', flipped: true }, d2);
-    expect(d2.refreshTurnCliIdentity).not.toHaveBeenCalled();
+    expect(d2.prepareTurnCliIdentity).not.toHaveBeenCalled();
   });
 
   it('purges plaintext before replaying the opening turn even with no daemon live-turn field set (P2)', async () => {
@@ -94,11 +94,11 @@ describe('handleIdentityDecisionFlip', () => {
     const d = deps();
     await runHandler(sessionFixture(), { model: 'proven', flipped: true, turnId: 'om_open' }, d);
     expect(d.clearSingleIdentityArtifacts).toHaveBeenCalledWith('/tmp/flip-data', 'flip-session');
-    expect(d.refreshTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
+    expect(d.prepareTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
       session: expect.objectContaining({ sessionId: 'flip-session' }),
     }), 'om_open');
     expect(d.clearSingleIdentityArtifacts.mock.invocationCallOrder[0])
-      .toBeLessThan(d.refreshTurnCliIdentity.mock.invocationCallOrder[0]);
+      .toBeLessThan(d.prepareTurnCliIdentity.mock.invocationCallOrder[0]);
   });
 
   it('purges proven memory on a flip back to single', async () => {
@@ -114,7 +114,7 @@ describe('handleIdentityDecisionFlip', () => {
     const ds = sessionFixture({ terminalIdentityTurnIds: new Set(['om_old']) });
     await runHandler(ds, { model: 'proven', flipped: true, turnId: 'om_old' }, d);
     expect(d.clearSingleIdentityArtifacts).toHaveBeenCalledOnce();
-    expect(d.refreshTurnCliIdentity).not.toHaveBeenCalled();
+    expect(d.prepareTurnCliIdentity).not.toHaveBeenCalled();
     // No success record: a genuinely new decision for a live turn still runs.
     expect(ds.lastIdentityDecisionRepublish).toBeUndefined();
   });
@@ -135,7 +135,7 @@ describe('handleIdentityDecisionFlip', () => {
   it('does not replay when the session is inactive or the worker is dead', async () => {
     const d1 = deps({ identityDecisionTurnIsLive: () => false });
     await runHandler(sessionFixture(), { model: 'proven', flipped: true, turnId: 'om_open' }, d1);
-    expect(d1.refreshTurnCliIdentity).not.toHaveBeenCalled();
+    expect(d1.prepareTurnCliIdentity).not.toHaveBeenCalled();
   });
 
   it('records success so an identical flipped report does not replay again (baseline moves)', async () => {
@@ -146,11 +146,11 @@ describe('handleIdentityDecisionFlip', () => {
     // baseline. A following identical report computes flipped=false.
     expect(ds.lastIdentityDecisionRepublish).toEqual({ model: 'proven', turnId: 'om_open', ok: true });
     await runHandler(ds, { model: 'proven', flipped: false, turnId: 'om_open' }, d);
-    expect(d.refreshTurnCliIdentity).toHaveBeenCalledOnce();
+    expect(d.prepareTurnCliIdentity).toHaveBeenCalledOnce();
   });
 
   it('keeps a failed replay retryable: baseline never moves, the identical flip replays (P3-1)', async () => {
-    const d = deps({ refreshTurnCliIdentity: vi.fn(async () => { throw new Error('BOOM'); }) });
+    const d = deps({ prepareTurnCliIdentity: vi.fn(async () => { throw new Error('BOOM'); }) });
     const ds = sessionFixture();
     await runHandler(ds, { model: 'single', flipped: true, turnId: 'om_1' }, d);
     expect(ds.lastIdentityDecisionRepublish).toMatchObject({ model: 'single', turnId: 'om_1', ok: false });
@@ -158,7 +158,7 @@ describe('handleIdentityDecisionFlip', () => {
     // Same flip arrives again: still flipped (baseline stayed single→proven
     // baseline unchanged), so it retries instead of being silently swallowed.
     await runHandler(ds, { model: 'single', flipped: true, turnId: 'om_1' }, d);
-    expect(d.refreshTurnCliIdentity).toHaveBeenCalledTimes(2);
+    expect(d.prepareTurnCliIdentity).toHaveBeenCalledTimes(2);
   });
 
   it('heals a failed middle flip when the other model comes back (P3-2)', async () => {
@@ -167,12 +167,12 @@ describe('handleIdentityDecisionFlip', () => {
     // 1. proven flip replays fine.
     const d1 = deps();
     await runHandler(ds, { model: 'proven', flipped: true, turnId: 'om_1' }, d1);
-    expect(d1.refreshTurnCliIdentity).toHaveBeenCalledTimes(1);
+    expect(d1.prepareTurnCliIdentity).toHaveBeenCalledTimes(1);
     ds.lastPublishedIdentityModel = 'proven';
 
     // 2. single flip FAILS — its forgetProvenIdentityContent already purged
     //    the proven material.
-    const d2 = deps({ refreshTurnCliIdentity: vi.fn(async () => { throw new Error('BOOM'); }) });
+    const d2 = deps({ prepareTurnCliIdentity: vi.fn(async () => { throw new Error('BOOM'); }) });
     await runHandler(ds, { model: 'single', flipped: true, turnId: 'om_1' }, d2);
     expect(ds.lastIdentityDecisionRepublish).toMatchObject({ model: 'single', ok: false });
 
@@ -180,7 +180,7 @@ describe('handleIdentityDecisionFlip', () => {
     //    failed single attempt purged proven content, so replay to heal.
     const d3 = deps();
     await runHandler(ds, { model: 'proven', flipped: false, turnId: 'om_1' }, d3);
-    expect(d3.refreshTurnCliIdentity).toHaveBeenCalledWith(expect.anything(), 'om_1');
+    expect(d3.prepareTurnCliIdentity).toHaveBeenCalledWith(expect.anything(), 'om_1');
     expect(ds.lastIdentityDecisionRepublish).toMatchObject({ model: 'proven', ok: true });
   });
 
@@ -192,13 +192,13 @@ describe('handleIdentityDecisionFlip', () => {
     await runHandler(ds, { model: 'single', flipped: true, turnId: 'om_1' }, d);
     ds.lastPublishedIdentityModel = 'single';
     await runHandler(ds, { model: 'proven', flipped: true, turnId: 'om_1' }, d);
-    expect(d.refreshTurnCliIdentity).toHaveBeenCalledTimes(3);
+    expect(d.prepareTurnCliIdentity).toHaveBeenCalledTimes(3);
   });
 });
 
 // P3-a: the daemon registers onIdentityDecision as fire-and-forget but MUST
 // not let a rejected flip promise escape as unhandledRejection (the inner
-// try/catch only covers refreshTurnCliIdentity; a purge throw still rejects
+// try/catch only covers prepareTurnCliIdentity; a purge throw still rejects
 // handleIdentityDecisionFlip). Exercise the REAL registered callback text.
 function extractOnIdentityDecision(): (deps: any) => any {
   let text: string | undefined;

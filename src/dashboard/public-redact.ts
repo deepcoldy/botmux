@@ -138,7 +138,7 @@ export function stripAllSchedulePreconditionMaterial(schedule: unknown): unknown
 }
 
 /** Drop `prompt` (business instructions), `workingDir` (repo/customer path),
- *  and every executable/authority-bearing precondition field from
+ *  the run-as identity fields, and every executable/authority-bearing precondition field from
  *  `/api/schedules` rows for anonymous visitors. The supported list projection
  *  may carry only `hasPrecondition` / `preconditionEnabled`; source/path/script/
  *  ref/hash are stripped defensively even though authenticated management rows
@@ -152,6 +152,11 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
     const {
       prompt: _prompt,
       workingDir: _workingDir,
+      // Who a task runs as is personal data. Rows never carry it; strip it from
+      // event patches too in case a write path ever includes it.
+      ownerOpenId: _ownerOpenId,
+      ownerUnionId: _ownerUnionId,
+      runAsClaim: _runAsClaim,
       ...rest
     } = projected as Record<string, unknown>;
     return rest;
@@ -271,6 +276,15 @@ function projectSessionEvent(type: string, body: unknown, isPrivate: SessionFiel
       patch: omitSessionFields(eventBody.patch as Record<string, unknown>, isPrivate),
     };
   }
+  // Defense in depth for a frame the SSE stream already drops for these
+  // audiences. `senderOpenId` is a new per-turn identity; `chatId` says which
+  // group just finished. Management never reaches this branch.
+  if (type === 'turn.finished') {
+    const projected = { ...eventBody };
+    delete projected.senderOpenId;
+    delete projected.chatId;
+    return projected;
+  }
   return body;
 }
 
@@ -319,11 +333,14 @@ export function redactSessionEventForPublic(type: string, body: unknown): unknow
 }
 
 /** 匿名只读面板不展示外部 Codex 活动、目标 Bot 或投递运行态,也不展示过载
- *  告警的目标 Bot / 收件人提示。 */
+ *  告警的目标 Bot / 收件人提示，以及机器人调度授权（群、控制管理员身份）。 */
 export function redactSettingsForPublic(settings: unknown): unknown {
   if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return settings;
   const source = settings as Record<string, unknown>;
   // httpProxy may embed `user:pass@` credentials.
-  const { codexNotifier: _privateNotifier, hostOverloadAlert: _privateOverload, httpProxy: _privateProxy, ...publicSettings } = source;
+  const {
+    codexNotifier: _privateNotifier, hostOverloadAlert: _privateOverload, httpProxy: _privateProxy,
+    scheduleBotGrants: _privateScheduleGrants, ...publicSettings
+  } = source;
   return publicSettings;
 }

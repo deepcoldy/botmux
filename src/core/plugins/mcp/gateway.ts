@@ -50,6 +50,7 @@ import {
   readSessionMcpRuntimeManifest,
   type SessionMcpRuntimeManifest,
 } from './session-runtime.js';
+import { pluginMcpToolTimeoutOptions } from './runtime-options.js';
 import { readPluginMcpDescriptor } from './private-store.js';
 import type { PluginMcpServer } from '../types.js';
 import type { TrustedCaller } from '../../../types.js';
@@ -95,6 +96,7 @@ interface GatewayDescriptor {
   pluginId: string;
   server: PluginMcpServer;
   pluginDir: string;
+  toolTimeoutMs?: number;
 }
 
 interface GatewayConnection extends GatewayDescriptor {
@@ -231,6 +233,7 @@ function snapshotGatewayDescriptors(snapshot: SessionMcpRuntimeManifest): Gatewa
     pluginId: entry.pluginId,
     server: entry.server,
     pluginDir: entry.pluginDir,
+    ...(entry.toolTimeoutMs === undefined ? {} : { toolTimeoutMs: entry.toolTimeoutMs }),
   }));
 }
 
@@ -533,11 +536,16 @@ export class PluginMcpGateway {
     }
   }
 
-  private requestOptions(request: { params?: { _meta?: { progressToken?: string | number } } }, extra: { signal: AbortSignal }) {
+  private requestOptions(
+    request: { params?: { _meta?: { progressToken?: string | number } } },
+    extra: { signal: AbortSignal },
+    timeout?: number,
+  ) {
     const token = request.params?._meta?.progressToken;
     return {
       signal: extra.signal,
       resetTimeoutOnProgress: true,
+      ...pluginMcpToolTimeoutOptions(timeout),
       ...(token === undefined ? {} : {
         onprogress: (progress: { progress: number; total?: number; message?: string }) => {
           void this.server.notification({ method: 'notifications/progress', params: { progressToken: token, ...progress } });
@@ -758,7 +766,7 @@ export class PluginMcpGateway {
       const result = await this.toolCallIdentity.run({ identity }, () => route.connection.client.callTool(
         this.withTrustedTurnMeta({ ...request.params, name: route.originalName }, identity),
         undefined,
-        this.requestOptions(request, extra),
+        this.requestOptions(request, extra, route.connection.toolTimeoutMs),
       ));
       const deliveryValue = isRecord(result._meta)
         ? result._meta[BOTMUX_HOST_DELIVERY_META_KEY]

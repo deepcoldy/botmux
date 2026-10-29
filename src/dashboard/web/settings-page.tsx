@@ -15,6 +15,8 @@ import {
 } from './update-action.js';
 import { ui } from './ui.js';
 import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
+import { ScheduleBotGrantsEditor, type ScheduleBotGrantBotOption } from './schedule-bot-grants-editor.js';
+import type { ScheduleBotGrant } from '../../global-config.js';
 import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
 import { PromptCacheEditor } from './prompt-cache-editor.js';
 import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
@@ -88,6 +90,14 @@ interface DashboardSettings {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
+  /** scheduleDelegation.createEnabled / selfManageEnabled / botGrants. */
+  scheduleBotGrants: {
+    createEnabled: boolean;
+    selfManageEnabled: boolean;
+    grants: ScheduleBotGrant[];
+    ignoredCount: number;
+    botOptions: ScheduleBotGrantBotOption[];
+  };
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -251,6 +261,15 @@ function parseSettings(s: any): DashboardSettings {
     },
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
     crossPrincipalInterruption: s?.crossPrincipalInterruption === true,
+    scheduleBotGrants: {
+      createEnabled: s?.scheduleBotGrants?.createEnabled === true,
+      selfManageEnabled: s?.scheduleBotGrants?.selfManageEnabled === true,
+      grants: Array.isArray(s?.scheduleBotGrants?.grants) ? s.scheduleBotGrants.grants : [],
+      ignoredCount: Number.isSafeInteger(s?.scheduleBotGrants?.ignoredCount)
+        ? Math.max(0, s.scheduleBotGrants.ignoredCount)
+        : 0,
+      botOptions: Array.isArray(s?.scheduleBotGrants?.botOptions) ? s.scheduleBotGrants.botOptions : [],
+    },
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
@@ -529,7 +548,10 @@ function SettingsPage() {
       } catch { /* still offline: fall back to the pre-save snapshot */ }
       if (!mountedRef.current) return;
       if (!reconciled) setSettings(before);
-      const detail = e instanceof Error ? e.message : String(e);
+      const code = e instanceof Error ? e.message : String(e);
+      // Known error codes have a sentence; anything else is shown as is.
+      const known = tr(`settings.saveError.${code}`);
+      const detail = known === `settings.saveError.${code}` ? code : known;
       setSettingsMsg({
         text: reconciled
           ? `${tr('settings.saveReconciled')}: ${detail}`
@@ -818,6 +840,18 @@ function SettingsPage() {
   );
 }
 
+type ScheduleBotGrantsPatch = Partial<Pick<DashboardSettings['scheduleBotGrants'], 'createEnabled' | 'selfManageEnabled' | 'grants'>>;
+
+/** PUT body for the bot-grant entry. A list write names the list it was edited
+ *  from, so the server can refuse it (and the page re-reads) when that is no
+ *  longer what is on disk — e.g. another tab revoked a grant meanwhile. */
+export function scheduleBotGrantsPayload(
+  shown: ScheduleBotGrant[],
+  patch: ScheduleBotGrantsPatch,
+): ScheduleBotGrantsPatch & { baseGrants?: ScheduleBotGrant[] } {
+  return patch.grants ? { ...patch, baseGrants: shown } : patch;
+}
+
 export function SettingsBody(props: {
   settings: DashboardSettings;
   canWrite: boolean;
@@ -861,6 +895,13 @@ export function SettingsBody(props: {
       'hostOverloadAlert',
       { hostOverloadAlert: patch },
       s => ({ ...s, hostOverloadAlert: { ...s.hostOverloadAlert, ...patch } }),
+    );
+  };
+  const saveScheduleBotGrants = (patch: ScheduleBotGrantsPatch) => {
+    return props.onSave(
+      'scheduleBotGrants',
+      { scheduleBotGrants: scheduleBotGrantsPayload(settings.scheduleBotGrants.grants, patch) },
+      s => ({ ...s, scheduleBotGrants: { ...s.scheduleBotGrants, ...patch } }),
     );
   };
   const repoModeOptions = useMemo(() => [
@@ -1036,6 +1077,30 @@ export function SettingsBody(props: {
             checked={settings.crossPrincipalInterruption}
             disabled={dis || savingKey === 'crossPrincipalInterruption'}
             onChange={value => saveBoolean('crossPrincipalInterruption', value)}
+          />
+          <ToggleRow
+            title={tr('settings.scheduleDelegationCreate')}
+            dataAction="toggle-schedule-delegation-create"
+            help={tr('settings.scheduleDelegationCreateHelp')}
+            checked={settings.scheduleBotGrants.createEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onChange={value => { void saveScheduleBotGrants({ createEnabled: value }); }}
+          />
+          <ToggleRow
+            title={tr('settings.scheduleDelegationSelfManage')}
+            dataAction="toggle-schedule-delegation-self-manage"
+            help={tr('settings.scheduleDelegationSelfManageHelp')}
+            checked={settings.scheduleBotGrants.selfManageEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onChange={value => { void saveScheduleBotGrants({ selfManageEnabled: value }); }}
+          />
+          <ScheduleBotGrantsEditor
+            grants={settings.scheduleBotGrants.grants}
+            ignoredCount={settings.scheduleBotGrants.ignoredCount}
+            botOptions={settings.scheduleBotGrants.botOptions}
+            createEnabled={settings.scheduleBotGrants.createEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onSave={grants => saveScheduleBotGrants({ grants })}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>

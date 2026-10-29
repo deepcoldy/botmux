@@ -21,7 +21,7 @@ import {
   triggerUserAuthApplies,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
-  tokenStoreProtection, credentialSourceOf } from '../src/services/trigger-user-auth.js';
+  tokenStoreProtection, credentialSourceOf, delegatesOnMention } from '../src/services/trigger-user-auth.js';
 
 describe('parseTriggerUserAuthConfig', () => {
   it('treats an absent field as "not configured at all"', () => {
@@ -187,5 +187,26 @@ describe('credentialSource', () => {
   it.each(['device', 'machine', 'owner', 1, true])('rejects %s', (bad) => {
     expect(() => parseTriggerUserAuthConfig({ enabled: true, credentialSource: bad }))
       .toThrow(/credentialSource must be one of auto \| platform \| local/);
+  });
+});
+
+describe('delegateOnMention', () => {
+  it('is on by default and stored only when turned off', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true })).not.toHaveProperty('delegateOnMention');
+    expect(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: true })).not.toHaveProperty('delegateOnMention');
+    expect(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: false })?.delegateOnMention).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true }))).toBe(true);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: false }))).toBe(false);
+  });
+
+  it('needs the policy itself: there is no verified sender to hand over otherwise', () => {
+    expect(delegatesOnMention(null)).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: false }))).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true, tools: [] }))).toBe(false);
+  });
+
+  it.each(['yes', 1, {}])('rejects %j', bad => {
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: bad }))
+      .toThrow(/delegateOnMention must be a boolean/);
   });
 });

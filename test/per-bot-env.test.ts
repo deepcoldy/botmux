@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { sanitizePerBotEnv, isReservedPerBotEnvKey } from '../src/core/per-bot-env.js';
+import {
+  droppedReservedPerBotEnvKeys,
+  isReservedPerBotEnvKey,
+  sanitizePerBotEnv,
+} from '../src/core/per-bot-env.js';
 
 describe('sanitizePerBotEnv()', () => {
   it('keeps valid env keys and stringifies primitive values', () => {
@@ -76,6 +80,32 @@ describe('sanitizePerBotEnv()', () => {
     expect(sanitizePerBotEnv([])).toEqual({});
     expect(sanitizePerBotEnv('ANTHROPIC_BASE_URL=x')).toEqual({});
     expect(sanitizePerBotEnv(42)).toEqual({});
+  });
+});
+
+describe('droppedReservedPerBotEnvKeys()', () => {
+  it('returns only the valid-named reserved keys sanitizePerBotEnv drops', () => {
+    expect(
+      droppedReservedPerBotEnvKeys({
+        CLAUDE_CONFIG_DIR: '/tmp/claude',
+        CODEX_HOME: '/tmp/codex',
+        BOTMUX_SESSION_ID: 'hijack',
+        ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        '1BAD': 'x',
+        OK_OBJ: { nested: true },
+      }),
+    ).toEqual(['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'BOTMUX_SESSION_ID']);
+  });
+
+  it('is empty for non-reserved or non-object input', () => {
+    expect(droppedReservedPerBotEnvKeys({ ANTHROPIC_BASE_URL: 'x', HTTPS_PROXY: 'y' })).toEqual([]);
+    expect(droppedReservedPerBotEnvKeys(undefined)).toEqual([]);
+    expect(droppedReservedPerBotEnvKeys(null)).toEqual([]);
+    expect(droppedReservedPerBotEnvKeys('CODEX_HOME=x')).toEqual([]);
+  });
+
+  it('does not report invalid env names (a different problem from reserved keys)', () => {
+    expect(droppedReservedPerBotEnvKeys({ 'BAD-NAME': 'x', 'has space': 'y' })).toEqual([]);
   });
 });
 

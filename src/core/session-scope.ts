@@ -182,6 +182,28 @@ export interface ScopedCommand {
   capabilities: SessionScopeCapabilities;
 }
 
+/**
+ * Whether `pid` has exited and is only waiting to be reaped (a zombie). Such a
+ * process is nobody's launch payload. A login shell that runs a hook in the
+ * background (autojump, …) and then execs leaves exactly this: an unreaped
+ * child under whatever it exec'd into, which never reaps it. Counting it as a
+ * child would make a single-payload launch layer look ambiguous forever.
+ * Linux only; an unreadable stat (process gone, other platforms) is "no".
+ */
+export function isZombieProcess(
+  pid: number,
+  read: (path: string) => string = path => readFileSync(path, 'utf8'),
+): boolean {
+  try {
+    const stat = read(`/proc/${pid}/stat`);
+    const close = stat.lastIndexOf(')');
+    const state = close >= 0 ? stat.slice(close + 2, close + 3) : '';
+    return state === 'Z' || state === 'X';
+  } catch {
+    return false;
+  }
+}
+
 const SCOPE_PARENT_SCRIPT = '"$@"; status=$?; exit "$status"';
 const SCOPE_PARENT_NAME = 'botmux-session-scope';
 
@@ -201,7 +223,8 @@ export function sessionScopePayloadPid(panePid: number, options: {
       || argv[4] !== 'systemd-run' || argv[5] !== '--user' || argv[6] !== '--scope'
       || argv[7] !== '--quiet' || argv[8] !== '--collect'
       || !/^--unit=botmux-session-[a-z0-9_.-]+\.scope$/.test(argv[9] ?? '')) return panePid;
-    const children = read(`/proc/${panePid}/task/${panePid}/children`).trim().split(/\s+/);
+    const children = read(`/proc/${panePid}/task/${panePid}/children`).trim().split(/\s+/)
+      .filter(child => !(/^[1-9]\d*$/.test(child) && isZombieProcess(Number(child), read)));
     if (children.length !== 1 || !/^[1-9]\d*$/.test(children[0])) return panePid;
     const child = Number(children[0]);
     return Number.isSafeInteger(child) && child > 1 && child !== panePid ? child : panePid;

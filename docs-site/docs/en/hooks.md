@@ -78,6 +78,7 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `session.exit` | A worker exits, crashes, or the session is closed (silenced by default on daemon shutdown) |
 | `session.idle` | A session enters or leaves idle, deduplicated per session + state over 10s |
 | `session.requires_attention` | A TUI prompt or a worker `user_notify` needs the user to act |
+| `turn.finished` | A worker `turn_terminal` was accepted by the durable callback. Notification only. Dedupe, VC sessions, and who receives the SSE frame are described below |
 
 ## Payload Fields
 
@@ -98,10 +99,19 @@ Different events carry extra fields:
 | `session.exit` | `reason`, `code` (worker exit path; `null` for `dashboard_close`) |
 | `session.idle` | `prevState`, `newState`, `transition`, `source` |
 | `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `multiSelect`, `message` |
+| `turn.finished` | `turnId`, `status` (`success` or `error`), `terminalStatus` (`completed`, `failed`, `cancelled`, or `ambiguous`), `senderOpenId` (this turn's reply-target sender, or the Codex App ledger sender frozen at acceptance), `dispatchAttempt` when present |
 
 `schedule.fired.status` and the task's `lastStatus` use `ok`, `error`, or `skipped`: `ok` means the task was handed to the executor, not that model generation or message delivery has completed; `error` means the precondition check or dispatch failed; `skipped` means the precondition did not pass and no model was called. A skip does not consume the repeat count or delete the task, precondition configuration, or execution logs. Enabled one-shot tasks remain enabled and become eligible for another scheduler check after at least 30 seconds; if an early manual run is skipped, subsequent automatic checks do not precede the original scheduled time. Recurring tasks keep their existing cadence.
 
 `skipped` is a new status and requires no migration of existing tasks. Custom hooks that accept only `ok/error` must handle it separately instead of treating it as a successful execution.
+
+`turn.finished` is the hook and daemon-loopback notice that a `turn_terminal` was accepted by the durable callback. It is not `turn.completed`. That name belongs to the feedback webhook outbox: it is written when a delivered answer is later correlated with a terminal, and it carries duration, usage, and a delivery id. `turn.finished` does not wait for that correlation and does not include usage.
+
+`status` maps `completed` to `success`, and `failed`, `cancelled`, or `ambiguous` to `error`. `terminalStatus` keeps the worker enum, so a cancel is distinct from a failure. `senderOpenId` comes from that turn's reply target, or from the Codex App ledger entry frozen at acceptance when that path publishes the event. When neither has a sender the field is absent. The session owner, creator, and previous caller are not filled in.
+
+The notice is emitted once per session, turn, and dispatch attempt inside one daemon process, remembered in a 4096-entry FIFO. A restart can emit the same terminal again. It is published only after the durable terminal callback returns. A thrown persist does not emit and does not consume that memory key. A worker that exits without `turn_terminal` does not synthesize one (`session.exit` still covers the process exit).
+
+A dedicated VC receiver session still publishes on the daemon loopback bus, which already carries that session's rows, and does not run the user hook. The public dashboard `GET /events` relay drops the frame for anonymous and workbench viewers. A signed-in host management session can still see it. The dashboard UI does not render the frame.
 
 By default, `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to **600 characters**, with `xxxLength` / `xxxTruncated` added; only events in `redact.fullContentEvents` pass through the full text.
 
@@ -113,7 +123,7 @@ The `<botmux_group_join>` block, the inviter `<sender>` tag, and the opening tru
 
 The trusted `botmux_group_join` block proves the host-observed lifecycle event, opening context, and turn ownership, **not that the caller is an authenticated human**. Without platform bot evidence the opening caller has no `senderType`, so automatic continuation leases, user-level dispatch, failed-turn recovery, and direct `schedule:create` privileges that require a user caller are not granted. Downstream consumers must independently verify identity and authorization when needed; a contact lookup alone does not replace these turn-level checks. If the event omits `operatorOpenId`, auto-start may still proceed if the gate allows it, but the opening has no `<sender>`, no `operator_open_id`, and no trusted caller.
 
-The separate session controller still records the operator with user-typed owner semantics (`trustedSessionController`), even when the operator is an app. This is not human authentication for the opening caller. With the experimental `crossPrincipalInterruption` feature enabled (off by default), that app's later bot messages do not match the user-typed owner and follow cross-principal handling. Owner-based display and confirmation behavior also retains the existing user semantics; this join gate does not tighten that separate mechanism.
+When the inviter is already known to be an app or bot (identity-cache `type` `app`/`bot`, or a same-host peer cross-ref), that operator is not stored as the session owner or `lastCallerOpenId`, and the opening reply target is not recorded as a human sender (`isBot: false`). `trustedSessionController` therefore does not mint a user-typed controller for the join, and later schedule / dispatch recovery cannot treat the operator as the human who opened the turn. This refusal does not depend on `autoStartOnGroupJoinGateRequired`: with the gate off the opening prompt stays byte-identical to older versions, but an app or bot operator still receives no human identity. An operator with no such evidence is still recorded as the human sender and owner. With the experimental `crossPrincipalInterruption` feature enabled (off by default), only an owner that was actually recorded as human gets a user-typed controller.
 
 A regular hook is a *notification* — nothing reads its result. A gate event with `mode: "sync"` is a *verdict*: the daemon waits for it, reads it, and allows or rejects the action. `prompt.submit` gates a message before it reaches the CLI. `chat.bot_added` gates only `autoStartOnGroupJoin`; it does not block async observers, `groupJoinCommand`, or owner auto-invite.
 

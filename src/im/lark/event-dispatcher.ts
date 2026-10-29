@@ -13,6 +13,8 @@ import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadB
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
+import { classifyLarkError } from './error-classify.js';
+import { ListenerCircuitBreaker } from '../../services/listener-circuit-breaker.js';
 import { logger } from '../../utils/logger.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
@@ -1468,9 +1470,11 @@ export function learnSameOwnerSiblingCrossRef(
   } catch {
     return false;
   }
-  const name = entries.find(e => e.larkAppId === sibling.larkAppId)?.botName?.trim();
+  const rawName = entries.find(e => e.larkAppId === sibling.larkAppId)?.botName;
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
   if (!name) return false;
-  const sameName = entries.filter(e => e.botName?.trim().toLowerCase() === name.toLowerCase()).length;
+  const sameName = entries.filter(e => typeof e.botName === 'string'
+    && e.botName.trim().toLowerCase() === name.toLowerCase()).length;
   if (sameName !== 1) return false;
   updateBotOpenIdCrossRef(dataDir, larkAppId, [{ name, id: { open_id: senderOpenId } }]);
   return isKnownPeerBot(dataDir, larkAppId, senderOpenId);
@@ -2460,7 +2464,9 @@ export function canRunDaemonCommand(
  * 入口 A：无权限者 @bot（或私聊 bot）时弹授权申请卡，由管理员处置。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内不再发卡。真人路径的调用方传
  * `notifyThrottledRequester`，申请人在这期间再来找 bot 时回一句原因（同一张卡 / 同一次拒绝
- * 只回一次，见 claimThrottleNotice）；bot 发送方不传，保持静默，免得两个 bot 互相回话。
+ * 只回一次，见 claimThrottleNotice）；卡片就回复在申请人自己消息下面时不回（卡片本身就是说明），
+ * 只有转投管理员私聊、申请人看不见卡的情况才提示「还在等」。bot 发送方不传，保持静默，免得两个
+ * bot 互相回话。
  * 开放模式（无 owner）兜底不发。关了 autoGrantRequestCards 是文档写明的静默拦截，不回话。
  *
  * 默认（grantRequestToOwnerDm 未开）：卡片回复在原会话、正文 @ resolveGrantApprover 选出的管理员；
@@ -2564,8 +2570,9 @@ export async function maybeSendGrantRequestCard(
     logger.debug(`grant request card send failed: ${err}`);
     return;
   }
-  // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
-  markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
+  // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。卡就回复在申请人自己的消息下面，
+  // 它本身就是「在等管理员处理」的说明，待处理期间申请人再来找 bot 不另发文字提示。
+  markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce, { shownToRequester: true });
 }
 
 function logSilentGrantDrop(
@@ -2574,7 +2581,8 @@ function logSilentGrantDrop(
   logger.info(`[grant:${larkAppId}] blocked @ from ${requesterOpenId?.substring(0, 12) ?? '?'} in ${chatId.substring(0, 12)}: no request card (${reason})`);
 }
 
-/** 申请人在申请卡待处理 / 刚被拒绝期间又来找 bot：回一句原因，免得 ta 以为 bot 坏了。 */
+/** 申请人在申请卡待处理 / 刚被拒绝期间又来找 bot：回一句原因，免得 ta 以为 bot 坏了。
+ *  待处理的卡就在申请人眼前（回复在原会话）时不回：卡片本身已经说明在等管理员。 */
 async function replyThrottledRequester(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string,
 ): Promise<void> {
@@ -2918,11 +2926,94 @@ function runWithAbortDeadline<T>(
   });
 }
 
+/**
+ * 每个 (larkAppId, chatId) 监听的熔断状态。message-listener 的轮询由
+ * runMessageListenerPoll 带看门狗整轮驱动（保留游标/超时语义），这里只做
+ * per-chat 的终态分类、熔断摘除与一次性 owner 告警——永久错误（bot 被移出
+ * 群 230002、文档失权等）连续命中后跳过该群，不再每 30s 空转。
+ *
+ * 熔断期间以慢探测节拍放行一次请求：bot 被重新拉回群后无需重启即自动回岗。
+ */
+const LISTENER_PERMANENT_THRESHOLD = 3;
+const LISTENER_PROBE_INTERVAL_MS = 10 * 60_000;
+/**
+ * 管理员熔断私信按 app 去重的窗口。应用级故障（凭据/全站权限被撤）会让所有群
+ * 同时返回永久错误，逐群私信会形成告警风暴；同一 app 在窗口内只发第一条，
+ * 其余在日志里逐群记录，窗口过后新熔断的群允许再报一次。
+ */
+const LISTENER_ALERT_DEDUPE_MS = LISTENER_PROBE_INTERVAL_MS;
+let listenerNow: () => number = () => Date.now();
+const listenerCircuits = new ListenerCircuitBreaker({
+  permanentThreshold: LISTENER_PERMANENT_THRESHOLD,
+  probeIntervalMs: LISTENER_PROBE_INTERVAL_MS,
+  now: () => listenerNow(),
+});
+const lastListenerAlertAt = new Map<string, number>();
+
+function listenerCircuitKey(larkAppId: string, chatId: string): string {
+  return `${larkAppId}:${chatId}`;
+}
+
+export function __resetListenerCircuitsForTest(): void {
+  listenerCircuits.clear();
+  lastListenerAlertAt.clear();
+  listenerNow = () => Date.now();
+}
+
+/** 测试用：注入熔断/告警共用的时钟（传 null/undefined 恢复真实时钟）。 */
+export function __setListenerClockForTest(now: (() => number) | null | undefined): void {
+  listenerNow = now ?? (() => Date.now());
+  lastListenerAlertAt.clear();
+}
+
+/**
+ * 熔断中的群是否在本拍放行一次慢探测。未熔断返回 true（正常轮询）。
+ */
+function listenerChatAllowed(larkAppId: string, chatId: string): boolean {
+  return listenerCircuits.shouldPoll(listenerCircuitKey(larkAppId, chatId));
+}
+
+function listenerChatSucceeded(larkAppId: string, chatId: string): void {
+  listenerCircuits.resume(listenerCircuitKey(larkAppId, chatId));
+}
+
+async function listenerChatFailed(
+  larkAppId: string,
+  chatId: string,
+  err: unknown,
+): Promise<void> {
+  const classified = classifyLarkError(err);
+  if (classified.classification !== 'permanent') return; // 瞬时错误：本轮 warn，下轮继续，不退避
+  const key = listenerCircuitKey(larkAppId, chatId);
+  const justOpened = listenerCircuits.recordPermanent(key);
+  if (!justOpened) return;
+  const codePart = classified.larkCode ? `（code ${classified.larkCode}）` : '';
+  logger.warn(`[message-listener:${larkAppId}] circuit OPEN for chat=${chatId.substring(0, 12)} code=${classified.larkCode ?? '?'}`);
+  // 应用级故障会同时熔断多个群：私信按 app 节流一个窗口，避免逐群告警风暴。
+  const now = listenerNow();
+  const lastAlertAt = lastListenerAlertAt.get(larkAppId) ?? 0;
+  if (now - lastAlertAt < LISTENER_ALERT_DEDUPE_MS) {
+    logger.warn(`[message-listener:${larkAppId}] circuit OPEN for chat=${chatId.substring(0, 12)} suppressed duplicate admin DM (app alerted ${now - lastAlertAt}ms ago)`);
+    return;
+  }
+  const bot = getBot(larkAppId) as BotState | undefined;
+  const adminOpenId = bot ? getAdminOpenId(bot) : undefined;
+  if (!adminOpenId) return;
+  const dm =
+    `[botmux] 群消息监听已自动熔断：${chatId}\n` +
+    `该群连续 ${LISTENER_PERMANENT_THRESHOLD} 次返回永久错误${codePart}（${classified.message.slice(0, 120)}），` +
+    `通常是 bot 被移出群或群已解散。已停止对该群的高频轮询并转为 10 分钟慢探测；` +
+    `bot 被重新拉回后会自动恢复。如不再需要该监听，可在工作台关闭对应群监听。` +
+    `（同一应用其它群也在窗口内熔断时不重复私信，请以工作台监听状态为准。）`;
+  lastListenerAlertAt.set(larkAppId, now);
+  try {
+    await dmAdmin(larkAppId, adminOpenId, dm, `listener circuit open ${chatId.substring(0, 12)}`);
+  } catch {
+    /* 私信失败保持熔断，不影响状态机；水印已置位，避免失败重试造成消息轰炸 */
+  }
+}
+
 function enabledMessageListenerChatIds(bot: BotState): string[] {
-  // Global listeners potentially apply to every joined group. The polling
-  // backfill needs concrete chat ids, so callers provide the configured
-  // exception set here; joined chats without an exception are still covered by
-  // realtime delivery and are discovered by the dashboard group list.
   const customChatIds = Object.entries(bot.config.groupMessageListenerOverrides ?? {})
     .filter(([, override]) => override?.mode === 'custom' && override.listener.enabled === true && !!override.listener.prompt?.trim())
     .map(([chatId]) => chatId);
@@ -3424,9 +3515,13 @@ async function pollMessageListenersOnce(
   const bot = getBot(larkAppId);
   const configuredChatIds = enabledMessageListenerChatIds(bot);
   let chatIds = configuredChatIds;
+  // roster 拉取成功时本轮 chatIds 是权威全量，可顺手 prune 熔断表里消失的群；
+  // roster 失败回退到仅配置群时不能 prune（全局监听群只是暂时没列出来）。
+  let rosterFresh = !bot.config.globalMessageListener?.enabled;
   if (bot.config.globalMessageListener?.enabled) {
     try {
       chatIds = [...new Set([...(await listChats(larkAppId)).map(chat => chat.chatId), ...configuredChatIds])];
+      rosterFresh = true;
     } catch (error) {
       // A transient roster failure must not suppress custom/legacy listener
       // backfill for the whole 30s pass. Realtime delivery stays unaffected.
@@ -3455,9 +3550,17 @@ async function pollMessageListenersOnce(
   }
 
   const orderedChatIds = orderChatIdsFromCursor(larkAppId, chatIds);
+  if (rosterFresh) {
+    listenerCircuits.prune(new Set(orderedChatIds.map(chatId => listenerCircuitKey(larkAppId, chatId))));
+  }
   if (progress) progress.firstChatId = orderedChatIds[0];
   for (const chatId of orderedChatIds) {
     if (signal?.aborted) return;
+    // 已熔断的群在慢探测节拍外直接跳过：不再对飞书发永久失败的请求。
+    if (!listenerChatAllowed(larkAppId, chatId)) {
+      if (progress) messageListenerPollCursor.set(larkAppId, { chatId, skip: true });
+      continue;
+    }
     if (progress) progress.currentChatId = chatId;
     let messages: any[];
     try {
@@ -3476,9 +3579,13 @@ async function pollMessageListenersOnce(
         `poll chat ${chatId.substring(0, 12)}`,
         signal,
       );
+      // 走到这里说明该群本拍可达（即使返回 0 条新消息）：若之前在慢探测熔断，
+      // 判定 bot 已被重新拉回/权限恢复，自动回岗。
+      listenerChatSucceeded(larkAppId, chatId);
     } catch (err) {
       if (signal?.aborted) return;
       logger.warn(`[message-listener:${larkAppId}] failed to poll chat=${chatId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+      await listenerChatFailed(larkAppId, chatId, err);
       continue;
     }
 
@@ -6383,6 +6490,8 @@ export function createLarkEventDispatcherRuntime(
         // D7「群内需有 allowedUser」闸能吃到刚拉进来的 owner。
         await autoInviteOwnerOnGroupJoin(larkAppId, chatId, operatorOpenId)
           .catch(err => logger.warn(`[groups] autoInviteOwner error (bot=${larkAppId} chat=${chatId}): ${err?.message ?? err}`));
+        // 重新入群立即解除该群监听熔断，不必等 10 分钟慢探测。
+        listenerChatSucceeded(larkAppId, chatId);
         await handlers.handleBotAdded?.(chatId, operatorOpenId, larkAppId);
       } catch (err) {
         logger.error(`Error handling bot-added event: ${err}`);

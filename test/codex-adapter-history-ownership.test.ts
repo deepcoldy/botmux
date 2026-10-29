@@ -191,9 +191,15 @@ describe('codex writeInput history ownership filter', () => {
     expect((result as any)?.submitted).toBe(true);
     expect((result as any)?.ownershipProven).toBeUndefined();
     expect((result as any)?.cliSessionId).toBeUndefined();
+    // Only a candidate the caller must prove before using.
+    expect((result as any)?.unprovenCliSessionId).toBe(SID_A);
   });
 
-  it.each(['immediate', 'late'])('confirms %s history with an empty rollout set without exposing a session ID', async (timing) => {
+  // Codex creates the rollout at the first submit, and its history line can be
+  // readable before the pid holds that rollout (#2363). The id must not become
+  // the session, but it must reach the caller as a candidate: dropping it left
+  // a fresh spawn with no way to find its rollout.
+  it.each(['immediate', 'late'])('confirms %s history with an empty rollout set, returning the id only as a candidate', async (timing) => {
     expect(findCodexRolloutSetByPid(process.pid)).toEqual(new Set());
     const pty = fakePty(process.pid, () => {
       if (timing === 'immediate') {
@@ -210,9 +216,9 @@ describe('codex writeInput history ownership filter', () => {
     if (timing === 'late') {
       if (!result || result.submitted !== false) throw new Error('Expected a pending submission');
       appendFileSync(join(home, 'history.jsonl'), historyLine(SID_A, 'shared submit'));
-      expect(result.recheck?.()).toEqual({ submitted: true });
+      expect(result.recheck?.()).toEqual({ submitted: true, unprovenCliSessionId: SID_A });
     } else {
-      expect(result).toEqual({ submitted: true });
+      expect(result).toEqual({ submitted: true, unprovenCliSessionId: SID_A });
     }
     expect(codexHistorySidIsOwned(SID_A, findCodexRolloutSetByPid(process.pid))).toBe(false);
   });

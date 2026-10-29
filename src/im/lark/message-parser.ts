@@ -385,7 +385,7 @@ export function isPureCardUpgradeFallback(content: string): boolean {
 }
 
 export interface MessageResource {
-  type: 'image' | 'file';
+  type: 'image' | 'file' | 'video';
   key: string;
   name: string;
   /** When set, download uses this message_id instead of the parent (e.g. merge_forward sub-messages). */
@@ -398,10 +398,10 @@ export interface MessageResource {
  * the same number, so duplicates across merge_forward sub-messages collapse
  * correctly.
  *
- * Image and file counters are INDEPENDENT — `formatAttachmentsHint` emits
- * `<image n=...>` and `<file n=...>` separately numbered, so a message with
+ * Image, file and video counters are INDEPENDENT — `formatAttachmentsHint`
+ * emits each attachment type separately numbered, so a message with
  * one image and one file should render as `[图片 1]` + `[文件 1]`, not
- * `[图片 1]` + `[文件 2]`. Keys are typed via the `image:` / `file:` prefix.
+ * `[图片 1]` + `[文件 2]`. Keys use the `image:` / `file:` / `video:` prefix.
  */
 export interface ImgNumberer {
   assign(key: string): { num: number; isNew: boolean };
@@ -411,18 +411,48 @@ export function createImgNumberer(): ImgNumberer {
   const map = new Map<string, number>();
   let imgCounter = 0;
   let fileCounter = 0;
+  let videoCounter = 0;
   return {
     assign(key: string) {
       const existing = map.get(key);
       if (existing !== undefined) return { num: existing, isNew: false };
-      // Key prefix selects the counter so image/file numbering stays
-      // independent (mirrors formatAttachmentsHint's per-type imgN/fileN).
-      // Unknown prefixes share the image counter as a safe default.
-      const num = key.startsWith('file:') ? ++fileCounter : ++imgCounter;
+      // Typed keys share the same independent counters as formatAttachmentsHint.
+      // Unknown prefixes retain the historical image counter.
+      const num = key.startsWith('file:') ? ++fileCounter
+        : key.startsWith('video:') ? ++videoCounter : ++imgCounter;
       map.set(key, num);
       return { num, isNew: true };
     },
   };
+}
+
+const VIDEO_FILE_NAME = /\.(mp4|m4v|mov|webm|mkv|avi|flv|3gp|wmv|mts)$/i;
+
+/** A single classifier keeps extraction, deduplication and text numbering aligned. */
+function fileResource(node: any): MessageResource | null {
+  if (typeof node.file_key !== 'string' || !node.file_key) return null;
+  const name = typeof node.file_name === 'string' && node.file_name ? node.file_name : node.file_key;
+  return { type: VIDEO_FILE_NAME.test(name) ? 'video' : 'file', key: node.file_key, name };
+}
+
+function mediaResource(node: any): MessageResource | null {
+  // image_key is only the poster; it must never replace a present video body.
+  if (typeof node.file_key === 'string' && node.file_key) {
+    return { type: 'video', key: node.file_key,
+      name: typeof node.file_name === 'string' && node.file_name ? node.file_name : `${node.file_key}.mp4` };
+  }
+  // A legacy poster-only payload is an image, never a JPEG renamed to .mp4.
+  if (typeof node.image_key === 'string' && node.image_key) {
+    return { type: 'image', key: node.image_key, name: `${node.image_key}.jpg` };
+  }
+  return null;
+}
+
+function resourcePlaceholder(resource: MessageResource, numberer?: ImgNumberer, includeName = false): string {
+  const label = resource.type === 'image' ? '图片' : resource.type === 'video' ? '视频' : '文件';
+  const index = numberer ? ` ${numberer.assign(`${resource.type}:${resource.key}`).num}` : '';
+  const name = includeName ? `: ${resource.name}` : '';
+  return `[${label}${index}${name}]`;
 }
 
 export function extractResources(msgType: string, rawContent: string, numberer?: ImgNumberer): MessageResource[] {
@@ -441,10 +471,10 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       return resources;
     }
 
-    if (msgType === 'file') {
+    if (msgType === 'file' || msgType === 'media') {
       const resources: MessageResource[] = [];
-      const fileKey = parsed.file_key;
-      if (fileKey) pushIfNew(resources, { type: 'file', key: fileKey, name: parsed.file_name ?? fileKey });
+      const resource = msgType === 'media' ? mediaResource(parsed) : fileResource(parsed);
+      if (resource) pushIfNew(resources, resource);
       return resources;
     }
 
@@ -454,11 +484,14 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       for (const block of contentBlocks) {
         const nodes = Array.isArray(block) ? block : [block];
         for (const node of nodes) {
-          if ((node.tag === 'img' || node.tag === 'media') && node.image_key) {
+          if (node.tag === 'media') {
+            const resource = mediaResource(node);
+            if (resource) pushIfNew(resources, resource);
+          } else if (node.tag === 'img' && node.image_key) {
             pushIfNew(resources, { type: 'image', key: node.image_key, name: `${node.image_key}.jpg` });
-          }
-          if (node.tag === 'file' && node.file_key) {
-            pushIfNew(resources, { type: 'file', key: node.file_key, name: node.file_name ?? node.file_key });
+          } else if (node.tag === 'file') {
+            const resource = fileResource(node);
+            if (resource) pushIfNew(resources, resource);
           }
         }
       }
@@ -469,7 +502,8 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       const topLevelFiles = Array.isArray(parsed.files) ? parsed.files : [];
       for (const file of topLevelFiles) {
         if (file?.file_key) {
-          pushIfNew(resources, { type: 'file', key: file.file_key, name: file.file_name ?? file.file_key });
+          const resource = fileResource(file);
+          if (resource) pushIfNew(resources, resource);
         }
       }
       return resources;
@@ -1085,19 +1119,19 @@ function renderPostNode(node: any, numberer?: ImgNumberer): string {
   }
   if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
   if (node.tag === 'code_block') return renderPostCodeBlock(node);
-  if (node.tag === 'img' || node.tag === 'media') {
-    const key = node.image_key ?? node.file_key;
+  if (node.tag === 'media') {
+    const resource = mediaResource(node);
+    return resource ? resourcePlaceholder(resource, numberer) : '[视频]';
+  }
+  if (node.tag === 'img') {
+    const key = node.image_key;
     if (key && numberer) return `[图片 ${numberer.assign(`image:${key}`).num}]`;
     return '[图片]';
   }
   if (node.tag === 'file') {
-    const key = node.file_key;
-    const name = node.file_name ?? '';
-    if (key && numberer) {
-      const n = numberer.assign(`file:${key}`).num;
-      return name ? `[文件 ${n}: ${name}]` : `[文件 ${n}]`;
-    }
-    return name ? `[文件: ${name}]` : '[文件]';
+    const resource = fileResource(node);
+    if (resource) return resourcePlaceholder(resource, numberer, !!node.file_name);
+    return node.file_name ? `[文件: ${node.file_name}]` : '[文件]';
   }
   return '';
 }
@@ -1151,16 +1185,14 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       } catch { /* fall through */ }
       return '[图片]';
     }
-    if (msgType === 'file') {
+    if (msgType === 'file' || msgType === 'media') {
       try {
         const p = JSON.parse(rawContent);
-        if (p.file_key && numberer) {
-          const n = numberer.assign(`file:${p.file_key}`).num;
-          return p.file_name ? `[文件 ${n}: ${p.file_name}]` : `[文件 ${n}]`;
-        }
-        return `[文件: ${p.file_name ?? 'unknown'}]`;
+        const resource = msgType === 'media' ? mediaResource(p) : fileResource(p);
+        if (resource) return resourcePlaceholder(resource, numberer, msgType === 'file' && !!p.file_name);
+        return msgType === 'media' ? '[视频]' : `[文件: ${p.file_name ?? 'unknown'}]`;
       } catch {
-        return '[文件]';
+        return msgType === 'media' ? '[视频]' : '[文件]';
       }
     }
     if (msgType === 'audio') {
@@ -1558,8 +1590,8 @@ export const CARD_EMBEDDED_PLACEHOLDER = '[卡片内嵌组件，需在飞书客�
 export function isPlaceholderOnlyText(text: string): boolean {
   if (!text.trim()) return false;
   const stripped = text
-    // `[图片]` / `[图片 2]` / `[文件]` / `[文件 3]` / `[语音]` / `[卡片]`
-    .replace(/\[(?:图片|文件|语音|卡片)(?:\s+\d+)?\]/g, '')
+    // Media placeholders carry no authored text, including numbered videos.
+    .replace(/\[(?:图片|文件|视频|语音|卡片)(?:\s+\d+)?\]/g, '')
     .replace(/\[卡片 \(模板\)\]/g, '')
     .replace(/\[合并转发消息\]/g, '')
     .replaceAll(CARD_EMBEDDED_PLACEHOLDER, '')

@@ -101,7 +101,7 @@ import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort,
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
 import { fetchAgents } from './agents-api.js';
-import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings } from '../../services/traex-auto-model.js';
+import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings, type TraexAutoModelPreviousSettings } from '../../services/traex-auto-model.js';
 import { TraexAutoModelEditor } from './traex-auto-model-editor.js';
 import {
   autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
@@ -2380,6 +2380,9 @@ export function BotAgentSection(props: {
   const autoDraftRef = useRef<TraexAutoModelDraft>(autoModelDraftFromConfig(bot.traexAutoModel, {
       reasoningEffort: bot.reasoningEffort, modelBackendVariant: bot.modelBackendVariant ?? undefined,
     }, initialAutoDraft.current, selectedAgentCliId(initialKey) === 'traex' && bot.model?.toLowerCase() === 'auto'));
+  // Kept separately from pool drafts: reordering a pool or reloading a stale
+  // local draft must never change the normal settings captured before Auto.
+  const previousAutoSettings = useRef<TraexAutoModelPreviousSettings>({ ...bot.traexAutoModel?.previousSettings });
   const [cliKey, setCliKey] = useState(initialKey);
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(autoDraftRef.current.enabled ? 'auto'
@@ -2470,6 +2473,7 @@ export function BotAgentSection(props: {
       reasoningEffort: bot.reasoningEffort, modelBackendVariant: bot.modelBackendVariant ?? undefined,
     }, stored, selectedAgentCliId(agentSelectionKey(bot, props.sessionFallback)) === 'traex' && bot.model?.toLowerCase() === 'auto');
     applyAutoDraft(draft);
+    previousAutoSettings.current = { ...bot.traexAutoModel?.previousSettings };
     setModel(draft.enabled ? 'auto' : typeof bot.model === 'string' ? bot.model : '');
     setAutoModelTouched(!!stored && JSON.stringify(stored) !== savedAutoPreferences.current);
     setAutoDraftStorageFailed(false);
@@ -2692,6 +2696,7 @@ export function BotAgentSection(props: {
       enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
       reselectPerTurn: autoReselectPerTurn,
       switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
+      previousSettings: previousAutoSettings.current,
       modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => [model,
         resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
           model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined }),
@@ -3276,6 +3281,13 @@ export function BotAgentSection(props: {
             let nextModels = current.models;
             let nextSettings = current.modelSettings;
             if (enabled) {
+              if (!current.enabled) {
+                previousAutoSettings.current = {
+                  ...(model.trim() && model.trim().toLowerCase() !== 'auto' ? { model: model.trim() } : {}),
+                  ...(reasoningEffort ? { reasoningEffort } : {}),
+                  ...(modelBackendVariant ? { modelBackendVariant } : {}),
+                };
+              }
               if (autoModels.length === 0) {
                 const preferred = model && model !== 'auto' ? model : modelCandidates[0] ?? '';
                 nextModels = [preferred];
@@ -3286,9 +3298,10 @@ export function BotAgentSection(props: {
               setModel('auto');
               setReasoningEffort('');
             } else if (model === 'auto') {
-              setModel(autoModels[0] ?? '');
-              setReasoningEffort(autoModelSettings[autoModels[0] ?? '']?.reasoningEffort ?? '');
-              setModelBackendVariant(autoModelSettings[autoModels[0] ?? '']?.modelBackendVariant ?? '');
+              const previous = previousAutoSettings.current;
+              setModel(previous.model ?? '');
+              setReasoningEffort(previous.reasoningEffort ?? '');
+              setModelBackendVariant(previous.modelBackendVariant ?? '');
               setModelBackendVariantTouched(true);
             }
             editAutoDraft({ enabled, models: nextModels, modelSettings: nextSettings });
@@ -4051,6 +4064,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
   const fallback = policy?.fallback ?? 'bot-identity';
   const credentialSource = policy?.credentialSource ?? 'auto';
+  const delegateOnMention = policy?.delegateOnMention !== false;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4092,11 +4106,15 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
   function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback, credentialSource });
+    void save({ enabled: true, tools: next, fallback, credentialSource, delegateOnMention });
   }
 
   function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
-    void save({ enabled: true, tools, fallback, credentialSource: next });
+    void save({ enabled: true, tools, fallback, credentialSource: next, delegateOnMention });
+  }
+
+  function setDelegateOnMention(next: boolean): void {
+    void save({ enabled: true, tools, fallback, credentialSource, delegateOnMention: next });
   }
 
   return (
@@ -4109,7 +4127,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
         onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback, credentialSource } : null,
+          checked ? { enabled: true, tools, fallback, credentialSource, delegateOnMention } : null,
         )}
       />
       {enabled ? (
@@ -4156,6 +4174,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>
             </p>
           ) : null}
+          <ToggleRow
+            checked={delegateOnMention}
+            disabled={busy}
+            dataAction="toggle-trigger-user-auth-delegate-on-mention"
+            title={tr('botDefaults.triggerUserAuthDelegateOnMention')}
+            help={tr('botDefaults.triggerUserAuthDelegateOnMentionHelp')}
+            onChange={checked => setDelegateOnMention(checked)}
+          />
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>

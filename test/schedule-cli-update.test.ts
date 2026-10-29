@@ -62,6 +62,7 @@ async function managed(
   customize?: (proof: ManagedOriginAttestation, index: number) => void,
   managedTurnId = 'om_live',
   observedRequests?: Array<Record<string, unknown>>,
+  refuseWith?: string,
 ) {
   seedPersistedSessionRows(f.dataDir, app, { [sid]: {
     sessionId: sid, status: 'active', larkAppId: app, chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -78,6 +79,10 @@ async function managed(
       scheduleOperator: { ok: true } };
     calls++;
     customize?.(proof, calls);
+    if (refuseWith && (req.url === SCHEDULE_DELEGATED_ADD_ROUTE || req.url === SCHEDULE_MANAGED_MUTATE_ROUTE)) {
+      res.statusCode = 403;
+      return res.end(JSON.stringify({ ok: false, error: refuseWith }));
+    }
     if (req.url === SCHEDULE_DELEGATED_ADD_ROUTE) {
       if (proof.turnId !== managedTurnId) {
         res.statusCode = 409;
@@ -167,6 +172,22 @@ async function managed(
 }
 
 describe('schedule CLI prompt updates', () => {
+  it.each([
+    ['add', 'schedule_working_dir_forbidden', '当前工作目录'],
+    ['add', 'schedule_direct_task_limit', '已达上限'],
+    ['update', 'schedule_mutation_scope_forbidden', '本会话所在群'],
+    ['update', 'schedule_working_dir_forbidden', '当前工作目录'],
+  ] as const)('turns a sandbox %s refusal %s into actionable text', async (action, code, text) => {
+    const f = fixture();
+    await managed(f, undefined, 'om_live', undefined, code);
+    const result = action === 'add'
+      ? await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344'])
+      : await f.run(['update', f.task.id, '--prompt', 'changed']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain(text);
+    expect(result.output).not.toContain(code);
+  });
+
   it.each(['--topic', '--follow-active'])('binds %s to the current topic in a reused chat session', async flag => {
     const f = fixture();
     await managed(f);
@@ -491,6 +512,24 @@ describe('schedule CLI prompt updates', () => {
       expect(result.output).toContain(errors[mode]);
       expect(readFileSync(f.path, 'utf8')).toBe(before);
     });
+});
+
+describe('schedule CLI pause/remove admission', () => {
+  // A bot turn cannot prove a current human operator, yet it may be cleaning
+  // up a bot-policy task in that task's original topic. Only the owning daemon
+  // can tell, so pause/remove must reach it instead of stopping at the CLI's
+  // human-operator check; other management actions still stop there.
+  it('leaves pause and remove from a turn without a human operator to the daemon', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, proof => { proof.scheduleOperator = { ok: false, error: 'caller_not_allowed' }; }, 'om_live', observed);
+    await f.run(['pause', f.task.id]);
+    await f.run(['remove', f.task.id]);
+    const resumed = await f.run(['resume', f.task.id]);
+    expect(resumed.code, resumed.output).not.toBe(0);
+    expect(observed.filter(request => typeof request.action === 'string').map(request => request.action))
+      .toEqual(['pause', 'remove']);
+  });
 });
 
 describe('work calendar CLI configuration and persisted manual intent', () => {

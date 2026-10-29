@@ -75,6 +75,7 @@ import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { contentHasToolCall, messageContentText } from './pi-family-content.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import {
+  PI_INPUT_QUEUED_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_STOP_REASON_ERROR,
 } from '../adapters/cli/pi-turn-boundary-extension.js';
@@ -85,7 +86,10 @@ const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 export interface PiBridgeEvent {
   uuid: string;
   timestampMs: number;
-  kind: 'user' | 'assistant_final' | 'cot';
+  /** `input_queued` / `cli_settled` carry no text: Pi accepted an input it
+   *  will only persist after its current work, and Pi finished all queued
+   *  work. See CodexBridgeEvent for how the queue uses them. */
+  kind: 'user' | 'assistant_final' | 'cot' | 'input_queued' | 'cli_settled';
   text: string;
   cotEntries?: CodexCotEntry[];
   /** Best-effort terminal outcome carried by an `assistant_final` (attribution
@@ -383,7 +387,15 @@ export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId
  *  is not mistaken for a turn that went quiet. The flip side: a turn that
  *  recovers and is THEN killed without a marker gets no failure from this
  *  reader — the same as a turn killed before any error record. The hold is
- *  evidence about one failed request, not a liveness probe for the process. */
+ *  evidence about one failed request, not a liveness probe for the process.
+ *
+ *  The distribution above predates Pi recording its retries. Since it does
+ *  (a `context_edit` right after the error, see `retrying` below), a retried
+ *  request can hang far longer: across 229 recorded retries in local sessions
+ *  the next record came 83.6s later at p50, 1194.7s at p95 and 3602.7s at the
+ *  maximum (a provider stream that idled out after an hour), 31 of them past
+ *  300s. A retry Pi has recorded is therefore never released by this clock;
+ *  it only covers errors Pi did not say it would retry. */
 export const PI_TURN_BOUNDARY_TIMEOUT_MS = 300_000;
 
 /** Per-transcript state that must survive across drain calls: a turn's records
@@ -397,10 +409,16 @@ interface PiPendingTurnState {
    *  first drain that observes it, not on the record's own timestamp). */
   error?: {
     uuid: string;
+    /** Pi's own id of the error record, which its retry `context_edit` names. */
+    entryId?: string;
     timestampMs: number;
     text: string;
     errorMessage?: string;
     heldSinceMs?: number;
+    /** Pi recorded that it is retrying this request (see the `context_edit`
+     *  branch of drainPiTranscript): the turn is still running, so neither the
+     *  timeout nor a steered user record may report it. */
+    retrying?: boolean;
   };
   /** Sticky: set once ANY turn-boundary marker is seen on this transcript.
    *  Proves the boundary extension is live for this session, after which the
@@ -430,6 +448,13 @@ function piPendingTurnState(path: string): PiPendingTurnState {
 export function resetPiPendingTurnState(path?: string): void {
   if (path === undefined) piPendingTurnCache.clear();
   else piPendingTurnCache.delete(path);
+}
+
+/** Record time of a session line, falling back to now when absent or bad. */
+function piRecordTimestampMs(obj: any): number {
+  const rawTs = obj?.timestamp ?? obj?.message?.timestamp;
+  const ts = typeof rawTs === 'number' ? rawTs : typeof rawTs === 'string' ? Date.parse(rawTs) : NaN;
+  return Number.isFinite(ts) ? ts : Date.now();
 }
 
 /** True when a session record is the turn-boundary marker appended by
@@ -477,7 +502,7 @@ function flushPiPendingError(
 ): PiBridgeEvent[] {
   const state = piPendingTurnCache.get(path);
   const held = state?.error;
-  if (!state || !held) return [];
+  if (!state || !held || held.retrying) return [];
   if (held.heldSinceMs === undefined) {
     held.heldSinceMs = nowMs;
     return [];
@@ -517,8 +542,30 @@ export function drainPiTranscript(
     // closes. This is the ONLY place a held error becomes a user-visible
     // failure: `lastStopReason === 'error'` means the turn really ended that
     // way; anything else means Pi recovered and the held error is dropped.
+    // Input Pi accepted while busy: it is held in Pi's queue until the current
+    // work ends, so its user record can be minutes away (pi-turn-boundary-extension).
+    if (obj?.type === 'custom' && obj.customType === PI_INPUT_QUEUED_CUSTOM_TYPE) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs: piRecordTimestampMs(obj),
+        kind: 'input_queued',
+        text: '',
+        sourceSessionId: sessionId,
+      });
+      continue;
+    }
+
     const boundary = piTurnBoundaryStopReason(obj);
     if (boundary.present) {
+      // Pi drains queued input before settling, so anything still waiting on
+      // it at this marker was not taken up.
+      events.push({
+        uuid: `${path}:${lineStart}:settled`,
+        timestampMs: piRecordTimestampMs(obj),
+        kind: 'cli_settled',
+        text: '',
+        sourceSessionId: sessionId,
+      });
       // One marker proves the extension is live here; from now on the marker
       // (or the backstop) resolves holds, never a bare user record. Set before
       // the branch below so the session_start announcement counts too.
@@ -533,6 +580,21 @@ export function drainPiTranscript(
         events.push(...flushHeldPiError(pending, sessionId));
       } else {
         pending.error = undefined;
+      }
+      continue;
+    }
+
+    // Pi's record that it is retrying the held request. Before every retry —
+    // automatic (pi-coding-agent `_prepareRetry`) or after an overflow
+    // compaction — Pi drops the failed attempt from the model's context by
+    // appending a `context_edit` that names it with `replacement: null`
+    // (`_omitRecoveryAttempt`), and writes nothing of the kind when it gives
+    // up. So this edit says the turn is still running, however long the retry
+    // then takes.
+    if (obj?.type === 'context_edit') {
+      const held = pending.error;
+      if (held?.entryId !== undefined && obj.targetId === held.entryId && obj.replacement === null) {
+        held.retrying = true;
       }
       continue;
     }
@@ -578,7 +640,12 @@ export function drainPiTranscript(
       // is live for this session, and from then on the boundary owns the
       // decision. Before the first marker we keep releasing, so a
       // marker-less session still reports its failures promptly.
-      if (!pending.markerSeen) events.push(...flushHeldPiError(pending, sessionId));
+      //
+      // A held error Pi has recorded as retrying settles the question without
+      // the marker: the retry re-enters the loop that takes in steering, so
+      // this record is a steer. (A worker that re-attached mid-turn has not
+      // seen this session's markers yet, so it relies on exactly this.)
+      if (!pending.markerSeen && !pending.error?.retrying) events.push(...flushHeldPiError(pending, sessionId));
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
@@ -623,7 +690,9 @@ export function drainPiTranscript(
     //     that then succeeded. So an error record is HELD: it closes the turn
     //     only once the turn-boundary marker says the turn really settled that
     //     way (see the `custom` branch above and `flushPiPendingError`), and
-    //     any later assistant record of the turn drops it.
+    //     any later assistant record of the turn drops it. While Pi records
+    //     that it is retrying it (the `context_edit` branch above), nothing
+    //     but those two resolves it.
     //   - `stop`/`length` end the turn ONLY when the message has NO tool calls.
     //     Both can carry tool calls mid-turn: agent-loop runs the batch and
     //     keeps looping unless it terminates (`length` → failToolCallsFrom-
@@ -661,6 +730,7 @@ export function drainPiTranscript(
       // model managed to say.
       pending.error = {
         uuid: `${path}:${lineStart}`,
+        ...(typeof obj.id === 'string' ? { entryId: obj.id } : {}),
         timestampMs,
         text: joinTextContent(obj.message.content),
         errorMessage,

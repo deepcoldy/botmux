@@ -3,7 +3,7 @@ import { lstatSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
+import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, GIT_CONFIG_PAIR_ENV_KEY, GIT_CONFIG_PAIR_ENV_SHELL_PATTERN, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { sessionEnvUnsetFlags } from '../../core/session-env.js';
 import { logger } from '../../utils/logger.js';
@@ -24,8 +24,31 @@ const PANE_ENV_UNSET_KEYS = [...new Set([
   ...REDACTED_CHILD_ENV_KEYS,
   ...BOTMUX_INJECTED_ENV_KEYS,
 ])];
-const PANE_ENV_UNSET_CLAUSE = `unset ${PANE_ENV_UNSET_KEYS.join(' ')}`;
-const FISH_PANE_ENV_UNSET_CLAUSE = `set -e ${PANE_ENV_UNSET_KEYS.join(' ')}`;
+// Double quotes, not single: the whole wrapper is embedded by callers inside a
+// single-quoted shell word, so an embedded single quote would truncate it.
+//
+// The ambient numbered pairs are collected at RUNTIME (their indices are not a
+// fixed 0..2 — nested CLIs and hooks share GIT_CONFIG_COUNT as an accumulator)
+// and unset name by name. The names arrive one per line from sed; they must
+// NOT be consumed via an unquoted command substitution because that relies on
+// field splitting, which depends on the caller's IFS (set freely in rc files)
+// and, under zsh, never happens at all — a non-splitting multi-word argument
+// makes zsh's special builtin `unset` abort the wrapper before the CLI starts.
+// A here-document feeds `read` line by line in every POSIX shell regardless of
+// IFS; the braces group the prelude for use in an && chain. Note the closing
+// brace must begin the line after the heredoc delimiter with no leading `;`
+// (dash rejects a `;` as the first token after a heredoc).
+const GIT_CONFIG_PAIR_ENV_NAMES_SED = `/usr/bin/env | sed -nE "s/^(${GIT_CONFIG_PAIR_ENV_SHELL_PATTERN})=.*/\\1/p"`;
+const PANE_ENV_UNSET_CLAUSE = `{ unset ${PANE_ENV_UNSET_KEYS.join(' ')}; while IFS= read -r __botmux_git_cfg_name; do if [ -n "$__botmux_git_cfg_name" ]; then unset "$__botmux_git_cfg_name"; fi; done <<__BOTMUX_GIT_CONFIG__
+$(${GIT_CONFIG_PAIR_ENV_NAMES_SED})
+__BOTMUX_GIT_CONFIG__
+}`;
+// Fish splits command-substitution output on $IFS (newline by default, but a
+// user rcfile may set IFS to "" / ":"), so force the newline for the
+// collection loop and restore the previous value afterwards. The names arrive
+// one per line from sed and only ever match [A-Z0-9_], so referencing the
+// loop variable is sufficient.
+const FISH_PANE_ENV_UNSET_CLAUSE = `set -e ${PANE_ENV_UNSET_KEYS.join(' ')}; set -l __botmux_git_ifs $IFS; set IFS \\n; for __botmux_git_cfg_name in (${GIT_CONFIG_PAIR_ENV_NAMES_SED}); set -e "$__botmux_git_cfg_name"; end; set IFS $__botmux_git_ifs`;
 
 /** Guard so the fallback self-heal runs at most once in this worker process. */
 let serverGlobalEnvScrubbed = false;
@@ -307,7 +330,18 @@ export class TmuxBackend {
    * verdict, only "nothing here can be attached to".
    */
   static probeSessionForLaunch(name: string, socketName?: string): SessionProbe {
-    return TmuxBackend.classifyHasSession(name, true, socketName);
+    const probe = TmuxBackend.classifyHasSession(name, true, socketName);
+    // A session whose pane is a KEPT CORPSE (a retaining `remain-on-exit` —
+    // `failed` on tmux >= 3.2, `on` on older/unknown builds — set by
+    // TmuxPipeBackend for status reporting) answers has-session but has no
+    // live CLI. For LAUNCH selection — and only there — that must read
+    // 'missing', or
+    // the next generation would "reattach" to a dead pane. Deliberately not in
+    // classifyHasSession: that is the generic existence probe used by dozens of
+    // call sites (teardown verification, restore, read isolation), each of
+    // which wants a single cheap round-trip and its own verdict on a stall.
+    if (probe === 'exists' && TmuxBackend.isPaneDead(name, socketName)) return 'missing';
+    return probe;
   }
 
   /**
@@ -363,6 +397,23 @@ export class TmuxBackend {
         return 'missing';
       }
       return 'unknown';
+    }
+  }
+
+  /** True only when tmux explicitly flags the target pane dead. Any
+   *  inconclusive answer (probe error, timeout, an option this tmux does not
+   *  report) is `false` — a liveness probe must never invent a death. */
+  static isPaneDead(name: string, socketName?: string): boolean {
+    try {
+      const out = String(
+        execFileSync(
+          'tmux', [...tmuxSocketArgs(socketName), 'display-message', '-p', '-t', name, '#{pane_dead}'],
+          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], env: tmuxEnv(), timeout: 2000 },
+        ) ?? '',
+      ).trim();
+      return out === '1';
+    } catch {
+      return false;
     }
   }
 
@@ -621,6 +672,7 @@ export function buildBotmuxEnvAssignments(
   env: NodeJS.ProcessEnv | undefined,
   injectEnv?: Record<string, string>,
   unsetEnv?: readonly string[],
+  gitConfigPairs?: ReadonlyArray<readonly [string, string]>,
 ): string[] {
   const out: string[] = [];
   // env(1) runs AFTER the login shell's rcfiles, so stripping these only from
@@ -634,9 +686,30 @@ export function buildBotmuxEnvAssignments(
   out.push(...sessionEnvUnsetFlags(unsetEnv));
   if (env) {
     for (const key of BOTMUX_INJECTED_ENV_KEYS) {
+      // GIT_CONFIG_COUNT is published below from the turn-authored pairs, never
+      // copied from the ambient value: an inherited stale/pushed-up count with
+      // no matching pairs makes git abort before reading any repository.
+      if (key === 'GIT_CONFIG_COUNT') continue;
       const val = env[key];
       if (val === undefined) continue;
       out.push(`${key}=${val}`);
+    }
+    // The git command-line config channel is rebuilt ONLY from the pair
+    // carrier the worker filled from this turn's identity (SpawnOpts),
+    // renumbered 0..n-1 with COUNT = the carrier length. The environment is not
+    // scanned for GIT_CONFIG_KEY_<n>/VALUE_<n>: ambient high-index, gapped,
+    // half or forged-name pairs must not reach git in the pane. With no
+    // authored pair, an inherited COUNT is zeroed — the pane wrapper has
+    // stripped the ambient pairs and count, so publishing COUNT=0 leaves git
+    // usable.
+    if (gitConfigPairs?.length) {
+      out.push(`GIT_CONFIG_COUNT=${gitConfigPairs.length}`);
+      gitConfigPairs.forEach(([configKey, configValue], i) => {
+        out.push(`GIT_CONFIG_KEY_${i}=${configKey}`);
+        out.push(`GIT_CONFIG_VALUE_${i}=${configValue}`);
+      });
+    } else if (env.GIT_CONFIG_COUNT !== undefined) {
+      out.push('GIT_CONFIG_COUNT=0');
     }
     // Proxy vars are not in BOTMUX_INJECTED_ENV_KEYS (which drives tmuxEnv
     // stripping + server-global scrub) — inject them explicitly here so the
@@ -687,6 +760,12 @@ export function buildBotmuxEnvAssignments(
   if (injectEnv) {
     for (const [key, val] of Object.entries(sanitizePerBotEnv(injectEnv))) {
       if (env?.BOTMUX_CODEX_INSTANCE_BINDING && ['CODEX_HOME', 'OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL', 'BOTMUX_CODEX_INSTANCE_BINDING'].includes(key)) continue;
+      // The git command-line config channel is owned by the turn-authored
+      // gitConfigPairs carrier: a bots.json `env` entry named
+      // GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n is never forwarded
+      // (it could push a forged count or pair past the authored set). Such an
+      // entry is simply inert, by design.
+      if (key === 'GIT_CONFIG_COUNT' || GIT_CONFIG_PAIR_ENV_KEY.test(key)) continue;
       out.push(`${key}=${val}`);
     }
   }
