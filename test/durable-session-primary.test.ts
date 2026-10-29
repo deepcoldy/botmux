@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { Session } from '../src/types.js';
 import type {
@@ -10,8 +13,11 @@ import {
 } from '../src/services/durable-session-facade.js';
 import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
 import type { DurableLarkSessionControlClaim } from '../src/services/durable-lark-session-control.js';
+import type { EffortTaskConfirmation } from '../src/services/codex-effort-task-state.js';
+import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import {
   admitDurableLarkSession,
+  checkpointDurableLarkSession,
   claimDurableLarkActiveSession,
   commitDurableLarkSessionControl,
   durablePrimarySessionProjection,
@@ -53,6 +59,13 @@ function message(messageId: string): DurableLarkMessageClaim {
     messageId,
     attempts: 1,
     data: { message: { message_id: messageId } },
+  };
+}
+
+function effortConfirmation(messageId: string): EffortTaskConfirmation {
+  return {
+    version: 1, messageId, inputHash: `hash-${messageId}`, effort: 'high',
+    cliId: 'codex', nativeId: 'native-session-1', workerGeneration: 3, sessionWorkerGeneration: 3,
   };
 }
 
@@ -106,6 +119,254 @@ function fakeStore() {
 }
 
 describe('durable primary Session admission', () => {
+  it('merges canonical pending effort A with local-only pending effort B and synchronizes the local Session', async () => {
+    mkdirSync(join(homedir(), 'temp'), { recursive: true });
+    const root = mkdtempSync(join(homedir(), 'temp', 'durable-checkpoint-merge-pending-'));
+    const store = new SqliteDurableCoordinationStore(join(root, 'coordination.db'));
+    const facade = createDurableSessionFacade({ store, ownerId: 'checkpoint-merge-pending' });
+    const canonicalPending = effortConfirmation('om_effort_a');
+    const localPending = effortConfirmation('om_effort_b');
+    try {
+      await admitDurableLarkSession({
+        facade, message: message('om_previous'),
+        session: session({ codexEffortTaskConfirmations: [canonicalPending] }),
+      });
+      const local = session({ reasoningEffort: 'high', codexEffortTaskConfirmations: [localPending] });
+
+      const checkpoint = await checkpointDurableLarkSession({
+        facade, message: message('om_effort_b'), session: local,
+      });
+
+      expect(checkpoint).toMatchObject({ kind: 'checkpointed', record: { revision: 2 } });
+      expect(checkpoint).not.toHaveProperty('receipt');
+      const persisted = parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!);
+      expect(persisted.session.codexEffortTaskConfirmations).toEqual([canonicalPending, localPending]);
+      expect(local.codexEffortTaskConfirmations).toEqual([canonicalPending, localPending]);
+      expect(persisted.admissions.map(item => item.messageId)).toEqual(['om_previous']);
+      expect(persisted.session.durablePrimaryInputCommits).toBeUndefined();
+      expect(persisted.session.dispatchInputReceipts).not.toHaveProperty('om_effort_a');
+      expect(persisted.session.dispatchInputReceipts).not.toHaveProperty('om_effort_b');
+    } finally {
+      await facade.stop();
+      await store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves canonical admitted effort A over local pending A and synchronizes the terminal without provider proof', async () => {
+    mkdirSync(join(homedir(), 'temp'), { recursive: true });
+    const root = mkdtempSync(join(homedir(), 'temp', 'durable-checkpoint-merge-terminal-'));
+    const store = new SqliteDurableCoordinationStore(join(root, 'coordination.db'));
+    const facade = createDurableSessionFacade({ store, ownerId: 'checkpoint-merge-terminal' });
+    const pending = effortConfirmation('om_effort_a');
+    try {
+      const admitted = await admitDurableLarkSession({
+        facade, message: message('om_effort_a'),
+        session: session({ codexEffortTaskConfirmations: [pending] }),
+      });
+      expect(admitted).toMatchObject({ kind: 'committed', record: { revision: 1 } });
+      const canonical = parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!);
+      expect(canonical.session.codexEffortTaskConfirmations).toEqual([{ ...pending, terminal: 'admitted' }]);
+      expect(canonical.session.durablePrimaryInputCommits).toBeUndefined();
+      expect(canonical.session.dispatchInputReceipts).not.toHaveProperty('om_effort_a');
+
+      const stalePending = effortConfirmation('om_effort_a');
+      const local = session({ codexEffortTaskConfirmations: [stalePending] });
+      expect(stalePending).not.toHaveProperty('terminal');
+      const checkpoint = await checkpointDurableLarkSession({
+        facade, message: message('om_effort_a'), session: local,
+      });
+
+      expect(checkpoint).toMatchObject({ kind: 'checkpointed', record: { revision: 2 } });
+      expect(checkpoint).not.toHaveProperty('receipt');
+      const persisted = parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!);
+      const terminal = [{ ...stalePending, terminal: 'admitted' }];
+      expect(persisted.session.codexEffortTaskConfirmations).toEqual(terminal);
+      expect(local.codexEffortTaskConfirmations).toEqual(terminal);
+      expect(persisted.admissions).toEqual(canonical.admissions);
+      expect(persisted.session.durablePrimaryInputCommits).toBeUndefined();
+      expect(local.durablePrimaryInputCommits).toBeUndefined();
+      expect(persisted.session.dispatchInputReceipts).not.toHaveProperty('om_effort_a');
+    } finally {
+      await facade.stop();
+      await store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('checkpoints an active Session in SQLite without admitting the pending task', async () => {
+    mkdirSync(join(homedir(), 'temp'), { recursive: true });
+    const root = mkdtempSync(join(homedir(), 'temp', 'durable-primary-checkpoint-'));
+    const store = new SqliteDurableCoordinationStore(join(root, 'coordination.db'));
+    const facade = createDurableSessionFacade({ store, ownerId: 'checkpoint-owner' });
+    try {
+      await admitDurableLarkSession({ facade, message: message('om_previous'), session: session() });
+      await commitDurableLarkSessionControl({
+        facade,
+        control: control('card.action.trigger:cli_test:evt_resume', 'resume'),
+        session: session(),
+        result: { status: 'active' },
+      });
+      const before = await store.readSession('om_root::cli_test');
+      if (!before) throw new Error('expected initial primary Session');
+      const updated = session({ reasoningEffort: 'high' });
+
+      const checkpoint = await checkpointDurableLarkSession({
+        facade, message: message('om_pending_task'), session: updated,
+      });
+      expect(checkpoint).toMatchObject({ kind: 'checkpointed', record: { revision: 3 } });
+      expect(checkpoint).not.toHaveProperty('receipt');
+      const after = await store.readSession('om_root::cli_test');
+      expect(after?.value).toEqual({
+        ...before.value as Record<string, unknown>,
+        session: updated,
+      });
+      expect(parseDurablePrimarySessionRecord(after!)).toMatchObject({
+        session: { reasoningEffort: 'high' },
+        admission: { messageId: 'om_previous' },
+        admissions: [{ messageId: 'om_previous' }],
+        controls: [{ action: 'resume' }],
+      });
+    } finally {
+      await facade.stop();
+      await store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not checkpoint a missing, inactive, replaced, or corrupt primary Session', async () => {
+    for (const canonical of [
+      undefined,
+      session({ status: 'closed' }),
+      session({ sessionId: 'session-successor' }),
+      session({ rootMessageId: 'om_corrupt_anchor' }),
+    ]) {
+      const { store, records } = fakeStore();
+      const facade = createDurableSessionFacade({ store, ownerId: 'checkpoint-fail-closed' });
+      if (canonical) {
+        const projected = durablePrimarySessionProjection(canonical, message('om_previous'));
+        records.set('om_root::cli_test', {
+          sessionKey: 'om_root::cli_test', revision: 1, value: projected.value, updatedAt: 1,
+        });
+      }
+      const before = records.get('om_root::cli_test');
+      try {
+        await expect(checkpointDurableLarkSession({
+          facade, message: message('om_pending_task'), session: session({ reasoningEffort: 'high' }),
+        })).rejects.toThrow(/checkpoint|mismatched routing identity/);
+        expect(store.writeSession).not.toHaveBeenCalled();
+        expect(records.get('om_root::cli_test')).toEqual(before);
+      } finally {
+        await facade.stop();
+      }
+    }
+  });
+
+  it('rejects a facade current record belonging to another stable Session key', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'checkpoint-key-identity' });
+    const projected = durablePrimarySessionProjection(session({ rootMessageId: 'om_other' }), message('om_previous'));
+    const current: DurableSessionRecord = {
+      sessionKey: projected.sessionKey, revision: 1, value: projected.value, updatedAt: 1,
+    };
+    records.set('om_root::cli_test', current);
+
+    await expect(checkpointDurableLarkSession({
+      facade, message: message('om_pending_task'), session: session({ reasoningEffort: 'high' }),
+    })).rejects.toThrow(/checkpoint.*changed before write/);
+    expect(store.writeSession).not.toHaveBeenCalled();
+    expect(records.get('om_root::cli_test')).toEqual(current);
+    await facade.stop();
+  });
+
+  it('rejects checkpoint identity changes before entering the durable write lane', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'checkpoint-identity' });
+    try {
+      await expect(checkpointDurableLarkSession({
+        facade, message: message('om_pending_task'), session: session({ larkAppId: 'cli_other' }),
+      })).rejects.toThrow(/does not belong/);
+      await expect(checkpointDurableLarkSession({
+        facade, message: message('om_pending_task'), session: session({ status: 'closed' }),
+      })).rejects.toThrow(/checkpoint.*active/);
+      await expect(checkpointDurableLarkSession({
+        facade, message: { ...message('om_pending_task'), larkAppId: '' }, session: session(),
+      })).rejects.toThrow(/checkpoint.*larkAppId/);
+      expect(store.acquireSessionLease).not.toHaveBeenCalled();
+      expect(store.writeSession).not.toHaveBeenCalled();
+    } finally {
+      await facade.stop();
+    }
+  });
+
+  it('preserves the canonical snapshot when checkpoint loses distributed fencing', async () => {
+    mkdirSync(join(homedir(), 'temp'), { recursive: true });
+    const root = mkdtempSync(join(homedir(), 'temp', 'durable-checkpoint-fencing-'));
+    const path = join(root, 'coordination.db');
+    const ownerStore = new SqliteDurableCoordinationStore(path);
+    const peerStore = new SqliteDurableCoordinationStore(path);
+    const owner = createDurableSessionFacade({ store: ownerStore, ownerId: 'checkpoint-live-owner' });
+    const peer = createDurableSessionFacade({ store: peerStore, ownerId: 'checkpoint-contender' });
+    try {
+      await admitDurableLarkSession({ facade: owner, message: message('om_previous'), session: session() });
+      const before = await ownerStore.readSession('om_root::cli_test');
+      await expect(checkpointDurableLarkSession({
+        facade: peer, message: message('om_pending_task'), session: session({ reasoningEffort: 'high' }),
+      })).resolves.toMatchObject({ kind: 'occupied', ownerId: 'checkpoint-live-owner' });
+      expect(await peerStore.readSession('om_root::cli_test')).toEqual(before);
+    } finally {
+      await Promise.all([owner.stop(), peer.stop()]);
+      await Promise.all([ownerStore.close(), peerStore.close()]);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('freezes checkpoint state and identity before waiting in the exact write lane', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'checkpoint-frozen' });
+    await admitDurableLarkSession({ facade, message: message('om_previous'), session: session() });
+    const before = records.get('om_root::cli_test');
+    let unblockRead!: (value: DurableSessionRecord | undefined) => void;
+    vi.mocked(store.readSession).mockImplementationOnce(() => new Promise(resolve => {
+      unblockRead = resolve;
+    }));
+    const mutable = session({ reasoningEffort: 'high' });
+    const saved = checkpointDurableLarkSession({
+      facade, message: message('om_pending_task'), session: mutable,
+    });
+    mutable.sessionId = 'mutated-session';
+    mutable.rootMessageId = 'om_mutated';
+    mutable.larkAppId = 'cli_mutated';
+    mutable.reasoningEffort = 'low';
+    await Promise.resolve();
+    unblockRead(before);
+    await expect(saved).resolves.toMatchObject({ kind: 'checkpointed' });
+    expect(parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!)).toMatchObject({
+      session: { sessionId: 'session-1', rootMessageId: 'om_root', larkAppId: 'cli_test', reasoningEffort: 'high' },
+      admissions: [{ messageId: 'om_previous' }],
+    });
+    expect(records.has('om_mutated::cli_mutated')).toBe(false);
+    await facade.stop();
+  });
+
+  it('preserves the exact legacy envelope when checkpointing a pre-history record', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'checkpoint-legacy' });
+    const projected = durablePrimarySessionProjection(session(), message('om_previous'));
+    const value = projected.value as Record<string, unknown>;
+    delete value.admissions;
+    records.set(projected.sessionKey, { sessionKey: projected.sessionKey, revision: 1, value: projected.value, updatedAt: 1 });
+    const updated = session({ reasoningEffort: 'high' });
+
+    await expect(checkpointDurableLarkSession({
+      facade, message: message('om_pending_task'), session: updated,
+    })).resolves.toMatchObject({ kind: 'checkpointed' });
+    expect(records.get(projected.sessionKey)?.value).toEqual({ ...value, session: updated });
+    expect(records.get(projected.sessionKey)?.value).not.toHaveProperty('admissions');
+    expect(records.get(projected.sessionKey)?.value).not.toHaveProperty('controls');
+    await facade.stop();
+  });
+
   it('round-trips the full persisted Session and its canonical admission identity', () => {
     const projected = durablePrimarySessionProjection(session({
       durablePrimaryInputCommits: [{

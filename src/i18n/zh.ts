@@ -3,7 +3,8 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
-  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — 修改 Codex 推理强度：CLI 通过原生菜单从下一轮生效；App 更新当前轮需显式启用实验特性 step_model_switching（默认关闭，档位以当前模型为准）',
+  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
+  'cmd.effort.task_not_submitted': '附带任务未投递：推理强度修改未确认、会话已变化或输入通道不可用。任务已保留在原消息，请重试本条任务。任务：{task}',
   'cmd.effort.cli_next_turn': '当前会话的推理强度已设为 {effort}，从下一轮生效；正在执行的这一轮保持原强度。',
   'cmd.effort.cli_menu_unavailable': '当前无法安全操作 Codex CLI 模型菜单（可能有未发送草稿、其它菜单、输入操作或不支持的后端）。请保留草稿，关闭其它菜单后重试；也可手动使用 /model。',
   'cmd.effort.applied': '后续轮次的推理强度已设为 {effort}，服务端已接受当前轮更新。若当前轮还有后续推理步骤，可取用新设置；已经发出的模型请求保持原参数。',

@@ -404,6 +404,10 @@ describe('setCodexAppThreadName', () => {
     // 处 reject。waitForThreadPreview 必须按「预览不可用」降级返回，让兜底
     // 标题照常写入，而不是把超时错误抛给 setCodexAppThreadName（CI 上同一
     // 缺陷以 "timed out after 1ms" 的尾窗竞态形状出现）。
+    // timeoutMs is both the preview wait budget and each later RPC's timeout
+    // (#2454). Only the first, preview-time read is slow here, so the budget
+    // needs to be short of that read but far above a localhost round trip:
+    // at 200ms a busy CI runner timed out the ordinary thread/name/set (#2454).
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-slow-preview-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -416,10 +420,10 @@ describe('setCodexAppThreadName', () => {
       env: {
         ...process.env,
         FAKE_CODEX_LOG: logPath,
-        FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
+        FAKE_CODEX_THREAD_READ_DELAY_MS: '3000',
         FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
       },
-      timeoutMs: 200,
+      timeoutMs: 2_000,
       initializeTimeoutMs: 2_000,
       waitForExistingPreview: true,
     });
@@ -472,7 +476,8 @@ describe('setCodexAppThreadName', () => {
   it('still writes the title when a slow thread/read exhausts the updatedAfter wait budget', async () => {
     // waitForThreadUpdatedAfter 的 catch 与 preview 等待同形：deadline 处的
     // 客户端超时必须按「等待结束」返回，让标题写入继续，而不是穿透抛出。
-    // 慢响应（300ms）> 整段预算（200ms），且 baseline 永不可达双保险。
+    // 慢响应（3s）> 整段预算（2s），且 baseline 永不可达双保险。预算同时是
+    // 之后 name/set 的 RPC 超时，必须远大于本机往返（同上一条，#2454）。
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-updatedafter-slow-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -485,9 +490,9 @@ describe('setCodexAppThreadName', () => {
       env: {
         ...process.env,
         FAKE_CODEX_LOG: logPath,
-        FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
+        FAKE_CODEX_THREAD_READ_DELAY_MS: '3000',
       },
-      timeoutMs: 200,
+      timeoutMs: 2_000,
       initializeTimeoutMs: 2_000,
       waitForUpdatedAfter: 999_999,
     });

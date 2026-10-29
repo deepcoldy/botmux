@@ -671,9 +671,17 @@ export function readBotDefaultsDeepLink(): BotDefaultsDeepLink | null {
   return tab ? { tab, section, field: field && section?.fieldKeys?.includes(field) ? field : null } : null;
 }
 
-/** 区块里文字恰好是 label 的标题（区块标题 / 配置项标题 / 选项组标题）。 */
+/**
+ * 区块里文字恰好是 label 的标题（区块标题 / 配置项标题 / 选项组标题）。
+ * 候选除了两套 FieldTitle 渲染出的 class（页面 bd-* 与共享组件 ui-*）和 h3/h4，
+ * 还包括 label/span/strong/small：部分配置行直接用 `<label><span>{tr()}</span><input/></label>`
+ * 或 `<span>{tr()}</span><DropdownField/>`，没有专门的标题 class；少了它们深链会落到
+ * 「当前 Bot 不显示该项」的假提示。文字全等匹配保证不会撞到按钮或说明文案。
+ */
 function findLabeledElement(root: HTMLElement, label: string): HTMLElement | null {
-  const candidates = root.querySelectorAll<HTMLElement>('.bd-field-title-text, .bd-mode-group-title, h3, h4');
+  const candidates = root.querySelectorAll<HTMLElement>(
+    '.bd-field-title-text, .bd-mode-group-title, .ui-field-title-text, h3, h4, label, span, strong, small',
+  );
   return [...candidates].find(el => el.textContent?.trim() === label) ?? null;
 }
 
@@ -696,7 +704,11 @@ export function resolveBotDefaultsTarget(
   if (!link.field) return { target: sectionEl, block: 'start', missing: null };
   const label = findLabeledElement(sectionEl, tr(link.field));
   if (!label) return { target: sectionEl, block: 'start', missing: tr(link.field) };
-  const row = label.closest<HTMLElement>('.toggle-row, .bd-row, .bd-field, .bd-mode-group, .bd-subsection') ?? label;
+  // settings-field-row 是共享编辑器（如 prompt-cache）的行容器，bd-sg-tag-name 是会话群标签输入行；
+  // 这两类行的标题是裸 label/span，closest 到行容器后整行高亮，找不到时退回标题元素本身。
+  const row = label.closest<HTMLElement>(
+    '.toggle-row, .settings-field-row, .bd-sg-tag-name, .bd-row, .bd-field, .bd-mode-group, .bd-subsection',
+  ) ?? label;
   return { target: row, block: 'center', missing: null };
 }
 
