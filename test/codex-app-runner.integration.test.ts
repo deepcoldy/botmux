@@ -1975,6 +1975,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         ? { enginePid: scope.codexAppEngineIdentity.pid, engineProcStart: scope.codexAppEngineIdentity.procStart }
         : scope.codexAppRunnerProcessIdentity),
       rejectCodexAppControlMarker: (reason: string) => rejected.push(reason),
+      // Fail-closed paths must show up here, not as a TypeError that the
+      // collector turns into a silent reconnect loop.
+      failCodexAppControlGeneration: (reason: string) => rejected.push(`fail-closed: ${reason}`),
       codexAppSignedStateReadiness: (payload: any) => payload.acceptingInput ? 'ready' : 'waiting',
       applyTrustedCodexAppStateMarker, codexAppTurnLiveness: tracker, codexAppReadyAuthority: authority,
       codexAppProofDeadline: { clear() {} }, cleanupCodexAppControlBootstrap() {},
@@ -1998,7 +2001,24 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     await control.listen();
     harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
       { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate } });
-    const waitForNative = (predicate: () => boolean) => waitFor(harness!, predicate, 60_000);
+    const waitForNative = (predicate: () => boolean) => waitFor(harness!, predicate, 60_000).catch(error => {
+      const tail = control.markers.slice(-8).map(marker => marker.kind
+        + (marker.payload.processIdentityBoundary ? `:${marker.payload.processIdentityBoundary}` : '')
+        + (typeof marker.payload.busy === 'boolean' ? `:busy=${marker.payload.busy}` : ''));
+      throw new Error(`rejected=${JSON.stringify(rejected)} auths=${control.authCount} finals=${control.finals.length} `
+        + `last markers=${tail.join(' | ')}\n${(error as Error).message}`);
+    });
+    // The runner settles idle 20ms after a turn. "The last state is idle" was
+    // already true from the startup state, so the engine could be killed
+    // before that settle. When the runner then noticed the exit first, its
+    // idle state carried no engine identity — a worker branch this extracted
+    // scope could not run, so the collector dropped the connection and the
+    // runner replayed the same state forever (#2520). Wait for the idle state
+    // that follows this turn's final instead.
+    const idleAfterLastFinal = () => {
+      const finalEnd = control.markers.findLastIndex(marker => marker.kind === 'final-end');
+      return control.markers.slice(finalEnd + 1).some(marker => marker.kind === 'state' && marker.payload.busy === false);
+    };
     try {
       await waitForNative(() => control.states.at(-1)?.busy === false);
       expect(published).toHaveLength(1);
@@ -2018,7 +2038,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(turnId, { text: turnId }, turnId)}\r`);
         await waitForNative(() => control.finals.length === index + 1);
         tracker.completeCurrent();
-        await waitForNative(() => control.states.at(-1)?.busy === false);
+        await waitForNative(idleAfterLastFinal);
       }
       expect(rejected).toEqual([]);
       expect(published).toHaveLength(2);
