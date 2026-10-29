@@ -15223,12 +15223,17 @@ async function handleTrustedCodexAppMarker(
   }
 
   if (kind === 'cot') {
-    const entries = normalizeDshCotMarker(lastInitConfig?.cliId, payload);
+    // Keep runtime gating in the pure normalizer: dsh-tui also has cliId 'dsh'.
+    const entries = normalizeDshCotMarker(lastInitConfig?.cliId, lastInitConfig?.dshRuntime, payload);
     if (entries) {
       // Cosmetic only: attributed like dsh's final reply; dropped without an active turn.
       if (currentBotmuxTurnId) {
         observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
       }
+      return true;
+    }
+    if (lastInitConfig?.cliId === 'dsh') {
+      log(`${cliName()} dropped untrusted or malformed cot control marker`);
       return true;
     }
   }

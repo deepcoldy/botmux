@@ -96,8 +96,14 @@ export function cotEntryFromToolResult(data: unknown): CotEntry | undefined {
 }
 
 /** Validate the entire cosmetic frame before admitting any entries. */
-export function normalizeDshCotMarker(cliId: string | undefined, payload: unknown): CotEntry[] | undefined {
-  if (cliId !== 'dsh') return undefined;
+export function normalizeDshCotMarker(
+  cliId: string | undefined,
+  dshRuntime: 'official' | 'tui' | undefined,
+  payload: unknown,
+): CotEntry[] | undefined {
+  // dsh-tui still uses cliId 'dsh'. Only the SDK runtime is trusted: RunnerControlWriter
+  // escapes ESC bytes from model/tool output; the external Ink TUI uses an untrusted raw PTY.
+  if (cliId !== 'dsh' || dshRuntime === 'tui') return undefined;
   if (!isPlainObject(payload) || Object.keys(payload).some(key => key !== 'entries')) return undefined;
   if (!Array.isArray(payload.entries) || payload.entries.length === 0 || payload.entries.length > DSH_COT_LIMITS.maxEntries) return undefined;
   const entries: CotEntry[] = [];

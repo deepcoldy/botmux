@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import {
   cotEntriesFromAssistantMessage,
   cotEntryFromToolCall,
@@ -7,6 +8,7 @@ import {
   normalizeDshCotMarker,
 } from '../src/services/dsh-cot.js';
 import { COT_SUBJECT_MAX_CHARS } from '../src/services/cot-subject.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const toolCall = { type: 'tool-call', id: 'call_cot_1', name: 'bash', arguments: '{"command":"echo cot-probe"}' };
 
@@ -61,7 +63,7 @@ describe('dsh CoT entries', () => {
   it.each(['', ' \n\t', undefined, null, 7])('uses an accepted fallback for an empty or invalid tool name: %s', name => {
     const entry = cotEntryFromToolCall({ callId: toolCall.id, name, arguments: '{}' });
     expect(entry).toEqual({ kind: 'tool_call', id: toolCall.id, name: 'tool', args: '{}' });
-    expect(normalizeDshCotMarker('dsh', { entries: [entry] })).toEqual([entry]);
+    expect(normalizeDshCotMarker('dsh', undefined, { entries: [entry] })).toEqual([entry]);
   });
 
   it('extracts the subject before truncating arguments', () => {
@@ -122,7 +124,7 @@ describe('dsh CoT entries', () => {
         args: `${JSON.stringify(input).slice(0, DSH_COT_LIMITS.toolArgsChars)}…`, subject: `${long.slice(0, COT_SUBJECT_MAX_CHARS)}…` },
       { kind: 'tool_result', id: toolCall.id, result: `${long.slice(0, DSH_COT_LIMITS.toolResultChars)}…` },
     ]);
-    const normalized = normalizeDshCotMarker('dsh', { entries });
+    const normalized = normalizeDshCotMarker('dsh', undefined, { entries });
     expect(normalized).toEqual(entries);
     expect(normalized).not.toBe(entries);
     for (let index = 0; index < entries.length; index++) expect(normalized![index]).not.toBe(entries[index]);
@@ -135,7 +137,15 @@ describe('normalizeDshCotMarker', () => {
   const result = { kind: 'tool_result', id: toolCall.id, result: 'cot-probe\n' };
 
   it.each([undefined, 'codex-app', 'claude', 'dsh-tui'])('rejects a non-dsh CLI: %s', cliId => {
-    expect(normalizeDshCotMarker(cliId, { entries: [thinking] })).toBeUndefined();
+    expect(normalizeDshCotMarker(cliId, undefined, { entries: [thinking] })).toBeUndefined();
+  });
+
+  it('rejects cot frames from the dsh TUI runtime', () => {
+    expect(normalizeDshCotMarker('dsh', 'tui', { entries: [thinking] })).toBeUndefined();
+  });
+
+  it.each([undefined, 'official'] as const)('accepts cot frames from the dsh SDK runtime: %s', dshRuntime => {
+    expect(normalizeDshCotMarker('dsh', dshRuntime, { entries: [thinking] })).toEqual([thinking]);
   });
 
   it.each([
@@ -145,7 +155,7 @@ describe('normalizeDshCotMarker', () => {
     { entries: [] }, { entries: 'invalid' },
     { entries: Array.from({ length: DSH_COT_LIMITS.maxEntries + 1 }, () => thinking) },
   ])('rejects malformed envelopes: %j', payload => {
-    expect(normalizeDshCotMarker('dsh', payload)).toBeUndefined();
+    expect(normalizeDshCotMarker('dsh', undefined, payload)).toBeUndefined();
   });
 
   it.each([
@@ -161,7 +171,7 @@ describe('normalizeDshCotMarker', () => {
     { ...call, name: 'x'.repeat(DSH_COT_LIMITS.toolNameChars + 2) }, { ...call, args: 'x'.repeat(DSH_COT_LIMITS.toolArgsChars + 2) },
     { ...call, subject: 'x'.repeat(COT_SUBJECT_MAX_CHARS + 2) }, { ...result, result: 'x'.repeat(DSH_COT_LIMITS.toolResultChars + 2) },
   ].map((entry, index) => ({ entry, index })))('rejects the whole frame for invalid entry $index', ({ entry }) => {
-    expect(normalizeDshCotMarker('dsh', { entries: [thinking, entry] })).toBeUndefined();
+    expect(normalizeDshCotMarker('dsh', undefined, { entries: [thinking, entry] })).toBeUndefined();
   });
 
   it('accepts empty arguments and results and the maximum number of entries', () => {
@@ -169,11 +179,11 @@ describe('normalizeDshCotMarker', () => {
       cotEntryFromToolCall({ callId: toolCall.id })!,
       cotEntryFromToolResult({ message: { toolCallId: toolCall.id, content: [] } })!,
     ];
-    expect(normalizeDshCotMarker('dsh', { entries })).toEqual([
+    expect(normalizeDshCotMarker('dsh', undefined, { entries })).toEqual([
       { kind: 'tool_call', id: toolCall.id, name: 'tool', args: '' },
       { kind: 'tool_result', id: toolCall.id, result: '' },
     ]);
-    expect(normalizeDshCotMarker('dsh', {
+    expect(normalizeDshCotMarker('dsh', undefined, {
       entries: Array.from({ length: DSH_COT_LIMITS.maxEntries }, () => thinking),
     })).toHaveLength(DSH_COT_LIMITS.maxEntries);
   });
@@ -186,8 +196,62 @@ describe('normalizeDshCotMarker', () => {
     expect(entries.length).toBeLessThanOrEqual(DSH_COT_LIMITS.maxEntries);
     expect(JSON.stringify(payload).length).toBeLessThan(DSH_COT_LIMITS.payloadBytes);
     expect(Buffer.byteLength(JSON.stringify(payload), 'utf8')).toBeGreaterThan(DSH_COT_LIMITS.payloadBytes);
-    expect(normalizeDshCotMarker('dsh', payload)).toBeUndefined();
+    expect(normalizeDshCotMarker('dsh', undefined, payload)).toBeUndefined();
     const smaller = entries.slice(0, -1);
-    expect(normalizeDshCotMarker('dsh', { entries: smaller })).toEqual(smaller);
+    expect(normalizeDshCotMarker('dsh', undefined, { entries: smaller })).toEqual(smaller);
+  });
+});
+
+describe('worker dsh cot markers', () => {
+  const entries = [{ kind: 'thinking', text: '先确认命令' }];
+
+  function runner(cliId = 'dsh', dshRuntime?: 'official' | 'tui') {
+    const scope = {
+      lastInitConfig: { cliId, dshRuntime }, normalizeDshCotMarker, isCodexAppCliId,
+      currentBotmuxTurnId: 'om_turn_1' as string | null, currentBotmuxDispatchAttempt: 1,
+      observeCotEntries: vi.fn(), rejectCodexAppControlMarker: vi.fn(),
+      log: vi.fn(), cliName: () => cliId,
+    };
+    return { scope, marker: loadWorkerFunction<(kind: string, payload: Record<string, unknown>) => Promise<boolean>>(
+      'handleTrustedCodexAppMarker', scope,
+    ) };
+  }
+
+  it('attributes valid dsh cot entries to the active turn', async () => {
+    const worker = runner();
+    expect(await worker.marker('cot', { entries })).toBe(true);
+    expect(worker.scope.observeCotEntries).toHaveBeenCalledTimes(1);
+    expect(worker.scope.observeCotEntries).toHaveBeenCalledWith(entries, { turnId: 'om_turn_1', dispatchAttempt: 1 });
+    expect(worker.scope.rejectCodexAppControlMarker).not.toHaveBeenCalled();
+  });
+
+  it('consumes untrusted dsh TUI cot frames without observing entries or rejecting a Codex App record', async () => {
+    const worker = runner('dsh', 'tui');
+    expect(await worker.marker('cot', { entries })).toBe(true);
+    expect(worker.scope.observeCotEntries).not.toHaveBeenCalled();
+    expect(worker.scope.log).toHaveBeenCalled();
+    expect(worker.scope.rejectCodexAppControlMarker).not.toHaveBeenCalled();
+  });
+
+  it('consumes malformed dsh cot frames without observing entries or rejecting a Codex App record', async () => {
+    const worker = runner();
+    expect(await worker.marker('cot', { entries: [] })).toBe(true);
+    expect(worker.scope.observeCotEntries).not.toHaveBeenCalled();
+    expect(worker.scope.log).toHaveBeenCalled();
+    expect(worker.scope.rejectCodexAppControlMarker).not.toHaveBeenCalled();
+  });
+
+  it('rejects cot frames from non-dsh sessions', async () => {
+    const worker = runner('codex-app');
+    expect(await worker.marker('cot', { entries })).toBe(false);
+    expect(worker.scope.observeCotEntries).not.toHaveBeenCalled();
+    expect(worker.scope.rejectCodexAppControlMarker).toHaveBeenCalled();
+  });
+
+  it('consumes valid dsh cot frames without attribution when no turn is active', async () => {
+    const worker = runner();
+    worker.scope.currentBotmuxTurnId = null;
+    expect(await worker.marker('cot', { entries })).toBe(true);
+    expect(worker.scope.observeCotEntries).not.toHaveBeenCalled();
   });
 });
