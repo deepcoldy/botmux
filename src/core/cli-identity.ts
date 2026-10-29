@@ -504,9 +504,9 @@ const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
 /** `--site` values (bytedcli 0.178) grouped by the JWT region each one uses,
  *  measured by minting with every site. Sites not listed keep the default. */
 const BYTEDCLI_SITE_REGIONS: Record<BytedcliRegion, readonly string[]> = {
-  // Not `i18n`: minting with it was measured returning an i18nbd token.
+  // The site `i18n` belongs to i18nbd; the i18n region uses i18n-tt.
   i18n: ['i18n-tt', 'eu-ttp', 'eu-ttp-limited', 'eu-ttp-full'],
-  i18nbd: ['i18n-bd'],
+  i18nbd: ['i18n', 'i18n-bd'],
   tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts', 'us-ttpbd'],
 };
 

@@ -402,7 +402,7 @@ export interface BytedcliJwts {
  * `--site` value onto these regions (see renderIdentityWrapper).
  */
 export const BYTEDCLI_REGIONAL_SITES = [
-  // `--site i18n` itself was measured minting an i18nbd-region token.
+  // The site `i18n` belongs to i18nbd; use i18n-tt for the i18n region.
   ['i18n', 'i18n-tt'],
   ['i18nbd', 'i18n-bd'],
   ['tx', 'us-ttp'],
