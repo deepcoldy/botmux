@@ -125,6 +125,31 @@ function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
   return record?.state === 'revoked' ? undefined : record?.task;
 }
 
+export function getScheduleAuthorityRecord(
+  id: string,
+  appId?: string,
+): import('../services/schedule-authority-store.js').ScheduleAuthorityRecord | undefined {
+  if (authorityUnavailable || !authorityStore) return undefined;
+  const effectiveAppId = authorityAppId(appId);
+  if (!effectiveAppId || !authorityStore.isInitialized(effectiveAppId)) return undefined;
+  return authorityStore.getRecord(effectiveAppId, id);
+}
+
+export function registerBackgroundExecution(job: import('./background-execution-policy.js').BackgroundExecutionRegistration): void {
+  if (authorityUnavailable || !authorityStore) throw new Error('schedule_authority_unavailable');
+  authorityStore.registerBackgroundExecution(job);
+}
+
+export function backgroundExecutions(appId: string, sessionId: string): import('./background-execution-policy.js').BackgroundExecutionRegistration[] {
+  if (authorityUnavailable || !authorityStore || !authorityStore.isInitialized(appId)) return [];
+  return authorityStore.backgroundExecutions(appId, sessionId);
+}
+
+export function revokeBackgroundExecution(id: string): void {
+  if (authorityUnavailable || !authorityStore) throw new Error('schedule_authority_unavailable');
+  authorityStore.revokeBackgroundExecution(id);
+}
+
 /** Fire-time guard for tasks created through a live conversation turn.
  *
  * Every such task has a non-null authority `targetTurnId` (direct and

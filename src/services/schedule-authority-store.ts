@@ -14,6 +14,8 @@ import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { canonicalScheduleInput } from './schedule-store.js';
 import { absorbLegacyFailureStats } from './schedule-until-done.js';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
+import { backgroundAuthorityKey, backgroundPeerBelongsToJob, type BackgroundExecutionRegistration } from '../core/background-execution-policy.js';
+import { isAutoCompletedSchedule } from './schedule-until-done.js';
 
 export type ScheduleAuthorityKind = 'legacy' | 'direct' | 'delegated';
 export type ScheduleAuthorityState = 'active' | 'paused' | 'completed' | 'revoked';
@@ -193,6 +195,13 @@ export class ScheduleAuthorityStore {
       // Inspect and migrate under the same write lock. Otherwise parallel
       // openers can both observe a missing column and attempt the same ALTER.
       db.exec('BEGIN IMMEDIATE;');
+      db.exec(`CREATE TABLE IF NOT EXISTS schedule_background_executions (
+        id TEXT PRIMARY KEY, app_id TEXT NOT NULL, session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL, registration_json TEXT NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS background_execution_session
+        ON schedule_background_executions(app_id, session_id);`);
       db.exec(`
         CREATE TABLE IF NOT EXISTS schedule_authority_apps (
           app_id TEXT PRIMARY KEY,
@@ -466,6 +475,11 @@ export class ScheduleAuthorityStore {
         return record.task;
       }
       const state = stateFor(next);
+      if ((state !== 'active' && !(state === 'completed' && isAutoCompletedSchedule(next)))
+        || backgroundAuthorityKey(next) !== backgroundAuthorityKey(record.task)) {
+        this.db.prepare('UPDATE schedule_background_executions SET revoked = 1 WHERE app_id = ? AND task_id = ?')
+          .run(appId, taskId);
+      }
       this.db.prepare(`
         UPDATE schedule_authority_tasks
         SET state = ?, task_json = ?, canonical_hash = ?, updated_at = ?
@@ -491,11 +505,64 @@ export class ScheduleAuthorityStore {
   }
 
   revoke(appId: string, taskId: string): boolean {
+    // Job reads join the authority row, so this atomic tombstone also retires jobs.
     const result = this.db.prepare(`
       UPDATE schedule_authority_tasks SET state = 'revoked', updated_at = ?
       WHERE app_id = ? AND task_id = ? AND state != 'revoked'
     `).run(new Date().toISOString(), appId, taskId);
     return Number(result.changes) > 0;
+  }
+
+  registerBackgroundExecution(job: BackgroundExecutionRegistration): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const record = this.getRecord(job.appId, job.taskId);
+      if (!record || record.kind !== 'direct'
+        || (record.state !== 'active' && !(record.state === 'completed' && isAutoCompletedSchedule(record.task)))
+        || backgroundAuthorityKey(record.task) !== job.authorityKey) throw new Error('background_authority_changed');
+      // A root is registered once; retrying an uncertain registration must not
+      // extend its expiry or redirect it to another session/principal.
+      const rows = this.db.prepare(`SELECT id, registration_json, revoked FROM schedule_background_executions
+        WHERE app_id = ? AND session_id = ?`).all(job.appId, job.sessionId) as Array<{
+          id: string; registration_json: string; revoked: number;
+        }>;
+      let active = 0;
+      for (const row of rows) {
+        const old = JSON.parse(row.registration_json) as BackgroundExecutionRegistration;
+        // Keep a live root's tombstone even after revoke/expiry: it may not
+        // grant itself a new lease by replaying registration in the old turn.
+        if (!backgroundPeerBelongsToJob({ ...old, expiresAt: Number.POSITIVE_INFINITY }, old.root)) {
+          this.db.prepare('DELETE FROM schedule_background_executions WHERE id = ?').run(row.id);
+          continue;
+        }
+        if (old.bootId === job.bootId && old.root.pid === job.root.pid && old.root.procStart === job.root.procStart) {
+          throw new Error('background_registration_conflict');
+        }
+        if (backgroundPeerBelongsToJob({ ...old, expiresAt: Number.POSITIVE_INFINITY }, job.root)
+          || backgroundPeerBelongsToJob({ ...job, expiresAt: Number.POSITIVE_INFINITY }, old.root)) {
+          throw new Error('background_registration_conflict');
+        }
+        if (old.expiresAt <= Date.now()) {
+          this.db.prepare('UPDATE schedule_background_executions SET revoked = 1 WHERE id = ?').run(row.id);
+        } else if (!row.revoked) active++;
+      }
+      if (active >= 64) throw new Error('background_registration_conflict');
+      this.db.prepare(`INSERT INTO schedule_background_executions
+        (id, app_id, session_id, task_id, registration_json) VALUES (?, ?, ?, ?, ?)`)
+        .run(job.id, job.appId, job.sessionId, job.taskId, JSON.stringify(job));
+      this.db.exec('COMMIT;');
+    } catch (error) { this.db.exec('ROLLBACK;'); throw error; }
+  }
+
+  backgroundExecutions(appId: string, sessionId: string): BackgroundExecutionRegistration[] {
+    return (this.db.prepare(`SELECT j.registration_json FROM schedule_background_executions j
+      JOIN schedule_authority_tasks t ON t.app_id = j.app_id AND t.task_id = j.task_id
+      WHERE j.app_id = ? AND j.session_id = ? AND j.revoked = 0 AND t.state != 'revoked'`)
+      .all(appId, sessionId) as Array<{ registration_json: string }>).map(row => JSON.parse(row.registration_json));
+  }
+
+  revokeBackgroundExecution(id: string): void {
+    this.db.prepare('UPDATE schedule_background_executions SET revoked = 1 WHERE id = ?').run(id);
   }
 
   getClaimCard(appId: string, taskId: string): ScheduleClaimCardRecord | undefined {
