@@ -127,10 +127,10 @@ describe('merged JWT lifecycle durable epoch timing', () => {
     expect(maximumActive).toBe(1);
   });
 
-  it('fences local revocation and rejects recreated SDK files until a new login begins', async () => {
+  it('fences recreated SDK files after the required durable-bump-before-clear revocation sequence', async () => {
     defaultDelay = 10_000;
     const old = auth.renewBytedcliJwts(USER); await vi.advanceTimersByTimeAsync(1000);
-    auth.clearBytedcliAuth(USER);
+    epoch.bumpCliAuthEpoch(USER); auth.clearBytedcliAuth(USER);
     mkdirSync(auth.bytedcliHomeFor(USER), { recursive: true });
     writeFileSync(join(auth.bytedcliHomeFor(USER), 'authorized'), 'replacement-session');
     const current = auth.mintBytedcliJwts(USER);
@@ -159,11 +159,12 @@ describe('merged JWT lifecycle durable epoch timing', () => {
     expect(await old).toBeNull();
   });
 
-  it.each(['durable-revoke', 'local-clear-only'])('keeps a post-revoke login begin behind an old SDK writer: %s', async revokeMode => {
+  it.each(['durable-bump-and-clear', 'durable-bump-only'])('keeps a post-revoke login begin behind an old SDK writer with durable bump before clear: %s', async revokeMode => {
     defaultDelay = 10_000; rewriteOldHome = true;
     const old = auth.renewBytedcliJwts(USER); await vi.advanceTimersByTimeAsync(1000);
-    if (revokeMode === 'durable-revoke') epoch.bumpCliAuthEpoch(USER);
-    auth.clearBytedcliAuth(USER);
+    // Production revocation persists the epoch before clearing the HOME.
+    epoch.bumpCliAuthEpoch(USER);
+    if (revokeMode === 'durable-bump-and-clear') auth.clearBytedcliAuth(USER);
     const login = auth.beginBytedcliLogin(USER); await vi.advanceTimersByTimeAsync(20);
     const overlapped = maximumActive;
     await vi.advanceTimersByTimeAsync(10_000); expect(await old).toBeNull(); await login;
@@ -172,6 +173,46 @@ describe('merged JWT lifecycle durable epoch timing', () => {
     // its fresh epoch stamp and masquerade as a usable new login.
     const status = auth.describeBytedcliAuth(USER); await vi.advanceTimersByTimeAsync(10);
     expect(await status).toEqual({ state: 'needs-login' });
+  });
+
+  it('accepts another daemon\'s completed post-revoke login and preserves its valid shared HOME on begin', async () => {
+    epoch.bumpCliAuthEpoch(USER); auth.clearBytedcliAuth(USER);
+    vi.resetModules(); const otherDaemon = await import('../src/services/bytedcli-auth.js');
+    const begin = otherDaemon.beginBytedcliLogin(USER); await vi.advanceTimersByTimeAsync(10);
+    const challenge = await begin;
+    expect(challenge).not.toBeNull();
+    completeSuccess = true;
+    const complete = otherDaemon.completeBytedcliLogin(USER, challenge!.completeToken);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await complete).toEqual({ state: 'authorized' });
+    const home = auth.bytedcliHomeFor(USER);
+    expect(epoch.cliAuthEpochAllows(USER, home)).toBe(true);
+    const otherStatus = otherDaemon.hasBytedcliHome(USER); await vi.advanceTimersByTimeAsync(10);
+    expect(await otherStatus).toBe(true);
+    const originalStatus = auth.hasBytedcliHome(USER); await vi.advanceTimersByTimeAsync(10);
+    expect.soft(await originalStatus).toBe(true);
+    const authorized = readFileSync(join(home, 'authorized'), 'utf8');
+    const nextBegin = auth.beginBytedcliLogin(USER); await vi.advanceTimersByTimeAsync(10);
+    expect(await nextBegin).not.toBeNull();
+    expect(existsSync(join(home, 'authorized'))).toBe(true);
+    expect(readFileSync(join(home, 'authorized'), 'utf8')).toBe(authorized);
+    const after = auth.hasBytedcliHome(USER); await vi.advanceTimersByTimeAsync(10);
+    expect(await after).toBe(true);
+  });
+
+  it('preserves an unstamped legacy HOME at durable epoch zero when beginning a login', async () => {
+    const home = auth.bytedcliHomeFor(USER);
+    expect(epoch.readCliAuthEpoch(USER)).toBe(0);
+    expect(existsSync(join(home, '.botmux-auth-epoch'))).toBe(false);
+    const authorized = readFileSync(join(home, 'authorized'), 'utf8');
+    const status = auth.hasBytedcliHome(USER); await vi.advanceTimersByTimeAsync(10);
+    expect(await status).toBe(true);
+    const begin = auth.beginBytedcliLogin(USER); await vi.advanceTimersByTimeAsync(10);
+    expect(await begin).not.toBeNull();
+    expect(existsSync(join(home, 'authorized'))).toBe(true);
+    expect(readFileSync(join(home, 'authorized'), 'utf8')).toBe(authorized);
+    const after = auth.hasBytedcliHome(USER); await vi.advanceTimersByTimeAsync(10);
+    expect(await after).toBe(true);
   });
 
   it.each(['same-daemon', 'other-daemon'])('does not let a late old login completion consume the new challenge: %s', async where => {

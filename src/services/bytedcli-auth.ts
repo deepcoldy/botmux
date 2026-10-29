@@ -43,9 +43,6 @@ import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-a
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
 const BYTEDCLI_HOME_ROOT = join(homedir(), '.botmux', 'data', 'bytedcli-home');
-// A still-running SDK child can recreate a deleted legacy HOME. Only a fresh
-// queued login may remove this local revocation barrier after clearing it.
-const locallyRevokedHomes = new Set<string>();
 
 /** How long to wait on a `bytedcli` invocation. The device-code calls talk to
  *  ByteCloud, so they are network-bound; the JWT reads are usually local but
@@ -90,7 +87,7 @@ interface LoginObservation {
 
 async function readLoginState(openId: string): Promise<LoginObservation> {
   const home = bytedcliHomeFor(openId);
-  if (locallyRevokedHomes.has(openId) || !existsSync(home)) return { authenticated: false };
+  if (!existsSync(home)) return { authenticated: false };
   // A HOME rewritten after revoke has no matching stamp. Do not ask the CLI —
   // its own session files are not authority once the epoch has moved.
   if (!cliAuthEpochAllows(openId, home)) return { authenticated: false };
@@ -173,9 +170,12 @@ export async function describeBytedcliAuth(openId: string): Promise<{
   }
 }
 
-/** Forget one person's bytedcli authorization entirely. */
+/** Forget one person's bytedcli authorization entirely.
+ * Precondition: persist bumpCliAuthEpoch(openId) BEFORE logout or this cleanup.
+ * The durable epoch fences stale SDK writers in every daemon; clearing local
+ * dedup maps does not stop an already-running child from recreating the HOME.
+ */
 export function clearBytedcliAuth(openId: string): void {
-  locallyRevokedHomes.add(openId);
   beginnings.delete(openId);
   authEpochs.set(openId, authEpoch(openId) + 1);
   minting.delete(openId);
@@ -362,7 +362,10 @@ async function beginLogin(openId: string, epoch: number, durableEpoch: number): 
   const home = bytedcliHomeFor(openId);
   // A revoked HOME must not resume its old challenge. Clear it before login;
   // a newer login that landed during this call is left alone below.
-  if (existsSync(home) && (locallyRevokedHomes.has(openId) || !cliAuthEpochAllows(openId, home))) {
+  // The durable epoch/stamp is shared by every daemon. A matching new login
+  // must survive here even if this process performed an earlier revoke.
+  // An unstamped legacy HOME is still valid at epoch zero.
+  if (existsSync(home) && !cliAuthEpochAllows(openId, home)) {
     // The previous SDK child has left the shared queue. Remove any late files
     // before stamping a new login; cleanup is not a new revocation operation.
     try { rmSync(home, { recursive: true, force: true }); } catch { return null; }
@@ -387,7 +390,6 @@ async function beginLogin(openId: string, epoch: number, durableEpoch: number): 
   // stamp or delete — the newer HOME may already be valid.
   if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   stampCliAuthEpoch(openId, home);
-  locallyRevokedHomes.delete(openId);
   if (!saveChallenge(openId, completeToken, authUrl)) return null;
   return { authUrl, completeToken };
 }

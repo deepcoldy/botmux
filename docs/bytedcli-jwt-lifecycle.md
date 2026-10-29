@@ -13,6 +13,8 @@
 
 签票和续期在接纳时同时固定进程内代次与持久 CLI auth epoch，排队前后及各 provider 等待点复核；另一个 daemon 撤权后即使已重新登录、HOME 新 stamp 有效，也不能使旧请求的结果恢复有效。区域缓存同样绑定持久 epoch，重新登录后的请求不能复用旧代次区域 JWT。
 
+HOME 的撤权判定只以持久 epoch 与 `.botmux-auth-epoch` stamp 为权威，不保留进程内的撤权 HOME 标记。撤权必须先持久 bump，再执行 logout 与 HOME 删除；旧 SDK child 重建的无 stamp HOME 在 epoch ≥ 1 时仍拒绝。另一个 daemon 完成重登后，当前 stamp 允许所有 daemon 使用新登录，后续 begin 不会删除有效 HOME。升级前 epoch 0 的无 stamp HOME 继续保留。进程内 epoch、去重失效和队列仍用于拦截本进程已接纳的旧操作；它们不代替跨进程判定。
+
 begin/complete 登录也与 mint/renew 共用本进程的按人 HOME 队列。撤权只失效去重记录，不提前释放仍在运行的 SDK 操作锁；新登录等旧 child 退出后清掉其晚到文件，再建立新 challenge。旧 complete 不得消费新 challenge，mint 内部的自动 complete 使用同一队列内的原语，避免重复入队自锁。该机制不声称实现了跨 daemon 的文件锁，跨进程 SDK 写入仍见下方后续边界。
 
 ## 已知边界与后续
