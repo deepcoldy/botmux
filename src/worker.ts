@@ -29177,8 +29177,12 @@ function unattendedRawInputRefusal(
 ): PromptCacheKeepaliveRefusal | undefined {
   if (!msg.requireSafeComposer) return undefined;
   let maintenanceScreen: string | undefined;
+  let codexInputState: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined;
   if (renderer && backendScreenEvidenceIsAuthoritativeForMutation()) {
     try { maintenanceScreen = renderer.rawSnapshot({ preserveFormatting: true }); } catch { maintenanceScreen = undefined; }
+  }
+  if (lastInitConfig?.cliId === 'codex' && backend && backendScreenEvidenceIsAuthoritativeForMutation()) {
+    try { codexInputState = backend.captureInputState?.(); } catch { codexInputState = undefined; }
   }
   return promptCacheKeepaliveRefusal({
     hasBackend: !!backend && !!cliAdapter,
@@ -29191,6 +29195,8 @@ function unattendedRawInputRefusal(
       || pendingSessionRename !== null,
     screen: maintenanceScreen,
     readyPattern: cliAdapter?.readyPattern,
+    cliId: lastInitConfig?.cliId,
+    ...(codexInputState !== undefined ? { codexInputState } : {}),
   });
 }
 

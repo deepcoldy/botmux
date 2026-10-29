@@ -14,7 +14,7 @@ export const AUTO_COMPACT_DEFAULT_COOLDOWN_MS = 10 * 60_000;
  * Human passthrough remains intentionally best-effort across a wider roster;
  * unattended maintenance is narrower because an unknown command would consume
  * a turn without doing useful work. */
-const NATIVE_AUTO_COMPACT_CLIS = new Set(['claude-code', 'codex', 'traex', 'grok']);
+const NATIVE_AUTO_COMPACT_CLIS = new Set(['claude-code', 'codex']);
 
 export function supportsNativeAutoCompact(cliId: string): boolean {
   return NATIVE_AUTO_COMPACT_CLIS.has(cliId);
@@ -83,6 +83,29 @@ export function isAutoCompactEligible(input: AutoCompactEligibilitySnapshot): bo
     && !input.vcMeetingReceiver
     && !input.remoteRunner
     && input.supportsCompact;
+}
+
+export interface AutoCompactRefusalProjection {
+  streamCardPending?: boolean;
+  streamCardPendingTurnId?: string;
+}
+
+/** Clear the synthetic turn's pending-card marker after the worker rejects an
+ * unattended write for missing live composer evidence. The refusal is an
+ * expected fail-closed maintenance outcome, not a user turn that may remain
+ * pending until the next message arrives. */
+export function settleAutoCompactSafeComposerRefusal(
+  state: AutoCompactRefusalProjection,
+  terminal: { turnId: string; status: string; errorCode?: string },
+): boolean {
+  if (!terminal.turnId.startsWith('auto-compact:')
+    || terminal.status !== 'failed'
+    || terminal.errorCode !== 'safe_composer_required') return false;
+  if (state.streamCardPendingTurnId === terminal.turnId) {
+    state.streamCardPending = false;
+    state.streamCardPendingTurnId = undefined;
+  }
+  return true;
 }
 
 interface AutoCompactState {

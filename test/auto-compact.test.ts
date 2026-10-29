@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import {
   AutoCompactCoordinator,
   isAutoCompactEligible,
+  settleAutoCompactSafeComposerRefusal,
   supportsNativeAutoCompact,
   type AutoCompactEligibilitySnapshot,
 } from '../src/core/auto-compact.js';
@@ -256,12 +257,44 @@ describe('supportsNativeAutoCompact', () => {
   it('admits only CLIs with a confirmed native compact command', () => {
     expect(supportsNativeAutoCompact('claude-code')).toBe(true);
     expect(supportsNativeAutoCompact('codex')).toBe(true);
-    expect(supportsNativeAutoCompact('traex')).toBe(true);
-    expect(supportsNativeAutoCompact('grok')).toBe(true);
+    expect(supportsNativeAutoCompact('traex')).toBe(false);
+    expect(supportsNativeAutoCompact('grok')).toBe(false);
     expect(supportsNativeAutoCompact('seed')).toBe(false);
     expect(supportsNativeAutoCompact('relay')).toBe(false);
     expect(supportsNativeAutoCompact('gemini')).toBe(false);
     expect(supportsNativeAutoCompact('cursor')).toBe(false);
+  });
+});
+
+describe('settleAutoCompactSafeComposerRefusal', () => {
+  it('clears only the matching synthetic turn pending marker', () => {
+    const projection = {
+      streamCardPending: true,
+      streamCardPendingTurnId: 'auto-compact:abc',
+    };
+    expect(settleAutoCompactSafeComposerRefusal(projection, {
+      turnId: 'auto-compact:abc', status: 'failed', errorCode: 'safe_composer_required',
+    })).toBe(true);
+    expect(projection).toEqual({
+      streamCardPending: false,
+      streamCardPendingTurnId: undefined,
+    });
+  });
+
+  it.each([
+    ['human turn', { turnId: 'om_123', status: 'failed', errorCode: 'safe_composer_required' }],
+    ['other failure', { turnId: 'auto-compact:abc', status: 'failed', errorCode: 'worker_failed' }],
+    ['completed turn', { turnId: 'auto-compact:abc', status: 'completed' }],
+  ])('leaves the projection unchanged for %s', (_name, terminal) => {
+    const projection = {
+      streamCardPending: true,
+      streamCardPendingTurnId: 'auto-compact:abc',
+    };
+    expect(settleAutoCompactSafeComposerRefusal(projection, terminal)).toBe(false);
+    expect(projection).toEqual({
+      streamCardPending: true,
+      streamCardPendingTurnId: 'auto-compact:abc',
+    });
   });
 });
 
@@ -284,6 +317,17 @@ describe('auto-compact unattended worker write gate', () => {
     '',
     ' Esc to cancel · Tab to amend',
   ].join('\n');
+  const CODEX_COMPOSER = readFileSync(
+    new URL('./fixtures/codex-startup/zmx-history-initialized.txt', import.meta.url),
+    'utf8',
+  );
+
+  function codexInputState(viewport: string, cursorX = 2) {
+    const lines = viewport.split(/\r?\n/);
+    const cursorY = lines.findIndex(line => /^\s*[›»]/.test(line));
+    if (cursorY < 0) throw new Error('fixture has no Codex composer');
+    return { viewport, cursor: { x: cursorX, y: cursorY } };
+  }
 
   function harness(overrides: Record<string, unknown> = {}) {
     const scope: Record<string, any> = {
@@ -302,6 +346,7 @@ describe('auto-compact unattended worker write gate', () => {
       pendingRawInputs: [],
       pendingInjections: [],
       pendingSessionRename: null,
+      lastInitConfig: { cliId: 'claude-code' },
       ...overrides,
     };
     const refuse = loadWorkerFunction<(msg: { requireSafeComposer?: true }) => string | undefined>(
@@ -326,6 +371,33 @@ describe('auto-compact unattended worker write gate', () => {
   it('refuses a permission selector even though it contains the ready pattern', () => {
     const { refuse } = harness({ renderer: { rawSnapshot: () => PERMISSION_DIALOG } });
     expect(refuse({ requireSafeComposer: true })).toBe('action_prompt_open');
+  });
+
+  it('admits the real Codex fixture without letting its footer steal the composer anchor', () => {
+    const state = codexInputState(CODEX_COMPOSER);
+    const { refuse } = harness({
+      lastInitConfig: { cliId: 'codex' },
+      backend: { captureInputState: () => state },
+      cliAdapter: { readyPattern: /[›»](?!\s*\d+\.)|\d+% left/ },
+    });
+    expect(refuse({ requireSafeComposer: true })).toBeUndefined();
+  });
+
+  it('fails closed for a Codex draft, picker, or missing cursor evidence', () => {
+    const draft = CODEX_COMPOSER.replace('› Ask Codex to do anything', '› delete everything');
+    const picker = CODEX_COMPOSER.replace('› Ask Codex to do anything', '› 1. Continue');
+    const codexHarness = (state: ReturnType<typeof codexInputState> | undefined) => harness({
+      lastInitConfig: { cliId: 'codex' },
+      backend: state ? { captureInputState: () => state } : {},
+      cliAdapter: { readyPattern: /[›»](?!\s*\d+\.)|\d+% left/ },
+    }).refuse({ requireSafeComposer: true });
+
+    expect(codexHarness(codexInputState(draft, 20))).toBe('composer_not_empty');
+    // Cursor-at-Home defeats the coarse cursor-only detector; the exact
+    // placeholder/footer proof must still reject this non-empty draft.
+    expect(codexHarness(codexInputState(draft))).toBe('prompt_not_framed');
+    expect(codexHarness(codexInputState(picker))).toBe('prompt_not_framed');
+    expect(codexHarness(undefined)).toBe('no_screen_evidence');
   });
 
   it.each([
@@ -353,9 +425,12 @@ describe('auto-compact unattended worker write gate', () => {
   it('keeps the daemon-to-worker and close cleanup wiring as a K4 structural guard', () => {
     const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
     const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    const workerPool = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
     expect(daemon).toContain('requireSafeComposer: true');
     expect(worker).toContain('const unattendedRefusal = unattendedRawInputRefusal(msg)');
     expect(worker).toContain("emitTurnTerminal(msg.turnId, 'failed', 'safe_composer_required')");
+    expect(worker).toContain('codexInputState = backend.captureInputState?.()');
+    expect(workerPool).toContain('settleAutoCompactSafeComposerRefusal(ds, msg)');
     expect(daemon).toContain('autoCompactCoordinator.cancel(session.sessionId)');
   });
 });
