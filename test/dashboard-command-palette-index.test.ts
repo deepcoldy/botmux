@@ -31,6 +31,7 @@ import {
   botDefaultsSectionDomId,
   findBotDefaultsSection,
   parseBotDefaultsTab,
+  type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults.js';
 import { BotAgentSection, BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
 import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
@@ -212,9 +213,14 @@ function trTextKeys(text: string): string[] {
  * 1. `<FieldTitle>` 的直接文本子节点（含跨行写法）；
  * 2. 选项组的 `groupName={tr(...)}`；
  * 3. `<ToggleRow>` 的 `title`（字面量与三元两支）；
- * 4. `<label>` 内 `<span>` / `<strong>` / `<small>` 的直接文本子节点（裸复选框、输入框行）；
+ * 4. `<label>` 自己的直接文本，以及其内 `<span>` / `<strong>` / `<small>` 的直接文本子节点
+ *    （`<label htmlFor>{tr()}</label><input/>`、裸复选框、输入框行）；
  * 5. 紧挨 `<DropdownField>` 的 `<span>` 标题（下拉框没有 `<label>`，标题就是它前面那个 span）；
  * 6. 按常量列表展开的键（REPLY_FOOTER_KEYS / STREAMING_CARD_BUTTON_IDS）与一键静默预设的小标题。
+ * 已知缺口（不静默跳过，登记在此）：常量数组里的 `tr(option.labelKey)`（如
+ * OWNER_REMINDER_STATE_OPTIONS 的 6 个同区块同义勾选项，登记会给 ⌘K 增同义噪音）、
+ * `<h4 className="bd-subsection-title">` 小组标题（组标题不是配置行，属产品取舍）——
+ * 这两类后续要收时需要新增加常量展开与 h4 扫描规则。
  * 只认 tr() 键：硬编码中文的标题（「高级 JSON」「每聊天覆盖」，英文界面也显示中文）读不到，是已知缺口，另行跟进。
  */
 function renderedBotConfigLabelKeys(sources: string): Set<string> {
@@ -229,6 +235,8 @@ function renderedBotConfigLabelKeys(sources: string): Set<string> {
     if (ternary) add([ternary[1]!, ternary[2]!]);
   }
   for (const label of elementChildren(sources, 'label')) {
+    // label 自己的直接文本（嵌套元素的文本会被 directText 剥掉，不和下面的子元素重复计数）。
+    add(trTextKeys(directText(label)));
     for (const tagName of ['span', 'strong', 'small']) {
       for (const children of elementChildren(label, tagName)) add(trTextKeys(directText(children)));
     }
@@ -248,6 +256,8 @@ const NOT_CONFIG_LABELS: ReadonlyMap<string, string> = new Map([
   ['botDefaults.stewardModeReplace', '同上，「管家指引」单选组的另一个选项'],
   ['sessionEnv.keyLabel', '新增/去掉环境变量弹窗里的表单字段名，只在弹窗打开时出现，页面上没有可定位的行'],
   ['sessionEnv.valueLabel', '同上，环境变量弹窗里的值字段名'],
+  ['botDefaults.sgTagRepairAllLabel', '飞书授权流程里一次性「顺便补齐」勾选，repairAll 只用于当次调用、不持久化为 bot 配置'],
+  ['botDefaults.autoStartExcludedChatsHelp', '排除群文本框上方的说明文案，不是配置项；对应配置行已由 botDefaults.autoStartExcludedChats 承载'],
 ]);
 
 const BOT_CONFIG_KEY_NAMESPACES = ['botDefaults.', 'sessionEnv.', 'quietPreset.', 'promptCache.', 'roles.', 'blocked.'];
@@ -697,6 +707,67 @@ describe('⌘K reaches the Bot config page, its categories and each bot', () => 
       const result = resolveBotDefaultsTarget({ tab: 'security', section: section('network-policy'), field: null }, doc(root), zh);
       expect(result).toEqual({ target: network, block: 'start', missing: null });
     });
+
+    // 补登进索引的配置行并不都渲染成 .bd-field-title-text：裸 span / 共享 FieldTitle /
+    // label 直接文本 / strong 都是实际写法。落地函数认不出这些形状时会误报「当前 Bot 不显示该项」。
+    const landingShapes: Array<{ name: string; tab: BotDefaultsTab; sectionId: string; field: string; build(): { tile: FakeEl; row: FakeEl } }> = [
+      {
+        name: 'bare span before a DropdownField in a bd-field', tab: 'common', sectionId: 'agent', field: 'botDefaults.agentCli',
+        build() {
+          const row = new FakeEl('div', ['bd-field']).add(new FakeEl('span', [], zh(this.field)), new FakeEl('div'));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'shared FieldTitle .ui-field-title-text in a settings-field-row', tab: 'sessions', sectionId: 'prompt-cache', field: 'promptCache.idleMinutes',
+        build() {
+          const row = new FakeEl('div', ['settings-field-row']).add(
+            new FakeEl('span', ['ui-field-title']).add(new FakeEl('span', ['ui-field-title-text'], zh(this.field))));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'strong inside a label.toggle-row', tab: 'cards', sectionId: 'card-behavior', field: 'quietPreset.switch',
+        build() {
+          const row = new FakeEl('label', ['toggle-row']).add(
+            new FakeEl('span', ['toggle-tx']).add(new FakeEl('strong', [], zh(this.field))));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'label direct text with a sibling input in a bd-row', tab: 'advanced', sectionId: 'codex-app-display', field: 'botDefaults.noProgressNotifyTimeoutLabel',
+        build() {
+          const row = new FakeEl('div', ['bd-row']).add(new FakeEl('label', [], zh(this.field)), new FakeEl('input'));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'label direct text in a session-group-tag-name row', tab: 'sessions', sectionId: 'session-mode', field: 'botDefaults.sgTagName',
+        build() {
+          const row = new FakeEl('div', ['bd-sg-tag-name']).add(new FakeEl('label', [], zh(this.field)), new FakeEl('input'));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'bare span inside a model-toggle label without a row container', tab: 'common', sectionId: 'agent', field: 'botDefaults.autoModelTitle',
+        build() {
+          const row = new FakeEl('label', ['bd-auto-model-toggle']).add(new FakeEl('input'), new FakeEl('span', [], zh(this.field)));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+    ];
+
+    for (const shape of landingShapes) {
+      it(`lands on a label rendered as ${shape.name}`, () => {
+        const { tile, row } = shape.build();
+        const root = new FakeEl('main').add(new FakeEl('button', [], '', `bd-tab-${shape.tab}`), tile);
+        const result = resolveBotDefaultsTarget(
+          { tab: shape.tab, section: section(shape.sectionId), field: shape.field }, doc(root), zh);
+        expect(result.missing, shape.name).toBeNull();
+        // 有行容器时落在整行（closest 缺容器选择器时这条会红）；没有行容器的退回 label 本身（构造里 row 即 label）。
+        expect(result.target, shape.name).toBe(row);
+      });
+    }
 
     it('reads tab / section / field from the hash, deriving the category from the section', () => {
       vi.stubGlobal('location', { hash: botDefaultsHref({ section: 'session-mode', field: 'botDefaults.groupRegular' }) });

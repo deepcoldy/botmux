@@ -87,6 +87,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.groupP2p', 'botDefaults.groupRegular', 'botDefaults.groupMention', 'botDefaults.sgTag',
       'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.sgTagAuthPasteLabel',
+      'botDefaults.sgTagName', 'botDefaults.sgClosedTagName',
     ],
   },
   // 管家：和「群负责人」同属「谁来接待 / 跟进」一类开关，紧挨着会话模式那一格放。
@@ -193,7 +194,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'codex-app-display',
     tab: 'advanced',
     titleKey: 'botDefaults.sectionCodexAppDisplay',
-    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.noProgressNotify'],
+    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.noProgressNotify', 'botDefaults.noProgressNotifyTimeoutLabel'],
   },
   {
     id: 'codex-runtime',
