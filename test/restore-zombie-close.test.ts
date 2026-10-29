@@ -1,3 +1,4 @@
+import { recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
 /**
  * Restore-time close decision for persistent backends (tmux/zellij/herdr/zmx).
  *
@@ -52,6 +53,8 @@ const bot = vi.hoisted(() => ({
   wrapperCli: undefined as string | undefined,
   cliLaunchMode: undefined as import('../src/core/cli-launch-mode.js').CliLaunchMode | undefined,
 }));
+
+vi.mock('../src/im/lark/event-dispatcher.js', () => ({ canTalk: vi.fn(() => true) }));
 
 vi.mock('../src/config.js', () => ({
   config: {
@@ -2121,4 +2124,62 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       .toMatchObject({ closed: 0 });
   });
 
+});
+
+
+describe('restoreActiveSessions — deployment interrupted Codex turn', () => {
+  function checkpoint() {
+    bot.cliId = 'codex';
+    const row = makeActivePersistentSession('om_deployment');
+    row.cliSessionId = 'native-original'; row.workerGeneration = 4;
+    sessionStore.updateSession(row);
+    recordDeploymentContinuation(row, { type: 'native_input_consumed', ordinaryInteractive: true, turnId: 'om_task',
+      proofKind: 'codex_history_match', nativeSessionId: 'native-original' }, {
+      currentTurnId: 'om_task', workerGeneration: 4, rpc: false,
+      caller: { senderType: 'user', requestLarkAppId: 'app_test', requestUserOpenId: 'ou_original' },
+    }, previous => sessionStore.updateDeploymentContinuation(row, previous));
+    return row;
+  }
+  it('eagerly wakes only a missing backend and persists the claim before forking', async () => {
+    const row = checkpoint(); probe.result = 'missing';
+    const active = new Map<string, DaemonSession>(); wp.registry = active;
+    let witnessed = false;
+    vi.mocked(forkWorker).mockImplementationOnce((ds, prompt, resume, options) => {
+      expect(sessionStore.getOwnedSession(row.sessionId)?.deploymentContinuation?.state).toBe('claimed');
+      expect(prompt).toBe(''); expect(resume).toMatchObject({ resume: true });
+      expect(options?.deploymentContinuation?.caller.requestUserOpenId).toBe('ou_original');
+      expect(ds.activeInteractiveTurn).toBeUndefined();
+      witnessed = true; return true;
+    });
+    await restoreActiveSessions(active);
+    expect(witnessed).toBe(true);
+    sessionStore.init('app_test'); vi.mocked(forkWorker).mockClear();
+    const second = new Map<string, DaemonSession>(); wp.registry = second;
+    await restoreActiveSessions(second);
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+  it.each(['rejected', 'pre-ipc-error', 'post-ipc-error'] as const)('fences restore outcome %s', async outcome => {
+    const row = checkpoint(); probe.result = 'missing';
+    const active = new Map<string, DaemonSession>(); wp.registry = active;
+    vi.mocked(forkWorker).mockImplementationOnce((_ds, _prompt, resume, options) => {
+      if (outcome === 'rejected') { options?.onAdmission?.('rejected'); return false; }
+      if (outcome === 'post-ipc-error' && typeof resume === 'object') resume.onIpcDispatchAttempted?.();
+      throw new Error('injected startup failure');
+    });
+    await restoreActiveSessions(active);
+    expect(sessionStore.getOwnedSession(row.sessionId)?.deploymentContinuation?.state)
+      .toBe(outcome === 'post-ipc-error' ? 'claimed' : 'running');
+  });
+  it('reattaches surviving native work without injecting a continuation', async () => {
+    checkpoint(); probe.result = 'exists';
+    const active = new Map<string, DaemonSession>(); wp.registry = active;
+    await restoreActiveSessions(active);
+    expect(forkWorker).toHaveBeenCalledWith(expect.anything(), '', true, { reattachLiveBackend: true });
+  });
+  it('does not act when backend existence is unknown', async () => {
+    checkpoint(); probe.result = 'unknown';
+    const active = new Map<string, DaemonSession>(); wp.registry = active;
+    await restoreActiveSessions(active);
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
 });

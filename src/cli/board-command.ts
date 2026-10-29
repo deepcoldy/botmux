@@ -11,9 +11,9 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
 
 用法:
   botmux board guide                                    打印管家规则（预置 + owner 自定义）
-  botmux board list [--view decide|active|all] [--json] 列事项（默认 all），每行带飞书里打开的链接
+  botmux board list [--view decide|active|all] [--json] 列事项（默认 all），每行带主群和飞书里打开的链接；缺群的标出来
   botmux board show <编号|key> [--json]                  一项的全部字段、关联、最近历史、未执行的决定
-  botmux board add <标题> [字段…]                        新建；带 --key 且已存在时按 set 更新
+  botmux board add <标题> --link chat=oc_… [字段…]        新建，必须带群（或 --no-chat "<原因>"）；带 --key 且已存在时按 set 更新
   botmux board set <编号|key> [字段…] [--clear-ask]      改字段；改状态和待拍板内容会自动进历史
   botmux board history <编号|key> <一句话> [--handled]   追加历史；--handled = 这项最近一批决定已执行
   botmux board attach <编号|key> <图片>... [--note 说明] 附截图（png / jpg / gif / webp）
@@ -30,6 +30,11 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
   --link kind=ref[|标签]  可重复，只追加：pr=owner/repo#12 | issue=owner/repo#3 | commit=owner/repo@sha
                           | chat=oc_… | thread=oc_…/omt_… | session=<会话id> | doc=https://… | url=https://…
                           最后一个 | 之后是标签；网址里本身有 | 时写成 %7C
+                          chat 写入前会用本机 bot 查群：查到了用群名当默认标签，查不到就拒绝写入；
+                          已有的群再 --link 一遍 = 重新核实并补上群名
+  --primary-chat oc_…     主群（看板上「进群」打开的群）；默认是第一个群。必须是这一项关联的群之一
+  --no-chat "<原因>"       确实没有群时写明原因（只有 issue、还没开工、管家自己处理…），看板上显示「无群：<原因>」
+  --allow-unverified-chat 查不到的群也写上，看板上标「未核实」
   --unlink kind=ref       可重复，仅 set：删掉一条关联（照 show 里的 kind=ref 写）；
                           先删后加，--unlink 旧 --link 新 = 替换
   --note <一句话>         同时往历史里记一句
@@ -40,8 +45,9 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
 const VALUE_FLAGS = new Set([
   '--view', '--key', '--state', '--stage', '--kind', '--repo', '--summary', '--progress', '--ask',
   '--option', '--recommend', '--reason', '--link', '--unlink', '--note', '--title', '--session-id',
+  '--primary-chat', '--no-chat',
 ]);
-const BOOL_FLAGS = new Set(['--json', '--handled', '--clear-ask', '--help', '-h']);
+const BOOL_FLAGS = new Set(['--json', '--handled', '--clear-ask', '--allow-unverified-chat', '--help', '-h']);
 
 /** 字段 flag → daemon 侧 patch 字段名。 */
 const FIELD_FLAGS: Record<string, string> = {
@@ -158,7 +164,19 @@ export function parseBoardArgs(argv: string[]): { ok: true; help: true } | { ok:
       if (t.flags.get('--option')?.length) request.options = t.flags.get('--option');
       if (t.flags.get('--link')?.length) request.links = t.flags.get('--link');
       if (t.flags.get('--unlink')?.length) request.unlinks = t.flags.get('--unlink');
-      if (action === 'set' && Object.keys(request.fields as object).length === 0 && !request.options && !request.links && !request.unlinks && !request.clearAsk) {
+      const primaryChat = single('--primary-chat');
+      if (primaryChat !== undefined) request.primaryChat = primaryChat;
+      const noChat = single('--no-chat');
+      if (noChat !== undefined) {
+        if (!noChat.trim()) return { ok: false, error: '--no-chat 要写明为什么没有群，如 --no-chat "只有 issue，还没开工"' };
+        if (t.flags.get('--link')?.some(spec => spec.trim().startsWith('chat='))) {
+          return { ok: false, error: '--link chat= 和 --no-chat 只能二选一：有群就挂群，确实没有群才写原因' };
+        }
+        request.noChat = noChat;
+      }
+      if (t.bools.has('--allow-unverified-chat')) request.allowUnverifiedChat = true;
+      if (action === 'set' && Object.keys(request.fields as object).length === 0 && !request.options && !request.links && !request.unlinks
+        && !request.clearAsk && request.primaryChat === undefined && request.noChat === undefined) {
         return { ok: false, error: 'set 至少要改一个字段' };
       }
       break;
@@ -185,6 +203,9 @@ export function parseBoardArgs(argv: string[]): { ok: true; help: true } | { ok:
   }
   if (t.bools.has('--handled') && action !== 'history') return { ok: false, error: `${action} 不支持 --handled` };
   if (t.bools.has('--clear-ask') && action !== 'set') return { ok: false, error: `${action} 不支持 --clear-ask` };
+  if (t.bools.has('--allow-unverified-chat') && action !== 'add' && action !== 'set') {
+    return { ok: false, error: `${action} 不支持 --allow-unverified-chat` };
+  }
   const sessionId = single('--session-id');
   return {
     ok: true,
@@ -207,7 +228,21 @@ export function readBoardAttachFiles(paths: string[], read: (p: string) => Buffe
   return { ok: true, files };
 }
 
-interface ListItem { seq: number; title: string; stateLabel?: string; stage?: string; pendingDecisions?: number; appLink?: string; url?: string }
+interface MainChat { text: string; url?: string; chatCheck?: 'verified' | 'unverified' }
+interface ListItem {
+  seq: number; title: string; stateLabel?: string; stage?: string; pendingDecisions?: number; appLink?: string; url?: string;
+  mainChat?: MainChat; chatCount?: number; noChatReason?: string; missingChat?: boolean;
+}
+
+/** 一项的群：「💬 主群名（+2 个群）」/「无群：原因」/「⚠缺群」。旧 daemon 不给这些字段时返回空串。 */
+function chatTag(i: ListItem): string {
+  if (i.mainChat) {
+    const more = (i.chatCount ?? 1) > 1 ? `（+${(i.chatCount ?? 1) - 1} 个群）` : '';
+    return `💬${i.mainChat.text}${i.mainChat.chatCheck === 'unverified' ? '（未核实）' : ''}${more}`;
+  }
+  if (i.noChatReason) return `无群：${i.noChatReason}`;
+  return i.missingChat ? '⚠缺群' : '';
+}
 
 /** 给人（和模型）读的输出；--json 时调用方直接打印原始 JSON。 */
 export function formatBoardResult(action: BoardAction, body: Record<string, unknown>): string {
@@ -218,12 +253,17 @@ export function formatBoardResult(action: BoardAction, body: Record<string, unkn
     case 'list': {
       const items = (body.items ?? []) as ListItem[];
       const counts = body.counts as { decide?: number; active?: number; all?: number } | undefined;
-      const head = counts ? `待你拍板 ${counts.decide ?? 0} · 进行中 ${counts.active ?? 0} · 全部 ${counts.all ?? 0}` : '';
+      const missing = Number(body.missingChat ?? 0);
+      const head = [
+        counts ? `待你拍板 ${counts.decide ?? 0} · 进行中 ${counts.active ?? 0} · 全部 ${counts.all ?? 0}` : '',
+        missing ? `⚠ 本页 ${missing} 项缺群：botmux board set <编号> --link chat=oc_…，确实没有群写 --no-chat "<原因>"` : '',
+      ].filter(Boolean).join('\n');
       if (!items.length) return [head, '（没有事项）'].filter(Boolean).join('\n');
       return [head, ...items.map(i => {
         const pending = i.pendingDecisions ? ` ⏳${i.pendingDecisions} 个决定待执行` : '';
+        const chat = chatTag(i);
         const link = linkOf(i);
-        return `#${i.seq} ${i.stateLabel ?? ''}${i.stage ? `·${i.stage}` : ''} ${i.title}${pending}${link ? `  ${link}` : ''}`;
+        return `#${i.seq} ${i.stateLabel ?? ''}${i.stage ? `·${i.stage}` : ''} ${i.title}${pending}${chat ? `  ${chat}` : ''}${link ? `  ${link}` : ''}`;
       })].filter(Boolean).join('\n');
     }
     case 'add':
@@ -232,7 +272,9 @@ export function formatBoardResult(action: BoardAction, body: Record<string, unkn
       if (!item) return JSON.stringify(body);
       const verb = action === 'add' ? (body.created === false ? '已存在，已更新' : '已创建') : '已更新';
       const link = linkOf(item);
-      return `#${item.seq} ${verb}：${item.title}（${item.stateLabel ?? ''}${item.stage ? `·${item.stage}` : ''}）${link ? `\n${link}` : ''}`;
+      const chat = chatTag(item);
+      return `#${item.seq} ${verb}：${item.title}（${item.stateLabel ?? ''}${item.stage ? `·${item.stage}` : ''}）`
+        + `${chat ? `\n${chat}${item.mainChat?.url ? ` ${item.mainChat.url}` : ''}` : ''}${link ? `\n${link}` : ''}`;
     }
     case 'history': {
       const handled = Number(body.handledDecisions ?? 0);

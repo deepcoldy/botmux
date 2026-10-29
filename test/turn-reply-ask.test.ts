@@ -328,6 +328,7 @@ describe('Ask inside the running reply card', () => {
     expect(replyCardAskTarget(ds, { ...input, chatId: 'oc_other' }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, input, { ...origin, originDispatchAttempt: 2 })).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, questions: [{ ...input.questions[0], prompt: '文'.repeat(2000) }] }, origin)).toBeUndefined();
+    expect(replyCardAskTarget(ds, { ...input, questions: [{ prompt: 'Details', options: [], multiSelect: false, input: { type: 'text' } }] }, origin)).toBeUndefined();
     const group = { ...ds, scope: 'chat' as const };
     expect(replyCardAskTarget(group, { ...input, rootMessageId: null }, origin)).toEqual(input.replyCardTarget);
     expect(replyCardAskTarget(group, { ...input, rootMessageId: 'oc_chat' }, origin)).toEqual(input.replyCardTarget);

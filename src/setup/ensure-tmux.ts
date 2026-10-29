@@ -216,6 +216,58 @@ export function resolveTmuxVersionAtSessionBoundary(): TmuxVersion | null {
 }
 
 /**
+ * Version of the tmux SERVER currently answering `socketArgs` (`[]` = the
+ * default server), as reported by `display-message -p '#{version}'`. Commands
+ * and option values are parsed by that server, which can be older than the
+ * `tmux` binary on PATH: a package upgrade leaves the shared server running the
+ * old process until it restarts (a daemon restart only reattaches).
+ *
+ * When no server is running on the socket, the command FAILS rather than
+ * starting one (non-new-session commands carry an implicit -N since tmux 2.5);
+ * the next server is spawned from this client binary, so the caller-supplied
+ * client version stands in that case.
+ *
+ * Resolution order on a throwing call:
+ *  - a version already present in the error's stdout is rescued and trusted —
+ *    a NEWER client vs an OLDER server can print the answer and exit 0 while an
+ *    inherited stdout pipe stays open, so execFileSync waits out the timeout
+ *    and THROWS (ETIMEDOUT, status 0) despite holding the real version
+ *    (reproduced 3.3a client against a 3.1c server);
+ *  - a TIMEOUT with nothing readable fails CLOSED (null): the server might be
+ *    old, and trusting the newer client would re-send values it rejects
+ *    (`remain-on-exit failed`, `new-session -e`) and block session creation;
+ *  - only a FAST non-timeout failure (no server on the socket yet) stands down
+ *    to the client, since that client is what spawns the next server.
+ * Never throws.
+ */
+export function serverTmuxVersion(socketArgs: readonly string[], clientVersion: TmuxVersion | null): TmuxVersion | null {
+  try {
+    const out = execFileSync('tmux', [...socketArgs, 'display-message', '-p', '#{version}'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      // Same budget as the other version probes (TMUX_VERSION_PROBE_TIMEOUT_MS):
+      // a loaded host delays a SAME-version server's answer by seconds (the
+      // gate's own measurements saw 0.93–4.45s at load ~4 and a blown 3s
+      // budget at load ~70). A shorter budget here would time out on a modern
+      // but busy server, and the fail-closed branch would then silence the
+      // 77/127 crash-exit-code channel on exactly those hosts.
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
+      env: tmuxEnv(),
+    });
+    const parsed = parseTmuxVersion(String(out ?? ''));
+    return parsed ?? clientVersion;
+  } catch (err: any) {
+    // Answer already captured despite the throw (version/client pipe mismatch).
+    const captured = parseTmuxVersion(String(err?.stdout ?? ''));
+    if (captured) return captured;
+    // Bounded timeout, nothing readable: the server may be old — fail closed.
+    if (err?.code === 'ETIMEDOUT' || err?.signal || err?.killed) return null;
+    // Fast failure with no server: the next server comes from this client.
+    return clientVersion;
+  }
+}
+
+/**
  * Child-process budgets for the worker-gate capability probe.
  *
  * These are fork+exec budgets, not tmux-work budgets: `tmux -V` answers in

@@ -11,6 +11,11 @@ export function traeHome(): string {
   return configured ? expandHome(configured) : join(homedir(), '.trae');
 }
 
+/** TraeX and CoCo share the same Codex-compatible TOML configuration. */
+export function traeConfigPath(): string {
+  return join(traeHome(), 'traecli.toml');
+}
+
 /** SQLite database holding the `threads` table (one row per interactive
  *  session). Used to reverse-map a botmux session id to a TRAE-native session
  *  UUID (buildArgs/buildResumeCommand) and as the session/path index for

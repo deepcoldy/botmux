@@ -6,6 +6,7 @@ function fixture() {
   const scope: Record<string, any> = {
     lastInitConfig: { cliId: 'codex-app' }, isCodexAppCliId: (id: string) => id === 'codex-app',
     backend: { getChildPid: () => 40 }, codexAppRunnerProcessIdentity: undefined,
+    codexAppControlProven: true,
     captureAttachedCodexAppProcessIdentity: vi.fn(),
     codexAppEngineHasExited: vi.fn(() => true), codexAppCompletionAwaitingFinal: false,
     verifyCodexAppProcessIdentity: vi.fn(() => identity), publishLocalProcessAttestation: vi.fn(),

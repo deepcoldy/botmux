@@ -126,3 +126,31 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"te
 - The `send` examples pass `--no-mention`: a progress card doesn't need to @ anyone, and explicitly opting out avoids the mention-policy gate (exit 2).
 - Bot identity is resolved from the session context (same as `send`); errors such as a withdrawn message, missing permission, or a non-card target are surfaced as-is (exit 1).
 - Success prints `{"success":true,"messageId":"om_xxx","sessionId":"..."}` (JSON only on stdout); usage errors exit 2.
+
+## Signed button: start a turn as the clicker
+
+A local integrator can ask the bot to post a single-use button into a chat it belongs to. The click starts a session turn whose `senderOpenId` is the **clicker**, the same way a message from that person would. When `triggerUserAuth` is on (`credentialSource: local`), credentials are issued for that turn sender. The session owner and creator are never a fallback.
+
+The daemon HMAC-signs the prompt, the target chat or session, the optional working directory and chat type, a nonce, and an expiry. The secret and the nonce file are per bot, under `<dataDir>/card-click-turn/<larkAppId>/` (`secret` and `nonces.json`). The session data directory is shared by every bot daemon in a fleet, so those files do not live at the data-dir root. A consume takes a cross-process lock and reloads the file first, so one daemon's rewrite cannot drop a nonce another daemon already used. Tampered, expired, and replayed clicks are rejected. Expiry is checked before the nonce is consumed, so the error is expiry rather than replay. A restart cannot reuse an unexpired button.
+
+The clicker must pass the same `evaluateTalk` checks as a message sender (allowed users, blocked users, grants), plus `canOperate` (with an `on_` union id when the callback has one) and `grantCommandRestriction`. A grant-only talker cannot use the button. While `restrictGrantCommands` is on, a click whose talk reason is `chatGrant` or `globalGrant` is rejected too. An app or bot gets no identity and does not start a turn. The evidence is a same-host peer, an identity-cache type of `bot` or `app`, or any of the three union-id tables (`isTeamBot`, `isPlatformTeamBot`, `isTrustedSameOwnerSiblingBot`). An operator with none of that evidence is still treated as a human. Card callbacks carry no platform `sender_type`; do not call `resolveSender` just to probe, because a missing type is written into the cache as `user`.
+
+A `cct_` turn is intentionally outside `isOrdinaryImTurnId` and outside the `om_` / `join_` human-registry whitelist. It has no ordinary-message delivery receipt, ACK, or cold-start retry. Current-turn provenance uses `session.lastCallerOpenId`, written with the quote target at the start of the turn, so both a new session and an existing session resolve the CLI caller as the clicker rather than the previous speaker. A principal-lane session, and any click while cross-principal interruption is enabled, is rejected before the nonce is consumed. The toast says so, and the click does not write `activeInteractiveTurn`.
+
+The card callback's immediate toast only says the click is starting. After the worker accepts the input, the chat gets "Started this turn as you". A failed delivery rolls back the quote target, reply target, `lastCallerOpenId`, and `activeInteractiveTurn` written for that attempt, then posts the failure instead. A session created by the button uses `creationSource: ordinary-feishu`, so a bot with a Codex instance pool does not leave the new session on the legacy instance.
+
+The signed target is exactly one of `chatId` or `sessionId`. A `sessionId` must already be an active session for this bot; a miss does not spawn a replacement and does not borrow that session's owner. A `chatId` with no chat-scope session creates one whose owner and creator are the clicker, and it requires an existing absolute working directory. An existing session whose working directory differs from the signed path is rejected. A new session with no signed `chatType` is authorized as a group; a private chat must be signed `p2p` or `p2pOpen` will not apply.
+
+The posting endpoint is the daemon IPC `POST /api/cards/click-turn` (same local HMAC as `POST /api/sessions/spawn`, and the daemon must already be bound to this bot). It is not a core-only public route.
+
+| Field | Meaning |
+| --- | --- |
+| `prompt` | Required. Sent as this turn's user text, at most 1500 characters |
+| `chatId` / `sessionId` | Exactly one. A chat-scope session for that chat, or one existing session |
+| `postChatId` | Where to post the card. Defaults to `chatId`. Required when only `sessionId` is set |
+| `workingDir` | Optional existing absolute path. Required when the click would create a session |
+| `chatType` | Optional `group` or `p2p` |
+| `ttlMs` | Optional, from 1 minute to 7 days. Default 1 hour |
+| `buttonLabel` / `title` | Optional |
+
+Success returns `{ ok, messageId, exp }`. If the bot is not in the destination chat the response is 403 `bot_not_in_chat`.

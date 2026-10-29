@@ -1,6 +1,8 @@
 # 当前执行的只读证明
 
-Codex App 的独立 runner 通过已认证的签名 state 上报原生 app-server 的 PID 与启动时间；worker 再核对本会话 backend 血缘及继承的 RPC stdin/stdout 管道，随后沿私有 IPC 发布引擎根。npm 的 Node 启动器不再造成跨轮工具被误判。接管旧 runner 时，只在签名通道认证后识别同一可执行文件、同一 session 的唯一 runner 及其直接启动的 RPC 子进程；歧义或无法证明时仍拒绝。普通 busy/idle 不重新快照正在执行的工具。引擎空闲退出后，runner 在新引擎投递原生轮次前发布签名的 `idle_restart` 边界；只有旧引擎已退出、没有待收尾 final 且新身份重新通过内核和 stdio 验证时，worker 才更新引擎根，不发布额外 prompt-ready。旧工具和旧代次不能获得新轮权限。
+Codex App 的新版独立 runner 使用主干的签名 `appServerProcess` 声明，worker 在本会话 backend 的宿主进程树中核对启动令牌，并通过 `NSpid` 解析命名空间内 PID，随后沿私有 IPC 发布引擎根。该现代证明路径优先于本 PR 的旧协议兼容，不会再被旧根覆盖。
+
+兼容已在运行、尚不带 `appServerProcess` 的旧 runner 时，才沿已认证签名通道处理 `processIdentity`：核对同一 session 的唯一 runner、其直接启动的 RPC 子进程、内核血缘和继承的 stdio。普通 busy/idle 不重新快照工具。旧协议空闲重启在投递前发布 `idle_restart`；旧引擎必须已退出、无待收尾 final 且新身份重新通过内核/stdio 验证，才更新旧根。新版引擎轮换继续使用主干的出生令牌和旧引擎退出检查。
 
 worker 重建后，只有存活 runner 已通过本次 challenge 且为唯一 active 签名代次、正整数签名序号越过该代次的 daemon 持久 ACK（首轮尚无完成记录时高水位为 0）、引擎已证明，且 runner 签名的精确 reply turn 与 daemon 下发的唯一 prepared 记录及恢复队列匹配时，才恢复该记录中的真人轮次。新 runner 在原生 busy state 中上报 `activeReplyTurnId`；旧 runner 可沿已有 thinking 记录的签名 turn 恢复，单凭 busy 不足以恢复。真人来源必须由 daemon 冻结的普通交互标记和 sender 共同证明；不使用 PID marker、最新聊天发送人、callerless/机器人记录或有歧义的队列补身份。
 
@@ -8,7 +10,7 @@ worker 重建后，只有存活 runner 已通过本次 challenge 且为唯一 ac
 
 命令复用 ancestor routing 和 loopback transport，仅发送 sessionId 到 `POST /api/current-execution`。daemon 从真实 TCP socket 确定调用 PID，再核对 Worker/CLI/RPC engine 的进程启动标识、当前代次及本轮之前已存在的进程树。宿主 HMAC、环境中的 TURN_ID、请求自报的 turn、旧进程或其他会话均不能代替这条检查。远程后端、没有可验证本机血缘或不支持进程证明的平台返回 blocked，不退回环境值。
 
-本机 Linux 的适用范围不包括开启 `bwrap --unshare-pid` 的文件沙箱：runner 读取沙箱内 `/proc`，worker 核对宿主 `/proc`，PID 空间不同，无法将沙箱内的 `processIdentity` 建立为宿主可验证的引擎血缘；这条执行证明不适用，保持 blocked。此限制不是本 PR 引入的回归：PR 前后的沙箱内跨轮工具判定均无法证明该宿主血缘，没有新增放行路径。跨命名空间身份映射需要独立设计宿主/沙箱 PID 对照，不在本 PR 范围，后续跟踪见 [#2383](https://github.com/deepcoldy/botmux/issues/2383)。
+旧 `processIdentity` 兼容路径不适用于 `bwrap --unshare-pid`：旧 runner 读取沙箱内 `/proc`，严格宿主血缘/stdio 检查无法证明该 PID，保持 blocked。新版 `appServerProcess` 已通过主干的命名空间映射路径处理该场景；不将旧协议的限制解释为新版的全局限制。历史跟踪见 [#2383](https://github.com/deepcoldy/botmux/issues/2383)。
 
 `coreOnlyPidNamespaceDegrade()` 去掉 `--unshare-pid` 的降级仅可能出现在 `BOTMUX_CORE_ONLY=1` 且宿主无法创建该命名空间时。core-only 合成的会话为 `apiOnly`，`larkTransportEnabled` 对它直接返回 false，不消费这套执行证明；普通带飞书通道的会话不走该降级。因此同一飞书会话不会因宿主探测结果在这两种证明行为之间翻转。
 

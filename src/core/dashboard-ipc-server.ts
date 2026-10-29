@@ -262,6 +262,7 @@ import {
   type AppSlashCommandSyncResult,
   type AppSlashCommandUnavailable,
 } from '../im/lark/app-slash-commands.js';
+import { pluginCommandGateway } from './plugins/commands/runtime.js';
 import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -487,6 +488,7 @@ import {
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
+import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
 import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
@@ -1132,7 +1134,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // exceptions: a receiver that learned another session id could otherwise
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
-  if (method === 'POST' && pathname === '/api/asks') return true;
+  if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/form-v1')) return true;
   // The dsh-tui wrapper plugin's structured end-of-turn report (`botmux
   // __turn-idle-v2`) runs INSIDE the CLI process, so it cannot read the host
   // secret either. The handler verifies this session's rotating per-turn
@@ -1618,6 +1620,19 @@ function composeDashboardSessionRows(
 // endpoints below which proxy calls into groups-store on this bot's behalf.
 let cachedLarkAppId = '';
 export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
+
+export type CardClickTurnPostResult =
+  | { ok: true; messageId: string; exp: number }
+  | { ok: false; status: number; error: string };
+
+let cardClickTurnPoster: ((larkAppId: string, body: unknown) => Promise<CardClickTurnPostResult>) | null = null;
+
+/** Daemon injects the signer that posts a single-use card into a chat. */
+export function setCardClickTurnPoster(
+  poster: ((larkAppId: string, body: unknown) => Promise<CardClickTurnPostResult>) | null,
+): void {
+  cardClickTurnPoster = poster;
+}
 
 let decisionBoardService: DecisionBoardService | null = null;
 /** daemon 启动时注入（只有 daemon 进程会写看板；core-only / 测试缺省为 null → 503）。 */
@@ -4537,6 +4552,17 @@ ipcRoute('POST', '/api/sessions/spawn', requireBoundBot(async (req, res) => {
   }
   jsonRes(res, 200, r);
   });
+}, NOT_BOUND_BODY.botNotFound));
+
+// Local integrator: post a signed single-use card. The click, not this call,
+// starts the turn, and the clicker — not the session owner — is the sender.
+ipcRoute('POST', '/api/cards/click-turn', requireBoundBot(async (req, res) => {
+  if (!cardClickTurnPoster) return jsonRes(res, 503, { ok: false, error: 'card_click_turn_unavailable' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const result = await cardClickTurnPoster(cachedLarkAppId, body);
+  if (!result.ok) return jsonRes(res, result.status, { ok: false, error: result.error });
+  return jsonRes(res, 200, { ok: true, messageId: result.messageId, exp: result.exp });
 }, NOT_BOUND_BODY.botNotFound));
 
 function parseHeadlessCreateBody(body: unknown): {
@@ -7825,7 +7851,11 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', requireBoundBot(async (r
 // 批量同步只增不删；删除只走逐条显式 route，且服务端按命令名重新解析远端 ID。
 function currentAppSlashCommandCatalog(): AppSlashCommandSpec[] {
   const config = getBot(cachedLarkAppId).config;
-  return buildAppSlashCommandCatalog({ cliId: config.cliId, locale: localeForBot(cachedLarkAppId) });
+  return buildAppSlashCommandCatalog({
+    cliId: config.cliId,
+    locale: localeForBot(cachedLarkAppId),
+    pluginCommands: pluginCommandGateway.list(cachedLarkAppId),
+  });
 }
 
 function appSlashCommandPermissionUrls(): { read: string; write: string } {
@@ -10127,6 +10157,24 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req,
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }
+}));
+
+// DELETE /api/bot-trigger-user-auth/users/:openId — 撤销这一个成员在本机上的
+// 触发人凭据（本 daemon 所属应用的 user token、该 open_id 的 lark-cli / bytedcli
+// HOME、已经发布的轮次身份）。平台侧 grant 不在本进程里，撤不掉。
+ipcRoute('DELETE', '/api/bot-trigger-user-auth/users/:openId', requireBoundBot(async (_req, res, params) => {
+  const openId = params.openId ?? '';
+  if (!isUsableOpenId(openId)) return jsonRes(res, 400, { ok: false, error: 'invalid_open_id' });
+  let cfg;
+  try { cfg = getBot(cachedLarkAppId).config; }
+  catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
+  const result = await revokeTriggerUserAuth({
+    openId,
+    appId: cfg.larkAppId,
+    brand: normalizeBrand(cfg.brand),
+    sessionDataDir: config.session.dataDir,
+  });
+  jsonRes(res, result.ok ? 200 : 400, result);
 }));
 
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如

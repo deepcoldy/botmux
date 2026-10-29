@@ -168,3 +168,31 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"te
 - **执行耗时**：从输入实际交给 CLI，到最终输出被观察到；Codex App 使用原生完成时间。两项都不包含飞书投递耗时。
 
 仅展示当前轮次和尝试的已知计时；缺失或无效的数值不显示。带独立 dispatch attempt 的重试不展示等待时间，以免把之前的执行也算进等待。旧 worker、恢复后无法确定起点的轮次，以及模型通过 `botmux send` 提前发出的消息不会补猜耗时。此配置不改变动态单卡已有的计时标题。
+
+## 签名按钮：以点击者身份开始一轮
+
+本机集成方可以让机器人往它所在的群里发一张一次性按钮。点击后，daemon 用**点击者**的 open_id 作为这一轮的 `senderOpenId` 开始会话，和这个人自己发了一条消息一样：若开启了 `triggerUserAuth`（`credentialSource: local`），凭证按这一轮的发送者签发，不会退回会话 owner 或创建者。
+
+按钮上的内容（提示词、目标群或会话、可选工作目录与会话类型、nonce、过期时间）由 daemon 用 HMAC 签名。密钥和 nonce 都按机器人分开，落在 `<dataDir>/card-click-turn/<larkAppId>/`（`secret` 与 `nonces.json`）。session data dir 是同一 fleet 里所有 bot daemon 共用的，所以不能再把这两份文件直接放在 data dir 根上。nonce 写入时持有跨进程锁，并在核销前重新读盘，避免一个 daemon 的整文件覆盖丢掉另一个 daemon 已经用过的按钮。篡改、过期、重放的点击会被拒绝。过期的令牌在核销 nonce 之前就拒绝，所以报的是过期而不是已使用。daemon 重启后未过期的按钮也不能再用第二次。
+
+点击者必须同时通过与发消息相同的 `evaluateTalk`（含 allowed users、blocked users、grant）、`canOperate`（会带上 `on_` 开头的 union id），以及 `grantCommandRestriction`。因此只有对话授权、没有操作权限的人点不了；`restrictGrantCommands` 打开时，对话来源是 chatGrant / globalGrant 的点击也会被拒绝。应用或机器人没有身份，不会开轮，也不会改用 owner。判定依据是：已知同机 peer、身份缓存类型为 `bot` / `app`，以及三张按 union id 锚定的表（`isTeamBot`、`isPlatformTeamBot`、`isTrustedSameOwnerSiblingBot`）。缓存里没有记录、也不在这三张表里的点击者仍按真人处理。卡片回调没有平台 `sender_type`，不要为了探测身份去 `resolveSender`（那会把未知 id 写成 user）。
+
+`cct_` 轮次有意不进入 `isOrdinaryImTurnId`，也不进入 `registryTurnMayAuthenticateHuman` 的 `om_` / `join_` 白名单。它没有普通消息那套投递收据、ACK 和冷启动补投。当前轮调用者靠 `session.lastCallerOpenId`：开轮时和 `quoteTarget*` 一起写成点击者，所以新建会话和命中已有会话都会把 CLI 侧的当前调用者解析成点击者，而不是上一位发言者。principal-lane 会话，以及打开了跨本人插话（`crossPrincipalInterruption`）时的任何点击，都会在核销 nonce 之前拒绝，并给出明确 toast，不会往会话里写入 `activeInteractiveTurn`。
+
+飞书回调先回「正在开始」。worker 真正收下输入之后，才会在群里发「已按你的身份开始」；投递失败会回滚这一轮写下的 quote / reply target / `lastCallerOpenId` / `activeInteractiveTurn`，并改发失败说明。新建会话的 `creationSource` 是 `ordinary-feishu`，这样开了 Codex 实例池的机器人不会把卡片会话落到 legacy 实例。
+
+目标必须是且只能是一个 `chatId` 或一个 `sessionId`。`sessionId` 只匹配本机器人当前活跃会话，找不到就拒绝，不会另开一条、也不会借用那条会话的 owner。`chatId` 在本群还没有 chat-scope 会话时会新建一条，owner 和创建者都是点击者，并且必须带一个已存在的绝对路径工作目录。已有会话如果工作目录和签名不一致，点击被拒绝。新建会话未签名 `chatType` 时按群聊鉴权；私聊要显式签 `p2p`，否则 `p2pOpen` 不会放行。
+
+发卡片的接口是 daemon IPC `POST /api/cards/click-turn`（与 `/api/sessions/spawn` 相同的本机 HMAC，且 daemon 已绑定当前机器人）。它不是 core-only 的公开路由。请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `prompt` | 必填，点下去之后原样作为这一轮的用户输入，最长 1500 字 |
+| `chatId` / `sessionId` | 二选一，轮次打到哪个群的 chat-scope 会话，或哪一个已有会话 |
+| `postChatId` | 卡片发到哪个群，默认同 `chatId`；只给了 `sessionId` 时必填 |
+| `workingDir` | 可选，必须是已存在的绝对路径。新建会话时必填 |
+| `chatType` | 可选，`group` 或 `p2p` |
+| `ttlMs` | 可选，1 分钟到 7 天，默认 1 小时 |
+| `buttonLabel` / `title` | 可选 |
+
+成功时返回 `{ ok, messageId, exp }`。机器人不在目标群时返回 403 `bot_not_in_chat`。

@@ -7,7 +7,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { larkTransportEnabled } from './types.js';
 import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
-import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir } from './cli-identity.js';
+import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir, sessionVisiblePath } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 
@@ -169,6 +169,9 @@ export function prepareLarkToolEnv(input: {
   defaultAs?: 'bot' | 'user';
   effectivePath?: string;
   runner?: { command: string; args: string[] };
+  /** Sandboxed session: the wrapper must name its runner by realpath, since a
+   *  fresh bwrap root has no alias for a symlinked home. */
+  canonicalPaths?: boolean;
 }): LarkToolBinding {
   const rootDir = resolveLarkToolDataDir(input.dataDir);
   const binDir = sessionIdentityBinDir(rootDir, input.sessionId);
@@ -207,7 +210,7 @@ export function prepareLarkToolEnv(input: {
   const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
   atomicWriteFileSync(join(binDir, 'lark-cli'), [
     '#!/bin/sh', '# botmux managed lark-cli — application and caller are host-bound.',
-    `exec ${[runner.command, ...runner.args, '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
+    `exec ${[...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, input.canonicalPaths)), '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
   ].join('\n'), { mode: 0o755 });
   const { zdotdir, bashEnv } = installLoginShellPathShim(binDir);
   input.env.PATH = [binDir, ...(input.env.PATH ?? '').split(':').filter(p => p !== binDir)].join(':');

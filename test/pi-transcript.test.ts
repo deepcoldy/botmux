@@ -638,3 +638,165 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(result.events[1].timestampMs).toBe(numTs + 1000);
   });
 });
+
+// Before retrying a failed request Pi appends a `context_edit` that drops that
+// record from the model's context (`replacement: null`); when it gives up it
+// writes none. Live shape (10-28): a provider stream hung
+// for an hour, ended with `Stream ended without finish_reason`, Pi retried and
+// the retry hung again — the 300s backstop reported the turn as failed while
+// Pi was still retrying it.
+describe('drainPiTranscript: retries Pi records', () => {
+  beforeEach(() => { rmSync(ROOT, { recursive: true, force: true }); resetPiPendingTurnState(); });
+  afterEach(() => { rmSync(ROOT, { recursive: true, force: true }); resetPiPendingTurnState(); });
+
+  const STREAM_ENDED = 'Stream ended without finish_reason';
+  function withId<T extends object>(id: string, record: T): T & { id: string } {
+    return { ...record, id };
+  }
+  function retryEdit(targetId: string, ts: string, replacement: unknown = null) {
+    return { type: 'context_edit', id: `edit-${targetId}`, timestamp: ts, targetId, replacement };
+  }
+  function append(path: string, records: object[]): void {
+    appendFileSync(path, records.map((o) => JSON.stringify(o)).join('\n') + '\n');
+  }
+
+  it('keeps a retried error unreported past the timeout until the retry lands', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      turnSettled(null, '2026-10-28T13:00:00.000Z'),
+      userMsg('复审 PR', '2026-10-28T13:00:01.000Z'),
+      assistantToolUse('2026-10-28T13:00:03.000Z'),
+      toolResult('r1', '2026-10-28T13:00:03.100Z'),
+      withId('e1', assistantFinal('error', '', '2026-10-28T14:00:03.953Z', STREAM_ENDED)),
+      retryEdit('e1', '2026-10-28T14:00:03.957Z'),
+    ]);
+    const t0 = 20_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    // An hour of retrying, polled the whole way: never reported.
+    let offset = first.newOffset;
+    const quiet: PiBridgeEvent[] = [...first.events];
+    for (let now = t0 + 1_000; now <= t0 + 3_600_000; now += 60_000) {
+      const r = drainPiTranscript(path, offset, now);
+      quiet.push(...r.events);
+      offset = r.newOffset;
+    }
+    expect(quiet.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+
+    append(path, [
+      assistantToolUse('2026-10-28T15:00:07.000Z'),
+      toolResult('r2', '2026-10-28T15:00:07.100Z'),
+      assistantFinal('stop', 'REVIEW_DONE', '2026-10-28T15:10:00.000Z'),
+      turnSettled('stop', '2026-10-28T15:10:00.010Z'),
+    ]);
+    const finals = drainPiTranscript(path, offset, t0 + 3_700_000).events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe('REVIEW_DONE');
+    expect(finals[0].terminalStatus).toBeUndefined();
+  });
+
+  it('a steer during a recorded retry is not read as a new turn, even before any marker was seen', () => {
+    // A worker that re-attached mid-turn reads from the restored turn onward,
+    // so it has not seen this session's markers.
+    const path = writeTranscript([
+      userMsg('复审 PR', '2026-10-28T13:00:01.000Z'),
+      assistantToolUse('2026-10-28T13:00:03.000Z'),
+      toolResult('r1', '2026-10-28T13:00:03.100Z'),
+      withId('e1', assistantFinal('error', '', '2026-10-28T14:00:03.953Z', STREAM_ENDED)),
+      retryEdit('e1', '2026-10-28T14:00:03.957Z'),
+      userMsg('重新请你复审（重试期间发来，被 Pi 当作 steer）', '2026-10-28T14:00:05.000Z'),
+      assistantFinal('stop', 'REVIEW_DONE', '2026-10-28T14:30:00.000Z'),
+    ]);
+    const events = drainAll(path);
+    expect(events.filter((e) => e.terminalStatus === 'failed')).toHaveLength(0);
+    expect(events.filter((e) => e.kind === 'assistant_final').map((e) => e.text)).toEqual(['REVIEW_DONE']);
+  });
+
+  it('reports the last error once when Pi gives up after retrying', () => {
+    // With the boundary marker…
+    const marked = writeTranscript([
+      sessionHeader(),
+      turnSettled(null, '2026-10-28T13:00:00.000Z'),
+      userMsg('复审 PR', '2026-10-28T13:00:01.000Z'),
+      withId('e1', assistantFinal('error', '', '2026-10-28T14:00:03.953Z', STREAM_ENDED)),
+      retryEdit('e1', '2026-10-28T14:00:03.957Z'),
+      withId('e2', assistantFinal('error', '', '2026-10-28T15:00:06.504Z', 'upstream stream error: service unavailable')),
+      turnSettled('error', '2026-10-28T15:00:06.510Z'),
+    ]);
+    const fails = drainAll(marked).filter((e) => e.terminalStatus === 'failed');
+    expect(fails).toHaveLength(1);
+    expect(fails[0].timestampMs).toBe(Date.parse('2026-10-28T15:00:06.504Z'));
+    expect(fails[0].terminalErrorCode).toBe('codex_upstream_error');
+
+    // …and without it: the error Pi did not retry falls back to the timeout.
+    resetPiPendingTurnState();
+    const bare = writeTranscript([
+      userMsg('复审 PR', '2026-10-28T13:00:01.000Z'),
+      withId('e1', assistantFinal('error', '', '2026-10-28T14:00:03.953Z', STREAM_ENDED)),
+      retryEdit('e1', '2026-10-28T14:00:03.957Z'),
+      withId('e2', assistantFinal('error', '', '2026-10-28T15:00:06.504Z', 'upstream stream error: service unavailable')),
+    ]);
+    const t0 = 30_000_000;
+    const first = drainPiTranscript(bare, 0, t0);
+    expect(first.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+    const late = drainPiTranscript(bare, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS).events
+      .filter((e) => e.terminalStatus === 'failed');
+    expect(late).toHaveLength(1);
+    expect(late[0].timestampMs).toBe(Date.parse('2026-10-28T15:00:06.504Z'));
+  });
+
+  it('a retry the user cancels is reported by the boundary marker', () => {
+    // Escape during the backoff cancels the retry; Pi settles the turn on the
+    // error it was about to retry.
+    const path = writeTranscript([
+      sessionHeader(),
+      turnSettled(null, '2026-10-28T13:00:00.000Z'),
+      userMsg('复审 PR', '2026-10-28T13:00:01.000Z'),
+      withId('e1', assistantFinal('error', '', '2026-10-28T14:00:03.953Z', STREAM_ENDED)),
+      retryEdit('e1', '2026-10-28T14:00:03.957Z'),
+      turnSettled('error', '2026-10-28T14:00:05.000Z'),
+    ]);
+    const fails = drainAll(path).filter((e) => e.terminalStatus === 'failed');
+    expect(fails).toHaveLength(1);
+    expect(fails[0].timestampMs).toBe(Date.parse('2026-10-28T14:00:03.953Z'));
+  });
+
+  it('an edit that does not drop the held error is not a retry', () => {
+    for (const edit of [
+      retryEdit('some-other-entry', '2026-10-28T14:00:03.957Z'),
+      retryEdit('e1', '2026-10-28T14:00:03.957Z', { role: 'assistant', content: [] }),
+    ]) {
+      resetPiPendingTurnState();
+      const path = writeTranscript([
+        userMsg('复审 PR', '2026-10-28T13:00:01.000Z'),
+        withId('e1', assistantFinal('error', '', '2026-10-28T14:00:03.953Z', STREAM_ENDED)),
+        edit,
+      ]);
+      const t0 = 40_000_000;
+      const first = drainPiTranscript(path, 0, t0);
+      const late = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS).events;
+      expect(late.filter((e) => e.terminalStatus === 'failed')).toHaveLength(1);
+    }
+  });
+});
+
+// Pi writes input it accepted while busy only once it dequeues it; the
+// extension's marker is the in-band evidence the turn is queued, and the
+// settle marker says Pi has finished every queued continuation.
+describe('drainPiTranscript: queued input and settle markers', () => {
+  it('surfaces the queued-input marker and the settle marker in file order', () => {
+    resetPiPendingTurnState();
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('first turn', '2026-08-03T05:13:39.000Z'),
+      assistantToolUse('2026-08-03T05:13:40.000Z'),
+      { type: 'custom', timestamp: '2026-08-03T05:13:41.000Z', customType: 'botmux-input-queued', data: { behavior: 'steer' } },
+      toolResult('done', '2026-08-03T05:13:50.000Z'),
+      userMsg('queued turn', '2026-08-03T05:13:50.001Z'),
+      assistantFinal('stop', 'answer', '2026-08-03T05:13:51.000Z'),
+      turnSettled('stop', '2026-08-03T05:13:52.000Z'),
+    ]);
+    const events = drainAll(path).filter(ev => ev.kind !== 'cot');
+    expect(events.map(ev => ev.kind)).toEqual(['user', 'input_queued', 'user', 'assistant_final', 'cli_settled']);
+    expect(events[1]).toMatchObject({ timestampMs: Date.parse('2026-08-03T05:13:41.000Z'), sourceSessionId: SESSION_ID });
+  });
+});

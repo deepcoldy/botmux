@@ -178,6 +178,8 @@ export interface BuildAppSlashCommandCatalogOptions {
   cliId?: string;
   /** `default_value` 用哪种语言；`i18n` 总是同时给中英文。 */
   locale?: Locale;
+  /** 当前 Bot 已启用插件声明的指令；排在内置命令之后，同名或冲突（pluginId 为 null）的跳过。 */
+  pluginCommands?: ReadonlyArray<{ name: string; description?: string; pluginId: string | null }>;
 }
 
 /**
@@ -220,6 +222,14 @@ export function buildAppSlashCommandCatalog(
       });
       if (byName.size >= APP_SLASH_COMMAND_LIMIT) return [...byName.values()];
     }
+  }
+  for (const entry of options.pluginCommands ?? []) {
+    const command = entry.name.replace(/^\/+/, '').toLowerCase();
+    const text = summarizeHelpLine(entry.description);
+    if (entry.pluginId === null || !text || !LARK_COMMAND_NAME.test(command) || byName.has(command)) continue;
+    // 插件只声明一种语言的描述，中英文共用。
+    byName.set(command, { command, source: 'botmux', description: { default_value: text, i18n: { zh_cn: text, en_us: text } } });
+    if (byName.size >= APP_SLASH_COMMAND_LIMIT) break;
   }
   return [...byName.values()];
 }
