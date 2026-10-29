@@ -7,7 +7,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson } from './model-catalog-json.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from '../../services/coco-transcript.js';
-import { traeHistoryPath } from '../../services/traex-paths.js';
+import { traeConfigPath, traeHistoryPath } from '../../services/traex-paths.js';
 import { traexHistoryMatchDelta } from '../../services/traex-transcript.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
@@ -145,6 +145,10 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
+    mcpGateway: {
+      get configPath(): string { return traeConfigPath(); },
+      format: 'codex-toml',
+    },
     bridgeSpec: cocoBridgeSpec,
     // ~/.trae/cli kept REAL (shared with traex): login + shared Trae state incl.
     // the codex-style SQLite DBs (fcntl locks don't work unless the dir is bound
@@ -157,7 +161,8 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // so it hits the same first-run migration prompt; the done-markers it needs
     // are exposed READ-ONLY via sandboxReadonlyPaths() below.
     authPaths: ['~/.trae/cli', '~/.cache/coco'],
-    sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
+    // CoCo reads the same Gateway entry without widening shared config writes.
+    sandboxReadonlyPaths: () => [traeConfigPath(), ...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass, hideRateLimitModelNudge }) {

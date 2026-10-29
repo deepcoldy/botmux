@@ -17,6 +17,7 @@ import {
   PLUGIN_CARD_ACTION_ENDPOINT_ENV,
   PLUGIN_CARD_ACTION_TOKEN_ENV,
 } from './card-actions/protocol.js';
+import { PLUGIN_COMMANDS_ENDPOINT_ENV } from './commands/protocol.js';
 import { loadPluginServiceDefinition, type PluginServiceDefinition } from './runtime.js';
 import { changePluginService, readPluginProcesses, type PluginProcessInfo } from './supervisor-client.js';
 import { ensurePluginServicePreload, pluginServiceName, type PluginServiceSpec } from './supervisor-store.js';
@@ -83,13 +84,20 @@ export function withPluginServiceLock<T>(fn: () => Promise<T> | T): Promise<T> {
   return withFileLock(serviceLockTarget(), async () => fn(), { maxWaitMs: 30_000 });
 }
 
+/** Card actions and Lark slash commands are both host → plugin loopback calls:
+ * they share the fixed port and the per-plugin bearer token. */
+const hostCallbackContributions = (record: InstalledPluginRecord): boolean =>
+  !!record.contributions?.cardActions || !!record.contributions?.commands;
+
 const assertCardActionServicePort = (
   record: InstalledPluginRecord,
   definition: PluginServiceDefinition,
 ): number | undefined => {
-  if (!record.contributions?.cardActions) return undefined;
+  if (!hostCallbackContributions(record)) return undefined;
   if (!Number.isInteger(definition.port) || definition.port! < 1 || definition.port! > 65_535) {
-    throw new Error(`plugin_card_actions_fixed_port_required:${record.id}`);
+    throw new Error(record.contributions?.cardActions
+      ? `plugin_card_actions_fixed_port_required:${record.id}`
+      : `plugin_commands_fixed_port_required:${record.id}`);
   }
   return definition.port;
 };
@@ -104,14 +112,17 @@ const publicDefinitionEnv = (record: InstalledPluginRecord, definition: PluginSe
   };
   if (record.contributions?.cardActions) {
     env[PLUGIN_CARD_ACTION_ENDPOINT_ENV] = record.contributions.cardActions.endpoint;
-    env.PORT = String(cardActionPort);
   }
+  if (record.contributions?.commands) {
+    env[PLUGIN_COMMANDS_ENDPOINT_ENV] = record.contributions.commands.endpoint;
+  }
+  if (cardActionPort !== undefined) env.PORT = String(cardActionPort);
   return env;
 };
 
 const definitionEnv = (record: InstalledPluginRecord, definition: PluginServiceDefinition): Record<string, string> => {
   const env = publicDefinitionEnv(record, definition);
-  return record.contributions?.cardActions
+  return hostCallbackContributions(record)
     ? {
         ...env,
         [PLUGIN_CARD_ACTION_TOKEN_ENV]: getOrCreatePluginCardActionToken(record.id),

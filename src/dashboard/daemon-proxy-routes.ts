@@ -120,7 +120,9 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   {
     method: 'GET',
     path: botPath('trigger-user-auth-status'),
-    upstream: '/api/bot-trigger-user-auth-status',
+    // `?openId=` 要原样到达 daemon，否则按人查询会在 dashboard 这一跳被丢掉，
+    // 集成方拿到的仍是聚合人数。没有 query 时 search 为空，路径与以前一致。
+    upstream: (_m, url) => `/api/bot-trigger-user-auth-status${url.search}`,
     body: NO_BODY,
   },
   // riff：`{ riff: string }`（原始 JSON 文本，'' = 清除）。

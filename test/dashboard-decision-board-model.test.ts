@@ -35,6 +35,8 @@ import {
   type BoardItem,
   type StewardForm,
   boardNeighbors,
+  itemChatView,
+  nonChatLinks,
   navListFrom,
   parseNavList,
   viewForItemState,
@@ -304,3 +306,29 @@ describe('上一项 / 下一项', () => {
   });
 });
 
+
+describe('itemChatView', () => {
+  const chat = (ref: string, extra: Record<string, unknown> = {}) => ({ kind: 'chat' as const, ref, text: ref, ...extra });
+  const pr = { kind: 'pr' as const, ref: 'o/r#1', text: 'PR #1' };
+
+  it('主群放最前：服务端标了 primary 就用它，旧 daemon 没标就是第一个群', () => {
+    const marked = itemChatView({}, [pr, chat('oc_a'), chat('oc_b', { primary: true }), chat('oc_c')]);
+    expect(marked.primary?.ref).toBe('oc_b');
+    expect(marked.chats.map(c => c.ref)).toEqual(['oc_b', 'oc_a', 'oc_c']);
+    expect(marked.missing).toBe(false);
+    const legacy = itemChatView({}, [chat('oc_a'), chat('oc_b')]);
+    expect(legacy.primary?.ref).toBe('oc_a');
+    expect(legacy.chats.map(c => c.ref)).toEqual(['oc_a', 'oc_b']);
+  });
+
+  it('无群原因只在没有群时显示；没群又没原因 = 缺群', () => {
+    expect(itemChatView({ noChatReason: '只有 issue' }, [pr])).toEqual({ chats: [], noChatReason: '只有 issue', missing: false });
+    expect(itemChatView({ noChatReason: '残留的原因' }, [chat('oc_a')])).not.toHaveProperty('noChatReason');
+    expect(itemChatView({}, [pr])).toEqual({ chats: [], missing: true });
+    expect(itemChatView({ noChatReason: '  ' }, [])).toEqual({ chats: [], missing: true });
+  });
+
+  it('其它关联里去掉群', () => {
+    expect(nonChatLinks([pr, chat('oc_a')])).toEqual([pr]);
+  });
+});

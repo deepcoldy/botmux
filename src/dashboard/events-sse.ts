@@ -40,6 +40,11 @@ export type DashboardEventAudience = 'management' | 'workbench' | 'anonymous';
  * dashboard.ts 做同款脱敏）；management 不变。
  */
 export function dashboardEventVisibleTo(event: string, audience: DashboardEventAudience): boolean {
+  // Per-turn sender, chat, and timing. The dashboard SPA does not render this
+  // frame, and anonymous public-read plus workbench identities must not
+  // receive it on GET /events. Host management still does. The daemon
+  // loopback `/api/events` bus is a different channel and is not filtered here.
+  if (event === 'turn.finished' && audience !== 'management') return false;
   if (audience !== 'workbench') return true;
   return !(event === 'schedule' || event.startsWith('schedule.'));
 }

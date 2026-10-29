@@ -18,6 +18,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
 
 let parsed: ts.SourceFile | undefined;
@@ -38,7 +39,21 @@ function transpiledWorkerFunction(name: string): string {
   const declaration = source.statements.find(statement => ts.isFunctionDeclaration(statement)
     && statement.name?.text === name);
   if (!declaration) throw new Error(`Missing top-level worker function: ${name}`);
-  return ts.transpileModule(declaration.getText(source), {
+  // Rewrite before transpilation's module classification: an import.meta in
+  // an otherwise standalone function would inject module-only boilerplate.
+  const transformed = ts.transform(declaration, [context => node => {
+    const visit: ts.Visitor = child => {
+      if (ts.isPropertyAccessExpression(child) && ts.isMetaProperty(child.expression)
+        && child.expression.keywordToken === ts.SyntaxKind.ImportKeyword && child.name.text === 'url') {
+        return context.factory.createStringLiteral(pathToFileURL(join(process.cwd(), 'src/worker.ts')).href);
+      }
+      return ts.visitEachChild(child, visit, context);
+    };
+    return ts.visitNode(node, visit) as ts.FunctionDeclaration;
+  }]);
+  const code = ts.createPrinter().printNode(ts.EmitHint.Unspecified, transformed.transformed[0]!, source);
+  transformed.dispose();
+  return ts.transpileModule(code, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText;
 }
@@ -57,4 +72,28 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   });
   // eslint-disable-next-line no-new-func
   return new Function('scope', `with (scope) { ${transpiledWorkerFunction(name)}; return ${name}; }`)(proxy) as T;
+}
+
+/** Execute one real IPC case without starting the worker's process listeners. */
+export function loadWorkerMessageHandler(name: string, scope: Record<string, unknown>): (message: unknown) => Promise<void> {
+  const source = workerSourceFile();
+  let clause: ts.CaseClause | undefined;
+  function visit(node: ts.Node) {
+    if (ts.isSwitchStatement(node) && node.expression.getText(source) === 'msg.type') {
+      clause = node.caseBlock.clauses.find((item): item is ts.CaseClause =>
+        ts.isCaseClause(item) && ts.isStringLiteral(item.expression) && item.expression.text === name);
+    }
+    if (!clause) ts.forEachChild(node, visit);
+  }
+  visit(source);
+  if (!clause) throw new Error(`Missing worker IPC case: ${name}`);
+  const code = ts.transpileModule(`async function handle(msg: any) { switch (msg.type) { ${clause.getText(source)} } }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText;
+  const proxy = new Proxy(scope, {
+    has: (_target, key) => key !== Symbol.unscopables,
+    get: (target, key) => key in target ? target[key as string] : (globalThis as any)[key],
+    set: (target, key, value) => { target[key as string] = value; return true; },
+  });
+  return new Function('scope', `with (scope) { ${code}; return handle; }`)(proxy);
 }

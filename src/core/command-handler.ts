@@ -17,6 +17,7 @@ import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLa
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
+import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -69,7 +70,8 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
 import { adoptedFromForTarget, isOrcaAdoptTarget, isZellijAdoptTarget, type LiveAdoptTarget } from './adopt-target.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES, isUsableOpenId } from '../utils/user-token.js';
+import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
 import { DocSubscriptionPermissionError, fetchDocTitle, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -3835,6 +3837,47 @@ export async function handleCommand(
         break;
       }
 
+      case '/logout': {
+        // 只认这条消息的发送者。`/logout ou_someone_else` 不能撤销别人；
+        // 管理员撤销指定成员走 dashboard IPC。
+        let botCfg: BotConfig | undefined;
+        try {
+          botCfg = ds ? getBot(ds.larkAppId).config : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
+        } catch {
+          botCfg = undefined;
+        }
+        const openId = message.senderId;
+        if (!isUsableOpenId(openId)) {
+          await sessionReply(rootId, t('cmd.logout.no_sender', undefined, loc));
+          break;
+        }
+        if (!botCfg?.larkAppId) {
+          await sessionReply(rootId, t('cmd.logout.no_bot', undefined, loc));
+          break;
+        }
+        await revokeTriggerUserAuth({
+          openId,
+          appId: botCfg.larkAppId,
+          brand: normalizeBrand(botCfg.brand),
+          sessionDataDir: config.session.dataDir,
+        });
+        // Local homes and this app's user token are gone. A platform grant is
+        // fetched again next turn; this process cannot revoke it. Say so when
+        // this bot actually takes credentials from the platform, the same way
+        // /login points at that page.
+        const credSource = credentialSourceOf(botCfg.triggerUserAuth);
+        const platformUrl = botCfg.triggerUserAuth?.enabled && credSource !== 'local'
+          ? platformCredentialsUrl()
+          : null;
+        const platformNote = !botCfg.triggerUserAuth?.enabled || credSource === 'local'
+          ? ''
+          : platformUrl
+            ? `\n${t('cmd.logout.platform_note', { url: platformUrl }, loc)}`
+            : `\n${t('cmd.logout.platform_unbound', undefined, loc)}`;
+        await sessionReply(rootId, t('cmd.logout.ok', undefined, loc) + platformNote);
+        break;
+      }
+
       case '/login': {
         const subCmd = message.content.replace(/^\/login\s*/, '').trim();
         // 先定位本 bot 配置——token 状态与 OAuth URL 都按 per-bot appId/brand 走。
@@ -6316,6 +6359,7 @@ export async function handleCommand(
           t('help.heading_login', undefined, loc),
           t('help.login', undefined, loc),
           t('help.login_status', undefined, loc),
+          t('help.logout', undefined, loc),
           t('help.pair', undefined, loc),
           // Workflow help section — omitted when the machine-wide workflow
           // switch is off, so `/help` never advertises a disabled feature.
@@ -6359,6 +6403,7 @@ export async function handleCommand(
           '',
           t('help.list_slash', undefined, loc),
           t('help.help', undefined, loc),
+          ...renderPluginCommandHelp(helpAppId, loc),
         ];
         await sessionReply(rootId, help.join('\n'));
         break;

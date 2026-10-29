@@ -68,6 +68,7 @@ import {
   SCRATCH_TREE_MARKER,
 } from './sandbox.js';
 import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
+import { procStatStartTimeDigits } from '../../utils/proc-stat.js';
 import { PROXY_ENV_KEYS, CA_BUNDLE_ENV_KEYS } from '../../utils/child-env.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
@@ -98,6 +99,9 @@ export interface ScratchSandboxSpawn {
    *  `${mergedHostPath}/x` on the host. The worker points its host-side
    *  transcript/state readers at this tree. */
   mergedHostPath: string;
+  /** Set when the host had more submounts than SCRATCH_SUBMOUNT_OVERLAY_LIMIT:
+   *  the excess is read-only in this session (see scratchSubmountOverflowNotice). */
+  submountOverflow?: { eligible: number; readOnly: string[] };
   /** Mount/unmount + remove the whole session (overlay, tmpfs slot, trees). */
   cleanup: () => void;
 }
@@ -112,8 +116,10 @@ export interface ScratchMeta {
   work: string;
   /** tmpfs slot mountpoint (tmpfs storage only). */
   slot?: string;
-  /** Submounts wrapped with their own overlay (for restart-time teardown). */
-  subs?: { mountpoint: string }[];
+  /** Submounts wrapped with their own overlay (for restart-time teardown).
+   *  `dir` names the sub-overlay's `subroots/<dir>` (and tmpfs `sub-<dir>-*`);
+   *  absent in metas written before it was recorded (see assignSubDirs). */
+  subs?: { mountpoint: string; dir?: string }[];
   /** Host-path → merged-tree view mappings for daemon-side transcript reads.
    *  Linux always has the single full-root mapping `'/' → merged`. */
   mappings?: { from: string; to: string }[];
@@ -224,19 +230,86 @@ const SUBMOUNT_FSTYPES = new Set([
  *  tmpfs — host submounts there are irrelevant to the COW view. */
 const CONTAINER_OWNED_PREFIXES = ['/proc', '/sys', '/dev', '/run', '/tmp', '/var/tmp', '/dev/shm'];
 
-interface HostMountEntry { mountpoint: string; fstype: string }
+/** Most submounts one session wraps in their own overlay. Each costs a host
+ *  overlay mount plus a bind into the merged tree (and, under FUSE, one
+ *  fuse-overlayfs daemon) for the whole life of the session. A workstation has
+ *  a handful (the live host: /data00, two binds and 9 docker rootfs = 12); 64
+ *  leaves room for a docker host with a few dozen containers while capping what
+ *  a host full of mounts botmux cannot recognise costs every new session. */
+export const SCRATCH_SUBMOUNT_OVERLAY_LIMIT = 64;
+
+export interface HostMountEntry { mountpoint: string; fstype: string }
+
+export interface ScratchSubmountPlan {
+  /** Wrapped in their own COW overlay, shallow first (parent bind before child). */
+  overlay: HostMountEntry[];
+  /** Over the limit: exposed read-only, like a submount that cannot be overlaid. */
+  readOnly: HostMountEntry[];
+  /** Skipped: mounts inside scratch session trees (any session, any data dir). */
+  scratchTreeMounts: number;
+}
 
 function decodeMountPath(raw: string): string {
   return raw.replace(/\\([0-7]{3})/g, (_m, oct: string) => String.fromCharCode(parseInt(oct, 8)));
 }
 
-/** Enumerate host mounts UNDER `/` that the full-root overlay would render
- *  EMPTY, shallow first so nested binds can be emitted parent-before-child. */
-function readRelevantSubmounts(infraRoots: readonly string[]): HostMountEntry[] {
-  let raw = '';
-  try { raw = readFileSync('/proc/self/mountinfo', 'utf8'); } catch { return []; }
+/** `<…>/sandboxes/<sid>` trees a mountpoint sits in, outermost first, when it is
+ *  at or under the tree's `root` (main overlay + the binds into it) or
+ *  `subroots` (sub-overlays): the only places a Linux scratch session mounts. */
+function scratchTreeRootsOf(mountpoint: string): string[] {
+  const parts = mountpoint.split('/');
+  const roots: string[] = [];
+  for (let i = 1; i + 2 < parts.length; i++) {
+    if (parts[i] !== 'sandboxes' || !parts[i + 1]) continue;
+    if (parts[i + 2] !== 'root' && parts[i + 2] !== 'subroots') continue;
+    roots.push(parts.slice(0, i + 2).join('/'));
+  }
+  return roots;
+}
+
+/** prepareScratchSandbox creates `subroots` before its first mount and writes
+ *  the marker after the last; the tree is never removed while mounted. A user
+ *  directory that merely looks like `sandboxes/x/root` has neither. */
+function isScratchTreeOnDisk(sessionRoot: string): boolean {
+  try { if (lstatSync(join(sessionRoot, 'subroots')).isDirectory()) return true; } catch { /* */ }
+  try { lstatSync(join(sessionRoot, SCRATCH_TREE_MARKER)); return true; } catch { return false; }
+}
+
+/**
+ * Pick the host mounts UNDER `/` that the full-root overlay would render EMPTY.
+ *
+ * Mounts that belong to a scratch session tree are skipped — whatever data dir
+ * it lives in (another BOTMUX_HOME, a test or probe dir under the session TMPDIR,
+ * a lab under /tmp). Wrapping them made each new session overlay every earlier
+ * session's overlays and binds again, so the host mount table (and, nested past
+ * the kernel's overlay depth, the fuse-overlayfs daemons) grew geometrically
+ * with every session. Matched by tree layout, not by fs type: a root daemon's
+ * own overlays are kernel `overlay`, and overlay / fuse-overlayfs mounts that
+ * are not botmux's (container rootfs, a user's own) are real data to wrap.
+ *
+ * At most `limit` get an overlay; the rest are reported in `readOnly` instead
+ * of being wrapped silently. Ranked: mounts holding a `writable` path (the
+ * working dir, HOME) first, then mounts below one, then the others; shallow
+ * first within each.
+ */
+export function planScratchSubmounts(input: {
+  mountinfo: string;
+  infraRoots: readonly string[];
+  /** Paths the CLI must be able to write (working dir, HOME). */
+  writable: readonly string[];
+  limit?: number;
+  isScratchTree?: (sessionRoot: string) => boolean;
+}): ScratchSubmountPlan {
+  const isScratchTree = input.isScratchTree ?? isScratchTreeOnDisk;
+  const treeVerdicts = new Map<string, boolean>();
+  const insideScratchTree = (mountpoint: string): boolean => scratchTreeRootsOf(mountpoint).some(root => {
+    let verdict = treeVerdicts.get(root);
+    if (verdict === undefined) treeVerdicts.set(root, verdict = isScratchTree(root));
+    return verdict;
+  });
   const picked = new Map<string, HostMountEntry>();
-  for (const line of raw.split('\n')) {
+  let scratchTreeMounts = 0;
+  for (const line of input.mountinfo.split('\n')) {
     if (!line) continue;
     const sep = line.indexOf(' - ');
     if (sep < 0) continue;
@@ -246,14 +319,130 @@ function readRelevantSubmounts(infraRoots: readonly string[]): HostMountEntry[] 
     const fstype = right[0] ?? '';
     if (!mountpoint.startsWith('/') || mountpoint === '/') continue;
     if (CONTAINER_OWNED_PREFIXES.some(p => mountpoint === p || isWithin(p, mountpoint))) continue;
-    if (infraRoots.some(p => isWithin(p, mountpoint))) continue;
+    if (input.infraRoots.some(p => isWithin(p, mountpoint))) continue;
     const baseType = fstype.split('.')[0] ?? '';
     if (!SUBMOUNT_FSTYPES.has(fstype) && !SUBMOUNT_FSTYPES.has(baseType) && !fstype.startsWith('fuse.')) continue;
-    if (!picked.has(mountpoint)) picked.set(mountpoint, { mountpoint, fstype });
+    if (picked.has(mountpoint)) continue;
+    if (insideScratchTree(mountpoint)) { scratchTreeMounts++; continue; }
+    picked.set(mountpoint, { mountpoint, fstype });
   }
-  return [...picked.values()].sort(
-    (a, b) => a.mountpoint.split('/').length - b.mountpoint.split('/').length || a.mountpoint.localeCompare(b.mountpoint),
-  );
+  const shallowFirst = (a: HostMountEntry, b: HostMountEntry): number =>
+    a.mountpoint.split('/').length - b.mountpoint.split('/').length || a.mountpoint.localeCompare(b.mountpoint);
+  const all = [...picked.values()].sort(shallowFirst);
+  const limit = input.limit ?? SCRATCH_SUBMOUNT_OVERLAY_LIMIT;
+  if (all.length <= limit) return { overlay: all, readOnly: [], scratchTreeMounts };
+  // A parent of a mount in a tier is in that tier or an earlier one, so an
+  // overlaid child always has its parent overlaid.
+  const tier = (m: HostMountEntry): number => {
+    if (input.writable.some(p => isWithin(m.mountpoint, p))) return 0;
+    if (input.writable.some(p => isWithin(p, m.mountpoint))) return 1;
+    return 2;
+  };
+  const ranked = [0, 1, 2].flatMap(t => all.filter(m => tier(m) === t));
+  return {
+    overlay: ranked.slice(0, limit).sort(shallowFirst),
+    readOnly: ranked.slice(limit).sort(shallowFirst),
+    scratchTreeMounts,
+  };
+}
+
+function readMountinfo(): string {
+  try { return readFileSync('/proc/self/mountinfo', 'utf8'); } catch { return ''; }
+}
+
+function mountpointSet(mountinfo: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of mountinfo.split('\n')) {
+    const sep = line.indexOf(' - ');
+    if (sep >= 0) out.add(decodeMountPath(line.slice(0, sep).split(' ')[4] ?? ''));
+  }
+  return out;
+}
+
+/**
+ * `subroots/<dir>` for each submount to overlay. A sub-overlay's disk upper
+ * (tmpfs: `sub-<dir>-upper` in the slot) holds the session's writes to THAT
+ * mount, so a re-mount must hand each mount its own dir back: an index into the
+ * current mount list would give a disk upper written for one mount to another
+ * once the host gained or lost a mount (or the plan's ranking changed).
+ *  - recorded `dir` → reused;
+ *  - a meta written before dirs were recorded → the index the old code gave it
+ *    (its position in `legacyOrder`, the unfiltered shallow-first list);
+ *  - otherwise → the lowest integer not used on disk or by another mount.
+ */
+export function assignSubDirs(input: {
+  mountpoints: readonly string[];
+  recorded: readonly { mountpoint: string; dir?: string }[];
+  legacyOrder: () => readonly string[];
+  usedOnDisk: readonly string[];
+}): Map<string, string> {
+  const dirs = new Map<string, string>();
+  const claimed = new Set<string>();
+  const claim = (mountpoint: string, dir: string | undefined): void => {
+    if (dir === undefined || !/^[0-9]+$/.test(dir) || claimed.has(dir) || dirs.has(mountpoint)) return;
+    dirs.set(mountpoint, dir);
+    claimed.add(dir);
+  };
+  for (const s of input.recorded) claim(s.mountpoint, s.dir);
+  // A reconstructed index that another mount already holds is not this mount's:
+  // never hand one upper to two overlays.
+  const legacy = input.recorded.filter(s => s.dir === undefined);
+  const order = legacy.length > 0 ? input.legacyOrder() : [];
+  for (const s of legacy) claim(s.mountpoint, order.includes(s.mountpoint) ? String(order.indexOf(s.mountpoint)) : undefined);
+  const taken = new Set([...input.usedOnDisk, ...dirs.values()]);
+  let next = 0;
+  const out = new Map<string, string>();
+  for (const mp of input.mountpoints) {
+    let dir = dirs.get(mp);
+    if (dir === undefined) {
+      while (taken.has(String(next))) next++;
+      dir = String(next);
+      taken.add(dir);
+    }
+    out.set(mp, dir);
+  }
+  return out;
+}
+
+// ───────────────────────── prepare-in-progress record ───────────────────────
+
+/** Written before a prepare's first mount, removed once its marker is written:
+ *  names the process still building the tree. */
+const PREPARING_RECORD = 'preparing';
+
+function processStartTime(pid: number): string | undefined {
+  try { return procStatStartTimeDigits(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return undefined; }
+}
+
+function readPreparingOwner(sessionRoot: string): { pid: number; start: string } | null {
+  try {
+    const raw = JSON.parse(readFileSync(join(sessionRoot, PREPARING_RECORD), 'utf8')) as { pid?: unknown; start?: unknown };
+    if (Number.isInteger(raw.pid) && typeof raw.start === 'string') return { pid: raw.pid as number, start: raw.start };
+  } catch { /* none / torn */ }
+  return null;
+}
+
+/** Another process, still running (same pid AND start time), is building this
+ *  tree right now: the sweep, a close-time teardown and a second prepare all
+ *  keep out (a prepare stuck on a mount is not residue). */
+function preparingByOther(sessionRoot: string): boolean {
+  const owner = readPreparingOwner(sessionRoot);
+  return !!owner && owner.pid !== process.pid && processStartTime(owner.pid) === owner.start;
+}
+
+/** A prepare started this tree and nobody is finishing it: the recorded
+ *  preparer is gone, or it is this process (an earlier attempt that failed). */
+function preparingAbandoned(sessionRoot: string): boolean {
+  const owner = readPreparingOwner(sessionRoot);
+  return !!owner && (owner.pid === process.pid || processStartTime(owner.pid) !== owner.start);
+}
+
+/** User-facing notice for a session whose submounts went over the limit. */
+export function scratchSubmountOverflowNotice(overflow: { eligible: number; readOnly: readonly string[] }): string {
+  const shown = overflow.readOnly.slice(0, 5).join('、');
+  const more = overflow.readOnly.length > 5 ? ` 等 ${overflow.readOnly.length} 个` : '';
+  return `⚠️ scratch 沙箱：本机有 ${overflow.eligible} 个需要写时复制的子挂载，超过单会话上限 ${SCRATCH_SUBMOUNT_OVERLAY_LIMIT}，`
+    + `超出的在本会话里只读（${shown}${more}）。工作目录和 HOME 所在的挂载不受影响；如果是残留挂载，清理宿主后新开会话即可恢复。`;
 }
 
 // ───────────────────────── layout + meta ────────────────────────────────────
@@ -373,6 +562,15 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   const launch = linuxIsolationLaunch('bwrap', []);
   const { sessionRoot, merged, upper, work, slot, subroots } =
     scratchLayout(opts.sessionId, opts.dataDir, storage);
+  // A prepare killed between its first mount and its marker left mounts and no
+  // marker. The marker is written before any CLI starts, so nothing ever ran on
+  // that view: take it down and build afresh (otherwise the session could never
+  // start again — "already mounted but meta missing").
+  if (!readMeta(sessionRoot) && isMountpoint(merged) && preparingAbandoned(sessionRoot)) {
+    console.error(`[scratch-sandbox] session ${opts.sessionId}: reclaiming a half-prepared tree left by a prepare that never finished`);
+    teardownScratchSession(opts.sessionId, opts.dataDir);
+    if (slot) { unmountAny(slot); removeTreeUnlessMounted(slot); }
+  }
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
@@ -388,27 +586,72 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     return null;
   }
 
+  // Two prepares of one session never run at once (one worker per session);
+  // if they somehow did, the second would stack a view over the first's.
+  if (preparingByOther(sessionRoot)) {
+    console.error(`[scratch-sandbox] session ${opts.sessionId}: another live process is preparing this sandbox — refusing to spawn`);
+    return null;
+  }
+
+  const preparingRecord = join(sessionRoot, PREPARING_RECORD);
   const rolledBack: string[] = [];
   const fail = (where: string): null => {
     console.error(`[scratch-sandbox] setup failed at ${where} — aborting spawn (fail closed, never bare-run)`);
     for (const p of [...rolledBack].reverse()) unmountAny(p);
     if (!existing && storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
-    // Never rm through anything still mounted (the merged root, a submount).
-    removeTreeUnlessMounted(sessionRoot);
+    // A recorded session's tree IS its state (a disk upper, the outbox its pane
+    // binds): keep it for the next attempt. Only a fresh tree is ours to drop —
+    // and never by rm through anything still mounted.
+    if (existing) rmSync(preparingRecord, { force: true });
+    else removeTreeUnlessMounted(sessionRoot);
     return null;
   };
 
+  // A recorded view that is not what its marker says — a re-mount or teardown
+  // that stopped half-way: a recorded submount's bind is missing, one that is
+  // not recorded is bound, or a re-mount's preparer died. Adopting it would run
+  // the CLI on empty dirs where those mounts belong; take the stack down
+  // (files untouched) and mount it again from the recorded layout.
+  if (existing && existing.merged === merged && isMountpoint(merged)) {
+    const mountinfo = readMountinfo();
+    const mounted = mountpointSet(mountinfo);
+    const recorded = new Set((existing.subs ?? []).map(sub => sub.mountpoint));
+    const plan = planScratchSubmounts({ mountinfo, infraRoots: [canonical(opts.dataDir), VARTMP_ROOT], writable: [] });
+    const incomplete = preparingAbandoned(sessionRoot)
+      || [...recorded].some(mp => !mounted.has(join(merged, mp)))
+      || [...plan.overlay, ...plan.readOnly].some(m => !recorded.has(m.mountpoint) && mounted.has(join(merged, m.mountpoint)));
+    if (incomplete) {
+      console.error(`[scratch-sandbox] session ${opts.sessionId}: its mounted view does not match its marker — re-mounting from the recorded layout`);
+      unmountScratchStack(sessionRoot, merged);
+    }
+  }
+
   // ── bring the main overlay up (or adopt an existing one) ─────────────────
-  const subMounts: { mountpoint: string; kind: 'overlay' | 'ro' }[] = [];
+  const cwdCanonical = canonical(opts.chdir);
+  const infraRoots = [canonical(opts.dataDir), VARTMP_ROOT];
+  const writable = [cwdCanonical, canonical(opts.home)];
+  const subMounts: { mountpoint: string; kind: 'overlay' | 'ro'; dir?: string }[] = [];
+  let submountOverflow: ScratchSandboxSpawn['submountOverflow'];
   if (!isMountpoint(merged)) {
+    // Before the first mount: lets the sweep tell this tree from residue, and a
+    // later prepare tell residue from a tree still being built.
+    // Nothing is mounted yet, and a recorded (disk) session's tree holds its
+    // upper: refuse without fail()'s tree removal.
+    try {
+      atomicWriteFileSync(preparingRecord, JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) ?? '' }), { mode: 0o600, followTargetSymlink: false });
+    } catch (err) {
+      console.error(`[scratch-sandbox] session ${opts.sessionId}: cannot record the prepare in progress (${(err as Error)?.message ?? err}) — refusing to spawn`);
+      return null;
+    }
     if (storage === 'tmpfs') {
-      // A RECORDED tmpfs session whose overlay/slot is gone means the machine
-      // rebooted and the in-RAM upper died with it. The meta is still on disk,
-      // but mounting a brand-new empty slot would silently fabricate a fresh
-      // COW view while keeping the old session identity — violating the
-      // documented "unrecoverable, start a new session" contract. Refuse.
-      // (A genuinely fresh session has existing === null and mounts normally.)
-      if (existing) {
+      // A RECORDED tmpfs session whose slot is gone means the machine rebooted
+      // and the in-RAM upper died with it. The meta is still on disk, but
+      // mounting a brand-new empty slot would silently fabricate a fresh COW
+      // view while keeping the old session identity — violating the documented
+      // "unrecoverable, start a new session" contract. Refuse. (A genuinely
+      // fresh session has existing === null and mounts normally; a recorded one
+      // whose slot survives is re-mounted onto the same upper.)
+      if (existing && !isMountpoint(slot!)) {
         console.error(`[scratch-sandbox] tmpfs upper for recorded session ${opts.sessionId} is gone (machine reboot wiped it) — refusing to fabricate a fresh COW view; start a new session`);
         return null;
       }
@@ -429,17 +672,39 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     rolledBack.push(merged);
 
     // ── recursive submount overlays (each host submount else renders EMPTY) ──
-    const candidates = readRelevantSubmounts([canonical(opts.dataDir), VARTMP_ROOT]);
-    candidates.forEach((m, idx) => {
-      const subDir = join(subroots, String(idx));
+    const mountinfo = readMountinfo();
+    const plan = planScratchSubmounts({ mountinfo, infraRoots, writable });
+    if (plan.scratchTreeMounts > 0) {
+      console.error(`[scratch-sandbox] session ${opts.sessionId}: skipped ${plan.scratchTreeMounts} mount(s) inside other scratch session trees (never re-overlaid)`);
+    }
+    if (plan.readOnly.length > 0) {
+      const eligible = plan.overlay.length + plan.readOnly.length;
+      submountOverflow = { eligible, readOnly: plan.readOnly.map(m => m.mountpoint) };
+      console.error(`[scratch-sandbox] session ${opts.sessionId}: ${eligible} host submounts exceed the overlay limit ${SCRATCH_SUBMOUNT_OVERLAY_LIMIT} — `
+        + `overlaying ${plan.overlay.length} (working dir / HOME first), exposing ${plan.readOnly.length} read-only: `
+        + `${plan.readOnly.slice(0, 10).map(m => m.mountpoint).join(', ')}${plan.readOnly.length > 10 ? ', …' : ''}`);
+    }
+    let usedOnDisk: string[] = [];
+    try { usedOnDisk = readdirSync(subroots); } catch { /* fresh */ }
+    const subDirs = assignSubDirs({
+      mountpoints: plan.overlay.map(m => m.mountpoint),
+      recorded: existing?.subs ?? [],
+      legacyOrder: () => planScratchSubmounts({
+        mountinfo, infraRoots, writable, limit: Number.POSITIVE_INFINITY, isScratchTree: () => false,
+      }).overlay.map(m => m.mountpoint),
+      usedOnDisk,
+    });
+    plan.overlay.forEach((m) => {
+      const dir = subDirs.get(m.mountpoint)!;
+      const subDir = join(subroots, dir);
       const subMerged = join(subDir, 'merged');
-      const subUpper = storage === 'tmpfs' ? join(slot!, `sub-${idx}-upper`) : join(subDir, 'upper');
-      const subWork = storage === 'tmpfs' ? join(slot!, `sub-${idx}-work`) : join(subDir, 'work');
+      const subUpper = storage === 'tmpfs' ? join(slot!, `sub-${dir}-upper`) : join(subDir, 'upper');
+      const subWork = storage === 'tmpfs' ? join(slot!, `sub-${dir}-work`) : join(subDir, 'work');
       const targetInMerged = join(merged, m.mountpoint);
       const ok = mountOverlay({ lower: m.mountpoint, upper: subUpper, work: subWork, merged: subMerged, allowFuseFallback: true });
       try { mkdirSync(targetInMerged, { recursive: true }); } catch { /* present from lower */ }
       if (ok && spawnSync('mount', ['--bind', subMerged, targetInMerged], { stdio: 'pipe' }).status === 0) {
-        subMounts.push({ mountpoint: m.mountpoint, kind: 'overlay' });
+        subMounts.push({ mountpoint: m.mountpoint, kind: 'overlay', dir });
         rolledBack.push(subMerged);
         rolledBack.push(targetInMerged);
         return;
@@ -448,16 +713,18 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       // Un-overlayable submount → exposed read-only at the bwrap layer below.
       subMounts.push({ mountpoint: m.mountpoint, kind: 'ro' });
     });
+    for (const m of plan.readOnly) subMounts.push({ mountpoint: m.mountpoint, kind: 'ro' });
   } else {
     // Adopting a live mount after a daemon restart: trust the recorded subs.
     if (!existing || existing.merged !== merged) {
       console.error(`[scratch-sandbox] ${merged} already mounted but meta missing/mismatch — refusing to spawn`);
       return null;
     }
-    for (const s of existing.subs ?? []) subMounts.push({ ...s, kind: 'overlay' });
+    for (const s of existing.subs ?? []) subMounts.push({ mountpoint: s.mountpoint, dir: s.dir, kind: 'overlay' });
     // Any submount that appeared since may need the read-only fallback at least;
     // re-scan cheaply (host-side binds of recorded subs are skipped as mounted).
-    for (const m of readRelevantSubmounts([canonical(opts.dataDir), VARTMP_ROOT])) {
+    const plan = planScratchSubmounts({ mountinfo: readMountinfo(), infraRoots, writable });
+    for (const m of [...plan.overlay, ...plan.readOnly]) {
       if (subMounts.some(s => s.mountpoint === m.mountpoint)) continue;
       const target = join(merged, m.mountpoint);
       if (isMountpoint(target)) { subMounts.push({ mountpoint: m.mountpoint, kind: 'overlay' }); continue; }
@@ -468,8 +735,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   // The working dir MUST be COW-writable through the merged view. Prove it with
   // a real write and a host-side zero-leak check; a read-only-fallback submount
   // under the cwd is a hard error (never bind the real project RW to host).
-  const cwdCanonical = canonical(opts.chdir);
-  const roFallbackPoints = subMounts.filter(s => s.kind === 'ro').map(s => s.mountpoint);
+  const roFallbackPoints = subMounts.filter(s => s.kind === 'ro').map(s => s.mountpoint)
+    .sort((a, b) => a.split('/').length - b.split('/').length);
   if (roFallbackPoints.some(p => p === cwdCanonical || isWithin(p, cwdCanonical))) {
     console.error(`[scratch-sandbox] working dir ${cwdCanonical} sits on a submount that cannot be overlaid (would be read-only) — refusing to spawn`);
     return fail('cwd-on-ro-submount');
@@ -491,7 +758,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     return fail('cwd-cow-probe');
   }
 
-  const currentOverlaySubs = subMounts.filter(s => s.kind === 'overlay');
+  const currentOverlaySubs = subMounts.filter(s => s.kind === 'overlay')
+    .map(({ mountpoint, dir }) => (dir === undefined ? { mountpoint } : { mountpoint, dir }));
   const meta: ScratchMeta = existing
     // Re-mount (disk cold resume): keep identity/createdAt but refresh the
     // submount set — the machine may have gained/lost mounts since.
@@ -510,9 +778,16 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   // Atomic (tmp + rename): a truncated marker would read as "not a scratch
   // session" to the scratch sweep while still being a scratch marker to the
   // generic sweep, so neither would ever reclaim the upper.
+  // A fresh session without its marker would run on mounts that attach, the
+  // sweeps and the next prepare cannot recognise: fail closed. A re-mount keeps
+  // its previous (still valid) marker.
   try {
     atomicWriteFileSync(metaPath(sessionRoot), JSON.stringify(meta), { mode: 0o600, followTargetSymlink: false, durable: true });
-  } catch { /* */ }
+  } catch (err) {
+    if (!existing) return fail(`meta-write: ${(err as Error)?.message ?? err}`);
+    console.error(`[scratch-sandbox] session ${opts.sessionId}: could not refresh its marker (keeping the previous one): ${(err as Error)?.message ?? err}`);
+  }
+  rmSync(preparingRecord, { force: true });
 
   // ── shim + outbox (REAL host tree, passthrough-bound over the merged root) ──
   const shim = join(shimBin, 'botmux');
@@ -722,6 +997,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     env,
     outbox,
     mergedHostPath: merged,
+    ...(submountOverflow ? { submountOverflow } : {}),
     cleanup: () => {
       compactLaunch?.cleanup();
       teardownScratchSession(opts.sessionId, opts.dataDir);
@@ -771,11 +1047,8 @@ function mountsUnder(root: string): string[] {
 
 /** Unmount + remove a scratch session from DISK state alone (no live pane).
  *  Used by sweep and close-time cleanup. Idempotent. */
-export function teardownScratchSession(sessionId: string, dataDirInput: string): void {
-  const dataDir = canonical(dataDirInput);
-  const sessionRoot = join(dataDir, 'sandboxes', sessionId);
-  const meta = readMeta(sessionRoot);
-  const merged = meta?.merged ?? join(sessionRoot, 'root');
+/** Take a session's overlay stack down (not its tmpfs slot); touches no file. */
+function unmountScratchStack(sessionRoot: string, merged: string): void {
   // 1. binds into the merged tree (submount overlays), deepest first
   for (const mp of mountsUnder(merged)) unmountAny(mp);
   // 2. the sub-overlay merged dirs themselves
@@ -784,8 +1057,21 @@ export function teardownScratchSession(sessionId: string, dataDirInput: string):
       if (entry.isDirectory()) unmountAny(join(sessionRoot, 'subroots', entry.name, 'merged'));
     }
   } catch { /* no subroots */ }
-  // 3. main overlay + tmpfs slot
+  // 3. main overlay
   unmountAny(merged);
+}
+
+export function teardownScratchSession(sessionId: string, dataDirInput: string): void {
+  const dataDir = canonical(dataDirInput);
+  const sessionRoot = join(dataDir, 'sandboxes', sessionId);
+  // Never pull a tree out from under the prepare still building it.
+  if (preparingByOther(sessionRoot)) {
+    console.error(`[scratch-sandbox] session ${sessionId}: not tearing down — another live process is preparing it`);
+    return;
+  }
+  const meta = readMeta(sessionRoot);
+  const merged = meta?.merged ?? join(sessionRoot, 'root');
+  unmountScratchStack(sessionRoot, merged);
   if (meta?.slot) unmountAny(meta.slot);
   // 4. remove — but never THROUGH a mount that refused to go away (a recursive
   //    rm crosses filesystem boundaries; through the merged root that walks the
@@ -808,8 +1094,9 @@ export function scratchSessionRecoverable(sessionId: string, dataDir: string): b
 }
 
 /**
- * Reclaim orphan scratch sessions: scratch trees WITH a scratch.json marker
- * whose session is not active and no live process references. Unlike the
+ * Reclaim orphan scratch sessions: scratch trees (a scratch.json marker, or
+ * mounts without one) whose session is not active and no live process
+ * references. Unlike the
  * oncall sweep (plain rm), scratch must UNMOUNT the overlay, the submount binds
  * and the tmpfs slot first. Slot dirs under /var/tmp/botmux-scratch with no
  * matching session tree are also swept. Guards mirror the oncall sweep:
@@ -837,6 +1124,10 @@ export function sweepOrphanScratchSandboxes(
     if (!/^\d+$/.test(pid)) continue;
     let cmd: string;
     try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { continue; }
+    // A fuse-overlayfs daemon names the tree's own mountpoint/upper in its argv
+    // but only serves that mount: it exits once the teardown unmounts it, and
+    // must not keep an orphan tree "live" forever.
+    if (basename(cmd.split('\0', 1)[0] ?? '') === 'fuse-overlayfs') continue;
     re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(cmd))) live.add(m[1]);
@@ -847,11 +1138,22 @@ export function sweepOrphanScratchSandboxes(
   try { sids = readdirSync(root); } catch { return; }
   const GRACE_MS = 60_000;
   const now = Date.now();
+  // A prepare killed between its first mount and the marker write leaves a
+  // tree with mounts but no marker. Only scratch mounts anything into a tree
+  // (same rule as recordedSandboxTreeFlavour), and the generic sweep never
+  // touches a mounted tree, so without this nothing would ever reclaim it.
+  const mountedSids = new Set<string>();
+  for (const mp of mountsUnder(root)) {
+    const sid = relative(root, mp).split('/')[0];
+    if (sid) mountedSids.add(sid);
+  }
   for (const sid of sids) {
     const sessionRoot = join(root, sid);
-    // No marker at all → oncall/off session, the generic sweep's. A marker that
-    // does not parse is still ours (see above).
-    try { lstatSync(metaPath(sessionRoot)); } catch { continue; }
+    // No marker and nothing mounted → oncall/off session, the generic sweep's.
+    // A marker that does not parse is still ours (see above).
+    let marked = true;
+    try { lstatSync(metaPath(sessionRoot)); } catch { marked = false; }
+    if (!marked && !mountedSids.has(sid)) continue;
     if (live.has(sid) || activeSessionIds.has(sid)) continue;
     let ageOk = false;
     try { ageOk = now - statSync(sessionRoot).mtimeMs > GRACE_MS; } catch { ageOk = false; }

@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { isCriticalInterruptKey, sendCriticalControlKey } from '../src/adapters/backend/critical-control-key.js';
+import { createPiAdapter } from '../src/adapters/cli/pi.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const start = source.indexOf('// Quick-action key → real key event for the CLI');
@@ -22,7 +23,7 @@ const slice = ts.transpileModule(source.slice(start, end), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 
-function harness(interruptKey?: 'esc', backendType: 'pty' | 'tmux' = 'pty') {
+function harness(interruptKey?: 'esc', backendType: 'pty' | 'tmux' = 'pty', adapter?: object) {
   // A PTY backend writes raw ANSI; a tmux backend goes through send-keys names.
   // Both forms must be covered: the card's Stop button takes a different path
   // per backend, and a wrong TMUX_KEY_MAP entry (esc → 'C-c') quits ZCode.
@@ -32,7 +33,8 @@ function harness(interruptKey?: 'esc', backendType: 'pty' | 'tmux' = 'pty') {
     ? { sendSpecialKeys: (key: string) => { specialKeys.push(key); return true; } }
     : { write: (data: string) => { written.push(data); return true; } };
   const state: Record<string, any> = {
-    cliAdapter: interruptKey ? { id: 'zcode', interruptKey } : { id: 'codex' },
+    lastInitConfig: null,
+    cliAdapter: adapter ?? (interruptKey ? { id: 'zcode', interruptKey } : { id: 'codex' }),
     backend,
     effectiveBackendType: backendType,
     isRemoteBackendType: () => false,
@@ -95,4 +97,16 @@ describe('handleTermAction interrupt-key normalisation', () => {
     expect(h.specialKeys).toEqual(['C-c']);
     expect(h.written).toEqual([]);
   });
+});
+
+// Pi stops on Escape. Its Ctrl+C only clears the editor (and a second one
+// within 500ms quits Pi), so a Stop that sent it left a retrying turn running.
+describe('handleTermAction for Pi', () => {
+  for (const backendType of ['pty', 'tmux'] as const) {
+    it(`sends Escape when Pi is asked to stop (${backendType})`, async () => {
+      const h = harness(undefined, backendType, createPiAdapter('/bin/true', () => '/dev/null'));
+      await h.handle('ctrlc');
+      expect(backendType === 'tmux' ? h.specialKeys : h.written).toEqual([backendType === 'tmux' ? 'Escape' : '\x1b']);
+    });
+  }
 });

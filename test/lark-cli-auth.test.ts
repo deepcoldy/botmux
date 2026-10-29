@@ -24,6 +24,7 @@ import {
   completeLarkCliLogin,
   larkCliHomeFor,
   hasLarkCliHome,
+  describeLarkCliAuth,
   pendingLarkCliChallenge,
   resolveLarkCliHomeForTurn,
   LARK_CLI_DEVICE_SCOPES,
@@ -122,6 +123,15 @@ describe('lark-cli per-person HOME layout', () => {
     simulateUserToken(OPEN);
     expect(hasLarkCliHome(OPEN)).toBe(true);
     expect(hasLarkCliHome(OPEN_B)).toBe(false);
+  });
+
+  it('reports per-person state without reading the encrypted token', () => {
+    seedMachine();
+    simulateUserToken(OPEN);
+    expect(describeLarkCliAuth(OPEN)).toEqual({ state: 'authorized' });
+    expect(describeLarkCliAuth(OPEN_B)).toEqual({ state: 'needs-login' });
+    expect(describeLarkCliAuth('../etc/passwd')).toEqual({ state: 'unknown' });
+    expect(JSON.stringify(describeLarkCliAuth(OPEN))).not.toContain('their-user-token');
   });
 });
 

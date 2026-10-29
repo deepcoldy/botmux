@@ -14,7 +14,8 @@ import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../servic
 import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 
 /** Only the authenticated, currently running turn can admit an inline Ask.
- * Large forms retain their standalone presentation without truncating choices. */
+ * Input forms stay standalone: streaming progress patches would erase client drafts.
+ * Large choice sets retain standalone presentation without truncation. */
 export function replyCardAskTarget(
   ds: DaemonSession | undefined,
   input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions'>,
@@ -26,6 +27,7 @@ export function replyCardAskTarget(
   if (!ds || typeof origin.originTurnId !== 'string' || origin.originTurnId !== ds.replyCardRunningTurnId
     || input.sessionId !== ds.session.sessionId || input.larkAppId !== ds.larkAppId || input.chatId !== ds.chatId
     || !sameAnchor
+    || input.questions.some(q => q.input)
     || input.questions.reduce((sum, q) => sum + q.options.length, 0) > 16
     || Buffer.byteLength(JSON.stringify(input.questions), 'utf8') > 3000) return undefined;
   if (replyCardSandboxBlocked(ds)) return undefined;

@@ -28,6 +28,7 @@ import type { LinkRefConfig } from './services/link-ref-types.js';
 import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
 import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
+import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -181,12 +182,40 @@ export interface SessionCleanupGlobalConfig {
   intervalMinutes?: number;
 }
 
+/** Host service authority letting one bot request schedule:create for others,
+ * without a human administrator driving the turn. It conveys scheduling only:
+ * no personal tool credentials, no persistent run scopes. */
+export interface ScheduleBotGrant {
+  /** Stable host-managed grant id; never supplied by a worker. */
+  id: string;
+  sourceAppId: string;
+  targetAppIds: string[];
+  chatIds: string[];
+  /** Accountable administrator, resolved separately in each app. No tool credentials are delegated. */
+  controllerUnionId: string;
+}
+
 /** Host policy for delegating creation of persistent scheduled work across bots.
  * Creation is opt-in and independent from triggerUserAuth.  Disabling execution
  * is a separate emergency revocation switch so stopping new grants does not
  * silently change the meaning of already committed tasks. */
 export interface ScheduleDelegationGlobalConfig {
-  /** Allow a directly authenticated human turn to request schedule:create. Default off. */
+  /** Explicit bot service grants. Default empty; effective only while
+   *  `createEnabled` is on. A grant matches on source app, every target app and
+   *  chat — not on who drives the source turn — and applies only to a dispatch
+   *  made from one of its chats into one of them. The dispatch route sets it aside
+   *  only for a source-bot administrator's own turn, which keeps its own
+   *  identity and rules. Every other turn in a granted chat gets it: bot,
+   *  report and scheduled turns, and also any person who is not an
+   *  administrator but can talk to the source bot there. Their dispatch is then
+   *  signed for `controllerUnionId` with no personal tool credentials (a bot
+   *  turn's inherited delegation included), and requests schedule:create
+   *  unless it passes `--no-delegate schedule:create`. */
+  botGrants?: ScheduleBotGrant[];
+  /** Allow schedule:create via a current human administrator or an explicit
+   *  bot grant. Default off. Turning it off also stops later admission of
+   *  already committed bot-grant tasks (their grant no longer matches);
+   *  `runEnabled` remains the one emergency stop for every delegated task. */
   createEnabled?: boolean;
   /** Allow already committed delegated schedules to run. Missing means on. */
   runEnabled?: boolean;
@@ -640,6 +669,12 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
       (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
     ))];
     if (appIds.length > 0) out.defaultOnDispatchFromBotAppIds = appIds;
+  }
+  if (Array.isArray(value.botGrants)) {
+    const grants = value.botGrants.filter(isScheduleBotGrant);
+    // Ambiguous grant ids fail closed, rather than choosing an arbitrary scope.
+    out.botGrants = grants.filter(g => grants.filter(other => other.id === g.id).length === 1)
+      .map(canonicalScheduleBotGrant);
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -1206,6 +1241,42 @@ export function writeHostOverloadAlertConfig(config: HostOverloadAlertGlobalConf
   delete existing.enterMemUsedFrac;
   mergeGlobalConfig({ hostOverloadAlert: { ...existing, ...config } as HostOverloadAlertGlobalConfig });
   return readGlobalConfig().hostOverloadAlert ?? {};
+}
+
+/** Hand-edited grants the reader drops (bad shape or a repeated id). The
+ *  Dashboard shows the count: saving its list writes back only valid grants. */
+export function ignoredScheduleBotGrantCount(): number {
+  const raw = readRawConfig().scheduleDelegation;
+  const list = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).botGrants
+    : undefined;
+  if (!Array.isArray(list)) return 0;
+  return list.length - (readGlobalConfig().scheduleDelegation?.botGrants?.length ?? 0);
+}
+
+/** Dashboard write for the bot-grant entry (`createEnabled`, `selfManageEnabled`,
+ *  `botGrants`). A value equal to its default (off / empty) removes the key
+ *  instead of being stored, an emptied block is dropped, and every other
+ *  scheduleDelegation key on disk is left exactly as it was. */
+export function writeScheduleBotGrantConfig(patch: {
+  createEnabled?: boolean;
+  selfManageEnabled?: boolean;
+  botGrants?: ScheduleBotGrant[];
+}): ScheduleDelegationGlobalConfig | undefined {
+  const raw = readRawConfig();
+  const next = raw.scheduleDelegation && typeof raw.scheduleDelegation === 'object' && !Array.isArray(raw.scheduleDelegation)
+    ? { ...raw.scheduleDelegation as Record<string, unknown> }
+    : {};
+  for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+    if (patch[key] === true) next[key] = true;
+    else if (patch[key] === false) delete next[key];
+  }
+  if (patch.botGrants?.length) next.botGrants = patch.botGrants.map(canonicalScheduleBotGrant);
+  else if (patch.botGrants) delete next.botGrants;
+  mergeGlobalConfig({
+    scheduleDelegation: Object.keys(next).length > 0 ? next as ScheduleDelegationGlobalConfig : null,
+  });
+  return readGlobalConfig().scheduleDelegation;
 }
 
 /** Merge only the maintenance sub-config, preserving unknown sibling keys.
