@@ -25,6 +25,8 @@ import {
   withActiveSessionKeyLock,
 } from './worker-pool.js';
 import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
+import { bindTriggerReplyTarget } from './reply-target.js';
+import { validateFrozenReplyTarget } from '../utils/frozen-reply-target.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { currentDeviceIsolationFreezeLease } from './device-isolation-activation.js';
 import * as messageQueue from '../services/message-queue.js';
@@ -790,7 +792,9 @@ async function triggerSessionTurnAdmitted(
     armTriggerStreamingCard(target, req, triggerId, getBot(target.larkAppId).config.apiOnly);
     // Standalone senders read this anchor from disk. Final-output suppression
     // is independent: wait/async and presentation-only turns need routing too.
-    let changed = exactTurn && inheritTriggerReplyAnchor(target, triggerId);
+    let changed = req.target.replyTarget
+      ? bindTriggerReplyTarget(target, triggerId, req.target.replyTarget)
+      : exactTurn && inheritTriggerReplyAnchor(target, triggerId);
     if (req.presentation?.thinking === 'hidden' && !target.session.hiddenThinkingTurns?.includes(triggerId)) {
       target.session.hiddenThinkingTurns = [...(target.session.hiddenThinkingTurns ?? []), triggerId].slice(-256);
       changed = true;
@@ -854,7 +858,7 @@ async function triggerSessionTurnAdmitted(
     && !req.options?.asyncReturnSessionId
     && req.options?.suppressFinalOutput === true;
   const loudTurnId = suppressLoudFinal || req.presentation?.liveCard === 'on-start'
-    || req.presentation?.thinking === 'hidden' ? triggerId : undefined;
+    || req.presentation?.thinking === 'hidden' || req.target.replyTarget ? triggerId : undefined;
   const armLoudFinalSuppression = (target: DaemonSession): void => {
     if (!suppressLoudFinal) return;
     armTriggerFinalSuppression(target, triggerId);
@@ -1065,6 +1069,7 @@ async function triggerSessionTurnAdmitted(
     ? computeInputHash({
         seam: 'turn',
         sessionId: req.target.sessionId ?? null,
+        ...(req.target.replyTarget ? { replyTarget: req.target.replyTarget } : {}),
         instruction: req.instruction ?? null,
         envelope: req.envelope,
         source: req.source,
@@ -1191,6 +1196,24 @@ async function triggerSessionTurnAdmitted(
   }
 
   let chatId = req.target.chatId ?? ds?.chatId;
+  if (req.target.replyTarget) {
+    if (!ds || ds.chatId !== chatId || steerRequested) {
+      return { ok: false, errorCode: 'bad_request', error: 'explicit reply target requires the original session chat without steer' };
+    }
+    let replyTarget;
+    try { replyTarget = validateFrozenReplyTarget(req.target.replyTarget, ds.chatId); }
+    catch (error) { return { ok: false, errorCode: 'bad_request', error: String(error) }; }
+    if (ds.scope === 'thread' && (replyTarget.mode !== 'thread' || replyTarget.rootMessageId !== ds.session.rootMessageId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'reply target differs from thread session root' };
+    }
+    if (rootMessageId && (replyTarget.mode === 'plain' || rootMessageId !== replyTarget.rootMessageId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'reply target and rootMessageId differ' };
+    }
+    if (replyTarget.mode !== 'plain') {
+      const rootTarget = await validateRootMessageTarget(larkAppId, chatId, replyTarget.rootMessageId);
+      if (!rootTarget.ok) return { ok: false, errorCode: rootTarget.errorCode, error: rootTarget.error };
+    }
+  }
   if (rootMessageId && !req.target.sessionId) {
     const rootTarget = await validateRootMessageTarget(larkAppId, chatId, rootMessageId);
     if (!rootTarget.ok) {

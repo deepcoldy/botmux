@@ -43,7 +43,7 @@ import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 
 import { join } from 'node:path';
 import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
-import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, replyContextForSessionTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
 import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
 import { TopicSendError } from '../../cli/topic-send-guard.js';
@@ -348,7 +348,10 @@ function interruptedNoticeEvents(
  * over the wire. (See the same constraint recorded in ask-card.ts:49.)
  */
 function cotPlacement(ds: DaemonSession, state: CotState): { origin_message_id?: string; reply_in_thread?: boolean } {
-  const target = frozenReplyContextForTurn(ds, fallbackTurnId(ds, state.turnId)).target;
+  const turnId = fallbackTurnId(ds, state.turnId);
+  const target = ds.session.turnReplyContexts !== undefined
+    ? replyContextForSessionTurn({ ...ds.session, scope: ds.scope ?? ds.session.scope, chatId: ds.chatId }, turnId).target
+    : frozenReplyContextForTurn(ds, turnId).target;
   if (target.mode === 'thread' || target.mode === 'quote') {
     const anchor = target.rootMessageId;
     if (!anchor.startsWith('om_')) return {};

@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 import { getBot } from '../src/bot-registry.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
+import { beginReplyTargetTurn, bindTriggerReplyTarget } from '../src/core/reply-target.js';
 import { t, localeForBot } from '../src/i18n/index.js';
 import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
 
@@ -130,6 +131,39 @@ describe('handleCotThinkingUpdate', () => {
       'REASONING_MESSAGE_START', 'REASONING_MESSAGE_CONTENT', 'REASONING_MESSAGE_END',
     ]);
     expect(events[3].content.delta).toBe('step 1');
+  });
+
+  it('creates delayed thinking in the frozen topic after interleaved input prunes the short registry', async () => {
+    const ds = makeDs({ scope: 'chat', session: { scope: 'chat', chatId: 'oc_chat1' } });
+    for (let index = 0; index <= 40; index += 1) {
+      beginReplyTargetTurn(ds, index === 0 ? 'om_topic_a' : 'om_topic_b', `om_turn_${index}`,
+        new Date(index * 1000).toISOString(), { inThread: true });
+    }
+    expect(ds.session.replyTargets.om_turn_0).toBeUndefined();
+    handleCotThinkingUpdate(ds, upd([think('older task')], 'om_turn_0'));
+    await flush();
+    const create = request.mock.calls.find(([entry]) => entry.method === 'POST' && entry.url === '/open-apis/im/v1/message_cot')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_topic_a', reply_in_thread: true });
+  });
+
+  it('keeps a report thinking bubble on its original lead topic rather than the latest input', async () => {
+    const ds = makeDs({ scope: 'chat', session: { scope: 'chat', chatId: 'oc_chat1' } });
+    beginReplyTargetTurn(ds, 'om_topic_b', 'om_new_input');
+    bindTriggerReplyTarget(ds, 'trg_report', { mode: 'thread', rootMessageId: 'om_topic_a' });
+    handleCotThinkingUpdate(ds, upd([think('integrating report')], 'trg_report'));
+    await flush();
+    const create = request.mock.calls.find(([entry]) => entry.method === 'POST' && entry.url === '/open-apis/im/v1/message_cot')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_topic_a', reply_in_thread: true });
+  });
+
+  it('does not create a group thinking bubble when the exact frozen topic was evicted', async () => {
+    const ds = makeDs({ scope: 'chat', session: { scope: 'chat', chatId: 'oc_chat1' } });
+    for (let index = 0; index <= 300; index += 1) {
+      beginReplyTargetTurn(ds, 'om_topic_b', `om_turn_${index}`, new Date(index * 1000).toISOString());
+    }
+    handleCotThinkingUpdate(ds, upd([think('old task')], 'om_turn_0'));
+    await flush();
+    expect(request).not.toHaveBeenCalled();
   });
 
   it('topic session with a synthetic (non om_) turn id still threads via the topic root', async () => {

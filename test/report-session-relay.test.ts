@@ -523,6 +523,30 @@ describe('report session relay fallback target', () => {
 });
 
 describe('report session relay delivery', () => {
+  it('keeps the signed lead root when an unavailable original session falls back to its successor', async () => {
+    const decision = prepareAutomaticDispatchReport({ registry: { om_subtask: { reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+      dispatchRoot: 'om_subtask', targetLarkAppId: 'cli_orchestrator', targetSessionId: 'lead_old',
+      targetChatId: 'oc_original', targetScope: 'chat', targetReplyTarget: { mode: 'thread', rootMessageId: 'om_lead_topic' },
+      sourceName: 'subtask',
+    }) } }, bindingSecret: BINDING_SECRET, dispatchRoot: 'om_subtask', sourceSessionId: 'worker', sourceLarkAppId: 'cli_source', content: 'done' });
+    expect(decision).toBeDefined();
+    const targets: Record<string, unknown>[] = [];
+    const delivered = await deliverReportSessionRelay({ decision: decision!,
+      triggerMeta: { requestId: 'report:fallback', receivedAt: new Date().toISOString() },
+      fetchTarget: async (path, init) => {
+        if (path === '/api/sessions') return { ok: true, status: 200, json: async () => ({ sessions: [{ sessionId: 'lead_new',
+          larkAppId: 'cli_orchestrator', chatId: 'oc_original', scope: 'chat', status: 'idle' }] }) };
+        targets.push(JSON.parse(String(init.body)).target);
+        return targets.length === 1 ? { ok: false, status: 404, json: async () => ({ errorCode: 'session_not_found' }) }
+          : { ok: true, status: 202, json: async () => ({ ok: true }) };
+      }, postProjectUpdate: async () => ({ projectSynced: false }),
+    });
+    expect(delivered.status).toBe(202);
+    expect(targets).toHaveLength(2);
+    expect(targets.map(target => target.sessionId)).toEqual(['lead_old', 'lead_new']);
+    for (const target of targets) expect(target).toMatchObject({ chatId: 'oc_original', rootMessageId: 'om_lead_topic',
+      replyTarget: { mode: 'thread', rootMessageId: 'om_lead_topic' } });
+  });
   it.each(['first', 'fallback'] as const)('does not emit a trigger when the source check fails at %s', async failure => {
     const authorized = authorize();
     if (!authorized.ok) throw new Error('invalid fixture');

@@ -86,6 +86,7 @@ import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import { __testOnly_sessionReply as sessionReply, __testOnly_activeSessions as activeSessions } from '../src/daemon.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 
 const APP = 'session_reply_anchor_app';
 const CHAT = 'oc_shared_chat';
@@ -307,6 +308,28 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     seedSharedSession({ rootMessageId: 'om_topic', turnId: 'turn-1', updatedAt: NOW });
     await sessionReply(CHAT, 'late', 'text', APP, 'turn-2');
     expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('routes daemon progress through a frozen older topic after the short registry has been pruned', async () => {
+    const ds = seedSharedSession();
+    ds.session.scope = 'chat';
+    for (let index = 0; index <= 40; index += 1) {
+      beginReplyTargetTurn(ds, index === 0 ? 'om_topic_a' : 'om_topic_b', `om_turn_${index}`,
+        new Date(index * 1000).toISOString());
+    }
+    expect(ds.session.replyTargets?.om_turn_0).toBeUndefined();
+    await sessionReply(CHAT, 'progress', 'interactive', APP, 'om_turn_0');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_topic_a', 'progress', 'interactive', true, undefined, expect.anything());
+  });
+
+  it('refuses daemon output when a known frozen topic context has been lost', async () => {
+    const ds = seedSharedSession();
+    ds.session.scope = 'chat';
+    beginReplyTargetTurn(ds, 'om_topic_b', 'om_latest');
+    await expect(sessionReply(CHAT, 'late progress', 'text', APP, 'om_missing')).rejects.toThrow('REPLY_TARGET_MISSING');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
     expect(mocks.replyMessage).not.toHaveBeenCalled();
   });
 

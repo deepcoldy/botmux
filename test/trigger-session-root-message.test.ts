@@ -237,6 +237,37 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
   });
 
+  it.each([true, false])('binds a report wake-up to the original topic with live worker=%s', async live => {
+    const send = vi.fn();
+    const ds = existingDs({ scope: 'chat', worker: live ? { killed: false, send } as any : null });
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = CHAT;
+    ds.currentReplyTarget = { rootMessageId: 'om_latest_topic', turnId: 'om_latest', updatedAt: new Date().toISOString() };
+    const req = request({ sessionId: ds.session.sessionId, rootMessageId: ROOT,
+      replyTarget: { mode: 'thread', rootMessageId: ROOT } });
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(CHAT, APP), ds]]) });
+    expect(res.ok).toBe(true);
+    expect(mockGetMessageChatId).toHaveBeenCalledWith(APP, ROOT);
+    const turnId = res.triggerId!;
+    expect(ds.session.turnReplyContexts?.[turnId]?.target).toEqual({ mode: 'thread', rootMessageId: ROOT });
+    expect(ds.currentReplyTarget?.rootMessageId).toBe('om_latest_topic');
+    if (live) expect(send.mock.calls[0][0].turnId).toBe(turnId);
+    else expect(mockForkWorker.mock.calls[0][2].turnId).toBe(turnId);
+    expect(mockUpdateSession).toHaveBeenCalled();
+  });
+
+  it('rejects a report root from a different group before dispatching any worker input', async () => {
+    const ds = existingDs({ scope: 'chat', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.scope = 'chat';
+    mockGetMessageChatId.mockResolvedValue('oc_other');
+    const req = request({ sessionId: ds.session.sessionId, replyTarget: { mode: 'thread', rootMessageId: ROOT } });
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) });
+    expect(result).toMatchObject({ ok: false, errorCode: 'chat_not_allowed' });
+    expect(ds.worker!.send).not.toHaveBeenCalled();
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(ds.session.turnReplyContexts).toBeUndefined();
+  });
+
   it('keeps the localized topic seed by default', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
   });

@@ -2,6 +2,8 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readSecureHostFileSync, withSecureHostParentSync } from '../platform/secure-host-file.js';
+import type { FrozenSessionReplyTarget } from '../types.js';
+import { validateFrozenReplyTarget } from '../utils/frozen-reply-target.js';
 
 const DOMAIN = 'botmux.dispatch-report-binding.v1';
 
@@ -15,6 +17,7 @@ export interface DispatchReportBindingPayload {
   targetSessionId: string;
   targetChatId?: string;
   targetScope?: 'thread' | 'chat';
+  targetReplyTarget?: FrozenSessionReplyTarget;
   sourceName: string;
   issuedAt: string;
 }
@@ -105,6 +108,7 @@ function canonicalPayload(input: {
   targetSessionId: string;
   targetChatId?: string;
   targetScope?: 'thread' | 'chat';
+  targetReplyTarget?: unknown;
   sourceName?: string;
   issuedAt?: string;
 }): DispatchReportBindingPayload {
@@ -122,6 +126,11 @@ function canonicalPayload(input: {
   if (input.targetScope !== undefined && input.targetScope !== 'thread' && input.targetScope !== 'chat') {
     throw new Error('invalid dispatch report target scope');
   }
+  const targetReplyTarget = input.targetReplyTarget === undefined ? undefined
+    : validateFrozenReplyTarget(input.targetReplyTarget, targetChatId ?? '');
+  if (targetReplyTarget && (!targetChatId || (input.targetScope === 'thread' && targetReplyTarget.mode !== 'thread'))) {
+    throw new Error('invalid dispatch report reply target');
+  }
   const sourceName = input.sourceName?.trim().slice(0, 200) || 'dispatched subtask';
   const issuedAt = input.issuedAt ?? new Date().toISOString();
   if (!Number.isFinite(Date.parse(issuedAt))) throw new Error('invalid dispatch report issue time');
@@ -132,6 +141,7 @@ function canonicalPayload(input: {
     targetSessionId,
     ...(targetChatId ? { targetChatId } : {}),
     ...(input.targetScope ? { targetScope: input.targetScope } : {}),
+    ...(targetReplyTarget ? { targetReplyTarget } : {}),
     sourceName,
     issuedAt,
   };
@@ -175,6 +185,7 @@ export function verifyDispatchReportBinding(
       targetScope: candidate.targetScope === 'thread' || candidate.targetScope === 'chat'
         ? candidate.targetScope
         : undefined,
+      targetReplyTarget: candidate.targetReplyTarget,
       sourceName: typeof candidate.sourceName === 'string' ? candidate.sourceName : '',
       issuedAt: typeof candidate.issuedAt === 'string' ? candidate.issuedAt : '',
     });

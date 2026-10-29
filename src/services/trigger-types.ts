@@ -1,3 +1,6 @@
+import type { FrozenSessionReplyTarget } from '../types.js';
+import { validateFrozenReplyTarget } from '../utils/frozen-reply-target.js';
+
 export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting' | 'headless';
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
@@ -21,6 +24,7 @@ export interface TriggerRequest {
     chatId?: string;
     sessionId?: string;
     rootMessageId?: string;
+    replyTarget?: FrozenSessionReplyTarget;
     workflowId?: string;
   };
   envelope: {
@@ -264,6 +268,21 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   const hasChatId = typeof target.chatId === 'string' && target.chatId.trim().length > 0;
   const hasSessionId = typeof target.sessionId === 'string' && target.sessionId.trim().length > 0;
   const hasRootMessageId = typeof target.rootMessageId === 'string' && target.rootMessageId.trim().length > 0;
+  if (target.replyTarget !== undefined) {
+    try {
+      if (target.kind !== 'turn' || typeof target.sessionId !== 'string' || !target.sessionId.trim()
+        || typeof target.chatId !== 'string' || (isRecord(raw.options) && raw.options.steer === true)) {
+        throw new Error('explicit reply target requires an existing non-steered group turn');
+      }
+      const replyTarget = validateFrozenReplyTarget(target.replyTarget, target.chatId);
+      if (target.rootMessageId !== undefined
+        && (replyTarget.mode === 'plain' || target.rootMessageId !== replyTarget.rootMessageId)) {
+        throw new Error('reply target and rootMessageId differ');
+      }
+    } catch (error) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: String(error) } };
+    }
+  }
   if (target.rootMessageId !== undefined && !hasRootMessageId) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.rootMessageId must be a non-empty string' } };
   }

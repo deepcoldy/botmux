@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
+import type { FrozenSessionReplyTarget } from '../types.js';
 import { resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
 import type { ProjectWorkstreamStatus } from '../services/project-group-store.js';
 
@@ -58,6 +59,7 @@ export type ReportSessionRelayDecision =
       target: { sessionId: string; larkAppId: string };
       targetChatId?: string;
       targetScope?: 'thread' | 'chat';
+      targetReplyTarget?: FrozenSessionReplyTarget;
       dispatchRoot: string;
       sourceName: string;
       content: string;
@@ -96,6 +98,7 @@ export function prepareAutomaticDispatchReport(input: {
     target: { sessionId: binding.targetSessionId, larkAppId: binding.targetLarkAppId },
     targetChatId: binding.targetChatId,
     targetScope: binding.targetScope,
+    ...(binding.targetReplyTarget ? { targetReplyTarget: binding.targetReplyTarget } : {}),
     dispatchRoot: input.dispatchRoot,
     sourceName: binding.sourceName,
     content: input.content,
@@ -273,6 +276,7 @@ export function authorizeReportSessionRelayRequest(
     },
     ...(resolved.binding.targetChatId ? { targetChatId: resolved.binding.targetChatId } : {}),
     ...(resolved.binding.targetScope ? { targetScope: resolved.binding.targetScope } : {}),
+    ...(resolved.binding.targetReplyTarget ? { targetReplyTarget: resolved.binding.targetReplyTarget } : {}),
     dispatchRoot,
     sourceName: resolved.binding.sourceName,
     content,
@@ -522,6 +526,11 @@ export function buildOrchestratorReportTrigger(
       kind: 'turn',
       botId: target.larkAppId,
       sessionId: target.sessionId,
+      ...(decision.targetReplyTarget ? {
+        chatId: decision.targetChatId,
+        replyTarget: decision.targetReplyTarget,
+        ...(decision.targetReplyTarget.mode === 'plain' ? {} : { rootMessageId: decision.targetReplyTarget.rootMessageId }),
+      } : {}),
     },
     envelope: {
       format: 'botmux-report/v1',

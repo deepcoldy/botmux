@@ -72,7 +72,7 @@ import {
   type DispatchTransportState,
 } from './core/dispatch-lifecycle.js';
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
-import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
+import { pickTurnReplyTarget, collectTurnWindowParticipants, replyContextForSessionTurn } from './core/reply-target.js';
 import {
   consumeAutostartUnitMarker,
   enableAutostart,
@@ -3995,13 +3995,7 @@ interface SessionData {
   /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
    *  `botmux send` 读取发送人类型，并用 `inThread` 判断 quote 目标当初是否从**顶层**
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
-  turnReplyContexts?: Record<string, {
-    target?: { mode?: string; chatId?: string; rootMessageId?: string };
-    quoteTargetId?: string;
-    inThread?: boolean;
-    replyTargetSenderOpenId?: string;
-    replyTargetSenderIsBot?: boolean;
-  }>;
+  turnReplyContexts?: import('./types.js').Session['turnReplyContexts'];
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
   queued?: boolean;
@@ -12357,9 +12351,17 @@ async function cmdSend(rest: string[]): Promise<void> {
   // #597: a frozen per-turn reply target (from a Codex App dispatch) overrides
   // the nominal resolveSendTarget in chat scope so a steered/dispatched turn
   // replies to its own origin, not the session's latest human quote target.
-  const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
-    ? frozenTurnReplyTarget
-    : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  const sendTarget = (() => {
+    if (sendInto || sendTopLevel || overrideChatId) {
+      return resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+    }
+    if (frozenTurnReplyTarget) return frozenTurnReplyTarget;
+    try { return replyContextForSessionTurn(s, currentTurnId).target; }
+    catch (error) {
+      console.error(`botmux send refused: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+  })();
 
   let completionProposalRecord: CompletionProposalRecord | undefined;
   let completionProposalStore: ReturnType<typeof createCompletionProposalStore> | undefined;
@@ -14955,6 +14957,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       originClaim: dispatchOriginClaim,
       body: {
         seedText: built.seedText,
+        ...(dispatchContext?.sessionId === sid && dispatchContext.turnId ? { reportTurnId: dispatchContext.turnId } : {}),
         targetChatId,
         targetAppIds: parsedBotApps.map(item => item.appId),
         acceptanceRequested: !standby && parsedBotApps.length > 0,

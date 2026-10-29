@@ -1,5 +1,63 @@
 import type { DaemonSession } from './types.js';
 import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import { validateFrozenReplyTarget } from '../utils/frozen-reply-target.js';
+
+type ReplyContextSession = Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'replyTargets' | 'turnReplyContexts' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId'>;
+type ReplyContextView = Pick<DaemonSession, 'scope' | 'chatId' | 'currentReplyTarget'> & { session: ReplyContextSession };
+
+export function pruneFrozenReplyContexts(ds: DaemonSession, extraTurnIds: readonly string[] = []): void {
+  const contexts = ds.session.turnReplyContexts;
+  if (!contexts) return;
+  const pinned = cronPinnedTurnIds(ds.session.cronTaskReplyAnchors);
+  const turnIds = [ds.currentTurnId, ds.managedTurnOrigin?.turnId, ds.principalLaneRunningTurn?.turnId,
+    ds.replyCardRunningTurnId, ds.pendingTurnId, ds.pendingRawTurnId, ds.pendingFollowUpTurnId,
+    ds.pendingFollowUpInput?.turnId, ds.session.readonlyTaskContinuation?.logicalTurnId,
+    ds.session.readonlyTaskContinuation?.currentTurnId, ds.session.ordinaryTurnRecovery?.logicalTurnId,
+    ds.session.ordinaryTurnRecovery?.currentTurnId,
+    ...(ds.pendingFollowUpTurnIds ?? []), ...extraTurnIds,
+    ...(ds.session.codexAppDispatchLedger ?? []).map(entry => entry.turnId),
+    ...(ds.session.queuedActivationTail ?? []).map(entry => entry.turnId)];
+  for (const turnId of turnIds) if (turnId) pinned.add(turnId);
+  const unpinned = Object.keys(contexts).filter(turnId => !pinned.has(turnId));
+  for (const turnId of unpinned.slice(0, Math.max(0, unpinned.length - 256))) delete contexts[turnId];
+}
+
+export function replyContextForSessionTurn(session: ReplyContextSession, turnId?: string): FrozenSessionReplyContext {
+  const view: ReplyContextView = { scope: session.scope ?? 'thread', chatId: session.chatId, session,
+    currentReplyTarget: session.currentReplyTarget };
+  const frozen = turnId ? session.turnReplyContexts?.[turnId] : undefined;
+  const exact = pickTurnReplyTarget(session, turnId);
+  if (view.scope === 'chat' && !turnId && session.currentReplyTarget?.rootMessageId) {
+    throw new Error('REPLY_TARGET_MISSING: turn identity required for topic-bound output');
+  }
+  if (view.scope === 'chat' && turnId && !frozen && !exact
+    && (session.turnReplyContexts !== undefined || session.replyTargets !== undefined || session.currentReplyTarget !== undefined)) {
+    throw new Error(`REPLY_TARGET_MISSING: ${turnId}`);
+  }
+  const context = frozenReplyContextForTurn(view, turnId);
+  return { ...context, target: validateFrozenReplyTarget(context.target, session.chatId) };
+}
+
+export function bindTriggerReplyTarget(ds: DaemonSession, turnId: string, target: FrozenSessionReplyTarget): boolean {
+  const validated = validateFrozenReplyTarget(target, ds.chatId);
+  const contexts = ds.session.turnReplyContexts ??= {};
+  const existing = contexts[turnId];
+  if (existing) {
+    if (replyTargetKey(existing.target) !== replyTargetKey(validated)) throw new Error('REPLY_TARGET_CONFLICT');
+    return false;
+  }
+  contexts[turnId] = { target: validated, ...(validated.mode === 'quote' ? { quoteTargetId: validated.rootMessageId } : {}) };
+  if (ds.scope === 'chat') {
+    const targets = ds.session.replyTargets ??= {};
+    targets[turnId] = { updatedAt: new Date().toISOString(),
+      ...(validated.mode === 'plain' ? {} : { rootMessageId: validated.rootMessageId }),
+      ...(validated.mode === 'quote' ? { quoteOnly: true } : {}) };
+    ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets, ds.session.replyTargetsPrunedThrough,
+      cronPinnedTurnIds(ds.session.cronTaskReplyAnchors));
+  }
+  pruneFrozenReplyContexts(ds, [turnId]);
+  return true;
+}
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -337,7 +395,7 @@ export function isSubstituteTurn(
 }
 
 export function resolveSessionReplyTarget(
-  ds: Pick<DaemonSession, 'scope' | 'chatId' | 'session' | 'currentReplyTarget'>,
+  ds: ReplyContextView,
   turnId?: string,
 ): SessionReplyTarget {
   if (ds.scope === 'chat') {
@@ -424,13 +482,8 @@ export function beginReplyTargetTurn(
       ? { inThread: opts.inThread }
       : {}),
   };
-  const overflow = Object.keys(exactContexts).length - 256;
-  if (overflow > 0) {
-    for (const staleTurnId of Object.keys(exactContexts).slice(0, overflow)) {
-      delete exactContexts[staleTurnId];
-    }
-  }
   ds.session.turnReplyContexts = exactContexts;
+  pruneFrozenReplyContexts(ds, [turnId]);
   // #750: routing and sender are one atomic per-turn record. Thread-scope and
   // rootless chat turns may have no rootMessageId, but still require their
   // exact sender for --mention-back. Sender attribution (senderOpenId) and the
@@ -498,7 +551,7 @@ export function beginReplyTargetTurn(
 /** Resolve a turn's immutable inbound destination, falling back only for
  * legacy/non-Lark turns that predate the bounded registry. */
 export function frozenReplyContextForTurn(
-  ds: Pick<DaemonSession, 'scope' | 'chatId' | 'session' | 'currentReplyTarget'>,
+  ds: ReplyContextView,
   turnId?: string,
 ): FrozenSessionReplyContext {
   const frozen = turnId ? ds.session.turnReplyContexts?.[turnId] : undefined;

@@ -69,7 +69,7 @@ import {
   initialPiLaunchSessionTitle,
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyContextForSessionTurn, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
@@ -20941,9 +20941,10 @@ function deliverFinalOutput(
   // necessarily retain a durable reply context after a newer turn starts.
   // Meeting-driven output has its own audited placement and quote policy.
   if (!managedReceiver && !isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)) {
-    frozenReplyTarget = { ...(frozenReplyTarget ?? frozenReplyContextForTurn(
-      ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId),
-    ).target) };
+    const replyTurnId = fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId);
+    frozenReplyTarget = { ...(frozenReplyTarget ?? (ds.session.turnReplyContexts !== undefined
+      ? replyContextForSessionTurn({ ...ds.session, scope: ds.scope, chatId: ds.chatId }, replyTurnId).target
+      : frozenReplyContextForTurn(ds, replyTurnId).target)) };
   }
   const cb = requireCallbacks();
   const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);

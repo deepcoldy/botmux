@@ -615,7 +615,7 @@ import {
   signDispatchLaunchIpcResponse,
   verifyDispatchLaunchIpcRequest,
 } from './core/dispatch-launch-ipc-auth.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, replyContextForSessionTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
 import {
@@ -4899,7 +4899,10 @@ async function sessionReply(
       // earlier e619250d fix. Guarded by test/session-reply-thread-anchor.test.ts
       // (drives the real sessionReply) and test/reply-target-fallback.test.ts
       // (the resolveSessionReplyTarget × fallbackTurnId composition it relies on).
-      const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
+      const resolvedTurnId = fallbackTurnId(ds, turnId);
+      const target = ds.session.turnReplyContexts !== undefined
+        ? replyContextForSessionTurn({ ...ds.session, scope: ds.scope, chatId: ds.chatId }, resolvedTurnId).target
+        : resolveSessionReplyTarget(ds, resolvedTurnId);
       if (target.mode === 'thread') return replyWithHookPolicy(target.rootMessageId, content, msgType, true, opts?.uuid);
       if (target.mode === 'quote') return replyWithHookPolicy(target.rootMessageId, content, msgType, false, opts?.uuid);
       if (ds.session.rootMessageId && !ds.session.externalTriggerTopicless) {
@@ -7711,6 +7714,21 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     isTrustedHostIpcRequest(req),
   );
 
+  const reportTurnId = isTrustedHostIpcRequest(req)
+    ? (typeof body?.reportTurnId === 'string' ? body.reportTurnId
+      : typeof body?.originTurnId === 'string' ? body.originTurnId : undefined)
+    : ds.managedTurnOrigin?.turnId;
+  if (ds.scope === 'chat' && !reportTurnId) {
+    return jsonRes(res, 409, { ok: false, error: 'report_reply_target_missing' });
+  }
+  let reportReplyTarget;
+  try { reportReplyTarget = replyContextForSessionTurn(ds.session, reportTurnId).target; }
+  catch (error) { return jsonRes(res, 409, { ok: false, error: 'report_reply_target_missing', detail: String(error) }); }
+  if (reportReplyTarget.mode !== 'plain') {
+    const reportRootChatId = await getMessageChatId(ds.larkAppId, reportReplyTarget.rootMessageId);
+    if (reportRootChatId !== ds.chatId) return jsonRes(res, 409, { ok: false, error: 'report_reply_target_chat_mismatch' });
+  }
+
   const stringArray = (value: unknown): string[] => Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string')
       .map(item => item.trim()).filter(Boolean).slice(0, 64)
@@ -7804,6 +7822,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     targetSessionId: ds.session.sessionId,
     targetChatId: ds.session.chatId,
     targetScope: ds.scope ?? ds.session.scope ?? 'thread',
+    targetReplyTarget: reportReplyTarget,
     sourceName: title || 'dispatched subtask',
     issuedAt,
   });

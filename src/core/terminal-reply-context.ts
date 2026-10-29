@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import { frozenReplyContextForTurn, pickTurnReplyTarget } from './reply-target.js';
+import { frozenReplyContextForTurn, pickTurnReplyTarget, pruneFrozenReplyContexts } from './reply-target.js';
 
 /** A native terminal turn has its own delivery identity, but zero-injection
  * sessions keep replying to the latest IM initiator. Capture once at start;
@@ -32,8 +32,6 @@ export function captureTerminalReplyContext(ds: DaemonSession, turnId: string, s
   };
   contexts[turnId] = { ...inherited, target: { ...inherited.target } };
   // Keep the latest original IM anchor even after many terminal-only rounds.
-  for (const stale of Object.keys(contexts).filter(id => id !== sourceId).slice(0, Math.max(0, Object.keys(contexts).length - 256))) {
-    delete contexts[stale];
-  }
+  pruneFrozenReplyContexts(ds, [turnId, ...(sourceId ? [sourceId] : [])]);
   return true;
 }
