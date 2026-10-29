@@ -89,6 +89,14 @@ describe.skipIf(process.platform !== 'linux')('merged modern and surviving legac
     expect(h.scope.send).toHaveBeenCalledTimes(1);
     expect(h.scope.codexAppEngineIdentity).toEqual(h.proof);
   });
+  it('publishes the modern frozen birth token when the legacy cache reuses the same pid', async () => {
+    const h = await fixture(); await h.apply('state', h.state(), h.control());
+    h.scope.codexAppRunnerProcessIdentity = { enginePid: h.proof.pid, engineProcStart: 'stale-legacy-token' };
+    h.scope.publishLocalProcessAttestation(process.pid);
+    expect(h.scope.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      enginePid: h.proof.pid, engineProcStart: h.proof.procStart,
+    }));
+  });
   it('publishes the modern frozen birth token before an old compatibility cache', async () => {
     const h = await fixture(); await h.apply('state', h.state(), h.control());
     h.scope.codexAppRunnerProcessIdentity = { enginePid: process.pid, engineProcStart: 'stale-legacy-token' };
