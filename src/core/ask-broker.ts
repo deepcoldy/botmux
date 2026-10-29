@@ -8,6 +8,7 @@
  * §3 / §6 / §7 / §8 of /tmp/botmux-ask.md.
  */
 
+import { hasAskForm, parseAskFormValues } from './ask-form.js';
 import { randomUUID } from 'node:crypto';
 
 import { logger } from '../utils/logger.js';
@@ -423,6 +424,7 @@ function questionsShape(qs: PendingAsk['questions']): string {
       m: !!q.multiSelect,
       d: q.defaultSelectedKeys,
       input: q.inputMode,
+      field: q.input,
       o: q.options.map((o) => [o.key, o.label]),
     })),
   );
@@ -626,7 +628,7 @@ export function toggleAsk(args: {
   const ask = pending.get(args.askId);
   const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
-  if (!ask) return 'stale';
+  if (!ask || hasAskForm(ask.questions)) return 'stale';
 
   const question = ask.questions[args.questionIndex];
   if (!question) return 'stale';
@@ -676,7 +678,7 @@ export function submitAsk(args: {
   const ask = pending.get(args.askId);
   const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
-  if (!ask) return 'stale';
+  if (!ask || hasAskForm(ask.questions)) return 'stale';
 
   // 构建最终答案数组（严格按 ask.questions 规范化，长度恒 = questions.length）
   let answers: ReadonlyArray<ReadonlyArray<string>>;
@@ -729,6 +731,19 @@ export function submitAsk(args: {
     comment: null,
     timedOut: false,
   });
+  return 'accepted';
+}
+
+/** Atomic form submission shares identity, nonce, deadline and durable settlement. */
+export function submitAskForm(args: { askId: string; nonce: string; by: string; values: unknown }): AskClickOutcome {
+  gcSettled();
+  const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  if (gate !== 'ready') return gate;
+  if (!ask || !hasAskForm(ask.questions)) return 'stale';
+  const values = parseAskFormValues(ask.questions, args.values);
+  if (!values) return 'invalid_form';
+  settle(args.askId, { kind: 'answered', ...values, by: args.by, comment: null, timedOut: false });
   return 'accepted';
 }
 
@@ -1312,6 +1327,8 @@ export function submitAskFromDesktop(args: {
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
+
+  if (hasAskForm(ask.questions)) return 'invalid_form';
 
   // 同 submitAsk：按 ask.questions 规范化，拒绝超长输入、缺失尾部补空集，越界槽不进结果。
   if (args.selections.length > ask.questions.length) return 'stale';

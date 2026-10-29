@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { routeHasNarrowUntrustedAuth } from '../src/core/dashboard-ipc-server.js';
 import {
   authorizeSessionScopedIpc,
   bindSessionScopedIpcIdentity,
@@ -12,6 +13,17 @@ const liveOrigin = {
 };
 
 describe('daemon IPC session-scoped fallback', () => {
+  it('keeps the versioned form endpoint behind the same exact session-auth aperture', () => {
+    expect(routeHasNarrowUntrustedAuth('POST', '/api/asks')).toBe(true);
+    expect(routeHasNarrowUntrustedAuth('POST', '/api/asks/form-v1')).toBe(true);
+    for (const path of ['/api/asks/form-v1/', '/api/asks/form-v1/answer', '/api/asks/form-v10', '/api/asks/answer', '/api/asks/pending']) {
+      expect(routeHasNarrowUntrustedAuth('POST', path)).toBe(false);
+    }
+    for (const method of ['GET', 'PUT', 'PATCH', 'DELETE']) {
+      expect(routeHasNarrowUntrustedAuth(method, '/api/asks/form-v1')).toBe(false);
+    }
+  });
+
   it('accepts only the exact ordinary-session live capability', () => {
     expect(authorizeSessionScopedIpc({
       trustedHost: false,
@@ -140,7 +152,10 @@ describe('daemon session-scoped IPC route wiring', () => {
   // `if (!isTrustedHostIpcRequest(req))` 鉴权块里。路由处理器内联在 daemon.ts 入口模块，没有行为 seam；
   // 绑定函数本身由上方 'daemon IPC session-scoped fallback' 行为用例覆盖。
   it('binds ask and hook identity from the authenticated session before any observable side effect', () => {
-    const ask = route('/api/asks');
+    // Both versioned and legacy endpoints reuse the same authenticated handler.
+    expect(route('/api/asks')).toContain("'/api/asks', handleAskRequest");
+    expect(route('/api/asks/form-v1')).toContain("'/api/asks/form-v1', handleAskRequest");
+    const ask = source.slice(source.indexOf('const handleAskRequest:'), source.indexOf("ipcRoute('POST', '/api/asks'"));
     const askBindAt = ask.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
     const authAt = ask.indexOf('if (!isTrustedHostIpcRequest(req)) {');
     expect(askBindAt).toBeGreaterThan(-1);

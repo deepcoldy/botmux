@@ -2,8 +2,10 @@ import { recordDeploymentContinuation, cancelDeploymentContinuation } from './se
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
-import { createBotAdminUnionsPublisher } from './services/bot-admin-unions-store.js';
+import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
+import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
+import { createBoardChatProbes, sameOwnerAs } from './services/board-chat-probes.js';
 import { resolveDashboardOrigin } from './core/workbench-link.js';
 import { getAttachmentsDir } from './core/attachment-path.js';
 import { scheduleTimeZone } from './utils/timezone.js';
@@ -95,6 +97,8 @@ import {
   registerBot,
   getBot,
   getAllBots,
+  getBotClient,
+  createDetachedLarkClient,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
   getBotBrand,
@@ -571,6 +575,7 @@ import {
   durablePrimaryExistingTurnDisposition,
 } from './services/durable-primary-turn-admission.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
+import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
 import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
@@ -4255,6 +4260,8 @@ function delegatedScheduleRuntimeDeps(appId: string) {
     runEnabled: schedulePolicy?.runEnabled !== false,
     hostRunScopes: schedulePolicy?.runScopes ?? [],
     triggerUserAuthTools: triggerPolicy?.enabled === true ? triggerPolicy.tools : [],
+    validateBotGrant: (record: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord) =>
+      assertScheduleBotGrantActive(record, readGlobalConfig().scheduleDelegation),
     adminOpenIds: getDashboardAdminOpenIds(appId),
     resolveTargetOpenId: async (unionId: string) => {
       const resolved = await resolveTargetAppOpenId(appId, unionId);
@@ -7915,9 +7922,32 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const turnId = sourceTurnId;
     const active = ds.activeInteractiveTurn;
     const delegationPolicy = readGlobalConfig().scheduleDelegation;
+    const adminOpenIds = getDashboardAdminOpenIds(ds.larkAppId);
+    const directScheduleSource = !!active && active.turnId === turnId
+      && active.caller.senderType === 'user' && !active.caller.source
+      && !!active.caller.requestUserOpenId
+      && adminOpenIds.includes(active.caller.requestUserOpenId);
+    const dispatchCaller = !turnId ? undefined
+      : ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
+        : active?.turnId === turnId ? active.caller
+          : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
+    // A host bot grant stands in only for turns that no human administrator
+    // drives. An administrator's own dispatch (live, or restored from the reply
+    // registry) keeps their identity, their tool delegation and the ordinary
+    // schedule:create rules, exactly as if no grant matched. Every use of the
+    // grant below goes through this one value, so the rule cannot drift apart.
+    const humanAdminTurn = directScheduleSource || (dispatchCaller?.senderType === 'user'
+      && !dispatchCaller.source && dispatchCaller.requestLarkAppId === ds.larkAppId
+      && !!dispatchCaller.requestUserOpenId && adminOpenIds.includes(dispatchCaller.requestUserOpenId));
+    // The grant covers dispatches made in a granted chat into a granted chat.
+    // Someone who reaches the source bot elsewhere (a p2p chat, another group)
+    // does not get it by naming a granted chat with --chat-id.
+    const matchedGrant = humanAdminTurn ? undefined
+      : matchingScheduleBotGrant(delegationPolicy, ds.larkAppId, targetAppIds, chatId);
+    const botGrant = matchedGrant?.chatIds.includes(ds.chatId) ? matchedGrant : undefined;
     const scheduleCreateDefaulted = body.suppressScheduleCreate !== true
       && body.delegateScheduleCreate !== true
-      && delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true;
+      && (delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true || !!botGrant);
     const scheduleCreateRequested = body.suppressScheduleCreate !== true
       && (body.delegateScheduleCreate === true || scheduleCreateDefaulted);
     if (scheduleCreateRequested && delegationPolicy?.createEnabled !== true) {
@@ -7925,7 +7955,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     }
     const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
     const configuredScheduleRunScopes = delegationPolicy?.runScopes ?? [];
-    if (scheduleCreateRequested
+    if (scheduleCreateRequested && !botGrant
       && configuredScheduleRunScopes.some(scope => !tools.includes(scope))) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_source_run_scope_unavailable' });
     }
@@ -7937,22 +7967,21 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     if (needsDelegation && !turnId) {
       return jsonRes(res, 403, { ok: false, error: 'dispatch_turn_unproven' });
     }
-    const directScheduleSource = !!active && active.turnId === turnId
-      && active.caller.senderType === 'user' && !active.caller.source
-      && !!active.caller.requestUserOpenId
-      && getDashboardAdminOpenIds(ds.larkAppId).includes(active.caller.requestUserOpenId);
-    if (scheduleCreateRequested && !directScheduleSource) {
+    if (scheduleCreateRequested && !directScheduleSource && !botGrant) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_source_operator_denied' });
     }
-    const inherited = needsDelegation && turnId ? await dispatchUserForTurn(ds, turnId) : undefined;
+    // The grant replaces the signed authority only when this dispatch asks for
+    // schedule:create; `--no-delegate schedule:create` keeps the caller's own
+    // immediate tool delegation.
+    const serviceGrant = scheduleCreateRequested ? botGrant : undefined;
+    const inherited = needsDelegation && turnId && !serviceGrant
+      ? await dispatchUserForTurn(ds, turnId) : undefined;
     if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return jsonRes(res, 403, { ok: false, error: 'delegated_caller_not_allowed' });
     }
-    const authority = needsDelegation && turnId ? await authorityForDispatch({
+    let authority = needsDelegation && turnId && !serviceGrant ? await authorityForDispatch({
       sourceAppId: ds.larkAppId,
-      caller: ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
-        : active?.turnId === turnId ? active.caller
-          : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
+      caller: dispatchCaller,
       inherited: inherited?.authority,
       tools,
       ...(scheduleCreateRequested ? {
@@ -7965,6 +7994,15 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       } : {}),
       resolveUnionId: resolveUnionIdFromOpenId,
     }) : undefined;
+    if (serviceGrant) {
+      const sponsor = await resolveTargetAppOpenId(ds.larkAppId, serviceGrant.controllerUnionId);
+      if (sponsor.status !== 'resolved' || !getDashboardAdminOpenIds(ds.larkAppId).includes(sponsor.openId)) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_controller_denied' });
+      }
+      // This service grant conveys scheduling only, never the sponsor's CLI credentials.
+      authority = botScheduleAuthority({ grant: serviceGrant, sourceOpenId: sponsor.openId,
+        targetAppIds, chatId, selfManage: delegationPolicy?.selfManageEnabled === true });
+    }
     if (scheduleCreateRequested
       && (!authority || scheduleCreateCapabilities(authority).length === 0)) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_direct_human_required' });
@@ -7986,11 +8024,17 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           }, send,
         })
       : await send();
-    if (scheduleCreateDefaulted) {
+    if (scheduleCreateDefaulted || serviceGrant) {
+      // With a service grant the signer is the sponsor, not whoever drove the
+      // turn; record both so the task can be traced back to its real trigger.
+      const trigger = dispatchCaller?.source ?? dispatchCaller?.senderType ?? 'unknown';
       logger.info(
-        `[schedule-delegation:audit] auto-attached schedule:create source=${ds.larkAppId} `
-        + `turn=${turnId ?? 'unknown'} chat=${chatId} targets=${targetAppIds.join(',')} `
-        + `runScopes=${configuredScheduleRunScopes.join(',') || 'none'} `
+        `[schedule-delegation:audit] ${scheduleCreateDefaulted ? 'auto-attached' : 'attached'} schedule:create `
+        + `source=${ds.larkAppId} turn=${turnId ?? 'unknown'} `
+        + `trigger=${trigger}${dispatchCaller?.requestUserOpenId ? `:${dispatchCaller.requestUserOpenId}` : ''} `
+        + `grant=${serviceGrant?.id ?? 'none'} signer=${authority?.openId ?? 'none'} `
+        + `chat=${chatId} targets=${targetAppIds.join(',')} `
+        + `runScopes=${serviceGrant ? 'none' : configuredScheduleRunScopes.join(',') || 'none'} `
         + `selfManage=${delegationPolicy?.selfManageEnabled === true}`,
       );
     }
@@ -8320,6 +8364,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let credentialOpenId: string | undefined;
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
+  let botGrantHolds: (() => boolean) | undefined;
   const caller = scheduleCallerForTurn(ds, turnId);
   const directHuman = caller?.senderType === 'user'
     && !caller.source && caller.requestLarkAppId === ds.larkAppId;
@@ -8371,6 +8416,18 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_position_denied' });
       }
       const targetPolicy = readGlobalConfig().scheduleDelegation;
+      if (capability.botGrantId) {
+        // Read the policy afresh each time: it is checked again after the
+        // identity lookups below, so a grant revoked meanwhile commits nothing.
+        botGrantHolds = () => {
+          const grant = matchingScheduleBotGrant(readGlobalConfig().scheduleDelegation,
+            delegation.sourceAppId, [ds.larkAppId], ds.chatId);
+          return !!grant && grant.id === capability.botGrantId
+            && grant.controllerUnionId === delegation.authority.unionId
+            && !capability.allowedRunScopes.length && !delegation.authority.tools.length;
+        };
+        if (!botGrantHolds()) return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
+      }
       const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
       if (!targetTriggerPolicy?.enabled
         || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
@@ -8392,7 +8449,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       credentialOpenId = delegation.authority.openId;
       persistentRunScopes = [...capability.allowedRunScopes];
       selfManage = capability.allowSelfManage === true;
-      grantId = `dispatch:${delegation.deliveryId}:${ds.larkAppId}`;
+      grantId = capability.botGrantId
+        ? `bot-policy:${delegation.sourceAppId}:${capability.botGrantId}:${delegation.deliveryId}:${ds.larkAppId}`
+        : `dispatch:${delegation.deliveryId}:${ds.larkAppId}`;
       sourceMessageId = delegation.messageId!;
       sourceSessionId = delegation.sourceSessionId;
     }
@@ -8407,6 +8466,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation
       || ds.managedTurnOrigin.capability !== capability) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_delegation_turn_changed' });
+    }
+    if (botGrantHolds && !botGrantHolds()) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
     }
     const baseParams = {
       name: task.name.trim(),
@@ -8581,10 +8643,23 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     }
     providerActorAdmin = true;
   }
+  // Topic cleanup belongs to the bot service authority, so only a bot turn
+  // uses it. People keep the ordinary rules: an administrator manages the task
+  // through the current-human path above, anyone else in the topic is refused.
+  const botPolicyTopicManager = !!ds && caller?.senderType === 'bot'
+    && caller.requestLarkAppId === ds.larkAppId && authority?.kind === 'delegated'
+    && authority.grantId?.startsWith('bot-policy:') === true && authority.selfManage
+    && authority.task.chatId === ds.chatId && !!authority.task.rootMessageId
+    // The topic of this turn, computed exactly as the delegated-add route did
+    // when it stored the task's rootMessageId (not the session's first anchor,
+    // which in a chat-scope session is just its first message).
+    && authority.task.rootMessageId === (pickTurnReplyTarget(ds.session, turnId)?.rootMessageId
+      ?? ((ds.scope ?? ds.session.scope) === 'thread' ? ds.session.rootMessageId : undefined))
+    && (action === 'pause' || action === 'remove');
   // A scheduled turn may close its own task: pause/remove, or `done` for an
   // until-done task reporting that the awaited work is finished.
-  const potentialScheduledSelfManager = !!ds && scheduledTaskId === id
-    && (action === 'pause' || action === 'remove' || action === 'done');
+  const potentialScheduledSelfManager = (!!ds && scheduledTaskId === id
+    && (action === 'pause' || action === 'remove' || action === 'done')) || botPolicyTopicManager;
   if (!hostAdmin && !currentHumanAdmin && !providerActorAdmin && !potentialScheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
   }
@@ -8599,10 +8674,15 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'schedule_self_manage_denied' });
   }
   if (scheduledSelfManager) {
+    const cleanupTurnId = ds!.managedTurnOrigin?.turnId;
+    const cleanupCapability = ds!.managedTurnOrigin?.capability;
+    const cleanupGeneration = ds!.workerGeneration;
     try {
       await authorizeScheduleSelfManage(authority, {
         selfManageEnabled: readGlobalConfig().scheduleDelegation?.selfManageEnabled === true,
+        validateBotGrant: record => assertScheduleBotGrantActive(record, readGlobalConfig().scheduleDelegation),
         targetChatId: ds!.chatId,
+        allowPaused: botPolicyTopicManager,
         adminOpenIds: getDashboardAdminOpenIds(appId),
         resolveTargetOpenId: async unionId => {
           const resolved = await resolveTargetAppOpenId(appId, unionId);
@@ -8610,6 +8690,11 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
         },
         listChatMemberOpenIds: chatId => listChatMemberOpenIds(appId, chatId),
       });
+      if (botPolicyTopicManager && (ds!.managedTurnOrigin?.turnId !== cleanupTurnId
+        || ds!.managedTurnOrigin?.capability !== cleanupCapability
+        || ds!.workerGeneration !== cleanupGeneration)) {
+        return jsonRes(res, 409, { ok: false, error: 'schedule_mutation_turn_changed' });
+      }
     } catch (error) {
       return jsonRes(res, 403, {
         ok: false,
@@ -9112,7 +9197,7 @@ async function notifyAsyncAsk(ds: DaemonSession, root: string | null, turnId: st
   } catch (error) { logger.warn(`[ask:${ds.session.sessionId}] could not show async question notice: ${String(error)}`); }
 }
 
-ipcRoute('POST', '/api/asks', async (req, res) => {
+const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   let raw: unknown;
   try {
     raw = await readJsonBody<unknown>(req);
@@ -9283,8 +9368,8 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
-    ...((documentDelivery?.openId ?? asyncCaller)
-      ? { answererOpenId: documentDelivery?.openId ?? asyncCaller } : {}),
+    ...((documentDelivery?.openId ?? asyncCaller ?? boundAsk.answererOpenId)
+      ? { answererOpenId: documentDelivery?.openId ?? asyncCaller ?? boundAsk.answererOpenId } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the
     // authenticated session's FROZEN backend, not the client's origin string. A
     // PTY-backed session dies with the daemon, so its ask must NOT persist; only
@@ -9426,7 +9511,9 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   }
 
   return jsonRes(res, 200, result);
-});
+};
+ipcRoute('POST', '/api/asks', handleAskRequest);
+ipcRoute('POST', '/api/asks/form-v1', handleAskRequest);
 
 // ─── attention IPC route (internal: set needs-you state) ─────────────────────
 //
@@ -33284,6 +33371,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   scheduler.startScheduler();
 
   // 决策看板：本 daemon 是自己这张看板唯一的写入方。存储懒打开，没开管家的 bot 不建库。
+  // 写群关联时核实群：先用管家自己的凭据，查不到再用 bots.json 里本机其他 bot 的凭据（只在内存里建客户端）。
+  const boardChatProbes = createBoardChatProbes({
+    self: { larkAppId: cfg.larkAppId, brand: cfg.brand },
+    ownClient: () => getBotClient(cfg.larkAppId),
+    configs: () => loadBotConfigsCached(),
+    // 只借同 owner 的 bot；管家自己的管理员名单按此刻的配置读（改过 allowedUsers 后快照会重新发布）。
+    sameOwner: candidate => sameOwnerAs(
+      { larkAppId: cfg.larkAppId, allowedUsers: getBot(cfg.larkAppId).config.allowedUsers,
+        trustSameOwnerBots: getBot(cfg.larkAppId).config.trustSameOwnerBots },
+      (appId, allowedUsers) => readBotAdminUnions(config.session.dataDir, appId, allowedUsers),
+    )(candidate),
+    createClient: createDetachedLarkClient,
+  });
   const decisionBoard = new DecisionBoardService({
     dataDir: config.session.dataDir,
     larkAppId: () => cfg.larkAppId,
@@ -33313,6 +33413,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
     })),
     log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
+    lookupChat: (chatId, opts) => lookupChatAcrossBots(chatId, boardChatProbes(), { deadline: opts.deadline }),
   });
   setDecisionBoardService(decisionBoard);
   // 补投重启前没送达的批次。等会话恢复与 worker 就绪的初始阶段过去再投，避免和恢复抢同一个会话。

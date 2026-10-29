@@ -8109,6 +8109,22 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     });
   });
 
+  it('keeps a scheduled creator turn behind any active interactive turn', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(
+      ds,
+      'hourly task prompt',
+      SCHEDULED_TURN,
+      { trustedCaller: CREATOR_IDENTITY as TrustedCaller },
+    )).toBe(true);
+
+    expect(sentMessages(worker).at(-1)).toMatchObject({
+      turnId: SCHEDULED_TURN,
+      trustedCaller: CREATOR_IDENTITY,
+      queueAfterActiveTurn: true,
+    });
+  });
+
   it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {
     const { ds, worker, sessionReply } = await bootClaudeSession();
     armSilentScheduledTurn(ds, SCHEDULED_TURN);

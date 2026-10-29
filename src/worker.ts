@@ -31,7 +31,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, publishActiveTurn, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
+import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
@@ -80,6 +80,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
+import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
@@ -519,6 +520,7 @@ import {
 import {
   prepareScratchSandbox,
   attachScratchSession,
+  scratchSubmountOverflowNotice,
   scratchHostView,
   type ScratchStorage,
 } from './adapters/backend/scratch-sandbox.js';
@@ -2095,6 +2097,9 @@ let tmuxRestartTimer: NodeJS.Timeout | null = null;
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
  *  of the same warning. */
 let resumeFallbackNotified = false;
+/** Guard: the scratch "submounts over the overlay limit" notice is sent once
+ *  per worker, not on every CLI respawn. */
+let scratchSubmountOverflowNotified = false;
 /** True once the claude-family transcript bridge has evidence that the CLI
  *  session produced user-visible history. Two setters, covering every bridge
  *  mode:
@@ -5725,6 +5730,48 @@ let codexAppCompletionAwaitingFinal = false;
 let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
+let codexAppEngineIdentity: CodexAppEngineIdentity | undefined;
+
+function clearCodexAppEngineIdentity(): void {
+  if (!codexAppEngineIdentity) return;
+  codexAppEngineIdentity = undefined;
+  publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
+}
+
+/** A persistent backend may authenticate its runner before it resolves the
+ * pane's host PID. Keep this signed state pending, without ACK/readiness, under
+ * the existing absolute proof deadline. A retired connection cannot publish. */
+async function waitForCodexAppEngineRoot(
+  ownerSocket = codexAppControlActiveSocket,
+  ownerChannel = codexAppControlChannelId,
+  ownerEpoch = codexAppControlEndpointEpoch,
+): Promise<{ pid: number; assertCurrent: () => void }> {
+  let ownerBackend = backend;
+  const current = () => !!(ownerSocket && !ownerSocket.destroyed && !codexAppControlFatal
+    && codexAppControlProven && (!ownerBackend || backend === ownerBackend)
+    && codexAppControlActiveSocket === ownerSocket && codexAppControlChannelId === ownerChannel
+    && codexAppControlEndpointEpoch === ownerEpoch);
+  const cancelled = () => new CodexAppEngineRootWaitCancelled(ownerSocket, ownerBackend, ownerChannel);
+  const assertCurrent = () => { if (!current()) throw cancelled(); };
+  assertCurrent();
+  codexAppSignedStateObserved = false;
+  codexAppInputReady = false;
+  codexAppReadyAuthority.beginWork();
+  isPromptReady = false;
+  idleDetector?.reset();
+  if (!codexAppProofDeadline.armed) {
+    codexAppProofDeadline.arm(() => {
+      failCodexAppControlGeneration('Codex App backend did not resolve its process before the proof deadline');
+    });
+  }
+  while (current()) {
+    ownerBackend ??= backend;
+    const pid = ownerBackend?.getChildPid?.();
+    if (pid !== null && pid !== undefined) return { pid, assertCurrent };
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+  }
+  throw cancelled();
+}
 /** Authentication proves identity, not app-server readiness. These become true
  * only after the active generation publishes a valid signed state marker. */
 let codexAppSignedStateObserved = false;
@@ -5819,6 +5866,7 @@ function stopCodexAppControlChannel(
   opts: { preserveDispatchRecovery?: boolean } = {},
 ): void {
   codexAppControlStopping = true;
+  clearCodexAppEngineIdentity();
   // Attribution belongs to exactly one worker/control generation.  A fresh or
   // replacement worker may recover only the daemon-frozen active identity
   // after the old runner proves a warm reattach; stale queued entries must not
@@ -5953,6 +6001,7 @@ function activateCodexAppControlConnection(
     return;
   }
   codexAppControlStateValue = active;
+  clearCodexAppEngineIdentity();
   codexAppControlProven = true;
   codexAppSignedStateObserved = false;
   codexAppInputReady = false;
@@ -6082,31 +6131,44 @@ async function handleCodexAppControlLine(
   // worker effects is single-flight by signed generation/sequence until the
   // replay window below is committed.
   if (finalResult.status === 'accepted') return;
-  const application = codexAppControlRecordApplicationGate.run(
-    identity.generation,
-    record.seq,
-    () => finalResult.status === 'not-final'
+  const applyRecord = () => finalResult.status === 'not-final'
       ? handleTrustedCodexAppMarker(
           record.kind,
           record.payload,
-          { generation: identity.generation, seq: record.seq },
+          { generation: identity.generation, seq: record.seq, socket: connection.socket,
+            channelId: connection.channelId, epoch: connection.epoch },
         )
       : handleTrustedCodexAppMarker(
           'final',
           finalResult.payload,
-          { generation: identity.generation, seq: record.seq },
-        ),
-  );
+          { generation: identity.generation, seq: record.seq, socket: connection.socket,
+            channelId: connection.channelId, epoch: connection.epoch },
+        );
+  let application = codexAppControlRecordApplicationGate.run(identity.generation, record.seq, applyRecord);
   let applied: boolean;
-  try {
-    applied = await application;
-  } catch (err) {
-    codexAppControlRecordApplicationGate.release(
-      identity.generation,
-      record.seq,
-      application,
-    );
-    throw err;
+  for (;;) {
+    try {
+      applied = await application;
+      break;
+    } catch (err) {
+      codexAppControlRecordApplicationGate.release(identity.generation, record.seq, application);
+      // A fresh authenticated connection may share the old connection's
+      // in-flight sequence. Retry its cancelled local PID wait here; a genuine
+      // semantic failure must still reject the marker without an ACK.
+      if (err instanceof CodexAppEngineRootWaitCancelled && !codexAppControlFatal
+        && err.ownerSocket !== connection.socket
+        // An unbound wait may follow the backend's FIRST installation, while
+        // an already-owned backend cannot be replaced under its old frame.
+        && (err.ownerBackend === null || err.ownerBackend === backend)
+        && err.ownerChannel === codexAppControlChannelId
+        && codexAppControlProven && connection.socket === codexAppControlActiveSocket
+        && !connection.socket.destroyed && connection.channelId === codexAppControlChannelId
+        && connection.epoch === codexAppControlEndpointEpoch) {
+        application = codexAppControlRecordApplicationGate.run(identity.generation, record.seq, applyRecord);
+        continue;
+      }
+      throw err;
+    }
   }
   if (!applied) {
     codexAppControlRecordApplicationGate.release(
@@ -6220,6 +6282,7 @@ function acceptCodexAppControlSocket(
     const wasActive = codexAppControlActiveSocket === socket;
     if (wasActive) {
       codexAppControlActiveSocket = undefined;
+      clearCodexAppEngineIdentity();
       codexAppControlProven = false;
       codexAppSignedStateObserved = false;
       codexAppInputReady = false;
@@ -15254,7 +15317,7 @@ async function retireCodexAppDispatchForDurableReplay(
 async function handleTrustedCodexAppMarker(
   kind: string,
   payload: Record<string, unknown>,
-  control?: { generation: string; seq: number },
+  control?: { generation: string; seq: number; socket?: Socket; channelId?: number; epoch?: string },
 ): Promise<boolean> {
   if (kind === 'effort_result' && isCodexAppCliId(lastInitConfig?.cliId)) {
     if (typeof payload.requestId !== 'string'
@@ -15350,6 +15413,44 @@ async function handleTrustedCodexAppMarker(
         'Codex App runner published signed state without boolean acceptingInput',
       );
       return false;
+    }
+    if (process.platform === 'linux' && payload.appServerProcess !== undefined) {
+      const claim = parseCodexAppEngineIdentityClaim(payload.appServerProcess);
+      if (!claim) {
+        failCodexAppControlGeneration('Codex App runner published an invalid app-server process claim');
+        return false;
+      }
+      let rootPid = backend?.getChildPid?.();
+      if (rootPid === null || rootPid === undefined) {
+        const resolved = await waitForCodexAppEngineRoot(control?.socket, control?.channelId, control?.epoch);
+        resolved.assertCurrent();
+        rootPid = resolved.pid;
+      }
+      const engine = verifyCodexAppEngineIdentity(
+        claim,
+        rootPid,
+      );
+      const previousEngine = codexAppEngineIdentity;
+      const changed = engine && previousEngine
+        && (previousEngine.pid !== engine.pid || previousEngine.procStart !== engine.procStart);
+      // The runner reconnects an idle app-server on the same control socket.
+      // A replacement is legitimate only after the attested old process died;
+      // keep the frozen birth token so PID reuse never counts as still alive.
+      if (!engine || (changed && previousEngine
+        && readProcessStartIdentity(previousEngine.pid) === previousEngine.procStart)) {
+        failCodexAppControlGeneration('Codex App runner published an invalid or changed app-server process');
+        return false;
+      }
+      if (!codexAppEngineIdentity || changed) {
+        codexAppEngineIdentity = engine;
+        publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
+      }
+    } else if (process.platform === 'linux' && codexAppEngineIdentity) {
+      if (readProcessStartIdentity(codexAppEngineIdentity.pid) === codexAppEngineIdentity.procStart) {
+        failCodexAppControlGeneration('Codex App runner dropped its attested app-server process');
+        return false;
+      }
+      clearCodexAppEngineIdentity();
     }
     if (readiness === 'waiting') {
       if (typeof payload.busy !== 'boolean') {
@@ -21125,6 +21226,7 @@ async function spawnCli(
   }
   const backendIsolationGate = backendSandboxCompatibilityError({
     backendType: effectiveBackendType,
+    cliId: cfg.cliId,
     fileSandboxRequested: sandboxRequested,
     ...(effectiveBackendType === 'mojo'
       ? { mojoConfig: (riffBackendConfig ?? {}) as EffectiveMojoConfig }
@@ -22504,7 +22606,16 @@ async function spawnCli(
   if (!boundLark && process.env.SESSION_DATA_DIR) {
     cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
   }
-  const identityDataDir = boundLark ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!) : process.env.SESSION_DATA_DIR;
+  // A bwrap sandbox only mounts canonical paths: on a symlinked home/data root
+  // (`/home/u` -> `/data00/home/u`) a lexical helper path (GIT_ASKPASS, git
+  // credential helper, ZDOTDIR, ...) does not exist inside. The lark-bound
+  // branch already resolves the root; do the same for the plain trigger-user
+  // branch, sandbox only so unsandboxed sessions keep their exact env.
+  const identityDataDir = boundLark
+    ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!)
+    : process.env.SESSION_DATA_DIR && sandboxRequested
+      ? canonicalPathNearest(process.env.SESSION_DATA_DIR)
+      : process.env.SESSION_DATA_DIR;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
   if (cfg.cliId === 'zcode' && !willReattachPersistent) {
     if (sandboxRequested) throw new Error('ZCode provider bridge is not yet validated in the OS file sandbox');
@@ -22765,9 +22876,10 @@ async function spawnCli(
     childIdentityModel,
     childIdentityModel === 'proven'
       ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
-      : undefined);
+      : undefined,
+    { canonicalPaths: sandboxRequested });
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
-    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     // Say plainly how protected the token store actually is. Without the file
     // sandbox the agent runs as the same OS user as botmux and can read every
@@ -23951,6 +24063,10 @@ async function spawnCli(
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, scratch full-root COW, ${storage}): merged=${sbx.mergedHostPath} outbox=${sbx.outbox}`);
+      if (sbx.submountOverflow && !scratchSubmountOverflowNotified) {
+        scratchSubmountOverflowNotified = true;
+        send({ type: 'user_notify', message: scratchSubmountOverflowNotice(sbx.submountOverflow), turnId: currentBotmuxTurnId });
+      }
     }
     // Host-side reads of CLI-written files (transcript bridge, rollouts, cwd
     // products) resolve through the scratch mappings for this spawn.
@@ -28929,7 +29045,10 @@ function publishLocalProcessAttestation(
   enginePid = codexRpcEngine?.appServerPid,
 ): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
-  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  // Keep the signed birth token frozen. Re-reading it for a cached PID would
+  // silently authorize a replacement process after PID reuse.
+  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : codexAppEngineIdentity?.procStart;
+  enginePid ??= codexAppEngineIdentity?.pid;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,

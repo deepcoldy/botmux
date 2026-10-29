@@ -66,6 +66,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     writeHostOverloadAlertConfig: vi.fn((config) => {
       storedGlobal.hostOverloadAlert = config;
     }),
+    writeScheduleBotGrantConfig: vi.fn(),
     mergeMaintenanceConfig: vi.fn((patch) => {
       Object.assign(storedMaintenance, patch);
       return storedMaintenance;
@@ -1130,6 +1131,73 @@ describe('applySettingsWrite — IO surface', () => {
     const deps = makeDeps();
     await applySettingsWrite({ publicReadOnly: true }, deps);
     expect(deps.readGlobalConfig).not.toHaveBeenCalled(); // only called for autoUpdate cross-check
+  });
+});
+
+describe('applySettingsWrite — scheduleBotGrants', () => {
+  const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_a', 'cli_b'],
+    chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+
+  it('writes the switches and the whole grant list through the bot-grant writer', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleBotGrants: {
+      createEnabled: true, selfManageEnabled: false, grants: [grant], baseGrants: [] } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({
+      createEnabled: true, selfManageEnabled: false, botGrants: [grant] });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('clears the list with an empty array', async () => {
+    const deps = makeDeps();
+    expect((await applySettingsWrite({ scheduleBotGrants: { grants: [], baseGrants: [] } }, deps)).ok).toBe(true);
+    expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({ botGrants: [] });
+  });
+
+  it.each([
+    [{ createEnabled: 'yes' }, 'invalid_scheduleBotGrants_createEnabled'],
+    [{ selfManageEnabled: 1 }, 'invalid_scheduleBotGrants_selfManageEnabled'],
+    [{}, 'invalid_scheduleBotGrants'],
+    [{ grants: 'team' }, 'invalid_scheduleBotGrants_grant'],
+    // An app-scoped open_id is never a cross-app controller identity.
+    [{ grants: [{ ...grant, controllerUnionId: 'ou_admin' }] }, 'invalid_scheduleBotGrants_grant'],
+    [{ grants: [grant, { ...grant, sourceAppId: 'cli_other' }] }, 'scheduleBotGrants_duplicate_id'],
+    // Shares source, chat and target cli_b with `team`: matching would be ambiguous.
+    [{ grants: [grant, { ...grant, id: 'other', targetAppIds: ['cli_b', 'cli_c'] }] }, 'scheduleBotGrants_overlap'],
+  ])('refuses %j without writing anything', async (scheduleBotGrants, error) => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ scheduleBotGrants }, deps)).toEqual({ ok: false, error });
+    expect(deps.writeScheduleBotGrantConfig).not.toHaveBeenCalled();
+  });
+
+  it('accepts grants that share a source but differ in chat or target', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleBotGrants: { baseGrants: [], grants: [grant,
+      { ...grant, id: 'other-chat', chatIds: ['oc_other'] },
+      { ...grant, id: 'other-target', targetAppIds: ['cli_c'] }] } }, deps);
+    expect(r.ok).toBe(true);
+  });
+
+  // A page that loaded before another tab (or a hand edit) revoked a grant
+  // must not write that grant back with its stale copy of the list.
+  it('refuses a list edited from a copy that is no longer what is on disk', async () => {
+    const other = { ...grant, id: 'other', chatIds: ['oc_other'] };
+    const deps = makeDeps({ readGlobalConfig: vi.fn(() => ({ scheduleDelegation: { botGrants: [grant] } })) });
+    for (const baseGrants of [[grant, other], [], undefined, ['team']]) {
+      expect(await applySettingsWrite({ scheduleBotGrants: { grants: [grant, other], baseGrants } }, deps))
+        .toEqual({ ok: false, error: 'scheduleBotGrants_stale' });
+    }
+    expect(deps.writeScheduleBotGrantConfig).not.toHaveBeenCalled();
+    // The same edit made on the current list goes through; the switches need no base.
+    expect((await applySettingsWrite({ scheduleBotGrants: { grants: [grant, other], baseGrants: [grant] } }, deps)).ok).toBe(true);
+    expect((await applySettingsWrite({ scheduleBotGrants: { createEnabled: false } }, deps)).ok).toBe(true);
+  });
+
+  it('does not write the grants when another field of the same request is invalid', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleBotGrants: { grants: [grant], baseGrants: [] }, repoPickerMode: 'bad' }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_repoPickerMode' });
+    expect(deps.writeScheduleBotGrantConfig).not.toHaveBeenCalled();
   });
 });
 

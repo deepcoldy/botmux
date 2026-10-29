@@ -1134,7 +1134,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // exceptions: a receiver that learned another session id could otherwise
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
-  if (method === 'POST' && pathname === '/api/asks') return true;
+  if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/form-v1')) return true;
   // The dsh-tui wrapper plugin's structured end-of-turn report (`botmux
   // __turn-idle-v2`) runs INSIDE the CLI process, so it cannot read the host
   // secret either. The handler verifies this session's rotating per-turn

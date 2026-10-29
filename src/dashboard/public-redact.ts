@@ -333,11 +333,14 @@ export function redactSessionEventForPublic(type: string, body: unknown): unknow
 }
 
 /** 匿名只读面板不展示外部 Codex 活动、目标 Bot 或投递运行态,也不展示过载
- *  告警的目标 Bot / 收件人提示。 */
+ *  告警的目标 Bot / 收件人提示，以及机器人调度授权（群、控制管理员身份）。 */
 export function redactSettingsForPublic(settings: unknown): unknown {
   if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return settings;
   const source = settings as Record<string, unknown>;
   // httpProxy may embed `user:pass@` credentials.
-  const { codexNotifier: _privateNotifier, hostOverloadAlert: _privateOverload, httpProxy: _privateProxy, ...publicSettings } = source;
+  const {
+    codexNotifier: _privateNotifier, hostOverloadAlert: _privateOverload, httpProxy: _privateProxy,
+    scheduleBotGrants: _privateScheduleGrants, ...publicSettings
+  } = source;
   return publicSettings;
 }
