@@ -128,6 +128,28 @@ describe('listChatBotMembers', () => {
     expect(bots.some(b => b.larkAppId === 'cli_self')).toBe(true);
   });
 
+  it('keeps valid configured identities after malformed registry rows', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      null,
+      42,
+      'x',
+      { larkAppId: 'cli_bad_number', botName: 42 },
+      { larkAppId: 'cli_bad_object', botName: {} },
+      { larkAppId: 'cli_bad_boolean', botName: true },
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(bots).toEqual(expect.arrayContaining([
+      expect.objectContaining({ larkAppId: 'cli_self', openId: 'ou_self', displayName: 'BotSelf' }),
+      expect.objectContaining({ larkAppId: 'cli_peer', openId: 'ou_peer', displayName: 'BotPeer' }),
+    ]));
+  });
+
   it('strict current-members helper calls live /members/bots even when discovery fallback is disabled', async () => {
     state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
     state.listBotsApiEnabled = false;

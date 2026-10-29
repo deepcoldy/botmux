@@ -14,6 +14,7 @@
  */
 
 import type { ChatMode } from '../services/groups-store.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from '../services/bots-info-shape.js';
 
 export interface BotConfigForResolve {
   larkAppId: string;
@@ -111,8 +112,10 @@ export function resolveChatMode(raw: string | undefined): ResolvedChatMode {
 export function resolveBotRefs(
   refs: string[],
   botConfigs: BotConfigForResolve[],
-  botInfo: BotInfoForResolve[],
+  botInfo: unknown[],
 ): ResolvedBots {
+  const safeBotInfo: BotInfoForResolve[] = botsInfoObjectEntries(botInfo)
+    .filter(isBotsInfoRouteEntry);
   const out: string[] = [];
   const seen = new Set<string>();
   const invalid: string[] = [];
@@ -137,7 +140,7 @@ export function resolveBotRefs(
       //    set of name-matched entries.
       const lower = trimmed.toLowerCase();
       const nameMatchSet = new Set(
-        botInfo.filter(b => b.botName?.toLowerCase() === lower).map(b => b.larkAppId),
+        safeBotInfo.filter(b => b.botName?.toLowerCase() === lower).map(b => b.larkAppId),
       );
       const byNameAll = botConfigs.filter(c => nameMatchSet.has(c.larkAppId));
       if (byNameAll.length > 0) {

@@ -1,3 +1,5 @@
+import { botsInfoObjectEntries, isBotsInfoNameEntry } from '../services/bots-info-shape.js';
+
 export interface HistoryMessage {
   messageId: string;
   senderId: string;
@@ -23,7 +25,7 @@ export interface HistoryBotMember {
 }
 
 export interface HistoryBotInfo {
-  larkAppId: string;
+  larkAppId?: string;
   botOpenId?: string | null;
   botName?: string | null;
   botAvatarUrl?: string | null;
@@ -40,13 +42,26 @@ export function enrichHistorySenders(
   messages: HistoryMessage[],
   humans: ReadonlyMap<string, HistoryHumanProfile | null>,
   botMembers: readonly HistoryBotMember[],
-  botInfos: readonly HistoryBotInfo[],
+  botInfos: unknown,
 ): Array<HistoryMessage & { senderName?: string; senderAvatar?: string; senderBotAppId?: string }> {
-  const infoByAppId = new Map(botInfos.filter(info => info.larkAppId).map(info => [info.larkAppId, info]));
+  const safeBotInfos: HistoryBotInfo[] = botsInfoObjectEntries(botInfos)
+    .filter(isBotsInfoNameEntry)
+    .map(info => ({
+      ...(typeof info.larkAppId === 'string' && info.larkAppId.trim()
+        ? { larkAppId: info.larkAppId }
+        : {}),
+      botName: info.botName,
+      ...(typeof info.botOpenId === 'string' ? { botOpenId: info.botOpenId } : {}),
+      ...(typeof info.botAvatarUrl === 'string' ? { botAvatarUrl: info.botAvatarUrl } : {}),
+    }));
+  const infoByAppId = new Map<string, HistoryBotInfo>();
+  for (const info of safeBotInfos) {
+    if (info.larkAppId) infoByAppId.set(info.larkAppId, info);
+  }
   const infoByName = new Map<string, HistoryBotInfo>();
   const duplicateNames = new Set<string>();
-  for (const info of botInfos) {
-    const name = String(info.botName ?? '').trim();
+  for (const info of safeBotInfos) {
+    const name = typeof info.botName === 'string' ? info.botName.trim() : '';
     if (!name) continue;
     if (infoByName.has(name)) duplicateNames.add(name);
     else infoByName.set(name, info);
@@ -70,12 +85,12 @@ export function enrichHistorySenders(
     const member = botByOpenId.get(message.senderId);
     const directInfo = infoByAppId.get(message.senderId);
     if (!member && directInfo) {
-      const name = String(directInfo.botName ?? '').trim();
+      const name = typeof directInfo.botName === 'string' ? directInfo.botName.trim() : '';
       return {
         ...message,
         ...(name ? { senderName: name } : {}),
         ...(directInfo.botAvatarUrl ? { senderAvatar: directInfo.botAvatarUrl } : {}),
-        senderBotAppId: directInfo.larkAppId,
+        ...(directInfo.larkAppId ? { senderBotAppId: directInfo.larkAppId } : {}),
       };
     }
     if (!member) return message;
