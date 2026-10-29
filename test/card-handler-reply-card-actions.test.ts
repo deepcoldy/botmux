@@ -88,6 +88,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   workerHasInitialized: vi.fn(() => true),
   sessionSupportsWebTerminal: vi.fn(() => true),
   readableTerminalUrlFor: (...args: any[]) => readableTerminalUrlMock(...args),
+  liveReadableTerminalUrlFor: (...args: any[]) => readableTerminalUrlMock(...args),
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: (...args: any[]) => deliverWriteLinkCardMock(...args),
   deliverEphemeralOrReply: (...args: any[]) => deliverEphemeralOrReplyMock(...args),

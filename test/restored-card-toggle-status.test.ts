@@ -431,11 +431,12 @@ describe('Web Terminal link on a restored session', () => {
     expect(ds.session.webPort).toBe(PERSISTED_PORT);
   });
 
-  it('through the terminal proxy: keeps the session link, which wakes a worker', async () => {
+  it('through the terminal proxy: hides the session recovery link until a live worker owns a terminal', async () => {
     setTerminalProxyPort(17_700);
     const ds = restored();
     const card = await toggleCurrent(ds, activate(ds));
-    expect(terminalLinkOf(card)).toContain(`:17700/s/${ds.session.sessionId}`);
+    expect(terminalLinkOf(card)).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain(`/s/${ds.session.sessionId}`);
   });
 
   it('direct link with a running worker points at its port', async () => {
@@ -444,9 +445,10 @@ describe('Web Terminal link on a restored session', () => {
     expect(terminalLinkOf(card)).toContain(':40001');
   });
 
-  it('direct link for a worker that has not reported its port yet uses the preferred one', async () => {
+  it('direct link for a worker that has not reported its port yet stays hidden', async () => {
     const ds = restored({ worker: makeFakeWorker() });
     const card = await toggleCurrent(ds, activate(ds));
-    expect(terminalLinkOf(card)).toContain(`:${PERSISTED_PORT}`);
+    expect(terminalLinkOf(card)).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain(`:${PERSISTED_PORT}`);
   });
 });
