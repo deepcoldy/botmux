@@ -25,13 +25,18 @@ describe('session env overlay reaches the CLI through a real worker', () => {
     // .cjs: an extensionless script under a /tmp with an ESM package.json
     // would be loaded as ESM and exit before reporting.
     const script = join(dir, 'fake-cli.cjs');
+    // The fake CLI renames a finished temp file into place, so the report
+    // exists only once it is complete. Writing it in place let the wait below
+    // see the file between creation and content and parse '' (#2510).
     const report = join(dir, 'report.json');
     const bots = join(dir, 'bots.json');
     writeFileSync(script, `#!/usr/bin/env node
 const fs = require('node:fs');
 if (process.argv.includes('--version')) { console.log('2.1.0 (Claude Code)'); process.exit(); }
 const pick = ['LEAKED_HOST_TOKEN', 'LEAKED_SERVER_TOKEN', 'HOST_KEPT', 'SET_BY_LAYER', 'BOTMUX_SESSION_ID', 'PATH'];
-fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify(Object.fromEntries(pick.map(k => [k, process.env[k] ?? null]))));
+const tmp = ${JSON.stringify(report)} + '.' + process.pid + '.tmp';
+fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(pick.map(k => [k, process.env[k] ?? null]))));
+fs.renameSync(tmp, ${JSON.stringify(report)});
 console.log('Ready >'); setTimeout(() => {}, 30000);
 `, { mode: 0o700 });
     writeFileSync(bots, JSON.stringify([{ larkAppId: 'app_probe', larkAppSecret: '', apiOnly: true, cliId: 'claude-code' }]));
