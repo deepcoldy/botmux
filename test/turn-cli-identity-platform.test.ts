@@ -18,6 +18,10 @@ import { join } from 'node:path';
 vi.mock('../src/utils/user-token.js', () => ({
   resolveUserToken: vi.fn(async () => null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
+  // cli-identity.ts imports this. vitest tolerates a missing mock export; bun
+  // rejects the module at link time. Any new user-token import from
+  // cli-identity has to be added here too.
+  isUsableOpenId: (openId: unknown) => typeof openId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(openId),
 }));
 const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
 const beginBytedcliLogin = vi.fn(async () => ({ authUrl: 'https://cloud.example.test/local-bytedcli', completeToken: 'tok' }));

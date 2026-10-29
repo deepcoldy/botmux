@@ -65,6 +65,7 @@ const LEGACY_ROUTES: ReadonlyArray<readonly [string, string]> = [
   ['PUT', '/api/bot-codex-auth-sync'],
   ['PUT', '/api/bot-trigger-user-auth'],
   ['GET', '/api/bot-trigger-user-auth-status'],
+  ['DELETE', '/api/bot-trigger-user-auth/users/:openId'],
   ['PUT', '/api/bot-session-owner-reminder'],
   ['PUT', '/api/bot-sandbox'],
   ['PUT', '/api/bot-sandbox-paths'],

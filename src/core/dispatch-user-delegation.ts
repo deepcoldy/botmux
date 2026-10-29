@@ -33,6 +33,7 @@ const scheduleCreateCapabilitySchema = z.object({
   allowedRunScopes: z.array(z.literal('bytedcli')).max(1),
   /** Fixed task-local lifecycle authority; absent on older v2 records. */
   allowSelfManage: z.boolean().optional(),
+  botGrantId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional(),
 }).strict();
 const authorityV2Schema = z.object({
   appId: identity('cli_'),

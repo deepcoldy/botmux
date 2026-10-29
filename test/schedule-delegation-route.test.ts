@@ -1,3 +1,4 @@
+import { matchingScheduleBotGrant } from '../src/core/schedule-bot-grant.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -71,6 +72,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     isTrustedHostIpcRequest: () => body.remoteRunnerSessionTool === true,
     selfDaemonLarkAppId: 'cli_target',
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
+    matchingScheduleBotGrant,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getBot: () => ({ config: { triggerUserAuth: { enabled: true,
       tools: ['lark-cli', 'bytedcli'] } } }),
@@ -101,6 +103,59 @@ function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe('delegated schedule add route', () => {
+  it('redeems a bot grant only while the receiving host permits its exact scope', async () => {
+    const h = harness();
+    const original = h.scope.dispatchUserForTurn;
+    h.scope.dispatchUserForTurn = async () => {
+      const payload = await original();
+      payload.authority.capabilities[0].botGrantId = 'team';
+      return payload;
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_user' }] } });
+    expect((await h.run()).status).toBe(201);
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      grantId: 'bot-policy:cli_source:team:delivery-1:cli_target',
+      control: expect.objectContaining({ runScopes: [] }),
+    }));
+  });
+  describe('bot grant redemption', () => {
+    const policy = { createEnabled: true, botGrants: [{ id: 'team', sourceAppId: 'cli_source',
+      targetAppIds: ['cli_target'], chatIds: ['oc_chat'], controllerUnionId: 'on_user' }] };
+    const granted = (mutate: (payload: any) => void = () => {}) => {
+      const h = harness();
+      const original = h.scope.dispatchUserForTurn;
+      h.scope.dispatchUserForTurn = async () => {
+        const payload = await original();
+        payload.authority.capabilities[0].botGrantId = 'team';
+        mutate(payload);
+        return payload;
+      };
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: policy });
+      return h;
+    };
+    it('commits nothing when the grant is revoked while the controller is being resolved', async () => {
+      const h = granted();
+      h.scope.resolveTargetAppOpenId = async () => {
+        h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true } });
+        return { status: 'resolved', openId: 'ou_user_target' };
+      };
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+      expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    });
+    it.each([
+      ['a controller other than the grant\'s', (payload: any) => { payload.authority.unionId = 'on_other'; }],
+      ['personal tool credentials', (payload: any) => { payload.authority.tools = ['bytedcli']; }],
+      ['persistent run scopes', (payload: any) => { payload.authority.capabilities[0].allowedRunScopes = ['bytedcli']; }],
+    ])('refuses a signed bot-grant delegation that carries %s', async (_label, mutate) => {
+      const h = granted(mutate);
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+      expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    });
+  });
   it('aligns a Remote Runner bot turn with its provider-selected developer Actor', async () => {
     const h = harness({
       remoteRunnerSessionTool: true,

@@ -174,10 +174,7 @@ export function sessionEnvLock(key: string, ctx: SessionEnvLockContext = {}): Se
  * always returns an object, never throws.
  */
 export function sanitizePerBotEnv(raw: unknown): Record<string, string> {
-  const obj =
-    raw && typeof raw === 'object' && !Array.isArray(raw)
-      ? (raw as Record<string, unknown>)
-      : {};
+  const obj = perBotEnvObject(raw);
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(obj)) {
     if (!ENV_KEY_RE.test(key)) continue;
@@ -186,6 +183,33 @@ export function sanitizePerBotEnv(raw: unknown): Record<string, string> {
     else if (typeof value === 'number' || typeof value === 'boolean') out[key] = String(value);
   }
   return out;
+}
+
+/** Coerce the raw `env` field to a plain object (non-object input → {}). */
+function perBotEnvObject(raw: unknown): Record<string, unknown> {
+  return raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Keys a raw `env` object carries that {@link sanitizePerBotEnv} drops because
+ * they are botmux-reserved (valid env-var name + reserved). Lets config loaders
+ * emit an actionable warning instead of silently deleting operator config.
+ *
+ * Deliberately CLI-agnostic: it only reports WHICH keys were dropped. Whether a
+ * dropped key has a supported top-level replacement depends on the bot's
+ * `cliId` (only `claude-code`'s `CLAUDE_CONFIG_DIR` maps to `cliConfigDir`), so
+ * that hint belongs to the caller, not here. Invalid names are excluded (a
+ * separate problem); only reserved-but-otherwise-valid keys are returned, in
+ * object order (Object.keys is already unique — no de-dup needed).
+ */
+export function droppedReservedPerBotEnvKeys(raw: unknown): string[] {
+  const keys: string[] = [];
+  for (const key of Object.keys(perBotEnvObject(raw))) {
+    if (ENV_KEY_RE.test(key) && isReservedPerBotEnvKey(key)) keys.push(key);
+  }
+  return keys;
 }
 
 /**

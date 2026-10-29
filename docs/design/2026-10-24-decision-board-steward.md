@@ -43,9 +43,16 @@ board_items      事项（主键 app_id + seq；seq 就是 #12）
   recommend, recommend_reason   推荐项和理由
   rev              管家每改一次内容 +1（提交时用来提示「你写完草稿后管家又改过这项」）
   created_at / updated_at / state_at / steward_event_at / owner_seen_at
-board_links      关联对象 (app_id, seq, kind, ref, label, ord)。ord 是事项内写入序号，从 0 起、无空洞：只有新关联
+  primary_chat     主群（oc_…）。指向的群不在关联里时按第一条 chat 关联算；删掉主群那条关联时一并清空
+  no_chat_reason   确实没有群时的原因（--no-chat）；只在没有 chat 关联时生效，挂上群自动清空
+board_links      关联对象 (app_id, seq, kind, ref, label, ord, chat_check, chat_name)。ord 是事项内写入序号，从 0 起、无空洞：只有新关联
                    占号，已有关联只改标签不挪位置；列表按 ord 排（同一毫秒写入时 created_at 打平，不能靠时间）。schema v2
                    kind = pr | issue | chat | thread | session | commit | doc | url
+                   chat_check（仅 chat）= verified 写入时查到了群 | unverified 显式允许未核实 | NULL 核实功能上线前的旧关联
+                   chat_name（仅 chat）= 最近一次核实查到的群名，和管家的 label 分开；展示 label > chat_name > 默认
+                   primary_chat / no_chat_reason / chat_check / chat_name 四列都可空，老库打开时按列存在性补列，不升 schema
+                   版本（旧构建的显式列 INSERT 照常可用，回滚不 fail-closed）；每次打开时清掉回滚期间旧构建留下的
+                   失效主群指定和已有群的无群原因
 board_events     历史，只追加：时间、actor（steward / owner / system，加会话 id 或提交人）、
                    kind（note / state / edit / decision / reply / attach / link / import）、text、data_json
 board_files      附件元数据：sha256、mime、大小、上传方（owner / steward）、所属事项、ord。ord 是看板内（按 app_id，
@@ -61,6 +68,8 @@ board_decisions  批次里每项的决定：选项、文本、附件、提交时
 **状态对应**：旧表格的 11 个状态按下面映射——待你拍板 → decide；待你验收 → accept；在审 / 在修 / 在验证 / 可合 → active，原状态名写进阶段；等作者 / 等外部 → waiting，原状态名写进阶段；已合 / 已完成 → done（「已合」写进阶段）；已关闭 → closed。状态只决定页面分组，具体的流程词放在「阶段」里，botmux 不把 PR 流程写死。
 
 **关联对象怎么显示**：pr / commit 按 GitHub 地址拼链接（不调 GitHub API）；chat 用 `chatAppLink` 打开群；thread 用 `threadAppLink` 打开话题；session 链到 Dashboard 会话页和 Web 终端；其它仓库或系统用 `url=`。
+
+**事项必须关联群（2026-10-28）**：`board add` 新建时必须带 `--link chat=oc_…`，确实没有群写 `--no-chat "<原因>"`；`board set` 不强制，存量不迁移，`list` 标出缺群的项。写 chat 关联前由管家 daemon 用本机 bot 的凭据查 `im/v1/chats/:chat_id`：先管家 bot，查不到再按 bots.json 顺序、分小批并发试其他同 owner、同品牌的 bot（同 owner 沿用同机 Bot 互信的判定，含上位闸：管家关了 `trustSameOwnerBots` 就只用管家自己；单次 5 秒、总共 20 秒上限；一次请求里几个群之间限 2 个并发）。查到的群名单独存，作默认展示，管家的标签优先；都查不到整次写入拒绝，`--allow-unverified-chat` 才写并标 unverified。其他 bot 的客户端只在 daemon 内存里建，不落盘、不进日志。汇总页每行给主群的「进群」按钮，详情页标题下方列全部群，批次的逐项文本带主群链接。
 
 **隔离**：
 - 一个管家 bot 一张看板，按 app_id 隔开。同一台机器上几个 owner 各开自己的管家 bot，就是几张看板，页面上可以切换。

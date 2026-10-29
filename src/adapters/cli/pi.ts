@@ -426,6 +426,11 @@ export function createPiAdapter(
     // custom-terminate turn has no on-disk boundary — see the header for why
     // that stronger promise is unsafe (and why type-ahead does not need it).
     supportsTypeAhead: true,
+    // Pi interrupts on Escape (`app.interrupt`: stop the run, cancel a retry
+    // backoff or a compaction). Ctrl+C is `app.clear` — it only clears the
+    // editor, and a second one within 500ms quits Pi (verified on 1.3.0) — so
+    // the card's Stop button and `/stop` did not stop a running Pi turn.
+    interruptKey: 'esc',
     supportsProgramStatus: true,
     systemHints: [],
     altScreen: true,

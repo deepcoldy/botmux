@@ -514,6 +514,24 @@ describe('schedule CLI prompt updates', () => {
     });
 });
 
+describe('schedule CLI pause/remove admission', () => {
+  // A bot turn cannot prove a current human operator, yet it may be cleaning
+  // up a bot-policy task in that task's original topic. Only the owning daemon
+  // can tell, so pause/remove must reach it instead of stopping at the CLI's
+  // human-operator check; other management actions still stop there.
+  it('leaves pause and remove from a turn without a human operator to the daemon', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, proof => { proof.scheduleOperator = { ok: false, error: 'caller_not_allowed' }; }, 'om_live', observed);
+    await f.run(['pause', f.task.id]);
+    await f.run(['remove', f.task.id]);
+    const resumed = await f.run(['resume', f.task.id]);
+    expect(resumed.code, resumed.output).not.toBe(0);
+    expect(observed.filter(request => typeof request.action === 'string').map(request => request.action))
+      .toEqual(['pause', 'remove']);
+  });
+});
+
 describe('work calendar CLI configuration and persisted manual intent', () => {
   it('lists the bundled CN region, coverage and official source without a local calendar file', async () => {
     const f = fixture();

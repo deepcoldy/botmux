@@ -26,6 +26,10 @@ vi.mock('../src/utils/user-token.js', () => ({
   resolveUserToken: vi.fn(async (appId: string, _secret: string, _brand: string, openId?: string) =>
     tokens.get(`${appId}|${openId ?? ''}`) ?? null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
+  // cli-identity.ts imports this. vitest tolerates a missing mock export; bun
+  // rejects the module at link time. Any new user-token import from
+  // cli-identity has to be added here too.
+  isUsableOpenId: (openId: unknown) => typeof openId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(openId),
 }));
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
