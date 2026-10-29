@@ -349,6 +349,7 @@ describe('auto-compact unattended worker write gate', () => {
     expect(refuse({ requireSafeComposer: true })).toBe(reason);
   });
 
+  // 源码结构护栏(K4)：无人值守标志必须跨 daemon/worker IPC 接线，session close 必须清理协调器状态。
   it('keeps the daemon-to-worker and close cleanup wiring as a K4 structural guard', () => {
     const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
     const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
