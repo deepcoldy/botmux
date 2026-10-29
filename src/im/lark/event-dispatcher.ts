@@ -2774,6 +2774,8 @@ export interface RoutingContext {
   /** runtime 级联的正文项以同一条消息重入 handleThreadReply 时置位：跳过已在首次入站跑过的
    *  一次性副作用（thread.reply hook、learnFromMentions），且不被级联在飞的推迟闸拦住。 */
   cascadeBodyReentry?: true;
+  /** An already-authorized effort command re-enters ordinary task admission. */
+  effortTaskReentry?: true;
   /** Set by the session-group birth flow (p2pMode='group') after it has
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
@@ -2810,6 +2812,8 @@ export interface RoutingContext {
   ingressAdmission?: { admitted: boolean; retryReason?: string };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
+  /** Preserve confirmed command state while its task remains in the Inbox. */
+  checkpointPreAdmissionSession?: (session: Session, isCurrent?: () => boolean) => Promise<void>;
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
   /** Durable-primary only: queue one lifecycle control after Session admission. */
@@ -4986,6 +4990,9 @@ export function createLarkEventDispatcherRuntime(
     if (typeof primary.context.queuePostAdmissionControl === 'function') {
       ctx.queuePostAdmissionControl = primary.context.queuePostAdmissionControl;
     }
+    if (typeof primary.context.checkpointPreAdmissionSession === 'function') {
+      ctx.checkpointPreAdmissionSession = primary.context.checkpointPreAdmissionSession;
+    }
   };
 
   const assertPrimaryRouteOwner = async (
@@ -6116,6 +6123,9 @@ export function createLarkEventDispatcherRuntime(
                 queuePostAdmissionControl: (
                   primary.context as DurableLarkCanonicalHandlerContext
                 ).queuePostAdmissionControl,
+                checkpointPreAdmissionSession: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).checkpointPreAdmissionSession,
               }
             : {}
         ),

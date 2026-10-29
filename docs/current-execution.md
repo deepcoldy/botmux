@@ -1,8 +1,18 @@
 # 当前执行的只读证明
 
+Codex App 的新版独立 runner 使用主干的签名 `appServerProcess` 声明，worker 在本会话 backend 的宿主进程树中核对启动令牌，并通过 `NSpid` 解析命名空间内 PID，随后沿私有 IPC 发布引擎根。该现代证明路径优先于本 PR 的旧协议兼容，不会再被旧根覆盖。
+
+兼容已在运行、尚不带 `appServerProcess` 的旧 runner 时，才沿已认证签名通道处理 `processIdentity`：核对同一 session 的唯一 runner、其直接启动的 RPC 子进程、内核血缘和继承的 stdio。普通 busy/idle 不重新快照工具。旧协议空闲重启在投递前发布 `idle_restart`；旧引擎必须已退出、无待收尾 final 且新身份重新通过内核/stdio 验证，才更新旧根。新版引擎轮换继续使用主干的出生令牌和旧引擎退出检查。
+
+worker 重建后，只有存活 runner 已通过本次 challenge 且为唯一 active 签名代次、正整数签名序号越过该代次的 daemon 持久 ACK（首轮尚无完成记录时高水位为 0）、引擎已证明，且 runner 签名的精确 reply turn 与 daemon 下发的唯一 prepared 记录及恢复队列匹配时，才恢复该记录中的真人轮次。新 runner 在原生 busy state 中上报 `activeReplyTurnId`；旧 runner 可沿已有 thinking 记录的签名 turn 恢复，单凭 busy 不足以恢复。真人来源必须由 daemon 冻结的普通交互标记和 sender 共同证明；不使用 PID marker、最新聊天发送人、callerless/机器人记录或有歧义的队列补身份。
+
 `botmux execution current --json` 返回调用工具进程所属的当前执行。适用于本机 Linux 的普通消息与机器 Trigger；不要求该轮存在真人 caller 或已验证邮箱。
 
 命令复用 ancestor routing 和 loopback transport，仅发送 sessionId 到 `POST /api/current-execution`。daemon 从真实 TCP socket 确定调用 PID，再核对 Worker/CLI/RPC engine 的进程启动标识、当前代次及本轮之前已存在的进程树。宿主 HMAC、环境中的 TURN_ID、请求自报的 turn、旧进程或其他会话均不能代替这条检查。远程后端、没有可验证本机血缘或不支持进程证明的平台返回 blocked，不退回环境值。
+
+旧 `processIdentity` 兼容路径不适用于 `bwrap --unshare-pid`：旧 runner 读取沙箱内 `/proc`，严格宿主血缘/stdio 检查无法证明该 PID，保持 blocked。新版 `appServerProcess` 已通过主干的命名空间映射路径处理该场景；不将旧协议的限制解释为新版的全局限制。历史跟踪见 [#2383](https://github.com/deepcoldy/botmux/issues/2383)。
+
+`coreOnlyPidNamespaceDegrade()` 去掉 `--unshare-pid` 的降级仅可能出现在 `BOTMUX_CORE_ONLY=1` 且宿主无法创建该命名空间时。core-only 合成的会话为 `apiOnly`，`larkTransportEnabled` 对它直接返回 false，不消费这套执行证明；普通带飞书通道的会话不走该降级。因此同一飞书会话不会因宿主探测结果在这两种证明行为之间翻转。
 
 Codex 的原生 `codex-code-mode-host` 会跨轮复用，属于引擎的工具派发进程。只有它是已证明 Codex 根进程的直接子进程、内核报告的可执行文件位于同一发布目录且没有额外启动参数时，血缘检查才允许本轮新工具经过它；不凭进程名或命令行自报身份。常驻 host 自身、上一轮工具及其后续子进程仍不能取得本轮权限。`actor current` 还要求当前执行具有可信真人 caller。增量授权使用当前执行的 caller 或有效工具委托指定的真人作为授权目标，并核对授权期间的主体与执行变化。
 
