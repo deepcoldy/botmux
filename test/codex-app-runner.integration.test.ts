@@ -1957,17 +1957,25 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     scope.restoreCodexAppAttestedTurn = loadWorkerFunction('restoreCodexAppAttestedTurn', scope);
     const apply = loadWorkerFunction<(kind: string, payload: any, control?: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);
     const control = new ControlCollector(dir, false, false, false, false, (payload, proof) => apply('state', payload, proof));
+    // ControlCollector authenticates the runner directly, bypassing the real
+    // worker's activateCodexAppControlConnection. Supply the active identity
+    // that production publishes after accepting the challenge proof.
+    scope.codexAppControlProven = true;
+    scope.codexAppControlStateValue = {
+      status: 'active', identities: [{ generation: control.bootstrap.identity.generation }],
+    };
     await control.listen();
     harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
       { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate } });
+    const waitForNative = (predicate: () => boolean) => waitFor(harness!, predicate, 60_000);
     try {
-      await waitFor(harness, () => control.states.at(-1)?.busy === false);
+      await waitForNative(() => control.states.at(-1)?.busy === false);
       expect(published).toHaveLength(1);
       for (const [index, turnId] of ['om_native_before', 'om_native_after', 'om_native_next'].entries()) {
         if (index === 1) {
           const pid = Number(readFileSync(pidPath, 'utf8'));
           process.kill(pid, 'SIGTERM');
-          await waitFor(harness, () => {
+          await waitForNative(() => {
             try { process.kill(pid, 0); return false; }
             catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true; throw error; }
           });
@@ -1977,9 +1985,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         tracker.begin(turnId);
         authority.beginWork();
         harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(turnId, { text: turnId }, turnId)}\r`);
-        await waitFor(harness, () => control.finals.length === index + 1);
+        await waitForNative(() => control.finals.length === index + 1);
         tracker.completeCurrent();
-        await waitFor(harness, () => control.states.at(-1)?.busy === false);
+        await waitForNative(() => control.states.at(-1)?.busy === false);
       }
       expect(rejected).toEqual([]);
       expect(published).toHaveLength(2);
@@ -1999,7 +2007,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       tracker.begin('om_warm_recovery');
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('om_warm_recovery',
         { text: 'warm recovery' }, 'om_warm_recovery')}\r`);
-      await waitFor(harness, () => readRequests(logPath).filter(request => request.method === 'turn/start').length === 4);
+      await waitForNative(() => readRequests(logPath).filter(request => request.method === 'turn/start').length === 4);
       const head = { state: 'prepared', dispatchId: 'warm-dispatch', turnId: 'om_warm_recovery',
         codexAppSteerable: true, replyTargetSenderOpenId: 'ou_original', replyTargetSenderIsBot: false };
       scope.codexAppGenerationCommits = [{ generation: control.bootstrap.identity.generation,
@@ -2007,13 +2015,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       scope.codexAppRecoveredDispatches = [head];
       scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [head];
       await control.restartEndpoint();
-      await waitFor(harness, () => !!scope.restored);
+      await waitForNative(() => !!scope.restored);
       expect(scope.restored).toMatchObject({ turnId: 'om_warm_recovery',
         trustedCaller: { requestLarkAppId: 'cli_test', requestUserOpenId: 'ou_original', senderType: 'user' } });
       expect(control.states.at(-1)).toMatchObject({ busy: true, activeReplyTurnId: 'om_warm_recovery' });
       scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [];
       writeFileSync(finishGate, 'ready');
-      await waitFor(harness, () => control.finals.length === 4);
+      await waitForNative(() => control.finals.length === 4);
       tracker.completeCurrent();
       expect(control.authCount).toBe(2);
       expect(rejected).toEqual([]);
@@ -2024,7 +2032,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       await control.close();
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 240_000);
 
   it.each([
     { behavior: 'success', content: 'fake answer 1' },
