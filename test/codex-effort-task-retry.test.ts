@@ -301,6 +301,51 @@ function expectedNotice(): string {
 }
 
 describe('ordinary ingress terminal failure → actionable notice', () => {
+  it('clears the retry reason when provider proof arrives after acceptance while the wait is pending', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    try {
+      getBot(APP).config.cliId = 'codex';
+      const anchor = 'om_effort_delayed_proof';
+      const messageId = 'om_effort_delayed_proof_task';
+      const ds = seedThreadSession(anchor, 'seeded');
+      ds.session.cliId = 'codex';
+      ds.session.backendType = 'tmux';
+      ds.session.workerGeneration = 1;
+      ds.workerGeneration = 1;
+      ds.session.cliSessionId = 'native';
+      ds.worker = { killed: false, send: vi.fn() } as any;
+      ds.cliReady = true;
+      ds.hasHistory = true;
+      let accepted!: () => void;
+      const acceptance = new Promise<void>(resolve => { accepted = resolve; });
+      mocks.sendWorkerInput.mockImplementationOnce(() => {
+        setTimeout(() => __testOnly_recordDurablePrimaryInputCommit(ds, {
+          type: 'turn_input_committed', turnId: messageId, durablePrimaryInbox: true,
+        } as any, 1), 10);
+        accepted();
+        return true;
+      });
+      const ctx = { ...makeCtx(anchor, messageId), checkpointPreAdmissionSession: async () => {},
+        durablePrimaryDispatch: { attempt: 1, signal: controller.signal } };
+      let settled = false;
+      const handling = handleThreadReply(makeEventData(messageId, '/effort ultra check', anchor), ctx)
+        .then(() => { settled = true; });
+      await acceptance;
+      expect(settled).toBe(false);
+      expect(ds.session.durablePrimaryInputCommits).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(10);
+      await handling;
+      expect(ctx.ingressAdmission.admitted).toBe(true);
+      expect(ctx.ingressAdmission.retryReason).toBeUndefined();
+      expect(ds.session.durablePrimaryInputCommits).toEqual([expect.objectContaining({ turnId: messageId })]);
+      expect(mocks.sendWorkerInput).toHaveBeenCalledOnce();
+    } finally {
+      controller.abort();
+      vi.useRealTimers();
+    }
+  });
+
   it('retries the confirmed attached task without reopening the effort menu', async () => {
     getBot(APP).config.cliId = 'codex';
     const anchor = 'om_effort_review_primary';
@@ -576,7 +621,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
   });
 
   it.each(['body', 'worker', 'native', 'sender', 'resource'])(
-    'does not reuse a settings confirmation after the %s identity changes', async change => {
+    'persists an ignored confirmation and not-submitted receipt after the %s identity changes', async change => {
       getBot(APP).config.cliId = 'codex';
       const anchor = 'om_effort_identity';
       const ds = seedThreadSession(anchor, 'seeded');
@@ -587,9 +632,15 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       ds.session.cliSessionId = 'native';
       const messageId = 'om_effort_identity_task';
       const data = makeEventData(messageId, '/effort ultra check', anchor);
-      const context = () => ({ ...makeCtx(anchor, messageId), checkpointPreAdmissionSession: async () => {},
+      const checkpoints: any[] = [];
+      const checkpoint = vi.fn(async (session: any) => { checkpoints.push(structuredClone(session)); });
+      const context = () => ({ ...makeCtx(anchor, messageId), checkpointPreAdmissionSession: checkpoint,
         durablePrimaryDispatch: { attempt: 1, signal: new AbortController().signal } });
-      await handleThreadReply(data, context());
+      const first = context();
+      await handleThreadReply(data, first);
+      expect(first.ingressAdmission.retryReason).toBe('session has an unfinished turn');
+      expect(ds.session.codexEffortTaskConfirmations).toHaveLength(1);
+      expect(ds.session.codexEffortTaskConfirmations![0]!.terminal).toBeUndefined();
       expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
       if (change === 'body') data.message.content = JSON.stringify({ text: '/effort ultra changed' });
       if (change === 'worker') { ds.worker = { killed: false, send: vi.fn() } as any; ds.workerGeneration = 2; }
@@ -604,9 +655,31 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
           { tag: 'text', text: '/effort ultra check' }, { tag: 'img', image_key: 'changed' },
         ]] } });
       }
+      // Let the resumed worker accept a turn so worker/native changes reach
+      // identity retirement rather than the earlier unfinished-turn retry.
+      ds.cliReady = true;
+      checkpoints.length = 0;
+      checkpoint.mockClear();
+      mocks.updateSession.mockClear();
+      mocks.replyMessage.mockClear();
+      mocks.sendMessage.mockClear();
+      // Refuse an unexpected delivery so a missing retirement guard fails
+      // on state assertions instead of waiting for a provider receipt timeout.
+      mocks.sendWorkerInput.mockReturnValue(false);
       const retry = context();
       await handleThreadReply(data, retry);
       expect(retry.ingressAdmission.admitted).toBe(false);
+      expect(retry.ingressAdmission.retryReason).toBeUndefined();
+      expect(ds.session.codexEffortTaskConfirmations![0]!.terminal).toBe('ignored');
+      expect(checkpoint).toHaveBeenCalledOnce();
+      expect(checkpoints[0].codexEffortTaskConfirmations).toEqual([
+        expect.objectContaining({ messageId, terminal: 'ignored' }),
+      ]);
+      expect(mocks.updateSession).toHaveBeenCalledWith(expect.objectContaining({
+        codexEffortTaskConfirmations: [expect.objectContaining({ messageId, terminal: 'ignored' })],
+      }));
+      const task = change === 'body' ? 'changed' : 'check';
+      expect(repliedText()).toContain(tr('cmd.effort.task_not_submitted', { task }, localeForBot(APP)));
       expect(mocks.updateCodexCliEffort).toHaveBeenCalledOnce();
       expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
     },
