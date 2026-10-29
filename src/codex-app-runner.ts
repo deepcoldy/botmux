@@ -351,6 +351,7 @@ class AppServerClient {
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
   private fatalError?: Error;
+  private initialized = false;
   readonly lifetime = new AbortController();
 
   get hasExited(): boolean {
@@ -359,9 +360,15 @@ class AppServerClient {
   }
 
   get executionIdentity(): { pid: number; procStart: string } | undefined {
-    if (process.platform !== 'linux' || this.hasExited || !this.child.pid) return undefined;
-    const procStart = readProcessStartIdentity(this.child.pid);
-    return procStart ? { pid: this.child.pid, procStart } : undefined;
+    if (process.platform !== 'linux' || !this.initialized || this.hasExited || !this.child.pid) return undefined;
+    // The npm entry point stays alive as a Node launcher. Its native Codex
+    // child owns the persistent tool host and must be the signed engine root;
+    // attesting Node instead makes the native child look like an old tool on
+    // the next turn. Reuse the kernel/stdio proof captured at initialization.
+    const pid = this.processIdentity?.enginePid ?? this.child.pid;
+    const procStart = readProcessStartIdentity(pid);
+    if (this.processIdentity && procStart !== this.processIdentity.engineProcStart) return undefined;
+    return procStart ? { pid, procStart } : undefined;
   }
 
   constructor(codexBin: string, cwd: string) {
@@ -407,6 +414,10 @@ class AppServerClient {
     }, { timeoutMs });
     this.notify('initialized');
     this.processIdentity = captureCodexAppProcessIdentity(this.child.pid ?? 0);
+    // Idle-state timers can run while a replacement client is initializing.
+    // Publish no root until capture finishes, so a live launcher can never be
+    // registered first and then mistaken for an unauthorized engine swap.
+    this.initialized = true;
   }
 
   request(
