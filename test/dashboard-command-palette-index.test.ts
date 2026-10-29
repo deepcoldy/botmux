@@ -220,7 +220,10 @@ function trTextKeys(text: string): string[] {
  * 已知缺口（不静默跳过，登记在此）：常量数组里的 `tr(option.labelKey)`（如
  * OWNER_REMINDER_STATE_OPTIONS 的 6 个同区块同义勾选项，登记会给 ⌘K 增同义噪音）、
  * `<h4 className="bd-subsection-title">` 小组标题（组标题不是配置行，属产品取舍）——
- * 这两类后续要收时需要新增加常量展开与 h4 扫描规则。
+ * 这两类后续要收时需要新增加常量展开与 h4 扫描规则；
+ * 以及 `<button>{tr()}</button>` 可展开控件（如 autoStartExcludedChats）——需新增 button 标签扫描；
+ * 同区块同译文去重（riffModel 与 agentModel 的 zh 译文都是「模型」，条目被
+ * buildBotDefaultsSectionItems 的 seen 去重丢掉，⌘K 搜不到）——属条目生成侧，另行跟进。
  * 只认 tr() 键：硬编码中文的标题（「高级 JSON」「每聊天覆盖」，英文界面也显示中文）读不到，是已知缺口，另行跟进。
  */
 function renderedBotConfigLabelKeys(sources: string): Set<string> {
@@ -257,7 +260,7 @@ const NOT_CONFIG_LABELS: ReadonlyMap<string, string> = new Map([
   ['sessionEnv.keyLabel', '新增/去掉环境变量弹窗里的表单字段名，只在弹窗打开时出现，页面上没有可定位的行'],
   ['sessionEnv.valueLabel', '同上，环境变量弹窗里的值字段名'],
   ['botDefaults.sgTagRepairAllLabel', '飞书授权流程里一次性「顺便补齐」勾选，repairAll 只用于当次调用、不持久化为 bot 配置'],
-  ['botDefaults.autoStartExcludedChatsHelp', '排除群文本框上方的说明文案，不是配置项；对应配置行已由 botDefaults.autoStartExcludedChats 承载'],
+  ['botDefaults.autoStartExcludedChatsHelp', '排除群文本框上方的说明文案，不是配置项；其入口 autoStartExcludedChats 是可展开 <button>，扫描器不识别 button 标签，登记需新增扫描规则，另行跟进'],
 ]);
 
 const BOT_CONFIG_KEY_NAMESPACES = ['botDefaults.', 'sessionEnv.', 'quietPreset.', 'promptCache.', 'roles.', 'blocked.'];
