@@ -46,6 +46,7 @@ import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry } from '../services/bots-info-shape.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -530,8 +531,9 @@ function globalKnownBotNames(): Set<string> {
   try {
     const p = join(config.session.dataDir, 'bots-info.json');
     if (!existsSync(p)) return new Set();
-    const entries: Array<{ botName?: string | null }> = JSON.parse(readFileSync(p, 'utf-8'));
-    return new Set(entries.map(e => e.botName?.toLowerCase()).filter((n): n is string => !!n));
+    const entries = botsInfoObjectEntries(JSON.parse(readFileSync(p, 'utf-8')))
+      .filter(isBotsInfoNameEntry);
+    return new Set(entries.map(e => e.botName.toLowerCase()));
   } catch {
     return new Set();
   }

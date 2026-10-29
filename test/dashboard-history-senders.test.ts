@@ -76,4 +76,23 @@ describe('dashboard history sender enrichment', () => {
       senderBotAppId: 'cli_peer',
     });
   });
+
+  it('skips malformed rows without polluting name indexes or duplicate detection', () => {
+    const [message] = enrichHistorySenders(
+      [{ messageId: 'm1', senderId: 'ou_peer', senderType: 'app', msgType: 'text', content: 'done' }],
+      new Map(),
+      [{ openId: 'ou_peer', displayName: 'Unique Bot' }],
+      [
+        null,
+        42,
+        'x',
+        { larkAppId: 'cli_bad_number', botName: 42 },
+        { larkAppId: 'cli_bad_object', botName: {} },
+        { larkAppId: 'cli_bad_boolean', botName: true },
+        { botName: 'Unique Bot', botAvatarUrl: 'https://img/unique' },
+      ],
+    );
+    expect(message).toMatchObject({ senderName: 'Unique Bot', senderAvatar: 'https://img/unique' });
+    expect(message).not.toHaveProperty('senderBotAppId');
+  });
 });
