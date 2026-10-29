@@ -9,6 +9,12 @@ export function codexCapacityRecoveryCli(cliId: string | undefined): boolean {
  * assistant answer, tool output or an unknown transport outcome is not one. */
 export function codexAppTurnFailureCode(turn: { status?: unknown; error?: unknown }): string | undefined {
   if (turn.status !== 'failed') return undefined;
+  // A failed terminal may omit the error object entirely (protocol variant).
+  // Classify before descending into isCodexCapacityError: JSON.stringify(
+  // undefined) returns undefined, not a string, and .toLowerCase() there is an
+  // uncaught TypeError that kills the runner. Mirrors codex-rpc-engine's
+  // `turn.error ? rpcTurnErrorCode(turn.error) : ''` guard.
+  if (!turn.error) return 'codex_app_turn_failed';
   return isCodexCapacityError(turn.error) ? CODEX_CAPACITY_ERROR_CODE : 'codex_app_turn_failed';
 }
 

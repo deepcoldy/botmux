@@ -21,6 +21,18 @@ describe('Codex App structured capacity failure', () => {
     expect(codexAppTurnFailureCode({ status: 'failed', error: { code: 'rate_limit_exceeded', message: error.message } })).not.toBe(code);
   });
 
+  it('classifies a failed terminal with a missing or null error object as a generic failure without throwing', () => {
+    // JSON.stringify(undefined) returns undefined, so the classifier must guard
+    // BEFORE descending into isCodexCapacityError (toLowerCase TypeError that
+    // otherwise kills the runner). Missing key and explicit null both map to
+    // the generic code; capacity text still wins when an error is present.
+    expect(codexAppTurnFailureCode({ status: 'failed' })).toBe('codex_app_turn_failed');
+    expect(codexAppTurnFailureCode({ status: 'failed', error: undefined })).toBe('codex_app_turn_failed');
+    expect(codexAppTurnFailureCode({ status: 'failed', error: null })).toBe('codex_app_turn_failed');
+    expect(codexAppTurnFailureCode({ status: 'failed', error: { codexErrorInfo: 'ServerOverloaded' } }))
+      .toBe(CODEX_CAPACITY_ERROR_CODE);
+  });
+
   it.each(['ou_other', undefined])('never borrows the current sender when exact human proof is missing: %s', sender => {
     const { ds } = appRecoveryHarness({ codexCapacityRecovery: false });
     ds.session.turnReplyContexts.om_original.replyTargetSenderIsBot = undefined;
