@@ -213,8 +213,9 @@ Tests are split into two Vitest projects with different execution profiles
 - **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
   Runs with **file parallelism on** (one process per file). This is what
   `bun run test` runs; it needs no real CLI binary or browser. The full project
-  takes minutes, not seconds (CI splits it into three shards), so while iterating
-  run only the files you touched: `bun run test -- test/<name>.test.ts`.
+  takes minutes, not seconds (CI splits it into four shards balanced by recorded
+  per-file duration, see `scripts/duration-shards.mjs`), so while iterating run
+  only the files you touched: `bun run test -- test/<name>.test.ts`.
 - **`e2e`** (`*.e2e.ts`, excluding `test/e2e-browser/`) — spawns real CLIs and
   runs sequentially. Opt-in only.
 - **Feishu browser E2E** (`test/e2e-browser/cases/*.yaml`) — runs through

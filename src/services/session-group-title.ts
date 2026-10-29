@@ -59,6 +59,10 @@ export const ONE_SHOT_ARGV: Record<string, string[]> = {
   gemini: ['gemini', '-p'],
   antigravity: ['agy', '-p'],
   grok: ['grok', '-p'],
+  // pi / oh-my-pi share the same `-p`/`--print` non-interactive print mode —
+  // bare answer on stdout, no tools needed for a title.
+  pi: ['pi', '-p'],
+  'oh-my-pi': ['omp', '-p'],
 };
 
 /** One in-flight title job per chat — birth and the heal-on-activity path

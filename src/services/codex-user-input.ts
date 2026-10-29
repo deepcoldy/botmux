@@ -105,7 +105,7 @@ export async function postCodexAsk(
   context: CodexUserInputContext,
   questions: AskQuestion[],
   signal?: AbortSignal,
-  asyncUserInput?: { threadId: string; itemId: string },
+  asyncUserInput?: { threadId: string; itemId: string; nativeTurnId?: string },
   asyncFailure?: 'limit' | 'invalid_questions',
 ): Promise<AskResult> {
   const env = context.env ?? process.env;

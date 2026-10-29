@@ -1013,6 +1013,18 @@ export function drainTraexRollout(
     const sourceTurnId = typeof payload.turn_id === 'string' && payload.turn_id.length > 0
       ? payload.turn_id
       : undefined;
+    // A cold or MCP-heavy first turn can persist task_started long before the
+    // UserMessage display completion (observed gaps of 90-117s). Surface the
+    // native lifecycle edge so the queue holds a provisional claim instead of
+    // expiring the short pre-start lease while TraeX is running the turn.
+    // Nested turns (root_turn_id differs) never start a Lark turn.
+    if (obj.type === 'event_msg'
+      && payload.type === 'task_started'
+      && sourceTurnId
+      && (payload.root_turn_id === undefined || payload.root_turn_id === sourceTurnId)) {
+      events.push({ ...base, kind: 'turn_started', text: '', sourceTurnId });
+      continue;
+    }
     // The append-only history is TraeX's canonical model/tool timeline. Its
     // event_msg records mirror reasoning and tool completion, so consuming
     // those too would duplicate nodes. One mutation can carry parallel calls

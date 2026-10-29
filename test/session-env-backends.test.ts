@@ -155,6 +155,37 @@ describe('local child env', () => {
     expect(ptyChildEnv(o)).toBe(o.env);
   });
 
+  it('pty: per-bot env cannot add GIT_CONFIG_COUNT or numbered pairs', () => {
+    const env = ptyChildEnv(opts({
+      // The worker-authored block survives in opts.env.
+      env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'a.b', GIT_CONFIG_VALUE_0: 'v' },
+      injectEnv: {
+        GIT_CONFIG_COUNT: '9',
+        GIT_CONFIG_KEY_7: 'core.hooksPath', GIT_CONFIG_VALUE_7: '/tmp/evil',
+        OK: '1',
+      },
+    }));
+    expect(env.GIT_CONFIG_COUNT).toBe('1');
+    expect(env.GIT_CONFIG_KEY_0).toBe('a.b');
+    expect(env.GIT_CONFIG_KEY_7).toBeUndefined();
+    expect(env.OK).toBe('1');
+  });
+
+  it('strict: per-bot env cannot add GIT_CONFIG_COUNT or numbered pairs', () => {
+    const argv = strictPaneEnvArgs(opts({
+      env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'a.b', GIT_CONFIG_VALUE_0: 'v' },
+      injectEnv: {
+        GIT_CONFIG_COUNT: '9',
+        GIT_CONFIG_KEY_7: 'core.hooksPath', GIT_CONFIG_VALUE_7: '/tmp/evil',
+        OK: '1',
+      },
+    }));
+    expect(argv).toContain('GIT_CONFIG_COUNT=1');
+    expect(argv).toContain('GIT_CONFIG_KEY_0=a.b');
+    expect(argv).not.toContain('GIT_CONFIG_KEY_7=core.hooksPath');
+    expect(argv).toContain('OK=1');
+  });
+
   it('strict panes drop removed variables from their explicit list', () => {
     const argv = strictPaneEnvArgs(opts({ unsetEnv: ['LEAKED'] }));
     expect(argv[0]).toBe('-i');

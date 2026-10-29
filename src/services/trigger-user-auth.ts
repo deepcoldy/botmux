@@ -88,6 +88,16 @@ export interface TriggerUserAuthConfig {
    *  callers) keep compiling — read it through {@link credentialSourceOf}. */
   credentialSource?: TriggerUserAuthCredentialSource;
   /**
+   * Whether `botmux send --mention <bot on this machine>` hands this turn's
+   * sender to that bot, the way `botmux dispatch` already does: the daemon
+   * signs a delegation for the exact handoff message, and the receiving bot
+   * runs its governed tools as the same human after its own talk-permission
+   * and chat-membership checks. Default ON; only an explicit `false` is
+   * stored. Cross-machine bots never receive it (the signed record and its
+   * key live on this machine).
+   */
+  delegateOnMention?: boolean;
+  /**
    * Code host whose git pushes should carry the acting identity, e.g.
    * `code.example.com`. Absent → git is left alone.
    *
@@ -214,6 +224,11 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     credentialSource = rec.credentialSource as TriggerUserAuthCredentialSource;
   }
 
+  if (rec.delegateOnMention !== undefined && rec.delegateOnMention !== null
+    && typeof rec.delegateOnMention !== 'boolean') {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.delegateOnMention must be a boolean');
+  }
+
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
   const gitTokenExchangeUrl = optionalHttpsUrl(
     rec.gitTokenExchangeUrl,
@@ -225,6 +240,8 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     tools,
     fallback,
     credentialSource,
+    // Equal to the default → not stored.
+    ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
@@ -274,4 +291,13 @@ export function triggerUserAuthApplies(
   tool: TriggerUserAuthTool,
 ): boolean {
   return !!config?.enabled && config.tools.includes(tool);
+}
+
+/** Whether a `--mention` handoff from this bot carries the turn's sender to a
+ *  bot on the same machine. Needs the policy itself to be on: a bot that does
+ *  not run its own tools as the sender has no verified sender to hand over. */
+export function delegatesOnMention(
+  config: TriggerUserAuthConfig | null | undefined,
+): boolean {
+  return !!config?.enabled && config.tools.length > 0 && config.delegateOnMention !== false;
 }

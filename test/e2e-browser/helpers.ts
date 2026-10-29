@@ -182,23 +182,31 @@ export async function navigateToMessenger(page: Page, url = getMessengerUrl()): 
   await load;
 }
 
+// While four lanes boot Chromium at once, CI recordings showed a Messenger
+// page going blank → skeleton → loaded over 60–80s: three 45s waits, each
+// restarted by a reload, failed cases whose own checks had passed.
+const MESSENGER_LOAD_ATTEMPTS = 4;
+const MESSENGER_LOAD_WAIT_MS = 60_000;
+
 async function loadMessenger(page: Page, url: string): Promise<void> {
   // The saved account can render either the English ("Messenger - Feishu",
   // "Search"/"Messenger") or Chinese ("消息 - 飞书", "搜索"/"消息") UI, so do
   // not gate on a single language.
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    if (attempt === 1) await page.goto(url, { waitUntil: 'domcontentloaded' });
-    else await page.reload({ waitUntil: 'domcontentloaded' });
+  for (let attempt = 1; attempt <= MESSENGER_LOAD_ATTEMPTS; attempt++) {
+    // A fresh navigation each time: a reload keeps a stalled app's state.
+    await page.goto(url, { waitUntil: 'domcontentloaded' }).catch((error: Error) => {
+      console.warn(`[e2e] Opening Feishu Messenger failed: ${error.message.split('\n')[0]}`);
+    });
     try {
       // A deep link (the test group) may open a view without the chat list.
-      await page.waitForFunction(messengerShellReady, url === getMessengerUrl(), { timeout: 45_000 });
+      await page.waitForFunction(messengerShellReady, url === getMessengerUrl(), { timeout: MESSENGER_LOAD_WAIT_MS });
       return;
     } catch {
-      console.warn(`[e2e] Feishu Messenger chat list not loaded (attempt ${attempt}/3); reloading`);
+      console.warn(`[e2e] Feishu Messenger chat list not loaded (attempt ${attempt}/${MESSENGER_LOAD_ATTEMPTS}); reopening`);
     }
   }
   throw new Error(
-    `Feishu Messenger chat list did not load after 3 attempts (URL: ${page.url()}, title: ${await page.title()}). ` +
+    `Feishu Messenger chat list did not load after ${MESSENGER_LOAD_ATTEMPTS} attempts (URL: ${page.url()}, title: ${await page.title()}). ` +
       'A login redirect means the saved storage state expired; a skeleton list means Feishu web is stalling.',
   );
 }
@@ -222,6 +230,52 @@ export function botChatName(botName: string): string {
   return botName.startsWith('[Botmux]') ? botName : `[Botmux]${botName}`;
 }
 
+/** A text box of TITLE_BOXES: `onTop` when hit-testing its middle lands on it. */
+export interface TitleBox extends ScreenBox {
+  onTop: boolean;
+}
+
+/**
+ * The chat list's entry titled exactly `[Botmux]<Name>`: on top, left of 30%
+ * of the width (the main area shows the name too, as its title and as the
+ * bot's sender line). Text scrolled out of the list is not on top. A pinned
+ * shortcut ahead of the list, if it holds the full name, opens the same chat.
+ */
+export function pickChatEntry(boxes: readonly TitleBox[], viewport: { width: number; height: number }): TitleBox | null {
+  return boxes.find((box) => box.onTop && box.x < viewport.width * 0.3) ?? null;
+}
+
+/**
+ * The main area's title bar names the chat: the name on top in the top 5%
+ * right of the list (CI at 1920×1080: title at y ≈ 30, the bar ends at
+ * y ≈ 72). A chat the bot posts in shows it as a sender line below the bar
+ * (「普通群聊」, run 40280910196), or scrolled under it, where it is not on
+ * top; an open topic's title bar reads 「话题」.
+ */
+export function chatOpenInMain(boxes: readonly TitleBox[], viewport: { width: number; height: number }): boolean {
+  return boxes.some((box) => box.onTop && box.x >= viewport.width * 0.3 && box.y < viewport.height * 0.05);
+}
+
+/**
+ * Click the bot DM's chat-list entry and confirm its title bar; false when
+ * the entry is not listed or the click did not open it. CI: the vision agent
+ * opened 「普通群聊」 or a restored topic instead (runs 40170880120,
+ * 40217853930, 40280910196), failing a suite's setup.
+ */
+async function openChatFromList(page: Page, chatName: string): Promise<boolean> {
+  const viewport = page.viewportSize() ?? BROWSER_CONFIG.viewport;
+  const boxes = async () =>
+    ((await page.evaluate(`(${TITLE_BOXES})(${JSON.stringify(chatName)})`).catch(() => [])) ?? []) as TitleBox[];
+  const entry = pickChatEntry(await boxes(), viewport);
+  if (!entry) return false;
+  await page.mouse.click(entry.x + entry.width / 2, entry.y + entry.height / 2);
+  for (let i = 0; i < 5; i++) {
+    await page.waitForTimeout(1_000);
+    if (chatOpenInMain(await boxes(), viewport)) return true;
+  }
+  return false;
+}
+
 export async function openChat(
   page: Page,
   agent: PlaywrightAgent,
@@ -234,8 +288,9 @@ export async function openChat(
   // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
   // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
   const chatName = botChatName(botName);
+  if (await openChatFromList(page, chatName)) return;
   let opened = false;
-  // Try clicking directly first
+  // The entry is not listed (or did not open): ask the vision agent.
   try {
     await agent.aiAct(
       `在左侧"消息"列表或其置顶会话中，点击 Botmux 机器人的私聊会话 ` +
@@ -362,10 +417,11 @@ export async function sendMentionMessage(
   botName: string,
   message: string,
 ): Promise<void> {
-  await focusOrAsk(page, agent, 'chat', '点击底部的消息输入框');
+  const focus = () => focusOrAsk(page, agent, 'chat', '点击底部的消息输入框');
+  await focus();
   await page.waitForTimeout(500);
   await warmUpInput(page);
-  await typeMention(page, agent, botName, message);
+  await typeMention(page, botName, message, focus);
 }
 
 /** Text of the rich-text input that currently has focus. */
@@ -392,6 +448,308 @@ const FIND_EDITOR = `(() => {
  */
 async function focusedInputText(page: Page): Promise<string> {
   return page.evaluate(`(${FIND_EDITOR}?.innerText ?? '')`);
+}
+
+export interface ScreenBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** What the page shows of Feishu's @ member list (see MENTION_LIST). */
+export interface MentionListSnapshot {
+  editor: ScreenBox;
+  /** Visible, uncovered elements led by the bot's display name. */
+  options: Array<ScreenBox & { fresh: boolean }>;
+  /** 「会话内成员」 section headers. */
+  inChat: ScreenBox[];
+  /** 「会话外的人（他们不会收到这条消息）」 section headers. */
+  outside: ScreenBox[];
+}
+
+/**
+ * In-page: every element led by `name` that is on top at its own position,
+ * and the list's section headers. With `before`, only marks the
+ * matches already on the page, so a list that has no headers can still be told
+ * apart from the chat's sender labels: its rows are the fresh ones. A string
+ * for the same reason as FIND_EDITOR.
+ */
+const MENTION_LIST = `(({ name, bare, mark, before }) => {
+  const editor = ${FIND_EDITOR};
+  if (!editor) return null;
+  const clean = (text) => (text || '').replace(/[\\u200b-\\u200d\\u2060\\ufeff]/g, '').replace(/\\s+/g, ' ').trim();
+  const rect = (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.left, y: r.top, width: r.width, height: r.height };
+  };
+  const onTop = (el, r) => {
+    if (r.width <= 0 || r.height <= 0) return false;
+    const hit = document.elementFromPoint(r.x + Math.min(r.width / 2, 24), r.y + r.height / 2);
+    return !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+  };
+  const find = (accept, probes) => {
+    const found = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const data = walker.currentNode.data;
+      if (!probes.some((probe) => data.includes(probe))) continue;
+      let el = walker.currentNode.parentElement;
+      for (let depth = 0; el && depth < 4; depth += 1, el = el.parentElement) {
+        const text = clean(el.textContent);
+        if (accept(text)) {
+          if (!found.includes(el) && !editor.contains(el)) found.push(el);
+          break;
+        }
+        if (text.length > 80) break;
+      }
+    }
+    return found;
+  };
+  // A row may hold the badge too (「[Botmux]Claude 机器人 | Claude」), or split
+  // the name around the highlighted query; the name must still lead it.
+  const isName = (text) => text === name || (text.startsWith(name) && !/^[\w-]/.test(text.slice(name.length)));
+  const options = find(isName, ['Botmux', bare]);
+  if (before) {
+    // Per attempt: a node the list reuses across attempts must count as new.
+    for (const el of document.querySelectorAll('[' + mark + ']')) el.removeAttribute(mark);
+    for (const el of options) el.setAttribute(mark, '');
+    return null;
+  }
+  const shown = (els) => els.map((el) => [el, rect(el)]).filter(([el, r]) => onTop(el, r));
+  return {
+    editor: rect(editor),
+    options: shown(options).map(([el, r]) => ({ ...r, fresh: !el.hasAttribute(mark) })),
+    inChat: shown(find((text) => text === '会话内成员', ['会话内成员'])).map(([, r]) => r),
+    outside: shown(find((text) => text.startsWith('会话外的人'), ['会话外的人'])).map(([, r]) => r),
+  };
+})`;
+
+const MENTION_MARK = 'data-e2e-before-mention';
+
+async function mentionList(page: Page, name: string, before = false): Promise<MentionListSnapshot | null> {
+  const args = { name: botChatName(name), bare: name, mark: MENTION_MARK, before };
+  return page.evaluate(`(${MENTION_LIST})(${JSON.stringify(args)})`);
+}
+
+/** Feishu opens the member list right above the editor, about as wide. */
+function aboveEditor(box: ScreenBox, editor: ScreenBox): boolean {
+  return (
+    box.y + box.height <= editor.y + 8 &&
+    box.y >= editor.y - 520 &&
+    box.x + box.width > editor.x &&
+    box.x < editor.x + editor.width
+  );
+}
+
+/**
+ * The member-list row to click for the bot: the first one under 「会话内成员」.
+ * 「会话外的人」 lists a same-named bot from another app ("they will not receive
+ * this message"), and the chat behind the list shows the same name on every
+ * reply, so a bare name match is not enough. Without section headers the list's
+ * rows are the matches that appeared after typing `@`.
+ */
+export function pickMentionOption(list: MentionListSnapshot): ScreenBox | null {
+  const options = list.options.filter((box) => aboveEditor(box, list.editor));
+  const inChat = list.inChat.filter((box) => aboveEditor(box, list.editor)).sort((a, b) => a.y - b.y)[0];
+  let rows: ScreenBox[];
+  if (inChat) {
+    const outside = list.outside
+      .filter((box) => aboveEditor(box, list.editor) && box.y > inChat.y)
+      .sort((a, b) => a.y - b.y)[0];
+    rows = options.filter(
+      (box) => box.y >= inChat.y + inChat.height - 2 && (!outside || box.y + box.height <= outside.y + 2),
+    );
+  } else {
+    rows = options.filter((box) => box.fresh);
+  }
+  return rows.sort((a, b) => a.y - b.y)[0] ?? null;
+}
+
+const MENTION_LIST_WAIT_MS = 20_000;
+/** How long the bot's row must stay put before it is clicked. */
+const MENTION_ROW_STILL_MS = 1_200;
+
+/**
+ * Wait for the member list to offer the bot, then return its row once it has
+ * stopped moving. CI recordings: the list sits on a single skeleton row for
+ * up to ~10s while four lanes load the runner, and its sections render one
+ * after another — a click while 「会话外的人」 was still loading closed the
+ * list without inserting the mention, so the row must hold still a while.
+ */
+async function waitForMentionOption(page: Page, name: string): Promise<ScreenBox | null> {
+  const deadline = Date.now() + MENTION_LIST_WAIT_MS;
+  let last: ScreenBox | null = null;
+  let stillSince = 0;
+  while (Date.now() < deadline) {
+    const list = await mentionList(page, name).catch(() => null);
+    const option = list ? pickMentionOption(list) : null;
+    const same = !!option && !!last && Math.abs(option.x - last.x) < 1 && Math.abs(option.y - last.y) < 1;
+    if (!same) stillSince = Date.now();
+    else if (Date.now() - stillSince >= MENTION_ROW_STILL_MS) return option;
+    last = option;
+    await page.waitForTimeout(400);
+  }
+  return null;
+}
+
+/**
+ * The topic icon of a hovered message's toolbar: 👍, 💬, ↪, the topic icon,
+ * 「⋯」 — the one left of 「⋯」. The toolbar opens at the bubble's top right
+ * (CI: icons ~24px apart, level with the message text). `bubble` is the box
+ * of the message text; `icons` are
+ * small uncovered elements next to the bubble; nested ones (a button and its
+ * svg) collapse into one slot. Null unless a run of at least four slots
+ * starts right after the bubble. The vision agent tapped empty space 500px
+ * off this toolbar until Midscene's replanning limit, in two CI runs.
+ */
+export function pickTopicIcon(bubble: ScreenBox, icons: readonly ScreenBox[]): ScreenBox | null {
+  const right = bubble.x + bubble.width;
+  const slots: ScreenBox[] = [];
+  const near = icons
+    .filter((box) => {
+      const cx = box.x + box.width / 2;
+      const cy = box.y + box.height / 2;
+      return (
+        box.width >= 10 && box.width <= 40 && box.height >= 10 && box.height <= 40 &&
+        cx > right && cy >= bubble.y - 14 && cy <= bubble.y + 26
+      );
+    })
+    .sort((a, b) => a.x + a.width / 2 - (b.x + b.width / 2));
+  for (const box of near) {
+    const last = slots.at(-1);
+    if (last && Math.abs(last.x + last.width / 2 - (box.x + box.width / 2)) < 6) {
+      if (box.width * box.height > last.width * last.height) slots[slots.length - 1] = box;
+    } else {
+      slots.push(box);
+    }
+  }
+  // One contiguous toolbar starting next to the bubble.
+  const run: ScreenBox[] = [];
+  for (const slot of slots) {
+    const prev = run.at(-1);
+    const gap = prev ? slot.x - (prev.x + prev.width) : slot.x - right;
+    if (gap > 40) break;
+    run.push(slot);
+  }
+  return run.length >= 4 ? run[run.length - 2] : null;
+}
+
+/**
+ * In-page: small elements hit at points just right of `bubble`, plus up to
+ * three of their ancestors — the hover toolbar's icons and buttons. A string
+ * for the same reason as FIND_EDITOR.
+ */
+const TOOLBAR_ICONS = `(({ x, y, width, height }) => {
+  const out = [];
+  const seen = new Set();
+  for (let py = y - 14; py <= y + 26; py += 4) {
+    for (let px = x + width + 2; px <= x + width + 220; px += 3) {
+      let el = document.elementFromPoint(px, py);
+      for (let depth = 0; el && depth < 4; depth += 1, el = el.parentElement) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+        const r = el.getBoundingClientRect();
+        if (r.width <= 40 && r.height <= 40) out.push({ x: r.left, y: r.top, width: r.width, height: r.height });
+      }
+    }
+  }
+  return out;
+})`;
+
+/** The hovered bubble's topic icon, read from the page; null if not found. */
+export async function findTopicIcon(page: Page, bubble: ScreenBox): Promise<ScreenBox | null> {
+  const icons = (await page.evaluate(`(${TOOLBAR_ICONS})(${JSON.stringify(bubble)})`).catch(() => [])) as ScreenBox[];
+  return pickTopicIcon(bubble, icons);
+}
+
+/** What openNativeTopicWith needs from the page; injected so it can be tested. */
+export interface NativeTopicDeps {
+  /** Hover the message bubble; false when it could not be hovered. */
+  hover: () => Promise<boolean>;
+  /** The hovered bubble's topic icon (findTopicIcon); null until the full toolbar shows. */
+  findIcon: () => Promise<ScreenBox | null>;
+  click: (box: ScreenBox) => Promise<void>;
+  /** The vision fallback: click the topic icon the prompt describes. */
+  askVision: () => Promise<void>;
+  /** The click hit 转发 and opened its dialog. */
+  forwardDialogOpen: () => Promise<boolean>;
+  /** Close whatever the click opened (Escape). */
+  dismiss: () => Promise<void>;
+  /** The message's topic panel opened. */
+  topicPanelOpen: () => Promise<boolean>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  log: (message: string) => void;
+}
+
+/** How long a hovered message may take to offer its full toolbar. */
+const TOOLBAR_WAIT_MS = 15_000;
+
+/**
+ * The hovered message's topic icon, once its full toolbar shows. A message
+ * that is still sending offers only 「⋯」 (CI, run 40207592909: every Claude
+ * seed was checked 800ms after the hover, still sending, so the vision agent
+ * was asked — and tapped empty space until Midscene's replanning limit). The
+ * toolbar is drawn for the state under the pointer, so hover again each poll.
+ */
+export async function waitForTopicIcon(deps: NativeTopicDeps, budgetMs = TOOLBAR_WAIT_MS): Promise<ScreenBox | null> {
+  const deadline = deps.now() + budgetMs;
+  for (;;) {
+    const icon = await deps.findIcon();
+    if (icon) return icon;
+    if (deps.now() >= deadline) return null;
+    await deps.sleep(1_000);
+    await deps.hover();
+  }
+}
+
+/**
+ * Open a message's native topic: hover it, wait for its toolbar and click the
+ * topic icon. The vision agent is only the last attempt's fallback, and its
+ * failure ends that attempt rather than the case.
+ */
+export async function openNativeTopicWith(deps: NativeTopicDeps, tag: string, attempts = 3): Promise<void> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (!(await deps.hover())) continue;
+    const icon = await waitForTopicIcon(deps);
+    if (icon) {
+      await deps.click(icon);
+    } else if (attempt < attempts) {
+      deps.log(`No full toolbar next to ${tag} (attempt ${attempt}); hovering again`);
+      continue;
+    } else {
+      deps.log(`No full toolbar next to ${tag} (attempt ${attempt}); asking the vision agent`);
+      try {
+        await deps.askVision();
+      } catch (error) {
+        deps.log(`The vision agent could not click the topic icon of ${tag}: ${(error as Error).message.split('\n')[0]}`);
+        continue;
+      }
+    }
+    await deps.sleep(1_000);
+    if (await deps.forwardDialogOpen()) {
+      deps.log(`Opening the topic of ${tag} hit Forward (attempt ${attempt}); retrying`);
+      await deps.dismiss();
+      continue;
+    }
+    if (await deps.topicPanelOpen()) return;
+    deps.log(`No topic panel for ${tag} (attempt ${attempt}); retrying`);
+    await deps.dismiss();
+  }
+  throw new Error(`Could not open the native topic of ${tag} after ${attempts} attempts`);
+}
+
+/** One line on what the page held when the list never offered the bot. */
+async function describeMentionList(page: Page, name: string): Promise<string> {
+  const list = await mentionList(page, name).catch(() => null);
+  if (!list) return 'no editor has focus';
+  const near = list.options.filter((box) => aboveEditor(box, list.editor));
+  return (
+    `${list.options.length} name match(es) on top, ${near.length} above the input ` +
+    `(${near.filter((box) => box.fresh).length} new); 会话内成员 headers ${list.inChat.length}, ` +
+    `会话外的人 headers ${list.outside.length}; input ${JSON.stringify(await focusedInputText(page))}`
+  );
 }
 /**
  * The input holds exactly one mention and it is `botName`. A selected mention
@@ -461,19 +819,157 @@ export function inputHolds(editorText: string, typed: string, lead = ''): boolea
 export async function focusEditor(page: Page, where: 'chat' | 'topic'): Promise<boolean> {
   const editors = page.locator('[contenteditable="true"]');
   const viewport = page.viewportSize() ?? BROWSER_CONFIG.viewport;
-  const boxes: { index: number; x: number; y: number; bottom: number }[] = [];
+  const boxes: Array<ScreenBox & { index: number }> = [];
   const count = await editors.count();
   for (let index = 0; index < count; index++) {
     const box = await editors.nth(index).boundingBox().catch(() => null);
-    if (!box || box.width < 80 || box.height < 8) continue;
-    // The conversation sits right of the chat list; inputs sit low.
-    if (box.x < viewport.width * 0.3 || box.y < viewport.height * 0.45) continue;
-    boxes.push({ index, x: box.x, y: box.y, bottom: box.y + box.height });
+    if (box) boxes.push({ index, ...box });
   }
-  if (boxes.length === 0) return false;
-  boxes.sort((a, b) => (where === 'topic' ? b.x - a.x : a.x - b.x) || b.bottom - a.bottom);
-  await editors.nth(boxes[0].index).click({ timeout: 5_000 });
+  const panelLeft = where === 'topic' ? await sideTopicPanelLeft(page) : null;
+  const pick = pickEditorBox(boxes, where, viewport, panelLeft);
+  if (!pick) return false;
+  await editors.nth(pick.index).click({ timeout: 5_000 });
   return true;
+}
+
+/**
+ * The editor to type into: right of the chat list and low on the page; for
+ * `topic` the right-most (an open topic panel's reply box), for `chat` the
+ * left-most (the chat's own input). With a topic panel open beside the chat
+ * (`panelLeft`), only an editor inside it counts: CI sent a topic probe to
+ * the group because the panel's box had not mounted yet and the chat's input
+ * was the right-most editor on the page.
+ */
+export function pickEditorBox<T extends ScreenBox>(
+  boxes: readonly T[],
+  where: 'chat' | 'topic',
+  viewport: { width: number; height: number },
+  panelLeft: number | null = null,
+): T | null {
+  const usable = boxes.filter(
+    (box) =>
+      box.width >= 80 &&
+      box.height >= 8 &&
+      // The conversation sits right of the chat list; inputs sit low.
+      box.x >= viewport.width * 0.3 &&
+      box.y >= viewport.height * 0.45 &&
+      (panelLeft === null || box.x >= panelLeft - 40),
+  );
+  usable.sort(
+    (a, b) => (where === 'topic' ? b.x - a.x : a.x - b.x) || b.y + b.height - (a.y + a.height),
+  );
+  return usable[0] ?? null;
+}
+
+/** Left edge of a topic panel open beside the chat (its 「话题」 title, top right); null without one. */
+async function sideTopicPanelLeft(page: Page): Promise<number | null> {
+  const viewport = page.viewportSize() ?? BROWSER_CONFIG.viewport;
+  const titles = page.getByText(/^\s*(话题|Topic)\s*$/);
+  const count = await titles.count().catch(() => 0);
+  for (let i = 0; i < count; i++) {
+    const box = await titles.nth(i).boundingBox().catch(() => null);
+    if (box && box.width > 0 && box.x > viewport.width * 0.6 && box.y < viewport.height * 0.15) return box.x;
+  }
+  return null;
+}
+
+const TOPIC_REPLY_BOX_PROMPT =
+  '点击正在显示的测试话题（右侧话题面板，或占满主内容区的话题）最底部提示为「回复话题」的输入框；' +
+  '不要点群聊自己的输入框（提示为「发送给 …」）';
+
+/** The pieces of a focus attempt; injected so the loop can be tested. */
+export interface FocusLoop {
+  /** Click the candidate input; true when an editor holds the caret. */
+  focus: () => Promise<boolean>;
+  /** The focused editor is the one wanted (a topic reply box, for `topic`). */
+  accepted: () => Promise<boolean>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/** True once a focused editor passes `accepted`; false when `waitMs` runs out. */
+export async function focusUntilAccepted(loop: FocusLoop, waitMs: number): Promise<boolean> {
+  const deadline = loop.now() + waitMs;
+  for (;;) {
+    if ((await loop.focus()) && (await loop.accepted())) return true;
+    if (loop.now() >= deadline) return false;
+    await loop.sleep(500);
+  }
+}
+
+/**
+ * Whether the focused editor is a topic's reply box, from what surrounds it:
+ * its own label, or its composer's text. A topic composer reads 「回复话题」 and
+ * carries a 「同时发送到群 / 同时发送到会话」 checkbox, which stays while the box
+ * holds text; the chat's own input reads 「发送给 …」 and has none.
+ */
+export function isTopicReplyComposer(evidence: { labels: readonly string[]; texts: readonly string[] }): boolean {
+  return (
+    evidence.labels.some((label) => /回复话题|Reply to topic/i.test(label)) ||
+    evidence.texts.some((text) => /回复话题|同时发送到|Also send to/i.test(text))
+  );
+}
+
+/**
+ * In-page: the focused editor's labels, and the text of each ancestor up to
+ * the composer's height. A string for the same reason as FIND_EDITOR.
+ */
+const FOCUSED_COMPOSER = `(() => {
+  const editor = ${FIND_EDITOR};
+  if (!editor) return { labels: [], texts: [] };
+  const labels = ['placeholder', 'data-placeholder', 'aria-placeholder', 'aria-label']
+    .map((name) => editor.getAttribute(name) || '');
+  const texts = [];
+  let el = editor;
+  for (let depth = 0; el && depth < 8; depth += 1, el = el.parentElement) {
+    if (el.getBoundingClientRect().height > 260) break;
+    texts.push(el.innerText || '');
+  }
+  return { labels, texts };
+})()`;
+
+async function focusedIsTopicReply(page: Page): Promise<boolean> {
+  const evidence = (await page.evaluate(FOCUSED_COMPOSER).catch(() => null)) as { labels: string[]; texts: string[] } | null;
+  return !!evidence && isTopicReplyComposer(evidence);
+}
+
+/** What focusTarget needs from the page; injected so the whole chain can be tested. */
+export interface FocusDeps {
+  /** Click the candidate input (focusEditor); false when there is none. */
+  clickEditor: () => Promise<boolean>;
+  /** An editor holds the caret: CI once typed into nothing after a positional click. */
+  hasCaret: () => Promise<boolean>;
+  /** The focused editor is a topic's reply box (isTopicReplyComposer). */
+  isTopicReply: () => Promise<boolean>;
+  /** The vision fallback: click the input the prompt describes. */
+  askVision: () => Promise<void>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/** The focus loop for `where`: `topic` accepts only a topic reply box. */
+export function buildFocusLoop(deps: FocusDeps, where: 'chat' | 'topic'): FocusLoop {
+  return {
+    focus: async () => (await deps.clickEditor()) && (await deps.hasCaret()),
+    accepted: () => (where === 'topic' ? deps.isTopicReply() : Promise.resolve(true)),
+    now: deps.now,
+    sleep: deps.sleep,
+  };
+}
+
+/**
+ * Put the caret in the chat's input or the open topic's reply box. `topic`
+ * only accepts a box that is itself a topic reply box: while a topic panel is
+ * still mounting, the only editor on the page can be the chat's own — CI sent
+ * a topic probe to the group that way. It waits up to `waitMs` for the box,
+ * then asks the vision agent, and refuses to go on in another input.
+ */
+export async function focusTarget(deps: FocusDeps, where: 'chat' | 'topic', waitMs: number): Promise<void> {
+  if (await focusUntilAccepted(buildFocusLoop(deps, where), waitMs)) return;
+  await deps.askVision();
+  if (where === 'topic' && !(await deps.isTopicReply())) {
+    throw new Error('Could not put the caret in the topic reply box; not typing into another input');
+  }
 }
 
 async function focusOrAsk(
@@ -481,11 +977,47 @@ async function focusOrAsk(
   agent: PlaywrightAgent,
   where: 'chat' | 'topic',
   prompt: string,
+  waitMs = 0,
 ): Promise<void> {
-  // CI once typed into nothing after a positional click ("the input still
-  // read ''"): only trust it when focus actually landed in an editor.
-  if ((await focusEditor(page, where).catch(() => false)) && (await page.evaluate(`!!${FIND_EDITOR}`))) return;
-  await agent.aiAct(prompt);
+  await focusTarget(
+    {
+      clickEditor: () => focusEditor(page, where).catch(() => false),
+      hasCaret: () => page.evaluate(`!!${FIND_EDITOR}`),
+      isTopicReply: () => focusedIsTopicReply(page),
+      askVision: async () => {
+        await agent.aiAct(prompt);
+      },
+      now: () => Date.now(),
+      sleep: (ms) => page.waitForTimeout(ms),
+    },
+    where,
+    waitMs,
+  );
+}
+
+/** How long the first focus of one topic send waits for the reply box to mount. */
+const TOPIC_REPLY_WAIT_MS = 10_000;
+/** Later focuses of the same send: the box was already given its time. */
+const TOPIC_REPLY_RETRY_WAIT_MS = 2_000;
+
+/**
+ * Wait budgets for the focuses of one send: the first gets the full wait, the
+ * retries (sendTyped and typeMention focus again after a failed attempt) only
+ * a short one, so a box that never mounts costs 10s, not 10s per retry.
+ */
+export function focusBudgets(first = TOPIC_REPLY_WAIT_MS, retry = TOPIC_REPLY_RETRY_WAIT_MS): () => number {
+  let next = first;
+  return () => {
+    const budget = next;
+    next = retry;
+    return budget;
+  };
+}
+
+/** A focus for one topic send (see focusBudgets). */
+function topicReplyFocus(page: Page, agent: PlaywrightAgent): () => Promise<void> {
+  const budget = focusBudgets();
+  return () => focusOrAsk(page, agent, 'topic', TOPIC_REPLY_BOX_PROMPT, budget());
 }
 
 /**
@@ -547,46 +1079,55 @@ async function warmUpInput(page: Page): Promise<void> {
 
 /**
  * Mention `botName` in the focused input, type `message` after it and send.
- * CI showed the vision pick from the @ dropdown landing on a neighbouring bot
- * (Aiden, OpenCode, another app) a few times per run — so the dropdown is
- * filtered by typing the name, and the input is checked before sending: a
- * message @ing the wrong bot is never sent. Slash commands get a trailing
- * space so Feishu's suggestion popup cannot take the Enter; the daemon trims it.
+ * The member list is filtered by typing the name, its row is clicked once it
+ * has loaded (waitForMentionOption), and the input is checked before sending:
+ * a message @ing the wrong bot is never sent. CI pressed Enter on the list
+ * while it still showed a skeleton row — that only added a line break — and
+ * the vision fallback then looped until Midscene's replanning limit. Slash
+ * commands get a trailing space so Feishu's suggestion popup cannot take the
+ * Enter; the daemon trims it. `focus` puts the caret back in the input
+ * between attempts: a click that misses the list blurs it, and a clear or a
+ * retype into a blurred input does nothing (CI: "@Claude" + "aude").
  */
 async function typeMention(
   page: Page,
-  agent: PlaywrightAgent,
   botName: string,
   message: string,
+  focus: () => Promise<unknown>,
 ): Promise<void> {
   const name = botName.replace(/^\[Botmux\]/, '');
   let text = '';
   for (let attempt = 1; attempt <= 3; attempt++) {
-    await page.keyboard.type(`@${name}`, { delay: 60 });
-    await page.waitForTimeout(1_500);
-    if (attempt < 3) {
-      // The filtered dropdown highlights its first match.
-      await page.keyboard.press('Enter');
-    } else {
-      await agent.aiAct(
-        `在弹出的@提及列表中点击名称恰好为"${botChatName(name)}"的机器人（带"机器人"徽标）；` +
-          '不要选其它机器人，也不要选同名的原生智能体',
-      );
+    if (attempt > 1) {
+      await focus();
+      await page.waitForTimeout(500);
+      await clearFocusedInput(page);
+      await warmUpInput(page);
     }
-    await page.waitForTimeout(600);
-    text = await focusedInputText(page);
-    if (
-      holdsOnlyMention(text, name) &&
-      (await typeVerified(page, ` ${message}${message.startsWith('/') ? ' ' : ''}`, 20, text)) &&
-      holdsOnlyMention(await focusedInputText(page), name)
-    ) {
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(1_000);
-      return;
+    await mentionList(page, name, true).catch(() => null);
+    await page.keyboard.type(`@${name}`, { delay: 60 });
+    const option = await waitForMentionOption(page, name);
+    if (option) {
+      await page.mouse.click(option.x + Math.min(option.width / 2, 40), option.y + option.height / 2);
+      await page.waitForTimeout(600);
+      text = await focusedInputText(page);
+      if (
+        holdsOnlyMention(text, name) &&
+        (await typeVerified(page, ` ${message}${message.startsWith('/') ? ' ' : ''}`, 20, text)) &&
+        holdsOnlyMention(await focusedInputText(page), name)
+      ) {
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(1_000);
+        return;
+      }
+    } else {
+      console.warn(
+        `[e2e] @${name}: the member list never offered ${botChatName(name)} (attempt ${attempt}): ` +
+          (await describeMentionList(page, name)),
+      );
     }
     text = await focusedInputText(page);
     console.warn(`[e2e] @${name} selection attempt ${attempt} left the input as ${JSON.stringify(text)}; retrying`);
-    await clearFocusedInput(page);
   }
   throw new Error(`Could not mention ${botChatName(name)}: the input still read ${JSON.stringify(text)}`);
 }
@@ -599,10 +1140,11 @@ export async function sendMentionInOpenTopic(
   message: string,
 ): Promise<void> {
   await scrollThreadToBottom(agent);
-  await focusOrAsk(page, agent, 'topic', '点击主内容区正在显示的测试话题最底部的回复输入框');
+  const focus = topicReplyFocus(page, agent);
+  await focus();
   await page.waitForTimeout(500);
   await warmUpInput(page);
-  await typeMention(page, agent, botName, message);
+  await typeMention(page, botName, message, focus);
 }
 
 /**
@@ -656,6 +1198,47 @@ export async function waitForCardStatus(
   );
 }
 
+/** What waitForCardButtons needs from the page; injected so it can be tested. */
+export interface CardWaitDeps {
+  /** The session card's buttons are in the DOM. */
+  cardShown: () => Promise<boolean>;
+  /** Reveal 「N 条新消息」 and click a late 直接开启会话. */
+  nudge: () => Promise<void>;
+  /** Load Messenger afresh and open the topic again. */
+  reopen: () => Promise<void>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/** How long the topic may go without the session card before it is reopened. */
+const CARD_STALE_MS = 45_000;
+
+/**
+ * Poll for the session card's buttons; once, after 45s without them, reopen
+ * the topic. CI (run 40257129089): the topic stayed at the recalled repo card
+ * (「此消息已撤回」) while the session had already answered, until the step
+ * timed out. Reopening (a Messenger load plus openThreadForMessage) can take
+ * longer than what is left of `timeoutMs`, so the card is looked for once
+ * more after it; `timeoutMs` still bounds the polling. True when the card
+ * showed.
+ */
+export async function waitForCardButtons(deps: CardWaitDeps, timeoutMs: number): Promise<boolean> {
+  const started = deps.now();
+  const deadline = started + timeoutMs;
+  let reopened = false;
+  while (deps.now() < deadline) {
+    if (await deps.cardShown()) return true;
+    if (!reopened && deps.now() - started >= CARD_STALE_MS) {
+      reopened = true;
+      await deps.reopen();
+      continue;
+    }
+    await deps.nudge();
+    await deps.sleep(2_000);
+  }
+  return reopened && (await deps.cardShown());
+}
+
 /**
  * Full flow after sending a message:
  *  1. Switch to Feishu's 「话题」filter tab so the test topic opens in the
@@ -683,13 +1266,25 @@ export async function waitForStreamingCard(
   // the card's buttons are in the DOM.
   const page = opts?.page;
   if (page) {
-    const tag = opts?.msgHint ? messageTag(opts.msgHint) : '';
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && (await pageTextCount(page, '打开 Web 终端')) === 0) {
-      await revealNewMessages(page);
-      if (tag) await clickDirectStartAfter(page, tag);
-      await page.waitForTimeout(2_000);
-    }
+    const msgHint = opts?.msgHint;
+    const tag = msgHint ? messageTag(msgHint) : '';
+    await waitForCardButtons(
+      {
+        cardShown: async () => (await pageTextCount(page, '打开 Web 终端')) > 0,
+        nudge: async () => {
+          await revealNewMessages(page);
+          if (tag) await clickDirectStartAfter(page, tag);
+        },
+        reopen: async () => {
+          if (!msgHint) return;
+          console.warn(`[e2e] No session card for "${tag}" after ${CARD_STALE_MS / 1000}s; re-opening the topic`);
+          await reopenTopic(agent, page, msgHint)();
+        },
+        now: () => Date.now(),
+        sleep: (ms) => page.waitForTimeout(ms),
+      },
+      timeoutMs,
+    );
   }
 
   // Step 5: Wait for streaming card.
@@ -702,53 +1297,294 @@ export async function waitForStreamingCard(
   );
 }
 
-/**
- * Open a test topic by switching to the 「话题」filter tab and clicking the
- * entry whose preview contains the test-message tag. After this call, the
- * topic is shown in the wide main content area (not the narrow right-side
- * thread panel), which is far more reliable for subsequent assertions and
- * button clicks.
- */
-export async function openThreadForMessage(
-  agent: PlaywrightAgent,
-  opts?: { timeoutMs?: number; msgHint?: string; page?: Page },
-): Promise<void> {
-  const timeoutMs = opts?.timeoutMs ?? 60_000;
-  const rawMsg = opts?.msgHint ?? '';
-  const tag = rawMsg ? messageTag(rawMsg) : '';
-
-  if (!tag) {
-    throw new Error(
-      'openThreadForMessage requires msgHint — without a test-message tag we cannot reliably pick the right topic among historical ones',
-    );
+/** Click an entry of the filter column (「消息」, 「话题」, …); false when it is not on screen (see pickFilterLabel). */
+export async function clickChatFilter(page: Page, labels: readonly string[]): Promise<boolean> {
+  const viewport = page.viewportSize() ?? BROWSER_CONFIG.viewport;
+  const boxes = ((await page.evaluate(`(${TEXT_NODE_BOXES})(${JSON.stringify(labels)})`).catch(() => [])) ??
+    []) as ScreenBox[];
+  const box = pickFilterLabel(boxes, viewport);
+  if (!box) {
+    const xs = boxes.map((b) => Math.round(b.x)).join(', ') || 'none';
+    console.warn(`[e2e] No 「${labels[0]}」 entry in the filter column (text nodes at x: ${xs})`);
+    return false;
   }
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForTimeout(1_000);
+  return true;
+}
 
+/**
+ * In-page: boxes of the elements holding a text node that reads exactly one
+ * of `labels`. Matching text nodes, not elements: the filter entry wraps the
+ * word with an icon and a count, so no element reads just 「话题」 — CI never
+ * once clicked it through `getByText` and fell back to the vision agent, which
+ * sometimes looped until the replanning limit. A string for the same reason
+ * as FIND_EDITOR.
+ */
+const TEXT_NODE_BOXES = `((labels) => {
+  const out = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const text = walker.currentNode.data.replace(/[\u200b-\u200d\u2060\ufeff]/g, '').trim();
+    if (!labels.includes(text)) continue;
+    const el = walker.currentNode.parentElement;
+    if (!el) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) out.push({ x: r.left, y: r.top, width: r.width, height: r.height });
+  }
+  return out;
+})`;
+
+/**
+ * In-page: boxes of the elements holding a text node that reads exactly
+ * `name`, each with `onTop`. Text clipped by a scroll container or off screen
+ * keeps its box but is not on top. A string for the same reason as
+ * FIND_EDITOR.
+ */
+const TITLE_BOXES = `((name) => {
+  const out = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    if (walker.currentNode.data.replace(/[\u200b-\u200d\u2060\ufeff]/g, '').trim() !== name) continue;
+    const el = walker.currentNode.parentElement;
+    if (!el) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    const onTop = !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+    out.push({ x: r.left, y: r.top, width: r.width, height: r.height, onTop });
+  }
+  return out;
+})`;
+
+/**
+ * The entry of the filter column between the app bar and the chat list. The
+ * same words title the app bar's 「消息」 (x ≈ 2%), the chat list (≈ 17%) and an
+ * open topic's panel (right half), so only a label inside the column's band
+ * (6%–16% of the width) counts.
+ */
+export function pickFilterLabel(boxes: readonly ScreenBox[], viewport: { width: number; height: number }): ScreenBox | null {
+  const inBand = boxes.filter((box) => box.x >= viewport.width * 0.06 && box.x <= viewport.width * 0.16);
+  return inBand[0] ?? null;
+}
+
+const TOPICS_FILTER = ['话题', 'Topics'] as const;
+export const MESSAGES_FILTER = ['消息', 'Messages'] as const;
+
+/** A text node holding a test tag (TAG_TEXTS): its element's box and the row around it. */
+export interface TagText {
+  box: ScreenBox;
+  /** Nearest ancestor at least twice the element's height: the chat-list entry in the list. */
+  row: ScreenBox | null;
+}
+
+/**
+ * In-page: every text node containing `tag`. A string for the same reason as
+ * FIND_EDITOR.
+ */
+const TAG_TEXTS = `((tag) => {
+  const box = (r) => ({ x: r.left, y: r.top, width: r.width, height: r.height });
+  const out = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    if (!walker.currentNode.data.includes(tag)) continue;
+    const el = walker.currentNode.parentElement;
+    if (!el) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    let row = null;
+    for (let a = el.parentElement, i = 0; a && i < 8; a = a.parentElement, i++) {
+      const ar = a.getBoundingClientRect();
+      if (ar.height >= r.height * 2) { row = box(ar); break; }
+    }
+    out.push({ box: box(r), row });
+  }
+  return out;
+})`;
+
+/**
+ * The chat-list entry of the topic whose root message carries the tag. The
+ * list (left of 30% of the width) shows every topic, in a group or a DM, as
+ * an entry titled with its root message; the chat the topic lives in shows
+ * the same tag in the preview line under the chat's name, and opening that
+ * shows the chat, not the topic. So only a tag in the upper half of its entry
+ * counts.
+ */
+export function pickTopicEntry(texts: readonly TagText[], viewport: { width: number; height: number }): ScreenBox | null {
+  const titles = texts.filter(({ box, row }) => {
+    const middle = box.y + box.height / 2;
+    return (
+      row !== null &&
+      box.x >= viewport.width * 0.03 &&
+      box.x < viewport.width * 0.3 &&
+      middle > 0 &&
+      middle < viewport.height &&
+      middle < row.y + row.height / 2
+    );
+  });
+  return [...titles].sort((a, b) => a.box.y - b.box.y)[0]?.box ?? null;
+}
+
+/**
+ * The wide main area shows a topic carrying the tag: the topic's 「话题」 header
+ * sits at its top left (30%–50% of the width; the narrow side panel's title is
+ * further right) and the tag is on the right of the list.
+ */
+export function topicOpenInMain(
+  headers: readonly ScreenBox[],
+  texts: readonly TagText[],
+  viewport: { width: number; height: number },
+): boolean {
+  const header = headers.some(
+    (box) => box.x >= viewport.width * 0.3 && box.x < viewport.width * 0.5 && box.y < viewport.height * 0.1,
+  );
+  return header && texts.some(({ box }) => box.x >= viewport.width * 0.3);
+}
+
+/**
+ * The main area already shows the tag's own topic: the tag sits in the root
+ * message right under the topic's 「话题」 header (within 15% of the height).
+ * A reply quoting the tag in another topic sits lower, below the root and its
+ * 「N 条话题回复」 divider.
+ */
+export function topicRootInMain(
+  headers: readonly ScreenBox[],
+  texts: readonly TagText[],
+  viewport: { width: number; height: number },
+): boolean {
+  return headers.some(
+    (header) =>
+      header.x >= viewport.width * 0.3 &&
+      header.x < viewport.width * 0.5 &&
+      header.y < viewport.height * 0.1 &&
+      texts.some(
+        ({ box }) =>
+          box.x >= viewport.width * 0.3 && box.y > header.y && box.y - header.y < viewport.height * 0.15,
+      ),
+  );
+}
+
+/** What openTopicFromList needs from the page; injected so it can be tested. */
+export interface TopicListDeps {
+  tagTexts: () => Promise<TagText[]>;
+  /** Text nodes reading 「话题」/"Topic" (TEXT_NODE_BOXES). */
+  headers: () => Promise<ScreenBox[]>;
+  click: (box: ScreenBox) => Promise<void>;
+  /** Load Messenger afresh (navigateToMessenger). */
+  reload: () => Promise<void>;
+  viewport: { width: number; height: number };
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/** How long the list may go without opening the topic before Messenger is reloaded. */
+const TOPIC_LIST_STALE_MS = 45_000;
+
+/**
+ * Click the topic's chat-list entry until the main area shows the topic;
+ * false when that never happened within budgetMs. Waits while the entry is
+ * not listed yet: a topic exists only once someone replies in it. After 45s
+ * without the topic open, Messenger is reloaded once: CI (run 40130808312)
+ * showed a chat list that stayed minutes behind while the open chat already
+ * had the topic and its reply. Only once: a reload redraws the list blank
+ * again, and while Messenger loads slowly every reload costs most of the
+ * budget (runs 40257129089 and 40271295593 reloaded every 30s and never got
+ * past the blank list before the step timed out).
+ */
+export async function openTopicFromList(deps: TopicListDeps, budgetMs: number): Promise<boolean> {
+  const started = deps.now();
+  const deadline = started + budgetMs;
+  let reloaded = false;
+  while (deps.now() < deadline) {
+    if (!reloaded && deps.now() - started >= TOPIC_LIST_STALE_MS) {
+      reloaded = true;
+      await deps.reload();
+    }
+    const texts = await deps.tagTexts();
+    const entry = pickTopicEntry(texts, deps.viewport);
+    if (!entry) {
+      // CI (run 40257129089): the list drew blank rows for over a minute while
+      // the main area already showed this topic. Without a listed entry to
+      // click, accept the topic only by its root message.
+      if (topicRootInMain(await deps.headers(), texts, deps.viewport)) return true;
+      await deps.sleep(2_000);
+      continue;
+    }
+    await deps.click(entry);
+    await deps.sleep(1_500);
+    if (topicOpenInMain(await deps.headers(), await deps.tagTexts(), deps.viewport)) return true;
+  }
+  return false;
+}
+
+function topicListDeps(page: Page, tag: string): TopicListDeps {
+  return {
+    tagTexts: async () =>
+      ((await page.evaluate(`(${TAG_TEXTS})(${JSON.stringify(tag)})`).catch(() => [])) ?? []) as TagText[],
+    headers: async () =>
+      ((await page.evaluate(`(${TEXT_NODE_BOXES})(${JSON.stringify(['话题', 'Topic'])})`).catch(() => [])) ??
+        []) as ScreenBox[],
+    click: async (box) => {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    },
+    // One page load, not navigateToMessenger's four 60s attempts: the list is
+    // polled right after, and the budget is the list path's, not a full load's.
+    reload: async () => {
+      await page.goto(getMessengerUrl(), { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+    },
+    viewport: page.viewportSize() ?? BROWSER_CONFIG.viewport,
+    now: () => Date.now(),
+    sleep: (ms) => page.waitForTimeout(ms),
+  };
+}
+
+/**
+ * Steps 1–3 of openThreadForMessage the way they ran before the chat-list
+ * path: switch to the 「话题」 filter, then click the entry holding the tag.
+ */
+async function openTopicViaFilter(
+  agent: PlaywrightAgent,
+  page: Page | undefined,
+  tag: string,
+  timeoutMs: number,
+): Promise<void> {
   // Step 1: Switch to the 「话题 / Topics」filter tab on the left-middle
   // column. The saved Feishu account can render either the Chinese UI (tab
   // labelled 「话题」) or the English UI (tab labelled "Topics" / "Topic
   // chats"), so the instruction accepts either label instead of demanding the
   // literal Chinese characters (which made the agent refuse to click when the
   // UI was English). After this, the middle column shows the topic list.
-  await agent.aiAct(
-    'Click the "Topics" filter tab at the top of the left-middle column ' +
-      '(Chinese UI: the tab labelled 「话题」; English UI: the tab labelled ' +
-      '"Topics" or "Topic chats"). Its icon looks like an index-card/contact ' +
-      'card (📇/▯). It is NOT "Messages/消息", NOT "@mentions/@我", NOT ' +
-      '"Unread/未读", NOT "Labels/标签". After clicking, the middle column ' +
-      'switches to the topics list.',
-  );
-  await agent.aiWaitFor(
-    'The middle column is now a list of topic/thread entries (a topic list, ' +
-      'not the ordinary message/chats list). The active filter tab is Topics ' +
-      '(「话题」in Chinese).',
-    { timeoutMs: 15_000, checkIntervalMs: 2_000 },
-  );
+  // The label is clicked through the DOM first: CI once saw the vision click
+  // "succeed" while 「消息」 stayed selected.
+  for (let round = 1; ; round++) {
+    if (!(round === 1 && page && (await clickChatFilter(page, TOPICS_FILTER)))) {
+      await agent.aiAct(
+        'Click the "Topics" filter tab at the top of the left-middle column ' +
+          '(Chinese UI: the tab labelled 「话题」; English UI: the tab labelled ' +
+          '"Topics" or "Topic chats"). Its icon looks like an index-card/contact ' +
+          'card (📇/▯). It is NOT "Messages/消息", NOT "@mentions/@我", NOT ' +
+          '"Unread/未读", NOT "Labels/标签". After clicking, the middle column ' +
+          'switches to the topics list.',
+      );
+    }
+    try {
+      await agent.aiWaitFor(
+        'The middle column is now a list of topic/thread entries (a topic list, ' +
+          'not the ordinary message/chats list). The active filter tab is Topics ' +
+          '(「话题」in Chinese).',
+        { timeoutMs: 15_000, checkIntervalMs: 2_000 },
+      );
+      break;
+    } catch (error) {
+      if (round >= 2) throw error;
+      console.warn(`[e2e] The 「话题」 filter did not take (round ${round}); clicking it again`);
+    }
+  }
 
   // Step 2 + 3: Find and click the topic. Feishu's topic list visually
   // truncates previews to ~6-10 chars, so the AI can't reliably match the
   // full tag. Playwright's DOM locator sees the full text even when it's
   // clipped by CSS, so we use it when page is available.
-  const page = opts?.page;
   if (page) {
     const deadline = Date.now() + timeoutMs;
     let clicked = false;
@@ -783,6 +1619,39 @@ export async function openThreadForMessage(
     await agent.aiAct(
       `在中间"话题"列表里点击那条预览包含"${labelPrefix}"的条目，把对应话题打开到右侧主内容区`,
     );
+  }
+}
+
+/**
+ * Open a test topic by clicking its chat-list entry (the one titled with the
+ * test-message tag; see pickTopicEntry). After this call, the topic is shown
+ * in the wide main content area (not the narrow right-side thread panel),
+ * which is far more reliable for subsequent assertions and button clicks.
+ */
+export async function openThreadForMessage(
+  agent: PlaywrightAgent,
+  opts?: { timeoutMs?: number; msgHint?: string; page?: Page },
+): Promise<void> {
+  const timeoutMs = opts?.timeoutMs ?? 60_000;
+  const rawMsg = opts?.msgHint ?? '';
+  const tag = rawMsg ? messageTag(rawMsg) : '';
+
+  if (!tag) {
+    throw new Error(
+      'openThreadForMessage requires msgHint — without a test-message tag we cannot reliably pick the right topic among historical ones',
+    );
+  }
+
+  // The chat list (「消息」) already shows every topic as an entry titled with
+  // its root message: click that entry through the DOM. CI never had a
+  // 「话题」 filter to switch to (run 40114756911: the vision agent tapped the
+  // 「普通群聊」/「话题群聊」 shortcuts above the list and the topic-list check
+  // failed both attempts). The filter steps stay as the fallback.
+  const page = opts?.page;
+  const listBudget = Math.max(timeoutMs - 30_000, timeoutMs / 2);
+  if (!(page && (await openTopicFromList(topicListDeps(page, tag), listBudget)))) {
+    if (page) console.warn(`[e2e] No chat-list entry opened the topic of "${tag}" in ${listBudget}ms; trying the 「话题」 filter`);
+    await openTopicViaFilter(agent, page, tag, page ? timeoutMs - listBudget : timeoutMs);
   }
 
   // Step 4: Confirm the topic is loaded in the wide main area. This is the
@@ -1103,6 +1972,32 @@ export async function clickDirectStartAfter(page: Page, anchor: string): Promise
  * `min` 2). On the way, clicks the repo card the bot may post first — both
  * Claude and Codex do when the session has no pinned working directory.
  */
+/**
+ * Why the watched view looks stale, or '' when it does not: a 「新消息」 pill
+ * that stays up, the probe itself missing from the page, or — once, before any
+ * re-open — nothing at all after 100s: no reply and no repo card to click.
+ * CI saw a group view keep the probe on screen while the bot's repo card and
+ * reply, both sent within seconds, never rendered.
+ */
+export function staleViewReason(state: {
+  now: number;
+  started: number;
+  pillSince: number | null;
+  anchorGoneSince: number | null;
+  cardVisible: boolean;
+  reopened: number;
+  anchor: string;
+}): string {
+  if (state.pillSince !== null && state.now - state.pillSince > 25_000) return '「新消息」 pill stayed up';
+  if (state.anchorGoneSince !== null && state.now - state.anchorGoneSince > 45_000) {
+    return `"${state.anchor}" is not on the page`;
+  }
+  if (state.reopened === 0 && !state.cardVisible && state.now - state.started > 100_000) {
+    return 'no reply or repo card after 100s';
+  }
+  return '';
+}
+
 export async function waitForReplyLine(
   page: Page,
   line: string,
@@ -1112,8 +2007,11 @@ export async function waitForReplyLine(
     anchor?: string;
     agent?: PlaywrightAgent;
     /**
-     * Re-open the view being watched. Used when a 「新消息」 pill stays up after
-     * being clicked: a topic opened after its reply arrived renders the reply.
+     * Re-open the view being watched, when it stopped updating: a 「新消息」
+     * pill stays up after being clicked, or the probe itself is not on the
+     * page. CI saw a group view stuck on 「正在加载…」 below an older message
+     * for four minutes while the bot's reply sat in the chat-list preview; a
+     * view opened after the reply arrived renders it.
      */
     reopen?: () => Promise<void>;
   },
@@ -1129,6 +2027,7 @@ export async function waitForReplyLine(
   let lastClick = 0;
   let visionClicked = false;
   let pillSince: number | null = null;
+  let anchorGoneSince: number | null = null;
   let reopened = 0;
   let count = 0;
   while (Date.now() < deadline) {
@@ -1136,10 +2035,22 @@ export async function waitForReplyLine(
     if (count >= min) return;
     const pillUp = await anyVisible(page.getByText(NEW_MESSAGES_PILL));
     pillSince = pillUp ? pillSince ?? Date.now() : null;
-    if (pillSince !== null && Date.now() - pillSince > 25_000 && opts?.reopen && reopened < 2) {
+    const anchorShown = (await pageTextCount(page, anchor)) > 0;
+    anchorGoneSince = anchorShown ? null : anchorGoneSince ?? Date.now();
+    const stale = staleViewReason({
+      now: Date.now(),
+      started,
+      pillSince,
+      anchorGoneSince,
+      cardVisible: await anyVisible(page.getByText(DIRECT_START_LABEL)),
+      reopened,
+      anchor,
+    });
+    if (stale && opts?.reopen && reopened < 2) {
       reopened += 1;
       pillSince = null;
-      console.warn(`[e2e] 「新消息」 pill stayed up; re-opening the view (${reopened}/2)`);
+      anchorGoneSince = null;
+      console.warn(`[e2e] ${stale}; re-opening the view (${reopened}/2)`);
       try {
         await opts.reopen();
       } catch (error) {
@@ -1191,7 +2102,10 @@ function escapeRegExp(text: string): string {
  * Send a command and wait for the bot's answer to it: text matching `pattern`
  * that appears after the last echo of `command` (the user's bubble, or the
  * quote in the bot's reply). Returns the match. DOM order instead of counts,
- * because older messages drop out of Feishu's partial rendering.
+ * because older messages drop out of Feishu's partial rendering. With
+ * `reopen`, a view that shows nothing by half time is opened again once: CI
+ * saw a mode restore fail three times while the bot had answered each within
+ * a second, because the group view had stopped rendering new messages.
  */
 export async function sendAndAwaitReply(
   page: Page,
@@ -1199,16 +2113,29 @@ export async function sendAndAwaitReply(
   command: string,
   pattern: RegExp,
   timeoutMs = 60_000,
+  reopen?: () => Promise<void>,
 ): Promise<RegExpMatchArray> {
   const echo = new RegExp(`${escapeRegExp(command.trim())}[ \\t]*\\n`, 'g');
   await send();
-  const deadline = Date.now() + timeoutMs;
+  const started = Date.now();
+  const deadline = started + timeoutMs;
+  let reopened = false;
   while (Date.now() < deadline) {
     const body = await page.locator('body').innerText();
     const echoes = [...body.matchAll(echo)];
     const after = echoes.length > 0 ? body.slice(echoes.at(-1)!.index! + echoes.at(-1)![0].length) : '';
     const match = after.match(pattern);
     if (match) return match;
+    if (reopen && !reopened && Date.now() - started > timeoutMs / 2) {
+      reopened = true;
+      console.warn(`[e2e] No reply to "${command}" yet; re-opening the view`);
+      try {
+        await reopen();
+      } catch (error) {
+        console.warn(`[e2e] Re-opening the view failed: ${(error as Error).message.split('\n')[0]}`);
+      }
+      continue;
+    }
     await scrollConversation(page);
     await page.waitForTimeout(2_000);
   }
@@ -1357,7 +2284,7 @@ export async function typeThreadReply(
   await scrollThreadToBottom(agent);
   await sendTyped(
     page,
-    () => focusOrAsk(page, agent, 'topic', '点击主内容区正在显示的测试话题最底部的回复输入框'),
+    topicReplyFocus(page, agent),
     text,
     30,
   );

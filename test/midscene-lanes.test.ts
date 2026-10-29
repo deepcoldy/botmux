@@ -4,7 +4,10 @@ import { describe, expect, it } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 import {
   CASES_DIR,
+  LONG_LANES_FIRST,
   laneProject,
+  laneStartOrder,
+  laneStem,
   listLaneFiles,
   selectedCaseFiles,
   selectLaneFiles,
@@ -58,6 +61,20 @@ describe('Feishu Midscene lanes', () => {
     expect(selectedCaseFiles('all')).not.toContain('cases-traex/traex-ambient.yaml');
     expect(selectedCaseFiles(undefined)).toEqual(selectLaneFiles(files).map((file) => `cases/${file}`));
     expect(laneProject('cases-traex/traex-ambient.yaml')).toBe('feishu-traex-ambient');
+  });
+
+  it('starts the long serial lane first and keeps the rest in order', () => {
+    const core = selectedCaseFiles('core');
+    const started = laneStartOrder(core);
+    expect(started.map(laneProject)).toEqual([
+      'feishu-core-group-modes',
+      ...core.map(laneProject).filter((name) => name !== 'feishu-core-group-modes'),
+    ]);
+    expect(laneStartOrder(selectedCaseFiles('core-codex,full-group'))).toEqual(
+      selectedCaseFiles('core-codex,full-group'),
+    );
+    // A renamed lane would silently stop starting first.
+    for (const stem of LONG_LANES_FIRST) expect(files.map(laneStem)).toContain(stem);
   });
 
   it('report scripts select and name lanes exactly like the Midscene config', () => {

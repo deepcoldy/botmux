@@ -122,6 +122,11 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: '/login', sessionPolicy: 'default', help: ['help.login', 'help.login_status'],
   },
+  {
+    name: '/logout', sessionPolicy: 'sessionless', permission: 'talk',
+    help: ['help.logout'],
+    notes: '只撤销发送者自己的触发人凭据；撤销他人走 dashboard IPC',
+  },
   { name: '/adopt', sessionPolicy: 'default', help: ['help.adopt', 'help.adopt_pane', 'help.adopt_orca'] },
   {
     name: '/oncall', sessionPolicy: 'default',
@@ -213,6 +218,26 @@ const BY_NAME: ReadonlyMap<string, CommandSpec> = new Map(
 /** 按命令 token（含别名，小写）查 spec。 */
 export function commandSpec(cmd: string): CommandSpec | undefined {
   return BY_NAME.get(cmd.trim().toLowerCase());
+}
+
+/**
+ * Commands consumed before slash routing by `im/lark/event-dispatcher.ts` or
+ * the daemon's admitted entries. They are not in the table above, but a plugin
+ * declaring one would never receive it.
+ */
+const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([
+  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode',
+  '/substitute', '/reply-mode', '/workflow', '/template', '/invite',
+]);
+
+/**
+ * Every slash token Botmux itself owns: table names and aliases (including
+ * CLI-specific ones such as `/effort`), the topic-header commands and the
+ * pre-routing commands. Plugin commands may never claim one of these.
+ */
+export function isBuiltinSlashCommandName(cmd: string): boolean {
+  const key = cmd.trim().toLowerCase();
+  return BY_NAME.has(key) || FORCE_TOPIC_COMMANDS.has(key) || PRE_ROUTING_COMMANDS.has(key);
 }
 
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────

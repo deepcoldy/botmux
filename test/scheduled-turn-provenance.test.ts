@@ -282,6 +282,20 @@ describe('authorizeScheduledTurn', () => {
     expect(call()).toEqual({ error: 'task_not_found' });
   });
 
+  it('authorizes a claimed task as its claimant, also when it has no creator', () => {
+    const claim = { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: appId, claimedAt: '2026-10-26T02:00:00.000Z' };
+    const seen: string[] = [];
+    const gate = (_app: string, openId: string) => { seen.push(openId); return openId === 'ou_claimant'; };
+    writeTask({ runAsClaim: claim });
+    expect(call(gate)).toMatchObject({ ownerOpenId: 'ou_claimant' });
+    writeTask({ ownerOpenId: undefined, runAsClaim: claim });
+    expect(call(gate)).toMatchObject({ ownerOpenId: 'ou_claimant' });
+    expect(seen).toEqual(['ou_claimant', 'ou_claimant']);
+    // The open_id only means something to the app that received the click.
+    writeTask({ runAsClaim: { ...claim, larkAppId: 'cli_other' } });
+    expect(call()).toEqual({ error: 'binding_mismatch' });
+  });
+
   it('passes the resolved app id and owner into the gate', () => {
     writeTask({ larkAppId: undefined });
     const seen: Array<[string, string]> = [];

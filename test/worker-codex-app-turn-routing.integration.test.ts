@@ -3,17 +3,24 @@ import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
+  mkdirSync,
   mkdtempSync,
+  readFileSync,
+  realpathSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { codexAppControlStatePath } from '../src/utils/codex-app-control.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
+import { buildCredentialOnlySandboxArgs } from '../src/adapters/backend/sandbox.js';
+import { backendSandboxCompatibilityUserMessage } from '../src/adapters/backend/session-backend-selector.js';
 
 // The worker inherits process.env, so its panes live on this server.
 const managedTmuxArgs = tmuxSocketArgs(preferredManagedTmuxSocket(process.env));
@@ -92,6 +99,7 @@ function spawnWorker(
   logs: string[],
   messages: WorkerToDaemon[],
   onMessage?: (message: WorkerToDaemon, child: ChildProcess) => void,
+  extraEnv: NodeJS.ProcessEnv = {},
 ): ChildProcess {
   const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
@@ -110,6 +118,7 @@ function spawnWorker(
       FAKE_CODEX_LOG: requestLog,
       FAKE_CODEX_VERSION: '0.136.0',
       FAKE_CODEX_BEHAVIOR: behavior,
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
@@ -184,6 +193,204 @@ function readRequests(path: string): Array<Record<string, any>> {
   return readJsonLines(path);
 }
 
+const pidNamespaceAvailable = process.platform === 'linux' && spawnSync('bwrap', [
+  '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--proc', '/proc', '--', '/bin/true',
+], { stdio: 'ignore', timeout: 5_000 }).status === 0;
+
+describe.skipIf(process.platform !== 'linux')('Codex App worker engine identity', () => {
+  it.each(['same', 'changed', 'dropped', 'restart', 'gap-restart'] as const)(
+    'handles signed engine states on one connection: %s', async mode => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-worker-engine-'));
+      tempDirs.add(root);
+      const fakeCodex = join(root, 'fake-codex');
+      copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+      chmodSync(fakeCodex, 0o755);
+      const report = join(root, 'proofs.jsonl');
+      const trigger = join(root, 'next-state');
+      const logs: string[] = [];
+      const messages: WorkerToDaemon[] = [];
+      const sessionId = replacementSessionId(`engine-${mode}`);
+      const child = spawnWorker(root, sessionId, fakeCodex, join(root, 'requests.jsonl'), 'success', logs, messages, undefined, {
+        BOTMUX_TEST_CODEX_APP_RUNNER_PATH: resolve('test/fixtures/codex-app-identity-runner.ts'),
+        FAKE_CODEX_IDENTITY_MODE: mode,
+        FAKE_CODEX_IDENTITY_REPORT: report,
+        FAKE_CODEX_IDENTITY_TRIGGER: trigger,
+      });
+      child.send(replacementInit(sessionId, fakeCodex, '', { backendType: 'pty' }));
+      await waitFor(child, logs, () => readJsonLines<{ ack: number }>(report).some(entry => entry.ack === 1)
+        && messages.some(message => message.type === 'prompt_ready'));
+      const proofs = readJsonLines<{ proofs: Array<{ pid: number; procStart: string }> }>(report)[0]!.proofs;
+      expect(messages.findLast(message => message.type === 'local_process_attestation')).toMatchObject({
+        enginePid: proofs[0]!.pid, engineProcStart: proofs[0]!.procStart,
+      });
+      expect(messages.some(message => message.type === 'prompt_ready')).toBe(true);
+      writeFileSync(trigger, 'go');
+      if (mode === 'restart' || mode === 'gap-restart') {
+        const finalSeq = mode === 'restart' ? 2 : 3;
+        await waitFor(child, logs, () => readJsonLines<{ ack: number }>(report).some(entry => entry.ack === finalSeq));
+        const replacement = readJsonLines<{ replacement?: { pid: number; procStart: string } }>(report)
+          .find(entry => entry.replacement)!.replacement!;
+        const attestations = messages.filter(message => message.type === 'local_process_attestation');
+        expect(attestations.at(-1)).toMatchObject({ enginePid: replacement.pid, engineProcStart: replacement.procStart });
+        expect(replacement.pid).not.toBe(proofs[0]!.pid);
+        expect(readProcessStartIdentity(proofs[0]!.pid)).not.toBe(proofs[0]!.procStart);
+        if (mode === 'gap-restart') {
+          const first = attestations.findIndex(message => message.enginePid === proofs[0]!.pid);
+          expect(attestations.slice(first + 1, -1).some(message => message.enginePid === undefined)).toBe(true);
+        }
+        expect(child.exitCode).toBeNull();
+        expect(messages.filter(message => message.type === 'error')).toEqual([]);
+      } else if (mode === 'same') {
+        await waitFor(child, logs, () => readJsonLines<{ ack: number }>(report).some(entry => entry.ack === 2));
+        expect(child.exitCode).toBeNull();
+        expect(messages.filter(message => message.type === 'error')).toEqual([]);
+      } else {
+        const exit = await waitForChildExit(child, logs, 10_000);
+        expect(exit.code).not.toBe(0);
+        expect(messages.some(message => message.type === 'error')).toBe(true);
+        expect(logs.join('')).toContain(mode === 'changed'
+          ? 'invalid or changed app-server process' : 'dropped its attested app-server process');
+        // A rejected frame must neither gain a new engine root nor be ACKed.
+        expect(readJsonLines<{ ack: number }>(report).some(entry => entry.ack === 2)).toBe(false);
+        expect(messages.some(message => message.type === 'local_process_attestation'
+          && message.enginePid === proofs[1]!.pid)).toBe(false);
+        expect(messages.findLast(message => message.type === 'local_process_attestation'))
+          .not.toHaveProperty('enginePid');
+      }
+    },
+  );
+
+  it.skipIf(!pidNamespaceAvailable).each(['pty', 'tmux'] as const)(
+    '%s publishes a host engine PID through the production credential-only wrapper', async backendType => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-worker-engine-ns-'));
+      tempDirs.add(root);
+      const fakeCodex = join(root, 'fake-codex');
+      copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+      chmodSync(fakeCodex, 0o755);
+      // Exercise the actual credential-only argv, including its PID namespace
+      // and authority mask. Full oncall/scratch have a separate early gate.
+      const hidden = join(root, 'masked-authority');
+      mkdirSync(hidden);
+      const bwrapArgs = buildCredentialOnlySandboxArgs({
+        hideDirectories: [realpathSync(hidden)], hideFiles: [], workingDir: resolve('.'),
+        cliBin: nodeTsRunnerPrefix().command, cliArgs: [resolve('dist/codex-app-runner.js')],
+      });
+      const wrapper = join(root, 'runner.mjs');
+      writeFileSync(wrapper, `
+        import { spawn } from 'node:child_process';
+        const child = spawn('bwrap', [...${JSON.stringify(bwrapArgs)}, ...process.argv.slice(2)], { stdio: 'inherit' });
+        child.on('error', error => { console.error(error); process.exit(1); });
+        child.on('exit', code => process.exit(code ?? 1));
+      `);
+      const logs: string[] = [];
+      const messages: WorkerToDaemon[] = [];
+      const sessionId = replacementSessionId('engine-namespace');
+      if (backendType === 'tmux') tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+      const pidPath = join(root, 'app-server.pid');
+      const child = spawnWorker(root, sessionId, fakeCodex, join(root, 'requests.jsonl'), 'success', logs, messages, undefined, {
+        BOTMUX_TEST_CODEX_APP_RUNNER_PATH: wrapper,
+        FAKE_CODEX_PID_PATH: pidPath,
+      });
+      child.send(replacementInit(sessionId, fakeCodex, 'hello', {
+        backendType, turnId: 'om_namespace_turn',
+        promptCodexAppInput: { text: 'hello', clientUserMessageId: 'om_namespace_turn' },
+      }));
+      await waitFor(child, logs, () => messages.some(message => message.type === 'final_output'));
+      const attestation = messages.findLast(
+        (message): message is Extract<WorkerToDaemon, { type: 'local_process_attestation' }> => (
+          message.type === 'local_process_attestation'
+        ),
+      )!;
+      const namespacePid = Number(readFileSync(pidPath, 'utf8').trim());
+      expect(attestation.enginePid).toBeGreaterThan(1);
+      expect(attestation.enginePid).not.toBe(namespacePid);
+      expect(attestation.engineProcStart).toBe(readProcessStartIdentity(attestation.enginePid!));
+      const status = readFileSync(`/proc/${attestation.enginePid}/status`, 'utf8');
+      expect(Number(status.match(/^NSpid:\s+(.+)$/m)![1]!.trim().split(/\s+/).at(-1))).toBe(namespacePid);
+      expect(messages.filter(message => message.type === 'error')).toEqual([]);
+      expect(child.exitCode).toBeNull();
+    },
+  );
+
+  it.each(['pty', 'tmux'] as const)('%s resumes the existing thread after a real idle app-server exit', async backendType => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-idle-engine-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const requestLog = join(root, 'requests.jsonl');
+    const sessionId = replacementSessionId('idle-engine');
+    if (backendType === 'tmux') tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+    const child = spawnWorker(root, sessionId, fakeCodex, requestLog, 'success', logs, messages, undefined, {
+      FAKE_CODEX_VERSION: '0.144.6',
+    });
+    const input = (turnId: string) => ({ text: turnId, clientUserMessageId: turnId });
+    const waitIdle = (finalCount: number) => waitFor(child, logs, () => (
+      messages.filter(message => message.type === 'final_output').length === finalCount
+      && messages.findLastIndex(message => message.type === 'prompt_ready')
+        > messages.findLastIndex(message => message.type === 'final_output')
+    ));
+    const engine = () => messages.findLast(
+      (message): message is Extract<WorkerToDaemon, { type: 'local_process_attestation' }> => (
+        message.type === 'local_process_attestation' && message.enginePid !== undefined
+      ),
+    )!;
+    child.send(replacementInit(sessionId, fakeCodex, 'before', {
+      backendType, turnId: 'om_idle_before', promptCodexAppInput: input('om_idle_before'),
+    }));
+    await waitIdle(1);
+    const old = engine();
+    process.kill(old.enginePid!, 'SIGTERM');
+    await waitFor(child, logs, () => readProcessStartIdentity(old.enginePid!) !== old.engineProcStart);
+    child.send({ type: 'message', content: 'after', turnId: 'om_idle_after', codexAppInput: input('om_idle_after') });
+    await waitIdle(2);
+    const replacement = engine();
+    expect(replacement.enginePid).not.toBe(old.enginePid);
+    expect(replacement.engineProcStart).toBe(readProcessStartIdentity(replacement.enginePid!));
+    child.send({ type: 'message', content: 'next', turnId: 'om_idle_next', codexAppInput: input('om_idle_next') });
+    await waitIdle(3);
+    expect(engine()).toMatchObject({ enginePid: replacement.enginePid, engineProcStart: replacement.engineProcStart });
+    expect(messages.filter(message => message.type === 'error')).toEqual([]);
+    expect(messages.filter(message => message.type === 'final_output').map(message => message.content))
+      .toEqual(['fake answer 1', 'fake answer 1', 'fake answer 2']);
+    const requests = readRequests(requestLog);
+    expect(requests.filter(request => request.method === 'initialize')).toHaveLength(2);
+    expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(1);
+    expect(requests.filter(request => request.method === 'thread/resume').map(request => request.params.threadId))
+      .toEqual(['thread-fake']);
+    expect(requests.filter(request => request.method === 'turn/start').map(request => request.params.clientUserMessageId))
+      .toEqual(['om_idle_before', 'om_idle_after', 'om_idle_next']);
+  });
+
+  it.each(['oncall', 'scratch', 'environment', 'legacy-read'] as const)(
+    'rejects an unsupported Linux file sandbox immediately: %s', async mode => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-worker-file-gate-'));
+      tempDirs.add(root);
+      const fakeCodex = join(root, 'fake-codex');
+      copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+      chmodSync(fakeCodex, 0o755);
+      const logs: string[] = [];
+      const messages: WorkerToDaemon[] = [];
+      const requestLog = join(root, 'requests.jsonl');
+      const sessionId = replacementSessionId('file-gate');
+      const child = spawnWorker(root, sessionId, fakeCodex, requestLog, 'success', logs, messages, undefined,
+        mode === 'environment' ? { BOTMUX_SANDBOX: 'oncall' } : {});
+      child.send(replacementInit(sessionId, fakeCodex, '', {
+        backendType: 'pty',
+        ...(mode === 'legacy-read' ? { readIsolation: true }
+          : mode === 'environment' ? {} : { sandbox: mode }),
+      }));
+      await waitForChildExit(child, logs, 10_000);
+      expect(messages.filter(message => message.type === 'error').map(message => message.message))
+        .toContain(backendSandboxCompatibilityUserMessage('codex_app_file_sandbox_unsupported'));
+      expect(messages.some(message => message.type === 'ready')).toBe(false);
+      expect(readRequests(requestLog)).toEqual([]);
+    },
+  );
+});
+
 describe('Codex App worker queued-turn attribution', () => {
   it('routes and ACKs turn N before N+1 after both inputs were written in one flush', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-routing-'));
@@ -210,6 +417,7 @@ describe('Codex App worker queued-turn attribution', () => {
         LARK_APP_ID: 'app_worker_routing',
         LARK_APP_SECRET: 'secret',
         FAKE_CODEX_LOG: requestLog,
+        FAKE_CODEX_PID_PATH: join(root, 'app-server.pid'),
         FAKE_CODEX_VERSION: '0.136.0',
         // Hold turn 1 open so flushPending deterministically writes turn 2 and
         // overwrites its legacy singleton globals before final 1 arrives.
@@ -274,6 +482,15 @@ describe('Codex App worker queued-turn attribution', () => {
       const finals = messages.filter(
         (message): message is Extract<WorkerToDaemon, { type: 'final_output' }> => message.type === 'final_output',
       );
+      if (process.platform === 'linux') {
+        const enginePid = Number(readFileSync(join(root, 'app-server.pid'), 'utf8').trim());
+        const attestation = messages.findLast(message => message.type === 'local_process_attestation');
+        expect(attestation).toMatchObject({
+          enginePid,
+          engineProcStart: readProcessStartIdentity(enginePid),
+        });
+        expect(enginePid).toBeGreaterThan(1);
+      }
       expect(finals.map(final => ({
         turnId: final.turnId,
         content: final.content,

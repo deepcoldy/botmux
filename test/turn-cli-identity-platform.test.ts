@@ -18,6 +18,10 @@ import { join } from 'node:path';
 vi.mock('../src/utils/user-token.js', () => ({
   resolveUserToken: vi.fn(async () => null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
+  // cli-identity.ts imports this. vitest tolerates a missing mock export; bun
+  // rejects the module at link time. Any new user-token import from
+  // cli-identity has to be added here too.
+  isUsableOpenId: (openId: unknown) => typeof openId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(openId),
 }));
 const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
 const beginBytedcliLogin = vi.fn(async () => ({ authUrl: 'https://cloud.example.test/local-bytedcli', completeToken: 'tok' }));
@@ -335,33 +339,82 @@ describe('credentialSource = platform', () => {
 });
 
 describe('delegated identity (signed cross-bot dispatch)', () => {
-  // credentialOpenId is the requester as seen by the ISSUING app; targetOpenId is
-  // the same human in the receiving app. The platform key must come from the
-  // former (that is what the daemon verified), so keep the two distinct here.
+  // credentialOpenId is the requester as seen by the ISSUING app (the key of
+  // their local stores here); targetOpenId is the same human in the receiving
+  // app. Neither is a platform key: the platform is asked with the union_id the
+  // daemon verified in the signed dispatch record, so the three stay distinct.
   const delegated = (tools: Array<'lark-cli' | 'bytedcli'>) => ({
-    credentialOpenId: 'ou_requester', targetOpenId: 'ou_requester_in_target_app', tools, dispatchRoot: 'om_root',
+    credentialOpenId: 'ou_requester', targetOpenId: 'ou_requester_in_target_app',
+    unionId: 'on_requester', tools, dispatchRoot: 'om_root',
+  });
+  const publishDelegated = (tools: Array<'lark-cli' | 'bytedcli'>, triggerUserAuth: unknown) => publishTurnCliIdentity({
+    botConfig: botConfig(triggerUserAuth), sessionDataDir: dir, sessionId: SESSION,
+    senderOpenId: undefined, delegatedIdentity: delegated(tools), turnId: 'om_d',
+  });
+  const contactLookups: string[] = [];
+  beforeEach(() => {
+    contactLookups.length = 0;
+    // An app-scoped open_id resolves only inside the app that issued it, and
+    // a receiving bot's contact range usually does not cover the requester.
+    unionIds = new Map([['ou_requester', 'on_issuer_scope_only'], ['ou_requester_in_target_app', null]]);
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => (bound ? BINDING : null),
+      resolveUnionId: async (_app, openId) => { contactLookups.push(openId); return unionIds.get(openId) ?? null; },
+      requestGrant: async (req) => { grantCalls.push(req); return typeof grantResponse === 'function' ? grantResponse(req) : grantResponse; },
+    });
   });
 
-  it('asks the platform for the original requester, not the dispatching bot', async () => {
-    unionIds.set('ou_requester', 'on_requester');
-    unionIds.set('ou_requester_in_target_app', 'on_wrong_key');
-    grantResponse = (req: any) => (req.unionId === 'on_requester' ? granted('lark-cli') : { ok: false, reason: 'not_authorized', error: 'x' });
-    const out = await publishTurnCliIdentity({
-      botConfig: botConfig({ enabled: true, tools: ['lark-cli'] }), sessionDataDir: dir, sessionId: SESSION,
-      senderOpenId: undefined, delegatedIdentity: delegated(['lark-cli']), turnId: 'om_d',
+  it.each(['lark-cli', 'bytedcli'] as const)('asks the platform for %s with the union_id from the dispatch, never an open_id lookup', async tool => {
+    grantResponse = (req: any) => (req.unionId === 'on_requester' ? granted(tool) : { ok: false, reason: 'not_authorized', error: 'x' });
+    const out = await publishDelegated([tool], { enabled: true, tools: [tool], credentialSource: 'platform' });
+    expect(out.find(o => o.tool === tool)?.state).toBe('user');
+    expect(grantCalls.map(call => call.unionId)).toEqual(['on_requester']);
+    expect(contactLookups).toEqual([]);
+    expect(read(tool)).toContain(tool === 'bytedcli' ? 'cloud-jwt' : 'platform-user-token');
+  });
+
+  it('still gets the platform grant while the contact API is unavailable', async () => {
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => BINDING,
+      resolveUnionId: async () => { throw new Error('contact API unavailable'); },
+      requestGrant: async (req) => { grantCalls.push(req); return granted('bytedcli'); },
     });
-    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('user');
+    const out = await publishDelegated(['bytedcli'], { enabled: true, tools: ['bytedcli'] });
+    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
     expect(grantCalls[0].unionId).toBe('on_requester');
   });
 
-  it('in platform mode a non-grant denies the delegated turn without local lookup', async () => {
-    unionIds.set('ou_requester', 'on_requester');
+  it('in platform mode a non-grant denies the delegated turn without any local lookup', async () => {
     larkHomes.set('ou_requester', '/homes/requester');
-    const out = await publishTurnCliIdentity({
-      botConfig: botConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }), sessionDataDir: dir, sessionId: SESSION,
-      senderOpenId: undefined, delegatedIdentity: delegated(['lark-cli']), turnId: 'om_d',
-    });
-    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    bytedcliJwts.set('ou_requester', { cloudJwt: 'local-requester' });
+    const out = await publishDelegated(['lark-cli', 'bytedcli'], { enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: 'platform' });
+    expect(out.map(o => o.state)).toEqual(['needs-authorization', 'needs-authorization']);
     expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+    expect(read('bytedcli')).not.toContain('local-requester');
+    expect(read('bytedcli')).toContain("BOTMUX_IDENTITY_MODE='denied'");
+  });
+
+  it('in auto mode a non-grant uses the requester\'s local login on this machine, keyed by the issuer open_id', async () => {
+    bytedcliJwts.set('ou_requester', { cloudJwt: 'local-requester' });
+    const out = await publishDelegated(['bytedcli'], { enabled: true, tools: ['bytedcli'] });
+    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
+    expect(read('bytedcli')).toContain('local-requester');
+  });
+
+  it('in auto mode with neither a grant nor a local login the delegated turn is denied explicitly', async () => {
+    const out = await publishDelegated(['bytedcli'], { enabled: true, tools: ['bytedcli'] });
+    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
+    expect(read('bytedcli')).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(read('bytedcli')).toContain('delegated bytedcli execution refused');
+  });
+
+  it('a malformed dispatch union_id is never sent to the platform', async () => {
+    const out = await publishTurnCliIdentity({
+      botConfig: botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }), sessionDataDir: dir, sessionId: SESSION,
+      senderOpenId: undefined, delegatedIdentity: { ...delegated(['bytedcli']), unionId: 'ou_requester' }, turnId: 'om_d',
+    });
+    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
+    expect(grantCalls).toEqual([]);
   });
 });
+

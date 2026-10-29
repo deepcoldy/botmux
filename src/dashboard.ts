@@ -184,7 +184,7 @@ import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { applyGlobalSessionEnvOps, globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { applyGlobalSessionEnvOps, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -360,6 +360,7 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
+import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -1176,6 +1177,16 @@ interface ResolvedDashboardSettings {
   noVisibleOutputHint: boolean;
   /** Experimental cross-principal turn isolation (XPI). Default OFF. */
   crossPrincipalInterruption: boolean;
+  /** Cross-bot schedule delegation: the two default-off switches and the
+   *  host bot grants. Private for anonymous read-only viewers. */
+  scheduleBotGrants: {
+    createEnabled: boolean;
+    selfManageEnabled: boolean;
+    grants: ScheduleBotGrant[];
+    /** Hand-edited entries the reader dropped; a save would not keep them. */
+    ignoredCount: number;
+    botOptions: Array<{ larkAppId: string; botName: string | null }>;
+  };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -1322,6 +1333,22 @@ function hostOverloadAlertBotOptions(): ResolvedDashboardSettings['hostOverloadA
           ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
         };
       });
+  } catch {
+    return [];
+  }
+}
+
+/** Bots that can take part in a dispatch on this host (apiOnly bots cannot
+ *  post into a chat, so they are neither source nor target). */
+function scheduleBotGrantBotOptions(): ResolvedDashboardSettings['scheduleBotGrants']['botOptions'] {
+  try {
+    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+    return loadBotConfigs()
+      .filter(bot => bot.apiOnly !== true)
+      .map(bot => ({
+        larkAppId: bot.larkAppId,
+        botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+      }));
   } catch {
     return [];
   }
@@ -1794,6 +1821,13 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     noVisibleOutputHint: dashboard.noVisibleOutputHint === true, // default OFF; opt-in anti-resend guidance
     crossPrincipalInterruption: dashboard.crossPrincipalInterruption === true, // default OFF; opt-in cross-principal isolation
+    scheduleBotGrants: {
+      createEnabled: global.scheduleDelegation?.createEnabled === true, // default OFF
+      selfManageEnabled: global.scheduleDelegation?.selfManageEnabled === true, // default OFF
+      grants: global.scheduleDelegation?.botGrants ?? [],
+      ignoredCount: ignoredScheduleBotGrantCount(),
+      botOptions: scheduleBotGrantBotOptions(),
+    },
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       larkCliVersion: larkCli?.version ?? null,
@@ -6545,7 +6579,7 @@ const server = createServer(async (req, res) => {
       if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
       const upstream = await proxyToDaemon(larkAppId, '/api/schedules', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: dashboardScheduleWriteHeaders(req, !!readPlatformBinding()),
         body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
@@ -6567,7 +6601,7 @@ const server = createServer(async (req, res) => {
       }
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}`, {
         method: 'PATCH',
-        headers: { 'content-type': 'application/json' },
+        headers: dashboardScheduleWriteHeaders(req, !!readPlatformBinding()),
         body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });

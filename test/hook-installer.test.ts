@@ -10,6 +10,8 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { botmuxShellCommand } from '../src/adapters/hook-command.js';
 import {
   cleanupTraexAskHooks,
   hasInstalledSessionReadyHook,
@@ -21,6 +23,16 @@ import {
 
 function makeTmpDir(): string {
   return mkdtempSync(join(tmpdir(), 'botmux-hook-test-'));
+}
+
+function extractEmbeddedArgs(content: string): string[] {
+  const match = content.match(/const ARGS = (\[[^\n]*\]);/);
+  if (!match) throw new Error('generated plugin has no argv array');
+  return JSON.parse(match[1]);
+}
+
+function hasCliEntry(args: readonly string[]): boolean {
+  return args.some((arg) => /[/\\](?:src[/\\]cli\.ts|dist[/\\]cli\.js)$/.test(arg));
 }
 
 // ─── claude-settings 格式 ─────────────────────────────────────────────────────
@@ -54,6 +66,28 @@ describe('installHook — claude-settings', () => {
     expect(entry.type).toBe('command');
     expect(typeof entry.timeout).toBe('number');
     expect(entry.timeout).toBeGreaterThan(0);
+  });
+
+  it('keeps source hook installation idempotent across checkout paths', () => {
+    const command = (checkout: string, subcommand: string[]) => botmuxShellCommand(
+      subcommand, false, pathToFileURL(join(tmpDir, checkout, 'src', 'adapters', 'hook-command.ts')).href,
+    );
+    for (const checkout of ['first checkout', "second ' checkout"]) {
+      const hookInstall = {
+        configPath, format: 'claude-settings' as const,
+        sessionStartCommand: command(checkout, ['session-ready']),
+        userPromptSubmitCommand: command(checkout, ['user-prompt-hook']),
+      };
+      installHook('claude-code', hookInstall, command(checkout, ['hook', 'claude-code']));
+      expect(hasInstalledSessionReadyHook(hookInstall)).toBe(true);
+      expect(hasInstalledPromptHook(hookInstall)).toBe(true);
+    }
+    const hooks = JSON.parse(readFileSync(configPath, 'utf8')).hooks;
+    for (const event of ['PreToolUse', 'SessionStart', 'UserPromptSubmit']) {
+      expect(hooks[event]).toHaveLength(1);
+      expect(hooks[event][0].hooks).toHaveLength(1);
+      expect(hooks[event][0].hooks[0].command).toContain('second');
+    }
   });
 
   it('(b) 幂等——二次调用后文件内容与第一次完全相同', () => {
@@ -688,10 +722,11 @@ describe('installHook — opencode-plugin', () => {
     // 答案 POST 回 OpenCode 的 reply 端点解阻塞
     expect(content).toContain('/question/');
     expect(content).toContain('/reply');
-    // args 以 JSON 数组嵌入，包含 hook 子命令与 cliId
-    expect(content).toContain('"hook"');
-    expect(content).toContain('"opencode"');
-    expect(content).toContain('cli.js');
+    // args 以 JSON 数组嵌入，包含当前运行时的 CLI 入口、hook 子命令与 cliId。
+    const args = extractEmbeddedArgs(content);
+    expect(args).toContain('hook');
+    expect(args).toContain('opencode');
+    expect(hasCliEntry(args)).toBe(true);
     // 绝不能再出现「把带引号命令字符串 .split(" ")」的旧写法
     expect(content).not.toContain('.split(');
     expect(content).not.toContain('parts[0]');
@@ -745,10 +780,11 @@ describe('installHook — opencode2-plugin', () => {
     expect(content).toContain('service.json');
     expect(content).toContain('x-opencode-directory');
     expect(content).toContain('"opencode:"');
-    // args 以 JSON 数组嵌入，包含 hook 子命令与 cliId
-    expect(content).toContain('"hook"');
-    expect(content).toContain('"opencode2"');
-    expect(content).toContain('cli.js');
+    // args 以 JSON 数组嵌入，包含当前运行时的 CLI 入口、hook 子命令与 cliId。
+    const args = extractEmbeddedArgs(content);
+    expect(args).toContain('hook');
+    expect(args).toContain('opencode2');
+    expect(hasCliEntry(args)).toBe(true);
     expect(content).not.toContain('.split(');
   });
 
@@ -959,4 +995,133 @@ describe('generated OpenCode plugins — a hook that exits before reading stdin'
       await expect(askBotmux(JSON.stringify({ text: 'x'.repeat(256 * 1024) }))).resolves.toBe('');
     });
   }
+});
+
+// ─── zcode-hooks 格式 ─────────────────────────────────────────────────────────
+//
+// ZCode 的生命周期 hook 是它拿到 native session id 与提交回执的唯一途径。
+// 没有它：每条消息都误报 submit_unconfirmed（PTY 里其实已经执行），换绑/重启
+// 时还会丢失精确 resume 能力。所以这里的合并语义必须是「只增删自己的条目」。
+
+describe('installHook — zcode-hooks', () => {
+  const install = (configPath: string) => installHook(
+    'zcode',
+    { configPath, format: 'zcode-hooks' },
+    'node /path/to/dist/cli.js hook zcode',
+  );
+
+  it('registers all three lifecycle events and enables hooks', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    install(configPath);
+    const doc = JSON.parse(readFileSync(configPath, 'utf8'));
+    expect(doc.hooks.enabled).toBe(true);
+    for (const event of ['SessionStart', 'UserPromptSubmit', 'Stop']) {
+      const groups = doc.hooks.events[event];
+      expect(Array.isArray(groups)).toBe(true);
+      const entry = groups.flatMap((g: any) => g.hooks)[0];
+      expect(entry.type).toBe('process');
+      expect(entry.args).toContain('zcode-session-hook');
+      expect(entry.timeoutMs).toBe(3000);
+    }
+  });
+
+  it('is idempotent — no duplicated hook groups, no mtime churn', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    install(configPath);
+    const first = readFileSync(configPath, 'utf8');
+    const before = statSync(configPath).mtimeMs;
+    install(configPath);
+    expect(readFileSync(configPath, 'utf8')).toBe(first);
+    expect(statSync(configPath).mtimeMs).toBe(before);
+    const doc = JSON.parse(first);
+    expect(doc.hooks.events.UserPromptSubmit).toHaveLength(1);
+  });
+
+  // 真实场景：用户自己的 ZCode 已经在 config.json 里配了别的 hook / 别的顶层键。
+  it('merges — foreign hooks and unrelated top-level keys survive', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      mcp: { servers: { keep: { command: 'x' } } },
+      hooks: {
+        enabled: true,
+        events: {
+          PreToolUse: [{ hooks: [{ type: 'process', command: '/usr/bin/other-hook', args: [] }] }],
+          Stop: [{ hooks: [{ type: 'process', command: '/usr/bin/user-stop', args: [] }] }],
+        },
+      },
+    }, null, 2));
+    install(configPath);
+    const doc = JSON.parse(readFileSync(configPath, 'utf8'));
+    expect(doc.mcp.servers.keep.command).toBe('x');
+    expect(doc.hooks.events.PreToolUse).toHaveLength(1);
+    const stopHooks = doc.hooks.events.Stop.flatMap((g: any) => g.hooks);
+    // 用户的 Stop hook 保留，我们的追加；不是覆盖掉用户那条。
+    expect(stopHooks.some((h: any) => h.command === '/usr/bin/user-stop')).toBe(true);
+    expect(stopHooks.some((h: any) => h.args?.includes('zcode-session-hook'))).toBe(true);
+  });
+
+  // 手工装过的旧配置指向 .mjs 文件；升级后必须被替换，否则会同时留两条、每次都跑两遍。
+  it('replaces a hand-installed legacy .mjs bridge entry', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      hooks: { enabled: true, events: { UserPromptSubmit: [{ hooks: [
+        { type: 'process', command: '/usr/bin/node', args: ['/home/u/.botmux/bin/zcode-session-hook.mjs'], timeoutMs: 3000 },
+      ] }] } },
+    }));
+    install(configPath);
+    const doc = JSON.parse(readFileSync(configPath, 'utf8'));
+    const hooks = doc.hooks.events.UserPromptSubmit.flatMap((g: any) => g.hooks);
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].args).toContain('zcode-session-hook');
+    expect(hooks[0].args).not.toContain('/home/u/.botmux/bin/zcode-session-hook.mjs');
+    expect(hasCliEntry(hooks[0].args)).toBe(true);
+  });
+
+  // 旧手工装法的另一种形态：`type: 'command'`，command 直接就是 .mjs 路径。
+  // 只认 `process` 会让它活下来，与我们的新条目并存、每次事件跑两遍。
+  it('replaces a legacy bare-command bridge entry', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      hooks: { enabled: true, events: { Stop: [{ hooks: [
+        { type: 'command', command: '/home/u/.botmux/bin/zcode-session-hook.mjs', timeoutMs: 3000 },
+      ] }] } },
+    }));
+    install(configPath);
+    const doc = JSON.parse(readFileSync(configPath, 'utf8'));
+    const hooks = doc.hooks.events.Stop.flatMap((g: any) => g.hooks);
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].type).toBe('process');
+    expect(hooks[0].command).not.toBe('/home/u/.botmux/bin/zcode-session-hook.mjs');
+    expect(hooks[0].args).toContain('zcode-session-hook');
+    expect(hasCliEntry(hooks[0].args)).toBe(true);
+  });
+
+  // 用户显式关掉了 hooks（他自己的其它 hook 也靠这个开关），不能被我们悄悄打开。
+  it('respects an explicit hooks.enabled: false', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ hooks: { enabled: false } }));
+    install(configPath);
+    const doc = JSON.parse(readFileSync(configPath, 'utf8'));
+    expect(doc.hooks.enabled).toBe(false);
+    // 仍然注册事件：用户之后自己打开开关时无需重装。
+    expect(doc.hooks.events.SessionStart.flatMap((g: any) => g.hooks)[0].args)
+      .toContain('zcode-session-hook');
+  });
+
+  // 坏 JSON 时 readJsonFile 返回 null，若继续 `{...null, hooks}` 会把用户的
+  // mcp / providers 等顶层配置整体抹掉。必须拒绝写入。
+  it('refuses to overwrite a corrupt config file', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    const corrupt = '{"mcp": {"servers": {"keep": {"command": "x"}}';
+    writeFileSync(configPath, corrupt);
+    install(configPath);
+    expect(readFileSync(configPath, 'utf8')).toBe(corrupt);
+  });
 });

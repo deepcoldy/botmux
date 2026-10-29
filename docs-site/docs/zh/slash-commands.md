@@ -230,6 +230,7 @@ Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还有一个可�
 | `/login` | 飞书基础用户授权：消息读取、资源访问和授权续期；不默认申请云文档、通讯录或日历权限 |
 | `/login --scope <权限名>... [--force]` | 在基础权限上按需追加指定权限，例如 `/login --scope docx:document:readonly`；加 `--force` 跳过本地目录校验（仅做语法校验）以支持未收录新权限 |
 | `/login status` | 查看授权状态 |
+| `/logout` | 撤销你自己在这台机器上的触发人授权（lark-cli / bytedcli 登录，以及该机器人名下的用户 token）。不会撤销其他成员 |
 | `/login tags` | 会话群标签专项授权（消息分组权限），授权后新建会话群自动进入侧边栏分组（p2pMode=group + feed-group 标签模式用，feed-group 为默认标签模式） |
 | `/pair <配对码>` | 把 Web/Dashboard 端的会话与你的飞书身份配对（在网页端拿配对码，话题里发 `/pair <码>` 认领） |
 

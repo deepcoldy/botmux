@@ -1,3 +1,5 @@
+import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
+import { canTalk } from '../im/lark/event-dispatcher.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { renderStewardHintBlock } from './decision-board/model.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
@@ -15,7 +17,7 @@ import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
 import * as scheduleStore from '../services/schedule-store.js';
-import { updateRuntimeTaskState } from './scheduler.js';
+import { scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -97,7 +99,7 @@ import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
-import { beginReplyTargetTurn } from './reply-target.js';
+import { beginReplyTargetTurn, pickTurnReplyTarget } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
   hasScheduleTopicTitleRuntimeTemplate,
@@ -974,18 +976,21 @@ function renderSubstituteTarget(trigger?: SubstituteTrigger): string {
   ].join('\n');
 }
 
-export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {
+export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale, cliId?: string): string {
   if (!attachments || attachments.length === 0) return '';
-  let imgN = 0, fileN = 0;
+  let imgN = 0, fileN = 0, videoN = 0;
   const items = attachments.map(a => {
-    const tag = a.type === 'image' ? 'image' : 'file';
-    const n = a.type === 'image' ? ++imgN : ++fileN;
+    const tag = a.type;
+    const n = a.type === 'image' ? ++imgN : a.type === 'video' ? ++videoN : ++fileN;
     const mime = a.mimeType ? ` mime_type="${xmlEscape(a.mimeType)}"` : '';
     const sequenceHint = imageSequenceHint(a);
     const hint = sequenceHint ? ` hint="${xmlEscape(sequenceHint)}"` : '';
     return `  <${tag} n="${n}" path="${xmlEscape(a.path)}"${mime}${hint} />`;
   });
-  return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
+  const videoHint = attachments.some(a => a.type === 'video')
+    ? `\n  <video_hint>${xmlEscape(t(cliId === 'kimi' ? 'ai.attach.videoHintKimi' : 'ai.attach.videoHint', undefined, locale))}</video_hint>`
+    : '';
+  return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}${videoHint}\n</attachments>`;
 }
 
 function renderRoleContextBlock(
@@ -1576,7 +1581,7 @@ function buildNewTopicBlocks(
   const senderNote = bare ? '' : renderCursorSenderNote(cliId, !!senderBlock, locale);
   if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
-  const attachHint = bare ? '' : formatAttachmentsHint(attachments, locale);
+  const attachHint = bare ? '' : formatAttachmentsHint(attachments, locale, cliId);
   if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
@@ -1726,7 +1731,7 @@ export function buildNewTopicCliInput(
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
-  const attachmentBlock = formatAttachmentsHint(attachments, locale);
+  const attachmentBlock = formatAttachmentsHint(attachments, locale, cliId);
   const mentionBlock = renderMentionBlock(mentions);
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
@@ -1905,7 +1910,7 @@ function buildFollowUpBlocks(
   if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
   const attachHint = !bare && opts?.attachments && opts.attachments.length > 0
-    ? formatAttachmentsHint(opts.attachments, opts.locale)
+    ? formatAttachmentsHint(opts.attachments, opts.locale, opts.cliId)
     : '';
   if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
@@ -2133,7 +2138,7 @@ export function buildFollowUpCliInput(
   const senderBlock = renderSenderTag(opts.sender, opts.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
-  const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);
+  const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale, opts.cliId);
   const mentionBlock = renderMentionBlock(opts.mentions);
   return withInitialLinkRefSources({
     content: legacyContent,
@@ -2375,11 +2380,20 @@ export function rememberLastCliInput(
     botCfg.codexAppCleanInput === true &&
     !ds.adoptedFrom
   );
-  if (keepCodexAppInput && normalized.codexAppInput) ds.lastCodexAppInput = normalized.codexAppInput;
+  // steerTargetTurnId is a one-shot host routing constraint for a correlated
+  // async answer: it may match only the still-running native turn that asked
+  // the question. Strip it before the sidecar is persisted, so a later
+  // retry_last_task / failed-turn replay cannot carry a stale target (replay
+  // has no steer grant anyway, but keeping it out of the stored shape makes
+  // that boundary explicit). The in-flight payload object is left untouched.
+  const replayCodexAppInput = keepCodexAppInput && normalized.codexAppInput
+    ? (({ steerTargetTurnId: _steerTargetTurnId, ...input }) => input)(normalized.codexAppInput)
+    : undefined;
+  if (replayCodexAppInput) ds.lastCodexAppInput = replayCodexAppInput;
   else delete ds.lastCodexAppInput;
   ds.session.lastUserPrompt = userPrompt;
   ds.session.lastCliInput = normalized.content;
-  if (keepCodexAppInput && normalized.codexAppInput) ds.session.lastCodexAppInput = normalized.codexAppInput;
+  if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
   ds.session.currentReplyTarget = ds.currentReplyTarget;
@@ -3478,6 +3492,10 @@ export async function restoreActiveSessions(
         toReattach.push(ds);
         continue;
       }
+      if (deploymentContinuationCandidate(ds.session)) {
+        toReattach.push(ds);
+        continue;
+      }
       // A missing backing pane is NEVER an auto-close trigger for a managed
       // session. Whatever wiped the pane — a host reboot (whole multiplexer
       // server gone, every pane at once), the idle-worker sweeper reclaiming
@@ -3574,7 +3592,33 @@ export async function restoreActiveSessions(
           }
         : true;
       if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, { reattachLiveBackend: true });
-      else forkWorker(ds, prompt, resume);
+      else {
+        const candidate = deploymentContinuationCandidate(ds.session);
+        if (candidate && !recoverExactNonCodex) {
+          const caller = candidate.caller;
+          if (!canTalk(ds.larkAppId, ds.chatId, caller.requestUserOpenId, undefined,
+            caller.requestUserUnionId, ds.chatType)) return;
+          const claimed = claimDeploymentContinuation(ds.session, candidate,
+            previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+          if (!claimed) return;
+          ds.currentReplyTarget = { rootMessageId: pickTurnReplyTarget(ds.session, claimed.turnId)?.rootMessageId ?? ds.session.rootMessageId,
+            turnId: claimed.turnId, updatedAt: new Date().toISOString() };
+          ds.session.currentReplyTarget = { ...ds.currentReplyTarget };
+          let ipcAttempted = false;
+          const releaseUndispatchedClaim = () => {
+            if (!ipcAttempted && deploymentContinuationClaimCurrent(ds.session, claimed)) {
+              setDeploymentContinuation(ds.session, { ...claimed, state: 'running' },
+                previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+            }
+          };
+          try {
+            forkWorker(ds, '', { resume: true, onIpcDispatchAttempted: () => { ipcAttempted = true; } }, {
+              deploymentContinuation: claimed,
+              onAdmission: admission => { if (admission === 'rejected') releaseUndispatchedClaim(); },
+            });
+          } catch (error) { releaseUndispatchedClaim(); throw error; }
+        } else forkWorker(ds, prompt, resume);
+      }
     },
     RECOVERY_FORK_BATCH_SIZE,
     RECOVERY_FORK_DELAY_MS,
@@ -4402,6 +4446,15 @@ export async function executeScheduledTask(
     );
   }
   const larkAppId = bot.config.larkAppId;
+
+  // Refuse — before any session is chosen or spawned — a turn-created task whose
+  // canonical workingDir has been swapped for a symlink since creation. The
+  // throw is recorded as this fire's failure; it is never skipped silently.
+  const workingDirSwap = scheduledWorkingDirSwapReason(task);
+  if (workingDirSwap) {
+    logger.error(`[scheduler] refusing to fire: ${workingDirSwap}`);
+    throw new Error(workingDirSwap);
+  }
 
   // --follow-active: keep the last landing point while a human holds it open;
   // otherwise re-target to where a human spoke most recently (persisting the

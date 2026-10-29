@@ -5,6 +5,7 @@
 // 值导入会把它们打进浏览器 bundle。
 import type {
   BoardBatch,
+  BoardChatCheck,
   BoardDecision,
   BoardDraft,
   BoardEvent,
@@ -39,6 +40,12 @@ export interface RenderedLink {
   label?: string;
   text: string;
   url?: string;
+  /** 仅 chat：这一项的主群。旧 daemon 不给，按第一个群算（见 itemChatView）。 */
+  primary?: boolean;
+  /** 仅 chat：verified / unverified；缺省 = 核实功能上线前的旧关联，不打标。 */
+  chatCheck?: BoardChatCheck;
+  /** 仅 chat：查到的群名（text 已按「标签 > 群名」取好，这里只是原始值）。 */
+  chatName?: string;
 }
 
 export interface StewardStatus {
@@ -66,6 +73,36 @@ export interface BoardItemSummary extends BoardItem {
   unseen: boolean;
   url?: string;
   appLink?: string;
+}
+
+// ─── 事项关联的群 ─────────────────────────────────────────────────────────────
+
+export interface ItemChatView {
+  /** 这一项的群，主群在最前，其余按管家写入的顺序。 */
+  chats: RenderedLink[];
+  primary?: RenderedLink;
+  /** 只在没有群时生效（之后补了群，原因就不再成立）。 */
+  noChatReason?: string;
+  /** 没有群、也没写原因：页面标「缺群」，提醒管家补。 */
+  missing: boolean;
+}
+
+/** 汇总行和详情页共用：从关联里挑出群、定主群（服务端标的 primary，没标就是第一个群）。 */
+export function itemChatView(item: Pick<BoardItem, 'noChatReason'>, links: readonly RenderedLink[]): ItemChatView {
+  const chats = links.filter(l => l.kind === 'chat');
+  const primary = chats.find(l => l.primary) ?? chats[0];
+  const reason = item.noChatReason?.trim();
+  return {
+    chats: primary ? [primary, ...chats.filter(l => l !== primary)] : [],
+    ...(primary ? { primary } : {}),
+    ...(!primary && reason ? { noChatReason: reason } : {}),
+    missing: !primary && !reason,
+  };
+}
+
+/** 详情页下方的关联对象里不再重复列群（群在标题下方单独一栏）。 */
+export function nonChatLinks(links: readonly RenderedLink[]): RenderedLink[] {
+  return links.filter(l => l.kind !== 'chat');
 }
 
 export interface BoardListResponse {

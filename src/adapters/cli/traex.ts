@@ -4,7 +4,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaExec } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
-import { traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import { traeConfigPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
   findTraexSessionIdByBotmuxSessionId,
   traexHistoryMatchDelta,
@@ -363,6 +363,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'traex',
+    mcpGateway: {
+      get configPath(): string { return traeConfigPath(); },
+      format: 'codex-toml',
+    },
     bridgeSpec: traexBridgeSpec,
     // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
     // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
@@ -375,7 +379,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // own non-sandboxed traecli) execute. The first-run migration markers that
     // must be visible are exposed READ-ONLY via sandboxReadonlyPaths() instead.
     authPaths: ['~/.trae/cli'],
-    sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
+    // The CLI must read the Gateway entry even when ~/.trae is not exposed.
+    // Keep the shared config read-only; hooks/plugins must not become writable.
+    sandboxReadonlyPaths: () => [traeConfigPath(), ...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {

@@ -17,16 +17,29 @@ export interface AskOption {
   label: string;
 }
 
+/** Opt-in input schema for an atomic Card 2.0 form. */
+export interface AskInputField {
+  type: 'text' | 'number';
+  /** Required by default; optional fields may be submitted blank. */
+  required?: boolean;
+  placeholder?: string;
+  maxLength?: number;
+  min?: number;
+  max?: number;
+}
+
 /** 多问多选模型中一个问题的描述。`key` 是问题的稳定标识符（可选，默认用序号），
  *  `label` 是人类可读的标题（暂保留向后兼容），`prompt` 是问题正文，
  *  `options` 是该问题的选项列表，`multiSelect` 表示是否允许多选。 */
 export interface AskQuestion {
+  /** Opt-in Card 2.0 form input; legacy inputMode=text remains a chat reply. */
+  input?: AskInputField;
   /** Native text-only questions use the existing conversation text-reply path.
    * They have no options and cannot be settled by an empty button submit. */
   inputMode?: 'text';
   /** 问题正文文本，展示给用户。 */
   prompt: string;
-  /** 该问题的选项列表，调用方保证 `options.length ≥ 2（inputMode=text 时为空）` 且 `key` 唯一。 */
+  /** 该问题的选项列表，调用方保证 `options.length ≥ 2（input 或 inputMode=text 时为空）` 且 `key` 唯一。 */
   options: ReadonlyArray<AskOption>;
   /** true = 多选（可选多个 key）；false = 单选（恰好 1 个 key）。 */
   multiSelect: boolean;
@@ -52,6 +65,8 @@ export type AskResult =
       kind: 'answered';
       /** answers[i] = questions[i] 选中的 key 数组。 */
       answers: ReadonlyArray<ReadonlyArray<string>>;
+      /** Form-only values, aligned with questions; choice/empty input slots are null. */
+      inputs?: ReadonlyArray<string | null>;
       by: string;
       /** 自定义回复原文（用户在话题里直接打字作答）；按钮选择时为 null。 */
       comment: string | null;
@@ -88,6 +103,7 @@ export interface AskJsonOutput {
   selected: string | null;
   /** v0.1.8 新增：按问题分组的完整答案，answered 时非 null。 */
   answers: string[][] | null;
+  inputs?: Array<string | null> | null;
   by: string | null;
   /** 自定义回复原文；按钮选择 / 超时 / 失效时为 null。 */
   comment: string | null;
@@ -131,7 +147,7 @@ export interface CreateAskInput {
    *  record that can never be re-claimed. Undefined → treated as false (fail
    *  closed: don't persist when the backend is unknown). */
   backendSurvivesRestart?: boolean;
-  /** 问题列表，调用方保证每问 `options.length ≥ 2（inputMode=text 时为空）` 且 key 唯一。 */
+  /** 问题列表，调用方保证每问 `options.length ≥ 2（input 或 inputMode=text 时为空）` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
    *  re-compute. */
@@ -213,7 +229,8 @@ export type AskClickOutcome =
   /** 空提交二次确认：鉴权 + nonce 校验都通过，但当前一个选项都没勾、且每个问题
    *  都允许空集（全多选），提交极可能是手滑——先不 settle，要求带 confirmEmpty 再点
    *  一次。仅当所有问题都可空时才可能返回；任一单选未选走 `stale`（空非有效答案）。 */
-  | 'needs_empty_confirm';
+  | 'needs_empty_confirm'
+  | 'invalid_form';
 
 /** 旧单选语义兼容：仅当"单问且恰好选 1 个"时返回该 key，否则 null。
  *  `botmux ask buttons` 子命令与其测试据此保持单选行为不变。 */

@@ -21,13 +21,19 @@ export function withCardRuntimeIdentity(
   const remoteState = remoteRunner ? normalizeRemoteRunnerBackendState(ds.session.remoteBackendState) : undefined;
   const remote = remoteUsage && remoteState && remoteUsage.generation === remoteState.generation
     ? remoteUsage.snapshot : undefined;
-  const nativeRuntime = effectiveCliId === 'grok' || effectiveCliId === 'minimax';
+  // ZCode's own ledger reports the model and level that actually answered, on
+  // the same footing as Grok's signals.json, and is fresher than the launch
+  // config — so it outranks every other source here.
+  const zcodeNative = effectiveCliId === 'zcode';
+  const nativeRuntime = effectiveCliId === 'grok' || effectiveCliId === 'minimax' || zcodeNative;
   const nativeModel = nativeRuntime ? snapshot.model?.trim() : undefined;
   const nativeEffort = nativeRuntime ? snapshot.reasoningEffort?.trim() : undefined;
-  const model = remote?.model?.trim()
+  const model = (zcodeNative ? nativeModel : undefined)
+    || remote?.model?.trim()
     || (effectiveCliId === 'minimax' ? nativeModel : undefined)
     || runtimeModel || nativeModel;
-  const effort = remote?.reasoningEffort?.trim()
+  const effort = (zcodeNative ? nativeEffort : undefined)
+    || remote?.reasoningEffort?.trim()
     || (effectiveCliId === 'minimax' ? nativeEffort : undefined)
     || reasoningEffort || nativeEffort;
   const variant = remote?.modelBackendVariant?.trim() || (ds.activeModelBackendVariant !== undefined

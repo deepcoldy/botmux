@@ -172,7 +172,7 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     text: {
       tag: 'lark_md',
       content: t('card.config.summary', {
-        cli: data.cliId, model: data.model ?? def, lang: data.lang ?? def, admins: data.admins,
+        cli: data.cliId, model: (data.model ? data.modelChoiceLabels?.[data.model] ?? data.model : def), lang: data.lang ?? def, admins: data.admins,
       }, locale),
     },
   });
@@ -185,8 +185,14 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   ];
   if (data.modelChoices.length > 0) {
     runSelects.push(configSelect('model', data.model ?? CONFIG_UNSET,
-      [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: m, value: m }))],
+      [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: data.modelChoiceLabels?.[m] ?? m, value: m }))],
       { action: 'config_set', field: 'model', ...locVal }));
+  }
+  if (data.reasoningEfforts && data.reasoningEfforts.length > 0) {
+    runSelects.push(configSelect(t('card.config.effort', undefined, locale),
+      data.reasoningEffort ?? CONFIG_UNSET,
+      [{ text: def, value: CONFIG_UNSET }, ...data.reasoningEfforts.map(level => ({ text: level, value: level }))],
+      { action: 'config_set', field: 'reasoningEffort', ...locVal }));
   }
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
@@ -206,6 +212,8 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     ],
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
+
+  if (data.cliId === 'zcode') elements.push({ tag: 'div', text: { tag: 'plain_text', content: locale === 'en' ? 'Model changes apply to new topics. Existing topics keep their own model and conversation.' : '模型修改对新话题生效；已有话题保留各自的模型和对话。' } });
 
   // ── 布尔开关分组 ─────────────────────────────────────────────────────────
   const onMap = new Map(data.booleans.map(b => [b.key, b.on]));

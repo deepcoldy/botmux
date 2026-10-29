@@ -1,3 +1,4 @@
+import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /**
  * The two daemon routes through which `botmux dispatch` writes to Lark — the
  * new-topic seed registration and the kickoff delivery — must apply the same
@@ -19,7 +20,7 @@ import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.j
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
-import { DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
+import { DISPATCH_USER_DELIVERY_MAX_BYTES, dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import {
   isDispatchOriginNotSendableError,
@@ -115,10 +116,11 @@ function run(
     initialDispatchLifecycle: () => ({}),
     projectCoordinator: { run: async () => undefined },
     getBot: () => ({ config: {} }),
+    matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({}),
     getDashboardAdminOpenIds: () => [],
     dispatchUserForTurn: async () => undefined,
-    pickTurnReplyTarget: () => undefined,
+    pickTurnReplyTarget: () => undefined, dispatchCallerFromReply,
     fallbackTurnId, frozenReplyContextForTurn,
     config: { session: { dataDir: '/nonexistent' } },
     join, logger: { info: vi.fn(), warn: vi.fn() },

@@ -1,4 +1,5 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { assertNoGlobalBotmuxSkills } from '../../skills/zero-injection.js';
 import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
@@ -7,7 +8,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { capabilitySlugs, type DebugModelCapabilities } from './model-catalog-json.js';
 import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
-import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec, WriteInputContext } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import {
   drainCodexRollout,
@@ -17,7 +18,7 @@ import {
   findCodexSessionIdByBotmuxSessionId,
   type CodexDrainState,
 } from '../../services/codex-transcript.js';
-import { refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
+import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeFooterRows, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 
@@ -76,14 +77,19 @@ function restoredCodexHistoryReady(history: string): boolean {
   const prompt = lines.length - 1 - fromBottom;
   if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   const footer = lines.slice(prompt + 1).filter(line => line.trim());
-  if (footer.length !== 1) return false;
+  const nativeFooter = codexNativeFooterRows(footer);
+  if (nativeFooter === undefined) return false;
   const restoredReady = (restored || initialized)
     && /^\s*\S[^\r\n]* · (?:\/|~)\S* · Ready(?: · [^\r\n]*)?$/.test(footer[0]!);
   // Codex 0.154 can resume straight into the composer without repainting the
   // banner or restoration marker. Its bottom Context footer is the positive
   // initialization evidence in that layout; the loading skeleton never has it.
   const contextReady = /^\s*\S[^\r\n]* · Context \d+% (?:left|used)(?: · [^\r\n]*)?$/.test(footer[0]!);
-  if (!restoredReady && !contextReady) return false;
+  // A custom status_line may omit both directory and Context. The complete
+  // native thread-id is also initialization evidence; reuse the same segment
+  // parser as terminal identity binding (no truncated/path/ambiguous UUIDs).
+  const threadReady = codexFooterSessionId(nativeFooter) !== undefined;
+  if (!restoredReady && !contextReady && !threadReady) return false;
   // History has no viewport bounds: never guess how far above the composer a
   // loading/status row can be. Conflicting evidence remains conservatively held.
   return !/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(history);
@@ -99,10 +105,12 @@ function resumedCodexPromptReady(screen: string): boolean {
   const prompt = lines.length - 1 - fromBottom;
   if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   // The composer must be the bottom input surface, followed only by its
-  // initialized model/path footer. Pickers, review dialogs and history alone
+  // initialized model/path or thread-id footer. Pickers, dialogs and history alone
   // cannot satisfy this shape. Do not depend on a particular model name.
   const footer = lines.slice(prompt + 1).filter(line => line.trim());
-  return footer.length === 1 && /^\s*\S[^\n]* · (?:\/|~)\S*/.test(footer[0]);
+  const nativeFooter = codexNativeFooterRows(footer);
+  return nativeFooter !== undefined && (/^\s*\S[^\n]* · (?:\/|~)\S*/.test(footer[0])
+    || codexFooterSessionId(nativeFooter) !== undefined);
 }
 
 /** Global submit log — Codex appends one JSON line here on every successful
@@ -125,11 +133,17 @@ interface HistoryMatch {
   ownershipProven?: boolean;
 }
 
-function historyMatchResult(match: HistoryMatch, requireOwnership: boolean): { submitted: true; cliSessionId?: string; ownershipProven?: true } {
+function historyMatchResult(match: HistoryMatch, requireOwnership: boolean): { submitted: true; cliSessionId?: string; ownershipProven?: true; unprovenCliSessionId?: string } {
+  const exposeSid = !!match.cliSessionId && (!requireOwnership || !!match.ownershipProven);
   return {
     submitted: true,
-    ...(match.cliSessionId && (!requireOwnership || match.ownershipProven) ? { cliSessionId: match.cliSessionId } : {}),
+    ...(exposeSid ? { cliSessionId: match.cliSessionId } : {}),
     ...(match.ownershipProven ? { ownershipProven: true } : {}),
+    // Codex creates the rollout lazily at the first submit and appends the
+    // history line from a separate task, so the line can be readable before
+    // the pid holds the rollout open. Hand the id back as a candidate only; the
+    // worker binds it once the pid is seen holding that rollout.
+    ...(match.cliSessionId && !exposeSid ? { unprovenCliSessionId: match.cliSessionId } : {}),
   };
 }
 
@@ -460,7 +474,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       return discoverRolloutSessions(codexSessionsRoot(), limit, exclude);
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
       const terminalSession = await refreshCodexTerminalSession(pty);
       // Codex's input mode treats every literal \n as Enter. The old path
       // (`send-keys -l` with the whole multi-line blob) therefore submitted
@@ -510,6 +524,16 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         && pty.expectedCodexSessionId.trim()
         ? pty.expectedCodexSessionId.trim()
         : undefined;
+      // Sandboxed Linux processes can deny /proc/<pid>/fd access even to
+      // their owner. Bare identical text in a shared history is not proof of
+      // which pane consumed it. A fresh per-write marker makes the exact
+      // post-baseByte history match unique without trusting a cwd/latest file
+      // or relaxing the owned-fd filter. Keep adopt, zero-prompt and explicit
+      // remote-thread input byte-for-byte unchanged (the worker opts in).
+      const initialOwned = cliPid ? findCodexRolloutSetByPid(cliPid) : undefined;
+      const correlated = context?.correlateTranscript === true && !!cliPid
+        && !expectedRemoteSid && (!initialOwned || initialOwned.size === 0);
+      if (correlated) content += `\n\n<botmux_routing>\nbotmux_input_id: ${randomBytes(16).toString('hex')}\n</botmux_routing>`;
       const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
         ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
         : cliPid
@@ -520,17 +544,18 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
             return owned.has(sid.toLowerCase());
           }
           : undefined;
-      // Positive ownership only: the explicit expected thread, or an owned
-      // rollout set that is available AND contains the line's session. The
-      // empty/unavailable-set and unfiltered acceptances above keep their
-      // submit semantics but never prove that this pane consumed the input.
+      // Positive ownership only: the explicit thread, an owned rollout fd,
+      // or this write's fresh correlation marker in the exact history match.
+      // Uncorrelated empty/unavailable-set acceptances remain submit evidence
+      // only, and never bind this pane to a sibling's conversation.
       const proveSid: HistorySidProof | undefined = expectedRemoteSid
         ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
         : cliPid
           ? (sid) => {
             if (!sid) return false;
             const owned = findCodexRolloutSetByPid(cliPid);
-            return !!owned && owned.has(sid.toLowerCase());
+            if (owned?.size) return owned.has(sid.toLowerCase());
+            return correlated && bindCodexSessionFromCorrelatedInput(pty, cliPid, sid);
           }
           : undefined;
 

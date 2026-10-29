@@ -26,6 +26,10 @@ vi.mock('../src/utils/user-token.js', () => ({
   resolveUserToken: vi.fn(async (appId: string, _secret: string, _brand: string, openId?: string) =>
     tokens.get(`${appId}|${openId ?? ''}`) ?? null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
+  // cli-identity.ts imports this. vitest tolerates a missing mock export; bun
+  // rejects the module at link time. Any new user-token import from
+  // cli-identity has to be added here too.
+  isUsableOpenId: (openId: unknown) => typeof openId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(openId),
 }));
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
@@ -499,15 +503,19 @@ describe('target daemon consumes signed message authority', () => {
     const ts = (await import('typescript')).default;
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
-    const { trustedCallerForScheduledTask } = await import('../src/core/scheduled-turn-provenance.js');
+    const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
+    const { buildUntilDoneRunPrompt, isAutoCompletedSchedule } = await import('../src/services/schedule-until-done.js');
+    const { scheduleTimeZone } = await import('../src/utils/timezone.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+    const { clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers } = await import('../src/core/cli-identity.js');
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
-      'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication'].map(name => {
+      'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
+      'handleIdentityDecisionFlip', 'noteTurnReceived'].map(name => {
       const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
       if (!fn) throw new Error('Missing production handler');
-      return ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+      return ts.transpileModule(fn.getText(source).replace(/^export\s+/, ''), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
     }).join('\n');
     const secret = 'target-test-secret';
     await deliverDispatchWithUser({ dataDir: dir, secret, payload: {
@@ -532,24 +540,41 @@ describe('target daemon consumes signed message authority', () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
         return options.member === false ? [] : ['ou_alice_target'];
       },
-      publishTurnCliIdentity, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn() },
-      identityStorageModelForDaemonSession: () => 'proven',
+      publishTurnCliIdentity, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+      // A session whose worker has not reported yet publishes under the
+      // fail-closed single default; tests set ds.reportedModel to stage that.
+      identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',
+      clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers,
+      // worker-pool's liveness rule (importing worker-pool here would pull in
+      // the full IM stack against this file's narrow user-token mock).
+      identityDecisionTurnIsLive: (session: any, turnId: string) => session.session.status === 'active'
+        && !!session.worker && !session.worker.killed && !session.terminalIdentityTurnIds?.has(turnId),
       identityDecisionConflict: () => undefined,
       parseScheduledTurnId: (turnId: string) => {
         const match = /^schedule:([0-9a-z_]{1,50}):[0-9a-f-]{36}$/.exec(turnId);
         return match?.[1] ?? null;
       },
-      trustedCallerForScheduledTask,
+      resolveScheduledRunIdentity,
+      noteScheduledIdentityGap: vi.fn(),
+      noteScheduledIdentityRestored: vi.fn(),
+      isAutoCompletedSchedule, buildUntilDoneRunPrompt, scheduleTimeZone,
       scheduleStore: { effectiveScheduleChatIds: (task: any) => task.chatIds ?? [task.chatId] },
       getDashboardAdminOpenIds: () => [ALICE],
       canOperate: vi.fn((_appId: string, _chatId: string, openId?: string) => openId === ALICE),
       scheduleAuthorityStore: undefined as any,
+      // noteTurnReceived's reaction bookkeeping: a card-on session stops there.
+      streamingCardDisabledFor: () => false,
     };
     const handlers = new Function('scope', 'with (scope) { ' + code
-      + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity }; }')(scopeValues);
+      + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity, handleIdentityDecisionFlip, noteTurnReceived }; }')(scopeValues);
     return {
       ds,
       scopeValues,
+      prepare: (turnId: string) => handlers.prepareTurnCliIdentity(ds, turnId),
+      /** The inbound-message acceptance point (human turns). */
+      accept: (messageId: string) => handlers.noteTurnReceived(ds, messageId),
+      flip: (context: { model: 'single' | 'proven'; flipped: boolean; turnId?: string }) =>
+        handlers.handleIdentityDecisionFlip(ds, context),
       run: (turnId = 'om_kickoff') => turnId.startsWith('schedule:')
         ? handlers.prepareTurnCliIdentity(ds, turnId)
         : handlers.refreshTurnCliIdentity(ds, turnId),
@@ -621,6 +646,51 @@ describe('target daemon consumes signed message authority', () => {
     expect(stale.stdout.trim()).toBe(tool === 'bytedcli' ? 'scheduled-alice' : home);
   });
 
+  it('keeps the creator identity when a cold-started scheduled turn is replayed after the worker reports proven', async () => {
+    // A scheduled fire that opens a new topic (or finds no live worker)
+    // publishes before the worker exists, so under the fail-closed single
+    // default. The new worker then reports proven and the daemon replays the
+    // turn. The replay must resolve the creator from the schedule authority
+    // again — not read a human sender a scheduled turn never has.
+    const h = await targetHarness();
+    directSchedule(h);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
+    Object.assign(h.ds.session, { status: 'active' });
+    h.ds.worker = { killed: false };
+    h.ds.reportedModel = 'single';
+    await h.prepare(firstScheduledTurn);
+    expect(h.ds.lastPublishedIdentityModel).toBe('single');
+
+    h.ds.reportedModel = 'proven';
+    await h.flip({ model: 'proven', flipped: true, turnId: firstScheduledTurn });
+
+    expect(h.ds.lastIdentityDecisionRepublish).toEqual({ model: 'proven', turnId: firstScheduledTurn, ok: true });
+    const body = recallProvenIdentityContent(dir, SESSION, firstScheduledTurn, 'bytedcli');
+    expect(body).toContain('scheduled-alice');
+    expect(body).not.toContain('denied');
+  });
+
+  it.each(['human message', 'scheduled fire'] as const)('leaves a live worker\'s wrappers alone when the policy goes off and back on (next %s)', async entry => {
+    // Wrappers follow the policy the worker was spawned with; only a respawn
+    // removes them. If the daemon removed them mid-life, turning the policy
+    // back on before a respawn would leave nothing to enforce it: the tool
+    // would run with the machine's login while every turn still publishes.
+    const h = await targetHarness();
+    directSchedule(h);
+    const { installIdentityWrapper, sessionIdentityBinDir } = await import('../src/core/cli-identity.js');
+    const binDir = sessionIdentityBinDir(dir, SESSION);
+    for (const tool of ['bytedcli', 'codebase'] as const) installIdentityWrapper(binDir, tool, '/bin/true', 'proven', ['/bin/true']);
+    h.ds.initConfig = { triggerUserAuth: botConfig({ enabled: true, tools: ['bytedcli'] }).triggerUserAuth };
+    const next = (turn: string) => entry === 'human message' ? h.accept(turn) : h.prepare(turn);
+
+    h.scopeValues.getBot = () => ({ config: botConfig({ enabled: false }) });
+    await next(entry === 'human message' ? 'om_off' : firstScheduledTurn);
+    h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) });
+    await next(entry === 'human message' ? 'om_on_again' : nextScheduledTurn);
+    expect(existsSync(join(binDir, 'bytedcli'))).toBe(true);
+    expect(existsSync(join(binDir, 'codebase'))).toBe(true);
+  });
+
   it('the production scheduler prepares ordinary tasks before dispatch', async () => {
     const h = await targetHarness();
     const { task } = directSchedule(h);
@@ -669,6 +739,53 @@ describe('target daemon consumes signed message authority', () => {
     expect(env).not.toContain('unauthorized-human');
   });
 
+  it('runs a claimed task as its claimant, ahead of a creator who still has access', async () => {
+    const h = await targetHarness();
+    directSchedule(h, {
+      ownerOpenId: BOB, ownerUnionId: 'on_bob',
+      runAsClaim: { openId: ALICE, unionId: 'on_alice', larkAppId: APP, claimedAt: '2026-10-26T02:00:00.000Z' },
+    });
+    h.scopeValues.canOperate.mockReturnValue(true);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'claimant-alice' });
+    bytedcliJwts.set(BOB, { cloudJwt: 'creator-bob' });
+    await h.run(firstScheduledTurn);
+    const env = identityBody('bytedcli', firstScheduledTurn);
+    expect(env).toContain('claimant-alice');
+    expect(env).not.toContain('creator-bob');
+    expect(h.scopeValues.canOperate).toHaveBeenCalledWith(APP, 'oc_chat', ALICE, 'on_alice');
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ ownerOpenId: undefined, ownerUnionId: undefined }, { ok: false, reason: 'no_creator' }],
+    [{ ownerOpenId: BOB, ownerUnionId: 'on_bob' }, { ok: false, reason: 'creator_revoked', lapsedOpenId: BOB }],
+    [{ runAsClaim: { openId: BOB, unionId: 'on_bob', larkAppId: APP, claimedAt: '2026-10-26T02:00:00.000Z' } },
+      { ok: false, reason: 'claimant_revoked', lapsedOpenId: BOB }],
+  ])('asks the chat for a claimant when a scheduled turn has no usable identity: %o', async (patch, gap) => {
+    const h = await targetHarness();
+    const { task } = directSchedule(h, patch);
+    bytedcliJwts.set(BOB, { cloudJwt: 'must-not-use-bob' });
+    await h.run(firstScheduledTurn);
+    const env = identityBody('bytedcli', firstScheduledTurn);
+    expect(env).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(env).not.toContain('must-not-use-bob');
+    expect(h.scopeValues.noteScheduledIdentityGap).toHaveBeenCalledTimes(1);
+    expect(h.scopeValues.noteScheduledIdentityGap).toHaveBeenCalledWith(h.ds, task, firstScheduledTurn, gap);
+    expect(h.scopeValues.noteScheduledIdentityRestored).not.toHaveBeenCalled();
+  });
+
+  it('a creator who still has access gets no claim card', async () => {
+    const h = await targetHarness();
+    directSchedule(h);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'creator-alice' });
+    await h.run(firstScheduledTurn);
+    expect(identityBody('bytedcli', firstScheduledTurn)).toContain('creator-alice');
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+    // A card still asking for a claimant from an earlier fire gets settled.
+    expect(h.scopeValues.noteScheduledIdentityRestored).toHaveBeenCalledWith(h.ds, expect.objectContaining({ id: 'a1b2c3d4' }),
+      firstScheduledTurn, { ok: true, openId: ALICE, unionId: 'on_alice', source: 'creator' });
+  });
+
   it('publishes a denial when the scheduled creator has not authorized the tool', async () => {
     const h = await targetHarness();
     directSchedule(h);
@@ -711,8 +828,11 @@ describe('target daemon consumes signed message authority', () => {
   it('keeps disabled trigger-user authentication inert for scheduled turns', async () => {
     const h = await targetHarness();
     h.scopeValues.getBot = () => ({ config: botConfig({ enabled: false }) });
+    directSchedule(h, { ownerOpenId: undefined, ownerUnionId: undefined });
     await h.run(firstScheduledTurn);
     expect(published('bytedcli', firstScheduledTurn)).toBe(false);
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+    expect(h.scopeValues.noteScheduledIdentityRestored).not.toHaveBeenCalled();
   });
   it.each(['live', 'restored'])('a proven human turn does not depend on the delegation store (%s)', async mode => {
     const h = await targetHarness();
@@ -765,6 +885,10 @@ describe('target daemon consumes signed message authority', () => {
     await h.run();
     expect(h.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith(APP, 'on_alice');
     expect(identityBody('bytedcli', 'om_kickoff')).toContain('original-user');
+    // The receiving side records who the turn's tools will run as, and from whom.
+    expect(h.scopeValues.logger.info).toHaveBeenCalledWith(expect.stringMatching(
+      /^\[dispatch-user:audit\] receive source=cli_source target=cli_bot union=on_alice .*turn=om_kickoff .*tools=bytedcli .*result=delegated$/,
+    ));
   });
   it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
     const h = await targetHarness(options);
@@ -773,6 +897,9 @@ describe('target daemon consumes signed message authority', () => {
     const env = identityBody('bytedcli', 'om_kickoff');
     expect(env).not.toContain('must-not-leak');
     expect(env).toContain('report --dispatch-root om_root');
+    expect(h.scopeValues.logger.info).toHaveBeenCalledWith(expect.stringMatching(
+      /^\[dispatch-user:audit\] receive source=cli_source .*result=target_(access_denied|validation_unavailable)$/,
+    ));
   });
   it('never uses root binding for an unrelated later turn', async () => {
     const h = await targetHarness();
@@ -803,6 +930,45 @@ describe('target daemon consumes signed message authority', () => {
     expect(identityBody('bytedcli', turnId))
       .toContain('scheduled-original-user');
   });
+
+  it.each(['signed kickoff', 'delegated scheduled turn'] as const)(
+    'asks the platform with the union_id the daemon verified for a %s, with the contact API down',
+    async kind => {
+      const h = await targetHarness();
+      const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+      const grants: any[] = [];
+      __setPlatformCredentialDepsForTest({
+        readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+        resolveUnionId: async () => { throw new Error('contact API unavailable'); },
+        requestGrant: async req => {
+          grants.push(req);
+          return { ok: true, value: { tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+            variables: { BYTEDCLI_USER_CLOUD_JWT: 'platform-alice' } } } as any;
+        },
+      });
+      try {
+        h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }) });
+        let turnId = 'om_kickoff';
+        if (kind === 'delegated scheduled turn') {
+          turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+          const task = { id: 'a1b2c3d4', chatId: 'oc_chat' };
+          h.scopeValues.scheduleAuthorityStore = { getRecord: () => ({
+            kind: 'delegated', state: 'active', task,
+            controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+            credentialOpenId: ALICE, runScopes: ['bytedcli'], selfManage: true, sourceMessageId: 'om_root',
+          }) };
+          h.scopeValues.authorizeDelegatedScheduleRun = vi.fn(async () => ({ task, targetOpenId: 'ou_alice_target' }));
+          h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true, runScopes: ['bytedcli'] } });
+          h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
+        }
+        await h.run(turnId);
+        expect(identityBody('bytedcli', turnId)).toContain('platform-alice');
+        expect(grants.map(grant => grant.unionId)).toEqual(['on_alice']);
+      } finally {
+        __setPlatformCredentialDepsForTest(null);
+      }
+    },
+  );
 
   it('withholds every identity publication while the worker decision conflicts', async () => {
     const h = await targetHarness();

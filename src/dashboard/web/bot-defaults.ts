@@ -352,6 +352,9 @@ export type BotDefaultsRow = {
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
     credentialSource?: 'auto' | 'platform' | 'local';
+    /** `--mention` handoffs to bots on this machine carry this turn's sender.
+     *  Absent = on (the default); only `false` is stored. */
+    delegateOnMention?: boolean;
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;

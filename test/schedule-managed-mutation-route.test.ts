@@ -1,10 +1,18 @@
-import { readFileSync } from 'node:fs';
+import { assertScheduleBotGrantActive } from '../src/core/schedule-bot-grant.js';
+import { authorizeScheduleSelfManage as realAuthorizeSelfManage } from '../src/core/schedule-delegated-runtime.js';
+import { mkdtempSync, readFileSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
+import { isUntilDoneClosed, UNTIL_DONE_NOTE_MAX_CHARS } from '../src/services/schedule-until-done.js';
+
+// A real directory: capabilityScheduleWorkingDir realpaths both sides.
+const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const route = source.statements.find(node => ts.isExpressionStatement(node)
@@ -14,7 +22,10 @@ const route = source.statements.find(node => ts.isExpressionStatement(node)
 const handler = (route.expression as ts.CallExpression).arguments[2];
 const callerHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
   && node.name?.text === 'scheduleCallerForTurn');
+const workingDirHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'capabilityScheduleWorkingDir');
 const code = ts.transpileModule(`${callerHelper?.getText(source) ?? ''}
+${workingDirHelper?.getText(source) ?? ''}
 const handler = ${handler.getText(source)}`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
@@ -22,7 +33,7 @@ const handler = ${handler.getText(source)}`, {
 function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group',
-    session: { sessionId: 's1' }, workerGeneration: 7,
+    session: { sessionId: 's1' }, workerGeneration: 7, workingDir: REPO,
     managedTurnOrigin: { capability: 'c'.repeat(64), turnId },
     activeInteractiveTurn: { turnId, caller: {
       senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_admin',
@@ -31,19 +42,24 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   const scheduler = {
     updateTask: vi.fn(() => ({ ok: true })), removeTask: vi.fn(() => true),
     disableTask: vi.fn(() => true), enableTask: vi.fn(() => true), runTaskNow: vi.fn(() => true),
+    completeTask: vi.fn((): { ok: boolean; replay?: boolean; error?: string } => ({ ok: true })),
   };
   const record: any = { kind: 'delegated', state: 'active', selfManage: false,
-    task: { id: 'a1b2c3d4', chatId: 'oc_chat' } };
+    task: { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO } };
   const authorizeScheduleSelfManage = vi.fn(async () => undefined);
   const scope: any = {
     readJsonBody: async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
       originTurnId: turnId, action, id, prompt: 'changed' }),
     findActiveBySessionId: () => ds, authorizeSessionScopedIpc,
+    realpathSync,
+    validateRoleLibraryPath: vi.fn((): { ok: boolean; resolvedPath?: string } => ({ ok: false })),
     pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
     isTrustedHostIpcRequest: () => false,
     getDashboardAdminOpenIds: () => ['ou_admin'],
     parseScheduledTurnId,
-    authorizeScheduleSelfManage,
+    isUntilDoneClosed,
+    UNTIL_DONE_NOTE_MAX_CHARS,
+    authorizeScheduleSelfManage, assertScheduleBotGrantActive,
     readGlobalConfig: () => ({ scheduleDelegation: { selfManageEnabled: true } }),
     resolveUnionIdFromOpenId: async () => 'on_admin',
     resolveTargetAppOpenId: async () => ({ status: 'resolved', openId: 'ou_admin' }),
@@ -79,6 +95,166 @@ function configureProviderActor(
 }
 
 describe('managed schedule mutation route', () => {
+  it.each(['pause', 'remove'])('lets the owning bot %s its policy task in the original topic after a report', async action => {
+    const h = harness(action, 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, state: 'paused', controlOpenId: 'ou_admin',
+      controlUnionId: 'on_admin', runScopes: [], grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    Object.assign(h.record.task, { larkAppId: 'cli_target', rootMessageId: 'om_topic' });
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_controller', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_admin' }] } });
+    expect((await h.run()).status).toBe(200);
+    h.ds.session.rootMessageId = 'om_other';
+    expect((await h.run()).status).toBe(403);
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true } });
+    expect((await h.run()).status).toBe(403);
+  });
+  // Topic cleanup is the bot service authority's. A person in the same topic
+  // keeps the ordinary rules: a non-administrator is refused, an administrator
+  // still manages the task through the current-human path.
+  function botPolicyTaskInTopic(action: string, turnId: string) {
+    const h = harness(action, turnId);
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, controlOpenId: 'ou_admin',
+      controlUnionId: 'on_admin', runScopes: [], grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    Object.assign(h.record.task, { larkAppId: 'cli_target', rootMessageId: 'om_topic' });
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_controller', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_admin' }] } });
+    return h;
+  }
+  it.each(['pause', 'remove'])('refuses a non-administrator in the original topic who asks to %s a bot policy task', async action => {
+    const h = botPolicyTaskInTopic(action, 'om_member');
+    h.ds.activeInteractiveTurn.caller.requestUserOpenId = 'ou_member';
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+    expect(h.scheduler.disableTask).not.toHaveBeenCalled();
+  });
+  // The topic is the one this turn runs in, computed as the delegated-add route
+  // computed it when it stored the task. In a chat-scope session the session
+  // anchor is only its first message, so it must not stand in for the topic.
+  it('in a chat-scope session, cleans up only the task of the thread the bot turn runs in', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    Object.assign(h.ds, { scope: 'chat' });
+    h.ds.session = { sessionId: 's1', rootMessageId: 'om_first',
+      replyTargets: { 'report:1': { rootMessageId: 'om_thread2', updatedAt: '2026-10-29T00:00:00.000Z' } } };
+    h.record.task.rootMessageId = 'om_first';
+    expect((await h.run()).status).toBe(403);
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+    h.record.task.rootMessageId = 'om_thread2';
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler.removeTask).toHaveBeenCalledOnce();
+  });
+  it('refuses topic cleanup when the grant is revoked while the controller is being checked', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.scope.resolveTargetAppOpenId = async () => {
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true } });
+      return { status: 'resolved', openId: 'ou_admin' };
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_self_manage_denied' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+  it('refuses topic cleanup from a bot turn the receiving bot did not observe itself', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_controller' };
+    expect((await h.run()).status).toBe(403);
+    h.ds.activeInteractiveTurn.caller.requestLarkAppId = 'cli_target';
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler.removeTask).toHaveBeenCalledOnce();
+  });
+  it.each(['pause', 'remove'])('still lets an administrator in the original topic %s a bot policy task', async action => {
+    const h = botPolicyTaskInTopic(action, 'om_admin_turn');
+    expect((await h.run()).status).toBe(200);
+    expect(action === 'pause' ? h.scheduler.disableTask : h.scheduler.removeTask).toHaveBeenCalledWith('a1b2c3d4');
+  });
+  it('rejects topic cleanup when its managed turn changes during authorization', async () => {
+    const h = harness('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    h.record.task.rootMessageId = 'om_topic';
+    h.scope.authorizeScheduleSelfManage = async () => { h.ds.workerGeneration++; };
+    expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_mutation_turn_changed' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+  it.each(['update', 'resume', 'run'])('does not turn a bot policy cleanup grant into %s authority', async action => {
+    const h = harness(action, 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    h.record.task.rootMessageId = 'om_topic';
+    expect((await h.run()).status).toBe(403);
+  });
+
+  it('refuses a capability-only update of a task pinned outside the caller\'s reach', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.record.task.workingDir = '/Users/ksher';
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    expect(h.scheduler.updateTask).not.toHaveBeenCalled();
+  });
+
+  it('allows a capability-only update of a task in the caller\'s own role library', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.record.task.workingDir = '/roles/cli_target/shared/pm';
+    h.scope.validateRoleLibraryPath = vi.fn(() => ({ ok: true, resolvedPath: '/roles/cli_target/shared/pm' }));
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.scope.validateRoleLibraryPath).toHaveBeenCalledWith('/roles/cli_target/shared/pm', undefined, 'cli_target');
+    expect(h.scheduler.updateTask).toHaveBeenCalledOnce();
+  });
+
+  it.each(['remove', 'pause', 'resume', 'run'] as const)(
+    'refuses a capability-only %s of a task in another chat', async action => {
+      const h = harness(action);
+      h.record.kind = 'direct';
+      h.record.task.enabled = true;
+      h.record.task.chatId = 'oc_other';
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_scope_forbidden' } });
+      const method = { remove: 'removeTask', pause: 'disableTask', resume: 'enableTask', run: 'runTaskNow' }[action];
+      expect(h.scheduler[method]).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['remove', 'pause', 'resume', 'run'] as const)(
+    'refuses a capability-only %s of a task pinned outside the caller\'s reach', async action => {
+      const h = harness(action);
+      h.record.kind = 'direct';
+      h.record.task.enabled = true;
+      h.record.task.workingDir = '/Users/ksher';
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    },
+  );
+
+  it('still lets the host run a task in another chat', async () => {
+    const h = harness('run');
+    h.record.kind = 'direct';
+    h.record.task.enabled = true;
+    h.record.task.chatId = 'oc_other';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+  });
+
+  it('still lets the host update a task pinned anywhere', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.record.task.workingDir = '/Users/ksher';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+  });
+
   it('runs the fixed protected task for a current same-app human administrator without a union lookup', async () => {
     const h = harness('run');
     h.record.kind = 'direct';
@@ -347,10 +523,72 @@ describe('managed schedule mutation route', () => {
     expect(await runSelf.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
   });
 
+  it('lets a scheduled turn mark only its own until-done task done, with a note', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('done', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.record.kind = 'direct';
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', enabled: true,
+      untilDone: { status: 'open', attempts: 2 } };
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: turnId, action: 'done', id: 'self', note: '  PR merged, fleet switched  ' });
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.authorizeScheduleSelfManage).toHaveBeenCalledOnce();
+    expect(h.scheduler.completeTask).toHaveBeenCalledWith('a1b2c3d4', 'PR merged, fleet switched');
+
+    const other = harness('done', turnId, 'deadbeef');
+    other.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    expect(await other.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+    expect(other.scheduler.completeTask).not.toHaveBeenCalled();
+  });
+
+  it('reports a repeated done as a replay and a plain task as not until-done', async () => {
+    const replay = harness('done');
+    replay.record.kind = 'direct';
+    replay.scheduler.completeTask.mockReturnValue({ ok: true, replay: true });
+    expect(await replay.run()).toMatchObject({ status: 200, value: { ok: true, replay: true } });
+
+    const plain = harness('done');
+    plain.record.kind = 'direct';
+    plain.scheduler.completeTask.mockReturnValue({ ok: false, error: 'schedule_not_until_done' });
+    expect(await plain.run()).toMatchObject({ status: 409, value: { ok: false, error: 'schedule_not_until_done' } });
+  });
+
+  it('rejects a non-string done note before touching the task', async () => {
+    const h = harness('done');
+    h.record.kind = 'direct';
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human', action: 'done', id: 'a1b2c3d4', note: { text: 'x' } });
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'invalid_schedule_mutation' } });
+    expect(h.scheduler.completeTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses to resume an until-done task that is already closed', async () => {
+    const h = harness('resume');
+    h.record.kind = 'direct';
+    h.record.state = 'completed';
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO, enabled: false,
+      disabledReason: 'once_completed', untilDone: { status: 'done', attempts: 3 } };
+    expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_until_done_closed' } });
+    expect(h.scheduler.enableTask).not.toHaveBeenCalled();
+  });
+
+  it('does not reveal another chat\'s closed until-done state to a capability-only caller', async () => {
+    // The scope guard must run before the until-done check: a caller outside
+    // the task's chat learns nothing about its state, only that it is out of scope.
+    const h = harness('resume');
+    h.record.kind = 'direct';
+    h.record.state = 'completed';
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_other', workingDir: REPO, enabled: false,
+      disabledReason: 'once_completed', untilDone: { status: 'done', attempts: 3 } };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_scope_forbidden' } });
+    expect(h.scheduler.enableTask).not.toHaveBeenCalled();
+  });
+
   it('refuses to force-run a paused task (must resume first)', async () => {
     const h = harness('run');
     h.record.kind = 'direct';
-    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', enabled: false };
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO, enabled: false };
     expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_task_disabled' } });
     expect(h.scheduler.runTaskNow).not.toHaveBeenCalled();
   });

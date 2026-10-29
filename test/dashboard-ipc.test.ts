@@ -3759,6 +3759,58 @@ describe('PUT + GET /api/bot-trigger-user-auth — 开关刷新回显', () => {
     }
   });
 
+  it('stores delegateOnMention only when the Dashboard turns it off, and drops it again when turned back on', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-user-auth-delegate-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-trigger-user-auth-delegate-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex',
+        triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'bot-identity', gitHost: 'code.example.com' },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (delegateOnMention: boolean) => fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'bot-identity', delegateOnMention } }),
+      });
+      const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth;
+
+      expect((await put(false)).status).toBe(200);
+      expect(stored()).toMatchObject({ delegateOnMention: false, gitHost: 'code.example.com' });
+      expect(getBot(appId).config.triggerUserAuth?.delegateOnMention).toBe(false);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).triggerUserAuth)
+        .toMatchObject({ delegateOnMention: false });
+
+      // An older Dashboard bundle saves without the key: the stored `false`
+      // must survive, never fall back to the default (on).
+      expect((await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'bot-identity' } }),
+      })).status).toBe(200);
+      expect(stored()).toMatchObject({ delegateOnMention: false });
+
+      // On is the default: the key leaves bots.json instead of storing `true`,
+      // and a merge with the stored `false` cannot keep it off.
+      expect((await put(true)).status).toBe(200);
+      expect(stored()).not.toHaveProperty('delegateOnMention');
+      expect(stored()).toMatchObject({ gitHost: 'code.example.com' });
+      expect(getBot(appId).config.triggerUserAuth).not.toHaveProperty('delegateOnMention');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('preserves the UI-less gitHost / gitTokenExchangeUrl across a tools-only save', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-user-auth-git-'));
     const configPath = join(dir, 'bots.json');

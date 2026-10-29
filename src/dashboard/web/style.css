@@ -2808,7 +2808,7 @@ button.primary {
   min-width: 220px;
   max-width: 360px;
   padding: 10px 12px;
-  border-radius: var(--radius-md, 8px);
+  border-radius: var(--radius-md);
   background: var(--surface-raised, #1b1f2a);
   border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
@@ -19784,6 +19784,47 @@ form.dashboard-toolbar > input[type="text"]:focus {
   min-width: 0;
   padding: 4px 0 2px;
 }
+.settings-page .settings-bot-grant-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.settings-page .settings-bot-grant {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+.settings-page .settings-bot-grant-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  font-size: 12px;
+}
+.settings-page .settings-bot-grant-main small {
+  color: var(--muted);
+  word-break: break-all;
+}
+.settings-page .settings-bot-grant .actions,
+.settings-page .settings-bot-grants > .actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.settings-page .settings-bot-grant-targets {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.settings-page .settings-bot-grant-form .bot-multi-select-list {
+  max-height: 180px;
+}
 .settings-page .settings-inline-link {
   border: 0;
   background: none;
@@ -30556,6 +30597,14 @@ button.skills-issue-badge:hover {
   cursor: not-allowed;
 }
 .feedback-page { display: grid; gap: 16px; }
+.feedback-filter-fields { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.feedback-filter-fields label { display: grid; gap: 6px; min-width: 0; font-size: 12px; }
+.feedback-filter-fields input, .feedback-filter-fields select { box-sizing: border-box; width: 100%; min-height: 34px; padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); color: var(--fg); font: inherit; }
+.feedback-filter-fields select { max-width: 260px; }
+.feedback-presets { display: flex; flex-wrap: wrap; gap: 8px; }
+.feedback-filter-hint { margin: 12px 0 0; color: var(--muted); font-size: 12px; }
+.feedback-page .panel h2 small { font-size: 11px; font-weight: normal; color: var(--muted); }
+@media (max-width: 700px) { .feedback-filter-fields > label { flex: 1 1 140px; } .feedback-filter-fields select { max-width: none; } .feedback-presets { flex-basis: 100%; } }
 .feedback-kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
 .feedback-kpis article { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
 .feedback-kpis span { color: var(--muted); font-size: 11px; }
@@ -36609,7 +36658,8 @@ dialog.command-palette-dialog::backdrop {
   color: var(--fg);
   text-decoration: none;
 }
-.dboard-row:hover { background: var(--surface-hover); }
+.dboard-list > li.dboard-row-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.dboard-row-item:hover { background: var(--surface-hover); }
 .dboard-row-dot { color: var(--accent); font-size: 10px; line-height: 22px; text-align: center; }
 .dboard-row-main { display: grid; gap: 3px; min-width: 0; }
 .dboard-row-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
@@ -36631,6 +36681,30 @@ dialog.command-palette-dialog::backdrop {
 }
 .dboard-row-repo { max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
 .dboard-row-draft { color: var(--accent-strong); font-weight: var(--fw-m); }
+/* 事项关联的群：行内一行主群名，右侧「进群」；没有群时写原因或标缺群。 */
+.dboard-row-chat { display: flex; align-items: center; flex-wrap: wrap; gap: 2px 6px; min-width: 0; color: var(--fg-2); font-size: var(--fs-12); }
+.dboard-row-chat-name { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dboard-row-chat-more { color: var(--muted); white-space: nowrap; }
+.dboard-row-chat.is-none { color: var(--muted); overflow-wrap: anywhere; }
+.dboard-row-chat.is-missing { color: var(--warning); font-weight: var(--fw-m); }
+.dboard-row-join { display: flex; justify-content: flex-end; min-width: 64px; padding-right: 14px; }
+a.dboard-join-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-m);
+  line-height: 22px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+a.dboard-join-btn:hover { border-color: var(--accent); background: var(--accent); color: var(--on-accent); }
+.dboard-chat-tag { flex: none; padding: 0 6px; border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--accent-strong); font-size: var(--fs-11); font-weight: var(--fw-m); line-height: 18px; white-space: nowrap; }
+.dboard-chat-tag.is-warn { background: var(--warning-soft); color: var(--warning); }
 
 .dboard-state {
   display: inline-flex;
@@ -36724,6 +36798,58 @@ button.dboard-text-btn:disabled { color: var(--faint); cursor: default; text-dec
 .dboard-detail-head h1 { flex: 1 1 240px; min-width: 0; margin: 0; font-size: var(--fs-20); line-height: var(--lh-title); overflow-wrap: anywhere; }
 .dboard-detail-head h1 .dboard-seq { font-size: var(--fs-17); }
 .dboard-detail-meta { margin: -8px 0 0; color: var(--muted); font-size: var(--fs-12); }
+.dboard-chats {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--accent-soft) 45%, var(--surface));
+}
+.dboard-chats-label { color: var(--muted); font-size: var(--fs-12); }
+.dboard-chats-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.dboard-chat {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 32px;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: var(--fs-13);
+  text-decoration: none;
+}
+a.dboard-chat:hover { border-color: var(--accent); color: var(--accent-strong); }
+.dboard-chat.is-primary { border-color: var(--accent); background: var(--accent); color: var(--on-accent); }
+a.dboard-chat.is-primary:hover { color: var(--on-accent); filter: brightness(1.06); }
+.dboard-chat.is-primary .dboard-chat-tag { background: color-mix(in srgb, var(--on-accent) 22%, transparent); color: var(--on-accent); }
+.dboard-chat.is-primary .dboard-chat-tag.is-warn { background: var(--warning-soft); color: var(--warning); }
+.dboard-chat-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: var(--fw-m); }
+.dboard-chat-go { flex: none; font-size: var(--fs-12); opacity: .85; white-space: nowrap; }
+.dboard-chats.is-none { border-color: var(--border-soft); background: var(--surface-muted); color: var(--fg-2); font-size: var(--fs-13); overflow-wrap: anywhere; }
+.dboard-chats.is-missing code {
+  justify-self: start;
+  max-width: 100%;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-12);
+  overflow-wrap: anywhere;
+}
+.dboard-chats.is-missing {
+  border-color: color-mix(in srgb, var(--warning) 35%, transparent);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: var(--fs-13);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
 .dboard-links { display: flex; flex-wrap: wrap; gap: 6px; }
 .dboard-link {
   display: inline-flex;
@@ -36912,6 +37038,7 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 
 @media (max-width: 560px) {
   .dboard-row { grid-template-columns: 12px minmax(0, 1fr); }
+  .dboard-row-join { min-width: 0; padding-right: 10px; }
   .dboard-row-meta { grid-column: 2; justify-content: flex-start; }
   .dboard-page .dboard-search { max-width: none; }
   .dboard-heading { padding-bottom: 8px; }

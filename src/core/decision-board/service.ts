@@ -19,17 +19,22 @@ import {
   DecisionBoardStore,
   type ItemPatch,
 } from '../../services/decision-board-store.js';
+import { formatChatLookupFailures, lookupProvesChatNotFound, type ChatLookupResult } from './chat-lookup.js';
 import {
   BOARD_STATE_LABELS,
+  CHAT_REF_PATTERN,
   boardItemPath,
+  cleanChatName,
   composeStewardGuide,
+  effectivePrimaryChat,
   formatBatchEcho,
   formatBatchMessage,
   splitEchoText,
   formatBoardTurnId,
   isBoardState,
   isBoardView,
-  linkDefaultLabel,
+  itemMissingChat,
+  linkText,
   linkUrl,
   parseBoardTurnId,
   parseItemRef,
@@ -40,6 +45,7 @@ import {
   stewardGuidePreset,
   stewardReady,
   type BoardBatch,
+  type BoardItem,
   type BoardLink,
   type BoardOption,
   type BoardUnlink,
@@ -73,6 +79,11 @@ export interface DecisionBoardServiceDeps {
     sessionTitle: string;
   }): Promise<{ sessionId: string }>;
   log(level: 'info' | 'warn', message: string): void;
+  /**
+   * 核实一个群：先用管家 bot 的凭据查，查不到再依次试本机其他 bot（见 chat-lookup.ts）。
+   * 只在写 chat 关联时调用；凭据只留在 daemon 进程内。`deadline` 是这条命令共用的截止时间。
+   */
+  lookupChat(chatId: string, opts: { deadline: number }): Promise<ChatLookupResult>;
 }
 
 /** CLI 发来的请求体：选项和关联都传原始 spec 字符串，由这里统一解析。 */
@@ -90,7 +101,32 @@ export interface BoardCliRequest {
   handled?: unknown;
   files?: unknown;
   note?: unknown;
+  /** `--primary-chat oc_…` */
+  primaryChat?: unknown;
+  /** `--no-chat "<原因>"` */
+  noChat?: unknown;
+  /** `--allow-unverified-chat`：查不到的群也写，标「未核实」。 */
+  allowUnverifiedChat?: unknown;
 }
+
+/** 建项缺群时的报错：写清楚三种写法（管家照着改命令即可）。 */
+export const ADD_CHAT_REQUIRED_MESSAGE = 'board add 要关联这件事所在的飞书群：--link chat=oc_…'
+  + '（可带标签 --link "chat=oc_…|评审群"，不带标签就用查到的群名）。'
+  + '挂多个群时第一个是主群，或用 --primary-chat oc_… 指定。'
+  + '确实没有群（只有 issue、还没开工、管家自己处理）：--no-chat "<原因>"，看板上显示「无群：<原因>」。';
+
+/**
+ * 一次请求里同时核实几个群。每个群的查群本身是「管家 1 + 其他 bot 每批 6」的并发，再按群数放大会
+ * 对同一个 app 突发几十个请求、自己撞上飞书频控；限成 2，对任一 app 的瞬时并发不超过 2。常见的一项
+ * 一到三个群，多等的时间可以忽略。
+ */
+const CHAT_VERIFY_CONCURRENCY = 2;
+
+/**
+ * 一条命令核实群的总时长，几个群共用这一份（不是每个群各 20 秒）：CLI 在等结果，挂再多群也不能等上几分钟。
+ * 预算用完时还没轮到的群按超时处理（已核实的群保持原状，新群要 --allow-unverified-chat）。
+ */
+const CHAT_VERIFY_BUDGET_MS = 20_000;
 
 const PATCH_TEXT_FIELDS = ['key', 'stage', 'kind', 'repo', 'summary', 'progress', 'question', 'recommend', 'recommendReason', 'note', 'title'] as const;
 
@@ -133,9 +169,39 @@ export class DecisionBoardService {
     return { url, appLink: sidebarAppLink(url, this.deps.brand()) };
   }
 
-  renderLinks(links: BoardLink[]): Array<BoardLink & { url?: string; text: string }> {
+  /** 关联 → 带展示文字和链接；chat 关联里的主群标 `primary: true`（主群按 effectivePrimaryChat 推导）。 */
+  renderLinks(links: BoardLink[], primaryChat?: string): Array<BoardLink & { url?: string; text: string; primary?: true }> {
     const ctx = { brand: this.deps.brand(), dashboardBase: this.deps.dashboardOrigin() };
-    return links.map(l => ({ ...l, text: l.label ?? linkDefaultLabel(l), ...(linkUrl(l, ctx) ? { url: linkUrl(l, ctx) } : {}) }));
+    const locale = this.deps.locale();
+    const primary = effectivePrimaryChat(links, primaryChat);
+    return links.map(l => {
+      const url = linkUrl(l, ctx);
+      return { ...l, text: linkText(l, locale), ...(url ? { url } : {}), ...(l === primary ? { primary: true as const } : {}) };
+    });
+  }
+
+  /**
+   * 原始的无群原因只在没有群时有意义：已经有群时不把库里残留的值带出去（CLI 和 Dashboard 同一口径）。
+   */
+  private withoutStaleReason<T extends Pick<BoardItem, 'noChatReason'>>(item: T, links: readonly BoardLink[]): T {
+    if (!item.noChatReason || !links.some(l => l.kind === 'chat')) return item;
+    const { noChatReason: _stale, ...rest } = item;
+    return rest as T;
+  }
+
+  /** 一项的群状态：实际主群（展示文字 + 链接）、群的个数、无群原因、是否缺群。list / show / 批次共用。 */
+  chatState(item: Pick<BoardItem, 'primaryChat' | 'noChatReason'>, links: BoardLink[]) {
+    const primary = effectivePrimaryChat(links, item.primaryChat);
+    const rendered = primary ? this.renderLinks([primary], primary.ref)[0] : undefined;
+    return {
+      // 叫 mainChat 而不是 primaryChat：事项本身的 primaryChat 是存下来的指定（可能为空或已失效），
+      // 这里是按规则推导出的实际主群，两者并存时不互相覆盖。
+      ...(rendered ? { mainChat: { ref: rendered.ref, text: rendered.text, ...(rendered.url ? { url: rendered.url } : {}),
+        ...(rendered.chatCheck ? { chatCheck: rendered.chatCheck } : {}) } } : {}),
+      chatCount: links.filter(l => l.kind === 'chat').length,
+      ...(item.noChatReason && !primary ? { noChatReason: item.noChatReason } : {}),
+      missingChat: itemMissingChat(item, links),
+    };
   }
 
   guide(): { effective: string; preset: string } {
@@ -191,6 +257,20 @@ export class DecisionBoardService {
       }
       if (unlinks.length) patch.unlinks = unlinks;
     }
+    if (req.primaryChat !== undefined) {
+      if (typeof req.primaryChat !== 'string' || !CHAT_REF_PATTERN.test(req.primaryChat.trim())) {
+        throw new BoardError('invalid_primary_chat', '--primary-chat 要写 oc_ 开头的群 ID');
+      }
+      patch.primaryChat = req.primaryChat.trim();
+    }
+    if (req.noChat !== undefined) {
+      if (typeof req.noChat !== 'string' || !req.noChat.trim()) throw new BoardError('no_chat_reason_required', '--no-chat 要写明为什么没有群');
+      patch.noChatReason = req.noChat.trim();
+      // 不联网就能判的冲突在查群之前拒，免得先等一轮查群、再报一个误导人的「查不到群」。
+      if (patch.links?.some(l => l.kind === 'chat')) {
+        throw new BoardError('no_chat_conflict', '同时给了群（--link chat=）和无群原因（--no-chat），只能二选一');
+      }
+    }
     if (req.clearAsk === true) {
       patch.question = null;
       patch.options = [];
@@ -204,6 +284,71 @@ export class DecisionBoardService {
     return patch;
   }
 
+  /**
+   * 主群必须是这一项写完之后的群之一。查群前按「已有的群 − 本次删的 + 本次加的」先判一次，
+   * 指错了不必先等查群；最终仍以 store 在事务里按写完的关联核对为准。
+   */
+  private precheckPrimaryChat(patch: ItemPatch, existing: readonly BoardLink[]): void {
+    if (patch.primaryChat === undefined) return;
+    const refs = new Set(existing.filter(l => l.kind === 'chat').map(l => l.ref));
+    for (const u of patch.unlinks ?? []) {
+      if (u.kind !== 'chat') continue;
+      refs.delete(u.raw);
+      if (u.ref) refs.delete(u.ref);
+    }
+    for (const l of patch.links ?? []) if (l.kind === 'chat') refs.add(l.ref);
+    if (!refs.has(patch.primaryChat)) {
+      throw new BoardError('primary_chat_not_linked', `主群 ${patch.primaryChat} 不在这一项的群关联里，先 --link chat=${patch.primaryChat}`);
+    }
+  }
+
+  /**
+   * 写 chat 关联前逐个核实：查到了记 verified 和群名（群名单独存，不顶替管家的标签）；查不到时整次
+   * 写入拒绝，除非显式 --allow-unverified-chat（记 unverified）。同一个群在一次请求里只查一次，几个群
+   * 之间限并发（{@link CHAT_VERIFY_CONCURRENCY}），共用一份总时长（{@link CHAT_VERIFY_BUDGET_MS}）。
+   *
+   * 已核实过的群，只有拿到「群确实不存在」的证据（{@link lookupProvesChatNotFound}）才按查不到处理
+   *（带 --allow-unverified-chat 降成 unverified，不带就拒绝）。其余情况——bot 不在群（232011 / 230002）、
+   * 频控等暂态码、超时、网络错误，单独或混合——都只是「这次没核实成」，保持原状、照常放行这次写入：
+   * 不降级就不需要「允许未核实」的授权，同一条命令里的其他字段更新也不会被连带丢掉。
+   * 没核实过的新群行为不变：查不到就要 --allow-unverified-chat。
+   */
+  private async verifyChatLinks(patch: ItemPatch, allowUnverified: boolean, existing: readonly BoardLink[]): Promise<void> {
+    const chats = patch.links?.filter(l => l.kind === 'chat') ?? [];
+    if (!chats.length) return;
+    const refs = [...new Set(chats.map(l => l.ref))];
+    const results = new Map<string, ChatLookupResult>();
+    const queue = [...refs];
+    const deadline = Date.now() + CHAT_VERIFY_BUDGET_MS;
+    await Promise.all(Array.from({ length: Math.min(CHAT_VERIFY_CONCURRENCY, refs.length) }, async () => {
+      for (let ref = queue.shift(); ref !== undefined; ref = queue.shift()) {
+        let result: ChatLookupResult;
+        try {
+          result = await this.deps.lookupChat(ref, { deadline });
+        } catch (error) {
+          result = { ok: false, chatId: ref, timedOut: false,
+            failures: [{ appId: this.appId, reason: error instanceof Error ? error.message.split('\n')[0]!.slice(0, 200) : String(error) }] };
+        }
+        results.set(ref, result);
+      }
+    }));
+    const failed = new Set<Extract<ChatLookupResult, { ok: false }>>();
+    patch.links = patch.links!.map(link => {
+      if (link.kind !== 'chat') return link;
+      const result = results.get(link.ref)!;
+      if (result.ok) {
+        const name = result.name ? cleanChatName(result.name) : '';
+        return { ...link, ...(name ? { chatName: name } : {}), chatCheck: 'verified' as const };
+      }
+      const wasVerified = existing.some(l => l.kind === 'chat' && l.ref === link.ref && l.chatCheck === 'verified');
+      if (wasVerified && !lookupProvesChatNotFound(result)) return link;
+      if (allowUnverified) return { ...link, chatCheck: 'unverified' as const };
+      failed.add(result);
+      return link;
+    });
+    if (failed.size) throw new BoardError('chat_unverified', formatChatLookupFailures([...failed], this.appId));
+  }
+
   private resolveRef(raw: unknown): number {
     const ref = parseItemRef(raw);
     if (!ref) throw new BoardError('invalid_ref', '要给出事项编号（如 12 或 #12）或 key');
@@ -214,7 +359,9 @@ export class DecisionBoardService {
 
   private itemOut(seq: number) {
     const item = this.store().getItem(this.appId, seq)!;
-    return { ...item, stateLabel: BOARD_STATE_LABELS[this.deps.locale()][item.state], ...this.itemLinks(seq) };
+    const rest = this.withoutStaleReason(item, this.store().links(this.appId, seq));
+    return { ...rest, stateLabel: BOARD_STATE_LABELS[this.deps.locale()][item.state], ...this.itemLinks(seq),
+      ...this.chatState(item, this.store().links(this.appId, seq)) };
   }
 
   async cli(req: BoardCliRequest, ctx: { sessionId: string }): Promise<Record<string, unknown>> {
@@ -233,15 +380,16 @@ export class DecisionBoardService {
           seq: i.seq, title: i.title, state: i.state, stateLabel: BOARD_STATE_LABELS[this.deps.locale()][i.state],
           ...(i.stage ? { stage: i.stage } : {}), ...(i.key ? { key: i.key } : {}), ...(i.repo ? { repo: i.repo } : {}),
           pendingDecisions: i.pendingDecisions, updatedAt: i.updatedAt, ...this.itemLinks(i.seq),
+          ...this.chatState(i, i.links),
         }));
-        return { view, counts: store.counts(app), items };
+        return { view, counts: store.counts(app), missingChat: items.filter(i => i.missingChat).length, items };
       }
       case 'show': {
         const seq = this.resolveRef(req.ref);
         const detail = store.detail(app, seq)!;
         return {
           item: this.itemOut(seq),
-          links: this.renderLinks(detail.links),
+          links: this.renderLinks(detail.links, detail.item.primaryChat),
           events: detail.events.slice(0, 30).map(e => ({ at: e.at, actor: e.actor, kind: e.kind, text: e.text,
             ...(e.batchId ? { batchId: e.batchId } : {}), ...(e.fileIds.length ? { files: e.fileIds.length } : {}) })),
           pendingDecisions: detail.pendingDecisions,
@@ -252,12 +400,26 @@ export class DecisionBoardService {
         if (patch.unlinks) throw new BoardError('invalid_link', 'add 不删关联，改用 set <编号> --unlink');
         const title = typeof req.title === 'string' ? req.title : patch.title;
         if (!title?.trim()) throw new BoardError('title_required', '缺少标题');
+        // 只在真正新建时强制带群：带已有 key 的 add 等于 set，存量事项不强制。
+        const existingSeq = patch.key ? store.resolveSeq(app, { key: patch.key }) : undefined;
+        if (existingSeq === undefined && !patch.links?.some(l => l.kind === 'chat') && patch.noChatReason === undefined) {
+          throw new BoardError('chat_required', ADD_CHAT_REQUIRED_MESSAGE);
+        }
+        const existing = existingSeq !== undefined ? store.links(app, existingSeq) : [];
+        this.precheckPrimaryChat(patch, existing);
+        await this.verifyChatLinks(patch, req.allowUnverifiedChat === true, existing);
+        // 查群可能要等十几秒：期间管家被关掉了就不再写。
+        this.requireSteward();
         const { item, created } = store.addItem(app, { ...patch, title }, ctx.sessionId, undefined, this.deps.locale());
         return { created, item: this.itemOut(item.seq) };
       }
       case 'set': {
         const seq = this.resolveRef(req.ref);
         const patch = this.parsePatch(req);
+        const existing = store.links(app, seq);
+        this.precheckPrimaryChat(patch, existing);
+        await this.verifyChatLinks(patch, req.allowUnverifiedChat === true, existing);
+        this.requireSteward();
         if (patch.recommend && !patch.options) {
           const item = store.getItem(app, seq)!;
           if (!item.options.some(o => o.key === patch.recommend)) throw new BoardError('unknown_recommend', `推荐项 ${patch.recommend} 不在选项里`);
@@ -313,7 +475,8 @@ export class DecisionBoardService {
     return {
       ...this.meta(),
       items: store.listItems(this.appId, view, { author, query }).map(i => ({
-        ...i, links: this.renderLinks(i.links), ...this.itemLinks(i.seq),
+        ...this.withoutStaleReason(i, i.links), links: this.renderLinks(i.links, i.primaryChat), ...this.itemLinks(i.seq),
+        missingChat: itemMissingChat(i, i.links),
       })),
       drafts: store.listDrafts(this.appId, author).map(d => ({ seq: d.seq, updatedAt: d.updatedAt })),
       batches: store.listBatches(this.appId, 10),
@@ -326,7 +489,9 @@ export class DecisionBoardService {
     if (!detail) throw new BoardError('item_not_found', `没有 #${seq}`);
     return {
       ...detail,
-      links: this.renderLinks(detail.links),
+      item: this.withoutStaleReason(detail.item, detail.links),
+      links: this.renderLinks(detail.links, detail.item.primaryChat),
+      missingChat: itemMissingChat(detail.item, detail.links),
       ...this.itemLinks(seq),
       steward: this.meta().steward,
       drafts: store.listDrafts(this.appId, author).map(d => ({ seq: d.seq, updatedAt: d.updatedAt })),
@@ -479,6 +644,7 @@ export class DecisionBoardService {
     const entries = decisions.map(d => {
       const item = store.getItem(app, d.seq);
       const option = item?.options.find(o => o.key === d.choice);
+      const chat = item ? this.chatState(item, store.links(app, d.seq)).mainChat : undefined;
       for (const fid of d.fileIds) {
         const found = store.getFile(app, fid);
         if (!found) continue;
@@ -502,6 +668,7 @@ export class DecisionBoardService {
         recommended: !!d.choice && item?.recommend === d.choice,
         text: d.text,
         fileCount: d.fileIds.length,
+        ...(chat?.url ? { primaryChat: { text: chat.text, url: chat.url } } : {}),
       };
     });
     const ownerOpenId = this.deps.ownerOpenId();
