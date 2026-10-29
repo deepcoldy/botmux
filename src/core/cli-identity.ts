@@ -525,6 +525,8 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
+  /** Partition-scoped ByteCloud JWTs; the wrapper swaps one in by `--site`. */
+  regionalCloudJwts?: Partial<Record<BytedcliRegion, string>>;
   /** See {@link LarkCliIdentity.openId}. */
   openId?: string;
 }
@@ -594,6 +596,54 @@ const OPEN_ID_VAR = 'BOTMUX_IDENTITY_OPEN_ID';
 const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
 
 /**
+ * ByteCloud JWTs are partition-scoped: a cn token is refused by i18n services
+ * (`invalid jwt token ... partition i18n`). The daemon mints one per region and
+ * the bytedcli wrapper picks the one matching the call's `--site` (or
+ * BYTEDCLI_CLOUD_SITE), so these never reach the child under their own names.
+ */
+export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx';
+const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
+  i18n: 'BOTMUX_IDENTITY_CLOUD_JWT_I18N',
+  i18nbd: 'BOTMUX_IDENTITY_CLOUD_JWT_I18NBD',
+  tx: 'BOTMUX_IDENTITY_CLOUD_JWT_TX',
+};
+/** `--site` values (bytedcli 0.178) grouped by the JWT region each one uses,
+ *  measured by minting with every site. Sites not listed keep the default. */
+const BYTEDCLI_SITE_REGIONS: Record<BytedcliRegion, readonly string[]> = {
+  // The site `i18n` belongs to i18nbd; the i18n region uses i18n-tt.
+  i18n: ['i18n-tt', 'eu-ttp', 'eu-ttp-limited', 'eu-ttp-full'],
+  i18nbd: ['i18n', 'i18n-bd'],
+  tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts', 'us-ttpbd'],
+};
+
+/** Shell lines selecting the regional ByteCloud JWT for this call's site. */
+function bytedcliRegionalSelection(): string[] {
+  const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region =>
+    `    ${BYTEDCLI_SITE_REGIONS[region].join('|')}) __botmux_regional=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`);
+  return [
+    '  __botmux_site=${BYTEDCLI_CLOUD_SITE:-}',
+    '  __botmux_next=',
+    // Last --site wins, as with the CLI's own option parsing. Arguments are
+    // only read, never rewritten: "$@" is passed to the tool unchanged.
+    '  for __botmux_arg in "$@"; do',
+    '    if [ -n "$__botmux_next" ]; then __botmux_site=$__botmux_arg; __botmux_next=; continue; fi',
+    '    case "$__botmux_arg" in',
+    '      --) break ;;',
+    '      --site) __botmux_next=1 ;;',
+    '      --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
+    '    esac',
+    '  done',
+    '  __botmux_regional=',
+    '  case "$__botmux_site" in',
+    ...cases,
+    '  esac',
+    // No token for that region: keep the default one rather than refusing.
+    '  if [ -n "$__botmux_regional" ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
+    `  unset __botmux_site __botmux_next __botmux_arg __botmux_regional ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')}`,
+  ];
+}
+
+/**
  * Values must survive `.` (source) in `/bin/sh` unchanged.
  *
  * A single-quoted shell word is fully literal apart from the quote itself, so
@@ -636,6 +686,10 @@ export function renderIdentityEnv(identity: CliIdentity): string {
   } else {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    for (const [region, jwt] of Object.entries(identity.regionalCloudJwts ?? {})) {
+      const key = BYTEDCLI_REGIONAL_JWT_VARS[region as BytedcliRegion];
+      if (key && jwt) pairs.push([key, jwt]);
+    }
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
   if ('openId' in identity && identity.openId) pairs.push([OPEN_ID_VAR, identity.openId]);
@@ -968,12 +1022,14 @@ export function renderIdentityWrapper(
     // daemon-provided identity when it carries them.
     `${TURN_VAR}=`,
     `${OPEN_ID_VAR}=`,
+    ...(tool === 'bytedcli' ? Object.values(BYTEDCLI_REGIONAL_JWT_VARS).map(key => `${key}=`) : []),
     '__botmux_live=',
     '__botmux_live_caller=',
     ...resolveBlock,
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
+    ...(tool === 'bytedcli' ? bytedcliRegionalSelection().map(line => `  ${line}`) : []),
     `    export ${exportKeys}`,
     '    ;;',
     '  user-home)',
