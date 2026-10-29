@@ -326,7 +326,13 @@ function completeTurn(request) {
     }
     if (responseLast) respond(request.id, { turn: { id: turnId } });
   };
-  if (behavior === 'delayed-first' && turnAttempt === 1) setTimeout(finish, 300);
+  if (process.env.FAKE_CODEX_FINISH_GATE) {
+    const gate = setInterval(() => {
+      if (!existsSync(process.env.FAKE_CODEX_FINISH_GATE)) return;
+      clearInterval(gate);
+      finish();
+    }, 10);
+  } else if (behavior === 'delayed-first' && turnAttempt === 1) setTimeout(finish, 300);
   else finish();
 }
 

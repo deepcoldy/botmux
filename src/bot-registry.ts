@@ -2849,6 +2849,31 @@ export function getBotClient(larkAppId: string): Lark.Client {
   return bot.client;
 }
 
+/**
+ * 用另一个 bot 的凭据建一个只在本进程内存里用的 Lark 客户端：不进 bots 表、不落盘。决策看板核实群时用：
+ * 管家 bot 查不到的群，换本机其他 bot 再查。apiOnly / 没有 secret 的 bot 没有飞书凭据，调用方先滤掉。
+ * SDK 日志只进 debug：查不到时调用方会把各 bot 的原因汇总报给管家，一次查不到不该在 daemon 日志里
+ * 刷几十行 WARN；格式仍走只打 status / code / msg 的 fmtLark（不带请求体和请求头，凭据不会进日志）。
+ */
+const detachedLarkLogger = {
+  error: (...msg: any[]) => logger.debug(`[lark:detached] ${fmtLark(msg)}`),
+  warn: (...msg: any[]) => logger.debug(`[lark:detached] ${fmtLark(msg)}`),
+  info: (..._msg: any[]) => { /* client ready 之类，没有信息量 */ },
+  debug: (...msg: any[]) => logger.debug(`[lark:detached] ${fmtLark(msg)}`),
+  trace: (..._msg: any[]) => { /* dropped */ },
+};
+
+export function createDetachedLarkClient(cfg: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand'>): Lark.Client {
+  const client = new Lark.Client({
+    appId: cfg.larkAppId,
+    appSecret: cfg.larkAppSecret,
+    domain: sdkDomain(normalizeBrand(cfg.brand)),
+    logger: detachedLarkLogger,
+  });
+  configureLarkClientHttpTimeout(client);
+  return client;
+}
+
 /** Client bound to the looser upload timeout. Use only for media uploads
  * (image/file); every other call uses `getBotClient` and its interactive bound. */
 export function getBotUploadClient(larkAppId: string): Lark.Client {

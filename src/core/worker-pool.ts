@@ -11257,11 +11257,14 @@ export function updateCodexCliEffort(
 ): Promise<import('../types.js').CodexAppEffortResult> {
   const worker = ds.worker;
   const cfg = ds.initConfig ?? ds.session;
+  // codexRpcInput is a requested launch preference: legacy runtimes and failed
+  // RPC startup can still use terminal input. The current worker checks its
+  // actual codexRpcEngine before opening a menu and returns an explicit refusal.
   if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) !== 'codex'
     || !worker || worker.killed || !ds.workerReady || !ds.cliReady
     || ds.session.status !== 'active' || isSessionTransferring(ds)
     || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli
-    || ds.initConfig?.codexRpcInput || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation
+    || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
     || pendingCodexCliEffort.has(ds)) return Promise.resolve({ status: 'unavailable', reason: 'cli_menu_unavailable' });
   if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) return Promise.resolve({ status: 'invalid' });

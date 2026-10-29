@@ -101,6 +101,17 @@ describe('Codex App / CLI /effort routing', () => {
     expect(classifySlash({ ...input, cliId: undefined })).toEqual({ kind: 'forward', reason: 'unknown_slash', cmd: '/effort' });
     expect(classifySlash({ ...input, senderIsBot: true, acceptSlashFromBots: false }).kind).toBe('forward');
     expect(classifySlash({ ...input, text: '/effort <level>' }).kind).toBe('forward');
-    expect(classifySlash({ ...input, text: '/effort high\nExplain this command' }).kind).toBe('forward');
+    expect(classifySlash({ ...input, text: '/effort high\nExplain this command' }).kind).toBe('daemon');
+  });
+
+  it.each(['codex', 'codex-app'])('keeps the multiline effort task in the %s command lane', cliId => {
+    const text = '/effort ultra\n检查 <Button />\n/这行属于任务正文';
+    expect(classifySlash({ ...input, cliId, phase: 'ready', text }))
+      .toEqual({ kind: 'daemon', cmd: '/effort', content: text, sessionPolicy: 'existing_only' });
+  });
+
+  it('keeps another CLI multiline effort message on its existing path', () => {
+    expect(classifySlash({ ...input, cliId: 'claude-code', text: '/effort ultra\n继续任务' }))
+      .toEqual({ kind: 'forward', reason: 'discussion' });
   });
 });

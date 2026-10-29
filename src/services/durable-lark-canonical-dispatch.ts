@@ -10,7 +10,7 @@ import type {
 } from './durable-coordination.js';
 import type { DurableLarkMessageClaim } from './durable-inbox-shadow.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
-import { admitDurableLarkSession } from './durable-session-primary.js';
+import { admitDurableLarkSession, checkpointDurableLarkSession } from './durable-session-primary.js';
 import {
   durableLarkOutboxMessage,
   type DurableLarkOutboxTarget,
@@ -35,6 +35,15 @@ export type DurableLarkCanonicalHandlerResult =
 export interface DurableLarkCanonicalHandlerContext extends DurableInboxPrimaryDispatchContext {
   /** Raw event data after the durable envelope identity has been validated. */
   data: unknown;
+  /**
+   * Fence and persist pre-admission state for an existing active Session.
+   * Await this before starting task input. This preserves earlier admissions
+   * and creates no receipt for the current message; it may survive a retry.
+   * The callback is valid only while this handler still owns its Inbox claim.
+   * Supply isCurrent to keep the caller's worker/native identity fenced while
+   * the snapshot waits in the durable Session lane.
+   */
+  checkpointPreAdmissionSession(session: Session, isCurrent?: () => boolean): Promise<void>;
   /**
    * Queue a user-visible effect that is allowed only after this handler's
    * canonical Session snapshot has been fenced and persisted. The queue is
@@ -77,12 +86,50 @@ export function createDurableLarkCanonicalDispatch(
     if (context.signal.aborted) throw abortError(context.signal);
     const outputs: DurableLarkPostAdmissionOutput[] = [];
     const controls: DurableInboxEvent[] = [];
+    const checkpoints: Promise<void>[] = [];
+    const pendingCheckpoints = new Set<Promise<void>>();
     let acceptingOutputs = true;
+    const assertCheckpointCurrent = (): void => {
+      if (context.signal.aborted) throw abortError(context.signal);
+      if (!acceptingOutputs) {
+        throw new Error('durable canonical pre-admission checkpoint was requested after handler completion');
+      }
+    };
     let result: DurableLarkCanonicalHandlerResult;
     try {
       result = await options.handle(message, {
         ...context,
         data: message.data,
+        checkpointPreAdmissionSession(session, isCurrent) {
+          const assertCurrent = (): void => {
+            assertCheckpointCurrent();
+            if (isCurrent && !isCurrent()) {
+              throw new Error('durable canonical pre-admission checkpoint runtime identity changed');
+            }
+          };
+          const checkpoint = (async () => {
+            assertCurrent();
+            const saved = await checkpointDurableLarkSession({
+              facade: options.facade,
+              message,
+              session,
+              assertCurrent,
+            });
+            assertCurrent();
+            if (saved.kind !== 'checkpointed') {
+              throw new Error(`durable canonical pre-admission checkpoint failed: ${saved.kind}`);
+            }
+          })();
+          checkpoints.push(checkpoint);
+          pendingCheckpoints.add(checkpoint);
+          // Dispatch observes failures even if the handler catches or forgets
+          // this promise. Attach immediately to avoid an unhandled rejection.
+          void checkpoint.then(
+            () => { pendingCheckpoints.delete(checkpoint); },
+            () => { pendingCheckpoints.delete(checkpoint); },
+          );
+          return checkpoint;
+        },
         queuePostAdmissionOutput(output) {
           if (!acceptingOutputs) {
             throw new Error('durable canonical post-admission output was queued after handler completion');
@@ -102,13 +149,32 @@ export function createDurableLarkCanonicalDispatch(
           controls.push(JSON.parse(JSON.stringify(event)) as DurableInboxEvent);
         },
       });
+    } catch (error) {
+      acceptingOutputs = false;
+      // An unawaited checkpoint may have entered storage already. Drain it
+      // before the Inbox retries, while preserving the handler's original error.
+      await Promise.allSettled(checkpoints);
+      throw error;
     } finally {
       acceptingOutputs = false;
     }
+    const hadPendingCheckpoint = pendingCheckpoints.size > 0;
+    if (result.kind === 'retry' && !hadPendingCheckpoint) {
+      // An awaited checkpoint outage is a recoverable wait-state. Keep the
+      // explicit retry so Inbox maxAttempts cannot retire the pending task.
+      await Promise.allSettled(checkpoints);
+    } else {
+      try {
+        await Promise.all(checkpoints);
+      } catch (error) {
+        await Promise.allSettled(checkpoints);
+        throw error;
+      }
+    }
     if (context.signal.aborted) throw abortError(context.signal);
     if (result.kind === 'retry') {
-      if (outputs.length > 0) {
-        throw new Error('durable canonical retry result cannot publish post-admission output');
+      if (outputs.length > 0 || controls.length > 0) {
+        throw new Error('durable canonical retry result cannot publish post-admission effects');
       }
       const reason = result.reason.trim();
       if (!reason || reason.length > 512) {
