@@ -107,6 +107,16 @@ async function waitForSettledIdle(
   );
 }
 
+/**
+ * Worker boot — transpiling src/worker.ts, init, spawning the CLI — runs on the
+ * host's time, not the behaviour under test. On a starved bun-test shard it
+ * alone took ~9s (#2511), so a test whose first 10s window had to cover boot
+ * plus the behaviour timed out right as the behaviour happened. Waiting for
+ * boot on its own keeps each behaviour window measured from the spawn: a real
+ * regression still fails within that window, a slow host only waits longer.
+ */
+const WORKER_BOOT_TIMEOUT_MS = 20_000;
+
 async function waitForLog(
   child: ChildProcess,
   logs: string[],
@@ -1011,7 +1021,7 @@ setInterval(() => {
     const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
     expect(updates.at(-1)?.status).toBe('idle');
-  }, 30_000);
+  }, WORKER_BOOT_TIMEOUT_MS + 30_000);
 
   it('delivers a message queued during startup even when every ready heuristic is lifecycle-blocked', async () => {
     // The terminate-gap deadlock: the argv first turn is transcript-started

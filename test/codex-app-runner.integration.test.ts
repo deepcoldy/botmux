@@ -2081,10 +2081,27 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       codexAppRunnerProcessIdentity: undefined,
       captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity,
       parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, readProcessStartIdentity,
+      // handleTrustedCodexAppMarker's "runner dropped its attested engine" branch
+      // clears the frozen engine identity through this worker global. It must be
+      // provided: without it that branch threw a TypeError, which destroyed the
+      // control connection and turned the drop into an endless reconnect loop.
+      clearCodexAppEngineIdentity: () => {
+        if (!scope.codexAppEngineIdentity) return;
+        scope.codexAppEngineIdentity = undefined;
+        scope.publishLocalProcessAttestation();
+      },
+      // Engine attestations and runner-only republications are both real, but
+      // they answer different questions. Keeping them distinguishable lets the
+      // assertions below count ENGINES; conflating them made the count depend on
+      // whether the post-SIGTERM state raced ahead of the engine's observed exit
+      // (3 vs 2 entries for the same behaviour).
       publishLocalProcessAttestation: () => published.push(scope.codexAppEngineIdentity
         ? { enginePid: scope.codexAppEngineIdentity.pid, engineProcStart: scope.codexAppEngineIdentity.procStart }
-        : scope.codexAppRunnerProcessIdentity),
+        : { runner: scope.codexAppRunnerProcessIdentity }),
       rejectCodexAppControlMarker: (reason: string) => rejected.push(reason),
+      // Fail-closed paths must show up here, not as a TypeError that the
+      // collector turns into a silent reconnect loop.
+      failCodexAppControlGeneration: (reason: string) => rejected.push(`fail-closed: ${reason}`),
       codexAppSignedStateReadiness: (payload: any) => payload.acceptingInput ? 'ready' : 'waiting',
       applyTrustedCodexAppStateMarker, codexAppTurnLiveness: tracker, codexAppReadyAuthority: authority,
       codexAppProofDeadline: { clear() {} }, cleanupCodexAppControlBootstrap() {},
@@ -2108,10 +2125,28 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     await control.listen();
     harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
       { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate } });
-    const waitForNative = (predicate: () => boolean) => waitFor(harness!, predicate, 60_000);
+    const enginePublications = () => published.filter((entry: any) => entry?.enginePid !== undefined);
+    const waitForNative = (predicate: () => boolean) => waitFor(harness!, predicate, 60_000).catch(error => {
+      const tail = control.markers.slice(-8).map(marker => marker.kind
+        + (marker.payload.processIdentityBoundary ? `:${marker.payload.processIdentityBoundary}` : '')
+        + (typeof marker.payload.busy === 'boolean' ? `:busy=${marker.payload.busy}` : ''));
+      throw new Error(`rejected=${JSON.stringify(rejected)} auths=${control.authCount} finals=${control.finals.length} `
+        + `last markers=${tail.join(' | ')}\n${(error as Error).message}`);
+    });
+    // The runner settles idle 20ms after a turn. "The last state is idle" was
+    // already true from the startup state, so the engine could be killed
+    // before that settle. When the runner then noticed the exit first, its
+    // idle state carried no engine identity — a worker branch this extracted
+    // scope could not run, so the collector dropped the connection and the
+    // runner replayed the same state forever (#2520). Wait for the idle state
+    // that follows this turn's final instead.
+    const idleAfterLastFinal = () => {
+      const finalEnd = control.markers.findLastIndex(marker => marker.kind === 'final-end');
+      return control.markers.slice(finalEnd + 1).some(marker => marker.kind === 'state' && marker.payload.busy === false);
+    };
     try {
       await waitForNative(() => control.states.at(-1)?.busy === false);
-      expect(published).toHaveLength(1);
+      expect(enginePublications()).toHaveLength(1);
       for (const [index, turnId] of ['om_native_before', 'om_native_after', 'om_native_next'].entries()) {
         if (index === 1) {
           const pid = Number(readFileSync(pidPath, 'utf8'));
@@ -2128,13 +2163,14 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(turnId, { text: turnId }, turnId)}\r`);
         await waitForNative(() => control.finals.length === index + 1);
         tracker.completeCurrent();
-        await waitForNative(() => control.states.at(-1)?.busy === false);
+        await waitForNative(idleAfterLastFinal);
       }
       expect(rejected).toEqual([]);
-      expect(published).toHaveLength(2);
-      expect(published[1].enginePid).not.toBe(published[0].enginePid);
+      const engines = enginePublications();
+      expect(engines).toHaveLength(2);
+      expect(engines[1].enginePid).not.toBe(engines[0].enginePid);
       const boundary = control.states.find(state => state.processIdentityBoundary === 'idle_restart');
-      expect(boundary).toMatchObject({ busy: true, tracksTurn: false, processIdentity: published[1] });
+      expect(boundary).toMatchObject({ busy: true, tracksTurn: false, processIdentity: engines[1] });
       const boundaryIndex = control.markers.findIndex(marker => marker.payload === boundary);
       const submittedAfter = control.markers.findIndex((marker, index) => index > boundaryIndex
         && marker.kind === 'activity' && marker.payload.phase === 'submitted');
