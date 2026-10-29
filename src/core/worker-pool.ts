@@ -1586,6 +1586,20 @@ export function readableTerminalUrlFor(ds: DaemonSession): string {
   return port ? buildTerminalUrl(ds) : '';
 }
 
+/** Empty means the live streaming card should not offer a Web Terminal button.
+ *  Session-level terminal URLs may intentionally route through the proxy and
+ *  wake/recover a session from a persisted `webPort`, but a live status card is
+ *  stronger UI: "working" plus a terminal button implies a currently attached
+ *  worker with a current terminal backend. Do not let a restored row's stale
+ *  port render as an empty terminal shell. */
+export function liveReadableTerminalUrlFor(ds: DaemonSession): string {
+  if (!sessionSupportsWebTerminal(ds)) return '';
+  if (!ds.worker || ds.worker.killed) return '';
+  if (ds.workerReady === false) return '';
+  if (!ds.workerPort) return '';
+  return buildTerminalUrl(ds);
+}
+
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
 // card body (token included). Returns undefined unless the bot enabled it AND
 // the worker port/token are known. Exported for card-handler's re-renders so the
@@ -1618,7 +1632,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status,
@@ -1674,7 +1688,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status,
@@ -1889,7 +1903,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    buildTerminalUrl(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
     ds.lastScreenContent ?? '',
     status,
@@ -1961,11 +1975,11 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    // readableTerminalUrlFor (NOT raw buildTerminalUrl): now that this tick can
+    // liveReadableTerminalUrlFor (NOT raw buildTerminalUrl): now that this tick can
     // run for a port=0 backend (ZMX reports ready without a Web Terminal), a raw
     // URL would render a fake `:undefined`/backend-less link. Mirror every other
     // card path — empty string when there is no real terminal.
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     ds.lastScreenStatus ?? 'working',
@@ -2055,7 +2069,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    buildTerminalUrl(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status,
@@ -3553,7 +3567,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
 
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
-  const readUrl = readableTerminalUrlFor(ds);
+  const readUrl = liveReadableTerminalUrlFor(ds);
   const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, bot.config);
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
@@ -5296,7 +5310,7 @@ function reconcilePostedStartingCard(
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status,
@@ -5413,7 +5427,7 @@ async function postTurnStartingStatusCard(
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     displayAnchorAtPost,
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     '',
     status,
@@ -5538,7 +5552,7 @@ export async function postFreshStreamingCard(
   if (!retainsLarkStreamingCardTransport(ds)) return false;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const readUrl = readableTerminalUrlFor(ds);
+  const readUrl = liveReadableTerminalUrlFor(ds);
   const title = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
   const status = ds.lastScreenStatus ?? 'idle';
 
@@ -9542,7 +9556,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
   return buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status ?? ds.lastScreenStatus ?? 'starting',
@@ -16295,7 +16309,7 @@ function setupWorkerHandlers(
         // （reattach 不代表本次新算命令真的执行了）。worker 每次 ready 会重报。
         ds.spawnCommand = msg.spawnCommand;
         sessionStore.updateSession(ds.session);
-        const readOnlyUrl = readableTerminalUrlFor(ds);
+        const readOnlyUrl = liveReadableTerminalUrlFor(ds);
         if (readOnlyUrl) {
           logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl.replace(/\?.*$/, '?viewToken=[redacted]')}`);
         } else {
@@ -17304,7 +17318,7 @@ function setupWorkerHandlers(
           break;
         }
 
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
 
@@ -17575,7 +17589,7 @@ function setupWorkerHandlers(
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -17981,7 +17995,7 @@ function setupWorkerHandlers(
           logger.info(`[${t}] Shared adopted session ended`);
           // Freeze the streaming card
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
-            const readUrl = readableTerminalUrlFor(ds);
+            const readUrl = '';
             const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
@@ -18090,7 +18104,7 @@ function setupWorkerHandlers(
           // forever. Backends without a Web Terminal pass an empty read URL;
           // the card keeps snapshot/manage controls and omits terminal links.
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
-            const readUrl = readableTerminalUrlFor(ds);
+            const readUrl = keepDiagnosticWorker ? liveReadableTerminalUrlFor(ds) : '';
             const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,

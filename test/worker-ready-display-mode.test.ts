@@ -158,6 +158,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import {
   CARD_POSTING_SENTINEL,
+  readableTerminalUrlFor,
+  liveReadableTerminalUrlFor,
   initWorkerPool,
   postTurnStartingCard,
   postFreshStreamingCard,
@@ -168,12 +170,14 @@ import {
   commitCaptureIdentity,
   displayableStreamingCardImageKey,
   canExpectFreshStreamingScreenshot,
+  buildStreamingCardJson,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
+import { resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
 
@@ -273,6 +277,55 @@ describe('Worker ready: set_display_mode re-sync', () => {
       closeSession: closeSessionMock,
     });
     setActiveSessionsRegistry(new Map());
+  });
+
+  it('keeps session-level proxy recovery links out of live streaming cards without a live worker', () => {
+    setTerminalProxyPort(8800);
+    try {
+      const ds = makeDs({
+        worker: null as any,
+        workerReady: undefined,
+        workerPort: null,
+        streamCardId: 'om_live_card',
+        session: {
+          ...makeDs().session,
+          backendType: 'tmux',
+          webPort: 52842,
+        },
+      });
+
+      expect(readableTerminalUrlFor(ds)).toContain('/s/sid-ready-test');
+      expect(liveReadableTerminalUrlFor(ds)).toBe('');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe('');
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it('keeps the Web Terminal button on live streaming cards when the current worker owns a terminal', () => {
+    setTerminalProxyPort(8800);
+    try {
+      const ds = makeDs({
+        worker: makeFakeWorker(),
+        workerReady: true,
+        workerPort: 9999,
+        workerViewToken: 'view_live',
+        workerCardViewToken: 'card_live',
+        streamCardId: 'om_live_card',
+        session: {
+          ...makeDs().session,
+          backendType: 'tmux',
+          webPort: 9999,
+        },
+      });
+
+      const liveUrl = liveReadableTerminalUrlFor(ds);
+      expect(liveUrl).toContain('/s/sid-ready-test');
+      expect(liveUrl).toContain('viewToken=card_live');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe(liveUrl);
+    } finally {
+      resetTerminalProxy();
+    }
   });
 
   it.each(['ready', 'screen_update', 'fallback'].flatMap(source => ['publish', 'stop', 'replace'].map(outcome => ({ source, outcome }))))(
