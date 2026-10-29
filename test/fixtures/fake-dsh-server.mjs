@@ -13,6 +13,7 @@ import { appendFileSync } from 'node:fs';
  *
  * Scenarios via FAKE_DSH_SCENARIO:
  *   happy (default) - full event stream with assistant text + usage
+ *   reasoning       - real DSH reasoning, interim text, tool call/result, then final text + usage
  *   multi-step      - two assistant/message events; only the last is the final
  *                     answer, usage accumulates, and its two text blocks join
  *                     with no separator
@@ -132,6 +133,52 @@ function runHappyTurn(sessionId, messageId) {
         source: { callId },
         content: [{ type: 'tool-result', content: [{ type: 'text', text: 'hi\n' }], isError: false }],
       },
+    },
+  });
+  notify('session.status', { sessionId, status: 'idle' });
+}
+
+function runReasoningTurn(sessionId, messageId) {
+  sendInboxReceipt(sessionId, messageId);
+  const callId = 'call_cot_1';
+  const args = '{"command":"echo cot-probe"}';
+  sessionEvent(sessionId, {
+    type: 'assistant/message',
+    data: {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '先确认命令' },
+          { type: 'text', text: '先执行一下命令。' },
+          { type: 'tool-call', id: callId, name: 'bash', arguments: args },
+        ],
+      },
+    },
+  });
+  sessionEvent(sessionId, {
+    type: 'tool/call',
+    data: { callId, name: 'bash', arguments: args },
+  });
+  sessionEvent(sessionId, {
+    type: 'tool/result',
+    data: {
+      message: {
+        role: 'tool', source: { kind: 'tool', callId }, toolCallId: callId,
+        content: [{ type: 'text', text: 'cot-probe\n' }], isError: false,
+      },
+    },
+  });
+  sessionEvent(sessionId, {
+    type: 'assistant/message',
+    data: {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '输出已确认' },
+          { type: 'text', text: finalText },
+        ],
+      },
+      usage: { inputTokens: 100, outputTokens: 42, cacheReadTokens: 10, reasoningTokens: 8 },
     },
   });
   notify('session.status', { sessionId, status: 'idle' });
@@ -315,6 +362,7 @@ function handleLine(line) {
     // Notifications land after the enqueue receipt, like the real server.
     setImmediate(() => {
       if (scenario === 'empty') runEmptyTurn(sessionId, messageId);
+      else if (scenario === 'reasoning') runReasoningTurn(sessionId, messageId);
       else if (scenario === 'multi-step') runMultiStepTurn(sessionId, messageId);
       else if (scenario === 'stale') runStaleTurn(sessionId, messageId);
       else if (scenario === 'turn-error') runTurnErrorTurn(sessionId, messageId);

@@ -19,6 +19,8 @@ interface FixtureOpts {
   modelSelected?: number;
   /** Model name the native thread_settings receipt records after `s`. */
   receiptModel?: string;
+  effort?: 'max' | 'ultra';
+  applyFooter?: boolean;
 }
 
 function fixture(opts: FixtureOpts = {}) {
@@ -38,7 +40,8 @@ function fixture(opts: FixtureOpts = {}) {
     screen: async () => page === 'idle' ? idle
       : page === 'model' ? picker('Select Model and Effort', modelRows, selected)
       : page === 'effort' ? picker('Select Reasoning Level for GPT-6-Astra', ['Low', 'High (current)', 'More reasoning…'], selected, opts.session)
-      : picker('Advanced Reasoning', ['Max', 'Ultra'], selected, opts.session),
+      : picker('Advanced Reasoning', ['Max', 'Ultra'], selected, opts.session)
+        .replace('enter default', opts.applyFooter ? 'enter apply' : 'enter default'),
     command: vi.fn(async () => { page = 'model'; }),
     key: key => {
       keys.push(key);
@@ -54,7 +57,7 @@ function fixture(opts: FixtureOpts = {}) {
       else if (key === 's') { applied = true; page = 'idle'; }
       else throw new Error('Unexpected key: ' + key);
     },
-    settings: () => applied && opts.receipt !== false ? { model: receiptModel, reasoningEffort: 'max', serviceTier: 'default' } : undefined,
+    settings: () => applied && opts.receipt !== false ? { model: receiptModel, reasoningEffort: opts.effort ?? 'max', serviceTier: 'default' } : undefined,
   };
   return { io, keys, abort, replace: () => { current = false; }, model };
 }
@@ -70,6 +73,29 @@ describe('Codex CLI effort menu', () => {
     const { io, keys } = fixture({ receipt: false });
     expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max')).toEqual({ status: 'error' });
     expect(keys.filter(key => key === 's')).toHaveLength(1);
+  });
+
+  it('waits for the picker to visibly close after a native settings receipt', async () => {
+    const { io } = fixture();
+    const screen = io.screen;
+    const settings = io.settings;
+    let closingFrames = 0;
+    io.screen = async () => {
+      if (settings() && closingFrames++ < 2) {
+        return picker('Advanced Reasoning', ['Max', 'Ultra'], 0);
+      }
+      return screen();
+    };
+    expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max'))
+      .toEqual({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(closingFrames).toBeGreaterThanOrEqual(3);
+  });
+
+  it('selects Ultra session-only when a forked Codex 0.164 menu says enter apply', async () => {
+    const { io, keys } = fixture({ effort: 'ultra', applyFooter: true });
+    expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'ultra'))
+      .toEqual({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(keys).toEqual(['Enter', 'Down', 'Enter', 'Down', 's']);
   });
 
   it('does not select Enter when an older CLI lacks session-scoped selection', async () => {

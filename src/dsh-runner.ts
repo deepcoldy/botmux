@@ -41,6 +41,7 @@ import { createRunnerTerminal } from './runner-common.js';
 import { parseArgs, MAX_TURN_TIMEOUT_MS, type Args } from './dsh-runner-args.js';
 import { appendPendingNotification } from './dsh-runner-pending.js';
 import { resolveDshModel } from './dsh-runner-config.js';
+import { cotEntriesFromAssistantMessage, cotEntryFromToolCall, cotEntryFromToolResult } from './services/dsh-cot.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
@@ -526,6 +527,8 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       if (callId) turn.toolNames.set(callId, name);
       const argsText = typeof ev.data?.arguments === 'string' ? ev.data.arguments : '';
       writeLine(`🔧 ${name} ${truncate(argsText, 200)}`);
+      const entry = cotEntryFromToolCall(ev.data);
+      if (entry) emitMarker('cot', { entries: [entry] });
       break;
     }
     case 'tool/result': {
@@ -534,6 +537,8 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       const name = turn.toolNames.get(callId) ?? 'tool';
       const isError = Array.isArray(message?.content) && message.content.some(c => c?.isError === true);
       writeLine(`${isError ? '✗' : '✓'} ${name}`);
+      const entry = cotEntryFromToolResult(ev.data);
+      if (entry) emitMarker('cot', { entries: [entry] });
       break;
     }
     case 'turn/end': {
@@ -560,6 +565,9 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       // usage is per model call; accumulate across steps for a turn total.
       const usage = normalizeUsage(ev.data?.usage);
       if (usage) turn.usage = turn.usage ? addUsage(turn.usage, usage) : usage;
+      for (const entry of cotEntriesFromAssistantMessage(ev.data?.message)) {
+        emitMarker('cot', { entries: [entry] });
+      }
       break;
     }
     default:

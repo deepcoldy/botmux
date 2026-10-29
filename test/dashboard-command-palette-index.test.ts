@@ -31,12 +31,15 @@ import {
   botDefaultsSectionDomId,
   findBotDefaultsSection,
   parseBotDefaultsTab,
+  type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults.js';
 import { BotAgentSection, BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
 import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
 import { INSIGHT_TABS } from '../src/dashboard/web/insight-tabs.js';
 import { NAV_ITEMS, NAV_SUBPAGES, PALETTE_UNINDEXED_ROUTES, type NavItem } from '../src/dashboard/web/nav-items.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
+import { REPLY_FOOTER_KEYS } from '../src/services/reply-footer.js';
+import { STREAMING_CARD_BUTTON_IDS } from '../src/im/lark/streaming-card-buttons.js';
 import { knownBots, loadNameMaps, t, ui } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -63,6 +66,204 @@ function topItem(items: PaletteItem[], query: string): PaletteItem | undefined {
   const row = searchPalette({ items, query, scope: 'all' }).rows[0];
   return row?.type === 'item' ? row.item : undefined;
 }
+
+// 反向扫描读取的区块组件源码：配置项行写在这些组件里。
+const BOT_CONFIG_SOURCE_FILES = [
+  'bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx',
+  'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx',
+];
+
+function readBotConfigSources(): string {
+  return BOT_CONFIG_SOURCE_FILES
+    .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
+}
+
+type OpeningTag = { start: number; end: number; body: string; selfClosing: boolean };
+
+function isTagBoundary(ch: string | undefined): boolean {
+  return ch === undefined || /[\s/>]/.test(ch);
+}
+
+/** 每个 `<tagName ...>` 开标签；按花括号深度和字符串边界找结尾，`{v => v > 0}` 里的 `>` 不会把标签提前截断。 */
+function openingTags(source: string, tagName: string): OpeningTag[] {
+  const tags: OpeningTag[] = [];
+  const tagStart = `<${tagName}`;
+  let pos = 0;
+  while (pos < source.length) {
+    const idx = source.indexOf(tagStart, pos);
+    if (idx === -1) break;
+    if (!isTagBoundary(source[idx + tagStart.length])) {
+      pos = idx + tagStart.length;
+      continue;
+    }
+    let i = idx + tagStart.length;
+    const bodyStart = i;
+    let braceDepth = 0;
+    let inString: string | null = null;
+    let closed = false;
+    while (i < source.length) {
+      const ch = source[i]!;
+      if (inString !== null) {
+        if (ch === '\\') {
+          i += 2;
+          continue;
+        }
+        if (ch === inString) inString = null;
+        i++;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        inString = ch;
+        i++;
+        continue;
+      }
+      if (ch === '{') {
+        braceDepth++;
+        i++;
+        continue;
+      }
+      if (ch === '}') {
+        if (braceDepth > 0) braceDepth--;
+        i++;
+        continue;
+      }
+      if (ch === '>' && braceDepth === 0) {
+        const body = source.slice(bodyStart, i);
+        tags.push({ start: idx, end: i + 1, body, selfClosing: body.trimEnd().endsWith('/') });
+        closed = true;
+        break;
+      }
+      i++;
+    }
+    if (!closed) break;
+    pos = i + 1;
+  }
+  return tags;
+}
+
+/** 每个非自闭合 `<tagName>` 元素的子节点源码，到与之配对的 `</tagName>` 为止（同名嵌套计深度）。 */
+function elementChildren(source: string, tagName: string): string[] {
+  const children: string[] = [];
+  const open = `<${tagName}`;
+  const close = `</${tagName}>`;
+  for (const tag of openingTags(source, tagName)) {
+    if (tag.selfClosing) continue;
+    let depth = 1;
+    let i = tag.end;
+    while (depth > 0) {
+      const nextClose = source.indexOf(close, i);
+      if (nextClose === -1) break;
+      let nextOpen = source.indexOf(open, i);
+      while (nextOpen !== -1 && nextOpen < nextClose && !isTagBoundary(source[nextOpen + open.length])) {
+        nextOpen = source.indexOf(open, nextOpen + 1);
+      }
+      if (nextOpen !== -1 && nextOpen < nextClose) {
+        if (!openingTags(source.slice(nextOpen), tagName)[0]?.selfClosing) depth++;
+        i = nextOpen + open.length;
+        continue;
+      }
+      depth--;
+      if (depth === 0) children.push(source.slice(tag.end, nextClose));
+      i = nextClose + close.length;
+    }
+  }
+  return children;
+}
+
+/** 只留元素自己的文本子节点：嵌套元素连同属性和内容一起去掉。 */
+function directText(children: string): string {
+  let text = '';
+  let i = 0;
+  while (i < children.length) {
+    const match = /<([A-Za-z][\w.]*)/.exec(children.slice(i));
+    if (!match) {
+      text += children.slice(i);
+      break;
+    }
+    const at = i + match.index;
+    text += children.slice(i, at);
+    const name = match[1]!;
+    const rest = children.slice(at);
+    const tag = openingTags(rest, name)[0];
+    if (!tag || tag.start !== 0) {
+      text += match[0];
+      i = at + match[0].length;
+      continue;
+    }
+    if (tag.selfClosing) {
+      i = at + tag.end;
+      continue;
+    }
+    const inner = elementChildren(rest, name)[0];
+    i = inner === undefined ? at + tag.end : at + tag.end + inner.length + `</${name}>`.length;
+  }
+  return text;
+}
+
+/** JSX 文本里的 `{tr('key')}` 与三元 `{tr(cond ? 'a' : 'b')}`。 */
+function trTextKeys(text: string): string[] {
+  const keys: string[] = [];
+  for (const m of text.matchAll(/\{\s*tr\(\s*'([^']+)'\s*\)\s*\}/g)) keys.push(m[1]!);
+  for (const m of text.matchAll(/\{\s*tr\([^?(){}]+\?\s*'([^']+)'\s*:\s*'([^']+)'\s*\)\s*\}/g)) keys.push(m[1]!, m[2]!);
+  return keys;
+}
+
+/**
+ * 区块组件里以「可见标签」写出的全部 tr() 键，按写法而非按键名找：
+ * 1. `<FieldTitle>` 的直接文本子节点（含跨行写法）；
+ * 2. 选项组的 `groupName={tr(...)}`；
+ * 3. `<ToggleRow>` 的 `title`（字面量与三元两支）；
+ * 4. `<label>` 自己的直接文本，以及其内 `<span>` / `<strong>` / `<small>` 的直接文本子节点
+ *    （`<label htmlFor>{tr()}</label><input/>`、裸复选框、输入框行）；
+ * 5. 紧挨 `<DropdownField>` 的 `<span>` 标题（下拉框没有 `<label>`，标题就是它前面那个 span）；
+ * 6. 按常量列表展开的键（REPLY_FOOTER_KEYS / STREAMING_CARD_BUTTON_IDS）与一键静默预设的小标题。
+ * 已知缺口（不静默跳过，登记在此）：常量数组里的 `tr(option.labelKey)`（如
+ * OWNER_REMINDER_STATE_OPTIONS 的 6 个同区块同义勾选项，登记会给 ⌘K 增同义噪音）、
+ * `<h4 className="bd-subsection-title">` 小组标题（组标题不是配置行，属产品取舍）——
+ * 这两类后续要收时需要新增加常量展开与 h4 扫描规则；
+ * 以及 `<button>{tr()}</button>` 可展开控件（如 autoStartExcludedChats）——需新增 button 标签扫描；
+ * 同区块同译文去重（riffModel 与 agentModel 的 zh 译文都是「模型」，条目被
+ * buildBotDefaultsSectionItems 的 seen 去重丢掉，⌘K 搜不到）——属条目生成侧，另行跟进。
+ * 只认 tr() 键：硬编码中文的标题（「高级 JSON」「每聊天覆盖」，英文界面也显示中文）读不到，是已知缺口，另行跟进。
+ */
+function renderedBotConfigLabelKeys(sources: string): Set<string> {
+  const keys = new Set<string>();
+  const add = (found: Iterable<string>) => { for (const key of found) keys.add(key); };
+  for (const children of elementChildren(sources, 'FieldTitle')) add(trTextKeys(directText(children)));
+  add([...sources.matchAll(/\bgroupName=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!));
+  for (const tag of openingTags(sources, 'ToggleRow')) {
+    const literal = /\btitle=\{tr\('([^']+)'\)\}/.exec(tag.body);
+    if (literal) add([literal[1]!]);
+    const ternary = /\btitle=\{tr\([^?(){}]+\?\s*'([^']+)'\s*:\s*'([^']+)'\)\}/.exec(tag.body);
+    if (ternary) add([ternary[1]!, ternary[2]!]);
+  }
+  for (const label of elementChildren(sources, 'label')) {
+    // label 自己的直接文本（嵌套元素的文本会被 directText 剥掉，不和下面的子元素重复计数）。
+    add(trTextKeys(directText(label)));
+    for (const tagName of ['span', 'strong', 'small']) {
+      for (const children of elementChildren(label, tagName)) add(trTextKeys(directText(children)));
+    }
+  }
+  add([...sources.matchAll(/<span>\{tr\('([^']+)'\)\}<\/span>\s*<DropdownField\b/g)].map(m => m[1]!));
+  if (sources.includes('title={tr(`botDefaults.${key}`)}')) add(REPLY_FOOTER_KEYS.map(key => `botDefaults.${key}`));
+  if (sources.includes('tr(`botDefaults.streamingButton.${id}`)')) {
+    add(STREAMING_CARD_BUTTON_IDS.map(id => `botDefaults.streamingButton.${id}`));
+  }
+  add([...sources.matchAll(/<h4 className="bd-card-setting-heading">\{tr\('(quietPreset\.[^']+)'\)\}<\/h4>/g)].map(m => m[1]!));
+  return keys;
+}
+
+// 反向扫描会读到、但不是配置项的标签。逐条写明理由；不在这里的键一律要登记进 BOT_DEFAULTS_SECTIONS。
+const NOT_CONFIG_LABELS: ReadonlyMap<string, string> = new Map([
+  ['botDefaults.stewardModeAppend', '「管家指引」单选组的选项；组本身只有 aria-label，搜索落到已登记的 botDefaults.stewardGuide 那一行'],
+  ['botDefaults.stewardModeReplace', '同上，「管家指引」单选组的另一个选项'],
+  ['sessionEnv.keyLabel', '新增/去掉环境变量弹窗里的表单字段名，只在弹窗打开时出现，页面上没有可定位的行'],
+  ['sessionEnv.valueLabel', '同上，环境变量弹窗里的值字段名'],
+  ['botDefaults.sgTagRepairAllLabel', '飞书授权流程里一次性「顺便补齐」勾选，repairAll 只用于当次调用、不持久化为 bot 配置'],
+  ['botDefaults.autoStartExcludedChatsHelp', '排除群文本框上方的说明文案，不是配置项；其入口 autoStartExcludedChats 是可展开 <button>，扫描器不识别 button 标签，登记需新增扫描规则，另行跟进'],
+]);
+
+const BOT_CONFIG_KEY_NAMESPACES = ['botDefaults.', 'sessionEnv.', 'quietPreset.', 'promptCache.', 'roles.', 'blocked.'];
 
 describe('⌘K index coverage', () => {
   it('every dashboard route is in the sidebar or NAV_SUBPAGES, or excluded on purpose with a reason', () => {
@@ -163,19 +364,56 @@ describe('⌘K index coverage', () => {
   // 源码结构护栏(K4)：配置项行在各区块组件内部渲染，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
   // 守的是「登记的配置项键拼错 / 已删 / 不是看得见的标签」——那样落地时按文字找不到那一行。
   it('every indexed Bot config title and option exists in both locales and is rendered as a label', () => {
-    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx']
-      .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
+    const rendered = renderedBotConfigLabelKeys(readBotConfigSources());
     for (const section of BOT_DEFAULTS_SECTIONS) {
       for (const key of [section.titleKey, ...(section.fieldKeys ?? [])]) {
         expect(zh(key), key).not.toBe(key);
         expect(en(key), key).not.toBe(key);
       }
-      for (const key of section.fieldKeys ?? []) {
-        // 落地时按文字找这一行，所以它得是看得见的标签：配置项标题、选项组名或开关行标题。
-        const asLabel = [`{tr('${key}')}</FieldTitle>`, `groupName={tr('${key}')}`, `title={tr('${key}')}`].some(form => sources.includes(form));
-        expect(asLabel, key).toBe(true);
-      }
+      // 落地时按文字找这一行，所以它得是看得见的标签（写法见 renderedBotConfigLabelKeys）。
+      for (const key of section.fieldKeys ?? []) expect(rendered.has(key), key).toBe(true);
     }
+  });
+
+  // 源码结构护栏(K4)：JSX 标签解析回归护栏；
+  // 守的是「ToggleRow 属性中包含带有 => 箭头函数或大于号时，避免正则提前闭合导致 title 属性漏解析」。
+  it('extracts ToggleRow title even when attributes before title contain arrow functions with >', () => {
+    const fixture = '<ToggleRow onChange={v => { doSomething(v > 0); }} title={tr(\'botDefaults.arrowRegressionTestKey\')} />';
+    expect([...renderedBotConfigLabelKeys(fixture)]).toEqual(['botDefaults.arrowRegressionTestKey']);
+  });
+
+  // 源码结构护栏(K4)：反向扫描按写法识别标签的回归护栏；
+  // 守的是「跨行的 FieldTitle、label 里的 span、下拉框前的 span 都算标签，嵌套元素里的文字和属性里的 tr() 不算」。
+  it('reads label text by JSX position, not by key name', () => {
+    const fixture = [
+      '<FieldTitle help={tr(\'botDefaults.fixtureHelp\')}>',
+      '  {tr(\'botDefaults.fixtureTitle\')}',
+      '</FieldTitle>',
+      '<label><input type="checkbox" /><span>{tr(\'botDefaults.fixtureCheckbox\')}</span></label>',
+      '<label><span><strong>{tr(\'botDefaults.fixtureLang\')}</strong><em>{tr(\'botDefaults.fixtureBadge\')}</em></span></label>',
+      '<div className="bd-field"><span>{tr(\'botDefaults.fixtureDropdown\')}</span>',
+      '  <DropdownField ariaLabel={tr(\'botDefaults.fixtureAria\')} /></div>',
+      '<div><span>{tr(\'botDefaults.fixtureDescription\')}</span></div>',
+    ].join('\n');
+    expect([...renderedBotConfigLabelKeys(fixture)].sort()).toEqual([
+      'botDefaults.fixtureCheckbox', 'botDefaults.fixtureDropdown', 'botDefaults.fixtureLang', 'botDefaults.fixtureTitle',
+    ]);
+  });
+
+  // 源码结构护栏(K4)：配置项标签写在各区块组件内部，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
+  // 守的是「区块组件里新增了可见配置项或选项组标签，却忘记在 BOT_DEFAULTS_SECTIONS.fieldKeys 登记」——
+  // 漏登记会导致新配置项在 ⌘K 里搜不到、也不能深链定位。
+  it('every rendered Bot config label is indexed in BOT_DEFAULTS_SECTIONS fieldKeys or titleKey', () => {
+    // 只校验全部区块的并集，不校验键登在了哪个区块：登错区块这里仍是绿的，深链会落到错的 tile 而找不到那一行。
+    // 按区块渲染范围逐块校验另行跟进。
+    const indexedKeys = new Set(BOT_DEFAULTS_SECTIONS.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? [])]));
+    const rendered = [...renderedBotConfigLabelKeys(readBotConfigSources())]
+      .filter(key => BOT_CONFIG_KEY_NAMESPACES.some(prefix => key.startsWith(prefix)));
+    const unindexed = rendered.filter(key => !indexedKeys.has(key) && !NOT_CONFIG_LABELS.has(key));
+    expect(unindexed, 'rendered Bot config labels missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
+    // 名单只放扫描真读到、又确实没登记的键：过时或已登记的条目要删掉，不留静默豁免。
+    const stale = [...NOT_CONFIG_LABELS.keys()].filter(key => !rendered.includes(key) || indexedKeys.has(key));
+    expect(stale, 'NOT_CONFIG_LABELS entries that are no longer rendered, or are indexed after all').toEqual([]);
   });
 });
 
@@ -472,6 +710,67 @@ describe('⌘K reaches the Bot config page, its categories and each bot', () => 
       const result = resolveBotDefaultsTarget({ tab: 'security', section: section('network-policy'), field: null }, doc(root), zh);
       expect(result).toEqual({ target: network, block: 'start', missing: null });
     });
+
+    // 补登进索引的配置行并不都渲染成 .bd-field-title-text：裸 span / 共享 FieldTitle /
+    // label 直接文本 / strong 都是实际写法。落地函数认不出这些形状时会误报「当前 Bot 不显示该项」。
+    const landingShapes: Array<{ name: string; tab: BotDefaultsTab; sectionId: string; field: string; build(): { tile: FakeEl; row: FakeEl } }> = [
+      {
+        name: 'bare span before a DropdownField in a bd-field', tab: 'common', sectionId: 'agent', field: 'botDefaults.agentCli',
+        build() {
+          const row = new FakeEl('div', ['bd-field']).add(new FakeEl('span', [], zh(this.field)), new FakeEl('div'));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'shared FieldTitle .ui-field-title-text in a settings-field-row', tab: 'sessions', sectionId: 'prompt-cache', field: 'promptCache.idleMinutes',
+        build() {
+          const row = new FakeEl('div', ['settings-field-row']).add(
+            new FakeEl('span', ['ui-field-title']).add(new FakeEl('span', ['ui-field-title-text'], zh(this.field))));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'strong inside a label.toggle-row', tab: 'cards', sectionId: 'card-behavior', field: 'quietPreset.switch',
+        build() {
+          const row = new FakeEl('label', ['toggle-row']).add(
+            new FakeEl('span', ['toggle-tx']).add(new FakeEl('strong', [], zh(this.field))));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'label direct text with a sibling input in a bd-row', tab: 'advanced', sectionId: 'codex-app-display', field: 'botDefaults.noProgressNotifyTimeoutLabel',
+        build() {
+          const row = new FakeEl('div', ['bd-row']).add(new FakeEl('label', [], zh(this.field)), new FakeEl('input'));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'label direct text in a session-group-tag-name row', tab: 'sessions', sectionId: 'session-mode', field: 'botDefaults.sgTagName',
+        build() {
+          const row = new FakeEl('div', ['bd-sg-tag-name']).add(new FakeEl('label', [], zh(this.field)), new FakeEl('input'));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+      {
+        name: 'bare span inside a model-toggle label without a row container', tab: 'common', sectionId: 'agent', field: 'botDefaults.autoModelTitle',
+        build() {
+          const row = new FakeEl('label', ['bd-auto-model-toggle']).add(new FakeEl('input'), new FakeEl('span', [], zh(this.field)));
+          return { row, tile: new FakeEl('section', ['bd-tile'], '', botDefaultsSectionDomId(this.sectionId)).add(row) };
+        },
+      },
+    ];
+
+    for (const shape of landingShapes) {
+      it(`lands on a label rendered as ${shape.name}`, () => {
+        const { tile, row } = shape.build();
+        const root = new FakeEl('main').add(new FakeEl('button', [], '', `bd-tab-${shape.tab}`), tile);
+        const result = resolveBotDefaultsTarget(
+          { tab: shape.tab, section: section(shape.sectionId), field: shape.field }, doc(root), zh);
+        expect(result.missing, shape.name).toBeNull();
+        // 有行容器时落在整行（closest 缺容器选择器时这条会红）；没有行容器的退回 label 本身（构造里 row 即 label）。
+        expect(result.target, shape.name).toBe(row);
+      });
+    }
 
     it('reads tab / section / field from the hash, deriving the category from the section', () => {
       vi.stubGlobal('location', { hash: botDefaultsHref({ section: 'session-mode', field: 'botDefaults.groupRegular' }) });

@@ -167,6 +167,9 @@ describe('dsh-runner', () => {
       cacheReadTokens: 10,
       cacheCreateTokens: 0,
     });
+    const entries = parseMarkers(h.stdout).filter(m => m.kind === 'cot').flatMap(m => m.payload.entries);
+    expect(entries.filter(entry => entry.kind === 'thinking')).toEqual([{ kind: 'thinking', text: 'thinking...' }]);
+    expect(entries.some(entry => entry.kind === 'text')).toBe(false);
     // Tool calls render as progress lines.
     expect(h.stdout).toContain('🔧 bash');
     expect(h.stdout).toContain('✓ bash');
@@ -174,6 +177,36 @@ describe('dsh-runner', () => {
     expect(existsSync(join(h.home, '.dsh', 'profiles', 'botmux'))).toBe(true);
     // The legacy ~/.botmux/dsh path must not be created anymore.
     expect(existsSync(join(h.home, '.botmux', 'dsh'))).toBe(false);
+  });
+
+  it('emits ordered CoT entries for reasoning without duplicating the final reply', async () => {
+    const finalText = 'cot 最终回复';
+    h = spawnRunner('reasoning', [], { FAKE_DSH_FINAL_TEXT: finalText });
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+    h.child.stdin.write(makeFrame('检查命令输出'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const markers = parseMarkers(h.stdout);
+    const cot = markers.filter(m => m.kind === 'cot');
+    expect(cot).toHaveLength(5);
+    for (const marker of cot) expect(marker.payload.entries).toHaveLength(1);
+    const entries = cot.flatMap(m => m.payload.entries);
+    expect(entries).toEqual([
+      { kind: 'thinking', text: '先确认命令' },
+      { kind: 'text', text: '先执行一下命令。' },
+      { kind: 'tool_call', id: 'call_cot_1', name: 'bash', args: '{"command":"echo cot-probe"}', subject: 'echo cot-probe' },
+      { kind: 'tool_result', id: 'call_cot_1', result: 'cot-probe\n' },
+      { kind: 'thinking', text: '输出已确认' },
+    ]);
+    expect(JSON.stringify(entries)).not.toContain(finalText);
+    const finals = markers.filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toBe(finalText);
+    expect(finals[0].payload.usage).toEqual({
+      inputTokens: 100, outputTokens: 42, cacheReadTokens: 10, cacheCreateTokens: 0,
+    });
+    expect(h.stdout).toContain('🔧 bash {"command":"echo cot-probe"}');
+    expect(h.stdout).toContain('✓ bash');
   });
 
   it('passes the question bridge patch to the dsh profile launch', async () => {
