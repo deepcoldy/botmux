@@ -43,6 +43,9 @@ import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-a
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
 const BYTEDCLI_HOME_ROOT = join(homedir(), '.botmux', 'data', 'bytedcli-home');
+// A still-running SDK child can recreate a deleted legacy HOME. Only a fresh
+// queued login may remove this local revocation barrier after clearing it.
+const locallyRevokedHomes = new Set<string>();
 
 /** How long to wait on a `bytedcli` invocation. The device-code calls talk to
  *  ByteCloud, so they are network-bound; the JWT reads are usually local but
@@ -87,7 +90,7 @@ interface LoginObservation {
 
 async function readLoginState(openId: string): Promise<LoginObservation> {
   const home = bytedcliHomeFor(openId);
-  if (!existsSync(home)) return { authenticated: false };
+  if (locallyRevokedHomes.has(openId) || !existsSync(home)) return { authenticated: false };
   // A HOME rewritten after revoke has no matching stamp. Do not ask the CLI —
   // its own session files are not authority once the epoch has moved.
   if (!cliAuthEpochAllows(openId, home)) return { authenticated: false };
@@ -172,6 +175,8 @@ export async function describeBytedcliAuth(openId: string): Promise<{
 
 /** Forget one person's bytedcli authorization entirely. */
 export function clearBytedcliAuth(openId: string): void {
+  locallyRevokedHomes.add(openId);
+  beginnings.delete(openId);
   authEpochs.set(openId, authEpoch(openId) + 1);
   minting.delete(openId);
   renewing.delete(openId);
@@ -337,22 +342,32 @@ export interface BytedcliLoginChallenge {
  * instead of holding a terminal open waiting for a scan, which is the only
  * shape that works when the person authorizing is on the other side of a chat.
  */
-const beginnings = new Map<string, Promise<BytedcliLoginChallenge | null>>();
+const beginnings = new Map<string, { epoch: number; durableEpoch: number; work: Promise<BytedcliLoginChallenge | null> }>();
 
 export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
+  const epoch = authEpoch(openId);
+  const durableEpoch = readCliAuthEpoch(openId);
   const existing = beginnings.get(openId);
-  if (existing) return existing;
-  const work = beginLogin(openId);
-  beginnings.set(openId, work);
-  try { return await work; } finally { beginnings.delete(openId); }
+  if (existing?.epoch === epoch && existing.durableEpoch === durableEpoch) return existing.work;
+  const work = serializedCredentialWork(openId, () => credentialEpochCurrent(openId, epoch, durableEpoch)
+    ? beginLogin(openId, epoch, durableEpoch) : Promise.resolve(null));
+  beginnings.set(openId, { epoch, durableEpoch, work });
+  try { return await work; } finally {
+    if (beginnings.get(openId)?.work === work) beginnings.delete(openId);
+    if (credentialWork.get(openId) === work) credentialWork.delete(openId);
+  }
 }
 
-async function beginLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
-  const epochAtStart = readCliAuthEpoch(openId);
+async function beginLogin(openId: string, epoch: number, durableEpoch: number): Promise<BytedcliLoginChallenge | null> {
   const home = bytedcliHomeFor(openId);
   // A revoked HOME must not resume its old challenge. Clear it before login;
   // a newer login that landed during this call is left alone below.
-  if (existsSync(home) && !cliAuthEpochAllows(openId, home)) clearBytedcliAuth(openId);
+  if (existsSync(home) && (locallyRevokedHomes.has(openId) || !cliAuthEpochAllows(openId, home))) {
+    // The previous SDK child has left the shared queue. Remove any late files
+    // before stamping a new login; cleanup is not a new revocation operation.
+    try { rmSync(home, { recursive: true, force: true }); } catch { return null; }
+    forgetRegionalJwts(openId);
+  }
 
   const pending = pendingBytedcliLogin(openId);
   if (pending?.authUrl) return pending;
@@ -370,8 +385,9 @@ async function beginLogin(openId: string): Promise<BytedcliLoginChallenge | null
   }
   // Epoch moved while the CLI ran: a revoke, or a newer login, won. Do not
   // stamp or delete — the newer HOME may already be valid.
-  if (readCliAuthEpoch(openId) !== epochAtStart) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   stampCliAuthEpoch(openId, home);
+  locallyRevokedHomes.delete(openId);
   if (!saveChallenge(openId, completeToken, authUrl)) return null;
   return { authUrl, completeToken };
 }
@@ -388,10 +404,24 @@ export async function completeBytedcliLogin(
   openId: string,
   completeToken: string,
 ): Promise<{ state: BytedcliLoginState; detail?: string }> {
+  const epoch = authEpoch(openId);
+  const durableEpoch = readCliAuthEpoch(openId);
+  const work = serializedCredentialWork(openId, () => completeLogin(openId, completeToken, epoch, durableEpoch));
+  try { return await work; } finally {
+    if (credentialWork.get(openId) === work) credentialWork.delete(openId);
+  }
+}
+
+async function completeLogin(openId: string, completeToken: string, epoch: number, durableEpoch: number): Promise<{ state: BytedcliLoginState; detail?: string }> {
+  const current = () => credentialEpochCurrent(openId, epoch, durableEpoch)
+    && (!pendingBytedcliChallenge(openId) || pendingBytedcliChallenge(openId) === completeToken);
+  const retired = () => ({ state: 'failed' as const, detail: 'Login attempt was replaced or revoked.' });
+  if (!current()) return retired();
   const { ok, stdout } = await runAsUser(
     openId,
     ['auth', 'login', '--complete', completeToken, '--json'],
   );
+  if (!current()) return retired();
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
   const state = data?.login_status ?? data?.status;
@@ -403,6 +433,7 @@ export async function completeBytedcliLogin(
     // Completion is not authority until the isolated provider can use the login.
     try {
       if ((await readLoginState(openId)).authenticated) {
+        if (!current()) return retired();
         clearChallenge(openId);
         return { state: 'authorized' };
       }
@@ -413,6 +444,7 @@ export async function completeBytedcliLogin(
     || ['BYTECLOUD_AUTH_LOGIN_EXPIRED', 'BYTECLOUD_AUTH_LOGIN_DENIED',
       'BYTECLOUD_AUTH_LOGIN_INVALID_TICKET', 'BYTECLOUD_AUTH_LOGIN_CHALLENGE_INVALID'].includes(errorCode);
   // Network errors, timeouts and unknown output do not invalidate a challenge.
+  if (!current()) return retired();
   if (terminal) clearChallenge(openId);
   return { state: terminal ? 'failed' : 'unavailable', detail: terminal
     ? 'Login challenge expired or was rejected.'
@@ -466,8 +498,8 @@ const minting = new Map<string, Promise<BytedcliJwts | null>>();
 const authEpochs = new Map<string, number>();
 // Epoch invalidation must not release the HOME's operation lock while an old
 // provider child can still write its SDK cache.
-const credentialWork = new Map<string, Promise<BytedcliJwts | null>>();
-function serializedCredentialWork(openId: string, run: () => Promise<BytedcliJwts | null>): Promise<BytedcliJwts | null> {
+const credentialWork = new Map<string, Promise<unknown>>();
+function serializedCredentialWork<T>(openId: string, run: () => Promise<T>): Promise<T> {
   const previous = credentialWork.get(openId);
   const work = (async () => { await previous?.catch(() => null); return await run(); })();
   credentialWork.set(openId, work);
@@ -475,6 +507,10 @@ function serializedCredentialWork(openId: string, run: () => Promise<BytedcliJwt
 }
 
 function authEpoch(openId: string): number { return authEpochs.get(openId) ?? 0; }
+function credentialEpochCurrent(openId: string, epoch: number, durableEpoch: number): boolean {
+  return epoch === authEpoch(openId) && durableEpoch === readCliAuthEpoch(openId);
+}
+
 
 /**
  * Regional JWTs reused while they keep at least half an hour of life. A fresh
@@ -483,7 +519,7 @@ function authEpoch(openId: string): number { return authEpochs.get(openId) ?? 0;
  * stretches the window in which a turn's identity is not yet published. Reuse
  * needs this turn's default mint to have just confirmed the login is live.
  */
-const regionalJwtCache = new Map<string, { jwt: string; expiresAtMs: number }>();
+const regionalJwtCache = new Map<string, { jwt: string; expiresAtMs: number; durableEpoch: number }>();
 const REGIONAL_JWT_REUSE_MARGIN_MS = 30 * 60_000;
 
 function jwtClaims(jwt: string): { exp?: unknown; region?: unknown } | null {
@@ -495,17 +531,17 @@ function jwtClaims(jwt: string): { exp?: unknown; region?: unknown } | null {
 }
 
 async function regionalCloudJwt(
-  openId: string, region: BytedcliRegion, site: string, forceRefresh = false, epoch = authEpoch(openId),
+  openId: string, region: BytedcliRegion, site: string, forceRefresh = false, epoch = authEpoch(openId), durableEpoch = readCliAuthEpoch(openId),
 ): Promise<string | null> {
-  if (epoch !== authEpoch(openId)) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const key = `${openId}\0${region}`;
   const cached = regionalJwtCache.get(key);
-  if (!forceRefresh && cached && cached.expiresAtMs - Date.now() > REGIONAL_JWT_REUSE_MARGIN_MS) return cached.jwt;
+  if (!forceRefresh && cached && cached.durableEpoch === durableEpoch && cached.expiresAtMs - Date.now() > REGIONAL_JWT_REUSE_MARGIN_MS) return cached.jwt;
   regionalJwtCache.delete(key);
   const result = await runAsUser(openId, [
     '--site', site, 'auth', 'get-bytecloud-jwt-token', ...(forceRefresh ? ['--force-refresh'] : []),
   ]);
-  if (epoch !== authEpoch(openId)) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const jwt = result.ok ? result.stdout.trim() : '';
   const claims = jwt && !/\s/.test(jwt) ? jwtClaims(jwt) : null;
   // A token for another partition would only move the failure; keep the default.
@@ -513,7 +549,7 @@ async function regionalCloudJwt(
     logger.debug(`[bytedcli-auth] no ${region} ByteCloud JWT for ${openId}; that region keeps the default token`);
     return null;
   }
-  if (typeof claims.exp === 'number') regionalJwtCache.set(key, { jwt, expiresAtMs: claims.exp * 1_000 });
+  if (typeof claims.exp === 'number') regionalJwtCache.set(key, { jwt, expiresAtMs: claims.exp * 1_000, durableEpoch });
   return jwt;
 }
 
@@ -525,12 +561,13 @@ function forgetRegionalJwts(openId: string): void {
 
 export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
   const epoch = authEpoch(openId);
+  const durableEpoch = readCliAuthEpoch(openId);
   const existing = minting.get(openId);
   if (existing) return existing;
   const work = serializedCredentialWork(openId, async () =>
-    epoch === authEpoch(openId) ? await mintJwts(openId, epoch) : null);
+    credentialEpochCurrent(openId, epoch, durableEpoch) ? await mintJwts(openId, epoch, durableEpoch) : null);
   minting.set(openId, work);
-  try { const result = await work; return epoch === authEpoch(openId) ? result : null; }
+  try { const result = await work; return credentialEpochCurrent(openId, epoch, durableEpoch) ? result : null; }
   finally {
     if (minting.get(openId) === work) minting.delete(openId);
     if (credentialWork.get(openId) === work) credentialWork.delete(openId);
@@ -549,31 +586,32 @@ const renewing = new Map<string, Promise<BytedcliJwts | null>>();
  */
 export async function renewBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
   const epoch = authEpoch(openId);
+  const durableEpoch = readCliAuthEpoch(openId);
   const existing = renewing.get(openId);
   if (existing) return existing;
   const work = serializedCredentialWork(openId, async () =>
-    epoch === authEpoch(openId) ? await renewJwts(openId, epoch) : null);
+    credentialEpochCurrent(openId, epoch, durableEpoch) ? await renewJwts(openId, epoch, durableEpoch) : null);
   renewing.set(openId, work);
-  try { const result = await work; return epoch === authEpoch(openId) ? result : null; }
+  try { const result = await work; return credentialEpochCurrent(openId, epoch, durableEpoch) ? result : null; }
   finally {
     if (renewing.get(openId) === work) renewing.delete(openId);
     if (credentialWork.get(openId) === work) credentialWork.delete(openId);
   }
 }
 
-async function renewJwts(openId: string, epoch: number): Promise<BytedcliJwts | null> {
+async function renewJwts(openId: string, epoch: number, durableEpoch: number): Promise<BytedcliJwts | null> {
   if (!(await readLoginState(openId)).authenticated || epoch !== authEpoch(openId)) return null;
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token', '--force-refresh']);
-  if (epoch !== authEpoch(openId)) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const cloudJwt = cloud.ok ? cloud.stdout.trim() : '';
   if (!cloudJwt || /\s/.test(cloudJwt)) return null;
   const code = await runAsUser(openId, ['auth', 'get-codebase-jwt-token']);
-  if (epoch !== authEpoch(openId)) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const codeJwt = code.ok ? code.stdout.trim() : '';
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
-    const jwt = await regionalCloudJwt(openId, region, site, true, epoch);
-    if (epoch !== authEpoch(openId)) return null;
+    const jwt = await regionalCloudJwt(openId, region, site, true, epoch, durableEpoch);
+    if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     if (jwt) regionalCloudJwts[region] = jwt;
   }
   if (!cliAuthEpochAllows(openId, bytedcliHomeFor(openId))) return null;
@@ -584,14 +622,14 @@ async function renewJwts(openId: string, epoch: number): Promise<BytedcliJwts | 
   };
 }
 
-async function mintJwts(openId: string, epoch: number): Promise<BytedcliJwts | null> {
+async function mintJwts(openId: string, epoch: number, durableEpoch: number): Promise<BytedcliJwts | null> {
   const challenge = pendingBytedcliChallenge(openId);
   if (challenge) {
-    await completeBytedcliLogin(openId, challenge);
+    await completeLogin(openId, challenge, epoch, durableEpoch);
   }
-  if (epoch !== authEpoch(openId) || !(await readLoginState(openId)).authenticated || epoch !== authEpoch(openId)) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch) || !(await readLoginState(openId)).authenticated || !credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
-  if (epoch !== authEpoch(openId)) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const cloudJwt = cloud.stdout.trim();
   if (!cloud.ok || !cloudJwt) {
     throw new BytedcliAuthUnavailableError('mint personal JWT');
@@ -599,7 +637,7 @@ async function mintJwts(openId: string, epoch: number): Promise<BytedcliJwts | n
   // The Codebase JWT is optional: without it lark/bytedcli calls still work and
   // only git attribution degrades, so a failure here must not deny the turn.
   const code = await runAsUser(openId, ['auth', 'get-codebase-jwt-token']);
-  if (epoch !== authEpoch(openId)) return null;
+  if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const codeJwt = code.ok ? code.stdout.trim() : '';
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
@@ -609,8 +647,8 @@ async function mintJwts(openId: string, epoch: number): Promise<BytedcliJwts | n
   // mints against the same HOME were measured returning another region's token.
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
-    const jwt = await regionalCloudJwt(openId, region, site, false, epoch);
-    if (epoch !== authEpoch(openId)) return null;
+    const jwt = await regionalCloudJwt(openId, region, site, false, epoch, durableEpoch);
+    if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     if (jwt) regionalCloudJwts[region] = jwt;
   }
   // Keep master's durable revoke fence after all regional provider awaits.

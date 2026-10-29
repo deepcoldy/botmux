@@ -11,6 +11,10 @@
 验证覆盖真实 shell 包装器的区域选择、按人隔离、撤权时晚到结果、撤权重登时同 HOME 串行、同轮追踪替换、旧 sweep 快照、周期重叠及 companion 写入失败后的恢复。故障注入用 provider 子进程替身与假时钟，不需要真实凭据。
 
 
+签票和续期在接纳时同时固定进程内代次与持久 CLI auth epoch，排队前后及各 provider 等待点复核；另一个 daemon 撤权后即使已重新登录、HOME 新 stamp 有效，也不能使旧请求的结果恢复有效。区域缓存同样绑定持久 epoch，重新登录后的请求不能复用旧代次区域 JWT。
+
+begin/complete 登录也与 mint/renew 共用本进程的按人 HOME 队列。撤权只失效去重记录，不提前释放仍在运行的 SDK 操作锁；新登录等旧 child 退出后清掉其晚到文件，再建立新 challenge。旧 complete 不得消费新 challenge，mint 内部的自动 complete 使用同一队列内的原语，避免重复入队自锁。该机制不声称实现了跨 daemon 的文件锁，跨进程 SDK 写入仍见下方后续边界。
+
 ## 已知边界与后续
 
 bytedcli 0.178 的内部跨 site 子请求可能重新取 JWT（例如请求 `cn`）。`bytecloudJwtBelongsToOtherSite` 发现注入的环境 JWT 的 region claim 与该子请求 site 不符时，会跳过它，继续读取 pane HOME 中的登录/SDK 缓存。当前 HOME 未被本 PR 改写，因此这类子请求仍可能回落到操作者登录。跳过不匹配环境 token 的判定与 HOME 是否指向个人目录无关；改 HOME 只能改变回落目录，不能消除单个环境变量无法供给多个 site 的接口错配。

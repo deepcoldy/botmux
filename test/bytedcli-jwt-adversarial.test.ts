@@ -26,9 +26,11 @@ vi.mock('node:child_process', () => ({
     const authorized = existsSync(join(options.env.HOME, 'authorized'));
     const isDefault = args[0] === 'auth' && args[1] === 'get-bytecloud-jwt-token';
     const isStatus = args[0] === 'auth' && args[1] === 'status';
+    const isBegin = args[0] === 'auth' && args[1] === 'login' && args.includes('--begin');
     // A provider request already accepted before a local logout can still
     // finish successfully; later requests observe the deleted authorization.
     const reply = isStatus ? JSON.stringify({ status: 'success', data: { authenticated: authorized } })
+      : isBegin ? JSON.stringify({ status: 'success', data: { verification_uri_complete: 'https://auth.example.test/login', complete_token: 'relogin' } })
       : isDefault && authorized ? jwt(7200, `mint-${++cloudNumber}`) : '';
     setTimeout(() => {
       active -= 1;
@@ -161,10 +163,14 @@ describe('JWT lifecycle adversarial timing probes', () => {
     const old = auth.renewBytedcliJwts(ALICE);
     await vi.advanceTimersByTimeAsync(5000);
     auth.clearBytedcliAuth(ALICE);
-    mkdirSync(auth.bytedcliHomeFor(ALICE), { recursive: true });
+    const login = auth.beginBytedcliLogin(ALICE);
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(await login).not.toBeNull();
+    // Model the person completing the fresh challenge, not an old SDK child
+    // recreating files after deletion.
     writeFileSync(join(auth.bytedcliHomeFor(ALICE), 'authorized'), '{}');
     const fresh = auth.renewBytedcliJwts(ALICE);
-    await vi.advanceTimersByTimeAsync(21_000);
+    await vi.advanceTimersByTimeAsync(11_000);
     expect(await old).toBeNull();
     expect(await fresh).not.toBeNull();
     expect(maxActive).toBe(1);

@@ -438,7 +438,11 @@ describe('mintBytedcliJwts — partition-scoped regional tokens', () => {
       ['--site', 'i18n-bd'], ['--site', 'us-ttp'],
     ]);
     mod.clearBytedcliAuth(ALICE);
+    replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://auth.example.test/relogin', complete_token: 'relogin' }) }];
+    await mod.beginBytedcliLogin(ALICE);
     authorize(mod, ALICE);
+    replies = [{ code: 0, stdout: envelope({ login_status: 'success' }) }];
+    expect((await mod.completeBytedcliLogin(ALICE, 'relogin')).state).toBe('authorized');
     calls.length = 0;
     replies = [{ code: 0, stdout: 'c3\n' }, { code: 0, stdout: 'k3\n' }, { code: 1 }, { code: 1 }, { code: 1 }];
     expect((await mod.mintBytedcliJwts(ALICE))?.regionalCloudJwts).toBeUndefined();
