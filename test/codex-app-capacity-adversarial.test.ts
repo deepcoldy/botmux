@@ -91,8 +91,42 @@ describe('capacity recovery adversarial interleavings', () => {
     expect(restored.ds.session.ordinaryTurnRecovery.status).toBe('attention_required');
   });
 
-  it('preserves original human across newer live routing changes and repeated failed terminals', async () => {
-    vi.useFakeTimers(); const h = host(); const gate = deferred(); h.prepare.mockImplementation(() => gate.promise);
+  // P3-1 negative wiring probes: the App continuation's human proof is gated in
+  // BOTH the prepare closure (before awaiting identity publication) and the
+  // enqueue closure (the later defense-in-depth check). Removing the frozen
+  // per-turn record must fail closed at each wiring, never dispatch.
+  it('prepare refuses a continuation whose frozen human proof is missing', async () => {
+    vi.useFakeTimers(); const h = host();
+    delete h.ds.session.turnReplyContexts.om_original;
+    delete h.ds.session.replyTargets.om_original;
+    recovery.beginOrdinaryTurnRecovery(h.ds.session, 'om_original'); h.fail();
+    await vi.advanceTimersByTimeAsync(120_000);
+    // The caller check throws before identity publication is even attempted.
+    expect(h.prepare).not.toHaveBeenCalled();
+    expect(h.send).not.toHaveBeenCalled();
+    expect(h.ds.session.ordinaryTurnRecovery.status).toBe('attention_required');
+    expect(h.ds.session.ordinaryTurnRecovery.lastErrorCode).toBe('recovery_enqueue_failed');
+  });
+
+  it('enqueue refuses a continuation when the proof vanishes during asynchronous prepare', async () => {
+    vi.useFakeTimers(); const h = host(); const gate = deferred();
+    // prepare passes its synchronous caller check (proof present), then waits;
+    // during that window the live logical-turn proof disappears. The enqueue
+    // closure re-reads the LOGICAL turn id and must fail closed.
+    h.prepare.mockImplementation(() => gate.promise);
+    recovery.beginOrdinaryTurnRecovery(h.ds.session, 'om_original'); h.fail();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(h.ds.session.ordinaryTurnRecovery.status).toBe('dispatching');
+    delete h.ds.session.turnReplyContexts.om_original;
+    delete h.ds.session.replyTargets.om_original;
+    gate.resolve();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.send).not.toHaveBeenCalled();
+    expect(h.ds.session.ordinaryTurnRecovery.status).toBe('attention_required');
+    expect(h.ds.session.ordinaryTurnRecovery.lastErrorCode).toBe('recovery_enqueue_failed');
+  });
+
+  it('preserves original human across newer live routing changes and repeated failed terminals', async () => {    vi.useFakeTimers(); const h = host(); const gate = deferred(); h.prepare.mockImplementation(() => gate.promise);
     recovery.beginOrdinaryTurnRecovery(h.ds.session, 'om_original'); h.fail(); h.fail();
     await vi.advanceTimersByTimeAsync(15_000);
     h.ds.session.quoteTargetSenderOpenId = 'ou_newer';
