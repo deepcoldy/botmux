@@ -34,7 +34,7 @@ const key = { larkAppId: 'app', sessionId: 'sid', turnId: 'om_turn' };
 const input: CreateAskInput = {
   larkAppId: 'app', sessionId: 'sid', chatId: 'oc_chat', rootMessageId: 'om_root', timeoutMs: 60_000,
   replyCardTarget: { turnId: 'om_turn' },
-  questions: [{ prompt: '继续执行吗？', multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
+  questions: [{ prompt: '继续执行吗？', allowCustom: false, multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
 };
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 let dir: string;
@@ -159,6 +159,26 @@ describe('Ask inside the running reply card', () => {
     expect(body).toContain('继续执行吗');
     expect(body).toContain('✓ 继续');
     expect(body).not.toContain('ask_select');
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('submits per-question text from the same live card after another question is toggled', async () => {
+    const { snapshot, answer } = await ask({ questions: [
+      { ...input.questions[0], allowCustom: true },
+      { ...input.questions[0], prompt: '第二题', allowCustom: true },
+    ] });
+    const toggle = { action: 'ask_toggle', key: 'yes', question_index: '1', custom_form: 'v1', revision: '0' };
+    const response = await handleAskCardAction({ context: { open_message_id: 'om_reply' }, operator: { open_id: 'ou_owner' },
+      action: { value: { ...toggle, ask_id: snapshot.askId, nonce: snapshot.nonce }, form_value: { custom_0: '自定义社区', custom_1: '' } } }, { larkAppId: 'app' });
+    await (response as any)?.afterAck?.();
+    await store.update(key, { kind: 'progress', text: '等待确认' }, io);
+    expect(JSON.stringify(JSON.parse(body))).toContain('自定义社区');
+    await click(snapshot, { action: 'ask_submit', custom_form: 'v1', revision: '1' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [[], ['yes']], customAnswers: ['自定义社区', null] });
+    await Promise.allSettled([...publishing]);
+    expect(body).toContain('✓ 自定义社区');
+    expect(body).toContain('✓ 继续');
     expect(replyMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
   });
