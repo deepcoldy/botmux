@@ -404,6 +404,10 @@ describe('setCodexAppThreadName', () => {
     // 处 reject。waitForThreadPreview 必须按「预览不可用」降级返回，让兜底
     // 标题照常写入，而不是把超时错误抛给 setCodexAppThreadName（CI 上同一
     // 缺陷以 "timed out after 1ms" 的尾窗竞态形状出现）。
+    // timeoutMs is both the preview wait budget and each later RPC's timeout
+    // (#2454). Only the first, preview-time read is slow here, so the budget
+    // needs to be short of that read but far above a localhost round trip:
+    // at 200ms a busy CI runner timed out the ordinary thread/name/set (#2454).
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-slow-preview-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -416,10 +420,10 @@ describe('setCodexAppThreadName', () => {
       env: {
         ...process.env,
         FAKE_CODEX_LOG: logPath,
-        FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
+        FAKE_CODEX_THREAD_READ_DELAY_MS: '3000',
         FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
       },
-      timeoutMs: 200,
+      timeoutMs: 2_000,
       initializeTimeoutMs: 2_000,
       waitForExistingPreview: true,
     });
