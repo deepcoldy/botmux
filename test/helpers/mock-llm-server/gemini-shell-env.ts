@@ -1,0 +1,35 @@
+/**
+ * Diagnostic shell fragment for the Feishu core-clis Gemini lane.
+ *
+ * The live run could not tell whether the per-bot `GITHUB_SHA: ''` actually
+ * reached Gemini CLI's shell subprocess: an empty string that disables
+ * gemini-cli's strict environment sanitization, an unset variable, and a
+ * leaked non-empty runner value all look identical in the browser (no ACK).
+ *
+ * This fragment appends one line per shell-tool invocation to a file in the
+ * CLI working directory, recording presence (`${VAR+x}` distinguishes
+ * set-but-empty from unset) and value for the variables that decide routing.
+ * It runs *before* the `botmux send` reply, in the same shell, so the snapshot
+ * reflects exactly what the shell tool's sanitization left behind.
+ *
+ * Pure and fixed — never interpolates message text — so it is unit-testable.
+ */
+
+/** File the gemini shell appends snapshots to (relative to the CLI cwd '.'). */
+export const GEMINI_SHELL_ENV_LOG = '.e2e-gemini-shell-env.log';
+
+const SNAPSHOT_VARS = ['GITHUB_SHA', 'BOTMUX_SESSION_ID', 'BOTMUX_IDENTITY_BIN', 'BASH_ENV', '__OWNER_OPEN_ID'] as const;
+
+/**
+ * Shell fragment that appends one line recording each tracked variable as
+ * `NAME={presence:value}`, e.g. `GITHUB_SHA={x:}` (set, empty) vs
+ * `GITHUB_SHA={:}` (unset). Safe to prepend to another command with `; `.
+ */
+export function buildGeminiShellEnvSnapshotFragment(): string {
+  const fields = SNAPSHOT_VARS.map(
+    (name) => `${name}={\${${name}+x}:\${${name}}}`,
+  ).join(' ');
+  // Double quotes so the shell expands ${...}; literal braces/colon survive.
+  // Renders e.g. GITHUB_SHA={x:} when set-empty, GITHUB_SHA={:} when unset.
+  return `printf '%s\\n' "${fields}" >> ${GEMINI_SHELL_ENV_LOG}`;
+}

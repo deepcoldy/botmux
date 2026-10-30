@@ -297,7 +297,11 @@ describe('MockLlmServer', () => {
       });
       const call = JSON.parse(first.replace(/^data: /, '').trim()).candidates[0].content.parts[0].functionCall;
       expect(call.name).toBe('run_shell_command');
-      expect(call.args.command).toBe("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
+      // The reply command carries an env-snapshot fragment (live diagnostic)
+      // followed by the real `botmux send`.
+      expect(call.args.command).toMatch(/^printf '%s\\n' "[\s\S]*" >> \.e2e-gemini-shell-env\.log; /);
+      expect(call.args.command).toContain("GITHUB_SHA={${GITHUB_SHA+x}:${GITHUB_SHA}}");
+      expect(call.args.command).toContain("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
 
       const second = await post('/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse', {
         contents: [
