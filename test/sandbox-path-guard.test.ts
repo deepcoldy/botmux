@@ -7,10 +7,12 @@ import {
   dropReadOnlyFilesystemRoot,
   findForbiddenReadWritePaths,
   findReadOnlyFilesystemRoot,
+  resolveStoredSandboxPaths,
   findNonAbsoluteSandboxEntries,
   forbiddenReadWriteMessage,
   type ProtectedRoots,
 } from '../src/services/sandbox-path-guard.js';
+import { accessForPath, buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
 
 describe('sandbox readWrite guard', () => {
   let root: string;
@@ -127,19 +129,56 @@ describe('sandbox readWrite guard', () => {
     const home = roots.homeDirs[0]!;
     const rootLink = join(root, 'rootlink');
     symlinkSync('/', rootLink);
-    expect(findReadOnlyFilesystemRoot(['/', '//', '/./', ' / ', rootLink, '/usr', '~', home, '/opt', '..'], home))
+    expect(findReadOnlyFilesystemRoot(['/', '//', '/./', ' / ', rootLink, '/usr', '~', home, '/opt', '..'], home, 'linux'))
       .toEqual(['/', '//', '/./', ' / ', rootLink]);
   });
 
   it('drops a stored readOnly `/` and keeps the other readOnly entries', () => {
     const home = roots.homeDirs[0]!;
     const { lists, dropped } = dropReadOnlyFilesystemRoot(
-      { readWrite: ['~/projects/app'], readOnly: ['/usr', '/', '~'], deny: ['~/secret'] }, home,
+      { readWrite: ['~/projects/app'], readOnly: ['/usr', '/', '~'], deny: ['~/secret'] }, home, 'linux',
     );
     expect(dropped).toEqual(['/']);
     expect(lists).toEqual({ readWrite: ['~/projects/app'], readOnly: ['/usr', '~'], deny: ['~/secret'] });
     const untouched = { readOnly: ['/usr'] };
-    expect(dropReadOnlyFilesystemRoot(untouched, home)).toEqual({ lists: untouched, dropped: [] });
-    expect(dropReadOnlyFilesystemRoot(undefined, home)).toEqual({ lists: undefined, dropped: [] });
+    expect(dropReadOnlyFilesystemRoot(untouched, home, 'linux')).toEqual({ lists: untouched, dropped: [] });
+    expect(dropReadOnlyFilesystemRoot(undefined, home, 'linux')).toEqual({ lists: undefined, dropped: [] });
+  });
+
+  it('leaves a readOnly `/` alone on macOS, where Seatbelt runs it as "read everything, write the deeper grants"', () => {
+    const home = roots.homeDirs[0]!;
+    expect(findReadOnlyFilesystemRoot(['/'], home, 'darwin')).toEqual([]);
+    const stored = { readOnly: ['/'] };
+    expect(dropReadOnlyFilesystemRoot(stored, home, 'darwin')).toEqual({ lists: stored, dropped: [] });
+    // The darwin policy keeps the grant and deeper readWrite rules still win.
+    const work = join(root, 'proj');
+    const policy = buildFsPolicy({
+      platform: 'darwin', homeDir: home, botmuxHome: join(home, '.botmux'), sessionDataDir: join(home, '.botmux', 'data'),
+      sessionId: 's', workingDir: work, currentAppId: 'cli_x', botHome: join(home, '.botmux', 'bots', 'cli_x'),
+      userPaths: { readOnly: ['/'] }, net: true, writeRegexes: [],
+    });
+    expect(accessForPath(policy.rules, '/etc/hosts').access).toBe('readOnly');
+    expect(accessForPath(policy.rules, join(work, 'file')).access).toBe('readWrite');
+  });
+
+  it('resolveStoredSandboxPaths applies every stored-entry rule in one step (the worker\'s list assembly)', () => {
+    const home = roots.homeDirs[0]!;
+    const stored = {
+      readWrite: ['/', '~/projects/app', '~', '..'],
+      readOnly: ['/usr', '/', '../ref', '~/docs'],
+      deny: ['~/secret', 'rel/hidden'],
+    };
+    const linux = resolveStoredSandboxPaths(stored, { roots, home, platform: 'linux' });
+    expect(linux.downgradedReadWrite.map(f => f.path)).toEqual(['~']);
+    expect(linux.droppedReadWrite.map(f => f.path)).toEqual(['/', '..']);
+    expect(linux.droppedReadOnlyRelative).toEqual(['../ref']);
+    expect(linux.droppedReadOnlyRoot).toEqual(['/']);
+    expect(linux.lists).toEqual({
+      readWrite: ['~/projects/app'], readOnly: ['/usr', '~/docs', '~'], deny: ['~/secret', 'rel/hidden'],
+    });
+    const darwin = resolveStoredSandboxPaths(stored, { roots, home, platform: 'darwin' });
+    expect(darwin.droppedReadOnlyRoot).toEqual([]);
+    expect(darwin.lists?.readOnly).toEqual(['/usr', '/', '~/docs', '~']);
+    expect(resolveStoredSandboxPaths(undefined, { roots, home, platform: 'linux' }).lists).toBeUndefined();
   });
 });

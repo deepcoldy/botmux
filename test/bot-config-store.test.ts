@@ -1670,8 +1670,9 @@ describe('bot-config store', () => {
       }
     }
     expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
-    // `/` is refused as readOnly too: a read-only root cannot start (#2588).
-    for (const root of ['/', '//', ' /./ ']) {
+    // On Linux `/` is refused as readOnly too: a read-only root cannot start (#2588).
+    const onLinux = process.platform === 'linux';
+    for (const root of onLinux ? ['/', '//', ' /./ '] : []) {
       const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj'], readOnly: [root] });
       expect(r.ok, root).toBe(false);
       if (!r.ok) {
@@ -1680,6 +1681,16 @@ describe('bot-config store', () => {
       }
     }
     expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
+    // macOS Seatbelt runs a readOnly `/` fine: saved there.
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    try {
+      const mac = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj'], readOnly: ['/'] });
+      expect(mac.ok).toBe(true);
+      expect(readConfig().sandboxPaths).toEqual({ readWrite: ['/opt/proj'], readOnly: ['/'] });
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+    }
     // HOME as readOnly, and deeper paths as readWrite, still save.
     const ok = await sandboxStore.updateBotSandboxPaths('app_default', {
       readWrite: ['~/projects/app'], readOnly: ['~', '/usr'],

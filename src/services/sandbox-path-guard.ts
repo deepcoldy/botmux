@@ -168,18 +168,24 @@ export function forbiddenReadWriteMessage(found: readonly ForbiddenReadWritePath
 
 /**
  * readOnly entries that name the filesystem root itself (any spelling, or a
- * link that resolves to it). A read-only bind of `/` cannot start: the policy
- * mounts fresh tmpfs at /run, /tmp, … before the user's binds, `--ro-bind / /`
- * then covers them with the host's read-only directories, and the next mount
- * point the launcher needs (`/run/sbxbin`) cannot be created — measured with
- * bubblewrap 0.8.0, with and without a user namespace:
+ * link that resolves to it). On Linux a read-only bind of `/` cannot start:
+ * the policy mounts fresh tmpfs at /run, /tmp, … before the user's binds,
+ * `--ro-bind / /` then covers them with the host's read-only directories, and
+ * the next mount point the launcher needs (`/run/sbxbin`) cannot be created —
+ * measured with bubblewrap 0.8.0, with and without a user namespace:
  * `bwrap: Can't mkdir /run/sbxbin: Read-only file system`. Deeper paths
  * (`/usr`, HOME as readOnly) are unaffected.
+ *
+ * Linux only. macOS Seatbelt has no mount namespace: a readOnly `/` compiles
+ * to "read everything, write only the deeper grants", which starts and is a
+ * legitimate configuration there.
  */
 export function findReadOnlyFilesystemRoot(
   readOnly: readonly string[] | undefined,
   home: string = homedir(),
+  platform: NodeJS.Platform = process.platform,
 ): string[] {
+  if (platform !== 'linux') return [];
   const out: string[] = [];
   for (const raw of readOnly ?? []) {
     if (!isAbsoluteSandboxEntry(raw, home)) continue;
@@ -196,14 +202,15 @@ export function readOnlyRootMessage(found: readonly string[]): string {
 
 /**
  * Spawn-time handling of a stored readOnly `/` (saved before the save path
- * refused it, or hand-edited into bots.json): dropped, so the session starts
- * deny-by-default instead of exiting at launch.
+ * refused it, or hand-edited into bots.json): dropped on Linux, so the session
+ * starts deny-by-default instead of exiting at launch. Kept elsewhere.
  */
 export function dropReadOnlyFilesystemRoot<T extends { readOnly?: string[] }>(
   lists: T | undefined,
   home: string = homedir(),
+  platform: NodeJS.Platform = process.platform,
 ): { lists: T | undefined; dropped: string[] } {
-  const dropped = findReadOnlyFilesystemRoot(lists?.readOnly, home);
+  const dropped = findReadOnlyFilesystemRoot(lists?.readOnly, home, platform);
   if (!lists || dropped.length === 0) return { lists, dropped };
   const removed = new Set(dropped);
   return { lists: { ...lists, readOnly: (lists.readOnly ?? []).filter(path => !removed.has(path)) }, dropped };
@@ -241,5 +248,48 @@ export function downgradeForbiddenReadWrite<T extends { readWrite?: string[]; re
     },
     downgraded,
     dropped,
+  };
+}
+
+export interface ResolvedStoredSandboxPaths<T> {
+  lists: T | undefined;
+  /** readWrite entries moved to readOnly (HOME / botmux home and ancestors). */
+  downgradedReadWrite: ForbiddenReadWritePath[];
+  /** readWrite entries dropped (`/`, relative). */
+  droppedReadWrite: ForbiddenReadWritePath[];
+  /** readOnly entries dropped for being relative. */
+  droppedReadOnlyRelative: string[];
+  /** readOnly `/` dropped (Linux only). */
+  droppedReadOnlyRoot: string[];
+}
+
+/**
+ * Everything the worker does to a STORED sandboxPaths object before compiling
+ * the policy, in order: forbidden readWrite entries downgraded or dropped,
+ * relative readOnly entries dropped (they resolve against the session cwd, so
+ * `..` would bind HOME), and a readOnly `/` dropped on Linux. Relative DENY
+ * entries are left as-is — their cwd-relative resolution only ever hides a
+ * path. The caller logs each non-empty list.
+ */
+export function resolveStoredSandboxPaths<T extends { readWrite?: string[]; readOnly?: string[] }>(
+  stored: T | undefined,
+  opts: { roots?: ProtectedRoots; home?: string; platform?: NodeJS.Platform } = {},
+): ResolvedStoredSandboxPaths<T> {
+  const home = opts.home ?? homedir();
+  const { lists: downgradedLists, downgraded, dropped } = downgradeForbiddenReadWrite(
+    stored, opts.roots ?? defaultProtectedRoots(),
+  );
+  const droppedReadOnlyRelative = (downgradedLists?.readOnly ?? [])
+    .filter(path => !isAbsoluteSandboxEntry(path, home));
+  const absoluteLists = droppedReadOnlyRelative.length && downgradedLists
+    ? { ...downgradedLists, readOnly: downgradedLists.readOnly?.filter(path => isAbsoluteSandboxEntry(path, home)) }
+    : downgradedLists;
+  const { lists, dropped: droppedReadOnlyRoot } = dropReadOnlyFilesystemRoot(absoluteLists, home, opts.platform);
+  return {
+    lists,
+    downgradedReadWrite: downgraded,
+    droppedReadWrite: dropped,
+    droppedReadOnlyRelative,
+    droppedReadOnlyRoot,
   };
 }
