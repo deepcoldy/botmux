@@ -733,8 +733,14 @@ export function startMaintenance(): void {
   const deps = productionDeps(() => latest);
   const tick = async () => {
     try {
-      // Only look the registry up on the tick that will actually run the update.
-      latest = autoUpdateDueNow(deps) ? await fetchLatestVersion() : null;
+      // Only look the registry up on the tick that will actually run the update,
+      // and only for a package-manager install: a self-replace already skips an
+      // equal version itself, and resolves its target from the public registry
+      // first — a lagging mirror here would wrongly skip a real update.
+      latest = autoUpdateDueNow(deps) && currentUpdateStrategy(botmuxInstallRoot()).kind === 'package-manager'
+        ? await fetchLatestVersion()
+        : null;
+      if (!timer) return; // stopped while the lookup was in flight
       runMaintenanceTick(deps);
     } catch (e) {
       logger.warn(`[maintenance] tick failed: ${e instanceof Error ? e.message : e}`);

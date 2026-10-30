@@ -341,6 +341,9 @@ describe('autoUpdateDueNow', () => {
     expect(autoUpdateDueNow({ ...base, readConfig: () => undefined })).toBe(false);
     expect(autoUpdateDueNow({ ...base, readConfig: () => ({ autoUpdate: { enabled: true, time: '12:00' } }),
       readState: () => ({ autoUpdate: { lastDate: TODAY } }) })).toBe(false);
+    // Not yet time, and past the grace window ("missed"): the tick would not install either.
+    expect(autoUpdateDueNow({ ...base, readConfig: () => ({ autoUpdate: { enabled: true, time: '13:00' } }) })).toBe(false);
+    expect(autoUpdateDueNow({ ...base, readConfig: () => ({ autoUpdate: { enabled: true, time: '10:00' } }) })).toBe(false);
   });
 });
 
