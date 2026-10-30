@@ -49,9 +49,10 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
 
     // No session found for this botmux session → the worker starts fresh and
     // says so once, instead of `--session` exiting on "Session … not found".
-    checkResumeTargetExists({ sessionId, cliSessionId, workingDir }) {
+    resumeFindsOwnSession: true,
+    checkResumeTargetExists({ sessionId, cliSessionId, workingDir, env }) {
       if (isKimiSessionId(cliSessionId)) return undefined;
-      return findKimiSessionForBotmuxSession(sessionId, workingDir) !== undefined;
+      return findKimiSessionForBotmuxSession(sessionId, workingDir, env ?? process.env) !== undefined;
     },
 
     async writeInput(pty: PtyHandle, content: string) {

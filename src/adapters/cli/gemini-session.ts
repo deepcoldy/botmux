@@ -11,7 +11,7 @@ import { join, resolve } from 'node:path';
  * - `--session-id <uuid>` starts a new session with that id (exit 42 if a file
  *   with that id already exists for the project);
  * - `--resume <uuid>` resumes it, but only within the same project and only a
- *   session with resumable content (at least one user message); anything else
+ *   session with resumable content (see isResumableRecord); anything else
  *   exits 42 ("No previous sessions found" / "Invalid session identifier").
  *
  * So botmux can name the session itself (its session id is a UUID) and must
@@ -60,9 +60,48 @@ function firstLine(path: string): string {
   }
 }
 
+/** Text of a message's `content` (a string, a part, or a list of parts). */
+function contentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(contentText).join('');
+  if (content && typeof content === 'object' && typeof (content as { text?: unknown }).text === 'string') {
+    return (content as { text: string }).text;
+  }
+  return '';
+}
+
+/**
+ * Gemini's own test (0.66 `isResumableMessageRecord` / `isIgnoredUserContent`):
+ * a session resumes only with a real user message or a non-empty model turn.
+ * The `<session_context>` line Gemini writes at startup, slash commands and
+ * `?` help do not count, so a session that crashed before the first prompt
+ * landed is not resumable and `--resume` would exit 42.
+ */
+function isResumableRecord(record: { type?: unknown; content?: unknown; toolCalls?: unknown; thoughts?: unknown }): boolean {
+  const text = contentText(record.content).trim();
+  if (record.type === 'user') {
+    return !(text.length === 0 || text.startsWith('/') || text.startsWith('?')
+      || text.startsWith('<session_context>') || text.startsWith('<hook_context>'));
+  }
+  if (record.type === 'gemini') {
+    return text.length > 0
+      || (Array.isArray(record.toolCalls) && record.toolCalls.length > 0)
+      || (Array.isArray(record.thoughts) && record.thoughts.length > 0);
+  }
+  return false;
+}
+
+function hasResumableContent(jsonl: string): boolean {
+  for (const line of jsonl.split('\n')) {
+    if (!line.trim()) continue;
+    try { if (isResumableRecord(JSON.parse(line))) return true; } catch { /* torn line */ }
+  }
+  return false;
+}
+
 export interface GeminiSessionFile {
   path: string;
-  /** Has at least one user message: Gemini resumes only such a session. */
+  /** Has resumable content by Gemini's own rule (isResumableRecord). */
   resumable: boolean;
 }
 
@@ -86,8 +125,7 @@ export function findGeminiSessionFile(
     try {
       const meta = JSON.parse(firstLine(path)) as { sessionId?: unknown };
       if (meta.sessionId !== sessionId) continue;
-      const text = readFileSync(path, 'utf8');
-      return { path, resumable: /"type"\s*:\s*"user"/.test(text) };
+      return { path, resumable: hasResumableContent(readFileSync(path, 'utf8')) };
     } catch { continue; }
   }
   return undefined;

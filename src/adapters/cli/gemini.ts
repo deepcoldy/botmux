@@ -50,9 +50,10 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
 
     // Resume only what Gemini will accept; else the worker starts fresh and
     // says so once, instead of a `--resume` that exits 42 in a restart loop.
-    checkResumeTargetExists({ sessionId, workingDir }) {
+    resumeFindsOwnSession: true,
+    checkResumeTargetExists({ sessionId, workingDir, env }) {
       if (!isGeminiSessionId(sessionId) || !workingDir) return undefined;
-      return findGeminiSessionFile(sessionId, workingDir)?.resumable === true;
+      return findGeminiSessionFile(sessionId, workingDir, env ?? process.env)?.resumable === true;
     },
 
     passesInitialPromptViaArgs: true,

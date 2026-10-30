@@ -84,6 +84,14 @@ describe('Gemini: resume by the botmux session id', () => {
     const env = { GEMINI_CLI_HOME: home };
     geminiSession(home, work, BOTMUX, [{ type: 'info', content: 'MCP issues detected' }]);
     expect(findGeminiSessionFile(BOTMUX, work, env)).toMatchObject({ resumable: false });
+    // What Gemini writes before the first prompt lands, and what it ignores
+    // when deciding a session is resumable (0.66 isIgnoredUserContent).
+    for (const text of ['<session_context>\nThis is the Gemini CLI.', '<hook_context>x', '/help', '?', '   ']) {
+      geminiSession(home, work, BOTMUX, [{ type: 'user', content: [{ text }] }]);
+      expect(findGeminiSessionFile(BOTMUX, work, env), text).toMatchObject({ resumable: false });
+    }
+    geminiSession(home, work, BOTMUX, [{ type: 'user', content: [{ text: '<session_context>x' }] }, { type: 'gemini', content: '', toolCalls: [{ id: 't' }] }]);
+    expect(findGeminiSessionFile(BOTMUX, work, env)).toMatchObject({ resumable: true });
     geminiSession(home, work, BOTMUX, [{ type: 'user', content: [{ text: 'hello' }] }]);
     expect(findGeminiSessionFile(BOTMUX, work, env)).toMatchObject({ resumable: true });
     expect(findGeminiSessionFile(BOTMUX, join(home, 'elsewhere'), env)).toBeUndefined();
@@ -107,6 +115,9 @@ describe('Gemini: resume by the botmux session id', () => {
     geminiSession(home, work, BOTMUX, [{ type: 'user', content: [{ text: 'hello' }] }]);
     expect(args(true)).toEqual(['--yolo', '--resume', BOTMUX]);
     expect(args(false)).toEqual(['--yolo']);
+    // The pre-resume probe reads the same per-bot home the CLI will use.
+    expect(adapter.checkResumeTargetExists?.({ sessionId: BOTMUX, workingDir: work, env })).toBe(true);
+    expect(createKimiAdapter('/usr/bin/kimi').checkResumeTargetExists?.({ sessionId: BOTMUX, workingDir: work, env: { KIMI_CODE_HOME: join(home, 'none') } })).toBe(false);
     // Not a UUID (Gemini only accepts UUIDs): untouched.
     expect(adapter.buildArgs({ sessionId: 'not-a-uuid', resume: true, workingDir: work, env })).toEqual(['--yolo']);
   });
