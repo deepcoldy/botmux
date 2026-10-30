@@ -301,6 +301,9 @@ describe('worker progress observation independent of display cap', () => {
     ['codex', true, 'tool_result', 'tool_returned'],
     ['codex', true, 'thinking', 'model_output'],
     ['codex', false, 'tool_call', null],
+    ['traex', false, 'tool_call', 'tool_started'],
+    ['traex', false, 'tool_result', 'tool_returned'],
+    ['traex', false, 'thinking', 'model_output'],
     ['codex-app', true, 'tool_call', null],
   ])('%s opt-in %s: %s', (cliId, cliEnabled, kind, stage) => {
     const send = vi.fn();
