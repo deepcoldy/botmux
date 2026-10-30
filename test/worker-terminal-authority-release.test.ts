@@ -276,7 +276,7 @@ describe('queued type-ahead advance skips turns whose terminal already went out'
     });
   });
 
-  it('tombsontes the turnId when every attempt named in the marker has terminated', () => {
+  it('tombstones the turnId when every attempt named in the marker has terminated', () => {
     withMarker(marker => {
       const h = harness({ markerPath: marker });
       startTurn(h, 'om_host');
@@ -315,26 +315,47 @@ describe('queued type-ahead advance skips turns whose terminal already went out'
     });
   });
 
-  it('refills an explicit live attempt despite an attempt-agnostic tombstone', () => {    withMarker(marker => {
+  it('never refills a turn the worker already advanced past, even with an explicit attempt', () => {
+    withMarker(marker => {
       const h = harness({ markerPath: marker });
       startTurn(h, 'om_host');
-      // A prior attempt of this turn was retired earlier in the same worker
-      // life; the dual-marker read can still surface a newer attempt whose own
-      // terminal has never gone out.
-      h.retiredTurnIds.add('om_T');
+      // markTurnRetired is attempt-agnostic and always marks the previous turn
+      // when advancing. A lagging marker (e.g. the slower of the dual markers,
+      // or a rewrite whose failure was swallowed) can still list that turn as
+      // a durable queued record. Refilling it would re-adopt a finished turn
+      // whose ordinary attempt-less terminal can never release the
+      // attempt-qualified authority again.
+      h.retiredTurnIds.add('om_A');
       writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_host',
-        queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }] }));
+        queuedTurns: [{ turnId: 'om_A', dispatchAttempt: 1 }] }));
 
       h.syncQueuedTurnsFromMarkerDisk();
+      expect(h.queuedTypeAheadTurns).toEqual([]);
+      expect(h.advanceQueuedTypeAheadTurn('prompt_ready')).toBe(false);
+      expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_host');
 
-      expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+      // The host ending releases authority normally; a scheduled fire is
+      // admitted instead of parking behind a resurrected dead turn.
+      h.emitTurnTerminal('om_B', 'completed');
+      h.emitTurnTerminal('om_A', 'completed');
+      h.emitTurnTerminal('om_host', 'completed');
+      expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+      expect(h.activeTurnBlocks({ turnId: 'schedule:task:2', queueAfterActiveTurn: true })).toBe(false);
+    });
+  });
 
-      // Attempt-less legacy records are still blocked by the turnId tombstone.
+  it('does not refill an attempt-qualified marker record whose terminal is the generic key', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_host');
+      // Ordinary IM turns emit terminals without a dispatchAttempt; a marker
+      // record carrying one for the same turn is equally dead.
       writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_host',
-        queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }, { turnId: 'om_L' }] }));
-      h.retiredTurnIds.add('om_L');
+        queuedTurns: [{ turnId: 'om_G', dispatchAttempt: 3 }] }));
+      h.emittedTurnTerminals.claim('sid', 'om_G', undefined, 'completed');
+
       h.syncQueuedTurnsFromMarkerDisk();
-      expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+      expect(h.queuedTypeAheadTurns).toEqual([]);
     });
   });
 });

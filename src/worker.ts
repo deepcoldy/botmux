@@ -29317,15 +29317,24 @@ function turnTerminalEmitted(turnId: string, dispatchAttempt?: number): boolean 
 }
 
 /** Whether a queuedTurns entry read back from the PID marker still names live
- *  work. The retiredTurnIds tombstone predates dispatch retries and is keyed by
- *  turnId alone; a durable retry under an explicit dispatchAttempt is a
- *  different execution, so its liveness is gated by its OWN per-attempt
- *  terminal record instead. Attempt-less (legacy) entries keep both gates. */
+ *  work.
+ *  - retiredTurnIds is attempt-agnostic and holds every turn the worker has
+ *    already advanced past. A lagging marker must never refill one of those:
+ *    re-adopting it hands the authority to a finished execution whose terminal
+ *    can no longer release the attempt-qualified tuple (an ordinary terminal
+ *    is keyed without an attempt) — the permanent wedge this guard prevents.
+ *    The live-durable-retry carve-out lives upstream in
+ *    retireTerminatedMarkerTurn, which refuses to place this tombstone while a
+ *    sibling attempt is still live.
+ *  - The entry's own per-attempt terminal blocks readback; an ordinary
+ *    attempt-less terminal for the same turn blocks it too, since a turn
+ *    finished under the generic key is equally dead. */
 function markerQueuedTurnStillLive(qt: { turnId?: unknown; dispatchAttempt?: unknown }): boolean {
   if (typeof qt?.turnId !== 'string' || !qt.turnId) return false;
+  if (retiredTurnIds.has(qt.turnId)) return false;
   const dispatchAttempt = typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined;
   if (turnTerminalEmitted(qt.turnId, dispatchAttempt)) return false;
-  if (dispatchAttempt === undefined && retiredTurnIds.has(qt.turnId)) return false;
+  if (dispatchAttempt !== undefined && turnTerminalEmitted(qt.turnId, undefined)) return false;
   return true;
 }
 
@@ -29352,7 +29361,8 @@ function retireTerminatedMarkerTurn(parsed: {
     const siblingAttempt = typeof candidate.dispatchAttempt === 'number'
       ? candidate.dispatchAttempt
       : undefined;
-    if (siblingAttempt === dispatchAttempt) return false;
+    // A same-attempt sibling is the head itself: its terminal is the one that
+    // was just confirmed emitted, so this lookup returns false for it too.
     return !turnTerminalEmitted(parsed.turnId, siblingAttempt);
   };
   const liveSibling = queuedTypeAheadTurns.some(siblingIsLive)
