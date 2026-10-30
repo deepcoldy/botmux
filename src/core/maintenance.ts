@@ -54,7 +54,7 @@ import {
   currentBinaryInstallShape,
   type BinaryInstallShape,
 } from './binary-self-update.js';
-import { compareVersions } from './update-check.js';
+import { compareVersions, fetchLatestVersion } from './update-check.js';
 import { globalWrapperPath } from '../utils/local-dev-update.js';
 import {
   captureDetachedRestartEnvFallback,
@@ -112,6 +112,19 @@ export interface MaintenanceDeps {
    * and behaviour is byte-identical to before.
    */
   installedVersion?: () => string;
+  /**
+   * The registry's `latest` version, looked up before this tick (the tick itself
+   * is synchronous), or null when unknown — the lookup failed or was not made.
+   *
+   * When it equals the current version the install is skipped. Reinstalling the
+   * same version is not a no-op: `npm install -g botmux@latest` rewrites every
+   * file of the install ("changed 170 packages"), including the compiled binary
+   * the running daemon was started from. The daemon keeps its old image while
+   * `after === before` means no restart, and workers forked afterwards from the
+   * rewritten file exit before ready (`An unknown error occurred (Unexpected)`).
+   * null keeps the previous behaviour (install, then compare versions).
+   */
+  latestVersion?: () => string | null;
   writeIntent: (intent: RestartIntent) => void;
   /** Spawn a detached `botmux restart` (this process is then killed by pm2). */
   triggerRestart: () => void;
@@ -126,6 +139,13 @@ export interface MaintenanceDeps {
  * the next day; auto-restart off ⇒ install only (applied on the next restart).
  * Pure orchestration over injected deps.
  */
+/** Would `runMaintenanceTick` run the update right now? Read-only (marks nothing). */
+export function autoUpdateDueNow(deps: Pick<MaintenanceDeps, 'readConfig' | 'readState' | 'now'>): boolean {
+  const cfg = deps.readConfig();
+  if (!cfg?.autoUpdate?.enabled) return false;
+  return evaluateDue(cfg.autoUpdate, deps.readState().autoUpdate?.lastDate, deps.now()).decision === 'due';
+}
+
 export function runMaintenanceTick(deps: MaintenanceDeps): void {
   const cfg = deps.readConfig();
   if (!cfg?.autoUpdate?.enabled) return; // auto-restart has no schedule of its own
@@ -152,10 +172,15 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
 
   let before = '';
   let after = '';
+  let skipped = false;
   let restartFailed = false;
   try {
     deps.withUpdateLock(() => {
       before = deps.currentVersion();
+      if (deps.latestVersion?.() === before) {
+        skipped = true;
+        return;
+      }
       deps.runUpdate();
       // Both strategies report what they installed: a compiled binary's baked
       // version shadows the disk on BOTH paths (see MaintenanceDeps.installedVersion).
@@ -178,6 +203,10 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
     });
   } catch (e) {
     log(`auto-update failed: ${e instanceof Error ? e.message : e}`);
+    return;
+  }
+  if (skipped) {
+    log(`auto-update: already on the latest version (${before}), install skipped`);
     return;
   }
   if (after === before) {
@@ -630,7 +659,7 @@ export function runSelfReplaceBlocking(version = 'latest'): string {
   return m?.[1] ?? '';
 }
 
-function productionDeps(): MaintenanceDeps {
+function productionDeps(latestVersion: () => string | null = () => null): MaintenanceDeps {
   // Kept after a successful resolve so post-pnpm-update version/restart lookups
   // use the stable global node_modules/botmux symlink, not the removed
   // .pnpm/botmux@old runtime realpath.
@@ -678,6 +707,7 @@ function productionDeps(): MaintenanceDeps {
       installedTo = diskVersionAt(installPlan.activePackageRoot);
     },
     installedVersion: () => installedTo,
+    latestVersion,
     writeIntent: (intent) => writeRestartIntent(intent),
     triggerRestart: () => {
       const leaseId = claimRestartLease();
@@ -699,9 +729,14 @@ let timer: NodeJS.Timeout | undefined;
 /** Start the maintenance loop. Call only on the primary daemon (bot-0). */
 export function startMaintenance(): void {
   if (timer) return;
-  const deps = productionDeps();
-  const tick = () => {
-    try { runMaintenanceTick(deps); } catch (e) {
+  let latest: string | null = null;
+  const deps = productionDeps(() => latest);
+  const tick = async () => {
+    try {
+      // Only look the registry up on the tick that will actually run the update.
+      latest = autoUpdateDueNow(deps) ? await fetchLatestVersion() : null;
+      runMaintenanceTick(deps);
+    } catch (e) {
       logger.warn(`[maintenance] tick failed: ${e instanceof Error ? e.message : e}`);
     }
   };

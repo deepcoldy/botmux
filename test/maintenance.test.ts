@@ -15,6 +15,7 @@ import {
   maintenanceRestartLogPath,
   globalInstallUpdateCwd,
   spawnDetachedRestart,
+  autoUpdateDueNow,
   type MaintenanceDeps,
   type MaintenanceState,
 } from '../src/core/maintenance.js';
@@ -60,6 +61,7 @@ interface Opts {
   busy?: boolean;
   localDev?: boolean;
   updateThrows?: boolean;
+  latest?: string | null; // registry latest looked up before the tick (undefined ⇒ dep not provided)
 }
 
 function makeDeps(cfg: MaintenanceConfig, opts: Opts = {}) {
@@ -104,6 +106,7 @@ function makeDeps(cfg: MaintenanceConfig, opts: Opts = {}) {
       calls.restart++;
     },
     log: (m) => { calls.logs.push(m); },
+    ...(opts.latest !== undefined ? { latestVersion: () => opts.latest ?? null } : {}),
   };
   return { deps, calls, state };
 }
@@ -279,6 +282,65 @@ describe('runMaintenanceTick — a binary self-replace still triggers the restar
     runMaintenanceTick(deps);
     expect(calls.restart).toBe(1);
     expect(calls.intents[0]).toMatchObject({ oldVersion: '2.64.0', newVersion: '2.65.0' });
+  });
+});
+
+describe('runMaintenanceTick — skips reinstalling the version already running', () => {
+  /**
+   * `npm install -g botmux@latest` on the version already installed is not a
+   * no-op: it rewrites the whole install, compiled binary included. The daemon
+   * keeps running the old image and (same version) never restarts, while workers
+   * forked from the rewritten file exit before ready. Skip the install when the
+   * registry's latest is what is already running.
+   */
+  const cfg = { autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } };
+
+  it('registry latest equals the running version → no install, no restart, still marks today', () => {
+    const { deps, calls, state } = makeDeps(cfg, { startVer: '3.55.0', installTo: '3.55.0', latest: '3.55.0' });
+    runMaintenanceTick(deps);
+    // MUTATION CHECK: removing the latestVersion guard runs the install again.
+    expect(calls.update).toBe(0);
+    expect(calls.restart).toBe(0);
+    expect(calls.intents).toEqual([]);
+    expect(calls.logs.join('\n')).toMatch(/already on the latest version \(3\.55\.0\), install skipped/);
+    expect(state.autoUpdate?.lastDate).toBe(TODAY);
+  });
+
+  it('registry has a newer version → installs and restarts as before', () => {
+    const { deps, calls } = makeDeps(cfg, { startVer: '3.55.0', installTo: '3.56.0', latest: '3.56.0' });
+    runMaintenanceTick(deps);
+    expect(calls.update).toBe(1);
+    expect(calls.restart).toBe(1);
+    expect(calls.intents).toEqual([expect.objectContaining({ oldVersion: '3.55.0', newVersion: '3.56.0' })]);
+  });
+
+  it('lookup failed (null) → installs and compares like before', () => {
+    const { deps, calls } = makeDeps(cfg, { startVer: '3.55.0', installTo: '3.55.0', latest: null });
+    runMaintenanceTick(deps);
+    expect(calls.update).toBe(1);
+    expect(calls.restart).toBe(0);
+    expect(calls.logs.join('\n')).toMatch(/already on the latest version$/m);
+  });
+
+  it('only an exact match skips: running a different version (e.g. a canary) still installs latest', () => {
+    const { deps, calls } = makeDeps(cfg, { startVer: '3.56.0-canary.1', installTo: '3.55.0', latest: '3.55.0' });
+    runMaintenanceTick(deps);
+    expect(calls.update).toBe(1);
+  });
+});
+
+describe('autoUpdateDueNow', () => {
+  const base = { now: () => NOON, readState: () => ({}) as MaintenanceState };
+
+  it('is true only when the tick would run the update, and marks nothing', () => {
+    const state: MaintenanceState = {};
+    expect(autoUpdateDueNow({ ...base, readConfig: () => ({ autoUpdate: { enabled: true, time: '12:00' } }),
+      readState: () => state })).toBe(true);
+    expect(state).toEqual({});
+    expect(autoUpdateDueNow({ ...base, readConfig: () => ({ autoUpdate: { enabled: false, time: '12:00' } }) })).toBe(false);
+    expect(autoUpdateDueNow({ ...base, readConfig: () => undefined })).toBe(false);
+    expect(autoUpdateDueNow({ ...base, readConfig: () => ({ autoUpdate: { enabled: true, time: '12:00' } }),
+      readState: () => ({ autoUpdate: { lastDate: TODAY } }) })).toBe(false);
   });
 });
 
