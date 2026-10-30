@@ -2407,6 +2407,22 @@ function relayPickerFilter(entries: RelayPickerEntry[], query: string | undefine
 }
 
 /**
+ * "Show all" button for the no-match state of the search pickers (relay /
+ * quote / adopt). Re-fires the picker's own `*_search` action; a button click
+ * has no `input_value`, so the handler reads the query as '' and re-renders
+ * the full list.
+ */
+function buildClearSearchButton(value: Record<string, unknown>, locale?: Locale): any {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.picker.btn_clear_search', undefined, locale) },
+    type: 'default',
+    width: 'fill',
+    behaviors: [{ type: 'callback', value }],
+  };
+}
+
+/**
  * Card listing the operator's relayable sessions, paginated 5 per page with
  * a search box at the top and a confirm button at the bottom. Layout:
  *
@@ -2529,8 +2545,13 @@ export function buildRelayPickerCard(
   if (filtered.length === 0) {
     elements.push({
       tag: 'markdown',
-      content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
+      content: t('card.relay.empty_filtered', { query: escapeMd(searchQuery) }, locale),
     });
+    // Without this the only way back to the full list is to clear the input
+    // and submit an empty string, which Lark won't fire — the card dead-ends.
+    // A button click carries no input_value, so the relay_search handler
+    // resolves it to '' and re-renders the unfiltered list.
+    elements.push(buildClearSearchButton({ action: 'relay_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
 
@@ -2823,7 +2844,8 @@ export function buildQuotePickerCard(
     return JSON.stringify(wrapQuoteCard(elements, locale));
   }
   if (filtered.length === 0) {
-    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: searchQuery }, locale) });
+    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
+    elements.push(buildClearSearchButton({ action: 'quote_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapQuoteCard(elements, locale));
   }
 
@@ -3213,8 +3235,9 @@ export function buildAdoptSelectCard(
     // markdown element, so an unescaped `![](http://x)` would render as an
     // image (external fetch = tracking beacon / SSRF surface). Neutralising
     // [ ] ` etc. defuses that. (buildRelayPickerCard echoes its query the
-    // same way and shares the same latent risk — tracked separately.)
+    // same way and now escapes it too.)
     elements.push({ tag: 'markdown', content: t('card.adopt.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
+    elements.push(buildClearSearchButton({ action: 'adopt_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapAdoptCard(elements, locale));
   }
 

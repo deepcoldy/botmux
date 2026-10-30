@@ -645,6 +645,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
     cotEnabled: body.cotEnabled,
+    replyCardShowTools: body.replyCardShowTools,
     senderTag: body.senderTag,
     senderTagHideEmail: body.senderTagHideEmail,
     summaryMemory: body.summaryMemory,
@@ -5321,6 +5322,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
+  const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -5335,7 +5337,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
     setCotEnabled(bot.cotEnabled !== false);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setShowTools(bot.replyCardShowTools !== false);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.replyCardShowTools, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -5447,6 +5450,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               const previous = cotEnabled;
               setCotEnabled(checked);
               void savePatch({ cotEnabled: checked }, 'cot', () => setCotEnabled(previous));
+            }}
+          />
+          <ToggleRow
+            checked={showTools}
+            disabled={busy !== null || replyMode === 'legacy'}
+            dataAction="toggle-show-tools"
+            title={tr('botDefaults.replyCardShowTools')}
+            description={tr('botDefaults.replyCardShowToolsDescription')}
+            help={tr(replyMode === 'legacy' ? 'botDefaults.replyCardShowToolsLegacyHelp' : 'botDefaults.replyCardShowToolsHelp')}
+            onChange={checked => {
+              const previous = showTools;
+              setShowTools(checked);
+              void savePatch({ replyCardShowTools: checked }, 'show-tools', () => setShowTools(previous));
             }}
           />
           {replyMode === 'legacy' && pinToggle}

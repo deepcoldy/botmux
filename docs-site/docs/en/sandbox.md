@@ -213,9 +213,13 @@ These apply to both allowlist isolation and scratch:
 
 ---
 
-## 7. Prerequisites in Containers / Restricted Hosts
+## 7. Prerequisites in Containers / Restricted Hosts {#linux-namespace}
 
 The Linux sandbox relies on kernel namespaces, which Docker-style containers and hardened hosts often block by default. Check per mode:
+
+- **Which bwrap**: the distro binary at `/usr/bin/bwrap` or `/bin/bwrap` is always preferred. Only when neither exists is a bwrap from PATH used, with a one-time warning in the daemon log. Codex installs its own build at `~/.local/bin/bwrap`; when that comes first on PATH, sandboxed sessions exit right after launch, and the warning names it. Install the distro `bubblewrap` package to fix it.
+- **Symlinked system directories**: when a baseline directory such as `/opt` is itself a symlink, the sandbox recreates the same symlink inside and binds the real path read-only.
+- **No PID-namespace downgrade in normal deployments**: even when procfs cannot be mounted in a new PID namespace, a normal deployment refuses to start (only the core-only deployment `BOTMUX_CORE_ONLY=1` may drop `--unshare-pid`) — sibling bot workers on the same host hold plaintext credentials in their environment, which a sandbox without PID isolation could read through /proc.
 
 | Required capability | Allowlist isolation | Scratch | Network policy |
 |---|---|---|---|

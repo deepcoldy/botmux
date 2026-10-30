@@ -347,6 +347,15 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(md).not.toContain('![x](');
   });
 
+  it('offers a clear-search button on no match that re-fires adopt_search', () => {
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'ja' }));
+    const buttons = (card.body.elements ?? []).filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].behaviors[0].value.action).toBe('adopt_search');
+    expect(buttons[0].behaviors[0].value.selected).toBe('');
+  });
+
   const herdrLive = (extra: Partial<AdoptableSession> = {}): AdoptableSession => ({
     source: 'herdr',
     herdrSessionName: 'collie',
@@ -853,7 +862,7 @@ describe('buildConfigCard', () => {
     const cliLine = (c: any) => String(adviceBlock(c).content).split('\n').at(-1);
     expect(cliLine(card('unsupported', 'codex-app'))).toBe('当前 CLI：Codex App，暂不支持白名单隔离，请改用 Codex');
     expect(cliLine(card('unverified', 'relay'))).toBe('当前 CLI：Relay，还没验证过，开启前先在测试会话里试一下');
-    expect(cliLine(card('wrapper', 'claude-code'))).toBe('当前 CLI：Claude，通过 wrapper 启动；开启后会跳过 wrapper，直接启动底层 CLI');
+    expect(cliLine(card('wrapper', 'claude-code'))).toBe('当前 CLI：Claude，通过 wrapper 启动。开启白名单隔离后 wrapper 仍在沙盒内运行；若 wrapper 依赖的路径不在白名单内会明确报错拒绝启动，把这些路径加进沙盒白名单（只读/读写）即可');
     expect(String(adviceBlock(card('verified', 'codex', ['allowedChatGroups'])).content)).toContain('原因：allowedChatGroups 授权了整群发言');
     expect(texts(card('wrapper', 'claude-code'))).not.toContain('card.config.sandbox_advice');
 
@@ -2741,6 +2750,32 @@ describe('buildRelayPickerCard', () => {
     expect(containers(card)).toHaveLength(0);
     const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
     expect(allMd).toMatch(/没有匹配|No sessions match/);
+  });
+
+  // Regression: the no-match card used to dead-end — the only way back was to
+  // clear the input and submit '', which Lark doesn't fire. A clear-search
+  // button re-fires relay_search without input_value, so the handler resolves
+  // the query to '' and re-renders the full list.
+  it('offers a clear-search button on no match that re-fires relay_search', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'ja' }));
+    const buttons = card.body.elements.filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    const v = buttons[0].behaviors[0].value;
+    expect(v.action).toBe('relay_search');
+    expect(v.target_chat_id).toBe('oc_t');
+    expect(v.root_id).toBe('om_r');
+    expect(v.invoker_open_id).toBe('ou_invoker_test');
+    expect(v.selected).toBe('');
+    // Not shown when the search has hits.
+    const hit = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'session 1' }));
+    expect(hit.body.elements.filter((e: any) => e.tag === 'button')).toHaveLength(0);
+  });
+
+  it('escapes the echoed search query in the no-match message', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: '![x](http://evil/b)' }));
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toContain('\\[x\\]');
+    expect(allMd).not.toContain('![x](');
   });
 
   // Regression (申晗现场): a p2p entry's chatLabel is the raw DM chatId while

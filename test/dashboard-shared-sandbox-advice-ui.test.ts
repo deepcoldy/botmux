@@ -53,8 +53,12 @@ describe('Dashboard shared-bot sandbox advice', () => {
   });
 
   it('renders the wrapper / custom-runtime caveat states from the daemon payload', () => {
-    expect(render({ cliId: 'claude-code', wrapperCli: 'aiden --' }))
-      .toContain('data-shared-sandbox-advice="wrapper"');
+    const wrapperHtml = render({ cliId: 'claude-code', wrapperCli: 'aiden --' });
+    expect(wrapperHtml).toContain('data-shared-sandbox-advice="wrapper"');
+    // Post-#2548 the wrapper runs INSIDE the sandbox; the copy must not say it is
+    // skipped/dropped (which would scare wrapper users off enabling isolation).
+    expect(wrapperHtml).toContain('wrapper 仍在沙盒内运行');
+    expect(wrapperHtml).not.toContain('跳过 wrapper');
     expect(render({ cliId: 'claude-code', cliRuntime: { id: 'r', executable: '/x' } as BotDefaultsRow['cliRuntime'] }))
       .toContain('data-shared-sandbox-advice="unverified"');
   });

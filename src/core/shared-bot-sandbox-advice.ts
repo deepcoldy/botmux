@@ -98,9 +98,14 @@ export interface SharedBotSandboxAdviceInput {
   allowedUsersCount: number | null | undefined;
   triggerUserAuthEnabled: boolean | null | undefined;
   /**
-   * Launcher wrapper configured (cfg.wrapperCli): under the sandbox the worker
-   * logs "wrapperCli ignored" and launches the bare CLI, so "verified" cannot
-   * be promised for the shape the bot actually runs today.
+   * Launcher wrapper configured (cfg.wrapperCli). Since #2548 the wrapper runs
+   * INSIDE the file sandbox on local pty/tmux backends (buildsSandboxWrapperLaunch),
+   * so it is not dropped — but its launch shape differs from the stock CLI the
+   * matrix tested, and paths its launcher needs must be allowlisted
+   * (sandboxPaths readOnly/readWrite) or the session refuses with a clear
+   * preflight error. That caveat is what the "wrapper" verdict conveys. (On a
+   * sandbox-incapable backend the wrapper is ignored, but that case is already
+   * the "blocked" verdict above.)
    */
   wrapperCli?: string | null | undefined;
   /** Custom cliRuntime configured: the matrix only covered stock runtimes. */
