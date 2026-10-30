@@ -69,10 +69,10 @@ const SERVER_BOOT_DEADLINE_MS = 5000;
 const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // Bound automatic agent detection after explicitly running the launcher in a
 // new pane. Input readiness remains gated by the worker's onAgentStatus hook.
-// 60s rather than 30s: on a loaded host (load ≈ 25 measured) a cold CLI start
+// 60s rather than 30s: on a heavily loaded host a cold CLI start
 // plus herdr's own detection can exceed 30s, and the failure is terminal for
 // a session started by an inbound message (no daemon-side startup auto-retry).
-const PANE_AGENT_START_TIMEOUT_MS = 60_000;
+export const PANE_AGENT_START_TIMEOUT_MS = 60_000;
 const PANE_AGENT_DETECTION_POLL_MS = 100;
 // A started launcher deletes itself. This fallback only reaps one Herdr never
 // ran, and is long enough for a macOS Gatekeeper assessment of the exec to end.
@@ -166,24 +166,27 @@ function requiredJsonCommand(
     const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : err?.stderr?.toString?.().trim();
     const stdout = typeof err?.stdout === 'string' ? err.stdout.trim() : err?.stdout?.toString?.().trim();
     const detail = stderr || stdout;
-    throw new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`);
+    // No output at all, or our own exec deadline killed it: herdr did not
+    // answer (slow host), as opposed to answering with an error.
+    // A spawn error (ENOENT, EACCES, …) carries an errno code and is not transient.
+    const transient = err?.code === 'ETIMEDOUT' || err?.killed === true || (!detail && !err?.code);
+    throw Object.assign(new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`),
+      transient ? { herdrTransient: true } : {});
   }
   if (!raw) {
     if (opts?.allowEmpty) return undefined;
-    throw new Error(`${operation} failed: empty response`);
+    throw Object.assign(new Error(`${operation} failed: empty response`), { herdrTransient: true });
   }
   let value: any;
   try {
     value = JSON.parse(raw);
   } catch {
-    throw new Error(`${operation} failed: invalid JSON response`);
+    throw Object.assign(new Error(`${operation} failed: invalid JSON response`), { herdrTransient: true });
   }
   if (value?.error) {
     const code = typeof value.error.code === 'string' ? value.error.code : 'unknown_error';
     const message = typeof value.error.message === 'string' ? value.error.message : 'unknown error';
-    // A structured herdr error is an answer, not a stall: callers that poll
-    // through transient command failures must still stop on it.
-    throw Object.assign(new Error(`${operation} failed: ${code}: ${message}`), { herdrStructuredError: true });
+    throw new Error(`${operation} failed: ${code}: ${message}`);
   }
   return value;
 }
@@ -1210,14 +1213,16 @@ export class HerdrBackend implements SessionBackend {
             { timeout: Math.max(1, Math.min(5000, detectionDeadline - Date.now())), env: this.childEnv },
           );
         } catch (err: any) {
-          // One slow/failed poll on a loaded host (the CLI timed out, no output)
-          // is not a verdict on the launch: keep polling until the deadline.
-          // A structured herdr error is, and still fails the launch at once.
-          if (err?.herdrStructuredError) throw err;
-          lastListError = err instanceof Error ? err : new Error(String(err));
+          // A poll herdr did not answer (timed out / no output / empty / not
+          // JSON) on a loaded host is not a verdict on the launch: keep polling
+          // until the deadline. Anything herdr actually answered with — a JSON
+          // error on stdout or stderr, a missing binary — still fails at once.
+          if (!err?.herdrTransient) throw err;
+          lastListError = err;
           sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
           continue;
         }
+        lastListError = undefined;
         const agent = extractAgents(listed).find(row => row?.pane_id === paneId && !agentRowExited(row));
         if (agent?.agent === kind) {
           detected = true;

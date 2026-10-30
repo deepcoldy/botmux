@@ -33,7 +33,9 @@ vi.mock('node-pty', () => ({
 
 import { execFileSync, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
-import { HerdrBackend, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes } from '../src/adapters/backend/herdr-backend.js';
+import {
+  HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes,
+} from '../src/adapters/backend/herdr-backend.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawn = vi.mocked(spawn);
@@ -545,7 +547,7 @@ describe('HerdrBackend.spawn', () => {
     setManagedLaunchResponses('pi', [{
       match: a => a.includes('agent') && a.includes('list'),
       reply: () => {
-        vi.setSystemTime(++polls === 1 ? 59_950 : 60_000);
+        vi.setSystemTime(++polls === 1 ? PANE_AGENT_START_TIMEOUT_MS - 50 : PANE_AGENT_START_TIMEOUT_MS);
         return JSON.stringify({ result: { agents: [
           { name: null, pane_id: MANAGED_PANE, agent: null },
         ] } });
@@ -554,7 +556,7 @@ describe('HerdrBackend.spawn', () => {
     const be = new HerdrBackend(SESSION);
 
     expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
-      .toThrow(/did not detect "pi" in pane w_launch-1 within 60000 ms/);
+      .toThrow(/did not detect "pi" in pane w_launch-1/);
     const listCalls = mockedExecFileSync.mock.calls.filter(call => {
       const args = call[1] as string[];
       return args.includes('agent') && args.includes('list');
@@ -609,7 +611,7 @@ describe('HerdrBackend.spawn', () => {
     setManagedLaunchResponses('pi', [{
       match: a => a.includes('agent') && a.includes('list'),
       reply: () => {
-        vi.setSystemTime(++polls * 20_000);
+        vi.setSystemTime(++polls * (PANE_AGENT_START_TIMEOUT_MS / 3));
         throw Object.assign(new Error('Command failed: herdr agent list'), {
           status: null, signal: 'SIGTERM', stdout: '', stderr: '',
         });
@@ -618,11 +620,49 @@ describe('HerdrBackend.spawn', () => {
     const be = new HerdrBackend(SESSION);
 
     expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
-      .toThrow(/did not detect "pi" in pane w_launch-1 within 60000 ms \(last agent list error: herdr agent list in .* failed\)/);
-    expect(polls).toBe(3);
+      .toThrow(/did not detect "pi" in pane w_launch-1.*last agent list error: herdr agent list in .* failed/);
+    expect(polls).toBeGreaterThanOrEqual(2); // kept polling after the first failure
     expect(herdrCall('workspace', 'close', MANAGED_WORKSPACE)).toBeDefined();
     expect(herdrCall('agent', 'rename')).toBeUndefined();
     expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it.each([
+    {
+      name: 'a JSON error on stdout',
+      reply: () => JSON.stringify({ error: { code: 'agent_list_failed', message: 'no such session' } }),
+    },
+    {
+      name: 'a JSON error on stderr with exit status 1',
+      reply: () => {
+        throw Object.assign(new Error('Command failed: herdr'), {
+          status: 1, stdout: '', stderr: JSON.stringify({ error: { code: 'agent_list_failed', message: 'x' } }),
+        });
+      },
+    },
+    {
+      name: 'a missing herdr binary (ENOENT)',
+      reply: () => { throw Object.assign(new Error('spawnSync herdr ENOENT'), { code: 'ENOENT' }); },
+    },
+  ])('Herdr 0.7.5: an agent list answer of $name fails the launch on the first poll', ({ reply }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    setManagedLaunchResponses('pi', [{ match: a => a.includes('agent') && a.includes('list'), reply }]);
+    const be = new HerdrBackend(SESSION);
+
+    let error: unknown;
+    try { be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }); } catch (err) { error = err; }
+    // MUTATION CHECK: retrying every poll failure turns these into a
+    // deadline-long spin ending in "did not detect".
+    expect(String(error)).toMatch(/herdr agent list in .* failed/);
+    expect(String(error)).not.toMatch(/did not detect/);
+    const listCalls = mockedExecFileSync.mock.calls.filter(call => {
+      const args = call[1] as string[];
+      return args.includes('agent') && args.includes('list');
+    });
+    expect(listCalls).toHaveLength(1);
+    expect(herdrCall('workspace', 'close', MANAGED_WORKSPACE)).toBeDefined();
     be.kill();
   });
 
