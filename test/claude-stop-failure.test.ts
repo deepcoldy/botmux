@@ -534,12 +534,12 @@ describe('transcriptApiErrorRecordSince', () => {
     expect(transcriptApiErrorRecordSince(path, at('2026-10-30T02:41:16.000Z'), 8 * 1024)).toBeUndefined();
   });
 
-  it('looks past screenshot-sized lines written after the record', () => {
+  it('finds the record past screenshot-sized lines written after it', () => {
     const path = transcriptOf([
       { ...transcriptRecord, uuid: 'rec-uuid', timestamp: '2026-10-30T02:42:15.000Z' },
       { type: 'user', timestamp: '2026-10-30T02:42:16.000Z', message: { content: 'z'.repeat(200 * 1024) } },
     ]);
-    expect(transcriptApiErrorRecordSince(path, at('2026-10-30T02:41:16.000Z'), 150 * 1024)).toBe('rec-uuid');
+    expect(transcriptApiErrorRecordSince(path, at('2026-10-30T02:41:16.000Z'))).toBe('rec-uuid');
   });
 });
 
