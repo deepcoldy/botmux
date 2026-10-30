@@ -375,7 +375,10 @@ describe('real CLI send into a running reply card', () => {
 
   it.each([
     ['isolated (no host secret): hands the row to the daemon', false],
-    ['host (secret readable): reports the local failure, no relay', true],
+    // A CLI's own sandbox (e.g. a workspace-write policy) can deny the store
+    // write while the host secret stays readable: the row must still reach
+    // the daemon instead of being dropped.
+    ['host secret readable (CLI-own sandbox): still hands the row to the daemon', true],
   ])('when the feedback store cannot be opened — %s', (_label, hostSecret) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-index-'));
     const dataDir = join(root, 'data');
@@ -445,11 +448,7 @@ describe('real CLI send into a running reply card', () => {
         .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
       const posts = requests.filter(r => r.method === 'POST');
       expect(posts[0]).toMatchObject({ path: `/api/sessions/${key.sessionId}/durable-send` });
-      const relayed = posts.filter(r => r.path.endsWith('/turn-delivery'));
-      if (hostSecret) {
-        expect(relayed).toHaveLength(0);
-        expect(String(result.stderr)).toContain('turn delivery indexing failed after delivery');
-      } else {
+      {
         expect(posts).toHaveLength(2);
         expect(posts[1]).toMatchObject({
           method: 'POST',
@@ -457,6 +456,9 @@ describe('real CLI send into a running reply card', () => {
           body: { messageId: 'om_durable_message' },
         });
         expect(posts[1].body.content).toContain('Indexed final');
+        // The turn this CLI answered, so the daemon refuses rather than
+        // indexing under a turn it has since moved on to.
+        expect(posts[1].body.expectedTurnId).toBe(key.turnId);
         // Correlation fields are the daemon's to derive, never the CLI's.
         for (const field of ['turnId', 'sessionId', 'chatId', 'botAppId', 'policy']) {
           expect(posts[1].body).not.toHaveProperty(field);

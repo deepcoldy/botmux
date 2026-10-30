@@ -66,6 +66,8 @@ describe('Midscene master failure notification', () => {
     });
     expect(cases.map((c) => c.name)).toEqual(['bad', 'late']);
     expect(problemCases(null)).toEqual([]);
+    // The Feishu job never started: its cases are not run for that one reason.
+    expect(problemCases({ cases: [{ name: 'late', status: 'not-run' }, { name: 'bad', status: 'failed' }] }, { feishuRan: false }).map((c) => c.name)).toEqual(['bad']);
   });
 
   it('counts a queue timeout as a failure, and a green or skipped run as none', () => {

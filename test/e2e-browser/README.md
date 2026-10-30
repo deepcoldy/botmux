@@ -38,6 +38,7 @@ first (`LONG_LANES_FIRST` in `lanes.ts`); on CI a failed case runs once more.
 | `core-dm-modes-claude` / `core-dm-modes-codex` | Private-chat modes `chat`, `thread` (topic), `group` (session group) |
 | `core-group-modes` | Claude and Codex in the test group: reply modes `chat-topic` / `chat` / `topic` / `new-topic`, @ policies `always` / `never` / `ambient` / `topic` |
 | `core-clis` | Public CLIs in their private chats: OpenCode, Pi, Oh My Pi (`OhMyPi`), Kimi, Gemini, Grok |
+| `core-sandbox` | `ClaudeSandbox` (Claude Code, `sandbox: true`): from inside the session's shell, home and harness secrets are hidden, writes stay in the working directory |
 | `full-bots` | Internal CLIs Aiden and CoCo (not installed on CI), reply smoke |
 | `full-group` | Group @mention routing, group topic replies, bot collaboration |
 | `full-claude-ui` | Card lifecycle, private topic mode, image/text mix, web terminal |

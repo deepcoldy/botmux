@@ -28,10 +28,11 @@ export const BROWSER_CONFIG = {
 
 /**
  * The test bots, named after their CLI. Claude, Codex and the public CLIs of
- * the core-clis lane run on CI against the mock LLM; Aiden and CoCo are
- * internal CLIs that only run where they are installed.
+ * the core-clis lane run on CI against the mock LLM; ClaudeSandbox is Claude
+ * Code with `sandbox: true` (core-sandbox lane); Aiden and CoCo are internal
+ * CLIs that only run where they are installed.
  */
-export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden', 'Pi', 'OhMyPi', 'Kimi', 'Gemini', 'Grok'] as const;
+export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden', 'Pi', 'OhMyPi', 'Kimi', 'Gemini', 'Grok', 'ClaudeSandbox'] as const;
 export type BotName = (typeof BOT_NAMES)[number];
 
 // ---------------------------------------------------------------------------
