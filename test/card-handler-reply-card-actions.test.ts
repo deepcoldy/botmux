@@ -66,6 +66,7 @@ vi.mock('../src/services/session-store.js', () => ({
 }));
 
 const readableTerminalUrlMock = vi.fn(() => 'https://example.com/term');
+const liveReadableTerminalUrlMock = vi.fn(() => 'https://example.com/term');
 const isSessionTransferringMock = vi.fn(() => false);
 const sessionAcceptsDirectCommandMock = vi.fn(() => true);
 const closeSessionMock = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false }));
@@ -88,7 +89,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   workerHasInitialized: vi.fn(() => true),
   sessionSupportsWebTerminal: vi.fn(() => true),
   readableTerminalUrlFor: (...args: any[]) => readableTerminalUrlMock(...args),
-  liveReadableTerminalUrlFor: (...args: any[]) => readableTerminalUrlMock(...args),
+  liveReadableTerminalUrlFor: (...args: any[]) => liveReadableTerminalUrlMock(...args),
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: (...args: any[]) => deliverWriteLinkCardMock(...args),
   deliverEphemeralOrReply: (...args: any[]) => deliverEphemeralOrReplyMock(...args),
@@ -261,6 +262,7 @@ beforeEach(() => {
   } as any);
   isSessionTransferringMock.mockReset().mockReturnValue(false);
   readableTerminalUrlMock.mockReset().mockReturnValue('https://example.com/term');
+  liveReadableTerminalUrlMock.mockReset().mockReturnValue('https://example.com/term');
   sessionAcceptsDirectCommandMock.mockReset().mockReturnValue(true);
   closeSessionMock.mockClear();
   deliverWriteLinkCardMock.mockClear();
@@ -577,6 +579,25 @@ describe('model catalogue selection key', () => {
 // ─── P2-c: bound-to-platform deployments get the read-only front door ──────
 
 describe('reply_card_menu terminal option under a bound platform', () => {
+  it('offers the session recovery link from the menu when there is no live worker', async () => {
+    enableMenu();
+    remoteAccessEnabledMock.mockReturnValue(true);
+    platformTerminalBaseUrlMock.mockReturnValue('https://t-m1.example.com');
+    setTerminalProxyPort(9100);
+    const ds = makeDs({ worker: null, workerReady: false, workerPort: null,
+      sessionOverrides: { webPort: 9000 } });
+    const recoveryUrl = 'https://t-m1.example.com/s/sess-menu-1?viewToken=recovery-view';
+    readableTerminalUrlMock.mockReturnValue(recoveryUrl);
+    liveReadableTerminalUrlMock.mockReturnValue('');
+    const result = await handleCardAction(menuData('terminal'), depsWith(ds), LARK_APP_ID);
+    expect(deliverWriteLinkCardMock).not.toHaveBeenCalled();
+    expect(deliverEphemeralOrReplyMock).toHaveBeenCalledTimes(1);
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    const open = card.elements.find((e: any) => e.tag === 'action').actions.find((b: any) => b.multi_url);
+    expect(open.multi_url.url).toBe(recoveryUrl);
+    expect(result.toast).toBeUndefined();
+  });
+
   it('delivers a read-only card (no write token, manage buttons off) and no write-link toast', async () => {
     enableMenu();
     remoteAccessEnabledMock.mockReturnValue(true);

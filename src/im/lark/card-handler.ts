@@ -91,7 +91,7 @@ import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.
 import { selectionKeyForBot } from '../../setup/cli-selection.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -1444,7 +1444,7 @@ async function deliverMenuTerminalLink(
   // Riff sessions are excluded: their AIO Sandbox URL is only produced on the
   // write path (their read URL falls back to the local log-view terminal).
   if (platformTerminalReadEntryActive() && !ds.riffAccessUrl) {
-    const readUrl = liveReadableTerminalUrlFor(ds);
+    const readUrl = readableTerminalUrlFor(ds);
     if (readUrl) {
       const cardJson = buildSessionCard(
         ds.session.sessionId,

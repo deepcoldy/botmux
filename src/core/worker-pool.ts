@@ -1595,7 +1595,8 @@ export function readableTerminalUrlFor(ds: DaemonSession): string {
 export function liveReadableTerminalUrlFor(ds: DaemonSession): string {
   if (!sessionSupportsWebTerminal(ds)) return '';
   if (!ds.worker || ds.worker.killed) return '';
-  if (ds.workerReady === false) return '';
+  // The terminal server outlives the CLI during restart/diagnostic parking.
+  // Prompt readiness does not determine whether the worker's port is usable.
   if (!ds.workerPort) return '';
   return buildTerminalUrl(ds);
 }

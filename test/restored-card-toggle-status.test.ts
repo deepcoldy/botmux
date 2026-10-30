@@ -451,4 +451,20 @@ describe('Web Terminal link on a restored session', () => {
     expect(terminalLinkOf(card)).toBeUndefined();
     expect(JSON.stringify(card)).not.toContain(`:${PERSISTED_PORT}`);
   });
+
+  it.each([
+    { name: 'direct', proxyPort: 0 },
+    { name: 'proxy', proxyPort: 17_700 },
+  ])('keeps the diagnostic terminal on the $name card after repeated display toggles', async ({ proxyPort }) => {
+    if (proxyPort) setTerminalProxyPort(proxyPort);
+    const ds = restored({ worker: makeFakeWorker(), workerReady: false, workerPort: 40_001,
+      crashDiagnosticParked: true, lastScreenStatus: 'idle' });
+    const deps = activate(ds);
+    for (let i = 0; i < 2; i++) {
+      const card = await toggleCurrent(ds, deps);
+      expect(terminalLinkOf(card)).toContain(proxyPort ? `/s/${ds.session.sessionId}` : ':40001');
+    }
+    expect(ds.workerReady).toBe(false);
+    expect(ds.crashDiagnosticParked).toBe(true);
+  });
 });
