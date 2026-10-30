@@ -8558,7 +8558,6 @@ esac
     });
 
     it.each([
-      [{ sandbox: true }, 'wrapper_sandbox_conflict'],
       [{ readIsolation: true }, 'wrapper_read_isolation_conflict'],
       [{ codexAuthSync: 'isolated' }, 'wrapper_isolated_auth_conflict'],
       [{ serviceTier: 'priority' }, 'service_tier_catalog_unavailable'],
@@ -8571,6 +8570,13 @@ esac
       expect(await response.json()).toMatchObject({ error });
       expect(readFileSync(configPath, 'utf8')).toBe(before);
       expect(getBot(appId).config).toEqual(memory);
+    });
+
+    it('saves a wrapper on a sandboxed bot (the wrapper runs inside the sandbox)', async () => {
+      await setup({ cliId: 'codex', wrapperCli: 'codex --profile withhooks', sandbox: true });
+      const response = await save({ cliId: 'codex', model: 'changed' });
+      expect(response.status).toBe(200);
+      expect(getBot(appId).config).toMatchObject({ wrapperCli: 'codex --profile withhooks', sandbox: true, model: 'changed' });
     });
 
 

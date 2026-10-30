@@ -3,6 +3,7 @@ import {
   alreadyNotified,
   commentBody,
   failureReasons,
+  feishuJobRan,
   mergedPullRequests,
   previousTestedSha,
   problemCases,
@@ -66,6 +67,25 @@ describe('Midscene master failure notification', () => {
     });
     expect(cases.map((c) => c.name)).toEqual(['bad', 'late']);
     expect(problemCases(null)).toEqual([]);
+    // The Feishu job never started: its cases are not run for that one reason.
+    expect(problemCases({ cases: [{ name: 'late', status: 'not-run' }, { name: 'bad', status: 'failed' }] }, { feishuRan: false }).map((c) => c.name)).toEqual(['bad']);
+  });
+
+  it('knows the Feishu job ran only when the queue job neither failed nor was cancelled', () => {
+    // The Feishu job needs the queue job: these two mean it never started.
+    expect(feishuJobRan('failure')).toBe(false);
+    expect(feishuJobRan('cancelled')).toBe(false);
+    // It acquired the slot and ran (even if later interrupted).
+    expect(feishuJobRan('success')).toBe(true);
+    // An absent or unanticipated value keeps listing rows rather than hiding them.
+    expect(feishuJobRan(undefined)).toBe(true);
+    expect(feishuJobRan('skipped')).toBe(true);
+
+    const manifest = { cases: [{ name: 'late', status: 'not-run' }, { name: 'bad', status: 'failed' }] };
+    for (const queueResult of ['failure', 'cancelled'] as const) {
+      expect(problemCases(manifest, { feishuRan: feishuJobRan(queueResult) }).map((c) => c.name)).toEqual(['bad']);
+    }
+    expect(problemCases(manifest, { feishuRan: feishuJobRan('success') }).map((c) => c.name)).toEqual(['bad', 'late']);
   });
 
   it('counts a queue timeout as a failure, and a green or skipped run as none', () => {

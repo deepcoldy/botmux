@@ -2,6 +2,7 @@ import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { findKimiSessionForBotmuxSession, isKimiSessionId } from './kimi-session.js';
 
 import { delay } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
@@ -14,10 +15,15 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'kimi',
-    authPaths: ['~/.kimi-code/credentials', '~/.kimi-code/oauth'],
+    // Kimi's whole data dir: under the oncall sandbox its sessions,
+    // session_index.jsonl and config.toml must persist on the host, or every
+    // restart starts over and the resume lookup below finds nothing. The
+    // binaries next to them stay read-only (sandboxReadonlyPaths, deeper wins).
+    authPaths: ['~/.kimi-code'],
+    sandboxReadonlyPaths: () => ['~/.kimi-code/bin'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ resume, resumeSessionId, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, env, model, disableCliBypass }) {
       const args: string[] = [];
       if (!disableCliBypass) {
         args.push('--yolo');
@@ -26,33 +32,28 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
         args.push('--model', model.trim());
       }
       if (!resume) return args;
-      if (resumeSessionId) return [...args, '--resume', resumeSessionId];
-      // No persisted session id: start FRESH, never `--continue`. Kimi's
-      // `--continue` resumes the most recent session, which is shared across
-      // every botmux session of this bot (same Kimi config home). A worker
-      // restart whose cliSessionId was never captured would then silently load
-      // a SIBLING session's conversation — e.g. a topic group's context
-      // leaking into a private chat. Losing this session's context is the
-      // lesser evil; matches reasonix/antigravity, which reject `--continue`
-      // for the same "most recent is racy" reason.
-      //
-      // 已知回退：Kimi 适配器目前没有任何 cliSessionId 捕获机制（无 bridge、
-      // 无 observation、无 output capture），「缺 id」是常态而非边角。移除
-      // `--continue` 后，Kimi 会话在每次 worker 重启（崩溃 / idle 回收 /
-      // 部署）后都新起干净会话，丧失跨重启恢复能力——`--continue` 曾是唯一的
-      // 跨重启恢复路径。后续需补 session id 捕获才能恢复精确 resume。
-      return args;
+      // Kimi resumes only a session it minted itself (`--session <id>`, see
+      // kimi-session.ts), so find it by the botmux session id. Never
+      // `--continue`: it resumes the most recent session of this working dir,
+      // which may be a sibling botmux session's.
+      const kimiSessionId = isKimiSessionId(resumeSessionId)
+        ? resumeSessionId
+        : findKimiSessionForBotmuxSession(sessionId, workingDir, { ...process.env, ...env });
+      return kimiSessionId ? [...args, '--session', kimiSessionId] : args;
     },
 
-    buildResumeCommand({ cliSessionId }) {
-      if (!cliSessionId) return null;
-      return `kimi --resume ${cliSessionId}`;
+    buildResumeCommand({ sessionId, cliSessionId }) {
+      const id = isKimiSessionId(cliSessionId) ? cliSessionId : findKimiSessionForBotmuxSession(sessionId, undefined);
+      return id ? `kimi --session ${id}` : null;
     },
 
-    // buildArgs can only resume a precise id (no --continue fallback — it
-    // would resume the globally most recent session, a sibling-context leak).
-    // Tells the worker to demote resume-without-id to a fresh launch + notify.
-    resumeRequiresCliSessionId: true,
+    // No session found for this botmux session → the worker starts fresh and
+    // says so once, instead of `--session` exiting on "Session … not found".
+    resumeFindsOwnSession: true,
+    checkResumeTargetExists({ sessionId, cliSessionId, workingDir, env }) {
+      if (isKimiSessionId(cliSessionId)) return undefined;
+      return findKimiSessionForBotmuxSession(sessionId, workingDir, env ?? process.env) !== undefined;
+    },
 
     async writeInput(pty: PtyHandle, content: string) {
       try {

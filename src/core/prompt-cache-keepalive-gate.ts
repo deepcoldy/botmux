@@ -19,7 +19,9 @@
  * purpose rather than relying on how far a whole-screen scan happens to reach.
  */
 import { claudeActionPrompt } from '../services/claude-action-prompt.js';
+import { codexNativeComposerState } from '../services/codex-terminal-session.js';
 import { screenShowsFramedPrompt } from '../utils/input-gate.js';
+import type { PtyHandle } from '../adapters/cli/types.js';
 
 export interface PromptCacheKeepaliveWriteProbe {
   hasBackend: boolean;
@@ -34,6 +36,10 @@ export interface PromptCacheKeepaliveWriteProbe {
    *  undefined when this backend has no authoritative screen. */
   screen?: string;
   readyPattern?: RegExp;
+  /** Unattended Codex maintenance uses cursor + native footer evidence rather
+   * than Claude's framed-composer shape. Omitted for Claude keep-alives. */
+  cliId?: string;
+  codexInputState?: ReturnType<NonNullable<PtyHandle['captureInputState']>>;
 }
 
 export type PromptCacheKeepaliveRefusal =
@@ -56,6 +62,12 @@ export function promptCacheKeepaliveRefusal(probe: PromptCacheKeepaliveWriteProb
   if (probe.tuiPromptOpen) return 'tui_prompt_open';
   if (probe.bareShell) return 'bare_shell';
   if (probe.inputPending) return 'input_pending';
+  if (probe.cliId === 'codex') {
+    if (!probe.codexInputState) return 'no_screen_evidence';
+    const state = codexNativeComposerState(probe.codexInputState);
+    if (state === 'draft') return 'composer_not_empty';
+    return state === 'empty' ? undefined : 'prompt_not_framed';
+  }
   if (!probe.screen || !probe.readyPattern) return 'no_screen_evidence';
   if (claudeActionPrompt(probe.screen)) return 'action_prompt_open';
   if (!screenShowsFramedPrompt(probe.screen, probe.readyPattern)) return 'prompt_not_framed';
