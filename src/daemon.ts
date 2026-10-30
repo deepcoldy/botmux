@@ -72,7 +72,7 @@ import {
   type OverloadCardBrowser,
 } from './core/host-overload-alert.js';
 import { registerOverloadNonce } from './im/lark/overload-nonce.js';
-import { settleCotMessageForShutdown, sweepOrphanCotMessages } from './im/lark/cot-message.js';
+import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages } from './im/lark/cot-message.js';
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
@@ -32883,7 +32883,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // old process, so without this they spin on「执行中」forever). Scoped to
   // THIS bot's markers: the orphan dir is shared across per-bot PM2 daemons.
   if (selfDaemonLarkAppId) {
-    void sweepOrphanCotMessages(selfDaemonLarkAppId).catch(() => { /* cosmetic */ });
+    const cotAppId = selfDaemonLarkAppId;
+    void sweepOrphanCotMessages(cotAppId, binding => {
+      const session = sessionStore.getOwnedSession(binding.sessionId);
+      return !!session && session.chatId === binding.chatId
+        && cotRecoveryMatches({ session, larkAppId: cotAppId }, binding);
+    }).catch(() => { /* cosmetic */ });
     void sweepInterruptedReplyCards(selfDaemonLarkAppId).catch(() => { /* cosmetic */ });
   }
 

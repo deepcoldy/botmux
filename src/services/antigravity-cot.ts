@@ -264,6 +264,19 @@ export function startAntigravityCot(
     }
   }
 
+  // Restore correlation for a tool that started before this reader attached,
+  // without replaying any old thinking or tool-call display entries.
+  const pendingTools: Array<{ id: string; name: string }> = [];
+  if (initialOffset > 0 && transcriptPath) {
+    const primed = scanJsonlFromOffset(transcriptPath, 0, {
+      endOffset: initialOffset,
+      onLine: line => {
+        try { extractAntigravityCotEntriesFromRecord(JSON.parse(line), pendingTools); } catch { /* partial line */ }
+      },
+    });
+    initialOffset = primed?.newOffset ?? initialOffset;
+  }
+
   const pollInterval = opts?.pollIntervalMs ?? POLL_INTERVAL_MS;
   const timer = setInterval(() => {
     const current = readers.get(cliSessionId);
@@ -279,7 +292,7 @@ export function startAntigravityCot(
     offset: initialOffset,
     timer,
     watcher: null,
-    pendingTools: [],
+    pendingTools,
     onEntries,
   };
 
