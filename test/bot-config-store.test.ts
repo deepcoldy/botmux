@@ -285,6 +285,48 @@ describe('bot-config store', () => {
     expect(readConfig().sandboxNetwork).toBe(false);
   });
 
+  it.runIf(process.platform === 'linux')('judges a network policy on the backend new sessions launch on (daemon default when not overridden)', async () => {
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] };
+    // No override: new sessions run on the daemon default (tmux), where the
+    // worker refuses the policy. Saving must not report success.
+    {
+      const { store } = await loaded({ sandbox: true });
+      const result = await store.applyConfigField('app_default', store.findConfigField('sandboxNetworkPolicy')!, policy);
+      expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('tmux 后端') });
+      expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+    }
+    process.env.BACKEND_TYPE = 'pty';
+    try {
+      const { store } = await loaded({ sandbox: true });
+      expect((await store.applyConfigField('app_default', store.findConfigField('sandboxNetworkPolicy')!, policy)).ok).toBe(true);
+      expect(readConfig().sandboxNetworkPolicy).toEqual(policy);
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
+  it.runIf(process.platform === 'linux')('reconciles CLI and daemon-default backend when judging a network policy', async () => {
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] };
+    // A remote CLI dictates its own backend even without an override: the save
+    // is refused and the message names that backend.
+    {
+      const { store } = await loaded({ sandbox: true, cliId: 'riff' });
+      const result = await store.applyConfigField('app_default', store.findConfigField('sandboxNetworkPolicy')!, policy);
+      expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('riff') });
+      expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+    }
+    // A local CLI on a daemon whose default backend is remote is paired back
+    // onto pty, so the policy is valid and saving succeeds.
+    process.env.BACKEND_TYPE = 'riff';
+    try {
+      const { store } = await loaded({ sandbox: true, cliId: 'claude-code' });
+      expect((await store.applyConfigField('app_default', store.findConfigField('sandboxNetworkPolicy')!, policy)).ok).toBe(true);
+      expect(readConfig().sandboxNetworkPolicy).toEqual(policy);
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
     const { store } = await freshModules();
     const keys = store.CONFIG_FIELDS.map(f => f.key);
@@ -1601,6 +1643,39 @@ describe('bot-config store', () => {
     expect(readConfig().sandbox).toBeUndefined();
     // 内存态可能由配置归一化填默认 false（盘上缺省才是契约）；关键是不能落成 scratch。
     expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+  });
+
+  it('updateBotSandboxPaths refuses `/` / HOME / botmux home and relative entries as readWrite and leaves bots.json untouched', async () => {
+    const { registry } = await loaded({ sandbox: true, sandboxPaths: { readOnly: ['/opt/ref'] } });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const { homedir } = await import('node:os');
+    for (const bad of ['/', '//', '~', `${homedir()}/`, '~/.botmux', '~/..', '..', '../..', './rel']) {
+      const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj', bad] });
+      expect(r.ok, bad).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toBe('sandbox_paths_forbidden_read_write');
+        expect(r.message).toContain(`「${bad}」`);
+        expect(r.forbiddenReadWrite?.map(f => f.path)).toEqual([bad]);
+      }
+    }
+    expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
+    expect(registry.getBot('app_default').config.sandboxPaths?.readWrite).toEqual([]);
+    // Relative entries in the other tiers are refused by the shape check too.
+    for (const tiers of [{ readOnly: ['../x'] }, { deny: ['rel/y'] }]) {
+      const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj'], ...tiers });
+      expect(r.ok, JSON.stringify(tiers)).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toBe('sandbox_paths_relative_entry');
+        expect(r.message).toContain('绝对路径');
+      }
+    }
+    expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
+    // Same roots as readOnly, and deeper paths as readWrite, still save.
+    const ok = await sandboxStore.updateBotSandboxPaths('app_default', {
+      readWrite: ['~/projects/app'], readOnly: ['/', '~'],
+    });
+    expect(ok.ok).toBe(true);
+    expect(readConfig().sandboxPaths).toEqual({ readWrite: ['~/projects/app'], readOnly: ['/', '~'] });
   });
 
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {

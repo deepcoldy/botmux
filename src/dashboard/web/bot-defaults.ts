@@ -390,8 +390,15 @@ export type BotDefaultsRow = {
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;
+  /** Host nameservers usable as dnsServers (Linux), for the editor's starting template. */
+  sandboxNetworkHostDns?: string[];
+  /** Proxy variable names set for this bot's workers (daemon env + bot env). */
+  sandboxNetworkProxyEnv?: string[];
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
+  /** Stored readWrite entries that are `/`, HOME, the botmux data root or an
+   *  ancestor of them: no longer accepted on save, run as readOnly. */
+  sandboxPathsForbiddenReadWrite?: string[];
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */

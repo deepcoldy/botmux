@@ -72,7 +72,7 @@ import { store } from './store.js';
 import { toast } from './toast.js';
 import { sendJson, type DashboardJsonResponse } from './dashboard-api.js';
 import { cliAvailabilityStatus, cliAvailabilityRevision, useCliAvailability } from './cli-availability.js';
-import { caughtErrorText, responseErrorText, saveBotField, type StatusMessage } from './bot-defaults-save.js';
+import { caughtErrorText, configErrorText, responseErrorText, saveBotField, type StatusMessage } from './bot-defaults-save.js';
 import { sessionMutationBlockedText } from './session-mutation-blocked.js';
 import type { RoleInjectMode } from './roles.js';
 import {
@@ -4306,7 +4306,7 @@ function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
-function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
+export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const { bot, patchBot } = props;
   const mode: 'off' | 'oncall' | 'scratch' = bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off');
@@ -4330,6 +4330,7 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?:
       setStatus,
       setBusy,
       saved: tr('botDefaults.sandboxSaved'),
+      errorText: res => configErrorText(res, tr),
       onSaved: body => patchBot(bot.larkAppId, {
         sandbox: body.sandbox === true,
         sandboxMode: (body.mode ?? next) as 'off' | 'oncall' | 'scratch',
@@ -4631,6 +4632,11 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandboxPaths')}</h3>
       <p className="bd-section-note">{tr('botDefaults.sbxPathsHelp')}</p>
+      {bot.sandboxPathsForbiddenReadWrite?.length ? (
+        <p className="hint-warn" data-sandbox-paths-forbidden-rw="">
+          {tr('botDefaults.sbxPathsForbiddenRw', { paths: bot.sandboxPathsForbiddenReadWrite.join('、') })}
+        </p>
+      ) : null}
       <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
         <button type="button" className="bd-btn" onClick={() => setTextMode(m => !m)}>
           {textMode ? tr('botDefaults.sbxPathsTreeMode') : tr('botDefaults.sbxPathsTextMode')}
@@ -4704,6 +4710,7 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lo
       setStatus,
       setBusy,
       saved: tr('botDefaults.backendSaved'),
+      errorText: res => configErrorText(res, tr),
       onSaved: body => patchBot(bot.larkAppId, { backendType: typeof body.backendType === 'string' ? body.backendType : null }),
       rollback: () => setValue(prev),
     });
@@ -9253,34 +9260,70 @@ export function renderBotDefaultsPage(root: HTMLElement): PageDisposer {
 }
 
 
+/** Starting text when no policy is stored: public allowed, private blocked,
+ *  the host's own nameservers as dnsServers (a policy without them has no DNS
+ *  at all), and trusted-egress when the workers inherit a proxy (otherwise the
+ *  session refuses to start). */
+export function networkPolicyTemplate(bot: Pick<BotDefaultsRow, 'sandboxNetworkHostDns' | 'sandboxNetworkProxyEnv'>): Record<string, unknown> {
+  return {
+    version: 1,
+    public: { mode: 'allow' },
+    private: { mode: 'block' },
+    ...(bot.sandboxNetworkHostDns?.length ? { dnsServers: bot.sandboxNetworkHostDns } : {}),
+    ...(bot.sandboxNetworkProxyEnv?.length ? { proxyMode: 'trusted-egress' } : {}),
+  };
+}
+
+/** Why new sessions of this bot cannot enforce a policy, as an i18n key +
+ *  params; undefined when they can. Mirrors the daemon's save-time check:
+ *  the effective backend is the override or the daemon default, reconciled
+ *  with the CLI (a remote CLI dictates its backend; a local CLI on a remote
+ *  default falls back to a local backend). */
+export function networkPolicyUnsupported(bot: Pick<BotDefaultsRow, 'cliId' | 'sandboxNetworkPolicyPlatform' | 'backendType' | 'defaultBackendType' | 'sandboxMode' | 'sandbox'>): { key: string; params?: Record<string, string> } | undefined {
+  if (bot.sandboxNetworkPolicyPlatform !== 'linux') return { key: 'botDefaults.networkUnsupportedPlatform', params: { platform: String(bot.sandboxNetworkPolicyPlatform ?? '?') } };
+  const backend = resolvePairedBackendId(bot.cliId, bot.backendType, bot.defaultBackendType) ?? 'pty';
+  if (backend !== 'pty') return { key: 'botDefaults.networkUnsupportedBackend', params: { backend } };
+  const mode = bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off');
+  if (mode !== 'oncall') return { key: 'botDefaults.networkUnsupportedMode', params: { mode } };
+  return undefined;
+}
+
 export function NetworkPolicySection({ bot, patchBot }: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
-  const [text, setText] = useState(JSON.stringify(bot.sandboxNetworkPolicy ?? { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, null, 2));
+  const [text, setText] = useState(JSON.stringify(bot.sandboxNetworkPolicy ?? networkPolicyTemplate(bot), null, 2));
   const [status, setStatus] = useState<StatusMessage>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
-  const supported = bot.sandboxNetworkPolicyPlatform === 'linux' && (bot.backendType ?? 'pty') === 'pty' && (bot.sandboxMode === 'oncall' || bot.sandboxMode == null && bot.sandbox === true);
+  const unsupported = networkPolicyUnsupported(bot);
   useEffect(() => { if (bot.sandboxNetworkPolicy) setText(JSON.stringify(bot.sandboxNetworkPolicy, null, 2)); }, [bot.sandboxNetworkPolicy]);
   async function save(clear: boolean) {
-    setBusy(true); setStatus(null);
+    setBusy(true); setStatus(null); setWarnings([]);
     try {
       const policy = clear ? null : JSON.parse(text);
       const result = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox-network-policy`, { policy });
       if (!result.ok) throw new Error(result.body.error ?? 'Save failed');
       patchBot(bot.larkAppId, { sandboxNetworkPolicy: result.body.sandboxNetworkPolicy });
-      setStatus({ ok: true, text: tr('botDefaults.networkSaved') });
+      if (clear) setText(JSON.stringify(networkPolicyTemplate(bot), null, 2));
+      setWarnings(Array.isArray(result.body.warnings) ? result.body.warnings.filter((w: unknown) => typeof w === 'string') : []);
+      setStatus({ ok: true, text: tr(clear ? 'botDefaults.networkCleared' : 'botDefaults.networkSaved') });
     } catch (error) { setStatus({ ok: false, text: (error as Error).message }); }
     finally { setBusy(false); }
   }
+  const warningKey = (w: string) => w === 'dns_servers_missing' ? 'botDefaults.networkWarnNoDns'
+    : w === 'proxy_requires_trusted_egress' ? 'botDefaults.networkWarnProxy' : undefined;
   return <section className="bd-section" data-network-policy="">
     <h3>{tr('botDefaults.networkPolicy')}</h3>
     <p className="bd-section-note">{tr('botDefaults.networkPolicyHelp')}</p>
-    <p className="bd-section-note">{supported ? tr('botDefaults.networkRequirements') : tr('botDefaults.networkUnsupported')}</p>
+    <p className="bd-section-note" data-network-support={unsupported ? 'no' : 'yes'}>{unsupported ? tr(unsupported.key, unsupported.params) : tr('botDefaults.networkRequirements')}</p>
+    <p className="bd-section-note">{tr('botDefaults.networkPrerequisites')}</p>
+    {bot.sandboxNetworkProxyEnv?.length ? <p className="bd-section-note bd-warn" data-network-proxy-env="">{tr('botDefaults.networkProxyEnv', { keys: bot.sandboxNetworkProxyEnv.join(', ') })}</p> : null}
     <p className="bd-section-note">{bot.sandboxNetworkPolicy ? tr('botDefaults.networkConfigured') : tr('botDefaults.networkLegacy')}</p>
-    <textarea aria-label={tr('botDefaults.networkPolicy')} value={text} onChange={event => setText(event.target.value)} disabled={busy || !supported} rows={12} style={{ width: '100%', fontFamily: 'monospace' }} />
+    <textarea aria-label={tr('botDefaults.networkPolicy')} value={text} onChange={event => setText(event.target.value)} disabled={busy || !!unsupported} rows={12} style={{ width: '100%', fontFamily: 'monospace' }} />
     <div className="actions bd-section-actions">
-      <button className="primary" type="button" disabled={busy || !supported} onClick={() => void save(false)}>{tr('botDefaults.networkSave')}</button>
-      <button type="button" disabled={busy || !bot.sandboxNetworkPolicy} onClick={() => void save(true)}>{tr('botDefaults.networkClear')}</button>
+      <button className="primary" type="button" data-action="save-network-policy" disabled={busy || !!unsupported} onClick={() => void save(false)}>{tr('botDefaults.networkSave')}</button>
+      <button type="button" data-action="clear-network-policy" disabled={busy || !bot.sandboxNetworkPolicy} onClick={() => void save(true)}>{tr('botDefaults.networkClear')}</button>
       <StatusSpan status={status} />
     </div>
+    {warnings.map(w => <p key={w} className="bd-section-note bd-warn" role="alert" data-network-warning={w}>⚠️ {warningKey(w) ? tr(warningKey(w)!) : w}</p>)}
   </section>;
 }

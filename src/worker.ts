@@ -3,7 +3,7 @@ import { deploymentContinuationTemplate } from './services/deployment-continuati
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
-import { networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
+import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
@@ -613,6 +613,7 @@ import {
   runAdoptSessionRenameSequence,
 } from './services/adopt-input-sequence.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
+import { downgradeForbiddenReadWrite, forbiddenReadWriteMessage, defaultProtectedRoots, isAbsoluteSandboxEntry } from './services/sandbox-path-guard.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from './utils/pty.js';
 import {
@@ -20411,9 +20412,10 @@ async function spawnCli(
     platform: process.platform, backendType: cfg.backendType, sandbox: cfg.sandbox,
     adopt: cfg.adoptMode, existingEndpoint: cfg.existingAppServerEndpoint, policy: cfg.sandboxNetworkPolicy,
   });
-  if (networkError) throw new Error(networkError);
+  // cfg.sandboxNetworkPolicy is the session's creation-time snapshot.
+  if (networkError) throw new Error(networkError + FROZEN_NETWORK_POLICY_HINT);
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
-  if (proxyError) throw new Error(proxyError);
+  if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
   const spawnStartedAtMs = Date.now();
   restartInterruptionScanBeforeMs = undefined;
@@ -21238,7 +21240,7 @@ async function spawnCli(
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
   const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: cfg.sandboxNetworkPolicy });
-  if (effectiveNetworkError) throw new Error(effectiveNetworkError);
+  if (effectiveNetworkError) throw new Error(effectiveNetworkError + FROZEN_NETWORK_POLICY_HINT);
   // Single-source network facts for THIS spawn. These same values feed the
   // bwrap/Seatbelt constructors below (netEnabled) and the identity storage
   // decision reported to the daemon (loopbackShared). Nothing else may derive
@@ -23425,7 +23427,34 @@ async function spawnCli(
       readDenyExtraPaths: cfg.readDenyExtraPaths,
       sandboxPaths: cfg.sandboxPaths,
     });
-    const userLists = cfg.sandboxPaths ?? legacyMapped?.sandboxPaths;
+    // `/`, HOME, the botmux data root (or an ancestor) stored as readWrite runs
+    // as readOnly: the save path refuses it now, but older configs and hand
+    // edits of bots.json still carry it. Roots come from the shared helper — a
+    // hand-rolled list called userInfo() unguarded, which THROWS on hosts
+    // without a passwd entry (numeric-uid containers) and bricked every
+    // sandboxed spawn.
+    const { lists: downgradedLists, downgraded: downgradedUserRw, dropped: droppedUserRw } = downgradeForbiddenReadWrite(
+      cfg.sandboxPaths ?? legacyMapped?.sandboxPaths,
+      defaultProtectedRoots(),
+    );
+    if (downgradedUserRw.length) {
+      log(`[sandbox] sandboxPaths readWrite entries downgraded to readOnly: ${forbiddenReadWriteMessage(downgradedUserRw)}`);
+    }
+    if (droppedUserRw.length) {
+      log(`[sandbox] sandboxPaths readWrite entries ignored: ${forbiddenReadWriteMessage(droppedUserRw)}`);
+    }
+    // Relative readOnly entries are dropped too: they resolve against the
+    // session cwd like the readWrite ones did (a save used to accept them), so
+    // `..` would bind HOME read-only. Relative DENY entries are left as-is —
+    // their cwd-relative resolution only ever hides a path (fail-closed).
+    const droppedRoRelative = (downgradedLists?.readOnly ?? [])
+      .filter(p => !isAbsoluteSandboxEntry(p, hostHomeDir));
+    if (droppedRoRelative.length) {
+      log(`[sandbox] sandboxPaths readOnly relative entries ignored (must be absolute or ~/-prefixed): ${droppedRoRelative.join(', ')}`);
+    }
+    const userLists = droppedRoRelative.length && downgradedLists
+      ? { ...downgradedLists, readOnly: downgradedLists.readOnly?.filter(p => isAbsoluteSandboxEntry(p, hostHomeDir)) }
+      : downgradedLists;
     const droppedUser: string[] = [];
     const resolveUser = (paths?: readonly string[]) => {
       const out: string[] = [];
