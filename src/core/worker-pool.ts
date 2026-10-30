@@ -123,6 +123,7 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import { sandboxNamespaceNotice } from './system-bwrap.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import {
@@ -18172,6 +18173,7 @@ function setupWorkerHandlers(
           if (keepDiagnosticWorker) {
             parts.push(tr('worker.crash_diagnostic_terminal', undefined, loc));
           }
+          if (msg.sandboxNamespace) parts.push(sandboxNamespaceNotice(msg.sandboxNamespace, loc));
           if (msg.logTail?.trim()) {
             parts.push(`${tr('worker.crash_recent_output', undefined, loc)}\n${msg.logTail.trim()}`);
           } else {
@@ -18238,7 +18240,13 @@ function setupWorkerHandlers(
         // a bounded silent re-fork self-heals without waking anyone (08-23:
         // idle sessions got "会话启动失败" cards while their panes were alive).
         if (scheduleTransientStartupRetry(msg.message, msg.turnId, msg.dispatchAttempt)) break;
-        await notifyStartupFailure(msg.message, msg.turnId, msg.dispatchAttempt);
+        await notifyStartupFailure(
+          msg.sandboxNamespace
+            ? `${msg.message}\n${sandboxNamespaceNotice(msg.sandboxNamespace, loc)}`
+            : msg.message,
+          msg.turnId,
+          msg.dispatchAttempt,
+        );
         break;
       }
 

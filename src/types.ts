@@ -2314,6 +2314,8 @@ export type WorkerToDaemon =
     canParkDiagnostic?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
+    /** Linux bwrap sandbox could not create this namespace on this host. */
+    sandboxNamespace?: 'pid' | 'user';
     turnId?: string;
     dispatchAttempt?: number;
   }
@@ -2370,7 +2372,7 @@ export type WorkerToDaemon =
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
-  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user' }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   /** Worker observed a successful explicit `botmux send` for this turn, so
    * the daemon should treat listener-preview runs as visibly replied even

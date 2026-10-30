@@ -533,7 +533,10 @@ import {
   localSandboxApplies,
   resolveLocalSandboxMode,
   autoWorktreeFallbackSandboxError,
+  bwrapNamespaceFailure,
+  coreOnlyPidNamespaceDegrade,
 } from './adapters/backend/sandbox.js';
+import { diagnoseSandboxNamespaceFailure, type BwrapNamespaceFailure } from './core/system-bwrap.js';
 import {
   prepareScratchSandboxDetailed,
   attachScratchSession,
@@ -2634,6 +2637,20 @@ function drainArgvDurableInitialPromptCompletion(): boolean {
 // CLI leaf. credentialOnlyBwrap needs host probes so it can't be recomputed from
 // cfg at gate-check time; capture the spawn-time verdict for currentTraexObservedPid.
 let lastSpawnOuterBwrapActive = false;
+// Set as soon as this spawn is known to launch through Linux bwrap (before
+// backend.spawn, which lastSpawnOuterBwrapActive is not), so a launch that
+// fails at once can still be diagnosed — see sandboxNamespaceDiagnosis().
+let lastSpawnLinuxBwrap = false;
+
+/** Diagnosis only — see diagnoseSandboxNamespaceFailure. */
+function sandboxNamespaceDiagnosis(text: string | undefined): BwrapNamespaceFailure | undefined {
+  return diagnoseSandboxNamespaceFailure({
+    linuxBwrap: lastSpawnLinuxBwrap,
+    text,
+    probe: bwrapNamespaceFailure,
+    pidNamespaceDropped: coreOnlyPidNamespaceDegrade,
+  });
+}
 /** wrapperCli of the current spawn while it runs inside the file sandbox and
  *  the CLI has not reached its first prompt yet. A CLI exit in this window
  *  gets the sandbox-wrapper hint appended to its crash diagnostic. */
@@ -21515,6 +21532,7 @@ async function spawnCli(
     && credentialIsolationGate.mode !== 'remote-bypass';
   const credentialOnlySeatbelt = credentialIsolationGate.mode === 'seatbelt';
   const credentialOnlyBwrap = credentialIsolationGate.mode === 'bwrap';
+  lastSpawnLinuxBwrap = process.platform === 'linux' && (sandboxRequested || credentialOnlyBwrap);
   /** Flavour of the per-session tree this spawn builds (null: none). */
   const requestedTreeFlavour = requestedSandboxTreeFlavour({
     platform: process.platform,
@@ -26340,7 +26358,8 @@ async function spawnCli(
     if (intentionalRestart) {
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
-      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt, ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}) });
+      const sandboxNamespace = code !== 0 ? sandboxNamespaceDiagnosis(logTail) : undefined;
+      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt, ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
     }
   });
 
@@ -29666,10 +29685,12 @@ async function sendFatalWorkerErrorAndExit(
   const message = chatSafeFatalErrorMessage(err);
   // The daemon posts `message` into the chat; the full text stays in this log.
   if (message !== rawMessage) log(`Fatal worker error (full text, local log only): ${rawMessage}`);
+  const sandboxNamespace = sandboxNamespaceDiagnosis(rawMessage);
   await sendAndFlush({
     type: 'error',
     message,
     turnId,
+    ...(sandboxNamespace ? { sandboxNamespace } : {}),
     // Carry the durable attempt so the daemon can leave a meeting delivery
     // failure to the receipt/lease recovery path instead of replying out-of-band.
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),

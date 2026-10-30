@@ -158,7 +158,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
       'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
-      'botDefaults.cotEnabled', 'botDefaults.replyCardTools',
+      'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
       'botDefaults.replyFooterUsage', 'botDefaults.replyFooterRecipients', 'botDefaults.replyFooterVoice',
       'botDefaults.streamingButton.output', 'botDefaults.streamingButton.terminal',
@@ -434,6 +434,9 @@ export type BotDefaultsRow = {
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   cotEnabled?: boolean;
+  /** Show tool calls/commands/results in unified reply cards. Default ON;
+   *  only meaningful for replyCardMode 'unified'. */
+  replyCardShowTools?: boolean;
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;

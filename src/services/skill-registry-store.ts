@@ -688,6 +688,18 @@ function ensureGitSource(url: string): string {
   return dir;
 }
 
+/**
+ * A plain `git checkout <branch>` in the CACHED source clone switches to the
+ * LOCAL branch the first checkout created, and `fetch` never moves it, so every
+ * later update kept installing the branch tip as of the first install. A ref
+ * that names a branch on origin therefore resolves to the freshly fetched
+ * remote-tracking ref; anything else (tag, commit, `origin/<x>`) is used as
+ * given. Checked out detached either way, so no local branch is left to go stale.
+ */
+function remoteBranchRef(ref: string): string {
+  return `refs/remotes/origin/${ref}`;
+}
+
 function checkoutGitSource(url: string, refValue: string | undefined): { sourceDir: string; ref: string; commit: string } {
   assertSafeGitRef(refValue);
   const sourceDir = ensureGitSource(url);
@@ -696,7 +708,12 @@ function checkoutGitSource(url: string, refValue: string | undefined): { sourceD
     fetchGitSource(url, sourceDir, ['fetch', 'origin', 'HEAD']);
     git(['checkout', 'FETCH_HEAD'], sourceDir);
   } else {
-    git(['checkout', ref], sourceDir);
+    let target = ref;
+    try {
+      git(['rev-parse', '--verify', '--quiet', `${remoteBranchRef(ref)}^{commit}`], sourceDir);
+      target = remoteBranchRef(ref);
+    } catch { /* not a branch on origin: a tag or commit */ }
+    git(['checkout', '--detach', target], sourceDir);
   }
   return { sourceDir, ref, commit: git(['rev-parse', 'HEAD'], sourceDir) };
 }
@@ -724,7 +741,12 @@ async function checkoutGitSourceAsync(url: string, refValue: string | undefined)
     await fetchGitSourceAsync(url, sourceDir, ['fetch', 'origin', 'HEAD']);
     await gitAsync(['checkout', 'FETCH_HEAD'], sourceDir);
   } else {
-    await gitAsync(['checkout', ref], sourceDir);
+    let target = ref;
+    try {
+      await gitAsync(['rev-parse', '--verify', '--quiet', `${remoteBranchRef(ref)}^{commit}`], sourceDir);
+      target = remoteBranchRef(ref);
+    } catch { /* not a branch on origin: a tag or commit */ }
+    await gitAsync(['checkout', '--detach', target], sourceDir);
   }
   return { sourceDir, ref, commit: await gitAsync(['rev-parse', 'HEAD'], sourceDir) };
 }
