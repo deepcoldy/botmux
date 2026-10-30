@@ -278,6 +278,7 @@ import {
   wrapCommandInSessionScope,
 } from './core/session-scope.js';
 import { unwrapBotmuxLaunchLayers, type UnwrappedLaunchLayers } from './core/launch-layers.js';
+import { decideQueuedReadyTransition } from './core/queued-ready-transition.js';
 import {
   deriveTerminalCardViewToken,
   deriveTerminalWriteToken,
@@ -17372,11 +17373,17 @@ function markPromptReady(): void {
   // already-promoted authority only while the PTY generation still identifies
   // this same A edge; later B output makes the observation stale. The matching
   // observation also prevents this same A edge from advancing twice to C.
-  const queuedAdvanceBelongsToThisReady = queuedTurnAdvanceConsumedForPrompt !== undefined
-    && ptyOutputGeneration.isCurrent(queuedTurnAdvanceConsumedForPrompt.outputGeneration);
-  if (!durableTurnInFlight
-    && !preserveActiveTurnAuthorityForReady
-    && !queuedAdvanceBelongsToThisReady) {
+  const observedQueuedAdvanceGeneration = queuedTurnAdvanceConsumedForPrompt?.outputGeneration;
+  const readyTransition = (syncedFromDisk: boolean) => decideQueuedReadyTransition({
+    observedOutputGeneration: observedQueuedAdvanceGeneration,
+    currentOutputGeneration: ptyOutputGeneration.snapshot(),
+    durableTurnInFlight,
+    preserveActiveTurnAuthority: preserveActiveTurnAuthorityForReady,
+    syncedFromDisk,
+    hasQueuedTurn: queuedTypeAheadTurns.length > 0,
+  });
+  const beforeMarkerSync = readyTransition(false);
+  if (beforeMarkerSync.releaseActiveTurnAuthority) {
     releaseActiveTurnAuthority('prompt_ready');
   }
   // A ready published without the detector's own idle (first-prompt timeout
@@ -17388,7 +17395,7 @@ function markPromptReady(): void {
   judgeClaudeBridgeTurn();
   settleSessionRenameOnPrompt();
   const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
-  if (!syncedFromDisk && !queuedAdvanceBelongsToThisReady && queuedTypeAheadTurns.length > 0) {
+  if (readyTransition(syncedFromDisk).advanceQueuedTurn) {
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
   queuedTurnAdvanceConsumedForPrompt = undefined;
