@@ -2109,6 +2109,7 @@ export const messages: Record<string, string> = {
   'worker.interrupt_recovery_web': '请重试，或打开 Web 终端后手动中断。',
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
+  'worker.traex_resume_target_in_default_home': '⚠️ 这个话题上次的 TRAE 会话（{sessionId}）记在默认目录 {defaultHome} 里，但这个 bot 现在的 TRAE_HOME 是 {traeHome}，TRAE 在新目录里找不到这个会话，这次可能接不上之前的上下文。botmux 不会去读旧目录（在那里找到的会话，TRAE 也恢复不了）。要继续旧会话，可以把那条会话的记录迁到新目录，或者去掉这个 bot 的 TRAE_HOME；不需要的话直接继续用即可。',
   'worker.structured_turn_not_collected': '⚠️ 这条消息已经发给 {cliName}，但它的会话记录（transcript）里一直没出现这一轮，botmux 采集不到本轮回复，结论不会自动转发到群里。{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
   'worker.structured_turn_not_started_blocked': '⚠️ {cliName} 一直停在{blocker}，这条消息没有开始处理，botmux 已不再等这一轮的回复。在 Web 终端里处理完后请重发。',
   'worker.startup_upgrade_hint': '（{cliName} 刚升级到 {to}，之前是 {from}）',

@@ -43,7 +43,8 @@ import { resolveEntrySpawn } from './self-spawn.js';
 import type { IdentityStorageModel } from './lark-tool-binding.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { isUsableOpenId } from '../utils/user-token.js';
-import { sessionTempDir } from './session-temp.js';
+import { logger } from '../utils/logger.js';
+import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
 
 export type { IdentityStorageModel };
 
@@ -693,22 +694,89 @@ function shellSingleQuoteMultiline(value: string): string {
  *
  * Both publication paths (writeSessionIdentity and refreshSessionIdentity,
  * which re-enters it) compute the path here, so they always agree.
+ *
+ * The path is spelled through the short alias when that layout is in place and
+ * through the cache root when it is not; see {@link bytedcliHomeRoot}.
+ *
+ * This function is a pure path computation on purpose — it is exported and read
+ * by callers that must not create directories (tests, the identity readers).
+ * Installing the layout and choosing the fallback are the publisher's job.
  */
 export function bytedcliTurnHome(
   sessionDataDir: string,
   sessionId: string,
   identity: Pick<BytedCliIdentity, 'openId'>,
 ): string {
+  return bytedcliHomeFromBase(sessionTempDir(sessionDataDir, sessionId), sessionId, identity);
+}
+
+/**
+ * The per-person HOME under a given session scratch `base`.
+ *
+ * The single place the layout `<base>/identity-home/bytedcli/<digest>` is
+ * spelled. `base` is the only thing the two callers disagree about —
+ * {@link bytedcliTurnHome} passes the plain scratch, {@link withBytedcliHome}
+ * passes whatever {@link bytedcliHomeRoot} settled on — so keeping the join in
+ * one function is what stops the published path from drifting away from the one
+ * the tests pin. That drift would be a security regression, not a cosmetic one:
+ * this is the boundary between the short alias and the cache root.
+ */
+function bytedcliHomeFromBase(
+  base: string,
+  sessionId: string,
+  identity: Pick<BytedCliIdentity, 'openId'>,
+): string {
+  return canonicalPathNearest(join(base, 'identity-home', 'bytedcli', bytedcliHomeDigest(sessionId, identity)));
+}
+
+/** Directory name for one person (or the session fallback) within a scratch. */
+function bytedcliHomeDigest(sessionId: string, identity: Pick<BytedCliIdentity, 'openId'>): string {
   const key = identity.openId ? `open_id:${identity.openId}` : `session:${sessionId}`;
-  const digest = createHash('sha256').update(key).digest('hex').slice(0, 16);
-  return canonicalPathNearest(join(sessionTempDir(sessionDataDir, sessionId), 'identity-home', 'bytedcli', digest));
+  return createHash('sha256').update(key).digest('hex').slice(0, 16);
+}
+
+/**
+ * The session-scratch base a published bytedcli HOME is placed under, after
+ * putting the short alias in place.
+ *
+ * Failing to install the layout does NOT fail the publication. The alias is a
+ * path-length optimisation, not a prerequisite for the identity being applied;
+ * refusing to publish someone's credential because a scratch alias could not be
+ * installed would turn a cosmetic problem into "this person cannot run the CLI
+ * at all".
+ *
+ * The fallback is the CACHE-ROOT spelling, never the lexical `<hub>/...` one. A
+ * failed layout means an ancestor is a link this code did not create (a hub
+ * symlinked at `/tmp/bm<uid>` pointing into a directory someone else controls);
+ * the executor then runs `mkdir -p` on whatever is published, and `mkdir -p`
+ * follows links. Publishing the lexical hub path would therefore create and fill
+ * that foreign tree — measured: the wrapper exited 0 and left 7 entries in it.
+ * Going through the cache root cannot lead there: it is under the user's HOME.
+ */
+function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
+  try {
+    ensureSessionTempLayout();
+    return sessionTempDir(sessionDataDir, sessionId);
+  } catch (error) {
+    // Only reachable when the hub is not ours to fix (foreign owner, a symlink
+    // planted at it); the session's exec reports it on its own terms.
+    logger.warn(`[cli-identity] session temp layout unavailable, publishing the cache-root HOME: ${
+      error instanceof Error ? error.message : String(error)}`);
+    return sessionTempDirWithoutAlias(sessionDataDir, sessionId);
+  }
 }
 
 /** Path only: the wrapper creates the directory at exec time, inside the
- *  session scratch the worker has already created and the sandbox binds. */
+ *  session scratch the worker has already created and the sandbox binds.
+ *
+ *  This is the enrichment point that touches the filesystem: it installs the
+ *  short-alias layout (or falls back to the cache-root spelling) and only then
+ *  computes the path, so the published HOME is the short one and the executor is
+ *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
 function withBytedcliHome(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
   if (identity.tool !== 'bytedcli' || 'mode' in identity || identity.home) return identity;
-  return { ...identity, home: bytedcliTurnHome(sessionDataDir, sessionId, identity) };
+  const base = bytedcliHomeRoot(sessionDataDir, sessionId);
+  return { ...identity, home: bytedcliHomeFromBase(base, sessionId, identity) };
 }
 
 /**
@@ -1072,7 +1140,14 @@ export function renderIdentityWrapper(
     // carries no HOME and the machine HOME is kept.
     `if [ -n "$${HOME_VAR}" ]; then`,
     `  __botmux_home=$${HOME_VAR}`,
-    '  mkdir -p -m 700 "$__botmux_home" 2>/dev/null || true',
+    // `mkdir -p -m 700` modes the LAST level only; every intermediate level is
+    // created with plain `mkdir(2)` and so takes the process umask. The path
+    // crosses `/tmp/bm<uid>` (the uid-wide short-alias hub, 0700 by design) and
+    // the session scratch, so at the default umask 022 the hub would land 0755
+    // and every later session on this host would fail its private-owner check
+    // until someone fixed the mode by hand. Creating under its own umask 077
+    // makes every level this creates private, and leaves existing ones alone.
+    '  (umask 077; mkdir -p -m 700 "$__botmux_home") 2>/dev/null || true',
     '  if [ ! -d "$__botmux_home" ]; then',
     `    printf '%s\\n' 'botmux: ${tool} 的按人目录无法创建，命令未执行。' >&2`,
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,

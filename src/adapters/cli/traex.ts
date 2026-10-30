@@ -4,7 +4,9 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaExec } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
-import { traeConfigPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { traeCliStatePath, traeConfigPath, traeHomeFor, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
   findTraexSessionIdByBotmuxSessionId,
   traexHistoryMatchDelta,
@@ -87,11 +89,18 @@ function goalEnvConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
  * legitimately fires. In practice the markers are written host-side once migration
  * has run (the normal fleet state); this bind just makes that host truth visible
  * through the sandbox instead of hidden behind the ~/.trae/cli-only carve-out.
+ *
+ * The markers sit at the TRAE data root, so a bot with its own TRAE_HOME has
+ * them there. The default-root copies stay listed too (zero-byte read-only
+ * files): which root a given traecli release consults was not observable
+ * locally, and exposing both keeps the default-home behaviour unchanged.
  */
-export const TRAE_MIGRATION_DONE_MARKERS = [
-  '~/.trae/.coco-rollouts-migrated',
-  '~/.trae/.coco-migrated',
-] as const;
+const TRAE_MIGRATION_DONE_MARKER_NAMES = ['.coco-rollouts-migrated', '.coco-migrated'] as const;
+
+export function traeMigrationDoneMarkers(env: NodeJS.ProcessEnv = process.env): string[] {
+  const roots = [...new Set([join(homedir(), '.trae'), traeHomeFor(env)])];
+  return roots.flatMap(root => TRAE_MIGRATION_DONE_MARKER_NAMES.map(name => join(root, name)));
+}
 
 /**
  * TraeX active-turn busy marker. Every anchor below is extracted verbatim
@@ -378,10 +387,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // sandbox could mutate shared hook/plugin CODE that later bots (or the user's
     // own non-sandboxed traecli) execute. The first-run migration markers that
     // must be visible are exposed READ-ONLY via sandboxReadonlyPaths() instead.
-    authPaths: ['~/.trae/cli'],
+    // Resolved at read time: TRAE_HOME may move it off ~/.trae (the worker pins
+    // a sandboxed session's per-bot TRAE_HOME before building the policy).
+    get authPaths(): string[] { return [traeCliStatePath()]; },
     // The CLI must read the Gateway entry even when ~/.trae is not exposed.
     // Keep the shared config read-only; hooks/plugins must not become writable.
-    sandboxReadonlyPaths: () => [traeConfigPath(), ...TRAE_MIGRATION_DONE_MARKERS],
+    sandboxReadonlyPaths: env => [traeConfigPath(env), ...traeMigrationDoneMarkers(env)],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
