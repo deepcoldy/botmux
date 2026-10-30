@@ -2074,7 +2074,7 @@ export const messages: Record<string, string> = {
   'card.ask.empty_warning': "⚠️ You haven't selected any option. Multi-select allows choosing none; if you really mean an empty answer, click \"Confirm empty submit\" again, otherwise select first and submit.",
   'card.ask.toast.empty_confirm_needed': 'Nothing selected — click confirm once more to answer empty',
   'card.ask.custom_input': "Other / custom answer",
-  'card.ask.custom_input_hint': "Replaces this question's choices. Submit when ready (1000 characters per question, 2000 total).",
+  'card.ask.custom_input_hint': "Enter another answer",
   'card.ask.toast.draft_conflict': "The card changed. Review the current answers and submit again.",
   'card.ask.toast.invalid_custom': "Answer each question and shorten custom text (1000 characters per question, 2000 total) to fit the card.",
   'card.ask.custom_reply_hint': '💬 None of the options fit? Just reply with your answer in this topic.',

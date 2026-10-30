@@ -18,7 +18,7 @@ export function parseAskCustomFields(
     if (!match) return null;
     const i = Number(match[1]);
     if (!questions[i] || questions[i].allowCustom === false || typeof value !== 'string' || value.length > ASK_CUSTOM_MAX_LENGTH) return null;
-    next[i] = value.trim() || null;
+    next[i] = value.trim() || (previous[i] === '' ? '' : null);
   }
   return next.reduce((sum, text) => sum + (text?.length ?? 0), 0) <= ASK_CUSTOM_TOTAL_LENGTH ? next : null;
 }

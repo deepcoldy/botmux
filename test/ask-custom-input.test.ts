@@ -40,6 +40,40 @@ function descendants(value: any): any[] {
 }
 
 describe('per-question custom form', () => {
+  it('renders each option on its own row and the last other option alongside a single-line input', async () => {
+    const { ask } = await start();
+    const form = descendants(JSON.parse(buildAskCard(ask))).find(n => n.tag === 'form');
+    const rows = form.elements.filter((n: any) => n.tag === 'column_set');
+    expect(rows).toHaveLength(6);
+    expect(rows.slice(0, 2).map((row: any) => row.columns[0].elements[0].text.content)).toEqual(['◉ A', '○ B']);
+    expect(rows[2].columns).toHaveLength(2);
+    expect(rows[2].columns[0].elements[0].text.content).toContain('○');
+    expect(rows[2].columns[0].elements[0].value.custom_choice).toBe('true');
+    expect(rows[2].columns[1].elements[0]).toMatchObject({ tag: 'input', name: 'custom_0' });
+    expect(rows[2].columns[1].elements[0].input_type).not.toBe('multiline_text');
+  });
+
+  it('selects other, persists its empty state, requires text and submits the custom answer', async () => {
+    const { ask, promise } = await start();
+    const initial = descendants(JSON.parse(buildAskCard(ask))).find(n => n.name === 'custom_option_0');
+    const clicked: any = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
+      value: initial.value, form_value: { custom_0: '', custom_1: '' },
+    } });
+    expect(getAskSnapshot(ask.askId)).toMatchObject({ selections: [[], ['a']], customAnswers: ['', null] });
+    const nodes = descendants(clicked.card.data);
+    expect(nodes.find(n => n.name === 'custom_option_0').text.content).toContain('◉');
+    const submit = nodes.find(n => n.name === 'submit_answers');
+    const empty: any = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
+      value: submit.value, form_value: { custom_0: '', custom_1: '' },
+    } });
+    expect(empty.toast.type).toBe('warning');
+    expect(getAskSnapshot(ask.askId)?.settled).toBe(false);
+    await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
+      value: submit.value, form_value: { custom_0: '指定社区', custom_1: '' },
+    } });
+    expect(await promise).toMatchObject({ answers: [[], ['a']], customAnswers: ['指定社区', null] });
+  });
+
   it('captures text while toggling another question, then submits the mixed batch exactly once', async () => {
     const { ask, promise, args } = await start();
     const firstCard = JSON.parse(buildAskCard(ask));

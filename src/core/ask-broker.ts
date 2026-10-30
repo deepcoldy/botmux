@@ -756,7 +756,7 @@ export function applyAskForm(args: {
   askId: string; nonce: string; by: string; revision: number;
   fields: Record<string, unknown>;
   canRenderDraft?: (draft: PendingAsk) => boolean;
-  toggle?: { questionIndex: number; key: string };
+  toggle?: { questionIndex: number; key: string; custom?: boolean };
   confirmEmpty?: boolean;
 }): AskClickOutcome {
   gcSettled();
@@ -771,12 +771,19 @@ export function applyAskForm(args: {
   if (args.toggle) {
     const { questionIndex: i, key } = args.toggle;
     const q = ask.questions[i];
-    if (!Number.isInteger(i) || !q || !q.options.some(o => o.key === key)) return 'stale';
-    const selected = new Set(selections[i]);
-    if (!q.multiSelect) selected.clear();
-    if (q.multiSelect && selected.has(key)) selected.delete(key); else selected.add(key);
-    selections[i] = [...selected];
-    custom[i] = null; // explicitly picking an option switches this question back
+    if (!Number.isInteger(i) || !q) return 'stale';
+    if (args.toggle.custom) {
+      if (q.allowCustom === false || q.inputMode === 'text') return 'stale';
+      selections[i] = [];
+      custom[i] = custom[i] ?? '';
+    } else {
+      if (!q.options.some(o => o.key === key)) return 'stale';
+      const selected = new Set(selections[i]);
+      if (!q.multiSelect) selected.clear();
+      if (q.multiSelect && selected.has(key)) selected.delete(key); else selected.add(key);
+      selections[i] = [...selected];
+      custom[i] = null; // explicitly picking an option switches this question back
+    }
   }
   const answers = selections.map((keys, i) => custom[i] ? [] : keys);
   const candidate = { ...snapshot(ask), selections, customAnswers: custom, customRevision: (ask.customRevision ?? 0) + 1 };
@@ -790,6 +797,7 @@ export function applyAskForm(args: {
     ask.customRevision = revision;
   };
   if (!args.toggle) {
+    if (custom.some(text => text === '')) return 'invalid_custom';
     if (ask.questions.some((q, i) => !q.multiSelect && !custom[i] && answers[i].length !== 1)) return 'invalid_custom';
     if (!args.confirmEmpty && answers.every(keys => !keys.length) && custom.every(text => !text)) {
       saveDraft();

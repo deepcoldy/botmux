@@ -2072,7 +2072,7 @@ export const messages: Record<string, string> = {
   'card.ask.empty_warning': '⚠️ 你还没有勾选任何选项。多选允许「一个都不选」，如确实要以空作答，请再次点击「确认空提交」；否则先勾选再提交。',
   'card.ask.toast.empty_confirm_needed': '未勾选任何选项，如确实要空作答请再点一次确认',
   'card.ask.custom_input': "其他／自定义",
-  'card.ask.custom_input_hint': "填写后替代本题选项；最后点击提交（单题 1000 字，全卡 2000 字）",
+  'card.ask.custom_input_hint': "输入其他答案",
   'card.ask.toast.draft_conflict': "卡片已更新，请检查当前答案后再提交",
   'card.ask.toast.invalid_custom': "请答完每道题并缩短自定义内容（单题 1000 字，全卡 2000 字），避免卡片超长",
   'card.ask.custom_reply_hint': '💬 选项都不合适？直接在话题里回复你的答案即可。',

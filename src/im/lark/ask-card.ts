@@ -256,7 +256,7 @@ export async function handleAskCardAction(
       fields: data.action?.form_value ?? {},
       canRenderDraft: draft => turnReplyCardRequestBytes(buildAskCard(draft), draft.deliveryTarget?.openId ?? draft.chatId,
         draft.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE) <= TURN_REPLY_CARD_MAX_BYTES - (draft.replyCardTarget ? 4000 : 0),
-      ...(action === ASK_TOGGLE_ACTION ? { toggle: { questionIndex: asNumber(value.question_index), key: asString(value.key) ?? '' } } : {}),
+      ...(action === ASK_TOGGLE_ACTION ? { toggle: { questionIndex: asNumber(value.question_index), key: asString(value.key) ?? '', custom: value.custom_choice === 'true' } } : {}),
       confirmEmpty: value.confirm_empty === 'true',
     });
     if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
