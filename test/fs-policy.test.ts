@@ -27,6 +27,7 @@ import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
+import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { buildPiArgs, createPiAdapter } from '../src/adapters/cli/pi.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
@@ -331,6 +332,32 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/home/u/.local/share/opencode/opencode.db').access).toBe('readWrite');
     // Only OpenCode's own dir: the rest of ~/.config stays out.
     expect(accessForPath(p.rules, '/home/u/.config/other-tool/token.json').access).toBe('none');
+  });
+
+  it('kimi keeps its sessions and index writable so resume works sandboxed, its binaries read-only', () => {
+    const adapter = createKimiAdapter('/usr/bin/kimi');
+    const expand = (path: string) => path.replace(/^~/, '/home/u');
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(expand),
+      readonlyRoots: adapter.sandboxReadonlyPaths?.().map(expand),
+    }));
+    for (const path of [
+      '/home/u/.kimi-code/session_index.jsonl',
+      '/home/u/.kimi-code/sessions/wd_proj_0123/session_x/agents/main/wire.jsonl',
+      '/home/u/.kimi-code/config.toml',
+      '/home/u/.kimi-code/credentials/kimi-code.json',
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+    expect(accessForPath(p.rules, '/home/u/.kimi-code/bin/kimi').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
   });
 
   it('gemini keeps its whole state dir writable: settings, folder trust (tmp + rename) and OAuth', () => {
