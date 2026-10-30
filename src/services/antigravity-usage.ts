@@ -150,6 +150,32 @@ export interface AntigravityUsageReadResult {
   result: SessionTokenUsage | null;
 }
 
+/** Read only recent native generation metadata for the session's model.
+ * Independent of usage display and transcript growth; WAL commits may precede
+ * the next transcript record. Missing evidence never invents a default model. */
+export function readLatestAntigravityRuntime(
+  cliSessionId: string,
+  opts?: { conversationsDir?: string },
+): { model?: string } {
+  if (!cliSessionId || !/^[a-zA-Z0-9_-][a-zA-Z0-9._-]*$/.test(cliSessionId)) return {};
+  const dbPath = join(opts?.conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations'), `${cliSessionId}.db`);
+  if (!existsSync(dbPath)) return {};
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true });
+  if (!db) return {};
+  try {
+    // Most recent row normally carries the model. Keep a small backward window
+    // for partial metadata without rereading all historical token counts.
+    const rows = db.prepare('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 16').all() as Array<{ data: unknown }>;
+    for (const row of rows) {
+      if (!(row.data instanceof Uint8Array)) continue;
+      const model = parseGenMetadataRow(row.data)?.model.trim();
+      if (model) return { model };
+    }
+  } catch { /* unavailable/old schema: keep identity unknown */ }
+  finally { try { db.close(); } catch { /* best-effort */ } }
+  return {};
+}
+
 export function readAntigravityTokenUsage(
   cliSessionId: string,
   opts?: { conversationsDir?: string; dbPath?: string },

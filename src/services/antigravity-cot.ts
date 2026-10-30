@@ -19,8 +19,9 @@
  */
 import { existsSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { scanJsonlFromOffset } from './jsonl-cursor.js';
+import { readLatestAntigravityRuntime } from './antigravity-usage.js';
 import {
   antigravityFullSiblingPath,
   mapAntigravityCompactOffsetToFull,
@@ -141,6 +142,7 @@ interface ReaderState {
   watcher: FSWatcher | null;
   pendingTools: Array<{ id: string; name: string }>;
   onEntries: (entries: readonly AntigravityCotEntry[]) => void;
+  onRuntime?: (runtime: { model: string }) => void;
 }
 
 const readers = new Map<string, ReaderState>();
@@ -198,6 +200,16 @@ function bindTranscript(state: ReaderState): boolean {
 }
 
 function readNewTranscriptLines(state: ReaderState): void {
+  // Identity is useful even when thinking is disabled or no log bytes arrived.
+  // Reuse this reader's lifetime and exact native session, not a global setting.
+  if (state.onRuntime) {
+    try {
+      const runtime = readLatestAntigravityRuntime(state.cliSessionId, {
+        conversationsDir: join(dirname(state.brainDir), 'conversations'),
+      });
+      if (runtime.model) state.onRuntime({ model: runtime.model });
+    } catch { /* cosmetic model reporting must not stop tool progress */ }
+  }
   if (!bindTranscript(state) || !state.transcriptPath) return;
   try {
     const st = statSync(state.transcriptPath);
@@ -234,6 +246,8 @@ export interface StartAntigravityCotOptions {
   brainDir?: string;
   mode?: 'baseline-existing' | 'fresh';
   pollIntervalMs?: number;
+  /** Observed native model, independent of the thinking-display switch. */
+  onRuntime?: (runtime: { model: string }) => void;
 }
 
 /**
@@ -294,13 +308,14 @@ export function startAntigravityCot(
     watcher: null,
     pendingTools,
     onEntries,
+    onRuntime: opts?.onRuntime,
   };
 
   readers.set(cliSessionId, state);
   if (transcriptPath && existsSync(transcriptPath)) watchTranscript(state);
 
-  // If starting in fresh mode, perform initial read immediately
-  if (opts?.mode === 'fresh') {
+  // Seed runtime immediately on resume too; the EOF cursor still skips history.
+  if (opts?.mode === 'fresh' || opts?.onRuntime) {
     readNewTranscriptLines(state);
   }
 
