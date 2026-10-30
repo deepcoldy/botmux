@@ -355,6 +355,7 @@ import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid,
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
 import {
   mapAntigravityCompactOffsetToFull,
   type AntigravityTranscriptState,
@@ -6848,7 +6849,28 @@ function classifyScreenUsageLimit(
   status: RuntimeScreenStatus,
 ): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
-  return usageLimitTracker.classify(content, status);
+  return classifyUsageLimitWithNativeEvidence(content, status);
+}
+
+/** Preserve existing non-agy display-frame classification while requiring an
+ * authoritative viewport for agy's stronger native composer evidence. */
+function classifyUsageLimitWithNativeEvidence(
+  content: string,
+  status: RuntimeScreenStatus,
+): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+  if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
+  let evidence = content;
+  if (cliAdapter?.id === 'antigravity' && backend) {
+    // Card snapshots intentionally remove input/composer rows. Native error
+    // reconciliation requires the full current viewport, not that display text.
+    try { evidence = captureBackendScreen(backend) || content; } catch { /* no stronger evidence */ }
+  }
+  if (cliAdapter?.id === 'antigravity' && isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+  const result = usageLimitTracker.classify(evidence, status);
+  if (cliAdapter?.id === 'antigravity' && result.usageLimit) {
+    return { ...result, usageLimit: annotateAntigravityUsageLimit(evidence, result.usageLimit) };
+  }
+  return result;
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -17436,7 +17458,7 @@ function markPromptReady(): void {
     send({
       type: 'screen_update',
       content,
-      ...usageLimitTracker.classify(content, projectedRuntimeScreenStatus()),
+      ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
       ...backgroundWaitPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
@@ -19716,7 +19738,7 @@ function startScreenUpdates(): void {
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
       }
-      const usageAware = usageLimitTracker.classify(snapshot.content, status);
+      const usageAware = classifyUsageLimitWithNativeEvidence(snapshot.content, status);
       // Claude Code's permission dialogs — including one raised by a
       // background fork agent AFTER the main turn already ended — park the
       // session on a static screen that idle detection reports as "ready for
