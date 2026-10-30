@@ -87,10 +87,29 @@ describe('buildQuotePickerCard', () => {
     expect(JSON.stringify(card)).toContain('清除搜索');
   });
 
+  it('escapes the echoed search query in the no-match message', () => {
+    // The query is raw operator input rendered into a markdown element; an
+    // unescaped `![](http://x)` would render as an external image (tracking
+    // beacon / SSRF surface). Same guard as the relay and adopt pickers.
+    const card = parse(buildQuotePickerCard(
+      entries, 'oc_1', 'om_root', 'ou_me', 'zh', { searchQuery: '![x](http://evil/b)' },
+    ));
+    const md = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(md).toContain('\\[x\\]');
+    expect(md).not.toContain('![x](');
+  });
+
   it('renders an empty-state instead of a bare card when no 话题 exist', () => {
     const card = buildQuotePickerCard([], 'oc_1', 'om_root', 'ou_me');
     expect(card).toContain('没有找到其他话题');
     expect(allValues(parse(card)).some(v => v.action === 'quote_select')).toBe(false);
+    // No clear-search button in the no-candidates state: it would lead back to
+    // the same empty list. The search input's own callback stays, but no
+    // button may be rendered (regression guard for the button being pushed
+    // into the entries.length === 0 branch).
+    const parsed = parse(card);
+    expect(parsed.body.elements.filter((e: any) => e.tag === 'button')).toHaveLength(0);
+    expect(allValues(parsed).filter(v => v.action === 'quote_search')).toHaveLength(1);
   });
 
   it('paginates and disables the edge buttons', () => {
