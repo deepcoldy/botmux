@@ -76,7 +76,7 @@ describe('structured turn send attribution retirement', () => {
         adoptInitialActiveTurn: vi.fn(), adoptDisplacedActiveTurn: vi.fn(),
         emittedTurnTerminals: new TurnTerminalDeduper(),
       });
-      for (const name of ['turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn']) {
+      for (const name of ['turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
         h[name] = loadWorkerFunction(name, h);
       }
       h.writeCliPidMarker = loadWorkerFunction('writeCliPidMarker', h);

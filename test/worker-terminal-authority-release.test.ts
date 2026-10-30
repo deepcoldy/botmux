@@ -27,6 +27,7 @@ function harness(opts: { markerPath?: string } = {}) {
     currentVcMeetingImTurnOrigin: undefined,
     currentTurnSteerPromoted: false,
     queuedTurnAdvanceConsumedForPrompt: false,
+    rememberQueuedTurnAdvanceForPendingReady: vi.fn(),
     queuedTypeAheadTurns: [],
     retiredTurnIds: new Set<string>(),
     activeTurnAuthority: new ActiveTurnAuthority(),
@@ -82,7 +83,7 @@ function harness(opts: { markerPath?: string } = {}) {
       adoptInitialActiveTurn: vi.fn(), adoptDisplacedActiveTurn: vi.fn(),
       markerIdentityTurnId: loadWorkerFunction('markerIdentityTurnId', { isValidMarkerIdentityTurnId }),
     });
-    names.push('syncQueuedTurnsFromMarkerDisk', 'writeCliPidMarker');
+    names.push('syncQueuedTurnsFromMarkerDisk', 'writeCliPidMarker', 'markerQueuedTurnStillLive');
   }
   for (const name of names) scope[name] = loadWorkerFunction(name, scope);
   return scope;
@@ -230,5 +231,110 @@ describe('queued type-ahead advance skips turns whose terminal already went out'
 
     expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_running');
     expect(h.currentBotmuxTurnId).toBe('om_running');
+  });
+
+  it('keeps a live retry attempt the marker lists while retiring its dead attempt head', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_host');
+      // The head names durable attempt 1, whose terminal is already out, while
+      // the same turn's attempt 2 is live work queued alongside it.
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_T', dispatchAttempt: 1,
+        queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }] }));
+      h.emittedTurnTerminals.claim('sid', 'om_T', 1, 'completed');
+
+      h.syncQueuedTurnsFromMarkerDisk();
+
+      // The attempt-agnostic turnId tombstone must not kill the retry: the
+      // record is restored from disk and later promotion stays possible.
+      expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+      expect(h.retiredTurnIds.has('om_T')).toBe(false);
+      expect(h.currentBotmuxTurnId).toBe('om_host');
+    });
+  });
+
+  it('adopts a memory-held live retry after the marker promotes that attempt', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_host');
+      h.queuedTypeAheadTurns.push({ turnId: 'om_T', dispatchAttempt: 2 });
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_T', dispatchAttempt: 1,
+        queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }] }));
+      h.emittedTurnTerminals.claim('sid', 'om_T', 1, 'completed');
+
+      h.syncQueuedTurnsFromMarkerDisk();
+      expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+      expect(h.retiredTurnIds.has('om_T')).toBe(false);
+
+      // A later marker write promotes the still-live attempt 2 to head.
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_T', dispatchAttempt: 2,
+        queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }] }));
+      expect(h.syncQueuedTurnsFromMarkerDisk()).toBe(true);
+
+      expect(h.currentBotmuxTurnId).toBe('om_T');
+      expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_T');
+    });
+  });
+
+  it('tombsontes the turnId when every attempt named in the marker has terminated', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_host');
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_T', dispatchAttempt: 1,
+        queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }] }));
+      h.emittedTurnTerminals.claim('sid', 'om_T', 1, 'completed');
+      h.emittedTurnTerminals.claim('sid', 'om_T', 2, 'failed');
+
+      h.syncQueuedTurnsFromMarkerDisk();
+
+      expect(h.queuedTypeAheadTurns).toEqual([]);
+      expect(h.retiredTurnIds.has('om_T')).toBe(true);
+      expect(h.currentBotmuxTurnId).toBe('om_host');
+    });
+  });
+
+  it('spares a memory-only live retry when a lagging marker heads its dead attempt', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_host');
+      // Retry delivered via IPC into memory; the lagging marker still heads the
+      // dead attempt 1 and does not list queuedTurns yet.
+      h.queuedTypeAheadTurns.push({ turnId: 'om_T', dispatchAttempt: 2 });
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_T', dispatchAttempt: 1 }));
+      h.emittedTurnTerminals.claim('sid', 'om_T', 1, 'completed');
+
+      h.syncQueuedTurnsFromMarkerDisk();
+
+      expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+      expect(h.retiredTurnIds.has('om_T')).toBe(false);
+
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_T', dispatchAttempt: 2 }));
+      expect(h.syncQueuedTurnsFromMarkerDisk()).toBe(true);
+      expect(h.currentBotmuxTurnId).toBe('om_T');
+      expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_T');
+    });
+  });
+
+  it('refills an explicit live attempt despite an attempt-agnostic tombstone', () => {    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_host');
+      // A prior attempt of this turn was retired earlier in the same worker
+      // life; the dual-marker read can still surface a newer attempt whose own
+      // terminal has never gone out.
+      h.retiredTurnIds.add('om_T');
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_host',
+        queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }] }));
+
+      h.syncQueuedTurnsFromMarkerDisk();
+
+      expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+
+      // Attempt-less legacy records are still blocked by the turnId tombstone.
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_host',
+        queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }, { turnId: 'om_L' }] }));
+      h.retiredTurnIds.add('om_L');
+      h.syncQueuedTurnsFromMarkerDisk();
+      expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+    });
   });
 });

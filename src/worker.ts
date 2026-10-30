@@ -5601,7 +5601,7 @@ function writeCliPidMarker(): void {
             }
             if (parsed && Array.isArray(parsed.queuedTurns)) {
               for (const qt of parsed.queuedTurns) {
-                if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !turnTerminalEmitted(qt.turnId, typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
+                if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
                   queuedTypeAheadTurns.push({
                     turnId: qt.turnId,
                     ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
@@ -5802,7 +5802,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
         }
         if (parsed && Array.isArray(parsed.queuedTurns)) {
           for (const qt of parsed.queuedTurns) {
-            if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !turnTerminalEmitted(qt.turnId, typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
+            if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
               queuedTypeAheadTurns.push({
                 turnId: qt.turnId,
                 ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
@@ -29275,14 +29275,21 @@ function retireTerminatedQueuedTurn(turnId: string, dispatchAttempt?: number): v
 }
 
 /** Remove one type-ahead record and tombstone its id. Returns false when no
- *  record matched. Does not rewrite the PID marker. */
-function dropQueuedTurnRecord(turnId: string, dispatchAttempt?: number): boolean {
+ *  record matched. Does not rewrite the PID marker. The caller opts out of the
+ *  turnId tombstone when a durable retry under another dispatchAttempt must
+ *  survive (the tombstone is attempt-agnostic and would kill it too). */
+function dropQueuedTurnRecord(
+  turnId: string,
+  dispatchAttempt?: number,
+  opts: { tombstone?: boolean } = {},
+): boolean {
   const before = queuedTypeAheadTurns.length;
   queuedTypeAheadTurns = queuedTypeAheadTurns.filter(queued => queued.turnId !== turnId
     || (queued.dispatchAttempt !== undefined && queued.dispatchAttempt !== dispatchAttempt));
   if (queuedTypeAheadTurns.length === before) return false;
   // A retry of the same turn under another attempt is still live work.
-  if (!queuedTypeAheadTurns.some(queued => queued.turnId === turnId)) markTurnRetired(turnId);
+  if (opts.tombstone !== false
+    && !queuedTypeAheadTurns.some(queued => queued.turnId === turnId)) markTurnRetired(turnId);
   return true;
 }
 
@@ -29290,18 +29297,49 @@ function turnTerminalEmitted(turnId: string, dispatchAttempt?: number): boolean 
   return !!sessionId && emittedTurnTerminals.statusOf(sessionId, turnId, dispatchAttempt) !== undefined;
 }
 
+/** Whether a queuedTurns entry read back from the PID marker still names live
+ *  work. The retiredTurnIds tombstone predates dispatch retries and is keyed by
+ *  turnId alone; a durable retry under an explicit dispatchAttempt is a
+ *  different execution, so its liveness is gated by its OWN per-attempt
+ *  terminal record instead. Attempt-less (legacy) entries keep both gates. */
+function markerQueuedTurnStillLive(qt: { turnId?: unknown; dispatchAttempt?: unknown }): boolean {
+  if (typeof qt?.turnId !== 'string' || !qt.turnId) return false;
+  const dispatchAttempt = typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined;
+  if (turnTerminalEmitted(qt.turnId, dispatchAttempt)) return false;
+  if (dispatchAttempt === undefined && retiredTurnIds.has(qt.turnId)) return false;
+  return true;
+}
+
 /** The PID marker can still name a turn whose terminal went out before the
  *  worker advanced to it. Adopting it would hand the active turn authority to
  *  a finished turn, so retire it instead and let the in-memory advance move on
- *  to the next unfinished record. Called under the marker lock: no marker
+ *  to the next unfinished record. The head's parsed `queuedTurns` travel in
+ *  the same marker JSON and are consulted for a live sibling attempt: a
+ *  durable retry under another dispatchAttempt must not fall under the
+ *  attempt-agnostic tombstone. Called under the marker lock: no marker
  *  rewrite here. */
-function retireTerminatedMarkerTurn(parsed: { turnId: string; dispatchAttempt?: unknown }): boolean {
+function retireTerminatedMarkerTurn(parsed: {
+  turnId: string;
+  dispatchAttempt?: unknown;
+  queuedTurns?: ReadonlyArray<{ turnId?: unknown; dispatchAttempt?: unknown }>;
+}): boolean {
   const queued = queuedTypeAheadTurns.find(t => t.turnId === parsed.turnId);
   const dispatchAttempt = typeof parsed.dispatchAttempt === 'number'
     ? parsed.dispatchAttempt
     : queued?.dispatchAttempt;
   if (!turnTerminalEmitted(parsed.turnId, dispatchAttempt)) return false;
-  if (!dropQueuedTurnRecord(parsed.turnId, dispatchAttempt)) markTurnRetired(parsed.turnId);
+  const siblingIsLive = (candidate: { turnId?: unknown; dispatchAttempt?: unknown } | undefined): boolean => {
+    if (!candidate || candidate.turnId !== parsed.turnId) return false;
+    const siblingAttempt = typeof candidate.dispatchAttempt === 'number'
+      ? candidate.dispatchAttempt
+      : undefined;
+    if (siblingAttempt === dispatchAttempt) return false;
+    return !turnTerminalEmitted(parsed.turnId, siblingAttempt);
+  };
+  const liveSibling = queuedTypeAheadTurns.some(siblingIsLive)
+    || (parsed.queuedTurns ?? []).some(siblingIsLive);
+  dropQueuedTurnRecord(parsed.turnId, dispatchAttempt, { tombstone: !liveSibling });
+  if (!liveSibling) markTurnRetired(parsed.turnId);
   return true;
 }
 

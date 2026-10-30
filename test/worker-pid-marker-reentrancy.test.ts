@@ -72,7 +72,7 @@ describe('pid marker reentrancy + capability persistence', () => {
     const withPidMarkerLock = loadWorkerFunction<(p: string, fn: () => void) => void>('withPidMarkerLock', scope);
     const writeCliPidMarker = loadWorkerFunction<() => void>('writeCliPidMarker', scope);
     scope.withPidMarkerLock = withPidMarkerLock;
-    for (const name of ['turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn']) {
+    for (const name of ['turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
       scope[name] = loadWorkerFunction(name, scope);
     }
     scope.writeCliPidMarker = writeCliPidMarker;

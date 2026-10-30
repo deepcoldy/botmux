@@ -79,7 +79,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
       },
     };
     for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'markerIdentityTurnId',
-      'turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn']) {
+      'turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
       scope[name] = loadWorkerFunction(name, scope);
     }
   });
