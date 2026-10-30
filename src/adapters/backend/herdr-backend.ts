@@ -69,7 +69,10 @@ const SERVER_BOOT_DEADLINE_MS = 5000;
 const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // Bound automatic agent detection after explicitly running the launcher in a
 // new pane. Input readiness remains gated by the worker's onAgentStatus hook.
-const PANE_AGENT_START_TIMEOUT_MS = 30_000;
+// 60s rather than 30s: on a loaded host (load ≈ 25 measured) a cold CLI start
+// plus herdr's own detection can exceed 30s, and the failure is terminal for
+// a session started by an inbound message (no daemon-side startup auto-retry).
+const PANE_AGENT_START_TIMEOUT_MS = 60_000;
 const PANE_AGENT_DETECTION_POLL_MS = 100;
 // A started launcher deletes itself. This fallback only reaps one Herdr never
 // ran, and is long enough for a macOS Gatekeeper assessment of the exec to end.
@@ -178,7 +181,9 @@ function requiredJsonCommand(
   if (value?.error) {
     const code = typeof value.error.code === 'string' ? value.error.code : 'unknown_error';
     const message = typeof value.error.message === 'string' ? value.error.message : 'unknown error';
-    throw new Error(`${operation} failed: ${code}: ${message}`);
+    // A structured herdr error is an answer, not a stall: callers that poll
+    // through transient command failures must still stop on it.
+    throw Object.assign(new Error(`${operation} failed: ${code}: ${message}`), { herdrStructuredError: true });
   }
   return value;
 }
@@ -1195,12 +1200,24 @@ export class HerdrBackend implements SessionBackend {
 
       const detectionDeadline = Date.now() + PANE_AGENT_START_TIMEOUT_MS;
       let detected = false;
+      let lastListError: Error | undefined;
       while (Date.now() < detectionDeadline) {
-        const listed = requiredJsonCommand(
-          `herdr agent list in ${this.sessionName}`,
-          herdrSessionArgs(this.sessionName, ['agent', 'list']),
-          { timeout: Math.max(1, Math.min(5000, detectionDeadline - Date.now())), env: this.childEnv },
-        );
+        let listed: any;
+        try {
+          listed = requiredJsonCommand(
+            `herdr agent list in ${this.sessionName}`,
+            herdrSessionArgs(this.sessionName, ['agent', 'list']),
+            { timeout: Math.max(1, Math.min(5000, detectionDeadline - Date.now())), env: this.childEnv },
+          );
+        } catch (err: any) {
+          // One slow/failed poll on a loaded host (the CLI timed out, no output)
+          // is not a verdict on the launch: keep polling until the deadline.
+          // A structured herdr error is, and still fails the launch at once.
+          if (err?.herdrStructuredError) throw err;
+          lastListError = err instanceof Error ? err : new Error(String(err));
+          sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
+          continue;
+        }
         const agent = extractAgents(listed).find(row => row?.pane_id === paneId && !agentRowExited(row));
         if (agent?.agent === kind) {
           detected = true;
@@ -1212,7 +1229,10 @@ export class HerdrBackend implements SessionBackend {
         sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
       }
       if (!detected) {
-        throw new Error(`Herdr did not detect "${kind}" in pane ${paneId} within ${PANE_AGENT_START_TIMEOUT_MS} ms`);
+        throw new Error(
+          `Herdr did not detect "${kind}" in pane ${paneId} within ${PANE_AGENT_START_TIMEOUT_MS} ms`
+          + (lastListError ? ` (last agent list error: ${lastListError.message})` : ''),
+        );
       }
 
       requiredJsonCommand(

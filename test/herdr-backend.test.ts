@@ -545,7 +545,7 @@ describe('HerdrBackend.spawn', () => {
     setManagedLaunchResponses('pi', [{
       match: a => a.includes('agent') && a.includes('list'),
       reply: () => {
-        vi.setSystemTime(++polls === 1 ? 29_950 : 30_000);
+        vi.setSystemTime(++polls === 1 ? 59_950 : 60_000);
         return JSON.stringify({ result: { agents: [
           { name: null, pane_id: MANAGED_PANE, agent: null },
         ] } });
@@ -554,7 +554,7 @@ describe('HerdrBackend.spawn', () => {
     const be = new HerdrBackend(SESSION);
 
     expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
-      .toThrow(/did not detect "pi" in pane w_launch-1 within 30000 ms/);
+      .toThrow(/did not detect "pi" in pane w_launch-1 within 60000 ms/);
     const listCalls = mockedExecFileSync.mock.calls.filter(call => {
       const args = call[1] as string[];
       return args.includes('agent') && args.includes('list');
@@ -564,6 +564,64 @@ describe('HerdrBackend.spawn', () => {
     expect(herdrCall('workspace', 'close', MANAGED_WORKSPACE)).toBeDefined();
     expect(herdrCall('agent', 'rename')).toBeUndefined();
     expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: a failed agent list poll (CLI timed out, no output) keeps polling instead of failing the launch', () => {
+    // Loaded host (load ≈ 25): single `herdr agent list` calls hit their 5s
+    // exec timeout while the CLI is still coming up. Each one used to fail the
+    // whole launch as "herdr agent list … failed"; a message-started session
+    // has no daemon-side retry, so the user saw 会话启动失败.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let polls = 0;
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => {
+        polls++;
+        vi.setSystemTime(polls * 5_000);
+        if (polls <= 2) {
+          throw Object.assign(new Error('Command failed: herdr agent list'), {
+            status: null, signal: 'SIGTERM', stdout: '', stderr: '',
+          });
+        }
+        return JSON.stringify({ result: { agents: [
+          { name: null, pane_id: MANAGED_PANE, agent: 'pi', agent_status: 'idle' },
+        ] } });
+      },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    // MUTATION CHECK: rethrowing every poll failure fails here with
+    // "herdr agent list … failed" on the first poll.
+    expect(polls).toBe(3);
+    expect(herdrCall('agent', 'rename')).toBeDefined();
+    expect(herdrCall('workspace', 'close')).toBeUndefined();
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: agent list failing until the deadline reports the timeout with the last poll error', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let polls = 0;
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => {
+        vi.setSystemTime(++polls * 20_000);
+        throw Object.assign(new Error('Command failed: herdr agent list'), {
+          status: null, signal: 'SIGTERM', stdout: '', stderr: '',
+        });
+      },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(/did not detect "pi" in pane w_launch-1 within 60000 ms \(last agent list error: herdr agent list in .* failed\)/);
+    expect(polls).toBe(3);
+    expect(herdrCall('workspace', 'close', MANAGED_WORKSPACE)).toBeDefined();
+    expect(herdrCall('agent', 'rename')).toBeUndefined();
     expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
     be.kill();
   });
