@@ -1779,7 +1779,8 @@ export interface BotConfig {
    *     docs/design/2026-09-21-sandbox-scratch-mode.md.
    *   false/"off"/missing — no local file isolation.
    * Env BOTMUX_SANDBOX=1 forces oncall, BOTMUX_SANDBOX=scratch forces scratch
-   * (testing/global).
+   * (testing/global); unset/0/false means no force and never turns this off
+   * (see resolveSandboxMode).
    */
   sandbox?: boolean | 'oncall' | 'scratch' | 'off';
   /**

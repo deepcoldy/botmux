@@ -8,6 +8,13 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { thinkingCard: true, cotEnabled: false }).cotEnabled).toBe(false);
   });
 
+  it('passes the daemon\'s scratch capability probe through, and null for an older daemon without one', () => {
+    const cap = { platform: 'linux', summary: 'disk-only', undecided: [], submountsReadOnly: true, autoInstall: false };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { scratchCapability: cap }).scratchCapability).toEqual(cap);
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).scratchCapability).toBeNull();
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { scratchCapability: 'bogus' }).scratchCapability).toBeNull();
+  });
+
   it('maps retired final-only settings to a dynamic reply with the separate status card off', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { replyCardMode: 'final-only' }))
       .toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });

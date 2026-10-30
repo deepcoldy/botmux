@@ -132,6 +132,8 @@ Botmux 提供多层次的运行隔离机制，保护你的宿主开发机免受�
 
 环境变量覆盖（适合测试或全局守护，对本机所有 Bot 生效）：`BOTMUX_SANDBOX=1`（白名单隔离）或 `BOTMUX_SANDBOX=scratch`。
 
+优先级：`BOTMUX_SANDBOX` 取 `1` / `oncall` / `scratch` 时强制所有 Bot 用该模式；未设、空、`0`、`false` 表示不强制，各 Bot 按自己的 `sandbox` 配置（旧配置 `readIsolation: true` 按白名单隔离），**不会关掉 Bot 自己开的沙盒**；其它取值报错拒绝启动。这个环境变量只能强制开，不能全局关。
+
 ---
 
 ## 4. 网络沙盒（Network Sandbox）

@@ -132,6 +132,8 @@ Configure in `~/.botmux/bots.json`:
 
 Environment variable overrides (useful for testing; applies to every bot on the machine): `BOTMUX_SANDBOX=1` (allowlist isolation) or `BOTMUX_SANDBOX=scratch`.
 
+Precedence: when `BOTMUX_SANDBOX` is `1` / `oncall` / `scratch`, every bot is forced into that mode. Unset, empty, `0` or `false` means no force: each bot follows its own `sandbox` setting (the legacy `readIsolation: true` counts as allowlist isolation), and **a sandbox the bot enables itself is never turned off**. Any other value is rejected at startup. The variable can only force the sandbox on, never turn it off globally.
+
 ---
 
 ## 4. Network Sandbox

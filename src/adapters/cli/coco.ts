@@ -7,11 +7,11 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson } from './model-catalog-json.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from '../../services/coco-transcript.js';
-import { traeConfigPath, traeHistoryPath } from '../../services/traex-paths.js';
+import { traeCliStatePath, traeConfigPath, traeHistoryPath } from '../../services/traex-paths.js';
 import { traexHistoryMatchDelta } from '../../services/traex-transcript.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
-import { TRAE_MIGRATION_DONE_MARKERS } from './traex.js';
+import { traeMigrationDoneMarkers } from './traex.js';
 import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 
 /** Legacy global submit log — CoCo / traecli <0.201.5 appends one JSON line
@@ -160,9 +160,11 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // mutate shared hook/plugin code). Coco runs the SAME traecli binary as traex,
     // so it hits the same first-run migration prompt; the done-markers it needs
     // are exposed READ-ONLY via sandboxReadonlyPaths() below.
-    authPaths: ['~/.trae/cli', '~/.cache/coco'],
+    // The Trae half follows TRAE_HOME (resolved at read time, like traex);
+    // ~/.cache/coco is CoCo's own fixed location.
+    get authPaths(): string[] { return [traeCliStatePath(), '~/.cache/coco']; },
     // CoCo reads the same Gateway entry without widening shared config writes.
-    sandboxReadonlyPaths: () => [traeConfigPath(), ...TRAE_MIGRATION_DONE_MARKERS],
+    sandboxReadonlyPaths: env => [traeConfigPath(env), ...traeMigrationDoneMarkers(env)],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass, hideRateLimitModelNudge }) {

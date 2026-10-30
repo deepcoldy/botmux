@@ -85,6 +85,27 @@ describe('global dashboard config', () => {
     });
   });
 
+  it('validates idle auto-compaction dashboard settings', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: {
+        autoCompactEnabled: true,
+        autoCompactThreshold: 75.4,
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().dashboard).toEqual({
+      autoCompactEnabled: true,
+      autoCompactThreshold: 75,
+    });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { autoCompactEnabled: false, autoCompactThreshold: 101 },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard).toEqual({ autoCompactEnabled: false });
+  });
+
   it('uses an absolute operator-provided global config path', () => {
     const shared = join(home, 'control', 'config.json');
     mkdirSync(dirname(shared), { recursive: true });
