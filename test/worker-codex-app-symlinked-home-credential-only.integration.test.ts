@@ -12,10 +12,12 @@
  * path keeps resolving: if a change hid or dropped the link inside the pane,
  * the runner could not consume its bootstrap and never authenticate.
  *
- * Starts a real sandbox: run it inside isolate-run (private /tmp, PID and
- * mount space). Needs a host where bwrap can create user + PID namespaces —
- * on isolate-run that means mounting a spare procfs first; GitHub runners
- * disable unprivileged user namespaces, so it skips there.
+ * Starts a real sandbox, so it needs a host where bwrap can create user +
+ * PID namespaces: CI enables bwrap on the runner (see the bwrap setup step in
+ * .github/workflows/ci.yml), where both cases really execute; a nested
+ * isolate-run additionally needs a spare procfs mounted first (its own PID
+ * namespace cannot provide bwrap's inner `--proc`), and without that the
+ * suite skips on the host-side namespace probe.
  */
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -24,7 +26,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
@@ -64,9 +66,17 @@ function waitFor(logs: string[], predicate: () => boolean, timeoutMs = 40_000): 
   });
 }
 
-describe.skipIf(!credentialOnlyBwrap || !existsSync(runnerPath))(
+describe.skipIf(!credentialOnlyBwrap)(
   'Codex App on a symlinked HOME under credential-only bwrap',
   () => {
+    // A missing build is a harness error, not an unsupported host: fail loudly
+    // like the other dist/-dependent suites instead of silently skipping.
+    beforeAll(() => {
+      if (!existsSync(runnerPath)) {
+        throw new Error('dist/codex-app-runner.js missing — run `bun run build` first');
+      }
+    });
+
     it.each(['pty', 'tmux'] as const)('%s authenticates the runner and completes a turn', async backendType => {
       const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-p5-home-')));
       tempDirs.add(base);
@@ -77,6 +87,9 @@ describe.skipIf(!credentialOnlyBwrap || !existsSync(runnerPath))(
       symlinkSync(realHome, linkHome);
       expect(realpathSync(linkHome)).not.toBe(linkHome);
       // Device enrollment marker: every new local CLI must run credential-only.
+      // Deliberately EMPTY: the worker only lstat()s this path, so an empty or
+      // unparseable marker still means "enrolled" (fail closed) — do not replace
+      // it with a well-formed pending marker, which would probe a different rule.
       writeFileSync(deviceCredentialIsolationMarkerPath(linkHome), '');
       const fakeCodex = join(base, 'fake-codex');
       copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
@@ -133,9 +146,13 @@ describe.skipIf(!credentialOnlyBwrap || !existsSync(runnerPath))(
       // It really ran confined: the app-server lives in bwrap's PID namespace,
       // so its in-namespace pid (written by the fake) differs from the host
       // pid the worker attested.
-      const attestation = messages.findLast(
-        (m): m is Extract<WorkerToDaemon, { type: 'local_process_attestation' }> => m.type === 'local_process_attestation',
-      );
+      // The last attestation overall can be an engineless one (an engine clear
+      // re-publishes cliPid alone); take the last one that still carries a pid.
+      const attestation = messages.filter(
+        (m): m is Extract<WorkerToDaemon, { type: 'local_process_attestation' }>
+          & { enginePid: number } =>
+          m.type === 'local_process_attestation' && m.enginePid !== undefined,
+      ).at(-1);
       expect(attestation?.enginePid).toBeGreaterThan(1);
       const status = readFileSync(`/proc/${attestation!.enginePid}/status`, 'utf8');
       const nsPids = status.match(/^NSpid:\s+(.+)$/m)![1]!.trim().split(/\s+/);
