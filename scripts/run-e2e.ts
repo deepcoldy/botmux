@@ -5,7 +5,7 @@
  * runs without mixing logs, screenshots, or HTML reports.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { sweepOrphanSchedTasks } from '../test/e2e-browser/schedule-cleanup.js';
 
 const groupUrl = process.env.FEISHU_TEST_GROUP_URL;
@@ -158,10 +158,18 @@ function mockCliEnv(cliId: string, baseUrl: string): Record<string, string> | nu
         KIMI_DISABLE_TELEMETRY: '1',
       };
     case 'gemini':
-      // Gemini CLI runs headless when CI or GITHUB_ACTIONS is "true" (both set
-      // on GitHub runners): it reads the prompt from stdin, finds none and
-      // exits 42 before every turn.
-      return { GOOGLE_GEMINI_BASE_URL: baseUrl, GEMINI_API_KEY: 'mock-test-key', CI: 'false', GITHUB_ACTIONS: 'false' };
+      // Gemini CLI detects the GitHub runner twice over:
+      // - CI or GITHUB_ACTIONS "true": it runs headless, reads the prompt from
+      //   stdin, finds none and exits 42 before every turn;
+      // - GITHUB_SHA set: its shell tool strips every variable outside a short
+      //   allow-list, BOTMUX_* included, so `botmux send` cannot reply.
+      return {
+        GOOGLE_GEMINI_BASE_URL: baseUrl,
+        GEMINI_API_KEY: 'mock-test-key',
+        CI: 'false',
+        GITHUB_ACTIONS: 'false',
+        GITHUB_SHA: '',
+      };
     case 'pi':
       return { PI_SKIP_VERSION_CHECK: '1' };
     default:
@@ -170,6 +178,8 @@ function mockCliEnv(cliId: string, baseUrl: string): Record<string, string> | nu
 }
 
 const daemonChildren: import('node:child_process').ChildProcess[] = [];
+/** Temp working directories minted for sandboxed test bots; removed in cleanup(). */
+const sandboxWorkDirs: string[] = [];
 const startDaemon =
   process.argv.includes('--start-daemon') ||
   process.env.BOTMUX_START_DAEMON === 'true' ||
@@ -192,9 +202,42 @@ if (startDaemon) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         let changed = false;
+        const { sandboxSecretPaths, planSandboxBotConfig } = await import('../test/helpers/mock-llm-server/sandbox-probe.js');
+        const { mkdtempSync } = await import('node:fs');
+        const { tmpdir } = await import('node:os');
         for (const b of parsed) {
-          if (!b.workingDir || !existsSync(b.workingDir)) {
-            b.workingDir = '.';
+          const sandboxPlan = planSandboxBotConfig(b, {
+            existsSync,
+            makeTempWorkDir: () => {
+              const dir = mkdtempSync(join(tmpdir(), 'botmux-sbx-work-'));
+              sandboxWorkDirs.push(dir);
+              return dir;
+            },
+            cwd: process.cwd(),
+            joinPath: join,
+            secretPaths: sandboxSecretPaths(),
+          });
+          if (sandboxPlan.workingDir !== undefined && sandboxPlan.workingDir !== b.workingDir) {
+            b.workingDir = sandboxPlan.workingDir;
+            changed = true;
+          }
+          if (
+            sandboxPlan.workingDirs !== undefined &&
+            (b.workingDirs?.length !== 1 || b.workingDirs[0] !== sandboxPlan.workingDirs[0])
+          ) {
+            b.workingDirs = sandboxPlan.workingDirs;
+            changed = true;
+          }
+          if (sandboxPlan.defaultWorkingDir !== undefined && sandboxPlan.defaultWorkingDir !== b.defaultWorkingDir) {
+            b.defaultWorkingDir = sandboxPlan.defaultWorkingDir;
+            changed = true;
+          }
+          if (sandboxPlan.defaultOncallWorkingDir !== undefined && b.defaultOncall?.workingDir !== undefined) {
+            b.defaultOncall = { ...b.defaultOncall, workingDir: sandboxPlan.defaultOncallWorkingDir };
+            changed = true;
+          }
+          if (sandboxPlan.sandboxPaths) {
+            b.sandboxPaths = { ...(b.sandboxPaths ?? {}), deny: sandboxPlan.sandboxPaths.deny };
             changed = true;
           }
           if (b.p2pMode !== 'thread') {
@@ -294,6 +337,15 @@ const cleanup = async () => {
   for (const dc of daemonChildren) {
     try {
       if (!dc.killed) dc.kill('SIGKILL');
+    } catch {
+      /* ignore */
+    }
+  }
+  // Daemons are gone, so the sandboxed bots' temp working directories are safe
+  // to remove (recursive: the lane writes probe files into them).
+  for (const dir of sandboxWorkDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
     } catch {
       /* ignore */
     }

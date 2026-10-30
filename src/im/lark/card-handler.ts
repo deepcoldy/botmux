@@ -91,7 +91,7 @@ import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.
 import { selectionKeyForBot } from '../../setup/cli-selection.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -3812,7 +3812,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
       let cardJson: string | undefined;
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -4412,7 +4412,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         opts: { canReceiveFreshFrame: boolean; serviceTierBadge: string | undefined; idleLabel: ReturnType<typeof streamCardLabel> },
       ): { cardJson: string; unavailable: boolean } => {
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         // Only a frame whose capturing turn may be shown here (silent /
         // managed / substitute sources are filtered out).
@@ -4614,7 +4614,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // fresh screenshot PATCH (~1s).
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         // workerHasInitialized() also passes for a restored session that kept
         // its Web Terminal port, so the status cannot assume a running CLI.
@@ -4695,7 +4695,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // 唯一差异是 status 参数传 'interrupted' 而非 ds.lastScreenStatus。
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -4901,7 +4901,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         // workerHasInitialized() also passes for a restored session that kept
         // its Web Terminal port, so the status cannot assume a running CLI.

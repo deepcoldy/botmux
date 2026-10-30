@@ -55,7 +55,7 @@ From then on, **all of the bot's unbound groups** automatically bind to this dir
 - Only the **owner / admins** (`allowedUsers`) can switch session state (`/cd`, `/restart`, `/close`, clicking the streaming card buttons)
 - This prevents external group members from accidentally messing up the session
 
-> Want semi-trusted members' **changes to also never touch the real repo**? Enable the [File Sandbox](/en/sandbox) — all writes are isolated and only land after the owner reviews the diff.
+> An Oncall binding by itself **does not restrict file access**. To keep semi-trusted members away from secrets and other repositories, enable the [File Sandbox](/en/sandbox) in allowlist isolation (the working directory stays writable and changes reach the host directly); to keep changes off your main branch, open the topic in a separate worktree with `/tw`.
 
 ## Take Off with Scheduled Tasks
 

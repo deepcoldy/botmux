@@ -26,6 +26,9 @@ import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
+import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
+import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { buildPiArgs, createPiAdapter } from '../src/adapters/cli/pi.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
 import { sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
 import { sessionSkillSnapshotRoot } from '../src/core/skills/snapshot.js';
@@ -264,6 +267,96 @@ describe('buildFsPolicy', () => {
     ]) {
       expect(accessForPath(p.rules, path).access).toBe('readWrite');
     }
+  });
+
+  it('pi sees its own config stores but only the current session transcript dir', () => {
+    const adapter = createPiAdapter('/usr/bin/pi', () => '/opt/botmux/pi-ext.js');
+    const ownSessionDir = adapter.sandboxSessionDir!('self');
+    const home = ownSessionDir.slice(0, ownSessionDir.indexOf('/.pi/'));
+    const sessionsRoot = `${home}/.pi/agent/sessions`;
+    expect(ownSessionDir).toBe(`${sessionsRoot}/botmux/self`);
+    for (const bad of ['', '.', '..', 'a/b', 'a\\b']) expect(() => adapter.sandboxSessionDir!(bad)).toThrow(/Invalid Botmux session id/);
+    // The worker's shape for an adapter-declared session dir (as for OMP/ebsd).
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: home,
+      botHome: `${home}/.botmux/bots/cli_self`,
+      botmuxHome: `${home}/.botmux`,
+      sessionDataDir: `${home}/.botmux/data`,
+      workingDir: `${home}/proj`,
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, home)),
+      mandatoryDenyPaths: [sessionsRoot],
+      extraWritePaths: [ownSessionDir],
+    }));
+    for (const path of [
+      `${home}/.pi/agent/models.json`,
+      `${home}/.pi/agent/settings.json`,
+      `${home}/.pi/agent/settings.json.lock`,
+      `${home}/.pi/agent/trust.json`,
+      `${home}/.pi/agent/auth.json`,
+      `${ownSessionDir}/2026-10-30T00-00-00-000Z_self.jsonl`,
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+    // Native cwd buckets hold every other Pi session on the host.
+    expect(accessForPath(p.rules, `${sessionsRoot}/--home-u-proj--/x_other.jsonl`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${sessionsRoot}/botmux/sibling/x.jsonl`).access).toBe('deny');
+    // Pi is pointed at that dir, and only when the sandbox hands one over.
+    const args = (sessionDir?: string) => buildPiArgs({ sessionId: 'self', turnBoundaryExtension: '/x.js', sessionDir });
+    expect(args(ownSessionDir)).toEqual(expect.arrayContaining(['--session-dir', ownSessionDir]));
+    expect(args()).not.toContain('--session-dir');
+  });
+
+  it('opencode sees its global config dir (providers, botmux ask plugin, plugin deps)', () => {
+    const adapter = createOpenCodeAdapter('/usr/bin/opencode');
+    const expand = (path: string) => path.replace(/^~/, '/home/u');
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(expand),
+    }));
+    for (const path of [
+      '/home/u/.config/opencode/opencode.json',
+      '/home/u/.config/opencode/plugin/botmux-ask.js',
+      '/home/u/.config/opencode/node_modules/@opencode-ai/plugin/package.json',
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+    expect(accessForPath(p.rules, '/home/u/.local/share/opencode/opencode.db').access).toBe('readWrite');
+    // Only OpenCode's own dir: the rest of ~/.config stays out.
+    expect(accessForPath(p.rules, '/home/u/.config/other-tool/token.json').access).toBe('none');
+  });
+
+  it('gemini keeps its whole state dir writable: settings, folder trust (tmp + rename) and OAuth', () => {
+    const adapter = createGeminiAdapter('/usr/bin/gemini');
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+    }));
+    for (const path of [
+      '/home/u/.gemini/settings.json',
+      '/home/u/.gemini/trustedFolders.json',
+      '/home/u/.gemini/trustedFolders.json.tmp.0b5c',
+      '/home/u/.gemini/oauth_creds.json',
+      '/home/u/.gemini/tmp/proj/chats/session.json',
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+    // The grant stays the CLI's own dir: sibling bots and host secrets stay out.
+    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/home/u/.ssh/id_rsa').access).toBe('deny');
   });
 
   it('darwin baseline: system ro, scratch rw, crown jewels denied, lark-cli store denied', () => {

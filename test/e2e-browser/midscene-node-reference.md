@@ -41,6 +41,8 @@ Projects created by `midscene-test create` select `cases/**/*.{yaml,yml}` by def
 
 **Case files:** `cases/core-queue.yaml` (Execution Project: feishu-core-queue)
 
+**Case files:** `cases/core-sandbox.yaml` (Execution Project: feishu-core-sandbox)
+
 Files matching `files.exclude` are not selected. Midscene Test always ignores `.git/`, `.midscene/`, `midscene_run/`, and `node_modules/` directories, including nested ones.
 
 Call a Node in `cases[].steps`, or in the Workflow Document lifecycle steps `beforeAll`, `beforeEach`, `afterEach`, and `afterAll`. Root Nodes are shared defaults; `projects[].nodes` adds local Nodes and overrides same-named root Nodes only within that Execution Project. Each Execution Project supplies its own runtime environment.
@@ -160,6 +162,7 @@ Run one migrated Botmux Feishu browser scenario
         "private-topic-reply",
         "scheduled-task-thread",
         "web-terminal",
+        "sandbox-file-isolation",
         "traex-ambient-continuity",
         "dm-chat-claude",
         "dm-thread-claude",

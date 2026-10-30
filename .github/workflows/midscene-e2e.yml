@@ -248,7 +248,7 @@ jobs:
           claude --version
           codex --version
 
-      - name: Install public CLI runtimes for the core-clis lane
+      - name: Install public CLI runtimes and sandbox tools for the core-clis and core-sandbox lanes
         if: steps.feishu_config.outputs.ready == 'true'
         # Each CLI talks to the mock LLM on 127.0.0.1:9999 (scripts/run-e2e.ts).
         # OpenCode, Kimi and Gemini get it through the bot env (mockCliEnv);
@@ -283,6 +283,13 @@ jobs:
           # first prompt; auto-update would npm-install a newer CLI mid-run.
           mkdir -p ~/.gemini
           echo '{"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false},"security":{"auth":{"selectedType":"gemini-api-key"},"folderTrust":{"enabled":false}},"privacy":{"usageStatisticsEnabled":false}}' > ~/.gemini/settings.json
+
+          # The core-sandbox lane: bubblewrap, and Ubuntu 24.04 restricts
+          # unprivileged user namespaces through AppArmor by default.
+          sudo apt-get install -y bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
           export PATH="$HOME/.bun/bin:$HOME/.kimi-code/bin:$HOME/.grok/bin:$PATH"
           # OpenCode's first start downloads its model catalog and installs a

@@ -112,6 +112,26 @@ describe('local-cli-opener', () => {
     });
   });
 
+  it('keeps a Pi resume command that points at the session\'s own dir, and nothing looser', () => {
+    const session = ds({ session: { ...ds().session, cliId: 'pi', cliSessionId: undefined } });
+    const open = (raw: string) => buildLocalCliOpenCommand(session, {
+      mode: 'resume',
+      adapterFactory: () => ({ buildResumeCommand: () => raw }),
+    });
+    const valid = "pi --session-id 'bm-1' --session-dir '/home/u/.pi/agent/sessions/botmux/bm-1'";
+    expect(open(valid)).toEqual({ ok: true, command: `cd '/tmp/project'\\''s dir' && ${valid}` });
+    // The plain form still gets its id quoted as before.
+    expect(open('pi --session-id bm-1')).toEqual({ ok: true, command: "cd '/tmp/project'\\''s dir' && pi --session-id 'bm-1'" });
+    for (const raw of [
+      "pi --session-id 'bm-1' --session-dir '/home/u/x'; touch /tmp/pwn",
+      "pi --session-id 'bm-1' --session-dir 'relative/dir'",
+      "pi --session-id bm-1 --session-dir '/home/u/x'",
+      "pi --session-id 'bm-1' --session-dir '/home/u/x' --model extra",
+    ]) {
+      expect(open(raw)).toMatchObject({ ok: false, error: 'missing_resume_id' });
+    }
+  });
+
   it('accepts only the exact shell-quoted OMP resume command shape', () => {
     const session = ds({
       session: { ...ds().session, cliId: 'oh-my-pi', cliSessionId: undefined },

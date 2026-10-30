@@ -13,7 +13,12 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'gemini',
-    authPaths: ['~/.gemini/oauth_creds.json'],
+    // Whole ~/.gemini, like antigravity (which shares it). Under the oncall
+    // sandbox a single-file grant left settings.json (selected auth method)
+    // and trustedFolders.json out, so every sandboxed start stopped on the
+    // auth / folder-trust dialogs; trustedFolders.json is also saved via
+    // tmp + rename, which needs the directory writable.
+    authPaths: ['~/.gemini'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ initialPrompt, model, disableCliBypass }) {

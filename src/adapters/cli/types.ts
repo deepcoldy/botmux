@@ -288,6 +288,11 @@ export interface CliAdapter {
     hideRateLimitModelNudge?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
+    /** Exact per-session transcript dir the worker re-opened read-write inside
+     *  the oncall file sandbox (the shared sessions tree around it is masked).
+     *  Set only for adapters declaring `sandboxSessionDir` and only when that
+     *  sandbox is on; the adapter must point its CLI at it. */
+    sandboxSessionDir?: string;
     /** True when this session runs under per-bot read isolation (the worker
      *  wraps the whole CLI process in a Seatbelt sandbox). Adapters use it for
      *  isolation-specific spawn tweaks only (e.g. Codex forwards its env to
@@ -920,6 +925,15 @@ export interface CliAdapter {
    *  Resolved lazily / read AFTER buildArgs() (so a lazily-resolved bin is cached).
    *  Missing/empty → no extra re-expose. */
   sandboxExtraExecPaths?(): readonly string[];
+
+  /** Exact per-session transcript dir for the oncall file sandbox, when the
+   *  CLI's session store is otherwise shared across sessions inside a state
+   *  dir that `authPaths` grants read-write. The worker creates it, masks its
+   *  grandparent (the shared sessions root) as a mandatory deny, re-opens this
+   *  dir read-write, and hands it back through `buildArgs({ sandboxSessionDir })`.
+   *  Must return `<sessionsRoot>/botmux/<sessionId>`. Not consulted when the
+   *  sandbox is off, so the unsandboxed layout never changes. */
+  sandboxSessionDir?(sessionId: string): string;
 
   /** Absolute paths (files or dirs) this adapter needs visible READ-ONLY inside
    *  the file sandbox — distinct from `authPaths`, which are bound READ-WRITE.

@@ -4,13 +4,10 @@ import {
   memo,
   useCallback,
   useEffect,
-  useId,
   useLayoutEffect,
   useMemo,
-  useReducer,
   useRef,
   useState,
-  type DragEvent,
   type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -36,36 +33,33 @@ import { FeedGroupAuthOverlay, FeedGroupAuthPrompt, useFeedGroups } from './feed
 import { BotMultiSelect } from './bot-multi-select.js';
 import { SessionHorizontalScrollbar } from './session-horizontal-scrollbar.js';
 import {
-  KANBAN_TEAM_STORAGE_KEY,
   normalizeSessionsViewMode,
-  readStoredBoardOrder,
   readStoredCreateKeepOpen,
   readStoredHiddenTableColumns,
-  readStoredKanbanGroupBy,
   readStoredSessionsShowUnknownChats,
   readStoredSessionsViewMode,
-  type KanbanGroupBy,
   type SessionsViewMode,
-  writeStoredBoardOrder,
   writeStoredCreateKeepOpen,
   writeStoredHiddenTableColumns,
-  writeStoredKanbanGroupBy,
   writeStoredSessionsShowUnknownChats,
   writeStoredSessionsViewMode,
 } from './preferences.js';
 import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import {
-  BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
   ICON,
   SESSION_STATUS_OPTIONS,
   canRestartSession,
+  clearSessionFilters,
   cssToken,
-  deriveSessionBoardColumn,
+  filterSessionRows,
+  hasActiveSessionFilters,
+  normalizeStatusFilterForView,
+  SESSION_STATUS_ANY,
+  type SessionRowFilters,
   fetchPickerBots,
   formatTokenCount,
-  groupSessionsByTopic,
   historySenderKey,
   isUnknownChatSession,
   lockActionLabel,
@@ -78,21 +72,13 @@ import {
   sessionLocationText,
   preferChatFilterLabel,
   sessionLocationTitle,
-  sessionExchangePreview,
   sessionRuntimeCounts,
-  sessionSearchText,
-  sessionTopicKey,
   sessionStatusText,
   shouldOpenWritableTerminal,
-  previewOverlayReducer,
-  previewOverlayInitialState,
   terminalHref,
   tokenCount,
-  type BoardColumnId,
   type PickerBot,
-  type SessionTopicGroup,
 } from './sessions.js';
-import { previewMarkdownHtml } from './preview-markdown.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
 import { dashboardShellAllowsWebTerminal } from './client-shell.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
@@ -106,24 +92,19 @@ import {
 } from './create-session-composer.js';
 import { store } from './store.js';
 import {
-  attentionWaitSince,
   botAvatarHtml,
   botDisplayName,
-  chatAvatarHtml,
-  chatDisplayTitle,
   loadNameMaps,
   relTime,
   stripMentionPrefix,
   t,
   ui,
 } from './ui.js';
-import type { SessionKanbanColumn } from './kanban-model.js';
+import { isOffBoardDormant, type SessionKanbanColumn } from './kanban-model.js';
 import {
   SessionsKanbanView,
   type SessionsKanbanIcons,
   type SessionsKanbanMove,
-  type SessionsKanbanTeam,
-  type SessionsKanbanTeamBoardData,
 } from './sessions-kanban.js';
 import { toast } from './toast.js';
 import { confirm } from './confirm-modal.js';
@@ -132,27 +113,13 @@ import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
 
-type FiltersState = {
-  q: string;
-  status: string;
-  adopt: string;
-  chat: string;
-  multiBotTopics: boolean;
-  botTriggeredTopics: boolean;
-  showUnknownChats: boolean;
-  active: boolean;
-  cli: Set<string>;
-};
+type FiltersState = SessionRowFilters;
 
 type ChatFilterOption = { value: string; label: string };
 
-type ChatBotsMap = Map<string, { botIds: Set<string>; observedNames: Set<string> }>;
-
-type TeamBoardState = {
-  data: SessionsKanbanTeamBoardData | null;
-  key: string;
-  fetchedAt: number;
-};
+function initialFilters(q: string, showUnknownChats: boolean): FiltersState {
+  return { q, status: '', adopt: '', bot: '', chat: '', cli: '', showUnknownChats };
+}
 
 type HistoryState = {
   sessionId: string;
@@ -392,57 +359,6 @@ function IconActionButton(props: {
   );
 }
 
-function TerminalControls(props: { row: any; url: string | null }): React.JSX.Element | null {
-  if (!props.url || !dashboardShellAllowsWebTerminal()) return null;
-  const canOpenWritable = shouldOpenWritableTerminal();
-  return (
-    <span className="term-pill">
-      <a
-        className="term-btn term-open"
-        href={props.url}
-        target="_blank"
-        rel="noopener"
-        data-action="terminal"
-        data-tip={t('sessions.openReadonlyTerminal')}
-        aria-label={t('sessions.openReadonlyTerminal')}
-        onClick={event => event.stopPropagation()}
-        dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
-      />
-      {canOpenWritable ? (
-        <button
-          type="button"
-          className="term-btn term-write"
-          data-action="write-link"
-          data-tip={t('sessions.openWritableTerminal')}
-          aria-label={t('sessions.openWritableTerminal')}
-          onClick={(event) => {
-            event.stopPropagation();
-            void openWriteLink(props.row, event.currentTarget);
-          }}
-          dangerouslySetInnerHTML={rawHtml(ICON.key)}
-        />
-      ) : null}
-    </span>
-  );
-}
-
-function ChatScopeLink(props: { row: any; className?: string }): React.JSX.Element | null {
-  const row = props.row;
-  if (row.scope !== 'chat' || !row.feishuChatLink) return null;
-  return (
-    <a
-      className={props.className ?? 'card-act'}
-      href={row.feishuChatLink}
-      target="_blank"
-      rel="noopener"
-      data-tip={t('sessions.openChat')}
-      aria-label={t('sessions.openChat')}
-      onClick={event => event.stopPropagation()}
-      dangerouslySetInnerHTML={rawHtml(ICON.feishu)}
-    />
-  );
-}
-
 function SortHeader(props: {
   sort: string;
   label: string;
@@ -487,23 +403,6 @@ function compareRows(a: any, b: any, sortKey: string, sortDir: 'asc' | 'desc'): 
   else cmp = String(av).localeCompare(String(bv));
   if (cmp === 0) cmp = Number(a.lastMessageAt ?? 0) - Number(b.lastMessageAt ?? 0);
   return sortDir === 'asc' ? cmp : -cmp;
-}
-
-function boardSignalLabel(s: any): string {
-  if (s.agentAttention?.reason) return s.agentAttention.reason;
-  if (s.agentAttention) return t('sessions.board.signalAgent');
-  if (s.pendingRepo) return t('sessions.board.signalRepo');
-  if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
-  if (s.status === 'limited') return t('sessions.board.signalLimited');
-  if (s.status === 'stalled') return t('sessions.board.signalStalled');
-  return '';
-}
-
-function compareBoardRows(a: any, b: any, column: BoardColumnId): number {
-  const av = column === 'needs-you' ? attentionWaitSince(a) : Number(a.lastMessageAt ?? 0);
-  const bv = column === 'needs-you' ? attentionWaitSince(b) : Number(b.lastMessageAt ?? 0);
-  if (av !== bv) return column === 'needs-you' ? av - bv : bv - av;
-  return String(a.title ?? a.sessionId).localeCompare(String(b.title ?? b.sessionId));
 }
 
 function historyTime(v: unknown): string {
@@ -564,306 +463,59 @@ function LocateButton(props: { row: any; locateSession: (row: any) => Promise<bo
   );
 }
 
-// Icon variant of LocateButton for board/list cards: same React-owned busy+30s
-// cooldown, but renders the pin icon via IconActionButton (no imperative DOM writes).
-function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boolean> }): React.JSX.Element {
-  const [cooldown, setCooldown] = useState(0);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    if (cooldown <= 0) return undefined;
-    const timer = window.setTimeout(() => setCooldown(cooldown - 1), 1000);
-    return () => window.clearTimeout(timer);
-  }, [cooldown]);
+/** 筛选条上的一个下拉：没选时只显示维度名，选了就显示「维度：值」并高亮。
+ *  复用全站的 DropdownMenu（自绘弹层 + 视口内定位 + 可搜索），不再用原生 <select>。 */
+function FilterChip(props: {
+  name: string;
+  value: string;
+  options: ChatFilterOption[];
+  allLabel: string;
+  searchable?: boolean;
+  onChange: (value: string) => void;
+}): React.JSX.Element {
+  const current = props.options.find(option => option.value === props.value);
+  const active = props.value !== '' && !!current;
   return (
-    <IconActionButton
-      action="locate"
-      icon={ICON.pin}
-      label={cooldown > 0 ? t('sessions.cooldown', { seconds: cooldown }) : t('sessions.locate')}
-      disabled={busy || cooldown > 0}
-      onClick={async () => {
-        setBusy(true);
-        const ok = await props.onLocate(props.row);
-        setBusy(false);
-        if (ok) setCooldown(30);
-      }}
+    <DropdownMenu
+      className={`sessions-filter-chip${active ? ' is-active' : ''}`}
+      ariaLabel={props.name}
+      label={active ? `${props.name}${ui.locale === 'zh' ? '：' : ': '}${current!.label}` : props.name}
+      value={props.value}
+      options={[{ value: '', label: props.allLabel }, ...props.options]}
+      searchable={props.searchable}
+      searchPlaceholder={t('sessions.filters.searchOption')}
+      searchEmptyLabel={t('sessions.filters.noMatch')}
+      onChange={props.onChange}
     />
   );
 }
 
-/** 排序下拉：表格列排序之外的统一入口（看板/状态板/话题视图没有表头可点）。
- *  只写既有 sortKey/sortDir，不引入新数据流。
- *
- *  刻意不并入 dashboard-components 的 SortMenu/DropdownMenu：那是「选值」语义
- *  （再选当前值是 no-op、选后收起、自带外点/Esc 关闭与上下翻转定位），而这里
- *  是「点同一项 = 翻转升降序」，选中项还要带 ↑/↓ 后缀，菜单项走 menu/menuitem
- *  role，且选后保持展开。强行并入要给共享版加 4 个互斥开关，且会改变现有行为。 */
-function SessionsSortMenu(props: {
-  sortKey: string;
-  sortDir: 'asc' | 'desc';
-  onSort: (key: string) => void;
-}): React.JSX.Element {
-  const options = [
-    { key: 'lastMessageAt', label: t('sessions.sort.lastMessageAt') },
-    { key: 'spawnedAt', label: t('sessions.sort.spawnedAt') },
-    { key: 'title', label: t('sessions.sort.title') },
-    { key: 'status', label: t('sessions.sort.status') },
-  ];
-  const current = options.find(option => option.key === props.sortKey) ?? options[0];
-  return (
-    <details className="sessions-sort-menu sect-sort-menu">
-      <summary aria-label={t('sessions.sort')}>
-        <span className="sect-sort-value">
-          {t('sessions.sort')}: {current.label} {props.sortDir === 'asc' ? '↑' : '↓'}
-        </span>
-      </summary>
-      <div className="sect-sort-pop" role="menu">
-        {options.map(option => (
-          <button
-            key={option.key}
-            type="button"
-            role="menuitem"
-            aria-current={option.key === props.sortKey ? 'true' : undefined}
-            onClick={() => props.onSort(option.key)}
-          >
-            {option.label}
-            {option.key === props.sortKey ? (props.sortDir === 'asc' ? ' ↑' : ' ↓') : null}
-          </button>
-        ))}
-      </div>
-    </details>
-  );
-}
-
-/** 高级筛选抽屉：来源 / CLI / 群 / 话题类型等低频筛选收进右侧抽屉，
- *  筛选 state 仍是同一个 FiltersState，只是换了渲染位置。抽屉内一律用原生
- *  <select> + 内联复选列表（不用浮层），避免被抽屉滚动容器裁剪。 */
-function SessionsFilterDrawer(props: {
-  open: boolean;
-  chatOptions: ChatFilterOption[];
-  filters: FiltersState;
-  setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
-  onClose: () => void;
-}): React.JSX.Element {
-  const [cliQuery, setCliQuery] = useState('');
-  const statusOptions = [
-    { value: '', label: t('sessions.anyStatus') },
-    ...SESSION_STATUS_OPTIONS.map(status => ({ value: status, label: sessionStatusText(status) })),
-  ];
-  const adoptOptions = [
-    { value: '', label: t('sessions.adoptAny') },
-    { value: 'yes', label: t('sessions.adoptYes') },
-    { value: 'no', label: t('sessions.adoptNo') },
-  ];
-  const chatOptions = [
-    { value: '', label: t('sessions.chatAny') },
-    ...props.chatOptions,
-  ];
-  const cliQueryNorm = cliQuery.trim().toLowerCase();
-  const visibleClis = cliQueryNorm
-    ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(cliQueryNorm))
-    : CLI_FILTER_OPTIONS;
-  const reset = () => {
-    writeStoredSessionsShowUnknownChats(windowStorage(), false);
-    props.setFilters(() => ({
-      q: props.filters.q,
-      status: '',
-      adopt: '',
-      chat: '',
-      multiBotTopics: false,
-      botTriggeredTopics: false,
-      showUnknownChats: false,
-      active: true,
-      cli: new Set(CLI_FILTER_OPTIONS),
-    }));
-  };
-  return (
-    <ModalDialog
-      open={props.open}
-      className="sessions-filter-drawer"
-      onClose={props.onClose}
-    >
-      <header>
-        <h3>{t('sessions.filters.title')}</h3>
-        <IconActionButton
-          className="card-act drawer-close-btn"
-          icon={ICON.close}
-          label={t('sessions.dismiss')}
-          onClick={props.onClose}
-        />
-      </header>
-      <div className="sessions-filter-drawer-body">
-        <div className="sessions-filter-field">
-          <span className="sessions-filter-label">{t('sessions.status')}</span>
-          <select
-            value={props.filters.status}
-            onChange={event => props.setFilters(prev => ({ ...prev, status: event.currentTarget.value }))}
-          >
-            {statusOptions.map(option => <option key={option.value || 'any'} value={option.value}>{option.label}</option>)}
-          </select>
-        </div>
-        <div className="sessions-filter-field">
-          <span className="sessions-filter-label">{t('sessions.adopt')}</span>
-          <select
-            value={props.filters.adopt}
-            onChange={event => props.setFilters(prev => ({ ...prev, adopt: event.currentTarget.value }))}
-          >
-            {adoptOptions.map(option => <option key={option.value || 'any'} value={option.value}>{option.label}</option>)}
-          </select>
-        </div>
-        <div className="sessions-filter-field">
-          <span className="sessions-filter-label">{t('sessions.location')}</span>
-          <select
-            value={props.filters.chat}
-            onChange={event => props.setFilters(prev => ({ ...prev, chat: event.currentTarget.value }))}
-          >
-            {chatOptions.map(option => <option key={option.value || 'any'} value={option.value}>{option.label}</option>)}
-          </select>
-        </div>
-        <div className="sessions-filter-field">
-          <span className="sessions-filter-label">{t('sessions.cli')}</span>
-          <div className="sessions-filter-cli">
-            <input
-              type="search"
-              className="sessions-filter-cli-search"
-              placeholder={t('sessions.cliSearch')}
-              value={cliQuery}
-              onChange={event => setCliQuery(event.currentTarget.value)}
-            />
-            <div className="sessions-filter-cli-bulk">
-              <button
-                type="button"
-                onClick={() => props.setFilters(prev => ({ ...prev, cli: new Set(CLI_FILTER_OPTIONS) }))}
-              >
-                {t('sessions.cliSelectAll')}
-              </button>
-              <button
-                type="button"
-                onClick={() => props.setFilters(prev => ({ ...prev, cli: new Set() }))}
-              >
-                {t('sessions.cliClear')}
-              </button>
-            </div>
-            <div className="sessions-filter-cli-list">
-              {visibleClis.length === 0 ? (
-                <span className="filter-cli-empty">{t('sessions.cliNoMatch')}</span>
-              ) : visibleClis.map(cli => (
-                <label key={cli} className="filter-check">
-                  <input
-                    type="checkbox"
-                    name="cli"
-                    value={cli}
-                    checked={props.filters.cli.has(cli)}
-                    onChange={event => {
-                      const checked = event.currentTarget.checked;
-                      props.setFilters(prev => {
-                        const next = new Set(prev.cli);
-                        if (checked) next.add(cli);
-                        else next.delete(cli);
-                        return { ...prev, cli: next };
-                      });
-                    }}
-                  />
-                  <span>{cli}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-        </div>
-        <div className="sessions-filter-toggles">
-          <label className="filter-toggle">
-            <input
-              type="checkbox"
-              name="multiBotTopics"
-              checked={props.filters.multiBotTopics}
-              onChange={event => {
-                const multiBotTopics = event.currentTarget.checked;
-                props.setFilters(prev => ({ ...prev, multiBotTopics }));
-              }}
-            />
-            <span className="filter-toggle-label">{t('sessions.multiBotTopics')}</span>
-            <span className="filter-toggle-switch" aria-hidden="true" />
-          </label>
-          <label className="filter-toggle">
-            <input
-              type="checkbox"
-              name="botTriggeredTopics"
-              checked={props.filters.botTriggeredTopics}
-              onChange={event => {
-                const botTriggeredTopics = event.currentTarget.checked;
-                props.setFilters(prev => ({ ...prev, botTriggeredTopics }));
-              }}
-            />
-            <span className="filter-toggle-label">{t('sessions.botTriggeredTopics')}</span>
-            <span className="filter-toggle-switch" aria-hidden="true" />
-          </label>
-          <label className="filter-toggle">
-            <input
-              type="checkbox"
-              name="showUnknownChats"
-              checked={props.filters.showUnknownChats}
-              onChange={event => {
-                const checked = event.currentTarget.checked;
-                writeStoredSessionsShowUnknownChats(windowStorage(), checked);
-                props.setFilters(prev => ({ ...prev, showUnknownChats: checked }));
-              }}
-            />
-            <span className="filter-toggle-label">{t('sessions.showUnknownChats')}</span>
-            <span className="filter-toggle-switch" aria-hidden="true" />
-          </label>
-          <label className="filter-toggle">
-            <input
-              type="checkbox"
-              name="active"
-              checked={props.filters.active}
-              onChange={event => {
-                const active = event.currentTarget.checked;
-                props.setFilters(prev => ({ ...prev, active }));
-              }}
-            />
-            <span className="filter-toggle-label">{t('sessions.activeOnly')}</span>
-            <span className="filter-toggle-switch" aria-hidden="true" />
-          </label>
-        </div>
-      </div>
-      <footer>
-        <button type="button" className="sessions-filter-clear" onClick={reset}>
-          {t('sessions.filters.clear')}
-        </button>
-        <button type="button" className="primary sessions-filter-done" onClick={props.onClose}>
-          {t('sessions.filters.done')}
-        </button>
-      </footer>
-    </ModalDialog>
-  );
-}
-
+// 工具栏：搜索 + 一排筛选下拉 + 清理空闲。看板的列本身就是状态分组、表格表头自带排序，
+// 以前的「待处理/进行中/全部」快捷分段、排序下拉和「筛选」弹窗都和它们重复，已去掉。
 function SessionsFilters(props: {
+  botOptions: ChatFilterOption[];
   chatOptions: ChatFilterOption[];
   filters: FiltersState;
+  viewMode: SessionsViewMode;
   idleCleanup: IdleCleanupBarProps;
   setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
-  sortKey: string;
-  sortDir: 'asc' | 'desc';
-  onSort: (key: string) => void;
 }): React.JSX.Element {
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  // 快捷分段视图映射到既有 status 筛选：待处理=stalled（长时间无进展，最需要人看），
-  // 进行中=working，全部=任意。抽屉里的完整状态下拉可覆盖为其它状态，此时分段无激活项。
-  const quickViews = [
-    { value: 'stalled', label: t('sessions.view.need') },
-    { value: 'working', label: t('sessions.view.work') },
-    { value: '', label: t('sessions.view.all') },
-  ] as const;
-  const activeFilterCount = [
-    props.filters.status !== '',
-    props.filters.adopt !== '',
-    props.filters.chat !== '',
-    props.filters.cli.size < CLI_FILTER_OPTIONS.length,
-    props.filters.multiBotTopics,
-    props.filters.botTriggeredTopics,
-    props.filters.showUnknownChats,
-    !props.filters.active,
-  ].filter(Boolean).length;
+  const { filters, setFilters } = props;
+  // 看板恒保留已关闭会话（给「已完成」列），状态下拉里「全部」本就含已关闭，
+  // 不再提供与默认项完全等价的「全部（含已关闭）」；默认项文案也按视图区分。
+  const kanbanKeepsClosed = props.viewMode === 'kanban';
+  const statusOptions: ChatFilterOption[] = [
+    ...SESSION_STATUS_OPTIONS.map(status => ({ value: status, label: sessionStatusText(status) })),
+    ...(kanbanKeepsClosed ? [] : [{ value: SESSION_STATUS_ANY, label: t('sessions.filters.statusAnyInclClosed') }]),
+  ];
+  const cliOptions: ChatFilterOption[] = CLI_FILTER_OPTIONS.map(cli => ({ value: cli, label: cli }));
+  const adoptOptions: ChatFilterOption[] = [
+    { value: 'no', label: t('sessions.filters.sourceNative') },
+    { value: 'yes', label: t('sessions.filters.sourceAdopt') },
+  ];
+  const set = (key: 'status' | 'bot' | 'chat' | 'cli' | 'adopt') => (value: string) =>
+    setFilters(prev => ({ ...prev, [key]: value }));
+  const hasActive = hasActiveSessionFilters(filters);
 
   return (
     <form id="filters" className="filters dashboard-toolbar sessions-filters sessions-toolbar" onSubmit={event => event.preventDefault()}>
@@ -871,45 +523,42 @@ function SessionsFilters(props: {
         type="search"
         name="q"
         placeholder={t('sessions.search')}
-        value={props.filters.q}
+        value={filters.q}
         onChange={event => {
           const q = event.currentTarget.value;
-          props.setFilters(prev => ({ ...prev, q }));
+          setFilters(prev => ({ ...prev, q }));
         }}
       />
-      <div className="segmented sessions-quick-view" role="group" aria-label={t('sessions.status')}>
-        {quickViews.map(view => (
+      <div className="sessions-filter-chips" role="group" aria-label={t('sessions.filters.title')}>
+        <FilterChip name={t('sessions.status')} value={filters.status} options={statusOptions} allLabel={kanbanKeepsClosed ? t('sessions.filters.all') : t('sessions.filters.statusOpen')} onChange={set('status')} />
+        <FilterChip name={t('sessions.filters.bot')} value={filters.bot} options={props.botOptions} allLabel={t('sessions.filters.all')} searchable onChange={set('bot')} />
+        <FilterChip name={t('sessions.location')} value={filters.chat} options={props.chatOptions} allLabel={t('sessions.filters.all')} searchable onChange={set('chat')} />
+        <FilterChip name={t('sessions.cli')} value={filters.cli} options={cliOptions} allLabel={t('sessions.filters.all')} searchable onChange={set('cli')} />
+        <FilterChip name={t('sessions.filters.source')} value={filters.adopt} options={adoptOptions} allLabel={t('sessions.filters.all')} onChange={set('adopt')} />
+        <button
+          type="button"
+          className={`sessions-filter-toggle${filters.showUnknownChats ? ' is-active' : ''}`}
+          aria-pressed={filters.showUnknownChats}
+          title={t('sessions.filters.unknownChatsHint')}
+          onClick={() => {
+            const next = !filters.showUnknownChats;
+            writeStoredSessionsShowUnknownChats(windowStorage(), next);
+            setFilters(prev => ({ ...prev, showUnknownChats: next }));
+          }}
+        >
+          {t('sessions.showUnknownChats')}
+        </button>
+        {hasActive ? (
           <button
-            key={view.label}
             type="button"
-            data-quick={view.value}
-            className={props.filters.status === view.value ? 'active' : undefined}
-            aria-pressed={props.filters.status === view.value}
-            onClick={() => props.setFilters(prev => ({ ...prev, status: view.value }))}
+            className="sessions-filter-clear"
+            onClick={() => setFilters(prev => clearSessionFilters(prev))}
           >
-            {view.label}
+            {t('sessions.filters.clear')}
           </button>
-        ))}
+        ) : null}
       </div>
-      <button
-        type="button"
-        className={`sessions-filter-btn${activeFilterCount > 0 ? ' has-active' : ''}`}
-        aria-haspopup="dialog"
-        aria-expanded={drawerOpen}
-        onClick={() => setDrawerOpen(true)}
-      >
-        {t('sessions.filters.title')}
-        {activeFilterCount > 0 ? <span className="sessions-filter-count">{activeFilterCount}</span> : null}
-      </button>
-      <SessionsSortMenu sortKey={props.sortKey} sortDir={props.sortDir} onSort={props.onSort} />
       <IdleCleanupBar {...props.idleCleanup} />
-      <SessionsFilterDrawer
-        open={drawerOpen}
-        chatOptions={props.chatOptions}
-        filters={props.filters}
-        setFilters={props.setFilters}
-        onClose={() => setDrawerOpen(false)}
-      />
     </form>
   );
 }
@@ -955,8 +604,9 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
-  const counts = props.countForHours(draftHours);
-  const count = counts.idle + counts.dormant;
+  // 只在弹层打开时才数候选：它要扫一遍全部会话，放在每次渲染里等于每条 SSE 都跑一遍。
+  const counts = open ? props.countForHours(draftHours) : null;
+  const count = counts ? counts.idle + counts.dormant : null;
 
   useEffect(() => {
     if (open) setDraftHours(props.hours);
@@ -1038,7 +688,7 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
         </svg>
         <span>{t('sessions.idleCleanupRun')}</span>
       </button>
-      {open && typeof document !== 'undefined' ? createPortal((
+      {open && counts && typeof document !== 'undefined' ? createPortal((
         <div
           ref={popRef}
           className="idle-cleanup-pop"
@@ -1108,13 +758,18 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   );
 }
 
-// 列表三视图（表格 / 状态板 / 话题）统一 memo 化。它们此前每次页面渲染都全量重绘，
-// 于是「打开/关闭详情」这种只动抽屉状态的操作也要重排上千行 DOM。memo 生效的前提是
-// 下面传进来的 props 引用稳定——页面侧的 list* 回调就是为此存在的。
-// 注意：memo 会挡住父组件触发的重渲染，而这些视图内部直接调 t()。所以每个视图都要
-// useT() 自己订阅 locale，否则切语言时文案会停在旧语言上。
+// 表格 memo 化：此前每次页面渲染都全量重绘，于是「打开/关闭详情」这种只动抽屉状态的
+// 操作也要重排上千行 DOM。memo 生效的前提是下面传进来的 props 引用稳定——页面侧的
+// table*/list* 回调就是为此存在的。
+// 注意：memo 会挡住父组件触发的重渲染，而表格内部直接调 t()。所以要 useT() 自己订阅
+// locale，否则切语言时文案会停在旧语言上。
+/** 表格每次多渲染多少行。几千行一次性铺开要 7 万个 DOM 节点，切到列表就卡一秒多。 */
+const TABLE_PAGE_SIZE = 200;
+
 function SessionsTableBase(props: {
   rows: any[];
+  limit: number;
+  onShowMore: () => void;
   selected: Set<string>;
   hidden: boolean;
   sortKey: string;
@@ -1245,7 +900,7 @@ function SessionsTableBase(props: {
         </tr>
       </thead>
       <tbody>
-        {props.rows.length ? props.rows.map(row => {
+        {props.rows.length ? props.rows.slice(0, props.limit).map(row => {
           const closed = row.status === 'closed';
           const id = String(row.sessionId);
           return (
@@ -1268,6 +923,15 @@ function SessionsTableBase(props: {
         }) : (
           <tr><td colSpan={colSpan} className="empty">{t('sessions.empty')}</td></tr>
         )}
+        {props.rows.length > props.limit ? (
+          <tr className="sessions-table-more-row">
+            <td colSpan={colSpan}>
+              <button type="button" className="sessions-table-more" onClick={props.onShowMore}>
+                {t('sessions.kanban.showMore', { count: props.rows.length - props.limit })}
+              </button>
+            </td>
+          </tr>
+        ) : null}
       </tbody>
     </table>
   );
@@ -1275,539 +939,18 @@ function SessionsTableBase(props: {
 
 const SessionsTable = memo(SessionsTableBase);
 
-type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
-
-function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): React.JSX.Element | null {
-  const { exchange } = props;
-  const triggerRef = useRef<HTMLDivElement>(null);
-  const tooltipRef = useRef<HTMLDivElement>(null);
-  const hideTimerRef = useRef<number | null>(null);
-  // open + one-shot focus-suppress live in one reducer (see sessions.ts) so the
-  // Escape→refocus race is driven by the SAME transitions the unit tests cover:
-  // Escape closes and arms suppress, and the trigger's refocus consumes it
-  // instead of reopening.
-  const [overlay, dispatch] = useReducer(previewOverlayReducer, previewOverlayInitialState);
-  const open = overlay.open;
-  const [position, setPosition] = useState<{
-    left: number;
-    placement: 'top' | 'bottom';
-    top: number;
-  } | null>(null);
-  const tooltipId = `session-exchange-tooltip-${useId().replace(/[^a-zA-Z0-9_-]/g, '-')}`;
-
-  const clearHide = useCallback(() => {
-    if (hideTimerRef.current === null) return;
-    window.clearTimeout(hideTimerRef.current);
-    hideTimerRef.current = null;
-  }, []);
-  const show = useCallback(() => {
-    clearHide();
-    dispatch('open');
-  }, [clearHide]);
-  const hide = useCallback(() => {
-    clearHide();
-    dispatch('close');
-    setPosition(null);
-  }, [clearHide]);
-  const scheduleHide = useCallback(() => {
-    clearHide();
-    hideTimerRef.current = window.setTimeout(hide, 120);
-  }, [clearHide, hide]);
-  const updatePosition = useCallback(() => {
-    const trigger = triggerRef.current;
-    const tooltip = tooltipRef.current;
-    if (!trigger || !tooltip) return;
-    const triggerRect = trigger.getBoundingClientRect();
-    const tooltipRect = tooltip.getBoundingClientRect();
-    const margin = 12;
-    const gap = 9;
-    const roomAbove = triggerRect.top - margin - gap;
-    const roomBelow = window.innerHeight - triggerRect.bottom - margin - gap;
-    const placement = roomAbove >= tooltipRect.height || roomAbove > roomBelow ? 'top' : 'bottom';
-    const desiredLeft = triggerRect.left + triggerRect.width / 2 - tooltipRect.width / 2;
-    const left = Math.min(
-      Math.max(desiredLeft, margin),
-      Math.max(margin, window.innerWidth - tooltipRect.width - margin),
-    );
-    const desiredTop = placement === 'top'
-      ? triggerRect.top - tooltipRect.height - gap
-      : triggerRect.bottom + gap;
-    const top = Math.min(
-      Math.max(desiredTop, margin),
-      Math.max(margin, window.innerHeight - tooltipRect.height - margin),
-    );
-    setPosition({ left, placement, top });
-  }, []);
-
-  useLayoutEffect(() => {
-    if (!open) return;
-    updatePosition();
-    window.addEventListener('resize', updatePosition);
-    window.addEventListener('scroll', updatePosition, true);
-    return () => {
-      window.removeEventListener('resize', updatePosition);
-      window.removeEventListener('scroll', updatePosition, true);
-    };
-  }, [exchange.botFullText, exchange.userFullText, open, updatePosition]);
-  useEffect(() => () => clearHide(), [clearHide]);
-  useEffect(() => {
-    if (!open) return;
-    const closeOnOutsidePointer = (event: PointerEvent) => {
-      const target = event.target;
-      if (!(target instanceof Node)) return;
-      if (
-        triggerRef.current?.contains(target)
-        || tooltipRef.current?.contains(target)
-      ) return;
-      hide();
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') hide();
-    };
-    document.addEventListener('pointerdown', closeOnOutsidePointer);
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('pointerdown', closeOnOutsidePointer);
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [hide, open]);
-
-  if (!exchange.userText && !exchange.botText) return null;
-  return (
-    <>
-      <div className="session-card-exchange-wrap">
-        <div
-          ref={triggerRef}
-          className="session-card-exchange"
-          role="button"
-          tabIndex={0}
-          aria-label={t('sessions.preview.showFull')}
-          aria-haspopup="dialog"
-          aria-controls={open ? tooltipId : undefined}
-          aria-expanded={open}
-          onClick={event => {
-            event.stopPropagation();
-            open ? hide() : show();
-          }}
-          onFocus={() => {
-            // Reducer consumes the one-shot suppress armed by Escape, so a
-            // programmatic refocus after Escape does not reopen the overlay.
-            clearHide();
-            dispatch('focus');
-          }}
-          onBlur={scheduleHide}
-          onPointerEnter={event => {
-            if (event.pointerType !== 'touch') show();
-          }}
-          onPointerLeave={event => {
-            if (event.pointerType !== 'touch') scheduleHide();
-          }}
-          onKeyDown={event => {
-            if (event.key === 'Escape') hide();
-            else if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault();
-              open ? hide() : show();
-            }
-          }}
-        >
-          {exchange.userText ? (
-            <div className="session-card-exchange-line">
-              <span>{t('sessions.history.user')}</span>
-              <p>{exchange.userText}</p>
-            </div>
-          ) : null}
-          {exchange.botText ? (
-            <div className="session-card-exchange-line bot">
-              <span>{t('sessions.history.bot')}</span>
-              <p>{exchange.botText}</p>
-            </div>
-          ) : null}
-        </div>
-      </div>
-      {open && typeof document !== 'undefined' ? createPortal(
-        <div
-          ref={tooltipRef}
-          id={tooltipId}
-          className="session-card-exchange-tooltip"
-          role="dialog"
-          aria-label={t('sessions.preview.latestExchange')}
-          data-placement={position?.placement ?? 'top'}
-          style={{
-            left: position?.left ?? -10_000,
-            top: position?.top ?? -10_000,
-            visibility: position ? 'visible' : 'hidden',
-          }}
-          onPointerEnter={clearHide}
-          onPointerLeave={event => {
-            if (event.pointerType !== 'touch') scheduleHide();
-          }}
-          // Keyboard: Tab into a rendered Markdown link keeps the overlay open
-          // (focus entering the panel cancels the trigger's blur-close timer);
-          // it only closes once focus leaves the panel entirely. Escape closes
-          // and returns focus to the trigger.
-          onFocusCapture={clearHide}
-          onBlur={event => {
-            const next = event.relatedTarget as Node | null;
-            if (next && (tooltipRef.current?.contains(next) || triggerRef.current?.contains(next))) return;
-            scheduleHide();
-          }}
-          onKeyDown={event => {
-            if (event.key === 'Escape') {
-              event.stopPropagation();
-              // Close + arm the one-shot suppress, THEN refocus the trigger; its
-              // focus handler dispatches 'focus', which the reducer consumes
-              // (no reopen). Order is race-free because suppress is reducer state.
-              clearHide();
-              dispatch('escape-refocus');
-              setPosition(null);
-              triggerRef.current?.focus();
-            }
-          }}
-        >
-          <div className="session-card-exchange-tooltip-scroll">
-            {exchange.userFullText ? (
-              <div className="session-card-exchange-tooltip-line">
-                <span>{t('sessions.history.user')}</span>
-                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.userFullText))} />
-              </div>
-            ) : null}
-            {exchange.botFullText ? (
-              <div className="session-card-exchange-tooltip-line bot">
-                <span>{t('sessions.history.bot')}</span>
-                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.botFullText))} />
-              </div>
-            ) : null}
-          </div>
-        </div>,
-        document.body,
-      ) : null}
-    </>
-  );
-}
-
-function BoardCard(props: {
-  row: any;
-  selected: boolean;
-  onToggleSelect: (row: any) => void;
-  onOpen: (row: any) => void;
-  onHistory: (row: any) => void;
-  onLocate: (row: any) => Promise<boolean>;
-  onRestart: (row: any, button?: HTMLButtonElement) => void;
-  onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
-  onClose: (row: any, button?: HTMLButtonElement) => void;
-}): React.JSX.Element {
-  const row = props.row;
-  const title = stripMentionPrefix(row.title) || row.sessionId;
-  const botName = botDisplayName(row);
-  const chatTitle = chatDisplayTitle(row);
-  const term = terminalHref(row);
-  const signal = boardSignalLabel(row);
-  const repo = repoBasename(row.workingDir);
-  const exchange = sessionExchangePreview(row);
-  // 状态色条语义与看板卡片一致：需要你 / 进行中 / 待办 / 空闲；已关闭单独一色。
-  const signalKind = deriveSessionBoardColumn(row) ?? (row.status === 'closed' ? 'closed' : 'idle');
-  const onCardClick = (event: MouseEvent<HTMLElement>) => {
-    const target = event.target as HTMLElement;
-    if (target.closest('a, button, input, label')) return;
-    props.onToggleSelect(row);
-  };
-  return (
-    <article
-      className={`session-card${props.selected ? ' selected' : ''}${row.locked ? ' locked' : ''}`}
-      data-id={row.sessionId}
-      data-signal={signalKind}
-      aria-pressed={props.selected}
-      onClick={onCardClick}
-    >
-      <div className="session-card-top">
-        <span dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name: botName, larkAppId: row.larkAppId, size: 'sm' }))} />
-        <div className="session-card-title">
-          <strong title={String(row.title ?? title)}>{String(title).slice(0, 72)}</strong>
-          <span>{botName} · {chatTitle ?? sessionCliDisplayName(row)}</span>
-        </div>
-        <span className="session-card-status-group">
-          <StatusBadge status={row.status} />
-          <TodoBadge row={row} />
-          <LockChip row={row} />
-        </span>
-      </div>
-      {repo !== '-' || row.adopt || signal ? (
-        <div className="session-card-meta">
-          {repo !== '-' ? <span title={row.workingDir ?? ''}>{repo}</span> : null}
-          {row.adopt ? <span className="badge">adopt</span> : null}
-          {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
-        </div>
-      ) : null}
-      <SessionExchangePreview exchange={exchange} />
-      <div className="session-card-time">
-        <span>{row.agentAttention?.at
-          ? `${t('sessions.board.waiting')} ${relTime(attentionWaitSince(row))}`
-          : `${t('sessions.last')}: ${relTime(row.lastMessageAt)}`}</span>
-      </div>
-      <div className="session-card-actions">
-        <ChatScopeLink row={row} />
-        {!row.feishuChatLink || row.scope !== 'chat' ? (
-          <LocateIconButton row={row} onLocate={props.onLocate} />
-        ) : null}
-        <IconActionButton action="details" icon={ICON.details} label={t('sessions.details')} onClick={() => props.onOpen(row)} />
-        {canRestartSession(row) ? (
-          <IconActionButton action="restart" icon={ICON.restart} label={t('sessions.restart')} onClick={button => props.onRestart(row, button)} />
-        ) : null}
-        <TerminalControls row={row} url={term} />
-        {row.status !== 'closed' ? (
-          <>
-            <IconActionButton
-              action="lock"
-              icon={row.locked ? ICON.unlock : ICON.lock}
-              label={lockActionLabel(row)}
-              kind={row.locked ? 'locked' : ''}
-              onClick={button => props.onLock(row, !row.locked, button)}
-            />
-            <IconActionButton action="close" icon={ICON.close} label={t('sessions.close')} kind="danger" onClick={button => props.onClose(row, button)} />
-          </>
-        ) : null}
-      </div>
-    </article>
-  );
-}
-
-function BoardViewBase(props: {
-  rows: any[];
-  selected: Set<string>;
-  hidden: boolean;
-  order: string[];
-  animated: boolean;
-  dragColId: string | null;
-  dragOverCol: string | null;
-  onAnimated: () => void;
-  onMoveColumn: (id: string, delta: number) => void;
-  onMoveColumnTo: (id: string, targetId: string) => void;
-  onDragCol: (id: string | null) => void;
-  onDragOverCol: (id: string | null) => void;
-  onToggleSelect: (row: any) => void;
-  onOpen: (row: any) => void;
-  onHistory: (row: any) => void;
-  onLocate: (row: any) => Promise<boolean>;
-  onRestart: (row: any, button?: HTMLButtonElement) => void;
-  onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
-  onClose: (row: any, button?: HTMLButtonElement) => void;
-}): React.JSX.Element {
-  useT();
-  useEffect(() => {
-    if (!props.hidden && !props.animated) props.onAnimated();
-  }, [props.animated, props.hidden, props.onAnimated]);
-  const groups = new Map<BoardColumnId, any[]>(BOARD_COLUMNS.map(column => [column.id, []]));
-  for (const row of props.rows) {
-    const column = deriveSessionBoardColumn(row);
-    if (column) groups.get(column)!.push(row);
-  }
-  const columns = props.order
-    .map(id => BOARD_COLUMNS.find(column => column.id === id))
-    .filter((column): column is typeof BOARD_COLUMNS[number] => !!column);
-  return (
-    <div id="sessions-board" className={`sessions-board${props.animated || props.hidden ? '' : ' board-enter'}`} hidden={props.hidden}>
-      {columns.map((column, idx) => {
-        const columnRows = (groups.get(column.id) ?? []).sort((a, b) => compareBoardRows(a, b, column.id));
-        return (
-          <section
-            key={column.id}
-            className={`session-board-column session-board-${column.id}${props.dragColId === column.id ? ' dragging' : ''}${props.dragOverCol === column.id ? ' drag-over' : ''}`}
-            data-col={column.id}
-            onDragOver={(event) => {
-              if (!props.dragColId) return;
-              event.preventDefault();
-              if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-              if (props.dragColId !== column.id) props.onDragOverCol(column.id);
-            }}
-            onDrop={(event) => {
-              if (!props.dragColId) return;
-              event.preventDefault();
-              props.onMoveColumnTo(props.dragColId, column.id);
-              props.onDragCol(null);
-              props.onDragOverCol(null);
-            }}
-          >
-            <header
-              draggable
-              title={t('sessions.board.dragHint')}
-              onDragStart={(event: DragEvent<HTMLElement>) => {
-                props.onDragCol(column.id);
-                if (event.dataTransfer) {
-                  event.dataTransfer.effectAllowed = 'move';
-                  event.dataTransfer.setData('text/plain', column.id);
-                }
-              }}
-              onDragEnd={() => {
-                props.onDragCol(null);
-                props.onDragOverCol(null);
-              }}
-            >
-              <div>
-                <h2>{t(column.labelKey)}</h2>
-                <p>{t(column.hintKey)}</p>
-              </div>
-              <span className="session-board-head-right">
-                <span className="session-board-move">
-                  <button
-                    type="button"
-                    data-move-col={column.id}
-                    data-dir="-1"
-                    aria-label={t('sessions.board.moveLeft')}
-                    disabled={idx === 0}
-                    onClick={() => props.onMoveColumn(column.id, -1)}
-                  >‹</button>
-                  <button
-                    type="button"
-                    data-move-col={column.id}
-                    data-dir="1"
-                    aria-label={t('sessions.board.moveRight')}
-                    disabled={idx === columns.length - 1}
-                    onClick={() => props.onMoveColumn(column.id, 1)}
-                  >›</button>
-                </span>
-                <span className="session-board-count">{columnRows.length}</span>
-              </span>
-            </header>
-            <div className="session-board-list">
-              {columnRows.length ? columnRows.map(row => (
-                <BoardCard
-                  key={row.sessionId}
-                  row={row}
-                  selected={props.selected.has(row.sessionId)}
-                  onToggleSelect={props.onToggleSelect}
-                  onOpen={props.onOpen}
-                  onHistory={props.onHistory}
-                  onLocate={props.onLocate}
-                  onRestart={props.onRestart}
-                  onLock={props.onLock}
-                  onClose={props.onClose}
-                />
-              )) : <div className="session-board-empty">{t('sessions.board.emptyColumn')}</div>}
-            </div>
-          </section>
-        );
-      })}
-    </div>
-  );
-}
-
-const BoardView = memo(BoardViewBase);
-
 // 看板卡片的图标集。以前是渲染体里的对象字面量：每次渲染都换一个新引用，
 // 于是每张卡片的 callbacks 都"变了"，React.memo 全部失效。图标本身是常量，
 // 提到模块级即可让 memo 真正命中。
 const KANBAN_ICONS: SessionsKanbanIcons = {
-  details: ICON.details,
   feishu: ICON.feishu,
   history: ICON.history,
-  key: ICON.key,
   lock: ICON.lock,
   restart: ICON.restart,
   close: ICON.close,
   terminal: ICON.terminal,
   unlock: ICON.unlock,
 };
-
-type TopicGroupsViewProps = {
-  rows: SessionRow[];
-  relationRows?: SessionRow[];
-  selected: Set<string>;
-  hidden: boolean;
-  onToggleSelect: (row: SessionRow) => void;
-  onOpen: (row: SessionRow) => void;
-  onHistory: (row: SessionRow) => void;
-  onLocate: (row: SessionRow) => Promise<boolean>;
-  onRestart: (row: SessionRow, button?: HTMLButtonElement) => void;
-  onLock: (row: SessionRow, locked: boolean, button?: HTMLButtonElement) => void;
-  onClose: (row: SessionRow, button?: HTMLButtonElement) => void;
-};
-
-function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
-  const title = stripMentionPrefix(group.title).trim();
-  if (title) return title;
-  if (group.kind === 'thread') return t('sessions.topic.untitled');
-  return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
-}
-
-function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
-  useT();
-  const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
-  const relationGroups = useMemo(
-    () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
-    [props.relationRows, props.rows],
-  );
-  return (
-    <div id="sessions-topics" className="sessions-topic-view" hidden={props.hidden}>
-      {groups.length ? groups.map(group => {
-        // Member cards respect the current session filters. Header metadata is
-        // derived from the complete store so a hidden closed sibling does not
-        // erase the topic's multi-Bot relationship.
-        const relation = relationGroups.get(group.key) ?? group;
-        const representative = group.rows[0];
-        const location = sessionLocationText(representative);
-        const title = topicGroupTitle(relation);
-        const anchor = relation.rootMessageId || relation.chatId;
-        return (
-          <section
-            key={group.key}
-            className={`session-topic-group${relation.multiBot ? ' multi-bot' : ''}${relation.inferredBotTriggered ? ' inferred-bot-trigger' : ''}`}
-            data-topic-key={group.key}
-          >
-            <header>
-              <span
-                className="session-topic-avatar"
-                dangerouslySetInnerHTML={rawHtml(chatAvatarHtml({ chatId: group.chatId, name: location, size: 'sm' }))}
-              />
-              <div className="session-topic-heading">
-                <span className="session-topic-location">{location}</span>
-                <h2 title={relation.title}>{title}</h2>
-                <code title={anchor}>{relation.kind === 'thread'
-                  ? anchor
-                  : relation.kind === 'chat'
-                    ? t('sessions.topic.wholeChat')
-                    : t('sessions.topic.singleSession')}</code>
-              </div>
-              <div className="session-topic-summary" aria-label={t('sessions.topic.summary')}>
-                {relation.multiBot ? <span className="topic-chip collaboration">{t('sessions.topic.collaboration')}</span> : null}
-                <span className="topic-chip">{t('sessions.topic.sessions', { count: relation.rows.length })}</span>
-                <span className="topic-chip">{t('sessions.topic.bots', { count: relation.botCount })}</span>
-                <span className="topic-chip active">{t('sessions.topic.active', { count: relation.activeCount })}</span>
-                {relation.closedCount ? <span className="topic-chip">{t('sessions.topic.closed', { count: relation.closedCount })}</span> : null}
-                {relation.inferredBotInputCount ? (
-                  <span className="topic-chip inferred" title={t('sessions.topic.inferredHint')}>
-                    {t('sessions.topic.botInputs', { count: relation.inferredBotInputCount })}
-                  </span>
-                ) : null}
-                <span className="session-topic-updated">{t('sessions.last')}: {relTime(relation.latestActivityAt)}</span>
-              </div>
-            </header>
-            <div className="session-topic-members">
-              {group.rows.map(row => (
-                <BoardCard
-                  key={row.sessionId}
-                  row={row}
-                  selected={props.selected.has(row.sessionId)}
-                  onToggleSelect={candidate => {
-                    if (candidate.status !== 'closed') props.onToggleSelect(candidate);
-                    else props.onOpen(candidate);
-                  }}
-                  onOpen={props.onOpen}
-                  onHistory={props.onHistory}
-                  onLocate={props.onLocate}
-                  onRestart={props.onRestart}
-                  onLock={props.onLock}
-                  onClose={props.onClose}
-                />
-              ))}
-            </div>
-          </section>
-        );
-      }) : <div className="sessions-topic-empty">{t('sessions.topic.empty')}</div>}
-    </div>
-  );
-}
-
-export const TopicGroupsView = memo(TopicGroupsViewBase);
 
 function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): React.JSX.Element {
   const m = props.message;
@@ -2778,12 +1921,12 @@ function CreateSessionDialog(props: {
   );
 }
 
-/** 首屏骨架屏：首个 /api/sessions 快照到达前不闪「空」。布局模仿状态板四列，
+/** 首屏骨架屏：首个 /api/sessions 快照到达前不闪「空」。布局模仿看板的五列，
  *  纯展示，无交互。 */
 function SessionsSkeleton(): React.JSX.Element {
   return (
     <div className="sessions-skeleton" aria-busy="true" aria-label={t('sessions.loadingSessions')}>
-      {[0, 1, 2, 3].map(column => (
+      {[0, 1, 2, 3, 4].map(column => (
         <div key={column} className="sessions-skeleton-col">
           <div className="skel skel-head" />
           <div className="skel skel-card" />
@@ -2801,41 +1944,16 @@ function SessionsPage(): React.JSX.Element {
   const bootstrapped = useStoreSelector(snapshot => snapshot.bootstrapped);
   const [revision, setRevision] = useState(0);
   const refresh = useCallback(() => setRevision(v => v + 1), []);
-  const [filters, setFilters] = useState<FiltersState>({
-    q: '',
-    status: '',
-    adopt: '',
-    chat: '',
-    multiBotTopics: false,
-    botTriggeredTopics: false,
-    showUnknownChats: readStoredSessionsShowUnknownChats(windowStorage()),
-    active: true,
-    cli: new Set(CLI_FILTER_OPTIONS),
-  });
+  const [filters, setFilters] = useState<FiltersState>(() => initialFilters('', readStoredSessionsShowUnknownChats(windowStorage())));
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [sortKey, setSortKey] = useState('lastMessageAt');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(() => new Set(readStoredHiddenTableColumns(windowStorage())));
   const [viewMode, setViewMode] = useState<SessionsViewMode>(() => readStoredSessionsViewMode(windowStorage()));
-  const [boardOrder, setBoardOrder] = useState<string[]>(() => readStoredBoardOrder(windowStorage()));
-  const [boardAnimated, setBoardAnimated] = useState(false);
-  const [dragColId, setDragColId] = useState<string | null>(null);
-  const [dragOverCol, setDragOverCol] = useState<string | null>(null);
-  const [kanbanGroupBy, setKanbanGroupBy] = useState<KanbanGroupBy>(() => readStoredKanbanGroupBy(windowStorage()));
-  const viewStageSignature = `${viewMode}:${viewMode === 'kanban' ? kanbanGroupBy : '-'}`;
+  const [tableLimit, setTableLimit] = useState(TABLE_PAGE_SIZE);
   const viewStageInitialRef = useRef(true);
   const viewStageRef = useRef<HTMLDivElement | null>(null);
-  const [kanbanTeams, setKanbanTeams] = useState<SessionsKanbanTeam[]>([]);
-  const [kanbanChatBots, setKanbanChatBots] = useState<ChatBotsMap | null>(null);
-  const [kanbanTeamsLoaded, setKanbanTeamsLoaded] = useState(false);
-  const kanbanTeamsLoadingRef = useRef(false);
-  const [kanbanTeamKey, setKanbanTeamKey] = useState(() => {
-    try { return window.localStorage.getItem(KANBAN_TEAM_STORAGE_KEY) ?? ''; } catch { return ''; }
-  });
-  const [teamBoard, setTeamBoard] = useState<TeamBoardState>({ data: null, key: '', fetchedAt: 0 });
-  const teamBoardLoadingRef = useRef(false);
   const restartCooldownIds = useRef(new Set<string>());
-  const [teamScopeText, setTeamScopeText] = useState('');
   const [bulkCloseProgress, setBulkCloseProgress] = useState<{ done: number; total: number } | null>(null);
   const [bulkLockProgress, setBulkLockProgress] = useState<{ locked: boolean; done: number; total: number } | null>(null);
   const [monitorRoomFeedback, setMonitorRoomFeedback] = useState<string | null>(null);
@@ -2854,7 +1972,7 @@ function SessionsPage(): React.JSX.Element {
   const createRequestRef = useRef(0);
 
   // 视图切换的入场动画。以前靠 `key={viewStageAnimKey}` 换 key 强制 remount 整个
-  // 舞台来重放 CSS animation——那等于每次点「看板/状态板/话题/表格」都把当前视图
+  // 舞台来重放 CSS animation——那等于每次切视图都把当前视图
   // 连同全部卡片从零重建一遍，5000+ 会话下单次点击主线程阻塞 4~6.6s。
   // 现在改成就地重启动画：摘掉 class、读一次 offsetWidth 触发 reflow、再加回去，
   // DOM 不动，React 也不用重建子树。
@@ -2878,7 +1996,7 @@ function SessionsPage(): React.JSX.Element {
     const animated = viewMode === 'table' && host ? host : stage;
     void animated.offsetWidth;
     animated.classList.add('sessions-view-stage-enter');
-  }, [viewStageSignature]);
+  }, [viewMode]);
 
   useEffect(() => {
     setCreateDialogEl(document.getElementById('create-session-modal') as HTMLDialogElement | null);
@@ -2902,48 +2020,56 @@ function SessionsPage(): React.JSX.Element {
       .map(([value, label]) => ({ value, label }));
   }, [filters.showUnknownChats, revision, storeRows]);
 
+  // 机器人筛选项：只列当前有会话的 Bot，按显示名排序。
+  const botOptions = useMemo<ChatFilterOption[]>(() => {
+    const options = new Map<string, string>();
+    for (const row of storeRows) {
+      const id = String(row.larkAppId ?? '').trim();
+      if (id && !options.has(id)) options.set(id, botDisplayName(row));
+    }
+    return [...options.entries()]
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .map(([value, label]) => ({ value, label }));
+  }, [revision, storeRows]);
+
   useEffect(() => {
     if (!filters.chat) return;
     if (chatOptions.some(option => option.value === filters.chat)) return;
     setFilters(prev => ({ ...prev, chat: '' }));
   }, [chatOptions, filters.chat]);
 
-  const rows = useMemo(() => {
-    const q = filters.q.toLowerCase();
-    const cli = [...filters.cli];
-    const cliFilterActive = cli.length > 0 && cli.length < CLI_FILTER_OPTIONS.length;
-    const keepClosed = viewMode === 'kanban';
-    const acceptedTopicKeys = filters.multiBotTopics || filters.botTriggeredTopics
-      ? new Set(groupSessionsByTopic(storeRows)
-        .filter(group => !filters.multiBotTopics || group.multiBot)
-        .filter(group => !filters.botTriggeredTopics || group.inferredBotTriggered)
-        .map(group => group.key))
-      : null;
-    const base = storeRows
-      .filter(s => !cliFilterActive || cli.includes(s.cliId ?? 'unknown'))
-      .filter(s => filters.showUnknownChats || !isUnknownChatSession(s))
-      .filter(s => !filters.status || s.status === filters.status)
-      .filter(s => !filters.adopt || (filters.adopt === 'yes') === !!s.adopt)
-      .filter(s => !filters.chat || String(s.chatId ?? '') === filters.chat)
-      .filter(s => !filters.active || keepClosed || s.status !== 'closed')
-      .filter(s => !q || sessionSearchText(s).includes(q));
-    if (!acceptedTopicKeys) {
-      return base.sort((a, b) => compareRows(a, b, sortKey, sortDir));
-    }
-    return base
-      .filter(row => acceptedTopicKeys.has(sessionTopicKey(row)))
-      .sort((a, b) => compareRows(a, b, sortKey, sortDir));
-  }, [filters, revision, sortDir, sortKey, storeRows, viewMode]);
+  const rows = useMemo(() => (
+    // 看板要留着已关闭会话给「已完成」列；表格默认只看未关闭的（状态选「全部（含已关闭）」才带上）。
+    filterSessionRows(storeRows, filters, { keepClosed: viewMode === 'kanban' })
+      .sort((a, b) => compareRows(a, b, sortKey, sortDir))
+  ), [filters, revision, sortDir, sortKey, storeRows, viewMode]);
   const runtimeCounts = useMemo(() => sessionRuntimeCounts(storeRows), [storeRows]);
 
+  // 看板只放「还在手上」的会话：休眠会话（进程已退出、等下条消息冷恢复）动辄几千个，
+  // 全铺上去既看不过来、又让看板卡顿。手动拖进过某列的休眠会话例外，照旧留在原列。
+  // 明确筛了「休眠」状态时也照常显示，否则筛选结果会是一块空板。
+  const { kanbanRows, dormantOffBoard } = useMemo(() => {
+    if (viewMode !== 'kanban' || filters.status === 'dormant') return { kanbanRows: rows, dormantOffBoard: 0 };
+    const onBoard: SessionRow[] = [];
+    let off = 0;
+    for (const row of rows) {
+      if (isOffBoardDormant(row)) off += 1;
+      else onBoard.push(row);
+    }
+    return { kanbanRows: onBoard, dormantOffBoard: off };
+  }, [filters.status, rows, viewMode]);
+
+  useEffect(() => {
+    setTableLimit(TABLE_PAGE_SIZE);
+  }, [filters, sortDir, sortKey]);
+
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
-  const boardRows = useMemo(() => rows.filter(row => row.status !== 'closed'), [rows]);
   // 下面这几个派生集合原来都是裸表达式，每次渲染（含每条 SSE session.update）都要
   // 在数千行上重跑一遍 filter/every/some。全部收进 useMemo：只有真正的输入变了才重算。
-  const visibleRows = viewMode === 'table' || viewMode === 'topics' ? rows : boardRows;
+  // 全选只作用于表格当前已渲染的行：没展开的行用户看不到，不能被一键批量关掉。
   const selectableRows = useMemo(
-    () => visibleRows.filter(row => row.status !== 'closed'),
-    [visibleRows],
+    () => rows.slice(0, tableLimit).filter(row => row.status !== 'closed'),
+    [rows, tableLimit],
   );
   const selectedRows = useMemo(
     () => [...selected]
@@ -2975,179 +2101,10 @@ function SessionsPage(): React.JSX.Element {
     });
   }, [rowsById]);
 
-  const teamChatIdsFor = useCallback((team: SessionsKanbanTeam | undefined): Set<string> => {
-    const teamChats = new Set<string>();
-    if (!team) return teamChats;
-    for (const chatId of team.groupChats) teamChats.add(chatId);
-    if (kanbanChatBots) {
-      for (const [chatId, c] of kanbanChatBots) {
-        if (teamChats.has(chatId)) continue;
-        let hasTeamBot = false;
-        for (const id of team.botIds) {
-          if (c.botIds.has(id)) { hasTeamBot = true; break; }
-        }
-        if (!hasTeamBot) continue;
-        for (const n of c.observedNames) {
-          if (team.botNames.has(n)) { teamChats.add(chatId); break; }
-        }
-      }
-    }
-    return teamChats;
-  }, [kanbanChatBots]);
-
-  const currentCleanupVisibleRows = useMemo(() => {
-    if (viewMode === 'kanban' && kanbanGroupBy === 'team') {
-      const team = kanbanTeams.find(tm => tm.key === kanbanTeamKey) ?? kanbanTeams[0];
-      const teamChats = teamChatIdsFor(team);
-      return rows.filter(row => teamChats.has(String(row.chatId)));
-    }
-    return rows;
-  }, [kanbanGroupBy, kanbanTeamKey, kanbanTeams, rows, teamChatIdsFor, viewMode]);
   const idleCleanupCandidatesFor = useCallback(
-    (hours: IdleCleanupHours) => selectCleanupCandidates(currentCleanupVisibleRows, hours),
-    [currentCleanupVisibleRows],
+    (hours: IdleCleanupHours) => selectCleanupCandidates(rows, hours),
+    [rows],
   );
-
-  const loadKanbanTeams = useCallback(async (): Promise<void> => {
-    if (kanbanTeamsLoadingRef.current || kanbanTeamsLoaded) return;
-    kanbanTeamsLoadingRef.current = true;
-    try {
-      const [hosted, remote, groups] = await Promise.all([
-        fetch('/api/team/hosted').then(r => r.json()).catch(() => null),
-        fetch('/api/team/remote-roster').then(r => r.json()).catch(() => null),
-        fetch('/api/groups').then(r => r.json()).catch(() => null),
-      ]);
-      if (Array.isArray(groups?.chats)) {
-        setKanbanChatBots(new Map(groups.chats.map((c: any) => [
-          String(c.chatId),
-          {
-            botIds: new Set<string>((c.memberBots ?? []).filter((mb: any) => mb.inChat).map((mb: any) => String(mb.larkAppId))),
-            observedNames: new Set<string>((c.observedBotNames ?? []).map((n: any) => String(n))),
-          },
-        ])));
-      }
-      const rosterBots = (bots: any[]): { ids: Set<string>; names: Set<string> } => ({
-        ids: new Set<string>(bots.map((b: any) => String(b.larkAppId))),
-        names: new Set<string>(bots.map((b: any) => String(b.name ?? '')).filter(Boolean)),
-      });
-      const teams: SessionsKanbanTeam[] = [];
-      for (const tm of hosted?.teams ?? []) {
-        const { ids, names } = rosterBots(tm.bots ?? []);
-        teams.push({
-          key: `local:${tm.teamId}`,
-          label: tm.isDefault ? t('team.myHostedTeam') : String(tm.name ?? tm.teamId),
-          botIds: ids,
-          botNames: names,
-          groupChats: new Set<string>((tm.groupChatIds ?? []).map((c: any) => String(c))),
-        });
-      }
-      for (const m of remote?.memberships ?? []) {
-        const { ids, names } = rosterBots(m.roster?.bots ?? []);
-        teams.push({
-          key: `${m.hubUrl}::${m.teamId}`,
-          label: String(m.teamName ?? m.teamId ?? m.hubUrl),
-          botIds: ids,
-          botNames: names,
-          groupChats: new Set<string>(),
-        });
-      }
-      setKanbanTeams(teams);
-      setKanbanTeamKey(prev => (teams.length && !teams.some(tm => tm.key === prev)) ? teams[0].key : prev);
-    } finally {
-      setKanbanTeamsLoaded(true);
-      kanbanTeamsLoadingRef.current = false;
-    }
-  }, [kanbanTeamsLoaded]);
-
-  const persistTeamBoardMove = useCallback(async (
-    teamKey: string,
-    sessionId: string,
-    column: SessionKanbanColumn,
-    position: number,
-    prevEntry: { column: string; position: number } | undefined,
-  ): Promise<void> => {
-    try {
-      const isLocal = teamKey.startsWith('local:');
-      const r = isLocal
-        ? await fetch(`/api/team/board/local/${encodeURIComponent(teamKey.slice('local:'.length))}/move`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId, column, position }),
-          })
-        : await fetch('/api/team/remote-board-move', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ key: teamKey, sessionId, column, position }),
-          });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false) {
-        setTeamBoard(prev => {
-          if (!prev.data || prev.key !== teamKey) return prev;
-          const board = { ...prev.data.board };
-          if (prevEntry) board[sessionId] = prevEntry;
-          else delete board[sessionId];
-          return { ...prev, data: { ...prev.data, board } };
-        });
-        if (r.status !== 401) toast(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
-      }
-    } catch (e) {
-      setTeamBoard(prev => {
-        if (!prev.data || prev.key !== teamKey) return prev;
-        const board = { ...prev.data.board };
-        if (prevEntry) board[sessionId] = prevEntry;
-        else delete board[sessionId];
-        return { ...prev, data: { ...prev.data, board } };
-      });
-      toast(`${t('sessions.kanban.moveFail')}: ${e}`, { kind: 'error' });
-    }
-  }, []);
-
-  const ensureTeamBoard = useCallback(async (team: { key: string }): Promise<void> => {
-    const fresh = teamBoard.key === team.key && Date.now() - teamBoard.fetchedAt < 30_000;
-    if (teamBoardLoadingRef.current || fresh) return;
-    teamBoardLoadingRef.current = true;
-    try {
-      const isLocal = team.key.startsWith('local:');
-      const u = isLocal
-        ? `/api/team/board/local/${encodeURIComponent(team.key.slice('local:'.length))}`
-        : `/api/team/remote-board?key=${encodeURIComponent(team.key)}`;
-      const r = await fetch(u);
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false) return;
-      const myDeploymentId = typeof body.deploymentId === 'string' ? body.deploymentId : null;
-      const remoteRows: any[] = [];
-      for (const rep of Array.isArray(body.reports) ? body.reports : []) {
-        if (myDeploymentId && rep.deploymentId === myDeploymentId) continue;
-        for (const s of Array.isArray(rep.sessions) ? rep.sessions : []) {
-          remoteRows.push({ ...s, remoteDeployment: rep.deploymentName || rep.deploymentId });
-        }
-      }
-      setTeamBoard({
-        key: team.key,
-        fetchedAt: Date.now(),
-        data: {
-          board: body.board && typeof body.board === 'object' ? body.board : {},
-          remoteRows,
-        },
-      });
-    } finally {
-      teamBoardLoadingRef.current = false;
-    }
-  }, [teamBoard.fetchedAt, teamBoard.key]);
-
-  useEffect(() => {
-    if (viewMode === 'kanban' && kanbanGroupBy === 'team' && !kanbanTeamsLoaded) void loadKanbanTeams();
-  }, [kanbanGroupBy, kanbanTeamsLoaded, loadKanbanTeams, viewMode]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (viewMode === 'kanban' && kanbanGroupBy === 'team') {
-        setTeamBoard(prev => ({ ...prev, fetchedAt: 0 }));
-        refresh();
-      }
-    }, 30_000);
-    return () => window.clearInterval(timer);
-  }, [kanbanGroupBy, refresh, viewMode]);
 
   const persistBoardMove = useCallback(async (
     row: any,
@@ -3182,22 +2139,6 @@ function SessionsPage(): React.JSX.Element {
       const sessionId = String(move.row.sessionId);
       if (!sessionId) continue;
       if (move.row.status === 'closed' && move.column !== 'done') continue;
-      if (kanbanGroupBy === 'team') {
-        const team = kanbanTeams.find(tm => tm.key === kanbanTeamKey) ?? kanbanTeams[0];
-        if (!team) continue;
-        // Compute the prior slot from committed state and persist OUTSIDE the updater —
-        // updaters must be pure (a POST inside would double-fire under StrictMode).
-        const priorBoard = (teamBoard.key === team.key && teamBoard.data) ? teamBoard.data.board : {};
-        const previous = priorBoard[sessionId];
-        setTeamBoard(prev => {
-          const base = (prev.key === team.key && prev.data) ? prev.data : { board: {}, remoteRows: prev.data?.remoteRows ?? [] };
-          const board = { ...base.board, [sessionId]: { column: move.column, position: move.position } };
-          return { ...prev, key: team.key, data: { ...base, board } };
-        });
-        void persistTeamBoardMove(team.key, sessionId, move.column, move.position, previous);
-        changed = true;
-        continue;
-      }
       const row = store.sessions.get(sessionId);
       if (!row) continue;
       const prev = { column: row.kanbanColumn, position: row.kanbanPosition };
@@ -3207,7 +2148,7 @@ function SessionsPage(): React.JSX.Element {
       changed = true;
     }
     if (changed) refresh();
-  }, [kanbanGroupBy, kanbanTeamKey, kanbanTeams, teamBoard, persistBoardMove, persistTeamBoardMove, refresh]);
+  }, [persistBoardMove, refresh]);
 
   const persistRename = useCallback(async (row: any, title: string): Promise<void> => {
     const prevTitle = row.title;
@@ -3427,10 +2368,6 @@ function SessionsPage(): React.JSX.Element {
     setTermState({ sessionId: row.sessionId, url: readonlyUrl, loading: false });
   }, []);
 
-  const openWritableTerminal = useCallback((row: any, button?: HTMLButtonElement): void => {
-    void openWriteLink(row, button);
-  }, []);
-
   // 抽屉主操作「接管终端」：有权限直接开可写终端，否则退到只读终端弹窗。
   const takeoverSession = useCallback((row: any, button?: HTMLButtonElement): void => {
     if (shouldOpenWritableTerminal() && row.status !== 'closed') {
@@ -3595,10 +2532,15 @@ function SessionsPage(): React.JSX.Element {
   }, [idleCleanupCandidatesFor, refresh]);
 
   const setView = (nextRaw: string | undefined): void => {
-    const next = normalizeSessionsViewMode(nextRaw) ?? 'board';
+    const next = normalizeSessionsViewMode(nextRaw) ?? 'kanban';
     if (next === viewMode) return;
     setViewMode(next);
     writeStoredSessionsViewMode(windowStorage(), next);
+    // 看板下「全部（含已关闭）」没有对应选项，切过去时归一化，避免状态芯片悬空。
+    setFilters(prev => {
+      const status = normalizeStatusFilterForView(prev.status, next === 'kanban');
+      return status === prev.status ? prev : { ...prev, status };
+    });
   };
   // 表格表头排序与筛选条排序下拉共用同一套 state 切换逻辑。
   const handleSort = useCallback((key: string) => {
@@ -3608,41 +2550,12 @@ function SessionsPage(): React.JSX.Element {
       setSortDir(key === 'spawnedAt' || key === 'lastMessageAt' ? 'desc' : 'asc');
     }
   }, [sortKey]);
-  const moveColumn = useCallback((id: string, delta: number): void => {
-    setBoardOrder(prev => {
-      const from = prev.indexOf(id);
-      const to = from + delta;
-      if (from < 0 || to < 0 || to >= prev.length) return prev;
-      const next = [...prev];
-      next.splice(from, 1);
-      next.splice(to, 0, id);
-      writeStoredBoardOrder(windowStorage(), next);
-      return next;
-    });
+  const showDormantInTable = useCallback(() => {
+    setFilters(prev => ({ ...prev, status: 'dormant' }));
+    setViewMode('table');
+    writeStoredSessionsViewMode(windowStorage(), 'table');
   }, []);
-  const moveColumnTo = useCallback((id: string, targetId: string): void => {
-    if (id === targetId) return;
-    setBoardOrder(prev => {
-      const from = prev.indexOf(id);
-      const to = prev.indexOf(targetId);
-      if (from < 0 || to < 0) return prev;
-      const next = [...prev];
-      next.splice(from, 1);
-      next.splice(to, 0, id);
-      writeStoredBoardOrder(windowStorage(), next);
-      return next;
-    });
-  }, []);
-
-  const kanbanState = useMemo(() => ({
-    rows,
-    groupBy: kanbanGroupBy,
-    teams: kanbanTeams,
-    teamsLoaded: kanbanTeamsLoaded,
-    teamKey: kanbanTeamKey,
-    teamBoardData: teamBoard.data,
-    teamBoardKey: teamBoard.key,
-  }), [kanbanGroupBy, kanbanTeamKey, kanbanTeams, kanbanTeamsLoaded, rows, teamBoard.data, teamBoard.key]);
+  const tableOnShowMore = useCallback(() => setTableLimit(limit => limit + TABLE_PAGE_SIZE), []);
 
   // 看板回调必须是稳定引用。以前这十个回调都是 <SessionsKanbanView> 上的内联箭头，
   // 于是每次页面渲染（含每条 SSE）都生成一整套新函数 → 看板内部 props/display 换新
@@ -3653,8 +2566,6 @@ function SessionsPage(): React.JSX.Element {
     if (s) void closeSession(s, button);
   }, [closeSession]);
   const kanbanOnDetails = useCallback((row: any) => setDrawerSessionId(String(row.sessionId)), []);
-  const kanbanOnNeedTeamBoard = useCallback((team: SessionsKanbanTeam) => { void ensureTeamBoard(team); }, [ensureTeamBoard]);
-  const kanbanOnNeedTeams = useCallback(() => { void loadKanbanTeams(); }, [loadKanbanTeams]);
   const kanbanOnRename = useCallback((row: any, title: string) => {
     const s = store.sessions.get(String(row.sessionId));
     if (s) void persistRename(s, title);
@@ -3663,9 +2574,6 @@ function SessionsPage(): React.JSX.Element {
     const s = store.sessions.get(String(row.sessionId));
     if (s) void restartSession(s, button);
   }, [restartSession]);
-  const kanbanOnTeamScope = useCallback((scope: { chats: number; sessions: number } | null) => {
-    setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '');
-  }, []);
   const kanbanOnToggleLock = useCallback((row: any, button: HTMLButtonElement) => {
     const s = store.sessions.get(String(row.sessionId));
     if (s) void setSessionLocked(s, !s.locked, button);
@@ -3676,33 +2584,15 @@ function SessionsPage(): React.JSX.Element {
     if (next.has(id)) next.delete(id); else next.add(id);
     return next;
   }), []);
-  // 表格 / 状态板 / 话题三视图的回调同样必须是稳定引用。它们过去都是 JSX 上的内联
-  // 箭头，于是每次页面渲染（含每条 SSE session.update、以及「打开/关闭详情」这种
-  // 只改抽屉状态的操作）都换一套新函数 → 视图 memo 全部失效 → 数千行整体重排。
-  // 这里只包一层薄转调，真正的实现仍是上面那些 useCallback helper。
+  // 表格的回调同样必须是稳定引用。它们过去都是 JSX 上的内联箭头，于是每次页面
+  // 渲染（含每条 SSE session.update、以及「打开/关闭详情」这种只改抽屉状态的操作）
+  // 都换一套新函数 → 视图 memo 全部失效 → 数千行整体重排。
   const listOnOpen = useCallback((row: any) => setDrawerSessionId(String(row.sessionId)), []);
-  const listOnToggleSelect = useCallback((row: any) => setSelected(prev => {
-    const id = String(row.sessionId);
-    const next = new Set(prev);
-    if (next.has(id)) next.delete(id); else next.add(id);
-    return next;
-  }), []);
   const listOnSelect = useCallback((id: string, checked: boolean) => setSelected(prev => {
     const next = new Set(prev);
     if (checked) next.add(id); else next.delete(id);
     return next;
   }), []);
-  const listOnLocate = useCallback((row: any) => locateSession(row), [locateSession]);
-  const listOnRestart = useCallback((row: any, button?: HTMLButtonElement) => {
-    void restartSession(row, button);
-  }, [restartSession]);
-  const listOnLock = useCallback((row: any, locked: boolean, button?: HTMLButtonElement) => {
-    void setSessionLocked(row, locked, button);
-  }, [setSessionLocked]);
-  const listOnClose = useCallback((row: any, button?: HTMLButtonElement) => {
-    void closeSession(row, button);
-  }, [closeSession]);
-  const boardOnAnimated = useCallback(() => setBoardAnimated(true), []);
   const tableOnSelectAll = useCallback((checked: boolean) => setSelected(prev => {
     const next = new Set(prev);
     for (const row of selectableRows) {
@@ -3730,25 +2620,12 @@ function SessionsPage(): React.JSX.Element {
     }
   }, [hiddenColumns, sortKey]);
 
-  // 这两个开关来自 dashboard 配置，值在一次会话内不变，但函数引用必须固定。
-  const kanbanOnOpenTerminal = dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined;
-  const kanbanOnOpenWritableTerminal = dashboardShellAllowsWebTerminal() && shouldOpenWritableTerminal()
-    ? openWritableTerminal
-    : undefined;
+  // 看板卡片只有一个「终端」入口，和详情抽屉的「接管终端」同一套判定：有操作权限
+  // （已登录）且会话没关就开可操作终端，否则（公开只读的访客）退回只读终端。
+  // 开关来自 dashboard 配置，值在一次会话内不变，但函数引用必须固定。
+  const kanbanOnOpenTerminal = dashboardShellAllowsWebTerminal() ? takeoverSession : undefined;
 
   const drawerRow = drawerSessionId ? rowsById.get(drawerSessionId) ?? null : null;
-  const kanbanTeamOptions = useMemo(() => {
-    if (!kanbanTeamsLoaded) return [{ value: '__loading', label: t('sessions.kanban.teamLoading') }];
-    if (!kanbanTeams.length) return [{ value: '', label: t('sessions.kanban.noTeam') }];
-    return kanbanTeams.map(team => ({ value: team.key, label: team.label }));
-  }, [kanbanTeams, kanbanTeamsLoaded]);
-  const kanbanTeamDisabled = !kanbanTeamsLoaded || kanbanTeams.length === 0;
-  const kanbanTeamValue = kanbanTeams.some(team => team.key === kanbanTeamKey)
-    ? kanbanTeamKey
-    : (kanbanTeamOptions[0]?.value ?? '');
-  const kanbanTeamLabel = kanbanTeamOptions.find(option => option.value === kanbanTeamValue)?.label
-    ?? t('sessions.kanban.groupTeam');
-
   const closeCreateSession = useCallback(() => {
     createRequestRef.current += 1;
     setCreateLoading(false);
@@ -3790,8 +2667,6 @@ function SessionsPage(): React.JSX.Element {
             <div className="segmented sessions-view-toggle" role="group" aria-label={t('sessions.viewMode')}>
               {([
                 ['kanban', t('sessions.viewKanban')],
-                ['board', t('sessions.viewBoard')],
-                ['topics', t('sessions.viewTopics')],
                 ['table', t('sessions.viewTable')],
               ] as const).map(([value, label]) => (
                 <button
@@ -3806,51 +2681,6 @@ function SessionsPage(): React.JSX.Element {
                 </button>
               ))}
             </div>
-            <div
-              className={`segmented kanban-groupby${viewMode === 'kanban' ? ' is-visible' : ' is-collapsed'}`}
-              id="kanban-groupby"
-              role="group"
-              aria-label={t('sessions.kanban.groupBy')}
-              aria-hidden={viewMode !== 'kanban'}
-            >
-              {([
-                ['flow', t('sessions.kanban.groupFlow')],
-                ['team', t('sessions.kanban.groupTeam')],
-                ['bot', t('sessions.kanban.groupBot')],
-              ] as const).map(([value, label]) => (
-                <button
-                  key={value}
-                  type="button"
-                  data-groupby={value}
-                  className={kanbanGroupBy === value ? 'active' : undefined}
-                  aria-pressed={kanbanGroupBy === value}
-                  onClick={() => {
-                    setKanbanGroupBy(value);
-                    writeStoredKanbanGroupBy(windowStorage(), value);
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <span id="kanban-team-stats" className="kanban-team-stats" hidden={!(viewMode === 'kanban' && kanbanGroupBy === 'team' && kanbanTeamsLoaded)}>
-              {teamScopeText}
-            </span>
-            <DropdownMenu
-              id="kanban-team"
-              className="kanban-team-menu"
-              ariaLabel={t('sessions.kanban.groupTeam')}
-              hidden={!(viewMode === 'kanban' && kanbanGroupBy === 'team')}
-              disabled={kanbanTeamDisabled}
-              label={kanbanTeamLabel}
-              value={kanbanTeamValue}
-              options={kanbanTeamOptions}
-              onChange={next => {
-                if (!kanbanTeams.some(team => team.key === next)) return;
-                setKanbanTeamKey(next);
-                try { window.localStorage.setItem(KANBAN_TEAM_STORAGE_KEY, next); } catch { /* current page only */ }
-              }}
-            />
           </div>
         </div>
         <div className="page-heading-actions sessions-page-actions">
@@ -3878,12 +2708,11 @@ function SessionsPage(): React.JSX.Element {
       </div>
 
       <SessionsFilters
+        botOptions={botOptions}
         chatOptions={chatOptions}
         filters={filters}
+        viewMode={viewMode}
         setFilters={setFilters}
-        sortKey={sortKey}
-        sortDir={sortDir}
-        onSort={handleSort}
         idleCleanup={{
           busy: idleCleanupBusy,
           hours: idleCleanupHours,
@@ -3913,13 +2742,14 @@ function SessionsPage(): React.JSX.Element {
         ref={viewStageRef}
         className="sessions-view-stage"
         data-view={viewMode}
-        data-kanban-group={kanbanGroupBy}
         data-local-horizontal-scrollbar={bootstrapped && viewMode === 'table' ? '' : undefined}
       >
         {!bootstrapped ? <SessionsSkeleton /> : null}
         {bootstrapped && viewMode === 'table' ? (
         <SessionsTable
           rows={rows}
+          limit={tableLimit}
+          onShowMore={tableOnShowMore}
           selected={selected}
           hidden={false}
           sortKey={sortKey}
@@ -3937,57 +2767,16 @@ function SessionsPage(): React.JSX.Element {
         />
         ) : null}
 
-        {bootstrapped && viewMode === 'board' ? (
-        <BoardView
-          rows={boardRows}
-          selected={selected}
-          hidden={false}
-          order={boardOrder}
-          animated={boardAnimated}
-          dragColId={dragColId}
-          dragOverCol={dragOverCol}
-          onAnimated={boardOnAnimated}
-          onMoveColumn={moveColumn}
-          onMoveColumnTo={moveColumnTo}
-          onDragCol={setDragColId}
-          onDragOverCol={setDragOverCol}
-          onToggleSelect={listOnToggleSelect}
-          onOpen={listOnOpen}
-          onHistory={openHistoryModal}
-          onLocate={listOnLocate}
-          onRestart={listOnRestart}
-          onLock={listOnLock}
-          onClose={listOnClose}
-        />
-        ) : null}
-
-        {bootstrapped && viewMode === 'topics' ? (
-        <TopicGroupsView
-          rows={rows}
-          relationRows={storeRows}
-          selected={selected}
-          hidden={false}
-          onToggleSelect={listOnToggleSelect}
-          onOpen={listOnOpen}
-          onHistory={openHistoryModal}
-          onLocate={listOnLocate}
-          onRestart={listOnRestart}
-          onLock={listOnLock}
-          onClose={listOnClose}
-        />
-        ) : null}
-
         {bootstrapped && viewMode === 'kanban' ? (
         <div
           id="sessions-kanban"
           ref={setKanbanHost}
-          className={`sessions-kanban${kanbanGroupBy === 'bot' ? ' kanban-mode-bot' : ''}`}
+          className="sessions-kanban"
         >
           <SessionsKanbanView
             host={kanbanHost}
-            {...kanbanState}
+            rows={kanbanRows}
             canRestartSession={canRestartSession}
-            getTeamChatIds={teamChatIdsFor}
             icons={KANBAN_ICONS}
             lockActionLabel={lockActionLabel}
             sessionStatusText={sessionStatusText}
@@ -3995,13 +2784,9 @@ function SessionsPage(): React.JSX.Element {
             onDetails={kanbanOnDetails}
             onHistory={openHistoryModal}
             onMoveRows={handleKanbanMoves}
-            onNeedTeamBoard={kanbanOnNeedTeamBoard}
-            onNeedTeams={kanbanOnNeedTeams}
             onOpenTerminal={kanbanOnOpenTerminal}
-            onOpenWritableTerminal={kanbanOnOpenWritableTerminal}
             onRename={kanbanOnRename}
             onRestart={kanbanOnRestart}
-            onTeamScope={kanbanOnTeamScope}
             onToggleLock={kanbanOnToggleLock}
             onToggleSelect={kanbanOnToggleSelect}
             selectedSessionIds={selected}
@@ -4012,6 +2797,14 @@ function SessionsPage(): React.JSX.Element {
       </div>
       {bootstrapped && viewMode === 'table' ? <SessionHorizontalScrollbar scrollRef={viewStageRef} /> : null}
       </div>
+      {bootstrapped && viewMode === 'kanban' && dormantOffBoard > 0 ? (
+        <p className="sessions-dormant-hint">
+          {t('sessions.kanban.dormantOffBoard', { count: dormantOffBoard })}
+          <button type="button" onClick={showDormantInTable}>
+            {t('sessions.kanban.dormantShowInTable')}
+          </button>
+        </p>
+      ) : null}
 
       <Drawer
         row={drawerRow}

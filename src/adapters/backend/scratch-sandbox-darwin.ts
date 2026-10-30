@@ -185,6 +185,26 @@ export function macLarkKeystoreDenies(homeReal: string): string[] {
   ];
 }
 
+/** Directories from each authority root down to the parent of every writable
+ *  tree below it (root included), deduplicated, shallowest first. */
+function sealedAncestors(writable: readonly string[], roots: readonly string[]): string[] {
+  const out = new Set<string>();
+  for (const root of roots) {
+    if (!root || !isAbsolute(root)) continue;
+    const prefix = root.endsWith(sep) ? root : `${root}${sep}`;
+    for (const w of writable) {
+      if (!w || !isAbsolute(w) || !w.startsWith(prefix)) continue;
+      const chain: string[] = [];
+      for (let cur = dirname(w); cur === root || cur.startsWith(prefix); cur = dirname(cur)) {
+        chain.push(cur);
+        if (cur === root) break;
+      }
+      for (const dir of chain.reverse()) out.add(dir);
+    }
+  }
+  return [...out].sort((a, b) => a.length - b.length || a.localeCompare(b));
+}
+
 export function buildMacScratchProfile(input: {
   /** Scratch trees granted read+write (clone trees, session tmp/outbox/shim). */
   writable: readonly string[];
@@ -230,6 +250,15 @@ export function buildMacScratchProfile(input: {
   for (const w of input.writable ?? []) {
     lines.push(`(allow file-read* (subpath "${escSb(w)}"))`);
     lines.push(`(allow file-write* (subpath "${escSb(w)}"))`);
+  }
+  // Stage 4: the sealed ancestors of each re-opened tree keep their METADATA
+  // readable (literal = that directory entry only, never its contents or
+  // subtree). realpath()/canonicalize walk every path component with lstat;
+  // a `file-read*` seal on ~/.botmux makes that walk fail with EPERM before it
+  // ever reaches the re-opened session tree (Codex: "failed to canonicalize
+  // CODEX_HOME … Operation not permitted").
+  for (const dir of sealedAncestors(input.writable ?? [], input.authorityRootDenies ?? [])) {
+    lines.push(`(allow file-read-metadata (literal "${escSb(dir)}"))`);
   }
   if (input.mcpSocket) {
     lines.push(`(allow file-write* (literal "${escSb(input.mcpSocket)}"))`);

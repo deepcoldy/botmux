@@ -13473,23 +13473,19 @@ async function cmdSend(rest: string[]): Promise<void> {
         indexError = error;
       }
       if (indexError !== undefined) {
-        // An isolated CLI (bwrap relay / macOS read isolation) cannot open the
-        // shared feedback store — it holds every bot's rows — so hand the row
-        // to the daemon, which derives it from the live session. Same test as
-        // postSessionCliIpc: a relay env or no readable host secret.
-        let isolated = !!process.env.BOTMUX_SEND_RELAY;
-        if (!isolated) {
-          try { loadDaemonIpcSecret(); } catch { isolated = true; }
-        }
-        const deliveryIpcPort = isolated
-          ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
-          : undefined;
+        // A CLI that cannot open the shared feedback store hands the row to
+        // the daemon, which derives it from the live session. That covers the
+        // botmux sandbox (bwrap relay / macOS read isolation: the store holds
+        // every bot's rows) and equally a CLI's OWN sandbox that leaves the
+        // host secret readable but denies the write (e.g. a workspace-write
+        // policy); postSessionCliIpc picks the matching authentication.
+        const deliveryIpcPort = resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
         // The daemon binds the row to the capability's turn and the session's
         // own chat; an unbound turn or a cross-chat publish has nothing there
         // to correlate against.
         if (deliveryIpcPort && currentTurnId && targetChatId === s.chatId) {
           try {
-            const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text });
+            const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text, expectedTurnId: currentTurnId });
             if (!res.ok) {
               const detail = await res.json().catch(() => undefined) as { error?: string } | undefined;
               throw new Error(detail?.error ?? `HTTP ${res.status}`);

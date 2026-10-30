@@ -2126,8 +2126,9 @@ describe('opencode buildArgs', () => {
 
   it('keeps the whole opencode data dir real in the sandbox (SQLite needs fcntl locks the home overlay lacks)', () => {
     // Not just auth.json: opencode's global opencode.db (WAL) lives here and
-    // can't lock on the overlayfs home — same failure mode as codex.
-    expect(adapter.authPaths).toEqual(['~/.local/share/opencode']);
+    // can't lock on the overlayfs home — same failure mode as codex. (The
+    // config dir next to it is covered in fs-policy.test.ts.)
+    expect(adapter.authPaths).toContain('~/.local/share/opencode');
   });
 
   it('returns empty args for basic case', () => {
