@@ -106,6 +106,27 @@ describe('reply footer console entry', () => {
     expect(buildReplyCardFooter({ brand: existing, presentation })?.content.split(consoleUrl)).toHaveLength(2);
   });
 
+  it('dedupes the same console entry written non-canonically in a custom brand', () => {
+    const footer = buildReplyCardFooter({
+      brand: '[my bot](https://M-EXAMPLE.Botmux.Example)',
+      presentation: { footerPreferences: {}, consoleUrl: 'https://m-example.botmux.example/' },
+    });
+    // The brand keeps its original uppercase spelling; only the normalized
+    // targets are compared, so the generated console link is dropped.
+    expect(footer?.content.match(/m-example\.botmux\.example/gui)).toHaveLength(1);
+    expect(footer?.content).not.toContain('[控制台]');
+    expect(footer?.content).not.toContain('[Console]');
+  });
+
+  it('still adds the entry when a custom brand links elsewhere', () => {
+    const footer = buildReplyCardFooter({
+      brand: '[my bot](https://other.example.com/)',
+      presentation,
+    });
+    expect(footer?.content).toContain(`](${consoleUrl})`);
+    expect(footer?.content).toContain('other.example.com');
+  });
+
   it('retains the host console URL through the serialized retry snapshot', () => {
     const snapshot = normalizeReplyCardRenderSnapshot(JSON.parse(JSON.stringify({ usage: facts, ...presentation })));
     expect(snapshot?.consoleUrl).toBe(consoleUrl);
