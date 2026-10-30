@@ -137,6 +137,9 @@ function jsonCommand(args: string[], opts?: { timeout?: number; input?: string; 
   return result.ok ? result.value : undefined;
 }
 
+/** exec failures (errno codes) that waiting will not fix. */
+const HERDR_EXEC_PERMANENT_CODES = new Set(['ENOENT', 'EACCES', 'ENOEXEC', 'ENOTDIR']);
+
 /** Required command variant used by multi-step Herdr protocols.
  *
  * `jsonCommand()` intentionally collapses command failures to undefined for
@@ -147,8 +150,6 @@ function jsonCommand(args: string[], opts?: { timeout?: number; input?: string; 
  * upstream error code/message. `allowEmpty` accepts successful commands such
  * as `pane run` that do not emit JSON.
  */
-const HERDR_EXEC_PERMANENT_CODES = new Set(['ENOENT', 'EACCES', 'ENOEXEC', 'ENOTDIR']);
-
 function requiredJsonCommand(
   operation: string,
   args: string[],
