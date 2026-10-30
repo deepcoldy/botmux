@@ -40,6 +40,7 @@ const BASE_SCENARIOS = [
   'private-topic-reply',
   'scheduled-task-thread',
   'web-terminal',
+  'sandbox-file-isolation',
   'traex-ambient-continuity',
 ] as const;
 
@@ -173,6 +174,11 @@ const BASE_TARGETS: Record<(typeof BASE_SCENARIOS)[number], ScenarioTarget> = {
     module: 'feishu-web-terminal.e2e.ts',
     suite: 'feishu web terminal',
     test: 'web terminal opens from the current streaming card',
+  },
+  'sandbox-file-isolation': {
+    module: 'feishu-sandbox.e2e.ts',
+    suite: 'sandbox file isolation',
+    test: 'hides the home directory and the harness secrets and keeps writes inside the working directory',
   },
   'traex-ambient-continuity': {
     module: 'feishu-traex-ambient.e2e.ts',

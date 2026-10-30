@@ -18,6 +18,7 @@ import {
   streamOpenAiEvents,
 } from './openai-sse.js';
 import { pickShellTool } from './shell-tool.js';
+import { sandboxProbeCommand } from './sandbox-probe.js';
 import { buildGeminiResponse, geminiMessages, isGeminiToolResult, streamGeminiEvents } from './gemini-sse.js';
 import {
   buildOpenAiResponsesTextEvents,
@@ -250,7 +251,7 @@ export class MockLlmServer {
     // Phase 1: Call the shell tool to send botmux reply. A request whose
     // tools hold no shell (a title call) gets plain text.
     const tool = pickShellTool(body?.tools, 'Bash');
-    const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+    const cmd = sandboxProbeCommand(messages) ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
     const events = tool
       ? buildAnthropicToolUseEvents({ model, toolName: tool.name, command: cmd, input: tool.args(cmd) })
       : buildAnthropicTextEvents({ model, text: marker });
@@ -274,7 +275,7 @@ export class MockLlmServer {
     }
 
     const tool = pickShellTool(body?.tools, 'bash');
-    const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+    const cmd = sandboxProbeCommand(messages) ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
     const events = tool
       ? buildOpenAiToolCallEvents({ model: body?.model, command: cmd, functionName: tool.name, args: tool.args(cmd) })
       : buildOpenAiTextEvents({ model: body?.model, text: marker });
@@ -293,7 +294,7 @@ export class MockLlmServer {
     } else if (isGeminiToolResult(body?.contents) || !tool) {
       response = buildGeminiResponse({ text: '已成功调用 botmux send 回复消息，本轮自动化测试结束。' });
     } else {
-      const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+      const cmd = sandboxProbeCommand(messages) ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
       response = buildGeminiResponse({ functionCall: { name: tool.name, args: tool.args(cmd) } });
     }
     if (stream) {
