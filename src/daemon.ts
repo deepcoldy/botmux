@@ -309,13 +309,15 @@ async function trustedCallerForInboundTurn(
   senderOpenId?: string,
   senderUnionId?: string,
   senderIsBot?: boolean,
+  messageId?: string,
 ): Promise<TrustedCaller | undefined> {
-  const caller = trustedCallerForTurn(
+  const caller = await trustedCallerFromInbound({
     larkAppId,
     senderOpenId,
     senderUnionId,
     senderIsBot,
-  );
+    messageId,
+  }, { resolveMessageSenderUnionId });
   const canonicalBindings = caller?.senderType === 'bot'
     ? await readCanonicalBotActorOwnerBindings(
       getLoadedConfigProvenance() === 'loaded' ? getLoadedConfigPath() : undefined,
@@ -569,7 +571,8 @@ import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
-import { resolveUnionIdFromOpenId } from './im/lark/client.js';
+import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
+import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
 import {
   appendDurablePrimaryInputCommit,
@@ -6317,6 +6320,7 @@ async function submitQueuedMessage(
     message.senderId,
     message.senderUnionId,
     senderIsBot,
+    message.messageId,
   );
   if (!isCurrent()) { rollbackReplyContext(); return false; }
   // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
@@ -24948,6 +24952,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     senderOpenId,
     senderUnionId,
     senderIsBotTriState(parsed.senderType, isForeignBotSender),
+    parsed.messageId,
   );
   // union_id 信任腿（canOperate/evaluateTalk 的 teamBot）只对**飞书盖章的 bot 发送方**
   // 生效：平台 roster 是成员机器自报的，若不锁 sender_type，恶意成员把某个真人的
@@ -26959,6 +26964,7 @@ async function handlePrincipalLaneLiveMessage(
           parsed.senderId,
           parsed.senderUnionId,
           senderIsBotTriState(parsed.senderType, isForeignBotSender),
+          parsed.messageId,
         );
         if (!target || !provenance || !activeTurn || !proposer
             || target.session.sessionId !== liveReference.decision.targetSessionId
@@ -27322,6 +27328,7 @@ async function handleThreadReplyAdmitted(
     threadSenderOpenId,
     threadSenderUnionId,
     senderIsBotTriState(parsed.senderType, isForeignBot),
+    parsed.messageId,
   );
   const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
     ? parseCrossPrincipalControlNotice(parsed.content)

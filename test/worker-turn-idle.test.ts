@@ -85,6 +85,12 @@ interface CliPidMarker {
   callerOpenId?: string;
   dispatchAttempt?: number | null;
   queuedTurnId?: string;
+  trustedCaller?: {
+    requestUserOpenId?: string;
+    requestUserUnionId?: string;
+    requestLarkAppId?: string;
+    senderType?: 'user' | 'bot';
+  };
   queuedTurns?: Array<{ turnId?: string }>;
 }
 
@@ -139,7 +145,7 @@ function lastManagedOriginTurnId(harness: Harness): string | undefined {
   return origins.length > 0 ? origins[origins.length - 1]!.turnId : undefined;
 }
 
-function startWorker(): Harness {
+function startWorker(options: { signalPrompt?: boolean } = {}): Harness {
   const root = mkdtempSync(join(tmpdir(), 'botmux-turn-idle-'));
   tempDirs.add(root);
   // A CLI that boots, renders nothing and stays alive: dsh-tui's readyPattern
@@ -147,7 +153,9 @@ function startWorker(): Harness {
   // fire on its own — every prompt_ready in this file must come from the
   // structured channel under test.
   const fakeCli = join(root, 'fake-dsh-tui');
-  writeFileSync(fakeCli, '#!/bin/sh\nexec sleep 300\n');
+  writeFileSync(fakeCli, options.signalPrompt
+    ? '#!/usr/bin/env node\nprocess.on("SIGUSR1", () => process.stdout.write("❯\\n"));\nsetInterval(() => {}, 1000);\n'
+    : '#!/bin/sh\nexec sleep 300\n');
   chmodSync(fakeCli, 0o755);
 
   const sessionId = `turnidle${Date.now().toString(36)}${process.pid.toString(36)}`;
@@ -194,8 +202,19 @@ function startWorker(): Harness {
 
 /** Boot the worker, release the ready gate, then write one real turn so the
  *  worker is genuinely waiting on `TURN_ID` (isPromptReady=false). */
-async function startWorkerWaitingOnTurn(dispatchAttempt?: number): Promise<Harness> {
-  const harness = startWorker();
+async function startWorkerWaitingOnTurn(
+  dispatchAttempt?: number,
+  options: {
+    signalPrompt?: boolean;
+    trustedCaller?: {
+      requestUserOpenId: string;
+      requestUserUnionId?: string;
+      requestLarkAppId: string;
+      senderType: 'user' | 'bot';
+    };
+  } = {},
+): Promise<Harness> {
+  const harness = startWorker(options);
   await waitFor(
     harness,
     () => harness.messages.some(message => message.type === 'ready'),
@@ -216,6 +235,7 @@ async function startWorkerWaitingOnTurn(dispatchAttempt?: number): Promise<Harne
     content: 'structured turn idle probe',
     turnId: TURN_ID,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}),
   } satisfies DaemonToWorker);
   await waitFor(
     harness,
@@ -527,5 +547,78 @@ describe('worker turn-idle channel', () => {
     expect(readyCount(harness)).toBe(afterPromotion);
     expect(activeTurnId(harness)).toBe(NEXT_TURN_ID);
     expect(lastManagedOriginTurnId(harness)).toBe(NEXT_TURN_ID);
+  }, 60_000);
+
+  it('expires a marker-promotion observation on a newer prompt generation', async () => {
+    const originalCaller = {
+      requestUserOpenId: 'ou_original_active',
+      requestUserUnionId: 'on_original_active',
+      requestLarkAppId: 'app_turn_idle',
+      senderType: 'user' as const,
+    };
+    const harness = await startWorkerWaitingOnTurn(undefined, {
+      signalPrompt: true,
+      trustedCaller: originalCaller,
+    });
+    const before = readyCount(harness);
+    const markersDir = join(harness.root, '.botmux-cli-pids');
+    const markerName = readdirSync(markersDir).find(name => /^\d+$/.test(name));
+    expect(markerName).toBeDefined();
+    const markerPath = join(markersDir, markerName!);
+    const promotedCaller = {
+      requestUserOpenId: 'ou_promoted_before_ready',
+      requestUserUnionId: 'on_promoted_before_ready',
+      requestLarkAppId: 'app_turn_idle',
+      senderType: 'user' as const,
+    };
+    const tailCaller = {
+      requestUserOpenId: 'ou_tail_after_promoted',
+      requestUserUnionId: 'on_tail_after_promoted',
+      requestLarkAppId: 'app_turn_idle',
+      senderType: 'user' as const,
+    };
+
+    harness.child.send({
+      type: 'message', content: 'promoted turn', turnId: NEXT_TURN_ID,
+      trustedCaller: promotedCaller,
+    } satisfies DaemonToWorker);
+    await waitFor(harness, () => queuedTurnIds(harness).includes(NEXT_TURN_ID), 'the promoted turn to queue');
+    // queuedTurnIds becomes visible as soon as the marker write lands; let the
+    // surrounding PTY write transaction finish before replacing that marker,
+    // otherwise its trailing publication can legitimately win this test race.
+    await delay(300);
+
+    // The in-CLI wrapper observes that B has started before the worker handles
+    // A's final prompt edge. A following type-ahead write makes the worker
+    // adopt that disk promotion and sets queuedTurnAdvanceConsumedForPrompt.
+    writeFileSync(markerPath, JSON.stringify({
+      ...JSON.parse(readFileSync(markerPath, 'utf-8')),
+      turnId: NEXT_TURN_ID,
+      callerOpenId: promotedCaller.requestUserOpenId,
+      trustedCaller: promotedCaller,
+    }));
+    expect(readCliPidMarker(harness)).toMatchObject({ turnId: NEXT_TURN_ID });
+
+    const tailTurnId = 'turn-idle-tail-after-promoted';
+    harness.child.send({
+      type: 'message', content: 'tail turn', turnId: tailTurnId,
+      trustedCaller: tailCaller,
+    } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => activeTurnId(harness) === NEXT_TURN_ID && queuedTurnIds(harness).includes(tailTurnId),
+      'the worker to adopt B and hold C',
+    );
+
+    // A's ready is lost. A later PTY generation is therefore B's own completion
+    // and must expire the old promotion observation, release B, advance C, and
+    // install C's exact caller rather than retaining B forever.
+    process.kill(Number(markerName), 'SIGUSR1');
+    await waitFor(harness, () => readyCount(harness) > before, 'B completion prompt edge');
+    expect(readCliPidMarker(harness)).toMatchObject({
+      turnId: tailTurnId,
+      callerOpenId: tailCaller.requestUserOpenId,
+      trustedCaller: tailCaller,
+    });
   }, 60_000);
 });

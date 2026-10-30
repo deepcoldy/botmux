@@ -4598,7 +4598,23 @@ interface QueuedTypeAheadTurnRecord {
   turnCallerOpenId?: string;
 }
 let queuedTypeAheadTurns: QueuedTypeAheadTurnRecord[] = [];
-let queuedTurnAdvanceConsumedForPrompt = false;
+/** PTY output generation whose pending ready edge already promoted a queued
+ * turn from the PID marker. A bare boolean can outlive that edge: if it is
+ * dropped, the next turn's terminal prompt would wrongly retain stale
+ * authority. New PTY output makes the observation ineligible automatically. */
+let queuedTurnAdvanceConsumedForPrompt: {
+  outputGeneration: number;
+  predecessorTurnId?: string;
+  promotedTurnId?: string;
+} | undefined;
+
+function rememberQueuedTurnAdvanceForPendingReady(predecessorTurnId?: string): void {
+  queuedTurnAdvanceConsumedForPrompt = {
+    outputGeneration: ptyOutputGeneration.snapshot(),
+    ...(predecessorTurnId ? { predecessorTurnId } : {}),
+    ...(currentBotmuxTurnId ? { promotedTurnId: currentBotmuxTurnId } : {}),
+  };
+}
 const retiredTurnIds = new Set<string>();
 function markTurnRetired(turnId?: string): void {
   if (!turnId) return;
@@ -5461,15 +5477,15 @@ function writeCliPidMarker(): void {
                   queuedTypeAheadTurns.splice(0, idx + 1);
                   markActiveTurnStarted(advancedRecord);
                   publishSandboxRelayCapability();
-                  queuedTurnAdvanceConsumedForPrompt = true;
+                  rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
                   log(`Adopted active turn advance from PID marker before write: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)}`);
                 } else if (!currentBotmuxTurnId) {
                   adoptInitialActiveTurn(parsed);
-                  queuedTurnAdvanceConsumedForPrompt = true;
+                  rememberQueuedTurnAdvanceForPendingReady();
                 } else {
                   const prevTurnId = currentBotmuxTurnId;
                   adoptDisplacedActiveTurn(parsed);
-                  queuedTurnAdvanceConsumedForPrompt = true;
+                  rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
                   publishSandboxRelayCapability();
                   log(`Adopted foreign promoted disk turnId ${parsed.turnId?.slice(0, 12)} before write, preserved memory turn ${prevTurnId?.slice(0, 12)} in queue`);
                 }
@@ -5660,17 +5676,17 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
               markActiveTurnStarted(advancedRecord);
               publishSandboxRelayCapability();
               anySynced = true;
-              queuedTurnAdvanceConsumedForPrompt = true;
+              rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
               log(`Synced active turn advance from PID marker: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
             } else if (!currentBotmuxTurnId) {
               adoptInitialActiveTurn(parsed);
               anySynced = true;
-              queuedTurnAdvanceConsumedForPrompt = true;
+              rememberQueuedTurnAdvanceForPendingReady();
             } else {
               const prevTurnId = currentBotmuxTurnId;
               adoptDisplacedActiveTurn(parsed);
               anySynced = true;
-              queuedTurnAdvanceConsumedForPrompt = true;
+              rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
               publishSandboxRelayCapability();
               log(`Retained foreign promoted disk turnId ${parsed.turnId?.slice(0, 12)}, preserved memory turn ${prevTurnId?.slice(0, 12)} in queue`);
             }
@@ -5712,7 +5728,7 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   currentBotmuxLinkRefMode = next.linkRefMode;
   currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
   currentTurnSteerPromoted = true;
-  queuedTurnAdvanceConsumedForPrompt = true;
+  rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
   markActiveTurnStarted(next);
   writeCliPidMarker();
   publishSandboxRelayCapability();
@@ -17348,7 +17364,19 @@ function markPromptReady(): void {
   // control channel can accept the opening turn.  It is not an execution
   // terminal for that already-admitted Lark turn, so keep the exact caller
   // authority until the provider later emits final/failure.
-  if (!durableTurnInFlight && !preserveActiveTurnAuthorityForReady) {
+  // A PID-marker observation may already have advanced A -> B immediately
+  // before this ready edge for A is handled. In that case B owns the CLI now:
+  // releasing it here and then honouring queuedTurnAdvanceConsumedForPrompt
+  // below leaves the worker with no authority at all until another promotion.
+  // The MCP gateway consequently signs B's tool calls with no caller. Keep the
+  // already-promoted authority only while the PTY generation still identifies
+  // this same A edge; later B output makes the observation stale. The matching
+  // observation also prevents this same A edge from advancing twice to C.
+  const queuedAdvanceBelongsToThisReady = queuedTurnAdvanceConsumedForPrompt !== undefined
+    && ptyOutputGeneration.isCurrent(queuedTurnAdvanceConsumedForPrompt.outputGeneration);
+  if (!durableTurnInFlight
+    && !preserveActiveTurnAuthorityForReady
+    && !queuedAdvanceBelongsToThisReady) {
     releaseActiveTurnAuthority('prompt_ready');
   }
   // A ready published without the detector's own idle (first-prompt timeout
@@ -17360,10 +17388,10 @@ function markPromptReady(): void {
   judgeClaudeBridgeTurn();
   settleSessionRenameOnPrompt();
   const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
-  if (!syncedFromDisk && !queuedTurnAdvanceConsumedForPrompt && queuedTypeAheadTurns.length > 0) {
+  if (!syncedFromDisk && !queuedAdvanceBelongsToThisReady && queuedTypeAheadTurns.length > 0) {
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
-  queuedTurnAdvanceConsumedForPrompt = false;
+  queuedTurnAdvanceConsumedForPrompt = undefined;
   // An old backend can still report idle while its async teardown is running.
   // Only a prompt observed after the general restart fence drops may release
   // slash commands to the replacement generation.
@@ -20475,7 +20503,7 @@ async function spawnCli(
   // Early mount based on cfg.cliId before cliAdapter is instantiated for this generation
   // (necessary for adopt mode which wires onPtyData before the normal spawn sequence).
   programStatusStream = shouldEnableProgramStatus(cfg.cliId, cliAdapter) ? new ProgramStatusFramingStream() : null;
-  queuedTurnAdvanceConsumedForPrompt = false;
+  queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
   currentCliCredentialIsolated = false;
   // Enrollment writes the fixed marker before any device credential appears.
@@ -26014,7 +26042,7 @@ async function spawnCli(
     setCaptureIdentity(undefined, undefined);
     currentBotmuxLinkRefMode = undefined;
     queuedTypeAheadTurns = [];
-    queuedTurnAdvanceConsumedForPrompt = false;
+    queuedTurnAdvanceConsumedForPrompt = undefined;
     retiredTurnIds.clear();
     activeTurnAuthority.clear();
     if (!intentionalRestart && activeRestartAttemptId) {
@@ -26384,7 +26412,7 @@ function killCli(opts: {
   setCaptureIdentity(undefined, undefined);
   currentBotmuxLinkRefMode = undefined;
   queuedTypeAheadTurns = [];
-  queuedTurnAdvanceConsumedForPrompt = false;
+  queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
   activeTurnAuthority.clear();
   currentVcMeetingImTurnOrigin = undefined;
@@ -30749,6 +30777,12 @@ process.on('message', async (raw: unknown) => {
         break;
       }
       log(`Turn-idle report accepted (turn=${msg.turnId} seq=${msg.seq ?? '?'} pid=${msg.pid ?? '?'}) — firing structured idle`);
+      // Unlike a screen prompt, this report names the turn that actually
+      // completed. If it names the marker-promoted successor, an older pending
+      // ready observation must not retain that successor past its own terminal.
+      if (queuedTurnAdvanceConsumedForPrompt?.promotedTurnId === msg.turnId) {
+        queuedTurnAdvanceConsumedForPrompt = undefined;
+      }
       idleDetector?.fireIdle();
       break;
     }
