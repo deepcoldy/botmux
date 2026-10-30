@@ -28958,6 +28958,34 @@ function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: nu
   if (turnId) send({ type: 'turn_execution_started', turnId, dispatchAttempt, startedAtMs });
 }
 
+/** The authority can be left holding a turn whose terminal already went out:
+ *  a lagging type-ahead advance or an adopted envelope of a finished turn. That
+ *  turn never emits again, so a later terminal is the only edge left to free
+ *  it — otherwise every queueAfterActiveTurn input (scheduled fires) parks
+ *  behind it for good while the CLI sits idle. */
+function releaseTerminatedActiveTurnAuthority(): void {
+  const active = activeTurnAuthority.snapshot();
+  if (!sessionId || !active?.turnId) return;
+  if (emittedTurnTerminals.statusOf(sessionId, active.turnId, active.dispatchAttempt) === undefined) return;
+  releaseActiveTurnAuthority('stale_terminal', { turnId: active.turnId, dispatchAttempt: active.dispatchAttempt });
+}
+
+/** Claude can fold a type-ahead input into the running turn (queued_command)
+ *  and end both together, before attribution ever advances to the queued
+ *  record. Advancing afterwards hands the active turn authority to a finished
+ *  turn that never sees another terminal. Drop the record once its terminal is
+ *  out; the tombstone keeps the PID-marker sync from re-adding it. */
+function retireTerminatedQueuedTurn(turnId: string, dispatchAttempt?: number): void {
+  if (turnId === currentBotmuxTurnId) return;
+  const before = queuedTypeAheadTurns.length;
+  queuedTypeAheadTurns = queuedTypeAheadTurns.filter(queued => queued.turnId !== turnId
+    || (queued.dispatchAttempt !== undefined && queued.dispatchAttempt !== dispatchAttempt));
+  if (queuedTypeAheadTurns.length === before) return;
+  // A retry of the same turn under another attempt is still live work.
+  if (!queuedTypeAheadTurns.some(queued => queued.turnId === turnId)) markTurnRetired(turnId);
+  writeCliPidMarker();
+}
+
 /** Report CLI processing completion independently from user-visible output.
  *  Keep a bounded worker-local dedup set because transcript watchers and app
  *  runners may surface the same final boundary more than once. */
@@ -28996,7 +29024,10 @@ function emitTurnTerminal(
   }
   // Revoke before publishing terminal. A stale terminal from a superseded
   // same-principal steer must not clear the newer turn's authority.
-  releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
+  if (!releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt })) {
+    releaseTerminatedActiveTurnAuthority();
+  }
+  retireTerminatedQueuedTurn(turnId, dispatchAttempt);
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
     flushThinkingUpdate();
   }
