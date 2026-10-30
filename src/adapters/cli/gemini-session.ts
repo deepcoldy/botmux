@@ -70,6 +70,17 @@ function contentText(content: unknown): string {
   return '';
 }
 
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isIgnoredUserText(text: string): boolean {
+  return text.length === 0 || text.startsWith('/') || text.startsWith('?')
+    || text.startsWith('<session_context>') || text.startsWith('<hook_context>');
+}
+
+interface ResumableRecordShape { type?: unknown; content?: unknown; toolCalls?: unknown; thoughts?: unknown }
+
 /**
  * Gemini's own test (0.66 `isResumableMessageRecord` / `isIgnoredUserContent`):
  * a session resumes only with a real user message or a non-empty model turn.
@@ -77,12 +88,9 @@ function contentText(content: unknown): string {
  * `?` help do not count, so a session that crashed before the first prompt
  * landed is not resumable and `--resume` would exit 42.
  */
-function isResumableRecord(record: { type?: unknown; content?: unknown; toolCalls?: unknown; thoughts?: unknown }): boolean {
+function isResumableRecord(record: ResumableRecordShape): boolean {
   const text = contentText(record.content).trim();
-  if (record.type === 'user') {
-    return !(text.length === 0 || text.startsWith('/') || text.startsWith('?')
-      || text.startsWith('<session_context>') || text.startsWith('<hook_context>'));
-  }
+  if (record.type === 'user') return !isIgnoredUserText(text);
   if (record.type === 'gemini') {
     return text.length > 0
       || (Array.isArray(record.toolCalls) && record.toolCalls.length > 0)
@@ -91,11 +99,95 @@ function isResumableRecord(record: { type?: unknown; content?: unknown; toolCall
   return false;
 }
 
+interface LiveMessageKind { isUser: boolean; isResumable: boolean }
+
+/**
+ * Decide resumability the way Gemini 0.66 lists sessions
+ * (`createJsonlRecordAccumulator`, metadataOnly branch): replay the append-only
+ * edit log into the LIVE message table, then ask whether any live row is
+ * resumable. The file is not a flat message list:
+ *  - a record with a string `id` and no `$patch` registers the row (info /
+ *    error / warning rows register too — never resumable, but they still hold a
+ *    table index that `$rewindTo` can target);
+ *  - `{$set:{messages:[…]}}` REPLACES the whole table (clear + reset order);
+ *  - `{$patch}` edits content / removes / reorders rows that already exist — it
+ *    never creates a row;
+ *  - `{$rewindTo:id}` drops that row and every row after it (or every row when
+ *    the id is unknown).
+ * A first turn that fails (bad key 401 / offline) is written as a user row and
+ * immediately rewound, or collapsed by a later `$set`; scanning physical lines
+ * would still see it and produce a `--resume` that exits 42. On 728 real 0.66
+ * session files flat scanning over-reports resumability on 92 of them.
+ */
 function hasResumableContent(jsonl: string): boolean {
+  const order: string[] = [];
+  const kinds = new Map<string, LiveMessageKind>();
+
+  // isMessageRecord: string id and no $patch. Mirrors the upstream guard so a
+  // {id, $patch} row inside `$set.messages` is skipped rather than registered.
+  const register = (record: unknown): void => {
+    if (!isObjectRecord(record) || typeof record.id !== 'string' || '$patch' in record) return;
+    const id = record.id;
+    if (!kinds.has(id)) order.push(id);
+    kinds.set(id, { isUser: record.type === 'user', isResumable: isResumableRecord(record) });
+  };
+
+  const applyPatch = (patch: unknown): void => {
+    if (!isObjectRecord(patch)) return;
+    const changes: Record<string, unknown>[] = [];
+    if (typeof patch.id === 'string') changes.push(patch);
+    if (Array.isArray(patch.updates)) {
+      for (const update of patch.updates) {
+        if (isObjectRecord(update) && typeof update.id === 'string') changes.push(update);
+      }
+    }
+    // A patch only edits an EXISTING row; an unknown id never creates one.
+    for (const change of changes) {
+      if (!('content' in change) || change.content === undefined) continue;
+      const kind = kinds.get(change.id as string);
+      if (!kind) continue;
+      const text = contentText(change.content).trim();
+      if (kind.isUser) kind.isResumable = !isIgnoredUserText(text);
+      else if (text.length > 0) kind.isResumable = true;
+    }
+    if (Array.isArray(patch.removeIds)) {
+      for (const removed of patch.removeIds) {
+        if (typeof removed !== 'string') continue;
+        const at = order.indexOf(removed);
+        if (at !== -1) order.splice(at, 1);
+        kinds.delete(removed);
+      }
+    }
+    if (Array.isArray(patch.orderIds)) {
+      // Unknown ids are dropped; surviving ordered rows move to the end, the
+      // rows not named keep their place as a prefix (upstream prefixIds rule).
+      const kept = patch.orderIds.filter((id): id is string => typeof id === 'string' && kinds.has(id));
+      const keptSet = new Set(kept);
+      order.splice(0, order.length, ...order.filter(id => !keptSet.has(id)), ...kept);
+    }
+  };
+
   for (const line of jsonl.split('\n')) {
     if (!line.trim()) continue;
-    try { if (isResumableRecord(JSON.parse(line))) return true; } catch { /* torn line */ }
+    let record: unknown;
+    try { record = JSON.parse(line); } catch { continue; /* torn line */ }
+    if (!isObjectRecord(record)) continue;
+    if (typeof record.$rewindTo === 'string') {
+      const at = order.indexOf(record.$rewindTo);
+      if (at === -1) { order.length = 0; kinds.clear(); }
+      else { for (const id of order.splice(at)) kinds.delete(id); }
+    } else if (isObjectRecord(record.$patch)) {
+      applyPatch(record.$patch);
+    } else if (typeof record.id === 'string' && !('$patch' in record)) {
+      register(record);
+    } else if (isObjectRecord(record.$set) && Array.isArray(record.$set.messages)) {
+      order.length = 0;
+      kinds.clear();
+      for (const message of record.$set.messages) register(message);
+    }
   }
+
+  for (const id of order) if (kinds.get(id)?.isResumable) return true;
   return false;
 }
 

@@ -68,12 +68,22 @@ describe('Kimi: the Kimi session of a botmux session', () => {
 });
 
 /** Gemini 0.66 layout: projects.json maps the dir to a short name; chats/session-<t>-<id8>.jsonl. */
+const STAMP = '2026-10-30T00:00:00Z';
 function geminiSession(gHome: string, workDir: string, id: string, rows: object[]) {
   const g = join(gHome, '.gemini');
   mkdirSync(join(g, 'tmp', 'work', 'chats'), { recursive: true });
   writeFileSync(join(g, 'projects.json'), JSON.stringify({ projects: { [workDir]: 'work' } }));
+  // Real 0.66 message rows all carry an id (1574/1574 rows in the host corpus)
+  // and the replay indexes by it; $rewindTo / $set / $patch control records
+  // carry no id. Stamp plain message rows, leave control records untouched.
+  const stamped = rows.map((row, i) => {
+    const o = row as Record<string, unknown>;
+    return ('id' in o || '$rewindTo' in o || '$set' in o || '$patch' in o)
+      ? row
+      : { id: `m${i}`, timestamp: STAMP, ...row };
+  });
   writeFileSync(join(g, 'tmp', 'work', 'chats', `session-2026-10-30T00-00-${id.slice(0, 8)}.jsonl`),
-    [{ sessionId: id, projectHash: 'x', startTime: '2026-10-30T00:00:00Z', kind: 'main' }, ...rows].map(r => JSON.stringify(r)).join('\n') + '\n');
+    [{ sessionId: id, projectHash: 'x', startTime: STAMP, kind: 'main' }, ...stamped].map(r => JSON.stringify(r)).join('\n') + '\n');
 }
 
 describe('Gemini: resume by the botmux session id', () => {
@@ -96,6 +106,61 @@ describe('Gemini: resume by the botmux session id', () => {
     expect(findGeminiSessionFile(BOTMUX, work, env)).toMatchObject({ resumable: true });
     expect(findGeminiSessionFile(BOTMUX, join(home, 'elsewhere'), env)).toBeUndefined();
     expect(findGeminiSessionFile('4c0a8f9e-0000-4000-8000-000000000000', work, env)).toBeUndefined();
+  });
+
+  it('replays $rewindTo / $set.messages / $patch like the 0.66 accumulator, not physical lines', () => {
+    const home = tmp();
+    const work = join(home, 'work');
+    mkdirSync(work);
+    const env = { GEMINI_CLI_HOME: home };
+    const probe = () => findGeminiSessionFile(BOTMUX, work, env)?.resumable;
+    const user = (text: string) => ({ type: 'user', content: [{ text }] });
+    const rewind = (to: string) => ({ $rewindTo: to });
+    const setTable = (messages: object[]) => ({ $set: { messages } });
+    const patch = (p: object) => ({ $patch: p });
+
+    // 1) Rewind drops the target row itself and everything after it: the only
+    //    real prompt is gone even though the physical line is still on disk
+    //    (a first turn that failed 401/offline leaves exactly this shape, and
+    //    `gemini --resume` exits 42 on it).
+    geminiSession(home, work, BOTMUX, [user('hello'), rewind('m0')]);
+    expect(probe()).toBe(false);
+
+    // 2) Rewinding an ignored slash-command row keeps the real prompt before it.
+    geminiSession(home, work, BOTMUX, [user('hello'), user('/help'), rewind('m1')]);
+    expect(probe()).toBe(true);
+
+    // 3) $set.messages REPLACES the whole table, it does not append: after it
+    //    holds only the auto context row, the earlier prompt is gone.
+    geminiSession(home, work, BOTMUX, [
+      user('hello'),
+      setTable([{ id: 'm9', type: 'user', content: [{ text: '<session_context>auto' }] }]),
+    ]);
+    expect(probe()).toBe(false);
+
+    // 4) A $patch that fills content into an existing blank user row is what
+    //    makes it resumable; patches never create the row themselves.
+    geminiSession(home, work, BOTMUX, [user('   '), patch({ id: 'm0', content: [{ text: 'hello' }] })]);
+    expect(probe()).toBe(true);
+    geminiSession(home, work, BOTMUX, [patch({ id: 'm9', content: [{ text: 'hello' }] })]);
+    expect(probe()).toBe(false);
+
+    // 5) info/error rows still occupy a table index a $rewindTo may target:
+    //    rewinding the info row deletes only it, keeping the prompt before it.
+    //    Filtering rows to user/gemini when registering would miss-find the id,
+    //    clear the whole table, and wrongly report false.
+    geminiSession(home, work, BOTMUX, [
+      user('keep'),
+      { type: 'info', content: 'note' },
+      rewind('m1'),
+    ]);
+    expect(probe()).toBe(true);
+
+    // 6) removeIds drops a live row; an orderIds reorder does not.
+    geminiSession(home, work, BOTMUX, [user('hello'), patch({ removeIds: ['m0'] })]);
+    expect(probe()).toBe(false);
+    geminiSession(home, work, BOTMUX, [user('hello'), patch({ orderIds: ['m0'] })]);
+    expect(probe()).toBe(true);
   });
 
   it('the adapter names a new session, resumes a resumable one, and never passes an id Gemini would reject', () => {

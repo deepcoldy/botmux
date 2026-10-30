@@ -60,7 +60,7 @@ describe('resumeStartsFresh', () => {
       mkdirSync(join(root, '.gemini', 'tmp', 'work', 'chats'), { recursive: true });
       writeFileSync(join(root, '.gemini', 'projects.json'), JSON.stringify({ projects: { [work]: 'work' } }));
       writeFileSync(join(root, '.gemini', 'tmp', 'work', 'chats', `session-x-${sid.slice(0, 8)}.jsonl`),
-        `${JSON.stringify({ sessionId: sid })}\n${JSON.stringify({ type: 'user', content: [{ text: 'hello' }] })}\n`);
+        `${JSON.stringify({ sessionId: sid })}\n${JSON.stringify({ id: 'm0', type: 'user', content: [{ text: 'hello' }] })}\n`);
       expect(resumeStartsFresh({ cliId: 'gemini', sessionId: sid, workingDir: work })).toBe(false);
     } finally {
       for (const [key, value] of Object.entries(prev)) {
