@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
@@ -157,9 +157,8 @@ export function readLatestAntigravityRuntime(
   cliSessionId: string,
   opts?: { conversationsDir?: string },
 ): { model?: string } {
-  if (!cliSessionId || !/^[a-zA-Z0-9_-][a-zA-Z0-9._-]*$/.test(cliSessionId)) return {};
-  const dbPath = join(opts?.conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations'), `${cliSessionId}.db`);
-  if (!existsSync(dbPath)) return {};
+  const dbPath = antigravityRuntimeDbPath(cliSessionId, opts);
+  if (!dbPath || !existsSync(dbPath)) return {};
   const db = openDatabaseSyncNow(dbPath, { readOnly: true });
   if (!db) return {};
   try {
@@ -174,6 +173,30 @@ export function readLatestAntigravityRuntime(
   } catch { /* unavailable/old schema: keep identity unknown */ }
   finally { try { db.close(); } catch { /* best-effort */ } }
   return {};
+}
+
+function antigravityRuntimeDbPath(cliSessionId: string, opts?: { conversationsDir?: string }): string | undefined {
+  if (!cliSessionId || !/^[a-zA-Z0-9_-][a-zA-Z0-9._-]*$/.test(cliSessionId)) return;
+  return join(opts?.conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations'), `${cliSessionId}.db`);
+}
+
+/** WAL commits need not change the main database. Sample before reading so a
+ * concurrent commit cannot be cached as though that newer snapshot was read. */
+export function antigravityRuntimeSignature(cliSessionId: string, opts?: { conversationsDir?: string }): string | undefined {
+  const dbPath = antigravityRuntimeDbPath(cliSessionId, opts);
+  if (!dbPath) return;
+  const signature = (path: string, optional = false): string => {
+    try {
+      const st = statSync(path, { bigint: true });
+      if (!st.isFile()) throw new Error('Not a native database file');
+      return [st.dev, st.ino, st.size, st.mtimeNs, st.ctimeNs].join(':');
+    } catch (error) {
+      if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+      throw error;
+    }
+  };
+  try { return `${signature(dbPath)}|${signature(dbPath + '-wal', true)}`; }
+  catch { return; }
 }
 
 export function readAntigravityTokenUsage(

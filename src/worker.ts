@@ -6865,7 +6865,12 @@ function classifyUsageLimitWithNativeEvidence(
     // reconciliation requires the full current viewport, not that display text.
     try { evidence = captureBackendScreen(backend) || content; } catch { /* no stronger evidence */ }
   }
-  if (cliAdapter?.id === 'antigravity' && isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+  if (cliAdapter?.id === 'antigravity') {
+    // tmux capture-pane -e preserves SGR inside phrases, countdowns and error
+    // IDs. Strip controls without filtering away native composer rows.
+    evidence = stripAnsiScreenText(evidence);
+    if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+  }
   const result = usageLimitTracker.classify(evidence, status);
   if (cliAdapter?.id === 'antigravity' && result.usageLimit) {
     return { ...result, usageLimit: annotateAntigravityUsageLimit(evidence, result.usageLimit) };

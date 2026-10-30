@@ -80,6 +80,77 @@ describe('surviving agy thinking stream', () => {
     finalizeCotMessage(next, 'om_turn', 'completed'); await flush(); expect(markers()).toEqual([]);
   });
 
+  it.each(['thinking', 'terminal', 'cot-off'] as const)('retires an unbound older marker on a proven successor %s', async event => {
+    const old = makeDs(); update(old, 'old progress', 'om_old', 1); await flush();
+    await settleCotMessageForShutdown(old);
+    const next = makeDs({ currentTurnId: 'om_new' });
+    await sweepOrphanCotMessages('app1', binding => cotRecoveryMatches(next, binding));
+    expect(entities.get('cot1')!.status).toBe('open');
+    if (event === 'cot-off') vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: false, cliId: 'antigravity' } } as any);
+    if (event === 'terminal') finalizeCotMessage(next, 'om_new', 'completed', 1);
+    else update(next, 'new progress', 'om_new', 1);
+    await flush();
+    expect(entities.get('cot1')!.status).toBe('done');
+    expect(markers()).not.toContain('cot1.json');
+    expect(next.session.status).toBe('active');
+    expect(completes().filter(([r]) => r.url.endsWith('/cot1'))).toHaveLength(1);
+    if (event === 'thinking') expect(entities.get('cot2')!.status).toBe('open');
+  });
+
+  it('does not retire old display state for a late update that is not the host current turn', async () => {
+    const old = makeDs(); update(old, 'old progress', 'om_old', 1); await flush(); await settleCotMessageForShutdown(old);
+    const next = makeDs({ currentTurnId: 'om_current' }); request.mockClear();
+    expect(update(next, 'late stale progress', 'om_stale', 1)).toBe(false); await flush();
+    expect(entities.get('cot1')!.status).toBe('open'); expect(request).not.toHaveBeenCalled();
+  });
+
+  it('retires a late create ACK even after the successor already completed', async () => {
+    let release!: () => void;
+    intercept = req => {
+      if (req.method !== 'POST' || req.url !== '/open-apis/im/v1/message_cot') return;
+      const created = deliver(req); intercept = undefined;
+      return new Promise(resolve => { release = () => resolve(created); });
+    };
+    const old = makeDs(); update(old, 'old progress', 'om_old', 1); await flush(); await settleCotMessageForShutdown(old);
+    const next = makeDs({ currentTurnId: 'om_new' }); update(next, 'new progress', 'om_new', 1); await flush();
+    finalizeCotMessage(next, 'om_new', 'completed', 1); await flush();
+    expect(entities.get('cot2')!.status).toBe('done'); expect(entities.get('cot1')!.status).toBe('open');
+    release(); await flush();
+    expect(entities.get('cot1')!.status).toBe('done'); expect(markers()).toEqual([]); expect(sequence).toBe(2);
+  });
+
+  it('settles an exact old terminal without replacing a newer current turn', async () => {
+    const old = makeDs(); update(old, 'old progress', 'om_old', 1); await flush(); await settleCotMessageForShutdown(old);
+    const next = makeDs({ currentTurnId: 'om_new' });
+    expect(finalizeCotMessage(next, 'om_old', 'completed', 1)).toBe(true); await flush();
+    expect(entities.get('cot1')!.status).toBe('done'); expect(markers()).toEqual([]);
+    expect(next.currentTurnId).toBe('om_new'); expect(next.session.status).toBe('active');
+    update(next, 'new progress', 'om_new', 1); await flush();
+    expect(entities.get('cot2')!.status).toBe('open');
+  });
+
+  it('does not retire a surviving marker from an unconfirmed or older attempt', async () => {
+    const old = makeDs(); update(old, 'current', 'om_turn', 2); await flush(); await settleCotMessageForShutdown(old);
+    const next = makeDs({ currentTurnId: 'om_turn' });
+    update(next, 'late earlier attempt', 'om_turn', 1); await flush();
+    expect(entities.get('cot1')!.status).toBe('open'); expect(sequence).toBe(1); expect(completes()).toHaveLength(0);
+    const unknown = makeDs(); resumeCotMessage(unknown); await flush();
+    expect(entities.get('cot1')!.status).toBe('open');
+  });
+
+  it('persists an orphan display supersession before an uncertain completion', async () => {
+    const old = makeDs(); update(old, 'old progress', 'om_old', 1); await flush(); await settleCotMessageForShutdown(old);
+    const next = makeDs({ currentTurnId: 'om_new' });
+    intercept = req => req.url.endsWith('/cot1') ? Promise.reject(new Error('offline')) : undefined;
+    update(next, 'new progress', 'om_new', 1); await flush();
+    expect(marker()).toMatchObject({ resumable: false, finishStatus: 'done' });
+    expect(entities.get('cot1')!.status).toBe('open');
+    intercept = undefined;
+    await sweepOrphanCotMessages('app1', binding => cotRecoveryMatches(next, binding));
+    expect(entities.get('cot1')!.status).toBe('done'); expect(markers()).not.toContain('cot1.json');
+    expect(entities.get('cot2')!.status).toBe('open');
+  });
+
   it('keeps a worker replacement open and closes it only on the matching terminal', async () => {
     const ds = makeDs(); update(ds, 'before', 'om_turn', 2); await flush();
     abortCotMessage(ds); await flush();
@@ -212,6 +283,29 @@ describe('surviving agy thinking stream', () => {
     expect(markers()).toEqual(['cot1.json']); expect(entities.get('cot1')!.status).toBe('open');
     intercept = undefined; await sweepOrphanCotMessages('app1');
     expect(markers()).toEqual([]); expect(entities.get('cot1')!.status).toBe('error');
+  });
+
+  it.each(['notice', 'completion'] as const)('consumes a retained marker on an explicit provider terminal receipt from %s', async endpoint => {
+    const ds = makeDs(); update(ds, 'before'); await flush();
+    intercept = () => Promise.reject(new Error('offline'));
+    finalizeCotMessage(ds, 'om_turn', 'completed'); await flush();
+    expect(markers()).toEqual(['cot1.json']);
+    intercept = req => {
+      if ((endpoint === 'notice' && req.method === 'PUT') || req.url.includes('/complete/')) {
+        return Promise.resolve({ code: 987654, msg: 'COT already in terminal state' });
+      }
+      return Promise.reject(new Error('notice unavailable'));
+    };
+    await sweepOrphanCotMessages('app1');
+    expect(markers()).toEqual([]); expect(sequence).toBe(1);
+  });
+
+  it('does not confuse a transport message or generic provider failure with a terminal receipt', async () => {
+    const ds = makeDs(); update(ds, 'before'); await flush();
+    intercept = () => Promise.reject(new Error('COT already in terminal state'));
+    await sweepOrphanCotMessages('app1'); expect(markers()).toEqual(['cot1.json']);
+    intercept = () => Promise.resolve({ code: 987654, msg: 'invalid request: COT already in terminal state' });
+    await sweepOrphanCotMessages('app1'); expect(markers()).toEqual(['cot1.json']);
   });
 
   it('uses the real success even if progress delivery had already failed', async () => {

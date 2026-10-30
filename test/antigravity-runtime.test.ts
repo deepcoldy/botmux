@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from '../src/services/sqlite-compat.js';
+import * as sqliteCompat from '../src/services/sqlite-compat.js';
 import { readLatestAntigravityRuntime } from '../src/services/antigravity-usage.js';
 import { startAntigravityCot, stopAllAntigravityCot, stopAntigravityCot } from '../src/services/antigravity-cot.js';
 import { withCardRuntimeIdentity } from '../src/core/card-runtime-identity.js';
@@ -38,7 +39,7 @@ beforeEach(() => {
 afterEach(() => {
   stopAllAntigravityCot();
   for (const db of writers.splice(0)) db.close();
-  vi.useRealTimers(); rmSync(root, { recursive: true, force: true });
+  vi.restoreAllMocks(); vi.useRealTimers(); rmSync(root, { recursive: true, force: true });
 });
 
 describe('Antigravity native runtime model', () => {
@@ -68,6 +69,25 @@ describe('Antigravity native runtime model', () => {
     expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-first' }); expect(onEntries).not.toHaveBeenCalled();
     insert(db, 2, 'model-next'); await vi.advanceTimersByTimeAsync(20);
     expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-next' }); expect(onEntries).not.toHaveBeenCalled();
+  });
+
+  it('does not reopen SQLite for an unchanged model, but sees WAL-only commits', async () => {
+    const db = database('native-a'); db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;');
+    insert(db, 1, 'model-first'); const opened = vi.spyOn(sqliteCompat, 'openDatabaseSyncNow'); const onRuntime = vi.fn();
+    startAntigravityCot('native-a', () => {}, { brainDir, onRuntime, pollIntervalMs: 10 });
+    const initial = opened.mock.calls.length; expect(initial).toBeGreaterThan(0);
+    await vi.advanceTimersByTimeAsync(100); expect(opened).toHaveBeenCalledTimes(initial);
+    insert(db, 2, 'model-next'); await vi.advanceTimersByTimeAsync(20);
+    expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-next' });
+    expect(opened).toHaveBeenCalledTimes(initial + 1);
+  });
+
+  it('retries a transient failed read without requiring another file change', async () => {
+    const db = database('native-a', 'model-first'); const opened = vi.spyOn(sqliteCompat, 'openDatabaseSyncNow'); const onRuntime = vi.fn();
+    startAntigravityCot('native-a', () => {}, { brainDir, onRuntime, pollIntervalMs: 10 });
+    insert(db, 2, 'model-next'); opened.mockReturnValueOnce(null);
+    await vi.advanceTimersByTimeAsync(10); expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-first' });
+    await vi.advanceTimersByTimeAsync(10); expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-next' });
   });
 
   it('keeps tool/thinking delivery working if the cosmetic model callback fails', async () => {

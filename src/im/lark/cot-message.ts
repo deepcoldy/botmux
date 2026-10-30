@@ -52,6 +52,7 @@ import { TopicSendError } from '../../cli/topic-send-guard.js';
 import { privateReplyEnabled } from '../../core/private-reply.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
+import { withFileLockSync } from '../../utils/file-lock.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import type { CotEntry, WorkerToDaemon } from '../../types.js';
 import type { DaemonSession } from '../../core/types.js';
@@ -97,6 +98,7 @@ interface CotState {
   prologueStarted?: boolean;
   recovery?: CotRecoveryIdentity;
   resumeRequested?: boolean;
+  createSuperseded?: boolean;
 }
 
 interface CotRecoveryIdentity {
@@ -271,14 +273,55 @@ function clearCreateIntent(ds: DaemonSession, state: CotState): void {
   try { unlinkSync(createIntentPath(ds, state)); } catch { /* not pending */ }
 }
 
-/** Adopt only the exact native session and persistent target. A replacement
- * reader starts at EOF; its fresh segment reserves new reasoning node IDs.
- * An unacknowledged old batch may leave a display gap, but must not be replayed. */
-export function resumeCotMessage(ds: DaemonSession, binding?: { turnId: string; dispatchAttempt?: number }): boolean {
-  const current = states.get(ds);
-  if (current && !current.pausedForRestore && (current.cotId || !current.disabled)) return !current.settled;
-  if (!canResumeCotMessage(ds)) return false;
-  if (current?.pumping) { current.resumeRequested = true; return false; }
+/** Serialize the create ACK's checkpoint with a successor's display handoff.
+ * No network operation runs under the lock. Unknown IDs keep their intent. */
+function recordCreatedCot(ds: DaemonSession, state: CotState): boolean {
+  if (!state.recovery) return recordCotOrphanMarker(ds, state);
+  return withFileLockSync(createIntentPath(ds, state), () => {
+    try {
+      const intent = JSON.parse(readFileSync(createIntentPath(ds, state), 'utf8'));
+      if (typeof intent.supersededBy === 'string' && intent.supersededBy !== state.turnKey) {
+        state.createSuperseded = true;
+        if (!state.finishStatus) state.finishStatus = 'done';
+        state.pausedForRestore = false;
+        state.pendingEntries = undefined;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    return recordCotOrphanMarker(ds, state);
+  }, { maxWaitMs: 1000 });
+}
+
+function cotCreateIntents(ds: DaemonSession): Array<{ path: string; rec: any }> {
+  const intents: Array<{ path: string; rec: any }> = [];
+  try {
+    for (const file of readdirSync(cotOrphanDir())) {
+      if (!/^create-[a-f0-9]{64}\.json$/.test(file)) continue;
+      try {
+        const path = join(cotOrphanDir(), file);
+        const rec = JSON.parse(readFileSync(path, 'utf8'));
+        if (rec.version !== 2 || !rec.createPending || !cotRecoveryMatches(ds, rec)
+          || typeof rec.turnKey !== 'string' || rec.turnKey.lastIndexOf('|') <= 0) continue;
+        intents.push({ path, rec: { ...rec, turnId: rec.turnKey.slice(0, rec.turnKey.lastIndexOf('|')) } });
+      } catch { /* never consume an uncertain intent */ }
+    }
+  } catch { /* missing directory */ }
+  return intents;
+}
+
+function cotKeyPrecedes(priorKey: string, binding: { turnId: string; dispatchAttempt?: number }): boolean {
+  const separator = priorKey.lastIndexOf('|');
+  if (separator <= 0 || priorKey === turnKeyOf(binding)) return false;
+  if (priorKey.slice(0, separator) !== binding.turnId) return true;
+  const suffix = priorKey.slice(separator + 1);
+  return /^\d+$/.test(suffix) && binding.dispatchAttempt !== undefined
+    && Number.isSafeInteger(Number(suffix)) && binding.dispatchAttempt > Number(suffix);
+}
+
+/** Read only exact host-owned recovery records; callers choose whether they
+ * resume a binding or retire its display after a proven successor starts. */
+function cotRecoveryMarkers(ds: DaemonSession): any[] {
   const candidates: any[] = [];
   try {
     for (const file of readdirSync(cotOrphanDir())) {
@@ -293,15 +336,83 @@ export function resumeCotMessage(ds: DaemonSession, binding?: { turnId: string; 
           || typeof rec.turnId !== 'string' || !rec.turnId || typeof rec.turnKey !== 'string'
           || !rec.turnKey.startsWith(`${rec.turnId}|`)
           || !Number.isSafeInteger(rec.nextNodeIndex) || rec.nextNodeIndex < 0) continue;
-        if (binding && rec.turnKey !== turnKeyOf(binding)) continue;
-        if (ds.currentTurnId && rec.turnId !== ds.currentTurnId) continue;
         candidates.push(rec);
       } catch { /* incomplete unrelated marker */ }
     }
-  } catch { return false; }
-  if (candidates.length !== 1) return false;
-  const rec = candidates[0];
-  const state: CotState = {
+  } catch { return []; }
+  return candidates;
+}
+
+/** A new worker-confirmed current turn is display-supersession evidence. Merely
+ * losing a PID marker or waiting a long time does not prove task failure. */
+function retireSupersededCotMarkers(ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number }): void {
+  if (!canResumeCotMessage(ds) || ds.currentTurnId !== binding.turnId) return;
+  const key = turnKeyOf(binding);
+  const intents = cotCreateIntents(ds);
+  const records = [...cotRecoveryMarkers(ds), ...intents.map(item => item.rec)];
+  if (records.some(rec => Array.isArray(rec.retiredKeys) && rec.retiredKeys.includes(key))) {
+    retireKey(ds, key);
+    return;
+  }
+  for (const rec of records) {
+    if (rec.turnKey === key) continue;
+    if (rec.turnId === binding.turnId) {
+      const suffix = rec.turnKey.slice(rec.turnId.length + 1);
+      const priorAttempt = /^\d+$/.test(suffix) ? Number(suffix) : undefined;
+      if (priorAttempt !== undefined && Number.isSafeInteger(priorAttempt)
+        && (binding.dispatchAttempt === undefined || binding.dispatchAttempt < priorAttempt)) {
+        retireKey(ds, key);
+        return;
+      }
+      if (binding.dispatchAttempt === undefined || priorAttempt === undefined
+        || !Number.isSafeInteger(priorAttempt) || binding.dispatchAttempt <= priorAttempt) continue;
+    }
+  }
+  // Mark unresolved POSTs before scanning known entities. If an ACK wins the
+  // lock it publishes a known marker first; otherwise it observes this flag.
+  // Thus an ACK arriving after the successor ended cannot resurrect old UI.
+  for (const { path, rec } of intents) {
+    if (!cotKeyPrecedes(rec.turnKey, binding)) continue;
+    try {
+      withFileLockSync(path, () => {
+        let current: any;
+        try { current = JSON.parse(readFileSync(path, 'utf8')); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+        const tmp = `${path}.${process.pid}.tmp`;
+        writeFileSync(tmp, JSON.stringify({ ...current, supersededBy: key }), { mode: 0o600 });
+        renameSync(tmp, path);
+      }, { maxWaitMs: 1000 });
+      retireKey(ds, rec.turnKey);
+    } catch (error) {
+      logger.warn(`[cot] create handoff retained for retry: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  for (const rec of cotRecoveryMarkers(ds)) {
+    if (rec.turnKey === key) continue;
+    if (rec.turnId === binding.turnId) {
+      const suffix = rec.turnKey.slice(rec.turnId.length + 1);
+      if (!/^\d+$/.test(suffix) || binding.dispatchAttempt === undefined
+        || binding.dispatchAttempt <= Number(suffix)) continue;
+    }
+    if (states.get(ds)?.cotId === rec.cotId) continue;
+    const state: CotState = {
+      turnId: rec.turnId, turnKey: rec.turnKey, cotId: rec.cotId, messageId: rec.messageId,
+      disabled: true, settled: true, pumping: false, sentCount: 0,
+      nodeOffset: rec.nextNodeIndex, finishStatus: 'done',
+      recovery: { larkAppId: rec.larkAppId, sessionId: rec.sessionId, chatId: rec.chatId,
+        nativeSessionId: rec.nativeSessionId, targetKey: rec.targetKey },
+    };
+    // Persist terminal intent before touching the provider. On a failed request
+    // the next sweep retries this same display result, never a new entity.
+    if (!recordCotOrphanMarker(ds, state)) continue;
+    retireKey(ds, rec.turnKey);
+    rememberRecentState(ds, state);
+    void completeAndClear(ds, state, 'done');
+  }
+}
+
+function recoveredCotState(rec: any): CotState {
+  return {
     turnKey: rec.turnKey, turnId: rec.turnId, cotId: rec.cotId, messageId: rec.messageId,
     disabled: false, settled: false, sentCount: 0, pumping: false, nodeOffset: rec.nextNodeIndex,
     prologueStarted: rec.prologueStarted === true,
@@ -310,6 +421,22 @@ export function resumeCotMessage(ds: DaemonSession, binding?: { turnId: string; 
     recovery: { larkAppId: rec.larkAppId, sessionId: rec.sessionId, chatId: rec.chatId,
       nativeSessionId: rec.nativeSessionId, targetKey: rec.targetKey },
   };
+}
+
+/** Adopt only the exact native session and persistent target. A replacement
+ * reader starts at EOF; its fresh segment reserves new reasoning node IDs.
+ * An unacknowledged old batch may leave a display gap, but must not be replayed. */
+export function resumeCotMessage(ds: DaemonSession, binding?: { turnId: string; dispatchAttempt?: number }): boolean {
+  const current = states.get(ds);
+  if (current && !current.pausedForRestore && (current.cotId || !current.disabled)) return !current.settled;
+  if (!canResumeCotMessage(ds)) return false;
+  if (current?.pumping) { current.resumeRequested = true; return false; }
+  const candidates = cotRecoveryMarkers(ds).filter(rec =>
+    (!binding || rec.turnKey === turnKeyOf(binding))
+    && (!ds.currentTurnId || rec.turnId === ds.currentTurnId));
+  if (candidates.length !== 1) return false;
+  const rec = candidates[0];
+  const state = recoveredCotState(rec);
   if (current) current.pausedForRestore = true;
   states.set(ds, state);
   retiredKeys.set(ds, Array.isArray(rec.retiredKeys) ? rec.retiredKeys.filter((k: unknown) => typeof k === 'string').slice(-RECENT_COT_STATES_MAX) : []);
@@ -386,6 +513,10 @@ export async function sweepOrphanCotMessages(
             },
             timeout: COT_REQUEST_TIMEOUT_MS,
           } as any);
+          if (cotAlreadyTerminal(noticeResponse)) {
+            try { unlinkSync(p); } catch { /* retry on the next sweep */ }
+            continue;
+          }
           assertCotResponse(rec.larkAppId, noticeResponse);
         } catch (err) {
           if (err instanceof TopicSendError) throw err;
@@ -401,9 +532,11 @@ export async function sweepOrphanCotMessages(
           params: { message_id: rec.messageId, reason: rec.finishStatus === 'done' ? 'done' : 'error' },
           timeout: COT_REQUEST_TIMEOUT_MS,
         } as any);
-        assertCotResponse(rec.larkAppId, completeResponse);
-        if (rec.version === 2 && completeResponse?.code != null && completeResponse.code !== 0) {
-          throw new Error(`CoT completion rejected: ${completeResponse.code}`);
+        if (!cotAlreadyTerminal(completeResponse)) {
+          assertCotResponse(rec.larkAppId, completeResponse);
+          if (rec.version === 2 && completeResponse?.code != null && completeResponse.code !== 0) {
+            throw new Error(`CoT completion rejected: ${completeResponse.code}`);
+          }
         }
         logger.info(`[cot] orphan closed cot=${rec.cotId}`);
       }
@@ -557,6 +690,15 @@ function assertCotResponse(larkAppId: string, response: any, state?: CotState): 
   // Legacy keeps its existing response handling; strict business-code checks are opt-in.
 }
 
+/** Only the provider's explicit terminal-state receipt confirms an unknown
+ * completion outcome. Do not guess undocumented numeric codes or accept a
+ * transport exception merely because its message mentions terminal state. */
+function cotAlreadyTerminal(response: any): boolean {
+  return typeof response?.code === 'number' && response.code !== 0
+    && typeof response.msg === 'string'
+    && /^COT already in terminal state\.?$/i.test(response.msg.trim());
+}
+
 async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
   const placement = cotPlacement(ds, state);
   if (getBot(ds.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
@@ -617,6 +759,7 @@ async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 
     params: { message_id: state.messageId!, reason },
     timeout: COT_REQUEST_TIMEOUT_MS,
   } as any);
+  if (cotAlreadyTerminal(response)) return;
   assertCotResponse(ds.larkAppId, response, state);
 }
 
@@ -842,7 +985,12 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         // before the turn settles), the next generation can still close it;
         // recording it after the append would leave a markerless window where
         // a created-but-never-settled bubble spins forever.
-        if (!recordCotOrphanMarker(ds, state) && canResumeCotMessage(ds)) throw new Error('CoT recovery checkpoint unavailable');
+        if (!recordCreatedCot(ds, state) && canResumeCotMessage(ds)) throw new Error('CoT recovery checkpoint unavailable');
+        if (state.createSuperseded && !state.settled) {
+          state.settled = true;
+          await completeAndClear(ds, state, state.finishStatus === 'done' ? 'done' : 'error');
+          break;
+        }
         if (state.pausedForRestore) break;
       }
       if (!state.prologueStarted) {
@@ -922,6 +1070,7 @@ export function handleCotThinkingUpdate(
   // Thinking bubbles are outbound messages too. Keep silent fires quiet even
   // when /cot show is armed, without suppressing another turn in this session.
   if (isSilentScheduledTurn(ds, msg.turnId) || ds.session.hiddenThinkingTurns?.includes(msg.turnId)) return false;
+  retireSupersededCotMarkers(ds, msg);
   if (!cotEnabled(ds)) return false;
   const key = turnKeyOf(msg);
   let state = states.get(ds);
@@ -1069,16 +1218,26 @@ export function finalizeCotMessage(
   status: 'completed' | 'failed' | 'cancelled' | 'ambiguous',
   dispatchAttempt?: number,
 ): boolean {
-  let state = states.get(ds);
-  if (!state) {
-    resumeCotMessage(ds, { turnId, dispatchAttempt });
-    state = states.get(ds);
+  if (!isSilentScheduledTurn(ds, turnId) && !ds.session.hiddenThinkingTurns?.includes(turnId)) {
+    retireSupersededCotMarkers(ds, { turnId, dispatchAttempt });
   }
+  let state = states.get(ds);
   // 当前 state 不是这一轮（已被新 turn 替换）时，按 turnId 找最近几轮的 state：
   // 迟到的 terminal 仍要收尾它自己的气泡（通常 settleSupersededState 已先按 done
   // 收过，这里靠 finishStatus / settled 幂等）。
   const key = turnKeyOf({ turnId, dispatchAttempt });
   if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
+  if (!state && canResumeCotMessage(ds)) {
+    const candidates = cotRecoveryMarkers(ds).filter(rec => rec.turnKey === key);
+    if (candidates.length === 1) {
+      // A matching old terminal may arrive after a new current turn, without
+      // any same-turn thinking. Close its own entity without replacing the
+      // current display state or granting the old turn execution authority.
+      state = recoveredCotState(candidates[0]);
+      rememberRecentState(ds, state);
+      retireKey(ds, key);
+    }
+  }
   if (!state || state.turnKey !== key) return false;
   if (state.recovery && !recoveryIdentityMatches(ds, state.recovery)) return false;
   if (state.settled) return true;

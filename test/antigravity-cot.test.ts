@@ -11,6 +11,7 @@ import {
   type AntigravityCotEntry,
 } from '../src/services/antigravity-cot.js';
 import { isAntigravityTranscriptBusy } from '../src/adapters/cli/antigravity.js';
+import * as jsonlCursor from '../src/services/jsonl-cursor.js';
 import { jsonl, writeAntigravityTwoLogs } from './helpers/antigravity-two-logs.js';
 
 describe('antigravity-cot', () => {
@@ -138,6 +139,24 @@ describe('antigravity-cot', () => {
     appendFileSync(transcriptPath, jsonl([{ step_index: 2, source: 'MODEL', type: 'GENERIC', content: 'result after restore' }]));
     await vi.advanceTimersByTimeAsync(40);
     expect(received).toEqual([{ kind: 'tool_result', id: 'call_pending', result: 'result after restore' }]);
+  });
+
+  it('restores pending tools from the latest input instead of replaying old turns', async () => {
+    vi.useFakeTimers();
+    const transcriptPath = join(tmpDir, 'long-history.jsonl');
+    const history = jsonl(Array.from({ length: 500 }, (_, step_index) => ({ type: 'PLANNER_RESPONSE', step_index, thinking: 'old'.repeat(1000) })));
+    const live = jsonl([{ type: 'USER_INPUT', content: 'current turn' },
+      { type: 'PLANNER_RESPONSE', step_index: 501, tool_calls: [{ id: 'current-tool', name: 'run_command', args: {} }] }]);
+    writeFileSync(transcriptPath, history + live);
+    const forward = vi.spyOn(jsonlCursor, 'scanJsonlFromFd'); const entries = vi.fn();
+    try {
+      startAntigravityCot('conv-long-history', entries, { transcriptPath, pollIntervalMs: 20 });
+      expect(forward).toHaveBeenCalled(); expect(forward.mock.calls[0][1]).toBe(Buffer.byteLength(history));
+      expect(entries).not.toHaveBeenCalled();
+      appendFileSync(transcriptPath, jsonl([{ type: 'GENERIC', source: 'MODEL', step_index: 502, content: 'current result' }]));
+      await vi.advanceTimersByTimeAsync(40);
+      expect(entries).toHaveBeenCalledWith([{ kind: 'tool_result', id: 'current-tool', result: 'current result' }]);
+    } finally { forward.mockRestore(); }
   });
 
   it('keeps the last incomplete transcript line for a later append', async () => {

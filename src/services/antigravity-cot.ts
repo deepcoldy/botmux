@@ -17,11 +17,11 @@
  * This reader runs for the session, streaming thinking, mid-turn text, tool calls
  * and tool results into the native Feishu CoT bubble (message_cot).
  */
-import { existsSync, statSync, watch, type FSWatcher } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { scanJsonlFromOffset } from './jsonl-cursor.js';
-import { readLatestAntigravityRuntime } from './antigravity-usage.js';
+import { scanJsonlBackwardFd, scanJsonlFromFd, scanJsonlFromOffset } from './jsonl-cursor.js';
+import { antigravityRuntimeSignature, readLatestAntigravityRuntime } from './antigravity-usage.js';
 import {
   antigravityFullSiblingPath,
   mapAntigravityCompactOffsetToFull,
@@ -143,6 +143,7 @@ interface ReaderState {
   pendingTools: Array<{ id: string; name: string }>;
   onEntries: (entries: readonly AntigravityCotEntry[]) => void;
   onRuntime?: (runtime: { model: string }) => void;
+  runtimeSignature?: string;
 }
 
 const readers = new Map<string, ReaderState>();
@@ -204,10 +205,17 @@ function readNewTranscriptLines(state: ReaderState): void {
   // Reuse this reader's lifetime and exact native session, not a global setting.
   if (state.onRuntime) {
     try {
-      const runtime = readLatestAntigravityRuntime(state.cliSessionId, {
-        conversationsDir: join(dirname(state.brainDir), 'conversations'),
-      });
-      if (runtime.model) state.onRuntime({ model: runtime.model });
+      const opts = { conversationsDir: join(dirname(state.brainDir), 'conversations') };
+      const signature = antigravityRuntimeSignature(state.cliSessionId, opts);
+      if (!signature || signature !== state.runtimeSignature) {
+        const runtime = readLatestAntigravityRuntime(state.cliSessionId, opts);
+        if (runtime.model) {
+          state.onRuntime({ model: runtime.model });
+          // Failed/unknown reads and failed delivery stay retryable without a
+          // file change. Unchanged successful snapshots need no SQLite open.
+          state.runtimeSignature = signature;
+        }
+      }
     } catch { /* cosmetic model reporting must not stop tool progress */ }
   }
   if (!bindTranscript(state) || !state.transcriptPath) return;
@@ -250,6 +258,40 @@ export interface StartAntigravityCotOptions {
   onRuntime?: (runtime: { model: string }) => void;
 }
 
+/** Pending tools reset at USER_INPUT. Locate that boundary backwards, then
+ * replay only the latest turn's correlation state, not the whole conversation.
+ * Use one regular-file fd for both passes and retain an incomplete EOF line. */
+function restorePendingTools(path: string, endOffset: number, pendingTools: Array<{ id: string; name: string }>): number {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    const st = fstatSync(fd);
+    if (!st.isFile()) return endOffset;
+    const end = Math.min(endOffset, st.size);
+    let completeEnd = end;
+    let turnStart = 0;
+    scanJsonlBackwardFd(fd, {
+      endOffset: end,
+      onLine: (line, start) => {
+        if (start + line.length === end) { completeEnd = start; return; }
+        if (!line.includes('"USER_INPUT"') && !line.includes('"USER_EXPLICIT"')) return;
+        try {
+          const record = JSON.parse(line.toString('utf8'));
+          if (record.type === 'USER_INPUT' || record.source === 'USER_EXPLICIT') { turnStart = start; return true; }
+        } catch { /* malformed old record is not an input boundary */ }
+      },
+    });
+    const primed = scanJsonlFromFd(fd, turnStart, {
+      endOffset: completeEnd,
+      onLine: line => {
+        try { extractAntigravityCotEntriesFromRecord(JSON.parse(line), pendingTools); } catch { /* malformed record */ }
+      },
+    });
+    return primed?.newOffset ?? completeEnd;
+  } catch { return endOffset; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+
 /**
  * Start monitoring Antigravity transcript for CoT events.
  *
@@ -282,13 +324,7 @@ export function startAntigravityCot(
   // without replaying any old thinking or tool-call display entries.
   const pendingTools: Array<{ id: string; name: string }> = [];
   if (initialOffset > 0 && transcriptPath) {
-    const primed = scanJsonlFromOffset(transcriptPath, 0, {
-      endOffset: initialOffset,
-      onLine: line => {
-        try { extractAntigravityCotEntriesFromRecord(JSON.parse(line), pendingTools); } catch { /* partial line */ }
-      },
-    });
-    initialOffset = primed?.newOffset ?? initialOffset;
+    initialOffset = restorePendingTools(transcriptPath, initialOffset, pendingTools);
   }
 
   const pollInterval = opts?.pollIntervalMs ?? POLL_INTERVAL_MS;
