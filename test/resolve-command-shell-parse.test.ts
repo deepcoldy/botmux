@@ -263,5 +263,11 @@ describe('async shell process-group retirement', () => {
       for (const pid of [...manual, ...pids()]) { try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ } }
       rmSync(root, { recursive: true, force: true });
     }
-  });
+    // Per-test wall budget 30s: the timeout variant legitimately burns ~2 × the
+    // 2s resolver budget (probes run -lc then -ic) ≈ 4s. CI legs pass an explicit
+    // --timeout (180s bun leg, 60s vitest), but a bare `bun test <file>` uses
+    // Bun's 5000ms default and killed a passing variant at ~4.5-5.1s on a loaded
+    // 1-CPU host (4/8 rounds). This lifts only the runner ceiling; the timeout
+    // semantics themselves stay asserted (inconclusive / group retirement).
+  }, 30_000);
 });

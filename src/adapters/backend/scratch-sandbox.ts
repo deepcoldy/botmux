@@ -45,6 +45,7 @@
  *
  * Nothing in this module runs on macOS (the kernel has no COW primitive).
  */
+import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
 import {
   mkdirSync,
   existsSync,
@@ -538,6 +539,9 @@ export interface PrepareScratchOpts {
   /** Transport bwrap options via a private file when launching under a backend
    *  with command-length limits (tmux new-session). */
   useBwrapArgsFile?: boolean;
+  /** wrapperCli inside the sandbox: `<cli name>` alias placed in the private
+   *  shim dir (first on PATH) pointing at the real, already-allowed CLI. */
+  cliNameLink?: { name: string; target: string };
   /** Absolute `botmux` command paths to overlay with the relay shim. */
   shimBindTargets?: readonly string[];
   mcpGatewaySocketPath?: string;
@@ -836,6 +840,9 @@ export function prepareScratchSandboxDetailed(opts: PrepareScratchOpts): Scratch
   const shim = join(shimBin, 'botmux');
   writeFileSync(shim, botmuxShimExecLine());
   try { chmodSync(shim, 0o755); } catch { /* */ }
+  // A wrapperCli running inside the sandbox may exec the CLI by name: alias
+  // that name to the (already allowed) real CLI binary in this private dir.
+  writeCliNameLink(shimBin, opts.cliNameLink);
 
   // Real-host passthrough carve-outs layered AFTER deny masks (later mount
   // wins). The outbox MUST stay host-real: the daemon watcher reads it without
