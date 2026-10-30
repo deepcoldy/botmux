@@ -702,6 +702,40 @@ export function transcriptShowsTurnDurationMarker(path: string): boolean {
   }
 }
 
+/** How far back from EOF transcriptRecordsApiErrorSince looks. */
+const API_ERROR_RECORD_PROBE_MAX_BYTES = 1024 * 1024;
+
+/** Whether the transcript holds an API-error record (`isApiErrorMessage:true`)
+ *  stamped at or after `sinceMs`. Undefined when the file cannot be read, so a
+ *  caller can tell "no record" from "could not look". */
+export function transcriptRecordsApiErrorSince(path: string, sinceMs: number): boolean | undefined {
+  if (!path || !existsSync(path)) return undefined;
+  try {
+    const completeEnd = baselineJsonlCursor(path).newOffset;
+    let found = false;
+    scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - API_ERROR_RECORD_PROBE_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line) => {
+        const text = line.toString('utf8');
+        let ev: TranscriptEvent;
+        try { ev = JSON.parse(text) as TranscriptEvent; } catch { return false; }
+        const at = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
+        if (Number.isFinite(at) && at < sinceMs) return true; // older than the window: stop
+        if (ev.isApiErrorMessage === true && (!Number.isFinite(at) || at >= sinceMs)) {
+          found = true;
+          return true;
+        }
+        return false;
+      },
+    });
+    return found;
+  } catch {
+    return undefined;
+  }
+}
+
 /** How much of a transcript's head transcriptHoldsConversation reads. Claude
  *  opens a file with a handful of small metadata records (mode,
  *  permission-mode, title, a file-history snapshot); the first conversation

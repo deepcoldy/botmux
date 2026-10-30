@@ -42,6 +42,15 @@ import { classifyClaudeTerminalEvent, type ClaudeTerminalOutcome } from './claud
  *  poll tick or two, so this only delays the fallback case. */
 export const CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS = 5_000;
 
+/** How far before the report an API-error record in the transcript still
+ *  counts as this failure's. Claude writes the record before it starts the
+ *  hook client, so normally it is a second or two old. */
+export const CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS = 60_000;
+
+/** A notice for the same error code is not repeated within this window: with
+ *  no turn to settle it carries no new information for the chat. */
+export const CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS = 60 * 60_000;
+
 export interface ClaudeStopFailureReport {
   /** Claude's machine error type: `server_error`, `overloaded`, `rate_limit`,
    *  `authentication_failed`, `invalid_request`, … */
@@ -182,8 +191,12 @@ export type ClaudeStopFailureFallback =
     action: 'skip';
     /** `rate_limited`: usage limits stay with the structured limit path.
      *  `surfaced`: a failed terminal or failure notice went out around the
-     *  report (normally the transcript path settling this turn). */
-    reason: 'unclassified' | 'rate_limited' | 'surfaced';
+     *  report (normally the transcript path settling this turn).
+     *  `unrecorded`: no turn to settle, and the transcript holds no API-error
+     *  record for it — the conversation's turns ended normally, so the
+     *  failure did not stop any work there.
+     *  `repeated`: the same notice went out recently. */
+    reason: 'unclassified' | 'rate_limited' | 'surfaced' | 'unrecorded' | 'repeated';
   }
   /** The turn is still open: settle it, so the daemon continues or reports it. */
   | { action: 'emit'; status: 'failed' | 'ambiguous'; errorCode: string; retryable: boolean }
@@ -198,7 +211,9 @@ export type ClaudeStopFailureFallback =
  *
  * The invariant is that every API error that ends a turn of the driven CLI
  * surfaces somewhere. The transcript path normally does it (a failed terminal,
- * or a local-turn notice), and then nothing more is sent.
+ * or a local-turn notice), and then nothing more is sent. A report the
+ * transcript holds no API-error record for ended no turn of the conversation
+ * (seen live: error "unknown" seconds after ordinary turns) and is only logged.
  */
 export function decideClaudeStopFailureFallback(input: {
   outcome: ClaudeTerminalOutcome | undefined;
@@ -212,6 +227,11 @@ export function decideClaudeStopFailureFallback(input: {
   cliIdle: boolean;
   /** A failed terminal or failure notice went out around the report. */
   surfaced: boolean;
+  /** The transcript holds an API-error record from around the report;
+   *  undefined when it could not be read. */
+  recorded?: boolean;
+  /** A notice with this error code went out within the cooldown. */
+  recentlyNotified?: boolean;
 }): ClaudeStopFailureFallback {
   const { outcome } = input;
   if (!outcome || outcome.status === 'completed') return { action: 'skip', reason: 'unclassified' };
@@ -220,6 +240,11 @@ export function decideClaudeStopFailureFallback(input: {
   if (input.turnId && !input.settled && input.cliIdle) {
     return { action: 'emit', status: outcome.status, errorCode: outcome.errorCode, retryable: outcome.retryable };
   }
+  // Claude writes the API-error record before it runs the hook, so a failure
+  // that stopped the conversation's work is on record. Without one there is
+  // nothing to tell the chat; an unreadable transcript still notifies.
+  if (input.recorded === false) return { action: 'skip', reason: 'unrecorded' };
+  if (input.recentlyNotified) return { action: 'skip', reason: 'repeated' };
   return { action: 'notify', errorCode: outcome.errorCode };
 }
 
@@ -242,6 +267,12 @@ export interface ClaudeStopFailureContext<TTimer = unknown> {
   /** When the worker last emitted a failed/ambiguous terminal or a failure
    *  notice. */
   lastFailureSurfacedAtMs: () => number | undefined;
+  /** Whether the transcript holds an API-error record at or after `sinceMs`;
+   *  undefined when it cannot be read. `reportTranscriptPath` is the one the
+   *  hook named. */
+  transcriptRecordsApiError: (sinceMs: number, reportTranscriptPath: string | undefined) => boolean | undefined;
+  /** When this worker last sent a StopFailure notice with `errorCode`. */
+  lastNoticeAtMs: (errorCode: string) => number | undefined;
   now: () => number;
   emit: (
     turnId: string,
@@ -303,9 +334,12 @@ export function handleClaudeStopFailureReport<TTimer>(
   // failure surfaced on another turn (a local-turn notice, an absorbed input).
   const surfacedSinceMs = ctx.now() - CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS;
   const outcome = classifyClaudeStopFailure(report);
+  const arrivedAtMs = ctx.now();
+  const detail = report.lastAssistantMessage ?? report.errorDetails;
   ctx.log(`Claude StopFailure (${report.error}${opts.notifyOnly ? ', notify-only' : ''}) for turn `
     + `${failedTurn.turnId?.slice(0, 12) ?? '-'}; waiting ${CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS}ms `
-    + 'for the transcript to surface it');
+    + 'for the transcript to surface it'
+    + (detail ? `; message: ${JSON.stringify(detail.slice(0, 200))}` : ''));
   return ctx.schedule(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS, () => {
     try {
       ctx.catchUp();
@@ -324,6 +358,9 @@ export function handleClaudeStopFailureReport<TTimer>(
       // the report. Otherwise only a failure surfaced around the report counts.
       surfaced: settledStatus === 'failed' || settledStatus === 'ambiguous'
         || (ctx.lastFailureSurfacedAtMs() ?? -Infinity) >= surfacedSinceMs,
+      recorded: ctx.transcriptRecordsApiError(arrivedAtMs - CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS, report.transcriptPath),
+      recentlyNotified: outcome !== undefined && 'errorCode' in outcome
+        && ctx.now() - (ctx.lastNoticeAtMs(outcome.errorCode) ?? -Infinity) < CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS,
     });
     switch (decision.action) {
       case 'skip':

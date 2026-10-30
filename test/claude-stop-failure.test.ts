@@ -13,6 +13,8 @@ import { join } from 'node:path';
 import {
   claudeStopFailureBelongsToOwner,
   classifyClaudeStopFailure,
+  CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS,
+  CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS,
   CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS,
   CLAUDE_STOP_FAILURE_OUTBOX_MAX_AGE_MS,
   CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX,
@@ -24,7 +26,7 @@ import {
   type ClaudeStopFailureReport,
   writeClaudeStopFailureOutboxReport,
 } from '../src/services/claude-stop-failure.js';
-import { classifyClaudeTerminalEvent, type TranscriptEvent } from '../src/services/claude-transcript.js';
+import { classifyClaudeTerminalEvent, transcriptRecordsApiErrorSince, type TranscriptEvent } from '../src/services/claude-transcript.js';
 
 const SESSION_ID = '7bb7a763-27bb-449b-9b1f-72159ee31588';
 const TRANSCRIPT = `/home/u/.claude/projects/-work/${SESSION_ID}.jsonl`;
@@ -193,6 +195,28 @@ describe('decideClaudeStopFailureFallback', () => {
       .toEqual({ action: 'notify', errorCode: 'provider_server_error' });
   });
 
+  it('only logs when no turn is left and the transcript holds no record of the failure', () => {
+    // Every turn of the conversation ended normally: the failure stopped no
+    // work there, so the chat hears nothing.
+    expect(decideClaudeStopFailureFallback({ ...base, settled: true, recorded: false }))
+      .toEqual({ action: 'skip', reason: 'unrecorded' });
+    expect(decideClaudeStopFailureFallback({ ...base, turnId: undefined, recorded: false }))
+      .toEqual({ action: 'skip', reason: 'unrecorded' });
+    // An unreadable transcript is no evidence either way: still notify.
+    expect(decideClaudeStopFailureFallback({ ...base, settled: true, recorded: undefined }))
+      .toEqual({ action: 'notify', errorCode: 'provider_server_error' });
+  });
+
+  it('still settles an open turn whether or not the transcript recorded the failure', () => {
+    expect(decideClaudeStopFailureFallback({ ...base, recorded: false }))
+      .toEqual({ action: 'emit', status: 'failed', errorCode: 'provider_server_error', retryable: true });
+  });
+
+  it('does not repeat a notice that went out recently', () => {
+    expect(decideClaudeStopFailureFallback({ ...base, settled: true, recorded: true, recentlyNotified: true }))
+      .toEqual({ action: 'skip', reason: 'repeated' });
+  });
+
   it('never acts on a usage limit', () => {
     expect(decideClaudeStopFailureFallback({ ...base, outcome: classifyClaudeStopFailure(report({ error: 'rate_limit' })) }))
       .toEqual({ action: 'skip', reason: 'rate_limited' });
@@ -200,13 +224,20 @@ describe('decideClaudeStopFailureFallback', () => {
 });
 
 describe('handleClaudeStopFailureReport', () => {
-  function harness(opts: { settled?: 'completed' | 'failed'; surfacedBy?: 'before' | 'catch-up' } = {}) {
+  function harness(opts: {
+    settled?: 'completed' | 'failed';
+    surfacedBy?: 'before' | 'catch-up';
+    /** What the transcript holds around the report (default: the API-error record). */
+    recorded?: boolean | 'unreadable';
+  } = {}) {
     const timers: Array<{ delayMs: number; run: () => void }> = [];
     const settled = new Map<string, string>(opts.settled ? [['om_failed', opts.settled]] : []);
     let clock = 1_000_000;
     let surfacedAt: number | undefined = opts.surfacedBy === 'before' ? clock - 1_000 : undefined;
     const emitted: unknown[][] = [];
     const notices: unknown[][] = [];
+    const noticeAt = new Map<string, number>();
+    const recordQueries: Array<[number, string | undefined]> = [];
     let idle = true;
     const ctx = {
       owner: { cliPid: 4242, cliSessionIds: new Set([SESSION_ID]), transcriptPath: TRANSCRIPT },
@@ -220,14 +251,19 @@ describe('handleClaudeStopFailureReport', () => {
       cliIdle: () => idle,
       isKnownTurn: (turnId: string) => ['om_failed', 'om_older', 'om_next'].includes(turnId),
       lastFailureSurfacedAtMs: () => surfacedAt,
+      transcriptRecordsApiError: (sinceMs: number, path: string | undefined) => {
+        recordQueries.push([sinceMs, path]);
+        return opts.recorded === 'unreadable' ? undefined : (opts.recorded ?? true);
+      },
+      lastNoticeAtMs: (code: string) => noticeAt.get(code),
       now: () => clock,
       advance: (ms: number) => { clock += ms; },
       setIdle: (value: boolean) => { idle = value; },
       emit: (...args: unknown[]) => { emitted.push(args); },
-      notify: (...args: unknown[]) => { notices.push(args); },
+      notify: (...args: unknown[]) => { notices.push(args); noticeAt.set(args[0] as string, clock); },
       log: () => undefined,
     };
-    return { ctx, timers, emitted, notices };
+    return { ctx, timers, emitted, notices, recordQueries };
   }
   const fromDrivenCli = parseClaudeStopFailureHookInput(JSON.stringify(hookPayload), '4242')!;
 
@@ -281,6 +317,43 @@ describe('handleClaudeStopFailureReport', () => {
     timers[0].run();
     expect(emitted).toEqual([]);
     expect(notices).toEqual([['provider_server_error', 'om_failed']]);
+  });
+
+  it('sends nothing for a closed turn when the transcript holds no record of the failure', () => {
+    // Seen live: a report with error "unknown" some seconds after a turn that
+    // ended normally, no API-error record anywhere in the transcript.
+    const { ctx, timers, emitted, notices, recordQueries } = harness({ settled: 'completed', recorded: false });
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+    const arrivedAt = ctx.now();
+    ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
+    timers[0].run();
+    expect(emitted).toEqual([]);
+    expect(notices).toEqual([]);
+    // It looks back from the report's arrival, in the transcript the hook named too.
+    expect(recordQueries).toEqual([[arrivedAt - CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS, TRANSCRIPT]]);
+  });
+
+  it('still notifies for a closed turn when the transcript cannot be read', () => {
+    const { ctx, timers, notices } = harness({ settled: 'completed', recorded: 'unreadable' });
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+    timers[0].run();
+    expect(notices).toEqual([['provider_server_error', 'om_failed']]);
+  });
+
+  it('sends the same notice at most once per cooldown', () => {
+    const { ctx, timers, notices } = harness({ settled: 'completed' });
+    const report = () => {
+      handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+      ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
+      timers.at(-1)!.run();
+    };
+    report();
+    ctx.advance(CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS - 2 * CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
+    report();
+    expect(notices).toHaveLength(1);
+    ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
+    report();
+    expect(notices).toHaveLength(2);
   });
 
   it('reports instead of failing the queued input Claude started after the failure', () => {
@@ -344,6 +417,46 @@ describe('handleClaudeStopFailureReport', () => {
     timers[0].run();
     expect(emitted).toEqual([]);
     expect(notices).toEqual([]);
+  });
+});
+
+describe('transcriptRecordsApiErrorSince', () => {
+  const dirs: string[] = [];
+  afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+  const at = (iso: string) => Date.parse(iso);
+  function transcriptOf(lines: object[]): string {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-stop-failure-record-'));
+    dirs.push(dir);
+    const path = join(dir, 'session.jsonl');
+    writeFileSync(path, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+    return path;
+  }
+  const turn = (ts: string) => [
+    { type: 'assistant', timestamp: ts, message: { content: [{ type: 'text', text: 'done' }] } },
+    { type: 'system', subtype: 'turn_duration', timestamp: ts, durationMs: 1_000 },
+  ];
+
+  it('finds the API-error record Claude writes before running the hook', () => {
+    const path = transcriptOf([
+      ...turn('2026-10-30T02:40:00.000Z'),
+      { ...transcriptRecord, timestamp: '2026-10-30T02:42:15.000Z' },
+      { type: 'system', subtype: 'turn_duration', timestamp: '2026-10-30T02:42:15.010Z', durationMs: 3_000 },
+    ]);
+    expect(transcriptRecordsApiErrorSince(path, at('2026-10-30T02:41:16.000Z'))).toBe(true);
+  });
+
+  it('reports no record when every turn ended normally, or the only record is older than the window', () => {
+    expect(transcriptRecordsApiErrorSince(transcriptOf([
+      ...turn('2026-10-30T02:41:30.000Z'), ...turn('2026-10-30T02:41:55.000Z'),
+    ]), at('2026-10-30T02:41:16.000Z'))).toBe(false);
+    expect(transcriptRecordsApiErrorSince(transcriptOf([
+      { ...transcriptRecord, timestamp: '2026-10-30T01:00:00.000Z' },
+      ...turn('2026-10-30T02:41:55.000Z'),
+    ]), at('2026-10-30T02:41:16.000Z'))).toBe(false);
+  });
+
+  it('cannot tell for a transcript that does not exist', () => {
+    expect(transcriptRecordsApiErrorSince('/nonexistent/botmux/session.jsonl', 0)).toBeUndefined();
   });
 });
 
