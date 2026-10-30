@@ -934,14 +934,22 @@ setInterval(() => {}, 1_000);
     const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
     writeFileSync(transcriptPath, '');
 
-    // The fake reproduces the gap: an idle-looking input box at spawn, total
-    // silence (NO Working...), then some mid-turn output so quiescence can
-    // fire again while the started turn is running.
+    // Drive each paint only after the previous phase is observed. Fixed
+    // wall-clock output can race worker startup or a delayed idle callback
+    // under CI contention, consuming the startup gap before we observe it.
+    const paintPhase = join(root, 'paint-phase');
     const fakePi = join(root, 'fake-pi');
     writeFileSync(fakePi, `#!/usr/bin/env node
-process.stdout.write('┌─ pi ──────────┐\\n│ ❯ type here   │\\n└───────────────┘\\n');
-setTimeout(() => process.stdout.write('streaming tokens\\n'), 6_000);
-setInterval(() => {}, 1_000);
+const fs = require('node:fs');
+let painted = '';
+setInterval(() => {
+  if (!fs.existsSync(${JSON.stringify(paintPhase)})) return;
+  const phase = fs.readFileSync(${JSON.stringify(paintPhase)}, 'utf8');
+  if (phase === painted) return;
+  painted = phase;
+  if (phase === 'startup') process.stdout.write('┌─ pi ──────────┐\\n│ ❯ type here   │\\n└───────────────┘\\n');
+  if (phase === 'running') process.stdout.write('streaming tokens\\n');
+}, 25);
 `);
     chmodSync(fakePi, 0o755);
 
@@ -980,7 +988,10 @@ setInterval(() => {}, 1_000);
       turnId: 'om_turn',
     } satisfies DaemonToWorker);
 
-    await waitForLog(child, logs, 'Codex bridge fresh-empty:', WORKER_BOOT_TIMEOUT_MS);
+    // Wait for the worker's sampler before painting, so the single startup
+    // write cannot land before its PTY listener is installed.
+    await waitForLog(child, logs, 'Argv-baked first prompt in flight — publishing projected working', WORKER_BOOT_TIMEOUT_MS);
+    writeFileSync(paintPhase, 'startup');
     // The startup-window quiescence idle is re-armed by the evidence gate —
     // this log is the proof it was caught (before the fix it flowed through
     // markPromptReady and seeded a premature working→idle).
@@ -993,8 +1004,9 @@ setInterval(() => {}, 1_000);
 
     // Turn actually starts: real Pi writes the user record at that instant.
     appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
+    writeFileSync(paintPhase, 'running');
 
-    // Mid-turn quiescence (the fake's 6s output going quiet) must now be
+    // Mid-turn quiescence (the new output going quiet) must now be
     // suppressed by the structured lifecycle gate (started turn, no terminal).
     await waitForLog(child, logs, 'Ignoring prompt-ready heuristic while a structured turn is unfinished');
     expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
