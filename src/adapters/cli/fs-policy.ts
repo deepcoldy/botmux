@@ -1228,6 +1228,65 @@ export function compileToSeatbelt(policy: FsPolicy): string {
 
 // ───────────────────────────── bwrap compiler ────────────────────────────────
 
+export interface SymlinkProbe {
+  /** lstat(path).isSymbolicLink(); false when absent. */
+  isSymlink(path: string): boolean;
+  /** realpath(path); undefined when it cannot be resolved (dangling). */
+  realpath(path: string): string | undefined;
+}
+
+/**
+ * Baseline directories are candidates written lexically (`/opt`, `/usr`,
+ * `/etc`, `~/.cache` …). On hosts where one of them is a symlink (`/opt ->
+ * /data00/opt` on some devboxes) bwrap resolves the bind source to the real
+ * directory but the mount target `/opt` is then a mountpoint for a different
+ * path — MEASURED in a user report: `bwrap: Can't bind mount /oldroot/data00
+ * on /newroot/opt`. Handle it the way usrmerge `/bin` is handled: recreate the
+ * link inside the fresh root (`--symlink <real> <path>`, via
+ * CompileBwrapOpts.symlinks) and bind the REAL path instead.
+ *
+ * Rules (any source) below the lexical link are moved under the real path too,
+ * so longest-prefix still decides. A rule already naming the real path wins
+ * over the relocated baseline (an explicit grant/deny is never widened or
+ * narrowed by a baseline candidate). A dangling baseline link is dropped —
+ * nothing to expose. Only a link whose PARENT is already canonical is
+ * rebuilt; deeper aliasing is left untouched (as before). Pure given `io`.
+ */
+export function relocateSymlinkedBaselineRules(
+  rules: readonly FsRule[],
+  io: SymlinkProbe,
+): { rules: FsRule[]; symlinks: { path: string; target: string }[] } {
+  const symlinks: { path: string; target: string }[] = [];
+  const moves: { from: string; to: string }[] = [];
+  const dropped = new Set<string>();
+  for (const r of rules) {
+    if (r.source !== 'baseline' || r.access === 'deny' || r.path === '/') continue;
+    if (!io.isSymlink(r.path)) continue;
+    const parent = r.path.slice(0, r.path.lastIndexOf('/')) || '/';
+    if (io.realpath(parent) !== parent) continue;
+    const target = io.realpath(r.path);
+    if (!target) { dropped.add(r.path); continue; }
+    if (target === r.path || coversPath(r.path, target) || coversPath(target, r.path)) continue;
+    if (symlinks.some(l => l.path === r.path)) continue;
+    symlinks.push({ path: r.path, target });
+    moves.push({ from: r.path, to: target });
+  }
+  if (!moves.length && !dropped.size) return { rules: [...rules], symlinks };
+  const byPath = new Map<string, FsRule>();
+  for (const r of rules) {
+    if (dropped.has(r.path)) continue;
+    const move = moves.find(m => coversPath(m.from, r.path));
+    if (!move) { byPath.set(r.path, r); continue; }
+    const path = move.to + r.path.slice(move.from.length);
+    // A rule already naming the real path wins whichever order it comes in: an
+    // earlier one is kept here, a later one overwrites below via set().
+    if (!byPath.has(path)) byPath.set(path, { ...r, path });
+  }
+  const out = [...byPath.values()].sort((a, b) =>
+    pathDepth(a.path) - pathDepth(b.path) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { rules: out, symlinks };
+}
+
 export interface CompileBwrapOpts {
   /** Top-level symlinks to replicate inside the tmpfs root (usrmerge /bin →
    *  usr/bin etc.). Resolved by the worker (impure readlink). */

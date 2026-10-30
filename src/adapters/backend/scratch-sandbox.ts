@@ -45,6 +45,7 @@
  *
  * Nothing in this module runs on macOS (the kernel has no COW primitive).
  */
+import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
 import {
   mkdirSync,
   existsSync,
@@ -69,6 +70,7 @@ import {
   SCRATCH_TREE_MARKER,
 } from './sandbox.js';
 import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
+import { bwrapExecutable } from '../../core/system-bwrap.js';
 import { procStatStartTimeDigits } from '../../utils/proc-stat.js';
 import { PROXY_ENV_KEYS, CA_BUNDLE_ENV_KEYS } from '../../utils/child-env.js';
 import {
@@ -143,7 +145,7 @@ function hasCmd(cmd: string): boolean {
  *  passwordless sudo only, never block on a prompt. */
 function ensureScratchDeps(needFuse: boolean): ScratchFailure | null {
   const missing: string[] = [];
-  if (!hasCmd('bwrap')) missing.push('bubblewrap');
+  if (!bwrapExecutable()) missing.push('bubblewrap');
   if (needFuse && !hasCmd('fuse-overlayfs')) missing.push('fuse-overlayfs');
   if (!missing.length) return null;
   const pm =
@@ -157,7 +159,7 @@ function ensureScratchDeps(needFuse: boolean): ScratchFailure | null {
   if (pm) {
     const argv = isRoot ? pm : ['sudo', '-n', ...pm];
     const r = spawnSync(argv[0], argv.slice(1), { stdio: 'ignore', timeout: 180_000 });
-    if (r.status === 0 && missing.every(m => hasCmd(m === 'bubblewrap' ? 'bwrap' : m))) return null;
+    if (r.status === 0 && missing.every(m => (m === 'bubblewrap' ? !!bwrapExecutable() : hasCmd(m)))) return null;
   }
   const guide = scratchInstallHint(pm?.[0] ?? null, isRoot, missing);
   console.error(`[scratch-sandbox] missing deps (${missing.join(', ')}); auto-install unavailable — ${guide}`);
@@ -537,6 +539,9 @@ export interface PrepareScratchOpts {
   /** Transport bwrap options via a private file when launching under a backend
    *  with command-length limits (tmux new-session). */
   useBwrapArgsFile?: boolean;
+  /** wrapperCli inside the sandbox: `<cli name>` alias placed in the private
+   *  shim dir (first on PATH) pointing at the real, already-allowed CLI. */
+  cliNameLink?: { name: string; target: string };
   /** Absolute `botmux` command paths to overlay with the relay shim. */
   shimBindTargets?: readonly string[];
   mcpGatewaySocketPath?: string;
@@ -587,8 +592,19 @@ export function prepareScratchSandboxDetailed(opts: PrepareScratchOpts): Scratch
   const needFuse = process.env.BOTMUX_SANDBOX_FUSE === '1' || process.getuid?.() !== 0;
   const depsFailure = ensureScratchDeps(needFuse);
   if (depsFailure) return refuse(depsFailure);
+  // ensureScratchDeps resolves through the same bwrapExecutable(), so this is
+  // present; keep the resolved path explicit at the launch sites (never a bare
+  // bwrap) and fail closed in the (unreachable) event it vanished.
+  const bwrap = bwrapExecutable();
+  if (!bwrap) {
+    return refuse({
+      reason: 'deps-missing',
+      detail: 'bubblewrap',
+      installHint: scratchInstallHint(null, process.getuid?.() === 0, ['bubblewrap']),
+    });
+  }
 
-  const launch = linuxIsolationLaunch('bwrap', []);
+  const launch = linuxIsolationLaunch(bwrap, []);
   const { sessionRoot, merged, upper, work, slot, subroots } =
     scratchLayout(opts.sessionId, opts.dataDir, storage);
   // A prepare killed between its first mount and its marker left mounts and no
@@ -824,6 +840,9 @@ export function prepareScratchSandboxDetailed(opts: PrepareScratchOpts): Scratch
   const shim = join(shimBin, 'botmux');
   writeFileSync(shim, botmuxShimExecLine());
   try { chmodSync(shim, 0o755); } catch { /* */ }
+  // A wrapperCli running inside the sandbox may exec the CLI by name: alias
+  // that name to the (already allowed) real CLI binary in this private dir.
+  writeCliNameLink(shimBin, opts.cliNameLink);
 
   // Real-host passthrough carve-outs layered AFTER deny masks (later mount
   // wins). The outbox MUST stay host-real: the daemon watcher reads it without
@@ -1022,7 +1041,7 @@ export function prepareScratchSandboxDetailed(opts: PrepareScratchOpts): Scratch
   let compactLaunch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | null = null;
   try {
     compactLaunch = opts.useBwrapArgsFile
-      ? linuxIsolationLaunchViaArgsFile('bwrap', args, command, sessionRoot)
+      ? linuxIsolationLaunchViaArgsFile(bwrap, args, command, sessionRoot)
       : null;
   } catch (error) {
     teardownScratchSession(opts.sessionId, opts.dataDir);

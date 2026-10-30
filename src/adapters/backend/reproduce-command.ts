@@ -29,9 +29,10 @@ function shq(value: string): string {
  *
  * 输入是**基础 CLI** 的 bin/args（cliAdapter.resolvedBin + buildArgs 产出，未经任何
  * Seatbelt/bwrap/credential 改写）。规则：
- *   - wrapperCli 生效**且** sandbox 关闭时 → 返回 wrapper 形态（`aiden x claude …`）。
- *     worker 侧 wrapperCli 与 file sandbox 互斥（sandboxOn 时忽略 wrapper），这里同构。
- *   - 其余（无 wrapper，或 sandbox 开启）→ 返回基础 CLI bin/args 原样。
+ *   - wrapperCli 生效时 → 返回 wrapper 形态（`aiden x claude …`）。sandbox 关闭时 wrapper
+ *     总是生效；sandbox 开启时只有 worker 把 wrapper 放进沙盒执行（wrapperInsideSandbox）
+ *     才生效，其余后端在沙盒下仍忽略 wrapper，这里同构。
+ *   - 其余 → 返回基础 CLI bin/args 原样。
  * 无论如何都**不**含 sandbox-exec / bwrap 外层——那是机器相关、裸 bash 跑不起来的包装。
  */
 export function selectReproduceLaunch(input: {
@@ -40,6 +41,8 @@ export function selectReproduceLaunch(input: {
   wrapperCli?: string;
   cliLaunchMode?: CliLaunchMode;
   sandboxOn: boolean;
+  /** worker 把 wrapperCli 放进了文件沙盒内执行。 */
+  wrapperInsideSandbox?: boolean;
   binResolver?: (bin: string) => string;
   ttadkModel?: string;
 }): { bin: string; args: string[] } {
@@ -48,7 +51,7 @@ export function selectReproduceLaunch(input: {
     const launch = buildForgeTraexLaunch(baseArgs, input.binResolver ?? ((b) => b));
     return { bin: launch.bin, args: launch.args };
   }
-  if (wrapperCli && wrapperCli.trim() && !sandboxOn) {
+  if (wrapperCli && wrapperCli.trim() && (!sandboxOn || input.wrapperInsideSandbox)) {
     const launch = buildWrappedLaunch(
       wrapperCli,
       baseArgs,

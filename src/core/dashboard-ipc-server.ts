@@ -8299,6 +8299,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
     cotEnabled: cardPrefs.cotEnabled,
+    replyCardShowTools: cardPrefs.replyCardShowTools,
     senderTag: cardPrefs.senderTag,
     senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
@@ -8449,6 +8450,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyFooterVoice?: unknown;
     showReplyTiming?: unknown;
     thinkingCardToolResult?: unknown;
+    replyCardShowTools?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
@@ -8466,6 +8468,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   const patch: ReplyFooterPreferences & {
     showReplyTiming?: boolean;
     thinkingCardToolResult?: boolean;
+    replyCardShowTools?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
@@ -8514,6 +8517,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     patch.codexBrowser = body.codexBrowser;
   }
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
+  if (typeof body.replyCardShowTools === 'boolean') patch.replyCardShowTools = body.replyCardShowTools;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
@@ -9250,9 +9254,10 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       if (nextRuntime && selected.wrapperCli) return { write: false, result: { error: 'runtime_wrapper_conflict' } };
       if (nextRuntime && selected.cliLaunchMode) return { write: false, result: { error: 'runtime_launch_mode_conflict' } };
       if (selected.wrapperCli && selected.cliLaunchMode) return { write: false, result: { error: 'wrapper_launch_mode_conflict' } };
-      if (selected.wrapperCli && sandboxBoolValue(entry.sandbox)) {
-        return { write: false, result: { error: 'wrapper_sandbox_conflict' } };
-      }
+      // wrapperCli + file sandbox is supported: the wrapper runs inside the
+      // sandbox (worker.ts wrapperInsideSandbox). Read isolation still
+      // conflicts — a wrapper may replace the env, so CLAUDE_CONFIG_DIR /
+      // CODEX_HOME cannot be proven to reach the real CLI.
       if (selected.wrapperCli && entry.readIsolation === true) {
         return { write: false, result: { error: 'wrapper_read_isolation_conflict' } };
       }

@@ -18,6 +18,7 @@
  * daemon-side watcher re-executes the send OUTSIDE the sandbox with real
  * credentials. No Feishu credential ever enters the sandbox.
  */
+import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
 import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
@@ -27,7 +28,8 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
-import { accessForPath, compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
+import { accessForPath, compileToBwrap, relocateSymlinkedBaselineRules, type FsPolicy, type FsRule } from '../cli/fs-policy.js';
+import { bwrapExecutable, bwrapNamespaceDocUrl, classifyBwrapNamespaceFailure, type BwrapNamespaceFailure } from '../../core/system-bwrap.js';
 import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
 import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
@@ -46,7 +48,7 @@ import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
  *  unsandboxed run). */
 function ensureSandboxDeps(): boolean {
   const has = (cmd: string) => spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
-  if (has('bwrap')) return true;
+  if (bwrapExecutable()) return true;
   const pm =
     has('apt-get') ? ['apt-get', 'install', '-y', 'bubblewrap'] :
     has('dnf')     ? ['dnf', 'install', '-y', 'bubblewrap'] :
@@ -60,7 +62,7 @@ function ensureSandboxDeps(): boolean {
     // (never blocks on an interactive prompt).
     const argv = isRoot ? pm : ['sudo', '-n', ...pm];
     const r = spawnSync(argv[0], argv.slice(1), { stdio: 'ignore', timeout: 180_000 });
-    if (r.status === 0 && has('bwrap')) return true;
+    if (r.status === 0 && bwrapExecutable()) return true;
   }
   const guide = pm ? `${isRoot ? '' : 'sudo '}${pm.join(' ')}` : 'install bubblewrap';
   console.error(`[sandbox] bwrap missing; auto-install unavailable — install manually then retry: ${guide}`);
@@ -105,6 +107,13 @@ export function buildCredentialOnlySandboxArgs(input: {
   const args: string[] = [
     '--bind', '/', '/',
     '--proc', '/proc',
+    // bwrap's own minimal /dev (null, zero, full, random, urandom, tty, a
+    // private devpts and shm), never the host's. The `/` bind above carries
+    // the host /dev in as a nodev mount, so without this every open of
+    // /dev/null or /dev/urandom fails EACCES and a CLI like codex-app dies at
+    // startup. Placed before the masks: hideFiles bind the HOST /dev/null
+    // (sources resolve in the old root), unaffected by this mount.
+    '--dev', '/dev',
   ];
   const privateReadonlyByParent = new Map<string, string[]>();
   for (const entry of input.privateReadonlyDirectories ?? []) {
@@ -182,39 +191,57 @@ export type HostCredentialIsolationMechanismProbe =
   | { supported: true; mechanism: 'seatbelt' | 'bwrap'; executable: string }
   | { supported: false; mechanism: null; reason: string };
 
+/** Same mount/namespace shape as buildCredentialOnlySandboxArgs, then really
+ *  write /dev/null and read /dev/urandom: `/bin/true` alone passed on hosts
+ *  where the real session could not open a single device node. */
+export const CREDENTIAL_ONLY_PROBE_ARGS: readonly string[] = [
+  '--bind', '/', '/',
+  '--proc', '/proc',
+  '--dev', '/dev',
+  '--tmpfs', '/tmp',
+  '--unshare-user',
+  '--unshare-pid',
+  '--unshare-ipc',
+  '--unshare-uts',
+  '--unshare-cgroup-try',
+  '--die-with-parent',
+  '--new-session',
+  '--', '/bin/sh', '-c', 'printf x >/dev/null && head -c 1 /dev/urandom >/dev/null',
+];
+
+/** User-facing line appended when bwrap refused the namespaces themselves. */
+export function bwrapNamespaceFailureHint(kind: BwrapNamespaceFailure): string {
+  return `the current environment does not support ${kind === 'pid' ? 'PID' : 'user'} namespaces for bubblewrap `
+    + `(common in containers and nested sandboxes); see ${bwrapNamespaceDocUrl('en')}`;
+}
+
 function probeBubblewrapCredentialMasks(): HostCredentialIsolationMechanismProbe {
-  const lookup = spawnSync('sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' });
-  const located = lookup.status === 0 ? lookup.stdout.trim() : '';
-  if (!located || !isAbsolute(located)) {
+  const executable = bwrapExecutable();
+  if (!executable) {
     return { supported: false, mechanism: null, reason: 'bubblewrap is unavailable' };
   }
-  let executable = located;
-  try { executable = realpathSync(located); } catch { /* spawn probe reports failure below */ }
   const probe = spawnSync(executable, ['--help'], { encoding: 'utf8' });
   if (probe.status !== 0) {
     return { supported: false, mechanism: null, reason: 'bubblewrap is unavailable' };
   }
-  const launch = linuxIsolationLaunch(executable, [
-    '--bind', '/', '/',
-    '--proc', '/proc',
-    '--tmpfs', '/tmp',
-    '--unshare-user',
-    '--unshare-pid',
-    '--unshare-ipc',
-    '--unshare-uts',
-    '--unshare-cgroup-try',
-    '--die-with-parent',
-    '--new-session',
-    '--', '/bin/true',
-  ]);
-  const runtime = spawnSync(launch.bin, launch.args, { stdio: 'ignore', timeout: 5_000 });
+  const launch = linuxIsolationLaunch(executable, [...CREDENTIAL_ONLY_PROBE_ARGS]);
+  const runtime = spawnSync(launch.bin, launch.args, {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    encoding: 'utf8',
+    timeout: 5_000,
+  });
   if (runtime.status === 0) return { supported: true, mechanism: 'bwrap', executable };
+  if (runtime.error?.message) {
+    return { supported: false, mechanism: null, reason: `bubblewrap execution probe failed: ${runtime.error.message}` };
+  }
+  const stderr = (runtime.stderr ?? '').trim().split('\n').slice(-3).join(' | ');
+  const namespace = classifyBwrapNamespaceFailure(stderr);
   return {
     supported: false,
     mechanism: null,
-    reason: runtime.error?.message
-      ? `bubblewrap execution probe failed: ${runtime.error.message}`
-      : 'bubblewrap cannot establish the required user/mount/PID namespaces',
+    reason: 'bubblewrap cannot establish the required user/mount/PID namespaces or devices'
+      + (stderr ? ` (${stderr})` : '')
+      + (namespace ? `: ${bwrapNamespaceFailureHint(namespace)}` : ''),
   };
 }
 
@@ -469,6 +496,22 @@ export function hostResolverBindArgs(opts: {
   return ['--dir', dirname(hop), '--ro-bind', source, hop];
 }
 
+/** Predicate for {@link hostResolverBindArgs}: a resolver name is denied when
+ *  EITHER the policy as handed to prepareDirectSandbox (pre-relocation) or the
+ *  relocated rules compileToBwrap actually mounts says so. The bind is compiled
+ *  from the relocated set, but a lexical (not-yet-canonicalized) deny in the
+ *  input must stay authoritative — judging by the relocated set alone would
+ *  silently re-bind a file the operator denied when a baseline directory is
+ *  itself a symlink. Worker-supplied denies are realpath-canonicalized
+ *  upstream, so in production the two agree; the union is defense in depth. */
+export function resolverPathDenied(
+  preRelocationRules: readonly FsRule[],
+  compiledRules: readonly FsRule[],
+): (path: string) => boolean {
+  return path => accessForPath(preRelocationRules, path).access === 'deny'
+    || accessForPath(compiledRules, path).access === 'deny';
+}
+
 /** Canonicalize if possible (Seatbelt/bwrap both resolve symlinks). */
 function canonical(p: string): string {
   try { return realpathSync(p); } catch { return p; }
@@ -625,19 +668,20 @@ function classifyProbe(r: ReturnType<typeof spawnSync>): BwrapProbeOutcome {
 
 export function bwrapCanUnsharePid(): boolean {
   if (_canUnsharePid !== undefined) return _canUnsharePid;
-  const lookup = spawnSync('sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' });
-  const located = lookup.status === 0 ? lookup.stdout.trim() : '';
-  if (!located || !isAbsolute(located)) { _canUnsharePid = true; return true; } // inconclusive → don't degrade
-  let executable = located;
-  try { executable = realpathSync(located); } catch { /* fall through to probe */ }
+  const executable = bwrapExecutable();
+  if (!executable) { _canUnsharePid = true; return true; } // inconclusive → don't degrade
   // Same SHAPE as the real fs-policy compile (compileToBwrap): --unshare-user
   // is always present there, and its userns interacts with the proc mount, so
   // the probe must carry it too or it isn't testing the real condition.
   const base = ['--dev-bind', '/', '/', '--proc', '/proc', '--unshare-user', '--', '/bin/true'];
   // FULL: real shape WITH --unshare-pid. Nested pid-ns-restricted sandbox →
   // clean-nonzero ("Can't mount proc … Operation not permitted"); normal host
-  // → success.
-  const full = classifyProbe(spawnSync(executable, ['--unshare-pid', ...base], { stdio: 'ignore', timeout: 5_000 }));
+  // → success. stderr is kept only for the startup-failure diagnosis.
+  const fullRun = spawnSync(executable, ['--unshare-pid', ...base], {
+    stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: 5_000,
+  });
+  const full = classifyProbe(fullRun);
+  _namespaceFailure = full === 'clean-nonzero' ? classifyBwrapNamespaceFailure(fullRun.stderr) : undefined;
   if (full === 'success') { _canUnsharePid = true; return true; } // full works → never degrade
   // WEAK: same minus --unshare-pid. Only a clean-nonzero full + success weak is
   // the nested signature; a full timeout/spawn-error (inconclusive) never
@@ -647,9 +691,26 @@ export function bwrapCanUnsharePid(): boolean {
   return _canUnsharePid;
 }
 
+let _namespaceFailure: BwrapNamespaceFailure | undefined;
+
+/**
+ * Why this host's bwrap cannot create the namespaces the sandbox launches
+ * with, if the (cached) probe above saw bwrap itself say so. For the
+ * startup-failure notice ONLY: a Linux tmux pane that dies at once leaves no
+ * terminal output to read the bwrap error from. It never changes whether or
+ * how a sandbox runs — dropping --unshare-pid stays limited to
+ * {@link coreOnlyPidNamespaceDegrade}.
+ */
+export function bwrapNamespaceFailure(): BwrapNamespaceFailure | undefined {
+  if (process.platform !== 'linux') return undefined;
+  bwrapCanUnsharePid();
+  return _namespaceFailure;
+}
+
 /** Test-only: reset the cached pid-ns probe. */
 export function __testOnly_resetPidNamespaceProbe(): void {
   _canUnsharePid = undefined;
+  _namespaceFailure = undefined;
 }
 
 /**
@@ -1114,6 +1175,9 @@ export function prepareDirectSandbox(opts: {
    * exact alias to its already-granted canonical directory on symlinked homes.
    * Only the minimax worker supplies this; absent leaves the mount plan intact. */
   minimaxDataDir?: string;
+  /** wrapperCli inside the sandbox: `<cli name>` alias placed in the private
+   *  shim dir (first on PATH) pointing at the real, already-allowed CLI. */
+  cliNameLink?: { name: string; target: string };
   /** The child's own TAR_OPTIONS (bot env merged over the worker env), the
    *  base sandboxTarOptions extends. Absent → the worker process env. */
   childTarOptions?: string;
@@ -1122,12 +1186,14 @@ export function prepareDirectSandbox(opts: {
   const proxyError = networkProxyError(opts.networkPolicy, process.env);
   if (proxyError) throw new Error(proxyError);
   if (!ensureSandboxDeps()) return null;
+  const bwrap = bwrapExecutable();
+  if (!bwrap) return null;
   if (opts.networkPolicy && opts.mcpGatewaySocketPath) throw new Error('sandboxNetworkPolicy cannot expose host MCP/Unix IPC; disable host MCP plugins for this session');
   // Validate all dependencies before creating files.
   if (opts.networkPolicy) sandboxNetworkLaunch(opts.networkPolicy, '/bin/true', []);
 
   // Validate marker support before creating any session files or deny masks.
-  const launch = linuxIsolationLaunch('bwrap', []);
+  const launch = linuxIsolationLaunch(bwrap, []);
   // --seccomp and --add-seccomp-fd are mutually exclusive. Stack both trusted
   // filters using the repeatable form for this opt-in path.
   if (opts.networkPolicy) launch.args = launch.args.map(arg => arg === '--seccomp' ? '--add-seccomp-fd' : arg);
@@ -1162,6 +1228,9 @@ export function prepareDirectSandbox(opts: {
   const shim = join(shimBin, 'botmux');
   writeFileSync(shim, botmuxShimExecLine());
   chmodSync(shim, 0o755);
+  // A wrapperCli running inside the sandbox may exec the CLI by name: alias
+  // that name to the (already allowed) real CLI binary in this private dir.
+  writeCliNameLink(shimBin, opts.cliNameLink);
 
   // usrmerge symlinks to replicate; deny rules that are FILES on the host need
   // a file-shaped mask, everything else (existing dir OR a not-yet-existing
@@ -1174,13 +1243,23 @@ export function prepareDirectSandbox(opts: {
       if (lstatSync(p).isSymbolicLink()) symlinks.push({ path: p, target: readlinkSync(p) });
     } catch { /* absent on this distro */ }
   }
+  // Baseline dirs (/opt, …) that are symlinks on this host: bwrap cannot bind a
+  // symlink as such into the fresh root, so rebuild the link the usrmerge way
+  // and bind its real target (see relocateSymlinkedBaselineRules).
+  const relocated = relocateSymlinkedBaselineRules(opts.policy.rules, {
+    isSymlink: (path) => { try { return lstatSync(path).isSymbolicLink(); } catch { return false; } },
+    realpath: (path) => { try { return realpathSync(path); } catch { return undefined; } },
+  });
+  const usrmergePaths = new Set(symlinks.map(link => link.path));
+  for (const link of relocated.symlinks) if (!usrmergePaths.has(link.path)) symlinks.push(link);
+  const policy: FsPolicy = { ...opts.policy, rules: relocated.rules };
   const filePaths = new Set<string>();
-  for (const r of opts.policy.rules) {
+  for (const r of policy.rules) {
     if (r.access !== 'deny') continue;
     try { if (statSync(r.path).isFile()) filePaths.add(r.path); } catch { /* absent → dir-shaped mask */ }
   }
 
-  const compiled = compileToBwrap(opts.policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir, skipPidNamespace: coreOnlyPidNamespaceDegrade() });
+  const compiled = compileToBwrap(policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir, skipPidNamespace: coreOnlyPidNamespaceDegrade() });
   if (minimaxAlias) {
     // After tmpfs setup and before any host binds. Parent directories are
     // empty namespace scaffolding; the alias grants no additional host path.
@@ -1255,8 +1334,9 @@ export function prepareDirectSandbox(opts: {
     args.push('--dir', dirname(resolverTarget), '--ro-bind', resolver, resolverTarget);
   } else {
     // Same /run masking without a policy: re-expose the host's own resolver
-    // file (read-only) unless the operator denied it.
-    args.push(...hostResolverBindArgs({ denied: path => accessForPath(opts.policy.rules, path).access === 'deny' }));
+    // file (read-only) unless the operator denied it, under EITHER the input
+    // policy or the relocated rules actually compiled into mounts.
+    args.push(...hostResolverBindArgs({ denied: resolverPathDenied(opts.policy.rules, policy.rules) }));
   }
   // Shim bin at a fixed path under the fresh /run tmpfs — appended after the
   // rule mounts (later mount wins over the tmpfs). PATH points here first.
@@ -1404,7 +1484,7 @@ export function prepareDirectSandbox(opts: {
   let compactLaunch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | null = null;
   try {
     compactLaunch = opts.useBwrapArgsFile && !opts.networkPolicy
-      ? linuxIsolationLaunchViaArgsFile('bwrap', args, command, sessionRoot)
+      ? linuxIsolationLaunchViaArgsFile(bwrap, args, command, sessionRoot)
       : null;
   } catch (error) {
     rollbackSandboxSetup(sessionRoot, createdMasks);

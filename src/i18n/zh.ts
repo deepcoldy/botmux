@@ -1394,6 +1394,7 @@ export const messages: Record<string, string> = {
   'worker.crash_permanent_exit_stopped': '⚠️ {cliName} 因确定性错误退出（退出码 {code}），已停止自动重启——这类失败重启也不会变好（常见原因：身份/凭证缺失、CLI 未安装或路径不可用）。修复后发消息可重新启动。',
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
+  'worker.sandbox_namespace_unsupported': '当前环境不支持沙盒需要的 {kind} namespace（常见于容器或嵌套沙盒），bwrap 沙盒无法启动。说明见 {docUrl}',
   'worker.mojo_lineage_quarantined': '⚠️ 这个会话创建于 botmux 记录 mojo 控制面（endpoint / workspace）之前，因此无法确认它此前的远端会话跑在哪里。\n该远端会话已被暂存而非丢弃：原有上下文不会延续，你的下一条消息将在当前配置上新建 mojo 会话。暂存的 id 保留在会话上以便人工清理：{lineage}',
   'worker.mojo_legacy_pinned': '⚠️ 本 mojo 会话创建于「本机执行」升级之前，已被固定在旧的沙箱回退模式——这里的工具和回复基本不可用。这是刻意为之（升级绝不能把活跃会话悄悄切到本机执行）。\n请关闭本会话（❌ 按钮或 /close），再发一条新消息即可用新行为开启全新会话。',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n会话 {sessionId}，详细日志见本机 {logPath}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',

@@ -247,6 +247,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 | 字段 | 说明 |
 |------|------|
 | `replyCardMode` | `legacy`（默认）分别发送进度与答复；`unified` 将同一轮公开进度、工具记录、执行状态和最终答复更新到同一张卡。支持未启用文件沙盒的 Claude Code / Codex / Grok 普通飞书会话，从下一轮生效。Grok 展示公开旁白和工具事件，不转发原始思考或 hook 内容；其他入口沿用默认路径。独立终端状态卡由 `disableStreamingCard` 单独控制。 |
+| `replyCardShowTools` | 仅用于 `unified` 回复卡。缺省显示工具调用；设为 `false` 时隐藏工具节点、命令、结果与折叠区标题的工具次数，仍显示思考摘要与主动发送的进度。原生 CoT 气泡不受影响，`/cot show` 也不会显示被隐藏的工具。可在 Dashboard「Bot 默认 → 卡片设置」配置，或执行 `/botconfig set replyCardShowTools off`；`legacy` 模式下无效，切换回答模式保留该设置。 |
 | `brandLabel` | 卡片底部品牌文案（仅在最终回答与顶层广播卡片中展示）。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。另受机器级总开关 `dashboard.cardBrandLabel` 约束（Dashboard「设置 → 飞书卡片」，缺省开）：关闭后所有 Bot 一律不显示页脚签名，本字段在 Bot 配置页置灰。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `cardFooterExtension` | 在卡片用量段末尾追加自定义文本。`{"command": "<shell 命令>", "refreshSeconds": 60}`：daemon 在卡片渲染时按 bot 懒执行命令（缓存到刷新间隔才在后台跑，同一 bot 的会话共用结果），输出接在用量后面，显示位置跟随 `usageDisplay`。详见 [卡片用量段自定义扩展](/cards#卡片用量段自定义扩展) |

@@ -478,21 +478,23 @@ describe('native-subagent-runtime-hook CLI', () => {
     expect(overloaded.stderr).toContain('policy service overloaded; denying spawn');
   });
 
+  // The hang bound is runHook's default cold-import budget, not a tight one:
+  // the clock starts before the CLI is imported (>5s on a loaded shard), and
+  // the hook's own 2s response deadline only starts after that. A stream the
+  // hook failed to cancel never ends, so it still hits the bound and fails.
   it('cancels oversized and timed-out never-ending response streams', async () => {
     const oversized = await runHook(JSON.stringify(spawnPayload), {
       responseMode: 'oversized-never-ending',
-      exitTimeoutMs: 6_000,
     });
-    expect(oversized.timedOut).toBe(false);
+    expect(oversized.timedOut, `hook killed before exit; stderr=${oversized.stderr}`).toBe(false);
     expect(oversized.stdout).toBe('');
 
     const partial = await runHook(JSON.stringify(spawnPayload), {
       responseMode: 'partial-never-ending',
-      exitTimeoutMs: 6_000,
     });
-    expect(partial.timedOut).toBe(false);
+    expect(partial.timedOut, `hook killed before exit; stderr=${partial.stderr}`).toBe(false);
     expect(partial.stdout).toBe('');
-  }, 12_000);
+  }, 50_000);
 
   it('is a no-op when the policy passes both runtime dimensions through', async () => {
     const result = await runHook(JSON.stringify(spawnPayload), { policy: undefined });
