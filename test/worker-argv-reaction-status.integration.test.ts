@@ -990,7 +990,7 @@ setInterval(() => {
 
     // Wait for the worker's sampler before painting, so the single startup
     // write cannot land before its PTY listener is installed.
-    await waitForLog(child, logs, 'Argv-baked first prompt in flight — publishing projected working');
+    await waitForLog(child, logs, 'Argv-baked first prompt in flight — publishing projected working', WORKER_BOOT_TIMEOUT_MS);
     writeFileSync(paintPhase, 'startup');
     // The startup-window quiescence idle is re-armed by the evidence gate —
     // this log is the proof it was caught (before the fix it flowed through
