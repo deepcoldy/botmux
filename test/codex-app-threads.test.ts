@@ -477,9 +477,9 @@ describe('setCodexAppThreadName', () => {
 
   it('keeps a full request timeout for the title write after a short wait budget runs out', async () => {
     // #2454: the wait budget and the request timeout used to be one value, so
-    // a short wait also gave thread/name/set that little time. The fake slows
-    // every name/set reply past the wait budget, as a loaded runner slows a
-    // local round trip; the write must still go through.
+    // a short wait also gave thread/name/set and its verifying read that little
+    // time. The fake slows both replies past the wait budget, as a loaded
+    // runner slows a local round trip; the write must still go through.
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-split-budget-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -494,6 +494,7 @@ describe('setCodexAppThreadName', () => {
         FAKE_CODEX_LOG: logPath,
         FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
         FAKE_CODEX_NAME_SET_DELAY_MS: '300',
+        FAKE_CODEX_VERIFY_READ_DELAY_MS: '300',
       },
       waitBudgetMs: 200,
       timeoutMs: 20_000,

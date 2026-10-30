@@ -30,6 +30,8 @@ const threadReadDelayMs = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_MS ?? 
 const threadReadDelayReads = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_READS ?? '1');
 // Slow every thread/name/set reply, as a loaded runner slows a local round trip.
 const nameSetDelayMs = Number(process.env.FAKE_CODEX_NAME_SET_DELAY_MS ?? '0');
+// Same for the thread/read that verifies a written name (reads after name/set).
+const verifyReadDelayMs = Number(process.env.FAKE_CODEX_VERIFY_READ_DELAY_MS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
@@ -574,6 +576,10 @@ function handle(request) {
     // 是待测的等待环节。
     if (threadReadDelayMs > 0 && threadReadAttempt <= threadReadDelayReads && !nameSetSeen) {
       setTimeout(sendThreadRead, threadReadDelayMs);
+      return;
+    }
+    if (verifyReadDelayMs > 0 && nameSetSeen) {
+      setTimeout(sendThreadRead, verifyReadDelayMs);
       return;
     }
     sendThreadRead();
