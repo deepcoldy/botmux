@@ -44,7 +44,14 @@ describe('pid marker reentrancy + capability persistence', () => {
       retiredTurnIds: new Set<string>(),
       emittedTurnTerminals: new TurnTerminalDeduper(),
       queuedTypeAheadTurns: [{ turnId: 'om_next', dispatchAttempt: 2 }],
-      queuedTurnAdvanceConsumedForPrompt: false,
+      queuedTurnAdvanceConsumedForPrompt: undefined,
+      rememberQueuedTurnAdvanceForPendingReady: () => {
+        scope.queuedTurnAdvanceConsumedForPrompt = {
+          outputGeneration: 1,
+          predecessorTurnId: 'om_current',
+          promotedTurnId: scope.currentBotmuxTurnId,
+        };
+      },
       // turn side-effects
       markTurnRetired: () => {},
       markActiveTurnStarted: () => {},

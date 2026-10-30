@@ -106,6 +106,7 @@ import {
   type SessionsKanbanIcons,
   type SessionsKanbanMove,
 } from './sessions-kanban.js';
+import { SandboxDriftChip } from './session-sandbox-drift-chip.js';
 import { toast } from './toast.js';
 import { confirm } from './confirm-modal.js';
 import { SessionEnvLiveModal } from './session-env-editor.js';
@@ -766,7 +767,7 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
 /** 表格每次多渲染多少行。几千行一次性铺开要 7 万个 DOM 节点，切到列表就卡一秒多。 */
 const TABLE_PAGE_SIZE = 200;
 
-function SessionsTableBase(props: {
+export function SessionsTableBase(props: {
   rows: any[];
   limit: number;
   onShowMore: () => void;
@@ -831,7 +832,7 @@ function SessionsTableBase(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /></td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':

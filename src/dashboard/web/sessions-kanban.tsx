@@ -29,6 +29,7 @@ import {
 } from './ui.js';
 import { deriveSessionBoardColumn, sessionExchangePreview } from './sessions.js';
 import { previewMarkdownHtml } from './preview-markdown.js';
+import { SandboxDriftChip } from './session-sandbox-drift-chip.js';
 import { useT } from './react-hooks.js';
 
 export interface SessionsKanbanIcons {
@@ -617,6 +618,7 @@ function KanbanCardBase(props: {
         <span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span>
         {row.adopt ? <span className="badge">adopt</span> : null}
         {row.locked ? <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span> : null}
+        <SandboxDriftChip row={row} />
         {menuItems.length ? <CardMenu items={menuItems} /> : null}
       </div>
       <div className="kanban-card-title-row">

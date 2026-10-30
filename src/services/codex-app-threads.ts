@@ -126,8 +126,15 @@ export interface SetCodexAppThreadNameOptions {
   codexBin?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /** Timeout of each app-server request: thread/name/set and the read that
+   *  verifies it. Default 7000ms. Also the default of the two below. */
   timeoutMs?: number;
   initializeTimeoutMs?: number;
+  /** Total time to wait for the existing preview / an updatedAt past
+   *  `waitForUpdatedAfter` before writing the title anyway. Defaults to
+   *  `timeoutMs`. Separate because running out of it is an expected outcome,
+   *  while each request after it still needs a real request timeout (#2454). */
+  waitBudgetMs?: number;
   signal?: AbortSignal;
   detached?: boolean;
   waitForExistingPreview?: boolean;
@@ -707,6 +714,7 @@ export async function listCodexAppThreads(opts: ListCodexAppThreadsOptions = {})
 /** 等待首条消息预览落盘后设置最终标题；预览缺失时超时兜底写入。 */
 export async function setCodexAppThreadName(opts: SetCodexAppThreadNameOptions): Promise<void> {
   const timeoutMs = opts.timeoutMs ?? 7000;
+  const waitBudgetMs = opts.waitBudgetMs ?? timeoutMs;
   const codexBin = resolveCommand(opts.codexBin ?? 'codex');
   const cwd = opts.cwd ?? process.cwd();
   const client = new CodexAppServerProbe(
@@ -720,10 +728,10 @@ export async function setCodexAppThreadName(opts: SetCodexAppThreadNameOptions):
   try {
     await client.initialize(opts.initializeTimeoutMs ?? timeoutMs);
     if (opts.waitForExistingPreview) {
-      await client.waitForThreadPreview(opts.threadId, timeoutMs);
+      await client.waitForThreadPreview(opts.threadId, waitBudgetMs);
     }
     if (opts.waitForUpdatedAfter !== undefined) {
-      await client.waitForThreadUpdatedAfter(opts.threadId, opts.waitForUpdatedAfter, timeoutMs);
+      await client.waitForThreadUpdatedAfter(opts.threadId, opts.waitForUpdatedAfter, waitBudgetMs);
     }
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await client.withTimeout(client.request('thread/name/set', {

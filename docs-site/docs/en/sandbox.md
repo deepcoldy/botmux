@@ -132,6 +132,8 @@ Configure in `~/.botmux/bots.json`:
 
 Environment variable overrides (useful for testing; applies to every bot on the machine): `BOTMUX_SANDBOX=1` (allowlist isolation) or `BOTMUX_SANDBOX=scratch`.
 
+Precedence: when `BOTMUX_SANDBOX` is `1` / `oncall` / `scratch`, every bot is forced into that mode. Unset, empty, `0` or `false` means no force: each bot follows its own `sandbox` setting (the legacy `readIsolation: true` counts as allowlist isolation), and **a sandbox the bot enables itself is never turned off**. Any other value is rejected at startup. The variable can only force the sandbox on, never turn it off globally.
+
 ---
 
 ## 4. Network Sandbox
@@ -170,6 +172,16 @@ For selective access to internal APIs or proxy endpoints (allowlist isolation + 
 - **Kernel-Level Filtering**: Enforced via nftables + slirp4netns within the network namespace.
 - **Trusted Proxy Egress (`proxyMode: "trusted-egress"`)**: Limits client egress strictly to authorized proxy endpoints.
 - **Host requirements**: `slirp4netns` (with `--disable-host-loopback` and `--disable-dns`), `nft`, `ip`, and `unshare` (with `--kill-child` and `--mount-proc`) must be on `PATH`, and bwrap must support `--add-seccomp-fd` and `--disable-userns`. Nothing is installed automatically; if any piece is missing, the session refuses to start.
+
+Check two prerequisites first, otherwise sessions either start without working network access or do not start at all:
+
+1. **Set `dnsServers` explicitly.** With a policy, the sandbox's `/etc/resolv.conf` contains only the `dnsServers` addresses and slirp4netns' built-in DNS forwarder is disabled. Without them there is no DNS and every lookup fails (`getaddrinfo EAI_AGAIN`) — an allow-all policy included. Use the nameservers from the host's `/etc/resolv.conf` (with systemd-resolved that file says `127.0.0.53`, which the sandbox cannot reach; use the upstream servers in `/run/systemd/resolve/resolv.conf`). Only port 53 is opened to them, even inside a blocked `private` zone. The Dashboard's starting template fills in the host's current nameservers.
+2. **Set `proxyMode` when the host or bot env has proxy variables.** If the daemon or the bot's `env` sets `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (any case), a policy that is not allow-all refuses to start sessions: the proxy resolves and forwards destinations, so the kernel rules only see the proxy. Once the proxy exit is trusted, add `"proxyMode": "trusted-egress"` (kernel rules still only allow the proxy's own IP), or remove the proxy variables.
+
+Other limits:
+
+- Linux, the **pty backend** and the oncall sandbox only. A bot without its own backend setting uses the daemon default (tmux) for new sessions; set it to pty under "Session backend" in the Dashboard. With a policy configured, changing the sandbox mode or backend is rejected until you "Clear network policy".
+- The policy is frozen into each topic when it is created. After clearing or changing it, existing topics (including ones restored after a daemon restart) still start with their original policy; start a new topic.
 
 ---
 

@@ -17,7 +17,7 @@ import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, reso
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
-import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
+import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -35,6 +35,7 @@ import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
+import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
@@ -5839,6 +5840,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
+      frozenSessionSandboxMode(ds.session.sandbox),
     );
   }
   const port = ds.workerPort ?? ds.session.webPort;
@@ -5856,6 +5858,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    frozenSessionSandboxMode(ds.session.sandbox),
   );
 }
 
@@ -5945,6 +5948,7 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    frozenSessionSandboxMode(ds.session.sandbox),
   );
 }
 
@@ -13927,7 +13931,7 @@ export function freezeSessionSandboxDecision(
 ): void {
   if (ds.session.sandbox !== undefined) return;
   if (!opts.resume) {
-    const resolved = botCfg.readIsolation === true ? 'oncall' : normalizeSandboxMode(botCfg.sandbox);
+    const resolved = botConfigSandboxMode(botCfg);
     ds.session.sandbox = resolved === 'scratch' ? 'scratch' : resolved === 'oncall' ? true : false;
     ds.session.sandboxPaths = botCfg.sandboxPaths;
     ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
@@ -16671,6 +16675,7 @@ function setupWorkerHandlers(
               loc,
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
+              frozenSessionSandboxMode(ds.session.sandbox),
             );
             const fallbackPost = scopedReplyTo(postingDisplayAnchor, postingAppId, cardJson,
               'interactive', cardReplyTarget.turnId, { replyTarget: cardReplyTarget.target, beforeWrite: beforeFallbackWrite });
@@ -16693,6 +16698,7 @@ function setupWorkerHandlers(
                 loc,
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
+                frozenSessionSandboxMode(ds.session.sandbox),
               );
               try {
                 await updateMessage(postingAppId, fallbackCardId, readyCardJson, { beforeWrite: beforeFallbackWrite });
@@ -18741,6 +18747,18 @@ function setupWorkerHandlers(
         terminalSet.add(msg.turnId);
         trimOldest(terminalSet, TERMINAL_RECEIPT_DEDUPE_MAX);
         observeTurnResultTerminal(ds, msg, workerGeneration);
+        if (settleAutoCompactSafeComposerRefusal(ds, msg)) {
+          // The worker deliberately refused an unattended maintenance write.
+          // Clear this synthetic turn's pending-card marker immediately and
+          // surface one cooldown-bounded operational warning; do not wait for
+          // a later human turn to repair the projection.
+          persistStreamCardState(ds);
+          if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+          logger.warn(
+            `[${t}] Auto compact skipped: live empty composer evidence was unavailable `
+            + `(turn=${msg.turnId.substring(0, 20)})`,
+          );
+        }
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event

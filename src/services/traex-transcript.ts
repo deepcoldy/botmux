@@ -44,6 +44,7 @@ import {
   statSync,
   type Dirent,
 } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import {
   splitCodexEventsByCutoff,
@@ -69,7 +70,7 @@ import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
 import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
-import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
+import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
@@ -1634,10 +1635,11 @@ function isCanonicalTraexRolloutPath(
 function findIndexedTraexRollout(
   cliSessionId: string,
   sessionsRoot: string,
+  dbPath?: string,
 ): string | undefined {
   const rows = withTraeDb((db) => db.prepare(
     'SELECT rollout_path AS rolloutPath FROM threads WHERE id = ? LIMIT 1',
-  ).all(cliSessionId) as { rolloutPath?: string }[]) ?? [];
+  ).all(cliSessionId) as { rolloutPath?: string }[], dbPath) ?? [];
   const path = rows[0]?.rolloutPath;
   if (typeof path !== 'string'
     || !isCanonicalTraexRolloutPath(path, sessionsRoot)
@@ -1700,6 +1702,12 @@ function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
 
 /** Locate the rollout file for a given TRAE session UUID.
  *
+ * `traeHomePath` optionally overrides the TRAE data root for THIS lookup
+ * (sessions root + state DB both derive from it); callers that need to probe
+ * the default root while a different TRAE_HOME is in effect pass it explicitly
+ * instead of mutating process.env — the finders are re-entrant and the worker
+ * has async bridge readers that share process.env.
+ *
  * TRAE's `threads` table is the authoritative session→path index. Older TRAE
  * versions may not expose `rollout_path`, so lookup degrades to the documented
  * `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl` tree. Newer releases may
@@ -1709,12 +1717,13 @@ function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
  * `rollout-blobs`), whose contents cannot be top-level sessions and may span
  * gigabytes. Repeated fallback misses are backed off, while the cheap indexed
  * lookup remains live on every late-attach tick. */
-export function findTraexRolloutBySessionId(cliSessionId: string): string | undefined {
+export function findTraexRolloutBySessionId(cliSessionId: string, traeHomePath?: string): string | undefined {
   if (!cliSessionId) return undefined;
-  const sessionsRoot = traeSessionsRoot();
+  const sessionsRoot = traeHomePath ? join(traeHomePath, 'cli', 'sessions') : traeSessionsRoot();
+  const dbPath = traeHomePath ? join(traeHomePath, 'cli', 'state_5.sqlite') : traeStateDbPath();
   const missKey = `${sessionsRoot}\0${cliSessionId.toLowerCase()}`;
 
-  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot);
+  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot, dbPath);
   if (indexed) {
     traexRolloutLookupMisses.delete(missKey);
     return indexed;
@@ -1734,6 +1743,21 @@ export function findTraexRolloutBySessionId(cliSessionId: string): string | unde
   return undefined;
 }
 
+
+/**
+ * The default-root path when `cliSessionId` has a rollout under the default
+ * ~/.trae but none under the TRAE_HOME in effect (a bot that got its own
+ * TRAE_HOME after the session started there); undefined otherwise, including
+ * when no TRAE_HOME override is in effect. The default-root lookup passes the
+ * root as an argument — never temporarily rewrites process.env, which async
+ * bridge readers share.
+ */
+export function traexResumeTargetLeftInDefaultHome(cliSessionId: string): string | undefined {
+  const defaultHome = join(homedir(), '.trae');
+  if (!cliSessionId || traeHome() === defaultHome) return undefined;
+  if (findTraexRolloutBySessionId(cliSessionId)) return undefined;
+  return findTraexRolloutBySessionId(cliSessionId, defaultHome) ? defaultHome : undefined;
+}
 
 /** Find the newest TRAE native session whose first prompt contains Botmux's
  *  session id. This mirrors Codex's history.jsonl bridge, but TRAE keeps the

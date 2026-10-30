@@ -44,6 +44,7 @@ describe('Feishu Midscene lanes', () => {
       'feishu-core-dm-modes-codex',
       'feishu-core-group-modes',
       'feishu-core-queue',
+      'feishu-core-sandbox',
     ]);
     expect(selectLaneFiles(files, 'all')).toEqual(files);
     expect(selectLaneFiles(files, 'core-codex, full-group').map(laneProject)).toEqual([

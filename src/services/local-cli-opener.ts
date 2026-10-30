@@ -57,7 +57,8 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'traex': 'traex resume',
   'pi': 'pi --session-id',
   'copilot': 'copilot --resume',
-  'kimi': 'kimi --resume',
+  // Kimi 0.31 has no --resume; -S/--session resumes an existing session_<uuid>.
+  'kimi': 'kimi --session',
   'grok': 'grok --resume',
   'zcode': 'zcode --resume',
 };

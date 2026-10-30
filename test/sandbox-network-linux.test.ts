@@ -163,7 +163,7 @@ console.log(JSON.stringify(await Promise.all(['10.77.0.1','10.0.2.2','10.0.2.3',
 const get=(url,path)=>new Promise(resolve=>{const req=request(url,{...(path?{path}:{}),timeout:300},res=>{let body='';res.on('data',chunk=>body+=chunk);res.on('end',()=>resolve(body))});req.on('timeout',()=>req.destroy());req.on('error',()=>resolve(false));req.end()});
 console.log(JSON.stringify([await get('http://10.77.0.1:18089/'),await get(process.env.HTTPS_PROXY,'http://10.77.0.1:18089/'),process.env.HTTPS_PROXY]));`;
     try {
-      await expect(run({ ...policy, proxyMode: 'reject' }, source)).rejects.toThrow('upstream proxy');
+      await expect(run({ ...policy, proxyMode: 'reject' }, source)).rejects.toThrow('"proxyMode": "trusted-egress"');
       expect(await run(policy, source)).toEqual([false,'private-via-trusted-exit','http://93.184.216.34:18090']);
       expect(await run({ ...policy, public: { mode: 'block' } }, source))
         .toEqual([false,false,'http://93.184.216.34:18090']);

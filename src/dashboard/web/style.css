@@ -16819,21 +16819,46 @@ form.dashboard-toolbar > input[type="text"]:focus {
   transform: translateY(2px) rotate(225deg);
 }
 
-.connector-group-picker-popover {
-  position: absolute;
+.connector-group-picker-positioner {
   z-index: 1600;
-  top: calc(100% + 7px);
-  left: 0;
+}
+
+/* Base UI Combobox 浮层：定位交给 Positioner（--anchor-width / --available-height
+   由它写入），开合动效参考 Arc 的「轻位移 + 缩放 + 淡入」，从触发器方向长出来。 */
+.connector-group-picker-popover {
   box-sizing: border-box;
   display: grid;
+  /* 视口矮时整体被 --available-height 压扁：让列表那一行吃掉剩余空间并内部滚动，
+     而不是溢出到浮层外框之外。 */
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 7px;
-  width: 100%;
+  width: var(--anchor-width);
   min-width: min(360px, calc(100vw - 64px));
+  max-height: min(var(--available-height, 100vh), 320px);
   padding: 8px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--modal-shadow);
+  transform-origin: var(--transform-origin);
+  transition: opacity 140ms ease, transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.connector-group-picker-popover[data-starting-style],
+.connector-group-picker-popover[data-ending-style] {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+}
+
+.connector-group-picker-popover[data-side="top"][data-starting-style],
+.connector-group-picker-popover[data-side="top"][data-ending-style] {
+  transform: translateY(4px) scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .connector-group-picker-popover { transition: opacity 80ms linear; }
+  .connector-group-picker-popover[data-starting-style],
+  .connector-group-picker-popover[data-ending-style] { transform: none; }
 }
 
 .connector-group-search {
@@ -16842,6 +16867,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .connector-group-search > input[type="search"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+  box-sizing: border-box;
+  width: 100%;
   height: 34px;
   min-height: 34px;
   padding: 0 12px 0 34px;
@@ -16877,7 +16904,9 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: grid;
   gap: 3px;
   max-height: 228px;
+  min-height: 0;
   overflow-y: auto;
+  outline: none;
 }
 
 .connector-group-option {
@@ -16896,11 +16925,23 @@ form.dashboard-toolbar > input[type="text"]:focus {
   box-shadow: none;
 }
 
-.connector-group-option:hover,
+.connector-group-option {
+  cursor: pointer;
+  user-select: none;
+  outline: none;
+}
+
 .connector-group-option.selected {
   background: color-mix(in srgb, var(--accent) 9%, transparent);
   color: var(--accent-strong);
   transform: none;
+}
+
+/* 键盘高亮与鼠标悬停同一个态（Base UI 悬停也会设 data-highlighted）。 */
+.connector-group-option[data-highlighted] {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent-strong);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
 .connector-group-option > span:last-child {
@@ -17523,7 +17564,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   }
 
   .connector-group-picker-popover {
-    min-width: 100%;
+    min-width: var(--anchor-width);
   }
 }
 
@@ -33139,8 +33180,6 @@ a.card-menu-item {
 .bd-oncall-scope { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
 .bd-oncall-scope > label { flex-shrink: 0; }
 .bd-oncall-scope .connector-group-picker { max-width: 360px; }
-.bd-oncall-scope .connector-group-picker-popover { min-width: 0; }
-.bd-oncall-scope .connector-group-search > input { width: 100%; box-sizing: border-box; padding-left: 34px; }
 .bd-oncall-secret { display: grid; gap: 8px; margin-top: 16px; max-width: 480px; }
 .bd-oncall-secret > label { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; font-size: 13px; }
 .bd-oncall-secret-input { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }

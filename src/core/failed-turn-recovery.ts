@@ -4,6 +4,7 @@ import type { DaemonSession } from './types.js';
 import { activeSessionKey } from './types.js';
 import * as store from '../services/session-store.js';
 import { buildFailedTurnRecord, shouldRecordFailedTurn } from '../services/failed-turn-retry.js';
+import { isAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { isRemoteBackendSession } from './persistent-backend.js';
@@ -106,6 +107,10 @@ export function recordFailedTurnTerminal(
     clearLimitedFailedTurn(ds, terminal.turnId);
   }
   if (terminal.status !== 'failed' && terminal.status !== 'ambiguous') return;
+  // A fail-closed refusal of synthetic maintenance is expected operational
+  // state, not a failed human turn. Recording it would reuse ds.lastCliInput
+  // from the previous human turn and make /retry replay already-completed work.
+  if (isAutoCompactSafeComposerRefusal(terminal)) return;
   if (!shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)
       || ds.session.lastFailedTurn?.turnId === terminal.turnId && ds.session.lastFailedTurn.recovery) return;
   const record = buildFailedTurnRecord({ ...terminal, status: terminal.status }, {

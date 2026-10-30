@@ -11,6 +11,7 @@ import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
 import { buildTurnTerminalFooterPatch } from '../src/im/lark/card-builder.js';
 import { customFinalCardError } from '../src/im/lark/final-card-sections.js';
+import { buildDiffCard, parseUnifiedDiff } from '../src/im/lark/md-card.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { normalizeCompletionProposalInput } from '../src/core/completion-proposal.js';
 
@@ -54,13 +55,20 @@ function setup(cliId = 'codex', feedback = true, scope = 'thread', chatType = 'g
       participants: [{ openId: 'ou_requester', isBot: false }] } },
     turnReplyContexts: { [key.turnId]: { replyTargetSenderOpenId: 'ou_requester', replyTargetSenderIsBot: false } },
   } });
-  const run = (card: unknown = customCard, kind = 'final', args: string[] = []) => spawnSyncTsScript(fixture,
-    ['send', '--card-json', JSON.stringify(card), '--response-kind', kind, ...(args.includes('--no-mention') ? [] : ['--mention-back']), ...args], {
+  const run = (card: unknown = customCard, kind = 'final', args: string[] = [],
+    options: { cardFile?: boolean; hostRelay?: boolean } = {}) => {
+    const cardPath = join(root, 'custom-input.json');
+    if (options.cardFile) writeFileSync(cardPath, JSON.stringify(card));
+    const input = options.cardFile ? ['--card-file', cardPath] : ['--card-json', JSON.stringify(card)];
+    return spawnSyncTsScript(fixture,
+    ['send', ...input, '--response-kind', kind, ...(args.includes('--no-mention') ? [] : ['--mention-back']), ...args], {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
       env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
-        BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId },
+        BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
+        BOTMUX_HOST_RELAY_AUTHORIZED: options.hostRelay ? '1' : '' },
       encoding: 'utf8', timeout: 30_000,
     });
+  };
   return { root, dataDir, run };
 }
 
@@ -156,6 +164,44 @@ describe('custom schema-2 final uses the canonical reply lifecycle', () => {
       expect(captured(result.stdout)).toHaveLength(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+
+  it.each([
+    { cliId: 'codex', scope: 'thread', hostRelay: false },
+    { cliId: 'codex', scope: 'thread', hostRelay: true },
+    { cliId: 'claude-code', scope: 'chat', hostRelay: false },
+    { cliId: 'claude-code', scope: 'chat', hostRelay: true },
+  ])('rejects caller host IDs with $cliId/$scope hostRelay=$hostRelay', ({ cliId, scope, hostRelay }) => {
+    const options = { cardFile: true, hostRelay };
+    for (const elementId of [
+      'botmux_md_h1_1', 'botmux_md_h2_2', 'botmux_feedback', 'botmux_reply_footer',
+      'botmux_completion_proposal', 'botmux_md_h9_1', 'botmux_md_h3_1', 'botmux_md_h1_', 'botmux_md_h1_1x',
+    ]) {
+      const { root, run } = setup(cliId, true, scope);
+      try {
+        const result = run({ ...customCard, body: { elements: [
+          { tag: 'markdown', text_size: 'heading-2', element_id: elementId, content: 'Caller heading' },
+        ] } }, 'final', [], options);
+        expect(result.status, String(result.stderr)).toBe(2);
+        expect(String(result.stderr)).toContain('不能占用 botmux_');
+        expect(captured(result.stdout)).toHaveLength(0);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    }
+    // A real generated diff card verifies that the same file/host context can
+    // send successfully; rejection above must come from the reserved-ID gate.
+    const { root, run } = setup(cliId, true, scope);
+    try {
+      const card = buildDiffCard(parseUnifiedDiff('--- a/spec.md\n+++ b/spec.md\n@@ -1 +1 @@\n-old\n+new\n'), {
+        summary: '# Summary\n\n## Details\n\nDocument changed.',
+      }).card;
+      const result = run(card, 'final', [], options);
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = captured(result.stdout);
+      expect(requests).toHaveLength(1);
+      const sent = JSON.parse(requests[0].body.content);
+      expect(sent.body.elements).toContainEqual({ tag: 'markdown', text_size: 'heading-2', content: 'Summary' });
+      expect(requests[0].body.content).not.toContain('botmux_md_h');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
 
   it('rejects a valid completion proposal at the custom-card mutual exclusion gate', () => {
     const { root, run } = setup();

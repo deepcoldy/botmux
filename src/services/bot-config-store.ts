@@ -443,7 +443,10 @@ async function applyConfigFieldInternal(
   if (spec.configKey === 'sandboxNetworkPolicy' && value !== null) {
     try {
       value = parseSandboxNetworkPolicy(value);
-      const reason = networkPolicySupportError({ platform: process.platform, backendType: bot.config.backendType ?? 'pty', sandbox: bot.config.sandbox, policy: value });
+      // Judge the backend new sessions launch on: the override, else the
+      // daemon default (tmux unless BACKEND_TYPE says otherwise), CLI-paired.
+      const backendType = resolvePairedBackendId(bot.config.cliId, bot.config.backendType, config.daemon.backendType) ?? 'pty';
+      const reason = networkPolicySupportError({ platform: process.platform, backendType, sandbox: bot.config.sandbox, policy: value });
       if (reason) return { ok: false, reason };
     } catch (error) { return { ok: false, reason: (error as Error).message }; }
   }

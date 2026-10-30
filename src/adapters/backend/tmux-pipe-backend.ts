@@ -255,7 +255,10 @@ export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDea
 /** Best-effort post-mortem after a terminal pipe-pane failure. Runs one
  *  display-message and one capture-pane, each with a short timeout. Never
  *  throws and never emits noise: any failure/timeout returns an inconclusive
- *  evidence ({ paneDead: false }), and the caller keeps the raw error. */
+ *  evidence ({ paneDead: false }), and the caller keeps the raw error. A dead
+ *  pane tmux has not reaped yet reads as status-less; its exit code then comes
+ *  from the kernel, as on the teardown path (#2453), so the message does not
+ *  call a plain non-zero exit a possible signal death. */
 function collectPipePaneDeathEvidence(paneTarget: string, socketArgs: readonly string[]): PipePaneDeathEvidence {
   let paneDead = false;
   let paneDeadStatus: string | null = null;
@@ -263,13 +266,17 @@ function collectPipePaneDeathEvidence(paneTarget: string, socketArgs: readonly s
     const out = String(
       execFileSync(
         'tmux',
-        [...socketArgs, 'display-message', '-p', '-t', paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+        [...socketArgs, 'display-message', '-p', '-t', paneTarget, PANE_DEATH_FORMAT],
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
       ) ?? '',
     ).trim();
-    const [dead, status] = out.split(':');
+    const [dead, status, panePid, serverPid] = out.split(':');
     paneDead = dead === '1';
     paneDeadStatus = status && status.trim() ? status.trim() : null;
+    if (paneDead && paneDeadStatus === null) {
+      const kernel = readUnreapedPaneExit(Number(panePid), Number(serverPid));
+      if (kernel?.kind === 'exited') paneDeadStatus = String(kernel.code);
+    }
   } catch {
     return { paneDead: false, paneDeadStatus: null, lastScreen: null };
   }

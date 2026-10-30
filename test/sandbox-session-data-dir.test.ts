@@ -369,9 +369,9 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
       plan = prepareDirectSandbox({
         sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
         chdir: repoRoot, home: f.home, cliBin: command,
-        // This flag is rejected at the start of relaySend, proving that the
-        // normal relay path was reached without issuing any real request.
-        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--top-level'],
+        // A valueless flag is rejected at the start of relaySend, proving that
+        // the normal relay path was reached without issuing any real request.
+        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--completion-proposal-file'],
       });
       expect(plan).not.toBeNull();
       writeFileSync(join(plan!.outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
@@ -383,7 +383,7 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
       });
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toContain('ROUTING_NOT_SUPPORTED');
+      expect(result.stderr).toContain('relay: --completion-proposal-file 需要路径参数');
     } finally {
       cleanup(f, plan);
     }

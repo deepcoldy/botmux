@@ -175,6 +175,25 @@ describe('Pi transcript dir under the allowlist file sandbox (real worker)', () 
     expect(report.argv).toContain(`--session-dir ${l.ownDir}`);
   }, 60_000);
 
+  it('unsandboxed resume after a /cd: the new cwd\'s native history is copied into the own dir it keeps using', async () => {
+    const l = lab();
+    const cwdA = join(l.home, 'cwd-a');
+    mkdirSync(cwdA, { recursive: true });
+    // Ran sandboxed in A: the own dir has A's file only.
+    mkdirSync(l.ownDir, { recursive: true });
+    writeFileSync(join(l.ownDir, `2026-10-01T00-00-00-000Z_${SID}.jsonl`),
+      JSON.stringify({ type: 'session', version: 3, id: SID, cwd: cwdA }) + '\n');
+    // Then, sandbox off, `/cd` to the working dir: Pi filed that cwd natively.
+    const bucket = join(l.sessions, piSessionDirName(l.workDir));
+    mkdirSync(bucket, { recursive: true });
+    const name = `2026-10-02T00-00-00-000Z_${SID}.jsonl`;
+    writeFileSync(join(bucket, name), JSON.stringify({ type: 'session', version: 3, id: SID, cwd: l.workDir }) + '\n');
+    const logs = l.start({ sandbox: false, resume: true });
+    const report = await readReport(l.report, logs);
+    expect(report.argv).toContain(`--session-dir ${l.ownDir}`);
+    expect(readdirSync(l.ownDir)).toContain(name);
+  }, 60_000);
+
   it('the resume command a closed card or local terminal offers points at the own dir once it has history', () => {
     const l = lab();
     const resumeCommand = () => {

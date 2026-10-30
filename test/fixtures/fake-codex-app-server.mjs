@@ -28,6 +28,10 @@ const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '
 // 超时容错只在这种条件下可复现）。只影响成功响应，不影响错误分支。
 const threadReadDelayMs = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_MS ?? '0');
 const threadReadDelayReads = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_READS ?? '1');
+// Slow every thread/name/set reply, as a loaded runner slows a local round trip.
+const nameSetDelayMs = Number(process.env.FAKE_CODEX_NAME_SET_DELAY_MS ?? '0');
+// Same for the thread/read that verifies a written name (reads after name/set).
+const verifyReadDelayMs = Number(process.env.FAKE_CODEX_VERIFY_READ_DELAY_MS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
@@ -574,6 +578,10 @@ function handle(request) {
       setTimeout(sendThreadRead, threadReadDelayMs);
       return;
     }
+    if (verifyReadDelayMs > 0 && nameSetSeen) {
+      setTimeout(sendThreadRead, verifyReadDelayMs);
+      return;
+    }
     sendThreadRead();
     return;
   }
@@ -586,7 +594,8 @@ function handle(request) {
     if (behavior === 'hang-name') return;
     currentThreadName = request.params.name;
     nameSetSeen = true;
-    respond(request.id, {});
+    if (nameSetDelayMs > 0) setTimeout(() => respond(request.id, {}), nameSetDelayMs);
+    else respond(request.id, {});
     return;
   }
   if (request.method === 'turn/interrupt' || request.method === 'thread/unsubscribe') {
