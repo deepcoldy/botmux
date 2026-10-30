@@ -673,6 +673,7 @@ describe('normal CLI send reply rendering snapshot', () => {
           BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
           BOTMUX_DAEMON_IPC_PORT: '7951', BOTMUX_TEST_REPLY_RENDER_SNAPSHOT: JSON.stringify({
             usage: { context: null, tokens: null }, footerPreferences: { replyFooterEnabled: !hidden },
+            consoleUrl: 'https://m-example.botmux.example/',
             timing: { executionDurationMs: 5000, waitingDurationMs: 2000, executionInProgress: true },
           }) }, encoding: 'utf8', timeout: 30_000,
       });
@@ -687,6 +688,7 @@ describe('normal CLI send reply rendering snapshot', () => {
       expect(card.includes('等待 2.0')).toBe(!hidden);
       expect(card.includes('执行至回复')).toBe(!hidden);
       expect(card.includes('botmux_reply_footer')).toBe(!hidden);
+      expect(card.includes('](https://m-example.botmux.example/)')).toBe(!hidden);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

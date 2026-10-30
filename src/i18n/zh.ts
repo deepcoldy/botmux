@@ -2026,6 +2026,7 @@ export const messages: Record<string, string> = {
   'card.duration_minutes': '{minutes} 分',
   'card.duration_hours': '{hours} 小时',
   'card.sent_to': '发送给：',
+  'card.reply_console': '控制台',
   'card.usage.context': '上下文',
   // Claude Code statusline 配额段（纯文本 `ctx 23% · 5h 18% · 7d 5%`），两语言同值。
   'card.usage.ctx': 'ctx',

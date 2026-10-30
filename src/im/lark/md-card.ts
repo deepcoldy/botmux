@@ -20,7 +20,7 @@
  */
 
 import { resolveReplyFooterPolicy } from '../../services/reply-footer.js';
-import type { ReplyCardPresentation } from '../../services/reply-card-render.js';
+import { normalizeReplyConsoleUrl, type ReplyCardPresentation } from '../../services/reply-card-render.js';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -760,6 +760,10 @@ export function buildReplyCardFooter(opts: {
   const parts: string[] = [];
   const brandSeg = !policy.brand ? null : brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
+  const consoleUrl = normalizeReplyConsoleUrl(opts.presentation?.consoleUrl);
+  if (brandSeg && consoleUrl && !brandSeg.includes(`](${consoleUrl})`)) {
+    parts.push(`[${t('card.reply_console', undefined, opts.locale)}](${consoleUrl})`);
+  }
   let hasUsage = false;
   if (opts.usage) {
     const usageSeg = !policy.usage ? null : cardUsageFooterSegment(opts.usage, opts.locale);
@@ -802,7 +806,7 @@ export function buildReplyCardFooter(opts: {
   const signMarker = hasUsage || hasDuration || hasWaiting || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
-    signedContent = parts[0]; // brand-only — no marker
+    signedContent = parts.join(' · '); // brand/console only — no marker
   } else if (parts.length > 1) {
     signedContent = `${parts[0]} ·${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
   } else {
