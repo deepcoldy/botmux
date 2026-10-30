@@ -2,7 +2,7 @@
  * 源码结构护栏(K3)：F3 执行身份单一事实源的接线，纯行为测试够不到的部分。
  *
  * 行为测试已覆盖（见 identity-spawn-matrix / identity-decision-report /
- * worker-turn-idle）：五格矩阵的真 bwrap 探针、daemon 只读上报值、PTY
+ * worker-turn-idle）：七格矩阵的真 bwrap 探针、daemon 只读上报值、PTY
  * spawn 真发 session_identity_decision。剩下三处只能在接线层钉死：
  *
  *  1. worker 有且仅有两个决策上站点（PTY spawnCli 与 Codex RPC engage），

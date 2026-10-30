@@ -15,6 +15,7 @@ BotMux 有**两种正交的文件沙盒**，一个开关三档：
 - dashboard：bot 默认设置面板「文件沙盒」三选一分段控件（关闭 / oncall / scratch），scratch 下可选存储（内存即焚 / 磁盘可跨重启续跑）。
 - `bots.json`：`"sandbox": true`（=oncall，向后兼容）、`"sandbox": "oncall"`、`"sandbox": "scratch"`、省略/`false`/`"off"`。
 - 环境变量：`BOTMUX_SANDBOX=1`（=oncall，向后兼容）、`BOTMUX_SANDBOX=scratch`；未识别取值**报错拒绝启动**（绝不静默关沙盒）。
+- 优先级：`BOTMUX_SANDBOX` 为 `1`/`oncall`/`scratch` > 旧字段 `readIsolation: true`（= oncall）> bot 自己的 `sandbox`。未设、空、`0`、`false` 都是「不强制」，按 bot 配置走，**不会关掉 bot 自己开的沙盒**——这个变量只能全局强制开，不能全局关。
 
 scratch 专属字段（均可选）：
 
@@ -369,7 +370,7 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 
 脚本在 `scripts/oncall-cli-matrix/`，必须在 isolate-run 里跑，详见 `lab.sh` 开头的注释。
 
-实测时间 2026-10-30，宿主 Linux 5.15（root daemon），CLI 版本：Claude Code 2.1.312、Codex 0.164.0、Gemini CLI 0.66.0、OpenCode 1.19.3、Kimi 0.31.0、Pi 1.3.0、Oh My Pi 18.10.1、Grok 1.0.70。
+实测时间 2026-10-30，宿主 Linux 5.15（root daemon），CLI 版本：Claude Code 2.1.312、Codex 0.164.0、Gemini CLI 0.66.0、OpenCode 1.19.3、Kimi 0.31.0、Pi 1.3.0、Oh My Pi 18.10.1、Grok 1.0.70。Gemini、Kimi 的「/restart 恢复」一列是接上会话恢复之后复测的结果（开沙盒、不开沙盒都通过）。
 
 | CLI | 后端 | 启动 | 首轮收发 | shell 工具 | 工作目录读写 | 联网 | botmux send | 宿主凭证不可读 | /restart 恢复 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -379,12 +380,12 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 | Codex | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Codex App | tmux | ⛔ 按设计拒绝启动（见下）| — | — | — | — | — | — | — |
 | Codex App | pty | ⛔ 按设计拒绝启动（见下）| — | — | — | — | — | — | — |
-| Gemini CLI | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ 适配器不恢复，不开沙盒同样新开会话 |
-| Gemini CLI | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ 适配器不恢复，不开沙盒同样新开会话 |
+| Gemini CLI | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Gemini CLI | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | OpenCode | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | OpenCode | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Kimi | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ 适配器不恢复，不开沙盒同样新开会话 |
-| Kimi | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ 适配器不恢复，不开沙盒同样新开会话 |
+| Kimi | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Kimi | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Pi | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Pi | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Oh My Pi | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -411,6 +412,8 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
   - 已知边界：整个 `~/.gemini` 读写放行，也覆盖了 Antigravity 放在 `antigravity-cli/` 下的 OAuth token、`history.jsonl`、`brain/` 和 `config/hooks.json`；`~/.gemini/tmp/<项目>/chats` 和 `~/.gemini/history` 里存着同机所有 Gemini 会话的聊天记录，开了白名单隔离的 Gemini（以及原本就放行整个 `~/.gemini` 的 Antigravity）在沙盒里都能读到。Gemini 按项目短名写这些目录，短名由它自己分配，spawn 前算不出来，没法像 Pi 那样只放行本会话。后续可以用 `GEMINI_CLI_HOME` 把每个 bot 的 Gemini 状态重定向进 BOT_HOME。
 - Pi：`~/.pi/agent` 整个目录，但把共享的 `sessions/` 遮掉，只重新放行本会话的 `sessions/botmux/<会话 id>`，并给 Pi 传 `--session-dir`（与 Oh My Pi / ebsd 同一做法；scratch 不传，那里整盘都是一次性副本）。会话文件的位置跟着会话走：开沙盒恢复一个原来不开沙盒的会话时，先把按工作目录分组的子目录里的旧文件复制进来；一个会话一旦在自己的目录下有了文件，之后不开沙盒重启、关闭态卡片和本地终端给出的恢复命令都继续用它，桥接也只读它；会话 `/cd` 到新目录后再恢复时，新目录的旧记录同样先复制进来。原来看不到 `models.json` / `settings.json`，Pi 退回内置 provider，请求根本没发给配置的模型；会话文件也只写在沙盒的临时 tmpfs 里，宿主侧的桥接读不到。不开沙盒的 Pi 会话布局不变。
 - OpenCode：加放行 `~/.config/opencode`（读写）。原来看不到这里的 `opencode.json`，按配置文件配的 provider 失效，退回 OpenCode 自带的托管模型；botmux 的 ask 插件也加载不了。OpenCode 每次启动都会往这里装插件依赖，只读挂载会让它直接退出。
+- Kimi：放行整个 `~/.kimi-code`（`bin/` 只读）。原来只放行 `credentials/` 和 `oauth/`，会话记录和 `session_index.jsonl` 都写在沙盒的临时 tmpfs 里，恢复必然新开会话。
+  - 已知边界：同机其它 Kimi 会话的记录在沙盒里也能读到，与 Gemini 相同。
 - 所有 CLI（只限白名单隔离；scratch 与仅凭据隔离不设）：daemon 以 root 运行时，沙盒内设 `TAR_OPTIONS=--no-same-owner`。`--unshare-user` 只映射当前 uid，GNU tar 以 root 身份解包别人的归档时 chown 失败。Pi 每次启动都会重新下载 fd / rg，启动期间会吞掉送进来的第一条输入。
 
 ## 后续

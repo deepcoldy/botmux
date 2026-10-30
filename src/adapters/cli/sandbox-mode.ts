@@ -70,25 +70,30 @@ export function sandboxBoolValue(raw: unknown): boolean {
 
 /**
  * Resolve the effective mode for a spawn from the bot config, the legacy
- * readIsolation flag and the BOTMUX_SANDBOX env override. Env wins when set to
- * an active mode (it is the operator's global test/force switch); the legacy
- * flag implies oncall like its auto-migration does.
+ * readIsolation flag and the BOTMUX_SANDBOX env override. Precedence:
+ *   1. BOTMUX_SANDBOX set to an active mode (1/oncall/scratch) — the operator's
+ *      global force switch, applied to every bot;
+ *   2. legacy readIsolation → oncall (like its auto-migration);
+ *   3. the bot's own `sandbox` config.
+ * An inactive env value (unset/''/'0'/'false') means "no force" and falls
+ * through: it never turns off a sandbox the bot itself enables. An invalid
+ * value still throws.
  */
 export function resolveSandboxMode(input: {
   configSandbox?: unknown;
   readIsolation?: boolean;
   envValue?: string | undefined;
 }): SandboxMode {
-  if (input.envValue !== undefined && input.envValue !== '') {
-    return envSandboxMode(input.envValue);
-  }
+  const forced = envSandboxMode(input.envValue);
+  if (forced !== 'off') return forced;
   if (input.readIsolation === true) return 'oncall';
   return normalizeSandboxMode(input.configSandbox);
 }
 
 /**
  * Resolve the BOTMUX_SANDBOX env override.
- *   unset/'0'/'false'/'' → off
+ *   unset/'0'/'false'/'' → off (= no force; resolveSandboxMode then follows
+ *                          the bot config)
  *   '1'/'oncall'         → oncall (BOTMUX_SANDBOX=1 stays backwards compatible)
  *   'scratch'            → scratch
  * Any other value fails CLOSED with a throw (never silently off).
