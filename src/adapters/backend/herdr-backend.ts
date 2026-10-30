@@ -147,6 +147,8 @@ function jsonCommand(args: string[], opts?: { timeout?: number; input?: string; 
  * upstream error code/message. `allowEmpty` accepts successful commands such
  * as `pane run` that do not emit JSON.
  */
+const HERDR_EXEC_PERMANENT_CODES = new Set(['ENOENT', 'EACCES', 'ENOEXEC', 'ENOTDIR']);
+
 function requiredJsonCommand(
   operation: string,
   args: string[],
@@ -166,10 +168,12 @@ function requiredJsonCommand(
     const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : err?.stderr?.toString?.().trim();
     const stdout = typeof err?.stdout === 'string' ? err.stdout.trim() : err?.stdout?.toString?.().trim();
     const detail = stderr || stdout;
-    // No output at all, or our own exec deadline killed it: herdr did not
-    // answer (slow host), as opposed to answering with an error.
-    // A spawn error (ENOENT, EACCES, …) carries an errno code and is not transient.
-    const transient = err?.code === 'ETIMEDOUT' || err?.killed === true || (!detail && !err?.code);
+    // herdr did not answer (our exec deadline hit, the host could not fork, or
+    // it exited without output), as opposed to answering with an error. A
+    // missing or unusable executable will not get better by waiting.
+    const transient = err?.code
+      ? !HERDR_EXEC_PERMANENT_CODES.has(err.code)
+      : !detail;
     throw Object.assign(new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`),
       transient ? { herdrTransient: true } : {});
   }

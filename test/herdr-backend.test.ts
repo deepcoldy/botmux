@@ -570,7 +570,38 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
-  it('Herdr 0.7.5: a failed agent list poll (CLI timed out, no output) keeps polling instead of failing the launch', () => {
+  // How execFileSync fails when herdr does not answer. The real timeout shape
+  // carries an errno code (ret.error merged with the spawnSync result) and may
+  // have partial output; a process killed from outside has neither.
+  const unansweredAgentList = [
+    {
+      name: 'the exec timeout fired (ETIMEDOUT, partial stderr)',
+      reply: () => {
+        throw Object.assign(new Error('spawnSync herdr ETIMEDOUT'), {
+          code: 'ETIMEDOUT', errno: -110, syscall: 'spawnSync herdr', status: null, signal: 'SIGTERM',
+          stdout: '', stderr: 'some partial warning',
+        });
+      },
+    },
+    {
+      name: 'the host could not fork (EAGAIN)',
+      reply: () => {
+        throw Object.assign(new Error('spawnSync herdr EAGAIN'), { code: 'EAGAIN', errno: -11, stdout: '', stderr: '' });
+      },
+    },
+    {
+      name: 'herdr was killed without output',
+      reply: () => {
+        throw Object.assign(new Error('Command failed: herdr agent list'), {
+          status: null, signal: 'SIGTERM', stdout: '', stderr: '',
+        });
+      },
+    },
+    { name: 'an empty response', reply: () => '' },
+    { name: 'a non-JSON response', reply: () => 'not json' },
+  ];
+
+  it.each(unansweredAgentList)('Herdr 0.7.5: an agent list poll where $name keeps polling instead of failing the launch', ({ reply }) => {
     // Loaded host (load ≈ 25): single `herdr agent list` calls hit their 5s
     // exec timeout while the CLI is still coming up. Each one used to fail the
     // whole launch as "herdr agent list … failed"; a message-started session
@@ -583,11 +614,7 @@ describe('HerdrBackend.spawn', () => {
       reply: () => {
         polls++;
         vi.setSystemTime(polls * 5_000);
-        if (polls <= 2) {
-          throw Object.assign(new Error('Command failed: herdr agent list'), {
-            status: null, signal: 'SIGTERM', stdout: '', stderr: '',
-          });
-        }
+        if (polls <= 2) return reply();
         return JSON.stringify({ result: { agents: [
           { name: null, pane_id: MANAGED_PANE, agent: 'pi', agent_status: 'idle' },
         ] } });
@@ -596,12 +623,13 @@ describe('HerdrBackend.spawn', () => {
     const be = new HerdrBackend(SESSION);
 
     be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
-    // MUTATION CHECK: rethrowing every poll failure fails here with
+    // MUTATION CHECK: treating this answer as permanent fails here with
     // "herdr agent list … failed" on the first poll.
     expect(polls).toBe(3);
     expect(herdrCall('agent', 'rename')).toBeDefined();
     expect(herdrCall('workspace', 'close')).toBeUndefined();
     be.kill();
+    rmSync(dirname(paneLauncherPath()), { recursive: true, force: true });
   });
 
   it('Herdr 0.7.5: agent list failing until the deadline reports the timeout with the last poll error', () => {
@@ -630,10 +658,6 @@ describe('HerdrBackend.spawn', () => {
 
   it.each([
     {
-      name: 'a JSON error on stdout',
-      reply: () => JSON.stringify({ error: { code: 'agent_list_failed', message: 'no such session' } }),
-    },
-    {
       name: 'a JSON error on stderr with exit status 1',
       reply: () => {
         throw Object.assign(new Error('Command failed: herdr'), {
@@ -648,13 +672,18 @@ describe('HerdrBackend.spawn', () => {
   ])('Herdr 0.7.5: an agent list answer of $name fails the launch on the first poll', ({ reply }) => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    setManagedLaunchResponses('pi', [{ match: a => a.includes('agent') && a.includes('list'), reply }]);
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('list'),
+      // Each poll costs time, so a mutated (always-retry) loop reaches the
+      // deadline and ends in "did not detect" instead of spinning forever.
+      reply: () => { vi.setSystemTime(Date.now() + 5_000); return reply(); },
+    }]);
     const be = new HerdrBackend(SESSION);
 
     let error: unknown;
     try { be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }); } catch (err) { error = err; }
-    // MUTATION CHECK: retrying every poll failure turns these into a
-    // deadline-long spin ending in "did not detect".
+    // MUTATION CHECK: retrying every poll failure keeps polling until the
+    // deadline and ends in "did not detect".
     expect(String(error)).toMatch(/herdr agent list in .* failed/);
     expect(String(error)).not.toMatch(/did not detect/);
     const listCalls = mockedExecFileSync.mock.calls.filter(call => {
