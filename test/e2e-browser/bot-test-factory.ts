@@ -34,6 +34,7 @@ import {
   waitForCodexSideResponse,
   clickDirectStartIfPresent,
   showStreamingOutput,
+  waitForReplyMarker,
   waitForModelTextReply,
   scrollThreadToBottom,
   closeSession,
@@ -110,11 +111,11 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
       });
 
       await scrollThreadToBottom(agent);
-      await waitForModelTextReply(agent, {
-        botName,
-        marker: expectedReplyMarker(msg),
-        timeoutMs: 180_000,
-      });
+      const marker = expectedReplyMarker(msg);
+      await waitForModelTextReply(agent, { botName, marker, timeoutMs: 180_000 });
+      // The vision check above also accepts the prompt, which quotes the same
+      // ACK: CI passed a Gemini case whose CLI exited before every turn.
+      await waitForReplyMarker(page, marker, 60_000);
 
       // The ACK bubble is now the last item. showStreamingOutput scrolls the
       // streaming card itself into view; scrolling to the thread bottom

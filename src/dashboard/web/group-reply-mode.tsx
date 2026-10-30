@@ -14,7 +14,7 @@ export interface GroupReplyModeState {
 type Choice = 'inherit' | ChatReplyMode;
 const MODES: readonly ChatReplyMode[] = ['chat-topic', 'chat', 'shared', 'new-topic'];
 
-const MODE_LABEL_KEY: Record<ChatReplyMode, string> = {
+export const MODE_LABEL_KEY: Record<ChatReplyMode, string> = {
   'chat-topic': 'groups.replyModeChatTopic',
   chat: 'groups.replyModeChat',
   shared: 'groups.replyModeShared',
@@ -25,6 +25,8 @@ type Props = {
   chatId: string;
   appId: string;
   botName: string;
+  /** 可见标题；按 bot 分栏展示时传设置名，缺省显示 botName。 */
+  label?: string;
   state?: GroupReplyModeState;
   /** 话题群（含普通群切成话题布局）：只允许清除休眠覆盖，不能设置新模式。 */
   topicGroup?: boolean;
@@ -96,7 +98,7 @@ export function GroupReplyModeRow(props: Props) {
     ? ['inherit', ...(shown?.override ? [shown.override] : [])]
     : ['inherit', ...MODES];
   return <div className="group-reply-mode-row" data-group-reply-mode-row={props.appId}>
-    <label htmlFor={id}><strong>{props.botName}</strong></label>
+    <label htmlFor={id}><strong>{props.label ?? props.botName}</strong></label>
     <select id={id} value={choice} disabled={props.disabled || saving || (props.topicGroup && !shown?.override)}
       onChange={event => { void save(event.currentTarget.value as Choice); }}>
       {options.map(option => <option key={option} value={option}>

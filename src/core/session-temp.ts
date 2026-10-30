@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import type { ChildProcess } from 'node:child_process';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 
 const SAFE_SESSION_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -14,8 +14,38 @@ function sessionTempSegment(sessionId: string): string {
   return `sha256-${createHash('sha256').update(sessionId).digest('hex')}`;
 }
 
-function sessionTempRoot(): string {
+function sessionTempCacheRoot(): string {
   return join(homedir(), '.cache', 'botmux', 'session-tmp');
+}
+
+function sessionTempRoot(): string {
+  if (!process.getuid) return sessionTempCacheRoot();
+  return join('/tmp', `bm${process.getuid()}`,
+    createHash('sha256').update(resolve(sessionTempCacheRoot())).digest('hex').slice(0, 8));
+}
+
+function ensureSessionTempRoot(): void {
+  const cache = sessionTempCacheRoot();
+  // Keep large scratch trees on the cache filesystem, but expose a bounded
+  // lexical path to tools. Chrome appends ~40 bytes for its SingletonSocket;
+  // shortening only the session/profile segments cannot bound a long HOME.
+  if (!process.getuid) return;
+  const uid = process.getuid();
+  const parent = join('/tmp', `bm${uid}`);
+  try { mkdirSync(parent, { mode: 0o700 }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  const owner = lstatSync(parent);
+  if (!owner.isDirectory() || owner.isSymbolicLink() || owner.uid !== uid || (owner.mode & 0o077) !== 0) {
+    throw new Error(`session temp alias parent is not a private owned directory: ${parent}`);
+  }
+  mkdirSync(cache, { recursive: true, mode: 0o700 });
+  const alias = sessionTempRoot();
+  try { symlinkSync(resolve(cache), alias, 'dir'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  const link = lstatSync(alias);
+  if (!link.isSymbolicLink() || link.uid !== uid || readlinkSync(alias) !== resolve(cache)) {
+    throw new Error(`session temp alias does not point to its cache directory: ${alias}`);
+  }
 }
 
 function sessionTempProfile(dataDir: string, length: number): string {
@@ -33,7 +63,7 @@ const PROFILE_DATA_DIR_MARKER = '.data-dir';
 
 /**
  * Stable scratch path owned by one logical session. It lives in the user's
- * cache tree, keyed by SESSION_DATA_DIR, rather than in the host's /tmp:
+ * cache tree, keyed by SESSION_DATA_DIR, through a short private /tmp alias:
  * production Linux hosts commonly mount /tmp as tmpfs, while agent turns clone
  * repositories and build dependency trees that can be many GiB.
  *
@@ -49,13 +79,9 @@ export function sessionTempDir(dataDir: string, sessionId: string, root: string 
   return join(root, sessionTempProfile(dataDir, 8), sessionTempKey(sessionId));
 }
 
-/** Pre-shortening layout, still owned by sessions created before the change. */
-function legacySessionTempDir(dataDir: string, sessionId: string): string {
-  return join(sessionTempRoot(), sessionTempProfile(dataDir, 16), sessionTempSegment(sessionId));
-}
-
 /** Create and validate the session scratch directory before exposing it. */
 export function ensureSessionTempDir(dataDir: string, sessionId: string, root: string = sessionTempRoot()): string {
+  if (root === sessionTempRoot()) ensureSessionTempRoot();
   const path = sessionTempDir(dataDir, sessionId, root);
   let existed = true;
   try {
@@ -96,8 +122,13 @@ function writeProfileDataDirMarker(profileDir: string, dataDir: string): void {
 
 /** Best-effort caller decides when the logical session is durably closed. */
 export async function cleanupSessionTempDir(dataDir: string, sessionId: string): Promise<void> {
-  await retireSessionTempPath(sessionTempDir(dataDir, sessionId));
-  await retireSessionTempPath(legacySessionTempDir(dataDir, sessionId));
+  let cache: string;
+  try { cache = realpathSync(sessionTempCacheRoot()); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+  // A short alias can be replaced while asynchronous removal is in progress.
+  // Delete through the fixed backing path, including the pre-shortening layout.
+  await retireSessionTempPath(sessionTempDir(dataDir, sessionId, cache));
+  await retireSessionTempPath(join(cache, sessionTempProfile(dataDir, 16), sessionTempSegment(sessionId)));
 }
 
 async function retireSessionTempPath(path: string): Promise<void> {
@@ -138,7 +169,7 @@ export function cleanupSessionTempDirAfterExit(
 }
 
 export interface SessionTempSweepOptions {
-  /** Defaults to ~/.cache/botmux/session-tmp. */
+  /** Defaults to a short alias of ~/.cache/botmux/session-tmp. */
   root?: string;
   now?: number;
   /** Directories touched more recently than this are never removed. */
@@ -194,7 +225,9 @@ export async function sweepOrphanSessionTempDirs(
   protectedSessionIds: ReadonlySet<string>,
   opts: SessionTempSweepOptions,
 ): Promise<string[]> {
-  const root = opts.root ?? sessionTempRoot();
+  if (opts.root === undefined) ensureSessionTempRoot();
+  let root: string;
+  try { root = realpathSync(opts.root ?? sessionTempCacheRoot()); } catch { return []; }
   const now = opts.now ?? Date.now();
   const graceMs = opts.graceMs ?? SESSION_TEMP_SWEEP_GRACE_MS;
   let profiles: string[];
@@ -228,11 +261,14 @@ export async function sweepOrphanSessionTempDirs(
   if (candidates.length > 0) {
     // A session without a store row (a v3 workflow attempt) is protected only
     // by its running CLI; when no process can be seen, nothing is provably dead.
-    const live = await opts.liveReferences(candidates.map(c => c.path));
+    const spellings = new Map(candidates.map(({ path }) => [path, opts.root === undefined
+      ? [...new Set([path, join(sessionTempRoot(), relative(root, path)), join(sessionTempCacheRoot(), relative(root, path))])]
+      : [path]]));
+    const live = await opts.liveReferences([...new Set([...spellings.values()].flat())]);
     for (const { path, detached } of live ? candidates : []) {
       // Re-read the mtime at removal time: a resume that landed after the
       // probe (its worker spawns the CLI later) refreshed it on claim.
-      if (live!.has(path) || !isOld(path)) continue;
+      if (spellings.get(path)!.some(spelling => live!.has(spelling)) || !isOld(path)) continue;
       try {
         if (detached) await rm(path, { recursive: true, force: true });
         else await retireSessionTempPath(path);
@@ -269,11 +305,11 @@ const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
  * paths are removed: an operator's own short TMPDIR is kept.
  */
 export function scrubSessionTempEnv(env: NodeJS.ProcessEnv): void {
-  const root = sessionTempRoot();
+  const roots = [sessionTempRoot(), sessionTempCacheRoot()];
   for (const key of SESSION_TEMP_ENV_KEYS) {
     const value = env[key]?.trim();
     if (!value) continue;
     const path = resolve(value);
-    if (path === root || path.startsWith(`${root}${sep}`)) delete env[key];
+    if (roots.some(root => path === root || path.startsWith(`${root}${sep}`))) delete env[key];
   }
 }

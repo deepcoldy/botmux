@@ -117,6 +117,58 @@ if (useMockLlm) {
   } catch {}
 }
 
+/**
+ * Bot env that points a public CLI at the mock (verified per CLI against the
+ * mock: OpenCode, Kimi, Gemini). Pi, Oh My Pi and Grok read the mock from
+ * config files under $HOME that the workflow writes (they have no env form),
+ * so they need nothing here.
+ */
+function mockCliEnv(cliId: string, baseUrl: string): Record<string, string> | null {
+  switch (cliId) {
+    case 'opencode':
+      // OPENAI_BASE_URL alone selects the built-in openai provider, which
+      // speaks the Responses API and loops without ever calling a tool.
+      return {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          $schema: 'https://opencode.ai/config.json',
+          model: 'mock/mock-model',
+          autoupdate: false,
+          share: 'disabled',
+          provider: {
+            mock: {
+              npm: '@ai-sdk/openai-compatible',
+              name: 'Mock LLM',
+              options: { baseURL: `${baseUrl}/v1`, apiKey: 'mock-test-key' },
+              models: { 'mock-model': { name: 'Mock Model', tool_call: true } },
+            },
+          },
+        }),
+        OPENCODE_DISABLE_AUTOUPDATE: '1',
+      };
+    case 'kimi':
+      return {
+        KIMI_MODEL_NAME: 'mock-model',
+        KIMI_MODEL_API_KEY: 'mock-test-key',
+        KIMI_MODEL_PROVIDER_TYPE: 'anthropic',
+        KIMI_MODEL_BASE_URL: baseUrl,
+        KIMI_MODEL_CAPABILITIES: 'tool_use',
+        // Without it Kimi fetches a newer release in the background, which asks
+        // to trust the folder on its next start.
+        KIMI_CODE_NO_AUTO_UPDATE: '1',
+        KIMI_DISABLE_TELEMETRY: '1',
+      };
+    case 'gemini':
+      // Gemini CLI runs headless when CI or GITHUB_ACTIONS is "true" (both set
+      // on GitHub runners): it reads the prompt from stdin, finds none and
+      // exits 42 before every turn.
+      return { GOOGLE_GEMINI_BASE_URL: baseUrl, GEMINI_API_KEY: 'mock-test-key', CI: 'false', GITHUB_ACTIONS: 'false' };
+    case 'pi':
+      return { PI_SKIP_VERSION_CHECK: '1' };
+    default:
+      return null;
+  }
+}
+
 const daemonChildren: import('node:child_process').ChildProcess[] = [];
 const startDaemon =
   process.argv.includes('--start-daemon') ||
@@ -166,10 +218,20 @@ if (startDaemon) {
               b.env.ANTHROPIC_API_KEY = 'mock-test-key';
               b.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
               changed = true;
-            } else if (b.cliId === 'codex' || b.cliId === 'coco' || b.cliId === 'opencode') {
+            } else if (b.cliId === 'codex' || b.cliId === 'coco') {
               b.env.OPENAI_BASE_URL = `${mockServerBaseUrl}/v1`;
               b.env.OPENAI_API_KEY = 'mock-test-key';
               changed = true;
+            } else {
+              // The public CLIs of the core-clis lane: each reads the mock from
+              // its own settings (mockCliEnv). A bot `model` would override the
+              // mock model the settings select.
+              const env = mockCliEnv(b.cliId, mockServerBaseUrl);
+              if (env) {
+                Object.assign(b.env, env);
+                delete b.model;
+                changed = true;
+              }
             }
           }
         }

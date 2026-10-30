@@ -4288,7 +4288,7 @@ td code,
   gap: 12px;
 }
 
-#g-drawer :where(.g-add-bots-dialog, .g-save-profile-dialog, .g-manage-dialog) > header {
+#g-drawer .g-add-bots-dialog > header {
   justify-items: center;
   text-align: center;
 }
@@ -4302,7 +4302,7 @@ td code,
   color: var(--text-muted, #888);
 }
 
-#g-drawer :where(.g-add-bots-dialog, .g-save-profile-dialog, .g-manage-dialog) > header h3 {
+#g-drawer .g-add-bots-dialog > header h3 {
   max-width: min(560px, 100%);
   text-align: center;
 }
@@ -4369,29 +4369,31 @@ td code,
   gap: var(--g-create-gap);
 }
 
-#g-drawer.groups-create-modal .g-profile-menu {
-  width: 100%;
+/* 一个长子项（比如下面的复制群角色说明）不能把整张表单撑出弹窗：弹窗 overflow:hidden，
+   撑宽的部分会被直接裁掉。 */
+#g-drawer.groups-create-modal :is(.g-create-form, .g-create-fields) {
+  grid-template-columns: minmax(0, 1fr);
 }
 
-#g-drawer.groups-create-modal .g-profile-menu > summary {
-  background: var(--surface);
-  font-size: 12px;
+#g-drawer.groups-create-modal .g-clone-roles-field .checkbox-row {
+  width: auto;
+  flex-wrap: wrap;
 }
 
-#g-drawer.groups-create-modal .g-profile-menu .sect-sort-value {
-  max-width: calc(100% - 44px);
+#g-drawer.groups-create-modal .g-clone-roles-field .checkbox-row-main {
+  flex: 1 1 0;
+  flex-wrap: wrap;
 }
 
-#g-drawer.groups-create-modal .g-profile-menu .sect-sort-pop {
-  left: 0;
-  right: 0;
-  min-width: 100%;
-  transform: none;
+#g-drawer.groups-create-modal .g-clone-roles-field .checkbox-row-main :is(strong, small) {
+  white-space: normal;
 }
 
-#g-drawer.groups-create-modal .g-profile-menu .sect-sort-pop button {
-  justify-content: flex-start;
+#g-drawer.groups-create-modal .g-clone-roles-field .checkbox-row-main small {
+  flex: 1 1 100%;
+  margin-left: 0;
 }
+
 
 #g-drawer.groups-create-modal .g-create-status:empty {
   display: none;
@@ -6309,57 +6311,6 @@ dialog.onboarding-dialog::backdrop {
   border-radius: var(--radius-full);
 }
 
-#g-drawer .g-manage-dialog {
-  gap: 10px;
-}
-
-#g-drawer .g-manage-dialog > header {
-  margin-bottom: 0;
-}
-
-#g-drawer .g-manage-meta {
-  display: flex;
-  align-items: center;
-  flex-wrap: nowrap;
-  gap: 8px;
-  min-width: 0;
-  margin: -2px 0 2px;
-  overflow: hidden;
-}
-
-#g-drawer .g-manage-meta > span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  box-sizing: border-box;
-  min-width: 0;
-  max-width: 50%;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-#g-drawer .g-manage-meta b {
-  flex: none;
-  color: var(--muted);
-  font-weight: 700;
-}
-
-#g-drawer .g-manage-meta code {
-  min-width: 0;
-  overflow: hidden;
-  padding: 0;
-  background: transparent;
-  color: var(--fg);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 #g-drawer .g-collaboration-mode {
   position: relative;
   display: grid;
@@ -6785,15 +6736,458 @@ dialog.onboarding-dialog::backdrop {
   white-space: normal;
 }
 
-@media (max-width: 720px) {
-  #g-drawer .g-manage-meta {
+/* 群管理：右侧抽屉 + 标签页。旧弹窗把 8 类设置按「设置 × 全部 bot」纵向堆叠，
+   看一个 bot 的全貌要翻完整个弹窗；现在概览一张表、单 bot 一屏。 */
+#g-drawer.groups-manage-drawer {
+  width: min(980px, calc(100vw - 24px));
+  height: calc(100vh - 24px);
+  max-height: none;
+  margin: 12px 12px 12px auto;
+  overflow: hidden;
+}
+
+#g-drawer.groups-manage-drawer[open] {
+  animation: g-drawer-in 160ms ease-out;
+}
+
+@keyframes g-drawer-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #g-drawer.groups-manage-drawer[open] { animation: none; }
+}
+
+#g-drawer .g-manage-dialog {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  gap: 0;
+  height: 100%;
+  padding: 0;
+}
+
+#g-drawer .g-manage-dialog > .hint-warn {
+  margin: 0 18px 10px;
+}
+
+#g-drawer .g-manage-head {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px 12px;
+  text-align: left;
+  justify-items: stretch;
+}
+
+#g-drawer .g-manage-title {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+#g-drawer .g-manage-title h3 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+#g-drawer .g-manage-facts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+#g-drawer .g-manage-facts b {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+#g-drawer .g-manage-chatid {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--faint);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+#g-drawer .g-manage-chatid code {
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-family: var(--mono);
+}
+
+#g-drawer .g-manage-chatid > span {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+#g-drawer .g-manage-chatid:hover code {
+  color: var(--fg);
+}
+
+#g-drawer .g-manage-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#g-drawer .g-manage-close {
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: var(--radius-full);
+  font-size: 18px;
+  line-height: 1;
+}
+
+#g-drawer .g-manage-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border-soft);
+  overflow-x: auto;
+}
+
+#g-drawer .g-manage-tabs button {
+  flex: none;
+  min-height: 36px;
+  padding: 0 12px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+#g-drawer .g-manage-tabs button:hover {
+  color: var(--fg);
+}
+
+#g-drawer .g-manage-tabs button.active {
+  border-bottom-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+#g-drawer .g-manage-tabs button.danger.active {
+  border-bottom-color: var(--danger);
+  color: var(--danger);
+}
+
+#g-drawer .g-manage-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 18px 18px;
+}
+
+#g-drawer .g-manage-body > section {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+#g-drawer .g-manage-body > section[hidden] {
+  display: none;
+}
+
+#g-drawer .g-panel-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 概览矩阵 */
+#g-drawer .g-matrix-wrap {
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+}
+
+#g-drawer .g-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+#g-drawer .g-matrix th,
+#g-drawer .g-matrix td {
+  max-width: 160px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#g-drawer .g-matrix thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: color-mix(in srgb, var(--surface-muted) 70%, var(--surface));
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+#g-drawer .g-matrix tbody tr {
+  cursor: pointer;
+}
+
+#g-drawer .g-matrix tbody tr:hover {
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+#g-drawer .g-matrix tbody tr:last-child > * {
+  border-bottom: none;
+}
+
+#g-drawer .g-matrix tbody th {
+  position: sticky;
+  left: 0;
+  max-width: 200px;
+  background: var(--surface);
+}
+
+#g-drawer .g-matrix tbody tr:hover th {
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+#g-drawer .g-matrix-bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+}
+
+#g-drawer .g-matrix-bot strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+#g-drawer .g-cell-on {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+#g-drawer .g-cell-off {
+  color: var(--faint);
+}
+
+#g-drawer .g-cell-warn {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+/* 机器人设置：左侧选 bot，右侧该 bot 的全部设置 */
+#g-drawer .g-bots-panel:not([hidden]) {
+  grid-template-columns: 200px minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+}
+
+#g-drawer .g-bot-picker-rail {
+  position: sticky;
+  top: 0;
+  display: grid;
+  gap: 2px;
+  max-height: calc(100vh - 200px);
+  overflow: auto;
+}
+
+#g-drawer .g-bot-picker-rail button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-align: left;
+}
+
+#g-drawer .g-bot-picker-rail button > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#g-drawer .g-bot-picker-rail button > small {
+  flex: none;
+  color: var(--faint);
+  font-size: 10.5px;
+}
+
+#g-drawer .g-bot-picker-rail button:hover {
+  background: color-mix(in srgb, var(--surface-muted) 60%, transparent);
+  color: var(--fg);
+}
+
+#g-drawer .g-bot-picker-rail button.active {
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: var(--accent-strong);
+}
+
+#g-drawer .g-bot-settings {
+  display: grid;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+}
+
+#g-drawer .g-setting-block {
+  display: grid;
+  grid-template-columns: minmax(150px, 220px) minmax(0, 1fr);
+  gap: 14px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+#g-drawer .g-setting-block:first-child {
+  border-top: none;
+}
+
+#g-drawer .g-setting-block > header {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  text-align: left;
+  justify-items: start;
+}
+
+#g-drawer .g-setting-block > header strong {
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+#g-drawer .g-setting-block > header small {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+#g-drawer .g-setting-body {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+}
+
+#g-drawer .g-setting-body .oncall-row,
+#g-drawer .g-setting-body .g-pin-row {
+  padding: 0;
+  border: none;
+}
+
+#g-drawer .g-role-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+#g-drawer .g-disband-field {
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border-soft));
+}
+
+@media (max-width: 760px) {
+  /* 基础 dialog 有 max-width: calc(100% - 32px)，不解除的话抽屉只有屏宽减 32px、
+     贴左，右侧露出底下的列表。 */
+  #g-drawer.groups-manage-drawer {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100dvh;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+  }
+  #g-drawer .g-manage-head {
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 12px 14px 10px;
+  }
+  #g-drawer .g-manage-head > .orb-avatar {
+    display: none;
+  }
+  #g-drawer .g-manage-tabs {
     flex-wrap: wrap;
+    padding: 0 8px;
   }
-
-  #g-drawer .g-manage-meta > span {
+  #g-drawer .g-manage-tabs button {
+    padding: 0 9px;
+  }
+  #g-drawer .g-manage-body {
+    padding: 12px 14px 16px;
+  }
+  #g-drawer .g-bots-panel:not([hidden]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  #g-drawer .g-bot-picker-rail {
+    position: static;
+    display: flex;
+    flex-wrap: wrap;
+    max-height: 116px;
+    overflow-y: auto;
+  }
+  #g-drawer .g-bot-picker-rail button {
+    flex: none;
     max-width: 100%;
+    min-height: 30px;
+    border-color: var(--border-soft);
   }
+  #g-drawer .g-setting-block {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+}
 
+.groups-session-section > summary {
+  padding: 10px 4px;
+  color: var(--fg);
+  font-weight: 600;
+  cursor: pointer;
+  opacity: 0.85;
+}
+
+.groups-session-section > summary > span {
+  margin-left: 8px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+@media (max-width: 720px) {
   #g-drawer .g-mode-rail,
   #g-drawer .g-project-protocol,
   #g-drawer .g-card-template-rail {
@@ -9818,330 +10212,13 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .orb-avatar.orb-square .orb-img { border-radius: var(--radius-md); }
 .orb-avatar.orb-square.orb-avatar-sm,
 .orb-avatar.orb-square.orb-avatar-sm .orb-img { border-radius: var(--radius-sm); }
-/* 群列表名称单元格：群头像 + 群名/ID 横向排列。 */
-.g-profile-status {
-  display: inline-flex;
-  align-items: center;
-  max-width: 240px;
-  margin-top: 5px;
-  padding: 2px 7px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-soft);
-  background: var(--surface-muted);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.5;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.g-profile-status.full {
-  border-color: color-mix(in srgb, var(--success) 35%, var(--border-soft));
-  background: color-mix(in srgb, var(--success) 10%, var(--surface));
-  color: var(--success);
-}
-.g-profile-status.partial {
-  border-color: color-mix(in srgb, var(--warning) 35%, var(--border-soft));
-  background: color-mix(in srgb, var(--warning) 12%, var(--surface));
-  color: var(--warning);
-}
-.g-profile-status.muted { font-weight: 600; }
-.g-save-profile-dialog {
-  display: grid;
-  gap: 12px;
-}
-.g-save-profile-dialog [hidden] {
-  display: none !important;
-}
-#g-drawer .g-save-profile-dialog .form-row {
-  gap: 8px;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-}
-#g-drawer .g-save-profile-dialog .form-row > span {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-.g-save-profile-panel {
-  display: grid;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  background: var(--surface-muted);
-}
-.g-save-profile-section-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: baseline;
-}
-.g-save-profile-section-head > span {
-  color: var(--fg);
-  font-weight: 700;
-}
-.g-save-profile-section-head > small {
-  color: var(--muted);
-  font-size: 12px;
-}
-.g-save-profile-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.g-save-profile-stats span {
-  display: inline-flex;
-  gap: 5px;
-  align-items: center;
-  padding: 3px 8px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-}
-.g-save-profile-stats strong {
-  color: var(--fg);
-}
-.g-save-profile-stats .warn {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-.g-save-profile-entry-list {
-  display: grid;
-  gap: 6px;
-  max-height: 170px;
-  overflow: auto;
-}
-.g-save-profile-entry {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-  padding: 8px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-}
-.g-save-profile-entry > div {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-.g-save-profile-entry strong,
-.g-save-profile-entry code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.g-save-profile-entry code {
-  color: var(--muted);
-  background: transparent;
-  padding: 0;
-}
-.g-save-profile-entry.error {
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--border-soft));
-}
-.g-save-profile-entry-status {
-  display: inline-flex;
-  align-items: center;
-  min-height: 22px;
-  padding: 2px 8px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-muted);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-.g-save-profile-entry-status.ok {
-  color: var(--success);
-  background: color-mix(in srgb, var(--success) 12%, var(--surface));
-}
-.g-save-profile-entry-status.error {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-.g-save-profile-empty {
-  color: var(--muted);
-  font-size: 13px;
-}
-.g-save-profile-switch {
-  display: inline-flex;
-  align-items: center;
-  justify-self: start;
-  gap: 2px;
-  width: fit-content;
-  max-width: 100%;
-  height: var(--button-height);
-  min-height: var(--button-height);
-  padding: 2px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  overflow-x: auto;
-}
-.g-save-profile-switch button {
-  box-sizing: border-box;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: calc(var(--button-height) - 6px);
-  min-height: calc(var(--button-height) - 6px);
-  max-height: calc(var(--button-height) - 6px);
-  min-width: 0;
-  padding: 0 var(--button-padding-x);
-  border: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--muted);
-  box-shadow: none;
-  white-space: nowrap;
-}
-.g-save-profile-switch button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--border-soft) 60%, transparent);
-  color: var(--accent-strong);
-}
-.g-save-profile-switch button.active {
-  background: color-mix(in srgb, var(--muted) 12%, var(--surface));
-  color: var(--accent);
-  box-shadow: none;
-}
-.g-save-profile-switch button:disabled {
-  opacity: 0.46;
-  cursor: not-allowed;
-}
-#g-drawer .g-save-profile-dialog input[name="profileId"] {
-  box-sizing: border-box;
-  width: min(420px, 100%);
-  height: var(--button-height);
-  min-height: var(--button-height);
-  padding: 0 var(--button-padding-x);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--fg);
-  font-size: 12px;
-  font-weight: 700;
-  box-shadow: none;
-}
-#g-drawer .g-save-profile-dialog input[name="profileId"]:hover:not(:disabled) {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
-  color: var(--accent-strong);
-}
-#g-drawer .g-save-profile-dialog input[name="profileId"]:focus,
-#g-drawer .g-save-profile-dialog input[name="profileId"]:focus-visible {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
-  color: var(--fg);
-  outline: none;
-  box-shadow: none;
-}
-.g-save-profile-picker {
-  display: grid;
-  gap: 8px;
-  max-height: 220px;
-  overflow: auto;
-}
-.g-save-profile-pick {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-  justify-content: stretch;
-  min-height: 38px;
-  width: 100%;
-  border-radius: var(--radius-sm);
-  background: var(--surface-muted);
-  box-shadow: none;
-  text-align: left;
-}
-.g-save-profile-pick.selected {
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
-  color: var(--accent-strong);
-}
-.g-save-profile-pick span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.g-save-profile-pick small,
-.g-save-profile-summary,
-.g-save-profile-status,
+
 .form-row small {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.55;
 }
-.g-save-profile-target {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 4px 10px;
-  align-items: center;
-  padding: 9px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--surface-muted);
-}
-.g-save-profile-target > span {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-.g-save-profile-target code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.g-save-profile-target small {
-  grid-column: 2;
-  color: var(--muted);
-  font-size: 12px;
-}
-.g-save-profile-summary {
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-muted);
-}
-.g-save-profile-summary.warn,
-.g-save-profile-status.error {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-.g-save-profile-status {
-  min-height: 0;
-}
-.g-save-profile-status:not(:empty) {
-  display: inline-flex;
-  align-items: center;
-  justify-self: start;
-  min-height: 30px;
-  padding: 0 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1.35;
-}
-.g-save-profile-status.ok:not(:empty) {
-  border-color: color-mix(in srgb, var(--success) 28%, var(--border-soft));
-  background: color-mix(in srgb, var(--success) 8%, var(--surface));
-  color: var(--success);
-}
-.g-save-profile-status.error:not(:empty) {
-  border-color: color-mix(in srgb, var(--danger) 34%, var(--border-soft));
-  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
-  color: var(--danger);
-}
+
 .orb-dot {
   position: absolute;
   right: -1px;
@@ -14503,29 +14580,30 @@ tbody tr[data-chat]:hover {
   overflow-y: auto;
 }
 
+/* 群列表行：群头像 | 群名 + 在群 bot | 操作。一行一个群，高度只随在群 bot 数变化，
+   不再把整个 roster 逐个标「缺失」。整行可点进管理抽屉。 */
 .groups-list-row {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) auto;
-  align-items: start;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
   column-gap: 12px;
-  row-gap: 12px;
   align-self: start;
-  min-height: 94px;
-  padding: 12px;
+  min-height: 64px;
+  padding: 10px 12px;
+  cursor: pointer;
   content-visibility: auto;
-  contain-intrinsic-size: auto 160px;
+  contain-intrinsic-size: auto 72px;
 }
 
 .groups-list-row > .orb-avatar {
   grid-column: 1;
   align-self: start;
-  margin-top: 0;
+  margin-top: 2px;
 }
 
 .groups-list-row .overview-list-main {
   grid-column: 2;
   display: grid;
-  align-self: start;
   gap: 6px;
   min-width: 0;
 }
@@ -14536,64 +14614,115 @@ tbody tr[data-chat]:hover {
   gap: 8px;
   min-width: 0;
   min-height: 24px;
-  overflow: hidden;
 }
 
-.groups-row-head b {
+.groups-page .groups-row-title {
   flex: 0 1 auto;
   min-width: 0;
-  line-height: 24px;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 22px;
+  text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.groups-page .groups-row-title:hover,
+.groups-page .groups-row-title:focus-visible {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .groups-row-count {
-  grid-column: 3;
-  grid-row: 1;
-  justify-self: end;
-  align-self: start;
   flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-sizing: border-box;
-  height: 24px;
-  min-height: 24px;
-  padding: 0 8px;
-  border-radius: var(--radius-full);
-  border: 1px solid var(--border-soft);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 22px;
-  text-align: center;
+  color: var(--faint);
+  font-size: 11.5px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
-.groups-list-row .groups-row-meta {
+.groups-row-bots {
   display: flex;
   align-items: center;
-  flex: 1 1 auto;
-  flex-wrap: nowrap;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 4px 6px;
   min-width: 0;
-  max-width: none;
-  overflow: hidden;
-  color: var(--faint);
-  font-size: 11px;
 }
 
-.groups-list-row .groups-row-tag {
+.groups-page .groups-bot-chip {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 5px;
   box-sizing: border-box;
+  max-width: 180px;
   height: 24px;
   min-height: 24px;
+  padding: 0 8px 0 3px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 22px;
+  white-space: nowrap;
+}
+
+.groups-page .groups-bot-chip > span:last-child {
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.groups-page .groups-bot-chip .orb-avatar-sm {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.groups-page button.groups-bot-chip {
+  cursor: pointer;
+}
+
+.groups-page button.groups-bot-chip:hover,
+.groups-page button.groups-bot-chip:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  color: var(--accent-strong);
+}
+
+.groups-page .groups-bot-chip-more {
+  padding: 0 8px;
+  color: var(--faint);
+}
+
+.groups-page .groups-bot-chip-error {
+  padding: 0 8px;
+  border-color: color-mix(in srgb, var(--danger) 34%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  color: var(--danger);
+}
+
+.groups-row-empty-bots {
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.groups-row-tag {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  box-sizing: border-box;
+  height: 22px;
   padding: 0 8px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-full);
@@ -14601,135 +14730,25 @@ tbody tr[data-chat]:hover {
   color: var(--faint);
   font-size: 11px;
   font-weight: 700;
-  line-height: 22px;
-  overflow: hidden;
   white-space: nowrap;
 }
 
-.groups-list-row .groups-row-tag:first-child {
-  flex: 0 1 auto;
-  max-width: none;
-}
-
-.groups-list-row .groups-row-owner-tag {
-  flex: 0 1 auto;
-  max-width: none;
-}
-
-.groups-list-row .groups-row-project-tag {
-  flex: none;
+.groups-row-project-tag {
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--accent-strong);
   letter-spacing: .04em;
 }
 
-.groups-list-row .groups-row-tag > span,
-.groups-list-row .groups-row-tag > code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.groups-list-row .groups-row-tag > code {
-  background: transparent;
-  color: inherit;
-  font-family: var(--mono);
-  padding: 0;
-}
-
-.groups-bot-strip {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.groups-bot-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  max-width: 172px;
-  box-sizing: border-box;
-  height: 24px;
-  min-height: 24px;
-  padding: 0 9px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 22px;
-  text-align: center;
-}
-
-.groups-bot-pill i {
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: 50%;
-  background: currentColor;
-  opacity: 0.78;
-}
-
-.groups-bot-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.groups-bot-state {
-  flex: none;
-  color: var(--faint);
-  font-size: 10px;
-  line-height: 1;
-}
-
-.groups-bot-in {
-  border-color: color-mix(in srgb, var(--success) 26%, var(--border-soft));
-  background: color-mix(in srgb, var(--success) 8%, var(--surface));
-  color: var(--success);
-}
-
-.groups-bot-out {
-  background: color-mix(in srgb, var(--muted) 10%, var(--surface));
-  color: var(--muted);
-}
-
-.groups-bot-error {
-  border-color: color-mix(in srgb, var(--danger) 34%, var(--border-soft));
-  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
-  color: var(--danger);
-}
-
-.groups-bot-unknown {
-  border-style: dashed;
-  color: var(--faint);
-}
-
-.groups-row-lower {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 12px;
-  min-width: 0;
-}
 
 .groups-list-row .overview-list-tail {
-  align-self: end;
+  grid-column: 3;
+  align-self: center;
   justify-self: end;
   justify-content: flex-end;
   flex: none;
   flex-wrap: nowrap;
   width: max-content;
-  max-width: 332px;
 }
 
 .groups-list-empty {
@@ -14810,15 +14829,14 @@ tbody tr[data-chat]:hover {
 }
 
 @media (max-width: 900px) {
-  .groups-row-lower {
-    align-items: flex-start;
-    grid-template-columns: 1fr;
+  .groups-list-row {
+    grid-template-columns: 28px minmax(0, 1fr);
+    row-gap: 8px;
   }
   .groups-list-row .overview-list-tail {
+    grid-column: 1 / -1;
     justify-self: end;
-    width: max-content;
     max-width: 100%;
-    flex-wrap: nowrap;
   }
 }
 
@@ -14834,13 +14852,13 @@ tbody tr[data-chat]:hover {
   color: var(--accent-strong);
 }
 
-.groups-page :where(.groups-list-row .save-profile, .groups-list-row .manage-chat) {
+.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat) {
   border-color: var(--border-soft);
   background: var(--surface);
   color: var(--muted);
 }
 
-.groups-page :where(.groups-list-row .save-profile, .groups-list-row .manage-chat):hover:not(:disabled) {
+.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat):hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface));
   color: var(--accent-strong);

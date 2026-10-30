@@ -330,6 +330,7 @@ import { PI_CREDENTIAL_ERROR_CODE } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
+import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -10991,21 +10992,6 @@ function resolveCodexOwnershipPid(
   return findLaunchedCliPid(candidatePid, 'codex', 6, {}, filterExecutable) ?? candidatePid;
 }
 
-/** Resolve the pid that actually holds a TRAE rollout open, given a candidate
- *  that may be a bwrap supervisor. Under the file sandbox, botmux launches
- *  `bwrap --unshare-pid -- traex`, so the tmux pane leaf / getChildPid() is the
- *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
- *  would always fail. The real traex leaf is host-visible across the pid ns
- *  (ps -A ppid links), so a comm-based BFS descends to it. Forge x TraeX has
- *  the same launcher shape (`forge` launcher → `traex` child). Outside such
- *  launcher shapes (or if traex hasn't been forked yet) the candidate already
- *  is the leaf, so we return it unchanged — fail closed to the launcher pid
- *  rather than guess. */
-function resolveTraexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
-  if (!launcherActive || !candidatePid) return candidatePid;
-  return findLaunchedCliPid(candidatePid, 'traex') ?? candidatePid;
-}
-
 /** TRAE counterpart of currentCodexObservedPid: the pid of the TRAE process
  *  this worker observes (spawned child or adopted pane). Same resolution order
  *  — the wired backend.cliPid first, then the live pane child pid, then the
@@ -11014,7 +11000,9 @@ function resolveTraexOwnershipPid(candidatePid: number, launcherActive: boolean)
  *  outside launcher shapes / when already a leaf). */
 function currentTraexObservedPid(): number | undefined {
   const wired = (backend as { cliPid?: number } | null)?.cliPid;
-  if (wired) return wired;
+  // A launch layer can still be wired (the leaf not forked yet, or a payload
+  // binding that landed first); keep descending instead of trusting it.
+  if (wired) return resolveTraexOwnershipPid(wired, lastSpawnTraexLauncherActive);
   const child = backend?.getChildPid?.();
   if (child) return resolveTraexOwnershipPid(child, lastSpawnTraexLauncherActive);
   return codexAdoptPendingPid;
@@ -23964,7 +23952,7 @@ async function spawnCli(
         home: sandboxHome,
         cliBin: cliAdapter.resolvedBin,
         cliArgs: args,
-        tempDir: canonical(sessionScratchDir),
+        tempDir: sessionScratchDir,
         effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH,
         identityBin: childEnv.BOTMUX_IDENTITY_BIN,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
@@ -24146,6 +24134,7 @@ async function spawnCli(
         dataDir: scratchDataDir,
         storage,
         tmpfsSizeMb: cfg.scratchTmpfsSizeMb,
+        tempDir: sessionScratchDir,
         net: spawnNetworkShape.netEnabled,
         chdir: cfg.workingDir,
         home: scratchHome,
@@ -25203,14 +25192,16 @@ async function spawnCli(
   lastSpawnCodexExecutable = codexFilterExecutable;
   const startTraexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
-    scheduleWrapperRealCliPid(launcherPid, {
-      findRealPid: (lp) => findLaunchedCliPid(lp, 'traex'),
+    scheduleTraexLeafPidResolve(launcherPid, {
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+        // Same pair applyResolvedCliPid keeps in step: a launch-payload binding
+        // may already have pointed the bridge pid at a layer above this leaf.
+        bridgeCliPid = realPid;
         publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },

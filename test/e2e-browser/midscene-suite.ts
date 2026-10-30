@@ -22,6 +22,11 @@ const BASE_SCENARIOS = [
   'bot-codex-basic',
   'bot-codex-prompt',
   'bot-opencode-basic',
+  'bot-pi-basic',
+  'bot-ohmypi-basic',
+  'bot-kimi-basic',
+  'bot-gemini-basic',
+  'bot-grok-basic',
   'bot-reply-smoke',
   'bot-collaboration',
   'card-lifecycle',
@@ -78,6 +83,31 @@ const BASE_TARGETS: Record<(typeof BASE_SCENARIOS)[number], ScenarioTarget> = {
     module: 'feishu-bot-opencode.e2e.ts',
     suite: 'OpenCode basic flow',
     test: 'sends hello, receives streaming card and actual reply from OpenCode',
+  },
+  'bot-pi-basic': {
+    module: 'feishu-bot-pi.e2e.ts',
+    suite: 'Pi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Pi',
+  },
+  'bot-ohmypi-basic': {
+    module: 'feishu-bot-ohmypi.e2e.ts',
+    suite: 'OhMyPi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from OhMyPi',
+  },
+  'bot-kimi-basic': {
+    module: 'feishu-bot-kimi.e2e.ts',
+    suite: 'Kimi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Kimi',
+  },
+  'bot-gemini-basic': {
+    module: 'feishu-bot-gemini.e2e.ts',
+    suite: 'Gemini basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Gemini',
+  },
+  'bot-grok-basic': {
+    module: 'feishu-bot-grok.e2e.ts',
+    suite: 'Grok basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Grok',
   },
   'bot-reply-smoke': {
     module: 'feishu-bot-reply.e2e.ts',

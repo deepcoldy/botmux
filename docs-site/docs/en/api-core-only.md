@@ -158,7 +158,7 @@ The trigger/poll/cancel **four-state contract is identical to a normal bot** —
 ```bash
 # Trigger (async) — public route, no signature
 curl -s http://127.0.0.1:8930/api/trigger -X POST -H 'content-type: application/json' -d '{
-  "source": {"type": "custom"},
+  "source": {"type": "webhook"},
   "target": {"kind": "turn", "botId": "local_riff"},
   "envelope": {"format": "text", "sourceName": "my-runner", "trusted": false},
   "instruction": "Run the tests and report results",

@@ -23,6 +23,7 @@ import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
 import type { FsPolicy } from '../src/adapters/cli/fs-policy.js';
 import {
   GIT_ASKPASS_BASENAME,
+  bytedcliTurnHome,
   canonicalPathNearest,
   prepareTriggerUserCliEnv,
   publishActiveTurn,
@@ -31,6 +32,7 @@ import {
   writeSessionIdentity,
 } from '../src/core/cli-identity.js';
 import { prepareLarkToolEnv } from '../src/core/lark-tool-binding.js';
+import { ensureSessionTempDir } from '../src/core/session-temp.js';
 
 const SESSION = 'sess-symlink-home';
 const HOST = 'code.example.test';
@@ -317,6 +319,55 @@ describe.skipIf(!canRunBwrap)('identity helper inside a bwrap root that only mou
     expect(fixed.out.stderr).toBe('');
     expect(fixed.out.status).toBe(0);
     expect(fixed.out.stdout).toBe(`lark-runner --binding ${env.BOTMUX_LARK_TOOL_BINDING} -- --version\n`);
+  });
+
+  it('bytedcli writes into the per-person HOME on the host, not into the sandbox tmpfs', () => {
+    // The daemon and worker see HOME through the alias, as on such a host.
+    const previousHome = process.env.HOME;
+    process.env.HOME = layout.alias;
+    try {
+      const env = prepare(true);
+      const scratch = ensureSessionTempDir(layout.canonicalDataDir, SESSION);
+      // Real bytedcli writes `$HOME/.local/share/bytedcli/...` even on injected JWTs.
+      writeFileSync(join(layout.stubBin, 'bytedcli'), [
+        '#!/bin/sh',
+        'mkdir -p "$HOME/.local/share/bytedcli/data" || exit 9',
+        'echo me > "$HOME/.local/share/bytedcli/data/userinfo.json" || exit 9',
+        'printf "%s" "$HOME"',
+        '',
+      ].join('\n'), { mode: 0o755 });
+      writeSessionIdentity(layout.canonicalDataDir, SESSION,
+        { tool: 'bytedcli', cloudJwt: 'user-jwt', openId: 'ou_alice', turnId: 't1' }, 'single');
+      publishActiveTurn(layout.canonicalDataDir, SESSION, 't1');
+      const home = bytedcliTurnHome(layout.canonicalDataDir, SESSION, { openId: 'ou_alice' });
+      expect(home.startsWith(`${realpathSync(scratch)}/`)).toBe(true);
+
+      const policy = policyFor(env);
+      // The worker binds the session scratch read-write, by canonical path.
+      policy.rules.push({ path: realpathSync(scratch), access: 'readWrite', source: 'internal' });
+      mkdirSync(join(layout.root, 'work'), { recursive: true });
+      const plan = prepareDirectSandbox({
+        sessionId: SESSION, dataDir: layout.lexicalDataDir, policy, chdir: join(layout.root, 'work'),
+        home: layout.home, cliBin: '/bin/sh',
+        cliArgs: ['-c', `export BOTMUX_SESSION_ID=${SESSION}; "${env.BOTMUX_IDENTITY_BIN}/bytedcli" auth userinfo`],
+      });
+      expect(plan).not.toBeNull();
+      let out;
+      try {
+        out = spawnSync(plan!.bin, plan!.args, { env: { ...process.env, ...plan!.env, ...env }, encoding: 'utf8' });
+      } finally {
+        plan!.cleanup();
+        const empty = join(layout.canonicalDataDir, 'sandboxes', SESSION, 'empties');
+        if (existsSync(empty)) { try { chmodSync(empty, 0o700); } catch { /* best effort */ } }
+      }
+      expect(out.stderr).toBe('');
+      expect(out.status).toBe(0);
+      expect(out.stdout).toBe(home);
+      // Visible on the host: the write landed in the bound scratch.
+      expect(readFileSync(join(home, '.local/share/bytedcli/data/userinfo.json'), 'utf8')).toBe('me\n');
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    }
   });
 
   it('does not widen the readable set: the home root and ssh key stay invisible', () => {

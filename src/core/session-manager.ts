@@ -16,8 +16,7 @@ import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
-import * as scheduleStore from '../services/schedule-store.js';
-import { scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
+import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -4583,7 +4582,9 @@ export async function executeScheduledTask(
         activeSessions,
         sessionKey(`schedule-task:${task.id}`, larkAppId),
         async () => {
-          const existingRoot = scheduleStore.getTask(task.id, larkAppId)?.rootMessageId?.trim();
+          // Authority, not schedules.json: a sandboxed agent can write a root
+          // into the projection and steer this fire into a topic of its choosing.
+          const existingRoot = getRuntimeTask(task.id, larkAppId)?.rootMessageId?.trim();
           if (existingRoot) {
             return { anchor: existingRoot, rootMessageId: existingRoot, isContinuation: true };
           }
@@ -4786,7 +4787,7 @@ export async function executeScheduledTask(
       // materialization would overwrite the task root and split the task's
       // history. Lock order stays virtual→real, identical to the promotion
       // helper, so no lock-order inversion is possible.
-      const promotedRoot = scheduleStore.getTask(task.id, larkAppId)?.rootMessageId?.trim();
+      const promotedRoot = getRuntimeTask(task.id, larkAppId)?.rootMessageId?.trim();
       if (promotedRoot) {
         logger.info(
           `[scheduler] Task "${task.name}" (${task.id}) first fire raced topic materialization; `

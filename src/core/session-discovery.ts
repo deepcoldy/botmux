@@ -488,13 +488,24 @@ export function readProcessStartTime(pid: number): number | undefined {
  * 低频操作（只在用户 /adopt 时跑一遍）。
  */
 export function getChildPids(pid: number): number[] {
+  return snapshotChildPids()(pid);
+}
+
+/**
+ * Read the process table ONCE and answer "children of pid" from that copy.
+ * A BFS over a deep launch chain (sandbox launchers stack 7+ levels) calling
+ * {@link getChildPids} per node would fork `ps` once per visited process on
+ * every retry tick; a snapshot keeps it at one fork per walk. An unreadable
+ * table yields no children (same as getChildPids' failure mode).
+ */
+export function snapshotChildPids(): (pid: number) => number[] {
+  const byParent = new Map<number, number[]>();
   try {
     const out = execSync('ps -A -o pid= -o ppid=', {
       encoding: 'utf-8',
       maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const children: number[] = [];
     for (const line of out.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -502,14 +513,15 @@ export function getChildPids(pid: number): number[] {
       if (parts.length < 2) continue;
       const childPid = Number(parts[0]);
       const parentPid = Number(parts[1]);
-      if (!isNaN(childPid) && !isNaN(parentPid) && parentPid === pid) {
-        children.push(childPid);
-      }
+      if (isNaN(childPid) || isNaN(parentPid)) continue;
+      const siblings = byParent.get(parentPid);
+      if (siblings) siblings.push(childPid);
+      else byParent.set(parentPid, [childPid]);
     }
-    return children;
   } catch {
-    return [];
+    // ps unavailable: every lookup answers "no children".
   }
+  return pid => [...(byParent.get(pid) ?? [])];
 }
 
 /**

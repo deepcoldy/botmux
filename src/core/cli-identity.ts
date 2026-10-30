@@ -43,6 +43,7 @@ import { resolveEntrySpawn } from './self-spawn.js';
 import type { IdentityStorageModel } from './lark-tool-binding.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { isUsableOpenId } from '../utils/user-token.js';
+import { sessionTempDir } from './session-temp.js';
 
 export type { IdentityStorageModel };
 
@@ -527,6 +528,15 @@ export interface BytedCliIdentity extends TurnBound {
   codeJwt?: string;
   /** See {@link LarkCliIdentity.openId}. */
   openId?: string;
+  /**
+   * HOME the wrapper gives this one bytedcli exec. bytedcli keeps its state
+   * under `$HOME/.local/share/bytedcli` even when it runs on injected JWTs
+   * (measured on 0.76.0: `userinfo.json` with the acting person's profile,
+   * per-person Codebase repo caches, command traces). Left on the machine HOME
+   * those land in a directory every person's turns share. Filled in by
+   * {@link writeSessionIdentity}; see {@link bytedcliTurnHome}.
+   */
+  home?: string;
 }
 
 /**
@@ -636,6 +646,9 @@ export function renderIdentityEnv(identity: CliIdentity): string {
   } else {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    // Same variable the lark-cli device-code identity uses: the wrapper scopes
+    // HOME to this exec only (see renderIdentityWrapper).
+    if (identity.home) pairs.push([HOME_VAR, identity.home]);
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
   if ('openId' in identity && identity.openId) pairs.push([OPEN_ID_VAR, identity.openId]);
@@ -655,6 +668,50 @@ function shellSingleQuoteMultiline(value: string): string {
 }
 
 /**
+ * Per-person bytedcli HOME for one session: `<session temp>/identity-home/
+ * bytedcli/<hash>`. The session temp dir is already the CLI's writable scratch
+ * and is removed when the session closes, so nothing outlives the session and
+ * no long-lived login is exposed — the daemon-side `bytedcli-home/<open_id>`
+ * holding the person's login stays where the sandbox cannot see it.
+ *
+ * Named by realpath: a sandbox binds the scratch by its canonical path and
+ * does not recreate a symlinked home (`/home/u` -> `/data00/home/u`). A lexical
+ * path there resolves into the sandbox's private tmpfs root, where `mkdir -p`
+ * succeeds and every write silently vanishes with the namespace. Outside a
+ * sandbox the canonical form names the same directory.
+ *
+ * What the per-person split is, and is not: it decides which directory one
+ * exec writes into and lets the session's cleanup take it all away. It is NOT
+ * a boundary between people within a session — the directories share the
+ * session's uid and the CLI can read and write the whole scratch. Keep
+ * long-lived or secret credentials out of it.
+ *
+ * Without an open_id (not expected for a granted identity) the session itself
+ * keys the directory, so it stays one stable directory instead of one per turn.
+ * Such a directory name no longer says whose it is; that is intended for a
+ * fallback that cannot tell people apart anyway, not a bug to "fix" back.
+ *
+ * Both publication paths (writeSessionIdentity and refreshSessionIdentity,
+ * which re-enters it) compute the path here, so they always agree.
+ */
+export function bytedcliTurnHome(
+  sessionDataDir: string,
+  sessionId: string,
+  identity: Pick<BytedCliIdentity, 'openId'>,
+): string {
+  const key = identity.openId ? `open_id:${identity.openId}` : `session:${sessionId}`;
+  const digest = createHash('sha256').update(key).digest('hex').slice(0, 16);
+  return canonicalPathNearest(join(sessionTempDir(sessionDataDir, sessionId), 'identity-home', 'bytedcli', digest));
+}
+
+/** Path only: the wrapper creates the directory at exec time, inside the
+ *  session scratch the worker has already created and the sandbox binds. */
+function withBytedcliHome(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
+  if (identity.tool !== 'bytedcli' || 'mode' in identity || identity.home) return identity;
+  return { ...identity, home: bytedcliTurnHome(sessionDataDir, sessionId, identity) };
+}
+
+/**
  * Publish the identity in force for a turn.
  *
  * In the proven model the rendered env body stays in daemon memory (see
@@ -670,9 +727,10 @@ function shellSingleQuoteMultiline(value: string): string {
 export function writeSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
-  identity: CliIdentity,
+  published: CliIdentity,
   model: IdentityStorageModel,
 ): string {
+  const identity = withBytedcliHome(sessionDataDir, sessionId, published);
   const body = renderIdentityEnv(identity);
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
   if (model === 'proven') {
@@ -968,6 +1026,9 @@ export function renderIdentityWrapper(
     // daemon-provided identity when it carries them.
     `${TURN_VAR}=`,
     `${OPEN_ID_VAR}=`,
+    // Same for the per-exec HOME: an inherited value must not redirect an
+    // identity that does not carry one.
+    `${HOME_VAR}=`,
     '__botmux_live=',
     '__botmux_live_caller=',
     ...resolveBlock,
@@ -1004,6 +1065,21 @@ export function renderIdentityWrapper(
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     'esac',
+    // A person-scoped HOME published with a user identity (bytedcli): scoped to
+    // this exec exactly like the user-home branch, so the parent shell and
+    // every other tool keep the machine HOME. Created here, on first use: the
+    // daemon publishes only the path. An unset value means the identity
+    // carries no HOME and the machine HOME is kept.
+    `if [ -n "$${HOME_VAR}" ]; then`,
+    `  __botmux_home=$${HOME_VAR}`,
+    '  mkdir -p -m 700 "$__botmux_home" 2>/dev/null || true',
+    '  if [ ! -d "$__botmux_home" ]; then',
+    `    printf '%s\\n' 'botmux: ${tool} 的按人目录无法创建，命令未执行。' >&2`,
+    `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '  fi',
+    `  unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}`,
+    `  HOME="$__botmux_home" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
+    'fi',
     `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',

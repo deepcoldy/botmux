@@ -41,9 +41,9 @@ describe('publish-gh-pages.sh', () => {
     return { remote, site };
   }
 
-  const publish = (remote: string, site: string, target: string) =>
+  const publish = (remote: string, site: string, target: string, extraEnv: Record<string, string> = {}) =>
     execFileSync('bash', [SCRIPT, site, target, `publish ${target}`], {
-      env: { ...ENV, PAGES_REMOTE: remote },
+      env: { ...ENV, PAGES_REMOTE: remote, ...extraEnv },
       encoding: 'utf8',
     });
 
@@ -64,6 +64,17 @@ describe('publish-gh-pages.sh', () => {
     const before = git(root!, 'ls-remote', remote, 'refs/heads/gh-pages');
     expect(publish(remote, site, 'botmux-midscene/pr-2')).toContain('Nothing changed');
     expect(git(root!, 'ls-remote', remote, 'refs/heads/gh-pages')).toBe(before);
+  });
+
+  it('keeps only the newest per-run directories with the prefix and leaves the rest alone', () => {
+    const { remote, site } = setup();
+    const keep = { PAGES_KEEP_PREFIX: 'master-run-', PAGES_KEEP: '2' };
+    // 9 < 10 < 100 numerically, but not as plain strings.
+    for (const id of ['100', '9', '10']) publish(remote, site, `botmux-midscene/master-run-${id}`, keep);
+    const check = join(root!, 'check');
+    git(root!, 'clone', '-q', '--branch', 'gh-pages', remote, check);
+    const listed = git(check, 'ls-tree', '--name-only', 'HEAD', 'botmux-midscene/').split('\n').sort();
+    expect(listed).toEqual(['botmux-midscene/master-run-10', 'botmux-midscene/master-run-100', 'botmux-midscene/pr-1']);
   });
 
   it('refuses target paths outside the branch', () => {

@@ -59,8 +59,15 @@ try {
   const page = await browser.newPage({ viewport: { width: 1100, height: 900 } });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  // 群管理抽屉按 bot 分栏：先切到「机器人设置」并选中 bot，它的设置块才可见。
+  const openBot = async id => {
+    await page.locator('#g-manage-tab-bots').click();
+    await page.locator(`.g-bot-picker-rail [data-bot="${id}"]`).click();
+  };
+  const pane = id => page.locator(`.g-bot-settings[data-bot="${id}"]`);
   await page.goto(`http://127.0.0.1:${server.address().port}`);
-  const card = page.locator('[data-group-idle-close]');
+  const card = pane('app-a').locator('[data-group-idle-close]');
+  await openBot('app-a');
   await card.waitFor();
   const row = card.locator('form').first();
   const number = row.getByRole('spinbutton');
@@ -69,7 +76,7 @@ try {
   const save = row.getByRole('button', { name: '保存', exact: true });
   assert.equal(await toggle.isChecked(), false);
   assert.equal(await number.isDisabled(), true);
-  assert.equal(await card.evaluate(node => node.nextElementSibling.querySelector('legend').textContent), '新话题默认模型');
+  assert.equal(await card.evaluate(node => node.nextElementSibling.querySelector('header strong').textContent), '运行过程卡片');
   await row.locator('.toggle-row').click();
   await number.fill('1.5');
   assert.equal(await number.inputValue(), '1');
@@ -86,11 +93,14 @@ try {
     path: '/api/groups/oc_demo/idle-close/app-a', settings: { enabled: true, duration: 12, unit: 'hours' },
   });
   await page.reload();
+  await openBot('app-a');
   await card.waitFor();
   assert.equal(await toggle.isChecked(), true);
   assert.equal(await number.inputValue(), '12');
   assert.equal(await unit.inputValue(), 'hours');
-  assert.equal(await card.locator('form').nth(1).getByRole('switch').isChecked(), false);
+  await openBot('app-b');
+  assert.equal(await pane('app-b').locator('[data-group-idle-close] form').getByRole('switch').isChecked(), false);
+  await openBot('app-a');
   await card.evaluate(node => node.scrollIntoView({ block: 'start' }));
   await page.screenshot({ path: join(output, 'desktop.png') });
   await page.setViewportSize({ width: 390, height: 844 });

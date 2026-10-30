@@ -17,6 +17,8 @@ import {
   buildOpenAiTextEvents,
   streamOpenAiEvents,
 } from './openai-sse.js';
+import { pickShellTool } from './shell-tool.js';
+import { buildGeminiResponse, geminiMessages, isGeminiToolResult, streamGeminiEvents } from './gemini-sse.js';
 import {
   buildOpenAiResponsesTextEvents,
   streamResponsesEvents,
@@ -160,6 +162,13 @@ export class MockLlmServer {
     }
 
     // Synthetic Mock mode (default or replay fall-through)
+    // Gemini: /v1beta/models/<model>:streamGenerateContent?alt=sse and :generateContent.
+    const gemini = /:(streamGenerateContent|generateContent)$/.exec(pathname);
+    if (gemini) {
+      await this.handleGemini(body, res, gemini[1] === 'streamGenerateContent');
+      return;
+    }
+
     if (pathname.includes('/messages')) {
       await this.handleAnthropicMessages(body, res);
       return;
@@ -238,20 +247,13 @@ export class MockLlmServer {
       return;
     }
 
-    // Find bash tool name from client tools definition
-    let toolName = 'Bash';
-    if (Array.isArray(body?.tools)) {
-      const bashTool = body.tools.find((t: any) => typeof t?.name === 'string' && /bash/i.test(t.name));
-      if (bashTool) toolName = bashTool.name;
-    }
-
-    // Phase 1: Call Bash tool to send botmux reply
+    // Phase 1: Call the shell tool to send botmux reply. A request whose
+    // tools hold no shell (a title call) gets plain text.
+    const tool = pickShellTool(body?.tools, 'Bash');
     const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
-    const events = buildAnthropicToolUseEvents({
-      model,
-      toolName,
-      command: cmd,
-    });
+    const events = tool
+      ? buildAnthropicToolUseEvents({ model, toolName: tool.name, command: cmd, input: tool.args(cmd) })
+      : buildAnthropicTextEvents({ model, text: marker });
     await streamSseEvents(res, events, this.config.chunkDelayMs);
   }
 
@@ -271,12 +273,35 @@ export class MockLlmServer {
       return;
     }
 
+    const tool = pickShellTool(body?.tools, 'bash');
     const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
-    const events = buildOpenAiToolCallEvents({
-      model: body?.model,
-      command: cmd,
-    });
+    const events = tool
+      ? buildOpenAiToolCallEvents({ model: body?.model, command: cmd, functionName: tool.name, args: tool.args(cmd) })
+      : buildOpenAiTextEvents({ model: body?.model, text: marker });
     await streamOpenAiEvents(res, events, this.config.chunkDelayMs);
+  }
+
+  private async handleGemini(body: any, res: ServerResponse, stream: boolean): Promise<void> {
+    const messages = geminiMessages(body?.contents);
+    const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
+    this.recordedMarkers.add(marker);
+    const tool = pickShellTool(body?.tools, 'run_shell_command');
+    let response;
+    if (body?.generationConfig?.responseJsonSchema || body?.generationConfig?.responseSchema) {
+      // Gemini CLI's model router asks for a JSON verdict; any valid one will do.
+      response = buildGeminiResponse({ text: JSON.stringify({ complexity_reasoning: 'mock', complexity_score: 1 }) });
+    } else if (isGeminiToolResult(body?.contents) || !tool) {
+      response = buildGeminiResponse({ text: '已成功调用 botmux send 回复消息，本轮自动化测试结束。' });
+    } else {
+      const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+      response = buildGeminiResponse({ functionCall: { name: tool.name, args: tool.args(cmd) } });
+    }
+    if (stream) {
+      await streamGeminiEvents(res, [response], this.config.chunkDelayMs);
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(response));
+    }
   }
 
   private async readBodyJson(req: IncomingMessage): Promise<any> {

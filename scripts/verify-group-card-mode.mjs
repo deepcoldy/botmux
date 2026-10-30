@@ -68,12 +68,19 @@ try {
   const page = await browser.newPage({ viewport: { width: 1100, height: 900 } });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  // 群管理抽屉按 bot 分栏：先切到「机器人设置」并选中 bot，它的设置块才可见。
+  const openBot = async id => {
+    await page.locator('#g-manage-tab-bots').click();
+    await page.locator(`.g-bot-picker-rail [data-bot="${id}"]`).click();
+  };
+  const pane = id => page.locator(`.g-bot-settings[data-bot="${id}"]`);
   await page.goto(`http://127.0.0.1:${server.address().port}`);
-  const section = page.locator('[data-group-card-mode]');
-  await section.waitFor();
-  assert.equal(await section.locator('legend').textContent(), '运行过程卡片');
-  assert.equal(await section.evaluate(node => node.nextElementSibling.querySelector('legend').textContent), '实时卡片置顶');
-  const row = id => section.locator(`[data-bot="${id}"]`);
+  const section = id => pane(id).locator('[data-group-card-mode]');
+  await openBot('app-a');
+  await section('app-a').waitFor();
+  assert.equal(await section('app-a').locator('header strong').textContent(), '运行过程卡片');
+  assert.equal(await section('app-a').evaluate(node => node.nextElementSibling.querySelector('header strong').textContent), '实时卡片置顶');
+  const row = id => section(id).locator(`[data-bot="${id}"]`);
   const state = id => row(id).locator('[data-card-mode-state]').getAttribute('data-card-mode-state');
   assert.equal(await state('app-a'), 'inherit-on');
   assert.equal(await state('app-b'), 'chat-off');
@@ -87,19 +94,24 @@ try {
   });
   assert.equal(await state('app-a'), 'chat-off');
   // Re-enable app-b (== /card on → inherit the bot).
+  await openBot('app-b');
   await row('app-b').locator('.toggle-row').click();
   await row('app-b').getByRole('status').filter({ hasText: '已保存' }).waitFor();
   assert.equal(await state('app-b'), 'inherit-on');
 
   await page.reload();
-  await section.waitFor();
+  await openBot('app-a');
+  await section('app-a').waitFor();
   assert.equal(await row('app-a').getByRole('switch').isChecked(), false);
+  await openBot('app-b');
   assert.equal(await row('app-b').getByRole('switch').isChecked(), true);
+  await openBot('app-c');
   assert.equal(await row('app-c').getByRole('switch').isChecked(), true);
-  await section.evaluate(node => node.scrollIntoView({ block: 'start' }));
+  await openBot('app-a');
+  await section('app-a').evaluate(node => node.scrollIntoView({ block: 'start' }));
   await page.screenshot({ path: join(output, 'desktop.png') });
   await page.setViewportSize({ width: 390, height: 844 });
-  await section.evaluate(node => node.scrollIntoView({ block: 'start' }));
+  await section('app-a').evaluate(node => node.scrollIntoView({ block: 'start' }));
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   await page.screenshot({ path: join(output, 'mobile.png') });
 
@@ -109,7 +121,7 @@ try {
   await row('app-a').getByRole('status').filter({ hasText: '模拟保存失败' }).waitFor();
   assert.equal(await row('app-a').getByRole('switch').isChecked(), false);
   assert.deepEqual(errors, []);
-  console.log('通过：区块位置、继承开/本群关/Bot 级关三态展示、关闭与恢复写入、刷新回显、保存失败回滚、手机无横向溢出。');
+  console.log('通过：bot 设置内区块位置、继承开/本群关/Bot 级关三态展示、关闭与恢复写入、刷新回显、保存失败回滚、手机无横向溢出。');
 } finally {
   await browser?.close();
   server.closeAllConnections();

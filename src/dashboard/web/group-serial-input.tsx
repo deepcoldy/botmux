@@ -5,6 +5,8 @@ type Props = {
   chatId: string;
   appId: string;
   botName: string;
+  /** 可见标题；按 bot 分栏展示时传设置名，缺省显示 botName。 */
+  label?: string;
   enabled: boolean;
   disabled?: boolean;
   onSaved(): Promise<unknown>;
@@ -38,7 +40,7 @@ export function GroupSerialInputRow(props: Props) {
   }
   return <div className="group-serial-input-row">
     <label><input type="checkbox" checked={enabled} disabled={props.disabled || saving}
-      onChange={event => { void save(event.target.checked); }} /> {props.botName}</label>
+      onChange={event => { void save(event.target.checked); }} /> {props.label ?? props.botName}</label>
     <small role="status">{status}</small>
   </div>;
 }

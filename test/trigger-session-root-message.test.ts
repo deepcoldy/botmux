@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { resolveTurnOrigin } from '../src/core/turn-origin.js';
 
 const mockGetMessageChatId = vi.fn();
 const mockGetChatMode = vi.fn(async () => 'topic');
@@ -235,6 +236,14 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+  });
+
+  it('registers the minted turn as a trigger turn of its connector kind (execution current origin)', async () => {
+    const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
+    const triggerId = (res as { triggerId?: string }).triggerId!;
+    expect(triggerId).toMatch(/^trg_/);
+    expect(resolveTurnOrigin({ session: {} } as any, triggerId)).toEqual({ origin: 'trigger', triggerSource: 'webhook' });
+    expect(resolveTurnOrigin({ session: {} } as any, 'trg_never_admitted')).toEqual({ origin: 'unknown' });
   });
 
   it('keeps the localized topic seed by default', () => {

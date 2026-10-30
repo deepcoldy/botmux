@@ -12,7 +12,9 @@
  *
  * What this module authenticates:
  *   1. The turn id is a well-formed scheduled turn.
- *   2. The task still exists and carries a creator (ownerOpenId). An enabled
+ *   2. The task still exists and carries a creator (ownerOpenId). The daemon
+ *      reads it from the host authority store; the CLI-side resolver can only
+ *      read the schedules.json projection and is a preflight, not a boundary. An enabled
  *      task is accepted directly. A one-shot that the scheduler auto-disabled
  *      after dispatch is accepted only while the daemon independently proves
  *      this exact turn is still live. Manual/legacy disables stay denied.
@@ -110,9 +112,12 @@ export function trustedCallerForScheduledTask(
 /**
  * Read a task straight from the per-bot schedules.json
  * (`<botmuxHome>/bots/<appId>/schedules.json`). Read-only, no global store
- * state — safe inside the sandboxed CLI (the file lives under the bot's own
- * home dir, same as `botmux schedule list`) and in tests (takes the dataDir
- * explicitly instead of the global config).
+ * state — usable inside the sandboxed CLI (the file lives under the bot's own
+ * home dir, same as `botmux schedule list`).
+ *
+ * That same property is why the daemon must not use it: the file is a
+ * projection of the host authority store, and a sandboxed CLI can rewrite it.
+ * Daemon-side identity decisions read readScheduledTaskFromAuthority instead.
  */
 export function readScheduledTaskForProvenance(
   dataDir: string,
@@ -129,6 +134,36 @@ export function readScheduledTaskForProvenance(
   } catch {
     // Corrupt/unreadable schedules.json must not grant an exemption — the
     // caller falls back to the ordinary (failing) human-turn checks.
+    return undefined;
+  }
+}
+
+/** Minimal read view of the host-only schedule authority store. */
+export interface ScheduleAuthorityReader {
+  getRecord(appId: string, taskId: string): { state: string; task: ScheduledTask } | undefined;
+}
+
+/**
+ * Read a task from the host-only authority store for an identity decision
+ * (who a scheduled turn runs as, which chat it is bound to).
+ *
+ * Deliberately has NO schedules.json fallback: that file is a projection the
+ * daemon rewrites from the authority store, and it lives in BOT_HOME, which a
+ * sandboxed CLI can write. A missing store, an unreadable row or a revoked
+ * task yields undefined — the same fail-closed outcome as a deleted task.
+ * Paused/completed rows are returned as-is; callers judge `enabled` exactly
+ * like they judged the projection row.
+ */
+export function readScheduledTaskFromAuthority(
+  store: ScheduleAuthorityReader | null | undefined,
+  larkAppId: string,
+  taskId: string,
+): ScheduledTask | undefined {
+  if (!store) return undefined;
+  try {
+    const record = store.getRecord(larkAppId, taskId);
+    return record && record.state !== 'revoked' ? record.task : undefined;
+  } catch {
     return undefined;
   }
 }
@@ -154,18 +189,26 @@ export interface ScheduledTurnAuth {
  */
 export function authorizeScheduledTurn(input: {
   turnId: string;
-  dataDir: string;
   sessionLarkAppId: string;
   sessionChatId: string;
   isOwnerAllowed: (larkAppId: string, ownerOpenId: string) => boolean;
   /** Daemon-owned exact-turn liveness. Omit on paths that cannot prove it. */
   isScheduledTurnLive?: (turnId: string) => boolean;
-}): ScheduledTurnAuth | { error: ScheduledTurnAuthError } {
+} & (
+  /** Daemon callers: read the task from the host authority store. */
+  | { loadTask: (larkAppId: string, taskId: string) => ScheduledTask | undefined; dataDir?: never }
+  /** CLI-side preflight only: the per-bot schedules.json projection. Inside a
+   *  sandbox that file is agent-writable, so a result read this way must never
+   *  be the last check before a daemon-side effect. */
+  | { dataDir: string; loadTask?: never }
+)): ScheduledTurnAuth | { error: ScheduledTurnAuthError } {
   const taskId = parseScheduledTurnId(input.turnId);
   if (!taskId) return { error: 'task_not_found' };
   if (!input.sessionLarkAppId || !input.sessionChatId) return { error: 'binding_mismatch' };
 
-  const task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
+  const task = input.loadTask
+    ? input.loadTask(input.sessionLarkAppId, taskId)
+    : readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
   if (task.enabled === false) {
     // A one-shot that ran, or an until-done task closed by its own run, keeps

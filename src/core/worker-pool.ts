@@ -740,6 +740,7 @@ import type {
   DaemonToWorker,
   ModelFallbackState,
   TrustedCaller,
+  ScheduledTask,
   WorkerToDaemon,
   Session,
   DisplayMode,
@@ -804,7 +805,6 @@ import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTur
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
-  readScheduledTaskForProvenance,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
 import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
@@ -1073,6 +1073,10 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** A scheduled task as the host authority store holds it, for deciding who a
+   *  scheduled turn runs as. Never backed by schedules.json (agent-writable
+   *  inside a sandbox). Absent or undefined → the turn carries no identity. */
+  loadScheduledTaskForIdentity?: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
   /** Connector-owned live card for a handoff whose exact input has started. */
   onTriggerTurnStarted?: (ds: DaemonSession, title: string, turnId: string) => void;
   /** Close a stale session (message withdrawn, etc.). `false` means the
@@ -2161,13 +2165,15 @@ function isOrdinaryRecoveryTurnId(turnId: string | undefined): turnId is string 
 
 /** The identity a scheduled continuation runs as — the task creator, exactly as
  *  the original fire resolved it (see trustedCallerForScheduledTask). Reads the
- *  task back from the bot's schedules store; a deleted task yields no identity,
- *  which is the same fail-closed outcome the fire path has. */
+ *  task back from the host authority store, never from schedules.json (a
+ *  sandboxed CLI can rewrite that projection to borrow someone else's
+ *  identity); a deleted task yields no identity, which is the same
+ *  fail-closed outcome the fire path has. */
 function scheduledContinuationTrustedCaller(
   ds: DaemonSession,
   taskId: string,
 ): TrustedCaller | undefined {
-  const task = readScheduledTaskForProvenance(config.session.dataDir, ds.larkAppId, taskId);
+  const task = callbacks?.loadScheduledTaskForIdentity?.(ds.larkAppId, taskId);
   return task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
 }
 
@@ -12951,9 +12957,7 @@ function rememberScheduledTurnCaller(
   if (!turnId || !caller || caller.source !== 'schedule_creator') return;
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId || caller.taskId !== taskId) return;
-  const task = readScheduledTaskForProvenance(
-    config.session.dataDir, ds.larkAppId, taskId,
-  );
+  const task = callbacks?.loadScheduledTaskForIdentity?.(ds.larkAppId, taskId);
   const expected = task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
   if (!expected
     || expected.requestLarkAppId !== ds.larkAppId

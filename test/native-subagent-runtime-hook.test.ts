@@ -262,18 +262,16 @@ describe('native-subagent-runtime-hook CLI', () => {
     expect(capturedRequests).toHaveLength(0);
   });
 
-  it('is a no-op for malformed or oversized stdin', async () => {
-    for (const input of [
-      '{bad json',
-      JSON.stringify({ ...spawnPayload, padding: 'secret-never-echo'.repeat(100_000) }),
-    ]) {
-      const result = await runHook(input, { startServer: false });
-      expect(result.timedOut).toBe(false);
-      expect(result.status).toBe(0);
-      expect(result.stdout).toBe('');
-      expect(result.stderr.length).toBeLessThanOrEqual(1024);
-      expect(result.stderr).not.toContain('secret-never-echo');
-    }
+  it.each([
+    ['malformed', '{bad json'],
+    ['oversized', JSON.stringify({ ...spawnPayload, padding: 'secret-never-echo'.repeat(100_000) })],
+  ])('is a no-op for %s stdin', async (_kind, input) => {
+    const result = await runHook(input, { startServer: false });
+    expect(result.timedOut).toBe(false);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr.length).toBeLessThanOrEqual(1024);
+    expect(result.stderr).not.toContain('secret-never-echo');
   });
 
   it('stops reading oversized stdin without waiting for EOF', async () => {
