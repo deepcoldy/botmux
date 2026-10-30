@@ -44,13 +44,25 @@ describe('per-question custom form', () => {
     const { ask } = await start();
     const form = descendants(JSON.parse(buildAskCard(ask))).find(n => n.tag === 'form');
     const rows = form.elements.filter((n: any) => n.tag === 'column_set');
-    expect(rows).toHaveLength(6);
-    expect(rows.slice(0, 2).map((row: any) => row.columns[0].elements[0].text.content)).toEqual(['◉ A', '○ B']);
-    expect(rows[2].columns).toHaveLength(2);
-    expect(rows[2].columns[0].elements[0].text.content).toContain('○');
-    expect(rows[2].columns[0].elements[0].value.custom_choice).toBe('true');
-    expect(rows[2].columns[1].elements[0]).toMatchObject({ tag: 'input', name: 'custom_0' });
-    expect(rows[2].columns[1].elements[0].input_type).not.toBe('multiline_text');
+    expect(rows).toHaveLength(4);
+    expect(rows[0].columns[0].elements.map((button: any) => button.text.content)).toEqual(['◉ A', '○ B']);
+    expect(rows[1].columns).toHaveLength(2);
+    expect(rows[1].columns[0].elements[0].text.content).toContain('○');
+    expect(rows[1].columns[0].elements[0].value.custom_choice).toBe('true');
+    expect(rows[1].columns[1].elements[0]).toMatchObject({ tag: 'input', name: 'custom_0' });
+    expect(rows[1].columns[1].elements[0].input_type).not.toBe('multiline_text');
+  });
+
+  it('keeps eleven questions with 42 options within the verified card element budget', async () => {
+    const counts = [3, 4, 4, 4, 4, 4, 4, 4, 3, 4, 4];
+    const qs = counts.map((count, i) => ({ prompt: `问题 ${i + 1}`, multiSelect: false,
+      options: Array.from({ length: count }, (_, j) => ({ key: `k${j}`, label: `选项${j}` })) }));
+    const { ask } = await start({ questions: qs });
+    const card = JSON.parse(buildAskCard(ask));
+    const nodes = descendants(card);
+    expect(nodes.filter(n => n.tag === 'button')).toHaveLength(42 + 11 + 1);
+    expect(nodes.filter(n => n.tag === 'input')).toHaveLength(11);
+    expect(nodes.filter(n => typeof n.tag === 'string')).toHaveLength(199);
   });
 
   it('selects other, persists its empty state, requires text and submits the custom answer', async () => {

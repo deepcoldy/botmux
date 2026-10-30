@@ -19,8 +19,10 @@ export function buildAskCustomForm(ask: PendingAsk, locale: Locale, confirmEmpty
     const mark = (on: boolean) => q.multiSelect ? (on ? '☑' : '☐') : (on ? '◉' : '○');
     const buttons = q.options.map((o, j) => button(`${mark(selected.has(o.key))} ${o.label}`,
       `option_${i}_${j}`, { action: 'ask_toggle', question_index: String(i), key: o.key }, selected.has(o.key) ? 'primary' : 'default'));
-    for (const b of buttons) elements.push({ tag: 'column_set', flex_mode: 'none', columns: [
-      { tag: 'column', width: 'weighted', weight: 1, elements: [b] },
+    // A column stacks its children vertically. One container per question
+    // preserves one option per line without multiplying Feishu card elements.
+    if (buttons.length) elements.push({ tag: 'column_set', flex_mode: 'none', columns: [
+      { tag: 'column', width: 'weighted', weight: 1, elements: buttons },
     ] });
     if (q.allowCustom !== false) {
       const input = { tag: 'input', name: `custom_${i}`, width: 'fill',
@@ -35,7 +37,6 @@ export function buildAskCustomForm(ask: PendingAsk, locale: Locale, confirmEmpty
         { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [input] },
       ] });
     }
-    elements.push({ tag: 'hr' });
   });
   if (confirmEmpty) elements.push({ tag: 'markdown', content: t('card.ask.empty_warning', undefined, locale) });
   elements.push(button(t(confirmEmpty ? 'card.ask.submit_confirm_empty' : 'card.ask.submit', undefined, locale), 'submit_answers', {
