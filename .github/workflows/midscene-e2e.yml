@@ -256,7 +256,7 @@ jobs:
         # pinned: newer Kimi releases ask to trust the folder, and an unpinned
         # CLI auto-updating mid-run would change what is under test.
         run: |
-          npm install -g opencode-ai@1.19.3 @earendil-works/pi-coding-agent@1.3.0 @google/gemini-cli@0.65.0
+          npm install -g opencode-ai@1.19.3 @earendil-works/pi-coding-agent@1.3.0 @google/gemini-cli@0.66.0
           bun add -g @oh-my-pi/pi-coding-agent@18.10.1
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
           curl -fsSL https://code.kimi.com/kimi-code/install.sh | KIMI_VERSION=0.31.0 KIMI_NO_MODIFY_PATH=1 bash

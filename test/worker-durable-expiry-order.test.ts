@@ -119,6 +119,11 @@ describe('worker restart input fence', () => {
       process: { platform: process.platform, env: {} },
       submitFailureChains: { clear: vi.fn() },
       queuedActivationReceipts: { clear: vi.fn() },
+      // spawnCli's entry points the worker's TRAE readers at the bot's
+      // TRAE_HOME before any of the gates below run. It is a no-op for this
+      // non-traex assertion, but the real worker global must be present or the
+      // harness throws a TypeError before reaching the expected rejection.
+      followBotTraeHome: vi.fn(),
     };
     const spawn = loadWorkerFunction<(cfg: unknown) => Promise<void>>('spawnCli', scope);
 

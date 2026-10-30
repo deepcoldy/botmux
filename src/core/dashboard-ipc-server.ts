@@ -2,6 +2,7 @@ import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexPr
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
+import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexConfigPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
 import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
@@ -21,7 +22,7 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
@@ -94,6 +95,7 @@ import { createGroupWithBots, transferGroupOwner } from '../services/group-creat
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
+import { findForbiddenReadWritePaths } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
 import { setGroupIdleClose } from '../services/group-idle-close-store.js';
@@ -105,6 +107,7 @@ import { setGroupDefaultModels } from '../services/group-default-models-store.js
 import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
+import { probeScratchCapability } from '../adapters/backend/scratch-capability.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
@@ -8197,6 +8200,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     displayName = bot.config.displayName ?? null;
     larkBotName = bot.botName ?? null;
   } catch { /* none */ }
+  const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
@@ -8245,9 +8249,17 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
     scratchSupported: process.platform === 'linux' || process.platform === 'darwin',
+    // Read-only host probe (no mounts, no bwrap): what scratch storage can work
+    // on THIS daemon. Advice next to the choice; saving is never blocked on it.
+    scratchCapability: (() => { try { return probeScratchCapability(); } catch { return null; } })(),
     codexAuthSync,
     envPolicy: (() => { try { return getBot(cachedLarkAppId).config.envPolicy ?? { mode: 'inherit' }; } catch { return { mode: 'inherit' }; } })(),
-    sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
+    sandboxPaths: sandboxPathsForDashboard ?? null,
+    // Already-stored readWrite entries the save path would now refuse; the
+    // worker runs them as readOnly. Shown on the sandbox-paths section.
+    sandboxPathsForbiddenReadWrite: findForbiddenReadWritePaths(
+      sandboxPathsForDashboard?.readWrite,
+    ),
     sandboxNetworkPolicy: (() => { try { return getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null; } catch { return null; } })(),
     sandboxNetworkPolicyPlatform: process.platform,
     // Inputs for the policy editor's starting template and its proxy hint.
@@ -10053,6 +10065,41 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', requireBoundBot(async (req, res) => 
   jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
 }));
 
+// GET /api/bot-codex-config — where this bot's isolated Codex config.toml lives
+// (`<BOT_HOME>/codex/config.toml`, seeded ONCE from ~/.codex/config.toml by the
+// worker) and whether new sessions use it. Paths only, never file contents.
+ipcRoute('GET', '/api/bot-codex-config', requireBoundBot(async (_req, res) => {
+  let cfg;
+  try { cfg = getBot(cachedLarkAppId).config; } catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
+  const path = isolatedCodexConfigPath(config.session.dataDir, cachedLarkAppId);
+  const hostPath = hostCodexConfigPath();
+  jsonRes(res, 200, {
+    ok: true,
+    isolated: botUsesIsolatedCodexHome(cfg),
+    path,
+    exists: existsSync(path),
+    hostPath,
+    hostExists: existsSync(hostPath),
+  });
+}));
+
+// POST /api/bot-codex-config/resync — back the per-bot config.toml up to
+// `config.toml.bak-<timestamp>` and replace it with the host copy (both 0600).
+// Only for bots whose new sessions use the isolated CODEX_HOME; running
+// sessions keep the config their Codex already loaded.
+ipcRoute('POST', '/api/bot-codex-config/resync', requireBoundBot(async (_req, res) => {
+  let cfg;
+  try { cfg = getBot(cachedLarkAppId).config; } catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
+  if (!botUsesIsolatedCodexHome(cfg)) return jsonRes(res, 409, { ok: false, error: 'codex_home_not_isolated' });
+  try {
+    const result = resyncIsolatedCodexConfig({ botHome: botHomeForSessionDataDir(config.session.dataDir, cachedLarkAppId) });
+    if (!result.ok) return jsonRes(res, result.error === 'host_config_missing' ? 404 : 409, result);
+    jsonRes(res, 200, result);
+  } catch (error) {
+    jsonRes(res, 500, { ok: false, error: 'resync_failed', message: (error as Error).message });
+  }
+}));
+
 // PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
 // `{ triggerUserAuth: object | null }`：null → 清除（关闭）。
 //
@@ -10427,7 +10474,15 @@ ipcRoute('PUT', '/api/bot-sandbox-paths', requireBoundBot(async (req, res) => {
     readOnly: asList(body.readOnly),
     deny: asList(body.deny),
   });
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    // `reason` carries the human-readable text the dashboard shows verbatim.
+    return jsonRes(res, 400, {
+      ok: false,
+      error: r.reason,
+      ...(r.message ? { reason: r.message } : {}),
+      ...(r.forbiddenReadWrite ? { forbiddenReadWrite: r.forbiddenReadWrite } : {}),
+    });
+  }
   jsonRes(res, 200, { ok: true, sandboxPaths: r.sandboxPaths ?? null });
 }));
 

@@ -13,6 +13,15 @@ import { NetworkPolicySection, SandboxSection, networkPolicyTemplate, networkPol
 import { configErrorText } from '../src/dashboard/web/bot-defaults-save.js';
 import { t } from '../src/dashboard/web/ui.js';
 
+// 切沙盒模式现在先弹确认框（沙盒切换确认）。下面的用例既不渲染确认框也不去点它，
+// 而 confirm() 在无人 settle 时返回永不 resolve 的 Promise，会让 selectMode 卡在
+// await、PUT 发不出去。测试关心的是「确认之后策略拦截的报错」，故直接确认通过，
+// 与 dashboard-sandbox-hints-ui.test.ts 同一写法；产品行为（确认后仍看到拦截提示）不变。
+vi.mock('../src/dashboard/web/confirm-modal.js', async () => {
+  const actual = await vi.importActual<any>('../src/dashboard/web/confirm-modal.js');
+  return { ...actual, confirm: () => Promise.resolve(true) };
+});
+
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const SUPPORTED = { cliId: 'claude-code', sandboxNetworkPolicyPlatform: 'linux', backendType: 'pty', sandboxMode: 'oncall' as const, sandbox: true };

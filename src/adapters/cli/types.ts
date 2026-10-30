@@ -152,9 +152,25 @@ export interface WorkspaceTrustOutcome {
   reason?: string;
 }
 
+/** How the most recent buildArgs() adapted to the installed CLI, worth telling
+ *  the user once (they can fix it by upgrading). */
+export interface CliLaunchNotice {
+  kind: 'flag_needs_newer_cli';
+  /** The option left out of the launch. */
+  flag: string;
+  /** Installed version. */
+  version: string;
+  /** First version that accepts `flag`. */
+  minVersion: string;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
+
+  /** Notice for the launch the latest buildArgs() produced; undefined when the
+   *  launch is the adapter's normal one. */
+  launchNotice?(): CliLaunchNotice | undefined;
 
   /** Controls whether BotMux uses its routing/session XML envelope or the
    *  non-command service-user envelope. The latter preserves the original
