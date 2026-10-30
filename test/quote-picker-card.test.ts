@@ -76,6 +76,17 @@ describe('buildQuotePickerCard', () => {
     expect(allValues(card).every(v => v.exclude_ids === 'om_root,omt_here')).toBe(true);
   });
 
+  it('offers a clear-search button on no match that keeps the card state', () => {
+    const card = parse(buildQuotePickerCard(
+      entries, 'oc_1', 'om_root', 'ou_me', 'zh', { searchQuery: 'ja' }, 'qtok1', 'public', 'om_root',
+    ));
+    const clear = allValues(card).filter(v => v.action === 'quote_search');
+    // input submit + the clear button
+    expect(clear).toHaveLength(2);
+    expect(clear.every(v => v.follow_up === 'qtok1' && v.exclude_ids === 'om_root' && v.selected === '')).toBe(true);
+    expect(JSON.stringify(card)).toContain('清除搜索');
+  });
+
   it('renders an empty-state instead of a bare card when no 话题 exist', () => {
     const card = buildQuotePickerCard([], 'oc_1', 'om_root', 'ou_me');
     expect(card).toContain('没有找到其他话题');
