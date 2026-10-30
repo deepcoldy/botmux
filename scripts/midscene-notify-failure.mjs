@@ -51,6 +51,10 @@ export function mergedPullRequests(commits, base) {
  * Cases worth naming: failed first, then the ones the run never reached.
  * When the Feishu job never ran (it waited out the live slot), every Feishu
  * case is "not run" for the same reason; listing them says nothing more.
+ * @param {{ cases?: Array<{ status?: string }> } | null | undefined} manifest
+ * @param {{ feishuRan?: boolean }} [options]
+ *        feishuRan=false drops the "not run" rows. Pass it when the Feishu job
+ *        never started, so its cases are all "not run" for that one reason.
  */
 export function problemCases(manifest, { feishuRan = true } = {}) {
   const cases = Array.isArray(manifest?.cases) ? manifest.cases : [];
@@ -58,6 +62,20 @@ export function problemCases(manifest, { feishuRan = true } = {}) {
     ...cases.filter((testCase) => testCase.status === 'failed'),
     ...(feishuRan ? cases.filter((testCase) => testCase.status === 'not-run') : []),
   ];
+}
+
+/**
+ * Whether the Feishu job ran, from the feishu-queue job's result
+ * (`needs.feishu-queue.result`: success | failure | cancelled | skipped).
+ * The Feishu job needs the queue job, so a queue that failed (waited out the
+ * slot) or was cancelled (the run was cancelled while waiting) means Feishu
+ * never started. Any other value is treated as "ran": an unexpected result
+ * must not hide rows that might be informative.
+ * @param {string | undefined} queueResult
+ * @returns {boolean}
+ */
+export function feishuJobRan(queueResult) {
+  return queueResult !== 'failure' && queueResult !== 'cancelled';
 }
 
 /**
@@ -175,7 +193,7 @@ async function main() {
   const pulls = mergedPullRequests(commits, branch);
   const range = shas.length > 1 ? `${shas[0].slice(0, 9)}…${headSha.slice(0, 9)}（${shas.length} 个提交）` : headSha.slice(0, 9);
   const cases = problemCases(await readManifest(env.MANIFEST_PATH && path.resolve(env.MANIFEST_PATH)), {
-    feishuRan: env.QUEUE_RESULT !== 'failure',
+    feishuRan: feishuJobRan(env.QUEUE_RESULT),
   });
 
   // NOTIFY_DRY_RUN=1 prints the comments instead of posting them.
