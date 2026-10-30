@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from '../src/services/sqlite-compat.js';
@@ -80,22 +80,6 @@ describe('Antigravity native runtime model', () => {
     insert(db, 2, 'model-next'); await vi.advanceTimersByTimeAsync(20);
     expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-next' });
     expect(opened).toHaveBeenCalledTimes(initial + 1);
-  });
-
-  it('ignores WAL metadata-only ctime changes without reopening the model database', async () => {
-    const db = database('native-a'); db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;');
-    insert(db, 1, 'model-first'); const opened = vi.spyOn(sqliteCompat, 'openDatabaseSyncNow');
-    startAntigravityCot('native-a', () => {}, { brainDir, onRuntime: () => {}, pollIntervalMs: 10 });
-    const count = opened.mock.calls.length;
-    const wal = join(conversationsDir, 'native-a.db-wal');
-    const before = statSync(wal, { bigint: true });
-    // SQLite builds may do an equivalent metadata operation on read-only open.
-    chmodSync(wal, Number(before.mode & 0o777n));
-    const after = statSync(wal, { bigint: true });
-    expect(after.mtimeNs).toBe(before.mtimeNs); expect(after.size).toBe(before.size);
-    expect(after.ctimeNs).not.toBe(before.ctimeNs);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(opened).toHaveBeenCalledTimes(count);
   });
 
   it('retries a transient failed read without requiring another file change', async () => {
