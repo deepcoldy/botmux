@@ -876,8 +876,14 @@ export interface BackgroundWaitCardLabel {
   backgroundTasks: number;
 }
 
+export interface ActivityCardLabel {
+  activity: 'working' | 'tool' | 'model_queue';
+  elapsedSeconds: number;
+  progressAgeSeconds?: number;
+}
+
 /** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
-export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel;
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel;
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
@@ -889,7 +895,7 @@ function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardL
 /** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
 function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
   if (status !== 'working' && status !== 'idle') return undefined;
-  if (!label || typeof label !== 'object' || !(label.backgroundTasks > 0)) return undefined;
+  if (!label || typeof label !== 'object' || !('backgroundTasks' in label) || !(label.backgroundTasks > 0)) return undefined;
   return label.backgroundTasks;
 }
 
@@ -904,6 +910,10 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
   const backgroundTasks = backgroundWaitCount(status, idleLabel);
   if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
+  if (status === 'working' && idleLabel && typeof idleLabel === 'object' && 'activity' in idleLabel) {
+    if (idleLabel.activity === 'model_queue') return t('card.status.model_queue', undefined, locale);
+    if (idleLabel.activity === 'tool') return t('card.status.tool_running', undefined, locale);
+  }
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
@@ -939,9 +949,17 @@ const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
 
 function pushStreamBody(
   elements: any[],
-  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot; screenshotUnavailable?: boolean },
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot; screenshotUnavailable?: boolean; activity?: boolean | StreamCardLabel },
 ): void {
   const { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable } = opts;
+  const activity = opts.activity;
+  if (status === 'working' && activity && typeof activity === 'object' && 'activity' in activity) {
+    const elapsed = t('card.status.activity_elapsed', { seconds: activity.elapsedSeconds }, locale);
+    const progress = activity.progressAgeSeconds === undefined ? ''
+      : ` · ${t('card.status.activity_progress_age', { seconds: activity.progressAgeSeconds }, locale)}`;
+    elements.push({ tag: 'markdown', element_id: 'botmux_stream_activity', text_size: 'notation_small_v2',
+      content: `<font color='grey'>${elapsed}${progress}</font>` });
+  }
   if (status === 'limited' && usageLimit) {
     elements.push({
       tag: 'markdown',
@@ -1063,7 +1081,7 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable });
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable, activity: silentIdle });
 
   // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
   // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer

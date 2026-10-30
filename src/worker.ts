@@ -7267,9 +7267,12 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   if (entries.length === 0) return;
   // Independent of the capped/display-only CoT buffer. No text, args or results
   // leave this signal; terminal spinners and process heartbeats never count.
-  if (lastInitConfig?.cliId === 'codex' && lastInitConfig.noProgressNotify?.cliEnabled === true) {
+  if (lastInitConfig?.cliId === 'traex'
+    || (lastInitConfig?.cliId === 'codex' && lastInitConfig.noProgressNotify?.cliEnabled === true)) {
     const last = entries[entries.length - 1];
-    send({ type: 'turn_progress', ...turn, stage: last.kind === 'tool_call' ? 'tool_started'
+    send({ type: 'turn_progress', turnId: turn.turnId,
+      ...(turn.dispatchAttempt === undefined ? {} : { dispatchAttempt: turn.dispatchAttempt }),
+      stage: last.kind === 'tool_call' ? 'tool_started'
       : last.kind === 'tool_result' ? 'tool_returned' : 'model_output' });
   }
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;

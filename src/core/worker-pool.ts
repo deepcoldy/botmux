@@ -2,6 +2,7 @@ import { canTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
+import { traexStreamCardActivity } from './stream-card-activity.js';
 import { listPendingAsks } from './ask-broker.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
@@ -1732,7 +1733,20 @@ export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined 
   if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
     return { backgroundTasks: ds.backgroundTaskCount };
   }
-  return idleCardLabel(ds);
+  const source = currentCaptureIdentity(ds) ?? ds.managedTurnOrigin;
+  const highWater = ds.turnDispatchAttemptHighWater;
+  const currentSource = source?.turnId === ds.currentTurnId && source?.turnId
+    && (highWater?.turnId !== source.turnId || (source.dispatchAttempt !== undefined
+      && source.dispatchAttempt >= highWater.dispatchAttempt)) ? source : undefined;
+  const activity = currentSource ? traexStreamCardActivity({
+    cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId,
+    status: ds.lastScreenStatus,
+    content: ds.lastScreenContent,
+    execution: ds.replyExecutionStarts?.get(JSON.stringify([currentSource.turnId, currentSource.dispatchAttempt ?? null])),
+    workerGeneration: ds.workerGeneration,
+    nowMs: Date.now(),
+  }) : undefined;
+  return activity ?? idleCardLabel(ds);
 }
 
 const TURN_EXPLICIT_MENTION_MAX = 64;
@@ -1941,7 +1955,10 @@ export function usageRefreshShouldRun(ds: DaemonSession): boolean {
   if (!workerHasInitialized(ds)) return false;
   if (!cliSupportsNativeUsage(sessionCliId(ds, getBot(ds.larkAppId).config))) return false;
   try {
-    if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') return false;
+    if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
+      const label = streamCardLabel(ds);
+      return !!label && typeof label === 'object' && 'activity' in label;
+    }
   } catch { /* missing config → default streaming → allowed */ }
   return true;
 }
@@ -16062,7 +16079,18 @@ function setupWorkerHandlers(
         break;
       }
       case 'turn_progress': {
-        if (!ownsLifecycleMutation() || !['model_output', 'tool_started', 'tool_returned'].includes(msg.stage)) break;
+        if (!ownsLifecycleMutation() || (msg.stage !== 'model_output'
+          && msg.stage !== 'tool_started' && msg.stage !== 'tool_returned')) break;
+        const execution = ds.replyExecutionStarts?.get(JSON.stringify([msg.turnId, msg.dispatchAttempt ?? null]));
+        if (execution?.workerGeneration === workerGeneration) {
+          const changed = execution.stage !== msg.stage;
+          execution.stage = msg.stage;
+          execution.lastProgressAtMs = Date.now();
+          if (changed) {
+            syncUsageRefreshTimer(ds);
+            refreshStreamingCardUsage(ds);
+          }
+        }
         cliNotices.progress(msg.turnId, msg.dispatchAttempt, workerGeneration, msg.stage);
         break;
       }
@@ -16074,7 +16102,7 @@ function setupWorkerHandlers(
         const starts = ds.replyExecutionStarts ??= new Map();
         const key = JSON.stringify([msg.turnId, msg.dispatchAttempt ?? null]);
         starts.delete(key);
-        starts.set(key, { startedAtMs: msg.startedAtMs, workerGeneration });
+        starts.set(key, { startedAtMs: msg.startedAtMs, workerGeneration, lastProgressAtMs: msg.startedAtMs });
         if (starts.size > 512) starts.delete(starts.keys().next().value!);
         break;
       }

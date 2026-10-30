@@ -29,6 +29,37 @@ const LOADED = `╭────────────────────�
 ❯ Find and fix a bug in @filename
   GPT-6-Astra xhigh · Context 100% left · /data00/home/huangyuhang.edu`;
 
+const REPOSITORY_NOTICE = [
+  '  █ ◆ ◆ █  TRAE CLI (v0.212.1)',
+  '  ~/projects',
+  '  permissions: YOLO mode',
+  '────────────────────────────────────────────────────',
+  '❯ Write tests for @filename',
+  '────────────────────────────────────────────────────',
+  '  无法访问 Git 仓库 `git@example.invalid`，请确认该仓库权限或地址。',
+];
+
+describe('TraeX startup repository notification', () => {
+  it('accepts the initialized composer while the transient repository notice hides the model footer', () => {
+    expect(traexRestoredComposerReady(REPOSITORY_NOTICE.join('\n'))).toBe(true);
+    expect(traexRestoredComposerReady(REPOSITORY_NOTICE.join('\n').replace('Write tests for @filename', 'Ask TRAE CLI to do anything'))).toBe(true);
+    expect(traexRestoredComposerReady(REPOSITORY_NOTICE.join('\n').replace('git@example.invalid', 'git@example.invalid:loading/repo.git'))).toBe(true);
+  });
+
+  it.each([
+    REPOSITORY_NOTICE.map(row => row.replace('Write tests for @filename', 'my unsent draft')),
+    REPOSITORY_NOTICE.map(row => row.replace('Write tests for @filename', '1. Sign in')),
+    ['Sign in to TraeCode CLI', ...REPOSITORY_NOTICE],
+    ['│ model: loading /model to change │', ...REPOSITORY_NOTICE],
+    [...REPOSITORY_NOTICE.slice(0, 3), '◆ Working… (3s • esc to interrupt)', ...REPOSITORY_NOTICE.slice(3)],
+    REPOSITORY_NOTICE.slice(3),
+    [...REPOSITORY_NOTICE, '  a wrapped draft continuation'],
+    REPOSITORY_NOTICE.map(row => row.replace('无法访问 Git 仓库 `git@example.invalid`，请确认该仓库权限或地址。', 'Please sign in before continuing')),
+  ])('keeps blocking input owners and unknown notifications gated: %j', (...rows: string[]) => {
+    expect(traexRestoredComposerReady(rows.join('\n'))).toBe(false);
+  });
+});
+
 let detector: IdleDetector;
 let idle: ReturnType<typeof vi.fn>;
 beforeEach(() => {

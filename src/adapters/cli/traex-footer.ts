@@ -64,6 +64,7 @@ export function traexViewportFooterBusy(screen: string): boolean {
 // Botmux's queued paste.
 const EMPTY_COMPOSER_HINTS = new Set([
   '',
+  'Ask TRAE CLI to do anything',
   'Ask TraeCode CLI to do anything',
   'Explain this codebase',
   'Summarize recent commits',
@@ -95,10 +96,20 @@ export function traexRestoredComposerReady(screen: string): boolean {
   // then the access/shortcut row. Extra rows can be a draft, picker or dialog.
   if (/^[ \t]*─+[ \t]*$/.test(footer[0] ?? '')) footer.shift();
   if (footer.length < 1 || footer.length > 2) return false;
-  if (!/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
+  // Recorded 0.212.1 cold start: marketplace Git access failure replaces
+  // BOTH native footer rows with a nonblocking notification for ~30s. The
+  // initialized startup banner and an empty composer still prove readiness.
+  // Accept only this known notification, never arbitrary error/dialog text.
+  const startupRows = rows.slice(0, composer);
+  const repositoryNotice = footer.length === 1
+    && /^[ \t]*无法访问 Git 仓库 `[^`\r\n]+`，请确认该仓库权限或地址。[ \t]*$/.test(footer[0]!)
+    && startupRows.some(row => /^[ \t]*(?:█ ◆ ◆ █[ \t]+)?TRAE CLI \(v\d[^\r\n]*\)[ \t]*$/.test(row))
+    && startupRows.some(row => /^[ \t]*permissions:[ \t]+\S/.test(row))
+    && !startupRows.some(row => /(?:model|directory):[ \t]*loading\b/i.test(row));
+  if (!repositoryNotice && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
   // Only the model cell is initialization evidence; a cwd named "loading"
   // in a later footer cell must not strand an otherwise initialized prompt.
-  if (/\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
+  if (!repositoryNotice && /\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
   if (footer.length === 2 && !/^[ \t]*(?:☢ )?(?:Full Access|Read Only|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
   // A login banner can be taller than the nearby live-status region. Inspect
   // all rows above the composer for native login prompts, but do not treat
