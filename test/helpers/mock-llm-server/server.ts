@@ -317,7 +317,7 @@ export class MockLlmServer {
       // sanitization left: GITHUB_SHA set-empty vs unset vs leaked value.
       const probeCmd = sandboxProbeCommand(messages);
       const sendCmd = probeCmd ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
-      const cmd = probeCmd ? sendCmd : `${buildGeminiShellEnvSnapshotFragment()}; ${sendCmd}`;
+      const cmd = probeCmd ? sendCmd : `${buildGeminiShellEnvSnapshotFragment(marker)}; ${sendCmd}`;
       response = buildGeminiResponse({ functionCall: { name: tool.name, args: tool.args(cmd) } });
     }
     if (this.config.verbose) {

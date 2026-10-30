@@ -22,14 +22,21 @@ const SNAPSHOT_VARS = ['GITHUB_SHA', 'BOTMUX_SESSION_ID', 'BOTMUX_IDENTITY_BIN',
 
 /**
  * Shell fragment that appends one line recording each tracked variable as
- * `NAME={presence:value}`, e.g. `GITHUB_SHA={x:}` (set, empty) vs
- * `GITHUB_SHA={:}` (unset). Safe to prepend to another command with `; `.
+ * `[epoch marker] NAME={presence:value} …`, e.g. `GITHUB_SHA={x:}` (set,
+ * empty) vs `GITHUB_SHA={:}` (unset). The timestamp + marker separate retry
+ * attempts. Safe to prepend to another command with `; `.
+ *
+ * The value half uses `${VAR-}` (not bare `${VAR}`) so an unset variable does
+ * not abort the shell under `set -u` / BASH_ENV profiles that enable nounset —
+ * otherwise a failed snapshot would also swallow the following `botmux send`
+ * and look identical to "the CLI never submitted". Presence is still decided
+ * solely by `${VAR+x}`, so the three-way distinction is unchanged.
  */
-export function buildGeminiShellEnvSnapshotFragment(): string {
+export function buildGeminiShellEnvSnapshotFragment(marker?: string): string {
+  const tag = marker ? ` ${marker}` : '';
   const fields = SNAPSHOT_VARS.map(
-    (name) => `${name}={\${${name}+x}:\${${name}}}`,
+    (name) => `${name}={\${${name}+x}:\${${name}-}}`,
   ).join(' ');
   // Double quotes so the shell expands ${...}; literal braces/colon survive.
-  // Renders e.g. GITHUB_SHA={x:} when set-empty, GITHUB_SHA={:} when unset.
-  return `printf '%s\\n' "${fields}" >> ${GEMINI_SHELL_ENV_LOG}`;
+  return `printf '%s %s %s\\n' "$(date +%s)" "${tag.trim()}" "${fields}" >> ${GEMINI_SHELL_ENV_LOG}`;
 }
