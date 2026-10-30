@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import {
   MockLlmServer,
   extractMarker,
@@ -297,7 +297,11 @@ describe('MockLlmServer', () => {
       });
       const call = JSON.parse(first.replace(/^data: /, '').trim()).candidates[0].content.parts[0].functionCall;
       expect(call.name).toBe('run_shell_command');
-      expect(call.args.command).toBe("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
+      // The reply command carries an env-snapshot fragment (live diagnostic)
+      // followed by the real `botmux send`.
+      expect(call.args.command).toMatch(/^printf '%s %s %s\\n' "\$\(date \+%s\)" "[\s\S]*" >> \.e2e-gemini-shell-env\.log; /);
+      expect(call.args.command).toContain("GITHUB_SHA={${GITHUB_SHA+x}:${GITHUB_SHA-}}");
+      expect(call.args.command).toContain("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
 
       const second = await post('/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse', {
         contents: [
@@ -315,6 +319,28 @@ describe('MockLlmServer', () => {
         body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'route' }] }], generationConfig: { responseJsonSchema: {} } }),
       }).then((r) => r.json() as Promise<any>);
       expect(JSON.parse(routed.candidates[0].content.parts[0].text)).toHaveProperty('complexity_score');
+    });
+
+    it('warns only after a marker asks the router >2 times without a main-model call', async () => {
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      const postRouter = () =>
+        post('/v1beta/models/flash:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { responseJsonSchema: {} },
+        });
+      try {
+        await postRouter();
+        await postRouter();
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+        await postRouter();
+        const hits = warnings.filter((w) => w.includes('gemini router') && w.includes('hit 3 times'));
+        expect(hits).toHaveLength(1);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 

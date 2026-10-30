@@ -345,6 +345,7 @@ export const messages: Record<string, string> = {
   'card.relay.btn_prev_page': '← Prev',
   'card.relay.btn_next_page': 'Next →',
   'card.relay.page_indicator': 'Page {current} / {total}',
+  'card.picker.btn_clear_search': '↩ Clear search, show all',
   'card.relay.empty_filtered': 'No sessions match "{query}". Try a different keyword.',
   'card.relay.type_group': 'group chat',
   'card.relay.type_topic': 'topic chat',
