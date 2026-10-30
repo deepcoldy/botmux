@@ -1057,7 +1057,9 @@ describe('worker read-isolation fences', () => {
     expect(adoptBranches.length).toBeGreaterThan(0);
     for (const branch of adoptBranches) expect(gateAt).toBeLessThan(branch.index!);
 
-    const wrapperAt = strippedSource.search(/if \(cfg\.wrapperCli\b/);
+    // The unsandboxed wrapperCli call site (the sandboxed one runs before the
+    // full sandbox, where credential-only confinement is never applied).
+    const wrapperAt = strippedSource.search(/if \(wrapperCliConfigured && !wrapperInsideSandbox\)/);
     const spawnAt = strippedSource.search(/backend\.spawn\(spawnBin, spawnArgs\b/);
     expect(wrapperAt).toBeGreaterThan(0);
     for (const flavour of ['credentialOnlySeatbelt', 'credentialOnlyBwrap']) {

@@ -18,6 +18,7 @@
  * daemon-side watcher re-executes the send OUTSIDE the sandbox with real
  * credentials. No Feishu credential ever enters the sandbox.
  */
+import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
 import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
@@ -1114,6 +1115,9 @@ export function prepareDirectSandbox(opts: {
    * exact alias to its already-granted canonical directory on symlinked homes.
    * Only the minimax worker supplies this; absent leaves the mount plan intact. */
   minimaxDataDir?: string;
+  /** wrapperCli inside the sandbox: `<cli name>` alias placed in the private
+   *  shim dir (first on PATH) pointing at the real, already-allowed CLI. */
+  cliNameLink?: { name: string; target: string };
   /** The child's own TAR_OPTIONS (bot env merged over the worker env), the
    *  base sandboxTarOptions extends. Absent → the worker process env. */
   childTarOptions?: string;
@@ -1162,6 +1166,9 @@ export function prepareDirectSandbox(opts: {
   const shim = join(shimBin, 'botmux');
   writeFileSync(shim, botmuxShimExecLine());
   chmodSync(shim, 0o755);
+  // A wrapperCli running inside the sandbox may exec the CLI by name: alias
+  // that name to the (already allowed) real CLI binary in this private dir.
+  writeCliNameLink(shimBin, opts.cliNameLink);
 
   // usrmerge symlinks to replicate; deny rules that are FILES on the host need
   // a file-shaped mask, everything else (existing dir OR a not-yet-existing
