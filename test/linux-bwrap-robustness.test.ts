@@ -300,7 +300,8 @@ describe('readOnly entries covering a launcher mount point', () => {
           net: true,
           writeRegexes: [],
         },
-        chdir: '/', home: root, cliBin: '/bin/sh', cliArgs: ['-c', 'echo started'],
+        // No shell: the probe only needs a process to start inside the plan.
+        chdir: '/', home: root, cliBin: '/usr/bin/echo', cliArgs: ['started'],
       });
       expect(plan).not.toBeNull();
       return spawnSync(plan!.bin, plan!.args, { encoding: 'utf8', timeout: 10_000 });
