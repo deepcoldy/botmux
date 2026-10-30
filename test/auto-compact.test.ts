@@ -393,7 +393,7 @@ describe('auto-compact unattended worker write gate', () => {
     expect(refuse({ requireSafeComposer: true })).toBeUndefined();
   });
 
-  it('rejects adjacent Codex busy state but ignores identical historical scrollback', () => {
+  it('rejects real-gap Codex busy state but ignores identical historical scrollback', () => {
     const codexRefusal = (viewport: string) => {
       const state = codexInputState(viewport);
       return harness({
@@ -402,14 +402,19 @@ describe('auto-compact unattended worker write gate', () => {
         cliAdapter: { readyPattern: /[›»](?!\s*\d+\.)|\d+% left/ },
       }).refuse({ requireSafeComposer: true });
     };
-    const historical = `◆ Queued for capacity (51s…)\n${CODEX_COMPOSER}`;
-    const adjacent = CODEX_COMPOSER.replace(
-      '› Ask Codex to do anything',
-      '• Resuming session…\n› Ask Codex to do anything',
-    );
+    const withStatusGap = (status: string, gap: number) => {
+      const lines = CODEX_COMPOSER.split(/\r?\n/);
+      const composerY = lines.findIndex(line => /^\s*[›»]/.test(line));
+      lines[composerY - gap] = status;
+      return lines.join('\n');
+    };
+    const historical = withStatusGap('◆ Queued for capacity (51s…)', 8);
+    const queuedAtNativeGap = withStatusGap('◆ Queued for capacity (51s…)', 2);
+    const resumingAtNativeGap = withStatusGap('• Resuming session…', 3);
 
     expect(codexRefusal(historical)).toBeUndefined();
-    expect(codexRefusal(adjacent)).toBe('prompt_not_framed');
+    expect(codexRefusal(queuedAtNativeGap)).toBe('prompt_not_framed');
+    expect(codexRefusal(resumingAtNativeGap)).toBe('prompt_not_framed');
   });
 
   it('fails closed for a Codex draft, picker, or missing cursor evidence', () => {

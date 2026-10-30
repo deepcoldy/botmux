@@ -52,7 +52,7 @@ export function codexEmptyComposerFooter(
   // ordinary transcript prose); scanning the whole viewport would then make a
   // healthy empty composer fail closed forever.
   const composerNeighborhood = lines.slice(
-    Math.max(0, state.cursor.y - 1),
+    Math.max(0, state.cursor.y - 3),
     Math.min(lines.length, state.cursor.y + 5),
   ).join('\n');
   if (footer.length < 1 || footer.length > 2 || below.slice(4).some(row => row.trim())
