@@ -161,6 +161,25 @@ describe('Gemini: resume by the botmux session id', () => {
     expect(probe()).toBe(false);
     geminiSession(home, work, BOTMUX, [user('hello'), patch({ orderIds: ['m0'] })]);
     expect(probe()).toBe(true);
+
+    // 7) orderIds only reorders rows that still exist: rows not named in it
+    //    stay as a prefix (upstream prefixIds + orderedIds). A prefix-only
+    //    prompt must survive; a naive "rebuild the table as orderIds" drops it
+    //    and leaves only the ignored /help row.
+    geminiSession(home, work, BOTMUX, [user('hello'), user('/help'), patch({ orderIds: ['m1'] })]);
+    expect(probe()).toBe(true);
+
+    // 8) $patch.updates[] is the nested patch form: filling an EXISTING row's
+    //    content counts, but naming an unknown id never creates a row.
+    geminiSession(home, work, BOTMUX, [user('   '), patch({ updates: [{ id: 'm0', content: [{ text: 'hello' }] }] })]);
+    expect(probe()).toBe(true);
+    geminiSession(home, work, BOTMUX, [patch({ updates: [{ id: 'm9', content: [{ text: 'hello' }] }] })]);
+    expect(probe()).toBe(false);
+
+    // 9) $rewindTo an unknown id clears the whole table (upstream
+    //    messageIds.length = 0 + kinds.clear()), it is not ignored.
+    geminiSession(home, work, BOTMUX, [user('hello'), rewind('nope')]);
+    expect(probe()).toBe(false);
   });
 
   it('the adapter names a new session, resumes a resumable one, and never passes an id Gemini would reject', () => {
