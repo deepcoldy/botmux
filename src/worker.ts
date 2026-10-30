@@ -20080,7 +20080,7 @@ function postTerminalPromptFenceHolds(
  *  open turn left, tells the chat. See services/claude-stop-failure.ts. */
 function handleClaudeStopFailure(
   msg: Extract<DaemonToWorker, { type: 'claude_stop_failure' }>,
-  opts: { notifyOnly?: boolean } = {},
+  opts: { notifyOnly?: boolean; reportedAtMs?: number } = {},
 ): void {
   if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) {
     log(`Ignoring Claude StopFailure (${msg.report.error}): not a botmux-driven Claude session`);
@@ -20106,7 +20106,7 @@ function handleClaudeStopFailure(
       dataDir: bridgeDataDir,
       sinceMs,
       canonical: path => { try { return realpathSync(path); } catch { return undefined; } },
-      probe: transcriptApiErrorRecordSince,
+      probe: (path, sinceMs) => transcriptApiErrorRecordSince(path, sinceMs),
     }),
     recordNoticed: recordKey => claudeStopFailureNoticedRecords.has(recordKey),
     lastNoticeAtMs: errorCode => claudeStopFailureNoticeAtMs.get(errorCode),
@@ -20138,7 +20138,7 @@ setInterval(() => {
   for (const entry of drainClaudeStopFailureOutbox(outbox)) {
     handleClaudeStopFailure(
       { type: 'claude_stop_failure', report: entry.report, ...(entry.turnId ? { turnId: entry.turnId } : {}) },
-      { notifyOnly: true },
+      { notifyOnly: true, reportedAtMs: entry.atMs },
     );
   }
 }, 1_000).unref?.();

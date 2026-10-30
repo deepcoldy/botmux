@@ -377,11 +377,12 @@ describe('handleClaudeStopFailureReport', () => {
     expect(h.notices).toHaveLength(2);
   });
 
-  it('reads only the bridge transcript for a notify-only report', () => {
+  it('reads only the bridge transcript for a notify-only report, looking back from when it was written', () => {
     const { ctx, timers, recordQueries } = harness({ settled: 'completed' });
-    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx, { notifyOnly: true });
+    const writtenAt = ctx.now() - 30_000; // drained from the outbox half a minute later
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx, { notifyOnly: true, reportedAtMs: writtenAt });
     timers[0].run();
-    expect(recordQueries.map(([, path]) => path)).toEqual([undefined]);
+    expect(recordQueries).toEqual([[writtenAt - CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS, undefined]]);
   });
 
   it('reports instead of failing the queued input Claude started after the failure', () => {
@@ -525,15 +526,20 @@ describe('transcriptApiErrorRecordSince', () => {
   });
 
   it('cannot tell when the probe window runs out before records older than the window', () => {
-    // A record pushed out of the probe by a large write after it (a big tool
-    // result) must not read as "no record".
-    const big = 'x'.repeat(64 * 1024);
+    // A record pushed out of the probe by later writes must not read as "no record".
     const filler = Array.from({ length: 20 }, (_, n) => ({
-      type: 'user', timestamp: `2026-10-30T02:42:${String(20 + n).padStart(2, '0')}.000Z`, message: { content: big },
+      type: 'user', timestamp: `2026-10-30T02:42:${String(20 + n).padStart(2, '0')}.000Z`, message: { content: 'y'.repeat(1_000) },
     }));
-    expect(transcriptApiErrorRecordSince(transcriptOf([
-      { ...transcriptRecord, timestamp: '2026-10-30T02:42:15.000Z' }, ...filler,
-    ]), at('2026-10-30T02:41:16.000Z'))).toBeUndefined();
+    const path = transcriptOf([{ ...transcriptRecord, timestamp: '2026-10-30T02:42:15.000Z' }, ...filler]);
+    expect(transcriptApiErrorRecordSince(path, at('2026-10-30T02:41:16.000Z'), 8 * 1024)).toBeUndefined();
+  });
+
+  it('looks past screenshot-sized lines written after the record', () => {
+    const path = transcriptOf([
+      { ...transcriptRecord, uuid: 'rec-uuid', timestamp: '2026-10-30T02:42:15.000Z' },
+      { type: 'user', timestamp: '2026-10-30T02:42:16.000Z', message: { content: 'z'.repeat(200 * 1024) } },
+    ]);
+    expect(transcriptApiErrorRecordSince(path, at('2026-10-30T02:41:16.000Z'), 150 * 1024)).toBe('rec-uuid');
   });
 });
 

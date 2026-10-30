@@ -358,7 +358,7 @@ export function handleClaudeStopFailureReport<TTimer>(
   report: ClaudeStopFailureReport,
   claimedTurn: { turnId?: string; dispatchAttempt?: number },
   ctx: ClaudeStopFailureContext<TTimer>,
-  opts: { notifyOnly?: boolean } = {},
+  opts: { notifyOnly?: boolean; reportedAtMs?: number } = {},
 ): TTimer | undefined {
   if (!claudeStopFailureBelongsToOwner(report, ctx.owner)) {
     ctx.log(`Ignoring Claude StopFailure (${report.error}) from another Claude process `
@@ -382,7 +382,8 @@ export function handleClaudeStopFailureReport<TTimer>(
   // failure surfaced on another turn (a local-turn notice, an absorbed input).
   const surfacedSinceMs = ctx.now() - CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS;
   const outcome = classifyClaudeStopFailure(report);
-  const arrivedAtMs = ctx.now();
+  // An outbox report may be read a while after it was written.
+  const arrivedAtMs = Math.min(ctx.now(), opts.reportedAtMs ?? Infinity);
   const detail = report.lastAssistantMessage ?? report.errorDetails;
   ctx.log(`Claude StopFailure (${report.error}${opts.notifyOnly ? ', notify-only' : ''}) for turn `
     + `${failedTurn.turnId?.slice(0, 12) ?? '-'}; waiting ${CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS}ms `
@@ -420,7 +421,8 @@ export function handleClaudeStopFailureReport<TTimer>(
     });
     switch (decision.action) {
       case 'skip':
-        ctx.log(`Claude StopFailure (${report.error}) needs no fallback (${decision.reason})`);
+        ctx.log(`Claude StopFailure (${report.error}) needs no fallback (${decision.reason}; `
+          + `transcript record: ${record === undefined ? 'cannot tell' : record === false ? 'none' : 'found'})`);
         return;
       case 'emit':
         ctx.log(`Claude StopFailure fallback: the transcript never settled turn ${settleTurnId!.slice(0, 12)}; `
@@ -429,7 +431,7 @@ export function handleClaudeStopFailureReport<TTimer>(
         return;
       case 'notify':
         ctx.log(`Claude StopFailure fallback: no open turn to settle and nothing surfaced the failure; `
-          + `notifying (${decision.errorCode})`);
+          + `notifying (${decision.errorCode}; transcript record: ${record === undefined ? 'cannot tell' : 'found'})`);
         ctx.notify(decision.errorCode, failedTurn.turnId, typeof record === 'string' ? record : undefined);
     }
   });

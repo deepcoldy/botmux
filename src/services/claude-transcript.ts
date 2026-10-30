@@ -703,7 +703,10 @@ export function transcriptShowsTurnDurationMarker(path: string): boolean {
 }
 
 /** How far back from EOF transcriptApiErrorRecordSince looks. */
-const API_ERROR_RECORD_PROBE_MAX_BYTES = 1024 * 1024;
+const API_ERROR_RECORD_PROBE_MAX_BYTES = 8 * 1024 * 1024;
+/** An API-error record is a short line; longer ones (screenshots, large tool
+ *  results) are skipped unparsed. */
+const API_ERROR_RECORD_MAX_LINE_BYTES = 64 * 1024;
 
 /** The API-error record (`isApiErrorMessage:true`) a transcript holds stamped
  *  at or after `sinceMs`: its key (uuid, else its timestamp) when there is
@@ -711,11 +714,15 @@ const API_ERROR_RECORD_PROBE_MAX_BYTES = 1024 * 1024;
  *  finding one, and undefined when it could not tell — the file is missing or
  *  unreadable, or the probe window ran out first. Timestamps are compared with
  *  the caller's clock: Claude and the worker share the host. */
-export function transcriptApiErrorRecordSince(path: string, sinceMs: number): string | false | undefined {
+export function transcriptApiErrorRecordSince(
+  path: string,
+  sinceMs: number,
+  probeMaxBytes: number = API_ERROR_RECORD_PROBE_MAX_BYTES,
+): string | false | undefined {
   if (!path || !existsSync(path)) return undefined;
   try {
     const completeEnd = baselineJsonlCursor(path).newOffset;
-    const floor = Math.max(0, completeEnd - API_ERROR_RECORD_PROBE_MAX_BYTES);
+    const floor = Math.max(0, completeEnd - probeMaxBytes);
     let key: string | undefined;
     let reachedOlder = false;
     scanJsonlBackward(path, {
@@ -723,9 +730,11 @@ export function transcriptApiErrorRecordSince(path: string, sinceMs: number): st
       floor,
       dropPartialAtFloor: true,
       onLine: (line) => {
+        if (line.length > API_ERROR_RECORD_MAX_LINE_BYTES) return false;
         let ev: TranscriptEvent;
         try { ev = JSON.parse(line.toString('utf8')) as TranscriptEvent; } catch { return false; }
         const at = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
+        // Records are appended in time order; the first older one ends the window.
         if (Number.isFinite(at) && at < sinceMs) { reachedOlder = true; return true; }
         if (ev.isApiErrorMessage === true) {
           key = ev.uuid ?? ev.timestamp ?? `${path}#record`;
