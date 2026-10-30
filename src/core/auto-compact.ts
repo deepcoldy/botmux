@@ -20,6 +20,22 @@ export function supportsNativeAutoCompact(cliId: string): boolean {
   return NATIVE_AUTO_COMPACT_CLIS.has(cliId);
 }
 
+/** Runtime capability for unattended native compaction.
+ *
+ * Codex needs a live terminal cursor + viewport snapshot for its positive
+ * empty-composer proof. Only the tmux backend exposes that authoritative
+ * input state today, and RPC-input sessions use the pane as a viewer rather
+ * than an input surface. Claude keeps its existing renderer-based evidence. */
+export function supportsNativeAutoCompactRuntime(
+  cliId: string,
+  backendType: string | undefined,
+  codexRpcInput: boolean,
+): boolean {
+  if (!supportsNativeAutoCompact(cliId)) return false;
+  if (cliId !== 'codex') return true;
+  return backendType === 'tmux' && !codexRpcInput;
+}
+
 export interface AutoCompactObservation {
   sessionId: string;
   idle: boolean;
@@ -90,6 +106,14 @@ export interface AutoCompactRefusalProjection {
   streamCardPendingTurnId?: string;
 }
 
+export function isAutoCompactSafeComposerRefusal(
+  terminal: { turnId: string; status: string; errorCode?: string },
+): boolean {
+  return terminal.turnId.startsWith('auto-compact:')
+    && terminal.status === 'failed'
+    && terminal.errorCode === 'safe_composer_required';
+}
+
 /** Clear the synthetic turn's pending-card marker after the worker rejects an
  * unattended write for missing live composer evidence. The refusal is an
  * expected fail-closed maintenance outcome, not a user turn that may remain
@@ -98,9 +122,7 @@ export function settleAutoCompactSafeComposerRefusal(
   state: AutoCompactRefusalProjection,
   terminal: { turnId: string; status: string; errorCode?: string },
 ): boolean {
-  if (!terminal.turnId.startsWith('auto-compact:')
-    || terminal.status !== 'failed'
-    || terminal.errorCode !== 'safe_composer_required') return false;
+  if (!isAutoCompactSafeComposerRefusal(terminal)) return false;
   if (state.streamCardPendingTurnId === terminal.turnId) {
     state.streamCardPending = false;
     state.streamCardPendingTurnId = undefined;

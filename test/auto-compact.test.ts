@@ -5,6 +5,7 @@ import {
   isAutoCompactEligible,
   settleAutoCompactSafeComposerRefusal,
   supportsNativeAutoCompact,
+  supportsNativeAutoCompactRuntime,
   type AutoCompactEligibilitySnapshot,
 } from '../src/core/auto-compact.js';
 import { promptCacheKeepaliveRefusal } from '../src/core/prompt-cache-keepalive-gate.js';
@@ -264,6 +265,15 @@ describe('supportsNativeAutoCompact', () => {
     expect(supportsNativeAutoCompact('gemini')).toBe(false);
     expect(supportsNativeAutoCompact('cursor')).toBe(false);
   });
+
+  it('limits Codex unattended compaction to terminal-input tmux sessions', () => {
+    expect(supportsNativeAutoCompactRuntime('codex', 'tmux', false)).toBe(true);
+    expect(supportsNativeAutoCompactRuntime('codex', 'pty', false)).toBe(false);
+    expect(supportsNativeAutoCompactRuntime('codex', 'zellij', false)).toBe(false);
+    expect(supportsNativeAutoCompactRuntime('codex', 'herdr', false)).toBe(false);
+    expect(supportsNativeAutoCompactRuntime('codex', 'tmux', true)).toBe(false);
+    expect(supportsNativeAutoCompactRuntime('claude-code', 'pty', false)).toBe(true);
+  });
 });
 
 describe('settleAutoCompactSafeComposerRefusal', () => {
@@ -381,6 +391,25 @@ describe('auto-compact unattended worker write gate', () => {
       cliAdapter: { readyPattern: /[›»](?!\s*\d+\.)|\d+% left/ },
     });
     expect(refuse({ requireSafeComposer: true })).toBeUndefined();
+  });
+
+  it('rejects adjacent Codex busy state but ignores identical historical scrollback', () => {
+    const codexRefusal = (viewport: string) => {
+      const state = codexInputState(viewport);
+      return harness({
+        lastInitConfig: { cliId: 'codex' },
+        backend: { captureInputState: () => state },
+        cliAdapter: { readyPattern: /[›»](?!\s*\d+\.)|\d+% left/ },
+      }).refuse({ requireSafeComposer: true });
+    };
+    const historical = `◆ Queued for capacity (51s…)\n${CODEX_COMPOSER}`;
+    const adjacent = CODEX_COMPOSER.replace(
+      '› Ask Codex to do anything',
+      '• Resuming session…\n› Ask Codex to do anything',
+    );
+
+    expect(codexRefusal(historical)).toBeUndefined();
+    expect(codexRefusal(adjacent)).toBe('prompt_not_framed');
   });
 
   it('fails closed for a Codex draft, picker, or missing cursor evidence', () => {

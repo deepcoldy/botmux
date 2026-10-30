@@ -47,8 +47,16 @@ export function codexEmptyComposerFooter(
   // Both layouts are native: an inline status/hints row, or a separate status
   // row followed by hints. Stay in the adjacent footer band, never scrollback.
   const footer = below.slice(0, 4).filter(row => row.trim());
+  // Busy/loading evidence is meaningful only next to the live composer. The
+  // same words can remain in scrollback after capacity recovers (or appear in
+  // ordinary transcript prose); scanning the whole viewport would then make a
+  // healthy empty composer fail closed forever.
+  const composerNeighborhood = lines.slice(
+    Math.max(0, state.cursor.y - 1),
+    Math.min(lines.length, state.cursor.y + 5),
+  ).join('\n');
   if (footer.length < 1 || footer.length > 2 || below.slice(4).some(row => row.trim())
-    || /^\s*(?:(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b|│\s*(?:model|directory):\s*loading\b)/im.test(lines.join('\n'))) return undefined;
+    || /^\s*(?:(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b|│\s*(?:model|directory):\s*loading\b)/im.test(composerNeighborhood)) return undefined;
   return codexNativeFooterRows(footer);
 }
 

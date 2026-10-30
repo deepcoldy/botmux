@@ -534,7 +534,7 @@ import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclare
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
-import { AutoCompactCoordinator, isAutoCompactEligible, supportsNativeAutoCompact } from './core/auto-compact.js';
+import { AutoCompactCoordinator, isAutoCompactEligible, supportsNativeAutoCompactRuntime } from './core/auto-compact.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -6126,7 +6126,11 @@ function autoCompactEligible(ds: DaemonSession): boolean {
     headless: !!ds.session.headless,
     vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
     remoteRunner: backendType === 'remote-runner',
-    supportsCompact: supportsNativeAutoCompact(effectiveCliId)
+    supportsCompact: supportsNativeAutoCompactRuntime(
+      effectiveCliId,
+      backendType,
+      ds.initConfig?.codexRpcInput === true,
+    )
       && resolvePassthroughCommands(ds.larkAppId, effectiveCliId).has('/compact'),
   });
 }
