@@ -2,6 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
+import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
 
 /**
  * Live wedge (Claude, chat-scope session + 10-minute silent schedule):
@@ -12,7 +17,7 @@ import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
  * release B any more, and every later `queueAfterActiveTurn` schedule fire
  * queued as "Claude is busy" for 13 hours while the CLI sat at its prompt.
  */
-function harness() {
+function harness(opts: { markerPath?: string } = {}) {
   const scope: Record<string, any> = {
     sessionId: 'sid',
     currentBotmuxTurnId: undefined,
@@ -53,7 +58,7 @@ function harness() {
     scope.currentBotmuxDispatchAttempt = dispatchAttempt;
     scope.currentBotmuxCallerOpenId = caller;
   };
-  for (const name of [
+  const names = [
     'turnAuthorityIdentity',
     'adoptActiveTurnWhenIsolationOff',
     'activeTurnBlocks',
@@ -63,9 +68,23 @@ function harness() {
     'retireTerminatedQueuedTurn',
     'advanceQueuedTypeAheadTurn',
     'emitTurnTerminal',
-  ]) {
-    scope[name] = loadWorkerFunction(name, scope);
+    'dropQueuedTurnRecord',
+    'turnTerminalEmitted',
+    'retireTerminatedMarkerTurn',
+  ];
+  if (opts.markerPath) {
+    // Real PID-marker round trip: the disk copy is what a lagging advance reads.
+    Object.assign(scope, {
+      cliPidMarker: opts.markerPath, rpcEnginePidMarker: undefined,
+      existsSync, readFileSync, basename, atomicWriteFileSync,
+      readProcessStartIdentity: () => undefined, publishActiveTurn: vi.fn(),
+      withPidMarkerLock: (_path: string, fn: () => void) => fn(),
+      adoptInitialActiveTurn: vi.fn(), adoptDisplacedActiveTurn: vi.fn(),
+      markerIdentityTurnId: loadWorkerFunction('markerIdentityTurnId', { isValidMarkerIdentityTurnId }),
+    });
+    names.push('syncQueuedTurnsFromMarkerDisk', 'writeCliPidMarker');
   }
+  for (const name of names) scope[name] = loadWorkerFunction(name, scope);
   return scope;
 }
 
@@ -122,5 +141,94 @@ describe('turn terminal releases the active turn authority', () => {
     h.emitTurnTerminal('om_retry', 'failed', 'x', 1);
     expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_retry', dispatchAttempt: 2 }]);
     expect(h.retiredTurnIds.has('om_retry')).toBe(false);
+  });
+});
+
+describe('queued type-ahead advance skips turns whose terminal already went out', () => {
+  function withMarker(fn: (marker: string) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), 'terminal-authority-marker-'));
+    try { fn(join(dir, 'marker')); } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  const readMarker = (marker: string) => JSON.parse(readFileSync(marker, 'utf8'));
+
+  it('never re-attaches authority to a finished turn the PID marker still names', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_host');
+      h.queuedTypeAheadTurns.push({ turnId: 'om_absorbed' });
+      // The send hook promoted the queued turn on disk while the host ran.
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_absorbed',
+        queuedTurns: [{ turnId: 'om_absorbed' }] }));
+      h.emitTurnTerminal('om_host', 'completed');
+      // Terminal claimed without the in-memory retire (e.g. another emitter).
+      h.emittedTurnTerminals.claim('sid', 'om_absorbed', undefined, 'completed');
+
+      expect(h.syncQueuedTurnsFromMarkerDisk()).toBe(false);
+      expect(h.advanceQueuedTypeAheadTurn('prompt_ready')).toBe(false);
+
+      expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+      expect(h.queuedTypeAheadTurns).toEqual([]);
+      expect(h.retiredTurnIds.has('om_absorbed')).toBe(true);
+      expect(h.activeTurnBlocks({ turnId: 'schedule:task:1', queueAfterActiveTurn: true })).toBe(false);
+    });
+  });
+
+  it('advances past an absorbed B to the unfinished C through the PID marker', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_host');
+      h.queuedTypeAheadTurns.push({ turnId: 'om_B' }, { turnId: 'om_C' });
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_B',
+        queuedTurns: [{ turnId: 'om_B' }, { turnId: 'om_C' }] }));
+      h.emitTurnTerminal('om_host', 'completed');
+      h.emittedTurnTerminals.claim('sid', 'om_B', undefined, 'completed');
+
+      expect(h.advanceQueuedTypeAheadTurn('prompt_ready')).toBe(true);
+
+      expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+      expect(h.currentBotmuxTurnId).toBe('om_C');
+      expect(h.queuedTypeAheadTurns).toEqual([]);
+      expect(readMarker(marker).turnId).toBe('om_C');
+      expect(h.retiredTurnIds.has('om_B')).toBe(true);
+    });
+  });
+
+  it('does not re-queue a finished turn that only the PID marker still lists', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_running');
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_running',
+        queuedTurns: [{ turnId: 'om_B' }, { turnId: 'om_C' }] }));
+      h.emittedTurnTerminals.claim('sid', 'om_B', undefined, 'completed');
+
+      h.syncQueuedTurnsFromMarkerDisk();
+
+      expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_C' }]);
+    });
+  });
+
+  it('skips a finished head in memory and advances to the next unfinished record', () => {
+    const h = harness();
+    startTurn(h, 'om_host');
+    h.queuedTypeAheadTurns.push({ turnId: 'om_B' }, { turnId: 'om_C' });
+    h.emitTurnTerminal('om_host', 'completed');
+    h.emittedTurnTerminals.claim('sid', 'om_B', undefined, 'completed');
+
+    expect(h.advanceQueuedTypeAheadTurn('prompt_ready')).toBe(true);
+
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+    expect(h.retiredTurnIds.has('om_B')).toBe(true);
+  });
+
+  it('leaves authority untouched when every queued record has finished', () => {
+    const h = harness();
+    startTurn(h, 'om_running');
+    h.queuedTypeAheadTurns.push({ turnId: 'om_B' });
+    h.emittedTurnTerminals.claim('sid', 'om_B', undefined, 'completed');
+
+    expect(h.advanceQueuedTypeAheadTurn('prompt_ready')).toBe(false);
+
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_running');
+    expect(h.currentBotmuxTurnId).toBe('om_running');
   });
 });
