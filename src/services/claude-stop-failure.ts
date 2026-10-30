@@ -33,7 +33,7 @@ import {
   closeSync, constants as fsConstants, fstatSync, openSync, readdirSync, readSync, renameSync,
   unlinkSync, writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { classifyClaudeTerminalEvent, type ClaudeTerminalOutcome } from './claude-transcript.js';
 
 /** How long the transcript path gets to settle the failed turn before the
@@ -43,12 +43,14 @@ import { classifyClaudeTerminalEvent, type ClaudeTerminalOutcome } from './claud
 export const CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS = 5_000;
 
 /** How far before the report an API-error record in the transcript still
- *  counts as this failure's. Claude writes the record before it starts the
- *  hook client, so normally it is a second or two old. */
+ *  counts as this failure's. The record lands within a second or two of the
+ *  report, on either side; it is looked for once the grace period is over, so
+ *  one written more than the grace period after the report is missed. */
 export const CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS = 60_000;
 
-/** A notice for the same error code is not repeated within this window: with
- *  no turn to settle it carries no new information for the chat. */
+/** When the transcript cannot tell whether the failure is on record, a notice
+ *  for the same error code is not repeated within this window. A failure that
+ *  is on record is told once per record instead. */
 export const CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS = 60 * 60_000;
 
 export interface ClaudeStopFailureReport {
@@ -195,7 +197,8 @@ export type ClaudeStopFailureFallback =
      *  `unrecorded`: no turn to settle, and the transcript holds no API-error
      *  record for it — the conversation's turns ended normally, so the
      *  failure did not stop any work there.
-     *  `repeated`: the same notice went out recently. */
+     *  `repeated`: this failure was already told (same record, or the same
+     *  error code within the cooldown when there is no record to go by). */
     reason: 'unclassified' | 'rate_limited' | 'surfaced' | 'unrecorded' | 'repeated';
   }
   /** The turn is still open: settle it, so the daemon continues or reports it. */
@@ -205,6 +208,47 @@ export type ClaudeStopFailureFallback =
    *  running, the claim named another turn, or the CLI already moved on to
    *  the next input. Tell the chat the work stopped. */
   | { action: 'notify'; errorCode: string };
+
+/**
+ * Whether the conversation's transcript holds the API-error record of a
+ * failure, merged over the transcripts that may hold it: the one the bridge
+ * reads, and the one the hook named when it lies under the CLI's data dir.
+ * Returns the record's key, `false` only when every transcript that may hold
+ * the record was read and none does, else undefined (cannot tell). A path the
+ * hook named but that cannot be checked keeps the answer at undefined: the
+ * bridge's file alone may be the wrong one.
+ */
+export function claudeStopFailureTranscriptRecord(input: {
+  bridgeTranscriptPath: string | undefined;
+  reportTranscriptPath: string | undefined;
+  dataDir: string | undefined;
+  sinceMs: number;
+  /** Resolve symlinks; undefined when the path does not exist. */
+  canonical: (path: string) => string | undefined;
+  probe: (path: string, sinceMs: number) => string | false | undefined;
+}): string | false | undefined {
+  const paths: string[] = [];
+  let incomplete = false;
+  const bridge = input.bridgeTranscriptPath ? input.canonical(input.bridgeTranscriptPath) : undefined;
+  if (bridge) paths.push(bridge);
+  else incomplete = true;
+  if (input.reportTranscriptPath) {
+    const reported = input.canonical(input.reportTranscriptPath);
+    const root = input.dataDir ? input.canonical(input.dataDir) : undefined;
+    if (reported && root && reported.endsWith('.jsonl') && reported.startsWith(root + sep)) {
+      if (!paths.includes(reported)) paths.push(reported);
+    } else {
+      incomplete = true;
+    }
+  }
+  let answer: false | undefined = incomplete ? undefined : false;
+  for (const path of paths) {
+    const record = input.probe(path, input.sinceMs);
+    if (record) return record;
+    if (record === undefined) answer = undefined;
+  }
+  return paths.length > 0 ? answer : undefined;
+}
 
 /**
  * Decide, once the grace period is over, how the failure reaches the chat.
@@ -230,8 +274,8 @@ export function decideClaudeStopFailureFallback(input: {
   /** The transcript holds an API-error record from around the report;
    *  undefined when it could not be read. */
   recorded?: boolean;
-  /** A notice with this error code went out within the cooldown. */
-  recentlyNotified?: boolean;
+  /** This failure was already told to the chat. */
+  repeated?: boolean;
 }): ClaudeStopFailureFallback {
   const { outcome } = input;
   if (!outcome || outcome.status === 'completed') return { action: 'skip', reason: 'unclassified' };
@@ -240,11 +284,11 @@ export function decideClaudeStopFailureFallback(input: {
   if (input.turnId && !input.settled && input.cliIdle) {
     return { action: 'emit', status: outcome.status, errorCode: outcome.errorCode, retryable: outcome.retryable };
   }
-  // Claude writes the API-error record before it runs the hook, so a failure
-  // that stopped the conversation's work is on record. Without one there is
-  // nothing to tell the chat; an unreadable transcript still notifies.
+  // A failure that stopped the conversation's work is on record in its
+  // transcript by the end of the grace period. Without one there is nothing
+  // to tell the chat; a transcript that cannot tell still notifies.
   if (input.recorded === false) return { action: 'skip', reason: 'unrecorded' };
-  if (input.recentlyNotified) return { action: 'skip', reason: 'repeated' };
+  if (input.repeated) return { action: 'skip', reason: 'repeated' };
   return { action: 'notify', errorCode: outcome.errorCode };
 }
 
@@ -267,10 +311,13 @@ export interface ClaudeStopFailureContext<TTimer = unknown> {
   /** When the worker last emitted a failed/ambiguous terminal or a failure
    *  notice. */
   lastFailureSurfacedAtMs: () => number | undefined;
-  /** Whether the transcript holds an API-error record at or after `sinceMs`;
-   *  undefined when it cannot be read. `reportTranscriptPath` is the one the
-   *  hook named. */
-  transcriptRecordsApiError: (sinceMs: number, reportTranscriptPath: string | undefined) => boolean | undefined;
+  /** The key of the API-error record the transcript holds at or after
+   *  `sinceMs`, `false` for none, undefined when it cannot tell (see
+   *  claudeStopFailureTranscriptRecord). `reportTranscriptPath` is the one
+   *  the hook named, undefined for a notify-only report. */
+  transcriptApiErrorRecord: (sinceMs: number, reportTranscriptPath: string | undefined) => string | false | undefined;
+  /** A notice already went out for this record. */
+  recordNoticed: (recordKey: string) => boolean;
   /** When this worker last sent a StopFailure notice with `errorCode`. */
   lastNoticeAtMs: (errorCode: string) => number | undefined;
   now: () => number;
@@ -281,8 +328,9 @@ export interface ClaudeStopFailureContext<TTimer = unknown> {
     dispatchAttempt: number | undefined,
     retryable: boolean,
   ) => void;
-  /** Plain chat notice; `replyTurnId` picks the reply target. */
-  notify: (errorCode: string, replyTurnId: string | undefined) => void;
+  /** Plain chat notice; `replyTurnId` picks the reply target, `recordKey`
+   *  names the transcript record it tells (when there is one). */
+  notify: (errorCode: string, replyTurnId: string | undefined, recordKey: string | undefined) => void;
   log: (line: string) => void;
 }
 
@@ -339,7 +387,7 @@ export function handleClaudeStopFailureReport<TTimer>(
   ctx.log(`Claude StopFailure (${report.error}${opts.notifyOnly ? ', notify-only' : ''}) for turn `
     + `${failedTurn.turnId?.slice(0, 12) ?? '-'}; waiting ${CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS}ms `
     + 'for the transcript to surface it'
-    + (detail ? `; message: ${JSON.stringify(detail.slice(0, 200))}` : ''));
+    + (detail ? `; message: ${JSON.stringify(detail.slice(0, 120))}` : ''));
   return ctx.schedule(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS, () => {
     try {
       ctx.catchUp();
@@ -349,6 +397,12 @@ export function handleClaudeStopFailureReport<TTimer>(
     const settledStatus = failedTurn.turnId
       ? ctx.settledStatus(failedTurn.turnId, failedTurn.dispatchAttempt)
       : undefined;
+    // A sandbox controls a notify-only report's bytes: only the bridge's own
+    // transcript is read for it.
+    const record = ctx.transcriptApiErrorRecord(
+      arrivedAtMs - CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS,
+      opts.notifyOnly ? undefined : report.transcriptPath,
+    );
     const decision = decideClaudeStopFailureFallback({
       outcome,
       turnId: settleTurnId,
@@ -358,9 +412,11 @@ export function handleClaudeStopFailureReport<TTimer>(
       // the report. Otherwise only a failure surfaced around the report counts.
       surfaced: settledStatus === 'failed' || settledStatus === 'ambiguous'
         || (ctx.lastFailureSurfacedAtMs() ?? -Infinity) >= surfacedSinceMs,
-      recorded: ctx.transcriptRecordsApiError(arrivedAtMs - CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS, report.transcriptPath),
-      recentlyNotified: outcome !== undefined && 'errorCode' in outcome
-        && ctx.now() - (ctx.lastNoticeAtMs(outcome.errorCode) ?? -Infinity) < CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS,
+      recorded: record === undefined ? undefined : record !== false,
+      repeated: typeof record === 'string'
+        ? ctx.recordNoticed(record)
+        : outcome !== undefined && 'errorCode' in outcome
+          && ctx.now() - (ctx.lastNoticeAtMs(outcome.errorCode) ?? -Infinity) < CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS,
     });
     switch (decision.action) {
       case 'skip':
@@ -374,7 +430,7 @@ export function handleClaudeStopFailureReport<TTimer>(
       case 'notify':
         ctx.log(`Claude StopFailure fallback: no open turn to settle and nothing surfaced the failure; `
           + `notifying (${decision.errorCode})`);
-        ctx.notify(decision.errorCode, failedTurn.turnId);
+        ctx.notify(decision.errorCode, failedTurn.turnId, typeof record === 'string' ? record : undefined);
     }
   });
 }

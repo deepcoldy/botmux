@@ -702,35 +702,40 @@ export function transcriptShowsTurnDurationMarker(path: string): boolean {
   }
 }
 
-/** How far back from EOF transcriptRecordsApiErrorSince looks. */
+/** How far back from EOF transcriptApiErrorRecordSince looks. */
 const API_ERROR_RECORD_PROBE_MAX_BYTES = 1024 * 1024;
 
-/** Whether the transcript holds an API-error record (`isApiErrorMessage:true`)
- *  stamped at or after `sinceMs`. Undefined when the file cannot be read, so a
- *  caller can tell "no record" from "could not look". */
-export function transcriptRecordsApiErrorSince(path: string, sinceMs: number): boolean | undefined {
+/** The API-error record (`isApiErrorMessage:true`) a transcript holds stamped
+ *  at or after `sinceMs`: its key (uuid, else its timestamp) when there is
+ *  one, `false` when the scan reached records older than `sinceMs` without
+ *  finding one, and undefined when it could not tell — the file is missing or
+ *  unreadable, or the probe window ran out first. Timestamps are compared with
+ *  the caller's clock: Claude and the worker share the host. */
+export function transcriptApiErrorRecordSince(path: string, sinceMs: number): string | false | undefined {
   if (!path || !existsSync(path)) return undefined;
   try {
     const completeEnd = baselineJsonlCursor(path).newOffset;
-    let found = false;
+    const floor = Math.max(0, completeEnd - API_ERROR_RECORD_PROBE_MAX_BYTES);
+    let key: string | undefined;
+    let reachedOlder = false;
     scanJsonlBackward(path, {
       endOffset: completeEnd,
-      floor: Math.max(0, completeEnd - API_ERROR_RECORD_PROBE_MAX_BYTES),
+      floor,
       dropPartialAtFloor: true,
       onLine: (line) => {
-        const text = line.toString('utf8');
         let ev: TranscriptEvent;
-        try { ev = JSON.parse(text) as TranscriptEvent; } catch { return false; }
+        try { ev = JSON.parse(line.toString('utf8')) as TranscriptEvent; } catch { return false; }
         const at = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
-        if (Number.isFinite(at) && at < sinceMs) return true; // older than the window: stop
-        if (ev.isApiErrorMessage === true && (!Number.isFinite(at) || at >= sinceMs)) {
-          found = true;
+        if (Number.isFinite(at) && at < sinceMs) { reachedOlder = true; return true; }
+        if (ev.isApiErrorMessage === true) {
+          key = ev.uuid ?? ev.timestamp ?? `${path}#record`;
           return true;
         }
         return false;
       },
     });
-    return found;
+    if (key !== undefined) return key;
+    return reachedOlder || floor === 0 ? false : undefined;
   } catch {
     return undefined;
   }

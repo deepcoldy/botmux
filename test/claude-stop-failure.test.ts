@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   claudeStopFailureBelongsToOwner,
+  claudeStopFailureTranscriptRecord,
   classifyClaudeStopFailure,
   CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS,
   CLAUDE_STOP_FAILURE_RECORD_LOOKBACK_MS,
@@ -26,7 +27,7 @@ import {
   type ClaudeStopFailureReport,
   writeClaudeStopFailureOutboxReport,
 } from '../src/services/claude-stop-failure.js';
-import { classifyClaudeTerminalEvent, transcriptRecordsApiErrorSince, type TranscriptEvent } from '../src/services/claude-transcript.js';
+import { classifyClaudeTerminalEvent, transcriptApiErrorRecordSince, type TranscriptEvent } from '../src/services/claude-transcript.js';
 
 const SESSION_ID = '7bb7a763-27bb-449b-9b1f-72159ee31588';
 const TRANSCRIPT = `/home/u/.claude/projects/-work/${SESSION_ID}.jsonl`;
@@ -213,7 +214,7 @@ describe('decideClaudeStopFailureFallback', () => {
   });
 
   it('does not repeat a notice that went out recently', () => {
-    expect(decideClaudeStopFailureFallback({ ...base, settled: true, recorded: true, recentlyNotified: true }))
+    expect(decideClaudeStopFailureFallback({ ...base, settled: true, recorded: true, repeated: true }))
       .toEqual({ action: 'skip', reason: 'repeated' });
   });
 
@@ -227,8 +228,9 @@ describe('handleClaudeStopFailureReport', () => {
   function harness(opts: {
     settled?: 'completed' | 'failed';
     surfacedBy?: 'before' | 'catch-up';
-    /** What the transcript holds around the report (default: the API-error record). */
-    recorded?: boolean | 'unreadable';
+    /** What the transcript holds around the report: a record key (default
+     *  'rec-1'), false for none, undefined when it cannot tell. */
+    record?: string | false | undefined;
   } = {}) {
     const timers: Array<{ delayMs: number; run: () => void }> = [];
     const settled = new Map<string, string>(opts.settled ? [['om_failed', opts.settled]] : []);
@@ -237,7 +239,9 @@ describe('handleClaudeStopFailureReport', () => {
     const emitted: unknown[][] = [];
     const notices: unknown[][] = [];
     const noticeAt = new Map<string, number>();
+    const noticedRecords = new Set<string>();
     const recordQueries: Array<[number, string | undefined]> = [];
+    let record: string | false | undefined = 'record' in opts ? opts.record : 'rec-1';
     let idle = true;
     const ctx = {
       owner: { cliPid: 4242, cliSessionIds: new Set([SESSION_ID]), transcriptPath: TRANSCRIPT },
@@ -251,16 +255,22 @@ describe('handleClaudeStopFailureReport', () => {
       cliIdle: () => idle,
       isKnownTurn: (turnId: string) => ['om_failed', 'om_older', 'om_next'].includes(turnId),
       lastFailureSurfacedAtMs: () => surfacedAt,
-      transcriptRecordsApiError: (sinceMs: number, path: string | undefined) => {
+      transcriptApiErrorRecord: (sinceMs: number, path: string | undefined) => {
         recordQueries.push([sinceMs, path]);
-        return opts.recorded === 'unreadable' ? undefined : (opts.recorded ?? true);
+        return record;
       },
+      setRecord: (value: string | false | undefined) => { record = value; },
+      recordNoticed: (key: string) => noticedRecords.has(key),
       lastNoticeAtMs: (code: string) => noticeAt.get(code),
       now: () => clock,
       advance: (ms: number) => { clock += ms; },
       setIdle: (value: boolean) => { idle = value; },
       emit: (...args: unknown[]) => { emitted.push(args); },
-      notify: (...args: unknown[]) => { notices.push(args); noticeAt.set(args[0] as string, clock); },
+      notify: (code: string, replyTurnId: string | undefined, recordKey: string | undefined) => {
+        notices.push([code, replyTurnId]);
+        noticeAt.set(code, clock);
+        if (recordKey) noticedRecords.add(recordKey);
+      },
       log: () => undefined,
     };
     return { ctx, timers, emitted, notices, recordQueries };
@@ -322,7 +332,7 @@ describe('handleClaudeStopFailureReport', () => {
   it('sends nothing for a closed turn when the transcript holds no record of the failure', () => {
     // Seen live: a report with error "unknown" some seconds after a turn that
     // ended normally, no API-error record anywhere in the transcript.
-    const { ctx, timers, emitted, notices, recordQueries } = harness({ settled: 'completed', recorded: false });
+    const { ctx, timers, emitted, notices, recordQueries } = harness({ settled: 'completed', record: false });
     handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
     const arrivedAt = ctx.now();
     ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
@@ -334,26 +344,44 @@ describe('handleClaudeStopFailureReport', () => {
   });
 
   it('still notifies for a closed turn when the transcript cannot be read', () => {
-    const { ctx, timers, notices } = harness({ settled: 'completed', recorded: 'unreadable' });
+    const { ctx, timers, notices } = harness({ settled: 'completed', record: undefined });
     handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
     timers[0].run();
     expect(notices).toEqual([['provider_server_error', 'om_failed']]);
   });
 
-  it('sends the same notice at most once per cooldown', () => {
-    const { ctx, timers, notices } = harness({ settled: 'completed' });
-    const report = () => {
-      handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
-      ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
-      timers.at(-1)!.run();
-    };
-    report();
-    ctx.advance(CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS - 2 * CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
-    report();
-    expect(notices).toHaveLength(1);
-    ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
-    report();
-    expect(notices).toHaveLength(2);
+  function reportAgain(h: ReturnType<typeof harness>) {
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, h.ctx);
+    h.ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
+    h.timers.at(-1)!.run();
+  }
+
+  it('tells each recorded failure once, and a new one even right after', () => {
+    const h = harness({ settled: 'completed' });
+    reportAgain(h);
+    reportAgain(h); // the same record reported twice
+    expect(h.notices).toHaveLength(1);
+    h.ctx.setRecord('rec-2'); // another failure, seconds later
+    reportAgain(h);
+    expect(h.notices).toHaveLength(2);
+  });
+
+  it('without a record to go by, sends the same notice at most once per cooldown', () => {
+    const h = harness({ settled: 'completed', record: undefined });
+    reportAgain(h);
+    h.ctx.advance(CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS - 2 * CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
+    reportAgain(h);
+    expect(h.notices).toHaveLength(1);
+    h.ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
+    reportAgain(h);
+    expect(h.notices).toHaveLength(2);
+  });
+
+  it('reads only the bridge transcript for a notify-only report', () => {
+    const { ctx, timers, recordQueries } = harness({ settled: 'completed' });
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx, { notifyOnly: true });
+    timers[0].run();
+    expect(recordQueries.map(([, path]) => path)).toEqual([undefined]);
   });
 
   it('reports instead of failing the queued input Claude started after the failure', () => {
@@ -420,7 +448,44 @@ describe('handleClaudeStopFailureReport', () => {
   });
 });
 
-describe('transcriptRecordsApiErrorSince', () => {
+describe('claudeStopFailureTranscriptRecord', () => {
+  const DATA = '/home/u/.claude';
+  const BRIDGE = `${DATA}/projects/-work/a.jsonl`;
+  const OTHER = `${DATA}/projects/-work/b.jsonl`;
+  const lookup = (opts: {
+    bridge?: string; reported?: string; files: Record<string, string | false | undefined>;
+  }) => claudeStopFailureTranscriptRecord({
+    bridgeTranscriptPath: opts.bridge,
+    reportTranscriptPath: opts.reported,
+    dataDir: DATA,
+    sinceMs: 0,
+    canonical: path => (path in opts.files || path === DATA ? path : undefined),
+    probe: path => opts.files[path],
+  });
+
+  it('finds the record in the transcript the hook named when the bridge reads another', () => {
+    expect(lookup({ bridge: BRIDGE, reported: OTHER, files: { [BRIDGE]: false, [OTHER]: 'rec' } })).toBe('rec');
+  });
+
+  it('says "no record" only when every transcript that may hold it was read', () => {
+    expect(lookup({ bridge: BRIDGE, reported: BRIDGE, files: { [BRIDGE]: false } })).toBe(false);
+    expect(lookup({ bridge: BRIDGE, reported: OTHER, files: { [BRIDGE]: false, [OTHER]: undefined } })).toBeUndefined();
+  });
+
+  it('cannot tell when the hook named a transcript it cannot check, or there is no bridge transcript', () => {
+    expect(lookup({ bridge: BRIDGE, reported: '/elsewhere/x.jsonl', files: { [BRIDGE]: false, '/elsewhere/x.jsonl': false } }))
+      .toBeUndefined();
+    expect(lookup({ bridge: BRIDGE, reported: `${DATA}/projects/gone.jsonl`, files: { [BRIDGE]: false } })).toBeUndefined();
+    expect(lookup({ reported: OTHER, files: { [OTHER]: false } })).toBeUndefined();
+    expect(lookup({ files: {} })).toBeUndefined();
+  });
+
+  it('answers from the bridge alone for a report that names no transcript', () => {
+    expect(lookup({ bridge: BRIDGE, files: { [BRIDGE]: false } })).toBe(false);
+  });
+});
+
+describe('transcriptApiErrorRecordSince', () => {
   const dirs: string[] = [];
   afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
   const at = (iso: string) => Date.parse(iso);
@@ -439,24 +504,36 @@ describe('transcriptRecordsApiErrorSince', () => {
   it('finds the API-error record Claude writes before running the hook', () => {
     const path = transcriptOf([
       ...turn('2026-10-30T02:40:00.000Z'),
-      { ...transcriptRecord, timestamp: '2026-10-30T02:42:15.000Z' },
+      { ...transcriptRecord, uuid: 'rec-uuid', timestamp: '2026-10-30T02:42:15.000Z' },
       { type: 'system', subtype: 'turn_duration', timestamp: '2026-10-30T02:42:15.010Z', durationMs: 3_000 },
     ]);
-    expect(transcriptRecordsApiErrorSince(path, at('2026-10-30T02:41:16.000Z'))).toBe(true);
+    expect(transcriptApiErrorRecordSince(path, at('2026-10-30T02:41:16.000Z'))).toBe('rec-uuid');
   });
 
   it('reports no record when every turn ended normally, or the only record is older than the window', () => {
-    expect(transcriptRecordsApiErrorSince(transcriptOf([
+    expect(transcriptApiErrorRecordSince(transcriptOf([
       ...turn('2026-10-30T02:41:30.000Z'), ...turn('2026-10-30T02:41:55.000Z'),
     ]), at('2026-10-30T02:41:16.000Z'))).toBe(false);
-    expect(transcriptRecordsApiErrorSince(transcriptOf([
+    expect(transcriptApiErrorRecordSince(transcriptOf([
       { ...transcriptRecord, timestamp: '2026-10-30T01:00:00.000Z' },
       ...turn('2026-10-30T02:41:55.000Z'),
     ]), at('2026-10-30T02:41:16.000Z'))).toBe(false);
   });
 
   it('cannot tell for a transcript that does not exist', () => {
-    expect(transcriptRecordsApiErrorSince('/nonexistent/botmux/session.jsonl', 0)).toBeUndefined();
+    expect(transcriptApiErrorRecordSince('/nonexistent/botmux/session.jsonl', 0)).toBeUndefined();
+  });
+
+  it('cannot tell when the probe window runs out before records older than the window', () => {
+    // A record pushed out of the probe by a large write after it (a big tool
+    // result) must not read as "no record".
+    const big = 'x'.repeat(64 * 1024);
+    const filler = Array.from({ length: 20 }, (_, n) => ({
+      type: 'user', timestamp: `2026-10-30T02:42:${String(20 + n).padStart(2, '0')}.000Z`, message: { content: big },
+    }));
+    expect(transcriptApiErrorRecordSince(transcriptOf([
+      { ...transcriptRecord, timestamp: '2026-10-30T02:42:15.000Z' }, ...filler,
+    ]), at('2026-10-30T02:41:16.000Z'))).toBeUndefined();
   });
 });
 

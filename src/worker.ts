@@ -29,7 +29,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter, relative, extname, resolve as resolvePath, sep as pathSep } from 'node:path';
+import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
@@ -87,7 +87,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, transcriptRecordsApiErrorSince, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, transcriptApiErrorRecordSince, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
@@ -192,7 +192,7 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
-import { drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
+import { claudeStopFailureTranscriptRecord, drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import { InputDeliveryEvidenceTracker } from './services/input-delivery-evidence.js';
 import {
@@ -20100,30 +20100,21 @@ function handleClaudeStopFailure(
     isKnownTurn: turnId => turnId === currentBotmuxTurnId || retiredTurnIds.has(turnId)
       || queuedTypeAheadTurns.some(queued => queued.turnId === turnId),
     lastFailureSurfacedAtMs: () => lastTurnFailureSurfacedAtMs,
-    transcriptRecordsApiError: (sinceMs, reportTranscriptPath) => {
-      // The bridge's transcript, plus the one the hook named when it is a
-      // transcript under this CLI's data dir (the bridge may have lost track).
-      const dataDir = cliAdapter?.claudeDataDir;
-      const paths = new Set<string>();
-      if (bridgeJsonlPath) paths.add(bridgeJsonlPath);
-      if (dataDir && reportTranscriptPath?.endsWith('.jsonl')
-        && resolvePath(reportTranscriptPath).startsWith(resolvePath(dataDir) + pathSep)) {
-        paths.add(resolvePath(reportTranscriptPath));
-      }
-      let answer: boolean | undefined;
-      for (const path of paths) {
-        const recorded = transcriptRecordsApiErrorSince(path, sinceMs);
-        if (recorded) return true;
-        if (recorded === false) answer = false;
-      }
-      return answer;
-    },
+    transcriptApiErrorRecord: (sinceMs, reportTranscriptPath) => claudeStopFailureTranscriptRecord({
+      bridgeTranscriptPath: bridgeJsonlPath,
+      reportTranscriptPath,
+      dataDir: bridgeDataDir,
+      sinceMs,
+      canonical: path => { try { return realpathSync(path); } catch { return undefined; } },
+      probe: transcriptApiErrorRecordSince,
+    }),
+    recordNoticed: recordKey => claudeStopFailureNoticedRecords.has(recordKey),
     lastNoticeAtMs: errorCode => claudeStopFailureNoticeAtMs.get(errorCode),
     now: Date.now,
     emit: (turnId, status, errorCode, dispatchAttempt, retryable) => {
       emitTurnTerminal(turnId, status, errorCode, dispatchAttempt, undefined, retryable);
     },
-    notify: (errorCode, replyTurnId) => {
+    notify: (errorCode, replyTurnId, recordKey) => {
       send({
         type: 'user_notify',
         ...(replyTurnId ? { turnId: replyTurnId } : {}),
@@ -20131,6 +20122,7 @@ function handleClaudeStopFailure(
       });
       lastTurnFailureSurfacedAtMs = Date.now();
       claudeStopFailureNoticeAtMs.set(errorCode, lastTurnFailureSurfacedAtMs);
+      if (recordKey) claudeStopFailureNoticedRecords.add(recordKey);
     },
     log,
   }, opts);
@@ -28940,6 +28932,8 @@ const emittedTurnTerminals = new TurnTerminalDeduper();
 let lastTurnFailureSurfacedAtMs: number | undefined;
 /** When each StopFailure notice code was last sent (see CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS). */
 const claudeStopFailureNoticeAtMs = new Map<string, number>();
+/** Transcript API-error records a StopFailure notice already told. */
+const claudeStopFailureNoticedRecords = new Set<string>();
 /** Opens at each turn's literal CLI write, closes at its terminal. See
  *  turn-execution-clock.ts for why queueing time is deliberately excluded. */
 const turnExecutionClock = new TurnExecutionClock();
