@@ -29365,15 +29365,22 @@ function turnTerminalEmitted(turnId: string, dispatchAttempt?: number): boolean 
  *    The live-durable-retry carve-out lives upstream in
  *    retireTerminatedMarkerTurn, which refuses to place this tombstone while a
  *    sibling attempt is still live.
- *  - The entry's own per-attempt terminal blocks readback; an ordinary
- *    attempt-less terminal for the same turn blocks it too, since a turn
- *    finished under the generic key is equally dead. */
+ *  - The entry's own per-attempt terminal blocks readback. An ordinary
+ *    attempt-less terminal for the same turn blocks it only at a terminal
+ *    outcome ('completed'/'cancelled'): durable delivery legitimately
+ *    re-dispatches after 'failed'/'ambiguous' with dispatchAttempt + 1
+ *    (markVcMeetingDeliveryDispatched), so those statuses must not drop the
+ *    in-flight retry — the following writeCliPidMarker would wipe it from the
+ *    on-disk queue as well. */
 function markerQueuedTurnStillLive(qt: { turnId?: unknown; dispatchAttempt?: unknown }): boolean {
   if (typeof qt?.turnId !== 'string' || !qt.turnId) return false;
   if (retiredTurnIds.has(qt.turnId)) return false;
   const dispatchAttempt = typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined;
   if (turnTerminalEmitted(qt.turnId, dispatchAttempt)) return false;
-  if (dispatchAttempt !== undefined && turnTerminalEmitted(qt.turnId, undefined)) return false;
+  if (dispatchAttempt !== undefined && sessionId) {
+    const genericStatus = emittedTurnTerminals.statusOf(sessionId, qt.turnId, undefined);
+    if (genericStatus === 'completed' || genericStatus === 'cancelled') return false;
+  }
   return true;
 }
 

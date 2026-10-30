@@ -344,18 +344,42 @@ describe('queued type-ahead advance skips turns whose terminal already went out'
     });
   });
 
-  it('does not refill an attempt-qualified marker record whose terminal is the generic key', () => {
-    withMarker(marker => {
-      const h = harness({ markerPath: marker });
-      startTurn(h, 'om_host');
-      // Ordinary IM turns emit terminals without a dispatchAttempt; a marker
-      // record carrying one for the same turn is equally dead.
-      writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_host',
-        queuedTurns: [{ turnId: 'om_G', dispatchAttempt: 3 }] }));
-      h.emittedTurnTerminals.claim('sid', 'om_G', undefined, 'completed');
+  for (const status of ['completed', 'cancelled'] as const) {
+    it(`does not refill an attempt-qualified record whose generic-key terminal is ${status}`, () => {
+      withMarker(marker => {
+        const h = harness({ markerPath: marker });
+        startTurn(h, 'om_host');
+        // Ordinary IM turns emit terminals without a dispatchAttempt; a
+        // completed/cancelled turn is terminal under every delivery policy,
+        // so an attempt-qualified marker record for the same turn is dead.
+        writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_host',
+          queuedTurns: [{ turnId: 'om_G', dispatchAttempt: 3 }] }));
+        h.emittedTurnTerminals.claim('sid', 'om_G', undefined, status);
 
-      h.syncQueuedTurnsFromMarkerDisk();
-      expect(h.queuedTypeAheadTurns).toEqual([]);
+        h.syncQueuedTurnsFromMarkerDisk();
+        expect(h.queuedTypeAheadTurns).toEqual([]);
+      });
     });
-  });
+  }
+
+  for (const status of ['failed', 'ambiguous'] as const) {
+    it(`keeps an attempt-qualified durable retry after a generic-key ${status} terminal`, () => {
+      withMarker(marker => {
+        const h = harness({ markerPath: marker });
+        startTurn(h, 'om_host');
+        // Durable delivery (VC meeting / hidden schedule) re-dispatches after
+        // failed/ambiguous with dispatchAttempt + 1; the attempt-qualified
+        // record IS that retry and must survive both in memory and in the
+        // marker rewrite that follows the sync.
+        writeFileSync(marker, JSON.stringify({ sessionId: 'sid', turnId: 'om_host',
+          queuedTurns: [{ turnId: 'om_T', dispatchAttempt: 2 }] }));
+        h.emittedTurnTerminals.claim('sid', 'om_T', undefined, status);
+
+        h.syncQueuedTurnsFromMarkerDisk();
+        expect(h.queuedTypeAheadTurns).toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+        expect(JSON.parse(readFileSync(marker, 'utf8')).queuedTurns)
+          .toEqual([{ turnId: 'om_T', dispatchAttempt: 2 }]);
+      });
+    });
+  }
 });
