@@ -377,7 +377,8 @@ describe('setCodexAppThreadName', () => {
         FAKE_CODEX_LOG: logPath,
         FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
       },
-      timeoutMs: 200,
+      waitBudgetMs: 200,
+      timeoutMs: 20_000,
       initializeTimeoutMs: 2_000,
       waitForExistingPreview: true,
     });
@@ -404,10 +405,9 @@ describe('setCodexAppThreadName', () => {
     // 处 reject。waitForThreadPreview 必须按「预览不可用」降级返回，让兜底
     // 标题照常写入，而不是把超时错误抛给 setCodexAppThreadName（CI 上同一
     // 缺陷以 "timed out after 1ms" 的尾窗竞态形状出现）。
-    // timeoutMs is both the preview wait budget and each later RPC's timeout
-    // (#2454). Only the first, preview-time read is slow here, so the budget
-    // needs to be short of that read but far above a localhost round trip:
-    // at 200ms a busy CI runner timed out the ordinary thread/name/set (#2454).
+    // Only the wait budget is short of the slow read; the name/set and its
+    // verifying read keep a full request timeout. When one value served both,
+    // a busy CI runner timed out the ordinary name/set at 200ms (#2454).
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-slow-preview-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -420,10 +420,11 @@ describe('setCodexAppThreadName', () => {
       env: {
         ...process.env,
         FAKE_CODEX_LOG: logPath,
-        FAKE_CODEX_THREAD_READ_DELAY_MS: '3000',
+        FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
         FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
       },
-      timeoutMs: 2_000,
+      waitBudgetMs: 200,
+      timeoutMs: 20_000,
       initializeTimeoutMs: 2_000,
       waitForExistingPreview: true,
     });
@@ -442,9 +443,9 @@ describe('setCodexAppThreadName', () => {
     // MIN_POLL_REQUEST_BUDGET_MS=50：总预算低于下限时一次请求都不该发出——
     // 任何 sub-floor 客户端超时的 thread/read 注定在响应落地前超时。用快速
     // 假 app-server 即可区分：有 floor 时等待阶段零请求；删掉 floor 就会发出
-    // 1 次请求（请求被服务器接收即入账，与是否赶上超时无关）。40ms 低于
-    // 50ms floor，同时给随后即时返回的 thread/name/set 与校验 read 留出
-    // localhost IPC 余量。
+    // 1 次请求（请求被服务器接收即入账，与是否赶上超时无关）。40ms 等待
+    // 预算低于 50ms floor；之后的 thread/name/set 与校验 read 用独立的请求
+    // 超时（#2454），不再被同一个 40ms 掐住。
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-floor-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -459,7 +460,8 @@ describe('setCodexAppThreadName', () => {
         FAKE_CODEX_LOG: logPath,
         FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
       },
-      timeoutMs: 40,
+      waitBudgetMs: 40,
+      timeoutMs: 20_000,
       initializeTimeoutMs: 2_000,
       waitForExistingPreview: true,
     });
@@ -473,11 +475,74 @@ describe('setCodexAppThreadName', () => {
     expect(methods).toContain('thread/name/set');
   });
 
+  it('keeps a full request timeout for the title write after a short wait budget runs out', async () => {
+    // #2454: the wait budget and the request timeout used to be one value, so
+    // a short wait also gave thread/name/set and its verifying read that little
+    // time. The fake slows both replies past the wait budget, as a loaded
+    // runner slows a local round trip; the write must still go through.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-split-budget-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    await setCodexAppThreadName({
+      threadId: 'thread-split-budget',
+      name: '[BotMux·Lark] 拆分预算标题',
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
+        FAKE_CODEX_NAME_SET_DELAY_MS: '300',
+        FAKE_CODEX_VERIFY_READ_DELAY_MS: '300',
+      },
+      waitBudgetMs: 200,
+      timeoutMs: 20_000,
+      initializeTimeoutMs: 2_000,
+      waitForExistingPreview: true,
+    });
+
+    const methods = readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line).method);
+    expect(methods).toContain('thread/name/set');
+  });
+
+  it('uses timeoutMs as the wait budget when no waitBudgetMs is given', async () => {
+    // Existing callers pass only timeoutMs and keep their behaviour: the wait
+    // ends after timeoutMs. With a 1s budget and the 250ms poll interval the
+    // wait can make at most a handful of reads (load only makes fewer); a
+    // longer default budget would make many more.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-default-budget-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    await setCodexAppThreadName({
+      threadId: 'thread-default-budget',
+      name: '[BotMux·Lark] 默认预算标题',
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
+      },
+      timeoutMs: 1_000,
+      initializeTimeoutMs: 2_000,
+      waitForExistingPreview: true,
+    });
+
+    const methods = readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line).method);
+    const setIndex = methods.indexOf('thread/name/set');
+    const waitReads = methods.slice(0, setIndex).filter(method => method === 'thread/read').length;
+    expect(setIndex).toBeGreaterThan(-1);
+    expect(waitReads).toBeGreaterThan(0);
+    expect(waitReads).toBeLessThanOrEqual(6);
+  });
+
   it('still writes the title when a slow thread/read exhausts the updatedAfter wait budget', async () => {
     // waitForThreadUpdatedAfter 的 catch 与 preview 等待同形：deadline 处的
     // 客户端超时必须按「等待结束」返回，让标题写入继续，而不是穿透抛出。
-    // 慢响应（3s）> 整段预算（2s），且 baseline 永不可达双保险。预算同时是
-    // 之后 name/set 的 RPC 超时，必须远大于本机往返（同上一条，#2454）。
+    // 慢响应（300ms）> 整段等待预算（200ms），且 baseline 永不可达双保险；
+    // 之后的 name/set 用独立的请求超时（同上一条，#2454）。
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-updatedafter-slow-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -490,9 +555,10 @@ describe('setCodexAppThreadName', () => {
       env: {
         ...process.env,
         FAKE_CODEX_LOG: logPath,
-        FAKE_CODEX_THREAD_READ_DELAY_MS: '3000',
+        FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
       },
-      timeoutMs: 2_000,
+      waitBudgetMs: 200,
+      timeoutMs: 20_000,
       initializeTimeoutMs: 2_000,
       waitForUpdatedAfter: 999_999,
     });
@@ -515,7 +581,7 @@ describe('setCodexAppThreadName', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-preview-clock-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
-    const timeoutMs = 200;
+    const waitBudgetMs = 200;
     const base = 1_700_000_000_000;
 
     const originalNow = Date.now;
@@ -533,12 +599,13 @@ describe('setCodexAppThreadName', () => {
           FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
           FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
         },
-        timeoutMs,
+        waitBudgetMs,
+        timeoutMs: 20_000,
         initializeTimeoutMs: 2_000,
         waitForExistingPreview: true,
       });
       await waitForLogContaining(logPath, 'thread/read');
-      pinnedNow = base + timeoutMs - 1;
+      pinnedNow = base + waitBudgetMs - 1;
       await completion;
     } finally {
       Date.now = originalNow;
@@ -559,7 +626,7 @@ describe('setCodexAppThreadName', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-updatedafter-clock-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
-    const timeoutMs = 200;
+    const waitBudgetMs = 200;
     const base = 1_700_000_000_000;
 
     const originalNow = Date.now;
@@ -576,12 +643,13 @@ describe('setCodexAppThreadName', () => {
           FAKE_CODEX_LOG: logPath,
           FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
         },
-        timeoutMs,
+        waitBudgetMs,
+        timeoutMs: 20_000,
         initializeTimeoutMs: 2_000,
         waitForUpdatedAfter: 999_999,
       });
       await waitForLogContaining(logPath, 'thread/read');
-      pinnedNow = base + timeoutMs - 1;
+      pinnedNow = base + waitBudgetMs - 1;
       await completion;
     } finally {
       Date.now = originalNow;
@@ -613,7 +681,8 @@ describe('setCodexAppThreadName', () => {
         FAKE_CODEX_LOG: logPath,
         FAKE_CODEX_BEHAVIOR: 'thread-read-error',
       },
-      timeoutMs: 60,
+      waitBudgetMs: 60,
+      timeoutMs: 20_000,
       initializeTimeoutMs: 2_000,
       waitForExistingPreview: true,
     })).rejects.toThrow('thread unavailable: thread-final-window-error');

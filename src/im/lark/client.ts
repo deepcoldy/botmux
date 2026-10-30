@@ -1522,6 +1522,48 @@ export async function getMessageDetail(
   return res.data;
 }
 
+/** Parse the sender union_id from an IM message fetched with
+ * `user_id_type=union_id`. Kept pure so malformed provider responses can be
+ * tested without mocking the Lark SDK. */
+export function messageSenderUnionIdFromDetail(detail: unknown): string | null {
+  const item = (detail as { items?: unknown[] } | null)?.items?.[0] as {
+    sender?: { sender_type?: unknown; id_type?: unknown; id?: unknown };
+  } | undefined;
+  const sender = item?.sender;
+  const unionId = typeof sender?.id === 'string' ? sender.id.trim() : '';
+  if (sender?.sender_type !== 'user'
+    || sender.id_type !== 'union_id'
+    || !/^on_[A-Za-z0-9_-]{4,128}$/.test(unionId)) return null;
+  return unionId;
+}
+
+/**
+ * Recover the tenant-stable sender identity for one exact inbound message.
+ * Lark sometimes omits union_id from the event envelope while the message API
+ * can still return the same sender directly in union-id form.
+ */
+export async function resolveMessageSenderUnionId(
+  larkAppId: string,
+  messageId: string,
+): Promise<string | null> {
+  if (!messageId.startsWith('om_')) return null;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      user_id_type: 'union_id',
+      with_sender_name: 'false',
+    }, { timeoutMs: 2_000 });
+    if (res?.code !== 0) return null;
+    return messageSenderUnionIdFromDetail(res.data);
+  } catch (err) {
+    logger.debug(
+      `[union_id] message sender resolve failed for ${messageId.substring(0, 12)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
 /** Resolve a message's chat without collapsing provider failures into absence.
  * Authorization gates must distinguish unavailable evidence from a mismatch. */
 export async function lookupMessageChatId(

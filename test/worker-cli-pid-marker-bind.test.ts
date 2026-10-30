@@ -50,7 +50,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
       activeTurnAuthority: new ActiveTurnAuthority(),
       retiredTurnIds: new Set<string>(),
       queuedTypeAheadTurns: [],
-      queuedTurnAdvanceConsumedForPrompt: false,
+      queuedTurnAdvanceConsumedForPrompt: undefined,
       markTurnRetired: () => {},
       markActiveTurnStarted: () => {},
       adoptDisplacedActiveTurn: () => { throw new Error('no turn was current before the bind'); },

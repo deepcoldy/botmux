@@ -2,6 +2,7 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
+import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
 import { CLI_DISPLAY_NAMES } from '../../adapters/cli/display-names.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
@@ -487,6 +488,7 @@ export function buildSessionCard(
   locale?: Locale,
   localCliReady = false,
   runtimeDisplayName?: string,
+  sessionSandbox?: SandboxMode,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -527,6 +529,15 @@ export function buildSessionCard(
   const card = wideCard({
     header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
+      // Frozen session sandbox (oncall / scratch) gets one notation line; an
+      // unsandboxed session keeps the legacy card byte-for-byte.
+      ...(sessionSandbox === 'oncall' || sessionSandbox === 'scratch'
+        ? [{
+            tag: 'markdown',
+            content: t(sessionSandbox === 'scratch' ? 'card.body.session_sandbox_scratch' : 'card.body.session_sandbox_oncall', undefined, locale),
+            text_size: 'notation',
+          }]
+        : []),
       { tag: 'action', actions },
     ],
   });

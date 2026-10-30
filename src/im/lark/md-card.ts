@@ -755,7 +755,7 @@ export function contextOverCompactThreshold(
 /** Rounded, clamped context percentage, or undefined when the CLI reports no
  *  window (⇒ no percentage to show). Shared so the footer text and
  *  {@link contextOverCompactThreshold} can never disagree on the value. */
-function contextPercentUsed(usage: CardUsageSnapshot): number | undefined {
+export function contextPercentUsed(usage: CardUsageSnapshot): number | undefined {
   // statusline 给的 contextPercent 优先（Claude Code 的 transcript 本身没有窗口字段，
   // 这是它唯一的百分比来源）；其余 CLI 仍走 transcript 的 percentUsed。
   const pct = usage.quota?.contextPercent ?? usage.context?.percentUsed;

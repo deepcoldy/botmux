@@ -3,7 +3,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaExec } from './model-catalog-json.js';
-import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
+import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { traeCliStatePath, traeConfigPath, traeHomeFor, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
@@ -24,6 +24,7 @@ import {
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
 import { traexRestoredComposerReady, traexViewportFooterBusy } from './traex-footer.js';
+import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION } from './traex-version.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -370,6 +371,8 @@ export const traexBridgeSpec: StructuredBridgeSpec = {
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
+  const resolvedBin = (): string => (cachedBin ??= resolveCommand(rawBin));
+  let launchNotice: CliLaunchNotice | undefined;
   return {
     id: 'traex',
     mcpGateway: {
@@ -393,9 +396,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // The CLI must read the Gateway entry even when ~/.trae is not exposed.
     // Keep the shared config read-only; hooks/plugins must not become writable.
     sandboxReadonlyPaths: env => [traeConfigPath(env), ...traeMigrationDoneMarkers(env)],
-    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+    get resolvedBin(): string { return resolvedBin(); },
+
+    launchNotice: () => launchNotice,
 
     buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+      launchNotice = undefined;
       // TraeX shares Codex's low-quota picker and notice setting. Disable it
       // per process so a message-submit Enter cannot confirm a model switch.
       const modelNudgeArgs = hideRateLimitModelNudge
@@ -411,6 +417,22 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         // codex's config schema; disable at the process level, never user-global.
         return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
       }
+      // Releases before the baseline reject the hook-trust flag at argv parsing
+      // and exit; leave it out for them (they have no hook-trust gate to pass
+      // either) and tell the user to upgrade. Unknown version → pass it as before.
+      let hookTrustFlag = !disableCliBypass && !!bypassHookTrust;
+      if (hookTrustFlag) {
+        const support = probeTraexHookTrustSupport(resolvedBin());
+        if (support.status === 'unsupported') {
+          hookTrustFlag = false;
+          launchNotice = {
+            kind: 'flag_needs_newer_cli',
+            flag: TRAEX_HOOK_TRUST_FLAG,
+            version: support.version,
+            minVersion: TRAEX_HOOK_TRUST_MIN_VERSION,
+          };
+        }
+      }
       const baseArgs = [
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',
@@ -422,7 +444,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           // `bypassHookTrust` toggle as codex (default ON, operator can disable —
           // it trusts ALL hook sources, not only botmux's), still ANDed with the
           // existing bypass decision: restricted bots must not gain hook trust.
-          ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
+          ...(hookTrustFlag ? [TRAEX_HOOK_TRUST_FLAG] : []),
         ] : []),
         '--no-alt-screen',
         ...modelNudgeArgs,
