@@ -10,6 +10,7 @@ import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser,
 import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
+import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
 
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { drainTraexRollout } from '../src/services/traex-transcript.js';
@@ -104,6 +105,9 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
     scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
     durableTurnInFlight: false, preserveActiveTurnAuthorityForReady: false,
     releaseActiveTurnAuthority: release,
+    queuedTurnAdvanceConsumedForPrompt: undefined, queuedTypeAheadTurns: [],
+    syncQueuedTurnsFromMarkerDisk: () => false,
+    decideQueuedReadyTransition,
     // These cases drive a turn already in flight, so the first prompt has been
     // admitted; the traex viewport veto (covered by the startup integration
     // suite) is inert here.

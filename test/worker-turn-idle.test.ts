@@ -169,7 +169,7 @@ setInterval(() => {
   } catch {}
 }, 20);
 `
-    : '#!/bin/sh\nexec sleep 300\n');
+    : '#!/bin/sh\nstty -echo 2>/dev/null\nexec sleep 300\n');
   chmodSync(fakeCli, 0o755);
 
   const sessionId = `turnidle${Date.now().toString(36)}${process.pid.toString(36)}`;
