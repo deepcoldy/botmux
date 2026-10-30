@@ -632,7 +632,7 @@ import {
   runAdoptSessionRenameSequence,
 } from './services/adopt-input-sequence.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
-import { downgradeForbiddenReadWrite, forbiddenReadWriteMessage, defaultProtectedRoots, isAbsoluteSandboxEntry } from './services/sandbox-path-guard.js';
+import { downgradeForbiddenReadWrite, forbiddenReadWriteMessage, defaultProtectedRoots, isAbsoluteSandboxEntry, dropReadOnlyFilesystemRoot, readOnlyRootMessage } from './services/sandbox-path-guard.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from './utils/pty.js';
 import {
@@ -23663,9 +23663,15 @@ async function spawnCli(
     if (droppedRoRelative.length) {
       log(`[sandbox] sandboxPaths readOnly relative entries ignored (must be absolute or ~/-prefixed): ${droppedRoRelative.join(', ')}`);
     }
-    const userLists = droppedRoRelative.length && downgradedLists
+    const absoluteLists = droppedRoRelative.length && downgradedLists
       ? { ...downgradedLists, readOnly: downgradedLists.readOnly?.filter(p => isAbsoluteSandboxEntry(p, hostHomeDir)) }
       : downgradedLists;
+    // A stored read-only `/` would make bwrap exit at launch; the save path
+    // refuses it now, older configs still carry it.
+    const { lists: userLists, dropped: droppedRoRoot } = dropReadOnlyFilesystemRoot(absoluteLists, hostHomeDir);
+    if (droppedRoRoot.length) {
+      log(`[sandbox] sandboxPaths readOnly entries ignored: ${readOnlyRootMessage(droppedRoRoot)}`);
+    }
     const droppedUser: string[] = [];
     const resolveUser = (paths?: readonly string[]) => {
       const out: string[] = [];

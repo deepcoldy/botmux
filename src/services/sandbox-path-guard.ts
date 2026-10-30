@@ -167,18 +167,59 @@ export function forbiddenReadWriteMessage(found: readonly ForbiddenReadWritePath
 }
 
 /**
+ * readOnly entries that name the filesystem root itself (any spelling, or a
+ * link that resolves to it). A read-only bind of `/` cannot start: the policy
+ * mounts fresh tmpfs at /run, /tmp, … before the user's binds, `--ro-bind / /`
+ * then covers them with the host's read-only directories, and the next mount
+ * point the launcher needs (`/run/sbxbin`) cannot be created — measured with
+ * bubblewrap 0.8.0, with and without a user namespace:
+ * `bwrap: Can't mkdir /run/sbxbin: Read-only file system`. Deeper paths
+ * (`/usr`, HOME as readOnly) are unaffected.
+ */
+export function findReadOnlyFilesystemRoot(
+  readOnly: readonly string[] | undefined,
+  home: string = homedir(),
+): string[] {
+  const out: string[] = [];
+  for (const raw of readOnly ?? []) {
+    if (!isAbsoluteSandboxEntry(raw, home)) continue;
+    if (variants(expandTilde(raw.trim(), home)).includes('/')) out.push(raw);
+  }
+  return out;
+}
+
+/** One-line Chinese explanation for the save rejection of a readOnly `/`. */
+export function readOnlyRootMessage(found: readonly string[]): string {
+  const names = found.map(path => `「${path}」`).join('、');
+  return `沙盒「只读」里不能放根目录${names}：把整个根目录只读绑进沙盒后，沙盒需要的挂载点无法创建，会话一启动就退出。请改成具体目录（如 /usr、/opt/工具目录、~/projects）后再保存。`;
+}
+
+/**
+ * Spawn-time handling of a stored readOnly `/` (saved before the save path
+ * refused it, or hand-edited into bots.json): dropped, so the session starts
+ * deny-by-default instead of exiting at launch.
+ */
+export function dropReadOnlyFilesystemRoot<T extends { readOnly?: string[] }>(
+  lists: T | undefined,
+  home: string = homedir(),
+): { lists: T | undefined; dropped: string[] } {
+  const dropped = findReadOnlyFilesystemRoot(lists?.readOnly, home);
+  if (!lists || dropped.length === 0) return { lists, dropped };
+  const removed = new Set(dropped);
+  return { lists: { ...lists, readOnly: (lists.readOnly ?? []).filter(path => !removed.has(path)) }, dropped };
+}
+
+/**
  * Spawn-time handling of an entry that is already stored (written before this
  * check existed, or edited into bots.json by hand), instead of refusing the
  * session:
  *  - HOME, the botmux data root and their ancestors move from readWrite to
  *    readOnly: the user keeps the read access they asked for, the write grant
  *    over every dotfile credential / every bot's data is gone.
- *  - `/` is dropped outright. Binding the host root in any mode makes bwrap
- *    fail at spawn on hosts where a baseline path is a symlink (measured:
- *    `/opt -> /data00` gives `Can't bind mount /oldroot/data00 on /newroot/opt`
- *    for both `--bind / /` and `--ro-bind / /` on bubblewrap 0.6.x-era hosts;
- *    not reproducible on 0.8.0), i.e. the CLI exits at once. A deny-by-default
- *    sandbox without the entry still starts.
+ *  - `/` is dropped outright, not moved to readOnly: a read-only bind of the
+ *    host root cannot start either (see findReadOnlyFilesystemRoot), so the
+ *    CLI would exit at launch. A deny-by-default sandbox without the entry
+ *    still starts.
  *  - Relative entries are dropped outright as well: their target depends on
  *    the session working directory, and moving one to readOnly would still
  *    grant reads of whatever the cwd-relative resolution happens to hit.

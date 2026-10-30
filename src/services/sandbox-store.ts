@@ -10,6 +10,8 @@ import { logger } from '../utils/logger.js';
 import {
   findForbiddenReadWritePaths,
   findNonAbsoluteSandboxEntries,
+  findReadOnlyFilesystemRoot,
+  readOnlyRootMessage,
   forbiddenReadWriteMessage,
   nonAbsoluteSandboxEntriesMessage,
   type ForbiddenReadWritePath,
@@ -230,6 +232,16 @@ export async function updateBotSandboxPaths(
       reason: 'sandbox_paths_forbidden_read_write',
       message: forbiddenReadWriteMessage(forbiddenReadWrite),
       forbiddenReadWrite,
+    };
+  }
+  // A read-only `/` makes the sandbox exit at launch (its own mount points
+  // cannot be created under a read-only root) — never stored.
+  const readOnlyRoot = findReadOnlyFilesystemRoot(normalized.readOnly);
+  if (readOnlyRoot.length) {
+    return {
+      ok: false,
+      reason: 'sandbox_paths_readonly_root',
+      message: readOnlyRootMessage(readOnlyRoot),
     };
   }
   // Relative entries resolve against the session working directory at spawn,

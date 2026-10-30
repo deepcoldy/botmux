@@ -4,7 +4,9 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   downgradeForbiddenReadWrite,
+  dropReadOnlyFilesystemRoot,
   findForbiddenReadWritePaths,
+  findReadOnlyFilesystemRoot,
   findNonAbsoluteSandboxEntries,
   forbiddenReadWriteMessage,
   type ProtectedRoots,
@@ -119,5 +121,25 @@ describe('sandbox readWrite guard', () => {
     const input = { readWrite: ['~/projects/app'] };
     expect(downgradeForbiddenReadWrite(input, roots)).toEqual({ lists: input, downgraded: [], dropped: [] });
     expect(downgradeForbiddenReadWrite(undefined, roots)).toEqual({ lists: undefined, downgraded: [], dropped: [] });
+  });
+
+  it('finds a readOnly filesystem root in every spelling, including a link that resolves to it', () => {
+    const home = roots.homeDirs[0]!;
+    const rootLink = join(root, 'rootlink');
+    symlinkSync('/', rootLink);
+    expect(findReadOnlyFilesystemRoot(['/', '//', '/./', ' / ', rootLink, '/usr', '~', home, '/opt', '..'], home))
+      .toEqual(['/', '//', '/./', ' / ', rootLink]);
+  });
+
+  it('drops a stored readOnly `/` and keeps the other readOnly entries', () => {
+    const home = roots.homeDirs[0]!;
+    const { lists, dropped } = dropReadOnlyFilesystemRoot(
+      { readWrite: ['~/projects/app'], readOnly: ['/usr', '/', '~'], deny: ['~/secret'] }, home,
+    );
+    expect(dropped).toEqual(['/']);
+    expect(lists).toEqual({ readWrite: ['~/projects/app'], readOnly: ['/usr', '~'], deny: ['~/secret'] });
+    const untouched = { readOnly: ['/usr'] };
+    expect(dropReadOnlyFilesystemRoot(untouched, home)).toEqual({ lists: untouched, dropped: [] });
+    expect(dropReadOnlyFilesystemRoot(undefined, home)).toEqual({ lists: undefined, dropped: [] });
   });
 });
