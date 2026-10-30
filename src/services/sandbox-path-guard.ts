@@ -167,20 +167,30 @@ export function forbiddenReadWriteMessage(found: readonly ForbiddenReadWritePath
 }
 
 /**
- * readOnly entries that name the filesystem root itself (any spelling, or a
- * link that resolves to it). On Linux a read-only bind of `/` cannot start:
- * the policy mounts fresh tmpfs at /run, /tmp, … before the user's binds,
- * `--ro-bind / /` then covers them with the host's read-only directories, and
- * the next mount point the launcher needs (`/run/sbxbin`) cannot be created —
- * measured with bubblewrap 0.8.0, with and without a user namespace:
- * `bwrap: Can't mkdir /run/sbxbin: Read-only file system`. Deeper paths
- * (`/usr`, HOME as readOnly) are unaffected.
+ * Mount points the Linux sandbox launcher binds AFTER the user's rules, on top
+ * of the fresh tmpfs it mounted first. A readOnly user entry that equals or
+ * contains one of them re-covers that tmpfs with the host's read-only
+ * directory, so bwrap cannot create the mount point and the session exits at
+ * launch — measured with bubblewrap 0.8.0, with and without a user namespace,
+ * for `/`, `/run` (and `/var/run` -> `/run`) and `/run/sbxbin`:
+ * `bwrap: Can't mkdir /run/sbxbin: Read-only file system`. Siblings such as
+ * `/run/lock`, `/run/user/<uid>`, `/tmp`, `/etc` start fine.
  *
- * Linux only. macOS Seatbelt has no mount namespace: a readOnly `/` compiles
- * to "read everything, write only the deeper grants", which starts and is a
- * legitimate configuration there.
+ * `/run/botmux-mcp` (MCP gateway) and the resolver target under
+ * `/run/systemd/resolve/` (network policy) share the same covering ancestors
+ * {`/`, `/run`} with `/run/sbxbin`, so listing sbxbin already refuses every
+ * entry that would break them through those ancestors. A future late bind
+ * under /run must be registered here.
  */
-export function findReadOnlyFilesystemRoot(
+export const LAUNCHER_LATE_MOUNT_POINTS: readonly string[] = ['/run/sbxbin'];
+
+/**
+ * readOnly entries that equal or contain a launcher late mount point (any
+ * spelling, or a link that resolves to one). Linux only: macOS Seatbelt has no
+ * mount namespace, and a readOnly `/` there compiles to "read everything,
+ * write only the deeper grants" — a legitimate configuration.
+ */
+export function findReadOnlyLauncherMountCovers(
   readOnly: readonly string[] | undefined,
   home: string = homedir(),
   platform: NodeJS.Platform = process.platform,
@@ -189,28 +199,31 @@ export function findReadOnlyFilesystemRoot(
   const out: string[] = [];
   for (const raw of readOnly ?? []) {
     if (!isAbsoluteSandboxEntry(raw, home)) continue;
-    if (variants(expandTilde(raw.trim(), home)).includes('/')) out.push(raw);
+    const candidates = variants(expandTilde(raw.trim(), home));
+    if (LAUNCHER_LATE_MOUNT_POINTS.some(point => candidates.some(candidate => covers(candidate, point)))) {
+      out.push(raw);
+    }
   }
   return out;
 }
 
-/** One-line Chinese explanation for the save rejection of a readOnly `/`. */
-export function readOnlyRootMessage(found: readonly string[]): string {
+/** One-line Chinese explanation for the save rejection of such an entry. */
+export function readOnlyLauncherMountMessage(found: readonly string[]): string {
   const names = found.map(path => `「${path}」`).join('、');
-  return `沙盒「只读」里不能放根目录${names}：把整个根目录只读绑进沙盒后，沙盒需要的挂载点无法创建，会话一启动就退出。请改成具体目录（如 /usr、/opt/工具目录、~/projects）后再保存。`;
+  return `沙盒「只读」里不能放根目录或 /run${names}：把它们只读绑进沙盒后，沙盒需要的挂载点无法创建，会话一启动就退出。请改成具体目录（如 /usr、/opt/工具目录、~/projects、/run/lock）后再保存。`;
 }
 
 /**
- * Spawn-time handling of a stored readOnly `/` (saved before the save path
+ * Spawn-time handling of such a stored entry (saved before the save path
  * refused it, or hand-edited into bots.json): dropped on Linux, so the session
  * starts deny-by-default instead of exiting at launch. Kept elsewhere.
  */
-export function dropReadOnlyFilesystemRoot<T extends { readOnly?: string[] }>(
+export function dropReadOnlyLauncherMountCovers<T extends { readOnly?: string[] }>(
   lists: T | undefined,
   home: string = homedir(),
   platform: NodeJS.Platform = process.platform,
 ): { lists: T | undefined; dropped: string[] } {
-  const dropped = findReadOnlyFilesystemRoot(lists?.readOnly, home, platform);
+  const dropped = findReadOnlyLauncherMountCovers(lists?.readOnly, home, platform);
   if (!lists || dropped.length === 0) return { lists, dropped };
   const removed = new Set(dropped);
   return { lists: { ...lists, readOnly: (lists.readOnly ?? []).filter(path => !removed.has(path)) }, dropped };
@@ -224,7 +237,7 @@ export function dropReadOnlyFilesystemRoot<T extends { readOnly?: string[] }>(
  *    readOnly: the user keeps the read access they asked for, the write grant
  *    over every dotfile credential / every bot's data is gone.
  *  - `/` is dropped outright, not moved to readOnly: a read-only bind of the
- *    host root cannot start either (see findReadOnlyFilesystemRoot), so the
+ *    host root cannot start either (see findReadOnlyLauncherMountCovers), so the
  *    CLI would exit at launch. A deny-by-default sandbox without the entry
  *    still starts.
  *  - Relative entries are dropped outright as well: their target depends on
@@ -259,7 +272,7 @@ export interface ResolvedStoredSandboxPaths<T> {
   droppedReadWrite: ForbiddenReadWritePath[];
   /** readOnly entries dropped for being relative. */
   droppedReadOnlyRelative: string[];
-  /** readOnly `/` dropped (Linux only). */
+  /** readOnly `/`, `/run` and other launcher-mount covers dropped (Linux only). */
   droppedReadOnlyRoot: string[];
 }
 
@@ -267,7 +280,7 @@ export interface ResolvedStoredSandboxPaths<T> {
  * Everything the worker does to a STORED sandboxPaths object before compiling
  * the policy, in order: forbidden readWrite entries downgraded or dropped,
  * relative readOnly entries dropped (they resolve against the session cwd, so
- * `..` would bind HOME), and a readOnly `/` dropped on Linux. Relative DENY
+ * `..` would bind HOME), and a readOnly `/` / `/run` dropped on Linux. Relative DENY
  * entries are left as-is — their cwd-relative resolution only ever hides a
  * path. The caller logs each non-empty list.
  */
@@ -284,7 +297,7 @@ export function resolveStoredSandboxPaths<T extends { readWrite?: string[]; read
   const absoluteLists = droppedReadOnlyRelative.length && downgradedLists
     ? { ...downgradedLists, readOnly: downgradedLists.readOnly?.filter(path => isAbsoluteSandboxEntry(path, home)) }
     : downgradedLists;
-  const { lists, dropped: droppedReadOnlyRoot } = dropReadOnlyFilesystemRoot(absoluteLists, home, opts.platform);
+  const { lists, dropped: droppedReadOnlyRoot } = dropReadOnlyLauncherMountCovers(absoluteLists, home, opts.platform);
   return {
     lists,
     downgradedReadWrite: downgraded,

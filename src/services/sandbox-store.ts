@@ -10,8 +10,8 @@ import { logger } from '../utils/logger.js';
 import {
   findForbiddenReadWritePaths,
   findNonAbsoluteSandboxEntries,
-  findReadOnlyFilesystemRoot,
-  readOnlyRootMessage,
+  findReadOnlyLauncherMountCovers,
+  readOnlyLauncherMountMessage,
   forbiddenReadWriteMessage,
   nonAbsoluteSandboxEntriesMessage,
   type ForbiddenReadWritePath,
@@ -234,14 +234,14 @@ export async function updateBotSandboxPaths(
       forbiddenReadWrite,
     };
   }
-  // A read-only `/` makes the sandbox exit at launch (its own mount points
-  // cannot be created under a read-only root) — never stored.
-  const readOnlyRoot = findReadOnlyFilesystemRoot(normalized.readOnly);
-  if (readOnlyRoot.length) {
+  // A read-only `/` or `/run` makes the Linux sandbox exit at launch (the
+  // launcher's own mount points cannot be created under it) — never stored.
+  const readOnlyLauncherMounts = findReadOnlyLauncherMountCovers(normalized.readOnly);
+  if (readOnlyLauncherMounts.length) {
     return {
       ok: false,
-      reason: 'sandbox_paths_readonly_root',
-      message: readOnlyRootMessage(readOnlyRoot),
+      reason: 'sandbox_paths_readonly_launcher_mount',
+      message: readOnlyLauncherMountMessage(readOnlyLauncherMounts),
     };
   }
   // Relative entries resolve against the session working directory at spawn,

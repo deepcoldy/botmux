@@ -632,7 +632,7 @@ import {
   runAdoptSessionRenameSequence,
 } from './services/adopt-input-sequence.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
-import { forbiddenReadWriteMessage, defaultProtectedRoots, readOnlyRootMessage, resolveStoredSandboxPaths } from './services/sandbox-path-guard.js';
+import { forbiddenReadWriteMessage, defaultProtectedRoots, readOnlyLauncherMountMessage, resolveStoredSandboxPaths } from './services/sandbox-path-guard.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from './utils/pty.js';
 import {
@@ -23658,7 +23658,7 @@ async function spawnCli(
       log(`[sandbox] sandboxPaths readOnly relative entries ignored (must be absolute or ~/-prefixed): ${storedPaths.droppedReadOnlyRelative.join(', ')}`);
     }
     if (storedPaths.droppedReadOnlyRoot.length) {
-      log(`[sandbox] sandboxPaths readOnly entries ignored: ${readOnlyRootMessage(storedPaths.droppedReadOnlyRoot)}`);
+      log(`[sandbox] sandboxPaths readOnly entries ignored: ${readOnlyLauncherMountMessage(storedPaths.droppedReadOnlyRoot)}`);
     }
     const userLists = storedPaths.lists;
     const droppedUser: string[] = [];

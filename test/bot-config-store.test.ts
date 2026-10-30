@@ -1672,12 +1672,12 @@ describe('bot-config store', () => {
     expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
     // On Linux `/` is refused as readOnly too: a read-only root cannot start (#2588).
     const onLinux = process.platform === 'linux';
-    for (const root of onLinux ? ['/', '//', ' /./ '] : []) {
+    for (const root of onLinux ? ['/', '//', ' /./ ', '/run', '/run/'] : []) {
       const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj'], readOnly: [root] });
       expect(r.ok, root).toBe(false);
       if (!r.ok) {
-        expect(r.reason).toBe('sandbox_paths_readonly_root');
-        expect(r.message).toContain('根目录');
+        expect(r.reason).toBe('sandbox_paths_readonly_launcher_mount');
+        expect(r.message).toContain('根目录或 /run');
       }
     }
     expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
@@ -1693,10 +1693,10 @@ describe('bot-config store', () => {
     }
     // HOME as readOnly, and deeper paths as readWrite, still save.
     const ok = await sandboxStore.updateBotSandboxPaths('app_default', {
-      readWrite: ['~/projects/app'], readOnly: ['~', '/usr'],
+      readWrite: ['~/projects/app'], readOnly: ['~', '/usr', '/run/lock'],
     });
     expect(ok.ok).toBe(true);
-    expect(readConfig().sandboxPaths).toEqual({ readWrite: ['~/projects/app'], readOnly: ['~', '/usr'] });
+    expect(readConfig().sandboxPaths).toEqual({ readWrite: ['~/projects/app'], readOnly: ['~', '/usr', '/run/lock'] });
   });
 
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
