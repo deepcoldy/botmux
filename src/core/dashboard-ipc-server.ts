@@ -8274,6 +8274,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
     cotEnabled: cardPrefs.cotEnabled,
+    replyCardShowTools: cardPrefs.replyCardShowTools,
     senderTag: cardPrefs.senderTag,
     senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
@@ -8424,6 +8425,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyFooterVoice?: unknown;
     showReplyTiming?: unknown;
     thinkingCardToolResult?: unknown;
+    replyCardShowTools?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
@@ -8441,6 +8443,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   const patch: ReplyFooterPreferences & {
     showReplyTiming?: boolean;
     thinkingCardToolResult?: boolean;
+    replyCardShowTools?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
@@ -8489,6 +8492,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     patch.codexBrowser = body.codexBrowser;
   }
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
+  if (typeof body.replyCardShowTools === 'boolean') patch.replyCardShowTools = body.replyCardShowTools;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;

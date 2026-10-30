@@ -1009,6 +1009,30 @@ describe('bot-config store', () => {
     expect(readConfig().cotEnabled).toBeUndefined();
   });
 
+  it('defaultOn boolean (replyCardShowTools): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('replyCardShowTools')!;
+    expect(spec.defaultOn).toBe(true);
+
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().replyCardShowTools).toBe(false);
+    expect(registry.getBot('app_default').config.replyCardShowTools).toBe(false);
+
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().replyCardShowTools).toBeUndefined();
+    expect(registry.getBot('app_default').config.replyCardShowTools).toBeUndefined();
+
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().replyCardShowTools).toBeUndefined();
+  });
+
   it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('usageDisplay')!;

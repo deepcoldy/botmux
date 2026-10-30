@@ -220,8 +220,18 @@ describe('one reply card per turn', () => {
       expect(card).not.toContain('SECRET_TOOL_COMMAND_MARKER');
       expect(card).not.toContain('SECRET_RESULT_MARKER');
       expect(card).not.toContain('ExecCommand');
+      // gate①: the panel title must not leak a tool count either.
+      expect(card).not.toContain('次工具调用');
     }
     expect(store.read(key)?.tools).toHaveLength(1);
+    // English rendering: singular "tool call" must be hidden too (covers both
+    // "tool call" and "tool calls"); positive assertions pin the fixture.
+    const hiddenEn = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: false, locale: 'en' });
+    expect(hiddenEn).not.toContain('tool call');
+    const shownZh = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: true });
+    expect(shownZh).toContain('次工具调用');
+    const shownEn = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: true, locale: 'en' });
+    expect(shownEn).toContain('tool call');
   });
 
   it('retains tools across a burst of progress patches without losing stored history or creating another message', async () => {
