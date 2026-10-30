@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { FsRule } from '../src/adapters/cli/fs-policy.js';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -109,15 +109,30 @@ describe('sandbox wrapper launch', () => {
     expect(sandboxWrapperPreflight({ ...input, launch: undefined, reattach: false })).toBeUndefined();
   });
 
+  // Bytes this thread actually read() — the only observable that tells a
+  // fixed-size head read apart from reading the whole file and slicing it
+  // (both return the same 256 bytes). Linux only.
+  const threadReadBytes = (): number | undefined => {
+    try {
+      const m = readFileSync('/proc/thread-self/io', 'utf8').match(/^rchar: (\d+)$/m);
+      return m ? Number(m[1]) : undefined;
+    } catch { return undefined; }
+  };
+
   it('reads only the shebang head of a wrapper, never a large binary whole', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-readhead-'));
     try {
+      const size = 32 * 1024 * 1024;
       const big = join(dir, 'big-wrapper');
-      writeFileSync(big, Buffer.concat([Buffer.from('#!/bin/sh\n'), Buffer.alloc(8 * 1024 * 1024, 0x61)]));
-      const head = defaultWrapperFsIo(() => undefined).readHead(big)!;
+      writeFileSync(big, Buffer.concat([Buffer.from('#!/bin/sh\n'), Buffer.alloc(size, 0x61)]));
+      const io = defaultWrapperFsIo(() => undefined);
+      const before = threadReadBytes();
+      const head = io.readHead(big)!;
+      const after = threadReadBytes();
       expect(head.length).toBe(256);
       expect(head.startsWith('#!/bin/sh\n')).toBe(true);
-      expect(defaultWrapperFsIo(() => undefined).readHead(join(dir, 'missing'))).toBeUndefined();
+      if (before !== undefined && after !== undefined) expect(after - before).toBeLessThan(size / 64);
+      expect(io.readHead(join(dir, 'missing'))).toBeUndefined();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

@@ -345,6 +345,7 @@ export const messages: Record<string, string> = {
   'card.relay.btn_prev_page': '← 上一页',
   'card.relay.btn_next_page': '下一页 →',
   'card.relay.page_indicator': '第 {current} / {total} 页',
+  'card.picker.btn_clear_search': '↩ 清除搜索，显示全部',
   'card.relay.empty_filtered': '没有匹配「{query}」的会话，请换个关键词。',
   'card.relay.type_group': '普通群',
   'card.relay.type_topic': '话题群',

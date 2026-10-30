@@ -2350,6 +2350,39 @@ describe('card behavior defaults', () => {
     expect(renderer.root.findByProps({ 'data-action': 'toggle-cot' }).props.checked).toBe(false);
   });
 
+  it('PUTs replyCardShowTools from the unified-card tool toggle and stays disabled in legacy mode', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_show_tools', replyCardMode: 'unified' }, putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-show-tools' });
+    expect(toggle.props.checked).toBe(true);
+    expect(toggle.props.disabled).toBe(false);
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenCalledWith({ replyCardShowTools: false });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-show-tools' }).props.checked).toBe(false);
+    act(() => renderer.unmount());
+
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_show_tools_legacy' }, putCardPref,
+      }));
+    });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-show-tools' }).props.disabled).toBe(true);
+    act(() => renderer.unmount());
+  });
+
   it('persists live-card button visibility as a canonical hidden list', async () => {
     const putCardPref = vi.fn(async (patch: Record<string, unknown>) => ({
       ok: true,
@@ -2488,6 +2521,7 @@ describe('card behavior defaults', () => {
       'toggle-writable-link',
       'toggle-private-card',
       'toggle-cot',
+      'toggle-show-tools',
       'toggle-streaming-button-output',
       'toggle-streaming-button-terminal',
       'toggle-streaming-button-writeLink',
@@ -2521,7 +2555,7 @@ describe('card behavior defaults', () => {
       renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card', 'toggle-cot']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card', 'toggle-cot', 'toggle-show-tools']) {
       expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
     }
     expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);
@@ -2563,6 +2597,15 @@ describe('reply footer controls', () => {
   });
 });
 
+
+describe('card pref save response backfills tool visibility onto the page row', () => {
+  it('maps replyCardShowTools from the PUT response body back onto the bot row', () => {
+    const base = { larkAppId: 'cli_show_tools_backfill' };
+    expect(patchCardPrefsFromBody(base, { replyCardShowTools: false }).replyCardShowTools).toBe(false);
+    // A true response restores the default-on display state.
+    expect(patchCardPrefsFromBody({ ...base, replyCardShowTools: false }, { replyCardShowTools: true }).replyCardShowTools).toBe(true);
+  });
+});
 
 describe('reply footer parent response synchronization', () => {
   it('clears saved false values when a sparse response restores defaults', async () => {

@@ -370,6 +370,7 @@ import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid,
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
 import {
   mapAntigravityCompactOffsetToFull,
   type AntigravityTranscriptState,
@@ -6989,7 +6990,33 @@ function classifyScreenUsageLimit(
   status: RuntimeScreenStatus,
 ): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
-  return usageLimitTracker.classify(content, status);
+  return classifyUsageLimitWithNativeEvidence(content, status);
+}
+
+/** Preserve existing non-agy display-frame classification while requiring an
+ * authoritative viewport for agy's stronger native composer evidence. */
+function classifyUsageLimitWithNativeEvidence(
+  content: string,
+  status: RuntimeScreenStatus,
+): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+  if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
+  let evidence = content;
+  if (cliAdapter?.id === 'antigravity' && backend) {
+    // Card snapshots intentionally remove input/composer rows. Native error
+    // reconciliation requires the full current viewport, not that display text.
+    try { evidence = captureBackendScreen(backend) || content; } catch { /* no stronger evidence */ }
+  }
+  if (cliAdapter?.id === 'antigravity') {
+    // tmux capture-pane -e preserves SGR inside phrases, countdowns and error
+    // IDs. Strip controls without filtering away native composer rows.
+    evidence = stripAnsiScreenText(evidence);
+    if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+  }
+  const result = usageLimitTracker.classify(evidence, status);
+  if (cliAdapter?.id === 'antigravity' && result.usageLimit) {
+    return { ...result, usageLimit: annotateAntigravityUsageLimit(evidence, result.usageLimit) };
+  }
+  return result;
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -10885,10 +10912,17 @@ function ensureAntigravityCotReader(cliSessionId: string): void {
     }
   }
   const boundSessionId = cliSessionId;
+  // A native /new must not keep the retired conversation's footer identity.
+  publishActiveRuntime({});
   const ok = startAntigravityCot(cliSessionId, (entries: readonly AntigravityCotEntry[]) => {
     if (antigravityCotReaderSessionId !== boundSessionId) return;
     if (!currentBotmuxTurnId) return;
     observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+  }, {
+    onRuntime: runtime => {
+      if (antigravityCotReaderSessionId !== boundSessionId || lastInitConfig?.cliId !== 'antigravity') return;
+      publishActiveRuntime(runtime);
+    },
   });
   if (ok) {
     log(`Antigravity CoT reader started for session ${cliSessionId}`);
@@ -15998,6 +16032,11 @@ async function handleTrustedCodexAppMarker(
         ...(linkRefMode ? { linkRefMode } : {}),
         ...((suppressDelivery || isSuperseded) ? { suppressDelivery: true } : {}),
         ...(isSuperseded ? { disposition: 'steer_superseded' as const } : {}),
+        ...(outcome.status === 'failed' ? {
+          turnFailed: true,
+          turnFailureCode: outcome.errorCode,
+          turnFailureNotice: deliverableContent,
+        } : {}),
         codexAppSettlement: {
           requestId,
           generation: control.generation,
@@ -17596,7 +17635,7 @@ function markPromptReady(): void {
     send({
       type: 'screen_update',
       content,
-      ...usageLimitTracker.classify(content, projectedRuntimeScreenStatus()),
+      ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
       ...backgroundWaitPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
@@ -19876,7 +19915,7 @@ function startScreenUpdates(): void {
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
       }
-      const usageAware = usageLimitTracker.classify(snapshot.content, status);
+      const usageAware = classifyUsageLimitWithNativeEvidence(snapshot.content, status);
       // Claude Code's permission dialogs — including one raised by a
       // background fork agent AFTER the main turn already ended — park the
       // session on a static screen that idle detection reports as "ready for
