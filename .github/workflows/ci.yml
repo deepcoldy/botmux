@@ -102,7 +102,7 @@ jobs:
       # so a second pass cannot finish anyway, and a flake must surface to be
       # fixed rather than be retried away (#2464).
       - name: Unit tests (shard ${{ matrix.shard }}/4)
-        run: bun run test -- --shard=${{ matrix.shard }}/4
+        run: bun run test -- --shard=${{ matrix.shard }}/4 --bail=1
 
   # One stable check name for the ruleset. Matrix names (`test (1/4)` …)
   # must not be required — they change if the shard count changes. This
