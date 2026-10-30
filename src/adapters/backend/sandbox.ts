@@ -38,6 +38,7 @@ import {
 } from '../../core/plugins/mcp/environment.js';
 import { isValidPluginId } from '../../core/plugins/ids.js';
 import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
+import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -1619,10 +1620,14 @@ export interface RelayRequest {
 }
 // Presentation flags plus the plugin id required to authorize a callback card.
 // Path-bearing flags
-// (--content-file/--file(s)/--image(s)/--video(s)), SEND routing flags
-// (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
-// content/attachments come from validated outbox files, and session-id is
-// forced by the worker. (`dispatch` has its own bounded allowlist below.)
+// (--content-file/--file(s)/--image(s)/--video(s)) and --session-id are NOT
+// allowlisted: content/attachments come from validated outbox files, and
+// session-id is forced by the worker. SEND routing flags
+// (--chat-id/--into/--top-level) pass only for watchers started with
+// `allowRouting` (file / scratch sandbox), only in bounded shapes, and the host
+// re-exec still asks the daemon to decide the real destination before any
+// provider effect (core/sandbox-send-route.ts). (`dispatch` has its own
+// bounded allowlist below.)
 const RELAY_FLAGS_NOVAL = new Set([
   '--mention-back',
   '--no-mention',
@@ -1667,7 +1672,10 @@ export interface ValidatedRelay {
  * The TOCTOU-safe filesystem read is handled separately by materializeOutboxFile,
  * NOT here — this function deliberately resolves no paths.
  */
-export function validateRelayRequest(req: RelayRequest): { ok: true; value: ValidatedRelay } | { ok: false; error: string } {
+export function validateRelayRequest(
+  req: RelayRequest,
+  opts: { allowRouting?: boolean } = {},
+): { ok: true; value: ValidatedRelay } | { ok: false; error: string } {
   const safeName = (n: unknown): n is string =>
     typeof n === 'string' && !!n && !n.includes('/') && !n.includes('\\') && !n.includes('..');
 
@@ -1734,6 +1742,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   // one root, so the request cannot mean different things on either side.
   const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--into', '--delegate', '--no-delegate']);
   let dispatchIntoSeen = false;
+  const sendRoutingSeen = new Set<string>();
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
@@ -1759,6 +1768,19 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
         return { ok: false, error: `dispatch ${f} only supports schedule:create` };
       }
       flags.push(f, v); i++; continue;
+    }
+    if (opts.allowRouting && (f === '--top-level' || f === '--chat-id' || f === '--into')) {
+      if (sendRoutingSeen.has(f)) return { ok: false, error: `flag ${f} may only be specified once` };
+      sendRoutingSeen.add(f);
+      if (f === '--top-level') { flags.push(f); continue; }
+      const v = rawFlags[i + 1];
+      if (f === '--chat-id' && (typeof v !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v))) {
+        return { ok: false, error: 'flag --chat-id must be an oc_ chat id' };
+      }
+      if (f === '--into' && (typeof v !== 'string' || !/^om_[A-Za-z0-9_-]{1,128}$/.test(v))) {
+        return { ok: false, error: 'flag --into must be an om_ topic root message id' };
+      }
+      flags.push(f, v as string); i++; continue;
     }
     if (RELAY_FLAGS_NOVAL.has(f)) { flags.push(f); continue; }
     if (/^--urgent=(app|sms|phone)$/.test(f)) { flags.push(f); continue; }
@@ -1894,6 +1916,9 @@ export function buildRelayHostEnv(
   delete env.BOTMUX_ORIGIN_CHANNEL_ID;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
   delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
+  // Every host re-exec of a sandbox relay carries the route gate: routing
+  // flags it forwards must be decided by the daemon, never trusted as given.
+  env[SANDBOX_RELAY_ROUTE_GATE_ENV] = '1';
   if (preparedContentFile) {
     env.BOTMUX_CARD_LOCAL_LINK_MODE = 'disabled';
     env.BOTMUX_CARD_PREPARED_CONTENT_FILE = preparedContentFile;
@@ -1932,6 +1957,10 @@ export function startOutboxWatcher(
         }
       | { ok: false; error: string };
     cliPath?: string;
+    /** Accept send routing flags (--top-level/--chat-id/--into). Only the
+     *  file / scratch sandbox watchers set this; the credential-only relay
+     *  keeps rejecting them. */
+    allowRouting?: boolean;
   } = {},
 ): () => void {
   const cliInvocation = botmuxCliInvocation(opts.cliPath);
@@ -1964,7 +1993,7 @@ export function startOutboxWatcher(
       try { req = JSON.parse(readFileSync(reqPath, 'utf8')); }
       catch { finish(id, reqPath, name, staged, 1, '', 'relay: bad json'); continue; }
 
-      const v = validateRelayRequest(req);
+      const v = validateRelayRequest(req, { allowRouting: opts.allowRouting === true });
       if (!v.ok) { finish(id, reqPath, name, staged, 1, '', `relay rejected: ${v.error}`); continue; }
       const authorization = authorize?.({ capability: v.value.originCapability });
       if (authorization && !authorization.ok) {

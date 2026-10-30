@@ -3119,6 +3119,20 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
 }
 
 /** Current application only. Throws on missing scope/unknown membership. */
+/** Strict chat facts for an authorization gate: throws on any provider failure
+ *  or an unclassifiable chat, never guesses a default. */
+export async function getChatRoutingFacts(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ external: boolean; mode: 'group' | 'p2p' }> {
+  const res: any = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+  if (res.code !== 0) throw larkApiError('get chat', res);
+  const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+  const mode = rawMode === 'p2p' ? 'p2p' : rawMode === 'group' || rawMode === 'topic' ? 'group' : null;
+  if (!mode || typeof res.data?.external !== 'boolean') throw new Error('chat_facts_unknown');
+  return { external: res.data.external, mode };
+}
+
 export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
   const response: any = await larkGet(getBotClient(larkAppId),
     `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);

@@ -2,7 +2,9 @@ import { findForbiddenReadWritePaths, forbiddenReadWriteMessage } from './servic
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
-import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
+import { getChatRoutingFacts, isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
+import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
+import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
@@ -8545,6 +8547,39 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+});
+
+// Sandboxed `botmux send --top-level/--chat-id/--into`: the host re-exec of
+// the relay asks here before any routed provider effect. Host-secret only —
+// deliberately NOT in the untrusted aperture, so the sandbox itself cannot
+// reach it. The destination and the principal come from daemon-owned state;
+// the request contributes only the requested flags. See sandbox-send-route.ts.
+ipcRoute('POST', SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let body: any;
+  try { body = await readJsonBody(req, 8 * 1024); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+  const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
+  const appId = ds?.larkAppId === selfDaemonLarkAppId ? ds?.larkAppId : undefined;
+  const result = await handleSandboxSendRouteRequest(body, {
+    session: ds && appId ? {
+      sessionId,
+      chatId: ds.chatId,
+      liveTurnId: ds.managedTurnOrigin?.turnId,
+      callerForTurn: turnId => currentGatewayCallerOpenId(ds, turnId),
+      ownerOpenId: ds.session.ownerOpenId,
+    } : undefined,
+    deps: {
+      lookupMessageChatId: id => lookupMessageChatId(appId!, id),
+      getChatInfo: id => getChatRoutingFacts(appId!, id),
+      isBotInChat: id => isCurrentBotInChat(appId!, id),
+      listMemberOpenIds: id => listChatMemberOpenIds(appId!, id),
+      canTalk: (id, openId) => evaluateTalk(appId!, id, openId, undefined, undefined, 'group').allowed,
+    },
+    audit: line => logger.info(`[sandbox-send-route] ${line}`),
+  });
+  return jsonRes(res, result.status, result.body);
 });
 
 ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {

@@ -24030,7 +24030,7 @@ async function spawnCli(
         att.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend },
+        { authorize: authorizeManagedSend, allowRouting: true },
       );
       publishSandboxRelayCapability();
       log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
@@ -24091,7 +24091,7 @@ async function spawnCli(
         sbx.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend },
+        { authorize: authorizeManagedSend, allowRouting: true },
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
@@ -24178,7 +24178,7 @@ async function spawnCli(
           scratchHostHome = att.clonedHome;
           scratchChdirInSandbox = att.chdirInSandbox;
           sandboxStopWatcher = startOutboxWatcher(
-            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend, allowRouting: true },
           );
           publishSandboxRelayCapability();
           log(`Scratch(mac) REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
@@ -24201,7 +24201,7 @@ async function spawnCli(
         scratchMappings = scratchLinuxMappings(att.mergedHostPath);
         scratchHostHome = scratchHostView(att.mergedHostPath, scratchHome);
         sandboxStopWatcher = startOutboxWatcher(
-          att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+          att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend, allowRouting: true },
         );
         publishSandboxRelayCapability();
         log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
@@ -24236,7 +24236,7 @@ async function spawnCli(
       scratchChdirInSandbox = sbx.chdirInSandbox;
       spawnCwd = sbx.chdirInSandbox;
       sandboxStopWatcher = startOutboxWatcher(
-        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend, allowRouting: true },
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, scratch APFS clone): home=${sbx.clonedHome} outbox=${sbx.outbox}`);
@@ -24276,7 +24276,7 @@ async function spawnCli(
       scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
       scratchHostHome = scratchHostView(sbx.mergedHostPath, scratchHome);
       sandboxStopWatcher = startOutboxWatcher(
-        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend, allowRouting: true },
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, scratch full-root COW, ${storage}): merged=${sbx.mergedHostPath} outbox=${sbx.outbox}`);

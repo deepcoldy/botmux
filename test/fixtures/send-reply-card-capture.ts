@@ -9,6 +9,59 @@ import {
 import { findExecutableLinkRefs } from '../../src/services/link-ref-resolver.js';
 import { enforceFinalLinkIntegrity } from '../../src/services/final-link-integrity.js';
 
+// Opt-in file policies exercise the CLI's pre-read limit and the second limit
+// after a file grows. Other fixture callers retain the actual fs behavior.
+const forbiddenDiffRead = process.env.BOTMUX_TEST_FORBID_DIFF_READ;
+if (forbiddenDiffRead) {
+  const originalRead = fs.readFileSync.bind(fs);
+  fs.readFileSync = ((path: fs.PathOrFileDescriptor, options?: unknown) => {
+    if (String(path) === forbiddenDiffRead) throw new Error('large diff must not be read in full');
+    return originalRead(path, options as never);
+  }) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+}
+const growingDiff = process.env.BOTMUX_TEST_GROW_DIFF_AFTER_STAT;
+if (growingDiff || forbiddenDiffRead) {
+  const watched = new Map<number, number>();
+  const originalOpen = fs.openSync.bind(fs);
+  const originalFstat = fs.fstatSync.bind(fs);
+  const originalRead = fs.readSync.bind(fs);
+  const originalClose = fs.closeSync.bind(fs);
+  let grown = false;
+  fs.openSync = ((...args: any[]) => {
+    const fd = (originalOpen as (...args: any[]) => number)(...args);
+    if (String(args[0]) === growingDiff || String(args[0]) === forbiddenDiffRead) watched.set(fd, 0);
+    return fd;
+  }) as typeof fs.openSync;
+  fs.fstatSync = ((...args: any[]) => {
+    const stat = (originalFstat as (...args: any[]) => fs.Stats)(...args);
+    if (watched.has(args[0]) && growingDiff && !grown) {
+      grown = true;
+      fs.writeFileSync(growingDiff, '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(3 * 1024 * 1024) + '\n');
+    }
+    return stat;
+  }) as typeof fs.fstatSync;
+  fs.readSync = ((...args: any[]) => {
+    const alreadyRead = watched.get(args[0]);
+    if (alreadyRead !== undefined && args[3] > 2 * 1024 * 1024 + 1 - alreadyRead) {
+      throw new Error('diff prefix read exceeded its byte budget');
+    }
+    const bytes = (originalRead as (...args: any[]) => number)(...args);
+    if (alreadyRead !== undefined) watched.set(args[0], alreadyRead + bytes);
+    return bytes;
+  }) as typeof fs.readSync;
+  fs.closeSync = ((fd: number) => { watched.delete(fd); return originalClose(fd); }) as typeof fs.closeSync;
+  syncBuiltinESMExports();
+}
+if ((globalThis as { Bun?: unknown }).Bun && (forbiddenDiffRead || growingDiff)) {
+  // Bun does not synchronize named fs imports with syncBuiltinESMExports.
+  // Register the same opt-in fs surface using its actual module-mock API.
+  const bunTestModule = 'bun:test';
+  const { mock } = await import(bunTestModule);
+  const mockedFs = { ...fs, default: fs };
+  mock.module('node:fs', () => mockedFs);
+}
+
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
 // uploadFile still asks fs for bytes, but this fixture only needs to exercise
