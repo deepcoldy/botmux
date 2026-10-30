@@ -181,7 +181,9 @@ function antigravityRuntimeDbPath(cliSessionId: string, opts?: { conversationsDi
 }
 
 /** WAL commits need not change the main database. Sample before reading so a
- * concurrent commit cannot be cached as though that newer snapshot was read. */
+ * concurrent commit cannot be cached as though that newer snapshot was read.
+ * Exclude ctime: opening a WAL read-only may change that metadata without any
+ * new database content, which would invalidate every successful cache read. */
 export function antigravityRuntimeSignature(cliSessionId: string, opts?: { conversationsDir?: string }): string | undefined {
   const dbPath = antigravityRuntimeDbPath(cliSessionId, opts);
   if (!dbPath) return;
@@ -189,7 +191,7 @@ export function antigravityRuntimeSignature(cliSessionId: string, opts?: { conve
     try {
       const st = statSync(path, { bigint: true });
       if (!st.isFile()) throw new Error('Not a native database file');
-      return [st.dev, st.ino, st.size, st.mtimeNs, st.ctimeNs].join(':');
+      return [st.dev, st.ino, st.size, st.mtimeNs].join(':');
     } catch (error) {
       if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
       throw error;

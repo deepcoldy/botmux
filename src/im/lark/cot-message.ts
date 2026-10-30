@@ -487,40 +487,42 @@ export async function sweepOrphanCotMessages(
           && canResume?.({ larkAppId: rec.larkAppId, sessionId: rec.sessionId, chatId: rec.chatId,
             turnId: rec.turnId, nativeSessionId: rec.nativeSessionId, targetKey: rec.targetKey })) continue;
         const c = getBotClient(rec.larkAppId);
-        // Annotate BEFORE terminating. Order is forced by the API, not a
-        // preference: once a CoT is completed every later append is rejected
-        // with "COT already in terminal state" (verified against the live
-        // endpoint), so a note added after the complete would silently never
-        // render. Best-effort — a failed note must still fall through to the
-        // complete below, since an un-terminated bubble spins on「执行中」
-        // forever, which is strictly worse than an unannotated one.
-        //
-        // Use the error completion endpoint after the notice. RUN_FINISHED
-        // would label this abandoned progress stream as completed even though
-        // the external CLI can still be executing the original task.
-        try {
-          if (getBot(rec.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
-            const { assertMessageWriteAllowed } = await import('./client.js');
-            await assertMessageWriteAllowed(rec.larkAppId, rec.messageId);
+        if (rec.finishStatus !== 'done') {
+          // Annotate BEFORE terminating. Order is forced by the API, not a
+          // preference: once a CoT is completed every later append is rejected
+          // with "COT already in terminal state" (verified against the live
+          // endpoint), so a note added after the complete would silently never
+          // render. Best-effort — a failed note must still fall through to the
+          // complete below, since an un-terminated bubble spins on「执行中」
+          // forever, which is strictly worse than an unannotated one.
+          //
+          // Use the error completion endpoint after the notice. RUN_FINISHED
+          // would label this abandoned progress stream as completed even though
+          // the external CLI can still be executing the original task.
+          try {
+            if (getBot(rec.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+              const { assertMessageWriteAllowed } = await import('./client.js');
+              await assertMessageWriteAllowed(rec.larkAppId, rec.messageId);
+            }
+            const noticeResponse = await c.request({
+              method: 'PUT',
+              url: '/open-apis/im/v1/message_cot',
+              data: {
+                cot_id: rec.cotId,
+                message_id: rec.messageId,
+                events: interruptedNoticeEvents(rec.larkAppId),
+              },
+              timeout: COT_REQUEST_TIMEOUT_MS,
+            } as any);
+            if (cotAlreadyTerminal(noticeResponse)) {
+              try { unlinkSync(p); } catch { /* retry on the next sweep */ }
+              continue;
+            }
+            assertCotResponse(rec.larkAppId, noticeResponse);
+          } catch (err) {
+            if (err instanceof TopicSendError) throw err;
+            logger.warn(`[cot] orphan notice ${rec.cotId}: ${err instanceof Error ? err.message : String(err)}`);
           }
-          const noticeResponse = await c.request({
-            method: 'PUT',
-            url: '/open-apis/im/v1/message_cot',
-            data: {
-              cot_id: rec.cotId,
-              message_id: rec.messageId,
-              events: interruptedNoticeEvents(rec.larkAppId),
-            },
-            timeout: COT_REQUEST_TIMEOUT_MS,
-          } as any);
-          if (cotAlreadyTerminal(noticeResponse)) {
-            try { unlinkSync(p); } catch { /* retry on the next sweep */ }
-            continue;
-          }
-          assertCotResponse(rec.larkAppId, noticeResponse);
-        } catch (err) {
-          if (err instanceof TopicSendError) throw err;
-          logger.warn(`[cot] orphan notice ${rec.cotId}: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (getBot(rec.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
           const { assertMessageWriteAllowed } = await import('./client.js');
