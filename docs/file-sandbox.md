@@ -73,7 +73,40 @@ bwrap:
 3. **daemon 侧读改写**：CLI 在容器里写的 transcript/rollout/events，宿主真实路径看不到，daemon/worker 统一从 `<merged>/<绝对路径>` 读（`scratchHostView`；transcript-resolver 按会话冻结的 scratch 状态自动 remap，unmount 时自然 ENOENT，**不回退读宿主真实路径**）。worker 是每会话进程，CODEX_HOME/TRAE_HOME 在进程内重指 merged、对容器子进程经 `--setenv/--unsetenv` 强制保持原生路径。
 4. **resume**：活 pane（tmux 等）跨 daemon 重启 / 话题转移时整棵会话树（overlay、上层、outbox）保留，reattach 只重接 outbox watcher，绝不重挂；disk 模式重启后用同一 upper/work 重挂可冷恢复（实测数据完整）；tmpfs 模式机器重启后 upper 消亡，会话标记不可恢复，提示开新会话（不伪造新 upper）。
 5. **生命周期**：正常关闭/sweep 按「子 bind → 子 overlay → 主 overlay → tmpfs 槽」逆序卸载并删目录；daemon 启动与周期 reconciler 调 `sweepOrphanScratchSandboxes`，/proc cmdline 活进程守卫 + 60s grace（沿用 oncall sweep 的事故教训）。
-6. 非 root：自动走 `fuse-overlayfs`（需 /dev/fuse），storage 强制为 disk 语义；依赖缺失自动装失败则**报错不裸跑**。
+6. 非 root：写时复制层走 `fuse-overlayfs`；**tmpfs 存储不可用**（宿主命名空间里挂 tmpfs 需要 root），不会自动改成 disk，选了 tmpfs 的会话直接失败并提示改 disk。依赖缺失时 root 会尝试自动安装，装不上则**报错不裸跑**。前置条件见下一节。
+
+### scratch 前置条件（Linux）
+
+Dashboard 选中 scratch 时会显示 daemon 对本机的只读预检结果（不挂载、不起沙盒）：「这台机器不能用 scratch」或「这台机器只能用 disk」，以及缺什么、怎么装。预检只是提示，不阻止保存；第一个会话才是真正的验证。
+
+| 运行身份 | tmpfs 存储（默认） | disk 存储 |
+|---|---|---|
+| root | `bwrap`；内核支持 overlay（`/proc/filesystems` 里有 `overlay`）。tmpfs 模式的主 overlay 没有 FUSE 回退 | `bwrap`；内核 overlay，挂载失败时回退 `fuse-overlayfs`（此时需要 `/dev/fuse`） |
+| 非 root | **不可用**，提示改 disk | `bwrap` + 允许非特权 user namespace（`user.max_user_namespaces` > 0；有 `kernel.unprivileged_userns_clone` 的发行版须为 1）；`fuse-overlayfs`；`/dev/fuse` 存在（由 setuid 的 `fusermount3` 以 root 身份打开，所以本用户打不开时预检只标「无法确定」）；setuid 的 `fusermount3`（fuse3 包）；daemon 不能带 NoNewPrivileges（systemd `NoNewPrivileges=yes` 会让 fusermount3 失去权限）。根文件系统以外的挂载盘（如 `/data00`）在沙盒里只读，工作目录不能放在上面 |
+| root + `BOTMUX_SANDBOX_FUSE=1` | 同上表 root，但 overlay 一律走 `fuse-overlayfs`，需要 `/dev/fuse` | 同左 |
+
+没有 `/dev/fuse` 的机器（部分 devbox / 容器）：非 root 时 tmpfs 和 disk 都起不来；root 时 tmpfs 可用，disk 依赖内核 overlay 接受 upper 在 `/` 之下（部分加固内核会拒绝，需回退 FUSE）。Ubuntu 23.10+ 开着 `kernel.apparmor_restrict_unprivileged_userns=1` 时，非 root 能否建 user namespace 取决于 bwrap 是否有对应 AppArmor profile，预检标「无法确定」。
+
+会话起不来时，飞书里会直接给出原因和修法；daemon / worker 日志里对应的 `[scratch-sandbox]` 行：
+
+| 日志 | 原因 | 修法 |
+|---|---|---|
+| `missing deps (…); auto-install unavailable — <命令>` | 缺 bubblewrap / fuse-overlayfs，自动安装失败（非 root 无免密 sudo，或没有包管理器） | 执行日志里给出的安装命令后重试 |
+| `tmpfs upper slot mount failed (non-root host? …)` | 非 root：不能挂 tmpfs；root：`/var/tmp` 不可写或内存不足 | 非 root 把 scratch 存储改成「磁盘」；root 检查 `/var/tmp` 与内存，或改「磁盘」 |
+| `kernel overlay mount failed: …` | root + tmpfs，内核 overlay 挂不上 | `modprobe overlay`，或改「磁盘」（disk 会回退 fuse-overlayfs） |
+| `overlay mount failed (kernel/fuse): …` | fuse-overlayfs 挂不上 | 装 fuse-overlayfs，确认 `/dev/fuse` 可读写；非 root 还要 setuid `fusermount3` 且无 NoNewPrivileges |
+| `tmpfs upper for recorded session … is gone (machine reboot wiped it)` | 机器重启，内存里的写时复制层已丢 | 新开会话（唯一需要新开会话的情况） |
+| `on-disk scratch meta (X) conflicts with requested Y` | 会话建立后改了 scratch 存储 | 改回 X；新设置只对之后新建的会话生效 |
+| `another live process is preparing this sandbox` | 同一会话的另一次准备还在进行 | 稍后重试 |
+| `cannot record the prepare in progress` / `setup failed at meta-write: …` | 数据目录写不进去 | 检查数据目录所在磁盘是否已满、是否可写 |
+| `<merged> already mounted but meta missing/mismatch` | 上次残留的挂载，缺少对应记录 | `umount -R <merged>` 后重试 |
+| `working dir … sits on a submount that cannot be overlaid` | 工作目录所在挂载做不了写时复制（非 root 时根文件系统以外的挂载都是这样） | 把工作目录放到根文件系统，或以 root 运行 daemon |
+| `working dir … is not writable inside the COW view` | 工作目录不存在或无权限 | 检查目录与 daemon 用户权限 |
+| `cwd COW probe leaked to the real host` | 自检发现写入穿透到真实目录，已拒绝启动 | 把这几行日志反馈给维护者 |
+| `setup failed at mcp-socket-…` | MCP 网关 socket 不可用 | 重试；仍失败看 MCP gateway 日志 |
+| `N host submounts exceed the overlay limit …` | 子挂载超过单会话上限，超出部分只读（会话照常启动） | 多半是残留挂载，清理宿主后新开会话 |
+| `reclaiming a half-prepared tree …` / `its mounted view does not match its marker — re-mounting …` / `skipped N mount(s) inside other scratch session trees` | 自动修复 / 正常跳过，仅记录 | 无需处理 |
+| `setup failed at <位置> — aborting spawn` | 汇总行，具体原因看它前面一行 | 按前一行处理 |
 
 scratch 与 oncall 共用：`botmux send` outbox 中转（凭证不进沙盒）、seccomp nice 隔离判据、owner env 冻结、proxy/CA env、shim/trusted 命令穿透 bind。互斥项与 oncall 相同（riff 远端、forge-traex、codexBrowser、existingAppServer、Codex instance routing、codexAuthSync: isolated、legacy readIsolation）。
 

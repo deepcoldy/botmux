@@ -30,6 +30,33 @@ export function normalizeSandboxMode(raw: unknown): SandboxMode {
   throw new Error(`invalid sandbox mode: ${JSON.stringify(raw)} (expected true/false or "off"|"oncall"|"scratch")`);
 }
 
+/** Read a session's FROZEN sandbox decision (`Session.sandbox`: true / "oncall" /
+ *  "scratch" / false / "off" / undefined) for display. Never throws — a corrupt
+ *  persisted value displays as "off" instead of breaking the card / list. */
+export function frozenSessionSandboxMode(raw: unknown): SandboxMode {
+  try { return normalizeSandboxMode(raw); } catch { return 'off'; }
+}
+
+/** The mode a NEW session of this bot would freeze right now — the same rule
+ *  as `freezeSessionSandboxDecision` (legacy readIsolation implies oncall). */
+export function botConfigSandboxMode(botCfg: { sandbox?: unknown; readIsolation?: boolean }): SandboxMode {
+  return botCfg.readIsolation === true ? 'oncall' : normalizeSandboxMode(botCfg.sandbox);
+}
+
+/** Session vs. current bot sandbox mismatch for the dashboard badge. Undefined
+ *  when the session has not frozen a decision yet (pre-spawn / legacy row), the
+ *  two agree, or the bot config is unreadable. */
+export function sessionSandboxDrift(
+  frozen: unknown,
+  botCfg: { sandbox?: unknown; readIsolation?: boolean } | undefined,
+): { session: SandboxMode; current: SandboxMode } | undefined {
+  if (frozen === undefined || !botCfg) return undefined;
+  let current: SandboxMode;
+  try { current = botConfigSandboxMode(botCfg); } catch { return undefined; }
+  const session = frozenSessionSandboxMode(frozen);
+  return session === current ? undefined : { session, current };
+}
+
 /** Whether the mode wraps the CLI in ANY local file sandbox. */
 export function sandboxIsActive(mode: SandboxMode): boolean {
   return mode !== 'off';

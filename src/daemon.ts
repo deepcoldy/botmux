@@ -2,7 +2,9 @@ import { findForbiddenReadWritePaths, forbiddenReadWriteMessage } from './servic
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
-import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
+import { getChatRoutingFacts, isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
+import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
+import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
@@ -122,7 +124,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
-import { buildMarkdownCard } from './im/lark/md-card.js';
+import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
@@ -310,13 +312,15 @@ async function trustedCallerForInboundTurn(
   senderOpenId?: string,
   senderUnionId?: string,
   senderIsBot?: boolean,
+  messageId?: string,
 ): Promise<TrustedCaller | undefined> {
-  const caller = trustedCallerForTurn(
+  const caller = await trustedCallerFromInbound({
     larkAppId,
     senderOpenId,
     senderUnionId,
     senderIsBot,
-  );
+    messageId,
+  }, { resolveMessageSenderUnionId });
   const canonicalBindings = caller?.senderType === 'bot'
     ? await readCanonicalBotActorOwnerBindings(
       getLoadedConfigProvenance() === 'loaded' ? getLoadedConfigPath() : undefined,
@@ -443,6 +447,7 @@ import {
   withActiveSessionKeyLock,
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
+  getDaemonSessionUsageSnapshot,
   postTurnStartingCard,
   reconcileBotStreamingCardPins,
   reconcileRestoredStreamingCardPins,
@@ -534,6 +539,7 @@ import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclare
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
+import { AutoCompactCoordinator, isAutoCompactEligible, supportsNativeAutoCompactRuntime } from './core/auto-compact.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -570,7 +576,8 @@ import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
-import { resolveUnionIdFromOpenId } from './im/lark/client.js';
+import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
+import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
 import {
   appendDurablePrimaryInputCommit,
@@ -6076,6 +6083,91 @@ function getActiveCount(): number {
   return count;
 }
 
+const autoCompactCoordinator = new AutoCompactCoordinator();
+
+function autoCompactThreshold(): number | undefined {
+  const dashboard = readGlobalConfig().dashboard;
+  if (dashboard?.autoCompactEnabled !== true) return undefined;
+  return dashboard.autoCompactThreshold ?? 75;
+}
+
+function autoCompactPercent(ds: DaemonSession): number | undefined {
+  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  return contextPercentUsed(getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: true }));
+}
+
+/** Final fire-time gate: a human/business turn admitted during the debounce
+ * window always wins. Auto-compaction is local maintenance, never a reason to
+ * wake a worker, mutate an adopted pane, or overtake queued durable input. */
+function autoCompactEligible(ds: DaemonSession): boolean {
+  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  return isAutoCompactEligible({
+    sessionActive: ds.session.status === 'active',
+    workerAlive: !!ds.worker && !ds.worker.killed,
+    workerReady: ds.workerReady === true,
+    cliReady: ds.cliReady === true,
+    idle: ds.lastScreenStatus === 'idle',
+    streamCardSettled: !ds.streamCardPending,
+    transferring: isSessionTransferring(ds),
+    protectedMutation: hasProtectedSessionMutationOwnership(ds),
+    pendingTurns: hasPendingSessionTurns(ds.session.sessionId),
+    pendingPrompt: !!ds.pendingPrompt,
+    pendingRawInput: !!ds.pendingRawInput,
+    pendingFollowUpInput: !!ds.pendingFollowUpInput,
+    queuedActivationCount: ds.session.queuedActivationTail?.length ?? 0,
+    cascadeInFlight: !!ds.cascadeInFlight,
+    usageLimited: !!ds.usageLimit,
+    agentAttention: !!ds.agentAttention,
+    finalDeliveriesInFlight: ds.finalOutputDeliveriesInFlight?.size ?? 0,
+    backgroundTaskCount: ds.backgroundTaskCount ?? 0,
+    adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom,
+    headless: !!ds.session.headless,
+    vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+    remoteRunner: backendType === 'remote-runner',
+    supportsCompact: supportsNativeAutoCompactRuntime(
+      effectiveCliId,
+      backendType,
+      ds.initConfig?.codexRpcInput === true,
+    )
+      && resolvePassthroughCommands(ds.larkAppId, effectiveCliId).has('/compact'),
+  });
+}
+
+function observeAutoCompact(ds: DaemonSession, status: string): void {
+  autoCompactCoordinator.observe({
+    sessionId: ds.session.sessionId,
+    idle: status === 'idle',
+    threshold: autoCompactThreshold(),
+    readThreshold: autoCompactThreshold,
+    readPercent: () => autoCompactPercent(ds),
+    eligible: () => autoCompactEligible(ds),
+    onError: (error) => logger.warn(
+      `[${tag(ds)}] Auto compact coordinator failed safely: ${error instanceof Error ? error.message : String(error)}`,
+    ),
+    trigger: (threshold) => {
+      if (!autoCompactEligible(ds)) return false;
+      const anchor = sessionAnchorId(ds);
+      const turnId = `auto-compact:${Date.now().toString(36)}`;
+      deliverPassthroughToExistingSession(ds, '/compact', '/compact', anchor, ds.larkAppId, {
+        // Bind any native acknowledgement to the real topic root rather than a
+        // synthetic, non-existent Lark message id.
+        messageId: anchor,
+        replyRootId: anchor,
+        senderIsBot: true,
+        substitute: false,
+        inThread: ds.scope === 'thread',
+        turnId,
+        requireSafeComposer: true,
+        onDelivered: () => logger.info(
+          `[${tag(ds)}] Auto compact admitted at context >= ${threshold}%`,
+        ),
+      });
+      return true;
+    },
+  });
+}
+
 /**
  * Freeze the previous turn's streaming card at "idle" and mark a new turn so the
  * next screen_update from the worker POSTs a fresh streaming card instead of
@@ -6311,6 +6403,7 @@ async function submitQueuedMessage(
     message.senderId,
     message.senderUnionId,
     senderIsBot,
+    message.messageId,
   );
   if (!isCurrent()) { rollbackReplyContext(); return false; }
   // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
@@ -8545,6 +8638,39 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+});
+
+// Sandboxed `botmux send --top-level/--chat-id/--into`: the host re-exec of
+// the relay asks here before any routed provider effect. Host-secret only —
+// deliberately NOT in the untrusted aperture, so the sandbox itself cannot
+// reach it. The destination and the principal come from daemon-owned state;
+// the request contributes only the requested flags. See sandbox-send-route.ts.
+ipcRoute('POST', SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let body: any;
+  try { body = await readJsonBody(req, 8 * 1024); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+  const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
+  const appId = ds?.larkAppId === selfDaemonLarkAppId ? ds?.larkAppId : undefined;
+  const result = await handleSandboxSendRouteRequest(body, {
+    session: ds && appId ? {
+      sessionId,
+      chatId: ds.chatId,
+      liveTurnId: ds.managedTurnOrigin?.turnId,
+      callerForTurn: turnId => currentGatewayCallerOpenId(ds, turnId),
+      ownerOpenId: ds.session.ownerOpenId,
+    } : undefined,
+    deps: {
+      lookupMessageChatId: id => lookupMessageChatId(appId!, id),
+      getChatInfo: id => getChatRoutingFacts(appId!, id),
+      isBotInChat: id => isCurrentBotInChat(appId!, id),
+      listMemberOpenIds: id => listChatMemberOpenIds(appId!, id),
+      canTalk: (id, openId) => evaluateTalk(appId!, id, openId, undefined, undefined, 'group').allowed,
+    },
+    audit: line => logger.info(`[sandbox-send-route] ${line}`),
+  });
+  return jsonRes(res, result.status, result.body);
 });
 
 ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
@@ -23912,6 +24038,9 @@ function deliverPassthroughToExistingSession(
      *  `quoteTargetId` 仍指向真实消息，所以派生 turn 期间 current-turn provenance 的
      *  `quoteTargetId === turnId` 校验不成立——级联里的透传本就不产生需要归属的 CLI 回复。 */
     turnId?: string;
+    /** Unattended maintenance must only write when the worker can prove that
+     * the real, empty CLI composer is visible. */
+    requireSafeComposer?: true;
   },
 ): void {
   const turnId = turn.turnId ?? turn.messageId;
@@ -23957,6 +24086,7 @@ function deliverPassthroughToExistingSession(
       // mojo turn, so it needs the live credential snapshot too.
       ...(mojoLivePatchForSession(ds) ?? {}),
       turnId,
+      ...(turn.requireSafeComposer ? { requireSafeComposer: true as const } : {}),
     });
     if (!accepted) {
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
@@ -24942,6 +25072,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     senderOpenId,
     senderUnionId,
     senderIsBotTriState(parsed.senderType, isForeignBotSender),
+    parsed.messageId,
   );
   // union_id 信任腿（canOperate/evaluateTalk 的 teamBot）只对**飞书盖章的 bot 发送方**
   // 生效：平台 roster 是成员机器自报的，若不锁 sender_type，恶意成员把某个真人的
@@ -26953,6 +27084,7 @@ async function handlePrincipalLaneLiveMessage(
           parsed.senderId,
           parsed.senderUnionId,
           senderIsBotTriState(parsed.senderType, isForeignBotSender),
+          parsed.messageId,
         );
         if (!target || !provenance || !activeTurn || !proposer
             || target.session.sessionId !== liveReference.decision.targetSessionId
@@ -27316,6 +27448,7 @@ async function handleThreadReplyAdmitted(
     threadSenderOpenId,
     threadSenderUnionId,
     senderIsBotTriState(parsed.senderType, isForeignBot),
+    parsed.messageId,
   );
   const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
     ? parseCrossPrincipalControlNotice(parsed.content)
@@ -31407,6 +31540,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      observeAutoCompact(ds, context.status);
       if (context.status === 'idle') scheduleMessageListenerAutoClose(ds);
       try {
         if (context.status === 'limited') recordLimitedFailedTurn(ds, context.turnId);
@@ -31694,7 +31828,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
       }
     },
-    onSessionClosed: finalizeClosedXpiSharedCwdMember,
+    async onSessionClosed(session, context) {
+      autoCompactCoordinator.cancel(session.sessionId);
+      await finalizeClosedXpiSharedCwdMember(session, context);
+    },
     onReceiverResetReady(_ds, context) {
       acknowledgeVcMeetingReceiverRecovery(vcMeetingReceiverRecoveryKey(
         context.sessionId,

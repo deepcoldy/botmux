@@ -7,6 +7,7 @@ import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 import type { TraexAutoModelConfig } from '../../services/traex-auto-model.js';
+import type { ScratchCapability } from '../../adapters/backend/scratch-capability.js';
 
 /** Bot 配置页的分类 tab。放在这个轻量模块里：⌘K 索引（入口包）要按它生成条目，页面本身很重。 */
 export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
@@ -367,6 +368,9 @@ export type BotDefaultsRow = {
   scratchDenyPaths?: string[] | null;
   /** Whether the scratch mode is available on this platform (Linux only). */
   scratchSupported?: boolean;
+  /** Daemon-side read-only probe of what scratch can use on this machine
+   *  (null: older daemon). Advice only; never blocks saving. */
+  scratchCapability?: ScratchCapability | null;
   codexAuthSync?: 'shared' | 'isolated';
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).

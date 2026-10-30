@@ -47,13 +47,35 @@ export function mergedPullRequests(commits, base) {
   return [...seen.values()];
 }
 
-/** Cases worth naming: failed first, then the ones the run never reached. */
-export function problemCases(manifest) {
+/**
+ * Cases worth naming: failed first, then the ones the run never reached.
+ * When the Feishu job never ran (it waited out the live slot), every Feishu
+ * case is "not run" for the same reason; listing them says nothing more.
+ * @param {{ cases?: Array<{ status?: string }> } | null | undefined} manifest
+ * @param {{ feishuRan?: boolean }} [options]
+ *        feishuRan=false drops the "not run" rows. Pass it when the Feishu job
+ *        never started, so its cases are all "not run" for that one reason.
+ */
+export function problemCases(manifest, { feishuRan = true } = {}) {
   const cases = Array.isArray(manifest?.cases) ? manifest.cases : [];
   return [
     ...cases.filter((testCase) => testCase.status === 'failed'),
-    ...cases.filter((testCase) => testCase.status === 'not-run'),
+    ...(feishuRan ? cases.filter((testCase) => testCase.status === 'not-run') : []),
   ];
+}
+
+/**
+ * Whether the Feishu job ran, from the feishu-queue job's result
+ * (`needs.feishu-queue.result`: success | failure | cancelled | skipped).
+ * The Feishu job needs the queue job, so a queue that failed (waited out the
+ * slot) or was cancelled (the run was cancelled while waiting) means Feishu
+ * never started. Any other value is treated as "ran": an unexpected result
+ * must not hide rows that might be informative.
+ * @param {string | undefined} queueResult
+ * @returns {boolean}
+ */
+export function feishuJobRan(queueResult) {
+  return queueResult !== 'failure' && queueResult !== 'cancelled';
 }
 
 /**
@@ -63,7 +85,9 @@ export function problemCases(manifest) {
 export function failureReasons(results) {
   const reasons = [];
   if (results.dashboard === 'failure') reasons.push('Dashboard Midscene 失败');
-  if (results.feishuQueue === 'failure') reasons.push('等待飞书 live 席位超时，飞书用例未运行');
+  if (results.feishuQueue === 'failure') {
+    reasons.push('等待飞书 live 席位超时，飞书用例未运行（席位排队问题，不是本次合入的回归；需要结果时在 master 上手动 dispatch）');
+  }
   if (results.feishu === 'failure') reasons.push('Feishu live Midscene 失败');
   if (results.report === 'failure') reasons.push('报告生成失败');
   return reasons;
@@ -168,7 +192,9 @@ async function main() {
   for (const sha of shas) commits.push({ sha, pulls: await github(`/commits/${sha}/pulls`) });
   const pulls = mergedPullRequests(commits, branch);
   const range = shas.length > 1 ? `${shas[0].slice(0, 9)}…${headSha.slice(0, 9)}（${shas.length} 个提交）` : headSha.slice(0, 9);
-  const cases = problemCases(await readManifest(env.MANIFEST_PATH && path.resolve(env.MANIFEST_PATH)));
+  const cases = problemCases(await readManifest(env.MANIFEST_PATH && path.resolve(env.MANIFEST_PATH)), {
+    feishuRan: feishuJobRan(env.QUEUE_RESULT),
+  });
 
   // NOTIFY_DRY_RUN=1 prints the comments instead of posting them.
   const post = async (route, body) => {
