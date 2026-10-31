@@ -76,6 +76,16 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
       }
     },
 
+    // Kimi Code reports its turn state over OSC 7501 (working / blocked on a
+    // permission or question / done), but under tmux it skips the support
+    // probe and stays silent unless PI_PROGRAM_STATUS=1. Without these reports
+    // the only completion signal is 2s of screen quiet, which a static approval
+    // dialog satisfies — the turn was marked done while Kimi was still waiting.
+    // Under tmux the reports arrive in a passthrough envelope, which
+    // ProgramStatusFramingStream unwraps. A Kimi build that never reports keeps
+    // the screen fallback: authority engages only on the first accepted report.
+    supportsProgramStatus: true,
+    spawnEnv: { PI_PROGRAM_STATUS: '1' },
     completionPattern: undefined,
     readyPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,
