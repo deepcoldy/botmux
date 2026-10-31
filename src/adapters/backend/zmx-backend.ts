@@ -2544,7 +2544,7 @@ export function zmxFreshSessionEnv(opts: SpawnOpts, socketDir?: string): NodeJS.
 
 /** Strip every payload-delivered key from ZMX control subprocesses. */
 export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.ProcessEnv {
-  const env = zmxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
+  const env = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : { ...opts.env };
   for (const assignment of buildBotmuxEnvAssignments(opts.env, opts.injectEnv, undefined, opts.gitConfigPairs)) {
     const equals = assignment.indexOf('=');
     if (equals <= 0) continue;
@@ -2558,10 +2558,11 @@ export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.Proce
   if (opts.injectEnv) {
     for (const key of Object.keys(opts.injectEnv)) delete env[key];
   }
-  // Apply the recorded address AFTER stripping payload keys: per-bot env
-  // must not redirect a control command or remove its frozen namespace.
-  if (socketDir !== undefined) env.ZMX_DIR = socketDir;
-  return env;
+  // A session PATH (e.g. the Lark identity shim) belongs only to the CLI.
+  // Once stripped, use the worker's PATH to find host-managed zmx, then add
+  // the normal search paths and freeze the socket address after sanitizing.
+  env.PATH ??= process.env.PATH;
+  return zmxEnv(env, socketDir);
 }
 
 export function parseZmxList(output: string): {
