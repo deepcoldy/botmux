@@ -23092,7 +23092,7 @@ async function spawnCli(
       identityShellEnv.PATH = [dir, ...effectivePath.split(':').filter(path => path !== dir)].join(':');
     }
   }
-  if (cfg.cliId === 'traex' && !cfg.adoptMode && effectiveResume && effectiveCliSessionId) {
+  if (cfg.cliId === 'traex' && !cfg.adoptMode && cfg.resume && effectiveCliSessionId) {
     noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
   }
   const args = cliAdapter.buildArgs({
