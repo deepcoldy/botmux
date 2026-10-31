@@ -317,4 +317,59 @@ describe('Kimi under tmux: approval dialog vs turn completion', () => {
     feed(report('state=idle:app=kimi-code'));
     expect(idle).toEqual(['program-status']);
   });
+
+  // The cold-start `clear` can arrive on its own, with the approval dialog
+  // painted afterwards and the next report seconds later. Dropping authority on
+  // that clear would reopen the screen-quiet path (3.2s past the spinner guard),
+  // so the static dialog would settle the turn before `working` ever arrived.
+  it('a bare clear after submit keeps authority over a static screen until busy arrives', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    feed(report('state=idle:app=kimi-code')); // authority engaged at spawn
+    idle.length = 0;
+    detector.reset(); // botmux submit
+    feed(report('state=clear'));
+    feed(dialog); // static approval dialog painted after the reset
+    vi.advanceTimersByTime(6_000); // well past 2s quiescence + 3s spinner guard
+    expect(idle).toEqual([]);
+    expect(detector.programStatusActive()).toBe(true);
+
+    feed(report('state=working:app=kimi-code'));
+    feed(report('state=done:app=kimi-code'));
+    expect(idle).toEqual(['program-status']);
+  });
+
+  it('a clear followed by no busy report still falls back to the screen at the deadline', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    feed(report('state=idle:app=kimi-code'));
+    idle.length = 0;
+    detector.reset();
+    feed(report('state=clear'));
+    feed(dialog);
+    vi.advanceTimersByTime(PROGRAM_STATUS_FALLBACK_MS + 5_000);
+    expect(idle).toEqual(['screen']);
+  });
+
+  // The post-SessionStart evidence paths must obey the same submit-busy wait as
+  // the ordinary terminal publish; otherwise a held terminal republishes
+  // through either of them before the submit's busy report.
+  it('held terminal is not republished via resetReadyEvidence/seedReadyEvidence while awaiting busy', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    feed(report('state=idle:app=kimi-code'));
+    idle.length = 0;
+    detector.reset();
+    feed(report('state=idle:app=kimi-code')); // terminal held behind the submit wait
+    expect(idle).toEqual([]);
+
+    detector.resetReadyEvidence();
+    expect(idle).toEqual([]);
+    expect(detector.seedReadyEvidence()).toBe(false);
+    expect(idle).toEqual([]);
+
+    feed(report('state=working:app=kimi-code'));
+    feed(report('state=done:app=kimi-code'));
+    expect(idle).toEqual(['program-status']);
+  });
 });

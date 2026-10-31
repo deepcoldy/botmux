@@ -425,12 +425,24 @@ export class IdleDetector {
 
     if (event.state === 'clear') {
       if (event.id === undefined) {
-        this.exitProgramStatusAuthority();
+        // A bare `clear` empties the whole state table.
+        this.programStatusRecords.clear();
+        this.evictedBusyIds.clear();
+        this.programStatusBlockInfo = null;
+        this.programStatusErrorMsg = undefined;
+        // programStatusSubmitAwaitsBusy: Kimi's cold-start session reset emits
+        // this `clear` between the submit and the first busy report. Dropping
+        // authority here would hand the turn to the 2s screen-quiet path while
+        // a static approval dialog may already be painted. Keep authority until
+        // the busy report or the submit deadline.
+        if (!this.armSubmitBusyFallback()) this.exitProgramStatusAuthority();
         return;
       }
       this.deleteProgramStatusSubtree(event.id);
       if (this.programStatusRecords.size === 0 && this.evictedBusyIds.size === 0) {
-        this.exitProgramStatusAuthority();
+        if (!this.armSubmitBusyFallback()) {
+          this.exitProgramStatusAuthority();
+        }
         return;
       }
       this.programStatusAuthority = true;
@@ -809,6 +821,18 @@ export class IdleDetector {
    *  time only. At the deadline the detector leaves authority and the screen
    *  decides. */
   private holdTerminalForSubmitBusy(): boolean {
+    return this.armSubmitBusyFallback();
+  }
+
+  /** While a submit is waiting for its first busy report, keep authority alive
+   *  to the deadline fixed at reset() and arm (or re-arm for the remaining time
+   *  only) the timer that drops it. Returns false when no submit is waiting
+   *  (opt-in off, busy already seen, or deadline passed); the caller then takes
+   *  the ordinary path (publish the terminal, or leave authority). A `clear`
+   *  that empties the records must call this: reset() withholds its own timer
+   *  while a busy record is held, so the record the clear just removed leaves
+   *  nothing that would otherwise release the hold. */
+  private armSubmitBusyFallback(): boolean {
     if (this.submitBusyDeadlineMs === 0) return false;
     const remaining = this.submitBusyDeadlineMs - Date.now();
     if (remaining <= 0) {
