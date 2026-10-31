@@ -56,8 +56,9 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { resolvePairedBackendId } from '../../core/remote-cli-ids.js';
 import type { HerdrBackendConfig } from '../../adapters/backend/types.js';
 import { SessionEnvEditor } from './session-env-editor.js';
-import { supportsZeroPromptInjection } from '../../core/zero-prompt-support.js';
+import { zeroPromptInjectionUnsupportedReason, type ZeroPromptUnsupportedReason } from '../../core/zero-prompt-support.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { confirm } from './confirm-modal.js';
 import { useT } from './react-hooks.js';
 import { DropdownField, ModelPickerField, type DropdownFieldOption } from './field-controls.js';
 import {
@@ -173,6 +174,7 @@ import {
   replyStyleDraftHasBlankCustomTag,
   type ReplyTagMode,
 } from './reply-style-form.js';
+import { scratchCapabilityNote } from './scratch-capability-note.js';
 
 /** 会话群标签名的输入上限，与服务端 `MAX_SESSION_TAG_NAME_CODEPOINTS`
  *  （services/feed-group-tagger.ts）保持一致。这里不 import 那个常量：该模块会连带
@@ -641,6 +643,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
     cotEnabled: body.cotEnabled,
+    replyCardShowTools: body.replyCardShowTools,
     senderTag: body.senderTag,
     senderTagHideEmail: body.senderTagHideEmail,
     summaryMemory: body.summaryMemory,
@@ -2401,6 +2404,7 @@ export function BotAgentSection(props: {
     : typeof bot.model === 'string' ? bot.model : '');
   const [autoModelEnabled, setAutoModelEnabled] = useState(autoDraftRef.current.enabled);
   const [autoReselectPerTurn, setAutoReselectPerTurn] = useState(autoDraftRef.current.reselectPerTurn);
+  const [autoTrigger, setAutoTrigger] = useState(autoDraftRef.current.trigger ?? 'capacity');
   const [autoModelTouched, setAutoModelTouched] = useState(!!initialAutoDraft.current);
   const [autoModels, setAutoModels] = useState(autoDraftRef.current.models);
   const [autoModelSettings, setAutoModelSettings] = useState(autoDraftRef.current.modelSettings);
@@ -2418,6 +2422,7 @@ export function BotAgentSection(props: {
     autoDraftRef.current = draft;
     setAutoModelEnabled(draft.enabled);
     setAutoReselectPerTurn(draft.reselectPerTurn);
+    setAutoTrigger(draft.trigger ?? 'capacity');
     setAutoModels(draft.models);
     setAutoModelSettings(draft.modelSettings);
     setAutoTimeoutSeconds(draft.timeoutSeconds);
@@ -2706,6 +2711,7 @@ export function BotAgentSection(props: {
     const saveCliId = selectedAgentCliId(cliKey);
     const autoConfig = normalizeTraexAutoModelConfig(autoModelEnabled ? {
       enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
+      trigger: autoTrigger,
       reselectPerTurn: autoReselectPerTurn,
       switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
       previousSettings: previousAutoSettings.current,
@@ -3266,6 +3272,8 @@ export function BotAgentSection(props: {
       {selectedCliId === 'traex' && !bot.wrapperCli && !option?.cliLaunchMode ? (
         <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
           reselectPerTurn={autoReselectPerTurn}
+          trigger={autoTrigger}
+          onTrigger={trigger => editAutoDraft({ trigger })}
           onReselectPerTurn={enabled => editAutoDraft({ reselectPerTurn: enabled })}
           modelSettings={autoModelSettings} capabilities={detectedModels?.modelCapabilities}
           timeoutSeconds={autoTimeoutSeconds} cooldownSeconds={autoCooldownSeconds}
@@ -4302,7 +4310,88 @@ function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         <small>{tr('botDefaults.codexAuthSyncHelp')}</small>
         <StatusSpan status={authStatus} attr={{ 'data-codex-auth-sync-status': '' }} />
       </div>
+      <CodexIsolatedConfigInfo bot={bot} />
     </section>
+  );
+}
+
+type CodexConfigInfo = { isolated: boolean; path: string; exists: boolean; hostPath: string; hostExists: boolean };
+
+/**
+ * 独立 CODEX_HOME 的 config.toml：worker 只在首次从宿主复制一次（之后可能有本 bot 的
+ * 定制），所以这里亮出路径并提供「从宿主重新同步」——先确认，daemon 备份现有文件再覆盖。
+ * 只对新会话生效。非独立 CODEX_HOME 的 bot 不显示。
+ */
+export function CodexIsolatedConfigInfo(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const { bot } = props;
+  const [info, setInfo] = useState<CodexConfigInfo | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const url = `/api/bots/${encodeURIComponent(bot.larkAppId)}/codex-config`;
+
+  const load = useCallback(async (): Promise<void> => {
+    try {
+      const res = await sendJson<CodexConfigInfo>('GET', url);
+      setInfo(res.ok ? res.body : null);
+    } catch {
+      setInfo(null);
+    }
+  }, [url]);
+
+  // 是否独立只取决于 codexAuthSync / 沙盒模式 / readIsolation / 实例池；后端不影响
+  // （codex 是本地 CLI，配 riff 等远端 id 会在 spawn 前配对回落本地），故不监听 backendType。
+  useEffect(() => { void load(); }, [load, bot.codexAuthSync, bot.sandboxMode, bot.sandbox, bot.readIsolation]);
+
+  async function resync(): Promise<void> {
+    if (!info) return;
+    const ok = await confirm({
+      title: tr('botDefaults.codexConfigResyncConfirmTitle'),
+      message: tr('botDefaults.codexConfigResyncConfirmMessage', { host: info.hostPath, path: info.path }),
+      confirmLabel: tr('botDefaults.codexConfigResync'),
+    });
+    if (!ok) return;
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson<{ ok: boolean; backupPath?: string | null; error?: string; message?: string }>('POST', `${url}/resync`, {});
+      if (res.ok) {
+        setStatus({
+          text: res.body.backupPath
+            ? tr('botDefaults.codexConfigResynced', { backup: res.body.backupPath })
+            : tr('botDefaults.codexConfigResyncedNoBackup'),
+          ok: true,
+        });
+        await load();
+      } else {
+        setStatus({
+          text: res.body?.error === 'host_config_missing'
+            ? tr('botDefaults.codexConfigHostMissing', { host: info.hostPath })
+            : `${tr('botDefaults.codexConfigResyncFailed')}: ${res.body?.message ?? res.body?.error ?? res.status}`,
+          ok: false,
+        });
+      }
+    } catch (error) {
+      setStatus({ text: `${tr('botDefaults.codexConfigResyncFailed')}: ${(error as Error).message}`, ok: false });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!info?.isolated) return null;
+  return (
+    <div className="bd-row" data-codex-isolated-config="">
+      <p className="bd-section-note">
+        {tr('botDefaults.codexConfigIsolatedPath')}<code data-codex-config-path="">{info.path}</code>
+        {info.exists ? null : <> {tr('botDefaults.codexConfigNotSeeded')}</>}
+      </p>
+      <div className="actions">
+        <button type="button" data-action="codex-config-resync" disabled={busy} onClick={() => void resync()}>
+          {tr('botDefaults.codexConfigResync')}
+        </button>
+        <StatusSpan status={status} attr={{ 'data-codex-config-status': '' }} />
+      </div>
+    </div>
   );
 }
 
@@ -4340,8 +4429,23 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     });
   }
 
+  // 切到 oncall / scratch 前先弹一次确认（说明含义 + 只对新会话生效）；取消即不保存。
+  // 切回关闭、或在当前模式内再点一次不弹。
+  async function selectMode(next: SandboxMode): Promise<void> {
+    if (next !== 'off' && next !== selected) {
+      const ok = await confirm({
+        title: tr('botDefaults.sandboxConfirmTitle', { mode: tr(next === 'scratch' ? 'botDefaults.sandboxModeScratch' : 'botDefaults.sandboxModeOncall') }),
+        message: tr(next === 'scratch' ? 'botDefaults.sandboxConfirmScratch' : 'botDefaults.sandboxConfirmOncall'),
+        confirmLabel: tr('botDefaults.sandboxConfirmOk'),
+      });
+      if (!ok) return;
+    }
+    await save(next, next === 'scratch' ? storage : 'tmpfs');
+  }
+
   const readIsoSupported = bot.readIsolationSupported === true;
   const scratchSupported = bot.scratchSupported !== false;
+  const capNote = selected === 'scratch' ? scratchCapabilityNote(bot.scratchCapability, storage, tr) : null;
   return (
     <section className="bd-section" data-sandbox-mode={selected}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandbox')}</h3>
@@ -4350,7 +4454,7 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
         mode={selected}
         disabled={busy}
         scratchSupported={scratchSupported}
-        onSelect={m => void save(m, m === 'scratch' ? storage : 'tmpfs')}
+        onSelect={m => void selectMode(m)}
       />
       {selected === 'oncall' ? (
         <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
@@ -4360,6 +4464,11 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       {selected === 'scratch' ? (
         <div className="bd-scratch-opts">
           <p className="bd-section-note bd-warn">{tr('botDefaults.sandboxScratchWarning')}</p>
+          {capNote ? (
+            <div className={`bd-section-note${capNote.level === 'info' ? '' : ' bd-warn'}`} data-scratch-capability={capNote.level} role="status">
+              {capNote.lines.map(line => <p key={line}>{line}</p>)}
+            </div>
+          ) : null}
           {bot.scratchStorageSelectable === false ? (
             <p className="bd-section-note">{tr('botDefaults.sandboxScratchStorageMacNote')}</p>
           ) : (
@@ -4635,6 +4744,11 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       {bot.sandboxPathsForbiddenReadWrite?.length ? (
         <p className="hint-warn" data-sandbox-paths-forbidden-rw="">
           {tr('botDefaults.sbxPathsForbiddenRw', { paths: bot.sandboxPathsForbiddenReadWrite.join('、') })}
+        </p>
+      ) : null}
+      {bot.sandboxPathsReadOnlyRoot?.length ? (
+        <p className="hint-warn" data-sandbox-paths-readonly-root="">
+          {tr('botDefaults.sbxPathsReadOnlyRoot', { paths: bot.sandboxPathsReadOnlyRoot.join('、') })}
         </p>
       ) : null}
       <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
@@ -5119,6 +5233,14 @@ function ProfileRoles(props: { appId: string }) {
   );
 }
 
+/** 动态单卡在沙盒会话里一律回落旧版（turn-reply-card 的 replyCardSandboxBlocked：卡片记录
+ *  目录在沙盒白名单外）。这里按 bot 当前配置提示，口径同新会话冻结规则：oncall / scratch，
+ *  或 legacy readIsolation。 */
+export function botSandboxBlocksReplyCard(bot: Pick<BotDefaultsRow, 'sandbox' | 'sandboxMode' | 'readIsolation'>): boolean {
+  const mode = bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off');
+  return mode === 'oncall' || mode === 'scratch' || bot.readIsolation === true;
+}
+
 export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
@@ -5135,6 +5257,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
+  const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -5149,7 +5272,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
     setCotEnabled(bot.cotEnabled !== false);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setShowTools(bot.replyCardShowTools !== false);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.replyCardShowTools, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -5214,6 +5338,9 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             </div>
             <p className="bd-card-setting-copy">{tr(replyMode === 'unified' ? 'botDefaults.replyCardUnifiedDescription'
               : 'botDefaults.replyCardLegacyDescription')}</p>
+            {botSandboxBlocksReplyCard(bot) ? (
+              <p className="bd-section-note bd-warn" data-reply-card-sandbox-blocked="">{tr('botDefaults.replyCardSandboxBlocked')}</p>
+            ) : null}
           </div>
           <ToggleRow
             className="bd-card-primary-toggle"
@@ -5258,6 +5385,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               const previous = cotEnabled;
               setCotEnabled(checked);
               void savePatch({ cotEnabled: checked }, 'cot', () => setCotEnabled(previous));
+            }}
+          />
+          <ToggleRow
+            checked={showTools}
+            disabled={busy !== null || replyMode === 'legacy'}
+            dataAction="toggle-show-tools"
+            title={tr('botDefaults.replyCardShowTools')}
+            description={tr('botDefaults.replyCardShowToolsDescription')}
+            help={tr(replyMode === 'legacy' ? 'botDefaults.replyCardShowToolsLegacyHelp' : 'botDefaults.replyCardShowToolsHelp')}
+            onChange={checked => {
+              const previous = showTools;
+              setShowTools(checked);
+              void savePatch({ replyCardShowTools: checked }, 'show-tools', () => setShowTools(previous));
             }}
           />
           {replyMode === 'legacy' && pinToggle}
@@ -5661,14 +5801,26 @@ function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: P
 /** 按 Bot 当前行的 CLI / 后端 / 沙盒实时判断（与 daemon 写入时的校验同一个函数），
  *  本页改了沙盒、后端或 CLI 后立即反映，不依赖加载时的快照。 */
 export function zeroPromptSupportedFor(bot: Pick<BotDefaultsRow, 'cliId' | 'backendType' | 'defaultBackendType' | 'sandbox' | 'sandboxMode'>): boolean {
+  return zeroPromptUnsupportedReasonFor(bot) === null;
+}
+
+/** 不支持零注入的具体原因（null = 支持），与 {@link zeroPromptSupportedFor} 同一口径。 */
+export function zeroPromptUnsupportedReasonFor(bot: Pick<BotDefaultsRow, 'cliId' | 'backendType' | 'defaultBackendType' | 'sandbox' | 'sandboxMode'>): ZeroPromptUnsupportedReason | null {
   const sandbox = bot.sandboxMode === 'off' || bot.sandboxMode === 'oncall' || bot.sandboxMode === 'scratch'
     ? bot.sandboxMode
     : bot.sandbox ? 'oncall' : 'off';
   // 后端按新会话 spawn 时的生效值（覆盖值，否则 daemon 默认，再按 CLI 配对），与 daemon
   // 写入校验、spawn 时的强制校验一致。
   const backendType = resolvePairedBackendId(bot.cliId, bot.backendType, bot.defaultBackendType);
-  return supportsZeroPromptInjection(bot.cliId, { backendType, sandbox });
+  return zeroPromptInjectionUnsupportedReason(bot.cliId, { backendType, sandbox });
 }
+
+const ZERO_PROMPT_UNSUPPORTED_COPY: Record<ZeroPromptUnsupportedReason, string> = {
+  cli_unsupported: 'botDefaults.promptInjectionUnsupportedCli',
+  backend_unsupported: 'botDefaults.promptInjectionUnsupportedBackend',
+  scratch_unsupported_for_cli: 'botDefaults.promptInjectionUnsupportedScratch',
+  zmx_unsupported_for_antigravity: 'botDefaults.promptInjectionUnsupportedZmx',
+};
 
 /** 「高级」tab 里 herdr 放置配置区块是否展示：有效后端（bot 覆盖 → daemon 默认 →
  *  CLI 配对）解析为 herdr 时才出现，与 {@link BackendTypeSection} 的后端选择同口径。
@@ -5687,7 +5839,8 @@ export function PromptInjectionSection(props: { bot: BotDefaultsRow; patchBot: P
   const [zero, setZero] = useState(props.bot.promptInjection === 'none');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
-  const supported = zeroPromptSupportedFor(props.bot);
+  const unsupportedReason = zeroPromptUnsupportedReasonFor(props.bot);
+  const supported = unsupportedReason === null;
 
   useEffect(() => setZero(props.bot.promptInjection === 'none'), [props.bot.promptInjection]);
 
@@ -5723,8 +5876,8 @@ export function PromptInjectionSection(props: { bot: BotDefaultsRow; patchBot: P
           help={tr('botDefaults.promptInjectionHelp')}
           onChange={checked => void save(checked)}
         />
-        <small className="bd-section-note">
-          {supported ? tr('botDefaults.promptInjectionNote') : tr('botDefaults.promptInjectionUnsupported')}
+        <small className="bd-section-note" data-zero-prompt-unsupported={unsupportedReason ?? undefined}>
+          {unsupportedReason === null ? tr('botDefaults.promptInjectionNote') : tr(ZERO_PROMPT_UNSUPPORTED_COPY[unsupportedReason])}
         </small>
       </AgentManagedLock>
       <div className="actions">

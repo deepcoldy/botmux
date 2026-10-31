@@ -8558,7 +8558,6 @@ esac
     });
 
     it.each([
-      [{ sandbox: true }, 'wrapper_sandbox_conflict'],
       [{ readIsolation: true }, 'wrapper_read_isolation_conflict'],
       [{ codexAuthSync: 'isolated' }, 'wrapper_isolated_auth_conflict'],
       [{ serviceTier: 'priority' }, 'service_tier_catalog_unavailable'],
@@ -8571,6 +8570,13 @@ esac
       expect(await response.json()).toMatchObject({ error });
       expect(readFileSync(configPath, 'utf8')).toBe(before);
       expect(getBot(appId).config).toEqual(memory);
+    });
+
+    it('saves a wrapper on a sandboxed bot (the wrapper runs inside the sandbox)', async () => {
+      await setup({ cliId: 'codex', wrapperCli: 'codex --profile withhooks', sandbox: true });
+      const response = await save({ cliId: 'codex', model: 'changed' });
+      expect(response.status).toBe(200);
+      expect(getBot(appId).config).toMatchObject({ wrapperCli: 'codex --profile withhooks', sandbox: true, model: 'changed' });
     });
 
 
@@ -12594,6 +12600,59 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
         }
       }
       expect(getBot(appId).config.thinkingCardToolResult).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — unified card tool visibility', () => {
+  it('persists replyCardShowTools false explicitly and deletes the key on true', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-show-tools-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-show-tools-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', replyCardMode: 'unified',
+      }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
+
+      const hidden = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: false }),
+      });
+      expect(hidden.status).toBe(200);
+      expect(await hidden.json()).toMatchObject({ ok: true, replyCardShowTools: false });
+      const storedHidden = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(storedHidden.replyCardShowTools).toBe(false);
+      expect(loadBotConfigs()[0].replyCardShowTools).toBe(false);
+      expect(getBot(appId).config.replyCardShowTools).toBe(false);
+
+      const shown = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: true }),
+      });
+      expect(shown.status).toBe(200);
+      expect(await shown.json()).toMatchObject({ ok: true, replyCardShowTools: true });
+      const storedShown = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(storedShown).not.toHaveProperty('replyCardShowTools');
+      expect(loadBotConfigs()[0].replyCardShowTools).toBeUndefined();
+      expect(getBot(appId).config.replyCardShowTools).toBeUndefined();
+
+      const badType = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: 'false' }),
+      });
+      expect(badType.status).toBe(400);
     } finally {
       if (handle) await handle.close();
       handle = null;

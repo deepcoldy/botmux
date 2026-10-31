@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import {
   MockLlmServer,
   extractMarker,
@@ -297,7 +297,11 @@ describe('MockLlmServer', () => {
       });
       const call = JSON.parse(first.replace(/^data: /, '').trim()).candidates[0].content.parts[0].functionCall;
       expect(call.name).toBe('run_shell_command');
-      expect(call.args.command).toBe("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
+      // The reply command carries an env-snapshot fragment (live diagnostic)
+      // followed by the real `botmux send`.
+      expect(call.args.command).toMatch(/^printf '%s %s %s\\n' "\$\(date \+%s\)" "[\s\S]*" >> \.e2e-gemini-shell-env\.log; /);
+      expect(call.args.command).toContain("GITHUB_SHA={${GITHUB_SHA+x}:${GITHUB_SHA-}}");
+      expect(call.args.command).toContain("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
 
       const second = await post('/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse', {
         contents: [
@@ -315,6 +319,112 @@ describe('MockLlmServer', () => {
         body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'route' }] }], generationConfig: { responseJsonSchema: {} } }),
       }).then((r) => r.json() as Promise<any>);
       expect(JSON.parse(routed.candidates[0].content.parts[0].text)).toHaveProperty('complexity_score');
+    });
+
+    it('warns only after a marker asks the router >2 times without a main-model call', async () => {
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      const postRouter = () =>
+        post('/v1beta/models/flash:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { responseJsonSchema: {} },
+        });
+      try {
+        await postRouter();
+        await postRouter();
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+        await postRouter();
+        const hits = warnings.filter((w) => w.includes('gemini router') && w.includes('hit 3 times'));
+        expect(hits).toHaveLength(1);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    // The warning is about a *streak* of router verdicts with no main-model
+    // call between them. A normal multi-step turn (router → tool call → …)
+    // must not accumulate toward it.
+    it('resets the router streak once the main model issues a function call', async () => {
+      const resetPrompt = '请立刻调用 botmux send 在本话题里回复一行内容："ACK-e2e-rstfc-1793300000101"';
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      const shellTools = [{ functionDeclarations: [{ name: 'run_shell_command', parametersJsonSchema: { type: 'object', properties: { command: { type: 'string' } } } }] }];
+      const routerTurn = () =>
+        post('/v1beta/models/flash:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: resetPrompt }] }],
+          generationConfig: { responseJsonSchema: {} },
+        });
+      const functionCallTurn = () =>
+        post('/v1beta/models/gemini-2.5-pro:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: resetPrompt }] }],
+          tools: shellTools,
+        });
+      try {
+        // Three (router verdict → main-model tool call) pairs in one turn:
+        // the router is asked 3 times, but a main-model call follows each.
+        await routerTurn();
+        await functionCallTurn();
+        await routerTurn();
+        await functionCallTurn();
+        await routerTurn();
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('resets the router streak once the main model answers with plain text', async () => {
+      const resetPrompt = '请立刻调用 botmux send 在本话题里回复一行内容："ACK-e2e-rsttxt-1793300000202"';
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      const routerTurn = () =>
+        post('/v1beta/models/flash:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: resetPrompt }] }],
+          generationConfig: { responseJsonSchema: {} },
+        });
+      // Declares tools but no shell (a title call): the main-model request is
+      // answered with plain text, not a function call.
+      const textTurn = () =>
+        post('/v1beta/models/gemini-2.5-pro:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: resetPrompt }] }],
+          tools: [{ functionDeclarations: [{ name: 'session_title' }] }],
+        });
+      try {
+        await routerTurn();
+        await routerTurn();
+        await textTurn();
+        await routerTurn();
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('never warns for JSON-verdict requests carrying no extractable ACK marker', async () => {
+      // Title/summary generateJson calls share no topic identity; attributing
+      // them to one bucket (and across bots on a shared mock server) would
+      // warn without any router loop.
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      try {
+        for (let i = 0; i < 4; i++) {
+          await post('/v1beta/models/flash:generateContent', {
+            contents: [{ role: 'user', parts: [{ text: `summarize title request ${i}` }] }],
+            generationConfig: { responseJsonSchema: {} },
+          });
+        }
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 

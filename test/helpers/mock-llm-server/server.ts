@@ -20,6 +20,7 @@ import {
 import { pickShellTool } from './shell-tool.js';
 import { sandboxProbeCommand } from './sandbox-probe.js';
 import { buildGeminiResponse, geminiMessages, isGeminiToolResult, streamGeminiEvents } from './gemini-sse.js';
+import { buildGeminiShellEnvSnapshotFragment } from './gemini-shell-env.js';
 import {
   buildOpenAiResponsesTextEvents,
   streamResponsesEvents,
@@ -30,6 +31,10 @@ export class MockLlmServer {
   private config: Required<MockServerConfig>;
   private recorder: TapeRecorder;
   private recordedMarkers: Set<string> = new Set();
+  // marker -> consecutive router-verdict request count since the last
+  // main-model call, to surface a Gemini CLI stuck re-asking the model router
+  // without ever calling the main model. Markerless JSON calls are ignored.
+  private geminiRouterHits = new Map<string, number>();
 
   constructor(config?: MockServerConfig) {
     const validModes = ['synthetic', 'record', 'replay'];
@@ -284,18 +289,50 @@ export class MockLlmServer {
 
   private async handleGemini(body: any, res: ServerResponse, stream: boolean): Promise<void> {
     const messages = geminiMessages(body?.contents);
-    const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
+    const rawMarker = extractMarkerFromMessages(messages);
+    const marker = rawMarker ?? 'ACK-test-message-received';
     this.recordedMarkers.add(marker);
     const tool = pickShellTool(body?.tools, 'run_shell_command');
+    const toolResult = isGeminiToolResult(body?.contents);
+    const toolNames = Array.isArray(body?.tools)
+      ? body.tools.flatMap((group: any) => group?.functionDeclarations?.map((f: any) => f?.name) ?? [])
+      : [];
+    const wantsJsonVerdict = Boolean(body?.generationConfig?.responseJsonSchema || body?.generationConfig?.responseSchema);
+
+    let branch: 'router' | 'text' | 'functionCall';
     let response;
-    if (body?.generationConfig?.responseJsonSchema || body?.generationConfig?.responseSchema) {
-      // Gemini CLI's model router asks for a JSON verdict; any valid one will do.
+    if (wantsJsonVerdict) {
+      branch = 'router';
+      // Only requests attributable to a real topic count. Markerless
+      // generateJson calls (titles/summaries) share the fallback marker, and
+      // the mock server is shared by every bot of the lane for its whole run.
+      if (rawMarker) {
+        const hits = (this.geminiRouterHits.get(marker) ?? 0) + 1;
+        this.geminiRouterHits.set(marker, hits);
+        if (hits > 2) {
+          console.warn(`[mock-llm-server] gemini router for ${marker} hit ${hits} times without a main-model call — likely a rejected JSON verdict (check responseJsonSchema shape)`);
+        }
+      }
       response = buildGeminiResponse({ text: JSON.stringify({ complexity_reasoning: 'mock', complexity_score: 1 }) });
-    } else if (isGeminiToolResult(body?.contents) || !tool) {
+    } else if (toolResult || !tool) {
+      branch = 'text';
+      // The main model answered: the router streak is over, reset it so a
+      // normal multi-step turn (router → text/tool → router …) never warns.
+      this.geminiRouterHits.delete(marker);
       response = buildGeminiResponse({ text: '已成功调用 botmux send 回复消息，本轮自动化测试结束。' });
     } else {
-      const cmd = sandboxProbeCommand(messages) ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+      branch = 'functionCall';
+      this.geminiRouterHits.delete(marker);
+      // Prepend an env snapshot (only for a real reply, never the sandbox
+      // probe) so the live artifact shows exactly what the shell tool's
+      // sanitization left: GITHUB_SHA set-empty vs unset vs leaked value.
+      const probeCmd = sandboxProbeCommand(messages);
+      const sendCmd = probeCmd ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+      const cmd = probeCmd ? sendCmd : `${buildGeminiShellEnvSnapshotFragment(marker)}; ${sendCmd}`;
       response = buildGeminiResponse({ functionCall: { name: tool.name, args: tool.args(cmd) } });
+    }
+    if (this.config.verbose) {
+      console.log(`[mock-llm-server] gemini branch=${branch} stream=${stream} toolResult=${toolResult} tools=[${toolNames.join(',')}] marker=${marker}`);
     }
     if (stream) {
       await streamGeminiEvents(res, [response], this.config.chunkDelayMs);

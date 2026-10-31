@@ -93,6 +93,7 @@ export async function collectAdoptCandidates(
     ? discoverAdoptableZellijSessions(botCliId as any, runtimeExecutable)
     : discoverAdoptableZellijSessions(botCliId as any);
   const orca = await discoverAdoptableOrcaSessions(botCliId as any, runtimeExecutable);
+  orca.sort((a, b) => (b.lastOutputAt ?? 0) - (a.lastOutputAt ?? 0));
   const sessions: LiveAdoptableSession[] = [
     ...excludeOwnedHerdrAdoptTargets(
       tmuxAndHerdr,

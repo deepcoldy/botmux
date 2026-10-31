@@ -3,6 +3,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { writeTextThenEnter } from './tui-input.js';
 import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter } from './types.js';
+import { findGeminiSessionFile, isGeminiSessionId } from './gemini-session.js';
 
 
 export function createGeminiAdapter(pathOverride?: string): CliAdapter {
@@ -21,10 +22,18 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.gemini'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ initialPrompt, model, disableCliBypass }) {
-      // Gemini CLI manages sessions internally (--resume takes "latest" or
-      // an index/UUID, not our daemon session IDs).  We always start fresh.
+    buildArgs({ sessionId, resume, workingDir, env, initialPrompt, model, disableCliBypass }) {
       const args = disableCliBypass ? [] : ['--yolo'];
+      // The botmux session id names the Gemini session (gemini-session.ts):
+      // resume it when Gemini has a resumable file for it in this project,
+      // otherwise start it under that id. An existing file that cannot be
+      // resumed (no user message yet) would make --session-id exit 42, so the
+      // session then starts without one.
+      if (isGeminiSessionId(sessionId)) {
+        const file = workingDir ? findGeminiSessionFile(sessionId, workingDir, { ...process.env, ...env }) : undefined;
+        if (resume && file?.resumable) args.push('--resume', sessionId);
+        else if (!file) args.push('--session-id', sessionId);
+      }
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
@@ -37,6 +46,14 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
         args.push('-i', initialPrompt);
       }
       return args;
+    },
+
+    // Resume only what Gemini will accept; else the worker starts fresh and
+    // says so once, instead of a `--resume` that exits 42 in a restart loop.
+    resumeFindsOwnSession: true,
+    checkResumeTargetExists({ sessionId, workingDir, env }) {
+      if (!isGeminiSessionId(sessionId) || !workingDir) return undefined;
+      return findGeminiSessionFile(sessionId, workingDir, env ?? process.env)?.resumable === true;
     },
 
     passesInitialPromptViaArgs: true,

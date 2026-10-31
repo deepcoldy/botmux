@@ -152,9 +152,25 @@ export interface WorkspaceTrustOutcome {
   reason?: string;
 }
 
+/** How the most recent buildArgs() adapted to the installed CLI, worth telling
+ *  the user once (they can fix it by upgrading). */
+export interface CliLaunchNotice {
+  kind: 'flag_needs_newer_cli';
+  /** The option left out of the launch. */
+  flag: string;
+  /** Installed version. */
+  version: string;
+  /** First version that accepts `flag`. */
+  minVersion: string;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
+
+  /** Notice for the launch the latest buildArgs() produced; undefined when the
+   *  launch is the adapter's normal one. */
+  launchNotice?(): CliLaunchNotice | undefined;
 
   /** Controls whether BotMux uses its routing/session XML envelope or the
    *  non-command service-user envelope. The latter preserves the original
@@ -446,6 +462,14 @@ export interface CliAdapter {
    *  Adapters that can always resume (botmux sessionId IS the CLI session id,
    *  e.g. claude-code/grok) or that ignore resume entirely leave this unset. */
   readonly resumeRequiresCliSessionId?: boolean;
+
+  /** True when this adapter finds the native session to resume by itself
+   *  from the botmux session id (Kimi: its index + wire logs; Gemini: the
+   *  session it was started under), so no `cliSessionId` is needed. Whether a
+   *  resume restores history is then exactly what `checkResumeTargetExists`
+   *  answers; upper layers (resume receipt, closed card) ask it instead of
+   *  assuming either way. */
+  readonly resumeFindsOwnSession?: boolean;
 
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete.
@@ -991,6 +1015,9 @@ export interface CliAdapter {
     /** Optional CLI-specific resume store path resolved by the worker after
      *  applying per-bot env/profile settings (for example Hermes state.db). */
     stateDbPath?: string;
+    /** The env the CLI will run with (worker env + per-bot env), for adapters
+     *  whose session store moves with it (KIMI_CODE_HOME, GEMINI_CLI_HOME). */
+    env?: NodeJS.ProcessEnv;
   }): boolean | undefined;
 
   /** Optional: discover sessions resumable from this CLI's on-disk transcript

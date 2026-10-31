@@ -54,6 +54,7 @@ import {
 } from '../../core/plugins/mcp/environment.js';
 import { PROXY_ENV_KEYS, CA_BUNDLE_ENV_KEYS } from '../../utils/child-env.js';
 import type { ScratchPathMapping } from '../../services/scratch-host-view.js';
+import type { ScratchFailure } from './scratch-capability.js';
 
 export type ScratchStorage = 'disk'; // macOS: always APFS-COW-backed; the Linux
 // module's same-named type is 'tmpfs' | 'disk'. Config accepts either string.
@@ -291,15 +292,26 @@ export interface PrepareMacScratchOpts {
   net?: boolean;
 }
 
+export type MacScratchPrepareResult =
+  | { ok: true; spawn: MacScratchSandboxSpawn }
+  | { ok: false; failure: ScratchFailure };
+
+/** prepareMacScratchSandboxDetailed without the reason: null on any failure. */
 export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratchSandboxSpawn | null {
-  if (process.platform !== 'darwin') return null;
+  const r = prepareMacScratchSandboxDetailed(opts);
+  return r.ok ? r.spawn : null;
+}
+
+export function prepareMacScratchSandboxDetailed(opts: PrepareMacScratchOpts): MacScratchPrepareResult {
+  const refuse = (failure: ScratchFailure): MacScratchPrepareResult => ({ ok: false, failure });
+  if (process.platform !== 'darwin') return refuse({ reason: 'unsupported-platform' });
   if (!/^[A-Za-z0-9_-]+$/.test(opts.sessionId)) {
     console.error('[scratch-darwin] unsafe sessionId for scratch tree');
-    return null;
+    return refuse({ reason: 'mac-unsafe-session-id' });
   }
   if (!has('sandbox-exec')) {
     console.error('[scratch-darwin] sandbox-exec not found — cannot enforce the scratch sandbox');
-    return null;
+    return refuse({ reason: 'mac-sandbox-exec-missing' });
   }
 
   const dataDir = canonical(opts.dataDir);
@@ -318,7 +330,7 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
   if (!sameVolume(homeReal, homeCloneRoot)) {
     console.error(`[scratch-darwin] HOME ${homeReal} not on the same volume as ${homeCloneRoot}; cross-volume scratch refused.`);
     removeTreeUnlessMounted(sessionRoot);
-    return null;
+    return refuse({ reason: 'mac-cross-volume', detail: homeReal });
   }
 
   let cleanedUp = false;
@@ -334,10 +346,10 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
     spawnSync('/bin/chmod', ['-R', 'u+w', cloneRoot], { stdio: 'ignore' });
     removeTreeUnlessMounted(sessionRoot);
   };
-  const fail = (where: string): null => {
+  const fail = (where: string, failure: ScratchFailure): MacScratchPrepareResult => {
     console.error(`[scratch-darwin] setup failed at ${where} — aborting (fail closed, never bare-run)`);
     cleanup();
-    return null;
+    return refuse(failure);
   };
 
   // ── 1. Symlink-farm HOME ───────────────────────────────────────────────────
@@ -346,7 +358,7 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
     homeEntries = readdirSync(homeReal, { withFileTypes: true });
   } catch (e) {
     console.error(`[scratch-darwin] cannot read HOME ${homeReal}: ${(e as Error).message}`);
-    return fail('home-read');
+    return fail('home-read', { reason: 'mac-clone-failed', detail: homeReal });
   }
 
   // Secret/authority roots. Computed HERE from first principles (NOT trusted
@@ -482,7 +494,7 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
 
   if (failedCore.length > 0) {
     console.error(`[scratch-darwin] required CLI state/project clone failed: ${failedCore.join(', ')}`);
-    return fail('core-clone');
+    return fail('core-clone', { reason: 'mac-clone-failed', detail: failedCore.join(', ') });
   }
 
   // ── 2. Project outside HOME → required bounded clone ───────────────────────
@@ -493,11 +505,11 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
   } else {
     if (!sameVolume(cwdReal, workCloneRoot)) {
       console.error(`[scratch-darwin] project ${cwdReal} not on the same volume as scratch data dir; refused.`);
-      return fail('work-cross-volume');
+      return fail('work-cross-volume', { reason: 'mac-cross-volume', detail: cwdReal });
     }
     const clonedWork = join(workCloneRoot, relative('/', cwdReal).split(sep).join('__'));
     cloneOrDegrade(cwdReal, clonedWork, 'core');
-    if (failedCore.length > 0) return fail('work-clone');
+    if (failedCore.length > 0) return fail('work-clone', { reason: 'mac-clone-failed', detail: failedCore.join(', ') });
     work = { real: cwdReal, cloned: clonedWork };
     chdirInSandbox = clonedWork;
   }
@@ -605,14 +617,17 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
   atomicWriteFileSync(join(sessionRoot, META_NAME), JSON.stringify(meta), { mode: 0o600, followTargetSymlink: false, durable: true });
 
   return {
-    bin: 'sandbox-exec',
-    args,
-    env,
-    outbox,
-    mappings,
-    clonedHome: homeCloneRoot,
-    chdirInSandbox,
-    cleanup,
+    ok: true,
+    spawn: {
+      bin: 'sandbox-exec',
+      args,
+      env,
+      outbox,
+      mappings,
+      clonedHome: homeCloneRoot,
+      chdirInSandbox,
+      cleanup,
+    },
   };
 }
 

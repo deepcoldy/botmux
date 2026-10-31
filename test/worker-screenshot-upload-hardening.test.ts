@@ -467,7 +467,13 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       expect(found).toBeDefined();
       return found!;
     };
-    const functions = ['setCaptureIdentity', 'markTurnRetired', 'advanceQueuedTypeAheadTurn', 'acknowledgeTurnInputCommitted']
+    const functions = [
+      'setCaptureIdentity',
+      'markTurnRetired',
+      'rememberQueuedTurnAdvanceForPendingReady',
+      'advanceQueuedTypeAheadTurn',
+      'acknowledgeTurnInputCommitted',
+    ]
       .map(name => findNode(node => ts.isFunctionDeclaration(node) && node.name?.text === name).getText(tree));
     const preparation = findNode(node => ts.isVariableDeclaration(node)
       && ts.isIdentifier(node.name) && node.name.text === 'prepareNormalWrite') as ts.VariableDeclaration;
@@ -482,7 +488,8 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
     const harness = new Function('send', 'isCodexAppCliId', `
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
-      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt = false;
+      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt;
+      const ptyOutputGeneration = { snapshot: () => 7 };
       const retiredTurnIds = new Set();
       const started = [];
       const syncQueuedTurnsFromMarkerDisk = () => false;

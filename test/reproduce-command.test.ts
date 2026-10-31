@@ -160,7 +160,20 @@ describe('selectReproduceLaunch (never surfaces sandbox wrapper)', () => {
     ]);
   });
 
-  it('wrapperCli set + sandbox ON: wrapper ignored (matches worker: wrapper vs bwrap mutually exclusive), base only', () => {
+  it('wrapperCli set + sandbox ON + wrapper runs inside the sandbox: returns wrapper form, never the bwrap layer', () => {
+    const r = selectReproduceLaunch({
+      ...base,
+      wrapperCli: 'aiden x claude',
+      sandboxOn: true,
+      wrapperInsideSandbox: true,
+      binResolver: (b) => b,
+    });
+    expect(r.bin).toBe('aiden');
+    expect(r.args[0]).toBe('x');
+    expect(r.args.join(' ')).not.toContain('bwrap');
+  });
+
+  it('wrapperCli set + sandbox ON on a backend that ignores the wrapper: base only', () => {
     const r = selectReproduceLaunch({
       ...base,
       wrapperCli: 'aiden x claude',

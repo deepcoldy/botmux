@@ -188,6 +188,27 @@ describe('controlled failed-turn recovery', () => {
     clearLimitedFailedTurn(ds);
     expect(ds.session.lastFailedTurn).toBeDefined();
   });
+  it('does not let a safe-composer maintenance refusal overwrite the human retry ledger', () => {
+    delete ds.session.lastFailedTurn;
+    ds.currentReplyTarget = undefined;
+    ds.lastUserPrompt = 'previous successful prompt';
+    ds.lastCliInput = 'previous successful wrapped input';
+
+    recordFailedTurnTerminal(ds, {
+      turnId: 'auto-compact:abc', status: 'failed', errorCode: 'safe_composer_required',
+    }, { workerGeneration: 1, caller, silent: false });
+    expect(ds.session.lastFailedTurn).toBeUndefined();
+    expect(store.updateSession).not.toHaveBeenCalled();
+
+    recordFailedTurnTerminal(ds, {
+      turnId: request.turnId, status: 'failed', errorCode: 'worker_failed',
+    }, { workerGeneration: 1, caller, silent: false });
+    expect(ds.session.lastFailedTurn).toMatchObject({
+      turnId: request.turnId,
+      cliInput: 'previous successful wrapped input',
+      errorCode: 'worker_failed',
+    });
+  });
   it.each(['failed', 'completed'])('keeps a claimed recovery fence across late terminal events (%s)', status => {
     ds.session.workerGeneration = 1;
     ds.session.lastFailedTurn.limitedSnapshot = true;

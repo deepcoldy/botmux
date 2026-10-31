@@ -68,7 +68,7 @@ async function waitFor(check: () => boolean, logs: string[], timeout = 10_000): 
   throw new Error(`Worker condition timed out\n${logs.join('')}`);
 }
 
-function startWorker(mode: 'delayed' | 'interrupted' | 'manual', cliId: 'antigravity' | 'traex' = 'antigravity') {
+function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'running', cliId: 'antigravity' | 'traex' = 'antigravity') {
   // Closing a worker also stops its OS session scope. A fixed session ID would
   // let parallel runtime/test invocations terminate each other's fake CLI.
   const sessionId = `agy-delivery-${randomUUID()}`;
@@ -86,14 +86,19 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual', cliId: 'antigra
   const history = cliId === 'antigravity'
     ? join(cliHome, 'history.jsonl') : join(root, '.trae', 'cli', 'history.jsonl');
   mkdirSync(join(history, '..'), { recursive: true });
-  if (mode === 'interrupted') {
+  const passive = ['interrupted', 'native-error', 'quota', 'running'].includes(mode);
+  if (passive) {
     writeFileSync(join(transcriptDir, 'transcript.jsonl'), JSON.stringify({
-      type: 'GENERIC', status: 'DONE', content: 'tool completed',
+      type: 'GENERIC', status: mode === 'running' ? 'RUNNING' : 'DONE', content: 'tool result',
     }) + '\n');
   }
   const ready = cliId === 'antigravity' ? '? for shortcuts' : '›';
   const screen = mode === 'interrupted'
     ? '  ⎿  Interrupted · What should Antigravity CLI do instead?\n────────\n>\n────────\n? for shortcuts\n'
+    : mode === 'native-error' || mode === 'quota'
+      ? `⚠ ${mode === 'quota' ? 'Individual quota reached. Resets in 124h24m15s.' : 'Request failed. Please retry.'}\nError ID: native-error-fixture\n────────\n>\n────────\n`
+    : mode === 'running'
+      ? '● Bash(sleep 30)\n⣻ Running command...\n────────\n>\n────────\nesc to cancel · 1 task(s)\n'
     : ready + '\n';
   const fakeCli = join(root, 'fake-cli');
   writeFileSync(fakeCli, `#!${tsRunnerPrefix().command}
@@ -153,8 +158,8 @@ setInterval(() => {}, 1_000);
     type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId, cliPathOverride: fakeCli, backendType: 'pty',
     cliSessionId: nativeId,
-    prompt: mode !== 'interrupted' ? 'ACTIVATION_UNIQUE_MARKER' : '',
-    ...(mode !== 'interrupted' ? { queuedActivationToken: 'activation-token', turnId: 'om_initial' } : {}),
+    prompt: passive ? '' : 'ACTIVATION_UNIQUE_MARKER',
+    ...(!passive ? { queuedActivationToken: 'activation-token', turnId: 'om_initial' } : {}),
     larkAppId: 'app_test', larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
   return {
@@ -167,6 +172,26 @@ setInterval(() => {}, 1_000);
 }
 
 describe('worker delayed activation and interrupted Antigravity delivery', () => {
+  it('publishes idle for a resumed native error with a footerless empty composer', async () => {
+    const worker = startWorker('native-error');
+    await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'idle'), worker.logs, 20_000);
+    expect(worker.input()).toBe('');
+  }, 30_000);
+
+  it('publishes a usage limit for a resumed relative-countdown quota refusal', async () => {
+    const worker = startWorker('quota');
+    await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'limited'
+      && m.usageLimit?.kind === 'usage' && m.usageLimit.source === 'antigravity-error-composer'), worker.logs, 20_000);
+    expect(worker.input()).toBe('');
+  }, 30_000);
+
+  it('keeps an active command working despite its visible empty composer', async () => {
+    const worker = startWorker('running');
+    await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'working'
+      && m.content.includes('Running command')), worker.logs, 20_000);
+    expect(worker.messages.some(m => m.type === 'prompt_ready')).toBe(false);
+    expect(worker.input()).toBe('');
+  }, 30_000);
   it.each(['antigravity', 'traex'] as const)('%s writes a slow activation once and acknowledges its deferred receipt', async cliId => {
     const worker = startWorker('delayed', cliId);
     await waitFor(() => worker.input().includes('ACTIVATION_UNIQUE_MARKER'), worker.logs, 30_000);

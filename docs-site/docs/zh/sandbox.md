@@ -134,6 +134,8 @@ Botmux 提供多层次的运行隔离机制，保护你的宿主开发机免受�
 
 环境变量覆盖（适合测试或全局守护，对本机所有 Bot 生效）：`BOTMUX_SANDBOX=1`（白名单隔离）或 `BOTMUX_SANDBOX=scratch`。
 
+优先级：`BOTMUX_SANDBOX` 取 `1` / `oncall` / `scratch` 时强制所有 Bot 用该模式；未设、空、`0`、`false` 表示不强制，各 Bot 按自己的 `sandbox` 配置（旧配置 `readIsolation: true` 按白名单隔离），**不会关掉 Bot 自己开的沙盒**；其它取值报错拒绝启动。这个环境变量只能强制开，不能全局关。
+
 ---
 
 ## 4. 网络沙盒（Network Sandbox）
@@ -213,9 +215,13 @@ Botmux 提供多层次的运行隔离机制，保护你的宿主开发机免受�
 
 ---
 
-## 7. 容器 / 受限主机上的前置条件
+## 7. 容器 / 受限主机上的前置条件 {#linux-namespace}
 
 Linux 沙盒依赖内核命名空间，在 Docker 等容器或加固过的主机里经常被默认策略挡住。按模式核对：
+
+- **用哪个 bwrap**：优先用系统包的 `/usr/bin/bwrap`、`/bin/bwrap`；两者都没有时才用 PATH 上的 bwrap，并在 daemon 日志里打一次警告。Codex 会在 `~/.local/bin/bwrap` 放一份自带定制版，它排在 PATH 前面时会让沙盒会话一启动就退出，警告里会点名；用系统包管理器装 `bubblewrap` 即可。
+- **软链的系统目录**：`/opt` 等基线目录本身是软链时，沙盒会在内部重建同样的软链，并把真实路径只读挂进去。
+- **不会靠去掉 PID namespace 降级运行**：普通部署即使新 PID namespace 里挂不上 procfs 也拒绝启动（仅核心专用部署 `BOTMUX_CORE_ONLY=1` 允许去掉 `--unshare-pid`）——同机其它 bot worker 的环境变量里有明文凭据，去掉 PID 隔离后沙盒内可经 /proc 读到。
 
 | 需要的能力 | 白名单隔离 | scratch | 网络策略 |
 |---|---|---|---|

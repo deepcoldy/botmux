@@ -30,6 +30,15 @@ function structuredLimit(): CliUsageLimitState {
 }
 
 describe('usage-limit tracker — 结构化限流粘性重发', () => {
+  it('recognizes a new relative quota episode after an answered turn with an older banner', () => {
+    const tracker = createUsageLimitTracker({ isRateKindSuppressed: () => false });
+    const text = 'Individual quota reached. Resets in 1m.\nError ID: old-episode';
+    tracker.beginTurn(text);
+    tracker.noteTurnCompleted('answered');
+    expect(tracker.classify(text, 'idle').status).toBe('idle');
+    expect(tracker.classify(text.replace('old-episode', 'new-episode'), 'idle').status).toBe('limited');
+    expect(tracker.classify(text + '\n' + text.replace('old-episode', 'new-episode'), 'idle').status).toBe('limited');
+  });
   it('结构化限流命中后，working 帧仍重发 limited（防 daemon 自愈误清）', () => {
     const tracker = createUsageLimitTracker({ isRateKindSuppressed: () => false });
     const seq = tracker.beginTurn('');

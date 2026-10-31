@@ -10,6 +10,8 @@ import { logger } from '../utils/logger.js';
 import {
   findForbiddenReadWritePaths,
   findNonAbsoluteSandboxEntries,
+  findReadOnlyLauncherMountCovers,
+  readOnlyLauncherMountMessage,
   forbiddenReadWriteMessage,
   nonAbsoluteSandboxEntriesMessage,
   type ForbiddenReadWritePath,
@@ -230,6 +232,16 @@ export async function updateBotSandboxPaths(
       reason: 'sandbox_paths_forbidden_read_write',
       message: forbiddenReadWriteMessage(forbiddenReadWrite),
       forbiddenReadWrite,
+    };
+  }
+  // A read-only `/` or `/run` makes the Linux sandbox exit at launch (the
+  // launcher's own mount points cannot be created under it) — never stored.
+  const readOnlyLauncherMounts = findReadOnlyLauncherMountCovers(normalized.readOnly);
+  if (readOnlyLauncherMounts.length) {
+    return {
+      ok: false,
+      reason: 'sandbox_paths_readonly_launcher_mount',
+      message: readOnlyLauncherMountMessage(readOnlyLauncherMounts),
     };
   }
   // Relative entries resolve against the session working directory at spawn,
