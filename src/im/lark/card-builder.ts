@@ -3,7 +3,8 @@ import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.j
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
-import { CLI_DISPLAY_NAMES } from '../../adapters/cli/display-names.js';
+import { CLI_DISPLAY_NAMES, lookupCliDisplayName } from '../../adapters/cli/display-names.js';
+import { allowlistSandboxVerifiedClis } from '../../core/shared-bot-sandbox-advice.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
 import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
@@ -177,6 +178,37 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
       }, locale),
     },
   });
+
+  if (data.sandboxAdvice) {
+    // Short lines, one fact each: why, how to turn it on, the current CLI; the
+    // verified list folds away.
+    const advice = data.sandboxAdvice;
+    const sep = t('card.config.sandbox_advice.sep', undefined, locale);
+    const name = (id: string) => lookupCliDisplayName(id) ?? id;
+    // A sandbox-refusing backend (herdr/zellij/zmx/orca/…): skip the "turn it
+    // on" line and the matrix list — the backend-blocked line is the action.
+    const backendBlocked = advice.cliSupport === 'blocked';
+    const lines = [
+      t('card.config.sandbox_advice', undefined, locale),
+      t('card.config.sandbox_advice.reasons', {
+        reasons: advice.reasons.map(r => t(`card.config.sandbox_advice.${r}`, undefined, locale)).join(sep),
+      }, locale),
+    ];
+    if (!backendBlocked) lines.push(t('card.config.sandbox_advice.action', undefined, locale));
+    lines.push(t(`card.config.sandbox_advice.${advice.cliSupport}`, { cli: name(advice.cliId) }, locale));
+    elements.push({ tag: 'markdown', content: lines.join('\n') });
+    if (!backendBlocked) {
+      elements.push({
+        tag: 'collapsible_panel', expanded: false,
+        header: {
+          title: { tag: 'plain_text', content: t('card.config.sandbox_advice.list_title', undefined, locale) },
+          icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+          icon_position: 'right', icon_expanded_angle: -180,
+        },
+        elements: [{ tag: 'markdown', content: allowlistSandboxVerifiedClis().map(name).join(sep) }],
+      });
+    }
+  }
 
   // ── 🧠 运行: cli / model / lang ─────────────────────────────────────────
   elements.push({ tag: 'hr' });

@@ -6704,6 +6704,22 @@ dialog.onboarding-dialog::backdrop {
   border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
 }
 
+/* Shared-bot sandbox advice: one short line per fact, verified CLIs folded. */
+.bd-section-note.bd-shared-sandbox-advice {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  line-height: 1.55;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
+}
+.bd-shared-sandbox-advice p { margin: 0; }
+.bd-shared-sandbox-advice p + p { margin-top: 2px; }
+.bd-shared-sandbox-advice details { margin-top: 4px; }
+.bd-shared-sandbox-advice summary { cursor: pointer; width: fit-content; }
+.bd-shared-sandbox-advice details p { margin-top: 2px; color: var(--muted); }
+
 /* ── Sandbox directory whitelist tree ── */
 .bd-sbx-tree { margin-top: 10px; max-height: 380px; overflow: auto; border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px; font-size: 13px; }
 .bd-sbx-row { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; padding: 2px 0; min-width: 0; }
