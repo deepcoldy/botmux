@@ -93,12 +93,15 @@ export function GroupMessageRecall(props: { chatId: string; bots: GroupBot[]; ac
   const locked = !available || busy || loading;
   const selectAll = selectable.length > 0 && selectable.slice(0, 50).every(message => selected.has(message.messageId));
   return <div className="group-message-recall">
-    <p className="hint">{tr('groups.recallHelp')}</p>
+    <header className="group-recall-heading">
+      <div><h4>{tr('groups.recallTitle')}</h4><p>{tr('groups.recallHelp')}</p></div>
+      {messages.length ? <span className="group-recall-count">{tr('groups.recallCount', { n: messages.length })}</span> : null}
+    </header>
     <div className="group-recall-toolbar">
-      <label>{tr('groups.recallBot')}<select aria-label={tr('groups.recallBot')} value={appId} disabled={busy || loading || props.disabled} onChange={event => { setAppId(event.currentTarget.value); setThreadRootId(''); }}>
+      <label className="group-recall-picker">{tr('groups.recallBot')}<select aria-label={tr('groups.recallBot')} value={appId} disabled={busy || loading || props.disabled} onChange={event => { setAppId(event.currentTarget.value); setThreadRootId(''); }}>
         {props.bots.map(bot => <option value={bot.larkAppId} key={bot.larkAppId}>{bot.botName ?? bot.larkAppId}</option>)}
       </select></label>
-      <button type="button" disabled={locked} onClick={() => setRefresh(value => value + 1)}>{tr('groups.recallRefresh')}</button>
+      <button type="button" className="group-recall-refresh" disabled={locked} onClick={() => setRefresh(value => value + 1)}>{tr('groups.recallRefresh')}</button>
       {threadRootId ? <button type="button" disabled={locked} onClick={() => setThreadRootId('')}>{tr('groups.recallBack')}</button> : null}
     </div>
     {error ? <p role="alert" className="hint-warn">{error}</p> : null}
@@ -106,24 +109,29 @@ export function GroupMessageRecall(props: { chatId: string; bots: GroupBot[]; ac
       <strong>{tr('groups.recallSummary', { ok: results.filter(result => result.ok).length, failed: results.filter(result => !result.ok).length })}</strong>
       {results.filter(result => !result.ok).map(result => <p key={result.messageId}><code>{result.messageId}</code> · {result.error}</p>)}
     </div> : null}
-    <div className="group-recall-toolbar">
-      <label className="checkbox-row"><input type="checkbox" aria-label={tr('groups.recallSelectAll')} checked={selectAll} disabled={locked || !selectable.length} onChange={event => setSelected(event.currentTarget.checked ? new Set(selectable.slice(0, 50).map(message => message.messageId)) : new Set())} />{tr('groups.recallSelectAll')}</label>
-      <button type="button" className="contrast" disabled={locked || !selected.size} onClick={() => void recall()}>{busy ? tr('groups.recallBusy') : tr('groups.recallSelected', { n: selected.size })}</button>
+    <div className="group-recall-selection">
+      <label className="group-recall-select-all"><input type="checkbox" aria-label={tr('groups.recallSelectAll')} checked={selectAll} disabled={locked || !selectable.length} onChange={event => setSelected(event.currentTarget.checked ? new Set(selectable.slice(0, 50).map(message => message.messageId)) : new Set())} />{tr('groups.recallSelectAll')}</label>
+      <button type="button" className="contrast group-recall-submit" disabled={locked || !selected.size} onClick={() => void recall()}>{busy ? tr('groups.recallBusy') : tr('groups.recallSelected', { n: selected.size })}</button>
     </div>
     {!messages.length && !loading ? <p className="empty">{tr('groups.recallEmpty')}</p> : null}
     <ul className="group-recall-list">
-      {messages.map(message => <li key={message.messageId} className={message.deleted ? 'recalled' : ''}>
+      {messages.map(message => <li key={message.messageId} className={[message.deleted ? 'recalled' : '', selected.has(message.messageId) ? 'selected' : ''].filter(Boolean).join(' ')}>
         <input type="checkbox" aria-label={tr('groups.recallSelectMessage', { id: message.messageId })} checked={selected.has(message.messageId)} disabled={locked || !message.canRecall || (!selected.has(message.messageId) && selected.size >= 50)} onChange={event => {
           const checked = event.currentTarget.checked;
           setSelected(previous => { const next = new Set(previous); if (checked) next.add(message.messageId); else next.delete(message.messageId); return next; });
         }} />
         <div className="group-recall-message">
-          <div className="group-recall-meta"><strong>{message.senderName || tr('groups.recallUnknownSender')}</strong><time>{Number.isFinite(Number(message.createTime)) && message.createTime ? new Date(Number(message.createTime)).toLocaleString() : ''}</time>{message.deleted ? <span>{tr('groups.recallDone')}</span> : null}</div>
-          <pre>{message.deleted ? tr('groups.recallDone') : message.preview}</pre>
-          {!threadRootId && message.hasThread ? <button type="button" disabled={locked} onClick={() => setThreadRootId(message.messageId)}>{tr('groups.recallThread')}</button> : null}
+          <div className="group-recall-meta">
+            <strong>{message.senderName || tr('groups.recallUnknownSender')}</strong>
+            <time>{Number.isFinite(Number(message.createTime)) && message.createTime ? new Date(Number(message.createTime)).toLocaleString() : ''}</time>
+            {message.deleted ? <span className="group-recall-badge">{tr('groups.recallDone')}</span> : null}
+            {!threadRootId && message.hasThread ? <button type="button" className="group-recall-thread" disabled={locked} onClick={() => setThreadRootId(message.messageId)}>{tr('groups.recallThread')}</button> : null}
+          </div>
+          {!message.deleted ? <pre>{message.preview}</pre> : null}
         </div>
       </li>)}
     </ul>
+    <p className="group-recall-note">{tr('groups.recallNote')}</p>
     {loading ? <p role="status">{tr('groups.recallLoading')}</p> : null}
     {nextToken ? <button type="button" disabled={locked} onClick={() => void load(true, nextToken)}>{tr('groups.recallMore')}</button> : null}
   </div>;
