@@ -30,6 +30,22 @@ describe('Riff receipt lifecycle cleanup', () => {
     for (const kept of [active, recent, live]) expect(existsSync(kept)).toBe(true);
   });
 
+  it('skips plain files beside session directories instead of failing the round', async () => {
+    const data = root(), closed = receipt(data, 'closed');
+    writeFileSync(join(data, 'sessions', 'closed.env-stamp'), 'stamp');
+    const removed = await sweepOrphanRiffHostReceiptDirs(data, new Set(), { liveReferences: async () => new Set() });
+    expect(removed).toEqual([closed]);
+    expect(existsSync(join(data, 'sessions', 'closed.env-stamp'))).toBe(true);
+  });
+
+  it('reclaims every orphan directory when a plain file sits between them', async () => {
+    const data = root(), first = receipt(data, 'alpha'), second = receipt(data, 'omega');
+    writeFileSync(join(data, 'sessions', 'mid.env-stamp'), 'stamp');
+    const removed = await sweepOrphanRiffHostReceiptDirs(data, new Set(), { liveReferences: async () => new Set() });
+    expect(removed.sort()).toEqual([first, second].sort());
+    expect(existsSync(join(data, 'sessions', 'mid.env-stamp'))).toBe(true);
+  });
+
   it('preserves receipts when live-process evidence is unknown', async () => {
     const data = root(), closed = receipt(data, 'closed');
     expect(await sweepOrphanRiffHostReceiptDirs(data, new Set(), { liveReferences: async () => null })).toEqual([]);
@@ -57,5 +73,18 @@ describe('Riff receipt lifecycle cleanup', () => {
     } });
     expect(removed).toEqual([]);
     expect(existsSync(join(moved, 'riff-host-operations', 'receipt.json'))).toBe(true);
+  });
+
+  it('skips a candidate whose parent became a plain file during the probe and still removes later ones', async () => {
+    const data = root(), later = receipt(data, 'b');
+    receipt(data, 'a');
+    const removed = await sweepOrphanRiffHostReceiptDirs(data, new Set(), { liveReferences: async () => {
+      rmSync(join(data, 'sessions', 'a'), { recursive: true, force: true });
+      writeFileSync(join(data, 'sessions', 'a'), 'replaced by a file');
+      return new Set();
+    } });
+    expect(existsSync(join(data, 'sessions', 'a'))).toBe(true);
+    expect(removed).toEqual([later]);
+    expect(existsSync(later)).toBe(false);
   });
 });

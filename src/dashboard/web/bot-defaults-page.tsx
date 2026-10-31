@@ -101,6 +101,8 @@ import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../servi
 import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
+import { allowlistSandboxVerifiedClis, sharedBotSandboxAdvice } from '../../core/shared-bot-sandbox-advice.js';
+import { lookupCliDisplayName } from '../../adapters/cli/display-names.js';
 import { fetchAgents } from './agents-api.js';
 import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings, type TraexAutoModelPreviousSettings } from '../../services/traex-auto-model.js';
 import { TraexAutoModelEditor } from './traex-auto-model-editor.js';
@@ -4449,6 +4451,7 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   return (
     <section className="bd-section" data-sandbox-mode={selected}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandbox')}</h3>
+      <SharedBotSandboxAdvice bot={bot} />
       <AgentManagedLock lock={props.lock} section="sandbox">
       <SandboxModeFields
         mode={selected}
@@ -4500,6 +4503,78 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       </div>
       </AgentManagedLock>
     </section>
+  );
+}
+
+/**
+ * Shown on a bot that other people use while the allowlist sandbox is off
+ * (core/shared-bot-sandbox-advice.ts). Display only: it changes no default.
+ * The verified-CLI list comes from the same table the advice reads.
+ */
+export function SharedBotSandboxAdvice(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const { bot } = props;
+  const advice = sharedBotSandboxAdvice({
+    // Prefer the daemon's spawn-effective view (global env / readIsolation
+    // folded in); old daemons only report the config value.
+    sandboxMode: bot.effectiveSandboxMode ?? bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off'),
+    cliId: bot.cliId,
+    // Old daemons report the raw binding count (includes session-group pins).
+    oncallChatCount: bot.oncallSharedChatCount ?? bot.oncallChatCount,
+    allowedChatGroupsCount: bot.allowedChatGroupsCount,
+    defaultOncallEnabled: bot.defaultOncall?.enabled,
+    allowedUsersCount: bot.allowedUsersCount,
+    triggerUserAuthEnabled: bot.triggerUserAuth?.enabled,
+    wrapperCli: bot.wrapperCli,
+    cliRuntimeConfigured: !!bot.cliRuntime,
+    // null = old daemon: assume the backend accepts a sandbox (historical).
+    sandboxCapable: bot.sandboxCapable ?? true,
+    // null = old daemon: assume local (the historical behaviour).
+    localSandboxApplies: bot.localSandboxApplies ?? true,
+    // The daemon's host platform (the page itself has no `process`).
+    platform: bot.sandboxNetworkPolicyPlatform ?? undefined,
+  });
+  if (!advice) return null;
+  const name = (id: string) => lookupCliDisplayName(id) ?? id;
+  const cli = name(bot.cliId ?? '');
+  // Literal tr() calls on purpose: the dashboard-i18n structural test only
+  // sees literal keys, and every reason must stay translated in both locales.
+  const reasonText = (r: typeof advice.reasons[number]): string => {
+    if (r === 'oncall') return tr('botDefaults.sharedSandboxReason.oncall');
+    if (r === 'allowedChatGroups') return tr('botDefaults.sharedSandboxReason.allowedChatGroups');
+    if (r === 'allowedUsers') return tr('botDefaults.sharedSandboxReason.allowedUsers');
+    return tr('botDefaults.sharedSandboxReason.triggerUserAuth');
+  };
+  // This backend refuses to spawn under a sandbox: do not say "turn it on
+  // below" — point at tmux/pty instead, and hide the matrix list.
+  const backendBlocked = advice.cliSupport === 'blocked';
+  const cliLine = advice.cliSupport === 'verified'
+    ? tr('botDefaults.sharedSandboxCliVerified', { cli })
+    : advice.cliSupport === 'unsupported'
+      ? tr('botDefaults.sharedSandboxCliUnsupported', { cli })
+      : advice.cliSupport === 'wrapper'
+        ? tr('botDefaults.sharedSandboxCliWrapper', { cli })
+        : advice.cliSupport === 'blocked'
+          ? tr('botDefaults.sharedSandboxCliBlocked')
+          : tr('botDefaults.sharedSandboxCliUnverified', { cli });
+  // Short lines, one fact each: why, how to turn it on, the current CLI; the
+  // verified list folds away.
+  return (
+    <div className="bd-section-note bd-warn bd-shared-sandbox-advice" role="note" data-shared-sandbox-advice={advice.cliSupport}>
+      <p><strong>⚠️ {tr('botDefaults.sharedSandboxTitle')}</strong></p>
+      <p>{tr('botDefaults.sharedSandboxAdvice')}</p>
+      <p>{tr('botDefaults.sharedSandboxReasons', { reasons: advice.reasons.map(reasonText).join(tr('agents.listSep')) })}</p>
+      {!backendBlocked && (
+        <p>{tr('botDefaults.sharedSandboxAction', { mode: tr('botDefaults.sandboxModeOncall') })}</p>
+      )}
+      <p>{cliLine}</p>
+      {!backendBlocked && (
+        <details>
+          <summary>{tr('botDefaults.sharedSandboxVerified')}</summary>
+          <p>{allowlistSandboxVerifiedClis().map(name).join(tr('agents.listSep'))}</p>
+        </details>
+      )}
+    </div>
   );
 }
 

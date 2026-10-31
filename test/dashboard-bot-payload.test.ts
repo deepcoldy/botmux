@@ -84,6 +84,35 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ autoboundChatCount: 1052, oncallChatCount: null });
   });
 
+  it('passes the shared-bot sandbox advice inputs through, degrading missing/malformed values to null', () => {
+    const row = botDefaultsPayload({ larkAppId: 'app' }, {
+      allowedUsersCount: 3,
+      oncallSharedChatCount: 2,
+      allowedChatGroupsCount: 1,
+      localSandboxApplies: false, sandboxCapable: false,
+      effectiveSandboxMode: 'oncall',
+    });
+    // Deleting the daemon-side field must surface as null here, not undefined:
+    // the advice component treats null as "old daemon" and falls back safely.
+    expect(row).toMatchObject({
+      allowedUsersCount: 3, oncallSharedChatCount: 2,
+      allowedChatGroupsCount: 1, localSandboxApplies: false, sandboxCapable: false, effectiveSandboxMode: 'oncall',
+    });
+    const old = botDefaultsPayload({ larkAppId: 'app' }, {});
+    expect(old).toMatchObject({
+      allowedUsersCount: null, oncallSharedChatCount: null,
+      allowedChatGroupsCount: null, localSandboxApplies: null, sandboxCapable: null, effectiveSandboxMode: null,
+    });
+    const bad = botDefaultsPayload({ larkAppId: 'app' }, {
+      allowedUsersCount: '3', oncallSharedChatCount: {},
+      allowedChatGroupsCount: [1], localSandboxApplies: 'no', sandboxCapable: 0, effectiveSandboxMode: 'bwrap',
+    });
+    expect(bad).toMatchObject({
+      allowedUsersCount: null, oncallSharedChatCount: null,
+      allowedChatGroupsCount: null, localSandboxApplies: null, sandboxCapable: null, effectiveSandboxMode: null,
+    });
+  });
+
   it('passes the herdr placement block through to the browser, degrading non-objects to null', () => {
     const herdr = { sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] };
     expect(botDefaultsPayload({ larkAppId: 'app' }, { herdr })).toMatchObject({ herdr });

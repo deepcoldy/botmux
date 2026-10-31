@@ -28,7 +28,9 @@ Botmux 提供多层次的运行隔离机制，保护你的宿主开发机免受�
 - **deny-by-default 白名单**：只有策略显式声明的路径才会挂进沙盒，读写档位逐条区分（可写 bind / 只读 bind / 空遮罩）：
   - 项目工作目录（`workingDir`）可写，CLI 运行必需的工具与动态库只读；
   - 默认硬阻断 `~/.ssh`、`~/.aws` 以及共享的 `~/.lark-cli`；
-  - ⚠️ `workingDir` 缺省是 `~`。此时整个家目录都在可写白名单里，包括 `~/.botmux` 下的 `bots.json`、Dashboard 密钥和其它 Bot 的凭证目录。要把这些挡在外面，请把工作目录指到具体项目目录（如 `~/proj`），这样它们不在白名单内。
+  - `~/.botmux`（以及自定义的 botmux 数据目录）始终按白名单处理：即使 `workingDir` 是 `~`（缺省值）或更上层的目录，沙盒里也只能访问本会话需要的那部分（本 Bot 自己的 `bots/<appId>/`、`botmux` 命令和插件目录、本会话的记录文件），`bots.json`、Dashboard 密钥、其它 Bot 的目录都不可读写。工作目录不能设在 botmux 数据目录里面（本 Bot 自己的 `bots/<appId>/` 除外），否则会话拒绝启动；
+  - botmux 安装目录只读挂入，用来运行 `botmux` 命令。安装目录是 git 仓库时，其中没被 git 跟踪的文件（如 `.env`、Bot 配置、登录态、`data/`）和 `.git` 会被遮住，构建产物 `dist/`、`node_modules/` 照常可读；工作目录本身就在安装目录里时，工作目录下面的部分不遮；`sandboxPaths` 里授予安装目录或其上层目录不会解除遮罩。
+  - `workingDir` 缺省是 `~`，此时家目录里其它未遮罩的内容都可写，建议把工作目录指到具体项目目录（如 `~/proj`）。
 - **CLI 数据目录按 Bot 重定向（Claude 家族与 Codex）**：Claude Code（含同源的 Seed）和 Codex 的配置、会话记录、记忆写到该 Bot 的专属目录 `<BOTMUX_HOME>/bots/<appId>/`（`.../claude`、`.../codex`），不读写你全局的 `~/.claude`、`~/.codex`，这也是旧字段 `readIsolation` 的实际含义。其它 CLI（Cursor、Gemini、Grok、Kimi 等）不做重定向，仍用宿主上的全局数据目录，按各自适配器声明的路径挂进沙盒（有的整目录可写，有的只挂凭证文件）。
 - **网络默认不隔离**：白名单只管文件。不配 `sandboxNetwork: false` 或 `sandboxNetworkPolicy` 时，沙盒内网络与宿主一致，见[网络沙盒](#4-网络沙盒network-sandbox)。
 - **底层实现**：
