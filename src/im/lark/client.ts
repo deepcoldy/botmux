@@ -3039,7 +3039,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
       for (const e of entries) {
         appIdToInfo.set(e.larkAppId, {
           botOpenId: typeof e.botOpenId === 'string' ? e.botOpenId : null,
-          botName: e.botName,
+          botName: e.botName ?? null,
         });
       }
     }

@@ -115,7 +115,8 @@ export function resolveBotRefs(
   botInfo: unknown[],
 ): ResolvedBots {
   const safeBotInfo: BotInfoForResolve[] = botsInfoObjectEntries(botInfo)
-    .filter(isBotsInfoRouteEntry);
+    .filter(isBotsInfoRouteEntry)
+    .map(entry => ({ larkAppId: entry.larkAppId, botName: entry.botName ?? null }));
   const out: string[] = [];
   const seen = new Set<string>();
   const invalid: string[] = [];

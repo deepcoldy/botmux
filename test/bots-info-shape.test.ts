@@ -23,7 +23,7 @@ describe('bots-info runtime shapes', () => {
     expect(isBotsInfoRouteEntry(nameOnly)).toBe(false);
   });
 
-  it('requires a non-empty app id and string-or-null name for routing rows', () => {
+  it('requires a non-empty app id and rejects only truthy non-string names for routing rows', () => {
     const entries = botsInfoObjectEntries([
       { larkAppId: '', botName: 'Empty App' },
       { larkAppId: '   ', botName: 'Blank App' },
@@ -32,6 +32,7 @@ describe('bots-info runtime shapes', () => {
       { larkAppId: 'cli_named', botName: 'Named' },
     ]);
     expect(entries.filter(isBotsInfoRouteEntry)).toEqual([
+      { larkAppId: 'cli_missing_name' },
       { larkAppId: 'cli_null_name', botName: null },
       { larkAppId: 'cli_named', botName: 'Named' },
     ]);

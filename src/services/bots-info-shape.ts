@@ -15,7 +15,7 @@ export type BotsInfoNameEntry = BotsInfoObjectEntry & {
 
 export type BotsInfoRouteEntry = BotsInfoObjectEntry & {
   larkAppId: string;
-  botName: string | null;
+  botName?: string | null;
 };
 
 /** Keep only JSON object rows; null, scalars and nested arrays are malformed. */
@@ -35,5 +35,5 @@ export function isBotsInfoNameEntry(entry: BotsInfoObjectEntry): entry is BotsIn
 export function isBotsInfoRouteEntry(entry: BotsInfoObjectEntry): entry is BotsInfoRouteEntry {
   return typeof entry.larkAppId === 'string'
     && entry.larkAppId.trim().length > 0
-    && (entry.botName === null || typeof entry.botName === 'string');
+    && (entry.botName == null || typeof entry.botName === 'string');
 }

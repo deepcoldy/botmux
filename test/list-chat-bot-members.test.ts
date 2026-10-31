@@ -83,6 +83,7 @@ vi.mock('../src/utils/user-token.js', () => ({
 vi.mock('../src/bot-registry.js', () => ({
   loadBotConfigs: vi.fn(() => state.botConfigs),
   getBotClient: vi.fn((appId: string) => new MockClient({ appId })),
+  formatLarkError: vi.fn(() => ''),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -139,6 +140,7 @@ describe('listChatBotMembers', () => {
       { larkAppId: 'cli_bad_boolean', botName: true },
       { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
       { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_garbled', botName: {} },
     ]));
 
     const { listChatBotMembers } = await import('../src/im/lark/client.js');
