@@ -117,6 +117,69 @@ describe('botmux root under a broad workingDir (transport session)', () => {
   });
 });
 
+describe('data root that is not a botmux home (dirname of SESSION_DATA_DIR)', () => {
+  // Shapes where dirname(SESSION_DATA_DIR) is $HOME, / or the checkout. The
+  // worker passes botmuxHomePlausible=false for the first two
+  // (plausibleConfiguredBotmuxHome); the checkout case is detected by path.
+  const layout = (root: string, plausible: boolean) => ({
+    botmuxHome: root,
+    sessionDataDir: `${root === '/' ? '' : root}/data`,
+    botHome: `${root === '/' ? '' : root}/bots/cli_self`,
+    loadedBotsConfigPath: `${BH}/bots.json`,
+    botmuxHomePlausible: plausible,
+  });
+
+  for (const [name, root, workingDirs] of [
+    ['SESSION_DATA_DIR=$HOME/data', H, [`${H}/projects`, H]],
+    ['SESSION_DATA_DIR=/data', '/', ['/proj', '/']],
+  ] as const) {
+    for (const workingDir of workingDirs) {
+      it(`${name}, workingDir=${workingDir}: starts, other bots' data hidden, own surface kept`, () => {
+        const o = { ...layout(root, false), workingDir };
+        const r = root === '/' ? '' : root;
+        expect(() => buildFsPolicy(ctx(o))).not.toThrow();
+        for (const p of [`${r}/bots/cli_other/send-cred.json`, `${r}/data/cli-identity/other.bin`, `${r}/data/session-stores/cli_other`, `${BH}/bots.json`, `${BH}/.dashboard-secret`]) {
+          expect(hidden(access(o, p)), p).toBe(true);
+        }
+        expect(access(o, `${r}/bots/cli_self/send-cred.json`)).toBe('readWrite');
+        expect(access(o, `${r}/data/session-stores/cli_self`)).toBe('readOnly');
+        expect(access(o, `${workingDir === '/' ? '' : workingDir}/some-file`)).toBe('readWrite');
+      });
+    }
+  }
+
+  it('SESSION_DATA_DIR=$HOME/data: a workingDir inside the data dir or the BOT_HOMEs dir is refused', () => {
+    for (const workingDir of [`${H}/data`, `${H}/data/x`, `${H}/bots`, `${H}/bots/cli_other`]) {
+      expect(() => buildFsPolicy(ctx({ ...layout(H, false), workingDir })), workingDir).toThrow(FsPolicyConfigError);
+    }
+    expect(() => buildFsPolicy(ctx({ ...layout(H, false), workingDir: `${H}/bots/cli_self` }))).not.toThrow();
+  });
+
+  it('SESSION_DATA_DIR=<checkout>/data: the checkout code stays readable, credentials stay hidden', () => {
+    const o = {
+      ...layout(CHECKOUT, true),
+      workingDir: '/srv/proj',
+      botmuxInstallRootMaskPaths: [`${CHECKOUT}/.env`, `${CHECKOUT}/.git`],
+    };
+    for (const p of [`${CHECKOUT}/dist/cli.js`, `${CHECKOUT}/src/cli.ts`, `${CHECKOUT}/package.json`]) expect(access(o, p), p).toBe('readOnly');
+    for (const p of [`${CHECKOUT}/.env`, `${CHECKOUT}/.git/config`, `${CHECKOUT}/data/cli-identity/other.bin`, `${CHECKOUT}/bots/cli_other`]) {
+      expect(hidden(access(o, p)), p).toBe(true);
+    }
+    expect(access(o, `${CHECKOUT}/bots/cli_self`)).toBe('readWrite');
+    expect(() => buildFsPolicy(ctx({ ...o, workingDir: `${CHECKOUT}/src` }))).not.toThrow();
+  });
+
+  it('a plausible custom instance root keeps the full ceiling', () => {
+    const o = { ...layout('/srv/inst', true), workingDir: '/' };
+    for (const p of ['/srv/inst/bots.json', '/srv/inst/.env', '/srv/inst/bots/cli_other', '/srv/inst/data/session-stores/cli_other', `${BH}/bots.json`]) {
+      expect(hidden(access(o, p)), p).toBe(true);
+    }
+    expect(access(o, '/srv/inst/bots/cli_self')).toBe('readWrite');
+    expect(access(o, '/srv/inst/data/session-stores/cli_self')).toBe('readOnly');
+    expect(() => buildFsPolicy(ctx({ ...o, workingDir: '/srv/inst/notes' }))).toThrow(FsPolicyConfigError);
+  });
+});
+
 describe('install-root masks in the policy', () => {
   const masks = [`${CHECKOUT}/.env`, `${CHECKOUT}/test-bots.json`, `${CHECKOUT}/storageState.json`, `${CHECKOUT}/.git`, `${CHECKOUT}/data`];
 
@@ -138,6 +201,19 @@ describe('install-root masks in the policy', () => {
     const o = { workingDir: CHECKOUT, botmuxInstallRootMaskPaths: masks };
     expect(access(o, `${CHECKOUT}/.git/config`)).not.toBe('deny');
     expect(access(o, `${CHECKOUT}/.env`)).not.toBe('deny');
+  });
+
+  it('a sandboxPaths grant of the checkout does not lift the masks', () => {
+    for (const userPaths of [{ readWrite: [CHECKOUT] }, { readOnly: [CHECKOUT] }, { readOnly: [H] }]) {
+      const o = { workingDir: `${H}/proj`, userPaths, botmuxInstallRootMaskPaths: masks };
+      for (const p of masks) expect(access(o, p), `${JSON.stringify(userPaths)} ${p}`).toBe('deny');
+    }
+  });
+
+  it('a workingDir inside the checkout lifts only the masks under it', () => {
+    const o = { workingDir: `${CHECKOUT}/data`, botmuxInstallRootMaskPaths: masks };
+    expect(access(o, `${CHECKOUT}/data/x.db`)).toBe('readWrite');
+    expect(access(o, `${CHECKOUT}/.env`)).toBe('deny');
   });
 
   it('only honours paths strictly inside the install root', () => {

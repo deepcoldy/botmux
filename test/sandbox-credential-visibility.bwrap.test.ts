@@ -52,15 +52,15 @@ d('sandbox credential visibility (real bubblewrap)', () => {
     writeFileSync(path, body);
   };
 
-  function compile(workingDir: string): string[] {
+  function compile(workingDir: string, root = bh): string[] {
     const emptiesDir = join(S, 'sbx/empties');
     const emptyDir = join(S, 'sbx/empty');
     mkdirSync(emptiesDir, { recursive: true });
     mkdirSync(emptyDir, { recursive: true });
     const policy = buildFsPolicy({
       platform: 'linux', homeDir: home,
-      botmuxHome: bh, defaultBotmuxHome: bh, sessionDataDir: join(bh, 'data'),
-      sessionId: 'cred-vis', workingDir, currentAppId: 'cli_self', botHome: join(bh, 'bots/cli_self'),
+      botmuxHome: root, defaultBotmuxHome: bh, sessionDataDir: join(root, 'data'),
+      sessionId: 'cred-vis', workingDir, currentAppId: 'cli_self', botHome: join(root, 'bots/cli_self'),
       redirectedCliData: true,
       loadedBotsConfigPath: join(bh, 'bots.json'),
       botmuxInstallRoot: checkout,
@@ -89,14 +89,14 @@ d('sandbox credential visibility (real bubblewrap)', () => {
     return compiled.args;
   }
 
-  const sh = (cmd: string) => {
-    const r = spawnSync('bwrap', [...args, '/bin/sh', '-c', cmd], { encoding: 'utf8' });
+  const sh = (cmd: string, argv = args) => {
+    const r = spawnSync('bwrap', [...argv, '/bin/sh', '-c', cmd], { encoding: 'utf8' });
     return { status: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
   };
   const q = (p: string) => JSON.stringify(p);
   // Content check, not just the exit code: every fake file holds a FAKE-* body.
-  const readable = (p: string) => {
-    const r = sh(`cat ${q(p)}`);
+  const readable = (p: string, argv = args) => {
+    const r = sh(`cat ${q(p)}`, argv);
     return r.status === 0 && r.out.includes('FAKE');
   };
 
@@ -148,5 +148,16 @@ d('sandbox credential visibility (real bubblewrap)', () => {
     expect(readable(join(checkout, 'dist/cli.js'))).toBe(true);
     expect(readable(join(checkout, 'package.json'))).toBe(true);
     expect(sh(`echo x > ${q(join(checkout, 'dist/cli.js'))}`).status).not.toBe(0);
+  });
+
+  it('data dir inside the checkout: code still readable, credentials hidden', () => {
+    put(join(checkout, 'bots/cli_self/send-cred.json'), 'FAKE-self-in-checkout');
+    put(join(checkout, 'bots/cli_other/send-cred.json'), 'FAKE-other-in-checkout');
+    const argv = compile(join(home, 'proj'), checkout);
+    expect(readable(join(checkout, 'dist/cli.js'), argv)).toBe(true);
+    expect(readable(join(checkout, 'package.json'), argv)).toBe(true);
+    expect(readable(join(checkout, '.env'), argv)).toBe(false);
+    expect(readable(join(checkout, 'bots/cli_other/send-cred.json'), argv)).toBe(false);
+    expect(readable(join(checkout, 'bots/cli_self/send-cred.json'), argv)).toBe(true);
   });
 });

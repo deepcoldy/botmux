@@ -357,7 +357,7 @@ describe('buildFsPolicy', () => {
       expect(accessForPath(p.rules, path).access).toBe('readWrite');
     }
     expect(accessForPath(p.rules, '/home/u/.kimi-code/bin/kimi').access).toBe('readOnly');
-    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('deny');
   });
 
   it('gemini keeps its whole state dir writable: settings, folder trust (tmp + rename) and OAuth', () => {
