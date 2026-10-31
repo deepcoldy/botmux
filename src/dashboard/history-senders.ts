@@ -1,4 +1,8 @@
-import { botsInfoObjectEntries, isBotsInfoNameEntry } from '../services/bots-info-shape.js';
+import {
+  botsInfoObjectEntries,
+  isBotsInfoNameEntry,
+  type BotsInfoObjectEntry,
+} from '../services/bots-info-shape.js';
 
 export interface HistoryMessage {
   messageId: string;
@@ -32,6 +36,20 @@ export interface HistoryBotInfo {
 }
 
 /**
+ * App-id index tier for history enrichment. Deliberately NOT the shared
+ * isBotsInfoRouteEntry: it also accepts a MISSING botName key (undefined),
+ * which the IPC caller self-builds and hand-written files contain, while still
+ * rejecting truthy non-string names. Kept local so this contract cannot shift
+ * when the routing guard's own decisions change.
+ */
+type HistoryAppIndexEntry = BotsInfoObjectEntry & { larkAppId: string };
+
+function isHistoryAppIndexEntry(entry: BotsInfoObjectEntry): entry is HistoryAppIndexEntry {
+  return typeof entry.larkAppId === 'string' && entry.larkAppId.trim().length > 0
+    && (entry.botName == null || typeof entry.botName === 'string');
+}
+
+/**
  * Attach sender presentation data without changing the Lark message order or
  * content. Lark history may identify an app sender either by its stable
  * `cli_*` app id or an observer-scoped `ou_*` open_id. Match the stable id
@@ -44,27 +62,29 @@ export function enrichHistorySenders(
   botMembers: readonly HistoryBotMember[],
   botInfos: unknown,
 ): Array<HistoryMessage & { senderName?: string; senderAvatar?: string; senderBotAppId?: string }> {
-  const safeBotInfos: HistoryBotInfo[] = botsInfoObjectEntries(botInfos)
-    .filter(isBotsInfoNameEntry)
-    .map(info => ({
-      ...(typeof info.larkAppId === 'string' && info.larkAppId.trim()
-        ? { larkAppId: info.larkAppId }
-        : {}),
-      botName: info.botName,
-      ...(typeof info.botOpenId === 'string' ? { botOpenId: info.botOpenId } : {}),
-      ...(typeof info.botAvatarUrl === 'string' ? { botAvatarUrl: info.botAvatarUrl } : {}),
-    }));
+  const objectRows = botsInfoObjectEntries(botInfos);
+  const normalizeHistoryInfo = (info: BotsInfoObjectEntry): HistoryBotInfo => ({
+    ...(typeof info.larkAppId === 'string' && info.larkAppId.trim()
+      ? { larkAppId: info.larkAppId }
+      : {}),
+    ...(typeof info.botName === 'string' ? { botName: info.botName } : {}),
+    ...(typeof info.botOpenId === 'string' ? { botOpenId: info.botOpenId } : {}),
+    ...(typeof info.botAvatarUrl === 'string' ? { botAvatarUrl: info.botAvatarUrl } : {}),
+  });
+  const rowsForAppIndex = objectRows.filter(isHistoryAppIndexEntry);
+  const rowsForNameIndex = objectRows.filter(isBotsInfoNameEntry);
   const infoByAppId = new Map<string, HistoryBotInfo>();
-  for (const info of safeBotInfos) {
-    if (info.larkAppId) infoByAppId.set(info.larkAppId, info);
+  for (const info of rowsForAppIndex) {
+    infoByAppId.set(info.larkAppId, normalizeHistoryInfo(info));
   }
   const infoByName = new Map<string, HistoryBotInfo>();
   const duplicateNames = new Set<string>();
-  for (const info of safeBotInfos) {
-    const name = typeof info.botName === 'string' ? info.botName.trim() : '';
+  for (const info of rowsForNameIndex) {
+    const normalized = normalizeHistoryInfo(info);
+    const name = typeof normalized.botName === 'string' ? normalized.botName.trim() : '';
     if (!name) continue;
     if (infoByName.has(name)) duplicateNames.add(name);
-    else infoByName.set(name, info);
+    else infoByName.set(name, normalized);
   }
   for (const name of duplicateNames) infoByName.delete(name);
 

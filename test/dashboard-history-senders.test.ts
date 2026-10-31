@@ -77,6 +77,36 @@ describe('dashboard history sender enrichment', () => {
     });
   });
 
+  it('keeps appId/avatar for a writer-shape row whose botName is legitimately null', () => {
+    const [message] = enrichHistorySenders(
+      [{ messageId: 'm1', senderId: 'cli_peer', senderType: 'app', msgType: 'text', content: 'done' }],
+      new Map(),
+      [],
+      [{ larkAppId: 'cli_peer', botName: null, botAvatarUrl: 'https://img/peer', cliId: 'codex' }],
+    );
+    expect(message).toMatchObject({ senderBotAppId: 'cli_peer', senderAvatar: 'https://img/peer' });
+  });
+
+  it('keeps appId for the IPC self-shaped row with undefined botName/avatar', () => {
+    const [message] = enrichHistorySenders(
+      [{ messageId: 'm1', senderId: 'cli_self', senderType: 'app', msgType: 'text', content: 'done' }],
+      new Map(),
+      [],
+      [{ larkAppId: 'cli_self', botOpenId: 'ou_self', botName: undefined, botAvatarUrl: undefined }],
+    );
+    expect(message).toMatchObject({ senderBotAppId: 'cli_self' });
+  });
+
+  it('never indexes a truthy non-string botName via the member-name fallback', () => {
+    const [message] = enrichHistorySenders(
+      [{ messageId: 'm1', senderId: 'ou_garbled', senderType: 'app', msgType: 'text', content: 'done' }],
+      new Map(),
+      [{ openId: 'ou_garbled', displayName: '[object Object]' }],
+      [{ larkAppId: 'cli_bad', botName: {}, botAvatarUrl: 'https://bad' }],
+    );
+    expect(message).not.toHaveProperty('senderAvatar');
+  });
+
   it('skips malformed rows without polluting name indexes or duplicate detection', () => {
     const [message] = enrichHistorySenders(
       [{ messageId: 'm1', senderId: 'ou_peer', senderType: 'app', msgType: 'text', content: 'done' }],

@@ -15964,7 +15964,8 @@ botmux grant chat — 给目标 Bot 增删/查询精确群对话授权（不授�
     try {
       if (existsSync(botInfoPath)) {
         botInfo = botsInfoObjectEntries(JSON.parse(readFileSync(botInfoPath, 'utf8')))
-          .filter(isBotsInfoRouteEntry);
+          .filter(isBotsInfoRouteEntry)
+          .map(entry => ({ larkAppId: entry.larkAppId, botName: entry.botName ?? null }));
       }
     } catch { /* invalid bots-info is equivalent to no display-name hints */ }
 
@@ -16146,7 +16147,7 @@ botmux create-group — 用一组机器人新建飞书群
         .map(entry => ({
           larkAppId: entry.larkAppId,
           botOpenId: typeof entry.botOpenId === 'string' ? entry.botOpenId : null,
-          botName: entry.botName,
+          botName: entry.botName ?? null,
           cliId: typeof entry.cliId === 'string' ? entry.cliId : '',
         }));
     }

@@ -324,7 +324,12 @@ import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.
 import { type CliAvailabilityProbe } from '../setup/cli-availability.js';
 import { agentSaveProbePlan, probeAgentSaveAvailability, AgentSaveProbeError } from '../dashboard/agent-save-probe.js';
 import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
-import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
+import { enrichHistorySenders } from '../dashboard/history-senders.js';
+import {
+  botsInfoObjectEntries,
+  isBotsInfoRouteEntry,
+  type BotsInfoRouteEntry,
+} from '../services/bots-info-shape.js';
 import {
   validateCodexAppManagedSendOrigin,
 } from '../utils/codex-app-dispatch-ledger.js';
@@ -4962,10 +4967,10 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
     // resolver (cross-ref + observed bot roster) instead of assuming every
     // non-user message came from the bot that owns this dashboard session.
     const botMembers: ChatBotMember[] = await listChatBotMembers(appId, session.chatId).catch(() => [] as ChatBotMember[]);
-    let botInfos: HistoryBotInfo[] = [];
+    let botInfos: BotsInfoRouteEntry[] = [];
     try {
       const parsed = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf8'));
-      if (Array.isArray(parsed)) botInfos = parsed;
+      botInfos = botsInfoObjectEntries(parsed).filter(isBotsInfoRouteEntry);
     } catch { /* missing/corrupt cache degrades to name/open_id placeholders */ }
     // listChatBotMembers can be temporarily unavailable during startup. Always
     // retain a local self-bot fallback so its own messages still have identity.
@@ -4985,7 +4990,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
         });
       }
       if (!botInfos.some(info => info.larkAppId === appId)) {
-        botInfos.push({ larkAppId: appId, botOpenId: self.botOpenId, botName: self.botName, botAvatarUrl: self.botAvatarUrl });
+        botInfos.push({ larkAppId: appId, botOpenId: self.botOpenId, botName: self.botName ?? null, botAvatarUrl: self.botAvatarUrl });
       }
     } catch { /* session record may outlive a removed bot config */ }
 
