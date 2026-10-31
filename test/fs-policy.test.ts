@@ -357,7 +357,7 @@ describe('buildFsPolicy', () => {
       expect(accessForPath(p.rules, path).access).toBe('readWrite');
     }
     expect(accessForPath(p.rules, '/home/u/.kimi-code/bin/kimi').access).toBe('readOnly');
-    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('deny');
   });
 
   it('gemini keeps its whole state dir writable: settings, folder trust (tmp + rename) and OAuth', () => {
@@ -382,7 +382,7 @@ describe('buildFsPolicy', () => {
       expect(accessForPath(p.rules, path).access).toBe('readWrite');
     }
     // The grant stays the CLI's own dir: sibling bots and host secrets stay out.
-    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('deny');
     expect(accessForPath(p.rules, '/home/u/.ssh/id_rsa').access).toBe('deny');
   });
 
@@ -396,8 +396,8 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/Library/Keychains/login.keychain').access).toBe('deny');
     // ~/.botmux is NOT exposed wholesale (deny-by-default) — cross-bot secrets
     // and unlisted files are simply uncovered ('none' = inaccessible).
-    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/send-cred.json').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/other-project/secret').access).toBe('none');
   });
 
@@ -447,10 +447,10 @@ describe('buildFsPolicy', () => {
       botHome: `${botmuxHome}/bots/cli_self`, workingDir: `${homeDir}/proj` }));
     for (const suffix of ['', '/record.json', '/record.json.lock', '/record-reply.md',
       '/.file-lock-stale-claim-test/owner.candidate-123-uuid']) {
-      expect(accessForPath(p.rules, `${sessionDataDir}/turn-reply-cards${suffix}`).access).toBe('none');
+      expect(accessForPath(p.rules, `${sessionDataDir}/turn-reply-cards${suffix}`).access).toBe('deny');
     }
     expect(accessForPath(p.rules, `${sessionDataDir}/turn-sends/s.jsonl`).access).toBe('readWrite');
-    expect(accessForPath(p.rules, `${sessionDataDir}/turn-sends/other.jsonl`).access).toBe('none');
+    expect(accessForPath(p.rules, `${sessionDataDir}/turn-sends/other.jsonl`).access).toBe('deny');
     expect(accessForPath(p.rules, `${sessionDataDir}/bots-info.json`).access).toBe('readOnly');
   });
 
@@ -477,69 +477,69 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
     // the leftover `sessions-<self>.json` is a one-shot import source, never
     // read at runtime → deliberately NOT granted.
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');        // OWN session marker only
     // blocker #4: turn-sends is granted per-session-FILE, not the whole dir —
     // another session's marker is NOT writable (can't corrupt its send-dedup).
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/other.jsonl').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/other.jsonl').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends').access).toBe('deny');
     // ready-signal: the dsh-tui wrapper plugin appends its diagnostic trail from
     // INSIDE the sandbox. Same shape as turn-sends: the OWN session's single file
     // is readWrite (the worker pre-creates it), siblings and the shared root stay
     // deny-by-default — the trail names the session and its dispatch outcome.
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal/s.log').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage/s.jsonl').access).toBe('readWrite');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage/other.jsonl').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal/other.log').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/dsh-tui-ready-signal.log').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage/other.jsonl').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal/other.log').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/dsh-tui-ready-signal.log').access).toBe('deny');
     // statusline: `botmux statusline` atomically writes latest.json (tmp+rename needs
     // a writable parent) → the OWN session DIRECTORY is readWrite; siblings stay 'none'.
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/s').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/s/latest.json').access).toBe('readWrite');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/other/latest.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/other/latest.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline').access).toBe('deny');
     // turn-send-ledger: `botmux send` writes its per-turn final fence (atomic
     // write + sibling .lock) → OWN session DIRECTORY readWrite; the shared root
     // and sibling sessions stay 'none' (no forging/deleting another's fence).
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/s').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/s/0123456789abcdef0123456789abcdef.json').access).toBe('readWrite');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/other/0123456789abcdef0123456789abcdef.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/0123456789abcdef0123456789abcdef.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/.completed-prune').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/other/0123456789abcdef0123456789abcdef.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/0123456789abcdef0123456789abcdef.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/.completed-prune').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger').access).toBe('deny');
     // own BOT_HOME rw + own attachments ro (allow-listed elsewhere)
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/claude/x').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_self/m/f.pdf').access).toBe('readWrite'); // botmux quoted downloads here
     // ── everything else under ~/.botmux is DENY-BY-DEFAULT ('none') — no umbrella ──
     // credentials (codex critical finding): config.json voice keys, .env, webhook master key
-    expect(accessForPath(p.rules, '/Users/u/.botmux/config.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/.env').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/webhook-master.key').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/webhook-secrets.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/config.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.env').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/webhook-master.key').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/webhook-secrets.json').access).toBe('deny');
     // cross-bot content/routing (codex high finding)
     // schedules moved into per-bot BOT_HOMEs: the legacy shared path is no
     // longer granted (own store rides the BOT_HOME rw; sibling stores denied).
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite-wal').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('none'); // sibling store
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite-wal').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('deny'); // sibling store
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('deny');
     // sibling session stores stay deny-by-default: neither the store DIR nor any
     // file in it is covered (the grant is scoped to `session-stores/<self>`).
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('deny');
     // the shared parent is not granted either — no umbrella over every bot's store
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_other.json').access).toBe('none'); // sibling
-    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/logs/daemon-0.log').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m/f.pdf').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_other.json').access).toBe('deny'); // sibling
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/send-cred.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/logs/daemon-0.log').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m/f.pdf').access).toBe('deny');
     // a file created AFTER spawn (codex #3 fail-open) is ALSO denied — allow-list, not enumeration
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_futureBot.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_futureBot/sessions.db').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_futureBot.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_futureBot/sessions.db').access).toBe('deny');
   });
 
   it('lark-cli key store: OWN appsecret + master.key readable, siblings denied (verified live: without this `lark-cli auth` fails EPERM)', () => {
@@ -698,13 +698,13 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db-shm').access).toBe('readOnly');
     // the leftover `sessions-<self>.json` is a one-shot import source, never
     // read at runtime → deliberately NOT granted.
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('deny');
     // siblings simply not covered under the allow-list → inaccessible
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('none');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_self/m1/f.pdf').access).toBe('readWrite');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m1/f.pdf').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m1/f.pdf').access).toBe('deny');
   });
 
   it('own role-library subtree is rw (enumerate/switch/create roles + post-switch knowledge writes); sibling bots’ libraries stay uncovered', () => {
@@ -2046,9 +2046,9 @@ describe('buildFsPolicy — session skill manifest + skill snapshot', () => {
 
   it('without the grants (pre-fix shape) neither the manifest nor the skill body is reachable', () => {
     const p = buildFsPolicy(ctx());
-    expect(accessForPath(p.rules, ownManifest).access).toBe('none');
-    expect(accessForPath(p.rules, `${snapshot}/deploy/SKILL.md`).access).toBe('none');
-    expect(accessForPath(p.rules, `${store}/deploy/SKILL.md`).access).toBe('none');
+    expect(accessForPath(p.rules, ownManifest).access).toBe('deny');
+    expect(accessForPath(p.rules, `${snapshot}/deploy/SKILL.md`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/deploy/SKILL.md`).access).toBe('deny');
   });
 
   it('a sibling session\'s snapshot passed by mistake is not session-owned and never reaches a no-transport turn', () => {
