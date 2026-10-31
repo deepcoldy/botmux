@@ -4403,9 +4403,12 @@ describe('grok buildArgs', () => {
 describe('kimi buildArgs', () => {
   const adapter = createKimiAdapter('/usr/bin/kimi');
 
-  it('new session passes --yolo by default', () => {
+  it('new session bypasses approvals with --auto (Never Ask) by default', () => {
+    // Kimi Code 2.x `--yolo` is "Ask When Needed": risky actions still stop
+    // for a human, which an unattended IM session cannot answer.
     const args = adapter.buildArgs({ sessionId: 'sess-1', resume: false });
-    expect(args).toContain('--yolo');
+    expect(args).toContain('--auto');
+    expect(args).not.toContain('--yolo');
     expect(args).not.toContain('--resume');
   });
 
@@ -4416,8 +4419,9 @@ describe('kimi buildArgs', () => {
     expect(args[idx + 1]).toBe('kimi-k2.5');
   });
 
-  it('omits --yolo when disableCliBypass is true', () => {
+  it('passes no permission-mode flag when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-1', resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--auto');
     expect(args).not.toContain('--yolo');
   });
 

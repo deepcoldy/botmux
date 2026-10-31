@@ -61,9 +61,9 @@ describe('Kimi: the Kimi session of a botmux session', () => {
     kimiSession(home, 'session_aaaa', work, `<session_id>${BOTMUX}</session_id>`);
     const adapter = createKimiAdapter('/usr/bin/kimi');
     const env = { KIMI_CODE_HOME: home };
-    expect(adapter.buildArgs({ sessionId: BOTMUX, resume: true, workingDir: work, env })).toEqual(['--yolo', '--session', 'session_aaaa']);
-    expect(adapter.buildArgs({ sessionId: 'other', resume: true, workingDir: work, env })).toEqual(['--yolo']);
-    expect(adapter.buildArgs({ sessionId: BOTMUX, resume: false, workingDir: work, env })).toEqual(['--yolo']);
+    expect(adapter.buildArgs({ sessionId: BOTMUX, resume: true, workingDir: work, env })).toEqual(['--auto', '--session', 'session_aaaa']);
+    expect(adapter.buildArgs({ sessionId: 'other', resume: true, workingDir: work, env })).toEqual(['--auto']);
+    expect(adapter.buildArgs({ sessionId: BOTMUX, resume: false, workingDir: work, env })).toEqual(['--auto']);
   });
 });
 
