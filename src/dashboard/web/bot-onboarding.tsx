@@ -685,6 +685,7 @@ function OnboardingForm(props: {
             ariaLabel={t('botOnboarding.modelLabel')}
             defaultLabel={t('botDefaults.modelPickerDefault')}
             customLabel={t('botDefaults.modelPickerCustom')}
+            includeDefault
             menuClassName="onboarding-menu"
             detectedCount={detectedLiveCount || undefined}
             detectedLabel={detectedLiveCount > 0
