@@ -1950,7 +1950,7 @@ export const USAGE_REFRESH_INTERVAL_MS = 12_000;
  *  PATCH path. Requires: an actively-working turn, a live (non-sentinel, not a
  *  new-turn handoff) streaming card, the worker initialized (NOT a Web-Terminal
  *  port — ZMX reports ready with port=0), usageDisplay='streaming', and a CLI
- *  that actually has a native-usage transcript (gemini/opencode/pi/… have none
+ *  that actually has a native-usage transcript (opencode/pi/… have none
  *  → nothing to show). */
 export function usageRefreshShouldRun(ds: DaemonSession): boolean {
   if (ds.lastScreenStatus !== 'working') return false;
@@ -6322,7 +6322,7 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   // Claude-family CLIs deliver skills per-session via `--plugin-dir` (no global
   // leak), so they always materialise their plugin dir — the builtin-injection
   // mode does not apply to them. Everything below the branch is the global-dir
-  // path (codex/gemini/opencode/…) where the mode decides whether we install.
+  // path (codex/opencode/…) where the mode decides whether we install.
   if (adapter.pluginDir) {
     const pluginSkillsDir = join(adapter.pluginDir, 'skills');
     // 白板 skill 每次 spawn 重新评估（跟随运行时开关），不进 once-cache。
@@ -6356,7 +6356,7 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
 
   // Global-skillsDir CLIs: only write the shared dir when SOME bot on that dir
   // resolves to `global` mode. `prompt`/`off` keep the dir clean so the user's
-  // own standalone `codex`/`gemini` never sees (and mis-fires) botmux skills —
+  // own standalone `codex`/`opencode` never sees (and mis-fires) botmux skills —
   // those modes deliver the skills via the session prompt instead (see
   // session-manager buildNewTopicPrompt + skills/injection-mode.ts).
   const skillsDir = adapter.skillsDir;
@@ -6366,7 +6366,7 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   //  - 白板：跟随运行时开关，仅 global 模式落全局盘。
   //  - prompt/off 泄漏清理：每个新会话拉起 CLI 前，把共享 skills 目录里的 botmux
   //    技能清掉。这样「运行时从 global 切到 prompt/off」「旧版本或外部重新写入的
-  //    残留」都会在下一个会话的 CLI 启动前被扫干净，用户手动跑的独立 codex/gemini
+  //    残留」都会在下一个会话的 CLI 启动前被扫干净，用户手动跑的独立 codex/opencode
   //    立刻不再看到 botmux 技能，无需等 daemon 重启。只动 `botmux-` 命名空间，
   //    绝不碰用户自定义 skill。
   ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());

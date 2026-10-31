@@ -26,7 +26,6 @@ import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { buildPiArgs, createPiAdapter } from '../src/adapters/cli/pi.js';
@@ -358,32 +357,6 @@ describe('buildFsPolicy', () => {
     }
     expect(accessForPath(p.rules, '/home/u/.kimi-code/bin/kimi').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
-  });
-
-  it('gemini keeps its whole state dir writable: settings, folder trust (tmp + rename) and OAuth', () => {
-    const adapter = createGeminiAdapter('/usr/bin/gemini');
-    const p = buildFsPolicy(ctx({
-      platform: 'linux',
-      homeDir: '/home/u',
-      botHome: '/home/u/.botmux/bots/cli_self',
-      botmuxHome: '/home/u/.botmux',
-      sessionDataDir: '/home/u/.botmux/data',
-      workingDir: '/home/u/proj',
-      redirectedCliData: false,
-      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
-    }));
-    for (const path of [
-      '/home/u/.gemini/settings.json',
-      '/home/u/.gemini/trustedFolders.json',
-      '/home/u/.gemini/trustedFolders.json.tmp.0b5c',
-      '/home/u/.gemini/oauth_creds.json',
-      '/home/u/.gemini/tmp/proj/chats/session.json',
-    ]) {
-      expect(accessForPath(p.rules, path).access).toBe('readWrite');
-    }
-    // The grant stays the CLI's own dir: sibling bots and host secrets stay out.
-    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
-    expect(accessForPath(p.rules, '/home/u/.ssh/id_rsa').access).toBe('deny');
   });
 
   it('darwin baseline: system ro, scratch rw, crown jewels denied, lark-cli store denied', () => {

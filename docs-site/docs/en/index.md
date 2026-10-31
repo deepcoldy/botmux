@@ -2,7 +2,7 @@
 
 <p class="lead">Turn a Lark topic group into a remote control for AI coding CLIs. One message launches a dedicated coding session.</p>
 
-botmux is a bridge: a persistent **daemon** listens to Lark messages and automatically launches a dedicated AI coding CLI process (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity, etc.) for each new topic. It renders terminal output into Lark **streaming cards** in real time, and provides an interactive **Web Terminal**. Phone, computer, and Lark stay in sync — wherever you are, your coding session follows.
+botmux is a bridge: a persistent **daemon** listens to Lark messages and automatically launches a dedicated AI coding CLI process (Claude Code / Codex / Cursor / OpenCode / Antigravity, etc.) for each new topic. It renders terminal output into Lark **streaming cards** in real time, and provides an interactive **Web Terminal**. Phone, computer, and Lark stay in sync — wherever you are, your coding session follows.
 
 > Project: <https://github.com/deepcoldy/botmux> ｜ Install: `curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh` (self-contained binary, no Node required; `npm i -g botmux` also works)
 

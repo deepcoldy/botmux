@@ -88,8 +88,9 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 通过 `bots.json` 里的 `cliId` 一键切换。内置 **20+ 适配器**，覆盖本地 CLI（独立进程隔离，`tmux attach` 可直接接入调试）以及 API / 云 Agent：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) …
 
+- **Gemini CLI 已下线**：`gemini` 适配器已移除，替代品是 `antigravity`。仍写 `cliId: "gemini"` 的 bot 会拒绝启动并提示改用 Antigravity，其它 bot 不受影响；Gemini 专属的 `cliPathOverride` / `wrapperCli` / `model` / `GEMINI_CLI_HOME` 不会沿用，详见 [迁移说明](https://deepcoldy.github.io/botmux/adapters#gemini-cli-已下线)。
 - **会话级 CLI 切换**：会话尚未启动前，可通过 `/cli <cliId>` 为当前会话临时指定已注册的 CLI。
 - **Codex 多账号与实例池**：同一 Bot 支持通过 [会话级 Codex 实例](docs/codex-instances.md) 配置多登录目录与分配策略。
 - **兼容发行版**：Codex 衍生版和 Kimi TUI 衍生版可直接保留原 `cliId` 并通过 `cliRuntime` 声明独立身份，详见 [Codex 兼容发行版](https://deepcoldy.github.io/botmux/adapters#codex-兼容发行版)。

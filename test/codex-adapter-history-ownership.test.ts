@@ -252,8 +252,8 @@ describe('codex writeInput history ownership filter', () => {
     // CLI missing from it (as codex once was) submits fine but never proves.
     expect(cliAdapterBindsOwnershipPid('codex', undefined)).toBe(true);
     expect(cliAdapterBindsOwnershipPid('traex', undefined)).toBe(true);
-    expect(cliAdapterBindsOwnershipPid('gemini', undefined)).toBe(false);
-    expect(cliAdapterBindsOwnershipPid('gemini', '/tmp/claude-data')).toBe(true);
+    expect(cliAdapterBindsOwnershipPid('opencode', undefined)).toBe(false);
+    expect(cliAdapterBindsOwnershipPid('opencode', '/tmp/claude-data')).toBe(true);
     // A real tmux backend handle that never touches tmux: every input path is
     // redirected to the temporary history, as the managed worker would see it.
     const handle = new TmuxPipeBackend('review-do-not-connect', { isReattach: true, ownsSession: true }) as TmuxPipeBackend & PtyHandle;

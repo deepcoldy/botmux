@@ -418,7 +418,7 @@ describe('two-phase turn reactions', () => {
 
 /**
  * Behavioral pin for PR #633 review P2: card-off finishTurnReactions requires a
- * working→idle edge. Argv cold-start (Pi/Gemini) must seed working before idle
+ * working→idle edge. Argv cold-start (Pi/MTR) must seed working before idle
  * (worker side); daemon-side, bare undefined→idle must NOT flip, while the
  * seeded working→idle sequence must.
  */

@@ -100,7 +100,7 @@ describe('supportsTranscriptReplyDelivery', () => {
     // cursor 的转写兜底自 #932 起在普通 spawn 下也始终开启；codex-app 天然转写模式。
     ['cursor', true],
     ['codex-app', false],
-    ['gemini', false],
+    ['opencode', false],
     [undefined, false],
     ['', false],
   ];

@@ -92,7 +92,7 @@ describe('local-cli-opener', () => {
         expect(result.command).not.toContain('attach-session');
       }
     }
-    for (const cliId of ['codex-app', 'gemini', 'mira', 'mir']) {
+    for (const cliId of ['codex-app', 'dsh', 'mira', 'mir']) {
       expect(supportsLocalCliOpen(cliId)).toBe(false);
     }
   });

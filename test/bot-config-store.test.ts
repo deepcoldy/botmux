@@ -120,7 +120,7 @@ describe('bot-config store', () => {
     registry.registerBot({ larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' });
     expect(effectiveReplyDelivery('plain', 'codex')).toBe('send');
     const cli = store.findConfigField('cli')!;
-    const changed = await store.applyConfigField('app_default', cli, 'gemini');
+    const changed = await store.applyConfigField('app_default', cli, 'opencode');
     expect(changed).toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
     expect(readConfig().cliId).toBe('codex');
     expect((await store.applyConfigField('app_default', spec, 'default')).ok).toBe(true);
@@ -257,7 +257,7 @@ describe('bot-config store', () => {
   });
 
   it('rejects zero injection without automatic reply support', async () => {
-    const { store } = await loaded({ cliId: 'gemini' });
+    const { store } = await loaded({ cliId: 'opencode' });
     expect(await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none'))
       .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
     expect(readConfig().promptInjection).toBeUndefined();
@@ -1426,7 +1426,7 @@ describe('bot-config store', () => {
   });
 
   it('rejects reasoningEffort writes for unsupported CLIs and model pairs', async () => {
-    const unsupportedCli = await loaded({ cliId: 'gemini' });
+    const unsupportedCli = await loaded({ cliId: 'opencode' });
     const spec = unsupportedCli.store.findConfigField('reasoningEffort')!;
     const r1 = await unsupportedCli.store.applyConfigField('app_default', spec, 'medium');
     expect(r1.ok).toBe(false);
@@ -1505,7 +1505,7 @@ describe('bot-config store', () => {
   });
 
   it('rejects serviceTier writes for unsupported CLIs and clears it when switching CLI', async () => {
-    const unsupported = await loaded({ cliId: 'gemini' });
+    const unsupported = await loaded({ cliId: 'opencode' });
     const spec = unsupported.store.findConfigField('serviceTier')!;
     const rejected = await unsupported.store.applyConfigField('app_default', spec, 'priority');
     expect(rejected.ok).toBe(false);

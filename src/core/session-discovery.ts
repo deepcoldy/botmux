@@ -2,7 +2,7 @@
  * Session Discovery — scans tmux panes for running CLI processes that can be adopted.
  *
  * Discovers non-botmux tmux sessions running known CLI binaries (Claude Code,
- * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
+ * Codex, Aiden, CoCo, Cursor, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
  */
 import { execFileSync, execSync } from 'node:child_process';
 import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
@@ -96,7 +96,6 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // TRAE（traex）是另一套 Codex 系 CLI，可执行就叫 `traex`，与上面 CoCo 的
   // traecli 别名是两个不同的二进制（traecli 是 coco 的软链）。
   traex: 'traex',
-  gemini: 'gemini',
   opencode: 'opencode',
   opencode2: 'opencode2',
   mimo: 'mimocode',
@@ -439,7 +438,7 @@ function clockTicksPerSecond(): number {
 /**
  * 进程启动时间（epoch ms），best-effort。让 /adopt 选择卡片能为**任意** CLI 显示
  * 真实运行时长，而不是只有 Claude（Claude 另有 ~/.claude/sessions/<pid>.json 带
- * startedAt）。其它 CLI（cursor/codex/coco/gemini…）之前一律落 "未知" 就是因为
+ * startedAt）。其它 CLI（cursor/codex/coco…）之前一律落 "未知" 就是因为
  * 这里没有兜底。
  *
  * Linux 走 /proc/<pid>/stat（字段 22 = starttime，单位时钟滴答，自开机起算）+
@@ -1156,7 +1155,7 @@ function resolveAdoptableSessionForPane(
 
   // 5b. Fall back to the CLI process's own start time for uptime. Without
   // this only Claude (which has a session JSON with startedAt) shows a real
-  // uptime; every other CLI — cursor/codex/coco/gemini… — rendered "未知".
+  // uptime; every other CLI — cursor/codex/coco… — rendered "未知".
   if (startedAt === undefined) {
     startedAt = readProcessStartTime(cliPid);
   }

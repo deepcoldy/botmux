@@ -89,7 +89,7 @@ describe('buildTeamRoster', () => {
     writeBotsInfo([
       { larkAppId: 'cli_c', botOpenId: null, botName: 'C', cliId: 'codex' },
       { larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' },
-      { larkAppId: 'cli_x', botOpenId: null, botName: 'X', cliId: 'gemini' }, // not in config
+      { larkAppId: 'cli_x', botOpenId: null, botName: 'X', cliId: 'opencode' }, // not in config
       { larkAppId: 'cli_b', botOpenId: null, botName: 'B', cliId: 'coco' },
     ]);
     const r = buildTeamRoster(dataDir, DEFAULT_TEAM_ID, ['cli_a', 'cli_b', 'cli_c']);

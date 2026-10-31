@@ -2016,7 +2016,7 @@ button.primary {
 .cli-codex       { background: #fff0df; color: #a14c11; border-color: #ffd8ad; }
 .cli-codex-app   { background: #e9f7ff; color: #11638f; border-color: #bde4fa; }
 .cli-cursor      { background: #ece9ff; color: #5b4ac7; border-color: #d9d2ff; }
-.cli-gemini      { background: #fde7f1; color: #a13268; border-color: #fac8df; }
+.cli-antigravity { background: #fde7f1; color: #a13268; border-color: #fac8df; }
 .cli-opencode    { background: #e7f7ec; color: #176b36; border-color: #bfe8ce; }
 .cli-mtr         { background: #e5f5ff; color: #0f6388; border-color: #b8e2f7; }
 .cli-hermes      { background: #f0f4e4; color: #546b14; border-color: #d9e9a8; }
@@ -2030,7 +2030,7 @@ button.primary {
 :root[data-theme="dark"] .cli-codex,
 :root[data-theme="dark"] .cli-codex-app,
 :root[data-theme="dark"] .cli-cursor,
-:root[data-theme="dark"] .cli-gemini,
+:root[data-theme="dark"] .cli-antigravity,
 :root[data-theme="dark"] .cli-opencode,
 :root[data-theme="dark"] .cli-mtr,
 :root[data-theme="dark"] .cli-hermes,
@@ -19186,7 +19186,7 @@ button.webhook-log-row.active {
 :root[data-skin="cyber"] .cli-codex,
 :root[data-skin="cyber"] .cli-codex-app,
 :root[data-skin="cyber"] .cli-cursor,
-:root[data-skin="cyber"] .cli-gemini,
+:root[data-skin="cyber"] .cli-antigravity,
 :root[data-skin="cyber"] .cli-opencode,
 :root[data-skin="cyber"] .cli-mtr,
 :root[data-skin="cyber"] .cli-hermes,

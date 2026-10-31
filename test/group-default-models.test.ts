@@ -9,7 +9,7 @@ describe('new-topic default models', () => {
     expect(normalizeGroupDefaultModels({ oc_a: { codex: 'a' }, oc_b: { 'claude-code': 'sonnet' }, oc_bad: null }))
       .toEqual({ oc_a: { codex: 'a' }, oc_b: { 'claude-code': 'sonnet' } });
   });
-  for (const raw of [null, [], { gemini: 'flash' }, { codex: 2 }, { codex: 'x\nflag' }, { codex: 'x'.repeat(201) }]) {
+  for (const raw of [null, [], { opencode: 'flash' }, { codex: 2 }, { codex: 'x\nflag' }, { codex: 'x'.repeat(201) }]) {
     it(`rejects invalid config ${JSON.stringify(raw)}`, () => {
       expect(() => parseGroupDefaultModels(raw)).toThrow();
     });
@@ -22,10 +22,10 @@ describe('new-topic default models', () => {
     expect(resolveSessionLaunchModel({ session: { ...session, cliId: 'claude-code' } }, { cliId: 'codex' })).toBe('sonnet');
   });
   it('preserves fallback and other CLIs including Codex App', () => {
-    for (const cliId of ['codex', 'claude-code', 'gemini', 'codex-app']) {
+    for (const cliId of ['codex', 'claude-code', 'opencode', 'codex-app']) {
       expect(resolveSessionLaunchModel({ session: { cliId } }, { cliId, model: 'bot' })).toBe('bot');
     }
-    expect(resolveSessionLaunchModel({ session: { cliId: 'gemini', groupDefaultModels: { codex: 'codex-only' } } }, { cliId: 'gemini', model: 'flash' })).toBe('flash');
+    expect(resolveSessionLaunchModel({ session: { cliId: 'opencode', groupDefaultModels: { codex: 'codex-only' } } }, { cliId: 'opencode', model: 'flash' })).toBe('flash');
   });
 });
 

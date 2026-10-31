@@ -861,7 +861,7 @@ describe('discoverAdoptableSessions', () => {
   it('should not include sessionId for non-claude CLI types', () => {
     setupMocks({
       paneLines: 'mysession:0.0 1000\n',
-      commMap: { 1000: 'bash', 1001: 'gemini' },
+      commMap: { 1000: 'bash', 1001: 'opencode' },
       childMap: { 1000: [1001] },
       cwdMap: { 1001: '/home/user/proj' },
       dimsMap: { 'mysession:0.0': '80 24' },
@@ -870,7 +870,7 @@ describe('discoverAdoptableSessions', () => {
     const results = discoverAdoptableSessions();
 
     expect(results).toHaveLength(1);
-    expect(results[0]!.cliId).toBe('gemini');
+    expect(results[0]!.cliId).toBe('opencode');
     expect(results[0]!.sessionId).toBeUndefined();
     expect(results[0]!.startedAt).toBeUndefined();
   });

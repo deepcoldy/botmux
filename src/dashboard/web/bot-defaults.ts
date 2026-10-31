@@ -455,6 +455,11 @@ export type BotDefaultsRow = {
   startupBlocked?: {
     reason: 'quota_fallback_cycle';
     cycle: string[];
+  } | {
+    /** cliId of a removed CLI (gemini): the Bot is not started until it changes. */
+    reason: 'retired_cli';
+    cliId: string;
+    replacement: string;
   };
   summaryRange?: { limit?: number; sinceHours?: number };
   summaryMemory?: boolean;

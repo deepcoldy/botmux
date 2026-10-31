@@ -708,10 +708,6 @@ describe('getCliDisplayName', () => {
     expect(getCliDisplayName('codex')).toBe('Codex');
   });
 
-  it('should return "Gemini" for gemini', () => {
-    expect(getCliDisplayName('gemini')).toBe('Gemini');
-  });
-
   it('should return "OpenCode" for opencode', () => {
     expect(getCliDisplayName('opencode')).toBe('OpenCode');
   });
@@ -1145,16 +1141,16 @@ describe('buildSessionCard', () => {
 
     it('can include local attach buttons for non-resume CLIs when mode-aware readiness is true', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', false, false, 'en', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'mimocode', false, false, 'en', true));
       const actions = findActions(card);
       const btn = actions.find((a: any) => a.value?.action === 'open_local_cli');
-      expect(btn?.value.cli_id).toBe('gemini');
-      expect(btn?.text.content).toBe('💻 Open Gemini');
+      expect(btn?.value.cli_id).toBe('mimocode');
+      expect(btn?.text.content).toBe('💻 Open MiMoCode');
     });
 
     it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
       enableLocalCliOpen();
-      for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
+      for (const cli of ['codex-app', 'mimocode', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
         expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
@@ -1204,11 +1200,11 @@ describe('buildSessionCard', () => {
     });
 
     it('should include restart button with CLI display name', () => {
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'opencode', true));
       const actions = findActions(card);
       const restartBtn = actions.find((a: any) => a.value?.action === 'restart');
       expect(restartBtn).toBeDefined();
-      expect(restartBtn.text.content).toContain('Gemini');
+      expect(restartBtn.text.content).toContain('OpenCode');
       expect(restartBtn.value.root_id).toBe(ROOT);
       expect(restartBtn.value.session_id).toBe(SID);
     });
@@ -1742,7 +1738,7 @@ describe('buildStreamingCard', () => {
 
     it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
       const card = parse(buildStreamingCard(
-        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'opencode', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         { context: null, tokens: null },
       ));
@@ -2474,7 +2470,7 @@ describe('buildSessionClosedCard', () => {
     expect(findMarkdownContent(card)).toContain('/proj/x');
   });
 
-  it('shows a fallback note when the CLI cannot resume from CLI args (gemini/opencode)', () => {
+  it('shows a fallback note when the CLI cannot resume from CLI args (e.g. opencode)', () => {
     const card = parse(buildSessionClosedCard(
       'sess-3', 'om_root', 'topic', 'opencode', undefined, null,
     ));

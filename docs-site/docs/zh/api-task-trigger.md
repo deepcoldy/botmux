@@ -136,7 +136,7 @@
 - `model` 是该 CLI 的模型 id；`reasoningEffort` 按 CLI/模型能力校验，未配置或未知模型只开放公共安全档位，明确不支持时 400。
 - **仅新建会话生效**：折叠进已有 worker 的续轮不改写。
 - `model` **只驻内存、不落盘**：daemon 重启后按机器人配置的模型启动；`reasoningEffort` 仍随会话持久化。
-- 目标机器人不是 codex/codex-app/traex/grok 时这两个字段被忽略（不会改动 Claude/Gemini/CoCo 等的模型）。
+- 目标机器人不是 codex/codex-app/traex/grok 时这两个字段被忽略（不会改动 Claude/Antigravity/CoCo 等的模型）。
 
 **⚠️ 三个陷阱字段（类型里有，但和你想的不一样）**
 

@@ -320,6 +320,7 @@ import {
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { findRetiredCliBots, retiredCli } from './adapters/cli/retired-cli.js';
 import {
   findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
@@ -3141,6 +3142,7 @@ function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
 }
 
 type QuotaFallbackStartupBlock = { reason: 'quota_fallback_cycle'; cycle: string[] };
+type RetiredCliStartupBlock = { reason: 'retired_cli'; cliId: string; replacement: string };
 
 /** File-backed Bot Defaults rows keep recovery possible when a daemon was
  * deliberately skipped during startup. The dashboard itself is online, so it
@@ -3161,10 +3163,29 @@ async function configuredBotDefaultsRecoveryRows(
       }
     }
     const persistedNames = readPersistedBotNames();
-    return configs
-      .map((bot, botIndex) => ({ bot, botIndex }))
+    // The loader leaves rows on a removed CLI (gemini) out of `configs`; show
+    // them anyway so the owner sees why the Bot is down. They are parsed as
+    // the replacement CLI only to fill the row, then carry their real cliId.
+    const retiredRows: Array<{ bot: BotConfig; botIndex: number; block: RetiredCliStartupBlock }> = [];
+    for (const retired of findRetiredCliBots(raw)) {
+      const entry = raw[retired.index];
+      const replacement = retiredCli(retired.cliId)!.replacement;
+      try {
+        const [parsed] = parseBotConfigsFromText(JSON.stringify([{ ...entry, cliId: replacement }]));
+        if (!parsed) continue;
+        retiredRows.push({
+          bot: { ...parsed, cliId: retired.cliId as CliId },
+          botIndex: retired.index,
+          block: { reason: 'retired_cli', cliId: retired.cliId, replacement },
+        });
+      } catch { /* a row that is invalid besides its cliId stays hidden, as before */ }
+    }
+    return [
+      ...configs.map((bot, botIndex) => ({ bot, botIndex, block: blockByAppId.get(bot.larkAppId) as QuotaFallbackStartupBlock | RetiredCliStartupBlock | undefined })),
+      ...retiredRows,
+    ]
       .filter(({ bot }) => !onlineAppIds.has(bot.larkAppId))
-      .map(({ bot, botIndex }) => {
+      .map(({ bot, botIndex, block }) => {
         const rawEntry = rawByAppId.get(bot.larkAppId);
         const payload = botDefaultsPayload({
           larkAppId: bot.larkAppId,
@@ -3198,7 +3219,7 @@ async function configuredBotDefaultsRecoveryRows(
           ...payload,
           botIndex,
           online: false,
-          ...(blockByAppId.has(bot.larkAppId) ? { startupBlocked: blockByAppId.get(bot.larkAppId) } : {}),
+          ...(block ? { startupBlocked: block } : {}),
         };
       });
   } catch {

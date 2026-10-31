@@ -1565,12 +1565,12 @@ setInterval(() => {}, 1_000);
     // first, then classify the real idle settle as limited. If the synthetic
     // tick is classified too, both updates collapse to limited and card-off
     // GoGoGo never sees the busy edge required to flip DONE.
-    const fakeGemini = join(root, 'fake-gemini');
-    writeFileSync(fakeGemini, `#!/usr/bin/env node
+    const fakeMtr = join(root, 'fake-mtr');
+    writeFileSync(fakeMtr, `#!/usr/bin/env node
 process.stdout.write('Rate limit exceeded. Try again at 10:36 PM.\\n');
 setInterval(() => {}, 1_000);
 `);
-    chmodSync(fakeGemini, 0o755);
+    chmodSync(fakeMtr, 0o755);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
@@ -1597,8 +1597,8 @@ setInterval(() => {}, 1_000);
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,
-      cliId: 'gemini',
-      cliPathOverride: fakeGemini,
+      cliId: 'mtr',
+      cliPathOverride: fakeMtr,
       backendType: 'pty',
       prompt: 'hello from argv',
       larkAppId: 'app_test',

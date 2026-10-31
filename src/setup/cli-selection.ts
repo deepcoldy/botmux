@@ -165,10 +165,9 @@ const TTADK_X_CODEX: CliSelectOption = { key: 'ttadk-x-codex', label: 'TTADK × 
 const TTADK_X_OPENCODE: CliSelectOption = { key: 'ttadk-x-opencode', label: 'TTADK × OpenCode', cliId: 'opencode', wrapperCli: 'ttadk opencode' };
 const TTADK_X_COCO: CliSelectOption = { key: 'ttadk-x-coco', label: 'TTADK × CoCo', cliId: 'coco', wrapperCli: 'ttadk coco' };
 const TTADK_X_CURSOR: CliSelectOption = { key: 'ttadk-x-cursor', label: 'TTADK × Cursor', cliId: 'cursor', wrapperCli: 'ttadk cursor-cli' };
-const TTADK_X_GEMINI: CliSelectOption = { key: 'ttadk-x-gemini', label: 'TTADK × Gemini', cliId: 'gemini', wrapperCli: 'ttadk gemini' };
 
 const TTADK_VARIANTS: ReadonlyArray<CliSelectOption> = [
-  TTADK_X_CLAUDE, TTADK_X_CODEX, TTADK_X_OPENCODE, TTADK_X_COCO, TTADK_X_CURSOR, TTADK_X_GEMINI,
+  TTADK_X_CLAUDE, TTADK_X_CODEX, TTADK_X_OPENCODE, TTADK_X_COCO, TTADK_X_CURSOR,
 ];
 
 /** 顶层 CLI 之外、纯 wrapperCli 网关分组（不对应任何原生 cliId），追加到树/列表末尾。 */

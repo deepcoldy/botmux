@@ -29,7 +29,7 @@ Botmux 提供多层次的运行隔离机制，保护你的宿主开发机免受�
   - 项目工作目录（`workingDir`）可写，CLI 运行必需的工具与动态库只读；
   - 默认硬阻断 `~/.ssh`、`~/.aws` 以及共享的 `~/.lark-cli`；
   - ⚠️ `workingDir` 缺省是 `~`。此时整个家目录都在可写白名单里，包括 `~/.botmux` 下的 `bots.json`、Dashboard 密钥和其它 Bot 的凭证目录。要把这些挡在外面，请把工作目录指到具体项目目录（如 `~/proj`），这样它们不在白名单内。
-- **CLI 数据目录按 Bot 重定向（Claude 家族与 Codex）**：Claude Code（含同源的 Seed）和 Codex 的配置、会话记录、记忆写到该 Bot 的专属目录 `<BOTMUX_HOME>/bots/<appId>/`（`.../claude`、`.../codex`），不读写你全局的 `~/.claude`、`~/.codex`，这也是旧字段 `readIsolation` 的实际含义。其它 CLI（Cursor、Gemini、Grok、Kimi 等）不做重定向，仍用宿主上的全局数据目录，按各自适配器声明的路径挂进沙盒（有的整目录可写，有的只挂凭证文件）。
+- **CLI 数据目录按 Bot 重定向（Claude 家族与 Codex）**：Claude Code（含同源的 Seed）和 Codex 的配置、会话记录、记忆写到该 Bot 的专属目录 `<BOTMUX_HOME>/bots/<appId>/`（`.../claude`、`.../codex`），不读写你全局的 `~/.claude`、`~/.codex`，这也是旧字段 `readIsolation` 的实际含义。其它 CLI（Cursor、Antigravity、Grok、Kimi 等）不做重定向，仍用宿主上的全局数据目录，按各自适配器声明的路径挂进沙盒（有的整目录可写，有的只挂凭证文件）。
 - **网络默认不隔离**：白名单只管文件。不配 `sandboxNetwork: false` 或 `sandboxNetworkPolicy` 时，沙盒内网络与宿主一致，见[网络沙盒](#4-网络沙盒network-sandbox)。
 - **底层实现**：
   - **Linux**：基于 bubblewrap（bwrap）用户命名空间 + 细粒度只读/读写挂载；

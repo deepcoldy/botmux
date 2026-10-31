@@ -109,7 +109,7 @@ const CASES: Record<string, () => string> = {
   'session.localcli': () => buildSessionCard('sess1', 'om_root', 'https://term.example/s/1', 'T', 'codex', false, false, 'en', true),
   'session.runtimename': () => buildSessionCard('sess1', 'om_root', 'https://term.example/s/1', 'T', 'codex', true, false, 'en', true, 'My Runtime'),
   'closed.resume-cmd': () => buildSessionClosedCard('sess1', 'om_root', 'My task', 'claude-code', '/work/dir', 'claude --resume abc', 'en'),
-  'closed.no-cmd': () => buildSessionClosedCard('sess1', 'om_root', '', 'gemini', undefined, null, 'zh'),
+  'closed.no-cmd': () => buildSessionClosedCard('sess1', 'om_root', '', 'opencode', undefined, null, 'zh'),
   'closed.fresh': () => buildSessionClosedCard('sess1', 'om_root', 'T', 'codex', '/w', null, 'en', 'Custom', true),
   'fork.empty': () => buildForkPanelCard([], 'en'),
   'fork.children': () => buildForkPanelCard([

@@ -2691,7 +2691,7 @@ let lastSpawnCodexExecutable: string | undefined;
 let spawnArgvInitialPromptBusy = false;
 /**
  * True when spawn baked first prompt into argv (any such adapter, incl. Pi /
- * Gemini). Card-off reactions need a working→idle edge: Grok uses the busy
+ * OpenCode). Card-off reactions need a working→idle edge: Grok uses the busy
  * arm above; quiescence argv adapters seed working then idle at first ready.
  */
 let spawnArgvNeedsWorkingSeed = false;
@@ -13818,7 +13818,7 @@ function startStuckDetector(): void {
       // so never raise a key-driving stuck card from this observer.
       if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
       // Scope gate: this PR only handles the Codex PreToolUse hook-review
-      // screen. Other CLIs (Claude Code, Gemini, ...) must never see the
+      // screen. Other CLIs (Claude Code, Kimi, ...) must never see the
       // Codex-specific t/Enter/Esc card, even if their output happens to
       // contain the same strings.
       if (lastInitConfig?.cliId !== 'codex') return false;
@@ -17157,7 +17157,7 @@ const SPAWN_ARGV_TURN_START_EVIDENCE_GRACE_MS = 90_000;
  *  Scoped to Pi — the only quiescence-argv adapter with BOTH evidence channels
  *  (busyPattern + always-on structured transcript) — and to hidden schedule
  *  runs whose CLI store can confirm the submit (spawnArgvSubmissionEvidence);
- *  Gemini/OpenCode/MTR otherwise keep their historical first-idle behavior.
+ *  OpenCode/MTR otherwise keep their historical first-idle behavior.
  *  Never applies to the Grok-class busy arm, whose first ready is handled by
  *  spawnArgvInitialPromptBusy. */
 function spawnArgvTurnStartGateHolds(): boolean {
@@ -17749,7 +17749,7 @@ function markPromptReady(): void {
   //    busy (avoids a false "就绪" flash on daemon restart);
   //  - Grok-class argv-baked prompt + reliable turn terminal: first ready is
   //    pre-execution, so park as working until assistant_final/fireIdle;
-  //  - quiescence argv CLIs (Pi/Gemini/MTR/OpenCode): first ready IS turn end
+  //  - quiescence argv CLIs (Pi/MTR/OpenCode): first ready IS turn end
   //    — seed working then idle so card-off gets working→idle (review P2).
   const hasPendingWork =
     pendingMessages.length > 0
@@ -22833,7 +22833,7 @@ async function spawnCli(
   // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。
   const ttadkGateway = isTtadkWrapper(cfg.wrapperCli);
   // When a bot has startupCommands AND this CLI bakes the first prompt into
-  // launch args (passesInitialPromptViaArgs, e.g. Gemini -i), don't bake it —
+  // launch args (passesInitialPromptViaArgs, e.g. OpenCode --prompt), don't bake it —
   // route it through the input queue instead so startupCommands run first
   // (flushPending's hook can't precede an args-baked prompt). The init handler
   // mirrors this when deciding whether to enqueue the prompt.
@@ -22912,7 +22912,7 @@ async function spawnCli(
   lastSpawnQueuedInitialPrompt = initialPromptDelivery.queuedContent;
   lastSpawnQueuedInitialPromptLogicalContent = initialPromptDelivery.logicalContent;
   // Argv-baked first prompt tracking (PR #633 P2 / second-round review):
-  //  - needsWorkingSeed: any argv CLI (Pi/Gemini/MTR/OpenCode/Grok) so card-off
+  //  - needsWorkingSeed: any argv CLI (Pi/MTR/OpenCode/Grok) so card-off
   //    reactions can form working→idle (seeded at first ready or Grok arm).
   //  - busy arm: argv-baked prompt + reliable turn terminal (Grok-class; first ready is pre-execution).
   const argvBakedOpts = {
@@ -30074,7 +30074,7 @@ process.on('message', async (raw: unknown) => {
         }
 
         // Queue the initial prompt — flushed when CLI shows idle.
-        // Adapters with passesInitialPromptViaArgs (e.g. Gemini -i) bake the
+        // Adapters with passesInitialPromptViaArgs (e.g. OpenCode --prompt) bake the
         // prompt into CLI args, so we normally skip queuing to avoid double-send.
         // EXCEPTION: when this bot has startupCommands, spawnCli deliberately did
         // NOT bake the prompt (deferInitialPrompt) so the commands can precede it

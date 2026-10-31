@@ -1433,7 +1433,7 @@ function buildNewTopicBlocks(
     : '';
 
   // Built-in skill delivery for CLIs without a per-session skill channel
-  // (codex/gemini/opencode/… — those with a global `skillsDir`). In `prompt`
+  // (codex/opencode/… — those with a global `skillsDir`). In `prompt`
   // mode we inline a compact skill catalog here instead of installing files
   // into the CLI's shared global dir; in `off` mode we only point at the CLI
   // help. `global` mode installs files (worker-pool ensureCliSkills) and adds
@@ -1537,7 +1537,7 @@ function buildNewTopicBlocks(
     if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
     // Trigger-user auth: the same credential boundary the claude-family adapters
     // get via --append-system-prompt. Without it the inline-prompt CLIs
-    // (codex/gemini/…) would run with NO constraint at all — and since that is
+    // (codex/opencode/…) would run with NO constraint at all — and since that is
     // this release's only protection, a missing block there is a silent hole.
     //
     // Deliberately NOT added to ENVELOPE_KEYS. Today that choice is inert:

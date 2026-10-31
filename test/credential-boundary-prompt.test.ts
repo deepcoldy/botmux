@@ -6,7 +6,7 @@
  * file. That makes two properties worth pinning:
  *
  *   1. It reaches BOTH prompt paths. Claude-family adapters build their own
- *      system prompt; codex/gemini get an inline one. A block present in only
+ *      system prompt; codex/opencode get an inline one. A block present in only
  *      one is a silent hole in whichever CLI the operator happens to run.
  *   2. It says what not to do AND what to do instead. "Don't read those files"
  *      alone leaves an agent debugging an auth failure with no alternative —
@@ -233,7 +233,7 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
  * covered.
  *
  * The claude-family assertions above go through buildBotmuxSystemPromptText.
- * codex/gemini/… never call it: they get the block inline, from
+ * codex/opencode/… never call it: they get the block inline, from
  * buildNewTopicPrompt. Until this suite existed, deleting the inline push left
  * every test green — and the inline CLIs then ran with no credential constraint
  * at all, which in a release with no kernel-level isolation is the whole
