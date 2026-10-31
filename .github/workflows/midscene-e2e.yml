@@ -536,8 +536,9 @@ jobs:
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
           export GIT_AUTHOR_NAME="botmux-midscene-bot" GIT_COMMITTER_NAME="botmux-midscene-bot"
           export GIT_AUTHOR_EMAIL="midscene-bot@users.noreply.github.com" GIT_COMMITTER_EMAIL="midscene-bot@users.noreply.github.com"
-          # A report is 300–400 MB and GitHub Pages stops building past 1 GB:
-          # keep two master runs, and drop reports of PRs that are no longer open.
+          # Reports are 300–600 MB each; without pruning the site grew to
+          # ~11 GB / 35k files and Pages builds repeatedly failed for hours.
+          # Keep two master runs, and drop reports of PRs that are no longer open.
           if [[ "$SITE_KEY" == master-run-* ]]; then
             export PAGES_KEEP_PREFIX=master-run- PAGES_KEEP=2
           fi

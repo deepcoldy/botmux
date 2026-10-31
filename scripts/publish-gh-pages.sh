@@ -51,8 +51,8 @@ for attempt in 1 2 3 4 5; do
   fi
   if [[ -n "${PAGES_OPEN_PRS+set}" ]]; then
     parent=$(dirname "$target")
-    # Reports of merged or closed PRs are never looked at again, and GitHub
-    # Pages stops building once the published site passes 1 GB.
+    # Reports of merged or closed PRs are never looked at again; without this
+    # pruning the site grew to ~11 GB / 35k files and Pages builds failed.
     find "$parent" -mindepth 1 -maxdepth 1 -type d -name 'pr-*' -printf '%f\n' \
       | while IFS= read -r dir; do
           number=${dir#pr-}
