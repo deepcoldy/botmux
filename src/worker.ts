@@ -99,7 +99,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, transcriptApiErrorRecordSince, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
@@ -204,7 +204,7 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
-import { drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
+import { claudeStopFailureTranscriptRecord, drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import { InputDeliveryEvidenceTracker } from './services/input-delivery-evidence.js';
 import {
@@ -20381,7 +20381,7 @@ function postTerminalPromptFenceHolds(
  *  open turn left, tells the chat. See services/claude-stop-failure.ts. */
 function handleClaudeStopFailure(
   msg: Extract<DaemonToWorker, { type: 'claude_stop_failure' }>,
-  opts: { notifyOnly?: boolean } = {},
+  opts: { notifyOnly?: boolean; reportedAtMs?: number } = {},
 ): void {
   if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) {
     log(`Ignoring Claude StopFailure (${msg.report.error}): not a botmux-driven Claude session`);
@@ -20401,17 +20401,29 @@ function handleClaudeStopFailure(
     isKnownTurn: turnId => turnId === currentBotmuxTurnId || retiredTurnIds.has(turnId)
       || queuedTypeAheadTurns.some(queued => queued.turnId === turnId),
     lastFailureSurfacedAtMs: () => lastTurnFailureSurfacedAtMs,
+    transcriptApiErrorRecord: (sinceMs, reportTranscriptPath) => claudeStopFailureTranscriptRecord({
+      bridgeTranscriptPath: bridgeJsonlPath,
+      reportTranscriptPath,
+      dataDir: bridgeDataDir,
+      sinceMs,
+      canonical: path => { try { return realpathSync(path); } catch { return undefined; } },
+      probe: (path, sinceMs) => transcriptApiErrorRecordSince(path, sinceMs),
+    }),
+    recordNoticed: recordKey => claudeStopFailureNoticedRecords.has(recordKey),
+    lastNoticeAtMs: errorCode => claudeStopFailureNoticeAtMs.get(errorCode),
     now: Date.now,
     emit: (turnId, status, errorCode, dispatchAttempt, retryable) => {
       emitTurnTerminal(turnId, status, errorCode, dispatchAttempt, undefined, retryable);
     },
-    notify: (errorCode, replyTurnId) => {
+    notify: (errorCode, replyTurnId, recordKey) => {
       send({
         type: 'user_notify',
         ...(replyTurnId ? { turnId: replyTurnId } : {}),
         message: t('worker.claude_stop_failure_unsettled', { cliName: cliName(), errorCode }),
       });
       lastTurnFailureSurfacedAtMs = Date.now();
+      claudeStopFailureNoticeAtMs.set(errorCode, lastTurnFailureSurfacedAtMs);
+      if (recordKey) claudeStopFailureNoticedRecords.add(recordKey);
     },
     log,
   }, opts);
@@ -20427,7 +20439,7 @@ setInterval(() => {
   for (const entry of drainClaudeStopFailureOutbox(outbox)) {
     handleClaudeStopFailure(
       { type: 'claude_stop_failure', report: entry.report, ...(entry.turnId ? { turnId: entry.turnId } : {}) },
-      { notifyOnly: true },
+      { notifyOnly: true, reportedAtMs: entry.atMs },
     );
   }
 }, 1_000).unref?.();
@@ -29384,6 +29396,10 @@ const emittedTurnTerminals = new TurnTerminalDeduper();
 /** When a failed/ambiguous terminal or failure notice last went out: lets a
  *  Claude StopFailure report tell whether anything surfaced its failure. */
 let lastTurnFailureSurfacedAtMs: number | undefined;
+/** When each StopFailure notice code was last sent (see CLAUDE_STOP_FAILURE_NOTICE_COOLDOWN_MS). */
+const claudeStopFailureNoticeAtMs = new Map<string, number>();
+/** Transcript API-error records a StopFailure notice already told. */
+const claudeStopFailureNoticedRecords = new Set<string>();
 /** Opens at each turn's literal CLI write, closes at its terminal. See
  *  turn-execution-clock.ts for why queueing time is deliberately excluded. */
 const turnExecutionClock = new TurnExecutionClock();
