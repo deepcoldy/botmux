@@ -929,6 +929,9 @@ export interface BackgroundTaskSignals {
 export interface CodexDrainState {
   nextOffset: number;
   turnStartOffset: number;
+  activeNativeTurnId?: string;
+  sourceSessionId?: string;
+  sourcePath?: string;
 }
 
 /** Model / reasoning-effort pair read from a rollout's `turn_context` record. */
@@ -1298,6 +1301,35 @@ function precedingTurnStartOffset(path: string, beforeOffset: number): number {
   return result;
 }
 
+/** Recover native execution context for a cold seek into a running rollout.
+ * Live drains carry it in their cursor state, so ordinary polling never
+ * rescans a growing transcript. Missing bounded evidence stays unattributed. */
+function precedingNativeTurn(path: string, beforeOffset: number): { turnId: string; offset: number } | undefined {
+  let result: { turnId: string; offset: number } | undefined;
+  const closed = new Set<string>();
+  try {
+    scanJsonlBackward(path, {
+      endOffset: beforeOffset,
+      floor: Math.max(0, beforeOffset - CODEX_RUNTIME_SCAN_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line, offset) => {
+        let obj: any;
+        try { obj = JSON.parse(line.toString('utf8')); } catch { return false; }
+        const p = obj?.payload;
+        if (obj?.type !== 'event_msg') return false;
+        if (p?.type === 'task_complete' || p?.type === 'turn_aborted') {
+          if (typeof p.turn_id === 'string' && p.turn_id.length > 0) closed.add(p.turn_id);
+          else return true;
+        }
+        if (p?.type !== 'task_started' || typeof p.turn_id !== 'string' || !p.turn_id) return false;
+        if (!closed.has(p.turn_id)) result = { turnId: p.turn_id, offset };
+        return true;
+      },
+    });
+  } catch { /* no native proof */ }
+  return result;
+}
+
 /** Resolve a custom tool output against the rollout itself. Outputs can land
  * in a later incremental drain than their calls, so the byte offset alone is
  * insufficient; a backward chunk scan keeps the parser stateless without
@@ -1655,6 +1687,7 @@ export function drainCodexRollout(
   const reusableState = !step.reset && previousState?.nextOffset === start
     && previousState.turnStartOffset >= 0
     && previousState.turnStartOffset <= start
+    && (previousState.sourcePath === undefined || previousState.sourcePath === path)
     ? previousState
     : undefined;
   if (step.kind === 'idle') {
@@ -1684,6 +1717,9 @@ export function drainCodexRollout(
     return turnStartOffset;
   };
   const turnExecEntries: TerminalExecEntry[] = [];
+  let activeNativeTurnId = reusableState?.activeNativeTurnId;
+  let nativeContextKnown = start === 0 || reusableState?.activeNativeTurnId !== undefined;
+  let sourceSessionId = reusableState?.sourceSessionId;
   // Walk lines with their byte offsets so synthetic uuids are stable across
   // re-drains.
   for (const { line, lineStart, lineEnd } of iterateJsonlLines(completeText, start)) {
@@ -1705,6 +1741,7 @@ export function drainCodexRollout(
     }
     const p = obj?.payload;
     if (!p || typeof p !== 'object') continue;
+    if (obj.type === 'session_meta' && typeof p.id === 'string' && p.id) sourceSessionId = p.id;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const lineId = codexRolloutLineId(line);
@@ -1718,12 +1755,20 @@ export function drainCodexRollout(
       && p.type === 'task_started'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
+      activeNativeTurnId = p.turn_id;
+      nativeContextKnown = true;
+      turnStartOffset ??= lineStart;
+      if (!sourceSessionId && start > 0) {
+        const header = rolloutHeaderCheck(path);
+        if (header.verified && header.sid) sourceSessionId = header.sid;
+      }
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'turn_started',
         text: '',
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
         rawId: lineId,
       });
       continue;
@@ -1742,7 +1787,22 @@ export function drainCodexRollout(
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       if (isCodexEnvironmentUpdate(p.internal_chat_message_metadata_passthrough, text)) continue;
-      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'user', text });
+      if (!nativeContextKnown) {
+        const native = precedingNativeTurn(path, start);
+        activeNativeTurnId = native?.turnId;
+        // Keep the proof in incremental cursor state even when this cold
+        // range contains only user records and no terminal/tool output.
+        if (native) turnStartOffset ??= native.offset;
+        nativeContextKnown = true;
+      }
+      if (activeNativeTurnId && !sourceSessionId && start > 0) {
+        const header = rolloutHeaderCheck(path);
+        if (header.verified && header.sid) sourceSessionId = header.sid;
+      }
+      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'user', text,
+        ...(activeNativeTurnId ? { sourceTurnId: activeNativeTurnId, sourceMessageId: lineId } : {}),
+        ...(sourceSessionId ? { sourceSessionId } : {}),
+      });
       continue;
     }
     // Mid-turn thinking timeline: reasoning summaries and tool calls/outputs
@@ -1789,6 +1849,20 @@ export function drainCodexRollout(
       events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries });
       continue;
     }
+    // A terminal without native identity cannot safely settle a queued turn.
+    // It still ends the parser's attribution evidence, matching cold seeks:
+    // later id-less inputs must not borrow the preceding execution's receipt.
+    if (obj.type === 'event_msg'
+      && (p.type === 'task_complete' || p.type === 'turn_aborted')
+      && (typeof p.turn_id !== 'string' || p.turn_id.length === 0)) {
+      activeNativeTurnId = undefined;
+      nativeContextKnown = true;
+      turnStartOffset = lineEnd;
+      turnFullyCovered = true;
+      turnExecEntries.length = 0;
+      toolCallDeferralById.clear();
+      continue;
+    }
     // Turn terminal: event_msg `task_complete` carries the final visible text
     // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
     // This is the SOLE assistant_final source. Codex assistant `response_item`
@@ -1827,7 +1901,10 @@ export function drainCodexRollout(
           ...(failureLimitKind ? { terminalLimitKind: failureLimitKind } : {}),
         } : {}),
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
       });
+      if (activeNativeTurnId === p.turn_id) activeNativeTurnId = undefined;
+      nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
       turnExecEntries.length = 0;
@@ -1859,7 +1936,10 @@ export function drainCodexRollout(
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
       });
+      if (activeNativeTurnId === p.turn_id) activeNativeTurnId = undefined;
+      nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
       turnExecEntries.length = 0;
@@ -1880,7 +1960,11 @@ export function drainCodexRollout(
     latestReasoningEffort,
     ...(spawnedSubagents.length > 0 ? { spawnedSubagents } : {}),
     ...(turnStartOffset !== undefined ? {
-      state: { nextOffset: newOffset, turnStartOffset },
+      state: { nextOffset: newOffset, turnStartOffset,
+        ...(activeNativeTurnId ? { activeNativeTurnId } : {}),
+        ...(sourceSessionId ? { sourceSessionId } : {}),
+        ...(activeNativeTurnId || sourceSessionId ? { sourcePath: path } : {}),
+      },
     } : {}),
   };
 }
