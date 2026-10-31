@@ -281,7 +281,7 @@ function identityLayoutMarkerPath(sessionDataDir: string, sessionId: string): st
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), IDENTITY_LAYOUT_FILE);
 }
 
-function readIdentityLayout(sessionDataDir: string, sessionId: string): IdentityStorageModel | undefined {
+export function readIdentityLayout(sessionDataDir: string, sessionId: string): IdentityStorageModel | undefined {
   try {
     const value = readFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), 'utf8').trim();
     return value === 'proven-v1' || value === 'single-v1'

@@ -503,6 +503,15 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
+import {
+  resolveRegisteredBackgroundContext,
+  backgroundContextStillValid,
+  registerScheduledBackgroundExecution,
+  revokeScheduledBackgroundExecution,
+  BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE,
+  resolveDetachedScheduledExecutionIdentity,
+} from './detached-scheduled-identity.js';
+import { noteSenderUnionId } from './platform-credential-source.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
@@ -1196,6 +1205,8 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // Same lineage proof as current-execution; the reply carries identity env
   // CONTENT, so it is admitted only through this exact route.
   if (method === 'POST' && pathname === CURRENT_EXECUTION_IDENTITY_ROUTE) return true;
+  // Both handlers independently prove the socket peer, never a supplied PID.
+  if (method === 'POST' && [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE].includes(pathname)) return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host
@@ -1518,12 +1529,27 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
   const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
-  if (!document) return jsonRes(res, 403, blocked);
-  const ds = findActiveBySessionId(sessionId);
-  if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return jsonRes(res, 403, blocked);
-  const identityTurnId = document.identityTurnId ?? document.turnId;
-  const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
-  if (!env) {
+  if (document) {
+    const ds = findActiveBySessionId(sessionId);
+    if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return jsonRes(res, 403, blocked);
+    const identityTurnId = document.identityTurnId ?? document.turnId;
+    const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+    if (env) {
+      return jsonRes(res, 200, {
+        schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
+        sessionId, larkAppId: document.larkAppId, tool, identityTurnId, env,
+      });
+    }
+    const detachedFromLive = await resolveDetachedScheduledExecutionIdentity({
+      sessionDataDir: config.session.dataDir, sessionId, tool, peer: peer.peer,
+    });
+    if (detachedFromLive) {
+      return jsonRes(res, 200, {
+        schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
+        sessionId, larkAppId: detachedFromLive.larkAppId, tool,
+        identityTurnId: detachedFromLive.identityTurnId, env: detachedFromLive.env,
+      });
+    }
     // Lineage is proven, but no identity material exists for this turn (never
     // prepared, collected at a terminal boundary, daemon restart). Distinct
     // from a proof failure so the wrapper denies without confusing the two.
@@ -1531,11 +1557,49 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'identity_material_unavailable',
     });
   }
-  return jsonRes(res, 200, {
-    schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
-    sessionId, larkAppId: document.larkAppId, tool, identityTurnId, env,
+  const detached = await resolveDetachedScheduledExecutionIdentity({
+    sessionDataDir: config.session.dataDir, sessionId, tool, peer: peer.peer,
   });
+  if (detached) {
+    return jsonRes(res, 200, {
+      schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
+      sessionId, larkAppId: detached.larkAppId, tool,
+      identityTurnId: detached.identityTurnId, env: detached.env,
+    });
+  }
+  return jsonRes(res, 403, blocked);
 });
+
+for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {
+  ipcRoute('POST', route, async (req, res) => {
+    res.setHeader('cache-control', 'no-store');
+    let body: Record<string, unknown>;
+    try { body = await readBoundedJsonBody(req, 1024, 1000); }
+    catch { return jsonRes(res, 400, { error: 'invalid_background_request' }); }
+    const allowed = route === BACKGROUND_REGISTRATION_ROUTE ? ['sessionId', 'ttlSeconds'] : ['sessionId', 'jobId'];
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.keys(body).some(key => !allowed.includes(key))
+      || typeof body.sessionId !== 'string' || !body.sessionId || body.sessionId.length > 256
+      || (route === BACKGROUND_REGISTRATION_ROUTE && body.ttlSeconds !== undefined
+        && (typeof body.ttlSeconds !== 'number' || !Number.isSafeInteger(body.ttlSeconds)))
+      || (route === BACKGROUND_REVOKE_ROUTE && (typeof body.jobId !== 'string' || body.jobId.length > 128))) {
+      return jsonRes(res, 400, { error: 'invalid_background_request' });
+    }
+    const peer = resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
+      remotePort: req.socket.remotePort, localPort: req.socket.localPort });
+    if (!peer.ok) return jsonRes(res, 403, { error: 'current_execution_unverified' });
+    const input = { sessionDataDir: config.session.dataDir, sessionId: body.sessionId, peer: peer.peer };
+    if (route === BACKGROUND_REVOKE_ROUTE) {
+      return revokeScheduledBackgroundExecution({ ...input, jobId: body.jobId as string })
+        ? jsonRes(res, 200, { ok: true }) : jsonRes(res, 403, { error: 'background_execution_unverified' });
+    }
+    const job = registerScheduledBackgroundExecution({ ...input,
+      ...(body.ttlSeconds !== undefined ? { ttlSeconds: body.ttlSeconds as number } : {}) });
+    return job ? jsonRes(res, 200, { ok: true, jobId: job.id, sessionId: job.sessionId,
+      larkAppId: job.appId, pid: job.root.pid, expiresAt: job.expiresAt })
+      : jsonRes(res, 403, { error: 'background_execution_unverified' });
+  });
+}
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
@@ -3188,17 +3252,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   try { body = await readBoundedJsonBody(req, 4096, 1000); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
   const ds = findActiveBySessionId(params.sessionId);
+  const peer = process.platform === 'linux' ? resolveLoopbackPeerProcesses({
+    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
+  }) : undefined;
+  const backgroundInput = peer?.ok ? { sessionDataDir: config.session.dataDir,
+    sessionId: params.sessionId, peer: peer.peer } : undefined;
+  const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
+  const targetLarkAppId = ds?.larkAppId ?? detachedScheduled?.larkAppId;
+  const targetChatId = ds?.chatId ?? detachedScheduled?.chatId;
   let botConfig: { larkToolBinding?: boolean } | undefined;
-  try { botConfig = ds ? getBot(ds.larkAppId).config : undefined; } catch { /* bot missing */ }
-  if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
-    || !boundLarkToolRequest(req, params.sessionId, ds.larkAppId, botConfig)) {
+  try { botConfig = targetLarkAppId ? getBot(targetLarkAppId).config : undefined; } catch { /* bot missing */ }
+  if ((!ds && !detachedScheduled)
+    || (ds && ds.session.status !== 'active')
+    || sessionTransportDisabled({ chatId: targetChatId, larkAppId: targetLarkAppId })
+    || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
   if (!body || Object.keys(body).some(key => key !== 'mode') || !['bot', 'user'].includes(String(body.mode))) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
   res.setHeader('cache-control', 'no-store');
-  const bot = getBot(ds.larkAppId).config;
+  const bot = getBot(targetLarkAppId!).config;
   if (body.mode === 'bot') {
     let token: unknown;
     try {
@@ -3211,30 +3285,43 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     if (typeof token !== 'string' || !token) {
       return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
     }
-    if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
-      || sessionTransportDisabled(ds) || ds.larkAppId !== bot.larkAppId
-      || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
+    const stillValidSession = ds
+      ? (findActiveBySessionId(params.sessionId) === ds && ds.session.status === 'active'
+        && !sessionTransportDisabled(ds) && ds.larkAppId === bot.larkAppId)
+      : (!!backgroundInput && !!detachedScheduled && backgroundContextStillValid(backgroundInput, detachedScheduled)
+        && !sessionTransportDisabled({ chatId: targetChatId, larkAppId: bot.larkAppId }));
+    if (!stillValidSession || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
       return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
     }
     return jsonRes(res, 200, {
       ok: true, appId: bot.larkAppId, mode: 'bot', credentialType: 'tenant_access_token', credential: token,
     });
   }
-  const origin = ds.managedTurnOrigin;
-  const originSender = origin?.callerOpenId;
-  const turnId = origin?.turnId;
-  if (!turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
-  const identityTurnId = origin?.identityTurnId;
-  const peer = process.platform === 'linux' ? resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
-  }) : undefined;
-  const executionInput = peer?.ok
+  const executionInput = (ds && peer?.ok)
     ? { sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId } : undefined;
   const execution = executionInput ? attestCurrentExecutionLoopbackPeer(executionInput) : undefined;
-  if (process.platform === 'linux' && !execution) {
+  const liveOrigin = (ds && (process.platform !== 'linux' || execution)) ? ds.managedTurnOrigin : undefined;
+  const detachedForUser = !liveOrigin?.turnId ? detachedScheduled : null;
+  if (detachedForUser?.runIdentity.ok) {
+    noteSenderUnionId(detachedForUser.larkAppId, detachedForUser.runIdentity.openId, detachedForUser.runIdentity.unionId);
+  }
+  const originSender = liveOrigin?.callerOpenId
+    ?? (detachedForUser?.runIdentity.ok ? detachedForUser.runIdentity.openId : undefined);
+  const turnId = liveOrigin?.turnId ?? detachedForUser?.scheduledTurnId;
+  if (!turnId) {
+    return jsonRes(res, 403, {
+      ok: false,
+      error: process.platform === 'linux' && ds?.managedTurnOrigin?.turnId && !execution
+        ? 'current_execution_unverified'
+        : 'No current requesting user; --as user requires their authorization',
+    });
+  }
+  const identityTurnId = liveOrigin?.identityTurnId;
+  if (process.platform === 'linux' && !execution && !detachedForUser) {
     return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
   }
-  const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId);
+  const delegated = detachedForUser ? undefined
+    : getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId);
   const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
   if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
     || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
@@ -3242,10 +3329,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   }
   const sender = delegated?.targetOpenId ?? originSender;
   if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
-  const cached = delegated ? undefined : getIdentity(ds.larkAppId, sender);
+  const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
   const user = delegated ? { type: 'user' as const, openId: sender }
     : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
-      ? cached : await resolveVerifiedUserIdentity(ds.larkAppId, sender);
+      ? cached : await resolveVerifiedUserIdentity(bot.larkAppId, sender);
   if (!user || user.type !== 'user' || user.openId !== sender) {
     return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
   }
@@ -3257,12 +3344,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     ...(delegated ? { unionId: delegated.unionId } : {}),
     botAppToken: openId => resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), openId),
   });
-  if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
-    || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
-    || execution && !currentTurnPeerAttestationStable(execution, executionInput!)
-    || ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
-    || ds.managedTurnOrigin?.identityTurnId !== identityTurnId
-    || JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated)) {
+  const stableAfterAwait = liveOrigin?.turnId
+    ? (!!ds && findActiveBySessionId(params.sessionId) === ds && ds.session.status === 'active'
+      && (!execution || currentTurnPeerAttestationStable(execution, executionInput!))
+      && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.callerOpenId === originSender
+      && ds.managedTurnOrigin?.identityTurnId === identityTurnId)
+    : (!!backgroundInput && !!detachedForUser && backgroundContextStillValid(backgroundInput, detachedForUser));
+  if (!boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
+    || !stableAfterAwait
+    || (!detachedForUser && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated))) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
   if (!resolved.ok && resolved.reason === 'platform') {
