@@ -4746,6 +4746,11 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
           {tr('botDefaults.sbxPathsForbiddenRw', { paths: bot.sandboxPathsForbiddenReadWrite.join('、') })}
         </p>
       ) : null}
+      {bot.sandboxPathsReadOnlyRoot?.length ? (
+        <p className="hint-warn" data-sandbox-paths-readonly-root="">
+          {tr('botDefaults.sbxPathsReadOnlyRoot', { paths: bot.sandboxPathsReadOnlyRoot.join('、') })}
+        </p>
+      ) : null}
       <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
         <button type="button" className="bd-btn" onClick={() => setTextMode(m => !m)}>
           {textMode ? tr('botDefaults.sbxPathsTreeMode') : tr('botDefaults.sbxPathsTextMode')}

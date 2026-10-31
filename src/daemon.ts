@@ -1,4 +1,4 @@
-import { findForbiddenReadWritePaths, forbiddenReadWriteMessage } from './services/sandbox-path-guard.js';
+import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
@@ -31065,6 +31065,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const forbiddenRw = findForbiddenReadWritePaths(cfg.sandboxPaths?.readWrite);
     if (forbiddenRw.length) {
       logger.warn(`[sandbox:${cfg.larkAppId}] ${forbiddenReadWriteMessage(forbiddenRw)}（沙盒会话忽略根目录与相对路径条目、主目录与 botmux 数据目录类条目按只读处理）`);
+    }
+    const readOnlyRoot = findReadOnlyLauncherMountCovers(cfg.sandboxPaths?.readOnly);
+    if (readOnlyRoot.length) {
+      logger.warn(`[sandbox:${cfg.larkAppId}] ${readOnlyLauncherMountMessage(readOnlyRoot)}（沙盒会话忽略这些条目）`);
     }
   }
   // 这里曾经有一次「给本 bot 播种默认会议角色预设」的启动写盘。已退役：角色预设

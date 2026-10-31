@@ -95,7 +95,7 @@ import { createGroupWithBots, transferGroupOwner } from '../services/group-creat
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
-import { findForbiddenReadWritePaths } from '../services/sandbox-path-guard.js';
+import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
 import { setGroupIdleClose } from '../services/group-idle-close-store.js';
@@ -8260,6 +8260,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     sandboxPathsForbiddenReadWrite: findForbiddenReadWritePaths(
       sandboxPathsForDashboard?.readWrite,
     ),
+    // Already-stored readOnly `/`: refused on save now, ignored by the worker.
+    sandboxPathsReadOnlyRoot: findReadOnlyLauncherMountCovers(sandboxPathsForDashboard?.readOnly),
     sandboxNetworkPolicy: (() => { try { return getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null; } catch { return null; } })(),
     sandboxNetworkPolicyPlatform: process.platform,
     // Inputs for the policy editor's starting template and its proxy hint.
