@@ -91,6 +91,20 @@ describe('enumerateScratchSecretPaths', () => {
     delete process.env.LARKSUITE_CLI_DATA_DIR;
   });
 
+  it('masks the per-person secret dirs even before they exist, so later tokens inside stay hidden', () => {
+    mkdirSync(data(), { recursive: true });
+    const got = new Set(enumerateScratchSecretPaths({ botmuxHomes: [home()], dataDirs: [data()], sessionId: 'sess-1' }).denyPaths);
+    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity']) {
+      expect(got.has(join(data(), dir)), dir).toBe(true);
+    }
+  });
+
+  it('never turns a same-named FILE into a directory mask', () => {
+    mkdirSync(data(), { recursive: true });
+    writeFileSync(join(data(), 'oauth-pending'), 'x');
+    expect(enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()] }).denyPaths).not.toContain(join(data(), 'oauth-pending'));
+  });
+
   it('adds external BOTS_CONFIG sidecar siblings outside the botmux home', () => {
     layout();
     const external = join(root, 'elsewhere', 'custom-bots.json');
@@ -104,15 +118,26 @@ describe('enumerateScratchSecretPaths', () => {
     expect(got).not.toContain(join(root, 'elsewhere', 'unrelated.txt'));
   });
 
-  it('skips absent botmux paths but still masks a real host lark-cli keystore', () => {
-    // No fake botmux home/data laid out. The enumerator returns at most the
-    // HOST's own lark-cli keystores (a real secret it must never un-mask),
-    // never anything from the absent fake homes.
+  it('skips absent botmux files but still masks a real host lark-cli keystore', () => {
+    // No fake botmux home/data laid out. Besides the fixed per-person dirs of
+    // the (absent) data dir, the enumerator returns at most the HOST's own
+    // lark-cli keystores (a real secret it must never un-mask), no file from
+    // the absent fake homes.
+    const fixedDirs = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity'].map(d => join(data(), d));
     const got = enumerateScratchSecretPaths({ botmuxHomes: [home(), join(root, 'nope')], dataDirs: [data()] }).denyPaths;
-    for (const p of got) {
+    for (const p of got.filter(p => !fixedDirs.includes(p))) {
       expect(p.startsWith(home())).toBe(false);
       expect(p.startsWith(join(root, 'nope'))).toBe(false);
       expect(p.includes('lark-cli')).toBe(true); // only host lark-cli stores
+    }
+  });
+
+  it('masks the per-person secret dirs even when the data dir itself does not exist yet', () => {
+    // A custom SESSION_DATA_DIR leaves ~/.botmux/data uncreated until the first
+    // login, which may happen while a scratch session runs.
+    const got = new Set(enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()], sessionId: 'sess-1' }).denyPaths);
+    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity']) {
+      expect(got.has(join(data(), dir)), dir).toBe(true);
     }
   });
 

@@ -36,6 +36,7 @@
  * not supported, this command only supports: user`). A hand-maintained list of
  * "commands needing a person" would go stale and grow holes.
  */
+import type { SandboxMode } from '../adapters/cli/sandbox-mode.js';
 
 /** Tools whose credentials botmux can inject per person. */
 export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
@@ -119,32 +120,45 @@ export interface TriggerUserAuthConfig {
  *
  * An honest report, not a reassurance. Botmux stores each person's token as a
  * 0600 file owned by the OS user — but the agent's CLI runs as that same OS
- * user, so without the file sandbox it can simply read every token file in
- * `~/.botmux/data/`. The per-person storage still fixes attribution and the
+ * user, so it can simply read every token file in `~/.botmux/data/` unless
+ * the OS stops it. The per-person storage still fixes attribution and the
  * overwrite bug, and the wrapper still injects only the current sender's
  * credentials; what is missing is any barrier against an agent that goes
  * looking on its own.
  *
- * With the sandbox on, the whole data dir is deny-by-default and only this
- * session's own identity file is granted — the boundary is then enforced by the
- * OS rather than by convention.
+ * Only the allowlist sandbox ('oncall') is such a barrier: the whole data dir
+ * is deny-by-default and only this session's own identity file is granted.
+ * The scratch sandbox isolates WRITES only — it keeps the real disk readable,
+ * including other people's tokens and login state (lark-cli homes, tokens
+ * created after the session started), so it counts as unprotected.
  *
  * Callers surface this so an operator can decide; it deliberately does not gate
  * the feature. Refusing to run without a sandbox would push people away from a
  * change that is an improvement either way, and claiming isolation we do not
  * have would be worse than both.
  */
-export function tokenStoreProtection(sandboxEnabled: boolean): {
+export function tokenStoreProtection(mode: SandboxMode): {
   enforced: boolean;
   advisory?: string;
 } {
-  if (sandboxEnabled) return { enforced: true };
+  if (mode === 'oncall') return { enforced: true };
+  const where = 'Dashboard → Bot 配置 → 权限与安全 → 文件沙盒';
+  if (mode === 'scratch') {
+    return {
+      enforced: false,
+      advisory:
+        'token 文件按人隔离，但当前的 scratch 一次性沙盒只隔离写入、不隔离凭据：'
+        + 'agent 仍能读到这台机器上其他人的 token 和登录态。'
+        + `多人共用的 bot 要隔离凭据，请到 ${where} 改选「白名单隔离」。`,
+    };
+  }
   return {
     enforced: false,
     advisory:
-      'token 文件按人隔离，但未开启文件沙盒：agent 与 botmux 跑在同一个系统用户下，'
-      + '有能力直接读取 ~/.botmux/data/ 里其他人的 token 文件。'
-      + '归因与覆盖问题已解决；要让隔离由操作系统强制，请为本 bot 开启 sandbox。',
+      'token 文件按人隔离，但未开启白名单隔离：agent 与 botmux 跑在同一个系统用户下，'
+      + '能直接读到 ~/.botmux/data/ 里其他人的 token 和登录态。'
+      + `归因与覆盖问题已解决；要让隔离由操作系统强制，请到 ${where} 选「白名单隔离」`
+      + '（scratch 一次性只隔离写入，不算）。',
   };
 }
 

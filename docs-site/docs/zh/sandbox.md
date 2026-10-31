@@ -8,13 +8,13 @@ Botmux 提供多层次的运行隔离机制，保护你的宿主开发机免受�
 |---|---|---|---|---|---|
 | 关闭（`off`，缺省） | 不隔离 | 全部宿主文件 | 直达宿主真实文件 | 完全信任的个人本地环境 | 全平台 |
 | 白名单隔离（`oncall`，原「oncall 分享」；`sandbox: true` 即此档） | **保密防泄露** | 只有白名单路径可见，其余不存在（另有少量运行必需的只读挂载，见下） | 只有白名单里的可写路径能写，写入直达宿主 | 把 Bot 开放给群成员、外部协作者 | Linux + macOS |
-| 一次性草稿（`scratch`） | **防写污染（完全可弃）** | 宿主真实文件系统原生可读（botmux 凭证除外） | Linux：全根 Copy-on-Write（COW），**宿主零写入**；macOS：克隆树 COW、系统路径只读，但 `~/Library/Caches` 等缓存 / 偏好目录和系统临时目录仍写真实磁盘 | 自己做高风险实验、编译构建、防误操作 | Linux + macOS |
+| 一次性草稿（`scratch`） | **防写污染（完全可弃）** | 宿主真实文件系统原生可读（只遮 botmux 自身凭证；**不隔离凭据**，其他人的 token 和登录态仍可读） | Linux：全根 Copy-on-Write（COW），**宿主零写入**；macOS：克隆树 COW、系统路径只读，但 `~/Library/Caches` 等缓存 / 偏好目录和系统临时目录仍写真实磁盘 | 自己做高风险实验、编译构建、防误操作 | Linux + macOS |
 
 `bots.json` 里不写 `sandbox`（或写 `false`）就是关闭；写 `true` 等价于 `"oncall"`。旧字段 `readIsolation: true` 现在也按白名单隔离处理，daemon 启动时会自动迁移。
 
 > 💡 **如何选择？**
 > - **要把机器人分享给半信任的人（比如飞书群里所有人）** → 用**白名单隔离**。私钥、Token、凭证与其它代码库默认不可见，防探针与信息泄露。
-> - **你自己用，但要执行复杂构建、跑未验证脚本或重构** → 用 **`scratch`**。无需配置白名单，所有工具和依赖原生可用；改坏随时丢弃，宿主磁盘毫发无损。scratch 能读到宿主上的大部分文件，**不适合**开放给不信任的人。
+> - **你自己用，但要执行复杂构建、跑未验证脚本或重构** → 用 **`scratch`**。无需配置白名单，所有工具和依赖原生可用；改坏随时丢弃，宿主磁盘毫发无损。scratch 只隔离写入、不隔离凭据：agent 仍能读到这台机器上的密钥，以及其他人的 token 和登录态（`~/.botmux/data/` 下的 `user-token-*`、`lark-cli-home/` 等），**不适合**开放给不信任的人。多人共用的 bot 要隔离凭据，请用白名单隔离。
 
 ---
 
@@ -233,8 +233,7 @@ Linux 沙盒依赖内核命名空间，在 Docker 等容器或加固过的主机
 botmux **不会**在沙盒起不来时裸跑 CLI，而是拒绝启动会话。日志里常见的报错：
 
 - `sandbox requested but could not be established (bwrap missing or setup failed)`：白名单隔离起不来。
-- `scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot)`：scratch 起不来；如果是重启后 tmpfs 层丢了，只能新开会话。
-- `scratch sandbox (macOS) could not be established (clonefile/Seatbelt setup failed ...)`：macOS scratch 起不来，检查同卷与剩余空间。
+- `scratch 沙箱没能建立：<原因>。<修法>`：scratch 起不来，话题里会直接给出原因和对应修法（缺依赖、非 root 用了内存存储、/dev/fuse 不可用、存储设置与会话不一致等）。只有机器重启后内存存储丢失这一种情况需要新开会话。选 scratch 时 Dashboard 也会先按本机条件提示「不能用 scratch」或「只能用磁盘存储」。
 - `[scratch-sandbox] tmpfs upper slot mount failed (non-root host? use scratchStorage "disk")`：非 root 主机用了 tmpfs 存储。
 - `[scratch-sandbox] missing deps (...)`：缺 bubblewrap 或 fuse-overlayfs，且无法自动安装（只在 root 或免密 sudo 时尝试）。
 - `bubblewrap cannot establish the required user/mount/PID namespaces`：主机探测失败，常见于容器。

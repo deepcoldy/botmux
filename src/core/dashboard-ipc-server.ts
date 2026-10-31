@@ -97,7 +97,7 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
-import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
@@ -8274,25 +8274,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
           allowedChatGroupsCount: (sCfg.allowedChatGroups ?? []).filter(id => !isSessionGroup(id)).length,
           localSandboxApplies: localSandboxApplies(sBackendType, sCfg.mojo),
           sandboxCapable: sSandboxCapable,
-          // resolveLocalSandboxMode throws on a typo'd env: this route must stay
-          // alive. Fall back to the config-only resolver WITHOUT the env leg,
-          // still honouring readIsolation (it implies oncall).
-          effectiveSandboxMode: (() => {
-            try {
-              return resolveLocalSandboxMode({
-                backendType: sBackendType,
-                mojoConfig: sCfg.mojo,
-                configSandbox: sCfg.sandbox,
-                readIsolation: sCfg.readIsolation === true,
-                envValue: process.env.BOTMUX_SANDBOX,
-              });
-            } catch {
-              return resolveSandboxMode({
-                configSandbox: sCfg.sandbox,
-                readIsolation: sCfg.readIsolation === true,
-              });
-            }
-          })(),
+          effectiveSandboxMode: effectiveBotSandboxMode(sCfg),
         };
       } catch {
         return {
@@ -10238,6 +10220,28 @@ botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-la
   respond: value => ({ ok: true, larkToolBinding: value !== false }),
 });
 
+/**
+ * The sandbox mode the worker will spawn this bot's CLI under
+ * (resolveLocalSandboxMode: global BOTMUX_SANDBOX and the legacy readIsolation
+ * flag folded in, remote backends exempt). It throws on a typo'd env and a
+ * route must stay alive: fall back to the config-only resolver WITHOUT the env
+ * leg, still honouring readIsolation (it implies oncall).
+ */
+function effectiveBotSandboxMode(cfg: BotConfig): SandboxMode {
+  const backendType = resolvePairedBackendId(cfg.cliId, cfg.backendType, config.daemon.backendType) ?? 'pty';
+  try {
+    return resolveLocalSandboxMode({
+      backendType,
+      mojoConfig: cfg.mojo,
+      configSandbox: cfg.sandbox,
+      readIsolation: cfg.readIsolation === true,
+      envValue: process.env.BOTMUX_SANDBOX,
+    });
+  } catch {
+    return resolveSandboxMode({ configSandbox: cfg.sandbox, readIsolation: cfg.readIsolation === true });
+  }
+}
+
 // GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
 // 边界提示（token 存储保护程度、自带凭证的 MCP server）。
 // 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。
@@ -10267,11 +10271,10 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req,
     const policy = cfg.triggerUserAuth ?? null;
     const brand = normalizeBrand(cfg.brand);
     const authorizedCount = listAuthorizedUsers(cfg.larkAppId, brand).length;
-    // Oncall (legacy true) provides the OS-enforced credential boundary that
-    // makes other people's token files unreadable. scratch is NOT counted here:
-    // it is write-integrity COW, not a read/credential boundary, so the agent
-    // can still read shared token stores.
-    const protection = tokenStoreProtection(cfg.sandbox === true || cfg.sandbox === 'oncall');
+    // Same verdict as the worker, on the mode its spawn resolves: only the
+    // allowlist sandbox (oncall, legacy true, readIsolation) makes other
+    // people's token files unreadable; scratch isolates writes only.
+    const protection = tokenStoreProtection(effectiveBotSandboxMode(cfg));
     const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
     // Platform-backed source: tell the UI whether this machine is bound so the
     // picker can say what `auto` / `platform` will actually do here.

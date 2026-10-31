@@ -8,13 +8,13 @@ The file sandbox is **one switch with three positions**, configured per bot, ful
 |---|---|---|---|---|---|
 | Off (`off`, the default) | No isolation | All host files | Directly writes to real host files | Fully trusted personal local environment | All platforms |
 | Allowlist isolation (`oncall`, formerly "oncall (shared)"; `sandbox: true` means this mode) | **Confidentiality & leak prevention** | Only allowlisted paths are visible; nothing else exists (apart from a few read-only runtime mounts, see below) | Only writable allowlisted paths can be written, and writes go straight to the host | Exposing bots to group members / external collaborators | Linux + macOS |
-| Scratch (`scratch`) | **Write-pollution prevention (fully disposable)** | Entire real host filesystem is natively readable (except botmux credentials) | Linux: full-root Copy-on-Write (COW), **zero writes to host**; macOS: COW over cloned trees with read-only system paths, but cache / preference dirs such as `~/Library/Caches` and the system temp dirs still write to the real disk | High-risk experiments, building untrusted code, disposable refactoring | Linux + macOS |
+| Scratch (`scratch`) | **Write-pollution prevention (fully disposable)** | Entire real host filesystem is natively readable (only botmux's own credentials are masked; **credentials are not isolated**: other people's tokens and login state stay readable) | Linux: full-root Copy-on-Write (COW), **zero writes to host**; macOS: COW over cloned trees with read-only system paths, but cache / preference dirs such as `~/Library/Caches` and the system temp dirs still write to the real disk | High-risk experiments, building untrusted code, disposable refactoring | Linux + macOS |
 
 Leaving `sandbox` out of `bots.json` (or setting `false`) means off; `true` is the same as `"oncall"`. The legacy field `readIsolation: true` is now treated as allowlist isolation and is migrated automatically at daemon startup.
 
 > 💡 **Which mode should you choose?**
 > - **Exposing your bot to semi-trusted group members** → choose **allowlist isolation**. SSH keys, tokens, credentials, and other projects are invisible by default, preventing reconnaissance and data leakage.
-> - **Using the bot yourself for complex builds, scripts, or risky commands** → choose **`scratch`**. No allowlist configuration needed; all dependencies and global tools just work, while any modification can be discarded cleanly without touching your real host disk. Scratch can read most files on the host, so it is **not suitable** for untrusted users.
+> - **Using the bot yourself for complex builds, scripts, or risky commands** → choose **`scratch`**. No allowlist configuration needed; all dependencies and global tools just work, while any modification can be discarded cleanly without touching your real host disk. Scratch isolates writes, not credentials: the agent can still read the secrets on this machine, including other people's tokens and login state (`user-token-*`, `lark-cli-home/` and the like under `~/.botmux/data/`), so it is **not suitable** for untrusted users. For a bot several people use, choose allowlist isolation to isolate credentials.
 
 ---
 
@@ -233,8 +233,7 @@ The Linux sandbox relies on kernel namespaces, which Docker-style containers and
 botmux **never** falls back to running the CLI unsandboxed; it refuses to start the session instead. Common log messages:
 
 - `sandbox requested but could not be established (bwrap missing or setup failed)`: allowlist isolation could not start.
-- `scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot)`: scratch could not start; if the tmpfs layer was lost in a reboot, only a new session will work.
-- `scratch sandbox (macOS) could not be established (clonefile/Seatbelt setup failed ...)`: macOS scratch could not start; check same-volume placement and free space.
+- `scratch 沙箱没能建立：<reason>。<fix>` (scratch sandbox could not be established): the chat names the reason and the matching fix (missing dependencies, RAM storage on a non-root daemon, /dev/fuse unavailable, a storage setting that no longer matches the session, …). Only a RAM upper lost in a machine reboot needs a new session. When you pick scratch, the Dashboard also warns up front whether this machine cannot run scratch or can only use disk storage.
 - `[scratch-sandbox] tmpfs upper slot mount failed (non-root host? use scratchStorage "disk")`: tmpfs storage on a non-root host.
 - `[scratch-sandbox] missing deps (...)`: bubblewrap or fuse-overlayfs is missing and could not be auto-installed (only attempted as root or with passwordless sudo).
 - `bubblewrap cannot establish the required user/mount/PID namespaces`: the host probe failed, typically inside a container.

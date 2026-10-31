@@ -8,7 +8,9 @@ BotMux 有**两种正交的文件沙盒**，一个开关三档：
 | `oncall`（缺省沙盒） | **保密**：分享给半受信任的人 | deny-by-default 白名单 | 白名单内直达宿主、即时落盘 | Linux + macOS |
 | `scratch`（2026-09 新增） | **完整可弃**：owner 自己的一次性草稿环境 | 整个真实文件系统 | Linux：全部进 COW upper 宿主永不变；mac：$HOME/项目写进 APFS 克隆副本，系统路径只读 | Linux + macOS |
 
-> scratch **不防恶意载荷**（agent 仍能读到磁盘上的密钥并经网络外发）；它防的是「写污染」——破坏性/试验性操作不影响真实机器。需要保密时用 oncall。
+> scratch **只隔离写入，不隔离凭据**：agent 仍能读到这台机器上的密钥，以及其他人的 token 和登录态（`~/.botmux/data/` 下的 `user-token-*`、`lark-cli-home/` 等），并能经网络外发。它防的是「写污染」：破坏性、试验性的操作不影响真实机器。多人共用的 bot 要隔离凭据，请用白名单隔离（oncall）。
+>
+> scratch 仍会遮住 botmux 自身的传输凭证（bots.json、dashboard secret、各 bot 的 send-cred 等），也会整目录遮住几个按人存放凭据的目录（`bytedcli-home/`、`cli-identity/` 里别的会话、`vc-meeting-daemon-auth/`、`oauth-pending/`），会话期间在里面新建的文件同样读不到。这些只是减少暴露，不构成凭据边界：`user-token-*` 只遮会话启动时已存在的文件，`lark-cli-home/` 不遮（scratch 里按人身份的 lark-cli 依赖它）。Dashboard 的按触发人鉴权面板和 worker 日志据此只把白名单隔离算作「token 已受保护」。
 
 ## 三模式的配置
 

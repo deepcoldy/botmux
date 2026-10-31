@@ -23318,14 +23318,15 @@ async function spawnCli(
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
     sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
-    // Say plainly how protected the token store actually is. Without the file
-    // sandbox the agent runs as the same OS user as botmux and can read every
-    // person's token file directly; per-person storage fixes attribution and the
-    // overwrite bug, but only the sandbox makes the isolation OS-enforced.
-    // Logged rather than enforced: refusing to run would push operators away
-    // from a change that helps either way, and implying isolation we do not have
-    // would be worse than both.
-    const protection = tokenStoreProtection(sandboxRequested);
+    // Say plainly how protected the token store actually is. Without the
+    // allowlist sandbox the agent runs as the same OS user as botmux and can
+    // read every person's token file directly (scratch isolates writes only and
+    // keeps the disk readable); per-person storage fixes attribution and the
+    // overwrite bug, but only the allowlist sandbox makes the isolation
+    // OS-enforced. Logged rather than enforced: refusing to run would push
+    // operators away from a change that helps either way, and implying
+    // isolation we do not have would be worse than both.
+    const protection = tokenStoreProtection(sandboxMode);
     if (protection.advisory) log(`[trigger-user-auth] NOTE ${protection.advisory}`);
     // An MCP server with its own app credentials never execs a wrapped CLI, so
     // this policy does not reach it: the agent can still act under an identity
@@ -24489,7 +24490,9 @@ async function spawnCli(
     // readable inside scratch (PR #1513 review).
     const scratchSecrets = enumerateScratchSecretPaths({
       botmuxHomes: [...new Set([defaultBotmuxHome, configuredBotmuxHome])].map(scratchCanonical),
-      dataDirs: [scratchDataDir].map(scratchCanonical),
+      // The per-person token stores (user-token-*, bytedcli-home, lark-cli
+      // homes) are rooted at ~/.botmux/data whatever SESSION_DATA_DIR says.
+      dataDirs: [...new Set([scratchDataDir, join(defaultBotmuxHome, 'data')].map(scratchCanonical))],
       botsConfigPath: cfg.loadedBotsConfigPath ? scratchCanonical(cfg.loadedBotsConfigPath) : undefined,
       homeDir: scratchHome,
       sessionId: cfg.sessionId,
