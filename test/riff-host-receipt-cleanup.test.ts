@@ -30,6 +30,14 @@ describe('Riff receipt lifecycle cleanup', () => {
     for (const kept of [active, recent, live]) expect(existsSync(kept)).toBe(true);
   });
 
+  it('skips plain files beside session directories instead of failing the round', async () => {
+    const data = root(), closed = receipt(data, 'closed');
+    writeFileSync(join(data, 'sessions', 'closed.env-stamp'), 'stamp');
+    const removed = await sweepOrphanRiffHostReceiptDirs(data, new Set(), { liveReferences: async () => new Set() });
+    expect(removed).toEqual([closed]);
+    expect(existsSync(join(data, 'sessions', 'closed.env-stamp'))).toBe(true);
+  });
+
   it('preserves receipts when live-process evidence is unknown', async () => {
     const data = root(), closed = receipt(data, 'closed');
     expect(await sweepOrphanRiffHostReceiptDirs(data, new Set(), { liveReferences: async () => null })).toEqual([]);
