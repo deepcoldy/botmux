@@ -441,8 +441,16 @@ describe('parseTopicHeader —— 生命周期变体（/th /tw /t here|worktree�
     expect(parseTopicHeader('/tw /repo botmux 干活')).toMatchObject({ lifecycle: 'worktree', directives: { repo: 'botmux' } });
   });
 
-  it('写了变体就算「已写头部」：未知 /xxx fail closed', () => {
-    expect(parseTopicHeader('/tw /modle sonnet 干活')).toEqual({ ok: false, sentinel: '/tw', kind: 'unknown_directive', token: '/modle' });
+  it('只写变体不算「已写头部」：紧跟的 /技能、/命令 原样落进正文（同 /t /goal）', () => {
+    expect(parseTopicHeader('/th /teach 讲讲实现')).toMatchObject({ ok: true, sentinel: '/th', lifecycle: 'here', directives: {}, prompt: '/teach 讲讲实现' });
+    expect(parseTopicHeader('/th\n/teach 讲讲实现')).toMatchObject({ ok: true, lifecycle: 'here', prompt: '/teach 讲讲实现' });
+    expect(parseTopicHeader('/tw /goal 修登录')).toMatchObject({ ok: true, lifecycle: 'worktree', prompt: '/goal 修登录' });
+    expect(parseTopicHeader('/t here /review')).toMatchObject({ ok: true, lifecycle: 'here', prompt: '/review' });
+  });
+
+  it('变体之外再写了标题或指令，未知 /xxx 仍 fail closed', () => {
+    expect(parseTopicHeader('日常 /tw /modle sonnet 干活')).toEqual({ ok: false, sentinel: '/tw', kind: 'unknown_directive', token: '/modle' });
+    expect(parseTopicHeader('/th /model sonnet /teach 干活')).toEqual({ ok: false, sentinel: '/th', kind: 'unknown_directive', token: '/teach' });
   });
 
   it('/two /three 不是分隔符', () => {
