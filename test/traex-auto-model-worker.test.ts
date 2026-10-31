@@ -60,6 +60,43 @@ function admissionHarness(extra: Record<string, unknown> = {}) {
 }
 
 describe('auto-model Worker admission and original-input retirement', () => {
+  it.each([undefined, 'native'])('retries an admitted quota input after a viewport race (native session: %s)', async nativeId => {
+    const controller = new TraexAutoModelController({ enabled: true, trigger: 'quota', models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    const h = admissionHarness({
+      traexAutoModelController: controller, activeTurnAuthority: new ActiveTurnAuthority(),
+      isPromptReady: true, queuedTypeAheadTurns: [],
+      lastInitConfig: { cliId: 'traex', cliSessionId: nativeId },
+      currentTraexQuotas: vi.fn(), executeTraexAutoModelSwitch: vi.fn(),
+    });
+    h.scope.selectTraexQuotaModelBeforeTurn = loadWorkerFunction('selectTraexQuotaModelBeforeTurn', h.scope);
+    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', h.scope);
+    // The real flush clears readiness before its asynchronous viewport read.
+    expect(reset()).toBe(false);
+    h.scope.isPromptReady = false;
+    h.scope.backend.captureViewportAsync = async () => {
+      h.scope.backendScreenRevision++;
+      return '❯ Ask anything';
+    };
+    expect(await h.admit()).toBe(false);
+    expect(h.scope.retryTraexAutoModelAdmission).toHaveBeenCalledOnce();
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+
+    // A static composer emits no new ready edge. The same unsent turn must
+    // reach admission again, without remote quota IO or a model restart.
+    h.scope.backend.captureViewportAsync = async () => '❯ Ask anything';
+    expect(reset()).toBe(false);
+    expect(await h.admit()).toBe(true);
+    expect(controller.currentTurnId()).toBe(h.item.turnId);
+    expect(h.scope.currentTraexQuotas).not.toHaveBeenCalled();
+    expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+
+    // Admission is not submission: successors remain fenced once the actual
+    // input has landed and we are still seeing its old composer.
+    controller.markInputSubmitted(h.item.turnId);
+    h.scope.pendingMessages = [{ content: 'successor', turnId: 'later' }];
+    expect(await h.admit()).toBe(false);
+  });
+
   it('does not admit a follow-up on the stale composer after the first input was submitted', async () => {
     const h = admissionHarness({ backend: { captureViewportAsync: async () => '❯ Ask anything' } });
     const controller = h.scope.traexAutoModelController as TraexAutoModelController;

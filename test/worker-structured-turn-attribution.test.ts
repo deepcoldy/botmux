@@ -123,6 +123,8 @@ describe('structured turn send attribution retirement', () => {
       sessionId: 'sid', bridgeGateInputForTurn: (_sid: unknown, _turn: unknown, gate: unknown) => gate,
       codexBridgeQueue: { drainEmittable: () => [extra], peek: () => [] },
       checkpointCodexAdoptRecovery: vi.fn(), checkpointStructuredBridgeRecovery: vi.fn(),
+      // Ordinary structured terminals are not owned by quota recovery.
+      recoverTraexQuotaTurn: () => false,
       armPostTerminalInputFence: vi.fn(), lastInitConfig: { adoptMode: false },
       isExistingAppServerSharedBridge: () => false, readSendMarkers: () => [],
       zeroPromptTerminalSync: () => false,

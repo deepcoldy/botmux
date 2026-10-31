@@ -15,6 +15,7 @@ import { isUnsentInputReplayable } from '../src/services/unsent-input-journal.js
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { cancelDeploymentContinuation, claimDeploymentContinuation, deploymentContinuationCandidate, recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
+import { codexCapacityRecoveryCli } from '../src/services/codex-app-failure.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // Execute the daemon's real receipt callback: importing daemon.ts would start
@@ -73,6 +74,7 @@ function manualInput(failPersistence: boolean) {
     cancelDeploymentContinuation, deploymentContinuationAuthority,
     sessionStore: failPersistence ? { updateDeploymentContinuation: () => { throw new Error('disk unavailable'); } } : store,
     getBot: () => ({ config: { cliId: 'codex' } }), sessionCliId: () => 'codex',
+    codexCapacityRecoveryCli,
     cancelOrdinaryRecoveryForUserInput: () => {},
     withTurnCaller: (_session: unknown, message: unknown) => message, bufferTransferInput: () => false,
     afterWorkerIpcBootstrap: (_worker: unknown, effect: () => void) => { effect(); return true; },
