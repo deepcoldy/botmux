@@ -3,7 +3,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { writeTextThenEnter } from './tui-input.js';
 import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter } from './types.js';
-import { findGeminiSessionFile, isGeminiSessionId } from './gemini-session.js';
+import { findGeminiSessionFile, findGeminiPromptSubmission, isGeminiSessionId, snapGeminiSubmitBaseline } from './gemini-session.js';
 
 
 export function createGeminiAdapter(pathOverride?: string): CliAdapter {
@@ -61,7 +61,48 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     // Same tmux command-string ceiling as OpenCode/Cursor.
     maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
-    writeInput: writeTextThenEnter,
+    // Submit verification via Gemini's own session jsonl. The Ink TextInput
+    // silently drops a prompt written while it is unmounted (startup/redraw),
+    // so after writing we check that a resumable user row carrying the prompt's
+    // ACK marker landed. Baseline is sampled BEFORE the write; the send itself
+    // keeps the existing writeTextThenEnter sequence unchanged.
+    async writeInput(pty, content) {
+      // Slash commands drive the TUI command palette, not a conversation turn:
+      // they produce no user message row, so do not verify (and never resend).
+      const verify = !content.startsWith('/');
+      const baseline = verify ? snapGeminiSubmitBaseline() : null;
+
+      await writeTextThenEnter(pty, content);
+
+      // No store handle (unreadable home) → preserve historical "assume
+      // delivered": never warn or resend on absent evidence.
+      if (baseline === null) return undefined;
+
+      const recheck = (): boolean | { submitted: boolean; cliSessionId?: string } => {
+        const r = findGeminiPromptSubmission(baseline, content);
+        if (r.submitted) {
+          return r.cliSessionId ? { submitted: true, cliSessionId: r.cliSessionId } : { submitted: true };
+        }
+        // unreadable = no evidence (meta-only / store not flushed / no marker
+        // yet / model turn absent): treat as "not failed" so the worker keeps
+        // waiting instead of warning on a possibly-still-landing submit. Only
+        // a positive marker match or authoritative absence settles it.
+        return r.unreadable ? true : { submitted: false };
+      };
+
+      const found = findGeminiPromptSubmission(baseline, content);
+      if (found.submitted) {
+        return found.cliSessionId
+          ? { submitted: true, cliSessionId: found.cliSessionId }
+          : { submitted: true };
+      }
+      // unreadable right after the write: no verdict — keep the old "assume OK"
+      // semantics, but attach a recheck so a late landing suppresses a warning.
+      if (found.unreadable) return { submitted: true, recheck };
+      // Authoritative absence (a model turn ran without this user row): report
+      // failed submit; recheck still rescues a late-but-real flush.
+      return { submitted: false, recheck };
+    },
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Ink TUI — '>' is too generic; rely on quiescence + spinner guard

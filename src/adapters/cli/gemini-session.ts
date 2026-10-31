@@ -1,4 +1,4 @@
-import { closeSync, openSync, readFileSync, readSync, readdirSync, realpathSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -99,8 +99,6 @@ function isResumableRecord(record: ResumableRecordShape): boolean {
   return false;
 }
 
-interface LiveMessageKind { isUser: boolean; isResumable: boolean }
-
 /**
  * Decide resumability the way Gemini 0.66 lists sessions
  * (`createJsonlRecordAccumulator`, metadataOnly branch): replay the append-only
@@ -120,16 +118,70 @@ interface LiveMessageKind { isUser: boolean; isResumable: boolean }
  * session files flat scanning over-reports resumability on 92 of them.
  */
 function hasResumableContent(jsonl: string): boolean {
-  const order: string[] = [];
-  const kinds = new Map<string, LiveMessageKind>();
+  return replayLiveMessages(jsonl).some((m) => m.isResumable);
+}
 
-  // isMessageRecord: string id and no $patch. Mirrors the upstream guard so a
-  // {id, $patch} row inside `$set.messages` is skipped rather than registered.
+/**
+ * Whether the live message table contains a resumable *user* row carrying the
+ * turn-unique ACK marker of the submitted prompt. Only exact equality or a
+ * marker substring match count — a short OLD user row that happens to be a
+ * substring of the new prompt (e.g. a resumed session's earlier "继续") must
+ * NOT count, or a prompt that never landed would read as submitted. When the
+ * prompt has no ACK marker there is no turn-unique handle, so return undefined
+ * ("no evidence") rather than guess.
+ */
+function findSubmittedUserText(jsonl: string, needle: string): string | undefined {
+  for (const m of replayLiveMessages(jsonl)) {
+    if (!m.isUser || !m.isResumable) continue;
+    const text = contentText(m.content).trim();
+    if (text && text.includes(needle)) return text;
+  }
+  return undefined;
+}
+
+/**
+ * True when the live table has a resumable *model* (gemini) row — i.e. this
+ * turn actually ran. A file with metadata only (Gemini creates it on
+ * `--session-id` start) has no model row, so "no user row yet" there means the
+ * store has not flushed, never authoritative absence.
+ */
+function hasResumableModelTurn(jsonl: string): boolean {
+  return replayLiveMessages(jsonl).some((m) => !m.isUser && m.isResumable);
+}
+
+/**
+ * The stable, turn-unique fragment to match a submitted prompt: the `ACK-…`
+ * marker (timestamped, ASCII). Returns null for prompts without one — there is
+ * then no safe turn-unique handle, so callers must treat the submit as
+ * unverified instead of matching on the full envelope.
+ */
+function submittedPromptNeedle(expected: string): string | null {
+  const m = expected.match(/ACK-[A-Za-z0-9_.:#@-]{8,}/);
+  return m ? m[0] : null;
+}
+
+interface LiveMessage { type?: unknown; content?: unknown; isUser: boolean; isResumable: boolean }
+
+/**
+ * Replay a session jsonl edit log into the LIVE message table, mirroring Gemini
+ * 0.66 (`createJsonlRecordAccumulator`). Returns the live rows in order with the
+ * resumability decision already applied. See {@link hasResumableContent} for why
+ * a physical line scan over-counts ($set/$patch/$rewindTo reshape the table).
+ */
+function replayLiveMessages(jsonl: string): LiveMessage[] {
+  const order: string[] = [];
+  const kinds = new Map<string, LiveMessage>();
+
   const register = (record: unknown): void => {
     if (!isObjectRecord(record) || typeof record.id !== 'string' || '$patch' in record) return;
     const id = record.id;
     if (!kinds.has(id)) order.push(id);
-    kinds.set(id, { isUser: record.type === 'user', isResumable: isResumableRecord(record) });
+    kinds.set(id, {
+      type: record.type,
+      content: record.content,
+      isUser: record.type === 'user',
+      isResumable: isResumableRecord(record),
+    });
   };
 
   const applyPatch = (patch: unknown): void => {
@@ -141,14 +193,12 @@ function hasResumableContent(jsonl: string): boolean {
         if (isObjectRecord(update) && typeof update.id === 'string') changes.push(update);
       }
     }
-    // A patch only edits an EXISTING row; an unknown id never creates one.
     for (const change of changes) {
       if (!('content' in change) || change.content === undefined) continue;
       const kind = kinds.get(change.id as string);
       if (!kind) continue;
-      const text = contentText(change.content).trim();
-      if (kind.isUser) kind.isResumable = !isIgnoredUserText(text);
-      else if (text.length > 0) kind.isResumable = true;
+      kind.content = change.content;
+      kind.isResumable = isResumableRecord({ type: kind.type, content: change.content });
     }
     if (Array.isArray(patch.removeIds)) {
       for (const removed of patch.removeIds) {
@@ -159,18 +209,16 @@ function hasResumableContent(jsonl: string): boolean {
       }
     }
     if (Array.isArray(patch.orderIds)) {
-      // Unknown ids are dropped; surviving ordered rows move to the end, the
-      // rows not named keep their place as a prefix (upstream prefixIds rule).
       const kept = patch.orderIds.filter((id): id is string => typeof id === 'string' && kinds.has(id));
       const keptSet = new Set(kept);
-      order.splice(0, order.length, ...order.filter(id => !keptSet.has(id)), ...kept);
+      order.splice(0, order.length, ...order.filter((id) => !keptSet.has(id)), ...kept);
     }
   };
 
   for (const line of jsonl.split('\n')) {
     if (!line.trim()) continue;
     let record: unknown;
-    try { record = JSON.parse(line); } catch { continue; /* torn line */ }
+    try { record = JSON.parse(line); } catch { continue; }
     if (!isObjectRecord(record)) continue;
     if (typeof record.$rewindTo === 'string') {
       const at = order.indexOf(record.$rewindTo);
@@ -187,8 +235,7 @@ function hasResumableContent(jsonl: string): boolean {
     }
   }
 
-  for (const id of order) if (kinds.get(id)?.isResumable) return true;
-  return false;
+  return order.map((id) => kinds.get(id)!).filter(Boolean);
 }
 
 export interface GeminiSessionFile {
@@ -221,4 +268,104 @@ export function findGeminiSessionFile(
     } catch { continue; }
   }
   return undefined;
+}
+
+/**
+ * Submit-evidence support (core-clis live lane / first-prompt delivery).
+ *
+ * Gemini gives no synchronous "the input was submitted" signal in the Ink TUI,
+ * and writing to the PTY while the TextInput is unmounted silently drops the
+ * first prompt. The session jsonl is the authoritative store: a submitted
+ * prompt appears as a live resumable `user` record. These helpers mirror the
+ * OpenCode SQLite baseline/find pair, scanning every project's chats dir
+ * globally (the adapter is a singleton with no per-session cwd) and matching
+ * on the turn-unique ACK marker.
+ */
+
+/** All `tmp/<project>/chats/session-*.{json,jsonl}` files, newest first. */
+function listGeminiChatFiles(gDir: string): string[] {
+  const tmp: string[] = [];
+  try { tmp.push(...readdirSync(join(gDir, 'tmp'), { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)); }
+  catch { return []; }
+  const files: { path: string; mtimeMs: number }[] = [];
+  for (const project of tmp) {
+    const chats = join(gDir, 'tmp', project, 'chats');
+    let names: string[];
+    try { names = readdirSync(chats); } catch { continue; }
+    for (const name of names) {
+      if (!name.startsWith('session-') || !(name.endsWith('.jsonl') || name.endsWith('.json'))) continue;
+      const p = join(chats, name);
+      try { files.push({ path: p, mtimeMs: statSync(p).mtimeMs }); } catch { /* unreadable entry */ }
+    }
+  }
+  return files.sort((a, b) => b.mtimeMs - a.mtimeMs).map((f) => f.path);
+}
+
+/**
+ * Pre-spawn baseline: mtimeMs of the newest chat file (0 when none). Returns
+ * null only when the `.gemini` root itself cannot be read, so a later null can
+ * be distinguished from "read successfully, nothing submitted yet".
+ */
+export function snapGeminiSubmitBaseline(env: NodeJS.ProcessEnv = process.env): number | null {
+  const gDir = geminiDir(env);
+  try { readdirSync(gDir); } catch { return null; }
+  try { readdirSync(join(gDir, 'tmp')); } catch { return null; }
+  const [newest] = listGeminiChatFiles(gDir);
+  if (!newest) return 0;
+  try { return statSync(newest).mtimeMs; } catch { return null; }
+}
+
+export interface GeminiPromptSubmission {
+  submitted: boolean;
+  /** Gemini's own session id, when the matching row was located. */
+  cliSessionId?: string;
+  /**
+   * No evidence either way this time: store unreadable, prompt has no
+   * turn-unique marker, no new file yet, or a file exists but the turn has not
+   * produced a model row (a missing user row may simply be unflushed). Callers
+   * must NOT treat this as absence (no resend, no warning).
+   */
+  unreadable?: true;
+}
+
+/**
+ * Determine whether `expected` was submitted to Gemini after `baseline`.
+ *
+ * - marker match in a resumable user row → submitted.
+ * - a newer file contains a resumable MODEL row but no matching user row → the
+ *   turn genuinely ran without this prompt: authoritative absence (safe to
+ *   surface / eventually resend). A metadata-only file does NOT qualify —
+ *   Gemini writes it on `--session-id` start and the user row can land a few
+ *   hundred ms later, so concluding absence there risks a duplicate send.
+ * - anything else (no newer file, meta-only, store unreadable, no marker) →
+ *   unreadable: keep waiting, never guess.
+ */
+export function findGeminiPromptSubmission(
+  baseline: number | null,
+  expected: string,
+  env: NodeJS.ProcessEnv = process.env,
+): GeminiPromptSubmission {
+  if (baseline === null) return { submitted: false, unreadable: true };
+  const needle = submittedPromptNeedle(expected);
+  if (!needle) return { submitted: false, unreadable: true };
+  const gDir = geminiDir(env);
+  for (const file of listGeminiChatFiles(gDir)) {
+    let mtimeMs: number;
+    try { mtimeMs = statSync(file).mtimeMs; } catch { continue; }
+    if (mtimeMs <= baseline) continue;
+    let raw: string;
+    try { raw = readFileSync(file, 'utf8'); } catch { continue; }
+    if (findSubmittedUserText(raw, needle)) {
+      let cliSessionId: string | undefined;
+      try {
+        const meta = JSON.parse(firstLine(file)) as { sessionId?: unknown };
+        if (typeof meta.sessionId === 'string') cliSessionId = meta.sessionId;
+      } catch { /* meta unreadable — submitted still established by content */ }
+      return cliSessionId ? { submitted: true, cliSessionId } : { submitted: true };
+    }
+    // Missing user row is authoritative only once the turn actually ran
+    // (resumable model row present); a meta-only start file is still pending.
+    if (hasResumableModelTurn(raw)) return { submitted: false };
+  }
+  return { submitted: false, unreadable: true };
 }
