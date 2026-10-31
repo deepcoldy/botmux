@@ -318,6 +318,7 @@ import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
   decideFingerprintSwitch,
+  foreignNativeSessionIds,
   shouldHealAbsentBaseline,
   pidRotationHistoryCutoffMs,
   shouldRecordPidStateSessionId,
@@ -7157,6 +7158,10 @@ let bridgeObservedCliSessionId: string | undefined;
  *  created — freshness/timestamp signals cannot prove pane ownership
  *  across siblings in the same project dir. */
 const bridgeKnownSessionIds = new Set<string>();
+/** Known ids this CLI's own pid state or open files showed it writing; see
+ *  `FingerprintSwitchInput.cliProvenSessionIds`. The spawn-time guess and ids
+ *  taken by a fingerprint switch are known but not in here. */
+const bridgeCliProvenSessionIds = new Set<string>();
 /** Set when the fingerprint fallback accepts a candidate whose sessionId
  *  doesn't match the pid file's current sessionId (Claude's pid file isn't
  *  refreshed by in-pane `/clear`, so it keeps reporting the spawn-time sid
@@ -8391,10 +8396,11 @@ function maybeEmitCodexAdoptPreamble(
  *  sessionId pattern so non-Claude jsonls in the project dir (accidental
  *  drops, third-party tooling) can't poison the trust set. No-op on
  *  parse failure. */
-function bridgeRememberSessionIdForPath(path: string | undefined): void {
+function bridgeRememberSessionIdForPath(path: string | undefined, evidence: 'cli' | 'unproven'): void {
   if (!path) return;
   const sid = sessionIdFromJsonlPath(path);
   if (!SESSION_ID_FILENAME_RE.test(sid)) return;
+  if (evidence === 'cli') bridgeCliProvenSessionIds.add(sid);
   bridgeKnownSessionIds.add(sid);
 }
 
@@ -8407,7 +8413,7 @@ function bridgeRememberSessionIdForPath(path: string | undefined): void {
 function bridgeProbeOpenSessionIds(): void {
   if (bridgeCliPid === undefined || !bridgeJsonlDir) return;
   const opened = findOpenJsonlsForPid(bridgeCliPid, bridgeJsonlDir);
-  for (const path of opened) bridgeRememberSessionIdForPath(path);
+  for (const path of opened) bridgeRememberSessionIdForPath(path, 'cli');
 }
 
 function bridgeShouldEmitAfterTranscriptQuiet(): boolean {
@@ -8665,7 +8671,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
   log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
-  bridgeRememberSessionIdForPath(matched);
+  bridgeRememberSessionIdForPath(matched, 'unproven');
   bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(matched));
   try {
     bridgeWatcher = fsWatch(matched, { persistent: false }, () => {
@@ -8724,6 +8730,21 @@ const bridgeFingerprintScanLastMs = new Map<string, number>();
  *  this long are real failures. */
 const BRIDGE_PENDING_TURN_TTL_MS = 120_000;
 
+/** Session ids of every other active botmux session (all bots share one data
+ *  dir). Read only on the rate-limited fingerprint fallback path. A store read
+ *  failure yields an empty set, i.e. the previous behaviour. */
+function bridgeForeignSessionIds(): Set<string> {
+  try {
+    const snapshot = sessionStore.loadAllSessionsSnapshot(
+      lastInitConfig?.larkAppId ? { fallbackAppId: lastInitConfig.larkAppId } : {},
+    );
+    return foreignNativeSessionIds(snapshot.values(), lastInitConfig?.sessionId);
+  } catch (err) {
+    log(`Bridge foreign-session lookup failed; sibling transcripts not excluded: ${err instanceof Error ? err.message : String(err)}`);
+    return new Set();
+  }
+}
+
 function maybeSwitchBridgeJsonl(): boolean {
   if (!bridgeJsonlDir) return false;
   const pending = bridgeQueue.peek();
@@ -8754,6 +8775,8 @@ function maybeSwitchBridgeJsonl(): boolean {
     contentFingerprint: candidate.contentFingerprint,
     contentNormalized: candidate.contentNormalized,
     knownSessionIds: bridgeKnownSessionIds,
+    cliProvenSessionIds: bridgeCliProvenSessionIds,
+    readForeignSessionIds: bridgeForeignSessionIds,
     findSubstring: (acceptCandidate) =>
       findJsonlContainingFingerprint(bridgeJsonlDir!, candidate.contentFingerprint!, {
         ...fingerprintScanOptions,
@@ -8978,7 +9001,7 @@ function maybeFollowQuietRotation(): void {
     // handshake; if a fd probe lands in that window, fingerprint
     // fallback can later accept the new sessionId on the user's next
     // Lark message.
-    for (const path of opened) bridgeRememberSessionIdForPath(path);
+    for (const path of opened) bridgeRememberSessionIdForPath(path, 'cli');
     const newest = newestPath(opened);
     if (newest && newest !== bridgeJsonlPath) {
       performRotationSwitch(newest, currentStat.mtimeMs, `pid fd → ${bridgeCliPid}`);
@@ -9066,7 +9089,7 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
   // Pid resolver always reports the spawn-time sessionId — this is a sid
   // that genuinely belongs to our adopted Claude pid, so remember it for
   // the sibling-pane hijack guard.
-  bridgeRememberSessionIdForPath(resolved.path);
+  bridgeRememberSessionIdForPath(resolved.path, 'cli');
   if (resolved.path === bridgeJsonlPath) {
     bridgePathConfirmedAtMs = Date.now();
     recordPidStateCliSessionId(resolved);
@@ -9206,7 +9229,7 @@ function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
   const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, bridgeDataDir);
   if (resolved && resolved.path !== bridgeJsonlPath && resolved.cliSessionId !== bridgeStalePidStateSessionId) {
     bridgeObservedCliSessionId = resolved.cliSessionId;
-    bridgeRememberSessionIdForPath(resolved.path);
+    bridgeRememberSessionIdForPath(resolved.path, 'cli');
     switchBridgeToPidStatePath(resolved.path, 'unread turn → pid state', confirmedAtMs);
     return true;
   }
@@ -9219,7 +9242,7 @@ function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
     .filter(path => path !== bridgeJsonlPath && (statSafe(path)?.mtimeMs ?? 0) >= confirmedAtMs);
   const newest = newestPath(written);
   if (!newest) return false;
-  bridgeRememberSessionIdForPath(newest);
+  bridgeRememberSessionIdForPath(newest, 'cli');
   switchBridgeToPidStatePath(newest, 'unread turn → open session files', confirmedAtMs);
   bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(newest));
   return true;
@@ -9699,7 +9722,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, bridgeDataDir);
     if (resolved) {
       bridgeObservedCliSessionId = resolved.cliSessionId;
-      bridgeRememberSessionIdForPath(resolved.path);
+      bridgeRememberSessionIdForPath(resolved.path, 'cli');
       if (resolved.path !== bridgeJsonlPath) {
         log(`Bridge transcript adjusted at start (pid resolver): ${bridgeJsonlPath} → ${resolved.path}`);
         bridgeJsonlPath = resolved.path;
@@ -9725,7 +9748,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     const candidates: string[] = [];
     for (const sid of sids) {
       const path = claudeJsonlPathForSession(sid, bridgeCliCwd, bridgeDataDir);
-      bridgeRememberSessionIdForPath(path);
+      bridgeRememberSessionIdForPath(path, 'cli');
       if (existsSyncSafe(path)) candidates.push(path);
     }
     if (candidates.length > 0) {
@@ -9745,7 +9768,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // anchor for the sibling-pane hijack guard. Subsequent fingerprint
   // candidates are accepted only if their sessionId is in this set
   // (populated here, by pid resolver hits, and by per-tick fd probes).
-  bridgeRememberSessionIdForPath(bridgeJsonlPath);
+  bridgeRememberSessionIdForPath(bridgeJsonlPath, 'unproven');
   // Every watcher start re-arms marker verdicts for the transcript it is
   // about to watch. Teardown already resets for a clean generation change, but
   // a resume→fresh fallback can start a watcher without one. The
@@ -9807,6 +9830,7 @@ function stopBridgeWatcher(): void {
   bridgeCliCwd = undefined;
   bridgeObservedCliSessionId = undefined;
   bridgeKnownSessionIds.clear();
+  bridgeCliProvenSessionIds.clear();
   bridgeStalePidStateSessionId = undefined;
   bridgeSecondaryPaths.clear();
   orcaClaudeWebHistorySignature = undefined;
