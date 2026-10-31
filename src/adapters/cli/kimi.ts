@@ -86,6 +86,10 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
     // the screen fallback: authority engages only on the first accepted report.
     supportsProgramStatus: true,
     spawnEnv: { PI_PROGRAM_STATUS: '1' },
+    // The first prompt of a fresh Kimi process resets its session runtime,
+    // which reports `clear` + `idle` before `working`; that idle must not
+    // complete the turn just submitted.
+    programStatusSubmitAwaitsBusy: true,
     completionPattern: undefined,
     readyPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,

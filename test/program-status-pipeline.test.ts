@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ProgramStatusFramingStream } from '../src/utils/program-status-parser.js';
-import { IdleDetector } from '../src/utils/idle-detector.js';
+import { IdleDetector, PROGRAM_STATUS_FALLBACK_MS } from '../src/utils/idle-detector.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createSeedAdapter } from '../src/adapters/cli/seed.js';
@@ -236,9 +236,9 @@ describe('Kimi under tmux: approval dialog vs turn completion', () => {
     '  ↑/↓ select · 1/2/3/4 choose · ↵ confirm',
   ].join('\r\n');
 
-  function pipeline() {
+  function pipeline(adapter = createKimiAdapter('/bin/kimi')) {
     const stream = new ProgramStatusFramingStream();
-    const detector = new IdleDetector(createKimiAdapter('/bin/kimi'));
+    const detector = new IdleDetector(adapter);
     const idle: string[] = [];
     detector.onIdle(source => idle.push(source));
     const feed = (raw: string) => {
@@ -278,5 +278,43 @@ describe('Kimi under tmux: approval dialog vs turn completion', () => {
     feed(dialog);
     vi.advanceTimersByTime(10_000);
     expect(idle).toEqual(['screen']);
+  });
+
+  // The first prompt of a fresh Kimi process resets its session runtime, which
+  // reports `clear` and then `idle` before `working` (seen live on 2.4.1).
+  it('cold start: clear + idle right after the submit do not complete the turn', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    feed(report('state=idle:app=kimi-code')); // startup, before any submit
+    idle.length = 0;
+    detector.reset(); // botmux submit
+    feed(report('state=clear'));
+    feed(report('state=idle:app=kimi-code'));
+    vi.advanceTimersByTime(5_000);
+    expect(idle).toEqual([]);
+
+    feed(report('state=working:app=kimi-code'));
+    feed(report('state=done:app=kimi-code'));
+    expect(idle).toEqual(['program-status']);
+  });
+
+  it('a submit that never produces work falls back to the screen at the deadline', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    detector.reset();
+    feed(report('state=clear'));
+    feed(report('state=idle:app=kimi-code'));
+    vi.advanceTimersByTime(PROGRAM_STATUS_FALLBACK_MS - 1_000);
+    feed(report('state=idle:app=kimi-code')); // a repeat does not push the deadline
+    vi.advanceTimersByTime(1_000 + 5_000);
+    expect(idle).toEqual(['screen']);
+  });
+
+  it('without programStatusSubmitAwaitsBusy an idle right after the submit completes the turn', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline({ ...createKimiAdapter('/bin/kimi'), programStatusSubmitAwaitsBusy: false });
+    detector.reset();
+    feed(report('state=idle:app=kimi-code'));
+    expect(idle).toEqual(['program-status']);
   });
 });
