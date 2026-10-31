@@ -5,6 +5,7 @@ import { basename, join } from 'node:path';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { withFileLockSync } from '../src/utils/file-lock.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 
 // Regression for a merge regression: writeCliPidMarker() runs inside the
 // non-reentrant marker lock, and the queued-turn adopt path calls
@@ -41,6 +42,7 @@ describe('pid marker reentrancy + capability persistence', () => {
       sandboxRelayCapability: undefined,
       activeTurnAuthority: { snapshot: () => undefined },
       retiredTurnIds: new Set<string>(),
+      emittedTurnTerminals: new TurnTerminalDeduper(),
       queuedTypeAheadTurns: [{ turnId: 'om_next', dispatchAttempt: 2 }],
       queuedTurnAdvanceConsumedForPrompt: undefined,
       rememberQueuedTurnAdvanceForPendingReady: () => {
@@ -70,6 +72,9 @@ describe('pid marker reentrancy + capability persistence', () => {
     const withPidMarkerLock = loadWorkerFunction<(p: string, fn: () => void) => void>('withPidMarkerLock', scope);
     const writeCliPidMarker = loadWorkerFunction<() => void>('writeCliPidMarker', scope);
     scope.withPidMarkerLock = withPidMarkerLock;
+    for (const name of ['turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
+      scope[name] = loadWorkerFunction(name, scope);
+    }
     scope.writeCliPidMarker = writeCliPidMarker;
     // Production publish tail: publish the capability for the now-current turn,
     // then re-write the marker — the call that used to self-deadlock.
