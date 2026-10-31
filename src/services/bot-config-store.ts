@@ -16,6 +16,12 @@ import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
 import { normalizeHerdrBackendConfig, resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { normalizeRemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
+import { sharedBotSandboxAdvice, type SharedBotSandboxAdvice } from '../core/shared-bot-sandbox-advice.js';
+import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
+import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
+import type { BackendType } from '../adapters/backend/types.js';
+import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { isSessionGroup } from './session-groups-store.js';
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, getOwnerOpenId, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
@@ -1252,6 +1258,8 @@ export interface ConfigCardData {
   quota: number | null;
   admins: number;
   booleans: Array<{ key: string; on: boolean }>;
+  /** Other people use this bot while the allowlist sandbox is off (display only). */
+  sandboxAdvice?: SharedBotSandboxAdvice & { cliId: string };
 }
 
 export function getConfigCardData(larkAppId: string, modelChoices: readonly string[] = []): ConfigCardData | null {
@@ -1295,5 +1303,65 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     booleans: CONFIG_FIELDS.filter(f => f.kind === 'boolean').map(f => ({
       key: f.key, on: (cfg as any)[f.configKey] === true,
     })),
+    ...(() => {
+      // p2pMode='group' session groups carry an oncall binding that only pins
+      // their workingDir: the talk gate treats them as owner-only, so they are
+      // not a "whole group can talk" signal. allowedChatGroups is talk-open for
+      // every member, except where the id is itself a session group.
+      const sharedOncallChats = (cfg.oncallChats ?? []).filter(c => !isSessionGroup(c.chatId));
+      const sharedAllowedChatGroups = (cfg.allowedChatGroups ?? []).filter(id => !isSessionGroup(id));
+      // Mirror the WORKER's pairing, not an open-coded override chain: a remote
+      // CLI id (riff / mojo / remote-runner) dictates its backend even when
+      // backendType is not written (the common config), and a non-remote CLI
+      // resolved onto a remote backend reconciles to the daemon default / pty.
+      // Pass cfg.mojo so a provably-remote mojo session is exempt too.
+      const backendType = resolvePairedBackendId(cfg.cliId, cfg.backendType, config.daemon.backendType) ?? 'pty';
+      const localApplies = localSandboxApplies(backendType, cfg.mojo);
+      // The worker's spawn gate, exactly: even a LOCAL backend may refuse a file
+      // sandbox (herdr / zellij / zmx / orca; local mojo without a remote
+      // proof). undefined = it would spawn; non-undefined = it would throw.
+      const sandboxCapable = backendSandboxCompatibilityError({
+        backendType: backendType as BackendType,
+        cliId: cfg.cliId,
+        fileSandboxRequested: true,
+        effectiveReadIsolationRequested: false,
+        ...(backendType === 'mojo' ? { mojoConfig: cfg.mojo } : {}),
+      }) === undefined;
+      // DISPLAY-only path: a typo'd BOTMUX_SANDBOX makes the resolver throw (the
+      // worker fail-closes at spawn). Fall back to the config-only mode (still
+      // honouring the legacy readIsolation flag, which implies oncall), so a bad
+      // env value neither kills /botconfig nor re-advises an isolated bot.
+      let effectiveSandboxMode: ReturnType<typeof resolveLocalSandboxMode>;
+      try {
+        effectiveSandboxMode = resolveLocalSandboxMode({
+          backendType,
+          mojoConfig: cfg.mojo,
+          configSandbox: cfg.sandbox,
+          readIsolation: cfg.readIsolation === true,
+          envValue: process.env.BOTMUX_SANDBOX,
+        });
+      } catch {
+        effectiveSandboxMode = resolveSandboxMode({
+          configSandbox: cfg.sandbox,
+          readIsolation: cfg.readIsolation === true,
+        });
+      }
+      const advice = sharedBotSandboxAdvice({
+        sandboxMode: effectiveSandboxMode,
+        localSandboxApplies: localApplies,
+        sandboxCapable,
+        cliId: cfg.cliId,
+        oncallChatCount: sharedOncallChats.length,
+        allowedChatGroupsCount: sharedAllowedChatGroups.length,
+        defaultOncallEnabled: cfg.defaultOncall?.enabled,
+        // Resolved identities, same source as `admins` above: a stale
+        // unresolvable entry must not make the bot look multi-user.
+        allowedUsersCount: bot.resolvedAllowedUsers.length,
+        triggerUserAuthEnabled: cfg.triggerUserAuth?.enabled,
+        wrapperCli: cfg.wrapperCli,
+        cliRuntimeConfigured: cfg.cliRuntime !== undefined,
+      });
+      return advice ? { sandboxAdvice: { ...advice, cliId: cfg.cliId } } : {};
+    })(),
   };
 }
