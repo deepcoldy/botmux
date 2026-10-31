@@ -17,7 +17,7 @@ import {
   buildOpenAiTextEvents,
   streamOpenAiEvents,
 } from './openai-sse.js';
-import { pickShellTool } from './shell-tool.js';
+import { hasDeclaredFunctions, pickShellTool } from './shell-tool.js';
 import { sandboxProbeCommand } from './sandbox-probe.js';
 import { buildGeminiResponse, geminiMessages, isGeminiToolResult, streamGeminiEvents } from './gemini-sse.js';
 import {
@@ -287,9 +287,11 @@ export class MockLlmServer {
     const messages = geminiMessages(body?.contents);
     const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
     this.recordedMarkers.add(marker);
-    // No declared tools (Antigravity's title call) gets text, not a call of a
+    // Only a request that actually declares a callable tool may get a tool
+    // call back: no tools at all (Antigravity's title call) or a group that
+    // holds only a built-in (`{googleSearch:{}}`) gets text, not a call of a
     // tool the request never offered.
-    const tool = Array.isArray(body?.tools) && body.tools.length > 0 ? pickShellTool(body.tools, 'run_command') : null;
+    const tool = hasDeclaredFunctions(body?.tools) ? pickShellTool(body.tools, 'run_command') : null;
     const toolResult = isGeminiToolResult(body?.contents);
     const branch = toolResult || !tool ? 'text' : 'functionCall';
     let response;

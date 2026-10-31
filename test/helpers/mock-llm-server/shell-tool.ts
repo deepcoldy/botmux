@@ -37,6 +37,12 @@ function declarations(tools: unknown): Declared[] {
   return out;
 }
 
+/** Whether the request declares any callable function/tool at all. A group
+ *  holding only a built-in (e.g. Gemini's `{googleSearch: {}}`) declares none. */
+export function hasDeclaredFunctions(tools: unknown): boolean {
+  return declarations(tools).length > 0;
+}
+
 // Exact names first: Claude also offers `BashOutput` and `KillShell`.
 const EXACT = /^_?(bash|shell|run_command)$/i;
 const LOOSE = /bash|shell|terminal/i;

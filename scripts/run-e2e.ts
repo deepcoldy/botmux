@@ -160,11 +160,13 @@ function mockCliEnv(cliId: string, baseUrl: string): Record<string, string> | nu
     case 'antigravity':
       // With the workflow's settings.json (modelProvider "gemini") agy talks
       // to the Gemini API at GOOGLE_GEMINI_BASE_URL with this key, no Google
-      // sign-in; a background self-update would swap the binary mid-run.
+      // sign-in. agy compares this var to the literal string "true" (verified
+      // against 1.4.12): "1" still spawns its background updater, which would
+      // swap the pinned binary mid-run.
       return {
         GEMINI_API_KEY: 'mock-test-key',
         GOOGLE_GEMINI_BASE_URL: baseUrl,
-        AGY_CLI_DISABLE_AUTO_UPDATE: '1',
+        AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       };
     case 'pi':
       return { PI_SKIP_VERSION_CHECK: '1' };

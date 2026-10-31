@@ -331,6 +331,28 @@ describe('MockLlmServer', () => {
       expect(part).not.toHaveProperty('functionCall');
       expect(part.text).toBeTypeOf('string');
     });
+
+    it('answers a Gemini API tools group holding only a built-in (googleSearch) with text', async () => {
+      // A non-empty `tools` array that declares no callable function must not
+      // fall through to a fabricated run_command the request never offered.
+      const text = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools: [{ googleSearch: {} }],
+      });
+      const part = JSON.parse(text.replace(/^data: /, '').trim()).candidates[0].content.parts[0];
+      expect(part).not.toHaveProperty('functionCall');
+      expect(part.text).toBeTypeOf('string');
+    });
+
+    it('answers a Gemini API request whose functions hold no shell with text', async () => {
+      const text = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools: [{ functionDeclarations: [{ name: 'session_title', parametersJsonSchema: { type: 'object' } }] }],
+      });
+      const part = JSON.parse(text.replace(/^data: /, '').trim()).candidates[0].content.parts[0];
+      expect(part).not.toHaveProperty('functionCall');
+      expect(part.text).toBeTypeOf('string');
+    });
   });
 
   describe('OpenAI Responses API (/v1/responses)', () => {

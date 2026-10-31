@@ -292,6 +292,8 @@ jobs:
           # (the mock) without a Google sign-in; the onboarding cache skips the
           # first-run colour-scheme and terms screens, which would swallow the
           # first prompt. The worker accepts the folder-trust dialog itself.
+          # agy compares this env var to the literal string "true" (verified
+          # against 1.4.12): "1"/"TRUE" still spawn its background updater.
           mkdir -p ~/.gemini/antigravity-cli/cache
           echo '{"modelProvider":"gemini"}' > ~/.gemini/antigravity-cli/settings.json
           echo '{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}' > ~/.gemini/antigravity-cli/cache/onboarding.json
@@ -312,7 +314,7 @@ jobs:
           omp --version
           kimi --version
           grok --version
-          AGY_CLI_DISABLE_AUTO_UPDATE=1 agy --version
+          AGY_CLI_DISABLE_AUTO_UPDATE=true agy --version
 
       - name: Build Botmux
         if: steps.feishu_config.outputs.ready == 'true'
