@@ -2,9 +2,11 @@
  * Resume-without-cliSessionId → fresh-session policy.
  *
  * Adapters whose buildArgs can only resume a PRECISE cliSessionId (cursor /
- * copilot / kimi — no --continue/latest fallback, which would risk loading a
- * SIBLING session's conversation) declare `resumeRequiresCliSessionId`. This
- * file covers:
+ * copilot — no --continue/latest fallback, which would risk loading a
+ * SIBLING session's conversation) declare `resumeRequiresCliSessionId`.
+ * Kimi / Gemini find their own session from the botmux id instead
+ * (`resumeFindsOwnSession`); for them the receipt follows the same
+ * `checkResumeTargetExists` probe the worker runs. This file covers:
  *
  *   1. `resumeStartsFresh` — the shared predicate upper layers (closed card,
  *      resume receipt) use to distinguish "route reactivated" from "CLI
@@ -17,6 +19,9 @@
  * Run: pnpm vitest run test/resume-fresh-policy.test.ts
  */
 import { describe, it, expect, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { resumeStartsFresh } from '../src/services/resume-fresh-policy.js';
 import { buildClosedSessionCard } from '../src/core/closed-session-card.js';
 import { getCliDisplayName } from '../src/im/lark/card-builder.js';
@@ -28,15 +33,46 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 describe('resumeStartsFresh', () => {
-  it('copilot / kimi / cursor without a persisted cliSessionId start fresh', () => {
+  it('copilot / cursor without a persisted cliSessionId start fresh', () => {
     expect(resumeStartsFresh({ cliId: 'copilot' })).toBe(true);
-    expect(resumeStartsFresh({ cliId: 'kimi' })).toBe(true);
     expect(resumeStartsFresh({ cliId: 'cursor' })).toBe(true);
+  });
+
+  it('kimi / gemini find their own session: fresh exactly when the same probe the worker runs finds none', () => {
+    const root = mkdtempSync(join(tmpdir(), 'resume-fresh-'));
+    const prev = { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME, GEMINI_CLI_HOME: process.env.GEMINI_CLI_HOME };
+    try {
+      process.env.KIMI_CODE_HOME = join(root, 'kimi');
+      process.env.GEMINI_CLI_HOME = root;
+      const work = join(root, 'work');
+      mkdirSync(work, { recursive: true });
+      const sid = '4c0a8f9e-1b2d-4e3f-8a5b-6c7d8e9f0a1b';
+      // Nothing on disk yet: the receipt must say "starts fresh".
+      expect(resumeStartsFresh({ cliId: 'kimi', sessionId: sid, workingDir: work })).toBe(true);
+      expect(resumeStartsFresh({ cliId: 'gemini', sessionId: sid, workingDir: work })).toBe(true);
+      // Kimi has the session (its prompt carries the botmux id): history is back.
+      const kdir = join(root, 'kimi', 'sessions', 'wd_work_0', 'session_aaaa');
+      mkdirSync(join(kdir, 'agents', 'main'), { recursive: true });
+      writeFileSync(join(kdir, 'agents', 'main', 'wire.jsonl'), `{"type":"metadata","protocol_version":"1.4"}\n{"content":"<session_id>${sid}</session_id>"}\n`);
+      writeFileSync(join(root, 'kimi', 'session_index.jsonl'), JSON.stringify({ sessionId: 'session_aaaa', sessionDir: kdir, workDir: work }) + '\n');
+      expect(resumeStartsFresh({ cliId: 'kimi', sessionId: sid, workingDir: work })).toBe(false);
+      // Gemini has a resumable file for it in this project.
+      mkdirSync(join(root, '.gemini', 'tmp', 'work', 'chats'), { recursive: true });
+      writeFileSync(join(root, '.gemini', 'projects.json'), JSON.stringify({ projects: { [work]: 'work' } }));
+      writeFileSync(join(root, '.gemini', 'tmp', 'work', 'chats', `session-x-${sid.slice(0, 8)}.jsonl`),
+        `${JSON.stringify({ sessionId: sid })}\n${JSON.stringify({ id: 'm0', type: 'user', content: [{ text: 'hello' }] })}\n`);
+      expect(resumeStartsFresh({ cliId: 'gemini', sessionId: sid, workingDir: work })).toBe(false);
+    } finally {
+      for (const [key, value] of Object.entries(prev)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('copilot / kimi / cursor WITH a cliSessionId resume precisely (not fresh)', () => {
     expect(resumeStartsFresh({ cliId: 'copilot', cliSessionId: 'sess-1' })).toBe(false);
-    expect(resumeStartsFresh({ cliId: 'kimi', cliSessionId: 'sess-1' })).toBe(false);
+    expect(resumeStartsFresh({ cliId: 'kimi', cliSessionId: 'session_1' })).toBe(false);
     expect(resumeStartsFresh({ cliId: 'cursor', cliSessionId: 'chat-1' })).toBe(false);
   });
 

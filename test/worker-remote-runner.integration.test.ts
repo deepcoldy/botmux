@@ -225,6 +225,20 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
         && message.status === 'completed'),
       () => `follow-up after recovered turn did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
     );
+    // The successor's turn_input_committed is sent from a microtask that runs
+    // after the runner's `status: busy` request resolves, whereas its terminal
+    // is emitted synchronously when the `final` line lands — when busy ACK and
+    // final arrive in one stdout chunk under load, the receipt reaches worker
+    // IPC just AFTER the terminal. The two channels are not ordered (same
+    // class of race fixed for engine-attestation cases in #2597), so wait for
+    // the receipt instead of asserting it is already present at terminal sight.
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_input_committed'
+        && message.turnId === 'om_turn_followup'
+        && message.dispatchAttempt === 9
+        && message.durablePrimaryInbox === true),
+      () => `follow-up turn_input_committed receipt did not arrive\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
     const commands = readFileSync(commandsPath, 'utf8')
       .trim()
       .split('\n')

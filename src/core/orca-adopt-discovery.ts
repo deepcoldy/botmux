@@ -10,7 +10,12 @@ import {
 import { scanLocalOrcaCliPids } from '../services/orca-processes.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
-import { findTraexRolloutByPid, findTraexThreadByPid } from '../services/traex-transcript.js';
+import {
+  findTraexRolloutByPid,
+  findTraexThreadByPid,
+  readTraexThreadIndex,
+  type TraexThreadIndexEntry,
+} from '../services/traex-transcript.js';
 import { readClaudeSessionMeta } from '../services/claude-transcript.js';
 import { queryOrcaRelayPtyMetadata } from '../services/orca-relay.js';
 import { queryOrcaDaemonSessions, type OrcaDaemonSessionMetadata } from '../services/orca-daemon.js';
@@ -39,6 +44,7 @@ export interface OrcaAdoptableSession {
   cliId: CliId;
   cwd: string;
   startedAt?: number;
+  lastOutputAt?: number;
   paneCols: number;
   paneRows: number;
   paneSizeVerified: boolean;
@@ -102,6 +108,7 @@ function toCandidate(
   instance: OrcaInstance,
   localPids: ReadonlyMap<string, { pid: number; cliId: CliId }> = new Map(),
   sizes: ReadonlyMap<string, { cols: number; rows: number }> = new Map(),
+  traexThreads: ReadonlyMap<string, TraexThreadIndexEntry> = new Map(),
 ): OrcaAdoptableSession | undefined {
   const cliId = cliIdFromOrcaAgentIdentity(terminal.agentIdentity);
   if (!cliId || (filterCliId && cliId !== filterCliId)) return undefined;
@@ -111,6 +118,7 @@ function toCandidate(
   const local = localPids.get(terminal.handle);
   const cliPid = local?.cliId === cliId ? local.pid : undefined;
   const session = sessionMetaForCliPid(cliId, cliPid);
+  const threadUpdatedAt = session.sessionId ? traexThreads.get(session.sessionId)?.updatedAtMs : undefined;
   const size = sizes.get(terminal.handle);
   return {
     source: 'orca',
@@ -121,12 +129,13 @@ function toCandidate(
     orcaExecutionHostId: terminal.executionHostId,
     orcaWorktreeId: terminal.worktreeId,
     orcaAgentIdentity: terminal.agentIdentity!,
-    orcaTerminalTitle: session.title || terminal.title?.trim() || undefined,
+    orcaTerminalTitle: terminal.title?.trim() || session.title || undefined,
     cliId,
     cliPid,
     sessionId: session.sessionId,
     cwd: terminal.worktreePath,
     startedAt: undefined,
+    lastOutputAt: cliId === 'traex' ? threadUpdatedAt : terminal.lastOutputAt ?? undefined,
     // Without an attested geometry (relay socket or terminal daemon) the
     // public CLI offers none; keep conservative render defaults.
     paneCols: size?.cols ?? 120,
@@ -197,10 +206,11 @@ export async function discoverAdoptableOrcaSessions(
     ...(serverList.ok ? [{ instance: 'server' as const, terminals: serverList.value.terminals ?? [] }] : []),
   ];
   const { localPids, sizes } = await localPidsForTerminals(instances, daemonSessions);
+  const traexThreads = readTraexThreadIndex();
   const byHandle = new Map<string, OrcaAdoptableSession>();
   for (const { instance, terminals } of instances) {
     for (const terminal of terminals) {
-      const candidate = toCandidate(terminal, filterCliId, instance, localPids, sizes);
+      const candidate = toCandidate(terminal, filterCliId, instance, localPids, sizes, traexThreads);
       if (!candidate) continue;
       // Prefer routes that keep working after the desktop disconnects.
       const existing = byHandle.get(candidate.orcaTerminalHandle);

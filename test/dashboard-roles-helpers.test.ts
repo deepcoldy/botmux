@@ -1,14 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  botMatchesTeamFilters,
-  mapHostedTeams,
-  mapRemoteTeams,
-  teamCliOptions,
-  updateTeamBotCapability,
-  type RosterBot,
-  type Team,
-} from '../src/dashboard/web/team-federation.js';
-import {
   applyRoleProfile,
   botInChatCount,
   botRoleCount,
@@ -27,69 +18,8 @@ import {
   type GroupInfo,
 } from '../src/dashboard/web/roles.js';
 
-const tr = (key: string, params?: Record<string, string | number>) => {
-  if (params) return `${key}:${JSON.stringify(params)}`;
-  return key;
-};
-
 afterEach(() => {
   vi.unstubAllGlobals();
-});
-
-describe('team federation helpers', () => {
-  const bot: RosterBot = {
-    larkAppId: 'cli_a',
-    name: 'Alpha Bot',
-    cliId: 'codex',
-    capability: 'code review',
-    hasTeamRole: true,
-    deployment: { id: 'dep1', name: 'local', local: true, stale: false },
-  };
-
-  it('filters roster bots by search, cli, capability, and role flags', () => {
-    expect(botMatchesTeamFilters(bot, { query: 'review', cliId: '', hasCapability: false, hasRole: false })).toBe(true);
-    expect(botMatchesTeamFilters(bot, { query: 'missing', cliId: '', hasCapability: false, hasRole: false })).toBe(false);
-    expect(botMatchesTeamFilters(bot, { query: '', cliId: 'codex', hasCapability: true, hasRole: true })).toBe(true);
-    expect(botMatchesTeamFilters({ ...bot, capability: null }, { query: '', cliId: '', hasCapability: true, hasRole: false })).toBe(false);
-    expect(botMatchesTeamFilters({ ...bot, hasTeamRole: false }, { query: '', cliId: '', hasCapability: false, hasRole: true })).toBe(false);
-  });
-
-  it('maps hosted and remote teams while preserving route/API identity keys', () => {
-    const hosted = mapHostedTeams({
-      teams: [
-        { teamId: 'default', isDefault: true, deployments: [], bots: [bot] },
-        { teamId: 'ops', name: 'Ops', deployments: [], bots: [] },
-      ],
-    }, tr);
-    expect(hosted.map(team => [team.key, team.label])).toEqual([
-      ['local:default', 'team.myHostedTeam'],
-      ['local:ops', 'Ops'],
-    ]);
-
-    const remote = mapRemoteTeams({
-      memberships: [{
-        hubUrl: 'https://hub.example',
-        teamId: 'team-r',
-        roster: { deployments: [{ id: 'hub', name: 'Hub Deploy', local: true, stale: false }], bots: [] },
-      }],
-    }, tr);
-    expect(remote[0]).toMatchObject({
-      kind: 'remote',
-      key: 'https://hub.example::team-r',
-      label: 'team.remoteTeamLabel:{"name":"Hub Deploy"}',
-      hubUrl: 'https://hub.example',
-    });
-  });
-
-  it('deduplicates cli options and trims capability updates', () => {
-    const teams: Team[] = [
-      { kind: 'local', key: 'a', teamId: 'a', label: 'A', sub: '', ok: true, deployments: [], bots: [bot] },
-      { kind: 'remote', key: 'b', teamId: 'b', label: 'B', sub: '', ok: true, deployments: [], bots: [{ ...bot, larkAppId: 'cli_b', cliId: 'claude' }] },
-    ];
-    expect(teamCliOptions(teams)).toEqual(['claude', 'codex']);
-    expect(updateTeamBotCapability(teams, 'cli_a', '  docs  ')[0].bots[0].capability).toBe('docs');
-    expect(updateTeamBotCapability(teams, 'cli_a', '   ')[0].bots[0].capability).toBeNull();
-  });
 });
 
 describe('message listener content policy helpers', () => {

@@ -662,6 +662,13 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     dbPath: opencodeDbPath,
     skillsDir: '~/.config/opencode/skills',
     hookConfigPath: '~/.config/opencode/plugin/botmux-ask.js',
+    // Data root + the global config dir: opencode.json (providers / model), the
+    // botmux ask plugin written above and global skills. Under the oncall
+    // sandbox the config dir was absent, so OpenCode fell back to its built-in
+    // hosted model and the botmux ask hook never loaded. Read-write, like
+    // MiMoCode's: OpenCode installs plugin dependencies into it on every start
+    // (package.json / node_modules) and exits on a read-only mount.
+    authPaths: ['~/.local/share/opencode', '~/.config/opencode'],
     modelListArgs: ['models'],
     modelChoices: CLI_MODEL_CHOICES['opencode'],
   });

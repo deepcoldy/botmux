@@ -7,6 +7,8 @@ import { useT } from './react-hooks.js';
 
 export function TraexAutoModelEditor(props: {
   enabled: boolean;
+  trigger?: 'capacity' | 'quota';
+  onTrigger?: (trigger: 'capacity' | 'quota') => void;
   reselectPerTurn: boolean;
   models: string[];
   modelSettings: Record<string, TraexAutoModelSettings>;
@@ -42,20 +44,25 @@ export function TraexAutoModelEditor(props: {
         <span>{tr('botDefaults.autoModelTitle')}</span>
       </label>
       <div className="bd-auto-model-description">
-        <span>{tr('botDefaults.autoModelSummary')}</span>
+        <span>{tr(props.trigger === 'quota' ? 'botDefaults.autoModelQuotaSummary' : 'botDefaults.autoModelSummary')}</span>
         <InfoTip label={tr('botDefaults.autoModelDetails')} className="bd-info-tip" trigger="?">
-          {tr('botDefaults.autoModelHelp')}
+          {tr(props.trigger === 'quota' ? 'botDefaults.autoModelQuotaHelp' : 'botDefaults.autoModelHelp')}
         </InfoTip>
       </div>
       {props.enabled ? <>
-        <label className="bd-auto-model-toggle">
+        <DropdownField dataInput="autoModelTrigger" ariaLabel={tr('botDefaults.autoModelTrigger')}
+          value={props.trigger ?? 'capacity'} disabled={props.busy}
+          options={[{ value: 'capacity', label: tr('botDefaults.autoModelCapacityTrigger') },
+            { value: 'quota', label: tr('botDefaults.autoModelQuotaTrigger') }]}
+          onChange={value => props.onTrigger?.(value === 'quota' ? 'quota' : 'capacity')} />
+        {props.trigger !== 'quota' && <label className="bd-auto-model-toggle">
           <input type="checkbox" data-input="autoModelReselectPerTurn" checked={props.reselectPerTurn}
             disabled={props.busy} onChange={event => props.onReselectPerTurn(event.currentTarget.checked)} />
           <span>{tr('botDefaults.autoModelReselectPerTurn')}</span>
           <InfoTip label={tr('botDefaults.autoModelDetails')} className="bd-info-tip" trigger="?">
             {tr('botDefaults.autoModelReselectPerTurnHelp')}
           </InfoTip>
-        </label>
+        </label>}
         <ol className="bd-auto-model-list">
           {props.models.map((model, index) => {
             const settings = props.modelSettings[model] ?? {};
@@ -124,7 +131,7 @@ export function TraexAutoModelEditor(props: {
         <button type="button" data-action="autoModelAdd" disabled={props.busy}
           onClick={() => props.onModels([...props.models, ''])}>{tr('botDefaults.autoModelAdd')}</button>
         <span className="bd-auto-model-count">{tr('botDefaults.autoModelCount', { count: props.models.length })}</span>
-        <label className="bd-auto-model-timeout">
+        {props.trigger !== 'quota' && <><label className="bd-auto-model-timeout">
           <span>{tr('botDefaults.autoModelTimeout')}</span>
           <input type="number" min="5" max="300" step="1" data-input="autoModelTimeout"
             value={props.timeoutSeconds} disabled={props.busy}
@@ -136,6 +143,7 @@ export function TraexAutoModelEditor(props: {
             value={props.cooldownSeconds} disabled={props.busy}
             onChange={event => props.onCooldown(event.currentTarget.value)} />
         </label>
+        </>}
       </> : null}
       <div className="bd-auto-model-save">
         <button type="button" className="primary" data-action="save-auto-model"

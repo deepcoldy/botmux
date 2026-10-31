@@ -17,6 +17,7 @@ import {
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../src/core/sandbox-send-route.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const roots: string[] = [];
@@ -233,38 +234,92 @@ describe('sandbox dispatch CLI routing', () => {
     expect(readdirSync(outbox).some(name => name.endsWith('.req.json'))).toBe(false);
   });
 
-  it('fails sandbox send routing with exit 2 and no relay request', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'botmux-send-cli-routing-'));
+  function sendRelayFixture(prefix: string) {
+    const root = mkdtempSync(join(tmpdir(), prefix));
     roots.push(root);
     const dataDir = join(root, 'data');
     const outbox = join(root, 'outbox');
     mkdirSync(dataDir);
     mkdirSync(outbox);
+    const capability = 'cd'.repeat(32);
     replaceManagedOriginCapabilityFile(
       join(outbox, RELAY_ORIGIN_CAPABILITY_BASENAME),
-      JSON.stringify({ token: 'cd'.repeat(32), turnId: 'turn-live', dispatchAttempt: 1 }),
+      JSON.stringify({ token: capability, turnId: 'turn-live', dispatchAttempt: 1 }),
     );
-    writeFileSync(join(dataDir, 'sessions-app-a.json'), JSON.stringify({
-      session: {
-        sessionId: 'session', chatId: 'oc_source', rootMessageId: 'om_source',
-        title: 'source', status: 'active', createdAt: new Date(0).toISOString(),
-        larkAppId: 'app-a', cliId: 'codex-app',
-        codexAppDispatchLedger: [{
-          dispatchId: 'dispatch-live', turnId: 'turn-live', dispatchAttempt: 1,
-          state: 'prepared', content: 'prompt', deliverySink: 'lark',
-        }],
-      },
-    }));
-    const result = await runCli([
-      'send', 'must not send', '--session-id', 'session', '--chat-id', 'oc_target',
-      '--top-level', '--no-mention',
-    ], {
+    const calls = join(root, 'calls.jsonl');
+    const hostFixture = join(root, 'send-host.mjs');
+    writeFileSync(hostFixture, `
+      import { appendFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      const result = { argv, routeGate: process.env.${SANDBOX_RELAY_ROUTE_GATE_ENV} ?? null };
+      appendFileSync(${JSON.stringify(calls)}, JSON.stringify(result) + '\\n');
+      process.stdout.write(JSON.stringify({ success: true }));
+    `);
+    const env = {
       ...process.env,
       SESSION_DATA_DIR: dataDir,
       BOTMUX_SESSION_ID: 'session',
       BOTMUX_SEND_RELAY: outbox,
       BOTMUX_WORKFLOW: '',
+    };
+    const watch = (allowRouting: boolean) => startOutboxWatcher(outbox, { ...process.env }, 'session', {
+      cliPath: hostFixture,
+      allowRouting,
+      authorize: claim => claim.capability === capability
+        ? { ok: true, origin: { turnId: 'turn-live', dispatchAttempt: 1 } }
+        : { ok: false, error: 'stale capability' },
     });
+    const hostCalls = () => existsSync(calls)
+      ? readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { argv: string[]; routeGate: string | null })
+      : [];
+    return { outbox, env, watch, hostCalls };
+  }
+
+  it('relays sandbox send routing flags to the host re-exec, which carries the route gate', async () => {
+    const f = sendRelayFixture('botmux-send-cli-routing-');
+    const stop = f.watch(true);
+    try {
+      const result = await runCli([
+        'send', 'broadcast', '--chat-id', 'oc_target', '--top-level', '--no-mention',
+      ], f.env);
+      expect(result.code, result.stderr).toBe(0);
+      const [call, ...rest] = f.hostCalls();
+      expect(rest).toEqual([]);
+      expect(call!.routeGate).toBe('1');
+      expect(call!.argv[0]).toBe('send');
+      expect(call!.argv).toEqual(expect.arrayContaining(['--top-level', '--no-mention']));
+      expect(call!.argv[call!.argv.indexOf('--chat-id') + 1]).toBe('oc_target');
+      // session-id is forced host-side, never taken from the request
+      expect(call!.argv[call!.argv.indexOf('--session-id') + 1]).toBe('session');
+
+      const into = await runCli(['send', 'follow-up', '--into', 'om_root', '--no-mention'], f.env);
+      expect(into.code, into.stderr).toBe(0);
+      const intoCall = f.hostCalls()[1]!;
+      expect(intoCall.argv[intoCall.argv.indexOf('--into') + 1]).toBe('om_root');
+    } finally {
+      stop();
+    }
+  });
+
+  it('a watcher without routing permission rejects routing flags before any host re-exec', async () => {
+    const f = sendRelayFixture('botmux-send-cli-norouting-');
+    const stop = f.watch(false);
+    try {
+      const result = await runCli(['send', 'broadcast', '--chat-id', 'oc_target', '--no-mention'], f.env);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('relay rejected: flag not allowed: --chat-id');
+      expect(f.hostCalls()).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
+
+  it('keeps refusing routing flags in a credential-only pane with exit 2 and no relay request', async () => {
+    const f = sendRelayFixture('botmux-send-cli-credonly-');
+    const result = await runCli([
+      'send', 'must not send', '--session-id', 'session', '--chat-id', 'oc_target',
+      '--top-level', '--no-mention',
+    ], { ...f.env, BOTMUX_SEND_RELAY_SCOPE: 'send' });
     expect(result.code).toBe(2);
     expect(errorReceipt(result.stderr)).toMatchObject({
       success: false,
@@ -272,7 +327,7 @@ describe('sandbox dispatch CLI routing', () => {
       acceptanceState: 'not_requested',
       errorCode: 'ROUTING_NOT_SUPPORTED',
     });
-    expect(readdirSync(outbox).some(name => name.endsWith('.req.json'))).toBe(false);
+    expect(readdirSync(f.outbox).some(name => name.endsWith('.req.json'))).toBe(false);
   });
 
   it('returns BRIEF_FILE_NOT_FOUND for a missing sandbox brief', async () => {

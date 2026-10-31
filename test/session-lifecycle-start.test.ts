@@ -189,19 +189,25 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
 
-// Scheduled-task store seen by the recovery continuation's identity lookup.
-// Keyed by task id; empty means "task deleted" (no identity, fail-closed).
-const { scheduledTasksForProvenance } = vi.hoisted(() => ({
+// Host authority store seen by the scheduled-turn identity lookups (the
+// daemon's loadScheduledTaskForIdentity callback). Keyed by task id; empty
+// means "task deleted" (no identity, fail-closed).
+// `tamperedProjection` is what a sandboxed CLI wrote into its BOT_HOME
+// schedules.json; daemon identity decisions must never see it.
+const { scheduledTasksForProvenance, tamperedProjection } = vi.hoisted(() => ({
   scheduledTasksForProvenance: new Map<string, any>(),
+  tamperedProjection: new Map<string, any>(),
 }));
 vi.mock('../src/core/scheduled-turn-provenance.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/scheduled-turn-provenance.js')>();
   return {
     ...actual,
     readScheduledTaskForProvenance: (_dataDir: string, _larkAppId: string, taskId: string) =>
-      scheduledTasksForProvenance.get(taskId),
+      tamperedProjection.get(taskId) ?? scheduledTasksForProvenance.get(taskId),
   };
 });
+const loadScheduledTaskForIdentity = (_larkAppId: string, taskId: string) =>
+  scheduledTasksForProvenance.get(taskId);
 import { armSilentScheduledTurn, isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
@@ -358,7 +364,9 @@ beforeEach(() => {
     getSessionWorkingDir: () => REPO,
     getActiveCount: () => 1,
     closeSession: vi.fn(),
+    loadScheduledTaskForIdentity,
   });
+  tamperedProjection.clear();
   setActiveSessionsRegistry(undefined);
   setLinkRefRuntime(undefined);
 });
@@ -6878,6 +6886,21 @@ describe('managed turn authority worker generations', () => {
     expect(ds.scheduledTurnCallers).toBeUndefined();
   });
 
+  it('rejects a scheduled creator that only matches a sandbox-rewritten schedules.json', () => {
+    // The agent swapped the creator in its BOT_HOME projection; the forged
+    // caller agrees with that file but not with the host authority row.
+    const forged = { ...scheduledCaller, requestUserOpenId: 'ou_forged', requestUserUnionId: 'on_forged' };
+    tamperedProjection.set('feedbeef', {
+      ...scheduledTasksForProvenance.get('feedbeef'),
+      ownerOpenId: forged.requestUserOpenId,
+      ownerUnionId: forged.requestUserUnionId,
+    });
+    const ds = makeDs();
+    forkWorker(ds, { content: 'scheduled', trustedCaller: forged }, scheduledTurnId);
+
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toBeUndefined();
+  });
+
   it('binds a live injected scheduled turn and clears the pending identity on terminal', async () => {
     const ds = makeDs();
     forkWorker(ds, 'ordinary opening', false);
@@ -8052,6 +8075,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
+      loadScheduledTaskForIdentity,
     });
     const ds = makeDs();
     forkWorker(ds, 'warm up', 'om_original');
@@ -8220,6 +8244,50 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       status: 'exhausted',
       continuationsStarted: 2,
     }));
+  });
+
+  it('continues as the authority-store creator even after the sandbox rewrote schedules.json', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    tamperedProjection.set('abcdef12', {
+      ...scheduledTasksForProvenance.get('abcdef12'),
+      ownerOpenId: 'ou_someone_else',
+      ownerUnionId: 'on_someone_else',
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: SCHEDULED_TURN,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation.trustedCaller).toEqual(CREATOR_IDENTITY);
+  });
+
+  it('continues without an identity when only schedules.json still lists the task', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    tamperedProjection.set('abcdef12', scheduledTasksForProvenance.get('abcdef12'));
+    scheduledTasksForProvenance.clear();
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: SCHEDULED_TURN,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation.turnId).toMatch(/^schedule:abcdef12:/);
+    expect(continuation.trustedCaller).toBeUndefined();
   });
 
   it('continues without an identity when the scheduled task was deleted meanwhile', async () => {

@@ -59,9 +59,24 @@ describe('envSandboxMode (BOTMUX_SANDBOX)', () => {
 });
 
 describe('resolveSandboxMode', () => {
-  it('env override wins', () => {
+  it('an active env value (1 / oncall / scratch) forces that mode on every bot', () => {
     expect(resolveSandboxMode({ configSandbox: 'oncall', envValue: 'scratch' })).toBe('scratch');
-    expect(resolveSandboxMode({ configSandbox: 'scratch', envValue: '0' })).toBe('off');
+    expect(resolveSandboxMode({ configSandbox: false, envValue: '1' })).toBe('oncall');
+    expect(resolveSandboxMode({ configSandbox: 'scratch', envValue: 'oncall' })).toBe('oncall');
+  });
+
+  it('an inactive env value (0 / false / empty / unset) never turns off a bot\'s own sandbox', () => {
+    for (const envValue of ['0', 'false', '', undefined]) {
+      expect(resolveSandboxMode({ configSandbox: true, envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: 'oncall', envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: 'scratch', envValue })).toBe('scratch');
+      expect(resolveSandboxMode({ configSandbox: false, readIsolation: true, envValue })).toBe('oncall');
+      expect(resolveSandboxMode({ configSandbox: false, envValue })).toBe('off');
+    }
+  });
+
+  it('an invalid env value still fails closed even when the bot config is valid', () => {
+    expect(() => resolveSandboxMode({ configSandbox: true, envValue: 'no' })).toThrow(/invalid BOTMUX_SANDBOX/);
   });
 
   it('legacy readIsolation implies oncall', () => {

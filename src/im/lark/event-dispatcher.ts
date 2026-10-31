@@ -1446,6 +1446,12 @@ export function isTrustedSameOwnerSiblingBot(
   return true;
 }
 
+type BotsInfoNameEntry = { larkAppId?: unknown; botName?: unknown };
+
+function isBotsInfoNameEntry(entry: unknown): entry is BotsInfoNameEntry {
+  return typeof entry === 'object' && entry !== null;
+}
+
 /**
  * 同 owner 腿（evaluateTalk 的 sameOwnerBot）放行的，是本 bot 还没学到 open_id 的兄弟 bot：它绕过了
  * @ 闸门里的冷启动自愈，就在这里替自愈做它会做的那件事——把「名字 → 本 bot 视角的 open_id」记进
@@ -1463,10 +1469,10 @@ export function learnSameOwnerSiblingCrossRef(
   if (!senderOpenId) return false;
   const sibling = resolveLocalSiblingBotByUnionId(dataDir, larkAppId, senderUnionId);
   if (!sibling) return false;
-  let entries: Array<{ larkAppId?: string; botName?: string | null }> = [];
+  let entries: BotsInfoNameEntry[] = [];
   try {
     const raw = readBotsInfoJson(dataDir);
-    if (Array.isArray(raw)) entries = raw;
+    if (Array.isArray(raw)) entries = raw.filter(isBotsInfoNameEntry);
   } catch {
     return false;
   }
@@ -1544,8 +1550,9 @@ export function resolveSiblingBotNameByUnionId(
 
   // appId → current botName from the shared, rename-fresh bots-info.json.
   try {
-    const entries = readBotsInfoJson(dataDir) as Array<{ larkAppId?: string; botName?: string | null }> | undefined;
-    if (entries) {
+    const raw = readBotsInfoJson(dataDir);
+    if (Array.isArray(raw)) {
+      const entries = raw.filter(isBotsInfoNameEntry);
       const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
       if (typeof name === 'string' && name.trim()) return name.trim();
     }
@@ -1600,10 +1607,13 @@ export function updateBotOpenIdCrossRef(
   // Read known bot names from bots-info.json
   const knownBotNames = new Set<string>();
   try {
-    const entries = readBotsInfoJson(dataDir) as Array<{ botName: string | null }> | undefined;
-    if (entries) {
+    const raw = readBotsInfoJson(dataDir);
+    if (Array.isArray(raw)) {
+      const entries = raw.filter(isBotsInfoNameEntry);
       for (const e of entries) {
-        if (e.botName) knownBotNames.add(e.botName.toLowerCase());
+        if (typeof e.botName === 'string' && e.botName) {
+          knownBotNames.add(e.botName.toLowerCase());
+        }
       }
     }
   } catch { /* ignore */ }
@@ -2774,6 +2784,8 @@ export interface RoutingContext {
   /** runtime 级联的正文项以同一条消息重入 handleThreadReply 时置位：跳过已在首次入站跑过的
    *  一次性副作用（thread.reply hook、learnFromMentions），且不被级联在飞的推迟闸拦住。 */
   cascadeBodyReentry?: true;
+  /** An already-authorized effort command re-enters ordinary task admission. */
+  effortTaskReentry?: true;
   /** Set by the session-group birth flow (p2pMode='group') after it has
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
@@ -2810,6 +2822,8 @@ export interface RoutingContext {
   ingressAdmission?: { admitted: boolean; retryReason?: string };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
+  /** Preserve confirmed command state while its task remains in the Inbox. */
+  checkpointPreAdmissionSession?: (session: Session, isCurrent?: () => boolean) => Promise<void>;
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
   /** Durable-primary only: queue one lifecycle control after Session admission. */
@@ -4986,6 +5000,9 @@ export function createLarkEventDispatcherRuntime(
     if (typeof primary.context.queuePostAdmissionControl === 'function') {
       ctx.queuePostAdmissionControl = primary.context.queuePostAdmissionControl;
     }
+    if (typeof primary.context.checkpointPreAdmissionSession === 'function') {
+      ctx.checkpointPreAdmissionSession = primary.context.checkpointPreAdmissionSession;
+    }
   };
 
   const assertPrimaryRouteOwner = async (
@@ -6116,6 +6133,9 @@ export function createLarkEventDispatcherRuntime(
                 queuePostAdmissionControl: (
                   primary.context as DurableLarkCanonicalHandlerContext
                 ).queuePostAdmissionControl,
+                checkpointPreAdmissionSession: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).checkpointPreAdmissionSession,
               }
             : {}
         ),

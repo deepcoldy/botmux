@@ -211,11 +211,11 @@ describe('effectiveReplyDelivery', () => {
     expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('transcript');
   });
 
-  it('BOTMUX_SANDBOX=0 显式关闭 → env 短路 off，即便 cfg 写 scratch 也按 off 解析（与 spawnCli 同一解析器）', () => {
+  it('BOTMUX_SANDBOX=0 不强制、也不关掉 bot 自己的 scratch：按 cfg 解析为 scratch → cursor 回落 send（与 spawnCli 同一解析器）', () => {
     process.env.BOTMUX_SANDBOX = '0';
     vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
     mockBotConfig({ sandbox: 'scratch' });
-    expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('transcript');
+    expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('send');
   });
 
   it('readIsolation=true（legacy，无 env 无 cfg sandbox）→ 解析为 oncall，cursor transcript 不受影响', () => {

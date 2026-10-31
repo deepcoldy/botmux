@@ -423,7 +423,7 @@ describe('restoreUsageLimitRuntimeState', () => {
     expect(buildStreamingCard).toHaveBeenCalledWith(
       SESSION_ID,
       'om_root',
-      `http://localhost:8800/s/${SESSION_ID}`,
+      '',
       't',
       '',
       'limited',
@@ -1572,8 +1572,17 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
     expect(call[2]).toBe(''); // 3rd positional arg = read-only terminal URL
   });
 
-  it('renders the read-only terminal URL for a Web-Terminal backend (tmux/pty)', () => {
+  it('renders an empty terminal URL for a Web-Terminal backend that has no live worker port', () => {
     const ds = workingDs();
+    ds.session.webPort = 9101; // persisted from a prior generation
+    refreshStreamingCardUsage(ds);
+    const call = buildStreamingCardMock.mock.calls[0]!;
+    expect(call[2]).toBe('');
+  });
+
+  it('renders the read-only terminal URL for a live Web-Terminal backend (tmux/pty)', () => {
+    const ds = workingDs();
+    ds.worker = { killed: false } as any;
     ds.workerPort = 9101; // a real Web Terminal port
     refreshStreamingCardUsage(ds);
     const call = buildStreamingCardMock.mock.calls[0]!;

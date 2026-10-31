@@ -22,6 +22,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import { setScheduleAuthorityStore } from '../src/core/scheduler.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -657,6 +662,33 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     expect(ds.session.rootMessageId).toBe('om_banner_123');
     expect(ds.session.deferredScheduleRun).toBeUndefined();
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a root forged into schedules.json does not steer the first fire: the root comes from the host authority', async () => {
+    // Sandboxed agent writes `rootMessageId` into its BOT_HOME projection; the
+    // authority row (the only thing the daemon executes) has no root yet.
+    const task = baseTask({ executionPosition: 'task', chatType: 'group' });
+    const root = mkdtempSync(join(tmpdir(), 'botmux-sched-authority-'));
+    const authority = ScheduleAuthorityStore.open(root);
+    authority.initializeApp(APP, [task]);
+    setScheduleAuthorityStore(authority);
+    scheduleStoreGetTaskMock.mockImplementation((id: string) => (
+      id === task.id ? { ...task, rootMessageId: 'om_attacker_chosen' } : undefined
+    ));
+    try {
+      const active = new Map<string, DaemonSession>();
+      await executeScheduledTask(task, active, refreshCliVersion);
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+      expect(active.has(sessionKey('om_attacker_chosen', APP))).toBe(false);
+      expect(active.get(sessionKey('om_banner_123', APP))?.session.rootMessageId).toBe('om_banner_123');
+      expect(authority.getRecord(APP, task.id)?.task.rootMessageId).toBe('om_banner_123');
+    } finally {
+      setScheduleAuthorityStore(null);
+      scheduleStoreGetTaskMock.mockReset();
+      authority.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('renders dynamic date and owner placeholders for the dedicated task root', async () => {

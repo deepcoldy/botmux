@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { __testOnly_resetTriggerTurns, rememberTriggerTurn } from '../src/core/turn-origin.js';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import * as workerPool from '../src/core/worker-pool.js';
@@ -13,6 +14,7 @@ import { config } from '../src/config.js';
 let ipc: IpcServerHandle | null = null;
 let previousDataDir = '';
 afterEach(async () => {
+  __testOnly_resetTriggerTurns();
   if (ipc) await ipc.close(); ipc = null; setIpcAuthSecret(null); vi.restoreAllMocks();
   if (previousDataDir) { config.session.dataDir = previousDataDir; previousDataDir = ''; }
 });
@@ -106,6 +108,8 @@ const mockDocument = {
   turnId: 'trigger-current',
   workerGeneration: 7,
   dispatchAttempt: 3,
+  // The real CLI asks for the origin; the mock turn has no daemon record.
+  origin: 'unknown',
 };
 
 describe('POST /api/current-execution', () => {
@@ -248,6 +252,22 @@ describe('POST /api/current-execution', () => {
     expect((await request({ sessionId: 'another-session' })).status).toBe(403);
     ds.workerGeneration++;
     expect((await request({ sessionId: 's-execution' })).status).toBe(403);
+  });
+
+  it.skipIf(process.platform !== 'linux')('returns origin only to a caller that asks for it', async () => {
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const plain = await (await request({ sessionId: 's-execution' })).json();
+    expect(plain).not.toHaveProperty('origin');
+    rememberTriggerTurn('trigger-current', 'webhook');
+    const asked = await (await request({ sessionId: 's-execution', fields: ['origin'] })).json();
+    expect(asked).toMatchObject({ turnId: 'trigger-current', origin: 'trigger', triggerSource: 'webhook' });
+    // A caller cannot pick the answer: forged origin fields in the request are ignored.
+    const forged = await (await request({
+      sessionId: 's-execution', fields: ['origin'], origin: 'im', scheduleTaskId: 'abcdef12',
+    })).json();
+    expect(forged).toEqual(asked);
   });
 
   it('rejects invalid and oversized bodies before using session state', async () => {

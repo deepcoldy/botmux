@@ -5,6 +5,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay } from '../../utils/timing.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
+import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, StructuredBridgeSpec } from './types.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
@@ -147,9 +148,38 @@ async function waitForHistoryAppend(
  *  All four modes (Auto / Accept-edits / Plan / Best-of-N) share the
  *  `(shift+tab to cycle)` suffix; older builds rendered a bare `>`. A real
  *  draft (including botmux's own <user_message> envelopes) matches neither. */
+const EMPTY_COMPOSER_ROW = /(?:>|> .+\(shift\+tab to cycle\))/;
+
 function isEmptyComposerRow(row: string): boolean {
-  if (row === '>') return true;
-  return /^> .+\(shift\+tab to cycle\)$/.test(row);
+  return new RegExp(`^${EMPTY_COMPOSER_ROW.source}$`).test(row);
+}
+
+// Native agy errors end at an empty composer without the normal shortcuts
+// footer. Error ID anchors this to the CLI's error layout, rather than any
+// bare `>` in tool output, a draft or a permission menu.
+const ERROR_COMPOSER_PATTERN = new RegExp(`(?:^|\\n)[ \\t]*Error ID:[ \\t]*[a-zA-Z0-9][a-zA-Z0-9-]*[ \\t]*\\r?\\n[─━ \\t\\r\\n]*${EMPTY_COMPOSER_ROW.source}[ \\t]*(?:\\r?\\n[─━ \\t]*)*$`);
+
+/** An agy task footer is positive work evidence; unrelated PTY/syslog output
+ * alone is not proof that a native quota refusal recovered. */
+export function isAntigravityWorkingScreen(screen: string): boolean {
+  return /(?:^|\n)[ \t]*esc to cancel(?:\s|$)/i.test(stripAnsiScreenText(screen));
+}
+
+/** Preserve provenance only for the CLI's own quota/error/composer layout,
+ * not generic quota-shaped text in model/tool output. */
+export function annotateAntigravityUsageLimit(screen: string, state: CliUsageLimitState): CliUsageLimitState {
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  const match = ERROR_COMPOSER_PATTERN.exec(plain);
+  if (!match || /esc to cancel/i.test(plain)) return state;
+  const rows = plain.slice(0, match.index).trimEnd().split('\n');
+  for (let i = rows.length - 1; i >= Math.max(0, rows.length - 8); i--) {
+    const row = rows[i]!;
+    if (/^⚠(?:️)?[ \t]*Individual quota reached\./.test(row)) {
+      return { ...state, source: 'antigravity-error-composer' };
+    }
+    if (/^[ \t]*(?:⚠|Error ID:|>|●)/.test(row)) return state;
+  }
+  return state;
 }
 
 /** Walk the tail of a viewport (ready footer → separators → composer) and
@@ -202,7 +232,7 @@ export function isAntigravityInterruptedScreen(screen: string): boolean {
 export function isAntigravityIdleComposerScreen(screen: string): boolean {
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   if (/esc to cancel/i.test(plain)) return false;
-  return readyComposerRowAbove(plain) >= 0;
+  return readyComposerRowAbove(plain) >= 0 || ERROR_COMPOSER_PATTERN.test(plain);
 }
 
 export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
@@ -452,7 +482,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    readyPattern: /\? for shortcuts/,
+    readyPattern: new RegExp(`\\? for shortcuts|${ERROR_COMPOSER_PATTERN.source}`),
     busyPattern: /esc to cancel/,
     // agy records Enter in history.jsonl immediately while a turn is running:
     // Queue mode parks the message until turn end (Auto-flush), while

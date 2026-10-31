@@ -20,6 +20,7 @@ import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } fro
 import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
+import { findEffortTaskConfirmation, recordEffortTaskConfirmation } from '../services/codex-effort-task-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scheduledTaskRunAs } from './schedule-run-as.js';
@@ -596,6 +597,10 @@ export interface CommandHandlerDeps {
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
   submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
+  /** Task text attached to a successful native effort change uses normal input delivery. */
+  submitEffortTask?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
+  effortTaskReplay?: { inputHash: string; checkpoint(session: import('../types.js').Session, isCurrent: () => boolean): Promise<void>;
+    retry(reason: string): void; complete(): void };
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
@@ -1883,20 +1888,100 @@ export async function handleCommand(
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
           break;
         }
-        const effort = message.content.replace(/^\/effort\b/i, '').trim().toLowerCase();
-        if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) {
+        const match = /^\/effort\s+(low|medium|high|xhigh|max|ultra)(?:\s+([\s\S]*))?$/i.exec(message.content.trim());
+        if (!match) {
           await sessionReply(rootId, t('cmd.effort.usage', undefined, loc));
           break;
         }
+        const effort = match[1]!.toLowerCase();
+        const task = match[2]?.trim();
         const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId;
-        const result = await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort);
+        const worker = ds.worker;
+        const workerGeneration = ds.workerGeneration;
+        const generation = ds.session.workerGeneration;
+        const nativeId = ds.session.cliSessionId;
+        const replay = task ? deps.effortTaskReplay : undefined;
+        const confirmation = replay ? findEffortTaskConfirmation(ds.session, message.messageId) : undefined;
+        const committed = !!confirmation && ds.session.durablePrimaryInputCommits?.some(proof => proof.turnId === message.messageId);
+        const current = () => activeSessions.get(sessionKey(rootId, larkAppId!)) === ds
+          && ds.worker === worker && ds.workerGeneration === workerGeneration
+          && ds.session.workerGeneration === generation
+          && ds.session.cliSessionId === nativeId && ds.session.status === 'active';
+        if (confirmation?.terminal && confirmation.inputHash === replay!.inputHash) {
+          try { await replay!.checkpoint(ds.session, current); }
+          catch { replay!.retry('terminal effort task checkpoint is not yet durable'); break; }
+          if (confirmation.terminal === 'admitted') replay!.complete();
+          break;
+        }
+        if (confirmation && (confirmation.inputHash !== replay!.inputHash || confirmation.effort !== effort
+          || (!committed && (confirmation.cliId !== cliId || confirmation.nativeId !== nativeId
+            || confirmation.workerGeneration !== workerGeneration || confirmation.sessionWorkerGeneration !== generation)))) {
+          try {
+            confirmation.terminal = 'ignored';
+            sessionStore.updateSession(ds.session);
+            await replay!.checkpoint(ds.session, current);
+          } catch {
+            replay!.retry('retired effort task checkpoint is not yet durable');
+            break;
+          }
+          await sessionReply(rootId, t('cmd.effort.task_not_submitted', { task }, loc));
+          break;
+        }
+        if (replay && !confirmation && (ds.session.codexEffortTaskConfirmations?.length ?? 0) >= 64
+          && !ds.session.codexEffortTaskConfirmations?.some(entry => entry.terminal || ds.session.durablePrimaryInputCommits?.some(proof => proof.turnId === entry.messageId))) {
+          try { await replay.checkpoint(ds.session, current); }
+          catch { replay.retry('pending effort task confirmation capacity is exhausted'); break; }
+          if (!ds.session.codexEffortTaskConfirmations?.some(entry => entry.terminal || ds.session.durablePrimaryInputCommits?.some(proof => proof.turnId === entry.messageId))) {
+            replay.retry('pending effort task confirmation capacity is exhausted');
+            break;
+          }
+        }
+        const result: import('../types.js').CodexAppEffortResult = confirmation
+          ? { status: 'future_only', reason: cliId === 'codex' ? 'cli_next_turn' : undefined }
+          : await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort);
+        const saved = result.status === 'applied' || result.status === 'future_only';
+        if (replay && saved && current()) {
+          try {
+            recordEffortTaskConfirmation(ds.session, { messageId: message.messageId, inputHash: replay.inputHash,
+              effort: effort as NonNullable<import('../types.js').Session['reasoningEffort']>, cliId: cliId!,
+              nativeId, workerGeneration, sessionWorkerGeneration: generation });
+            sessionStore.updateSession(ds.session);
+            await replay.checkpoint(ds.session, current);
+            const restored = findEffortTaskConfirmation(ds.session, message.messageId);
+            if (restored?.terminal && restored.inputHash === replay.inputHash) {
+              if (restored.terminal === 'admitted') replay.complete();
+              break;
+            }
+          } catch (error) {
+            replay.retry('confirmed effort task checkpoint is not yet durable');
+            logger.error('[' + logTag + '] Effort task checkpoint failed: ' + String(error));
+            break;
+          }
+        }
         const replyKey = result.reason
           ? `cmd.effort.${result.reason}`
           : result.status === 'invalid' && !result.choices?.length
             ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
-        await sessionReply(rootId, t(replyKey, {
-          effort, choices: result.choices?.join(', ') ?? '',
-        }, loc));
+        try {
+          await sessionReply(rootId, t(replyKey, {
+            effort, choices: result.choices?.join(', ') ?? '',
+          }, loc));
+        } catch (error) {
+          if (!task) throw error;
+          logger.warn(`[${logTag}] Effort receipt reply failed; continuing attached task admission`);
+        }
+        if (task) {
+          let accepted = false;
+          if (saved && current() && deps.submitEffortTask) {
+            try { accepted = await deps.submitEffortTask(ds, message, task, deps.invocationReplyTarget); }
+            catch (error) {
+              // The callback has not confirmed acceptance; do not silently
+              // lose the original task when sender/resource preparation fails.
+              logger.error(`[${logTag}] Effort task callback failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+          if (!accepted) await sessionReply(rootId, t('cmd.effort.task_not_submitted', { task }, loc));
+        }
         break;
       }
       case '/cli': {

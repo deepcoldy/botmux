@@ -97,7 +97,8 @@ export interface GroupsSnapshot {
 
 export interface GroupFilters {
   q: string;
-  missingOnly: boolean;
+  /** 只看有这个 bot 在群里的群；空串 = 不限。 */
+  botId: string;
 }
 
 export interface FetchGroupsSnapshotOptions {

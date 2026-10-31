@@ -61,7 +61,7 @@
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。它就是「会话环境变量」Bot 层的「设置」，也可在 Dashboard「Bot 配置 → 高级 → 启动环境 → 会话环境变量」配置 |
 | `envUnset` | 在这个 bot 的会话里去掉的继承变量名列表，如 `["BYTECLOUD_AUTH_AS"]`（「会话环境变量」Bot 层的「去掉」，见下文）。botmux 保留变量与 `PATH` / `HOME` 不能去掉；同一个名字也写在 `env` 里时按 `env` 处理。下个新会话生效 |
 | `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
-| `codexCapacityRecovery` | **默认关闭**。仅对托管 Codex 飞书会话的明确模型容量错误自动续跑，设为 `true` 开启；可用 `/botconfig set codexCapacityRecovery on` / `off` 在线切换。每个任务最多追加两条恢复输入，可能保留在原生模型上下文中，关闭不会删除已有历史；不针对特定 provider，普通限流与额度耗尽不适用。 |
+| `codexCapacityRecovery` | **默认关闭**。仅对托管 Codex / Codex App 飞书会话的明确模型容量错误自动续跑，设为 `true` 开启；可用 `/botconfig set codexCapacityRecovery on` / `off` 在线切换。每个任务最多追加两条恢复输入，可能保留在原生模型上下文中，关闭不会删除已有历史；不针对特定 provider，普通限流与额度耗尽不适用。 |
 | `suppressDeliveredFinalFailureNotice` | **实验性、默认关闭**。设为 `true` 后，结构化转写会话（如 Codex）中同一轮、同一次执行尝试已带飞书回执送达显式 final（`botmux send --response-kind final` 或托管 final 卡）时，收尾阶段再遇到模型服务错误（如 527）只记日志与失败终态，不再补发「模型连接失败」通知。该开关信任已送达的 final，不比对模型事后续写的文本；进度 / 补充消息、未带回执或跨轮次的发送不受影响。缺省 / `false` 与此前行为一致。可用 `/botconfig set suppressDeliveredFinalFailureNotice on` / `off` 切换，下个 worker 启动生效 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
 | `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。可在 Dashboard 的“高级 → Codex App”中开关；设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome。对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`，详见下方说明 |
@@ -247,6 +247,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 | 字段 | 说明 |
 |------|------|
 | `replyCardMode` | `legacy`（默认）分别发送进度与答复；`unified` 将同一轮公开进度、工具记录、执行状态和最终答复更新到同一张卡。支持未启用文件沙盒的 Claude Code / Codex / Grok 普通飞书会话，从下一轮生效。Grok 展示公开旁白和工具事件，不转发原始思考或 hook 内容；其他入口沿用默认路径。独立终端状态卡由 `disableStreamingCard` 单独控制。 |
+| `replyCardShowTools` | 仅用于 `unified` 回复卡。缺省显示工具调用；设为 `false` 时隐藏工具节点、命令、结果与折叠区标题的工具次数，仍显示思考摘要与主动发送的进度。原生 CoT 气泡不受影响，`/cot show` 也不会显示被隐藏的工具。可在 Dashboard「Bot 默认 → 卡片设置」配置，或执行 `/botconfig set replyCardShowTools off`；`legacy` 模式下无效，切换回答模式保留该设置。 |
 | `brandLabel` | 卡片底部品牌文案（仅在最终回答与顶层广播卡片中展示）。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。另受机器级总开关 `dashboard.cardBrandLabel` 约束（Dashboard「设置 → 飞书卡片」，缺省开）：关闭后所有 Bot 一律不显示页脚签名，本字段在 Bot 配置页置灰。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `cardFooterExtension` | 在卡片用量段末尾追加自定义文本。`{"command": "<shell 命令>", "refreshSeconds": 60}`：daemon 在卡片渲染时按 bot 懒执行命令（缓存到刷新间隔才在后台跑，同一 bot 的会话共用结果），输出接在用量后面，显示位置跟随 `usageDisplay`。详见 [卡片用量段自定义扩展](/cards#卡片用量段自定义扩展) |

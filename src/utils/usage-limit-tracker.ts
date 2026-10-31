@@ -50,7 +50,8 @@ export interface UsageLimitTracker<S extends string = string> {
  * same banner I saw earlier?" comparison must therefore use this instead.
  */
 function bannerTextIdentity(state: CliUsageLimitState): string {
-  return `${state.kind}:${state.retryLabel}`;
+  const key = `${state.kind}:${state.retryLabel}`;
+  return state.relativeResetKey ? `${key}:${state.relativeResetKey}` : key;
 }
 
 /** Whether a bridge turn's terminal is positive evidence the CLI produced an

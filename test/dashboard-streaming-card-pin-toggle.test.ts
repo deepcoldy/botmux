@@ -626,16 +626,16 @@ describe('group manage streaming-card pin rows', () => {
         pollingResponse.resolve(jsonResponse({ chats: [polledChat], bots: [bot] }));
       });
       await waitForRender(() => {
-        expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByType('b').children.join(''))
+        expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByProps({ className: 'groups-row-title' }).children.join(''))
           .toBe('Polled Room');
       });
       expect(renderer.root.findAll(node => node.props.className === 'hint-warn'
         && node.children.join('').includes('later_manual_failed'))).toHaveLength(0);
     } finally {
       (globalThis as any).FormData = nativeFormData;
+      act(() => renderer.unmount());
       (globalThis as any).document = nativeDocument;
       (globalThis as any).window = nativeWindow;
-      act(() => renderer.unmount());
     }
   });
 
@@ -733,7 +733,7 @@ describe('group manage streaming-card pin rows', () => {
       await act(async () => {
         manualResponse.resolve(jsonResponse({ chats: [newestChat], bots: [bot] }));
       });
-      expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByType('b').children.join(''))
+      expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByProps({ className: 'groups-row-title' }).children.join(''))
         .toBe('Newest Room');
 
       await act(async () => {
@@ -742,13 +742,13 @@ describe('group manage streaming-card pin rows', () => {
       });
 
       expect(refreshCount).toBe(1);
-      expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByType('b').children.join(''))
+      expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByProps({ className: 'groups-row-title' }).children.join(''))
         .toBe('Newest Room');
     } finally {
       (globalThis as any).FormData = nativeFormData;
+      act(() => renderer.unmount());
       (globalThis as any).document = nativeDocument;
       (globalThis as any).window = nativeWindow;
-      act(() => renderer.unmount());
     }
   });
 
@@ -793,14 +793,14 @@ describe('group manage streaming-card pin rows', () => {
       newerResponse.resolve(jsonResponse({ chats: [newerChat], bots: [] }));
       await newerReload;
     });
-    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByType('b').children.join(''))
+    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByProps({ className: 'groups-row-title' }).children.join(''))
       .toBe('Newer Room');
 
     await act(async () => {
       olderResponse.resolve(jsonResponse({ chats: [olderChat], bots: [] }));
       await olderReload;
     });
-    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByType('b').children.join(''))
+    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByProps({ className: 'groups-row-title' }).children.join(''))
       .toBe('Newer Room');
 
     act(() => renderer.unmount());
@@ -839,7 +839,7 @@ describe('group manage streaming-card pin rows', () => {
     await waitForRender(() => {
       expect(renderer.root.findAllByProps({ className: 'manage-chat' })).toHaveLength(1);
     });
-    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByType('b').children.join(''))
+    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByProps({ className: 'groups-row-title' }).children.join(''))
       .toBe('Initial Room');
 
     act(() => { renderer.root.findByProps({ id: 'g-refresh' }).props.onClick(); });
@@ -856,7 +856,7 @@ describe('group manage streaming-card pin rows', () => {
     });
 
     await waitForRender(() => {
-      expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByType('b').children.join(''))
+      expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByProps({ className: 'groups-row-title' }).children.join(''))
         .toBe('Older Page Room');
     });
     await expect(fetchGroupsSnapshot()).resolves.toEqual({ chats: [newestSharedChat], bots: [] });

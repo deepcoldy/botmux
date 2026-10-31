@@ -88,6 +88,11 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  // Valid Codex effort headers may include a literal task body on later lines.
+  (input, legacy, next) => ['codex', 'codex-app'].includes(input.cliId ?? '')
+    && /^\s*\/effort\s+(?:low|medium|high|xhigh|max|ultra)(?:\s|$)/i.test(input.text)
+    && legacy.kind === 'forward' && legacy.reason === 'discussion'
+    && next.kind === 'daemon' && next.cmd === '/effort' && next.sessionPolicy === 'existing_only',
   // Native Codex /effort now drives the model menu; other CLIs still pass through.
   (input, legacy, next) => input.cliId === 'codex'
     && (legacy.kind === 'passthrough' || (legacy.kind === 'forward' && legacy.reason === 'unknown_slash'))

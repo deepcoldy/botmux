@@ -1,18 +1,21 @@
 import { GroupIdleCloseRow } from './group-idle-close.js';
 import { GroupCardModeRow } from './group-card-mode.js';
-import { GroupReplyModeSection } from './group-reply-mode.js';
+import { GroupReplyModeRow, useGroupTopology } from './group-reply-mode.js';
 import { GroupSerialInputRow } from './group-serial-input.js';
 import { GroupDefaultModelsRow } from './group-default-models.js';
 import { describeCloseResidual } from '../../core/close-residual.js';
 import {
+  createContext,
   memo,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
   type FormEvent,
+  type MouseEvent,
   type ReactNode,
 } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
@@ -28,7 +31,7 @@ import {
 } from './groups-api.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { MemberAccessSection } from './member-access-section.js';
-import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
+import { botAvatarHtml, botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
 import { confirm } from './confirm-modal.js';
@@ -38,6 +41,7 @@ import { BotMultiSelect } from './bot-multi-select.js';
 import {
   CreateActionButton,
   DropdownMenu,
+  Html,
   LoadingState,
   OverviewList,
   OverviewListItem,
@@ -45,58 +49,48 @@ import {
   OverviewListTail,
   RefreshIconButton,
 } from './dashboard-components.js';
-import { GroupProfileStatus } from './group-profile-status.js';
-import type { RoleProfileSummaryLike } from './role-profile-match.js';
+import { BOT_SETTING_COLUMNS, summarizeBotSettings } from './group-settings-summary.js';
 import {
   allExpectedInChat,
   availableBotsForPicker,
   botNameById,
   chatHasAddableBots,
-  collectGroupProfileEntries,
+  copyChatRoles,
   createAddBotsReconciler,
   createReconciledChatCommitter,
   emptyGroupsSnapshot,
   fetchGroupsSnapshot,
-  fetchRoleProfileSummaries,
   filterGroupChats,
+  groupCloneTemplate,
+  inChatMembers,
   injectOptimisticChat,
-  isValidProfileId,
-  loadGroupRoleProfileContext,
   markBotsInChat,
   paginateGroupRows,
   planAddBotsFollowup,
-  roleKey,
-  roleProfileBootstrapStatus,
   stewardJoinNotes,
   summarizeAddBotsResult,
-  suggestRoleProfileIdFromChat,
   type AddBotsSummary,
+  type CopyChatRolesResult,
   type GroupBot,
   type GroupChat,
+  type GroupCloneTemplate,
   type GroupFilters,
   type GroupsSnapshot,
-  type RoleProfileContext,
-  type SaveProfileEntry,
 } from './groups.js';
 
 type Translator = ReturnType<typeof useT>;
 
+type ManageTab = 'overview' | 'bots' | 'collab' | 'access' | 'danger';
+
 type DialogState =
-  | { type: 'create'; roleProfiles: RoleProfileSummaryLike[] }
+  | { type: 'create'; template?: GroupCloneTemplate }
   | { type: 'add-bots'; chat: GroupChat }
-  | { type: 'save-profile'; chat: GroupChat; suggestedProfileId: string }
-  | { type: 'manage'; chat: GroupChat };
+  | { type: 'manage'; chat: GroupChat; botId?: string };
 
 type DialogErrorState = { title: string; reason: unknown };
 
-function emptyRoleContext(): RoleProfileContext {
-  return {
-    profiles: [],
-    entriesById: new Map(),
-    groupRoleContentByBot: new Map(),
-    loaded: false,
-  };
-}
+/** 列表行里最多直接列出的在群 bot 数，其余折成「+N」。 */
+const ROW_BOT_CHIP_LIMIT = 8;
 
 function orbVars(name: string): CSSProperties {
   const style: Record<string, string> = {};
@@ -107,6 +101,10 @@ function orbVars(name: string): CSSProperties {
     style[part.slice(0, i)] = part.slice(i + 1);
   }
   return style as CSSProperties;
+}
+
+function chatOpenLink(chatId: string): string {
+  return `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
 }
 
 function ChatAvatar(props: { chat: GroupChat }) {
@@ -135,6 +133,30 @@ function ChatAvatar(props: { chat: GroupChat }) {
         />
       ) : null}
     </span>
+  );
+}
+
+/**
+ * 群矩阵里每个群的 memberBots 只带名字和设置，头像 URL 只在顶层 roster（snapshot.bots）上。
+ * 页面把 roster 的头像按 appId 放进 context，群行 / 管理抽屉里的 bot 头像都从这里取。
+ */
+const BotAvatarUrlContext = createContext<ReadonlyMap<string, string>>(new Map());
+
+function botAvatarUrlMap(bots: GroupBot[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const bot of bots) if (bot.botAvatarUrl) map.set(bot.larkAppId, bot.botAvatarUrl);
+  return map;
+}
+
+function BotAvatar(props: { bot: GroupBot }) {
+  const rosterAvatars = useContext(BotAvatarUrlContext);
+  return (
+    <Html html={botAvatarHtml({
+      name: props.bot.botName,
+      larkAppId: props.bot.larkAppId,
+      avatarUrl: props.bot.botAvatarUrl ?? rosterAvatars.get(props.bot.larkAppId),
+      size: 'sm',
+    })} />
   );
 }
 
@@ -197,44 +219,57 @@ function AddBotsResult(props: { summary: AddBotsSummary; bots: GroupBot[] }) {
   );
 }
 
-function groupBotStatus(member: GroupChat['memberBots'][number] | undefined): 'in' | 'out' | 'error' | 'unknown' {
-  if (!member) return 'unknown';
-  if (member.error) return 'error';
-  return member.inChat ? 'in' : 'out';
-}
-
-function groupBotStatusLabel(status: ReturnType<typeof groupBotStatus>, tr: Translator): string {
-  switch (status) {
-    case 'in': return tr('groups.botStatusIn');
-    case 'out': return tr('groups.botStatusOut');
-    case 'error': return tr('groups.botStatusError');
-    case 'unknown':
-    default:
-      return tr('groups.botStatusUnknown');
+/**
+ * 列表行只列「在群」的 bot：几十个 roster bot 逐个标「缺失」信息量为零，
+ * 真正要回答的是「这个群里有谁」。点某个 bot 直接打开它在本群的设置。
+ */
+function GroupMemberChips(props: {
+  chat: GroupChat;
+  tr: Translator;
+  onOpenBot(botId: string): void;
+}) {
+  const { chat, tr } = props;
+  const members = inChatMembers(chat);
+  const errors = (chat.memberBots ?? []).filter(member => member.error);
+  if (members.length === 0 && errors.length === 0) {
+    return <span className="groups-row-empty-bots">{tr('groups.noBotsInChat')}</span>;
   }
-}
-
-function GroupBotCoverage(props: { chat: GroupChat; bots: GroupBot[]; tr: Translator }) {
-  const members = new Map((props.chat.memberBots ?? []).map(member => [member.larkAppId, member]));
+  const shown = members.slice(0, ROW_BOT_CHIP_LIMIT);
+  const hidden = members.slice(ROW_BOT_CHIP_LIMIT);
   return (
-    <div className="groups-bot-strip" aria-label={props.tr('groups.botCoverage')}>
-      {props.bots.map(bot => {
-        const member = members.get(bot.larkAppId);
-        const status = groupBotStatus(member);
-        const label = groupBotStatusLabel(status, props.tr);
-        const name = bot.botName ?? bot.larkAppId;
+    <div className="groups-row-bots" aria-label={tr('groups.botCount', { n: members.length })}>
+      {shown.map(member => {
+        const name = member.botName ?? member.larkAppId;
         return (
-          <span
-            className={`groups-bot-pill groups-bot-${status}`}
-            title={`${name}: ${label}${member?.error ? ` (${String(member.error)})` : ''}`}
-            key={bot.larkAppId}
+          <button
+            type="button"
+            className="groups-bot-chip"
+            key={member.larkAppId}
+            title={tr('groups.openBotSettings', { bot: name })}
+            data-bot={member.larkAppId}
+            onClick={() => props.onOpenBot(member.larkAppId)}
           >
-            <i aria-hidden="true" />
-            <span className="groups-bot-name">{name}</span>
-            <span className="groups-bot-state">{label}</span>
-          </span>
+            <BotAvatar bot={member} />
+            <span>{name}</span>
+          </button>
         );
       })}
+      {hidden.length ? (
+        <span
+          className="groups-bot-chip groups-bot-chip-more"
+          title={hidden.map(member => member.botName ?? member.larkAppId).join('\n')}
+        >
+          {tr('groups.moreBots', { n: hidden.length })}
+        </span>
+      ) : null}
+      {errors.length ? (
+        <span
+          className="groups-bot-chip groups-bot-chip-error"
+          title={errors.map(member => `${member.botName ?? member.larkAppId}: ${String(member.error)}`).join('\n')}
+        >
+          {tr('groups.memberErrors', { n: errors.length })}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -242,15 +277,13 @@ function GroupBotCoverage(props: { chat: GroupChat; bots: GroupBot[]; tr: Transl
 export const GroupListRow = memo(function GroupListRow(props: {
   chat: GroupChat;
   bots: GroupBot[];
-  roleContext: RoleProfileContext;
   tr: Translator;
   onAddBots(chat: GroupChat): void;
-  onSaveProfile(chat: GroupChat): void;
-  onManage(chat: GroupChat): void;
+  onClone(chat: GroupChat): void;
+  onManage(chat: GroupChat, botId?: string): void;
 }) {
   const { chat, tr } = props;
-  const members = chat.memberBots ?? [];
-  const inCount = members.filter(member => member.inChat).length;
+  const inCount = inChatMembers(chat).length;
   // Grey out "添加 bot" when every roster bot is already in this chat — there is
   // nothing to add, so opening the dialog would only show an empty picker. Derived
   // from the snapshot, so it re-enables automatically once membership/roster shifts.
@@ -261,87 +294,96 @@ export const GroupListRow = memo(function GroupListRow(props: {
   const disabledTitle = props.bots.length === 0
     ? tr('groups.noBotsOnline')
     : tr('groups.addBotsAllInChat');
+  // 整行可点进管理；行内按钮/链接各有自己的动作，不冒泡成「打开管理」。
+  const onRowClick = (event: MouseEvent<HTMLLIElement>) => {
+    const target = event.target as Element | null;
+    if (target?.closest?.('button, a, input, label')) return;
+    props.onManage(chat);
+  };
   return (
-    <OverviewListItem kind="group" className="groups-list-row" data-chat={chat.chatId}>
+    <OverviewListItem kind="group" className="groups-list-row" data-chat={chat.chatId} onClick={onRowClick}>
       <ChatAvatar chat={chat} />
       <OverviewListMain>
         <div className="groups-row-head">
-          <b>{chat.name ?? chat.chatId}</b>
-          <span className="groups-row-meta">
-            {chat.collaborationMode === 'project' ? (
-              <span className="groups-row-tag groups-row-project-tag">{tr('groups.projectModeBadge')}</span>
-            ) : null}
-            <span className="groups-row-tag"><code>{chat.chatId}</code></span>
-            {chat.ownerId ? (
-              <span className="groups-row-tag groups-row-owner-tag">
-                <span>{tr('groups.owner')}</span>
-                <code>{chat.ownerId}</code>
-              </span>
-            ) : null}
-          </span>
-        </div>
-        <GroupProfileStatus
-          className="g-profile-status"
-          memberBots={chat.memberBots ?? []}
-          profiles={props.roleContext.profiles}
-          entriesByProfile={props.roleContext.entriesById}
-          loaded={props.roleContext.loaded}
-          roleOf={larkAppId => props.roleContext.groupRoleContentByBot.get(roleKey(larkAppId, chat.chatId))}
-          tr={tr}
-        />
-      </OverviewListMain>
-      <span className="groups-row-count">{tr('groups.memberSummary', { count: inCount, total: props.bots.length })}</span>
-      <div className="groups-row-lower">
-        <GroupBotCoverage chat={chat} bots={props.bots} tr={tr} />
-        <OverviewListTail>
-          <CreateActionButton
-            className="add-bots"
-            onClick={() => props.onAddBots(chat)}
-            disabled={!hasAddableBots}
-            title={hasAddableBots ? undefined : disabledTitle}
-          >{tr('groups.addBots')}</CreateActionButton>
-          <button
-            className="save-profile"
-            type="button"
-            onClick={() => props.onSaveProfile(chat)}
-          >
-            {tr('groups.saveAsProfile')}
+          <button type="button" className="groups-row-title" onClick={() => props.onManage(chat)}>
+            {chat.name ?? chat.chatId}
           </button>
-          <button className="manage-chat" type="button" onClick={() => props.onManage(chat)}>{tr('groups.manage')}</button>
-        </OverviewListTail>
-      </div>
+          {chat.collaborationMode === 'project' ? (
+            <span className="groups-row-tag groups-row-project-tag">{tr('groups.projectModeBadge')}</span>
+          ) : null}
+          <span className="groups-row-count">{tr('groups.botCount', { n: inCount })}</span>
+        </div>
+        <GroupMemberChips chat={chat} tr={tr} onOpenBot={botId => props.onManage(chat, botId)} />
+      </OverviewListMain>
+      <OverviewListTail>
+        <CreateActionButton
+          className="add-bots"
+          onClick={() => props.onAddBots(chat)}
+          disabled={!hasAddableBots}
+          title={hasAddableBots ? undefined : disabledTitle}
+        >{tr('groups.addBots')}</CreateActionButton>
+        <button
+          className="clone-chat"
+          type="button"
+          title={tr('groups.cloneHint')}
+          onClick={() => props.onClone(chat)}
+        >
+          {tr('groups.clone')}
+        </button>
+        <button className="manage-chat" type="button" onClick={() => props.onManage(chat)}>{tr('groups.manage')}</button>
+      </OverviewListTail>
     </OverviewListItem>
   );
 });
 
-function CreateDialog(props: {
+function RoleCopyNote(props: { result: CopyChatRolesResult; bots: GroupBot[]; tr: Translator }) {
+  const { result, tr } = props;
+  if (result.failed.length === 0) {
+    return result.copied.length
+      ? <p className="hint-ok">{tr('groups.cloneRolesDone', { n: result.copied.length })}</p>
+      : null;
+  }
+  return (
+    <p className="hint-warn">
+      {tr('groups.cloneRolesFailed', { n: result.failed.length, ok: result.copied.length })}
+      {result.failed.map(item => (
+        <span key={item.larkAppId}>
+          <br /><code>{botNameById(item.larkAppId, props.bots)}</code>: {item.error}
+        </span>
+      ))}
+    </p>
+  );
+}
+
+export function CreateDialog(props: {
   bots: GroupBot[];
-  roleProfiles: RoleProfileSummaryLike[];
+  template?: GroupCloneTemplate;
   tr: Translator;
   onClose(): void;
   onCreated(resp: any, selectedIds: string[], name: string): void;
   setTimer(fn: () => void, ms: number): number;
 }) {
-  const { tr } = props;
+  const { tr, template } = props;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [success, setSuccess] = useState<any | null>(null);
   const [copied, setCopied] = useState(false);
-  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
-  const [roleProfileId, setRoleProfileId] = useState('');
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(() => new Set(template?.botIds ?? []));
+  const [copyRoles, setCopyRoles] = useState(true);
   const feed = useFeedGroups({
     onAuthError: (kind, reason) => setError({
       title: kind === 'open' ? '无法发起标签授权' : '标签授权失败',
       reason,
     }),
   });
+  // 只复制仍被选中的 bot 的群角色；用户在弹窗里取消勾选的 bot 不再写角色。
+  const roleBotIds = (template?.roleBotIds ?? []).filter(id => selectedBots.has(id));
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
     const fd = new FormData(ev.currentTarget);
     const name = String(fd.get('name') ?? '').trim();
     const bindWorkingDir = String(fd.get('bindWorkingDir') ?? '').trim();
-    const roleProfileId = String(fd.get('roleProfileId') ?? '').trim();
     const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再创建群聊。' });
@@ -358,7 +400,6 @@ function CreateDialog(props: {
           name: name || undefined,
           larkAppIds: ids,
           bindWorkingDir: bindWorkingDir || undefined,
-          roleProfileId: roleProfileId || undefined,
           feedGroupId: feed.selectedId || undefined,
           newFeedGroupName: feed.newName || undefined,
           feedGroupAppId: (feed.selectedId || feed.newName) ? feed.appId : undefined,
@@ -366,8 +407,17 @@ function CreateDialog(props: {
       });
       const respBody = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
       if (respBody.ok && respBody.chatId) {
-        setSuccess(respBody);
         props.onCreated(respBody, ids, name);
+        let roleCopy: CopyChatRolesResult | null = null;
+        if (template && copyRoles && roleBotIds.length > 0) {
+          const invalid = new Set<string>(Array.isArray(respBody.invalidBotIds) ? respBody.invalidBotIds : []);
+          roleCopy = await copyChatRoles(
+            template.sourceChatId,
+            String(respBody.chatId),
+            roleBotIds.filter(id => !invalid.has(id)),
+          );
+        }
+        setSuccess({ ...respBody, roleCopy });
       } else {
         setError({ title: '创建失败', reason: respBody.error ?? `HTTP ${r.status}` });
         setSubmitting(false);
@@ -382,18 +432,13 @@ function CreateDialog(props: {
     const chatId = String(success.chatId);
     const appLink = typeof success.shareLink === 'string' && success.shareLink
       ? success.shareLink
-      : `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+      : chatOpenLink(chatId);
     const invalidBots = (success.invalidBotIds ?? []) as string[];
     const invalidUsers = (success.invalidUserIds ?? []) as string[];
     const binds = Array.isArray(success.oncallBindings) ? success.oncallBindings as any[] : [];
     const stewardNotes = stewardJoinNotes(success.stewardJoins, props.bots);
     const bindOk = binds.filter(b => b?.ok).length;
     const bindFailed = binds.filter(b => !b?.ok);
-    const profileStatus = roleProfileBootstrapStatus(
-      typeof success.roleProfileId === 'string' ? success.roleProfileId : '',
-      success.roleProfileBootstrapMessageId,
-      success.roleProfileBootstrapError,
-    );
 
     return (
       <article className="g-create-dialog g-create-success">
@@ -432,7 +477,7 @@ function CreateDialog(props: {
             </p>
           )
         ) : null}
-        {profileStatus ? <p className={profileStatus.kind === 'ok' ? 'hint-ok' : 'hint-warn'}>{profileStatus.text}</p> : null}
+        {success.roleCopy ? <RoleCopyNote result={success.roleCopy} bots={props.bots} tr={tr} /> : null}
         {stewardNotes.map(note => <p key={note.larkAppId} className={note.kind === 'ok' ? 'hint-ok' : 'hint-warn'}>{note.text}</p>)}
         {invalidBots.length || invalidUsers.length ? (
           <ul>
@@ -451,8 +496,8 @@ function CreateDialog(props: {
   return (
     <article className="g-create-dialog">
       <header className="g-create-head">
-        <h3>{tr('groups.createTitle')}</h3>
-        <p>{tr('groups.createHelp')}</p>
+        <h3>{template ? tr('groups.cloneTitle', { name: template.sourceName }) : tr('groups.createTitle')}</h3>
+        <p>{template ? tr('groups.cloneHelp') : tr('groups.createHelp')}</p>
       </header>
       <form id="g-createform" className="g-create-form" onSubmit={ev => void submit(ev)}>
         <fieldset className="g-modal-field g-create-bots">
@@ -474,29 +519,42 @@ function CreateDialog(props: {
         <div className="g-create-fields">
           <fieldset className="g-modal-field">
             <legend>{tr('groups.name')}</legend>
-            <input type="text" name="name" placeholder={tr('groups.namePlaceholder')} maxLength={60} />
+            <input
+              type="text"
+              name="name"
+              placeholder={tr('groups.namePlaceholder')}
+              defaultValue={template ? tr('groups.cloneName', { name: template.sourceName }).slice(0, 60) : undefined}
+              maxLength={60}
+            />
           </fieldset>
           <fieldset className="g-modal-field">
             <legend>{tr('groups.bindDir')}</legend>
-            <input type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/botmux" />
+            <input
+              type="text"
+              name="bindWorkingDir"
+              placeholder="e.g. ~/projects/botmux"
+              defaultValue={template?.workingDir || undefined}
+            />
             <small>{tr('groups.bindDirHelp')}</small>
           </fieldset>
-          <fieldset className="g-modal-field g-profile-field">
-            <legend>{tr('groups.roleProfile')}</legend>
-            <input type="hidden" name="roleProfileId" value={roleProfileId} />
-            <DropdownMenu
-              className="g-profile-menu"
-              ariaLabel={tr('groups.roleProfile')}
-              label={roleProfileId || tr('groups.roleProfileNone')}
-              value={roleProfileId}
-              options={[
-                { value: '', label: tr('groups.roleProfileNone') },
-                ...props.roleProfiles.map(profile => ({ value: profile.profileId, label: profile.profileId })),
-              ]}
-              onChange={setRoleProfileId}
-            />
-            <small>{tr('groups.roleProfileHelp')}</small>
-          </fieldset>
+          {template && template.roleBotIds.length > 0 ? (
+            <fieldset className="g-modal-field g-clone-roles-field">
+              <legend>{tr('groups.cloneRolesLegend')}</legend>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  name="copyRoles"
+                  checked={copyRoles && roleBotIds.length > 0}
+                  disabled={roleBotIds.length === 0}
+                  onChange={ev => setCopyRoles(ev.currentTarget.checked)}
+                />
+                <span className="checkbox-row-main">
+                  <strong>{tr('groups.cloneRoles', { n: roleBotIds.length })}</strong>
+                  <small>{tr('groups.cloneRolesHelp')}</small>
+                </span>
+              </label>
+            </fieldset>
+          ) : null}
           <fieldset className="g-modal-field g-feed-group-field">
             <legend>飞书标签（可选）</legend>
             <input type="hidden" name="feedGroupId" value={feed.selectedId} />
@@ -671,261 +729,11 @@ export function AddBotsDialog(props: {
   );
 }
 
-function SaveProfileDialog(props: {
-  chat: GroupChat;
-  suggestedProfileId: string;
-  tr: Translator;
-  onClose(): void;
-  onRefreshRoleContext(): Promise<void>;
-  setTimer(fn: () => void, ms: number): number;
-}) {
-  const { tr } = props;
-  const [entries, setEntries] = useState<SaveProfileEntry[]>([]);
-  const [profiles, setProfiles] = useState<RoleProfileSummaryLike[]>([]);
-  const [loadingSnapshot, setLoadingSnapshot] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const sortedProfiles = useMemo(
-    () => [...profiles].sort((a, b) => a.profileId.localeCompare(b.profileId)),
-    [profiles],
-  );
-  const hasExistingProfiles = sortedProfiles.length > 0;
-  const emptyCount = entries.filter(entry => entry.status === 'empty').length;
-  const failedCount = entries.filter(entry => entry.status === 'error').length;
-  const canSubmitSnapshot = !loadingSnapshot && !loadError && entries.length > 0 && failedCount === 0;
-  const [selectedMode, setSelectedMode] = useState<'new' | 'overwrite'>('new');
-  const [profileId, setProfileId] = useState(props.suggestedProfileId);
-  const [selectedExistingProfileId, setSelectedExistingProfileId] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [status, setStatus] = useState<{ text: string; className?: 'ok' | 'error' } | null>(null);
-
-  const currentProfileId = selectedMode === 'overwrite' ? selectedExistingProfileId : profileId.trim();
-  const submitText = selectedMode === 'overwrite'
-    ? tr('groups.saveProfileOverwriteSubmit')
-    : tr('groups.saveProfileSubmit');
-  const snapshotSummary = loadError
-    ? loadError
-    : loadingSnapshot
-      ? tr('groups.saveProfilePreparing')
-      : failedCount
-        ? tr('groups.saveProfileFailedLoadSummary', { count: failedCount })
-        : entries.length
-          ? emptyCount
-            ? tr('groups.saveProfileEntrySummaryWithEmpty', { count: entries.length, emptyCount })
-            : tr('groups.saveProfileEntrySummary', { count: entries.length })
-          : tr('groups.saveProfileNoRoles');
-
-  useEffect(() => {
-    let alive = true;
-    setLoadingSnapshot(true);
-    setLoadError(null);
-    setStatus(null);
-    void (async () => {
-      try {
-        const [nextEntries, nextProfiles] = await Promise.all([
-          collectGroupProfileEntries(props.chat),
-          fetchRoleProfileSummaries().catch(() => [] as RoleProfileSummaryLike[]),
-        ]);
-        if (!alive) return;
-        const sortedNextProfiles = [...nextProfiles].sort((a, b) => a.profileId.localeCompare(b.profileId));
-        setEntries(nextEntries);
-        setProfiles(nextProfiles);
-        setSelectedExistingProfileId(cur =>
-          sortedNextProfiles.some(profile => profile.profileId === cur)
-            ? cur
-            : sortedNextProfiles[0]?.profileId ?? '',
-        );
-      } catch (err) {
-        if (!alive) return;
-        setEntries([]);
-        setProfiles([]);
-        setSelectedExistingProfileId('');
-        setLoadError(err instanceof Error ? err.message : String(err));
-      } finally {
-        if (alive) setLoadingSnapshot(false);
-      }
-    })();
-    return () => { alive = false; };
-  }, [props.chat]);
-
-  async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
-    ev.preventDefault();
-    if (!canSubmitSnapshot) return;
-    if (!isValidProfileId(currentProfileId)) {
-      setStatus({ text: tr('groups.saveProfileInvalid'), className: 'error' });
-      return;
-    }
-
-    setSubmitting(true);
-    setStatus({ text: tr('groups.saveProfileSaving') });
-    try {
-      const results = await Promise.all(entries.map(async entry => {
-        const r = await fetch(`/api/role-profiles/${encodeURIComponent(currentProfileId)}/${encodeURIComponent(entry.larkAppId)}`, {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ content: entry.content, allowEmpty: true }),
-        });
-        return r.ok;
-      }));
-      const saved = results.filter(Boolean).length;
-      if (saved !== entries.length) {
-        setStatus({
-          text: tr('groups.saveProfileFailed', { saved, total: entries.length }),
-          className: 'error',
-        });
-        setSubmitting(false);
-        return;
-      }
-      setStatus({
-        text: tr('groups.saveProfileDone', { name: currentProfileId, count: saved }),
-        className: 'ok',
-      });
-      await props.onRefreshRoleContext();
-      props.setTimer(props.onClose, 700);
-    } catch (err) {
-      setStatus({ text: String(err), className: 'error' });
-      setSubmitting(false);
-    }
-  }
-
-  function pickMode(mode: 'new' | 'overwrite'): void {
-    if (mode === 'overwrite' && !hasExistingProfiles) return;
-    setSelectedMode(mode);
-    setStatus(null);
-  }
-
-  return (
-    <article className="g-save-profile-dialog">
-      <header>
-        <h3>{tr('groups.saveProfileTitle')}</h3>
-        <p>{tr('groups.saveProfileIntro', {
-          name: props.chat.name ?? props.chat.chatId,
-          count: loadingSnapshot ? '-' : entries.length,
-        })}</p>
-      </header>
-      <form id="g-save-profile-form" onSubmit={ev => void submit(ev)}>
-        <section className="g-save-profile-panel">
-          <div className="g-save-profile-section-head">
-            <span>{tr('groups.saveProfileScope')}</span>
-            <small>{tr('groups.saveProfileScopeHelp')}</small>
-          </div>
-          <div className="g-save-profile-stats">
-            <span>{tr('groups.saveProfileBotCount')} <strong>{loadingSnapshot ? '-' : entries.length}</strong></span>
-            {failedCount ? <span className="warn">{tr('groups.saveProfileLoadFailed')} <strong>{failedCount}</strong></span> : null}
-          </div>
-          <div className="g-save-profile-entry-list">
-            {loadingSnapshot ? (
-              <div className="g-save-profile-loading"><LoadingState label={tr('common.loading')} /></div>
-            ) : loadError ? (
-              <div className="g-save-profile-empty">{loadError}</div>
-            ) : entries.length ? entries.map(entry => (
-              <div className={`g-save-profile-entry ${entry.status === 'error' ? 'error' : ''}`} key={entry.larkAppId}>
-                <div>
-                  <strong>{entry.botName ?? entry.larkAppId}</strong>
-                  <code>{entry.larkAppId}</code>
-                </div>
-                <span className={`g-save-profile-entry-status ${entry.status === 'error' ? 'error' : 'ok'}`}>
-                  {tr(entry.status === 'error' ? 'groups.saveProfileStatus.error' : 'groups.saveProfileStatus.entry')}
-                </span>
-              </div>
-            )) : <div className="g-save-profile-empty">{tr('groups.saveProfileNoRoles')}</div>}
-          </div>
-        </section>
-
-        <div className="form-row">
-          <span>{tr('groups.saveProfileMode')}</span>
-          <div className="g-save-profile-switch" role="tablist" aria-label={tr('groups.saveProfileMode')}>
-            <button
-              type="button"
-              className={selectedMode === 'new' ? 'active' : ''}
-              data-save-profile-mode="new"
-              aria-pressed={selectedMode === 'new'}
-              onClick={() => pickMode('new')}
-            >
-              {tr('groups.saveProfileNew')}
-            </button>
-            <button
-              type="button"
-              className={selectedMode === 'overwrite' ? 'active' : ''}
-              data-save-profile-mode="overwrite"
-              aria-pressed={selectedMode === 'overwrite'}
-              disabled={!hasExistingProfiles}
-              onClick={() => pickMode('overwrite')}
-            >
-              {tr('groups.saveProfileOverwrite')}
-            </button>
-          </div>
-        </div>
-        <label className="form-row" data-profile-mode-row="new" hidden={selectedMode !== 'new'}>
-          <span>{tr('groups.saveProfileIdLabel')}</span>
-          <input
-            type="text"
-            name="profileId"
-            value={profileId}
-            maxLength={64}
-            autoComplete="off"
-            onChange={ev => {
-              setProfileId(ev.currentTarget.value);
-              setStatus(null);
-            }}
-          />
-          <small>{tr('groups.saveProfileInvalid')}</small>
-        </label>
-        <div className="form-row" data-profile-mode-row="overwrite" hidden={selectedMode !== 'overwrite'}>
-          <span>{tr('groups.saveProfileExistingLabel')}</span>
-          {hasExistingProfiles ? (
-            <div className="g-save-profile-picker">
-              {sortedProfiles.map(profile => (
-                <button
-                  type="button"
-                  className={`g-save-profile-pick ${profile.profileId === selectedExistingProfileId ? 'selected' : ''}`}
-                  data-profile-id={profile.profileId}
-                  aria-pressed={profile.profileId === selectedExistingProfileId}
-                  key={profile.profileId}
-                  onClick={() => {
-                    setSelectedExistingProfileId(profile.profileId);
-                    setSelectedMode('overwrite');
-                    setStatus(null);
-                  }}
-                >
-                  <span>{profile.profileId}</span>
-                  <small>{tr('groups.saveProfileExistingMeta', { count: profile.entryCount ?? 0 })}</small>
-                </button>
-              ))}
-            </div>
-          ) : <div className="g-save-profile-summary warn">{tr('groups.saveProfileExistingEmpty')}</div>}
-          <small>{tr('groups.saveProfileOverwriteHelp')}</small>
-        </div>
-        <div className="g-save-profile-target">
-          <span>{tr('groups.saveProfileTarget')}</span>
-          <code data-save-profile-target>{currentProfileId || '-'}</code>
-          <small data-save-profile-target-mode>
-            {selectedMode === 'overwrite' ? tr('groups.saveProfileTargetOverwrite') : tr('groups.saveProfileTargetNew')}
-          </small>
-        </div>
-        <div className={`g-save-profile-summary ${canSubmitSnapshot ? '' : 'warn'}`}>
-          {snapshotSummary}
-        </div>
-        <div className={`g-save-profile-status ${status?.className ?? ''}`} data-save-profile-status>
-          {status?.text ?? ''}
-        </div>
-        <div className="actions">
-          <button type="button" id="g-save-profile-cancel" onClick={props.onClose}>{tr('groups.cancel')}</button>
-          <button
-            type="submit"
-            className="primary"
-            disabled={!canSubmitSnapshot || submitting || (selectedMode === 'overwrite' && !selectedExistingProfileId)}
-          >
-            {submitting ? tr('groups.saveProfileSaving') : submitText}
-          </button>
-        </div>
-      </form>
-    </article>
-  );
-}
-
 function OncallRow(props: {
   chat: GroupChat;
   member: GroupBot & { oncallChat?: { workingDir?: string } | null };
+  /** 可见标题；缺省显示 bot 名 + appId。 */
+  label?: string;
   disabled?: boolean;
   tr: Translator;
   onSaved(): Promise<GroupsSnapshot>;
@@ -1018,8 +826,10 @@ function OncallRow(props: {
             if (ev.currentTarget.checked) window.setTimeout(() => inputRef.current?.focus(), 0);
           }}
         />
-        <strong>{member.botName ?? member.larkAppId}</strong>
-        <small>({member.larkAppId})</small>
+        {props.label ? <strong>{props.label}</strong> : <>
+          <strong>{member.botName ?? member.larkAppId}</strong>
+          <small>({member.larkAppId})</small>
+        </>}
       </label>
       <div className="oncall-row-body">
         <input
@@ -1050,6 +860,8 @@ function responseErrorText(res: { status: number; body: any }): string {
 function GroupPinStreamingCardRow(props: {
   chat: GroupChat;
   member: GroupChat['memberBots'][number];
+  /** 按 bot 分栏展示时不再重复 bot 名头部。 */
+  hideHead?: boolean;
   disabled?: boolean;
   tr: Translator;
   onSaved(): Promise<GroupsSnapshot>;
@@ -1127,10 +939,12 @@ function GroupPinStreamingCardRow(props: {
 
   return (
     <div className="g-pin-row" data-bot={member.larkAppId}>
-      <div className="g-pin-row-head">
-        <strong>{member.botName ?? member.larkAppId}</strong>
-        <small>{member.larkAppId}</small>
-      </div>
+      {props.hideHead ? null : (
+        <div className="g-pin-row-head">
+          <strong>{member.botName ?? member.larkAppId}</strong>
+          <small>{member.larkAppId}</small>
+        </div>
+      )}
       <StreamingCardPinToggle
         scope="group-manage"
         checked={checked}
@@ -1479,17 +1293,181 @@ export function ProjectGroupModeSection(props: {
   );
 }
 
+const MANAGE_TABS: Array<{ id: ManageTab; labelKey: string }> = [
+  { id: 'overview', labelKey: 'groups.tabOverview' },
+  { id: 'bots', labelKey: 'groups.tabBots' },
+  { id: 'collab', labelKey: 'groups.tabCollab' },
+  { id: 'access', labelKey: 'groups.tabAccess' },
+  { id: 'danger', labelKey: 'groups.tabDanger' },
+];
+
+const SETTING_COLUMN_LABEL: Record<typeof BOT_SETTING_COLUMNS[number], string> = {
+  role: 'groups.col.role',
+  replyMode: 'groups.col.replyMode',
+  oncall: 'groups.col.oncall',
+  model: 'groups.col.model',
+  serialInput: 'groups.col.serialInput',
+  idleClose: 'groups.col.idleClose',
+  cardMode: 'groups.col.cardMode',
+  pin: 'groups.col.pin',
+};
+
+/** 一项设置的标题 + 说明 + 控件。说明很长，默认收成两行，悬停看全文。 */
+function SettingBlock(props: { title: string; help?: string; children: ReactNode; attrs?: Record<string, string> }) {
+  return (
+    <section className="g-setting-block" {...props.attrs}>
+      <header>
+        <strong>{props.title}</strong>
+        {props.help ? <small title={props.help}>{props.help}</small> : null}
+      </header>
+      <div className="g-setting-body">{props.children}</div>
+    </section>
+  );
+}
+
+/**
+ * 概览：本群每个 bot × 每项设置一张表，取代旧弹窗「按设置分段、每段把所有 bot
+ * 再列一遍」的长滚动——看一个 bot 的全貌不必翻 8 段。点一行进入该 bot 的设置。
+ */
+function BotSettingsMatrix(props: {
+  chat: GroupChat;
+  members: GroupChat['memberBots'];
+  tr: Translator;
+  onOpenBot(botId: string): void;
+}) {
+  const { tr } = props;
+  const columns = BOT_SETTING_COLUMNS.filter(column => column !== 'replyMode' || !props.chat.sessionGroup);
+  if (props.members.length === 0) return <p className="empty">{tr('groups.noBotsInChat')}</p>;
+  return (
+    <div className="g-matrix-wrap">
+      <table className="g-matrix">
+        <thead>
+          <tr>
+            <th scope="col">{tr('groups.col.bot')}</th>
+            {columns.map(column => <th scope="col" key={column}>{tr(SETTING_COLUMN_LABEL[column])}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {props.members.map(member => {
+            const cells = summarizeBotSettings(member, tr);
+            return (
+              <tr key={member.larkAppId} data-bot={member.larkAppId} onClick={() => props.onOpenBot(member.larkAppId)}>
+                <th scope="row">
+                  <button
+                    type="button"
+                    className="g-matrix-bot"
+                    title={tr('groups.openBotSettings', { bot: member.botName ?? member.larkAppId })}
+                    onClick={event => { event.stopPropagation(); props.onOpenBot(member.larkAppId); }}
+                  >
+                    <BotAvatar bot={member} />
+                    <strong>{member.botName ?? member.larkAppId}</strong>
+                  </button>
+                </th>
+                {columns.map(column => (
+                  <td key={column} className={`g-cell-${cells[column].tone}`} title={cells[column].detail ?? cells[column].text}>
+                    {cells[column].text}
+                  </td>
+                ))}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** 单个 bot 在本群的全部设置，按「最常改 → 最少改」排列。 */
+function BotSettingsPane(props: {
+  chat: GroupChat;
+  member: GroupChat['memberBots'][number];
+  topology: string;
+  replyModeHelp: string;
+  disabled: boolean;
+  tr: Translator;
+  onSaved(): Promise<GroupsSnapshot>;
+}) {
+  const { chat, member, tr } = props;
+  const botName = member.botName ?? member.larkAppId;
+  const roleHref = `#/roles?chatId=${encodeURIComponent(chat.chatId)}&botId=${encodeURIComponent(member.larkAppId)}`;
+  return (
+    <div className="g-bot-settings" data-bot={member.larkAppId}>
+      <SettingBlock title={tr('groups.col.role')} help={tr('groups.roleHelp')}>
+        <div className="g-role-line">
+          <span className={member.hasRole ? 'g-cell-on' : 'g-cell-off'}>
+            {tr(member.hasRole ? 'groups.projectRoleConfigured' : 'groups.projectRoleInherited')}
+          </span>
+          <a className="btn-link" href={roleHref}>{tr('groups.roleEdit')}</a>
+        </div>
+      </SettingBlock>
+      {chat.sessionGroup ? null : (
+        <SettingBlock title={tr('groups.replyMode')} help={props.replyModeHelp} attrs={{ 'data-group-reply-mode': '', 'data-topology': props.topology }}>
+          <GroupReplyModeRow
+            chatId={chat.chatId} appId={member.larkAppId} botName={botName}
+            label={tr('groups.col.replyMode')}
+            state={member.replyMode} topicGroup={props.topology === 'topic'} disabled={props.disabled}
+            onSaved={props.onSaved}
+          />
+        </SettingBlock>
+      )}
+      <SettingBlock title={tr('groups.oncall')} help={tr('groups.oncallHelp')}>
+        <OncallRow chat={chat} member={member} label={tr('groups.enable')} disabled={props.disabled} tr={tr} onSaved={props.onSaved} />
+      </SettingBlock>
+      <SettingBlock title={tr('groups.defaultModels')} help={tr('groups.defaultModelsHelp')}>
+        <GroupDefaultModelsRow
+          chatId={chat.chatId} appId={member.larkAppId} botName={botName}
+          label={tr('groups.col.model')}
+          cliId={member.agentCliId} botModel={member.agentModel} botEffort={member.agentReasoningEffort}
+          models={member.defaultModels} disabled={props.disabled}
+          onSaved={props.onSaved}
+        />
+      </SettingBlock>
+      <SettingBlock title={tr('groups.serialInput')} help={tr('groups.serialInputHelp')}>
+        <GroupSerialInputRow
+          chatId={chat.chatId} appId={member.larkAppId} botName={botName} label={tr('groups.enable')}
+          enabled={member.serialInput === true} disabled={props.disabled}
+          onSaved={props.onSaved}
+        />
+      </SettingBlock>
+      <SettingBlock title={tr('groups.idleClose')} help={tr('groups.idleCloseHelp')} attrs={{ 'data-group-idle-close': '' }}>
+        <GroupIdleCloseRow
+          chatId={chat.chatId} appId={member.larkAppId} botName={botName} label={tr('groups.enable')}
+          settings={member.idleClose} disabled={props.disabled}
+          onSaved={props.onSaved}
+        />
+      </SettingBlock>
+      <SettingBlock title={tr('groups.cardMode')} help={tr('groups.cardModeHelp')} attrs={{ 'data-group-card-mode': '' }}>
+        <GroupCardModeRow
+          chatId={chat.chatId} appId={member.larkAppId} botName={botName} label={tr('groups.cardModeShow')}
+          chatEnabled={member.streamingCardChatEnabled !== false}
+          masterEnabled={member.streamingCardMasterEnabled !== false}
+          disabled={props.disabled}
+          onSaved={props.onSaved}
+        />
+      </SettingBlock>
+      <SettingBlock title={tr('groups.pinStreamingCardSection')} help={tr('groups.pinStreamingCardBotHint')}>
+        <GroupPinStreamingCardRow chat={chat} member={member} hideHead disabled={props.disabled} tr={tr} onSaved={props.onSaved} />
+      </SettingBlock>
+    </div>
+  );
+}
+
 export function ManageDialog(props: {
   chat: GroupChat;
   available?: boolean;
+  initialBotId?: string;
   tr: Translator;
   onClose(): void;
   onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
 }) {
   const { chat, tr } = props;
   const available = props.available !== false;
-  const inChat = (chat.memberBots ?? []).filter(member => member.inChat);
+  const inChat = inChatMembers(chat);
   const ownerAppId = typeof chat.ownerId === 'string' ? chat.ownerId : '';
+  const ownerBot = inChat.find(member => member.larkAppId === ownerAppId);
+  const [tab, setTab] = useState<ManageTab>(props.initialBotId ? 'bots' : 'overview');
+  const [selectedBotId, setSelectedBotId] = useState(props.initialBotId ?? inChat[0]?.larkAppId ?? '');
+  const [chatIdCopied, setChatIdCopied] = useState(false);
   const [leaveSelection, setLeaveSelection] = useState<Set<string>>(() => new Set());
   const inChatIdsRef = useRef(new Set(inChat.map(member => member.larkAppId)));
   inChatIdsRef.current = new Set(inChat.map(member => member.larkAppId));
@@ -1501,6 +1479,14 @@ export function ManageDialog(props: {
   }, []);
   const isMounted = useCallback(() => mountedRef.current, []);
   const isAlive = useCallback(() => mountedRef.current && availableRef.current, []);
+  // 会话群不展示回复模式，也就不必探测群拓扑。
+  const topology = useGroupTopology(chat, chat.sessionGroup ? undefined : inChat[0]?.larkAppId);
+  const replyModeHelp = tr(topology === 'topic' ? 'groups.replyModeTopicGroupHelp'
+    : topology === 'group' ? 'groups.replyModeHelp'
+    : 'groups.replyModeNeutralHelp');
+  const reload = useCallback(() => props.onReloadGroups({ force: true }), [props.onReloadGroups]);
+  // 选中的 bot 退群后落回第一个在群 bot，避免右侧空白。
+  const selectedMember = inChat.find(member => member.larkAppId === selectedBotId) ?? inChat[0];
 
   useEffect(() => {
     setLeaveSelection(current => {
@@ -1508,6 +1494,11 @@ export function ManageDialog(props: {
       return next.size === current.size ? current : next;
     });
   }, [chat.chatId, chat.memberBots]);
+
+  function openBot(botId: string): void {
+    setSelectedBotId(botId);
+    setTab('bots');
+  }
 
   function toggleLeave(appId: string, checked: boolean): void {
     if (!availableRef.current) return;
@@ -1607,151 +1598,165 @@ export function ManageDialog(props: {
     toast(`所有在群机器人均无法解散：\n${errs.join('\n')}\n\n建议改用「退出群聊」。`, { kind: 'error' });
   }
 
+  // 所有标签页常驻挂载、只切 hidden：切标签不丢未保存的输入，也不重复发起各行的首屏请求。
   return (
     <article className="g-manage-dialog">
-      <header><h3>{tr('groups.manageTitle', { name: chat.name ?? chat.chatId })}</h3></header>
-      <div className="g-manage-meta">
-        <span><b>chatId</b><code>{chat.chatId}</code></span>
-        <span><b>{tr('groups.owner')}</b><code>{chat.ownerId ?? tr('common.unknown')}</code></span>
-      </div>
+      <header className="g-manage-head">
+        <ChatAvatar chat={chat} />
+        <div className="g-manage-title">
+          <h3>{chat.name ?? chat.chatId}</h3>
+          <div className="g-manage-facts">
+            {chat.collaborationMode === 'project' ? (
+              <span className="groups-row-tag groups-row-project-tag">{tr('groups.projectModeBadge')}</span>
+            ) : null}
+            <span>{tr('groups.botCount', { n: inChat.length })}</span>
+            <span>
+              {tr('groups.owner')}
+              {' '}
+              {ownerBot ? <b>{ownerBot.botName ?? ownerBot.larkAppId}</b> : <code>{chat.ownerId ?? tr('common.unknown')}</code>}
+            </span>
+            <button
+              type="button"
+              className="g-manage-chatid"
+              title={tr('groups.copyChatId')}
+              onClick={() => {
+                void copyText(chat.chatId, tr('sessions.copy')).then(didCopy => {
+                  if (!didCopy || !mountedRef.current) return;
+                  setChatIdCopied(true);
+                  window.setTimeout(() => { if (mountedRef.current) setChatIdCopied(false); }, 900);
+                });
+              }}
+            >
+              <code>{chat.chatId}</code>
+              <span>{chatIdCopied ? tr('sessions.copied') : tr('sessions.copy')}</span>
+            </button>
+          </div>
+        </div>
+        <div className="g-manage-head-actions">
+          <a className="btn-link" href={chatOpenLink(chat.chatId)} target="_blank" rel="noopener">{tr('groups.openInLark')}</a>
+          <button type="button" className="g-manage-close" aria-label={tr('sessions.dismiss')} onClick={props.onClose}>×</button>
+        </div>
+      </header>
       {!available ? (
         <p className="hint-warn" data-chat-unavailable>该群聊已不在最新列表中，管理操作已禁用。</p>
       ) : null}
 
-      <ProjectGroupModeSection
-        chat={chat}
-        members={inChat}
-        disabled={!available}
-        tr={tr}
-        onSaved={() => props.onReloadGroups({ force: true })}
-      />
+      <nav className="g-manage-tabs" role="tablist" aria-label={tr('groups.manage')}>
+        {MANAGE_TABS.map(item => (
+          <button
+            type="button"
+            role="tab"
+            key={item.id}
+            id={`g-manage-tab-${item.id}`}
+            aria-selected={tab === item.id}
+            aria-controls={`g-manage-panel-${item.id}`}
+            className={`${tab === item.id ? 'active' : ''}${item.id === 'danger' ? ' danger' : ''}`}
+            onClick={() => setTab(item.id)}
+          >
+            {tr(item.labelKey)}
+          </button>
+        ))}
+      </nav>
 
-      <fieldset>
-        <legend>{tr('groups.oncall')}</legend>
-        <p><small>{tr('groups.oncallHelp')}</small></p>
-        {inChat.length === 0 ? (
-          <p className="empty">没有机器人在群里</p>
-        ) : inChat.map(member => (
-          <OncallRow
-            key={member.larkAppId}
+      <div className="g-manage-body">
+        <section role="tabpanel" id="g-manage-panel-overview" aria-labelledby="g-manage-tab-overview" hidden={tab !== 'overview'}>
+          <p className="g-panel-help">{tr('groups.overviewHelp')}</p>
+          <BotSettingsMatrix chat={chat} members={inChat} tr={tr} onOpenBot={openBot} />
+        </section>
+
+        <section role="tabpanel" id="g-manage-panel-bots" aria-labelledby="g-manage-tab-bots" hidden={tab !== 'bots'} className="g-bots-panel">
+          {inChat.length === 0 ? <p className="empty">{tr('groups.noBotsInChat')}</p> : (
+            <>
+              <div className="g-bot-picker-rail" role="listbox" aria-label={tr('groups.tabBots')}>
+                {inChat.map(member => (
+                  <button
+                    type="button"
+                    role="option"
+                    key={member.larkAppId}
+                    aria-selected={member.larkAppId === selectedMember?.larkAppId}
+                    className={member.larkAppId === selectedMember?.larkAppId ? 'active' : ''}
+                    data-bot={member.larkAppId}
+                    onClick={() => setSelectedBotId(member.larkAppId)}
+                  >
+                    <BotAvatar bot={member} />
+                    <span>{member.botName ?? member.larkAppId}</span>
+                    {member.larkAppId === ownerAppId ? <small>{tr('groups.owner')}</small> : null}
+                  </button>
+                ))}
+              </div>
+              <div className="g-bot-settings-host">
+                {inChat.map(member => (
+                  <div key={member.larkAppId} hidden={member.larkAppId !== selectedMember?.larkAppId}>
+                    <BotSettingsPane
+                      chat={chat}
+                      member={member}
+                      topology={topology}
+                      replyModeHelp={replyModeHelp}
+                      disabled={!available}
+                      tr={tr}
+                      onSaved={reload}
+                    />
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+
+        <section role="tabpanel" id="g-manage-panel-collab" aria-labelledby="g-manage-tab-collab" hidden={tab !== 'collab'}>
+          <ProjectGroupModeSection
             chat={chat}
-            member={member}
+            members={inChat}
             disabled={!available}
             tr={tr}
-            onSaved={() => props.onReloadGroups({ force: true })}
+            onSaved={reload}
           />
-        ))}
-      </fieldset>
+        </section>
 
-      <fieldset>
-        <legend>{tr('grantAdmin.sectionTitle')}</legend>
-        <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
-      </fieldset>
+        <section role="tabpanel" id="g-manage-panel-access" aria-labelledby="g-manage-tab-access" hidden={tab !== 'access'}>
+          <fieldset>
+            <legend>{tr('grantAdmin.sectionTitle')}</legend>
+            <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
+          </fieldset>
+        </section>
 
-      <fieldset>
-        <legend>{tr('groups.serialInput')}</legend>
-        <p><small>{tr('groups.serialInputHelp')}</small></p>
-        {inChat.map(member => <GroupSerialInputRow
-          key={`${chat.chatId}-${member.larkAppId}`}
-          chatId={chat.chatId} appId={member.larkAppId}
-          botName={member.botName ?? member.larkAppId}
-          enabled={member.serialInput === true} disabled={!available}
-          onSaved={() => props.onReloadGroups({ force: true })}
-        />)}
-      </fieldset>
-
-      {chat.sessionGroup ? null : <GroupReplyModeSection
-        chat={chat} disabled={!available}
-        onSaved={() => props.onReloadGroups({ force: true })}
-      />}
-
-      <fieldset data-group-idle-close>
-        <legend>{tr('groups.idleClose')}</legend>
-        <p><small>{tr('groups.idleCloseHelp')}</small></p>
-        {inChat.length === 0 ? <p className="empty">没有机器人在群里</p> : inChat.map(member => <GroupIdleCloseRow
-          key={`${chat.chatId}-${member.larkAppId}`}
-          chatId={chat.chatId} appId={member.larkAppId}
-          botName={member.botName ?? member.larkAppId}
-          settings={member.idleClose} disabled={!available}
-          onSaved={() => props.onReloadGroups({ force: true })}
-        />)}
-      </fieldset>
-
-      <fieldset>
-        <legend>新话题默认模型</legend>
-        <p><small>CLI 跟随 Bot 的 Agent 配置；模型和思考强度可单独覆盖，选择继承则沿用 Agent 配置。修改仅影响新话题。</small></p>
-        {inChat.map(member => <GroupDefaultModelsRow
-          key={`${chat.chatId}-${member.larkAppId}`}
-          chatId={chat.chatId} appId={member.larkAppId}
-          botName={member.botName ?? member.larkAppId}
-          cliId={member.agentCliId} botModel={member.agentModel} botEffort={member.agentReasoningEffort}
-          models={member.defaultModels} disabled={!available}
-          onSaved={() => props.onReloadGroups({ force: true })}
-        />)}
-      </fieldset>
-
-      <fieldset data-group-card-mode>
-        <legend>{tr('groups.cardMode')}</legend>
-        <p><small>{tr('groups.cardModeHelp')}</small></p>
-        {inChat.length === 0 ? <p className="empty">没有机器人在群里</p> : inChat.map(member => <GroupCardModeRow
-          key={`${chat.chatId}-${member.larkAppId}`}
-          chatId={chat.chatId} appId={member.larkAppId}
-          botName={member.botName ?? member.larkAppId}
-          chatEnabled={member.streamingCardChatEnabled !== false}
-          masterEnabled={member.streamingCardMasterEnabled !== false}
-          disabled={!available}
-          onSaved={() => props.onReloadGroups({ force: true })}
-        />)}
-      </fieldset>
-
-      <fieldset>
-        <legend>{tr('groups.pinStreamingCardSection')}</legend>
-        <p><small>{tr('groups.pinStreamingCardBotHint')}</small></p>
-        {inChat.length === 0 ? (
-          <p className="empty">没有机器人在群里</p>
-        ) : inChat.map(member => (
-          <GroupPinStreamingCardRow
-            key={`pin-${member.larkAppId}`}
-            chat={chat}
-            member={member}
-            disabled={!available}
-            tr={tr}
-            onSaved={() => props.onReloadGroups({ force: true })}
-          />
-        ))}
-      </fieldset>
-
-      <fieldset>
-        <legend>{tr('groups.leaveTitle')}</legend>
-        {inChat.length === 0 ? (
-          <p className="empty">没有机器人在群里</p>
-        ) : (
-          <div className="g-leave-picker">
-            {inChat.map(member => (
-              <label className="checkbox-row" key={member.larkAppId}>
-                <input
-                  type="checkbox"
-                  name="leave-bot"
-                  value={member.larkAppId}
-                  checked={leaveSelection.has(member.larkAppId)}
-                  disabled={!available}
-                  onChange={ev => toggleLeave(member.larkAppId, ev.currentTarget.checked)}
-                />
-                <span className="checkbox-row-main">
-                  <strong>{member.botName ?? member.larkAppId}</strong>
-                  {member.larkAppId === ownerAppId ? <small>· 群主</small> : null}
-                </span>
-              </label>
-            ))}
-          </div>
-        )}
-      </fieldset>
-
-      <p className="g-manage-danger-hint">{tr('groups.dangerHint')}</p>
-      <div className="actions">
-        <button type="button" onClick={props.onClose}>{tr('sessions.dismiss')}</button>
-        <button id="g-leave-btn" type="button" disabled={!available || inChat.length === 0} onClick={() => void leaveSelected()}>{tr('groups.leaveSelected')}</button>
-        <button id="g-disband-btn" type="button" className="contrast" disabled={!available || inChat.length === 0} onClick={() => void disband()}>{tr('groups.disband')}</button>
+        <section role="tabpanel" id="g-manage-panel-danger" aria-labelledby="g-manage-tab-danger" hidden={tab !== 'danger'}>
+          <fieldset>
+            <legend>{tr('groups.leaveTitle')}</legend>
+            {inChat.length === 0 ? (
+              <p className="empty">{tr('groups.noBotsInChat')}</p>
+            ) : (
+              <div className="g-leave-picker">
+                {inChat.map(member => (
+                  <label className="checkbox-row" key={member.larkAppId}>
+                    <input
+                      type="checkbox"
+                      name="leave-bot"
+                      value={member.larkAppId}
+                      checked={leaveSelection.has(member.larkAppId)}
+                      disabled={!available}
+                      onChange={ev => toggleLeave(member.larkAppId, ev.currentTarget.checked)}
+                    />
+                    <span className="checkbox-row-main">
+                      <strong>{member.botName ?? member.larkAppId}</strong>
+                      {member.larkAppId === ownerAppId ? <small>· 群主</small> : null}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+            <div className="actions">
+              <button id="g-leave-btn" type="button" disabled={!available || inChat.length === 0} onClick={() => void leaveSelected()}>{tr('groups.leaveSelected')}</button>
+            </div>
+          </fieldset>
+          <fieldset className="g-disband-field">
+            <legend>{tr('groups.disband')}</legend>
+            <p className="g-manage-danger-hint">{tr('groups.dangerHint')}</p>
+            <div className="actions">
+              <button id="g-disband-btn" type="button" className="contrast" disabled={!available || inChat.length === 0} onClick={() => void disband()}>{tr('groups.disband')}</button>
+            </div>
+          </fieldset>
+        </section>
       </div>
     </article>
   );
@@ -1765,7 +1770,6 @@ function DialogHost(props: {
   onCreated(resp: any, selectedIds: string[], name: string): void;
   onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
   onBotsAdded(chatId: string, okIds: string[]): void;
-  onRefreshRoleContext(): Promise<void>;
   setTimer(fn: () => void, ms: number): number;
 }) {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
@@ -1789,8 +1793,9 @@ function DialogHost(props: {
   if (props.dialog?.type === 'create') {
     content = (
       <CreateDialog
+        key={props.dialog.template?.sourceChatId ?? 'new'}
         bots={props.snapshot.bots}
-        roleProfiles={props.dialog.roleProfiles}
+        template={props.dialog.template}
         tr={props.tr}
         onClose={props.onClose}
         onCreated={props.onCreated}
@@ -1807,17 +1812,6 @@ function DialogHost(props: {
         onBotsAdded={props.onBotsAdded}
       />
     );
-  } else if (props.dialog?.type === 'save-profile') {
-    content = (
-      <SaveProfileDialog
-        chat={props.dialog.chat}
-        suggestedProfileId={props.dialog.suggestedProfileId}
-        tr={props.tr}
-        onClose={props.onClose}
-        onRefreshRoleContext={props.onRefreshRoleContext}
-        setTimer={props.setTimer}
-      />
-    );
   } else if (props.dialog?.type === 'manage') {
     const capturedChat = props.dialog.chat;
     const currentChat = props.snapshot.chats.find(chat => chat.chatId === capturedChat.chatId);
@@ -1827,6 +1821,7 @@ function DialogHost(props: {
         key={capturedChat.chatId}
         chat={chat}
         available={!!currentChat}
+        initialBotId={props.dialog.botId}
         tr={props.tr}
         onClose={props.onClose}
         onReloadGroups={props.onReloadGroups}
@@ -1834,7 +1829,9 @@ function DialogHost(props: {
     );
   }
 
-  const className = props.dialog?.type === 'create' ? 'groups-create-modal' : undefined;
+  const className = props.dialog?.type === 'create'
+    ? 'groups-create-modal'
+    : props.dialog?.type === 'manage' ? 'groups-manage-drawer' : undefined;
   return (
     <dialog
       id="g-drawer"
@@ -1855,12 +1852,10 @@ function GroupsPage() {
   const snapshotRef = useRef<GroupsSnapshot>(emptyGroupsSnapshot);
   const timersRef = useRef<Set<number>>(new Set());
   const delayResolversRef = useRef<Map<number, () => void>>(new Map());
-  const roleContextRunRef = useRef(0);
   const snapshotRequestRunRef = useRef(0);
   const snapshotSuccessRunRef = useRef(0);
   const [snapshot, setSnapshotState] = useState<GroupsSnapshot>(emptyGroupsSnapshot);
-  const [roleContext, setRoleContext] = useState<RoleProfileContext>(() => emptyRoleContext());
-  const [filters, setFilters] = useState<GroupFilters>({ q: '', missingOnly: false });
+  const [filters, setFilters] = useState<GroupFilters>({ q: '', botId: '' });
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -1902,18 +1897,6 @@ function GroupsPage() {
     delayResolversRef.current.set(id, resolve);
   }), []);
 
-  const refreshRoleProfileContext = useCallback(async (source?: GroupsSnapshot): Promise<void> => {
-    const runId = ++roleContextRunRef.current;
-    try {
-      const context = await loadGroupRoleProfileContext(source ?? snapshotRef.current);
-      if (mountedRef.current && runId === roleContextRunRef.current) setRoleContext(context);
-    } catch {
-      if (mountedRef.current && runId === roleContextRunRef.current) {
-        setRoleContext({ ...emptyRoleContext(), loaded: true });
-      }
-    }
-  }, []);
-
   const reloadGroups = useCallback(async (options?: { force?: boolean }): Promise<GroupsSnapshot> => {
     const runId = ++snapshotRequestRunRef.current;
     try {
@@ -1922,13 +1905,12 @@ function GroupsPage() {
       snapshotSuccessRunRef.current = runId;
       setSnapshot(next);
       setLoadError(null);
-      void refreshRoleProfileContext(next);
       return next;
     } catch (error) {
       if (!mountedRef.current || runId !== snapshotRequestRunRef.current) return snapshotRef.current;
       throw error;
     }
-  }, [refreshRoleProfileContext, setSnapshot]);
+  }, [setSnapshot]);
 
   const refreshUntilSeen = useCallback(async (chatId: string, expectedBotIds: Set<string>): Promise<void> => {
     const runId = ++snapshotRequestRunRef.current;
@@ -1945,11 +1927,10 @@ function GroupsPage() {
         snapshotSuccessRunRef.current = runId;
         setSnapshot(next);
         setLoadError(null);
-        void refreshRoleProfileContext(next);
         return;
       }
     }
-  }, [delay, refreshRoleProfileContext, setSnapshot]);
+  }, [delay, setSnapshot]);
 
   // Add-bots reconciliation. Batches on the same chat can overlap (the dialog lets the
   // user submit batch B while batch A is still catching up Lark-side), so the pure
@@ -1972,7 +1953,6 @@ function GroupsPage() {
       commit: createReconciledChatCommitter({
         getSnapshot: () => snapshotRef.current,
         applySnapshot: merged => { setSnapshot(merged); },
-        onCommitted: merged => { void refreshRoleProfileContext(merged); },
       }),
     });
   }
@@ -1991,7 +1971,6 @@ function GroupsPage() {
         if (mountedRef.current) {
           setSnapshot(emptyGroupsSnapshot);
           setLoadError(err instanceof Error ? err.message : String(err));
-          void refreshRoleProfileContext(emptyGroupsSnapshot);
         }
       } finally {
         if (mountedRef.current) setLoading(false);
@@ -2000,7 +1979,6 @@ function GroupsPage() {
 
     return () => {
       mountedRef.current = false;
-      roleContextRunRef.current += 1;
       for (const id of timersRef.current) window.clearTimeout(id);
       timersRef.current.clear();
       for (const resolve of delayResolversRef.current.values()) resolve();
@@ -2015,12 +1993,19 @@ function GroupsPage() {
     () => filterGroupChats(snapshot.chats, filters),
     [snapshot.chats, filters],
   );
-  const rows = useMemo(() => allMatched.filter(c => !(c as any).sessionGroup), [allMatched]);
-  const sessionRows = useMemo(() => allMatched.filter(c => (c as any).sessionGroup), [allMatched]);
+  const rows = useMemo(() => allMatched.filter(c => !c.sessionGroup), [allMatched]);
+  const sessionRows = useMemo(() => allMatched.filter(c => c.sessionGroup), [allMatched]);
   const pageWindow = useMemo(
     () => paginateGroupRows(rows, page),
     [rows, page],
   );
+  const avatarUrls = useMemo(() => botAvatarUrlMap(snapshot.bots), [snapshot.bots]);
+  const botFilterOptions = useMemo(() => [
+    { value: '', label: tr('groups.botFilterAll') },
+    ...snapshot.bots.map(bot => ({ value: bot.larkAppId, label: bot.botName ?? bot.larkAppId })),
+  ], [snapshot.bots, tr]);
+  const botFilterLabel = botFilterOptions.find(option => option.value === filters.botId)?.label
+    ?? tr('groups.botFilterAll');
 
   useEffect(() => {
     if (page !== pageWindow.page) setPage(pageWindow.page);
@@ -2037,16 +2022,21 @@ function GroupsPage() {
     }
   }
 
-  async function openCreateDialog(): Promise<void> {
+  function openCreateDialog(): void {
     if (snapshotRef.current.bots.length === 0) {
       toast(tr('groups.noBotsOnline'), { kind: 'warning' });
       return;
     }
-    let roleProfiles: RoleProfileSummaryLike[] = [];
-    try { roleProfiles = await fetchRoleProfileSummaries(); }
-    catch { /* profile selector is optional */ }
-    if (mountedRef.current) setDialog({ type: 'create', roleProfiles });
+    setDialog({ type: 'create' });
   }
+
+  const openCloneDialog = useCallback((chat: GroupChat): void => {
+    if (snapshotRef.current.bots.length === 0) {
+      toast(tr('groups.noBotsOnline'), { kind: 'warning' });
+      return;
+    }
+    setDialog({ type: 'create', template: groupCloneTemplate(chat, snapshotRef.current.bots) });
+  }, [tr]);
 
   function handleCreated(resp: any, selectedIds: string[], name: string): void {
     const chatId = String(resp.chatId);
@@ -2054,11 +2044,7 @@ function GroupsPage() {
     const validIds = selectedIds.filter(id => !invalidBotIds.includes(id));
     const expectedBotIds = new Set<string>(validIds);
     if (typeof resp.creator === 'string' && resp.creator) expectedBotIds.add(resp.creator);
-    // Compute the optimistic snapshot from committed state (setSnapshot keeps snapshotRef in
-    // sync) so the profile-context refresh always sees it — not a null from a deferred updater.
-    const optimistic = injectOptimisticChat(snapshotRef.current, chatId, name || chatId, validIds, resp.creator);
-    setSnapshot(optimistic);
-    void refreshRoleProfileContext(optimistic);
+    setSnapshot(injectOptimisticChat(snapshotRef.current, chatId, name || chatId, validIds, resp.creator));
     void refreshUntilSeen(chatId, expectedBotIds).catch(() => { /* tolerate */ });
   }
 
@@ -2069,9 +2055,7 @@ function GroupsPage() {
   // batches on the same chat must not let an older poll roll a newer batch back.
   function handleBotsAdded(chatId: string, okIds: string[]): void {
     if (okIds.length === 0) return;
-    const optimistic = markBotsInChat(snapshotRef.current, chatId, okIds);
-    setSnapshot(optimistic);
-    void refreshRoleProfileContext(optimistic);
+    setSnapshot(markBotsInChat(snapshotRef.current, chatId, okIds));
     void reconcileAddedBots(chatId, okIds).catch(() => { /* tolerate */ });
   }
 
@@ -2084,16 +2068,8 @@ function GroupsPage() {
     setDialog({ type: 'add-bots', chat });
   }, []);
 
-  const openSaveProfileDialog = useCallback((chat: GroupChat): void => {
-    const suggestedByName = suggestRoleProfileIdFromChat(chat.name ?? '');
-    const suggestedProfileId = suggestedByName === 'profile'
-      ? suggestRoleProfileIdFromChat(chat.chatId)
-      : suggestedByName;
-    setDialog({ type: 'save-profile', chat, suggestedProfileId });
-  }, []);
-
-  const openManageDialog = useCallback((chat: GroupChat): void => {
-    setDialog({ type: 'manage', chat });
+  const openManageDialog = useCallback((chat: GroupChat, botId?: string): void => {
+    setDialog({ type: 'manage', chat, botId });
   }, []);
 
   function goToPage(nextPage: number): void {
@@ -2102,7 +2078,20 @@ function GroupsPage() {
     setPage(nextPage);
   }
 
+  const renderRow = (chat: GroupChat) => (
+    <GroupListRow
+      chat={chat}
+      bots={snapshot.bots}
+      tr={tr}
+      key={chat.chatId}
+      onAddBots={openAddBotsDialog}
+      onClone={openCloneDialog}
+      onManage={openManageDialog}
+    />
+  );
+
   return (
+    <BotAvatarUrlContext.Provider value={avatarUrls}>
     <section className="page groups-page">
       <div className="page-heading">
         <div>
@@ -2110,7 +2099,7 @@ function GroupsPage() {
           <h1>{tr('groups.title')}</h1>
         </div>
         <div className="page-heading-actions">
-          <CreateActionButton id="g-create" className="page-primary-action" onClick={() => void openCreateDialog()}>{tr('groups.create')}</CreateActionButton>
+          <CreateActionButton id="g-create" className="page-primary-action" onClick={openCreateDialog}>{tr('groups.create')}</CreateActionButton>
         </div>
       </div>
       <form id="g-filters" className="filters dashboard-toolbar groups-toolbar" onSubmit={ev => ev.preventDefault()}>
@@ -2125,23 +2114,23 @@ function GroupsPage() {
             setFilters(cur => ({ ...cur, q }));
           }}
         />
-        <label className="filter-toggle">
-          <input
-            type="checkbox"
-            name="missing"
-            checked={filters.missingOnly}
-            onChange={ev => {
-              const missingOnly = ev.currentTarget.checked;
-              setPage(1);
-              setFilters(cur => ({ ...cur, missingOnly }));
-            }}
-          />
-          <span className="filter-toggle-label">{tr('groups.missingOnly')}</span>
-          <span className="filter-toggle-switch" aria-hidden="true" />
-        </label>
+        <DropdownMenu
+          className="groups-bot-filter"
+          ariaLabel={tr('groups.botFilterLabel')}
+          label={botFilterLabel}
+          value={filters.botId}
+          options={botFilterOptions}
+          searchable
+          searchPlaceholder={tr('botPicker.searchPlaceholder')}
+          searchEmptyLabel={tr('botPicker.noMatch')}
+          onChange={botId => {
+            setPage(1);
+            setFilters(cur => ({ ...cur, botId }));
+          }}
+        />
         <span className="groups-toolbar-spacer" aria-hidden="true" />
         <span className="groups-toolbar-count">
-          {tr('groups.matrixTitle')} {loading ? '-/-' : `${rows.length}/${snapshot.chats.length}`}
+          {loading ? '-' : tr('groups.listCount', { n: rows.length })}
         </span>
         <RefreshIconButton id="g-refresh" label={tr('groups.refresh')} busy={refreshing} disabled={refreshing} onClick={() => void refresh()} />
       </form>
@@ -2155,18 +2144,7 @@ function GroupsPage() {
               <div className="empty groups-list-empty" id="g-body">{tr('groups.empty')}</div>
             ) : (
               <OverviewList id="g-body" className="groups-list">
-                {pageWindow.rows.map(chat => (
-                  <GroupListRow
-                    chat={chat}
-                    bots={snapshot.bots}
-                    roleContext={roleContext}
-                    tr={tr}
-                    key={chat.chatId}
-                    onAddBots={openAddBotsDialog}
-                    onSaveProfile={openSaveProfileDialog}
-                    onManage={openManageDialog}
-                  />
-                ))}
+                {pageWindow.rows.map(renderRow)}
               </OverviewList>
             )}
             {rows.length > 0 && pageWindow.totalPages > 1 ? (
@@ -2198,24 +2176,13 @@ function GroupsPage() {
         )}
       </section>
       {!loading && sessionRows.length > 0 ? (
-        <details className="overview-block groups-session-section" open={!!filters.q} data-session-groups>
-          <summary style={{ cursor: 'pointer', padding: '10px 4px', fontWeight: 600, opacity: 0.85 }}>
-            🤖 {tr('groups.sessionSection')}（{sessionRows.length}）
-            <span style={{ fontWeight: 400, opacity: 0.7, marginLeft: 8 }}>{tr('groups.sessionSectionHint')}</span>
+        <details className="overview-block groups-session-section" open={!!filters.q || !!filters.botId} data-session-groups>
+          <summary>
+            {tr('groups.sessionSection')}（{sessionRows.length}）
+            <span>{tr('groups.sessionSectionHint')}</span>
           </summary>
           <OverviewList id="g-session-body" className="groups-list">
-            {sessionRows.map(chat => (
-              <GroupListRow
-                chat={chat}
-                bots={snapshot.bots}
-                roleContext={roleContext}
-                tr={tr}
-                key={chat.chatId}
-                onAddBots={openAddBotsDialog}
-                onSaveProfile={openSaveProfileDialog}
-                onManage={openManageDialog}
-              />
-            ))}
+            {sessionRows.map(renderRow)}
           </OverviewList>
         </details>
       ) : null}
@@ -2227,10 +2194,10 @@ function GroupsPage() {
         onCreated={handleCreated}
         onReloadGroups={reloadGroups}
         onBotsAdded={handleBotsAdded}
-        onRefreshRoleContext={() => refreshRoleProfileContext()}
         setTimer={setTimer}
       />
     </section>
+    </BotAvatarUrlContext.Provider>
   );
 }
 

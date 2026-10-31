@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { hasEmptyCodexComposer, parseCodexEffortMenu } from '../src/utils/codex-effort-menu.js';
+import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 
 // Exercise the production input boundaries without starting worker.ts's IPC server.
 const parsed = ts.createSourceFile('worker.ts', readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'),
@@ -47,11 +48,12 @@ describe('Codex effort menu input ownership', () => {
 
   it.each([false, true])('holds queued messages until the picker is visibly closed (observe=%s)', observe => {
     let screen = 'Advanced Reasoning\n› 1. Max\n  2. Ultra\nenter default · s session · esc back';
-    const backend = { captureCurrentScreen: () => screen };
+    const backend = { captureCurrentScreen: () => screen, captureViewport: () => screen };
     const state = {
       backend, cliLifetimeNonce: 1, codexCliEffortRecovery: { backend, lifetime: 1 },
       isObserveBackend: () => observe, renderer: { rawSnapshot: () => screen },
-      hasEmptyCodexComposer, parseCodexEffortMenu,
+      hasEmptyCodexComposer, parseCodexEffortMenu, stripAnsiScreenText,
+      captureBackendScreen: () => screen,
     };
     const held = evaluate<() => boolean>('codexCliEffortNeedsRecovery', state);
     expect(held()).toBe(true);
@@ -59,6 +61,22 @@ describe('Codex effort menu input ownership', () => {
     expect(held()).toBe(true);
     screen = '› Ask Codex to do anything';
     expect(held()).toBe(false);
+    expect(state.codexCliEffortRecovery).toBeUndefined();
+  });
+
+  it('releases queued input after the colored tmux viewport closes the Ultra picker', () => {
+    const esc = String.fromCharCode(27);
+    const viewport = esc + '[1m»' + esc + '[22m ' + esc + '[2mAsk Codex to do anything' + esc + '[0m';
+    const backend = {
+      captureViewport: () => viewport,
+      captureCurrentScreen: () => 'Advanced Reasoning\n› 1. Ultra\nenter apply · s session · esc back',
+    };
+    const state = {
+      backend, cliLifetimeNonce: 1, codexCliEffortRecovery: { backend, lifetime: 1 },
+      isObserveBackend: () => true, captureBackendScreen: () => backend.captureViewport(),
+      hasEmptyCodexComposer, parseCodexEffortMenu, stripAnsiScreenText,
+    };
+    expect(evaluate<() => boolean>('codexCliEffortNeedsRecovery', state)()).toBe(false);
     expect(state.codexCliEffortRecovery).toBeUndefined();
   });
 

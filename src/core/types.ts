@@ -718,6 +718,8 @@ export interface DaemonSession {
     taskId?: string | null;
   };
   usageLimit?: CliUsageLimitState;
+  /** A failed persistence must be retried even if the next frame is identical. */
+  usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;
   /** Latch for the proactive rate/usage-limit owner notification: the
    *  usageLimitStateKey of the limit episode we already posted about. Exactly

@@ -10123,11 +10123,27 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
       expect(crossRefWrites()).toEqual([]);
     });
 
-    it('忽略其它非字符串 botName，仍能确认当前名字唯一并回填 cross-ref', () => {
+    it('畸形 botName 条目排在目标之前时仍能确认当前名字唯一并回填 cross-ref', () => {
       mockReadFileSync.mockImplementation((path: any) => (String(path).includes('bots-info.json')
         ? JSON.stringify([
-          { larkAppId: SIB_APP, botName: 'SameOwnerSibling' },
           { larkAppId: OTHER_OWNER_APP, botName: { malformed: true } },
+          { larkAppId: SIB_APP, botName: 'SameOwnerSibling' },
+        ])
+        : '{}'));
+
+      expect(() => learnSameOwnerSiblingCrossRef(
+        siblingDataDir, MY_APP_ID, OTHER_BOT_OPEN_ID, SIB_UNION,
+      )).not.toThrow();
+      expect(crossRefWrites()).toContainEqual({ SameOwnerSibling: OTHER_BOT_OPEN_ID });
+    });
+
+    it('忽略 null 和非对象条目，仍能回填目标 sibling 的 cross-ref', () => {
+      mockReadFileSync.mockImplementation((path: any) => (String(path).includes('bots-info.json')
+        ? JSON.stringify([
+          null,
+          42,
+          'malformed',
+          { larkAppId: SIB_APP, botName: 'SameOwnerSibling' },
         ])
         : '{}'));
 

@@ -7,6 +7,11 @@
  *
  *   node scripts/scratch-real-cli-probe.mjs           # claude
  *   node scripts/scratch-real-cli-probe.mjs --codex   # codex
+ *
+ * Mounts for real in THIS mount namespace (a full-root overlay plus one per
+ * host submount). Run it under `isolate-run` (or another private mount + PID
+ * namespace) where you can: Ctrl-C / SIGTERM is cleaned up below, SIGKILL
+ * would leave the overlay mounted on the host.
  */
 import { prepareScratchSandbox } from '../dist/adapters/backend/scratch-sandbox.js';
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -43,6 +48,9 @@ const sbx = prepareScratchSandbox({
 });
 check('prepare ok', !!sbx);
 if (!sbx) process.exit(1);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => { try { sbx.cleanup(); } catch { /* */ } process.exit(signal === 'SIGINT' ? 130 : 143); });
+}
 
 const t0 = Date.now();
 const r = spawnSync(sbx.bin, sbx.args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: 180_000 });

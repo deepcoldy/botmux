@@ -3,8 +3,10 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaExec } from './model-catalog-json.js';
-import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
-import { traeConfigPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec } from './types.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { traeCliStatePath, traeConfigPath, traeHomeFor, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
   findTraexSessionIdByBotmuxSessionId,
   traexHistoryMatchDelta,
@@ -22,6 +24,7 @@ import {
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
 import { traexRestoredComposerReady, traexViewportFooterBusy } from './traex-footer.js';
+import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION } from './traex-version.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -87,11 +90,18 @@ function goalEnvConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
  * legitimately fires. In practice the markers are written host-side once migration
  * has run (the normal fleet state); this bind just makes that host truth visible
  * through the sandbox instead of hidden behind the ~/.trae/cli-only carve-out.
+ *
+ * The markers sit at the TRAE data root, so a bot with its own TRAE_HOME has
+ * them there. The default-root copies stay listed too (zero-byte read-only
+ * files): which root a given traecli release consults was not observable
+ * locally, and exposing both keeps the default-home behaviour unchanged.
  */
-export const TRAE_MIGRATION_DONE_MARKERS = [
-  '~/.trae/.coco-rollouts-migrated',
-  '~/.trae/.coco-migrated',
-] as const;
+const TRAE_MIGRATION_DONE_MARKER_NAMES = ['.coco-rollouts-migrated', '.coco-migrated'] as const;
+
+export function traeMigrationDoneMarkers(env: NodeJS.ProcessEnv = process.env): string[] {
+  const roots = [...new Set([join(homedir(), '.trae'), traeHomeFor(env)])];
+  return roots.flatMap(root => TRAE_MIGRATION_DONE_MARKER_NAMES.map(name => join(root, name)));
+}
 
 /**
  * TraeX active-turn busy marker. Every anchor below is extracted verbatim
@@ -361,6 +371,8 @@ export const traexBridgeSpec: StructuredBridgeSpec = {
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
+  const resolvedBin = (): string => (cachedBin ??= resolveCommand(rawBin));
+  let launchNotice: CliLaunchNotice | undefined;
   return {
     id: 'traex',
     mcpGateway: {
@@ -378,13 +390,18 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // sandbox could mutate shared hook/plugin CODE that later bots (or the user's
     // own non-sandboxed traecli) execute. The first-run migration markers that
     // must be visible are exposed READ-ONLY via sandboxReadonlyPaths() instead.
-    authPaths: ['~/.trae/cli'],
+    // Resolved at read time: TRAE_HOME may move it off ~/.trae (the worker pins
+    // a sandboxed session's per-bot TRAE_HOME before building the policy).
+    get authPaths(): string[] { return [traeCliStatePath()]; },
     // The CLI must read the Gateway entry even when ~/.trae is not exposed.
     // Keep the shared config read-only; hooks/plugins must not become writable.
-    sandboxReadonlyPaths: () => [traeConfigPath(), ...TRAE_MIGRATION_DONE_MARKERS],
-    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+    sandboxReadonlyPaths: env => [traeConfigPath(env), ...traeMigrationDoneMarkers(env)],
+    get resolvedBin(): string { return resolvedBin(); },
+
+    launchNotice: () => launchNotice,
 
     buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+      launchNotice = undefined;
       // TraeX shares Codex's low-quota picker and notice setting. Disable it
       // per process so a message-submit Enter cannot confirm a model switch.
       const modelNudgeArgs = hideRateLimitModelNudge
@@ -400,6 +417,22 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         // codex's config schema; disable at the process level, never user-global.
         return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
       }
+      // Releases before the baseline reject the hook-trust flag at argv parsing
+      // and exit; leave it out for them (they have no hook-trust gate to pass
+      // either) and tell the user to upgrade. Unknown version → pass it as before.
+      let hookTrustFlag = !disableCliBypass && !!bypassHookTrust;
+      if (hookTrustFlag) {
+        const support = probeTraexHookTrustSupport(resolvedBin());
+        if (support.status === 'unsupported') {
+          hookTrustFlag = false;
+          launchNotice = {
+            kind: 'flag_needs_newer_cli',
+            flag: TRAEX_HOOK_TRUST_FLAG,
+            version: support.version,
+            minVersion: TRAEX_HOOK_TRUST_MIN_VERSION,
+          };
+        }
+      }
       const baseArgs = [
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',
@@ -411,7 +444,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           // `bypassHookTrust` toggle as codex (default ON, operator can disable —
           // it trusts ALL hook sources, not only botmux's), still ANDed with the
           // existing bypass decision: restricted bots must not gain hook trust.
-          ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
+          ...(hookTrustFlag ? [TRAEX_HOOK_TRUST_FLAG] : []),
         ] : []),
         '--no-alt-screen',
         ...modelNudgeArgs,

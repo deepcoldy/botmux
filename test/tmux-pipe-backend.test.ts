@@ -2384,6 +2384,42 @@ describe('TmuxPipeBackend pipe-pane death evidence', () => {
     }
   });
 
+  // #2453 on the startup path: tmux had not reaped the instantly-dead CLI, so
+  // the pane read dead-without-status and the message blamed a possible signal
+  // death for what was a plain `exit 3`. A real unreaped child stands in for
+  // the pane process (python forks it and never waits).
+  const python3 = ['/usr/bin/python3', '/bin/python3'].find(path => existsSync(path));
+  it.skipIf(!python3 || process.platform !== 'linux')('reports the exit code of a CLI tmux has not reaped yet', async () => {
+    const parent = spawn(python3!, ['-c', [
+      'import os, sys, time',
+      'pid = os.fork()',
+      'if pid == 0: os._exit(3)',
+      'time.sleep(0.2)',
+      'print(pid, flush=True)',
+      'sys.stdin.read()',
+    ].join('\n')], { stdio: ['pipe', 'pipe', 'inherit'] });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const [chunk] = await once(parent.stdout!, 'data') as [Buffer];
+      const corpse = `1::${String(chunk).trim()}:${parent.pid}\n`;
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          throw Object.assign(new Error('Command failed: tmux pipe-pane -O -t 0:2.0'), {
+            status: 1, signal: null, stderr: Buffer.from("can't find pane: 0:2.0"),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => (isDeadProbe(args) ? corpse : '')) as any);
+      const be = new TmuxPipeBackend('0:2.0', { createSession: true, ownsSession: true });
+      expect(() => be.spawn('', [], spawnOpts())).toThrow(/exit status=3/);
+    } finally {
+      errSpy.mockRestore();
+      parent.stdin!.end();
+      await once(parent, 'close');
+    }
+  });
+
   it('silently degrades to the raw error when both evidence probes fail (server-level outage)', () => {
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {

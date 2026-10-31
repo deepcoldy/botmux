@@ -114,6 +114,14 @@ function runtimeTasks(): ScheduledTask[] {
   return authorityStore.listTasks(appId);
 }
 
+/** The task as the daemon executes it: the host authority row once the app is
+ *  enrolled, never the agent-writable schedules.json projection; undefined
+ *  while authority is unavailable. Runtime writes (updateRuntimeTaskState)
+ *  land here first, so read-after-write within one fire is consistent. */
+export function getRuntimeTask(id: string, appId?: string): ScheduledTask | undefined {
+  return runtimeTask(id, appId);
+}
+
 function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
   if (authorityUnavailable) return;
   if (!authorityStore) return scheduleStore.getTask(id, appId);

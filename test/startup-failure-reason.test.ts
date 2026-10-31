@@ -47,11 +47,32 @@ describe('worker fatal error report', () => {
       sendAndFlush: async (message: unknown) => { sent.push(message); },
       log: (line: string) => { logged.push(line); },
       chatSafeFatalErrorMessage,
+      sandboxNamespaceDiagnosis: () => undefined,
       process: { exit: vi.fn() },
     };
     await loadWorkerFunction<(e: unknown) => Promise<void>>('sendFatalWorkerErrorAndExit', scope)(err);
     expect(sent).toEqual([{ type: 'error', message: 'sh 执行失败（退出码 1），完整命令只写入本机日志：\ntmux said no', turnId: 'turn-1' }]);
     expect(logged.some(line => line.includes('PROVIDER_TOKEN=secret-value'))).toBe(true);
     expect((scope.process as { exit: ReturnType<typeof vi.fn> }).exit).toHaveBeenCalledWith(1);
+  });
+
+  it('tags a bwrap namespace refusal so the daemon can explain it', async () => {
+    const sent: unknown[] = [];
+    const seen: Array<string | undefined> = [];
+    const scope: Record<string, unknown> = {
+      fatalWorkerErrorPending: false, pendingLaunchConvergence: undefined, activeRestartAttemptId: undefined,
+      currentBotmuxTurnId: 'turn-ns', currentBotmuxDispatchAttempt: undefined,
+      sendAndFlush: async (message: unknown) => { sent.push(message); },
+      log: () => {},
+      chatSafeFatalErrorMessage,
+      // Gets the FULL error text, not the chat-safe one.
+      sandboxNamespaceDiagnosis: (text: string | undefined) => { seen.push(text); return 'user'; },
+      process: { exit: vi.fn() },
+    };
+    await loadWorkerFunction<(e: unknown) => Promise<void>>('sendFatalWorkerErrorAndExit', scope)(
+      new Error('bwrap: No permissions to create new namespace'),
+    );
+    expect(seen).toEqual(['bwrap: No permissions to create new namespace']);
+    expect(sent).toEqual([{ type: 'error', message: 'bwrap: No permissions to create new namespace', turnId: 'turn-ns', sandboxNamespace: 'user' }]);
   });
 });

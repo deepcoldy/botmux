@@ -161,6 +161,15 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     // 当前 oncall 绑定数。旧 daemon 不回这个字段 → null，页面只显示自动绑定过的数量。
     oncallChatCount: typeof j?.oncallChatCount === 'number' ? j.oncallChatCount : null,
+    // Shared-bot sandbox advice inputs (daemon computes; old daemon → null).
+    allowedUsersCount: typeof j?.allowedUsersCount === 'number' ? j.allowedUsersCount : null,
+    oncallSharedChatCount: typeof j?.oncallSharedChatCount === 'number' ? j.oncallSharedChatCount : null,
+    allowedChatGroupsCount: typeof j?.allowedChatGroupsCount === 'number' ? j.allowedChatGroupsCount : null,
+    localSandboxApplies: typeof j?.localSandboxApplies === 'boolean' ? j.localSandboxApplies : null,
+    sandboxCapable: typeof j?.sandboxCapable === 'boolean' ? j.sandboxCapable : null,
+    effectiveSandboxMode: j?.effectiveSandboxMode === 'off' || j?.effectiveSandboxMode === 'oncall' || j?.effectiveSandboxMode === 'scratch'
+      ? j.effectiveSandboxMode
+      : null,
     brandLabel: j?.brandLabel ?? null,
     // Private Bot Defaults payload only. Keep the persisted shape sparse and
     // drop malformed hand edits field-by-field before they reach form state.
@@ -179,8 +188,12 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     scratchTmpfsSizeMb: typeof j?.scratchTmpfsSizeMb === 'number' ? j.scratchTmpfsSizeMb : null,
     scratchDenyPaths: Array.isArray(j?.scratchDenyPaths) ? j.scratchDenyPaths.filter((x: unknown) => typeof x === 'string') : null,
     scratchSupported: j?.scratchSupported === true,
+    // Older daemons do not send it → null (the page shows no capability note).
+    scratchCapability: j?.scratchCapability && typeof j.scratchCapability === 'object' ? j.scratchCapability : null,
     sandboxNetworkPolicy: j?.sandboxNetworkPolicy ?? null,
     sandboxNetworkPolicyPlatform: j?.sandboxNetworkPolicyPlatform ?? null,
+    sandboxNetworkHostDns: Array.isArray(j?.sandboxNetworkHostDns) ? j.sandboxNetworkHostDns.filter((ip: unknown) => typeof ip === 'string') : [],
+    sandboxNetworkProxyEnv: Array.isArray(j?.sandboxNetworkProxyEnv) ? j.sandboxNetworkProxyEnv.filter((key: unknown) => typeof key === 'string') : [],
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {
           readWrite: Array.isArray(j.sandboxPaths.readWrite) ? j.sandboxPaths.readWrite.filter((x: unknown) => typeof x === 'string') : [],
@@ -188,6 +201,15 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
           deny: Array.isArray(j.sandboxPaths.deny) ? j.sandboxPaths.deny.filter((x: unknown) => typeof x === 'string') : [],
         }
       : null,
+    readIsolation: j?.readIsolation === true,
+    sandboxPathsForbiddenReadWrite: Array.isArray(j?.sandboxPathsForbiddenReadWrite)
+      ? j.sandboxPathsForbiddenReadWrite
+        .filter((x: any) => x && typeof x.path === 'string')
+        .map((x: any) => String(x.path))
+      : [],
+    sandboxPathsReadOnlyRoot: Array.isArray(j?.sandboxPathsReadOnlyRoot)
+      ? j.sandboxPathsReadOnlyRoot.filter((x: unknown) => typeof x === 'string')
+      : [],
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
     defaultBackendType: typeof j?.defaultBackendType === 'string' && j.defaultBackendType ? j.defaultBackendType : null,
@@ -207,6 +229,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
     cotEnabled: normalizeCotEnabled(j),
+    replyCardShowTools: j?.replyCardShowTools !== false,
     senderTag: j?.senderTag !== false,
     senderTagHideEmail: j?.senderTagHideEmail === true,
     overloadAlert: j?.overloadAlert === true,

@@ -18,6 +18,7 @@ import {
   parseWorkflowDaemonMutationBody,
 } from './daemon-ipc-body.js';
 import type { WorkflowDaemonMutation } from './daemon-ipc-client.js';
+import type { ScheduledTask } from '../../types.js';
 import {
   authorizeV3RunMutationForCurrentTuple,
   V3DaemonCommandAuthorityError,
@@ -91,9 +92,11 @@ export function authorizeV3SessionRunMutationRequest(input: {
   session: V3SessionRelaySessionView | undefined;
   selfLarkAppId: string | undefined;
   baseDir: string;
-  /** Session data dir, for reading the per-bot schedules.json of a scheduled
-   *  turn. Required only when a `schedule:` turn is presented. */
-  sessionDataDir?: string;
+  /** Reads a scheduled turn's task from the host-only authority store. Must
+   *  not read schedules.json: that projection lives in BOT_HOME, which the
+   *  sandboxed CLI behind this relay can write. Required only when a
+   *  `schedule:` turn is presented; absent → fail closed. */
+  loadScheduledTask?: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
   /**
    * Live owner gate for scheduled turns: must return true iff the task's
    * creator (ownerOpenId) is still authorized for the bot. The daemon injects
@@ -174,7 +177,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
   // creator, never anything the request chooses.
   let callerOpenId: string;
   if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
-    if (!input.sessionDataDir) {
+    if (!input.loadScheduledTask) {
       return {
         ok: false, status: 403, error: 'schedule_turn_unauthorized',
         detail: scheduledTurnAuthErrorMessage('task_not_found'),
@@ -184,7 +187,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
     const gate = input.isScheduleOwnerAllowed ?? (() => false);
     const auth = authorizeScheduledTurn({
       turnId: liveTurnId,
-      dataDir: input.sessionDataDir,
+      loadTask: input.loadScheduledTask,
       sessionLarkAppId: current.larkAppId,
       sessionChatId: current.chatId,
       isOwnerAllowed: gate,

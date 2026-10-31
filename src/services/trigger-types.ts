@@ -1,4 +1,11 @@
-export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting' | 'headless';
+/** Connector kinds a Trigger request may arrive from. This runtime list is
+ *  the single source of truth: TriggerSourceType is derived from it,
+ *  validateTriggerRequest rejects every other string, and the turn-origin
+ *  table (core/turn-origin) imports the same list. Adding a connector kind is
+ *  therefore a one-line change here plus the CLI-side literal, and the K4
+ *  consistency test fails until the CLI side catches up. */
+export const TRIGGER_SOURCE_TYPES = ['webhook', 'ui', 'workflow', 'schedule', 'vc_meeting', 'headless'] as const;
+export type TriggerSourceType = typeof TRIGGER_SOURCE_TYPES[number];
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
 export type TriggerAsyncStatus = 'pending' | 'completed';
@@ -237,6 +244,17 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   const envelope = raw.envelope;
   if (!isRecord(source) || !isRecord(target) || !isRecord(envelope)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'source, target, and envelope are required objects' } };
+  }
+  // An unknown source.type must fail at the edge: triggerSessionTurn records
+  // it verbatim and `execution current` then fails its own origin enum check
+  // for the whole turn, so accepting garbage here turns one bad request into
+  // an unusable execution-identity read instead of a 400 at submission.
+  if (typeof source.type !== 'string'
+    || !(TRIGGER_SOURCE_TYPES as readonly string[]).includes(source.type)) {
+    return { ok: false, status: 400, body: {
+      ok: false, errorCode: 'bad_request',
+      error: `source.type must be one of ${TRIGGER_SOURCE_TYPES.join(', ')}`,
+    } };
   }
   if (target.kind !== 'turn' && target.kind !== 'workflow') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn or workflow' } };

@@ -318,6 +318,19 @@ describe('daemon records the Dashboard Feishu-login person as creator', () => {
     expect(record(id).task).toMatchObject({ ownerOpenId: OWNER, runAsClaim: claim });
   });
 
+  it('checks the editor against the chat in the authority record, not a rewritten schedules.json', async () => {
+    const id = await create();
+    // The sandboxed agent can rewrite its BOT_HOME projection; the authority
+    // row still targets oc_target.
+    scheduleStore.projectAuthoritativeTask({ ...record(id).task, chatId: 'oc_projection_only' }, APP);
+    const info = vi.spyOn(logger, 'info');
+    const response = await signed('PATCH', `/api/schedules/${id}`, { prompt: '编辑' }, ALICE.union);
+    expect(response.status).toBe(200);
+    const recorded = info.mock.calls.map(call => String(call[0])).filter(line => line.includes('recorded as creator'));
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toContain('chat=oc_target');
+  });
+
   it('keeps a creator captured under another app, while still applying the edit', async () => {
     const id = await create();
     scheduler.updateRuntimeTaskState(id, { creatorLarkAppId: 'cli_other_app', ownerOpenId: 'ou_other_scope' }, APP);

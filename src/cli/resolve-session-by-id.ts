@@ -19,12 +19,23 @@ import type { Session } from '../types.js';
 import { formatUnmigratedMessage, isSessionScopedCliProcess } from '../services/session-store-copy.js';
 import { knownBotAppIds } from '../services/known-bot-app-ids.js';
 import { findOnlineDaemon, listOnlineDaemons, type OnlineDaemonInfo } from '../utils/daemon-discovery.js';
+import { daemonVersionDiffersFromDisk, stripBotmuxVersionPrefix } from '../utils/daemon-version-display.js';
 
 export type ResolveSessionByIdOk = { ok: true; session: Session; source: 'daemon' | 'store' };
 export type ResolveSessionByIdErr = {
   ok: false;
   reason: 'not_found' | 'unmigrated' | 'app_id_mismatch' | 'session_id_mismatch';
   message: string;
+  /** Who was asked and what the store says, for the caller's diagnostic line. */
+  diagnostics?: ResolveSessionDiagnostics;
+};
+
+export type ResolveSessionDiagnostics = {
+  /** Daemons queried, with the version each advertises in its descriptor. */
+  askedDaemons: Array<{ appId: string; version?: string }>;
+  /** App the session belongs to per the session store, read after an
+   *  authoritative 404 (absent when the store has no such row). */
+  ownerAppId?: string;
 };
 export type ResolveSessionByIdResult = ResolveSessionByIdOk | ResolveSessionByIdErr;
 
@@ -39,6 +50,8 @@ export type ResolveSessionByIdDeps = {
   /** Bots that still exist (configured / online / own); leftover JSON of any
    *  other app id is abandoned data, not `unmigrated`. Computed when omitted. */
   knownAppIds?: ReadonlySet<string>;
+  /** Version of this CLI, to flag a daemon still running another build. */
+  cliVersion?: string;
 };
 
 function asSession(row: unknown): Session | undefined {
@@ -181,8 +194,74 @@ export async function resolveSessionById(
       if (envAppId) { sawAuthoritativeMiss = true; break; }
     }
   }
+  const askedDaemons = candidates.map(d => ({
+    appId: d.larkAppId,
+    ...(d.botmuxVersion ? { version: d.botmuxVersion } : {}),
+  }));
   if (sawAuthoritativeMiss) {
-    return { ok: false, reason: 'not_found', message: `未找到 session ${sessionId}` };
+    return authoritativeMiss(sessionId, envAppId!, askedDaemons, { ...deps, env });
   }
-  return readFromStore(sessionId, { ...deps, env });
+  const fromStore = readFromStore(sessionId, { ...deps, env });
+  if (fromStore.ok) return fromStore;
+  const stale = fromStore.reason === 'not_found'
+    ? staleDaemonNote(askedDaemons, deps.cliVersion, env)
+    : undefined;
+  return {
+    ...fromStore,
+    ...(stale ? { message: `${fromStore.message}（${stale}）` } : {}),
+    diagnostics: { askedDaemons },
+  };
+}
+
+function staleDaemonNote(
+  askedDaemons: ResolveSessionDiagnostics['askedDaemons'],
+  cliVersion: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  const stale = askedDaemons.find(d => daemonVersionDiffersFromDisk(d.version, cliVersion));
+  if (!stale) return undefined;
+  // Design doc 2026-08-12 §3.6: a session subprocess (an unsandboxed session
+  // shell IS the host) gets STATE ONLY — no fleet-level command and no pid /
+  // port / version numbers, because an agent that follows a `botmux restart`
+  // hint would restart the very fleet its own daemon runs in. The operator
+  // wording (versions + command) is for host shells only.
+  if (isSessionScopedCliProcess(env)) {
+    return '被问的 daemon 与当前 CLI 版本不一致，本次未做任何修改';
+  }
+  return `被问的 daemon（${stale.appId}）版本 v${stripBotmuxVersionPrefix(stale.version!)} `
+    + `与当前 CLI v${stripBotmuxVersionPrefix(cliVersion!)} 不一致，请在宿主终端执行 botmux restart 后重试`;
+}
+
+/**
+ * The owning daemon said 404. That stays the answer, but say why where we can:
+ * a row in the store under ANOTHER app means the session id was sent with the
+ * wrong bot identity, and a daemon still on another build may simply not know
+ * the lookup this CLI performs.
+ */
+function authoritativeMiss(
+  sessionId: string,
+  envAppId: string,
+  askedDaemons: ResolveSessionDiagnostics['askedDaemons'],
+  deps: ResolveSessionByIdDeps,
+): ResolveSessionByIdErr {
+  let ownerAppId: string | undefined;
+  try {
+    const snapshot = (deps.loadSnapshot ?? loadAllSessionsSnapshot)({
+      dataDir: deps.dataDir,
+      knownAppIds: deps.knownAppIds ?? knownBotAppIds({ dataDir: deps.dataDir, env: deps.env ?? process.env }),
+    });
+    ownerAppId = snapshot.get(sessionId)?.larkAppId || undefined;
+  } catch { /* unreadable store (sandbox): the 404 alone stands */ }
+  const notes: string[] = [];
+  if (ownerAppId && ownerAppId !== envAppId) {
+    notes.push(`该会话属于 app ${ownerAppId}，不属于当前 BOTMUX_LARK_APP_ID=${envAppId}`);
+  }
+  const stale = staleDaemonNote(askedDaemons, deps.cliVersion, deps.env ?? process.env);
+  if (stale) notes.push(stale);
+  return {
+    ok: false,
+    reason: 'not_found',
+    message: `未找到 session ${sessionId}${notes.length ? `（${notes.join('；')}）` : ''}`,
+    diagnostics: { askedDaemons, ...(ownerAppId ? { ownerAppId } : {}) },
+  };
 }
