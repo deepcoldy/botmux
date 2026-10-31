@@ -26,7 +26,12 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, env, model, disableCliBypass }) {
       const args: string[] = [];
       if (!disableCliBypass) {
-        args.push('--yolo');
+        // Kimi Code's `--yolo` stopped meaning "approve everything": since
+        // 0.28 it auto-approves only regular tool calls, and since 2.0 it is
+        // "Ask When Needed" (risky actions, questions and plans still stop for
+        // a human). `--auto` ("Never Ask") is the approval bypass that
+        // disableCliBypass guards; it is present from 0.10.0 on.
+        args.push('--auto');
       }
       if (model && model.trim()) {
         args.push('--model', model.trim());

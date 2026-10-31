@@ -79,6 +79,10 @@ import {
   type SandboxWrapperLaunch,
 } from './core/sandbox-wrapper-launch.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, larkCliChildDataRoot, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
+import { botmuxInstallRootMaskPaths } from './adapters/cli/install-root-masks.js';
+import { plausibleConfiguredBotmuxHome } from './core/skills/snapshot.js';
+import { skillStoreDir } from './core/skills/registry-paths.js';
+import { pluginsHome } from './core/plugins/paths.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
@@ -24119,6 +24123,18 @@ async function spawnCli(
       throw new Error(msg);
     }
 
+    // Non-code entries of a git checkout install root (.env, bots configs,
+    // login state, .git, …) — hidden even though the root itself is read-only.
+    const installRootMasksStartedAt = Date.now();
+    const installRootMasks = botmuxInstallRootMaskPaths(botmuxInstallRoot);
+    const installRootMasksMs = Date.now() - installRootMasksStartedAt;
+    if (installRootMasksMs >= 500) {
+      log(`[file-sandbox] listing untracked files of ${botmuxInstallRoot} took ${installRootMasksMs}ms`);
+    }
+    if (installRootMasks.fallbackReason) {
+      log(`[file-sandbox] could not list untracked files of ${botmuxInstallRoot} (${installRootMasks.fallbackReason}); `
+        + `masking the well-known credential names only`);
+    }
     const fsPolicyCtx = {
       platform: process.platform as 'darwin' | 'linux',
       homeDir: sandboxHome,
@@ -24147,6 +24163,14 @@ async function spawnCli(
       // denying only one leaves the sibling-daemon escalation open (codex P1).
       // Deduped inside buildFsPolicy when the two are equal (default layout).
       defaultBotmuxHome: canonical(defaultBotmuxHome),
+      // dirname(dataDir) is a botmux home only in the standard / custom-instance
+      // layouts; for $HOME/data or /data it is $HOME or / (same check the skill
+      // snapshot trust uses). fs-policy narrows the transport ceiling then.
+      botmuxHomePlausible: plausibleConfiguredBotmuxHome(dirname(dataDir), {
+        defaultBotmux: defaultBotmuxHome,
+        storeDir: skillStoreDir(),
+        pluginsDir: pluginsHome(),
+      }),
       // The ACTUAL loaded bots-config path, frozen by the daemon
       // (getLoadedConfigPath), NOT guessed from BOTS_CONFIG env here. Inside a
       // frozen root → the parent mask already covers it; OUTSIDE every root →
@@ -24236,6 +24260,7 @@ async function spawnCli(
         ...piInitialPromptReadonlyRoots,
       ]),
       botmuxInstallRoot,
+      botmuxInstallRootMaskPaths: installRootMasks.paths,
       outbox,
       extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir]),
       userPaths,
@@ -24260,7 +24285,8 @@ async function spawnCli(
         // spawn CLOSED with a diagnostic — never a silent parent-dir mask that
         // would hide /tmp, /etc, or a project root and brick the core CLI (codex P1).
         if (err instanceof FsPolicyConfigError) {
-          const msg = `[file-sandbox] refusing to start no-transport session ${cfg.sessionId}: ${err.message}`;
+          const scope = larkTransportEnabled ? 'session' : 'no-transport session';
+          const msg = `[file-sandbox] refusing to start ${scope} ${cfg.sessionId}: ${err.message}`;
           log(msg);
           throw new Error(msg);
         }
