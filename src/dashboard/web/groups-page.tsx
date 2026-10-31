@@ -1,3 +1,4 @@
+import { GroupMessageRecall } from './group-message-recall.js';
 import { GroupIdleCloseRow } from './group-idle-close.js';
 import { GroupCardModeRow } from './group-card-mode.js';
 import { GroupReplyModeRow, useGroupTopology } from './group-reply-mode.js';
@@ -80,7 +81,7 @@ import {
 
 type Translator = ReturnType<typeof useT>;
 
-type ManageTab = 'overview' | 'bots' | 'collab' | 'access' | 'danger';
+type ManageTab = 'overview' | 'bots' | 'collab' | 'access' | 'recall' | 'danger';
 
 type DialogState =
   | { type: 'create'; template?: GroupCloneTemplate }
@@ -1298,6 +1299,7 @@ const MANAGE_TABS: Array<{ id: ManageTab; labelKey: string }> = [
   { id: 'bots', labelKey: 'groups.tabBots' },
   { id: 'collab', labelKey: 'groups.tabCollab' },
   { id: 'access', labelKey: 'groups.tabAccess' },
+  { id: 'recall', labelKey: 'groups.recallTitle' },
   { id: 'danger', labelKey: 'groups.tabDanger' },
 ];
 
@@ -1718,6 +1720,10 @@ export function ManageDialog(props: {
             <legend>{tr('grantAdmin.sectionTitle')}</legend>
             <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
           </fieldset>
+        </section>
+
+        <section role="tabpanel" id="g-manage-panel-recall" aria-labelledby="g-manage-tab-recall" hidden={tab !== 'recall'}>
+          <GroupMessageRecall key={chat.chatId} chatId={chat.chatId} bots={inChat} active={tab === 'recall'} disabled={!available} />
         </section>
 
         <section role="tabpanel" id="g-manage-panel-danger" aria-labelledby="g-manage-tab-danger" hidden={tab !== 'danger'}>

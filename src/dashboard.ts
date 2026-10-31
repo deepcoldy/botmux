@@ -7208,6 +7208,27 @@ const server = createServer(async (req, res) => {
       return writeHandlerResult(res, result);
     }
 
+    let mGroupMessages: RegExpMatchArray | null;
+    if ((mGroupMessages = url.pathname.match(/^\/api\/groups\/([^/]+)\/messages\/([^/]+)(\/recall)?$/))) {
+      const chatId = decodeURIComponent(mGroupMessages[1]);
+      const appId = decodeURIComponent(mGroupMessages[2]);
+      const recall = !!mGroupMessages[3];
+      if (req.method !== (recall ? 'POST' : 'GET')) return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      let body: string | undefined;
+      if (recall) {
+        try { body = JSON.stringify(await readJsonBody(req)); }
+        catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      }
+      const upstream = await proxyToDaemon(appId,
+        `/api/groups/${encodeURIComponent(chatId)}/messages${recall ? '/recall' : url.search}`, {
+          method: req.method,
+          ...(body ? { headers: { 'content-type': 'application/json' }, body } : {}),
+        });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Disband a chat. Body: `{ larkAppId }` — the bot whose daemon should
     // perform the delete. See `dashboard/groups-action-helpers.ts:disbandGroup`.
     let mDisband: RegExpMatchArray | null;

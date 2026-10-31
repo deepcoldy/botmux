@@ -35315,3 +35315,17 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .sessions-page .sessions-filter-chips .sessions-filter-clear:hover {
   text-decoration: underline;
 }
+
+/* Message recall stays inside the group-management drawer, including narrow screens. */
+.group-recall-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 0; }
+.group-recall-toolbar > label { display: flex; align-items: center; gap: 8px; }
+.group-recall-toolbar select { max-width: 240px; margin: 0; }
+.group-recall-list { list-style: none; padding: 0; margin: 0; }
+.group-recall-list > li { display: flex; align-items: flex-start; gap: 10px; padding: 14px 0; border-bottom: 1px solid var(--border-soft); }
+.group-recall-list > li > input { flex: none; margin-top: 5px; }
+.group-recall-message { min-width: 0; flex: 1; }
+.group-recall-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
+.group-recall-meta strong { color: var(--fg); }
+.group-recall-message pre { margin: 8px 0; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; font-size: 13px; background: transparent; padding: 0; }
+.group-recall-list > li.recalled { opacity: .65; }
+.group-recall-results { padding: 10px; background: var(--bg-soft); border-radius: 8px; overflow-wrap: anywhere; }
