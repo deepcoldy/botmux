@@ -119,7 +119,7 @@ if (useMockLlm) {
 
 /**
  * Bot env that points a public CLI at the mock (verified per CLI against the
- * mock: OpenCode, Kimi, Gemini). Pi, Oh My Pi and Grok read the mock from
+ * mock: OpenCode, Kimi, Antigravity). Pi, Oh My Pi and Grok read the mock from
  * config files under $HOME that the workflow writes (they have no env form),
  * so they need nothing here.
  */
@@ -157,18 +157,16 @@ function mockCliEnv(cliId: string, baseUrl: string): Record<string, string> | nu
         KIMI_CODE_NO_AUTO_UPDATE: '1',
         KIMI_DISABLE_TELEMETRY: '1',
       };
-    case 'gemini':
-      // Gemini CLI detects the GitHub runner twice over:
-      // - CI or GITHUB_ACTIONS "true": it runs headless, reads the prompt from
-      //   stdin, finds none and exits 42 before every turn;
-      // - GITHUB_SHA set: its shell tool strips every variable outside a short
-      //   allow-list, BOTMUX_* included, so `botmux send` cannot reply.
+    case 'antigravity':
+      // With the workflow's settings.json (modelProvider "gemini") agy talks
+      // to the Gemini API at GOOGLE_GEMINI_BASE_URL with this key, no Google
+      // sign-in. agy compares this var to the literal string "true" (verified
+      // against 1.4.12): "1" still spawns its background updater, which would
+      // swap the pinned binary mid-run.
       return {
-        GOOGLE_GEMINI_BASE_URL: baseUrl,
         GEMINI_API_KEY: 'mock-test-key',
-        CI: 'false',
-        GITHUB_ACTIONS: 'false',
-        GITHUB_SHA: '',
+        GOOGLE_GEMINI_BASE_URL: baseUrl,
+        AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       };
     case 'pi':
       return { PI_SKIP_VERSION_CHECK: '1' };

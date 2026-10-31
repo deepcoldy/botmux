@@ -5678,7 +5678,7 @@ function writeCliPidMarker(): void {
             const raw = readFileSync(markerPath, 'utf-8');
             const parsed = JSON.parse(raw);
             if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
-              if (retiredTurnIds.has(parsed.turnId)) {
+              if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
                 // Disk holds an older turn that worker memory has already retired/advanced past.
                 // Do not adopt it back; allow write to overwrite disk with currentBotmuxTurnId.
               } else {
@@ -5713,7 +5713,7 @@ function writeCliPidMarker(): void {
             }
             if (parsed && Array.isArray(parsed.queuedTurns)) {
               for (const qt of parsed.queuedTurns) {
-                if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
+                if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
                   queuedTypeAheadTurns.push({
                     turnId: qt.turnId,
                     ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
@@ -5874,7 +5874,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
-          if (retiredTurnIds.has(parsed.turnId)) {
+          if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
             // Disk holds an older turn that worker memory has already retired/advanced past.
           } else {
             const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
@@ -5914,7 +5914,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
         }
         if (parsed && Array.isArray(parsed.queuedTurns)) {
           for (const qt of parsed.queuedTurns) {
-            if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
+            if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
               queuedTypeAheadTurns.push({
                 turnId: qt.turnId,
                 ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
@@ -5940,6 +5940,12 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
 
 function advanceQueuedTypeAheadTurn(reason: string): boolean {
   if (syncQueuedTurnsFromMarkerDisk()) return true;
+  while (queuedTypeAheadTurns[0]
+    && turnTerminalEmitted(queuedTypeAheadTurns[0].turnId, queuedTypeAheadTurns[0].dispatchAttempt)) {
+    const finished = queuedTypeAheadTurns[0];
+    dropQueuedTurnRecord(finished.turnId, finished.dispatchAttempt);
+    log(`Skipped type-ahead turn ${finished.turnId.slice(0, 12)} whose terminal already went out (${reason})`);
+  }
   if (queuedTypeAheadTurns.length === 0) return false;
   const next = queuedTypeAheadTurns.shift()!;
   const prevTurnId = currentBotmuxTurnId;
@@ -16576,8 +16582,12 @@ function releaseInputDeliveryQuarantine(
     queueMicrotask(() => {
       if (backend !== quarantine.backend || cliSpawnGeneration !== quarantine.generation
         || cliRestartInProgress) return;
-      if (isPromptReady) void flushPending();
-      else idleDetector?.fireIdle();
+      // Re-drive the queue itself, like a new arrival does: type-ahead
+      // admission does not wait for prompt-ready, and while the predecessor
+      // turn is still open the idle edge below is fenced and never flushes.
+      // flushPending re-checks every delivery gate (#2642).
+      void flushPending();
+      if (!isPromptReady) idleDetector?.fireIdle();
     });
   }
   return true;
@@ -29421,6 +29431,120 @@ function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: nu
   if (turnId) send({ type: 'turn_execution_started', turnId, dispatchAttempt, startedAtMs });
 }
 
+/** The authority can be left holding a turn whose terminal already went out:
+ *  a lagging type-ahead advance or an adopted envelope of a finished turn. That
+ *  turn never emits again, so a later terminal is the only edge left to free
+ *  it — otherwise every queueAfterActiveTurn input (scheduled fires) parks
+ *  behind it for good while the CLI sits idle.
+ *
+ *  Trade-off: a write reported ambiguous/failed whose input is in fact still
+ *  running has a claimed terminal too, so its authority can be released early
+ *  and the next queued input may interleave with it. The previous behaviour
+ *  for a dead holder was a permanent wedge; an early release is the lesser
+ *  harm. */
+function releaseTerminatedActiveTurnAuthority(): void {
+  const active = activeTurnAuthority.snapshot();
+  if (!sessionId || !active?.turnId) return;
+  if (emittedTurnTerminals.statusOf(sessionId, active.turnId, active.dispatchAttempt) === undefined) return;
+  releaseActiveTurnAuthority('stale_terminal', { turnId: active.turnId, dispatchAttempt: active.dispatchAttempt });
+}
+
+/** Claude can fold a type-ahead input into the running turn (queued_command)
+ *  and end both together, before attribution ever advances to the queued
+ *  record. Advancing afterwards hands the active turn authority to a finished
+ *  turn that never sees another terminal. Drop the record once its terminal is
+ *  out; the tombstone keeps the PID-marker sync from re-adding it. */
+function retireTerminatedQueuedTurn(turnId: string, dispatchAttempt?: number): void {
+  if (turnId === currentBotmuxTurnId) return;
+  if (dropQueuedTurnRecord(turnId, dispatchAttempt)) writeCliPidMarker();
+}
+
+/** Remove one type-ahead record and tombstone its id. Returns false when no
+ *  record matched. Does not rewrite the PID marker. The caller opts out of the
+ *  turnId tombstone when a durable retry under another dispatchAttempt must
+ *  survive (the tombstone is attempt-agnostic and would kill it too). */
+function dropQueuedTurnRecord(
+  turnId: string,
+  dispatchAttempt?: number,
+  opts: { tombstone?: boolean } = {},
+): boolean {
+  const before = queuedTypeAheadTurns.length;
+  queuedTypeAheadTurns = queuedTypeAheadTurns.filter(queued => queued.turnId !== turnId
+    || (queued.dispatchAttempt !== undefined && queued.dispatchAttempt !== dispatchAttempt));
+  if (queuedTypeAheadTurns.length === before) return false;
+  // A retry of the same turn under another attempt is still live work.
+  if (opts.tombstone !== false
+    && !queuedTypeAheadTurns.some(queued => queued.turnId === turnId)) markTurnRetired(turnId);
+  return true;
+}
+
+function turnTerminalEmitted(turnId: string, dispatchAttempt?: number): boolean {
+  return !!sessionId && emittedTurnTerminals.statusOf(sessionId, turnId, dispatchAttempt) !== undefined;
+}
+
+/** Whether a queuedTurns entry read back from the PID marker still names live
+ *  work.
+ *  - retiredTurnIds is attempt-agnostic and holds every turn the worker has
+ *    already advanced past. A lagging marker must never refill one of those:
+ *    re-adopting it hands the authority to a finished execution whose terminal
+ *    can no longer release the attempt-qualified tuple (an ordinary terminal
+ *    is keyed without an attempt) — the permanent wedge this guard prevents.
+ *    The live-durable-retry carve-out lives upstream in
+ *    retireTerminatedMarkerTurn, which refuses to place this tombstone while a
+ *    sibling attempt is still live.
+ *  - The entry's own per-attempt terminal blocks readback. An ordinary
+ *    attempt-less terminal for the same turn blocks it only at a terminal
+ *    outcome ('completed'/'cancelled'): durable delivery legitimately
+ *    re-dispatches after 'failed'/'ambiguous' with dispatchAttempt + 1
+ *    (markVcMeetingDeliveryDispatched), so those statuses must not drop the
+ *    in-flight retry — the following writeCliPidMarker would wipe it from the
+ *    on-disk queue as well. */
+function markerQueuedTurnStillLive(qt: { turnId?: unknown; dispatchAttempt?: unknown }): boolean {
+  if (typeof qt?.turnId !== 'string' || !qt.turnId) return false;
+  if (retiredTurnIds.has(qt.turnId)) return false;
+  const dispatchAttempt = typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined;
+  if (turnTerminalEmitted(qt.turnId, dispatchAttempt)) return false;
+  if (dispatchAttempt !== undefined && sessionId) {
+    const genericStatus = emittedTurnTerminals.statusOf(sessionId, qt.turnId, undefined);
+    if (genericStatus === 'completed' || genericStatus === 'cancelled') return false;
+  }
+  return true;
+}
+
+/** The PID marker can still name a turn whose terminal went out before the
+ *  worker advanced to it. Adopting it would hand the active turn authority to
+ *  a finished turn, so retire it instead and let the in-memory advance move on
+ *  to the next unfinished record. The head's parsed `queuedTurns` travel in
+ *  the same marker JSON and are consulted for a live sibling attempt: a
+ *  durable retry under another dispatchAttempt must not fall under the
+ *  attempt-agnostic tombstone. Called under the marker lock: no marker
+ *  rewrite here. */
+function retireTerminatedMarkerTurn(parsed: {
+  turnId: string;
+  dispatchAttempt?: unknown;
+  queuedTurns?: ReadonlyArray<{ turnId?: unknown; dispatchAttempt?: unknown }>;
+}): boolean {
+  const queued = queuedTypeAheadTurns.find(t => t.turnId === parsed.turnId);
+  const dispatchAttempt = typeof parsed.dispatchAttempt === 'number'
+    ? parsed.dispatchAttempt
+    : queued?.dispatchAttempt;
+  if (!turnTerminalEmitted(parsed.turnId, dispatchAttempt)) return false;
+  const siblingIsLive = (candidate: { turnId?: unknown; dispatchAttempt?: unknown } | undefined): boolean => {
+    if (!candidate || candidate.turnId !== parsed.turnId) return false;
+    const siblingAttempt = typeof candidate.dispatchAttempt === 'number'
+      ? candidate.dispatchAttempt
+      : undefined;
+    // A same-attempt sibling is the head itself: its terminal is the one that
+    // was just confirmed emitted, so this lookup returns false for it too.
+    return !turnTerminalEmitted(parsed.turnId, siblingAttempt);
+  };
+  const liveSibling = queuedTypeAheadTurns.some(siblingIsLive)
+    || (parsed.queuedTurns ?? []).some(siblingIsLive);
+  dropQueuedTurnRecord(parsed.turnId, dispatchAttempt, { tombstone: !liveSibling });
+  if (!liveSibling) markTurnRetired(parsed.turnId);
+  return true;
+}
+
 /** Report CLI processing completion independently from user-visible output.
  *  Keep a bounded worker-local dedup set because transcript watchers and app
  *  runners may surface the same final boundary more than once. */
@@ -29460,7 +29584,10 @@ function emitTurnTerminal(
   }
   // Revoke before publishing terminal. A stale terminal from a superseded
   // same-principal steer must not clear the newer turn's authority.
-  releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
+  if (!releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt })) {
+    releaseTerminatedActiveTurnAuthority();
+  }
+  retireTerminatedQueuedTurn(turnId, dispatchAttempt);
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
     flushThinkingUpdate();
   }

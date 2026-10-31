@@ -251,18 +251,27 @@ jobs:
       - name: Install public CLI runtimes and sandbox tools for the core-clis and core-sandbox lanes
         if: steps.feishu_config.outputs.ready == 'true'
         # Each CLI talks to the mock LLM on 127.0.0.1:9999 (scripts/run-e2e.ts).
-        # OpenCode, Kimi and Gemini get it through the bot env (mockCliEnv);
+        # OpenCode, Kimi and Antigravity get it through the bot env (mockCliEnv);
         # Pi, Oh My Pi and Grok only read it from these files. Versions are
         # pinned: newer Kimi releases ask to trust the folder, and an unpinned
         # CLI auto-updating mid-run would change what is under test.
         run: |
-          npm install -g opencode-ai@1.19.3 @earendil-works/pi-coding-agent@1.3.0 @google/gemini-cli@0.66.0
+          npm install -g opencode-ai@1.19.3 @earendil-works/pi-coding-agent@1.3.0
           bun add -g @oh-my-pi/pi-coding-agent@18.10.1
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
           curl -fsSL https://code.kimi.com/kimi-code/install.sh | KIMI_VERSION=0.31.0 KIMI_NO_MODIFY_PATH=1 bash
           echo "$HOME/.kimi-code/bin" >> "$GITHUB_PATH"
           curl -fsSL https://x.ai/cli/install.sh | bash -s 1.0.70
           echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+          # Antigravity: the tarball its own updater installs (manifest at
+          # antigravity-cli-auto-updater-…run.app/manifests/linux_amd64.json),
+          # pinned by version and checksum.
+          curl -fsSL -o /tmp/agy.tar.gz https://storage.googleapis.com/antigravity-public/antigravity-cli/1.4.12-4768735748292608/linux-x64/cli_linux_x64.tar.gz
+          echo "ea01c73b772187bca928852cf96235f0d846d6da5ebdac188b9ae719597465737f325540d483ee5f3f62d151029001713344972a187ddfb98cc7b97f7204b7f4  /tmp/agy.tar.gz" | sha512sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/agy.tar.gz -C /tmp antigravity
+          install -m 0755 /tmp/antigravity "$HOME/.local/bin/agy"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
           # Pi: without a default provider it picks Anthropic from the mock key
           # in the env and calls the real API.
@@ -279,10 +288,15 @@ jobs:
           mkdir -p ~/.grok
           printf '[cli]\nauto_update = false\nshow_tips = false\n\n[features]\ntelemetry = false\n\n[models]\ndefault = "mock"\n\n[model.mock]\nmodel = "mock-model"\nname = "Mock"\nbase_url = "http://127.0.0.1:9999/v1"\napi_backend = "messages"\napi_key = "mock-test-key"\ncontext_window = 200000\n' > ~/.grok/config.toml
 
-          # Gemini: an unanswered auth or folder-trust dialog swallows the
-          # first prompt; auto-update would npm-install a newer CLI mid-run.
-          mkdir -p ~/.gemini
-          echo '{"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false},"security":{"auth":{"selectedType":"gemini-api-key"},"folderTrust":{"enabled":false}},"privacy":{"usageStatisticsEnabled":false}}' > ~/.gemini/settings.json
+          # Antigravity: modelProvider "gemini" runs it against the Gemini API
+          # (the mock) without a Google sign-in; the onboarding cache skips the
+          # first-run colour-scheme and terms screens, which would swallow the
+          # first prompt. The worker accepts the folder-trust dialog itself.
+          # agy compares this env var to the literal string "true" (verified
+          # against 1.4.12): "1"/"TRUE" still spawn its background updater.
+          mkdir -p ~/.gemini/antigravity-cli/cache
+          echo '{"modelProvider":"gemini"}' > ~/.gemini/antigravity-cli/settings.json
+          echo '{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}' > ~/.gemini/antigravity-cli/cache/onboarding.json
 
           # The core-sandbox lane: bubblewrap, and Ubuntu 24.04 restricts
           # unprivileged user namespaces through AppArmor by default.
@@ -291,7 +305,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
-          export PATH="$HOME/.bun/bin:$HOME/.kimi-code/bin:$HOME/.grok/bin:$PATH"
+          export PATH="$HOME/.bun/bin:$HOME/.kimi-code/bin:$HOME/.grok/bin:$HOME/.local/bin:$PATH"
           # OpenCode's first start downloads its model catalog and installs a
           # plugin; a first message typed meanwhile was lost (submit_unconfirmed).
           timeout 180 opencode models >/dev/null 2>&1 || true
@@ -300,7 +314,7 @@ jobs:
           omp --version
           kimi --version
           grok --version
-          gemini --version
+          AGY_CLI_DISABLE_AUTO_UPDATE=true agy --version
 
       - name: Build Botmux
         if: steps.feishu_config.outputs.ready == 'true'
@@ -318,21 +332,6 @@ jobs:
           FEISHU_E2E_CASES: ${{ steps.feishu_config.outputs.cases }}
           FEISHU_E2E_CONCURRENCY: ${{ inputs.feishu_concurrency || '4' }}
         run: bun run test:midscene:feishu
-
-      - name: Print Gemini shell env snapshot
-        if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
-        # Diagnostic for the core-clis Gemini lane: shows whether the per-bot
-        # GITHUB_SHA:'' reached the shell tool as set-empty ({x:}) vs unset
-        # ({:}) vs a leaked runner value ({x:abc}), and whether BOTMUX_* vars
-        # survived gemini-cli's environment sanitization.
-        run: |
-          if [ -f .e2e-gemini-shell-env.log ]; then
-            echo "::group::Gemini shell env snapshot"
-            cat .e2e-gemini-shell-env.log
-            echo "::endgroup::"
-          else
-            echo "No Gemini shell env snapshot (gemini shell tool never ran)."
-          fi
 
       - name: Upload Feishu Midscene data
         if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'

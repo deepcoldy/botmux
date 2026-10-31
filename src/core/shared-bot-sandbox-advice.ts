@@ -22,6 +22,9 @@ export const ALLOWLIST_SANDBOX_CLI_SUPPORT: Readonly<Partial<Record<CliId, 'veri
   'claude-code': 'verified',
   'codex': 'verified',
   'codex-app': 'unsupported',
+  // `gemini` is absent: Gemini CLI stopped being maintained and its adapter was
+  // removed (adapters/cli/retired-cli.ts); Antigravity (agy) took its matrix row.
+  'antigravity': 'verified',
   'opencode': 'verified',
   'pi': 'verified',
   'oh-my-pi': 'verified',

@@ -25,7 +25,7 @@ const BASE_SCENARIOS = [
   'bot-pi-basic',
   'bot-ohmypi-basic',
   'bot-kimi-basic',
-  'bot-gemini-basic',
+  'bot-antigravity-basic',
   'bot-grok-basic',
   'bot-reply-smoke',
   'bot-collaboration',
@@ -100,10 +100,10 @@ const BASE_TARGETS: Record<(typeof BASE_SCENARIOS)[number], ScenarioTarget> = {
     suite: 'Kimi basic flow',
     test: 'sends hello, receives streaming card and actual reply from Kimi',
   },
-  'bot-gemini-basic': {
-    module: 'feishu-bot-gemini.e2e.ts',
-    suite: 'Gemini basic flow',
-    test: 'sends hello, receives streaming card and actual reply from Gemini',
+  'bot-antigravity-basic': {
+    module: 'feishu-bot-antigravity.e2e.ts',
+    suite: 'Antigravity basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Antigravity',
   },
   'bot-grok-basic': {
     module: 'feishu-bot-grok.e2e.ts',

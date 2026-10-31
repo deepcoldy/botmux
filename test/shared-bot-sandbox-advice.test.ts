@@ -126,18 +126,22 @@ describe('allowlist sandbox CLI support table', () => {
   // matrix has to update this test on purpose (deriving the expectation from
   // the table itself let a fully emptied table stay green).
   const EXPECTED_VERIFIED: readonly string[] = [
-    'claude-code', 'codex', 'opencode', 'pi', 'oh-my-pi', 'grok', 'kimi',
+    'claude-code', 'codex', 'antigravity', 'opencode', 'pi', 'oh-my-pi', 'grok', 'kimi',
   ];
 
   it('lists exactly the matrix-verified CLI ids in table order', () => {
     expect(allowlistSandboxVerifiedClis()).toEqual(EXPECTED_VERIFIED);
-    expect(EXPECTED_VERIFIED).toHaveLength(7);
+    expect(EXPECTED_VERIFIED).toHaveLength(8);
   });
 
   it('names only real CLIs, so the advice can list them by display name', () => {
     for (const id of allowlistSandboxVerifiedClis()) expect(CLI_DISPLAY_NAMES[id]).toBeTruthy();
     expect(allowlistSandboxVerifiedClis()).not.toContain('codex-app');
     expect(ALLOWLIST_SANDBOX_CLI_SUPPORT['codex-app']).toBe('unsupported');
+    // Gemini CLI's adapter still ships, but the matrix dropped its row when it
+    // stopped being maintained: it must not be vouched for as verified.
+    expect(ALLOWLIST_SANDBOX_CLI_SUPPORT).not.toHaveProperty('gemini');
+    expect(allowlistSandboxCliSupport('gemini')).toBe('unverified');
     expect(allowlistSandboxCliSupport('not-a-cli')).toBe('unverified');
   });
 });

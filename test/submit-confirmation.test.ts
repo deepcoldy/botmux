@@ -235,6 +235,90 @@ describe('decideSubmitConfirmationAction', () => {
     expect(queue.peek()[0]?.submitConfirmedAtMs).toBeUndefined();
   });
 
+  it('still settles an exact attempt whose native terminal is FIFO-held behind an open predecessor', async () => {
+    // Two distinct native turns: the predecessor stays open, the successor
+    // already closed. The successor is no longer pending but is not replaced
+    // either — its recheck is the only release for an input-delivery hold.
+    const queue = new CodexBridgeQueue();
+    queue.mark('working', 'working ask', 100);
+    queue.mark('capacity', 'correction', 101);
+    queue.ingest([
+      { uuid: 'u-working', timestampMs: 200, kind: 'user', text: 'working ask', sourceTurnId: 'native-working' },
+      { uuid: 'u-capacity', timestampMs: 300, kind: 'user', text: 'correction', sourceTurnId: 'native-capacity' },
+      { uuid: 'a-capacity', timestampMs: 400, kind: 'assistant_final', text: 'done', sourceTurnId: 'native-capacity' },
+    ]);
+    expect(queue.drainEmittable()).toEqual([]);
+    expect(queue.hasPendingTurn('capacity')).toBe(false);
+    expect(queue.hasTerminalTurn('capacity')).toBe(true);
+    let recheckCalls = 0;
+
+    // A missed receipt plus a usage-limit signal (or no activity) would
+    // otherwise fail the attempt and drop its already-collected final.
+    const settlement = await settleDeferredSubmitConfirmation(queue, {
+      turnId: 'capacity',
+      structuredTarget: true,
+      recheck: async () => { recheckCalls++; return false; },
+      usageLimitDetected: () => true,
+      activityEvidence: () => undefined,
+      isCurrent: () => true,
+    });
+
+    expect(recheckCalls).toBe(0);
+    expect(settlement).toEqual({
+      stale: false,
+      action: { kind: 'suppress-active', evidence: 'structured-transcript' },
+      lifecycle: 'unchanged',
+    });
+    expect(queue.hasTerminalTurn('capacity')).toBe(true);
+  });
+
+  it('treats an aborted (empty-final) native terminal as the same closed-but-undrained success', async () => {
+    // turn_aborted closes the exact attempt with an EMPTY finalText, so a
+    // hasTerminalTurn that required non-empty text would silently fall back to
+    // the old stale:attempt drop — stranding the quarantine on TraeX and never
+    // emitting the abort's terminal. An abort proves the input was received and
+    // the turn ran; it is not an "input not submitted" signal.
+    const queue = new CodexBridgeQueue();
+    queue.mark('working', 'working ask', 100);
+    queue.mark('capacity', 'correction', 101);
+    queue.ingest([
+      { uuid: 'u-working', timestampMs: 200, kind: 'user', text: 'working ask', sourceTurnId: 'native-working' },
+      { uuid: 'u-capacity', timestampMs: 300, kind: 'user', text: 'correction', sourceTurnId: 'native-capacity' },
+      { uuid: 't-capacity', timestampMs: 400, kind: 'turn_aborted', text: 'interrupted',
+        terminalStatus: 'ambiguous', terminalErrorCode: 'structured_turn_aborted',
+        sourceTurnId: 'native-capacity' },
+    ]);
+    expect(queue.drainEmittable()).toEqual([]);
+    expect(queue.hasPendingTurn('capacity')).toBe(false);
+    // The empty-string final must still count as a terminal (not as pending and
+    // not as missing): this is the line a `finalText !== ''` regression breaks.
+    expect(queue.hasTerminalTurn('capacity')).toBe(true);
+    let recheckCalls = 0;
+
+    const settlement = await settleDeferredSubmitConfirmation(queue, {
+      turnId: 'capacity',
+      structuredTarget: true,
+      recheck: async () => { recheckCalls++; return false; },
+      usageLimitDetected: () => true,
+      activityEvidence: () => undefined,
+      isCurrent: () => true,
+    });
+
+    expect(recheckCalls).toBe(0);
+    expect(settlement).toEqual({
+      stale: false,
+      action: { kind: 'suppress-active', evidence: 'structured-transcript' },
+      lifecycle: 'unchanged',
+    });
+    // The aborted turn is retained (empty final + ambiguous status) so the FIFO
+    // drain still emits its exact terminal; it is not dropped as a failed mark.
+    const aborted = queue.peek().find(turn => turn.turnId === 'capacity')!;
+    expect(aborted.finalText).toBe('');
+    expect(aborted.terminalStatus).toBe('ambiguous');
+    expect(aborted.terminalErrorCode).toBe('structured_turn_aborted');
+    expect(queue.hasTerminalTurn('capacity')).toBe(true);
+  });
+
   it('rechecks generation after an awaited callback and returns no stale session side effect', async () => {
     const queue = new CodexBridgeQueue();
     queue.mark('delivery', 'durable body', 100, 1);

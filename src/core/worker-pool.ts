@@ -824,7 +824,7 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
-import { recordDispatchInputCommit, resolveProseBotMentions } from './dispatch.js';
+import { recordDispatchInputCommit, resolveProseBotMentions, unboundInputCommitLogLevel } from './dispatch.js';
 import { loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
@@ -16205,7 +16205,7 @@ function setupWorkerHandlers(
             markMessageListenerRunPreviewRunning(msg.turnId);
           }
         } else {
-          logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+          logger[unboundInputCommitLogLevel(msg.turnId)](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;

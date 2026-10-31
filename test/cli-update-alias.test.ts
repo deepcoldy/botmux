@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -10,27 +10,28 @@ const PROJECT_ROOT = join(__dirname, '..');
 
 // 桩 git 输出的哨兵：断言靠它证明 status 调用被桩接住、真实 git/pull 从未执行。
 const STUB_DIRTY_LINE = 'M botmux-test-stub-deliberately-dirty';
+const STUB_STATUS_FAIL = 'botmux-test-stub: synthetic git status failure';
 const STUB_UNEXPECTED = 'botmux-test-stub: unexpected git invocation';
 
 let home: string;
 let stubBin: string;
+let failStubBin: string;
 
-beforeAll(() => {
-  home = mkdtempSync(join(tmpdir(), 'botmux-update-alias-'));
-  // 非空 PATH 目录，里面只有一个桩 git。不能用 PATH:''：Bun 在 PATH 为空/未设时
-  // 会回退到内置默认 PATH，bun-test 腿上因此解析到真实 git，CLI 对 runner 的真实
-  // checkout 跑了 git pull --ff-only（#2643）；非空但没有目标二进制的 PATH 在
-  // Node 与 Bun 下都严格 ENOENT。
-  stubBin = mkdtempSync(join(tmpdir(), 'botmux-update-alias-bin-'));
-  const gitStub = join(stubBin, 'git');
+// 写一个只含桩 git 的非空 PATH 目录。不能用 PATH:''：Bun 在 PATH 为空/未设时会
+// 回退到内置默认 PATH，bun-test 腿上因此解析到真实 git，CLI 对 runner 的真实
+// checkout 跑了 git pull --ff-only（#2643）；非空但没有目标二进制的 PATH 在
+// Node 与 Bun 下都严格 ENOENT。
+function writeGitStub(dir: string, statusBody: { stdout?: string; stderr?: string; exit: number }): void {
+  const bin = join(dir, 'bin');
+  mkdirSync(bin, { recursive: true });
+  const gitStub = join(bin, 'git');
   writeFileSync(gitStub, [
     '#!/bin/sh',
     'case "$1" in',
     '  status)',
-    // 本地更新流程的第一步是 porcelain 干净检查；返回非空让它走既有的
-    // 「工作区不干净，中止更新」路径，不会进入 pull/build/restart。
-    `    echo '${STUB_DIRTY_LINE}'`,
-    '    exit 0',
+    ...(statusBody.stdout ? [`    echo '${statusBody.stdout}'`] : []),
+    ...(statusBody.stderr ? [`    echo '${statusBody.stderr}' >&2`] : []),
+    `    exit ${statusBody.exit}`,
     '    ;;',
     '  *)',
     // 干净检查之后的任何调用都意味着隔离失效（真的要 pull/build 了）。
@@ -41,14 +42,27 @@ beforeAll(() => {
     '',
   ].join('\n'));
   chmodSync(gitStub, 0o755);
+}
+
+beforeAll(() => {
+  home = mkdtempSync(join(tmpdir(), 'botmux-update-alias-'));
+  // 本地更新流程的第一步是 porcelain 干净检查；这个桩返回非空，让 CLI 走既有的
+  // 「工作区不干净，中止更新」路径，不会进入 pull/build/restart。
+  stubBin = mkdtempSync(join(tmpdir(), 'botmux-update-alias-dirty-'));
+  writeGitStub(stubBin, { stdout: STUB_DIRTY_LINE, exit: 0 });
+  // git status 自身失败（git 损坏/IO 错误）：CLI 必须报「读取 git 状态失败」并
+  // 以 exit 1 中止，同样不得进入 pull/build/restart。
+  failStubBin = mkdtempSync(join(tmpdir(), 'botmux-update-alias-fail-'));
+  writeGitStub(failStubBin, { stderr: STUB_STATUS_FAIL, exit: 1 });
 });
 
 afterAll(() => {
   rmSync(home, { recursive: true, force: true });
   rmSync(stubBin, { recursive: true, force: true });
+  rmSync(failStubBin, { recursive: true, force: true });
 });
 
-function runCli(command: string): { status: number | null; stdout: string; stderr: string } {
+function runCli(command: string, binDir: string = stubBin): { status: number | null; stdout: string; stderr: string } {
   const result = spawnSyncTsScript(CLI_PATH, [command], {
     cwd: PROJECT_ROOT,
     env: {
@@ -56,7 +70,7 @@ function runCli(command: string): { status: number | null; stdout: string; stder
       HOME: home,
       USERPROFILE: home,
       SESSION_DATA_DIR: join(home, 'data'),
-      PATH: stubBin,
+      PATH: join(binDir, 'bin'),
     },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -84,6 +98,16 @@ describe('botmux update alias', () => {
     expect(update.stdout).toBe(upgrade.stdout);
     expect(update.stderr).toContain(STUB_DIRTY_LINE);
     expect(update.stderr).not.toContain(STUB_UNEXPECTED);
+  });
+
+  it('aborts when the git status check itself fails, without pulling', () => {
+    const result = runCli('upgrade', failStubBin);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('本地 checkout 更新');
+    expect(result.stderr).toContain('读取 git 状态失败');
+    expect(result.stderr).toContain(STUB_STATUS_FAIL);
+    expect(result.stderr).not.toContain(STUB_UNEXPECTED);
   });
 
   it('documents the alias in help', () => {
