@@ -493,6 +493,8 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const retiredTurnIds = new Set();
       const started = [];
       const syncQueuedTurnsFromMarkerDisk = () => false;
+      // No terminal has gone out for any queued record in this scenario.
+      const turnTerminalEmitted = () => false, dropQueuedTurnRecord = () => false;
       const readSendMarkers = () => [];
       const markActiveTurnStarted = record => started.push(record);
       const writeCliPidMarker = () => {}, publishSandboxRelayCapability = () => {}, log = () => {};

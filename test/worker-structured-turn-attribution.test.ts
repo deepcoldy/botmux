@@ -6,6 +6,7 @@ import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
+import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 
 function harness() {
   const scope: Record<string, any> = {
@@ -73,7 +74,11 @@ describe('structured turn send attribution retirement', () => {
         activeTurnAuthority: { snapshot: () => undefined }, sandboxRelayCapability: null,
         withPidMarkerLock: (_path: string, fn: () => void) => fn(), log: vi.fn(),
         adoptInitialActiveTurn: vi.fn(), adoptDisplacedActiveTurn: vi.fn(),
+        emittedTurnTerminals: new TurnTerminalDeduper(),
       });
+      for (const name of ['turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
+        h[name] = loadWorkerFunction(name, h);
+      }
       h.writeCliPidMarker = loadWorkerFunction('writeCliPidMarker', h);
       h.retireStructuredTurnAttribution([{ turnId: 'first' }, { turnId: 'extra' }]);
       const saved = JSON.parse(readFileSync(marker, 'utf8'));
