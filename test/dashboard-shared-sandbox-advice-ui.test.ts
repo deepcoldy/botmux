@@ -35,7 +35,7 @@ describe('Dashboard shared-bot sandbox advice', () => {
     expect(html).toMatch(/<p>开启：在下方选「[^」]+」，新会话生效。<\/p>/);
     expect(html).toContain('<p>当前 CLI：Claude，已验证可用。</p>');
     // Folded: a closed <details> holding the matrix list, literal order.
-    expect(html).toMatch(/<details><summary>已验证可用的 CLI（Linux 实测）<\/summary><p>Claude、Codex、Gemini、OpenCode、Pi、Oh My Pi、Grok Build、Kimi<\/p><\/details>/);
+    expect(html).toMatch(/<details><summary>已验证可用的 CLI（Linux 实测）<\/summary><p>Claude、Codex、Antigravity、OpenCode、Pi、Oh My Pi、Grok Build、Kimi<\/p><\/details>/);
     expect(html).not.toMatch(/<details open/);
   });
 

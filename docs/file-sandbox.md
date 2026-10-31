@@ -374,7 +374,7 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 
 脚本在 `scripts/oncall-cli-matrix/`，必须在 isolate-run 里跑，详见 `lab.sh` 开头的注释。
 
-实测时间 2026-10-30，宿主 Linux 5.15（root daemon），CLI 版本：Claude Code 2.1.312、Codex 0.164.0、Gemini CLI 0.66.0、OpenCode 1.19.3、Kimi 0.31.0、Pi 1.3.0、Oh My Pi 18.10.1、Grok 1.0.70。Gemini、Kimi 的「/restart 恢复」一列是接上会话恢复之后复测的结果（开沙盒、不开沙盒都通过）。
+实测时间 2026-10-30（Antigravity 行 2026-11-01 复测），宿主 Linux 5.15（root daemon），CLI 版本：Claude Code 2.1.312、Codex 0.164.0、Antigravity（agy）1.4.12、OpenCode 1.19.3、Kimi 0.31.0、Pi 1.3.0、Oh My Pi 18.10.1、Grok 1.0.70。Antigravity、Kimi 的「/restart 恢复」一列是接上会话恢复之后复测的结果（开沙盒、不开沙盒都通过）。Gemini CLI 停维，矩阵行 2026-11-01 起被 Antigravity 取代，不再覆盖。
 
 | CLI | 后端 | 启动 | 首轮收发 | shell 工具 | 工作目录读写 | 联网 | botmux send | 宿主凭证不可读 | /restart 恢复 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -384,8 +384,8 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 | Codex | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Codex App | tmux | ⛔ 按设计拒绝启动（见下）| — | — | — | — | — | — | — |
 | Codex App | pty | ⛔ 按设计拒绝启动（见下）| — | — | — | — | — | — | — |
-| Gemini CLI | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Gemini CLI | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Antigravity（agy） | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Antigravity（agy） | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | OpenCode | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | OpenCode | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Kimi | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -405,7 +405,7 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 - 闭源 / 公司内部（本次不在范围）：Seed、Relay、Aiden、CoCo、TRAE（traex）、MTR、Mira、Mir CLI、Genius、ebsd、Riff、Mojo、Remote Runner。Riff、Remote Runner 和全远端的 Mojo 不在本机执行，本地沙盒不包裹；在本机执行的 Mojo 开沙盒会拒绝启动。
 - Codex App：Linux 文件沙盒下按设计拒绝启动（runner 的控制 socket 与 bootstrap 文件在沙盒里不可见），开了白名单隔离的 bot 请改用 Codex。
 - 本机没能配通假模型、未验证：OpenCode 2（不开沙盒时假模型配置也不生效）、Hermes（本机有宿主侧的命令拦截，不开沙盒也起不来）。
-- 只能用官方账号调模型、未验证模型调用：Cursor、Antigravity、Copilot、Kiro。
+- 只能用官方账号调模型、未验证模型调用：Cursor、Copilot、Kiro。（Antigravity 2026-11-01 起已用 `modelProvider: "gemini"` + 假模型按上表实测，不再在此列。）
 - 本机未安装、未验证：DeepSeek Harness（dsh / dsh-tui）、MiniMax Code、Reasonix、MiMoCode、CodeM、ZCode。
 
 **本次为白名单隔离补的路径**（每项都只放行该 CLI 自己的目录）

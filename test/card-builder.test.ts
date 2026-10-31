@@ -855,7 +855,7 @@ describe('buildConfigCard', () => {
     // Literal list, not derived from the table: it must be the matrix result in table order.
     expect(fold(verified).expanded).toBe(false);
     expect(fold(verified).header.title.content).toBe('已验证可用的 CLI（Linux 实测）');
-    expect(fold(verified).elements[0].content).toBe('Claude、Codex、Gemini、OpenCode、Pi、Oh My Pi、Grok Build、Kimi');
+    expect(fold(verified).elements[0].content).toBe('Claude、Codex、Antigravity、OpenCode、Pi、Oh My Pi、Grok Build、Kimi');
     expect(String(adviceBlock(verified).content)).not.toContain('Grok Build');
 
     // Each support state gets its own CLI line; the dynamic keys resolve to text.
