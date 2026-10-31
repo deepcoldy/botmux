@@ -50,7 +50,8 @@ async function freshModules() {
   const registry = await import('../src/bot-registry.js');
   const store = await import('../src/services/bot-config-store.js');
   const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
-  return { registry, store, pinStreamingCardChange };
+  const sessionGroups = await import('../src/services/session-groups-store.js');
+  return { registry, store, pinStreamingCardChange, sessionGroups };
 }
 
 describe('bot-config store', () => {
@@ -81,9 +82,9 @@ describe('bot-config store', () => {
   }
   async function loaded(entry: Record<string, unknown> = {}) {
     writeConfig(entry);
-    const { registry, store, pinStreamingCardChange } = await freshModules();
+    const { registry, store, pinStreamingCardChange, sessionGroups } = await freshModules();
     registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
-    return { registry, store, pinStreamingCardChange };
+    return { registry, store, pinStreamingCardChange, sessionGroups };
   }
 
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
@@ -1783,6 +1784,195 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().startupCommands).toBeUndefined();
     expect(registry.getBot('app_default').config.startupCommands).toBeUndefined();
+  });
+
+  it('getConfigCardData carries the shared-bot sandbox advice only for shared, unsandboxed bots', async () => {
+    const { store: solo } = await loaded();
+    expect(solo.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    const { store: shared, registry, sessionGroups } = await loaded({ oncallChats: [{ chatId: 'oc_x', workingDir: '/tmp' }] });
+    expect(shared.getConfigCardData('app_default')?.sandboxAdvice).toMatchObject({
+      reasons: ['oncall'], cliSupport: 'verified', cliId: 'claude-code',
+    });
+    const { store: sandboxed } = await loaded({ oncallChats: [{ chatId: 'oc_x', workingDir: '/tmp' }], sandbox: 'oncall' });
+    expect(sandboxed.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+
+    // A p2pMode='group' session group's oncall binding only pins a workingDir:
+    // the talk gate treats it as owner-only, so it is not a sharing signal.
+    sessionGroups.initSessionGroups('app_default');
+    sessionGroups.registerSessionGroup('oc_x', { ownerOpenId: 'ou_owner', lastSessionId: 'sess-1' });
+    expect(shared.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    // Sanity: the registry used by getConfigCardData sees the same store.
+    expect(sessionGroups.isSessionGroup('oc_x')).toBe(true);
+    expect(registry.getBot('app_default').config.oncallChats).toHaveLength(1);
+
+    // allowedChatGroups is talk-open for a whole group, unless the id is itself
+    // a session group.
+    const { store: groups, sessionGroups: gs2 } = await loaded({ allowedChatGroups: ['oc_g'] });
+    expect(groups.getConfigCardData('app_default')?.sandboxAdvice?.reasons).toEqual(['allowedChatGroups']);
+    gs2.initSessionGroups('app_default');
+    gs2.registerSessionGroup('oc_g', { ownerOpenId: 'ou_owner', lastSessionId: 'sess-2' });
+    expect(groups.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+
+    // The legacy readIsolation flag and the global env switch also engage the
+    // sandbox at spawn — an already-isolated bot must not be advised.
+    const { store: readIso } = await loaded({ readIsolation: true, oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    expect(readIso.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    const { store: envIso } = await loaded({ oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    process.env.BOTMUX_SANDBOX = 'oncall';
+    try {
+      expect(envIso.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+
+    // A launcher wrapper is dropped under the sandbox → dedicated caveat.
+    const { store: wrapped } = await loaded({ wrapperCli: 'aiden --', oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    expect(wrapped.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('wrapper');
+
+    // Counts use RESOLVED identities: a stale email entry (raw count 2, one
+    // effective) must not make the bot look multi-user.
+    const { store: stale } = await loaded();
+    const upd = await stale.setBotAllowedUsers('app_default', ['ou_owner', 'ghost@corp.com'], 'ou_owner');
+    expect(upd.ok).toBe(true);
+    expect(readConfig().allowedUsers).toHaveLength(2);
+    expect(stale.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+  });
+
+  it('config card advice never throws on a typo BOTMUX_SANDBOX (display-only path)', async () => {
+    // The worker's resolver fail-closes (throws) on a bad env value at SPAWN;
+    // /botconfig is display-only — before the fix the same throw killed the
+    // command (outer catch only logs) and card buttons re-rendered to nothing.
+    const { store } = await loaded({ oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    process.env.BOTMUX_SANDBOX = 'oncll';
+    try {
+      let data;
+      expect(() => { data = store.getConfigCardData('app_default'); }).not.toThrow();
+      // Fallback = config-only mode (sandbox unset → off) → the shared bot still
+      // gets the advice, instead of the whole card disappearing.
+      expect(data?.sandboxAdvice?.reasons).toEqual(['oncall']);
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+  });
+
+  it('config card advice is silent for remote backends where no local sandbox engages', async () => {
+    for (const backendType of ['riff', 'remote-runner']) {
+      const { store } = await loaded({
+        cliId: backendType,
+        backendType,
+        oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+        allowedChatGroups: ['oc_g'],
+      });
+      expect(
+        store.getConfigCardData('app_default')?.sandboxAdvice,
+        `advice must be absent for ${backendType}`,
+      ).toBeUndefined();
+    }
+    // The remote exemption wraps the WHOLE resolution: a global env switch must
+    // not change the verdict for riff either.
+    const { store: riffEnv } = await loaded({ cliId: 'riff', backendType: 'riff', oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    process.env.BOTMUX_SANDBOX = 'oncall';
+    try {
+      expect(riffEnv.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+    // Local backends keep the advice (pty default / explicit tmux).
+    const { store: tmux } = await loaded({ backendType: 'tmux', oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    expect(tmux.getConfigCardData('app_default')?.sandboxAdvice?.reasons).toEqual(['oncall']);
+    // Opposite direction: a LOCAL cli resolved onto a remote backend reconciles
+    // to pty exactly like the worker pairing does, so the advice stays — not
+    // silenced by the unreachable remote backend name.
+    const { store: localOnRemote } = await loaded({
+      cliId: 'claude-code', backendType: 'riff',
+      oncallChats: [{ chatId: 'oc_w', workingDir: '/tmp' }],
+    });
+    expect(localOnRemote.getConfigCardData('app_default')?.sandboxAdvice?.reasons).toEqual(['oncall']);
+  });
+
+  it('pairs a remote CLI id with its backend even when backendType is not written', async () => {
+    // The natural config: cliId riff/mojo/remote-runner, no backendType line.
+    // The open-coded `cfg.backendType ?? default ?? pty` chain classified these
+    // as pty and still showed the advice; the worker resolves the paired backend.
+    for (const cliId of ['riff', 'remote-runner']) {
+      const { store } = await loaded({
+        cliId,
+        oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+      });
+      expect(
+        store.getConfigCardData('app_default')?.sandboxAdvice,
+        `advice must be absent for cliId=${cliId} without backendType`,
+      ).toBeUndefined();
+    }
+  });
+
+  it('treats a provably-remote mojo session as non-local', async () => {
+    const { store: remote } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      mojo: { cloud: true, localDaemon: false },
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    expect(remote.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    // cloud without the remote proof stays local (mojo spawns a binary locally).
+    const { store: localish } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      oncallChats: [{ chatId: 'oc_z', workingDir: '/tmp' }],
+    });
+    expect(localish.getConfigCardData('app_default')?.sandboxAdvice?.reasons).toEqual(['oncall']);
+  });
+
+  it('reports a local backend that refuses a file sandbox via the worker gate', async () => {
+    // herdr / zellij / zmx / orca run locally but backendSandboxCompatibilityError
+    // refuses a sandbox: the advice must not say "verified / turn it on".
+    for (const backendType of ['herdr', 'zellij', 'zmx']) {
+      const { store } = await loaded({
+        backendType,
+        oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+      });
+      expect(
+        store.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport,
+        `${backendType} must not be presented as sandbox-capable`,
+      ).toBe('blocked');
+    }
+    // pty/tmux are capable → the ordinary matrix verdict.
+    const { store: pty } = await loaded({ oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    expect(pty.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('verified');
+  });
+
+  it('a local mojo session (cloud off or unprovable env) is shown as blocked, cloud mojo is silent', async () => {
+    const { store: localMojo } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    expect(localMojo.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('blocked');
+    // cloud + an unprovable PATH override voids the remote proof → local → blocked.
+    const { store: envMojo } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      mojo: { cloud: true, localDaemon: false, env: { PATH: '/opt/fake' } },
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    expect(envMojo.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('blocked');
+    // Fully remote mojo is silent (localSandboxApplies=false short-circuit).
+    const { store: remoteMojo } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      mojo: { cloud: true, localDaemon: false },
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    expect(remoteMojo.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+  });
+
+  it('typod BOTMUX_SANDBOX fallback still honours readIsolation=true', async () => {    const { store } = await loaded({
+      readIsolation: true,
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    process.env.BOTMUX_SANDBOX = 'oncll';
+    try {
+      // Already isolated via the legacy flag: the fallback must resolve oncall,
+      // not re-advise enabling isolation.
+      expect(store.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
   });
 
   it('getConfigCardData joins startupCommands with ", " (commands carry space args)', async () => {
