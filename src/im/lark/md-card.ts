@@ -20,7 +20,7 @@
  */
 
 import { resolveReplyFooterPolicy } from '../../services/reply-footer.js';
-import type { ReplyCardPresentation } from '../../services/reply-card-render.js';
+import { normalizeReplyConsoleUrl, type ReplyCardPresentation } from '../../services/reply-card-render.js';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -995,6 +995,19 @@ function formatReplyDuration(durationMs: number, locale?: Locale): string {
   return parts.join(' ');
 }
 
+/** Whether a custom brand already carries this machine's console entry.
+ *  Compare normalized markdown-link targets rather than a raw substring: a
+ *  hand-written brand may spell the same entry with an uppercase host or no
+ *  trailing slash, and an exact-substring check then renders two links. */
+function brandSegmentHasConsoleEntry(brandSeg: string, consoleUrl: string): boolean {
+  const entry = consoleUrl.replace(/\/+$/, '');
+  for (const match of brandSeg.matchAll(/\]\(([^()\s]+)\)/gu)) {
+    const href = normalizeReplyConsoleUrl(match[1]);
+    if (href && href.replace(/\/+$/, '') === entry) return true;
+  }
+  return false;
+}
+
 /** Build the one canonical footer shared by all Bot Session reply cards.
  * Ordering, i18n, the parser marker, grey styling, and recipient rendering live
  * here so direct sends and daemon fallbacks cannot drift apart. */
@@ -1012,6 +1025,10 @@ export function buildReplyCardFooter(opts: {
   const parts: string[] = [];
   const brandSeg = !policy.brand ? null : brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
+  const consoleUrl = normalizeReplyConsoleUrl(opts.presentation?.consoleUrl);
+  if (brandSeg && consoleUrl && !brandSegmentHasConsoleEntry(brandSeg, consoleUrl)) {
+    parts.push(`[${t('card.reply_console', undefined, opts.locale)}](${consoleUrl})`);
+  }
   let hasUsage = false;
   if (opts.usage) {
     const usageSeg = !policy.usage ? null : cardUsageFooterSegment(opts.usage, opts.locale);
@@ -1054,7 +1071,7 @@ export function buildReplyCardFooter(opts: {
   const signMarker = hasUsage || hasDuration || hasWaiting || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
-    signedContent = parts[0]; // brand-only — no marker
+    signedContent = parts.join(' · '); // brand/console only — no marker
   } else if (parts.length > 1) {
     signedContent = `${parts[0]} ·${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
   } else {

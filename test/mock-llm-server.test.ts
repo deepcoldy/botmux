@@ -342,6 +342,90 @@ describe('MockLlmServer', () => {
         spy.mockRestore();
       }
     });
+
+    // The warning is about a *streak* of router verdicts with no main-model
+    // call between them. A normal multi-step turn (router → tool call → …)
+    // must not accumulate toward it.
+    it('resets the router streak once the main model issues a function call', async () => {
+      const resetPrompt = '请立刻调用 botmux send 在本话题里回复一行内容："ACK-e2e-rstfc-1793300000101"';
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      const shellTools = [{ functionDeclarations: [{ name: 'run_shell_command', parametersJsonSchema: { type: 'object', properties: { command: { type: 'string' } } } }] }];
+      const routerTurn = () =>
+        post('/v1beta/models/flash:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: resetPrompt }] }],
+          generationConfig: { responseJsonSchema: {} },
+        });
+      const functionCallTurn = () =>
+        post('/v1beta/models/gemini-2.5-pro:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: resetPrompt }] }],
+          tools: shellTools,
+        });
+      try {
+        // Three (router verdict → main-model tool call) pairs in one turn:
+        // the router is asked 3 times, but a main-model call follows each.
+        await routerTurn();
+        await functionCallTurn();
+        await routerTurn();
+        await functionCallTurn();
+        await routerTurn();
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('resets the router streak once the main model answers with plain text', async () => {
+      const resetPrompt = '请立刻调用 botmux send 在本话题里回复一行内容："ACK-e2e-rsttxt-1793300000202"';
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      const routerTurn = () =>
+        post('/v1beta/models/flash:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: resetPrompt }] }],
+          generationConfig: { responseJsonSchema: {} },
+        });
+      // Declares tools but no shell (a title call): the main-model request is
+      // answered with plain text, not a function call.
+      const textTurn = () =>
+        post('/v1beta/models/gemini-2.5-pro:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: resetPrompt }] }],
+          tools: [{ functionDeclarations: [{ name: 'session_title' }] }],
+        });
+      try {
+        await routerTurn();
+        await routerTurn();
+        await textTurn();
+        await routerTurn();
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('never warns for JSON-verdict requests carrying no extractable ACK marker', async () => {
+      // Title/summary generateJson calls share no topic identity; attributing
+      // them to one bucket (and across bots on a shared mock server) would
+      // warn without any router loop.
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      try {
+        for (let i = 0; i < 4; i++) {
+          await post('/v1beta/models/flash:generateContent', {
+            contents: [{ role: 'user', parts: [{ text: `summarize title request ${i}` }] }],
+            generationConfig: { responseJsonSchema: {} },
+          });
+        }
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 
   describe('OpenAI Responses API (/v1/responses)', () => {

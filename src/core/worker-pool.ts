@@ -166,6 +166,7 @@ import {
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
+import { buildReplyConsoleUrl } from './dashboard-url.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
@@ -573,7 +574,9 @@ export function getDaemonReplyCardRenderSnapshot(
     receivedAtMs: options.dispatchAttempt === undefined && options.turnId ? ds.turnReceivedAtMs?.get(options.turnId) : undefined,
     durationMs: options.finalTiming?.durationMs, completed: options.finalTiming !== undefined, nowMs: Date.now(),
   }) : undefined;
-  return { usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId), footerPreferences: normalizeReplyFooter(cfg), ...(timing ? { timing } : {}) };
+  const consoleUrl = buildReplyConsoleUrl();
+  return { usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId), footerPreferences: normalizeReplyFooter(cfg),
+    ...(consoleUrl ? { consoleUrl } : {}), ...(timing ? { timing } : {}) };
 }
 
 /** Streaming-card metrics obey usageDisplay; known model/effort do not depend

@@ -2358,6 +2358,13 @@ describe('drainTraexRollout', () => {
     });
   });
 
+  it.each(['usageLimitExceeded', 'usage_limit_exceeded'])('preserves the explicit quota code %s', code => {
+    writeFileSync(path, line(user('continue task')) + line(taskCompleteWithError({ codex_error_info: code })));
+    expect(drainTraexRollout(path, 0).events.at(-1)).toMatchObject({
+      terminalStatus: 'failed', terminalErrorCode: 'traex_usage_limit_exceeded',
+    });
+  });
+
   it('synthesises the bare sentinel when the last commentary ends with BOTMUX_NO_REPLY (path B: deliberate silence)', () => {
     writeFileSync(path, [
       line(user('do the work')),

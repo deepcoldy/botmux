@@ -31,8 +31,9 @@ export class MockLlmServer {
   private config: Required<MockServerConfig>;
   private recorder: TapeRecorder;
   private recordedMarkers: Set<string> = new Set();
-  // marker -> router-verdict request count, to surface a Gemini CLI stuck
-  // re-asking the model router without ever calling the main model.
+  // marker -> consecutive router-verdict request count since the last
+  // main-model call, to surface a Gemini CLI stuck re-asking the model router
+  // without ever calling the main model. Markerless JSON calls are ignored.
   private geminiRouterHits = new Map<string, number>();
 
   constructor(config?: MockServerConfig) {
@@ -288,7 +289,8 @@ export class MockLlmServer {
 
   private async handleGemini(body: any, res: ServerResponse, stream: boolean): Promise<void> {
     const messages = geminiMessages(body?.contents);
-    const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
+    const rawMarker = extractMarkerFromMessages(messages);
+    const marker = rawMarker ?? 'ACK-test-message-received';
     this.recordedMarkers.add(marker);
     const tool = pickShellTool(body?.tools, 'run_shell_command');
     const toolResult = isGeminiToolResult(body?.contents);
@@ -301,17 +303,26 @@ export class MockLlmServer {
     let response;
     if (wantsJsonVerdict) {
       branch = 'router';
-      const hits = (this.geminiRouterHits.get(marker) ?? 0) + 1;
-      this.geminiRouterHits.set(marker, hits);
-      if (hits > 2) {
-        console.warn(`[mock-llm-server] gemini router for ${marker} hit ${hits} times without a main-model call — likely a rejected JSON verdict (check responseJsonSchema shape)`);
+      // Only requests attributable to a real topic count. Markerless
+      // generateJson calls (titles/summaries) share the fallback marker, and
+      // the mock server is shared by every bot of the lane for its whole run.
+      if (rawMarker) {
+        const hits = (this.geminiRouterHits.get(marker) ?? 0) + 1;
+        this.geminiRouterHits.set(marker, hits);
+        if (hits > 2) {
+          console.warn(`[mock-llm-server] gemini router for ${marker} hit ${hits} times without a main-model call — likely a rejected JSON verdict (check responseJsonSchema shape)`);
+        }
       }
       response = buildGeminiResponse({ text: JSON.stringify({ complexity_reasoning: 'mock', complexity_score: 1 }) });
     } else if (toolResult || !tool) {
       branch = 'text';
+      // The main model answered: the router streak is over, reset it so a
+      // normal multi-step turn (router → text/tool → router …) never warns.
+      this.geminiRouterHits.delete(marker);
       response = buildGeminiResponse({ text: '已成功调用 botmux send 回复消息，本轮自动化测试结束。' });
     } else {
       branch = 'functionCall';
+      this.geminiRouterHits.delete(marker);
       // Prepend an env snapshot (only for a real reply, never the sandbox
       // probe) so the live artifact shows exactly what the shell tool's
       // sanitization left: GITHUB_SHA set-empty vs unset vs leaked value.

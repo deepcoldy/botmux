@@ -20,6 +20,7 @@ export function strongestTraexModelSettings(model: string, capability?: ModelCap
 }
 
 export interface TraexAutoModelPreferences {
+  trigger?: 'capacity' | 'quota';
   reselectPerTurn: boolean;
   models: string[];
   modelSettings: Record<string, TraexAutoModelSettings>;
@@ -38,6 +39,7 @@ export function autoModelDraftFromConfig(
   enabled = config?.enabled === true,
 ): TraexAutoModelDraft {
   return {
+    ...(config?.trigger ? { trigger: config.trigger } : {}),
     reselectPerTurn: config?.reselectPerTurn === true,
     models: config?.models ?? [],
     modelSettings: Object.fromEntries((config?.models ?? []).map(model => [
@@ -81,7 +83,9 @@ export function readAutoModelDraft(botId: string, storage = autoModelDraftStorag
       }
     }
     if (value.draft.reselectPerTurn !== undefined && typeof value.draft.reselectPerTurn !== 'boolean') return undefined;
+    if (value.draft.trigger !== undefined && !['capacity', 'quota'].includes(value.draft.trigger)) return undefined;
     return {
+      ...(value.draft.trigger ? { trigger: value.draft.trigger } : {}),
       reselectPerTurn: value.draft.reselectPerTurn === true,
       models: value.draft.models,
       modelSettings: value.draft.modelSettings,
@@ -96,9 +100,9 @@ export function readAutoModelDraft(botId: string, storage = autoModelDraftStorag
 export function writeAutoModelDraft(botId: string, draft: TraexAutoModelPreferences, storage = autoModelDraftStorage()): boolean {
   try {
     if (!storage) return false;
-    const { reselectPerTurn, models, modelSettings, timeoutSeconds, cooldownSeconds } = draft;
+    const { trigger, reselectPerTurn, models, modelSettings, timeoutSeconds, cooldownSeconds } = draft;
     storage.setItem(keyFor(botId), JSON.stringify({
-      version: 1, draft: { reselectPerTurn, models, modelSettings, timeoutSeconds, cooldownSeconds },
+      version: 1, draft: { trigger, reselectPerTurn, models, modelSettings, timeoutSeconds, cooldownSeconds },
     }));
     return true;
   } catch { return false; }

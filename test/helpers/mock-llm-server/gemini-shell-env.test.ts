@@ -50,4 +50,11 @@ describe('buildGeminiShellEnvSnapshotFragment', () => {
     // "<epoch> <marker> GITHUB_SHA=…"
     expect(out).toMatch(/^\d+ ACK-e2e-cli-1793300000000 GITHUB_SHA=/);
   });
+
+  it('refuses a marker outside the shell-quoted-safe charset', () => {
+    for (const evil of ['$(touch pwned)', '`id`', 'a; rm -rf /', 'a"$(id)', '$HOME', 'a|b', 'a\nb']) {
+      expect(() => buildGeminiShellEnvSnapshotFragment(evil)).toThrow(/unsafe marker/);
+    }
+    expect(buildGeminiShellEnvSnapshotFragment('ACK-e2e-x.1:2#3@4 5')).toContain('ACK-e2e-x.1:2#3@4 5');
+  });
 });

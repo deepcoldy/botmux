@@ -136,6 +136,9 @@ export const messages: Record<string, string> = {
   'worker.traex_auto_model.lowest_load_hold': '⚠️ 后续模型均显示高负载，当前 {model} 是池内负载最低的模型（{load}%）。负载相同时按你的顺序选择；保持等待。',
   'worker.traex_auto_model.queued_backup': '↪️ 备用模型 {fromModel} 实际排队，短暂确认后继续尝试模型池中的 {toModel}，正在续接原会话。',
   'worker.traex_auto_model.continue_prompt': '继续完成当前尚未结束的任务。请先根据已有会话上下文确认已经完成的步骤，不要重复已经成功执行的有副作用操作，然后从中断处继续并给出最终结果。',
+  'worker.traex_auto_model.quota_switch': '⚠️ {fromModel} 已明确报告额度耗尽，按配置顺序切换到 {toModel}，继续原会话。',
+  'worker.traex_auto_model.quota_preference': '↩️ 根据当前额度状态，后续输入使用 {toModel}，原会话保留。',
+  'worker.traex_auto_model.quota_exhausted': '当前没有可自动尝试的备选模型，本次自动重试已停止。额度信息恢复后可重发；若无法取得重置时间或恢复信息，请用 /model 手动选择模型后重试。不会使用池外模型。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',
   'card.private.snapshot_note_no_terminal': '🔒 仅你可见的静态快照（不会实时刷新）。当前后端不提供 Web 终端。',
 
@@ -2030,6 +2033,7 @@ export const messages: Record<string, string> = {
   'card.duration_minutes': '{minutes} 分',
   'card.duration_hours': '{hours} 小时',
   'card.sent_to': '发送给：',
+  'card.reply_console': '控制台',
   'card.usage.context': '上下文',
   // Claude Code statusline 配额段（纯文本 `ctx 23% · 5h 18% · 7d 5%`），两语言同值。
   'card.usage.ctx': 'ctx',
