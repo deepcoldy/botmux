@@ -16576,8 +16576,12 @@ function releaseInputDeliveryQuarantine(
     queueMicrotask(() => {
       if (backend !== quarantine.backend || cliSpawnGeneration !== quarantine.generation
         || cliRestartInProgress) return;
-      if (isPromptReady) void flushPending();
-      else idleDetector?.fireIdle();
+      // Re-drive the queue itself, like a new arrival does: type-ahead
+      // admission does not wait for prompt-ready, and while the predecessor
+      // turn is still open the idle edge below is fenced and never flushes.
+      // flushPending re-checks every delivery gate (#2642).
+      void flushPending();
+      if (!isPromptReady) idleDetector?.fireIdle();
     });
   }
   return true;
