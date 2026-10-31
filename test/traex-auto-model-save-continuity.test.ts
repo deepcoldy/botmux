@@ -37,6 +37,14 @@ async function mount(bot: any, onSaved?: (patch: any) => void, modelCatalog = ca
   await act(async () => { rendered = TestRenderer.create(React.createElement(BotAgentSection, props)); });
 }
 describe('Auto editor save and draft continuity', () => {
+  it('persists quota selection and hides capacity-only controls', async () => {
+    await mount({ larkAppId: 'quota-policy', cliId: 'traex', model: 'auto', traexAutoModel: pool });
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onTrigger('quota'));
+    expect(rendered!.root.findAllByProps({ 'data-input': 'autoModelTimeout' })).toHaveLength(0);
+    await act(async () => rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+    expect(saved.traexAutoModel.trigger).toBe('quota');
+    expect(rendered!.root.findByType(TraexAutoModelEditor).props.trigger).toBe('quota');
+  });
   it('preserves a saved effort while a future model catalog loads', async () => {
     await mount({ larkAppId: 'future-effort', cliId: 'traex', model: 'future-live-model', reasoningEffort: 'xhigh' }, undefined, {
       ...catalog, models: ['future-live-model'], modelCapabilities: [{ ...catalog.modelCapabilities[0]!, slug: 'future-live-model' }],

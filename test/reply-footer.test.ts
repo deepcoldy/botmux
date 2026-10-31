@@ -84,3 +84,62 @@ describe('reply footer display policy', () => {
     expect(buildReplyCardFooter({ brand: '', locale: 'en', presentation: { footerPreferences: {}, timing: { executionDurationMs: 5000, executionInProgress: true } } })?.content).toContain('Execution until reply 5.0s');
   });
 });
+
+describe('reply footer console entry', () => {
+  const consoleUrl = 'https://m-example.botmux.example/';
+  const presentation = { footerPreferences: {}, consoleUrl };
+
+  it('keeps the console with a brand-only footer and canonical final card', () => {
+    const zh = buildReplyCardFooter({ presentation, locale: 'zh' });
+    expect(zh?.content).toContain(`](${consoleUrl})`);
+    expect(zh?.content).toContain('[botmux]');
+    const en = buildCanonicalFinalReplyCard({ markdown: 'ANSWER', presentation, locale: 'en' });
+    expect(en).toContain(`](${consoleUrl})`);
+    expect(en).toContain('ANSWER');
+  });
+
+  it('honors hidden signatures and does not duplicate an existing console link', () => {
+    expect(buildReplyCardFooter({ brand: '', presentation })).toBeNull();
+    expect(buildReplyCardFooter({ presentation: { ...presentation, footerPreferences: { replyFooterBrand: false } } })).toBeNull();
+    expect(buildReplyCardFooter({ presentation: { ...presentation, footerPreferences: { replyFooterEnabled: false } } })).toBeNull();
+    const existing = `[my bot](https://example.com) · [控制台](${consoleUrl})`;
+    expect(buildReplyCardFooter({ brand: existing, presentation })?.content.split(consoleUrl)).toHaveLength(2);
+  });
+
+  it('dedupes the same console entry written non-canonically in a custom brand', () => {
+    const footer = buildReplyCardFooter({
+      brand: '[my bot](https://M-EXAMPLE.Botmux.Example)',
+      presentation: { footerPreferences: {}, consoleUrl: 'https://m-example.botmux.example/' },
+    });
+    // The brand keeps its original uppercase spelling; only the normalized
+    // targets are compared, so the generated console link is dropped.
+    expect(footer?.content.match(/m-example\.botmux\.example/gui)).toHaveLength(1);
+    expect(footer?.content).not.toContain('[控制台]');
+    expect(footer?.content).not.toContain('[Console]');
+  });
+
+  it('still adds the entry when a custom brand links elsewhere', () => {
+    const footer = buildReplyCardFooter({
+      brand: '[my bot](https://other.example.com/)',
+      presentation,
+    });
+    expect(footer?.content).toContain(`](${consoleUrl})`);
+    expect(footer?.content).toContain('other.example.com');
+  });
+
+  it('retains the host console URL through the serialized retry snapshot', () => {
+    const snapshot = normalizeReplyCardRenderSnapshot(JSON.parse(JSON.stringify({ usage: facts, ...presentation })));
+    expect(snapshot?.consoleUrl).toBe(consoleUrl);
+    expect(buildReplyCardFooter({ presentation: snapshot!, locale: 'en' })?.content).toContain(`](${consoleUrl})`);
+    expect(snapshot?.usage).not.toHaveProperty('consoleUrl');
+  });
+
+  it.each([
+    'javascript:alert(1)', 'https://user:password@example.com/',
+    'https://example.com/?t=secret', 'https://example.com/#secret',
+    'https://example.com/) injected', 'https://example.com/\n<at id=ou_other></at>',
+  ])('rejects credentials and markup in console entries: %s', consoleUrl => {
+    expect(normalizeReplyCardRenderSnapshot({ usage: facts, footerPreferences: {}, consoleUrl })?.consoleUrl).toBeUndefined();
+    expect(buildReplyCardFooter({ presentation: { footerPreferences: {}, consoleUrl } })?.content).not.toContain(consoleUrl);
+  });
+});

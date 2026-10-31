@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
+import { buildReplyConsoleUrl } from './core/dashboard-url.js';
 /**
  * CLI entry point for botmux.
  *
@@ -6881,7 +6882,9 @@ async function readReplyCardRenderSnapshotForSend(
       }
     }
   } catch { /* old/offline/isolated: retain local policy, omit unknown timing */ }
-  return { usage: await readCardUsageSnapshotForSend(session, larkAppId), footerPreferences: resolveReplyFooterPreferences(larkAppId) };
+  const consoleUrl = buildReplyConsoleUrl();
+  return { usage: await readCardUsageSnapshotForSend(session, larkAppId), footerPreferences: resolveReplyFooterPreferences(larkAppId),
+    ...(consoleUrl ? { consoleUrl } : {}) };
 }
 
 /**

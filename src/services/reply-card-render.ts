@@ -4,6 +4,8 @@ import { normalizeReplyFooter, type ReplyFooterPreferences } from './reply-foote
 /** Display decisions and measured timing are separate from native usage facts. */
 export interface ReplyCardPresentation {
   footerPreferences: ReplyFooterPreferences;
+  /** Host-selected, credential-free console entry, frozen for delivery retries. */
+  consoleUrl?: string;
   timing?: ReplyCardTiming;
 }
 export interface ReplyCardTiming {
@@ -17,6 +19,17 @@ export interface ReplyCardRenderSnapshot extends ReplyCardPresentation {
   usage: CardUsageSnapshot;
 }
 
+/** A console entry is a URL, never a credential-bearing operation link. */
+export function normalizeReplyConsoleUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string' || /[\s()[\]<>"'`\\]/.test(value)) return undefined;
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password
+      || url.search || url.hash) return undefined;
+    return url.href;
+  } catch { return undefined; }
+}
+
 export function normalizeReplyCardPresentation(value: unknown): ReplyCardPresentation {
   const raw = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : {};
@@ -28,7 +41,9 @@ export function normalizeReplyCardPresentation(value: unknown): ReplyCardPresent
     if (typeof n === 'number' && Number.isFinite(n) && n >= 0) out[key] = n;
   }
   if (out.executionDurationMs !== undefined && timing.executionInProgress === true) out.executionInProgress = true;
-  return { footerPreferences: normalizeReplyFooter(raw.footerPreferences), ...(Object.keys(out).length ? { timing: out } : {}) };
+  const consoleUrl = normalizeReplyConsoleUrl(raw.consoleUrl);
+  return { footerPreferences: normalizeReplyFooter(raw.footerPreferences),
+    ...(consoleUrl ? { consoleUrl } : {}), ...(Object.keys(out).length ? { timing: out } : {}) };
 }
 
 /** Use only observed native starts/completions. Never count queue time as execution. */

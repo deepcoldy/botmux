@@ -675,6 +675,7 @@ describe('normal CLI send reply rendering snapshot', () => {
           BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
           BOTMUX_DAEMON_IPC_PORT: '7951', BOTMUX_TEST_REPLY_RENDER_SNAPSHOT: JSON.stringify({
             usage: { context: null, tokens: null }, footerPreferences: { replyFooterEnabled: !hidden },
+            consoleUrl: 'https://m-example.botmux.example/',
             timing: { executionDurationMs: 5000, waitingDurationMs: 2000, executionInProgress: true },
           }) }, encoding: 'utf8', timeout: 30_000,
       });
@@ -689,6 +690,54 @@ describe('normal CLI send reply rendering snapshot', () => {
       expect(card.includes('等待 2.0')).toBe(!hidden);
       expect(card.includes('执行至回复')).toBe(!hidden);
       expect(card.includes('botmux_reply_footer')).toBe(!hidden);
+      expect(card.includes('](https://m-example.botmux.example/)')).toBe(!hidden);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+});
+
+describe('CLI local fallback snapshot selects the host console entry', () => {
+  // No BOTMUX_DAEMON_IPC_PORT and an empty data dir means the daemon IPC route
+  // is unreachable, so the CLI builds the render snapshot itself — the second
+  // production generation point that must carry consoleUrl.
+  const consoleEntry = 'https://m-mtest.console.example.com/';
+  it.each([
+    { name: 'remote on + bound', remoteAccess: true, bound: true, linked: true },
+    { name: 'remote on + unbound', remoteAccess: true, bound: false, linked: false },
+    { name: 'remote off + bound', remoteAccess: false, bound: true, linked: false },
+  ])('$name', ({ remoteAccess, bound, linked }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-local-console-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(root, '.botmux'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, '.botmux', 'config.json'), JSON.stringify({ remoteAccess }), { mode: 0o600 });
+      if (bound) {
+        writeFileSync(join(root, '.botmux', 'platform.json'), JSON.stringify({
+          platformUrl: 'https://console.example.com', machineId: 'mtest', machineToken: 'tok',
+        }), { mode: 0o600 });
+      }
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'codex', replyCardMode: 'legacy',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId, status: 'active', cliId: 'codex', larkAppId: key.larkAppId,
+        chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', 'LOCAL FALLBACK BODY'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      // The daemon snapshot route was unreachable: nothing should have answered it.
+      expect(String(result.stdout)).not.toContain('CAPTURE_RENDER_QUERY=');
+      const captured = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(captured).toHaveLength(1);
+      const card = captured[0].body.content as string;
+      expect(card).toContain('LOCAL FALLBACK BODY');
+      expect(card).toContain(DEFAULT_BRAND_LABEL);
+      expect(card.includes(`](${consoleEntry})`)).toBe(linked);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 35_000);
 });

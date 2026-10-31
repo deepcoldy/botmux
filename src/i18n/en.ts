@@ -133,6 +133,9 @@ export const messages: Record<string, string> = {
   'worker.traex_auto_model.lowest_load_hold': '⚠️ Later models report high load. The current model {model} has the lowest pool load ({load}%), with your pool order breaking ties. Holding it.',
   'worker.traex_auto_model.queued_backup': '↪️ Backup model {fromModel} actually queued. After brief confirmation, trying allowlisted model {toModel} and resuming the same session.',
   'worker.traex_auto_model.continue_prompt': 'Continue the current unfinished task. First use the existing session context to identify steps that already completed; do not repeat successful side-effecting operations. Resume from the interruption and provide the final result.',
+  'worker.traex_auto_model.quota_switch': '⚠️ {fromModel} reported exhausted usage quota. Switching to {toModel} in configured order and continuing the same session.',
+  'worker.traex_auto_model.quota_preference': '↩️ Based on current quota evidence, using {toModel} for the next input in the same session.',
+  'worker.traex_auto_model.quota_exhausted': 'No eligible fallback remains; automatic retries have stopped. Retry after quota recovery is observable. If reset/recovery metadata is unavailable, select a model manually with /model before retrying. No model outside the pool will be used.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',
   'card.private.snapshot_note_no_terminal': '🔒 Private static snapshot (visible only to you, not live-updating). This backend does not provide a Web Terminal.',
 
@@ -2029,6 +2032,7 @@ export const messages: Record<string, string> = {
   'card.duration_minutes': '{minutes}m',
   'card.duration_hours': '{hours}h',
   'card.sent_to': 'Sent to: ',
+  'card.reply_console': 'Console',
   'card.usage.context': 'Context',
   // Claude Code statusline quota segment (plain `ctx 23% · 5h 18% · 7d 5%`); same in both locales.
   'card.usage.ctx': 'ctx',
