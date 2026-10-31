@@ -115,11 +115,8 @@ function renderSection(members: GroupMemberBot[] = IN_CHAT): TestRenderer.ReactT
   return renderer;
 }
 
-async function open(renderer: TestRenderer.ReactTestRenderer): Promise<void> {
-  await act(async () => {
-    renderer.root.findByProps({ 'data-member-access-toggle': true })
-      .props.onToggle({ currentTarget: { open: true } });
-  });
+// 内容直接展示、挂载即加载（不再有折叠开关）；等首轮请求落地。
+async function open(_renderer: TestRenderer.ReactTestRenderer): Promise<void> {
   await settle();
 }
 
@@ -153,6 +150,18 @@ describe('MemberAccessSection', () => {
     const renderer = renderSection([]);
     expect(JSON.stringify(renderer.toJSON())).toContain('grantAdmin.noBot');
     expect(state.calls).toHaveLength(0);
+  });
+
+  it('shows the member controls right away — no collapsed block, no repeated section title', async () => {
+    const state = makeState();
+    installFetch(state);
+    const renderer = renderSection();
+    await settle();
+    expect(renderer.root.findAllByType('details')).toHaveLength(0);
+    expect(renderer.root.findAllByType('summary')).toHaveLength(0);
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('grantAdmin.sectionTitle');
+    expect(renderer.root.findAllByProps({ 'data-member-row': 'ou_u1' })).toHaveLength(1);
+    expect(state.calls.some(call => call.url.endsWith('/members-display'))).toBe(true);
   });
 
   it('defaults to the first in-chat bot, batches readback, and groups users vs bots', async () => {
