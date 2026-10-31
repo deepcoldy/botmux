@@ -1223,6 +1223,20 @@ describe('CodexBridgeQueue', () => {
     ]);
   });
 
+  it('a replayed attempt terminal never satisfies an exact-attempt lookup for the retired attempt', () => {
+    // #2648 follow-up: a stale deferred submit timer keeps the OLD
+    // dispatchAttempt. Once a replay with the same turnId has run and closed,
+    // hasTerminalTurn must answer only for the new attempt — otherwise the
+    // stale timer would settle against the replacement delivery.
+    const q = new CodexBridgeQueue();
+    q.mark('delivery', 'same durable body', 100, 1);
+    expect(q.dropPendingTurn('delivery', 1, true)?.turnId).toBe('delivery');
+    q.mark('delivery', 'same durable body', 200, 2);
+    q.ingest([userEv('same durable body', 'u2', 300), asstEv('done', 'a2', 400)]);
+    expect(q.hasTerminalTurn('delivery', 2)).toBe(true);
+    expect(q.hasTerminalTurn('delivery', 1)).toBe(false);
+  });
+
   it('does not let stale submit lifecycle callbacks mutate a replay attempt with the same turnId', () => {
     const q = new CodexBridgeQueue();
     q.mark('same-turn', 'durable prompt', 100, 1);
