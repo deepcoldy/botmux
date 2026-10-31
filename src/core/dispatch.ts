@@ -669,6 +669,16 @@ export function recordDispatchInputCommit(
 }
 
 /**
+ * Dispatch acceptance waits on receipts keyed by the kickoff's Lark message id
+ * (`om_…`). Synthetic turns (scheduled `schedule:…`, recovery, preview runs)
+ * can never be a kickoff, so a missing receipt for them is expected and only
+ * worth a debug line; an unbound Lark message turn keeps the warning.
+ */
+export function unboundInputCommitLogLevel(turnId: string): 'warn' | 'debug' {
+  return turnId.trim().startsWith('om_') ? 'warn' : 'debug';
+}
+
+/**
  * Return the exact local Bot app identities whose persisted session state proves
  * that a dispatch message reached the intended chat/topic after it was sent.
  *
