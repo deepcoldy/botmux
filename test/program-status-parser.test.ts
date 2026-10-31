@@ -164,3 +164,62 @@ describe('ProgramStatusFramingStream', () => {
     ]);
   });
 });
+
+// tmux DCS passthrough: `ESC P tmux; <inner with every ESC doubled> ESC \`.
+// Kimi Code wraps each OSC 7501 report this way whenever $TMUX is set, and
+// `pipe-pane` hands botmux the pane's raw bytes, envelope included.
+const tmuxWrap = (inner: string) => `\x1bPtmux;${inner.replace(/\x1b/g, '\x1b\x1b')}\x1b\\`;
+
+/** Feed `chunks` and merge adjacent data parts, so a test can compare the
+ *  output of one feed with the output of the same bytes split anywhere. */
+function feedAll(chunks: string[]) {
+  const stream = new ProgramStatusFramingStream();
+  const out: ReturnType<ProgramStatusFramingStream['feed']> = [];
+  for (const part of [...chunks.flatMap(c => stream.feed(c)), ...stream.flush()]) {
+    const last = out[out.length - 1];
+    if (part.type === 'data' && last?.type === 'data') last.text += part.text;
+    else out.push(part.type === 'data' ? { ...part } : part);
+  }
+  return out;
+}
+
+describe('ProgramStatusFramingStream: tmux passthrough', () => {
+  const blocked = tmuxWrap(
+    `\x1b]7501;state=blocked:app=kimi-code:kind=permission:msg=${Buffer.from('Approval required').toString('base64')}\x1b\\`,
+  );
+
+  it('unwraps an OSC 7501 report inside a tmux passthrough envelope', () => {
+    expect(feedAll([`before${blocked}after`])).toEqual([
+      { type: 'data', text: 'before' },
+      { type: 'status', event: { state: 'blocked', app: 'kimi-code', kind: 'permission', msg: 'Approval required' } },
+      { type: 'data', text: 'after' },
+    ]);
+  });
+
+  it('accepts a BEL-terminated inner report', () => {
+    expect(feedAll([tmuxWrap('\x1b]7501;state=done:app=kimi-code\x07')])).toEqual([
+      { type: 'status', event: { state: 'done', app: 'kimi-code' } },
+    ]);
+  });
+
+  it('yields the same parts wherever the envelope is split across chunks', () => {
+    const raw = `x${blocked}y`;
+    const whole = feedAll([raw]);
+    for (let i = 1; i < raw.length; i++) {
+      expect(feedAll([raw.slice(0, i), raw.slice(i)]), `split at ${i}`).toEqual(whole);
+    }
+  });
+
+  it('keeps a non-7501 passthrough (OSC 9 notification) as data, byte for byte', () => {
+    const notify = tmuxWrap('\x1b]9;Task finished\x07');
+    expect(feedAll([`a${notify}b`])).toEqual([{ type: 'data', text: `a${notify}b` }]);
+  });
+
+  it('keeps a malformed envelope as data without swallowing what follows', () => {
+    // An undoubled ESC that is not ST breaks the envelope.
+    const raw = '\x1bPtmux;\x1b\x1b]7501;state=working\x1b[0mtext';
+    const parts = feedAll([raw]);
+    expect(parts.filter(p => p.type === 'status')).toEqual([]);
+    expect(parts.map(p => (p.type === 'data' ? p.text : '')).join('')).toBe(raw);
+  });
+});

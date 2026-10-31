@@ -804,6 +804,16 @@ export interface CliAdapter {
    *  and observe authoritative program status events in IdleDetector. */
   readonly supportsProgramStatus?: boolean;
 
+  /** After a botmux submit, an OSC 7501 terminal report (`idle` / `done` /
+   *  `error`) completes the turn only once a busy report (`working` /
+   *  `blocked`) has been seen since that submit. For CLIs that can re-report a
+   *  terminal state while picking up new input — Kimi Code's session-runtime
+   *  reset sends `clear` + `idle` on the first prompt of a fresh process,
+   *  before `working`. If no busy report arrives within
+   *  PROGRAM_STATUS_FALLBACK_MS of the submit, the detector leaves authority
+   *  and the screen decides, as it does without OSC 7501. */
+  readonly programStatusSubmitAwaitsBusy?: boolean;
+
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,
    *  require fresh composer evidence (`staticBusyClearPattern`, falling back
