@@ -8829,6 +8829,39 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
+    it('keeps the global bot election stable when malformed rows precede valid names', async () => {
+      const original = vi.mocked(readFileSync).getMockImplementation()!;
+      vi.mocked(readFileSync).mockImplementation(((path: any, ...rest: any[]) => (
+        typeof path === 'string' && path.includes('bots-info.json')
+          ? JSON.stringify([
+            null,
+            42,
+            'x',
+            { larkAppId: 'bad-number', botName: 42 },
+            { larkAppId: 'bad-object', botName: {} },
+            { larkAppId: 'bad-boolean', botName: true },
+            ...BOTS_INFO.map(({ botName }) => ({ botName })),
+          ])
+          : original(path, ...rest)
+      )) as any);
+      try {
+        const deps = makeDeps(makeDaemonSession());
+        const msg = makeLarkMessage('/group @Claude @Codex 项目', {
+          mentions: [
+            { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+            { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+          ],
+        });
+
+        await handleCommand('/group', ROOT_ID, msg, deps, 'app-2');
+
+        expect(mockedCreate).not.toHaveBeenCalled();
+        expect(deps.sessionReply).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(readFileSync).mockImplementation(original);
+      }
+    });
+
     it('fails closed (no group) when an @-mentioned bot cannot be resolved to an app id', async () => {
       // We are the leader (Claude, first), but the chat-member roster is missing
       // Codex → must NOT create a group silently dropping an intended bot.
