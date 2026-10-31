@@ -2,7 +2,10 @@
  * Scratch transport-credential enumeration.
  *
  * Scratch's threat model is integrity (host writes are COW-isolated), NOT
- * confidentiality — but the design still promises a "fixed credential mask":
+ * confidentiality: other people's tokens and login state stay readable (see
+ * the user-token note below; lark-cli homes are not masked). The per-person
+ * masks here only reduce exposure. The design does promise a "fixed credential
+ * mask" for botmux's own transport secrets:
  * the in-sandbox CLI must not be able to READ botmux/Lark transport secrets
  * from the real disk (it sends exclusively through the outbox relay). The
  * oncall whitelist gets this for free (the whole fs root is a fresh tmpfs and
@@ -20,7 +23,11 @@
  *  - webhook signing key/secrets under the data dirs;
  *  - the shared lark-cli keystore (~/.lark-cli holds every app's secret).
  *
- * Paths that don't exist are skipped (the mask compiler existence-filters).
+ * Files that don't exist are skipped. Per-person secret DIRECTORIES are masked
+ * whether or not they exist yet: the overlay's lower layer is the live host, so
+ * a directory (or a token file inside one) the daemon creates after spawn would
+ * otherwise be readable inside a running session. A mask is a mount on the path
+ * itself, so whatever later appears beneath it on the host stays hidden.
  */
 import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
@@ -62,6 +69,7 @@ export interface ScratchSecrets {
 //      files in place, and a directory bind resolves names live so a persistent
 //      tmux pane reads the refreshed identity each turn.
 const CLI_IDENTITY_DIR = 'cli-identity';
+const PER_PERSON_SECRET_DIRS = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending'];
 function sessionIdentityDirName(sessionId: string): string {
   return `${sessionId}.bin`;
 }
@@ -119,6 +127,7 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
 
   // Webhook signing material in session data dirs.
   for (const dataDir of input.dataDirs) {
+    if (!isDir(dataDir)) continue;
     addFile(join(dataDir, 'webhook-master.key'));
     addFile(join(dataDir, 'webhook-secrets.json'));
     addFile(join(dataDir, 'feedback-webhook-secrets.json'));
@@ -127,8 +136,9 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     // Per-PERSON OAuth User Access Tokens. Named dynamically
     // (user-token-<appId>-<openId>.json, legacy user-token-<appId>.json /
     // user-token.json), so scan the data-dir top level by prefix rather than
-    // a fixed list — an agent reading another person's token is the exact
-    // boundary tokenStoreProtection describes.
+    // a fixed list. Exposure reduction only: a token file created after spawn
+    // is NOT masked, which is one reason scratch is not a credential boundary
+    // (tokenStoreProtection counts only the allowlist sandbox).
     try {
       for (const name of readdirSync(dataDir)) {
         if (name === 'user-token.json' || name.startsWith('user-token-')) {
@@ -137,12 +147,13 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
       }
     } catch { /* */ }
 
-    // Per-person secret subdirectories (whole dirs): VC daemon auth tokens
-    // and each person's bytedcli login HOME. The CLI never needs these inside
-    // a scratch turn (they are daemon-side / per-owner).
-    for (const secretDir of ['vc-meeting-daemon-auth', 'bytedcli-home']) {
+    // Per-person secret subdirectories (whole dirs, present or not — see the
+    // header): VC daemon auth tokens, each person's bytedcli login HOME and the
+    // pending OAuth logins. The CLI never needs these inside a scratch turn
+    // (they are daemon-side / per-owner).
+    for (const secretDir of PER_PERSON_SECRET_DIRS) {
       const p = join(dataDir, secretDir);
-      if (isDir(p)) out.add(p);
+      if (!isFileOrLink(p)) out.add(p);
     }
 
     // Trigger-user CLI identity dir: holds EVERY concurrent session's
@@ -152,7 +163,7 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     // / `botmux send` wrapper sources at runtime. Mirrors fs-policy's
     // per-session grants; never grant the parent.
     const cliIdentityDir = join(dataDir, CLI_IDENTITY_DIR);
-    if (isDir(cliIdentityDir)) {
+    if (!isFileOrLink(cliIdentityDir)) {
       out.add(cliIdentityDir);
       if (input.sessionId) {
         const ownDir = join(cliIdentityDir, sessionIdentityDirName(input.sessionId));

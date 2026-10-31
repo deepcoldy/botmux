@@ -91,6 +91,20 @@ describe('enumerateScratchSecretPaths', () => {
     delete process.env.LARKSUITE_CLI_DATA_DIR;
   });
 
+  it('masks the per-person secret dirs even before they exist, so later tokens inside stay hidden', () => {
+    mkdirSync(data(), { recursive: true });
+    const got = new Set(enumerateScratchSecretPaths({ botmuxHomes: [home()], dataDirs: [data()], sessionId: 'sess-1' }).denyPaths);
+    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity']) {
+      expect(got.has(join(data(), dir)), dir).toBe(true);
+    }
+  });
+
+  it('never turns a same-named FILE into a directory mask', () => {
+    mkdirSync(data(), { recursive: true });
+    writeFileSync(join(data(), 'oauth-pending'), 'x');
+    expect(enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()] }).denyPaths).not.toContain(join(data(), 'oauth-pending'));
+  });
+
   it('adds external BOTS_CONFIG sidecar siblings outside the botmux home', () => {
     layout();
     const external = join(root, 'elsewhere', 'custom-bots.json');
