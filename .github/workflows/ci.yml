@@ -11,7 +11,10 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A new push to a PR replaces the run for the old head. On master every
+  # merge used to cancel the run before it, so no master run finished; there
+  # the running one now completes and only the newest pending one waits.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Compile + workflow-core only. The unit suite used to live here and dominated
