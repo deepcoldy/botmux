@@ -23,28 +23,34 @@ afterEach(() => {
   for (const base of bases.splice(0)) rmdirSync(base);
 });
 
-describe.skipIf(!runtime)('scratch credential masks (real container, private namespace)', () => {
-  it('per-person secret dirs stay unreadable for files created after the session started', () => {
-    const base = freshBase();
-    const run = runInPrivateMountNs(`
+function lateSecretsReport(ghostData: boolean) {
+  const base = freshBase();
+  const run = runInPrivateMountNs(`
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { prepareScratchSandbox } from './src/adapters/backend/scratch-sandbox.js';
 import { enumerateScratchSecretPaths } from './src/adapters/backend/scratch-credentials.js';
 const base = ${JSON.stringify(base)};
+const ghostData = ${JSON.stringify(ghostData)};
 spawnSync('mount', ['-t', 'tmpfs', 'tmpfs', base]);
 const home = join(base, 'home');
 const botmux = join(home, '.botmux');
+// The session's own data dir always exists; the token data dir may not yet
+// (a custom SESSION_DATA_DIR leaves ~/.botmux/data to the first login).
+const sessionData = join(base, 'session-data');
 const data = join(botmux, 'data');
 const work = join(base, 'work');
-for (const d of [data, work]) mkdirSync(d, { recursive: true });
-// At spawn: one person's bytedcli login exists; nobody has a pending OAuth login,
-// a VC auth dir or a cli-identity dir yet.
-mkdirSync(join(data, 'bytedcli-home', 'ou_early'), { recursive: true });
-writeFileSync(join(data, 'bytedcli-home', 'ou_early', 'login.json'), 'early-secret');
-writeFileSync(join(data, 'notes.txt'), 'not a secret');
-const secrets = enumerateScratchSecretPaths({ botmuxHomes: [botmux], dataDirs: [data], homeDir: home, sessionId: 'sid-cred' });
+for (const d of [sessionData, work, ...(ghostData ? [home] : [data])]) mkdirSync(d, { recursive: true });
+if (!ghostData) {
+  // At spawn: one person's bytedcli login exists; nobody has a pending OAuth
+  // login, a VC auth dir or a cli-identity dir yet.
+  mkdirSync(join(data, 'bytedcli-home', 'ou_early'), { recursive: true });
+  writeFileSync(join(data, 'bytedcli-home', 'ou_early', 'login.json'), 'early-secret');
+  writeFileSync(join(data, 'notes.txt'), 'not a secret');
+}
+writeFileSync(join(home, 'notes.txt'), 'not a secret');
+const secrets = enumerateScratchSecretPaths({ botmuxHomes: [botmux], dataDirs: [sessionData, data], homeDir: home, sessionId: 'sid-cred' });
 // The CLI: wait for the host to say "go", then try every path and report.
 const probes = {
   bytedcliLate: join(data, 'bytedcli-home', 'ou_late', 'login.json'),
@@ -52,7 +58,7 @@ const probes = {
   oauthPendingLate: join(data, 'oauth-pending', 'state.json'),
   vcAuthLate: join(data, 'vc-meeting-daemon-auth', '57'),
   otherIdentityLate: join(data, 'cli-identity', 'sess-OTHER.bin', '.data', 'lark-cli.env'),
-  ordinary: join(data, 'notes.txt'),
+  ordinary: join(home, 'notes.txt'),
 };
 const code = \`
 const fs = require('fs');
@@ -67,7 +73,7 @@ const tick = setInterval(() => {
   fs.writeFileSync(relay + '/report.json', JSON.stringify(out));
 }, 50);
 \`;
-const sbx = prepareScratchSandbox({ sessionId: 'sid-cred', dataDir: data, storage: 'tmpfs', chdir: work, home,
+const sbx = prepareScratchSandbox({ sessionId: 'sid-cred', dataDir: sessionData, storage: 'tmpfs', chdir: work, home,
   cliBin: process.execPath, cliArgs: ['-e', code], denyPaths: secrets.denyPaths, readOnlyCarvePaths: secrets.readOnlyCarvePaths });
 if (!sbx) throw new Error('prepare failed');
 const child = spawn(sbx.bin, sbx.args, { env: { ...process.env, ...sbx.env }, stdio: 'inherit' });
@@ -88,12 +94,21 @@ await exited;
 sbx.cleanup();
 console.log(JSON.stringify({ report }));
 `, { timeoutMs: 90_000 });
-    const { report } = lastJsonLine<{ report: Record<string, string> | null }>(run);
-    expect(report, run.stderr).not.toBeNull();
-    for (const key of ['bytedcliLate', 'bytedcliEarly', 'oauthPendingLate', 'vcAuthLate', 'otherIdentityLate']) {
-      expect([report![key], key]).not.toEqual(['late-secret', key]);
-      expect([report![key], key]).not.toEqual(['early-secret', key]);
-    }
-    expect(report!.ordinary).toBe('not a secret');
+  const { report } = lastJsonLine<{ report: Record<string, string> | null }>(run);
+  expect(report, run.stderr).not.toBeNull();
+  for (const key of ['bytedcliLate', 'bytedcliEarly', 'oauthPendingLate', 'vcAuthLate', 'otherIdentityLate']) {
+    expect([report![key], key]).not.toEqual(['late-secret', key]);
+    expect([report![key], key]).not.toEqual(['early-secret', key]);
+  }
+  expect(report!.ordinary).toBe('not a secret');
+}
+
+describe.skipIf(!runtime)('scratch credential masks (real container, private namespace)', () => {
+  it('per-person secret dirs stay unreadable for files created after the session started', () => {
+    lateSecretsReport(false);
+  }, 120_000);
+
+  it('…even when the token data dir itself is only created after the session started', () => {
+    lateSecretsReport(true);
   }, 120_000);
 });

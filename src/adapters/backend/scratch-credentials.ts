@@ -125,9 +125,12 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     } catch { /* */ }
   }
 
-  // Webhook signing material in session data dirs.
   for (const dataDir of input.dataDirs) {
-    if (!isDir(dataDir)) continue;
+    // The fixed per-person dirs below are masked even when the data dir itself
+    // does not exist yet: a custom SESSION_DATA_DIR leaves ~/.botmux/data to be
+    // created by the first login, which may land mid-session.
+    const dataDirExists = isDir(dataDir);
+    // Webhook signing material in session data dirs.
     addFile(join(dataDir, 'webhook-master.key'));
     addFile(join(dataDir, 'webhook-secrets.json'));
     addFile(join(dataDir, 'feedback-webhook-secrets.json'));
@@ -139,13 +142,15 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     // a fixed list. Exposure reduction only: a token file created after spawn
     // is NOT masked, which is one reason scratch is not a credential boundary
     // (tokenStoreProtection counts only the allowlist sandbox).
-    try {
-      for (const name of readdirSync(dataDir)) {
-        if (name === 'user-token.json' || name.startsWith('user-token-')) {
-          addFile(join(dataDir, name));
+    if (dataDirExists) {
+      try {
+        for (const name of readdirSync(dataDir)) {
+          if (name === 'user-token.json' || name.startsWith('user-token-')) {
+            addFile(join(dataDir, name));
+          }
         }
-      }
-    } catch { /* */ }
+      } catch { /* */ }
+    }
 
     // Per-person secret subdirectories (whole dirs, present or not — see the
     // header): VC daemon auth tokens, each person's bytedcli login HOME and the
