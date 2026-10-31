@@ -633,7 +633,7 @@ import {
   runAdoptSessionRenameSequence,
 } from './services/adopt-input-sequence.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
-import { downgradeForbiddenReadWrite, forbiddenReadWriteMessage, defaultProtectedRoots, isAbsoluteSandboxEntry } from './services/sandbox-path-guard.js';
+import { forbiddenReadWriteMessage, defaultProtectedRoots, readOnlyLauncherMountMessage, resolveStoredSandboxPaths } from './services/sandbox-path-guard.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from './utils/pty.js';
 import {
@@ -23779,34 +23779,29 @@ async function spawnCli(
       readDenyExtraPaths: cfg.readDenyExtraPaths,
       sandboxPaths: cfg.sandboxPaths,
     });
-    // `/`, HOME, the botmux data root (or an ancestor) stored as readWrite runs
-    // as readOnly: the save path refuses it now, but older configs and hand
-    // edits of bots.json still carry it. Roots come from the shared helper — a
-    // hand-rolled list called userInfo() unguarded, which THROWS on hosts
-    // without a passwd entry (numeric-uid containers) and bricked every
-    // sandboxed spawn.
-    const { lists: downgradedLists, downgraded: downgradedUserRw, dropped: droppedUserRw } = downgradeForbiddenReadWrite(
-      cfg.sandboxPaths ?? legacyMapped?.sandboxPaths,
-      defaultProtectedRoots(),
-    );
-    if (downgradedUserRw.length) {
-      log(`[sandbox] sandboxPaths readWrite entries downgraded to readOnly: ${forbiddenReadWriteMessage(downgradedUserRw)}`);
+    // A stored sandboxPaths object may carry entries the save path refuses
+    // now (older configs, hand edits of bots.json): `/`, HOME, the botmux data
+    // root (or an ancestor) as readWrite, relative entries, a readOnly `/` on
+    // Linux. Normalized in one pure step (resolveStoredSandboxPaths); roots
+    // come from the shared helper — a hand-rolled list called userInfo()
+    // unguarded, which THROWS on hosts without a passwd entry (numeric-uid
+    // containers) and bricked every sandboxed spawn.
+    const storedPaths = resolveStoredSandboxPaths(cfg.sandboxPaths ?? legacyMapped?.sandboxPaths, {
+      roots: defaultProtectedRoots(), home: hostHomeDir,
+    });
+    if (storedPaths.downgradedReadWrite.length) {
+      log(`[sandbox] sandboxPaths readWrite entries downgraded to readOnly: ${forbiddenReadWriteMessage(storedPaths.downgradedReadWrite)}`);
     }
-    if (droppedUserRw.length) {
-      log(`[sandbox] sandboxPaths readWrite entries ignored: ${forbiddenReadWriteMessage(droppedUserRw)}`);
+    if (storedPaths.droppedReadWrite.length) {
+      log(`[sandbox] sandboxPaths readWrite entries ignored: ${forbiddenReadWriteMessage(storedPaths.droppedReadWrite)}`);
     }
-    // Relative readOnly entries are dropped too: they resolve against the
-    // session cwd like the readWrite ones did (a save used to accept them), so
-    // `..` would bind HOME read-only. Relative DENY entries are left as-is —
-    // their cwd-relative resolution only ever hides a path (fail-closed).
-    const droppedRoRelative = (downgradedLists?.readOnly ?? [])
-      .filter(p => !isAbsoluteSandboxEntry(p, hostHomeDir));
-    if (droppedRoRelative.length) {
-      log(`[sandbox] sandboxPaths readOnly relative entries ignored (must be absolute or ~/-prefixed): ${droppedRoRelative.join(', ')}`);
+    if (storedPaths.droppedReadOnlyRelative.length) {
+      log(`[sandbox] sandboxPaths readOnly relative entries ignored (must be absolute or ~/-prefixed): ${storedPaths.droppedReadOnlyRelative.join(', ')}`);
     }
-    const userLists = droppedRoRelative.length && downgradedLists
-      ? { ...downgradedLists, readOnly: downgradedLists.readOnly?.filter(p => isAbsoluteSandboxEntry(p, hostHomeDir)) }
-      : downgradedLists;
+    if (storedPaths.droppedReadOnlyRoot.length) {
+      log(`[sandbox] sandboxPaths readOnly entries ignored: ${readOnlyLauncherMountMessage(storedPaths.droppedReadOnlyRoot)}`);
+    }
+    const userLists = storedPaths.lists;
     const droppedUser: string[] = [];
     const resolveUser = (paths?: readonly string[]) => {
       const out: string[] = [];

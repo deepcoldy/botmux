@@ -498,6 +498,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -523,6 +524,7 @@ jobs:
         env:
           DEPLOY_KEY: ${{ secrets.PAGES_DEPLOY_KEY }}
           SITE_KEY: ${{ needs.midscene-report.outputs.report-site-key }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test -n "$DEPLOY_KEY"
@@ -534,8 +536,17 @@ jobs:
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
           export GIT_AUTHOR_NAME="botmux-midscene-bot" GIT_COMMITTER_NAME="botmux-midscene-bot"
           export GIT_AUTHOR_EMAIL="midscene-bot@users.noreply.github.com" GIT_COMMITTER_EMAIL="midscene-bot@users.noreply.github.com"
+          # Reports are 300–600 MB each; without pruning the site grew to
+          # ~11 GB / 35k files and Pages builds repeatedly failed for hours.
+          # Keep two master runs, and drop reports of PRs that are no longer open.
           if [[ "$SITE_KEY" == master-run-* ]]; then
-            export PAGES_KEEP_PREFIX=master-run- PAGES_KEEP=5
+            export PAGES_KEEP_PREFIX=master-run- PAGES_KEEP=2
+          fi
+          if open_prs=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 1000 --json number --jq '.[].number'); then
+            PAGES_OPEN_PRS=$(echo $open_prs)
+            export PAGES_OPEN_PRS
+          else
+            echo "::warning::Could not list open PRs; keeping every pr-* report this time."
           fi
           # Single-commit publish: gh-pages keeps no history (see the script).
           PAGES_REMOTE=git@github.com:deepcoldy/deepcoldy.github.io.git \

@@ -132,7 +132,9 @@ export async function enrichAdoptLiveSessions(
 }
 
 /** Default HerdrRunner: `herdr <args>` through execFile. Both the timeout and an
- *  aborted signal SIGKILL the child, so a hung herdr never outlives the budget. */
+ *  aborted signal SIGKILL the child, so a hung herdr never outlives the budget.
+ *  The signal is not handed to execFile: Node answers an abort there with
+ *  SIGTERM, which a child can ignore, and drops the timeout along with it. */
 export function runHerdrCli(
   args: string[],
   opts: { signal: AbortSignal; timeoutMs: number },
@@ -145,10 +147,12 @@ export function runHerdrCli(
         encoding: 'utf-8',
         timeout: opts.timeoutMs,
         killSignal: 'SIGKILL',
-        signal: opts.signal,
         maxBuffer: 16 * 1024 * 1024,
         windowsHide: true,
       }, (err, stdout) => resolve(err ? undefined : stdout));
+      const kill = () => { child.kill('SIGKILL'); };
+      opts.signal.addEventListener('abort', kill, { once: true });
+      child.once('close', () => opts.signal.removeEventListener('abort', kill));
       child.stdin?.end();
     } catch {
       resolve(undefined);
@@ -274,11 +278,12 @@ async function isFile(path: string): Promise<boolean> {
 
 /** Claude keeps a session at `projects/<realpath(cwd) with every
  *  non-[A-Za-z0-9-] char as '-'>/<id>.jsonl`. A long cwd gets a cut + hashed
- *  directory name instead, so fall back to any `projects/<dir>/<id>.jsonl` —
- *  the id is a UUID, a hit cannot belong to another session. Checks `signal`
- *  around every filesystem call and probes the fallback at most 8 directories
- *  at a time, so once aborted no new call is issued (one already in flight is
- *  left to finish). */
+ *  directory name instead (`<first 200 chars>-<hash>`, probed first), so fall
+ *  back to any `projects/<dir>/<id>.jsonl` — the id is a UUID, a hit cannot
+ *  belong to another session. Checks `signal` around every filesystem call and
+ *  probes the fallback at most 8 directories at a time, each at most once, so
+ *  once aborted no new call is issued (one already in flight is left to
+ *  finish). */
 async function locateClaudeTranscript(
   projectsDir: string,
   sessionId: string,
@@ -289,7 +294,8 @@ async function locateClaudeTranscript(
   const file = `${sessionId}.jsonl`;
   const realCwd = await fsp.realpath(cwd).catch(() => cwd);
   if (signal.aborted) return undefined;
-  const exact = join(projectsDir, realCwd.replace(/[^A-Za-z0-9-]/g, '-'), file);
+  const slug = realCwd.replace(/[^A-Za-z0-9-]/g, '-');
+  const exact = join(projectsDir, slug, file);
   if (await isFile(exact)) return exact;
   if (signal.aborted) return undefined;
   let dirs: string[];
@@ -299,14 +305,24 @@ async function locateClaudeTranscript(
     return undefined;
   }
   let hit: string | undefined;
-  let next = 0;
-  const probe = async (): Promise<void> => {
-    while (!hit && !signal.aborted && next < dirs.length) {
-      const path = join(projectsDir, dirs[next++]!, file);
-      if (path !== exact && await isFile(path)) hit ??= path;
-    }
+  const scan = async (names: string[]): Promise<void> => {
+    let next = 0;
+    const probe = async (): Promise<void> => {
+      while (!hit && !signal.aborted && next < names.length) {
+        const path = join(projectsDir, names[next++]!, file);
+        if (path !== exact && await isFile(path)) hit ??= path;
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(TRANSCRIPT_SCAN_CONCURRENCY, names.length) }, probe));
   };
-  await Promise.all(Array.from({ length: Math.min(TRANSCRIPT_SCAN_CONCURRENCY, dirs.length) }, probe));
+  if (slug.length > 200) {
+    // Same rule as resolveClaudeJsonlPath: try the cut directories first.
+    const cut = `${slug.slice(0, 200)}-`;
+    const likely = (dir: string) => dir === slug || dir.startsWith(cut);
+    await scan(dirs.filter(likely));
+    dirs = dirs.filter(dir => !likely(dir));
+  }
+  await scan(dirs);
   return signal.aborted ? undefined : hit;
 }
 

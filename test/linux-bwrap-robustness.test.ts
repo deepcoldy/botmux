@@ -35,6 +35,7 @@ import {
   systemBwrapPath,
 } from '../src/core/system-bwrap.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { resolveStoredSandboxPaths } from '../src/services/sandbox-path-guard.js';
 
 const linux = process.platform === 'linux';
 const credentialBwrapUsable = linux && probeHostCredentialIsolationMechanism().mechanism === 'bwrap';
@@ -274,6 +275,50 @@ describe('symlinked baseline directories', () => {
       expect(r.stderr).toBe('');
       expect(r.stdout.split('\n')).toEqual(['hi' + realOpt, 'denied', '']);
     } finally { plan?.cleanup(); rmSandboxScratch(root); }
+  });
+});
+
+describe('readOnly entries covering a launcher mount point', () => {
+  // Real bwrap on the production plan: a readOnly `/run` (or `/var/run`, a
+  // link to it on most distros) re-covers the launcher's tmpfs /run, so
+  // `/run/sbxbin` cannot be created and the session exits at launch. The
+  // stored-entry step drops such entries; this pins the two together so the
+  // guard cannot regress to matching one literal path again.
+  function launch(readOnly: string[]) {
+    const root = tmp('sbx-ro-run-');
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'ro-run', dataDir: join(root, 'botmux'),
+        policy: {
+          rules: [
+            { path: '/etc', access: 'readOnly', source: 'baseline' },
+            { path: '/usr', access: 'readOnly', source: 'baseline' },
+            // The worker canonicalizes user entries before building the policy.
+            ...readOnly.map(path => ({ path: realpathSync(path), access: 'readOnly' as const, source: 'user' as const })),
+          ],
+          net: true,
+          writeRegexes: [],
+        },
+        // No shell: the probe only needs a process to start inside the plan.
+        chdir: '/', home: root, cliBin: '/usr/bin/echo', cliArgs: ['started'],
+      });
+      expect(plan).not.toBeNull();
+      return spawnSync(plan!.bin, plan!.args, { encoding: 'utf8', timeout: 10_000 });
+    } finally { plan?.cleanup(); rmSandboxScratch(root); }
+  }
+
+  const entries = ['/run', ...(linux && realpathSync('/var/run') === '/run' ? ['/var/run'] : [])];
+  it.skipIf(!credentialBwrapUsable).each(entries)('%s exits at launch as stored, and starts once dropped', entry => {
+    const stored = launch([entry]);
+    expect(stored.status).not.toBe(0);
+    expect(stored.stderr).toContain('sbxbin');
+
+    const { lists, droppedReadOnlyRoot } = resolveStoredSandboxPaths({ readOnly: [entry, '/run/lock'] }, { platform: 'linux' });
+    expect(droppedReadOnlyRoot).toEqual([entry]);
+    const started = launch(lists!.readOnly!);
+    expect(started.stderr).toBe('');
+    expect(started.stdout).toBe('started\n');
   });
 });
 
