@@ -32,7 +32,7 @@ The channel through which routing guidance and the Skill catalog are **injected 
 
 - **Claude family (claude-code / seed / relay)**: routing / identity via `--append-system-prompt`; Skills via `--plugin-dir` (not stuffed into the system prompt).
 - **genius**: both routing and the Skill catalog go through `--append-system-prompt`; **grok** uses its equivalent flag `--rules`.
-- **Most other CLIs** (codex / gemini / opencode / cursor / coco / traex, etc.): under the default `skillInjection=prompt` mode, routing and the Skill catalog are **inlined into the first prompt**, consuming no system-prompt flag.
+- **Most other CLIs** (codex / opencode / cursor / coco / traex, etc.): under the default `skillInjection=prompt` mode, routing and the Skill catalog are **inlined into the first prompt**, consuming no system-prompt flag.
 
 > Skill catalog injection is governed by the per-bot `skillInjection` mode (genius/grok too): `prompt` (default) inlines a compact catalog into the prompt and pulls full text on demand via `botmux skill show <name>`; `global` installs the skill files into the CLI's shared skills dir (your hand-run CLI sees them too); `off` installs no catalog, leaving only routing guidance + `botmux --help`. The `global`/`off` mechanics differ from the "inline" case above.
 >
@@ -43,6 +43,6 @@ The channel through which routing guidance and the Skill catalog are **injected 
 Compared with an MCP-based approach, the Skill + CLI combination:
 
 - The CLI **doesn't need an MCP handshake** on startup, the core `botmux send` / `history` channels have zero MCP dependency, and it doesn't consume tool-list tokens (a gateway only starts when an adapter explicitly opts in *and* a plugin actually contributes MCP servers).
-- The **shell / routing layer is universal** — as long as a CLI can read a system prompt and run shell commands, `~/.botmux/bin/botmux` + PATH work, covering Claude Code / Codex / Cursor / Gemini / OpenCode, and more.
+- The **shell / routing layer is universal** — as long as a CLI can read a system prompt and run shell commands, `~/.botmux/bin/botmux` + PATH work, covering Claude Code / Codex / Cursor / OpenCode / Antigravity, and more.
 
 > ⚠️ But the **out-of-box Skill layer is not equal across every CLI**: a few (e.g. Antigravity, which only recognizes SKILL.md inside plugin bundles, not a flat `skills/` dir) get routing guidance only, without a Skill catalog. So "universal" holds for the shell/routing channel, and is "most" rather than "all" for the Skill catalog.

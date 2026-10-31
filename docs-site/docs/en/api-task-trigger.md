@@ -136,7 +136,7 @@ Details for `model` / `reasoningEffort`:
 - `model` is that CLI's model id. `reasoningEffort` is validated against the CLI/model capability; when unconfigured or unknown only the common safe tiers are allowed, and an explicitly unsupported value is a 400.
 - **New sessions only**: a follow-up turn folded into a live worker does not rewrite them.
 - `model` **lives in memory only, never on disk**: after a daemon restart the session starts on the bot's configured model. `reasoningEffort` is still persisted with the session.
-- Both fields are ignored when the target bot is not codex / codex-app / traex / grok (they never change the model of Claude / Gemini / CoCo and friends).
+- Both fields are ignored when the target bot is not codex / codex-app / traex / grok (they never change the model of Claude / Antigravity / CoCo and friends).
 
 **⚠️ Three trap fields (present in the type, but not what you think)**
 

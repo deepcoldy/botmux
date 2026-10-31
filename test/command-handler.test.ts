@@ -937,7 +937,7 @@ describe('/cli session selection', () => {
       session: makeSession({ promptInjection: 'none', cliId: undefined, cliLaunchSnapshot: undefined }),
     });
     const deps = makeDeps(ds);
-    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli gemini'), deps, LARK_APP_ID);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli opencode'), deps, LARK_APP_ID);
     expect(ds.session.cliLaunchSnapshot).toBeUndefined();
     expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID,
       expect.stringContaining('automatic final reply capture'), undefined, LARK_APP_ID, 'msg_001');
@@ -10032,8 +10032,8 @@ describe('/card — operator / canOperate gate', () => {
   });
 
   it.each([
-    { frozen: 'grok', stale: 'gemini', mode: 'unified', managed: true },
-    { frozen: 'gemini', stale: 'grok', mode: 'unified', managed: false },
+    { frozen: 'grok', stale: 'opencode', mode: 'unified', managed: true },
+    { frozen: 'opencode', stale: 'grok', mode: 'unified', managed: false },
     { frozen: undefined, stale: 'grok', mode: 'unified', managed: true },
     { frozen: undefined, stale: undefined, mode: 'unified', managed: true },
     { frozen: 'grok', stale: 'grok', mode: 'legacy', managed: false },

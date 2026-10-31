@@ -35,7 +35,6 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
@@ -119,7 +118,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'mimocode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'genius', 'opencode', 'opencode2', 'mimocode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -577,7 +576,7 @@ describe('claude-code buildArgs', () => {
     expect(cursorTranscript).not.toBe(buildBotmuxShellHints('en', false, 'transcript').join('\n'));
 
     // Other CLIs: byte-identical to the no-cliId baseline.
-    for (const cliId of ['codex', 'gemini', 'coco', 'opencode'] as const) {
+    for (const cliId of ['codex', 'aiden', 'coco', 'opencode'] as const) {
       expect(buildBotmuxShellHints('en', false, 'send', cliId).join('\n')).toBe(base);
       expect(buildBotmuxShellHints('en', false, 'transcript', cliId))
         .toEqual(buildBotmuxShellHints('en', false, 'transcript'));
@@ -2077,50 +2076,6 @@ describe('genius buildArgs', () => {
   });
 });
 
-describe('gemini buildArgs', () => {
-  const adapter = createGeminiAdapter('/usr/bin/gemini');
-
-  it('basic args include --yolo', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false });
-    expect(args).toContain('--yolo');
-    expect(args).not.toContain('-i');
-  });
-
-  it('omits --yolo when disableCliBypass is true while preserving initial prompt', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, initialPrompt: 'do something', disableCliBypass: true });
-    expect(args).not.toContain('--yolo');
-    expect(args).toEqual(['-i', 'do something']);
-  });
-
-  it('passes initialPrompt via -i flag', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, initialPrompt: 'do something' });
-    expect(args).toContain('-i');
-    const idx = args.indexOf('-i');
-    expect(args[idx + 1]).toBe('do something');
-  });
-
-  it('passes configured model with --model', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, model: 'gemini-3-pro-preview' });
-    const idx = args.indexOf('--model');
-    expect(idx).toBeGreaterThanOrEqual(0);
-    expect(args[idx + 1]).toBe('gemini-3-pro-preview');
-  });
-
-  it('passesInitialPromptViaArgs is true', () => {
-    expect(adapter.passesInitialPromptViaArgs).toBe(true);
-  });
-
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
-    // -i bakes the full first prompt into argv, same tmux ceiling as OpenCode.
-    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
-  });
-
-  it('does not include session id', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false });
-    expect(args).not.toContain('sess-5');
-  });
-});
-
 describe('opencode buildArgs', () => {
   const adapter = createOpenCodeAdapter('/usr/bin/opencode');
 
@@ -3159,10 +3114,6 @@ describe('completionPattern', () => {
     expect(createMiraAdapter().completionPattern).toBeUndefined();
   });
 
-  it('gemini has no completionPattern', () => {
-    expect(createGeminiAdapter('/bin/gemini').completionPattern).toBeUndefined();
-  });
-
   it('opencode has no completionPattern', () => {
     expect(createOpenCodeAdapter('/bin/opencode').completionPattern).toBeUndefined();
   });
@@ -3607,10 +3558,6 @@ describe('readyPattern', () => {
     expect(createAidenAdapter('/bin/aiden').readyPattern).toBeUndefined();
   });
 
-  it('gemini has no readyPattern', () => {
-    expect(createGeminiAdapter('/bin/gemini').readyPattern).toBeUndefined();
-  });
-
   it('opencode has no readyPattern', () => {
     expect(createOpenCodeAdapter('/bin/opencode').readyPattern).toBeUndefined();
   });
@@ -3813,7 +3760,6 @@ describe('systemHints', () => {
     ['aiden', () => createAidenAdapter('/bin/aiden')],
     ['coco', () => createCocoAdapter('/bin/coco')],
     ['codex', () => createCodexAdapter('/bin/codex')],
-    ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
@@ -3845,7 +3791,6 @@ describe('id property', () => {
     ['coco', () => createCocoAdapter('/bin/coco')],
     ['codex', () => createCodexAdapter('/bin/codex')],
     ['codex-app', () => createCodexAppAdapter('/bin/codex')],
-    ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
@@ -3867,10 +3812,6 @@ describe('id property', () => {
 // ---------------------------------------------------------------------------
 
 describe('altScreen property', () => {
-  it('gemini uses alt screen', () => {
-    expect(createGeminiAdapter('/bin/gemini').altScreen).toBe(true);
-  });
-
   it('opencode uses alt screen', () => {
     expect(createOpenCodeAdapter('/bin/opencode').altScreen).toBe(true);
   });
@@ -3990,11 +3931,6 @@ describe('buildResumeCommand', () => {
   it('mira has no copy-paste resume command', () => {
     const a = createMiraAdapter();
     expect(a.buildResumeCommand?.({ sessionId: 'bm-x', cliSessionId: 'mira-session-1' })).toBeNull();
-  });
-
-  it('gemini does not implement buildResumeCommand (no precise resume)', () => {
-    const a = createGeminiAdapter('/bin/gemini');
-    expect(a.buildResumeCommand).toBeUndefined();
   });
 
   it('opencode emits `opencode -s <cliSessionId>` when known', () => {
@@ -4525,13 +4461,6 @@ describe('resumeRequiresCliSessionId capability', () => {
     // is always available, so no demotion is needed.
     expect(createClaudeCodeAdapter('/usr/bin/claude').resumeRequiresCliSessionId).toBeUndefined();
     expect(createGrokAdapter('/usr/bin/grok').resumeRequiresCliSessionId).toBeUndefined();
-  });
-
-  it('adapters that ignore resume entirely do not declare it', () => {
-    // gemini always starts fresh regardless — but its resume story is "no
-    // resume at all", not "resume requires an id"; keep it out of the demotion
-    // path so its existing card copy is unchanged.
-    expect(createGeminiAdapter('/usr/bin/gemini').resumeRequiresCliSessionId).toBeUndefined();
   });
 });
 

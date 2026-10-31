@@ -585,7 +585,7 @@ export function buildSessionCard(
  * `claude --resume <id>`), built by the per-CLI adapter's
  * `buildResumeCommand`. That keeps the conversation portable: users can
  * pick it up locally without going through botmux. CLIs that can't resume
- * a specific session from CLI args (gemini's "latest only") surface a
+ * a specific session from CLI args (a "latest only" mode) surface a
  * fallback note instead of a fake command.
  *
  * The "▶️ 恢复会话" button still goes through botmux — it re-enables the

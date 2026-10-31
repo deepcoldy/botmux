@@ -817,7 +817,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
   // authPaths = the model CLI's OWN login/state surface (~/.codex, ~/.claude
-  // credentials, Seed/bytedcli SSO, Gemini OAuth, OpenCode DB, …) — NOT Feishu.
+  // credentials, Seed/bytedcli SSO, Antigravity OAuth, OpenCode DB, …) — NOT Feishu.
   // These MUST stay granted even for a no-transport turn, else the CLI can't
   // authenticate and the core functionality breaks. The no-Lark-transport gate
   // only denies Feishu-authority paths (below), never the CLI's own auth.

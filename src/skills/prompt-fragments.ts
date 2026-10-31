@@ -82,7 +82,7 @@ export const BLOCK_META: Record<string, { label: string; hint?: string }> = {
   },
   routing_shell: {
     label: 'Shell 提示路径 · 同批规则散文版',
-    hint: 'codex / gemini / opencode 等无系统提示参数的 CLI，随首轮 prompt 注入',
+    hint: 'codex / opencode 等无系统提示参数的 CLI，随首轮 prompt 注入',
   },
   identity: {
     label: '<identity> 身份与多 bot 归属',
@@ -176,7 +176,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '实验开关：跨主体插队 XPI（默认关）；强制开/关同时作用于 Shell 路径',
   },
 
-  // shell-hints path (codex / gemini / opencode / …) — the same guidance, prose form
+  // shell-hints path (codex / opencode / …) — the same guidance, prose form
   { key: 'ai.shell.intro', block: 'routing_shell', stage: 'new', label: 'Shell：开场说明（标准模式）', kind: 'editable' },
   {
     key: 'ai.shell.intro_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',

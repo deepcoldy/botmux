@@ -411,14 +411,14 @@ describe('triggerSessionTurn rootMessageId target', () => {
   });
 
   it('does NOT stamp model/effort onto a CLI without reasoning support', async () => {
-    // gemini has no configurable reasoning effort (claude-code now does), so the
+    // opencode has no configurable reasoning effort (claude-code now does), so the
     // gate must keep the override from silently changing such a bot's model.
     mockGetBot.mockReturnValue({
-      config: { larkAppId: APP, cliId: 'gemini', workingDir: '/tmp' },
-      botName: 'Gemini', botOpenId: 'ou_bot',
+      config: { larkAppId: APP, cliId: 'opencode', workingDir: '/tmp' },
+      botName: 'OpenCode', botOpenId: 'ou_bot',
     });
     const req = request();
-    (req.options as any) = { model: 'gemini-3-pro', reasoningEffort: 'high' };
+    (req.options as any) = { model: 'anthropic/claude-sonnet-4', reasoningEffort: 'high' };
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));

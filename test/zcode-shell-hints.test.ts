@@ -27,7 +27,7 @@ describe('ZCode interim progress instruction', () => {
   it('is ZCode-only — other CLIs keep byte-identical hints', () => {
     // Cursor is excluded on purpose: it has its own legitimate background-task
     // note. Every other id must render exactly the no-cliId baseline.
-    for (const cliId of ['claude-code', 'codex', 'kimi', 'gemini'] as const) {
+    for (const cliId of ['claude-code', 'codex', 'kimi', 'opencode'] as const) {
       const withCli = buildBotmuxShellHints('zh', false, 'send', cliId).join('\n');
       const baseline = buildBotmuxShellHints('zh', false, 'send').join('\n');
       expect(withCli).toBe(baseline);

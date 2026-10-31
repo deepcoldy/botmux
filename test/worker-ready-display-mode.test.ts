@@ -1408,7 +1408,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
       streamCardId: 'om_existing_card',
       workingDir: '/tmp',
     });
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     ds.session.backendType = 'tmux';
     ds.session.cliSessionId = undefined;
     ds.session.workingDir = '/tmp';

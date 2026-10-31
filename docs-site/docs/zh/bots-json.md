@@ -44,7 +44,7 @@
 | 字段 | 说明 |
 |------|------|
 | `name` | 进程名后缀，如 `claude-main` → `botmux-claude-main`；留空默认 `botmux-<序号>` |
-| `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
+| `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters)。`gemini` 已下线：仍写 `"gemini"` 的 bot 会拒绝启动并提示改成 `"antigravity"`（其它 bot 不受影响），Gemini 专属的 `cliPathOverride` / `wrapperCli` / `model` / `GEMINI_CLI_HOME` 不会沿用，见 [Gemini CLI 已下线](/adapters#gemini-cli-已下线) |
 | `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选。**每次启动 CLI 时都按当前配置解析**（含 resume）：改完（dashboard 或本文件）对**未设置群级模型的存量会话**也生效，在它下一次启动/恢复时应用；与 `cliId` / `cliRuntime` / `wrapperCli` 不同——那几个在会话创建时冻结，避免中途换掉底层运行时 |
 | `groupDefaultModels` | 按群 ID 配置新话题默认模型，例如 `{ "oc_team": { "codex": { "model": "your-codex-model", "reasoningEffort": "high" } } }`；目前仅支持 Codex 和 Claude。可在 Dashboard「群管理 → 新话题默认模型」按 Bot 配置 |
 | `reasoningEffort` | 新会话默认思考强度。仅对 `codex` / `codex-app` / `traex` / `grok` 这类有结构化思考强度控制的 CLI 生效；按 CLI 与模型能力校验，不支持或未声明支持的组合会被拒绝或忽略 |
@@ -308,7 +308,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
 2. **不再逐轮注入 `<botmux_reminder>`**（每轮 prompt 少一段提醒）；
 3. **solo 会话去壳**：私聊、或只有 owner 和本 bot 两个参与者的 1v1 普通群，每轮消息去掉 `<user_message>` 壳与 `<sender/>` 标签，模型看到的就是裸文本。话题群、多人群、非 owner 发言的一律不算 solo，壳与标签照旧。
 
-支持的 CLI 白名单：`claude-code`，以及走结构化转写桥的 `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`。其它 CLI（如 `cursor`、`gemini`）没有转写采集通道，`/botconfig set` 与 dashboard 都会拒绝（`reply_delivery_unsupported`）；已写盘后再把 `cli` 切到不支持的 CLI，运行时自动回落 `send`（日志 warn 一次），不会丢回复。
+支持的 CLI 白名单：`claude-code`，以及走结构化转写桥的 `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`。其它 CLI（如 `cursor`、`antigravity`）没有转写采集通道，`/botconfig set` 与 dashboard 都会拒绝（`reply_delivery_unsupported`）；已写盘后再把 `cli` 切到不支持的 CLI，运行时自动回落 `send`（日志 warn 一次），不会丢回复。
 
 可由 owner / `allowedUsers` 通过 `/botconfig` 热更新：
 

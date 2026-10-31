@@ -19,7 +19,7 @@ import type { RiffHostBinding } from '../../services/riff-host-tools.js';
 /**
  * Fallback system prompt injected into every riff task when no explicit
  * `systemPrompt` is configured. Mirrors the `<botmux_routing>` block that
- * codex/gemini/etc. get via buildBotmuxShellHints — the riff agent must use
+ * codex/opencode/etc. get via buildBotmuxShellHints — the riff agent must use
  * `botmux send` to reply (same as any other botmux-bridged CLI), not rely on
  * passive output capture. botmux is installed in the sandbox via setupCommands.
  */

@@ -7,7 +7,7 @@
 ## 结构与能力
 
 ```text
-Codex / Claude Code / OpenCode / Gemini / 其他具备 shell 的 Agent
+Codex / Claude Code / OpenCode / 其他具备 shell 的 Agent
   -> 同一份 OpenViking Skill
   -> 公共 CLI search / find / read / remember / status
   -> OpenViking HTTP 服务
@@ -145,4 +145,4 @@ node verify-runtime.mjs
 
 跨 Agent 测试每次使用独立项目和未知验收标签，Codex 内置 Memory 与原生 OV 插件在共享入口测试中关闭。测试同时检查另一个项目不返回原 peer 的目录。原生 TUI 测试覆盖普通问题不查询、新会话主动搜索、自动捕获/提交/提取。证据写入 git 忽略的 `evidence/`，会话和配置文件不提交 PR。
 
-Botmux 测试 `test/openviking-memory-example.test.ts` 验证 Codex、Claude Code、OpenCode、Gemini 的公共分发与默认关闭，以及非 Codex Bot 命令使用固定的共享配置。安装器还经过隔离运行验证：非 Codex Bot 绑定/撤回、保留其他 Bot 和采集配置、拒绝覆盖手动修改。真实模型验证以实际记录的宿主为准；公共目录生成不证明每种模型都正确查询。完整飞书进入、worker 处理与回复交付未由上述本地测试覆盖。
+Botmux 测试 `test/openviking-memory-example.test.ts` 验证 Codex、Claude Code、OpenCode 的公共分发与默认关闭，以及非 Codex Bot 命令使用固定的共享配置。安装器还经过隔离运行验证：非 Codex Bot 绑定/撤回、保留其他 Bot 和采集配置、拒绝覆盖手动修改。真实模型验证以实际记录的宿主为准；公共目录生成不证明每种模型都正确查询。完整飞书进入、worker 处理与回复交付未由上述本地测试覆盖。

@@ -1,13 +1,13 @@
 /**
  * E2E test: Antigravity CLI (`agy`) first-input submission.
  *
- *   agy is Google's Ink-based TUI; like Gemini, its TextInput mounts
+ *   agy is Google's Ink-based TUI; like other Ink TUIs, its TextInput mounts
  *   asynchronously after process spawn. Two empirical findings drive
  *   the production adapter:
  *
  *     1. agy's `-i` / `--prompt-interactive` flag is NOT functional as a
  *        prompt-injection channel:
- *          - the deposited prompt is not auto-submitted (unlike Gemini)
+ *          - the deposited prompt is only pre-filled, not auto-submitted
  *          - it does not appear in history.jsonl, so we have no way to
  *            verify the submission landed
  *          - a follow-up Enter does not finish the deposit either
@@ -214,8 +214,8 @@ describe.skipIf(!AGY_AVAILABLE)('Antigravity (agy) first input submission', () =
   it('finding (1): -i flag does NOT auto-submit and is NOT logged to history.jsonl', async () => {
     /**
      * This is the core reason the adapter doesn't set
-     * passesInitialPromptViaArgs. If Google ever fixes -i to behave like
-     * Gemini's, this test will start failing — and that's the signal to
+     * passesInitialPromptViaArgs. If Google ever fixes -i to auto-submit
+     * the prompt, this test will start failing — and that's the signal to
      * flip the adapter back to args-based prompt injection.
      */
     const baseSize = historyBaseSize();

@@ -204,7 +204,7 @@ botmux skills pack delete <id> [--force]
 
 ## Delivery 行为
 
-通用路径是 prompt delivery：botmux 在首轮 prompt 后追加 priority catalog，告诉 agent 先查看这些 skill，并用 `botmux skill show/read/resources` 读取内容。这对 Codex、OpenCode、Gemini、Cursor 等 CLI 都可用，而且不会写入 `~/.codex/skills` 或其他 CLI 全局目录。
+通用路径是 prompt delivery：botmux 在首轮 prompt 后追加 priority catalog，告诉 agent 先查看这些 skill，并用 `botmux skill show/read/resources` 读取内容。这对 Codex、OpenCode、Cursor、Antigravity 等 CLI 都可用，而且不会写入 `~/.codex/skills` 或其他 CLI 全局目录。
 
 Claude Code 支持 scoped plugin 优化：botmux 会为当前 session 生成 runtime plugin，并通过 `--plugin-dir` 注入。这个目录是会话派生物，不进入 Git，不污染全局 `~/.claude/skills`。同时仍保留 prompt catalog，方便 agent 明确知道哪些是 botmux priority skills。
 

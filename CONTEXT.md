@@ -7,7 +7,7 @@ the conversation anchored to the chat where the work started.
 
 **Agent CLI**:
 An AI coding command-line tool that botmux can run on behalf of a chat, such as
-Claude Code, Codex, Gemini, Cursor, or OpenCode.
+Claude Code, Codex, Cursor, OpenCode, or Antigravity.
 _Avoid_: agent cli, CLI bot
 
 **Bot**:

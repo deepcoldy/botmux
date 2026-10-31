@@ -193,7 +193,7 @@ export interface CliAdapter {
    *  The backend also spawns the process in `workingDir`; adapters may use the
    *  same value when a CLI needs an explicit workspace-root flag.
    *  When initialPrompt is provided and the adapter supports it, the prompt
-   *  is baked into CLI args (e.g. Gemini's -i flag) instead of being written
+   *  is baked into CLI args (e.g. OpenCode's --prompt flag) instead of being written
    *  to stdin after idle detection. */
   buildArgs(opts: {
     sessionId: string;
@@ -439,7 +439,7 @@ export interface CliAdapter {
    *  conversation outside the bot.
    *
    *  Returns `null` when the CLI doesn't support precise per-session resume
-   *  from CLI args (e.g. gemini's "latest only" mode), or when the CLI-native
+   *  from CLI args (e.g. a "latest only" mode), or when the CLI-native
    *  session id can't be resolved (e.g. codex history file is missing).
    *  The card falls back to a static note in those cases.
    *
@@ -464,7 +464,7 @@ export interface CliAdapter {
   readonly resumeRequiresCliSessionId?: boolean;
 
   /** True when this adapter finds the native session to resume by itself
-   *  from the botmux session id (Kimi: its index + wire logs; Gemini: the
+   *  from the botmux session id (Kimi: its index + wire logs; the
    *  session it was started under), so no `cliSessionId` is needed. Whether a
    *  resume restores history is then exactly what `checkResumeTargetExists`
    *  answers; upper layers (resume receipt, closed card) ask it instead of
@@ -1026,7 +1026,7 @@ export interface CliAdapter {
      *  applying per-bot env/profile settings (for example Hermes state.db). */
     stateDbPath?: string;
     /** The env the CLI will run with (worker env + per-bot env), for adapters
-     *  whose session store moves with it (KIMI_CODE_HOME, GEMINI_CLI_HOME). */
+     *  whose session store moves with it (KIMI_CODE_HOME). */
     env?: NodeJS.ProcessEnv;
   }): boolean | undefined;
 
@@ -1159,7 +1159,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。

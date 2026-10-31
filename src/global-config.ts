@@ -327,11 +327,11 @@ export interface GlobalSkillConfig {
   delivery?: 'auto' | 'prompt' | 'native';
   /** Machine-wide default for how botmux's **built-in bridge skills**
    *  (botmux-send / botmux-schedule / …) reach CLIs that only support a GLOBAL
-   *  skills directory (codex/gemini/opencode/… — everything with `skillsDir`,
+   *  skills directory (codex/opencode/… — everything with `skillsDir`,
    *  i.e. no per-session `--plugin-dir` injection like Claude Code):
    *   - `global`: install the skill files into the CLI's shared global dir
    *     (e.g. `~/.codex/skills`). Full native experience, but the user's own
-   *     standalone `codex`/`gemini` sees & can mis-fire them. Right for hosts
+   *     standalone `codex`/`opencode` sees & can mis-fire them. Right for hosts
    *     whose users NEVER run those CLIs by hand.
    *   - `prompt` (default): don't touch the global dir; inject a compact skill
    *     catalog into the session prompt and let the model pull full instructions

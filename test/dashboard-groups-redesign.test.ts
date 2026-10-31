@@ -185,7 +185,7 @@ describe('summarizeBotSettings — overview matrix cells', () => {
   it('treats a missing / inherited configuration as off', () => {
     const cells = summarizeBotSettings(member('cli_a', {
       replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
-      agentCliId: 'gemini',
+      agentCliId: 'opencode',
     }), tr);
     expect(cells.role.tone).toBe('off');
     expect(cells.replyMode.tone).toBe('off');

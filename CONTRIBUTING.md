@@ -77,7 +77,7 @@ Daemon (daemon.ts → core/ modules)
     |-- core/scheduler: cron scheduling
     |
 Worker (worker.ts) -- forked per session
-    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / Gemini / OpenCode)
+    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / OpenCode / Antigravity / ...)
     |-- adapters/backend: PtyBackend or TmuxBackend
     |-- utils/idle-detector: idle detection
     |-- HTTP + WebSocket: xterm.js web terminal
@@ -85,7 +85,7 @@ Worker (worker.ts) -- forked per session
     |-- IPC: daemon communication
     |
 AI Coding CLI (interactive TTY)
-    |-- Auto-installed Skills (~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/)
+    |-- Auto-installed Skills (~/.claude/skills/, ~/.config/opencode/skills/, ...)
     |-- ~/.botmux/bin/botmux wrapper on PATH → `botmux send/schedule/bots/thread` subcommands
     |
 Lark API
@@ -108,7 +108,7 @@ src/
       registry.ts           # Adapter factory + resolveCommand
       claude-code.ts        # Claude Code adapter
       codex.ts              # Codex adapter
-      gemini.ts             # Gemini CLI adapter
+      antigravity.ts        # Antigravity adapter
     backend/
       types.ts              # SessionBackend interface
       pty-backend.ts        # node-pty backend
@@ -153,8 +153,8 @@ teach the agent when/how to use them.
 **Runtime setup per CLI worker spawn** (see `src/core/worker-pool.ts`):
 
 1. `ensureCliSkills(cliId)` — writes `src/skills/definitions.ts` content
-   into the CLI's native skill dir (`~/.claude/skills/`, `~/.gemini/skills/`,
-   `~/.config/opencode/skills/`). Synchronous, idempotent per lifecycle.
+   into the CLI's native skill dir (`~/.claude/skills/`,
+   `~/.config/opencode/skills/`, ...). Synchronous, idempotent per lifecycle.
 2. Worker `PATH` is prepended with `~/.botmux/bin`, which contains a
    `botmux` shell wrapper written by the daemon at startup (points at the
    running daemon's `dist/cli.js` — always in sync).
@@ -227,7 +227,6 @@ bun run test:all            # Unit + E2E (needs real CLIs / browser session)
 bun run test:e2e            # All *.e2e.ts (sequential)
 bun run test:e2e-browser    # Feishu browser cases through Midscene Test
 bun run test:codex          # Codex input E2E
-bun run test:gemini         # Gemini CLI input E2E
 bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
 bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```

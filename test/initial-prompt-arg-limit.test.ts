@@ -5,7 +5,6 @@ import { describe, expect, it } from 'vitest';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createRiffAdapter } from '../src/adapters/cli/riff.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
@@ -47,8 +46,8 @@ describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
     })).toBe(false);
   });
 
-  it('does not arm for quiescence-only argv adapters (Pi / Gemini) but still tracks argv seed', () => {
-    for (const adapter of [createPiAdapter('/bin/pi'), createGeminiAdapter('/bin/gemini')]) {
+  it('does not arm for quiescence-only argv adapters (Pi / MTR) but still tracks argv seed', () => {
+    for (const adapter of [createPiAdapter('/bin/pi'), createMtrAdapter('/bin/mtr')]) {
       expect(adapter.passesInitialPromptViaArgs).toBe(true);
       expect(adapter.injectsReadyHook).toBeFalsy();
       const base = {
@@ -439,7 +438,6 @@ describe('argv-baked providers share the tmux command-too-long guard', () => {
   // maxInitialPromptArgBytes stays unset (see the Pi cases above).
   const cases: Array<[string, CliAdapter, number]> = [
     ['cursor', createCursorAdapter('/usr/bin/cursor-agent'), 8192],
-    ['gemini', createGeminiAdapter('/usr/bin/gemini'), 8192],
     ['mtr', createMtrAdapter('/usr/bin/mtr'), 8192],
     ['grok', createGrokAdapter('/usr/bin/grok'), 4096],
   ];

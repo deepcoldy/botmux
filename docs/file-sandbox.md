@@ -376,7 +376,7 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 
 脚本在 `scripts/oncall-cli-matrix/`，必须在 isolate-run 里跑，详见 `lab.sh` 开头的注释。
 
-实测时间 2026-10-30（Antigravity 行 2026-11-01 复测），宿主 Linux 5.15（root daemon），CLI 版本：Claude Code 2.1.312、Codex 0.164.0、Antigravity（agy）1.4.12、OpenCode 1.19.3、Kimi 0.31.0、Pi 1.3.0、Oh My Pi 18.10.1、Grok 1.0.70。Antigravity、Kimi 的「/restart 恢复」一列是接上会话恢复之后复测的结果（开沙盒、不开沙盒都通过）。Gemini CLI 停维，矩阵行 2026-11-01 起被 Antigravity 取代，不再覆盖。
+实测时间 2026-10-30（Antigravity 行 2026-11-01 复测），宿主 Linux 5.15（root daemon），CLI 版本：Claude Code 2.1.312、Codex 0.164.0、Antigravity（agy）1.4.12、OpenCode 1.19.3、Kimi 0.31.0、Pi 1.3.0、Oh My Pi 18.10.1、Grok 1.0.70。Antigravity、Kimi 的「/restart 恢复」一列是接上会话恢复之后复测的结果（开沙盒、不开沙盒都通过）。Gemini CLI 停维，矩阵行 2026-11-01 起被 Antigravity 取代，适配器已移除。
 
 | CLI | 后端 | 启动 | 首轮收发 | shell 工具 | 工作目录读写 | 联网 | botmux send | 宿主凭证不可读 | /restart 恢复 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -412,14 +412,14 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 
 **本次为白名单隔离补的路径**（每项都只放行该 CLI 自己的目录）
 
-这些目录是读写放行的，里面也有 CLI 会自动加载并执行的内容：Pi 的 `extensions/`、Gemini `settings.json` 里的 hooks / MCP、OpenCode 的 `plugin/`。所以沙盒里的 agent 写进去的东西，之后同机不开沙盒的同一个 CLI 也会加载。这与 Codex（`config.toml`）、Oh My Pi、MiMoCode 原有的整目录读写是同一类问题，属于跨适配器的收紧项，这次没有改。
+这些目录是读写放行的，里面也有 CLI 会自动加载并执行的内容：Pi 的 `extensions/`、Antigravity 的 `config/hooks.json`、OpenCode 的 `plugin/`。所以沙盒里的 agent 写进去的东西，之后同机不开沙盒的同一个 CLI 也会加载。这与 Codex（`config.toml`）、Oh My Pi、MiMoCode 原有的整目录读写是同一类问题，属于跨适配器的收紧项，这次没有改。
 
-- Gemini CLI：`~/.gemini` 整个目录。原来只放行 `oauth_creds.json`，看不到 `settings.json` 和 `trustedFolders.json`，每次启动都卡在认证方式 / 目录信任对话框；而且 trustedFolders 是写临时文件再 rename，需要目录可写。
-  - 已知边界：整个 `~/.gemini` 读写放行，也覆盖了 Antigravity 放在 `antigravity-cli/` 下的 OAuth token、`history.jsonl`、`brain/` 和 `config/hooks.json`；`~/.gemini/tmp/<项目>/chats` 和 `~/.gemini/history` 里存着同机所有 Gemini 会话的聊天记录，开了白名单隔离的 Gemini（以及原本就放行整个 `~/.gemini` 的 Antigravity）在沙盒里都能读到。Gemini 按项目短名写这些目录，短名由它自己分配，spawn 前算不出来，没法像 Pi 那样只放行本会话。后续可以用 `GEMINI_CLI_HOME` 把每个 bot 的 Gemini 状态重定向进 BOT_HOME。
+- Antigravity：`~/.gemini` 整个目录读写放行（原有的放行，本次没有改）。
+  - 已知边界：这包括 `antigravity-cli/` 下的 OAuth token、`history.jsonl`、`brain/` 和 `config/hooks.json`；同机其它 Antigravity 会话的记录在沙盒里也能读到。
 - Pi：`~/.pi/agent` 整个目录，但把共享的 `sessions/` 遮掉，只重新放行本会话的 `sessions/botmux/<会话 id>`，并给 Pi 传 `--session-dir`（与 Oh My Pi / ebsd 同一做法；scratch 不传，那里整盘都是一次性副本）。会话文件的位置跟着会话走：开沙盒恢复一个原来不开沙盒的会话时，先把按工作目录分组的子目录里的旧文件复制进来；一个会话一旦在自己的目录下有了文件，之后不开沙盒重启、关闭态卡片和本地终端给出的恢复命令都继续用它，桥接也只读它；会话 `/cd` 到新目录后再恢复时，新目录的旧记录同样先复制进来。原来看不到 `models.json` / `settings.json`，Pi 退回内置 provider，请求根本没发给配置的模型；会话文件也只写在沙盒的临时 tmpfs 里，宿主侧的桥接读不到。不开沙盒的 Pi 会话布局不变。
 - OpenCode：加放行 `~/.config/opencode`（读写）。原来看不到这里的 `opencode.json`，按配置文件配的 provider 失效，退回 OpenCode 自带的托管模型；botmux 的 ask 插件也加载不了。OpenCode 每次启动都会往这里装插件依赖，只读挂载会让它直接退出。
 - Kimi：放行整个 `~/.kimi-code`（`bin/` 只读）。原来只放行 `credentials/` 和 `oauth/`，会话记录和 `session_index.jsonl` 都写在沙盒的临时 tmpfs 里，恢复必然新开会话。
-  - 已知边界：同机其它 Kimi 会话的记录在沙盒里也能读到，与 Gemini 相同。
+  - 已知边界：同机其它 Kimi 会话的记录在沙盒里也能读到，与 Antigravity 相同。
 - 所有 CLI（只限白名单隔离；scratch 与仅凭据隔离不设）：daemon 以 root 运行时，沙盒内设 `TAR_OPTIONS=--no-same-owner`。`--unshare-user` 只映射当前 uid，GNU tar 以 root 身份解包别人的归档时 chown 失败。Pi 每次启动都会重新下载 fd / rg，启动期间会吞掉送进来的第一条输入。
 
 ## 后续

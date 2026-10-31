@@ -73,7 +73,7 @@ export function shouldRunStartupCommandsOnSpawn(opts: { willReattachPersistent: 
 /**
  * Whether to defer the initial prompt from launch-args to the normal input queue
  * so startupCommands precede it. Only when commands exist AND the CLI bakes the
- * first prompt into launch args (passesInitialPromptViaArgs, e.g. Gemini `-i`):
+ * first prompt into launch args (passesInitialPromptViaArgs, e.g. OpenCode `--prompt`):
  * an args-baked prompt would execute BEFORE flushPending's startup-command hook,
  * breaking the "before the first message" contract. Adopt never spawns fresh.
  * Default path (no startupCommands) is untouched, so args-CLIs keep their robust

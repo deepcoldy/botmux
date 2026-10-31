@@ -1797,7 +1797,7 @@ async function triggerSessionTurnAdmitted(
     // Per-turn model / reasoning-effort override — scoped to CLIs with an
     // explicit reasoning control and to a freshly-created trigger session.
     // Gating on cliId keeps the contract honest and bounded: it never silently
-    // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
+    // changes the model of a Claude/Kimi/CoCo bot, and a fold-in to an existing
     // worker never reaches here. Model is gated here so it cannot leak to
     // other CLIs whose adapters do not implement this contract.
     //

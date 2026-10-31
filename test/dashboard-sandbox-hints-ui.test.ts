@@ -115,7 +115,7 @@ describe('SandboxSection — confirm before switching the sandbox on', () => {
 
 describe('PromptInjectionSection — reason-specific unsupported note', () => {
   it.each([
-    [{ cliId: 'gemini' }, 'cli_unsupported'],
+    [{ cliId: 'opencode' }, 'cli_unsupported'],
     [{ cliId: 'cursor', sandboxMode: 'scratch' as const }, 'scratch_unsupported_for_cli'],
     [{ cliId: 'antigravity', backendType: 'zmx' }, 'zmx_unsupported_for_antigravity'],
   ])('%j → %s', (over, reason) => {
@@ -125,7 +125,7 @@ describe('PromptInjectionSection — reason-specific unsupported note', () => {
   });
 
   it('each reason renders its own sentence, and a supported CLI renders none of them', () => {
-    const texts = (['gemini', 'cursor', 'antigravity'] as const).map((cliId, i) => {
+    const texts = (['opencode', 'cursor', 'antigravity'] as const).map((cliId, i) => {
       const over = [{}, { sandboxMode: 'scratch' as const }, { backendType: 'zmx' }][i];
       const view = mount(React.createElement(PromptInjectionSection, { bot: bot({ cliId, promptInjection: 'default', ...over }), patchBot: vi.fn() }));
       return JSON.stringify(view.root.findByProps({ className: 'bd-section-note' }).props.children);

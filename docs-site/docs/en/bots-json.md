@@ -44,7 +44,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | Field | Description |
 |------|------|
 | `name` | Process name suffix, e.g. `claude-main` → `botmux-claude-main`; leave empty to default to `botmux-<index>` |
-| `cliId` | CLI adapter, defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters) |
+| `cliId` | CLI adapter, defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters). `gemini` has been removed: a bot still set to `"gemini"` refuses to start with a hint to switch to `"antigravity"` (other bots are unaffected); Gemini-specific `cliPathOverride` / `wrapperCli` / `model` / `GEMINI_CLI_HOME` do not carry over — see [Gemini CLI has been removed](/en/adapters#gemini-cli-has-been-removed) |
 | `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup`. **Resolved from the current config on every CLI launch**, resume included: a change (dashboard or this file) also applies to **existing sessions without a captured group override**, from their next launch/resume onward. Unlike `cliId` / `cliRuntime` / `wrapperCli`, which are frozen when the session is created so a live conversation never has its runtime swapped underneath it |
 | `groupDefaultModels` | Per-chat defaults for new topics, e.g. `{ "oc_team": { "codex": { "model": "your-codex-model", "reasoningEffort": "high" } } }`. Supports Codex and Claude; configure each bot from Dashboard group management |
 | `reasoningEffort` | Default reasoning effort for new sessions. Only applies to CLIs with structured reasoning controls (`codex` / `codex-app` / `traex` / `grok`); values are validated against the selected CLI/model, and unsupported or undeclared combinations are rejected or ignored |
@@ -301,7 +301,7 @@ Editable visually in Dashboard → Bot Config → Cards → Final Answer Feedbac
 2. **The per-turn `<botmux_reminder>` is no longer injected** (one less reminder block per prompt);
 3. **Solo sessions are unwrapped**: in a DM, or a plain 1:1 group whose only participants are the owner and this bot, each turn drops the `<user_message>` wrapper and the `<sender/>` tag, so the model sees bare text. Topic groups, multi-member groups, and turns spoken by anyone other than the owner never count as solo; wrapper and tag stay as before.
 
-Supported CLIs: `claude-code`, plus the structured-transcript bridge CLIs `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`. Other CLIs (e.g. `cursor`, `gemini`) have no transcript capture, so both `/botconfig set` and the dashboard reject the value (`reply_delivery_unsupported`); if the field is already persisted and `cli` is later switched to an unsupported CLI, the runtime falls back to `send` (one warn in the log) rather than losing replies.
+Supported CLIs: `claude-code`, plus the structured-transcript bridge CLIs `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`. Other CLIs (e.g. `cursor`, `antigravity`) have no transcript capture, so both `/botconfig set` and the dashboard reject the value (`reply_delivery_unsupported`); if the field is already persisted and `cli` is later switched to an unsupported CLI, the runtime falls back to `send` (one warn in the log) rather than losing replies.
 
 Hot-updatable by the owner / `allowedUsers` via `/botconfig`:
 

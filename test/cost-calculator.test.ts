@@ -588,7 +588,7 @@ describe('getSessionTokenUsage', () => {
     vi.mocked(existsSync).mockReturnValue(false);
 
     expect(getSessionTokenUsage({
-      cliId: 'gemini',
+      cliId: 'opencode',
       sessionId: 's1',
       cwd: '/tmp',
     })).toBeNull();

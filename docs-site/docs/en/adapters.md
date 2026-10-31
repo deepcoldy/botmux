@@ -14,7 +14,6 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `claude-code` | Claude Code (default) | local process | ✅ |
 | `codex` | Codex CLI | local process | ✅ |
 | `codex-app` | Codex App | local process (app-server protocol) | |
-| `gemini` | Gemini | local process | ✅ |
 | `cursor` | Cursor (cursor-agent) | local process | ✅ |
 | `opencode` | OpenCode | local process | ✅ |
 | `opencode2` | OpenCode 2 (beta, `opencode2`) | local process | |
@@ -44,6 +43,14 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `dsh` | DeepSeek Harness (dsh CLI) | local process (SDK JSON-RPC) | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
+
+### Gemini CLI has been removed
+
+Gemini CLI is no longer maintained upstream, so botmux removed the `gemini` adapter, and the Dashboard and `botmux setup` no longer offer it (the old setup menu number 6 now reports an error instead of selecting another CLI). The replacement is `antigravity` (Antigravity, `agy`).
+
+- A bot whose `bots.json` entry still says `cliId: "gemini"` **refuses to start**, with a (Chinese) hint that Gemini CLI is retired and that `cliId` should be changed to `"antigravity"`. Other bots are unaffected.
+- To migrate: install `agy` and sign in with a Google account, or skip the sign-in and use a Gemini API key — set `modelProvider: "gemini"` in `~/.gemini/antigravity-cli/settings.json` and provide `GEMINI_API_KEY`. Then change `cliId` to `"antigravity"` (edit `bots.json` directly, or change the bot's CLI with `botmux setup`) and run `botmux restart`. While the bot is not started, the Dashboard shows the reason but cannot save its settings.
+- Gemini-specific settings do not carry over: `cliPathOverride` / `wrapperCli` (e.g. `ttadk gemini`), Gemini `model` names and `GEMINI_CLI_HOME` must be removed or reconfigured for the new CLI.
 
 ## Pi execution progress
 
