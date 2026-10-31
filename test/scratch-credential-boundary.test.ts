@@ -23,19 +23,28 @@ afterEach(() => {
   for (const base of bases.splice(0)) rmdirSync(base);
 });
 
-function lateSecretsReport(ghostData: boolean) {
+function lateSecretsReport(ghostData: boolean, symlinkedBotmux = false) {
   const base = freshBase();
   const run = runInPrivateMountNs(`
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { prepareScratchSandbox } from './src/adapters/backend/scratch-sandbox.js';
 import { enumerateScratchSecretPaths } from './src/adapters/backend/scratch-credentials.js';
 const base = ${JSON.stringify(base)};
 const ghostData = ${JSON.stringify(ghostData)};
+const symlinkedBotmux = ${JSON.stringify(symlinkedBotmux)};
 spawnSync('mount', ['-t', 'tmpfs', 'tmpfs', base]);
 const home = join(base, 'home');
 const botmux = join(home, '.botmux');
+// ~/.botmux moved to another disk and symlinked back: paths below it that do
+// not exist yet cannot be resolved, so they reach the mask compiler lexically.
+const movedBotmux = join(base, 'moved-botmux');
+if (symlinkedBotmux) {
+  mkdirSync(home, { recursive: true });
+  mkdirSync(movedBotmux, { recursive: true });
+  symlinkSync(movedBotmux, botmux);
+}
 // The session's own data dir always exists; the token data dir may not yet
 // (a custom SESSION_DATA_DIR leaves ~/.botmux/data to the first login).
 const sessionData = join(base, 'session-data');
@@ -59,6 +68,7 @@ const probes = {
   vcAuthLate: join(data, 'vc-meeting-daemon-auth', '57'),
   otherIdentityLate: join(data, 'cli-identity', 'sess-OTHER.bin', '.data', 'lark-cli.env'),
   ordinary: join(home, 'notes.txt'),
+  ...(symlinkedBotmux ? { bytedcliLateResolved: join(movedBotmux, 'data', 'bytedcli-home', 'ou_late', 'login.json') } : {}),
 };
 const code = \`
 const fs = require('fs');
@@ -76,6 +86,8 @@ const tick = setInterval(() => {
 const sbx = prepareScratchSandbox({ sessionId: 'sid-cred', dataDir: sessionData, storage: 'tmpfs', chdir: work, home,
   cliBin: process.execPath, cliArgs: ['-e', code], denyPaths: secrets.denyPaths, readOnlyCarvePaths: secrets.readOnlyCarvePaths });
 if (!sbx) throw new Error('prepare failed');
+// Preparing must not write the host (scratch's promise): nothing new below ~/.botmux.
+const hostBotmuxAfterPrepare = existsSync(botmux) ? readdirSync(botmux) : null;
 const child = spawn(sbx.bin, sbx.args, { env: { ...process.env, ...sbx.env }, stdio: 'inherit' });
 await new Promise(r => setTimeout(r, 1500));
 // Mid-session: the daemon writes new per-person secrets on the host.
@@ -92,11 +104,12 @@ const exited = new Promise(r => { if (child.exitCode !== null || child.signalCod
 child.kill('SIGKILL');
 await exited;
 sbx.cleanup();
-console.log(JSON.stringify({ report }));
+console.log(JSON.stringify({ report, hostBotmuxAfterPrepare }));
 `, { timeoutMs: 90_000 });
-  const { report } = lastJsonLine<{ report: Record<string, string> | null }>(run);
+  const { report, hostBotmuxAfterPrepare } = lastJsonLine<{ report: Record<string, string> | null; hostBotmuxAfterPrepare: string[] | null }>(run);
+  if (ghostData) expect(hostBotmuxAfterPrepare ?? [], run.stderr).toEqual([]);
   expect(report, run.stderr).not.toBeNull();
-  for (const key of ['bytedcliLate', 'bytedcliEarly', 'oauthPendingLate', 'vcAuthLate', 'otherIdentityLate']) {
+  for (const key of ['bytedcliLate', 'bytedcliEarly', 'oauthPendingLate', 'vcAuthLate', 'otherIdentityLate', 'bytedcliLateResolved']) {
     expect([report![key], key]).not.toEqual(['late-secret', key]);
     expect([report![key], key]).not.toEqual(['early-secret', key]);
   }
@@ -110,5 +123,9 @@ describe.skipIf(!runtime)('scratch credential masks (real container, private nam
 
   it('…even when the token data dir itself is only created after the session started', () => {
     lateSecretsReport(true);
+  }, 120_000);
+
+  it('…and when ~/.botmux is a symlink to another disk, without failing to start or writing the host', () => {
+    lateSecretsReport(true, true);
   }, 120_000);
 });
