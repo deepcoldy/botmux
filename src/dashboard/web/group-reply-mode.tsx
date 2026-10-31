@@ -98,7 +98,7 @@ export function GroupReplyModeRow(props: Props) {
     ? ['inherit', ...(shown?.override ? [shown.override] : [])]
     : ['inherit', ...MODES];
   return <div className="group-reply-mode-row" data-group-reply-mode-row={props.appId}>
-    <label htmlFor={id}><strong>{props.label ?? props.botName}</strong></label>
+    <label htmlFor={id} data-reply-mode-label={props.label ? '' : undefined}><strong>{props.label ?? props.botName}</strong></label>
     <select id={id} value={choice} disabled={props.disabled || saving || (props.topicGroup && !shown?.override)}
       onChange={event => { void save(event.currentTarget.value as Choice); }}>
       {options.map(option => <option key={option} value={option}>

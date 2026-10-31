@@ -6518,8 +6518,10 @@ dialog.onboarding-dialog::backdrop {
   border: none;
 }
 
-/* 回复模式块的标题已经是「普通群回复模式」，下拉框自己的「回复模式」标签只留给读屏。 */
-#g-drawer .g-setting-body .group-reply-mode-row > label {
+/* 回复模式块的标题已经是「普通群回复模式」，下拉框自己的「回复模式」标签只留给读屏。
+   按 data 属性定向：只有调用方显式传了字段标签时才隐藏，避免未来新增不传 label
+   的调用点时把 botName 视觉隐藏。 */
+#g-drawer .g-setting-body .group-reply-mode-row > label[data-reply-mode-label] {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -33192,7 +33194,9 @@ a.card-menu-item {
   gap: 12px;
   padding: 12px 0;
 }
-.group-default-models-row > .group-default-models-cli {
+/* 两个分支（不支持配置时的裸 <p>、可配置时行内的 <small>）都用同一弱化样式，
+   不依赖外层是不是 .group-default-models-row。 */
+.group-default-models-cli {
   flex-basis: 100%;
   color: var(--muted);
   font-size: 12px;
