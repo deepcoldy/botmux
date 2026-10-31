@@ -57,6 +57,7 @@
  *     nextBoundaryMs) — without that, a model that's still mid-tool-use
  *     for turn N+1 could leak a send credit into turn N's window.
  */
+import { createHash } from 'node:crypto';
 import type { TurnTerminalCarrierKind } from '../core/types.js';
 import { normaliseForFingerprint } from './bridge-turn-queue.js';
 import { CODEX_RATE_LIMIT_ERROR_CODE } from './codex-transcript.js';
@@ -242,8 +243,11 @@ export interface BridgeSendMarker {
    * uses this while ordinary historical `botmux send` keeps its old heuristic. */
   terminalIndependent?: true;
   contentLength?: number;
+  /** Full normalized body digest. A bounded preview alone cannot prove that
+   * a merged execution's later answer has already been delivered. */
+  contentHash?: string;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
-   *  The fallback gate still uses contentLength only. */
+   * A complete legacy preview can also prove a merged final's full body. */
   previewText?: string;
 }
 
@@ -268,6 +272,10 @@ export interface BridgeGateInput {
    * stronger correlation (including the durable dispatch attempt). */
   turnId?: string;
   dispatchAttempt?: number;
+  /** Earlier inputs proven by the transcript queue to have been folded into
+   * this same native execution. Only their explicit final receipts may stand
+   * in for this execution's final; neighbouring independent turns never do. */
+  supersededTurns?: ReadonlyArray<{ turnId: string; dispatchAttempt?: number }>;
   /** When the user message was queued — defines the lower bound of the
    *  send window. Undefined for legacy turns; the gate degrades to
    *  "never suppress" in that case. */
@@ -301,10 +309,14 @@ export interface BridgeGateInput {
  * the source turn. */
 export function bridgeGateInputForTurn<
   T extends Omit<BridgeGateInput,
-    'sessionId' | 'turnId' | 'dispatchAttempt' | 'chatId' | 'rootMessageId'>,
+    'sessionId' | 'turnId' | 'dispatchAttempt' | 'supersededTurns' | 'chatId' | 'rootMessageId'>,
 >(
   sessionId: string | undefined,
-  turn: { turnId: string; dispatchAttempt?: number },
+  turn: {
+    turnId: string;
+    dispatchAttempt?: number;
+    supersededTurns?: ReadonlyArray<{ turnId: string; dispatchAttempt?: number }>;
+  },
   input: T,
   chatId?: string,
   rootMessageId?: string,
@@ -318,6 +330,9 @@ export function bridgeGateInputForTurn<
     ...(turn.dispatchAttempt !== undefined
       ? { dispatchAttempt: turn.dispatchAttempt }
       : {}),
+    // Like the source identity above, merge evidence comes from the queue,
+    // never from the fallback payload spread into this projection.
+    supersededTurns: turn.supersededTurns?.map(identity => ({ ...identity })),
   };
 }
 
@@ -345,7 +360,7 @@ export function buildBridgeSendPreviewText(content: string): string | undefined 
 
 export function buildBridgeSendMarkerContent(
   content: string,
-): Pick<BridgeSendMarker, 'contentLength' | 'previewText'> | undefined {
+): Pick<BridgeSendMarker, 'contentLength' | 'contentHash' | 'previewText'> | undefined {
   const visibleContent = stripTrailingOaiMemoryCitation(content);
   const normalized = normaliseForFingerprint(visibleContent);
   if (!normalized) return undefined;
@@ -353,6 +368,7 @@ export function buildBridgeSendMarkerContent(
     // Length stays fingerprint-normalized: the fallback gate compares it against
     // normalise(finalText).length, so it must not count preview-only newlines.
     contentLength: normalized.length,
+    contentHash: createHash('sha256').update(normalized).digest('hex'),
     // Preview keeps newlines — derive it from the raw body, NOT `normalized`.
     previewText: buildBridgeSendPreviewText(visibleContent),
   };
@@ -448,6 +464,33 @@ function markerMatchesExactTurn(turn: BridgeGateInput, marker: BridgeSendMarker)
     && markerMatchesSession(turn, marker);
 }
 
+/** Codex type-ahead can merge several IM inputs into one native execution.
+ * The CLI's explicit send can still carry the first input's authority while
+ * the transcript terminal belongs to its successor. The queue records this
+ * relation only after matching a native turn id. Do not widen the time window
+ * or accept progress credit from any of these earlier inputs. */
+function markerMatchesSupersededFinal(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  const normalizedFinal = normaliseForFingerprint(bridgePostText(turn.finalText ?? '', false));
+  // Same-native evidence does not make an earlier answer cover a later human
+  // request. Require a completed body sent after the successor input, and an
+  // exact body proof. Durable attempts keep their separate recovery owner.
+  if (!normalizedFinal || turn.markTimeMs === undefined || !Number.isFinite(turn.markTimeMs)
+    || !Number.isFinite(marker.sentAtMs) || marker.sentAtMs < turn.markTimeMs
+    || turn.dispatchAttempt !== undefined || marker.dispatchAttempt !== undefined) return false;
+  const sameBody = marker.contentHash !== undefined
+    ? marker.contentHash === createHash('sha256').update(normalizedFinal).digest('hex')
+    : typeof marker.previewText === 'string'
+      && marker.contentLength === normalizedFinal.length
+      && normaliseForFingerprint(marker.previewText) === normalizedFinal;
+  return sameBody
+    && !!turn.turnId
+    && !!turn.sessionId
+    && marker.sessionId === turn.sessionId
+    && isFinalBridgeSendMarker(marker)
+    && turn.supersededTurns?.some(identity => marker.turnId === identity.turnId
+      && identity.dispatchAttempt === undefined) === true;
+}
+
 /** Whether this delivery can replace the non-empty answer expected here.
  *
  * A cross-chat / cross-thread delivery still explains an EMPTY terminal, but
@@ -481,8 +524,9 @@ function markerCoversOwnThread(turn: BridgeGateInput, marker: BridgeSendMarker):
 /**
  * Successful reply markers attributable to one structured turn.
  *
- * New-schema markers with a turn id must match the exact turn/attempt and may
- * not borrow timestamp credit from a neighbouring turn. Exact identity is
+ * New-schema markers with a turn id must match the exact turn/attempt, or an
+ * explicit final from a proven same-execution predecessor. They may not
+ * borrow timestamp credit from a neighbouring turn. Exact identity is
  * stronger than clock ordering, which covers provider/relay completion after a
  * successor window opened. Legacy markers without a turn id retain the bounded
  * time-window fallback for rolling-upgrade compatibility.
@@ -499,7 +543,7 @@ export function attributableBridgeReplyMarkers(
     // Use exact identity only when BOTH sides carry a turn. A rolling-upgrade
     // marker or an unmigrated caller keeps the bounded legacy time window.
     if (marker.turnId !== undefined && turn.turnId !== undefined) {
-      return markerMatchesExactTurn(turn, marker);
+      return markerMatchesExactTurn(turn, marker) || markerMatchesSupersededFinal(turn, marker);
     }
     return lower !== undefined && marker.sentAtMs >= lower && marker.sentAtMs < upper;
   });
@@ -528,7 +572,8 @@ export function shouldSuppressBridgeEmit(
   // attribution and survives provider completion latency / host recovery.
   // Keep the dispatch attempt in the identity so a stale durable retry cannot
   // suppress a later attempt of the same logical turn.
-  if (turn.turnId && markers.some(marker => markerMatchesExactTurn(turn, marker)
+  if (turn.turnId && markers.some(marker => (markerMatchesExactTurn(turn, marker)
+      || markerMatchesSupersededFinal(turn, marker))
       && markerCoversOwnThread(turn, marker)
       && marker.terminalIndependent !== true
       && isFinalBridgeSendMarker(marker)

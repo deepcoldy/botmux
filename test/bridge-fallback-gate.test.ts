@@ -295,7 +295,7 @@ describe('buildBridgeSendMarkerContent', () => {
     // contentLength stays fingerprint-normalized (gate compares against
     // normalise(final).length); previewText keeps line breaks AND leading
     // indentation for display (indented code / nested markdown).
-    expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toEqual({
+    expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toMatchObject({
       contentLength: normalise('  hello\n  bot  ').length,
       previewText: '  hello\n  bot',
     });
