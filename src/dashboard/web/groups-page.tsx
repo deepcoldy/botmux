@@ -951,7 +951,6 @@ function GroupPinStreamingCardRow(props: {
         disabled={props.disabled || saving}
         title={tr('groups.pinStreamingCard')}
         description={tr('groups.pinStreamingCardDescription')}
-        help={tr('groups.pinStreamingCardHelp')}
         detail={detail}
         detailTone={detailTone}
         detailAttrs={{ 'data-pin-master-state': masterEnabled ? 'on' : 'off' }}
@@ -1098,8 +1097,7 @@ export function ProjectGroupModeSection(props: {
   }
 
   return (
-    <fieldset className="g-collaboration-mode">
-      <legend>{tr('groups.collaborationMode')}</legend>
+    <fieldset className="g-collaboration-mode" aria-label={tr('groups.collaborationMode')}>
       <p><small>{tr('groups.collaborationModeHelp')}</small></p>
       <div className="g-mode-rail" role="radiogroup" aria-label={tr('groups.collaborationMode')}>
         <label className={`g-mode-option${mode === 'standard' ? ' selected' : ''}`}>
@@ -1416,7 +1414,6 @@ function BotSettingsPane(props: {
       <SettingBlock title={tr('groups.defaultModels')} help={tr('groups.defaultModelsHelp')}>
         <GroupDefaultModelsRow
           chatId={chat.chatId} appId={member.larkAppId} botName={botName}
-          label={tr('groups.col.model')}
           cliId={member.agentCliId} botModel={member.agentModel} botEffort={member.agentReasoningEffort}
           models={member.defaultModels} disabled={props.disabled}
           onSaved={props.onSaved}
@@ -1465,7 +1462,14 @@ export function ManageDialog(props: {
   const inChat = inChatMembers(chat);
   const ownerAppId = typeof chat.ownerId === 'string' ? chat.ownerId : '';
   const ownerBot = inChat.find(member => member.larkAppId === ownerAppId);
-  const [tab, setTab] = useState<ManageTab>(props.initialBotId ? 'bots' : 'overview');
+  const [tab, setTabState] = useState<ManageTab>(props.initialBotId ? 'bots' : 'overview');
+  // 「成员权限」一挂载就按在群 bot 拉成员列表 / 黑名单 / 授权回读，只在第一次切过去时挂载；
+  // 之后和其它页签一样常驻、只切 hidden，来回切不丢已加载的状态。
+  const [accessVisited, setAccessVisited] = useState(false);
+  const setTab = useCallback((next: ManageTab) => {
+    setTabState(next);
+    if (next === 'access') setAccessVisited(true);
+  }, []);
   const [selectedBotId, setSelectedBotId] = useState(props.initialBotId ?? inChat[0]?.larkAppId ?? '');
   const [chatIdCopied, setChatIdCopied] = useState(false);
   const [leaveSelection, setLeaveSelection] = useState<Set<string>>(() => new Set());
@@ -1714,10 +1718,7 @@ export function ManageDialog(props: {
         </section>
 
         <section role="tabpanel" id="g-manage-panel-access" aria-labelledby="g-manage-tab-access" hidden={tab !== 'access'}>
-          <fieldset>
-            <legend>{tr('grantAdmin.sectionTitle')}</legend>
-            <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
-          </fieldset>
+          {accessVisited ? <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} /> : null}
         </section>
 
         <section role="tabpanel" id="g-manage-panel-danger" aria-labelledby="g-manage-tab-danger" hidden={tab !== 'danger'}>

@@ -290,6 +290,63 @@ describe('ManageDialog — overview matrix drives the per-bot pane', () => {
   });
 });
 
+describe('ManageDialog — tabs show their content directly', () => {
+  function renderDialog(urls: string[]) {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url);
+      if (/\/chat-mode\//.test(url)) return json({ ok: true, chatMode: 'group' });
+      if (url.endsWith('/members-display')) return json({ members: [{ openId: 'ou_u1', name: '成员甲', memberType: 'user' }] });
+      if (url.endsWith('/blocked-users')) return json({ ok: true, raw: [], resolved: [] });
+      if (url.endsWith('/grants/chat')) return json({ ok: true, subjects: [] });
+      return json({ ok: true });
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(ManageDialog, {
+        chat: chat([member('cli_a'), member('cli_b')]),
+        tr,
+        onClose: vi.fn(),
+        onReloadGroups: async () => ({ chats: [], bots: [] }),
+      }));
+    });
+    return renderer;
+  }
+  const panel = (renderer: TestRenderer.ReactTestRenderer, id: string) =>
+    renderer.root.findByProps({ id: `g-manage-panel-${id}` });
+  const tabButton = (renderer: TestRenderer.ReactTestRenderer, id: string) =>
+    renderer.root.findByProps({ id: `g-manage-tab-${id}` });
+
+  it('member access: no collapsed block or repeated title, and it loads only once the tab is opened', async () => {
+    const urls: string[] = [];
+    const renderer = renderDialog(urls);
+    await flush();
+    // 打开抽屉不该为成员权限发请求
+    expect(urls.some(url => url.endsWith('/members-display'))).toBe(false);
+
+    act(() => { tabButton(renderer, 'access').props.onClick(); });
+    await flush();
+    const access = panel(renderer, 'access');
+    expect(access.props.hidden).toBe(false);
+    expect(access.findAllByType('details')).toHaveLength(0);
+    expect(access.findAllByType('legend')).toHaveLength(0);
+    expect(access.findAllByProps({ 'data-member-row': 'ou_u1' })).toHaveLength(1);
+    expect(urls.filter(url => url.endsWith('/members-display'))).toHaveLength(1);
+
+    // 切走再切回：常驻挂载，不重复加载
+    act(() => { tabButton(renderer, 'overview').props.onClick(); });
+    act(() => { tabButton(renderer, 'access').props.onClick(); });
+    await flush();
+    expect(urls.filter(url => url.endsWith('/members-display'))).toHaveLength(1);
+  });
+
+  it('collaboration: the tab label is the only title (no legend repeating it)', () => {
+    const renderer = renderDialog([]);
+    const collab = panel(renderer, 'collab');
+    expect(collab.findAllByType('legend')).toHaveLength(0);
+    expect(collab.findByProps({ className: 'g-collaboration-mode' }).props['aria-label']).toBe(tr('groups.collaborationMode'));
+  });
+});
+
 describe('CreateDialog — duplicate as new chat', () => {
   it('prefills the source bots, creates the chat, then copies the selected bots\' chat roles', async () => {
     const calls: Array<{ method: string; url: string; body?: any }> = [];

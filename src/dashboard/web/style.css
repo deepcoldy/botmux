@@ -6518,6 +6518,16 @@ dialog.onboarding-dialog::backdrop {
   border: none;
 }
 
+/* 回复模式块的标题已经是「普通群回复模式」，下拉框自己的「回复模式」标签只留给读屏。 */
+#g-drawer .g-setting-body .group-reply-mode-row > label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 #g-drawer .g-role-line {
   display: flex;
   align-items: center;
@@ -33182,7 +33192,11 @@ a.card-menu-item {
   gap: 12px;
   padding: 12px 0;
 }
-.group-default-models-row > strong { flex-basis: 100%; }
+.group-default-models-row > .group-default-models-cli {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+}
 .group-default-models-field { display: grid; gap: 6px; flex: 1 1 180px; }
 .group-default-models-row input { width: 100%; min-width: 0; }
 .group-default-models-row > small { flex-basis: 100%; }
