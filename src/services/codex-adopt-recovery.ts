@@ -28,9 +28,17 @@ export function checkpointCodexAdoptTurns(
       && turn.recoveryOffsetAtMark! >= 0
       ? turn.recoveryOffsetAtMark
       : undefined;
+    const supersededTurnIds = turn.supersededTurns
+      ?.filter(identity => identity.dispatchAttempt === undefined)
+      .map(identity => identity.turnId);
     return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
       fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath,
       ...(turn.linkRefMode ? { linkRefMode: turn.linkRefMode } : {}),
+      ...(turn.sourceTurnId && supersededTurnIds?.length ? { mergedExecution: {
+        sourceTurnId: turn.sourceTurnId,
+        ...(turn.sourceSessionId ? { sourceSessionId: turn.sourceSessionId } : {}),
+        supersededTurnIds,
+      } } : {}),
       offsetAtMark: prior?.offsetAtMark ?? capturedOffset ?? safeOffsetAtMark }];
   });
   if (JSON.stringify(previous) === JSON.stringify(entries)) return;
