@@ -403,7 +403,7 @@ jobs:
   # that does not exist there. The signature path was reachable ONLY in a
   # release run, which is precisely why it kept escaping to users.
   #
-  # WHY macos-14 SPECIFICALLY, and not "some macOS runner": it is arm64, which
+  # WHY macos-15 SPECIFICALLY, and not "some macOS runner": it is arm64, which
   # is what makes darwin-x64 a CROSS-COMPILE — and cross-compiling is the only
   # configuration that reproduces the v3.19.0 defect at all (the native arm64
   # output was valid on the very same run). On an x64 macOS runner the broken
@@ -414,7 +414,7 @@ jobs:
   # Free for this repo: macOS runners bill 10× minutes on private repos, but
   # public repos consume no included minutes at all.
   bun-binary-darwin:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
