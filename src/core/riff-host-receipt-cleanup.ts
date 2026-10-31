@@ -51,7 +51,8 @@ export async function sweepOrphanRiffHostReceiptDirs(
       rmSync(candidate.path, { recursive: true, force: true });
       removed.push(candidate.path);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
     }
   }
   return removed;
