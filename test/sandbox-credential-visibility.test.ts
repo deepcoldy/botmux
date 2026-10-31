@@ -169,6 +169,19 @@ describe('data root that is not a botmux home (dirname of SESSION_DATA_DIR)', ()
     expect(() => buildFsPolicy(ctx({ ...o, workingDir: `${CHECKOUT}/src` }))).not.toThrow();
   });
 
+  it('a data dir AT $HOME is not denied wholesale (the default home under it keeps its ceiling)', () => {
+    const o = {
+      botmuxHome: '/tmp', sessionDataDir: H, botHome: '/tmp/bots/cli_self',
+      loadedBotsConfigPath: `${BH}/bots.json`, botmuxHomePlausible: false,
+      workingDir: '/srv/proj', execPaths: [H], authPaths: [`${H}/.dsh`],
+    };
+    expect(() => buildFsPolicy(ctx(o))).not.toThrow();
+    expect(access(o, `${H}/fake-cli`)).toBe('readOnly');
+    expect(access(o, `${H}/.dsh/config`)).toBe('readWrite');
+    expect(access(o, `${BH}/bots.json`)).toBe('deny');
+    expect(access(o, '/tmp/bots/cli_other')).toBe('deny');
+  });
+
   it('a plausible custom instance root keeps the full ceiling', () => {
     const o = { ...layout('/srv/inst', true), workingDir: '/' };
     for (const p of ['/srv/inst/bots.json', '/srv/inst/.env', '/srv/inst/bots/cli_other', '/srv/inst/data/session-stores/cli_other', `${BH}/bots.json`]) {

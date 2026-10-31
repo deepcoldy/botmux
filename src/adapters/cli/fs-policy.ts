@@ -785,9 +785,15 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const botmuxRoots = larkTransport
     ? [...new Set([configuredIsHome ? configuredHome : null, defaultHome].filter((p): p is string => p !== null))]
     : [];
+  // A narrowed entry that contains the default botmux home (a data dir AT
+  // $HOME, as some test harnesses set) is not botmux-owned either: denying it
+  // would hide the whole home, CLI binaries and auth dirs included. The
+  // default home under it keeps its own full ceiling.
   const narrowedBotmuxDenies = larkTransport && configuredHome !== null && !configuredIsHome
     ? [`${configuredHome === '/' ? '' : configuredHome}/bots`, normalizeFsPath(ctx.sessionDataDir)]
-      .filter((p): p is string => p !== null && !botmuxRoots.some(root => coversPath(root, p)))
+      .filter((p): p is string => p !== null
+        && !botmuxRoots.some(root => coversPath(root, p))
+        && !(defaultHome !== null && coversPath(p, defaultHome)))
     : [];
   if (larkTransport) {
     const wd = normalizeFsPath(ctx.workingDir);

@@ -53,8 +53,11 @@ d('sandbox credential visibility (real bubblewrap)', () => {
   };
 
   function compile(workingDir: string, root = bh): string[] {
-    const emptiesDir = join(S, 'sbx/empties');
-    const emptyDir = join(S, 'sbx/empty');
+    // Fresh mask sources per compile: the previous ones are mode 000 and a
+    // non-root uid cannot rewrite them.
+    const sbx = mkdtempSync(join(S, 'sbx-'));
+    const emptiesDir = join(sbx, 'empties');
+    const emptyDir = join(sbx, 'empty');
     mkdirSync(emptiesDir, { recursive: true });
     mkdirSync(emptyDir, { recursive: true });
     const policy = buildFsPolicy({
