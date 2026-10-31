@@ -1,7 +1,8 @@
 import type { ServerResponse } from 'node:http';
 
 /**
- * Gemini generateContent wire format (Gemini CLI with GOOGLE_GEMINI_BASE_URL):
+ * Gemini API generateContent wire format (Antigravity with `modelProvider:
+ * "gemini"`, GEMINI_API_KEY and GOOGLE_GEMINI_BASE_URL):
  * history in `contents[].parts[]`, a tool result as a `functionResponse` part
  * in the last user content, and one `GenerateContentResponse` per SSE event.
  */

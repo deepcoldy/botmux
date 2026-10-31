@@ -147,7 +147,7 @@ Run one migrated Botmux Feishu browser scenario
         "bot-pi-basic",
         "bot-ohmypi-basic",
         "bot-kimi-basic",
-        "bot-gemini-basic",
+        "bot-antigravity-basic",
         "bot-grok-basic",
         "bot-reply-smoke",
         "bot-collaboration",
