@@ -290,6 +290,13 @@ export interface CliAdapter {
     modelBackendVariant?: 'standard' | 'max';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Version of the CLI binary this spawn will run ("1.17.11", "2.1.4", …), as
+     *  last probed by the daemon (`getCurrentCliVersion`). Adapters use it to gate
+     *  flags that only newer releases accept — passing an unknown flag makes some
+     *  CLIs print help and exit 1, which the daemon amplifies into a crash loop.
+     *  Missing or "unknown" means "not probed": adapters must then behave as if the
+     *  flag is unsupported (keep the old argv) rather than guess. */
+    cliVersion?: string;
     /** Codex App only: restricted local browser extension bridge. */
     codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
