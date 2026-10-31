@@ -18,10 +18,10 @@ cases:
     tags: [bot, smoke, core, cli]
     steps:
       - feishu.runScenario: { scenario: bot-kimi-basic }
-  - name: Gemini basic bot flow
+  - name: Antigravity basic bot flow
     tags: [bot, smoke, core, cli]
     steps:
-      - feishu.runScenario: { scenario: bot-gemini-basic }
+      - feishu.runScenario: { scenario: bot-antigravity-basic }
   - name: Grok basic bot flow
     tags: [bot, smoke, core, cli]
     steps:

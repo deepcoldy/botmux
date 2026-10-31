@@ -2,9 +2,10 @@
  * Scripted model for the oncall-sandbox CLI matrix (scripts/oncall-cli-matrix).
  *
  * Speaks the four wire formats the public CLIs use against a custom endpoint:
- * Anthropic Messages, OpenAI Chat Completions, OpenAI Responses and Gemini
- * generateContent (streaming or not). Every probe prompt carries a tag
- * `SBXP-<tag>`; for the latest such prompt the model
+ * Anthropic Messages, OpenAI Chat Completions, OpenAI Responses and Gemini API
+ * generateContent (Antigravity with `modelProvider: "gemini"`; streaming or
+ * not). Every probe prompt carries a tag `SBXP-<tag>`; for the latest such
+ * prompt the model
  *
  *   1. answers with ONE call of the shell tool the CLI declared, running the
  *      probe command the harness registered for that tag, then
@@ -59,7 +60,7 @@ function declarations(body: any): Declared[] {
   return out;
 }
 
-const EXACT = /^_?(bash|shell|exec_command|run_shell_command|run_terminal_command|run_terminal_cmd|terminal)$/i;
+const EXACT = /^_?(bash|shell|exec_command|run_command|run_shell_command|run_terminal_command|run_terminal_cmd|terminal)$/i;
 const LOOSE = /bash|shell|terminal|exec_command|command/i;
 
 function pickShell(body: any): { name: string; args(command: string): Record<string, unknown> } | null {
@@ -73,16 +74,19 @@ function pickShell(body: any): { name: string; args(command: string): Record<str
     name: tool.name,
     args(command: string) {
       const args: Record<string, unknown> = {};
-      // Codex `shell` takes argv; `exec_command` takes `cmd`; most take `command`.
+      // Codex `shell` takes argv; `exec_command` takes `cmd`; Antigravity
+      // `run_command` takes `CommandLine`; most take `command`.
       if (props.command?.type === 'array') args.command = ['bash', '-lc', command];
       else if ('cmd' in props && !('command' in props)) args.cmd = command;
+      else if ('CommandLine' in props && !('command' in props)) args.CommandLine = command;
       else args.command = command;
       for (const field of required) {
         if (field in args) continue;
         const type = props[field]?.type;
         if (type === 'string') args[field] = field === 'workdir' || field === 'cwd' || field === 'directory' ? '.' : 'probe';
         else if (type === 'boolean') args[field] = false;
-        else if (type === 'integer' || type === 'number') args[field] = field.includes('timeout') ? 60_000 : 1;
+        // Antigravity's WaitMsBeforeAsync (500–10000): wait the longest so the probe runs synchronously.
+        else if (type === 'integer' || type === 'number') args[field] = field.includes('timeout') ? 60_000 : field === 'WaitMsBeforeAsync' ? 10_000 : 1;
       }
       return args;
     },
