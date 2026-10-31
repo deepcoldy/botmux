@@ -1,10 +1,12 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ProgramStatusFramingStream } from '../src/utils/program-status-parser.js';
-import { IdleDetector } from '../src/utils/idle-detector.js';
+import { IdleDetector, PROGRAM_STATUS_FALLBACK_MS } from '../src/utils/idle-detector.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createSeedAdapter } from '../src/adapters/cli/seed.js';
 import { createRelayAdapter } from '../src/adapters/cli/relay.js';
+import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
+import { buildBotmuxEnvAssignments } from '../src/adapters/backend/tmux-backend.js';
 
 describe('ProgramStatus pipeline (FramingStream + IdleDetector)', () => {
   it('processes probe, working, and done transitions end-to-end', () => {
@@ -144,6 +146,15 @@ describe('ProgramStatus pipeline (FramingStream + IdleDetector)', () => {
     expect(relayAdapter.supportsProgramStatus).toBeFalsy();
   });
 
+  it('kimi declares program status and its pane gets PI_PROGRAM_STATUS=1', () => {
+    // Kimi Code skips the 7501 probe when $TMUX is set, so unlike Pi there is
+    // no handshake to answer: the env var is the only way to turn reports on
+    // inside a tmux pane, and a pane only receives allow-listed keys.
+    const kimi = createKimiAdapter('/bin/kimi');
+    expect(kimi.supportsProgramStatus).toBe(true);
+    expect(buildBotmuxEnvAssignments({ ...kimi.spawnEnv })).toContain('PI_PROGRAM_STATUS=1');
+  });
+
   it('processes Pi OSC 7501 handshake, working, blocked dialog, and done transitions end-to-end', () => {
     const stream = new ProgramStatusFramingStream();
     const idleEvents: string[] = [];
@@ -205,5 +216,105 @@ describe('ProgramStatus pipeline (FramingStream + IdleDetector)', () => {
     feedPipeline(`\x1b]7501;state=done:app=pi:msg=${b64SessionName}\x1b\\`);
     expect(idleEvents).toEqual(['program-status']);
     expect(detector.programStatusBlock()).toBeNull();
+  });
+});
+
+describe('Kimi under tmux: approval dialog vs turn completion', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  // Byte shapes as Kimi Code 2.4.1 writes them into a tmux pane.
+  const wrap = (inner: string) => `\x1bPtmux;${inner.replace(/\x1b/g, '\x1b\x1b')}\x1b\\`;
+  const report = (payload: string) => wrap(`\x1b]7501;${payload}\x1b\\`);
+  const dialog = [
+    '● Running a command · $ rm -rf ./work',
+    '  ▶ Run this command?',
+    '  Dangerous: recursive delete',
+    '  ▶ 1. Approve once',
+    '    2. Approve for this session',
+    '    3. Reject',
+    '    4. Reject with feedback',
+    '  ↑/↓ select · 1/2/3/4 choose · ↵ confirm',
+  ].join('\r\n');
+
+  function pipeline(adapter = createKimiAdapter('/bin/kimi')) {
+    const stream = new ProgramStatusFramingStream();
+    const detector = new IdleDetector(adapter);
+    const idle: string[] = [];
+    detector.onIdle(source => idle.push(source));
+    const feed = (raw: string) => {
+      for (const part of stream.feed(raw)) {
+        if (part.type === 'status') detector.observeProgramStatus(part.event);
+        else if (part.type === 'data') detector.feed(part.text);
+      }
+    };
+    return { detector, idle, feed };
+  }
+
+  it('stays busy while the approval dialog sits still, and completes on done', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    detector.reset(); // botmux submit
+    feed(report('state=working:app=kimi-code'));
+    feed('● Writing the report...\r\n');
+    feed(report('state=blocked:app=kimi-code:kind=permission'));
+    feed(dialog);
+    vi.advanceTimersByTime(60_000);
+    expect(idle).toEqual([]);
+    expect(detector.programStatusBlock()).toEqual({ kind: 'permission' });
+
+    feed(report('state=working:app=kimi-code'));
+    feed('● Sending the file\r\n');
+    feed(report('state=done:app=kimi-code'));
+    expect(idle).toEqual(['program-status']);
+  });
+
+  it('without status reports the same screen goes idle (the screen-quiet fallback)', () => {
+    // A Kimi build that never reports keeps the old behaviour: 2s of quiet on
+    // a static dialog reads as a finished turn.
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    detector.reset();
+    feed('● Writing the report...\r\n');
+    feed(dialog);
+    vi.advanceTimersByTime(10_000);
+    expect(idle).toEqual(['screen']);
+  });
+
+  // The first prompt of a fresh Kimi process resets its session runtime, which
+  // reports `clear` and then `idle` before `working` (seen live on 2.4.1).
+  it('cold start: clear + idle right after the submit do not complete the turn', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    feed(report('state=idle:app=kimi-code')); // startup, before any submit
+    idle.length = 0;
+    detector.reset(); // botmux submit
+    feed(report('state=clear'));
+    feed(report('state=idle:app=kimi-code'));
+    vi.advanceTimersByTime(5_000);
+    expect(idle).toEqual([]);
+
+    feed(report('state=working:app=kimi-code'));
+    feed(report('state=done:app=kimi-code'));
+    expect(idle).toEqual(['program-status']);
+  });
+
+  it('a submit that never produces work falls back to the screen at the deadline', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline();
+    detector.reset();
+    feed(report('state=clear'));
+    feed(report('state=idle:app=kimi-code'));
+    vi.advanceTimersByTime(PROGRAM_STATUS_FALLBACK_MS - 1_000);
+    feed(report('state=idle:app=kimi-code')); // a repeat does not push the deadline
+    vi.advanceTimersByTime(1_000 + 5_000);
+    expect(idle).toEqual(['screen']);
+  });
+
+  it('without programStatusSubmitAwaitsBusy an idle right after the submit completes the turn', () => {
+    vi.useFakeTimers();
+    const { detector, idle, feed } = pipeline({ ...createKimiAdapter('/bin/kimi'), programStatusSubmitAwaitsBusy: false });
+    detector.reset();
+    feed(report('state=idle:app=kimi-code'));
+    expect(idle).toEqual(['program-status']);
   });
 });
