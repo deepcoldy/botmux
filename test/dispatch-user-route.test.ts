@@ -86,7 +86,7 @@ const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'traexFirst
   if (!node) throw new Error(`missing worker function ${name}`);
   return node.getText(workerSource);
 }).join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
-function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
+function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unknown = undefined) {
   const released = Symbol('released');
   const release = vi.fn(() => { throw released; });
   const scope = {
@@ -94,6 +94,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
     idleDetector: { isStartupPending: () => false, reset: vi.fn(), isReadyEvidenceWeak: () => false },
     remoteRunnerRecoveredTurnInFlight: false,
+    traexQuotaPending: quotaPending,
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
     stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,
@@ -158,6 +159,12 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect(screenReady(queue)).toBe(false);
     queue.ingest([{ kind: 'user', text: 'query', uuid: 'u', timestampMs: Date.now() }]);
     expect(screenReady(queue, 'codex')).toBe(false);
+  });
+  it('keeps the ready gate closed while a traex quota recovery lookup is pending', () => {
+    const queue = new CodexBridgeQueue();
+    queue.mark('om_human', 'query');
+    expect(screenReady(queue)).toBe(true);
+    expect(screenReady(queue, 'traex', { turnId: 'om_human' })).toBe(false);
   });
   it.each([undefined, { capability: 'p'.repeat(64), policyCapability: 'p'.repeat(64) }])(
     'rejects host dispatch without live turn authority instead of silently sending without a human', async origin => {

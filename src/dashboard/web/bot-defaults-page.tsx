@@ -2404,6 +2404,7 @@ export function BotAgentSection(props: {
     : typeof bot.model === 'string' ? bot.model : '');
   const [autoModelEnabled, setAutoModelEnabled] = useState(autoDraftRef.current.enabled);
   const [autoReselectPerTurn, setAutoReselectPerTurn] = useState(autoDraftRef.current.reselectPerTurn);
+  const [autoTrigger, setAutoTrigger] = useState(autoDraftRef.current.trigger ?? 'capacity');
   const [autoModelTouched, setAutoModelTouched] = useState(!!initialAutoDraft.current);
   const [autoModels, setAutoModels] = useState(autoDraftRef.current.models);
   const [autoModelSettings, setAutoModelSettings] = useState(autoDraftRef.current.modelSettings);
@@ -2421,6 +2422,7 @@ export function BotAgentSection(props: {
     autoDraftRef.current = draft;
     setAutoModelEnabled(draft.enabled);
     setAutoReselectPerTurn(draft.reselectPerTurn);
+    setAutoTrigger(draft.trigger ?? 'capacity');
     setAutoModels(draft.models);
     setAutoModelSettings(draft.modelSettings);
     setAutoTimeoutSeconds(draft.timeoutSeconds);
@@ -2709,6 +2711,7 @@ export function BotAgentSection(props: {
     const saveCliId = selectedAgentCliId(cliKey);
     const autoConfig = normalizeTraexAutoModelConfig(autoModelEnabled ? {
       enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
+      trigger: autoTrigger,
       reselectPerTurn: autoReselectPerTurn,
       switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
       previousSettings: previousAutoSettings.current,
@@ -3269,6 +3272,8 @@ export function BotAgentSection(props: {
       {selectedCliId === 'traex' && !bot.wrapperCli && !option?.cliLaunchMode ? (
         <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
           reselectPerTurn={autoReselectPerTurn}
+          trigger={autoTrigger}
+          onTrigger={trigger => editAutoDraft({ trigger })}
           onReselectPerTurn={enabled => editAutoDraft({ reselectPerTurn: enabled })}
           modelSettings={autoModelSettings} capabilities={detectedModels?.modelCapabilities}
           timeoutSeconds={autoTimeoutSeconds} cooldownSeconds={autoCooldownSeconds}

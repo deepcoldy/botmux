@@ -154,6 +154,18 @@ function completeTurn(request) {
   // Exercise duplicate pre-response lifecycle notifications: the runner must
   // buffer one edge and must not misclassify a duplicate as autonomous work.
   if (responseLast) notify('turn/started', { threadId, turn: { id: turnId } });
+  if (behavior === 'capacity-error') {
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed',
+      error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } } });
+    return;
+  }
+  if (behavior === 'failed-no-error') {
+    // Protocol variant: terminal failure that omits the error object entirely.
+    // The runner must settle it as a generic failure, never crash the process
+    // (JSON.stringify(undefined) returns undefined → toLowerCase TypeError).
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed' } });
+    return;
+  }
   if (request.params.outputSchema) {
     write({
       id: 9000 + turnAttempt,
@@ -690,6 +702,43 @@ function handle(request) {
       activeTurn = undefined;
       return;
     }
+    if (behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      steerCount += 1;
+      groupClientIds.push(request.params.clientUserMessageId ?? null);
+      respond(request.id, { turnId: activeTurn.turnId });
+      const { threadId, turnId } = activeTurn;
+      const failedGroupTurn = {
+        id: turnId,
+        status: 'failed',
+        itemsView: 'full',
+        // steer-failed-no-error: protocol variant with NO error key at all.
+        ...(behavior === 'steer-failed-no-error'
+          ? {}
+          : { error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } }),
+        items: [
+          { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+          { id: 'user-follow', type: 'userMessage', clientId: groupClientIds[1], content: [] },
+        ],
+      };
+      if (behavior === 'steer-capacity-history') {
+        // Non-canonical completion id; the authoritative failed full-group turn
+        // is reachable only via thread/turns/list, exercising the runner's
+        // reconcileSteeredGroupFromHistory group settle path.
+        reconciledTurn = failedGroupTurn;
+        notify('turn/completed', {
+          threadId,
+          turn: { id: 'turn-foreign-noncanonical', status: 'completed' },
+        });
+      } else {
+        notify('turn/completed', { threadId, turn: failedGroupTurn });
+      }
+      activeTurn = undefined;
+      return;
+    }
     if (behavior === 'steer-group-mismatch') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expectedTurnId does not match active turn');
@@ -887,11 +936,11 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
-    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+    if (behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
       groupClientIds = [request.params.clientUserMessageId ?? null];
     }
     respond(request.id, { turn: { id: turnId } });

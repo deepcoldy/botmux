@@ -319,6 +319,21 @@ jobs:
           FEISHU_E2E_CONCURRENCY: ${{ inputs.feishu_concurrency || '4' }}
         run: bun run test:midscene:feishu
 
+      - name: Print Gemini shell env snapshot
+        if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
+        # Diagnostic for the core-clis Gemini lane: shows whether the per-bot
+        # GITHUB_SHA:'' reached the shell tool as set-empty ({x:}) vs unset
+        # ({:}) vs a leaked runner value ({x:abc}), and whether BOTMUX_* vars
+        # survived gemini-cli's environment sanitization.
+        run: |
+          if [ -f .e2e-gemini-shell-env.log ]; then
+            echo "::group::Gemini shell env snapshot"
+            cat .e2e-gemini-shell-env.log
+            echo "::endgroup::"
+          else
+            echo "No Gemini shell env snapshot (gemini shell tool never ran)."
+          fi
+
       - name: Upload Feishu Midscene data
         if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
         uses: actions/upload-artifact@v7
