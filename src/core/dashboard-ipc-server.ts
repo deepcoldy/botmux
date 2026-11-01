@@ -328,11 +328,7 @@ import { type CliAvailabilityProbe } from '../setup/cli-availability.js';
 import { agentSaveProbePlan, probeAgentSaveAvailability, AgentSaveProbeError } from '../dashboard/agent-save-probe.js';
 import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { enrichHistorySenders } from '../dashboard/history-senders.js';
-import {
-  botsInfoObjectEntries,
-  isBotsInfoRouteEntry,
-  type BotsInfoRouteEntry,
-} from '../services/bots-info-shape.js';
+import { seedSessionHistoryIdentity } from '../dashboard/session-history-identity.js';
 import {
   validateCodexAppManagedSendOrigin,
 } from '../utils/codex-app-dispatch-ledger.js';
@@ -5008,33 +5004,23 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
     // Bot sender ids are scoped to the observing app. Reuse the chat-member
     // resolver (cross-ref + observed bot roster) instead of assuming every
     // non-user message came from the bot that owns this dashboard session.
-    const botMembers: ChatBotMember[] = await listChatBotMembers(appId, session.chatId).catch(() => [] as ChatBotMember[]);
-    let botInfos: BotsInfoRouteEntry[] = [];
+    const resolvedBotMembers: ChatBotMember[] = await listChatBotMembers(appId, session.chatId).catch(() => [] as ChatBotMember[]);
+    let botInfosRaw: unknown;
     try {
-      const parsed = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf8'));
-      botInfos = botsInfoObjectEntries(parsed).filter(isBotsInfoRouteEntry);
+      botInfosRaw = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf8'));
     } catch { /* missing/corrupt cache degrades to name/open_id placeholders */ }
     // listChatBotMembers can be temporarily unavailable during startup. Always
     // retain a local self-bot fallback so its own messages still have identity.
+    let self: ReturnType<typeof getBot> | undefined;
     try {
-      const self = getBot(appId);
-      if (self.botOpenId && !botMembers.some(member => member.openId === self.botOpenId)) {
-        const selfName = self.botName || appId;
-        botMembers.push({
-          openId: self.botOpenId,
-          displayName: selfName,
-          name: selfName,
-          larkAppId: appId,
-          source: 'configured',
-          mentionable: true,
-          mentionSource: 'self',
-          hasTeamRole: false,
-        });
-      }
-      if (!botInfos.some(info => info.larkAppId === appId)) {
-        botInfos.push({ larkAppId: appId, botOpenId: self.botOpenId, botName: self.botName ?? null, botAvatarUrl: self.botAvatarUrl });
-      }
+      self = getBot(appId);
     } catch { /* session record may outlive a removed bot config */ }
+    const { botMembers, botInfos } = seedSessionHistoryIdentity(
+      appId,
+      self,
+      resolvedBotMembers,
+      botInfosRaw,
+    );
 
     jsonRes(res, 200, {
       ok: true,
