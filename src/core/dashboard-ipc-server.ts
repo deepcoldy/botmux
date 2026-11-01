@@ -9489,6 +9489,15 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
             return { write: false, result: { error: 'invalid_traex_auto_model',
               message: `${modelId} 不支持所选思考强度 ${settings.reasoningEffort}` } };
           }
+          if (nextTraexAutoModel.preflightLoadCheck === true && settings.reasoningEffort) {
+            const requiredEffort = (efforts
+              ? efforts.includes('max')
+              : cliModelSupportsReasoningEffort('traex', modelId, 'max')) ? 'max' : 'xhigh';
+            if (settings.reasoningEffort !== requiredEffort) {
+              return { write: false, result: { error: 'invalid_traex_auto_model',
+                message: `${modelId} 启用负载预检时必须使用自身最高思考强度 ${requiredEffort}` } };
+            }
+          }
         }
       }
       const effectiveServiceTier = supportsServiceTier

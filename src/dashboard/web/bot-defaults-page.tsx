@@ -108,7 +108,7 @@ import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings, type Trae
 import { TraexAutoModelEditor } from './traex-auto-model-editor.js';
 import {
   autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
-  strongestTraexModelSettings, type TraexAutoModelDraft,
+  strongestTraexModelSettings, strongestTraexPreflightModelSettings, type TraexAutoModelDraft,
 } from './traex-auto-model-preferences.js';
 import { AGENT_SECTIONS } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
@@ -2412,6 +2412,11 @@ export function BotAgentSection(props: {
   const [autoModelEnabled, setAutoModelEnabled] = useState(autoDraftRef.current.enabled);
   const [autoReselectPerTurn, setAutoReselectPerTurn] = useState(autoDraftRef.current.reselectPerTurn);
   const [autoTrigger, setAutoTrigger] = useState(autoDraftRef.current.trigger ?? 'capacity');
+  const [autoPreflightLoadCheck, setAutoPreflightLoadCheck] = useState(autoDraftRef.current.preflightLoadCheck === true);
+  const [autoOverloadThresholdPercent, setAutoOverloadThresholdPercent] = useState(autoDraftRef.current.overloadThresholdPercent ?? '100');
+  const [autoPreflightTimeoutSeconds, setAutoPreflightTimeoutSeconds] = useState(autoDraftRef.current.preflightTimeoutSeconds ?? '8');
+  const [autoUnknownLoadPolicy, setAutoUnknownLoadPolicy] = useState<'skip'>(autoDraftRef.current.unknownLoadPolicy ?? 'skip');
+  const [autoAllOverloadedPolicy, setAutoAllOverloadedPolicy] = useState<'lowest_load'>(autoDraftRef.current.allOverloadedPolicy ?? 'lowest_load');
   const [autoModelTouched, setAutoModelTouched] = useState(!!initialAutoDraft.current);
   const [autoModels, setAutoModels] = useState(autoDraftRef.current.models);
   const [autoModelSettings, setAutoModelSettings] = useState(autoDraftRef.current.modelSettings);
@@ -2430,6 +2435,11 @@ export function BotAgentSection(props: {
     setAutoModelEnabled(draft.enabled);
     setAutoReselectPerTurn(draft.reselectPerTurn);
     setAutoTrigger(draft.trigger ?? 'capacity');
+    setAutoPreflightLoadCheck(draft.preflightLoadCheck === true);
+    setAutoOverloadThresholdPercent(draft.overloadThresholdPercent ?? '100');
+    setAutoPreflightTimeoutSeconds(draft.preflightTimeoutSeconds ?? '8');
+    setAutoUnknownLoadPolicy(draft.unknownLoadPolicy ?? 'skip');
+    setAutoAllOverloadedPolicy(draft.allOverloadedPolicy ?? 'lowest_load');
     setAutoModels(draft.models);
     setAutoModelSettings(draft.modelSettings);
     setAutoTimeoutSeconds(draft.timeoutSeconds);
@@ -2564,7 +2574,9 @@ export function BotAgentSection(props: {
     for (const model of pendingAutoDefaults.current) {
       const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
       if (!capability) continue;
-      settings = { ...settings, [model]: strongestTraexModelSettings(model, capability) };
+      settings = { ...settings, [model]: current.preflightLoadCheck
+        ? strongestTraexPreflightModelSettings(model, capability)
+        : strongestTraexModelSettings(model, capability) };
       pendingAutoDefaults.current.delete(model);
     }
     if (settings !== current.modelSettings) editAutoDraft({ modelSettings: settings });
@@ -2719,13 +2731,22 @@ export function BotAgentSection(props: {
     const autoConfig = normalizeTraexAutoModelConfig(autoModelEnabled ? {
       enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
       trigger: autoTrigger,
+      preflightLoadCheck: autoPreflightLoadCheck,
+      overloadThresholdPercent: Number(autoOverloadThresholdPercent),
+      preflightTimeoutMs: Number(autoPreflightTimeoutSeconds) * 1_000,
+      unknownLoadPolicy: autoUnknownLoadPolicy,
+      allOverloadedPolicy: autoAllOverloadedPolicy,
       reselectPerTurn: autoReselectPerTurn,
       switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
       previousSettings: previousAutoSettings.current,
-      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => [model,
-        resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
-          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined }),
-      ])),
+      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => {
+        const configured = resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
+          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined });
+        const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
+        return [model, autoPreflightLoadCheck
+          ? { ...configured, reasoningEffort: strongestTraexPreflightModelSettings(model, capability).reasoningEffort }
+          : configured];
+      })),
     } : null);
     if (saveCliId === 'traex' && autoConfig.error) {
       setAgentStatus({ text: `✗ ${tr('botDefaults.autoModelInvalid')}` });
@@ -3280,7 +3301,25 @@ export function BotAgentSection(props: {
         <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
           reselectPerTurn={autoReselectPerTurn}
           trigger={autoTrigger}
-          onTrigger={trigger => editAutoDraft({ trigger })}
+          preflightLoadCheck={autoPreflightLoadCheck}
+          overloadThresholdPercent={autoOverloadThresholdPercent}
+          preflightTimeoutSeconds={autoPreflightTimeoutSeconds}
+          unknownLoadPolicy={autoUnknownLoadPolicy}
+          allOverloadedPolicy={autoAllOverloadedPolicy}
+          onTrigger={trigger => editAutoDraft({ trigger,
+            ...(trigger === 'quota' ? { preflightLoadCheck: false } : {}) })}
+          onPreflightLoadCheck={enabled => {
+            const settings = enabled ? Object.fromEntries(autoDraftRef.current.models.filter(Boolean).map(model => {
+              const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
+              return [model, { ...autoDraftRef.current.modelSettings[model],
+                reasoningEffort: strongestTraexPreflightModelSettings(model, capability).reasoningEffort }];
+            })) : autoDraftRef.current.modelSettings;
+            editAutoDraft({ preflightLoadCheck: enabled, modelSettings: settings });
+          }}
+          onOverloadThresholdPercent={value => editAutoDraft({ overloadThresholdPercent: value })}
+          onPreflightTimeoutSeconds={value => editAutoDraft({ preflightTimeoutSeconds: value })}
+          onUnknownLoadPolicy={value => editAutoDraft({ unknownLoadPolicy: value })}
+          onAllOverloadedPolicy={value => editAutoDraft({ allOverloadedPolicy: value })}
           onReselectPerTurn={enabled => editAutoDraft({ reselectPerTurn: enabled })}
           modelSettings={autoModelSettings} capabilities={detectedModels?.modelCapabilities}
           timeoutSeconds={autoTimeoutSeconds} cooldownSeconds={autoCooldownSeconds}
@@ -3291,7 +3330,9 @@ export function BotAgentSection(props: {
               if (Object.prototype.hasOwnProperty.call(current.modelSettings, model)) return [model, current.modelSettings[model]];
               const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
               if (!capability) pendingAutoDefaults.current.add(model);
-              return [model, strongestTraexModelSettings(model, capability)];
+              return [model, current.preflightLoadCheck
+                ? strongestTraexPreflightModelSettings(model, capability)
+                : strongestTraexModelSettings(model, capability)];
             }));
             editAutoDraft({ models, modelSettings: settings });
           }}
@@ -3320,7 +3361,9 @@ export function BotAgentSection(props: {
                 nextModels = [preferred];
                 const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === preferred.toLowerCase());
                 if (preferred && !capability) pendingAutoDefaults.current.add(preferred);
-                nextSettings = preferred ? { [preferred]: strongestTraexModelSettings(preferred, capability) } : {};
+                nextSettings = preferred ? { [preferred]: current.preflightLoadCheck
+                  ? strongestTraexPreflightModelSettings(preferred, capability)
+                  : strongestTraexModelSettings(preferred, capability) } : {};
               }
               setModel('auto');
               setReasoningEffort('');
