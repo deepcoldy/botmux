@@ -4238,19 +4238,43 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId);
 }
 
-function sessionGroupBoardFields(chatId: string): { sessionGroup?: true; sessionGroupMeta?: SessionGroupBoardMeta } {
-  if (!isSessionGroup(chatId)) return {};
-  try {
-    const entry = getSessionGroup(chatId);
+/**
+ * 每个 GET /api/groups 请求建一个解析器。存储故障是全局性的（同一个未完成的
+ * load() 对每个群都会再抛一次），若逐群重试，N 个会话群会串行各等满一次
+ * busy_timeout——同步 map 里直接卡住事件循环几十秒并刷 N 条 warn。所以两类失败
+ * 各自在本请求内熔断一次：
+ *  - 注册表读取失败：无法分型，该请求内后续群全部降级为普通群（{}）；
+ *  - 会话存储读取失败：仍给注册表摘要（时间/会话入口），只缺会话状态与
+ *    会话侧的最近活跃时间，本请求内不再查会话存储。
+ */
+function makeSessionGroupBoardFields(): (chatId: string) => { sessionGroup?: true; sessionGroupMeta?: SessionGroupBoardMeta } {
+  let registryFailed = false;
+  let sessionLookupFailed = false;
+  return (chatId: string) => {
+    if (registryFailed) return {};
+    let entry: ReturnType<typeof getSessionGroup>;
+    try {
+      // isSessionGroup / getSessionGroup 的 load() 内含 ensureDir→mkdirSync，
+      // dataDir 不可写时同样会抛，必须整段在 try 里。
+      if (!isSessionGroup(chatId)) return {};
+      entry = getSessionGroup(chatId);
+    } catch (err) {
+      registryFailed = true;
+      logger.warn(`[dashboard-ipc] session-group registry unavailable; chats degrade to regular groups for this request: ${err instanceof Error ? err.message : String(err)}`);
+      return {};
+    }
     if (!entry) return { sessionGroup: true };
-    const session = entry.lastSessionId ? findOwnedSessionRecord(entry.lastSessionId) : undefined;
+    let session: Session | undefined;
+    if (entry.lastSessionId && !sessionLookupFailed) {
+      try {
+        session = findOwnedSessionRecord(entry.lastSessionId);
+      } catch (err) {
+        sessionLookupFailed = true;
+        logger.warn(`[dashboard-ipc] session lookup unavailable for session groups; serving registry-only summaries for this request (first error on ${entry.lastSessionId}): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     return { sessionGroup: true, sessionGroupMeta: sessionGroupBoardMeta(entry, session) };
-  } catch (err) {
-    // 注册表 / 会话存储读取异常（如启动瞬间 SQLITE_BUSY）只让这一个群缺摘要，
-    // 不能让整个群组页 502——分型标记仍保留，排序/状态/会话入口降级为不展示。
-    logger.warn(`[dashboard-ipc] session-group meta unavailable for ${chatId}: ${err instanceof Error ? err.message : String(err)}`);
-    return { sessionGroup: true };
-  }
+  };
 }
 
 /** Four-state async lookup with durable fallback (design A).
@@ -6963,6 +6987,8 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
     // backfill new ones with Date.now()). Lark doesn't expose chat create_time
     // anywhere, so the dashboard sorts by this client-side proxy instead.
     const seenMap = chatFirstSeenStore.markSeenBulk(chats.map(c => c.chatId));
+    // 请求级熔断的会话群摘要解析器（见 makeSessionGroupBoardFields）。
+    const sessionGroupFields = makeSessionGroupBoardFields();
     // Annotate each chat with its oncall binding (if any) so the dashboard
     // matrix can show toggle state without a second round-trip.
     const enriched = chats.map(c => {
@@ -6999,7 +7025,7 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
         // 会话群分型（p2pMode=group 自动创建）：dashboard 群组页据此把它们放进
         // 独立的「会话群」视图，避免淹没需要人工管理的常驻群；附带的摘要用于
         // 按最近活跃排序、显示会话状态和跳转当前会话。
-        ...sessionGroupBoardFields(c.chatId),
+        ...sessionGroupFields(c.chatId),
       };
     });
     jsonRes(res, 200, { chats: enriched });

@@ -63,13 +63,24 @@ describe('GET /api/groups session-group summary', () => {
     vi.spyOn(botRegistry, 'getBot').mockImplementation((() => ({ config: { larkAppId: 'app-a', cliId: 'codex' } })) as any);
     vi.spyOn(groupsStore, 'listChats').mockResolvedValue([
       { chatId: 'oc_session', name: '修复登录跳转' },
+      { chatId: 'oc_session2', name: '整理日志' },
       { chatId: 'oc_plain', name: '评审群' },
     ] as any);
-    vi.spyOn(sessionGroupsStore, 'isSessionGroup').mockImplementation(chatId => chatId === 'oc_session');
-    vi.spyOn(sessionGroupsStore, 'getSessionGroup').mockImplementation(chatId => (chatId === 'oc_session' ? entry() : undefined));
-    vi.spyOn(sessionStore, 'getOwnedSession').mockImplementation(id => (id === 'sess-1'
-      ? { sessionId: 'sess-1', status: 'active', lastMessageAt: new Date(T0 + 7_200_000).toISOString() } as any
-      : undefined));
+    vi.spyOn(sessionGroupsStore, 'isSessionGroup').mockImplementation(
+      chatId => chatId === 'oc_session' || chatId === 'oc_session2');
+    vi.spyOn(sessionGroupsStore, 'getSessionGroup').mockImplementation(chatId =>
+      (chatId === 'oc_session' ? entry()
+        : chatId === 'oc_session2' ? entry({ lastSessionId: 'sess-2' })
+          : undefined));
+    vi.spyOn(sessionStore, 'getOwnedSession').mockImplementation(id => {
+      if (id === 'sess-1') {
+        return { sessionId: 'sess-1', status: 'active', lastMessageAt: new Date(T0 + 7_200_000).toISOString() } as any;
+      }
+      if (id === 'sess-2') {
+        return { sessionId: 'sess-2', status: 'closed', lastMessageAt: new Date(T0 + 1_000).toISOString() } as any;
+      }
+      return undefined;
+    });
   });
 
   afterEach(async () => {
@@ -84,26 +95,55 @@ describe('GET /api/groups session-group summary', () => {
     const response = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
     const body = await response.json() as { chats: Array<Record<string, any>> };
     const session = body.chats.find(chat => chat.chatId === 'oc_session')!;
+    const session2 = body.chats.find(chat => chat.chatId === 'oc_session2')!;
     const plain = body.chats.find(chat => chat.chatId === 'oc_plain')!;
-    expect(session.sessionGroup).toBe(true);
     expect(session.sessionGroupMeta).toEqual({
       createdAt: T0, lastActiveAt: T0 + 7_200_000, sessionId: 'sess-1', sessionStatus: 'active',
     });
+    // 会话最后一条消息比注册表旧 → lastActiveAt 用注册表时间
+    expect(session2.sessionGroupMeta).toEqual({
+      createdAt: T0, lastActiveAt: T0 + 60_000, sessionId: 'sess-2', sessionStatus: 'closed',
+    });
+    expect(session.sessionGroup).toBe(true);
     expect(plain).not.toHaveProperty('sessionGroup');
     expect(plain).not.toHaveProperty('sessionGroupMeta');
   });
 
-  it('keeps serving the list (flag only, no summary) when the session store read throws', async () => {
-    // 启动瞬间 SQLITE_BUSY 等存储异常只让这一个会话群缺摘要，不能把整个群组页打成 502。
+  it('trips a per-request circuit when the session store throws: registry-only summary, one lookup, no 502', async () => {
+    // 启动瞬间 SQLITE_BUSY 这类故障是全局的：不能 N 个会话群串行各等一次 busy_timeout
+    // （同步 map 里会卡住事件循环），第一次抛错后本请求内不再查会话存储。
     vi.mocked(sessionStore.getOwnedSession).mockImplementation(() => {
       throw new Error('database is locked');
     });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const response = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
     expect(response.status).toBe(200);
+    expect(vi.mocked(sessionStore.getOwnedSession)).toHaveBeenCalledTimes(1);
     const body = await response.json() as { chats: Array<Record<string, any>> };
-    const session = body.chats.find(chat => chat.chatId === 'oc_session')!;
-    expect(session.sessionGroup).toBe(true);
-    expect(session).not.toHaveProperty('sessionGroupMeta');
+    for (const id of ['oc_session', 'oc_session2']) {
+      const chat = body.chats.find(c => c.chatId === id)!;
+      expect(chat.sessionGroup).toBe(true);
+      // 注册表摘要仍在（排序/会话入口可用），只缺会话状态与会话侧时间
+      expect(chat.sessionGroupMeta).toEqual({
+        createdAt: T0, lastActiveAt: T0 + 60_000, sessionId: id === 'oc_session' ? 'sess-1' : 'sess-2',
+      });
+    }
+  });
+
+  it('trips a per-request circuit when the registry read throws (mkdir in load): chats degrade to regular, no 502', async () => {
+    // dataDir 不可写时 isSessionGroup 的 load()→ensureDir→mkdirSync 会抛；
+    // 无法分型时该请求内所有群降级为普通群，且只探测一次。
+    vi.mocked(sessionGroupsStore.isSessionGroup).mockImplementation(() => {
+      throw new Error('EACCES: mkdir denied');
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
+    expect(response.status).toBe(200);
+    expect(vi.mocked(sessionGroupsStore.isSessionGroup)).toHaveBeenCalledTimes(1);
+    const body = await response.json() as { chats: Array<Record<string, any>> };
+    for (const chat of body.chats) {
+      expect(chat).not.toHaveProperty('sessionGroup');
+      expect(chat).not.toHaveProperty('sessionGroupMeta');
+    }
   });
 });
