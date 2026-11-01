@@ -61,12 +61,15 @@ import {
   emptyGroupsSnapshot,
   fetchGroupsSnapshot,
   filterGroupChats,
+  formatSessionGroupTime,
   groupCloneTemplate,
   inChatMembers,
   injectOptimisticChat,
   markBotsInChat,
   paginateGroupRows,
   planAddBotsFollowup,
+  isGroupView,
+  sortSessionGroups,
   stewardJoinNotes,
   summarizeAddBotsResult,
   type AddBotsSummary,
@@ -75,8 +78,11 @@ import {
   type GroupChat,
   type GroupCloneTemplate,
   type GroupFilters,
+  type GroupView,
   type GroupsSnapshot,
+  type SessionGroupSort,
 } from './groups.js';
+import { hashQueryParam, setHashQueryParam } from './dashboard-routes.js';
 
 type Translator = ReturnType<typeof useT>;
 
@@ -101,6 +107,11 @@ function orbVars(name: string): CSSProperties {
     style[part.slice(0, i)] = part.slice(i + 1);
   }
   return style as CSSProperties;
+}
+
+/** 会话页详情抽屉的深链（会话页读 `?session=`）。 */
+function sessionDetailHref(sessionId: string): string {
+  return `#/sessions?session=${encodeURIComponent(sessionId)}`;
 }
 
 function chatOpenLink(chatId: string): string {
@@ -330,6 +341,71 @@ export const GroupListRow = memo(function GroupListRow(props: {
         >
           {tr('groups.clone')}
         </button>
+        <button className="manage-chat" type="button" onClick={() => props.onManage(chat)}>{tr('groups.manage')}</button>
+      </OverviewListTail>
+    </OverviewListItem>
+  );
+});
+
+/**
+ * 会话群一行：私聊里自动创建的一人一 bot 群，要回答的是「哪个会话、在不在进行、
+ * 多久没动」。没有「添加 bot」「复制为新群」——一次性的会话群用不上。
+ */
+export const SessionGroupRow = memo(function SessionGroupRow(props: {
+  chat: GroupChat;
+  now: number;
+  tr: Translator;
+  onManage(chat: GroupChat, botId?: string): void;
+}) {
+  const { chat, tr } = props;
+  const meta = chat.sessionGroupMeta;
+  const members = inChatMembers(chat);
+  const onRowClick = (event: MouseEvent<HTMLLIElement>) => {
+    const target = event.target as Element | null;
+    if (target?.closest?.('button, a, input, label')) return;
+    props.onManage(chat);
+  };
+  return (
+    <OverviewListItem kind="group" className="groups-list-row groups-session-row" data-chat={chat.chatId} onClick={onRowClick}>
+      <ChatAvatar chat={chat} />
+      <OverviewListMain>
+        <div className="groups-row-head">
+          <button type="button" className="groups-row-title" onClick={() => props.onManage(chat)}>
+            {chat.name ?? chat.chatId}
+          </button>
+          {meta?.sessionStatus ? (
+            <span className={`groups-session-state groups-session-state-${meta.sessionStatus}`} data-session-state={meta.sessionStatus}>
+              {tr(meta.sessionStatus === 'active' ? 'groups.sessionStatusActive' : 'groups.sessionStatusClosed')}
+            </span>
+          ) : null}
+        </div>
+        <div className="groups-session-meta">
+          {members.length ? members.map(member => (
+            <button
+              type="button"
+              className="groups-session-bot"
+              key={member.larkAppId}
+              data-bot={member.larkAppId}
+              title={tr('groups.openBotSettings', { bot: member.botName ?? member.larkAppId })}
+              onClick={() => props.onManage(chat, member.larkAppId)}
+            >
+              <BotAvatar bot={member} />
+              <span>{member.botName ?? member.larkAppId}</span>
+            </button>
+          )) : <span className="groups-row-empty-bots">{tr('groups.noBotsInChat')}</span>}
+          {meta ? (
+            <>
+              <span data-session-active-at>{tr('groups.sessionLastActive', { time: formatSessionGroupTime(meta.lastActiveAt, props.now, tr) })}</span>
+              <span>{tr('groups.sessionCreated', { time: formatSessionGroupTime(meta.createdAt, props.now, tr) })}</span>
+            </>
+          ) : null}
+        </div>
+      </OverviewListMain>
+      <OverviewListTail>
+        <a className="btn-link open-chat" href={chatOpenLink(chat.chatId)} target="_blank" rel="noopener">{tr('groups.openInLark')}</a>
+        {meta?.sessionId ? (
+          <a className="btn-link open-session" href={sessionDetailHref(meta.sessionId)}>{tr('groups.openSession')}</a>
+        ) : null}
         <button className="manage-chat" type="button" onClick={() => props.onManage(chat)}>{tr('groups.manage')}</button>
       </OverviewListTail>
     </OverviewListItem>
@@ -1856,12 +1932,24 @@ function GroupsPage() {
   const snapshotRequestRunRef = useRef(0);
   const snapshotSuccessRunRef = useRef(0);
   const [snapshot, setSnapshotState] = useState<GroupsSnapshot>(emptyGroupsSnapshot);
-  const [filters, setFilters] = useState<GroupFilters>({ q: '', botId: '' });
+  // 普通群 / 会话群两个视图各自记着搜索、机器人筛选和页码，切过去再切回来不丢。
+  // 当前视图写进地址（`#/groups?view=session`），刷新和分享都能还原。
+  const [view, setViewState] = useState<GroupView>(() => {
+    const fromHash = hashQueryParam('view');
+    return isGroupView(fromHash) ? fromHash : 'standard';
+  });
+  const [filtersByView, setFiltersByView] = useState<Record<GroupView, GroupFilters>>({
+    standard: { q: '', botId: '' },
+    session: { q: '', botId: '' },
+  });
+  const [pageByView, setPageByView] = useState<Record<GroupView, number>>({ standard: 1, session: 1 });
+  const [sessionSort, setSessionSort] = useState<SessionGroupSort>('active');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [dialog, setDialog] = useState<DialogState | null>(null);
-  const [page, setPage] = useState(1);
+  const filters = filtersByView[view];
+  const page = pageByView[view];
 
   // Single source of truth for snapshot writes: update the synchronous `snapshotRef`
   // BEFORE enqueuing the React state update, and always enqueue an absolute value (never
@@ -1988,14 +2076,16 @@ function GroupsPage() {
   }, [reloadGroups]);
 
   // 会话群（p2pMode=group 自动创建，session-groups-store 分型标记）与常驻群
-  // 分开管理：主列表只展示常驻群，会话群收进下方折叠区——它们由 bot 自动
-  // 创建/命名/管理，数量随会话增长，混排会淹没真正需要人工管理的常驻群。
-  const allMatched = useMemo(
-    () => filterGroupChats(snapshot.chats, filters),
-    [snapshot.chats, filters],
-  );
-  const rows = useMemo(() => allMatched.filter(c => !c.sessionGroup), [allMatched]);
-  const sessionRows = useMemo(() => allMatched.filter(c => c.sessionGroup), [allMatched]);
+  // 分两个视图：会话群由 bot 自动创建/命名/管理，数量随会话增长，混排会淹没
+  // 真正需要人工管理的常驻群。两个视图共用同一个限高滚动列表 + 分页。
+  const standardChats = useMemo(() => snapshot.chats.filter(c => !c.sessionGroup), [snapshot.chats]);
+  const sessionChats = useMemo(() => snapshot.chats.filter(c => c.sessionGroup), [snapshot.chats]);
+  const rows = useMemo(() => {
+    if (view === 'standard') return filterGroupChats(standardChats, filters);
+    return sortSessionGroups(filterGroupChats(sessionChats, filters), sessionSort);
+  }, [view, standardChats, sessionChats, filters, sessionSort]);
+  // 「最近活跃 N 分钟前」按快照到达的时刻算，不必每分钟重渲染整页。
+  const now = useMemo(() => Date.now(), [snapshot]);
   const pageWindow = useMemo(
     () => paginateGroupRows(rows, page),
     [rows, page],
@@ -2008,9 +2098,23 @@ function GroupsPage() {
   const botFilterLabel = botFilterOptions.find(option => option.value === filters.botId)?.label
     ?? tr('groups.botFilterAll');
 
+  const setPage = useCallback((next: number) => {
+    setPageByView(cur => (cur[view] === next ? cur : { ...cur, [view]: next }));
+  }, [view]);
+  const updateFilters = useCallback((patch: Partial<GroupFilters>) => {
+    setFiltersByView(cur => ({ ...cur, [view]: { ...cur[view], ...patch } }));
+    setPageByView(cur => (cur[view] === 1 ? cur : { ...cur, [view]: 1 }));
+  }, [view]);
+  const switchView = useCallback((next: GroupView) => {
+    setViewState(next);
+    setHashQueryParam('view', next === 'session' ? 'session' : null);
+    const list = document.getElementById('g-body');
+    if (list) list.scrollTop = 0;
+  }, []);
+
   useEffect(() => {
     if (page !== pageWindow.page) setPage(pageWindow.page);
-  }, [page, pageWindow.page]);
+  }, [page, pageWindow.page, setPage]);
 
   async function refresh(): Promise<void> {
     setRefreshing(true);
@@ -2046,6 +2150,8 @@ function GroupsPage() {
     const expectedBotIds = new Set<string>(validIds);
     if (typeof resp.creator === 'string' && resp.creator) expectedBotIds.add(resp.creator);
     setSnapshot(injectOptimisticChat(snapshotRef.current, chatId, name || chatId, validIds, resp.creator));
+    // 新群总是普通群；在会话群视图里建的群，切回普通群视图才看得到。
+    if (view !== 'standard') switchView('standard');
     void refreshUntilSeen(chatId, expectedBotIds).catch(() => { /* tolerate */ });
   }
 
@@ -2079,7 +2185,9 @@ function GroupsPage() {
     setPage(nextPage);
   }
 
-  const renderRow = (chat: GroupChat) => (
+  const renderRow = (chat: GroupChat) => (view === 'session' ? (
+    <SessionGroupRow chat={chat} now={now} tr={tr} key={chat.chatId} onManage={openManageDialog} />
+  ) : (
     <GroupListRow
       chat={chat}
       bots={snapshot.bots}
@@ -2089,7 +2197,11 @@ function GroupsPage() {
       onClone={openCloneDialog}
       onManage={openManageDialog}
     />
-  );
+  ));
+  const sessionSortOptions: Array<{ value: SessionGroupSort; label: string }> = [
+    { value: 'active', label: tr('groups.sessionSortActive') },
+    { value: 'created', label: tr('groups.sessionSortCreated') },
+  ];
 
   return (
     <BotAvatarUrlContext.Provider value={avatarUrls}>
@@ -2104,16 +2216,31 @@ function GroupsPage() {
         </div>
       </div>
       <form id="g-filters" className="filters dashboard-toolbar groups-toolbar" onSubmit={ev => ev.preventDefault()}>
+        <div className="groups-view-switch" role="group" aria-label={tr('groups.viewSwitch')}>
+          {([
+            ['standard', 'groups.viewStandard', standardChats.length],
+            ['session', 'groups.viewSession', sessionChats.length],
+          ] as Array<[GroupView, string, number]>).map(([id, labelKey, count]) => (
+            <button
+              type="button"
+              key={id}
+              data-group-view={id}
+              aria-pressed={view === id}
+              className={view === id ? 'active' : ''}
+              title={id === 'session' ? tr('groups.viewSessionHint') : undefined}
+              onClick={() => switchView(id)}
+            >
+              {tr(labelKey)}
+              <small>{loading ? '-' : count}</small>
+            </button>
+          ))}
+        </div>
         <input
           type="search"
           name="q"
           placeholder={tr('groups.search')}
           value={filters.q}
-          onChange={ev => {
-            const q = ev.currentTarget.value;
-            setPage(1);
-            setFilters(cur => ({ ...cur, q }));
-          }}
+          onChange={ev => updateFilters({ q: ev.currentTarget.value })}
         />
         <DropdownMenu
           className="groups-bot-filter"
@@ -2124,14 +2251,24 @@ function GroupsPage() {
           searchable
           searchPlaceholder={tr('botPicker.searchPlaceholder')}
           searchEmptyLabel={tr('botPicker.noMatch')}
-          onChange={botId => {
-            setPage(1);
-            setFilters(cur => ({ ...cur, botId }));
-          }}
+          onChange={botId => updateFilters({ botId })}
         />
+        {view === 'session' ? (
+          <DropdownMenu
+            className="groups-session-sort"
+            ariaLabel={tr('groups.sessionSortLabel')}
+            label={sessionSortOptions.find(option => option.value === sessionSort)?.label ?? ''}
+            value={sessionSort}
+            options={sessionSortOptions}
+            onChange={next => {
+              setSessionSort(next);
+              setPage(1);
+            }}
+          />
+        ) : null}
         <span className="groups-toolbar-spacer" aria-hidden="true" />
         <span className="groups-toolbar-count">
-          {loading ? '-' : tr('groups.listCount', { n: rows.length })}
+          {loading ? '-' : tr(view === 'session' ? 'groups.sessionListCount' : 'groups.listCount', { n: rows.length })}
         </span>
         <RefreshIconButton id="g-refresh" label={tr('groups.refresh')} busy={refreshing} disabled={refreshing} onClick={() => void refresh()} />
       </form>
@@ -2142,7 +2279,7 @@ function GroupsPage() {
         ) : (
           <div className="groups-list-wrap" id="g-table-wrap">
             {rows.length === 0 ? (
-              <div className="empty groups-list-empty" id="g-body">{tr('groups.empty')}</div>
+              <div className="empty groups-list-empty" id="g-body">{tr(view === 'session' ? 'groups.sessionEmpty' : 'groups.empty')}</div>
             ) : (
               <OverviewList id="g-body" className="groups-list">
                 {pageWindow.rows.map(renderRow)}
@@ -2176,17 +2313,6 @@ function GroupsPage() {
           </div>
         )}
       </section>
-      {!loading && sessionRows.length > 0 ? (
-        <details className="overview-block groups-session-section" open={!!filters.q || !!filters.botId} data-session-groups>
-          <summary>
-            {tr('groups.sessionSection')}（{sessionRows.length}）
-            <span>{tr('groups.sessionSectionHint')}</span>
-          </summary>
-          <OverviewList id="g-session-body" className="groups-list">
-            {sessionRows.map(renderRow)}
-          </OverviewList>
-        </details>
-      ) : null}
       <DialogHost
         dialog={dialog}
         snapshot={snapshot}

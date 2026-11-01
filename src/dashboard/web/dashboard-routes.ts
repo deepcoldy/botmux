@@ -34,6 +34,24 @@ export function clearHashQueryParam(name: string): void {
   history.replaceState(history.state, '', `${location.pathname}${location.search}${hash.slice(0, queryIndex)}${query ? `?${query}` : ''}`);
 }
 
+/**
+ * 设置 / 去掉（value 为 null）当前 hash 上的某个查询参数，用于把页面内的视图状态
+ * 写进地址（刷新、分享都能还原）。同样走 replaceState，不会重挂载页面。
+ */
+export function setHashQueryParam(name: string, value: string | null): void {
+  if (typeof location === 'undefined' || typeof history === 'undefined') return;
+  const hash = location.hash;
+  // 没有 hash 路由时无处可写（拼到地址上会变成 ?query 而不是 #/page?query）。
+  if (!hash.startsWith('#')) return;
+  const queryIndex = hash.indexOf('?');
+  const params = new URLSearchParams(queryIndex < 0 ? '' : hash.slice(queryIndex + 1));
+  if (value === null) params.delete(name);
+  else params.set(name, value);
+  const query = params.toString();
+  const base = queryIndex < 0 ? hash : hash.slice(0, queryIndex);
+  history.replaceState(history.state, '', `${location.pathname}${location.search}${base}${query ? `?${query}` : ''}`);
+}
+
 function pageRoute<T extends Record<K, DashboardRouteRenderer>, K extends keyof T & string>(
   id: string,
   routePrefix: string,
