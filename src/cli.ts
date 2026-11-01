@@ -355,6 +355,7 @@ import {
   mentionedBotAppIds,
   orderedFooterRecipients,
 } from './utils/bot-routing.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
   crossPrincipalAsKeyword,
@@ -15980,8 +15981,9 @@ botmux grant chat — 给目标 Bot 增删/查询精确群对话授权（不授�
     let botInfo: Array<{ larkAppId: string; botName: string | null }> = [];
     try {
       if (existsSync(botInfoPath)) {
-        const raw = JSON.parse(readFileSync(botInfoPath, 'utf8'));
-        if (Array.isArray(raw)) botInfo = raw;
+        botInfo = botsInfoObjectEntries(JSON.parse(readFileSync(botInfoPath, 'utf8')))
+          .filter(isBotsInfoRouteEntry)
+          .map(entry => ({ larkAppId: entry.larkAppId, botName: entry.botName ?? null }));
       }
     } catch { /* invalid bots-info is equivalent to no display-name hints */ }
 
@@ -16156,7 +16158,18 @@ botmux create-group — 用一组机器人新建飞书群
   const botInfoPath = join(dataDir, 'bots-info.json');
   type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
   let botInfoEntries: BotInfoEntry[] = [];
-  try { if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
+  try {
+    if (existsSync(botInfoPath)) {
+      botInfoEntries = botsInfoObjectEntries(JSON.parse(readFileSync(botInfoPath, 'utf-8')))
+        .filter(isBotsInfoRouteEntry)
+        .map(entry => ({
+          larkAppId: entry.larkAppId,
+          botOpenId: typeof entry.botOpenId === 'string' ? entry.botOpenId : null,
+          botName: entry.botName ?? null,
+          cliId: typeof entry.cliId === 'string' ? entry.cliId : '',
+        }));
+    }
+  } catch { /* */ }
 
   const {
     resolveBotRefs,

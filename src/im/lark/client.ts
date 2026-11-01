@@ -14,6 +14,7 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { getGroupContextSettings } from '../../services/group-context-settings-store.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from '../../services/bots-info-shape.js';
 import type { GroupContextDeliveryBinding } from '../../services/group-context-delivery-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
@@ -3033,9 +3034,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries = botsInfoObjectEntries(JSON.parse(readFileSync(infoPath, 'utf-8')))
+        .filter(isBotsInfoRouteEntry);
       for (const e of entries) {
-        appIdToInfo.set(e.larkAppId, { botOpenId: e.botOpenId, botName: e.botName });
+        appIdToInfo.set(e.larkAppId, {
+          botOpenId: typeof e.botOpenId === 'string' ? e.botOpenId : null,
+          botName: e.botName ?? null,
+        });
       }
     }
   } catch { /* ignore corrupt file */ }
