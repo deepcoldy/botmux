@@ -6591,18 +6591,73 @@ dialog.onboarding-dialog::backdrop {
   }
 }
 
-.groups-session-section > summary {
-  padding: 10px 4px;
-  color: var(--fg);
-  font-weight: 600;
-  cursor: pointer;
-  opacity: 0.85;
+/* 会话群行：标题 + 会话状态；第二行是机器人、最近活跃、创建时间。 */
+.groups-page .groups-session-state {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
-.groups-session-section > summary > span {
-  margin-left: 8px;
+.groups-page .groups-session-state-active {
+  border-color: color-mix(in srgb, var(--success) 34%, var(--border-soft));
+  background: color-mix(in srgb, var(--success) 8%, var(--surface));
+  color: var(--success);
+}
+
+.groups-page .groups-session-state-closed {
+  border-style: dashed;
+  color: var(--faint);
+}
+
+.groups-page .groups-session-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-width: 0;
   color: var(--muted);
-  font-weight: 400;
+  font-size: 12px;
+}
+
+.groups-page .groups-session-bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 220px;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.groups-page .groups-session-bot > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.groups-page .groups-session-bot .orb-avatar-sm {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.groups-page .groups-session-bot:hover,
+.groups-page .groups-session-bot:focus-visible {
+  color: var(--accent-strong);
 }
 
 @media (max-width: 720px) {
@@ -14045,7 +14100,7 @@ tbody tr[data-chat]:hover {
   }
 }
 
-.groups-page .groups-list-row .overview-list-tail button {
+.groups-page .groups-list-row .overview-list-tail :is(button, .btn-link) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -14080,13 +14135,13 @@ tbody tr[data-chat]:hover {
   color: var(--accent-strong);
 }
 
-.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat) {
+.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat, .groups-list-row .open-chat, .groups-list-row .open-session) {
   border-color: var(--border-soft);
   background: var(--surface);
   color: var(--muted);
 }
 
-.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat):hover:not(:disabled) {
+.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat, .groups-list-row .open-chat, .groups-list-row .open-session):hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface));
   color: var(--accent-strong);
@@ -15683,6 +15738,53 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .groups-toolbar {
   align-items: center;
+}
+
+/* 普通群 / 会话群切换：工具栏最左侧，两侧各带数量。 */
+.groups-view-switch {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+}
+
+.groups-page .groups-view-switch button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: calc(var(--button-height) - 8px);
+  padding: 0 14px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  transition: background-color 80ms ease, color 80ms ease;
+}
+
+.groups-page .groups-view-switch button small {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.groups-page .groups-view-switch button:hover:not(.active) {
+  color: var(--fg);
+}
+
+.groups-page .groups-view-switch button.active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.groups-page .groups-view-switch button.active small {
+  color: inherit;
+  opacity: .8;
 }
 
 .groups-toolbar input[type="search"] {

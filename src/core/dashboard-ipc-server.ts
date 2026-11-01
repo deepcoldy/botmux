@@ -563,7 +563,7 @@ import { recoverFailedTurn, parseFailedTurnRecoveryRequest } from './failed-turn
 import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
-import { isSessionGroup } from '../services/session-groups-store.js';
+import { getSessionGroup, isSessionGroup, sessionGroupBoardMeta, type SessionGroupBoardMeta } from '../services/session-groups-store.js';
 import {
   commitDeviceIsolationActivation,
   DEVICE_ISOLATION_COMMIT_PATH,
@@ -4238,6 +4238,14 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId);
 }
 
+function sessionGroupBoardFields(chatId: string): { sessionGroup?: true; sessionGroupMeta?: SessionGroupBoardMeta } {
+  if (!isSessionGroup(chatId)) return {};
+  const entry = getSessionGroup(chatId);
+  if (!entry) return { sessionGroup: true };
+  const session = entry.lastSessionId ? findOwnedSessionRecord(entry.lastSessionId) : undefined;
+  return { sessionGroup: true, sessionGroupMeta: sessionGroupBoardMeta(entry, session) };
+}
+
 /** Four-state async lookup with durable fallback (design A).
  *
  *  In-memory `asyncTriggerResults` lives only on the active DaemonSession and is
@@ -6981,9 +6989,10 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
         streamingCardMasterEnabled,
         streamingCardChatEnabled,
         streamingCardEffectiveEnabled: streamingCardMasterEnabled && streamingCardChatEnabled,
-        // 会话群分型（p2pMode=group 自动创建）：dashboard 群面板据此把它们
-        // 收进独立折叠区，避免淹没需要人工管理的常驻群。
-        ...(isSessionGroup(c.chatId) ? { sessionGroup: true } : {}),
+        // 会话群分型（p2pMode=group 自动创建）：dashboard 群组页据此把它们放进
+        // 独立的「会话群」视图，避免淹没需要人工管理的常驻群；附带的摘要用于
+        // 按最近活跃排序、显示会话状态和跳转当前会话。
+        ...sessionGroupBoardFields(c.chatId),
       };
     });
     jsonRes(res, 200, { chats: enriched });

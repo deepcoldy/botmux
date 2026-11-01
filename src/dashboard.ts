@@ -57,6 +57,7 @@ import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { reconcileDaemonSessions, reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
+  adoptSessionGroupFields,
   compactGroupsMatrix,
   groupsNamesMatrix,
   createGroupsMatrixSnapshot,
@@ -3492,6 +3493,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           _firstSeenAt: null as number | null,
           observedBotNames: [] as string[],
         };
+        adoptSessionGroupFields(cur, chatBase);
         if (Array.isArray(observedBotNames) && observedBotNames.length > 0) {
           cur.observedBotNames = [...new Set([...(cur.observedBotNames ?? []), ...observedBotNames])];
         }
