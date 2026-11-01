@@ -1805,6 +1805,17 @@ async function cmdSetupScripted(
     return;
   }
 
+  // --welcome-message @<文件>：执行层读文件（setup-args 保持纯函数）。
+  if ((cmd.action === 'add' || cmd.action === 'edit') && cmd.flags.welcomeMessage?.startsWith('@')) {
+    const file = resolve(expandHomePath(cmd.flags.welcomeMessage.slice(1)));
+    try {
+      cmd.flags.welcomeMessage = readFileSync(file, 'utf8');
+    } catch (err) {
+      failSetupScripted(cmd.json, `读取欢迎语文件 ${file} 失败: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+  }
+
   ensureConfigDir();
   const bots = loadBotsJson();
 

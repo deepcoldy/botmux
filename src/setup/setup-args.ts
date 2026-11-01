@@ -43,6 +43,8 @@ export interface SetupBotFlags {
   brand?: string;
   /** UI 语言：zh | en。 */
   lang?: string;
+  /** 首次上线后私聊 owner 的欢迎语；'@路径' 由执行层读文件，'-' 清空。 */
+  welcomeMessage?: string;
 }
 
 export type SetupCommand =
@@ -83,6 +85,7 @@ const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--show-in-team': 'showInTeam',
   '--brand': 'brand',
   '--lang': 'lang',
+  '--welcome-message': 'welcomeMessage',
 };
 
 export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
@@ -144,6 +147,9 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --show-in-team <bool>      平台团队页是否展示（默认 true）
   --brand <feishu|lark>      租户类型（仅 add）
   --lang <zh|en>             Bot 语言（zh | en；edit 传 - 清空以继承全局语言）
+  --welcome-message <t|@f>   机器人首次成功上线后私聊 owner 的欢迎语，只发一次；
+                             @<文件路径> 从文件读取；edit 传 - 清空。发送失败不影响
+                             启动，下次启动重试
 
 通用选项：
   --json                     输出机器可读 JSON（含 ok / error 字段）
@@ -358,6 +364,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
     // 显式 --wrapper-cli 覆盖 --cli 推导出的前缀（undefined 时不动 base 里的值）。
     wrapperCli: flags.wrapperCli,
     lang: flags.lang,
+    welcomeMessage: flags.welcomeMessage,
   };
   const bot = applyBotConfigEdits(base, input);
   if (!hasOwnerEntry(bot.allowedUsers)) {
@@ -408,6 +415,7 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.allowedChatGroups !== undefined) input.allowedChatGroups = flags.allowedChatGroups;
   if (flags.showInTeam !== undefined) input.showInTeam = flags.showInTeam;
   if (flags.lang !== undefined) input.lang = flags.lang;
+  if (flags.welcomeMessage !== undefined) input.welcomeMessage = flags.welcomeMessage;
   return input;
 }
 

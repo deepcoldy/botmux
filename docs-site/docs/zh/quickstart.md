@@ -37,6 +37,8 @@ botmux setup
 
 > 🔧 **扫码创建会自动配好全部权限并发版**，无需手动操作。只有加 `botmux setup --no-open-platform-auto`（跳过自动配置）或手动建应用时，才需自己去开放平台导入权限 JSON（setup 会把完整权限写到 `~/.botmux/lark-scopes.json` 并打印一键复制命令）并创建发布版本，可用性范围选「仅自己可见」自动通过。
 
+> 👋 **上线欢迎语**：`botmux setup add ... --welcome-message "回复 /init 开始配置"`（或 `--welcome-message @welcome.txt` 从文件读取）会让机器人首次成功上线后主动私聊主人一次；已有机器人用 `botmux setup edit <进程名|AppID> --welcome-message ...` 设置，传 `-` 清空。发送记录在 daemon 数据目录 `welcome-sent/` 下，之后重启不会重发；发送失败不影响启动，下次启动重试。
+
 ## Step 3 · 启动
 
 ```bash
