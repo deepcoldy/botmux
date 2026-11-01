@@ -58,20 +58,25 @@ describe('GET /api/groups session-group summary', () => {
   let handle: IpcServerHandle | undefined;
 
   beforeEach(() => {
-    setActiveSessionsRegistry(new Map() as any);
+    // oc_live 的常驻会话只在内存活跃表里（不需要落库就能拿到状态）。
+    setActiveSessionsRegistry(new Map([['live-key', {
+      session: { sessionId: 'sess-live', status: 'active', lastMessageAt: new Date(T0 + 5_400_000).toISOString() },
+    }]]) as any);
     setLarkAppId('app-a');
     vi.spyOn(botRegistry, 'getBot').mockImplementation((() => ({ config: { larkAppId: 'app-a', cliId: 'codex' } })) as any);
     vi.spyOn(groupsStore, 'listChats').mockResolvedValue([
       { chatId: 'oc_session', name: '修复登录跳转' },
       { chatId: 'oc_session2', name: '整理日志' },
+      { chatId: 'oc_live', name: '升级依赖' },
       { chatId: 'oc_plain', name: '评审群' },
     ] as any);
     vi.spyOn(sessionGroupsStore, 'isSessionGroup').mockImplementation(
-      chatId => chatId === 'oc_session' || chatId === 'oc_session2');
+      chatId => chatId === 'oc_session' || chatId === 'oc_session2' || chatId === 'oc_live');
     vi.spyOn(sessionGroupsStore, 'getSessionGroup').mockImplementation(chatId =>
       (chatId === 'oc_session' ? entry()
         : chatId === 'oc_session2' ? entry({ lastSessionId: 'sess-2' })
-          : undefined));
+          : chatId === 'oc_live' ? entry({ lastSessionId: 'sess-live' })
+            : undefined));
     vi.spyOn(sessionStore, 'getOwnedSession').mockImplementation(id => {
       if (id === 'sess-1') {
         return { sessionId: 'sess-1', status: 'active', lastMessageAt: new Date(T0 + 7_200_000).toISOString() } as any;
@@ -128,6 +133,24 @@ describe('GET /api/groups session-group summary', () => {
         createdAt: T0, lastActiveAt: T0 + 60_000, sessionId: id === 'oc_session' ? 'sess-1' : 'sess-2',
       });
     }
+  });
+
+  it('the store circuit only skips the database: a session-group whose session is in the live registry keeps its status (#2663)', async () => {
+    // oc_session 落库抛错先触发熔断；排在后面的 oc_live 的会话就在内存活跃表里，
+    // 不需要碰数据库，仍应拿到「会话中」和会话侧的最近活跃时间。
+    vi.mocked(sessionStore.getOwnedSession).mockImplementation(() => {
+      throw new Error('database is locked');
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { chats: Array<Record<string, any>> };
+    expect(body.chats.find(c => c.chatId === 'oc_live')!.sessionGroupMeta).toEqual({
+      createdAt: T0, lastActiveAt: T0 + 5_400_000, sessionId: 'sess-live', sessionStatus: 'active',
+    });
+    // 熔断照旧：落库只试了一次（oc_session），oc_session2 不再落库
+    expect(vi.mocked(sessionStore.getOwnedSession)).toHaveBeenCalledTimes(1);
+    expect(body.chats.find(c => c.chatId === 'oc_session2')!.sessionGroupMeta).not.toHaveProperty('sessionStatus');
   });
 
   it('trips a per-request circuit when the registry read throws (mkdir in load): chats degrade to regular, no 502', async () => {

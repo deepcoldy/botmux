@@ -4245,7 +4245,8 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
  * 各自在本请求内熔断一次：
  *  - 注册表读取失败：无法分型，该请求内后续群全部降级为普通群（{}）；
  *  - 会话存储读取失败：仍给注册表摘要（时间/会话入口），只缺会话状态与
- *    会话侧的最近活跃时间，本请求内不再查会话存储。
+ *    会话侧的最近活跃时间，本请求内不再落库。熔断只管落库那一步：常驻会话
+ *    在内存活跃表里时照常取到状态，不受影响。
  */
 function makeSessionGroupBoardFields(): (chatId: string) => { sessionGroup?: true; sessionGroupMeta?: SessionGroupBoardMeta } {
   let registryFailed = false;
@@ -4265,9 +4266,11 @@ function makeSessionGroupBoardFields(): (chatId: string) => { sessionGroup?: tru
     }
     if (!entry) return { sessionGroup: true };
     let session: Session | undefined;
-    if (entry.lastSessionId && !sessionLookupFailed) {
+    // 与 findOwnedSessionRecord 同序：内存活跃表优先（不碰数据库），未命中才落库。
+    if (entry.lastSessionId) session = findActiveBySessionId(entry.lastSessionId)?.session;
+    if (entry.lastSessionId && !session && !sessionLookupFailed) {
       try {
-        session = findOwnedSessionRecord(entry.lastSessionId);
+        session = sessionStore.getOwnedSession(entry.lastSessionId);
       } catch (err) {
         sessionLookupFailed = true;
         logger.warn(`[dashboard-ipc] session lookup unavailable for session groups; serving registry-only summaries for this request (first error on ${entry.lastSessionId}): ${err instanceof Error ? err.message : String(err)}`);
