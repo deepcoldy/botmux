@@ -30,7 +30,10 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
         // 0.28 it auto-approves only regular tool calls, and since 2.0 it is
         // "Ask When Needed" (risky actions, questions and plans still stop for
         // a human). `--auto` ("Never Ask") is the approval bypass that
-        // disableCliBypass guards; it is present from 0.10.0 on.
+        // disableCliBypass guards. It exists from 0.5.0 on (older builds exit
+        // on an unknown option); 0.5.0–0.14.x refuse it together with
+        // `--session`, as they refuse `--yolo --session`, so resume works with
+        // either flag only from 0.15.0.
         args.push('--auto');
       }
       if (model && model.trim()) {
