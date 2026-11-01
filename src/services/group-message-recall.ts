@@ -1,4 +1,5 @@
 import { parseApiMessage } from '../im/lark/message-parser.js';
+import { extractLarkBusinessCode, LARK_CODE_MESSAGE_WITHDRAWN } from '../im/lark/lark-errors.js';
 
 export interface RecallMessageRecord {
   message_id?: string;
@@ -7,7 +8,7 @@ export interface RecallMessageRecord {
   create_time?: string;
   thread_id?: string;
   deleted?: boolean;
-  sender?: { id?: string; sender_type?: string; sender_name?: string };
+  sender?: { id?: string; sender_type?: string; sender_name?: string; id_type?: string; sender_id_type?: string };
   body?: { content?: string };
 }
 export interface GroupRecallTransport {
@@ -41,7 +42,11 @@ function validChat(chatId: string): void {
 export class GroupMessageRecallService {
   constructor(private readonly appId: string, private readonly transport: GroupRecallTransport) {}
   private own(message: RecallMessageRecord): boolean {
-    return message.sender?.sender_type === 'app' && message.sender.id === this.appId;
+    const sender = message.sender;
+    const idType = sender?.id_type ?? sender?.sender_id_type;
+    // 列表与详情可能分别标为 app、bot，或仅标 app_id；始终校验所选应用的 ID。
+    return sender?.id === this.appId
+      && (sender.sender_type === 'app' || sender.sender_type === 'bot' || idType === 'app_id');
   }
   private async membership(chatId: string): Promise<void> {
     validChat(chatId);
@@ -104,7 +109,12 @@ export class GroupMessageRecallService {
           results.push({ messageId, ok: true });
         }
       } catch (error) {
-        results.push({ messageId, ok: false, error: error instanceof Error ? error.message : 'recall_failed' });
+        // 已撤回消息的回读可能直接报 230011；此时不再执行删除，重试也应收敛为成功。
+        if (extractLarkBusinessCode(error) === LARK_CODE_MESSAGE_WITHDRAWN) {
+          results.push({ messageId, ok: true, alreadyRecalled: true });
+        } else {
+          results.push({ messageId, ok: false, error: error instanceof Error ? error.message : 'recall_failed' });
+        }
       }
     }
     return { ok: results.every(result => result.ok), results };
