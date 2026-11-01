@@ -215,6 +215,21 @@ describe('ProgramStatusFramingStream: tmux passthrough', () => {
     expect(feedAll([`a${notify}b`])).toEqual([{ type: 'data', text: `a${notify}b` }]);
   });
 
+  it('passes an envelope carrying more than one inner sequence through as data, byte for byte', () => {
+    // Real Kimi wraps each report on its own; a packed envelope is not a
+    // report botmux can attribute, so it must neither yield status nor vanish.
+    const twoReports = tmuxWrap('\x1b]7501;state=working:app=kimi-code\x07\x1b]7501;state=done:app=kimi-code\x07');
+    const reportThenOsc = tmuxWrap('\x1b]7501;state=done:app=kimi-code\x07\x1b]9;Task finished\x07');
+    for (const env of [twoReports, reportThenOsc]) {
+      const raw = `a${env}b`;
+      const whole = feedAll([raw]);
+      expect(whole).toEqual([{ type: 'data', text: raw }]);
+      for (let i = 1; i < raw.length; i++) {
+        expect(feedAll([raw.slice(0, i), raw.slice(i)]), `split at ${i}`).toEqual(whole);
+      }
+    }
+  });
+
   it('keeps a malformed envelope as data without swallowing what follows', () => {
     // An undoubled ESC that is not ST breaks the envelope.
     const raw = '\x1bPtmux;\x1b\x1b]7501;state=working\x1b[0mtext';
