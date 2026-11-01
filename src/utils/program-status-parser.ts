@@ -191,7 +191,12 @@ export class ProgramStatusFramingStream {
             let payload = inner.slice(2 + PREFIX_TARGET.length);
             if (payload.endsWith('\x1b\\')) payload = payload.slice(0, -2);
             else if (payload.endsWith('\x07')) payload = payload.slice(0, -1);
-            if (!payload.includes('\x1b')) this.pushPayload(parts, payload);
+            // One report per envelope is the only shape accepted as status.
+            // Anything else inside (a second sequence, stray escapes) is not
+            // ours to interpret: pass the whole envelope through as data, as
+            // the bare-OSC path does with an unterminated report.
+            if (payload.includes('\x1b')) emitData(str.slice(cursor, endIdx + 2));
+            else this.pushPayload(parts, payload);
             cursor = endIdx + 2;
             continue;
           }
