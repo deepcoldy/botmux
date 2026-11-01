@@ -173,6 +173,11 @@ describe('GroupsPage — standard / session views', () => {
       .toBe('#/sessions?session=sess-new');
     expect(newest.findByProps({ 'data-session-active-at': true }).children.join('')).toBe('最近活跃 1 小时前');
 
+    // 拿不到摘要的会话群：不渲染状态徽标，也没有「查看会话」入口
+    const noMetaRow = sessionRows.find(r => r.props['data-chat'] === 'oc_s_nometa')!;
+    expect(noMetaRow.findAll(node => node.props['data-session-state'] !== undefined)).toHaveLength(0);
+    expect(noMetaRow.findAll(node => node.type === 'a' && String(node.props.className).includes('open-session'))).toHaveLength(0);
+
     act(() => { renderer.root.findByProps({ className: 'groups-session-sort' }).props.onChange('created'); });
     expect(rowIds(renderer)).toEqual(['oc_s_old', 'oc_s_new', 'oc_s_nometa']);
 
@@ -205,6 +210,50 @@ describe('GroupsPage — standard / session views', () => {
     const renderer = await mount();
     expect(viewButton(renderer, 'session').props['aria-pressed']).toBe(true);
     expect(rowIds(renderer)).toEqual(['oc_s_new', 'oc_s_old', 'oc_s_nometa']);
+    act(() => renderer.unmount());
+  });
+
+  it('switches back to the standard view after creating a chat while on the session view', async () => {
+    stubPage();
+    const renderer = await mount();
+    act(() => { viewButton(renderer, 'session').props.onClick(); });
+    expect(viewButton(renderer, 'session').props['aria-pressed']).toBe(true);
+
+    // 新建群聊对话框提交成功（新群总是普通群，留在会话群视图里看不到它）
+    const dialogHost = renderer.root.findAll(node => typeof node.props?.onCreated === 'function')[0];
+    act(() => { dialogHost.props.onCreated({ chatId: 'oc_new_2661' }, ['cli_a'], '新群'); });
+    expect(viewButton(renderer, 'standard').props['aria-pressed']).toBe(true);
+    expect(replaceState).toHaveBeenLastCalledWith(null, '', '/#/groups');
+    act(() => renderer.unmount());
+  });
+
+  it('resets the current view to page 1 when searching from a later page', async () => {
+    __testOnly_resetGroupsSnapshotCache();
+    // 35 个会话群、名字都含「批量」，搜索后仍是 2 页——这是页码重置唯一可见的场景
+    const many: GroupChat[] = Array.from({ length: 35 }, (_, i) =>
+      sessionChat(`oc_m_${i}`, `批量群 ${i}`, { createdAt: NOW - i * HOUR, lastActiveAt: NOW - i * HOUR, sessionId: `sess-m-${i}`, sessionStatus: 'active' }));
+    replaceState = vi.fn();
+    vi.stubGlobal('document', { addEventListener() {}, removeEventListener() {}, getElementById() { return null; } });
+    vi.stubGlobal('location', { hash: '#/groups?view=session', pathname: '/', search: '' });
+    vi.stubGlobal('history', { state: null, replaceState });
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ bots: [{ larkAppId: 'cli_a', botName: 'Alpha' }], chats: many }),
+    })));
+
+    const renderer = await mount();
+    expect(viewButton(renderer, 'session').props['aria-pressed']).toBe(true);
+    expect(rowIds(renderer)).toHaveLength(30);
+    const nextPage = renderer.root.find(node =>
+      node.type === 'button' && Array.isArray(node.children) && node.children.join('') === '下一页');
+    act(() => { nextPage.props.onClick(); });
+    expect(rowIds(renderer)[0]).toBe('oc_m_30');
+
+    typeSearch(renderer, '批量');
+    expect(rowIds(renderer)).toHaveLength(30);
+    expect(rowIds(renderer)[0]).toBe('oc_m_0');
     act(() => renderer.unmount());
   });
 });

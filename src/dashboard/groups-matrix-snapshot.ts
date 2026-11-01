@@ -57,7 +57,6 @@ export interface GroupsMatrixSnapshot {
   peekPresentation: () => ReadonlyMap<string, GroupPresentation>;
 }
 
-/** 会让聚合后的群矩阵过期的 daemon SSE 事件（目前只有回复模式策略变化）。 */
 /**
  * 群矩阵按 chatId 汇总各 daemon 的回包，群级字段取第一个回包。会话群标记和摘要只有
  * 注册了这个会话群的 bot 才给得出；群里还有别的 bot 时，先回包的若是那个 bot，
@@ -69,6 +68,7 @@ export function adoptSessionGroupFields(target: Record<string, unknown>, incomin
   if (incoming.sessionGroupMeta !== undefined) target.sessionGroupMeta = incoming.sessionGroupMeta;
 }
 
+/** 会让聚合后的群矩阵过期的 daemon SSE 事件（目前只有回复模式策略变化）。 */
 export function dashboardEventInvalidatesGroupsMatrix(event: { type: string }): boolean {
   return event.type === "groups.reply-policy.changed";
 }

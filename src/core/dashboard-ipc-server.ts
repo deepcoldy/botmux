@@ -4240,10 +4240,17 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
 
 function sessionGroupBoardFields(chatId: string): { sessionGroup?: true; sessionGroupMeta?: SessionGroupBoardMeta } {
   if (!isSessionGroup(chatId)) return {};
-  const entry = getSessionGroup(chatId);
-  if (!entry) return { sessionGroup: true };
-  const session = entry.lastSessionId ? findOwnedSessionRecord(entry.lastSessionId) : undefined;
-  return { sessionGroup: true, sessionGroupMeta: sessionGroupBoardMeta(entry, session) };
+  try {
+    const entry = getSessionGroup(chatId);
+    if (!entry) return { sessionGroup: true };
+    const session = entry.lastSessionId ? findOwnedSessionRecord(entry.lastSessionId) : undefined;
+    return { sessionGroup: true, sessionGroupMeta: sessionGroupBoardMeta(entry, session) };
+  } catch (err) {
+    // 注册表 / 会话存储读取异常（如启动瞬间 SQLITE_BUSY）只让这一个群缺摘要，
+    // 不能让整个群组页 502——分型标记仍保留，排序/状态/会话入口降级为不展示。
+    logger.warn(`[dashboard-ipc] session-group meta unavailable for ${chatId}: ${err instanceof Error ? err.message : String(err)}`);
+    return { sessionGroup: true };
+  }
 }
 
 /** Four-state async lookup with durable fallback (design A).

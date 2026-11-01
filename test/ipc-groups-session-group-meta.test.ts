@@ -92,4 +92,18 @@ describe('GET /api/groups session-group summary', () => {
     expect(plain).not.toHaveProperty('sessionGroup');
     expect(plain).not.toHaveProperty('sessionGroupMeta');
   });
+
+  it('keeps serving the list (flag only, no summary) when the session store read throws', async () => {
+    // 启动瞬间 SQLITE_BUSY 等存储异常只让这一个会话群缺摘要，不能把整个群组页打成 502。
+    vi.mocked(sessionStore.getOwnedSession).mockImplementation(() => {
+      throw new Error('database is locked');
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/groups`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { chats: Array<Record<string, any>> };
+    const session = body.chats.find(chat => chat.chatId === 'oc_session')!;
+    expect(session.sessionGroup).toBe(true);
+    expect(session).not.toHaveProperty('sessionGroupMeta');
+  });
 });
