@@ -37,6 +37,8 @@ An interactive wizard; just follow the prompts:
 
 > 🔧 **Creating by QR code auto-configures all permissions and publishes a version** — no manual steps needed. Only if you add `botmux setup --no-open-platform-auto` (skip auto-config) or create the app manually do you need to import the permission JSON yourself in the Open Platform (setup writes the full set to `~/.botmux/lark-scopes.json` and prints a one-click copy command) and create/publish a version; choosing availability "Visible to me only" gets auto-approved.
 
+> ➕ **Need permissions beyond the built-in list?** Pass `--extra-scopes-file <json>` in scripted setup, e.g. `botmux setup add --create-app --allowed-users <email> --extra-scopes-file ./scopes.json`; for an existing bot run `botmux setup configure <process-name|AppID> --extra-scopes-file ./scopes.json`. The file uses the `lark-scopes.json` shape (`{"scopes":{"tenant":[],"user":[]}}`) or `{"scopes":[{"scope":"x:y"}]}` (treated as user scopes). Scopes missing from the tenant catalog are skipped and listed in the result instead of failing the run; the file path is saved on the bot so later `configure` runs reuse it.
+
 ## Step 3 · Start
 
 ```bash

@@ -37,6 +37,8 @@ botmux setup
 
 > 🔧 **扫码创建会自动配好全部权限并发版**，无需手动操作。只有加 `botmux setup --no-open-platform-auto`（跳过自动配置）或手动建应用时，才需自己去开放平台导入权限 JSON（setup 会把完整权限写到 `~/.botmux/lark-scopes.json` 并打印一键复制命令）并创建发布版本，可用性范围选「仅自己可见」自动通过。
 
+> ➕ **需要内置清单之外的权限？** 脚本化添加时传 `--extra-scopes-file <json>`，例如 `botmux setup add --create-app --allowed-users <邮箱> --extra-scopes-file ./scopes.json`；已有机器人用 `botmux setup configure <进程名|AppID> --extra-scopes-file ./scopes.json` 补上。文件格式同 `lark-scopes.json`（`{"scopes":{"tenant":[],"user":[]}}`），也接受 `{"scopes":[{"scope":"x:y"}]}`（视为 user 权限）。当前租户目录里没有的权限会跳过并列在结果里，不会中断流程；文件路径会记到该机器人配置，之后重跑 `configure` 自动沿用。
+
 ## Step 3 · 启动
 
 ```bash

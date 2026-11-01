@@ -843,6 +843,8 @@ async function finishOpenPlatformSetup(
     quiet?: boolean;
     /** 本次 setup 刚创建出这个应用 —— 只有它允许 redirect 白名单在读失败时盲写覆盖。 */
     appJustCreated?: boolean;
+    /** 内置清单 + --extra-scopes-file 合并后的权限清单；不传用内置默认清单。 */
+    scopeManifest?: import('./setup/open-platform-automation.js').ScopeManifest;
   } = {},
 ): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
@@ -873,6 +875,7 @@ async function finishOpenPlatformSetup(
     disableQrLogin: options.reuseOnly,
     disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
     appJustCreated: options.appJustCreated,
+    scopeManifest: options.scopeManifest,
   });
   const outcome = classifySetupOpenPlatformOutcome(result);
   if (result.ok) {
@@ -880,6 +883,10 @@ async function finishOpenPlatformSetup(
     say(`   Session 来源: ${result.sessionSource}`);
     const skipped = result.skippedScopeCount ?? 0;
     say(`   已导入权限数: ${result.scopeCount}${skipped > 0 ? `（另有 ${skipped} 项当前租户目录中没有，已跳过）` : ''}`);
+    if (options.scopeManifest && skipped > 0 && result.skippedScopes) {
+      const names = [...result.skippedScopes.tenant.map(n => `${n}(tenant)`), ...result.skippedScopes.user.map(n => `${n}(user)`)];
+      say(`   已跳过的权限: ${names.join(', ')}`);
+    }
     if (result.scopeWarning) {
       say(`   ⚠️ 权限注册未全部成功（部分租户对个别权限有限制）：${result.scopeWarning}`);
       say('      可稍后到开放平台「权限管理」手动补齐缺失权限。');
@@ -1747,9 +1754,30 @@ function setupAddContinuationCommand(
   appId: string,
   brand: Brand,
   ownerPlaceholder = '<OWNER_EMAIL>',
+  extraScopesFile?: string,
 ): string {
   return `botmux setup add --app-id ${appId} --app-secret <APP_SECRET> ` +
-    `--allowed-users ${ownerPlaceholder}${brand === 'lark' ? ' --brand lark' : ''} --open-platform-auto`;
+    `--allowed-users ${ownerPlaceholder}${brand === 'lark' ? ' --brand lark' : ''} --open-platform-auto` +
+    (extraScopesFile ? ` --extra-scopes-file ${shellQuoteArg(extraScopesFile)}` : '');
+}
+
+function shellQuoteArg(value: string): string {
+  return /^[A-Za-z0-9_./~:=@%+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * --extra-scopes-file：解析成绝对路径并读取校验，返回「内置清单 + 追加清单」合并结果。
+ * 未给路径时返回 undefined（走 automateOpenPlatformSetup 的内置默认清单）。
+ */
+async function resolveSetupScopeManifest(
+  extraScopesFile: string | undefined,
+): Promise<{ path: string; manifest: import('./setup/open-platform-automation.js').ScopeManifest } | undefined> {
+  if (!extraScopesFile) return undefined;
+  const path = resolve(expandHomePath(extraScopesFile));
+  const { loadExtraScopeManifest, mergeScopeManifests } = await import('./setup/extra-scopes.js');
+  const { readDefaultScopeManifest } = await import('./setup/open-platform-automation.js');
+  const extra = loadExtraScopeManifest(path);
+  return { path, manifest: mergeScopeManifests(readDefaultScopeManifest(), extra) };
 }
 
 /** 某个（可能带 ~ 前缀的）路径若不存在/不是目录，返回展开后的绝对路径；合法返回 null。 */
@@ -1828,11 +1856,26 @@ async function cmdSetupScripted(
     }
     const bot = bots[index];
     const processName = botProcessName(bot, index, PM2_NAME);
+    // 显式 --extra-scopes-file 优先；否则沿用该机器人上次记下的路径。
+    let scopes: Awaited<ReturnType<typeof resolveSetupScopeManifest>>;
+    try {
+      scopes = await resolveSetupScopeManifest(
+        cmd.extraScopesFile ?? (typeof bot.extraScopesFile === 'string' ? bot.extraScopesFile : undefined),
+      );
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    if (scopes && bot.extraScopesFile !== scopes.path) {
+      bot.extraScopesFile = scopes.path;
+      writeBotsJsonAtomic(bots);
+    }
     const openPlatform = await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
       // Machine-readable callers must never be surprised by an interactive QR.
       reuseOnly: cmd.json && !cmd.switchAccount,
       forceQrLogin: cmd.switchAccount,
       quiet: cmd.json,
+      scopeManifest: scopes?.manifest,
     });
     if (openPlatform.status === 'failed' || openPlatform.status === 'manual') {
       const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform);
@@ -1882,6 +1925,14 @@ async function cmdSetupScripted(
     let createdAppId: string | undefined;
     let createdAppName: string | undefined;
     const requestedBrand = normalizeBrand(cmd.flags.brand);
+    // 追加权限清单在建应用之前就读取校验：文件写错不该留下一个已创建的半成品应用。
+    let scopes: Awaited<ReturnType<typeof resolveSetupScopeManifest>>;
+    try {
+      scopes = await resolveSetupScopeManifest(cmd.extraScopesFile);
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
     if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
       const legacy = parseDotEnvToBotConfig();
       if (legacy.larkAppId && legacy.larkAppSecret) {
@@ -2035,7 +2086,7 @@ async function cmdSetupScripted(
 
       if (!credentials.ok) {
         const continueCommand = credentials.appId
-          ? setupAddContinuationCommand(credentials.appId, requestedBrand)
+          ? setupAddContinuationCommand(credentials.appId, requestedBrand, undefined, scopes?.path)
           : undefined;
         failSetupScripted(cmd.json,
           `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
@@ -2092,7 +2143,7 @@ async function cmdSetupScripted(
     const v = await validateCredentials(bot.larkAppId, bot.larkAppSecret, botBrand(bot));
     if (!v.ok) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot))
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), undefined, scopes?.path)
         : undefined;
       failSetupScripted(
         cmd.json,
@@ -2115,7 +2166,7 @@ async function cmdSetupScripted(
     );
     if (unusableOwners.length > 0) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot), '<OWNER_EMAIL_OR_UNION_ID>')
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), '<OWNER_EMAIL_OR_UNION_ID>', scopes?.path)
         : undefined;
       failSetupScripted(
         cmd.json,
@@ -2135,10 +2186,11 @@ async function cmdSetupScripted(
     }
 
     try {
+      if (scopes) bot.extraScopesFile = scopes.path;
       writeBotsJsonAtomic([...existing, bot]);
     } catch (err) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot))
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), undefined, scopes?.path)
         : undefined;
       failSetupScripted(
         cmd.json,
@@ -2173,6 +2225,7 @@ async function cmdSetupScripted(
         // 只认「本次命令确实创建出了这个 appId」这一条硬证据：--app-id/--app-secret
         // 直接传进来的存量应用绝不能拿到盲写授权。
         appJustCreated: createdAppId !== undefined && createdAppId === bot.larkAppId,
+        scopeManifest: scopes?.manifest,
       });
     }
 
