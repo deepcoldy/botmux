@@ -32,6 +32,57 @@ describe('group message recall', () => {
     await expect(service.list('oc_group', { threadRootId: 'om_root' })).rejects.toMatchObject({ status: 403 });
     expect(transport.list).toHaveBeenCalledTimes(1);
   });
+  it.each([
+    { sender_type: 'bot' },
+    { id_type: 'app_id' },
+    { sender_id_type: 'app_id' },
+  ])('accepts the selected bot across sender shapes: %j', async shape => {
+    const message = own('om_own', { sender: { id: 'cli_bot', ...shape } });
+    vi.mocked(transport.list).mockResolvedValue({ items: [message] });
+    vi.mocked(transport.read).mockResolvedValue(message);
+    expect((await service.list('oc_group')).messages[0].canRecall).toBe(true);
+    expect(await service.recall('oc_group', { messageIds: ['om_own'] })).toEqual({
+      ok: true, results: [{ messageId: 'om_own', ok: true }],
+    });
+    expect(transport.recall).toHaveBeenCalledExactlyOnceWith('om_own');
+  });
+  it.each([
+    { sender_type: 'bot' },
+    { id_type: 'app_id' },
+    { sender_id_type: 'app_id' },
+  ])('recalls when list says app but detail uses another bot shape: %j', async shape => {
+    vi.mocked(transport.list).mockResolvedValue({ items: [own('om_own')] });
+    vi.mocked(transport.read).mockResolvedValue(own('om_own', { sender: { id: 'cli_bot', ...shape } }));
+    const listed = await service.list('oc_group');
+    expect(listed.messages[0].canRecall).toBe(true);
+    expect(await service.recall('oc_group', { messageIds: [listed.messages[0].messageId] })).toEqual({
+      ok: true, results: [{ messageId: 'om_own', ok: true }],
+    });
+    expect(transport.recall).toHaveBeenCalledExactlyOnceWith('om_own');
+  });
+  it.each([
+    { id: 'cli_other', sender_type: 'bot' },
+    { id: 'cli_other', id_type: 'app_id' },
+    { id: 'cli_other', sender_id_type: 'app_id' },
+    { id: 'ou_user', sender_type: 'user' },
+    { id: 'cli_bot', sender_type: 'user' },
+    { id: 'cli_bot' },
+  ])('keeps foreign and untyped senders non-recallable: %j', async sender => {
+    const message = own('om_foreign', { sender });
+    vi.mocked(transport.list).mockResolvedValue({ items: [message] });
+    vi.mocked(transport.read).mockResolvedValue(message);
+    expect((await service.list('oc_group')).messages[0].canRecall).toBe(false);
+    expect((await service.recall('oc_group', { messageIds: ['om_foreign'] })).results).toEqual([
+      { messageId: 'om_foreign', ok: false, error: 'not_bot_message' },
+    ]);
+    expect(transport.recall).not.toHaveBeenCalled();
+  });
+  it('excludes cross-group list items without dropping items whose chat is omitted', async () => {
+    vi.mocked(transport.list).mockResolvedValue({ items: [
+      own('om_local'), own('om_foreign', { chat_id: 'oc_elsewhere' }), own('om_omitted', { chat_id: undefined }),
+    ] });
+    expect((await service.list('oc_group')).messages.map(message => message.messageId)).toEqual(['om_local', 'om_omitted']);
+  });
   it('refuses foreign messages even when the selected bot could administratively recall them', async () => {
     vi.mocked(transport.read).mockImplementation(async id => id === 'om_cross'
       ? own(id, { chat_id: 'oc_elsewhere' }) : id === 'om_user'
