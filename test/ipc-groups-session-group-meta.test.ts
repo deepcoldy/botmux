@@ -109,6 +109,14 @@ describe('GET /api/groups session-group summary', () => {
     expect(session2.sessionGroupMeta).toEqual({
       createdAt: T0, lastActiveAt: T0 + 60_000, sessionId: 'sess-2', sessionStatus: 'closed',
     });
+    // sess-live 只在内存活跃表：无故障时也必须内存命中、不触发落库（#2663 的短路与故障无关）。
+    const live = body.chats.find(chat => chat.chatId === 'oc_live')!;
+    expect(live.sessionGroupMeta).toEqual({
+      createdAt: T0, lastActiveAt: T0 + 5_400_000, sessionId: 'sess-live', sessionStatus: 'active',
+    });
+    // 只有 sess-1/sess-2 落库，sess-live 内存命中不落库——钉住「内存优先、命中不读库」，
+    // 删掉 !session 短路或调换内存/落库次序都会让调用数变成 3。
+    expect(vi.mocked(sessionStore.getOwnedSession)).toHaveBeenCalledTimes(2);
     expect(session.sessionGroup).toBe(true);
     expect(plain).not.toHaveProperty('sessionGroup');
     expect(plain).not.toHaveProperty('sessionGroupMeta');
