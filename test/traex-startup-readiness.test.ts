@@ -282,6 +282,8 @@ const INITIALIZED_COMPOSER = [
 describe('TraeX initialized composer', () => {
   it.each([
     ['fresh context', INITIALIZED_COMPOSER, true],
+    ['Auto Mode footer', INITIALIZED_COMPOSER.map(row => row.replace('☢ Full Access', '▧ Auto Mode')), true],
+    ['Workspace Edit footer', INITIALIZED_COMPOSER.map(row => row.replace('☢ Full Access', '▧ Workspace Edit')), true],
     ['model still loading', INITIALIZED_COMPOSER.map(row => row.replace('GPT-6-Astra xhigh', 'loading')), false],
     ['directory named loading', INITIALIZED_COMPOSER.map(row => row.replace('/tmp/project', '/tmp/loading')), true],
   ])('%s has the expected initialization evidence', (_name, rows, expected) => {

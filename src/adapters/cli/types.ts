@@ -40,6 +40,8 @@ export interface PtyHandle {
   cliPid?: number;
   /** Authoritative terminal snapshots, when supported by an observe backend. */
   captureCurrentScreen?(): string;
+  /** Fresh viewport read without blocking the worker on a cursor query. */
+  captureViewportAsync?(): Promise<string>;
   captureInputState?(): {
     viewport: string;
     cursor: { x: number; y: number };
