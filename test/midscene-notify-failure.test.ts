@@ -1,10 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   alreadyNotified,
+  assessFailures,
   commentBody,
   failureReasons,
   feishuJobRan,
   mergedPullRequests,
+  notify,
   previousTestedSha,
   problemCases,
 } from '../scripts/midscene-notify-failure.mjs';
@@ -156,5 +161,122 @@ describe('Midscene master failure notification', () => {
     });
     expect(body).not.toContain('报告（');
     expect(body).toContain('https://example.test/run/2');
+  });
+});
+
+// 报告 manifest 里额度耗尽的失败信息（Midscene 错误第一行，截到 200 字）。
+const QUOTA_FAILURE = 'AI model request failed after 3 retries (4/4 attempts). Last error: failed to call AI model service (model-x): 429 Your token-plan 1-month quota has been exhausted. The quota will reset at 11-15…';
+const quotaCase = (name: string, project = 'feishu-core-clis') => ({ name, project, status: 'failed', failure: QUOTA_FAILURE });
+const otherCase = (name: string, failure: string, project = 'feishu-core-claude') => ({ name, project, status: 'failed', failure });
+const passedCase = (name: string, project = 'feishu-core-claude') => ({ name, project, status: 'success', failure: null });
+
+describe('Midscene failures the model quota explains (#2670)', () => {
+  const results = { modelCheck: 'success', dashboard: 'success', feishuQueue: 'success', feishu: 'failure', report: 'success' };
+
+  it('leaves a run quiet when every failed case failed on the quota', () => {
+    const verdict = assessFailures({ results, manifest: { cases: [quotaCase('Kimi'), quotaCase('Grok'), passedCase('Claude')] } });
+    expect(verdict).toMatchObject({ reasons: [], quotaOnly: true });
+    expect(verdict.quotaCases).toHaveLength(2);
+  });
+
+  it('leaves a run quiet when the Feishu job found the quota gone after waiting for the slot', () => {
+    expect(assessFailures({ results, feishuQuotaExhausted: true, manifest: null })).toMatchObject({ reasons: [], quotaOnly: true });
+  });
+
+  it('keeps real failures: other cases are listed without the quota rows, and the quota is noted', () => {
+    // The d2abdcf7f run: 23 quota failures, 4 timeouts, 1 replanning failure.
+    const cases = [
+      ...Array.from({ length: 23 }, (_, i) => quotaCase(`quota ${i}`)),
+      ...Array.from({ length: 4 }, (_, i) => otherCase(`slow ${i}`, 'Node "feishu.runScenario" timed out after 1800000ms.')),
+      otherCase('Claude basic bot flow', 'Replanned 20 times, exceeding the limit.'),
+    ];
+    const verdict = assessFailures({ results, manifest: { cases } });
+    expect(verdict.quotaOnly).toBe(false);
+    expect(verdict.reasons).toEqual(['Feishu live Midscene 失败']);
+    expect(verdict.cases.map((c: { name: string }) => c.name)).toEqual(['slow 0', 'slow 1', 'slow 2', 'slow 3', 'Claude basic bot flow']);
+    expect(verdict.quotaCases).toHaveLength(23);
+  });
+
+  it('does not let quota rows in one suite excuse another suite or the slot wait', () => {
+    const manifest = { cases: [quotaCase('Kimi')] };
+    // Dashboard failed without failed cases (a build step, say): a real failure.
+    expect(assessFailures({ results: { ...results, dashboard: 'failure' }, manifest }).reasons).toEqual(['Dashboard Midscene 失败']);
+    expect(assessFailures({ results: { ...results, feishuQueue: 'failure', feishu: 'skipped' }, manifest }).quotaOnly).toBe(false);
+    // Dashboard failed on the quota too: still quiet.
+    const both = { cases: [quotaCase('Kimi'), quotaCase('smoke', 'dashboard-smoke')] };
+    expect(assessFailures({ results: { ...results, dashboard: 'failure' }, manifest: both }).quotaOnly).toBe(true);
+    // A failed model check (not a quota: that job passes on a quota) is reported.
+    expect(failureReasons({ modelCheck: 'failure' })).toEqual(['Midscene 模型服务预检失败']);
+  });
+
+  it('notes the quota rows it left out of a comment', () => {
+    const body = commentBody({ mentions: [], reasons: ['Feishu live Midscene 失败'], cases: [], reportUrl: '', runUrl: 'u', range: 'r', pulls: [], self: null, quotaCases: 23, quotaReset: '11-15 16:00:00 UTC' });
+    expect(body).toContain('另有 23 个用例');
+    expect(body).toContain('11-15 16:00:00 UTC');
+  });
+});
+
+describe('notify() against a stubbed GitHub API', () => {
+  let dir: string;
+  let requests: Array<{ method: string; route: string }>;
+  let posted: string[];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'midscene-notify-'));
+    writeFileSync(join(dir, 'summary'), '');
+    requests = [];
+    posted = [];
+  });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    const route = url.replace('https://api.github.com/repos/o/r', '');
+    const method = init?.method ?? 'GET';
+    requests.push({ method, route });
+    if (route.startsWith('/actions/workflows/')) return json({ workflow_runs: [] });
+    if (route === '/commits/head/pulls') return json([pull(7, 'alice')]);
+    if (route.startsWith('/issues/7/comments') && method === 'GET') return json([]);
+    if (route === '/issues/7/comments' && method === 'POST') {
+      posted.push(JSON.parse(String(init?.body)).body);
+      return json({});
+    }
+    throw new Error(`unexpected ${method} ${route}`);
+  }) as unknown as typeof fetch;
+
+  function runWith(env: Record<string, string>, cases: unknown[]) {
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ cases }));
+    return notify({
+      env: {
+        GITHUB_REPOSITORY: 'o/r', GITHUB_REPOSITORY_OWNER: 'o', GITHUB_RUN_ID: '100', GITHUB_SHA: 'head', GITHUB_REF_NAME: 'master',
+        GITHUB_SERVER_URL: 'https://github.example', GITHUB_TOKEN: 't', GITHUB_STEP_SUMMARY: join(dir, 'summary'),
+        MANIFEST_PATH: join(dir, 'manifest.json'),
+        MODEL_CHECK_RESULT: 'success', DASHBOARD_RESULT: 'success', QUEUE_RESULT: 'success', FEISHU_RESULT: 'failure', REPORT_RESULT: 'success',
+        ...env,
+      },
+      fetchImpl,
+    });
+  }
+  const posts = () => requests.filter((request) => request.method === 'POST');
+
+  it('posts nothing and writes the summary line when the quota explains the failure', async () => {
+    await runWith({}, [quotaCase('Kimi'), quotaCase('Grok')]);
+    expect(requests).toEqual([]);
+    expect(readFileSync(join(dir, 'summary'), 'utf8')).toMatch(/额度耗尽.*不评论合入的 PR/);
+  });
+
+  it('posts nothing for a Feishu job that hit the quota at its own preflight', async () => {
+    await runWith({ FEISHU_QUOTA_EXHAUSTED: 'true', QUOTA_RESET: '11-15 16:00:00 UTC' }, []);
+    expect(posts()).toEqual([]);
+    expect(readFileSync(join(dir, 'summary'), 'utf8')).toContain('11-15 16:00:00 UTC');
+  });
+
+  it('still comments on the merged pull request for a real case failure', async () => {
+    await runWith({}, [otherCase('Claude basic bot flow', 'Replanned 20 times, exceeding the limit.'), quotaCase('Kimi')]);
+    expect(posts()).toEqual([{ method: 'POST', route: '/issues/7/comments' }]);
+    expect(posted[0]).toContain('Claude basic bot flow');
+    expect(posted[0]).not.toContain('| Kimi |');
+    expect(posted[0]).toContain('另有 1 个用例');
+    expect(readFileSync(join(dir, 'summary'), 'utf8')).toBe('');
   });
 });
