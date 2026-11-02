@@ -638,6 +638,11 @@ export class CodexBrowserBroker {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (this.browser === browser && this.browserGeneration === generation
+        // Error-text contract with the bundled Codex chrome plugin
+        // (scripts/browser-client.mjs): only these two prefixes prove the
+        // binding/transport is dead. The match is anchored at message start, so
+        // if the plugin ever wraps its errors with a leading context string,
+        // invalidation silently stops — update both sides together.
         && /^(?:Browser is not available:|native pipe closed before response\b)/i.test(message)) {
         // Rediscover on the next explicit call. Never replay an operation that
         // may have run, or discard a newer binding for an older call's error.
@@ -1165,6 +1170,12 @@ export class CodexBrowserBroker {
   }
 
   private async initialize(metadata?: Pick<DynamicToolCallParams, 'threadId' | 'turnId'>): Promise<BrowserBinding> {
+    // The runtime — its native transport and turn-ended hooks — is created at
+    // most once for this broker's lifetime (the app-server runner process).
+    // Reconnection only re-runs the plugin's browsers.get(family) discovery.
+    // A dead in-process runtime therefore has no in-band rebuild path: recovery
+    // relies on the plugin reconnecting its own transport, or the runner being
+    // replaced by a new process.
     if (!this.agent) {
       const modules = this.opts.modules ?? await loadBrowserPluginModules(
         resolveCodexBrowserPluginRoot(this.opts.pluginRoot),
