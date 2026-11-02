@@ -76,6 +76,16 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     retryOffer: o.retryOffer,
     action: o.retryOffer !== 'none' && o.retryTurnId ? 'retry_turn' : undefined,
   })),
+  // Recovery failure notices (ordinary-turn recovery settled failed) use their
+  // own card; echo what the assertions read (codes, retry affordance, turn).
+  buildRecoveryFailedCard: vi.fn((o: any) => JSON.stringify({
+    type: 'recovery-failed',
+    logicalTurnId: o.logicalTurnId,
+    errorCodes: o.errorCodes,
+    retry: o.retry?.kind,
+    action: o.retry?.kind === 'available' ? 'retry_recovery_turn'
+      : o.retry?.kind === 'continue_legacy' ? 'retry_turn' : undefined,
+  })),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -3550,12 +3560,15 @@ describe('ordinary Claude semantic recovery', () => {
     // there is no input to re-send. The raw error code must still be visible:
     // it is the only thing distinguishing a real provider fault from the
     // unconditional "cannot retry safely" fallback wording.
+    // Delivered through the recovery-notice outbox: a stable Feishu uuid rides
+    // along so a retried send after an unconfirmed one is de-duplicated.
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('provider_unexpected_eof'),
       'interactive',
       'app_test',
       'om_original',
+      expect.objectContaining({ uuid: expect.any(String) }),
     );
     expect(vi.mocked(sessionReply).mock.calls[0][1]).not.toContain('retry_turn');    expect(ds.agentAttention).toEqual(expect.objectContaining({
       kind: 'blocked',
@@ -4094,14 +4107,17 @@ describe('ordinary Claude semantic recovery', () => {
       'interactive',
       'app_test',
       'om_original',
+      expect.objectContaining({ uuid: expect.any(String) }),
     );
-    // The builder is stubbed in this suite, so assert on the policy decision it
-    // was handed: `caveated`, never `safe`. A safe offer here would render a
-    // verbatim-resend button for a turn whose progress is unknown.
+    // The builder is stubbed in this suite, so assert on the decision it was
+    // handed: this turn has no recorded human sender (no reply registry entry,
+    // no caller) and no lastFailedTurn, so there is nothing it may re-deliver
+    // or continue — never a button that replays a turn of unknown progress.
     const recoveryCard = JSON.parse(
       vi.mocked(sessionReply).mock.calls.find(c => c[2] === 'interactive')![1] as string,
     );
-    expect(recoveryCard.retryOffer).toBe('caveated');
+    expect(recoveryCard.retry).toBe('none');
+    expect(recoveryCard.action).toBeUndefined();
     expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
       status: 'attention_required',
       lastErrorCode: 'recovery_delivery_failed',
@@ -8161,6 +8177,8 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       continuationsStarted: 0,
       status: 'running',
       silentLogicalTurnIds: [SCHEDULED_TURN],
+      // The admitted input is frozen for a failure card's re-delivery.
+      retryInputs: { [SCHEDULED_TURN]: { cliInput: 'hourly task prompt' } },
     });
 
     worker.emit('message', {
@@ -8323,6 +8341,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       continuationsStarted: 0,
       status: 'running',
       queuedLogicalTurnIds: ['om_second'],
+      retryInputs: { om_first: { cliInput: 'first question' }, om_second: { cliInput: 'second question' } },
     });
 
     worker.emit('message', {
@@ -8334,6 +8353,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       currentTurnId: 'om_second',
       continuationsStarted: 0,
       status: 'running',
+      retryInputs: { om_second: { cliInput: 'second question' } },
     });
 
     worker.emit('message', {
@@ -8629,7 +8649,7 @@ describe('Codex capacity recovery', () => {
     expect(continuations(worker)).toHaveLength(2);
     expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'exhausted', continuationsStarted: 2 });
     expect(sessionReply).toHaveBeenCalledOnce();
-    expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
+    expect(sessionReply.mock.calls[0][1]).toContain('recovery-failed');
   });
 
   it('uses capacity advice for a Codex runtime with a custom display name', async () => {
