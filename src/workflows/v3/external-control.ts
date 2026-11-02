@@ -19,9 +19,11 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { fsyncFilesAndDirectorySync } from '../../utils/fs-durability.js';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
@@ -52,6 +54,7 @@ import {
   type V3ExternalAttempt,
 } from './external-attempt-ledger.js';
 import {
+  V3_EXTERNAL_CALL_TIMEOUT_MS,
   V3_EXTERNAL_ERROR_CODES,
   type V3ExternalAttemptRef,
   type V3ExternalNodeExecutor,
@@ -61,6 +64,7 @@ import { readJournal, withJournalMutationSync, type JournalMutation } from './jo
 import { ManifestValidationError, readAndValidateManifest } from './manifest.js';
 import { readRevisitRequest, validateResult } from './result-contract.js';
 import { planV3Revisit } from './revisit-plan.js';
+import { readRunEnvelope } from './run-envelope.js';
 import { materialize, type V3RunSnapshot } from './state.js';
 
 // ─── Current-attempt classification ─────────────────────────────────────────
@@ -90,11 +94,15 @@ export type V3CurrentExternalAttempt =
 /**
  * Decide whether `attemptId` is the current open external attempt of its node.
  * Pure over `events`; call it under the journal lock before appending.
+ *
+ * `expect.sessionId`: omit for engine-internal checks; transport callers pass
+ * the reporting session or `null` when they have none. Once the attempt is
+ * accepted, only the accepting session may act on it (`null` is refused).
  */
 export function classifyExternalAttempt(
   events: readonly StoredEvent[],
   attemptId: string,
-  expect: { instanceId?: string; sessionId?: string } = {},
+  expect: { instanceId?: string; sessionId?: string | null } = {},
 ): V3CurrentExternalAttempt {
   const attempt = foldV3ExternalAttempts(events).get(attemptId);
   if (!attempt) return { ok: false, reason: 'unknown-attempt' };
@@ -137,6 +145,17 @@ export function classifyExternalAttempt(
   return { ok: true, attempt, snap };
 }
 
+/** Caller-facing session expectation: an absent session is explicit `null`. */
+function callerExpectation(input: { instanceId?: string; sessionId?: string }): {
+  instanceId?: string;
+  sessionId: string | null;
+} {
+  return {
+    ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
+    sessionId: input.sessionId ?? null,
+  };
+}
+
 /** Transport identity of a prepared attempt (undefined before Prepared). */
 export function externalAttemptRef(
   runId: string,
@@ -156,25 +175,52 @@ export function externalAttemptRef(
   };
 }
 
+/** Settle `call` or reject after `timeoutMs` (engine-side bound on every
+ *  transport call). The timer never keeps the process alive. */
+export async function withExternalCallTimeout<T>(
+  call: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      call,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`external ${label} did not settle within ${timeoutMs}ms`)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Stop the target bot's turn for `attempt`. Best-effort and idempotent:
  *  failures are returned (never thrown) because the journal close, not the
- *  remote stop, is what invalidates the attempt. */
+ *  remote stop, is what invalidates the attempt. The request carries every
+ *  identity the handoff may have been delivered under — the idempotency keys
+ *  even when no Sent record exists yet. */
 export async function stopExternalAttempt(
   executor: V3ExternalNodeExecutor | undefined,
   runId: string,
   attempt: V3ExternalAttempt,
   reason: V3ExternalStopReason,
+  timeoutMs: number = V3_EXTERNAL_CALL_TIMEOUT_MS,
 ): Promise<{ ok: true } | { ok: false; error: unknown }> {
   const ref = externalAttemptRef(runId, attempt);
   // Before Prepared nothing can have been delivered, so there is no turn.
   if (!executor || !ref) return { ok: true };
   try {
-    await executor.stop({
+    await withExternalCallTimeout(Promise.resolve().then(() => executor.stop({
       ...ref,
       reason,
+      ...(attempt.idempotency ? { idempotency: attempt.idempotency } : {}),
       ...(attempt.handoffMessageId ? { handoffMessageId: attempt.handoffMessageId } : {}),
+      ...(attempt.nodeCardMessageId ? { nodeCardMessageId: attempt.nodeCardMessageId } : {}),
+      ...(attempt.threadId ? { threadId: attempt.threadId } : {}),
       ...(attempt.sessionId ? { sessionId: attempt.sessionId } : {}),
-    });
+    })), timeoutMs, 'stop');
     return { ok: true };
   } catch (error) {
     return { ok: false, error };
@@ -278,7 +324,7 @@ export function appendAcceptedLocked(
     ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
     sessionId: input.sessionId,
   });
-  if (!current.ok) return current;
+  if (!current.ok) return { ok: false, reason: current.reason };
   const { attempt } = current;
   if (attempt.phase === 'accepted') {
     return { ok: true, deadlineAt: attempt.deadlineAt!, alreadyAccepted: true };
@@ -306,11 +352,8 @@ export function recordExternalStalled(
 ): V3ExternalRecordOutcome {
   const at = input.at ?? clockOf(ctx)();
   return withJournalMutationSync(journalPathOf(runDir), ({ events, append }) => {
-    const current = classifyExternalAttempt(events, input.attemptId, {
-      ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
-      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
-    });
-    if (!current.ok) return current;
+    const current = classifyExternalAttempt(events, input.attemptId, callerExpectation(input));
+    if (!current.ok) return { ok: false, reason: current.reason };
     append({
       type: 'nodeStalled',
       nodeId: current.attempt.nodeId,
@@ -332,11 +375,8 @@ export function reportExternalBlocked(
 ): V3ExternalRecordOutcome {
   const message = input.reason.trim().slice(0, BOT_REPORT_MESSAGE_MAX_CHARS) || 'bot reported blocked';
   return withJournalMutationSync(journalPathOf(runDir), ({ events, append }) => {
-    const current = classifyExternalAttempt(events, input.attemptId, {
-      ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
-      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
-    });
-    if (!current.ok) return current;
+    const current = classifyExternalAttempt(events, input.attemptId, callerExpectation(input));
+    if (!current.ok) return { ok: false, reason: current.reason };
     append({
       type: 'nodeBlocked',
       nodeId: current.attempt.nodeId,
@@ -538,7 +578,6 @@ function stageSubmission(stageDir: string, files: StagedFile[], summary: string)
 type SubmissionVerdict =
   | { kind: 'success' }
   | { kind: 'revisit'; request: { toNodeId: string; reason?: string } }
-  | { kind: 'revisitBudgetExhausted'; toNodeId: string }
   | { kind: 'invalid'; problems: string[] };
 
 /** The same contract order as the in-process worker settle path. */
@@ -573,16 +612,243 @@ function moveAsideIfPresent(path: string, tag: string): void {
   renameSync(path, `${path}.uncommitted-${tag}`);
 }
 
+/** Durable install intent, written under the journal lock before the first
+ *  rename of a submission into the attempt directory and removed once the
+ *  verdict is journalled. Its presence after a crash means "installed (or
+ *  partly installed) but not recorded". */
+export const V3_SUBMISSION_INTENT_FILE = 'submission.intent.json';
+
+interface SubmissionIntent {
+  schemaVersion: 1;
+  attemptId: string;
+  stageTag: string;
+}
+
+function submissionIntentPath(attemptDir: string): string {
+  return join(attemptDir, V3_SUBMISSION_INTENT_FILE);
+}
+
+function writeSubmissionIntent(attemptDir: string, intent: SubmissionIntent): void {
+  const path = submissionIntentPath(attemptDir);
+  writeFileSync(path, `${JSON.stringify(intent)}\n`, { mode: 0o600 });
+  fsyncFilesAndDirectorySync(attemptDir, [path]);
+}
+
+function removeSubmissionIntent(attemptDir: string, stageTag: string): void {
+  rmSync(submissionIntentPath(attemptDir), { force: true });
+  rmSync(join(attemptDir, 'submissions', stageTag), { recursive: true, force: true });
+  try {
+    rmdirSync(join(attemptDir, 'submissions'));
+  } catch {
+    // Another staged submission may still be in flight; leave its parent.
+  }
+}
+
+function readSubmissionIntent(attemptDir: string): SubmissionIntent | 'corrupt' | undefined {
+  const path = submissionIntentPath(attemptDir);
+  if (!existsSync(path)) return undefined;
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as Partial<SubmissionIntent>;
+    if (raw.schemaVersion !== 1 || typeof raw.attemptId !== 'string' || typeof raw.stageTag !== 'string') {
+      return 'corrupt';
+    }
+    if (!/^[0-9a-f-]{36}$/.test(raw.stageTag)) return 'corrupt';
+    return { schemaVersion: 1, attemptId: raw.attemptId, stageTag: raw.stageTag };
+  } catch {
+    return 'corrupt';
+  }
+}
+
+/** Synchronous re-validation of an installed submission (the engine wrote
+ *  these bytes; this proves they are still exactly what the manifest says). */
+function verifyInstalledSubmissionSync(
+  manifestPath: string,
+  workDir: string,
+): { ok: true; manifest: Manifest } | { ok: false; problems: string[] } {
+  let manifest: Manifest;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as Manifest;
+  } catch (err) {
+    return { ok: false, problems: [`manifest unreadable: ${err instanceof Error ? err.message : String(err)}`] };
+  }
+  if (manifest?.schemaVersion !== MANIFEST_SCHEMA_VERSION || manifest.status !== 'ok' || !Array.isArray(manifest.files) || manifest.files.length === 0) {
+    return { ok: false, problems: ['manifest is not an engine-generated success manifest'] };
+  }
+  const root = resolve(workDir);
+  const problems: string[] = [];
+  for (const file of manifest.files) {
+    const target = resolve(root, file.path);
+    const rel = relative(root, target);
+    if (!rel || isAbsolute(rel) || rel.startsWith('..')) {
+      problems.push(`${file.path}: escapes the output directory`);
+      continue;
+    }
+    try {
+      if (!lstatSync(target).isFile()) {
+        problems.push(`${file.path}: not a regular file`);
+        continue;
+      }
+      const bytes = readFileSync(target);
+      if (bytes.length !== file.bytes || createHash('sha256').update(bytes).digest('hex') !== file.sha256) {
+        problems.push(`${file.path}: bytes do not match the manifest`);
+      }
+    } catch (err) {
+      problems.push(`${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return problems.length > 0 ? { ok: false, problems } : { ok: true, manifest };
+}
+
+/** Append the verdict of an installed submission for the current attempt.
+ *  Caller holds the journal lock and has already classified the attempt. */
+function appendInstalledVerdictLocked(input: {
+  runDir: string;
+  dag: V3Dag;
+  events: readonly StoredEvent[];
+  append: JournalMutation['append'];
+  attempt: V3ExternalAttempt;
+  verdict: Extract<SubmissionVerdict, { kind: 'success' | 'revisit' }>;
+  manifestPath: string;
+}): Extract<V3ExternalSubmissionOutcome, { ok: true }> {
+  const { attempt, append, events, verdict, manifestPath } = input;
+  const identity = {
+    nodeId: attempt.nodeId,
+    ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+    attemptId: attempt.attemptId,
+  };
+  if (verdict.kind === 'revisit') {
+    // Budget is judged against the locked journal (another revisit may have
+    // consumed it since staging).
+    const budget = revisitBudgetStatus([...events], attempt.nodeId, verdict.request.toNodeId);
+    if (!budget.ok) {
+      append({
+        type: 'nodeBlocked',
+        ...identity,
+        errorClass: 'resultInvalid',
+        errorCode: 'REVISIT_BUDGET_EXHAUSTED',
+        message: budget.detail,
+        revisitTo: verdict.request.toNodeId,
+      }, { durable: true });
+      return { ok: true, kind: 'blocked', errorCode: 'REVISIT_BUDGET_EXHAUSTED' };
+    }
+    const plan = planV3Revisit({
+      runDir: input.runDir,
+      dag: input.dag,
+      events,
+      nodeId: attempt.nodeId,
+      instanceId: attempt.instanceId ?? attempt.nodeId,
+      attemptId: attempt.attemptId,
+      request: verdict.request,
+      sourceManifestPath: manifestPath,
+    });
+    for (const event of plan.events) append(event);
+    // A revisit verdict is not a node settle: close the binding explicitly.
+    append({ type: 'nodeAttemptDrained', ...identity, reason: 'obsoleteAttempt' }, { durable: true });
+    return { ok: true, kind: 'revisit', toNodeId: verdict.request.toNodeId };
+  }
+  append({ type: 'nodeSucceeded', ...identity, manifestPath }, { durable: true });
+  return { ok: true, kind: 'succeeded', manifestPath };
+}
+
+/** True when the journal already records the verdict an install produced. */
+function installVerdictCommitted(events: readonly StoredEvent[], attemptId: string): boolean {
+  return events.some((event) =>
+    (event.type === 'nodeSucceeded' && event.attemptId === attemptId) ||
+    (event.type === 'nodeRevisitRequested' && event.attemptId === attemptId) ||
+    (event.type === 'nodeBlocked' && event.attemptId === attemptId && event.errorCode === 'REVISIT_BUDGET_EXHAUSTED'));
+}
+
+export type V3InstallRecovery =
+  | { kind: 'none' }
+  | { kind: 'committed'; outcome: Extract<V3ExternalSubmissionOutcome, { ok: true }> }
+  /** The intent was already journalled; only the marker was left behind. */
+  | { kind: 'cleaned' }
+  /** The attempt can no longer take it, or the bytes failed re-validation. */
+  | { kind: 'discarded' };
+
+/** Lock-held body of {@link settleExternalInstallIntent}. */
+function settleInstallIntentLocked(
+  runDir: string,
+  dag: V3Dag,
+  events: readonly StoredEvent[],
+  append: JournalMutation['append'],
+  attemptId: string,
+): V3InstallRecovery {
+  const attemptDir = safeExternalAttemptDir(runDir, attemptId);
+  const intent = readSubmissionIntent(attemptDir);
+  if (intent === undefined) return { kind: 'none' };
+  if (intent === 'corrupt' || intent.attemptId !== attemptId) {
+    rmSync(submissionIntentPath(attemptDir), { force: true });
+    return { kind: 'discarded' };
+  }
+  const workDir = join(attemptDir, 'work');
+  const manifestPath = join(attemptDir, 'manifest.json');
+  const stageDir = join(attemptDir, 'submissions', intent.stageTag);
+  const discard = (): V3InstallRecovery => {
+    if (!installVerdictCommitted(events, attemptId)) {
+      moveAsideIfPresent(workDir, intent.stageTag);
+      moveAsideIfPresent(manifestPath, intent.stageTag);
+    }
+    removeSubmissionIntent(attemptDir, intent.stageTag);
+    return { kind: 'discarded' };
+  };
+  if (installVerdictCommitted(events, attemptId)) {
+    removeSubmissionIntent(attemptDir, intent.stageTag);
+    return { kind: 'cleaned' };
+  }
+  const current = classifyExternalAttempt(events, attemptId);
+  if (!current.ok) return discard();
+  const node = externalAttemptNode(dag, current.attempt);
+  if (!node || !isGoalNode(node)) return discard();
+  // Finish whatever part of the install the crash interrupted.
+  if (existsSync(join(stageDir, 'work'))) {
+    moveAsideIfPresent(workDir, intent.stageTag);
+    renameSync(join(stageDir, 'work'), workDir);
+  }
+  if (existsSync(join(stageDir, 'manifest.json'))) renameSync(join(stageDir, 'manifest.json'), manifestPath);
+  const verified = verifyInstalledSubmissionSync(manifestPath, workDir);
+  if (!verified.ok) return discard();
+  const verdict = judgeStagedSubmission(node, verified.manifest, workDir);
+  if (verdict.kind === 'invalid') return discard();
+  const outcome = appendInstalledVerdictLocked({
+    runDir, dag, events, append, attempt: current.attempt, verdict, manifestPath,
+  });
+  removeSubmissionIntent(attemptDir, intent.stageTag);
+  return { kind: 'committed', outcome };
+}
+
+/**
+ * Recovery for design §9.5 row 4 ("提交区有文件，journal 里没有结果"): a
+ * submission whose install intent survived a crash is re-validated from the
+ * installed bytes and committed if its attempt is still the current one;
+ * otherwise the uncommitted install is moved aside. The staging directory is
+ * removed either way.
+ */
+export function settleExternalInstallIntent(
+  runDir: string,
+  dag: V3Dag,
+  attemptId: string,
+): V3InstallRecovery {
+  if (!existsSync(submissionIntentPath(safeExternalAttemptDir(runDir, attemptId)))) return { kind: 'none' };
+  return withJournalMutationSync(journalPathOf(runDir), ({ events, append }) =>
+    settleInstallIntentLocked(runDir, dag, events, append, attemptId));
+}
+
+/** True when a crash-left install intent exists for the attempt. */
+export function hasExternalInstallIntent(runDir: string, attemptId: string): boolean {
+  return existsSync(submissionIntentPath(safeExternalAttemptDir(runDir, attemptId)));
+}
+
 /**
  * Ingest a structured submission for the CURRENT open attempt (design §7.2
  * step 4). The engine writes the files into a private staging directory,
  * generates `manifest.json` itself (bytes + sha256 computed here), runs the
  * normal manifest validation plus the node's `resultSchema` / `outputs`
  * contract, and only then — under the journal lock, re-checking that the
- * attempt is still current — installs `work/` + `manifest.json` into the
- * attempt directory and appends the verdict. Contract problems are returned
- * as `invalid` without touching the journal: the node stays running and the
- * bot may resubmit within the same turn.
+ * attempt is still current — records a durable install intent, installs
+ * `work/` + `manifest.json` into the attempt directory and appends the
+ * verdict. Contract problems are returned as `invalid` without touching the
+ * journal: the node stays running and the bot may resubmit in the same turn.
  */
 export async function ingestExternalSubmission(
   runDir: string,
@@ -590,10 +856,7 @@ export async function ingestExternalSubmission(
   ctx?: V3ExternalEngineContext,
 ): Promise<V3ExternalSubmissionOutcome> {
   const journalPath = journalPathOf(runDir);
-  const expect = {
-    ...(submission.instanceId !== undefined ? { instanceId: submission.instanceId } : {}),
-    ...(submission.sessionId !== undefined ? { sessionId: submission.sessionId } : {}),
-  };
+  const expect = callerExpectation(submission);
   // Cheap pre-check so a late/duplicate submission never stages files.
   const pre = classifyExternalAttempt(readJournal(journalPath), submission.attemptId, expect);
   if (!pre.ok) return { ok: false, reason: pre.reason };
@@ -609,7 +872,15 @@ export async function ingestExternalSubmission(
   const stageTag = randomUUID();
   const stageDir = join(attemptDir, 'submissions', stageTag);
   try {
-    const stagedManifestPath = stageSubmission(stageDir, planned.files, submission.summary);
+    let stagedManifestPath: string;
+    try {
+      stagedManifestPath = stageSubmission(stageDir, planned.files, submission.summary);
+    } catch (err) {
+      // Closed-attempt cleanup may remove `submissions/` under a late caller.
+      const latest = classifyExternalAttempt(readJournal(journalPath), submission.attemptId, expect);
+      if (!latest.ok) return { ok: false, reason: latest.reason };
+      throw err;
+    }
     const stagedWorkDir = join(stageDir, 'work');
     let manifest: Manifest;
     try {
@@ -623,63 +894,37 @@ export async function ingestExternalSubmission(
 
     const manifestPath = join(attemptDir, 'manifest.json');
     return withJournalMutationSync(journalPath, ({ events, append }): V3ExternalSubmissionOutcome => {
+      // A crash-left install for this attempt is settled first: if it
+      // commits, this later submission is the duplicate.
+      const recovered = settleInstallIntentLocked(runDir, dag, events, append, submission.attemptId);
+      if (recovered.kind === 'committed') {
+        return {
+          ok: false,
+          reason: recovered.outcome.kind === 'succeeded' ? 'already-succeeded'
+            : recovered.outcome.kind === 'revisit' ? 'superseded'
+            : 'closed',
+        };
+      }
       const current = classifyExternalAttempt(events, submission.attemptId, expect);
       if (!current.ok) return { ok: false, reason: current.reason };
-      const { attempt } = current;
-      const identity = {
-        nodeId: attempt.nodeId,
-        ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
-        attemptId: attempt.attemptId,
-      };
 
-      // Budget is judged against the locked journal (another revisit may
-      // have consumed it since staging).
-      let effective: SubmissionVerdict = verdict;
-      if (verdict.kind === 'revisit') {
-        const budget = revisitBudgetStatus([...events], attempt.nodeId, verdict.request.toNodeId);
-        if (!budget.ok) effective = { kind: 'revisitBudgetExhausted', toNodeId: verdict.request.toNodeId };
-      }
-
-      // Install: the winner's bytes become the attempt's work/ + manifest.
+      // Durable intent first: a crash after any rename below is recoverable.
+      writeSubmissionIntent(attemptDir, { schemaVersion: 1, attemptId: submission.attemptId, stageTag });
       moveAsideIfPresent(join(attemptDir, 'work'), stageTag);
       renameSync(stagedWorkDir, join(attemptDir, 'work'));
       renameSync(stagedManifestPath, manifestPath);
-
-      if (effective.kind === 'revisitBudgetExhausted') {
-        const budget = revisitBudgetStatus([...events], attempt.nodeId, effective.toNodeId);
-        append({
-          type: 'nodeBlocked',
-          ...identity,
-          errorClass: 'resultInvalid',
-          errorCode: 'REVISIT_BUDGET_EXHAUSTED',
-          message: budget.ok ? 'revisit budget exhausted' : budget.detail,
-          revisitTo: effective.toNodeId,
-        }, { durable: true });
-        return { ok: true, kind: 'blocked', errorCode: 'REVISIT_BUDGET_EXHAUSTED' };
-      }
-      if (effective.kind === 'revisit') {
-        const plan = planV3Revisit({
-          runDir,
-          dag,
-          events,
-          nodeId: attempt.nodeId,
-          instanceId: attempt.instanceId ?? attempt.nodeId,
-          attemptId: attempt.attemptId,
-          request: effective.request,
-          sourceManifestPath: manifestPath,
-        });
-        for (const event of plan.events) append(event);
-        // A revisit verdict is not a node settle: close the binding explicitly.
-        append({ type: 'nodeAttemptDrained', ...identity, reason: 'obsoleteAttempt' }, { durable: true });
-        return { ok: true, kind: 'revisit', toNodeId: effective.request.toNodeId };
-      }
-      append({ type: 'nodeSucceeded', ...identity, manifestPath }, { durable: true });
-      return { ok: true, kind: 'succeeded', manifestPath };
+      const outcome = appendInstalledVerdictLocked({
+        runDir, dag, events, append, attempt: current.attempt, verdict, manifestPath,
+      });
+      removeSubmissionIntent(attemptDir, stageTag);
+      return outcome;
     });
   } finally {
-    // Losers and invalid submissions leave nothing behind; the winner's
-    // staged work/ + manifest were renamed out already.
-    rmSync(stageDir, { recursive: true, force: true });
+    // Losers and invalid submissions leave nothing behind. A crash-left
+    // intent keeps its own staging dir until recovery settles it.
+    if (!existsSync(submissionIntentPath(attemptDir))) {
+      rmSync(stageDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -707,8 +952,20 @@ export type V3ReassignOutcome =
         | 'same-bot'
         | 'not-reassignable'
         | 'stale-attempt'
-        | 'revise-workflow-required';
+        | 'revise-workflow-required'
+        | 'not-bot-run';
     };
+
+/** `run.json` is authoritative when present; envelope-less (dev/test) runs
+ *  are bot-executed only if their runtime stamped `runStarted.nodeExecutor`. */
+function isBotExecutedRun(runDir: string, events: readonly StoredEvent[]): boolean {
+  const envelope = readRunEnvelope(runDir);
+  if (envelope.kind === 'ok') {
+    return 'nodeExecutor' in envelope.envelope && envelope.envelope.nodeExecutor === 'bot';
+  }
+  if (envelope.kind === 'invalid') return false;
+  return events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot');
+}
 
 export interface V3ReassignContext extends V3ExternalEngineContext {
   /** Frozen selector → snapshot (the run's bot set). Defaults to
@@ -804,6 +1061,9 @@ export async function reassignNode(
 ): Promise<V3ReassignOutcome> {
   const journalPath = journalPathOf(runDir);
   if (!existsSync(journalPath)) return { kind: 'rejected', reason: 'missing' };
+  // Only bot-executed runs read assignments; elsewhere a reassignment would
+  // be recorded while the original worker keeps running.
+  if (!isBotExecutedRun(runDir, readJournal(journalPath))) return { kind: 'rejected', reason: 'not-bot-run' };
   const dag = dagFor(runDir, ctx);
   const snapshots = botSnapshotsFor(runDir, ctx);
   const botSet = new Set([...snapshots.values()].map((snapshot) => snapshot.larkAppId));

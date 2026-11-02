@@ -398,7 +398,9 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         break;
       case 'nodeReassigned': {
         assignments.set(e.nodeId, e.to);
-        if (!e.attemptId || runStatus !== 'running') break;
+        // Like nodeAttemptDrained: a blocked run can still hold a lingering
+        // binding (older/raced history); closing it must requeue its node.
+        if (!e.attemptId || (runStatus !== 'running' && runStatus !== 'blocked')) break;
         const key = e.instanceId ?? e.nodeId;
         if (attempts.get(key) !== e.attemptId) break;
         // Reassignment of the in-flight attempt closes it; the node returns to

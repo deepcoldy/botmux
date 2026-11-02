@@ -1489,9 +1489,10 @@ export interface V3GateRunnerDeps {
   externalExecutor?: V3DaemonRunDeps['externalExecutor'];
   now?: V3DaemonRunDeps['now'];
   onExternalError?: V3DaemonRunDeps['onExternalError'];
-  /** Arm a re-drive at an engine deadline (`awaitingExternal.wakeAt`). The
-   *  default uses an unref'd timer; replacing the previous timer per run. */
-  scheduleWake?: (runId: string, wakeAt: number, wake: () => void) => void;
+  /** Arm a re-drive at an engine deadline (`awaitingExternal.wakeAt`), or
+   *  cancel the run's pending wake when `wakeAt` is undefined (any other
+   *  outcome). The default keeps one unref'd timer per run. */
+  scheduleWake?: (runId: string, wakeAt: number | undefined, wake: () => void) => void;
 }
 
 /**
@@ -1506,10 +1507,38 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
   const rerunRequested = new Set<string>();
   const activeControllers = new Map<string, AbortController>();
   const wakeTimers = new Map<string, NodeJS.Timeout>();
+  // Cards already posted by this process, per run. Every drive re-derives
+  // what to show from the journal, and bot-executed runs are re-driven on
+  // every acceptance / submission / deadline: without this one gate or
+  // blocked node would be announced once per drive.
+  const postedCards = new Map<string, Set<string>>();
+  async function postOnce(runId: string, key: string, post: () => Promise<void>): Promise<void> {
+    const seen = postedCards.get(runId) ?? new Set<string>();
+    if (seen.has(key)) return;
+    await post();
+    seen.add(key);
+    postedCards.set(runId, seen);
+  }
+  const postGateCardOnce = (binding: RunChatBinding, gate: V3PendingGate, runId: string) =>
+    postOnce(runId, `gate:${gate.waitId}`, () => deps.postCard(binding, gate, runId));
+  const postBlockedCardOnce = deps.postBlockedCard
+    ? (binding: RunChatBinding, info: V3BlockedInfo, runId: string) =>
+        postOnce(runId, `blocked:${info.nodeId}:${info.attemptId}`, () => deps.postBlockedCard!(binding, info, runId))
+    : undefined;
+  const postLoopGrantCardOnce = deps.postLoopGrantCard
+    ? (binding: RunChatBinding, info: V3LoopExhaustedInfo, runId: string) =>
+        postOnce(runId, `loop:${info.loopId}:${info.iteration}`, () => deps.postLoopGrantCard!(binding, info, runId))
+    : undefined;
+  const postRevisitGrantCardOnce = deps.postRevisitGrantCard
+    ? (binding: RunChatBinding, info: V3RevisitBudgetBlockedInfo, runId: string) =>
+        postOnce(runId, `revisit:${info.sourceNodeId}:${info.attemptId}`, () => deps.postRevisitGrantCard!(binding, info, runId))
+    : undefined;
   const now = deps.now ?? Date.now;
-  const scheduleWake = deps.scheduleWake ?? ((runId: string, wakeAt: number, wake: () => void): void => {
+  const scheduleWake = deps.scheduleWake ?? ((runId: string, wakeAt: number | undefined, wake: () => void): void => {
     const prior = wakeTimers.get(runId);
     if (prior) clearTimeout(prior);
+    wakeTimers.delete(runId);
+    if (wakeAt === undefined) return;
     const timer = setTimeout(() => {
       if (wakeTimers.get(runId) === timer) wakeTimers.delete(runId);
       wake();
@@ -1576,17 +1605,23 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
                     ...(deps.externalExecutor ? { externalExecutor: deps.externalExecutor } : {}),
                     ...(deps.now ? { now: deps.now } : {}),
                     ...(deps.onExternalError ? { onExternalError: deps.onExternalError } : {}),
-                    postGateCard: (binding, gate, rid) => deps.postCard(binding, gate, rid),
-                    postBlockedCard: deps.postBlockedCard,
-                    postLoopGrantCard: deps.postLoopGrantCard,
-                    postRevisitGrantCard: deps.postRevisitGrantCard,
+                    postGateCard: postGateCardOnce,
+                    postBlockedCard: postBlockedCardOnce,
+                    postLoopGrantCard: postLoopGrantCardOnce,
+                    postRevisitGrantCard: postRevisitGrantCardOnce,
                     onTerminal: (rid, terminal, binding) =>
                       deps.notifyTerminal ? deps.notifyTerminal(binding, rid, terminal) : Promise.resolve(),
                   });
                   // External attempts wait on disk; deadlines need a re-drive
-                  // even when no settle event arrives.
-                  if (outcome.reason === 'awaitingExternal' && outcome.wakeAt !== undefined) {
-                    scheduleWake(runId, outcome.wakeAt, () => driveDetached(runId));
+                  // even when no settle event arrives. Any other outcome
+                  // cancels a stale wake (it would only re-announce the run).
+                  scheduleWake(
+                    runId,
+                    outcome.reason === 'awaitingExternal' ? outcome.wakeAt : undefined,
+                    () => driveDetached(runId),
+                  );
+                  if (outcome.reason === 'terminal' && outcome.runStatus !== 'blocked') {
+                    postedCards.delete(runId);
                   }
                 } while (currentRunStatus(baseDir, runId) === 'cancelling');
               }, { maxWaitMs: V3_DRIVE_LEASE_MAX_WAIT_MS });
@@ -1649,29 +1684,29 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
         if (!rec.resume) {
           for (const gate of rec.repost) {
             try {
-              await deps.postCard(rec.binding, gate, rec.runId);
+              await postGateCardOnce(rec.binding, gate, rec.runId);
             } catch (err) {
               deps.onError?.(rec.runId, err);
             }
           }
         }
-        if (rec.repostBlocked && deps.postBlockedCard) {
+        if (rec.repostBlocked && postBlockedCardOnce) {
           try {
-            await deps.postBlockedCard(rec.binding, rec.repostBlocked, rec.runId);
+            await postBlockedCardOnce(rec.binding, rec.repostBlocked, rec.runId);
           } catch (err) {
             deps.onError?.(rec.runId, err);
           }
         }
-        if (rec.repostLoopGrant && deps.postLoopGrantCard) {
+        if (rec.repostLoopGrant && postLoopGrantCardOnce) {
           try {
-            await deps.postLoopGrantCard(rec.binding, rec.repostLoopGrant, rec.runId);
+            await postLoopGrantCardOnce(rec.binding, rec.repostLoopGrant, rec.runId);
           } catch (err) {
             deps.onError?.(rec.runId, err);
           }
         }
-        if (rec.repostRevisitGrant && deps.postRevisitGrantCard) {
+        if (rec.repostRevisitGrant && postRevisitGrantCardOnce) {
           try {
-            await deps.postRevisitGrantCard(rec.binding, rec.repostRevisitGrant, rec.runId);
+            await postRevisitGrantCardOnce(rec.binding, rec.repostRevisitGrant, rec.runId);
           } catch (err) {
             deps.onError?.(rec.runId, err);
           }

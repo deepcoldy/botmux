@@ -18,7 +18,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { join, dirname, relative, isAbsolute, resolve, sep } from 'node:path';
 import { computeInputHash } from '../../utils/canonical-input-hash.js';
 
@@ -99,6 +99,7 @@ import {
 } from './external-attempt-ledger.js';
 import {
   V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS,
+  V3_EXTERNAL_CALL_TIMEOUT_MS,
   V3_EXTERNAL_ERROR_CODES,
   V3_HANDOFF_IDEMPOTENCY_WINDOW_MS,
   type V3ExternalDispatchRequest,
@@ -109,7 +110,10 @@ import {
   appendAcceptedLocked,
   classifyExternalAttempt,
   externalAttemptRef,
+  hasExternalInstallIntent,
+  settleExternalInstallIntent,
   stopExternalAttempt,
+  withExternalCallTimeout,
 } from './external-control.js';
 import {
   prepareV3HostInputArtifact,
@@ -425,6 +429,8 @@ export interface V3RuntimeOptions {
   nodeExecutor?: 'bot';
   /** Acceptance window for a sent handoff (engine clock). */
   externalAcceptTimeoutMs?: number;
+  /** Wall-clock bound on each external transport call. */
+  externalCallTimeoutMs?: number;
 }
 
 export interface V3PendingGate {
@@ -519,6 +525,18 @@ function assertOrCreateFrozenJson(
 
 /** Back-off before a same-key re-send after an unknown dispatch failure. */
 const HANDOFF_RESEND_BACKOFF_MS = 30_000;
+/** Back-off between acceptance probes whose outcome was unknown. */
+const PROBE_RETRY_BACKOFF_MS = 30_000;
+/** How long acceptance may stay unknown past its deadline before the node
+ *  blocks HANDOFF_UNCERTAIN for a human (it is never assumed "not accepted"). */
+const PROBE_UNCERTAIN_AFTER_MS = 10 * 60_000;
+
+/**
+ * Unknown-probe bookkeeping, process-wide so it spans the many short drives
+ * of one daemon (each drive is a fresh runtime). A restart starts a fresh
+ * grace period, which can only delay — never wrongly cause — a block.
+ */
+const probeFailures = new Map<string, { firstFailedAt: number; retryAt: number }>();
 
 // ─── Main loop ───────────────────────────────────────────────────────────
 
@@ -561,6 +579,11 @@ export async function runWorkflow(
     throw new Error('v3 runtime: externalAcceptTimeoutMs must be a non-negative safe integer');
   }
   const clock = (): number => deps.now?.() ?? Date.now();
+  const externalCallTimeoutMs = opts.externalCallTimeoutMs ?? V3_EXTERNAL_CALL_TIMEOUT_MS;
+  if (!Number.isSafeInteger(externalCallTimeoutMs) || externalCallTimeoutMs < 1) {
+    throw new Error('v3 runtime: externalCallTimeoutMs must be a positive safe integer');
+  }
+  const probeKey = (attemptId: string): string => `${runDir}\0${attemptId}`;
 
   const nodesById = new Map(dag.nodes.map((n) => [n.id, n]));
 
@@ -625,7 +648,11 @@ export async function runWorkflow(
 
   // First run only: stamp runStarted (idempotent on resume).
   if (readJournal(journalPath).length === 0) {
-    appendEvent(journalPath, { type: 'runStarted', runId: dag.runId });
+    appendEvent(journalPath, {
+      type: 'runStarted',
+      runId: dag.runId,
+      ...(externalMode ? { nodeExecutor: 'bot' as const } : {}),
+    });
   }
 
   // In-flight bookkeeping.  Work uses the nodeId as the key; gates use
@@ -754,6 +781,8 @@ export async function runWorkflow(
       if (!settled) await new Promise((resolve) => setTimeout(resolve, 1_000));
       continue;
     }
+
+    if (settleExternalLeftovers(events)) continue;
 
     if (snap.runStatus === 'cancelling' && snap.cancelRequestId) {
       // Stop active workers first. Pending/gated nodes can be neutral-cancelled
@@ -2425,7 +2454,7 @@ export async function runWorkflow(
   }
 
   async function stopExternal(attempt: V3ExternalAttempt, reason: V3ExternalStopReason): Promise<void> {
-    const stopped = await stopExternalAttempt(externalExecutor, dag.runId, attempt, reason);
+    const stopped = await stopExternalAttempt(externalExecutor, dag.runId, attempt, reason, externalCallTimeoutMs);
     if (!stopped.ok) reportExternalError(stopped.error, attempt.attemptId, 'stop');
   }
 
@@ -2574,7 +2603,16 @@ export async function runWorkflow(
     const controller = new AbortController();
     handoffControllers.set(attempt.attemptId, controller);
     const p = Promise.resolve()
-      .then(() => executor.dispatch(buildExternalDispatchRequest(attempt, redispatch, controller.signal)))
+      .then(() => withExternalCallTimeout(
+        Promise.resolve().then(() => executor.dispatch(buildExternalDispatchRequest(attempt, redispatch, controller.signal))),
+        externalCallTimeoutMs,
+        'dispatch',
+      ).catch((err: unknown) => {
+        // A hung or failed send is an unknown outcome: tell the transport to
+        // give up, then re-send later with the same keys.
+        if (!controller.signal.aborted) controller.abort(err);
+        throw err;
+      }))
       .then(async (outcome) => {
         handoffRetryAt.delete(attempt.attemptId);
         if (outcome.kind === 'rejected') {
@@ -2639,8 +2677,11 @@ export async function runWorkflow(
     stopReason: V3ExternalStopReason,
     verdict: { errorClass: V3ErrorClass; errorCode: string; message: string },
   ): Promise<boolean> {
+    // A crash-left install is settled (next tick) before any deadline close.
+    if (hasExternalInstallIntent(runDir, attempt.attemptId)) return true;
     await stopExternal(attempt, stopReason);
     return withJournalMutationSync(journalPath, ({ events, append }) => {
+      if (hasExternalInstallIntent(runDir, attempt.attemptId)) return true;
       const current = classifyExternalAttempt(events, attempt.attemptId);
       if (!current.ok) return false;
       append({
@@ -2656,18 +2697,32 @@ export async function runWorkflow(
 
   async function probeExternalAcceptance(
     attempt: V3ExternalAttempt,
-  ): Promise<{ sessionId: string; acceptedAt?: number } | undefined> {
+  ): Promise<
+    | { status: 'accepted'; sessionId: string; acceptedAt?: number }
+    | { status: 'notAccepted' }
+    | { status: 'unknown' }
+  > {
     const ref = externalAttemptRef(dag.runId, attempt);
-    if (!externalExecutor || !ref || !attempt.handoffMessageId) return undefined;
+    const executor = externalExecutor;
+    if (!executor || !ref || !attempt.handoffMessageId) return { status: 'unknown' };
+    const handoffMessageId = attempt.handoffMessageId;
     try {
-      const probe = await externalExecutor.probeAcceptance({ ...ref, handoffMessageId: attempt.handoffMessageId });
+      const probe = await withExternalCallTimeout(
+        Promise.resolve().then(() => executor.probeAcceptance({ ...ref, handoffMessageId })),
+        externalCallTimeoutMs,
+        'probe',
+      );
       return probe.status === 'accepted'
-        ? { sessionId: probe.sessionId, ...(probe.acceptedAt !== undefined ? { acceptedAt: probe.acceptedAt } : {}) }
-        : undefined;
+        ? {
+            status: 'accepted',
+            sessionId: probe.sessionId,
+            ...(probe.acceptedAt !== undefined ? { acceptedAt: probe.acceptedAt } : {}),
+          }
+        : { status: 'notAccepted' };
     } catch (err) {
-      // Unknown is not "accepted"; before the deadline we simply keep waiting.
+      // Unknown is neither "accepted" nor "not accepted".
       reportExternalError(err, attempt.attemptId, 'probe');
-      return undefined;
+      return { status: 'unknown' };
     }
   }
 
@@ -2707,19 +2762,46 @@ export async function runWorkflow(
         }
       } else if (attempt.phase === 'sent') {
         const due = now >= attempt.acceptDeadlineAt!;
-        if (!acceptanceObserved.has(attempt.attemptId) || due) {
-          const accepted = await probeExternalAcceptance(attempt);
-          acceptanceObserved.add(attempt.attemptId);
+        const key = probeKey(attempt.attemptId);
+        const failure = probeFailures.get(key);
+        const probeDue = failure
+          ? now >= failure.retryAt
+          : !acceptanceObserved.has(attempt.attemptId) || due;
+        if (probeDue) {
+          const probe = await probeExternalAcceptance(attempt);
           progressed = true;
-          if (accepted) {
-            withJournalMutationSync(journalPath, ({ events: latest, append }) =>
-              appendAcceptedLocked(latest, append, dag, { attemptId: attempt.attemptId, ...accepted }, clock()));
-          } else if (due) {
-            await blockExternalAttempt(attempt, 'notAccepted', {
-              errorClass: 'workerError',
-              errorCode: V3_EXTERNAL_ERROR_CODES.HANDOFF_NOT_ACCEPTED,
-              message: 'the target bot did not accept the handoff before the acceptance deadline',
-            });
+          if (probe.status === 'unknown') {
+            // Back off and ask again; only a persistently unknown answer past
+            // the deadline needs a human (HANDOFF_UNCERTAIN).
+            const firstFailedAt = failure?.firstFailedAt ?? now;
+            if (due && now - firstFailedAt >= PROBE_UNCERTAIN_AFTER_MS) {
+              probeFailures.delete(key);
+              await blockExternalAttempt(attempt, 'uncertain', {
+                errorClass: 'workerError',
+                errorCode: V3_EXTERNAL_ERROR_CODES.HANDOFF_UNCERTAIN,
+                message: 'whether the target bot accepted the handoff could not be confirmed; check the chat before retrying',
+              });
+            } else {
+              probeFailures.set(key, { firstFailedAt, retryAt: now + PROBE_RETRY_BACKOFF_MS });
+            }
+          } else {
+            probeFailures.delete(key);
+            acceptanceObserved.add(attempt.attemptId);
+            if (probe.status === 'accepted') {
+              const { sessionId, acceptedAt } = probe;
+              withJournalMutationSync(journalPath, ({ events: latest, append }) =>
+                appendAcceptedLocked(latest, append, dag, {
+                  attemptId: attempt.attemptId,
+                  sessionId,
+                  ...(acceptedAt !== undefined ? { acceptedAt } : {}),
+                }, clock()));
+            } else if (due) {
+              await blockExternalAttempt(attempt, 'notAccepted', {
+                errorClass: 'workerError',
+                errorCode: V3_EXTERNAL_ERROR_CODES.HANDOFF_NOT_ACCEPTED,
+                message: 'the target bot did not accept the handoff before the acceptance deadline',
+              });
+            }
           }
         }
       } else if (now >= attempt.deadlineAt!) {
@@ -2729,6 +2811,26 @@ export async function runWorkflow(
           message: 'the node did not submit a valid result before its timeout',
         });
         progressed = true;
+      }
+    }
+    return progressed;
+  }
+
+  /**
+   * §9.5 row 4: an installed-but-unrecorded submission (crash between the
+   * install and its journal append) is re-validated and committed while its
+   * attempt is current — before any deadline can discard it — and otherwise
+   * set aside. Runs before cancellation/terminal handling so every run state
+   * converges. Also drops staging leftovers of closed attempts.
+   */
+  function settleExternalLeftovers(events: StoredEvent[]): boolean {
+    let progressed = false;
+    for (const attempt of foldV3ExternalAttempts(events).values()) {
+      if (hasExternalInstallIntent(runDir, attempt.attemptId)) {
+        if (settleExternalInstallIntent(runDir, dag, attempt.attemptId).kind !== 'none') progressed = true;
+      } else if (attempt.closed) {
+        // No submission can land on a closed attempt any more.
+        rmSync(join(safeAttemptDirFromId(attempt.attemptId), 'submissions'), { recursive: true, force: true });
       }
     }
     return progressed;
@@ -2793,6 +2895,16 @@ export async function runWorkflow(
     }
   }
 
+  /** A sent attempt needs attention at its acceptance deadline, or at the
+   *  next probe retry while acceptance is unknown. */
+  function sentWakeAt(attempt: V3ExternalAttempt, now: number): number {
+    const failure = probeFailures.get(probeKey(attempt.attemptId));
+    if (!failure) return attempt.acceptDeadlineAt!;
+    return attempt.acceptDeadlineAt! > now
+      ? Math.min(attempt.acceptDeadlineAt!, failure.retryAt)
+      : failure.retryAt;
+  }
+
   function awaitingExternalOutcome(
     open: readonly V3ExternalAttempt[],
     pendingWaits: V3PendingGate[],
@@ -2803,7 +2915,7 @@ export async function runWorkflow(
         attempt.phase === 'dispatched' ? now
         : attempt.phase === 'prepared'
           ? Math.min(handoffRetryAt.get(attempt.attemptId) ?? now, attempt.preparedAt! + V3_HANDOFF_IDEMPOTENCY_WINDOW_MS)
-        : attempt.phase === 'sent' ? attempt.acceptDeadlineAt
+        : attempt.phase === 'sent' ? sentWakeAt(attempt, now)
         : attempt.deadlineAt;
       return {
         nodeId: attempt.nodeId,

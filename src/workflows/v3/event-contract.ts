@@ -65,7 +65,12 @@ export interface V3HandoffIdempotency {
 }
 
 export type V3Event =
-  | { type: 'runStarted'; runId: string }
+  | {
+      type: 'runStarted';
+      runId: string;
+      /** Stamped by a runtime executing goal nodes through bot sessions. */
+      nodeExecutor?: 'bot';
+    }
   | {
       type: 'nodeDispatched';
       nodeId: string;

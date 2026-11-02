@@ -47,11 +47,18 @@ export type V3HandoffRejectionCode =
 
 /**
  * How long a prepared-but-unconfirmed handoff may be re-sent with the same
- * idempotency keys. Lark de-duplicates message `uuid`s for one hour; measuring
- * from `preparedAt` (which precedes every send) keeps every re-send inside the
- * de-duplication window of the original.
+ * idempotency keys. Lark de-duplicates message `uuid`s for one hour. Measuring
+ * from `preparedAt` (which precedes every send) already keeps re-sends inside
+ * the original's window; the engine additionally stops re-sending 10 minutes
+ * early (50 min) to absorb clock skew between this host and Lark and the time
+ * an in-flight send can take (bounded by {@link V3_EXTERNAL_CALL_TIMEOUT_MS}).
  */
-export const V3_HANDOFF_IDEMPOTENCY_WINDOW_MS = 60 * 60 * 1000;
+export const V3_HANDOFF_IDEMPOTENCY_WINDOW_MS = 50 * 60 * 1000;
+
+/** Engine-side bound on every transport call (dispatch / probe / stop). A
+ *  call that does not settle in time is treated as an unknown outcome, so a
+ *  hung transport can never freeze the run or its cancellation. */
+export const V3_EXTERNAL_CALL_TIMEOUT_MS = 30_000;
 
 /** Default acceptance window (mirrors `botmux dispatch`). */
 export const V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS = 15_000;
@@ -122,7 +129,12 @@ export type V3ExternalStopReason =
 
 export interface V3ExternalStopRequest extends V3ExternalAttemptRef {
   reason: V3ExternalStopReason;
+  /** The keys the handoff was (or may have been) sent with: lets the
+   *  transport find a delivery whose Sent record never reached the journal. */
+  idempotency?: V3HandoffIdempotency;
   handoffMessageId?: string;
+  nodeCardMessageId?: string;
+  threadId?: string;
   sessionId?: string;
 }
 
@@ -136,7 +148,10 @@ export interface V3ExternalStopRequest extends V3ExternalAttemptRef {
  *   Throwing means "unknown" — the engine re-sends with the same keys inside
  *   {@link V3_HANDOFF_IDEMPOTENCY_WINDOW_MS}, then blocks HANDOFF_UNCERTAIN.
  * - `probeAcceptance` reports whether the target session registered the
- *   handoff (cold attach and acceptance deadline). Throwing = unknown.
+ *   handoff (cold attach and acceptance deadline). Throwing = unknown: the
+ *   engine backs off and probes again, and only a persistently unknown
+ *   answer becomes HANDOFF_UNCERTAIN (never HANDOFF_NOT_ACCEPTED).
+ * - Every call is bounded by {@link V3_EXTERNAL_CALL_TIMEOUT_MS} engine-side.
  * - `stop` stops the target bot's current turn for this attempt and
  *   invalidates its handoff binding. Must be idempotent and must tolerate
  *   attempts whose handoff never reached the target. Failures are reported

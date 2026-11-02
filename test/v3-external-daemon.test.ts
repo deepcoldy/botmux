@@ -36,6 +36,12 @@ import type {
   V3ExternalNodeExecutor,
 } from '../src/workflows/v3/external-executor.js';
 import type { RunNode } from '../src/workflows/v3/contract.js';
+import {
+  reassignNode,
+  recordExternalAccepted,
+  reportExternalBlocked,
+} from '../src/workflows/v3/external-control.js';
+import { loadDag } from '../src/workflows/v3/dag-loader.js';
 
 const BINDING = { larkAppId: 'cli_owner', chatId: 'oc_chat', rootMessageId: 'om_root' };
 const CREATED_AT = '2026-11-01T08:00:00.000Z';
@@ -56,12 +62,11 @@ function writeJson(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function seedAdHocArtifacts(runDir: string, runId: string) {
+const WORK_NODE = { id: 'work', type: 'goal', goal: 'do the work', bot: 'cli_worker', depends: [], inputs: [] };
+
+function seedAdHocArtifacts(runDir: string, runId: string, nodes: unknown[] = [WORK_NODE]) {
   mkdirSync(runDir, { recursive: true });
-  writeJson(join(runDir, 'dag.json'), {
-    runId,
-    nodes: [{ id: 'work', type: 'goal', goal: 'do the work', bot: 'cli_worker', depends: [], inputs: [] }],
-  });
+  writeJson(join(runDir, 'dag.json'), { runId, nodes });
   writeJson(join(runDir, 'spec.json'), {
     schemaVersion: 1,
     runId,
@@ -82,14 +87,14 @@ function seedAdHocArtifacts(runDir: string, runId: string) {
   };
 }
 
-function seedAdHocRun(base: string, runId: string, nodeExecutor?: 'bot'): string {
+function seedAdHocRun(base: string, runId: string, nodeExecutor?: 'bot', nodes?: unknown[]): string {
   const runDir = join(base, runId);
   publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
     runId,
     createdAt: CREATED_AT,
     authorizedAt: AUTHORIZED_AT,
     chatBinding: BINDING,
-    artifacts: seedAdHocArtifacts(runDir, runId),
+    artifacts: seedAdHocArtifacts(runDir, runId, nodes),
     ...(nodeExecutor ? { nodeExecutor } : {}),
   }));
   return runDir;
@@ -235,7 +240,7 @@ describe('daemon driver — external executor injection point', () => {
       now: () => clock.t,
       postCard: async () => {},
       postBlockedCard: async (_binding, info) => { blockedSeen(info); },
-      scheduleWake: (_runId, wakeAt, wake) => { wakes.push({ wakeAt, wake }); },
+      scheduleWake: (_runId, wakeAt, wake) => { if (wakeAt !== undefined) wakes.push({ wakeAt, wake }); },
     });
 
     await runner.drive('drv-wake');
@@ -249,3 +254,68 @@ describe('daemon driver — external executor injection point', () => {
     expect(await blocked).toMatchObject({ nodeId: 'work', errorCode: 'HANDOFF_NOT_ACCEPTED' });
   });
 });
+
+describe('daemon driver — review regressions', () => {
+  it('P2-a G1: a gate beside an external node is announced once across accept and wake re-drives', async () => {
+    const base = freshBase();
+    const runDir = seedAdHocRun(base, 'rv-gate-cards', 'bot', [
+      WORK_NODE,
+      { id: 'deploy', type: 'goal', goal: 'deploy', bot: 'cli_worker', depends: [], inputs: [], humanGate: { prompt: 'deploy?' } },
+    ]);
+    const clock = { t: 5_000 };
+    const posted: string[] = [];
+    const wakes: Array<() => void> = [];
+    const runner = createV3GateRunner({
+      baseDir: base,
+      loadBots: () => [],
+      makeRunNode: () => async () => { throw new Error('unexpected ephemeral worker'); },
+      externalExecutor: new RecordingExecutor(),
+      now: () => clock.t,
+      postCard: async (_binding, gate) => { posted.push(gate.waitId); },
+      scheduleWake: (_runId, wakeAt, wake) => { if (wakeAt !== undefined) wakes.push(wake); },
+    });
+    await runner.drive('rv-gate-cards');
+    const attemptId = openV3ExternalAttempts(readJournal(join(runDir, 'journal.ndjson')))[0]!.attemptId;
+    expect(recordExternalAccepted(runDir, { attemptId, sessionId: 'sess' }, { dag: loadDag(join(runDir, 'dag.json')), now: () => clock.t }))
+      .toMatchObject({ ok: true });
+    await runner.drive('rv-gate-cards'); // acceptance notification re-drive
+    await runner.drive('rv-gate-cards'); // engine-deadline wake
+    expect(posted).toEqual(['deploy#001-gate']);
+  });
+
+  it('P2-a W1: a blocked outcome cancels the pending wake and is announced once', async () => {
+    const base = freshBase();
+    const runDir = seedAdHocRun(base, 'rv-blocked-cards', 'bot');
+    const clock = { t: 5_000 };
+    const blockedCards: V3BlockedInfo[] = [];
+    const wakeCalls: Array<number | undefined> = [];
+    const runner = createV3GateRunner({
+      baseDir: base,
+      loadBots: () => [],
+      makeRunNode: () => async () => { throw new Error('unexpected ephemeral worker'); },
+      externalExecutor: new RecordingExecutor(),
+      now: () => clock.t,
+      postCard: async () => {},
+      postBlockedCard: async (_binding, info) => { blockedCards.push(info); },
+      scheduleWake: (_runId, wakeAt) => { wakeCalls.push(wakeAt); },
+    });
+    await runner.drive('rv-blocked-cards');
+    expect(wakeCalls.at(-1)).toEqual(expect.any(Number));
+    const attemptId = openV3ExternalAttempts(readJournal(join(runDir, 'journal.ndjson')))[0]!.attemptId;
+    expect(reportExternalBlocked(runDir, { attemptId, reason: 'cannot' })).toEqual({ ok: true });
+    await runner.drive('rv-blocked-cards');
+    expect(wakeCalls.at(-1)).toBeUndefined(); // the stale deadline wake is cancelled
+    await runner.drive('rv-blocked-cards'); // what a stale wake would have caused
+    expect(blockedCards.map((info) => [info.nodeId, info.errorCode])).toEqual([['work', 'BOT_REPORTED_BLOCKED']]);
+  });
+
+  it('R2: reassignment is refused for an envelope that does not pin nodeExecutor "bot"', async () => {
+    const base = freshBase();
+    const plainDir = seedAdHocRun(base, 'rv-plain-reassign');
+    const { deps } = driverDeps(base);
+    await driveV3Run('rv-plain-reassign', deps).catch(() => undefined);
+    expect(await reassignNode(plainDir, { nodeId: 'work', toLarkAppId: 'cli_worker', by: 'ou' }))
+      .toEqual({ kind: 'rejected', reason: 'not-bot-run' });
+  });
+});
+

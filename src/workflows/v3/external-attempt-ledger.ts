@@ -126,8 +126,10 @@ export function foldV3ExternalAttempts(
         attempt.preparedAt = event.preparedAt;
         break;
       case 'nodeHandoffSent':
-        if (attempt.phase !== 'prepared') break;
-        attempt.phase = 'sent';
+        // The target may accept before dispatch() returns, so Sent can follow
+        // Accepted: it then only fills the message ids, never regresses phase.
+        if (attempt.phase === 'dispatched' || attempt.handoffMessageId !== undefined) break;
+        if (attempt.phase === 'prepared') attempt.phase = 'sent';
         attempt.handoffMessageId = event.handoffMessageId;
         if (event.nodeCardMessageId) attempt.nodeCardMessageId = event.nodeCardMessageId;
         if (event.threadId) attempt.threadId = event.threadId;
@@ -135,7 +137,8 @@ export function foldV3ExternalAttempts(
         attempt.acceptDeadlineAt = event.acceptDeadlineAt;
         break;
       case 'nodeHandoffAccepted':
-        if (attempt.phase !== 'sent') break;
+        // Acceptance is never lost: it may precede the Sent record.
+        if (attempt.phase !== 'prepared' && attempt.phase !== 'sent') break;
         attempt.phase = 'accepted';
         attempt.sessionId = event.sessionId;
         attempt.acceptedAt = event.acceptedAt;

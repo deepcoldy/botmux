@@ -7,30 +7,20 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { validateDag, type V3Dag } from '../src/workflows/v3/dag.js';
+import { validateDag } from '../src/workflows/v3/dag.js';
 import { appendEvent, readJournal, type StoredEvent, type V3Event } from '../src/workflows/v3/journal.js';
 import { materialize } from '../src/workflows/v3/state.js';
-import { readAndValidateManifest, ManifestValidationError } from '../src/workflows/v3/manifest.js';
+import { readAndValidateManifest } from '../src/workflows/v3/manifest.js';
 import { openV3WorkerAttempts } from '../src/workflows/v3/attempt-ledger.js';
 import { openV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
-import {
-  runWorkflow,
-  type V3RunOutcome,
-  type V3RuntimeDeps,
-  type V3RuntimeOptions,
-} from '../src/workflows/v3/runtime.js';
+import { runWorkflow } from '../src/workflows/v3/runtime.js';
 import {
   V3_HANDOFF_IDEMPOTENCY_WINDOW_MS,
-  type V3ExternalAcceptanceProbe,
-  type V3ExternalAttemptRef,
-  type V3ExternalDispatchOutcome,
-  type V3ExternalDispatchRequest,
   type V3ExternalNodeExecutor,
-  type V3ExternalStopRequest,
 } from '../src/workflows/v3/external-executor.js';
 import {
   ingestExternalSubmission,
@@ -38,174 +28,26 @@ import {
   recordExternalAccepted,
   recordExternalStalled,
   reportExternalBlocked,
-  type V3ExternalSubmission,
 } from '../src/workflows/v3/external-control.js';
 import { requestV3Retry } from '../src/workflows/v3/daemon-run.js';
-import type { BotSnapshot, RunNode } from '../src/workflows/v3/contract.js';
+import type { RunNode } from '../src/workflows/v3/contract.js';
 import type { HostExecutorRegistry } from '../src/workflows/hostExecutors/registry.js';
+import {
+  ACCEPT_MS,
+  BotRun,
+  FakeExecutor,
+  T0,
+  TIMEOUT_SEC,
+  cleanupBotRuns,
+  expectAwaitingExternal,
+  expectTerminal,
+  reportDag,
+  reportFiles,
+  trackTempDir,
+  validateManifest,
+} from './helpers/v3-external-harness.js';
 
-// ─── Fixtures ────────────────────────────────────────────────────────────
-
-const ACCEPT_MS = 20_000;
-const TIMEOUT_SEC = 600;
-const T0 = 1_700_000_000_000;
-
-const validateManifest: V3RuntimeDeps['validateManifest'] = async (manifestPath, outputDir) => {
-  try {
-    return { ok: true, manifest: await readAndValidateManifest(manifestPath, outputDir) };
-  } catch (err) {
-    return { ok: false, problems: err instanceof ManifestValidationError ? err.problems : [String(err)] };
-  }
-};
-
-const snapshotFor = (bot: string | undefined): BotSnapshot => ({
-  larkAppId: bot ?? 'cli_main',
-  cliId: 'claude-code',
-  workingDir: '/tmp',
-});
-
-class FakeExecutor implements V3ExternalNodeExecutor {
-  readonly dispatches: V3ExternalDispatchRequest[] = [];
-  readonly probes: Array<V3ExternalAttemptRef & { handoffMessageId: string }> = [];
-  readonly stops: V3ExternalStopRequest[] = [];
-  onDispatch: (req: V3ExternalDispatchRequest) => V3ExternalDispatchOutcome | Promise<V3ExternalDispatchOutcome> =
-    (req) => ({ kind: 'sent', handoffMessageId: `om_${req.idempotency.handoff}` });
-  onProbe: (ref: V3ExternalAttemptRef) => V3ExternalAcceptanceProbe | Promise<V3ExternalAcceptanceProbe> =
-    () => ({ status: 'notAccepted' });
-  onStop: (req: V3ExternalStopRequest) => void | Promise<void> = () => {};
-
-  async dispatch(req: V3ExternalDispatchRequest): Promise<V3ExternalDispatchOutcome> {
-    this.dispatches.push(req);
-    return this.onDispatch(req);
-  }
-
-  async probeAcceptance(ref: V3ExternalAttemptRef & { handoffMessageId: string }): Promise<V3ExternalAcceptanceProbe> {
-    this.probes.push(ref);
-    return this.onProbe(ref);
-  }
-
-  async stop(req: V3ExternalStopRequest): Promise<void> {
-    this.stops.push(req);
-    await this.onStop(req);
-  }
-}
-
-const bases: string[] = [];
-afterEach(() => {
-  for (const base of bases.splice(0)) rmSync(base, { recursive: true, force: true });
-});
-
-class BotRun {
-  readonly base: string;
-  readonly runDir: string;
-  readonly journalPath: string;
-  readonly clock = { t: T0 };
-  workerSpawns = 0;
-
-  constructor(readonly dag: V3Dag) {
-    this.base = mkdtempSync(join(tmpdir(), 'v3-ext-'));
-    bases.push(this.base);
-    this.runDir = join(this.base, dag.runId);
-    this.journalPath = join(this.runDir, 'journal.ndjson');
-  }
-
-  drive(
-    executor: V3ExternalNodeExecutor,
-    extra: { opts?: Partial<V3RuntimeOptions>; deps?: Partial<V3RuntimeDeps> } = {},
-  ): Promise<V3RunOutcome> {
-    const runNode: RunNode = async () => {
-      this.workerSpawns++;
-      throw new Error('bot mode must never spawn an ephemeral worker');
-    };
-    return runWorkflow(this.dag, {
-      runNode,
-      validateManifest,
-      resolveBotSnapshot: snapshotFor,
-      externalExecutor: executor,
-      now: () => this.clock.t,
-      ...extra.deps,
-    }, {
-      baseDir: this.base,
-      gateMode: 'suspend',
-      nodeExecutor: 'bot',
-      externalAcceptTimeoutMs: ACCEPT_MS,
-      ...extra.opts,
-    });
-  }
-
-  events(): StoredEvent[] {
-    return readJournal(this.journalPath);
-  }
-
-  of<T extends V3Event['type']>(type: T): Array<StoredEvent & Extract<V3Event, { type: T }>> {
-    return this.events().filter((event) => event.type === type) as Array<StoredEvent & Extract<V3Event, { type: T }>>;
-  }
-
-  snap() {
-    return materialize(this.events());
-  }
-
-  ctx() {
-    return { dag: this.dag, now: () => this.clock.t };
-  }
-
-  openAttempt(nodeId: string) {
-    const found = openV3ExternalAttempts(this.events()).filter((attempt) => attempt.nodeId === nodeId);
-    expect(found).toHaveLength(1);
-    return found[0]!;
-  }
-
-  accept(attemptId: string, sessionId = 'sess-1') {
-    return recordExternalAccepted(this.runDir, { attemptId, sessionId }, this.ctx());
-  }
-
-  submit(attemptId: string, input: Partial<V3ExternalSubmission> = {}) {
-    return ingestExternalSubmission(this.runDir, {
-      attemptId,
-      files: [],
-      summary: 'done',
-      ...input,
-    }, this.ctx());
-  }
-}
-
-function reportDag(runId: string, extra: Record<string, unknown> = {}) {
-  return validateDag({
-    schemaVersion: 2,
-    runId,
-    nodes: [{
-      id: 'write',
-      type: 'goal',
-      goal: 'write the report',
-      bot: 'cli_a',
-      timeoutSec: TIMEOUT_SEC,
-      outputs: { report: { path: 'report.md', kind: 'markdown' } },
-      resultSchema: {
-        type: 'object',
-        properties: { message: { type: 'string' } },
-        required: ['message'],
-      },
-      ...extra,
-    }],
-  });
-}
-
-const reportFiles = (content = '# report\n') => ({
-  files: [{ key: 'report', name: 'risk-report.md', data: Buffer.from(content) }],
-  result: { message: 'ok' },
-});
-
-function expectAwaitingExternal(outcome: V3RunOutcome) {
-  expect(outcome.reason).toBe('awaitingExternal');
-  if (outcome.reason !== 'awaitingExternal') throw new Error('unreachable');
-  return outcome;
-}
-
-function expectTerminal(outcome: V3RunOutcome) {
-  expect(outcome.reason).toBe('terminal');
-  if (outcome.reason !== 'terminal') throw new Error('unreachable');
-  return outcome;
-}
+afterEach(cleanupBotRuns);
 
 // ─── Dispatch, suspend, submit ───────────────────────────────────────────
 
@@ -246,7 +88,7 @@ describe('external goal nodes — dispatch suspends on disk', () => {
     expect(accepted).toMatchObject({ ok: true, deadlineAt: run.clock.t + TIMEOUT_SEC * 1000 });
     expect(expectAwaitingExternal(await run.drive(new FakeExecutor())).wakeAt).toBe(run.clock.t + TIMEOUT_SEC * 1000);
 
-    const ingested = await run.submit(attemptId, reportFiles('# risk\n'));
+    const ingested = await run.submit(attemptId, { ...reportFiles('# risk\n'), sessionId: 'sess-1' });
     expect(ingested).toMatchObject({ ok: true, kind: 'succeeded' });
     if (!ingested.ok || ingested.kind !== 'succeeded') throw new Error('unreachable');
     // Engine-generated manifest passes the normal validator against work/.
@@ -332,10 +174,10 @@ describe('external goal nodes — dispatch suspends on disk', () => {
     await run.drive(executor);
     const attemptId = executor.dispatches[0]!.attemptId;
     run.accept(attemptId);
-    expect(recordExternalStalled(run.runDir, { attemptId }, run.ctx())).toEqual({ ok: true });
+    expect(recordExternalStalled(run.runDir, { attemptId, sessionId: 'sess-1' }, run.ctx())).toEqual({ ok: true });
     expect(run.openAttempt('write').stalledAt).toBe(run.clock.t);
     expect(run.snap().nodes.get('write')?.status).toBe('running');
-    expect(await run.submit(attemptId, reportFiles())).toMatchObject({ ok: true, kind: 'succeeded' });
+    expect(await run.submit(attemptId, { ...reportFiles(), sessionId: 'sess-1' })).toMatchObject({ ok: true, kind: 'succeeded' });
   });
 
   it('blocks on a bot-reported failure and retries in the same instance with the reason attached', async () => {
@@ -591,7 +433,7 @@ describe('external goal nodes — late submissions and first-wins races (§9.7)'
     const attemptId = run.openAttempt('write').attemptId;
     run.accept(attemptId);
     let concurrentWriter: (() => void) | undefined = () => {
-      reportExternalBlocked(run.runDir, { attemptId, reason: 'gave up' });
+      expect(reportExternalBlocked(run.runDir, { attemptId, sessionId: 'sess-1', reason: 'gave up' })).toEqual({ ok: true });
     };
     const outcome = await run.drive(new FakeExecutor(), {
       deps: {
@@ -624,7 +466,7 @@ describe('external goal nodes — late submissions and first-wins races (§9.7)'
     const attemptId = run.openAttempt('write').attemptId;
     const accepted = run.accept(attemptId);
     if (!accepted.ok) throw new Error('accept failed');
-    expect(await run.submit(attemptId, reportFiles())).toMatchObject({ ok: true });
+    expect(await run.submit(attemptId, { ...reportFiles(), sessionId: 'sess-1' })).toMatchObject({ ok: true });
 
     run.clock.t = accepted.deadlineAt + 1;
     const executor = new FakeExecutor();
@@ -644,7 +486,7 @@ describe('external goal nodes — late submissions and first-wins races (§9.7)'
     const executor = new FakeExecutor();
     let raced: unknown;
     executor.onStop = async () => {
-      raced = await run.submit(attemptId, reportFiles());
+      raced = await run.submit(attemptId, { ...reportFiles(), sessionId: 'sess-1' });
     };
     expect(expectTerminal(await run.drive(executor)).runStatus).toBe('succeeded');
     expect(raced).toMatchObject({ ok: true, kind: 'succeeded' });
@@ -925,8 +767,7 @@ describe('external goal nodes — concurrency caps', () => {
   });
 
   it('ephemeral mode: two selectors resolving to the same bot share its per-bot slot', async () => {
-    const base = mkdtempSync(join(tmpdir(), 'v3-ext-ephemeral-'));
-    bases.push(base);
+    const base = trackTempDir(mkdtempSync(join(tmpdir(), 'v3-ext-ephemeral-')));
     let active = 0;
     let peak = 0;
     const runNode: RunNode = async (req) => {
@@ -1221,5 +1062,251 @@ describe('external goal nodes — loops, revisits, gates, edges, host nodes', ()
     expect(executor.stops).toEqual([expect.objectContaining({ attemptId: b, reason: 'runBoundary' })]);
     expect(run.snap().nodes.get('b')?.status).toBe('pending');
     expect(openV3ExternalAttempts(run.events())).toEqual([]);
+  });
+});
+
+// ─── Adversarial-review regressions ──────────────────────────────────────
+
+describe('external goal nodes — review regressions', () => {
+  it('P1: an acceptance recorded before dispatch() returns is kept and guards the attempt', async () => {
+    const run = new BotRun(reportDag('rv-accept-before-sent'));
+    const executor = new FakeExecutor();
+    executor.onDispatch = (req) => {
+      expect(run.accept(req.attemptId, 'sess-owner')).toMatchObject({ ok: true });
+      return { kind: 'sent', handoffMessageId: 'om_early' };
+    };
+    const outcome = expectAwaitingExternal(await run.drive(executor));
+    const attempt = run.openAttempt('write');
+    expect(attempt).toMatchObject({ phase: 'accepted', sessionId: 'sess-owner', handoffMessageId: 'om_early' });
+    expect(outcome.wakeAt).toBe(attempt.deadlineAt);
+    expect(await run.submit(attempt.attemptId, { ...reportFiles(), sessionId: 'sess-intruder' }))
+      .toEqual({ ok: false, reason: 'session-mismatch' });
+
+    // Past the acceptance window the working bot is neither blocked nor stopped.
+    run.clock.t += ACCEPT_MS + 1;
+    const later = new FakeExecutor();
+    later.onProbe = () => ({ status: 'accepted', sessionId: 'sess-owner' });
+    expectAwaitingExternal(await run.drive(later));
+    expect(later.stops).toEqual([]);
+    expect(run.of('nodeBlocked')).toEqual([]);
+    expect(run.of('nodeHandoffAccepted')).toHaveLength(1);
+    expect(await run.submit(attempt.attemptId, { ...reportFiles(), sessionId: 'sess-owner' }))
+      .toMatchObject({ ok: true, kind: 'succeeded' });
+  });
+
+  it('P2-b: an unknown probe after a long outage backs off; only persistence becomes HANDOFF_UNCERTAIN', async () => {
+    const run = new BotRun(reportDag('rv-probe-outage'));
+    await run.drive(new FakeExecutor());
+    const attemptId = run.openAttempt('write').attemptId;
+    run.clock.t += 2 * 60 * 60_000; // main daemon was down for two hours
+
+    const flaky = new FakeExecutor();
+    flaky.onProbe = () => { throw new Error('target daemon unreachable'); };
+    let outcome = expectAwaitingExternal(await run.drive(flaky));
+    expect(run.of('nodeBlocked')).toEqual([]);
+    expect(flaky.stops).toEqual([]);
+    expect(outcome.wakeAt).toBeGreaterThan(run.clock.t);
+
+    for (let wakes = 0; ; wakes++) {
+      if (wakes > 500) throw new Error('never escalated');
+      run.clock.t = outcome.wakeAt!;
+      const next = await run.drive(flaky);
+      if (next.reason !== 'awaitingExternal') break;
+      outcome = next;
+    }
+    expect(flaky.probes.length).toBeGreaterThan(2);
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ attemptId, errorCode: 'HANDOFF_UNCERTAIN' })]);
+    expect(flaky.stops.map((stop) => stop.reason)).toEqual(['uncertain']);
+  });
+
+  it('P2-b: a probe that recovers after failing records the acceptance', async () => {
+    const run = new BotRun(reportDag('rv-probe-recovers'));
+    await run.drive(new FakeExecutor());
+    run.clock.t += 2 * 60 * 60_000;
+    const executor = new FakeExecutor();
+    let failures = 1;
+    executor.onProbe = () => {
+      if (failures-- > 0) throw new Error('transient');
+      return { status: 'accepted', sessionId: 'sess-late', acceptedAt: run.clock.t };
+    };
+    const first = expectAwaitingExternal(await run.drive(executor));
+    run.clock.t = first.wakeAt!;
+    expectAwaitingExternal(await run.drive(executor));
+    expect(run.openAttempt('write')).toMatchObject({ phase: 'accepted', sessionId: 'sess-late' });
+    expect(run.of('nodeBlocked')).toEqual([]);
+  });
+
+  it('R1: reassigning a lingering binding inside a blocked run requeues the node', async () => {
+    const run = new BotRun(validateDag({
+      runId: 'rv-blocked-reassign',
+      nodes: [
+        { id: 'a', type: 'goal', goal: 'a', bot: 'cli_a' },
+        { id: 'b', type: 'goal', goal: 'b', bot: 'cli_b' },
+        { id: 'spare', type: 'goal', goal: 'spare', bot: 'cli_c', depends: ['a'] },
+      ],
+    }));
+    await run.drive(new FakeExecutor());
+    const a = run.openAttempt('a').attemptId;
+    appendEvent(run.journalPath, {
+      type: 'nodeBlocked', nodeId: 'a', instanceId: 'a#001', attemptId: a,
+      errorClass: 'workerError', errorCode: 'BOT_REPORTED_BLOCKED', message: 'x',
+    });
+    appendEvent(run.journalPath, { type: 'runBlocked', blockedNodeId: 'a' }); // older/raced boundary
+
+    const executor = new FakeExecutor();
+    expect(await reassignNode(run.runDir, { nodeId: 'b', toLarkAppId: 'cli_c', by: 'ou' }, { ...run.ctx(), executor }))
+      .toMatchObject({ kind: 'reassigned' });
+    expect(requestV3Retry(run.base, run.dag.runId, { nodeId: 'a' })).toMatchObject({ kind: 'requested' });
+    expectAwaitingExternal(await run.drive(executor));
+    expect(executor.dispatches.find((req) => req.nodeId === 'b')).toMatchObject({ targetLarkAppId: 'cli_c' });
+  });
+
+  it('E1: a dispatch that never settles (and ignores abort) is bounded and retried later', async () => {
+    const run = new BotRun(reportDag('rv-hung-dispatch'));
+    const executor = new FakeExecutor();
+    executor.onDispatch = () => new Promise(() => {});
+    const errors: string[] = [];
+    const outcome = expectAwaitingExternal(await run.drive(executor, {
+      opts: { externalCallTimeoutMs: 20 },
+      deps: { onExternalError: (_err, ctx) => { errors.push(ctx.operation); } },
+    }));
+    expect(errors).toEqual(['dispatch']);
+    expect(run.openAttempt('write').phase).toBe('prepared');
+    expect(outcome.wakeAt).toBeGreaterThan(run.clock.t);
+  });
+
+  it('E1: a probe and a stop that never settle cannot wedge acceptance checks or cancellation', async () => {
+    const run = new BotRun(reportDag('rv-hung-probe-stop'));
+    await run.drive(new FakeExecutor());
+    const hung = new FakeExecutor();
+    hung.onProbe = () => new Promise(() => {});
+    hung.onStop = () => new Promise(() => {});
+    const fast = { opts: { externalCallTimeoutMs: 20 } };
+    expectAwaitingExternal(await run.drive(hung, fast));
+    appendEvent(run.journalPath, { type: 'runCancelRequested', cancelRequestId: 'cancel-hung', by: 'ou' });
+    expect(expectTerminal(await run.drive(hung, fast)).runStatus).toBe('cancelled');
+    expect(hung.stops.map((stop) => stop.reason)).toEqual(['runCancelled']);
+  });
+
+  it('F1: stopping a prepared-but-unconfirmed handoff names its idempotency keys', async () => {
+    const run = new BotRun(reportDag('rv-stop-prepared'));
+    const crashed = new FakeExecutor();
+    crashed.onDispatch = () => { throw new Error('connection reset'); };
+    await run.drive(crashed);
+    appendEvent(run.journalPath, { type: 'runCancelRequested', cancelRequestId: 'cancel-prep', by: 'ou' });
+    const executor = new FakeExecutor();
+    expect(expectTerminal(await run.drive(executor)).runStatus).toBe('cancelled');
+    expect(executor.stops).toEqual([expect.objectContaining({
+      reason: 'runCancelled',
+      idempotency: crashed.dispatches[0]!.idempotency,
+    })]);
+  });
+
+  it('C1: once accepted, a caller without the accepting session is refused', async () => {
+    const run = new BotRun(reportDag('rv-session-required'));
+    await run.drive(new FakeExecutor());
+    const attemptId = run.openAttempt('write').attemptId;
+    run.accept(attemptId, 'sess-owner');
+    expect(await run.submit(attemptId, reportFiles())).toEqual({ ok: false, reason: 'session-mismatch' });
+    expect(reportExternalBlocked(run.runDir, { attemptId, reason: 'x' })).toEqual({ ok: false, reason: 'session-mismatch' });
+    expect(recordExternalStalled(run.runDir, { attemptId }, run.ctx())).toEqual({ ok: false, reason: 'session-mismatch' });
+    expect(await run.submit(attemptId, { ...reportFiles(), sessionId: 'sess-owner' })).toMatchObject({ ok: true });
+  });
+
+  it('R2: reassignment is refused for a run that does not execute nodes through bots', async () => {
+    const base = trackTempDir(mkdtempSync(join(tmpdir(), 'v3-ext-r2-')));
+    const runDir = join(base, 'rv-ephemeral');
+    mkdirSync(runDir);
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId: 'rv-ephemeral' });
+    expect(await reassignNode(runDir, { nodeId: 'write', toLarkAppId: 'cli_b', by: 'ou' }, {
+      dag: reportDag('rv-ephemeral'),
+      botSnapshots: new Map([['', { larkAppId: 'cli_b', cliId: 'claude-code', workingDir: '/tmp' }]]),
+    })).toEqual({ kind: 'rejected', reason: 'not-bot-run' });
+    expect(readJournal(join(runDir, 'journal.ndjson')).map((event) => event.type)).toEqual(['runStarted']);
+  });
+
+  it('window: stops same-key re-sends with a margin before Lark’s one-hour uuid de-duplication ends', async () => {
+    const LARK_UUID_DEDUP_MS = 60 * 60_000; // Lark message `uuid` de-duplication window
+    const run = new BotRun(reportDag('rv-window-margin'));
+    const crashed = new FakeExecutor();
+    crashed.onDispatch = () => { throw new Error('connection reset'); };
+    await run.drive(crashed);
+    run.clock.t = run.openAttempt('write').preparedAt! + LARK_UUID_DEDUP_MS - 5 * 60_000;
+    const restarted = new FakeExecutor();
+    expect(expectTerminal(await run.drive(restarted)).runStatus).toBe('blocked');
+    expect(restarted.dispatches).toEqual([]);
+    expect(run.of('nodeBlocked')[0]).toMatchObject({ errorCode: 'HANDOFF_UNCERTAIN' });
+  });
+
+  it('P2-c: staging left by a crash before the install intent is removed once the attempt closes', async () => {
+    const run = new BotRun(reportDag('rv-staging-leftover'));
+    await run.drive(new FakeExecutor());
+    const attemptId = run.openAttempt('write').attemptId;
+    const leftover = join(run.runDir, attemptId, 'submissions', '00000000-0000-4000-8000-000000000000', 'work');
+    mkdirSync(leftover, { recursive: true });
+    writeFileSync(join(leftover, 'report.md'), 'half-staged');
+    expect(await run.submit(attemptId, reportFiles())).toMatchObject({ ok: true });
+    expect(expectTerminal(await run.drive(new FakeExecutor())).runStatus).toBe('succeeded');
+    expect(existsSync(join(run.runDir, attemptId, 'submissions'))).toBe(false);
+  });
+
+  it('M25: a submission may only revisit nodes listed in revisitTo', async () => {
+    const run = new BotRun(validateDag({
+      runId: 'rv-revisit-membership',
+      nodes: [
+        { id: 'draft', type: 'goal', goal: 'draft', bot: 'cli_a' },
+        { id: 'other', type: 'goal', goal: 'other', bot: 'cli_c' },
+        { id: 'review', type: 'goal', goal: 'review', bot: 'cli_b', depends: ['draft', 'other'], revisitTo: ['draft'] },
+      ],
+    }));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    await run.submit(run.openAttempt('draft').attemptId, { files: [{ key: 'd', name: 'd.md', data: Buffer.from('d') }] });
+    await run.submit(run.openAttempt('other').attemptId, { files: [{ key: 'o', name: 'o.md', data: Buffer.from('o') }] });
+    await run.drive(executor);
+    const before = run.events().length;
+    expect(await run.submit(run.openAttempt('review').attemptId, { result: { status: 'revisit', revisitTo: 'other' } }))
+      .toMatchObject({ ok: false, reason: 'invalid' });
+    expect(run.events()).toHaveLength(before);
+  });
+
+  it('M17: a reassignment planned while idle refuses an attempt dispatched before its lock', async () => {
+    const run = new BotRun(twoBotDag('rv-reassign-idle-open'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    await run.submit(run.openAttempt('write').attemptId, { files: [{ key: 'report', data: Buffer.from('ok') }] });
+    // `spare` is pending; a concurrent drive dispatches it mid-reassignment.
+    const frozen = new Map([
+      ['cli_a', { larkAppId: 'cli_a', cliId: 'claude-code' as const, workingDir: '/tmp' }],
+      ['cli_b', { larkAppId: 'cli_b', cliId: 'claude-code' as const, workingDir: '/tmp' }],
+    ]);
+    let concurrentDispatch: (() => void) | undefined = () => {
+      appendEvent(run.journalPath, {
+        type: 'nodeDispatched', nodeId: 'spare', instanceId: 'spare#001', attemptId: 'spare#001/attempts/001', nodeExecutor: 'bot',
+      });
+    };
+    const racing = new Map(frozen);
+    racing.get = (key: string) => {
+      const write = concurrentDispatch;
+      concurrentDispatch = undefined;
+      write?.();
+      return frozen.get(key);
+    };
+    const outcome = await reassignNode(run.runDir, { nodeId: 'spare', toLarkAppId: 'cli_a', by: 'ou' }, {
+      ...run.ctx(),
+      botSnapshots: racing,
+      executor,
+    });
+    expect(outcome).toEqual({ kind: 'rejected', reason: 'stale-attempt' });
+    expect(run.of('nodeReassigned')).toEqual([]);
+    expect(executor.stops).toEqual([]);
+  });
+
+  it('M15: an acceptance time in the future is clamped to now', async () => {
+    const run = new BotRun(reportDag('rv-accept-clamp'));
+    await run.drive(new FakeExecutor());
+    const attemptId = run.openAttempt('write').attemptId;
+    expect(recordExternalAccepted(run.runDir, { attemptId, sessionId: 's', acceptedAt: run.clock.t + 3_600_000 }, run.ctx()))
+      .toMatchObject({ ok: true, deadlineAt: run.clock.t + TIMEOUT_SEC * 1000 });
   });
 });
