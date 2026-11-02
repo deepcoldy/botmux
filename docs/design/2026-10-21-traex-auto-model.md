@@ -35,7 +35,7 @@
 
 预检算法先读取本轮目标模型（默认沿用当前模型；启用每轮重新择优时目标为池首）的负载。目标负载未知或查询失败/超时时 fail-open 保持当前模型；目标负载不超过阈值时保持；超过阈值时按模型池顺序选择第一个负载已知且不超过阈值的候选，未知候选按 `skip` 跳过。所有已知项均超阈值时选择最低负载，同值按模型池顺序。预检不关闭现有运行中 `queueTimeoutMs` 排队检测；若真实进入队列，原有运行中 fallback 继续工作。
 
-开启预检后，每个候选模型都使用自身最高的受约束思考档位：目录声明支持 `max` 时使用 `max`，否则使用 `xhigh`（界面可显示 Extra High），不会因为切到备用模型而继承较低共享 effort。Dashboard 保存时把每项归一到该规则；显式 `low`/`medium`/`high`/`ultra` 配置会被严格拒绝，手写配置或目录漂移在 Worker 启动边界再次归一并记录日志。
+开启预检后，每个候选模型都使用自身实际支持的最高思考档位，按 `max` → `xhigh`（界面可显示 Extra High）→ `high` → `medium` → `low` 的顺序解析，不会因为切到备用模型而继承较低共享 effort。Dashboard 保存时把每项归一到该规则；当目录或静态能力无法给出任何可用档位时不发明 `xhigh` 等值，也不覆盖原设置。手写配置或目录漂移在 Worker 启动边界按同一规则再次归一并记录日志。
 
 预检正常保持不发用户提示；日志记录 `from/to/load/threshold/reason/duration`。切换和全池超载会发可见提示。查询失败、超时、目标负载未知均只记录可诊断日志，不把探测失败升级成任务失败。
 
@@ -67,6 +67,6 @@ Worker 内重启按原生会话 ID、模型池策略和池内模型校验运行�
 
 本 PR 的 `startupReadyFromHistory` 与恢复输入框识别作用于所有 TraeX 终端会话，包括未启用 Auto 的会话。Auto 的容量切换和输入暂停门控仍只作用于受支持的托管会话。
 
-验证包含配置读写与刷新、五模型顺序编辑、预检默认关闭与严格字段校验、100% 保持/101% 切换、未知负载跳过和查询失败/超时 fail-open、全高负载与同值稳定顺序、每模型 max/xhigh 选择、冷启动只 spawn/提交一次、暖会话 exact native resume、busy type-ahead 不预检、dispatch 共用 Worker 准入、运行中 queue fallback、quota/非 TraeX/不安全后端回归，以及编译二进制与真实 Worker/tmux。
+验证包含配置读写与刷新、五模型顺序编辑、预检默认关闭与严格字段校验、100% 保持/101% 切换、未知负载跳过和查询失败/超时 fail-open、全高负载与同值稳定顺序、每模型 `max`/`xhigh`/`high` 等实际最高支持档位选择、冷启动只 spawn/提交一次、暖会话 exact native resume、busy type-ahead 不预检、dispatch 共用 Worker 准入、运行中 queue fallback、quota/非 TraeX/不安全后端回归，以及编译二进制与真实 Worker/tmux。
 
 独立输入首次提交后即保持后继消息，直到当前原生回合出现工作/排队证据或终态，避免首个活动帧之前残留的 composer 放行连续输入。tmux 的异步输入核验可用当前原生工作视口解除等待，并核对读取前后的模型、活动等待状态及既有 generation/输入围栏；旧版紧邻工作 spinner 的 next-turn parking 仍允许正常追加。带有原生 Send after tool call 面板时，按面板标题、输入行和底部模型/Context 几何定位面板上方活动行，避免最后 12 行被长待发预览占满；不能验证为原生面板时保持原窄扫描范围。
