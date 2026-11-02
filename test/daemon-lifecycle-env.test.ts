@@ -111,6 +111,34 @@ describe('resolveDaemonEnv()', () => {
     });
   });
 
+  it('re-reads the sender resolve timeout from .env on a session-origin restart, including rollback', () => {
+    // P2 regression: the CLI pane wrapper does not unset this key, so a
+    // restart from inside a session (or a detached self-upgrade restart)
+    // inherits the OLD daemon's value, and the daemon's dotenv load never
+    // overrides an inherited key. The lifecycle snapshot must therefore
+    // resolve it from the persisted file like the other machine-wide knobs —
+    // otherwise editing it has no effect and, worse, deleting it from the
+    // file can never restore the documented 800ms default.
+    const inheritedWithStaleValue = {
+      BOTMUX_SESSION_ID: 'session-1',
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '3000',
+    };
+
+    expect(resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_SENDER_RESOLVE_TIMEOUT_MS=1500',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '1500',
+    });
+
+    // Rollback: key removed from the file must resolve to '' so the consumer
+    // falls back to its default instead of keeping the inherited stale value.
+    expect(resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=1500',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '',
+    });
+  });
+
   it('keeps ordinary shell overrides ahead of .env', () => {
     expect(resolveDaemonEnv({
       WEB_HOST: '127.0.0.2',
