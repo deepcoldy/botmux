@@ -75,7 +75,7 @@ import {
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
+import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
@@ -697,12 +697,25 @@ import {
   beginOrdinaryTurnRecovery,
   ordinaryTurnRecoverySilentTurnIds,
   cancelOrdinaryTurnRecoveryForUserInput as cancelOrdinaryRecoveryForUserInput,
+  cancelOrdinaryTurnRecoveryForStop,
   disposeOrdinaryTurnRecovery,
   handleOrdinaryTurnRecoveryTerminal,
+  noteOrdinaryTurnRecoveryCliIdle,
   ordinaryTurnRecoveryHandlesTerminal,
   requireOrdinaryTurnRecoveryAttention,
   type OrdinaryTurnRecoveryDispatch,
+  type OrdinaryTurnRetryInput,
 } from '../services/ordinary-turn-recovery.js';
+import {
+  isRecoveryRetryTurnId,
+  recordAndDeliverOrdinaryRecoveryNotice,
+  recoveryCauseI18nKey,
+  recoveryNoticeInitiator,
+  recoveryOutcomeI18nKey,
+  RecoveryNoticeOutbox,
+  type OrdinaryRecoveryNoticeRecord,
+  type RecoveryNoticeHost,
+} from '../services/ordinary-recovery-notice.js';
 import {
   attachReadonlyTaskContinuation,
   beginReadonlyTaskContinuationDelivery,
@@ -2161,6 +2174,11 @@ function supportsBotmuxLarkNativeSessionTitle(cliId: CliId): boolean {
   return cliId === 'codex' || cliId === 'traex';
 }
 
+/** Idle grace before a delivered continuation without a terminal is declared
+ *  unverifiable. Comfortably above the worker's own late-terminal windows
+ *  (StopFailure settles within ~5s of the idle prompt). */
+const ORDINARY_RECOVERY_LOST_CONTINUATION_GRACE_MS = 60_000;
+
 function ordinaryTurnRecoveryEligible(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
@@ -2178,10 +2196,14 @@ function ordinaryTurnRecoveryEligible(
  *  Scheduled turns used to be excluded by an `om_` prefix check, so a transient
  *  provider failure inside an hourly task never auto-continued and only raised
  *  the「未启动自动续跑」card — the most frequent shape of that card on a box that
- *  runs recurring tasks. Everything else (durable replays, HTTP triggers,
- *  meeting deliveries, `bmx-recovery-*` continuations themselves) stays out. */
+ *  runs recurring tasks. A failure card's「重试」re-delivery
+ *  (`bmx-recovery-retry-*`) is a fresh logical turn of the same message and gets
+ *  the same ladder (and, if that also fails, its own failure card). Everything
+ *  else (durable replays, HTTP triggers, meeting deliveries, `bmx-recovery-*`
+ *  continuations themselves) stays out. */
 function isOrdinaryRecoveryTurnId(turnId: string | undefined): turnId is string {
-  return !!turnId && (turnId.startsWith('om_') || parseScheduledTurnId(turnId) !== null);
+  return !!turnId && (turnId.startsWith('om_') || parseScheduledTurnId(turnId) !== null
+    || isRecoveryRetryTurnId(turnId));
 }
 
 /** The identity a scheduled continuation runs as — the task creator, exactly as
@@ -2233,6 +2255,12 @@ function ordinaryTurnRecoveryWarning(
   }
   if (state.lastErrorCode === 'recovery_persist_failed') {
     return tr('worker.ordinary_recovery_persist_failed', { cliName }, locale);
+  }
+  if (state.lastErrorCode === 'recovery_outcome_unverified') {
+    return tr('worker.ordinary_recovery_outcome_unverified', { cliName }, locale);
+  }
+  if (state.lastErrorCode === 'recovery_queued_unrecovered') {
+    return tr('worker.ordinary_recovery_queued_unrecovered', { cliName }, locale);
   }
   return tr('worker.ordinary_recovery_non_retryable', { cliName }, locale);
 }
@@ -2302,25 +2330,143 @@ function notifyOrdinaryTurnRecoveryFailure(
     errorCode: state.lastErrorCode,
     logicalTurnId: state.logicalTurnId,
   });
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(ds),
-    buildSessionTurnFailedCard(ds, {
-      status: 'failed',
-      reason: warning,
-      ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
-      // Include attempted continuations for both exhausted and opted-out
-      // recovery, so the user can see how far automatic handling got.
-      continuations: state.continuationsStarted,
-      // A recovery failure or opt-out does not prove that no side effects
-      // ran. Leave retry safety to the shared error-code policy.
-    }),
-    'interactive',
-    ds.larkAppId,
-    state.logicalTurnId,
-  ).catch(err => logger.error(
-    `[${tag(ds)}] Failed to deliver ordinary-turn recovery warning: `
-    + `${err instanceof Error ? err.message : String(err)}`,
-  ));
+  // The live status card follows the recovery into its failed end state
+  // (「执行失败」 instead of 「等待输入」) — only while it still shows this turn.
+  markFailedTurnIdle(ds, state.logicalTurnId);
+  enqueueOrdinaryRecoveryNotice(ds, state, botCfg);
+}
+
+/** Durable delivery of the one failure card per logical turn. The record is
+ *  persisted before the first send; the outbox retries until Feishu accepts it
+ *  (10-31: the Feishu API itself was failing DNS, and the single-shot notice
+ *  was dropped) and a restart resumes pending records instead of re-sending
+ *  delivered ones. */
+const ordinaryRecoveryNoticeOutbox = new RecoveryNoticeOutbox<ReturnType<typeof setTimeout>>({
+  schedule: (delayMs, run) => {
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+    return timer;
+  },
+  cancel: timer => clearTimeout(timer),
+  log: (level, message) => logger[level](`[recovery-notice] ${message}`),
+});
+
+function enqueueOrdinaryRecoveryNotice(
+  ds: DaemonSession,
+  state: NonNullable<Session['ordinaryTurnRecovery']>,
+  botCfg = getBot(ds.larkAppId).config,
+): void {
+  const replyTarget = pickTurnReplyTarget(ds.session, state.logicalTurnId);
+  const initiator = recoveryNoticeInitiator(state, {
+    larkAppId: ds.larkAppId,
+    ...(replyTarget ? { replyTarget } : {}),
+  });
+  const admittedAt = Date.parse(replyTarget?.updatedAt ?? '');
+  recordAndDeliverOrdinaryRecoveryNotice({
+    state,
+    context: {
+      now: Date.now(),
+      ...(initiator.openId ? { initiatorOpenId: initiator.openId } : {}),
+      ...(initiator.caller ? { retryCaller: initiator.caller } : {}),
+      // Re-delivery replays a Claude CLI envelope verbatim; scheduled fires and
+      // other CLIs keep the card without a retry button.
+      retrySupported: sessionCliId(ds, botCfg) === 'claude-code' && !parseScheduledTurnId(state.logicalTurnId),
+      ...(Number.isFinite(admittedAt) ? { turnAdmittedAt: admittedAt } : {}),
+    },
+    host: ordinaryRecoveryNoticeHost(ds),
+    outbox: ordinaryRecoveryNoticeOutbox,
+    saveList: list => {
+      ds.session.ordinaryRecoveryNotices = list;
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        // A failed write reloads the durable row; keep the notice in memory so
+        // this process still delivers it (a restart then cannot resume it).
+        ds.session.ordinaryRecoveryNotices = list;
+        throw err;
+      }
+    },
+    log: (level, message) => logger[level](`[${tag(ds)}] [recovery-notice] ${message}`),
+  });
+}
+
+function ordinaryRecoveryNoticeHost(ds: DaemonSession): RecoveryNoticeHost {
+  const find = (logicalTurnId: string) => ds.session.ordinaryRecoveryNotices
+    ?.find(entry => entry.logicalTurnId === logicalTurnId);
+  return {
+    key: ds.session.sessionId,
+    list: () => ds.session.ordinaryRecoveryNotices ?? [],
+    update: (logicalTurnId, mutate) => {
+      const record = find(logicalTurnId);
+      if (!record) return undefined;
+      mutate(record);
+      sessionStore.updateSession(ds.session);
+      return find(logicalTurnId);
+    },
+    send: record => requireCallbacks().sessionReply(
+      sessionAnchorId(ds),
+      buildOrdinaryRecoveryNoticeCard(ds, record),
+      'interactive',
+      ds.larkAppId,
+      record.logicalTurnId,
+      { uuid: record.delivery.uuid },
+    ),
+    canDeliver: () => ds.session.status === 'active' && ordinaryTurnRecoveryStillOwnsSession(ds),
+  };
+}
+
+/** Render the failure card for one notice record — the first delivery, every
+ *  delivery retry, and the in-place「已重试」patch all build from the record. */
+export function buildOrdinaryRecoveryNoticeCard(
+  ds: DaemonSession,
+  record: OrdinaryRecoveryNoticeRecord,
+): string {
+  const botCfg = getBot(ds.larkAppId).config;
+  const cliId = sessionCliId(ds, botCfg);
+  const mentionOpenId = record.initiatorOpenId
+    ?? daemonCardFooterRecipientOpenId(ds, cliId)
+    ?? failureNoticeFallbackMentionOpenId(ds);
+  const retried = record.retried?.state === 'accepted' ? record.retried : undefined;
+  return buildRecoveryFailedCard({
+    rootId: sessionAnchorId(ds),
+    sessionId: ds.session.sessionId,
+    cliId,
+    cliName: sessionRuntimeDisplayName(ds) ?? getCliDisplayName(cliId),
+    logicalTurnId: record.logicalTurnId,
+    ...(mentionOpenId ? { mentionOpenId } : {}),
+    causeKey: recoveryCauseI18nKey(record.causeErrorCode ?? record.errorCode),
+    outcomeKey: recoveryOutcomeI18nKey(record),
+    continuations: record.continuations,
+    errorCodes: [record.causeErrorCode, record.errorCode].filter((code): code is string => !!code),
+    ...(record.task ? { task: record.task } : {}),
+    failedAt: new Date(record.createdAt),
+    retry: retried
+      ? { kind: 'retried', byOpenId: retried.byOpenId, at: new Date(retried.at) }
+      : record.retry
+        ? { kind: 'available' }
+        : ds.session.lastFailedTurn?.turnId === record.logicalTurnId
+          // Pre-existing behaviour for recoveries without re-delivery material
+          // (other CLIs, pre-upgrade turns): the admin continue button, pinned
+          // to this exact turn so it can never replay a different message.
+          ? { kind: 'continue_legacy', turnId: record.logicalTurnId }
+          : {
+            kind: 'none',
+            reason: parseScheduledTurnId(record.logicalTurnId)
+              ? 'scheduled'
+              : cliId === 'claude-code' ? 'no_input' : 'unsupported',
+          },
+    terminalUrl: readableTerminalUrlFor(ds),
+    locale: localeForBot(ds.larkAppId),
+  });
+}
+
+/** Persist one mutation of a notice record (used by the card's retry flow). */
+export function updateOrdinaryRecoveryNotice(
+  ds: DaemonSession,
+  logicalTurnId: string,
+  mutate: (record: OrdinaryRecoveryNoticeRecord) => void,
+): OrdinaryRecoveryNoticeRecord | undefined {
+  return ordinaryRecoveryNoticeHost(ds).update(logicalTurnId, mutate);
 }
 
 /** Opting out settles a pending failure before removing its runtime owner.
@@ -2342,6 +2488,7 @@ function disposeIneligibleOrdinaryTurnRecovery(
         ...current, status: 'cancelled' as const, nextAttemptAt: undefined,
         cancelledByTurnId: 'recovery_disabled', lastErrorCode: 'recovery_disabled',
         alertSentAt: current.alertSentAt ?? Date.now(), warningDispatched: true,
+        failureNoticeOwed: true as const,
       };
       // Keep the cancellation/notice fence in memory even if disk is full.
       ds.session.ordinaryTurnRecovery = cancelled;
@@ -2389,7 +2536,25 @@ export function ensureOrdinaryTurnRecoveryAttached(
       supersedeOnUserInput: true,
       resumeRecoveryOnRestore: false,
       backoffMs: [15_000, 45_000],
-    } : {}),
+    } : {
+      // Claude keeps a running recovery across newer input, so a continuation
+      // whose terminal is lost would otherwise own the slot forever. Once the
+      // CLI has been idle this long with no terminal for it, settle failed.
+      lostContinuationGraceMs: ORDINARY_RECOVERY_LOST_CONTINUATION_GRACE_MS,
+      // A usage-limit pause keeps the recovery deliberately `running` until
+      // the limit resets (rate-limited terminals are not failures) — never
+      // settle it as lost while the CLI is limited or back at work.
+      isCliBusy: () => ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing'
+        || ds.lastScreenStatus === 'stalled' || ds.lastScreenStatus === 'limited'
+        || ds.usageLimit?.limited === true,
+      // A type-ahead follow-up that fails while the earlier turn's recovery is
+      // in flight gets its own durable failure card — the same failures the
+      // fallback card would have announced, without its single-shot delivery.
+      ownsQueuedFailure: terminal => shouldNotifyTurnFailure({
+        status: terminal.status,
+        ...(terminal.errorCode !== undefined ? { errorCode: terminal.errorCode } : {}),
+      }),
+    }),
     schedule: (delayMs, run) => {
       const timer = setTimeout(() => {
         try {
@@ -2470,6 +2635,18 @@ export function ensureOrdinaryTurnRecoveryAttached(
     },
     warn: state => notifyOrdinaryTurnRecoveryFailure(ds, state, botCfg),
   });
+  // The failed state and its notice record are two writes: a process that
+  // died between them left the notice owed but unrecorded — re-create it.
+  // Pre-upgrade states carry no marker (the old code already sent theirs).
+  const settled = ds.session.ordinaryTurnRecovery;
+  if (settled?.failureNoticeOwed && settled.warningDispatched
+    && !(ds.session.ordinaryRecoveryNotices ?? []).some(entry => entry.logicalTurnId === settled.logicalTurnId)) {
+    enqueueOrdinaryRecoveryNotice(ds, settled, botCfg);
+  }
+  // A failure card that could not reach Feishu before a restart (or before
+  // this worker generation) continues from its persisted next attempt;
+  // delivered/abandoned records stay inert.
+  ordinaryRecoveryNoticeOutbox.resume(ordinaryRecoveryNoticeHost(ds));
   const restored = ds.session.ordinaryTurnRecovery;
   if (restored?.alertSentAt
     && (restored.status === 'exhausted' || restored.status === 'attention_required')) {
@@ -10825,7 +11002,9 @@ function failOrdinaryImDelivery(
     + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
     + `attempts=${record.attempt} reason=${reason}`,
   );
-  if (record.turnId.startsWith('bmx-recovery-')) {
+  if (record.turnId.startsWith('bmx-recovery-')
+    && (!isRecoveryRetryTurnId(record.turnId)
+      || record.ds.session.ordinaryTurnRecovery?.currentTurnId === record.turnId)) {
     requireOrdinaryTurnRecoveryAttention(
       record.ds.session,
       record.turnId,
@@ -10833,6 +11012,9 @@ function failOrdinaryImDelivery(
     );
     return;
   }
+  // A failure card's re-delivery that the recovery does not own (it queued
+  // behind another live turn) still gets the ordinary delivery-failure notice.
+
   // 决策看板批次（board:<app>:<batchId>）是 owner 在看板前触发的后台投递，不是群里
   // 等来的真人消息：失败不往管家群贴卡片（owner 看不到，横幅还会造成困惑），交给
   // daemon 的回调把批次退回 failed——Dashboard 批次行显示原因并用同一稳定 turnId 重投。
@@ -11286,10 +11468,17 @@ export function sendWorkerSessionInput(
   // Evaluate the cheap message-shape guards FIRST: getBot() THROWS for an
   // unregistered app (IPC tests / in-flight teardown), and every other input
   // type (inject_command, set_display_mode, …) must reach worker.send without
-  // this registry lookup at all. Only a Codex Ctrl+C/ESC needs the cancel.
-  if (message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')
-    && codexCapacityRecoveryCli(sessionCliId(ds, getBot(ds.larkAppId).config))) {
-    cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
+  // this registry lookup at all. Only a Ctrl+C/ESC needs the recovery cancel.
+  if (message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')) {
+    const stopCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
+    if (codexCapacityRecoveryCli(stopCliId)) {
+      cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
+    } else if (stopCliId === 'claude-code') {
+      // The stopped turn's pending/in-flight continuation must neither run
+      // afterwards nor later settle as an "outcome unverified" failure card.
+      try { cancelOrdinaryTurnRecoveryForStop(ds.session); }
+      catch (err) { logger.error(`[${tag(ds)}] Could not cancel recovery on stop: ${err instanceof Error ? err.message : String(err)}`); }
+    }
   }
   if ((message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc'))
     || message.type === 'raw_input' || message.type === 'inject_command') {
@@ -12943,7 +13132,7 @@ function rollbackWorkerForkPreInit(
 function recordAdmittedOrdinaryUserTurn(
   ds: DaemonSession,
   turnId: string,
-  opts: { beginRecovery: boolean; dispatchAttempt?: number },
+  opts: { beginRecovery: boolean; dispatchAttempt?: number; input?: OrdinaryTurnRetryInput },
 ): void {
   const priorRecoveryStatus = ds.session.ordinaryTurnRecovery?.status;
   const priorReadonlyStatus = ds.session.readonlyTaskContinuation?.status;
@@ -12953,9 +13142,11 @@ function recordAdmittedOrdinaryUserTurn(
       if (opts.beginRecovery) {
         // Freeze the fire's silent attribute onto the logical turn now: the
         // scheduler arms the runtime registry before dispatch, so it is readable
-        // here, and only the persisted copy survives a restart.
+        // here, and only the persisted copy survives a restart. The exact input
+        // is frozen alongside for a failure card's re-delivery.
         const state = beginOrdinaryTurnRecovery(ds.session, turnId, {
           silent: isSilentScheduledTurn(ds, turnId),
+          ...(opts.input?.cliInput ? { input: opts.input } : {}),
         });
         recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
           && state.currentTurnId === turnId;
@@ -13270,6 +13461,10 @@ export function sendWorkerInput(
     recordAdmittedOrdinaryUserTurn(ds, admittedTurnId, {
       beginRecovery: true,
       ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+      input: {
+        cliInput: normalized.content,
+        ...(opts.trustedCaller ? { trustedCaller: { ...opts.trustedCaller } } : {}),
+      },
     });
   }
   return true;
@@ -13666,6 +13861,10 @@ export function promoteQueuedActivationTail(
       ...(head.dispatchAttempt !== undefined
         ? { dispatchAttempt: head.dispatchAttempt }
         : {}),
+      input: {
+        cliInput: exactInput.content,
+        ...(exactInput.trustedCaller ? { trustedCaller: { ...exactInput.trustedCaller } } : {}),
+      },
     });
   } catch (err) {
     // Durable ownership already moved to the journal (and Codex ledger). Never
@@ -15332,6 +15531,10 @@ export function forkWorker(
       ...(initDispatchAttempt !== undefined
         ? { dispatchAttempt: initDispatchAttempt }
         : {}),
+      input: {
+        cliInput: prompt,
+        ...(initTrustedCaller ? { trustedCaller: { ...initTrustedCaller } } : {}),
+      },
     });
   }
   ds.spawnedAt = Date.now();
@@ -16854,6 +17057,10 @@ function setupWorkerHandlers(
         // CLI reached its prompt — any previously posted stuck warning is stale.
         invalidateStuckWarning(ds, 'prompt_ready');
         invalidateTuiPrompt(ds, 'prompt_ready', 'resolved');
+        // A delivered recovery continuation that never reported its terminal
+        // must not hold the recovery in `running` forever (10-31: it was
+        // attributed to a synthesised local turn and silenced).
+        noteOrdinaryTurnRecoveryCliIdle(ds.session);
         break;
       }
 
