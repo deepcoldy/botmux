@@ -24157,8 +24157,13 @@ function deliverPassthroughToExistingSession(
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
       return;
     }
-    beginNewTurn(ds, commandContent, turnId);
+    // The worker has the turn from here on: report delivery before the
+    // bookkeeping below, so a throw in beginNewTurn (e.g. a transient session
+    // store error while persisting card state) cannot make the caller believe
+    // the input never landed — the idle auto-compact sweep would otherwise
+    // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
+    beginNewTurn(ds, commandContent, turnId);
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return;
