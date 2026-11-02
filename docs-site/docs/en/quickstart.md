@@ -37,6 +37,8 @@ An interactive wizard; just follow the prompts:
 
 > 🔧 **Creating by QR code auto-configures all permissions and publishes a version** — no manual steps needed. Only if you add `botmux setup --no-open-platform-auto` (skip auto-config) or create the app manually do you need to import the permission JSON yourself in the Open Platform (setup writes the full set to `~/.botmux/lark-scopes.json` and prints a one-click copy command) and create/publish a version; choosing availability "Visible to me only" gets auto-approved.
 
+> 👋 **Welcome message on first launch**: `botmux setup add ... --welcome-message "Reply /init to get started"` (or `--welcome-message @welcome.txt` to read from a file) makes the bot DM its owner once after it first comes online; for an existing bot use `botmux setup edit <process-name|AppID> --welcome-message ...`, and `-` clears it. Delivery is recorded under `welcome-sent/` in the daemon data dir so restarts never resend; a failed send does not block startup and is retried on the next start.
+
 ## Step 3 · Start
 
 ```bash

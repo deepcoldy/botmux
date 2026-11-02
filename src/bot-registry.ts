@@ -1936,6 +1936,8 @@ export interface BotConfig {
    * identity, simply have none and fall back to the resolved allowlist.
    */
   ownerOpenId?: string;
+  /** 首次成功上线后私聊 owner 一次的欢迎语；已发送记录在 dataDir，见 services/welcome-message.ts。 */
+  welcomeMessage?: string;
   allowedChatGroups?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
@@ -4323,6 +4325,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // value that itself needs resolving.
       ownerOpenId: typeof entry.ownerOpenId === 'string' && entry.ownerOpenId.startsWith('ou_')
         ? entry.ownerOpenId
+        : undefined,
+      welcomeMessage: typeof entry.welcomeMessage === 'string' && entry.welcomeMessage.trim()
+        ? entry.welcomeMessage.trim()
         : undefined,
       allowedChatGroups,
       oncallChats,

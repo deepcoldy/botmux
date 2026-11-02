@@ -470,3 +470,17 @@ describe('maskAppSecret', () => {
     expect(maskAppSecret('abcd1234efgh5678')).toBe('abcd••••5678');
   });
 });
+
+describe('--welcome-message', () => {
+  it('is stored on add and can be set / cleared on edit', () => {
+    const add = parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--welcome-message', '回复 /init 开始']);
+    expect(add).toMatchObject({ action: 'add', flags: { welcomeMessage: '回复 /init 开始' } });
+    const bot = buildBotFromAddFlags({ appId: 'cli_x', appSecret: 's', allowedUsers: 'a@b.com', welcomeMessage: '  hi  ' });
+    expect(bot.welcomeMessage).toBe('hi');
+
+    const base = { larkAppId: 'cli_x', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['a@b.com'], welcomeMessage: 'old' };
+    expect(applyBotConfigEdits(base, editInputFromFlags({ welcomeMessage: 'new' })).welcomeMessage).toBe('new');
+    expect(applyBotConfigEdits(base, editInputFromFlags({ welcomeMessage: '-' }))).not.toHaveProperty('welcomeMessage');
+    expect(applyBotConfigEdits(base, editInputFromFlags({ model: 'm' })).welcomeMessage).toBe('old');
+  });
+});
