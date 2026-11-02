@@ -597,8 +597,7 @@ export class CodexBrowserBroker {
       return errorResult(new Error('tool arguments must be an object'));
     }
     try {
-      this.updateTurnMetadata(params.threadId, params.turnId);
-      return await withTimeout(this.execute(params.arguments as Json));
+      return await withTimeout(this.execute(params.arguments as Json, params));
     } catch (error) {
       return errorResult(error);
     }
@@ -623,9 +622,35 @@ export class CodexBrowserBroker {
     if (failure) throw failure.reason;
   }
 
-  private async execute(input: Json): Promise<DynamicToolCallResponse> {
+  private async execute(
+    input: Json,
+    metadata: Pick<DynamicToolCallParams, 'threadId' | 'turnId'>,
+  ): Promise<DynamicToolCallResponse> {
     const operation = requiredString(input.operation, 'operation', 64);
     const browser = await this.getBrowser();
+    // Discovery can recreate the runtime shim, including after a reconnect.
+    this.updateTurnMetadata(metadata.threadId, metadata.turnId);
+    try {
+      return await this.executeWithBrowser(input, operation, browser);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.browser === browser
+        && /^(?:Browser is not available:|native pipe closed before response\b)/i.test(message)) {
+        // Rediscover on the next explicit call. Never replay an operation that
+        // may have run, or discard a newer binding for an older call's error.
+        this.browser = undefined;
+        this.init = undefined;
+        this.claimedTabs.clear();
+      }
+      throw error;
+    }
+  }
+
+  private async executeWithBrowser(
+    input: Json,
+    operation: string,
+    browser: BrowserBinding,
+  ): Promise<DynamicToolCallResponse> {
     if (operation === 'list_tabs') {
       return textResult({ browserFamily: this.opts.family, tabs: await browser.user.openTabs() });
     }
@@ -1132,8 +1157,8 @@ export class CodexBrowserBroker {
     const modules = this.opts.modules ?? await loadBrowserPluginModules(
       resolveCodexBrowserPluginRoot(this.opts.pluginRoot),
     );
+    if (!this.runtimeShim) this.previousNodeRepl = (globalThis as Json).nodeRepl;
     const nodeRepl = this.createRuntimeShim();
-    this.previousNodeRepl = (globalThis as Json).nodeRepl;
     (globalThis as Json).nodeRepl = nodeRepl;
     nodeRepl.rpc = async (name: string, request: { method: string; params?: unknown }) => {
       if (name !== 'browser') throw new Error(`unsupported trusted service: ${name}`);

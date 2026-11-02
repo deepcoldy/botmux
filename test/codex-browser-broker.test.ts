@@ -137,6 +137,94 @@ describe.sequential('CodexBrowserBroker', () => {
     expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['Browser is not available: 1', 'native pipe closed before response'])(
+    'rediscovers after a cached browser disconnects: %s', async message => {
+      const previousRuntime = (globalThis as any).nodeRepl;
+      const stale = fakeModules();
+      const fresh = fakeModules();
+      const get = vi.fn().mockResolvedValueOnce(stale.browser).mockResolvedValue(fresh.browser);
+      stale.modules.setupBrowserRuntime = vi.fn(async () => ({ browsers: { get } }));
+      broker = new CodexBrowserBroker({ sessionId: 'cached-reconnect', family: 'chrome', modules: stale.modules });
+
+      expect((await broker.handleToolCall(call({ operation: 'claim_tab', tabId: 'user-7' }))).success).toBe(true);
+      stale.browser.user.openTabs.mockRejectedValueOnce(new Error(message));
+      const disconnected = await broker.handleToolCall(call({ operation: 'list_tabs' }));
+      expect(disconnected.success).toBe(false);
+      expect(get).toHaveBeenCalledOnce();
+
+      const recoveredCall = { ...call({ operation: 'list_tabs' }), threadId: 'thread-recovered', turnId: 'turn-recovered' };
+      fresh.browser.user.openTabs.mockImplementation(async () => {
+        const meta = JSON.parse((globalThis as any).nodeRepl.requestMeta['x-codex-turn-metadata']);
+        expect(meta).toMatchObject({ thread_id: 'thread-recovered', turn_id: 'turn-recovered' });
+        return [{ id: 'user-7', title: 'Existing tab', url: 'https://example.test/' }];
+      });
+      expect((await broker.handleToolCall(recoveredCall)).success).toBe(true);
+      expect(get).toHaveBeenCalledTimes(2);
+
+      expect((await broker.handleToolCall(call({ operation: 'snapshot', tabId: 'claimed-7' }))).success).toBe(true);
+      expect(fresh.tab.ax.get).toHaveBeenCalledOnce();
+      expect(stale.tab.ax.get).not.toHaveBeenCalled();
+      broker.close();
+      expect((globalThis as any).nodeRepl).toBe(previousRuntime);
+    },
+  );
+
+  it('invalidates a disconnected binding without replaying an uncertain click', async () => {
+    const stale = fakeModules();
+    const fresh = fakeModules();
+    const get = vi.fn().mockResolvedValueOnce(stale.browser).mockResolvedValue(fresh.browser);
+    stale.modules.setupBrowserRuntime = vi.fn(async () => ({ browsers: { get } }));
+    broker = new CodexBrowserBroker({ sessionId: 'uncertain-click', family: 'chrome', modules: stale.modules });
+    await broker.handleToolCall(call({ operation: 'claim_tab', tabId: 'user-7' }));
+    stale.tab.ax.click.mockRejectedValueOnce(new Error('native pipe closed before response'));
+
+    const failed = await broker.handleToolCall(call({ operation: 'click', tabId: 'claimed-7', elementIndex: 12 }));
+    expect(failed.success).toBe(false);
+    expect(stale.tab.ax.click).toHaveBeenCalledOnce();
+    expect(get).toHaveBeenCalledOnce();
+    expect(fresh.tab.ax.click).not.toHaveBeenCalled();
+
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(stale.tab.ax.click).toHaveBeenCalledOnce();
+    expect(fresh.tab.ax.click).not.toHaveBeenCalled();
+  });
+
+  it('keeps a fresh binding when an older in-flight operation fails late', async () => {
+    const stale = fakeModules();
+    const fresh = fakeModules();
+    const get = vi.fn().mockResolvedValueOnce(stale.browser).mockResolvedValue(fresh.browser);
+    stale.modules.setupBrowserRuntime = vi.fn(async () => ({ browsers: { get } }));
+    broker = new CodexBrowserBroker({ sessionId: 'late-disconnect', family: 'chrome', modules: stale.modules });
+    await broker.handleToolCall(call({ operation: 'claim_tab', tabId: 'user-7' }));
+    let rejectClick!: (error: Error) => void;
+    stale.tab.ax.click.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectClick = reject; }));
+    const pending = broker.handleToolCall(call({ operation: 'click', tabId: 'claimed-7', elementIndex: 12 }));
+    await vi.waitFor(() => expect(rejectClick).toBeTypeOf('function'));
+
+    stale.browser.user.openTabs.mockRejectedValueOnce(new Error('Browser is not available: 1'));
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(false);
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    rejectClick(new Error('native pipe closed before response'));
+    expect((await pending).success).toBe(false);
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(stale.tab.ax.click).toHaveBeenCalledOnce();
+    expect(fresh.tab.ax.click).not.toHaveBeenCalled();
+  });
+
+  it.each(['Permission denied by browser safety policy', 'Locator deadline exceeded'])(
+    'keeps its binding after a non-transport failure: %s', async message => {
+      const fake = fakeModules();
+      broker = new CodexBrowserBroker({ sessionId: 'non-transport-error', family: 'chrome', modules: fake.modules });
+      await broker.handleToolCall(call({ operation: 'claim_tab', tabId: 'user-7' }));
+      fake.tab.ax.click.mockRejectedValueOnce(new Error(message));
+      expect((await broker.handleToolCall(call({ operation: 'click', tabId: 'claimed-7', elementIndex: 12 }))).success).toBe(false);
+      expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+      expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledOnce();
+    },
+  );
+
   it('bridges app-server turn completion into the browser runtime hook', async () => {
     const fake = fakeModules();
     const turnEnded = vi.fn(async () => {});
