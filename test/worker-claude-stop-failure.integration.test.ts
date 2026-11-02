@@ -140,6 +140,21 @@ describe.skipIf(!runnable)('Claude StopFailure fallback, hook client → daemon 
     expect(g.notices().map(n => n.message)).not.toContain(UNSETTLED_NOTICE);
   }, 120_000);
 
+  it('stays quiet for a report after a turn that ended normally, with no record in the transcript', async () => {
+    // Seen live: StopFailure reports arriving seconds after ordinary turns,
+    // with no API-error record anywhere in the conversation's transcript.
+    const h = setup({ turnMs: 1_000 });
+    const g = await startWorker(h);
+    g.child.send({ type: 'message', content: 'an ordinary task', turnId: 'om_ordinary' } satisfies DaemonToWorker);
+    await g.waitFor(() => terminalsOf(g, 'om_ordinary').length > 0, 'the transcript terminal');
+    expect(terminalsOf(g, 'om_ordinary').map(m => m.status)).toEqual(['completed']);
+
+    expect(await runHookClient(h, 'om_ordinary')).toBe(0);
+    await sleep(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS + 2_000);
+    expect(terminalsOf(g, 'om_ordinary')).toHaveLength(1);
+    expect(g.notices().map(n => n.message)).not.toContain(UNSETTLED_NOTICE);
+  }, 120_000);
+
   it('reports a failure that lands after its turn was already closed', async () => {
     // The quiet screen mid-turn closes the turn as completed; the API error
     // that ends the real work afterwards has no turn left to fail.
