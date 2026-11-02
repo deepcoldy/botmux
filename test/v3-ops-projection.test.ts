@@ -272,3 +272,438 @@ describe('read-only projection tolerates a corrupt journal (hardening #11 carve-
     }
   });
 });
+
+describe('v3 ops-projection — 负责 Bot、耗时与尝试记录', () => {
+  /** Write journal lines with explicit `ts` so timing assertions are exact. */
+  function writeJournal(runDir: string, events: Array<Record<string, unknown> & { ts: number }>): void {
+    writeFileSync(join(runDir, 'journal.ndjson'), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  }
+
+  function buildTimedRun(base: string, opts: { snapshot?: boolean } = {}): string {
+    const runId = 'timed-261103-0101';
+    const runDir = join(base, runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+      runId,
+      nodes: [
+        { id: 'research', type: 'goal', goal: '调研', depends: [], inputs: [] },
+        { id: 'report', type: 'goal', goal: '写报告', bot: 'cli_writer', depends: ['research'], inputs: [] },
+        { id: 'approve', type: 'goal', goal: '确认', depends: ['research'], inputs: [], humanGate: { prompt: 'ok?', options: ['approve', 'reject'] } },
+        { id: 'send', type: 'host', executor: 'feishu-send', depends: ['report'], inputs: [], input: {} },
+        {
+          id: 'fix', type: 'loop', maxIterations: 2, bot: 'cli_writer', depends: ['research'], inputs: [],
+          body: { nodes: [
+            { id: 'code', type: 'goal', goal: '改代码', depends: [], inputs: [] },
+            { id: 'verify', type: 'goal', goal: '验证', bot: 'cli_checker', depends: ['code'], inputs: [] },
+          ] },
+          exit: { node: 'verify', when: { path: 'result.passed', equals: true } },
+          output: { from: 'code' },
+        },
+      ],
+    }));
+    if (opts.snapshot !== false) {
+      writeFileSync(join(runDir, 'bots.snapshot.json'), JSON.stringify({
+        '': {
+          larkAppId: 'cli_default', cliId: 'claude-code', model: 'opus',
+          workingDir: '/private/default-wd', sandboxPaths: { readWrite: ['/private/rw'] }, wrapperCli: 'secret-wrapper',
+        },
+        cli_writer: { larkAppId: 'cli_writer', cliId: 'codex', workingDir: '/private/writer-wd' },
+        cli_checker: { larkAppId: 'cli_checker', cliId: 'seed', workingDir: '/private/checker-wd' },
+      }));
+    }
+    writeJournal(runDir, [
+      { ts: 1_000, type: 'runStarted', runId },
+      // research: blocked on attempt 1, retried, succeeded on attempt 2
+      { ts: 1_000, type: 'nodeDispatched', nodeId: 'research', attemptId: 'research/attempts/001' },
+      { ts: 5_000, type: 'nodeBlocked', nodeId: 'research', attemptId: 'research/attempts/001', errorClass: 'contractViolation', errorCode: 'MANIFEST_MISSING', message: '/private/path leaked?' },
+      { ts: 6_000, type: 'nodeRetryRequested', nodeId: 'research', previousAttemptId: 'research/attempts/001', nextAttemptId: 'research/attempts/002', reason: 'blockedRetry' },
+      { ts: 9_000, type: 'nodeDispatched', nodeId: 'research', attemptId: 'research/attempts/002' },
+      { ts: 12_000, type: 'nodeSucceeded', nodeId: 'research', attemptId: 'research/attempts/002', manifestPath: join(runDir, 'research/attempts/002/manifest.json') },
+      // report: running on its named bot
+      { ts: 13_000, type: 'nodeDispatched', nodeId: 'report', attemptId: 'report/attempts/001' },
+      // approve: waiting on a human gate
+      { ts: 14_000, type: 'gateDispatched', nodeId: 'approve', waitId: 'approve-gate' },
+      // fix loop: round 1, body instance `code` running on the loop's bot
+      { ts: 15_000, type: 'loopStarted', loopId: 'fix' },
+      { ts: 15_000, type: 'loopIterationStarted', loopId: 'fix', iteration: 1 },
+      { ts: 16_000, type: 'nodeDispatched', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', loop: { loopId: 'fix', iteration: 1, bodyNodeId: 'code' } },
+    ]);
+    return runDir;
+  }
+
+  it('按冻结快照投影负责 Bot（默认 Bot / 指名 Bot / Loop 继承），宿主节点只给执行器，且不泄露快照里的其它字段', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-bot-'));
+    try {
+      const runDir = buildTimedRun(base);
+      const names: Record<string, string> = { cli_default: '主Bot', cli_writer: '写作Bot' };
+      const view = projectRun('timed-261103-0101', runDir, { botName: (id) => names[id], now: () => 20_000 });
+      const byId = new Map(view.nodes.map((n) => [n.id, n]));
+
+      expect(byId.get('research')!.bot).toEqual({ larkAppId: 'cli_default', cliId: 'claude-code', model: 'opus', name: '主Bot' });
+      expect(byId.get('report')!.bot).toEqual({ selector: 'cli_writer', larkAppId: 'cli_writer', cliId: 'codex', name: '写作Bot' });
+      // loop body instance: body node without its own bot inherits the loop's selector
+      expect(byId.get('fix.i001.code')!.bot).toEqual({ selector: 'cli_writer', larkAppId: 'cli_writer', cliId: 'codex', name: '写作Bot' });
+      // host node: executor, never a bot; loop container: neither
+      expect(byId.get('send')!.host).toEqual({ executor: 'feishu-send' });
+      expect(byId.get('send')!.bot).toBeUndefined();
+      expect(byId.get('fix')!.bot).toBeUndefined();
+
+      const json = JSON.stringify(view);
+      for (const secret of ['/private/', 'workingDir', 'sandboxPaths', 'secret-wrapper', 'leaked']) {
+        expect(json).not.toContain(secret);
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('没有 bots.snapshot.json 时回退到 DAG 里写的选择器，不臆造默认 Bot', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-bot-'));
+    try {
+      const runDir = buildTimedRun(base, { snapshot: false });
+      const view = projectRun('timed-261103-0101', runDir);
+      const byId = new Map(view.nodes.map((n) => [n.id, n]));
+      expect(byId.get('report')!.bot).toEqual({ selector: 'cli_writer' });
+      expect(byId.get('research')!.bot).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('按 journal 时间戳给出当前尝试的起止、审批等待起点和全部尝试记录', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-time-'));
+    try {
+      const runDir = buildTimedRun(base);
+      const view = projectRun('timed-261103-0101', runDir, { now: () => 20_000 });
+      const byId = new Map(view.nodes.map((n) => [n.id, n]));
+      expect(view.generatedAt).toBe(20_000);
+
+      const research = byId.get('research')!;
+      expect(research.status).toBe('done');
+      // current attempt is the retry: 9s → 12s, not the first dispatch at 1s
+      expect(research.startedAt).toBe(9_000);
+      expect(research.endedAt).toBe(12_000);
+      expect(research.attempts).toEqual([
+        { attemptId: 'research/attempts/001', startedAt: 1_000, endedAt: 5_000, outcome: 'blocked', errorCode: 'MANIFEST_MISSING' },
+        { attemptId: 'research/attempts/002', startedAt: 9_000, endedAt: 12_000, outcome: 'succeeded' },
+      ]);
+
+      const report = byId.get('report')!;
+      expect(report.status).toBe('running');
+      expect(report.startedAt).toBe(13_000);
+      expect(report.endedAt).toBeUndefined();
+
+      const approve = byId.get('approve')!;
+      expect(approve.status).toBe('gateWaiting');
+      expect(approve.gateSince).toBe(14_000);
+      expect(approve.startedAt).toBeUndefined();
+
+      const loop = byId.get('fix')!;
+      expect(loop.startedAt).toBe(15_000);
+      expect(loop.endedAt).toBeUndefined();
+
+      const pendingHost = byId.get('send')!;
+      expect(pendingHost.status).toBe('pending');
+      expect(pendingHost.startedAt).toBeUndefined();
+      expect(pendingHost.attempts).toEqual([]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('被 daemon 重启打断的尝试记为「中断」，不会把节点时间算到下一次尝试之前', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-drain-'));
+    try {
+      const runId = 'drain-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'a', type: 'goal', goal: 'x', depends: [], inputs: [] }],
+      }));
+      writeJournal(runDir, [
+        { ts: 100, type: 'runStarted', runId },
+        { ts: 100, type: 'nodeDispatched', nodeId: 'a', attemptId: 'a/attempts/001' },
+        { ts: 400, type: 'nodeAttemptDrained', nodeId: 'a', attemptId: 'a/attempts/001', reason: 'orphanRecovery' },
+        { ts: 500, type: 'nodeDispatched', nodeId: 'a', attemptId: 'a/attempts/002' },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 900 });
+      const a = view.nodes[0]!;
+      expect(a.attempts.map((x) => [x.attemptId, x.outcome, x.endedAt])).toEqual([
+        ['a/attempts/001', 'interrupted', 400],
+        ['a/attempts/002', undefined, undefined],
+      ]);
+      expect(a.startedAt).toBe(500);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('循环迭代耗尽阻断时，等人时长从 exhausted 决策的时间算起（loop 容器没有 nodeBlocked 事件）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-exhausted-'));
+    try {
+      const runId = 'exhausted-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{
+          id: 'fix', type: 'loop', maxIterations: 1, depends: [], inputs: [],
+          body: { nodes: [{ id: 'code', type: 'goal', goal: '改', depends: [], inputs: [] }] },
+          exit: { node: 'code', when: { path: 'result.passed', equals: true } },
+          output: { from: 'code' },
+        }],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 1_000, type: 'loopStarted', loopId: 'fix' },
+        { ts: 1_000, type: 'loopIterationStarted', loopId: 'fix', iteration: 1 },
+        { ts: 2_000, type: 'nodeDispatched', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', loop: { loopId: 'fix', iteration: 1, bodyNodeId: 'code' } },
+        { ts: 5_000, type: 'nodeSucceeded', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', manifestPath: join(runDir, 'm.json') },
+        { ts: 6_000, type: 'loopIterationDecision', loopId: 'fix', iteration: 1, decision: 'exhausted' },
+        { ts: 6_000, type: 'runBlocked', blockedNodeId: 'fix' },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 60_000 });
+      const loop = view.nodes[0]!;
+      expect(loop.status).toBe('blocked');
+      expect(loop.startedAt).toBe(1_000);
+      expect(loop.endedAt).toBe(6_000);
+
+      // After a human grants another round and the loop exits, the earlier
+      // exhausted stamp must NOT survive as the node's end time.
+      const runDir2 = join(base, 'run2');
+      mkdirSync(runDir2, { recursive: true });
+      writeFileSync(join(runDir2, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{
+          id: 'fix', type: 'loop', maxIterations: 1, depends: [], inputs: [],
+          body: { nodes: [{ id: 'code', type: 'goal', goal: '改', depends: [], inputs: [] }] },
+          exit: { node: 'code', when: { path: 'result.passed', equals: true } },
+          output: { from: 'code' },
+        }],
+      }));
+      writeJournal(runDir2, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 1_000, type: 'loopStarted', loopId: 'fix' },
+        { ts: 1_000, type: 'loopIterationStarted', loopId: 'fix', iteration: 1 },
+        { ts: 2_000, type: 'nodeDispatched', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', loop: { loopId: 'fix', iteration: 1, bodyNodeId: 'code' } },
+        { ts: 3_000, type: 'nodeSucceeded', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', manifestPath: join(runDir2, 'm1.json') },
+        { ts: 4_000, type: 'loopIterationDecision', loopId: 'fix', iteration: 1, decision: 'exhausted' },
+        { ts: 5_000, type: 'runBlocked', blockedNodeId: 'fix' },
+        { ts: 6_000, type: 'loopIterationGranted', loopId: 'fix', fromIteration: 1, by: 'owner' },
+        { ts: 7_000, type: 'loopIterationStarted', loopId: 'fix', iteration: 2 },
+        { ts: 8_000, type: 'nodeDispatched', nodeId: 'fix.i002.code', attemptId: 'fix.i002.code/attempts/001', loop: { loopId: 'fix', iteration: 2, bodyNodeId: 'code' } },
+        { ts: 9_000, type: 'nodeSucceeded', nodeId: 'fix.i002.code', attemptId: 'fix.i002.code/attempts/001', manifestPath: join(runDir2, 'm2.json') },
+        { ts: 10_000, type: 'loopIterationDecision', loopId: 'fix', iteration: 2, decision: 'exit' },
+        { ts: 11_000, type: 'nodeSucceeded', nodeId: 'fix', attemptId: 'fix-seal/attempts/001', manifestPath: join(runDir2, 'seal.json') },
+      ]);
+      const view2 = projectRun(runId, runDir2, { now: () => 60_000 });
+      const loop2 = view2.nodes[0]!;
+      expect(loop2.status).toBe('done');
+      expect(loop2.endedAt).toBe(11_000);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('宿主动作结果不确定直接阻断时，等人时长从 hostEffectUncertain 的时间算起', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-uncertain-'));
+    try {
+      const runId = 'uncertain-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'send', type: 'host', executor: 'feishu-send', depends: [], inputs: [], input: {} }],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        {
+          ts: 2_000, type: 'hostInputPrepared', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send', provider: 'x',
+          inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+          inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+        },
+        {
+          ts: 3_000, type: 'hostEffectIntent', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send', provider: 'x',
+          inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+          inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+        },
+        {
+          ts: 8_000, type: 'hostEffectUncertain', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send',
+          reason: 'providerUncertain', errorCode: 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED',
+        },
+        { ts: 8_000, type: 'runBlocked', blockedNodeId: 'send' },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 60_000 });
+      const node = view.nodes[0]!;
+      expect(node.status).toBe('blocked');
+      expect(node.startedAt).toBe(3_000);
+      expect(node.endedAt).toBe(8_000);
+      expect(node.attempts).toEqual([{
+        attemptId: 'send#001/attempts/001',
+        instanceId: 'send#001',
+        startedAt: 3_000,
+        endedAt: 8_000,
+        outcome: 'blocked',
+        errorCode: 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED',
+      }]);
+      expect(node.host).toEqual({ executor: 'feishu-send' });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('宿主动作成功时，尝试从 hostEffectIntent 开始、到 nodeSucceeded 结算（host 节点没有 nodeDispatched）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-hostok-'));
+    try {
+      const runId = 'hostok-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'send', type: 'host', executor: 'feishu-send', depends: [], inputs: [], input: {} }],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        {
+          ts: 2_000, type: 'hostInputPrepared', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send', provider: 'x',
+          inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+          inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+        },
+        {
+          ts: 3_000, type: 'hostEffectIntent', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send', provider: 'x',
+          inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+          inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+        },
+        { ts: 9_000, type: 'nodeSucceeded', nodeId: 'send', instanceId: 'send#001', attemptId: 'send#001/attempts/001', manifestPath: join(runDir, 'm.json') },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 60_000 });
+      const node = view.nodes[0]!;
+      expect(node.status).toBe('done');
+      expect(node.startedAt).toBe(3_000);
+      expect(node.endedAt).toBe(9_000);
+      expect(node.attempts).toEqual([{
+        attemptId: 'send#001/attempts/001',
+        instanceId: 'send#001',
+        startedAt: 3_000,
+        endedAt: 9_000,
+        outcome: 'succeeded',
+      }]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('旧实例审批卡的过期 gateResolved 不清掉新一轮 gate 的等待起点（revisit 会换新 waitId）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proje-stategate-'));
+    try {
+      const runId = 'stategate-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [
+          { id: 'a', type: 'goal', goal: 'a', depends: [], inputs: [], humanGate: { prompt: 'ok?', options: ['approve'] } },
+          { id: 'b', type: 'goal', goal: 'b', depends: [], inputs: [] },
+        ],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 2_000, type: 'gateDispatched', nodeId: 'a', instanceId: 'a#001', waitId: 'a#001-gate' },
+        { ts: 3_000, type: 'nodeInstanceSuperseded', nodeId: 'a', instanceId: 'a#001', byNodeId: 'b', reason: 'refresh' },
+        { ts: 4_000, type: 'gateDispatched', nodeId: 'a', instanceId: 'a#002', waitId: 'a#002-gate' },
+        { ts: 5_000, type: 'gateResolved', nodeId: 'a', instanceId: 'a#001', waitId: 'a#001-gate', resolution: 'approved', by: 'u' },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 60_000 });
+      const a = view.nodes[0]!;
+      expect(a.status).toBe('gateWaiting');
+      expect(a.gateSince).toBe(4_000);
+
+      // The matching waitId still clears it as before.
+      const runDir2 = join(base, 'ok');
+      mkdirSync(runDir2, { recursive: true });
+      writeFileSync(join(runDir2, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{ id: 'a', type: 'goal', goal: 'a', depends: [], inputs: [], humanGate: { prompt: 'ok?', options: ['approve'] } }],
+      }));
+      writeJournal(runDir2, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 2_000, type: 'gateDispatched', nodeId: 'a', waitId: 'a-gate' },
+        { ts: 3_000, type: 'gateResolved', nodeId: 'a', waitId: 'a-gate', resolution: 'approved', by: 'u' },
+      ]);
+      const view2 = projectRun(runId, runDir2, { now: () => 60_000 });
+      expect(view2.nodes[0]!.status).toBe('pending');
+      expect(view2.nodes[0]!.gateSince).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('宿主重试在 intent 之前就被 nodeBlocked 时，结束时间取这次阻断而不是上一次尝试的结束', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-hostretry-'));
+    try {
+      const runId = 'hostretry-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'send', type: 'host', executor: 'feishu-send', depends: [], inputs: [], input: {} }],
+      }));
+      const hostFields = (attemptId: string) => ({
+        nodeId: 'send', instanceId: 'send#001', attemptId, executor: 'feishu-send', provider: 'x',
+        inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+        inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+      });
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 2_000, type: 'hostInputPrepared', ...hostFields('send#001/attempts/001') },
+        { ts: 3_000, type: 'hostEffectIntent', ...hostFields('send#001/attempts/001') },
+        { ts: 8_000, type: 'hostEffectUncertain', nodeId: 'send', instanceId: 'send#001', attemptId: 'send#001/attempts/001', executor: 'feishu-send', reason: 'providerUncertain', errorCode: 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED' },
+        { ts: 8_000, type: 'runBlocked', blockedNodeId: 'send' },
+        { ts: 9_000, type: 'nodeRetryRequested', nodeId: 'send', instanceId: 'send#001', previousAttemptId: 'send#001/attempts/001', nextAttemptId: 'send#001/attempts/002', reason: 'blockedRetry', resetGate: true },
+        // attempt 2 is rejected by the pre-intent precondition, so it never opens
+        // an attempt row: the LAST attempt is still attempt 1.
+        { ts: 9_500, type: 'hostInputPrepared', ...hostFields('send#001/attempts/002') },
+        { ts: 10_000, type: 'nodeBlocked', nodeId: 'send', instanceId: 'send#001', attemptId: 'send#001/attempts/002', errorClass: 'resultInvalid', errorCode: 'HOST_INPUT_PRECONDITION_FAILED', message: 'x' },
+        { ts: 10_000, type: 'runBlocked', blockedNodeId: 'send' },
+      ]);
+      const node = projectRun(runId, runDir, { now: () => 60_000 }).nodes[0]!;
+      expect(node.status).toBe('blocked');
+      expect(node.errorCode).toBe('HOST_INPUT_PRECONDITION_FAILED');
+      expect(node.attempts.map((attempt) => attempt.attemptId)).toEqual(['send#001/attempts/001']);
+      // 耗时与「等人」都按这次阻断算，而不是上一次尝试的 8_000。
+      expect(node.startedAt).toBe(3_000);
+      expect(node.endedAt).toBe(10_000);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('被替代实例的迟到 nodeSucceeded 不当作节点的结束时间（materialize 已冻结该实例）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-stalesettle-'));
+    try {
+      const runId = 'stalesettle-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'a', type: 'goal', goal: 'a', depends: [], inputs: [] }],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 2_000, type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001' },
+        { ts: 3_000, type: 'nodeInstanceSuperseded', nodeId: 'a', instanceId: 'a#001', byNodeId: 'z', reason: 'refresh' },
+        { ts: 4_000, type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#002', attemptId: 'a#002/attempts/001' },
+        { ts: 5_000, type: 'nodeBlocked', nodeId: 'a', instanceId: 'a#002', attemptId: 'a#002/attempts/001', errorClass: 'workerError', errorCode: 'X' },
+        { ts: 6_000, type: 'runBlocked', blockedNodeId: 'a' },
+        { ts: 9_000, type: 'nodeSucceeded', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001', manifestPath: join(runDir, 'm.json') },
+      ]);
+      const node = projectRun(runId, runDir, { now: () => 60_000 }).nodes[0]!;
+      expect(node.status).toBe('blocked');
+      expect(node.endedAt).toBe(5_000);
+      expect(node.startedAt).toBe(4_000);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});

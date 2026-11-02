@@ -85,13 +85,19 @@ describe('parseV3SavedWorkflowCommand', () => {
     expect(parseV3SavedWorkflowCommand('/workflow cancel r extra')).toMatchObject({ kind: 'invalid' });
   });
 
-  it('reserves the retired v2 resume verb and points to v3 retry/static archive', () => {
+  it('reserves the retired v2 resume verb instead of starting a grill', () => {
+    expect(parseV3SavedWorkflowCommand('/workflow resume old-run')).toMatchObject({ kind: 'invalid' });
+  });
+
+  it('resume 的报错只能推荐 daemon 真正认的 /workflow 子命令，不能把人引到会被当成新目标的写法', () => {
     const result = parseV3SavedWorkflowCommand('/workflow resume old-run');
-    expect(result).toMatchObject({ kind: 'invalid' });
     const error = result && 'error' in result ? result.error : '';
-    expect(error).toContain('resume 已下线');
-    expect(error).toContain('/workflow retry');
-    expect(error).toContain('静态归档');
+    const advertised = [...error.matchAll(/\/workflow\s+([a-z]+)/gi)].map((m) => m[1]!);
+    for (const verb of advertised) {
+      // An unreserved verb returns null here and the daemon then turns the whole
+      // message into a natural-language grill goal — the hint would mislead.
+      expect(parseV3SavedWorkflowCommand(`/workflow ${verb} some-run`), `/workflow ${verb}`).not.toBeNull();
+    }
   });
 
   it('treats words before the first key=value as the saved name', () => {

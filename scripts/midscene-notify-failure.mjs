@@ -9,10 +9,15 @@
 // collects the pull requests merged in it, and comments on each one with the
 // failed cases and the published report, mentioning the author and the
 // repository owner. A push without a pull request gets a commit comment.
+//
+// Failures the Midscene model quota explains (HTTP 429, #2670) say nothing
+// about the merged code, so they get one line in the run summary instead of
+// comments. A run with other failures still comments, without the quota rows.
 
-import { readFile } from 'node:fs/promises';
+import { appendFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isQuotaFailureMessage, quotaNote, quotaResetTime } from './midscene-quota.mjs';
 
 // Comment bodies are bounded; a broken run can fail every case.
 const MAX_LISTED_CASES = 20;
@@ -80,10 +85,11 @@ export function feishuJobRan(queueResult) {
 
 /**
  * Why the run counts as failed, from the job results, or null when it did not.
- * @param {{ dashboard?: string, feishuQueue?: string, feishu?: string, report?: string }} results
+ * @param {{ modelCheck?: string, dashboard?: string, feishuQueue?: string, feishu?: string, report?: string }} results
  */
 export function failureReasons(results) {
   const reasons = [];
+  if (results.modelCheck === 'failure') reasons.push('Midscene 模型服务预检失败');
   if (results.dashboard === 'failure') reasons.push('Dashboard Midscene 失败');
   if (results.feishuQueue === 'failure') {
     reasons.push('等待飞书 live 席位超时，飞书用例未运行（席位排队问题，不是本次合入的回归；需要结果时在 master 上手动 dispatch）');
@@ -91,6 +97,44 @@ export function failureReasons(results) {
   if (results.feishu === 'failure') reasons.push('Feishu live Midscene 失败');
   if (results.report === 'failure') reasons.push('报告生成失败');
   return reasons;
+}
+
+const isDashboardCase = (testCase) => testCase.project === 'dashboard-smoke';
+const isFeishuCase = (testCase) => typeof testCase.project === 'string' && testCase.project.startsWith('feishu-');
+
+/**
+ * Split the run's failures into those the model quota explains and the rest.
+ * A suite counts as explained only when it has failed cases and every one of
+ * them failed on the quota, or (Feishu) its own preflight found the quota gone
+ * after it waited for the slot. Anything else — a timeout, a build step, a case
+ * failing for another reason — stays a real failure.
+ * @param {{
+ *   results: { modelCheck?: string, dashboard?: string, feishuQueue?: string, feishu?: string, report?: string },
+ *   feishuQuotaExhausted?: boolean,
+ *   manifest?: { cases?: Array<{ project?: string, status?: string, failure?: string | null }> } | null,
+ *   feishuRan?: boolean,
+ * }} input
+ */
+export function assessFailures({ results, feishuQuotaExhausted = false, manifest, feishuRan = true }) {
+  const failed = (Array.isArray(manifest?.cases) ? manifest.cases : []).filter((testCase) => testCase.status === 'failed');
+  const quotaCases = failed.filter((testCase) => isQuotaFailureMessage(testCase.failure));
+  const explainedByQuota = (cases) => cases.length > 0 && cases.every((testCase) => isQuotaFailureMessage(testCase.failure));
+  const dashboardQuota = results.dashboard === 'failure' && explainedByQuota(failed.filter(isDashboardCase));
+  const feishuQuota = results.feishu === 'failure'
+    && (feishuQuotaExhausted || explainedByQuota(failed.filter(isFeishuCase)));
+  const reasons = failureReasons({
+    ...results,
+    dashboard: dashboardQuota ? 'quota' : results.dashboard,
+    feishu: feishuQuota ? 'quota' : results.feishu,
+  });
+  const quotaHit = dashboardQuota || feishuQuota || quotaCases.length > 0;
+  return {
+    reasons,
+    // Nothing left to tell the authors: the summary line is the whole report.
+    quotaOnly: reasons.length === 0 && quotaHit,
+    quotaCases,
+    cases: problemCases(manifest, { feishuRan }).filter((testCase) => !quotaCases.includes(testCase)),
+  };
 }
 
 // Backslashes first: `a\|b` must not become `a\\|b`, whose pipe splits the cell.
@@ -106,7 +150,7 @@ export function alreadyNotified(comments, runId) {
   return Array.isArray(comments) && comments.some((comment) => String(comment?.body ?? '').includes(marker));
 }
 
-export function commentBody({ mentions, reasons, cases, reportUrl, runUrl, range, pulls, self, runId }) {
+export function commentBody({ mentions, reasons, cases, reportUrl, runUrl, range, pulls, self, runId, quotaCases = 0, quotaReset = null }) {
   const lines = [];
   const who = [...new Set(mentions.filter(Boolean))].map((login) => `@${login}`).join(' ');
   lines.push(`${who ? `${who} ` : ''}合入 master 后的 Midscene E2E 失败：${reasons.join('；')}。`);
@@ -127,25 +171,30 @@ export function commentBody({ mentions, reasons, cases, reportUrl, runUrl, range
     if (cases.length > MAX_LISTED_CASES) lines.push('', `另有 ${cases.length - MAX_LISTED_CASES} 个用例未列出，见报告。`);
     lines.push('');
   }
+  if (quotaCases > 0) {
+    lines.push(`${quotaNote(quotaReset)}：另有 ${quotaCases} 个用例因此失败，未列出；上面的失败也可能受其影响。`, '');
+  }
   if (reportUrl) lines.push(`- Midscene 报告（截图、回放、录像）：${reportUrl}`);
   lines.push(`- 运行与 Summary：${runUrl}`);
   if (runId !== undefined) lines.push('', runMarker(runId));
   return `${lines.join('\n')}\n`;
 }
 
-async function github(route, init = {}) {
-  const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}${route}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-    },
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`GitHub API ${route} returned HTTP ${response.status}: ${await response.text()}`);
-  return response.json();
+function githubClient(env, fetchImpl) {
+  return async (route, init = {}) => {
+    const response = await fetchImpl(`https://api.github.com/repos/${env.GITHUB_REPOSITORY}${route}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) throw new Error(`GitHub API ${route} returned HTTP ${response.status}: ${await response.text()}`);
+    return response.json();
+  };
 }
 
 async function readManifest(file) {
@@ -158,18 +207,38 @@ async function readManifest(file) {
   }
 }
 
-async function main() {
-  const env = process.env;
-  const reasons = failureReasons({
+/**
+ * Comment on the pull requests a failed master run covers.
+ * @param {{ env: Record<string, string | undefined>, fetchImpl?: typeof fetch }} options
+ */
+export async function notify({ env, fetchImpl = fetch }) {
+  const github = githubClient(env, fetchImpl);
+  const results = {
+    modelCheck: env.MODEL_CHECK_RESULT,
     dashboard: env.DASHBOARD_RESULT,
     feishuQueue: env.QUEUE_RESULT,
     feishu: env.FEISHU_RESULT,
     report: env.REPORT_RESULT,
-  });
-  if (reasons.length === 0) {
+  };
+  if (failureReasons(results).length === 0) {
     console.log('No failed Midscene job; nothing to notify.');
     return;
   }
+  const manifest = await readManifest(env.MANIFEST_PATH && path.resolve(env.MANIFEST_PATH));
+  const assessment = assessFailures({
+    results,
+    feishuQuotaExhausted: env.FEISHU_QUOTA_EXHAUSTED === 'true',
+    manifest,
+    feishuRan: feishuJobRan(env.QUEUE_RESULT),
+  });
+  const quotaReset = env.QUOTA_RESET || quotaResetTime(assessment.quotaCases.map((testCase) => testCase.failure).join('\n'));
+  if (assessment.quotaOnly) {
+    const note = `${quotaNote(quotaReset)}：本次 Midscene 失败都由此引起，不评论合入的 PR。`;
+    console.log(note);
+    if (env.GITHUB_STEP_SUMMARY) await appendFile(env.GITHUB_STEP_SUMMARY, `${note}\n`);
+    return;
+  }
+  const { reasons } = assessment;
   const selfRunId = Number(env.GITHUB_RUN_ID);
   const headSha = env.GITHUB_SHA;
   const branch = env.GITHUB_REF_NAME;
@@ -192,9 +261,8 @@ async function main() {
   for (const sha of shas) commits.push({ sha, pulls: await github(`/commits/${sha}/pulls`) });
   const pulls = mergedPullRequests(commits, branch);
   const range = shas.length > 1 ? `${shas[0].slice(0, 9)}…${headSha.slice(0, 9)}（${shas.length} 个提交）` : headSha.slice(0, 9);
-  const cases = problemCases(await readManifest(env.MANIFEST_PATH && path.resolve(env.MANIFEST_PATH)), {
-    feishuRan: feishuJobRan(env.QUEUE_RESULT),
-  });
+  const { cases } = assessment;
+  const quota = { quotaCases: assessment.quotaCases.length, quotaReset };
 
   // NOTIFY_DRY_RUN=1 prints the comments instead of posting them.
   const post = async (route, body) => {
@@ -207,20 +275,20 @@ async function main() {
     else await github(route, { method: 'POST', body: JSON.stringify({ body }) });
   };
   if (pulls.length === 0) {
-    const body = commentBody({ mentions: [owner], reasons, cases, reportUrl, runUrl, range, pulls, self: null, runId: selfRunId });
+    const body = commentBody({ mentions: [owner], reasons, cases, reportUrl, runUrl, range, pulls, self: null, runId: selfRunId, ...quota });
     await post(`/commits/${headSha}/comments`, body);
     console.log(`No merged pull request in ${range}; commented on ${headSha}.`);
     return;
   }
   for (const pull of pulls) {
-    const body = commentBody({ mentions: [pull.author, owner], reasons, cases, reportUrl, runUrl, range, pulls, self: pull.number, runId: selfRunId });
+    const body = commentBody({ mentions: [pull.author, owner], reasons, cases, reportUrl, runUrl, range, pulls, self: pull.number, runId: selfRunId, ...quota });
     await post(`/issues/${pull.number}/comments`, body);
     console.log(`Commented on #${pull.number} (${pull.author}).`);
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  main().catch((error) => {
+  notify({ env: process.env }).catch((error) => {
     console.log(`::error::${error.stack ?? error.message}`);
     process.exit(1);
   });

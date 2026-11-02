@@ -337,6 +337,11 @@ export interface OpenPlatformAutomationOptions {
   grantedScopeNames?: { tenant: string[]; user: string[] };
   pollIntervalMs?: number;
   maxWaitMs?: number;
+  /**
+   * 回调白名单恢复流程的总截止时间（毫秒），缺省仍为 15 秒。
+   * 调用方可传更紧的预算；测试也用它验证在飞请求的取消。
+   */
+  redirectWriteTimeoutMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
   /** Emitted once only after Feishu reports this exact QR as scanned. */
   onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
@@ -899,7 +904,11 @@ export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | nu
 }
 
 /** `automateOpenPlatformSetup` 内联 postJson / `OpenPlatformApiClient.postJson` 的公共形状。 */
-export type OpenPlatformPostJson = (path: string, body?: unknown) => Promise<unknown>;
+export interface OpenPlatformPostOptions {
+  signal?: AbortSignal;
+}
+
+export type OpenPlatformPostJson = (path: string, body?: unknown, options?: OpenPlatformPostOptions) => Promise<unknown>;
 
 export interface RedirectWhitelistWriteResult {
   /**
@@ -941,6 +950,8 @@ export function missingRedirectUrls(wanted: string[], written: string[]): string
 }
 
 export interface WriteRedirectWhitelistOptions {
+  /** 整个读→合并→写→回读及恢复流程的截止时间，默认 15 秒。 */
+  timeoutMs?: number;
   /**
    * 允许「读不出线上现值时直接全量覆盖写」。
    *
@@ -972,10 +983,12 @@ export interface WriteRedirectWhitelistOptions {
  * `<origin>/app`，可对任意 appId 调用），而不是 `automateOpenPlatformSetup` 里那份
  * referer 绑死单个 appId 的内联 postJson。
  *
- * 写失败时**只在「URL 被 console 判非法」这一类错误上**兜底重试一次「线上现值 ∪
+ * 瞬态写入失败会在总截止时间内恢复至多两轮，每轮先重新读取现值再合并写；
+ * 写成功后必须读回确认。权限/登录拒绝不重试，创建/发布等其它 POST 不受影响。
+ * **只在「URL 被 console 判非法」这一类错误上**兜底写一次「线上现值 ∪
  * 127.0.0.1 那条」：`wanted` 里某条 URL 的格式被拒时整批会一起失败，最小集能保住
- * 最核心的粘贴回调链路。网络抖动 / 403 鉴权失败不做第二次改写（见
- * {@link isRedirectUrlRejectedError}）。两次都失败才抛出，由调用方记成 warning
+ * 最核心的粘贴回调链路。网络抖动 / 403 鉴权失败不触发最小集兜底（见
+ * {@link isRedirectUrlRejectedError}）；瞬态恢复由外层重读后合并完成。兜底仍失败则抛出，由调用方记成 warning
  * （不阻断建 bot）。
  */
 export async function writeRedirectWhitelist(
@@ -983,6 +996,82 @@ export async function writeRedirectWhitelist(
   appId: string,
   wanted: string[] = collectBotmuxRedirectUrls(),
   options: WriteRedirectWhitelistOptions = {},
+): Promise<RedirectWhitelistWriteResult> {
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  const deadline = setTimeout(() => controller.abort(new Error('回调白名单配置超时')), timeoutMs);
+  deadline.unref?.();
+  const boundedPostJson: OpenPlatformPostJson = async (path, body) => {
+    controller.signal.throwIfAborted();
+    const result = await postJson(path, body, { signal: controller.signal });
+    controller.signal.throwIfAborted();
+    return result;
+  };
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        // 每一轮都重读现值；结果未知时可能已写入，也可能有人新增了自定义地址。
+        const result = await writeRedirectWhitelistOnce(boundedPostJson, appId, wanted, {
+          ...options,
+          // 新应用允许的初始盲写不能延伸到恢复阶段：前一轮可能已经落地。
+          allowBlindWrite: attempt === 0 && options.allowBlindWrite === true,
+        });
+        controller.signal.throwIfAborted();
+        if (result.status === 'skipped_unreadable') return result;
+        if (result.status === 'unchanged') {
+          // 前一轮可能已写入、但响应丢失；保守计作变更，避免调用方跳过发版。
+          return attempt === 0 ? result : { ...result, status: 'updated' };
+        }
+        const live = extractOpenPlatformRedirectUrls(
+          await boundedPostJson(`/developers/v1/safe_setting/${appId}`, {}),
+        );
+        if (live === null) throw new Error('回调白名单写入已提交，但无法读回确认');
+        if (missingRedirectUrls(result.redirectUrls, live).length > 0) {
+          throw new RedirectWhitelistNotConfirmedError('回调白名单写入已提交，但回读仍缺少地址');
+        }
+        return { ...result, redirectUrls: live };
+      } catch (err) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isRetryableRedirectWriteError(err)) throw err;
+        await waitForRedirectRetry(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt], controller.signal);
+      }
+    }
+  } finally {
+    clearTimeout(deadline);
+  }
+}
+
+class RedirectWhitelistNotConfirmedError extends Error {}
+
+function isRetryableRedirectWriteError(err: unknown): boolean {
+  if (openPlatformWebSessionExpired(err) || openPlatformOwnerAccessDenied(err)) return false;
+  if (err instanceof OpenPlatformApiError) {
+    if (err.status === 401 || err.status === 403) return false;
+    return err.status >= 500 || asRecord(err.payload).code === 10008;
+  }
+  return err instanceof RedirectWhitelistNotConfirmedError || isLikelyTransientNetworkError(err);
+}
+
+function waitForRedirectRetry(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
+async function writeRedirectWhitelistOnce(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  wanted: string[],
+  options: WriteRedirectWhitelistOptions,
 ): Promise<RedirectWhitelistWriteResult> {
   let existing: string[] | null = null;
   let readError: string | undefined;
@@ -1425,7 +1514,7 @@ export async function automateOpenPlatformSetup(
     };
   }
 
-  const postJson = async (path: string, body?: unknown): Promise<unknown> => {
+  const postJson = async (path: string, body?: unknown, options: OpenPlatformPostOptions = {}): Promise<unknown> => {
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -1437,6 +1526,7 @@ export async function automateOpenPlatformSetup(
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     let data: any;
     try {
@@ -1477,6 +1567,7 @@ export async function automateOpenPlatformSetup(
     const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
       // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
       allowBlindWrite: options.appJustCreated === true,
+      timeoutMs: options.redirectWriteTimeoutMs,
     });
     // 只有真的发了写请求（updated / updated_fallback）才算改过；unchanged（幂等
     // 短路）与 skipped_unreadable（一次都没写）都不置位。
@@ -2062,7 +2153,7 @@ export interface OpenPlatformAppSummary {
 
 export interface OpenPlatformApiClient {
   apiOrigin: string;
-  postJson(path: string, body?: unknown): Promise<unknown>;
+  postJson: OpenPlatformPostJson;
   /**
    * 语义幂等的 console POST（重复调用无副作用：设值型 switch、只读拉取）。
    * 与 GET/HEAD 同权享受完整的瞬态错误退避重试，且**预算只在 fetchRaw 这一层**
@@ -2109,7 +2200,7 @@ export async function createOpenPlatformApiClient(
   }
 
   const request = async (
-    path: string, body?: BodyInit, contentType?: string, opts: { idempotent?: boolean } = {},
+    path: string, body?: BodyInit, contentType?: string, opts: { idempotent?: boolean; signal?: AbortSignal } = {},
   ): Promise<unknown> => {
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
@@ -2122,6 +2213,7 @@ export async function createOpenPlatformApiClient(
         ...(contentType ? { 'content-type': contentType } : {}),
       },
       body,
+      ...(opts.signal ? { signal: opts.signal } : {}),
     }, 10, opts);
     let data: any;
     try {
@@ -2138,8 +2230,8 @@ export async function createOpenPlatformApiClient(
     return data;
   };
 
-  const postJson = async (path: string, body?: unknown): Promise<unknown> =>
-    request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json');
+  const postJson: OpenPlatformPostJson = async (path, body, opts = {}) =>
+    request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json', opts);
   const postJsonIdempotent = async (path: string, body?: unknown): Promise<unknown> =>
     request(
       path,

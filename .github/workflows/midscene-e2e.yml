@@ -18,7 +18,8 @@ on:
   # Midscene runs after merge, not on pull requests. Every Feishu run drives
   # the same bots, so pull requests queued for the one live slot for hours.
   # A failed master run comments on the pull requests it covers
-  # (scripts/midscene-notify-failure.mjs).
+  # (scripts/midscene-notify-failure.mjs), unless an exhausted model quota
+  # explains it (#2670).
   push:
     branches: [master]
 
@@ -43,8 +44,38 @@ concurrency:
 # so per-runner daemons for the same bots would receive each other's messages.
 
 jobs:
+  # Probes the vision model once before anything else. When its quota is used
+  # up (HTTP 429, #2670) every case would fail the same way, so the suites are
+  # skipped — not failed — and no pull request is told about it; the run
+  # summary says when the quota resets. Other preflight failures fail this job.
+  model-check:
+    name: Check the Midscene model
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      quota_exhausted: ${{ steps.model.outputs.quota_exhausted }}
+      quota_reset: ${{ steps.model.outputs.quota_reset }}
+    env:
+      MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
+      MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
+      MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
+      NODE_OPTIONS: "--dns-result-order=ipv4first --no-network-family-autoselection"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/check-midscene-model.mjs
+            scripts/midscene-quota.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Check Midscene model connectivity and quota
+        id: model
+        run: node scripts/check-midscene-model.mjs --allow-quota-exhausted
+
   dashboard:
     name: Dashboard Midscene
+    needs: model-check
+    if: needs.model-check.outputs.quota_exhausted != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -77,9 +108,6 @@ jobs:
           test -n "$MIDSCENE_MODEL_NAME"
           test -n "$MIDSCENE_MODEL_BASE_URL"
           test -n "$MIDSCENE_MODEL_FAMILY"
-
-      - name: Check Midscene model connectivity
-        run: node scripts/check-midscene-model.mjs
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -120,6 +148,9 @@ jobs:
   feishu-queue:
     # The name is matched by scripts/feishu-live-queue.mjs.
     name: Wait for the Feishu live slot
+    # No waiting hours for the slot when the model quota is already used up.
+    needs: model-check
+    if: needs.model-check.outputs.quota_exhausted != 'true'
     runs-on: ubuntu-latest
     # Waiting has its own budget, so it never eats into the Feishu job's.
     timeout-minutes: 300
@@ -149,6 +180,10 @@ jobs:
       ready: ${{ steps.feishu_config.outputs.ready }}
       outcome: ${{ steps.feishu_midscene.outcome }}
       cases: ${{ steps.feishu_config.outputs.cases }}
+      # The quota can run out while this job waits for the slot. It cannot skip
+      # itself by then, so it fails, and the notification stays quiet.
+      quota_exhausted: ${{ steps.model.outputs.quota_exhausted }}
+      quota_reset: ${{ steps.model.outputs.quota_reset }}
     env:
       CI: "true"
       FEISHU_TEST_GROUP_URL: ${{ secrets.FEISHU_TEST_GROUP_URL }}
@@ -217,6 +252,7 @@ jobs:
           bun-version: 1.4.3
 
       - name: Check Midscene model connectivity
+        id: model
         if: steps.feishu_config.outputs.ready == 'true'
         run: node scripts/check-midscene-model.mjs
 
@@ -434,6 +470,10 @@ jobs:
         env:
           FEISHU_OUTCOME: ${{ steps.outcomes.outputs.feishu }}
           FEISHU_CASES: ${{ steps.outcomes.outputs.feishu-cases }}
+          # Masked out of everything published (scripts/midscene-redact.mjs).
+          MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
+          MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
+          MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
         run: |
           arguments=(
             --dashboard-report-root test/midscene/midscene_run
@@ -458,6 +498,10 @@ jobs:
           FEISHU_OUTCOME: ${{ steps.outcomes.outputs.feishu }}
           FEISHU_CASES: ${{ steps.outcomes.outputs.feishu-cases }}
           REPORT_SITE_URL: ${{ steps.report_target.outputs.site-url }}
+          # Masked out of everything published (scripts/midscene-redact.mjs).
+          MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
+          MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
+          MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
         run: |
           node scripts/render-midscene-summary.mjs \
             --results midscene_run/dashboard/results \
@@ -554,8 +598,8 @@ jobs:
 
   notify-failure:
     name: Notify merged pull requests of a failure
-    needs: [dashboard, feishu-queue, feishu, midscene-report, deploy-report]
-    if: always() && github.event_name == 'push' && (needs.dashboard.result == 'failure' || needs.feishu-queue.result == 'failure' || needs.feishu.result == 'failure' || needs.midscene-report.result == 'failure')
+    needs: [model-check, dashboard, feishu-queue, feishu, midscene-report, deploy-report]
+    if: always() && github.event_name == 'push' && (needs.model-check.result == 'failure' || needs.dashboard.result == 'failure' || needs.feishu-queue.result == 'failure' || needs.feishu.result == 'failure' || needs.midscene-report.result == 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -566,7 +610,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          sparse-checkout: scripts/midscene-notify-failure.mjs
+          sparse-checkout: |
+            scripts/midscene-notify-failure.mjs
+            scripts/midscene-quota.mjs
           sparse-checkout-cone-mode: false
 
       - name: Download linked evidence site
@@ -580,10 +626,14 @@ jobs:
       - name: Comment on the pull requests this run covers
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          MODEL_CHECK_RESULT: ${{ needs.model-check.result }}
           DASHBOARD_RESULT: ${{ needs.dashboard.result }}
           QUEUE_RESULT: ${{ needs.feishu-queue.result }}
           FEISHU_RESULT: ${{ needs.feishu.result }}
           REPORT_RESULT: ${{ needs.midscene-report.result }}
+          # Quota failures go to the run summary, not to the pull requests.
+          FEISHU_QUOTA_EXHAUSTED: ${{ needs.feishu.outputs.quota_exhausted }}
+          QUOTA_RESET: ${{ needs.feishu.outputs.quota_reset }}
           REPORT_PUBLISHED: ${{ needs.deploy-report.result == 'success' }}
           REPORT_SITE_URL: ${{ needs.midscene-report.outputs.report-site-url }}
           MANIFEST_PATH: ${{ runner.temp }}/midscene-site/manifest.json

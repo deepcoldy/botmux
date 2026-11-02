@@ -1193,6 +1193,7 @@ export async function runAutoWorktreeCommit(deps: {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
         // Never reached under suppressConfirmReply for a pendingRepo session.
         sessionReply: async () => '',
+        prepareTurn,
       },
       targetDir,
       pathBasename(targetDir),
@@ -3900,6 +3901,35 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     //     failed-turn-retry.test 有用例钉住），因为一次重试也可能再失败。
     // 两道都 fail-closed：宁可让用户多发一条消息，也不重复提交可能带外部副作用
     // 的任务。
+    // 自动恢复失败卡的「重试」：重新投递那一轮的原消息。刻意不在
+    // SENSITIVE_CARD_ACTIONS 里——通用 canOperate 门会把原发起人（oncall 群里常是
+    // talk-only 成员）挡在外面；权限门在 handleOrdinaryRecoveryRetryClick 里：
+    // 原发起人（仍能和 bot 对话）或 bot 管理员，其余人一律拒绝。
+    if (actionType === 'retry_recovery_turn') {
+      if (!ds) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.retry_recovery_missing', undefined, localeForBot(larkAppId)),
+          },
+        };
+      }
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
+      const { handleOrdinaryRecoveryRetryClick } = await import('../../core/ordinary-recovery-retry.js');
+      return handleOrdinaryRecoveryRetryClick(ds, {
+        logicalTurnId: typeof value?.logical_turn_id === 'string' ? value.logical_turn_id : undefined,
+        operatorOpenId,
+        ...(data?.operator?.union_id ? { operatorUnionId: data.operator.union_id } : {}),
+      });
+    }
+
     if (actionType === 'retry_turn' && ds) {
       const locDs = localeForBot(ds.larkAppId);
       if (isSessionTransferring(ds)) {

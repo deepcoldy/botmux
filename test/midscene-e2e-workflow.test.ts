@@ -14,12 +14,21 @@ import { evaluateExpression, format, interpolate, isTruthy } from './helpers/git
  * These tests evaluate the real triggers, concurrency group and job
  * conditions per event, so they go red when pull requests start runs again,
  * when a master merge cancels the master run that is testing earlier merges,
- * or when a failure stops reaching the notification job.
+ * or when a failure stops reaching the notification job. When the model quota
+ * is used up (#2670) the suites are skipped and nobody is notified.
  */
+
+interface Step {
+  id?: string;
+  run?: string;
+  env?: Record<string, string>;
+}
 
 interface Job {
   if?: string;
   needs?: string | string[];
+  outputs?: Record<string, string>;
+  steps?: Step[];
 }
 
 interface Workflow {
@@ -34,7 +43,7 @@ const workflow = parseYaml(
 
 const REPOSITORY = 'deepcoldy/botmux';
 // deploy-report also depends on a job output, which this harness leaves empty.
-const SUITE_JOBS = ['dashboard', 'feishu-queue', 'feishu', 'midscene-report'];
+const SUITE_JOBS = ['model-check', 'dashboard', 'feishu-queue', 'feishu', 'midscene-report'];
 const NOTIFY_JOB = 'notify-failure';
 
 interface GithubContext {
@@ -72,9 +81,14 @@ type Result = 'success' | 'failure' | 'skipped';
 
 /**
  * The jobs GitHub starts for this event. A job that runs ends with
- * `outcomes[id]` (default success).
+ * `outcomes[id]` (default success) and sets `outputs[id]`; a skipped job has
+ * no outputs.
  */
-function jobsThatRun(github: GithubContext, outcomes: Record<string, Result> = {}): string[] {
+function jobsThatRun(
+  github: GithubContext,
+  outcomes: Record<string, Result> = {},
+  outputs: Record<string, Record<string, string>> = {},
+): string[] {
   const results: Record<string, Result> = {};
   const visit = (id: string): Result => {
     if (results[id]) return results[id];
@@ -88,7 +102,10 @@ function jobsThatRun(github: GithubContext, outcomes: Record<string, Result> = {
     const context = {
       github,
       inputs: (github.event.inputs as Record<string, unknown> | undefined) ?? {},
-      needs: Object.fromEntries(needs.map((need, i) => [need, { result: needResults[i], outputs: {} }])),
+      needs: Object.fromEntries(needs.map((need, i) => [
+        need,
+        { result: needResults[i], outputs: needResults[i] === 'skipped' ? {} : outputs[need] ?? {} },
+      ])),
     };
     let runs = isTruthy(evaluateExpression(condition, context, functions));
     // Without a status function GitHub adds success(): a job whose needs did
@@ -126,13 +143,63 @@ describe('Midscene E2E runs after merge on master', () => {
   });
 
   it('a failed master run reaches the notification job, whichever suite failed', () => {
-    for (const failed of ['dashboard', 'feishu-queue', 'feishu', 'midscene-report']) {
+    for (const failed of ['model-check', 'dashboard', 'feishu-queue', 'feishu', 'midscene-report']) {
       expect(jobsThatRun(masterPush(), { [failed]: 'failure' }), failed).toContain(NOTIFY_JOB);
     }
   });
 
   it('a failed manual run comments on no pull request', () => {
     expect(jobsThatRun(manualRun(), { feishu: 'failure' })).not.toContain(NOTIFY_JOB);
+  });
+
+  it('an exhausted model quota skips every suite, the slot wait and the notification', () => {
+    const exhausted = { 'model-check': { quota_exhausted: 'true', quota_reset: '11-15 16:00:00 UTC' } };
+    for (const github of [masterPush(), manualRun()]) {
+      expect(jobsThatRun(github, {}, exhausted)).toEqual(['model-check']);
+    }
+    // A model check that fails for another reason still notifies.
+    expect(jobsThatRun(masterPush(), { 'model-check': 'failure' })).toEqual(['model-check', NOTIFY_JOB]);
+  });
+});
+
+describe('Midscene model quota wiring (#2670)', () => {
+  const jobStep = (jobId: string, stepId: string) => workflow.jobs[jobId].steps!.find((step) => step.id === stepId)!;
+  const jobOutput = (jobId: string, name: string, steps: Record<string, unknown>) =>
+    interpolate(workflow.jobs[jobId].outputs![name], { steps }, { format });
+
+  it('the model-check job exports the preflight\'s quota flag and lets an exhausted quota pass', () => {
+    const steps = { model: { outputs: { quota_exhausted: 'true', quota_reset: '11-15 16:00:00 UTC' } } };
+    expect(jobOutput('model-check', 'quota_exhausted', steps)).toBe('true');
+    expect(jobOutput('model-check', 'quota_reset', steps)).toBe('11-15 16:00:00 UTC');
+    expect(jobStep('model-check', 'model').run).toMatch(/check-midscene-model\.mjs --allow-quota-exhausted\b/);
+  });
+
+  it('the Feishu job, which checks again after the slot wait, fails on the quota but exports the flag', () => {
+    const steps = { model: { outputs: { quota_exhausted: 'true', quota_reset: '11-15 16:00:00 UTC' } } };
+    expect(jobOutput('feishu', 'quota_exhausted', steps)).toBe('true');
+    expect(jobStep('feishu', 'model').run).toMatch(/check-midscene-model\.mjs\s*$/);
+  });
+
+  it('the notification receives the results and the Feishu quota flag', () => {
+    const notifyStep = workflow.jobs[NOTIFY_JOB].steps!.find((step) => step.run?.includes('midscene-notify-failure.mjs'))!;
+    const needs = {
+      'model-check': { result: 'success', outputs: {} },
+      dashboard: { result: 'success', outputs: {} },
+      'feishu-queue': { result: 'success', outputs: {} },
+      feishu: { result: 'failure', outputs: { quota_exhausted: 'true', quota_reset: '11-15 16:00:00 UTC' } },
+      'midscene-report': { result: 'success', outputs: {} },
+      'deploy-report': { result: 'success', outputs: {} },
+    };
+    const env = Object.fromEntries(Object.entries(notifyStep.env ?? {}).map(([key, value]) => [
+      key,
+      interpolate(String(value), { github: masterPush(), needs, runner: { temp: '/tmp' } }, { format }),
+    ]));
+    expect(env).toMatchObject({
+      MODEL_CHECK_RESULT: 'success',
+      FEISHU_RESULT: 'failure',
+      FEISHU_QUOTA_EXHAUSTED: 'true',
+      QUOTA_RESET: '11-15 16:00:00 UTC',
+    });
   });
 });
 

@@ -19941,6 +19941,15 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .st-cancelled   { --ns: var(--v3r-skipped); }
 .st-blocked     { --ns: var(--v3r-blocked); }
 .st-failed      { --ns: var(--v3r-failed); }
+/* Display buckets (等待 / 进行中 / 完成 / 失败 / 等人工确认 …). Declared after
+   .st-* so a node carrying both classes is colored by its display bucket:
+   gate waits and blocked nodes both read as "needs a person". */
+.ds-waiting     { --ns: var(--v3r-pending); }
+.ds-running     { --ns: var(--v3r-running); }
+.ds-done        { --ns: var(--v3r-done); }
+.ds-failed      { --ns: var(--v3r-failed); }
+.ds-needsHuman  { --ns: var(--v3r-gate); }
+.ds-skipped, .ds-cancelled, .ds-superseded { --ns: var(--v3r-skipped); }
 /* skipped 整体降透明度 + 虚线盒 — 一眼读出"这条路没走"，与 pending 区分 */
 .v3r-node.st-skipped, .v3r-node.st-cancelled { opacity: .55; }
 .v3r-node.st-skipped .v3r-box, .v3r-node.st-cancelled .v3r-box { stroke-dasharray: 4 3; }
@@ -19997,6 +20006,10 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-node .v3r-nid {
   fill: var(--fg); font-family: var(--mono); font-size: 12px; font-weight: 600;
 }
+.v3r-node .v3r-nbot {
+  fill: var(--muted); font-size: 11px;
+}
+.v3r-node .v3r-nbot.empty { fill: var(--faint, var(--muted)); }
 .v3r-node .v3r-nstatus {
   fill: var(--ns); font-size: 10.5px; font-weight: 600;
   font-variant-numeric: tabular-nums;
@@ -20391,6 +20404,41 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-deps {
   margin: 0;
 }
+
+.v3r-exec {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+.v3r-exec-row {
+  margin: 0;
+  display: flex;
+  gap: .6em;
+  align-items: baseline;
+}
+.v3r-exec-row > span:first-child {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.v3r-attempts {
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.v3r-attempts li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .8em;
+  color: var(--muted);
+}
+.v3r-attempts .n { color: var(--fg); }
+.v3r-attempts .o-succeeded { color: var(--v3r-done); }
+.v3r-attempts .o-failed { color: var(--v3r-failed); }
+.v3r-attempts .o-blocked { color: var(--v3r-blocked); }
+.v3r-attempts .o-running { color: var(--v3r-running); }
 
 .v3r-dep,
 .v3r-granted-tag,

@@ -14,6 +14,115 @@ export const V3_NODE_LABEL: Record<RunNodeView['status'], string> = {
   failed: '失败',
 };
 
+/**
+ * The five states people read a workflow by, plus the three "this path did
+ * not run" states. Gate waits and blocked nodes both need a person, so they
+ * share one bucket; the node panel still names the precise raw state.
+ */
+export type V3DisplayStatus =
+  | 'waiting'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'needsHuman'
+  | 'skipped'
+  | 'cancelled'
+  | 'superseded';
+
+export const V3_DISPLAY_STATUS: Record<RunNodeView['status'], V3DisplayStatus> = {
+  pending: 'waiting',
+  running: 'running',
+  done: 'done',
+  failed: 'failed',
+  gateWaiting: 'needsHuman',
+  blocked: 'needsHuman',
+  skipped: 'skipped',
+  cancelled: 'cancelled',
+  superseded: 'superseded',
+};
+
+export const V3_DISPLAY_LABEL: Record<V3DisplayStatus, string> = {
+  waiting: '等待',
+  running: '进行中',
+  done: '完成',
+  failed: '失败',
+  needsHuman: '等人工确认',
+  skipped: '已跳过',
+  cancelled: '已取消',
+  superseded: '已替代',
+};
+
+/** Legend order: the five states first, then the not-run states. */
+export const V3_DISPLAY_LEGEND: V3DisplayStatus[] = [
+  'waiting', 'running', 'done', 'failed', 'needsHuman', 'skipped', 'cancelled',
+];
+
+export const V3_ATTEMPT_OUTCOME_LABEL: Record<string, string> = {
+  succeeded: '完成',
+  failed: '失败',
+  blocked: '受阻',
+  cancelled: '已取消',
+  interrupted: '中断',
+  superseded: '已替代',
+};
+
+/** Compact duration for an SVG node row: 45秒 / 6分 / 1时20分 / 2天3时. */
+export function formatV3Duration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}秒`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}分`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) {
+    const minutes = totalMinutes % 60;
+    return minutes ? `${totalHours}时${minutes}分` : `${totalHours}时`;
+  }
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours ? `${days}天${hours}时` : `${days}天`;
+}
+
+/** How long the node has been working (running) or worked (finished), measured
+ *  on the server clock carried by the view. Undefined when it never started. */
+export function nodeElapsedMs(node: RunNodeView, generatedAt: number): number | undefined {
+  if (node.startedAt === undefined) return undefined;
+  const end = node.endedAt ?? (node.status === 'running' ? generatedAt : undefined);
+  return end === undefined ? undefined : Math.max(0, end - node.startedAt);
+}
+
+/** How long a person has been needed: gate wait, or time since it blocked. */
+export function nodeWaitingMs(node: RunNodeView, generatedAt: number): number | undefined {
+  const since = node.status === 'gateWaiting'
+    ? node.gateSince
+    : node.status === 'blocked' ? node.endedAt : undefined;
+  return since === undefined ? undefined : Math.max(0, generatedAt - since);
+}
+
+/** Third row of a graph node: display state, then elapsed / attempt count. */
+export function nodeStatusLine(node: RunNodeView, generatedAt: number | undefined): string {
+  const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
+  const parts = [label];
+  if (node.status === 'gateWaiting') parts.push('审批');
+  else if (node.status === 'blocked') parts.push('受阻');
+  if (generatedAt !== undefined) {
+    const elapsed = nodeElapsedMs(node, generatedAt);
+    if (elapsed !== undefined && (node.status === 'running' || node.status === 'done' || node.status === 'failed')) {
+      parts.push(formatV3Duration(elapsed));
+    }
+  }
+  if (node.attempts.length > 1 && node.status !== 'pending') parts.push(`第${node.attempts.length}次`);
+  return parts.join(' · ');
+}
+
+/** Second row of a graph node: who executes it. */
+export function nodeBotLine(node: RunNodeView): string {
+  if (node.host) return `宿主动作 · ${node.host.executor}`;
+  const bot = node.bot;
+  if (!bot) return '';
+  const who = bot.name ?? bot.larkAppId ?? bot.selector ?? '默认 Bot';
+  return bot.cliId ? `${who} · ${bot.cliId}` : who;
+}
+
 export const V3_DECISION_LABEL: Record<string, string> = {
   exit: '✓ 通过',
   continue: '↻ 继续返工',
@@ -21,10 +130,10 @@ export const V3_DECISION_LABEL: Record<string, string> = {
 };
 
 export const V3_GRAPH = {
-  nodeWidth: 168,
-  plainHeight: 48,
+  nodeWidth: 196,
+  plainHeight: 66,
   loopHeight: 70,
-  columnGap: 226,
+  columnGap: 254,
   verticalGap: 30,
   padding: 26,
   maxDots: 8,

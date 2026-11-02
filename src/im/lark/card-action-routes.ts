@@ -219,6 +219,10 @@ export interface SensitiveCardActionMeta {
 
 const NO_META: SensitiveCardActionMeta = {};
 
+// 不在本表、但有自己权限门的动作（别「顺手」补进来，会把合法点击者挡掉）：
+// - `retry_recovery_turn`（自动恢复失败卡的「重试」）：原发起人（仍能对话）或
+//   bot 管理员可点，门在 core/ordinary-recovery-retry.ts 的 handleOrdinaryRecoveryRetryClick。
+
 export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta> = new Map<string, SensitiveCardActionMeta>([
   ['restart', NO_META],
   ['close', NO_META],
