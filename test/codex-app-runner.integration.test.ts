@@ -15,7 +15,7 @@ import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { resolveBunExecutable, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { resolveBunExecutable, resolveNodeExecutable, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity } from '../src/services/codex-app-process-attestation.js';
 import { parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity } from '../src/services/codex-app-engine-identity.js';
@@ -2057,11 +2057,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it.skipIf(process.platform !== 'linux' || !resolveBunExecutable())('registers native engines across idle recovery on the authenticated worker path', async () => {
+  it.skipIf(process.platform !== 'linux' || !resolveBunExecutable() || !resolveNodeExecutable())
+    .each(['native', 'node-launcher'] as const)('registers native engines across idle recovery on the authenticated worker path: %s', async launchMode => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-native-engine-recovery-'));
     const fakeCodex = join(dir, 'codex');
     const logPath = join(dir, 'requests.jsonl');
     const pidPath = join(dir, 'app-server.pid');
+    const launcherPidPath = join(dir, 'launcher.pid');
     const finishGate = join(dir, 'finish-gate');
     writeFileSync(finishGate, 'ready');
     // A Node script cannot reach process attestation (/proc/exe is node).
@@ -2069,6 +2071,23 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     const build = spawnSync(resolveBunExecutable()!, ['build', '--compile', FAKE_SERVER_FIXTURE, '--outfile', fakeCodex],
       { encoding: 'utf8', timeout: 60_000 });
     expect(build.status, build.stderr).toBe(0);
+    let codexBin = fakeCodex;
+    if (launchMode === 'node-launcher') {
+      codexBin = join(dir, 'codex-launcher.mjs');
+      // Reproduce the npm CLI: a persistent Node launcher inherits the RPC
+      // pipes and spawns the native codex server. Keep both processes real.
+      writeFileSync(codexBin, `#!${resolveNodeExecutable()}\n`
+        + `import { spawn } from 'node:child_process';\n`
+        + `import { writeFileSync } from 'node:fs';\n`
+        + `writeFileSync(process.env.FAKE_CODEX_LAUNCHER_PID_PATH, String(process.pid));\n`
+        // Keep the launcher alive across an idle-settle timer before the
+        // native server exists, including after idle engine recovery.
+        + `await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_CODEX_LAUNCH_DELAY_MS ?? '100')));\n`
+        + `const child = spawn(${JSON.stringify(fakeCodex)}, process.argv.slice(2), { stdio: 'inherit' });\n`
+        + `for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));\n`
+        + `child.on('exit', code => process.exit(code ?? 1));\n`);
+      chmodSync(codexBin, 0o755);
+    }
     const published: any[] = [];
     const rejected: string[] = [];
     const tracker = new CodexAppTurnLiveness();
@@ -2112,9 +2131,19 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       adoptInitialActiveTurn: (entry: any) => { scope.currentBotmuxTurnId = entry.turnId; scope.restored = entry; },
       publishSandboxRelayCapability() {}, log() {},
     };
+    scope.clearCodexAppEngineIdentity = loadWorkerFunction('clearCodexAppEngineIdentity', scope);
     scope.restoreCodexAppAttestedTurn = loadWorkerFunction('restoreCodexAppAttestedTurn', scope);
     const apply = loadWorkerFunction<(kind: string, payload: any, control?: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);
-    const control = new ControlCollector(dir, false, false, false, false, (payload, proof) => apply('state', payload, proof));
+    const control = new ControlCollector(dir, false, false, false, false, async (payload, proof) => {
+      try { return await apply('state', payload, proof); }
+      catch (error) {
+        rejected.push(`${String(error)} ${JSON.stringify({ claim: payload.appServerProcess,
+          previous: scope.codexAppEngineIdentity, busy: payload.busy, boundary: payload.processIdentityBoundary,
+          previousStart: scope.codexAppEngineIdentity && readProcessStartIdentity(scope.codexAppEngineIdentity.pid),
+          verified: verifyCodexAppEngineIdentity(payload.appServerProcess, harness?.child.pid) })}`);
+        return false;
+      }
+    });
     // ControlCollector authenticates the runner directly, bypassing the real
     // worker's activateCodexAppControlConnection. Supply the active identity
     // that production publishes after accepting the challenge proof.
@@ -2123,16 +2152,55 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       status: 'active', identities: [{ generation: control.bootstrap.identity.generation }],
     };
     await control.listen();
-    harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
-      { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate } });
+    harness = startRunner(codexBin, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
+      { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate,
+        // Wide enough that the control re-acceptance below lands inside the
+        // replacement client's initialize() window, before the launcher has
+        // spawned the native engine.
+        ...(launchMode === 'node-launcher' ? { FAKE_CODEX_LAUNCH_DELAY_MS: '1200',
+          FAKE_CODEX_LAUNCHER_PID_PATH: launcherPidPath } : {}) } });
     const enginePublications = () => published.filter((entry: any) => entry?.enginePid !== undefined);
-    const waitForNative = (predicate: () => boolean) => waitFor(harness!, predicate, 60_000).catch(error => {
-      const tail = control.markers.slice(-8).map(marker => marker.kind
-        + (marker.payload.processIdentityBoundary ? `:${marker.payload.processIdentityBoundary}` : '')
-        + (typeof marker.payload.busy === 'boolean' ? `:busy=${marker.payload.busy}` : ''));
-      throw new Error(`rejected=${JSON.stringify(rejected)} auths=${control.authCount} finals=${control.finals.length} `
-        + `last markers=${tail.join(' | ')}\n${(error as Error).message}`);
-    });
+    const waitForNative = async (predicate: () => boolean) => {
+      await waitFor(harness!, () => rejected.length > 0 || predicate(), 60_000).catch(error => {
+        const tail = control.markers.slice(-8).map(marker => marker.kind
+          + (marker.payload.processIdentityBoundary ? `:${marker.payload.processIdentityBoundary}` : '')
+          + (typeof marker.payload.busy === 'boolean' ? `:busy=${marker.payload.busy}` : ''));
+        throw new Error(`rejected=${JSON.stringify(rejected)} auths=${control.authCount} finals=${control.finals.length} `
+          + `last markers=${tail.join(' | ')}\n${(error as Error).message}`);
+      });
+      expect(rejected).toEqual([]);
+    };
+    // A replacement client is created and assigned to `client` before its
+    // initialize() RPC returns, and signed state can be emitted inside that
+    // window: an idle settle, or the control re-acceptance edge
+    // (`controlAcceptanceCount > 1`). Such a state must carry NO engine root.
+    // Attesting the npm launcher there freezes it as the engine root, and the
+    // real native engine's next state then reads as an unauthorized swap, so
+    // the worker runs failCodexAppControlGeneration. This drops the accepted
+    // control socket to force that re-authentication while the slow launcher
+    // has not spawned the native engine yet.
+    const expectNoRootDuringReplacementInitialization = async (
+      collector: ControlCollector, running: Harness, previousLauncherPid: number,
+    ): Promise<void> => {
+      // Wait for the replacement launcher to enter its deliberate delay. This
+      // pins the re-authentication to initialize(), rather than racing input.
+      await waitFor(running, () => Number(readFileSync(launcherPidPath, 'utf8')) !== previousLauncherPid, 60_000);
+      const launcherPid = Number(readFileSync(launcherPidPath, 'utf8'));
+      const before = collector.states.length;
+      await collector.restartEndpoint();
+      await waitFor(running, () => collector.states.length > before, 60_000);
+      const windowStates = collector.states.slice(before);
+      expect(windowStates.length).toBeGreaterThan(0);
+      // The first state of the window is the one emitted by the re-acceptance,
+      // while the replacement client is still inside initialize(): it must not
+      // claim any engine root at all.
+      expect(windowStates[0].appServerProcess).toBeUndefined();
+      // And the spawned child is the npm launcher, kept alive by the delay above
+      // so it is still the only process this client has. Publishing it is the
+      // defect that turns the real engine into an "unauthorized swap".
+      const rooted = windowStates.filter(state => state.appServerProcess !== undefined);
+      expect(rooted.map(state => state.appServerProcess.pid)).not.toContain(launcherPid);
+    };
     // The runner settles idle 20ms after a turn. "The last state is idle" was
     // already true from the startup state, so the engine could be killed
     // before that settle. When the runner then noticed the exit first, its
@@ -2147,6 +2215,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     try {
       await waitForNative(() => control.states.at(-1)?.busy === false);
       expect(enginePublications()).toHaveLength(1);
+      expect(enginePublications()[0].enginePid).toBe(Number(readFileSync(pidPath, 'utf8')));
+      expect(control.states.at(-1)?.appServerProcess).toEqual({
+        pid: enginePublications()[0].enginePid, procStart: enginePublications()[0].engineProcStart,
+      });
+      const initialLauncherPid = launchMode === 'node-launcher'
+        ? Number(readFileSync(launcherPidPath, 'utf8')) : undefined;
+      let probeInitWindow = false;
       for (const [index, turnId] of ['om_native_before', 'om_native_after', 'om_native_next'].entries()) {
         if (index === 1) {
           const pid = Number(readFileSync(pidPath, 'utf8'));
@@ -2155,12 +2230,17 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             try { process.kill(pid, 0); return false; }
             catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true; throw error; }
           });
+          probeInitWindow = launchMode === 'node-launcher';
         }
         // Production reserves a local liveness slot BEFORE the runner discovers
         // the dead engine. This must not be confused with native execution.
         tracker.begin(turnId);
         authority.beginWork();
         harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(turnId, { text: turnId }, turnId)}\r`);
+        if (probeInitWindow) {
+          probeInitWindow = false;
+          await expectNoRootDuringReplacementInitialization(control, harness!, initialLauncherPid!);
+        }
         await waitForNative(() => control.finals.length === index + 1);
         tracker.completeCurrent();
         await waitForNative(idleAfterLastFinal);
@@ -2168,7 +2248,14 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(rejected).toEqual([]);
       const engines = enginePublications();
       expect(engines).toHaveLength(2);
+      expect(engines[1].enginePid).toBe(Number(readFileSync(pidPath, 'utf8')));
       expect(engines[1].enginePid).not.toBe(engines[0].enginePid);
+      for (const state of control.states) {
+        if (state.appServerProcess) {
+          expect(engines.some(engine => engine.enginePid === state.appServerProcess.pid
+            && engine.engineProcStart === state.appServerProcess.procStart)).toBe(true);
+        }
+      }
       const boundary = control.states.find(state => state.processIdentityBoundary === 'idle_restart');
       expect(boundary).toMatchObject({ busy: true, tracksTurn: false, processIdentity: engines[1] });
       const boundaryIndex = control.markers.findIndex(marker => marker.payload === boundary);
@@ -2176,7 +2263,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         && marker.kind === 'activity' && marker.payload.phase === 'submitted');
       expect(boundaryIndex).toBeGreaterThan(-1);
       expect(submittedAfter).toBeGreaterThan(boundaryIndex);
-      expect(control.authCount).toBe(1);
+      expect(control.authCount).toBe(launchMode === 'node-launcher' ? 2 : 1);
       expect(control.finals.map(final => final.turnId)).toEqual(['om_native_before', 'om_native_after', 'om_native_next']);
       // Replace the observing worker during native work. The signed state must
       // bind the exact persisted reply turn, rather than guessing from busy.
@@ -2200,7 +2287,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       writeFileSync(finishGate, 'ready');
       await waitForNative(() => control.finals.length === 4);
       tracker.completeCurrent();
-      expect(control.authCount).toBe(2);
+      expect(control.authCount).toBe(launchMode === 'node-launcher' ? 3 : 2);
       expect(rejected).toEqual([]);
       expect(readRequests(logPath).filter(request => request.method === 'thread/start')).toHaveLength(1);
       expect(readRequests(logPath).filter(request => request.method === 'thread/resume')).toHaveLength(1);
