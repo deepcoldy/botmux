@@ -64,6 +64,20 @@ afterEach(() => {
 });
 
 describe('bytedcli identity renewal', () => {
+  it('leaves registered background cache to its per-invocation authority checks', async () => {
+    const ordinary = publish(600, 600);
+    forgetBytedcliIdentityRenewals();
+    const background = { ...ordinary, turnId: 'background:12345678-1234-1234-1234-123456789abc' };
+    writeSessionIdentity(dir, SESSION, background, 'proven');
+    renew.mockResolvedValueOnce({ cloudJwt: jwt('cn', 7200, 'unwanted-background-renewal') });
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity: background });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+    expect(recallProvenIdentityContent(dir, SESSION, background.turnId, 'bytedcli'))
+      .toBe(renderIdentityEnv(publishedIdentityShape(dir, SESSION, background)));
+  });
+
   it('renews the full published shape including HOME and rejects a changed HOME after await', async () => {
     const original = publish(7200, 600);
     const published = publishedIdentityShape(dir, SESSION, original);

@@ -60,6 +60,10 @@ export function bytedcliIdentityExpiryMs(identity: BytedCliIdentity): number | u
 
 /** Track a proven bytedcli identity just published from a local mint. */
 export function trackBytedcliIdentityRenewal(entry: RenewalEntry): void {
+  // Registered jobs have their own per-invocation authority/lease checks. The
+  // ordinary-turn timer must never renew their cache or derive its HOME after
+  // the job has been retired in the authority store.
+  if (entry.identity.turnId.startsWith('background:')) return;
   entries.set(entryKey(entry.sessionDataDir, entry.sessionId, entry.identity.turnId), {
     ...entry,
     identity: { ...entry.identity },
