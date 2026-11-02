@@ -2826,6 +2826,43 @@ describe('automateOpenPlatformSetup', () => {
     if (!result.ok) expect(result.redirectConfigured).toBe(true);
   });
 
+  it('写请求挂住时由白名单自身截止时间中断（automation 内联 postJson 必须把 signal 透传到底层 fetch）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    let writeSignal: AbortSignal | null | undefined;
+    let writes = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/safe_setting/update/')) {
+        writes++;
+        writeSignal = init?.signal;
+        // 挂住的写请求只会在收到实际传入 fetch 的取消信号时结束。
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+        });
+      }
+      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+      // 回调段之后立即结束配置，让断言聚焦回调截止时间的处理。
+      if (href.includes('/scope/all/')) return new Response('forbidden', { status: 403 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_x', sessionFilePath: sessionFile, fetchImpl,
+      redirectWriteTimeoutMs: 20,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+
+    expect(writes).toBe(1);
+    expect(writeSignal).toBeInstanceOf(AbortSignal);
+    expect(writeSignal?.aborted).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.redirectWarning).toContain('超时');
+  }, 5000);
+
   it('keeps going and reports a warning when the redirect whitelist cannot be written', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
     const sessionFile = join(dir, 'feishu-session.json');

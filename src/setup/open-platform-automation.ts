@@ -337,6 +337,11 @@ export interface OpenPlatformAutomationOptions {
   grantedScopeNames?: { tenant: string[]; user: string[] };
   pollIntervalMs?: number;
   maxWaitMs?: number;
+  /**
+   * 回调白名单恢复流程的总截止时间（毫秒），缺省仍为 15 秒。
+   * 调用方可传更紧的预算；测试也用它验证在飞请求的取消。
+   */
+  redirectWriteTimeoutMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
   /** Emitted once only after Feishu reports this exact QR as scanned. */
   onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
@@ -1562,6 +1567,7 @@ export async function automateOpenPlatformSetup(
     const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
       // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
       allowBlindWrite: options.appJustCreated === true,
+      timeoutMs: options.redirectWriteTimeoutMs,
     });
     // 只有真的发了写请求（updated / updated_fallback）才算改过；unchanged（幂等
     // 短路）与 skipped_unreadable（一次都没写）都不置位。
