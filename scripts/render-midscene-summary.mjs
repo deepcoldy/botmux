@@ -6,6 +6,7 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { feishuLaneProject, selectFeishuLaneFiles } from './midscene-report-evidence.mjs';
+import { createRedactor, secretValues } from './midscene-redact.mjs';
 
 function parseArguments(argv) {
   const options = {};
@@ -298,7 +299,8 @@ async function main() {
   if (missingResults.length > 0) {
     markdown += `\nMissing native summary for a successful step: ${missingResults.join(', ')}. The run cannot be reported as passed.\n`;
   }
-  await appendFile(required(options, 'output'), markdown);
+  // The run summary is public; failure messages carry the model name.
+  await appendFile(required(options, 'output'), createRedactor(secretValues(process.env))(markdown));
 }
 
 if (
