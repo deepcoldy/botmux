@@ -1378,6 +1378,14 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   }
 }
 
+/** Workflow run view: live registry name first, then the persisted
+ *  bots-info.json name (offline bots), read lazily once per request. */
+function v3RunBotNameResolver(): (larkAppId: string) => string | undefined {
+  let persisted: Map<string, string> | undefined;
+  return (appId) => registry.getByAppId(appId)?.botName
+    ?? (persisted ??= readPersistedBotNames()).get(appId);
+}
+
 /** Map appId → persisted Feishu-probed botName from bots-info.json (offline
  *  bots keep a friendly name in the dashboard). Best-effort; empty on any error. */
 function readPersistedBotNames(): Map<string, string> {
@@ -6649,6 +6657,7 @@ const server = createServer(async (req, res) => {
     if (await handleV3RunsApi(req, res, url, {
       runsDir: v3RunsDir(),
       proxyToDaemon,
+      botName: v3RunBotNameResolver(),
     }, authed)) {
       return;
     }
