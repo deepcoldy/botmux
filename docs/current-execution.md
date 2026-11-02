@@ -1,5 +1,7 @@
 # 当前执行的只读证明
 
+显式登记的定时后台任务可以通过凭据内容路由续用原执行人的材料，见[定时后台执行](scheduled-background-identity.md)。登记必须在原 scheduled turn 仍可证明时完成，后台取票逐次校验受控根、任务、原执行人、策略与撤权代次；同 UID 或历史 turn 文件不能建立登记。`execution current` / `actor current` 本身仍只证明当前 live turn，不把后台登记描述为新的真人指令。
+
 Codex App 的新版独立 runner 使用主干的签名 `appServerProcess` 声明，worker 在本会话 backend 的宿主进程树中核对启动令牌，并通过 `NSpid` 解析命名空间内 PID，随后沿私有 IPC 发布引擎根。该现代证明路径优先于本 PR 的旧协议兼容，不会再被旧根覆盖。
 
 兼容已在运行、尚不带 `appServerProcess` 的旧 runner 时，才沿已认证签名通道处理 `processIdentity`：核对同一 session 的唯一 runner、其直接启动的 RPC 子进程、内核血缘和继承的 stdio。普通 busy/idle 不重新快照工具。旧协议空闲重启在投递前发布 `idle_restart`；旧引擎必须已退出、无待收尾 final 且新身份重新通过内核/stdio 验证，才更新旧根。新版引擎轮换继续使用主干的出生令牌和旧引擎退出检查。
