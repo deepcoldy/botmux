@@ -3,7 +3,9 @@ import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { traexModelPickerPage } from '../src/adapters/cli/traex-footer.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
 const rule = '─'.repeat(80);
 // Sanitized current-viewport captures from TRAE CLI 0.213.1.
@@ -16,6 +18,19 @@ const effort = picker('Select Reasoning Level for GPT-5.6-Sol / Standard');
 const composer = [rule, '❯ Explain this codebase', rule,
   '  GPT-5.6-Sol · /tmp/project · Context 89% left',
   '  ▧ Workspace Edit (shift+tab to cycle) · ? for shortcuts · ← for agents'].join('\n');
+
+describe('TraeX live model picker recognition', () => {
+  it.each([
+    ['hint above a live composer', `${model}\n❯ Explain this codebase\n`
+      + '  GPT-5.6-Sol · /tmp/project · Context 89% left\n'
+      + '  ▧ Workspace Edit · ? for shortcuts'],
+    ['no numbered option', [rule, '  Select Model and Effort',
+      '  GPT-5.6-Sol / Standard', '  enter confirm | esc go back'].join('\n')],
+    ['unknown title', picker('Select Model Backend Variant')],
+  ])('rejects %s', (_label, screen) => {
+    expect(traexModelPickerPage(screen)).toBeUndefined();
+  });
+});
 
 describe('TraeX ordinary input after /model', () => {
   let home: string;
@@ -34,6 +49,7 @@ describe('TraeX ordinary input after /model', () => {
     const pty: PtyHandle = {
       write: vi.fn(),
       captureInputState: () => ({ viewport: screens[index]!, cursor: { x: 0, y: 0 } }),
+      captureViewportAsync: vi.fn(async () => screens[index]!),
       pasteText: vi.fn(text => { if (screens[index] === composer) pasted = text; }),
       sendSpecialKeys: vi.fn(key => {
         if (key === 'Escape') {
@@ -61,6 +77,45 @@ describe('TraeX ordinary input after /model', () => {
       expect(submissions).toEqual(['first question', 'second question']);
       expect(vi.mocked(pty.sendSpecialKeys!).mock.calls.map(call => call[0]))
         .toEqual([...menus.map(() => 'Escape'), 'Enter', 'Enter']);
+    },
+  );
+
+  it('recovers through asynchronous viewports without a blocking cursor capture', async () => {
+    const { pty, submissions } = terminal([effort, mode, model, composer]);
+    pty.captureInputState = vi.fn(() => { throw new Error('cursor capture must not block input'); });
+    expect(await createTraexAdapter('/bin/traex').writeInput(pty, 'async question'))
+      .toMatchObject({ submitted: true });
+    expect(submissions).toEqual(['async question']);
+    expect(pty.captureInputState).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1])('fails before pasting when asynchronous viewport reads fail after %i captures', async successfulReads => {
+    const { pty, submissions } = terminal([model, composer]);
+    let reads = 0;
+    pty.captureViewportAsync = vi.fn(async () => {
+      if (reads++ < successfulReads) return model;
+      throw new Error('viewport unavailable');
+    });
+    expect(await createTraexAdapter('/bin/traex').writeInput(pty, 'do not lose this'))
+      .toMatchObject({ submitted: false, failureReason: expect.any(String) });
+    expect(pty.pasteText).not.toHaveBeenCalled();
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+    expect(submissions).toEqual([]);
+  });
+
+  it.each(['empty async viewport', 'unavailable input state'])(
+    'fails before pasting with an %s', async unavailable => {
+      const { pty } = terminal([composer]);
+      if (unavailable === 'empty async viewport') {
+        pty.captureViewportAsync = async () => '';
+      } else {
+        delete pty.captureViewportAsync;
+        pty.captureInputState = () => null;
+      }
+      expect(await createTraexAdapter('/bin/traex').writeInput(pty, 'do not lose this'))
+        .toMatchObject({ submitted: false, failureReason: expect.any(String) });
+      expect(pty.pasteText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
     },
   );
 
@@ -115,7 +170,7 @@ describe('TraeX ordinary input after /model', () => {
     const adapter = createTraexAdapter('/bin/traex');
     const queued = (async () => [await adapter.writeInput(pty, 'first queued question'),
       await adapter.writeInput(pty, 'second queued question')])();
-    await vi.runAllTimersAsync();
+    await flushFakeTimers();
     expect(await queued).toEqual([
       expect.objectContaining({ submitted: true }), expect.objectContaining({ submitted: true }),
     ]);

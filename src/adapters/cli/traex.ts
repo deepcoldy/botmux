@@ -726,11 +726,20 @@ async function dismissTraexModelPicker(pty: PtyHandle): Promise<string | undefin
   // This capability is an authoritative viewport, not a scrollback/render
   // cache. Backends without it retain their existing input protocol.
   if (!pty.captureInputState) return;
-  const screen = () => { try { return pty.captureInputState!()?.viewport; } catch { return undefined; } };
-  let current = screen();
-  let page = current === undefined ? undefined : traexModelPickerPage(current);
-  if (!page) return;
+  // Recovery only needs cells, not the cursor. Tmux's async read avoids two
+  // synchronous child processes on every redraw poll.
+  const screen = async () => {
+    try {
+      return pty.captureViewportAsync
+        ? await pty.captureViewportAsync()
+        : pty.captureInputState!()?.viewport;
+    } catch { return undefined; }
+  };
   const failure = 'TRAE model picker could not return to an empty composer; no message was pasted. Finish or cancel the menu in the Web terminal, then retry.';
+  let current = await screen();
+  if (!current?.trim()) return failure;
+  let page = traexModelPickerPage(current);
+  if (!page) return;
   for (let depth = 0; depth < 3 && page; depth++) {
     try {
       const accepted = pty.sendSpecialKeys ? pty.sendSpecialKeys('Escape') : pty.write('\x1b');
@@ -740,7 +749,7 @@ async function dismissTraexModelPicker(pty: PtyHandle): Promise<string | undefin
     // must not turn repeated Escape into an interruption of a newer task.
     for (let poll = 0; poll < 20; poll++) {
       await delay(50);
-      current = screen();
+      current = await screen();
       if (current !== undefined) {
         const next = traexModelPickerPage(current);
         if ((next && next !== page) || traexRestoredComposerReady(current)) break;
