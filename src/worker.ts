@@ -100,7 +100,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { BridgeTurnQueue, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -8583,6 +8583,8 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, bridgeJsonlPath);
+  // The old CLI's queue died with it: a replayed enqueue proves nothing now.
+  bridgeQueue.forgetCliQueue();
   observeModelFallbackEvents(bridgeJsonlPath, drained.events);
   bridgeBaselineDone = true;
   log(`Bridge restored ${restorable.length} interrupted turn(s) from journal (drain ${recoveryPlan.fromOffset}→${bridgeOffset}, absorbed=${history.length}, live=${live.length})`);
@@ -8714,6 +8716,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
  *  i.e. Claude rotated the file via `/clear` / `/resume`. Those rotations
  *  happen hours apart in practice, so a 10s detection delay is invisible. */
 const BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 10_000;
+const BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 60_000;
 const bridgeFingerprintScanLastMs = new Map<string, number>();
 
 /** Pending+unstarted bridge marks expire after this long. Defensive TTL:
@@ -8730,9 +8733,14 @@ function maybeSwitchBridgeJsonl(): boolean {
   const candidate = pending.find(t => !t.started && !!t.contentFingerprint);
   if (!candidate || !candidate.contentFingerprint) return false;
   // Per-fingerprint rate limit — see BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS.
+  // An input Claude's own transcript shows queued is not lost, but an in-pane
+  // /clear while it waits moves it to a new file, so it is still scanned, rarely.
   const lastScan = bridgeFingerprintScanLastMs.get(candidate.contentFingerprint);
   const now = Date.now();
-  if (lastScan !== undefined && now - lastScan < BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS) {
+  const minInterval = isHeldInCliQueue(candidate)
+    ? BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS
+    : BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS;
+  if (lastScan !== undefined && now - lastScan < minInterval) {
     return false;
   }
   bridgeFingerprintScanLastMs.set(candidate.contentFingerprint, now);
@@ -9311,6 +9319,7 @@ function makeBridgeTranscriptSettle(
  *  teardown/start and every in-process transcript switch. */
 function beginNewBridgeTranscriptGeneration(): void {
   disarmProvisionalExitWatch();
+  bridgeQueue.forgetCliQueue();
   // Pending turns are carried onto the new file; tag them so a watchdog
   // releasing one does not teach the new generation it is marker-less.
   bridgeQueue.markPendingTurnsCarriedAcrossGeneration();
@@ -9462,7 +9471,7 @@ function bridgeIngest(): void {
   for (const t of expired) {
     if (t.contentFingerprint) bridgeFingerprintScanLastMs.delete(t.contentFingerprint);
     journalBridgeTurnClear(t.turnId, t.dispatchAttempt);
-    log(`Bridge mark expired after ${Math.round(BRIDGE_PENDING_TURN_TTL_MS / 1000)}s without matching a jsonl user line (turnId=${t.turnId}) — dropped to prevent rotation-fallback scan loop.`);
+    log(`Bridge mark expired (${Math.round(BRIDGE_PENDING_TURN_TTL_MS / 1000)}s without a matching jsonl user line, or held past the queue cap) (turnId=${t.turnId}) — dropped to prevent rotation-fallback scan loop.`);
   }
   // Drain secondary paths first so any trailing assistant text on an old
   // jsonl reaches the queue before the rotation check considers retiring
@@ -17657,6 +17666,7 @@ function markPromptReady(): void {
   isPromptReady = true;
   promptReadyEdges++;
   judgeClaudeBridgeTurn();
+  bridgeQueue.cliQueueDrained();
   settleSessionRenameOnPrompt();
   const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
   if (readyTransition(syncedFromDisk).advanceQueuedTurn) {
