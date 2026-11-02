@@ -89,11 +89,11 @@ describe('TraeX ordinary input after /model', () => {
     expect(pty.captureInputState).not.toHaveBeenCalled();
   });
 
-  it.each([0, 1])('fails before pasting when asynchronous viewport reads fail after %i captures', async successfulReads => {
+  it('fails before pasting when asynchronous viewport reads fail during recovery', async () => {
     const { pty, submissions } = terminal([model, composer]);
     let reads = 0;
     pty.captureViewportAsync = vi.fn(async () => {
-      if (reads++ < successfulReads) return model;
+      if (++reads === 1) return model;
       throw new Error('viewport unavailable');
     });
     expect(await createTraexAdapter('/bin/traex').writeInput(pty, 'do not lose this'))
@@ -102,22 +102,6 @@ describe('TraeX ordinary input after /model', () => {
     expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
     expect(submissions).toEqual([]);
   });
-
-  it.each(['empty async viewport', 'unavailable input state'])(
-    'fails before pasting with an %s', async unavailable => {
-      const { pty } = terminal([composer]);
-      if (unavailable === 'empty async viewport') {
-        pty.captureViewportAsync = async () => '';
-      } else {
-        delete pty.captureViewportAsync;
-        pty.captureInputState = () => null;
-      }
-      expect(await createTraexAdapter('/bin/traex').writeInput(pty, 'do not lose this'))
-        .toMatchObject({ submitted: false, failureReason: expect.any(String) });
-      expect(pty.pasteText).not.toHaveBeenCalled();
-      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
-    },
-  );
 
   it.each([
     ['picker did not dismiss', [model], false],

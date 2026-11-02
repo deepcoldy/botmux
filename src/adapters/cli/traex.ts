@@ -735,11 +735,10 @@ async function dismissTraexModelPicker(pty: PtyHandle): Promise<string | undefin
         : pty.captureInputState!()?.viewport;
     } catch { return undefined; }
   };
-  const failure = 'TRAE model picker could not return to an empty composer; no message was pasted. Finish or cancel the menu in the Web terminal, then retry.';
   let current = await screen();
-  if (!current?.trim()) return failure;
-  let page = traexModelPickerPage(current);
+  let page = current === undefined ? undefined : traexModelPickerPage(current);
   if (!page) return;
+  const failure = 'TRAE model picker could not return to an empty composer; no message was pasted. Finish or cancel the menu in the Web terminal, then retry.';
   for (let depth = 0; depth < 3 && page; depth++) {
     try {
       const accepted = pty.sendSpecialKeys ? pty.sendSpecialKeys('Escape') : pty.write('\x1b');
