@@ -3002,6 +3002,10 @@ describe('automateOpenPlatformSetup', () => {
     if (result.ok) {
       expect(result.scopeCount).toBe(0);
       expect(result.skippedScopeCount).toBe(3);
+      expect(result.skippedScopes).toEqual({
+        tenant: ['im:message', 'contact:user.base:readonly'],
+        user: ['auth:user_access_token:read'],
+      });
     }
     expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
   });

@@ -163,7 +163,7 @@ describe('parseSetupCommand', () => {
     expect(() => parseSetupCommand(['configure'])).toThrow(/需要指定机器人/);
     expect(() => parseSetupCommand(['configure', 'a', 'b'])).toThrow(/只接受一个机器人标识/);
     expect(() => parseSetupCommand(['configure', 'botmux-1', '--cli', 'codex'])).toThrow(/不接受字段参数/);
-    expect(() => parseSetupCommand(['configure', 'botmux-1', '--open-platform-auto'])).toThrow(/只接受机器人标识、--switch-account 和 --json/);
+    expect(() => parseSetupCommand(['configure', 'botmux-1', '--open-platform-auto'])).toThrow(/只接受机器人标识/);
   });
 
   it('accepts "-" as a clear value but treats a following --flag as a missing value', () => {
@@ -468,5 +468,30 @@ describe('maskAppSecret', () => {
     expect(maskAppSecret(undefined)).toBe('');
     expect(maskAppSecret('short')).toBe('••••');
     expect(maskAppSecret('abcd1234efgh5678')).toBe('abcd••••5678');
+  });
+});
+
+describe('parseSetupCommand --extra-scopes-file', () => {
+  it('is accepted by add --create-app and configure (both spellings)', () => {
+    expect(parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--extra-scopes-file', './s.json']))
+      .toMatchObject({ action: 'add', extraScopesFile: './s.json', openPlatformAuto: true });
+    expect(parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file=/x/s.json']))
+      .toMatchObject({ action: 'configure', selector: 'botmux-0', extraScopesFile: '/x/s.json' });
+    expect(parseSetupCommand(['configure', 'botmux-0'])).not.toHaveProperty('extraScopesFile');
+  });
+
+  it('requires a path and Open Platform automation on add', () => {
+    expect(() => parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file'])).toThrow(/缺少文件路径/);
+    expect(() => parseSetupCommand(['configure', 'botmux-0', '--extra-scopes-file', '--json'])).toThrow(/缺少文件路径/);
+    expect(() => parseSetupCommand(['add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--extra-scopes-file', 's.json']))
+      .toThrow(/自动配置/);
+    expect(parseSetupCommand(['add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--open-platform-auto', '--extra-scopes-file', 's.json']))
+      .toMatchObject({ extraScopesFile: 's.json' });
+  });
+
+  it('is rejected by list / edit / remove', () => {
+    expect(() => parseSetupCommand(['list', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
+    expect(() => parseSetupCommand(['edit', 'botmux-0', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
+    expect(() => parseSetupCommand(['remove', 'botmux-0', '--yes', '--extra-scopes-file', 's.json'])).toThrow(/仅适用于 add 或 configure/);
   });
 });
