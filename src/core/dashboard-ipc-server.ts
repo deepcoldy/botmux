@@ -2251,6 +2251,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   const initiallyClosed = initial?.status === 'closed';
   let codexArchiveReleaseTicket: CodexCleanupReleaseTicket | undefined;
   const closeCurrentGeneration = () => closeSession(params.sessionId, {
+    ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
+      ? { backgroundExecutionCleanup: true } : {}),
     onCodexCleanupRelease: ticket => { codexArchiveReleaseTicket = ticket; },
   });
   const cleanupSource = body.idleCleanupSource === 'manual' ? 'manual'
@@ -2285,6 +2287,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     // never clear a stale pre-drain snapshot while a turn is still preparing.
     const current = findSessionRecord(params.sessionId);
     if (current && current.status === 'closed') {
+      // Manual re-close must revoke jobs preserved by automatic cleanup. Do
+      // not return before the canonical durable close clears that marker.
+      if (current.backgroundExecutionCleanupClosedAt
+        && !(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled')) {
+        await closeCurrentGeneration();
+      }
       // A closed row can still carry an UNCANCELLED remote session (a quarantined
       // lineage is parked, not cancelled). Short-circuiting to a bare success here
       // meant a retry — or any client that lost the first response — could never

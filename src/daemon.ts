@@ -3890,6 +3890,7 @@ function scheduleDeferredScheduleSettlement(
       closeSession: (id: string) => closeSessionForBackgroundCleanup(
         id,
         'deferred-schedule settlement',
+        { backgroundExecutionCleanup: true },
       ),
     }).then((result) => {
       if (result.action === 'materialized') {

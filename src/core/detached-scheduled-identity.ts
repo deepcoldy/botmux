@@ -11,6 +11,8 @@ import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 import * as sessionStore from '../services/session-store.js';
 import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../utils/process-identity.js';
+import { cleanupBackgroundJobHome } from '../services/bytedcli-home.js';
+import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import type { Session } from '../types.js';
 import { readIdentityLayout, recallProvenIdentityContent, forgetProvenIdentityContent } from './cli-identity.js';
 import { attestCurrentExecutionLoopbackPeer, type ProcessIdentity } from './current-actor-attestation.js';
@@ -36,11 +38,16 @@ const inFlightPublishes = new Map<string, Promise<void>>();
 
 /** The fire id comes only from live process attestation or a host registration. */
 export function resolveAuthorizedScheduledSession(
-  sessionDataDir: string, sessionId: string, scheduledTurnId: string,
+  sessionDataDir: string, sessionId: string, scheduledTurnId: string, allowAutomaticCleanup = false,
 ): AuthorizedScheduledSessionContext | null {
+  // This registration's authority and automatic-close protocol are local
+  // SQLite state. Distributed primary close does not carry that protocol.
+  if (coordinationModeIsPrimary()) return null;
   const ds = findActiveBySessionId(sessionId);
   const session = ds?.session ?? sessionStore.getOwnedSession(sessionId);
-  if (!session || session.status !== 'active'
+  const automaticallyClosed = session?.status === 'closed' && !!session.closedAt
+    && session.backgroundExecutionCleanupClosedAt === session.closedAt;
+  if (!session || (session.status !== 'active' && !(allowAutomaticCleanup && automaticallyClosed))
     || sandboxBoolValue(session.sandbox) || ds?.reportedIdentityModel?.sandboxEngaged
     || session.adoptedFrom || session.vcMeetingReceiver) return null;
   const larkAppId = ds?.larkAppId ?? session.larkAppId;
@@ -57,7 +64,7 @@ export function resolveAuthorizedScheduledSession(
   if ((authority.task.larkAppId && authority.task.larkAppId !== larkAppId)
     || !scheduleStore.effectiveScheduleChatIds(authority.task).includes(chatId)) return null;
   if (ds?.reportedIdentityModel ? identityStorageModelForDaemonSession(ds) !== 'proven'
-    : readIdentityLayout(sessionDataDir, sessionId) !== 'proven') return null;
+    : !automaticallyClosed && readIdentityLayout(sessionDataDir, sessionId) !== 'proven') return null;
   return { ds, session, larkAppId, chatId, botConfig, scheduledTurnId, taskId, authority,
     runIdentity: resolveScheduledRunIdentity(authority.task, larkAppId,
       (openId, unionId) => canOperate(larkAppId, chatId, openId, unionId)) };
@@ -87,6 +94,7 @@ export function registerScheduledBackgroundExecution(input: {
     sessionId: input.sessionId, taskId: ctx.taskId, turnId, root: { ...input.peer }, bootId,
     uid: process.getuid(), openId: ctx.runIdentity.openId, unionId: ctx.runIdentity.unionId,
     authEpoch: readCliAuthEpoch(ctx.runIdentity.openId), authorityKey: backgroundAuthorityKey(ctx.authority.task),
+    sessionEpoch: ctx.session.backgroundExecutionEpoch ?? 0,
     credentialPolicyKey: backgroundCredentialPolicyKey(ctx.botConfig),
     expiresAt: Date.now() + ttl * 1000 };
   scheduler.registerBackgroundExecution(job);
@@ -109,10 +117,11 @@ export function resolveRegisteredBackgroundContext(input: {
     releaseActiveIdentityTurn(input.sessionDataDir, input.sessionId, `background:${job.id}`);
     return null;
   };
-  const ctx = resolveAuthorizedScheduledSession(input.sessionDataDir, input.sessionId, job.turnId);
+  const ctx = resolveAuthorizedScheduledSession(input.sessionDataDir, input.sessionId, job.turnId, true);
   if (!ctx) return retire();
   if (!ctx.runIdentity.ok || ctx.larkAppId !== job.appId || ctx.taskId !== job.taskId
     || ctx.runIdentity.openId !== job.openId || ctx.runIdentity.unionId !== job.unionId
+    || (ctx.session.backgroundExecutionEpoch ?? 0) !== (job.sessionEpoch ?? 0)
     || backgroundAuthorityKey(ctx.authority.task) !== job.authorityKey
     || backgroundCredentialPolicyKey(ctx.botConfig) !== job.credentialPolicyKey
     || readCliAuthEpoch(job.openId) !== job.authEpoch) {
@@ -200,6 +209,16 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
         } finally {
           // This cache is disposable, never an admitted ordinary message turn.
           releaseActiveIdentityTurn(input.sessionDataDir, input.sessionId, turnId);
+          // A dead-root row may already have been collected while the provider
+          // awaited. Its late publication must not recreate orphan job state.
+          let stable = false;
+          try { stable = backgroundContextStillValid(input, ctx); }
+          finally {
+            if (!stable) {
+              forgetProvenIdentityContent(input.sessionDataDir, input.sessionId, turnId);
+              cleanupBackgroundJobHome(ctx.job.id);
+            }
+          }
         }
       })().finally(() => {
         if (inFlightPublishes.get(flightKey) === pending) inFlightPublishes.delete(flightKey);
@@ -210,6 +229,7 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
   }
   if (!backgroundContextStillValid(input, ctx)) {
     forgetProvenIdentityContent(input.sessionDataDir, input.sessionId, turnId);
+    cleanupBackgroundJobHome(ctx.job.id);
     return null;
   }
   const env = current();

@@ -18,6 +18,8 @@ export interface BackgroundExecutionRegistration {
   openId: string;
   unionId: string;
   authEpoch: number;
+  /** Explicit session close/resume cannot revive an older registration. */
+  sessionEpoch?: number;
   authorityKey: string;
   credentialPolicyKey: string;
   expiresAt: number;
@@ -28,11 +30,21 @@ export function backgroundCredentialPolicyKey(bot: BotConfig): string {
     larkToolBinding: bot.larkToolBinding ?? true, apiOnly: bot.apiOnly ?? false });
 }
 
-/** Runtime counters and next-fire bookkeeping do not change a job's authority. */
+/** Only task definition and authorization belong here. rootMessageId is
+ * materialized by runtime AFTER a silent task-position fire; like counters and
+ * preconditionRef it must not revoke the job started by that very fire. */
 export function backgroundAuthorityKey(task: ScheduledTask): string {
-  return JSON.stringify([task.larkAppId, task.chatId, task.chatIds, task.rootMessageId,
-    task.ownerOpenId, task.ownerUnionId, task.creatorLarkAppId, task.runAsClaim,
-    task.prompt, task.workingDir, task.followActive, task.scope]);
+  return JSON.stringify({
+    // App and execution destinations delimit the authority's routing scope.
+    appId: task.larkAppId, chatId: task.chatId, chatIds: task.chatIds,
+    executionPosition: task.executionPosition, scope: task.scope, followActive: task.followActive,
+    // Creator/claimant identify the human whose credentials the job may use.
+    ownerOpenId: task.ownerOpenId, ownerUnionId: task.ownerUnionId,
+    creatorLarkAppId: task.creatorLarkAppId, runAsClaim: task.runAsClaim,
+    // Editing work or its scheduling definition requires a new registration.
+    prompt: task.prompt, workingDir: task.workingDir, schedule: task.schedule, parsed: task.parsed,
+    calendar: task.calendar, calendarDayType: task.calendarDayType,
+  });
 }
 
 export function backgroundPeerBelongsToJob(

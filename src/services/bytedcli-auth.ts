@@ -32,7 +32,6 @@
  */
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
@@ -41,7 +40,7 @@ import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
 import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-auth-epoch.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
-const BYTEDCLI_HOME_ROOT = join(homedir(), '.botmux', 'data', 'bytedcli-home');
+import { BYTEDCLI_HOME_ROOT } from './bytedcli-home.js';
 
 /** How long to wait on a `bytedcli` invocation. The device-code calls talk to
  *  ByteCloud, so they are network-bound; the JWT reads are usually local but

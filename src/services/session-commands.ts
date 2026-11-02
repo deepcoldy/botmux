@@ -26,6 +26,8 @@ import type { LarkAttachment, Session } from '../types.js';
 
 /** Close inputs only the owning daemon can produce. */
 type DaemonCloseOptions = {
+  /** Only trusted scheduled host cleanup may preserve already-registered jobs. */
+  backgroundExecutionCleanup?: boolean;
   workspaceRetirement?: Session['workspaceRetirement'];
   /**
    * Close-time token snapshot, sampled by the caller BEFORE the write (the
@@ -187,6 +189,19 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
   }
   if (alreadyClosed && row.queuedAttachments !== undefined) {
     row.queuedAttachments = undefined;
+    changed = true;
+  }
+  const previousCleanup = row.backgroundExecutionCleanupClosedAt;
+  const cleanup = command.backgroundExecutionCleanup
+    ? (alreadyClosed ? previousCleanup : row.closedAt) : undefined;
+  if (previousCleanup !== cleanup) {
+    row.backgroundExecutionCleanupClosedAt = cleanup;
+    changed = true;
+  }
+  // Manual close is durable revocation even if no job asks for credentials
+  // before a later resume. Repeating an already-manual close stays a no-op.
+  if (!command.backgroundExecutionCleanup && (!alreadyClosed || previousCleanup !== undefined)) {
+    row.backgroundExecutionEpoch = (row.backgroundExecutionEpoch ?? 0) + 1;
     changed = true;
   }
   // Closing ends the principal-lane lifecycle. No queued human turn may cross

@@ -755,6 +755,11 @@ export interface Session {
    *  a bot's own output. */
   lastHumanMessageAt?: string;
   closedAt?: string;
+  /** Owning-daemon automatic scratch cleanup, tied to this exact close. It
+   * preserves existing registered jobs, never permission to admit a new turn. */
+  backgroundExecutionCleanupClosedAt?: string;
+  /** Explicit close invalidates registrations across a later session resume. */
+  backgroundExecutionEpoch?: number;
   /** Permanent retirement after successful workspace reclamation. Written with
    * the closed row; generic resume must never reuse this conversation's cwd. */
   workspaceRetirement?: {
