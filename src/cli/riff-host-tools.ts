@@ -11,6 +11,7 @@ import {
   RIFF_HOST_BINDING_ENV, RIFF_HOST_MAX_BYTES, riffHostFileArguments,
   type RiffHostBinding, type RiffHostRequest, type RiffHostResult,
 } from '../services/riff-host-tools.js';
+import { RIFF_HOST_UNREACHABLE_HINT } from '../services/riff-host-hint.js';
 
 function bindingPath(env: NodeJS.ProcessEnv): string {
   if (!env.BOTMUX_SESSION_ID) throw new Error('riff_host_session_missing');
@@ -72,10 +73,16 @@ export async function prepareRiffHostRequest(argv: string[], readStdin: () => Pr
   return request;
 }
 
+/** The part of an HTTP answer the client needs. Deliberately not a WHATWG
+ * Response: a gateway may answer with a status that Response refuses to
+ * construct (Node rejects any body on 204), and every answer must surface as a
+ * reportable HTTP failure instead of crashing the CLI. */
+export interface RiffHostHttpResponse { status: number; text(): Promise<string> }
+
 // A host capability is sent directly to its deployment-owned endpoint. Bun's
 // global fetch snapshots proxy variables at startup and can hand private IPv6
 // addresses (and their credentials) to the sandbox's HTTP egress proxy.
-async function riffHostDirectFetch(url: string, init: RequestInit): Promise<Response> {
+async function riffHostDirectFetch(url: string, init: RequestInit): Promise<RiffHostHttpResponse> {
   const endpoint = new URL(url);
   if (!['http:', 'https:'].includes(endpoint.protocol)) throw new Error('riff_host_endpoint_invalid');
   const headers = Object.fromEntries(new Headers(init.headers).entries());
@@ -92,15 +99,62 @@ async function riffHostDirectFetch(url: string, init: RequestInit): Promise<Resp
         chunks.push(Buffer.from(chunk));
       });
       res.on('error', reject);
-      res.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: res.statusCode ?? 502 })));
+      res.on('end', () => {
+        const bytes = Buffer.concat(chunks);
+        resolve({ status: res.statusCode ?? 0, text: async () => new TextDecoder().decode(bytes) });
+      });
     });
     req.on('error', reject);
     req.end(body);
   });
 }
 
+const EXCERPT_CHARS = 120;
+// C0/C1 controls plus invisible/bidi format characters: an excerpt must not
+// rewrite the terminal or reorder the text a human reads.
+const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g;
+
+/** One printable line from an unexpected response body: the capability token
+ * is masked before anything else, markup of an HTML error page is dropped,
+ * control characters are removed and the result is truncated. */
+function riffHostResponseExcerpt(text: string, token: string): string {
+  // Mask on the whole body first so a later cut can never expose a token part.
+  let value = (token ? text.split(token).join('***') : text).slice(0, 8192);
+  if (/^\s*</.test(value)) value = value.replace(/<[^>]*>/g, ' ');
+  value = value.replace(UNPRINTABLE, ' ').replace(/\s+/g, ' ').trim();
+  const chars = Array.from(value);
+  return chars.length > EXCERPT_CHARS ? `${chars.slice(0, EXCERPT_CHARS).join('')}…` : value;
+}
+
+/** Error text for an answer that is not a usable worker reply. A JSON error
+ * from the botmux worker keeps its own code; anything else (HTML/plain-text
+ * gateway pages, empty bodies, 502/503/504, foreign JSON) did not come from
+ * the worker and also names the configuration to check. */
+function riffHostResponseError(status: number, text: string, token: string): string {
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { parsed = undefined; }
+  const workerError = parsed && typeof parsed === 'object' ? (parsed as { error?: unknown }).error : undefined;
+  const success = status >= 200 && status < 300;
+  // The worker answers with JSON {error} and never with a gateway status.
+  if (!success && typeof workerError === 'string' && ![502, 503, 504].includes(status)) {
+    return `riff_host_http_${status}: ${riffHostResponseExcerpt(workerError, token) || '<empty error>'}`;
+  }
+  const detail = riffHostResponseExcerpt(text, token) || '<empty body>';
+  return `${success ? `riff_host_response_invalid (HTTP ${status})` : `riff_host_http_${status}`}: ${detail} — ${RIFF_HOST_UNREACHABLE_HINT}`;
+}
+
+/** A short, non-secret cause for a failed request: an error code or timeout,
+ * never the error message (it can contain the private endpoint address). */
+function riffHostTransportCause(error: unknown): string | undefined {
+  const e = error as { code?: unknown; message?: unknown; cause?: { name?: unknown } } | undefined;
+  if (e?.cause?.name === 'TimeoutError' || (e as { name?: unknown } | undefined)?.name === 'TimeoutError') return 'timeout';
+  if (typeof e?.code === 'string' && /^[A-Za-z0-9_]{1,40}$/.test(e.code)) return e.code;
+  if (typeof e?.message === 'string' && /^riff_host_[a-z_]{1,60}$/.test(e.message)) return e.message;
+  return undefined;
+}
+
 export async function callRiffHostTool(binding: RiffHostBinding, request: RiffHostRequest,
-  fetchImpl: (url: string, init: RequestInit) => Promise<Response> = riffHostDirectFetch): Promise<RiffHostResult> {
+  fetchImpl: (url: string, init: RequestInit) => Promise<RiffHostHttpResponse> = riffHostDirectFetch): Promise<RiffHostResult> {
   const headers = { 'x-riff-host-token': binding.token, 'content-type': 'application/json' };
   const deadline = Date.now() + 62 * 60_000;
   let posted = false, transportFailures = 0;
@@ -110,18 +164,26 @@ export async function callRiffHostTool(binding: RiffHostBinding, request: RiffHo
     const init = !posted ? { method: 'POST', headers, body: JSON.stringify(request) } : { method: 'GET', headers };
     const url = posted ? `${binding.url}?operationId=${encodeURIComponent(request.operationId)}` : binding.url;
     posted = true;
-    let response: Response;
+    let response: RiffHostHttpResponse;
     try { response = await fetchImpl(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(15_000) }); }
-    catch {
-      if (++transportFailures >= 3) throw new Error('riff_host_transport_unknown; do not repeat automatically');
+    catch (error) {
+      if (++transportFailures >= 3) {
+        const cause = riffHostTransportCause(error);
+        throw new Error(`riff_host_transport_unknown${cause ? ` (${cause})` : ''}; do not repeat automatically — ${RIFF_HOST_UNREACHABLE_HINT}`);
+      }
       await new Promise(resolve => setTimeout(resolve, 500)); continue;
     }
     transportFailures = 0;
-    const body = await response.json() as { state?: string; result?: RiffHostResult; error?: string };
-    if (!response.ok) throw new Error(body.error ?? `riff_host_http_${response.status}`);
-    if (body.state === 'completed' && body.result) return body.result;
-    if (body.state !== 'running') throw new Error('riff_host_response_invalid');
-    await new Promise(resolve => setTimeout(resolve, 300));
+    // Read text first: a gateway page is not JSON, and its status is the
+    // useful part of the failure (not a JSON parse error).
+    const text = await response.text();
+    let body: { state?: unknown; result?: RiffHostResult } | undefined;
+    try { body = JSON.parse(text); } catch { body = undefined; }
+    if (response.status >= 200 && response.status < 300 && body && typeof body === 'object') {
+      if (body.state === 'completed' && body.result) return body.result;
+      if (body.state === 'running') { await new Promise(resolve => setTimeout(resolve, 300)); continue; }
+    }
+    throw new Error(riffHostResponseError(response.status, text, binding.token));
   }
   throw new Error('riff_host_execution_unknown; do not repeat automatically');
 }

@@ -120,3 +120,29 @@ describe('Riff verified CLI bootstrap shell boundary', () => {
     }
   });
 });
+
+describe('Riff verified CLI bootstrap download failure', () => {
+  it('stops before binding and points at the host-tools endpoint configuration when curl fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'riff-bootstrap-')); roots.push(root);
+    const bin = join(root, 'bin'); mkdirSync(bin);
+    writeFileSync(join(bin, 'botmux'), '#!/bin/sh\nexit 91\n', { mode: 0o755 });
+    const token = 'T'.repeat(43);
+    const { instance, requests } = backend(() => ({ url: 'http://host/api/riff-host-tools', token,
+      sessionId: 'session-1', turnId: 'turn-1', cliSha256: 'a'.repeat(64) }));
+    instance.write('request'); await (instance as any).writeChain;
+    const prompt = requests.find(r => r.url.endsWith('/api/task-execute'))!.body.config.userPrompt;
+    const command = /before binding:\n([\s\S]*?)\nFor EVERY/.exec(prompt)![1]!;
+    // Stand-in for `curl --fail --show-error` against a gateway answering 502.
+    const result = spawnSync('bash', ['-c', `
+      curl() { echo 'curl: (22) The requested URL returned error: 502' >&2; return 22; }
+      ${command}
+    `], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: root } });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('curl: (22) The requested URL returned error: 502');
+    expect(result.stderr).toMatch(/riff_host_cli_download_failed \(see the curl error above\): check that the Riff sandbox can reach/);
+    expect(result.stderr).toContain('riff.hostToolsUrl');
+    expect(result.stderr).not.toContain(token);
+    // Nothing installed, nothing bound: the old CLI is untouched.
+    expect(readFileSync(join(bin, 'botmux'), 'utf8')).toBe('#!/bin/sh\nexit 91\n');
+  });
+});
