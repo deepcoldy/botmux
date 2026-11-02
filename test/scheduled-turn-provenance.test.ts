@@ -15,9 +15,12 @@ import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
   readScheduledTaskForProvenance,
+  readScheduledTaskFromAuthority,
   trustedCallerForScheduledTask,
 } from '../src/core/scheduled-turn-provenance.js';
 import { botHomePath } from '../src/adapters/cli/read-isolation.js';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import type { ScheduledTask } from '../src/types.js';
 
 const TASK_ID = 'abcdef12';
 const TURN_UUID = '12345678-1234-1234-1234-123456789abc';
@@ -366,5 +369,56 @@ describe('trustedCallerForScheduledTask', () => {
 
   it('fails closed without a creator union id (legacy / bot-created task)', () => {
     expect(trustedCallerForScheduledTask({ ...base, ownerOpenId: 'ou_owner' }, 'cli_session')).toBeUndefined();
+  });
+});
+
+describe('readScheduledTaskFromAuthority', () => {
+  let root: string;
+  let store: ScheduleAuthorityStore;
+  const appId = 'cli_test';
+  const task = {
+    id: TASK_ID, name: 't', chatId: 'oc_test', larkAppId: appId,
+    ownerOpenId: 'ou_owner', enabled: true,
+  } as unknown as ScheduledTask;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'botmux-sched-authority-'));
+    store = ScheduleAuthorityStore.open(root);
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('returns the authority row, paused rows included', () => {
+    store.initializeApp(appId, [task, { ...task, id: 'deadbeef', enabled: false } as ScheduledTask]);
+    expect(readScheduledTaskFromAuthority(store, appId, TASK_ID)?.ownerOpenId).toBe('ou_owner');
+    expect(readScheduledTaskFromAuthority(store, appId, 'deadbeef')?.enabled).toBe(false);
+  });
+
+  it('treats a revoked row like a deleted task', () => {
+    store.initializeApp(appId, [task]);
+    store.revoke(appId, TASK_ID);
+    expect(readScheduledTaskFromAuthority(store, appId, TASK_ID)).toBeUndefined();
+  });
+
+  it('fails closed without a store or when the store throws', () => {
+    expect(readScheduledTaskFromAuthority(null, appId, TASK_ID)).toBeUndefined();
+    expect(readScheduledTaskFromAuthority({
+      getRecord: () => { throw new Error('schedule_authority_schema_mismatch'); },
+    }, appId, TASK_ID)).toBeUndefined();
+  });
+
+  it('drives authorizeScheduledTurn instead of the projection when injected', () => {
+    store.initializeApp(appId, [task]);
+    const auth = authorizeScheduledTurn({
+      turnId: TURN_ID,
+      loadTask: (app, id) => readScheduledTaskFromAuthority(store, app, id),
+      sessionLarkAppId: appId,
+      sessionChatId: 'oc_test',
+      isOwnerAllowed: () => true,
+    });
+    expect(auth).toMatchObject({ ownerOpenId: 'ou_owner' });
   });
 });

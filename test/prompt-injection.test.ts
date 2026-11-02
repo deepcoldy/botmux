@@ -24,7 +24,7 @@ describe('supportsZeroPromptInjection', () => {
   });
 
   it('keeps CLIs without a transcript bridge unsupported', () => {
-    expect(supportsZeroPromptInjection('gemini')).toBe(false);
+    expect(supportsZeroPromptInjection('opencode')).toBe(false);
     expect(supportsZeroPromptInjection('kimi')).toBe(false);
     expect(supportsZeroPromptInjection(undefined)).toBe(false);
   });

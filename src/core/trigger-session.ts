@@ -1,4 +1,5 @@
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
+import { rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
 import * as sessionStore from '../services/session-store.js';
@@ -779,6 +780,7 @@ async function triggerSessionTurnAdmitted(
 ): Promise<TriggerResponse> {
   const stableTurnId = internal?.stableTurnId?.trim();
   const triggerId = stableTurnId || `trg_${randomUUID()}`;
+  rememberTriggerTurn(triggerId, req.source.type);
   // HTTP opt-in for codex-app native in-flight steer (turn/steer). The flag is
   // pure AUTHORIZATION forwarded to the worker — the live runner decides whether
   // it can actually merge into an active turn (canSteer); when it cannot, the
@@ -1795,7 +1797,7 @@ async function triggerSessionTurnAdmitted(
     // Per-turn model / reasoning-effort override — scoped to CLIs with an
     // explicit reasoning control and to a freshly-created trigger session.
     // Gating on cliId keeps the contract honest and bounded: it never silently
-    // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
+    // changes the model of a Claude/Kimi/CoCo bot, and a fold-in to an existing
     // worker never reaches here. Model is gated here so it cannot leak to
     // other CLIs whose adapters do not implement this contract.
     //

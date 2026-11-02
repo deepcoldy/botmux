@@ -9,9 +9,9 @@ Before installing botmux, make sure these are in place — **many "installed but
 
 - **botmux itself: no Node required.** The default [curl install](/en/quickstart) delivers a self-contained single-file binary with its runtime embedded. **Node ≥ 22 is required only on the npm install path** — that's a requirement of running `npm i -g`, not of running botmux. (Plugin-development commands like `botmux plugin init` shell out to npm and need Node too.)
 - **AI coding CLI / local agent app**: at least one **installed and authenticated**, with the executable on your `PATH`:
-  - `claude` (Claude Code), `codex`, `cursor-agent` (Cursor), `gemini`, `opencode`, `coco` (Trae / CoCo), `agy` (Antigravity), `hermes`, etc. (full `cliId` list in [CLI Adapters](/en/adapters)).
+  - `claude` (Claude Code), `codex`, `cursor-agent` (Cursor), `opencode`, `coco` (Trae / CoCo), `agy` (Antigravity), `hermes`, etc. (full `cliId` list in [CLI Adapters](/en/adapters)).
   - ⚠️ botmux is only a bridge — it doesn't manage login. **Run the CLI once in a terminal to confirm it can chat** before wiring it into botmux.
-  - ⚠️ Those CLIs have their own runtime requirements: many ship as npm packages (`claude` / `codex` / `gemini`, …) and still need Node to install. "botmux needs no Node" is about botmux itself.
+  - ⚠️ Those CLIs have their own runtime requirements: many ship as npm packages (`claude` / `codex`, …) and still need Node to install. "botmux needs no Node" is about botmux itself.
 - **tmux ≥ 3.x** (**the default backend — strongly recommended to install**): **in the default configuration** the session backend is tmux, so you need it to start sessions — when tmux isn't available botmux **no longer silently downgrades to pty**; it hard-gates the session and posts a card asking you to install tmux (see [tmux Session Persistence](/en/tmux)). To run a tmux-free environment, pick an explicit backend: `BACKEND_TYPE=pty` / per-bot `backendType` (`pty`/`herdr`/`zellij`) — pty doesn't survive daemon restarts; herdr/zellij need their own binaries. (riff is a cloud agent and doesn't occupy a local backend.)
 
 ## Recommended deployment

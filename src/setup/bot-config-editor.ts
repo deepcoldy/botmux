@@ -1,5 +1,6 @@
 import type { CliId } from '../adapters/cli/types.js';
 import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
+import { RETIRED_CLIS, retiredCliNotice } from '../adapters/cli/retired-cli.js';
 import {
   dropConfiguredCliRuntime,
   normalizeCliRuntimeConfig,
@@ -19,7 +20,8 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '3': 'coco',
   '4': 'codex',
   '5': 'cursor',
-  '6': 'gemini',
+  // '6' 是已移除的 gemini（见 adapters/cli/retired-cli.ts），留空不复用：
+  // 老脚本喂 6 应当报错，而不是静默选中别的 CLI。
   '7': 'opencode',
   '8': 'antigravity',
   '9': 'mtr',
@@ -84,8 +86,10 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   const mapped = CLI_ID_CHOICES[raw];
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
+  const retiredId = Object.keys(RETIRED_CLIS).find(id => id === raw || RETIRED_CLIS[id]!.setupChoice === raw);
+  if (retiredId) throw new Error(retiredCliNotice(retiredId));
   // 序号上界从 CLI_ID_CHOICES 派生, 新增 CLI 时自动跟随, 不再手写硬编码区间.
-  const maxChoice = Object.keys(CLI_ID_CHOICES).length;
+  const maxChoice = Math.max(...Object.keys(CLI_ID_CHOICES).map(Number));
   throw new Error(
     `Unknown CLI 适配器 "${raw}"。请输入序号 1-${maxChoice} 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );

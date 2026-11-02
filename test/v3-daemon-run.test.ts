@@ -179,7 +179,7 @@ describe('driveV3Run — suspend gate → 发卡 → 点击 redrive', () => {
       const shared = stubDeps(base, {
         // If runtime re-resolves the live bot this unsupported CLI would fail;
         // the definition run must use bots.snapshot.json instead.
-        loadBots: () => [{ larkAppId: 'cli_test', larkAppSecret: 's', cliId: 'gemini' } as any],
+        loadBots: () => [{ larkAppId: 'cli_test', larkAppSecret: 's', cliId: 'opencode' } as any],
       });
       const outcome = await driveV3Run('saved-run', shared.deps);
       expect(outcome.reason).toBe('awaitingGate');

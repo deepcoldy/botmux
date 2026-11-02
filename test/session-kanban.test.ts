@@ -21,6 +21,7 @@ import {
   computeDropPosition,
   deriveKanbanColumn,
   effectiveKanbanPosition,
+  paginateColumnEntries,
 } from '../src/dashboard/web/kanban-model.js';
 
 describe('session-board normalizers', () => {
@@ -188,5 +189,98 @@ describe('computeDropPosition', () => {
 
   it('seeds an empty column with a constant', () => {
     expect(computeDropPosition(null, null)).toBe(1024);
+  });
+});
+
+describe('paginateColumnEntries', () => {
+  const card = (): { size: number; expanded: boolean } => ({ size: 1, expanded: false });
+
+  it('admits whole entries up to the budget and counts the rest as hidden', () => {
+    const entries = Array.from({ length: 67 }, card);
+    expect(paginateColumnEntries(entries, 60)).toMatchObject({
+      visibleCount: 60,
+      hiddenUnits: 7,
+    });
+    expect(paginateColumnEntries(entries, 120)).toMatchObject({ visibleCount: 67, hiddenUnits: 0 });
+  });
+
+  it('never excludes the first entry: an oversized collapsed cluster stays reachable', () => {
+    // 折叠簇只渲染一个标题，按 1 个渲染单位占位；后面的单卡照常填满剩余预算。
+    const page = paginateColumnEntries([{ size: 400, expanded: false }, card()], 60);
+    expect(page.visibleCount).toBe(2);
+    expect(page.memberCaps[0]).toBe(-1);
+    expect(page.hiddenUnits).toBe(0);
+  });
+
+  it('a large collapsed cluster at the head costs one render unit, not its member count', () => {
+    // 真实主路径：最近活跃的大群恒在列首。3000 人折叠群 + 100 个单会话，
+    // 首屏必须是「群标题 + 59 个单卡」，而不是只剩一个群标题、单卡要点几十次才出现。
+    const entries = [{ size: 3000, expanded: false }, ...Array.from({ length: 100 }, card)];
+    const page1 = paginateColumnEntries(entries, 60);
+    expect(page1.visibleCount).toBe(60);
+    expect(page1.memberCaps[0]).toBe(-1);
+    expect(page1.hiddenUnits).toBe(41);
+    // 第二页（预算 120）：群标题 + 100 单卡共 101 个渲染单位，全部可见，无隐藏。
+    const page2 = paginateColumnEntries(entries, 120);
+    expect(page2.visibleCount).toBe(101);
+    expect(page2.hiddenUnits).toBe(0);
+  });
+
+  it('a collapsed group at the head sized at/over one page still leaves room for every card', () => {
+    // 60 人群 + 50 单卡：群只占 1，50 张单卡全部留在首屏（旧实现按 size 占位时只剩群标题）。
+    for (const groupSize of [59, 60, 400]) {
+      const entries = [{ size: groupSize, expanded: false }, ...Array.from({ length: 50 }, card)];
+      const page = paginateColumnEntries(entries, 60);
+      expect(page.visibleCount).toBe(51);
+      expect(page.hiddenUnits).toBe(0);
+    }
+  });
+
+  it('truncates the expanded first cluster to the remaining budget and pages the rest', () => {
+    const page = paginateColumnEntries([{ size: 400, expanded: true }, card()], 60);
+    expect(page.visibleCount).toBe(1);
+    expect(page.memberCaps[0]).toBe(60);
+    expect(page.hiddenUnits).toBe(341);
+    const page2 = paginateColumnEntries([{ size: 400, expanded: true }, card()], 420);
+    expect(page2.memberCaps[0]).toBe(400);
+    expect(page2.visibleCount).toBe(2);
+    expect(page2.hiddenUnits).toBe(0);
+  });
+
+  it('expanding a collapsed cluster after cards truncates its members by the remaining budget', () => {
+    // 40 个单卡 + 一个 60 人群：折叠时群标题也在首屏（41 个单位）；展开后成员卡
+    // 只拿到剩余 20 个位置，其余 40 个成员走「显示更多」，单卡一个都不被挤走。
+    const collapsed = [...Array.from({ length: 40 }, card), { size: 60, expanded: false }];
+    expect(paginateColumnEntries(collapsed, 60)).toMatchObject({ visibleCount: 41, hiddenUnits: 0 });
+    const expanded = [...Array.from({ length: 40 }, card), { size: 60, expanded: true }];
+    const page1 = paginateColumnEntries(expanded, 60);
+    expect(page1.visibleCount).toBe(41);
+    expect(page1.memberCaps[40]).toBe(20);
+    expect(page1.hiddenUnits).toBe(40);
+    const page2 = paginateColumnEntries(expanded, 120);
+    expect(page2.memberCaps[40]).toBe(60);
+    expect(page2.hiddenUnits).toBe(0);
+  });
+
+  it('excludes entries only when no render unit fits and counts their members as hidden', () => {
+    // 60 个单卡填满预算后，第 61 个条目（哪怕只画标题）放不下：未纳入群簇的成员不可达。
+    const entries = [...Array.from({ length: 60 }, card), { size: 5, expanded: false }];
+    const page = paginateColumnEntries(entries, 60);
+    expect(page.visibleCount).toBe(60);
+    expect(page.hiddenUnits).toBe(5);
+    const wider = paginateColumnEntries(entries, 120);
+    expect(wider.visibleCount).toBe(61);
+    expect(wider.memberCaps[60]).toBe(-1);
+    expect(wider.hiddenUnits).toBe(0);
+  });
+
+  it('does not render an expanded cluster header with zero cards when the budget is exactly spent', () => {
+    // 60 张单卡恰好填满预算，后面紧跟一个展开簇：cap=0 时必须整条留给下一页
+    // （否则会渲染一个 0 成员的展开簇空壳）。
+    const entries = [...Array.from({ length: 60 }, card), { size: 5, expanded: true }];
+    const page = paginateColumnEntries(entries, 60);
+    expect(page.visibleCount).toBe(60);
+    expect(page.memberCaps).not.toContain(0);
+    expect(page.hiddenUnits).toBe(5);
   });
 });

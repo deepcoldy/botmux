@@ -34,7 +34,7 @@ export interface ScheduleModelOverride {
  *
  * The CLI gate mirrors the trigger API (`trigger-session.ts`): only CLIs whose
  * adapters implement the model/effort launch contract may be steered per turn,
- * so a task can never hand a codex model id to a Gemini bot.
+ * so a task can never hand a codex model id to an OpenCode bot.
  */
 export function resolveScheduleModelOverride(
   task: { model?: string; reasoningEffort?: ScheduleReasoningEffort },

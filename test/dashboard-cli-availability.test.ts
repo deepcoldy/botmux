@@ -9,7 +9,7 @@ import { fetchCliAvailability } from '../src/dashboard/web/cli-availability.js';
 const cliState = {
   options: [
     { id: 'traex', label: 'TraeX', available: false, command: 'traex', availabilityStatus: 'unknown' as const },
-    { id: 'gemini', label: 'Gemini', available: false, command: 'gemini', availabilityStatus: 'unknown' as const },
+    { id: 'opencode', label: 'OpenCode', available: false, command: 'opencode', availabilityStatus: 'unknown' as const },
   ],
   ttadkModelDefault: 'glm-5.1',
   ttadkModelSuggestions: [],
@@ -59,11 +59,11 @@ describe('selected Dashboard CLI availability', () => {
     }));
     const renderer = renderAgent();
     await act(async () => {
-      renderer.root.findByProps({ dataInput: 'agentCliId' }).props.onChange('gemini');
+      renderer.root.findByProps({ dataInput: 'agentCliId' }).props.onChange('opencode');
     });
     await act(async () => { resolveOld({ ok: true, json: async () => ({ status: 'unavailable' }) }); });
     expect(renderer.root.findAllByProps({ className: 'hint-warn' })).toHaveLength(0);
-    expect(renderer.root.findByProps({ dataInput: 'agentCliId' }).props.value).toBe('gemini');
+    expect(renderer.root.findByProps({ dataInput: 'agentCliId' }).props.value).toBe('opencode');
   });
 
   it('discards the old Bot readiness when its persisted configuration changes', async () => {

@@ -1,0 +1,9 @@
+# Lane: the file sandbox in a real private chat. ClaudeSandbox is Claude Code
+# with `sandbox: true`; the mock LLM's sandbox probe reports from inside the
+# session's shell what it can read and write (feishu-sandbox.e2e.ts). Needs
+# bubblewrap and unprivileged user namespaces on the runner.
+cases:
+  - name: Sandbox hides home and harness secrets
+    tags: [sandbox, core]
+    steps:
+      - feishu.runScenario: { scenario: sandbox-file-isolation }

@@ -262,7 +262,6 @@ describe('group manage streaming-card pin rows', () => {
     }
     if (key === 'groups.pinStreamingCard') return 'Pin current live card';
     if (key === 'groups.pinStreamingCardDescription') return 'Only affects the current public live card for this chat.';
-    if (key === 'groups.pinStreamingCardHelp') return 'Uses the exact group-level override route.';
     if (key === 'groups.pinStreamingCardRefreshFailed') {
       return `Saved, but refresh failed: ${String(Object.prototype.hasOwnProperty.call(vars ?? {}, 'error') ? vars?.error : '{error}')}`;
     }
@@ -626,16 +625,16 @@ describe('group manage streaming-card pin rows', () => {
         pollingResponse.resolve(jsonResponse({ chats: [polledChat], bots: [bot] }));
       });
       await waitForRender(() => {
-        expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByType('b').children.join(''))
+        expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByProps({ className: 'groups-row-title' }).children.join(''))
           .toBe('Polled Room');
       });
       expect(renderer.root.findAll(node => node.props.className === 'hint-warn'
         && node.children.join('').includes('later_manual_failed'))).toHaveLength(0);
     } finally {
       (globalThis as any).FormData = nativeFormData;
+      act(() => renderer.unmount());
       (globalThis as any).document = nativeDocument;
       (globalThis as any).window = nativeWindow;
-      act(() => renderer.unmount());
     }
   });
 
@@ -733,7 +732,7 @@ describe('group manage streaming-card pin rows', () => {
       await act(async () => {
         manualResponse.resolve(jsonResponse({ chats: [newestChat], bots: [bot] }));
       });
-      expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByType('b').children.join(''))
+      expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByProps({ className: 'groups-row-title' }).children.join(''))
         .toBe('Newest Room');
 
       await act(async () => {
@@ -742,13 +741,13 @@ describe('group manage streaming-card pin rows', () => {
       });
 
       expect(refreshCount).toBe(1);
-      expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByType('b').children.join(''))
+      expect(renderer.root.findByProps({ 'data-chat': 'oc_created' }).findByProps({ className: 'groups-row-title' }).children.join(''))
         .toBe('Newest Room');
     } finally {
       (globalThis as any).FormData = nativeFormData;
+      act(() => renderer.unmount());
       (globalThis as any).document = nativeDocument;
       (globalThis as any).window = nativeWindow;
-      act(() => renderer.unmount());
     }
   });
 
@@ -793,14 +792,14 @@ describe('group manage streaming-card pin rows', () => {
       newerResponse.resolve(jsonResponse({ chats: [newerChat], bots: [] }));
       await newerReload;
     });
-    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByType('b').children.join(''))
+    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByProps({ className: 'groups-row-title' }).children.join(''))
       .toBe('Newer Room');
 
     await act(async () => {
       olderResponse.resolve(jsonResponse({ chats: [olderChat], bots: [] }));
       await olderReload;
     });
-    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByType('b').children.join(''))
+    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByProps({ className: 'groups-row-title' }).children.join(''))
       .toBe('Newer Room');
 
     act(() => renderer.unmount());
@@ -839,7 +838,7 @@ describe('group manage streaming-card pin rows', () => {
     await waitForRender(() => {
       expect(renderer.root.findAllByProps({ className: 'manage-chat' })).toHaveLength(1);
     });
-    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByType('b').children.join(''))
+    expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByProps({ className: 'groups-row-title' }).children.join(''))
       .toBe('Initial Room');
 
     act(() => { renderer.root.findByProps({ id: 'g-refresh' }).props.onClick(); });
@@ -856,7 +855,7 @@ describe('group manage streaming-card pin rows', () => {
     });
 
     await waitForRender(() => {
-      expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByType('b').children.join(''))
+      expect(renderer.root.findByProps({ 'data-chat': 'oc_group' }).findByProps({ className: 'groups-row-title' }).children.join(''))
         .toBe('Older Page Room');
     });
     await expect(fetchGroupsSnapshot()).resolves.toEqual({ chats: [newestSharedChat], bots: [] });
@@ -1278,8 +1277,8 @@ describe('group manage streaming-card pin rows', () => {
     });
 
     expect(renderer.root.findByProps({ 'data-streaming-card-pin-toggle': 'group-manage' })).toBeTruthy();
-    expect(renderer.root.findByProps({ 'data-streaming-card-pin-help': 'group-manage' }).children.join(''))
-      .toContain('exact group-level override route');
+    // 群管理里块标题旁已有说明，开关下不再重复一段 help。
+    expect(renderer.root.findAllByProps({ 'data-streaming-card-pin-help': 'group-manage' })).toHaveLength(0);
     expect(renderer.root.findByProps({ 'data-pin-master-state': 'off' }).children.join(''))
       .toContain('cannot force-enable');
 
@@ -1403,7 +1402,7 @@ describe('group manage streaming-card pin rows', () => {
     expect(String(status.props.className ?? '')).not.toContain('hint-ok');
   });
 
-  it('uses a distinct help id per row and points each checkbox aria-describedby at its own help element', () => {
+  it('uses a distinct description id per row and points each checkbox aria-describedby at its own description', () => {
     const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) })) as any;
     installFetch(fetchMock);
     const onReloadGroups = vi.fn(async () => ({ chats: [], bots: [] }));
@@ -1440,7 +1439,9 @@ describe('group manage streaming-card pin rows', () => {
       }));
     });
 
-    const rows = renderer.root.findAllByProps({ 'data-streaming-card-pin-help': 'group-manage' });
+    const rows = renderer.root.findAll(node => node.type === 'small'
+      && typeof node.props.id === 'string' && node.props.id.endsWith('-description')
+      && node.children.join('').includes('Only affects the current public live card'));
     expect(rows).toHaveLength(2);
     const ids = rows.map(row => row.props.id);
     expect(new Set(ids).size).toBe(2);
@@ -1448,9 +1449,9 @@ describe('group manage streaming-card pin rows', () => {
     for (const appId of ['cli_a', 'cli_b']) {
       const toggle = renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card-group', 'data-app-id': appId });
       const describedBy = String(toggle.props['aria-describedby'] ?? '');
-      const helpId = rows.find(row => describedBy.includes(String(row.props.id)))?.props.id;
-      expect(helpId).toBeTruthy();
-      expect(describedBy).toContain(String(helpId));
+      const descriptionId = rows.find(row => describedBy.includes(String(row.props.id)))?.props.id;
+      expect(descriptionId).toBeTruthy();
+      expect(describedBy).toContain(String(descriptionId));
     }
   });
 });

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { resolveTurnOrigin } from '../src/core/turn-origin.js';
 
 const mockGetMessageChatId = vi.fn();
 const mockGetChatMode = vi.fn(async () => 'topic');
@@ -237,6 +238,14 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
   });
 
+  it('registers the minted turn as a trigger turn of its connector kind (execution current origin)', async () => {
+    const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
+    const triggerId = (res as { triggerId?: string }).triggerId!;
+    expect(triggerId).toMatch(/^trg_/);
+    expect(resolveTurnOrigin({ session: {} } as any, triggerId)).toEqual({ origin: 'trigger', triggerSource: 'webhook' });
+    expect(resolveTurnOrigin({ session: {} } as any, 'trg_never_admitted')).toEqual({ origin: 'unknown' });
+  });
+
   it('keeps the localized topic seed by default', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
   });
@@ -402,14 +411,14 @@ describe('triggerSessionTurn rootMessageId target', () => {
   });
 
   it('does NOT stamp model/effort onto a CLI without reasoning support', async () => {
-    // gemini has no configurable reasoning effort (claude-code now does), so the
+    // opencode has no configurable reasoning effort (claude-code now does), so the
     // gate must keep the override from silently changing such a bot's model.
     mockGetBot.mockReturnValue({
-      config: { larkAppId: APP, cliId: 'gemini', workingDir: '/tmp' },
-      botName: 'Gemini', botOpenId: 'ou_bot',
+      config: { larkAppId: APP, cliId: 'opencode', workingDir: '/tmp' },
+      botName: 'OpenCode', botOpenId: 'ou_bot',
     });
     const req = request();
-    (req.options as any) = { model: 'gemini-3-pro', reasoningEffort: 'high' };
+    (req.options as any) = { model: 'anthropic/claude-sonnet-4', reasoningEffort: 'high' };
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));

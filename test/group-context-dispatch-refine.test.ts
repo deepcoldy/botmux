@@ -331,3 +331,30 @@ describe('dispatch boundary: attachments and transports', () => {
     expect(claimPromptContext(SESSION, 'om_turn_2', fingerprintPromptText(payload.content), prefixOf(payload.content))).toBeUndefined();
   });
 });
+
+describe('context rewind keeps covered background out', () => {
+  // /rewind truncates the Claude transcript and cold-resumes under the SAME
+  // native session id; it touches no group-context state. The dropped turn's
+  // background therefore stays covered for that epoch and is not re-injected.
+  // A fresh native id (what --fork-session would mint) is a new epoch and gets
+  // the whole background again — the reason /rewind must not fork.
+  it('same native id: the poisoned source stays covered; new native id: it comes back', async () => {
+    const poison = say('om_poison', 'poisoned instructions', T0 + 1_000);
+    const first = await prepare('om_turn_1', T0 + 5_000, 'poisoned');
+    expect(first.prepared.includedSeqs).toEqual([poison.seq]);
+    consume('om_turn_1', first.epoch);
+
+    const fresh = say('om_fresh', 'later normal message', T0 + 7_000);
+    const second = await prepare('om_turn_2', T0 + 8_000, 'poisoned');
+    // Preparation in the same epoch already leaves the covered source out.
+    expect(second.prepared.includedSeqs).toEqual([fresh.seq]);
+    const sameNative = commitGroupContextDispatchIntoPayload(
+      payloadWith(second.prepared.body), identity('om_turn_2', second.epoch), dataDir)!.dispatched;
+    expect(sameNative.includedSeqs).toEqual([fresh.seq]);
+    expect(sameNative.body).not.toContain('poisoned instructions');
+
+    const forkEpoch = groupContextEpoch(SESSION, 'native_forked', 'codex', 'om_turn_3');
+    const forked = await prepareGroupContextForTurn({ appId: APP, chatId: CHAT, turnId: 'om_turn_3', query: 'poisoned', createTime: T0 + 9_000, scope: 'main', sessionId: SESSION, epoch: forkEpoch });
+    expect(forked!.includedSeqs).toContain(poison.seq);
+  });
+});

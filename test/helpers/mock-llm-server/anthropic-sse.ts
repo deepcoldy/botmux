@@ -18,11 +18,13 @@ export function buildAnthropicToolUseEvents(opts: {
   command: string;
   toolName?: string;
   toolUseId?: string;
+  /** Full tool input; defaults to `{ command }`. */
+  input?: Record<string, unknown>;
 }): SseEvent[] {
   const model = opts.model ?? 'claude-3-7-sonnet-20250219';
   const toolName = opts.toolName ?? 'Bash';
   const toolUseId = opts.toolUseId ?? createToolUseId();
-  const inputJson = JSON.stringify({ command: opts.command });
+  const inputJson = JSON.stringify(opts.input ?? { command: opts.command });
 
   return [
     {

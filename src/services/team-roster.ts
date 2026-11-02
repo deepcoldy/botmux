@@ -12,6 +12,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBotCapability } from './bot-profile-store.js';
 import { getBotOwner } from './bot-owner-store.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from './bots-info-shape.js';
 import { getTeam, getDefaultTeam, DEFAULT_TEAM_ID } from './team-store.js';
 
 export interface TeamRosterBot {
@@ -65,7 +66,12 @@ function readBotsInfo(dataDir: string): BotInfoEntry[] {
   if (!existsSync(fp)) return [];
   try {
     const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (Array.isArray(parsed)) return parsed as BotInfoEntry[];
+    return botsInfoObjectEntries(parsed).filter(isBotsInfoRouteEntry).map(entry => ({
+      larkAppId: entry.larkAppId,
+      botOpenId: typeof entry.botOpenId === 'string' ? entry.botOpenId : null,
+      botName: typeof entry.botName === 'string' ? entry.botName : null,
+      cliId: typeof entry.cliId === 'string' ? entry.cliId : '',
+    }));
   } catch { /* corrupt — empty roster */ }
   return [];
 }

@@ -57,7 +57,8 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'traex': 'traex resume',
   'pi': 'pi --session-id',
   'copilot': 'copilot --resume',
-  'kimi': 'kimi --resume',
+  // Kimi 0.31 has no --resume; -S/--session resumes an existing session_<uuid>.
+  'kimi': 'kimi --session',
   'grok': 'grok --resume',
   'zcode': 'zcode --resume',
 };
@@ -202,6 +203,16 @@ function quoteKnownResumeCommand(cliId: LocalCliId, raw: string): string | null 
       return isAbsolute(value) && shellQuote(value) === token ? value : null;
     };
     return decodePath(match[1]) !== null && decodePath(match[2]) !== null ? raw : null;
+  }
+  if (cliId === 'pi' && raw.includes(' --session-dir ')) {
+    // A session that keeps its history in its own dir (it ran under the file
+    // sandbox): both values come quoted from the adapter.
+    const quoted = String.raw`'(?:[^']|'\\'')*'`;
+    const match = new RegExp(`^pi --session-id (${quoted}) --session-dir (${quoted})(?![\\s\\S])`).exec(raw);
+    if (!match) return null;
+    const decode = (token: string): string => token.slice(1, -1).split("'\\''").join("'");
+    const dir = decode(match[2]);
+    return decode(match[1]) && isAbsolute(dir) && shellQuote(dir) === match[2] ? raw : null;
   }
   const prefix = `${RESUME_COMMAND_PREFIXES[cliId]} `;
   if (!raw.startsWith(prefix)) return null;

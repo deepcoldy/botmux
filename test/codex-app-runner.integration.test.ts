@@ -581,7 +581,7 @@ function readRequests(logPath: string): Array<Record<string, any>> {
 
 async function exerciseRunner(opts: {
   version: string;
-  behavior?: 'success' | 'capability-error' | 'generic-error' | 'osc-injection' | 'empty-final' | 'start-response-last';
+  behavior?: 'success' | 'capability-error' | 'generic-error' | 'capacity-error' | 'failed-no-error' | 'osc-injection' | 'empty-final' | 'start-response-last';
   includeMissingImage?: boolean;
   includeSidecar?: boolean;
   turnCount?: number;
@@ -680,6 +680,116 @@ afterEach(async () => {
 // not a mask: a real regression fails all three attempts deterministically.
 // Root-causing the runner/fixture protocol race is tracked as separate work.
 describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
+  it('publishes capacity failure as a signed structured terminal rather than a successful reply', async () => {
+    const result = await exerciseRunner({ version: '0.162.1', behavior: 'capacity-error' });
+    expect(result.final.errorCode).toBe('codex_capacity_exceeded');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.final.content).toContain('Selected model is at capacity');
+    expect(result.finals).toHaveLength(1);
+  });
+  it('settles a native failed terminal without an error object as a generic failure instead of crashing', async () => {
+    // Protocol variant: turn/completed status:'failed' with NO error key.
+    // JSON.stringify(undefined) returns undefined (not the string), so the
+    // classifier must not descend into toLowerCase — that TypeError was
+    // uncaught and killed the whole runner (exit 1, zero finals). It must settle
+    // as the generic code, survive, and still emit exactly one real final.
+    const result = await exerciseRunner({ version: '0.162.1', behavior: 'failed-no-error' });
+    expect(result.final.errorCode).toBe('codex_app_turn_failed');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.finals).toHaveLength(1);
+  });
+  it.each(['steer-capacity', 'steer-capacity-history'] as const)(
+    'carries the structured capacity code only on the steered group REAL final: %s', async behavior => {
+      // REGRESSION: a native capacity failure terminating a STEERED group settles
+      // through settleSteeredCompletion (canonical id) or
+      // reconcileSteeredGroupFromHistory (non-canonical id, history match). Both
+      // group paths must classify the terminal like the single-turn path.
+      // Without turn.failureCode there, the real final carries no errorCode: the
+      // worker omits turnFailed and the whole group — including parked HTTP steer
+      // members — settles as completed despite the failure text.
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-steer-capacity-'));
+      const fakeCodex = join(dir, 'fake-codex');
+      const logPath = join(dir, 'requests.jsonl');
+      copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+      chmodSync(fakeCodex, 0o755);
+      const control = new ControlCollector(dir);
+      await control.listen();
+      const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path);
+      const send = (text: string, replyTurnId: string) => {
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+          `legacy:${text}`,
+          { text, clientUserMessageId: replyTurnId },
+          replyTurnId,
+          true,
+        )}\r`);
+      };
+      try {
+        await waitFor(harness, () => control.states.some(state => state.busy === false));
+        send('root', 'om_sc_root');
+        await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+        send('follow', 'om_sc_follow');
+        await waitFor(harness, () => control.finals.length === 2
+          && control.states.filter(state => state.busy === false).length >= 2);
+        expect(control.finals).toEqual([
+          expect.objectContaining({ turnId: 'om_sc_root', content: '', disposition: 'steer_superseded' }),
+          expect.objectContaining({
+            turnId: 'om_sc_follow',
+            content: expect.stringContaining('Selected model is at capacity'),
+            errorCode: 'codex_capacity_exceeded',
+          }),
+        ]);
+        // The superseded member carries no failure code and the real final no
+        // supersede disposition.
+        expect(control.finals[0]).not.toHaveProperty('errorCode');
+        expect(control.finals[1]).not.toHaveProperty('disposition');
+      } finally {
+        await stopChild(harness.child);
+        await control.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  it('settles a steered group whose real native failure has no error object without crashing', async () => {
+    // Same crash class as the single-turn path, reached through
+    // settleSteeredCompletion on a steered group: turn/completed is
+    // status:'failed' with no error key. The group must still expand into its
+    // superseded member + one real final carrying the GENERIC failure code, and
+    // the runner must stay alive (the wait predicate's early-exit guard fails
+    // the test on exit 1).
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-steer-noerr-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'steer-failed-no-error', control.bootstrap.path);
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      )}\r`);
+    };
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_ne_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_ne_follow');
+      await waitFor(harness, () => control.finals.length === 2
+        && control.states.filter(state => state.busy === false).length >= 2);
+      expect(control.finals).toEqual([
+        expect.objectContaining({ turnId: 'om_ne_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: 'om_ne_follow', errorCode: 'codex_app_turn_failed' }),
+      ]);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap', 'live-steer'] as const)(
     'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
       resetAskBroker();
@@ -1953,6 +2063,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     const fakeCodex = join(dir, 'codex');
     const logPath = join(dir, 'requests.jsonl');
     const pidPath = join(dir, 'app-server.pid');
+    const launcherPidPath = join(dir, 'launcher.pid');
     const finishGate = join(dir, 'finish-gate');
     writeFileSync(finishGate, 'ready');
     // A Node script cannot reach process attestation (/proc/exe is node).
@@ -1967,9 +2078,11 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       // pipes and spawns the native codex server. Keep both processes real.
       writeFileSync(codexBin, `#!${resolveNodeExecutable()}\n`
         + `import { spawn } from 'node:child_process';\n`
+        + `import { writeFileSync } from 'node:fs';\n`
+        + `writeFileSync(process.env.FAKE_CODEX_LAUNCHER_PID_PATH, String(process.pid));\n`
         // Keep the launcher alive across an idle-settle timer before the
         // native server exists, including after idle engine recovery.
-        + `await new Promise(resolve => setTimeout(resolve, 100));\n`
+        + `await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_CODEX_LAUNCH_DELAY_MS ?? '100')));\n`
         + `const child = spawn(${JSON.stringify(fakeCodex)}, process.argv.slice(2), { stdio: 'inherit' });\n`
         + `for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));\n`
         + `child.on('exit', code => process.exit(code ?? 1));\n`);
@@ -1987,10 +2100,27 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       codexAppRunnerProcessIdentity: undefined,
       captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity,
       parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, readProcessStartIdentity,
+      // handleTrustedCodexAppMarker's "runner dropped its attested engine" branch
+      // clears the frozen engine identity through this worker global. It must be
+      // provided: without it that branch threw a TypeError, which destroyed the
+      // control connection and turned the drop into an endless reconnect loop.
+      clearCodexAppEngineIdentity: () => {
+        if (!scope.codexAppEngineIdentity) return;
+        scope.codexAppEngineIdentity = undefined;
+        scope.publishLocalProcessAttestation();
+      },
+      // Engine attestations and runner-only republications are both real, but
+      // they answer different questions. Keeping them distinguishable lets the
+      // assertions below count ENGINES; conflating them made the count depend on
+      // whether the post-SIGTERM state raced ahead of the engine's observed exit
+      // (3 vs 2 entries for the same behaviour).
       publishLocalProcessAttestation: () => published.push(scope.codexAppEngineIdentity
         ? { enginePid: scope.codexAppEngineIdentity.pid, engineProcStart: scope.codexAppEngineIdentity.procStart }
-        : scope.codexAppRunnerProcessIdentity),
+        : { runner: scope.codexAppRunnerProcessIdentity }),
       rejectCodexAppControlMarker: (reason: string) => rejected.push(reason),
+      // Fail-closed paths must show up here, not as a TypeError that the
+      // collector turns into a silent reconnect loop.
+      failCodexAppControlGeneration: (reason: string) => rejected.push(`fail-closed: ${reason}`),
       codexAppSignedStateReadiness: (payload: any) => payload.acceptingInput ? 'ready' : 'waiting',
       applyTrustedCodexAppStateMarker, codexAppTurnLiveness: tracker, codexAppReadyAuthority: authority,
       codexAppProofDeadline: { clear() {} }, cleanupCodexAppControlBootstrap() {},
@@ -2000,7 +2130,6 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       codexAppGenerationCommits: [], codexAppRecoveredDispatches: [],
       adoptInitialActiveTurn: (entry: any) => { scope.currentBotmuxTurnId = entry.turnId; scope.restored = entry; },
       publishSandboxRelayCapability() {}, log() {},
-      failCodexAppControlGeneration: (reason: string) => { throw new Error(reason); },
     };
     scope.clearCodexAppEngineIdentity = loadWorkerFunction('clearCodexAppEngineIdentity', scope);
     scope.restoreCodexAppAttestedTurn = loadWorkerFunction('restoreCodexAppAttestedTurn', scope);
@@ -2024,18 +2153,75 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     };
     await control.listen();
     harness = startRunner(codexBin, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
-      { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate } });
+      { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate,
+        // Wide enough that the control re-acceptance below lands inside the
+        // replacement client's initialize() window, before the launcher has
+        // spawned the native engine.
+        ...(launchMode === 'node-launcher' ? { FAKE_CODEX_LAUNCH_DELAY_MS: '1200',
+          FAKE_CODEX_LAUNCHER_PID_PATH: launcherPidPath } : {}) } });
+    const enginePublications = () => published.filter((entry: any) => entry?.enginePid !== undefined);
     const waitForNative = async (predicate: () => boolean) => {
-      await waitFor(harness!, () => rejected.length > 0 || predicate(), 60_000);
+      await waitFor(harness!, () => rejected.length > 0 || predicate(), 60_000).catch(error => {
+        const tail = control.markers.slice(-8).map(marker => marker.kind
+          + (marker.payload.processIdentityBoundary ? `:${marker.payload.processIdentityBoundary}` : '')
+          + (typeof marker.payload.busy === 'boolean' ? `:busy=${marker.payload.busy}` : ''));
+        throw new Error(`rejected=${JSON.stringify(rejected)} auths=${control.authCount} finals=${control.finals.length} `
+          + `last markers=${tail.join(' | ')}\n${(error as Error).message}`);
+      });
       expect(rejected).toEqual([]);
+    };
+    // A replacement client is created and assigned to `client` before its
+    // initialize() RPC returns, and signed state can be emitted inside that
+    // window: an idle settle, or the control re-acceptance edge
+    // (`controlAcceptanceCount > 1`). Such a state must carry NO engine root.
+    // Attesting the npm launcher there freezes it as the engine root, and the
+    // real native engine's next state then reads as an unauthorized swap, so
+    // the worker runs failCodexAppControlGeneration. This drops the accepted
+    // control socket to force that re-authentication while the slow launcher
+    // has not spawned the native engine yet.
+    const expectNoRootDuringReplacementInitialization = async (
+      collector: ControlCollector, running: Harness, previousLauncherPid: number,
+    ): Promise<void> => {
+      // Wait for the replacement launcher to enter its deliberate delay. This
+      // pins the re-authentication to initialize(), rather than racing input.
+      await waitFor(running, () => Number(readFileSync(launcherPidPath, 'utf8')) !== previousLauncherPid, 60_000);
+      const launcherPid = Number(readFileSync(launcherPidPath, 'utf8'));
+      const before = collector.states.length;
+      await collector.restartEndpoint();
+      await waitFor(running, () => collector.states.length > before, 60_000);
+      const windowStates = collector.states.slice(before);
+      expect(windowStates.length).toBeGreaterThan(0);
+      // The first state of the window is the one emitted by the re-acceptance,
+      // while the replacement client is still inside initialize(): it must not
+      // claim any engine root at all.
+      expect(windowStates[0].appServerProcess).toBeUndefined();
+      // And the spawned child is the npm launcher, kept alive by the delay above
+      // so it is still the only process this client has. Publishing it is the
+      // defect that turns the real engine into an "unauthorized swap".
+      const rooted = windowStates.filter(state => state.appServerProcess !== undefined);
+      expect(rooted.map(state => state.appServerProcess.pid)).not.toContain(launcherPid);
+    };
+    // The runner settles idle 20ms after a turn. "The last state is idle" was
+    // already true from the startup state, so the engine could be killed
+    // before that settle. When the runner then noticed the exit first, its
+    // idle state carried no engine identity — a worker branch this extracted
+    // scope could not run, so the collector dropped the connection and the
+    // runner replayed the same state forever (#2520). Wait for the idle state
+    // that follows this turn's final instead.
+    const idleAfterLastFinal = () => {
+      const finalEnd = control.markers.findLastIndex(marker => marker.kind === 'final-end');
+      return control.markers.slice(finalEnd + 1).some(marker => marker.kind === 'state' && marker.payload.busy === false);
     };
     try {
       await waitForNative(() => control.states.at(-1)?.busy === false);
-      expect(published).toHaveLength(1);
-      expect(published[0].enginePid).toBe(Number(readFileSync(pidPath, 'utf8')));
+      expect(enginePublications()).toHaveLength(1);
+      expect(enginePublications()[0].enginePid).toBe(Number(readFileSync(pidPath, 'utf8')));
       expect(control.states.at(-1)?.appServerProcess).toEqual({
-        pid: published[0].enginePid, procStart: published[0].engineProcStart,
+        pid: enginePublications()[0].enginePid, procStart: enginePublications()[0].engineProcStart,
       });
+      const initialLauncherPid = launchMode === 'node-launcher'
+        ? Number(readFileSync(launcherPidPath, 'utf8')) : undefined;
+      let probeInitWindow = false;
       for (const [index, turnId] of ['om_native_before', 'om_native_after', 'om_native_next'].entries()) {
         if (index === 1) {
           const pid = Number(readFileSync(pidPath, 'utf8'));
@@ -2044,18 +2230,23 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             try { process.kill(pid, 0); return false; }
             catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true; throw error; }
           });
+          probeInitWindow = launchMode === 'node-launcher';
         }
         // Production reserves a local liveness slot BEFORE the runner discovers
         // the dead engine. This must not be confused with native execution.
         tracker.begin(turnId);
         authority.beginWork();
         harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(turnId, { text: turnId }, turnId)}\r`);
+        if (probeInitWindow) {
+          probeInitWindow = false;
+          await expectNoRootDuringReplacementInitialization(control, harness!, initialLauncherPid!);
+        }
         await waitForNative(() => control.finals.length === index + 1);
         tracker.completeCurrent();
-        await waitForNative(() => control.states.at(-1)?.busy === false);
+        await waitForNative(idleAfterLastFinal);
       }
       expect(rejected).toEqual([]);
-      const engines = published.filter(Boolean);
+      const engines = enginePublications();
       expect(engines).toHaveLength(2);
       expect(engines[1].enginePid).toBe(Number(readFileSync(pidPath, 'utf8')));
       expect(engines[1].enginePid).not.toBe(engines[0].enginePid);
@@ -2072,7 +2263,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         && marker.kind === 'activity' && marker.payload.phase === 'submitted');
       expect(boundaryIndex).toBeGreaterThan(-1);
       expect(submittedAfter).toBeGreaterThan(boundaryIndex);
-      expect(control.authCount).toBe(1);
+      expect(control.authCount).toBe(launchMode === 'node-launcher' ? 2 : 1);
       expect(control.finals.map(final => final.turnId)).toEqual(['om_native_before', 'om_native_after', 'om_native_next']);
       // Replace the observing worker during native work. The signed state must
       // bind the exact persisted reply turn, rather than guessing from busy.
@@ -2096,7 +2287,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       writeFileSync(finishGate, 'ready');
       await waitForNative(() => control.finals.length === 4);
       tracker.completeCurrent();
-      expect(control.authCount).toBe(2);
+      expect(control.authCount).toBe(launchMode === 'node-launcher' ? 3 : 2);
       expect(rejected).toEqual([]);
       expect(readRequests(logPath).filter(request => request.method === 'thread/start')).toHaveLength(1);
       expect(readRequests(logPath).filter(request => request.method === 'thread/resume')).toHaveLength(1);

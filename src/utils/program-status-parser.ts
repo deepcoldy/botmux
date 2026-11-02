@@ -23,6 +23,32 @@ const VALID_STATES = new Set<ProgramStatusState>([
 const PREFIX_TARGET = '7501;';
 const DEFAULT_MAX_BUFFER_SIZE = 4096;
 
+/**
+ * tmux DCS passthrough envelope around an OSC 7501 report:
+ * `ESC P tmux; <inner, every ESC doubled> ESC \`.
+ *
+ * Programs that see `$TMUX` wrap their own OSC so that an outer terminal
+ * (with tmux `allow-passthrough`) receives it. Kimi Code does this for every
+ * 7501 report. `pipe-pane` hands botmux the pane's raw output, so the report
+ * arrives still wrapped. Only a wrapper whose inner sequence is OSC 7501 is
+ * unwrapped; any other passthrough stays data, byte for byte.
+ */
+const TMUX_PASSTHROUGH_START = '\x1bPtmux;';
+const TMUX_WRAPPED_7501_PREFIX = `${TMUX_PASSTHROUGH_START}\x1b\x1b]${PREFIX_TARGET}`;
+
+/** Index of the `ESC \` that closes a tmux passthrough whose inner content
+ *  starts at `from`, or -1 (malformed) / -2 (not yet complete). Inside the
+ *  envelope every ESC is doubled, so the first undoubled `ESC \` closes it. */
+function findTmuxPassthroughEnd(str: string, from: number): number {
+  for (let i = str.indexOf('\x1b', from); i !== -1; i = str.indexOf('\x1b', i)) {
+    if (i + 1 >= str.length) return -2;
+    const next = str[i + 1];
+    if (next === '\x1b') { i += 2; continue; }
+    return next === '\\' ? i : -1;
+  }
+  return -2;
+}
+
 /** Safe base64 decoding for msg; returns undefined on malformed base64 or control chars */
 export function decodeProgramStatusMsg(val: string): string | undefined {
   if (!val) return undefined;
@@ -139,6 +165,45 @@ export class ProgramStatusFramingStream {
         break;
       }
 
+      if (str[cursor + 1] === 'P') {
+        const rest = str.slice(cursor, cursor + TMUX_WRAPPED_7501_PREFIX.length);
+        if (rest.length < TMUX_WRAPPED_7501_PREFIX.length && TMUX_WRAPPED_7501_PREFIX.startsWith(rest)) {
+          // Chunk ends inside what may be a wrapped 7501 report; wait.
+          this.buffered = str.slice(cursor);
+          cursor = str.length;
+          break;
+        }
+        if (rest === TMUX_WRAPPED_7501_PREFIX) {
+          const innerStart = cursor + TMUX_PASSTHROUGH_START.length;
+          const endIdx = findTmuxPassthroughEnd(str, innerStart);
+          if (endIdx === -2) {
+            if (str.length - cursor > this.maxBufferSize) {
+              logger.warn(`[program-status] parser buffer exceeded ${this.maxBufferSize} bytes inside tmux passthrough; dropping`);
+              cursor += TMUX_WRAPPED_7501_PREFIX.length;
+              continue;
+            }
+            this.buffered = str.slice(cursor);
+            cursor = str.length;
+            break;
+          }
+          if (endIdx >= 0) {
+            const inner = str.slice(innerStart, endIdx).replace(/\x1b\x1b/g, '\x1b');
+            let payload = inner.slice(2 + PREFIX_TARGET.length);
+            if (payload.endsWith('\x1b\\')) payload = payload.slice(0, -2);
+            else if (payload.endsWith('\x07')) payload = payload.slice(0, -1);
+            // One report per envelope is the only shape accepted as status.
+            // Anything else inside (a second sequence, stray escapes) is not
+            // ours to interpret: pass the whole envelope through as data, as
+            // the bare-OSC path does with an unterminated report.
+            if (payload.includes('\x1b')) emitData(str.slice(cursor, endIdx + 2));
+            else this.pushPayload(parts, payload);
+            cursor = endIdx + 2;
+            continue;
+          }
+          // Malformed envelope: fall through and keep its bytes as data.
+        }
+      }
+
       if (str[cursor + 1] !== ']') {
         // Non-OSC escape sequence (e.g. CSI \x1b[)
         emitData(str.slice(cursor, cursor + 2));
@@ -210,15 +275,7 @@ export class ProgramStatusFramingStream {
           }
         }
 
-        const payload = str.slice(contentStart, termIdx);
-        if (payload.trim() === '?') {
-          parts.push({ type: 'probe' });
-        } else {
-          const event = parseProgramStatusPayload(payload);
-          if (event) {
-            parts.push({ type: 'status', event });
-          }
-        }
+        this.pushPayload(parts, str.slice(contentStart, termIdx));
 
         cursor = termIdx + termLen;
         continue;
@@ -230,6 +287,15 @@ export class ProgramStatusFramingStream {
     }
 
     return parts;
+  }
+
+  private pushPayload(parts: ProgramStatusPart[], payload: string): void {
+    if (payload.trim() === '?') {
+      parts.push({ type: 'probe' });
+      return;
+    }
+    const event = parseProgramStatusPayload(payload);
+    if (event) parts.push({ type: 'status', event });
   }
 
   flush(): ProgramStatusPart[] {

@@ -81,10 +81,11 @@ describe('claude-code reasoningEffort — reachable from bots.json', () => {
     const [bot] = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'cli_effort_probe2',
       larkAppSecret: 'secret',
-      cliId: 'gemini',
+      cliId: 'opencode',
       allowedUsers: ['owner@example.com'],
       reasoningEffort: 'xhigh',
     }]));
+    expect(bot?.cliId).toBe('opencode');
     expect(bot?.reasoningEffort).toBeUndefined();
   });
 });

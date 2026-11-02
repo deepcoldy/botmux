@@ -6,7 +6,9 @@
  *
  * These cases pin the split the old dual-predicate design got wrong:
  *  - frozen `sandbox:true, sandboxNetwork:false` with the worker reporting
- *    `proven` (BOTMUX_SANDBOX=0 forced the spawn off) → daemon follows proven;
+ *    `proven` (a worker whose actual spawn ran without a sandbox — e.g. it
+ *    started with a different config than the frozen one) → daemon follows
+ *    proven;
  *  - frozen `sandbox:off` with the worker reporting `single` (env=1 engaged a
  *    net-isolated sandbox) → daemon follows single;
  *  - no report yet → fail-closed 'single' and the proven content route stays
@@ -59,9 +61,10 @@ describe('identityStorageModelForDaemonSession follows the worker report', () =>
   });
 
   it('follows a proven report even when the frozen config says net-isolated sandbox', () => {
-    // Cell 1 of the matrix: BOTMUX_SANDBOX=0 disengaged the worker's sandbox,
-    // so the spawn reached loopback and rendered proven. The frozen config
-    // (sandbox:true, sandboxNetwork:false) used to make the daemon publish
+    // The worker's spawn ran without a sandbox (e.g. a worker started with a
+    // different config than the frozen one), so it reached loopback and
+    // rendered proven. The frozen config (sandbox:true, sandboxNetwork:false)
+    // used to make the daemon publish
     // single files — the fail-open split. It must now follow the report.
     const ds = sessionFixture();
     recordWorkerIdentityDecision(ds, worker, 9, {

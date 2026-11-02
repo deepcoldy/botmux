@@ -6,7 +6,7 @@
  * push `buildBotmuxSystemPromptText` via that flag instead:
  *   - Claude Code / genius: `--append-system-prompt`
  *   - Grok: `--rules` (docs: Claude's append alias)
- * This constant is only for CLIs without such a flag (coco / codex / gemini /
+ * This constant is only for CLIs without such a flag (coco / codex /
  * opencode / aiden / mtr / hermes / …).
  *
  * Each array element becomes one line inside the `<botmux_routing>` XML block
