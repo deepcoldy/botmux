@@ -30,6 +30,9 @@ export function appRecoveryHarness(config: Record<string, any> = {}, sessionOver
     tag: () => 'test', logger: { error: vi.fn() }, publishAttentionPatch: vi.fn(),
     localeForBot: () => 'zh', sessionCliDisplayName: () => 'Codex App', ordinaryTurnRecoveryWarning: () => 'failed',
     disposeIneligibleOrdinaryTurnRecovery: () => recovery.disposeOrdinaryTurnRecovery(ds.session),
+    // Failure-card outbox wiring (re-armed on attach); inert for these cases.
+    ordinaryRecoveryNoticeOutbox: { resume: vi.fn() }, ordinaryRecoveryNoticeHost: () => ({}),
+    enqueueOrdinaryRecoveryNotice: vi.fn(),
   };
   scope.ordinaryTurnRecoveryEligible = loadWorkerPoolFunction('ordinaryTurnRecoveryEligible', scope);
   const attach = loadWorkerPoolFunction('ensureOrdinaryTurnRecoveryAttached', scope);
