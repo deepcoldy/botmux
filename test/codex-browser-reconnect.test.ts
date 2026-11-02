@@ -260,7 +260,7 @@ describe.sequential('browser connection recovery', () => {
 
   it('does not let a late close remove a newly claimed alias', async () => {
     const stale = fakeModules();
-    const fresh = fakeModules();
+    const fresh = stale;
     const get = vi.fn().mockResolvedValueOnce(stale.browser).mockResolvedValue(fresh.browser);
     stale.modules.setupBrowserRuntime = vi.fn(async () => ({ browsers: { get } }));
     broker = new CodexBrowserBroker({ sessionId: 'late-close', family: 'chrome', modules: stale.modules });
