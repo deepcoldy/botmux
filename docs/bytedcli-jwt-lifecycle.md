@@ -1,6 +1,6 @@
 # 按人 ByteCloud JWT 的区域与续期
 
-开启 trigger-user-auth 后，daemon 从触发人的独立 HOME 获取默认及区域 JWT；这限定的是签票材料来源，不代表 bytedcli 命令内部所有请求都已消除宿主登录回落。包装器按规范 `--site value`、`--site=value` 或 `BYTEDCLI_CLOUD_SITE` 选择对应区域，原始参数保持不变；显式参数优先于环境变量。`i18n`/`i18n-bd` 选择 i18nbd，`i18n-tt`/EU 规范站点选择 i18n，US 规范站点选择 tx。区域材料不以内部变量名传给子进程；区域材料缺失时沿用默认 JWT，claim 不符的签票结果被丢弃。
+开启 trigger-user-auth 后，daemon 从触发人的独立 HOME 获取默认及区域 JWT；签票材料来自宿主按人登录目录，而包装器执行命令时使用会话 scratch 内的按人空 HOME；两者不共享 SDK 登录。包装器按规范 `--site value`、`--site=value` 或 `BYTEDCLI_CLOUD_SITE` 选择对应区域，原始参数保持不变；显式参数优先于环境变量。`i18n`/`i18n-bd` 选择 i18nbd，`i18n-tt`/EU 规范站点选择 i18n，US 规范站点选择 tx。区域材料不以内部变量名传给子进程；区域材料缺失时沿用默认 JWT，claim 不符的签票结果被丢弃。
 
 普通轮次每次重新核验个人登录并取得默认 JWT。区域 JWT 可在剩余寿命超过 30 分钟时复用，退出登录后清空。mint、续期以及撤权重登后的请求共用按人串行队列，旧子进程结束前不释放其 HOME 的操作锁；撤权代次校验阻止旧请求结果重新发布或进入缓存。
 
@@ -19,11 +19,11 @@ begin/complete 登录也与 mint/renew 共用本进程的按人 HOME 队列。�
 
 ## 已知边界与后续
 
-bytedcli 0.178 的内部跨 site 子请求可能重新取 JWT（例如请求 `cn`）。`bytecloudJwtBelongsToOtherSite` 发现注入的环境 JWT 的 region claim 与该子请求 site 不符时，会跳过它，继续读取 pane HOME 中的登录/SDK 缓存。当前 HOME 未被本 PR 改写，因此这类子请求仍可能回落到操作者登录。跳过不匹配环境 token 的判定与 HOME 是否指向个人目录无关；改 HOME 只能改变回落目录，不能消除单个环境变量无法供给多个 site 的接口错配。
+bytedcli 0.178 的内部跨 site 子请求可能重新取 JWT（例如请求 `cn`）。`bytecloudJwtBelongsToOtherSite` 发现注入环境 JWT 的 region claim 不匹配时，会跳过它，再查执行 HOME 的登录/SDK 缓存。主干 #2550 已把受治理调用的 HOME 固定到会话 scratch 内的按人空目录，宿主按人登录目录不暴露给 pane。因此该子请求在没有适配的 SDK 登录时 fail-closed 拒绝，不能回落到操作者登录。外层规范 site 在有匹配区域材料时仍使用触发人的对应区域 JWT；没有区域材料时沿用默认 JWT，不构成跨区域身份保证。
 
-本 PR 收窄而未消除该既有通道：修复前，外层 site 与默认 JWT 分区不匹配时，外层调用便可能整体回落操作者；有匹配区域材料后，外层规范 site 选择的是触发人对应区域的 JWT，但命令内部跨 site 子请求的回落仍存在。没有区域材料时沿用默认 JWT 的兼容行为也不构成跨区域身份保证。
+#2550 消除了回落操作者登录的安全通道；跨 site 子请求的多站点 token 供给功能仍由 [#2505](https://github.com/deepcoldy/botmux/issues/2505) 跟踪，评估 0.178 `--bytecloud-user-jwt-file` / `resolveCliRequestJwtContext`。执行 HOME 并非宿主持久 per-person 登录目录，不与 daemon mint/renew 共写登录缓存。宿主多个 daemon 之间的 SDK 写入仍只由各进程的按人队列协调，尚未实现跨进程文件锁。
 
-后续跟踪 [#2505](https://github.com/deepcoldy/botmux/issues/2505)：评估 0.178 `--bytecloud-user-jwt-file` / `resolveCliRequestJwtContext` 的 request-scoped 按站点供给方式。本期不钉 HOME；若后续采用个人 HOME，必须同时决定文件沙箱 bind（当前个人目录未 bind）和与 scratch-credentials 保密封禁的关系，并处理 pane 与多个 daemon 的 mint/renew 对同一 SDK 缓存写入的跨进程串行问题。当前按人队列仅限单 daemon，不是文件锁。
+发布层统一通过 `publishedIdentityShape` 派生 HOME。续期前后使用同一派生形状与已发布 body 严格整串比较；任何凭据、执行人、turn 或 HOME 替换均使旧续期结果失效，不通过忽略字段放宽一致性。
 
 站点别名/大小写归一另跟踪 [#2506](https://github.com/deepcoldy/botmux/issues/2506)：当前 `row`、`usttp`、`I18N-TT` 等非规范写法仍选择默认 JWT，`us-ttpbd` 无效映射的清理也留在该项一并处理。回归明确分为规范站点分区对照和带 issue 的 known-gap 行为断言；Bun 1.4.3 不支持 `it.fails`，跨引擎用例不使用该语法。
 

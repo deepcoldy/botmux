@@ -17,6 +17,7 @@ import { renewBytedcliJwts } from '../services/bytedcli-auth.js';
 import {
   recallProvenIdentityContent,
   renderIdentityEnv,
+  publishedIdentityShape,
   writeSessionIdentity,
   type BytedCliIdentity,
 } from './cli-identity.js';
@@ -76,7 +77,7 @@ export function forgetBytedcliIdentityRenewals(): void {
 
 function stillPublished(entry: RenewalEntry): boolean {
   const current = recallProvenIdentityContent(entry.sessionDataDir, entry.sessionId, entry.identity.turnId, 'bytedcli');
-  return current !== undefined && current === renderIdentityEnv(entry.identity);
+  return current !== undefined && current === renderIdentityEnv(publishedIdentityShape(entry.sessionDataDir, entry.sessionId, entry.identity));
 }
 
 const inFlight = new Set<string>();

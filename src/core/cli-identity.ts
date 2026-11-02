@@ -769,7 +769,7 @@ export function bytedcliTurnHome(
  *
  * The single place the layout `<base>/identity-home/bytedcli/<digest>` is
  * spelled. `base` is the only thing the two callers disagree about —
- * {@link bytedcliTurnHome} passes the plain scratch, {@link withBytedcliHome}
+ * {@link bytedcliTurnHome} passes the plain scratch, {@link publishedIdentityShape}
  * passes whatever {@link bytedcliHomeRoot} settled on — so keeping the join in
  * one function is what stops the published path from drifting away from the one
  * the tests pin. That drift would be a security regression, not a cosmetic one:
@@ -827,7 +827,7 @@ function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
  *  short-alias layout (or falls back to the cache-root spelling) and only then
  *  computes the path, so the published HOME is the short one and the executor is
  *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
-function withBytedcliHome(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
+export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
   if (identity.tool !== 'bytedcli' || 'mode' in identity || identity.home) return identity;
   const base = bytedcliHomeRoot(sessionDataDir, sessionId);
   return { ...identity, home: bytedcliHomeFromBase(base, sessionId, identity) };
@@ -852,7 +852,7 @@ export function writeSessionIdentity(
   published: CliIdentity,
   model: IdentityStorageModel,
 ): string {
-  const identity = withBytedcliHome(sessionDataDir, sessionId, published);
+  const identity = publishedIdentityShape(sessionDataDir, sessionId, published);
   const body = renderIdentityEnv(identity);
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
   if (model === 'proven') {

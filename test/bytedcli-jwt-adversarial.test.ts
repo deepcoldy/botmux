@@ -83,7 +83,7 @@ describe('JWT lifecycle adversarial timing probes', () => {
     auth.clearBytedcliAuth(ALICE);
     await vi.advanceTimersByTimeAsync(6000);
     expect(await pending).toBe(0);
-    expect(identity.recallProvenIdentityContent(home, SESSION, TURN, 'bytedcli')).toBe(identity.renderIdentityEnv(original));
+    expect(identity.recallProvenIdentityContent(home, SESSION, TURN, 'bytedcli')).toBe(identity.renderIdentityEnv(identity.publishedIdentityShape(home, SESSION, original)));
   });
 
   it('retains a replacement tracking entry when an older renewal lands for that same turn', async () => {
@@ -94,7 +94,7 @@ describe('JWT lifecycle adversarial timing probes', () => {
     const replacement = publish(1200, 'replacement');
     await vi.advanceTimersByTimeAsync(6000);
     expect(await pending).toBe(0);
-    expect(identity.recallProvenIdentityContent(home, SESSION, TURN, 'bytedcli')).toBe(identity.renderIdentityEnv(replacement));
+    expect(identity.recallProvenIdentityContent(home, SESSION, TURN, 'bytedcli')).toBe(identity.renderIdentityEnv(identity.publishedIdentityShape(home, SESSION, replacement)));
     expect(renewal.trackedBytedcliRenewalCount()).toBe(1);
     defaultDelayMs = 1;
     const retry = renewal.renewExpiringBytedcliIdentities();
@@ -111,7 +111,7 @@ describe('JWT lifecycle adversarial timing probes', () => {
     const replacement = publish(1200, 'replacement', 'turn-b');
     await vi.advanceTimersByTimeAsync(6000);
     expect(await pending).toBe(1);
-    expect(identity.recallProvenIdentityContent(home, SESSION, 'turn-b', 'bytedcli')).toBe(identity.renderIdentityEnv(replacement));
+    expect(identity.recallProvenIdentityContent(home, SESSION, 'turn-b', 'bytedcli')).toBe(identity.renderIdentityEnv(identity.publishedIdentityShape(home, SESSION, replacement)));
     expect(renewal.trackedBytedcliRenewalCount()).toBe(2);
     defaultDelayMs = 1;
     const retry = renewal.renewExpiringBytedcliIdentities();

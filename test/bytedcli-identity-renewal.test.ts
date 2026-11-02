@@ -22,6 +22,8 @@ const {
 } = await import('../src/core/bytedcli-identity-renewal.js');
 const {
   writeSessionIdentity,
+  publishedIdentityShape,
+  renderIdentityEnv,
   recallProvenIdentityContent,
   forgetProvenIdentityContent,
 } = await import('../src/core/cli-identity.js');
@@ -62,6 +64,22 @@ afterEach(() => {
 });
 
 describe('bytedcli identity renewal', () => {
+  it('renews the full published shape including HOME and rejects a changed HOME after await', async () => {
+    const original = publish(7200, 600);
+    const published = publishedIdentityShape(dir, SESSION, original);
+    expect('home' in published && published.home).toBeTruthy();
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toBe(renderIdentityEnv(published));
+    renew.mockImplementationOnce(async () => {
+      writeSessionIdentity(dir, SESSION, { ...original, home: join(dir, 'replacement-home') }, 'proven');
+      return { cloudJwt: jwt('cn', 7200, 'late') };
+    });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).toHaveBeenCalledWith(ALICE);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli'))
+      .toBe(renderIdentityEnv({ ...original, home: join(dir, 'replacement-home') }));
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+
   it('uses the soonest-expiring selectable ByteCloud JWT', () => {
     const identity = publish(7200, 600);
     expect(bytedcliIdentityExpiryMs(identity)! - Date.now()).toBeLessThan(601_000);
