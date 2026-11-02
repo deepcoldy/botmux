@@ -2143,6 +2143,128 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
   }));
 }
 
+export interface RecoveryFailedCardOpts {
+  rootId: string;
+  sessionId: string;
+  cliId: CliId | undefined;
+  cliName: string;
+  /** Logical turn the notice is about; pins the retry button to it. */
+  logicalTurnId: string;
+  /** Original sender, @-mentioned first (never a bot). */
+  mentionOpenId?: string;
+  /** i18n key of the human-readable cause (see recoveryCauseI18nKey). */
+  causeKey: string;
+  /** i18n key of how far automatic recovery got (see recoveryOutcomeI18nKey). */
+  outcomeKey: string;
+  continuations: number;
+  /** Closed-set error codes, shown de-emphasised for whoever debugs it. */
+  errorCodes: string[];
+  task?: string;
+  failedAt?: Date;
+  /** `available` renders the retry button; `retried` replaces it with who
+   *  retried and when; `none` explains why there is nothing to re-deliver. */
+  retry:
+    | { kind: 'available' }
+    | { kind: 'retried'; byOpenId: string; at: Date }
+    /** No re-delivery material, but the session's `lastFailedTurn` is this
+     *  very turn: keep the pre-existing admin「继续这一轮」button (retry_turn,
+     *  continue mode) that recovery cards used to carry. */
+    | { kind: 'continue_legacy'; turnId: string }
+    | { kind: 'none'; reason: 'no_input' | 'scheduled' | 'unsupported' };
+  terminalUrl?: string;
+  locale?: Locale;
+}
+
+/** 自动恢复失败卡：一轮普通消息的自动续跑最终失败（重试用尽 / 续跑结果无法确认 /
+ *  交接被打断……）时发到原群（原话题）的唯一一张卡。
+ *
+ *  与 {@link buildTurnFailedCard} 的区别：
+ *  1. 原因按错误码归类成一句人话（`causeKey`），错误码只作为次要信息附在后面——
+ *     从不出现 provider 原文、堆栈或内部地址；
+ *  2. 「重试」按钮重新投递**这条消息本身**（logical turn 的原始输入，按原发起人身份），
+ *     按钮钉在 logical turn 上，而不是会被后续失败覆盖的 `lastFailedTurn`；
+ *  3. 发起人与管理员都能点（handler 校验），点过后卡片原地换成「已由谁重试」。 */
+export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
+  const { locale } = o;
+  const lines: string[] = [];
+  if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  lines.push(t('card.recovery_failed.field_cause', { cause: t(o.causeKey, undefined, locale) }, locale));
+  if (o.task) {
+    lines.push(t('card.recovery_failed.field_task', { task: escapeMd(o.task) }, locale));
+  }
+  if (o.failedAt) {
+    lines.push(t('card.recovery_failed.field_when', {
+      when: o.failedAt.toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false }),
+    }, locale));
+  }
+  lines.push(t('card.recovery_failed.field_recovery', {
+    outcome: t(o.outcomeKey, { count: String(o.continuations) }, locale),
+  }, locale));
+  const codes = [...new Set(o.errorCodes.filter(Boolean))]
+    .map(code => `\`${code.replace(/[`<>]/g, '')}\``);
+  if (codes.length > 0) {
+    lines.push(t('card.recovery_failed.field_codes', { codes: codes.join(' · ') }, locale));
+  }
+
+  const elements: any[] = [
+    { tag: 'markdown', content: lines.join('\n') },
+    { tag: 'hr' },
+  ];
+  const advice = o.retry.kind === 'available'
+    ? t('card.recovery_failed.retry_hint', undefined, locale)
+    : o.retry.kind === 'continue_legacy'
+      ? t('card.turn_failed.retry_caveated', undefined, locale)
+    : o.retry.kind === 'retried'
+      ? t('card.recovery_failed.retried', {
+        who: `<at id=${o.retry.byOpenId}></at>`,
+        when: o.retry.at.toLocaleTimeString(locale === 'en' ? 'en-US' : 'zh-CN', {
+          hour12: false, hour: '2-digit', minute: '2-digit',
+        }),
+      }, locale)
+      : t(`card.recovery_failed.no_retry_${o.retry.reason}`, undefined, locale);
+  elements.push({ tag: 'markdown', content: advice });
+
+  const actions: any[] = [];
+  if (o.retry.kind === 'available') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.retry_recovery_turn', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'retry_recovery_turn',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+        logical_turn_id: o.logicalTurnId,
+      },
+    });
+  }
+  if (o.retry.kind === 'continue_legacy') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.continue_turn', undefined, locale) },
+      type: 'default',
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retry.turnId,
+        mode: 'continue',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.terminalUrl) {
+    actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
+  }
+  if (actions.length > 0) elements.push({ tag: 'action', actions });
+
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.recovery_failed.title', { cliName: plainTitle(o.cliName) }, locale), 'red'),
+    elements,
+  }));
+}
+
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
 function formatGrantExpiry(expiresAt: number, locale?: Locale): string {
   return new Date(expiresAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false });

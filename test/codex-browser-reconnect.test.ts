@@ -147,12 +147,34 @@ describe.sequential('browser connection recovery', () => {
   it.each(['Permission denied by browser safety policy', 'Locator deadline exceeded'])(
     'keeps its binding after a non-transport failure: %s', async message => {
       const fake = fakeModules();
+      const get = vi.fn(async () => fake.browser);
+      fake.modules.setupBrowserRuntime = vi.fn(async () => ({ browsers: { get } }));
       broker = new CodexBrowserBroker({ sessionId: 'non-transport-error', family: 'chrome', modules: fake.modules });
       await broker.handleToolCall(call({ operation: 'claim_tab', tabId: 'user-7' }));
       fake.tab.ax.click.mockRejectedValueOnce(new Error(message));
-      expect((await broker.handleToolCall(call({ operation: 'click', tabId: 'claimed-7', elementIndex: 12 }))).success).toBe(false);
+      const failed = await broker.handleToolCall(call({ operation: 'click', tabId: 'claimed-7', elementIndex: 12 }));
+      expect(failed.success).toBe(false);
+      // State-level proof that no invalidation happened:
+      //  - the claimed tab cache stays usable through its old id, and the
+      //    snapshot is still served by that tab's accessibility tree;
+      //  - a bare id that was never claimed still resolves through
+      //    browser.tabs.get, i.e. the reconnect-only fresh-claim gate was not
+      //    armed by a benign error;
+      //  - family discovery is not re-run;
+      //  - the failure is not misreported as a connection change. That last
+      //    assertion guards the model-facing instruction (whether the model
+      //    must list/claim again), not the exact wording.
+      const cachedSnapshot = await broker.handleToolCall(call({ operation: 'snapshot', tabId: 'claimed-7' }));
+      expect(cachedSnapshot.success).toBe(true);
+      expect((cachedSnapshot.contentItems[0] as { text: string }).text)
+        .toContain('AX snapshot: button "Continue" [12]');
+      const bareSnapshot = await broker.handleToolCall(call({ operation: 'snapshot', tabId: 'bare-9' }));
+      expect(bareSnapshot.success).toBe(true);
+      expect(fake.browser.tabs.get).toHaveBeenCalledOnce();
       expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+      expect(get).toHaveBeenCalledOnce();
       expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledOnce();
+      expect((failed.contentItems[0] as { text: string }).text).not.toContain('Browser connection changed');
     },
   );
 
