@@ -2085,7 +2085,10 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         + `await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_CODEX_LAUNCH_DELAY_MS ?? '100')));\n`
         + `const child = spawn(${JSON.stringify(fakeCodex)}, process.argv.slice(2), { stdio: 'inherit' });\n`
         + `for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));\n`
-        + `child.on('exit', code => process.exit(code ?? 1));\n`);
+        // A real launcher exits some time after its native child: Node first
+        // reaps the child, then tears itself down. Make that gap fixed and
+        // visible, so an input sent inside it fails every run, not under load.
+        + `child.on('exit', code => setTimeout(() => process.exit(code ?? 1), Number(process.env.FAKE_CODEX_LAUNCHER_EXIT_DELAY_MS ?? '0')));\n`);
       chmodSync(codexBin, 0o755);
     }
     const published: any[] = [];
@@ -2157,7 +2160,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         // Wide enough that the control re-acceptance below lands inside the
         // replacement client's initialize() window, before the launcher has
         // spawned the native engine.
-        ...(launchMode === 'node-launcher' ? { FAKE_CODEX_LAUNCH_DELAY_MS: '1200',
+        ...(launchMode === 'node-launcher' ? { FAKE_CODEX_LAUNCH_DELAY_MS: '1200', FAKE_CODEX_LAUNCHER_EXIT_DELAY_MS: '300',
           FAKE_CODEX_LAUNCHER_PID_PATH: launcherPidPath } : {}) } });
     const enginePublications = () => published.filter((entry: any) => entry?.enginePid !== undefined);
     const waitForNative = async (predicate: () => boolean) => {
@@ -2225,10 +2228,21 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       for (const [index, turnId] of ['om_native_before', 'om_native_after', 'om_native_next'].entries()) {
         if (index === 1) {
           const pid = Number(readFileSync(pidPath, 'utf8'));
+          // The runner treats its engine as gone only once its OWN child's exit
+          // handler has run (`client.hasExited`); that handler logs the line
+          // counted below. A dead engine pid is not that signal: with the npm
+          // launcher the runner's child is the launcher, which exits after it
+          // has reaped the native engine, and even a reaped child can reach the
+          // runner's exit handler after its stdin. Input sent before the line
+          // finds a "live" client, turn/start goes into the dead engine's pipe,
+          // and the unknown outcome fences the generation (#2676).
+          const exitLines = () => harness!.stdout.split('[codex-app] app-server exited').length - 1;
+          const exitedBefore = exitLines();
           process.kill(pid, 'SIGTERM');
           await waitForNative(() => {
             try { process.kill(pid, 0); return false; }
-            catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true; throw error; }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+            return exitLines() > exitedBefore;
           });
           probeInitWindow = launchMode === 'node-launcher';
         }
@@ -2323,14 +2337,18 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       send('om_before_exit');
       await waitFor(harness, () => control.finals.length === 1 && control.states.at(-1)?.busy === false);
       const pid = Number(readFileSync(pidPath, 'utf8'));
+      const exitedBefore = harness.stdout.split('[codex-app] app-server exited').length - 1;
       process.kill(pid, 'SIGTERM');
       // The fixture's PID is a real child of the runner, not a mocked RPC rejection.
+      // A gone pid is not enough: the next input must also wait for the runner's
+      // own exit handler (its log line), or it can reach a client the runner
+      // still believes alive (#2676).
       await waitFor(harness, () => {
         try { process.kill(pid, 0); return false; }
         catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
-          throw error;
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
         }
+        return harness.stdout.split('[codex-app] app-server exited').length - 1 > exitedBefore;
       });
       send('om_after_exit');
       await waitFor(harness, () => control.finals.length === 2
