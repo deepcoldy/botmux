@@ -126,6 +126,10 @@ export interface CodexPendingTurn {
   /** Native provider turn id learned from the transcript user event. */
   sourceTurnId?: string;
   sourceMessageId?: string;
+  /** A fresh lifecycle observed while this HOL successor still owns the
+   * input. It is only a candidate until a terminal or another user arrives;
+   * replay reconstructs it from lifecycle records, never from a pending mark. */
+  replacementNativeTurnId?: string;
   /** Inputs folded into this native execution by a confirmed same-turn steer.
    * Their send attribution must retire with the single native terminal. */
   supersededTurns?: Array<Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'>>;
@@ -268,6 +272,22 @@ export class CodexBridgeQueue {
       && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId));
     if (exact) return exact;
     const fallback = this.collecting;
+    // A same-native HOL steer can inherit an abandoned task_started id X,
+    // while Codex completes the execution as Y without another start. Only a
+    // terminal may replace that inherited identity. Require exact session
+    // evidence and no competing active turn; ordinary native turns and CoT
+    // retain exact-id routing. Credit from X cannot suppress Y's answer.
+    if (fallback?.sourceTurnId && fallback.supersededTurns?.length
+      && (ev.kind === 'assistant_final' || ev.kind === 'turn_aborted')
+      && fallback.sourceSessionId === ev.sourceSessionId
+      && fallback.transcriptStartTimeMs !== undefined
+      && ev.timestampMs >= fallback.transcriptStartTimeMs
+      && !this.queue.some(turn => turn !== fallback && turn.started && turn.finalText === undefined)) {
+      this.rememberClosedNativeTurn(fallback);
+      fallback.sourceTurnId = ev.sourceTurnId;
+      fallback.supersededTurns = undefined;
+      return fallback;
+    }
     if (!fallback
       || this.isProvisionalTaskStart(fallback)
       || fallback.sourceTurnId
@@ -758,6 +778,17 @@ export class CodexBridgeQueue {
           // new start supersede it and reclaim the same queue head below.
           if (this.isProvisionalTaskStart(active)) {
             this.rollbackProvisionalTaskStart(active);
+          } else if (active.supersededTurns?.length
+            && active.sourceSessionId === ev.sourceSessionId
+            && active.transcriptStartTimeMs !== undefined
+            && ev.timestampMs >= active.transcriptStartTimeMs
+            && !this.queue.some(turn => turn !== active && turn.started && turn.finalText === undefined)) {
+            // A new start can replace the abandoned execution containing the
+            // HOL successor. Do not let an unread pending input claim it. If
+            // that input's user record arrives, its fingerprint below decides
+            // the handoff; otherwise the terminal still belongs to active.
+            active.replacementNativeTurnId = ev.sourceTurnId;
+            return;
           }
         } else {
           // A native start cannot precede the user record of the same turn.
@@ -911,7 +942,9 @@ export class CodexBridgeQueue {
       // text yet" — the streaming-transcript equivalent of "no finalText").
       const isDistinctNativeTurn = !!ev.sourceTurnId
         && !!this.collecting?.sourceTurnId
-        && ev.sourceTurnId !== this.collecting.sourceTurnId;
+        && ev.sourceTurnId !== this.collecting.sourceTurnId
+        && !(this.collecting.replacementNativeTurnId === ev.sourceTurnId
+          && this.collecting.sourceSessionId === ev.sourceSessionId);
       if ((willStartNext || willSynthLocal)
         && this.collecting
         && this.collecting.finalText === undefined

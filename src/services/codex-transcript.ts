@@ -1306,7 +1306,6 @@ function precedingTurnStartOffset(path: string, beforeOffset: number): number {
  * rescans a growing transcript. Missing bounded evidence stays unattributed. */
 function precedingNativeTurn(path: string, beforeOffset: number): { turnId: string; offset: number } | undefined {
   let result: { turnId: string; offset: number } | undefined;
-  const closed = new Set<string>();
   try {
     scanJsonlBackward(path, {
       endOffset: beforeOffset,
@@ -1318,11 +1317,12 @@ function precedingNativeTurn(path: string, beforeOffset: number): { turnId: stri
         const p = obj?.payload;
         if (obj?.type !== 'event_msg') return false;
         if (p?.type === 'task_complete' || p?.type === 'turn_aborted') {
-          if (typeof p.turn_id === 'string' && p.turn_id.length > 0) closed.add(p.turn_id);
-          else return true;
+          // Any terminal ends the preceding execution, even when Codex
+          // abandoned its start id and completed under a replacement id.
+          return true;
         }
         if (p?.type !== 'task_started' || typeof p.turn_id !== 'string' || !p.turn_id) return false;
-        if (!closed.has(p.turn_id)) result = { turnId: p.turn_id, offset };
+        result = { turnId: p.turn_id, offset };
         return true;
       },
     });
@@ -1903,7 +1903,7 @@ export function drainCodexRollout(
         sourceTurnId: p.turn_id,
         ...(sourceSessionId ? { sourceSessionId } : {}),
       });
-      if (activeNativeTurnId === p.turn_id) activeNativeTurnId = undefined;
+      activeNativeTurnId = undefined;
       nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
@@ -1938,7 +1938,7 @@ export function drainCodexRollout(
         sourceTurnId: p.turn_id,
         ...(sourceSessionId ? { sourceSessionId } : {}),
       });
-      if (activeNativeTurnId === p.turn_id) activeNativeTurnId = undefined;
+      activeNativeTurnId = undefined;
       nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;

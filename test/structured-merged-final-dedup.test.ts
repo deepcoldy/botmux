@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
+import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 import { drainCodexRollout, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import {
@@ -177,6 +178,52 @@ describe('structured merged execution final delivery', () => {
     expect(shouldSuppressBridgeEmit(gate(turn), undefined, [finalMarker()], false)).toBe(false);
   });
 
+  it('does not replace a HOL identity with stale, foreign-session or cosmetic events', () => {
+    const queue = new CodexBridgeQueue(() => 1_000);
+    for (const [index, text] of ['first input', 'second input'].entries()) {
+      queue.mark(`report-${index + 1}`, text, 100 + index * 100);
+      queue.ingest([{ uuid: `u${index}`, kind: 'user', text, timestampMs: 110 + index * 100,
+        sourceSessionId: 'provider', sourceTurnId: 'X', sourceMessageId: `m${index}` }]);
+    }
+    queue.ingest([
+      { uuid: 'stale', kind: 'assistant_final', text: result, timestampMs: 205,
+        sourceSessionId: 'provider', sourceTurnId: 'Y' },
+      { uuid: 'foreign', kind: 'assistant_final', text: result, timestampMs: 900,
+        sourceSessionId: 'foreign-provider', sourceTurnId: 'Y' },
+      { uuid: 'cosmetic', kind: 'cot', text: '', timestampMs: 900,
+        sourceSessionId: 'provider', sourceTurnId: 'Y' },
+    ]);
+    expect(queue.drainEmittable()).toEqual([]);
+    expect(queue.size()).toBe(1);
+    queue.ingest([{ uuid: 'real-final', kind: 'assistant_final', text: result, timestampMs: 910,
+      sourceSessionId: 'provider', sourceTurnId: 'X' }]);
+    const ready = queue.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].sourceTurnId).toBe('X');
+    expect(shouldSuppressBridgeEmit(gate(ready[0]), undefined, [finalMarker()], false)).toBe(true);
+    expect(queue.size()).toBe(0);
+  });
+
+  it.each([true, false])('does not transfer HOL credit when only one session is known (predecessor known=%s)', predecessorKnown => {
+    const queue = new CodexBridgeQueue(() => 1_000);
+    queue.mark('report-1', 'first input', 100);
+    queue.ingest([{ uuid: 'u1', kind: 'user', text: 'first input', timestampMs: 110,
+      sourceSessionId: predecessorKnown ? 'provider' : undefined,
+      sourceTurnId: 'native', sourceMessageId: 'm1' }]);
+    queue.mark('report-2', 'second input', 200);
+    queue.ingest([{ uuid: 'u2', kind: 'user', text: 'second input', timestampMs: 210,
+      sourceSessionId: predecessorKnown ? undefined : 'provider',
+      sourceTurnId: 'native', sourceMessageId: 'm2' },
+    { uuid: 'final', kind: 'assistant_final', text: result, timestampMs: 900,
+      sourceSessionId: predecessorKnown ? undefined : 'provider', sourceTurnId: 'native' }]);
+    const ready = queue.drainEmittable();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].turnId).toBe('report-2');
+    expect(queue.size()).toBe(0);
+    // Plain IM turns: no durable-attempt gate can mask a leaked HOL receipt.
+    expect(shouldSuppressBridgeEmit(gate(ready[0]), undefined, [finalMarker()], false)).toBe(false);
+  });
+
   it('does not let a superseded retry attempt cover its successor', () => {
     const queue = new CodexBridgeQueue(() => 1_000);
     queue.mark('retry-task', 'first attempt', 100, 1);
@@ -196,7 +243,7 @@ describe('structured merged execution final delivery', () => {
 });
 
 describe('merged final delivery across checkpoint recovery', () => {
-  function replay(options: { wrongNative?: boolean; malformedEvidence?: boolean; successorOnly?: boolean } = {}) {
+  function replay(options: { wrongNative?: boolean; malformedEvidence?: boolean; successorOnly?: boolean; replacementTerminal?: boolean } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'merged-final-recovery-'));
     try {
       const journal = join(dir, 'pending.json');
@@ -226,15 +273,20 @@ describe('merged final delivery across checkpoint recovery', () => {
 
       if (options.malformedEvidence) {
         const data = JSON.parse(readFileSync(journal, 'utf8'));
-        data.pending[0].mergedExecution = { ...native, supersededTurnIds: [42] };
+        data.pending[0].mergedExecution = { ...native, supersededTurnIds: 'not-an-array' };
         writeFileSync(journal, JSON.stringify(data));
+        const pending = readBridgeTurnJournal(journal);
+        expect(pending).toHaveLength(1);
+        expect(pending[0].turnId).toBe('report-2');
+        expect(pending[0].mergedExecution).toBeUndefined();
       }
       const replayed = options.successorOnly ? inputs.slice(1) : inputs;
       const events: CodexBridgeEvent[] = options.wrongNative
         ? [{ ...inputs[1], sourceTurnId: 'new-native', sourceSessionId: 'new-provider' }]
         : [...replayed];
       events.push({ uuid: 'a', kind: 'assistant_final', text: result, timestampMs: 900,
-        ...(options.wrongNative ? { sourceTurnId: 'new-native', sourceSessionId: 'new-provider' } : native) });
+        ...(options.wrongNative ? { sourceTurnId: 'new-native', sourceSessionId: 'new-provider' }
+          : { ...native, ...(options.replacementTerminal ? { sourceTurnId: 'replacement' } : {}) }) });
       const restored = new CodexBridgeQueue(() => 2_000);
       const recovery = restoreCodexAdoptTurns(journal, rollout, restored, events, 1_500, 2_000);
       restored.absorb(recovery.history);
@@ -252,6 +304,10 @@ describe('merged final delivery across checkpoint recovery', () => {
     expect(replay({ successorOnly })).toBe(true);
   });
 
+  it.each([false, true])('releases a replacement terminal after checkpoint recovery (successor-only=%s)', successorOnly => {
+    expect(replay({ successorOnly, replacementTerminal: true })).toBe(false);
+  });
+
   it('does not carry old credit into a new provider execution after restart', () => {
     expect(replay({ wrongNative: true })).toBe(false);
   });
@@ -262,6 +318,50 @@ describe('merged final delivery across checkpoint recovery', () => {
 });
 
 describe('native Codex rollout merge evidence', () => {
+  it.each(['task_complete', 'turn_aborted'])('releases the HOL successor after START X USER a USER b %s Y', terminal => {
+    const dir = mkdtempSync(join(tmpdir(), 'abandoned-native-rollout-'));
+    try {
+      const path = join(dir, 'rollout.jsonl');
+      writeFileSync(path, '');
+      const queue = new CodexBridgeQueue(() => 1_000);
+      let cursor = drainCodexRollout(path, 0);
+      const line = (type: string, payload: unknown, time: number) => {
+        appendFileSync(path, JSON.stringify({ type, payload, timestamp: new Date(time).toISOString() }) + '\n');
+        cursor = drainCodexRollout(path, cursor.newOffset, cursor.state);
+        queue.ingest(cursor.events);
+      };
+      const user = (text: string) => ({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] });
+      queue.mark('report-1', 'First report', 90);
+      line('session_meta', { id: 'provider-session' }, 50);
+      line('event_msg', { type: 'task_started', turn_id: 'X' }, 100);
+      line('response_item', user('First report'), 200);
+      queue.mark('report-2', 'Second report', 290);
+      line('response_item', user('Second report'), 300);
+      expect(queue.drainEmittable()).toEqual([]);
+      line('event_msg', { type: terminal, turn_id: 'Y', last_agent_message: result }, 900);
+      const ready = queue.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0]).toMatchObject({ turnId: 'report-2', sourceTurnId: 'Y',
+        finalText: terminal === 'task_complete' ? result : '',
+        ...(terminal === 'turn_aborted' ? { terminalStatus: 'ambiguous' } : {}) });
+      expect(queue.size()).toBe(0);
+      expect(shouldSuppressBridgeEmit(gate(ready[0]), undefined, [finalMarker()], false)).toBe(false);
+      const boundary = cursor.newOffset;
+      // A post-terminal user cannot keep borrowing X, for warm or cold drains.
+      queue.mark('report-3', 'Third report', 940);
+      line('response_item', user('Third report'), 950);
+      for (const parsed of [cursor, drainCodexRollout(path, boundary)]) {
+        expect(parsed.events.find(event => event.kind === 'user')?.sourceTurnId).toBeUndefined();
+      }
+
+      line('event_msg', { type: 'task_complete', turn_id: 'Z', last_agent_message: 'Third answer' }, 980);
+      expect(queue.drainEmittable().map(turn => turn.finalText)).toEqual(['Third answer']);
+      expect(queue.size()).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['task_complete', 'turn_aborted'])('drops native credit after an unattributable %s', terminal => {
     const dir = mkdtempSync(join(tmpdir(), 'unattributable-native-terminal-'));
     try {
