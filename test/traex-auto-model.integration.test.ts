@@ -65,7 +65,8 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
   freshStart = false, activityMode?: 'working' | 'queue-after-second' | 'delayed-first-queue', terminalDelayMs = 0,
   delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false, holdPreferredSuccessor = false,
-  quota?: { code: string; exhaustLast?: boolean; initial?: boolean; blocked?: boolean }) {
+  quota?: { code: string; exhaustLast?: boolean; initial?: boolean; blocked?: boolean },
+  delayedHistoryReceipt?: { submission: number; ms: number }) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -167,7 +168,12 @@ process.stdin.on('data', chunk => {
     const text = pasted; pasted = ''; input = ''; submitted = true; completed = false;
     turnId = require('node:crypto').randomUUID();
     fs.appendFileSync(${JSON.stringify(submissions)}, JSON.stringify({ model, text }) + '\\n');
-    fs.appendFileSync(${JSON.stringify(historyPath)}, JSON.stringify({ session_id: nativeId, ts: Date.now() / 1000, text }) + '\\n');
+    // delayedHistoryReceipt: the Nth submit's history receipt lands after
+    // writeInput's (time-scaled) in-band confirmation budget — the
+    // loaded-runner timing that leaves that submit unconfirmed.
+    const appendHistory = () => fs.appendFileSync(${JSON.stringify(historyPath)}, JSON.stringify({ session_id: nativeId, ts: Date.now() / 1000, text }) + '\\n');
+    if (submissionCount + 1 === ${delayedHistoryReceipt?.submission ?? 0}) setTimeout(appendHistory, ${delayedHistoryReceipt?.ms ?? 0});
+    else appendHistory();
     line({ type: 'task_started', turn_id: turnId });
     line({ type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId });
     // Real interrupted work leaves model/tool history beyond the user receipt.
@@ -484,6 +490,29 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await f.wait(() => rows(f.submissions).length === 3, 'held input after composer');
     expect(rows(f.submissions).filter(row => row.text.startsWith('held successor'))).toHaveLength(1);
   }, 45_000);
+
+  // A late history receipt quarantines one write while the original turn is
+  // still open. The hold must be released by the deferred recheck and the
+  // type-ahead queue re-driven; neither release may wait for the open turn.
+  it.each([
+    { name: 'the original ask', submission: 1, quarantinedTurn: 'om_working' },
+    { name: 'the capacity-changing correction', submission: 2, quarantinedTurn: 'om_capacity' },
+  ])('delivers queued follow-ups after a late receipt quarantines $name', async ({ submission, quarantinedTurn }) => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, 'queue-after-second',
+      0, 0, false, false, undefined, { submission, ms: 400 });
+    f.child.send({ type: 'message', content: 'original working ask', turnId: 'om_working' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original working submit');
+    f.child.send({ type: 'message', content: 'correction changes capacity', turnId: 'om_capacity' } satisfies DaemonToWorker);
+    f.child.send({ type: 'message', content: 'held successor', turnId: 'om_held' } satisfies DaemonToWorker);
+    await f.wait(() => f.logs.join('').includes(`after unconfirmed submit turn=${quarantinedTurn} `), 'late receipt quarantined');
+    await f.wait(() => rows(f.submissions).length === 2, 'correction submitted');
+    writeFileSync(f.release, 'finish');
+    await f.wait(() => rows(f.submissions).length === 3, 'held input after deferred recheck');
+    expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
+      'original working ask', 'correction changes capacity', 'held successor',
+    ]);
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+  }, 75_000);
 
   it('preserves a fresh topic selection, final wait and catalog across an in-worker restart', async () => {
     const f = await fixture(true, 'busy', false, undefined, false, undefined, true);

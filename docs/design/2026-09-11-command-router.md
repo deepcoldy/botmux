@@ -234,6 +234,7 @@ type SessionPhase =
 |---|---|---|---|---|
 | `/resume [id]` | 未注册，整条当未知命令转发给 CLI | 无会话（相位 `none`，或现有会话只是命令空壳 `sessionIsCommandScratch`；`closed` 臂是防御性的，两条入口关闭即删注册项、当前不可达）时由 schema 的 `claimWithoutSessionOnly` 认领为 sessionless daemon 命令（`permission: 'talk'`，有对话权限即可）：恢复本锚点最近关闭的会话，或把别处的已关闭会话复制（cold fork）到这里；有会话时与今天逐字一致（自定义透传照常透传，否则未知命令转发）。不进全局 daemon 集合 | 会话群关闭后改为默认开新会话，需要一个不翻聊天记录的恢复入口；有会话时保留 CLI 原生 `/resume` | session-group 新会话 |
 | `/queue <消息>` | 未注册，作为普通模型输入，可引导当前轮 | existingOnly、多行 daemon 命令；Codex App 活会话冻结为 serial FIFO，新轮次执行；其它 CLI / 无活 worker 明确拒绝 | 不改变普通消息引导；不创建会话；仍走命令授权；附件暂不支持 |  #1880（接纳前刷新按人身份；等待期间单槽可被新消息覆盖） |
+| `/rewind [n\|n confirm]` | 未注册，整条当未知命令转发给 CLI | existingOnly daemon 命令；Claude Code 会话列出检查点、按轮次截断 CLI 原生 transcript 后重启；其它 CLI / 远端后端明确拒绝 | 用户级上下文回退（读到污染内容后可丢弃该轮）；执行前自动备份 transcript；不创建会话 | 本次变更 |
 | Codex App 会话内 `/effort <档位>` | 无 raw 透传面，作为普通模型输入 | schema 按 `cliId: codex-app` 登记为只用于已有会话的 daemon 命令，通过原生设置接口更新；其它 CLI 仍透传 | 调整后续轮次推理强度；更新当前轮需显式启用实验特性 `step_model_switching`（默认关闭）；不创建模型轮次，CLI 专属命令不进入全局 daemon 集合 | #1817 |
 | Codex CLI 会话内 `/effort <档位>` | 原样透传，CLI 不识别 `/effort` | schema 匹配 `codex`，操作原生 `/model` 菜单；按新增的原生设置记录确认后保存会话设置 | 仅后续轮次生效；不创建或中断模型轮次，其它 CLI 继续透传 | 本次变更 |
 | Codex CLI/App `/effort <档位> [任务]` | 同行任务被当成档位拒绝，多行任务当讨论文字 | 有效档位后剩余文字为字面任务，支持同行/多行；原生强度确认后走接纳输入流程 | 不创建新会话；失败或会话变代时不投递任务并显示原任务；其它 CLI 解析行为保留 | #2370 后续 |

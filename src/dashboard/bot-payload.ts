@@ -161,6 +161,15 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     // 当前 oncall 绑定数。旧 daemon 不回这个字段 → null，页面只显示自动绑定过的数量。
     oncallChatCount: typeof j?.oncallChatCount === 'number' ? j.oncallChatCount : null,
+    // Shared-bot sandbox advice inputs (daemon computes; old daemon → null).
+    allowedUsersCount: typeof j?.allowedUsersCount === 'number' ? j.allowedUsersCount : null,
+    oncallSharedChatCount: typeof j?.oncallSharedChatCount === 'number' ? j.oncallSharedChatCount : null,
+    allowedChatGroupsCount: typeof j?.allowedChatGroupsCount === 'number' ? j.allowedChatGroupsCount : null,
+    localSandboxApplies: typeof j?.localSandboxApplies === 'boolean' ? j.localSandboxApplies : null,
+    sandboxCapable: typeof j?.sandboxCapable === 'boolean' ? j.sandboxCapable : null,
+    effectiveSandboxMode: j?.effectiveSandboxMode === 'off' || j?.effectiveSandboxMode === 'oncall' || j?.effectiveSandboxMode === 'scratch'
+      ? j.effectiveSandboxMode
+      : null,
     brandLabel: j?.brandLabel ?? null,
     // Private Bot Defaults payload only. Keep the persisted shape sparse and
     // drop malformed hand edits field-by-field before they reach form state.
@@ -197,6 +206,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       ? j.sandboxPathsForbiddenReadWrite
         .filter((x: any) => x && typeof x.path === 'string')
         .map((x: any) => String(x.path))
+      : [],
+    sandboxPathsReadOnlyRoot: Array.isArray(j?.sandboxPathsReadOnlyRoot)
+      ? j.sandboxPathsReadOnlyRoot.filter((x: unknown) => typeof x === 'string')
       : [],
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,

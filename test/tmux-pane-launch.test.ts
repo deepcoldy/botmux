@@ -164,7 +164,7 @@ describe('launch file vs the inline launch, outside tmux', () => {
 describe('real CLI argv shapes', () => {
   // Every adapter's argv reaches its CLI through the same file — first prompts
   // within the adapter's own baked-prompt budget.
-  const IDS: CliId[] = ['claude-code', 'codex', 'kimi', 'opencode', 'cursor', 'codem', 'traex', 'minimax', 'grok', 'gemini', 'pi'];
+  const IDS: CliId[] = ['claude-code', 'codex', 'kimi', 'opencode', 'cursor', 'codem', 'traex', 'minimax', 'grok', 'pi'];
   it.each(IDS)('%s', id => {
     const root = scratch('cli-');
     const probe = join(root, 'probe.cjs');

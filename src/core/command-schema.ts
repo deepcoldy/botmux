@@ -81,6 +81,10 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
+  {
+    name: '/rewind', sessionPolicy: 'existingOnly', help: ['help.rewind'],
+    notes: '可选 `<n>` 预览、`<n> confirm` 执行；只对 Claude Code（append-only transcript）生效',
+  },
   { name: '/queue', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.queue'],
     notes: 'Codex App 活会话中的文字消息按原生 FIFO 新轮次执行；其它 CLI 明确拒绝，不创建会话' },
   { name: '/help', sessionPolicy: 'default', help: ['help.help'] },

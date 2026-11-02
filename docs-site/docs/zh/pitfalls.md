@@ -10,6 +10,7 @@
 
 - **装完 `botmux: command not found`**：`~/.botmux/bin` 没进 PATH。两种安装方式都会写你当前 shell 的启动文件，但**要开个新终端（或 source 一下）才生效**。⚠️ 已知限制：如果执行安装时 `~/.botmux/bin` 恰好已在当前进程的 PATH 里（**在 botmux 自己的 CLI 会话里装就是这种情况**——daemon 会把它注入每个会话的 PATH），`install.sh` 会认为无需处理而**不写启动文件**，于是新终端里仍然找不到。→ 在**普通终端**里装，或手动把 `export PATH="$HOME/.botmux/bin:$PATH"` 加进启动文件。
 - **Node 太老**（仅 npm 安装路径）：v18 等没内置全局 `fetch`，`npm i -g botmux` 的 postinstall 或 `botmux setup` 会报 `fetch is not defined` / `fetch failed`。→ 升级到 **Node ≥ 22**，或改用 curl 安装方式（自包含二进制，不需要 Node）。
+- **`cliId: "gemini"` 的 bot 拒绝启动**：Gemini CLI 已下线，适配器已移除，提示会让你改用 Antigravity；其它 bot 不受影响。→ 把 `cliId` 改成 `"antigravity"`（先装 `agy` 并登录 Google 账号，或用 Gemini API key），并清掉 Gemini 专属的 `cliPathOverride` / `wrapperCli` / `model` / `GEMINI_CLI_HOME`。见 [Gemini CLI 已下线](/adapters#gemini-cli-已下线)。
 - **首次启动卡在人工确认**：CLI（如 Claude Code）首次会弹"信任目录 / bypass 权限"确认，没人工点过会卡住、报 `tmux send-keys` 错。→ 首次手动确认一次，之后不再出现。
 
 ## 环境变量丢失（高频）
@@ -25,7 +26,7 @@
 ## 输入 / 提交
 
 - **多行消息被拆成多条提交**：部分 TUI（Codex / CoCo）把多行 prompt 里的 `\n`、`\t` 当成 Enter / 补全键，逐行提交。→ 新版已把 Codex 输入改成 bracketed paste 规避（与 CoCo 一致）。自己写 `botmux send` 多行时也务必用 heredoc。
-- **上下文压缩后"忘记"往飞书发消息**：无持久 system prompt 的 CLI（CoCo / Codex / Gemini / OpenCode）只在话题首条注入路由说明，上下文被压缩后 routing 块丢失，模型会直接在终端答而不发飞书。→ 新版已对这类 CLI 每条 follow-up 重注入完整 routing 块；用更强的模型可缓解。
+- **上下文压缩后"忘记"往飞书发消息**：无持久 system prompt 的 CLI（CoCo / Codex / OpenCode 等）只在话题首条注入路由说明，上下文被压缩后 routing 块丢失，模型会直接在终端答而不发飞书。→ 新版已对这类 CLI 每条 follow-up 重注入完整 routing 块；用更强的模型可缓解。
 - **弱模型 / 套壳模型不调 `botmux send`**：容易忘记调用、或一直重复调用停不下来。→ 用 SOTA 模型，或加更硬的 prompt 约束。
 - **`botmux send --images` ≥ 6 张可能 silent fail**：→ 一次 ≤ 4 张、分批发。
 

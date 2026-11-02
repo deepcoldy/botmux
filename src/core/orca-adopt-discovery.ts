@@ -86,7 +86,6 @@ const ORCA_AGENT_CLI_IDS: Readonly<Record<string, CliId>> = {
   'trae-cli': 'traex',
   traex: 'traex',
   cursor: 'cursor',
-  gemini: 'gemini',
   opencode: 'opencode',
   opencode2: 'opencode2',
   mtr: 'mtr',

@@ -8,6 +8,7 @@ import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from '../src/core/session-marker.js';
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 
 // A successor worker that reattaches a live CLI binds the PID marker its
 // predecessor left behind on a daemon restart. That marker records the turn the
@@ -49,6 +50,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
       sandboxRelayCapability: null,
       activeTurnAuthority: new ActiveTurnAuthority(),
       retiredTurnIds: new Set<string>(),
+      emittedTurnTerminals: new TurnTerminalDeduper(),
       queuedTypeAheadTurns: [],
       queuedTurnAdvanceConsumedForPrompt: undefined,
       markTurnRetired: () => {},
@@ -76,7 +78,8 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
         return true;
       },
     };
-    for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'markerIdentityTurnId']) {
+    for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'markerIdentityTurnId',
+      'turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
       scope[name] = loadWorkerFunction(name, scope);
     }
   });

@@ -577,7 +577,10 @@ async function loadBrowserPluginModules(root: string): Promise<BrowserPluginModu
  */
 export class CodexBrowserBroker {
   private browser?: BrowserBinding;
+  private agent?: BrowserAgent;
   private init?: Promise<BrowserBinding>;
+  private requiresFreshTabClaim = false;
+  private browserGeneration = 0;
   private readonly claimedTabs = new Map<string, BrowserTab>();
   private readonly configStore = new Map<string, Json>();
   private readonly sessionApprovals = new Set<string>();
@@ -597,8 +600,7 @@ export class CodexBrowserBroker {
       return errorResult(new Error('tool arguments must be an object'));
     }
     try {
-      this.updateTurnMetadata(params.threadId, params.turnId);
-      return await withTimeout(this.execute(params.arguments as Json));
+      return await withTimeout(this.execute(params.arguments as Json, params));
     } catch (error) {
       return errorResult(error);
     }
@@ -623,9 +625,44 @@ export class CodexBrowserBroker {
     if (failure) throw failure.reason;
   }
 
-  private async execute(input: Json): Promise<DynamicToolCallResponse> {
+  private async execute(
+    input: Json,
+    metadata: Pick<DynamicToolCallParams, 'threadId' | 'turnId'>,
+  ): Promise<DynamicToolCallResponse> {
     const operation = requiredString(input.operation, 'operation', 64);
-    const browser = await this.getBrowser();
+    const browser = await this.getBrowser(metadata);
+    const generation = this.browserGeneration;
+    this.updateTurnMetadata(metadata.threadId, metadata.turnId);
+    try {
+      return await this.executeWithBrowser(input, operation, browser, generation);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.browser === browser && this.browserGeneration === generation
+        // Error-text contract with the bundled Codex chrome plugin
+        // (scripts/browser-client.mjs): only these two prefixes prove the
+        // binding/transport is dead. The match is anchored at message start, so
+        // if the plugin ever wraps its errors with a leading context string,
+        // invalidation silently stops — update both sides together.
+        && /^(?:Browser is not available:|native pipe closed before response\b)/i.test(message)) {
+        // Rediscover on the next explicit call. Never replay an operation that
+        // may have run, or discard a newer binding for an older call's error.
+        this.browserGeneration++;
+        this.browser = undefined;
+        this.init = undefined;
+        this.claimedTabs.clear();
+        this.requiresFreshTabClaim = true;
+        throw new Error(`${message}. Browser connection changed; call list_tabs and claim_tab again before using an existing tab. The failed operation was not replayed.`);
+      }
+      throw error;
+    }
+  }
+
+  private async executeWithBrowser(
+    input: Json,
+    operation: string,
+    browser: BrowserBinding,
+    generation: number,
+  ): Promise<DynamicToolCallResponse> {
     if (operation === 'list_tabs') {
       return textResult({ browserFamily: this.opts.family, tabs: await browser.user.openTabs() });
     }
@@ -634,23 +671,22 @@ export class CodexBrowserBroker {
       const info = (await browser.user.openTabs()).find(tab => tab.id === tabId);
       if (!info) throw new Error(`user tab is no longer available: ${tabId}`);
       const tab = await browser.user.claimTab(info);
-      this.claimedTabs.set(tab.id, tab);
-      this.claimedTabs.set(tabId, tab);
+      this.rememberTab(browser, generation, tab, tabId);
       return textResult(await this.describeTab(tab));
     }
     if (operation === 'new_tab') {
       const tab = await browser.tabs.new();
-      this.claimedTabs.set(tab.id, tab);
+      this.rememberTab(browser, generation, tab);
       return textResult(await this.describeTab(tab));
     }
     if (operation === 'selected_tab') {
       const tab = await browser.tabs.selected();
       if (!tab) return textResult({ tab: null });
-      this.claimedTabs.set(tab.id, tab);
+      this.rememberTab(browser, generation, tab);
       return textResult(await this.describeTab(tab));
     }
 
-    const tab = await this.getTab(requiredString(input.tabId, 'tabId', 256));
+    const tab = await this.getTab(requiredString(input.tabId, 'tabId', 256), browser, generation);
     switch (operation) {
       case 'capabilities':
         return textResult(await this.describeCapabilities(browser, tab));
@@ -916,7 +952,11 @@ export class CodexBrowserBroker {
       case 'mark_deliverable': await tab.markDeliverable(); return textResult({ ok: true });
       case 'close_tab':
         await tab.close();
-        this.claimedTabs.delete(tab.id);
+        if (this.browser === browser && this.browserGeneration === generation) {
+          for (const [id, claimed] of this.claimedTabs) {
+            if (claimed === tab) this.claimedTabs.delete(id);
+          }
+        }
         return textResult({ ok: true });
       default:
         throw new Error(`unsupported browser operation: ${operation}`);
@@ -1112,9 +1152,10 @@ export class CodexBrowserBroker {
     await chooser.setFiles(files.length === 1 ? files[0]! : files, { timeoutMs });
   }
 
-  private async getBrowser(): Promise<BrowserBinding> {
+  private async getBrowser(metadata?: Pick<DynamicToolCallParams, 'threadId' | 'turnId'>): Promise<BrowserBinding> {
+    if (metadata) this.updateTurnMetadata(metadata.threadId, metadata.turnId);
     if (this.browser) return this.browser;
-    const init = this.init ??= this.initialize();
+    const init = this.init ??= this.initialize(metadata);
     try {
       this.browser = await init;
       return this.browser;
@@ -1128,19 +1169,42 @@ export class CodexBrowserBroker {
     }
   }
 
-  private async initialize(): Promise<BrowserBinding> {
-    const modules = this.opts.modules ?? await loadBrowserPluginModules(
-      resolveCodexBrowserPluginRoot(this.opts.pluginRoot),
-    );
-    const nodeRepl = this.createRuntimeShim();
-    this.previousNodeRepl = (globalThis as Json).nodeRepl;
-    (globalThis as Json).nodeRepl = nodeRepl;
-    nodeRepl.rpc = async (name: string, request: { method: string; params?: unknown }) => {
-      if (name !== 'browser') throw new Error(`unsupported trusted service: ${name}`);
-      return modules.handleRpc(request);
-    };
-    const agent = await modules.setupBrowserRuntime();
-    const browser = await agent.browsers.get(this.opts.family);
+  private async initialize(metadata?: Pick<DynamicToolCallParams, 'threadId' | 'turnId'>): Promise<BrowserBinding> {
+    // The runtime — its native transport and turn-ended hooks — is created at
+    // most once for this broker's lifetime (the app-server runner process).
+    // Reconnection only re-runs the plugin's browsers.get(family) discovery.
+    // A dead in-process runtime therefore has no in-band rebuild path: recovery
+    // relies on the plugin reconnecting its own transport, or the runner being
+    // replaced by a new process.
+    if (!this.agent) {
+      const modules = this.opts.modules ?? await loadBrowserPluginModules(
+        resolveCodexBrowserPluginRoot(this.opts.pluginRoot),
+      );
+      if (!this.runtimeShim) {
+        this.previousNodeRepl = (globalThis as Json).nodeRepl;
+        const nodeRepl = this.createRuntimeShim();
+        (globalThis as Json).nodeRepl = nodeRepl;
+        nodeRepl.rpc = async (name: string, request: { method: string; params?: unknown }) => {
+          if (name !== 'browser') throw new Error(`unsupported trusted service: ${name}`);
+          return modules.handleRpc(request);
+        };
+      }
+      if (metadata) this.updateTurnMetadata(metadata.threadId, metadata.turnId);
+      const previousHandlers = new Set(this.turnEndedHandlers);
+      try {
+        this.agent = await modules.setupBrowserRuntime();
+      } catch (error) {
+        // The plugin can register cleanup hooks before setup finishes. Roll
+        // back that failed attempt so a retry cannot run those hooks twice.
+        for (const handler of this.turnEndedHandlers) {
+          if (!previousHandlers.has(handler)) this.turnEndedHandlers.delete(handler);
+        }
+        throw error;
+      }
+    }
+    // Re-select the configured family through the plugin's discovery API.
+    // Reusing the runtime keeps its transport and turn-ended hooks singular.
+    const browser = await this.agent.browsers.get(this.opts.family);
     await browser.nameSession(`botmux-${this.opts.sessionId.slice(0, 12)}`).catch(() => {});
     return browser;
   }
@@ -1257,12 +1321,21 @@ export class CodexBrowserBroker {
     };
   }
 
-  private async getTab(tabId: string): Promise<BrowserTab> {
+  private rememberTab(browser: BrowserBinding, generation: number, tab: BrowserTab, alias?: string): void {
+    if (this.browser !== browser || this.browserGeneration !== generation) throw new Error('Browser connection changed while acquiring the tab; list and claim the tab again');
+    this.claimedTabs.set(tab.id, tab);
+    if (alias) this.claimedTabs.set(alias, tab);
+  }
+
+  private async getTab(tabId: string, browser: BrowserBinding, generation: number): Promise<BrowserTab> {
+    if (this.browser !== browser || this.browserGeneration !== generation) throw new Error('Browser connection changed; list and claim the tab again');
     const claimed = this.claimedTabs.get(tabId);
     if (claimed) return claimed;
-    const browser = await this.getBrowser();
+    if (this.requiresFreshTabClaim) {
+      throw new Error('Browser connection changed; call list_tabs and claim_tab again before using an existing tab');
+    }
     const tab = await browser.tabs.get(tabId);
-    this.claimedTabs.set(tab.id, tab);
+    this.rememberTab(browser, generation, tab);
     return tab;
   }
 

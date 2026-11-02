@@ -93,7 +93,6 @@ const PANE_AGENT_KIND_BY_EXECUTABLE: Readonly<Record<string, string>> = {
   pi: 'pi',
   claude: 'claude',
   codex: 'codex',
-  gemini: 'gemini',
   'cursor-agent': 'cursor',
   agy: 'agy',
   omp: 'omp',

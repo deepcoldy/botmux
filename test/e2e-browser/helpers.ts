@@ -32,7 +32,7 @@ export const BROWSER_CONFIG = {
  * Code with `sandbox: true` (core-sandbox lane); Aiden and CoCo are internal
  * CLIs that only run where they are installed.
  */
-export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden', 'Pi', 'OhMyPi', 'Kimi', 'Gemini', 'Grok', 'ClaudeSandbox'] as const;
+export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden', 'Pi', 'OhMyPi', 'Kimi', 'Antigravity', 'Grok', 'ClaudeSandbox'] as const;
 export type BotName = (typeof BOT_NAMES)[number];
 
 // ---------------------------------------------------------------------------

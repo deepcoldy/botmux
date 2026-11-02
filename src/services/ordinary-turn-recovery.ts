@@ -1,8 +1,36 @@
+import type { TrustedCaller } from '../types.js';
+
 export const ORDINARY_TURN_RECOVERY_PROMPT = [
   '[BOTMUX_RECOVERY]',
   '上一执行因暂态 provider 故障中止。请读取当前会话和工作区状态，从最后一个可验证 checkpoint 继续原任务；',
   '不要重复已经完成的外部副作用。完成后按原任务的交付协议回复；若无法安全判断 checkpoint，请停止并明确请求人工决策。',
 ].join('\n');
+
+/** Error code for a delivered continuation whose own terminal never arrived
+ *  while the CLI sat idle: its outcome cannot be verified, so the recovery
+ *  settles as failed instead of waiting forever (10-31: the continuation's
+ *  terminal was attributed to a synthesised local turn and silenced, and the
+ *  state stayed `running` for days). */
+export const RECOVERY_OUTCOME_UNVERIFIED = 'recovery_outcome_unverified';
+
+/** The original input of one tracked logical turn, frozen at admission so a
+ *  terminal recovery failure can offer an exact re-delivery. The session's
+ *  `lastCliInput` / `lastFailedTurn` cannot serve: a type-ahead successor
+ *  overwrites both before the earlier turn's failure is known. */
+export interface OrdinaryTurnRetryInput {
+  cliInput: string;
+  /** Daemon-authenticated caller of the original turn, when admission had one. */
+  trustedCaller?: TrustedCaller;
+}
+
+/** Remembered retry inputs beyond the owner, counted from the queue head
+ *  (the successors that run — and may fail — next). */
+const MAX_QUEUED_RETRY_INPUTS = 8;
+
+/** Error code of a type-ahead successor that failed while the owner's own
+ *  recovery was in flight: the single recovery slot could not continue it, so
+ *  it gets a failure notice instead of being forgotten. */
+export const RECOVERY_QUEUED_UNRECOVERED = 'recovery_queued_unrecovered';
 
 export type OrdinaryTurnRecoveryStatus =
   | 'running'
@@ -42,7 +70,34 @@ export interface OrdinaryTurnRecoveryState {
   /** Signed App terminal saved atomically with its final ACK high-water. The
    * worker may disappear before sending the redundant terminal IPC. */
   pendingTerminal?: OrdinaryTurnRecoveryTerminal;
+  /** Original inputs of the tracked turns (owner + queued successors), keyed
+   *  by logical turn id. Pruned with the tracked set on every commit and
+   *  dropped once the slot settles completed/cancelled. Absent on pre-upgrade
+   *  archives, which simply cannot offer a re-delivery. */
+  retryInputs?: Record<string, OrdinaryTurnRetryInput>;
+  /** Epoch ms at which the current continuation was dispatched. Absent on
+   *  pre-upgrade archives (lets a failure notice tell a fresh failure from a
+   *  state that has been stuck since before the upgrade). */
+  dispatchedAt?: number;
+  /** The provider failure that started (or last fed) this recovery. Kept when
+   *  a later `recovery_*` code overwrites `lastErrorCode`, so a failure notice
+   *  can still name the real cause (e.g. a DNS outage). */
+  causeErrorCode?: string;
+  /** Set (by this version) in the same write as `warningDispatched`: the
+   *  failure notice for this logical turn is owed. A restart that finds it
+   *  without a notice record re-creates the record — closes the window where
+   *  the process dies between the state write and the notice write. Absent on
+   *  pre-upgrade states, whose notice the old code already sent. */
+  failureNoticeOwed?: true;
 }
+
+/** A continuation has been delivered and is still awaiting its own terminal. */
+export function ordinaryTurnRecoveryAwaitsContinuationTerminal(
+  state: OrdinaryTurnRecoveryState | undefined,
+): boolean {
+  return !!state && state.status === 'running' && state.currentTurnId !== state.logicalTurnId;
+}
+
 
 /** The slot is held by the original logical turn itself, still running — no
  *  continuation has been dispatched for it. Only then may a queued successor's
@@ -82,6 +137,8 @@ export interface OrdinaryTurnRecoveryDispatch {
 export interface OrdinaryTurnBeginOptions {
   /** Freeze "this fire is silent" onto the logical turn at admission. */
   silent?: boolean;
+  /** Freeze the turn's original input for a later failure-card re-delivery. */
+  input?: OrdinaryTurnRetryInput;
 }
 
 function isSilentLogicalTurn(state: OrdinaryTurnRecoveryState, logicalTurnId: string): boolean {
@@ -97,6 +154,39 @@ function pruneSilentLogicalTurnIds(state: OrdinaryTurnRecoveryState): OrdinaryTu
   const live = new Set([state.logicalTurnId, ...(state.queuedLogicalTurnIds ?? [])]);
   const kept = silentLogicalTurnIds.filter((id, index, all) => live.has(id) && all.indexOf(id) === index);
   return kept.length > 0 ? { ...rest, silentLogicalTurnIds: kept } : rest;
+}
+
+/** Same lifetime rule for frozen retry inputs: only the owner and the newest
+ *  queued successors keep theirs, and a slot that settled completed/cancelled
+ *  keeps none (nothing left to re-deliver). A failed owner keeps its input so
+ *  the failure notice can offer the retry. */
+function pruneRetryInputs(state: OrdinaryTurnRecoveryState): OrdinaryTurnRecoveryState {
+  const { retryInputs, ...rest } = state;
+  if (!retryInputs || state.status === 'completed' || state.status === 'cancelled') return rest;
+  const live = [state.logicalTurnId, ...(state.queuedLogicalTurnIds ?? []).slice(0, MAX_QUEUED_RETRY_INPUTS)];
+  const kept: Record<string, OrdinaryTurnRetryInput> = {};
+  for (const id of live) {
+    const input = retryInputs[id];
+    if (input) kept[id] = input;
+  }
+  return Object.keys(kept).length > 0 ? { ...rest, retryInputs: kept } : rest;
+}
+
+function withRetryInput(
+  state: OrdinaryTurnRecoveryState,
+  logicalTurnId: string,
+  input: OrdinaryTurnRetryInput | undefined,
+): OrdinaryTurnRecoveryState {
+  if (!input) return state;
+  return { ...state, retryInputs: { ...(state.retryInputs ?? {}), [logicalTurnId]: { ...input } } };
+}
+
+/** The provider code worth naming to a human: a `recovery_*` code describes
+ *  what the recovery machinery did, not why the turn failed. */
+export function ordinaryTurnRecoveryCauseCode(state: OrdinaryTurnRecoveryState): string | undefined {
+  if (state.causeErrorCode) return state.causeErrorCode;
+  const code = state.lastErrorCode;
+  return code && !code.startsWith('recovery_') ? code : undefined;
 }
 
 /** Turn ids a daemon restore must re-arm in its runtime silent registry before
@@ -149,6 +239,20 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   /** A newer user action may have failed to persist before the old process
    * exited. Without durable proof of ownership, do not rearm its backoff. */
   resumeRecoveryOnRestore?: boolean;
+  /** How long the CLI must sit idle, with a delivered continuation still
+   *  lacking its terminal, before that continuation's outcome is declared
+   *  unverifiable and the recovery settles as failed. Undefined disables the
+   *  check (CLIs whose newer input already supersedes a running recovery). */
+  lostContinuationGraceMs?: number;
+  /** Fresh busy probe read when the idle grace elapses: a CLI that went back
+   *  to work (e.g. it picked up the queued continuation) is left alone, and
+   *  its next idle edge re-arms the check. */
+  isCliBusy?: () => boolean;
+  /** Whether a type-ahead successor's non-completed terminal, arriving while
+   *  the owner's recovery is in flight, deserves a failure notice (the daemon's
+   *  shouldNotifyTurnFailure). When true, the coordinator claims that terminal
+   *  and raises the notice through `warn` instead of forgetting the turn. */
+  ownsQueuedFailure?: (terminal: OrdinaryTurnRecoveryTerminal) => boolean;
 }
 
 export interface OrdinaryTurnRecoverySession {
@@ -173,6 +277,7 @@ const attachedRecoveries = new Map<string, AttachedRecovery>();
 export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   private state: OrdinaryTurnRecoveryState | undefined;
   private timer: TTimer | undefined;
+  private idleTimer: TTimer | undefined;
   private restoredRunningWithoutRecoveryAuthority = false;
   private readonly now: () => number;
   private readonly randomId: () => string;
@@ -211,10 +316,10 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       if (logicalTurnId === live.currentTurnId || logicalTurnId === live.logicalTurnId
         || queued.includes(logicalTurnId)) return live;
       try {
-        const withQueue = withQueuedLogicalTurnIds(
+        const withQueue = withRetryInput(withQueuedLogicalTurnIds(
           live,
           [...queued, logicalTurnId].slice(-MAX_QUEUED_LOGICAL_TURNS),
-        );
+        ), logicalTurnId, opts.input);
         return this.commit(opts.silent
           ? { ...withQueue, silentLogicalTurnIds: [...(withQueue.silentLogicalTurnIds ?? []), logicalTurnId] }
           : withQueue);
@@ -231,6 +336,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         continuationsStarted: 0,
         status: 'running',
         ...(opts.silent ? { silentLogicalTurnIds: [logicalTurnId] } : {}),
+        ...(opts.input ? { retryInputs: { [logicalTurnId]: { ...opts.input } } } : {}),
       });
       this.restoredRunningWithoutRecoveryAuthority = false;
       return begun;
@@ -260,7 +366,29 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       // an already-delivered continuation that is still running) or the owner
       // already settled: the successor ran on its own and is simply forgotten
       // here — the delivered continuation keeps the slot.
-      if (!ownerAwaitingOwnTerminal(current)) return this.commit(remaining);
+      if (!ownerAwaitingOwnTerminal(current)) {
+        // Raise the successor's own notice BEFORE pruning it (and its frozen
+        // input) from the slot: the notice write lands first, so a crash in
+        // between can only leave a harmless stale queue entry, never a lost
+        // failure (10-31: this successor failed too and was only ever offered
+        // a single-shot card that the outage swallowed).
+        if (this.ownsQueuedFailure(terminal)) {
+          const input = current.retryInputs?.[terminal.turnId];
+          this.deps.warn({
+            logicalTurnId: terminal.turnId,
+            currentTurnId: terminal.turnId,
+            continuationsStarted: 0,
+            status: 'attention_required',
+            lastErrorCode: RECOVERY_QUEUED_UNRECOVERED,
+            ...(terminal.errorCode ? { causeErrorCode: terminal.errorCode } : {}),
+            ...(input ? { retryInputs: { [terminal.turnId]: input } } : {}),
+            ...(isSilentLogicalTurn(current, terminal.turnId) ? { silentLogicalTurnIds: [terminal.turnId] } : {}),
+            alertSentAt: this.now(),
+            warningDispatched: true,
+          });
+        }
+        return this.commit(remaining);
+      }
       // The owner never reported a terminal (lost/missed) yet its successor
       // did: the successor is the live turn now, and its terminal is handled
       // exactly as an owner terminal would be.
@@ -290,6 +418,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         continuationsStarted: 0,
         status: 'running',
         ...(current.silentLogicalTurnIds ? { silentLogicalTurnIds: current.silentLogicalTurnIds } : {}),
+        ...(current.retryInputs ? { retryInputs: current.retryInputs } : {}),
       }, rest));
     }
     if (this.deps.recoverableErrorCodes
@@ -312,11 +441,13 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       this.warnOnce(next);
       return next;
     }
+    const causeErrorCode = terminal.errorCode ?? current.causeErrorCode;
     if (current.continuationsStarted >= this.backoffMs.length) {
       const exhausted = {
         ...current,
         status: 'exhausted' as const,
         lastErrorCode: terminal.errorCode,
+        ...(causeErrorCode ? { causeErrorCode } : {}),
       };
       this.warnOnce(exhausted);
       return exhausted;
@@ -327,6 +458,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       status: 'backoff',
       nextAttemptAt: this.now() + delayMs,
       lastErrorCode: terminal.errorCode,
+      ...(causeErrorCode ? { causeErrorCode } : {}),
     });
     this.armBackoff();
     return next;
@@ -344,14 +476,63 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       return this.state ?? current;
     }
     this.cancelTimer();
+    const causeErrorCode = ordinaryTurnRecoveryCauseCode(current);
     const next = {
       ...current,
       status: 'attention_required' as const,
       nextAttemptAt: undefined,
       lastErrorCode: errorCode,
+      ...(causeErrorCode ? { causeErrorCode } : {}),
     };
     this.warnOnce(next);
     return this.state ?? next;
+  }
+
+  /** The CLI reached an idle prompt. When a delivered continuation still has
+   *  no terminal, arm one grace timer; if the CLI is still idle when it fires
+   *  and the same continuation is still unanswered, its outcome cannot be
+   *  verified any more (its terminal was lost or attributed elsewhere), so the
+   *  recovery settles as failed — fail closed: no further continuation is
+   *  dispatched for an execution whose effects are unknown. */
+  noteCliIdle(): void {
+    const graceMs = this.deps.lostContinuationGraceMs;
+    const current = this.state;
+    if (graceMs === undefined || !ordinaryTurnRecoveryAwaitsContinuationTerminal(current)) return;
+    this.cancelIdleTimer();
+    const continuationTurnId = current!.currentTurnId;
+    const check = (): void => {
+      this.idleTimer = undefined;
+      const live = this.state;
+      if (!ordinaryTurnRecoveryAwaitsContinuationTerminal(live)
+        || live!.currentTurnId !== continuationTurnId) return;
+      // Busy (working / usage-limited): look again after another grace rather
+      // than waiting for the next idle edge, which a long limit can delay.
+      if (this.deps.isCliBusy?.()) {
+        this.idleTimer = this.deps.schedule(graceMs, check);
+        return;
+      }
+      this.requireAttention(live!, RECOVERY_OUTCOME_UNVERIFIED);
+    };
+    this.idleTimer = this.deps.schedule(graceMs, check);
+  }
+
+  /** A stop key from the user (card stop / `/stop`): an in-flight continuation
+   *  or pending backoff belongs to the turn the user just stopped. Cancel it so
+   *  it neither runs afterwards nor settles as a failure card. A running owner
+   *  that was never continued is left to its own terminal. */
+  cancelForStop(): OrdinaryTurnRecoveryState | undefined {
+    const current = this.state;
+    if (!current) return undefined;
+    if (current.status !== 'backoff' && current.status !== 'dispatching'
+      && !ordinaryTurnRecoveryAwaitsContinuationTerminal(current)) return current;
+    this.cancelIdleTimer();
+    return this.cancelForUserInput('stop');
+  }
+
+  private ownsQueuedFailure(terminal: OrdinaryTurnRecoveryTerminal): boolean {
+    return !this.deps.recoverableErrorCodes
+      && terminal.status !== 'completed'
+      && this.deps.ownsQueuedFailure?.(terminal) === true;
   }
 
   cancelForUserInput(turnId: string): OrdinaryTurnRecoveryState {
@@ -412,6 +593,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         continuationsStarted: continuation,
         status: 'dispatching',
         nextAttemptAt: undefined,
+        dispatchedAt: this.now(),
       });
       const dispatch: OrdinaryTurnRecoveryDispatch = {
         logicalTurnId: dispatching.logicalTurnId,
@@ -472,6 +654,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       ...state,
       alertSentAt: state.alertSentAt ?? prior?.alertSentAt ?? this.now(),
       warningDispatched: true,
+      failureNoticeOwed: true,
     });
     if (prior?.warningDispatched || state.warningDispatched) return;
     this.deps.warn(alerted);
@@ -479,7 +662,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
 
   private commit(state: OrdinaryTurnRecoveryState): OrdinaryTurnRecoveryState {
     const prior = this.state;
-    const next = pruneSilentLogicalTurnIds({ ...state });
+    const next = pruneRetryInputs(pruneSilentLogicalTurnIds({ ...state }));
     this.state = next;
     try {
       this.deps.persist(next);
@@ -491,7 +674,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   }
 
   private retain(state: OrdinaryTurnRecoveryState): void {
-    this.state = pruneSilentLogicalTurnIds({ ...state });
+    this.state = pruneRetryInputs(pruneSilentLogicalTurnIds({ ...state }));
     this.deps.retain?.(this.state);
   }
 
@@ -500,8 +683,14 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     this.timer = undefined;
   }
 
+  private cancelIdleTimer(): void {
+    if (this.idleTimer !== undefined) this.deps.cancel(this.idleTimer);
+    this.idleTimer = undefined;
+  }
+
   dispose(): void {
     this.cancelTimer();
+    this.cancelIdleTimer();
   }
 
   handlesTerminal(terminal: OrdinaryTurnRecoveryTerminal, current: OrdinaryTurnRecoveryState): boolean {
@@ -518,6 +707,14 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       && (current.status !== 'completed' || recoveredPredecessor)
       && terminal.status === 'failed'
       && this.deps.recoverableErrorCodes.includes(terminal.errorCode ?? '');
+  }
+
+  /** A queued successor's failure that onTerminal will raise as its own
+   *  notice (see ownsQueuedFailure) — the fallback card must stay quiet. */
+  handlesQueuedFailure(terminal: OrdinaryTurnRecoveryTerminal, current: OrdinaryTurnRecoveryState): boolean {
+    return !ownerAwaitingOwnTerminal(current)
+      && (current.queuedLogicalTurnIds ?? []).includes(terminal.turnId)
+      && this.ownsQueuedFailure(terminal);
   }
 
   handlesRecoveredPredecessor(terminal: OrdinaryTurnRecoveryTerminal, current: OrdinaryTurnRecoveryState): boolean {
@@ -599,6 +796,7 @@ export function attachOrdinaryTurnRecovery<TTimer>(
         lastErrorCode: pendingBackoff ? 'recovery_restart_unverified' : 'recovery_dispatch_interrupted',
         alertSentAt: session.ordinaryTurnRecovery.alertSentAt ?? Date.now(),
         warningDispatched: true,
+        failureNoticeOwed: true as const,
       };
       session.ordinaryTurnRecovery = interrupted;
       deps.persist(interrupted);
@@ -670,11 +868,13 @@ export function ordinaryTurnRecoveryHandlesTerminal(
   if (current.currentTurnId === terminal.turnId) return true;
   if (attachedRecoveries.get(session.sessionId)!.coordinator.handlesRecoveredPredecessor(terminal, current)) return true;
   // A queued type-ahead successor is adopted by onTerminal only while the
-  // original owner itself is still running (no continuation dispatched); in any
-  // other state its terminal is merely forgotten and the fallback notice must
-  // stay in charge.
-  return ownerAwaitingOwnTerminal(current)
-    && (current.queuedLogicalTurnIds ?? []).includes(terminal.turnId);
+  // original owner itself is still running (no continuation dispatched). In any
+  // other state its terminal is forgotten by the slot; a failure that the
+  // policy owns is raised as the successor's own durable notice, anything else
+  // leaves the fallback notice in charge.
+  return (ownerAwaitingOwnTerminal(current)
+      && (current.queuedLogicalTurnIds ?? []).includes(terminal.turnId))
+    || attachedRecoveries.get(session.sessionId)!.coordinator.handlesQueuedFailure(terminal, current);
 }
 
 export function beginOrdinaryTurnRecovery(
@@ -715,6 +915,25 @@ export function requireOrdinaryTurnRecoveryAttention(
   const current = session.ordinaryTurnRecovery;
   if (!attached || !current || current.currentTurnId !== turnId) return current;
   return attached.coordinator.requireAttention(current, errorCode);
+}
+
+/** The user pressed stop (card stop / `/stop`) on this session's CLI. */
+export function cancelOrdinaryTurnRecoveryForStop(
+  session: OrdinaryTurnRecoverySession,
+): OrdinaryTurnRecoveryState | undefined {
+  const attached = attachedRecoveries.get(session.sessionId);
+  if (!attached || attached.session !== session) return session.ordinaryTurnRecovery;
+  return attached.coordinator.cancelForStop();
+}
+
+/** The CLI of this session reached an idle prompt (worker `prompt_ready`).
+ *  Arms the lost-continuation check when a delivered continuation is still
+ *  waiting for its terminal; a no-op otherwise or when the attached policy
+ *  disables the check. */
+export function noteOrdinaryTurnRecoveryCliIdle(session: OrdinaryTurnRecoverySession): void {
+  const attached = attachedRecoveries.get(session.sessionId);
+  if (!attached || attached.session !== session) return;
+  attached.coordinator.noteCliIdle();
 }
 
 export function disposeOrdinaryTurnRecovery(

@@ -519,6 +519,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'EBSD_BOTMUX_SUBJECT',
   'EBSD_BOTMUX_REPOSITORY_ROOT',
   'EBSD_NO_UPDATE_CHECK',
+  // Kimi Code: emit OSC 7501 turn state inside a tmux pane (it skips the
+  // support probe there). Set by the kimi adapter's spawnEnv.
+  'PI_PROGRAM_STATUS',
 ] as const;
 
 /**

@@ -1458,7 +1458,7 @@ describe('scheduleCardPatch adjacent duplicate handling', () => {
 // gaps in the first cut; these lock the corrected contract:
 //   - the arm predicate must NOT depend on the Web Terminal port (ZMX ready with
 //     port=0 must still refresh), and must gate on native-usage CLI capability
-//     (gemini/opencode/… have no transcript → nothing to refresh) and on
+//     (opencode/kimi/… have no transcript → nothing to refresh) and on
 //     usageDisplay='streaming';
 //   - the tick reads fresh (breaks the 15s cost-reader throttle) and is
 //     self-correcting (clears its own timer when state no longer qualifies).
@@ -1501,9 +1501,9 @@ describe('usageRefreshShouldRun (arm/clear predicate)', () => {
     expect(usageRefreshShouldRun(ds)).toBe(false);
   });
 
-  it('is false for a CLI without native usage (gemini/opencode/…)', () => {
+  it('is false for a CLI without native usage (opencode/kimi/…)', () => {
     const ds = workingDs();
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     expect(usageRefreshShouldRun(ds)).toBe(false);
   });
 
@@ -1663,7 +1663,7 @@ describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
   it('does not arm for an unsupported CLI (no group-visible empty-usage PATCH storm)', () => {
     vi.useFakeTimers();
     const ds = workingDs();
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     syncUsageRefreshTimer(ds);
     expect(ds.usageRefreshTimer).toBeUndefined();
     vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS * 3);

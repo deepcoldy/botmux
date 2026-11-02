@@ -4,11 +4,15 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   downgradeForbiddenReadWrite,
+  dropReadOnlyLauncherMountCovers,
   findForbiddenReadWritePaths,
+  findReadOnlyLauncherMountCovers,
+  resolveStoredSandboxPaths,
   findNonAbsoluteSandboxEntries,
   forbiddenReadWriteMessage,
   type ProtectedRoots,
 } from '../src/services/sandbox-path-guard.js';
+import { accessForPath, buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
 
 describe('sandbox readWrite guard', () => {
   let root: string;
@@ -119,5 +123,70 @@ describe('sandbox readWrite guard', () => {
     const input = { readWrite: ['~/projects/app'] };
     expect(downgradeForbiddenReadWrite(input, roots)).toEqual({ lists: input, downgraded: [], dropped: [] });
     expect(downgradeForbiddenReadWrite(undefined, roots)).toEqual({ lists: undefined, downgraded: [], dropped: [] });
+  });
+
+  it('finds a readOnly entry covering a launcher mount point: `/`, `/run`, `/run/sbxbin`, any spelling or link', () => {
+    const home = roots.homeDirs[0]!;
+    const rootLink = join(root, 'rootlink');
+    symlinkSync('/', rootLink);
+    const runLink = join(root, 'varrun');
+    symlinkSync('/run', runLink);
+    expect(findReadOnlyLauncherMountCovers([
+      '/', '//', '/./', ' / ', rootLink,
+      '/run', '//run/', '/run/', '/./run', runLink, '/run/sbxbin',
+      '/usr', '~', home, '/opt', '..', '/run/lock', '/run/user/1000', '/tmp', '/etc', '/runx',
+    ], home, 'linux')).toEqual([
+      '/', '//', '/./', ' / ', rootLink,
+      '/run', '//run/', '/run/', '/./run', runLink, '/run/sbxbin',
+    ]);
+  });
+
+  it('drops a stored readOnly `/` and keeps the other readOnly entries', () => {
+    const home = roots.homeDirs[0]!;
+    const { lists, dropped } = dropReadOnlyLauncherMountCovers(
+      { readWrite: ['~/projects/app'], readOnly: ['/usr', '/', '~'], deny: ['~/secret'] }, home, 'linux',
+    );
+    expect(dropped).toEqual(['/']);
+    expect(lists).toEqual({ readWrite: ['~/projects/app'], readOnly: ['/usr', '~'], deny: ['~/secret'] });
+    const untouched = { readOnly: ['/usr'] };
+    expect(dropReadOnlyLauncherMountCovers(untouched, home, 'linux')).toEqual({ lists: untouched, dropped: [] });
+    expect(dropReadOnlyLauncherMountCovers(undefined, home, 'linux')).toEqual({ lists: undefined, dropped: [] });
+  });
+
+  it('leaves a readOnly `/` alone on macOS, where Seatbelt runs it as "read everything, write the deeper grants"', () => {
+    const home = roots.homeDirs[0]!;
+    expect(findReadOnlyLauncherMountCovers(['/', '/run'], home, 'darwin')).toEqual([]);
+    const stored = { readOnly: ['/'] };
+    expect(dropReadOnlyLauncherMountCovers(stored, home, 'darwin')).toEqual({ lists: stored, dropped: [] });
+    // The darwin policy keeps the grant and deeper readWrite rules still win.
+    const work = join(root, 'proj');
+    const policy = buildFsPolicy({
+      platform: 'darwin', homeDir: home, botmuxHome: join(home, '.botmux'), sessionDataDir: join(home, '.botmux', 'data'),
+      sessionId: 's', workingDir: work, currentAppId: 'cli_x', botHome: join(home, '.botmux', 'bots', 'cli_x'),
+      userPaths: { readOnly: ['/'] }, net: true, writeRegexes: [],
+    });
+    expect(accessForPath(policy.rules, '/etc/hosts').access).toBe('readOnly');
+    expect(accessForPath(policy.rules, join(work, 'file')).access).toBe('readWrite');
+  });
+
+  it('resolveStoredSandboxPaths applies every stored-entry rule in one step (the worker\'s list assembly)', () => {
+    const home = roots.homeDirs[0]!;
+    const stored = {
+      readWrite: ['/', '~/projects/app', '~', '..'],
+      readOnly: ['/usr', '/', '../ref', '~/docs', '/run', '/run/lock'],
+      deny: ['~/secret', 'rel/hidden'],
+    };
+    const linux = resolveStoredSandboxPaths(stored, { roots, home, platform: 'linux' });
+    expect(linux.downgradedReadWrite.map(f => f.path)).toEqual(['~']);
+    expect(linux.droppedReadWrite.map(f => f.path)).toEqual(['/', '..']);
+    expect(linux.droppedReadOnlyRelative).toEqual(['../ref']);
+    expect(linux.droppedReadOnlyRoot).toEqual(['/', '/run']);
+    expect(linux.lists).toEqual({
+      readWrite: ['~/projects/app'], readOnly: ['/usr', '~/docs', '/run/lock', '~'], deny: ['~/secret', 'rel/hidden'],
+    });
+    const darwin = resolveStoredSandboxPaths(stored, { roots, home, platform: 'darwin' });
+    expect(darwin.droppedReadOnlyRoot).toEqual([]);
+    expect(darwin.lists?.readOnly).toEqual(['/usr', '/', '~/docs', '/run', '/run/lock', '~']);
+    expect(resolveStoredSandboxPaths(undefined, { roots, home, platform: 'linux' }).lists).toBeUndefined();
   });
 });

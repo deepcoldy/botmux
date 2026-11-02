@@ -6,6 +6,7 @@ import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
+import { buildFederatedRoster } from '../src/services/federation-roster.js';
 import { buildTeamRoster, resolveLiveBotTransport } from '../src/services/team-roster.js';
 import { setBotCapability } from '../src/services/bot-profile-store.js';
 import { setBotOwner } from '../src/services/bot-owner-store.js';
@@ -59,6 +60,44 @@ describe('buildTeamRoster', () => {
     expect(buildTeamRoster(dataDir).bots).toEqual([]);
   });
 
+  it('filters malformed bots-info rows without dropping valid fallback bots', () => {
+    writeBotsInfo([
+      null,
+      42,
+      { larkAppId: 'cli_bad_name', botName: {}, cliId: 'claude-code' },
+      { larkAppId: 'cli_ok', botOpenId: 'ou_ok', botName: 'OK', cliId: 'codex' },
+    ]);
+
+    expect(buildTeamRoster(dataDir).bots).toMatchObject([
+      { larkAppId: 'cli_ok', name: 'OK', cliId: 'codex' },
+    ]);
+  });
+
+  it('filters malformed bots-info rows before enriching authoritative live bots', () => {
+    writeBotsInfo([
+      null,
+      { larkAppId: 'cli_ok', botOpenId: 'ou_ok', botName: 'Info', cliId: 'codex' },
+    ]);
+
+    expect(buildTeamRoster(dataDir, DEFAULT_TEAM_ID, undefined, [
+      { larkAppId: 'cli_ok', botName: 'Live' },
+    ]).bots).toMatchObject([
+      { larkAppId: 'cli_ok', name: 'Live', cliId: 'codex' },
+    ]);
+  });
+
+  it('filters malformed local bots-info rows in the federated roster', () => {
+    writeBotsInfo([
+      null,
+      { larkAppId: 'cli_ok', botOpenId: 'ou_ok', botName: 'OK', cliId: 'codex' },
+    ]);
+
+    const localBots = buildFederatedRoster(dataDir).bots.filter(bot => bot.deployment.local);
+    expect(localBots).toMatchObject([
+      { larkAppId: 'cli_ok', name: 'OK', cliId: 'codex' },
+    ]);
+  });
+
   it('liveBots is authoritative — shows running bots even when bots-info.json is empty', () => {
     // bots-info.json empty (e.g. probe lagged / write race) but daemons are running
     writeBotsInfo([]);
@@ -89,7 +128,7 @@ describe('buildTeamRoster', () => {
     writeBotsInfo([
       { larkAppId: 'cli_c', botOpenId: null, botName: 'C', cliId: 'codex' },
       { larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' },
-      { larkAppId: 'cli_x', botOpenId: null, botName: 'X', cliId: 'gemini' }, // not in config
+      { larkAppId: 'cli_x', botOpenId: null, botName: 'X', cliId: 'opencode' }, // not in config
       { larkAppId: 'cli_b', botOpenId: null, botName: 'B', cliId: 'coco' },
     ]);
     const r = buildTeamRoster(dataDir, DEFAULT_TEAM_ID, ['cli_a', 'cli_b', 'cli_c']);

@@ -155,6 +155,30 @@ export function getSessionGroup(chatId: string): SessionGroupEntry | undefined {
   return entries.get(chatId);
 }
 
+/** 群组管理页「会话群」视图要的摘要：排序、状态和「查看会话」入口。 */
+export interface SessionGroupBoardMeta {
+  createdAt: number;
+  /** 注册表时间与当前会话最后一条消息里较新的那个——注册表只在建群 / 恢复 / 换新会话时更新，
+   *  会话里每来一条消息只会推进会话自己的 lastMessageAt。 */
+  lastActiveAt: number;
+  sessionId?: string;
+  sessionStatus?: 'active' | 'closed';
+}
+
+export function sessionGroupBoardMeta(
+  entry: SessionGroupEntry,
+  session?: { status?: string; lastMessageAt?: string } | null,
+): SessionGroupBoardMeta {
+  const sessionActiveAt = session?.lastMessageAt ? Date.parse(session.lastMessageAt) : NaN;
+  const status = session?.status === 'active' || session?.status === 'closed' ? session.status : undefined;
+  return {
+    createdAt: entry.createdAt,
+    lastActiveAt: Number.isFinite(sessionActiveAt) ? Math.max(entry.lastActiveAt, sessionActiveAt) : entry.lastActiveAt,
+    ...(entry.lastSessionId ? { sessionId: entry.lastSessionId } : {}),
+    ...(status ? { sessionStatus: status } : {}),
+  };
+}
+
 /** Remember the automatic group only for the user who owns this session group. */
 export function setSessionGroupFeedGroup(chatId: string, ownerOpenId: string, feedGroupId: string): void {
   const entry = getSessionGroup(chatId);

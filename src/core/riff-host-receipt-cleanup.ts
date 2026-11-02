@@ -25,13 +25,16 @@ export async function sweepOrphanRiffHostReceiptDirs(
     if (protectedSessionIds.has(name)) continue;
     const session = join(root, name), path = join(session, 'riff-host-operations');
     try {
-      const parent = lstatSync(session), stat = lstatSync(path);
-      if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== uid
-        || !stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid
+      // sessions/ also holds per-session files (e.g. <id>.env-stamp); only directories can own receipts.
+      const parent = lstatSync(session);
+      if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== uid) continue;
+      const stat = lstatSync(path);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid
         || now - stat.mtimeMs <= graceMs) continue;
       candidates.push({ path, inode: stat.ino, parentInode: parent.ino });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
     }
   }
   if (!candidates.length) return [];
@@ -48,7 +51,8 @@ export async function sweepOrphanRiffHostReceiptDirs(
       rmSync(candidate.path, { recursive: true, force: true });
       removed.push(candidate.path);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
     }
   }
   return removed;

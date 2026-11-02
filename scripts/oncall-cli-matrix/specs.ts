@@ -73,15 +73,17 @@ export const CLI_SPECS: CliSpec[] = [
     },
   },
   {
-    id: 'gemini',
-    stateDirs: ['.gemini'],
+    id: 'antigravity',
+    stateDirs: ['.gemini/antigravity-cli'],
     setup: ({ home, mockUrl }) => {
-      write(join(home, '.gemini/settings.json'), JSON.stringify({
-        general: { enableAutoUpdate: false, enableAutoUpdateNotification: false },
-        security: { auth: { selectedType: 'gemini-api-key' }, folderTrust: { enabled: false } },
-        privacy: { usageStatisticsEnabled: false },
-      }));
-      return { env: { GOOGLE_GEMINI_BASE_URL: mockUrl, GEMINI_API_KEY: FAKE_KEY } };
+      // modelProvider "gemini" + GEMINI_API_KEY: agy runs against the Gemini
+      // API without a Google sign-in, at GOOGLE_GEMINI_BASE_URL. The
+      // onboarding cache skips the first-run colour-scheme / terms screens.
+      // AGY_CLI_DISABLE_AUTO_UPDATE must be the literal "true": with "1" agy
+      // 1.4.12 still spawns its background updater.
+      write(join(home, '.gemini/antigravity-cli/settings.json'), JSON.stringify({ modelProvider: 'gemini' }));
+      write(join(home, '.gemini/antigravity-cli/cache/onboarding.json'), JSON.stringify({ consumerOnboardingComplete: true, enterpriseOnboardingComplete: false, onboardingComplete: true }));
+      return { env: { GOOGLE_GEMINI_BASE_URL: mockUrl, GEMINI_API_KEY: FAKE_KEY, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' } };
     },
   },
   {

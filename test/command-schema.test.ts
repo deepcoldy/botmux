@@ -34,17 +34,18 @@ import {
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const sorted = (s: ReadonlySet<string>) => [...s].sort();
-const INTENTIONAL_NEW_COMMANDS = new Set(['/context-sharing', '/queue', '/dash', '/logout']);
+const INTENTIONAL_NEW_COMMANDS = new Set(['/context-sharing', '/queue', '/dash', '/logout', '/rewind']);
 const withoutIntentional = (s: ReadonlySet<string>) => new Set([...s].filter(c => !INTENTIONAL_NEW_COMMANDS.has(c)));
 
 describe('command schema ↔ 冻结的 legacy 集合', () => {
   it('DAEMON_COMMANDS 逐字相等', () => {
     expect(sorted(withoutIntentional(DAEMON_COMMANDS))).toEqual(sorted(ORACLE_DAEMON_COMMANDS));
-    expect(sorted(INTENTIONAL_NEW_COMMANDS)).toEqual(['/context-sharing', '/dash', '/logout', '/queue']);
+    expect(sorted(INTENTIONAL_NEW_COMMANDS)).toEqual(['/context-sharing', '/dash', '/logout', '/queue', '/rewind']);
     expect(commandSpec('/context-sharing')).toMatchObject({ sessionPolicy: 'sessionless' });
     expect(commandSpec('/queue')).toMatchObject({ sessionPolicy: 'existingOnly', multiline: true });
     expect(commandSpec('/dash')).toMatchObject({ sessionPolicy: 'sessionless', mentionless: true });
     expect(commandSpec('/logout')).toMatchObject({ sessionPolicy: 'sessionless', permission: 'talk' });
+    expect(commandSpec('/rewind')).toMatchObject({ sessionPolicy: 'existingOnly' });
   });
   it('SESSIONLESS / EXISTING_SESSION_ONLY / MULTILINE 逐字相等', () => {
     expect(sorted(withoutIntentional(SESSIONLESS_DAEMON_COMMANDS))).toEqual(sorted(ORACLE_SESSIONLESS_DAEMON_COMMANDS));
