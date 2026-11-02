@@ -507,7 +507,6 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
-import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import {
   resolveRegisteredBackgroundContext,
   backgroundContextStillValid,
