@@ -507,7 +507,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
-import { larkToolBindingPath, readLarkToolBinding, larkToolIdentityEnabled } from './lark-tool-binding.js';
+import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import {
   resolveRegisteredBackgroundContext,
   backgroundContextStillValid,
@@ -4331,13 +4331,6 @@ function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): b
   let apiOnly = false;
   if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
   return !larkTransportEnabled({ chatId: s.chatId ?? '', apiOnly });
-}
-
-function sessionLarkToolIdentityDisabled(s: { chatId?: string; larkAppId?: string; session: { headless?: { id: string; source: string } } }): boolean {
-  if (!s.larkAppId) return true;
-  try {
-    return !larkToolIdentityEnabled({ chatId: s.chatId ?? '', apiOnly: getBot(s.larkAppId).config.apiOnly, headless: s.session.headless });
-  } catch { return true; }
 }
 
 /** Mutating IPC routes may only touch this daemon's own bot-partitioned store. */
