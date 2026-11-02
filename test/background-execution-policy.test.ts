@@ -1,15 +1,16 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { once } from 'node:events';
-import type { ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { ScheduleAuthorityStore, scheduleAuthorityDbPath } from '../src/services/schedule-authority-store.js';
 import { backgroundAuthorityKey, backgroundCredentialPolicyKey, backgroundPeerBelongsToJob, type BackgroundExecutionRegistration } from '../src/core/background-execution-policy.js';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { parseBackgroundExecutionArgs } from '../src/cli/background-execution.js';
-import { spawnTsEval } from './helpers/ts-runner.js';
+import { spawnTsEval, spawnTsScript } from './helpers/ts-runner.js';
 import type { ScheduledTask } from '../src/types.js';
 
 const roots: string[] = [];
@@ -85,6 +86,7 @@ describe.skipIf(process.platform !== 'linux')('registered background execution p
     const h = fixture();
     h.store.updateTask('cli_probe', h.t.id, t => ({ ...t,
       parsed: { kind: 'once', at: new Date().toISOString(), display: 'once' } } as ScheduledTask));
+    h.job.authorityKey = backgroundAuthorityKey(h.store.getRecord('cli_probe', h.t.id)!.task);
     h.store.registerBackgroundExecution(h.job);
     h.store.updateTask('cli_probe', h.t.id, t => ({ ...t, enabled: false, disabledReason: 'once_completed' }));
     expect(h.store.backgroundExecutions('cli_probe', 's-probe')).toHaveLength(1);
@@ -110,6 +112,44 @@ describe.skipIf(process.platform !== 'linux')('registered background execution p
     children.push(child); await once(child, 'spawn');
     expect(() => h.store.registerBackgroundExecution({ ...h.job, id: 'nested-root',
       root: { pid: child.pid!, procStart: readProcessStartIdentity(child.pid!)! } })).toThrow();
+  });
+  it.each(['revoked', 'expired'] as const)('rejects replay of the exact still-live %s root after restart', state => {
+    const h = fixture();
+    h.store.registerBackgroundExecution({ ...h.job, expiresAt: state === 'expired' ? Date.now() - 1 : h.job.expiresAt });
+    if (state === 'revoked') h.store.revokeBackgroundExecution(h.job.id);
+    const reopened = ScheduleAuthorityStore.open(h.root); stores.push(reopened);
+    expect(() => reopened.registerBackgroundExecution({ ...h.job, id: 'replay-exact-live-root' })).toThrow();
+  });
+  it('rejects the 65th live independent root and recovers one slot after a root dies', async () => {
+    const h = fixture();
+    // Real lightweight Linux processes avoid fabricating liveness or requiring
+    // 65 Node engines. These are external executables, not TS child fixtures.
+    const peers = await Promise.all(Array.from({ length: 65 }, async () => {
+      const child = spawn('sleep', ['60'], { stdio: 'ignore' }); children.push(child);
+      await once(child, 'spawn');
+      return { child, identity: { pid: child.pid!, procStart: readProcessStartIdentity(child.pid!)! } };
+    }));
+    const ids = Array.from({ length: 65 }, () => randomUUID());
+    for (let i = 0; i < 64; i++) h.store.registerBackgroundExecution({ ...h.job, id: ids[i], root: peers[i].identity });
+    expect(h.store.backgroundExecutions('cli_probe', 's-probe')).toHaveLength(64);
+    const next = { ...h.job, id: ids[64], root: peers[64].identity };
+    expect(() => h.store.registerBackgroundExecution(next)).toThrow();
+    const exited = once(peers[0].child, 'exit'); peers[0].child.kill('SIGKILL'); await exited;
+    expect(() => h.store.registerBackgroundExecution(next)).not.toThrow();
+    const jobs = h.store.backgroundExecutions('cli_probe', 's-probe');
+    expect(jobs).toHaveLength(64);
+    expect(jobs.some(job => job.id === next.id)).toBe(true);
+    expect(jobs.some(job => job.id === ids[0])).toBe(false);
+  });
+  it.each(['root', 'intermediate'] as const)('independently checks the %s process UID', async hop => {
+    const child = spawnTsScript(resolve('test/helpers/background-uid-guard-probe.ts'), [hop], { stdio: ['ignore', 'pipe', 'pipe'] });
+    children.push(child);
+    let stdout = '', stderr = '';
+    child.stdout!.on('data', data => { stdout += data; });
+    child.stderr!.on('data', data => { stderr += data; });
+    const [code] = await once(child, 'exit');
+    expect({ code, stderr }).toEqual({ code: 0, stderr: '' });
+    expect(JSON.parse(stdout)).toEqual({ baseline: true, guarded: false, mismatches: 1 });
   });
   it('requires the registered root birth, boot, lease and peer birth', () => {
     const { job } = fixture(); const peer = { ...job.root };

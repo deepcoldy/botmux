@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
+import * as processIdentity from '../src/utils/process-identity.js';
 import { spawnTsEval } from './helpers/ts-runner.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import { rememberProvenIdentityContent, recallProvenIdentityContent, sessionIdentityDataDir } from '../src/core/cli-identity.js';
@@ -12,30 +13,38 @@ import { bumpCliAuthEpoch } from '../src/services/cli-auth-epoch.js';
 import { registerScheduledBackgroundExecution, resolveDetachedScheduledExecutionIdentity,
   resolveRegisteredBackgroundContext, revokeScheduledBackgroundExecution } from '../src/core/detached-scheduled-identity.js';
 
-const h = vi.hoisted(() => ({ root: '', ds: undefined as any, session: undefined as any,
-  store: undefined as any, allowed: true, delay: 0, publishes: 0, bot: undefined as any }));
-vi.mock('../src/bot-registry.js', () => ({ getBot: () => ({ config: h.bot }) }));
-vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'en' }));
-vi.mock('../src/im/lark/event-dispatcher.js', () => ({ canOperate: () => h.allowed }));
-vi.mock('../src/core/worker-pool.js', () => ({ findActiveBySessionId: (id: string) => id === 's-bg' ? h.ds : undefined,
-  identityStorageModelForDaemonSession: () => 'proven' }));
-vi.mock('../src/services/session-store.js', () => ({ getOwnedSession: (id: string) => id === 's-bg' ? h.session : undefined }));
-vi.mock('../src/core/scheduler.js', () => ({
-  getScheduleAuthorityRecord: (id: string, app: string) => h.store.getRecord(app, id),
-  registerBackgroundExecution: (job: any) => h.store.registerBackgroundExecution(job),
-  backgroundExecutions: (app: string, session: string) => h.store.backgroundExecutions(app, session),
-  revokeBackgroundExecution: (id: string) => h.store.revokeBackgroundExecution(id),
-}));
-vi.mock('../src/core/platform-credential-source.js', () => ({ noteSenderUnionId() {} }));
-vi.mock('../src/core/turn-cli-identity.js', () => ({ publishTurnCliIdentity: async (args: any) => {
-  h.publishes++;
-  if (h.delay) await new Promise(resolve => setTimeout(resolve, h.delay));
-  const { rememberProvenIdentityContent } = await import('../src/core/cli-identity.js');
-  const env = `BOTMUX_IDENTITY_MODE='local'\nBOTMUX_IDENTITY_OPEN_ID='${args.senderOpenId}'\n`;
-  for (const tool of ['bytedcli', 'codebase', 'lark-cli'] as const) {
-    rememberProvenIdentityContent(args.sessionDataDir, args.sessionId, args.turnId, tool, env);
-  }
-} }));
+import * as registry from '../src/bot-registry.js';
+import * as i18n from '../src/i18n/index.js';
+import * as access from '../src/im/lark/event-dispatcher.js';
+import * as workerPool from '../src/core/worker-pool.js';
+import * as sessions from '../src/services/session-store.js';
+import * as scheduler from '../src/core/scheduler.js';
+import * as platformCredentials from '../src/core/platform-credential-source.js';
+import * as publication from '../src/core/turn-cli-identity.js';
+const h = { root: '', ds: undefined as any, session: undefined as any,
+  store: undefined as any, jobs: undefined as any, storageModel: 'proven', allowed: true, delay: 0, publishes: 0, bot: undefined as any };
+function mockDependencies() {
+  vi.spyOn(registry, 'getBot').mockImplementation(() => ({ config: h.bot }) as any);
+  vi.spyOn(i18n, 'localeForBot').mockReturnValue('en');
+  vi.spyOn(access, 'canOperate').mockImplementation(() => h.allowed);
+  vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-bg' ? h.ds : undefined);
+  vi.spyOn(workerPool, 'identityStorageModelForDaemonSession').mockImplementation(() => h.storageModel as 'proven' | 'single');
+  vi.spyOn(sessions, 'getOwnedSession').mockImplementation(id => id === 's-bg' ? h.session : undefined);
+  vi.spyOn(scheduler, 'getScheduleAuthorityRecord').mockImplementation((id, app) => h.store.getRecord(app, id));
+  vi.spyOn(scheduler, 'registerBackgroundExecution').mockImplementation(job => h.store.registerBackgroundExecution(job));
+  vi.spyOn(scheduler, 'backgroundExecutions').mockImplementation((app, session) => h.jobs ?? h.store.backgroundExecutions(app, session));
+  vi.spyOn(scheduler, 'revokeBackgroundExecution').mockImplementation(id => h.store.revokeBackgroundExecution(id));
+  vi.spyOn(platformCredentials, 'noteSenderUnionId').mockImplementation(() => {});
+  vi.spyOn(publication, 'publishTurnCliIdentity').mockImplementation(async args => {
+    h.publishes++;
+    if (h.delay) await new Promise(resolve => setTimeout(resolve, h.delay));
+    const env = `BOTMUX_IDENTITY_MODE='local'\nBOTMUX_IDENTITY_OPEN_ID='${args.senderOpenId}'\n`;
+    for (const tool of ['bytedcli', 'codebase', 'lark-cli'] as const) {
+      rememberProvenIdentityContent(args.sessionDataDir, args.sessionId, args.turnId!, tool, env);
+    }
+    return [];
+  });
+}
 const app = 'cli_background';
 const turn = 'schedule:abcd1234:12345678-1234-1234-1234-123456789abc';
 let rootProcess: ChildProcess;
@@ -43,6 +52,7 @@ const peer = () => ({ pid: rootProcess.pid!, procStart: readProcessStartIdentity
 const input = () => ({ sessionDataDir: h.root, sessionId: 's-bg', peer: peer(), tool: 'bytedcli' as const });
 const jwt = (seconds: number) => `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + seconds })).toString('base64url')}.sig`;
 beforeEach(async () => {
+  mockDependencies();
   h.root = mkdtempSync(join(tmpdir(), 'registered-bg-'));
   h.store = ScheduleAuthorityStore.open(h.root); h.store.initializeApp(app, []);
   h.store.createDirect({ id: 'abcd1234', larkAppId: app, chatId: 'oc_bg', enabled: true,
@@ -55,13 +65,13 @@ beforeEach(async () => {
     localProcessAttestation: { workerGeneration: 1, cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) },
     managedTurnOrigin: { turnId: turn, callerOpenId: 'ou_bg', dispatchAttempt: 1,
       capability: 'a'.repeat(64), preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`] } };
-  h.allowed = true; h.delay = h.publishes = 0;
+  h.allowed = true; h.jobs = undefined; h.storageModel = 'proven'; h.delay = h.publishes = 0;
   h.bot = { larkAppId: app, apiOnly: false };
   rootProcess = spawnTsEval('setInterval(() => {}, 1000)', { stdio: 'ignore' });
   await once(rootProcess, 'spawn');
 });
 afterEach(async () => {
-  vi.useRealTimers();
+  vi.useRealTimers(); vi.restoreAllMocks();
   if (rootProcess.exitCode === null && rootProcess.signalCode === null) {
     const end = once(rootProcess, 'exit'); rootProcess.kill('SIGKILL'); await end;
   }
@@ -85,6 +95,93 @@ describe.skipIf(process.platform !== 'linux')('registered scheduled identity', (
   it('uses the actual worker sandbox report even if frozen session configuration says off', () => {
     h.ds.reportedIdentityModel.sandboxEngaged = true;
     expect(registerScheduledBackgroundExecution(input())).toBeNull();
+  });
+  it('refuses registration beyond the maximum lease', () => {
+    expect(registerScheduledBackgroundExecution({ ...input(), ttlSeconds: 604801 })).toBeNull();
+    expect(h.store.backgroundExecutions(app, 's-bg')).toEqual([]);
+  });
+  it('rereads the peer birth after live attestation before registration', () => {
+    const request = input();
+    vi.spyOn(processIdentity, 'readProcessStartIdentity').mockReturnValue('reused-after-proof');
+    expect(registerScheduledBackgroundExecution(request)).toBeNull();
+    expect(h.store.backgroundExecutions(app, 's-bg')).toEqual([]);
+  });
+  it('refuses registration when the peer UID differs from the daemon', () => {
+    const uid = process.getuid!();
+    vi.spyOn(process, 'getuid').mockReturnValue(uid + 1);
+    expect(registerScheduledBackgroundExecution(input())).toBeNull();
+  });
+  it.each(['adoptedFrom', 'vcMeetingReceiver'] as const)('refuses the %s session path', field => {
+    h.session[field] = 'external-session';
+    expect(registerScheduledBackgroundExecution(input())).toBeNull();
+  });
+  it('requires the session chat to belong to the task', () => {
+    h.store.updateTask(app, 'abcd1234', (task: any) => ({ ...task, chatId: 'oc_other', chatIds: ['oc_other'] }));
+    expect(registerScheduledBackgroundExecution(input())).toBeNull();
+  });
+  it('requires proven identity from the worker report', () => {
+    h.ds.reportedIdentityModel.model = 'single'; h.storageModel = 'single';
+    expect(registerScheduledBackgroundExecution(input())).toBeNull();
+  });
+  it('requires proven identity from disk when the worker has no report', () => {
+    delete h.ds.reportedIdentityModel;
+    const dir = sessionIdentityDataDir(h.root, 's-bg'); mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'identity-layout'), 'single');
+    expect(registerScheduledBackgroundExecution(input())).toBeNull();
+  });
+  it.each(['appId', 'taskId', 'openId', 'unionId', 'authorityKey'] as const)(
+    'retires a stored job whose %s no longer matches current authority', field => {
+      const job = registerScheduledBackgroundExecution(input())!;
+      expect(resolveRegisteredBackgroundContext(input())?.job.id).toBe(job.id);
+      // Inject a stale persisted snapshot without using updateTask, whose own
+      // proactive invalidation would conceal deletion of resolver safeguards.
+      h.jobs = [{ ...job, [field]: `mismatched-${field}` }];
+      expect(resolveRegisteredBackgroundContext(input())).toBeNull();
+      h.jobs = undefined;
+      expect(h.store.backgroundExecutions(app, 's-bg')).toEqual([]);
+    });
+  it('rejects a peer matching two otherwise valid persisted registrations', () => {
+    const job = registerScheduledBackgroundExecution(input())!;
+    expect(resolveRegisteredBackgroundContext(input())?.job.id).toBe(job.id);
+    // Corrupt/legacy snapshots can contain overlaps even though new writes
+    // prevent them. Resolver must fail closed instead of picking the first.
+    h.jobs = [job, { ...job, id: 'overlapping-registration' }];
+    expect(resolveRegisteredBackgroundContext(input())).toBeNull();
+  });
+  it('lets the live original human revoke a job outside its process lineage', () => {
+    const job = registerScheduledBackgroundExecution(input())!;
+    expect(revokeScheduledBackgroundExecution({ ...input(), peer: { pid: process.pid,
+      procStart: readProcessStartIdentity(process.pid)! }, jobId: job.id })).toBe(true);
+    expect(h.store.backgroundExecutions(app, 's-bg')).toEqual([]);
+  });
+  it('lets a real descendant of the registered root revoke itself after the original turn ends', async () => {
+    const exited = once(rootProcess, 'exit'); rootProcess.kill('SIGKILL'); await exited;
+    rootProcess = spawnTsEval(`import { spawn } from 'node:child_process';
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      child.once('spawn', () => process.send({ pid: child.pid }));
+      setInterval(() => {}, 1000);`, { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    const [message] = await once(rootProcess, 'message') as [{ pid: number }];
+    try {
+      const job = registerScheduledBackgroundExecution(input())!;
+      expect(job).not.toBeNull(); h.ds.managedTurnOrigin = undefined;
+      const descendant = { pid: message.pid, procStart: readProcessStartIdentity(message.pid)! };
+      expect(revokeScheduledBackgroundExecution({ ...input(), peer: descendant, jobId: job.id })).toBe(true);
+      expect(h.store.backgroundExecutions(app, 's-bg')).toEqual([]);
+    } finally { try { process.kill(message.pid, 'SIGKILL'); } catch { /* gone */ } }
+  });
+  it('refuses a live different human revoking a job outside its process lineage', () => {
+    const job = registerScheduledBackgroundExecution(input())!;
+    h.ds.managedTurnOrigin.callerOpenId = 'ou_other';
+    expect(revokeScheduledBackgroundExecution({ ...input(), peer: { pid: process.pid,
+      procStart: readProcessStartIdentity(process.pid)! }, jobId: job.id })).toBe(false);
+    expect(h.store.backgroundExecutions(app, 's-bg')).toHaveLength(1);
+  });
+  it('refuses an unrelated same-UID peer after the original turn ends', () => {
+    const job = registerScheduledBackgroundExecution(input())!;
+    h.ds.managedTurnOrigin = undefined;
+    expect(revokeScheduledBackgroundExecution({ ...input(), peer: { pid: process.pid,
+      procStart: readProcessStartIdentity(process.pid)! }, jobId: job.id })).toBe(false);
+    expect(h.store.backgroundExecutions(app, 's-bg')).toHaveLength(1);
   });
   it('rejects a same-UID peer without registration even when its session has a schedule receipt', async () => {
     h.ds.managedTurnOrigin = undefined;
