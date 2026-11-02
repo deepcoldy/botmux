@@ -81,6 +81,11 @@ import {
 } from './journal.js';
 import { materialize } from './state.js';
 import { openV3WorkerAttempts } from './attempt-ledger.js';
+import { openV3ExternalAttempts } from './external-attempt-ledger.js';
+import {
+  V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS,
+  type V3ExternalNodeExecutor,
+} from './external-executor.js';
 import { openV3HostEffects } from './host-effect-ledger.js';
 import { readAndVerifyV3PreparedHostInput } from './host-execution.js';
 import { composeV3HostGatePrompt, renderV3HostInputPreview } from './host-bindings.js';
@@ -804,6 +809,16 @@ export interface V3DaemonRunDeps {
   maxParallel?: number;
   /** Low-latency interrupt delivery. Durable intent always lives in journal. */
   cancelSignal?: AbortSignal;
+  /**
+   * EXTERNAL EXECUTOR INJECTION POINT. Transport for runs whose `run.json`
+   * pins `nodeExecutor: "bot"`. The daemon does not construct one yet, so such
+   * a run fails closed at start; runs without the field never consult it.
+   */
+  externalExecutor?: V3ExternalNodeExecutor;
+  /** Engine clock for external handoff deadlines (tests inject a fake). */
+  now?: () => number;
+  /** Observability sink for external transport failures. */
+  onExternalError?: V3RuntimeDeps['onExternalError'];
 }
 
 /**
@@ -871,6 +886,11 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   const imWriteOptions = chatBoundWorkflowWriteOptions(context.resolvedWorkflowData, 'send');
   const replyWriteOptions = chatBoundWorkflowWriteOptions(context.resolvedWorkflowData, 'reply');
 
+  // Frozen per run: only an envelope can opt a run into bot-executed nodes.
+  const nodeExecutor = context.envelope && 'nodeExecutor' in context.envelope
+    ? context.envelope.nodeExecutor
+    : undefined;
+
   // suspend mode → no resolveGate (runtime writes the wait + returns awaitingGate).
   const runtimeDeps: V3RuntimeDeps = {
     runNode,
@@ -878,8 +898,14 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     resolveBotSnapshot,
     hostExecutors: createDefaultHostExecutorRegistry(imWriteOptions, replyWriteOptions),
     hostReconcilers: createDefaultProviderReconcilers(imWriteOptions, replyWriteOptions),
+    ...(deps.now ? { now: deps.now } : {}),
+    ...(nodeExecutor === 'bot' && deps.externalExecutor ? { externalExecutor: deps.externalExecutor } : {}),
+    ...(nodeExecutor === 'bot' && deps.onExternalError ? { onExternalError: deps.onExternalError } : {}),
   };
   const opts: V3RuntimeOptions = {
+    ...(nodeExecutor === 'bot'
+      ? { nodeExecutor, externalAcceptTimeoutMs: handoffAcceptTimeoutMs() }
+      : {}),
     baseDir,
     gateMode: 'suspend',
     ...(context.botSnapshots ? { frozenBotSnapshots: context.botSnapshots } : {}),
@@ -899,8 +925,9 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     return outcome;
   }
 
-  if (outcome.reason === 'awaitingGate') {
-    if (!binding) {
+  if (outcome.reason === 'awaitingGate' || outcome.reason === 'awaitingExternal') {
+    // An external wait may coexist with pending gates; those still need cards.
+    if (outcome.pendingWaits.length > 0 && !binding) {
       // No chat binding (e.g. not born via grill) → can't post a card.  The
       // wait files are on disk; surface rather than silently strand the run.
       throw new Error(
@@ -908,7 +935,7 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
       );
     }
     for (const gate of outcome.pendingWaits) {
-      await deps.postGateCard(binding, gate, runId);
+      await deps.postGateCard(binding!, gate, runId);
     }
   } else if (outcome.runStatus === 'blocked' && outcome.blockedNodeId && binding) {
     // Blocked = terminal-for-now.  Two distinct causes, two distinct cards:
@@ -936,6 +963,15 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
   }
 
   return outcome;
+}
+
+/** Acceptance window for bot handoffs: the same knob and default as
+ *  `botmux dispatch` acceptance. */
+function handoffAcceptTimeoutMs(): number {
+  const configured = Number(process.env.BOTMUX_DISPATCH_ACCEPT_TIMEOUT_MS);
+  return Number.isSafeInteger(configured) && configured >= 0
+    ? configured
+    : V3_DEFAULT_HANDOFF_ACCEPT_TIMEOUT_MS;
 }
 
 function defaultMakeRunNode(
@@ -1449,6 +1485,13 @@ export interface V3GateRunnerDeps {
   maxParallel?: number;
   /** error sink (default: swallow).  Daemon passes its logger.warn. */
   onError?: (runId: string, err: unknown) => void;
+  /** External executor injection point (see V3DaemonRunDeps.externalExecutor). */
+  externalExecutor?: V3DaemonRunDeps['externalExecutor'];
+  now?: V3DaemonRunDeps['now'];
+  onExternalError?: V3DaemonRunDeps['onExternalError'];
+  /** Arm a re-drive at an engine deadline (`awaitingExternal.wakeAt`). The
+   *  default uses an unref'd timer; replacing the previous timer per run. */
+  scheduleWake?: (runId: string, wakeAt: number, wake: () => void) => void;
 }
 
 /**
@@ -1462,6 +1505,18 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
   const inFlight = new Set<string>();
   const rerunRequested = new Set<string>();
   const activeControllers = new Map<string, AbortController>();
+  const wakeTimers = new Map<string, NodeJS.Timeout>();
+  const now = deps.now ?? Date.now;
+  const scheduleWake = deps.scheduleWake ?? ((runId: string, wakeAt: number, wake: () => void): void => {
+    const prior = wakeTimers.get(runId);
+    if (prior) clearTimeout(prior);
+    const timer = setTimeout(() => {
+      if (wakeTimers.get(runId) === timer) wakeTimers.delete(runId);
+      wake();
+    }, Math.max(0, wakeAt - now()));
+    timer.unref?.();
+    wakeTimers.set(runId, timer);
+  });
 
   const invokeLifecycleHook = (
     hook: ((runId: string) => void | Promise<void>) | undefined,
@@ -1511,20 +1566,28 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
                 // Re-fold under the SAME lease before releasing ownership so
                 // the request cannot be stranded between runtime and transport.
                 do {
-                  await driveV3Run(runId, {
+                  const outcome = await driveV3Run(runId, {
                     baseDir,
                     loadBots: deps.loadBots,
                     makeRunNode: deps.makeRunNode,
                     validateManifest: deps.validateManifest,
                     maxParallel: deps.maxParallel,
                     cancelSignal: controller.signal,
+                    ...(deps.externalExecutor ? { externalExecutor: deps.externalExecutor } : {}),
+                    ...(deps.now ? { now: deps.now } : {}),
+                    ...(deps.onExternalError ? { onExternalError: deps.onExternalError } : {}),
                     postGateCard: (binding, gate, rid) => deps.postCard(binding, gate, rid),
                     postBlockedCard: deps.postBlockedCard,
                     postLoopGrantCard: deps.postLoopGrantCard,
                     postRevisitGrantCard: deps.postRevisitGrantCard,
-                    onTerminal: (rid, outcome, binding) =>
-                      deps.notifyTerminal ? deps.notifyTerminal(binding, rid, outcome) : Promise.resolve(),
+                    onTerminal: (rid, terminal, binding) =>
+                      deps.notifyTerminal ? deps.notifyTerminal(binding, rid, terminal) : Promise.resolve(),
                   });
+                  // External attempts wait on disk; deadlines need a re-drive
+                  // even when no settle event arrives.
+                  if (outcome.reason === 'awaitingExternal' && outcome.wakeAt !== undefined) {
+                    scheduleWake(runId, outcome.wakeAt, () => driveDetached(runId));
+                  }
                 } while (currentRunStatus(baseDir, runId) === 'cancelling');
               }, { maxWaitMs: V3_DRIVE_LEASE_MAX_WAIT_MS });
               leaseSettled = true;
@@ -1663,8 +1726,12 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
 
       const events = readJournal(journalPath);
       const snap = materialize(events);
+      // Open external (bot-executed) attempts are resumed, not killed: the
+      // drive reconciles each against its durable handoff phase (§9.5).
       const hasOpenAttempts =
-        openV3WorkerAttempts(events).length > 0 || openV3HostEffects(events).length > 0;
+        openV3WorkerAttempts(events).length > 0 ||
+        openV3HostEffects(events).length > 0 ||
+        openV3ExternalAttempts(events).length > 0;
       if (
         snap.runStatus === 'succeeded' ||
         snap.runStatus === 'failed' ||
