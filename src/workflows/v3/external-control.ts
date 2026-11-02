@@ -64,7 +64,6 @@ import { readJournal, withJournalMutationSync, type JournalMutation } from './jo
 import { ManifestValidationError, readAndValidateManifest } from './manifest.js';
 import { readRevisitRequest, validateResult } from './result-contract.js';
 import { planV3Revisit } from './revisit-plan.js';
-import { readRunEnvelope } from './run-envelope.js';
 import { materialize, type V3RunSnapshot } from './state.js';
 
 // ─── Current-attempt classification ─────────────────────────────────────────
@@ -956,14 +955,12 @@ export type V3ReassignOutcome =
         | 'not-bot-run';
     };
 
-/** `run.json` is authoritative when present; envelope-less (dev/test) runs
- *  are bot-executed only if their runtime stamped `runStarted.nodeExecutor`. */
-function isBotExecutedRun(runDir: string, events: readonly StoredEvent[]): boolean {
-  const envelope = readRunEnvelope(runDir);
-  if (envelope.kind === 'ok') {
-    return 'nodeExecutor' in envelope.envelope && envelope.envelope.nodeExecutor === 'bot';
-  }
-  if (envelope.kind === 'invalid') return false;
+/** A caller holding the validated `run.json` passes its pinned executor;
+ *  otherwise the runtime's `runStarted.nodeExecutor` stamp (written from that
+ *  same validated envelope) decides. Kept free of the envelope parser so the
+ *  host-neutral runtime graph carries no third-party schema library. */
+function isBotExecutedRun(events: readonly StoredEvent[], pinned: V3ReassignContext['nodeExecutor']): boolean {
+  if (pinned !== undefined) return pinned === 'bot';
   return events.some((event) => event.type === 'runStarted' && event.nodeExecutor === 'bot');
 }
 
@@ -973,6 +970,9 @@ export interface V3ReassignContext extends V3ExternalEngineContext {
   botSnapshots?: ReadonlyMap<string, BotSnapshot>;
   /** Stops the current attempt's bot turn, when one is open. */
   executor?: V3ExternalNodeExecutor;
+  /** The executor pinned by the caller's validated `run.json` (`null` = the
+   *  envelope has none). Omitted: the journal's `runStarted` stamp decides. */
+  nodeExecutor?: 'bot' | null;
 }
 
 function botSnapshotsFor(runDir: string, ctx: V3ReassignContext): ReadonlyMap<string, BotSnapshot> {
@@ -1063,7 +1063,7 @@ export async function reassignNode(
   if (!existsSync(journalPath)) return { kind: 'rejected', reason: 'missing' };
   // Only bot-executed runs read assignments; elsewhere a reassignment would
   // be recorded while the original worker keeps running.
-  if (!isBotExecutedRun(runDir, readJournal(journalPath))) return { kind: 'rejected', reason: 'not-bot-run' };
+  if (!isBotExecutedRun(readJournal(journalPath), ctx.nodeExecutor)) return { kind: 'rejected', reason: 'not-bot-run' };
   const dag = dagFor(runDir, ctx);
   const snapshots = botSnapshotsFor(runDir, ctx);
   const botSet = new Set([...snapshots.values()].map((snapshot) => snapshot.larkAppId));
