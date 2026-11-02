@@ -14,6 +14,7 @@
 | `/lane status` | 查看本人的独立 principal lane，包括分支、worktree、脏状态和未推送提交数（复用现有 bot 级 XPI 开关启用 principal lane 时可用） |
 | `/lane close` | 安全关闭本人的独立 principal lane：有运行中/排队任务或未提交文件时拒绝，回收前先推送未发布提交，且不会自动合并或删除分支 |
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
+| `/rewind [n\|n confirm]` | 回退会话上下文：不带参数列出最近检查点；`n` 预览、`n confirm` 回退到第 n 轮之前。仅 Claude Code，执行前自动备份 transcript，下条消息冷启动续上下文 |
 | `/queue <消息>` | Codex App 活会话：将文字消息作为独立一轮排队，等当前任务结束后执行；空闲时直接开始。支持多行纯文本，暂不支持富文本和附件；需命令操作权限（可通过 canTalkDaemonCommands 授权）。无会话、尚未就绪或其它 CLI 会明确拒绝 开启 trigger-user 按人凭证时会在接纳前刷新本轮身份；但后续消息可覆盖单槽凭证，等待轮的 bytedcli/lark-cli 仍可能被 turn-mismatch 拒绝，需要重试。 |
 | `/stop` | 中断当前 turn，保留会话；等价于流式卡片里的「停止」按钮 |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |

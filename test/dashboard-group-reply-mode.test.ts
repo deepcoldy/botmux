@@ -49,6 +49,28 @@ it('offers inherit + four modes, shows the source, and saves/rolls back via PUT'
   } finally { await act(async () => renderer.unmount()); }
 });
 
+it('marks the redundant field label for visual hiding only when a label prop is passed', async () => {
+  const base = { chatId: 'oc_l', appId: 'app-a', botName: '助手', state: inherited, onSaved: vi.fn(async () => undefined) };
+  let withLabel!: TestRenderer.ReactTestRenderer;
+  let withoutLabel!: TestRenderer.ReactTestRenderer;
+  await act(async () => {
+    withLabel = TestRenderer.create(React.createElement(GroupReplyModeRow, { ...base, label: '回复模式' }));
+  });
+  await act(async () => {
+    withoutLabel = TestRenderer.create(React.createElement(GroupReplyModeRow, { ...base }));
+  });
+  try {
+    // 显式字段标签与 SettingBlock 标题重复：打标记交给 CSS 视觉隐藏，读屏仍经 htmlFor 关联
+    expect(withLabel.root.findByType('label').props['data-reply-mode-label']).toBe('');
+    expect(withLabel.root.findByType('label').props.htmlFor).toBeTruthy();
+    // 不传 label 时这里显示的是 botName，绝不能被同一条隐藏规则带走
+    expect(withoutLabel.root.findByType('label').props['data-reply-mode-label']).toBeUndefined();
+  } finally {
+    await act(async () => withLabel.unmount());
+    await act(async () => withoutLabel.unmount());
+  }
+});
+
 it('topic groups only allow clearing a dormant override', async () => {
   const base = { chatId: 'oc_t', appId: 'app-a', botName: 'b', topicGroup: true, onSaved: vi.fn(async () => undefined) };
   let renderer!: TestRenderer.ReactTestRenderer;

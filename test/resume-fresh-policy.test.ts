@@ -4,8 +4,8 @@
  * Adapters whose buildArgs can only resume a PRECISE cliSessionId (cursor /
  * copilot — no --continue/latest fallback, which would risk loading a
  * SIBLING session's conversation) declare `resumeRequiresCliSessionId`.
- * Kimi / Gemini find their own session from the botmux id instead
- * (`resumeFindsOwnSession`); for them the receipt follows the same
+ * Kimi finds its own session from the botmux id instead
+ * (`resumeFindsOwnSession`); for it the receipt follows the same
  * `checkResumeTargetExists` probe the worker runs. This file covers:
  *
  *   1. `resumeStartsFresh` — the shared predicate upper layers (closed card,
@@ -38,30 +38,22 @@ describe('resumeStartsFresh', () => {
     expect(resumeStartsFresh({ cliId: 'cursor' })).toBe(true);
   });
 
-  it('kimi / gemini find their own session: fresh exactly when the same probe the worker runs finds none', () => {
+  it('kimi finds its own session: fresh exactly when the same probe the worker runs finds none', () => {
     const root = mkdtempSync(join(tmpdir(), 'resume-fresh-'));
-    const prev = { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME, GEMINI_CLI_HOME: process.env.GEMINI_CLI_HOME };
+    const prev = { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME };
     try {
       process.env.KIMI_CODE_HOME = join(root, 'kimi');
-      process.env.GEMINI_CLI_HOME = root;
       const work = join(root, 'work');
       mkdirSync(work, { recursive: true });
       const sid = '4c0a8f9e-1b2d-4e3f-8a5b-6c7d8e9f0a1b';
       // Nothing on disk yet: the receipt must say "starts fresh".
       expect(resumeStartsFresh({ cliId: 'kimi', sessionId: sid, workingDir: work })).toBe(true);
-      expect(resumeStartsFresh({ cliId: 'gemini', sessionId: sid, workingDir: work })).toBe(true);
       // Kimi has the session (its prompt carries the botmux id): history is back.
       const kdir = join(root, 'kimi', 'sessions', 'wd_work_0', 'session_aaaa');
       mkdirSync(join(kdir, 'agents', 'main'), { recursive: true });
       writeFileSync(join(kdir, 'agents', 'main', 'wire.jsonl'), `{"type":"metadata","protocol_version":"1.4"}\n{"content":"<session_id>${sid}</session_id>"}\n`);
       writeFileSync(join(root, 'kimi', 'session_index.jsonl'), JSON.stringify({ sessionId: 'session_aaaa', sessionDir: kdir, workDir: work }) + '\n');
       expect(resumeStartsFresh({ cliId: 'kimi', sessionId: sid, workingDir: work })).toBe(false);
-      // Gemini has a resumable file for it in this project.
-      mkdirSync(join(root, '.gemini', 'tmp', 'work', 'chats'), { recursive: true });
-      writeFileSync(join(root, '.gemini', 'projects.json'), JSON.stringify({ projects: { [work]: 'work' } }));
-      writeFileSync(join(root, '.gemini', 'tmp', 'work', 'chats', `session-x-${sid.slice(0, 8)}.jsonl`),
-        `${JSON.stringify({ sessionId: sid })}\n${JSON.stringify({ id: 'm0', type: 'user', content: [{ text: 'hello' }] })}\n`);
-      expect(resumeStartsFresh({ cliId: 'gemini', sessionId: sid, workingDir: work })).toBe(false);
     } finally {
       for (const [key, value] of Object.entries(prev)) {
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -82,8 +74,8 @@ describe('resumeStartsFresh', () => {
     expect(resumeStartsFresh({ cliId: 'hermes' })).toBe(false);
   });
 
-  it('adapters that ignore resume entirely (gemini) are not flagged', () => {
-    expect(resumeStartsFresh({ cliId: 'gemini' })).toBe(false);
+  it('adapters that ignore resume entirely (mimocode) are not flagged', () => {
+    expect(resumeStartsFresh({ cliId: 'mimocode' })).toBe(false);
   });
 
   it('missing cliId / unknown cliId → false (fail safe, no false "history lost" claim)', () => {

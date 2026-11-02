@@ -460,7 +460,7 @@ setInterval(() => {}, 1000);
       platform: 'darwin',
       invokeStructuredModel,
     })).rejects.toMatchObject({ code: 'UNSUPPORTED_PLATFORM' });
-    await expect(runV3DistillationModel({ fields: FIELDS, botSnapshot: bot('gemini') }, {
+    await expect(runV3DistillationModel({ fields: FIELDS, botSnapshot: bot('opencode') }, {
       scratchParent: dirs.scratchParent,
       platform: 'linux',
       invokeStructuredModel,

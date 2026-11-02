@@ -53,9 +53,9 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     const aiden = CLI_SELECT_TREE.find((g) => g.key === 'aiden');
     expect(aiden?.children?.map((c) => c.key)).toEqual(['aiden', 'aiden-x-claude', 'aiden-x-codex']);
     // an ungrouped top entry is a directly-selectable leaf
-    const gemini = CLI_SELECT_TREE.find((g) => g.key === 'gemini');
-    expect(gemini?.option?.cliId).toBe('gemini');
-    expect(gemini?.children).toBeUndefined();
+    const kimi = CLI_SELECT_TREE.find((g) => g.key === 'kimi');
+    expect(kimi?.option?.cliId).toBe('kimi');
+    expect(kimi?.children).toBeUndefined();
   });
 
   it('cascades Codex into one submenu of Codex + Codex App (no top-level codex-app)', () => {
@@ -159,21 +159,21 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(cjadk?.option).toBeUndefined();
   });
 
-  it('appends the six ttadk gateway options after cjadk', () => {
+  it('appends the five ttadk gateway options after cjadk', () => {
     const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
     expect(keys).toContain('ttadk-x-claude');
     const i = keys.indexOf('ttadk-x-claude');
-    expect(keys.slice(i, i + 6)).toEqual([
-      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor', 'ttadk-x-gemini',
+    expect(keys.slice(i, i + 5)).toEqual([
+      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor',
     ]);
     // ttadk comes after the cjadk block
     expect(keys.indexOf('ttadk-x-claude')).toBeGreaterThan(keys.indexOf('cjadk-x-codex'));
   });
 
-  it('cascades TTADK into a submenu of its six × variants', () => {
+  it('cascades TTADK into a submenu of its five × variants', () => {
     const ttadk = CLI_SELECT_TREE.find((g) => g.key === 'ttadk');
     expect(ttadk?.children?.map((c) => c.key)).toEqual([
-      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor', 'ttadk-x-gemini',
+      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor',
     ]);
     expect(ttadk?.option).toBeUndefined();
   });
@@ -182,7 +182,7 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
 describe('resolveCliSelection', () => {
   it('maps a plain cli key to just its cliId', () => {
     expect(resolveCliSelection('claude-code')).toEqual({ cliId: 'claude-code' });
-    expect(resolveCliSelection('gemini')).toEqual({ cliId: 'gemini' });
+    expect(resolveCliSelection('kimi')).toEqual({ cliId: 'kimi' });
   });
 
   it('maps aiden×claude to claude-code + wrapperCli "aiden x claude"', () => {
@@ -212,7 +212,6 @@ describe('resolveCliSelection', () => {
     expect(resolveCliSelection('ttadk-x-coco')).toEqual({ cliId: 'coco', wrapperCli: 'ttadk coco' });
     // Cursor uses ttadk's `cursor-cli` subcommand but the botmux adapter is still `cursor`.
     expect(resolveCliSelection('ttadk-x-cursor')).toEqual({ cliId: 'cursor', wrapperCli: 'ttadk cursor-cli' });
-    expect(resolveCliSelection('ttadk-x-gemini')).toEqual({ cliId: 'gemini', wrapperCli: 'ttadk gemini' });
   });
 
   it('throws on an unknown key', () => {
@@ -980,7 +979,7 @@ describe('isTtadkWrapper / ttadkAcceptsModel', () => {
   it('reports which ttadk subcommands accept -m', () => {
     expect(ttadkAcceptsModel('ttadk claude')).toBe(true);
     expect(ttadkAcceptsModel('ttadk cursor-cli')).toBe(true);
-    expect(ttadkAcceptsModel('ttadk gemini')).toBe(true);
+    expect(ttadkAcceptsModel('ttadk opencode')).toBe(true);
     expect(ttadkAcceptsModel('ttadk coco')).toBe(false);
     expect(ttadkAcceptsModel('cjadk claude')).toBe(false);
     expect(ttadkAcceptsModel(undefined)).toBe(false);

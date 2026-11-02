@@ -75,7 +75,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(nextBefore).toMatchObject({ phase: 'working', messageId: 'om_reply_2' });
   });
 
-  it.each([['grok', 'gemini', 'unified'], ['gemini', 'grok', 'legacy']] as const)(
+  it.each([['grok', 'opencode', 'unified'], ['opencode', 'grok', 'legacy']] as const)(
     'uses frozen %s rather than stale %s for reply-card admission', (frozen, stale, expected) => {
       const ds = session();
       ds.session.cliId = stale;
@@ -362,7 +362,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('answer');
   });
 
-  it.each(['gemini', 'codex-app', 'hermes'])('leaves %s on its established delivery path', cli => {
+  it.each(['opencode', 'codex-app', 'hermes'])('leaves %s on its established delivery path', cli => {
     const ds = session();
     ds.session.cliId = cli as typeof ds.session.cliId;
     expect(replyCardModeFor(ds)).toBe('legacy');

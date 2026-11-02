@@ -5,7 +5,7 @@ import { delay } from '../../utils/timing.js';
  * 交互式 TUI 适配器共用的输入原语。
  *
  * 之前每个适配器各自抄一份：`BRACKETED_PASTE_START/END` 在 dsh-tui / ebsd-input / kimi /
- * oh-my-pi 各定义一遍，gemini / aiden / copilot / mtr 的 `writeInput` 逐字相同。
+ * oh-my-pi 各定义一遍，aiden / copilot / mtr 的 `writeInput` 逐字相同。
  */
 
 /** xterm bracketed paste 起止序列：TUI 把两者之间的内容当作一次粘贴，不逐键解析。 */
@@ -26,7 +26,7 @@ export function wrapBracketedPaste(content: string): string {
  *   太早的 CR 会被吞）。
  *
  * 不做提交校验、不返回 `submitted` —— 只适用于没有可验证提交信号的 CLI
- * （aiden / copilot / gemini / mtr）。
+ * （aiden / copilot / mtr）。
  */
 export async function writeTextThenEnter(pty: PtyHandle, content: string): Promise<void> {
   if (pty.sendText && pty.sendSpecialKeys) {

@@ -24,7 +24,6 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
   'codex': CODEX_MODEL_CHOICES,
   'codex-app': CODEX_MODEL_CHOICES,
   'cursor': ['auto', 'claude-4-sonnet', 'claude-4-opus', 'gpt-5'],
-  'gemini': ['gemini-2.5-pro', 'gemini-2.5-flash'],
   'genius': ['gpt-5.5'],
   'opencode': [
     'anthropic/claude-sonnet-4',

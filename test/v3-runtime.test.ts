@@ -857,7 +857,7 @@ describe('human-gate 文件等待存储', () => {
 describe('runtime CLI 白名单守卫', () => {
   it('白名单里的 CLI 都通过守卫，未验证 /goal 的 CLI 被拒', () => {
     for (const cliId of V3_SUPPORTED_CLIS) expect(isV3SupportedCli(cliId)).toBe(true);
-    expect(isV3SupportedCli('gemini')).toBe(false);
+    expect(isV3SupportedCli('opencode')).toBe(false);
   });
 
   it('节点 bot 解析到未验证 /goal 的 CLI → run 启动即报错', async () => {
@@ -866,7 +866,7 @@ describe('runtime CLI 白名单守卫', () => {
       const deps: V3RuntimeDeps = {
         runNode: async () => ({ status: 'ok', manifestPath: '' }),
         validateManifest,
-        resolveBotSnapshot: () => ({ larkAppId: 'a', cliId: 'gemini', workingDir: '/tmp' }),
+        resolveBotSnapshot: () => ({ larkAppId: 'a', cliId: 'opencode', workingDir: '/tmp' }),
       };
       await expect(runWorkflow(validateDag(TWO_NODE), deps, { baseDir: base }))
         .rejects.toThrow(/not supported by v3 goal-mode/);
@@ -945,12 +945,12 @@ describe('runtime CLI 白名单守卫', () => {
 
   it('P2-1 守门：freezeDagBotSnapshots 对不在允许列表的 CLI 抛错（闸门真实生效）', () => {
     const dag = validateDag({
-      runId: 'gemini-freeze',
-      nodes: [{ id: 'n', type: 'goal', goal: 'g', bot: 'cli_gemini', depends: [], inputs: [] }],
+      runId: 'opencode-freeze',
+      nodes: [{ id: 'n', type: 'goal', goal: 'g', bot: 'cli_opencode', depends: [], inputs: [] }],
     });
     const bots = [{
-      larkAppId: 'cli_gemini', larkAppSecret: 'secret', cliId: 'gemini',
-      name: 'gem', workingDir: '/tmp',
+      larkAppId: 'cli_opencode', larkAppSecret: 'secret', cliId: 'opencode',
+      name: 'oc', workingDir: '/tmp',
     }] as unknown as Parameters<typeof freezeDagBotSnapshots>[1];
     expect(() => freezeDagBotSnapshots(dag, bots)).toThrow(/unsupported CLI/);
   });

@@ -88,7 +88,7 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 通过 `bots.json` 里的 `cliId` 一键切换。内置 **20+ 适配器**，覆盖本地 CLI（独立进程隔离，`tmux attach` 可直接接入调试）以及 API / 云 Agent：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) …
 
 - **会话级 CLI 切换**：会话尚未启动前，可通过 `/cli <cliId>` 为当前会话临时指定已注册的 CLI。
 - **Codex 多账号与实例池**：同一 Bot 支持通过 [会话级 Codex 实例](docs/codex-instances.md) 配置多登录目录与分配策略。
@@ -112,11 +112,6 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 | 多机器人 | 同群多 bot @mention 路由 | 取决于实现 |
 | 终端直连 | 本地 CLI 可 `tmux attach` 进真进程 | 取决于实现 |
 
-## 进阶集成
-
-- **[可信建群服务的默认免 @](docs/signed-chat-defaults.md)** — 自助建群服务可通过签名绑定为普通群声明默认 `ambient` 免 @ 模式，在保持权限隔离的同时简化群交互。
-- **[模型透明代理模式](docs/model-proxy.md)** — 外部系统（如 [OpenCodeReview](https://github.com/alibaba/open-code-review)）可通过有鉴权的本地 Chat Completions 入口直接复用 CLI 的模型能力，结合 [受约束执行接口](docs/constrained-invocations.md) 实现任务幂等与状态查询。
-
 ## 文档 · 社区 · 贡献
 
 - 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>**
@@ -133,5 +128,3 @@ botmux 或许是目前专为飞书（Feishu/Lark）打造的开源项目中贡�
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
 </a>
-
-<p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>

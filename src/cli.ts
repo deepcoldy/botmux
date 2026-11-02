@@ -88,6 +88,7 @@ import { tmuxEnv } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
+import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
@@ -354,6 +355,7 @@ import {
   mentionedBotAppIds,
   orderedFooterRecipients,
 } from './utils/bot-routing.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
   crossPrincipalAsKeyword,
@@ -544,6 +546,16 @@ function preflightQuotaFallbackTopology(
   console.warn(`   已跳过 ${blocked.size} 个环路 Bot；Dashboard 和其它 Bot 将继续启动。`);
   console.warn('   修复入口: Dashboard → Bot 配置 → 高级 → 额度耗尽交接');
   return blocked;
+}
+
+/** Bots on a removed CLI (gemini) are skipped by the fleet; say why and how to fix. */
+function preflightRetiredClis(bots: any[], action: 'start' | 'restart'): Set<string> {
+  const retired = findRetiredCliBots(bots);
+  if (retired.length > 0) {
+    console.warn(`\n⚠️  daemon ${action} 前自检发现 ${retired.length} 个 Bot 使用已移除的 CLI，已跳过，其它 Bot 照常启动：`);
+    for (const bot of retired) console.warn(`   - ${retiredCliNotice(bot.cliId, bot.label)}`);
+  }
+  return new Set(retired.map(bot => bot.appId));
 }
 
 function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {
@@ -2788,7 +2800,10 @@ async function cmdWatchdog(): Promise<void> {
 /** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
 async function preflightConfiguredBotCredentials() {
   const botsForCheck = loadBotsJson();
-  const blockedBotIds = preflightQuotaFallbackTopology(botsForCheck, 'start');
+  const blockedBotIds = new Set([
+    ...preflightQuotaFallbackTopology(botsForCheck, 'start'),
+    ...preflightRetiredClis(botsForCheck, 'start'),
+  ]);
   if (botsForCheck.length > 0) {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
     const invalid: Array<{ appId: string; reason: string }> = [];
@@ -2871,11 +2886,13 @@ async function startConfiguredFleet(
   });
   const bots = loadBotsJson();
   const blockedCount = new Set(findQuotaFallbackCycles(bots).flat()).size;
-  const count = Math.max(0, bots.length - blockedCount);
+  const retiredCount = findRetiredCliBots(bots).length;
+  const count = Math.max(0, bots.length - blockedCount - retiredCount);
   console.log(count === 0
     ? '\n✅ Dashboard 已启动 (0 个 Bot daemon)'
     : `\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
   if (blockedCount > 0) console.log(`   已跳过 ${blockedCount} 个额度交接环路 Bot，请在 Dashboard 修复后重启`);
+  if (retiredCount > 0) console.log(`   已跳过 ${retiredCount} 个使用已移除 CLI 的 Bot，改好 cliId 后重启`);
   console.log(`   日志: botmux logs`);
   console.log(`   状态: botmux status`);
   // If the user previously enabled autostart, sync the unit file in case the
@@ -3004,7 +3021,9 @@ async function cmdRestart(): Promise<void> {
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     // Report recovery guidance before any live-fleet mutation. The locked
     // check below repeats against the exact generation used for restart.
-    preflightQuotaFallbackTopology(loadBotsJson(), 'restart');
+    const botsBeforeRestart = loadBotsJson();
+    preflightQuotaFallbackTopology(botsBeforeRestart, 'restart');
+    preflightRetiredClis(botsBeforeRestart, 'restart');
     const includePluginServices = process.argv.includes('--with-plugin');
 
     const restartIntentDir = resolveDataDir();
@@ -7543,6 +7562,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                          按精确工作区发现、回收会话并读取资源验证结果
   execution current --json
               只读核验当前进程所属的 bot/session/turn、执行尝试和 Worker 代次
+  execution background [--ttl-seconds <秒>] -- <命令> [参数...]
+              在已验证定时轮次登记并启动后台任务，返回任务 ID、PID 与日志位置
+  execution background-revoke <任务ID> --json
+              撤销本会话原执行人启动的后台任务凭据登记
   auth request [--scope "<scope1 scope2,...>"] [--json]
               为本轮发起人生成飞书授权链接，返回 JSON；由 Agent 将链接发给用户
   auth wait --request-id <id> [--json]
@@ -7721,10 +7744,10 @@ ${SEND_HELP_BODY}
                                        默认 team 级角色，--from-chat 取某群角色内容；
                                        缺省写 ./<name或appid>.botmux-preset.json，--out - 走 stdout
 
-botmux skills 注入方式（仅影响 codex/gemini/opencode 等只支持全局 skills 目录的 CLI）:
+botmux skills 注入方式（仅影响 codex/opencode 等只支持全局 skills 目录的 CLI）:
   skills injection [global|prompt|off]  查看/设置机器级默认（无参=查看）
        prompt（默认）  不落全局盘，把技能目录注入进会话 prompt，按需 \`botmux skill show\`——
-                       不会泄漏到你手动跑的 codex/gemini
+                       不会泄漏到你手动跑的 codex/opencode
        global          装进 CLI 全局 skills 目录（体验原生，但独立 CLI 也会看到）
        off             只留路由提示 + \`botmux --help\`，让模型自行摸索
   （per-bot 可在 bots.json 用 "skillInjection" 字段覆盖机器级默认）
@@ -15962,8 +15985,9 @@ botmux grant chat — 给目标 Bot 增删/查询精确群对话授权（不授�
     let botInfo: Array<{ larkAppId: string; botName: string | null }> = [];
     try {
       if (existsSync(botInfoPath)) {
-        const raw = JSON.parse(readFileSync(botInfoPath, 'utf8'));
-        if (Array.isArray(raw)) botInfo = raw;
+        botInfo = botsInfoObjectEntries(JSON.parse(readFileSync(botInfoPath, 'utf8')))
+          .filter(isBotsInfoRouteEntry)
+          .map(entry => ({ larkAppId: entry.larkAppId, botName: entry.botName ?? null }));
       }
     } catch { /* invalid bots-info is equivalent to no display-name hints */ }
 
@@ -16138,7 +16162,18 @@ botmux create-group — 用一组机器人新建飞书群
   const botInfoPath = join(dataDir, 'bots-info.json');
   type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
   let botInfoEntries: BotInfoEntry[] = [];
-  try { if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
+  try {
+    if (existsSync(botInfoPath)) {
+      botInfoEntries = botsInfoObjectEntries(JSON.parse(readFileSync(botInfoPath, 'utf-8')))
+        .filter(isBotsInfoRouteEntry)
+        .map(entry => ({
+          larkAppId: entry.larkAppId,
+          botOpenId: typeof entry.botOpenId === 'string' ? entry.botOpenId : null,
+          botName: entry.botName ?? null,
+          cliId: typeof entry.cliId === 'string' ? entry.cliId : '',
+        }));
+    }
+  } catch { /* */ }
 
   const {
     resolveBotRefs,
@@ -18393,6 +18428,10 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
   else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
   else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
+  else if (__entrySubcommand === 'background-execution-runner') {
+    await import('./background-execution-runner.js');
+    process.exit(process.exitCode ?? 0);
+  }
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the
@@ -19471,6 +19510,21 @@ switch (command) {
     break;
   }
   case 'execution': {
+    const { parseBackgroundExecutionArgs, launchBackgroundExecution, revokeBackgroundExecution } = await import('./cli/background-execution.js');
+    const background = parseBackgroundExecutionArgs(process.argv.slice(3));
+    if (background) {
+      try {
+        const { resolveBotmuxAncestorContext } = await import('./cli/current-actor.js');
+        const context = resolveBotmuxAncestorContext();
+        const result = background.kind === 'launch' ? await launchBackgroundExecution(context, background)
+          : (await revokeBackgroundExecution(context, background.jobId), { ok: true });
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } catch {
+        process.stdout.write(`${JSON.stringify({ ok: false, error: 'background_execution_unverified' })}\n`);
+        process.exitCode = 2;
+      }
+      break;
+    }
     const { CURRENT_EXECUTION_SCHEMA, parseCurrentExecutionArgs, resolveCurrentExecution } = await import('./cli/current-execution.js');
     if (!parseCurrentExecutionArgs(process.argv.slice(3))) {
       console.error('用法: botmux execution current --json');

@@ -134,7 +134,7 @@ describe('absent unless proven', () => {
       snapshot: { context: { usedTokens: 900 }, tokens: TOKENS, turnTokens: null },
     });
 
-    const row = composeRowFromActive(activeSession('gemini'));
+    const row = composeRowFromActive(activeSession('opencode'));
     expect('contextUsage' in row).toBe(false);
     expect(row.tokenUsage).toEqual(TOKENS);
   });

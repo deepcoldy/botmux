@@ -657,6 +657,10 @@ export interface Session {
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
+  /** One failure notice per logical turn whose ordinary recovery ended failed:
+   * durable delivery state (retried until Feishu accepts it, never re-sent once
+   * delivered) plus the material for the card's retry button. Bounded. */
+  ordinaryRecoveryNotices?: import('./services/ordinary-recovery-notice.js').OrdinaryRecoveryNoticeRecord[];
   /**
    * Bounded, crash-recoverable proof that a durable-primary Inbox message
    * crossed the Remote Runner provider submission boundary. The turn id is the
@@ -755,6 +759,11 @@ export interface Session {
    *  a bot's own output. */
   lastHumanMessageAt?: string;
   closedAt?: string;
+  /** Owning-daemon automatic scratch cleanup, tied to this exact close. It
+   * preserves existing registered jobs, never permission to admit a new turn. */
+  backgroundExecutionCleanupClosedAt?: string;
+  /** Explicit close invalidates registrations across a later session resume. */
+  backgroundExecutionEpoch?: number;
   /** Permanent retirement after successful workspace reclamation. Written with
    * the closed row; generic resume must never reuse this conversation's cwd. */
   workspaceRetirement?: {

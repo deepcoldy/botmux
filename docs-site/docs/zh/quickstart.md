@@ -16,7 +16,7 @@ botmux 是**自包含单文件二进制**，运行时已嵌在里面——**装�
 
 > 📦 **也可以走 npm**（`npm install -g botmux`，需 Node ≥ 22 才能执行安装本身）：npm 包内带的是**同一个自包含二进制**（实测与 GitHub Release 资产 SHA-256 逐字节相同，按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。区别只在**谁来装**：npm 路径需要 Node，curl 路径全程不碰 Node；**无论当初怎么装，升级都重跑 curl**（v3.18.0 之前的老版本用 npm 跨形态升级会让 daemon 起不回来，见 [FAQ · 怎么升级？](/faq#怎么升级)）。跑起来之后两者完全一致。
 
-跑 botmux 本身不需要 Node，但**本地要装好并登录至少一种 AI 编程 CLI**（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` 等，它们各自的运行时要求另算）。**默认会话后端是 tmux（≥3.x），需装好**——不可用时会硬拦截弹卡、不再自动降级 pty；确需无 tmux 环境才用 `BACKEND_TYPE=pty` 或 per-bot `backendType`（`pty`/`herdr`/`zellij`）等显式后端（riff 是云 Agent，不占本地后端）。
+跑 botmux 本身不需要 Node，但**本地要装好并登录至少一种 AI 编程 CLI**（`claude` / `codex` / `cursor-agent` / `opencode` / `coco` / `agy` 等，它们各自的运行时要求另算）。**默认会话后端是 tmux（≥3.x），需装好**——不可用时会硬拦截弹卡、不再自动降级 pty；确需无 tmux 环境才用 `BACKEND_TYPE=pty` 或 per-bot `backendType`（`pty`/`herdr`/`zellij`）等显式后端（riff 是云 Agent，不占本地后端）。
 
 ## Step 2 · 配置（`botmux setup`）
 
@@ -67,7 +67,6 @@ DIAG='botmux 在飞书群收不到消息，请只读排查（别改任何东西�
 ```bash
 claude -p "$DIAG" --allowedTools "Bash"   # Claude Code
 codex exec "$DIAG"                         # Codex
-gemini -p "$DIAG" --yolo                   # Gemini
 coco  -p "$DIAG" --yolo                    # Trae / CoCo（别名 trae-agent / ta）
 cursor-agent -p "$DIAG"                    # Cursor
 ```

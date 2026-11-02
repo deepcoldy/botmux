@@ -26,8 +26,8 @@ import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
+import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { buildPiArgs, createPiAdapter } from '../src/adapters/cli/pi.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
@@ -360,8 +360,8 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_other/send-cred.json').access).toBe('deny');
   });
 
-  it('gemini keeps its whole state dir writable: settings, folder trust (tmp + rename) and OAuth', () => {
-    const adapter = createGeminiAdapter('/usr/bin/gemini');
+  it('antigravity keeps the whole ~/.gemini writable: its OAuth token, submit log, transcripts and config', () => {
+    const adapter = createAntigravityAdapter('/usr/bin/agy');
     const p = buildFsPolicy(ctx({
       platform: 'linux',
       homeDir: '/home/u',
@@ -373,11 +373,11 @@ describe('buildFsPolicy', () => {
       authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
     }));
     for (const path of [
-      '/home/u/.gemini/settings.json',
-      '/home/u/.gemini/trustedFolders.json',
-      '/home/u/.gemini/trustedFolders.json.tmp.0b5c',
-      '/home/u/.gemini/oauth_creds.json',
-      '/home/u/.gemini/tmp/proj/chats/session.json',
+      '/home/u/.gemini/antigravity-cli/antigravity-oauth-token',
+      '/home/u/.gemini/antigravity-cli/history.jsonl',
+      '/home/u/.gemini/antigravity-cli/brain/conv/.system_generated/logs/transcript_full.jsonl',
+      '/home/u/.gemini/antigravity-cli/settings.json',
+      '/home/u/.gemini/config/hooks.json',
     ]) {
       expect(accessForPath(p.rules, path).access).toBe('readWrite');
     }

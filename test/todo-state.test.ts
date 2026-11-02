@@ -187,7 +187,7 @@ describe('parseOpenTodos (Claude Task* incremental replay)', () => {
 
 describe('readSessionOpenTodos (unsupported CLIs)', () => {
   it('returns null for CLIs without a todo dialect, without touching disk', () => {
-    expect(readSessionOpenTodos({ cliId: 'gemini', sessionId: 's1', cwd: '/tmp' })).toBeNull();
+    expect(readSessionOpenTodos({ cliId: 'opencode', sessionId: 's1', cwd: '/tmp' })).toBeNull();
     expect(readSessionOpenTodos({ cliId: 'unknown', sessionId: 's1', cwd: '/tmp' })).toBeNull();
     expect(readSessionOpenTodos({ cliId: undefined, sessionId: 's1', cwd: '/tmp' })).toBeNull();
   });

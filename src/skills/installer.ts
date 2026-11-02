@@ -224,7 +224,7 @@ export function ensureChatManagerSkill(cliId: string, skillsDir: string | undefi
  * directory. Idempotent — only writes when content differs.
  *
  * Each skill becomes {skillsDir}/<name>/SKILL.md. Sub-directory layout
- * matches Claude Code / Gemini / OpenCode convention. Retired skills (renamed
+ * matches Claude Code / OpenCode convention. Retired skills (renamed
  * or removed in a later version) are deleted from the directory so the CLI
  * doesn't keep surfacing stale entries alongside their replacements.
  */

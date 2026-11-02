@@ -87,7 +87,7 @@ describe('handleFederationApi', () => {
 
     // sync updates bots
     res = makeRes();
-    await call(makeReq('POST', '/api/federation/sync', { syncToken, bots: [{ larkAppId: 'cli_b1', botName: 'B1', cliId: 'codex' }, { larkAppId: 'cli_b2', botName: 'B2', cliId: 'gemini' }] }), res, '/api/federation/sync');
+    await call(makeReq('POST', '/api/federation/sync', { syncToken, bots: [{ larkAppId: 'cli_b1', botName: 'B1', cliId: 'codex' }, { larkAppId: 'cli_b2', botName: 'B2', cliId: 'opencode' }] }), res, '/api/federation/sync');
     expect(res.statusCode).toBe(200);
 
     // roster reflects hub local + B's two bots (token in Authorization header)

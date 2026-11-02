@@ -1001,7 +1001,7 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
         <b><OverflowText text={name} showPopover={false} textClassName="bd-roster-name" /></b>
         <span>{cli || bot.larkAppId.slice(0, 14)}</span>
       </div>
-      {bot.startupBlocked?.reason === 'quota_fallback_cycle'
+      {bot.startupBlocked
         ? <span className="bd-roster-flag bd-roster-flag-blocked">{tr('botDefaults.startupBlockedBadge')}</span>
         : bot.online === false ? <span className="bd-roster-flag">{tr('botDefaults.offlineBadge')}</span>
         : bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
@@ -1085,8 +1085,8 @@ function BotDefaultsCard(props: {
               patchBot={patchBot}
               meta={(
                 <>
-                  {bot.startupBlocked?.reason === 'quota_fallback_cycle'
-                    ? <small className="bd-meta-blocked">● {tr('botDefaults.metaStartupBlocked')}</small>
+                  {bot.startupBlocked
+                    ? <small className="bd-meta-blocked">● {tr(bot.startupBlocked.reason === 'retired_cli' ? 'botDefaults.metaRetiredCli' : 'botDefaults.metaStartupBlocked')}</small>
                     : bot.online === false ? <small>● {tr('botDefaults.metaOffline')}</small>
                     : <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>}
                   {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
@@ -1103,6 +1103,11 @@ function BotDefaultsCard(props: {
         <div className="bd-startup-blocked" role="alert" data-startup-blocked>
           <strong>{tr('botDefaults.startupBlockedTitle')}</strong>
           <span>{tr('botDefaults.startupBlockedHelp', { cycle: bot.startupBlocked.cycle.join(' → ') })}</span>
+        </div>
+      ) : bot.startupBlocked?.reason === 'retired_cli' ? (
+        <div className="bd-startup-blocked" role="alert" data-startup-blocked>
+          <strong>{tr('botDefaults.retiredCliTitle', { cliId: bot.startupBlocked.cliId })}</strong>
+          <span>{tr('botDefaults.retiredCliHelp', { cliId: bot.startupBlocked.cliId, replacement: bot.startupBlocked.replacement })}</span>
         </div>
       ) : null}
       {props.linkedAgent ? (

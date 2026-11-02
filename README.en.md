@@ -90,7 +90,7 @@ Designed for multi-agent dispatch pipelines (lead-bot delegating tasks to sub-bo
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents:
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) …
 
 - **Session-level CLI Selection**: Select a registered CLI for an upcoming session with `/cli <cliId>`.
 - **Codex Multi-Account & Instances**: Configure multiple login homes and distribution strategies via [Session-level Codex Instances](docs/codex-instances.md).
@@ -114,11 +114,6 @@ The table below compares only **verifiable integration boundaries** — it does 
 | Multi-bot | Multi-bot @mention routing in one group | Depends on the implementation |
 | Direct terminal | Local CLIs can `tmux attach` into the real process | Depends on the implementation |
 
-## Advanced Integrations
-
-- **[Signed Chat Defaults](docs/signed-chat-defaults.md)** — Automated chat provisioning services can declare default `ambient` (mention-free) modes for standard groups via signed bindings.
-- **[Model Proxy Mode](docs/model-proxy.md)** — External applications (such as [OpenCodeReview](https://github.com/alibaba/open-code-review)) can access CLI model capabilities through an authenticated local Chat Completions endpoint, backed by [constrained invocation interfaces](docs/constrained-invocations.md).
-
 ## Docs · Community · Contributing
 
 - 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>**
@@ -135,5 +130,3 @@ botmux may well be the most-contributed-to open-source project built specificall
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
 </a>
-
-<p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>

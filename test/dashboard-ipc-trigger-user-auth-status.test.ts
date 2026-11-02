@@ -13,7 +13,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { __setLarkCliHomeRootForTest, larkCliHomeFor } from '../src/services/lark-cli-auth.js';
 
@@ -122,6 +122,28 @@ describe('GET /api/bot-trigger-user-auth-status', () => {
     expect(packed).not.toContain(REFRESH);
     expect(packed).not.toContain(ENC);
     expect(packed).not.toContain(SECRET);
+  });
+
+  it('reports the token store as protected only under the allowlist sandbox, not scratch', async () => {
+    const cfg = getBot(APP).config as { sandbox?: unknown; readIsolation?: unknown };
+    const prevSandbox = cfg.sandbox;
+    const prevEnv = process.env.BOTMUX_SANDBOX;
+    delete process.env.BOTMUX_SANDBOX;
+    const enforcedFor = async (sandbox: unknown) => {
+      cfg.sandbox = sandbox;
+      const body = await (await fetch(base())).json();
+      return { enforced: body.tokenStoreEnforced, advised: typeof body.tokenStoreAdvisory === 'string' };
+    };
+    try {
+      expect(await enforcedFor('oncall')).toEqual({ enforced: true, advised: false });
+      expect(await enforcedFor(true)).toEqual({ enforced: true, advised: false });
+      expect(await enforcedFor('scratch')).toEqual({ enforced: false, advised: true });
+      expect(await enforcedFor(undefined)).toEqual({ enforced: false, advised: true });
+    } finally {
+      cfg.sandbox = prevSandbox;
+      if (prevEnv === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevEnv;
+    }
   });
 
   it('does not borrow another person\'s authorization', async () => {

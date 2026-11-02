@@ -602,7 +602,7 @@ describe('Saved Workflow application service', () => {
       ref: created.metadata.workflowId,
       context: context(),
       rawParams: { city: { kind: 'string', value: '北京' } },
-      bots: [bot('gemini')],
+      bots: [bot('opencode')],
       baseDir: runsDir,
       runId: 'unsupported-cli-run',
     })).rejects.toThrow(/unsupported CLI/);

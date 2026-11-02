@@ -19,7 +19,7 @@
  *   message in the input box. Submit is verified via CoCo's platform-specific
  *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
- * - Other adapters (Aiden/Gemini): use plain sendText + Enter
+ * - Other adapters (Aiden/Genius/MTR): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
  *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
  * - Hermes: single pasteText with the whole content + delayed Enter. Its
@@ -78,7 +78,6 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
@@ -215,7 +214,7 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, Genius, MTR. (Codex moved to PASTE_BUFFER_ADAPTERS; its
+ *  Genius, MTR. (Codex moved to PASTE_BUFFER_ADAPTERS; its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
  *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.
  *  Hermes moved to PASTE_BUFFER_ADAPTERS too: on a cold start its prompt_toolkit
@@ -224,7 +223,6 @@ type AdapterEntry = [string, CliAdapter];
  *  newline, stranding the opening prompt until a manual Enter.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
-  ['gemini', createGeminiAdapter('/bin/gemini')],
   ['genius', createGeniusAdapter('/bin/genius')],
   ['mtr', createMtrAdapter('/bin/mtr')],
 ];
@@ -351,7 +349,7 @@ describe('writeInput: single-line, non-tmux mode', () => {
 //    - CLAUDE_CODE / CoCo / Codex / Kimi / Pi / Hermes: bracketed paste
 //      (pasteText) with the whole string — the embedded \n stay content, only
 //      the trailing Enter submits.
-//    - PLAIN adapters (Aiden/Gemini/MTR): sendText with the
+//    - PLAIN adapters (Aiden/Genius/MTR): sendText with the
 //      whole string (including \n) — those CLIs treat literal LF as a newline,
 //      not a submit, so only the trailing Enter submits.
 //    - OpenCode: pasteText for multiline/large prompts so its TUI receives

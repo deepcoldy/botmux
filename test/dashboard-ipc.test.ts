@@ -6885,7 +6885,7 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
   });
 
   it('400s any override on a CLI without the per-turn model contract', async () => {
-    await withServer('gemini', undefined, async base => {
+    await withServer('opencode', undefined, async base => {
       const res = await create(base, { model: 'gpt-5.6-sol' });
       expect(res.status).toBe(400);
       expect((await res.json()).field).toBe('model');
@@ -6929,7 +6929,7 @@ describe('POST/PATCH /api/schedules — local work calendar', () => {
       process.env.BOTMUX_SCHEDULE_TIMEZONE = 'Asia/Shanghai';
       scheduleStore.setScheduleScope(app);
       setLarkAppId(app);
-      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'gemini', apiOnly: true });
+      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'opencode', apiOnly: true });
       const { workCalendarPath } = await import('../src/services/work-calendar.js');
       const fixture = JSON.parse(readFileSync(new URL('./fixtures/work-calendar/demo.json', import.meta.url), 'utf8'));
       mkdirSync(join(dir, 'bots', app), { recursive: true });
@@ -12668,7 +12668,7 @@ describe('group default model configuration', () => {
       expect(chats.chats[0].agentCliId).toBe('codex');
       list.mockRestore();
       const before = readFileSync(configPath, 'utf8');
-      expect((await put({ gemini: 'flash' })).status).toBe(400);
+      expect((await put({ opencode: 'flash' })).status).toBe(400);
       expect((await put(null)).status).toBe(400);
       expect((await put({codex:{model:'gpt-5.5',reasoningEffort:'ultra'}})).status).toBe(400);
       expect(readFileSync(configPath, 'utf8')).toBe(before);
