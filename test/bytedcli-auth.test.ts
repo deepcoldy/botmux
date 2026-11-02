@@ -319,6 +319,9 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
       ['auth', 'login', '--complete', 'tok-1', '--json'],
       ['auth', 'get-bytecloud-jwt-token'],
       ['auth', 'get-codebase-jwt-token'],
+      ['--site', 'i18n-tt', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'i18n-bd', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'us-ttp', 'auth', 'get-bytecloud-jwt-token'],
     ]);
     expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
   });
@@ -369,12 +372,117 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   it('asks bytedcli again on every turn rather than caching', async () => {
     const mod = await fresh();
     authorize(mod, ALICE);
+    const noRegional = [{ code: 1 }, { code: 1 }, { code: 1 }];
     replies = [
-      { code: 0, stdout: 'jwt-1\n' }, { code: 0, stdout: 'code-1\n' },
-      { code: 0, stdout: 'jwt-2\n' }, { code: 0, stdout: 'code-2\n' },
+      { code: 0, stdout: 'jwt-1\n' }, { code: 0, stdout: 'code-1\n' }, ...noRegional,
+      { code: 0, stdout: 'jwt-2\n' }, { code: 0, stdout: 'code-2\n' }, ...noRegional,
     ];
     expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe('jwt-1');
     expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe('jwt-2');
+  });
+});
+
+describe('mintBytedcliJwts — partition-scoped regional tokens', () => {
+  const jwtFor = (region: string, expInSec: number, tag = '') => [
+    Buffer.from('{"alg":"none"}').toString('base64url'),
+    Buffer.from(JSON.stringify({ region, exp: Math.floor(Date.now() / 1000) + expInSec, tag })).toString('base64url'),
+    'sig',
+  ].join('.');
+
+  it('mints one token per region, one at a time, keyed by the region it claims', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    const i18n = jwtFor('i18n', 7200);
+    const tx = jwtFor('tx', 7200);
+    replies = [
+      { code: 0, stdout: 'cloud.jwt\n' }, { code: 0, stdout: 'code.jwt\n' },
+      { code: 0, stdout: `${i18n}\n` }, { code: 1, stderr: 'no access' }, { code: 0, stdout: `${tx}\n` },
+    ];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
+      cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt', regionalCloudJwts: { i18n, tx },
+    });
+    expect(calls.slice(2).map(c => c.args)).toEqual([
+      ['--site', 'i18n-tt', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'i18n-bd', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'us-ttp', 'auth', 'get-bytecloud-jwt-token'],
+    ]);
+    expect(calls.every(c => c.home === mod.bytedcliHomeFor(ALICE))).toBe(true);
+  });
+
+  it('drops a token whose region claim belongs to another partition', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    replies = [
+      { code: 0, stdout: 'cloud.jwt\n' }, { code: 0, stdout: 'code.jwt\n' },
+      { code: 0, stdout: `${jwtFor('i18nbd', 7200)}\n` }, { code: 1 }, { code: 1 },
+    ];
+    expect((await mod.mintBytedcliJwts(ALICE))?.regionalCloudJwts).toBeUndefined();
+  });
+
+  it('reuses a fresh regional token, re-mints one past the reuse window, and forgets on logout', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    const fresh1 = jwtFor('i18n', 45 * 60, 'a');
+    const stale = jwtFor('tx', 20 * 60, 'b');
+    replies = [
+      { code: 0, stdout: 'c1\n' }, { code: 0, stdout: 'k1\n' },
+      { code: 0, stdout: `${fresh1}\n` }, { code: 1 }, { code: 0, stdout: `${stale}\n` },
+    ];
+    await mod.mintBytedcliJwts(ALICE);
+    const tx2 = jwtFor('tx', 7200, 'c');
+    calls.length = 0;
+    replies = [{ code: 0, stdout: 'c2\n' }, { code: 0, stdout: 'k2\n' }, { code: 1 }, { code: 0, stdout: `${tx2}\n` }];
+    expect((await mod.mintBytedcliJwts(ALICE))?.regionalCloudJwts).toEqual({ i18n: fresh1, tx: tx2 });
+    expect(calls.map(c => c.args.slice(0, 2))).toEqual([
+      ['auth', 'get-bytecloud-jwt-token'], ['auth', 'get-codebase-jwt-token'],
+      ['--site', 'i18n-bd'], ['--site', 'us-ttp'],
+    ]);
+    mod.clearBytedcliAuth(ALICE);
+    replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://auth.example.test/relogin', complete_token: 'relogin' }) }];
+    await mod.beginBytedcliLogin(ALICE);
+    authorize(mod, ALICE);
+    replies = [{ code: 0, stdout: envelope({ login_status: 'success' }) }];
+    expect((await mod.completeBytedcliLogin(ALICE, 'relogin')).state).toBe('authorized');
+    calls.length = 0;
+    replies = [{ code: 0, stdout: 'c3\n' }, { code: 0, stdout: 'k3\n' }, { code: 1 }, { code: 1 }, { code: 1 }];
+    expect((await mod.mintBytedcliJwts(ALICE))?.regionalCloudJwts).toBeUndefined();
+    expect(calls).toHaveLength(5);
+  });
+
+  it('renewal force-refreshes the default and every regional token, bypassing the reuse cache', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    const cached = jwtFor('i18n', 7200, 'cached');
+    replies = [
+      { code: 0, stdout: 'c1\n' }, { code: 0, stdout: 'k1\n' },
+      { code: 0, stdout: `${cached}\n` }, { code: 1 }, { code: 1 },
+    ];
+    await mod.mintBytedcliJwts(ALICE);
+    calls.length = 0;
+    const renewed = jwtFor('i18n', 7200, 'renewed');
+    replies = [
+      { code: 0, stdout: 'c2\n' }, { code: 0, stdout: 'k2\n' },
+      { code: 0, stdout: `${renewed}\n` }, { code: 1 }, { code: 1 },
+    ];
+    expect(await mod.renewBytedcliJwts(ALICE)).toEqual({
+      cloudJwt: 'c2', codeJwt: 'k2', regionalCloudJwts: { i18n: renewed },
+    });
+    expect(calls.map(c => c.args)).toEqual([
+      ['auth', 'get-bytecloud-jwt-token', '--force-refresh'],
+      ['auth', 'get-codebase-jwt-token'],
+      ['--site', 'i18n-tt', 'auth', 'get-bytecloud-jwt-token', '--force-refresh'],
+      ['--site', 'i18n-bd', 'auth', 'get-bytecloud-jwt-token', '--force-refresh'],
+      ['--site', 'us-ttp', 'auth', 'get-bytecloud-jwt-token', '--force-refresh'],
+    ]);
+    expect(calls.every(c => c.home === mod.bytedcliHomeFor(ALICE))).toBe(true);
+  });
+
+  it('renewal returns null when the default token cannot be refreshed', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    replies = [{ code: 1, stderr: 'login expired' }];
+    expect(await mod.renewBytedcliJwts(ALICE)).toBeNull();
+    expect(calls).toHaveLength(1);
   });
 });
 
@@ -404,6 +512,9 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
       ['auth', 'login', '--complete', 'tok-1', '--json'],
       ['auth', 'get-bytecloud-jwt-token'],
       ['auth', 'get-codebase-jwt-token'],
+      ['--site', 'i18n-tt', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'i18n-bd', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'us-ttp', 'auth', 'get-bytecloud-jwt-token'],
     ]);
     // Pending leaves the challenge in place so the link stays usable.
     expect(mod.pendingBytedcliChallenge(ALICE)).toBe('tok-1');

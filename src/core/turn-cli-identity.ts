@@ -38,6 +38,7 @@ import {
   clearSessionIdentity,
   type CliIdentity,
 } from './cli-identity.js';
+import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 
 /** What was published for one tool this turn — drives the user-visible notice. */
 export interface ToolIdentityOutcome {
@@ -188,11 +189,13 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     if (platform.state === 'granted') identity = platform.identity;
     else if (source === 'platform') return denyDelegated(tool, args, user);
   }
+  let localMint = false;
   if (!identity && tool === 'bytedcli') {
     // Keep the issuer-scoped credential key; do not copy a source open_id into
     // the target app or duplicate/extend the lifetime of the user's login.
     const jwt = await mintBytedcliJwts(user.credentialOpenId);
-    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
+    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}), ...(jwt.regionalCloudJwts ? { regionalCloudJwts: jwt.regionalCloudJwts } : {}) };
+    localMint = !!jwt;
   } else if (!identity && tool === 'lark-cli') {
     const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
     if (home) identity = { tool, mode: 'user-home', home };
@@ -205,11 +208,18 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     }
   }
   if (!identity) return denyDelegated(tool, args, user);
-  writeSessionIdentity(args.sessionDataDir, args.sessionId, {
+  const stamped = {
     ...identity,
     ...(args.turnId ? { turnId: args.turnId } : {}),
     ...(user.targetOpenId ? { openId: user.targetOpenId } : {}),
-  }, args.storageModel);
+  };
+  writeSessionIdentity(args.sessionDataDir, args.sessionId, stamped, args.storageModel);
+  if (localMint && args.turnId && args.storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+    trackBytedcliIdentityRenewal({
+      sessionDataDir: args.sessionDataDir, sessionId: args.sessionId,
+      credentialOpenId: user.credentialOpenId, identity: { ...stamped, turnId: args.turnId },
+    });
+  }
   return { tool, state: 'user' };
 }
 
@@ -231,12 +241,14 @@ async function publishOne(
   // creator's or the owner's credentials to fill the gap.
   if (!senderOpenId) return await withheld();
 
-  const publish = (identity: CliIdentity): ToolIdentityOutcome => {
-    writeSessionIdentity(sessionDataDir, sessionId, {
-      ...identity,
-      ...(turnId ? { turnId } : {}),
-      openId: senderOpenId,
-    }, storageModel);
+  const publish = (identity: CliIdentity, localMint = false): ToolIdentityOutcome => {
+    const stamped = { ...identity, ...(turnId ? { turnId } : {}), openId: senderOpenId };
+    writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
+    if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+      trackBytedcliIdentityRenewal({
+        sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId },
+      });
+    }
     return { tool, state: 'user' };
   };
 
@@ -256,7 +268,7 @@ async function publishOne(
     if (source === 'platform' || platform.state !== 'unbound') {
       if (source === 'auto') {
         const local = await resolveIdentityFor(tool, botConfig, senderOpenId);
-        if (local) return publish(local);
+        if (local) return publish(local, true);
       }
       return refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform);
     }
@@ -264,7 +276,7 @@ async function publishOne(
 
   const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
   if (!identity) return await withheld();
-  return publish(identity);
+  return publish(identity, true);
 }
 
 /**
@@ -486,5 +498,10 @@ async function resolveIdentityFor(
   // falling back to the machine's own SSO session.
   const jwts = await mintBytedcliJwts(senderOpenId);
   if (!jwts) return null;
-  return { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) };
+  return {
+    tool: 'bytedcli',
+    cloudJwt: jwts.cloudJwt,
+    ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}),
+    ...(jwts.regionalCloudJwts ? { regionalCloudJwts: jwts.regionalCloudJwts } : {}),
+  };
 }

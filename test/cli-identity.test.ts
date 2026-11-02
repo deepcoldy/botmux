@@ -734,6 +734,80 @@ describe('renderIdentityWrapper', () => {
     expect(output.trim()).toBe('authorized-human');
   });
 
+  it.each([
+    [[], {}, 'cn-tok'],
+    [['--site', 'i18n-tt', 'auth', 'userinfo'], {}, 'i18n-tok'],
+    [['--json', '--site=eu-ttp', 'x'], {}, 'i18n-tok'],
+    [['--site', 'i18n-bd'], {}, 'bd-tok'],
+    [['--site', 'i18n'], {}, 'bd-tok'],
+    [[], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'bd-tok'],
+    [['x'], { BYTEDCLI_CLOUD_SITE: 'us-ttp-usts' }, 'tx-tok'],
+    [['--site', 'cn'], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'cn-tok'],
+    [['--site', 'boe'], {}, 'cn-tok'],
+    [['--', '--site', 'i18n'], {}, 'cn-tok'],
+  ] as const)('selects the ByteCloud JWT for the call site: %j %j', (args, env, expected) => {
+    const tool = join(dir, 'real-bytedcli.sh');
+    writeFileSync(tool, '#!/bin/sh\nprintf "%s|%s|%s" "$BYTEDCLI_USER_CLOUD_JWT" "$BOTMUX_IDENTITY_CLOUD_JWT_I18N" "$*"\n');
+    chmodSync(tool, 0o755);
+    const wrapperPath = join(dir, 'bytedcli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', tool));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok' },
+    }, 'single');
+    const out = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, [...args]);
+    // The regional variables stay internal; the arguments reach the tool unchanged.
+    expect(out).toBe(`${expected}||${args.join(' ')}`);
+  });
+
+  function bytedcliSiteToken(args: string[], env: Record<string, string> = {}): string {
+    const tool = join(dir, 'site-token.sh');
+    writeFileSync(tool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n');
+    chmodSync(tool, 0o755);
+    const wrapper = join(dir, 'bytedcli');
+    writeFileSync(wrapper, renderIdentityWrapper('bytedcli', tool));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', cloudJwt: 'cn-tok',
+      regionalCloudJwts: { i18n: 'i18n-tok', i18nbd: 'bd-tok', tx: 'tx-tok' },
+    }, 'single');
+    return runWrapper(wrapper, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env }, args);
+  }
+
+  // Required layer: bytedcli 0.178 normalized canonical sites and their
+  // bytecloudJwtRegionClaimForCloudSite partitions. The limited/full EU
+  // variants normalize to eu-ttp before that lookup. Keep this external
+  // contract explicit; tests never load the installed CLI's private bundle.
+  const canonicalSiteClaims = [
+    ['cn', 'cn-tok'], ['i18n', 'bd-tok'], ['i18n-bd', 'bd-tok'],
+    ['i18n-tt', 'i18n-tok'], ['eu-ttp', 'i18n-tok'],
+    ['eu-ttp-limited', 'i18n-tok'], ['eu-ttp-full', 'i18n-tok'],
+    ['us-ttp', 'tx-tok'], ['us-ttp-bdee', 'tx-tok'], ['us-ttp-usts', 'tx-tok'],
+  ] as const;
+  it.each(canonicalSiteClaims)('matches the bytedcli 0.178 canonical site partition: %s', (site, token) => {
+    expect(bytedcliSiteToken(['--site', site])).toBe(token);
+    expect(bytedcliSiteToken([`--site=${site}`])).toBe(token);
+    expect(bytedcliSiteToken([], { BYTEDCLI_CLOUD_SITE: site })).toBe(token);
+  });
+
+  // Known-gap layer: alias/case normalization is deliberately deferred to
+  // #2506. That change must flip these assertions to the normalized token.
+  // Ordinary behavior assertions work under both Vitest and Bun 1.4.3;
+  // Bun does not implement it.fails.
+  it.each(['row', 'usttp', 'I18N-TT'])('known gap: alias/case %s selects the default JWT (#2506)', site => {
+    expect(bytedcliSiteToken(['--site', site])).toBe('cn-tok');
+  });
+
+  it('keeps the default ByteCloud JWT for a site whose region has no token', () => {
+    const tool = join(dir, 'real-bytedcli.sh');
+    writeFileSync(tool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n');
+    chmodSync(tool, 0o755);
+    const wrapperPath = join(dir, 'bytedcli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', tool));
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cn-tok' }, 'single');
+    expect(runWrapper(wrapperPath, {
+      SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, BOTMUX_IDENTITY_CLOUD_JWT_I18N: 'forged',
+    }, ['--site', 'i18n-tt'])).toBe('cn-tok');
+  });
+
   it('uses refreshed credentials on the next invocation in the same turn', () => {
     const wrapperPath = join(dir, 'lark-cli');
     writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
