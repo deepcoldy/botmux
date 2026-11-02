@@ -397,6 +397,10 @@ function approvalOptions(meta: Json): string {
 function sessionApprovalKey(request: BrowserElicitationRequest): string | undefined {
   const meta = asMeta(request);
   if (meta.codex_approval_kind === 'browser_auth') return undefined;
+  // Escalated or ambiguous origin requests must reach a fresh human decision,
+  // including while another origin approval is pending. Do not collapse two
+  // risk fields or sensitive markers into the ordinary session cache key.
+  if (meta.tool_name === 'access_browser_origin' && !isOrdinaryBrowserOriginRequest(meta)) return undefined;
 
   const persist = Array.isArray(meta.persist) ? meta.persist : [meta.persist];
   if (!persist.includes('session') && !persist.includes('always')) return undefined;
@@ -420,8 +424,10 @@ function sessionApprovalKey(request: BrowserElicitationRequest): string | undefi
 function isOrdinaryBrowserOriginRequest(meta: Json): boolean {
   if (meta.codex_approval_kind !== 'mcp_tool_call' || meta.connector_id !== 'browser-use'
     || meta.tool_name !== 'access_browser_origin' || typeof meta.origin !== 'string'
-    || meta.file_transfer !== undefined || meta.full_cdp_access !== undefined
-    || meta.sensitive_data !== undefined || meta.risk_level === 'high' || meta.riskLevel === 'high') return false;
+    || [meta.file_transfer, meta.fileTransfer, meta.full_cdp_access, meta.fullCdpAccess,
+      meta.sensitive_data, meta.sensitiveData].some(value => value !== undefined)
+    || [meta.risk_level, meta.riskLevel].some(value => value !== undefined
+      && value !== 'low' && value !== 'medium')) return false;
   try {
     const origin = new URL(meta.origin);
     return (origin.protocol === 'http:' || origin.protocol === 'https:')
@@ -1166,6 +1172,8 @@ export class CodexBrowserBroker {
     if (this.opts.autoApproveOrigins === true && isOrdinaryBrowserOriginRequest(meta)) {
       // A bot configuration is the operator's delegation, not an interactive
       // human click. Never request an "always" browser-plugin grant.
+      process.stderr.write(`[codex-browser] ${JSON.stringify({ event: 'origin_auto_approved',
+        sessionId: this.opts.sessionId, origin: meta.origin, persist: 'session' })}\n`);
       return { action: 'accept', meta: { approval_channel: 'bot-config',
         approval_scope: 'browser-origin', persist: 'session' } };
     }
