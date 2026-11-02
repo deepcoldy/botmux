@@ -31,6 +31,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import type { Locale } from '../i18n/index.js';
 import { escapeXmlText } from '../utils/xml.js';
 import { isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from '../global-config.js';
+import { isWorkflowSubagentEnv } from '../workflows/subagent-env.js';
 import {
   BUILTIN_SKILLS,
   WORKFLOW_FEATURE_SKILLS,
@@ -60,12 +61,27 @@ function catalogBuiltinSkills(multiTopicEnabled: boolean): typeof BUILTIN_SKILLS
     : BUILTIN_SKILLS.filter(skill => skill.name !== 'botmux-orchestrate');
 }
 
+const GOAL_ASK_SKILL_NAME = 'botmux-goal-ask';
+
 /** Everything `botmux skill show` may resolve: the catalog plus, while the
- *  machine-wide workflow switch is ON, the on-demand v3 Workflow family. A
- *  disabled host can't pull a workflow skill at all. */
-function showableBuiltinSkills(workflowEnabled: boolean, multiTopicEnabled: boolean): typeof BUILTIN_SKILLS {
+ *  machine-wide workflow switch is ON, the on-demand v3 Workflow skills for
+ *  this kind of session. A disabled host can't pull a workflow skill at all.
+ *
+ *  - Ordinary session (may become a workflow's main bot): the orchestration
+ *    skills (`botmux-workflow`, the v2 `botmux-workflow-create` helper), never
+ *    the goal-worker ask protocol.
+ *  - Workflow sub-session (goal worker / Architect): only `botmux-goal-ask`,
+ *    the one workflow skill a node needs; no orchestration skills. */
+function showableBuiltinSkills(
+  workflowEnabled: boolean,
+  multiTopicEnabled: boolean,
+  subagent: boolean,
+): typeof BUILTIN_SKILLS {
   const catalog = catalogBuiltinSkills(multiTopicEnabled);
-  return workflowEnabled ? [...catalog, ...WORKFLOW_FEATURE_SKILLS] : catalog;
+  if (!workflowEnabled) return catalog;
+  const forSession = WORKFLOW_FEATURE_SKILLS.filter((skill) =>
+    subagent ? skill.name === GOAL_ASK_SKILL_NAME : skill.name !== GOAL_ASK_SKILL_NAME);
+  return [...catalog, ...forSession];
 }
 
 export type SkillInjectionMode = 'global' | 'prompt' | 'off';
@@ -234,7 +250,7 @@ export function builtinSkillContent(
   env: Record<string, string | undefined> = process.env,
 ): string | undefined {
   const all = [
-    ...showableBuiltinSkills(isWorkflowFeatureEnabled(), isMultiTopicOrchestrationEnabled(env)),
+    ...showableBuiltinSkills(isWorkflowFeatureEnabled(), isMultiTopicOrchestrationEnabled(env), isWorkflowSubagentEnv(env)),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },
     { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
     { name: CHAT_MANAGER_SKILL_NAME, content: CHAT_MANAGER_SKILL },

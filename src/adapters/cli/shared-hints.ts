@@ -15,6 +15,7 @@
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
+import { isWorkflowSubagentEnv } from '../../workflows/subagent-env.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
@@ -49,9 +50,11 @@ function workflowDiscoveryHintText(locale?: Locale): string {
 
 /** Keep Workflow discoverable even when the full skill catalog is not injected.
  *  Gated by the machine-wide workflow switch (isWorkflowFeatureEnabled) so a
- *  disabled host never advertises `/workflow`; returns undefined when off. */
+ *  disabled host never advertises `/workflow`; returns undefined when off.
+ *  A workflow sub-session (goal worker / Architect) is executing one step of a
+ *  workflow and must not be told to offer starting one, so it never gets it. */
 function workflowDiscoveryHint(locale?: Locale): string | undefined {
-  if (!isWorkflowFeatureEnabled()) return undefined;
+  if (!isWorkflowFeatureEnabled() || isWorkflowSubagentEnv()) return undefined;
   return workflowDiscoveryHintText(locale);
 }
 

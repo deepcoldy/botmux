@@ -60,11 +60,37 @@ describe('workflow feature gate — prompt skill catalog (builtinSkillEntries)',
 });
 
 describe('workflow feature gate — botmux skill show content resolution', () => {
-  it('resolves workflow skill bodies only while the feature is enabled', () => {
+  const ORCHESTRATION = ['botmux-workflow', 'botmux-workflow-create'];
+  const NODE_ONLY = ['botmux-goal-ask'];
+
+  it('an ordinary session can show the orchestration skills but not the goal-worker ask protocol', () => {
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    try {
+      for (const name of ORCHESTRATION) expect(builtinSkillContent(name, {})).toContain(`name: ${name}`);
+      for (const name of NODE_ONLY) expect(builtinSkillContent(name, {})).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
+  });
+
+  it('a workflow sub-session (goal worker / Architect) can show only botmux-goal-ask', () => {
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    try {
+      for (const env of [{ BOTMUX_V3_GOAL: '1' }, { BOTMUX_WORKFLOW: '1' }]) {
+        for (const name of NODE_ONLY) expect(builtinSkillContent(name, env)).toContain(`name: ${name}`);
+        for (const name of ORCHESTRATION) expect(builtinSkillContent(name, env)).toBeUndefined();
+        // ordinary built-ins are unaffected
+        expect(builtinSkillContent('botmux-send', env)).toContain('name: botmux-send');
+      }
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
+  });
+
+  it('resolves no workflow skill at all while the feature is disabled', () => {
     // The accessor is env-driven here so we do not need a config file on disk.
     process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
     try {
-      for (const name of WF) expect(builtinSkillContent(name)).toContain(`name: ${name}`);
       // A non-gated skill always resolves.
       expect(builtinSkillContent('botmux-orchestrate')).toContain('name: botmux-orchestrate');
     } finally {
@@ -73,7 +99,10 @@ describe('workflow feature gate — botmux skill show content resolution', () =>
 
     process.env.BOTMUX_WORKFLOW_ENABLED = 'false';
     try {
-      for (const name of WF) expect(builtinSkillContent(name)).toBeUndefined();
+      for (const name of WF) {
+        expect(builtinSkillContent(name, {})).toBeUndefined();
+        expect(builtinSkillContent(name, { BOTMUX_V3_GOAL: '1' })).toBeUndefined();
+      }
       // A disabled host must still resolve non-workflow skills.
       expect(builtinSkillContent('botmux-orchestrate')).toContain('name: botmux-orchestrate');
       expect(builtinSkillContent('botmux-send')).toContain('name: botmux-send');
@@ -130,6 +159,25 @@ describe('workflow feature gate — routing Workflow-discovery hint', () => {
       expect(shown).toContain('botmux-workflow');
       for (const name of shown) expect(builtinSkillContent(name)).toContain(`name: ${name}`);
     }
+  });
+
+  it('a workflow sub-session (goal worker / Architect) never gets the discovery hint, even when ON', () => {
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    for (const marker of ['BOTMUX_V3_GOAL', 'BOTMUX_WORKFLOW'] as const) {
+      process.env[marker] = '1';
+      try {
+        expect(buildBotmuxShellHints('zh').some((l) => l.startsWith('Workflow：'))).toBe(false);
+        expect(buildBotmuxShellHints('en').some((l) => l.startsWith('Workflow:'))).toBe(false);
+        expect(buildBotmuxSystemPromptText({ locale: 'zh' })).not.toContain('Workflow：');
+        expect(buildBotmuxSystemPromptText({ locale: 'en' })).not.toContain('Workflow:');
+        // the rest of routing is intact
+        expect(buildBotmuxSystemPromptText({ locale: 'zh' })).toContain('</botmux_routing>');
+      } finally {
+        delete process.env[marker];
+      }
+    }
+    // paired: an ordinary session on the same host still gets it
+    expect(buildBotmuxShellHints('zh').some((l) => l.startsWith('Workflow：'))).toBe(true);
   });
 
   it('injectsSessionContext system routing carries the Workflow line only when ON', () => {
