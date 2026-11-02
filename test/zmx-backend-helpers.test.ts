@@ -14,7 +14,7 @@ vi.mock('node:child_process', () => {
   };
 });
 
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   buildFreshAttachArgs,
   buildZmxLaunchFiles,
@@ -121,6 +121,34 @@ function waitForExit(
 }
 
 describe('zmx env/probe helpers', () => {
+  it.each([false, true])('finds host zmx after stripping an injected CLI PATH (strictEnv=%s)', (strictEnv) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-zmx-path-'));
+    tempDirs.push(root);
+    const hostBin = join(root, 'host');
+    const sessionBin = join(root, 'session');
+    for (const [dir, output] of [[hostBin, 'host-zmx'], [sessionBin, 'session-zmx']]) {
+      mkdirSync(dir);
+      writeFileSync(join(dir, 'zmx'), `#!/bin/sh\nprintf '%s\\n' '${output}'\n`, { mode: 0o755 });
+    }
+    vi.stubEnv('PATH', hostBin);
+    const cliPath = `${sessionBin}:${hostBin}`;
+    const opts = {
+      cwd: root, cols: 80, rows: 24, strictEnv,
+      env: { PATH: cliPath, BOTMUX_SESSION_ID: 'session-secret' },
+      injectEnv: { PATH: cliPath, API_TOKEN: 'payload-secret' },
+    };
+    const env = zmxControlEnv(opts);
+    const result = spawnSync('zmx', ['version'], { env, encoding: 'utf8' });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe('host-zmx');
+    expect(env.PATH?.split(':')).not.toContain(sessionBin);
+    expect(env.API_TOKEN).toBeUndefined();
+    expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+    expect(opts.env.PATH).toBe(cliPath);
+    expect(zmxFreshSessionEnv(opts).PATH).toBe(env.PATH);
+  });
+
   it('records the native socket directory once and preserves it across selection in another environment', () => {
     execFileSyncMock.mockReturnValue('zmx\t\t0.7.1\nsocket_dir\t/tmp/created zmx\n' as never);
     const first = selectSessionBackend({
