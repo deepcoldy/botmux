@@ -154,6 +154,11 @@ vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
 }));
 
+const recoveryRetryClickMock = vi.fn(async (..._a: any[]) => ({ toast: { type: 'success', content: 'ok' } }));
+vi.mock('../src/core/ordinary-recovery-retry.js', () => ({
+  handleOrdinaryRecoveryRetryClick: (...a: any[]) => recoveryRetryClickMock(...a),
+}));
+
 // ─── Imports (after mocks) ────────────────────────────────────────────────
 
 import { handleCardAction } from '../src/im/lark/card-handler.js';
@@ -453,5 +458,40 @@ describe('retry_turn — permission gate', () => {
     await handleCardAction(actionData(), depsWith(ds), LARK_APP_ID);
     expect(sendWorkerInputMock).not.toHaveBeenCalled();
     expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('retry_recovery_turn — routing', () => {
+  function recoveryClick(operator: string): any {
+    return {
+      operator: { open_id: operator, union_id: 'on_operator' },
+      action: {
+        value: { action: 'retry_recovery_turn', root_id: ROOT, session_id: SID, logical_turn_id: 'om_A' },
+      },
+      context: { open_message_id: 'om_card' },
+    };
+  }
+
+  it('reaches its own sender-or-admin gate even when the generic operator gate would deny the clicker', async () => {
+    // The original sender is usually a talk-only member of an oncall group:
+    // the generic canOperate card gate must not swallow their click.
+    recoveryRetryClickMock.mockClear();
+    vi.mocked(canOperate).mockReturnValue(false);
+    const ds = makeDs();
+    const res = await handleCardAction(recoveryClick('ou_asker'), depsWith(ds), LARK_APP_ID);
+    expect(recoveryRetryClickMock).toHaveBeenCalledTimes(1);
+    expect(recoveryRetryClickMock).toHaveBeenCalledWith(ds, {
+      logicalTurnId: 'om_A', operatorOpenId: 'ou_asker', operatorUnionId: 'on_operator',
+    });
+    expect(res?.toast?.type).toBe('success');
+    // And it never takes the lastFailedTurn-based retry_turn path.
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+  });
+
+  it('answers a click on a card whose session is gone without dispatching anything', async () => {
+    recoveryRetryClickMock.mockClear();
+    const res = await handleCardAction(recoveryClick('ou_asker'), depsWith(undefined), LARK_APP_ID);
+    expect(res?.toast?.type).toBe('warning');
+    expect(recoveryRetryClickMock).not.toHaveBeenCalled();
   });
 });
