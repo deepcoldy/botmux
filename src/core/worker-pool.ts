@@ -39,7 +39,7 @@ import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../service
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
-import { idleAutoCompactMinutes, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, supportsIdleAutoCompact } from './idle-auto-compact.js';
+import { clearIdleAutoCompactStretch, idleAutoCompactMinutes, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
 import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
@@ -9244,6 +9244,12 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // edge, otherwise a stale stamp could get the new worker TTL-suspended almost
   // immediately after resume.
   ds.idleSinceAt = undefined;
+  // Drop the persisted idle auto-compact stretch too: a message-less cold
+  // resume must not immediately /compact a freshly started CLI reading its
+  // whole context without a warm prompt cache (core/idle-auto-compact.ts).
+  clearIdleAutoCompactStretch(ds.session);
+  ds.idleAutoCompactPendingNotice = undefined;
+  ds.idleAutoCompactDispatchedTurnId = undefined;
   ds.session.webPort = undefined;
   // The daemon already destroyed the exact backing session + CLI and verified
   // it missing before reaching this state. The worker's suspend handler now
@@ -18853,6 +18859,13 @@ function setupWorkerHandlers(
             `[${t}] Auto compact skipped: live empty composer evidence was unavailable `
             + `(turn=${msg.turnId.substring(0, 20)})`,
           );
+        }
+        // Any other non-completed end of our idle auto-compact turn (Ctrl-C,
+        // crash, ambiguous) must not be announced as a successful compact. The
+        // refusal branch above already settled the safe-composer case, so this
+        // is a no-op for it.
+        if (noteIdleAutoCompactTurnEnded(ds, msg.turnId, msg.status)) {
+          try { sessionStore.updateSession(ds.session); } catch { /* next status edge re-saves */ }
         }
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at

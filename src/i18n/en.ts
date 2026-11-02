@@ -88,6 +88,7 @@ export const messages: Record<string, string> = {
   'idle_compact.notice.compacted_unknown': '⏲️ Session idle for {minutes} min: sent /compact automatically while the prompt cache is still warm, so the next cold start is cheaper. Turn off "Idle auto-compact" on the card to stop this.',
   'idle_compact.notice.skipped_small': '⏲️ Session idle for {minutes} min, but the context is only ~{tokens}k tokens (below {min}k); not compacting this time.',
   'idle_compact.notice.refused': "⏲️ Session idle for {minutes} min, but the CLI input box wasn't empty, so auto-compact was skipped this time for safety.",
+  'idle_compact.notice.interrupted': '⏲️ Session idle for {minutes} min, but the automatic /compact was interrupted (cancelled or failed), so nothing was compacted this time.',
   'help.idlecompact': '/idlecompact [on|off|minutes] - Idle auto-compact for this session: send /compact after N idle minutes (default 55, 1–59); no argument shows status (Claude Code / Codex on tmux only)',
   'cmd.idlecompact.status_on': '⏲️ Idle auto-compact: on (/compact after {minutes} idle min; skipped below {min}k context tokens). `/idlecompact off` to turn off.',
   'cmd.idlecompact.status_off': '⏲️ Idle auto-compact: off. `/idlecompact on` to enable (default {minutes} idle min), or `/idlecompact <minutes>` for 1–59 min.',

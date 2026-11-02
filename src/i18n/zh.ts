@@ -91,6 +91,7 @@ export const messages: Record<string, string> = {
   'idle_compact.notice.compacted_unknown': '⏲️ 会话已闲置 {minutes} 分钟，已自动发送 /compact 压缩上下文，趁提示缓存未过期减小下次冷启动的开销。可在卡片上关闭「闲置自动压缩」。',
   'idle_compact.notice.skipped_small': '⏲️ 会话已闲置 {minutes} 分钟，但上下文只有约 {tokens}k tokens（低于 {min}k），本次不自动压缩。',
   'idle_compact.notice.refused': '⏲️ 会话已闲置 {minutes} 分钟，但 CLI 输入框此刻不是空的，为安全起见本次未自动压缩。',
+  'idle_compact.notice.interrupted': '⏲️ 会话已闲置 {minutes} 分钟，但本次自动 /compact 被中断（取消或出错），未执行压缩。',
   'help.idlecompact': '/idlecompact [on|off|分钟] - 本会话闲置自动压缩：闲置 N 分钟（默认 55，1–59）后自动 /compact；不带参数查看状态（仅 Claude Code / tmux 后端 Codex）',
   'cmd.idlecompact.status_on': '⏲️ 闲置自动压缩：开（闲置 {minutes} 分钟后自动 /compact；上下文低于 {min}k tokens 时跳过）。`/idlecompact off` 关闭。',
   'cmd.idlecompact.status_off': '⏲️ 闲置自动压缩：关。`/idlecompact on` 开启（默认闲置 {minutes} 分钟），或 `/idlecompact <分钟>` 指定 1–59 分钟。',

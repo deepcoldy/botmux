@@ -63,7 +63,8 @@ export const IDLE_AUTO_COMPACT_IN_FLIGHT_STALE_MS = 60 * 60_000;
 export const IDLE_AUTO_COMPACT_TURN_PREFIX = 'auto-compact:idle:';
 
 type IdleAutoCompactSessionState = Pick<DaemonSession,
-  'session' | 'lastScreenStatus' | 'idleSinceAt' | 'idleAutoCompactPendingNotice' | 'promptCacheKeepalive'>;
+  'session' | 'lastScreenStatus' | 'idleSinceAt'
+  | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId' | 'promptCacheKeepalive'>;
 
 export function idleAutoCompactMinutes(setting: IdleAutoCompactSetting | undefined): number {
   const minutes = setting?.minutes;
@@ -177,16 +178,22 @@ export function noteIdleAutoCompactScreenStatus(
   const idle = ds.idleSinceAt;
   const finished = liveInFlight(setting, now);
   if (finished) {
-    // Our own /compact just finished: the stretch it opens counts as handled,
-    // and only now does the topic hear that it ran.
+    // Our own /compact just finished: the stretch it opens counts as handled.
     delete setting.inFlight;
     setting.idleSince = idle;
     setting.handledIdleSince = idle;
-    ds.idleAutoCompactPendingNotice = {
-      kind: 'compacted',
-      idleMinutes: finished.idleMinutes,
-      ...(finished.tokens !== undefined ? { tokens: finished.tokens } : {}),
-    };
+    // Only a compact THIS process dispatched may be announced as done. A
+    // marker inherited from a restarted daemon is folded as handled (never
+    // compacted twice) but makes no success claim — we never saw it run.
+    if (ds.idleAutoCompactDispatchedTurnId === finished.turnId) {
+      ds.idleAutoCompactPendingNotice = {
+        kind: 'compacted',
+        turnId: finished.turnId,
+        idleMinutes: finished.idleMinutes,
+        ...(finished.tokens !== undefined ? { tokens: finished.tokens } : {}),
+      };
+      delete ds.idleAutoCompactDispatchedTurnId;
+    }
     return true;
   }
   // A stale marker (or one a different turn already ended) is just dropped.
@@ -219,14 +226,52 @@ export function noteIdleAutoCompactTurnStarted(
  *  The stretch stays handled (no retry loop); the topic is told it was skipped.
  *  Returns true when the caller should save the session row. */
 export function noteIdleAutoCompactRefused(
-  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactPendingNotice'>,
+  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId'>,
   turnId: string,
 ): boolean {
   const setting = ds.session.idleAutoCompact;
   if (setting?.inFlight?.turnId !== turnId) return false;
   ds.idleAutoCompactPendingNotice = { kind: 'refused', idleMinutes: setting.inFlight.idleMinutes };
   delete setting.inFlight;
+  delete ds.idleAutoCompactDispatchedTurnId;
   return true;
+}
+
+/** The compact turn reached a terminal receipt. Anything other than
+ *  `completed` (cancelled / failed / ambiguous — Ctrl-C, a crash, an
+ *  interrupted compact) means the topic must not be told the compact ran:
+ *  the stretch stays handled (no immediate retry) and, when this process
+ *  witnessed the dispatch, an "interrupted" notice is queued. Also retracts a
+ *  `compacted` notice whose finishing edge beat the terminal here but has not
+ *  been posted yet (the two events can race on Ctrl-C/crash). Returns true
+ *  when the caller should save the session row. */
+export function noteIdleAutoCompactTurnEnded(
+  ds: IdleAutoCompactSessionState,
+  turnId: string,
+  status: string,
+): boolean {
+  if (status === 'completed') return false;
+  const setting = ds.session.idleAutoCompact;
+  const witnessed = ds.idleAutoCompactDispatchedTurnId === turnId;
+  let idleMinutes: number | undefined;
+  let changed = false;
+  if (setting?.inFlight?.turnId === turnId) {
+    idleMinutes = setting.inFlight.idleMinutes;
+    delete setting.inFlight;
+    changed = true;
+  }
+  if (witnessed) delete ds.idleAutoCompactDispatchedTurnId;
+  const pending = ds.idleAutoCompactPendingNotice;
+  if (pending?.kind === 'compacted' && pending.turnId === turnId) {
+    // The idle edge announced success first; retract it before the sweep posts.
+    idleMinutes = pending.idleMinutes;
+    ds.idleAutoCompactPendingNotice = { kind: 'interrupted', idleMinutes };
+    return true;
+  }
+  if (changed && witnessed && idleMinutes !== undefined) {
+    ds.idleAutoCompactPendingNotice = { kind: 'interrupted', idleMinutes };
+  }
+  return changed;
 }
 
 /** A prompt-cache keep-alive is being typed into the CLI right now. */
@@ -277,7 +322,38 @@ function decideIdleAutoCompact(
 export type IdleAutoCompactNotice =
   | { kind: 'compacted'; idleMinutes: number; tokens?: number }
   | { kind: 'refused'; idleMinutes: number }
+  | { kind: 'interrupted'; idleMinutes: number }
   | { kind: 'skipped_small'; idleMinutes: number; tokens: number; minTokens: number };
+
+/** A notice parked in memory until the next sweep tick posts it. A
+ *  `compacted` notice carries its compact turnId internally so a non-completed
+ *  turn_terminal that arrives after the finishing idle edge but before the
+ *  notice is flushed can still retract it (the two can race on Ctrl-C/crash). */
+export type IdleAutoCompactPendingNotice = IdleAutoCompactNotice & { turnId?: string };
+
+/** Drop the internal retraction-correlation field before posting. */
+function postedNotice(p: IdleAutoCompactPendingNotice): IdleAutoCompactNotice {
+  if (p.kind === 'skipped_small') {
+    return { kind: 'skipped_small', idleMinutes: p.idleMinutes, tokens: p.tokens, minTokens: p.minTokens };
+  }
+  if (p.kind === 'compacted' && p.tokens !== undefined) {
+    return { kind: 'compacted', idleMinutes: p.idleMinutes, tokens: p.tokens };
+  }
+  return { kind: p.kind, idleMinutes: p.idleMinutes };
+}
+
+/** Forget the persisted idle-stretch mirror and any in-flight marker when the
+ *  live CLI is destroyed (worker suspend): a cold-resumed CLI opens a fresh
+ *  idle edge, and compacting it immediately would read the whole context
+ *  cold — the cost this feature exists to avoid. Returns true when the
+ *  persisted setting changed (the caller saves the row). */
+export function clearIdleAutoCompactStretch(session: { idleAutoCompact?: IdleAutoCompactSetting }): boolean {
+  const setting = session.idleAutoCompact;
+  if (!setting || (setting.idleSince === undefined && !setting.inFlight)) return false;
+  delete setting.idleSince;
+  delete setting.inFlight;
+  return true;
+}
 
 export interface IdleAutoCompactSweepDeps {
   now?: () => number;
@@ -311,7 +387,7 @@ export function runIdleAutoCompactSweep(
       const pending = ds.idleAutoCompactPendingNotice;
       if (pending) {
         ds.idleAutoCompactPendingNotice = undefined;
-        deps.notify(ds, pending);
+        deps.notify(ds, postedNotice(pending));
       }
       if (!deps.supported(ds)) continue;
       const decision = decideIdleAutoCompact(ds, current()!, {
@@ -357,10 +433,15 @@ export function runIdleAutoCompactSweep(
           if (release.inFlight?.turnId === turnId) delete release.inFlight;
           if (previousHandled === undefined) delete release.handledIdleSince;
           else release.handledIdleSince = previousHandled;
+          if (ds.idleAutoCompactDispatchedTurnId === turnId) delete ds.idleAutoCompactDispatchedTurnId;
           deps.persist(ds);
         }
         continue;
       }
+      // This process itself saw the worker accept the compact: only it may
+      // later claim the compact ran. In-memory only, so a restart inherits the
+      // persisted in-flight marker without the success witness.
+      ds.idleAutoCompactDispatchedTurnId = turnId;
       sent += 1;
       deps.log(`[idle-compact] ${id} /compact sent after ${idleMinutes}m idle`
         + (decision.tokens !== undefined ? ` (context ${decision.tokens} tokens)` : ' (context size unknown)'));

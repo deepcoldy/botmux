@@ -29,7 +29,9 @@ import {
   IDLE_AUTO_COMPACT_DEFAULT_MINUTES,
   IDLE_AUTO_COMPACT_TURN_PREFIX,
   applyIdleAutoCompactSetting,
+  clearIdleAutoCompactStretch,
   noteIdleAutoCompactRefused,
+  noteIdleAutoCompactTurnEnded,
   noteIdleAutoCompactTurnStarted,
   parseIdleAutoCompactCommand,
   runIdleAutoCompactSweep,
@@ -365,6 +367,23 @@ describe('idle auto-compact across a daemon restart', () => {
     expect(h.sweepAt([restored], T0 + 85 * MIN)).toBe(1);
   });
 
+  it('a marker inherited across a restart folds silently on the FIRST idle edge', () => {
+    const before = makeDs('eeee1111', { enabled: true });
+    edge(before, 'idle', T0);
+    const h = harness();
+    h.sweepAt([before], T0 + 55 * MIN); // claim + dispatch, then the daemon dies mid-compact
+    edge(before, 'working', T0 + 55 * MIN + 1_000);
+    // Restart: the replacement worker's FIRST observed status is idle and this
+    // process never dispatched the marker, so no success claim may be posted.
+    const restored = restartFrom(before);
+    edge(restored, 'idle', T0 + 58 * MIN);
+    expect(restored.session.idleAutoCompact).toMatchObject({ handledIdleSince: T0 + 58 * MIN });
+    expect(restored.idleAutoCompactPendingNotice).toBeUndefined();
+    h.sweepAt([restored], T0 + 59 * MIN);
+    expect(h.notify).not.toHaveBeenCalled();
+    expect(h.compact).toHaveBeenCalledTimes(1);
+  });
+
   it('the screen-edge bookkeeping is saved while opted in, never while off', () => {
     const on = makeDs('ffff0000', { enabled: true });
     edge(on, 'idle', T0);
@@ -380,6 +399,118 @@ describe('idle auto-compact across a daemon restart', () => {
     expect(persisted.updates).toEqual([]);
   });
 });
+
+describe('idle auto-compact interrupted turns', () => {
+  it.each(['cancelled', 'failed', 'ambiguous'] as const)(
+    'a %s terminal before the idle edge queues "interrupted", never "compacted"',
+    (terminalStatus) => {
+      const ds = makeDs('intr0001', { enabled: true });
+      edge(ds, 'idle', T0);
+      const h = harness();
+      h.sweepAt([ds], T0 + 55 * MIN);
+      const turnId = h.compact.mock.calls[0][1];
+      edge(ds, 'working', T0 + 55 * MIN + 1_000);
+      expect(noteIdleAutoCompactTurnEnded(ds, turnId, terminalStatus)).toBe(true);
+      expect(ds.session.idleAutoCompact.inFlight).toBeUndefined();
+      expect(ds.idleAutoCompactDispatchedTurnId).toBeUndefined();
+      expect(ds.idleAutoCompactPendingNotice).toEqual({ kind: 'interrupted', idleMinutes: 55 });
+      // Back to idle: the queued notice is the only one ever posted.
+      edge(ds, 'idle', T0 + 56 * MIN);
+      h.sweepAt([ds], T0 + 57 * MIN);
+      expect(h.notify).toHaveBeenCalledTimes(1);
+      expect(h.notify.mock.calls[0][1]).toEqual({ kind: 'interrupted', idleMinutes: 55 });
+    },
+  );
+
+  it('retracts the queued "compacted" notice when the cancelled terminal lands after the idle edge', () => {
+    const ds = makeDs('intr0002', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    const turnId = h.compact.mock.calls[0][1];
+    edge(ds, 'working', T0 + 55 * MIN + 1_000);
+    edge(ds, 'idle', T0 + 56 * MIN); // finishing edge wins the race, queues success
+    expect(ds.idleAutoCompactPendingNotice?.kind).toBe('compacted');
+    expect(noteIdleAutoCompactTurnEnded(ds, turnId, 'cancelled')).toBe(true);
+    h.sweepAt([ds], T0 + 57 * MIN);
+    expect(h.notify).toHaveBeenCalledTimes(1);
+    expect(h.notify.mock.calls[0][1]).toEqual({ kind: 'interrupted', idleMinutes: 55 });
+  });
+
+  it('a completed terminal leaves the in-flight compact to finish normally', () => {
+    const ds = makeDs('intr0003', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    const turnId = h.compact.mock.calls[0][1];
+    edge(ds, 'working', T0 + 55 * MIN + 1_000);
+    expect(noteIdleAutoCompactTurnEnded(ds, turnId, 'completed')).toBe(false);
+    expect(ds.session.idleAutoCompact.inFlight?.turnId).toBe(turnId);
+    expect(ds.idleAutoCompactDispatchedTurnId).toBe(turnId);
+    edge(ds, 'idle', T0 + 56 * MIN);
+    h.sweepAt([ds], T0 + 57 * MIN);
+    expect(h.notify.mock.calls[0][1]).toMatchObject({ kind: 'compacted' });
+  });
+
+  it('a terminal for a different turn neither clears the marker nor posts anything', () => {
+    const ds = makeDs('intr0004', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    const turnId = h.compact.mock.calls[0][1];
+    expect(noteIdleAutoCompactTurnEnded(ds, 'om_some_user_turn', 'cancelled')).toBe(false);
+    expect(ds.session.idleAutoCompact.inFlight?.turnId).toBe(turnId);
+    expect(ds.idleAutoCompactDispatchedTurnId).toBe(turnId);
+    expect(ds.idleAutoCompactPendingNotice).toBeUndefined();
+  });
+
+  it('a cancelled terminal inherited from a restart posts nothing (no local witness)', () => {
+    const before = makeDs('intr0005', { enabled: true });
+    edge(before, 'idle', T0);
+    const h = harness();
+    h.sweepAt([before], T0 + 55 * MIN);
+    const turnId = h.compact.mock.calls[0][1];
+    edge(before, 'working', T0 + 55 * MIN + 1_000);
+    const restored = restartFrom(before); // in-flight marker on the row, no witness in memory
+    expect(noteIdleAutoCompactTurnEnded(restored, turnId, 'cancelled')).toBe(true);
+    expect(restored.idleAutoCompactPendingNotice).toBeUndefined();
+  });
+});
+
+describe('idle auto-compact across a worker suspend', () => {
+  it('clearIdleAutoCompactStretch drops only the live-stretch mirror and marker', () => {
+    const session: { idleAutoCompact?: any } = {};
+    expect(clearIdleAutoCompactStretch(session)).toBe(false);
+    applyIdleAutoCompactSetting(session, { enabled: true, minutes: 20 });
+    expect(clearIdleAutoCompactStretch(session)).toBe(false);
+    session.idleAutoCompact.idleSince = T0;
+    session.idleAutoCompact.inFlight = { turnId: 'auto-compact:idle:x', since: T0, idleMinutes: 20 };
+    expect(clearIdleAutoCompactStretch(session)).toBe(true);
+    expect(session.idleAutoCompact).toEqual({ enabled: true, minutes: 20 });
+    // Idempotent.
+    expect(clearIdleAutoCompactStretch(session)).toBe(false);
+  });
+
+  it('a message-less cold resume starts a fresh stretch: no immediate /compact on the cold CLI', () => {
+    const ds = makeDs('susp001', { enabled: true, minutes: 55 });
+    edge(ds, 'idle', T0);
+    // suspendWorker(): live fields and the persisted mirror are all dropped.
+    expect(clearIdleAutoCompactStretch(ds.session)).toBe(true);
+    ds.idleSinceAt = undefined;
+    ds.lastScreenStatus = undefined;
+    ds.idleAutoCompactPendingNotice = undefined;
+    delete ds.idleAutoCompactDispatchedTurnId;
+    // A web-terminal / dashboard visit cold-starts the CLI with no queued
+    // message; its first status is idle at T0+56m.
+    const h = harness();
+    edge(ds, 'idle', T0 + 56 * MIN);
+    expect(h.sweepAt([ds], T0 + 56 * MIN)).toBe(0);
+    // The timer counts from the fresh edge, not from before the suspend.
+    expect(h.sweepAt([ds], T0 + 110 * MIN)).toBe(0);
+    expect(h.sweepAt([ds], T0 + 111 * MIN)).toBe(1);
+  });
+});
+
 
 describe('idle auto-compact support and command parsing', () => {
   const base = { cliId: 'claude-code', backendType: 'tmux', codexRpcInput: false, adopted: false, headless: false, vcMeetingReceiver: false };

@@ -6193,6 +6193,7 @@ function idleAutoCompactNoticeText(ds: DaemonSession, notice: IdleAutoCompactNot
     return tr('idle_compact.notice.skipped_small', { minutes: notice.idleMinutes, tokens: k(notice.tokens), min: k(notice.minTokens) }, loc);
   }
   if (notice.kind === 'refused') return tr('idle_compact.notice.refused', { minutes: notice.idleMinutes }, loc);
+  if (notice.kind === 'interrupted') return tr('idle_compact.notice.interrupted', { minutes: notice.idleMinutes }, loc);
   return notice.tokens !== undefined
     ? tr('idle_compact.notice.compacted', { minutes: notice.idleMinutes, tokens: k(notice.tokens) }, loc)
     : tr('idle_compact.notice.compacted_unknown', { minutes: notice.idleMinutes }, loc);
