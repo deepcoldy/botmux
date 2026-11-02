@@ -34,9 +34,11 @@ describe('structured-bridge-clis', () => {
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('hermes');
     expect(isStructuredBridgeAdoptCli('hermes')).toBe(false);
     for (const id of STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) {
-      if (id === 'hermes' || id === 'oh-my-pi' || id === 'ebsd') continue;
+      // doubao has no /adopt transcript branch (like hermes/omp/ebsd).
+      if (id === 'hermes' || id === 'oh-my-pi' || id === 'ebsd' || id === 'doubao') continue;
       expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).toContain(id);
     }
+    expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('doubao');
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('oh-my-pi');
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('ebsd');
   });
@@ -90,9 +92,12 @@ describe('structured-bridge-clis', () => {
     expect(isStructuredBridgeLifecycleBlockingCli('oh-my-pi')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('ebsd')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('grok')).toBe(true);
-    for (const id of ['coco', 'hermes', 'mtr', 'cursor', 'antigravity']) {
+    for (const id of ['coco', 'hermes', 'mtr', 'cursor', 'antigravity', 'doubao']) {
       expect(isStructuredBridgeLifecycleBlockingCli(id)).toBe(false);
     }
+    expect(isStructuredBridgeFallbackActive('doubao')).toBe(true);
+    expect(supportsZeroPromptStructuredBridge('doubao')).toBe(true);
+    expect(supportsTranscriptReplyDelivery('doubao')).toBe(true);
   });
 });
 

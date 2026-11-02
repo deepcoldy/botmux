@@ -34,6 +34,11 @@ export const STRUCTURED_BRIDGE_ALWAYS_CLI_IDS = [
   'ebsd',
   'grok',
   'cursor',
+  // Doubao has no `botmux send` skill: its only reply channel is its own
+  // trajectory.jsonl, so the bridge is always-on for spawned sessions. Like
+  // coco/cursor it lacks a complete interrupted/error terminal contract and
+  // stays OUT of the lifecycle-blocking list.
+  'doubao',
 ] as const satisfies readonly CliId[];
 
 /** Adopt must forward pid/cwd/cliSessionId for these (CLIs whose worker

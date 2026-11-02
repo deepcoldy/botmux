@@ -77,8 +77,8 @@ describe('local-cli-opener', () => {
   it('resume mode supports every adapter with a portable local resume command', () => {
     for (const cliId of LOCAL_CLI_IDS) {
       const result = buildLocalCliOpenCommand(ds({
-        // Kimi only resumes its own session_<uuid> ids.
-        session: { ...ds().session, cliId, cliSessionId: cliId === 'kimi' ? 'session_nativeid' : 'ses_nativeid' },
+        // Kimi only resumes its own session_<uuid> ids; Doubao only its numeric ids.
+        session: { ...ds().session, cliId, cliSessionId: cliId === 'kimi' ? 'session_nativeid' : cliId === 'doubao' ? '38450922917357570' : 'ses_nativeid' },
       }), {
         mode: 'resume',
         adapterFactory: (id) => id === 'oh-my-pi'

@@ -353,6 +353,7 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
+import { doubaoTrajectoryPathForSession } from './services/doubao-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
@@ -10819,6 +10820,25 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset}, skipTail=true)`);
   } else if (existsSync(rolloutPath)) {
+    if (structuredBridgeIs('doubao')) {
+      // Doubao keeps TWO native logs (trajectory.jsonl + assignment.md) and
+      // has its own resume semantics: `--resume <snowflake>` rehydrates the
+      // conversation inside the CLI. A spawn-time baseline must therefore
+      // touch NEITHER file's history — no restart-interruption scan (it would
+      // misread the previous session's tool calls as an interrupted botmux
+      // turn and inject a note that wedges the first write), no journal
+      // recovery. Cursor both cursors to EOF, including the drainer's own
+      // two-file state, so the first ingest only sees the resumed live turn.
+      const traj = baselineJsonlCursor(rolloutPath);
+      codexBridgeOffset = traj.newOffset;
+      codexBridgePendingTail = traj.pendingTail;
+      let assignmentOffset = 0;
+      try { assignmentOffset = statSync(rolloutPath.replace(/\/trajectory\.jsonl$/, '/assignment.md')).size; } catch { /* no assignment yet */ }
+      structuredBridgeDriverState = { assignmentOffset, trajectoryOffset: traj.newOffset };
+      codexBridgeBaselineDone = true;
+      structuredBridgeRecoveryAttempted = true;
+      log(`Codex bridge baselined (doubao two-file): ${rolloutPath} (trajectoryOffset=${traj.newOffset}, assignmentOffset=${assignmentOffset})`);
+    } else {
     if (!lastInitConfig?.adoptMode) scanRestartInterruption(rolloutPath, 'structured');
     const journalPath = structuredBridgeJournalPath() ?? codexAdoptJournalPath();
     // Cursor's JSONL transcript lacks per-event timestamps and stamps wall-clock Date.now() on drain;
@@ -10895,6 +10915,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       codexBridgePendingTail = cursor.pendingTail;
       codexBridgeBaselineDone = true;
       log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+    }
     }
   } else {
     // baseline-existing requested but file missing — degrade to fresh
@@ -25878,6 +25899,20 @@ async function spawnCli(
     const eventsPath = cocoEventsPathForSession(effectiveAdapterSessionId);
     codexBridgeAttach(eventsPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
     codexBridgeStartTimer();
+  } else if (cfg.cliId === 'doubao') {
+    // Doubao's native snowflake session id is unknown until the first submit
+    // (writeInput discovers it from assignment.md). A resumed spawn already
+    // has the id: bind its trajectory now; a fresh spawn arms the 1s late-
+    // attach poller and writeInput's notify attaches the moment the id lands.
+    const doubaoPath = effectiveCliSessionId
+      ? doubaoTrajectoryPathForSession(effectiveCliSessionId)
+      : undefined;
+    if (doubaoPath) {
+      codexBridgeAttach(doubaoPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+      codexBridgeStartTimer();
+    } else {
+      codexBridgeStartTimer();
+    }
   } else if (cfg.cliId === 'mtr') {
     const mtrSessionId = effectiveCliSessionId ?? mtrSessionIdForBotmuxSession(effectiveAdapterSessionId);
     codexBridgePendingSessionId = mtrSessionId;
