@@ -45,6 +45,7 @@ import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/tri
 import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
+import { ensureBackgroundJobHome } from '../services/bytedcli-home.js';
 
 export type { IdentityStorageModel };
 
@@ -281,7 +282,7 @@ function identityLayoutMarkerPath(sessionDataDir: string, sessionId: string): st
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), IDENTITY_LAYOUT_FILE);
 }
 
-function readIdentityLayout(sessionDataDir: string, sessionId: string): IdentityStorageModel | undefined {
+export function readIdentityLayout(sessionDataDir: string, sessionId: string): IdentityStorageModel | undefined {
   try {
     const value = readFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), 'utf8').trim();
     return value === 'proven-v1' || value === 'single-v1'
@@ -829,6 +830,9 @@ function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
  *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
 export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
   if (identity.tool !== 'bytedcli' || 'mode' in identity || identity.home) return identity;
+  if (identity.turnId?.startsWith('background:')) {
+    return { ...identity, home: ensureBackgroundJobHome(identity.turnId.slice('background:'.length)) };
+  }
   const base = bytedcliHomeRoot(sessionDataDir, sessionId);
   return { ...identity, home: bytedcliHomeFromBase(base, sessionId, identity) };
 }
