@@ -336,6 +336,7 @@ describe('plugin MCP Gateway', () => {
           caller: {
             requestUserOpenId: 'ou_trusted',
             requestUserUnionId: 'on_trusted',
+            requestUserEmail: 'alice@bytedance.com',
             requestLarkAppId: 'cli_trusted',
             source: 'schedule_creator',
             taskId: 'task_123',
@@ -365,6 +366,7 @@ describe('plugin MCP Gateway', () => {
     const text = (result.content[0] as any).text;
     expect(text).toContain('"requestUserOpenId":"ou_trusted"');
     expect(text).toContain('"requestUserUnionId":"on_trusted"');
+    expect(text).toContain('"requestUserEmail":"alice@bytedance.com"');
     expect(text).toContain('"requestLarkAppId":"cli_trusted"');
     expect(text).toContain('"source":"schedule_creator"');
     expect(text).toContain('"taskId":"task_123"');
@@ -391,6 +393,7 @@ describe('plugin MCP Gateway', () => {
           caller: {
             requestUserOpenId: 'ou_trusted',
             requestUserUnionId: 'on_trusted',
+            requestUserEmail: 'alice@bytedance.com',
             requestLarkAppId: 'cli_trusted',
             source: 'gateway_meta',
             senderType: 'user',
@@ -618,6 +621,7 @@ describe('plugin MCP Gateway', () => {
     expect(trusted.get('x-botmux-trusted-open-id')).toBe('ou_trusted');
     expect(trusted.get('x-botmux-trusted-union-id')).toBe('on_trusted');
     expect(trusted.get('x-botmux-trusted-app-id')).toBe('cli_trusted');
+    expect(trusted.get('x-botmux-trusted-email')).toBeNull();
     expect(trusted.get('x-botmux-turn-id')).toBe('om_trusted');
     expect(trusted.get('x-botmux-dispatch-attempt')).toBe('2');
     // Provenance stays on the local `_meta` path only: these headers reach every

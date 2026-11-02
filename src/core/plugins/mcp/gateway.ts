@@ -554,13 +554,19 @@ export class PluginMcpGateway {
     };
   }
 
-  private trustedTurnMeta(identity: GatewayTrustedTurnIdentity | undefined): Record<string, unknown> | undefined {
+  private trustedTurnMeta(
+    identity: GatewayTrustedTurnIdentity | undefined,
+    includeLocalActorFields = false,
+  ): Record<string, unknown> | undefined {
     const caller = identity?.caller;
     if (!caller && !identity?.turnId) return undefined;
     const hostCapabilities = this.trustedResultDelivery ? ['result_delivery_v1'] : [];
     return {
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
+      ...(includeLocalActorFields && caller?.requestUserEmail
+        ? { requestUserEmail: caller.requestUserEmail }
+        : {}),
       ...(caller?.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
       // Provenance travels with the identity so a plugin can tell "a human just
       // asked" from "a scheduled task is running as them". Deliberately NOT
@@ -582,8 +588,9 @@ export class PluginMcpGateway {
   private withTrustedTurnMeta<T extends { _meta?: Record<string, unknown> }>(
     params: T,
     identity: GatewayTrustedTurnIdentity | undefined,
+    includeLocalActorFields = false,
   ): T {
-    const trusted = this.trustedTurnMeta(identity);
+    const trusted = this.trustedTurnMeta(identity, includeLocalActorFields);
     const cleanedMeta = Object.fromEntries(
       Object.entries(params._meta ?? {})
         .filter(([key]) => !key.toLowerCase().startsWith(BOTMUX_META_RESERVED_PREFIX)),
@@ -764,7 +771,11 @@ export class PluginMcpGateway {
         ? { ...currentIdentity, ...(currentIdentity.caller ? { caller: { ...currentIdentity.caller } } : {}) }
         : undefined;
       const result = await this.toolCallIdentity.run({ identity }, () => route.connection.client.callTool(
-        this.withTrustedTurnMeta({ ...request.params, name: route.originalName }, identity),
+        this.withTrustedTurnMeta(
+          { ...request.params, name: route.originalName },
+          identity,
+          route.connection.server.transport === 'stdio',
+        ),
         undefined,
         this.requestOptions(request, extra, route.connection.toolTimeoutMs),
       ));
