@@ -33,7 +33,7 @@ import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
 import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureChatManagerSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
+import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureChatManagerSkill, removeWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -46,7 +46,7 @@ import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
-import { readGlobalConfig, isWorkflowFeatureEnabled } from '../global-config.js';
+import { readGlobalConfig } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
@@ -6525,9 +6525,9 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
     // 群负责人 skill：plugin-dir 机器共享，任一 bot 开启即落盘；真正 per-bot
     // 授权在 daemon IPC，关闭开关的 bot 调 set 会被拒。每次 spawn 重新评估。
     ensureChatManagerSkill(cliId, pluginSkillsDir, getAllBots().some(b => b.config.chatManagerEnabled === true));
-    // Workflow skill 家族同理：跟随机器级 workflow 开关，每次 spawn 重新评估，
-    // 关闭时删除已装的三个 skill，下一个会话即生效。
-    ensureWorkflowSkills(cliId, pluginSkillsDir, isWorkflowFeatureEnabled());
+    // Workflow skill 家族不常驻：只在确定要用工作流时由 agent 按需
+    // `botmux skill show`。每次 spawn 清掉旧版本写进插件目录的残留。
+    removeWorkflowSkills(cliId, pluginSkillsDir);
     // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
     // ——与上面白板 / workflow 同样放在 once-cache 之前，否则改了 skill 正文或
     // 停用某 skill 后，claude 家族（--plugin-dir）的新会话仍读旧文件、要等 daemon
@@ -6567,9 +6567,9 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());
   // 群负责人 skill 同理：仅 global 模式落共享盘，且任一 bot 开启才落。
   ensureChatManagerSkill(cliId, skillsDir, globalInstall && getAllBots().some(b => b.config.chatManagerEnabled === true));
-  // Workflow skill 家族：仅 global 模式落全局盘，且跟随机器级 workflow 开关。
-  // 非 global（prompt/off）由上面的 removeGlobalBotmuxSkills 前缀清理兜底。
-  ensureWorkflowSkills(cliId, skillsDir, globalInstall && isWorkflowFeatureEnabled());
+  // Workflow skill 家族不常驻（global 模式也不落盘），按需 `botmux skill show`；
+  // 清掉旧版本在 global 模式下写进共享目录的残留。
+  removeWorkflowSkills(cliId, skillsDir);
   if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
   // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
   // ——同白板 / workflow 放在 once-cache 之前。global 模式落全局盘；幂等（内容相同

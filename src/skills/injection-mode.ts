@@ -45,20 +45,27 @@ import {
 } from './effective-builtins.js';
 import { renderBotmuxSendSkill } from './reply-style-guide.js';
 
-/** The unconditional built-ins with the v3 Workflow family spliced back in at
- *  their historical position (right after `botmux-handoff`) when the machine-wide
- *  workflow switch is ON. Splicing rather than appending keeps the ENABLED-path
- *  catalog byte-for-byte identical to before the family was factored out; when
- *  the switch is OFF the family is simply absent. The independent multi-topic
- *  switch similarly filters `botmux-orchestrate`. */
-function baseBuiltinSkills(workflowEnabled: boolean, multiTopicEnabled: boolean): typeof BUILTIN_SKILLS {
-  const builtins = multiTopicEnabled
+/** Built-ins the model is told about up front (prompt catalog / `botmux skill
+ *  list`). The independent multi-topic switch filters `botmux-orchestrate`.
+ *
+ *  The v3 Workflow family is deliberately NEVER here, even with the workflow
+ *  switch ON: a session only needs it once a workflow is actually decided (the
+ *  user sent `/workflow`, or agreed to the routing hint's offer), and then it
+ *  reads the body on demand via `botmux skill show botmux-workflow`. Keeping
+ *  ~770 characters of workflow trigger text out of every session prompt is the
+ *  point; see docs/design/2026-11-03-workflow-bot-handoff.md §4. */
+function catalogBuiltinSkills(multiTopicEnabled: boolean): typeof BUILTIN_SKILLS {
+  return multiTopicEnabled
     ? [...BUILTIN_SKILLS]
     : BUILTIN_SKILLS.filter(skill => skill.name !== 'botmux-orchestrate');
-  if (!workflowEnabled) return builtins;
-  const anchor = builtins.findIndex((s) => s.name === 'botmux-handoff');
-  const at = anchor >= 0 ? anchor + 1 : builtins.length;
-  return [...builtins.slice(0, at), ...WORKFLOW_FEATURE_SKILLS, ...builtins.slice(at)];
+}
+
+/** Everything `botmux skill show` may resolve: the catalog plus, while the
+ *  machine-wide workflow switch is ON, the on-demand v3 Workflow family. A
+ *  disabled host can't pull a workflow skill at all. */
+function showableBuiltinSkills(workflowEnabled: boolean, multiTopicEnabled: boolean): typeof BUILTIN_SKILLS {
+  const catalog = catalogBuiltinSkills(multiTopicEnabled);
+  return workflowEnabled ? [...catalog, ...WORKFLOW_FEATURE_SKILLS] : catalog;
 }
 
 export type SkillInjectionMode = 'global' | 'prompt' | 'off';
@@ -199,18 +206,13 @@ export function builtinSkillEntries(opts: {
    *  Send remains as an on-demand complex-delivery skill. Set for the prompt-mode
    *  catalog; leave off for `botmux skill list`, which surfaces everything. */
   excludeRoutingCovered?: boolean;
-  /** Machine-wide v3 Workflow switch. Defaults to the live accessor
-   *  (`isWorkflowFeatureEnabled`); when off, the botmux-workflow family is not
-   *  advertised. Explicit for tests. */
-  workflowEnabled?: boolean;
   /** Machine-wide multi-topic orchestration switch. Explicit for tests. */
   multiTopicEnabled?: boolean;
   /** Per-bot 群负责人开关（默认关）。开启时才在 prompt 目录里暴露该技能。 */
   chatManagerEnabled?: boolean;
 }): BuiltinSkillEntry[] {
-  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
   const multiTopicEnabled = opts.multiTopicEnabled ?? isMultiTopicOrchestrationEnabled();
-  let defs = baseBuiltinSkills(workflowEnabled, multiTopicEnabled);
+  let defs = catalogBuiltinSkills(multiTopicEnabled);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
   if (opts.chatManagerEnabled === true) defs.push({ name: CHAT_MANAGER_SKILL_NAME, content: CHAT_MANAGER_SKILL });
@@ -232,7 +234,7 @@ export function builtinSkillContent(
   env: Record<string, string | undefined> = process.env,
 ): string | undefined {
   const all = [
-    ...baseBuiltinSkills(isWorkflowFeatureEnabled(), isMultiTopicOrchestrationEnabled(env)),
+    ...showableBuiltinSkills(isWorkflowFeatureEnabled(), isMultiTopicOrchestrationEnabled(env)),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },
     { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
     { name: CHAT_MANAGER_SKILL_NAME, content: CHAT_MANAGER_SKILL },

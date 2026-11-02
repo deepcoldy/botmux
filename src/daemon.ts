@@ -25146,8 +25146,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     return;
   }
 
-  // v3 即兴 grill：`/workflow [new] <目标>`。daemon 不拷问——把目标包成触发
-  // botmux-workflow skill 的 prompt（改写 content，promptContent 随后从 content
+  // v3 即兴 grill：`/workflow [new] <目标>`。daemon 不拷问——把目标包成要求先按需
+  // 读取 botmux-workflow skill 的 prompt（改写 content，promptContent 随后从 content
   // 构造），fall-through 到正常 session 创建，让本话题 agent 接管整条链路。
   // v3 Workflow 动词已在上方处理；`/template` 只保留退役提示。
   // Freeze the Lark-authored bytes before a workflow command rewrites the
@@ -27588,8 +27588,8 @@ async function handleThreadReplyAdmitted(
     return;
   }
 
-  // v3 即兴 grill（thread 内）：`/workflow [new] <目标>` → 把目标包成触发
-  // botmux-workflow skill 的 prompt 覆盖 promptContent，fall-through 到下面正常
+  // v3 即兴 grill（thread 内）：`/workflow [new] <目标>` → 把目标包成要求先按需
+  // 读取 botmux-workflow skill 的 prompt 覆盖 promptContent，fall-through 到下面正常
   // 转发逻辑，让现有/新建的 agent 接管。v3 Workflow 动词已在上方处理，
   // `/template` 只保留退役提示。
   const threadGrill = parseWorkflowGrillTrigger(cmdContent);
