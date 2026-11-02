@@ -2192,6 +2192,35 @@ describe('Codex App history switch', () => {
       .toContain('write_failed');
   });
 
+  it('disables origin delegation without the browser bridge and saves an explicit opt-in', async () => {
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true, codexBrowserAutoApproveOrigins: true } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    const render = (enabled: boolean) => React.createElement(CodexAppDisplaySection, {
+      bot: { larkAppId: 'cli_browser_policy', cliId: 'codex-app', codexBrowser: enabled },
+      putCardPref,
+    });
+    act(() => { renderer = TestRenderer.create(render(false)); });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-codex-browser-auto-approve-origins' });
+    expect(toggle().props.disabled).toBe(true);
+    expect(toggle().props.checked).toBe(false);
+    act(() => { renderer.update(render(true)); });
+    expect(toggle().props.disabled).toBe(false);
+    await act(async () => { toggle().props.onChange({ currentTarget: { checked: true } }); await Promise.resolve(); });
+    expect(putCardPref).toHaveBeenCalledWith({ codexBrowserAutoApproveOrigins: true });
+    expect(toggle().props.checked).toBe(true);
+  });
+
+  it('rolls origin delegation back when the bot setting cannot be saved', async () => {
+    const putCardPref = vi.fn(async () => ({ ok: false, status: 500, body: { error: 'write_failed' } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+      bot: { larkAppId: 'cli_browser_policy', cliId: 'codex-app', codexBrowser: true }, putCardPref,
+    })); });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-codex-browser-auto-approve-origins' });
+    await act(async () => { toggle().props.onChange({ currentTarget: { checked: true } }); await Promise.resolve(); });
+    expect(toggle().props.checked).toBe(false);
+  });
+
   it('renders and persists the default-off Codex browser bridge switch', async () => {
     const putCardPref = vi.fn(async () => ({
       ok: true,

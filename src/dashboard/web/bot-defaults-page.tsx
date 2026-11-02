@@ -641,6 +641,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
     codexBrowser: body.codexBrowser,
+    codexBrowserAutoApproveOrigins: body.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
@@ -5639,9 +5640,10 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
   const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
+  const [autoApproveOrigins, setAutoApproveOrigins] = useState(props.bot.codexBrowserAutoApproveOrigins === true);
   const [cliNudge, setCliNudge] = useState(props.bot.noProgressNotify?.cliEnabled === true);
   const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState<'clean-input' | 'browser' | 'no-progress' | null>(null);
+  const [busy, setBusy] = useState<'clean-input' | 'browser' | 'browser-approval' | 'no-progress' | null>(null);
   // 无进展提醒（#1162）：null 配置 = 默认（开启，90s）。UI 状态与 bot 配置同步，
   // 两个控件独立保存但总是提交完整对象，避免 toggle 顺手丢掉已配置的阈值。
   const noProgress = props.bot.noProgressNotify ?? null;
@@ -5658,6 +5660,7 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
   useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
+  useEffect(() => setAutoApproveOrigins(props.bot.codexBrowserAutoApproveOrigins === true), [props.bot.codexBrowserAutoApproveOrigins]);
   useEffect(() => setCliNudge(props.bot.noProgressNotify?.cliEnabled === true), [props.bot.noProgressNotify]);
 
   async function saveCleanInput(checked: boolean): Promise<void> {
@@ -5683,6 +5686,19 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       setBusy: on => setBusy(on ? 'browser' : null),
       saved: tr('botDefaults.cardPrefSaved'),
       rollback: () => setBrowserEnabled(previous),
+    });
+  }
+
+  async function saveBrowserApproval(checked: boolean): Promise<void> {
+    const previous = autoApproveOrigins;
+    setAutoApproveOrigins(checked);
+    await saveBotField({
+      request: () => props.putCardPref({ codexBrowserAutoApproveOrigins: checked }),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? 'browser-approval' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      rollback: () => setAutoApproveOrigins(previous),
     });
   }
 
@@ -5737,6 +5753,15 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
           description={tr('botDefaults.codexBrowserDescription')}
           help={tr('botDefaults.codexBrowserHelp')}
           onChange={checked => void saveBrowser(checked)}
+        />
+        <ToggleRow
+          checked={browserEnabled && autoApproveOrigins}
+          disabled={busy !== null || !browserEnabled}
+          dataAction="toggle-codex-browser-auto-approve-origins"
+          title={tr('botDefaults.codexBrowserAutoApproveOrigins')}
+          description={tr('botDefaults.codexBrowserAutoApproveOriginsDescription')}
+          help={tr('botDefaults.codexBrowserAutoApproveOriginsHelp')}
+          onChange={checked => void saveBrowserApproval(checked)}
         />
         <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
         <ToggleRow

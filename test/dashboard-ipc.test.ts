@@ -2513,6 +2513,23 @@ describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
       expect(await on.json()).toMatchObject({ ok: true, codexBrowser: true });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser).toBe(true);
 
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ codexBrowserAutoApproveOrigins: false });
+      const approvalOn = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowserAutoApproveOrigins: true }),
+      });
+      expect(approvalOn.status).toBe(200);
+      expect(await approvalOn.json()).toMatchObject({ codexBrowserAutoApproveOrigins: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser)
+        .toMatchObject({ enabled: true, autoApproveOrigins: true });
+      expect(getBot(appId).config.codexBrowser?.autoApproveOrigins).toBe(true);
+      const malformed = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowserAutoApproveOrigins: 'true' }),
+      });
+      expect(malformed.status).toBe(400);
+
       const off = await fetch(`${base}/api/bot-card-prefs`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
@@ -2520,6 +2537,13 @@ describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
       });
       expect(off.status).toBe(200);
       expect(await off.json()).toMatchObject({ ok: true, codexBrowser: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser).toBeUndefined();
+
+      const disabledBridge = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowserAutoApproveOrigins: true }),
+      });
+      expect(disabledBridge.status).toBe(409);
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser).toBeUndefined();
 
       getBot(appId).config.sandbox = true;

@@ -71,6 +71,7 @@ interface Args {
   reasoningEffort?: string;
   serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
+  browserAutoApproveOrigins?: boolean;
   browserPluginRoot?: string;
 }
 
@@ -285,6 +286,7 @@ function parseArgs(argv: string[]): Args {
     }
     else if (key === '--browser-family' && (val === 'chrome' || val === 'edge')) { out.browserFamily = val; i++; }
     else if (key === '--browser-plugin-root' && val !== undefined) { out.browserPluginRoot = val; i++; }
+    else if (key === '--browser-auto-approve-origins') { out.browserAutoApproveOrigins = true; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   if (out.strictResume && !out.threadId) throw new Error('--strict-resume requires --thread-id');
@@ -719,6 +721,7 @@ const browserBroker = args.browserFamily
   ? new CodexBrowserBroker({
       sessionId: args.sessionId,
       family: args.browserFamily,
+      autoApproveOrigins: args.browserAutoApproveOrigins === true,
       codexBin: args.codexBin,
       ...(args.browserPluginRoot ? { pluginRoot: args.browserPluginRoot } : {}),
       readConfig: params => client.request('config/read', params, { timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS }),
