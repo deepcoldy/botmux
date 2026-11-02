@@ -127,7 +127,7 @@ function openPlatformSubscriptionMock(appId: string, opts: {
       return Response.json({ code: 0 });
     }
     if (href.endsWith(`/developers/v1/safe_setting/${appId}`)) {
-      return opts.redirectUnreadable
+      return opts.redirectUnreadable && redirectWrites.length === 0
         ? Response.json({ code: 0 })
         : Response.json({ code: 0, data: { redirectURL: [...state.redirectUrls] } });
     }
@@ -1260,16 +1260,20 @@ describe('redirect 白名单读→合并→写', () => {
     const reads: string[] = [];
     const writes: Array<{ path: string; body: any }> = [];
     let writeIndex = 0;
+    let liveRead = opts.read;
+    let committed = false;
     const postJson = async (path: string, body?: unknown): Promise<unknown> => {
       if (path.includes('/safe_setting/update/')) {
         writes.push({ path, body });
         const err = (opts.writeErrors ?? [])[writeIndex++];
         if (err) throw err;
+        committed = true;
+        liveRead = { code: 0, data: { redirectURL: (body as { redirectURL: string[] }).redirectURL } };
         return { code: 0 };
       }
       reads.push(path);
-      if (opts.readThrows) throw new Error('safe_setting read endpoint missing');
-      return opts.read;
+      if (opts.readThrows && !committed) throw new Error('safe_setting read endpoint missing');
+      return liveRead;
     };
     return { postJson, reads, writes };
   }
@@ -1315,7 +1319,7 @@ describe('redirect 白名单读→合并→写', () => {
       'https://m-abc.example.com/oauth/callback',
     ]);
 
-    expect(stub.reads).toEqual(['/developers/v1/safe_setting/cli_x']);
+    expect(stub.reads).toEqual(['/developers/v1/safe_setting/cli_x', '/developers/v1/safe_setting/cli_x']);
     expect(result.status).toBe('updated');
     expect(stub.writes).toHaveLength(1);
     // 用户自己配的那条必须原样留着——历史实现的全量覆盖会把它静默清掉。
@@ -1385,7 +1389,7 @@ describe('redirect 白名单读→合并→写', () => {
     ]);
   });
 
-  it('网络类写失败不触发最小集兜底（重发只会再失败一次）', async () => {
+  it('网络类写失败重读现值并补写全集，不触发最小集兜底', async () => {
     const networkError = new TypeError('fetch failed');
     (networkError as any).cause = Object.assign(new Error('connect ECONNRESET'), { code: 'ECONNRESET' });
     const stub = stubPostJson({
@@ -1393,12 +1397,13 @@ describe('redirect 白名单读→合并→写', () => {
       writeErrors: [networkError],
     });
 
-    await expect(writeRedirectWhitelist(stub.postJson, 'cli_x', [
+    const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', [
       BOTMUX_REDIRECT_URL,
       'https://m-abc.example.com/oauth/callback',
-    ])).rejects.toThrow('fetch failed');
-    // 最小集与被拒全集并不相同，历史实现会在这里再写一次；网络故障时那一次毫无意义。
-    expect(stub.writes).toHaveLength(1);
+    ]);
+    expect(result.status).toBe('updated');
+    expect(stub.writes).toHaveLength(2);
+    expect(stub.writes[1].body.redirectURL).toEqual(stub.writes[0].body.redirectURL);
   });
 
   it('403 写失败不触发最小集兜底，且原始 OpenPlatformApiError 原样抛出', async () => {
@@ -1512,8 +1517,15 @@ describe('redirect 白名单读→合并→写', () => {
     ['409 且文案双命中', new OpenPlatformApiError('HTTP 409: redirect url format invalid', { code: 1 }, 409)],
     // 只有拒绝词「not allowed」，与白名单写了什么无关。
     ['operation not allowed', new Error('code=1 msg=operation not allowed')],
-  ])('不因 %s 触发二次写', async (_label, err) => {
+  ])('不因 %s 触发最小集兜底', async (_label, err) => {
     const stub = rejectedByConsole(err);
+    if (err instanceof OpenPlatformApiError && err.status === 503) {
+      const result = await writeRedirectWhitelist(stub.postJson, 'cli_x', twoWanted);
+      expect(result.status).toBe('updated');
+      expect(stub.writes).toHaveLength(2);
+      expect(stub.writes[1].body.redirectURL).toEqual(stub.writes[0].body.redirectURL);
+      return;
+    }
     await expect(writeRedirectWhitelist(stub.postJson, 'cli_x', twoWanted)).rejects.toBe(err);
     // 只发 1 次 update，也就不可能返回 updated_fallback（兜底那次才会产生它）。
     expect(stub.writes).toHaveLength(1);
@@ -2621,6 +2633,7 @@ describe('automateOpenPlatformSetup', () => {
       '/app/cli_x/auth',
       '/developers/v1/safe_setting/cli_x',
       '/developers/v1/safe_setting/update/cli_x',
+      '/developers/v1/safe_setting/cli_x',
       '/developers/v1/scope/all/cli_x',
       '/developers/v1/scope/update/cli_x',
       // 权限点进清单后紧接着读它带的「数据范围」条目（这个 mock 没有待配条目，
@@ -2711,6 +2724,7 @@ describe('automateOpenPlatformSetup', () => {
       '/app/cli_x/auth',
       '/developers/v1/safe_setting/cli_x',
       '/developers/v1/safe_setting/update/cli_x',
+      '/developers/v1/safe_setting/cli_x',
       '/developers/v1/scope/all/cli_x',
       '/developers/v1/scope/update/cli_x',
       // 权限点进清单后紧接着读它带的「数据范围」条目（这个 mock 没有待配条目，
@@ -2789,12 +2803,17 @@ describe('automateOpenPlatformSetup', () => {
     const sessionFile = join(dir, 'feishu-session.json');
     writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
     const calls: string[] = [];
-    const fetchImpl = (async (url: string | URL | Request) => {
+    let redirects: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
       calls.push(href);
       if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
       if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
-      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+      if (href.includes('/safe_setting/update/')) {
+        redirects = JSON.parse(String(init?.body)).redirectURL;
+        return Response.json({ code: 0 });
+      }
+      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: redirects } });
       // scope/all 失败会让整个流程提前 return——白名单必须在这之前就已经落地。
       if (href.includes('/scope/all/')) return new Response('forbidden', { status: 403 });
       throw new Error(`unexpected url: ${href}`);
@@ -2806,6 +2825,43 @@ describe('automateOpenPlatformSetup', () => {
     expect(calls.some(u => u.includes('/safe_setting/update/cli_x'))).toBe(true);
     if (!result.ok) expect(result.redirectConfigured).toBe(true);
   });
+
+  it('写请求挂住时由白名单自身截止时间中断（automation 内联 postJson 必须把 signal 透传到底层 fetch）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    let writeSignal: AbortSignal | null | undefined;
+    let writes = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      if (href.includes('/safe_setting/update/')) {
+        writes++;
+        writeSignal = init?.signal;
+        // 挂住的写请求只会在收到实际传入 fetch 的取消信号时结束。
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+        });
+      }
+      if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+      // 回调段之后立即结束配置，让断言聚焦回调截止时间的处理。
+      if (href.includes('/scope/all/')) return new Response('forbidden', { status: 403 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_x', sessionFilePath: sessionFile, fetchImpl,
+      redirectWriteTimeoutMs: 20,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+
+    expect(writes).toBe(1);
+    expect(writeSignal).toBeInstanceOf(AbortSignal);
+    expect(writeSignal?.aborted).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.redirectWarning).toContain('超时');
+  }, 5000);
 
   it('keeps going and reports a warning when the redirect whitelist cannot be written', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
@@ -2935,7 +2991,11 @@ describe('automateOpenPlatformSetup', () => {
           : Response.json({ code: 0 });
       }
       if (href.includes('/safe_setting/')) {
-        return Response.json({ code: 0, data: { redirectURL: ['https://console.example.com/my-own-callback'] } });
+        return Response.json({ code: 0, data: {
+          redirectURL: redirectWrites.length > 1
+            ? redirectWrites.at(-1)
+            : ['https://console.example.com/my-own-callback'],
+        } });
       }
       if (href.includes('/scope/all/')) {
         return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });

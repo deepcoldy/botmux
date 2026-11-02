@@ -225,6 +225,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     codexAppCleanInput: j?.codexAppCleanInput === true,
     codexBrowser: j?.codexBrowser === true
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
+    codexBrowserAutoApproveOrigins: j?.codexBrowserAutoApproveOrigins === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,

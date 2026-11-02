@@ -126,6 +126,7 @@ import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
+import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -8232,14 +8233,7 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
   try {
     const fp = join(config.session.dataDir, 'bots-info.json');
     if (!existsSync(fp)) return [];
-    const entries = JSON.parse(readFileSync(fp, 'utf8')) as Array<{
-      larkAppId?: string;
-      botOpenId?: string | null;
-      botName?: string | null;
-      botAvatarUrl?: string | null;
-      cliId?: string;
-    }>;
-    if (!Array.isArray(entries)) return [];
+    const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(fp, 'utf8')));
     // Merge per-bot team-visibility config (showInTeam) from bots.json by
     // larkAppId so the platform team page can hide bots. Default: showInTeam =
     // true (shown). bots.json may be unreadable from the dashboard process →
@@ -8255,13 +8249,13 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
     }
     return entries
       .map((e) => {
-        const cfg = cfgByAppId.get(e.larkAppId || '');
+        const cfg = cfgByAppId.get(e.larkAppId);
         return {
-          appId: e.larkAppId || '',
-          openId: e.botOpenId ?? null,
+          appId: e.larkAppId,
+          openId: e.botOpenId,
           name: e.botName || e.larkAppId || 'bot',
           avatar: e.botAvatarUrl || undefined,
-          cli: e.cliId,
+          cli: e.cliId ?? undefined,
           showInTeam: cfg?.showInTeam !== false, // default true
           // 自家消息回声学到的租户稳定 union_id（可能尚未学到 → undefined）。
           // 平台聚合团队 roster 用，见 bot-union-ids-store / platform-team-store。

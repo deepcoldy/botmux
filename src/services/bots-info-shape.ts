@@ -18,6 +18,14 @@ export type BotsInfoRouteEntry = BotsInfoObjectEntry & {
   botName?: string | null;
 };
 
+export type NormalizedBotsInfoRouteEntry = {
+  larkAppId: string;
+  botOpenId: string | null;
+  botName: string | null;
+  botAvatarUrl: string | null;
+  cliId: string | null;
+};
+
 /** Keep only JSON object rows; null, scalars and nested arrays are malformed. */
 export function botsInfoObjectEntries(value: unknown): BotsInfoObjectEntry[] {
   if (!Array.isArray(value)) return [];
@@ -36,4 +44,19 @@ export function isBotsInfoRouteEntry(entry: BotsInfoObjectEntry): entry is BotsI
   return typeof entry.larkAppId === 'string'
     && entry.larkAppId.trim().length > 0
     && (entry.botName == null || typeof entry.botName === 'string');
+}
+
+/**
+ * Normalize the shared routing shape once at the file boundary. Consumers may
+ * need different fallbacks for optional fields, but none should receive a
+ * truthy scalar that only looked safe through a TypeScript cast.
+ */
+export function normalizeBotsInfoRouteEntries(value: unknown): NormalizedBotsInfoRouteEntry[] {
+  return botsInfoObjectEntries(value).filter(isBotsInfoRouteEntry).map(entry => ({
+    larkAppId: entry.larkAppId,
+    botOpenId: typeof entry.botOpenId === 'string' ? entry.botOpenId : null,
+    botName: typeof entry.botName === 'string' ? entry.botName : null,
+    botAvatarUrl: typeof entry.botAvatarUrl === 'string' ? entry.botAvatarUrl : null,
+    cliId: typeof entry.cliId === 'string' ? entry.cliId : null,
+  }));
 }

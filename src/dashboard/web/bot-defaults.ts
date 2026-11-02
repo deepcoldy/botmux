@@ -197,7 +197,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'codex-app-display',
     tab: 'advanced',
     titleKey: 'botDefaults.sectionCodexAppDisplay',
-    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.noProgressNotify', 'botDefaults.noProgressNotifyTimeoutLabel'],
+    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.codexBrowserAutoApproveOrigins', 'botDefaults.noProgressNotify', 'botDefaults.noProgressNotifyTimeoutLabel'],
   },
   {
     id: 'codex-runtime',
@@ -444,6 +444,7 @@ export type BotDefaultsRow = {
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
   codexBrowser?: boolean;
+  codexBrowserAutoApproveOrigins?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
