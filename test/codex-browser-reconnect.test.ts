@@ -147,12 +147,22 @@ describe.sequential('browser connection recovery', () => {
   it.each(['Permission denied by browser safety policy', 'Locator deadline exceeded'])(
     'keeps its binding after a non-transport failure: %s', async message => {
       const fake = fakeModules();
+      const get = vi.fn(async () => fake.browser);
+      fake.modules.setupBrowserRuntime = vi.fn(async () => ({ browsers: { get } }));
       broker = new CodexBrowserBroker({ sessionId: 'non-transport-error', family: 'chrome', modules: fake.modules });
       await broker.handleToolCall(call({ operation: 'claim_tab', tabId: 'user-7' }));
       fake.tab.ax.click.mockRejectedValueOnce(new Error(message));
-      expect((await broker.handleToolCall(call({ operation: 'click', tabId: 'claimed-7', elementIndex: 12 }))).success).toBe(false);
+      const failed = await broker.handleToolCall(call({ operation: 'click', tabId: 'claimed-7', elementIndex: 12 }));
+      expect(failed.success).toBe(false);
+      // State-level proof that no invalidation happened: the claimed tab cache
+      // stays usable through its old id, family discovery is not re-run, and the
+      // failure is not misreported as a browser connection change.
+      expect((await broker.handleToolCall(call({ operation: 'snapshot', tabId: 'claimed-7' }))).success).toBe(true);
       expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+      expect(get).toHaveBeenCalledOnce();
       expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledOnce();
+      expect(fake.tab.ax.get).toHaveBeenCalledOnce();
+      expect((failed.contentItems[0] as { text: string }).text).not.toContain('Browser connection changed');
     },
   );
 
