@@ -133,6 +133,13 @@ jobs:
           BOTMUX_E2E_RECORD_VIDEO: "1"
         run: bun run test:midscene
 
+      # Artifacts of a public repository are downloadable by anyone signed in
+      # to GitHub: mask the model configuration before uploading
+      # (scripts/midscene-redact.mjs; the MIDSCENE_MODEL_* values are in the job env).
+      - name: Mask secrets in the Dashboard Midscene data
+        if: always() && !cancelled()
+        run: node scripts/midscene-redact.mjs midscene_run/dashboard test/midscene/midscene_run
+
       - name: Upload Dashboard Midscene data
         if: always() && !cancelled()
         uses: actions/upload-artifact@v7
@@ -369,6 +376,12 @@ jobs:
           FEISHU_E2E_CONCURRENCY: ${{ inputs.feishu_concurrency || '4' }}
         run: bun run test:midscene:feishu
 
+      # Same as the Dashboard data, plus the Feishu tenant address the cases'
+      # page URLs carry (FEISHU_TEST_GROUP_URL, in the job env).
+      - name: Mask secrets in the Feishu Midscene data
+        if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
+        run: node scripts/midscene-redact.mjs midscene_run/runs test/e2e-browser/midscene_run
+
       - name: Upload Feishu Midscene data
         if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
         uses: actions/upload-artifact@v7
@@ -474,6 +487,7 @@ jobs:
           MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
           MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
           MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
+          FEISHU_TEST_GROUP_URL: ${{ secrets.FEISHU_TEST_GROUP_URL }}
         run: |
           arguments=(
             --dashboard-report-root test/midscene/midscene_run
@@ -502,6 +516,7 @@ jobs:
           MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
           MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
           MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
+          FEISHU_TEST_GROUP_URL: ${{ secrets.FEISHU_TEST_GROUP_URL }}
         run: |
           node scripts/render-midscene-summary.mjs \
             --results midscene_run/dashboard/results \
