@@ -272,3 +272,169 @@ describe('read-only projection tolerates a corrupt journal (hardening #11 carve-
     }
   });
 });
+
+describe('v3 ops-projection — 负责 Bot、耗时与尝试记录', () => {
+  /** Write journal lines with explicit `ts` so timing assertions are exact. */
+  function writeJournal(runDir: string, events: Array<Record<string, unknown> & { ts: number }>): void {
+    writeFileSync(join(runDir, 'journal.ndjson'), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  }
+
+  function buildTimedRun(base: string, opts: { snapshot?: boolean } = {}): string {
+    const runId = 'timed-261103-0101';
+    const runDir = join(base, runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+      runId,
+      nodes: [
+        { id: 'research', type: 'goal', goal: '调研', depends: [], inputs: [] },
+        { id: 'report', type: 'goal', goal: '写报告', bot: 'cli_writer', depends: ['research'], inputs: [] },
+        { id: 'approve', type: 'goal', goal: '确认', depends: ['research'], inputs: [], humanGate: { prompt: 'ok?', options: ['approve', 'reject'] } },
+        { id: 'send', type: 'host', executor: 'feishu-send', depends: ['report'], inputs: [], input: {} },
+        {
+          id: 'fix', type: 'loop', maxIterations: 2, bot: 'cli_writer', depends: ['research'], inputs: [],
+          body: { nodes: [
+            { id: 'code', type: 'goal', goal: '改代码', depends: [], inputs: [] },
+            { id: 'verify', type: 'goal', goal: '验证', bot: 'cli_checker', depends: ['code'], inputs: [] },
+          ] },
+          exit: { node: 'verify', when: { path: 'result.passed', equals: true } },
+          output: { from: 'code' },
+        },
+      ],
+    }));
+    if (opts.snapshot !== false) {
+      writeFileSync(join(runDir, 'bots.snapshot.json'), JSON.stringify({
+        '': {
+          larkAppId: 'cli_default', cliId: 'claude-code', model: 'opus',
+          workingDir: '/private/default-wd', sandboxPaths: { readWrite: ['/private/rw'] }, wrapperCli: 'secret-wrapper',
+        },
+        cli_writer: { larkAppId: 'cli_writer', cliId: 'codex', workingDir: '/private/writer-wd' },
+        cli_checker: { larkAppId: 'cli_checker', cliId: 'seed', workingDir: '/private/checker-wd' },
+      }));
+    }
+    writeJournal(runDir, [
+      { ts: 1_000, type: 'runStarted', runId },
+      // research: blocked on attempt 1, retried, succeeded on attempt 2
+      { ts: 1_000, type: 'nodeDispatched', nodeId: 'research', attemptId: 'research/attempts/001' },
+      { ts: 5_000, type: 'nodeBlocked', nodeId: 'research', attemptId: 'research/attempts/001', errorClass: 'contractViolation', errorCode: 'MANIFEST_MISSING', message: '/private/path leaked?' },
+      { ts: 6_000, type: 'nodeRetryRequested', nodeId: 'research', previousAttemptId: 'research/attempts/001', nextAttemptId: 'research/attempts/002', reason: 'blockedRetry' },
+      { ts: 9_000, type: 'nodeDispatched', nodeId: 'research', attemptId: 'research/attempts/002' },
+      { ts: 12_000, type: 'nodeSucceeded', nodeId: 'research', attemptId: 'research/attempts/002', manifestPath: join(runDir, 'research/attempts/002/manifest.json') },
+      // report: running on its named bot
+      { ts: 13_000, type: 'nodeDispatched', nodeId: 'report', attemptId: 'report/attempts/001' },
+      // approve: waiting on a human gate
+      { ts: 14_000, type: 'gateDispatched', nodeId: 'approve', waitId: 'approve-gate' },
+      // fix loop: round 1, body instance `code` running on the loop's bot
+      { ts: 15_000, type: 'loopStarted', loopId: 'fix' },
+      { ts: 15_000, type: 'loopIterationStarted', loopId: 'fix', iteration: 1 },
+      { ts: 16_000, type: 'nodeDispatched', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', loop: { loopId: 'fix', iteration: 1, bodyNodeId: 'code' } },
+    ]);
+    return runDir;
+  }
+
+  it('按冻结快照投影负责 Bot（默认 Bot / 指名 Bot / Loop 继承），宿主节点只给执行器，且不泄露快照里的其它字段', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-bot-'));
+    try {
+      const runDir = buildTimedRun(base);
+      const names: Record<string, string> = { cli_default: '主Bot', cli_writer: '写作Bot' };
+      const view = projectRun('timed-261103-0101', runDir, { botName: (id) => names[id], now: () => 20_000 });
+      const byId = new Map(view.nodes.map((n) => [n.id, n]));
+
+      expect(byId.get('research')!.bot).toEqual({ larkAppId: 'cli_default', cliId: 'claude-code', model: 'opus', name: '主Bot' });
+      expect(byId.get('report')!.bot).toEqual({ selector: 'cli_writer', larkAppId: 'cli_writer', cliId: 'codex', name: '写作Bot' });
+      // loop body instance: body node without its own bot inherits the loop's selector
+      expect(byId.get('fix.i001.code')!.bot).toEqual({ selector: 'cli_writer', larkAppId: 'cli_writer', cliId: 'codex', name: '写作Bot' });
+      // host node: executor, never a bot; loop container: neither
+      expect(byId.get('send')!.host).toEqual({ executor: 'feishu-send' });
+      expect(byId.get('send')!.bot).toBeUndefined();
+      expect(byId.get('fix')!.bot).toBeUndefined();
+
+      const json = JSON.stringify(view);
+      for (const secret of ['/private/', 'workingDir', 'sandboxPaths', 'secret-wrapper', 'leaked']) {
+        expect(json).not.toContain(secret);
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('没有 bots.snapshot.json 时回退到 DAG 里写的选择器，不臆造默认 Bot', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-bot-'));
+    try {
+      const runDir = buildTimedRun(base, { snapshot: false });
+      const view = projectRun('timed-261103-0101', runDir);
+      const byId = new Map(view.nodes.map((n) => [n.id, n]));
+      expect(byId.get('report')!.bot).toEqual({ selector: 'cli_writer' });
+      expect(byId.get('research')!.bot).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('按 journal 时间戳给出当前尝试的起止、审批等待起点和全部尝试记录', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-time-'));
+    try {
+      const runDir = buildTimedRun(base);
+      const view = projectRun('timed-261103-0101', runDir, { now: () => 20_000 });
+      const byId = new Map(view.nodes.map((n) => [n.id, n]));
+      expect(view.generatedAt).toBe(20_000);
+
+      const research = byId.get('research')!;
+      expect(research.status).toBe('done');
+      // current attempt is the retry: 9s → 12s, not the first dispatch at 1s
+      expect(research.startedAt).toBe(9_000);
+      expect(research.endedAt).toBe(12_000);
+      expect(research.attempts).toEqual([
+        { attemptId: 'research/attempts/001', startedAt: 1_000, endedAt: 5_000, outcome: 'blocked', errorCode: 'MANIFEST_MISSING' },
+        { attemptId: 'research/attempts/002', startedAt: 9_000, endedAt: 12_000, outcome: 'succeeded' },
+      ]);
+
+      const report = byId.get('report')!;
+      expect(report.status).toBe('running');
+      expect(report.startedAt).toBe(13_000);
+      expect(report.endedAt).toBeUndefined();
+
+      const approve = byId.get('approve')!;
+      expect(approve.status).toBe('gateWaiting');
+      expect(approve.gateSince).toBe(14_000);
+      expect(approve.startedAt).toBeUndefined();
+
+      const loop = byId.get('fix')!;
+      expect(loop.startedAt).toBe(15_000);
+      expect(loop.endedAt).toBeUndefined();
+
+      const pendingHost = byId.get('send')!;
+      expect(pendingHost.status).toBe('pending');
+      expect(pendingHost.startedAt).toBeUndefined();
+      expect(pendingHost.attempts).toEqual([]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('被 daemon 重启打断的尝试记为「中断」，不会把节点时间算到下一次尝试之前', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-drain-'));
+    try {
+      const runId = 'drain-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'a', type: 'goal', goal: 'x', depends: [], inputs: [] }],
+      }));
+      writeJournal(runDir, [
+        { ts: 100, type: 'runStarted', runId },
+        { ts: 100, type: 'nodeDispatched', nodeId: 'a', attemptId: 'a/attempts/001' },
+        { ts: 400, type: 'nodeAttemptDrained', nodeId: 'a', attemptId: 'a/attempts/001', reason: 'orphanRecovery' },
+        { ts: 500, type: 'nodeDispatched', nodeId: 'a', attemptId: 'a/attempts/002' },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 900 });
+      const a = view.nodes[0]!;
+      expect(a.attempts.map((x) => [x.attemptId, x.outcome, x.endedAt])).toEqual([
+        ['a/attempts/001', 'interrupted', 400],
+        ['a/attempts/002', undefined, undefined],
+      ]);
+      expect(a.startedAt).toBe(500);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
