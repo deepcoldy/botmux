@@ -9,6 +9,8 @@ import {
   type CliOptionsState,
 } from '../src/dashboard/web/bot-defaults.js';
 import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotOnboardingDialog } from '../src/dashboard/web/bot-onboarding.js';
+import { ModelPickerField } from '../src/dashboard/web/field-controls.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -88,6 +90,103 @@ describe('BotAgentSection runtime catalog hydration', () => {
         await Promise.resolve();
       });
       expect(renderer.root.findByProps({ dataInput: 'agentModel' }).props.options).toEqual(['new-live']);
+    } finally {
+      if (renderer) act(() => renderer.unmount());
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+});
+
+describe('BotAgentSection 主模型选择器', () => {
+  it('已选模型时下拉仍提供「跟随 CLI 默认」，点选后清空模型值', async () => {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ models: ['gpt-6.1-sol', 'gpt-6-astra'], source: 'live' }),
+    }));
+
+    const cliOptions: CliOptionsState = {
+      options: [{ id: 'codex', label: 'Codex', modelChoices: ['static-model'] }],
+      ttadkModelDefault: '',
+      ttadkModelSuggestions: [],
+    };
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+          bot: {
+            larkAppId: 'cli_model_default_reset',
+            cliId: 'codex',
+            agentSelectionKey: 'codex',
+            model: 'gpt-6.1-sol',
+          },
+          sessionFallback: 'codex',
+          cliState: cliOptions,
+          patchBot: () => undefined,
+        }));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const menu = renderer.root.findByProps({ id: 'bd-menu-agentModel' });
+      const optionValues = menu.props.options.map((option: { value: string }) => option.value);
+      expect(optionValues).toContain('');
+
+      await act(async () => {
+        menu.props.onChange('');
+      });
+      expect(renderer.root.findByType(ModelPickerField).props.value).toBe('');
+    } finally {
+      if (renderer) act(() => renderer.unmount());
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+});
+
+describe('BotOnboardingDialog 模型选择器', () => {
+  it('已选模型时下拉仍提供「跟随 CLI 默认」，点选后清空模型值', async () => {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async (url: string) => {
+      if (url.includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: ['gpt-6.1-sol', 'gpt-6-astra'], source: 'live' }) } as any;
+      }
+      if (url.includes('/api/cli-options/availability')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'available' }) } as any;
+      }
+      if (url.includes('/api/cli-options')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ options: [{ id: 'codex', label: 'Codex', modelChoices: ['gpt-6.1-sol'] }], ttadkModelSuggestions: [] }),
+        } as any;
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    try {
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(BotOnboardingDialog, { open: true, onClose: () => undefined }));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const menu = renderer.root.findByProps({ id: 'bd-menu-ob-model' });
+      expect(menu.props.options.map((option: { value: string }) => option.value)).toContain('');
+
+      await act(async () => {
+        menu.props.onChange('gpt-6.1-sol');
+      });
+      const afterPick = renderer.root.findByProps({ id: 'bd-menu-ob-model' });
+      const optionValues = afterPick.props.options.map((option: { value: string }) => option.value);
+      expect(optionValues).toContain('');
+
+      await act(async () => {
+        afterPick.props.onChange('');
+      });
+      expect(renderer.root.findByType(ModelPickerField).props.value).toBe('');
     } finally {
       if (renderer) act(() => renderer.unmount());
       (globalThis as any).fetch = previousFetch;
