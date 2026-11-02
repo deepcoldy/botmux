@@ -640,4 +640,70 @@ describe('v3 ops-projection — 负责 Bot、耗时与尝试记录', () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  it('宿主重试在 intent 之前就被 nodeBlocked 时，结束时间取这次阻断而不是上一次尝试的结束', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-hostretry-'));
+    try {
+      const runId = 'hostretry-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'send', type: 'host', executor: 'feishu-send', depends: [], inputs: [], input: {} }],
+      }));
+      const hostFields = (attemptId: string) => ({
+        nodeId: 'send', instanceId: 'send#001', attemptId, executor: 'feishu-send', provider: 'x',
+        inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+        inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+      });
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 2_000, type: 'hostInputPrepared', ...hostFields('send#001/attempts/001') },
+        { ts: 3_000, type: 'hostEffectIntent', ...hostFields('send#001/attempts/001') },
+        { ts: 8_000, type: 'hostEffectUncertain', nodeId: 'send', instanceId: 'send#001', attemptId: 'send#001/attempts/001', executor: 'feishu-send', reason: 'providerUncertain', errorCode: 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED' },
+        { ts: 8_000, type: 'runBlocked', blockedNodeId: 'send' },
+        { ts: 9_000, type: 'nodeRetryRequested', nodeId: 'send', instanceId: 'send#001', previousAttemptId: 'send#001/attempts/001', nextAttemptId: 'send#001/attempts/002', reason: 'blockedRetry', resetGate: true },
+        // attempt 2 is rejected by the pre-intent precondition, so it never opens
+        // an attempt row: the LAST attempt is still attempt 1.
+        { ts: 9_500, type: 'hostInputPrepared', ...hostFields('send#001/attempts/002') },
+        { ts: 10_000, type: 'nodeBlocked', nodeId: 'send', instanceId: 'send#001', attemptId: 'send#001/attempts/002', errorClass: 'resultInvalid', errorCode: 'HOST_INPUT_PRECONDITION_FAILED', message: 'x' },
+        { ts: 10_000, type: 'runBlocked', blockedNodeId: 'send' },
+      ]);
+      const node = projectRun(runId, runDir, { now: () => 60_000 }).nodes[0]!;
+      expect(node.status).toBe('blocked');
+      expect(node.errorCode).toBe('HOST_INPUT_PRECONDITION_FAILED');
+      expect(node.attempts.map((attempt) => attempt.attemptId)).toEqual(['send#001/attempts/001']);
+      // 耗时与「等人」都按这次阻断算，而不是上一次尝试的 8_000。
+      expect(node.startedAt).toBe(3_000);
+      expect(node.endedAt).toBe(10_000);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('被替代实例的迟到 nodeSucceeded 不当作节点的结束时间（materialize 已冻结该实例）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-stalesettle-'));
+    try {
+      const runId = 'stalesettle-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'a', type: 'goal', goal: 'a', depends: [], inputs: [] }],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 2_000, type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001' },
+        { ts: 3_000, type: 'nodeInstanceSuperseded', nodeId: 'a', instanceId: 'a#001', byNodeId: 'z', reason: 'refresh' },
+        { ts: 4_000, type: 'nodeDispatched', nodeId: 'a', instanceId: 'a#002', attemptId: 'a#002/attempts/001' },
+        { ts: 5_000, type: 'nodeBlocked', nodeId: 'a', instanceId: 'a#002', attemptId: 'a#002/attempts/001', errorClass: 'workerError', errorCode: 'X' },
+        { ts: 6_000, type: 'runBlocked', blockedNodeId: 'a' },
+        { ts: 9_000, type: 'nodeSucceeded', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001', manifestPath: join(runDir, 'm.json') },
+      ]);
+      const node = projectRun(runId, runDir, { now: () => 60_000 }).nodes[0]!;
+      expect(node.status).toBe('blocked');
+      expect(node.endedAt).toBe(5_000);
+      expect(node.startedAt).toBe(4_000);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });

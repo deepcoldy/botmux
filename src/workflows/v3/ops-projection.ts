@@ -266,6 +266,14 @@ function readBotSnapshots(runDir: string): Map<string, Omit<RunNodeBotView, 'sel
   return out;
 }
 
+/** Newest of the given journal stamps (undefined entries ignored). */
+function latestStamp(stamps: Array<number | undefined>): number | undefined {
+  return stamps.reduce<number | undefined>(
+    (latest, ts) => (ts === undefined || (latest !== undefined && ts < latest) ? latest : ts),
+    undefined,
+  );
+}
+
 const TERMINAL_NODE_STATUSES = new Set<V3NodeStatus>([
   'done', 'failed', 'blocked', 'cancelled', 'skipped', 'superseded',
 ]);
@@ -323,6 +331,9 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
   // a new waitId) cannot clear the NEW gate's pending timestamp. Mirrors
   // materialize's first-wins-per-waitId rule.
   const pendingGateWait = new Map<string, string>();
+  // Instance ids materialize FROZEN as superseded: their late settle events are
+  // ignored by the canonical fold, so they must not stamp the node either.
+  const supersededInstances = new Set<string>();
   const endAttempt = (
     attemptId: string | undefined,
     ts: number,
@@ -361,13 +372,13 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
       beginAttempt(e.nodeId, e.attemptId, e.ts, e.instanceId);
     } else if (e.type === 'nodeSucceeded') {
       endAttempt(e.attemptId, e.ts, 'succeeded');
-      terminalAt.set(e.nodeId, e.ts);
+      if (!(e.instanceId && supersededInstances.has(e.instanceId))) terminalAt.set(e.nodeId, e.ts);
     } else if (e.type === 'nodeFailed') {
       endAttempt(e.attemptId, e.ts, 'failed', e.errorCode);
-      terminalAt.set(e.nodeId, e.ts);
+      if (!(e.instanceId && supersededInstances.has(e.instanceId))) terminalAt.set(e.nodeId, e.ts);
     } else if (e.type === 'nodeBlocked') {
       endAttempt(e.attemptId, e.ts, 'blocked', e.errorCode);
-      terminalAt.set(e.nodeId, e.ts);
+      if (!(e.instanceId && supersededInstances.has(e.instanceId))) terminalAt.set(e.nodeId, e.ts);
     } else if (e.type === 'nodeCancelled') {
       endAttempt(e.attemptId, e.ts, 'cancelled');
       cancelledAt.set(e.nodeId, e.ts);
@@ -376,6 +387,7 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
     } else if (e.type === 'nodeAttemptDrained') {
       endAttempt(e.attemptId, e.ts, 'interrupted');
     } else if (e.type === 'nodeInstanceSuperseded') {
+      supersededInstances.add(e.instanceId);
       for (const attempt of attemptsByNode.get(e.nodeId) ?? []) {
         if (attempt.instanceId === e.instanceId) endAttempt(attempt.attemptId, e.ts, 'superseded');
       }
@@ -491,13 +503,16 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
       view.startedAt = startedAt;
     }
     if (TERMINAL_NODE_STATUSES.has(status)) {
-      const endedAt = status === 'skipped'
-        ? skippedAt.get(id)
-        : status === 'superseded'
-          ? supersededAt.get(id) ?? current?.endedAt
+      // Latest known stamp, not a priority chain: a retry can settle the node
+      // WITHOUT opening an attempt row (host input rejected before its intent),
+      // so the node-level terminal stamp can be newer than the last attempt's end.
+      const endedAt = latestStamp(
+        status === 'skipped' ? [skippedAt.get(id)] : status === 'superseded'
+          ? [supersededAt.get(id), current?.endedAt]
           : status === 'cancelled'
-            ? current?.endedAt ?? cancelledAt.get(id)
-            : current?.endedAt ?? terminalAt.get(id) ?? blockedAt.get(id);
+            ? [cancelledAt.get(id), current?.endedAt]
+            : [terminalAt.get(id), current?.endedAt, blockedAt.get(id)],
+      );
       if (endedAt !== undefined) view.endedAt = endedAt;
     }
     if (status === 'gateWaiting') {
