@@ -92,8 +92,18 @@ const baseShape = {
   chatBinding: chatBindingSchema.optional(),
 };
 
+/**
+ * Goal-node execution mode, frozen at authorization (design D1). Absent =
+ * ephemeral CLI workers (the historical behaviour). `bot` = each goal node is
+ * handed off to a bot session and completes through a structured submission.
+ * Only daemon-driven ad-hoc / saved runs may carry it; older readers reject
+ * the key through `.strict()`, so a new-mode run is never driven the old way.
+ */
+const nodeExecutorSchema = z.literal('bot').optional();
+
 const adHocEnvelopeSchema = z.object({
   ...baseShape,
+  nodeExecutor: nodeExecutorSchema,
   source: z.object({
     kind: z.literal('ad_hoc'),
     grillStatePath: z.literal('grill.state.json'),
@@ -114,6 +124,7 @@ const adHocEnvelopeSchema = z.object({
 
 const savedDefinitionEnvelopeSchema = z.object({
   ...baseShape,
+  nodeExecutor: nodeExecutorSchema,
   source: z.object({
     kind: z.literal('saved_definition'),
     workflowId: runIdSchema,
@@ -802,6 +813,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
   authorizedAt: string;
   authorizedByOpenId?: string;
   artifacts: V3AdHocRunEnvelope['artifacts'];
+  nodeExecutor?: 'bot';
 }): V3AdHocRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,
@@ -809,6 +821,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
     runId: input.runId,
     createdAt: input.createdAt,
     ...(input.chatBinding ? { chatBinding: input.chatBinding } : {}),
+    ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
     source: { kind: 'ad_hoc', grillStatePath: 'grill.state.json' },
     artifacts: input.artifacts,
     authorization: {
@@ -827,6 +840,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
   humanVersion: number;
   authorizedAt: string;
   artifacts: V3SavedDefinitionRunEnvelope['artifacts'];
+  nodeExecutor?: 'bot';
 }): V3SavedDefinitionRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,
@@ -834,6 +848,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
     runId: input.runId,
     createdAt: input.createdAt,
     ...(input.chatBinding ? { chatBinding: input.chatBinding } : {}),
+    ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
     source: {
       kind: 'saved_definition',
       workflowId: input.workflowId,
