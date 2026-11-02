@@ -5068,6 +5068,12 @@ export interface OwnerBatchTurnInput {
   ownerOpenId?: string;
   ownerName?: string;
   sessionTitle: string;
+  /**
+   * 静默回合（群秘书摘要用）：按定时任务 --silent 同一套 turn 级登记，worker→飞书的
+   * 自动输出（流式卡、兜底最终回复）全部压掉，只有模型主动 `botmux send` 的内容可见；
+   * 也不刷新人活动钟、不清会话举手（这不是真人刚发的消息）。缺省 = 看板批次原行为。
+   */
+  silent?: boolean;
 }
 
 /**
@@ -5109,6 +5115,8 @@ export async function deliverOwnerBatchTurn(
   const postBanner = async (): Promise<string | undefined> => {
     if (bannerAttempted) return bannerId;
     bannerAttempted = true;
+    // 没有横幅正文（群秘书静默回合）：不发任何东西，落点回落 chat 锚点。
+    if (!firstText) return undefined;
     try {
       bannerId = await sendMessage(larkAppId, chatId, firstText);
     } catch (err: any) {
@@ -5181,8 +5189,10 @@ export async function deliverOwnerBatchTurn(
         const sharedTopicRootId = sharedRootFor(await postBanner());
         // 批次就是 owner 刚点的提交：按真人入站同口径刷新人活动钟，并清掉管家的决策举手
         // （否则 Dashboard「需要你」常亮，且空闲自动关闭会一直跳过这个会话）。
-        markSessionActivity(existing, Date.now(), { human: !!input.ownerOpenId });
-        clearAgentAttention(existing);
+        if (!input.silent) {
+          markSessionActivity(existing, Date.now(), { human: !!input.ownerOpenId });
+          clearAgentAttention(existing);
+        }
         ensureSessionWhiteboard(existing);
         if (sharedTopicRootId) {
           beginReplyTargetTurn(existing, sharedTopicRootId, turnId);
@@ -5204,6 +5214,7 @@ export async function deliverOwnerBatchTurn(
           trustedCaller,
         });
         rememberLastCliInput(existing, input.prompt, payload);
+        if (input.silent) armSilentScheduledTurn(existing, turnId);
         if (existing.worker && !existing.worker.killed) {
           try {
             if (sendWorkerInput(existing, payload, turnId, trustedCaller ? { trustedCaller } : {})) {
@@ -5215,9 +5226,15 @@ export async function deliverOwnerBatchTurn(
           }
         }
         if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          if (input.silent) disarmSilentScheduledTurn(existing, turnId);
           throw new Error(`steward session ${existing.session.sessionId} is no longer active`);
         }
-        forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
+        try {
+          forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
+        } catch (err) {
+          if (input.silent) disarmSilentScheduledTurn(existing, turnId);
+          throw err;
+        }
         logger.info(`[decision-board] Batch turn ${turnId} cold-resumed steward session ${existing.session.sessionId}`);
         return { sessionId: existing.session.sessionId };
       }
@@ -5237,7 +5254,8 @@ export async function deliverOwnerBatchTurn(
     if (input.ownerOpenId) {
       session.ownerOpenId = input.ownerOpenId;
       // 批次按 owner 本人的消息投递，新人活动钟与真人开话题同口径（follow-active 据此落点）。
-      stampHumanActivity(session, now);
+      // 静默回合不是真人消息，不刷人活动钟。
+      if (!input.silent) stampHumanActivity(session, now);
     }
     session.lastMessageAt = new Date(now).toISOString();
     sessionStore.updateSession(session);
@@ -5290,9 +5308,11 @@ export async function deliverOwnerBatchTurn(
         + (winner ? ` to ${winner.session.sessionId}` : ''));
     }
     rememberLastCliInput(ds, input.prompt, prompt);
+    if (input.silent) armSilentScheduledTurn(ds, turnId);
     try {
       forkWorker(ds, prompt, turnId);
     } catch (err) {
+      if (input.silent) disarmSilentScheduledTurn(ds, turnId);
       await releaseStartRefusedForMissingDir(ds, err);
       throw err;
     }

@@ -230,7 +230,7 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
  * declaring one would never receive it.
  */
 const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([
-  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode',
+  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode', '/secretary',
   '/substitute', '/reply-mode', '/workflow', '/template', '/invite',
 ]);
 
