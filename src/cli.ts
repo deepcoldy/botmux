@@ -2010,6 +2010,7 @@ async function cmdSetupScripted(
             : { forceQrLogin: true as const };
           const created = await createFeishuOpenPlatformApp({
             name: appName,
+            ...(cmd.flags.appIcon?.trim() ? { iconFilePath: resolve(cmd.flags.appIcon.trim()) } : {}),
             ...sessionOptions,
             disableBytedcliFallback: true,
             onSessionReady: ({ identity, source }) => {
@@ -2374,12 +2375,20 @@ async function cmdSetupScripted(
 }
 
 async function cmdClone(argv: string[]): Promise<void> {
-  const [sourceSelector, nameFlag, requestedName] = argv;
-  if (
-    !sourceSelector
-    || (argv.length !== 1 && (argv.length !== 3 || nameFlag !== '--name' || !requestedName?.trim()))
-  ) {
-    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>]');
+  const [sourceSelector, ...rest] = argv;
+  let requestedName: string | undefined;
+  let iconPath: string | undefined;
+  let badArgs = !sourceSelector || sourceSelector.startsWith('-');
+  for (let i = 0; i < rest.length && !badArgs; i += 2) {
+    const flag = rest[i];
+    const value = rest[i + 1];
+    if (!value?.trim()) badArgs = true;
+    else if (flag === '--name' && requestedName === undefined) requestedName = value;
+    else if (flag === '--icon' && iconPath === undefined) iconPath = value;
+    else badArgs = true;
+  }
+  if (badArgs) {
+    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>] [--icon <PNG 路径>]');
     process.exitCode = 1;
     return;
   }
@@ -2403,8 +2412,8 @@ async function cmdClone(argv: string[]): Promise<void> {
   }
   const addArgs = ['add', '--create-app', '--allowed-users', owners.join(',')];
   if (botBrand(source) === 'lark') {
-    if (requestedName) {
-      console.error('Lark SDK 创建路径暂不支持自定义应用名称。');
+    if (requestedName || iconPath) {
+      console.error('Lark SDK 创建路径暂不支持自定义应用名称或图标。');
       process.exitCode = 1;
       return;
     }
@@ -2414,6 +2423,7 @@ async function cmdClone(argv: string[]): Promise<void> {
       ? source.displayName.trim()
       : botProcessName(source, sourceIndex);
     addArgs.push('--app-name', resolveCloneAppName(requestedName, sourceName));
+    if (iconPath) addArgs.push('--app-icon', iconPath);
   }
   await cmdSetupScripted(addArgs, source);
 }
