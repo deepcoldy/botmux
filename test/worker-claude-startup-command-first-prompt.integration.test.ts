@@ -79,7 +79,7 @@ const render = () => {
 };
 const record = content => {
   fs.mkdirSync(path.dirname(cfg.transcript), { recursive: true });
-  fs.appendFileSync(cfg.transcript, JSON.stringify({ type: 'user', message: { role: 'user', content } }) + '\\n');
+  fs.appendFileSync(cfg.transcript, JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content } }) + '\\n');
 };
 let busy = null;
 const startRedraws = () => {
