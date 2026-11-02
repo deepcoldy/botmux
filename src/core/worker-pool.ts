@@ -9718,8 +9718,9 @@ export type CloseSessionResult =
 export async function closeSessionForBackgroundCleanup(
   sessionId: string,
   context: string,
+  opts?: { backgroundExecutionCleanup?: boolean },
 ): Promise<CloseSessionResult> {
-  const result = await closeSession(sessionId);
+  const result = await closeSession(sessionId, opts);
   const tagId = sessionId.slice(0, 8);
   if (!result.ok) {
     logger.error(
@@ -9743,7 +9744,7 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -9886,7 +9887,7 @@ export async function closeSession(
 
   // Mutations are bot-owner scoped. getSession() has a read-only cross-file
   // fallback for agent CLI discovery, so it must not authorize close.
-  if (wasOpen) {
+  if (wasOpen || (stored?.backgroundExecutionCleanupClosedAt && !opts?.backgroundExecutionCleanup)) {
     if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
     try {
       // Parking is handed to the store as part of ITS transaction rather than
@@ -9895,6 +9896,7 @@ export async function closeSession(
       // a field it never set). Same mistake as the early lineage clear fixed
       // earlier — one layer up.
       sessionStore.closeSession(sessionId, {
+        ...(opts?.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
         cleanupBridgeMarkers: !hadLiveWorker,
         ...(opts?.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
         ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),

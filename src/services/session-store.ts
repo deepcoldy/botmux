@@ -2664,6 +2664,7 @@ export function markMojoCloseUnresolved(
 export function closeSession(
   sessionId: string,
   opts: {
+    backgroundExecutionCleanup?: boolean;
     cleanupBridgeMarkers?: boolean;
     workspaceRetirement?: Session['workspaceRetirement'];
     clearRiffParentTaskId?: boolean;
@@ -2722,6 +2723,7 @@ export function closeSession(
     const next: Session = { ...session };
     const applied = applySessionRowCommand(next, {
       type: 'close',
+      ...(opts.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
       ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
       ...(opts.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
@@ -2790,6 +2792,7 @@ export function reactivateClosedSession(
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
+  next.backgroundExecutionCleanupClosedAt = undefined;
   next.lastMessageAt = new Date().toISOString();
   next.codexAppDispatchLedger = undefined;
   next.codexAppGenerationCommits = undefined;
