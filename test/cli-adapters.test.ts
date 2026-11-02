@@ -1293,11 +1293,13 @@ describe('codex-app buildArgs', () => {
         enabled: true,
         family: 'edge',
         pluginRoot: '/opt/codex/chrome-plugin',
+        autoApproveOrigins: true,
       },
     });
     expect(enabled).toEqual(expect.arrayContaining([
       '--browser-family', 'edge',
       '--browser-plugin-root', '/opt/codex/chrome-plugin',
+      '--browser-auto-approve-origins',
     ]));
   });
 });

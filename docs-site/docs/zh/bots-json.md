@@ -64,7 +64,7 @@
 | `codexCapacityRecovery` | **默认关闭**。仅对托管 Codex / Codex App 飞书会话的明确模型容量错误自动续跑，设为 `true` 开启；可用 `/botconfig set codexCapacityRecovery on` / `off` 在线切换。每个任务最多追加两条恢复输入，可能保留在原生模型上下文中，关闭不会删除已有历史；不针对特定 provider，普通限流与额度耗尽不适用。 |
 | `suppressDeliveredFinalFailureNotice` | **实验性、默认关闭**。设为 `true` 后，结构化转写会话（如 Codex）中同一轮、同一次执行尝试已带飞书回执送达显式 final（`botmux send --response-kind final` 或托管 final 卡）时，收尾阶段再遇到模型服务错误（如 527）只记日志与失败终态，不再补发「模型连接失败」通知。该开关信任已送达的 final，不比对模型事后续写的文本；进度 / 补充消息、未带回执或跨轮次的发送不受影响。缺省 / `false` 与此前行为一致。可用 `/botconfig set suppressDeliveredFinalFailureNotice on` / `off` 切换，下个 worker 启动生效 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
-| `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。可在 Dashboard 的“高级 → Codex App”中开关；设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome。对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`，详见下方说明 |
+| `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。可在 Dashboard 的“高级 → Codex App”中开关；设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome。对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径", "autoApproveOrigins"?: true }`，详见下方说明 |
 
 `nativeSubagentRuntime` 只改写 Trae 原生 `spawn_agent` 创建的新子代理，不改变父代理自身配置。缺少某一维时透传子代理请求中的原值；`custom` 使用固定值。自定义模型和自定义思考强度同时设置时，BotMux 会校验该组合是否受 Trae 支持。切换到其它 CLI 会自动删除此字段。Dashboard 中“透传子代理请求”对应字段缺失；该策略属于 Bot 行为配置，克隆 Bot 时会复制，但不会进入可移植 Agent preset。旧版 `mode: "inherit"` 配置无效且不会生效。
 
@@ -188,6 +188,12 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
   "cliId": "codex-app",
   "codexBrowser": true
 }
+```
+
+在同一设置区开启“自动允许浏览器站点访问”，此 Bot 的新浏览器会话访问 HTTP/HTTPS 站点时将不再弹出逐站授权卡。默认关闭；登录凭据、上传下载、浏览历史和完整开发者工具访问不在自动授权范围内。已有会话重启或恢复后加载设置。该选项只向浏览器插件授予当前会话权限，不写入“始终允许”的站点记录。
+
+```json
+{ "codexBrowser": { "enabled": true, "family": "chrome", "autoApproveOrigins": true } }
 ```
 
 - 需要先在同一 OS 用户的 Chrome / Edge 中安装并启用 Codex 浏览器扩展；Botmux 默认从 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存中选择最新完整版本。只有维护自定义插件目录时才填写绝对路径 `pluginRoot`。

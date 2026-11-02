@@ -24,5 +24,13 @@ describe('normalizeCodexBrowserConfig', () => {
     expect(() => normalizeCodexBrowserConfig({ enabled: false })).toThrow('requires enabled: true');
     expect(() => normalizeCodexBrowserConfig({ enabled: true, family: 'firefox' })).toThrow('chrome');
     expect(() => normalizeCodexBrowserConfig({ enabled: true, pluginRoot: './relative' })).toThrow('absolute');
+    expect(() => normalizeCodexBrowserConfig({ enabled: true, autoApproveOrigins: 'true' })).toThrow('boolean');
+  });
+
+  it('requires an explicit boolean opt-in and preserves the configured browser', () => {
+    expect(normalizeCodexBrowserConfig({ enabled: true, family: 'edge', autoApproveOrigins: true }))
+      .toEqual({ enabled: true, family: 'edge', autoApproveOrigins: true });
+    expect(normalizeCodexBrowserConfig({ enabled: true, autoApproveOrigins: false }))
+      .toEqual({ enabled: true, family: 'chrome' });
   });
 });

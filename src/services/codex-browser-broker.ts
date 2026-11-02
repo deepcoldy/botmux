@@ -22,7 +22,7 @@ export const CODEX_BROWSER_DYNAMIC_TOOL = {
     'Call capabilities after claiming a tab. Prefer snapshot and accessibility actions; snapshot automatically falls back to DOM when AX is unavailable.',
     'For stable selectors or frontend testing, use locator_* operations. Use DOM or coordinate operations only when AX and locators are unsuitable.',
     'For locator_upload, target the visible upload button or label that opens the chooser; use locator_count and locator_is_visible to disambiguate, and do not pick an arbitrary hidden input[type=file].',
-    'Browser security prompts are projected to a blocking Lark confirmation card and require an authorized human decision.',
+    'Site access follows the bot-configured approval policy; other browser security prompts require an authorized human decision through Lark.',
     'This tool does not expose cookies, local storage, browsing history, arbitrary JavaScript, raw CDP, or clipboard.',
   ].join(' '),
   inputSchema: {
@@ -241,6 +241,7 @@ export interface CodexBrowserBrokerOptions {
   sessionId: string;
   codexBin?: string;
   family: CodexBrowserFamily;
+  autoApproveOrigins?: boolean;
   pluginRoot?: string;
   /** Unit-test seam. Production always loads the installed Codex plugin. */
   modules?: BrowserPluginModules;
@@ -414,6 +415,19 @@ function sessionApprovalKey(request: BrowserElicitationRequest): string | undefi
       : typeof meta.riskLevel === 'string' ? meta.riskLevel : undefined,
     tool,
   });
+}
+
+function isOrdinaryBrowserOriginRequest(meta: Json): boolean {
+  if (meta.codex_approval_kind !== 'mcp_tool_call' || meta.connector_id !== 'browser-use'
+    || meta.tool_name !== 'access_browser_origin' || typeof meta.origin !== 'string'
+    || meta.file_transfer !== undefined || meta.full_cdp_access !== undefined
+    || meta.sensitive_data !== undefined || meta.risk_level === 'high' || meta.riskLevel === 'high') return false;
+  try {
+    const origin = new URL(meta.origin);
+    return (origin.protocol === 'http:' || origin.protocol === 'https:')
+      && origin.origin === meta.origin
+      && (meta.tool_params?.origin === undefined || meta.tool_params.origin === meta.origin);
+  } catch { return false; }
 }
 
 async function requestLarkBrowserApproval(
@@ -1148,6 +1162,13 @@ export class CodexBrowserBroker {
   private async requestBrowserApproval(
     request: BrowserElicitationRequest,
   ): Promise<BrowserElicitationResponse> {
+    const meta = asMeta(request);
+    if (this.opts.autoApproveOrigins === true && isOrdinaryBrowserOriginRequest(meta)) {
+      // A bot configuration is the operator's delegation, not an interactive
+      // human click. Never request an "always" browser-plugin grant.
+      return { action: 'accept', meta: { approval_channel: 'bot-config',
+        approval_scope: 'browser-origin', persist: 'session' } };
+    }
     const key = sessionApprovalKey(request);
     if (key && this.sessionApprovals.has(key)) {
       return {

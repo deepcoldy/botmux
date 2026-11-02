@@ -64,7 +64,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `codexCapacityRecovery` | **Off by default**. Set `true` to continue explicit model-capacity failures in managed Codex and Codex App Lark sessions, or use `/botconfig set codexCapacityRecovery on` / `off`. At most two recovery inputs are appended per task and may remain in native model context; disabling this does not delete history. Not provider-specific; ordinary rate limits and quota exhaustion are excluded. |
 | `suppressDeliveredFinalFailureNotice` | **Experimental, off by default**. When `true`, a structured-transcript session (such as Codex) that already delivered an explicit final with a Lark receipt for the same turn and dispatch attempt (`botmux send --response-kind final` or a managed final card) no longer posts the "model connection failed" notice if a later model-service error (such as 527) ends that turn; the failed terminal and logs are kept. It trusts the delivered final and does not compare it with text the model may write afterwards. Progress/auxiliary sends, unacknowledged sends and sends from other turns are unaffected. Missing/`false` keeps the previous behavior. Toggle with `/botconfig set suppressDeliveredFinalFailureNotice on` / `off`; takes effect on the next worker start |
 | `codexAppCleanInput` | **Experimental**, and only effective for Botmux-managed sessions whose actual CLI is `codex-app`. When `true`, the visible / persisted text `UserMessage` contains only the user's original input while message-level Botmux context primarily moves to `additionalContext`. Defaults to off, takes effect on the next turn dispatch, and does not rewrite existing history. See details below |
-| `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Toggle it under Dashboard **Advanced → Codex App**, or set it to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path" }`. See below |
+| `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Toggle it under Dashboard **Advanced → Codex App**, or set it to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path", "autoApproveOrigins"?: true }`. See below |
 
 `nativeSubagentRuntime` rewrites only new subagents created through Trae's native `spawn_agent`; it does not alter the parent agent itself. An absent dimension passes through the subagent request, while `custom` replaces it with a fixed value. When both a custom model and custom effort are configured, BotMux validates that Trae supports the combination. Switching the bot to another CLI removes this field automatically. In the Dashboard, “Pass through request” corresponds to an absent dimension. This policy is behavior configuration and is copied when cloning a bot, but it is intentionally excluded from portable Agent presets. Legacy `mode: "inherit"` values are invalid and are not applied.
 
@@ -186,6 +186,12 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
   "cliId": "codex-app",
   "codexBrowser": true
 }
+```
+
+Enable **Automatically allow browser site access** in the same bot settings section to skip HTTP/HTTPS origin approval cards in new browser sessions. Off by default. Authentication, file transfers, browsing history, and full developer-tools access remain outside this delegation. Restart or resume existing sessions to load changes. The bridge grants session permission only; it does not create an “always allow” origin record.
+
+```json
+{ "codexBrowser": { "enabled": true, "family": "chrome", "autoApproveOrigins": true } }
 ```
 
 - Install and enable the Codex browser extension in Chrome / Edge under the same OS user first. Botmux selects the newest complete official plugin under `CODEX_HOME` (or `~/.codex`) automatically; use an absolute `pluginRoot` only for a maintained custom location.

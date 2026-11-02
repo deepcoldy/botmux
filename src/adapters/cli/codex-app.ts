@@ -76,6 +76,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--service-tier', serviceTier);
       pushOpt(args, '--browser-family', codexBrowser?.family);
       pushOpt(args, '--browser-plugin-root', codexBrowser?.pluginRoot);
+      if (codexBrowser?.autoApproveOrigins === true) args.push('--browser-auto-approve-origins');
       return args;
     },
 
