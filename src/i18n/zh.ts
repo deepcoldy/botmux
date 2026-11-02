@@ -84,6 +84,10 @@ export const messages: Record<string, string> = {
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': '启动中…',
   'card.status.working': '工作中',
+  'card.status.model_queue': '模型排队中',
+  'card.status.tool_running': '工具执行中',
+  'card.status.activity_elapsed': '本轮已运行 {seconds} 秒',
+  'card.status.activity_progress_age': '最近执行活动在 {seconds} 秒前',
   'card.status.idle': '等待输入',
   'card.status.idle_silent': '✓ 本轮已结束（AI 判断无需回复） · 等待输入',
   'card.status.idle_failed': '执行失败',

@@ -81,6 +81,10 @@ export const messages: Record<string, string> = {
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
   'card.status.working': 'Working',
+  'card.status.model_queue': 'Waiting for model capacity',
+  'card.status.tool_running': 'Running tools',
+  'card.status.activity_elapsed': 'Turn running for {seconds}s',
+  'card.status.activity_progress_age': 'Last execution activity {seconds}s ago',
   'card.status.idle': 'Awaiting input',
   'card.status.idle_silent': '✓ Turn ended (AI determined no reply was needed) · Awaiting input',
   'card.status.idle_failed': 'Failed',
