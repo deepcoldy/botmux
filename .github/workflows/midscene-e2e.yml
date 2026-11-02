@@ -136,12 +136,15 @@ jobs:
       # Artifacts of a public repository are downloadable by anyone signed in
       # to GitHub: mask the model configuration before uploading
       # (scripts/midscene-redact.mjs; the MIDSCENE_MODEL_* values are in the job env).
+      # Nothing is uploaded unless the mask succeeded: data that failed to be
+      # masked must not become a public artifact.
       - name: Mask secrets in the Dashboard Midscene data
+        id: mask_dashboard_data
         if: always() && !cancelled()
         run: node scripts/midscene-redact.mjs midscene_run/dashboard test/midscene/midscene_run
 
       - name: Upload Dashboard Midscene data
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.mask_dashboard_data.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
           name: botmux-midscene-dashboard-data
@@ -379,11 +382,12 @@ jobs:
       # Same as the Dashboard data, plus the Feishu tenant address the cases'
       # page URLs carry (FEISHU_TEST_GROUP_URL, in the job env).
       - name: Mask secrets in the Feishu Midscene data
+        id: mask_feishu_data
         if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
         run: node scripts/midscene-redact.mjs midscene_run/runs test/e2e-browser/midscene_run
 
       - name: Upload Feishu Midscene data
-        if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
+        if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true' && steps.mask_feishu_data.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
           name: botmux-midscene-feishu-data

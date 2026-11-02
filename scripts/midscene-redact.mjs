@@ -45,10 +45,11 @@ const CODE_BLOCK = /<(script|style)\b([^>]*)>[\s\S]*?<\/\1\s*>/gi;
 function isCodeBlock(tag, attributes) {
   if (tag.toLowerCase() === 'style') return true;
   const type = /\btype\s*=\s*["']([^"']*)["']/i.exec(attributes)?.[1]?.trim().toLowerCase() ?? '';
-  return type === '' || type === 'module' || /javascript|ecmascript/.test(type);
+  // midscene-image blocks hold a screenshot (see DATA_URI below).
+  return type === '' || type === 'module' || type === 'midscene-image' || /javascript|ecmascript/.test(type);
 }
 
-/** Mask a report page, keeping the viewer's code blocks intact. */
+/** Mask a report page, keeping the viewer's code blocks and embedded screenshots intact. */
 export function redactHtml(html, redact) {
   let result = '';
   let last = 0;
@@ -87,24 +88,46 @@ export function secretValues(env) {
   return [...values].sort((left, right) => right.length - left.length);
 }
 
+const withEscapedSlashes = (values) =>
+  values.flatMap((value) => (value.includes('/') ? [value, value.replaceAll('/', '\\/')] : [value]));
+
+// Embedded images (Midscene's <script type="midscene-image"> blocks and any
+// data URI inside a dump) are left as they are, like the image files: an
+// alphanumeric name such as "kimi" can occur in base64 by chance, and masking
+// it there corrupts the screenshot. A secret is never base64-encoded in them.
+const DATA_URI = /data:[\w.+/-]+;base64,[A-Za-z0-9+/=]+/g;
+
 /** A function masking every value in text, including JSON-escaped slashes. */
 export function createRedactor(values) {
-  const needles = values.flatMap((value) => (value.includes('/') ? [value, value.replaceAll('/', '\\/')] : [value]));
-  return (text) => needles.reduce((result, needle) => result.split(needle).join(REDACTED), String(text));
+  const needles = withEscapedSlashes(values);
+  const mask = (text) => needles.reduce((result, needle) => result.split(needle).join(REDACTED), text);
+  return (input) => {
+    const text = String(input);
+    if (needles.length === 0) return text;
+    let result = '';
+    let last = 0;
+    for (const match of text.matchAll(DATA_URI)) {
+      result += mask(text.slice(last, match.index)) + match[0];
+      last = match.index + match[0].length;
+    }
+    return result + mask(text.slice(last));
+  };
 }
 
 /**
  * Mask the values in every text file under root. Files are only rewritten
  * when they contain one, and are searched as bytes first so report files of
- * tens of megabytes are not decoded for nothing.
+ * tens of megabytes are not decoded for nothing. They are handled as latin1,
+ * one character per byte, so every byte outside a masked value is written
+ * back unchanged even where a file is not valid UTF-8.
  * @returns {Promise<string[]>} the rewritten files, relative to root
  */
 export async function redactTree(root, values) {
   if (values.length === 0) return [];
-  const redact = createRedactor(values);
-  const needles = values
-    .flatMap((value) => (value.includes('/') ? [value, value.replaceAll('/', '\\/')] : [value]))
-    .map((value) => Buffer.from(value));
+  // The values' UTF-8 bytes, in the same one-character-per-byte form.
+  const byteValues = values.map((value) => Buffer.from(value, 'utf8').toString('latin1'));
+  const redact = createRedactor(byteValues);
+  const needles = withEscapedSlashes(byteValues).map((value) => Buffer.from(value, 'latin1'));
   const rewritten = [];
   async function visit(directory) {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -116,10 +139,10 @@ export async function redactTree(root, values) {
       if (!entry.isFile() || !TEXT_FILE.test(entry.name)) continue;
       const bytes = await readFile(file);
       if (!needles.some((needle) => bytes.includes(needle))) continue;
-      const text = bytes.toString('utf8');
+      const text = bytes.toString('latin1');
       const masked = HTML_FILE.test(entry.name) ? redactHtml(text, redact) : redact(text);
-      if (masked === text) continue; // the value only occurs in the viewer's code
-      await writeFile(file, masked);
+      if (masked === text) continue; // the value only occurs in the viewer's code or an image
+      await writeFile(file, Buffer.from(masked, 'latin1'));
       rewritten.push(path.relative(root, file));
     }
   }

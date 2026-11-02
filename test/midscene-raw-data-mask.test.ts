@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 import { createRedactor, redactHtml, redactTree, secretValues } from '../scripts/midscene-redact.mjs';
 import { prepareMidscenePages } from '../scripts/prepare-midscene-pages.mjs';
-import { format, interpolate } from './helpers/github-expression.js';
+import { evaluateExpression, format, interpolate, isTruthy } from './helpers/github-expression.js';
 
 const MODEL = 'vision-model-9.9-pro';
 const TENANT_HOST = 'acme-tenant.feishu.example';
@@ -76,6 +76,35 @@ describe('report pages keep working when a value also occurs in the viewer code 
     expect(await redactTree(root, secretValues({ MIDSCENE_MODEL_NAME: 'gemini' }))).toEqual(['report.html']);
     expect(await readFile(join(root, 'bundle.js'), 'utf8')).toBe('export const gemini = 1;');
     expect(await readFile(join(root, 'report.html'), 'utf8')).toContain('return "gemini"');
+  });
+});
+
+describe('embedded screenshots stay intact (#2706 review P2-1)', () => {
+  // "kimi" both names the model and occurs, by chance, inside the base64 of a screenshot.
+  const redact = createRedactor(secretValues({ MIDSCENE_MODEL_NAME: 'kimi' }));
+  const image = 'data:image/png;base64,AAAkimib20AAAkimi+/==';
+
+  it('leaves midscene-image blocks and data URIs in dumps untouched, masking the text around them', () => {
+    const page = `<script type="midscene-image" data-id="s1">${image}</script>`
+      + `<script type="midscene_web_dump">{"model_name":"kimi","shot":"${image}"}</script><p>kimi</p>`;
+    const masked = redactHtml(page, redact);
+    expect(masked.split(image)).toHaveLength(3);
+    expect(masked).toContain('{"model_name":"***","shot":');
+    expect(masked).toContain('<p>***</p>');
+    expect(redact(`{"m":"kimi","img":"${image}"}`)).toBe(`{"m":"***","img":"${image}"}`);
+    // A screenshot block is left alone whatever its encoding, data URI or not.
+    const bare = '<script type="midscene-image" data-id="s2">AAAkimiAAA</script>';
+    expect(redactHtml(bare, redact)).toBe(bare);
+  });
+
+  it('writes every byte outside a masked value back unchanged, even in a file that is not valid UTF-8 (P3)', async () => {
+    root = await mkdtemp(join(tmpdir(), 'botmux-midscene-bytes-'));
+    // 0xFF 0xFE is not valid UTF-8; "é" is valid two-byte UTF-8.
+    const before = Buffer.concat([Buffer.from('log '), Buffer.from([0xff, 0xfe]), Buffer.from(' model kimi \u00e9\n')]);
+    await writeFile(join(root, 'run.log'), before);
+    expect(await redactTree(root, secretValues({ MIDSCENE_MODEL_NAME: 'kimi' }))).toEqual(['run.log']);
+    const after = await readFile(join(root, 'run.log'));
+    expect(after).toEqual(Buffer.from(before.toString('latin1').replace('kimi', '***'), 'latin1'));
   });
 });
 
@@ -179,14 +208,41 @@ describe('Midscene workflow masks the raw data before uploading it', () => {
     expect(uploads.map(({ step }) => step.with!.name).sort()).toEqual(['botmux-midscene-dashboard-data', 'botmux-midscene-feishu-data']);
   });
 
-  it('runs the mask over exactly the uploaded paths, under the same condition, right before each upload', () => {
+  it('runs the mask over exactly the uploaded paths, right before each upload', () => {
     for (const { job, step, index } of uploads) {
       const mask = job.steps[index - 1];
       expect(mask.run, step.with!.name).toMatch(/^node scripts\/midscene-redact\.mjs /);
       const masked = mask.run!.replace(/^node scripts\/midscene-redact\.mjs /, '').split(/\s+/).filter(Boolean);
       const uploaded = step.with!.path.split('\n').map((line) => line.trim().replace(/\/$/, '')).filter(Boolean);
       expect(masked.sort(), step.with!.name).toEqual(uploaded.sort());
-      expect(mask.if, step.with!.name).toBe(step.if);
+    }
+  });
+
+  // Evaluates the real step conditions: the mask runs whenever the data would
+  // be uploaded (a failed suite included), and nothing is uploaded unless the
+  // mask succeeded — a mask that crashed must not let unmasked data out.
+  it('masks whenever the data could be uploaded, and uploads only masked data', () => {
+    const evaluate = (condition: string, maskOutcome: string | null, jobFailed: boolean) => {
+      const value = isTruthy(evaluateExpression(condition, {
+        steps: {
+          feishu_config: { outputs: { ready: 'true' } },
+          ...(maskOutcome ? Object.fromEntries(uploads.map(({ job, index }) => [job.steps[index - 1].id ?? 'missing-id', { outcome: maskOutcome }])) : {}),
+        },
+      }, { always: () => true, cancelled: () => false, success: () => !jobFailed, failure: () => jobFailed, format }));
+      // Without a status function GitHub adds success(): the step is skipped once an earlier one failed.
+      return /\b(?:always|success|failure|cancelled)\s*\(/i.test(condition) ? value : value && !jobFailed;
+    };
+    for (const { job, step, index } of uploads) {
+      const mask = job.steps[index - 1];
+      const name = step.with!.name;
+      expect(mask.id, name).toBeTruthy();
+      for (const jobFailed of [false, true]) {
+        expect(evaluate(mask.if!, null, jobFailed), `${name}: mask runs (job failed: ${jobFailed})`).toBe(true);
+        expect(evaluate(step.if!, 'success', jobFailed), `${name}: masked data is uploaded`).toBe(true);
+        for (const outcome of ['failure', 'skipped', 'cancelled']) {
+          expect(evaluate(step.if!, outcome, jobFailed), `${name}: mask ${outcome}`).toBe(false);
+        }
+      }
     }
   });
 
