@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { cliIdForComm, findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { cliIdForComm, findLaunchedCliPid, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
 import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from '../src/core/traex-leaf-pid.js';
@@ -46,6 +46,9 @@ function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; 
   runInNewContext(leafFnsSource, {
     ...sandbox,
     readComm: deps.readComm,
+    readCmdline: () => [],
+    isNonInteractiveCodexArgv,
+    isZombieProcess: () => false,
     cliIdForComm,
     findLaunchedCliPid: deps.findReal,
   });
@@ -111,6 +114,8 @@ function runWorkerWiring(late: boolean, options: {
     scopePayloadLauncherActive: options.scopeLaunched ?? options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,
+    lastSpawnCodexLauncherPid: undefined,
+    codexOwnershipAttestationPending: false,
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
     process: { env: {} }, cliPidMarker: undefined,
