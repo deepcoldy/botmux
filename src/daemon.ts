@@ -572,6 +572,7 @@ import {
 } from './core/session-manager.js';
 import { createGroupSecretaryRuntime, setGroupSecretaryRuntime } from './services/group-secretary-runtime.js';
 import { fetchObserveSnapshot } from './services/session-observe-command-fetch.js';
+import { fetchSessionRecentTranscript } from './services/group-secretary-transcript.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
@@ -33661,6 +33662,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     selfOpenId: () => getBot(cfg.larkAppId).botOpenId,
     canTalk: (chatId, openId) => evaluateTalk(cfg.larkAppId, chatId, openId, undefined, undefined, 'group').allowed,
     fetchSnapshot: () => fetchObserveSnapshot(),
+    fetchTranscript: (appId, sessionId) => fetchSessionRecentTranscript(appId, sessionId),
     deliver: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
       larkAppId: cfg.larkAppId,
       chatId: input.chatId,

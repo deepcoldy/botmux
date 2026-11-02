@@ -9,7 +9,7 @@ const { dataDir } = vi.hoisted(() => {
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir } } }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
-import { createGroupSecretaryRuntime, larkEventToSecretaryMessage, setGroupSecretaryRuntime, forgetGroupSecretaryChat, observeGroupSecretaryMessage } from '../src/services/group-secretary-runtime.js';
+import { createGroupSecretaryRuntime, larkEventToSecretaryMessage, setGroupSecretaryRuntime, forgetGroupSecretaryChat, observeGroupSecretaryMessage, staggeredGraceMs } from '../src/services/group-secretary-runtime.js';
 import { setGroupSecretaryChat, resetGroupSecretaryStoreCache } from '../src/services/group-secretary-store.js';
 import type { ObserveSnapshot } from '../src/services/session-observe.js';
 
@@ -39,7 +39,7 @@ let clock = 0;
 beforeEach(() => {
   clock = 1_000_000;
   resetGroupSecretaryStoreCache();
-  setGroupSecretaryChat(APP, CHAT, null);
+  setGroupSecretaryChat(CHAT, null);
 });
 
 function runtime(snapshots: ObserveSnapshot[], deliver = vi.fn(async () => undefined)) {
@@ -70,7 +70,7 @@ describe('group secretary runtime', () => {
   });
 
   it('delivers a silent digest turn as the enabler once a watched session goes idle', async () => {
-    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     const { rt, deliver } = runtime([snapshot('working'), snapshot('idle')]);
     await rt.tick();
     clock += 10_000; await rt.tick();
@@ -87,7 +87,7 @@ describe('group secretary runtime', () => {
   });
 
   it('a failed probe in between does not fabricate a transition', async () => {
-    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     const { rt, deliver } = runtime([snapshot('working'), snapshot('idle', 'unreachable'), snapshot('idle')]);
     for (let i = 0; i < 4; i++) { await rt.tick(); clock += 10_000; }
     expect(deliver).not.toHaveBeenCalled();
@@ -95,7 +95,7 @@ describe('group secretary runtime', () => {
   });
 
   it('requeues and retries when delivery fails', async () => {
-    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     const deliver = vi.fn().mockRejectedValueOnce(new Error('busy')).mockResolvedValue(undefined);
     const { rt } = runtime([snapshot('working'), snapshot('idle')], deliver as any);
     await rt.tick();
@@ -118,7 +118,7 @@ describe('group secretary runtime — hardening', () => {
   }
 
   it('a slow snapshot fetch is not re-entered by the next tick', async () => {
-    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     let release!: (s: ObserveSnapshot) => void;
     const fetch = vi.fn(() => new Promise<ObserveSnapshot>(r => { release = r; }));
     const rt = createGroupSecretaryRuntime({
@@ -136,8 +136,8 @@ describe('group secretary runtime — hardening', () => {
 
   it('a hung delivery times out without retry and does not block other chats', async () => {
     const CHAT_B = 'oc_b';
-    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
-    setGroupSecretaryChat(APP, CHAT_B, { enabledBy: 'ou_owner', enabledAt: 1 });
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    setGroupSecretaryChat(CHAT_B, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     vi.useFakeTimers();
     try {
       const deliver = vi.fn((input: { chatId: string }) => input.chatId === CHAT ? new Promise(() => {}) : Promise.resolve());
@@ -158,12 +158,12 @@ describe('group secretary runtime — hardening', () => {
       rt.stop();
     } finally {
       vi.useRealTimers();
-      setGroupSecretaryChat(APP, CHAT_B, null);
+      setGroupSecretaryChat(CHAT_B, null);
     }
   });
 
   it('ignores messages from before the secretary was enabled', async () => {
-    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: clock });
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: clock });
     const { rt, deliver } = runtime([]);
     rt.observeMessageEvent(textEvent('om_before', clock - 1_000));
     clock += 60_000;
@@ -173,17 +173,52 @@ describe('group secretary runtime — hardening', () => {
   });
 
   it('turning the secretary off drops its backlog (off → on does not replay old events)', async () => {
-    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     const { rt, deliver } = runtime([]);
     setGroupSecretaryRuntime(rt);
     observeGroupSecretaryMessage(textEvent('om_1', clock));
-    setGroupSecretaryChat(APP, CHAT, null);
+    setGroupSecretaryChat(CHAT, null);
     forgetGroupSecretaryChat(CHAT);
-    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_other', enabledAt: 1 });
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_other', enabledAt: 1 });
     clock += 60_000;
     await rt.tick();
     expect(deliver).not.toHaveBeenCalled();
     setGroupSecretaryRuntime(undefined);
+  });
+});
+
+describe('group secretary runtime — evidence and ownership', () => {
+  it('attaches the stalled session\'s recent transcript to the digest', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const fetchTranscript = vi.fn(async () => [{ role: 'agent', text: '第一步做完了，接下来我做第二步' }]);
+    const deliver = vi.fn(async () => undefined);
+    const snaps = [snapshot('working'), snapshot('idle')];
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => snaps.shift() ?? snapshot('idle'),
+      fetchTranscript, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
+    });
+    await rt.tick(); clock += 10_000; await rt.tick(); clock += 5_000; await rt.tick();
+    expect(fetchTranscript).toHaveBeenCalledWith('cli_a', 's1');
+    const prompt = (deliver.mock.calls[0] as any[])[0].prompt as string;
+    expect(prompt).toContain('<recent_transcript trusted="false">');
+    expect(prompt).toContain('接下来我做第二步');
+    rt.stop();
+  });
+
+  it('stops acting for a chat once another local bot takes over', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const { rt, deliver } = runtime([snapshot('working'), snapshot('idle')]);
+    await rt.tick(); clock += 10_000; await rt.tick();
+    setGroupSecretaryChat(CHAT, { larkAppId: 'cli_other', enabledBy: 'ou_owner', enabledAt: 2 });
+    clock += 5_000; await rt.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    rt.stop();
+  });
+
+  it('staggers the unaddressed grace per bot within 20–35s', () => {
+    const values = ['cli_a', 'cli_b', 'cli_aaf586ba90785cc4', 'cli_aa62247d7df8dcb0'].map(staggeredGraceMs);
+    for (const v of values) { expect(v).toBeGreaterThanOrEqual(20_000); expect(v).toBeLessThan(35_000); }
+    expect(new Set(values).size).toBeGreaterThan(1);
   });
 });
 

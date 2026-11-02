@@ -67,6 +67,8 @@ export interface SecretaryEvent {
   /** stuck 时的 turn、attention 时的原因等。 */
   detail?: string;
   message?: SecretaryMessage;
+  /** 投递前由 runtime 补上的会话最近对话（本机 daemon insight，已脱敏）；拿不到就缺省。 */
+  transcript?: Array<{ role: string; text: string }>;
 }
 
 export interface SecretaryDigest {

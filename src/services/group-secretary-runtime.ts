@@ -16,6 +16,8 @@ export interface GroupSecretaryRuntimeDeps {
   selfOpenId: () => string | undefined;
   fetchSnapshot: () => Promise<ObserveSnapshot>;
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
+  /** 读某会话最近几条对话（本机 daemon insight）；拿不到返回 undefined。 */
+  fetchTranscript?: (larkAppId: string | undefined, sessionId: string) => Promise<Array<{ role: string; text: string }> | undefined>;
   log: (level: 'info' | 'warn', message: string) => void;
   /** 发送方在该群能否和本 bot 对话（canTalk）。 */
   canTalk: (chatId: string, senderOpenId: string | undefined) => boolean;
@@ -82,12 +84,24 @@ export function larkEventToSecretaryMessage(data: any, selfOpenId: string | unde
   };
 }
 
+/**
+ * 「没人 @ 的任务」的等待时间按 bot 错开（20–35 秒）。不同机器上的秘书互相锁不住，
+ * 靠群消息协调：先到期的秘书引用原消息发建议，其它秘书收到这条 bot 回复（parent/root
+ * 指向原消息）就放弃该候选。错开让「先到者」确定，避免同一秒一起出声。
+ */
+export function staggeredGraceMs(larkAppId: string): number {
+  let h = 0;
+  for (const ch of larkAppId) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return 20_000 + (h % 15_000);
+}
+
 export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): GroupSecretaryRuntime {
   const now = deps.now ?? Date.now;
   const engine = new GroupSecretaryEngine({
     selfAppId: deps.larkAppId,
     isEnabledChat: chatId => isGroupSecretaryChat(deps.larkAppId, chatId),
     isTrustedHuman: (chatId, openId) => !!openId && deps.canTalk(chatId, openId),
+    unaddressedGraceMs: staggeredGraceMs(deps.larkAppId),
     now,
   });
   const deliverTimeoutMs = deps.deliverTimeoutMs ?? 90_000;
@@ -100,6 +114,17 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
     const entry = getGroupSecretaryChat(deps.larkAppId, digest.chatId);
     if (!entry) return;
     const turnId = `secretary:${deps.larkAppId}:${digest.chatId}:${now()}:${++seq}`;
+    // 补证据：每个会话事件附上该会话最近几条对话（bot 最后说了什么），让模型判断「做完了」
+    // 还是「做一半停了」。只补一次（重投沿用），失败就不带。
+    if (deps.fetchTranscript) {
+      await Promise.all(digest.events.map(async event => {
+        if (!event.session || event.transcript) return;
+        try {
+          const lines = await deps.fetchTranscript!(event.session.larkAppId, event.session.sessionId);
+          if (lines?.length) event.transcript = lines;
+        } catch { /* 无证据照常投递 */ }
+      }));
+    }
     const prompt = renderGroupSecretaryPrompt(digest, { enabledByOpenId: entry.enabledBy });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<'timeout'>(resolve => {

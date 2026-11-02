@@ -28,6 +28,10 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/i18n/index.js', () => ({ t: (key: string) => key, localeForBot: () => 'zh' }));
 const mockIsSessionGroup = vi.fn(() => false);
 vi.mock('../src/services/session-groups-store.js', () => ({ isSessionGroup: (...a: any[]) => mockIsSessionGroup(...a) }));
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: (id: string) => ({ config: { larkAppId: id } }),
+  effectiveBotDisplayName: (st: any) => `Bot-${st.config.larkAppId}`,
+}));
 const mockForget = vi.fn();
 vi.mock('../src/services/group-secretary-runtime.js', () => ({ forgetGroupSecretaryChat: (...a: any[]) => mockForget(...a) }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
@@ -61,7 +65,7 @@ describe('tryHandleSecretaryCommand', () => {
     expect(await tryHandleSecretaryCommand(APP, msg('/secretary on'), USER, true)).toBe(true);
     expect(lastReply()).toBe('cmd.secretary.enabled');
     resetGroupSecretaryStoreCache();
-    expect(getGroupSecretaryChat(APP, 'oc_group')?.enabledBy).toBe(USER);
+    expect(getGroupSecretaryChat(APP, 'oc_group')).toMatchObject({ enabledBy: USER, larkAppId: APP, botName: `Bot-${APP}` });
     expect(isGroupSecretaryChat(APP, 'oc_other')).toBe(false);
 
     await tryHandleSecretaryCommand(APP, msg('/secretary on'), USER, true);
@@ -103,5 +107,30 @@ describe('tryHandleSecretaryCommand', () => {
     mockGetChatMode.mockResolvedValue('topic');
     await tryHandleSecretaryCommand(APP, msg('/secretary on', 'group', 'oc_topic'), USER, true);
     expect(lastReply()).toBe('cmd.secretary.enabled');
+  });
+
+  it('one secretary per group per machine: a second bot must take over explicitly', async () => {
+    const OTHER = 'cli_other';
+    const chat = 'oc_shared';
+    await tryHandleSecretaryCommand(APP, msg('/secretary on', 'group', chat), USER, true);
+    await tryHandleSecretaryCommand(OTHER, msg('/secretary on', 'group', chat), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.taken');
+    expect(isGroupSecretaryChat(OTHER, chat)).toBe(false);
+    await tryHandleSecretaryCommand(OTHER, msg('/secretary', 'group', chat), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.status_other');
+    await tryHandleSecretaryCommand(OTHER, msg('/secretary off', 'group', chat), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.not_mine');
+    expect(isGroupSecretaryChat(APP, chat)).toBe(true);
+
+    await tryHandleSecretaryCommand(OTHER, msg('/secretary takeover', 'group', chat), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.took_over');
+    expect(isGroupSecretaryChat(OTHER, chat)).toBe(true);
+    expect(isGroupSecretaryChat(APP, chat)).toBe(false);
+  });
+
+  it('takeover with no current secretary simply enables', async () => {
+    await tryHandleSecretaryCommand(APP, msg('/secretary takeover', 'group', 'oc_free'), USER, true);
+    expect(lastReply()).toBe('cmd.secretary.enabled');
+    expect(isGroupSecretaryChat(APP, 'oc_free')).toBe(true);
   });
 });
