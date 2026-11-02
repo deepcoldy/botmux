@@ -9,7 +9,7 @@ const { dataDir } = vi.hoisted(() => {
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir } } }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
-import { createGroupSecretaryRuntime, larkEventToSecretaryMessage } from '../src/services/group-secretary-runtime.js';
+import { createGroupSecretaryRuntime, larkEventToSecretaryMessage, setGroupSecretaryRuntime, forgetGroupSecretaryChat, observeGroupSecretaryMessage } from '../src/services/group-secretary-runtime.js';
 import { setGroupSecretaryChat, resetGroupSecretaryStoreCache } from '../src/services/group-secretary-store.js';
 import type { ObserveSnapshot } from '../src/services/session-observe.js';
 
@@ -49,6 +49,7 @@ function runtime(snapshots: ObserveSnapshot[], deliver = vi.fn(async () => undef
     fetchSnapshot: async () => snapshots.shift() ?? snapshots.at(-1) ?? snapshot('idle'),
     deliver,
     log: () => {},
+    canTalk: () => true,
     now: () => clock,
     tickMs: 1e9,
     sessionPollMs: 10_000,
@@ -61,7 +62,7 @@ describe('group secretary runtime', () => {
     const fetch = vi.fn();
     const rt = createGroupSecretaryRuntime({
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: fetch as any,
-      deliver: vi.fn(), log: () => {}, now: () => clock, tickMs: 1e9,
+      deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
     });
     await rt.tick();
     expect(fetch).not.toHaveBeenCalled();
@@ -104,6 +105,85 @@ describe('group secretary runtime', () => {
     expect(deliver).toHaveBeenCalledTimes(2);
     expect((deliver.mock.calls[1] as any[])[0].prompt).toContain('turn_ended');
     rt.stop();
+  });
+});
+
+describe('group secretary runtime — hardening', () => {
+  function textEvent(id: string, createTime: number, chatId = CHAT) {
+    return {
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
+      message: { chat_id: chatId, chat_type: 'group', message_id: id, create_time: String(createTime),
+        message_type: 'text', content: JSON.stringify({ text: '帮我整理周报' }), mentions: [] },
+    };
+  }
+
+  it('a slow snapshot fetch is not re-entered by the next tick', async () => {
+    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
+    let release!: (s: ObserveSnapshot) => void;
+    const fetch = vi.fn(() => new Promise<ObserveSnapshot>(r => { release = r; }));
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: fetch, deliver: vi.fn(),
+      log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, sessionPollMs: 0,
+    });
+    const first = rt.tick();
+    await rt.tick();
+    await rt.tick();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    release(snapshot('idle'));
+    await first;
+    rt.stop();
+  });
+
+  it('a hung delivery times out without retry and does not block other chats', async () => {
+    const CHAT_B = 'oc_b';
+    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
+    setGroupSecretaryChat(APP, CHAT_B, { enabledBy: 'ou_owner', enabledAt: 1 });
+    vi.useFakeTimers();
+    try {
+      const deliver = vi.fn((input: { chatId: string }) => input.chatId === CHAT ? new Promise(() => {}) : Promise.resolve());
+      const rt = createGroupSecretaryRuntime({
+        larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+        deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, deliverTimeoutMs: 1_000,
+      });
+      rt.observeMessageEvent(textEvent('om_a', clock, CHAT));
+      rt.observeMessageEvent(textEvent('om_b', clock, CHAT_B));
+      clock += 60_000;
+      const ticking = rt.tick();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await ticking;
+      expect(deliver.mock.calls.map(c => (c[0] as any).chatId).sort()).toEqual([CHAT, CHAT_B].sort());
+      clock += 60_000;
+      await rt.tick();
+      expect(deliver).toHaveBeenCalledTimes(2);
+      rt.stop();
+    } finally {
+      vi.useRealTimers();
+      setGroupSecretaryChat(APP, CHAT_B, null);
+    }
+  });
+
+  it('ignores messages from before the secretary was enabled', async () => {
+    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: clock });
+    const { rt, deliver } = runtime([]);
+    rt.observeMessageEvent(textEvent('om_before', clock - 1_000));
+    clock += 60_000;
+    await rt.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    rt.stop();
+  });
+
+  it('turning the secretary off drops its backlog (off → on does not replay old events)', async () => {
+    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_owner', enabledAt: 1 });
+    const { rt, deliver } = runtime([]);
+    setGroupSecretaryRuntime(rt);
+    observeGroupSecretaryMessage(textEvent('om_1', clock));
+    setGroupSecretaryChat(APP, CHAT, null);
+    forgetGroupSecretaryChat(CHAT);
+    setGroupSecretaryChat(APP, CHAT, { enabledBy: 'ou_other', enabledAt: 1 });
+    clock += 60_000;
+    await rt.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    setGroupSecretaryRuntime(undefined);
   });
 });
 

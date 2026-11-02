@@ -33659,6 +33659,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   setGroupSecretaryRuntime(createGroupSecretaryRuntime({
     larkAppId: cfg.larkAppId,
     selfOpenId: () => getBot(cfg.larkAppId).botOpenId,
+    canTalk: (chatId, openId) => evaluateTalk(cfg.larkAppId, chatId, openId, undefined, undefined, 'group').allowed,
     fetchSnapshot: () => fetchObserveSnapshot(),
     deliver: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
       larkAppId: cfg.larkAppId,

@@ -225,3 +225,47 @@ describe('renderGroupSecretaryPrompt', () => {
     expect(prompt).toContain('ou_owner');
   });
 });
+
+describe('GroupSecretaryEngine — hardening', () => {
+  it('per-session hourly cap survives the session dropping out of a snapshot', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    let emitted = 0;
+    for (let i = 0; i < 8; i++) {
+      e.observeSessions([session('s1', { turn: 'working' })]);
+      e.observeSessions([session('s1', { turn: 'idle' })]);
+      e.observeSessions([]);
+      emitted += advance(e, 5_000).flatMap(d => d.events).length;
+    }
+    expect(emitted).toBe(3);
+  });
+
+  it('messages from senders without talk permission are context only', () => {
+    const e = engine({ isTrustedHuman: (_c, id) => id === 'ou_human' });
+    e.observeMessage(msg('om_x', { senderOpenId: 'ou_stranger' }));
+    expect(advance(e, 60_000)).toEqual([]);
+    e.observeMessage(msg('om_y', { createTime: clock }));
+    expect(advance(e, 60_000)[0].events.map(ev => ev.message?.messageId)).toEqual(['om_y']);
+  });
+
+  it('stale (replayed) messages never become task candidates', () => {
+    const e = engine();
+    e.observeMessage(msg('om_old', { createTime: clock - 60 * 60_000 }));
+    expect(advance(e, 60_000)).toEqual([]);
+  });
+
+  it('requeue gives up after maxDeliveryAttempts and caps the backlog', () => {
+    const e = engine({ minFlushIntervalMs: 0, maxDeliveryAttempts: 3, maxPendingPerChat: 2 });
+    e.observeSessions(['s1', 's2', 's3'].map(id => session(id)));
+    e.observeSessions(['s1', 's2', 's3'].map(id => session(id, { turn: 'idle' })));
+    let [digest] = advance(e, 5_000);
+    expect(digest.events).toHaveLength(2);
+    expect(e.requeue(digest)).toBe(true);
+    [digest] = advance(e, 5_000);
+    expect(digest.attempts).toBe(1);
+    expect(e.requeue(digest)).toBe(true);
+    [digest] = advance(e, 5_000);
+    expect(e.requeue(digest)).toBe(false);
+    expect(advance(e, 60_000)).toEqual([]);
+  });
+});
+

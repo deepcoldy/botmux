@@ -17,7 +17,11 @@ export interface GroupSecretaryRuntimeDeps {
   fetchSnapshot: () => Promise<ObserveSnapshot>;
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
   log: (level: 'info' | 'warn', message: string) => void;
+  /** 发送方在该群能否和本 bot 对话（canTalk）。 */
+  canTalk: (chatId: string, senderOpenId: string | undefined) => boolean;
   now?: () => number;
+  /** 单次投递超时；超时视为结果未知，不重投（避免重复回合）。 */
+  deliverTimeoutMs?: number;
   tickMs?: number;
   sessionPollMs?: number;
 }
@@ -83,8 +87,10 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
   const engine = new GroupSecretaryEngine({
     selfAppId: deps.larkAppId,
     isEnabledChat: chatId => isGroupSecretaryChat(deps.larkAppId, chatId),
+    isTrustedHuman: (chatId, openId) => !!openId && deps.canTalk(chatId, openId),
     now,
   });
+  const deliverTimeoutMs = deps.deliverTimeoutMs ?? 90_000;
   const sessionPollMs = deps.sessionPollMs ?? 10_000;
   let lastPollAt = 0;
   let inFlight = false;
@@ -95,13 +101,30 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
     if (!entry) return;
     const turnId = `secretary:${deps.larkAppId}:${digest.chatId}:${now()}:${++seq}`;
     const prompt = renderGroupSecretaryPrompt(digest, { enabledByOpenId: entry.enabledBy });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<'timeout'>(resolve => {
+      timer = setTimeout(() => resolve('timeout'), deliverTimeoutMs);
+      timer.unref?.();
+    });
     try {
-      await deps.deliver({ chatId: digest.chatId, turnId, prompt, ownerOpenId: entry.enabledBy });
+      const result = await Promise.race([
+        deps.deliver({ chatId: digest.chatId, turnId, prompt, ownerOpenId: entry.enabledBy }),
+        timeout,
+      ]);
+      if (result === 'timeout') {
+        // 投递可能仍在进行、也可能已经送达：结果未知时不重投，宁可漏一批也不重复唤起。
+        deps.log('warn', `[group-secretary] deliver timed out chat=${digest.chatId.slice(0, 12)}; dropped ${digest.events.length} event(s)`);
+        return;
+      }
       deps.log('info', `[group-secretary] delivered ${digest.events.length} event(s) chat=${digest.chatId.slice(0, 12)} `
         + `kinds=${digest.events.map(e => e.kind).join(',')}`);
     } catch (err) {
-      engine.requeue(digest);
-      deps.log('warn', `[group-secretary] deliver failed chat=${digest.chatId.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+      const requeued = engine.requeue(digest);
+      deps.log('warn', `[group-secretary] deliver failed chat=${digest.chatId.slice(0, 12)}`
+        + `${requeued ? ' (will retry)' : `; dropped ${digest.events.length} event(s) after retries`}: `
+        + `${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   };
 
@@ -118,7 +141,8 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
           deps.log('warn', `[group-secretary] session snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      for (const digest of engine.takeDigests()) await deliver(digest);
+      // 各群并行投递：一个群卡住不拖累其它群（单次投递另有超时兜底）。
+      await Promise.allSettled(engine.takeDigests().map(deliver));
     } finally {
       inFlight = false;
     }
@@ -134,7 +158,11 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
         const chatId = data?.message?.chat_id;
         if (!isGroupSecretaryChat(deps.larkAppId, chatId)) return;
         const message = larkEventToSecretaryMessage(data, deps.selfOpenId());
-        if (message) engine.observeMessage(message);
+        if (!message) return;
+        // 开启之前的消息（重放 / 补拉）不进秘书视野。
+        const entry = getGroupSecretaryChat(deps.larkAppId, chatId);
+        if (entry && message.createTime < entry.enabledAt) return;
+        engine.observeMessage(message);
       } catch (err) {
         deps.log('warn', `[group-secretary] observe failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -151,6 +179,11 @@ let current: GroupSecretaryRuntime | undefined;
 export function setGroupSecretaryRuntime(runtime: GroupSecretaryRuntime | undefined): void {
   current?.stop();
   current = runtime;
+}
+
+/** /secretary off 时清掉该群的积压，免得关了又开时投递关之前的旧事件。 */
+export function forgetGroupSecretaryChat(chatId: string): void {
+  current?.engine.forgetChat(chatId);
 }
 
 /** event-dispatcher 的旁路入口：未启动 / 未开启时零成本返回，永不抛出。 */

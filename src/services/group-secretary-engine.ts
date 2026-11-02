@@ -71,6 +71,8 @@ export interface SecretaryEvent {
 
 export interface SecretaryDigest {
   chatId: string;
+  /** 已投递失败的次数（requeue 时累加）。 */
+  attempts?: number;
   events: SecretaryEvent[];
   /** 与事件相关的近期消息（按时间升序），供模型判断上下文。 */
   context: SecretaryMessage[];
@@ -92,6 +94,12 @@ export interface GroupSecretaryEngineOptions {
   contextMessagesPerChat?: number;
   /** 每个事件最多附带多少条相关消息。 */
   contextPerEvent?: number;
+  /** 发送方是否有权让秘书替他办事（canTalk）。无权者的消息只当上下文，不成为任务候选。 */
+  isTrustedHuman?: (chatId: string, senderOpenId: string | undefined) => boolean;
+  /** 投递失败最多重试几次，超过就丢弃这批事件。 */
+  maxDeliveryAttempts?: number;
+  /** 每个群积压事件上限（超出丢最旧的），防止投递持续失败时 prompt 无限变长。 */
+  maxPendingPerChat?: number;
 }
 
 const WORKING_TURNS = new Set(['working', 'starting', 'analyzing']);
@@ -110,6 +118,8 @@ interface ChatState {
   unaddressed: Array<{ message: SecretaryMessage; dueAt: number }>;
   lastEventAt: number;
   lastFlushAt: number;
+  /** 当前积压里最多已失败过几次。 */
+  pendingAttempts: number;
 }
 
 export class GroupSecretaryEngine {
@@ -129,13 +139,16 @@ export class GroupSecretaryEngine {
       perSessionEventsPerHour: options.perSessionEventsPerHour ?? 3,
       contextMessagesPerChat: options.contextMessagesPerChat ?? 60,
       contextPerEvent: options.contextPerEvent ?? 6,
+      isTrustedHuman: options.isTrustedHuman ?? (() => true),
+      maxDeliveryAttempts: options.maxDeliveryAttempts ?? 3,
+      maxPendingPerChat: options.maxPendingPerChat ?? 20,
     };
   }
 
   private chat(chatId: string): ChatState {
     let state = this.chats.get(chatId);
     if (!state) {
-      state = { messages: [], pending: [], unaddressed: [], lastEventAt: 0, lastFlushAt: 0 };
+      state = { messages: [], pending: [], unaddressed: [], lastEventAt: 0, lastFlushAt: 0, pendingAttempts: 0 };
       this.chats.set(chatId, state);
     }
     return state;
@@ -144,7 +157,14 @@ export class GroupSecretaryEngine {
   private pushEvent(chatId: string, event: SecretaryEvent): void {
     const state = this.chat(chatId);
     state.pending.push(event);
+    this.trimPending(state);
     state.lastEventAt = this.opts.now();
+  }
+
+  private trimPending(state: ChatState): void {
+    if (state.pending.length > this.opts.maxPendingPerChat) {
+      state.pending.splice(0, state.pending.length - this.opts.maxPendingPerChat);
+    }
   }
 
   observeMessage(message: SecretaryMessage): void {
@@ -167,7 +187,12 @@ export class GroupSecretaryEngine {
     if (message.rootId) return;
     if (message.mentionCount > 0) return;
     if (message.text.trim().length < 2) return;
-    state.unaddressed.push({ message, dueAt: this.opts.now() + this.opts.unaddressedGraceMs });
+    // 重放 / 补拉到的旧消息不当新任务：宽限期按消息自身时间算，早已过期的直接忽略。
+    const now = this.opts.now();
+    if (now - message.createTime > this.opts.unaddressedGraceMs + 60_000) return;
+    // 没有对话权限的人发的消息只当上下文：秘书回合以开启人身份运行，不能替任意群成员派活。
+    if (!this.opts.isTrustedHuman(message.chatId, message.senderOpenId)) return;
+    state.unaddressed.push({ message, dueAt: Math.max(now, message.createTime + this.opts.unaddressedGraceMs) });
   }
 
   /** 传入本次拉到的全部会话（可含其它群、已关闭的）；未出现在快照里的会话会被遗忘。 */
@@ -203,10 +228,14 @@ export class GroupSecretaryEngine {
       }
     }
     for (const id of [...this.sessions.keys()]) {
-      if (!seen.has(id)) {
-        this.sessions.delete(id);
-        this.sessionEventTimes.delete(id);
-      }
+      if (!seen.has(id)) this.sessions.delete(id);
+    }
+    // 限流计数与会话记忆分开过期：会话因探测失败暂时从快照里消失时，计数不能被清零，
+    // 否则「催 → 停 → 再催」的循环会绕过每小时上限。
+    for (const [id, times] of [...this.sessionEventTimes]) {
+      const live = times.filter(t => now - t < HOUR_MS);
+      if (live.length === 0) this.sessionEventTimes.delete(id);
+      else this.sessionEventTimes.set(id, live);
     }
   }
 
@@ -246,17 +275,28 @@ export class GroupSecretaryEngine {
       if (now - state.lastEventAt < this.opts.debounceMs) continue;
       if (now - state.lastFlushAt < this.opts.minFlushIntervalMs) continue;
       const events = state.pending;
+      const attempts = state.pendingAttempts;
       state.pending = [];
+      state.pendingAttempts = 0;
       state.lastFlushAt = now;
-      out.push({ chatId, events, context: this.contextFor(state, events) });
+      out.push({ chatId, events, context: this.contextFor(state, events), ...(attempts ? { attempts } : {}) });
     }
     return out;
   }
 
-  /** 投递失败时把事件放回去，下一拍重试（不重置限流计数）。 */
-  requeue(digest: SecretaryDigest): void {
+  /**
+   * 投递失败时把事件放回去，下一拍重试（不重置限流计数）。超过重试上限返回 false 并丢弃，
+   * 避免永久性失败（如秘书会话卡在选仓库）无限重试。
+   */
+  requeue(digest: SecretaryDigest): boolean {
+    const attempts = (digest.attempts ?? 0) + 1;
+    if (attempts >= this.opts.maxDeliveryAttempts) return false;
+    if (!this.opts.isEnabledChat(digest.chatId)) return false;
     const state = this.chat(digest.chatId);
     state.pending = [...digest.events, ...state.pending];
+    this.trimPending(state);
+    state.pendingAttempts = Math.max(state.pendingAttempts, attempts);
+    return true;
   }
 
   private contextFor(state: ChatState, events: SecretaryEvent[]): SecretaryMessage[] {

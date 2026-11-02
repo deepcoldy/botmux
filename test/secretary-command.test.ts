@@ -28,6 +28,8 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/i18n/index.js', () => ({ t: (key: string) => key, localeForBot: () => 'zh' }));
 const mockIsSessionGroup = vi.fn(() => false);
 vi.mock('../src/services/session-groups-store.js', () => ({ isSessionGroup: (...a: any[]) => mockIsSessionGroup(...a) }));
+const mockForget = vi.fn();
+vi.mock('../src/services/group-secretary-runtime.js', () => ({ forgetGroupSecretaryChat: (...a: any[]) => mockForget(...a) }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
 import { tryHandleSecretaryCommand } from '../src/im/lark/secretary-command.js';
@@ -67,6 +69,7 @@ describe('tryHandleSecretaryCommand', () => {
 
     await tryHandleSecretaryCommand(APP, msg('/secretary off'), USER, true);
     expect(lastReply()).toBe('cmd.secretary.disabled');
+    expect(mockForget).toHaveBeenCalledWith('oc_group');
     resetGroupSecretaryStoreCache();
     expect(isGroupSecretaryChat(APP, 'oc_group')).toBe(false);
   });

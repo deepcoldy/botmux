@@ -9,6 +9,7 @@ import { getChatMode, replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { isSessionGroup } from '../../services/session-groups-store.js';
 import { getGroupSecretaryChat, setGroupSecretaryChat } from '../../services/group-secretary-store.js';
+import { forgetGroupSecretaryChat } from '../../services/group-secretary-runtime.js';
 import { logger } from '../../utils/logger.js';
 
 export async function tryHandleSecretaryCommand(
@@ -77,6 +78,7 @@ export async function tryHandleSecretaryCommand(
     await reply(t('cmd.secretary.failed', { reason: res.reason }, loc));
     return true;
   }
+  if (disable) forgetGroupSecretaryChat(chatId);
   logger.info(`[secretary] ${enable ? 'enabled' : 'disabled'} chat=${chatId.slice(0, 12)} by=${senderOpenId.slice(0, 12)}`);
   await reply(t(enable ? 'cmd.secretary.enabled' : 'cmd.secretary.disabled', undefined, loc));
   return true;
