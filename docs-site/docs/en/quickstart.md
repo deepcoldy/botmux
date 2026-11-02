@@ -16,7 +16,7 @@ botmux is a **self-contained single-file binary** with its runtime embedded — 
 
 > 📦 **npm works too** (`npm install -g botmux`, needs Node ≥ 22 to run the install itself): the npm package carries **the same self-contained binary** (verified byte-identical to the GitHub Release asset by SHA-256; only the one matching your os/arch is installed), and its postinstall points `~/.botmux/bin/botmux` at it and writes PATH the same way. The only difference is **who installs it**: the npm path needs Node, the curl path never touches it; **upgrades always re-run the curl command, no matter how you installed** (npm-upgrading from a pre-v3.18.0 install across that form boundary can leave the daemon unable to restart — see [FAQ · How do I upgrade?](/en/faq#how-do-i-upgrade)). Once running, the two are identical.
 
-Running botmux itself needs no Node, but you do need **at least one AI coding CLI installed and signed in locally** (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy`, etc. — each with its own runtime requirements). **The default session backend is tmux (≥3.x), so install it** — when it's unavailable botmux hard-gates with a card instead of silently downgrading to pty; only pick an explicit backend (`BACKEND_TYPE=pty` or per-bot `backendType`: `pty`/`herdr`/`zellij`) if you truly need a tmux-free environment (riff is a cloud agent and doesn't occupy a local backend).
+Running botmux itself needs no Node, but you do need **at least one AI coding CLI installed and signed in locally** (`claude` / `codex` / `cursor-agent` / `opencode` / `coco` / `agy`, etc. — each with its own runtime requirements). **The default session backend is tmux (≥3.x), so install it** — when it's unavailable botmux hard-gates with a card instead of silently downgrading to pty; only pick an explicit backend (`BACKEND_TYPE=pty` or per-bot `backendType`: `pty`/`herdr`/`zellij`) if you truly need a tmux-free environment (riff is a cloud agent and doesn't occupy a local backend).
 
 ## Step 2 · Configure (`botmux setup`)
 
@@ -67,7 +67,6 @@ Pick one line for the CLI you have installed (all non-interactive; they print th
 ```bash
 claude -p "$DIAG" --allowedTools "Bash"   # Claude Code
 codex exec "$DIAG"                         # Codex
-gemini -p "$DIAG" --yolo                   # Gemini
 coco  -p "$DIAG" --yolo                    # Trae / CoCo (aliases trae-agent / ta)
 cursor-agent -p "$DIAG"                    # Cursor
 ```

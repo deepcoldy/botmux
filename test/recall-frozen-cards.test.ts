@@ -423,7 +423,7 @@ describe('restoreUsageLimitRuntimeState', () => {
     expect(buildStreamingCard).toHaveBeenCalledWith(
       SESSION_ID,
       'om_root',
-      `http://localhost:8800/s/${SESSION_ID}`,
+      '',
       't',
       '',
       'limited',
@@ -1458,7 +1458,7 @@ describe('scheduleCardPatch adjacent duplicate handling', () => {
 // gaps in the first cut; these lock the corrected contract:
 //   - the arm predicate must NOT depend on the Web Terminal port (ZMX ready with
 //     port=0 must still refresh), and must gate on native-usage CLI capability
-//     (gemini/opencode/… have no transcript → nothing to refresh) and on
+//     (opencode/kimi/… have no transcript → nothing to refresh) and on
 //     usageDisplay='streaming';
 //   - the tick reads fresh (breaks the 15s cost-reader throttle) and is
 //     self-correcting (clears its own timer when state no longer qualifies).
@@ -1501,9 +1501,9 @@ describe('usageRefreshShouldRun (arm/clear predicate)', () => {
     expect(usageRefreshShouldRun(ds)).toBe(false);
   });
 
-  it('is false for a CLI without native usage (gemini/opencode/…)', () => {
+  it('is false for a CLI without native usage (opencode/kimi/…)', () => {
     const ds = workingDs();
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     expect(usageRefreshShouldRun(ds)).toBe(false);
   });
 
@@ -1572,8 +1572,17 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
     expect(call[2]).toBe(''); // 3rd positional arg = read-only terminal URL
   });
 
-  it('renders the read-only terminal URL for a Web-Terminal backend (tmux/pty)', () => {
+  it('renders an empty terminal URL for a Web-Terminal backend that has no live worker port', () => {
     const ds = workingDs();
+    ds.session.webPort = 9101; // persisted from a prior generation
+    refreshStreamingCardUsage(ds);
+    const call = buildStreamingCardMock.mock.calls[0]!;
+    expect(call[2]).toBe('');
+  });
+
+  it('renders the read-only terminal URL for a live Web-Terminal backend (tmux/pty)', () => {
+    const ds = workingDs();
+    ds.worker = { killed: false } as any;
     ds.workerPort = 9101; // a real Web Terminal port
     refreshStreamingCardUsage(ds);
     const call = buildStreamingCardMock.mock.calls[0]!;
@@ -1654,7 +1663,7 @@ describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
   it('does not arm for an unsupported CLI (no group-visible empty-usage PATCH storm)', () => {
     vi.useFakeTimers();
     const ds = workingDs();
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     syncUsageRefreshTimer(ds);
     expect(ds.usageRefreshTimer).toBeUndefined();
     vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS * 3);

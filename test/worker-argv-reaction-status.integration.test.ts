@@ -107,6 +107,16 @@ async function waitForSettledIdle(
   );
 }
 
+/**
+ * Worker boot — transpiling src/worker.ts, init, spawning the CLI — runs on the
+ * host's time, not the behaviour under test. On a starved bun-test shard it
+ * alone took ~9s (#2511), so a test whose first 10s window had to cover boot
+ * plus the behaviour timed out right as the behaviour happened. Waiting for
+ * boot on its own keeps each behaviour window measured from the spawn: a real
+ * regression still fails within that window, a slow host only waits longer.
+ */
+const WORKER_BOOT_TIMEOUT_MS = 20_000;
+
 async function waitForLog(
   child: ChildProcess,
   logs: string[],
@@ -924,14 +934,22 @@ setInterval(() => {}, 1_000);
     const transcriptPath = join(piSessionsDir, `20260810120000_${cliSessionId}.jsonl`);
     writeFileSync(transcriptPath, '');
 
-    // The fake reproduces the gap: an idle-looking input box at spawn, total
-    // silence (NO Working...), then some mid-turn output so quiescence can
-    // fire again while the started turn is running.
+    // Drive each paint only after the previous phase is observed. Fixed
+    // wall-clock output can race worker startup or a delayed idle callback
+    // under CI contention, consuming the startup gap before we observe it.
+    const paintPhase = join(root, 'paint-phase');
     const fakePi = join(root, 'fake-pi');
     writeFileSync(fakePi, `#!/usr/bin/env node
-process.stdout.write('┌─ pi ──────────┐\\n│ ❯ type here   │\\n└───────────────┘\\n');
-setTimeout(() => process.stdout.write('streaming tokens\\n'), 6_000);
-setInterval(() => {}, 1_000);
+const fs = require('node:fs');
+let painted = '';
+setInterval(() => {
+  if (!fs.existsSync(${JSON.stringify(paintPhase)})) return;
+  const phase = fs.readFileSync(${JSON.stringify(paintPhase)}, 'utf8');
+  if (phase === painted) return;
+  painted = phase;
+  if (phase === 'startup') process.stdout.write('┌─ pi ──────────┐\\n│ ❯ type here   │\\n└───────────────┘\\n');
+  if (phase === 'running') process.stdout.write('streaming tokens\\n');
+}, 25);
 `);
     chmodSync(fakePi, 0o755);
 
@@ -970,6 +988,10 @@ setInterval(() => {}, 1_000);
       turnId: 'om_turn',
     } satisfies DaemonToWorker);
 
+    // Wait for the worker's sampler before painting, so the single startup
+    // write cannot land before its PTY listener is installed.
+    await waitForLog(child, logs, 'Argv-baked first prompt in flight — publishing projected working', WORKER_BOOT_TIMEOUT_MS);
+    writeFileSync(paintPhase, 'startup');
     // The startup-window quiescence idle is re-armed by the evidence gate —
     // this log is the proof it was caught (before the fix it flowed through
     // markPromptReady and seeded a premature working→idle).
@@ -982,8 +1004,9 @@ setInterval(() => {}, 1_000);
 
     // Turn actually starts: real Pi writes the user record at that instant.
     appendFileSync(transcriptPath, piTranscriptRecord('user', 'hello from argv'));
+    writeFileSync(paintPhase, 'running');
 
-    // Mid-turn quiescence (the fake's 6s output going quiet) must now be
+    // Mid-turn quiescence (the new output going quiet) must now be
     // suppressed by the structured lifecycle gate (started turn, no terminal).
     await waitForLog(child, logs, 'Ignoring prompt-ready heuristic while a structured turn is unfinished');
     expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
@@ -998,7 +1021,7 @@ setInterval(() => {}, 1_000);
     const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
     expect(updates.at(-1)?.status).toBe('idle');
-  }, 30_000);
+  }, WORKER_BOOT_TIMEOUT_MS + 30_000);
 
   it('delivers a message queued during startup even when every ready heuristic is lifecycle-blocked', async () => {
     // The terminate-gap deadlock: the argv first turn is transcript-started
@@ -1542,12 +1565,12 @@ setInterval(() => {}, 1_000);
     // first, then classify the real idle settle as limited. If the synthetic
     // tick is classified too, both updates collapse to limited and card-off
     // GoGoGo never sees the busy edge required to flip DONE.
-    const fakeGemini = join(root, 'fake-gemini');
-    writeFileSync(fakeGemini, `#!/usr/bin/env node
+    const fakeMtr = join(root, 'fake-mtr');
+    writeFileSync(fakeMtr, `#!/usr/bin/env node
 process.stdout.write('Rate limit exceeded. Try again at 10:36 PM.\\n');
 setInterval(() => {}, 1_000);
 `);
-    chmodSync(fakeGemini, 0o755);
+    chmodSync(fakeMtr, 0o755);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
@@ -1574,8 +1597,8 @@ setInterval(() => {}, 1_000);
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,
-      cliId: 'gemini',
-      cliPathOverride: fakeGemini,
+      cliId: 'mtr',
+      cliPathOverride: fakeMtr,
       backendType: 'pty',
       prompt: 'hello from argv',
       larkAppId: 'app_test',

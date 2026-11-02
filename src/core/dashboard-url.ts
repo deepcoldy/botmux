@@ -224,6 +224,13 @@ function platformCentralBaseUrl(): string | null {
   return isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
 }
 
+/** Permanent reply cards may link to the SSO console without exporting a
+ * dashboard token. Other dashboard routes still require owner credentials. */
+export function buildReplyConsoleUrl(): string | undefined {
+  const base = platformCentralBaseUrl();
+  return base ? `${base.replace(/\/+$/, '')}/` : undefined;
+}
+
 /** The central-platform terminal surface (`t-<machineId>...`) only, or null. */
 function platformCentralTerminalBaseUrl(): string | null {
   return isRemoteAccessEnabled() ? platformTerminalBaseUrl() : null;

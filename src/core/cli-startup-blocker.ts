@@ -65,13 +65,6 @@ const RULES: readonly StartupBlockerRule[] = [
     folderAfter: /Do you trust the contents of this directory\?/,
   },
   {
-    // Gemini CLI 0.65.0 (captured). Not auto-accepted by the worker's trust
-    // fallback; `--skip-trust` would pre-answer it but older builds reject it.
-    rule: 'gemini-folder-trust',
-    kind: 'folder_trust',
-    all: [/Do you trust the files in this folder\?/, dialogLine(String.raw`Trust folder \(`), dialogLine("Don't trust")],
-  },
-  {
     // Claude Code 2.1.x / Seed / Genius (wording in the 2.1.310 binary). The
     // worker's TRUST_DIALOG_PATTERN normally accepts it within a second; this
     // only reports one that is still up at the first-prompt timeout.
@@ -112,12 +105,6 @@ const RULES: readonly StartupBlockerRule[] = [
       dialogLine(String.raw`Approve in your browser to finish signing in\.`),
       dialogLine('Waiting for approval'),
     ],
-  },
-  {
-    // Gemini CLI 0.65.0 (captured).
-    rule: 'gemini-auth-method',
-    kind: 'login',
-    all: [/How would you like to authenticate for this project\?/, dialogLine('(?:Use Gemini API Key|Sign in with Google)')],
   },
   {
     // Claude Code 2.1.310 (binary strings).

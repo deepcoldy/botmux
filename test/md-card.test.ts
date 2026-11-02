@@ -7,12 +7,17 @@
  * rewrite plus baseline behaviors that must not regress.
  */
 import { describe, it, expect } from 'vitest';
+import assert from 'node:assert/strict';
+import { customFinalCardError } from '../src/im/lark/final-card-sections.js';
 import { homedir, tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   appendReplyCardFooterToV2Card,
   buildCardBodyElements,
+  buildDiffCard,
+  parseUnifiedDiff,
+  DIFF_PREVIEW_BUDGET_BYTES,
   buildCanonicalFinalReplyCard,
   buildImageCardElements,
   buildMarkdownCard,
@@ -1785,5 +1790,152 @@ describe('cardUsageFooterSegment — Claude Code statusline quota (ctx / 5h / 7d
       { context: null, tokens: null, quota: { contextPercent: 23.6, fiveHourPercent: 140, sevenDayPercent: -1 } },
       'zh',
     )).toBe('ctx 24% · 5h 100%');
+  });
+});
+
+describe('unified diff reply cards', () => {
+  const BASIC = '--- a/docs/stress_test.md\n+++ b/docs/stress_test.md\n@@ -1,3 +1,3 @@\n #文档\n-old_value\n+new_value\n \n';
+  const panel = (card: any) => card.body.elements.find(e => e.tag === 'collapsible_panel');
+
+  it('shares the ordinary card envelope and default configuration', () => {
+    const result = buildDiffCard(parseUnifiedDiff(BASIC));
+    expect(result.card).toEqual(createReplyCard(result.card.body.elements));
+    expect(result.card.config).toEqual(createReplyCard([]).config);
+    expect(result.bytes).toBe(Buffer.byteLength(JSON.stringify(result.card), 'utf8'));
+  });
+
+  it('renders summary tables through the same Markdown body builder', () => {
+    const summary = '已修改。\n\n| 项目 | 状态 |\n| --- | --- |\n| 文档 | 已更新 |';
+    const result = buildDiffCard(parseUnifiedDiff(BASIC), { summary });
+    const summaryElements = buildCardBodyElements(summary);
+    expect(result.card.body.elements.slice(0, summaryElements.length)).toEqual(summaryElements);
+    expect(result.card.body.elements.some(element => element.tag === 'table')).toBe(true);
+    expect(result.card.body.elements.some(element => element.tag === 'collapsible_panel')).toBe(true);
+  });
+
+  it.each(['#', '##'])('keeps %s summary headings displayable in final cards', heading => {
+    const result = buildDiffCard(parseUnifiedDiff(BASIC), { summary: `${heading} 修改结果\n\n已更新需求。` });
+    expect(result.card.body.elements[0]).toEqual({ tag: 'markdown', text_size: 'heading-2', content: '修改结果' });
+    expect(customFinalCardError(result.card as unknown as Record<string, unknown>)).toBeUndefined();
+    expect(JSON.stringify(result.card)).not.toContain('botmux_md_h');
+    expect(JSON.stringify(result.card)).toContain('修改结果');
+  });
+
+  it('keeps visible rows from an explicitly incomplete hunk without treating them as full counts', () => {
+    const prefix = '--- a/spec.md\n+++ b/spec.md\n@@ -1,3 +1,3 @@\n-old\n+new\n';
+    expect(() => parseUnifiedDiff(prefix)).toThrow();
+    const files = parseUnifiedDiff(prefix, { allowIncomplete: true });
+    const result = buildDiffCard(files, { inputBytes: 3 * 1024 * 1024 });
+    expect(result.statsScope).toBe('preview');
+    expect(result.stats.added).toBe(1);
+    expect(result.stats.removed).toBe(1);
+    expect(JSON.stringify(result.card)).toContain('+new');
+    expect(JSON.stringify(result.card)).toContain('-old');
+    expect(JSON.stringify(result.card)).toContain('计数仅预览');
+  });
+
+  it('only relaxes EOF truncation and drops unfinished trailing file headers', () => {
+    const prefix = BASIC + '--- a/later.md\n++';
+    const files = parseUnifiedDiff(prefix, { allowIncomplete: true });
+    expect(files).toHaveLength(1);
+    expect(files[0].path).toBe('docs/stress_test.md');
+    expect(() => parseUnifiedDiff('--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n!invalid\n', { allowIncomplete: true })).toThrow();
+  });
+
+  it('shows up to sixty preview rows and preserves part of a single very long line', () => {
+    const input = '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1,100 @@\n' + Array.from({ length: 100 }, (_, i) => '+requirement ' + i).join('\n') + '\n';
+    const result = buildDiffCard(parseUnifiedDiff(input), { inputBytes: 3 * 1024 * 1024 });
+    expect(result.preview.rows).toBe(60);
+    expect(JSON.stringify(result.card)).toContain('diff 超限，仅显示前60行');
+    expect(result.stats.added).toBe(59);
+    const long = '--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+first visible content ' + 'x'.repeat(20_000) + '\n';
+    const line = buildDiffCard(parseUnifiedDiff(long));
+    expect(JSON.stringify(line.card)).toContain('+first visible content');
+    expect(JSON.stringify(line.card)).toContain('长行已截断');
+    expect(line.bytes).toBeLessThanOrEqual(DIFF_PREVIEW_BUDGET_BYTES);
+  });
+
+  it('统一 diff 的真实计数、路径、上下文和空行', () => {
+    const files = parseUnifiedDiff(BASIC);
+    assert.equal(files[0].path, 'docs/stress_test.md');
+    assert.equal(files[0].added, 1);
+    assert.equal(files[0].removed, 1);
+    const output = buildDiffCard(files);
+    assert.match(panel(output.card).header.title.content, /stress\\_test/);
+    assert.match(panel(output.card).elements[0].content, /color='green'>\+new\\_value/);
+    assert.match(panel(output.card).elements[0].content, /color='grey'>·<\/font>/);
+    assert.equal(panel(output.card).expanded, false);
+  });
+
+  it('像文件头一样的新增/删除内容仍算真实内容行', () => {
+    const files = parseUnifiedDiff('--- a/x\n+++ b/x\n@@ -1 +1 @@\n----old\n++++new\n');
+    assert.equal(files[0].added, 1);
+    assert.equal(files[0].removed, 1);
+    assert.equal(files[0].rows[2].text, '+++new');
+  });
+
+  it('转义 font 字面文本、反斜杠、Markdown 和实体，保留缩进', () => {
+    const files = parseUnifiedDiff('--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\told\n+    <font color="red"> _x_ &nbsp; \\\n');
+    const content = panel(buildDiffCard(files).card).elements[0].content;
+    assert.match(content, /\+&nbsp;&nbsp;&nbsp;&nbsp;\\<font/);
+    assert.match(content, /-(&nbsp;){4}old/);
+    assert.match(content, /\\_x\\_/);
+    assert.ok(content.includes('&amp;nbsp;'));
+    assert.ok(content.includes('\\\\'));
+    assert.ok(!content.includes('<font color="red">'));
+  });
+
+  it('Git 八进制 UTF-8 quoted 路径可读，时间戳不混入路径', () => {
+    const encoded = [...Buffer.from('文档/说明.md')].map(byte => '\\' + byte.toString(8).padStart(3, '0')).join('');
+    const files = parseUnifiedDiff(`--- "a/${encoded}"\n+++ "b/${encoded}"\n@@ -1 +1 @@\n-a\n+b\n`);
+    assert.equal(files[0].path, '文档/说明.md');
+    const timestamp = parseUnifiedDiff('--- old file.md\t2026-01-01\n+++ new file.md\t2026-01-02\n@@ -1 +1 @@\n-a\n+b\n');
+    assert.equal(timestamp[0].path, 'new file.md');
+  });
+
+  it('新增、删除、多文件与多个 hunk 的计数', () => {
+    const input = '--- /dev/null\n+++ b/new.md\n@@ -0,0 +1,2 @@\n+one\n+two\n--- a/old.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n--- a/third.md\n+++ b/third.md\n@@ -1 +1 @@\n-a\n+b\n@@ -3 +3 @@\n-c\n+d\n';
+    const output = buildDiffCard(parseUnifiedDiff(input));
+    assert.deepEqual(output.stats, {files: 3, added: 4, removed: 3});
+    assert.match(output.card.body.elements[1].elements[0].content, /新增文件/);
+  });
+
+  it('No newline 标记、CRLF、rename、mode 和 binary 元数据', () => {
+    const newline = parseUnifiedDiff('--- a/x\r\n+++ b/x\r\n@@ -1 +1 @@\r\n-a\r\n\\ No newline at end of file\r\n+b\r\n\\ No newline at end of file\r\n');
+    assert.equal(newline[0].rows.filter(row => row.kind === '\\').length, 2);
+    const rename = parseUnifiedDiff('diff --git a/old.md b/new.md\nsimilarity index 100%\nrename from old.md\nrename to new.md\nold mode 100644\nnew mode 100755\n');
+    assert.equal(rename[0].path, 'new.md');
+    assert.equal(rename[0].notes.length, 4);
+    const binary = parseUnifiedDiff('diff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n');
+    assert.match(panel(buildDiffCard(binary).card).elements[0].content, /二进制/);
+  });
+
+  it('截断长 Unicode 预览，保留真实计数和 hunk 定位', () => {
+    const input = '--- /dev/null\n+++ b/large.md\n@@ -0,0 +1,100 @@\n' + Array.from({length: 100}, (_, i) => '+' + i + '中'.repeat(1_000)).join('\n') + '\n';
+    const output = buildDiffCard(parseUnifiedDiff(input));
+    assert.equal(output.stats.added, 100);
+    assert.equal(output.preview.truncated, true);
+    assert.ok(output.bytes <= DIFF_PREVIEW_BUDGET_BYTES);
+    assert.match(panel(output.card).elements[0].content, /@@ -0,0 \+1,100 @@/);
+    assert.match(panel(output.card).header.title.content, /\+100/);
+    assert.deepEqual(JSON.parse(JSON.stringify(output.card)), output.card);
+  });
+
+  it('过多文件/过长路径也受整卡预算约束', () => {
+    const input = Array.from({length: 40}, (_, i) => `--- a/${i}\n+++ b/${i}\n@@ -1 +1 @@\n-a\n+b\n`).join('');
+    const output = buildDiffCard(parseUnifiedDiff(input));
+    assert.equal(output.stats.files, 40);
+    assert.ok(output.preview.omittedFiles >= 20);
+    const giant = parseUnifiedDiff(`--- a/x\n+++ b/${'x'.repeat(30_000)}\n@@ -1 +1 @@\n-a\n+b\n`);
+    assert.ok(buildDiffCard(giant).bytes <= DIFF_PREVIEW_BUDGET_BYTES);
+  });
+
+  it('无差异、非法 diff、hunk 不完整和参数边界', () => {
+    assert.equal(buildDiffCard(parseUnifiedDiff('')).stats.files, 0);
+    for (const input of ['not a diff', '--- a/x\n@@ -1 +1 @@\n-a\n+b\n', '--- a/x\n+++ b/x\n@@ -1,2 +1 @@\n-a\n+b\n', '--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n+extra\n']) assert.throws(() => parseUnifiedDiff(input));
+    const oversizedValidDiff = '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(2 * 1024 * 1024) + '\n';
+    assert.throws(() => parseUnifiedDiff(oversizedValidDiff), /diff 输入超过 2MiB/);
+    assert.throws(() => buildDiffCard([], {maxLines: 0}));
+    assert.throws(() => buildDiffCard([], {summary: '中'.repeat(1_400)}));
   });
 });

@@ -158,7 +158,7 @@ describe('v2 -> v3 Saved Workflow conversion', () => {
 
     expect(codes(convertLegacyWorkflowDefinition({
       definition: baseDefinition(),
-      bots: [{ ...BOT, cliId: 'gemini' }],
+      bots: [{ ...BOT, cliId: 'opencode' }],
     }))).toContain('CLI_NOT_SUPPORTED');
 
     expect(codes(convertLegacyWorkflowDefinition({

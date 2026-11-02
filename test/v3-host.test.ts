@@ -110,7 +110,7 @@ describe('host — architect/default bot selection', () => {
         },
       });
       const bots = [
-        { larkAppId: 'cli_first', name: 'first', cliId: 'gemini', workingDir: '/first' },
+        { larkAppId: 'cli_first', name: 'first', cliId: 'opencode', workingDir: '/first' },
         { larkAppId: 'cli_bound', name: 'bound', cliId: 'traex', workingDir: '/bound' },
         { larkAppId: 'cli_relay', name: 'relay', cliId: 'relay', workingDir: '/relay' },
       ] as any;
@@ -133,10 +133,10 @@ describe('host — architect/default bot selection', () => {
     try {
       const { runDir } = hostNew({ goal: 'g', baseDir: b, runId: 'r' });
       const bots = [
-        { larkAppId: 'cli_gemini', name: 'gemini', cliId: 'gemini', workingDir: '/g' },
+        { larkAppId: 'cli_opencode', name: 'opencode', cliId: 'opencode', workingDir: '/g' },
         { larkAppId: 'cli_restricted', name: 'restricted', cliId: 'codex', workingDir: '/r', disableCliBypass: true },
       ] as any;
-      expect(() => resolveArchitectBotSnapshot(runDir, bots, 'gemini'))
+      expect(() => resolveArchitectBotSnapshot(runDir, bots, 'opencode'))
         .toThrow(/unsupported CLI.*supported:/);
       expect(() => resolveArchitectBotSnapshot(runDir, bots, 'restricted'))
         .toThrow(/requires CLI bypass permissions/);

@@ -83,6 +83,15 @@ function resolveTipTarget(node: EventTarget | null): Element | null {
   return node.closest('[data-tip]');
 }
 
+function isKeyboardFocus(node: EventTarget | null): boolean {
+  if (!(node instanceof Element)) return false;
+  try {
+    return node.matches(':focus-visible');
+  } catch {
+    return true; // 不支持 :focus-visible 的老浏览器维持原行为
+  }
+}
+
 /** 初始化一次即可。委托监听 hover / focus，出现前有 120ms 延迟（避免划过闪烁）。 */
 export function initIconTooltips(): void {
   if (initialized || typeof document === 'undefined') return;
@@ -102,10 +111,11 @@ export function initIconTooltips(): void {
     if (to && (to === from || from.contains(to))) return;
     hide();
   });
-  // 键盘可达：focus 显示，blur 隐藏。
+  // 键盘可达：focus 显示，blur 隐藏。只认键盘焦点（:focus-visible）——弹窗 showModal() 会
+  // 自动把焦点给第一个按钮（详情抽屉里就是「关闭」），鼠标打开时不该凭空冒出一个气泡。
   document.addEventListener('focusin', (e) => {
     const target = resolveTipTarget(e.target);
-    if (target) showFor(target);
+    if (target && isKeyboardFocus(e.target)) showFor(target);
   });
   document.addEventListener('focusout', hide);
   // 点击后立即隐藏（多为触发了操作），滚动/尺寸变化重定位或隐藏。

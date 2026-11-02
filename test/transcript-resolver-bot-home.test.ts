@@ -461,7 +461,7 @@ describe('cliSupportsNativeUsage', () => {
       expect(cliSupportsNativeUsage(id)).toBe(true);
     }
     // CLIs the resolver's switch has no case for → no native usage → hide the UI.
-    for (const id of ['gemini', 'opencode', 'mtr', 'hermes', 'kiro-cli', 'unknown', undefined]) {
+    for (const id of ['kimi', 'opencode', 'mtr', 'hermes', 'kiro-cli', 'unknown', undefined]) {
       expect(cliSupportsNativeUsage(id)).toBe(false);
     }
   });

@@ -45,6 +45,7 @@
  *
  * Nothing in this module runs on macOS (the kernel has no COW primitive).
  */
+import { writeCliNameLink } from '../../core/sandbox-wrapper-launch.js';
 import {
   mkdirSync,
   existsSync,
@@ -65,15 +66,18 @@ import {
   reattachableRelayOutbox,
   removeTreeUnlessMounted,
   reexposeRunBinArgs,
+  hostResolverBindArgs,
   SCRATCH_TREE_MARKER,
 } from './sandbox.js';
 import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
+import { bwrapExecutable } from '../../core/system-bwrap.js';
 import { procStatStartTimeDigits } from '../../utils/proc-stat.js';
 import { PROXY_ENV_KEYS, CA_BUNDLE_ENV_KEYS } from '../../utils/child-env.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import { scratchInstallHint, type ScratchFailure } from './scratch-capability.js';
 
 /** Scratch upper storage selection. */
 export type ScratchStorage = 'tmpfs' | 'disk';
@@ -132,6 +136,24 @@ function canonical(p: string): string {
   try { return realpathSync(p); } catch { return resolve(p); }
 }
 
+/** Like canonical, but a path that does not exist (yet) keeps its missing tail
+ *  under the realpath of its deepest existing ancestor. A lexical path through
+ *  a symlink (a ~/.botmux moved to another disk and linked back) can be neither
+ *  a bwrap mount target nor a safe mkdir target in the merged tree: an
+ *  absolute symlink there resolves on the HOST. */
+export function canonicalAllowMissing(p: string): string {
+  const abs = resolve(p);
+  let head = abs;
+  const tail: string[] = [];
+  for (;;) {
+    try { return join(realpathSync(head), ...tail.reverse()); } catch { /* missing: go up */ }
+    const parent = dirname(head);
+    if (parent === head) return abs;
+    tail.push(basename(head));
+    head = parent;
+  }
+}
+
 function hasCmd(cmd: string): boolean {
   return spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
 }
@@ -139,11 +161,11 @@ function hasCmd(cmd: string): boolean {
 /** Verify (best-effort auto-install) bwrap +, for the userspace path,
  *  fuse-overlayfs. Same provisioning policy as the oncall sandbox: root or
  *  passwordless sudo only, never block on a prompt. */
-function ensureScratchDeps(needFuse: boolean): boolean {
+function ensureScratchDeps(needFuse: boolean): ScratchFailure | null {
   const missing: string[] = [];
-  if (!hasCmd('bwrap')) missing.push('bubblewrap');
+  if (!bwrapExecutable()) missing.push('bubblewrap');
   if (needFuse && !hasCmd('fuse-overlayfs')) missing.push('fuse-overlayfs');
-  if (!missing.length) return true;
+  if (!missing.length) return null;
   const pm =
     hasCmd('apt-get') ? ['apt-get', 'install', '-y', ...missing] :
     hasCmd('dnf') ? ['dnf', 'install', '-y', ...missing] :
@@ -155,15 +177,16 @@ function ensureScratchDeps(needFuse: boolean): boolean {
   if (pm) {
     const argv = isRoot ? pm : ['sudo', '-n', ...pm];
     const r = spawnSync(argv[0], argv.slice(1), { stdio: 'ignore', timeout: 180_000 });
-    if (r.status === 0 && missing.every(m => hasCmd(m === 'bubblewrap' ? 'bwrap' : m))) return true;
+    if (r.status === 0 && missing.every(m => (m === 'bubblewrap' ? !!bwrapExecutable() : hasCmd(m)))) return null;
   }
-  const guide = pm ? `${isRoot ? '' : 'sudo '}${pm.join(' ')}` : `install: ${missing.join(', ')}`;
+  const guide = scratchInstallHint(pm?.[0] ?? null, isRoot, missing);
   console.error(`[scratch-sandbox] missing deps (${missing.join(', ')}); auto-install unavailable — ${guide}`);
-  return false;
+  return { reason: 'deps-missing', detail: missing.join(', '), installHint: guide };
 }
 
 /** Mount an overlayfs. root → kernel `mount -t overlay`; otherwise (or when
- *  BOTMUX_SANDBOX_FUSE=1) → fuse-overlayfs. Returns true on success. When the
+ *  BOTMUX_SANDBOX_FUSE=1) → fuse-overlayfs. Returns null on success, else the
+ *  driver tried last and its error. When the
  *  kernel mount fails and allowFuseFallback is set, FUSE is tried (the
  *  userspace driver tolerates upper-under-lower for lower=/). */
 function mountOverlay(opts: {
@@ -172,7 +195,7 @@ function mountOverlay(opts: {
   work: string;
   merged: string;
   allowFuseFallback: boolean;
-}): boolean {
+}): { driver: 'kernel' | 'fuse'; detail: string } | null {
   for (const d of [opts.upper, opts.work, opts.merged]) {
     try { mkdirSync(d, { recursive: true }); } catch { /* */ }
   }
@@ -180,18 +203,27 @@ function mountOverlay(opts: {
   const forceFuse = process.env.BOTMUX_SANDBOX_FUSE === '1';
   if (!forceFuse && process.getuid?.() === 0) {
     const r = spawnSync('mount', ['-t', 'overlay', 'overlay', '-o', optStr, opts.merged], { stdio: 'pipe' });
-    if (r.status === 0) return true;
+    if (r.status === 0) return null;
     if (!opts.allowFuseFallback) {
-      console.error(`[scratch-sandbox] kernel overlay mount failed: ${r.stderr?.toString().trim() || r.status}`);
-      return false;
+      const detail = spawnErrorText(r);
+      console.error(`[scratch-sandbox] kernel overlay mount failed: ${detail}`);
+      return { driver: 'kernel', detail };
     }
   }
   const f = spawnSync('fuse-overlayfs', ['-o', optStr, opts.merged], { stdio: 'pipe' });
   if (f.status !== 0) {
-    console.error(`[scratch-sandbox] overlay mount failed (kernel/fuse): ${f.stderr?.toString().trim() || f.status}`);
-    return false;
+    const detail = spawnErrorText(f);
+    console.error(`[scratch-sandbox] overlay mount failed (kernel/fuse): ${detail}`);
+    return { driver: 'fuse', detail };
   }
-  return true;
+  return null;
+}
+
+/** First stderr line (mount appends a generic dmesg hint after the real
+ *  error), else the spawn error / exit status, for a failure notice. */
+function spawnErrorText(r: ReturnType<typeof spawnSync>): string {
+  const line = (r.stderr?.toString() ?? '').split('\n').map(l => l.trim()).find(Boolean);
+  return line ?? (r.error ? r.error.message : `exit ${r.status}`);
 }
 
 export function isMountpoint(p: string): boolean {
@@ -487,17 +519,20 @@ function scratchLayout(sessionId: string, dataDir: string, storage: ScratchStora
  *  kernel default. A non-root daemon cannot mount a tmpfs in the host
  *  namespace — fail honestly (use disk storage + fuse-overlayfs), never
  *  silently change the RAM-backed promise. */
-function mountSlot(slot: string, sizeMb?: number): boolean {
+function mountSlot(slot: string, sizeMb?: number): ScratchFailure | null {
   try { mkdirSync(slot, { recursive: true }); } catch { /* */ }
-  if (isMountpoint(slot)) return true; // already there (daemon restart)
+  if (isMountpoint(slot)) return null; // already there (daemon restart)
   const sizeKb = sizeMb && sizeMb > 0 ? `,size=${Math.trunc(sizeMb * 1024)}k` : '';
   const args = sizeKb
     ? ['-t', 'tmpfs', '-o', `mode=700${sizeKb}`, 'tmpfs', slot]
     : ['-t', 'tmpfs', '-o', 'mode=700', 'tmpfs', slot];
   const r = spawnSync('mount', args, { stdio: 'pipe' });
-  if (r.status === 0) return true;
-  console.error(`[scratch-sandbox] tmpfs upper slot mount failed (non-root host? use scratchStorage "disk"): ${r.stderr?.toString().trim() || r.status}`);
-  return false;
+  if (r.status === 0) return null;
+  const detail = spawnErrorText(r);
+  console.error(`[scratch-sandbox] tmpfs upper slot mount failed (non-root host? use scratchStorage "disk"): ${detail}`);
+  // Only root can mount a tmpfs in the host namespace: say so rather than
+  // passing mount's "must be superuser" through (no automatic switch to disk).
+  return process.getuid?.() === 0 ? { reason: 'tmpfs-mount-failed', detail } : { reason: 'tmpfs-needs-root', detail };
 }
 
 export interface PrepareScratchOpts {
@@ -506,6 +541,8 @@ export interface PrepareScratchOpts {
   storage: ScratchStorage;
   /** tmpfs size cap in MB (tmpfs storage only). 0/undefined = kernel default. */
   tmpfsSizeMb?: number;
+  /** Session temp path; recreate its short alias after the private /tmp mount. */
+  tempDir?: string;
   /** Keep network (default true). */
   net?: boolean;
   /** Absolute host paths to hide inside the sandbox ON TOP OF the full-root
@@ -520,6 +557,9 @@ export interface PrepareScratchOpts {
   /** Transport bwrap options via a private file when launching under a backend
    *  with command-length limits (tmux new-session). */
   useBwrapArgsFile?: boolean;
+  /** wrapperCli inside the sandbox: `<cli name>` alias placed in the private
+   *  shim dir (first on PATH) pointing at the real, already-allowed CLI. */
+  cliNameLink?: { name: string; target: string };
   /** Absolute `botmux` command paths to overlay with the relay shim. */
   shimBindTargets?: readonly string[];
   mcpGatewaySocketPath?: string;
@@ -540,10 +580,20 @@ export interface PrepareScratchOpts {
   skipPidNamespace?: boolean;
 }
 
+export type ScratchPrepareResult =
+  | { ok: true; spawn: ScratchSandboxSpawn }
+  | { ok: false; failure: ScratchFailure };
+
+/** prepareScratchSandboxDetailed without the reason: null on any failure. */
+export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxSpawn | null {
+  const r = prepareScratchSandboxDetailed(opts);
+  return r.ok ? r.spawn : null;
+}
+
 /**
- * Build the scratch-sandboxed spawn for a CLI session. Returns null ONLY when
- * the platform/deps/storage cannot serve it (the worker treats null as a hard
- * error — never a silent unsandboxed run).
+ * Build the scratch-sandboxed spawn for a CLI session. Fails ONLY when the
+ * platform/deps/storage cannot serve it, with the reason (the worker turns it
+ * into a notice and a hard error — never a silent unsandboxed run).
  *
  * Re-entry semantics (same-session re-spawn, daemon-restart cold resume):
  *  - an already-mounted matching overlay (+submounts) is REUSED;
@@ -552,14 +602,27 @@ export interface PrepareScratchOpts {
  *    the caller must surface that, never fabricate a fresh upper (the CLI
  *    would "resume" against a state it never had).
  */
-export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxSpawn | null {
-  if (process.platform !== 'linux') return null;
+export function prepareScratchSandboxDetailed(opts: PrepareScratchOpts): ScratchPrepareResult {
+  const refuse = (failure: ScratchFailure): ScratchPrepareResult => ({ ok: false, failure });
+  if (process.platform !== 'linux') return refuse({ reason: 'unsupported-platform' });
 
   const storage: ScratchStorage = opts.storage === 'disk' ? 'disk' : 'tmpfs';
   const needFuse = process.env.BOTMUX_SANDBOX_FUSE === '1' || process.getuid?.() !== 0;
-  if (!ensureScratchDeps(needFuse)) return null;
+  const depsFailure = ensureScratchDeps(needFuse);
+  if (depsFailure) return refuse(depsFailure);
+  // ensureScratchDeps resolves through the same bwrapExecutable(), so this is
+  // present; keep the resolved path explicit at the launch sites (never a bare
+  // bwrap) and fail closed in the (unreachable) event it vanished.
+  const bwrap = bwrapExecutable();
+  if (!bwrap) {
+    return refuse({
+      reason: 'deps-missing',
+      detail: 'bubblewrap',
+      installHint: scratchInstallHint(null, process.getuid?.() === 0, ['bubblewrap']),
+    });
+  }
 
-  const launch = linuxIsolationLaunch('bwrap', []);
+  const launch = linuxIsolationLaunch(bwrap, []);
   const { sessionRoot, merged, upper, work, slot, subroots } =
     scratchLayout(opts.sessionId, opts.dataDir, storage);
   // A prepare killed between its first mount and its marker left mounts and no
@@ -583,19 +646,19 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   const existing = readMeta(sessionRoot);
   if (existing && (existing.storage !== storage || existing.upper !== upper)) {
     console.error(`[scratch-sandbox] session ${opts.sessionId}: on-disk scratch meta (${existing.storage}) conflicts with requested ${storage} — refusing to spawn`);
-    return null;
+    return refuse({ reason: 'storage-conflict', recordedStorage: existing.storage === 'disk' ? 'disk' : 'tmpfs' });
   }
 
   // Two prepares of one session never run at once (one worker per session);
   // if they somehow did, the second would stack a view over the first's.
   if (preparingByOther(sessionRoot)) {
     console.error(`[scratch-sandbox] session ${opts.sessionId}: another live process is preparing this sandbox — refusing to spawn`);
-    return null;
+    return refuse({ reason: 'prepare-in-progress' });
   }
 
   const preparingRecord = join(sessionRoot, PREPARING_RECORD);
   const rolledBack: string[] = [];
-  const fail = (where: string): null => {
+  const fail = (where: string, failure: ScratchFailure): ScratchPrepareResult => {
     console.error(`[scratch-sandbox] setup failed at ${where} — aborting spawn (fail closed, never bare-run)`);
     for (const p of [...rolledBack].reverse()) unmountAny(p);
     if (!existing && storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
@@ -604,7 +667,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     // and never by rm through anything still mounted.
     if (existing) rmSync(preparingRecord, { force: true });
     else removeTreeUnlessMounted(sessionRoot);
-    return null;
+    return refuse(failure);
   };
 
   // A recorded view that is not what its marker says — a re-mount or teardown
@@ -641,7 +704,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       atomicWriteFileSync(preparingRecord, JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) ?? '' }), { mode: 0o600, followTargetSymlink: false });
     } catch (err) {
       console.error(`[scratch-sandbox] session ${opts.sessionId}: cannot record the prepare in progress (${(err as Error)?.message ?? err}) — refusing to spawn`);
-      return null;
+      return refuse({ reason: 'state-write-failed', detail: (err as Error)?.message ?? String(err) });
     }
     if (storage === 'tmpfs') {
       // A RECORDED tmpfs session whose slot is gone means the machine rebooted
@@ -653,21 +716,22 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       // whose slot survives is re-mounted onto the same upper.)
       if (existing && !isMountpoint(slot!)) {
         console.error(`[scratch-sandbox] tmpfs upper for recorded session ${opts.sessionId} is gone (machine reboot wiped it) — refusing to fabricate a fresh COW view; start a new session`);
-        return null;
+        return refuse({ reason: 'tmpfs-upper-lost' });
       }
-      if (!mountSlot(slot!, opts.tmpfsSizeMb)) return null;
+      const slotFailure = mountSlot(slot!, opts.tmpfsSizeMb);
+      if (slotFailure) return refuse(slotFailure);
     }
     // disk: a cold resume normally arrives here (overlay unmounted at the last
     // process exit; upper/work persist on disk and are cleanly re-mounted).
-    const mounted = mountOverlay({
+    const mainOverlayFailure = mountOverlay({
       lower: '/', upper, work, merged,
       // disk upper under lower=/ fails the kernel overlapping-layer check on
       // hardened kernels; fuse-overlayfs serves it. tmpfs slot never overlaps.
       allowFuseFallback: storage === 'disk',
     });
-    if (!mounted) {
+    if (mainOverlayFailure) {
       if (!existing && storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
-      return fail('main-overlay');
+      return fail('main-overlay', { reason: 'overlay-mount-failed', ...mainOverlayFailure });
     }
     rolledBack.push(merged);
 
@@ -701,7 +765,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       const subUpper = storage === 'tmpfs' ? join(slot!, `sub-${dir}-upper`) : join(subDir, 'upper');
       const subWork = storage === 'tmpfs' ? join(slot!, `sub-${dir}-work`) : join(subDir, 'work');
       const targetInMerged = join(merged, m.mountpoint);
-      const ok = mountOverlay({ lower: m.mountpoint, upper: subUpper, work: subWork, merged: subMerged, allowFuseFallback: true });
+      const ok = mountOverlay({ lower: m.mountpoint, upper: subUpper, work: subWork, merged: subMerged, allowFuseFallback: true }) === null;
       try { mkdirSync(targetInMerged, { recursive: true }); } catch { /* present from lower */ }
       if (ok && spawnSync('mount', ['--bind', subMerged, targetInMerged], { stdio: 'pipe' }).status === 0) {
         subMounts.push({ mountpoint: m.mountpoint, kind: 'overlay', dir });
@@ -718,7 +782,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     // Adopting a live mount after a daemon restart: trust the recorded subs.
     if (!existing || existing.merged !== merged) {
       console.error(`[scratch-sandbox] ${merged} already mounted but meta missing/mismatch — refusing to spawn`);
-      return null;
+      return refuse({ reason: 'stale-mount', detail: merged });
     }
     for (const s of existing.subs ?? []) subMounts.push({ mountpoint: s.mountpoint, dir: s.dir, kind: 'overlay' });
     // Any submount that appeared since may need the read-only fallback at least;
@@ -739,7 +803,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     .sort((a, b) => a.split('/').length - b.split('/').length);
   if (roFallbackPoints.some(p => p === cwdCanonical || isWithin(p, cwdCanonical))) {
     console.error(`[scratch-sandbox] working dir ${cwdCanonical} sits on a submount that cannot be overlaid (would be read-only) — refusing to spawn`);
-    return fail('cwd-on-ro-submount');
+    const roPoint = roFallbackPoints.filter(p => p === cwdCanonical || isWithin(p, cwdCanonical)).at(-1);
+    return fail('cwd-on-ro-submount', { reason: 'cwd-on-ro-submount', ...(roPoint ? { detail: roPoint } : {}) });
   }
   const probeName = `.botmux-scratch-probe-${process.pid}-${Date.now()}`;
   const probeInMerged = join(merged, relative('/', cwdCanonical), probeName);
@@ -750,12 +815,12 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     if (existsSync(probeOnHost)) {
       rmSync(probeInMerged, { force: true });
       console.error(`[scratch-sandbox] cwd COW probe leaked to the real host (${probeOnHost}) — refusing to spawn`);
-      return fail('cwd-write-leaked-to-host');
+      return fail('cwd-write-leaked-to-host', { reason: 'cwd-write-leaked' });
     }
     rmSync(probeInMerged, { force: true });
   } catch (err) {
     console.error(`[scratch-sandbox] working dir ${cwdCanonical} is not writable inside the COW view: ${(err as Error)?.message ?? err}`);
-    return fail('cwd-cow-probe');
+    return fail('cwd-cow-probe', { reason: 'cwd-not-writable', detail: (err as Error)?.message ?? String(err) });
   }
 
   const currentOverlaySubs = subMounts.filter(s => s.kind === 'overlay')
@@ -784,7 +849,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   try {
     atomicWriteFileSync(metaPath(sessionRoot), JSON.stringify(meta), { mode: 0o600, followTargetSymlink: false, durable: true });
   } catch (err) {
-    if (!existing) return fail(`meta-write: ${(err as Error)?.message ?? err}`);
+    if (!existing) return fail(`meta-write: ${(err as Error)?.message ?? err}`, { reason: 'state-write-failed', detail: (err as Error)?.message ?? String(err) });
     console.error(`[scratch-sandbox] session ${opts.sessionId}: could not refresh its marker (keeping the previous one): ${(err as Error)?.message ?? err}`);
   }
   rmSync(preparingRecord, { force: true });
@@ -793,6 +858,9 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   const shim = join(shimBin, 'botmux');
   writeFileSync(shim, botmuxShimExecLine());
   try { chmodSync(shim, 0o755); } catch { /* */ }
+  // A wrapperCli running inside the sandbox may exec the CLI by name: alias
+  // that name to the (already allowed) real CLI binary in this private dir.
+  writeCliNameLink(shimBin, opts.cliNameLink);
 
   // Real-host passthrough carve-outs layered AFTER deny masks (later mount
   // wins). The outbox MUST stay host-real: the daemon watcher reads it without
@@ -810,6 +878,12 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   args.push('--bind', merged, '/');
   args.push('--proc', '/proc', '--dev', '/dev');
   args.push('--tmpfs', '/tmp', '--tmpfs', '/run', '--tmpfs', '/var/tmp', '--tmpfs', '/dev/shm');
+  // Point into the merged COW view, never bind the host cache writable.
+  // Install before deny masks so denied descendants remain hidden via the alias.
+  if (opts.tempDir && resolve(opts.tempDir) !== canonical(opts.tempDir)) {
+    args.push('--dir', dirname(resolve(opts.tempDir)),
+      '--symlink', canonical(opts.tempDir), resolve(opts.tempDir));
+  }
   if (existsSync('/sys')) args.push('--ro-bind', '/sys', '/sys');
   // /var/tmp mask also hides the tmpfs upper slot from the container.
 
@@ -844,7 +918,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   for (const raw of opts.denyPaths ?? []) {
     if (typeof raw !== 'string' || !raw) continue;
     let p: string;
-    try { p = canonical(raw); } catch { continue; }
+    try { p = canonicalAllowMissing(raw); } catch { continue; }
     if (!isAbsolute(p) || p === '/' || seen.has(p)) continue;
     seen.add(p);
     denies.push(p);
@@ -886,14 +960,14 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   if (opts.mcpGatewaySocketPath) {
     try {
       const socketPath = resolve(opts.mcpGatewaySocketPath);
-      if (!lstatSync(socketPath).isSocket()) return fail('mcp-socket-not-socket');
+      if (!lstatSync(socketPath).isSocket()) return fail('mcp-socket-not-socket', { reason: 'mcp-socket' });
       const hostDir = realpathSync(dirname(socketPath));
       const sandboxDir = '/run/botmux-mcp';
       args.push('--dir', sandboxDir, '--ro-bind', hostDir, sandboxDir);
       sandboxMcpSocket = join(sandboxDir, basename(socketPath));
       carveTargets.add(hostDir);
     } catch {
-      return fail('mcp-socket-setup');
+      return fail('mcp-socket-setup', { reason: 'mcp-socket' });
     }
   }
   // Read-only carve-outs under denied directories (this session's own
@@ -931,6 +1005,9 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
 
   // fnm/nvm/volta bin farms under /run get masked by the fresh /run tmpfs.
   args.push(...reexposeRunBinArgs([opts.cliBin, process.execPath]));
+  // /etc/resolv.conf → /run/... (systemd-resolved) dangles under the fresh
+  // /run tmpfs; re-expose that one file unless the operator denied it.
+  args.push(...hostResolverBindArgs({ denied: path => denies.some(d => isWithin(d, path)) }));
 
   // Outbox real-host passthrough (daemon watcher reads THIS dir).
   args.push('--bind', outbox, outbox);
@@ -982,7 +1059,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   let compactLaunch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | null = null;
   try {
     compactLaunch = opts.useBwrapArgsFile
-      ? linuxIsolationLaunchViaArgsFile('bwrap', args, command, sessionRoot)
+      ? linuxIsolationLaunchViaArgsFile(bwrap, args, command, sessionRoot)
       : null;
   } catch (error) {
     teardownScratchSession(opts.sessionId, opts.dataDir);
@@ -990,7 +1067,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   }
   if (!compactLaunch) args.push('--', ...command);
 
-  return {
+  const spawn: ScratchSandboxSpawn = {
     bin: compactLaunch?.bin ?? launch.bin,
     args: compactLaunch?.args ?? [...launch.args, ...args],
     ...(compactLaunch ? { argsFile: compactLaunch.argsFile } : {}),
@@ -1003,6 +1080,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       teardownScratchSession(opts.sessionId, opts.dataDir);
     },
   };
+  return { ok: true, spawn };
 }
 
 /** Re-attach the daemon side to a LIVE scratch pane after a daemon restart or

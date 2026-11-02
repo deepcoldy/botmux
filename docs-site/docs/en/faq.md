@@ -38,7 +38,7 @@ botmux has two permission layers (the full layer model is in [Permissions & Acce
 
 ### C. Terminal has output but nothing sent to Lark
 
-**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Gemini / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Antigravity / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
 
 > ⚠️ **Exception: `codex-app` (Codex App app-server protocol)** — its final assistant message is **auto-forwarded** back to Lark by botmux, so **don't call `botmux send` for normal replies** (that would double-send); use it only for mid-turn pushes / attachments / cross-bot @mentions.
 
@@ -194,6 +194,10 @@ curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh 
 ### Why can't I npm-upgrade from a release older than v3.18.0?
 
 Starting with v3.18.0 the npm package changed form, from "Node + `dist/` sources" to a **platform binary subpackage**, and `node-pty` left `dependencies`. Old builds shipped a `botmux upgrade` that simply delegated to npm; when npm installs across that boundary it prunes `node-pty` from the old tree, while the old daemon's first restart step is still `node …/dist/cli.js restart` — and that file still statically imports `node-pty`. The driver dies on `ERR_MODULE_NOT_FOUND` and the whole daemon fleet never comes back, even though output may already have said "restarting to apply". The curl route drops in the new binary and points the launcher at it without touching the old directory or depending on what npm prunes, which makes it the one reliable way across this boundary. On current (≥3.18) binary installs `botmux upgrade` is equivalent to re-running curl; when you don't remember your install form, curl always works.
+
+## A bot with `cliId: "gemini"` no longer starts?
+
+Gemini CLI has been retired and the `gemini` adapter removed. That bot refuses to start with a hint to switch to Antigravity; other bots keep running. Install `agy` and sign in with a Google account (or set `modelProvider: "gemini"` in `~/.gemini/antigravity-cli/settings.json` and provide `GEMINI_API_KEY`), then change `cliId` to `"antigravity"` (in `bots.json` or with `botmux setup`) and run `botmux restart`. The old `cliPathOverride` / `wrapperCli` (e.g. `ttadk gemini`), Gemini `model` names and `GEMINI_CLI_HOME` do not carry over. See [Gemini CLI has been removed](/en/adapters#gemini-cli-has-been-removed).
 
 ## CoCo loses messages while busy?
 

@@ -25,7 +25,7 @@ function isInside(parent: string, child: string): boolean {
 }
 
 /** Resolve a private Codex directory without following a bot-planted leaf symlink. */
-function secureCodexHome(botHome: string): string {
+export function secureCodexHome(botHome: string): string {
   if (existsSync(botHome)) {
     const stat = lstatSync(botHome);
     if (stat.isSymbolicLink() || !stat.isDirectory()) {

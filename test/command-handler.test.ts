@@ -937,7 +937,7 @@ describe('/cli session selection', () => {
       session: makeSession({ promptInjection: 'none', cliId: undefined, cliLaunchSnapshot: undefined }),
     });
     const deps = makeDeps(ds);
-    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli gemini'), deps, LARK_APP_ID);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli opencode'), deps, LARK_APP_ID);
     expect(ds.session.cliLaunchSnapshot).toBeUndefined();
     expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID,
       expect.stringContaining('automatic final reply capture'), undefined, LARK_APP_ID, 'msg_001');
@@ -8829,6 +8829,39 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
+    it('keeps the global bot election stable when malformed rows precede valid names', async () => {
+      const original = vi.mocked(readFileSync).getMockImplementation()!;
+      vi.mocked(readFileSync).mockImplementation(((path: any, ...rest: any[]) => (
+        typeof path === 'string' && path.includes('bots-info.json')
+          ? JSON.stringify([
+            null,
+            42,
+            'x',
+            { larkAppId: 'bad-number', botName: 42 },
+            { larkAppId: 'bad-object', botName: {} },
+            { larkAppId: 'bad-boolean', botName: true },
+            ...BOTS_INFO.map(({ botName }) => ({ botName })),
+          ])
+          : original(path, ...rest)
+      )) as any);
+      try {
+        const deps = makeDeps(makeDaemonSession());
+        const msg = makeLarkMessage('/group @Claude @Codex 项目', {
+          mentions: [
+            { key: '@_user_1', name: 'Claude', openId: 'ou_claude' },
+            { key: '@_user_2', name: 'Codex', openId: 'ou_codex' },
+          ],
+        });
+
+        await handleCommand('/group', ROOT_ID, msg, deps, 'app-2');
+
+        expect(mockedCreate).not.toHaveBeenCalled();
+        expect(deps.sessionReply).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(readFileSync).mockImplementation(original);
+      }
+    });
+
     it('fails closed (no group) when an @-mentioned bot cannot be resolved to an app id', async () => {
       // We are the leader (Claude, first), but the chat-member roster is missing
       // Codex → must NOT create a group silently dropping an intended bot.
@@ -10032,8 +10065,8 @@ describe('/card — operator / canOperate gate', () => {
   });
 
   it.each([
-    { frozen: 'grok', stale: 'gemini', mode: 'unified', managed: true },
-    { frozen: 'gemini', stale: 'grok', mode: 'unified', managed: false },
+    { frozen: 'grok', stale: 'opencode', mode: 'unified', managed: true },
+    { frozen: 'opencode', stale: 'grok', mode: 'unified', managed: false },
     { frozen: undefined, stale: 'grok', mode: 'unified', managed: true },
     { frozen: undefined, stale: undefined, mode: 'unified', managed: true },
     { frozen: 'grok', stale: 'grok', mode: 'legacy', managed: false },

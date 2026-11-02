@@ -21,6 +21,7 @@ const AUTO_LINK_SKILL_ROOT_MARKERS = new Set([
   '.claude',
   '.codex',
   '.cursor',
+  // Antigravity keeps its plugins (and their skills) under ~/.gemini/config.
   '.gemini',
   '.opencode',
   'mimocode',

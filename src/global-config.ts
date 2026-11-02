@@ -327,11 +327,11 @@ export interface GlobalSkillConfig {
   delivery?: 'auto' | 'prompt' | 'native';
   /** Machine-wide default for how botmux's **built-in bridge skills**
    *  (botmux-send / botmux-schedule / …) reach CLIs that only support a GLOBAL
-   *  skills directory (codex/gemini/opencode/… — everything with `skillsDir`,
+   *  skills directory (codex/opencode/… — everything with `skillsDir`,
    *  i.e. no per-session `--plugin-dir` injection like Claude Code):
    *   - `global`: install the skill files into the CLI's shared global dir
    *     (e.g. `~/.codex/skills`). Full native experience, but the user's own
-   *     standalone `codex`/`gemini` sees & can mis-fire them. Right for hosts
+   *     standalone `codex`/`opencode` sees & can mis-fire them. Right for hosts
    *     whose users NEVER run those CLIs by hand.
    *   - `prompt` (default): don't touch the global dir; inject a compact skill
    *     catalog into the session prompt and let the model pull full instructions
@@ -464,6 +464,11 @@ export interface DashboardGlobalConfig {
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
   contextCompactThreshold?: number;
+  /** Automatically send the native `/compact` command after an idle session
+   *  reaches this context percentage. Disabled unless autoCompactEnabled=true. */
+  autoCompactThreshold?: number;
+  /** Machine-wide opt-in for idle, debounced native context compaction. */
+  autoCompactEnabled?: boolean;
   /** 机器级总开关：是否在回复卡片页脚渲染品牌签名（默认 botmux 链接 / 各 bot 自定义
    *  brandLabel）。缺省 ON（absent ⇒ 显示）；显式 `false` 时**所有** bot 的页脚品牌
    *  签名一律不渲染（等价于每 bot brandLabel 被置空），Dashboard 每个 bot 的签名
@@ -619,6 +624,12 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
     && Number.isFinite(d.contextCompactThreshold)
     && d.contextCompactThreshold >= 1 && d.contextCompactThreshold <= 100) {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
+  }
+  if (typeof d.autoCompactEnabled === 'boolean') out.autoCompactEnabled = d.autoCompactEnabled;
+  if (typeof d.autoCompactThreshold === 'number'
+    && Number.isFinite(d.autoCompactThreshold)
+    && d.autoCompactThreshold >= 1 && d.autoCompactThreshold <= 100) {
+    out.autoCompactThreshold = Math.round(d.autoCompactThreshold);
   }
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // reader (bot-registry.ts `isCardBrandLabelEnabled`) treats absent as ON, so a stored

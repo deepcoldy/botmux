@@ -14,7 +14,6 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `claude-code` | Claude Code（默认） | 本地进程 | ✅ |
 | `codex` | Codex CLI | 本地进程 | ✅ |
 | `codex-app` | Codex App | 本地进程（app-server 协议） | |
-| `gemini` | Gemini | 本地进程 | ✅ |
 | `cursor` | Cursor（cursor-agent） | 本地进程 | ✅ |
 | `opencode` | OpenCode | 本地进程 | ✅ |
 | `opencode2` | OpenCode 2（beta，`opencode2`） | 本地进程 | |
@@ -44,6 +43,14 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `dsh` | DeepSeek Harness（dsh CLI） | 本地进程（SDK JSON-RPC） | ✅ |
 
 > `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。
+
+### Gemini CLI 已下线
+
+上游已停止维护 Gemini CLI，botmux 移除了 `gemini` 适配器，Dashboard 与 `botmux setup` 不再提供该选项（`botmux setup` 的旧序号 6 现在会报错，不会改选别的 CLI）；替代品是 `antigravity`（Antigravity，`agy`）。
+
+- `bots.json` 里仍写着 `cliId: "gemini"` 的 bot 会**拒绝启动**，并给出中文提示：Gemini CLI 已下线，请把 `cliId` 改成 `"antigravity"`。其它 bot 不受影响。
+- 迁移：装好 `agy` 并用 Google 账号登录；或不登录、改用 Gemini API key——在 `~/.gemini/antigravity-cli/settings.json` 里设 `modelProvider: "gemini"`，并提供 `GEMINI_API_KEY`。然后把 `cliId` 改成 `"antigravity"`（直接改 `bots.json`，或用 `botmux setup` 修改这个 bot 的 CLI），再 `botmux restart`。该 bot 未启动时，Dashboard 只显示原因，不能在那里保存配置。
+- 原来的 Gemini 专属配置不会沿用：`cliPathOverride` / `wrapperCli`（如 `ttadk gemini`）、Gemini 的 `model` 名、`GEMINI_CLI_HOME` 都需要删掉或按新 CLI 重配。
 
 ## Pi 执行过程气泡
 

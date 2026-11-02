@@ -14,7 +14,6 @@ export const CLI_DISPLAY_NAMES: Readonly<Record<CliId, string>> = {
   'codex': 'Codex',
   'codex-app': 'Codex App',
   'cursor': 'Cursor',
-  'gemini': 'Gemini',
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',

@@ -381,13 +381,13 @@ describe('Agent Workbench components', () => {
     act(() => renderer.unmount());
   });
 
-  it('keeps the original locate action and adds a direct jump link for a native topic', async () => {
+  it.each(['group', 'p2p'] as const)('keeps locate and direct jump for a native %s topic', async (chatType) => {
     const located: string[] = [];
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, kindViewProps(
         kindSession({
-          chatType: 'group',
+          chatType,
           scope: 'thread',
           feishuThreadLink: 'https://applink.feishu.cn/client/thread/open?open_thread_id=omt_0',
         }),
@@ -396,9 +396,8 @@ describe('Agent Workbench components', () => {
     });
     const badges = kindBadges(renderer);
     expect(badges).toHaveLength(1);
-    expect(textOf(badges[0])).toBe('话题');
-    expect(badges[0].props.className).toContain('is-thread');
-    expect(badges[0].props.title).toBe('话题会话');
+    expect(textOf(badges[0])).toBe(chatType === 'p2p' ? '单聊' : '话题');
+    expect(badges[0].props.className).toContain(chatType === 'p2p' ? 'is-p2p' : 'is-thread');
 
     // 原定位仍走 POST /locate，并保留服务端一致的冷却状态。
     const locate = locateButtons(renderer);
@@ -421,15 +420,17 @@ describe('Agent Workbench components', () => {
     expect(jump[0].props.rel).toBe('noopener');
     expect(jump[0].props['aria-label']).toContain('跳转到原话题');
     expect(textOf(jump[0])).toBe('跳转');
+    await act(async () => { jump[0].props.onClick({ stopPropagation() {} }); });
+    expect(located).toEqual(['session-0']);
     act(() => renderer.unmount());
   });
 
-  it('keeps locate but hides jump for a legacy thread row without its native topic id', async () => {
+  it.each(['group', 'p2p'] as const)('keeps locate but hides jump for a legacy %s thread without its native topic id', async (chatType) => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(
         AgentWorkbenchView,
-        kindViewProps(kindSession({ chatType: 'group', scope: 'thread' })),
+        kindViewProps(kindSession({ chatType, scope: 'thread' })),
       ));
     });
     expect(locateButtons(renderer)).toHaveLength(1);
@@ -439,24 +440,76 @@ describe('Agent Workbench components', () => {
     act(() => renderer.unmount());
   });
 
-  it('leaves a group-chat row with chat only and no redundant locate or jump action', async () => {
+  it.each(['group', 'p2p'] as const)('leaves a %s chat-scope row without redundant topic actions', async (chatType) => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
       renderer = TestRenderer.create(React.createElement(
         AgentWorkbenchView,
-        kindViewProps(kindSession({ chatType: 'group', scope: 'chat' })),
+        kindViewProps(kindSession({ chatType, scope: 'chat', feishuThreadLink: 'https://applink.feishu.cn/client/thread/open?open_thread_id=omt_stale' })),
       ));
     });
     const badges = kindBadges(renderer);
     expect(badges).toHaveLength(1);
-    expect(textOf(badges[0])).toBe('群');
-    expect(badges[0].props.className).toContain('is-group');
+    expect(textOf(badges[0])).toBe(chatType === 'p2p' ? '单聊' : '群');
+    expect(badges[0].props.className).toContain(chatType === 'p2p' ? 'is-p2p' : 'is-group');
     // 群会话没有原话题定位；聊天已经是 chat/open，因此不再重复渲染跳转。
     expect(locateButtons(renderer)).toHaveLength(0);
     expect(jumpLinks(renderer)).toHaveLength(0);
     // 但聊天入口照旧在，否则这条断言会把「按钮全没了」也当成通过。
     expect(renderer.root.findAll(node =>
       node.type === 'a' && String(node.props.className ?? '').includes('is-chat')).length).toBeGreaterThan(0);
+    act(() => renderer.unmount());
+  });
+
+  it.each(['working', 'closed', 'dormant'])('keeps p2p topic actions across %s session snapshots', async (status) => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    const session = kindSession({ chatType: 'p2p', scope: 'thread', status });
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, kindViewProps(session)));
+    });
+    expect(locateButtons(renderer)).toHaveLength(1);
+    expect(jumpLinks(renderer)).toHaveLength(0);
+    // A later server snapshot may backfill the native topic, including after restore.
+    await act(async () => {
+      renderer.update(React.createElement(AgentWorkbenchView, kindViewProps({
+        ...session, status: 'working',
+        feishuThreadLink: 'https://applink.feishu.cn/client/thread/open?open_thread_id=omt_restored',
+      })));
+    });
+    expect(locateButtons(renderer)).toHaveLength(1);
+    expect(jumpLinks(renderer)[0].props.href).toContain('open_thread_id=omt_restored');
+    expect(kindBadges(renderer)[0].props.className).toContain('is-p2p');
+    act(() => renderer.unmount());
+  });
+
+  it('does not infer native topic actions from a legacy p2p routing anchor or mode', async () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, kindViewProps(kindSession({
+        chatType: 'p2p', p2pMode: 'thread', threadId: 'om_legacy',
+      }))));
+    });
+    expect(locateButtons(renderer)).toHaveLength(0);
+    expect(jumpLinks(renderer)).toHaveLength(0);
+    act(() => renderer.unmount());
+  });
+
+  it('reports p2p locate failures and allows retry without creating a jump link', async () => {
+    const locateSession = vi.fn().mockRejectedValueOnce(new Error('root unavailable')).mockResolvedValueOnce(undefined);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, kindViewProps(
+        kindSession({ chatType: 'p2p', scope: 'thread' }), { api: { ...api, locateSession } },
+      )));
+    });
+    await act(async () => { locateButtons(renderer)[0].props.onClick({ stopPropagation() {} }); });
+    expect(locateSession).toHaveBeenCalledWith('session-0');
+    expect(locateButtons(renderer)[0].props.title).toContain('root unavailable');
+    expect(locateButtons(renderer)[0].props.disabled).toBe(false);
+    expect(jumpLinks(renderer)).toHaveLength(0);
+    await act(async () => { locateButtons(renderer)[0].props.onClick({ stopPropagation() {} }); });
+    expect(locateSession).toHaveBeenCalledTimes(2);
+    expect(locateButtons(renderer)[0].props.disabled).toBe(true);
     act(() => renderer.unmount());
   });
 
@@ -1642,13 +1695,13 @@ describe('P1-4 操作入口按最小能力集渲染', () => {
     return renderer.root.findAllByType('button').map(node => textOf(node));
   }
 
-  it('六类身份矩阵：定位遵循写能力，跳转不依赖写能力，接管仍遵循投影', async () => {
+  it.each(['group', 'p2p'] as const)('六类身份矩阵（%s）：定位遵循写能力，跳转只读，接管遵循投影', async (chatType) => {
     for (const { name, actor, authenticated } of MATRIX) {
       const capabilities = projectWorkbenchOperationCapabilities(actor);
       let renderer!: TestRenderer.ReactTestRenderer;
       await act(async () => {
         renderer = TestRenderer.create(React.createElement(AgentWorkbenchView, {
-          sessions: [fullSurfaceSession()],
+          sessions: [{ ...fullSurfaceSession(), chatType }],
           online: true,
           authenticated,
           capabilities,

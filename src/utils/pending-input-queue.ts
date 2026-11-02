@@ -260,7 +260,7 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
  * Riff (and any queue-after-spawn adapter) has passesInitialPromptViaArgs=false
  * — must return false, or the first markPromptReady would clear isPromptReady
  * and leave the post-spawn queue flush never firing.
- * Gemini/Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
+ * Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
  * idle signal — first ready IS completion; must return false or they stick
  * (use {@link shouldTrackArgvBakedFirstPrompt} + seed working→idle instead).
  *

@@ -150,34 +150,34 @@ describe('card-handler open_local_cli', () => {
   it('attach mode opens a Herdr-backed CLI outside the direct-resume whitelist when cli_id matches', async () => {
     const { types, opener, terminal, handler } = await fresh();
     vi.mocked(opener.localCliOpenMode).mockReturnValue('attach');
-    const ds = makeDs('gemini');
+    const ds = makeDs('mira');
     ds.session.backendType = 'herdr';
     ds.session.cliSessionId = undefined;
     deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
 
-    const res = await handler.handleCardAction(action('ou_owner', 'gemini'), deps, 'h1');
+    const res = await handler.handleCardAction(action('ou_owner', 'mira'), deps, 'h1');
 
     expect(res?.toast?.type).toBe('success');
-    expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId: 'gemini', mode: 'attach' });
+    expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId: 'mira', mode: 'attach' });
     expect(terminal.openLocalTerminalForSession).not.toHaveBeenCalled();
   });
 
   it('legacy open_local_terminal also uses attach mode for Herdr instead of generic fallback', async () => {
     const { types, opener, terminal, handler } = await fresh();
     vi.mocked(opener.localCliOpenMode).mockReturnValue('attach');
-    const ds = makeDs('gemini');
+    const ds = makeDs('mira');
     ds.session.backendType = 'herdr';
     ds.session.cliSessionId = undefined;
     deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
 
     const res = await handler.handleCardAction(
-      action('ou_owner', 'gemini', {}, { action: 'open_local_terminal' }),
+      action('ou_owner', 'mira', {}, { action: 'open_local_terminal' }),
       deps,
       'h1',
     );
 
     expect(res?.toast?.type).toBe('success');
-    expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId: 'gemini', mode: 'attach' });
+    expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId: 'mira', mode: 'attach' });
     expect(terminal.openLocalTerminalForSession).not.toHaveBeenCalled();
   });
 
@@ -255,17 +255,17 @@ describe('card-handler open_local_cli', () => {
 
   it('legacy open_local_terminal fails closed for unsupported CLIs in resume mode', async () => {
     const { types, opener, terminal, handler } = await fresh();
-    const ds = makeDs('gemini');
+    const ds = makeDs('mira');
     deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
 
     const res = await handler.handleCardAction(
-      action('ou_owner', 'gemini', {}, { action: 'open_local_terminal' }),
+      action('ou_owner', 'mira', {}, { action: 'open_local_terminal' }),
       deps,
       'h1',
     );
 
     expect(res?.toast?.type).toBe('warning');
-    expect(res.toast.content).toContain('Gemini');
+    expect(res.toast.content).toContain('Mira');
     expect(terminal.openLocalTerminalForSession).not.toHaveBeenCalled();
     expect(opener.openLocalCliInIterm).not.toHaveBeenCalled();
   });

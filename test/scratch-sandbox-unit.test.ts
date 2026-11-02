@@ -3,6 +3,7 @@ import {
   scratchHostView,
   remapIntoMerged,
   attachScratchSession,
+  canonicalAllowMissing,
 } from '../src/adapters/backend/scratch-sandbox.js';
 import {
   scratchViewPath,
@@ -14,11 +15,32 @@ import {
   persistedScratchMappings,
   type ScratchPathMapping,
 } from '../src/services/scratch-host-view.js';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, existsSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { lastJsonLine, privateMountNsAvailable, runInPrivateMountNs } from './helpers/private-mount-ns.js';
+
+describe('canonicalAllowMissing (scratch deny-mask targets)', () => {
+  it('resolves the existing ancestors of a missing path, keeping the missing tail', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'scratch-canon-')));
+    try {
+      const moved = join(root, 'moved-botmux');
+      mkdirSync(join(moved, 'bots'), { recursive: true });
+      mkdirSync(join(root, 'home'));
+      symlinkSync(moved, join(root, 'home', '.botmux'));
+      // Missing below a symlink: lands on the real directory, never through the link.
+      expect(canonicalAllowMissing(join(root, 'home', '.botmux', 'data', 'bytedcli-home')))
+        .toBe(join(moved, 'data', 'bytedcli-home'));
+      // Existing: plain realpath.
+      expect(canonicalAllowMissing(join(root, 'home', '.botmux', 'bots'))).toBe(join(moved, 'bots'));
+      // Nothing symlinked on the way: unchanged.
+      expect(canonicalAllowMissing(join(root, 'nope', 'x'))).toBe(join(root, 'nope', 'x'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Linux scratch host-view mapping', () => {
   const merged = '/var/lib/botmux/data/sandboxes/sid-1/root';
@@ -181,6 +203,65 @@ const diskScratchInPrivateNs = privateMountNsAvailable() && lastJsonLine<boolean
 import { probeScratchMountsInThisNamespace } from './test/helpers/scratch-mount-probe.js';
 console.log(JSON.stringify(probeScratchMountsInThisNamespace('disk')));
 `)) === true;
+
+describe('prepareScratchSandbox session temp alias', () => {
+  it.skipIf(!diskScratchInPrivateNs).each([false, true])('keeps temp files inside COW and deny masks effective (args file: %s)', useBwrapArgsFile => {
+    // The alias must live under the fresh /tmp mount, even when outer TMPDIR is elsewhere.
+    const root = realpathSync(mkdtempSync('/tmp/scratch-short-temp-'));
+    try {
+      const run = runInPrivateMountNs(`
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { prepareScratchSandbox, scratchHostView } from './src/adapters/backend/scratch-sandbox.js';
+const root = ${JSON.stringify(root)};
+const workingDir = join(root, 'work');
+const cache = join(workingDir, 'cache', 'session');
+const alias = join(root, 'short', 'session');
+mkdirSync(cache, { recursive: true });
+mkdirSync(join(root, 'short'));
+symlinkSync(cache, alias);
+writeFileSync(join(cache, 'secret'), 'must-stay-hidden');
+const script = ${JSON.stringify(`
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'probe-'));
+fs.writeFileSync(path.join(dir, 'artifact'), 'cow-only');
+let secret;
+try { secret = fs.readFileSync(path.join(os.tmpdir(), 'secret'), 'utf8'); } catch {}
+console.log(JSON.stringify({ dir, temp: os.tmpdir(), secret: secret ?? null }));
+`)};
+// Bun itself may be a downloaded binary under /tmp, which scratch masks.
+// Run the JS probe with installed Node; keep preparation on the test runtime.
+const node = spawnSync('node', ['-p', 'process.execPath'], { encoding: 'utf8' });
+if (node.status !== 0) throw new Error('installed Node is required for the sandbox probe');
+const plan = prepareScratchSandbox({ sessionId: 'short-temp', dataDir: join(root, 'data'),
+  storage: 'disk', chdir: workingDir, home: workingDir,
+  cliBin: realpathSync(node.stdout.trim()), cliArgs: ['-e', script], tempDir: alias,
+  denyPaths: [join(cache, 'secret')], useBwrapArgsFile: ${useBwrapArgsFile} });
+if (!plan) throw new Error('scratch preparation failed after capability probe');
+try {
+  const child = spawnSync(plan.bin, plan.args, {
+    env: { ...process.env, ...plan.env, TMPDIR: alias, TMP: alias, TEMP: alias },
+    encoding: 'utf8', timeout: 20_000 });
+  if (child.status !== 0) throw new Error('sandbox child failed: ' + child.stderr);
+  const report = JSON.parse(child.stdout.trim());
+  const physicalDir = join(cache, report.dir.slice(alias.length));
+  console.log(JSON.stringify({ ...report, hostArtifact: existsSync(physicalDir),
+    mergedArtifact: readFileSync(join(scratchHostView(plan.mergedHostPath, physicalDir), 'artifact'), 'utf8') }));
+} finally { plan.cleanup(); }
+`);
+      const result = lastJsonLine<{ dir: string; temp: string; secret: string | null; hostArtifact: boolean; mergedArtifact: string }>(run);
+      expect(run.status, run.stderr).toBe(0);
+      expect(result.temp).toBe(join(root, 'short', 'session'));
+      expect(result.dir.startsWith(result.temp + '/probe-')).toBe(true);
+      expect(result.secret).not.toBe('must-stay-hidden');
+      expect(result.hostArtifact).toBe(false);
+      expect(result.mergedArtifact).toBe('cow-only');
+    } finally { rmSandboxScratch(root); }
+  });
+});
 
 describe('prepareScratchSandbox tmux argument transport', () => {
   it.skipIf(!privateMountNsAvailable())('stores long bwrap options in a private file while keeping CLI argv on the command line', () => {

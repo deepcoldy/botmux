@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  botDisplayNames,
   buildFocusLoop,
   chatOpenInMain,
   focusBudgets,
@@ -28,17 +29,26 @@ import {
 } from './e2e-browser/helpers.js';
 
 describe('Feishu E2E mention check', () => {
-  it('accepts only the intended bot chip, never a bare query or a neighbour', () => {
-    expect(holdsOnlyMention('@[Botmux]Claude ', 'Claude')).toBe(true);
-    expect(holdsOnlyMention('@BotmuxCodex ', 'Codex')).toBe(true);
-    // The typed filter query before a pick has no display name yet.
-    expect(holdsOnlyMention('@Claude', 'Claude')).toBe(false);
+  it('accepts only one chip naming the intended bot, never a bare query or a neighbour', () => {
+    expect(holdsOnlyMention(['@Claude'], '@Claude ', 'Claude')).toBe(true);
+    // Apps still named the old way while they are renamed.
+    expect(holdsOnlyMention(['@[Botmux]Claude'], '@[Botmux]Claude ', 'Claude')).toBe(true);
+    // The typed filter query reads the same but is not a chip yet.
+    expect(holdsOnlyMention([], '@Claude', 'Claude')).toBe(false);
     // CI picked neighbouring bots from the dropdown.
-    expect(holdsOnlyMention('@[Botmux]Aiden ', 'Claude')).toBe(false);
-    expect(holdsOnlyMention('@[Botmux]OpenCode ', 'Codex')).toBe(false);
-    expect(holdsOnlyMention('@[Botmux]Claude @[Botmux]Codex ', 'Claude')).toBe(false);
+    expect(holdsOnlyMention(['@Aiden'], '@Aiden ', 'Claude')).toBe(false);
+    expect(holdsOnlyMention(['@OpenCode'], '@OpenCode ', 'Codex')).toBe(false);
+    expect(holdsOnlyMention(['@Claude', '@Codex'], '@Claude @Codex ', 'Claude')).toBe(false);
+    // Same-named apps in the test tenant differ only in case or a prefix.
+    expect(holdsOnlyMention(['@codex'], '@codex ', 'Codex')).toBe(false);
+    expect(holdsOnlyMention(['@Nash_Claude'], '@Nash_Claude ', 'Claude')).toBe(false);
     // A stray literal @ broke `/reply-mode` parsing in CI.
-    expect(holdsOnlyMention('@@[Botmux]Claude ', 'Claude')).toBe(false);
+    expect(holdsOnlyMention(['@Claude'], '@@Claude ', 'Claude')).toBe(false);
+  });
+
+  it('names the bot by its CLI first and by the old prefixed name second', () => {
+    expect(botDisplayNames('Claude')).toEqual(['Claude', '[Botmux]Claude']);
+    expect(botDisplayNames('[Botmux]Codex')).toEqual(['Codex', '[Botmux]Codex']);
   });
 });
 

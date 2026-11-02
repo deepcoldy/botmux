@@ -158,6 +158,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import {
   CARD_POSTING_SENTINEL,
+  readableTerminalUrlFor,
+  liveReadableTerminalUrlFor,
   initWorkerPool,
   postTurnStartingCard,
   postFreshStreamingCard,
@@ -168,12 +170,14 @@ import {
   commitCaptureIdentity,
   displayableStreamingCardImageKey,
   canExpectFreshStreamingScreenshot,
+  buildStreamingCardJson,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
+import { resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
 
@@ -273,6 +277,100 @@ describe('Worker ready: set_display_mode re-sync', () => {
       closeSession: closeSessionMock,
     });
     setActiveSessionsRegistry(new Map());
+  });
+
+  it('keeps session-level proxy recovery links out of live streaming cards without a live worker', () => {
+    setTerminalProxyPort(8800);
+    try {
+      const ds = makeDs({
+        worker: null as any,
+        workerReady: undefined,
+        workerPort: null,
+        streamCardId: 'om_live_card',
+        session: {
+          ...makeDs().session,
+          backendType: 'tmux',
+          webPort: 52842,
+        },
+      });
+
+      expect(readableTerminalUrlFor(ds)).toContain('/s/sid-ready-test');
+      expect(liveReadableTerminalUrlFor(ds)).toBe('');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe('');
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it('keeps the Web Terminal button on live streaming cards when the current worker owns a terminal', () => {
+    setTerminalProxyPort(8800);
+    try {
+      const ds = makeDs({
+        worker: makeFakeWorker(),
+        workerReady: true,
+        workerPort: 9999,
+        workerViewToken: 'view_live',
+        workerCardViewToken: 'card_live',
+        streamCardId: 'om_live_card',
+        session: {
+          ...makeDs().session,
+          backendType: 'tmux',
+          webPort: 9999,
+        },
+      });
+
+      const liveUrl = liveReadableTerminalUrlFor(ds);
+      expect(liveUrl).toContain('/s/sid-ready-test');
+      expect(liveUrl).toContain('viewToken=card_live');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe(liveUrl);
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it.each([
+    { name: 'diagnostic parking', crashDiagnosticParked: true },
+    { name: 'CLI restart', crashDiagnosticParked: false },
+  ])('keeps the terminal server available during $name without a ready CLI', ({ crashDiagnosticParked }) => {
+    setTerminalProxyPort(8800);
+    try {
+      const ds = makeDs({ worker: makeFakeWorker(), workerReady: false, workerPort: 9999, crashDiagnosticParked });
+      expect(liveReadableTerminalUrlFor(ds)).toContain('/s/sid-ready-test');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'idle')).readUrl).toContain('/s/sid-ready-test');
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it.each([
+    { name: 'missing worker', workerState: 'missing', backendType: 'tmux' },
+    { name: 'killed worker', workerState: 'killed', backendType: 'tmux' },
+    { name: 'backend without Web Terminal', workerState: 'alive', backendType: 'zmx' },
+  ] as const)('hides stale ports from live cards with a $name', ({ workerState, backendType }) => {
+    setTerminalProxyPort(8800);
+    try {
+      const worker = workerState === 'missing' ? null : makeFakeWorker();
+      if (workerState === 'killed') worker.killed = true;
+      const ds = makeDs({ worker, workerReady: true, workerPort: 9999,
+        session: { ...makeDs().session, backendType, webPort: 9999 } });
+      expect(liveReadableTerminalUrlFor(ds)).toBe('');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe('');
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it('removes the terminal from an adopted session freeze when its worker exits', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, workerPort: 9999, streamCardId: 'om_adopt_card',
+      adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'traex', cwd: '/tmp' } });
+    activate(ds);
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'claude_exit', code: 0, signal: null });
+    await flush();
+    const card = JSON.parse(updateMessageMock.mock.calls.at(-1)![2]);
+    expect(card).toMatchObject({ status: 'idle', readUrl: '' });
+    expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
   });
 
   it.each(['ready', 'screen_update', 'fallback'].flatMap(source => ['publish', 'stop', 'replace'].map(outcome => ({ source, outcome }))))(
@@ -1310,7 +1408,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
       streamCardId: 'om_existing_card',
       workingDir: '/tmp',
     });
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     ds.session.backendType = 'tmux';
     ds.session.cliSessionId = undefined;
     ds.session.workingDir = '/tmp';

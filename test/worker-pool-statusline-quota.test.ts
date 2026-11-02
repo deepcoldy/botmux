@@ -94,8 +94,8 @@ describe('getDaemonSessionUsageSnapshot × cardFooterExtension', () => {
       config: { cliId: 'codex', name: 'demo', cardFooterExtension: { command: 'printf \'%s\' "$BOTMUX_CLI_ID"' } },
     } as any);
     const session = { session: { sessionId: 's6', larkAppId: 'cli_envcli' }, larkAppId: 'cli_envcli', workingDir: '/repo' } as any;
-    getDaemonSessionUsageSnapshot(session, 'gemini' as any);
+    getDaemonSessionUsageSnapshot(session, 'opencode');
     await cache.pending('cli_envcli');
-    expect(getDaemonSessionUsageSnapshot(session, 'gemini' as any)).toEqual({ ...base, extensionSegments: ['codex'] });
+    expect(getDaemonSessionUsageSnapshot(session, 'opencode')).toEqual({ ...base, extensionSegments: ['codex'] });
   });
 });

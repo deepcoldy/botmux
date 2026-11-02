@@ -491,7 +491,7 @@ describe('Saved Workflow materialization + daemon execution', () => {
       const deps: V3DaemonRunDeps = {
         baseDir: join(root, 'runs'),
         loadBots: () => [{
-          larkAppId: 'cli_test', larkAppSecret: 'secret', cliId: 'gemini', workingDir: '/drifted',
+          larkAppId: 'cli_test', larkAppSecret: 'secret', cliId: 'opencode', workingDir: '/drifted',
         } as any],
         makeRunNode: () => runNode,
         validateManifest: async (manifestPath) => ({

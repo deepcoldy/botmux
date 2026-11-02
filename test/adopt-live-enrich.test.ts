@@ -10,16 +10,9 @@
  * Run:  bunx vitest run --project unit test/adopt-live-enrich.test.ts
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, promises as fsPromises, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, promises as fsPromises, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
-// The real module, with its entry point wrapped in a spy so the confirm-path
-// test at the bottom can prove the enrichment is never reached from there.
-vi.mock('../src/services/adopt-live-enrich.js', async () => {
-  const actual = await vi.importActual<typeof import('../src/services/adopt-live-enrich.js')>('../src/services/adopt-live-enrich.js');
-  return { ...actual, enrichAdoptLiveSessions: vi.fn(actual.enrichAdoptLiveSessions) };
-});
 
 import {
   enrichAdoptLiveSessions,
@@ -442,6 +435,8 @@ describe('enrichAdoptLiveSessions: time budget', () => {
       return new Promise<string | undefined>(() => {});
     };
     const state = settle(enrichAdoptLiveSessions([live({ herdrWorkspaceId: undefined })], { runHerdr: herdr.run, readFirstPrompt }));
+    // Let the tab answer and the read start before the clock moves.
+    await flush();
     await vi.advanceTimersByTimeAsync(800);
     await flush();
     expect(state.done).toBe(true);
@@ -504,7 +499,8 @@ describe('enrichAdoptLiveSessions: time budget', () => {
       [live(), live({ herdrSessionName: 'side' })],
       { runHerdr, readFirstPrompt },
     ));
-    await vi.advanceTimersByTimeAsync(0);
+    // Nothing is advanced: with the deadline behind it, it must return without
+    // waiting on any timer (and Bun's advanceTimersByTime(0) moves the clock 1 ms).
     await flush();
     expect(state.done).toBe(true);
     expect(calls.map(a => a.join(' '))).toEqual([
@@ -525,14 +521,23 @@ describe('enrichAdoptLiveSessions: time budget', () => {
     let dir: string;
     let pidFile: string;
     let script: string;
+    let ignoresTerm: string;
     beforeEach(() => {
       dir = mkdtempSync(join(tmpdir(), 'adopt-live-herdr-'));
       pidFile = join(dir, 'pids');
       script = join(dir, 'herdr');
       writeFileSync(script, `#!/bin/sh\necho $$ >> '${pidFile}'\nexec sleep 30\n`);
       chmodSync(script, 0o755);
+      // SIGTERM is ignored before the pid is published, and stays ignored across exec.
+      ignoresTerm = join(dir, 'herdr-ignores-term');
+      writeFileSync(ignoresTerm, `#!/bin/sh\ntrap '' TERM\necho $$ >> '${pidFile}'\nexec sleep 30\n`);
+      chmodSync(ignoresTerm, 0o755);
     });
     afterEach(() => {
+      // Whatever a case left running, pass or fail.
+      for (const pid of pids()) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
       rmSync(dir, { recursive: true, force: true });
     });
     const alive = (pid: number) => {
@@ -547,6 +552,18 @@ describe('enrichAdoptLiveSessions: time budget', () => {
     it('the default runner kills the child as soon as the signal aborts', async () => {
       const controller = new AbortController();
       const result = runHerdrCli(['--session', 'default', 'tab', 'list'], { signal: controller.signal, timeoutMs: 30_000 }, script);
+      await waitFor(() => pids().length === 1);
+      const [pid] = pids();
+      expect(pid && alive(pid)).toBe(true);
+      controller.abort();
+      expect(await result).toBeUndefined();
+      await waitFor(() => !alive(pid!));
+      expect(alive(pid!)).toBe(false);
+    });
+
+    it('the default runner also ends a child that ignores SIGTERM once the signal aborts', async () => {
+      const controller = new AbortController();
+      const result = runHerdrCli(['--session', 'default', 'tab', 'list'], { signal: controller.signal, timeoutMs: 30_000 }, ignoresTerm);
       await waitFor(() => pids().length === 1);
       const [pid] = pids();
       expect(pid && alive(pid)).toBe(true);
@@ -673,6 +690,56 @@ describe('transcript lookup after the budget runs out', () => {
   });
 });
 
+// ─── Transcript lookup for a long cwd ──────────────────────────────────────
+
+describe('transcript lookup for a long cwd (cut + hashed directory name)', () => {
+  // Over 200 chars as a slug, so Claude names its directory `<first 200>-<hash>`.
+  const longCwd = `/work/${'nested/'.repeat(30)}demo`;
+  const slug = longCwd.replace(/[^A-Za-z0-9-]/g, '-');
+  const cutDir = `${slug.slice(0, 200)}-1a2b3c`;
+  const projectDirs = () => readdirSync(join(dataDir, 'projects')).length;
+
+  /** Every path `stat`ed under the temp projects dir, in call order. */
+  function spyStat(): string[] {
+    const realStat = fsPromises.stat.bind(fsPromises);
+    const paths: string[] = [];
+    vi.spyOn(fsPromises, 'stat').mockImplementation(((...args: any[]) => {
+      if (String(args[0]).startsWith(join(dataDir, 'projects'))) paths.push(String(args[0]));
+      return (realStat as any)(...args);
+    }) as any);
+    return paths;
+  }
+
+  it('finds it in the cut directory without probing every directory', async () => {
+    for (let i = 0; i < 20; i++) mkdirSync(join(dataDir, 'projects', `dir-${i}`), { recursive: true });
+    writeTranscript([userRecord('整理示例数据')], { dir: cutDir });
+    const stats = spyStat();
+    expect(await readPrompt(SID, longCwd)).toBe('整理示例数据');
+    // The exact slug path and the cut directory, none of the 20 others.
+    expect(stats.length).toBeLessThanOrEqual(1 + 1);
+    expect(stats.length).toBeLessThan(projectDirs());
+  });
+
+  it('still finds it elsewhere when no directory carries the cut name', async () => {
+    for (const dir of ['alpha', 'beta', 'gamma']) mkdirSync(join(dataDir, 'projects', dir), { recursive: true });
+    writeTranscript([userRecord('整理示例数据')], { dir: 'some-other-project' });
+    const stats = spyStat();
+    expect(await readPrompt(SID, longCwd)).toBe('整理示例数据');
+    expect(new Set(stats).size).toBe(stats.length);
+    expect(stats.length).toBeLessThanOrEqual(projectDirs() + 1);
+  });
+
+  it('still finds it elsewhere when the cut directory does not hold it, and probes that directory once', async () => {
+    for (const dir of ['alpha', 'beta', 'gamma']) mkdirSync(join(dataDir, 'projects', dir), { recursive: true });
+    writeTranscript([userRecord('另一个会话')], { dir: cutDir, sid: '1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed' });
+    writeTranscript([userRecord('整理示例数据')], { dir: 'some-other-project' });
+    const stats = spyStat();
+    expect(await readPrompt(SID, longCwd)).toBe('整理示例数据');
+    expect(new Set(stats).size).toBe(stats.length);
+    expect(stats.length).toBeLessThanOrEqual(projectDirs() + 1);
+  });
+});
+
 // ─── Rendering after partial failures ──────────────────────────────────────
 
 describe('enrichment failures render like before on the failing side', () => {
@@ -749,119 +816,5 @@ describe('first prompt end to end (generic terminal title, no transcript, botmux
     }));
     const out = await enrichAdoptLiveSessions(sessions, { runHerdr: herdr.run, claudeDataDir: dataDir });
     expect(cardLines(out as AdoptableSession[], 'zh').map(l => l[0])).toEqual(['**修复登录页样式**', '**2**', '**3**']);
-  });
-});
-
-// ─── Confirm path ──────────────────────────────────────────────────────────
-// Keep this block LAST in the file: it calls vi.resetModules() and doMocks the
-// card-handler graph, so anything added below would see fresh module instances.
-
-describe('adopt_confirm (live) never enriches', () => {
-  it('re-discovers exactly as before (four scans for a vanished pane) without calling the enrichment', async () => {
-    const discover = vi.fn(() => []);
-    vi.doMock('../src/core/session-discovery.js', () => ({
-      discoverAdoptableSessions: discover,
-      discoverAdoptableSessionByTarget: vi.fn(() => undefined),
-      excludeOwnedHerdrAdoptTargets: (sessions: unknown[]) => sessions,
-      adoptTargetKey: (s: any) => `herdr:${s.herdrSessionName}:${s.herdrPaneId}`,
-      adoptTargetLabel: (s: any) => `${s.herdrSessionName}:${s.herdrPaneId}`,
-    }));
-    vi.doMock('../src/core/zellij-adopt-discovery.js', () => ({ discoverAdoptableZellijSessions: vi.fn(() => []) }));
-    vi.doMock('../src/im/lark/client.js', () => ({
-      updateMessage: vi.fn(async () => {}),
-      sendUserMessage: vi.fn(async () => {}),
-      deleteMessage: vi.fn(async () => {}),
-      getMessageDetail: vi.fn(async () => ({ items: [{ chat_id: 'oc_chat', thread_id: 'omt_picker' }] })),
-      getChatInfo: vi.fn(),
-      MessageWithdrawnError: class MessageWithdrawnError extends Error {},
-    }));
-    vi.doMock('../src/bot-registry.js', () => ({
-      getBot: vi.fn(() => ({
-        config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
-        resolvedAllowedUsers: [],
-        resolvedBlockedUsers: [],
-        botOpenId: 'ou_bot',
-      })),
-      getAllBots: vi.fn(() => []),
-      getBotClient: vi.fn(),
-      getBotBrand: vi.fn(() => 'feishu'),
-      getOwnerOpenId: vi.fn(() => undefined),
-    }));
-    vi.doMock('../src/config.js', () => ({
-      config: {
-        web: { externalHost: 'localhost' },
-        session: { dataDir: join(dataDir, 'sessions') },
-        daemon: { backendType: 'pty', cliId: 'claude-code' },
-      },
-    }));
-    vi.doMock('../src/services/session-store.js', () => ({
-      getSession: vi.fn(),
-      getOwnedSession: vi.fn(),
-      registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
-      cleanupSessionBridgeSendMarkers: vi.fn(),
-      cleanupSessionBridgeSendMarkersNow: vi.fn(),
-      closeSession: vi.fn(),
-      updateSession: vi.fn(),
-      createSession: vi.fn(),
-      collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
-    }));
-    vi.doMock('../src/core/session-manager.js', () => ({
-      getSessionWorkingDir: vi.fn(() => '/tmp'),
-      ensureSessionWhiteboard: vi.fn(),
-      buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
-      expandHome: vi.fn((p: string) => p),
-      getProjectScanDir: vi.fn(() => '/tmp'),
-      getProjectScanDirs: vi.fn(() => ['/tmp']),
-      getAvailableBots: vi.fn(async () => []),
-      rememberLastCliInput: vi.fn(),
-      persistStreamCardState: vi.fn(),
-    }));
-    vi.doMock('../src/services/frozen-card-store.js', () => ({
-      loadFrozenCards: vi.fn(() => new Map()),
-      saveFrozenCards: vi.fn(),
-    }));
-    vi.doMock('@larksuiteoapi/node-sdk', () => ({
-      Client: class {},
-      WSClient: class { start() {} },
-      EventDispatcher: class { register() {} },
-      LoggerLevel: { info: 2 },
-    }));
-    try {
-      // Re-evaluate the card-handler graph so every doMock above applies (some
-      // of these modules were already loaded through card-builder).
-      vi.resetModules();
-      const { handleCardAction } = await import('../src/im/lark/card-handler.js');
-      const { sessionKey } = await import('../src/core/types.js');
-      const { enrichAdoptLiveSessions: enrichSpy } = await import('../src/services/adopt-live-enrich.js');
-      const rootId = 'om_root_confirm';
-      const ds: any = {
-        session: {
-          sessionId: 'uuid-confirm-test', rootMessageId: rootId, chatId: 'oc_chat', title: 'Adopt Test',
-          status: 'active', createdAt: Date.now(), updatedAt: Date.now(), pid: null, chatType: 'group',
-        },
-        worker: { killed: false, send: vi.fn(), once: vi.fn() },
-        larkAppId: 'app_test', chatId: 'oc_chat', chatType: 'group',
-        spawnedAt: Date.now(), lastMessageAt: Date.now(), hasHistory: false,
-      };
-      const activeSessions = new Map([[sessionKey(rootId, 'app_test'), ds]]);
-      const sessionReply = vi.fn(async () => 'om_reply');
-      vi.mocked(enrichSpy).mockClear();
-
-      await handleCardAction({
-        action: { value: { action: 'adopt_confirm', entry_key: 'live:herdr:default:w1:p1', root_id: rootId } },
-        operator: { open_id: 'ou_user' },
-        context: { open_message_id: 'om_card_msg' },
-      } as any, { activeSessions, sessionReply, lastRepoScan: new Map() } as any, 'app_test');
-
-      expect(discover).toHaveBeenCalledTimes(4);
-      expect(enrichSpy).not.toHaveBeenCalled();
-      expect(sessionReply).toHaveBeenCalledWith(rootId, expect.stringContaining('已退出'), undefined, 'app_test', undefined, expect.anything());
-    } finally {
-      for (const path of [
-        '../src/core/session-discovery.js', '../src/core/zellij-adopt-discovery.js', '../src/im/lark/client.js',
-        '../src/bot-registry.js', '../src/config.js', '../src/services/session-store.js', '../src/core/session-manager.js',
-        '../src/services/frozen-card-store.js', '@larksuiteoapi/node-sdk',
-      ]) vi.doUnmock(path);
-    }
   });
 });

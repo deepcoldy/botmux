@@ -662,7 +662,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // (skills.directories/paths/dirs/extra_dirs/...), env vars
     // (CODEX_SKILLS_DIR/...), and `[[skills.config]]`'s `path` (enable/disable
     // only — can't register an arbitrary path) all fail to add a scan root.
-    // Codex only reads hard-coded roots, so — like gemini/opencode/cursor — we
+    // Codex only reads hard-coded roots, so — like opencode/cursor — we
     // install into Codex's global skills dir under CODEX_HOME (default ~/.codex;
     // a getter so a custom CODEX_HOME is honored, matching where Codex actually
     // scans). This is visible to a standalone `codex` too, but every botmux-*
