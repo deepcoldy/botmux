@@ -144,10 +144,10 @@ describe('/api/agents zero injection', () => {
   it('stores the mode and rejects it up front when the unified CLI cannot support it', async () => {
     const ok = await call('POST', '/api/agents', { agent: { ...agent, promptInjection: { mode: 'none' } } });
     expect(ok.body.agent.promptInjection).toEqual({ mode: 'none' });
-    const gemini = await call('POST', '/api/agents', {
-      agent: { name: 'g', exec: { cliId: 'gemini', model: '', reasoningEffort: '' }, promptInjection: { mode: 'none' } },
+    const opencode = await call('POST', '/api/agents', {
+      agent: { name: 'g', exec: { cliId: 'opencode', model: '', reasoningEffort: '' }, promptInjection: { mode: 'none' } },
     });
-    expect(gemini).toMatchObject({ status: 400, body: { error: 'promptInjection:unsupported' } });
+    expect(opencode).toMatchObject({ status: 400, body: { error: 'promptInjection:unsupported' } });
     const withSandbox = await call('POST', '/api/agents', {
       agent: { ...agent, sandbox: { mode: 'off' }, promptInjection: { mode: 'none' } },
     });

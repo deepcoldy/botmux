@@ -936,6 +936,41 @@ describe('Codex CLI effort IPC', () => {
     expect(worker.kill).not.toHaveBeenCalled();
   });
 
+  it('lets the worker confirm a terminal fallback when RPC was requested at launch', async () => {
+    const { worker, ds } = fixture();
+    ds.initConfig!.codexRpcInput = true;
+    ds.initConfig!.cliPathOverride = '/tools/codex-proxy';
+    ds.initConfig!.cliRuntime = {
+      id: 'codex-proxy', displayName: 'Codex proxy', executable: '/tools/codex-proxy', source: 'legacy-path',
+    };
+    const pending = updateCodexCliEffort(ds, 'ultra');
+    const request = worker.send.mock.calls[0]?.[0];
+    expect(request).toMatchObject({ type: 'codex_cli_effort', effort: 'ultra' });
+    expect(ds.session.reasoningEffort).toBe('high');
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId,
+      status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toMatchObject({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(ds.activeReasoningEffort).toBe('high');
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
+  it('preserves the worker refusal for a real RPC input channel', async () => {
+    const { worker, ds } = fixture();
+    ds.initConfig!.codexRpcInput = true;
+    const pending = updateCodexCliEffort(ds, 'ultra');
+    const request = worker.send.mock.calls[0]?.[0];
+    expect(request).toMatchObject({ type: 'codex_cli_effort', effort: 'ultra' });
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId,
+      status: 'unavailable', reason: 'cli_menu_unavailable' });
+    expect(await pending).toMatchObject({ status: 'unavailable', reason: 'cli_menu_unavailable' });
+    expect(ds.session.reasoningEffort).toBe('high');
+    expect(ds.initConfig!.reasoningEffort).toBe('high');
+    expect(ds.codexCliEffortConfirmed).toBeUndefined();
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
   it('rolls back the saved preference if durable storage rejects the update', async () => {
     const { worker, ds } = fixture();
     vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });

@@ -38,6 +38,7 @@ import {
 scheduleStore.setScheduleScope('cli_ipc_test_bot001');
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
+import { initSessionGroups, registerSessionGroup } from '../src/services/session-groups-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as sandboxStore from '../src/services/sandbox-store.js';
@@ -1943,8 +1944,10 @@ describe('GET /api/bot-default-oncall — oncall chat counts', () => {
     const configPath = join(dir, 'bots.json');
     const appId = 'test-oncall-counts-app';
     const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
     try {
       process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
       writeFileSync(configPath, JSON.stringify([{
         larkAppId: appId,
         larkAppSecret: 'secret',
@@ -1952,19 +1955,228 @@ describe('GET /api/bot-default-oncall — oncall chat counts', () => {
         // oc_live is still bound; the other two were unbound / released and only
         // remain in the "auto-bind already used" list.
         oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+        allowedChatGroups: ['oc_grp'],
         defaultOncallAutoboundChats: ['oc_live', 'oc_unbound', 'oc_released'],
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      initSessionGroups(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
       const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
-      expect(body).toMatchObject({ autoboundChatCount: 3, oncallChatCount: 1 });
+      expect(body).toMatchObject({
+        autoboundChatCount: 3,
+        oncallChatCount: 1,
+        // Shared-bot advice inputs: oc_live / oc_grp are ordinary groups here.
+        oncallSharedChatCount: 1,
+        allowedChatGroupsCount: 1,
+        allowedUsersCount: 0,
+        effectiveSandboxMode: 'off',
+      });
+
+      // Once both ids are p2pMode='group' session groups, the counts feeding
+      // the advice drop to zero (their oncall binding only pins a workingDir).
+      registerSessionGroup('oc_live', { ownerOpenId: 'ou_owner', lastSessionId: 's1' });
+      registerSessionGroup('oc_grp', { ownerOpenId: 'ou_owner', lastSessionId: 's2' });
+      const body2 = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body2).toMatchObject({ oncallChatCount: 1, oncallSharedChatCount: 0, allowedChatGroupsCount: 0 });
     } finally {
       if (handle) await handle.close();
       handle = null;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks the advice inputs localSandboxApplies=false for a riff backend even with BOTMUX_SANDBOX on', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-riff-advice-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-riff-advice-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevEnv = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      // The remote exemption wraps the whole resolution, including the env leg.
+      process.env.BOTMUX_SANDBOX = 'oncall';
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'riff', backendType: 'riff',
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: false, effectiveSandboxMode: 'off' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      if (prevEnv === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevEnv;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('pairs a remote CLI id with its backend when backendType is absent', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-riff-paired-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-riff-paired-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      // cliId riff with NO backendType line (the natural config).
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'riff',
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: false, effectiveSandboxMode: 'off' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a herdr backend local but sandbox-incapable at the IPC route', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-herdr-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-herdr-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code', backendType: 'herdr',
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: true, sandboxCapable: false });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a provably-remote mojo session non-local at the IPC route', async () => {    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-mojo-remote-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-mojo-remote-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'mojo', backendType: 'mojo',
+        mojo: { cloud: true, localDaemon: false },
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: false, effectiveSandboxMode: 'off' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still resolves readIsolation to oncall in the typo-env fallback', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-readiso-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-readiso-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevEnv = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      process.env.BOTMUX_SANDBOX = 'oncll';
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', readIsolation: true,
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: true, effectiveSandboxMode: 'oncall' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      if (prevEnv === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevEnv;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not die when BOTMUX_SANDBOX has a typo, falling back to the config-only mode', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-bad-env-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-bad-env-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevEnv = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      process.env.BOTMUX_SANDBOX = 'oncll';
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex',
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ effectiveSandboxMode: 'off', localSandboxApplies: true });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      if (prevEnv === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevEnv;
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -6673,7 +6885,7 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
   });
 
   it('400s any override on a CLI without the per-turn model contract', async () => {
-    await withServer('gemini', undefined, async base => {
+    await withServer('opencode', undefined, async base => {
       const res = await create(base, { model: 'gpt-5.6-sol' });
       expect(res.status).toBe(400);
       expect((await res.json()).field).toBe('model');
@@ -6717,7 +6929,7 @@ describe('POST/PATCH /api/schedules — local work calendar', () => {
       process.env.BOTMUX_SCHEDULE_TIMEZONE = 'Asia/Shanghai';
       scheduleStore.setScheduleScope(app);
       setLarkAppId(app);
-      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'gemini', apiOnly: true });
+      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'opencode', apiOnly: true });
       const { workCalendarPath } = await import('../src/services/work-calendar.js');
       const fixture = JSON.parse(readFileSync(new URL('./fixtures/work-calendar/demo.json', import.meta.url), 'utf8'));
       mkdirSync(join(dir, 'bots', app), { recursive: true });
@@ -8558,7 +8770,6 @@ esac
     });
 
     it.each([
-      [{ sandbox: true }, 'wrapper_sandbox_conflict'],
       [{ readIsolation: true }, 'wrapper_read_isolation_conflict'],
       [{ codexAuthSync: 'isolated' }, 'wrapper_isolated_auth_conflict'],
       [{ serviceTier: 'priority' }, 'service_tier_catalog_unavailable'],
@@ -8571,6 +8782,13 @@ esac
       expect(await response.json()).toMatchObject({ error });
       expect(readFileSync(configPath, 'utf8')).toBe(before);
       expect(getBot(appId).config).toEqual(memory);
+    });
+
+    it('saves a wrapper on a sandboxed bot (the wrapper runs inside the sandbox)', async () => {
+      await setup({ cliId: 'codex', wrapperCli: 'codex --profile withhooks', sandbox: true });
+      const response = await save({ cliId: 'codex', model: 'changed' });
+      expect(response.status).toBe(200);
+      expect(getBot(appId).config).toMatchObject({ wrapperCli: 'codex --profile withhooks', sandbox: true, model: 'changed' });
     });
 
 
@@ -12450,7 +12668,7 @@ describe('group default model configuration', () => {
       expect(chats.chats[0].agentCliId).toBe('codex');
       list.mockRestore();
       const before = readFileSync(configPath, 'utf8');
-      expect((await put({ gemini: 'flash' })).status).toBe(400);
+      expect((await put({ opencode: 'flash' })).status).toBe(400);
       expect((await put(null)).status).toBe(400);
       expect((await put({codex:{model:'gpt-5.5',reasoningEffort:'ultra'}})).status).toBe(400);
       expect(readFileSync(configPath, 'utf8')).toBe(before);
@@ -12594,6 +12812,59 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
         }
       }
       expect(getBot(appId).config.thinkingCardToolResult).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — unified card tool visibility', () => {
+  it('persists replyCardShowTools false explicitly and deletes the key on true', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-show-tools-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-show-tools-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', replyCardMode: 'unified',
+      }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
+
+      const hidden = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: false }),
+      });
+      expect(hidden.status).toBe(200);
+      expect(await hidden.json()).toMatchObject({ ok: true, replyCardShowTools: false });
+      const storedHidden = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(storedHidden.replyCardShowTools).toBe(false);
+      expect(loadBotConfigs()[0].replyCardShowTools).toBe(false);
+      expect(getBot(appId).config.replyCardShowTools).toBe(false);
+
+      const shown = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: true }),
+      });
+      expect(shown.status).toBe(200);
+      expect(await shown.json()).toMatchObject({ ok: true, replyCardShowTools: true });
+      const storedShown = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(storedShown).not.toHaveProperty('replyCardShowTools');
+      expect(loadBotConfigs()[0].replyCardShowTools).toBeUndefined();
+      expect(getBot(appId).config.replyCardShowTools).toBeUndefined();
+
+      const badType = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: 'false' }),
+      });
+      expect(badType.status).toBe(400);
     } finally {
       if (handle) await handle.close();
       handle = null;

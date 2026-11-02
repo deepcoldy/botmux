@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import { TurnReplyCardStore, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
-import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
+import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
+import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 import type { CotEntry } from '../src/types.js';
@@ -18,6 +19,15 @@ const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' }
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 const finalEvent = (text = '完整答复', source: 'explicit' | 'bridge' = 'explicit') => ({
   kind: 'final' as const, text, card: buildCanonicalFinalReplyCard({ markdown: text }), source,
+});
+
+it('reads the unified card tool visibility from bot config, defaulting to visible', () => {
+  const configs = parseBotConfigsFromText(JSON.stringify([
+    { larkAppId: 'app_hidden', larkAppSecret: 'secret', replyCardShowTools: false },
+    { larkAppId: 'app_default', larkAppSecret: 'secret' },
+  ]));
+  expect(replyCardPresentation(configs[0], 'oc_any').showTools).toBe(false);
+  expect(replyCardPresentation(configs[1], 'oc_any').showTools).toBe(true);
 });
 
 describe('one reply card per turn', () => {
@@ -190,6 +200,38 @@ describe('one reply card per turn', () => {
     await store.update(nextKey, { kind: 'start' }, io);
     expect(cards.size).toBe(2);
     expect(cards.get(start.messageId!)).toBe(body);
+  });
+
+  it('keeps thinking in unified cards while hiding tool calls and commands', async () => {
+    io.render = record => buildTurnReplyCard(record, { ...presentation, showTools: false });
+    const started = await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'tools',
+      tools: [{ id: 't1', name: 'ExecCommand', subject: 'SECRET_TOOL_COMMAND_MARKER', result: 'SECRET_RESULT_MARKER' }],
+      activity: [
+        { kind: 'thinking', id: 'thinking:1', text: 'VISIBLE_THINKING_MARKER' },
+        { kind: 'tool', id: 't1' },
+      ],
+    }, io);
+    const workingCard = cards.get(started.messageId!)!;
+    const finalCard = (await store.update(key, finalEvent(), io)).card!;
+    const completedCard = (await store.update(key, { kind: 'terminal', phase: 'completed' }, io)).card!;
+    for (const card of [workingCard, finalCard, completedCard]) {
+      expect(card).toContain('VISIBLE_THINKING_MARKER');
+      expect(card).not.toContain('SECRET_TOOL_COMMAND_MARKER');
+      expect(card).not.toContain('SECRET_RESULT_MARKER');
+      expect(card).not.toContain('ExecCommand');
+      // gate①: the panel title must not leak a tool count either.
+      expect(card).not.toContain('次工具调用');
+    }
+    expect(store.read(key)?.tools).toHaveLength(1);
+    // English rendering: singular "tool call" must be hidden too (covers both
+    // "tool call" and "tool calls"); positive assertions pin the fixture.
+    const hiddenEn = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: false, locale: 'en' });
+    expect(hiddenEn).not.toContain('tool call');
+    const shownZh = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: true });
+    expect(shownZh).toContain('次工具调用');
+    const shownEn = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: true, locale: 'en' });
+    expect(shownEn).toContain('tool call');
   });
 
   it('retains tools across a burst of progress patches without losing stored history or creating another message', async () => {

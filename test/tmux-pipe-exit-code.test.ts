@@ -75,7 +75,10 @@ type TmuxRun = (...args: string[]) => { stdout?: string | null };
 
 /**
  * Wait until a pane is dead and its exit status is known; returns the status
- * as text ('' only if it never became known) and what was last seen.
+ * as text and what was last seen. `status` is '' both when no status became
+ * known and for a signal death, which has no exit code; `seen` tells them
+ * apart — a signal death ends with the kernel reading (`kernel={"kind":
+ * "signaled",…}`) or, once tmux reaped it, with tmux's own empty status.
  *
  * tmux publishes `#{pane_dead_status}` only once it has reaped the pane's
  * process. Until then the pane reads `1:` — dead, no status — and on CI tmux
@@ -316,6 +319,15 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
     it('lets the corpse fixture learn the exit code tmux never publishes', async () => {
       tmux('new-session', '-d', '-s', 'bmx-corpse', 'sh -c "exit 77"', ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed');
       expect(await waitForDeadPane(tmux, 'bmx-corpse')).toMatchObject({ dead: true, status: '77' });
+    });
+
+    // The fixture's other kernel outcome: a signal death has no exit code, so
+    // the wait ends with an empty status and says why in `seen`.
+    it('lets the corpse fixture end on an unreaped signal death without inventing a code', async () => {
+      tmux('new-session', '-d', '-s', 'bmx-signal-corpse', 'sh -c "kill -9 $$"', ';', 'set-option', '-t', 'bmx-signal-corpse', 'remain-on-exit', 'on');
+      const result = await waitForDeadPane(tmux, 'bmx-signal-corpse');
+      expect(result).toMatchObject({ dead: true, status: '' });
+      expect(result.seen).toContain('kernel={"kind":"signaled","signal":9}');
     });
 
     it('keeps an unreaped signal death on the ordinary channel and reaps its remnant', async () => {

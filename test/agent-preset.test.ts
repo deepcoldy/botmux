@@ -91,8 +91,8 @@ describe('buildPreset — version + guide stamping', () => {
 describe('serialize ↔ load round-trip', () => {
   it('loadPreset(serializePreset(x)) deep-equals x', () => {
     const preset = buildPreset({
-      cliId: 'gemini',
-      model: 'gemini-2.5-pro',
+      cliId: 'opencode',
+      model: 'anthropic/claude-sonnet-4',
       teamRole: 'PERSONA',
       capability: 'CAP',
       sourceName: 'researcher',

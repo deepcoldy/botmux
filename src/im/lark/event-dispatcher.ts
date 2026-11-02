@@ -97,6 +97,7 @@ import { sessionKey } from '../../core/types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { readBotsInfoJson } from '../../services/bots-info-cache.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry, type BotsInfoObjectEntry } from '../../services/bots-info-shape.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
 import type { DurableInboxEvent, DurableInboxStore } from '../../services/durable-coordination.js';
@@ -1463,10 +1464,9 @@ export function learnSameOwnerSiblingCrossRef(
   if (!senderOpenId) return false;
   const sibling = resolveLocalSiblingBotByUnionId(dataDir, larkAppId, senderUnionId);
   if (!sibling) return false;
-  let entries: Array<{ larkAppId?: string; botName?: string | null }> = [];
+  let entries: BotsInfoObjectEntry[] = [];
   try {
-    const raw = readBotsInfoJson(dataDir);
-    if (Array.isArray(raw)) entries = raw;
+    entries = botsInfoObjectEntries(readBotsInfoJson(dataDir));
   } catch {
     return false;
   }
@@ -1544,11 +1544,9 @@ export function resolveSiblingBotNameByUnionId(
 
   // appId → current botName from the shared, rename-fresh bots-info.json.
   try {
-    const entries = readBotsInfoJson(dataDir) as Array<{ larkAppId?: string; botName?: string | null }> | undefined;
-    if (entries) {
-      const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
-      if (typeof name === 'string' && name.trim()) return name.trim();
-    }
+    const entries = botsInfoObjectEntries(readBotsInfoJson(dataDir));
+    const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
+    if (typeof name === 'string' && name.trim()) return name.trim();
   } catch { /* fall through to caller's cross-ref path */ }
   return undefined;
 }
@@ -1600,11 +1598,9 @@ export function updateBotOpenIdCrossRef(
   // Read known bot names from bots-info.json
   const knownBotNames = new Set<string>();
   try {
-    const entries = readBotsInfoJson(dataDir) as Array<{ botName: string | null }> | undefined;
-    if (entries) {
-      for (const e of entries) {
-        if (e.botName) knownBotNames.add(e.botName.toLowerCase());
-      }
+    const entries = botsInfoObjectEntries(readBotsInfoJson(dataDir)).filter(isBotsInfoNameEntry);
+    for (const e of entries) {
+      knownBotNames.add(e.botName.toLowerCase());
     }
   } catch { /* ignore */ }
   if (knownBotNames.size === 0) return;
@@ -2774,6 +2770,8 @@ export interface RoutingContext {
   /** runtime 级联的正文项以同一条消息重入 handleThreadReply 时置位：跳过已在首次入站跑过的
    *  一次性副作用（thread.reply hook、learnFromMentions），且不被级联在飞的推迟闸拦住。 */
   cascadeBodyReentry?: true;
+  /** An already-authorized effort command re-enters ordinary task admission. */
+  effortTaskReentry?: true;
   /** Set by the session-group birth flow (p2pMode='group') after it has
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
@@ -2810,6 +2808,8 @@ export interface RoutingContext {
   ingressAdmission?: { admitted: boolean; retryReason?: string };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
+  /** Preserve confirmed command state while its task remains in the Inbox. */
+  checkpointPreAdmissionSession?: (session: Session, isCurrent?: () => boolean) => Promise<void>;
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
   /** Durable-primary only: queue one lifecycle control after Session admission. */
@@ -4986,6 +4986,9 @@ export function createLarkEventDispatcherRuntime(
     if (typeof primary.context.queuePostAdmissionControl === 'function') {
       ctx.queuePostAdmissionControl = primary.context.queuePostAdmissionControl;
     }
+    if (typeof primary.context.checkpointPreAdmissionSession === 'function') {
+      ctx.checkpointPreAdmissionSession = primary.context.checkpointPreAdmissionSession;
+    }
   };
 
   const assertPrimaryRouteOwner = async (
@@ -6116,6 +6119,9 @@ export function createLarkEventDispatcherRuntime(
                 queuePostAdmissionControl: (
                   primary.context as DurableLarkCanonicalHandlerContext
                 ).queuePostAdmissionControl,
+                checkpointPreAdmissionSession: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).checkpointPreAdmissionSession,
               }
             : {}
         ),

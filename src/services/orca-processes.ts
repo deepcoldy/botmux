@@ -43,7 +43,6 @@ export function scanLocalOrcaCliPids(
     traex: 'traex',
     traecli: 'traex',
     'cursor-agent': 'cursor',
-    gemini: 'gemini',
     opencode: 'opencode',
     opencode2: 'opencode2',
     mtr: 'mtr',

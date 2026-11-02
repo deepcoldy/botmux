@@ -33,9 +33,10 @@ describe('Codex per-Bot reasoning effort', () => {
     const [config] = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'cli_non_codex_effort',
       larkAppSecret: 'secret',
-      cliId: 'gemini',
+      cliId: 'opencode',
       reasoningEffort: 'high',
     }]));
+    expect(config?.cliId).toBe('opencode');
     expect(config?.reasoningEffort).toBeUndefined();
   });
 

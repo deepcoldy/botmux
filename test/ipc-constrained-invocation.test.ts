@@ -11,10 +11,6 @@ vi.mock('../src/services/constrained-invocation/pi-runtime.js', async importOrig
   ...await importOriginal<typeof import('../src/services/constrained-invocation/pi-runtime.js')>(),
   runPiInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
 }));
-vi.mock('../src/services/constrained-invocation/gemini-runtime.js', async importOriginal => ({
-  ...await importOriginal<typeof import('../src/services/constrained-invocation/gemini-runtime.js')>(),
-  runGeminiInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
-}));
 vi.mock('../src/services/constrained-invocation/opencode-runtime.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/services/constrained-invocation/opencode-runtime.js')>(),
   runOpenCodeInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
@@ -45,9 +41,9 @@ it('requires host authentication even with core-only public routes enabled', asy
   }
   expect(runCodexInvocation).not.toHaveBeenCalled();
 });
-it.each(['codex', 'codex-app', 'claude-code', 'pi', 'gemini', 'opencode'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
+it.each(['codex', 'codex-app', 'claude-code', 'pi', 'opencode'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
   const s = await start(cli); const path = '/api/headless/invocations';
-  const run = cli.startsWith('codex') ? runCodexInvocation : cli === 'pi' ? runPiInvocation : cli === 'gemini' ? runGeminiInvocation : cli === 'opencode' ? runOpenCodeInvocation : runClaudeInvocation;
+  const run = cli.startsWith('codex') ? runCodexInvocation : cli === 'pi' ? runPiInvocation : cli === 'opencode' ? runOpenCodeInvocation : runClaudeInvocation;
   const invocation = { ...request, requestId: `round-${cli}` };
   const call = (method: string, target: string, body?: unknown) => fetchDaemonIpc(s.port, target, { method, ...(body ? { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } } : {}) }, secret);
   expect((await call('POST', path, invocation)).status).toBe(202);
@@ -94,7 +90,5 @@ it.each([
 
 import { runPiInvocation } from '../src/services/constrained-invocation/pi-runtime.js';
 
-
-import { runGeminiInvocation } from '../src/services/constrained-invocation/gemini-runtime.js';
 
 import { runOpenCodeInvocation } from '../src/services/constrained-invocation/opencode-runtime.js';

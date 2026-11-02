@@ -242,7 +242,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetListenerCircuitsForTest, __setListenerClockForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, learnSameOwnerSiblingCrossRef, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetListenerCircuitsForTest, __setListenerClockForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, learnSameOwnerSiblingCrossRef, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, updateBotOpenIdCrossRef, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -10123,11 +10123,11 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
       expect(crossRefWrites()).toEqual([]);
     });
 
-    it('忽略其它非字符串 botName，仍能确认当前名字唯一并回填 cross-ref', () => {
+    it('畸形 botName 条目排在目标之前时仍能确认当前名字唯一并回填 cross-ref', () => {
       mockReadFileSync.mockImplementation((path: any) => (String(path).includes('bots-info.json')
         ? JSON.stringify([
-          { larkAppId: SIB_APP, botName: 'SameOwnerSibling' },
           { larkAppId: OTHER_OWNER_APP, botName: { malformed: true } },
+          { larkAppId: SIB_APP, botName: 'SameOwnerSibling' },
         ])
         : '{}'));
 
@@ -10135,6 +10135,34 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
         siblingDataDir, MY_APP_ID, OTHER_BOT_OPEN_ID, SIB_UNION,
       )).not.toThrow();
       expect(crossRefWrites()).toContainEqual({ SameOwnerSibling: OTHER_BOT_OPEN_ID });
+    });
+
+    it('忽略 null 和非对象条目，仍能回填目标 sibling 的 cross-ref', () => {
+      mockReadFileSync.mockImplementation((path: any) => (String(path).includes('bots-info.json')
+        ? JSON.stringify([
+          null,
+          42,
+          'malformed',
+          { larkAppId: SIB_APP, botName: 'SameOwnerSibling' },
+        ])
+        : '{}'));
+
+      expect(() => learnSameOwnerSiblingCrossRef(
+        siblingDataDir, MY_APP_ID, OTHER_BOT_OPEN_ID, SIB_UNION,
+      )).not.toThrow();
+      expect(crossRefWrites()).toContainEqual({ SameOwnerSibling: OTHER_BOT_OPEN_ID });
+    });
+
+    it('名字集合保留缺少 larkAppId 的合法 botName 行', () => {
+      mockReadFileSync.mockImplementation((path: any) => (String(path).includes('bots-info.json')
+        ? JSON.stringify([{ botName: 'NameOnly' }, { larkAppId: SIB_APP, botName: 'Sibling' }])
+        : '{}'));
+
+      updateBotOpenIdCrossRef(siblingDataDir, MY_APP_ID, [
+        { name: 'NameOnly', id: { open_id: OTHER_BOT_OPEN_ID } },
+      ]);
+
+      expect(crossRefWrites()).toContainEqual({ NameOnly: OTHER_BOT_OPEN_ID });
     });
 
     it('关了 trustSameOwnerBots → 不自动开工，发授权卡', async () => {

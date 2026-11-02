@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
@@ -230,6 +230,11 @@ describe.skipIf(process.platform !== 'linux')('Codex App worker engine identity'
         await waitFor(child, logs, () => readJsonLines<{ ack: number }>(report).some(entry => entry.ack === finalSeq));
         const replacement = readJsonLines<{ replacement?: { pid: number; procStart: string } }>(report)
           .find(entry => entry.replacement)!.replacement!;
+        // The runner's ack travels over the control socket; the attestation over
+        // worker IPC. They are not ordered with each other, so wait for the IPC
+        // side instead of assuming it already arrived.
+        const lastAttestation = () => messages.filter(message => message.type === 'local_process_attestation').at(-1);
+        await waitFor(child, logs, () => lastAttestation()?.enginePid === replacement.pid, 10_000);
         const attestations = messages.filter(message => message.type === 'local_process_attestation');
         expect(attestations.at(-1)).toMatchObject({ enginePid: replacement.pid, engineProcStart: replacement.procStart });
         expect(replacement.pid).not.toBe(proofs[0]!.pid);
@@ -247,7 +252,8 @@ describe.skipIf(process.platform !== 'linux')('Codex App worker engine identity'
       } else {
         const exit = await waitForChildExit(child, logs, 10_000);
         expect(exit.code).not.toBe(0);
-        expect(messages.some(message => message.type === 'error')).toBe(true);
+        // The process exit and its last IPC messages are separate channels.
+        await vi.waitFor(() => expect(messages.some(message => message.type === 'error')).toBe(true), { timeout: 5_000 });
         expect(logs.join('')).toContain(mode === 'changed'
           ? 'invalid or changed app-server process' : 'dropped its attested app-server process');
         // A rejected frame must neither gain a new engine root nor be ACKed.

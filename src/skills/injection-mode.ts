@@ -1,7 +1,7 @@
 /**
  * Built-in skill injection mode — how botmux's own bridge skills
  * (botmux-send / botmux-schedule / …) reach a CLI that only supports a GLOBAL
- * skills directory (codex/gemini/opencode/coco/traex/mtr/
+ * skills directory (codex/opencode/coco/traex/mtr/
  * kiro-cli/genius/grok — everything with an adapter `skillsDir`, i.e. no per-session
  * injection like Claude Code, Cursor, Pi, or Oh My Pi).
  *
@@ -9,7 +9,7 @@
  * `skills.builtinInjection` (config.json) → the `prompt` default:
  *
  *   - `global`: install the skill files into the CLI's shared global dir. Full
- *     native discovery, but the user's own standalone `codex`/`gemini` also sees
+ *     native discovery, but the user's own standalone `codex`/`opencode` also sees
  *     them and can mis-fire. Right for hosts whose users never run the CLI by hand.
  *   - `prompt` (DEFAULT): don't touch the global dir; inject a compact skill
  *     catalog into the session prompt and let the model pull full instructions on
@@ -135,7 +135,7 @@ export function shouldInstallGlobalSkills(skillsDir: string): boolean {
  *    claude-code / seed / relay / oh-my-pi), cursor (`--plugin-dir`), and pi (`--skill`), which set `pluginDir`.
  *    Not configurable: they always inject dynamically, no global leak.
  *    The mode knobs don't apply.
- *  - 'global': a shared global skills dir (`skillsDir`) — codex/gemini/opencode/
+ *  - 'global': a shared global skills dir (`skillsDir`) — codex/opencode/
  *    coco/traex/mtr/kiro-cli/genius/grok — where
  *    global|prompt|off applies.
  *  - 'none': neither — the CLI has no skill mechanism (antigravity/aiden/hermes/

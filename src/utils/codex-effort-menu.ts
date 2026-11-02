@@ -49,7 +49,7 @@ export function parseCodexEffortMenu(screen: string): Menu | undefined {
   }
   if (title < 0) return;
   const tail = lines.slice(title + 1);
-  if (!tail.some(line => /enter (?:select|default).*esc back/i.test(line))) return;
+  if (!tail.some(line => /enter (?:select|default|apply).*esc back/i.test(line))) return;
   // A later live composer means the title belongs to old output, not a picker.
   if (tail.some(line => /^\s*[›»]\s*(?!\d+\.)\S/.test(line))) return;
   const rows = tail.flatMap(line => {
@@ -109,13 +109,14 @@ export async function applyCodexEffortMenu(
     opened = true;
     while (alive()) {
       const settings = io.settings();
-      if (selected && settings?.model && sameModelIdentity(settings.model, model) && settings.reasoningEffort === effort) {
-        confirmed = true;
-        return { status: 'future_only', reason: 'cli_next_turn' };
-      }
       const screen = await io.screen();
       if (!alive()) break;
       const menu = parseCodexEffortMenu(screen);
+      if (selected && settings?.model && sameModelIdentity(settings.model, model) && settings.reasoningEffort === effort
+        && hasEmptyCodexComposer(screen) && !menu) {
+        confirmed = true;
+        return { status: 'future_only', reason: 'cli_next_turn' };
+      }
       if (menu && !selected) {
         const current = menu.rows.findIndex(row => row.selected);
         // The `(current)` marker is primary. Codex 0.162 omits it entirely
@@ -154,10 +155,10 @@ export async function applyCodexEffortMenu(
           if (current !== target) io.key(current < target ? 'Down' : 'Up');
           else if (menu.kind === 'model' || /^More reasoning/.test(menu.rows[target]!.label)) io.key('Enter');
           else {
-            if (!/enter default\s*·\s*s session\s*·\s*esc back/i.test(screen)) {
+            if (!/enter (?:default|apply)\s*·\s*s session\s*·\s*esc back/i.test(screen)) {
               return { status: 'unavailable', reason: 'cli_menu_unavailable' };
             }
-            io.key('s'); // Enter changes defaults; this operation is session scoped.
+            io.key('s'); // Use the session-scoped key for both default and apply menus.
             selected = true;
           }
         }

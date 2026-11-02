@@ -5,7 +5,7 @@
  * runs without mixing logs, screenshots, or HTML reports.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { sweepOrphanSchedTasks } from '../test/e2e-browser/schedule-cleanup.js';
 
 const groupUrl = process.env.FEISHU_TEST_GROUP_URL;
@@ -117,7 +117,67 @@ if (useMockLlm) {
   } catch {}
 }
 
+/**
+ * Bot env that points a public CLI at the mock (verified per CLI against the
+ * mock: OpenCode, Kimi, Antigravity). Pi, Oh My Pi and Grok read the mock from
+ * config files under $HOME that the workflow writes (they have no env form),
+ * so they need nothing here.
+ */
+function mockCliEnv(cliId: string, baseUrl: string): Record<string, string> | null {
+  switch (cliId) {
+    case 'opencode':
+      // OPENAI_BASE_URL alone selects the built-in openai provider, which
+      // speaks the Responses API and loops without ever calling a tool.
+      return {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          $schema: 'https://opencode.ai/config.json',
+          model: 'mock/mock-model',
+          autoupdate: false,
+          share: 'disabled',
+          provider: {
+            mock: {
+              npm: '@ai-sdk/openai-compatible',
+              name: 'Mock LLM',
+              options: { baseURL: `${baseUrl}/v1`, apiKey: 'mock-test-key' },
+              models: { 'mock-model': { name: 'Mock Model', tool_call: true } },
+            },
+          },
+        }),
+        OPENCODE_DISABLE_AUTOUPDATE: '1',
+      };
+    case 'kimi':
+      return {
+        KIMI_MODEL_NAME: 'mock-model',
+        KIMI_MODEL_API_KEY: 'mock-test-key',
+        KIMI_MODEL_PROVIDER_TYPE: 'anthropic',
+        KIMI_MODEL_BASE_URL: baseUrl,
+        KIMI_MODEL_CAPABILITIES: 'tool_use',
+        // Without it Kimi fetches a newer release in the background, which asks
+        // to trust the folder on its next start.
+        KIMI_CODE_NO_AUTO_UPDATE: '1',
+        KIMI_DISABLE_TELEMETRY: '1',
+      };
+    case 'antigravity':
+      // With the workflow's settings.json (modelProvider "gemini") agy talks
+      // to the Gemini API at GOOGLE_GEMINI_BASE_URL with this key, no Google
+      // sign-in. agy compares this var to the literal string "true" (verified
+      // against 1.4.12): "1" still spawns its background updater, which would
+      // swap the pinned binary mid-run.
+      return {
+        GEMINI_API_KEY: 'mock-test-key',
+        GOOGLE_GEMINI_BASE_URL: baseUrl,
+        AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+      };
+    case 'pi':
+      return { PI_SKIP_VERSION_CHECK: '1' };
+    default:
+      return null;
+  }
+}
+
 const daemonChildren: import('node:child_process').ChildProcess[] = [];
+/** Temp working directories minted for sandboxed test bots; removed in cleanup(). */
+const sandboxWorkDirs: string[] = [];
 const startDaemon =
   process.argv.includes('--start-daemon') ||
   process.env.BOTMUX_START_DAEMON === 'true' ||
@@ -140,9 +200,42 @@ if (startDaemon) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         let changed = false;
+        const { sandboxSecretPaths, planSandboxBotConfig } = await import('../test/helpers/mock-llm-server/sandbox-probe.js');
+        const { mkdtempSync } = await import('node:fs');
+        const { tmpdir } = await import('node:os');
         for (const b of parsed) {
-          if (!b.workingDir || !existsSync(b.workingDir)) {
-            b.workingDir = '.';
+          const sandboxPlan = planSandboxBotConfig(b, {
+            existsSync,
+            makeTempWorkDir: () => {
+              const dir = mkdtempSync(join(tmpdir(), 'botmux-sbx-work-'));
+              sandboxWorkDirs.push(dir);
+              return dir;
+            },
+            cwd: process.cwd(),
+            joinPath: join,
+            secretPaths: sandboxSecretPaths(),
+          });
+          if (sandboxPlan.workingDir !== undefined && sandboxPlan.workingDir !== b.workingDir) {
+            b.workingDir = sandboxPlan.workingDir;
+            changed = true;
+          }
+          if (
+            sandboxPlan.workingDirs !== undefined &&
+            (b.workingDirs?.length !== 1 || b.workingDirs[0] !== sandboxPlan.workingDirs[0])
+          ) {
+            b.workingDirs = sandboxPlan.workingDirs;
+            changed = true;
+          }
+          if (sandboxPlan.defaultWorkingDir !== undefined && sandboxPlan.defaultWorkingDir !== b.defaultWorkingDir) {
+            b.defaultWorkingDir = sandboxPlan.defaultWorkingDir;
+            changed = true;
+          }
+          if (sandboxPlan.defaultOncallWorkingDir !== undefined && b.defaultOncall?.workingDir !== undefined) {
+            b.defaultOncall = { ...b.defaultOncall, workingDir: sandboxPlan.defaultOncallWorkingDir };
+            changed = true;
+          }
+          if (sandboxPlan.sandboxPaths) {
+            b.sandboxPaths = { ...(b.sandboxPaths ?? {}), deny: sandboxPlan.sandboxPaths.deny };
             changed = true;
           }
           if (b.p2pMode !== 'thread') {
@@ -166,10 +259,20 @@ if (startDaemon) {
               b.env.ANTHROPIC_API_KEY = 'mock-test-key';
               b.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
               changed = true;
-            } else if (b.cliId === 'codex' || b.cliId === 'coco' || b.cliId === 'opencode') {
+            } else if (b.cliId === 'codex' || b.cliId === 'coco') {
               b.env.OPENAI_BASE_URL = `${mockServerBaseUrl}/v1`;
               b.env.OPENAI_API_KEY = 'mock-test-key';
               changed = true;
+            } else {
+              // The public CLIs of the core-clis lane: each reads the mock from
+              // its own settings (mockCliEnv). A bot `model` would override the
+              // mock model the settings select.
+              const env = mockCliEnv(b.cliId, mockServerBaseUrl);
+              if (env) {
+                Object.assign(b.env, env);
+                delete b.model;
+                changed = true;
+              }
             }
           }
         }
@@ -232,6 +335,15 @@ const cleanup = async () => {
   for (const dc of daemonChildren) {
     try {
       if (!dc.killed) dc.kill('SIGKILL');
+    } catch {
+      /* ignore */
+    }
+  }
+  // Daemons are gone, so the sandboxed bots' temp working directories are safe
+  // to remove (recursive: the lane writes probe files into them).
+  for (const dir of sandboxWorkDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
     } catch {
       /* ignore */
     }

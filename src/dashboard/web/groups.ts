@@ -1,9 +1,4 @@
 import { t } from './ui.js';
-import type {
-  EffectiveRoleValue,
-  RoleProfileEntryLike,
-  RoleProfileSummaryLike,
-} from './role-profile-match.js';
 import {
   emptyGroupsSnapshot,
   fetchGroupsSnapshot,
@@ -13,7 +8,6 @@ import {
   type GroupFilters,
   type GroupsSnapshot,
 } from './groups-api.js';
-import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
 
 export {
   emptyGroupsSnapshot,
@@ -26,16 +20,8 @@ export type {
   GroupsSnapshot,
 };
 
-const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
-const GROUP_ROLE_CONTEXT_CONCURRENCY = 6;
+const ROLE_COPY_CONCURRENCY = 6;
 export const GROUPS_PAGE_SIZE = 30;
-
-export interface RoleProfileContext {
-  profiles: RoleProfileSummaryLike[];
-  entriesById: Map<string, RoleProfileEntryLike[]>;
-  groupRoleContentByBot: Map<string, EffectiveRoleValue>;
-  loaded: boolean;
-}
 
 export interface GroupPageWindow<T> {
   rows: T[];
@@ -44,15 +30,6 @@ export interface GroupPageWindow<T> {
   from: number;
   to: number;
   total: number;
-}
-
-export type SaveProfileEntryStatus = 'chat' | 'team' | 'empty' | 'error';
-
-export interface SaveProfileEntry {
-  larkAppId: string;
-  botName?: string;
-  content: string;
-  status: SaveProfileEntryStatus;
 }
 
 export interface GroupAddBotResult {
@@ -65,15 +42,6 @@ export interface AddBotsSummary {
   rows: GroupAddBotResult[];
   okCount: number;
   failed: number;
-}
-
-export interface RoleProfileBootstrapStatus {
-  kind: 'ok' | 'warn';
-  text: string;
-}
-
-export function roleKey(larkAppId: string, chatId: string): string {
-  return effectiveRoleKey(larkAppId, chatId);
 }
 
 /** Keep the expensive group coverage matrix bounded to one client-side page. */
@@ -117,91 +85,6 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-export function isValidProfileId(profileId: string): boolean {
-  return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
-}
-
-export function suggestRoleProfileIdFromChat(value: string): string {
-  const cleaned = String(value ?? '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 64);
-  return isValidProfileId(cleaned) ? cleaned : 'profile';
-}
-
-export async function fetchRoleProfileSummaries(): Promise<RoleProfileSummaryLike[]> {
-  const r = await fetch('/api/role-profiles');
-  const body = await r.json().catch(() => ({}));
-  return Array.isArray(body.profiles) ? body.profiles as RoleProfileSummaryLike[] : [];
-}
-
-export async function loadGroupRoleProfileContext(snapshot: GroupsSnapshot): Promise<RoleProfileContext> {
-  const nextProfiles = await fetchRoleProfileSummaries();
-  const detailPairs = await mapWithConcurrency(nextProfiles, GROUP_ROLE_CONTEXT_CONCURRENCY, async profile => {
-    try {
-      const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
-      const body = await r.json().catch(() => ({}));
-      return [profile.profileId, Array.isArray(body.entries) ? body.entries as RoleProfileEntryLike[] : []] as const;
-    } catch {
-      return [profile.profileId, [] as RoleProfileEntryLike[]] as const;
-    }
-  });
-
-  const seenRoleKeys = new Set<string>();
-  const roleTargets: Array<{ chatId: string; larkAppId: string }> = [];
-  for (const chat of snapshot.chats ?? []) {
-    for (const bot of chat.memberBots ?? []) {
-      // Profile matching intentionally considers explicit chat roles only.
-      // /api/groups already tells us whether one exists, so skip every
-      // unconfigured membership instead of reading its effective team role.
-      if (!bot?.inChat || !bot?.hasRole || !bot?.larkAppId) continue;
-      const key = roleKey(bot.larkAppId, chat.chatId);
-      if (seenRoleKeys.has(key)) continue;
-      seenRoleKeys.add(key);
-      roleTargets.push({ chatId: chat.chatId, larkAppId: bot.larkAppId });
-    }
-  }
-  const nextGroupRoles = await loadEffectiveRoleMap(roleTargets);
-
-  return {
-    profiles: nextProfiles,
-    entriesById: new Map(detailPairs),
-    groupRoleContentByBot: nextGroupRoles,
-    loaded: true,
-  };
-}
-
-export async function collectGroupProfileEntries(chat: GroupChat): Promise<SaveProfileEntry[]> {
-  const inChat = (chat.memberBots ?? []).filter(bot => bot?.inChat && bot?.larkAppId);
-  return mapWithConcurrency(inChat, GROUP_ROLE_CONTEXT_CONCURRENCY, async bot => {
-    try {
-      const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
-      const body = await r.json().catch(() => ({}));
-      const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
-      const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
-      const content = hasEffectiveRole ? String(effectiveContent ?? '').trim() : '';
-      const source = body?.effectiveSource === 'chat' || body?.effectiveSource === 'team'
-        ? body.effectiveSource as SaveProfileEntryStatus
-        : null;
-      return {
-        larkAppId: bot.larkAppId,
-        botName: bot.botName,
-        content,
-        status: content ? (source ?? 'chat') : 'empty',
-      };
-    } catch {
-      return {
-        larkAppId: bot.larkAppId,
-        botName: bot.botName,
-        content: '',
-        status: 'error' as const,
-      };
-    }
-  });
-}
-
 export function availableBotsForPicker(
   bots: GroupBot[],
   excludeIds?: Set<string>,
@@ -241,9 +124,142 @@ export function filterGroupChats(chats: GroupChat[], filters: GroupFilters): Gro
     .filter(chat => !q ||
       (chat.name ?? '').toLowerCase().includes(q) ||
       chat.chatId.toLowerCase().includes(q) ||
-      (chat.ownerId ?? '').toLowerCase().includes(q)
+      (chat.ownerId ?? '').toLowerCase().includes(q) ||
+      inChatMembers(chat).some(member => (member.botName ?? '').toLowerCase().includes(q))
     )
-    .filter(chat => !filters.missingOnly || (chat.memberBots ?? []).some(member => !member.inChat));
+    .filter(chat => !filters.botId
+      || (chat.memberBots ?? []).some(member => member.inChat && member.larkAppId === filters.botId));
+}
+
+/** 群组页的两个视图：常驻的普通群，和私聊里自动创建的会话群。 */
+export type GroupView = 'standard' | 'session';
+
+export type SessionGroupSort = 'active' | 'created';
+
+export function isGroupView(value: unknown): value is GroupView {
+  return value === 'standard' || value === 'session';
+}
+
+/**
+ * 会话群按最近活跃（或创建时间）倒序。拿不到摘要的群（比如注册它的 bot 不在线）
+ * 排在最后，彼此保持原顺序。
+ */
+export function sortSessionGroups(chats: GroupChat[], sort: SessionGroupSort): GroupChat[] {
+  const key = (chat: GroupChat): number => {
+    const meta = chat.sessionGroupMeta;
+    const value = sort === 'created' ? meta?.createdAt : meta?.lastActiveAt;
+    return typeof value === 'number' && Number.isFinite(value) ? value : -Infinity;
+  };
+  return chats
+    .map((chat, index) => ({ chat, index, key: key(chat) }))
+    .sort((a, b) => (b.key - a.key) || (a.index - b.index))
+    .map(item => item.chat);
+}
+
+/** 会话群行里的时间：一周内用相对时间，再早显示日期（跨年带年份）。 */
+export function formatSessionGroupTime(
+  ms: number | undefined,
+  now: number,
+  tr: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '—';
+  const diff = Math.max(0, now - ms);
+  if (diff < 60_000) return tr('groups.time.justNow');
+  if (diff < 3_600_000) return tr('groups.time.minutesAgo', { n: Math.floor(diff / 60_000) });
+  if (diff < 86_400_000) return tr('groups.time.hoursAgo', { n: Math.floor(diff / 3_600_000) });
+  if (diff < 7 * 86_400_000) return tr('groups.time.daysAgo', { n: Math.floor(diff / 86_400_000) });
+  const date = new Date(ms);
+  const md = `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  return date.getFullYear() === new Date(now).getFullYear() ? md : `${date.getFullYear()}-${md}`;
+}
+
+/** 群里实际在群的 bot，保持快照（roster）顺序。 */
+export function inChatMembers(chat: GroupChat): GroupMemberBot[] {
+  return (chat.memberBots ?? []).filter(member => member.inChat);
+}
+
+/**
+ * 「复制为新群」的预填内容：取源群在群、且仍在 roster 里的 bot，群级角色要复制的
+ * bot，以及 oncall 绑定目录（各 bot 目录不一时取绑定最多的那个）。
+ */
+export interface GroupCloneTemplate {
+  sourceChatId: string;
+  sourceName: string;
+  botIds: string[];
+  roleBotIds: string[];
+  workingDir: string;
+}
+
+export function groupCloneTemplate(chat: GroupChat, bots: GroupBot[]): GroupCloneTemplate {
+  const members = new Map(inChatMembers(chat).map(member => [member.larkAppId, member]));
+  const botIds = bots.map(bot => bot.larkAppId).filter(id => members.has(id));
+  const roleBotIds = botIds.filter(id => members.get(id)?.hasRole === true);
+  const dirCounts = new Map<string, number>();
+  for (const id of botIds) {
+    const dir = members.get(id)?.oncallChat?.workingDir?.trim();
+    if (dir) dirCounts.set(dir, (dirCounts.get(dir) ?? 0) + 1);
+  }
+  let workingDir = '';
+  for (const [dir, count] of dirCounts) {
+    if (count > (dirCounts.get(workingDir) ?? 0)) workingDir = dir;
+  }
+  return {
+    sourceChatId: chat.chatId,
+    sourceName: chat.name ?? chat.chatId,
+    botIds,
+    roleBotIds,
+    workingDir,
+  };
+}
+
+export interface CopyChatRolesResult {
+  copied: string[];
+  /** 源群里其实没有群级角色（快照过期），跳过不算失败。 */
+  skipped: string[];
+  failed: Array<{ larkAppId: string; error: string }>;
+}
+
+/** 角色正文连同它在源群的注入/回报/私聊设置一起复制，新群行为与源群一致。 */
+function roleCopyPayload(content: string, source: any): Record<string, unknown> {
+  const payload: Record<string, unknown> = { content };
+  if (source?.injectMode === 'once' || source?.injectMode === 'every') payload.injectMode = source.injectMode;
+  if (typeof source?.dispatchCompletionEnabled === 'boolean') payload.dispatchCompletionEnabled = source.dispatchCompletionEnabled;
+  if (typeof source?.replyPrivately === 'boolean') payload.replyPrivately = source.replyPrivately;
+  if (typeof source?.privateReplyNotice === 'string' && source.privateReplyNotice) payload.privateReplyNotice = source.privateReplyNotice;
+  return payload;
+}
+
+/** 把源群的群级角色（只复制群级，不复制团队默认）逐个 bot 写到目标群。 */
+export async function copyChatRoles(
+  sourceChatId: string,
+  targetChatId: string,
+  botIds: string[],
+): Promise<CopyChatRolesResult> {
+  const result: CopyChatRolesResult = { copied: [], skipped: [], failed: [] };
+  await mapWithConcurrency(botIds, ROLE_COPY_CONCURRENCY, async larkAppId => {
+    const app = encodeURIComponent(larkAppId);
+    try {
+      const r = await fetch(`/api/roles/${app}/${encodeURIComponent(sourceChatId)}`);
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(String(body?.error ?? `HTTP ${r.status}`));
+      const content = typeof body?.content === 'string' ? body.content : '';
+      if (!body?.hasRole || !content.trim()) {
+        result.skipped.push(larkAppId);
+        return;
+      }
+      const put = await fetch(`/api/roles/${app}/${encodeURIComponent(targetChatId)}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(roleCopyPayload(content, body)),
+      });
+      const putBody = await put.json().catch(() => ({}));
+      if (!put.ok || putBody?.ok === false) throw new Error(String(putBody?.error ?? `HTTP ${put.status}`));
+      result.copied.push(larkAppId);
+    } catch (error) {
+      result.failed.push({ larkAppId, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+  return result;
 }
 
 /** True iff every expected bot id appears in the row's memberBots with
@@ -388,8 +404,6 @@ export interface ReconciledChatCommitDeps {
    * stale queued updater from later clobbering the ref during flush.
    */
   applySnapshot(merged: GroupsSnapshot): void;
-  /** Post-commit hook (e.g. refresh role-profile context) with the exact merged snapshot. */
-  onCommitted(merged: GroupsSnapshot): void;
 }
 
 /**
@@ -402,8 +416,7 @@ export interface ReconciledChatCommitDeps {
  * silently overwrites the earlier chat's canonical merge.
  *
  * Here each commit reads the live snapshot via `getSnapshot` (which `applySnapshot` keeps in
- * sync synchronously), merges only this chat's row (`mergeReconciledChat`), applies it, and
- * hands the merged snapshot to `onCommitted`. Read→merge→write is atomic per commit, so the
+ * sync synchronously), merges only this chat's row (`mergeReconciledChat`) and applies it. Read→merge→write is atomic per commit, so the
  * second commit sees the first's result and both chats end up canonical.
  */
 export function createReconciledChatCommitter(
@@ -412,7 +425,6 @@ export function createReconciledChatCommitter(
   return (chatId, next) => {
     const merged = mergeReconciledChat(deps.getSnapshot(), chatId, next);
     deps.applySnapshot(merged);
-    deps.onCommitted(merged);
   };
 }
 
@@ -499,41 +511,6 @@ export function stewardJoinNotes(
         ? { larkAppId: s.larkAppId, kind: 'ok' as const, text: t('groups.stewardJoined', { bot }) }
         : { larkAppId: s.larkAppId, kind: 'warn' as const, text: t('groups.stewardJoinFailed', { bot, error: String(s.error ?? 'unknown') }) };
     });
-}
-
-export function roleProfileBootstrapStatus(
-  profileId: string,
-  messageId?: unknown,
-  error?: unknown,
-): RoleProfileBootstrapStatus | null {
-  const cleanProfileId = String(profileId ?? '').trim();
-  if (!cleanProfileId) return null;
-
-  if (error) {
-    return {
-      kind: 'warn',
-      text: t('groups.roleProfileBootstrapFailed', {
-        name: cleanProfileId,
-        reason: String(error),
-      }),
-    };
-  }
-
-  const cleanMessageId = typeof messageId === 'string' && messageId.trim() ? messageId.trim() : '';
-  if (cleanMessageId) {
-    return {
-      kind: 'ok',
-      text: t('groups.roleProfileBootstrapSent', {
-        name: cleanProfileId,
-        messageId: cleanMessageId,
-      }),
-    };
-  }
-
-  return {
-    kind: 'ok',
-    text: t('groups.roleProfileBootstrapDone', { name: cleanProfileId }),
-  };
 }
 
 export function injectOptimisticChat(

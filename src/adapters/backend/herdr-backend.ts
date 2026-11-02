@@ -69,7 +69,10 @@ const SERVER_BOOT_DEADLINE_MS = 5000;
 const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // Bound automatic agent detection after explicitly running the launcher in a
 // new pane. Input readiness remains gated by the worker's onAgentStatus hook.
-const PANE_AGENT_START_TIMEOUT_MS = 30_000;
+// 60s rather than 30s: on a heavily loaded host a cold CLI start
+// plus herdr's own detection can exceed 30s, and the failure is terminal for
+// a session started by an inbound message (no daemon-side startup auto-retry).
+export const PANE_AGENT_START_TIMEOUT_MS = 60_000;
 const PANE_AGENT_DETECTION_POLL_MS = 100;
 // A started launcher deletes itself. This fallback only reaps one Herdr never
 // ran, and is long enough for a macOS Gatekeeper assessment of the exec to end.
@@ -90,7 +93,6 @@ const PANE_AGENT_KIND_BY_EXECUTABLE: Readonly<Record<string, string>> = {
   pi: 'pi',
   claude: 'claude',
   codex: 'codex',
-  gemini: 'gemini',
   'cursor-agent': 'cursor',
   agy: 'agy',
   omp: 'omp',
@@ -134,6 +136,9 @@ function jsonCommand(args: string[], opts?: { timeout?: number; input?: string; 
   return result.ok ? result.value : undefined;
 }
 
+/** exec failures (errno codes) that waiting will not fix. */
+const HERDR_EXEC_PERMANENT_CODES = new Set(['ENOENT', 'EACCES', 'ENOEXEC', 'ENOTDIR']);
+
 /** Required command variant used by multi-step Herdr protocols.
  *
  * `jsonCommand()` intentionally collapses command failures to undefined for
@@ -163,17 +168,24 @@ function requiredJsonCommand(
     const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : err?.stderr?.toString?.().trim();
     const stdout = typeof err?.stdout === 'string' ? err.stdout.trim() : err?.stdout?.toString?.().trim();
     const detail = stderr || stdout;
-    throw new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`);
+    // herdr did not answer (our exec deadline hit, the host could not fork, or
+    // it exited without output), as opposed to answering with an error. A
+    // missing or unusable executable will not get better by waiting.
+    const transient = err?.code
+      ? !HERDR_EXEC_PERMANENT_CODES.has(err.code)
+      : !detail;
+    throw Object.assign(new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`),
+      transient ? { herdrTransient: true } : {});
   }
   if (!raw) {
     if (opts?.allowEmpty) return undefined;
-    throw new Error(`${operation} failed: empty response`);
+    throw Object.assign(new Error(`${operation} failed: empty response`), { herdrTransient: true });
   }
   let value: any;
   try {
     value = JSON.parse(raw);
   } catch {
-    throw new Error(`${operation} failed: invalid JSON response`);
+    throw Object.assign(new Error(`${operation} failed: invalid JSON response`), { herdrTransient: true });
   }
   if (value?.error) {
     const code = typeof value.error.code === 'string' ? value.error.code : 'unknown_error';
@@ -1195,12 +1207,26 @@ export class HerdrBackend implements SessionBackend {
 
       const detectionDeadline = Date.now() + PANE_AGENT_START_TIMEOUT_MS;
       let detected = false;
+      let lastListError: Error | undefined;
       while (Date.now() < detectionDeadline) {
-        const listed = requiredJsonCommand(
-          `herdr agent list in ${this.sessionName}`,
-          herdrSessionArgs(this.sessionName, ['agent', 'list']),
-          { timeout: Math.max(1, Math.min(5000, detectionDeadline - Date.now())), env: this.childEnv },
-        );
+        let listed: any;
+        try {
+          listed = requiredJsonCommand(
+            `herdr agent list in ${this.sessionName}`,
+            herdrSessionArgs(this.sessionName, ['agent', 'list']),
+            { timeout: Math.max(1, Math.min(5000, detectionDeadline - Date.now())), env: this.childEnv },
+          );
+        } catch (err: any) {
+          // A poll herdr did not answer (timed out / no output / empty / not
+          // JSON) on a loaded host is not a verdict on the launch: keep polling
+          // until the deadline. Anything herdr actually answered with — a JSON
+          // error on stdout or stderr, a missing binary — still fails at once.
+          if (!err?.herdrTransient) throw err;
+          lastListError = err;
+          sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
+          continue;
+        }
+        lastListError = undefined;
         const agent = extractAgents(listed).find(row => row?.pane_id === paneId && !agentRowExited(row));
         if (agent?.agent === kind) {
           detected = true;
@@ -1212,7 +1238,10 @@ export class HerdrBackend implements SessionBackend {
         sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
       }
       if (!detected) {
-        throw new Error(`Herdr did not detect "${kind}" in pane ${paneId} within ${PANE_AGENT_START_TIMEOUT_MS} ms`);
+        throw new Error(
+          `Herdr did not detect "${kind}" in pane ${paneId} within ${PANE_AGENT_START_TIMEOUT_MS} ms`
+          + (lastListError ? ` (last agent list error: ${lastListError.message})` : ''),
+        );
       }
 
       requiredJsonCommand(

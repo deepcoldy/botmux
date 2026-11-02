@@ -23,19 +23,26 @@ import {
   type SandboxTreeFlavour,
 } from '../src/adapters/backend/sandbox-tree-teardown.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
-import { unmountTestMount } from './helpers/unmount-test-mount.js';
+import { detachTestMount, unmountTestMount } from './helpers/unmount-test-mount.js';
+import { onTestProcessExit } from './helpers/exit-cleanup.js';
 
 const linux = process.platform === 'linux';
 const isRoot = process.getuid?.() === 0;
 
 function mountSmallFs(target: string, scratch: string): boolean {
   mkdirSync(target, { recursive: true });
+  let mounted: boolean;
   if (isRoot) {
-    return spawnSync('mount', ['-t', 'tmpfs', '-o', 'mode=700,size=1m', 'tmpfs', target], { stdio: 'ignore' }).status === 0;
+    mounted = spawnSync('mount', ['-t', 'tmpfs', '-o', 'mode=700,size=1m', 'tmpfs', target], { stdio: 'ignore' }).status === 0;
+  } else {
+    const dirs = ['lower', 'upper', 'work'].map(d => join(scratch, d));
+    for (const d of dirs) mkdirSync(d, { recursive: true });
+    mounted = spawnSync('fuse-overlayfs', ['-o', `lowerdir=${dirs[0]},upperdir=${dirs[1]},workdir=${dirs[2]}`, target], { stdio: 'ignore' }).status === 0;
   }
-  const dirs = ['lower', 'upper', 'work'].map(d => join(scratch, d));
-  for (const d of dirs) mkdirSync(d, { recursive: true });
-  return spawnSync('fuse-overlayfs', ['-o', `lowerdir=${dirs[0]},upperdir=${dirs[1]},workdir=${dirs[2]}`, target], { stdio: 'ignore' }).status === 0;
+  // An interrupted run never reaches the `finally` that unmounts a fixture:
+  // detach it on the way out (a no-op once the test unmounted it itself).
+  if (mounted) onTestProcessExit(() => { detachTestMount(target); });
+  return mounted;
 }
 
 const mountsAvailable = linux && (() => {

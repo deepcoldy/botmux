@@ -6,6 +6,7 @@ import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.j
 import { cliIdForComm, findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
+import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from '../src/core/traex-leaf-pid.js';
 
 // Manual scheduler so the retry loop runs deterministically without real timers.
 function makeScheduler() {
@@ -83,6 +84,8 @@ function runWorkerWiring(late: boolean, options: {
   scopeLaunched?: boolean;
   /** Payload becomes observable only after this many sessionScopePayloadPid reads. */
   scopePayloadAfterProbe?: number;
+  /** Children of pids other than the pane (100); a synthetic launch chain. */
+  children?: Record<number, number[]>;
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
@@ -130,7 +133,7 @@ function runWorkerWiring(late: boolean, options: {
         return options.paneCmdline ?? ['launcher'];
       };
     })(),
-    getChildPids: (pid: number) => (pid === 100 ? (options.relayChildren ?? [150]) : []),
+    getChildPids: (pid: number) => (pid === 100 ? (options.relayChildren ?? [150]) : (options.children?.[pid] ?? [])),
     readComm: (pid: number) => (pid === 100 ? (options.comm ?? 'node') : (options.childComms?.[pid] ?? 'claude')),
     isProgramStatusRelayArgv,
     programStatusRelayLaunched: options.relayLaunched ?? false,
@@ -139,8 +142,13 @@ function runWorkerWiring(late: boolean, options: {
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(), observeZcodeCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };
-  // The REAL layer walk, probing the same synthetic process table.
+  // The REAL layer walk and TRAE leaf resolver, probing the same synthetic
+  // process table.
+  const traexProbes = { childrenOf: context.getChildPids, commOf: context.readComm };
   Object.assign(context, {
+    resolveTraexOwnershipPid: (pid: number, active: boolean) => resolveTraexOwnershipPid(pid, active, traexProbes),
+    scheduleTraexLeafPidResolve: (pid: number, deps: Parameters<typeof scheduleTraexLeafPidResolve>[1]) =>
+      scheduleTraexLeafPidResolve(pid, { ...deps, probes: traexProbes }),
     unwrapBotmuxLaunchLayers: (pid: number, opts: { relay: boolean }) => unwrapBotmuxLaunchLayers(pid, {
       ...opts,
       probes: {
@@ -170,6 +178,22 @@ describe('worker wrapper PID wiring', () => {
     expect(result.bridgeCliPid).toBe(150);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
     expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('binds the sandboxed TRAE leaf under the network-policy chain, not the scope payload (late PID=%s)', late => {
+    // Measured network-policy sandbox chain below the scope supervisor (100):
+    // runner 150 → unshare 151 → runner 152 → sh 153 → sh 154 → bwrap 155
+    // → bwrap init 156 → traex 157. The scope payload (150) is bound first;
+    // the leaf sits seven levels down.
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', sandboxRequested: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153], 153: [154], 154: [155], 155: [156], 156: [157] },
+      childComms: { 150: 'node', 151: 'unshare', 152: 'node', 153: 'sh', 154: 'sh', 155: 'bwrap', 156: 'bwrap', 157: 'traex' },
+    });
+    expect(result.backend.cliPid).toBe(157);
+    expect(result.bridgeCliPid).toBe(157);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(157);
   });
 
   it.each([false, true])('follows a scope payload that appears after the initial PID wiring (late PID=%s)', late => {

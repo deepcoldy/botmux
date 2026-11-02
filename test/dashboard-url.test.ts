@@ -19,6 +19,7 @@ vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
 import {
   buildDashboardUrl,
   buildDashboardUrls,
+  buildReplyConsoleUrl,
   buildPlatformDashboardLoginUrl,
   buildV3RunDetailUrl,
   buildV3TerminalUrl,
@@ -530,5 +531,31 @@ describe('buildDashboardUrls: the wire URL always keeps its token', () => {
     // 摘 token 是消费端的决定，不是协议的决定。
     expect(urls.url).toContain('?t=abc');
     expect(urls.localUrl).toContain('?t=abc');
+  });
+});
+
+describe('permanent reply console URLs', () => {
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+    setPublic(null);
+    setDevbox(null);
+  });
+
+  it('uses the bound SSO machine entry without reading or publishing a token', () => {
+    setRemote(true);
+    setPlatform('https://m-example.botmux.example');
+    expect(buildReplyConsoleUrl()).toBe('https://m-example.botmux.example/');
+  });
+
+  it('does not advertise routes that require dashboard owner credentials', () => {
+    setPublic('https://proxy.example.com');
+    setDevbox('https://devbox.example.com');
+    expect(buildReplyConsoleUrl()).toBeUndefined();
+    setPlatform('https://m-example.botmux.example');
+    expect(buildReplyConsoleUrl()).toBeUndefined();
+    setRemote(true);
+    setPlatform(null);
+    expect(buildReplyConsoleUrl()).toBeUndefined();
   });
 });

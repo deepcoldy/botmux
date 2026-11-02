@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -215,6 +215,47 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
       expect(r.args[index + 1]).toBe(join(dir, 'session-temp'));
     }
     r.cleanup();
+  });
+});
+
+// Root daemon + --unshare-user maps only uid 0, so GNU tar's default
+// --same-owner chown of a foreign-owned archive fails inside the sandbox.
+describe('sandbox TAR_OPTIONS', () => {
+  it('adds --no-same-owner for a root worker and keeps an operator value', () => {
+    expect(sandboxTarOptions(undefined, 0)).toBe('--no-same-owner');
+    expect(sandboxTarOptions('  ', 0)).toBe('--no-same-owner');
+    expect(sandboxTarOptions('--warning=no-timestamp', 0)).toBe('--warning=no-timestamp --no-same-owner');
+  });
+
+  it('leaves an explicit owner choice and non-root workers alone', () => {
+    expect(sandboxTarOptions('--same-owner', 0)).toBeUndefined();
+    expect(sandboxTarOptions('-v --no-same-owner', 0)).toBeUndefined();
+    expect(sandboxTarOptions(undefined, 1000)).toBeUndefined();
+    expect(sandboxTarOptions(undefined, undefined)).toBeUndefined();
+  });
+
+  it('reaches the bwrap child of a root worker', () => {
+    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-tar-'));
+    const r = prepareDirectSandbox({
+      sessionId: 'taropts', dataDir: tmp(),
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
+    });
+    if (!r) return; // bwrap unavailable on this host
+    const index = r.args.indexOf('TAR_OPTIONS');
+    expect(r.args[index - 1]).toBe('--setenv');
+    expect(r.args[index + 1]).toContain('--no-same-owner');
+    r.cleanup();
+    // The bot's own value is the base, not the daemon's.
+    const own = prepareDirectSandbox({
+      sessionId: 'taropts2', dataDir: tmp(),
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
+      childTarOptions: '--warning=no-timestamp',
+    })!;
+    expect(own.args[own.args.indexOf('TAR_OPTIONS') + 1]).toBe('--warning=no-timestamp --no-same-owner');
+    own.cleanup();
   });
 });
 

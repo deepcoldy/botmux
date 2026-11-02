@@ -157,7 +157,7 @@ function coreOnlyAuthHeaders(secret, method, path, port) {
 ```bash
 # 触发（异步）——公共路由，无需签名
 curl -s http://127.0.0.1:8930/api/trigger -X POST -H 'content-type: application/json' -d '{
-  "source": {"type": "custom"},
+  "source": {"type": "webhook"},
   "target": {"kind": "turn", "botId": "local_riff"},
   "envelope": {"format": "text", "sourceName": "my-runner", "trusted": false},
   "instruction": "跑一下测试并报告结果",

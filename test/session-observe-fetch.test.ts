@@ -73,7 +73,7 @@ describe('fetchObserveSnapshot', () => {
             status: 'idle', queued: true, pendingRepo: true, workerPid: undefined,
           }),
           baseRow({
-            sessionId: 's_alpha_3', cliId: 'gemini', status: 'dormant',
+            sessionId: 's_alpha_3', cliId: 'opencode', status: 'dormant',
             backendType: 'pty', workerPid: undefined, queued: false,
           }),
           baseRow({
@@ -100,7 +100,7 @@ describe('fetchObserveSnapshot', () => {
       ['s_alpha_4', 'closed', 'unknown', false],
     ]);
     // CLI adapter identity survives the projection
-    expect(envelope.sessions.map(s => s.cli.id)).toEqual(['codex', 'claude-code', 'gemini', 'codex']);
+    expect(envelope.sessions.map(s => s.cli.id)).toEqual(['codex', 'claude-code', 'opencode', 'codex']);
     // Backend type is preserved verbatim
     expect(envelope.sessions.map(s => s.backend.type)).toEqual(['pty', 'tmux', 'pty', 'pty']);
     // phase is universally unknown by contract

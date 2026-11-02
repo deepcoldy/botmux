@@ -81,6 +81,53 @@ function cleanup(f: ReturnType<typeof fixture>, plan: ReturnType<typeof prepareD
 }
 
 describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
+  it('rejects a short temp alias without an exact writable scratch grant', () => {
+    const f = fixture();
+    const scratch = join(f.workspace, 'scratch');
+    const alias = join(f.root, 'short-scratch');
+    mkdirSync(scratch);
+    symlinkSync(scratch, alias);
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      expect(() => {
+        plan = prepareDirectSandbox({ sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
+          chdir: f.workspace, home: f.home, cliBin: '/bin/true', cliArgs: [], tempDir: alias });
+      }).toThrow(/exact writable scratch grant/);
+    } finally { cleanup(f, plan); }
+  });
+
+  it('keeps a short scratch alias writable without bypassing deny masks or exposing siblings', () => {
+    const f = fixture();
+    const scratch = join(f.root, 'cache', 'session');
+    const sibling = join(f.root, 'cache', 'sibling');
+    mkdirSync(scratch, { recursive: true });
+    mkdirSync(sibling);
+    writeFileSync(join(scratch, 'secret'), 'must-stay-hidden');
+    const alias = join(f.root, 'short-scratch');
+    symlinkSync(scratch, alias);
+    f.policy.rules.push(
+      { path: scratch, access: 'readWrite', source: 'internal' },
+      { path: join(scratch, 'secret'), access: 'deny', source: 'internal' },
+    );
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({ sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
+        chdir: f.workspace, home: f.home, cliBin: '/bin/bash',
+        cliArgs: ['-c', 'printf artifact > "$TMPDIR/artifact"; test "$(cat "$TMPDIR/secret")" != must-stay-hidden && test ! -e "$TMPDIR/../sibling"'],
+        tempDir: alias });
+      expect(plan).not.toBeNull();
+      expect(plan!.env.TMPDIR).toBe(alias);
+      const index = plan!.args.findIndex((arg, i, args) => arg === '--symlink' && args[i + 1] === scratch && args[i + 2] === alias);
+      expect(index).toBeGreaterThan(-1);
+      expect(plan!.args.slice(index, index + 3)).toEqual(['--symlink', scratch, alias]);
+      if (canRunBwrap) {
+        const result = spawnSync(plan!.bin, plan!.args, { env: { ...process.env, ...plan!.env }, timeout: 10_000 });
+        expect(result.status, result.stderr?.toString()).toBe(0);
+        expect(readFileSync(join(scratch, 'artifact'), 'utf8')).toBe('artifact');
+      }
+    } finally { cleanup(f, plan); }
+  });
+
   it.each(['home-link', 'data-link', 'canonical'] as const)(
     'pins the mounted root in both the child env and bwrap argv (%s)', layout => {
       const f = fixture(layout);
@@ -322,9 +369,9 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
       plan = prepareDirectSandbox({
         sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
         chdir: repoRoot, home: f.home, cliBin: command,
-        // This flag is rejected at the start of relaySend, proving that the
-        // normal relay path was reached without issuing any real request.
-        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--top-level'],
+        // A valueless flag is rejected at the start of relaySend, proving that
+        // the normal relay path was reached without issuing any real request.
+        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--completion-proposal-file'],
       });
       expect(plan).not.toBeNull();
       writeFileSync(join(plan!.outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
@@ -336,7 +383,7 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
       });
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toContain('ROUTING_NOT_SUPPORTED');
+      expect(result.stderr).toContain('relay: --completion-proposal-file 需要路径参数');
     } finally {
       cleanup(f, plan);
     }

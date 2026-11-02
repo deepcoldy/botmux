@@ -6,6 +6,11 @@ export interface CliUsageLimitState {
   retryAtMs: number;
   retryLabel: string;
   retryReady: boolean;
+  /** Stable identity of one relative-countdown refusal, persisted so a
+   * reattached worker cannot move its already-observed reset deadline. */
+  relativeResetKey?: string;
+  /** A confirmed native quota composer must survive unrelated PTY output. */
+  source?: 'antigravity-error-composer';
 }
 
 export interface CliUsageLimitNotDetected {
@@ -89,6 +94,27 @@ function parseMeridiemTime(text: string, now: Date): { retryAtMs: number; retryL
     };
   }
   return null;
+}
+
+function parseRelativeReset(text: string, now: Date): {
+  retryAtMs: number; retryLabel: string; relativeResetKey: string;
+} | null {
+  const match = /\bresets?\s+in\s+((?:\d+(?:\.\d+)?[dhms]\s*)+)(?=$|[.,!;)\]\r\n])/i.exec(text);
+  if (!match) return null;
+  const label = match[1]!.replace(/\s+/g, '');
+  const scales: Record<string, number> = { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1_000 };
+  let duration = 0;
+  let previousScale = Infinity;
+  for (const part of label.matchAll(/(\d+(?:\.\d+)?)([dhms])/gi)) {
+    const scale = scales[part[2]!.toLowerCase()]!;
+    if (scale >= previousScale) return null;
+    previousScale = scale;
+    duration += Number(part[1]) * scale;
+  }
+  const retryAtMs = now.getTime() + duration;
+  if (!Number.isSafeInteger(duration) || !Number.isFinite(new Date(retryAtMs).getTime())) return null;
+  const errorId = /(?:^|\n)[ \t]*Error ID:[ \t]*([a-zA-Z0-9-]+)/.exec(text)?.[1] ?? '';
+  return { retryAtMs, retryLabel: label, relativeResetKey: `${duration}:${errorId}` };
 }
 
 /** Stable fixed cooldown pinned to wall-clock buckets for hard 429 fallbacks. */
@@ -228,9 +254,26 @@ export function detectCliUsageLimit(
     return { limited: false };
   }
 
-  const time = parseMeridiemTime(text, now);
-  const isRate = !opts.suppressRateKind && hasPattern(text, RATE_LIMIT_PATTERNS);
-  const isUsage = !isRate && hasPattern(text, USAGE_LIMIT_PATTERNS);
+  // A viewport may retain several refusals. Parse the newest matching line
+  // and the reset/Error ID below it, never a previous episode above it.
+  const lastRefusalLine = (patterns: RegExp[]): number => {
+    let start = -1;
+    for (const pattern of patterns) {
+      for (const match of text.matchAll(new RegExp(pattern.source, 'gi'))) {
+        start = Math.max(start, text.lastIndexOf('\n', match.index - 1) + 1);
+      }
+    }
+    return start;
+  };
+  const rateLine = lastRefusalLine(RATE_LIMIT_PATTERNS);
+  const usageLine = lastRefusalLine(USAGE_LIMIT_PATTERNS);
+  const start = Math.max(rateLine, usageLine);
+  if (start < 0) return { limited: false };
+  const latest = text.slice(start);
+  const isRate = rateLine >= 0 && rateLine >= usageLine;
+  if (isRate && opts.suppressRateKind) return { limited: false };
+  const isUsage = !isRate && usageLine >= 0;
+  const time = parseMeridiemTime(latest, now) ?? parseRelativeReset(latest, now);
   if (!isRate && !isUsage) return { limited: false };
 
   if (time) {
@@ -240,13 +283,14 @@ export function detectCliUsageLimit(
       retryAtMs: time.retryAtMs,
       retryLabel: time.retryLabel,
       retryReady: now.getTime() >= time.retryAtMs,
+      ...('relativeResetKey' in time ? { relativeResetKey: `${isRate ? 'rate' : 'usage'}:${time.relativeResetKey}` } : {}),
     };
   }
 
   // Usage limits without a concrete clock time stay non-blocking (existing tests).
   // Hard HTTP 429 / exceeded-retry-limit paths get a stable cooldown fallback so
   // the session can still surface as limited → Dashboard「需要你」.
-  if (isRate && hasPattern(text, HARD_RATE_LIMIT_WITHOUT_TIME_PATTERNS)) {
+  if (isRate && hasPattern(latest, HARD_RATE_LIMIT_WITHOUT_TIME_PATTERNS)) {
     const fallback = hardRateLimitFallbackTime(now);
     return {
       limited: true,
@@ -261,7 +305,26 @@ export function detectCliUsageLimit(
 }
 
 export function usageLimitStateKey(state: CliUsageLimitState): string {
-  return `${state.kind}:${state.retryAtMs}:${state.retryLabel}`;
+  const key = `${state.kind}:${state.retryAtMs}:${state.retryLabel}`;
+  return state.relativeResetKey ? `${key}:${state.relativeResetKey}` : key;
+}
+
+/** Repeated screenshots contain the same relative duration, not a new reset.
+ * Keep the first deadline, including after session-state restore. Clearing the
+ * prior state or seeing a new error episode starts a fresh deadline. */
+export function reconcileUsageLimitState(
+  previous: CliUsageLimitState | undefined,
+  incoming: CliUsageLimitState,
+  nowMs = Date.now(),
+): CliUsageLimitState {
+  if (!incoming.relativeResetKey || previous?.relativeResetKey !== incoming.relativeResetKey
+    || previous.kind !== incoming.kind || !Number.isFinite(previous.retryAtMs)) return incoming;
+  return {
+    ...incoming,
+    retryAtMs: previous.retryAtMs,
+    retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
+    ...(previous.source ? { source: previous.source } : {}),
+  };
 }
 
 /**
