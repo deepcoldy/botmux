@@ -156,8 +156,9 @@ export function isCredentialIsolationReservedBasename(name: string): boolean {
 export function credentialIsolationRequired(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
+  mixCredentialExists?: boolean;
 }): boolean {
-  return input.markerExists || input.deviceCredentialExists;
+  return input.markerExists || input.deviceCredentialExists || input.mixCredentialExists === true;
 }
 
 export type CredentialOnlyIsolationGate =
@@ -182,6 +183,7 @@ export type CredentialOnlyIsolationGate =
 export function evaluateCredentialOnlyIsolationGate(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
+  mixCredentialExists?: boolean;
   remoteBackend: boolean;
   platform: string;
   mechanismAvailable: boolean;
@@ -236,17 +238,19 @@ export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): 
   const roots = dedupe([defaultBh, bh]);
   const credentialPaths = roots.flatMap(hostDeviceAuthorityPaths);
   const markerPath = `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+  const mixCredentialPath = `${h}/.mixrc`;
   const denyRegexes = roots.flatMap(root =>
     HOST_DEVICE_CREDENTIAL_FILES.map(file =>
       `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`));
   denyRegexes.push(
     `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
+    `^${escapeForRegex(mixCredentialPath)}(?:\\.|$)`,
   );
   return {
     roots,
-    denyPaths: dedupe([...credentialPaths, markerPath]),
+    denyPaths: dedupe([...credentialPaths, markerPath, mixCredentialPath]),
     denyRegexes: dedupe(denyRegexes),
-    denyWritePaths: dedupe([...credentialPaths, markerPath]),
+    denyWritePaths: dedupe([...credentialPaths, markerPath, mixCredentialPath]),
     denyWriteRegexes: dedupe(denyRegexes),
     denyWriteLiterals: roots,
   };

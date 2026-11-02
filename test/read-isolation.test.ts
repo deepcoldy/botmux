@@ -160,10 +160,15 @@ describe('evaluateReadIsolationGate (fail-closed, single decision point)', () =>
 });
 
 describe('mandatory device credential isolation', () => {
-  it('activates once either the enrollment marker or a device credential exists', () => {
+  it('activates once an enrollment marker, device credential, or machine MIX credential exists', () => {
     expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: false })).toBe(false);
     expect(credentialIsolationRequired({ markerExists: true, deviceCredentialExists: false })).toBe(true);
     expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: true })).toBe(true);
+    expect(credentialIsolationRequired({
+      markerExists: false,
+      deviceCredentialExists: false,
+      mixCredentialExists: true,
+    })).toBe(true);
     expect(deviceCredentialIsolationMarkerPath('/home/agent/'))
       .toBe('/home/agent/.botmux/.device-credential-isolation');
   });
@@ -196,6 +201,8 @@ describe('mandatory device credential isolation', () => {
     expect(rules.denyPaths).toContain('/home/agent/.botmux/device-auth');
     expect(rules.denyPaths).toContain('/srv/botmux-runtime/platform.json');
     expect(rules.denyPaths).toContain('/home/agent/.botmux/.device-credential-isolation');
+    expect(rules.denyPaths).toContain('/home/agent/.mixrc');
+    expect(rules.denyRegexes.some(rx => new RegExp(rx).test('/home/agent/.mixrc.tmp'))).toBe(true);
     for (const name of [
       'device-auth',
       'device.json',

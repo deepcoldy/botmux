@@ -179,6 +179,7 @@ function hostRequiresCredentialIsolation(): boolean {
     markerExists: exists(deviceCredentialIsolationMarkerPath(home)),
     deviceCredentialExists: [...roots].some(root => exists(join(root, DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE))
       || exists(join(root, DEVICE_CREDENTIAL_FILE))),
+    mixCredentialExists: exists(join(home, '.mixrc')),
   });
 }
 

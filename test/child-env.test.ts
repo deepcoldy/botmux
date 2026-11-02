@@ -135,6 +135,19 @@ describe('redactChildEnv()', () => {
     expect(out.KEEP).toBe('v');
   });
 
+  it('removes machine MIX and AI Auth credentials from child env', () => {
+    const out = redactChildEnv({
+      MIX_AUTH_TOKEN: 'machine-jwt',
+      BYTEDCLI_AI_AUTH_APP_KEY: 'ai-auth-app-key',
+      KEEP: 'v',
+    });
+    for (const key of ['MIX_AUTH_TOKEN', 'BYTEDCLI_AI_AUTH_APP_KEY']) {
+      expect(key in out, key).toBe(false);
+      expect(REDACTED_CHILD_ENV_KEYS, key).toContain(key);
+    }
+    expect(out.KEEP).toBe('v');
+  });
+
   it('removes host-authorized LinkRef relay controls from ordinary children', () => {
     const out = redactChildEnv({
       BOTMUX_LINK_REF_TURN_MODE: 'enabled',

@@ -230,6 +230,11 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
+  // Host-side MIX Broker credentials. The model CLI receives only the local
+  // MCP Gateway capability; machine/AI-auth credentials stay in the host MCP
+  // process and must never be inherited by a pane or shell subprocess.
+  'MIX_AUTH_TOKEN',
+  'BYTEDCLI_AI_AUTH_APP_KEY',
   'ONCALL_SERVICE_SECRET',
   // node:child_process.fork() injects these into the worker so Node can attach
   // its IPC channel on startup. They belong to that exact parent/worker edge.

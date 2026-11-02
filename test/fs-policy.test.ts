@@ -392,6 +392,7 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/usr/bin/env').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/private/var/folders/ab/T/x').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.ssh/id_rsa').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.mixrc').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/appsecret.enc').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/Library/Keychains/login.keychain').access).toBe('deny');
     // ~/.botmux is NOT exposed wholesale (deny-by-default) — cross-bot secrets
