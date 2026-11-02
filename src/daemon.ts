@@ -20433,6 +20433,7 @@ function startAutoWorktreePending(ds: DaemonSession, args: {
     worktreePath: args.worktreePath, branch: args.branch, reuseExisting: args.reuseExisting,
     targetSubdir: args.targetSubdir,
     activeSessions,
+    prepareTurn: prepareTurnCliIdentity,
     notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
   });
   logger.info(`[${tag(ds)}] auto-worktree → pending, building worktree off ${args.baseDir}`);
@@ -25496,6 +25497,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // (quoteTargetId === marker.turnId) holds on session-group first turns.
     // Outside a birth replyAnchorId === messageId, so plain paths are unchanged.
     pendingTurnId: replyAnchorId,
+    pendingTrustedCaller: trustedCaller,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
@@ -28118,6 +28120,7 @@ async function handleThreadReplyAdmitted(
         // durable opening instead of an impossible successor to an empty ACK.
         ds.pendingPrompt = promptContent;
         ds.pendingTurnId = parsed.messageId;
+        ds.pendingTrustedCaller = threadTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
         ds.pendingCodexAppMessageContext = codexAppMessageContext;
@@ -28372,6 +28375,10 @@ async function handleThreadReplyAdmitted(
       pendingSubstituteTrigger: substituteTrigger,
       pendingSubstituteControlCard: shouldSendSubstituteControlCard,
       pendingSender: autoCreateSender,
+      // The auto-worktree / repo-picker deferred fork can only read caller
+      // state off this ds literal; the pinned twin below passes
+      // threadTrustedCaller explicitly to forkReservedInitialSession.
+      pendingTrustedCaller: threadTrustedCaller,
       // R5-B1-1: freeze the plain-human steer authorization into the new-topic
       // opening metadata. buildReservedInitialInput COPIES this onto the built
       // opening payload; forkReservedInitialSession never infers it (that shared
