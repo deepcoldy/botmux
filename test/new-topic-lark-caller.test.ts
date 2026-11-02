@@ -32,6 +32,14 @@ const dsStart = daemon.indexOf('  const ds: DaemonSession = {', daemon.indexOf('
 assert(dsStart > 0);
 const dsSource = daemon.slice(dsStart, daemon.indexOf('\n  };', dsStart) + 5);
 const newTopic = new Function('deps', 'with(deps){' + stripTypeScriptTypes(dsSource, { mode: 'transform' }) + '; return ds;}');
+// handleThreadReplyAdmitted auto-create literal (a message landing without a
+// live session builds THIS session; its auto-worktree deferred fork can only
+// read the caller off the ds literal, exactly like the new-topic twin above).
+const acStart = daemon.indexOf('  const newDs: DaemonSession = {');
+assert(acStart > 0);
+const acSource = daemon.slice(acStart, daemon.indexOf('\n    };', acStart) + 7);
+assert(acSource.includes('pendingSender: autoCreateSender'));
+const autoCreate = new Function('deps', 'with(deps){' + stripTypeScriptTypes(acSource, { mode: 'transform' }) + '; return newDs;}');
 const initStart = pool.indexOf('  const initTrustedCaller = promptPayload.trustedCaller');
 const initSource = pool.slice(initStart, pool.indexOf(';', initStart) + 1);
 const initCaller = new Function('promptPayload', 'resumeOrTurnId', initSource + '; return initTrustedCaller;');
@@ -63,7 +71,19 @@ async function runCase(name: string, options: Record<string, any> = {}) {
   let turnId = 'first-turn';
   let senderId = options.senderId ?? 'ou_real_sender';
   const verifiedCaller = options.anonymous && !options.replaceOpening ? undefined : {requestLarkAppId:'test-app', requestUserOpenId:senderId, senderType:'user'};
-  const ds = newTopic({
+  const ds = options.autoCreate ? autoCreate({
+    session: {sessionId:'test-session', status:'active', cliId:'codex', createdAt:new Date().toISOString(),
+      replyTargets: {[turnId]: {senderOpenId:'ou_real_sender'}}},
+    larkAppId:'test-app', autoCreateChatId:'test-chat', autoCreateChatType:'p2p', scope:'thread', now:Date.now(),
+    cliVersionCache:new Map(),cliRuntimeVersionKey:()=>'',botCfg:{},pinnedWorkingDir:'/test/base',autoWt:true,
+    promptContent:options.replaceOpening ? '' : 'new ticket',
+    parsed:{messageId:turnId, senderType:'user', mentions:[], content:options.replaceOpening ? '' : 'new ticket'},
+    codexAppApplicationContext:undefined,codexAppMessageContext:undefined,attachments:[],
+    substituteTrigger:undefined,shouldSendSubstituteControlCard:false,
+    autoCreateSender:{openId:'ou_real_sender',type:'user'},codexAppSteerable:false,
+    ownerOpenId:'ou_real_sender',
+    threadTrustedCaller:verifiedCaller,
+  }) : newTopic({
     session: {sessionId:'test-session', status:'active', cliId:'codex', createdAt:new Date().toISOString(),
       replyTargets: {[turnId]: {senderOpenId:'ou_real_sender'}}},
     larkAppId:'test-app',chatId:'test-chat',chatType:'p2p',scope:'thread',now:Date.now(),
@@ -224,5 +244,11 @@ describe('new topic caller through auto worktree and Lark user gateway', () => {
   });
   it('does not fork after the pending session is taken over', async () => {
     await runCase('takeover', {takeover:true});
+  });
+  it('keeps the first human caller when a thread reply auto-creates the session', async () => {
+    await runCase('auto-create worktree', {autoCreate:true});
+  });
+  it('denies an auto-created turn that has no trusted caller', async () => {
+    await runCase('auto-create callerless', {autoCreate:true, anonymous:true});
   });
 });

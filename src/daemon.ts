@@ -28373,6 +28373,10 @@ async function handleThreadReplyAdmitted(
       pendingSubstituteTrigger: substituteTrigger,
       pendingSubstituteControlCard: shouldSendSubstituteControlCard,
       pendingSender: autoCreateSender,
+      // The auto-worktree / repo-picker deferred fork can only read caller
+      // state off this ds literal; the pinned twin below passes
+      // threadTrustedCaller explicitly to forkReservedInitialSession.
+      pendingTrustedCaller: threadTrustedCaller,
       // R5-B1-1: freeze the plain-human steer authorization into the new-topic
       // opening metadata. buildReservedInitialInput COPIES this onto the built
       // opening payload; forkReservedInitialSession never infers it (that shared
