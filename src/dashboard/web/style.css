@@ -35451,3 +35451,48 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .sessions-page .sessions-filter-chips .sessions-filter-clear:hover {
   text-decoration: underline;
 }
+
+/* 撤回区域使用独立滚动列表，避免撑长群管理面板或影响其它页面的表单样式。 */
+.group-message-recall {
+  display: grid; gap: 16px; padding: 20px;
+  border: 1px solid var(--border-soft); border-radius: var(--radius-lg);
+  background: var(--surface); color: var(--fg); font-size: 13px;
+}
+.group-recall-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.group-recall-heading h4 { margin: 0; font-size: 15px; font-weight: 700; line-height: 1.4; }
+.group-recall-heading p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.group-recall-count { flex: none; padding: 4px 8px; border-radius: var(--radius-sm); background: var(--surface-muted); color: var(--muted); font-size: 11px; white-space: nowrap; }
+.group-recall-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+.group-recall-toolbar .group-recall-picker { display: grid; flex: 1 1 180px; gap: 7px; margin: 0; max-width: 280px; color: var(--muted); font-size: 12px; }
+.group-recall-toolbar select { width: 100%; min-width: 0; height: 34px; margin: 0; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); color: var(--fg); font: inherit; }
+.group-message-recall button { min-height: 32px; border-radius: var(--radius-md); font-size: 12px; }
+.group-recall-refresh { flex: none; }
+.group-recall-selection { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
+.group-recall-selection .group-recall-select-all { display: inline-flex; align-items: center; gap: 8px; margin: 0; padding: 0; border: none; border-radius: 0; background: none; color: var(--fg); font-size: 12px; font-weight: 500; cursor: pointer; }
+.group-recall-select-all input, .group-recall-list > li > input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); flex: none; }
+.group-message-recall button.group-recall-submit { border-color: var(--danger); background: var(--danger); color: var(--on-danger); }
+.group-message-recall button.group-recall-submit:disabled { border-color: var(--border); background: var(--surface-muted); color: var(--faint); opacity: 1; }
+.group-recall-list { display: grid; gap: 8px; max-height: min(52vh, 480px); overflow: auto; list-style: none; padding: 0; margin: 0; scrollbar-gutter: stable; }
+.group-recall-list > li { display: flex; align-items: flex-start; gap: 12px; padding: 14px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface-muted); transition: border-color .12s, background .12s; }
+.group-recall-list > li.selected { border-color: var(--accent-border, var(--accent)); background: var(--accent-soft); }
+.group-recall-list > li > input { margin-top: 3px; }
+.group-recall-message { min-width: 0; flex: 1; }
+.group-recall-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 20px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.group-recall-meta strong { color: var(--fg); font-size: 12px; font-weight: 650; }
+.group-recall-meta time { font-variant-numeric: tabular-nums; }
+.group-recall-message pre { margin: 9px 0 0; max-height: 150px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; font-size: 13px; line-height: 1.65; background: transparent; padding: 0; color: var(--fg); }
+.group-recall-list > li.recalled { background: transparent; }
+.group-recall-badge { padding: 2px 6px; border-radius: 4px; background: var(--surface-muted); color: var(--faint); font-size: 10px; }
+.group-message-recall button.group-recall-thread { margin-left: auto; padding: 0; min-height: 20px; border: none; background: none; color: var(--accent); font-size: 11px; font-weight: 500; }
+.group-recall-results { padding: 12px; border: 1px solid var(--accent-border, var(--border)); border-radius: var(--radius-md); background: var(--accent-soft); overflow-wrap: anywhere; font-size: 12px; }
+.group-recall-results p { margin: 6px 0 0; color: var(--muted); }
+.group-message-recall .group-recall-note { margin: 0; color: var(--faint); font-size: 11px; line-height: 1.6; }
+.group-message-recall > .empty { padding: 32px 12px; margin: 0; text-align: center; color: var(--muted); border: 1px dashed var(--border); border-radius: var(--radius-md); }
+@media (max-width: 600px) {
+  .group-message-recall { padding: 14px; gap: 14px; }
+  .group-recall-heading { align-items: center; }
+  .group-recall-toolbar .group-recall-picker { max-width: none; }
+  .group-recall-list > li { padding: 11px; gap: 9px; }
+  .group-recall-meta { gap: 5px 8px; }
+  .group-recall-meta time { font-size: 10px; }
+}
