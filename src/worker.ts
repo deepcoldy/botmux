@@ -656,10 +656,18 @@ import {
 import {
   TraexAutoModelController,
   resolveTraexAutoModelSettings,
+  resolveTraexAutoModelRuntimeSettings,
+  traexAutoModelPreflightEnabled,
   validTraexAutoModelRuntime,
+  TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
+  TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
   type TraexAutoModelAction,
+  type TraexAutoModelPreflightDecision,
 } from './services/traex-auto-model.js';
-import { readTraexModelLoads } from './services/traex-model-load.js';
+import {
+  readTraexModelLoadSnapshot,
+  type TraexModelLoadSnapshot,
+} from './services/traex-model-load.js';
 import { readTraexModelQuotas, TRAEX_QUOTA_ERROR_CODE } from './services/traex-quota.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
@@ -2986,6 +2994,8 @@ let traexAutoModelController: TraexAutoModelController | null = null;
 let traexAutoModelSwitching = false;
 let traexAutoModelTurnReplayForbidden = false;
 let traexQuotaPending: { turnId: string; failedTurn?: CodexPendingTurn } | undefined;
+let traexAutoModelPreflightPending: { item: PendingCliInput; generation: number; startedAtMs: number } | undefined;
+let traexAutoModelReasoningEfforts = new Map<string, readonly import('./services/codex-reasoning-effort.js').CodexReasoningEffort[]>();
 
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
  *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
@@ -4766,6 +4776,90 @@ const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => 
   send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
 });
 
+function rememberTraexModelLoadSnapshot(snapshot: TraexModelLoadSnapshot | null): void {
+  if (!snapshot) return;
+  traexAutoModelReasoningEfforts = new Map(snapshot.reasoningEfforts);
+}
+
+function applyTraexAutoModelSettings(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  controller: TraexAutoModelController,
+  model: string,
+): void {
+  const inherited = controller.sharedSettings ?? cfg;
+  const configured = resolveTraexAutoModelSettings(controller.config, model, inherited);
+  const settings = resolveTraexAutoModelRuntimeSettings(
+    controller.config,
+    model,
+    inherited,
+    traexAutoModelReasoningEfforts.get(model.toLowerCase()),
+  );
+  if (traexAutoModelPreflightEnabled(controller.config)
+    && configured.reasoningEffort !== settings.reasoningEffort) {
+    log(`TraeX preflight reasoning normalized model=${model} from=${configured.reasoningEffort ?? 'native'} to=${settings.reasoningEffort}`);
+  }
+  cfg.model = model;
+  cfg.reasoningEffort = settings.reasoningEffort;
+  cfg.modelBackendVariant = settings.modelBackendVariant;
+  if (lastInitConfig && lastInitConfig !== cfg) {
+    lastInitConfig.model = model;
+    lastInitConfig.reasoningEffort = settings.reasoningEffort;
+    lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
+  }
+}
+
+function logTraexPreflightDecision(
+  decision: TraexAutoModelPreflightDecision,
+  durationMs: number,
+  threshold: number,
+  phase: 'cold_start' | 'idle_turn',
+): void {
+  const from = decision.kind === 'switch' ? decision.fromModel : decision.model;
+  const to = decision.kind === 'switch' ? decision.toModel : decision.model;
+  const checkedLoad = decision.kind === 'keep'
+    ? decision.checkedLoadPercent
+    : decision.checkedLoadPercent;
+  const selectedLoad = decision.kind === 'keep'
+    ? decision.loadPercent
+    : decision.loadPercent;
+  log(
+    `TraeX preflight phase=${phase} from=${from} to=${to} checked=${decision.checkedModel} `
+    + `load=${checkedLoad ?? 'unknown'} selected_load=${selectedLoad ?? 'unknown'} `
+    + `threshold=${threshold} reason=${decision.reason} duration_ms=${durationMs}`,
+  );
+}
+
+function notifyTraexPreflightDecision(
+  decision: TraexAutoModelPreflightDecision,
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  if (decision.kind === 'keep') return;
+  send({
+    type: 'user_notify',
+    ...(turnId ? { turnId } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    message: decision.kind === 'hold'
+      ? t('worker.traex_auto_model.preflight_hold', {
+          model: decision.model,
+          load: decision.loadPercent,
+          threshold: traexAutoModelController?.config.overloadThresholdPercent
+            ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
+        })
+      : t(decision.reason === 'preflight_lowest_load'
+        ? 'worker.traex_auto_model.preflight_lowest_load'
+        : 'worker.traex_auto_model.preflight_switch', {
+          fromModel: decision.fromModel,
+          checkedModel: decision.checkedModel,
+          fromLoad: decision.checkedLoadPercent,
+          toModel: decision.toModel,
+          load: decision.loadPercent ?? '?',
+          threshold: traexAutoModelController?.config.overloadThresholdPercent
+            ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
+        }),
+  });
+}
+
 function configureTraexAutoModel(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
 ): void {
@@ -4800,21 +4894,14 @@ function configureTraexAutoModel(
     : null;
   traexAutoModelSwitching = false;
   traexQuotaPending = undefined;
+  traexAutoModelPreflightPending = undefined;
   traexAutoModelTurnReplayForbidden = cfg.atMostOnce === true;
   if (traexAutoModelController) {
     if (restoreRuntime) {
       deliveredPluginSkillCatalogFingerprint = restoreRuntime.skillCatalogFingerprint;
     }
     const model = traexAutoModelController.currentModel();
-    const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, model, traexAutoModelController.sharedSettings ?? cfg);
-    cfg.model = model;
-    cfg.reasoningEffort = settings.reasoningEffort;
-    cfg.modelBackendVariant = settings.modelBackendVariant;
-    if (lastInitConfig && lastInitConfig !== cfg) {
-      lastInitConfig.model = model;
-      lastInitConfig.reasoningEffort = settings.reasoningEffort;
-      lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
-    }
+    applyTraexAutoModelSettings(cfg, traexAutoModelController, model);
   }
   if (traexAutoModelController
     && traexAutoModelController.config.trigger !== 'quota'
@@ -4823,6 +4910,54 @@ function configureTraexAutoModel(
     && cfg.dispatchAttempt === undefined) {
     traexAutoModelController.beginTurn(cfg.turnId);
   }
+}
+
+async function preflightTraexAutoModelBeforeSpawn(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  options: { willReattachPersistent: boolean; restartCause?: CliRestartCause },
+): Promise<void> {
+  const controller = traexAutoModelController;
+  if (!controller || !traexAutoModelRuntimeEligible()
+    || !traexAutoModelPreflightEnabled(controller.config)
+    || !cfg.prompt || !cfg.turnId
+    || options.willReattachPersistent
+    || options.restartCause === 'traex-auto-model'
+    || !cliAdapter) return;
+
+  const startedAtMs = Date.now();
+  let snapshot: TraexModelLoadSnapshot | null = null;
+  try {
+    snapshot = await readTraexModelLoadSnapshot({
+      cliBin: cliAdapter.resolvedBin,
+      cwd: cfg.workingDir,
+      timeoutMs: controller.config.preflightTimeoutMs
+        ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
+      env: {
+        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset),
+        ...botInjectedEnv(cfg.env, cfg.envPolicy),
+      },
+    });
+  } catch (error) {
+    log(`TraeX preflight load query failed before spawn: ${String(error)}`);
+  }
+  rememberTraexModelLoadSnapshot(snapshot);
+  const decision = controller.preflightDecision(cfg.turnId, snapshot?.loads ?? null, {
+    preferFirstModel: controller.config.reselectPerTurn === true,
+  });
+  const threshold = controller.config.overloadThresholdPercent
+    ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
+  logTraexPreflightDecision(decision, Date.now() - startedAtMs, threshold, 'cold_start');
+
+  if (decision.kind === 'switch') {
+    if (!controller.commitSwitch(decision)) {
+      log(`TraeX preflight switch refused before spawn; keeping ${controller.currentModel()}`);
+      controller.beginTurn(cfg.turnId, { retainCurrentModel: true });
+    }
+  } else {
+    controller.beginTurn(cfg.turnId, { retainCurrentModel: true });
+  }
+  applyTraexAutoModelSettings(cfg, controller, controller.currentModel());
+  notifyTraexPreflightDecision(decision, cfg.turnId, cfg.dispatchAttempt);
 }
 
 function traexAutoModelRuntimeEligible(): boolean {
@@ -4858,7 +4993,7 @@ function enqueueTraexAutoModelRecovery(turnId: string): boolean {
 
 function executeTraexAutoModelSwitch(
   action: Extract<TraexAutoModelAction, { kind: 'switch' }>,
-  opts: { resumeCurrentTurn: boolean },
+  opts: { resumeCurrentTurn: boolean; dispatchAttempt?: number },
 ): boolean {
   if (!traexAutoModelRuntimeEligible()
     || traexAutoModelSwitching
@@ -4878,24 +5013,28 @@ function executeTraexAutoModelSwitch(
   }
 
   lastInitConfig.model = action.toModel;
-  const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, action.toModel,
-    traexAutoModelController.sharedSettings ?? lastInitConfig);
-  // Handwritten shared settings, like per-model settings, are syntax-checked
-  // at load time; the live CLI catalog may support efforts absent locally.
-  lastInitConfig.reasoningEffort = settings.reasoningEffort;
-  lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
+  applyTraexAutoModelSettings(lastInitConfig, traexAutoModelController, action.toModel);
   // Native resume owns the original ask. Retire its transport replay before
   // teardown can synchronously call onCliExit and stash it ahead of recovery.
   inflightInputs.retireTurn(action.turnId);
   traexAutoModelSwitching = true;
+  const preflightAction = action.reason === 'preflight_available'
+    || action.reason === 'preflight_lowest_load'
+    ? action as Extract<TraexAutoModelPreflightDecision, { kind: 'switch' }>
+    : undefined;
   send({
     type: 'user_notify',
     turnId: action.turnId,
+    ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     message: t(
       action.reason === 'quota_exhausted'
         ? 'worker.traex_auto_model.quota_switch'
         : action.reason === 'new_turn' && traexAutoModelController.config.trigger === 'quota'
           ? 'worker.traex_auto_model.quota_preference'
+        : action.reason === 'preflight_available'
+          ? 'worker.traex_auto_model.preflight_switch'
+          : action.reason === 'preflight_lowest_load'
+            ? 'worker.traex_auto_model.preflight_lowest_load'
         : action.reason === 'capacity_timeout'
         ? 'worker.traex_auto_model.capacity_switch'
         : action.reason === 'queued_backup'
@@ -4912,6 +5051,10 @@ function executeTraexAutoModelSwitch(
         toModel: action.toModel,
         position: action.queuePosition ?? '?',
         load: action.loadPercent ?? '?',
+        checkedModel: preflightAction?.checkedModel ?? action.fromModel,
+        fromLoad: preflightAction?.checkedLoadPercent ?? action.loadPercent ?? '?',
+        threshold: traexAutoModelController.config.overloadThresholdPercent
+          ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
         seconds: Math.round(
           (traexAutoModelController?.config.queueTimeoutMs ?? 0) / 1_000,
         ),
@@ -4967,11 +5110,11 @@ function observeTraexAutoModelCapacity(screen: string): void {
     const target = backend;
     const generation = cliSpawnGeneration;
     const config = lastInitConfig;
-    void readTraexModelLoads({
+    void readTraexModelLoadSnapshot({
       cliBin: cliAdapter!.resolvedBin,
       cwd: config.workingDir,
       env: { ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset), ...botInjectedEnv(config.env, config.envPolicy) },
-    }).then(loads => {
+    }).then(snapshot => {
       const active = activeTurnAuthority.snapshot();
       if (backend !== target || generation !== cliSpawnGeneration
         || controller !== traexAutoModelController || cliRestartInProgress
@@ -4983,7 +5126,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
         if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
         return;
       }
-      const choice = controller.resolveModelLoads(action.turnId, loads);
+      rememberTraexModelLoadSnapshot(snapshot);
+      const choice = controller.resolveModelLoads(action.turnId, snapshot?.loads ?? null);
       if (choice.kind === 'switch') executeTraexAutoModelSwitch(choice, { resumeCurrentTurn: true });
       else if (choice.kind === 'exhausted') {
         publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
@@ -5017,15 +5161,73 @@ function observeTraexAutoModelCapacity(screen: string): void {
   }
 }
 
+function currentTraexLoadSnapshot(timeoutMs: number): Promise<TraexModelLoadSnapshot | null> {
+  if (!cliAdapter || !lastInitConfig) return Promise.resolve(null);
+  const config = lastInitConfig;
+  return readTraexModelLoadSnapshot({
+    cliBin: cliAdapter.resolvedBin,
+    cwd: config.workingDir,
+    timeoutMs,
+    env: {
+      ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset),
+      ...botInjectedEnv(config.env, config.envPolicy),
+    },
+  });
+}
+
+function selectTraexCapacityModelBeforeTurn(head: PendingCliInput): boolean {
+  const controller = traexAutoModelController;
+  if (!controller || !head.turnId || head.traexAutoModelPreflightDone) return false;
+  const token = { item: head, generation: cliSpawnGeneration, startedAtMs: Date.now() };
+  traexAutoModelPreflightPending = token;
+  void currentTraexLoadSnapshot(controller.config.preflightTimeoutMs
+    ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS)
+    .catch(error => {
+      log(`TraeX preflight load query failed before idle turn: ${String(error)}`);
+      return null;
+    })
+    .then(snapshot => {
+      if (traexAutoModelPreflightPending !== token) return;
+      traexAutoModelPreflightPending = undefined;
+      if (controller !== traexAutoModelController
+        || token.generation !== cliSpawnGeneration
+        || pendingMessages[0] !== head
+        || !isPromptReady
+        || cliRestartInProgress
+        || activeTurnAuthority.snapshot()?.started) {
+        void flushPending();
+        return;
+      }
+      rememberTraexModelLoadSnapshot(snapshot);
+      const decision = controller.preflightDecision(head.turnId!, snapshot?.loads ?? null, {
+        preferFirstModel: controller.config.reselectPerTurn === true,
+      });
+      const threshold = controller.config.overloadThresholdPercent
+        ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
+      logTraexPreflightDecision(decision, Date.now() - token.startedAtMs, threshold, 'idle_turn');
+      head.traexAutoModelPreflightDone = true;
+      if (decision.kind === 'switch'
+        && executeTraexAutoModelSwitch(decision, {
+          resumeCurrentTurn: false,
+          ...(head.dispatchAttempt !== undefined ? { dispatchAttempt: head.dispatchAttempt } : {}),
+        })) return;
+      controller.beginTurn(head.turnId!, { retainCurrentModel: true });
+      if (lastInitConfig) applyTraexAutoModelSettings(lastInitConfig, controller, controller.currentModel());
+      notifyTraexPreflightDecision(decision, head.turnId, head.dispatchAttempt);
+      void flushPending();
+    });
+  return true;
+}
+
 /** A busy follow-up steers the current model. Only an idle, independent turn
  * may opt into a preferred-model reset. Capacity rotation retains its queue. */
 function resetTraexAutoModelBeforePendingTurn(): boolean {
   const controller = traexAutoModelController;
   const head = pendingMessages[0];
   if (!controller || !traexAutoModelRuntimeEligible() || !head?.turnId
-    || head.dispatchAttempt !== undefined || head.traexAutoModelRecovery
+    || head.traexAutoModelRecovery || head.noReplay === true
     || controller.currentTurnId() === head.turnId) return false;
-  if (traexAutoModelSwitching || traexQuotaPending) return true;
+  if (traexAutoModelSwitching || traexQuotaPending || traexAutoModelPreflightPending) return true;
   // Type-ahead steers the turn that currently owns the CLI. Once a structured
   // terminal has released that turn (no active authority) but the PTY composer
   // has not been re-observed yet, the queued message is an independent turn —
@@ -5040,6 +5242,12 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
     && queuedTypeAheadTurns.length === 0) return true;
   if (!isPromptReady) return traexAutoModelInputHold();
   if (controller.config.trigger === 'quota') return selectTraexQuotaModelBeforeTurn(head);
+  if (traexAutoModelPreflightEnabled(controller.config)) {
+    if (!head.traexAutoModelPreflightDone) return selectTraexCapacityModelBeforeTurn(head);
+    controller.beginTurn(head.turnId, { retainCurrentModel: true });
+    return false;
+  }
+  if (head.dispatchAttempt !== undefined) return false;
   if (!controller.config.reselectPerTurn || controller.currentModelIndex() === 0) return false;
   // commitSwitch can only be reached through executeTraexAutoModelSwitch,
   // which requires the exact native id before advancing the pool index.
@@ -22845,6 +23053,14 @@ async function spawnCli(
   }
   ompRetiredTranscriptPaths.clear();
   ebsdRetiredTranscriptPaths.clear();
+
+  // A cold/new independent TraeX turn must choose its real model before
+  // buildArgs freezes --model / effort / variant. Persistent reattach keeps the
+  // already-running pane untouched; failures retain the configured model.
+  await preflightTraexAutoModelBeforeSpawn(cfg, {
+    willReattachPersistent,
+    restartCause: opts.restartCause,
+  });
 
   // ttadk 网关：模型走 ttadk 自己的 `-m`（启动期注入到 ttadk 前缀，见下方 wrapperCli
   // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。

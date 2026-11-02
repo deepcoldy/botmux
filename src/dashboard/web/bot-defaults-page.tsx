@@ -108,7 +108,7 @@ import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings, type Trae
 import { TraexAutoModelEditor } from './traex-auto-model-editor.js';
 import {
   autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
-  strongestTraexModelSettings, type TraexAutoModelDraft,
+  strongestTraexModelSettings, strongestTraexPreflightModelSettings, type TraexAutoModelDraft,
 } from './traex-auto-model-preferences.js';
 import { AGENT_SECTIONS } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
@@ -2413,6 +2413,11 @@ export function BotAgentSection(props: {
   const [autoModelEnabled, setAutoModelEnabled] = useState(autoDraftRef.current.enabled);
   const [autoReselectPerTurn, setAutoReselectPerTurn] = useState(autoDraftRef.current.reselectPerTurn);
   const [autoTrigger, setAutoTrigger] = useState(autoDraftRef.current.trigger ?? 'capacity');
+  const [autoPreflightLoadCheck, setAutoPreflightLoadCheck] = useState(autoDraftRef.current.preflightLoadCheck === true);
+  const [autoOverloadThresholdPercent, setAutoOverloadThresholdPercent] = useState(autoDraftRef.current.overloadThresholdPercent ?? '100');
+  const [autoPreflightTimeoutSeconds, setAutoPreflightTimeoutSeconds] = useState(autoDraftRef.current.preflightTimeoutSeconds ?? '8');
+  const [autoUnknownLoadPolicy, setAutoUnknownLoadPolicy] = useState<'skip'>(autoDraftRef.current.unknownLoadPolicy ?? 'skip');
+  const [autoAllOverloadedPolicy, setAutoAllOverloadedPolicy] = useState<'lowest_load'>(autoDraftRef.current.allOverloadedPolicy ?? 'lowest_load');
   const [autoModelTouched, setAutoModelTouched] = useState(!!initialAutoDraft.current);
   const [autoModels, setAutoModels] = useState(autoDraftRef.current.models);
   const [autoModelSettings, setAutoModelSettings] = useState(autoDraftRef.current.modelSettings);
@@ -2431,6 +2436,11 @@ export function BotAgentSection(props: {
     setAutoModelEnabled(draft.enabled);
     setAutoReselectPerTurn(draft.reselectPerTurn);
     setAutoTrigger(draft.trigger ?? 'capacity');
+    setAutoPreflightLoadCheck(draft.preflightLoadCheck === true);
+    setAutoOverloadThresholdPercent(draft.overloadThresholdPercent ?? '100');
+    setAutoPreflightTimeoutSeconds(draft.preflightTimeoutSeconds ?? '8');
+    setAutoUnknownLoadPolicy(draft.unknownLoadPolicy ?? 'skip');
+    setAutoAllOverloadedPolicy(draft.allOverloadedPolicy ?? 'lowest_load');
     setAutoModels(draft.models);
     setAutoModelSettings(draft.modelSettings);
     setAutoTimeoutSeconds(draft.timeoutSeconds);
@@ -2717,16 +2727,38 @@ export function BotAgentSection(props: {
     }
     const trimmedNativeModel = nativeModel.trim();
     const saveCliId = selectedAgentCliId(cliKey);
+    const overloadThresholdPercent = autoOverloadThresholdPercent.trim() === ''
+      ? 100 : Number(autoOverloadThresholdPercent);
+    const preflightTimeoutSeconds = autoPreflightTimeoutSeconds.trim() === ''
+      ? 8 : Number(autoPreflightTimeoutSeconds);
+    const preflightTimeoutMs = Math.round(preflightTimeoutSeconds * 1_000);
+    if (autoModelEnabled && autoPreflightLoadCheck
+      && (!Number.isInteger(overloadThresholdPercent) || overloadThresholdPercent < 0
+        || overloadThresholdPercent > 65_535 || !Number.isFinite(preflightTimeoutSeconds)
+        || preflightTimeoutSeconds < 0.1 || preflightTimeoutSeconds > 30)) {
+      setAgentStatus({ text: `✗ ${tr('botDefaults.autoModelInvalid')}` });
+      return;
+    }
     const autoConfig = normalizeTraexAutoModelConfig(autoModelEnabled ? {
       enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
       trigger: autoTrigger,
+      preflightLoadCheck: autoPreflightLoadCheck,
+      overloadThresholdPercent,
+      preflightTimeoutMs,
+      unknownLoadPolicy: autoUnknownLoadPolicy,
+      allOverloadedPolicy: autoAllOverloadedPolicy,
       reselectPerTurn: autoReselectPerTurn,
       switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
       previousSettings: previousAutoSettings.current,
-      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => [model,
-        resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
-          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined }),
-      ])),
+      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => {
+        const configured = resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
+          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined });
+        const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
+        const requiredEffort = strongestTraexPreflightModelSettings(model, capability).reasoningEffort;
+        return [model, autoPreflightLoadCheck && requiredEffort
+          ? { ...configured, reasoningEffort: requiredEffort }
+          : configured];
+      })),
     } : null);
     if (saveCliId === 'traex' && autoConfig.error) {
       setAgentStatus({ text: `✗ ${tr('botDefaults.autoModelInvalid')}` });
@@ -3281,7 +3313,18 @@ export function BotAgentSection(props: {
         <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
           reselectPerTurn={autoReselectPerTurn}
           trigger={autoTrigger}
-          onTrigger={trigger => editAutoDraft({ trigger })}
+          preflightLoadCheck={autoPreflightLoadCheck}
+          overloadThresholdPercent={autoOverloadThresholdPercent}
+          preflightTimeoutSeconds={autoPreflightTimeoutSeconds}
+          unknownLoadPolicy={autoUnknownLoadPolicy}
+          allOverloadedPolicy={autoAllOverloadedPolicy}
+          onTrigger={trigger => editAutoDraft({ trigger,
+            ...(trigger === 'quota' ? { preflightLoadCheck: false } : {}) })}
+          onPreflightLoadCheck={enabled => editAutoDraft({ preflightLoadCheck: enabled })}
+          onOverloadThresholdPercent={value => editAutoDraft({ overloadThresholdPercent: value })}
+          onPreflightTimeoutSeconds={value => editAutoDraft({ preflightTimeoutSeconds: value })}
+          onUnknownLoadPolicy={value => editAutoDraft({ unknownLoadPolicy: value })}
+          onAllOverloadedPolicy={value => editAutoDraft({ allOverloadedPolicy: value })}
           onReselectPerTurn={enabled => editAutoDraft({ reselectPerTurn: enabled })}
           modelSettings={autoModelSettings} capabilities={detectedModels?.modelCapabilities}
           timeoutSeconds={autoTimeoutSeconds} cooldownSeconds={autoCooldownSeconds}

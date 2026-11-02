@@ -7,6 +7,9 @@ import {
   resolveTraexAutoModelSettings,
   validTraexAutoModelRuntime,
   traexAutoModelPolicyKey,
+  strongestTraexPreflightReasoningEffort,
+  TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
+  TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
 } from '../src/services/traex-auto-model.js';
 
 describe('normalizeTraexAutoModelConfig', () => {
@@ -58,6 +61,32 @@ describe('normalizeTraexAutoModelConfig', () => {
     expect(resolveTraexAutoModelSettings(parsed.config!, 'model-49', { reasoningEffort: 'high', modelBackendVariant: 'max' })).toEqual({});
     expect(normalizeTraexAutoModelConfig({ enabled: true, models, modelSettings: { outside: {} } }).error).toContain('invalid model entry');
   });
+  it('keeps preflight off for legacy configs and strictly normalizes its enabled contract', () => {
+    const legacy = normalizeTraexAutoModelConfig({ enabled: true, models: ['m1'] }).config!;
+    expect(legacy.preflightLoadCheck).toBeUndefined();
+    const enabled = normalizeTraexAutoModelConfig({
+      enabled: true, models: ['m1'], preflightLoadCheck: true,
+    }).config!;
+    expect(enabled).toMatchObject({
+      preflightLoadCheck: true,
+      overloadThresholdPercent: TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
+      preflightTimeoutMs: TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
+      unknownLoadPolicy: 'skip',
+      allOverloadedPolicy: 'lowest_load',
+    });
+    expect(traexAutoModelPolicyKey(legacy)).toBe(traexAutoModelPolicyKey({ ...legacy, preflightLoadCheck: false }));
+    expect(traexAutoModelPolicyKey(legacy)).not.toBe(traexAutoModelPolicyKey(enabled));
+  });
+  it.each([
+    [{ preflightLoadCheck: 'yes' }, 'boolean'],
+    [{ preflightLoadCheck: true, overloadThresholdPercent: -1 }, 'overloadThresholdPercent'],
+    [{ preflightLoadCheck: true, preflightTimeoutMs: 99 }, 'preflightTimeoutMs'],
+    [{ preflightLoadCheck: true, unknownLoadPolicy: 'try' }, 'unknownLoadPolicy'],
+    [{ preflightLoadCheck: true, allOverloadedPolicy: 'first' }, 'allOverloadedPolicy'],
+    [{ preflightLoadCheck: true, trigger: 'quota' }, 'capacity mode'],
+  ])('rejects invalid preflight config %j', (extra, fragment) => {
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['m1'], ...extra }).error).toContain(fragment);
+  });
   it('round-trips a normal settings snapshot outside the pool without changing runtime policy', () => {
     const config = { enabled: true as const, models: ['pool-model'], queueTimeoutMs: 30_000 };
     const previousSettings = { model: 'normal-model', reasoningEffort: 'xhigh', modelBackendVariant: 'standard' };
@@ -106,6 +135,66 @@ describe('TraexAutoModelController', () => {
     expect(controller.observeCapacityQueue({ turnId, queued: true, nowMs: nowMs + 10_000 }).kind).toBe('load_check');
     return controller.resolveModelLoads(turnId, loads);
   }
+
+  describe('independent-turn load preflight', () => {
+    const preflight = { ...config, preflightLoadCheck: true as const,
+      overloadThresholdPercent: 100, preflightTimeoutMs: 8_000,
+      unknownLoadPolicy: 'skip' as const, allOverloadedPolicy: 'lowest_load' as const };
+
+    it('keeps 100%, switches at 101%, and preserves pool order over a lighter later model', () => {
+      const atBoundary = new TraexAutoModelController(preflight);
+      expect(atBoundary.preflightDecision('turn', new Map([
+        ['core', 100], ['backup-1', 1], ['backup-2', 0],
+      ]))).toMatchObject({ kind: 'keep', reason: 'within_threshold', model: 'core', loadPercent: 100 });
+
+      const overloaded = new TraexAutoModelController(preflight);
+      const decision = overloaded.preflightDecision('turn', new Map([
+        ['core', 101], ['backup-1', 100], ['backup-2', 20],
+      ]));
+      expect(decision).toMatchObject({ kind: 'switch', reason: 'preflight_available',
+        fromModel: 'core', toModel: 'backup-1', toIndex: 1, loadPercent: 100 });
+      expect(overloaded.currentModel()).toBe('core');
+      if (decision.kind === 'switch') expect(overloaded.commitSwitch(decision)).toBe(true);
+      expect(overloaded.currentModel()).toBe('backup-1');
+    });
+
+    it('skips unknown candidates, fails open for an unknown checked model, and honors a custom threshold', () => {
+      const controller = new TraexAutoModelController({ ...preflight, overloadThresholdPercent: 120 });
+      expect(controller.preflightDecision('turn', new Map([
+        ['core', 121], ['backup-2', 120],
+      ]))).toMatchObject({ kind: 'switch', toModel: 'backup-2', loadPercent: 120 });
+      expect(new TraexAutoModelController(preflight).preflightDecision('turn', new Map([
+        ['backup-1', 10],
+      ]))).toMatchObject({ kind: 'keep', reason: 'load_unavailable', model: 'core' });
+    });
+
+    it('chooses the lowest known overload with stable pool-order ties and holds when already there', () => {
+      const controller = new TraexAutoModelController(preflight);
+      expect(controller.preflightDecision('turn', new Map([
+        ['core', 180], ['backup-1', 120], ['backup-2', 120],
+      ]))).toMatchObject({ kind: 'switch', reason: 'preflight_lowest_load',
+        toModel: 'backup-1', toIndex: 1, loadPercent: 120 });
+      controller.observeRunningModel('backup-1');
+      expect(controller.preflightDecision('turn', new Map([
+        ['core', 180], ['backup-1', 120], ['backup-2', 120],
+      ]))).toMatchObject({ kind: 'hold', reason: 'lowest_load', model: 'backup-1', loadPercent: 120 });
+
+      controller.observeRunningModel('backup-2');
+      expect(controller.preflightDecision('turn', new Map([
+        ['core', 130], ['backup-1', 120], ['backup-2', 120],
+      ]))).toMatchObject({ kind: 'switch', reason: 'preflight_lowest_load',
+        toModel: 'backup-1', toIndex: 1, loadPercent: 120 });
+    });
+
+    it('uses the preferred first model only for independent-turn reselection', () => {
+      const controller = new TraexAutoModelController(preflight);
+      controller.observeRunningModel('backup-1');
+      expect(controller.preflightDecision('turn', new Map([
+        ['core', 100], ['backup-1', 20], ['backup-2', 0],
+      ]), { preferFirstModel: true })).toMatchObject({ kind: 'switch',
+        checkedModel: 'core', fromModel: 'backup-1', toModel: 'core' });
+    });
+  });
 
   it('switches downward only after the configured queue duration', () => {
     const controller = new TraexAutoModelController(config);
@@ -530,6 +619,16 @@ describe('Auto policy setting presence', () => {
   it('distinguishes inherited settings from an explicit native-default entry', () => {
     const base = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 30_000 };
     expect(traexAutoModelPolicyKey(base)).not.toBe(traexAutoModelPolicyKey({ ...base, modelSettings: { backup: {} } }));
+  });
+});
+
+describe('preflight reasoning contract', () => {
+  it('uses max/xhigh when advertised and otherwise the model actual highest effort', () => {
+    expect(strongestTraexPreflightReasoningEffort('m1', ['low', 'xhigh', 'max'])).toBe('max');
+    expect(strongestTraexPreflightReasoningEffort('m2', ['low', 'high', 'xhigh', 'ultra'])).toBe('xhigh');
+    expect(strongestTraexPreflightReasoningEffort('m3', ['low', 'medium', 'high'])).toBe('high');
+    expect(strongestTraexPreflightReasoningEffort('future-model')).toBe('high');
+    expect(strongestTraexPreflightReasoningEffort('future-model', [])).toBeUndefined();
   });
 });
 
