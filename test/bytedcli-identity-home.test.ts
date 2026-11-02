@@ -13,7 +13,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   bytedcliTurnHome,
   canonicalPathNearest,
+  publishActiveTurn,
   recallProvenIdentityContent,
+  refreshSessionIdentity,
   renderIdentityEnv,
   renderIdentityWrapper,
   writeSessionIdentity,
@@ -92,6 +94,22 @@ describe('bytedcli per-person HOME', () => {
     expect(renderIdentityEnv({ tool: 'bytedcli', mode: 'denied', message: 'no' })).not.toContain('BOTMUX_IDENTITY_HOME');
     // The Codebase companion keeps its own (unchanged) shape.
     expect(recallProvenIdentityContent(dataDir(), SESSION, 'turn-1', 'codebase')).not.toContain('BOTMUX_IDENTITY_HOME');
+  });
+
+  it('a refresh of the same turn publishes the same HOME as the original publication', () => {
+    writeSessionIdentity(dataDir(), SESSION, {
+      tool: 'bytedcli', cloudJwt: 'jwt-a', openId: 'ou_alice', turnId: 'turn-r',
+    }, 'proven');
+    publishActiveTurn(dataDir(), SESSION, 'turn-r');
+    const before = recallProvenIdentityContent(dataDir(), SESSION, 'turn-r', 'bytedcli')!;
+    expect(refreshSessionIdentity(dataDir(), SESSION, {
+      tool: 'bytedcli', cloudJwt: 'jwt-a2', openId: 'ou_alice', turnId: 'turn-r',
+    }, 'proven')).toBe(true);
+    const after = recallProvenIdentityContent(dataDir(), SESSION, 'turn-r', 'bytedcli')!;
+    const homeOf = (body: string) => /BOTMUX_IDENTITY_HOME='([^']+)'/.exec(body)?.[1];
+    expect(after).toContain("BYTEDCLI_USER_CLOUD_JWT='jwt-a2'");
+    expect(homeOf(after)).toBe(homeOf(before));
+    expect(homeOf(after)).toBe(bytedcliTurnHome(dataDir(), SESSION, { openId: 'ou_alice' }));
   });
 
   it('the wrapper runs that exec with the person HOME and leaves the machine HOME untouched', () => {

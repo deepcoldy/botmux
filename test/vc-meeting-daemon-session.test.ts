@@ -6229,8 +6229,8 @@ describe('VC meeting daemon session lifecycle', () => {
     registerBot({
       larkAppId: AGENT_APP_ID,
       larkAppSecret: 'agent-secret',
-      name: 'Unsupported Gemini',
-      cliId: 'gemini',
+      name: 'Unsupported OpenCode',
+      cliId: 'opencode',
       sandbox: true,
       backendType: 'pty',
       workingDir: process.cwd(),
@@ -6246,7 +6246,7 @@ describe('VC meeting daemon session lifecycle', () => {
         meetingConsumer: {
           enabled: true,
           defaultMode: 'listenOnly',
-          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Unsupported Gemini' }],
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Unsupported OpenCode' }],
         },
       },
     });
@@ -6259,7 +6259,7 @@ describe('VC meeting daemon session lifecycle', () => {
       raw: { event: { meeting: { id: 'm_unsupported_terminal', meeting_no: '454545454' } } },
     });
 
-    const result = await selectConsumerAgentViaCard('Unsupported Gemini');
+    const result = await selectConsumerAgentViaCard('Unsupported OpenCode');
     expect(result.header.title.content).toBe('仅同步会议消息');
     expect(interactiveCardMarkdownContent(result)).toContain('选择 agent 失败，已回退只监听');
     expect(interactiveCardMarkdownContent(result)).toContain('reliable turn terminal contract');

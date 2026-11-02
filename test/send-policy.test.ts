@@ -10,6 +10,8 @@ import {
   mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
+  parseDiffFlag,
+  diffUsageError,
   parseUrgentFlag,
   urgentUsageError,
   managedVcQuoteError,
@@ -575,5 +577,26 @@ describe('outsidersForMembership', () => {
       new Set<string>(),
     );
     expect(out).toHaveLength(1);
+  });
+});
+
+describe('core --diff policy', () => {
+  it('parses absent, separate and equals values like other send flags', () => {
+    expect(parseDiffFlag(['hello'])).toEqual({ requested: false });
+    expect(parseDiffFlag(['--diff', '/tmp/有 空格.diff'])).toEqual({ requested: true, path: '/tmp/有 空格.diff' });
+    expect(parseDiffFlag(['--diff=/tmp/a.diff'])).toEqual({ requested: true, path: '/tmp/a.diff' });
+  });
+
+  it.each([['--diff'], ['--diff='], ['--diff', '--no-mention'], ['--diff', '-'], ['--diff', '/dev/stdin'], ['--diff=x', '--diff=y']].map(args => ({ args })))('rejects missing/ambiguous paths $args', ({ args }) => {
+    expect(parseDiffFlag(args)).toMatchObject({ requested: true, error: expect.any(String) });
+  });
+
+  it('rejects incompatible display modes without changing ordinary send', () => {
+    const defaults = { requested: true, customCardRequested: false, mediaRequested: false, voice: false, slash: false };
+    expect(diffUsageError(defaults)).toBeNull();
+    for (const option of ['customCardRequested', 'mediaRequested', 'voice', 'slash']) {
+      expect(diffUsageError({ ...defaults, [option]: true })).toEqual(expect.any(String));
+    }
+    expect(diffUsageError({ ...defaults, requested: false, mediaRequested: true })).toBeNull();
   });
 });

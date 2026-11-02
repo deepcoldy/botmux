@@ -1,3 +1,9 @@
+import {
+  botsInfoObjectEntries,
+  isBotsInfoNameEntry,
+  type BotsInfoObjectEntry,
+} from '../services/bots-info-shape.js';
+
 export interface HistoryMessage {
   messageId: string;
   senderId: string;
@@ -23,10 +29,24 @@ export interface HistoryBotMember {
 }
 
 export interface HistoryBotInfo {
-  larkAppId: string;
+  larkAppId?: string;
   botOpenId?: string | null;
   botName?: string | null;
   botAvatarUrl?: string | null;
+}
+
+/**
+ * App-id index tier for history enrichment. Deliberately NOT the shared
+ * isBotsInfoRouteEntry: it also accepts a MISSING botName key (undefined),
+ * which the IPC caller self-builds and hand-written files contain, while still
+ * rejecting truthy non-string names. Kept local so this contract cannot shift
+ * when the routing guard's own decisions change.
+ */
+type HistoryAppIndexEntry = BotsInfoObjectEntry & { larkAppId: string };
+
+function isHistoryAppIndexEntry(entry: BotsInfoObjectEntry): entry is HistoryAppIndexEntry {
+  return typeof entry.larkAppId === 'string' && entry.larkAppId.trim().length > 0
+    && (entry.botName == null || typeof entry.botName === 'string');
 }
 
 /**
@@ -40,16 +60,31 @@ export function enrichHistorySenders(
   messages: HistoryMessage[],
   humans: ReadonlyMap<string, HistoryHumanProfile | null>,
   botMembers: readonly HistoryBotMember[],
-  botInfos: readonly HistoryBotInfo[],
+  botInfos: unknown,
 ): Array<HistoryMessage & { senderName?: string; senderAvatar?: string; senderBotAppId?: string }> {
-  const infoByAppId = new Map(botInfos.filter(info => info.larkAppId).map(info => [info.larkAppId, info]));
+  const objectRows = botsInfoObjectEntries(botInfos);
+  const normalizeHistoryInfo = (info: BotsInfoObjectEntry): HistoryBotInfo => ({
+    ...(typeof info.larkAppId === 'string' && info.larkAppId.trim()
+      ? { larkAppId: info.larkAppId }
+      : {}),
+    ...(typeof info.botName === 'string' ? { botName: info.botName } : {}),
+    ...(typeof info.botOpenId === 'string' ? { botOpenId: info.botOpenId } : {}),
+    ...(typeof info.botAvatarUrl === 'string' ? { botAvatarUrl: info.botAvatarUrl } : {}),
+  });
+  const rowsForAppIndex = objectRows.filter(isHistoryAppIndexEntry);
+  const rowsForNameIndex = objectRows.filter(isBotsInfoNameEntry);
+  const infoByAppId = new Map<string, HistoryBotInfo>();
+  for (const info of rowsForAppIndex) {
+    infoByAppId.set(info.larkAppId, normalizeHistoryInfo(info));
+  }
   const infoByName = new Map<string, HistoryBotInfo>();
   const duplicateNames = new Set<string>();
-  for (const info of botInfos) {
-    const name = String(info.botName ?? '').trim();
+  for (const info of rowsForNameIndex) {
+    const normalized = normalizeHistoryInfo(info);
+    const name = typeof normalized.botName === 'string' ? normalized.botName.trim() : '';
     if (!name) continue;
     if (infoByName.has(name)) duplicateNames.add(name);
-    else infoByName.set(name, info);
+    else infoByName.set(name, normalized);
   }
   for (const name of duplicateNames) infoByName.delete(name);
 
@@ -70,12 +105,12 @@ export function enrichHistorySenders(
     const member = botByOpenId.get(message.senderId);
     const directInfo = infoByAppId.get(message.senderId);
     if (!member && directInfo) {
-      const name = String(directInfo.botName ?? '').trim();
+      const name = typeof directInfo.botName === 'string' ? directInfo.botName.trim() : '';
       return {
         ...message,
         ...(name ? { senderName: name } : {}),
         ...(directInfo.botAvatarUrl ? { senderAvatar: directInfo.botAvatarUrl } : {}),
-        senderBotAppId: directInfo.larkAppId,
+        ...(directInfo.larkAppId ? { senderBotAppId: directInfo.larkAppId } : {}),
       };
     }
     if (!member) return message;

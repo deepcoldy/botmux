@@ -33,7 +33,7 @@ export function defaultGatewayEntry(): GatewayEntry {
   // Canonicalize $HOME: on a symlinked-home host (/home/u → /data00/home/u) the
   // lexical path is written into the CLI's MCP config, but the file sandbox binds
   // only CANONICAL exec dirs — the lexical /home/u prefix doesn't exist in the
-  // bwrap root, so codex/gemini's `botmux mcp serve` launch fails with
+  // bwrap root, so codex/opencode's `botmux mcp serve` launch fails with
   // "No such file or directory" and MCP startup aborts. realpath the home root
   // so the command path lands on a bound dir. Same file off-sandbox, so it's a
   // safe no-op on non-symlinked hosts.

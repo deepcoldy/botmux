@@ -1,3 +1,5 @@
+import type { TraexQuotaEvidence } from './traex-quota.js';
+
 export const TRAEX_AUTO_MODEL_ID = 'auto';
 export const TRAEX_AUTO_MODEL_DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
 export const TRAEX_AUTO_MODEL_MIN_QUEUE_TIMEOUT_MS = 5_000;
@@ -16,6 +18,8 @@ export interface TraexAutoModelPreviousSettings extends TraexAutoModelSettings {
 export interface TraexAutoModelConfig {
   enabled: true;
   models: string[];
+  /** Omitted preserves the original capacity/queue policy. */
+  trigger?: 'capacity' | 'quota';
   /** Keys are concrete model ids. An explicit empty entry follows that model's
    * native defaults; absence preserves legacy shared settings. */
   modelSettings?: Record<string, TraexAutoModelSettings>;
@@ -50,6 +54,9 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
   }
   const value = raw as Record<string, unknown>;
   if (value.enabled !== true) return {};
+  if (value.trigger !== undefined && value.trigger !== 'capacity' && value.trigger !== 'quota') {
+    return { error: 'traexAutoModel.trigger must be capacity or quota' };
+  }
   if (!Array.isArray(value.models)) {
     return { error: 'traexAutoModel.models must be an array' };
   }
@@ -161,6 +168,7 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
     config: {
       enabled: true,
       models,
+      ...(value.trigger !== undefined ? { trigger: value.trigger as 'capacity' | 'quota' } : {}),
       ...(modelSettings ? { modelSettings } : {}),
       ...(value.reselectPerTurn !== undefined ? { reselectPerTurn: value.reselectPerTurn as boolean } : {}),
       ...(previousSettings !== undefined ? { previousSettings } : {}),
@@ -188,6 +196,7 @@ export interface TraexAutoModelRuntimeState {
   nativeSessionId: string;
   skillCatalogFingerprint?: string;
   sharedSettings?: TraexAutoModelSettings;
+  quotaBlocks?: Array<{ model: string; resetAtMs?: number }>;
 }
 
 export function traexAutoModelPolicyKey(config: TraexAutoModelConfig): string {
@@ -197,7 +206,7 @@ export function traexAutoModelPolicyKey(config: TraexAutoModelConfig): string {
       const settings = resolveTraexAutoModelSettings(config, model);
       return [Object.prototype.hasOwnProperty.call(config.modelSettings ?? {}, model),
         settings.reasoningEffort ?? null, settings.modelBackendVariant ?? null];
-    })]);
+    }), ...(config.trigger === 'quota' ? ['quota'] : [])]);
 }
 
 export function validTraexAutoModelRuntime(
@@ -214,7 +223,7 @@ export type TraexAutoModelAction =
   | { kind: 'load_check'; turnId: string }
   | {
       kind: 'switch';
-      reason: 'new_turn' | 'capacity_timeout' | 'queued_backup' | 'available_model' | 'shortest_queue' | 'lowest_load';
+      reason: 'new_turn' | 'quota_exhausted' | 'capacity_timeout' | 'queued_backup' | 'available_model' | 'shortest_queue' | 'lowest_load';
       turnId: string;
       fromModel: string;
       toModel: string;
@@ -253,6 +262,7 @@ export class TraexAutoModelController {
   private searchingBackups = false;
   private progressSinceMs: number | undefined;
   private awaitingActivity = false;
+  private quotaBlocks = new Map<string, { resetAtMs?: number }>();
 
   readonly sharedSettings?: TraexAutoModelSettings;
 
@@ -264,12 +274,21 @@ export class TraexAutoModelController {
       if (restored.sharedSettings) this.sharedSettings = { ...restored.sharedSettings };
       this.currentIndex = config.models.indexOf(restored.model);
       this.exhausted = restored.waitingOnFinalModel;
+      if (config.trigger === 'quota' && Array.isArray(restored.quotaBlocks)) {
+        for (const block of restored.quotaBlocks) {
+          if (config.models.includes(block.model)) this.quotaBlocks.set(block.model, {
+            ...(typeof block.resetAtMs === 'number' && Number.isFinite(block.resetAtMs)
+              ? { resetAtMs: block.resetAtMs } : {}),
+          });
+        }
+      }
     }
   }
 
   runtimeState(nativeSessionId: string): TraexAutoModelRuntimeState {
     return { model: this.currentModel(), waitingOnFinalModel: this.exhausted,
       policyKey: traexAutoModelPolicyKey(this.config), nativeSessionId,
+      ...(this.config.trigger === 'quota' ? { quotaBlocks: [...this.quotaBlocks].map(([model, block]) => ({ model, ...block })) } : {}),
       ...(this.sharedSettings !== undefined ? { sharedSettings: { ...this.sharedSettings } } : {}) };
   }
 
@@ -290,6 +309,10 @@ export class TraexAutoModelController {
 
   currentModelIndex(): number {
     return this.currentIndex;
+  }
+
+  hasQuotaBlocks(): boolean {
+    return this.quotaBlocks.size > 0;
   }
 
   currentTurnId(): string | undefined {
@@ -332,6 +355,14 @@ export class TraexAutoModelController {
   beginTurn(turnId: string, options: { retainCurrentModel?: boolean } = {}): TraexAutoModelAction {
     if (!turnId || this.turnId === turnId) return { kind: 'none' };
     const fromModel = this.currentModel();
+    if (this.config.trigger === 'quota' && !options.retainCurrentModel) {
+      this.turnId = turnId;
+      this.awaitingActivity = false;
+      const toIndex = this.config.models.findIndex(model => !this.quotaBlocked(model, Date.now()));
+      if (toIndex < 0) return { kind: 'exhausted', turnId, model: fromModel, modelCount: this.config.models.length };
+      if (toIndex === this.currentIndex) return { kind: 'none' };
+      return { kind: 'switch', reason: 'new_turn', turnId, fromModel, toModel: this.config.models[toIndex]!, toIndex };
+    }
     if (options.retainCurrentModel || !this.config.reselectPerTurn || this.currentIndex === 0) {
       this.turnId = turnId;
       this.queueSinceMs = undefined;
@@ -352,6 +383,41 @@ export class TraexAutoModelController {
       toModel: this.config.models[0]!,
       toIndex: 0,
     };
+  }
+
+  private quotaBlocked(model: string, nowMs: number): boolean {
+    const block = this.quotaBlocks.get(model);
+    if (!block) return false;
+    if (block.resetAtMs !== undefined && block.resetAtMs <= nowMs) {
+      this.quotaBlocks.delete(model);
+      return false;
+    }
+    return true;
+  }
+
+  /** Native failure wins over an older catalog's optimistic reading. Only
+   * later entries are eligible in this recovery; no load ranking or wraparound. */
+  refreshQuotaEvidence(quotas: ReadonlyMap<string, TraexQuotaEvidence> | null, nowMs = Date.now()): void {
+    for (const model of this.config.models) {
+      const evidence = quotas?.get(model.toLowerCase());
+      if (evidence?.depleted === true) this.quotaBlocks.set(model, {
+        ...(evidence.resetAtMs !== undefined && evidence.resetAtMs > nowMs ? { resetAtMs: evidence.resetAtMs } : {}),
+      });
+      else if (evidence?.depleted === false) this.quotaBlocks.delete(model);
+    }
+  }
+
+  observeQuotaFailure(turnId: string, quotas: ReadonlyMap<string, TraexQuotaEvidence> | null,
+    nowMs = Date.now()): TraexAutoModelAction {
+    if (this.config.trigger !== 'quota' || turnId !== this.turnId) return { kind: 'none' };
+    this.refreshQuotaEvidence(quotas, nowMs);
+    if (!this.quotaBlocks.has(this.currentModel())) this.quotaBlocks.set(this.currentModel(), {});
+    for (let index = this.currentIndex + 1; index < this.config.models.length; index++) {
+      if (this.quotaBlocked(this.config.models[index]!, nowMs)) continue;
+      return { kind: 'switch', reason: 'quota_exhausted', turnId, fromModel: this.currentModel(),
+        toModel: this.config.models[index]!, toIndex: index };
+    }
+    return { kind: 'exhausted', turnId, model: this.currentModel(), modelCount: this.config.models.length };
   }
 
   /** Advance only after the host has admitted the exact native-session restart.
@@ -448,6 +514,10 @@ export class TraexAutoModelController {
     nowMs: number;
     queuePosition?: number;
   }): TraexAutoModelAction {
+    if (this.config.trigger === 'quota') {
+      if (input.turnId === this.turnId && (input.queued || input.progressing)) this.awaitingActivity = false;
+      return { kind: 'none' };
+    }
     // Record the live viewport fact before any early return: the exhausted
     // latch outlives queueSinceMs, so "still parked in the queue" is an
     // observation of the current pane, independent of turn-id ownership.

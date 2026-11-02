@@ -82,57 +82,14 @@ export function sessionExchangePreview(row: Record<string, any>): SessionExchang
   };
 }
 
-/** Reducer backing the session-card preview overlay's open/focus state. The
- * component drives its `useReducer` with these exact actions (not a parallel
- * mirror), so this unit-tests the real transitions — in particular the
- * Escape→refocus race: Escape closes the overlay AND returns focus to the
- * trigger, whose `focus` action would otherwise reopen it in the same event, so
- * `escape-refocus` arms a one-shot `suppressFocusOpen` that the immediately
- * following `focus` consumes instead of opening. */
-export interface PreviewOverlayState {
-  open: boolean;
-  /** One-shot: the next trigger `focus` must NOT open (set by escape-refocus). */
-  suppressFocusOpen: boolean;
-}
-
-export type PreviewOverlayAction = 'open' | 'close' | 'focus' | 'escape-refocus' | 'toggle';
-
-export const previewOverlayInitialState: PreviewOverlayState = { open: false, suppressFocusOpen: false };
-
-export function previewOverlayReducer(state: PreviewOverlayState, action: PreviewOverlayAction): PreviewOverlayState {
-  switch (action) {
-    case 'open':
-      return { open: true, suppressFocusOpen: false };
-    case 'close':
-      return { open: false, suppressFocusOpen: false };
-    case 'toggle':
-      return { open: !state.open, suppressFocusOpen: false };
-    case 'focus':
-      // Consume the one-shot: a refocus armed by Escape does NOT reopen.
-      if (state.suppressFocusOpen) return { open: state.open, suppressFocusOpen: false };
-      return { open: true, suppressFocusOpen: false };
-    case 'escape-refocus':
-      return { open: false, suppressFocusOpen: true };
-    default:
-      return state;
-  }
-}
-
 // CLI 过滤选项从 setup 的单一事实源 CLI_OPTIONS 派生，新增 CLI 自动跟随，
 // 不再手抄一份（手抄版曾漏 antigravity/traex/mir/kimi/genius）。
 // 'unknown' 兜底：没有 cliId 的会话在 filtered() 里按 'unknown' 归类。
 export const CLI_FILTER_OPTIONS = [...CLI_OPTIONS.map(o => o.id), 'unknown'];
 
-// 状态列收敛：「启动中」并入「进行中」（starting 归到 working 列）；「待办」重定义为
-// 任务态（有未完成 TODO），不再拿 idle 冒充——idle 且无未完成 todo 才是真「空闲」。
+// 看板卡片左侧状态色条的语义分组：「启动中」并入「进行中」；「待办」是任务态（有未完成
+// TODO），不拿 idle 冒充——idle 且无未完成 todo 才是真「空闲」。
 export type BoardColumnId = 'needs-you' | 'working' | 'todo' | 'idle';
-
-export const BOARD_COLUMNS: Array<{ id: BoardColumnId; labelKey: string; hintKey: string }> = [
-  { id: 'needs-you', labelKey: 'sessions.board.needsYou', hintKey: 'sessions.board.needsYouHint' },
-  { id: 'working', labelKey: 'sessions.board.working', hintKey: 'sessions.board.workingHint' },
-  { id: 'todo', labelKey: 'sessions.board.todo', hintKey: 'sessions.board.todoHint' },
-  { id: 'idle', labelKey: 'sessions.board.idle', hintKey: 'sessions.board.idleHint' },
-];
 
 export function cssToken(value: unknown): string {
   return String(value ?? 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
@@ -251,117 +208,73 @@ export function sessionLocationTitle(s: any): string {
   return chatId && !label.includes(chatId) ? `${label} · ${chatId}` : label;
 }
 
+/** 状态筛选里「全部（含已关闭）」的取值；空串表示「未关闭的全部」。 */
+export const SESSION_STATUS_ANY = '__any';
+
+export interface SessionRowFilters {
+  q: string;
+  /** '' = 未关闭的全部；SESSION_STATUS_ANY = 含已关闭；其它 = 精确状态。 */
+  status: string;
+  /** '' | 'yes'（/adopt 接入）| 'no'（飞书原生） */
+  adopt: string;
+  bot: string;
+  chat: string;
+  /** '' = 全部 CLI；没有 cliId 的会话按 'unknown' 归类。 */
+  cli: string;
+  showUnknownChats: boolean;
+}
+
+/** 会话页的行筛选。keepClosed：看板要把已关闭会话留给「已完成」列，状态为空时也不剔除。 */
+export function filterSessionRows<T extends Record<string, any>>(
+  rows: readonly T[],
+  filters: SessionRowFilters,
+  options: { keepClosed: boolean },
+): T[] {
+  const q = filters.q.trim().toLowerCase();
+  return rows.filter(s => {
+    if (filters.cli && String(s.cliId ?? 'unknown') !== filters.cli) return false;
+    if (!filters.showUnknownChats && isUnknownChatSession(s)) return false;
+    if (filters.status === '') {
+      if (!options.keepClosed && s.status === 'closed') return false;
+    } else if (filters.status !== SESSION_STATUS_ANY && s.status !== filters.status) {
+      return false;
+    }
+    if (filters.adopt && (filters.adopt === 'yes') !== !!s.adopt) return false;
+    if (filters.bot && String(s.larkAppId ?? '') !== filters.bot) return false;
+    if (filters.chat && String(s.chatId ?? '') !== filters.chat) return false;
+    if (q && !sessionSearchText(s).includes(q)) return false;
+    return true;
+  });
+}
+
+/** 用户是否施加了真正收窄结果的筛选维度。「显示未知聊天」是独立显示设置（有自己的
+ *  开关、默认开启），不算筛选——把它计入会让全新页面在零操作时就出现「清除筛选」。 */
+export function hasActiveSessionFilters(filters: SessionRowFilters): boolean {
+  return !!(filters.status || filters.bot || filters.chat || filters.cli || filters.adopt);
+}
+
+/** 清除筛选：只清空五个筛选维度，搜索词与「显示未知聊天」显示设置原样保留
+ *  （清除筛选不应反过来隐藏一批会话，也不该改写用户的显示偏好）。 */
+export function clearSessionFilters(filters: SessionRowFilters): SessionRowFilters {
+  return {
+    q: filters.q,
+    status: '',
+    adopt: '',
+    bot: '',
+    chat: '',
+    cli: '',
+    showUnknownChats: filters.showUnknownChats,
+  };
+}
+
+/** 切到看板时，状态下拉里的「全部（含已关闭）」与默认项等价（看板恒保留已关闭给
+ *  「已完成」列），该取值没有对应选项，归一化成默认项，避免芯片停在无选项的悬空值。 */
+export function normalizeStatusFilterForView(status: string, keepClosed: boolean): string {
+  return keepClosed && status === SESSION_STATUS_ANY ? '' : status;
+}
+
 export function sessionSearchText(s: any): string {
   return `${JSON.stringify(s)} ${sessionLocationText(s)} ${sessionLocationTitle(s)}`.toLowerCase();
-}
-
-export type SessionTopicKind = 'thread' | 'chat' | 'session';
-
-/** Location-level grouping used by the Dashboard topic view.
- *
- * This is intentionally not called a collaboration graph. A thread anchor
- * proves that sessions live in the same Lark topic, while chat-scope sessions
- * can only be grouped at whole-chat granularity. Neither relation proves which
- * session woke another one.
- */
-export interface SessionTopicGroup<T = any> {
-  key: string;
-  kind: SessionTopicKind;
-  chatId: string;
-  rootMessageId?: string;
-  title: string;
-  rows: T[];
-  botCount: number;
-  activeCount: number;
-  closedCount: number;
-  inferredBotInputCount: number;
-  latestActivityAt: number;
-  multiBot: boolean;
-  inferredBotTriggered: boolean;
-}
-
-function nonEmptyString(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function sessionTopicKind(s: any): SessionTopicKind {
-  const chatId = nonEmptyString(s?.chatId);
-  const rootMessageId = nonEmptyString(s?.rootMessageId);
-  if (s?.scope === 'chat') return chatId ? 'chat' : 'session';
-  return chatId && rootMessageId ? 'thread' : 'session';
-}
-
-/** Stable location key for the current schema. Keep it separate from any
- * future `collaborationId`: location and logical task identity are different
- * dimensions and must not silently alias each other. */
-export function sessionTopicKey(s: any): string {
-  const chatId = nonEmptyString(s?.chatId);
-  const rootMessageId = nonEmptyString(s?.rootMessageId);
-  const kind = sessionTopicKind(s);
-  if (kind === 'thread') {
-    return `thread:${encodeURIComponent(chatId)}:${encodeURIComponent(rootMessageId)}`;
-  }
-  if (kind === 'chat') return `chat:${encodeURIComponent(chatId)}`;
-  return `session:${encodeURIComponent(nonEmptyString(s?.sessionId) || 'unknown')}`;
-}
-
-function topicTitle(rows: any[], fallback: string): string {
-  const ordered = [...rows].sort((a, b) => Number(a?.spawnedAt ?? 0) - Number(b?.spawnedAt ?? 0));
-  for (const row of ordered) {
-    const title = nonEmptyString(row?.title);
-    if (title) return title;
-  }
-  return fallback;
-}
-
-/** Group arbitrary Dashboard rows by their best available Lark conversation
- * anchor. Groups and members are sorted by recent activity for deterministic
- * rendering. */
-export function groupSessionsByTopic<T extends Record<string, any>>(rows: readonly T[]): SessionTopicGroup<T>[] {
-  const grouped = new Map<string, T[]>();
-  for (const row of rows) {
-    const key = sessionTopicKey(row);
-    const bucket = grouped.get(key);
-    if (bucket) bucket.push(row);
-    else grouped.set(key, [row]);
-  }
-
-  const result: SessionTopicGroup<T>[] = [];
-  for (const [key, members] of grouped) {
-    const sorted = [...members].sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0));
-    const first = sorted[0] ?? ({} as T);
-    const kind = sessionTopicKind(first);
-    const chatId = nonEmptyString(first.chatId);
-    const rootMessageId = kind === 'thread' ? nonEmptyString(first.rootMessageId) : '';
-    const botIds = new Set(sorted
-      .map(row => nonEmptyString(row.larkAppId) || nonEmptyString(row.botName))
-      .filter(Boolean));
-    // Missing identity must not turn two sessions into a false multi-Bot
-    // signal. Count the group as one unknown Bot, but only claim multi-Bot
-    // collaboration when at least two distinct identities are present.
-    const botCount = Math.max(1, botIds.size);
-    const activeCount = sorted.filter(row => row.status !== 'closed').length;
-    const inferredBotInputCount = sorted.filter(row => row.lastInputFromBot === true).length;
-    const latestActivityAt = sorted.reduce((max, row) => Math.max(max, Number(row.lastMessageAt ?? 0)), 0);
-    const fallback = rootMessageId || chatId || nonEmptyString(first.sessionId) || key;
-    result.push({
-      key,
-      kind,
-      chatId,
-      ...(rootMessageId ? { rootMessageId } : {}),
-      title: topicTitle(sorted, fallback),
-      rows: sorted,
-      botCount,
-      activeCount,
-      closedCount: sorted.length - activeCount,
-      inferredBotInputCount,
-      latestActivityAt,
-      multiBot: botIds.size > 1,
-      inferredBotTriggered: inferredBotInputCount > 0,
-    });
-  }
-
-  return result.sort((a, b) => b.latestActivityAt - a.latestActivityAt || a.key.localeCompare(b.key));
 }
 
 export const terminalHref = sessionTerminalHref;

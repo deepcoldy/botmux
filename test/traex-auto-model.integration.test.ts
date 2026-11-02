@@ -12,6 +12,7 @@ import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { t } from '../src/i18n/index.js';
 import { lookupCliDisplayName } from '../src/adapters/cli/display-names.js';
+import { traexAutoModelPolicyKey } from '../src/services/traex-auto-model.js';
 import { restartInterruptionNote, restartInterruptionNotice } from '../src/services/restart-interruption.js';
 
 const interruptedTurn = { turnOpen: true, tasks: [] };
@@ -63,7 +64,9 @@ function rows(path: string): any[] {
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
   freshStart = false, activityMode?: 'working' | 'queue-after-second' | 'delayed-first-queue', terminalDelayMs = 0,
-  delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false, holdPreferredSuccessor = false) {
+  delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false, holdPreferredSuccessor = false,
+  quota?: { code: string; exhaustLast?: boolean; initial?: boolean; blocked?: boolean },
+  delayedHistoryReceipt?: { submission: number; ms: number }) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -87,6 +90,10 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   const fake = join(root, 'fake-traex');
   writeFileSync(fake, `#!/usr/bin/env node
 const fs = require('node:fs');
+if (process.argv[2] === 'debug') {
+  fs.appendFileSync(${JSON.stringify(rpcRequests)}, JSON.stringify({ method: 'debug/models' }) + '\\n');
+  process.stdout.write(JSON.stringify({ models: [] })); process.exit(0);
+}
 if (process.argv[2] === 'app-server') {
   let pending = '';
   process.stdin.setEncoding('utf8');
@@ -161,7 +168,12 @@ process.stdin.on('data', chunk => {
     const text = pasted; pasted = ''; input = ''; submitted = true; completed = false;
     turnId = require('node:crypto').randomUUID();
     fs.appendFileSync(${JSON.stringify(submissions)}, JSON.stringify({ model, text }) + '\\n');
-    fs.appendFileSync(${JSON.stringify(historyPath)}, JSON.stringify({ session_id: nativeId, ts: Date.now() / 1000, text }) + '\\n');
+    // delayedHistoryReceipt: the Nth submit's history receipt lands after
+    // writeInput's (time-scaled) in-band confirmation budget — the
+    // loaded-runner timing that leaves that submit unconfirmed.
+    const appendHistory = () => fs.appendFileSync(${JSON.stringify(historyPath)}, JSON.stringify({ session_id: nativeId, ts: Date.now() / 1000, text }) + '\\n');
+    if (submissionCount + 1 === ${delayedHistoryReceipt?.submission ?? 0}) setTimeout(appendHistory, ${delayedHistoryReceipt?.ms ?? 0});
+    else appendHistory();
     line({ type: 'task_started', turn_id: turnId });
     line({ type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId });
     // Real interrupted work leaves model/tool history beyond the user receipt.
@@ -180,7 +192,16 @@ process.stdin.on('data', chunk => {
     const successorAfterReset = ${JSON.stringify(holdPreferredSuccessor)} && model === 'core'
       && fs.existsSync(${JSON.stringify(launches)})
       && fs.readFileSync(${JSON.stringify(launches)}, 'utf8').includes('"model":"last"');
-    if (successorAfterReset) {
+    if (${JSON.stringify(!!quota)}) {
+      process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
+      setTimeout(() => {
+        completed = true;
+        const failed = model !== 'last' || ${JSON.stringify(quota?.exhaustLast === true)};
+        line({ type: 'task_complete', turn_id: turnId, last_agent_message: failed ? '' : 'done',
+          ...(failed ? { error: { codex_error_info: ${JSON.stringify(quota?.code ?? '')} } } : {}) });
+        idle();
+      }, 1200);
+    } else if (successorAfterReset) {
       process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
     } else if (${JSON.stringify(activityMode === 'delayed-first-queue')} && model === 'core') {
       // Native submission is acknowledged before its first activity repaint.
@@ -288,9 +309,17 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
   }
   const init = { type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId: 'traex', cliPathOverride: fake, cliSessionId: freshStart ? undefined : nativeId,
-    resume: !freshStart, model: 'core', backendType, prompt: '',
+    resume: !freshStart, model: 'core', backendType, prompt: quota?.initial ? 'initial quota task' : '',
+    ...(quota?.initial ? { turnId: 'om_initial_quota' } : {}),
+    ...(quota?.blocked ? { traexAutoModelRuntime: {
+      model: 'last', nativeSessionId: nativeId, waitingOnFinalModel: false,
+      policyKey: traexAutoModelPolicyKey({ enabled: true, trigger: 'quota', models: ['core', 'backup', 'last'],
+        queueTimeoutMs: 5000, switchCooldownMs: 5000 }),
+      quotaBlocks: ['core', 'backup', 'last'].map(model => ({ model })),
+    } } : {}),
     ...(rpcPolicy ? { codexRpcInput: resolveCodexRpcInput('traex', rpcPolicy.override, rpcPolicy.global) } : {}),
     ...(enabled ? { traexAutoModel: { enabled: true, models: ['core', 'backup', 'last'], queueTimeoutMs: 5_000, switchCooldownMs: 5_000,
+      ...(quota ? { trigger: 'quota' as const } : {}),
       reselectPerTurn,
       ...(loadData ? { modelSettings: {
         core: { reasoningEffort: 'high', modelBackendVariant: 'standard' },
@@ -306,6 +335,56 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('quota initial prompts use admission instead of bypassing persisted blocks', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      { code: 'usage_limit_exceeded', initial: true, blocked: true });
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_initial_quota' && m.status === 'failed'), 'blocked initial input settled');
+    expect(rows(f.submissions)).toHaveLength(0);
+  }, 45_000);
+
+  it('quota initial fresh prompts recover on the discovered exact native session', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, true, undefined, 0, 0, false, false,
+      { code: 'usage_limit_exceeded', initial: true });
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_initial_quota' && m.status === 'completed'), 'fresh initial recovery');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('initial quota task'))).toHaveLength(1);
+    expect(rows(f.launches).slice(1).every(row => row.args.includes(f.nativeId))).toBe(true);
+  }, 60_000);
+
+  it('quota recovery preserves native identity, ordered models and one original input', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      { code: 'usage_limit_exceeded' });
+    f.child.send({ type: 'message', content: 'original quota task', turnId: 'om_quota' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_quota' && m.status === 'completed'), 'quota recovery complete');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.launches).every(row => row.args.includes(f.nativeId))).toBe(true);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('original quota task'))).toHaveLength(1);
+    expect(rows(f.submissions).slice(1).every(row => row.text.includes(t('worker.traex_auto_model.continue_prompt')))).toBe(true);
+    expect(f.messages.filter(m => m.type === 'turn_terminal' && m.turnId === 'om_quota')).toHaveLength(1);
+    // Only the two structured failures query quotas; initial admission does not.
+    expect(rows(f.rpcRequests).filter(row => row.method === 'debug/models')).toHaveLength(2);
+  }, 60_000);
+
+  it('quota mode stops after all models fail without cycling or replaying', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      { code: 'usageLimitExceeded', exhaustLast: true });
+    f.child.send({ type: 'message', content: 'all depleted task', turnId: 'om_all' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_all' && m.status === 'failed'), 'all quotas failed');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.submissions)).toHaveLength(3);
+    expect(f.messages.filter(m => m.type === 'turn_terminal' && m.turnId === 'om_all')).toHaveLength(1);
+  }, 60_000);
+
+  it('quota mode does not turn ordinary rate limits into model switches', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      { code: 'rateLimitExceeded' });
+    f.child.send({ type: 'message', content: 'rate limited task', turnId: 'om_rate' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_rate' && m.status === 'failed'), 'ordinary failure');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+    expect(rows(f.submissions)).toHaveLength(1);
+    expect(rows(f.rpcRequests).filter(row => row.method === 'debug/models')).toHaveLength(0);
+  }, 45_000);
+
   it('keeps planned model recovery silent and still reports a later genuine crash', async () => {
     const f = await fixture(true, 'busy');
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_original' } satisfies DaemonToWorker);
@@ -411,6 +490,29 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await f.wait(() => rows(f.submissions).length === 3, 'held input after composer');
     expect(rows(f.submissions).filter(row => row.text.startsWith('held successor'))).toHaveLength(1);
   }, 45_000);
+
+  // A late history receipt quarantines one write while the original turn is
+  // still open. The hold must be released by the deferred recheck and the
+  // type-ahead queue re-driven; neither release may wait for the open turn.
+  it.each([
+    { name: 'the original ask', submission: 1, quarantinedTurn: 'om_working' },
+    { name: 'the capacity-changing correction', submission: 2, quarantinedTurn: 'om_capacity' },
+  ])('delivers queued follow-ups after a late receipt quarantines $name', async ({ submission, quarantinedTurn }) => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, 'queue-after-second',
+      0, 0, false, false, undefined, { submission, ms: 400 });
+    f.child.send({ type: 'message', content: 'original working ask', turnId: 'om_working' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original working submit');
+    f.child.send({ type: 'message', content: 'correction changes capacity', turnId: 'om_capacity' } satisfies DaemonToWorker);
+    f.child.send({ type: 'message', content: 'held successor', turnId: 'om_held' } satisfies DaemonToWorker);
+    await f.wait(() => f.logs.join('').includes(`after unconfirmed submit turn=${quarantinedTurn} `), 'late receipt quarantined');
+    await f.wait(() => rows(f.submissions).length === 2, 'correction submitted');
+    writeFileSync(f.release, 'finish');
+    await f.wait(() => rows(f.submissions).length === 3, 'held input after deferred recheck');
+    expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
+      'original working ask', 'correction changes capacity', 'held successor',
+    ]);
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+  }, 75_000);
 
   it('preserves a fresh topic selection, final wait and catalog across an in-worker restart', async () => {
     const f = await fixture(true, 'busy', false, undefined, false, undefined, true);

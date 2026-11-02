@@ -422,8 +422,7 @@ main:has(.sessions-page) .sessions-view-stage {
   overflow: hidden;
 }
 
-main:has(.sessions-page) .sessions-view-stage[data-view="table"],
-main:has(.sessions-page) .sessions-view-stage[data-view="topics"] {
+main:has(.sessions-page) .sessions-view-stage[data-view="table"] {
   overflow: auto;
 }
 
@@ -455,42 +454,6 @@ main:has(.groups-page) .groups-matrix-section > #g-loading {
 }
 
 @media (min-width: 721px) {
-  main:has(.team-home-page) {
-    padding-bottom: 0;
-    overflow: hidden;
-  }
-
-  main:has(.team-home-page) .team-home-page {
-    height: 100%;
-    min-height: 0;
-    display: grid;
-    grid-template-rows: auto auto minmax(0, 1fr);
-    overflow: hidden;
-  }
-
-  main:has(.team-home-page) .team-roster-section {
-    height: 100%;
-    min-height: 0;
-    display: grid;
-    grid-template-rows: var(--section-title-row-height) minmax(0, 1fr);
-    overflow: hidden;
-  }
-
-  main:has(.team-home-page) .team-roster-card {
-    height: 100%;
-    min-height: 0;
-    display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
-    overflow: hidden;
-    box-sizing: border-box;
-  }
-
-  main:has(.team-home-page) #tf-teams {
-    min-height: 0;
-    overflow-x: hidden;
-    overflow-y: auto;
-    padding-right: 4px;
-  }
 
   main:has(.roles-page) {
     padding-bottom: 0;
@@ -1758,30 +1721,6 @@ a:focus-visible {
   margin: 0;
 }
 
-.filter-check {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 32px;
-  padding: 0 7px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-raised);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
-}
-
-.filter-check:hover {
-  border-color: var(--accent);
-  color: var(--fg);
-}
-
-.filter-check input {
-  margin: 0;
-}
-
 label {
   color: var(--muted);
 }
@@ -2077,7 +2016,7 @@ button.primary {
 .cli-codex       { background: #fff0df; color: #a14c11; border-color: #ffd8ad; }
 .cli-codex-app   { background: #e9f7ff; color: #11638f; border-color: #bde4fa; }
 .cli-cursor      { background: #ece9ff; color: #5b4ac7; border-color: #d9d2ff; }
-.cli-gemini      { background: #fde7f1; color: #a13268; border-color: #fac8df; }
+.cli-antigravity { background: #fde7f1; color: #a13268; border-color: #fac8df; }
 .cli-opencode    { background: #e7f7ec; color: #176b36; border-color: #bfe8ce; }
 .cli-mtr         { background: #e5f5ff; color: #0f6388; border-color: #b8e2f7; }
 .cli-hermes      { background: #f0f4e4; color: #546b14; border-color: #d9e9a8; }
@@ -2091,7 +2030,7 @@ button.primary {
 :root[data-theme="dark"] .cli-codex,
 :root[data-theme="dark"] .cli-codex-app,
 :root[data-theme="dark"] .cli-cursor,
-:root[data-theme="dark"] .cli-gemini,
+:root[data-theme="dark"] .cli-antigravity,
 :root[data-theme="dark"] .cli-opencode,
 :root[data-theme="dark"] .cli-mtr,
 :root[data-theme="dark"] .cli-hermes,
@@ -2122,579 +2061,6 @@ button.primary {
 .status-limited { background: var(--danger-soft); color: var(--danger); }
 .status-stalled { background: var(--danger-soft); color: var(--danger); }
 
-/* ── Sessions board — "control-room signal wall" ─────────────────────────────
-   Each column is a signal channel: a LED dot + uppercase channel label in the
-   header, and every card inherits the channel color through `--col-signal`.
-   The needs-you channel pulses; everything else stays calm. Terminal-native
-   typography (mono labels, tabular numerals) over generic SaaS chrome. */
-.sessions-board {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(220px, 1fr));
-  gap: 12px;
-  align-items: stretch;
-  min-height: 0;
-  height: 100%;
-  background-image: none;
-  border-radius: var(--radius);
-  padding: 10px;
-  overflow: hidden;
-}
-
-.sessions-board[hidden] {
-  display: none;
-}
-
-/* ── Sessions topic view — group by Lark location, not inferred ancestry ─── */
-.sessions-topic-view {
-  display: grid;
-  grid-auto-rows: max-content;
-  align-content: start;
-  gap: 12px;
-  min-height: 0;
-  height: 100%;
-  padding: 10px;
-  overflow-y: auto;
-  box-sizing: border-box;
-}
-
-.sessions-topic-view[hidden] {
-  display: none;
-}
-
-.session-topic-group {
-  --topic-signal: var(--border);
-  min-width: 0;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  overflow: hidden;
-}
-
-.session-topic-group.multi-bot {
-  --topic-signal: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft));
-}
-
-.session-topic-group.inferred-bot-trigger {
-  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warning) 72%, transparent), var(--shadow);
-}
-
-.session-topic-group > header {
-  display: grid;
-  grid-template-columns: auto minmax(220px, 1fr) minmax(280px, auto);
-  align-items: center;
-  gap: 12px;
-  min-height: 74px;
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--border-soft);
-  background: color-mix(in srgb, var(--topic-signal) 5%, var(--surface-muted));
-}
-
-.session-topic-avatar {
-  display: inline-flex;
-}
-
-.session-topic-heading {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-}
-
-.session-topic-location,
-.session-topic-updated {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.session-topic-heading h2 {
-  margin: 0;
-  color: var(--fg);
-  font-size: 14px;
-  line-height: 1.4;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.session-topic-heading code {
-  max-width: min(58vw, 520px);
-  color: var(--faint);
-  font-size: 10px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.session-topic-summary {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-
-.topic-chip {
-  display: inline-flex;
-  align-items: center;
-  min-height: 22px;
-  padding: 2px 8px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface-raised);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.topic-chip.collaboration {
-  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
-  background: color-mix(in srgb, var(--accent) 10%, var(--surface-raised));
-  color: var(--accent-strong);
-}
-
-.topic-chip.active {
-  border-color: color-mix(in srgb, var(--success) 36%, var(--border));
-  color: var(--success);
-}
-
-.topic-chip.inferred {
-  border-style: dashed;
-  border-color: color-mix(in srgb, var(--warning) 44%, var(--border));
-  color: var(--warning);
-}
-
-.session-topic-members {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  align-items: start;
-  gap: 10px;
-  padding: 10px;
-}
-
-.session-topic-members .session-card {
-  --col-signal: var(--topic-signal);
-}
-
-.sessions-topic-empty {
-  min-height: 160px;
-  display: grid;
-  place-items: center;
-  color: var(--muted);
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-}
-
-.session-board-column {
-  --col-signal: var(--border);
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  min-width: 0;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  overflow: hidden;
-}
-
-.session-board-column > header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  min-height: 72px;
-  padding: 12px;
-  border-bottom: 1px solid var(--border-soft);
-  background: var(--surface-muted);
-  box-sizing: border-box;
-}
-
-.session-board-column > header > div {
-  display: grid;
-  align-content: center;
-  flex: 1 1 auto;
-  gap: 5px;
-  min-width: 0;
-}
-
-.session-board-column h2 {
-  flex: none;
-  margin: 0;
-  font-family: var(--mono);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1.4;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  white-space: nowrap;
-}
-
-/* channel LED */
-.session-board-column h2::before {
-  content: '';
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--col-signal);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--col-signal) 18%, transparent);
-  flex: none;
-}
-
-.session-board-column p {
-  min-width: 0;
-  margin: 0;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.35;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.session-board-count {
-  width: auto;
-  height: 26px;
-  min-width: 26px;
-  min-height: 26px;
-  padding: 0 7px;
-  box-sizing: border-box;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--col-signal) 10%, var(--surface-raised));
-  border: 1px solid color-mix(in srgb, var(--col-signal) 35%, var(--border));
-  color: color-mix(in srgb, var(--col-signal) 75%, var(--fg));
-  font-family: var(--mono);
-  font-weight: 700;
-  line-height: 26px;
-  font-variant-numeric: tabular-nums;
-}
-
-.session-board-list {
-  flex: 1;
-  min-height: 0;
-  display: grid;
-  grid-auto-rows: max-content;
-  align-content: start;
-  gap: 10px;
-  padding: 10px;
-  overflow-y: auto;
-}
-
-.session-board-empty {
-  min-height: 64px;
-  display: grid;
-  place-items: center;
-  color: var(--faint);
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
-  background: transparent;
-  font-family: var(--mono);
-  font-size: 12px;
-  letter-spacing: 0.04em;
-}
-
-.session-board-needs-you {
-  --col-signal: var(--danger);
-  background: color-mix(in srgb, var(--danger) 4%, var(--surface));
-}
-
-/* the one channel that's allowed to breathe */
-.session-board-needs-you h2::before {
-  animation: board-led-pulse 1.6s ease-in-out infinite;
-}
-
-.session-board-todo {
-  --col-signal: var(--warning);
-}
-
-.session-board-working {
-  --col-signal: var(--success);
-}
-
-.session-board-idle {
-  --col-signal: var(--faint);
-}
-
-@keyframes board-led-pulse {
-  0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--col-signal) 18%, transparent); }
-  50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--col-signal) 30%, transparent); }
-}
-
-.session-card {
-  --session-board-card-min-height: 132px;
-  display: grid;
-  gap: 10px;
-  align-content: start;
-  box-sizing: border-box;
-  min-height: var(--session-board-card-min-height);
-  padding: 11px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface-raised);
-  cursor: pointer;
-  position: relative;
-  overflow: hidden;
-  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
-}
-
-/* Entry animation ONLY on the board's first paint (.board-enter set by JS).
- * SSE-driven re-renders rebuild the DOM — replaying the staggered reveal on
- * every status update made the whole page flash. */
-.board-enter .session-board-list .session-card {
-  animation: board-card-in 280ms ease backwards;
-}
-
-/* stagger the first paint — one orchestrated reveal, then calm */
-.board-enter .session-board-list .session-card:nth-child(1) { animation-delay: 30ms; }
-.board-enter .session-board-list .session-card:nth-child(2) { animation-delay: 75ms; }
-.board-enter .session-board-list .session-card:nth-child(3) { animation-delay: 120ms; }
-.board-enter .session-board-list .session-card:nth-child(4) { animation-delay: 165ms; }
-.board-enter .session-board-list .session-card:nth-child(n+5) { animation-delay: 210ms; }
-
-@keyframes board-card-in {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: none; }
-}
-
-.session-card:hover {
-  border-color: color-mix(in srgb, var(--col-signal) 55%, var(--border));
-  transform: translateY(-1px);
-  box-shadow: 0 6px 18px color-mix(in srgb, var(--col-signal) 12%, rgba(15, 23, 42, 0.10));
-}
-
-/* whole-card selection (no checkbox) — accent ring + soft tint */
-.session-card.selected {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
-  background: color-mix(in srgb, var(--accent) 5%, var(--surface-raised));
-}
-
-.session-card.locked {
-  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .session-card { animation: none; transition: none; }
-  .session-board-needs-you h2::before { animation: none; }
-  .session-card:hover { transform: none; }
-}
-
-.session-card-top {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) max-content;
-  align-items: start;
-  gap: 8px;
-}
-
-.session-card-title {
-  min-width: 0;
-}
-
-.session-card-title strong,
-.session-card-title span {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.session-card-title strong {
-  color: var(--fg);
-  font-size: 13px;
-}
-
-.session-card-title span {
-  margin-top: 2px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.session-card-meta,
-.session-card-time,
-.session-card-actions {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-
-.session-card-meta {
-  color: var(--muted);
-  font-size: 12px;
-  flex-wrap: nowrap;
-}
-
-.session-card-meta > span:not(.badge):not(.session-signal) {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.session-card-exchange-wrap {
-  position: relative;
-  min-width: 0;
-}
-
-.session-card-exchange {
-  display: grid;
-  gap: 5px;
-  flex: 1 1 auto;
-  min-width: 0;
-  padding: 7px 8px;
-  border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--surface) 78%, transparent);
-  cursor: pointer;
-}
-
-.session-card-exchange:hover,
-.session-card-exchange:focus-visible {
-  border-color: color-mix(in srgb, var(--accent) 46%, var(--border));
-  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
-}
-
-.session-card-exchange:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
-  outline-offset: 2px;
-}
-
-.session-card-exchange-line {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  align-items: start;
-  gap: 7px;
-  min-width: 0;
-}
-
-.session-card-exchange-line > span {
-  padding-top: 1px;
-  color: var(--faint);
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1.4;
-  text-transform: uppercase;
-}
-
-.session-card-exchange-line.bot > span {
-  color: var(--accent);
-}
-
-.session-card-exchange-line > p {
-  display: -webkit-box;
-  min-width: 0;
-  margin: 0;
-  overflow: hidden;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.4;
-  overflow-wrap: anywhere;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-
-.session-card-exchange-tooltip {
-  position: fixed;
-  z-index: 10020;
-  display: grid;
-  gap: 10px;
-  width: min(520px, calc(100vw - 24px));
-  max-height: min(420px, calc(100vh - 24px));
-  padding: 12px 13px;
-  overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
-  color: var(--fg);
-  box-shadow: 0 16px 44px rgba(3, 7, 18, 0.34);
-  cursor: text;
-  overscroll-behavior: contain;
-}
-
-.session-card-exchange-tooltip-scroll {
-  display: grid;
-  gap: 10px;
-  max-height: min(394px, calc(100vh - 50px));
-  overflow: auto;
-  scrollbar-gutter: stable;
-}
-
-.session-card-exchange-tooltip-line {
-  display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
-  align-items: start;
-  gap: 9px;
-}
-
-.session-card-exchange-tooltip-line + .session-card-exchange-tooltip-line {
-  padding-top: 10px;
-  border-top: 1px solid var(--border-soft);
-}
-
-.session-card-exchange-tooltip-line > span {
-  padding-top: 2px;
-  color: var(--faint);
-  font-size: 10px;
-  font-weight: 800;
-  line-height: 1.45;
-  text-transform: uppercase;
-}
-
-.session-card-exchange-tooltip-line.bot > span {
-  color: var(--accent);
-}
-
-.session-card-exchange-tooltip-line > p,
-.session-card-exchange-md {
-  min-width: 0;
-  margin: 0;
-  color: var(--fg);
-  font-size: 12px;
-  line-height: 1.55;
-  overflow-wrap: anywhere;
-  user-select: text;
-}
-
-/* Markdown rendered inside the full-exchange overlay. Scoped tight so bot
- * replies read as formatting (bold / code / lists / links) without importing
- * a new palette — dashboard tokens only. Compact block spacing keeps a long
- * reply legible in the scrollable overlay. */
-.session-card-exchange-md > :first-child { margin-top: 0; }
-.session-card-exchange-md > :last-child { margin-bottom: 0; }
-.session-card-exchange-md p { margin: 0 0 6px; }
-.session-card-exchange-md ul,
-.session-card-exchange-md ol { margin: 0 0 6px; padding-left: 18px; }
-.session-card-exchange-md li { margin: 1px 0; }
-.session-card-exchange-md li > p { margin: 0; }
-.session-card-exchange-md h1,
-.session-card-exchange-md h2,
-.session-card-exchange-md h3,
-.session-card-exchange-md h4,
-.session-card-exchange-md h5,
-.session-card-exchange-md h6 {
-  margin: 8px 0 4px;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1.4;
-}
-.session-card-exchange-md strong { font-weight: 700; }
-.session-card-exchange-md em { font-style: italic; }
-.session-card-exchange-md a {
-  color: var(--accent);
-  text-decoration: underline;
-  overflow-wrap: anywhere;
-}
 /* Markdown images are downgraded to a non-fetching text placeholder (no auto
  * <img> request); the alt becomes an opt-in click-through link for safe schemes. */
 .session-card-exchange-img {
@@ -2702,45 +2068,7 @@ button.primary {
   font-size: 11px;
   overflow-wrap: anywhere;
 }
-.session-card-exchange-md code {
-  padding: 1px 4px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--fg) 10%, transparent);
-  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-size: 11px;
-}
-.session-card-exchange-md pre {
-  margin: 0 0 6px;
-  padding: 8px 10px;
-  overflow-x: auto;
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--fg) 8%, transparent);
-}
-.session-card-exchange-md pre code {
-  padding: 0;
-  background: transparent;
-  font-size: 11px;
-  line-height: 1.5;
-}
-.session-card-exchange-md blockquote {
-  margin: 0 0 6px;
-  padding-left: 10px;
-  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, var(--border));
-  color: var(--muted);
-}
-.session-card-exchange-md hr {
-  margin: 8px 0;
-  border: 0;
-  border-top: 1px solid var(--border-soft);
-}
 
-.session-card-time {
-  justify-content: space-between;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.session-card-status-group,
 .drawer-status-line {
   display: inline-flex;
   align-items: center;
@@ -2748,7 +2076,6 @@ button.primary {
   flex-wrap: wrap;
 }
 
-.session-card-status-group .session-lock-badge,
 .drawer-status-line .session-lock-badge {
   margin-left: 0;
 }
@@ -2930,7 +2257,6 @@ button.primary {
   border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
-.session-card-meta .session-signal,
 .kanban-card-meta-row .session-signal {
   flex: none;
   justify-content: center;
@@ -2943,27 +2269,6 @@ button.primary {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.session-card-actions {
-  padding-top: 2px;
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-.session-card-actions button,
-.session-card-actions .btn-link {
-  min-height: 30px;
-  padding: 0 9px;
-  font-size: 12px;
-}
-
-.session-card-actions .card-act {
-  border-radius: var(--radius-full);
-}
-
-.session-card-actions .term-pill {
-  border-radius: var(--radius-full);
 }
 
 /* ── 看板视图（multica Issues 风格）：横排状态列 + 简洁卡片 ─────────────────── */
@@ -3087,62 +2392,6 @@ button.primary {
   }
 }
 
-/* 团队下拉使用平台 DropdownMenu，和其他短选项下拉保持同一 trigger / popover 规范。 */
-.kanban-team-menu {
-  --dropdown-trigger-width: 176px;
-  width: var(--dropdown-trigger-width);
-}
-
-.kanban-team-menu > summary {
-  background: var(--surface);
-}
-
-.kanban-team-menu .sect-sort-value {
-  max-width: calc(var(--dropdown-trigger-width) - 44px);
-}
-
-.kanban-team-menu > .sect-sort-pop {
-  width: 100%;
-  min-width: 100%;
-  max-width: 100%;
-}
-
-.kanban-team-menu[open] {
-  z-index: 1302;
-}
-
-/* 团队筛选范围统计：让"筛掉了什么"可见 */
-.kanban-team-stats {
-  color: var(--muted);
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-/* 团队清单加载中的整板占位（替代裸文本） */
-.kanban-loading-state {
-  flex: 1;
-  min-height: 220px;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius-lg);
-}
-
-/* 对方部署的会话卡：来源徽章 + 虚线边框区分快照身份 */
-.kanban-remote-badge {
-  background: color-mix(in srgb, var(--accent) 12%, var(--surface-muted));
-  color: var(--accent-strong);
-  white-space: nowrap;
-  flex: none;
-}
-
-.kanban-card-remote {
-  border-style: dashed;
-}
-
-/* 机器人视角：bot 多时列不再无限压缩——固定列宽 + 容器横向滚动 */
-.sessions-kanban.kanban-mode-bot .kanban-column {
-  flex: 0 0 264px;
-}
-
 /* 整簇拖拽 */
 .kanban-cluster > header {
   cursor: grab;
@@ -3248,12 +2497,6 @@ button.primary {
   transform: rotate(180deg);
 }
 
-/* 团队模式列头：bot 头像替代状态图标 */
-.kanban-col-avatar {
-  display: inline-flex;
-  flex: none;
-}
-
 .kanban-backlog .kanban-col-icon { color: var(--faint); }
 .kanban-todo .kanban-col-icon { color: var(--muted); }
 .kanban-in_progress .kanban-col-icon { color: var(--warning); }
@@ -3297,6 +2540,208 @@ button.primary {
   color: var(--faint);
   font-size: 11px;
   text-align: center;
+}
+
+/* 看板卡片勾选框：选中走这里（或 Shift/⌘ + 单击），单击卡片本身打开详情。 */
+.kanban-card-check {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* 卡片摘要悬停弹层：按 Markdown 渲染完整的最近一轮对话（CardPreview）。 */
+.session-card-exchange-tooltip {
+  position: fixed;
+  z-index: 10020;
+  display: grid;
+  gap: 10px;
+  width: min(520px, calc(100vw - 24px));
+  max-height: min(420px, calc(100vh - 24px));
+  padding: 12px 13px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
+  color: var(--fg);
+  box-shadow: 0 16px 44px rgba(3, 7, 18, 0.34);
+  cursor: text;
+  overscroll-behavior: contain;
+}
+
+.session-card-exchange-tooltip-scroll {
+  display: grid;
+  gap: 10px;
+  max-height: min(394px, calc(100vh - 50px));
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.session-card-exchange-tooltip-line {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+}
+
+.session-card-exchange-tooltip-line + .session-card-exchange-tooltip-line {
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.session-card-exchange-tooltip-line > span {
+  padding-top: 2px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.session-card-exchange-tooltip-line.bot > span {
+  color: var(--accent);
+}
+
+.session-card-exchange-tooltip-line > p,
+.session-card-exchange-md {
+  min-width: 0;
+  margin: 0;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* Markdown rendered inside the full-exchange overlay. Scoped tight so bot
+ * replies read as formatting (bold / code / lists / links) without importing
+ * a new palette — dashboard tokens only. Compact block spacing keeps a long
+ * reply legible in the scrollable overlay. */
+.session-card-exchange-md > :first-child { margin-top: 0; }
+
+.session-card-exchange-md > :last-child { margin-bottom: 0; }
+
+.session-card-exchange-md p { margin: 0 0 6px; }
+
+.session-card-exchange-md ul,
+.session-card-exchange-md ol { margin: 0 0 6px; padding-left: 18px; }
+
+.session-card-exchange-md li { margin: 1px 0; }
+
+.session-card-exchange-md li > p { margin: 0; }
+
+.session-card-exchange-md h1,
+.session-card-exchange-md h2,
+.session-card-exchange-md h3,
+.session-card-exchange-md h4,
+.session-card-exchange-md h5,
+.session-card-exchange-md h6 {
+  margin: 8px 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.session-card-exchange-md strong { font-weight: 700; }
+
+.session-card-exchange-md em { font-style: italic; }
+
+.session-card-exchange-md a {
+  color: var(--accent);
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+
+/* Markdown images are downgraded to a non-fetching text placeholder (no auto
+ * <img> request); the alt becomes an opt-in click-through link for safe schemes. */
+.session-card-exchange-img {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.session-card-exchange-md code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+}
+
+.session-card-exchange-md pre {
+  margin: 0 0 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
+.session-card-exchange-md pre code {
+  padding: 0;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.session-card-exchange-md blockquote {
+  margin: 0 0 6px;
+  padding-left: 10px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--muted);
+}
+
+.session-card-exchange-md hr {
+  margin: 8px 0;
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+/* 看板列 / 表格的「显示更多」：只渲染首屏，按页展开。 */
+.kanban-col-show-more,
+.sessions-table-more {
+  width: 100%;
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.kanban-col-show-more:hover,
+.sessions-table-more:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.sessions-table-more-row > td {
+  padding: 8px 12px;
+}
+
+/* 休眠会话不上看板时的一行提示，放在看板下方。 */
+.sessions-dormant-hint {
+  margin: 10px 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sessions-dormant-hint button {
+  margin-left: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.sessions-dormant-hint button:hover {
+  text-decoration: underline;
 }
 
 .kanban-card {
@@ -3732,11 +3177,6 @@ button.primary {
   font-size: 13px;
 }
 
-.team-bind-loading {
-  min-height: 0;
-  padding: 0;
-}
-
 /* ── 会话历史弹窗：飞书式左右气泡 ─────────────────────────────────────────── */
 .history-modal {
   width: min(860px, 94vw);
@@ -3857,8 +3297,7 @@ button.primary {
    EN 文案更宽把「关闭」挤下行的崩布局。基础按钮外观放在通用 .card-act 选择器上，
    这样抽屉里的裸 <a class="card-act"> 也有按钮态；.session-card-actions 只管布局。
    SVG 走 stroke:currentColor。 */
-.card-act svg,
-.term-btn svg {
+.card-act svg {
   width: 15px;
   height: 15px;
   display: block;
@@ -3899,37 +3338,6 @@ button.primary {
   background: color-mix(in srgb, var(--warning) 8%, var(--surface-raised));
 }
 .card-act:active { transform: scale(0.9); }
-
-/* 终端与可操作 Web 终端分成两个明确入口：钥匙按钮只在有写权限时显示。 */
-.term-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.term-pill .term-btn {
-  width: 30px;
-  height: 30px;
-  min-height: 30px;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--accent);
-  border-radius: 50%;
-  cursor: pointer;
-  transition: background .15s ease, filter .15s ease, transform .07s ease;
-}
-.term-pill .term-open {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 9%, var(--surface-raised));
-}
-.term-pill .term-open:hover { background: color-mix(in srgb, var(--accent) 24%, transparent); }
-.term-pill .term-write {
-  color: var(--on-accent);
-  background: var(--accent);
-}
-.term-pill .term-write:hover { filter: brightness(1.1); }
-.term-pill .term-btn:active { transform: scale(0.88); }
 
 /* ── 全局图标 tooltip（icon-tooltip.ts 委托渲染到 body，逃出容器 overflow）────── */
 .icon-tip {
@@ -4080,8 +3488,7 @@ dialog header p {
 }
 
 #drawer .actions > button,
-#drawer .actions > .btn-link,
-#drawer .actions .term-pill {
+#drawer .actions > .btn-link {
   min-height: var(--button-height);
   border-radius: var(--radius-full);
   font-size: 12px;
@@ -4288,7 +3695,7 @@ td code,
   gap: 12px;
 }
 
-#g-drawer :where(.g-add-bots-dialog, .g-save-profile-dialog, .g-manage-dialog) > header {
+#g-drawer .g-add-bots-dialog > header {
   justify-items: center;
   text-align: center;
 }
@@ -4302,7 +3709,7 @@ td code,
   color: var(--text-muted, #888);
 }
 
-#g-drawer :where(.g-add-bots-dialog, .g-save-profile-dialog, .g-manage-dialog) > header h3 {
+#g-drawer .g-add-bots-dialog > header h3 {
   max-width: min(560px, 100%);
   text-align: center;
 }
@@ -4369,29 +3776,31 @@ td code,
   gap: var(--g-create-gap);
 }
 
-#g-drawer.groups-create-modal .g-profile-menu {
-  width: 100%;
+/* 一个长子项（比如下面的复制群角色说明）不能把整张表单撑出弹窗：弹窗 overflow:hidden，
+   撑宽的部分会被直接裁掉。 */
+#g-drawer.groups-create-modal :is(.g-create-form, .g-create-fields) {
+  grid-template-columns: minmax(0, 1fr);
 }
 
-#g-drawer.groups-create-modal .g-profile-menu > summary {
-  background: var(--surface);
-  font-size: 12px;
+#g-drawer.groups-create-modal .g-clone-roles-field .checkbox-row {
+  width: auto;
+  flex-wrap: wrap;
 }
 
-#g-drawer.groups-create-modal .g-profile-menu .sect-sort-value {
-  max-width: calc(100% - 44px);
+#g-drawer.groups-create-modal .g-clone-roles-field .checkbox-row-main {
+  flex: 1 1 0;
+  flex-wrap: wrap;
 }
 
-#g-drawer.groups-create-modal .g-profile-menu .sect-sort-pop {
-  left: 0;
-  right: 0;
-  min-width: 100%;
-  transform: none;
+#g-drawer.groups-create-modal .g-clone-roles-field .checkbox-row-main :is(strong, small) {
+  white-space: normal;
 }
 
-#g-drawer.groups-create-modal .g-profile-menu .sect-sort-pop button {
-  justify-content: flex-start;
+#g-drawer.groups-create-modal .g-clone-roles-field .checkbox-row-main small {
+  flex: 1 1 100%;
+  margin-left: 0;
 }
+
 
 #g-drawer.groups-create-modal .g-create-status:empty {
   display: none;
@@ -4812,7 +4221,6 @@ td code,
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-
 
 .plugin-enable-list {
   max-height: 272px;
@@ -6309,57 +5717,6 @@ dialog.onboarding-dialog::backdrop {
   border-radius: var(--radius-full);
 }
 
-#g-drawer .g-manage-dialog {
-  gap: 10px;
-}
-
-#g-drawer .g-manage-dialog > header {
-  margin-bottom: 0;
-}
-
-#g-drawer .g-manage-meta {
-  display: flex;
-  align-items: center;
-  flex-wrap: nowrap;
-  gap: 8px;
-  min-width: 0;
-  margin: -2px 0 2px;
-  overflow: hidden;
-}
-
-#g-drawer .g-manage-meta > span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  box-sizing: border-box;
-  min-width: 0;
-  max-width: 50%;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-#g-drawer .g-manage-meta b {
-  flex: none;
-  color: var(--muted);
-  font-weight: 700;
-}
-
-#g-drawer .g-manage-meta code {
-  min-width: 0;
-  overflow: hidden;
-  padding: 0;
-  background: transparent;
-  color: var(--fg);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 #g-drawer .g-collaboration-mode {
   position: relative;
   display: grid;
@@ -6785,15 +6142,525 @@ dialog.onboarding-dialog::backdrop {
   white-space: normal;
 }
 
-@media (max-width: 720px) {
-  #g-drawer .g-manage-meta {
+/* 群管理：右侧抽屉 + 标签页。旧弹窗把 8 类设置按「设置 × 全部 bot」纵向堆叠，
+   看一个 bot 的全貌要翻完整个弹窗；现在概览一张表、单 bot 一屏。 */
+#g-drawer.groups-manage-drawer {
+  width: min(980px, calc(100vw - 24px));
+  height: calc(100vh - 24px);
+  max-height: none;
+  margin: 12px 12px 12px auto;
+  overflow: hidden;
+}
+
+#g-drawer.groups-manage-drawer[open] {
+  animation: g-drawer-in 160ms ease-out;
+}
+
+@keyframes g-drawer-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #g-drawer.groups-manage-drawer[open] { animation: none; }
+}
+
+#g-drawer .g-manage-dialog {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  gap: 0;
+  height: 100%;
+  padding: 0;
+}
+
+#g-drawer .g-manage-dialog > .hint-warn {
+  margin: 0 18px 10px;
+}
+
+#g-drawer .g-manage-head {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px 12px;
+  text-align: left;
+  justify-items: stretch;
+}
+
+#g-drawer .g-manage-title {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+#g-drawer .g-manage-title h3 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+#g-drawer .g-manage-facts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+#g-drawer .g-manage-facts b {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+#g-drawer .g-manage-chatid {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--faint);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+#g-drawer .g-manage-chatid code {
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-family: var(--mono);
+}
+
+#g-drawer .g-manage-chatid > span {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+#g-drawer .g-manage-chatid:hover code {
+  color: var(--fg);
+}
+
+#g-drawer .g-manage-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#g-drawer .g-manage-close {
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: var(--radius-full);
+  font-size: 18px;
+  line-height: 1;
+}
+
+#g-drawer .g-manage-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border-soft);
+  overflow-x: auto;
+}
+
+#g-drawer .g-manage-tabs button {
+  flex: none;
+  min-height: 36px;
+  padding: 0 12px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+#g-drawer .g-manage-tabs button:hover {
+  color: var(--fg);
+}
+
+#g-drawer .g-manage-tabs button.active {
+  border-bottom-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+#g-drawer .g-manage-tabs button.danger.active {
+  border-bottom-color: var(--danger);
+  color: var(--danger);
+}
+
+#g-drawer .g-manage-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 18px 18px;
+}
+
+#g-drawer .g-manage-body > section {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+#g-drawer .g-manage-body > section[hidden] {
+  display: none;
+}
+
+#g-drawer .g-panel-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 概览矩阵 */
+#g-drawer .g-matrix-wrap {
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+}
+
+#g-drawer .g-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+#g-drawer .g-matrix th,
+#g-drawer .g-matrix td {
+  max-width: 160px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#g-drawer .g-matrix thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: color-mix(in srgb, var(--surface-muted) 70%, var(--surface));
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+#g-drawer .g-matrix tbody tr {
+  cursor: pointer;
+}
+
+#g-drawer .g-matrix tbody tr:hover {
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+#g-drawer .g-matrix tbody tr:last-child > * {
+  border-bottom: none;
+}
+
+#g-drawer .g-matrix tbody th {
+  position: sticky;
+  left: 0;
+  max-width: 200px;
+  background: var(--surface);
+}
+
+#g-drawer .g-matrix tbody tr:hover th {
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+#g-drawer .g-matrix-bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+}
+
+#g-drawer .g-matrix-bot strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+#g-drawer .g-cell-on {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+#g-drawer .g-cell-off {
+  color: var(--faint);
+}
+
+#g-drawer .g-cell-warn {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+/* 机器人设置：左侧选 bot，右侧该 bot 的全部设置 */
+#g-drawer .g-bots-panel:not([hidden]) {
+  grid-template-columns: 200px minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+}
+
+#g-drawer .g-bot-picker-rail {
+  position: sticky;
+  top: 0;
+  display: grid;
+  gap: 2px;
+  max-height: calc(100vh - 200px);
+  overflow: auto;
+}
+
+#g-drawer .g-bot-picker-rail button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-align: left;
+}
+
+#g-drawer .g-bot-picker-rail button > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#g-drawer .g-bot-picker-rail button > small {
+  flex: none;
+  color: var(--faint);
+  font-size: 10.5px;
+}
+
+#g-drawer .g-bot-picker-rail button:hover {
+  background: color-mix(in srgb, var(--surface-muted) 60%, transparent);
+  color: var(--fg);
+}
+
+#g-drawer .g-bot-picker-rail button.active {
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: var(--accent-strong);
+}
+
+#g-drawer .g-bot-settings {
+  display: grid;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+}
+
+#g-drawer .g-setting-block {
+  display: grid;
+  grid-template-columns: minmax(150px, 220px) minmax(0, 1fr);
+  gap: 14px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+#g-drawer .g-setting-block:first-child {
+  border-top: none;
+}
+
+#g-drawer .g-setting-block > header {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  text-align: left;
+  justify-items: start;
+}
+
+#g-drawer .g-setting-block > header strong {
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+#g-drawer .g-setting-block > header small {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+#g-drawer .g-setting-body {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+}
+
+#g-drawer .g-setting-body .oncall-row,
+#g-drawer .g-setting-body .g-pin-row {
+  padding: 0;
+  border: none;
+}
+
+/* 回复模式块的标题已经是「普通群回复模式」，下拉框自己的「回复模式」标签只留给读屏。
+   按 data 属性定向：只有调用方显式传了字段标签时才隐藏，避免未来新增不传 label
+   的调用点时把 botName 视觉隐藏。 */
+#g-drawer .g-setting-body .group-reply-mode-row > label[data-reply-mode-label] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+#g-drawer .g-role-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+#g-drawer .g-disband-field {
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border-soft));
+}
+
+@media (max-width: 760px) {
+  /* 基础 dialog 有 max-width: calc(100% - 32px)，不解除的话抽屉只有屏宽减 32px、
+     贴左，右侧露出底下的列表。 */
+  #g-drawer.groups-manage-drawer {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100dvh;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+  }
+  #g-drawer .g-manage-head {
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 12px 14px 10px;
+  }
+  #g-drawer .g-manage-head > .orb-avatar {
+    display: none;
+  }
+  #g-drawer .g-manage-tabs {
     flex-wrap: wrap;
+    padding: 0 8px;
   }
-
-  #g-drawer .g-manage-meta > span {
+  #g-drawer .g-manage-tabs button {
+    padding: 0 9px;
+  }
+  #g-drawer .g-manage-body {
+    padding: 12px 14px 16px;
+  }
+  #g-drawer .g-bots-panel:not([hidden]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  #g-drawer .g-bot-picker-rail {
+    position: static;
+    display: flex;
+    flex-wrap: wrap;
+    max-height: 116px;
+    overflow-y: auto;
+  }
+  #g-drawer .g-bot-picker-rail button {
+    flex: none;
     max-width: 100%;
+    min-height: 30px;
+    border-color: var(--border-soft);
   }
+  #g-drawer .g-setting-block {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+}
 
+/* 会话群行：标题 + 会话状态；第二行是机器人、最近活跃、创建时间。 */
+.groups-page .groups-session-state {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.groups-page .groups-session-state-active {
+  border-color: color-mix(in srgb, var(--success) 34%, var(--border-soft));
+  background: color-mix(in srgb, var(--success) 8%, var(--surface));
+  color: var(--success);
+}
+
+.groups-page .groups-session-state-closed {
+  border-style: dashed;
+  color: var(--faint);
+}
+
+.groups-page .groups-session-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.groups-page .groups-session-bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 220px;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.groups-page .groups-session-bot > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.groups-page .groups-session-bot .orb-avatar-sm {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.groups-page .groups-session-bot:hover,
+.groups-page .groups-session-bot:focus-visible {
+  color: var(--accent-strong);
+}
+
+@media (max-width: 720px) {
   #g-drawer .g-mode-rail,
   #g-drawer .g-project-protocol,
   #g-drawer .g-card-template-rail {
@@ -6903,6 +6770,22 @@ dialog.onboarding-dialog::backdrop {
   background: color-mix(in srgb, var(--warning) 8%, transparent);
   border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
 }
+
+/* Shared-bot sandbox advice: one short line per fact, verified CLIs folded. */
+.bd-section-note.bd-shared-sandbox-advice {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  line-height: 1.55;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
+}
+.bd-shared-sandbox-advice p { margin: 0; }
+.bd-shared-sandbox-advice p + p { margin-top: 2px; }
+.bd-shared-sandbox-advice details { margin-top: 4px; }
+.bd-shared-sandbox-advice summary { cursor: pointer; width: fit-content; }
+.bd-shared-sandbox-advice details p { margin-top: 2px; color: var(--muted); }
 
 /* ── Sandbox directory whitelist tree ── */
 .bd-sbx-tree { margin-top: 10px; max-height: 380px; overflow: auto; border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px; font-size: 13px; }
@@ -7221,9 +7104,6 @@ dialog.onboarding-dialog::backdrop {
     flex: 1 1 0;
     min-width: 0;
   }
-  .sessions-board {
-    grid-template-columns: 1fr;
-  }
   /* 窄屏看板：列改纵向堆叠，高度交还内容 */
   .sessions-kanban {
     flex-direction: column;
@@ -7263,10 +7143,6 @@ dialog.onboarding-dialog::backdrop {
   }
   .term-modal-body {
     padding: 8px;
-  }
-
-  .filter-check {
-    justify-content: flex-start;
   }
   table {
     display: block;
@@ -9818,330 +9694,13 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .orb-avatar.orb-square .orb-img { border-radius: var(--radius-md); }
 .orb-avatar.orb-square.orb-avatar-sm,
 .orb-avatar.orb-square.orb-avatar-sm .orb-img { border-radius: var(--radius-sm); }
-/* 群列表名称单元格：群头像 + 群名/ID 横向排列。 */
-.g-profile-status {
-  display: inline-flex;
-  align-items: center;
-  max-width: 240px;
-  margin-top: 5px;
-  padding: 2px 7px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-soft);
-  background: var(--surface-muted);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.5;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.g-profile-status.full {
-  border-color: color-mix(in srgb, var(--success) 35%, var(--border-soft));
-  background: color-mix(in srgb, var(--success) 10%, var(--surface));
-  color: var(--success);
-}
-.g-profile-status.partial {
-  border-color: color-mix(in srgb, var(--warning) 35%, var(--border-soft));
-  background: color-mix(in srgb, var(--warning) 12%, var(--surface));
-  color: var(--warning);
-}
-.g-profile-status.muted { font-weight: 600; }
-.g-save-profile-dialog {
-  display: grid;
-  gap: 12px;
-}
-.g-save-profile-dialog [hidden] {
-  display: none !important;
-}
-#g-drawer .g-save-profile-dialog .form-row {
-  gap: 8px;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-}
-#g-drawer .g-save-profile-dialog .form-row > span {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-.g-save-profile-panel {
-  display: grid;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  background: var(--surface-muted);
-}
-.g-save-profile-section-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: baseline;
-}
-.g-save-profile-section-head > span {
-  color: var(--fg);
-  font-weight: 700;
-}
-.g-save-profile-section-head > small {
-  color: var(--muted);
-  font-size: 12px;
-}
-.g-save-profile-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.g-save-profile-stats span {
-  display: inline-flex;
-  gap: 5px;
-  align-items: center;
-  padding: 3px 8px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-}
-.g-save-profile-stats strong {
-  color: var(--fg);
-}
-.g-save-profile-stats .warn {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-.g-save-profile-entry-list {
-  display: grid;
-  gap: 6px;
-  max-height: 170px;
-  overflow: auto;
-}
-.g-save-profile-entry {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-  padding: 8px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-}
-.g-save-profile-entry > div {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-.g-save-profile-entry strong,
-.g-save-profile-entry code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.g-save-profile-entry code {
-  color: var(--muted);
-  background: transparent;
-  padding: 0;
-}
-.g-save-profile-entry.error {
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--border-soft));
-}
-.g-save-profile-entry-status {
-  display: inline-flex;
-  align-items: center;
-  min-height: 22px;
-  padding: 2px 8px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-muted);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-.g-save-profile-entry-status.ok {
-  color: var(--success);
-  background: color-mix(in srgb, var(--success) 12%, var(--surface));
-}
-.g-save-profile-entry-status.error {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-.g-save-profile-empty {
-  color: var(--muted);
-  font-size: 13px;
-}
-.g-save-profile-switch {
-  display: inline-flex;
-  align-items: center;
-  justify-self: start;
-  gap: 2px;
-  width: fit-content;
-  max-width: 100%;
-  height: var(--button-height);
-  min-height: var(--button-height);
-  padding: 2px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  overflow-x: auto;
-}
-.g-save-profile-switch button {
-  box-sizing: border-box;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: calc(var(--button-height) - 6px);
-  min-height: calc(var(--button-height) - 6px);
-  max-height: calc(var(--button-height) - 6px);
-  min-width: 0;
-  padding: 0 var(--button-padding-x);
-  border: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--muted);
-  box-shadow: none;
-  white-space: nowrap;
-}
-.g-save-profile-switch button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--border-soft) 60%, transparent);
-  color: var(--accent-strong);
-}
-.g-save-profile-switch button.active {
-  background: color-mix(in srgb, var(--muted) 12%, var(--surface));
-  color: var(--accent);
-  box-shadow: none;
-}
-.g-save-profile-switch button:disabled {
-  opacity: 0.46;
-  cursor: not-allowed;
-}
-#g-drawer .g-save-profile-dialog input[name="profileId"] {
-  box-sizing: border-box;
-  width: min(420px, 100%);
-  height: var(--button-height);
-  min-height: var(--button-height);
-  padding: 0 var(--button-padding-x);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--fg);
-  font-size: 12px;
-  font-weight: 700;
-  box-shadow: none;
-}
-#g-drawer .g-save-profile-dialog input[name="profileId"]:hover:not(:disabled) {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
-  color: var(--accent-strong);
-}
-#g-drawer .g-save-profile-dialog input[name="profileId"]:focus,
-#g-drawer .g-save-profile-dialog input[name="profileId"]:focus-visible {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
-  color: var(--fg);
-  outline: none;
-  box-shadow: none;
-}
-.g-save-profile-picker {
-  display: grid;
-  gap: 8px;
-  max-height: 220px;
-  overflow: auto;
-}
-.g-save-profile-pick {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-  justify-content: stretch;
-  min-height: 38px;
-  width: 100%;
-  border-radius: var(--radius-sm);
-  background: var(--surface-muted);
-  box-shadow: none;
-  text-align: left;
-}
-.g-save-profile-pick.selected {
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
-  color: var(--accent-strong);
-}
-.g-save-profile-pick span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.g-save-profile-pick small,
-.g-save-profile-summary,
-.g-save-profile-status,
+
 .form-row small {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.55;
 }
-.g-save-profile-target {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 4px 10px;
-  align-items: center;
-  padding: 9px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--surface-muted);
-}
-.g-save-profile-target > span {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-.g-save-profile-target code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.g-save-profile-target small {
-  grid-column: 2;
-  color: var(--muted);
-  font-size: 12px;
-}
-.g-save-profile-summary {
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-muted);
-}
-.g-save-profile-summary.warn,
-.g-save-profile-status.error {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-.g-save-profile-status {
-  min-height: 0;
-}
-.g-save-profile-status:not(:empty) {
-  display: inline-flex;
-  align-items: center;
-  justify-self: start;
-  min-height: 30px;
-  padding: 0 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1.35;
-}
-.g-save-profile-status.ok:not(:empty) {
-  border-color: color-mix(in srgb, var(--success) 28%, var(--border-soft));
-  background: color-mix(in srgb, var(--success) 8%, var(--surface));
-  color: var(--success);
-}
-.g-save-profile-status.error:not(:empty) {
-  border-color: color-mix(in srgb, var(--danger) 34%, var(--border-soft));
-  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
-  color: var(--danger);
-}
+
 .orb-dot {
   position: absolute;
   right: -1px;
@@ -10626,45 +10185,6 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .overview-list-item-schedule .overview-list-meta .ui-overflow-text {
   width: 100%;
 }
-
-/* ── 会话看板：工作面收敛（弱玻璃 + 高密度 + 新状态光）───────────────────── */
-.sessions-board {
-  background-image: none;
-  padding: 0;
-}
-.session-board-column { border-radius: var(--radius-xl); }
-:root[data-theme="dark"] .session-board-column {
-  background: color-mix(in srgb, var(--surface-muted) 88%, var(--bg));
-  border-color: var(--border-soft);
-}
-:root[data-theme="dark"] .session-board-column > header {
-  background: transparent;
-  border-color: var(--border-soft);
-}
-.session-board-column h2 {
-  font-family: inherit;
-  letter-spacing: 0.02em;
-  text-transform: none;
-  font-size: 13px;
-}
-.session-board-count { border-radius: var(--radius-full); font-family: inherit; }
-.session-board-needs-you { --col-signal: var(--warning); }
-.session-board-needs-you { background: color-mix(in srgb, var(--warning) 4%, var(--surface)); }
-.session-board-todo { --col-signal: var(--info); }
-.session-board-working { --col-signal: var(--accent); }
-.session-board-idle { --col-signal: var(--success); }
-:root[data-theme="dark"] .session-board-needs-you {
-  background: color-mix(in srgb, var(--warning) 7%, var(--surface-muted));
-}
-.session-card { border-radius: var(--radius-lg); }
-:root[data-theme="dark"] .session-card {
-  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
-  border-color: var(--border-soft);
-}
-.session-card-top {
-  grid-template-columns: max-content minmax(0, 1fr) max-content;
-  align-items: center;
-}
 .session-signal {
   color: var(--warning);
   background: color-mix(in srgb, var(--warning) 10%, transparent);
@@ -10773,60 +10293,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   background: var(--accent);
   box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 60%, transparent);
 }
-
-/* CLI 下拉 chip + 弹层 */
-.filter-cli {
-  position: relative;
-  width: var(--dropdown-trigger-width);
-  flex: none;
-}
-.filter-cli summary {
-  position: relative;
-  list-style: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  width: 100%;
-  min-height: var(--button-height);
-  padding: 0 28px 0 var(--button-padding-x);
-  border-radius: var(--radius-full);
-  border: 1px solid var(--border-soft);
-  background: color-mix(in srgb, var(--surface) 72%, transparent);
-  color: var(--muted);
-  font-size: 11.5px;
-  font-weight: 700;
-  cursor: pointer;
-  user-select: none;
-  transition:
-    border-color 150ms ease,
-    background-color 150ms ease,
-    color 150ms ease,
-    transform 150ms ease;
-}
-.filter-cli summary::-webkit-details-marker { display: none; }
-.filter-cli summary::after {
-  content: "";
-  position: absolute;
-  right: 12px;
-  top: 50%;
-  width: 6px;
-  height: 6px;
-  border-right: 1.5px solid currentColor;
-  border-bottom: 1.5px solid currentColor;
-  transform: translateY(-58%) rotate(45deg);
-  opacity: 0.72;
-}
-.filter-cli summary b { font-weight: 700; color: var(--fg); }
 .filter-cli summary b.cli-filter-active { color: var(--accent); }
-.filter-cli summary:hover,
-.filter-cli[open] summary {
-  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--accent-strong);
-}
-.filter-cli[open] summary::after {
-  transform: translateY(-34%) rotate(225deg);
-}
 .filter-cli-pop {
   position: absolute;
   z-index: 30;
@@ -10849,42 +10316,6 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   align-items: center;
   gap: 6px;
 }
-.filter-cli-search {
-  flex: 1 1 auto;
-  min-width: 0;
-  min-height: var(--button-compact-height);
-  padding: 0 10px;
-  border-radius: var(--radius-full);
-  border: 1px solid var(--border-soft);
-  background: var(--surface-raised);
-  color: var(--fg);
-  font-size: 12px;
-}
-.filter-cli-search:focus {
-  outline: none;
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft));
-}
-.filter-cli-bulk {
-  display: inline-flex;
-  gap: 4px;
-  flex: none;
-}
-.filter-cli-bulk button {
-  min-height: var(--button-compact-height);
-  padding: 0 9px;
-  border-radius: var(--radius-full);
-  border: 1px solid var(--border-soft);
-  background: var(--surface-raised);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.filter-cli-bulk button:hover {
-  border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
-  color: var(--accent-strong);
-}
 .filter-cli-options {
   display: flex;
   flex-wrap: wrap;
@@ -10892,37 +10323,8 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   max-height: 320px;
   overflow-y: auto;
 }
-.filter-cli-empty {
-  padding: 8px 4px;
-  color: var(--faint);
-  font-size: 12px;
-}
-.filter-cli-pop .filter-check {
-  min-height: var(--button-compact-height);
-  padding: 0 var(--button-padding-x);
-  border-radius: var(--radius-full);
-  border: 1px solid transparent;
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-}
-.filter-cli-pop .filter-check input { position: absolute; opacity: 0; pointer-events: none; }
-.filter-cli-pop .filter-check:hover {
-  border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
-  color: var(--accent-strong);
-}
-.filter-cli-pop .filter-check:has(input:checked) {
-  color: var(--accent-strong);
-  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
-}
-
 @media (max-width: 720px) {
   .sessions-filters input[type=search] { flex: 1 1 100%; }
-  .filter-cli-pop { left: auto; right: 0; }
 }
 
 /* ── Bot 配置 → 数字员工档案（master-detail）────────────────────────────── */
@@ -13432,46 +12834,6 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
 .roles-group-row.selected { background: var(--accent-soft); }
 .roles-badge { border-radius: var(--radius-sm); }
 
-/* ── 看板列顺序自定义：列头可拖拽 + hover 出现 ‹/› 按钮 ──────────────────── */
-.session-board-column > header[draggable] { cursor: grab; }
-.session-board-column > header[draggable]:active { cursor: grabbing; }
-.session-board-head-right {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-}
-.session-board-move { display: inline-flex; gap: 3px; opacity: 0; transition: opacity 120ms ease; }
-.session-board-column > header:hover .session-board-move,
-.session-board-move:focus-within { opacity: 1; }
-@media (hover: none) {
-  .session-board-move { opacity: 1; }
-}
-.session-board-move button {
-  min-height: 22px;
-  min-width: 22px;
-  padding: 0;
-  border-radius: var(--radius-full);
-  font-size: 13px;
-  line-height: 1;
-  color: var(--muted);
-  background: transparent;
-  border: 1px solid var(--border-soft);
-}
-.session-board-move button:hover:not(:disabled) {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-}
-.session-board-move button:disabled { opacity: 0.3; }
-.session-board-column.dragging { opacity: 0.55; }
-.session-board-column.drag-over {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
-}
-@media (prefers-reduced-motion: reduce) {
-  .session-board-move { transition: none; }
-}
-
 @media (max-width: 980px) {
   .chrome-body {
     display: flex;
@@ -13973,7 +13335,6 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
 
 .groups-page .filters label,
 .schedules-page .filters label,
-.team-page .card label,
 .insights-page .ins-toggle {
   display: inline-flex;
   align-items: center;
@@ -13991,7 +13352,6 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
 
 .groups-page .filters label:has(input:checked),
 .schedules-page .filters label:has(input:checked),
-.team-page .card label:has(input:checked),
 .insights-page .ins-toggle:has(input:checked) {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 9%, var(--surface));
@@ -14503,29 +13863,30 @@ tbody tr[data-chat]:hover {
   overflow-y: auto;
 }
 
+/* 群列表行：群头像 | 群名 + 在群 bot | 操作。一行一个群，高度只随在群 bot 数变化，
+   不再把整个 roster 逐个标「缺失」。整行可点进管理抽屉。 */
 .groups-list-row {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) auto;
-  align-items: start;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
   column-gap: 12px;
-  row-gap: 12px;
   align-self: start;
-  min-height: 94px;
-  padding: 12px;
+  min-height: 64px;
+  padding: 10px 12px;
+  cursor: pointer;
   content-visibility: auto;
-  contain-intrinsic-size: auto 160px;
+  contain-intrinsic-size: auto 72px;
 }
 
 .groups-list-row > .orb-avatar {
   grid-column: 1;
   align-self: start;
-  margin-top: 0;
+  margin-top: 2px;
 }
 
 .groups-list-row .overview-list-main {
   grid-column: 2;
   display: grid;
-  align-self: start;
   gap: 6px;
   min-width: 0;
 }
@@ -14536,64 +13897,115 @@ tbody tr[data-chat]:hover {
   gap: 8px;
   min-width: 0;
   min-height: 24px;
-  overflow: hidden;
 }
 
-.groups-row-head b {
+.groups-page .groups-row-title {
   flex: 0 1 auto;
   min-width: 0;
-  line-height: 24px;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 22px;
+  text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.groups-page .groups-row-title:hover,
+.groups-page .groups-row-title:focus-visible {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .groups-row-count {
-  grid-column: 3;
-  grid-row: 1;
-  justify-self: end;
-  align-self: start;
   flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-sizing: border-box;
-  height: 24px;
-  min-height: 24px;
-  padding: 0 8px;
-  border-radius: var(--radius-full);
-  border: 1px solid var(--border-soft);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 22px;
-  text-align: center;
+  color: var(--faint);
+  font-size: 11.5px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
-.groups-list-row .groups-row-meta {
+.groups-row-bots {
   display: flex;
   align-items: center;
-  flex: 1 1 auto;
-  flex-wrap: nowrap;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 4px 6px;
   min-width: 0;
-  max-width: none;
-  overflow: hidden;
-  color: var(--faint);
-  font-size: 11px;
 }
 
-.groups-list-row .groups-row-tag {
+.groups-page .groups-bot-chip {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 5px;
   box-sizing: border-box;
+  max-width: 180px;
   height: 24px;
   min-height: 24px;
+  padding: 0 8px 0 3px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 22px;
+  white-space: nowrap;
+}
+
+.groups-page .groups-bot-chip > span:last-child {
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.groups-page .groups-bot-chip .orb-avatar-sm {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.groups-page button.groups-bot-chip {
+  cursor: pointer;
+}
+
+.groups-page button.groups-bot-chip:hover,
+.groups-page button.groups-bot-chip:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  color: var(--accent-strong);
+}
+
+.groups-page .groups-bot-chip-more {
+  padding: 0 8px;
+  color: var(--faint);
+}
+
+.groups-page .groups-bot-chip-error {
+  padding: 0 8px;
+  border-color: color-mix(in srgb, var(--danger) 34%, var(--border-soft));
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  color: var(--danger);
+}
+
+.groups-row-empty-bots {
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.groups-row-tag {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  box-sizing: border-box;
+  height: 22px;
   padding: 0 8px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-full);
@@ -14601,135 +14013,25 @@ tbody tr[data-chat]:hover {
   color: var(--faint);
   font-size: 11px;
   font-weight: 700;
-  line-height: 22px;
-  overflow: hidden;
   white-space: nowrap;
 }
 
-.groups-list-row .groups-row-tag:first-child {
-  flex: 0 1 auto;
-  max-width: none;
-}
-
-.groups-list-row .groups-row-owner-tag {
-  flex: 0 1 auto;
-  max-width: none;
-}
-
-.groups-list-row .groups-row-project-tag {
-  flex: none;
+.groups-row-project-tag {
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--accent-strong);
   letter-spacing: .04em;
 }
 
-.groups-list-row .groups-row-tag > span,
-.groups-list-row .groups-row-tag > code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.groups-list-row .groups-row-tag > code {
-  background: transparent;
-  color: inherit;
-  font-family: var(--mono);
-  padding: 0;
-}
-
-.groups-bot-strip {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.groups-bot-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  max-width: 172px;
-  box-sizing: border-box;
-  height: 24px;
-  min-height: 24px;
-  padding: 0 9px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 22px;
-  text-align: center;
-}
-
-.groups-bot-pill i {
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: 50%;
-  background: currentColor;
-  opacity: 0.78;
-}
-
-.groups-bot-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.groups-bot-state {
-  flex: none;
-  color: var(--faint);
-  font-size: 10px;
-  line-height: 1;
-}
-
-.groups-bot-in {
-  border-color: color-mix(in srgb, var(--success) 26%, var(--border-soft));
-  background: color-mix(in srgb, var(--success) 8%, var(--surface));
-  color: var(--success);
-}
-
-.groups-bot-out {
-  background: color-mix(in srgb, var(--muted) 10%, var(--surface));
-  color: var(--muted);
-}
-
-.groups-bot-error {
-  border-color: color-mix(in srgb, var(--danger) 34%, var(--border-soft));
-  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
-  color: var(--danger);
-}
-
-.groups-bot-unknown {
-  border-style: dashed;
-  color: var(--faint);
-}
-
-.groups-row-lower {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 12px;
-  min-width: 0;
-}
 
 .groups-list-row .overview-list-tail {
-  align-self: end;
+  grid-column: 3;
+  align-self: center;
   justify-self: end;
   justify-content: flex-end;
   flex: none;
   flex-wrap: nowrap;
   width: max-content;
-  max-width: 332px;
 }
 
 .groups-list-empty {
@@ -14798,7 +14100,7 @@ tbody tr[data-chat]:hover {
   }
 }
 
-.groups-page .groups-list-row .overview-list-tail button {
+.groups-page .groups-list-row .overview-list-tail :is(button, .btn-link) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -14810,15 +14112,14 @@ tbody tr[data-chat]:hover {
 }
 
 @media (max-width: 900px) {
-  .groups-row-lower {
-    align-items: flex-start;
-    grid-template-columns: 1fr;
+  .groups-list-row {
+    grid-template-columns: 28px minmax(0, 1fr);
+    row-gap: 8px;
   }
   .groups-list-row .overview-list-tail {
+    grid-column: 1 / -1;
     justify-self: end;
-    width: max-content;
     max-width: 100%;
-    flex-wrap: nowrap;
   }
 }
 
@@ -14834,13 +14135,13 @@ tbody tr[data-chat]:hover {
   color: var(--accent-strong);
 }
 
-.groups-page :where(.groups-list-row .save-profile, .groups-list-row .manage-chat) {
+.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat, .groups-list-row .open-chat, .groups-list-row .open-session) {
   border-color: var(--border-soft);
   background: var(--surface);
   color: var(--muted);
 }
 
-.groups-page :where(.groups-list-row .save-profile, .groups-list-row .manage-chat):hover:not(:disabled) {
+.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat, .groups-list-row .open-chat, .groups-list-row .open-session):hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface));
   color: var(--accent-strong);
@@ -14891,36 +14192,6 @@ tbody tr[data-chat]:hover {
   margin: 10px 0 0;
   padding: 12px 14px;
   background: var(--surface-muted);
-}
-
-.team-page .card {
-  margin-bottom: 0 !important;
-}
-
-.team-page .card + .card {
-  margin-top: 0;
-}
-
-.team-page .card p:has(input, select, button),
-.team-page .card > div[style*="display: flex"] {
-  display: flex !important;
-  align-items: center !important;
-  gap: 10px !important;
-  flex-wrap: wrap !important;
-}
-
-.team-page .card h2 {
-  margin: 0 0 var(--section-title-content-gap) !important;
-}
-
-.team-list-card {
-  margin: 0 0 10px;
-  padding: 12px 14px;
-  background: var(--surface-muted);
-}
-
-.team-manage-card {
-  padding: 10px 14px;
 }
 
 .wb-split {
@@ -15739,34 +15010,27 @@ main:has(.whiteboards-page) {
 }
 
 .sessions-page .sessions-page-actions > .create-session-btn,
-.sessions-page .sessions-view-controls > .segmented,
-.sessions-page .sessions-view-controls > .kanban-team-menu,
-.sessions-page .sessions-view-controls > .kanban-team-menu > summary {
+.sessions-page .sessions-view-controls > .segmented {
   height: var(--sessions-heading-control-height);
   min-height: var(--sessions-heading-control-height);
   max-height: var(--sessions-heading-control-height);
 }
 
-.sessions-page .sessions-view-controls > .kanban-team-menu {
-  width: var(--dropdown-trigger-width);
-  min-width: var(--dropdown-trigger-width);
-}
-
-.sessions-page .sessions-view-controls :where(.segmented button, .kanban-team-menu > summary),
+.sessions-page .sessions-view-controls .segmented button,
 .sessions-page .sessions-page-actions > .create-session-btn {
   font-size: 12px;
   font-weight: 700;
 }
 
-.sessions-page .sessions-view-controls :where(.kanban-groupby, .sessions-view-toggle) button.active,
-.sessions-page .sessions-view-controls :where(.kanban-groupby, .sessions-view-toggle) button[aria-pressed="true"] {
+.sessions-page .sessions-view-controls .sessions-view-toggle button.active,
+.sessions-page .sessions-view-controls .sessions-view-toggle button[aria-pressed="true"] {
   background: var(--sessions-switch-active-bg);
   color: var(--sessions-switch-active-fg);
   box-shadow: none;
 }
 
-.sessions-page .sessions-view-controls :where(.kanban-groupby, .sessions-view-toggle) button.active:hover,
-.sessions-page .sessions-view-controls :where(.kanban-groupby, .sessions-view-toggle) button[aria-pressed="true"]:hover {
+.sessions-page .sessions-view-controls .sessions-view-toggle button.active:hover,
+.sessions-page .sessions-view-controls .sessions-view-toggle button[aria-pressed="true"]:hover {
   background: var(--sessions-switch-active-bg);
   color: var(--sessions-switch-active-fg);
 }
@@ -15789,60 +15053,10 @@ main:has(.whiteboards-page) {
   flex: none;
 }
 
-.sessions-page .sessions-view-controls > .kanban-groupby {
-  box-sizing: border-box;
-  min-width: 0;
-  max-width: 280px;
-  overflow: hidden;
-  opacity: 1;
-  visibility: visible;
-  will-change: max-width, padding, gap, opacity;
-  transition:
-    max-width var(--sessions-groupby-motion),
-    padding var(--sessions-groupby-motion),
-    gap var(--sessions-groupby-motion),
-    border-color 180ms ease,
-    opacity 150ms ease-out 100ms,
-    visibility 0s linear 0s;
-}
-
-.sessions-page .sessions-view-controls > .kanban-groupby button {
-  flex: 0 0 auto;
-  min-width: max-content;
-  white-space: nowrap;
-  transition:
-    background-color 220ms ease,
-    color 200ms ease,
-    transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.sessions-page .sessions-view-controls > .kanban-groupby.is-collapsed {
-  max-width: 0;
-  padding-right: 0;
-  padding-left: 0;
-  gap: 0;
-  border-color: transparent;
-  opacity: 0;
-  pointer-events: none;
-  visibility: hidden;
-  transition:
-    max-width var(--sessions-groupby-motion),
-    padding var(--sessions-groupby-motion),
-    gap var(--sessions-groupby-motion),
-    border-color 180ms ease,
-    opacity 120ms ease-in,
-    visibility 0s linear 360ms;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .topbar .brand-wordmark,
   .topbar .brand-product {
     animation: none;
-  }
-
-  .sessions-page .sessions-view-controls > .kanban-groupby,
-  .sessions-page .sessions-view-controls > .kanban-groupby button {
-    transition: none;
   }
 }
 
@@ -16098,8 +15312,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
 .dashboard-toolbar > button,
 .dashboard-toolbar > .btn-link,
 .dashboard-toolbar > .filter-toggle,
-.dashboard-toolbar > .sect-sort-menu,
-.dashboard-toolbar > .toolbar-status {
+.dashboard-toolbar > .sect-sort-menu {
   height: var(--button-height);
   min-height: var(--button-height);
   max-height: var(--button-height);
@@ -16209,25 +15422,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
-}
-
-.dashboard-toolbar > .toolbar-status {
-  display: inline-flex;
-  align-items: center;
-  padding: 0 var(--button-padding-x);
-  border: 1px solid var(--border-soft);
-  background: var(--surface);
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.dashboard-toolbar > .toolbar-status:empty {
-  display: none;
-}
-
-.dashboard-toolbar > .toolbar-status.error {
-  border-color: color-mix(in srgb, var(--danger) 42%, var(--border-soft));
-  color: var(--danger);
 }
 
 .dashboard-toolbar .filter-toggle {
@@ -16546,6 +15740,53 @@ form.dashboard-toolbar > input[type="text"]:focus {
   align-items: center;
 }
 
+/* 普通群 / 会话群切换：工具栏最左侧，两侧各带数量。 */
+.groups-view-switch {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+}
+
+.groups-page .groups-view-switch button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: calc(var(--button-height) - 8px);
+  padding: 0 14px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  transition: background-color 80ms ease, color 80ms ease;
+}
+
+.groups-page .groups-view-switch button small {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.groups-page .groups-view-switch button:hover:not(.active) {
+  color: var(--fg);
+}
+
+.groups-page .groups-view-switch button.active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.groups-page .groups-view-switch button.active small {
+  color: inherit;
+  opacity: .8;
+}
+
 .groups-toolbar input[type="search"] {
   flex: 1 1 280px;
   max-width: 460px;
@@ -16763,7 +16004,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   min-width: 154px;
 }
 
-.sessions-page .sessions-view-controls :is(.kanban-groupby, .sessions-view-toggle) {
+.sessions-page .sessions-view-controls .sessions-view-toggle {
   box-sizing: border-box;
   height: var(--button-height);
   min-height: var(--button-height);
@@ -16772,257 +16013,24 @@ form.dashboard-toolbar > input[type="text"]:focus {
   border-color: var(--border-soft);
 }
 
-.sessions-page .sessions-view-controls :is(.kanban-groupby, .sessions-view-toggle) button {
+.sessions-page .sessions-view-controls .sessions-view-toggle button {
   height: calc(var(--button-height) - 6px);
   min-height: calc(var(--button-height) - 6px);
   padding: 0 var(--button-padding-x);
 }
 
-.page :where(.actions, .update-actions, .schedule-actions, .roles-editor-actions, .connector-item-actions, .connector-edit-actions, .team-manage-actions, .team-role-actions) {
+.page :where(.actions, .update-actions, .schedule-actions, .roles-editor-actions, .connector-item-actions, .connector-edit-actions) {
   align-items: center;
   gap: 8px;
 }
 
-.page :where(.connector-item-actions, .team-manage-actions, .roles-editor-actions, .update-actions) {
+.page :where(.connector-item-actions, .roles-editor-actions, .update-actions) {
   min-height: var(--button-height);
-}
-
-.team-subnav {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  width: fit-content;
-  min-height: var(--button-height);
-  margin: 0;
-  padding: 2px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-}
-
-.team-subnav a {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: calc(var(--button-height) - 6px);
-  padding: 0 var(--button-padding-x);
-  border: 0;
-  border-radius: var(--radius-full);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  text-decoration: none;
-  transition:
-    border-color 150ms ease,
-    background-color 150ms ease,
-    color 150ms ease;
-}
-
-.team-subnav a:hover {
-  color: var(--accent-strong);
-  background: color-mix(in srgb, var(--border-soft) 60%, transparent);
 }
 
 .team-subnav a.active {
   background: color-mix(in srgb, var(--muted) 12%, var(--surface));
   color: var(--accent);
-}
-
-.team-card {
-  display: grid;
-  gap: 12px;
-  padding: 16px;
-}
-
-.team-card h2 {
-  margin: 0 !important;
-}
-
-.team-filters {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-  margin-bottom: 8px;
-  padding: 8px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--surface-muted) 55%, transparent);
-  font-size: 13px;
-}
-
-.tf-team-h,
-.team-identity-row,
-.team-pull-row,
-.team-inline-form,
-.team-manage-head,
-.team-manage-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.team-identity-row {
-  margin: 0;
-}
-
-.team-identity-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 12.5px;
-  font-weight: 700;
-  line-height: 1;
-}
-
-.team-identity-label::before {
-  content: "";
-  width: var(--section-title-dot-size);
-  height: var(--section-title-dot-size);
-  flex: 0 0 var(--section-title-dot-size);
-  border-radius: 50%;
-  background:
-    radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--accent) 88%, #fff) 0 22%, transparent 23%),
-    linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 38%, var(--border)));
-}
-
-.team-identity-row #tf-owner {
-  color: var(--fg);
-}
-
-.team-bind-status {
-  display: inline-flex;
-  align-items: center;
-  min-height: var(--button-height);
-  padding: 0 12px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.team-bind-status[hidden] {
-  display: none !important;
-}
-
-.team-bind-status .ok {
-  color: var(--success);
-}
-
-.team-bind-status .err {
-  color: var(--danger);
-}
-
-.tf-team-h {
-  cursor: pointer;
-}
-
-.tf-team-h b {
-  color: var(--fg);
-  font-size: 14px;
-}
-
-.team-pull-row {
-  margin-top: 12px;
-}
-
-.team-pull-row .team-group-name-field {
-  min-width: 200px;
-}
-
-.team-pull-row .tf-gout {
-  display: block;
-  flex-basis: 100%;
-  font-size: 13px;
-}
-
-.tf-dep-h {
-  margin: 10px 0 2px;
-  cursor: pointer;
-}
-
-.team-inline-form {
-  margin: 0 0 6px;
-}
-
-.team-inline-form #tm-newname {
-  min-width: 200px;
-}
-
-.team-inline-form #tm-hub {
-  flex: 1;
-  min-width: 240px;
-}
-
-.team-inline-form #tm-code {
-  min-width: 160px;
-}
-
-.team-manage-head b {
-  color: var(--fg);
-}
-
-.team-manage-actions {
-  margin-left: auto;
-  gap: 6px;
-}
-
-.team-role-modal {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--modal-backdrop);
-  backdrop-filter: blur(3px);
-}
-
-.team-role-modal[hidden] {
-  display: none !important;
-}
-
-.team-role-dialog {
-  display: grid;
-  gap: 12px;
-  width: min(560px, 92vw);
-  padding: 18px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  color: var(--fg);
-  box-shadow: var(--modal-shadow);
-}
-
-.team-role-dialog h2 {
-  margin: 0;
-  font-size: 17px;
-  line-height: 1.25;
-  text-align: center;
-}
-
-.team-role-dialog textarea {
-  width: 100%;
-  min-height: 200px;
-  padding: 12px;
-  box-sizing: border-box;
-  border-color: var(--border-soft);
-  border-radius: var(--radius-lg);
-  font: 13px/1.5 var(--mono);
-}
-
-.team-role-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 0;
 }
 
 .connector-section {
@@ -17574,9 +16582,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .skills-source-badge,
 .skills-count-pill,
-.team-count-pill,
-.team-meta-pill,
-.team-status-pill,
 .connector-status-pill,
 .connector-item-meta span {
   border-radius: var(--radius-full);
@@ -17609,25 +16614,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
   color: var(--danger);
 }
 
-.team-card {
-  gap: 12px;
-}
-
-.team-card-head {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px 10px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-
-.team-card-head h2 {
-  margin: 0 !important;
-}
-
-.team-count-pill,
-.team-meta-pill,
-.team-status-pill,
 .connector-status-pill,
 .connector-item-meta span {
   display: inline-flex;
@@ -17644,441 +16630,10 @@ form.dashboard-toolbar > input[type="text"]:focus {
   white-space: nowrap;
 }
 
-.team-status-pill.ok,
 .connector-status-pill.ok {
   color: var(--success);
   border-color: color-mix(in srgb, var(--success) 32%, var(--border-soft));
   background: var(--success-soft);
-}
-
-.team-status-pill.err {
-  color: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 32%, var(--border-soft));
-  background: var(--danger-soft);
-}
-
-.team-filters.dashboard-toolbar,
-.team-inline-form.dashboard-toolbar {
-  width: 100%;
-}
-
-.team-filters.dashboard-toolbar {
-  margin: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-}
-
-.team-filters.dashboard-toolbar input[type="search"],
-.team-inline-form.dashboard-toolbar input[type="text"] {
-  height: var(--button-height);
-  min-height: var(--button-height);
-  padding: 0 var(--button-padding-x);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--fg);
-  font-size: 12px;
-  font-weight: 700;
-  box-shadow: none;
-}
-
-.team-filters.dashboard-toolbar input[type="search"]:hover,
-.team-filters.dashboard-toolbar input[type="search"]:focus,
-.team-inline-form.dashboard-toolbar input[type="text"]:hover,
-.team-inline-form.dashboard-toolbar input[type="text"]:focus {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--accent-strong);
-  box-shadow: none;
-}
-
-.team-page #tf-search {
-  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
-}
-
-.team-page #tf-search:hover:not(:disabled),
-.team-page #tf-search:focus,
-.team-page #tf-search:focus-visible {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
-  color: var(--accent-strong);
-  box-shadow: none;
-  outline: none;
-}
-
-.team-filters .team-cli-menu {
-  width: var(--dropdown-trigger-width);
-  min-width: var(--dropdown-trigger-width);
-}
-
-.team-page .card label.team-pill-field {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: var(--button-height);
-  min-height: var(--button-height);
-  max-height: var(--button-height);
-  min-width: 0;
-  padding: 0 var(--button-padding-x);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  white-space: nowrap;
-  box-shadow: none;
-  transition:
-    border-color 150ms ease,
-    background-color 150ms ease,
-    color 150ms ease;
-}
-
-.team-page .card label.team-pill-field > span {
-  flex: none;
-  color: var(--muted);
-}
-
-.team-page .card label.team-pill-field > input {
-  flex: 1 1 140px;
-  width: 100%;
-  min-width: 0;
-  height: calc(var(--button-height) - 2px);
-  min-height: calc(var(--button-height) - 2px);
-  padding: 0;
-  border: 0 !important;
-  border-radius: 0;
-  background: transparent !important;
-  color: var(--fg);
-  font: inherit;
-  line-height: 1;
-  box-shadow: none !important;
-  outline: 0;
-}
-
-.team-page .card label.team-pill-field > input::placeholder {
-  color: var(--faint);
-  font-weight: 600;
-}
-
-.team-page .card label.team-pill-field:hover,
-.team-page .card label.team-pill-field:focus-within {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--accent-strong);
-}
-
-.team-page .card label.team-pill-field:hover > span,
-.team-page .card label.team-pill-field:focus-within > span {
-  color: var(--accent-strong);
-}
-
-.team-capability-cell .team-cap-field {
-  width: 100%;
-}
-
-.team-page .card label.filter-toggle,
-.team-page .team-check-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  min-height: var(--button-height);
-  padding: 0 var(--button-padding-x);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-}
-
-.team-page .card label.filter-toggle:has(input:checked),
-.team-page .team-check-pill.selected {
-  border-color: var(--border-soft);
-  background: color-mix(in srgb, var(--muted) 12%, var(--surface));
-  color: var(--accent);
-}
-
-.team-page .team-check-pill {
-  box-sizing: border-box;
-  width: 12px;
-  min-width: 12px;
-  height: 12px;
-  min-height: 12px;
-  max-height: 12px;
-  justify-content: center;
-  gap: 0;
-  padding: 0;
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  transition:
-    border-color 150ms ease,
-    background-color 150ms ease,
-    transform 150ms ease;
-}
-
-.team-check-pill input {
-  position: absolute;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.team-check-pill .team-check-dot {
-  position: relative;
-  width: 4px;
-  height: 4px;
-  border: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-}
-
-.team-check-pill.selected {
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--border-soft));
-  background: var(--surface);
-}
-
-.team-check-pill.selected .team-check-dot {
-  background: var(--accent);
-}
-
-.team-page .card label.team-check-pill {
-  box-sizing: border-box;
-  flex: 0 0 14px;
-  width: 14px;
-  min-width: 14px;
-  max-width: 14px;
-  height: 14px;
-  min-height: 14px;
-  max-height: 14px;
-  padding: 0;
-  border-radius: var(--radius-full);
-  background: var(--surface);
-}
-
-.team-page .card label.team-check-pill.selected {
-  border-color: color-mix(in srgb, var(--accent) 50%, var(--border-soft));
-  background: var(--surface);
-  color: var(--accent);
-}
-
-.team-page .card label.team-check-pill .team-check-dot {
-  flex: 0 0 auto;
-  width: 5px;
-  height: 5px;
-}
-
-.tf-team-h,
-.tf-dep-h {
-  width: 100%;
-  min-height: 30px;
-  padding: 0 2px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  color: var(--fg);
-  text-align: left;
-  cursor: pointer;
-}
-
-.tf-team-h::before {
-  content: "";
-  flex: none;
-  width: 3px;
-  height: 16px;
-  border-radius: var(--radius-full);
-  background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 38%, var(--border)));
-}
-
-.tf-team-h > b,
-.tf-dep-h > b {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tf-team-h .team-chevron,
-.tf-dep-h .team-chevron {
-  order: 20;
-  margin-left: auto;
-}
-
-.tf-team-h .team-status-pill,
-.tf-team-h .team-meta-pill,
-.tf-dep-h .tf-rmmember {
-  flex: none;
-}
-
-.tf-team-h:hover,
-.tf-dep-h:hover {
-  background: transparent;
-  color: var(--accent-strong);
-  transform: none;
-}
-
-.team-chevron {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  color: var(--muted);
-  font-size: 0;
-  font-weight: 800;
-  line-height: 1;
-}
-
-.team-chevron::before {
-  content: "";
-  display: block;
-  width: 6px;
-  height: 6px;
-  border-right: 2px solid currentColor;
-  border-bottom: 2px solid currentColor;
-  transform: rotate(-45deg);
-  transform-origin: center;
-}
-
-.tf-team-h[aria-expanded="true"] .team-chevron::before,
-.tf-dep-h[aria-expanded="true"] .team-chevron::before {
-  transform: rotate(45deg) translate(-1px, -1px);
-}
-
-.team-list-card {
-  display: grid;
-  gap: 10px;
-  margin: 0 0 8px;
-  padding: 10px;
-  border: 1px solid color-mix(in srgb, var(--accent) 12%, var(--border-soft));
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--surface-muted) 42%, var(--surface));
-}
-
-.team-deployment-block {
-  display: grid;
-  gap: 8px;
-  min-width: 0;
-  margin-left: 3px;
-  padding: 0 0 0 10px;
-  border: 0;
-  border-left: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border-soft));
-  border-radius: 0;
-  background: transparent;
-}
-
-.team-roster-list {
-  display: grid;
-  gap: 8px;
-  min-width: 0;
-  margin-left: 3px;
-  padding-left: 10px;
-  border-left: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-soft));
-}
-
-.team-bot-row {
-  display: grid;
-  grid-template-columns: auto minmax(180px, 1fr) auto minmax(180px, 0.6fr) auto;
-  gap: 8px;
-  align-items: center;
-  padding: 9px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  cursor: pointer;
-  outline: none;
-  transition: border-color 150ms ease, background-color 150ms ease;
-}
-
-.team-bot-row:hover {
-  border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
-}
-
-.team-bot-row.selected {
-  border-color: color-mix(in srgb, var(--accent) 38%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
-}
-
-.team-bot-row:focus-visible {
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--border-soft));
-  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
-}
-
-.team-bot-main {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.team-bot-main strong,
-.team-bot-main span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.team-bot-main span,
-.team-capability-cell,
-.team-role-cell,
-.team-pull-hint {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.team-capability-cell,
-.team-role-cell {
-  min-width: 0;
-}
-
-.team-pull-row {
-  gap: 8px;
-}
-
-.team-pull-row .team-group-name-field {
-  flex: 1 1 220px;
-  min-width: 200px;
-  max-width: 360px;
-}
-
-.team-inline-output {
-  padding: 9px 11px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--surface-muted) 64%, transparent);
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.team-inline-output[hidden] {
-  display: none !important;
-}
-
-.team-join-form #tm-hub {
-  flex: 1 1 320px;
-  max-width: none;
-}
-
-.team-join-form #tm-code {
-  flex: 0 1 220px;
-}
-
-.team-manage-card {
-  padding: 12px;
-}
-
-.team-manage-head {
-  min-width: 0;
-}
-
-.team-manage-actions {
-  margin-left: auto;
-}
-
-.team-invite-code {
-  font-size: 15px;
 }
 
 .connectors-page .cn-form {
@@ -18394,21 +16949,46 @@ form.dashboard-toolbar > input[type="text"]:focus {
   transform: translateY(2px) rotate(225deg);
 }
 
-.connector-group-picker-popover {
-  position: absolute;
+.connector-group-picker-positioner {
   z-index: 1600;
-  top: calc(100% + 7px);
-  left: 0;
+}
+
+/* Base UI Combobox 浮层：定位交给 Positioner（--anchor-width / --available-height
+   由它写入），开合动效参考 Arc 的「轻位移 + 缩放 + 淡入」，从触发器方向长出来。 */
+.connector-group-picker-popover {
   box-sizing: border-box;
   display: grid;
+  /* 视口矮时整体被 --available-height 压扁：让列表那一行吃掉剩余空间并内部滚动，
+     而不是溢出到浮层外框之外。 */
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 7px;
-  width: 100%;
+  width: var(--anchor-width);
   min-width: min(360px, calc(100vw - 64px));
+  max-height: min(var(--available-height, 100vh), 320px);
   padding: 8px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--modal-shadow);
+  transform-origin: var(--transform-origin);
+  transition: opacity 140ms ease, transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.connector-group-picker-popover[data-starting-style],
+.connector-group-picker-popover[data-ending-style] {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+}
+
+.connector-group-picker-popover[data-side="top"][data-starting-style],
+.connector-group-picker-popover[data-side="top"][data-ending-style] {
+  transform: translateY(4px) scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .connector-group-picker-popover { transition: opacity 80ms linear; }
+  .connector-group-picker-popover[data-starting-style],
+  .connector-group-picker-popover[data-ending-style] { transform: none; }
 }
 
 .connector-group-search {
@@ -18417,6 +16997,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .connector-group-search > input[type="search"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+  box-sizing: border-box;
+  width: 100%;
   height: 34px;
   min-height: 34px;
   padding: 0 12px 0 34px;
@@ -18452,7 +17034,9 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: grid;
   gap: 3px;
   max-height: 228px;
+  min-height: 0;
   overflow-y: auto;
+  outline: none;
 }
 
 .connector-group-option {
@@ -18471,11 +17055,23 @@ form.dashboard-toolbar > input[type="text"]:focus {
   box-shadow: none;
 }
 
-.connector-group-option:hover,
+.connector-group-option {
+  cursor: pointer;
+  user-select: none;
+  outline: none;
+}
+
 .connector-group-option.selected {
   background: color-mix(in srgb, var(--accent) 9%, transparent);
   color: var(--accent-strong);
   transform: none;
+}
+
+/* 键盘高亮与鼠标悬停同一个态（Base UI 悬停也会设 data-highlighted）。 */
+.connector-group-option[data-highlighted] {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent-strong);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
 .connector-group-option > span:last-child {
@@ -19098,7 +17694,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   }
 
   .connector-group-picker-popover {
-    min-width: 100%;
+    min-width: var(--anchor-width);
   }
 }
 
@@ -19618,7 +18214,6 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .skills-page .bd-section-title::before,
 .skills-page .sect-head h2::before,
-.team-page .sect-head h2::before,
 .connectors-page .sect-head h2::before {
   width: 3px;
   height: 14px;
@@ -20007,15 +18602,12 @@ form.dashboard-toolbar > input[type="text"]:focus {
     margin-top: 2px;
   }
 
-  .team-bot-row,
   .connector-url-row,
   .connector-chat-control {
     grid-template-columns: 1fr;
   }
 
-  .team-check-pill,
-  .connector-item-actions,
-  .team-manage-actions {
+  .connector-item-actions {
     margin-left: 0;
   }
 }
@@ -20703,8 +19295,8 @@ button.webhook-log-row.active {
   --dashboard-toolbar-active-fg: var(--brand-accent);
 }
 
-:root[data-skin="cyber"] .sessions-page .sessions-view-controls :where(.kanban-groupby, .sessions-view-toggle) button.active,
-:root[data-skin="cyber"] .sessions-page .sessions-view-controls :where(.kanban-groupby, .sessions-view-toggle) button[aria-pressed="true"] {
+:root[data-skin="cyber"] .sessions-page .sessions-view-controls .sessions-view-toggle button.active,
+:root[data-skin="cyber"] .sessions-page .sessions-view-controls .sessions-view-toggle button[aria-pressed="true"] {
   background: var(--sessions-switch-active-bg);
   color: var(--sessions-switch-active-fg);
   box-shadow: none;
@@ -20724,7 +19316,7 @@ button.webhook-log-row.active {
 :root[data-skin="cyber"] .cli-codex,
 :root[data-skin="cyber"] .cli-codex-app,
 :root[data-skin="cyber"] .cli-cursor,
-:root[data-skin="cyber"] .cli-gemini,
+:root[data-skin="cyber"] .cli-antigravity,
 :root[data-skin="cyber"] .cli-opencode,
 :root[data-skin="cyber"] .cli-mtr,
 :root[data-skin="cyber"] .cli-hermes,
@@ -21300,13 +19892,8 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 :root:not([data-skin="default"]) .metric-card,
 :root:not([data-skin="default"]) .bd-card,
 :root:not([data-skin="default"]) .mate,
-:root:not([data-skin="default"]) .session-card,
-:root:not([data-skin="default"]) .session-board-column,
 :root:not([data-skin="default"]) .filters:not(.dashboard-toolbar) {
   background: var(--surface);
-}
-:root:not([data-skin="default"]) .session-board-column > header {
-  background: var(--surface-muted);
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -25380,8 +23967,6 @@ dialog select[multiple]:hover:not(:disabled) {
   color: #fff;
 }
 
-
-
 /* Reply-style overrides stay compact but explicit: every semantic layout gets
    the same color + tri-state tag controls, with custom text revealed in place. */
 .bot-defaults-page .bd-reply-style-basics {
@@ -28109,37 +26694,6 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   main:has(.sessions-page) .sessions-view-stage[data-view="table"] {
     min-height: 0;
     overflow: visible;
-  }
-
-  main:has(.sessions-page) .sessions-board {
-    height: auto;
-    min-height: 0;
-    overflow: visible;
-  }
-
-  main:has(.sessions-page) .sessions-topic-view {
-    height: auto;
-    overflow: visible;
-    padding-right: 0;
-    padding-left: 0;
-  }
-
-  main:has(.sessions-page) .session-topic-group > header {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-
-  main:has(.sessions-page) .session-topic-summary {
-    grid-column: 1 / -1;
-    justify-content: flex-start;
-  }
-
-  main:has(.sessions-page) .session-topic-members {
-    grid-template-columns: 1fr;
-  }
-
-  main:has(.sessions-page) .session-board-column {
-    height: min(70dvh, 640px);
-    min-height: 320px;
   }
 
   main:has(.sessions-page) .sessions-kanban {
@@ -33582,67 +32136,6 @@ body:has(.workbench-route-host) { min-width: 0; }
   font-size: var(--fs-13);
 }
 
-.sessions-page .sessions-toolbar .sessions-quick-view {
-  flex: none;
-  border-radius: var(--radius-full);
-  border-color: var(--border-soft);
-}
-
-.sessions-page .sessions-toolbar .sessions-quick-view button {
-  min-height: 26px;
-  padding: 0 var(--sp-3);
-}
-
-.sessions-filter-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-  height: var(--button-height);
-  padding: 0 var(--sp-4);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--fg);
-  font-size: var(--fs-12);
-  font-weight: var(--fw-m);
-  cursor: pointer;
-  transition: border-color var(--t-fast), color var(--t-fast), background var(--t-fast);
-}
-
-.sessions-filter-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent-strong);
-}
-
-.sessions-filter-btn.has-active {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-  color: var(--accent-strong);
-}
-
-.sessions-filter-count {
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-full);
-  background: var(--accent);
-  color: var(--on-accent);
-  font-size: 11px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-}
-
-.sessions-sort-menu .sect-sort-value {
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 /* 「清理空闲」降级为 ghost 链接 */
 .sessions-page .sessions-toolbar .idle-cleanup-bar {
   margin: 0 0 0 auto;
@@ -33674,155 +32167,6 @@ body:has(.workbench-route-host) { min-width: 0; }
   height: 13px;
 }
 
-/* ── 2. 高级筛选抽屉 ───────────────────────────────────────────────── */
-.sessions-filter-drawer {
-  width: min(400px, calc(100vw - 24px));
-  max-width: 400px;
-  padding: 0;
-  border: 0;
-  border-left: 1px solid var(--border);
-  border-radius: 0;
-  background: var(--surface);
-  box-shadow: var(--modal-shadow);
-}
-
-.sessions-filter-drawer[open] {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  max-height: 100%;
-  top: 0;
-  bottom: 0;
-  margin: 0 0 0 auto;
-}
-
-.sessions-filter-drawer::backdrop {
-  background: var(--modal-backdrop);
-}
-
-.sessions-filter-drawer > header {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  padding: var(--sp-4) var(--sp-5);
-  border-bottom: 1px solid var(--border-soft);
-}
-
-.sessions-filter-drawer > header h3 {
-  margin: 0;
-  font-size: var(--fs-15);
-  font-weight: var(--fw-s);
-  color: var(--fg);
-}
-
-.sessions-filter-drawer-body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: var(--sp-5);
-  display: grid;
-  gap: var(--sp-4);
-  align-content: start;
-}
-
-.sessions-filter-field {
-  display: grid;
-  gap: 6px;
-}
-
-.sessions-filter-label {
-  font-size: var(--fs-12);
-  font-weight: var(--fw-m);
-  color: var(--muted);
-}
-
-.sessions-filter-field select {
-  width: 100%;
-  height: var(--button-height);
-  padding: 0 var(--sp-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background-color: var(--surface-raised);
-  color: var(--fg);
-  font-size: var(--fs-13);
-}
-
-.sessions-filter-cli {
-  display: grid;
-  gap: var(--sp-2);
-  padding: var(--sp-3);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-md);
-  background: var(--surface-muted);
-}
-
-.sessions-filter-cli-search {
-  height: var(--button-height);
-  padding: 0 var(--sp-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-  color: var(--fg);
-  font-size: var(--fs-12);
-}
-
-.sessions-filter-cli-bulk {
-  display: flex;
-  gap: var(--sp-2);
-}
-
-.sessions-filter-cli-bulk button {
-  height: 26px;
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--muted);
-  font-size: 11px;
-  cursor: pointer;
-  transition: border-color var(--t-fast), color var(--t-fast);
-}
-
-.sessions-filter-cli-bulk button:hover {
-  border-color: var(--accent);
-  color: var(--accent-strong);
-}
-
-.sessions-filter-cli-list {
-  display: grid;
-  gap: 2px;
-  max-height: 180px;
-  overflow-y: auto;
-}
-
-.sessions-filter-cli-list .filter-check {
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-}
-
-.sessions-filter-cli-list .filter-check:hover {
-  background: var(--surface-hover);
-}
-
-.sessions-filter-toggles {
-  display: grid;
-  gap: var(--sp-2);
-  padding-top: var(--sp-3);
-  border-top: 1px solid var(--border-soft);
-}
-
-.sessions-filter-drawer > footer {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  padding: var(--sp-4) var(--sp-5);
-  border-top: 1px solid var(--border-soft);
-}
-
 .sessions-filter-clear {
   height: var(--button-height);
   padding: 0 var(--sp-3);
@@ -33835,24 +32179,6 @@ body:has(.workbench-route-host) { min-width: 0; }
 
 .sessions-filter-clear:hover {
   color: var(--danger);
-}
-
-.sessions-filter-done {
-  height: var(--button-height);
-  padding: 0 var(--sp-6);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-full);
-  background: var(--accent);
-  color: var(--on-accent);
-  font-size: var(--fs-13);
-  font-weight: var(--fw-s);
-  cursor: pointer;
-  transition: background var(--t-fast), border-color var(--t-fast);
-}
-
-.sessions-filter-done:hover {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
 }
 
 /* ── 3. 看板卡片 v2：状态色条 + 标题 + meta + 预览 + 底部标签操作 ──────── */
@@ -33892,11 +32218,14 @@ body:has(.workbench-route-host) { min-width: 0; }
   white-space: nowrap;
 }
 
-.kanban-card-head .session-signal {
-  min-width: 0;
+.kanban-card-reason {
+  display: -webkit-box;
+  margin: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .kanban-card-meta {
@@ -33961,45 +32290,47 @@ body:has(.workbench-route-host) { min-width: 0; }
 .kanban-card-more {
   margin-left: auto;
   flex: none;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 0;
-  border-radius: var(--radius-full);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--faint);
+  color: var(--muted);
   cursor: pointer;
-  opacity: 0;
-  pointer-events: none;
-  visibility: hidden;
-  transition: opacity var(--t-fast), visibility var(--t-fast), background var(--t-fast), color var(--t-fast);
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
 
 .kanban-card-more svg {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
 }
 
-.kanban-card-more:hover {
+/* 「⋯」常驻可见：以前只在 hover 时出现、颜色又是最淡的 faint，用户找不到入口。 */
+.kanban-card:hover .kanban-card-more,
+.kanban-card:focus-within .kanban-card-more {
+  color: var(--fg);
+}
+
+.kanban-card-more:hover,
+.kanban-card-more.is-open {
+  border-color: var(--border-soft);
   background: var(--surface-hover);
   color: var(--fg);
 }
 
 .kanban-card:hover .kanban-card-term,
-.kanban-card:focus-within .kanban-card-term,
-.kanban-card:hover .kanban-card-more,
-.kanban-card:focus-within .kanban-card-more,
-.kanban-card-more.is-open {
+.kanban-card:focus-within .kanban-card-term {
   opacity: 1;
   pointer-events: auto;
   visibility: visible;
 }
 
 @media (hover: none), (max-width: 720px) {
-  .kanban-card-term,
-  .kanban-card-more {
+  .kanban-card-term {
     opacity: 1;
     pointer-events: auto;
     visibility: visible;
@@ -34011,9 +32342,9 @@ body:has(.workbench-route-host) { min-width: 0; }
   position: fixed;
   z-index: var(--z-modal);
   min-width: 190px;
-  padding: 6px;
+  padding: 4px;
   display: grid;
-  gap: 2px;
+  gap: 1px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-md);
   background: var(--surface-raised);
@@ -34023,10 +32354,16 @@ body:has(.workbench-route-host) { min-width: 0; }
 .card-menu-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  /* 全局 button 是居中对齐，链接项（打开飞书）是左对齐——不显式写死，两种项会对不齐。 */
+  justify-content: flex-start;
+  gap: 10px;
   width: 100%;
   min-height: 32px;
+  margin: 0;
   padding: 0 10px;
+  font-weight: 400;
+  line-height: 1.4;
+  box-shadow: none;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -34046,24 +32383,47 @@ body:has(.workbench-route-host) { min-width: 0; }
   cursor: not-allowed;
 }
 
+.card-menu-item.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.card-menu-item:hover:not(:disabled) .card-menu-icon {
+  color: var(--fg);
+}
+
+/* 危险项和上面的常规项之间留一条分隔线。 */
 .card-menu-item.danger {
+  margin-top: 4px;
+  position: relative;
   color: var(--danger);
 }
 
-.card-menu-item.danger:hover:not(:disabled) {
-  background: var(--danger-soft);
+.card-menu-item.danger::before {
+  content: "";
+  position: absolute;
+  top: -3px;
+  left: 6px;
+  right: 6px;
+  border-top: 1px solid var(--border-soft);
 }
 
 .card-menu-icon {
   display: inline-flex;
   flex: none;
-  width: 14px;
-  color: var(--faint);
+  width: 15px;
+  color: var(--muted);
 }
 
+/* ICON 里的图标都是描边画法、不带 fill 属性；不写 fill:none 会被浏览器按默认黑色填满，糊成一团。 */
 .card-menu-icon svg {
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .card-menu-item.danger .card-menu-icon {
@@ -34114,73 +32474,6 @@ a.card-menu-item {
   font-size: 11px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-}
-
-/* ── 5. 状态板列头降噪：色点保留，名称正体，描述小字，信号色对齐 st-* ──── */
-.session-board-needs-you { --col-signal: var(--st-need); }
-.session-board-working { --col-signal: var(--st-work); }
-.session-board-todo { --col-signal: var(--st-todo); }
-.session-board-idle { --col-signal: var(--st-idle); }
-
-.session-board-column > header {
-  min-height: 0;
-  padding: 10px 12px;
-  gap: 8px;
-}
-
-.session-board-column h2 {
-  font-family: var(--font);
-  font-size: var(--fs-13);
-  font-weight: var(--fw-s);
-  letter-spacing: 0;
-  text-transform: none;
-}
-
-.session-board-column p {
-  font-size: 11px;
-  color: var(--faint);
-}
-
-.session-board-count {
-  font-family: inherit;
-  font-size: 11px;
-}
-
-/* 状态板卡片：状态色条 + hover 显示操作 */
-.session-card {
-  padding-left: 14px;
-}
-
-.session-card::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 3px;
-  background: var(--st-idle);
-}
-
-.session-card[data-signal="needs-you"]::before { background: var(--st-need); }
-.session-card[data-signal="working"]::before { background: var(--st-work); }
-.session-card[data-signal="todo"]::before { background: var(--st-todo); }
-.session-card[data-signal="idle"]::before { background: var(--st-idle); }
-.session-card[data-signal="closed"]::before { background: var(--border-strong); }
-
-.session-card-actions {
-  opacity: 0;
-  transition: opacity var(--t-fast);
-}
-
-.session-card:hover .session-card-actions,
-.session-card:focus-within .session-card-actions {
-  opacity: 1;
-}
-
-@media (hover: none), (max-width: 720px) {
-  .session-card-actions {
-    opacity: 1;
-  }
 }
 
 /* ── 6. Drawer：底部固定操作栏（主/次/危险 + 更多） ─────────────────── */
@@ -34416,7 +32709,7 @@ a.card-menu-item {
 /* ── 7. 骨架屏：首个快照到达前不闪「空」 ───────────────────────────── */
 .sessions-skeleton {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: var(--sp-3);
   height: 100%;
   min-height: 300px;
@@ -34465,8 +32758,6 @@ a.card-menu-item {
 
 /* ── 8. 移动端：筛选条收敛为搜索 + 筛选按钮；骨架单列 ────────────────── */
 @media (max-width: 720px) {
-  .sessions-page .sessions-toolbar .sessions-quick-view,
-  .sessions-page .sessions-toolbar .sessions-sort-menu,
   .sessions-page .sessions-toolbar .idle-cleanup-bar {
     display: none;
   }
@@ -34479,10 +32770,6 @@ a.card-menu-item {
   .sessions-skeleton {
     grid-template-columns: 1fr;
     height: auto;
-  }
-
-  .sessions-filter-drawer {
-    width: min(400px, calc(100vw - 24px));
   }
 }
 .message-listener-page .roles-layout {
@@ -35009,7 +33296,13 @@ a.card-menu-item {
   gap: 12px;
   padding: 12px 0;
 }
-.group-default-models-row > strong { flex-basis: 100%; }
+/* 两个分支（不支持配置时的裸 <p>、可配置时行内的 <small>）都用同一弱化样式，
+   不依赖外层是不是 .group-default-models-row。 */
+.group-default-models-cli {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+}
 .group-default-models-field { display: grid; gap: 6px; flex: 1 1 180px; }
 .group-default-models-row input { width: 100%; min-width: 0; }
 .group-default-models-row > small { flex-basis: 100%; }
@@ -35023,8 +33316,6 @@ a.card-menu-item {
 .bd-oncall-scope { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
 .bd-oncall-scope > label { flex-shrink: 0; }
 .bd-oncall-scope .connector-group-picker { max-width: 360px; }
-.bd-oncall-scope .connector-group-picker-popover { min-width: 0; }
-.bd-oncall-scope .connector-group-search > input { width: 100%; box-sizing: border-box; padding-left: 34px; }
 .bd-oncall-secret { display: grid; gap: 8px; margin-top: 16px; max-width: 480px; }
 .bd-oncall-secret > label { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; font-size: 13px; }
 .bd-oncall-secret-input { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
@@ -35110,7 +33401,6 @@ a.card-menu-item {
   flex-direction: column;
   gap: 6px;
 }
-
 
 .schedule-calendar-fields { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius-md); }
 .schedule-calendar-fields legend { padding: 0 5px; }
@@ -37070,3 +35360,94 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .bd-steward-guide-input { width: 100%; min-height: 96px; resize: vertical; }
 .bd-steward-guide-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .bd-steward-open { display: inline-block; margin-top: 4px; color: var(--accent-strong); font-size: var(--fs-13); }
+
+/* ── 会话页筛选条：一排自绘下拉（FilterChip）取代原「筛选」弹窗里的原生 <select> ── */
+.sessions-page .sessions-filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sessions-page .sessions-filter-chips .sect-sort-menu {
+  width: auto;
+  max-width: 260px;
+}
+
+.sessions-page .sessions-filter-chips .sect-sort-menu > summary {
+  width: auto;
+  max-width: 260px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0 26px 0 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.sessions-page .sessions-filter-chips .sect-sort-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 有取值的维度高亮：一眼看出当前生效了哪些筛选。 */
+.sessions-page .sessions-filter-chips .sessions-filter-chip.is-active > summary,
+.sessions-page .sessions-filter-chips .sessions-filter-toggle.is-active {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent-strong);
+}
+
+.sessions-page .sessions-filter-chips .sect-sort-pop {
+  left: 0;
+  transform: none;
+  width: max-content;
+  min-width: 200px;
+  max-width: min(360px, calc(100vw - 48px));
+}
+
+.sessions-page .sessions-filter-chips .sect-sort-pop button {
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.sessions-page .sessions-filter-chips .sessions-filter-toggle {
+  height: 30px;
+  min-height: 30px;
+  margin: 0;
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.sessions-page .sessions-filter-chips .sessions-filter-toggle:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
+  color: var(--fg);
+}
+
+.sessions-page .sessions-filter-chips .sessions-filter-clear {
+  height: 30px;
+  min-height: 30px;
+  margin: 0;
+  padding: 0 6px;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.sessions-page .sessions-filter-chips .sessions-filter-clear:hover {
+  text-decoration: underline;
+}

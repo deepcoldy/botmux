@@ -44,11 +44,11 @@ it('refreshes the effective reply delivery shown next to it when zero injection 
 });
 
 it('cannot be turned on for an unsupported CLI, but an enabled one can still be turned off', () => {
-  const off = render({ cliId: 'gemini', promptInjection: 'default' });
+  const off = render({ cliId: 'opencode', promptInjection: 'default' });
   expect(toggle(off).props.disabled).toBe(true);
   expect(JSON.stringify(off.toJSON())).toContain('不支持零注入');
   act(() => off.unmount());
-  const on = render({ cliId: 'gemini', promptInjection: 'none' });
+  const on = render({ cliId: 'opencode', promptInjection: 'none' });
   expect(toggle(on).props.disabled).toBe(false);
   act(() => on.unmount());
 });

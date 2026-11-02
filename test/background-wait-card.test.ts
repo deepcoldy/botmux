@@ -21,6 +21,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
 } }));
 import {
   initWorkerPool, setActiveSessionsRegistry, getActiveSessionsRegistry, streamCardLabel,
+  usageRefreshShouldRun, syncUsageRefreshTimer,
   __testOnly_setupWorkerHandlers as setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
@@ -97,6 +98,93 @@ async function screenUpdate(status: 'working' | 'idle' | 'limited', backgroundTa
 function patchedHeaders(): string[] {
   return mocks.patch.mock.calls.map(([request]) => JSON.parse(request.data.content).header.title.content as string);
 }
+
+async function withActivityClock(run: () => Promise<void>): Promise<void> {
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  try { await run(); } finally {
+    if (ds.usageRefreshTimer) clearInterval(ds.usageRefreshTimer);
+    ds.usageRefreshTimer = undefined;
+    vi.useRealTimers();
+  }
+}
+
+async function beginActivity(cliId: 'traex' | 'codex', usageDisplay: 'streaming' | 'footer' | 'off'): Promise<void> {
+  registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId, replyCardMode: 'legacy', usageDisplay });
+  ds.session.cliId = cliId;
+  ds.currentTurnId = 'om_turn';
+  const input = { turnId: 'om_turn', dispatchAttempt: 1 };
+  await worker.listeners('message')[0]({ type: 'capture_identity', revision: 1, ...input });
+  await worker.listeners('message')[0]({ type: 'turn_execution_started', ...input, startedAtMs: Date.now() - 1000 });
+}
+
+describe('activity-triggered refresh boundaries', () => {
+  it.each([
+    ['codex', 'streaming', 0], ['codex', 'footer', 0], ['codex', 'off', 0],
+    ['traex', 'streaming', 1], ['traex', 'footer', 1], ['traex', 'off', 1],
+  ] as const)('%s with usage %s adds %s stage-change PATCH', async (cliId, usageDisplay, patches) => {
+    await withActivityClock(async () => {
+      await beginActivity(cliId, usageDisplay);
+      await worker.listeners('message')[0]({ type: 'turn_progress', turnId: 'om_turn', dispatchAttempt: 1, stage: 'tool_started' });
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(mocks.patch).toHaveBeenCalledTimes(patches);
+      if (cliId === 'traex') {
+        const content = JSON.parse(mocks.patch.mock.calls.at(-1)![0].data.content);
+        expect(content.elements.some((element: any) => element.element_id === 'botmux_stream_activity')).toBe(true);
+      }
+    });
+  });
+
+  it.each(['footer', 'off'] as const)('does not arm a %s timer for backgroundTasks alone', async usageDisplay => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', usageDisplay);
+      ds.backgroundTaskCount = 2;
+      expect(streamCardLabel(ds)).toEqual({ backgroundTasks: 2 });
+      expect(usageRefreshShouldRun(ds)).toBe(false);
+      syncUsageRefreshTimer(ds);
+      expect(ds.usageRefreshTimer).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(36_000);
+      expect(mocks.patch).not.toHaveBeenCalled();
+    });
+  });
+
+  it('does not rewrite a previous generation execution record or PATCH for it', async () => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', 'streaming');
+      const key = JSON.stringify(['om_turn', 1]);
+      const stale = { startedAtMs: Date.now() - 2000, lastProgressAtMs: Date.now() - 1000, workerGeneration: 0, stage: 'model_output' as const };
+      ds.replyExecutionStarts!.set(key, stale);
+      const before = { ...stale };
+      await worker.listeners('message')[0]({ type: 'turn_progress', turnId: 'om_turn', dispatchAttempt: 1, stage: 'tool_started' });
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(ds.replyExecutionStarts!.get(key)).toEqual(before);
+      expect(mocks.patch).not.toHaveBeenCalled();
+    });
+  });
+
+  it('updates progress age for repeated stages without additional PATCH, and PATCHes a new stage once', async () => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', 'streaming');
+      const input = { type: 'turn_progress' as const, turnId: 'om_turn', dispatchAttempt: 1, stage: 'model_output' as const };
+      await worker.listeners('message')[0](input);
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      mocks.patch.mockClear();
+      let lastProgressAtMs = 0;
+      for (let n = 0; n < 20; n++) {
+        await vi.advanceTimersByTimeAsync(100);
+        lastProgressAtMs = Date.now();
+        await worker.listeners('message')[0](input);
+        await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      }
+      expect(mocks.patch).not.toHaveBeenCalled();
+      expect(ds.replyExecutionStarts!.get(JSON.stringify(['om_turn', 1]))!.lastProgressAtMs).toBe(lastProgressAtMs);
+      await worker.listeners('message')[0]({ ...input, stage: 'tool_started' });
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      expect(streamCardLabel(ds)).toMatchObject({ activity: 'tool' });
+    });
+  });
+});
 
 describe('background-wait label on the live card', () => {
   it('keeps current capture tuples intact and rejects superseded or mismatching activity', async () => {

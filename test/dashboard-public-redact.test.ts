@@ -46,6 +46,28 @@ function sampleChats() {
         },
       ],
     },
+    {
+      // 会话群：分型标记与摘要（含内部 session id）是新增的群级字段，
+      // 同样不在匿名访客的白名单里。
+      chatId: 'oc_session1',
+      name: '修复登录',
+      chatMode: 'group',
+      avatar: 'https://avatar.example/session1.png',
+      sessionGroup: true,
+      sessionGroupMeta: {
+        createdAt: 1000,
+        lastActiveAt: 2000,
+        sessionId: 'sess-secret-1',
+        sessionStatus: 'active',
+      },
+      memberBots: [
+        {
+          larkAppId: 'cli_a',
+          botName: 'Claude',
+          inChat: true,
+        },
+      ],
+    },
   ];
 }
 
@@ -86,7 +108,7 @@ describe('redactGroupsForPublic', () => {
       expect(mb).not.toHaveProperty('hasRole');
     }
     const json = JSON.stringify(out);
-    for (const leaked of ['workingDir', 'customer-secret', 'private description', 'ou_owner']) {
+    for (const leaked of ['workingDir', 'customer-secret', 'private description', 'ou_owner', 'sess-secret-1', 'sessionGroup']) {
       expect(json).not.toContain(leaked);
     }
   });
@@ -109,6 +131,19 @@ describe('redactGroupsForPublic', () => {
             larkAppId: 'cli_b',
             botName: 'Codex',
             inChat: false,
+          },
+        ],
+      },
+      {
+        chatId: 'oc_session1',
+        name: '修复登录',
+        chatMode: 'group',
+        avatar: 'https://avatar.example/session1.png',
+        memberBots: [
+          {
+            larkAppId: 'cli_a',
+            botName: 'Claude',
+            inChat: true,
           },
         ],
       },
@@ -137,6 +172,14 @@ describe('redactGroupsForPublic', () => {
     const out = redactGroupsForPublic(chats) as any[];
     expect(out[0].memberBots[0]).not.toHaveProperty('p2pOpen');
     expect(JSON.stringify(out)).not.toContain('p2pOpen');
+  });
+
+  it('strips session-group flag and board summary (including the internal session id) for anonymous visitors', () => {
+    const out = redactGroupsForPublic(sampleChats()) as any[];
+    const sessionChat = out.find(c => c.chatId === 'oc_session1')!;
+    expect(sessionChat).not.toHaveProperty('sessionGroup');
+    expect(sessionChat).not.toHaveProperty('sessionGroupMeta');
+    expect(JSON.stringify(sessionChat)).not.toContain('sess-secret-1');
   });
 
   it('does not mutate the input (authed callers keep the original oncallChat/description)', () => {

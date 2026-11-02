@@ -22,6 +22,11 @@ const BASE_SCENARIOS = [
   'bot-codex-basic',
   'bot-codex-prompt',
   'bot-opencode-basic',
+  'bot-pi-basic',
+  'bot-ohmypi-basic',
+  'bot-kimi-basic',
+  'bot-antigravity-basic',
+  'bot-grok-basic',
   'bot-reply-smoke',
   'bot-collaboration',
   'card-lifecycle',
@@ -35,6 +40,7 @@ const BASE_SCENARIOS = [
   'private-topic-reply',
   'scheduled-task-thread',
   'web-terminal',
+  'sandbox-file-isolation',
   'traex-ambient-continuity',
 ] as const;
 
@@ -78,6 +84,31 @@ const BASE_TARGETS: Record<(typeof BASE_SCENARIOS)[number], ScenarioTarget> = {
     module: 'feishu-bot-opencode.e2e.ts',
     suite: 'OpenCode basic flow',
     test: 'sends hello, receives streaming card and actual reply from OpenCode',
+  },
+  'bot-pi-basic': {
+    module: 'feishu-bot-pi.e2e.ts',
+    suite: 'Pi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Pi',
+  },
+  'bot-ohmypi-basic': {
+    module: 'feishu-bot-ohmypi.e2e.ts',
+    suite: 'OhMyPi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from OhMyPi',
+  },
+  'bot-kimi-basic': {
+    module: 'feishu-bot-kimi.e2e.ts',
+    suite: 'Kimi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Kimi',
+  },
+  'bot-antigravity-basic': {
+    module: 'feishu-bot-antigravity.e2e.ts',
+    suite: 'Antigravity basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Antigravity',
+  },
+  'bot-grok-basic': {
+    module: 'feishu-bot-grok.e2e.ts',
+    suite: 'Grok basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Grok',
   },
   'bot-reply-smoke': {
     module: 'feishu-bot-reply.e2e.ts',
@@ -143,6 +174,11 @@ const BASE_TARGETS: Record<(typeof BASE_SCENARIOS)[number], ScenarioTarget> = {
     module: 'feishu-web-terminal.e2e.ts',
     suite: 'feishu web terminal',
     test: 'web terminal opens from the current streaming card',
+  },
+  'sandbox-file-isolation': {
+    module: 'feishu-sandbox.e2e.ts',
+    suite: 'sandbox file isolation',
+    test: 'hides the home directory and the harness secrets and keeps writes inside the working directory',
   },
   'traex-ambient-continuity': {
     module: 'feishu-traex-ambient.e2e.ts',

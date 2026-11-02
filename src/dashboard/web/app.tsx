@@ -111,7 +111,6 @@ const MANAGE_ROUTES = [
   'doc-watches',
   'message-listeners',
   'plugins',
-  'team',
   'connectors',
   'insights',
   'feedback',

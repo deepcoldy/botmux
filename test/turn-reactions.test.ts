@@ -20,6 +20,7 @@ import { join } from 'path';
 const mocks = vi.hoisted(() => ({
   addReaction: vi.fn(),
   removeReaction: vi.fn(),
+  publishTurnCliIdentity: vi.fn(),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -40,6 +41,11 @@ vi.mock('node-pty', () => ({
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
   return { ...actual, addReaction: mocks.addReaction, removeReaction: mocks.removeReaction };
+});
+
+vi.mock('../src/core/turn-cli-identity.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/turn-cli-identity.js');
+  return { ...actual, publishTurnCliIdentity: mocks.publishTurnCliIdentity };
 });
 
 import { getBot, registerBot } from '../src/bot-registry.js';
@@ -82,11 +88,68 @@ function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolea
 describe('two-phase turn reactions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.publishTurnCliIdentity.mockResolvedValue([]);
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-'));
     sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
   });
+
+  it('用户身份刷新期间展示收到表情，身份就绪后完成接收登记', async () => {
+    registerWith(true);
+    getBot(APP).config.triggerUserAuth = { enabled: true, tools: ['lark-cli'] };
+    const ds = makeDs();
+    let releaseIdentity!: () => void;
+    mocks.publishTurnCliIdentity.mockImplementationOnce(() => new Promise<void>(resolve => {
+      releaseIdentity = resolve;
+    }));
+    let accepted = false;
+    const receiving = noteTurnReceived(ds, 'om_slow_auth').then(() => { accepted = true; });
+
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_slow_auth', 'GoGoGo');
+    await vi.waitFor(() => expect(mocks.publishTurnCliIdentity).toHaveBeenCalledTimes(1));
+    expect(accepted).toBe(false);
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+    await finishTurnReactions(ds);
+    expect(mocks.removeReaction).toHaveBeenCalledTimes(0);
+
+    releaseIdentity();
+    await receiving;
+    expect(accepted).toBe(true);
+    expect(ds.pendingAckReactions).toEqual([{ messageId: 'om_slow_auth', reactionId: 'rid_om_slow_auth' }]);
+    await finishTurnReactions(ds);
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_slow_auth', 'rid_om_slow_auth');
+  });
+
+  it('连续两位发送者分别按消息绑定本轮身份', async () => {
+    registerWith(true);
+    getBot(APP).config.triggerUserAuth = { enabled: true, tools: ['lark-cli'] };
+    const ds = makeDs();
+    ds.session.replyTargets = {
+      om_user_a: { rootMessageId: 'om_user_a', senderOpenId: 'ou_user_a', participants: [{ openId: 'ou_user_a', isBot: false }], updatedAt: new Date().toISOString() },
+      om_user_b: { rootMessageId: 'om_user_b', senderOpenId: 'ou_user_b', participants: [{ openId: 'ou_user_b', isBot: false }], updatedAt: new Date().toISOString() },
+    };
+    await Promise.all([noteTurnReceived(ds, 'om_user_a'), noteTurnReceived(ds, 'om_user_b')]);
+    expect(mocks.publishTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'om_user_a', senderOpenId: 'ou_user_a',
+    }));
+    expect(mocks.publishTurnCliIdentity).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'om_user_b', senderOpenId: 'ou_user_b',
+    }));
+    expect(ds.pendingAckReactions?.map(entry => entry.messageId).sort()).toEqual(['om_user_a', 'om_user_b']);
+  });
+
+  it.each(['card', 'silent', 'comment', 'duplicate', 'failed'])(
+    '接收路径 %s 完成本轮身份准备', async path => {
+      registerWith(path !== 'card', { silentTurnReactions: path === 'silent' });
+      getBot(APP).config.triggerUserAuth = { enabled: true, tools: ['lark-cli'] };
+      const ds = makeDs();
+      if (path === 'duplicate') ds.pendingAckReactions = [{ messageId: 'om_auth', reactionId: 'existing' }];
+      if (path === 'failed') mocks.addReaction.mockRejectedValueOnce(new Error('transport'));
+      await noteTurnReceived(ds, path === 'comment' ? 'comment_auth' : 'om_auth');
+      expect(mocks.publishTurnCliIdentity).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('streaming card on (default): no reaction on receipt', async () => {
     registerWith(false);
@@ -355,7 +418,7 @@ describe('two-phase turn reactions', () => {
 
 /**
  * Behavioral pin for PR #633 review P2: card-off finishTurnReactions requires a
- * working→idle edge. Argv cold-start (Pi/Gemini) must seed working before idle
+ * working→idle edge. Argv cold-start (Pi/MTR) must seed working before idle
  * (worker side); daemon-side, bare undefined→idle must NOT flip, while the
  * seeded working→idle sequence must.
  */
@@ -379,6 +442,7 @@ describe('turn reaction screen_update behavioral gate', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.publishTurnCliIdentity.mockResolvedValue([]);
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-behav-'));
     sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);

@@ -15,7 +15,8 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { hostResolverBindArgs, shadowedResolverPath } from '../src/adapters/backend/sandbox.js';
+import { hostResolverBindArgs, resolverPathDenied, shadowedResolverPath } from '../src/adapters/backend/sandbox.js';
+import { accessForPath, type FsRule } from '../src/adapters/cli/fs-policy.js';
 import { lastJsonLine, privateMountNsAvailable, runInPrivateMountNs } from './helpers/private-mount-ns.js';
 import { isBunRuntime } from './helpers/ts-runner.js';
 
@@ -120,6 +121,45 @@ describe('shadowedResolverPath / hostResolverBindArgs', () => {
     expect(shadowedResolverPath(l.link, [l.run])).toBe(hop);
     expect(hostResolverBindArgs({ link: l.link, shadowedRoots: [l.run], denied: () => false }))
       .toEqual(['--dir', join(l.run, 'dnsproxy'), '--ro-bind', real, hop]);
+  });
+});
+
+describe('resolverPathDenied (input policy ∪ relocated compiled rules)', () => {
+  // /etc is a symlinked baseline dir (/etc → /data00/etc): relocate moves the
+  // baseline allow and every rule below it to the real path.
+  const lexicalDeny: FsRule = { path: '/etc/resolv.conf', access: 'deny', source: 'user' };
+  const pre: FsRule[] = [
+    { path: '/etc', access: 'readOnly', source: 'baseline' },
+    lexicalDeny,
+  ];
+  const compiled: FsRule[] = [
+    { path: '/data00/etc', access: 'readOnly', source: 'baseline' },
+    { path: '/data00/etc/resolv.conf', access: 'deny', source: 'user' },
+  ];
+
+  it('still suppresses a lexical deny that relocation moved off the name', () => {
+    const denied = resolverPathDenied(pre, compiled);
+    // Judging by compiled rules alone this name is not denied (the bind would
+    // come back); the input-policy branch of the union must keep it suppressed.
+    expect(accessForPath(compiled, '/etc/resolv.conf')).not.toBe('deny');
+    expect(denied('/etc/resolv.conf')).toBe(true);
+    // The relocated name is denied by the compiled set.
+    expect(denied('/data00/etc/resolv.conf')).toBe(true);
+  });
+
+  it('does not suppress when neither rule set denies the resolver', () => {
+    const denied = resolverPathDenied(
+      [{ path: '/etc', access: 'readOnly', source: 'baseline' }],
+      [{ path: '/data00/etc', access: 'readOnly', source: 'baseline' }],
+    );
+    expect(denied('/etc/resolv.conf')).toBe(false);
+    expect(denied('/run/systemd/resolve/stub-resolv.conf')).toBe(false);
+  });
+
+  it('suppresses on a canonical deny present in both sets', () => {
+    const target = '/run/systemd/resolve/stub-resolv.conf';
+    const rule: FsRule = { path: target, access: 'deny', source: 'user' };
+    expect(resolverPathDenied([rule], [rule])(target)).toBe(true);
   });
 });
 

@@ -25,6 +25,7 @@ import {
   __testOnly_closeSkillFeedbackStores,
 } from '../src/services/skill-feedback-store.js';
 import { RELAYED_TURN_DELIVERY_MAX_BYTES } from '../src/core/relayed-turn-delivery.js';
+import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 
 const SECRET = 'turn-delivery-narrow-secret';
 const CAP_A = 'ab12cd34'.repeat(8);
@@ -150,6 +151,24 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'turn_unbound' });
     expect(await rowFor('om_unbound')).toBeUndefined();
+  });
+
+  it('a trusted host request is indexed only under the turn the CLI says it answered', async () => {
+    // A host CLI whose own sandbox denies the store write: authenticated by the
+    // host secret, no capability pins the turn, and the daemon may already be
+    // on the next queued turn.
+    await setup({ 'sess-a': liveSession('sess-a', CAP_B, 'turn-2') });
+    const hostPost = (body: Record<string, unknown>) => fetchDaemonIpc(handle!.port,
+      '/api/sessions/sess-a/turn-delivery',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) },
+      SECRET);
+    const stale = await hostPost({ messageId: 'om_prev_turn', content: 'answer to turn-1', expectedTurnId: 'turn-1' });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ ok: false, error: 'turn_mismatch' });
+    expect(await rowFor('om_prev_turn')).toBeUndefined();
+    const current = await hostPost({ messageId: 'om_this_turn', content: 'answer to turn-2', expectedTurnId: 'turn-2' });
+    expect(current.status).toBe(200);
+    expect(await rowFor('om_this_turn')).toMatchObject({ sessionId: 'sess-a', turnId: 'turn-2' });
   });
 
   it('404s a closed session', async () => {

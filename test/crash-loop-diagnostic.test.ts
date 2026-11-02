@@ -114,6 +114,7 @@ import { initWorkerPool, __testOnly_setupWorkerHandlers, __testOnly_resetRestart
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER } from '../src/core/worker-stderr-ring.js';
+import { sandboxNamespaceNotice } from '../src/core/system-bwrap.js';
 
 function makeFakeWorker() {
   const w = new EventEmitter() as any;
@@ -345,6 +346,29 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(cardText).toContain('最近终端输出：');
     expect(cardText).not.toContain('RING_MUST_NOT_APPEAR');
     expect(cardText).not.toContain('最近的 worker 输出（可能含死因）：');
+  });
+
+  it('crash card names an unsupported bwrap namespace with the docs link', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-diag-namespace', worker);
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, undefined, createWorkerStderrRing());
+    for (let i = 0; i < 4; i++) {
+      worker.emit('message', { type: 'claude_exit', code: 1, signal: null, sandboxNamespace: 'pid' });
+    }
+    await flush();
+    const cardText = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(cardText).toContain(sandboxNamespaceNotice('pid', 'zh'));
+  });
+
+  it('startup-failure notice names an unsupported bwrap namespace', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-start-namespace', worker);
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, undefined, createWorkerStderrRing());
+    worker.emit('message', { type: 'error', message: 'bwrap failed', sandboxNamespace: 'user' });
+    await flush();
+    const notice = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(notice).toContain('bwrap failed');
+    expect(notice).toContain(sandboxNamespaceNotice('user', 'zh'));
   });
 
   it('pre-ready exit notice appends the per-worker stderr ring tail', async () => {

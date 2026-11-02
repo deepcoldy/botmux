@@ -53,6 +53,9 @@ describe('TraeX startup repository notification', () => {
     ['│ model: loading /model to change │', ...REPOSITORY_NOTICE],
     [...REPOSITORY_NOTICE.slice(0, 3), '◆ Working… (3s • esc to interrupt)', ...REPOSITORY_NOTICE.slice(3)],
     REPOSITORY_NOTICE.slice(3),
+    REPOSITORY_NOTICE.filter(row => !row.includes('TRAE CLI (v')),
+    REPOSITORY_NOTICE.filter(row => !row.includes('permissions:')),
+    [...REPOSITORY_NOTICE, '  ☢ Full Access (shift+tab to cycle) · ? for shortcuts · ← for agents'],
     [...REPOSITORY_NOTICE, '  a wrapped draft continuation'],
     REPOSITORY_NOTICE.map(row => row.replace('无法访问 Git 仓库 `git@example.invalid`，请确认该仓库权限或地址。', 'Please sign in before continuing')),
   ])('keeps blocking input owners and unknown notifications gated: %j', (...rows: string[]) => {
@@ -313,6 +316,8 @@ const INITIALIZED_COMPOSER = [
 describe('TraeX initialized composer', () => {
   it.each([
     ['fresh context', INITIALIZED_COMPOSER, true],
+    ['Auto Mode footer', INITIALIZED_COMPOSER.map(row => row.replace('☢ Full Access', '▧ Auto Mode')), true],
+    ['Workspace Edit footer', INITIALIZED_COMPOSER.map(row => row.replace('☢ Full Access', '▧ Workspace Edit')), true],
     ['model still loading', INITIALIZED_COMPOSER.map(row => row.replace('GPT-6-Astra xhigh', 'loading')), false],
     ['directory named loading', INITIALIZED_COMPOSER.map(row => row.replace('/tmp/project', '/tmp/loading')), true],
   ])('%s has the expected initialization evidence', (_name, rows, expected) => {

@@ -56,7 +56,6 @@ export const ONE_SHOT_ARGV: Record<string, string[]> = {
   // TRAE CLI is a codex fork — same exec surface and bare-answer stdout.
   traex: ['traex', 'exec', '--skip-git-repo-check'],
   opencode: ['opencode', 'run'],
-  gemini: ['gemini', '-p'],
   antigravity: ['agy', '-p'],
   grok: ['grok', '-p'],
   // pi / oh-my-pi share the same `-p`/`--print` non-interactive print mode —
@@ -132,7 +131,7 @@ function cleanTitleLine(raw: string): string {
 }
 
 /** Extract a plausible title from one-shot CLI stdout: last non-empty line
- *  (codex/opencode prepend progress logs; claude/gemini print the bare
+ *  (codex/opencode prepend progress logs; claude/agy print the bare
  *  answer), stripped of quotes/markdown and length-capped. Two passes: a
  *  strict pass drops known log-line shapes; if that filters EVERYTHING (an
  *  output shape we didn't predict), a lenient pass takes the last line that

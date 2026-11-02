@@ -102,6 +102,11 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
     && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
     && next.kind === 'daemon' && next.cmd === '/queue'
     && next.sessionPolicy === 'existing_only',
+  // /rewind is a new existing-session daemon command; the frozen oracle treats it as unknown.
+  (input, legacy, next) => legacy.kind === 'forward'
+    && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
+    && next.kind === 'daemon' && next.cmd === '/rewind'
+    && next.sessionPolicy === 'existing_only',
   // Codex App 的 /effort 由原生控制接口处理；其它 CLI 保留冻结的透传行为。
   (input, legacy, next) =>
     input.cliId === 'codex-app'

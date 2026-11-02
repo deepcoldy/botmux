@@ -212,8 +212,8 @@ describe('isForkCapableSession', () => {
     expect(isForkCapableSession(ds)).toBe(false);
   });
 
-  it('refuses a non-forkable CLI (e.g. gemini)', () => {
-    const ds = makeSourceDs({ cliId: 'gemini' });
+  it('refuses a non-forkable CLI (e.g. opencode)', () => {
+    const ds = makeSourceDs({ cliId: 'opencode' });
     expect(isForkCapableSession(ds)).toBe(false);
   });
 });

@@ -26,7 +26,7 @@ describe('shared OpenViking example delivery', () => {
   });
 
   it('installed but disabled contributes no memory prompt, CLI command or MCP server', async () => {
-    for (const cliId of ['codex', 'claude-code', 'opencode', 'gemini'] as CliId[]) {
+    for (const cliId of ['codex', 'claude-code', 'opencode'] as CliId[]) {
       const result = prepareCliPluginGeneration({
         sessionId: `off-${cliId}`, bot: { larkAppId: 'owner-bot' }, global: { plugins: [] },
         cliId, adapter: { id: cliId } as CliAdapter, workingDir: home,
@@ -40,7 +40,7 @@ describe('shared OpenViking example delivery', () => {
   });
 
   it('one plugin supplies the same memory skill and CLI to different Agent adapters', async () => {
-    for (const cliId of ['codex', 'claude-code', 'opencode', 'gemini'] as CliId[]) {
+    for (const cliId of ['codex', 'claude-code', 'opencode'] as CliId[]) {
       const result = prepareCliPluginGeneration({
         sessionId: `on-${cliId}`, bot: { larkAppId: 'owner-bot', plugins: ['openviking'] }, global: { plugins: [] },
         cliId, adapter: { id: cliId } as CliAdapter, workingDir: home,

@@ -51,6 +51,9 @@ function harness(interruptKey?: 'esc', backendType: 'pty' | 'tmux' = 'pty', adap
     t: (key: string) => key,
     isCriticalInterruptKey,
     sendCriticalControlKey,
+    // These are not quota pools; quota recovery must remain inert.
+    traexQuotaPending: undefined,
+    emitReadyCodexTurns: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
   };
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);

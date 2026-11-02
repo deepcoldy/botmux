@@ -12,6 +12,7 @@ import { markGroupContextCardPurpose } from './group-context-card.js';
 export interface TurnReplyCardPresentation {
   locale?: 'zh' | 'en';
   showProcess: boolean;
+  showTools?: boolean;
   showToolResults: boolean;
   canStop: boolean;
   workingDir?: string;
@@ -158,7 +159,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted', superseded: 'Continued in a later message' }
       : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认', superseded: '已由后续消息接续' };
   const phaseIcons = { queued: '⏳', working: '💭', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️', superseded: '↪️' };
-  const toolCount = presentation.showProcess ? record.tools.length : 0;
+  const toolCount = presentation.showProcess && presentation.showTools !== false ? record.tools.length : 0;
   const duration = record.durationMs !== undefined ? record.durationMs
     : !terminal && record.startedAtMs ? Date.now() - record.startedAtMs : undefined;
   const title = [
@@ -213,7 +214,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
       card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_thinking', content: `💭 ${publicText(bounded(latest.text, 600))}` });
     }
-    if (!terminal && !record.finalCard && !pendingAsks.length && record.tools.length) {
+    if (!terminal && !record.finalCard && !pendingAsks.length && presentation.showTools !== false && record.tools.length) {
       card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_tools', content: record.tools.slice(-2).map(tool =>
         toolLine(tool, 300),
       ).join('\n') });
@@ -231,7 +232,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       if (entry?.result) process.push({ kind: 'text', content: turnReplyAskSummary(entry, presentation.locale) });
     } else if (presentation.showProcess && item.kind === 'thinking') {
       process.push({ kind: 'text', content: `💭 ${publicText(item.text)}` });
-    } else if (presentation.showProcess && item.kind === 'tool') {
+    } else if (presentation.showProcess && presentation.showTools !== false && item.kind === 'tool') {
       const tool = record.tools.find(tool => tool.id === item.id);
       if (tool) process.push({ kind: 'tool', label: toolLine({ ...tool, subject: '' }), content: toolLine(tool)
         + (presentation.showToolResults && tool.result ? `\n${publicText(tool.result)}` : '') });
@@ -313,9 +314,10 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   return serialized;
 }
 
-export function replyCardPresentation(config: Pick<BotConfig, 'cotEnabled' | 'thinkingCardToolResult' | 'noCotChats' | 'hiddenStreamingCardButtons'>, chatId: string): Pick<TurnReplyCardPresentation, 'showProcess' | 'showToolResults' | 'canStop'> {
+export function replyCardPresentation(config: Pick<BotConfig, 'cotEnabled' | 'thinkingCardToolResult' | 'replyCardShowTools' | 'noCotChats' | 'hiddenStreamingCardButtons'>, chatId: string): Pick<TurnReplyCardPresentation, 'showProcess' | 'showTools' | 'showToolResults' | 'canStop'> {
   return {
     showProcess: config.cotEnabled !== false && !config.noCotChats?.includes(chatId),
+    showTools: config.replyCardShowTools !== false,
     showToolResults: config.thinkingCardToolResult !== false,
     canStop: !config.hiddenStreamingCardButtons?.includes('stop'),
   };

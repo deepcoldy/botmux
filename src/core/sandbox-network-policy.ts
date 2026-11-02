@@ -135,13 +135,32 @@ export function compileNetworkNft(raw: SandboxNetworkPolicy): string {
   ].join('\n');
 }
 
+function sandboxModeLabel(sandbox: unknown): string {
+  if (sandbox === true || sandbox === 'oncall') return 'oncall';
+  if (sandbox === 'scratch') return 'scratch';
+  return '关闭';
+}
+
+/** Why this launch cannot enforce the policy, naming what the launch actually
+ * is. Callers holding a session's frozen policy append
+ * {@link FROZEN_NETWORK_POLICY_HINT}. */
 export function networkPolicySupportError(input: { platform: string; backendType: string; sandbox: unknown; adopt?: boolean; existingEndpoint?: string; policy?: unknown }): string | undefined {
   if (input.policy === undefined) return;
   parseSandboxNetworkPolicy(input.policy);
-  if (input.platform !== 'linux') return 'sandboxNetworkPolicy requires Linux';
-  if (input.backendType !== 'pty' || input.adopt || input.existingEndpoint) return 'sandboxNetworkPolicy requires a new local PTY process; remote, persistent and adopt backends are unsupported';
-  if (input.sandbox !== true && input.sandbox !== 'oncall') return 'sandboxNetworkPolicy requires sandbox oncall';
+  if (input.platform !== 'linux') return `目标 IP 网络策略（sandboxNetworkPolicy）只支持 Linux，当前平台是 ${input.platform}`;
+  if (input.backendType !== 'pty' || input.adopt || input.existingEndpoint) {
+    const launch = input.adopt ? `adopt 接管的 ${input.backendType} 会话`
+      : input.existingEndpoint ? '外部 App Server 会话'
+        : `${input.backendType} 后端`;
+    return `已配置目标 IP 网络策略，但当前是${launch}；网络策略只支持新建的本地 PTY 会话（不支持 tmux 等持久化后端、远端后端与 adopt）。请把 Bot 后端设为 pty，或清除网络策略`;
+  }
+  if (input.sandbox !== true && input.sandbox !== 'oncall') return `已配置目标 IP 网络策略，但当前沙盒模式是「${sandboxModeLabel(input.sandbox)}」；网络策略只支持 oncall 沙盒。请把沙盒模式设为 oncall，或清除网络策略`;
 }
+
+/** Appended where the policy comes from a session's creation-time snapshot. */
+export const FROZEN_NETWORK_POLICY_HINT = '。网络策略在话题创建时随会话冻结：在 Dashboard 清除或修改后，已有话题仍按旧策略启动，需要新开话题才生效';
+
+const PROXY_KEYS = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'] as const;
 
 /** Default to rejecting proxy configuration for restricted policies. An
  * explicit trusted-egress mode delegates business destination control to that
@@ -149,5 +168,50 @@ export function networkPolicySupportError(input: { platform: string; backendType
 export function networkProxyError(policy: SandboxNetworkPolicy | undefined, env: Record<string, string | undefined>): string | undefined {
   if (!policy || policy.proxyMode === 'trusted-egress') return;
   if (policy.proxyMode === undefined && policy.public.mode === 'allow' && policy.private.mode === 'allow') return;
-  if (['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'].some(key => !!env[key])) return 'restricted sandboxNetworkPolicy does not support upstream proxy destination re-resolution; use direct permitted egress or explicitly delegate destination control with proxyMode trusted-egress';
+  const keys = PROXY_KEYS.filter(key => !!env[key]);
+  if (keys.length) return `环境里设置了代理变量（${keys.join('、')}），受限的目标 IP 网络策略约束不了代理转发后的目标地址，会话不会启动。请在策略里加上 "proxyMode": "trusted-egress"（把业务目标的控制交给这个代理出口，内核规则仍只放行到代理本身的地址），或去掉这些代理变量`;
+}
+
+export type NetworkPolicyWarning = 'dns_servers_missing' | 'proxy_requires_trusted_egress';
+
+/** Save-time warnings for a policy that parses but will not work as the
+ * operator probably expects. Saving still succeeds: the daemon's env can
+ * differ from the worker's at launch. */
+export function networkPolicyWarnings(policy: SandboxNetworkPolicy, env: Record<string, string | undefined>): NetworkPolicyWarning[] {
+  const warnings: NetworkPolicyWarning[] = [];
+  // Any configured policy replaces resolv.conf with dnsServers only and the
+  // slirp DNS forwarder is disabled — allow/allow included.
+  if (!policy.dnsServers?.length) warnings.push('dns_servers_missing');
+  if (networkProxyError(policy, env)) warnings.push('proxy_requires_trusted_egress');
+  return warnings;
+}
+
+/** CLI wording of a {@link NetworkPolicyWarning} (the dashboard has its own i18n). */
+export function networkPolicyWarningText(warning: string): string {
+  if (warning === 'dns_servers_missing') return '策略没有 dnsServers：沙盒里不会有任何 DNS 服务器，所有域名都解析不了（getaddrinfo EAI_AGAIN）。请填上可达的 DNS 服务器 IP，例如宿主 /etc/resolv.conf 里的 nameserver';
+  if (warning === 'proxy_requires_trusted_egress') return '宿主或 Bot 环境设置了 HTTP(S)_PROXY / ALL_PROXY，而策略不是全放行且没有 "proxyMode": "trusted-egress"：新会话会启动失败';
+  return warning;
+}
+
+/** Proxy variable NAMES (never values) set in `env`, for the dashboard. */
+export function proxyEnvKeys(env: Record<string, string | undefined>): string[] {
+  return PROXY_KEYS.filter(key => !!env[key]);
+}
+
+/** Host nameservers usable as `dnsServers` (template suggestion only).
+ * systemd-resolved's 127.0.0.53 stub is not reachable from the sandbox
+ * namespace, so its upstream list is used instead. */
+export function hostDnsServers(readFile: (path: string) => string): string[] {
+  const read = (path: string): string[] => {
+    try {
+      return readFile(path).split('\n')
+        .map(line => /^\s*nameserver\s+(\S+)/.exec(line)?.[1])
+        .filter((ip): ip is string => !!ip);
+    } catch { return []; }
+  };
+  const usable = (ips: string[]) => ips.filter(ip => {
+    try { return !!parseSandboxNetworkPolicy({ version: 1, public: { mode: 'allow' }, private: { mode: 'allow' }, dnsServers: [ip] }).dnsServers; } catch { return false; }
+  });
+  const direct = usable(read('/etc/resolv.conf'));
+  return [...new Set(direct.length ? direct : usable(read('/run/systemd/resolve/resolv.conf')))].slice(0, 8);
 }

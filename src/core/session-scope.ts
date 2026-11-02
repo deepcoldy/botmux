@@ -161,8 +161,28 @@ export function sessionScopeCapabilities(): SessionScopeCapabilities {
 }
 
 export function sessionScopeUnitName(sessionId: string): string {
+  return `${sessionScopeUnitStem(sessionId)}.scope`;
+}
+
+function sessionScopeUnitStem(sessionId: string): string {
   const safe = sessionId.toLowerCase().replace(/[^a-z0-9_.-]/g, '-').slice(0, 96);
-  return `botmux-session-${safe || 'unknown'}.scope`;
+  return `botmux-session-${safe || 'unknown'}`;
+}
+
+/** Name used when the deterministic unit is still held by a scope that would
+ *  not stop (see {@link releaseSessionScopeForSpawn}). Worker pid + spawn
+ *  generation keep it unique across worker restarts of the same session. */
+export function sessionScopeFallbackUnitName(sessionId: string, workerPid: number, generation: number): string {
+  return `${sessionScopeUnitStem(sessionId)}-p${workerPid}g${generation}.scope`;
+}
+
+/** Whether `unit` is this session's scope: the deterministic name or one of
+ *  its spawn-generation fallbacks. */
+export function isSessionScopeUnitFor(sessionId: string, unit: string): boolean {
+  const stem = sessionScopeUnitStem(sessionId);
+  if (unit === `${stem}.scope`) return true;
+  if (!unit.startsWith(`${stem}-p`) || !unit.endsWith('.scope')) return false;
+  return /^\d+g\d+$/.test(unit.slice(stem.length + 2, -'.scope'.length));
 }
 
 const SESSION_SCOPE_UNIT_RE = /^botmux-session-[a-z0-9_.-]+\.scope$/;
@@ -240,9 +260,9 @@ export function wrapCommandInSessionScope(
   workerConfig?: WorkerConfig,
   capabilities = sessionScopeCapabilities(),
   systemdEnv = userSystemdBusEnv(),
+  unitName = sessionScopeUnitName(sessionId),
 ): ScopedCommand {
   if (!capabilities.cleanupSupported) return { bin, args: [...args], capabilities };
-  const unitName = sessionScopeUnitName(sessionId);
   const scopeArgs = [
     '--user',
     '--scope',
@@ -277,11 +297,177 @@ export function wrapCommandInSessionScope(
 
 export function stopSessionScope(
   sessionId: string,
+  options: { platform?: NodeJS.Platform; run?: RunSync; unitName?: string } = {},
+): boolean {
+  if ((options.platform ?? process.platform) !== 'linux') return false;
+  const run = options.run ?? defaultRun;
+  return run('systemctl', ['--user', 'stop', options.unitName ?? sessionScopeUnitName(sessionId)]).status === 0;
+}
+
+export interface SessionScopeRelease {
+  /** Unit name the next launch must use. */
+  unitName: string;
+  /** Why the deterministic name could not be reused (absent when it could). */
+  blocked?: string;
+}
+
+interface ScopeOps {
+  run: RunSync;
+  readFile: (path: string) => string;
+  sleep: (ms: number) => void;
+  now: () => number;
+}
+
+function scopeOps(options: Partial<ScopeOps>): ScopeOps {
+  return {
+    run: options.run ?? defaultRun,
+    readFile: options.readFile ?? (path => readFileSync(path, 'utf8')),
+    sleep: options.sleep ?? (ms => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }),
+    now: options.now ?? Date.now,
+  };
+}
+
+function scopeActiveState(unit: string, run: RunSync): string | undefined {
+  const shown = run('systemctl', ['--user', 'show', unit, '--property=ActiveState', '--value']);
+  return shown.status === 0 ? shown.stdout.trim() : undefined;
+}
+
+/** A unit name systemd-run can create again: never loaded, or stopped. A
+ *  failed unit keeps its name until reset-failed. Unknown (systemctl itself
+ *  failed) is treated as free: the launch then reports systemd's own error. */
+function scopeNameFree(unit: string, run: RunSync): boolean {
+  const state = scopeActiveState(unit, run);
+  if (state === 'failed') {
+    run('systemctl', ['--user', 'reset-failed', unit]);
+    return scopeActiveState(unit, run) !== 'failed';
+  }
+  return state === undefined || state === '' || state === 'inactive';
+}
+
+function describeScopeProcesses(unit: string, run: RunSync, readFile: (path: string) => string): string {
+  const shown = run('systemctl', ['--user', 'show', unit, '--property=ControlGroup', '--value']);
+  const controlGroup = shown.status === 0 ? shown.stdout.trim() : '';
+  if (!controlGroup) return 'processes unknown';
+  try {
+    const pids = readFile(`/sys/fs/cgroup${controlGroup}/cgroup.procs`).trim().split(/\s+/).filter(Boolean);
+    if (pids.length === 0) return 'no processes left';
+    return pids.slice(0, 8).map(pid => {
+      let command = '?';
+      try { command = readFile(`/proc/${pid}/cmdline`).split('\0').filter(Boolean).join(' ').slice(0, 120) || '?'; } catch { /* exited */ }
+      return `${pid} ${command}`;
+    }).join('; ') + (pids.length > 8 ? `; … ${pids.length - 8} more` : '');
+  } catch {
+    return 'processes unknown';
+  }
+}
+
+/** Spawn-generation fallback scopes of this session that systemd still knows. */
+function listSessionScopeFallbacks(sessionId: string, run: RunSync): string[] {
+  const listed = run('systemctl', [
+    '--user', 'list-units', '--all', '--plain', '--no-legend', '--full',
+    `${sessionScopeUnitStem(sessionId)}-p*.scope`,
+  ]);
+  if (listed.status !== 0) return [];
+  return listed.stdout.split('\n').map(line => line.trim().split(/\s+/)[0] ?? '')
+    .filter(unit => unit !== sessionScopeUnitName(sessionId) && isSessionScopeUnitFor(sessionId, unit));
+}
+
+/** Stop a scope; one that will not stop (payload ignoring SIGTERM) gets a
+ *  SIGKILL without waiting for it to settle. */
+function retireScope(sessionId: string, unit: string, run: RunSync): boolean {
+  if (stopSessionScope(sessionId, { platform: 'linux', run, unitName: unit })) return true;
+  run('systemctl', ['--user', 'kill', '--signal=SIGKILL', unit]);
+  return false;
+}
+
+/**
+ * Stop every scope this session owns: the deterministic unit and any
+ * spawn-generation fallback. Found through systemd rather than remembered in
+ * the worker, so a worker that reattached a persistent pane (and never ran the
+ * launch that picked a fallback name) still retires it on close / restart.
+ * Returns whether the deterministic unit stopped cleanly.
+ */
+export function stopAllSessionScopes(
+  sessionId: string,
   options: { platform?: NodeJS.Platform; run?: RunSync } = {},
 ): boolean {
   if ((options.platform ?? process.platform) !== 'linux') return false;
   const run = options.run ?? defaultRun;
-  return run('systemctl', ['--user', 'stop', sessionScopeUnitName(sessionId)]).status === 0;
+  for (const unit of listSessionScopeFallbacks(sessionId, run)) retireScope(sessionId, unit, run);
+  return stopSessionScope(sessionId, { platform: 'linux', run });
+}
+
+/** Upper bound for the synchronous retire-before-launch work. Each systemctl
+ *  call is itself capped at 5s; past this budget the launch stops waiting and
+ *  moves to a fresh name. */
+export const SESSION_SCOPE_RELEASE_BUDGET_MS = 8_000;
+
+/**
+ * Retire this session's previous scopes before a fresh launch and pick the
+ * unit name to launch under. The deterministic name is reused only once that
+ * unit is really gone: `systemctl stop` can fail or time out (a payload that
+ * ignores SIGTERM keeps the scope deactivating for TimeoutStopSec), and
+ * launching under a still-loaded name fails with "Unit … already exists" on
+ * every retry. Such a scope gets a SIGKILL; if it still survives, the launch
+ * moves to a spawn-generation name and `blocked` says which processes held
+ * the old one.
+ */
+export function releaseSessionScopeForSpawn(
+  sessionId: string,
+  generation: number,
+  options: { platform?: NodeJS.Platform; workerPid?: number; budgetMs?: number } & Partial<ScopeOps> = {},
+): SessionScopeRelease {
+  const unitName = sessionScopeUnitName(sessionId);
+  if ((options.platform ?? process.platform) !== 'linux') return { unitName };
+  const { run, readFile, sleep, now } = scopeOps(options);
+  const deadline = now() + (options.budgetMs ?? SESSION_SCOPE_RELEASE_BUDGET_MS);
+  const fallback = (why: string): SessionScopeRelease => ({
+    unitName: sessionScopeFallbackUnitName(sessionId, options.workerPid ?? process.pid, generation),
+    blocked: `${unitName} ${why} (${describeScopeProcesses(unitName, run, readFile)})`,
+  });
+  // Fallback scopes of an earlier worker of this session (its own
+  // deterministic name was blocked) hold descendants too.
+  for (const unit of listSessionScopeFallbacks(sessionId, run)) {
+    if (now() >= deadline) break;
+    retireScope(sessionId, unit, run);
+  }
+  if (now() >= deadline) return fallback('was not checked: scope cleanup ran out of time');
+  stopSessionScope(sessionId, { platform: 'linux', run });
+  if (scopeNameFree(unitName, run)) return { unitName };
+  run('systemctl', ['--user', 'kill', '--signal=SIGKILL', unitName]);
+  while (now() < deadline) {
+    if (scopeNameFree(unitName, run)) return { unitName };
+    sleep(50);
+  }
+  return fallback(`is still ${scopeActiveState(unitName, run) || 'loaded'} after stop and SIGKILL`);
+}
+
+/**
+ * The launch-time half: retire the old scopes, then wrap the command under
+ * whichever unit name is actually free.
+ */
+export function prepareSessionScopedLaunch(
+  sessionId: string,
+  generation: number,
+  bin: string,
+  args: readonly string[],
+  workerConfig?: WorkerConfig,
+  options: Parameters<typeof releaseSessionScopeForSpawn>[2] & {
+    capabilities?: SessionScopeCapabilities;
+    systemdEnv?: Record<string, string> | undefined;
+  } = {},
+): { scoped: ScopedCommand; release: SessionScopeRelease } {
+  const release = releaseSessionScopeForSpawn(sessionId, generation, options);
+  const scoped = wrapCommandInSessionScope(
+    sessionId,
+    bin,
+    args,
+    workerConfig,
+    options.capabilities ?? sessionScopeCapabilities(),
+    'systemdEnv' in options ? options.systemdEnv : userSystemdBusEnv(),
+    release.unitName,
+  );
+  return { scoped, release };
 }
 
 export function __testOnly_resetSessionScopeCapabilityCache(): void {

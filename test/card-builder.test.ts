@@ -347,6 +347,15 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(md).not.toContain('![x](');
   });
 
+  it('offers a clear-search button on no match that re-fires adopt_search', () => {
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'ja' }));
+    const buttons = (card.body.elements ?? []).filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].behaviors[0].value.action).toBe('adopt_search');
+    expect(buttons[0].behaviors[0].value.selected).toBe('');
+  });
+
   const herdrLive = (extra: Partial<AdoptableSession> = {}): AdoptableSession => ({
     source: 'herdr',
     herdrSessionName: 'collie',
@@ -699,10 +708,6 @@ describe('getCliDisplayName', () => {
     expect(getCliDisplayName('codex')).toBe('Codex');
   });
 
-  it('should return "Gemini" for gemini', () => {
-    expect(getCliDisplayName('gemini')).toBe('Gemini');
-  });
-
   it('should return "OpenCode" for opencode', () => {
     expect(getCliDisplayName('opencode')).toBe('OpenCode');
   });
@@ -817,6 +822,57 @@ describe('buildConfigCard', () => {
     // Sentinel first = "clear and follow the CLI/model default".
     expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', 'low', 'high', 'max']);
     expect(select.initial_option).toBe('max');
+  });
+
+  it('shows the shared-bot sandbox advice only when the data carries it, as short lines plus a folded CLI list', () => {
+    const texts = (card: any) => JSON.stringify(card.elements ?? card.body?.elements ?? card);
+    const plain = parse(buildConfigCard(configData(null), 'zh'));
+    // CLI display names legitimately appear in the CLI dropdown; the advice
+    // block has its own markers that must be absent without sandboxAdvice.
+    expect(texts(plain)).not.toContain('建议开启白名单隔离');
+    expect(texts(plain)).not.toContain('已验证可用的 CLI');
+
+    const card = (cliSupport: 'verified' | 'unverified' | 'unsupported' | 'wrapper' | 'blocked', cliId: string, reasons: string[] = ['oncall']) =>
+      parse(buildConfigCard({ ...configData(null), sandboxAdvice: { reasons, cliSupport, cliId } }, 'zh'));
+    const elementsOf = (c: any): any[] => c.elements ?? c.body?.elements ?? [];
+    const adviceBlock = (c: any) => elementsOf(c).find((e: any) => e.tag === 'markdown' && String(e.content).includes('建议开启白名单隔离'));
+    const fold = (c: any) => elementsOf(c).find((e: any) => e.tag === 'collapsible_panel');
+
+    const verified = card('verified', 'codex', ['oncall', 'allowedUsers']);
+    // One fact per line: headline, why, the reasons, where to turn it on, the current CLI.
+    expect(String(adviceBlock(verified).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式、allowedUsers 有多人',
+      '开启：Dashboard → Bot 配置 → 文件沙盒，新会话生效',
+      '当前 CLI：Codex，已验证可用',
+    ]);
+    // The verified list sits in a folded panel, not in the advice text.
+    // Literal list, not derived from the table: it must be the matrix result in table order.
+    expect(fold(verified).expanded).toBe(false);
+    expect(fold(verified).header.title.content).toBe('已验证可用的 CLI（Linux 实测）');
+    expect(fold(verified).elements[0].content).toBe('Claude、Codex、Antigravity、OpenCode、Pi、Oh My Pi、Grok Build、Kimi');
+    expect(String(adviceBlock(verified).content)).not.toContain('Grok Build');
+
+    // Each support state gets its own CLI line; the dynamic keys resolve to text.
+    const cliLine = (c: any) => String(adviceBlock(c).content).split('\n').at(-1);
+    expect(cliLine(card('unsupported', 'codex-app'))).toBe('当前 CLI：Codex App，暂不支持白名单隔离，请改用 Codex');
+    expect(cliLine(card('unverified', 'relay'))).toBe('当前 CLI：Relay，还没验证过，开启前先在测试会话里试一下');
+    expect(cliLine(card('wrapper', 'claude-code'))).toBe('当前 CLI：Claude，通过 wrapper 启动。开启白名单隔离后 wrapper 仍在沙盒内运行；若 wrapper 依赖的路径不在白名单内会明确报错拒绝启动，把这些路径加进沙盒白名单（只读/读写）即可');
+    expect(String(adviceBlock(card('verified', 'codex', ['allowedChatGroups'])).content)).toContain('原因：allowedChatGroups 授权了整群发言');
+    expect(texts(card('wrapper', 'claude-code'))).not.toContain('card.config.sandbox_advice');
+
+    // A local-but-sandbox-refusing backend (herdr/zellij/zmx/orca): no "turn it
+    // on" action line and no verified-list fold — they would brick sessions.
+    const backendBlocked = card('blocked', 'claude-code');
+    expect(String(adviceBlock(backendBlocked).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式',
+      '当前会话后端不支持文件沙盒（开启后新会话会起不来）；请先把后端切换为 tmux 或 pty，再回来开启',
+    ]);
+    expect(fold(backendBlocked)).toBeUndefined();
+    expect(String(adviceBlock(backendBlocked).content)).not.toContain('开启：Dashboard');
   });
 
   it('renders card-behaviour toggles', () => {
@@ -1136,16 +1192,16 @@ describe('buildSessionCard', () => {
 
     it('can include local attach buttons for non-resume CLIs when mode-aware readiness is true', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', false, false, 'en', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'mimocode', false, false, 'en', true));
       const actions = findActions(card);
       const btn = actions.find((a: any) => a.value?.action === 'open_local_cli');
-      expect(btn?.value.cli_id).toBe('gemini');
-      expect(btn?.text.content).toBe('💻 Open Gemini');
+      expect(btn?.value.cli_id).toBe('mimocode');
+      expect(btn?.text.content).toBe('💻 Open MiMoCode');
     });
 
     it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
       enableLocalCliOpen();
-      for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
+      for (const cli of ['codex-app', 'mimocode', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
         expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
@@ -1195,11 +1251,11 @@ describe('buildSessionCard', () => {
     });
 
     it('should include restart button with CLI display name', () => {
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'opencode', true));
       const actions = findActions(card);
       const restartBtn = actions.find((a: any) => a.value?.action === 'restart');
       expect(restartBtn).toBeDefined();
-      expect(restartBtn.text.content).toContain('Gemini');
+      expect(restartBtn.text.content).toContain('OpenCode');
       expect(restartBtn.value.root_id).toBe(ROOT);
       expect(restartBtn.value.session_id).toBe(SID);
     });
@@ -1733,7 +1789,7 @@ describe('buildStreamingCard', () => {
 
     it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
       const card = parse(buildStreamingCard(
-        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'opencode', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         { context: null, tokens: null },
       ));
@@ -2465,7 +2521,7 @@ describe('buildSessionClosedCard', () => {
     expect(findMarkdownContent(card)).toContain('/proj/x');
   });
 
-  it('shows a fallback note when the CLI cannot resume from CLI args (gemini/opencode)', () => {
+  it('shows a fallback note when the CLI cannot resume from CLI args (e.g. opencode)', () => {
     const card = parse(buildSessionClosedCard(
       'sess-3', 'om_root', 'topic', 'opencode', undefined, null,
     ));
@@ -2690,6 +2746,32 @@ describe('buildRelayPickerCard', () => {
     expect(containers(card)).toHaveLength(0);
     const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
     expect(allMd).toMatch(/没有匹配|No sessions match/);
+  });
+
+  // Regression: the no-match card used to dead-end — the only way back was to
+  // clear the input and submit '', which Lark doesn't fire. A clear-search
+  // button re-fires relay_search without input_value, so the handler resolves
+  // the query to '' and re-renders the full list.
+  it('offers a clear-search button on no match that re-fires relay_search', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'ja' }));
+    const buttons = card.body.elements.filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    const v = buttons[0].behaviors[0].value;
+    expect(v.action).toBe('relay_search');
+    expect(v.target_chat_id).toBe('oc_t');
+    expect(v.root_id).toBe('om_r');
+    expect(v.invoker_open_id).toBe('ou_invoker_test');
+    expect(v.selected).toBe('');
+    // Not shown when the search has hits.
+    const hit = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'session 1' }));
+    expect(hit.body.elements.filter((e: any) => e.tag === 'button')).toHaveLength(0);
+  });
+
+  it('escapes the echoed search query in the no-match message', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: '![x](http://evil/b)' }));
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toContain('\\[x\\]');
+    expect(allMd).not.toContain('![x](');
   });
 
   // Regression (申晗现场): a p2p entry's chatLabel is the raw DM chatId while

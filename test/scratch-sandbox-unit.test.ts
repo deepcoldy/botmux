@@ -3,6 +3,7 @@ import {
   scratchHostView,
   remapIntoMerged,
   attachScratchSession,
+  canonicalAllowMissing,
 } from '../src/adapters/backend/scratch-sandbox.js';
 import {
   scratchViewPath,
@@ -14,11 +15,32 @@ import {
   persistedScratchMappings,
   type ScratchPathMapping,
 } from '../src/services/scratch-host-view.js';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, existsSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { lastJsonLine, privateMountNsAvailable, runInPrivateMountNs } from './helpers/private-mount-ns.js';
+
+describe('canonicalAllowMissing (scratch deny-mask targets)', () => {
+  it('resolves the existing ancestors of a missing path, keeping the missing tail', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'scratch-canon-')));
+    try {
+      const moved = join(root, 'moved-botmux');
+      mkdirSync(join(moved, 'bots'), { recursive: true });
+      mkdirSync(join(root, 'home'));
+      symlinkSync(moved, join(root, 'home', '.botmux'));
+      // Missing below a symlink: lands on the real directory, never through the link.
+      expect(canonicalAllowMissing(join(root, 'home', '.botmux', 'data', 'bytedcli-home')))
+        .toBe(join(moved, 'data', 'bytedcli-home'));
+      // Existing: plain realpath.
+      expect(canonicalAllowMissing(join(root, 'home', '.botmux', 'bots'))).toBe(join(moved, 'bots'));
+      // Nothing symlinked on the way: unchanged.
+      expect(canonicalAllowMissing(join(root, 'nope', 'x'))).toBe(join(root, 'nope', 'x'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Linux scratch host-view mapping', () => {
   const merged = '/var/lib/botmux/data/sandboxes/sid-1/root';

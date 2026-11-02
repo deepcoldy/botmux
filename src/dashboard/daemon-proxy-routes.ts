@@ -114,6 +114,9 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('env'),
   putBotConfig('env-policy'),
   putBotConfig('codex-auth-sync'),
+  // codex-config：独立 CODEX_HOME 的 config.toml 路径信息；resync 先备份再从宿主覆盖。
+  { method: 'GET', path: botPath('codex-config'), upstream: '/api/bot-codex-config', body: NO_BODY },
+  { method: 'POST', path: botPath('codex-config/resync'), upstream: '/api/bot-codex-config/resync', body: RAW },
   // Trigger-user CLI auth：开关（PUT）+ 状态（GET），校验路径由 daemon 统一持有。
   putBotConfig('trigger-user-auth'),
   putBotConfig('lark-tool-binding'),

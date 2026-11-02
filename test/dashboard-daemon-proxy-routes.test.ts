@@ -33,6 +33,8 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/env', '/api/bot-env', 'raw'],
   ['PUT', '/api/bots/cli_a/env-policy', '/api/bot-env-policy', 'raw'],
   ['PUT', '/api/bots/cli_a/codex-auth-sync', '/api/bot-codex-auth-sync', 'raw'],
+  ['GET', '/api/bots/cli_a/codex-config', '/api/bot-codex-config', 'none'],
+  ['POST', '/api/bots/cli_a/codex-config/resync', '/api/bot-codex-config/resync', 'raw'],
   ['PUT', '/api/bots/cli_a/trigger-user-auth', '/api/bot-trigger-user-auth', 'raw'],
   ['PUT', '/api/bots/cli_a/lark-tool-binding', '/api/bot-lark-tool-binding', 'raw'],
   ['GET', '/api/bots/cli_a/trigger-user-auth-status', '/api/bot-trigger-user-auth-status', 'none'],

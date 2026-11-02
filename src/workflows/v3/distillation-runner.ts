@@ -39,6 +39,7 @@ import {
   readProcessStartIdentity,
 } from '../../core/session-marker.js';
 import { locateExecutable } from '../../utils/executable.js';
+import { systemBwrapPath } from '../../core/system-bwrap.js';
 import {
   fsyncDirectorySyncPortable,
   fsyncRegularFileSync,
@@ -582,13 +583,12 @@ function resolveStockClaudeExecutable(testBin: string | undefined): ResolvedClau
   }
 }
 
+/** Distillation never falls back to a PATH bwrap (unlike the session
+ *  sandboxes, which only warn): it runs unattended with no user to read a
+ *  warning, so a missing distro bubblewrap is a setup failure. */
 function resolveSystemBwrap(): string {
-  for (const candidate of ['/usr/bin/bwrap', '/bin/bwrap']) {
-    try {
-      const resolved = realpathSync(candidate);
-      if (statSync(resolved).isFile() && locateExecutable(resolved) !== null) return resolved;
-    } catch { /* try the next fixed system path */ }
-  }
+  const resolved = systemBwrapPath();
+  if (resolved) return resolved;
   throw new V3DistillationRunnerError('SCRATCH_SETUP_FAILED');
 }
 

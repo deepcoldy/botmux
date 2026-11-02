@@ -39,6 +39,9 @@ export interface OrdinaryTurnRecoveryState {
    *  owner + queue on every commit; absent when empty (pre-upgrade archives have
    *  no field and are read as loud, the pre-existing semantics). */
   silentLogicalTurnIds?: string[];
+  /** Signed App terminal saved atomically with its final ACK high-water. The
+   * worker may disappear before sending the redundant terminal IPC. */
+  pendingTerminal?: OrdinaryTurnRecoveryTerminal;
 }
 
 /** The slot is held by the original logical turn itself, still running — no
@@ -160,6 +163,7 @@ type AttachedRecovery = {
   coordinator: OrdinaryTurnRecoveryCoordinator<any>;
   cancelActive: boolean;
   dispose: () => void;
+  persist: (state: OrdinaryTurnRecoveryState) => void;
 };
 
 const attachedRecoveries = new Map<string, AttachedRecovery>();
@@ -582,6 +586,7 @@ export function attachOrdinaryTurnRecovery<TTimer>(
     coordinator,
     cancelActive: deps.supersedeOnUserInput === true,
     dispose: () => coordinator.dispose(),
+    persist: wrapped.persist,
   });
   if (session.ordinaryTurnRecovery) {
     if (session.ordinaryTurnRecovery.status === 'dispatching'
@@ -610,6 +615,36 @@ export function attachOrdinaryTurnRecovery<TTimer>(
         );
       }
     }
+  }
+  reconcileOrdinaryTurnRecoveryTerminalReceipt(session);
+}
+
+/** Stage only the exact live owner; the caller persists this together with
+ * the signed final ledger before acknowledging the runner. */
+export function stageOrdinaryTurnRecoveryTerminal(
+  session: OrdinaryTurnRecoverySession, terminal: OrdinaryTurnRecoveryTerminal,
+): void {
+  const state = session.ordinaryTurnRecovery;
+  if (state?.status === 'running' && state.currentTurnId === terminal.turnId) {
+    session.ordinaryTurnRecovery = { ...state, pendingTerminal: { ...terminal } };
+  }
+}
+
+export function reconcileOrdinaryTurnRecoveryTerminalReceipt(session: OrdinaryTurnRecoverySession): void {
+  const current = session.ordinaryTurnRecovery;
+  const attached = attachedRecoveries.get(session.sessionId);
+  if (!current?.pendingTerminal || !attached || attached.session !== session) return;
+  const { pendingTerminal, ...clean } = current;
+  session.ordinaryTurnRecovery = clean;
+  try {
+    if (clean.status === 'running' && clean.currentTurnId === pendingTerminal.turnId) {
+      attached.coordinator.onTerminal(clean, pendingTerminal);
+    } else {
+      attached.persist(clean);
+    }
+  } catch (error) {
+    session.ordinaryTurnRecovery = current;
+    throw error;
   }
 }
 

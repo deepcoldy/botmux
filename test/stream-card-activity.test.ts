@@ -29,6 +29,15 @@ describe('streaming execution activity', () => {
     ]) expect(traexStreamCardActivity(input)).toBeUndefined();
   });
 
+  it.each([NaN, Infinity, -1])('omits an invalid execution start: %s', startedAtMs => {
+    expect(traexStreamCardActivity({ ...turn, execution: { ...execution, startedAtMs } })).toBeUndefined();
+  });
+
+  it.each([NaN, Infinity, 5001])('omits an invalid or future progress time without hiding valid activity: %s', lastProgressAtMs => {
+    expect(traexStreamCardActivity({ ...turn, execution: { ...execution, lastProgressAtMs } }))
+      .toEqual({ activity: 'working', elapsedSeconds: 4 });
+  });
+
   it.each(['zh', 'en'] as const)('renders phase and running time with output collapsed (%s)', locale => {
     function card(activity: ActivityCardLabel, status: 'working' | 'idle' = 'working') {
       return JSON.parse(buildStreamingCard('s', 'om_root', '', 'task', '', status, 'traex', 'hidden',

@@ -127,7 +127,7 @@ describe('resolveTopicSpec —— /effort 的拒绝分支', () => {
   });
 
   it('CLI 没有显式推理控制', async () => {
-    const result = await resolve('/t /effort high 干活', { cliId: 'gemini' });
+    const result = await resolve('/t /effort high 干活', { cliId: 'opencode' });
     expect(errorKinds(result)).toEqual(['effort_unsupported_cli']);
   });
 

@@ -3584,7 +3584,7 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it.each([
-    ['gemini', {}],
+    ['opencode', {}],
     ['codex', { adoptedFrom: { sessionId: 'external' } }],
     ['codex', { chatId: 'http_async_test' }],
     ['claude-code', { adoptedFrom: { sessionId: 'external' } }],
