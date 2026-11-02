@@ -2091,6 +2091,41 @@ describe('opencode buildArgs', () => {
     expect(args).toEqual([]);
   });
 
+  it('passes --auto when the probed CLI version accepts it (>= 1.17.12)', () => {
+    // V1 的默认 ask（external_directory / .env）在托管态没人看得见，turn 会
+    // 静默卡在原生弹窗上；--auto 是 opencode 1.17.12 才加的。
+    for (const cliVersion of ['1.17.12', '1.17.13', '1.19.1', 'v1.18.32', '2.1.4']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual(['--auto']);
+    }
+  });
+
+  it('omits --auto on versions that predate the flag (help-and-exit would crash-loop)', () => {
+    // adapter 注释里的实测基线就是 1.17.11 —— 传未知 flag 会打帮助退出 1，
+    // 再被 daemon 的自动重启放大成 crash-loop。
+    for (const cliVersion of ['1.17.11', '1.17.8', '1.16.0', '1.4.1', '1.0.0']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('omits --auto when the version was never probed', () => {
+    for (const cliVersion of [undefined, '', 'unknown']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('omits --auto when disableCliBypass is set even on a new version', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '1.19.1', disableCliBypass: true });
+    expect(args).toEqual([]);
+  });
+
+  it('mimo (same adapter family) never gets --auto: it has no such flag', () => {
+    const mimo = createMiMoCodeAdapter('/usr/bin/mimo');
+    expect(mimo.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '2.1.4' })).toEqual(['--trust']);
+  });
+
   it('passes initialPrompt via --prompt flag', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, initialPrompt: 'hello world' });
     expect(args).toContain('--prompt');

@@ -23142,6 +23142,8 @@ async function spawnCli(
     codexProfile: cfg.codexProfile,
     serviceTier: cfg.serviceTier,
     disableCliBypass: cfg.disableCliBypass === true,
+    // 已探测的 CLI 版本：给「新版本才有的 flag」做门控（见 SpawnContext.cliVersion）。
+    cliVersion: cfg.cliVersion,
     settingsEnv: perBotSettingsEnv,
     settingsFilePath: perBotSettingsFilePath,
     codexBrowser: cfg.codexBrowser,
