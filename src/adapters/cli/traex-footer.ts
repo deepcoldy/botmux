@@ -45,6 +45,22 @@ const STATUS_ROW = new RegExp(
  *  so a quoted "❯ …" never reaches column 0. */
 const PROMPT_ROW = /^[›❯](?:[ \t]|$)/;
 
+/** Native /model overlays replace the composer. Match only the live tail
+ * below the final rule, never an old menu quoted in the transcript. Return
+ * the page identity so recovery waits for redraw before sending another Esc.
+ * Captured on 0.213.1: model -> backend variant -> reasoning level. */
+export function traexModelPickerPage(screen: string): string | undefined {
+  const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+  if (!/^\s*enter confirm\s*\|\s*esc go back\s*$/.test(rows.at(-1) ?? '')) return;
+  let start = rows.length - 1;
+  while (start >= 0 && !/^[ \t]*─{3,}[^\r\n]*$/.test(rows[start]!)) start--;
+  if (start < 0) return;
+  const tail = rows.slice(start + 1);
+  const title = tail.find(row => /^  Select (?:Model and (?:Effort|Mode)|Reasoning Level for .+)\s*$/.test(row));
+  if (!title || !tail.some(row => /^[›❯][ \t]+\d+\. /.test(row))) return;
+  return title.trim();
+}
+
 /**
  * True only when the row two above the composer is a live status row. The
  * row between is the composer's top rule: a ─ run in tmux captures, blank
@@ -99,7 +115,7 @@ export function traexRestoredComposerReady(screen: string): boolean {
   // Only the model cell is initialization evidence; a cwd named "loading"
   // in a later footer cell must not strand an otherwise initialized prompt.
   if (/\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
-  if (footer.length === 2 && !/^[ \t]*(?:☢ )?(?:Full Access|Read Only|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
+  if (footer.length === 2 && !/^[ \t]*(?:[☢▧] )?(?:Full Access|Read Only|Auto Mode|Workspace Edit|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
   // A login banner can be taller than the nearby live-status region. Inspect
   // all rows above the composer for native login prompts, but do not treat
   // a transcript sentence mentioning login as an active input owner.
