@@ -3406,6 +3406,72 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('rediscovers a disconnected browser within the same native runner', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'browser-reconnect-runner-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const plugin = join(dir, 'plugin'); mkdirSync(join(plugin, 'scripts'), { recursive: true });
+    writeFileSync(join(plugin, 'scripts', 'browser-service.mjs'), 'export async function handleRpc(){return {}}');
+    writeFileSync(join(plugin, 'scripts', 'browser-client.mjs'), `
+      let setupCount=0,discoveries=0;
+      export async function setupBrowserRuntime(){setupCount++;return {browsers:{get:async family=>{
+        if(family!=='chrome')throw new Error('wrong browser family');
+        const id=String(++discoveries);
+        const tab={id:'7',title:async()=> 'Example',url:async()=> 'https://example.test',
+          dom_cua:{get_visible_dom:async()=>{if(id==='1')throw new Error('Browser is not available: 1');
+            return {connected:id,setupCount};}}};
+        return {browserId:id,nameSession:async()=>{},
+          user:{openTabs:async()=>[{id:'7'}],claimTab:async()=>tab},
+          tabs:{get:async()=>tab}};
+      }}}}
+    `);
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+      const fs=require('node:fs'),readline=require('node:readline');
+      if(process.argv.includes('--version')){console.log('codex 0.162.1');process.exit(0)}
+      const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+      const notify=(method,params)=>send({method,params});
+      const ops=[{operation:'list_tabs'},{operation:'claim_tab',tabId:'7'},
+        {operation:'snapshot',tabId:'7'},{operation:'list_tabs'},
+        {operation:'snapshot',tabId:'7'},{operation:'claim_tab',tabId:'7'},
+        {operation:'snapshot',tabId:'7'}];
+      let index=0;
+      const tool=()=>send({id:9000+index,method:'item/tool/call',params:{threadId:'thread-browser',
+        turnId:'turn-browser',callId:'browser-'+index,tool:'botmux_browser',arguments:ops[index]}});
+      readline.createInterface({input:process.stdin}).on('line',line=>{
+        const q=JSON.parse(line);fs.appendFileSync(process.env.FAKE_CODEX_LOG,JSON.stringify(q)+'\\n');
+        if(q.id>=9000&&q.result){
+          if(++index<ops.length){tool();return;}
+          const item={type:'agentMessage',id:'answer',text:'Browser recovered'};
+          notify('item/completed',{threadId:'thread-browser',turnId:'turn-browser',item});
+          notify('turn/completed',{threadId:'thread-browser',turn:{id:'turn-browser',status:'completed',items:[item]}});return;
+        }
+        if(q.id===undefined)return;
+        let result={};
+        if(q.method==='initialize')result={userAgent:'fake-codex'};
+        if(q.method==='thread/start')result={thread:{id:'thread-browser',turns:[]}};
+        if(q.method==='turn/start')result={turn:{id:'turn-browser'}};
+        send({id:q.id,result});
+        if(q.method==='turn/start'){
+          notify('turn/started',{threadId:'thread-browser',turn:{id:'turn-browser'}});tool();
+        }
+      });
+    `); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'browser-reconnect', control.bootstrap.path, {
+      extraArgs: ['--browser-family', 'chrome', '--browser-plugin-root', plugin],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('read browser', { text: 'read browser' })}\r`);
+      await waitFor(harness, () => control.finals.length === 1);
+      const results = readRequests(logPath).filter(r => r.id >= 9000 && r.result).map(r => r.result);
+      expect(results.map(r => r.success)).toEqual([true, true, false, true, false, true, true]);
+      expect(results[2].contentItems[0].text).toContain('Browser is not available: 1');
+      expect(JSON.parse(results[6].contentItems[0].text).snapshot).toEqual({ connected: '2', setupCount: 1 });
+      expect(readRequests(logPath).filter(r => r.method === 'turn/start')).toHaveLength(1);
+    } finally { await stopChild(harness.child); await control.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('registers the bounded browser dynamic tool only when the bridge is enabled', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-browser-tool-'));
     const fakeCodex = join(dir, 'fake-codex');
