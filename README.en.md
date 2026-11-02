@@ -46,6 +46,7 @@ botmux start                 # start the daemon (botmux autostart enable for aut
 
 - **Self-contained single-file binary**: Runtime and PTY are embedded — **no Node required on the host to install or run**. Supports Linux / macOS (x64 / arm64, stable Apple Developer ID signature for official macOS builds); on Windows, run inside WSL2.
 - **Seamless upgrade**: Run `botmux upgrade` or re-run the curl command above for safe in-place upgrades.
+- **Source installs**: Dashboard version settings offer normal updates and a confirmed force update that backs up local changes before replacing them. See [source updates and recovery](docs/local-source-update.md).
 - **Full Guide**: Lark international edition, manual permission configuration, and troubleshooting are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
 
 <details>

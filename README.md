@@ -44,6 +44,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 - **自包含单文件二进制**：运行时与 PTY 已内嵌，**安装和运行都不依赖本机 Node**。支持 Linux / macOS（x64 / arm64，macOS 正式版提供稳定 Apple Developer ID 签名），Windows 用户请在 WSL2 中使用。
 - **平滑升级**：执行 `botmux upgrade` 或重跑上述 curl 命令即可原地安全更新。
+- **源码安装更新**：Dashboard「版本与更新」支持普通更新，以及预览、确认并备份后强制覆盖本地改动；恢复方法见[本地源码更新](docs/local-source-update.md)。
 - **完整指南**：包含 Lark 国际版、手动配置权限与排查，见 [5 分钟快速接入文档](https://deepcoldy.github.io/botmux/quickstart)。
 
 <details>
