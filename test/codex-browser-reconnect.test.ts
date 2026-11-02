@@ -154,14 +154,26 @@ describe.sequential('browser connection recovery', () => {
       fake.tab.ax.click.mockRejectedValueOnce(new Error(message));
       const failed = await broker.handleToolCall(call({ operation: 'click', tabId: 'claimed-7', elementIndex: 12 }));
       expect(failed.success).toBe(false);
-      // State-level proof that no invalidation happened: the claimed tab cache
-      // stays usable through its old id, family discovery is not re-run, and the
-      // failure is not misreported as a browser connection change.
-      expect((await broker.handleToolCall(call({ operation: 'snapshot', tabId: 'claimed-7' }))).success).toBe(true);
+      // State-level proof that no invalidation happened:
+      //  - the claimed tab cache stays usable through its old id, and the
+      //    snapshot is still served by that tab's accessibility tree;
+      //  - a bare id that was never claimed still resolves through
+      //    browser.tabs.get, i.e. the reconnect-only fresh-claim gate was not
+      //    armed by a benign error;
+      //  - family discovery is not re-run;
+      //  - the failure is not misreported as a connection change. That last
+      //    assertion guards the model-facing instruction (whether the model
+      //    must list/claim again), not the exact wording.
+      const cachedSnapshot = await broker.handleToolCall(call({ operation: 'snapshot', tabId: 'claimed-7' }));
+      expect(cachedSnapshot.success).toBe(true);
+      expect((cachedSnapshot.contentItems[0] as { text: string }).text)
+        .toContain('AX snapshot: button "Continue" [12]');
+      const bareSnapshot = await broker.handleToolCall(call({ operation: 'snapshot', tabId: 'bare-9' }));
+      expect(bareSnapshot.success).toBe(true);
+      expect(fake.browser.tabs.get).toHaveBeenCalledOnce();
       expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
       expect(get).toHaveBeenCalledOnce();
       expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledOnce();
-      expect(fake.tab.ax.get).toHaveBeenCalledOnce();
       expect((failed.contentItems[0] as { text: string }).text).not.toContain('Browser connection changed');
     },
   );
