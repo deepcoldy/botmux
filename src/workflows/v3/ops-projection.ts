@@ -312,6 +312,17 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
   // nodeFailed / nodeBlocked on the loop id.
   const terminalAt = new Map<string, number>();
   const loopStartedAt = new Map<string, number>();
+  // Blocked states reached WITHOUT a nodeBlocked event on the node id:
+  //  - loop `exhausted` decision blocks the LOOP container (materialize folds
+  //    the decision; only runBlocked follows, no nodeBlocked on the loop id);
+  //  - hostEffectUncertain blocks a host node directly.
+  // Both still need a "blocked since" stamp for the waiting-time display.
+  const blockedAt = new Map<string, number>();
+  // waitId of the gate currently marking each node gateWaiting, so a stale
+  // resolution for an old instance's wait (a revisit refreshes the gate under
+  // a new waitId) cannot clear the NEW gate's pending timestamp. Mirrors
+  // materialize's first-wins-per-waitId rule.
+  const pendingGateWait = new Map<string, string>();
   const endAttempt = (
     attemptId: string | undefined,
     ts: number,
@@ -325,17 +336,29 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
     attempt.outcome = outcome;
     if (errorCode) attempt.errorCode = errorCode;
   };
+  const beginAttempt = (
+    nodeId: string,
+    attemptId: string,
+    ts: number,
+    instanceId?: string,
+  ): void => {
+    if (attemptById.has(attemptId)) return;
+    const attempt: RunAttemptView = {
+      attemptId,
+      ...(instanceId ? { instanceId } : {}),
+      startedAt: ts,
+    };
+    attemptById.set(attemptId, attempt);
+    (attemptsByNode.get(nodeId) ?? attemptsByNode.set(nodeId, []).get(nodeId)!).push(attempt);
+  };
   for (const e of events) {
     if (e.type === 'nodeDispatched') {
-      if (!attemptById.has(e.attemptId)) {
-        const attempt: RunAttemptView = {
-          attemptId: e.attemptId,
-          ...(e.instanceId ? { instanceId: e.instanceId } : {}),
-          startedAt: e.ts,
-        };
-        attemptById.set(e.attemptId, attempt);
-        (attemptsByNode.get(e.nodeId) ?? attemptsByNode.set(e.nodeId, []).get(e.nodeId)!).push(attempt);
-      }
+      // Worker (goal) attempts start at dispatch.
+      beginAttempt(e.nodeId, e.attemptId, e.ts, e.instanceId);
+    } else if (e.type === 'hostEffectIntent') {
+      // Host nodes never emit nodeDispatched: the approved effect INTENT is
+      // where the provider call actually starts, so it opens the attempt row.
+      beginAttempt(e.nodeId, e.attemptId, e.ts, e.instanceId);
     } else if (e.type === 'nodeSucceeded') {
       endAttempt(e.attemptId, e.ts, 'succeeded');
       terminalAt.set(e.nodeId, e.ts);
@@ -359,10 +382,22 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
       supersededAt.set(e.nodeId, e.ts);
     } else if (e.type === 'gateDispatched') {
       pendingGateSince.set(e.nodeId, e.ts);
+      pendingGateWait.set(e.nodeId, e.waitId);
     } else if (e.type === 'gateResolved') {
-      pendingGateSince.delete(e.nodeId);
+      if (pendingGateWait.get(e.nodeId) === e.waitId) {
+        pendingGateSince.delete(e.nodeId);
+        pendingGateWait.delete(e.nodeId);
+      }
     } else if (e.type === 'nodeSkipped') {
       skippedAt.set(e.nodeId, e.ts);
+    } else if (e.type === 'hostEffectUncertain') {
+      // Close the open host attempt as blocked (it never gets a nodeBlocked /
+      // nodeSucceeded), and stamp the block time. Last uncertain wins: an
+      // operator retry re-runs the node, and a later block measures from the
+      // later event; a settled retry ignores this via the terminalAt-first
+      // ordering in the end-stamp selection.
+      endAttempt(e.attemptId, e.ts, 'blocked', e.errorCode);
+      blockedAt.set(e.nodeId, e.ts);
     }
     if (e.type === 'nodeSessionReady') {
       sessions.set(e.nodeId, { ...e.sessionInfo, ptyLogPath: e.ptyLogPath });
@@ -377,6 +412,9 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
       // enum only — e.detail can quote agent-written strings, never project it.
       (loopDecisions.get(e.loopId) ?? loopDecisions.set(e.loopId, []).get(e.loopId)!)
         .push({ iteration: e.iteration, decision: e.decision });
+      // Exhausted blocks the LOOP container with no nodeBlocked event on the
+      // loop id, so stamp the block time here for the waiting display.
+      if (e.decision === 'exhausted') blockedAt.set(e.loopId, e.ts);
     }
   }
 
@@ -459,7 +497,7 @@ export function projectRun(runId: string, runDir: string, opts: ProjectRunOption
           ? supersededAt.get(id) ?? current?.endedAt
           : status === 'cancelled'
             ? current?.endedAt ?? cancelledAt.get(id)
-            : current?.endedAt ?? terminalAt.get(id);
+            : current?.endedAt ?? terminalAt.get(id) ?? blockedAt.get(id);
       if (endedAt !== undefined) view.endedAt = endedAt;
     }
     if (status === 'gateWaiting') {

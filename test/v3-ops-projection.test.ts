@@ -437,4 +437,207 @@ describe('v3 ops-projection — 负责 Bot、耗时与尝试记录', () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  it('循环迭代耗尽阻断时，等人时长从 exhausted 决策的时间算起（loop 容器没有 nodeBlocked 事件）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-exhausted-'));
+    try {
+      const runId = 'exhausted-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{
+          id: 'fix', type: 'loop', maxIterations: 1, depends: [], inputs: [],
+          body: { nodes: [{ id: 'code', type: 'goal', goal: '改', depends: [], inputs: [] }] },
+          exit: { node: 'code', when: { path: 'result.passed', equals: true } },
+          output: { from: 'code' },
+        }],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 1_000, type: 'loopStarted', loopId: 'fix' },
+        { ts: 1_000, type: 'loopIterationStarted', loopId: 'fix', iteration: 1 },
+        { ts: 2_000, type: 'nodeDispatched', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', loop: { loopId: 'fix', iteration: 1, bodyNodeId: 'code' } },
+        { ts: 5_000, type: 'nodeSucceeded', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', manifestPath: join(runDir, 'm.json') },
+        { ts: 6_000, type: 'loopIterationDecision', loopId: 'fix', iteration: 1, decision: 'exhausted' },
+        { ts: 6_000, type: 'runBlocked', blockedNodeId: 'fix' },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 60_000 });
+      const loop = view.nodes[0]!;
+      expect(loop.status).toBe('blocked');
+      expect(loop.startedAt).toBe(1_000);
+      expect(loop.endedAt).toBe(6_000);
+
+      // After a human grants another round and the loop exits, the earlier
+      // exhausted stamp must NOT survive as the node's end time.
+      const runDir2 = join(base, 'run2');
+      mkdirSync(runDir2, { recursive: true });
+      writeFileSync(join(runDir2, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{
+          id: 'fix', type: 'loop', maxIterations: 1, depends: [], inputs: [],
+          body: { nodes: [{ id: 'code', type: 'goal', goal: '改', depends: [], inputs: [] }] },
+          exit: { node: 'code', when: { path: 'result.passed', equals: true } },
+          output: { from: 'code' },
+        }],
+      }));
+      writeJournal(runDir2, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 1_000, type: 'loopStarted', loopId: 'fix' },
+        { ts: 1_000, type: 'loopIterationStarted', loopId: 'fix', iteration: 1 },
+        { ts: 2_000, type: 'nodeDispatched', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', loop: { loopId: 'fix', iteration: 1, bodyNodeId: 'code' } },
+        { ts: 3_000, type: 'nodeSucceeded', nodeId: 'fix.i001.code', attemptId: 'fix.i001.code/attempts/001', manifestPath: join(runDir2, 'm1.json') },
+        { ts: 4_000, type: 'loopIterationDecision', loopId: 'fix', iteration: 1, decision: 'exhausted' },
+        { ts: 5_000, type: 'runBlocked', blockedNodeId: 'fix' },
+        { ts: 6_000, type: 'loopIterationGranted', loopId: 'fix', fromIteration: 1, by: 'owner' },
+        { ts: 7_000, type: 'loopIterationStarted', loopId: 'fix', iteration: 2 },
+        { ts: 8_000, type: 'nodeDispatched', nodeId: 'fix.i002.code', attemptId: 'fix.i002.code/attempts/001', loop: { loopId: 'fix', iteration: 2, bodyNodeId: 'code' } },
+        { ts: 9_000, type: 'nodeSucceeded', nodeId: 'fix.i002.code', attemptId: 'fix.i002.code/attempts/001', manifestPath: join(runDir2, 'm2.json') },
+        { ts: 10_000, type: 'loopIterationDecision', loopId: 'fix', iteration: 2, decision: 'exit' },
+        { ts: 11_000, type: 'nodeSucceeded', nodeId: 'fix', attemptId: 'fix-seal/attempts/001', manifestPath: join(runDir2, 'seal.json') },
+      ]);
+      const view2 = projectRun(runId, runDir2, { now: () => 60_000 });
+      const loop2 = view2.nodes[0]!;
+      expect(loop2.status).toBe('done');
+      expect(loop2.endedAt).toBe(11_000);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('宿主动作结果不确定直接阻断时，等人时长从 hostEffectUncertain 的时间算起', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-uncertain-'));
+    try {
+      const runId = 'uncertain-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'send', type: 'host', executor: 'feishu-send', depends: [], inputs: [], input: {} }],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        {
+          ts: 2_000, type: 'hostInputPrepared', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send', provider: 'x',
+          inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+          inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+        },
+        {
+          ts: 3_000, type: 'hostEffectIntent', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send', provider: 'x',
+          inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+          inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+        },
+        {
+          ts: 8_000, type: 'hostEffectUncertain', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send',
+          reason: 'providerUncertain', errorCode: 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED',
+        },
+        { ts: 8_000, type: 'runBlocked', blockedNodeId: 'send' },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 60_000 });
+      const node = view.nodes[0]!;
+      expect(node.status).toBe('blocked');
+      expect(node.startedAt).toBe(3_000);
+      expect(node.endedAt).toBe(8_000);
+      expect(node.attempts).toEqual([{
+        attemptId: 'send#001/attempts/001',
+        instanceId: 'send#001',
+        startedAt: 3_000,
+        endedAt: 8_000,
+        outcome: 'blocked',
+        errorCode: 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED',
+      }]);
+      expect(node.host).toEqual({ executor: 'feishu-send' });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('宿主动作成功时，尝试从 hostEffectIntent 开始、到 nodeSucceeded 结算（host 节点没有 nodeDispatched）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proj-hostok-'));
+    try {
+      const runId = 'hostok-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId, nodes: [{ id: 'send', type: 'host', executor: 'feishu-send', depends: [], inputs: [], input: {} }],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        {
+          ts: 2_000, type: 'hostInputPrepared', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send', provider: 'x',
+          inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+          inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+        },
+        {
+          ts: 3_000, type: 'hostEffectIntent', nodeId: 'send', instanceId: 'send#001',
+          attemptId: 'send#001/attempts/001', executor: 'feishu-send', provider: 'x',
+          inputRef: { path: join(runDir, 'i.json'), sha256: 's', bytes: 1 },
+          inputHash: 'h', idempotencyKey: 'k', idempotencyTtlMs: 1, approvalDigest: 'd',
+        },
+        { ts: 9_000, type: 'nodeSucceeded', nodeId: 'send', instanceId: 'send#001', attemptId: 'send#001/attempts/001', manifestPath: join(runDir, 'm.json') },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 60_000 });
+      const node = view.nodes[0]!;
+      expect(node.status).toBe('done');
+      expect(node.startedAt).toBe(3_000);
+      expect(node.endedAt).toBe(9_000);
+      expect(node.attempts).toEqual([{
+        attemptId: 'send#001/attempts/001',
+        instanceId: 'send#001',
+        startedAt: 3_000,
+        endedAt: 9_000,
+        outcome: 'succeeded',
+      }]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('旧实例审批卡的过期 gateResolved 不清掉新一轮 gate 的等待起点（revisit 会换新 waitId）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-proje-stategate-'));
+    try {
+      const runId = 'stategate-261103-0101';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [
+          { id: 'a', type: 'goal', goal: 'a', depends: [], inputs: [], humanGate: { prompt: 'ok?', options: ['approve'] } },
+          { id: 'b', type: 'goal', goal: 'b', depends: [], inputs: [] },
+        ],
+      }));
+      writeJournal(runDir, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 2_000, type: 'gateDispatched', nodeId: 'a', instanceId: 'a#001', waitId: 'a#001-gate' },
+        { ts: 3_000, type: 'nodeInstanceSuperseded', nodeId: 'a', instanceId: 'a#001', byNodeId: 'b', reason: 'refresh' },
+        { ts: 4_000, type: 'gateDispatched', nodeId: 'a', instanceId: 'a#002', waitId: 'a#002-gate' },
+        { ts: 5_000, type: 'gateResolved', nodeId: 'a', instanceId: 'a#001', waitId: 'a#001-gate', resolution: 'approved', by: 'u' },
+      ]);
+      const view = projectRun(runId, runDir, { now: () => 60_000 });
+      const a = view.nodes[0]!;
+      expect(a.status).toBe('gateWaiting');
+      expect(a.gateSince).toBe(4_000);
+
+      // The matching waitId still clears it as before.
+      const runDir2 = join(base, 'ok');
+      mkdirSync(runDir2, { recursive: true });
+      writeFileSync(join(runDir2, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{ id: 'a', type: 'goal', goal: 'a', depends: [], inputs: [], humanGate: { prompt: 'ok?', options: ['approve'] } }],
+      }));
+      writeJournal(runDir2, [
+        { ts: 1_000, type: 'runStarted', runId },
+        { ts: 2_000, type: 'gateDispatched', nodeId: 'a', waitId: 'a-gate' },
+        { ts: 3_000, type: 'gateResolved', nodeId: 'a', waitId: 'a-gate', resolution: 'approved', by: 'u' },
+      ]);
+      const view2 = projectRun(runId, runDir2, { now: () => 60_000 });
+      expect(view2.nodes[0]!.status).toBe('pending');
+      expect(view2.nodes[0]!.gateSince).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });
