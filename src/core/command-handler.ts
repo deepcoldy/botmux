@@ -46,7 +46,7 @@ import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { botsInfoObjectEntries, isBotsInfoNameEntry } from '../services/bots-info-shape.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -548,7 +548,7 @@ function botDisplayName(larkAppId: string): string {
     try {
       const p = join(config.session.dataDir, 'bots-info.json');
       if (existsSync(p)) {
-        const entries: Array<{ larkAppId?: string; botName?: string | null; cliId?: string | null }> = JSON.parse(readFileSync(p, 'utf-8'));
+        const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(p, 'utf-8')));
         const found = entries.find(e => e.larkAppId === larkAppId);
         return found?.botName || found?.cliId || larkAppId;
       }
@@ -5544,7 +5544,7 @@ export async function handleCommand(
             let bots: Parameters<typeof resolveGroupCreationAgents>[2] = [];
             try {
               const cached: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
-              if (Array.isArray(cached)) bots = cached.filter(b => b && typeof b === 'object');
+              bots = normalizeBotsInfoRouteEntries(cached);
             } catch { /* Names can be unavailable; app IDs still resolve against config. */ }
             configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, configs, bots);
           }

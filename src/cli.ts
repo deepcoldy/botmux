@@ -355,7 +355,7 @@ import {
   mentionedBotAppIds,
   orderedFooterRecipients,
 } from './utils/bot-routing.js';
-import { botsInfoObjectEntries, isBotsInfoRouteEntry } from './services/bots-info-shape.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
   crossPrincipalAsKeyword,
@@ -14940,7 +14940,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     let botInfo: Array<{ larkAppId: string; botName: string | null }> = [];
     try {
       const raw = JSON.parse(readFileSync(join(resolveDataDir(), 'bots-info.json'), 'utf-8'));
-      if (Array.isArray(raw)) botInfo = raw;
+      botInfo = normalizeBotsInfoRouteEntries(raw);
     } catch { /* strict resolver already validated names; display can fall back to app id */ }
     const byAppId = new Map(resolved.mappings.map(mapping => [mapping.larkAppId, mapping.subjectOpenId]));
     appBots = parsedBotApps.map(item => ({
@@ -17780,7 +17780,16 @@ botmux bots — 机器人协作花名册 / 团队补人
 
   type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
   let botEntries: BotInfoEntry[] = [];
-  try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
+  try {
+    if (existsSync(botInfoPath)) {
+      botEntries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(botInfoPath, 'utf-8'))).map(entry => ({
+        larkAppId: entry.larkAppId,
+        botOpenId: entry.botOpenId,
+        botName: entry.botName,
+        cliId: entry.cliId ?? '',
+      }));
+    }
+  } catch { /* */ }
 
   const collaborationFactsFor = (appIds: string[]): BotCollaborationFactsByAppId => {
     const facts: Record<string, BotCollaborationFactsByAppId[string]> = Object.create(null);

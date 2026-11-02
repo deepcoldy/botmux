@@ -30,6 +30,7 @@ import { readFileSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'n
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
+import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
@@ -12691,7 +12692,7 @@ function resolveVcMeetingListenerBotLabel(larkAppId: string): { label: string; c
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId?: unknown; botName?: unknown }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(infoPath, 'utf-8')));
       const hit = entries.find(entry => entry.larkAppId === larkAppId);
       if (typeof hit?.botName === 'string' && hit.botName.trim()) {
         return { label: hit.botName.trim(), canMentionByName: true };
@@ -26831,9 +26832,9 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string, senderUni
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(infoPath, 'utf-8')));
       const hit = entries.find(e => e.botOpenId === senderOpenId);
-      if (hit) return hit.botName ?? getCliDisplayName(hit.cliId as CliId);
+      if (hit) return hit.botName ?? (hit.cliId ? getCliDisplayName(hit.cliId as CliId) : 'Bot');
     }
   } catch { /* */ }
   return 'Bot';
