@@ -205,15 +205,6 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
   if (value.allOverloadedPolicy !== undefined && value.allOverloadedPolicy !== 'lowest_load') {
     return { error: 'traexAutoModel.allOverloadedPolicy must be lowest_load' };
   }
-  if (preflightLoadCheck && modelSettings) {
-    for (const [model, settings] of Object.entries(modelSettings)) {
-      if (settings.reasoningEffort
-        && settings.reasoningEffort !== 'max'
-        && settings.reasoningEffort !== 'xhigh') {
-        return { error: `traexAutoModel.modelSettings.${model}.reasoningEffort must be max or xhigh when preflightLoadCheck is enabled` };
-      }
-    }
-  }
   if (cooldown !== undefined && (!Number.isInteger(cooldown)
     || (cooldown as number) < 5_000 || (cooldown as number) > 300_000)) {
     return { error: 'traexAutoModel.switchCooldownMs must be an integer between 5000 and 300000' };
@@ -257,14 +248,15 @@ export function traexAutoModelPreflightEnabled(config: TraexAutoModelConfig): bo
   return config.trigger !== 'quota' && config.preflightLoadCheck === true;
 }
 
-/** The preflight contract intentionally has only two strength outcomes:
- * native `max` when advertised, otherwise `xhigh` (Extra High). */
+/** Prefer max/xhigh for the deep-reasoning models that advertise them, while
+ * still honoring the actual highest effort of every other catalog model. */
 export function strongestTraexPreflightReasoningEffort(
   model: string,
-  advertised?: readonly CodexReasoningEffort[],
-): 'max' | 'xhigh' {
+  advertised?: readonly string[],
+): CodexReasoningEffort | undefined {
   const efforts = advertised ?? reasoningEffortsForCliModel('traex', model);
-  return efforts.includes('max') ? 'max' : 'xhigh';
+  return (['max', 'xhigh', 'high', 'medium', 'low'] as const)
+    .find(effort => efforts.includes(effort));
 }
 
 export function resolveTraexAutoModelRuntimeSettings(
@@ -274,11 +266,11 @@ export function resolveTraexAutoModelRuntimeSettings(
   advertised?: readonly CodexReasoningEffort[],
 ): TraexAutoModelSettings {
   const settings = resolveTraexAutoModelSettings(config, model, legacy);
-  return traexAutoModelPreflightEnabled(config)
-    ? { ...settings, reasoningEffort: advertised === undefined && settings.reasoningEffort === 'max'
-        ? 'max'
-        : strongestTraexPreflightReasoningEffort(model, advertised) }
-    : settings;
+  if (!traexAutoModelPreflightEnabled(config)) return settings;
+  const strongest = advertised === undefined && settings.reasoningEffort === 'max'
+    ? 'max'
+    : strongestTraexPreflightReasoningEffort(model, advertised);
+  return strongest ? { ...settings, reasoningEffort: strongest } : settings;
 }
 
 export interface TraexAutoModelRuntimeState {
@@ -478,14 +470,18 @@ export class TraexAutoModelController {
       }
       if (selectedIndex < 0) {
         reason = 'preflight_lowest_load';
-        selectedIndex = checkedIndex;
-        selectedLoad = checkedLoad;
+        selectedIndex = -1;
+        selectedLoad = Infinity;
         for (let index = 0; index < this.config.models.length; index++) {
           const candidateLoad = loadAt(index);
           if (candidateLoad !== undefined && candidateLoad < selectedLoad) {
             selectedIndex = index;
             selectedLoad = candidateLoad;
           }
+        }
+        if (selectedIndex < 0) {
+          selectedIndex = checkedIndex;
+          selectedLoad = checkedLoad;
         }
       }
     }

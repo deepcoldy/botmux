@@ -84,7 +84,6 @@ describe('normalizeTraexAutoModelConfig', () => {
     [{ preflightLoadCheck: true, unknownLoadPolicy: 'try' }, 'unknownLoadPolicy'],
     [{ preflightLoadCheck: true, allOverloadedPolicy: 'first' }, 'allOverloadedPolicy'],
     [{ preflightLoadCheck: true, trigger: 'quota' }, 'capacity mode'],
-    [{ preflightLoadCheck: true, modelSettings: { m1: { reasoningEffort: 'high' } } }, 'max or xhigh'],
   ])('rejects invalid preflight config %j', (extra, fragment) => {
     expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['m1'], ...extra }).error).toContain(fragment);
   });
@@ -179,6 +178,12 @@ describe('TraexAutoModelController', () => {
       expect(controller.preflightDecision('turn', new Map([
         ['core', 180], ['backup-1', 120], ['backup-2', 120],
       ]))).toMatchObject({ kind: 'hold', reason: 'lowest_load', model: 'backup-1', loadPercent: 120 });
+
+      controller.observeRunningModel('backup-2');
+      expect(controller.preflightDecision('turn', new Map([
+        ['core', 130], ['backup-1', 120], ['backup-2', 120],
+      ]))).toMatchObject({ kind: 'switch', reason: 'preflight_lowest_load',
+        toModel: 'backup-1', toIndex: 1, loadPercent: 120 });
     });
 
     it('uses the preferred first model only for independent-turn reselection', () => {
@@ -618,10 +623,12 @@ describe('Auto policy setting presence', () => {
 });
 
 describe('preflight reasoning contract', () => {
-  it('uses max only when the model advertises it, otherwise Extra High', () => {
+  it('uses max/xhigh when advertised and otherwise the model actual highest effort', () => {
     expect(strongestTraexPreflightReasoningEffort('m1', ['low', 'xhigh', 'max'])).toBe('max');
     expect(strongestTraexPreflightReasoningEffort('m2', ['low', 'high', 'xhigh', 'ultra'])).toBe('xhigh');
-    expect(strongestTraexPreflightReasoningEffort('future-model', [])).toBe('xhigh');
+    expect(strongestTraexPreflightReasoningEffort('m3', ['low', 'medium', 'high'])).toBe('high');
+    expect(strongestTraexPreflightReasoningEffort('future-model')).toBe('high');
+    expect(strongestTraexPreflightReasoningEffort('future-model', [])).toBeUndefined();
   });
 });
 

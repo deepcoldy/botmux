@@ -1,5 +1,10 @@
 import { isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
-import { resolveTraexAutoModelSettings, type TraexAutoModelConfig, type TraexAutoModelSettings } from '../../services/traex-auto-model.js';
+import {
+  resolveTraexAutoModelSettings,
+  strongestTraexPreflightReasoningEffort,
+  type TraexAutoModelConfig,
+  type TraexAutoModelSettings,
+} from '../../services/traex-auto-model.js';
 import type { ModelCapabilities } from './bot-defaults.js';
 
 /** Pick the strongest combination advertised for the largest context variant.
@@ -25,8 +30,9 @@ export function strongestTraexPreflightModelSettings(model: string, capability?:
     : undefined;
   const efforts = variant?.reasoningEfforts ?? capability?.reasoningEfforts
     ?? reasoningEffortsForCliModel('traex', model);
+  const reasoningEffort = strongestTraexPreflightReasoningEffort(model, efforts);
   return {
-    reasoningEffort: efforts.includes('max') ? 'max' : 'xhigh',
+    ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(variant ? { modelBackendVariant: variant.id } : {}),
   };
 }
@@ -119,8 +125,8 @@ export function readAutoModelDraft(botId: string, storage = autoModelDraftStorag
       preflightLoadCheck: value.draft.preflightLoadCheck === true,
       overloadThresholdPercent: value.draft.overloadThresholdPercent ?? '100',
       preflightTimeoutSeconds: value.draft.preflightTimeoutSeconds ?? '8',
-      unknownLoadPolicy: 'skip',
-      allOverloadedPolicy: 'lowest_load',
+      unknownLoadPolicy: value.draft.unknownLoadPolicy ?? 'skip',
+      allOverloadedPolicy: value.draft.allOverloadedPolicy ?? 'lowest_load',
       reselectPerTurn: value.draft.reselectPerTurn === true,
       models: value.draft.models,
       modelSettings: value.draft.modelSettings,

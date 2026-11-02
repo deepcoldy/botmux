@@ -1,7 +1,10 @@
 import { DropdownField, ModelPickerField } from './field-controls.js';
 import { InfoTip } from './dashboard-components.js';
 import { isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
-import type { TraexAutoModelSettings } from '../../services/traex-auto-model.js';
+import {
+  strongestTraexPreflightReasoningEffort,
+  type TraexAutoModelSettings,
+} from '../../services/traex-auto-model.js';
 import type { ModelCapabilities } from './bot-defaults.js';
 import { useT } from './react-hooks.js';
 import { strongestTraexPreflightModelSettings } from './traex-auto-model-preferences.js';
@@ -113,8 +116,8 @@ export function TraexAutoModelEditor(props: {
             const variant = capability?.contextVariants?.find(entry => entry.id === settings.modelBackendVariant);
             const advertisedEfforts = (variant?.reasoningEfforts ?? capability?.reasoningEfforts
               ?? reasoningEffortsForCliModel('traex', model)).filter(isCodexReasoningEffort);
-            const forcedEffort = strongestTraexPreflightModelSettings(model, capability).reasoningEffort!;
-            const efforts = props.preflightLoadCheck ? [forcedEffort] : advertisedEfforts;
+            const forcedEffort = strongestTraexPreflightModelSettings(model, capability).reasoningEffort;
+            const efforts = props.preflightLoadCheck && forcedEffort ? [forcedEffort] : advertisedEfforts;
             const contextOptions = [
               { value: '', label: capability?.contextWindow
                 ? `${tr('botDefaults.autoModelDefault')} · ${capacityLabel(capability.contextWindow)}`
@@ -148,7 +151,7 @@ export function TraexAutoModelEditor(props: {
                 <div className="bd-auto-model-setting">
                   <span>{tr('botDefaults.agentReasoningEffort')}</span>
                   <DropdownField dataInput={`autoModelEffort${index}`} ariaLabel={`${model} ${tr('botDefaults.agentReasoningEffort')}`}
-                    value={props.preflightLoadCheck ? forcedEffort : settings.reasoningEffort ?? ''}
+                    value={props.preflightLoadCheck ? forcedEffort ?? '' : settings.reasoningEffort ?? ''}
                     disabled={props.busy || !model || props.preflightLoadCheck}
                     options={[...(props.preflightLoadCheck ? [] : [{ value: '', label: tr('botDefaults.autoModelDefault') }]),
                       ...efforts.map(effort => ({ value: effort, label: effort }))]}
@@ -167,7 +170,7 @@ export function TraexAutoModelEditor(props: {
                         ?? capability?.reasoningEfforts ?? advertisedEfforts;
                       props.onSettings(model, { ...settings, modelBackendVariant: nextVariant,
                         reasoningEffort: props.preflightLoadCheck
-                          ? (allowed.includes('max') ? 'max' : 'xhigh')
+                          ? strongestTraexPreflightReasoningEffort(model, allowed)
                           : settings.reasoningEffort && allowed.includes(settings.reasoningEffort)
                             ? settings.reasoningEffort : undefined });
                     }} />

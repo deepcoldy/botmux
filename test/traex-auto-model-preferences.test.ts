@@ -25,6 +25,12 @@ describe('Auto model defaults and reload persistence', () => {
     expect(strongestTraexPreflightModelSettings('max-model', {
       slug: 'max-model', serviceTiers: [], reasoningEfforts: ['xhigh', 'max'], contextVariants: [],
     })).toEqual({ reasoningEffort: 'max' });
+    expect(strongestTraexPreflightModelSettings('high-model', {
+      slug: 'high-model', serviceTiers: [], reasoningEfforts: ['low', 'medium', 'high'], contextVariants: [],
+    })).toEqual({ reasoningEffort: 'high' });
+    expect(strongestTraexPreflightModelSettings('unknown', {
+      slug: 'unknown', serviceTiers: [], contextVariants: [],
+    })).toEqual({ reasoningEffort: 'high' });
   });
 
   it('stores unfinished selections synchronously and isolates bots; clearing one after save preserves another', () => {

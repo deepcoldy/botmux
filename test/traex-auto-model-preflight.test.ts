@@ -33,11 +33,14 @@ describe('TraeX independent-turn load preflight', () => {
     });
   });
 
-  it('rejects lower explicit efforts rather than silently weakening preflight models', () => {
+  it('keeps config normalization capability-agnostic and resolves the advertised highest effort at runtime', () => {
     expect(normalizeTraexAutoModelConfig({
       enabled: true, models: ['core'], preflightLoadCheck: true,
       modelSettings: { core: { reasoningEffort: 'high' } },
-    }).error).toContain('max or xhigh');
+    }).error).toBeUndefined();
+    expect(resolveTraexAutoModelRuntimeSettings({ ...config,
+      modelSettings: { core: { reasoningEffort: 'xhigh' } } }, 'core', {}, ['low', 'medium', 'high']))
+      .toMatchObject({ reasoningEffort: 'high' });
   });
 
   it('keeps 100%, switches at 101%, and chooses the first available pool entry', () => {
@@ -64,6 +67,13 @@ describe('TraeX independent-turn load preflight', () => {
       ['core', 180], ['backup-1', 120], ['backup-2', 120],
     ]))).toMatchObject({ kind: 'switch', reason: 'preflight_lowest_load',
       toModel: 'backup-1', loadPercent: 120 });
+
+    const demoted = new TraexAutoModelController(config);
+    demoted.observeRunningModel('backup-2');
+    expect(demoted.preflightDecision('turn', new Map([
+      ['core', 130], ['backup-1', 120], ['backup-2', 120],
+    ]))).toMatchObject({ kind: 'switch', reason: 'preflight_lowest_load',
+      toModel: 'backup-1', loadPercent: 120 });
   });
 
   it('does not consume the runtime queue fallback cooldown after admission', () => {
@@ -78,9 +88,10 @@ describe('TraeX independent-turn load preflight', () => {
       .toEqual({ kind: 'load_check', turnId: 'turn' });
   });
 
-  it('uses max when supported, otherwise xhigh even if another label ranks above it', () => {
+  it('uses max/xhigh when supported, otherwise the actual highest effort', () => {
     expect(strongestTraexPreflightReasoningEffort('max-model', ['xhigh', 'max'])).toBe('max');
     expect(strongestTraexPreflightReasoningEffort('extra-high-model', ['xhigh', 'ultra'])).toBe('xhigh');
+    expect(strongestTraexPreflightReasoningEffort('high-model', ['low', 'medium', 'high'])).toBe('high');
     expect(resolveTraexAutoModelRuntimeSettings({ ...config,
       modelSettings: { core: { reasoningEffort: 'max' } } }, 'core')).toMatchObject({ reasoningEffort: 'max' });
   });

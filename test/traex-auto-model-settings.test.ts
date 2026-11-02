@@ -170,17 +170,22 @@ describe('TraeX auto-model settings', () => {
       act(() => root.findByProps({ 'data-action': 'autoModelAdd' }).props.onClick());
       act(() => root.findAllByType(ModelPickerField).find(field => field.props.dataInput === 'autoModel1')!.props.onChange('m2'));
       act(() => root.findAllByProps({ 'aria-label': '上移模型' })[1]!.props.onClick());
-      act(() => root.findByProps({ dataInput: 'autoModelEffort0' }).props.onChange('high'));
+      act(() => root.findByProps({ dataInput: 'autoModelEffort0' }).props.onChange('medium'));
       act(() => root.findByProps({ dataInput: 'autoModelContext0' }).props.onChange('max'));
       act(() => root.findByProps({ 'data-input': 'autoModelPreflightLoadCheck' }).props.onChange({ currentTarget: { checked: true } }));
       act(() => root.findByProps({ 'data-input': 'autoModelOverloadThreshold' }).props.onChange({ currentTarget: { value: '110' } }));
       act(() => root.findByProps({ 'data-input': 'autoModelPreflightTimeout' }).props.onChange({ currentTarget: { value: '1.5' } }));
-      expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.value).toBe('xhigh');
+      expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.value).toBe('high');
       expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.disabled).toBe(true);
+      act(() => root.findByProps({ dataInput: 'autoModelTrigger' }).props.onChange('quota'));
+      expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.value).toBe('medium');
+      expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.disabled).toBe(false);
+      act(() => root.findByProps({ dataInput: 'autoModelTrigger' }).props.onChange('capacity'));
+      act(() => root.findByProps({ 'data-input': 'autoModelPreflightLoadCheck' }).props.onChange({ currentTarget: { checked: true } }));
       act(() => root.findByProps({ 'data-input': 'autoModelTimeout' }).props.onChange({ currentTarget: { value: '15' } }));
       await act(async () => { await root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
       expect(saved).toMatchObject({ model: 'auto', traexAutoModel: { enabled: true, models: ['m2', 'm1'],
-        modelSettings: { m2: { reasoningEffort: 'xhigh', modelBackendVariant: 'max' }, m1: { reasoningEffort: 'xhigh' } },
+        modelSettings: { m2: { reasoningEffort: 'high', modelBackendVariant: 'max' }, m1: { reasoningEffort: 'high' } },
         preflightLoadCheck: true, overloadThresholdPercent: 110, preflightTimeoutMs: 1_500,
         unknownLoadPolicy: 'skip', allOverloadedPolicy: 'lowest_load',
         reselectPerTurn: false, queueTimeoutMs: 15_000, switchCooldownMs: 60_000 } });

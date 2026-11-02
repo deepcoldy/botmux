@@ -550,7 +550,11 @@ import {
   writeNativeSubagentRuntimeResponseProof,
 } from './native-subagent-runtime-ipc-auth.js';
 import { normalizeNativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
-import { normalizeTraexAutoModelConfig, TRAEX_AUTO_MODEL_ID } from '../services/traex-auto-model.js';
+import {
+  normalizeTraexAutoModelConfig,
+  strongestTraexPreflightReasoningEffort,
+  TRAEX_AUTO_MODEL_ID,
+} from '../services/traex-auto-model.js';
 import { detectModelCapabilitiesViaExec } from '../adapters/cli/model-catalog-json.js';
 import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
@@ -9490,10 +9494,8 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
               message: `${modelId} 不支持所选思考强度 ${settings.reasoningEffort}` } };
           }
           if (nextTraexAutoModel.preflightLoadCheck === true && settings.reasoningEffort) {
-            const requiredEffort = (efforts
-              ? efforts.includes('max')
-              : cliModelSupportsReasoningEffort('traex', modelId, 'max')) ? 'max' : 'xhigh';
-            if (settings.reasoningEffort !== requiredEffort) {
+            const requiredEffort = strongestTraexPreflightReasoningEffort(modelId, efforts);
+            if (requiredEffort && settings.reasoningEffort !== requiredEffort) {
               return { write: false, result: { error: 'invalid_traex_auto_model',
                 message: `${modelId} 启用负载预检时必须使用自身最高思考强度 ${requiredEffort}` } };
             }
