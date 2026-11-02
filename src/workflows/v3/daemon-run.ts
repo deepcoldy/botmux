@@ -1507,17 +1507,40 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
   const rerunRequested = new Set<string>();
   const activeControllers = new Map<string, AbortController>();
   const wakeTimers = new Map<string, NodeJS.Timeout>();
-  // Cards already posted by this process, per run. Every drive re-derives
-  // what to show from the journal, and bot-executed runs are re-driven on
+  // Cards already posted by this process, per BOT-EXECUTED run. Every drive
+  // re-derives what to show from the journal, and such runs are re-driven on
   // every acceptance / submission / deadline: without this one gate or
-  // blocked node would be announced once per drive.
+  // blocked node would be announced once per drive. Other runs keep their
+  // historical posting behaviour untouched.
   const postedCards = new Map<string, Set<string>>();
+  const isBotRun = (runId: string): boolean => {
+    try {
+      const envelope = readRunEnvelope(safeRunDir(baseDir, runId));
+      return envelope.kind === 'ok' && 'nodeExecutor' in envelope.envelope && envelope.envelope.nodeExecutor === 'bot';
+    } catch {
+      return false;
+    }
+  };
   async function postOnce(runId: string, key: string, post: () => Promise<void>): Promise<void> {
+    if (!isBotRun(runId)) return post();
     const seen = postedCards.get(runId) ?? new Set<string>();
     if (seen.has(key)) return;
     await post();
     seen.add(key);
     postedCards.set(runId, seen);
+  }
+  /** Keep only keys for what is still awaiting a human: a gate key lives
+   *  while its wait is pending (a later re-dispatch is announced again), a
+   *  blocked-family key while the run is blocked. */
+  function forgetSettledCards(runId: string, outcome: V3RunOutcome): void {
+    const seen = postedCards.get(runId);
+    if (!seen) return;
+    const pendingGates = new Set(outcome.reason === 'terminal' ? [] : outcome.pendingWaits.map((gate) => `gate:${gate.waitId}`));
+    const blocked = outcome.reason === 'terminal' && outcome.runStatus === 'blocked';
+    for (const key of [...seen]) {
+      if (key.startsWith('gate:') ? !pendingGates.has(key) : !blocked) seen.delete(key);
+    }
+    if (seen.size === 0) postedCards.delete(runId);
   }
   const postGateCardOnce = (binding: RunChatBinding, gate: V3PendingGate, runId: string) =>
     postOnce(runId, `gate:${gate.waitId}`, () => deps.postCard(binding, gate, runId));
@@ -1620,9 +1643,7 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
                     outcome.reason === 'awaitingExternal' ? outcome.wakeAt : undefined,
                     () => driveDetached(runId),
                   );
-                  if (outcome.reason === 'terminal' && outcome.runStatus !== 'blocked') {
-                    postedCards.delete(runId);
-                  }
+                  forgetSettledCards(runId, outcome);
                 } while (currentRunStatus(baseDir, runId) === 'cancelling');
               }, { maxWaitMs: V3_DRIVE_LEASE_MAX_WAIT_MS });
               leaseSettled = true;

@@ -26,10 +26,12 @@ import {
   createV3GateRunner,
   driveV3Run,
   reconcileV3PendingGates,
+  requestV3Retry,
+  resolveV3GateClick,
   type V3BlockedInfo,
   type V3DaemonRunDeps,
 } from '../src/workflows/v3/daemon-run.js';
-import { readJournal } from '../src/workflows/v3/journal.js';
+import { readJournal, type StoredEvent } from '../src/workflows/v3/journal.js';
 import { openV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
 import type {
   V3ExternalDispatchRequest,
@@ -316,6 +318,83 @@ describe('daemon driver — review regressions', () => {
     await driveV3Run('rv-plain-reassign', deps).catch(() => undefined);
     expect(await reassignNode(plainDir, { nodeId: 'work', toLarkAppId: 'cli_worker', by: 'ou' }))
       .toEqual({ kind: 'rejected', reason: 'not-bot-run' });
+  });
+});
+
+const SEND_NODE = {
+  id: 'send', type: 'host', executor: 'feishu-send', depends: [], inputs: [],
+  input: { larkAppId: { $ref: 'context.larkAppId' }, chatId: { $ref: 'context.chatId' }, content: 'hello' },
+  humanGate: { prompt: 'send?' },
+};
+
+describe('daemon gate runner — card posting across re-drives', () => {
+  function runnerFor(base: string, posted: string[], blocked: string[]) {
+    return createV3GateRunner({
+      baseDir: base,
+      loadBots: () => [],
+      makeRunNode: () => async () => { throw new Error('unexpected ephemeral worker'); },
+      externalExecutor: new RecordingExecutor(),
+      now: () => 5_000,
+      postCard: async (_binding, gate) => { posted.push(gate.waitId); },
+      postBlockedCard: async (_binding, info) => { blocked.push(`${info.nodeId}:${info.errorCode}`); },
+      scheduleWake: () => {},
+    });
+  }
+
+  for (const mode of ['non-bot', 'bot'] as const) {
+    it(`${mode} run: gate → approve → blocked → resetGate retry announces the fresh gate`, async () => {
+      const base = freshBase();
+      const runId = `cards-reset-${mode}`;
+      const runDir = seedAdHocRun(base, runId, mode === 'bot' ? 'bot' : undefined, [SEND_NODE]);
+      const posted: string[] = [];
+      const blocked: string[] = [];
+      const runner = runnerFor(base, posted, blocked);
+
+      await runner.drive(runId);
+      expect(posted).toHaveLength(1);
+      expect(resolveV3GateClick(base, runId, { waitId: posted[0]!, selected: 'approve', by: 'ou_owner' }))
+        .toEqual({ kind: 'resolved', resolution: 'approved' });
+      // The frozen input is lost after approval but before any intent: the
+      // node blocks pre-effect and its retry must re-freeze and re-approve.
+      const prepared = readJournal(join(runDir, 'journal.ndjson'))
+        .find((event): event is StoredEvent & { type: 'hostInputPrepared' } => event.type === 'hostInputPrepared')!;
+      writeFileSync(join(runDir, prepared.inputRef.path), 'corrupted');
+      await runner.drive(runId);
+      expect(blocked).toEqual(['send:HOST_INPUT_UNRECOVERABLE']);
+
+      expect(requestV3Retry(base, runId, { nodeId: 'send' })).toMatchObject({ kind: 'requested' });
+      await runner.drive(runId);
+      expect(posted).toHaveLength(2);
+      expect(posted[1]).not.toBe(posted[0]);
+    });
+  }
+
+  it('non-bot run: still-pending gates are re-announced on every drive, as before', async () => {
+    const base = freshBase();
+    const gate = (id: string) => ({ id, type: 'goal', goal: id, bot: 'cli_worker', depends: [], inputs: [], humanGate: { prompt: `${id}?` } });
+    seedAdHocRun(base, 'cards-plain-repost', undefined, [gate('a'), gate('b')]);
+    const posted: string[] = [];
+    const runner = runnerFor(base, posted, []);
+    await runner.drive('cards-plain-repost');
+    await runner.drive('cards-plain-repost');
+    expect(posted.sort()).toEqual(['a#001-gate', 'a#001-gate', 'b#001-gate', 'b#001-gate']);
+  });
+
+  it('bot run: a pending gate is announced again after the run was blocked and resumed', async () => {
+    const base = freshBase();
+    const runDir = seedAdHocRun(base, 'cards-bot-resume', 'bot', [
+      WORK_NODE,
+      { id: 'deploy', type: 'goal', goal: 'deploy', bot: 'cli_worker', depends: [], inputs: [], humanGate: { prompt: 'deploy?' } },
+    ]);
+    const posted: string[] = [];
+    const runner = runnerFor(base, posted, []);
+    await runner.drive('cards-bot-resume');
+    const attemptId = openV3ExternalAttempts(readJournal(join(runDir, 'journal.ndjson')))[0]!.attemptId;
+    reportExternalBlocked(runDir, { attemptId, reason: 'cannot' });
+    await runner.drive('cards-bot-resume');
+    expect(requestV3Retry(base, 'cards-bot-resume', { nodeId: 'work' })).toMatchObject({ kind: 'requested' });
+    await runner.drive('cards-bot-resume');
+    expect(posted).toEqual(['deploy#001-gate', 'deploy#001-gate']);
   });
 });
 
