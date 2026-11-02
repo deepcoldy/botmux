@@ -56,7 +56,8 @@ export function promptCacheKeepaliveIneligibility(ds: DaemonSession): string | u
   return undefined;
 }
 
-function contextTokens(dataDir: string, sessionId: string, now: number): number | undefined {
+/** Context size from the Claude Code statusline snapshot; undefined when absent/stale. */
+export function statuslineContextTokens(dataDir: string, sessionId: string, now: number): number | undefined {
   const snap = readStatuslineSnapshot(dataDir, sessionId, { now });
   if (snap?.contextPercent === undefined || snap.contextWindowTokens === undefined) return undefined;
   return Math.round(snap.contextPercent * snap.contextWindowTokens / 100);
@@ -90,7 +91,7 @@ export function runPromptCacheKeepaliveSweep(
       minuteOfDay,
       idleSinceAt: ds.idleSinceAt,
       state: ds.promptCacheKeepalive,
-      contextTokens: contextTokens(opts.dataDir, sessionId, now),
+      contextTokens: statuslineContextTokens(opts.dataDir, sessionId, now),
     });
     if (!verdict.due) continue;
     const text = buildPromptCacheKeepalivePrompt(ds.initConfig?.locale);

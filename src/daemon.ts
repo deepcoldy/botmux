@@ -448,6 +448,7 @@ import {
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
   getDaemonSessionUsageSnapshot,
+  sessionSupportsIdleAutoCompact,
   postTurnStartingCard,
   reconcileBotStreamingCardPins,
   reconcileRestoredStreamingCardPins,
@@ -474,7 +475,8 @@ import {
   identityDecisionTurnIsLive,
   collectSessionTurnGarbage,
 } from './core/worker-pool.js';
-import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep } from './core/prompt-cache-keepalive.js';
+import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
+import { noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
@@ -6170,6 +6172,65 @@ function observeAutoCompact(ds: DaemonSession, status: string): void {
   });
 }
 
+/** Context size for the idle auto-compact threshold: Claude statusline first,
+ *  then the transcript usage snapshot; undefined = unknown (threshold skipped). */
+function idleAutoCompactContextTokens(ds: DaemonSession): number | undefined {
+  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  if (effectiveCliId === 'claude-code') {
+    try {
+      const tokens = statuslineContextTokens(config.session.dataDir, ds.session.sessionId, Date.now());
+      if (tokens !== undefined) return tokens;
+    } catch { /* fall through to the transcript */ }
+  }
+  const used = getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: true }).context?.usedTokens;
+  return typeof used === 'number' && Number.isFinite(used) && used > 0 ? used : undefined;
+}
+
+function idleAutoCompactNoticeText(ds: DaemonSession, notice: IdleAutoCompactNotice): string {
+  const loc = localeForBot(ds.larkAppId);
+  const k = (tokens: number) => String(Math.round(tokens / 1000));
+  if (notice.kind === 'skipped_small') {
+    return tr('idle_compact.notice.skipped_small', { minutes: notice.idleMinutes, tokens: k(notice.tokens), min: k(notice.minTokens) }, loc);
+  }
+  if (notice.kind === 'refused') return tr('idle_compact.notice.refused', { minutes: notice.idleMinutes }, loc);
+  return notice.tokens !== undefined
+    ? tr('idle_compact.notice.compacted', { minutes: notice.idleMinutes, tokens: k(notice.tokens) }, loc)
+    : tr('idle_compact.notice.compacted_unknown', { minutes: notice.idleMinutes }, loc);
+}
+
+/** Per-session opt-in idle auto-compact (core/idle-auto-compact.ts), run from
+ *  the 60s idle sweep. The compact itself goes through the same passthrough
+ *  path as the card 「🗜️ 压缩」 button, gated like the threshold auto-compact. */
+function runIdleAutoCompact(): void {
+  runIdleAutoCompactSweep(activeSessions.values(), {
+    supported: sessionSupportsIdleAutoCompact,
+    eligible: autoCompactEligible,
+    contextTokens: idleAutoCompactContextTokens,
+    persist: ds => sessionStore.updateSession(ds.session),
+    compact: (ds, turnId) => {
+      if (!autoCompactEligible(ds)) return false;
+      const anchor = sessionAnchorId(ds);
+      let delivered = false;
+      deliverPassthroughToExistingSession(ds, '/compact', '/compact', anchor, ds.larkAppId, {
+        messageId: anchor,
+        replyRootId: anchor,
+        senderIsBot: true,
+        substitute: false,
+        inThread: ds.scope === 'thread',
+        turnId,
+        requireSafeComposer: true,
+        onDelivered: () => { delivered = true; },
+      });
+      return delivered;
+    },
+    notify: (ds, notice) => {
+      void sessionReply(sessionAnchorId(ds), idleAutoCompactNoticeText(ds, notice), 'text', ds.larkAppId)
+        .catch(err => logger.warn(`[${tag(ds)}] idle auto-compact notice failed: ${err instanceof Error ? err.message : String(err)}`));
+    },
+    log: message => logger.info(message),
+  });
+}
+
 /**
  * Freeze the previous turn's streaming card at "idle" and mark a new turn so the
  * next screen_update from the worker POSTs a fresh streaming card instead of
@@ -6181,6 +6242,8 @@ function observeAutoCompact(ds: DaemonSession, status: string): void {
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
   resetPromptCacheKeepalive(ds);
+  // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
+  noteIdleAutoCompactTurnStarted(ds, turnId);
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
   // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
   // deliverFinalOutput / botmux send 成功路径清理。
@@ -33353,6 +33416,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       });
     } catch (error) {
       logger.warn(`[prompt-cache] keep-alive sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    // Per-session idle auto-compact: a no-op unless a session opted in.
+    try {
+      runIdleAutoCompact();
+    } catch (error) {
+      logger.warn(`[idle-compact] sweep failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }, 60_000);
   idleWorkerSweepTimer.unref?.();

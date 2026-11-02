@@ -1123,6 +1123,11 @@ export interface Session {
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /** Codex service tier frozen at session creation; legacy missing means inherit. */
   serviceTier?: CodexServiceTierPreference;
+  /** Per-session opt-in idle auto-compaction (core/idle-auto-compact.ts).
+   *  Absent / enabled=false = off (the default). `idleSince` / `handledIdleSince`
+   *  are the persisted idle-stretch bookkeeping that lets the timer survive a
+   *  daemon restart; only written while the feature is on. */
+  idleAutoCompact?: import('./core/idle-auto-compact.js').IdleAutoCompactSetting;
   /** Optional TraeX backend variant frozen when this session first launches.
    * Missing preserves the historical inherit-from-TraeX-global behavior. */
   modelBackendVariant?: 'standard' | 'max';
