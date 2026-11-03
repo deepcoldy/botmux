@@ -1760,7 +1760,7 @@ botmux workflow new "<把用户目标浓缩成一句话>"
 - \`input_needs\` 是**自由文本**描述"这步需要什么信息/产物"，**绝不要写成上游 sketchId 列表**——画依赖边是 architect 的活，不是你的。
 - \`risk_gate: true\` = 这步执行期要人工审批（如对外发送）。
 - \`unknowns\` 放没跟用户定死、用了默认的点。
-- 用户明确点名某步由哪个 Bot 做时，在该节点加 \`"assignee": "<Bot 名或 larkAppId>"\`；没点名就不写，别替用户挑。
+- 第 1 步返回里有 \`"nodeExecutor": "bot"\`（节点交给群里的 Bot 执行）时，用户明确点名某步由哪个 Bot 做，就在该节点加 \`"assignee": "<Bot 名或 larkAppId>"\`；没点名或没有这个字段就不写。
 
 ### 4. 校验 spec
 \`\`\`bash

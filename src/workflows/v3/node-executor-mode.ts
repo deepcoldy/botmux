@@ -69,6 +69,8 @@ export interface V3NodeExecutorTarget {
   nodeId: string;
   /** The bot that will execute it (the frozen snapshot's app id). */
   larkAppId: string;
+  /** Set for a loop body node (authored ids may themselves contain dots). */
+  loop?: { loopId: string; bodyNodeId: string };
   /** Declared outputs of kind `directory`: a bot cannot submit a directory
    *  (`botmux report --output` carries files), so such a node can never
    *  complete when handed to a bot. */
@@ -104,7 +106,11 @@ export function v3BotExecutorTargets(
     if (isLoopNode(node)) {
       for (const body of node.body.nodes) {
         const nodeId = `${node.id}.${body.id}`;
-        out.push(withOutputs({ nodeId, larkAppId: targetOf(body.bot ?? node.bot, nodeId) }, body.outputs));
+        out.push(withOutputs({
+          nodeId,
+          larkAppId: targetOf(body.bot ?? node.bot, nodeId),
+          loop: { loopId: node.id, bodyNodeId: body.id },
+        }, body.outputs));
       }
     }
   }

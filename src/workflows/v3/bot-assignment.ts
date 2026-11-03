@@ -113,7 +113,8 @@ export async function buildV3BotRoster(input: {
     const name = input.nameOf(bot.larkAppId);
     const why = verdicts[index];
     if (why) {
-      roster.excluded.push({ larkAppId: bot.larkAppId, name, why });
+      // Probe details are external error text: one line, bounded.
+      roster.excluded.push({ larkAppId: bot.larkAppId, name, why: oneLine(why, MAX_REASON_CHARS) });
       return;
     }
     const role = input.roleOf?.(bot.larkAppId);
@@ -215,6 +216,46 @@ export function v3RosterSelectorProblems(dag: V3Dag, roster: V3BotRoster): strin
   return problems;
 }
 
+/** Goal nodes of `dag` as "node → app id" (omitted selector = main bot). */
+function dagTargets(dag: V3Dag, mainLarkAppId: string): V3NodeExecutorTarget[] {
+  const out: V3NodeExecutorTarget[] = [];
+  for (const node of dag.nodes) {
+    if (isGoalNode(node)) out.push({ nodeId: node.id, larkAppId: node.bot ?? mainLarkAppId });
+    if (isLoopNode(node)) {
+      for (const body of node.body.nodes) {
+        out.push({
+          nodeId: `${node.id}.${body.id}`,
+          larkAppId: body.bot ?? node.bot ?? mainLarkAppId,
+          loop: { loopId: node.id, bodyNodeId: body.id },
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** §6.2: a named bot that is on the roster MUST execute its sketch's node.
+ *  Problems send the dag back to the Architect; named bots that cannot be
+ *  used are only flagged at Gate-2. */
+export function v3AssigneeProblems(dag: V3Dag, assignment: V3ArchitectBotAssignment): string[] {
+  const targets = dagTargets(dag, assignment.roster.mainLarkAppId);
+  const problems: string[] = [];
+  for (const entry of assignment.assignees) {
+    if (entry.target.kind !== 'bot' || entry.unavailable) continue;
+    const wanted = entry.target.larkAppId;
+    const named = `sketch ${entry.sketchId} 点名「${entry.assignee}」（${wanted}）`;
+    const nodes = nodesForSketch(targets, entry.sketchId);
+    if (nodes.length === 0) {
+      problems.push(`${named}，但没有 id 为 ${entry.sketchId} 的节点（实现它的节点要沿用 sketchId）`);
+      continue;
+    }
+    for (const node of nodes.filter((candidate) => candidate.larkAppId !== wanted)) {
+      problems.push(`${named}，但节点 ${node.nodeId} 交给了 ${node.larkAppId}`);
+    }
+  }
+  return problems;
+}
+
 // ─── Reasons (architect-notes.md) and the Gate-2 summary ─────────────────
 
 const ASSIGNMENT_HEADING_RE = /^#{1,6}\s*bot assignments\b/i;
@@ -248,10 +289,12 @@ export type V3AssigneeCheck =
    *  when no node carries the sketch's id. */
   | { sketchId: string; assignee: string; status: 'not-honoured'; larkAppId: string; nodeIds: string[]; why?: string };
 
-/** The nodes implementing a sketch: the goal node (or loop body node) that
- *  kept the sketch's id, as the Architect is told to do. */
+/** The nodes implementing a sketch: the top-level goal node, or the loop
+ *  body node, whose own id is the sketch's id (the Architect is told to keep
+ *  it). Node ids may contain dots, so a top-level `code.review` is not
+ *  `review`. */
 function nodesForSketch(targets: readonly V3NodeExecutorTarget[], sketchId: string): V3NodeExecutorTarget[] {
-  return targets.filter((target) => target.nodeId === sketchId || target.nodeId.endsWith(`.${sketchId}`));
+  return targets.filter((target) => (target.loop ? target.loop.bodyNodeId : target.nodeId) === sketchId);
 }
 
 /** Did the frozen assignment follow every bot the user named? */
@@ -271,10 +314,10 @@ export function checkV3Assignees(input: {
     if (target.kind === 'ambiguous') {
       return [{ ...base, status: 'unresolved', why: `有多个 Bot 叫这个名字（${target.larkAppIds.join(', ')}），请改用 larkAppId` }];
     }
+    // No corresponding node = not honoured (another node on that bot proves
+    // nothing about this sketch).
     const nodes = nodesForSketch(input.targets, sketch.sketchId);
-    const honoured = nodes.length > 0
-      ? nodes.every((node) => node.larkAppId === target.larkAppId)
-      : input.targets.some((node) => node.larkAppId === target.larkAppId);
+    const honoured = nodes.length > 0 && nodes.every((node) => node.larkAppId === target.larkAppId);
     if (honoured) {
       return [{ ...base, status: 'honoured', larkAppId: target.larkAppId, nodeIds: nodes.map((node) => node.nodeId) }];
     }

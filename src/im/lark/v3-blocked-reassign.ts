@@ -9,11 +9,14 @@
  * 下拉框只列批准时的 Bot，点击时也只认它们。
  */
 
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+
+import { latestAttemptIdFor } from '../../workflows/v3/attempt-numbering.js';
 
 import { parseFrozenBotSnapshots } from '../../workflows/v3/bot-resolve.js';
 import type { BotSnapshot } from '../../workflows/v3/contract.js';
-import type { V3BlockedInfo } from '../../workflows/v3/daemon-run.js';
+import { requestV3Retry, type V3BlockedInfo } from '../../workflows/v3/daemon-run.js';
 import { isGoalNode, type V3Dag } from '../../workflows/v3/dag.js';
 import { externalAttemptNode, reassignNode, type V3ReassignOutcome } from '../../workflows/v3/external-control.js';
 import type { V3ExternalNodeExecutor } from '../../workflows/v3/external-executor.js';
@@ -164,7 +167,8 @@ export async function buildV3BlockedCardForRun(input: {
   let offer: V3BlockedReassignOffer | undefined;
   try {
     const view = loadBotRun(input.runDir);
-    if (view) offer = await reassignOffer(view, input.runDir, info.nodeId, input.reassign);
+    // Only the initiator may reassign; without one nobody could ever use it.
+    if (view?.initiatorOpenId) offer = await reassignOffer(view, input.runDir, info.nodeId, input.reassign);
   } catch {
     offer = undefined; // the plain card still lets a human retry
   }
@@ -195,6 +199,48 @@ const REJECTION_TEXT: Record<Extract<V3ReassignOutcome, { kind: 'rejected' }>['r
   'not-bot-run': '这个 run 的节点不是交给群里的 Bot 执行的，不能改派',
 };
 
+type V3ClickState =
+  | { kind: 'missing' }
+  | { kind: 'run-over' }
+  /** The node is no longer blocked on the card's attempt. */
+  | { kind: 'moved'; current?: string }
+  | { kind: 'blocked'; current?: string };
+
+/** Where the run and the card's node stand now, from the journal alone. */
+function clickState(runDir: string, view: V3BotRunView, nodeId: string, attemptId: string): V3ClickState {
+  const journalPath = join(runDir, 'journal.ndjson');
+  if (!existsSync(journalPath)) return { kind: 'missing' };
+  const events = readJournal(journalPath);
+  const snap = materialize([...events]);
+  if (snap.runStatus !== 'running' && snap.runStatus !== 'blocked') return { kind: 'run-over' };
+  const current = currentTarget(view, events, nodeId);
+  const node = snap.nodes.get(nodeId);
+  const blockedHere = node?.status === 'blocked'
+    && latestAttemptIdFor([...events], node.effectiveInstanceId ?? nodeId) === attemptId;
+  return { kind: blockedHere ? 'blocked' : 'moved', ...(current ? { current } : {}) };
+}
+
+function reassignedCard(
+  runDir: string,
+  value: V3ReassignActionValue,
+  toName: string,
+  nextAttemptId: string | undefined,
+  by: string,
+): unknown {
+  const events = readJournal(join(runDir, 'journal.ndjson'));
+  const blocked = [...events].reverse().find((event): event is StoredEvent & { type: 'nodeBlocked' } =>
+    event.type === 'nodeBlocked' && event.nodeId === value.nodeId && event.attemptId === value.attemptId);
+  return JSON.parse(buildV3BlockedCard({
+    runId: value.runId,
+    nodeId: value.nodeId,
+    attemptId: value.attemptId,
+    errorClass: blocked?.errorClass,
+    errorCode: blocked?.errorCode,
+    message: blocked?.message,
+    reassigned: { toName, ...(nextAttemptId ? { nextAttemptId } : {}), by },
+  }));
+}
+
 /**
  * A 「确认改派」 click. Only the run's initiator may reassign (§10.3); the
  * target must be one of the bots frozen at approval and pass §6.1 right now
@@ -209,6 +255,11 @@ export async function handleV3BlockedReassign(
   deps: V3BlockedReassignHandlerDeps,
 ): Promise<unknown> {
   if (!isValidRunId(value.runId)) return toast('warning', '改派已失效（非法 run）');
+  // The card always names the blocked attempt; without it neither the nonce
+  // nor the engine's freshness check would mean anything.
+  if (typeof value.nodeId !== 'string' || !value.nodeId || typeof value.attemptId !== 'string' || !value.attemptId) {
+    return toast('warning', '这张卡已失效（缺少节点或 attempt）');
+  }
   if (value.nonce !== v3BlockedCardNonce(value.runId, value.nodeId, value.attemptId)) {
     return toast('warning', '这张卡已失效（nonce 不匹配）');
   }
@@ -238,6 +289,18 @@ export async function handleV3BlockedReassign(
 
   const reassignDeps = deps.reassign;
   const name = reassignDeps.nameOf(target);
+  // The journal decides before anything is written (no chat grant for a run
+  // that is over or a node that moved on).
+  const state = clickState(runDir, view, value.nodeId, value.attemptId);
+  if (state.kind === 'missing') return toast('warning', REJECTION_TEXT.missing);
+  if (state.kind === 'run-over') return toast('warning', REJECTION_TEXT['run-not-running']);
+  if (state.kind === 'moved') {
+    if (state.current !== target) return toast('warning', REJECTION_TEXT['stale-attempt']);
+    // A repeated click after the node already went to this bot.
+    deps.driveRun(value.runId);
+    return toast('info', `已改派给 ${name}，正在交接`);
+  }
+
   let why: string | undefined;
   try {
     why = await unavailableReason(view, target, lazyProbe(reassignDeps, view.binding), { grant: true });
@@ -246,6 +309,16 @@ export async function handleV3BlockedReassign(
   }
   if (why) return toast('warning', `不能改派给 ${name}：${why}`);
 
+  if (state.current === target) {
+    // Still blocked although already assigned to this bot: an earlier
+    // reassignment wrote its nodeReassigned but not its retry. Finish it.
+    const retried = requestV3Retry(deps.baseDir, value.runId, { nodeId: value.nodeId, expectedAttemptId: value.attemptId });
+    if (retried.kind === 'stale-run') return toast('warning', REJECTION_TEXT['not-reassignable']);
+    deps.driveRun(value.runId);
+    if (retried.kind === 'already-requested') return toast('info', `已改派给 ${name}，正在交接`);
+    return reassignedCard(runDir, value, name, retried.nextAttemptId, operatorOpenId);
+  }
+
   let outcome: V3ReassignOutcome;
   try {
     outcome = await reassignNode(runDir, {
@@ -253,6 +326,7 @@ export async function handleV3BlockedReassign(
       toLarkAppId: target,
       by: operatorOpenId,
       expectedAttemptId: value.attemptId,
+      requireBlocked: true,
     }, {
       dag: view.dag,
       botSnapshots: view.snapshots,
@@ -262,26 +336,8 @@ export async function handleV3BlockedReassign(
   } catch (err) {
     return toast('error', `改派失败，请再试：${err instanceof Error ? err.message : String(err)}`);
   }
-  if (outcome.kind === 'rejected') {
-    // A repeated click after the first one already moved the node.
-    if (outcome.reason === 'same-bot') deps.driveRun(value.runId);
-    return toast(outcome.reason === 'same-bot' ? 'info' : 'warning', REJECTION_TEXT[outcome.reason]);
-  }
+  // Raced with another change between the read above and the locked write.
+  if (outcome.kind === 'rejected') return toast('warning', REJECTION_TEXT[outcome.reason]);
   deps.driveRun(value.runId);
-  const events = readJournal(join(runDir, 'journal.ndjson'));
-  const blocked = [...events].reverse().find((event): event is StoredEvent & { type: 'nodeBlocked' } =>
-    event.type === 'nodeBlocked' && event.nodeId === value.nodeId && event.attemptId === value.attemptId);
-  return JSON.parse(buildV3BlockedCard({
-    runId: value.runId,
-    nodeId: value.nodeId,
-    attemptId: value.attemptId,
-    errorClass: blocked?.errorClass,
-    errorCode: blocked?.errorCode,
-    message: blocked?.message,
-    reassigned: {
-      toName: name,
-      ...(outcome.nextAttemptId ? { nextAttemptId: outcome.nextAttemptId } : {}),
-      by: operatorOpenId,
-    },
-  }));
+  return reassignedCard(runDir, value, name, outcome.nextAttemptId, operatorOpenId);
 }

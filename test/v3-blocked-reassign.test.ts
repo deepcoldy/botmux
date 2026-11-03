@@ -20,8 +20,8 @@ import {
   makeSavedDefinitionRunEnvelope,
   publishRunEnvelopeOnce,
 } from '../src/workflows/v3/run-envelope.js';
-import { blockedInfoFor, createV3GateRunner, requestV3Retry } from '../src/workflows/v3/daemon-run.js';
-import { readJournal } from '../src/workflows/v3/journal.js';
+import { blockedInfoFor, createV3GateRunner, requestV3Retry, requestV3RunCancel } from '../src/workflows/v3/daemon-run.js';
+import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { validateDag } from '../src/workflows/v3/dag.js';
 import type { V3BotEligibilityProbe } from '../src/workflows/v3/node-executor-mode.js';
 import type { RunChatBinding } from '../src/workflows/v3/grill-state.js';
@@ -34,6 +34,7 @@ import {
 } from '../src/im/lark/v3-blocked-card.js';
 import { handleV3BlockedAction } from '../src/im/lark/v3-blocked-card-handler.js';
 import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from '../src/im/lark/v3-blocked-reassign.js';
+import { reassignNode } from '../src/workflows/v3/external-control.js';
 import { BotRun, FakeExecutor } from './helpers/v3-external-harness.js';
 
 const MAIN = 'cli_main';
@@ -88,11 +89,12 @@ function seedArtifacts(runDir: string, runId: string) {
   };
 }
 
-function seedAdHoc(base: string, runId: string, executor: 'bot' | 'ephemeral'): string {
+function seedAdHoc(base: string, runId: string, executor: 'bot' | 'ephemeral', initiator: string | null = OWNER): string {
   const runDir = join(base, runId);
   publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
     runId, createdAt: CREATED_AT, authorizedAt: AUTHORIZED_AT, chatBinding: BINDING,
-    authorizedByOpenId: OWNER, artifacts: seedArtifacts(runDir, runId),
+    ...(initiator ? { authorizedByOpenId: initiator } : {}),
+    artifacts: seedArtifacts(runDir, runId),
     ...(executor === 'bot' ? { nodeExecutor: 'bot' as const } : {}),
   }));
   return runDir;
@@ -117,10 +119,10 @@ function reassignDeps(probe: V3BotEligibilityProbe): V3BlockedReassignDeps {
 
 /** A bot run driven through the daemon gate runner until `write` is blocked
  *  (its first handoff is refused). Cards are composed as the daemon does. */
-async function blockedBotRun(runId: string, notInChat: string[] = []) {
+async function blockedBotRun(runId: string, notInChat: string[] = [], opts: { initiator?: string | null } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'v3-reassign-'));
   bases.push(base);
-  const runDir = seedAdHoc(base, runId, 'bot');
+  const runDir = seedAdHoc(base, runId, 'bot', opts.initiator === undefined ? OWNER : opts.initiator);
   const executor = new FakeExecutor();
   executor.onDispatch = (req) => (req.attemptNumber === 1 && req.nodeId === 'write'
     ? { kind: 'rejected', code: 'BOT_OFFLINE' }
@@ -342,5 +344,146 @@ describe('blocked card of an ordinary run', () => {
       baseDir: base, driveRun: () => {}, canResolve: () => true, reassign: reassignDeps(tableProbe().probe),
     }, { [V3_BLOCKED_REASSIGN_FIELD]: 'cli_b' }, MAIN) as any;
     expect(result.toast.content).toContain('不是交给群里的 Bot');
+  });
+});
+
+// ─── Review follow-ups ───────────────────────────────────────────────────
+
+describe('改派 hardening', () => {
+  const clickWith = (run: Awaited<ReturnType<typeof blockedBotRun>>, value: V3ReassignActionValue, extra: {
+    canResolve?: () => boolean;
+    probe?: V3BotEligibilityProbe;
+  } = {}) => handleV3BlockedAction(
+    value,
+    OWNER,
+    {
+      baseDir: run.base,
+      driveRun: (id) => { run.drives.push(id); },
+      canResolve: extra.canResolve ?? (() => true),
+      reassign: extra.probe ? reassignDeps(extra.probe) : run.deps,
+    },
+    { [V3_BLOCKED_REASSIGN_FIELD]: 'cli_b' },
+    MAIN,
+  );
+
+  it('a callback without an attempt is refused before anything is written', async () => {
+    const run = await blockedBotRun('rh-no-attempt');
+    const { attemptId: _dropped, ...rest } = reassignValueOf(run.cards[0]!);
+    const forged = { ...rest, nonce: v3BlockedCardNonce(run.runId, 'write', undefined as unknown as string) } as V3ReassignActionValue;
+    const result = await clickWith(run, forged) as any;
+    expect(result.toast.content).toContain('缺少');
+    expect(reassignedEvents(run.runDir)).toEqual([]);
+    expect(run.asked).not.toContain('grant:cli_b');
+  });
+
+  it('a callback naming the running attempt never retargets it', async () => {
+    const run = await blockedBotRun('rh-running');
+    requestV3Retry(run.base, run.runId, { nodeId: 'write' });
+    await run.runner.drive(run.runId);
+    const running = run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)!.attemptId;
+    const forged: V3ReassignActionValue = {
+      action: V3_BLOCKED_REASSIGN_ACTION, runId: run.runId, nodeId: 'write', attemptId: running,
+      nonce: v3BlockedCardNonce(run.runId, 'write', running),
+    };
+    const result = await clickWith(run, forged) as any;
+    expect(result.toast).toBeDefined();
+    expect(reassignedEvents(run.runDir)).toEqual([]);
+    expect(run.executor.stops).toEqual([]);
+    expect(run.asked).not.toContain('grant:cli_b');
+  });
+
+  it('the engine re-checks "still blocked" under the journal lock', async () => {
+    const run = await blockedBotRun('rh-race');
+    // A retry lands while the target's chat grant is being made.
+    const { probe } = tableProbe();
+    const racing: V3BotEligibilityProbe = {
+      ...probe,
+      ensureGrant: async () => { requestV3Retry(run.base, run.runId, { nodeId: 'write' }); },
+    };
+    const result = await clickWith(run, reassignValueOf(run.cards[0]!), { probe: racing }) as any;
+    expect(result.toast).toBeDefined();
+    expect(reassignedEvents(run.runDir)).toEqual([]);
+  });
+
+  it('the engine re-checks the card\'s attempt: a node blocked again meanwhile is not moved by the old card', async () => {
+    const run = await blockedBotRun('rh-race-reblocked');
+    run.executor.onDispatch = () => ({ kind: 'rejected', code: 'BOT_OFFLINE' });
+    const { probe } = tableProbe();
+    const racing: V3BotEligibilityProbe = {
+      ...probe,
+      ensureGrant: async () => {
+        requestV3Retry(run.base, run.runId, { nodeId: 'write' });
+        await run.runner.drive(run.runId); // attempt 002 is refused too → blocked again
+      },
+    };
+    const result = await clickWith(run, reassignValueOf(run.cards[0]!), { probe: racing }) as any;
+    expect(result.toast).toBeDefined();
+    expect(reassignedEvents(run.runDir)).toEqual([]);
+  });
+
+  it('no 改派 section when the run has no recorded initiator', async () => {
+    const run = await blockedBotRun('rh-no-initiator', [], { initiator: null });
+    expect(reassignForm(run.cards[0]!)).toBeUndefined();
+  });
+
+  it('a half-written reassignment (no retry yet) is finished by clicking the same bot again', async () => {
+    const run = await blockedBotRun('rh-half');
+    appendEvent(join(run.runDir, 'journal.ndjson'), {
+      type: 'nodeReassigned', nodeId: 'write', instanceId: 'write#001', from: 'cli_a', to: 'cli_b', by: OWNER,
+    });
+    const frozen = await run.click(OWNER, 'cli_b') as any;
+    expect(frozen.header?.title.content).toContain('已改派');
+    expect(readJournal(join(run.runDir, 'journal.ndjson')).filter((event) => event.type === 'nodeRetryRequested')).toHaveLength(1);
+    await run.runner.drive(run.runId);
+    expect(run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1))
+      .toMatchObject({ targetLarkAppId: 'cli_b', attemptNumber: 2 });
+  });
+
+  it('a cancelled run refuses before any chat grant is written', async () => {
+    const run = await blockedBotRun('rh-cancelled');
+    expect(requestV3RunCancel(run.base, run.runId, { by: OWNER })).toMatchObject({ kind: 'requested' });
+    const result = await run.click(OWNER, 'cli_b') as any;
+    expect(result.toast.content).toContain('结束');
+    expect(run.asked).not.toContain('grant:cli_b');
+    expect(reassignedEvents(run.runDir)).toEqual([]);
+  });
+
+  it('the initiator still needs the card\'s operate permission', async () => {
+    const run = await blockedBotRun('rh-no-permission');
+    const result = await clickWith(run, reassignValueOf(run.cards[0]!), { canResolve: () => false }) as any;
+    expect(result.toast.content).toContain('权限');
+    expect(run.asked).not.toContain('grant:cli_b');
+    expect(reassignedEvents(run.runDir)).toEqual([]);
+  });
+
+  it.each([
+    ['a contract error that needs a revised workflow', { retryForbidden: 'revise-workflow-required' as const }],
+    ['a human-ask', { ask: { question: 'Q?', options: ['a'] } }],
+  ])('no 改派 section on %s, and no bot is probed for it', async (_label, extra) => {
+    const run = await blockedBotRun('rh-forbidden');
+    const info = { ...blockedInfoFor(readJournal(join(run.runDir, 'journal.ndjson')), 'write'), ...extra };
+    const probeFactory = vi.fn(() => tableProbe().probe);
+    const card = await buildV3BlockedCardForRun({
+      runDir: run.runDir, runId: run.runId, info, reassign: { ...run.deps, probe: probeFactory },
+    });
+    expect(card).not.toContain(V3_BLOCKED_REASSIGN_ACTION);
+    expect(probeFactory).not.toHaveBeenCalled();
+  });
+});
+
+describe('engine: reassignNode(requireBlocked)', () => {
+  it('refuses a running attempt even when the caller names it exactly', async () => {
+    const dag = validateDag({ schemaVersion: 2, runId: 'rq-running', nodes: NODES });
+    const run = new BotRun(dag);
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const open = run.openAttempt('write');
+    const snapshots = new Map(Object.entries(SNAPSHOTS));
+    const ctx = { ...run.ctx(), botSnapshots: snapshots, nodeExecutor: 'bot' as const, executor };
+    expect(await reassignNode(run.runDir, {
+      nodeId: 'write', toLarkAppId: 'cli_b', by: OWNER, expectedAttemptId: open.attemptId, requireBlocked: true,
+    }, ctx)).toEqual({ kind: 'rejected', reason: 'not-reassignable' });
+    expect(run.of('nodeReassigned')).toEqual([]);
+    expect(executor.stops).toEqual([]);
   });
 });

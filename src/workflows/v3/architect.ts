@@ -25,6 +25,7 @@ import {
 import type { V3ArchitectBotAssignment, V3RosterBot, V3SketchAssignee } from './bot-assignment.js';
 
 const ARCHITECT_NODE_ID = 'architect';
+const MAX_UNAVAILABLE_CHARS = 200;
 const ARCHITECT_ATTEMPT_ID = 'architect/attempts/001';
 
 export interface RunArchitectInput {
@@ -168,7 +169,9 @@ function assigneeLine(entry: V3SketchAssignee): string {
   const fallback = 'assign that node like any other and say so in its reason';
   if (entry.target.kind === 'bot' && !entry.unavailable) return `  - ${sketch} → ${entry.target.larkAppId} (${named})`;
   if (entry.target.kind === 'bot') {
-    return `  - ${sketch}: ${named} (${entry.target.larkAppId}), which cannot execute nodes here: ${entry.unavailable}; ${fallback}.`;
+    // The reason may carry probe / Lark error text: keep it one quoted value.
+    const why = JSON.stringify((entry.unavailable ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_UNAVAILABLE_CHARS));
+    return `  - ${sketch}: ${named} (${entry.target.larkAppId}), which cannot execute nodes here (${why}); ${fallback}.`;
   }
   if (entry.target.kind === 'ambiguous') {
     return `  - ${sketch}: ${named}, which matches several bots (${entry.target.larkAppIds.join(', ')}); ${fallback}.`;

@@ -62,6 +62,7 @@ import {
   formatV3Gate2BotPlan,
   parseV3AssignmentReasons,
   planV3SketchAssignees,
+  v3AssigneeProblems,
   v3RosterSelectorProblems,
   type V3ArchitectBotAssignment,
   type V3BotRoster,
@@ -397,7 +398,10 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
         throw new DagValidationError(['architect dag.json must use schemaVersion 2']);
       }
       if (deps.botAssignment) {
-        const problems = v3RosterSelectorProblems(dag as V3Dag, deps.botAssignment.roster);
+        const problems = [
+          ...v3RosterSelectorProblems(dag as V3Dag, deps.botAssignment.roster),
+          ...v3AssigneeProblems(dag as V3Dag, deps.botAssignment),
+        ];
         if (problems.length > 0) throw new DagValidationError(problems);
       }
     } catch (err) {
@@ -701,6 +705,24 @@ export function describeAdHocBotPlan(
 }
 
 /**
+ * When the run's nodes stay on temporary processes, the bots named in the
+ * spec (`assignee`) have no effect; say so at Gate-2 instead of silently
+ * ignoring them. `undefined` when the spec names nobody.
+ */
+export function describeIgnoredAssignees(runDir: string): string | undefined {
+  try {
+    const cur = readGrillState(runDir);
+    if (!cur) return undefined;
+    const spec = validateSpec(JSON.parse(readFileSync(cur.specJsonPath, 'utf-8')) as unknown);
+    const named = spec.nodes.filter((sketch) => sketch.assignee);
+    if (named.length === 0) return undefined;
+    return `本次节点不交给群里的 Bot 执行，spec 里的点名不生效：${named.map((sketch) => `${sketch.sketchId} →「${sketch.assignee}」`).join('、')}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * 改稿·改需求：把任一 grilling 之后的阶段退回 `grilling`，并清掉已失效的
  * architect 产物（dagPath/notesPath/architectManifestPath）+ problems，让用户
  * 重新 grill / 改 spec.md 再 finalize。改需求意味着已编排的 DAG 作废，所以这里
@@ -858,9 +880,17 @@ export async function cmdWorkflowHost(
       // daemon humanGate 发审批卡用（CLI/dev 出生无 env → undefined，不影响）。
       const chatBinding = (deps.resolveChatBinding ?? chatBindingFromEnv)();
       const { runId, runDir, state } = hostNew({ goal, baseDir, chatBinding });
+      // Tells the grill whether named bots (`assignee`) will matter; approve-dag
+      // decides for real.
+      const botExecuted = decideV3NodeExecutor({
+        switchMode: (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)(),
+        binding: chatBinding,
+        multiTopicEnabled: (deps.multiTopicEnabled ?? (() => isMultiTopicOrchestrationEnabled()))(),
+      }).mode === 'bot';
       console.log(JSON.stringify({
         runId, runDir, status: state.status, specPath: state.specPath,
         chatBound: !!chatBinding,
+        ...(botExecuted ? { nodeExecutor: 'bot' } : {}),
       }, null, 2));
       return;
     }
@@ -944,6 +974,10 @@ export async function cmdWorkflowHost(
         return;
       }
       console.log(JSON.stringify({ runId, status: out.state.status, dagPath: out.state.dagPath, notesPath: out.state.notesPath }, null, 2));
+      if (!botAssignment) {
+        const ignored = describeIgnoredAssignees(runDir);
+        if (ignored) console.log(`\n${ignored}`);
+      }
       // Gate-2 preview: with the experimental executor switch on, show who
       // will execute each node so the summary can list it before approval
       // (approve-dag re-decides and checks eligibility; this never blocks).
@@ -995,6 +1029,8 @@ export async function cmdWorkflowHost(
           if (plan.kind === 'ephemeral') {
             const fallback = describeV3EphemeralFallback(plan.decision);
             if (fallback) summary.push(fallback);
+            const ignored = describeIgnoredAssignees(runDir);
+            if (ignored) summary.push(ignored);
           } else {
             const nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
             if (plan.kind === 'refused') {
@@ -1003,6 +1039,9 @@ export async function cmdWorkflowHost(
             nodeExecutor = 'bot';
             summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
           }
+        } else {
+          const ignored = describeIgnoredAssignees(runDir);
+          if (ignored) summary.push(ignored);
         }
       } else if (before.kind === 'ok' && 'nodeExecutor' in before.envelope && before.envelope.nodeExecutor === 'bot') {
         summary.push('执行方式：节点交给群里的 Bot 执行（已在首次批准时冻结）');
