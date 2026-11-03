@@ -1,7 +1,9 @@
 import { realpath } from 'node:fs/promises';
 import { SkillFeedbackStore } from './skill-feedback-store.js';
 import { FeedbackAnalyticsService } from './feedback-analytics.js';
-import { readFeedbackStorageConfig } from './feedback-storage-config.js';
+import { readFeedbackStorageConfig, readFeedbackStorageSecret } from './feedback-storage-config.js';
+import { openPostgresFeedbackStore } from './feedback-postgres-store.js';
+import { openPostgresFeedbackAnalytics } from './feedback-postgres-analytics.js';
 import type { FeedbackAnalytics, FeedbackStore, FeedbackStorageConfig } from './feedback-storage-types.js';
 
 export interface FeedbackStorage {
@@ -24,7 +26,18 @@ function serialized<Result>(key: string, operation: () => Promise<Result>): Prom
 }
 
 async function openStorage(dataDir: string, config: FeedbackStorageConfig): Promise<FeedbackStorage> {
-  if (config.active.backend !== 'sqlite') throw new Error('feedback_storage_backend_unavailable');
+  if (config.active.backend === 'postgresql') {
+    const target = config.active.postgres;
+    const password = await readFeedbackStorageSecret(dataDir, target.passwordRef);
+    const ca = target.tls.caRef ? await readFeedbackStorageSecret(dataDir, target.tls.caRef) : undefined;
+    const store = await openPostgresFeedbackStore(target, password, config.instanceId, ca);
+    try {
+      const analytics = await openPostgresFeedbackAnalytics(target, password, ca);
+      const close = store.close.bind(store);
+      store.close = async () => { await analytics.close(); await close(); };
+      return { store, analytics, generation: config.generation };
+    } catch (error) { await store.close(); throw error; }
+  }
   const sqlite = await SkillFeedbackStore.open(dataDir);
   let analytics: FeedbackAnalyticsService;
   try {
