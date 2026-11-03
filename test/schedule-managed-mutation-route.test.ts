@@ -542,6 +542,51 @@ describe('managed schedule mutation route', () => {
     expect(other.scheduler.completeTask).not.toHaveBeenCalled();
   });
 
+  // `botmux schedule add` from the host terminal stores no controller. Its own
+  // scheduled turn must be able to close it, or an until-done task retries
+  // until the deadline even after the work is finished.
+  it.each(['done', 'pause', 'remove'] as const)(
+    'lets a host-terminal task\'s scheduled turn %s itself through the real authorizer',
+    async action => {
+      const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+      const h = harness(action, turnId, 'self');
+      h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+      h.record.kind = 'direct';
+      h.record.runScopes = [];
+      h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO, enabled: true,
+        untilDone: { status: 'open', attempts: 2 } };
+      h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+      h.scope.getDashboardAdminOpenIds = () => [];
+      h.scope.readGlobalConfig = () => ({});
+      expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+      const mutated = { done: h.scheduler.completeTask, pause: h.scheduler.disableTask,
+        remove: h.scheduler.removeTask }[action];
+      expect(mutated).toHaveBeenCalledWith('a1b2c3d4', ...(action === 'done' ? [undefined] : []));
+
+      // The exemption is for stopping itself only, never another task or a rerun.
+      for (const [otherAction, otherId] of [[action, 'deadbeef'], ['run', 'self'], ['update', 'self']]) {
+        const other = harness(otherAction, turnId, otherId);
+        other.ds.activeInteractiveTurn.caller.senderType = 'bot';
+        other.record.kind = 'direct';
+        other.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+        expect(await other.run()).toMatchObject({ status: 403,
+          value: { error: 'schedule_mutation_current_human_required' } });
+      }
+    },
+  );
+
+  it('still refuses self-close for a direct task whose recorded controller lost access', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('done', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    Object.assign(h.record, { kind: 'direct', controlOpenId: 'ou_left', controlUnionId: 'on_left', runScopes: [] });
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', enabled: true, untilDone: { status: 'open', attempts: 1 } };
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_self_manage_denied',
+      detail: 'schedule controller is no longer an allowed bot operator' } });
+    expect(h.scheduler.completeTask).not.toHaveBeenCalled();
+  });
+
   it('reports a repeated done as a replay and a plain task as not until-done', async () => {
     const replay = harness('done');
     replay.record.kind = 'direct';
