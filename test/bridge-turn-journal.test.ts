@@ -28,6 +28,8 @@ import {
   BRIDGE_TURN_RECOVERY_MAX_BYTES,
   BridgeRestoreGate,
   clearBridgeTurnJournal,
+  entriesOfLaterGenerations,
+  LIVE_CLI_START_TOLERANCE_MS,
   planBridgeTurnRecovery,
   readBridgeTurnJournal,
   removeBridgeTurnJournalEntry,
@@ -174,6 +176,45 @@ describe('selectRestorableBridgeTurns', () => {
     ];
     const restorable = selectRestorableBridgeTurns(entries, { currentJsonlPath: '/a.jsonl', nowMs: now });
     expect(restorable.map(e => e.turnId)).toEqual(['plain']);
+  });
+});
+
+describe('restore scope against CLI generations (#2727)', () => {
+  const now = 10_000_000;
+
+  it('a re-attach restores only turns marked into the CLI that is still running', () => {
+    // 15:04 turn written into a CLI that later crashed and was relaunched in
+    // the same worker at 15:09; 10:06 turn written into the relaunched one.
+    const cliStartedAt = now - 60_000;
+    const entries = [
+      entry({ turnId: 'before-relaunch', jsonlPath: '/a.jsonl', markTimeMs: cliStartedAt - 5 * 60_000 }),
+      entry({ turnId: 'live', jsonlPath: '/a.jsonl', markTimeMs: cliStartedAt + 30_000 }),
+    ];
+    expect(selectRestorableBridgeTurns(entries, { currentJsonlPath: '/a.jsonl', nowMs: now, liveCliStartedAtMs: cliStartedAt })
+      .map(e => e.turnId)).toEqual(['live']);
+    // Without a surviving CLI (a cold start relaunches it) the scope is unchanged.
+    expect(selectRestorableBridgeTurns(entries, { currentJsonlPath: '/a.jsonl', nowMs: now })
+      .map(e => e.turnId)).toEqual(['before-relaunch', 'live']);
+  });
+
+  it('keeps a mark inside the start-time read slack', () => {
+    const cliStartedAt = now - 60_000;
+    const entries = [
+      entry({ turnId: 'within', jsonlPath: '/a.jsonl', markTimeMs: cliStartedAt - LIVE_CLI_START_TOLERANCE_MS }),
+      entry({ turnId: 'beyond', jsonlPath: '/a.jsonl', markTimeMs: cliStartedAt - LIVE_CLI_START_TOLERANCE_MS - 1 }),
+    ];
+    expect(selectRestorableBridgeTurns(entries, { currentJsonlPath: '/a.jsonl', nowMs: now, liveCliStartedAtMs: cliStartedAt })
+      .map(e => e.turnId)).toEqual(['within']);
+  });
+
+  it('a new CLI generation in the same worker keeps only marks taken after the old one retired', () => {
+    const retiredAt = 5_000;
+    const entries = [
+      entry({ turnId: 'old', markTimeMs: retiredAt - 1 }),
+      entry({ turnId: 'at-retire', markTimeMs: retiredAt }),
+      entry({ turnId: 'new', markTimeMs: retiredAt + 1 }),
+    ];
+    expect(entriesOfLaterGenerations(entries, retiredAt).map(e => e.turnId)).toEqual(['new']);
   });
 });
 

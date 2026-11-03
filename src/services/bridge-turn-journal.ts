@@ -213,19 +213,36 @@ export function clearBridgeTurnJournal(path: string): void {
   rmSync(path, { force: true });
 }
 
+/** Slack for comparing a mark against a process start read from the OS: Linux
+ *  derives it from whole-second `btime` plus clock ticks, `ps -o lstart=` has
+ *  one-second resolution. A mark is taken right before its input is written
+ *  into a running CLI, seconds after that process started, so the slack only
+ *  ever keeps a borderline entry. */
+export const LIVE_CLI_START_TOLERANCE_MS = 2_000;
+
 /** Pure restore filter: which journal entries may be re-marked on this
  *  worker generation? Scoped to the same transcript file (rotation between
  *  generations makes offset+fingerprint attribution unsafe) and bounded by
- *  age (stale partials are noise). */
+ *  age (stale partials are noise).
+ *
+ *  `liveCliStartedAtMs`: when the worker re-attaches a CLI that survived the
+ *  previous worker, an entry marked before that process started was written
+ *  into an earlier CLI generation. That generation was replaced inside the old
+ *  worker, whose carryover already owned its interrupted input; restoring it
+ *  here would rewind the replay to that old mark and re-deliver everything the
+ *  session answered since (#2727). */
 export function selectRestorableBridgeTurns(
   entries: readonly BridgeTurnJournalEntry[],
-  opts: { currentJsonlPath: string; nowMs?: number; maxAgeMs?: number },
+  opts: { currentJsonlPath: string; nowMs?: number; maxAgeMs?: number; liveCliStartedAtMs?: number },
 ): BridgeTurnJournalEntry[] {
   const nowMs = opts.nowMs ?? Date.now();
   const maxAgeMs = opts.maxAgeMs ?? BRIDGE_TURN_RESTORE_MAX_AGE_MS;
+  const liveCliStartedAtMs = opts.liveCliStartedAtMs;
   return entries
     .filter(entry => entry.jsonlPath === opts.currentJsonlPath
       && nowMs - entry.markTimeMs <= maxAgeMs
+      && (liveCliStartedAtMs === undefined
+        || entry.markTimeMs >= liveCliStartedAtMs - LIVE_CLI_START_TOLERANCE_MS)
       // Only PLAIN Lark IM turns are restorable. Durable turns
       // (dispatchAttempt set) have their own cross-restart recovery owner (the
       // daemon's persisted queuedActivation* write-ahead + receipt
@@ -236,6 +253,19 @@ export function selectRestorableBridgeTurns(
       // journal file left behind by a pre-fix build across an upgrade.
       && entry.dispatchAttempt === undefined)
     .sort((a, b) => a.markTimeMs - b.markTimeMs);
+}
+
+/** Entries that outlive the CLI generation they were written for once a new
+ *  generation starts in the SAME worker process: everything marked at or
+ *  before the old generation was retired. That generation's interrupted input
+ *  is re-delivered by the carryover and marked again under the new one; the
+ *  old entries would otherwise stay on disk until the age cap and be restored
+ *  by the next worker process as if that process had interrupted them (#2727). */
+export function entriesOfLaterGenerations(
+  entries: readonly BridgeTurnJournalEntry[],
+  retiredAtMs: number,
+): BridgeTurnJournalEntry[] {
+  return entries.filter(entry => entry.markTimeMs > retiredAtMs);
 }
 
 /**
