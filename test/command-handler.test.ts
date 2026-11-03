@@ -10087,6 +10087,12 @@ describe('/card — operator / canOperate gate', () => {
 
   it.each([
     { frozen: 'grok', stale: 'opencode', mode: 'unified', managed: true },
+    { frozen: 'traex', stale: 'opencode', mode: 'unified', managed: true },
+    { frozen: 'pi', stale: 'opencode', mode: 'unified', managed: true },
+    { frozen: 'opencode', stale: 'traex', mode: 'unified', managed: false },
+    { frozen: 'opencode', stale: 'pi', mode: 'unified', managed: false },
+    { frozen: undefined, stale: 'traex', mode: 'unified', managed: true },
+    { frozen: undefined, stale: 'pi', mode: 'unified', managed: true },
     { frozen: 'opencode', stale: 'grok', mode: 'unified', managed: false },
     { frozen: undefined, stale: 'grok', mode: 'unified', managed: true },
     { frozen: undefined, stale: undefined, mode: 'unified', managed: true },
