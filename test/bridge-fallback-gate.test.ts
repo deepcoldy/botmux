@@ -548,6 +548,61 @@ describe('shouldSuppressBridgeEmit', () => {
       .toBe(false);
     expect(isBridgeSendCompletionNarration('I have not sent any final reply through botmux yet.'))
       .toBe(false);
+    // Negation contractions that bare \bnot\b misses.
+    expect(isBridgeSendCompletionNarration("I haven't sent the final answer via botmux send yet."))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration("The final answer wasn't sent via botmux because it returned 500."))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('No final answer was sent via botmux; the send failed.'))
+      .toBe(false);
+    // A reported delivery failure is an alert, never a successful-delivery status.
+    expect(isBridgeSendCompletionNarration('已通过 botmux 发出最终结论，但飞书返回 400，这条没送达，请立即介入。'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('I sent the final answer via botmux send. Note: it failed with 500.'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('最终答复通过 botmux 发送失败，被对方服务拒绝了。'))
+      .toBe(false);
+    // Length cap: a long self-report-shaped answer is treated as a real answer.
+    const long = '已通过 botmux 发出最终结论。' + '这是对后继问题的补充说明'.repeat(20);
+    expect(long.length).toBeGreaterThan(180);
+    expect(isBridgeSendCompletionNarration(long)).toBe(false);
+  });
+
+  it('fails open (emits) when a folded predecessor final coexists with a failure/negation report', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 220,
+      sessionId: 'session-source',
+      turnId: 'turn-original',
+      responseKind: 'final',
+      deliveryKind: 'current_session_send',
+      targetChatId: 'oc_source',
+      contentLength: 42,
+    };
+    const folded = (finalText: string) => ({
+      markTimeMs: 100,
+      isLocal: false,
+      sessionId: 'session-source',
+      turnId: 'turn-queued',
+      supersededTurns: [{ turnId: 'turn-original' }],
+      chatId: 'oc_source',
+      rootMessageId: 'om_source_root',
+      finalText,
+    });
+    // Even with a proven folded predecessor final, a failed-send / undelivered
+    // alert must reach the user rather than be swallowed as a success status.
+    expect(shouldSuppressBridgeEmit(
+      folded('已通过 botmux 发出最终结论，但飞书返回 400，这条没送达，请立即介入。'),
+      undefined, [marker], false)).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      folded('I sent the final answer via botmux send. Note: it failed with 500.'),
+      undefined, [marker], false)).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      folded("I haven't sent the final answer via botmux send yet."),
+      undefined, [marker], false)).toBe(false);
+    // The genuine post-send status line is still suppressed in the same folded setup.
+    expect(shouldSuppressBridgeEmit(
+      folded('已通过 botmux 发出最终结论，并已把只读 DB 查询部分交接给 Celebi。'),
+      undefined, [marker], false)).toBe(true);
   });
 
   it('suppresses send-completion narration only for a proven superseded predecessor final', () => {

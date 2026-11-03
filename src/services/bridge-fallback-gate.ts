@@ -69,6 +69,20 @@ const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
  *  line. A self-report beyond this length is treated as a real answer. */
 const SEND_COMPLETION_NARRATION_MAX_CHARS = 180;
 
+/** A negation — including English contractions the bare `\bnot\b` misses
+ *  (haven't / wasn't / …) and Chinese 没/未 — means the line is NOT a
+ *  successful-delivery self-report. */
+const SEND_COMPLETION_NEGATION = /\b(?:not|no|never|none|without)\b|n't|未|没|尚未|还没|并未/i;
+
+/** A reported delivery failure must always fail open: a line that says the
+ *  send errored / was rejected / returned a 4xx-5xx / 未送达 is an alert, not
+ *  a harmless "already sent" status — suppressing it would hide the failure. */
+const SEND_COMPLETION_FAILURE = new RegExp([
+  '\\b(?:fail(?:ed|s|ure)?|failure|error|errored|denied|rejected|refused|undelivered|bounced|exception)\\b',
+  '失败|报错|出错|异常|被拒|拒绝|未送达|没送达|无法送达|送达失败|投递失败|发送失败',
+  '(?:返回|returned|status|http|code)[^0-9]{0,8}[45]\\d{2}',
+].join('|'), 'i');
+
 export const BRIDGE_NOTHING_TO_SEND_SENTINEL = 'BOTMUX_NOTHING_TO_SEND';
 /** Superseded token name. Instructions no longer teach it, but the matcher
  *  below still accepts it: during a rollout (and after a restart that restores
@@ -266,7 +280,10 @@ export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'response
  *  send."). It is deliberately strict — a short answer merely *about* botmux
  *  must not match:
  *   - ≤180 visible chars and literally mentions `botmux`;
- *   - a denial ("not / never / 未 / 没有 / 尚未 / …") rules it out;
+ *   - a denial ("not / no / never / -n't contraction / 未 / 没 / 尚未 / …")
+ *     or a reported delivery failure (failed/error/denied/…、失败/报错/未送达、
+ *     a 4xx-5xx status) rules it out and fails open — a failed-send alert must
+ *     never be swallowed as a successful-delivery status;
  *   - a final-meaning word (最终/结论/答复/回复/final/answer/reply);
  *   - an explicit-send construction placing botmux between the delivery verb
  *     and its target — Chinese 已/已经 … botmux … 发出/发送/投递/送达, or
@@ -279,7 +296,8 @@ export function isBridgeSendCompletionNarration(finalText: string | undefined): 
   const visible = normaliseForFingerprint(bridgePostText(finalText, false));
   if (!visible || visible.length > SEND_COMPLETION_NARRATION_MAX_CHARS) return false;
   if (!visible.toLowerCase().includes('botmux')) return false;
-  if (/\b(?:not|never|without)\b|未|没有|尚未|还没|并未/i.test(visible)) return false;
+  // Fail open on any negation or delivery-failure report.
+  if (SEND_COMPLETION_NEGATION.test(visible) || SEND_COMPLETION_FAILURE.test(visible)) return false;
   const mentionsFinal = /(?:最终|结论|答复|回复|final(?:\s+(?:answer|reply|response))?|answer|reply)/i
     .test(visible);
   const mentionsExplicitSend = /(?:已|已经).{0,12}botmux.{0,16}(?:发出|发送|投递|送达)/i
