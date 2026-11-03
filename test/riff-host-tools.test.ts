@@ -407,3 +407,104 @@ describe('Riff host boundary', () => {
     expect(JSON.parse(readFileSync(join(dir, readdirSync(dir)[0]!), 'utf8'))).toEqual(b);
   });
 });
+
+describe('Riff host client failure reporting', () => {
+  const token = 'T'.repeat(43);
+  const binding = (url: string): RiffHostBinding => ({ url, token, sessionId: 'session-1', turnId: 'turn-1' });
+  /** A stand-in for whatever answers at the configured endpoint (gateway or worker).
+   * Only requests carrying this test's token are answered and recorded, so a
+   * stray client hitting a reused loopback port cannot skew the counts. */
+  async function endpoint(answer: (req: { method?: string; url?: string }) => { status: number; body?: string; type?: string }) {
+    const seen: string[] = [], foreign: string[] = [];
+    const s = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        if (req.headers['x-riff-host-token'] !== token) {
+          foreign.push(`${req.method} ${req.url}`);
+          res.writeHead(403); res.end(); return;
+        }
+        seen.push(req.method!);
+        const { status, body, type = 'text/plain' } = answer(req);
+        res.writeHead(status, { 'content-type': type });
+        res.end(body);
+      });
+    });
+    servers.push(s);
+    await new Promise<void>(resolve => s.listen(0, '127.0.0.1', resolve));
+    return { url: `http://127.0.0.1:${(s.address() as { port: number }).port}${RIFF_HOST_TOOLS_ROUTE}`, seen, foreign };
+  }
+  const failure = (promise: Promise<unknown>) => promise.then(() => { throw new Error('expected a failure'); }, (e: Error) => e.message);
+
+  it('reports a plain-text gateway 502 by status and body, with the endpoint configuration to check', async () => {
+    const gateway = await endpoint(() => ({ status: 502, body: 'Bad Gateway' }));
+    const message = await failure(callRiffHostTool(binding(gateway.url), request()));
+    expect(message).toMatch(/^riff_host_http_502: Bad Gateway — /);
+    expect(message).toContain('riff.hostToolsUrl');
+    expect(message).not.toContain('JSON');
+    // An HTTP answer is definitive: no GET reconciliation, the command was not resent.
+    expect(gateway.seen, `foreign: ${gateway.foreign.join(', ')}`).toEqual(['POST']);
+  });
+
+  it.each([502, 204])('reports an empty %i answer instead of a parse error or a crash', async status => {
+    const gateway = await endpoint(() => ({ status }));
+    const message = await failure(callRiffHostTool(binding(gateway.url), request()));
+    const head = status === 502 ? 'riff_host_http_502' : 'riff_host_response_invalid (HTTP 204)';
+    expect(message.startsWith(`${head}: <empty body> — `), message).toBe(true);
+    expect(message).toContain('riff.hostToolsUrl');
+  });
+
+  it('reports a non-JSON 200 page as an invalid response from something other than the worker', async () => {
+    const gateway = await endpoint(() => ({ status: 200, type: 'text/html', body: '<!doctype html><html><head><title>Sign in</title></head><body>Login required</body></html>' }));
+    const message = await failure(callRiffHostTool(binding(gateway.url), request()));
+    expect(message).toMatch(/^riff_host_response_invalid \(HTTP 200\): Sign in Login required — /);
+    expect(message).toContain('riff.hostToolsUrl');
+  });
+
+  it('masks the token, strips control characters and markup, and truncates a gateway page', async () => {
+    const page = `<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>x-riff-host-token: ${token}\u0007\u202e\u001b[31m ${'filler '.repeat(200)}</body></html>`;
+    const message = await failure(callRiffHostTool(binding('http://gateway.example/api/riff-host-tools'), request(),
+      async () => new Response(page, { status: 502 })));
+    const excerpt = message.slice('riff_host_http_502: '.length, message.indexOf(' — '));
+    expect(excerpt.startsWith('502 Bad Gateway x-riff-host-token: ***'), excerpt).toBe(true);
+    expect(message).not.toContain(token);
+    expect(message).not.toMatch(/[\u0000-\u001f\u007f\u202e]/);
+    expect(excerpt.endsWith('…')).toBe(true);
+    expect(Array.from(excerpt).length).toBeLessThanOrEqual(121);
+  });
+
+  it('keeps worker JSON errors as worker errors with their HTTP status and no reachability hint', async () => {
+    const gateway = new RiffHostTools(vi.fn()), url = await listen(gateway), ctx = context();
+    const old = gateway.bind(url, ctx);
+    gateway.bind(url, { ...ctx, turnId: 'turn-2' });
+    const message = await failure(callRiffHostTool(old, request()));
+    expect(message).toBe('riff_host_http_403: riff_host_turn_unavailable');
+  });
+
+  it('treats a JSON body on a gateway status as a gateway answer', async () => {
+    const message = await failure(callRiffHostTool(binding('http://gateway.example/api/riff-host-tools'), request(),
+      async () => Response.json({ error: 'no healthy upstream' }, { status: 503 })));
+    expect(message).toMatch(/^riff_host_http_503: \{"error":"no healthy upstream"\} — /);
+    expect(message).toContain('riff.hostToolsUrl');
+  });
+
+  it('names the transport error code without the private address when the endpoint never answers', async () => {
+    const closed = createServer();
+    await new Promise<void>(resolve => closed.listen(0, '127.0.0.1', resolve));
+    const port = (closed.address() as { port: number }).port;
+    await new Promise<void>(resolve => closed.close(() => resolve()));
+    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}/api/riff-host-tools`), request()));
+    expect(message).toMatch(/^riff_host_transport_unknown \(ECONNREFUSED\); do not repeat automatically — /);
+    expect(message).toContain('riff.hostToolsUrl');
+    expect(message).not.toContain(String(port));
+  });
+
+  it('still completes a normal running → completed exchange through the direct client', async () => {
+    let polls = 0;
+    const worker = await endpoint(req => req.method === 'POST'
+      ? { status: 202, type: 'application/json', body: JSON.stringify({ state: 'running' }) }
+      : ++polls < 2 ? { status: 202, type: 'application/json', body: JSON.stringify({ state: 'running' }) }
+        : { status: 200, type: 'application/json', body: JSON.stringify({ state: 'completed', result: { exitCode: 0, stdout: 'sent', stderr: '' } }) });
+    expect(await callRiffHostTool(binding(worker.url), request())).toEqual({ exitCode: 0, stdout: 'sent', stderr: '' });
+    expect(worker.seen, `foreign: ${worker.foreign.join(', ')}`).toEqual(['POST', 'GET', 'GET']);
+  });
+});
