@@ -81,7 +81,7 @@ const read = () => resolveDispatchUser({ dataDir, secret, appId: 'cli_target', c
 // Run the actual worker screen-ready gate against a real transcript queue.
 // Stop at its release boundary: the remainder only schedules UI/input work.
 const workerSource = ts.createSourceFile('worker.ts', readFileSync('src/worker.ts', 'utf8'), ts.ScriptTarget.Latest, true);
-const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'traexFirstPromptViewportRejects', 'markPromptReady'].map(name => {
+const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'traexFirstPromptViewportRejects', 'nativeSessionForkPending', 'holdForNativeSessionFork', 'markPromptReady'].map(name => {
   const node = workerSource.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
   if (!node) throw new Error(`missing worker function ${name}`);
   return node.getText(workerSource);

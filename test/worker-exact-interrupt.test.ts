@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { TraexAutoModelController } from '../src/services/traex-auto-model.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 // Execute the actual worker handler with a controlled backend. Importing the
 // whole worker would start its IPC/runtime; a copy of the handler would miss
@@ -36,6 +37,7 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc') {
     sendCriticalControlKey: controlKey,
     sendTermActionOnce: control,
   });
+  context.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', context);
   runInContext(handler, context);
   const interrupt = () => runInContext("handleExactTurnInterrupt('request', 'stop')", context) as Promise<void>;
   const replay = () => { inflightInputs.onCliExit(); return inflightInputs.takeCarryOver().map(item => item.turnId); };
