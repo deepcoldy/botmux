@@ -12,10 +12,13 @@ try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); }
 const realCat = execFileSync('which', ['cat'], { encoding: 'utf8' }).trim();
 const originalPath = process.env.PATH;
 
-type CatKind = 'uutils' | 'system';
+type CatKind = 'uutils' | 'busybox' | 'system';
 const CATS: ReadonlyArray<readonly [string, CatKind]> = [
   // uutils 0.8.0: `cat` (with or without -u) holds short pipe writes until EOF.
   ['a uutils cat that holds output until EOF', 'uutils'],
+  // busybox: same buffering, but --version is rejected with the banner on
+  // stderr, so detection has to read stderr to see it.
+  ['a busybox cat that holds output until EOF', 'busybox'],
   ['the system cat', 'system'],
 ];
 
@@ -41,20 +44,28 @@ afterEach(() => {
 });
 
 /** A private dir whose `bin` comes first on the returned PATH. With `uutils`
- *  it holds a `cat` that reports itself as uutils and, like uutils 0.8.0,
- *  emits nothing until stdin closes. Its path has only plain characters, so
+ *  or `busybox` it holds a `cat` that identifies itself the way that
+ *  implementation does and, like both of them on a socket stdin, emits nothing
+ *  until stdin closes. Its path has only plain characters, so
  *  pipePaneShellCommand needs no tmux format escaping and runs under sh as is. */
 function fixture(cat: CatKind): { root: string; bin: string; path: string } {
   root = mkdtempSync('/tmp/bmx-stream-');
   const bin = join(root, 'bin'); mkdirSync(bin);
-  if (cat === 'uutils') {
+  if (cat !== 'system') {
     const bufferedCat = join(root, 'buffered-cat.mjs');
     writeFileSync(bufferedCat, `const chunks = [];
 process.stdin.on('data', chunk => chunks.push(chunk));
 process.stdin.on('end', () => process.stdout.write(Buffer.concat(chunks)));
 `);
+    // A real busybox rejects --version outright; its banner goes to stderr and
+    // the exit status is 1 (measured on BusyBox v1.35.0).
+    const version = cat === 'uutils'
+      ? `echo 'cat (uutils coreutils) 0.8.0'; exit 0`
+      : `echo "cat: unrecognized option '--version'" >&2
+  echo 'BusyBox v1.35.0 (Debian 1:1.35.0-4+b3) multi-call binary.' >&2
+  exit 1`;
     writeFileSync(join(bin, 'cat'), `#!/bin/sh
-if [ "$1" = --version ]; then echo 'cat (uutils coreutils) 0.8.0'; exit 0; fi
+if [ "$1" = --version ]; then ${version}; fi
 if [ "$#" -gt 0 ]; then exec ${quote(realCat)} "$@"; fi
 exec ${quote(tsRunnerPrefix().command)} ${quote(bufferedCat)}
 `, { mode: 0o700 });
