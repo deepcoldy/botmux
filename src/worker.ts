@@ -451,6 +451,8 @@ import {
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
+import { waitForProcessQuiescence } from './services/process-quiescence.js';
+import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
@@ -27169,7 +27171,7 @@ function stopOwnedSessionScope(reason: string): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause; afterQuiesceBeforeRespawn?: () => void } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause; afterQuiesceBeforeRespawn?: () => void; preserveSandboxUntilMaintenance?: boolean } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
     codexAutoUpgrade.reject?.(new Error(reason));
@@ -27219,6 +27221,9 @@ async function restartCliProcess(
       // resume this exact thread on its fresh port.
       const rpcThreadId = remoteThreadId;
       const restartingBackend = backend;
+      const retiringCliPid = restartingBackend?.getChildPid?.();
+      const deferredSandboxCleanup = opts.preserveSandboxUntilMaintenance ? sandboxCleanup : null;
+      if (opts.preserveSandboxUntilMaintenance) sandboxCleanup = null;
       if (restartingBackend) intentionalRestartBackend = restartingBackend;
       const teardown = restartingBackend?.destroySession?.();
       let teardownOutcome: RestartTeardownOutcome = { kind: 'absent' };
@@ -27268,11 +27273,21 @@ async function restartCliProcess(
         preservePending: opts.preservePending,
         preservePolicyCapability: true,
       });
-      // Destructive transcript maintenance must happen only after destroy+kill:
-      // otherwise Claude may append through its old fd after our rename and the
-      // append lands on an unlinked inode. Throwing here aborts the replacement;
-      // the queued continuation remains fenced and is rejected by worker exit.
-      opts.afterQuiesceBeforeRespawn?.();
+      // Destructive transcript maintenance must happen only after destroy+kill
+      // AND positive process death: node-pty kill() returns before its child has
+      // necessarily stopped writing. The scratch tree is deliberately retained
+      // until maintenance has consumed the active merged-view transcript.
+      if (opts.afterQuiesceBeforeRespawn) {
+        await waitForProcessQuiescence(retiringCliPid ?? undefined, {
+          now: () => Date.now(),
+          wait: ms => delay(ms),
+          provablyGone: pid => !pidNotProvablyGone(pid),
+        });
+        opts.afterQuiesceBeforeRespawn();
+      }
+      if (deferredSandboxCleanup) {
+        try { deferredSandboxCleanup(); } finally { sandboxTeardownDone = true; }
+      }
       // A normal restart cannot observe activity from the retired process.
       // Only capacity-model rotation carries that waiting latch forward.
       traexAutoModelController?.noteProcessExited(opts.restartCause === 'traex-auto-model');
@@ -30934,6 +30949,7 @@ process.on('message', async (raw: unknown) => {
               preservePending: true,
               skipRestartBudget: true,
               exactResumeSessionId: purgeTarget.sessionId,
+              preserveSandboxUntilMaintenance: true,
               afterQuiesceBeforeRespawn: () => {
                 const purgedFiles = purgeUndersizedImages(purgeTarget.jsonlPath, {
                   // <claudeDataDir>/projects/<cwd-key>/<sid>.jsonl. Pin the
