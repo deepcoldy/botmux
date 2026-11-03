@@ -970,3 +970,44 @@ describe('dispatch outcome classification (dispatchDidRun)', () => {
     expect(dispatchDidRun({ ok: false, errorCode: 'wait_timeout' })).toBe(false);
   });
 });
+
+describe('durable virtual async webhook service contract', () => {
+  const setup = async () => {
+    await seedConnector({ target: { mode: 'dynamic', kind: 'turn', botId: 'app1', allowChats: [] } });
+    proxyToDaemon.mockImplementation(async (_bot: string, _path: string, init: any) => {
+      const request = JSON.parse(init.body);
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'queued',
+        triggerId: 'original-trigger', target: { kind: 'turn', sessionId: 'original-session' },
+        idempotencyKey: request.options.idempotencyKey }) };
+    });
+  };
+  it('forwards a stable connector-scoped durable lease, preserving full references on retry', async () => {
+    await setup();
+    const a = await post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'stable' }, '?async=1&durable=1');
+    const b = await post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'stable' }, '?async=1&durable=1');
+    expect(a.body).toMatchObject({ durableAsync: true, triggerId: 'original-trigger', target: { sessionId: 'original-session' } });
+    expect(b.body.target.sessionId).toBe('original-session');
+    expect(proxyToDaemon).toHaveBeenCalledTimes(2); // daemon, not edge memory, owns retries
+    const first = JSON.parse(proxyToDaemon.mock.calls[0][2].body);
+    const second = JSON.parse(proxyToDaemon.mock.calls[1][2].body);
+    expect(first).toEqual(second);
+    expect(first.options.idempotencyKey).toMatch(/^whapi:[a-f0-9]{64}$/);
+    expect(first.source).toEqual({ type: 'webhook', connectorId: 'conn_idem' });
+  });
+  it('checks capabilities with the connector credential before a caller submits', async () => {
+    await setup();
+    const response = await fetch(baseUrl + '/webhook/conn_idem?capabilities=1', {
+      headers: { Authorization: 'Bearer tok_secret_value' },
+    });
+    expect(await response.json()).toMatchObject({ ok: true, capabilities: { durableAsync: true } });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+  it('rejects missing keys and injected chat/session routing without dispatch', async () => {
+    await setup();
+    for (const [body, headers] of [[MR_EVENT, {}], [{ ...MR_EVENT, sessionId: 'another-session' }, { 'Idempotency-Key': 'k' }]] as const) {
+      const response = await post('conn_idem', body, headers, '?async=1&durable=1');
+      expect(response.status).toBe(400);
+    }
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+});
