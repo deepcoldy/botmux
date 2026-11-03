@@ -17,7 +17,7 @@ const handler = transpileModule(source.slice(start, end), {
   compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
 }).outputText;
 
-function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc') {
+function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'codex') {
   const inflightInputs = new InflightInputTracker();
   inflightInputs.onWrite({ content: 'cancelled task', turnId: 'stop' });
   inflightInputs.onWrite({ content: 'next task', turnId: 'next' });
@@ -25,21 +25,23 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc') {
   const send = vi.fn();
   const control = vi.fn(async () => delivered);
   const controlKey = vi.fn(async (_key: string, action: () => unknown) => action());
+  const retireDoubaoBridgeTurnOnInterrupt = vi.fn(() => false);
   const context = createContext({
-    currentBotmuxTurnId: 'stop', backend: {}, lastInitConfig: { cliId: 'codex' }, effectiveBackendType: 'pty', isCodexAppCliId,
+    currentBotmuxTurnId: 'stop', currentBotmuxDispatchAttempt: undefined, backend: {}, lastInitConfig: { cliId }, effectiveBackendType: 'pty', isCodexAppCliId,
     codexCliEffortOperation: undefined, cliLifetimeNonce: 1,
     traexAutoModelController: null,
-    cliAdapter: interruptKey ? { interruptKey } : undefined,
+    cliAdapter: interruptKey ? { id: cliId, interruptKey } : undefined,
     inflightInputs, pendingMessages, send, log: vi.fn(), tuiPromptBlocking: true,
     flushPending: vi.fn(), scheduleOneShotAfterAction: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
     sendCriticalControlKey: controlKey,
     sendTermActionOnce: control,
+    retireDoubaoBridgeTurnOnInterrupt,
   });
   runInContext(handler, context);
   const interrupt = () => runInContext("handleExactTurnInterrupt('request', 'stop')", context) as Promise<void>;
   const replay = () => { inflightInputs.onCliExit(); return inflightInputs.takeCarryOver().map(item => item.turnId); };
-  return { context, pendingMessages, send, control, controlKey, interrupt, replay, inflightInputs };
+  return { context, pendingMessages, send, control, controlKey, retireDoubaoBridgeTurnOnInterrupt, interrupt, replay, inflightInputs };
 }
 
 describe('worker exact interrupt acknowledgement and crash replay', () => {
@@ -110,5 +112,27 @@ describe('worker exact interrupt acknowledgement and crash replay', () => {
     await h.interrupt();
     expect(controller.currentTurnId()).toBe(delivered ? undefined : 'stop');
     expect(h.pendingMessages.map(item => item.turnId)).toEqual(delivered ? ['next'] : ['stop', 'next']);
+  });
+
+  it('retires the doubao structured-bridge mark only when the interrupt is delivered', async () => {
+    const h = harness(true, 'esc', 'doubao');
+    await h.interrupt();
+    // Doubao writes no trajectory record after Esc; without this retirement the
+    // mark stays open forever and the next fast turn misattributes its answer.
+    expect(h.retireDoubaoBridgeTurnOnInterrupt).toHaveBeenCalledWith('stop', h.context.currentBotmuxDispatchAttempt);
+  });
+
+  it('does not retire any bridge mark when delivery fails', async () => {
+    const h = harness(false, 'esc', 'doubao');
+    await h.interrupt();
+    expect(h.retireDoubaoBridgeTurnOnInterrupt).not.toHaveBeenCalled();
+  });
+
+  it('calls the shared retirement helper for non-doubao CLIs too (the helper itself gates on cliId)', async () => {
+    const h = harness(true, undefined, 'codex');
+    await h.interrupt();
+    expect(h.retireDoubaoBridgeTurnOnInterrupt).toHaveBeenCalledWith('stop', h.context.currentBotmuxDispatchAttempt);
+    // The shared helper itself gates on cliId; the handler still calls it once.
+    expect(h.retireDoubaoBridgeTurnOnInterrupt.mock.results[0]!.value).toBe(false);
   });
 });

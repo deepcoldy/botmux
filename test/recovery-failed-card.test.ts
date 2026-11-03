@@ -114,6 +114,13 @@ describe('re-delivery content and permission', () => {
     expect(userMessageExcerpt(once)).toBe('@Bot 问题');
   });
 
+  // #2716: bare（transcript + solo）续轮没有 <user_message> 壳，恢复失败卡片
+  // 走标签剥离兜底时，追加在正文后的格式提示块（含块体）不能出现在任务行。
+  it('bare 续轮的 <botmux_formatting> 块体不进恢复卡片任务行', () => {
+    const bare = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    expect(userMessageExcerpt(bare)).toBe('继续看一下这个 PR');
+  });
+
   it('allows the sender (while allowed to talk) and admins only', () => {
     const base = { operatorOpenId: 'ou_asker', initiatorOpenId: 'ou_asker', operatorIsAdmin: false, operatorCanTalk: true };
     expect(recoveryRetryPermitted(base)).toBe(true);

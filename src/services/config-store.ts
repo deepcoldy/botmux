@@ -1,3 +1,4 @@
+import { withManagedDirectoriesAsync } from './managed-directory-retention.js';
 /**
  * 共享的 bots.json 读改写原语：跨进程文件锁 + 原子 rename。
  * oncall-store 与 grant-store 共用，保证对同一 bots.json 的并发写不丢更新。
@@ -49,8 +50,10 @@ export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<vo
   assertNextBotsGenerationContent(previous, raw);
   const tmp = path + '.tmp.' + process.pid;
   // bots.json 含 appSecret —— 临时文件即以 0o600 写入，rename 后保持私有权限。
-  await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
-  await fsp.rename(tmp, path);
+  await withManagedDirectoriesAsync(raw, async () => {
+    await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
+    await fsp.rename(tmp, path);
+  }, undefined, path);
 }
 
 export function findEntryIndex(raw: any[], larkAppId: string): number {

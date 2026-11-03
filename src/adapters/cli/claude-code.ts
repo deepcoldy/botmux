@@ -495,6 +495,7 @@ const BOTMUX_ENVELOPE_TAGS = new Set([
   'role',
   'summary_memory',
   'botmux_reminder',
+  'botmux_formatting',
   'whiteboard',
   'chat_context_policy',
   'chat_context',

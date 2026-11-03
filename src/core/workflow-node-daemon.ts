@@ -62,6 +62,7 @@ import type { V3HandoffIdentityTool } from '../workflows/v3/run-envelope.js';
 import { createV3BotHandoffExecutor, readV3HandoffTopics, type V3SelfTurnRequest } from '../im/lark/v3-bot-handoff-executor.js';
 import { createV3NodeCardSync } from '../im/lark/v3-node-card-sync.js';
 import { buildV3NodeReportCard } from '../im/lark/v3-node-card.js';
+import type { WorkflowSidebarEntryLink } from '../im/lark/workflow-sidebar-entry.js';
 
 export interface WorkflowNodeDaemonDeps {
   selfLarkAppId(): string;
@@ -120,6 +121,9 @@ export interface WorkflowNodeDaemonDeps {
   loadRun(runDir: string): { dag: V3Dag; nodeExecutor?: 'bot'; chatId?: string; title: string } | undefined;
   drive(runId: string): void;
   botName(larkAppId: string): string;
+  /** §11: a run's「工作流 ›」sidebar entry, keyed by its main bot; undefined
+   *  when this host cannot name its Dashboard address (no entry on cards). */
+  workflowEntry?(mainLarkAppId: string, runId: string): WorkflowSidebarEntryLink | undefined;
   warn(message: string): void;
   /** Publish a turn's tool identity (the daemon's per-turn preparation,
    *  which resolves a signed delegation for it). */
@@ -312,6 +316,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       }, deps.hostSecret());
       if (result.status >= 400) throw new Error(`stop failed: ${String(result.body.error ?? result.status)}`);
     },
+    workflowEntry: (runId) => deps.workflowEntry?.(deps.selfLarkAppId(), runId),
     startSelfTurn: async (input: V3SelfTurnRequest) => {
       const runDir = input.runDir;
       const inputs = readWorkflowAttemptInputs(runDir, input.marker.attemptId) ?? input.inputs;
@@ -350,6 +355,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     acceptanceUnknownSince: v3AcceptanceProbeUnknownSince,
     activity: readWorkflowHandoffActivity,
     topicCards: readV3HandoffTopics,
+    workflowEntry: (runId) => deps.workflowEntry?.(deps.selfLarkAppId(), runId),
   });
 
   function notify(
@@ -450,10 +456,12 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         }
       },
       postReportCard: async (binding, input) => {
+        const entry = deps.workflowEntry?.(binding.sourceLarkAppId, binding.workflow.runId);
         await deps.replyCard(binding.publishRoot, buildV3NodeReportCard({
           nodeId: binding.workflow.nodeId,
           botName: deps.botName(deps.selfLarkAppId()),
           ...input,
+          ...(entry ? { entry } : {}),
         }));
       },
     }),

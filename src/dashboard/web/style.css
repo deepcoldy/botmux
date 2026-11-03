@@ -35499,3 +35499,23 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .sessions-page .sessions-filter-chips .sessions-filter-clear:hover {
   text-decoration: underline;
 }
+
+/* ── 工作流侧边栏（飞书侧栏 350–800px，设计 2026-11-03 §11.4） ── */
+.wfs-page { padding: 12px 12px 24px; display: flex; flex-direction: column; gap: 10px; max-width: 800px; margin: 0 auto; }
+/* Flex items default to min-width:auto and would grow to the SVG's width, so
+   the measured container (and the layout fitted to it) could never shrink. */
+.wfs-page > * { min-width: 0; }
+.wfs-head h1 { margin: 0; font-size: 16px; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wfs-sub { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .7rem; margin-top: 4px; font-size: 12px; color: var(--muted); }
+.wfs-sub a, .wfs-landing a { color: var(--accent-strong, var(--accent)); text-decoration: none; }
+.wfs-graph { overflow-x: auto; overflow-y: hidden; }
+.wfs-graph svg { display: block; }
+.wfs-graph-card .v3r-legend { gap: .6rem; padding: .4rem .7rem; }
+.wfs-detail {
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: .75rem; background: var(--surface);
+}
+.wfs-detail-head { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .35rem; }
+.wfs-detail .v3r-nodeid { font-size: 14px; }
+.wfs-hint { margin: 0; font-size: 12px; }
+.wfs-denied { margin: 48px auto; max-width: 420px; text-align: center; color: var(--muted); font-size: 14px; line-height: 1.7; }

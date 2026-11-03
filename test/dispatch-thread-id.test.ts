@@ -116,6 +116,7 @@ function harness(mode: Mode, options: {
     DISPATCH_REPORT_REGISTER_ROUTE: '/dispatch-report/register',
     DISPATCH_USER_DELIVERY_ROUTE: '/api/dispatch-user/deliver',
     trySyncProjectDispatch: vi.fn(async () => true),
+    syncDispatchTaskTreeAfterDispatch: vi.fn(async () => {}),
     __import: async (path: string) => {
       if (path === './bot-registry.js') return {
         getBot: () => ({ config: { topicUnavailablePolicy: 'legacy' } }),

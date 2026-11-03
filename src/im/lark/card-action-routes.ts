@@ -28,7 +28,7 @@ import {
   handleV3BlockedAction,
   isV3BlockedAction,
 } from './v3-blocked-card-handler.js';
-import type { V3BlockedActionValue, V3AskAnswerActionValue } from './v3-blocked-card.js';
+import type { V3BlockedActionValue, V3AskAnswerActionValue, V3ReassignActionValue } from './v3-blocked-card.js';
 import {
   handleV3LoopGrantAction,
   isV3LoopGrantAction,
@@ -151,10 +151,11 @@ export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
     matches: isV3BlockedAction,
     run: ctx => ctx.deps.v3BlockedDeps
       && handleV3BlockedAction(
-        ctx.value as unknown as V3BlockedActionValue | V3AskAnswerActionValue,
+        ctx.value as unknown as V3BlockedActionValue | V3AskAnswerActionValue | V3ReassignActionValue,
         ctx.operatorOpenId,
         ctx.deps.v3BlockedDeps,
         ctx.formValue as any,
+        ctx.larkAppId,
       ),
   },
   {

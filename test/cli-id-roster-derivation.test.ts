@@ -76,6 +76,8 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // MiniMax Code loads native skills from its persistent data directory.
       minimax: 'global',
       zcode: 'global',
+      // Doubao CLI discovers user skills under ~/Doubao/skills.
+      doubao: 'global',
     };
     // Two-way key equality. `Record<CliId, …>` looks like tsc enforces
     // exhaustiveness, but this file lives in test/ and tsconfig only includes
