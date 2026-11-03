@@ -6,6 +6,7 @@ import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
 import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
 import {
   protectedMcpContainmentActive,
+  protectedMcpHomeDenyPaths,
   protectedMcpHomePaths,
   protectedMcpRedactedEnvKeys,
 } from './core/protected-mcp-capabilities.js';
@@ -20884,12 +20885,8 @@ async function spawnCli(
       // mandatory confinement until the host explicitly removes/migrates it.
       || hostEntryExistsNoFollow(join(root, DEVICE_CREDENTIAL_FILE)));
   const configuredProtectedHomePaths = protectedMcpHomePaths(hostHomeDir, cfg.protectedMcpPolicy);
-  // Canonicalize only the parent chain. The protected leaf itself may be a
-  // hostile symlink and must remain the lexical mount/profile target.
-  const canonicalDenyNoFollow = (path: string): string =>
-    join(canonicalPathNearest(dirname(path)), basename(path));
   const protectedPathsForHome = (home: string): string[] =>
-    protectedMcpHomePaths(home, cfg.protectedMcpPolicy).map(canonicalDenyNoFollow);
+    protectedMcpHomeDenyPaths(home, cfg.protectedMcpPolicy);
   const existingProtectedPathVariants = (paths: readonly string[]): string[] => {
     const variants = new Set<string>();
     for (const path of paths) {

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   clearWorkerConfig,
+  configuredProtectedMcpEnvKeys,
   GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
@@ -187,6 +188,46 @@ describe('global dashboard config', () => {
     invalidateGlobalConfigCache();
 
     expect(readGlobalConfig().protectedMcpCapabilities).toBeUndefined();
+  });
+
+  it('drops protected MCP capability records whose enabled flag is not boolean', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.string-enabled.v1': {
+          enabled: 'true',
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'FIXTURE_STRING_SECRET' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.numeric-enabled.v1': {
+          enabled: 1,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'FIXTURE_NUMERIC_SECRET' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.boolean-enabled.v1': {
+          enabled: false,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'FIXTURE_BOOLEAN_SECRET' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.boolean-enabled.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'env', name: 'FIXTURE_BOOLEAN_SECRET' },
+        containmentProfile: 'local-stdio-secret-v1',
+      },
+    });
+    expect(configuredProtectedMcpEnvKeys()).toEqual([
+      'FIXTURE_STRING_SECRET',
+      'FIXTURE_NUMERIC_SECRET',
+      'FIXTURE_BOOLEAN_SECRET',
+    ]);
   });
 
   it('keeps matching protected MCP isolation active while the capability is disabled', () => {

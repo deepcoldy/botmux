@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  captureProtectedMcpDaemonEnvironment,
   prepareProtectedMcpWorkerProvisioning,
   protectedMcpContainmentConfigured,
   serveProtectedMcpSecrets,
@@ -33,6 +34,52 @@ const contained = parseSandboxNetworkPolicy({
 });
 
 describe('protected MCP worker provisioning', () => {
+  it('captures configured secrets once and removes every protected env name from the daemon', () => {
+    const env: NodeJS.ProcessEnv = {
+      FIXTURE_SECRET: ' daemon-secret ',
+      FIXTURE_TOKEN: 'daemon-token',
+      BOTMUX_PROTECTED_SECRET_FD: '3',
+      UNRELATED: 'visible',
+    };
+    const captured = captureProtectedMcpDaemonEnvironment(
+      { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
+      env,
+    );
+
+    expect(captured.get('FIXTURE_SECRET')).toBe('daemon-secret');
+    for (const key of ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'BOTMUX_PROTECTED_SECRET_FD']) {
+      expect(env[key], key).toBeUndefined();
+    }
+    expect(env.UNRELATED).toBe('visible');
+
+    const provisioning = prepareProtectedMcpWorkerProvisioning(
+      ['fixture-plugin'],
+      captured,
+      { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
+      true,
+    );
+    expect(provisioning.secrets.get('fixture.secret.v1')).toBe('daemon-secret');
+  });
+
+  it('globally redacts configured secret env names without widening Home paths for unmatched plugins', () => {
+    const provisioning = prepareProtectedMcpWorkerProvisioning(
+      [],
+      {
+        FIXTURE_SECRET: 'must-stay-daemon-only',
+        FIXTURE_TOKEN: 'must-also-stay-daemon-only',
+      },
+      { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
+      true,
+    );
+
+    expect(provisioning.workerPolicy).toEqual({
+      capabilities: [],
+      protectedHomePaths: [],
+      redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+    });
+    expect(provisioning.secrets.size).toBe(0);
+  });
+
   it('keeps capabilities default-off while retaining matching isolation', () => {
     const provisioning = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],

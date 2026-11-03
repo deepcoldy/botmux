@@ -31,6 +31,7 @@ import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-
 import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
 import {
   normalizeProtectedMcpCapabilities,
+  protectedMcpConfiguredEnvKeys,
   type ProtectedMcpCapabilityConfigMap,
 } from './core/protected-mcp-capabilities.js';
 
@@ -917,6 +918,11 @@ function readRawConfig(): Record<string, unknown> {
 const READ_CACHE_TTL_MS = 2_000;
 let readCache: { path: string; value: GlobalConfig; at: number } | null = null;
 let vcMeetingAgentLiveCache: { path: string; mtimeMs: number; config: VcMeetingAgentGlobalConfig } | null = null;
+let lastConfiguredProtectedMcpEnvKeys: string[] = [];
+
+export function configuredProtectedMcpEnvKeys(): string[] {
+  return [...lastConfiguredProtectedMcpEnvKeys];
+}
 
 /** Typed view of the global config. Validates `lang` so a malformed file
  *  can't propagate a bad value into the i18n module. */
@@ -926,6 +932,7 @@ export function readGlobalConfig(): GlobalConfig {
     return readCache.value;
   }
   const raw = readRawConfig();
+  lastConfiguredProtectedMcpEnvKeys = protectedMcpConfiguredEnvKeys(raw.protectedMcpCapabilities);
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
   const linkRefs = normalizeLinkRefConfig(raw.linkRefs);

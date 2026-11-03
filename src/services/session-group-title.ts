@@ -27,6 +27,8 @@ import { botOneShotEnv, type SessionEnvBotInput } from '../core/session-env-reso
 import { resolveEffectivePluginIds } from '../core/plugins/effective.js';
 import {
   protectedMcpHomePaths,
+  protectedMcpDaemonRedactedEnvKeys,
+  protectedMcpGlobalRedactedEnvKeys,
   protectedMcpIsolationPolicy,
   protectedMcpRedactedEnvKeys,
   type ProtectedMcpWorkerPolicy,
@@ -123,7 +125,10 @@ function matchingProtectedMcpPolicy(plugins?: string[]): ProtectedMcpWorkerPolic
   return {
     capabilities: [],
     protectedHomePaths: isolation.protectedHomePaths,
-    redactEnv: [...new Set([...isolation.secretEnvNames, ...isolation.redactEnv])],
+    redactEnv: [...new Set([
+      ...protectedMcpGlobalRedactedEnvKeys(global.protectedMcpCapabilities),
+      ...protectedMcpDaemonRedactedEnvKeys(),
+    ])],
   };
 }
 

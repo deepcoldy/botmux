@@ -107,6 +107,7 @@ import { buildBotWorkerEnv, type EnvPolicy } from './env-policy.js';
 import {
   PROTECTED_MCP_SECRET_FD_ENV,
   prepareProtectedMcpWorkerProvisioning,
+  protectedMcpDaemonSecretEnvironment,
   protectedMcpContainmentConfigured,
   serveProtectedMcpSecrets,
 } from './protected-mcp-capabilities.js';
@@ -14728,7 +14729,7 @@ export function forkWorker(
   const globalConfig = readGlobalConfig();
   const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
     resolveEffectivePluginIds(botCfg, globalConfig),
-    process.env,
+    protectedMcpDaemonSecretEnvironment(),
     globalConfig.protectedMcpCapabilities,
     protectedMcpContainmentConfigured({
       platform: process.platform,
@@ -22115,7 +22116,7 @@ export function forkAdoptWorker(
   const globalConfig = readGlobalConfig();
   const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
     resolveEffectivePluginIds(botCfg, globalConfig),
-    process.env,
+    protectedMcpDaemonSecretEnvironment(),
     globalConfig.protectedMcpCapabilities,
     false,
   );

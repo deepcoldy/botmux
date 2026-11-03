@@ -8,6 +8,7 @@
  */
 
 import { buildBotWorkerEnv } from '../../core/env-policy.js';
+import { protectedMcpDaemonRedactedEnvKeys } from '../../core/protected-mcp-capabilities.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
 import { getBot } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
@@ -171,6 +172,7 @@ async function runNodeImpl(
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
   const sessionId = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
+  const protectedEnvKeys = protectedMcpDaemonRedactedEnvKeys();
   const workerEnv: Record<string, string | undefined> = {
     // v3 ephemeral workers fork straight from the daemon here (not via
     // workerForkEnv), so strip the PM2 graceful-exit sentinel to keep the
@@ -185,6 +187,7 @@ async function runNodeImpl(
     BOTMUX_WORKFLOW_RUN_ID: req.runId,
     BOTMUX_WORKFLOW_NODE_ID: req.node.id,
   };
+  for (const key of protectedEnvKeys) delete workerEnv[key];
   // Where the worker writes this attempt's skill manifest + snapshot (its own
   // SESSION_DATA_DIR, i.e. config.session.dataDir unless req.env overrides it).
   const workerDataDir = workerEnv.SESSION_DATA_DIR || config.session.dataDir;
@@ -276,6 +279,10 @@ async function runNodeImpl(
   // permission isolation (BOTMUX_OWNER_OPEN_ID is daemon-authenticated at run
   // birth — a CLI child cannot forge it).  Standalone/dev runs keep synthetic
   // values and get no owner env at all.
+  const workerSessionEnv = v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot);
+  for (const key of protectedEnvKeys) {
+    if (workerSessionEnv.env) delete workerSessionEnv.env[key];
+  }
   const init = {
     type: 'init' as const,
     sessionId,
@@ -291,7 +298,7 @@ async function runNodeImpl(
     wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
     envPolicy: req.botSnapshot.envPolicy,
-    ...v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot),
+    ...workerSessionEnv,
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,

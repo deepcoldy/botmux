@@ -287,7 +287,7 @@ Streamable HTTP MCP 服务不能申请 `protectedCapability`，同时声明两�
 }
 ```
 
-只有显式 JSON 布尔值 `true` 才会启用绑定。缺少 `enabled`、设为 `false`、字符串 `"true"`、数字 `1` 或任何其它值时均保持关闭。密钥值只存在于 daemon 启动环境，配置中只写环境变量名。Botmux 会从 worker 和插件通用环境删除该变量及 `redactEnv` 中的变量，并只通过全新的一次性文件描述符通道把已授权密钥交给本地 stdio MCP 进程，不放入 argv 或通用环境变量。
+省略 `enabled` 时默认关闭，JSON 布尔值 `true` 启用绑定，布尔值 `false` 关闭绑定。字符串 `"true"`、数字 `1` 等任何非布尔值都会使整条能力记录被拒绝，不会被强制转换成关闭状态。密钥值只存在于 daemon 启动环境，配置中只写环境变量名。无论当前 Bot 是否启用匹配插件，Botmux 都会从全部 daemon 子进程、worker、模型进程和插件通用环境删除所有已配置的 secret source 与 `redactEnv` 变量；能力授权与受保护 Home 路径仍按插件范围生效。
 
 MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allowedPluginIds` 中、配置的隔离前提不满足，或 daemon 无法提供一次性通道，Botmux 会改用不带受保护密钥文件描述符的普通 stdio transport 启动服务。服务仍可启动并提供只读工具；该连接上的 `tools/call` 不会收到 `botmuxTrustedPrincipal` 或 `botmuxGrantedCapabilities`，插件必须对受保护写入失败关闭。
 

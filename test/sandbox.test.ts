@@ -15,7 +15,7 @@ import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
-import { protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
+import { protectedMcpHomeDenyPaths, protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -155,6 +155,29 @@ describe('configured protected MCP credential masks', () => {
       expect(args).not.toContain(realpathSync(link));
     } finally {
       rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before a protected Home deny can follow an intermediate symlink', () => {
+    const home = mkdtempSync(join(tmpdir(), 'protected-parent-home-'));
+    const outside = mkdtempSync(join(tmpdir(), 'protected-parent-outside-'));
+    symlinkSync(outside, join(home, 'nested'));
+    const nestedPolicy: ProtectedMcpWorkerPolicy = {
+      capabilities: [],
+      protectedHomePaths: ['nested/credential.json'],
+      redactEnv: ['FIXTURE_SECRET'],
+    };
+    try {
+      expect(() => {
+        const protectedPaths = protectedMcpHomeDenyPaths(home, nestedPolicy);
+        buildCredentialIsolationRules(
+          { homeDir: home, botmuxHome: join(home, '.botmux') },
+          protectedPaths,
+        );
+      }).toThrow(/protected MCP Home path.*symbolic link/i);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

@@ -80,9 +80,15 @@ async function main() {
   // daemon code — `bot-registry`, `card-builder`, etc. read `t()` against
   // the process default when a bot has no per-bot `lang` set.
   {
-    const { readGlobalConfig } = await import('./global-config.js');
+    const { configuredProtectedMcpEnvKeys, readGlobalConfig } = await import('./global-config.js');
+    const { captureProtectedMcpDaemonEnvironment } = await import('./core/protected-mcp-capabilities.js');
     const { setDefaultLocale } = await import('./i18n/index.js');
     const cfg = readGlobalConfig();
+    captureProtectedMcpDaemonEnvironment(
+      cfg.protectedMcpCapabilities,
+      process.env,
+      configuredProtectedMcpEnvKeys(),
+    );
     if (cfg.lang) setDefaultLocale(cfg.lang);
     // Wire user prompt-key overrides into t() before any prompt is built.
     const { registerPromptOverrideResolver } = await import('./skills/effective-builtins.js');

@@ -1,7 +1,8 @@
 import type { ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
+import { lstatSync, realpathSync } from 'node:fs';
 import { createConnection, createServer, type Socket } from 'node:net';
-import { resolve, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { isValidPluginId } from './plugins/ids.js';
 import {
   privateBrokerContainmentEnabled,
@@ -69,6 +70,11 @@ export interface ProtectedMcpWorkerProvisioning {
   secrets: Map<string, string>;
 }
 
+type ProtectedMcpSecretEnvironment = NodeJS.ProcessEnv | ReadonlyMap<string, string>;
+
+let daemonProtectedSecretEnv = new Map<string, string>();
+let daemonProtectedEnvKeys: string[] = [];
+
 export function isValidProtectedMcpCapabilityId(value: unknown): value is string {
   return typeof value === 'string' && PROTECTED_MCP_CAPABILITY_ID.test(value);
 }
@@ -106,6 +112,7 @@ function isProtectedHomeRelativePath(value: unknown): value is string {
 
 function normalizeCapabilityConfig(raw: unknown): ProtectedMcpCapabilityConfig | undefined {
   if (!isRecord(raw)) return undefined;
+  if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') return undefined;
   const allowedPluginIds = uniqueValidatedStrings(raw.allowedPluginIds, isValidPluginId);
   if (!allowedPluginIds?.length) return undefined;
 
@@ -155,6 +162,26 @@ export function normalizeProtectedMcpCapabilities(raw: unknown): ProtectedMcpCap
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+/**
+ * Conservatively collect syntactically valid protected env names even when
+ * the surrounding capability record is rejected for another field.
+ */
+export function protectedMcpConfiguredEnvKeys(raw: unknown): string[] {
+  if (!isRecord(raw)) return [];
+  const keys = new Set<string>();
+  for (const value of Object.values(raw)) {
+    if (!isRecord(value)) continue;
+    if (isRecord(value.secret) && isValidEnvironmentVariableName(value.secret.name)) {
+      keys.add(value.secret.name);
+    }
+    if (!isRecord(value.isolation) || !Array.isArray(value.isolation.redactEnv)) continue;
+    for (const name of value.isolation.redactEnv) {
+      if (isValidEnvironmentVariableName(name)) keys.add(name);
+    }
+  }
+  return [...keys];
+}
+
 export function protectedMcpIsolationPolicy(
   pluginIds: readonly string[] | undefined,
   config: ProtectedMcpCapabilityConfigMap | undefined,
@@ -174,6 +201,60 @@ export function protectedMcpIsolationPolicy(
     secretEnvNames: [...secretEnvNames],
     redactEnv: [...redactEnv],
   };
+}
+
+/** Machine-configured env names are secret-bearing regardless of bot plugins. */
+export function protectedMcpGlobalRedactedEnvKeys(
+  config: ProtectedMcpCapabilityConfigMap | undefined,
+): string[] {
+  const keys = new Set<string>();
+  for (const capability of Object.values(config ?? {})) {
+    keys.add(capability.secret.name);
+    for (const name of capability.isolation?.redactEnv ?? []) keys.add(name);
+  }
+  return [...keys];
+}
+
+/**
+ * Capture configured daemon-only secret sources before removing every
+ * protected name from the daemon environment inherited by arbitrary children.
+ */
+export function captureProtectedMcpDaemonEnvironment(
+  config: ProtectedMcpCapabilityConfigMap | undefined,
+  env: NodeJS.ProcessEnv,
+  configuredEnvKeys: readonly string[] = protectedMcpGlobalRedactedEnvKeys(config),
+): ReadonlyMap<string, string> {
+  const captured = new Map<string, string>();
+  for (const capability of Object.values(config ?? {})) {
+    const value = env[capability.secret.name]?.trim();
+    if (value) captured.set(capability.secret.name, value);
+  }
+  for (const key of configuredEnvKeys) delete env[key];
+  delete env[PROTECTED_MCP_SECRET_FD_ENV];
+  daemonProtectedSecretEnv = captured;
+  daemonProtectedEnvKeys = [...new Set(configuredEnvKeys.filter(isValidEnvironmentVariableName))];
+  return new Map(captured);
+}
+
+/** Snapshot of secret source values retained only by the daemon process. */
+export function protectedMcpDaemonSecretEnvironment(): ReadonlyMap<string, string> {
+  return new Map(daemonProtectedSecretEnv);
+}
+
+/** Machine-wide protected env names captured at daemon boot, including safe names from rejected records. */
+export function protectedMcpDaemonRedactedEnvKeys(): string[] {
+  return [...daemonProtectedEnvKeys];
+}
+
+function protectedSecretValue(
+  source: ProtectedMcpSecretEnvironment,
+  name: string,
+): string | undefined {
+  const raw = typeof (source as ReadonlyMap<string, string>).get === 'function'
+    ? (source as ReadonlyMap<string, string>).get(name)
+    : (source as NodeJS.ProcessEnv)[name];
+  const value = raw?.trim();
+  return value || undefined;
 }
 
 /** Environment names that must stay daemon-only for this worker generation. */
@@ -203,9 +284,44 @@ export function protectedMcpHomePaths(
   return [...paths];
 }
 
+/**
+ * Resolve the trusted Home root once, then lstat every existing intermediate
+ * component without following it. The protected leaf stays lexical so a leaf
+ * symlink is masked rather than turning its target into the policy boundary.
+ */
+export function protectedMcpHomeDenyPaths(
+  home: string,
+  policy: Pick<ProtectedMcpWorkerPolicy, 'protectedHomePaths'> | undefined,
+): string[] {
+  const root = realpathSync(home);
+  const paths: string[] = [];
+  for (const relativePath of policy?.protectedHomePaths ?? []) {
+    if (!isProtectedHomeRelativePath(relativePath)) continue;
+    const parts = relativePath.split('/');
+    let current = root;
+    for (const part of parts.slice(0, -1)) {
+      current = join(current, part);
+      try {
+        const stat = lstatSync(current);
+        if (stat.isSymbolicLink()) {
+          throw new Error(`protected MCP Home path has an intermediate symbolic link: ${current}`);
+        }
+        if (!stat.isDirectory()) {
+          throw new Error(`protected MCP Home path has a non-directory intermediate component: ${current}`);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') break;
+        throw error;
+      }
+    }
+    paths.push(join(root, ...parts));
+  }
+  return [...new Set(paths)];
+}
+
 export function prepareProtectedMcpWorkerProvisioning(
   pluginIds: readonly string[] | undefined,
-  env: NodeJS.ProcessEnv,
+  env: ProtectedMcpSecretEnvironment,
   config: ProtectedMcpCapabilityConfigMap | undefined,
   containmentConfigured: boolean,
 ): ProtectedMcpWorkerProvisioning {
@@ -213,7 +329,10 @@ export function prepareProtectedMcpWorkerProvisioning(
   const workerPolicy: ProtectedMcpWorkerPolicy = {
     capabilities: [],
     protectedHomePaths: isolation.protectedHomePaths,
-    redactEnv: [...new Set([...isolation.secretEnvNames, ...isolation.redactEnv])],
+    redactEnv: [...new Set([
+      ...protectedMcpGlobalRedactedEnvKeys(config),
+      ...protectedMcpDaemonRedactedEnvKeys(),
+    ])],
   };
   const secrets = new Map<string, string>();
   const enabledPlugins = new Set(pluginIds ?? []);
@@ -222,7 +341,7 @@ export function prepareProtectedMcpWorkerProvisioning(
   for (const [id, capability] of Object.entries(config ?? {})) {
     if (!capability.enabled) continue;
     if (!capability.allowedPluginIds.some(pluginId => enabledPlugins.has(pluginId))) continue;
-    const secret = env[capability.secret.name]?.trim();
+    const secret = protectedSecretValue(env, capability.secret.name);
     if (!secret) continue;
     workerPolicy.capabilities.push({
       id,
