@@ -7637,6 +7637,31 @@ function deliverRestartInterruptionNote(): void {
     ...(noticeTurnId ? { turnId: noticeTurnId } : {}),
   });
 }
+
+/** A cold-resumed structured bridge may restore the previous process's
+ * started-but-unfinished turn from the durable journal. Once the replacement
+ * CLI has reached its first prompt, that old in-memory lifecycle can no longer
+ * be completed by the dead process. Let the restart-interruption notice own
+ * recovery instead of allowing the stale queue head to reject prompt-ready
+ * forever. */
+function releaseInterruptedStructuredBridgeOnFirstPrompt(): void {
+  if (!awaitingFirstPrompt || !pendingRestartInterruption || !codexBridgeFallbackActive()) return;
+  const stale = codexBridgeQueue.peek().filter(turn => turn.restoredFromJournal === true
+    && turn.finalText === undefined
+    && (turn.started
+      || turn.rpcActive
+      || turn.cliQueuedAtMs !== undefined
+      || turn.submitConfirmedAtMs !== undefined
+      || turn.submitVerificationStartedAtMs !== undefined));
+  if (stale.length === 0) return;
+  const dropped = stale.flatMap(turn => {
+    const removed = codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
+    return removed ? [removed] : [];
+  });
+  if (dropped.length === 0) return;
+  checkpointStructuredBridgeRecovery();
+  log(`Cleared ${dropped.length} stale structured turn(s) from the previous CLI process before delivering the restart-interruption note`);
+}
 /** Journal-restore of interrupted Lark turns is allowed AT MOST ONCE per worker
  *  process, and only on the FIRST baseline this process runs. Rationale: the
  *  journal exists to recover a turn that a *cross-process* death (daemon
@@ -17868,6 +17893,7 @@ function markPromptReady(): void {
   // so a dropped Enter cannot create permanent false-busy.
   // Reject the heuristic and re-arm IdleDetector so the later transcript-final
   // fireIdle() can drive the real ready edge.
+  releaseInterruptedStructuredBridgeOnFirstPrompt();
   if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {
     // Grok is lifecycle-blocking, but its FIRST ready is still a pre-execution
     // composer / idle-detector edge while the argv-baked prompt is running.

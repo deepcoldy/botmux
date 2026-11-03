@@ -69,6 +69,10 @@ export interface CodexPendingTurn {
   turnId: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
+  /** This attribution mark came from the previous worker generation's durable
+   * journal. Recovery-only cleanup may retire these marks without touching a
+   * new turn that the replacement process accepted during startup. */
+  restoredFromJournal?: boolean;
   started: boolean;
   contentFingerprint?: string;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
@@ -368,6 +372,7 @@ export class CodexBridgeQueue {
       if (existing.has(entry.turnId)) continue;
       existing.add(entry.turnId);
       restored.push({ turnId: entry.turnId, started: false,
+        restoredFromJournal: true,
         ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         recoveryJsonlPathAtMark: entry.jsonlPath,
