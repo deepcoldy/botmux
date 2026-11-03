@@ -70,6 +70,9 @@ export interface V3RunSnapshot {
   loops: V3LoopRunState;
   /** `${from}->${to}` → conditional edge verdicts folded from edgeResolved. */
   edges: V3EdgeRunState;
+  /** nodeId → larkAppId the node was reassigned to (latest `nodeReassigned`).
+   *  Absent = the frozen bot snapshot's larkAppId. External executor only. */
+  assignments: Map<string, string>;
 }
 
 // ─── Materialize (replay) ────────────────────────────────────────────────
@@ -92,6 +95,14 @@ export interface V3RunSnapshot {
  *   nodeCancelled      → cancelled (settle-wins; late same-attempt settle ignored)
  *   nodeAttemptDrained → pending only when the exact current attempt was
  *                        still running; otherwise resource-audit only
+ *   nodeReassigned     → assignments[nodeId] = to; when it closes the exact
+ *                        current running attempt, that attempt's node goes
+ *                        pending (gate approval kept) so the next attempt
+ *                        dispatches to the new bot
+ *   nodeHandoffPrepared / Sent / Accepted / nodeStalled
+ *                      → no node-status change: an external attempt is
+ *                        `running` from its nodeDispatched; phase/deadlines
+ *                        live in external-attempt-ledger.ts
  */
 export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const nodes: V3RunState = new Map();
@@ -99,6 +110,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const attempts = new Map<string, string>();
   const loops: V3LoopRunState = new Map();
   const edges: V3EdgeRunState = new Map();
+  const assignments = new Map<string, string>();
   let runStatus: V3RunStatus = 'running';
   let cancelRequestId: string | undefined;
   let cancelRequestedBy: string | undefined;
@@ -377,6 +389,38 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         if (e.instanceId) recordInstance(e.nodeId, e.instanceId, 'cancelled', false);
         else set(e.nodeId, 'cancelled');
         break;
+      case 'nodeHandoffPrepared':
+      case 'nodeHandoffSent':
+      case 'nodeHandoffAccepted':
+      case 'nodeStalled':
+        // External handoff progress is audit/ledger state only; the attempt
+        // is already `running` from its nodeDispatched.
+        break;
+      case 'nodeReassigned': {
+        assignments.set(e.nodeId, e.to);
+        // Like nodeAttemptDrained: a blocked run can still hold a lingering
+        // binding (older/raced history); closing it must requeue its node.
+        if (!e.attemptId || (runStatus !== 'running' && runStatus !== 'blocked')) break;
+        const key = e.instanceId ?? e.nodeId;
+        if (attempts.get(key) !== e.attemptId) break;
+        // Reassignment of the in-flight attempt closes it; the node returns to
+        // pending (same instance, gate approval kept) for a fresh attempt.
+        if (e.instanceId) {
+          if (instances.get(e.instanceId)?.status !== 'running') break;
+          instances.set(e.instanceId, { status: 'pending' });
+          const current = nodes.get(e.nodeId);
+          if (current?.effectiveInstanceId === e.instanceId && current.status === 'running') {
+            nodes.set(e.nodeId, {
+              status: 'pending',
+              effectiveInstanceId: e.instanceId,
+              ...(current.gateCleared ? { gateCleared: true } : {}),
+            });
+          }
+        } else if (nodes.get(e.nodeId)?.status === 'running') {
+          set(e.nodeId, 'pending');
+        }
+        break;
+      }
       case 'nodeAttemptDrained': {
         // A drained peer must be retryable after a blocked run is reopened or
         // after crash recovery. Never revive an obsolete/settled instance, and
@@ -492,6 +536,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     attempts,
     loops,
     edges,
+    assignments,
   };
 }
 
@@ -513,6 +558,7 @@ interface StateFile {
   attempts: Record<string, string>;
   loops?: Record<string, V3LoopState>;
   edges?: Record<string, { active: boolean; sourceAttemptId: string }>;
+  assignments?: Record<string, string>;
   updatedAt: number;
 }
 
@@ -539,6 +585,7 @@ export function writeState(statePath: string, snap: V3RunSnapshot): void {
     attempts: Object.fromEntries(snap.attempts),
     loops: snap.loops.size > 0 ? Object.fromEntries(snap.loops) : undefined,
     edges: snap.edges.size > 0 ? Object.fromEntries(snap.edges) : undefined,
+    assignments: snap.assignments.size > 0 ? Object.fromEntries(snap.assignments) : undefined,
     updatedAt: Date.now(),
   };
   const tmp = `${statePath}.tmp`;
@@ -566,5 +613,6 @@ export function readState(statePath: string): V3RunSnapshot | undefined {
     attempts: new Map(Object.entries(file.attempts)),
     loops: new Map(Object.entries(file.loops ?? {})),
     edges: new Map(Object.entries(file.edges ?? {})),
+    assignments: new Map(Object.entries(file.assignments ?? {})),
   };
 }

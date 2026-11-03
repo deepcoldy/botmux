@@ -165,7 +165,7 @@ vi.mock('../src/skills/installer.js', () => ({
   ensureAskSkill: vi.fn(),
   ensureWhiteboardSkill: vi.fn(),
   ensureChatManagerSkill: vi.fn(),
-  ensureWorkflowSkills: vi.fn(),
+  removeWorkflowSkills: vi.fn(),
   removeGlobalBotmuxSkills: vi.fn(),
 }));
 

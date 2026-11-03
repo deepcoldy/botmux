@@ -79,6 +79,7 @@ import { recordCreatedWorktree } from '../../services/botmux-worktree-store.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
+import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled } from '../../core/idle-auto-compact.js';
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
@@ -92,7 +93,7 @@ import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.
 import { selectionKeyForBot } from '../../setup/cli-selection.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -1192,6 +1193,7 @@ export async function runAutoWorktreeCommit(deps: {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
         // Never reached under suppressConfirmReply for a pendingRepo session.
         sessionReply: async () => '',
+        prepareTurn,
       },
       targetDir,
       pathBasename(targetDir),
@@ -3342,6 +3344,44 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
       logger.info(`[${tag(ds)}] voice_summary triggered by ${operatorOpenId ?? '?'}`);
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
+    }
+
+    // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in（core/idle-auto-compact.ts）。按钮值带目标
+    // 状态 desired，旧卡片重复点击幂等；设置落在会话行上，daemon 重启后仍生效。
+    if (actionType === 'toggle_idle_compact') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+      }
+      // canOperate is enforced by the sensitive-action gate (card-action-routes.ts).
+      if (!sessionSupportsIdleAutoCompact(ds)) {
+        return { toast: { type: 'warning', content: t('card.idle_compact.unsupported', undefined, loc) } };
+      }
+      const enabled = value?.desired === 'on'
+        ? true
+        : value?.desired === 'off' ? false : !isIdleAutoCompactEnabled(ds.session);
+      const previous = ds.session.idleAutoCompact ? { ...ds.session.idleAutoCompact } : undefined;
+      const setting = applyIdleAutoCompactSetting(ds.session, { enabled });
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        if (previous) ds.session.idleAutoCompact = previous;
+        else delete ds.session.idleAutoCompact;
+        logger.warn(`[${tag(ds)}] toggle_idle_compact save failed: ${err instanceof Error ? err.message : String(err)}`);
+        return { toast: { type: 'warning', content: t('card.idle_compact.save_failed', undefined, loc) } };
+      }
+      logger.info(`[${tag(ds)}] idle auto-compact ${enabled ? 'on' : 'off'} via card by ${operatorOpenId ?? '?'}`);
+      return {
+        toast: {
+          type: 'success',
+          content: enabled
+            ? t('card.idle_compact.enabled', { minutes: idleAutoCompactMinutes(setting) }, loc)
+            : t('card.idle_compact.disabled', undefined, loc),
+        },
+        ...(cardMessageId && ds.streamCardId === cardMessageId ? {
+          card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+        } : {}),
+      };
     }
 
     if (actionType === 'set_reasoning_effort') {

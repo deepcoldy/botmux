@@ -73,6 +73,16 @@ describe('buildTeamRoster', () => {
     ]);
   });
 
+  it('normalizes a non-string cliId instead of leaking it into the roster', () => {
+    writeBotsInfo([
+      { larkAppId: 'cli_ok', botOpenId: 'ou_ok', botName: 'OK', cliId: 42 },
+    ]);
+
+    expect(buildTeamRoster(dataDir).bots).toMatchObject([
+      { larkAppId: 'cli_ok', name: 'OK', cliId: '' },
+    ]);
+  });
+
   it('filters malformed bots-info rows before enriching authoritative live bots', () => {
     writeBotsInfo([
       null,

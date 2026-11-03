@@ -8,10 +8,15 @@
   "traexAutoModel": {
     "enabled": true,
     "models": ["gpt-5.6-sol", "gpt-6-astra", "gpt-5.6-terra"],
+    "preflightLoadCheck": true,
+    "overloadThresholdPercent": 100,
+    "preflightTimeoutMs": 8000,
+    "unknownLoadPolicy": "skip",
+    "allOverloadedPolicy": "lowest_load",
     "modelSettings": {
-      "gpt-5.6-sol": { "reasoningEffort": "high", "modelBackendVariant": "max" },
+      "gpt-5.6-sol": { "reasoningEffort": "xhigh", "modelBackendVariant": "max" },
       "gpt-6-astra": { "reasoningEffort": "xhigh", "modelBackendVariant": "standard" },
-      "gpt-5.6-terra": {}
+      "gpt-5.6-terra": { "reasoningEffort": "max" }
     },
     "queueTimeoutMs": 30000,
     "reselectPerTurn": false,
@@ -23,6 +28,16 @@
 模型池无数量上限。每个模型下方独立选择思考强度与上下文；Standard / Max 及容量、可用思考档位来自 TraeX 实时目录。空设置表示使用该模型默认；缺少条目继承独立保存的共享设置，不能继承上个模型的覆盖值。共享设置随原生恢复状态保存，同 Worker 重启时保留已选模型和共享设置；旧版仅字符串池继续兼容共享设置。切换与启用下一回合恢复首选时同时更新两项覆盖，卡片显示当前档位。
 
 页面只显示「模型排队时，自动切换到模型池中其他不排队的模型。」，详细规则在问号的 hover/focus 提示中。该说明表达自动寻找可用模型的目标；负载快照不保证一次尝试即可免排队。
+
+独立新轮次负载预检由 `preflightLoadCheck` 控制，兼容默认关闭，只在 `trigger: "capacity"` 下生效。默认契约是：`overloadThresholdPercent: 100`（严格 `>` 才超载，100% 保持）、`preflightTimeoutMs: 8000`（允许 100–30000ms）、`unknownLoadPolicy: "skip"`、`allOverloadedPolicy: "lowest_load"`。字段严格校验；quota 模式不得开启预检。全池最低负载同值时按用户模型池顺序选择。
+
+冷启动/新会话首轮在最终 `buildArgs` 和真实 TraeX spawn 之前读取一次只读 `model/list`，先确定实际模型，因此只启动一个真实 CLI、原 prompt 只提交一次。已有会话只在空闲、尚未出队的独立新轮次写入前检查；需要换模时用相同 native session ID exact resume，换模完成后才写原 prompt。该 Worker 队列入口同时承接 IM、dispatch、schedule/API trigger，无需各入口分别实现。忙碌回合中的追加、纠正和 type-ahead 不检查、不重启、不打断工具调用，也不重放输入。
+
+预检算法先读取本轮目标模型（默认沿用当前模型；启用每轮重新择优时目标为池首）的负载。目标负载未知或查询失败/超时时 fail-open 保持当前模型；目标负载不超过阈值时保持；超过阈值时按模型池顺序选择第一个负载已知且不超过阈值的候选，未知候选按 `skip` 跳过。所有已知项均超阈值时选择最低负载，同值按模型池顺序。预检不关闭现有运行中 `queueTimeoutMs` 排队检测；若真实进入队列，原有运行中 fallback 继续工作。
+
+开启预检后，每个候选模型都使用自身实际支持的最高思考档位，按 `max` → `xhigh`（界面可显示 Extra High）→ `high` → `medium` → `low` 的顺序解析，不会因为切到备用模型而继承较低共享 effort。Dashboard 保存时把每项归一到该规则；当目录或静态能力无法给出任何可用档位时不发明 `xhigh` 等值，也不覆盖原设置。手写配置或目录漂移在 Worker 启动边界按同一规则再次归一并记录日志。
+
+预检正常保持不发用户提示；日志记录 `from/to/load/threshold/reason/duration`。切换和全池超载会发可见提示。查询失败、超时、目标负载未知均只记录可诊断日志，不把探测失败升级成任务失败。
 
 未保存模型池编辑同步写入按 Bot 隔离的浏览器草稿；刷新和目录重新加载不得覆盖模型偏好。实验开关不存入草稿，刷新后按服务端已保存配置显示，旧草稿中的 enabled 也不参与恢复。未保存的启用在刷新后恢复关闭，再次打开可恢复模型顺序、各模型档位、阈值与话题内重新择优偏好。原来已保存启用的开关，未保存关闭后刷新仍为启用。
 
@@ -40,7 +55,7 @@
 
 Auto 的 exact resume 继续刷新 Skill 快照和 MCP 绑定，但比较标准目录的 SHA-256，只交付发生变化的目录。空目录撤销仍交付替换说明，变化目录在真实写入边界附到下一次写入（包括恢复提示），避免拖到下一条用户输入。该去重只在已准入的 Auto 恢复中启用；普通恢复维持原目录替换规则。TraeX 自身恢复时追加的 developer 技能说明仍由原生 CLI 管理，不能声称已完全消除。
 
-飞书卡片使用已有 `active_runtime` 通道显示实际运行模型，切换后立即重新发布，新的 `turn_context` 再提供执行器观测。Wrapper、Forge、共享 adopt、直接 RPC、远端后端、durable delivery 和 at-most-once 输入不进行自动容量切换。人工 `/model`、`/new`、`/clear` 优先，停用本 Worker 的池；重新 init/restart 可重新加载设置。
+飞书卡片使用已有 `active_runtime` 通道显示实际运行模型，切换后立即重新发布，新的 `turn_context` 再提供执行器观测。Wrapper、Forge、共享 adopt、直接 RPC、远端后端不进行预检或自动容量切换；durable dispatch 可在尚未提交的空闲独立新轮次执行预检，但已提交 durable turn 不参与运行中容量恢复。冷启动 at-most-once 输入可在真实 spawn 前安全预检；暖会话 at-most-once 输入 fail-open 保持当前模型，避免通过进程重启跨越不重放边界。人工 `/model`、`/new`、`/clear` 优先，停用本 Worker 的池；重新 init/restart 可重新加载设置。
 
 RPC 输入的实际配置由一处共享规则解析：仅 Codex/TraeX 支持；通常 Bot 的显式 true/false 优先，未设置才继承 `dashboard.codexRpcInput`。当前实际启动为受支持的 TraeX Auto 时，自动使用终端输入；Bot 原有 `codexRpcInput` 字段保持原样，关闭 Auto 后自然恢复。共享 App Server 接入不启用 Botmux 自有 RPC。Dashboard 的生效状态、Worker 初始启动与 `/restart` 使用同一规则，不再用 OR 合并丢失显式 false。
 
@@ -52,6 +67,6 @@ Worker 内重启按原生会话 ID、模型池策略和池内模型校验运行�
 
 本 PR 的 `startupReadyFromHistory` 与恢复输入框识别作用于所有 TraeX 终端会话，包括未启用 Auto 的会话。Auto 的容量切换和输入暂停门控仍只作用于受支持的托管会话。
 
-验证包含配置读写与刷新、五模型顺序编辑、阈值和缓冲、白名单、100% 与更低负载的偏好顺序、备选实际排队后继续向后检查、缺失数据、全高负载选择及同值顺序、exact native resume、原输入不重放、新话题切模后的 Worker 内重启和最终等待保持、新回合恢复首选、卡片模型 IPC、关闭时行为、现有 TraeX type-ahead/隔离重启回归，以及编译二进制与真实 Worker/tmux。
+验证包含配置读写与刷新、五模型顺序编辑、预检默认关闭与严格字段校验、100% 保持/101% 切换、未知负载跳过和查询失败/超时 fail-open、全高负载与同值稳定顺序、每模型 `max`/`xhigh`/`high` 等实际最高支持档位选择、冷启动只 spawn/提交一次、暖会话 exact native resume、busy type-ahead 不预检、dispatch 共用 Worker 准入、运行中 queue fallback、quota/非 TraeX/不安全后端回归，以及编译二进制与真实 Worker/tmux。
 
 独立输入首次提交后即保持后继消息，直到当前原生回合出现工作/排队证据或终态，避免首个活动帧之前残留的 composer 放行连续输入。tmux 的异步输入核验可用当前原生工作视口解除等待，并核对读取前后的模型、活动等待状态及既有 generation/输入围栏；旧版紧邻工作 spinner 的 next-turn parking 仍允许正常追加。带有原生 Send after tool call 面板时，按面板标题、输入行和底部模型/Context 几何定位面板上方活动行，避免最后 12 行被长待发预览占满；不能验证为原生面板时保持原窄扫描范围。

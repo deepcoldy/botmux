@@ -550,7 +550,11 @@ import {
   writeNativeSubagentRuntimeResponseProof,
 } from './native-subagent-runtime-ipc-auth.js';
 import { normalizeNativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
-import { normalizeTraexAutoModelConfig, TRAEX_AUTO_MODEL_ID } from '../services/traex-auto-model.js';
+import {
+  normalizeTraexAutoModelConfig,
+  strongestTraexPreflightReasoningEffort,
+  TRAEX_AUTO_MODEL_ID,
+} from '../services/traex-auto-model.js';
 import { detectModelCapabilitiesViaExec } from '../adapters/cli/model-catalog-json.js';
 import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
@@ -8474,6 +8478,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     silentTurnReactions: cardPrefs.silentTurnReactions,
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
     codexBrowser: cardPrefs.codexBrowser,
+    codexBrowserAutoApproveOrigins: cardPrefs.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
@@ -8632,7 +8637,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardShowTools?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -8650,7 +8655,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardShowTools?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -8694,6 +8699,16 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
       }
     }
     patch.codexBrowser = body.codexBrowser;
+  }
+  if (body.codexBrowserAutoApproveOrigins !== undefined) {
+    if (typeof body.codexBrowserAutoApproveOrigins !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_codex_browser_auto_approve_origins' });
+    }
+    const browserEnabled = body.codexBrowser ?? getBot(cachedLarkAppId).config.codexBrowser?.enabled === true;
+    if (body.codexBrowserAutoApproveOrigins && !browserEnabled) {
+      return jsonRes(res, 409, { ok: false, error: 'codex_browser_not_enabled' });
+    }
+    patch.codexBrowserAutoApproveOrigins = body.codexBrowserAutoApproveOrigins;
   }
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
   if (typeof body.replyCardShowTools === 'boolean') patch.replyCardShowTools = body.replyCardShowTools;
@@ -8764,7 +8779,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
 
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
   if (!r.ok) {
-    const status = r.reason === 'codex_browser_config_conflict'
+    const status = r.reason === 'codex_browser_config_conflict' || r.reason === 'codex_browser_not_enabled'
       || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
     return jsonRes(res, status, { ok: false, error: r.reason });
   }
@@ -9488,6 +9503,13 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
             : !cliModelSupportsReasoningEffort('traex', modelId, settings.reasoningEffort))) {
             return { write: false, result: { error: 'invalid_traex_auto_model',
               message: `${modelId} 不支持所选思考强度 ${settings.reasoningEffort}` } };
+          }
+          if (nextTraexAutoModel.preflightLoadCheck === true && settings.reasoningEffort) {
+            const requiredEffort = strongestTraexPreflightReasoningEffort(modelId, efforts);
+            if (requiredEffort && settings.reasoningEffort !== requiredEffort) {
+              return { write: false, result: { error: 'invalid_traex_auto_model',
+                message: `${modelId} 启用负载预检时必须使用自身最高思考强度 ${requiredEffort}` } };
+            }
           }
         }
       }
