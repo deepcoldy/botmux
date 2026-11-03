@@ -147,6 +147,19 @@ describe('coreOnlyPidNamespaceDegrade gate (credential-safety)', () => {
     }
   });
 
+  it('never drops the PID namespace when a host MCP credential broker is exposed', () => {
+    const prev = process.env.BOTMUX_CORE_ONLY;
+    process.env.BOTMUX_CORE_ONLY = '1';
+    __testOnly_resetPidNamespaceProbe();
+    try {
+      expect(coreOnlyPidNamespaceDegrade({ credentialBearingMcp: true })).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prev;
+      __testOnly_resetPidNamespaceProbe();
+    }
+  });
+
   // codex review concern #2 (P1): a naive probe treats ANY bwrap failure as
   // "safe to drop --unshare-pid". Three-state classification (success /
   // clean-nonzero / inconclusive) is load-bearing — a timeout/spawn-error must

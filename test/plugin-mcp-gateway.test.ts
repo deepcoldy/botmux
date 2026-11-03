@@ -344,6 +344,7 @@ describe('plugin MCP Gateway', () => {
           },
           turnId: 'om_turn',
           dispatchAttempt: 2,
+          actorWriteAllowed: true,
         }),
       },
     );
@@ -373,11 +374,44 @@ describe('plugin MCP Gateway', () => {
     expect(text).toContain('"senderType":"user"');
     expect(text).toContain('"turnId":"om_turn"');
     expect(text).toContain('"dispatchAttempt":2');
+    expect(text).toContain('"actorWriteAllowed":true');
     expect(text).toContain('"customTrace":"keep-me"');
     expect(text).not.toContain('ou_forged');
     expect(text).not.toContain('on_forged');
     expect(text).not.toContain('on_sibling_forged');
 
+    await client.close();
+    await gateway.close();
+  });
+
+  it('withholds local actor-write metadata when the turn envelope belongs to another caller', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-mismatched-actor' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_alice',
+            requestUserEmail: 'alice@bytedance.com',
+            requestLarkAppId: 'cli_trusted',
+            senderType: 'user',
+          },
+          turnId: 'om_bob',
+          identityTurnId: 'om_alice',
+          actorWriteAllowed: true,
+        }),
+      },
+    );
+    const client = new Client({ name: 'gateway-mismatched-actor-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    const result = await client.callTool({ name: 'echo', arguments: {} });
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('"requestUserOpenId":"ou_alice"');
+    expect(text).toContain('"turnId":"om_bob"');
+    expect(text).not.toContain('requestUserEmail');
+    expect(text).not.toContain('actorWriteAllowed');
     await client.close();
     await gateway.close();
   });

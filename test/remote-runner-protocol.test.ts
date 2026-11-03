@@ -8,11 +8,27 @@ import {
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
   parseRemoteRunnerEventLine,
+  projectRemoteRunnerTrustedCaller,
   remoteRunnerCommand,
   type RemoteRunnerEvent,
 } from '../src/adapters/backend/remote-runner-protocol.js';
 
 describe('remote runner protocol', () => {
+  it('never serializes the local actor email to a remote provider', () => {
+    expect(projectRemoteRunnerTrustedCaller({
+      requestUserOpenId: 'ou_actor',
+      requestUserUnionId: 'on_actor',
+      requestUserEmail: 'actor@bytedance.com',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user',
+    })).toEqual({
+      requestUserOpenId: 'ou_actor',
+      requestUserUnionId: 'on_actor',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user',
+    });
+  });
+
   it('keeps remote compute and native agent lineage as separate state', () => {
     expect(normalizeRemoteRunnerBackendState({
       version: 1,

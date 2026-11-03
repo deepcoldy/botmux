@@ -3,7 +3,7 @@ import { deploymentContinuationTemplate } from './services/deployment-continuati
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
-import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
+import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError, privateBrokerContainmentEnabled } from './core/sandbox-network-policy.js';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
@@ -1903,6 +1903,7 @@ let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
+let localActorWriteContainmentActive = false;
 const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
   reject: (error: Error) => void;
@@ -2175,6 +2176,7 @@ function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
 function stopSessionMcpGatewayHost(): void {
   const host = sessionMcpGatewayHost;
   sessionMcpGatewayHost = null;
+  localActorWriteContainmentActive = false;
   if (!host) return;
   void host.close().catch((error) => {
     log(`[mcp-gateway] host shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -5279,6 +5281,7 @@ function currentGatewayTrustedTurnIdentity() {
   const identity = activeTurnAuthority.identity();
   return {
     ...identity,
+    ...(localActorWriteContainmentActive ? { actorWriteAllowed: true } : {}),
     ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
   };
 }
@@ -20732,6 +20735,7 @@ async function spawnCli(
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
+  localActorWriteContainmentActive = false;
   const spawnStartedAtMs = Date.now();
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
@@ -24434,6 +24438,8 @@ async function spawnCli(
       if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
+      localActorWriteContainmentActive = !!sessionMcpGatewayHost
+        && privateBrokerContainmentEnabled(cfg.sandboxNetworkPolicy);
       // session-id is FORCED here so a relayed send can't target another session.
       sandboxStopWatcher = startOutboxWatcher(
         sbx.outbox,

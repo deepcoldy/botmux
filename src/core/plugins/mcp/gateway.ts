@@ -121,8 +121,10 @@ interface ResourceRoute {
 export interface GatewayTrustedTurnIdentity {
   caller?: TrustedCaller;
   turnId?: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
+  actorWriteAllowed?: boolean;
 }
 
 export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
@@ -561,12 +563,18 @@ export class PluginMcpGateway {
     const caller = identity?.caller;
     if (!caller && !identity?.turnId) return undefined;
     const hostCapabilities = this.trustedResultDelivery ? ['result_delivery_v1'] : [];
+    const actorBoundToEnvelope = !identity?.identityTurnId
+      || identity.identityTurnId === identity.turnId;
+    const includeActorWriteFields = includeLocalActorFields
+      && identity?.actorWriteAllowed === true
+      && actorBoundToEnvelope;
     return {
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
-      ...(includeLocalActorFields && caller?.requestUserEmail
+      ...(includeActorWriteFields && caller?.requestUserEmail
         ? { requestUserEmail: caller.requestUserEmail }
         : {}),
+      ...(includeActorWriteFields ? { actorWriteAllowed: true } : {}),
       ...(caller?.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
       // Provenance travels with the identity so a plugin can tell "a human just
       // asked" from "a scheduled task is running as them". Deliberately NOT

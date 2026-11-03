@@ -730,7 +730,10 @@ export function __testOnly_resetPidNamespaceProbe(): void {
  * only the pid-namespace defense-in-depth is dropped, and only where it both
  * (a) can't work and (b) protects nothing.
  */
-export function coreOnlyPidNamespaceDegrade(): boolean {
+export function coreOnlyPidNamespaceDegrade(
+  opts: { credentialBearingMcp?: boolean } = {},
+): boolean {
+  if (opts.credentialBearingMcp) return false;
   return process.env.BOTMUX_CORE_ONLY === '1' && !bwrapCanUnsharePid();
 }
 
@@ -1188,7 +1191,6 @@ export function prepareDirectSandbox(opts: {
   if (!ensureSandboxDeps()) return null;
   const bwrap = bwrapExecutable();
   if (!bwrap) return null;
-  if (opts.networkPolicy && opts.mcpGatewaySocketPath) throw new Error('sandboxNetworkPolicy cannot expose host MCP/Unix IPC; disable host MCP plugins for this session');
   // Validate all dependencies before creating files.
   if (opts.networkPolicy) sandboxNetworkLaunch(opts.networkPolicy, '/bin/true', []);
 
@@ -1259,7 +1261,16 @@ export function prepareDirectSandbox(opts: {
     try { if (statSync(r.path).isFile()) filePaths.add(r.path); } catch { /* absent → dir-shaped mask */ }
   }
 
-  const compiled = compileToBwrap(policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir, skipPidNamespace: coreOnlyPidNamespaceDegrade() });
+  const compiled = compileToBwrap(policy, {
+    symlinks,
+    emptyDir,
+    emptiesDir: empties,
+    filePaths,
+    chdir: opts.chdir,
+    skipPidNamespace: coreOnlyPidNamespaceDegrade({
+      credentialBearingMcp: !!opts.mcpGatewaySocketPath,
+    }),
+  });
   if (minimaxAlias) {
     // After tmpfs setup and before any host binds. Parent directories are
     // empty namespace scaffolding; the alias grants no additional host path.

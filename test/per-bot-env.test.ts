@@ -62,6 +62,8 @@ describe('sanitizePerBotEnv()', () => {
         LARKSUITE_CLI_DATA_DIR: '/tmp/evil-keystore',
         CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '1',
         CJADK_INTERACTIVE: '1',
+        MIX_AUTH_TOKEN: 'machine-mix-token',
+        BYTEDCLI_AI_AUTH_APP_KEY: 'host-ai-auth-key',
         IS_SANDBOX: '1',
         SESSION_DATA_DIR: '/tmp',
         TMPDIR: '/tmp/shared',

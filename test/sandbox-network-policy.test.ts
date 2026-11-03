@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys } from '../src/core/sandbox-network-policy.js';
+import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys, privateBrokerContainmentEnabled } from '../src/core/sandbox-network-policy.js';
 import { networkSocketFilter } from '../src/core/sandbox-network-launch.js';
 import { workflowSandboxInitFields } from '../src/workflows/shared/sandbox-policy.js';
 
@@ -65,13 +65,25 @@ describe('network policy', () => {
   it.each([
     ['x64', 0xc000003e, 41, 53, [272, 308, 425, 426, 427]],
     ['arm64', 0xc00000b7, 198, 199, [97, 268, 425, 426, 427]],
-  ] as const)('seccomp %s rejects IPC, escape and alternate ABIs', (arch, audit, socket, socketpair, blocked) => {
-    for (const family of [2, 10]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x7fff0000);
-    for (const family of [1, 16, 17, 40]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x00050001);
+  ] as const)('seccomp %s permits mounted Unix sockets but rejects other IPC, escape and alternate ABIs', (arch, audit, socket, socketpair, blocked) => {
+    for (const family of [1, 2, 10]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x7fff0000);
+    for (const family of [16, 17, 40]) expect(evaluateFilter(arch, audit, socket, family)).toBe(0x00050001);
     expect(evaluateFilter(arch, audit, socketpair, 1)).toBe(0x7fff0000);
     for (const syscall of blocked) expect(evaluateFilter(arch, audit, syscall)).toBe(0x00050001);
     expect(evaluateFilter(arch, 0x40000003, socket, 2)).toBe(0x80000000);
     if (arch === 'x64') expect(evaluateFilter(arch, audit, 0x40000029, 2)).toBe(0x00050001);
+  });
+  it('enables actor writes only for a private-blocking policy without delegated proxy egress', () => {
+    expect(privateBrokerContainmentEnabled(parseSandboxNetworkPolicy(base))).toBe(true);
+    expect(privateBrokerContainmentEnabled(parseSandboxNetworkPolicy({
+      ...base,
+      proxyMode: 'trusted-egress',
+    }))).toBe(false);
+    expect(privateBrokerContainmentEnabled(parseSandboxNetworkPolicy({
+      ...base,
+      private: { mode: 'allow' },
+    }))).toBe(false);
+    expect(privateBrokerContainmentEnabled(undefined)).toBe(false);
   });
   it('proxy re-resolution configurations fail closed without changing environment', () => {
     const p = parseSandboxNetworkPolicy(base); const env = { HTTPS_PROXY: 'http://example.org:8080', NO_PROXY: '*' };

@@ -263,6 +263,8 @@ describe('control-plane env keys are not a back door', () => {
       'LARK_APP_SECRET',     // bot credential
       'CLAUDE_CONFIG_DIR',   // CLI data root / identity marker
       'IS_SANDBOX',
+      'MIX_AUTH_TOKEN',
+      'BYTEDCLI_AI_AUTH_APP_KEY',
     ]) {
       const r = normalizeMojoConfig({ env: { [key]: 'hijacked' } });
       expect(r.ok, `${key} must be rejected in mojo.env`).toBe(false);

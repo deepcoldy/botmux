@@ -6532,7 +6532,7 @@ const en: Record<keyof typeof zh, string> = {
   'botDefaults.sandboxModeOncall': 'Allowlist isolation',
   'botDefaults.sandboxModeScratch': 'scratch (throwaway)',
   'botDefaults.networkPolicy': 'Destination IP network policy',
-  'botDefaults.networkPolicyHelp': 'Independent public/private allow, block, allowlist or denylist modes. IP/CIDR rules support TCP/UDP ports; domains and host Unix IPC are unsupported.',
+  'botDefaults.networkPolicyHelp': 'Independent public/private allow, block, allowlist or denylist modes. IP/CIDR rules support TCP/UDP ports; domains are unsupported. Only explicitly mounted session MCP Unix sockets are reachable.',
   'botDefaults.networkRequirements': 'Requires the Linux local pty backend with the allowlist-isolation sandbox, nft, slirp4netns and compatible bwrap. Capabilities are checked at launch.',
   'botDefaults.networkUnsupportedPlatform': 'Network policy requires Linux; this host is {platform}.',
   'botDefaults.networkUnsupportedBackend': 'New sessions use the {backend} backend; network policy requires the pty backend. Set the session backend to pty first.',
