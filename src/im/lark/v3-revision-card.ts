@@ -51,6 +51,14 @@ function list(ids: readonly string[]): string {
   return ids.length > 0 ? ids.join('、') : '';
 }
 
+/** Who proposed a revision, as a role. The stored value is the proposer's
+ *  open_id (or `main_bot`); a raw open_id means nothing to people in the
+ *  chat, so the card shows the role instead and never prints the id. */
+export function v3RevisionProposerLabel(view: Pick<V3RevisionCardView, 'proposedBy' | 'reasons'>): string {
+  if (view.proposedBy === 'main_bot') return '主 Bot（自行调整）';
+  return view.reasons.includes('callerNotInitiator') ? '群成员（非发起人）' : '发起人';
+}
+
 export function buildV3RevisionCard(input: V3RevisionCardInput): string {
   const { view, resolution } = input;
   const nonce = v3RevisionCardNonce(input.runId, view.revision);
@@ -90,7 +98,7 @@ export function buildV3RevisionCard(input: V3RevisionCardInput): string {
       tag: 'div',
       fields: [
         { is_short: true, text: { tag: 'plain_text', content: `Run\n${short(input.runId, 24)}` } },
-        { is_short: true, text: { tag: 'plain_text', content: `提出者\n${short(view.proposedBy, 24)}` } },
+        { is_short: true, text: { tag: 'plain_text', content: `提出者\n${v3RevisionProposerLabel(view)}` } },
       ],
     },
     { tag: 'hr' },

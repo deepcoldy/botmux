@@ -120,6 +120,21 @@ describe('confirmation card', () => {
     }
   });
 
+  it('shows the proposer as a role, never as a raw open_id', () => {
+    const proposerOf = (proposed: Partial<V3RevisionCardView>): string => {
+      const card = JSON.parse(buildV3RevisionCard({ runId: 'r1', view: { ...view, ...proposed }, webDetailUrl: 'https://x' })) as {
+        elements: Array<{ fields?: Array<{ text: { content: string } }> }>;
+      };
+      return card.elements.flatMap((element) => element.fields ?? []).map((field) => field.text.content).join('\n');
+    };
+    const member = proposerOf({});
+    const initiator = proposerOf({ proposedBy: 'ou_initiator', reasons: ['hostNode'] });
+    const mainBot = proposerOf({ proposedBy: 'main_bot', reasons: ['newBot'] });
+    for (const shown of [member, initiator, mainBot]) expect(shown).not.toMatch(/ou_|main_bot/);
+    // Three distinct roles, so the initiator can tell who asked.
+    expect(new Set([member, initiator, mainBot]).size).toBe(3);
+  });
+
   it('never renders free text as lark_md (no mention side effects)', () => {
     const card = JSON.parse(buildV3RevisionCard({ runId: 'r1', view, webDetailUrl: 'https://x' })) as Card;
     expect(card.elements.filter((element) => element.text).every((element) => element.text!.tag === 'plain_text')).toBe(true);
