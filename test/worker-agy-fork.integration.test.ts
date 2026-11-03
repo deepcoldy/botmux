@@ -213,4 +213,58 @@ describe.skipIf(process.platform !== 'linux')('worker Antigravity native fork', 
     expect(g.ids()).toEqual([]);
     expect(readFileSync(f.parentFile, 'utf8')).toBe('PARENT_IMMUTABLE_STATE');
   }, 60_000);
+
+  it('refuses an exact-turn interrupt while the native fork is unconfirmed', async () => {
+    // The dashboard's interrupt route reaches the same control-key path as the
+    // card stop; it must report undelivered and keep Ctrl+C away from the
+    // resumed source pane until the child identity is confirmed.
+    const f = setup(); fixtures.push(f);
+    const g = f.start();
+    await waitFor(() => f.inputs().some(r => r.text === '/fork'), g.logs);
+    await waitFor(() => g.messages.some(m => m.type === 'ready'), g.logs);
+    await sleep(300);
+    const byteBefore = readFileSync(f.byteLog, 'utf8');
+    const result = await new Promise<WorkerToDaemon>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no turn_interrupt_result')), 5_000);
+      const onMsg = (raw: WorkerToDaemon) => {
+        if (raw?.type === 'turn_interrupt_result' && raw.requestId === 'fork-gate-1') {
+          clearTimeout(timer);
+          g.worker.off('message', onMsg);
+          resolve(raw);
+        }
+      };
+      g.worker.on('message', onMsg);
+      g.worker.send({ type: 'interrupt_turn', requestId: 'fork-gate-1', turnId: 'om_first' } satisfies DaemonToWorker);
+    });
+    expect(result.type).toBe('turn_interrupt_result');
+    if (result.type !== 'turn_interrupt_result') throw new Error('narrowed');
+    expect(result.delivered).toBe(false);
+    expect(result.reason).toBe('fork_pending');
+    await sleep(300);
+    expect(readFileSync(f.byteLog, 'utf8')).toBe(byteBefore);
+    await f.stop(g.worker);
+  }, 60_000);
+
+  it('an in-worker restart after confirmation relaunches into the child', async () => {
+    // Cold worker restart is covered above with a brand-new init message. An
+    // IN-WORKER /restart instead respawns from lastInitConfig: the fork
+    // completion must have updated the resume identity there, or the child
+    // shell would silently resume the parent conversation.
+    const f = setup(); fixtures.push(f);
+    const g = f.start();
+    await waitFor(() => f.inputs().some(r => r.text === '/fork'), g.logs);
+    writeFileSync(f.release, 'ok');
+    await waitFor(() => g.ids().includes(childId), g.logs);
+    g.worker.send({ type: 'restart', attemptId: 'fork-restart-1' } satisfies DaemonToWorker);
+    const launches = (): string[] =>
+      readFileSync(f.launchLog, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l).id);
+    await waitFor(() => launches().length >= 2, g.logs, 60_000);
+    expect(launches()[0]).toBe(parentId);
+    expect(launches()[1]).toBe(childId);
+    g.worker.send({ type: 'message', content: 'POST_RESTART', turnId: 'om_post_restart' } satisfies DaemonToWorker);
+    await waitFor(() => f.inputs().some(r => r.text === 'POST_RESTART'), g.logs, 60_000);
+    await waitFor(() => f.inputs().find(r => r.text === 'POST_RESTART')?.id === childId, g.logs, 60_000);
+    expect(g.ids().filter(id => id === parentId)).toEqual([]);
+    await f.stop(g.worker);
+  }, 90_000);
 });
