@@ -165,6 +165,10 @@ async function architect(base: string, opts: {
     botRole: roleFactory,
     runArchitect: worker.run,
   };
+  // Bun keeps exiting 1 once exitCode was set, even after `= undefined`; put
+  // back the previous value, or 0 when there was none (a failing architect
+  // sets it to 1).
+  const previousExitCode = process.exitCode;
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
   const error = vi.spyOn(console, 'error').mockImplementation(() => {});
   try {
@@ -177,7 +181,7 @@ async function architect(base: string, opts: {
   } finally {
     log.mockRestore();
     error.mockRestore();
-    process.exitCode = undefined;
+    process.exitCode = previousExitCode ?? 0;
   }
 }
 
