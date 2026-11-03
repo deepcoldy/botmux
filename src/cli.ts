@@ -8580,7 +8580,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       try { cur = await detectAuthenticatedCurrentSession() ?? cur; }
       catch (error) { creatorAuthError = error; }
     }
-    if (rest.includes('--run-as') && (cur || !argValue(rest, '--run-as'))) {
+    // Match both `--run-as x` and `--run-as=x`: the includes() idiom used for
+    // other flags only catches the spaced form, and an agent in a session using
+    // the equals form would have the flag silently ignored by the daemon's
+    // session branch instead of getting this refusal.
+    const runAsFlagPresent = rest.some(a => a === '--run-as' || a.startsWith('--run-as='));
+    if (runAsFlagPresent && (cur || !argValue(rest, '--run-as'))) {
       console.error(cur
         ? '--run-as 只能在宿主终端使用；会话内创建的任务以当前发起人身份运行。'
         : '--run-as 需要本 bot 应用下的 open_id（ou_ 开头）或飞书邮箱。');

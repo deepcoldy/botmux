@@ -188,6 +188,22 @@ describe('schedule CLI prompt updates', () => {
     expect(result.output).not.toContain(code);
   });
 
+  it.each([
+    ['spaced', ['--run-as', 'ou_victim']],
+    ['equals', ['--run-as=ou_victim']],
+  ])('refuses %s --run-as inside a session before reaching the delegated add route', async (_label, flag) => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', observed);
+    const result = await f.run(['add', '0 12 * * *', 'new task', ...flag, '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('只能在宿主终端');
+    expect(f.read()['11223344']).toBeUndefined();
+    // Session detection may hit the attestation endpoint, but the task body
+    // must never reach SCHEDULE_DELEGATED_ADD_ROUTE.
+    expect(observed.some(request => 'task' in request)).toBe(false);
+  });
+
   it.each(['--topic', '--follow-active'])('binds %s to the current topic in a reused chat session', async flag => {
     const f = fixture();
     await managed(f);
