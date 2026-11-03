@@ -1,3 +1,4 @@
+import { withManagedDirectories } from '../services/managed-directory-retention.js';
 /**
  * `bots.json` 原子读写. Codex review 边界 #2 + #3:
  * - tmp 文件必须和 `bots.json` 同目录, 保证 `renameSync` 在同 fs 下原子覆盖
@@ -28,8 +29,10 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
     assertNextBotsGenerationContent(previous, bots);
     // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
     const tmp = botsJsonPath + '.tmp';
-    writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });
-    renameSync(tmp, botsJsonPath);
+    withManagedDirectories(bots, () => {
+      writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });
+      renameSync(tmp, botsJsonPath);
+    }, undefined, botsJsonPath);
   });
 }
 

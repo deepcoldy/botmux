@@ -1,3 +1,4 @@
+import { guardSessionDirectoryWrites } from './managed-directory-retention.js';
 import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
@@ -504,7 +505,7 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   ensurePrincipalLaneWorktreeCommonDirColumns(db);
   ensureMessageProvenanceTrustFenceIdentityColumns(db);
   db.exec(OCCUPANCY_SCHEMA_SQL);
-  return db;
+  return guardSessionDirectoryWrites(db);
 }
 
 /** `0d6ab50d1` could create this sidecar before the common-dir proof columns

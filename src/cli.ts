@@ -19485,6 +19485,11 @@ if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
 }
 
 switch (command) {
+  case 'managed-directories': {
+    const { managedDirectoriesCommand } = await import('./cli/managed-directories.js');
+    await managedDirectoriesCommand(process.argv.slice(3));
+    break;
+  }
   case '--version':
   case '-v':      console.log(getVersion()); break;
   case '__pty-smoke': {
