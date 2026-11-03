@@ -57,6 +57,7 @@ import {
   loadEffectiveV3Dag,
   missingV3RevisionFollowUps,
   snapshotForSelector,
+  v3ApprovedBotScope,
   v3NodeHeldByProposal,
 } from './dag-revision.js';
 import {
@@ -694,7 +695,8 @@ export async function runWorkflow(
     pendingRevision = history.pending?.revision;
     if (history.current === dagRevision) return;
     const effective = loadEffectiveV3Dag(runDir, authorizedDag, events);
-    for (const [selector, snap] of effective.botAdditions) {
+    // The run's approved bot scope grows only through confirmed revisions.
+    for (const [selector, snap] of v3ApprovedBotScope(botSnapshots, effective.botAdditions)) {
       if (botSnapshots.has(selector)) continue;
       validateSnapshot(selector, snap);
       botSnapshots.set(selector, snap);

@@ -32,7 +32,7 @@ import {
   serializeFrozenBotSnapshots,
 } from './bot-resolve.js';
 import { readJournal } from './journal.js';
-import { loadEffectiveV3Dag } from './dag-revision.js';
+import { loadEffectiveV3Dag, v3ApprovedBotScope } from './dag-revision.js';
 import { materialize } from './state.js';
 import { validateSpec } from './spec.js';
 import { mintV3RunId, type RunChatBinding } from './grill-state.js';
@@ -249,10 +249,10 @@ export function compileSavedWorkflowFromRun(
     : {
         ...loaded,
         dag: effective.dag,
-        botSnapshots: {
-          ...(loaded.botSnapshots as Record<string, unknown>),
-          ...Object.fromEntries(effective.botAdditions),
-        },
+        botSnapshots: Object.fromEntries(v3ApprovedBotScope(
+          new Map(Object.entries(loaded.botSnapshots as Record<string, BotSnapshot>)),
+          effective.botAdditions,
+        )),
       };
   const built = buildSavedWorkflowRevisionBaseline(source, opts);
   const { lintWarnings } = built;

@@ -48,7 +48,12 @@ import {
   type V3Node,
 } from './dag.js';
 import { loadDag } from './dag-loader.js';
-import { loadEffectiveV3Dag, snapshotForSelector } from './dag-revision.js';
+import {
+  loadEffectiveV3Dag,
+  snapshotForSelector,
+  v3ApprovedBotScope,
+  v3PendingProposalHolds,
+} from './dag-revision.js';
 import type { StoredEvent, V3ErrorClass, V3LoopRef } from './event-contract.js';
 import {
   foldV3ExternalAttempts,
@@ -1021,7 +1026,9 @@ export type V3ReassignOutcome =
         | 'not-reassignable'
         | 'stale-attempt'
         | 'revise-workflow-required'
-        | 'not-bot-run';
+        | 'not-bot-run'
+        /** A pending flow-revision proposal touches the node: decide it first. */
+        | 'revision-pending';
     };
 
 /** A caller holding the validated `run.json` passes its pinned executor;
@@ -1050,11 +1057,7 @@ function botSnapshotsFor(runDir: string, ctx: V3ReassignContext): ReadonlyMap<st
   ));
   // Bots an applied runtime revision brought in are part of the run's set.
   const base = ctx.dag ?? loadDag(join(runDir, 'dag.json'));
-  const additions = loadEffectiveV3Dag(runDir, base, readJournal(journalPathOf(runDir))).botAdditions;
-  if (additions.size === 0) return frozen;
-  const merged = new Map(frozen);
-  for (const [selector, snapshot] of additions) if (!merged.has(selector)) merged.set(selector, snapshot);
-  return merged;
+  return v3ApprovedBotScope(frozen, loadEffectiveV3Dag(runDir, base, readJournal(journalPathOf(runDir))).botAdditions);
 }
 
 /** Which node-scoped definition a reassign targets: an authored goal node, or
@@ -1155,6 +1158,7 @@ export async function reassignNode(
   if (!botSet.has(input.toLarkAppId)) return { kind: 'rejected', reason: 'not-in-bot-set' };
 
   const before = readJournal(journalPath);
+  if (v3PendingProposalHolds(before, input.nodeId)) return { kind: 'rejected', reason: 'revision-pending' };
   const selector = reassignTargetSelector(dag, before, input.nodeId);
   if (selector === undefined) return { kind: 'rejected', reason: 'unknown-node' };
   const frozenTarget = snapshotForSelector(snapshots, selector)?.larkAppId;
@@ -1179,6 +1183,8 @@ export async function reassignNode(
   }
 
   return withJournalMutationSync(journalPath, ({ events, append }): V3ReassignOutcome => {
+    // A proposal that touches the node may have been filed meanwhile.
+    if (v3PendingProposalHolds(events, input.nodeId)) return { kind: 'rejected', reason: 'revision-pending' };
     const snap = materialize([...events]);
     const from = snap.assignments.get(input.nodeId) ?? frozenTarget;
     if (from === input.toLarkAppId) return { kind: 'rejected', reason: 'same-bot' };

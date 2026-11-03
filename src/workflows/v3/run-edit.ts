@@ -35,6 +35,7 @@ import {
   foldV3Revisions,
   appendMissingV3RevisionFollowUps,
   loadEffectiveV3Dag,
+  v3ApprovedBotScope,
   parseV3DagPatch,
   planV3DagRevision,
   missingV3RevisionFollowUps,
@@ -229,11 +230,6 @@ function loadEditableRun(baseDir: string, runId: string): LoadedEditableRun {
   };
 }
 
-function knownBotsFor(frozen: ReadonlyMap<string, BotSnapshot>, additions: ReadonlyMap<string, BotSnapshot>): Map<string, BotSnapshot> {
-  const merged = new Map(frozen);
-  for (const [selector, snapshot] of additions) if (!merged.has(selector)) merged.set(selector, snapshot);
-  return merged;
-}
 
 function hasChanges(changes: V3RevisionChanges): boolean {
   return changes.added.length + changes.removed.length + changes.changed.length +
@@ -461,7 +457,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
     if (input.baseRevision !== effective.revision) {
       return { kind: 'conflict', currentRevision: effective.revision };
     }
-    const knownBots = knownBotsFor(run.frozenBots, effective.botAdditions);
+    const knownBots = v3ApprovedBotScope(run.frozenBots, effective.botAdditions);
     const planned = planV3DagRevision({
       dag: effective.dag,
       approvedDag: run.approvedDag,
@@ -507,7 +503,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
       by: actor,
       newBots,
     });
-    const effects = remapAssignTargets(plan.effects, knownBotsFor(knownBots, newBots));
+    const effects = remapAssignTargets(plan.effects, v3ApprovedBotScope(knownBots, newBots));
     const pending = effective.history.pending;
     const voidedRevisions: Array<{ revision: number; reason: V3VoidedProposal['reason'] }> = [];
     if (direct) {
@@ -722,7 +718,7 @@ function replanProposal(
   } catch (err) {
     return { ok: false, detail: err instanceof Error ? err.message : String(err) };
   }
-  const knownBots = knownBotsFor(run.frozenBots, effective.botAdditions);
+  const knownBots = v3ApprovedBotScope(run.frozenBots, effective.botAdditions);
   const planned = planV3DagRevision({
     dag: effective.dag,
     approvedDag: run.approvedDag,
@@ -743,7 +739,7 @@ function replanProposal(
   }
   return {
     ok: true,
-    effects: remapAssignTargets(planned.plan.effects, knownBotsFor(knownBots, newBots)),
+    effects: remapAssignTargets(planned.plan.effects, v3ApprovedBotScope(knownBots, newBots)),
     edges: planned.plan.edges,
     retries: planned.plan.retries,
   };
@@ -947,7 +943,7 @@ function proposalViewFromJournal(
       events,
       snap,
       patch: parsePinnedPatch(patchBytes),
-      knownBots: knownBotsFor(run.frozenBots, effective.botAdditions),
+      knownBots: v3ApprovedBotScope(run.frozenBots, effective.botAdditions),
     });
     return planned.ok ? { ...fallback, changes: planned.plan.changes } : fallback;
   } catch {
@@ -1027,7 +1023,7 @@ export function projectV3RunStatus(baseDir: string, runId: string): V3RunStatusV
   const events = existsSync(journalPath) ? readJournal(journalPath) : [];
   const snap = materialize(events);
   const effective = loadEffectiveV3Dag(run.runDir, run.approvedDag, events);
-  const bots = knownBotsFor(run.frozenBots, effective.botAdditions);
+  const bots = v3ApprovedBotScope(run.frozenBots, effective.botAdditions);
   const attemptCounts = new Map<string, number>();
   const dispatchRevision = new Map<string, number>();
   for (const event of events) {

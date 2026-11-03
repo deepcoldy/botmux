@@ -1388,6 +1388,34 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
 
 /** Is a node (or a loop body instance of it) held back by a pending
  *  proposal? Loop body instance ids map back to their loop. */
+/**
+ * The run's approved bot scope (§13.5): the snapshots frozen at approval plus
+ * every bot the initiator approved into the run on a revision card (the
+ * `dag-revisions/NNN.bots.json` of applied revisions — `botAdditions` of the
+ * effective flow). The one definition of "approved": confirming an edit
+ * (a bot outside it is a `newBot`), reassigning from the blocked card, and
+ * the engine's reassignment all read it. Frozen entries win a selector clash.
+ */
+export function v3ApprovedBotScope(
+  frozen: ReadonlyMap<string, BotSnapshot>,
+  botAdditions: ReadonlyMap<string, BotSnapshot>,
+): Map<string, BotSnapshot> {
+  const scope = new Map(frozen);
+  for (const [selector, snapshot] of botAdditions) if (!scope.has(selector)) scope.set(selector, snapshot);
+  return scope;
+}
+
+/** A pending proposal touches `nodeId` (or the loop it runs in): answering
+ *  its ask or reassigning it now would be overtaken by the proposal's
+ *  decision, so both wait for the revision card to be decided. */
+export function v3PendingProposalHolds(events: readonly StoredEvent[], nodeId: string): boolean {
+  const pending = foldV3Revisions(events).pending;
+  if (!pending) return false;
+  const loopId = events.find((event): event is Extract<StoredEvent, { type: 'nodeDispatched' }> =>
+    event.type === 'nodeDispatched' && event.nodeId === nodeId && !!event.loop)?.loop?.loopId;
+  return v3NodeHeldByProposal(new Set(pending.touched), nodeId, loopId);
+}
+
 export function v3NodeHeldByProposal(
   pendingTouched: ReadonlySet<string> | undefined,
   nodeId: string,

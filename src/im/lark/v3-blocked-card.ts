@@ -43,7 +43,7 @@ export interface V3ReassignActionValue {
 export interface V3BlockedReassignOffer {
   /** 当前执行这个节点的 Bot 名。 */
   currentName: string;
-  /** 现在能改派过去的 Bot（本 run 批准时选定的 Bot 里、当前合格的）。 */
+  /** 现在能改派过去的 Bot（本 run 批准范围里、当前合格的）。 */
   candidates: Array<{ larkAppId: string; label: string }>;
   /** 批准时选定、但现在不能用的 Bot 及原因。 */
   unavailable: Array<{ label: string; why: string }>;
@@ -137,7 +137,8 @@ function reassignElements(input: V3BlockedCardInput, nonce: string): Array<Recor
         tag: 'lark_md',
         content:
           `**改派**（只有发起人能操作）\n当前执行：${escapeMd(short(offer.currentName, 40))}。` +
-          '只能改派给本 run 批准时选定的 Bot，暂不支持改派给其他 Bot。' +
+          '只能改派给本 run 已批准的 Bot（批准时选定的，或在修改确认卡上批准加入的）；' +
+          '要换成其他 Bot，请让主 Bot 提交流程修改。' +
           (unavailable ? `\n以下 Bot 现在不能接手：${unavailable}` : ''),
       },
     },

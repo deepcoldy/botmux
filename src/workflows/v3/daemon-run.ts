@@ -81,7 +81,7 @@ import {
   type V3ErrorClass,
 } from './journal.js';
 import { materialize } from './state.js';
-import { foldV3Revisions, loadEffectiveV3Dag, v3NodeHeldByProposal } from './dag-revision.js';
+import { loadEffectiveV3Dag, v3PendingProposalHolds } from './dag-revision.js';
 import {
   reconcileV3RevisionProposals,
   type V3RevisionCardView,
@@ -1360,12 +1360,8 @@ export function requestV3Retry(
   // A pending proposal touching this node would, once approved, re-run it as
   // a fresh instance — the answer would be silently dropped. Keep the card
   // answerable and ask for the proposal to be decided first.
-  if (input.answer) {
-    const pending = foldV3Revisions(events).pending;
-    const loopId = [...snap.loops.keys()].find((id) => nodeId.startsWith(`${id}.i`));
-    if (pending && v3NodeHeldByProposal(new Set(pending.touched), nodeId, loopId)) {
-      return { kind: 'stale-run', reason: 'revision-pending' };
-    }
+  if (input.answer && v3PendingProposalHolds(events, nodeId)) {
+    return { kind: 'stale-run', reason: 'revision-pending' };
   }
   let answer: { path: string; preview: string; by: string } | undefined;
   if (input.answer) {
