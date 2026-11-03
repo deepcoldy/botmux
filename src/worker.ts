@@ -9369,6 +9369,24 @@ function noteClaudeBridgeTurnStarted(): void {
   bridgeBlindTurnWatch.noteTurnStarted(bridgeReadPosition(), Date.now());
 }
 
+/** 压缩 hook 只标记维护状态，不能打开 ready gate 或宣告模型回复结束。 */
+let claudeCompactionInputSnapshot: {
+  webGeneration: number;
+  writtenInput: typeof lastWrittenCliInput;
+} | undefined;
+
+function handleClaudeCompactionSignal(startedAtMs: number): void {
+  if (lastInitConfig?.cliId !== 'claude-code') return;
+  if (lastWebTerminalInputAtMs > startedAtMs) return;
+  if (bridgeBlindTurnWatch.noteCompactionStarted(bridgeQueue.peek().length > 0, startedAtMs)) {
+    claudeCompactionInputSnapshot = {
+      webGeneration: webTerminalInputGeneration,
+      writtenInput: lastWrittenCliInput,
+    };
+  }
+  log('Claude PreCompact maintenance signal received; not a model reply');
+}
+
 /** Prompt-ready edge: did the bridge read the turn Claude just ran? For an
  *  unread one, first locate the transcript Claude really writes and replay the
  *  unread run from it; failing that, tell the group once rather than let the
@@ -9377,7 +9395,12 @@ function judgeClaudeBridgeTurn(): void {
   if (!bridgeJsonlPath) return;
   // Judge what is on disk now, not what the last poll happened to drain.
   try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest before the turn check failed: ${err.message}`); }
-  const verdict = bridgeBlindTurnWatch.noteTurnEnded(bridgeReadPosition(), Date.now());
+  const inputDuringCompaction = claudeCompactionInputSnapshot !== undefined
+    && (webTerminalInputGeneration !== claudeCompactionInputSnapshot.webGeneration
+      || lastWrittenCliInput !== claudeCompactionInputSnapshot.writtenInput);
+  const verdict = bridgeBlindTurnWatch.noteTurnEnded(bridgeReadPosition(), Date.now(),
+    bridgeQueue.peek().length > 0 || inputDuringCompaction);
+  claudeCompactionInputSnapshot = undefined;
   if (verdict.kind !== 'blind') return;
   log(`Bridge read nothing from ${bridgeJsonlPath} during a ${Math.round((Date.now() - verdict.turnStartedAtMs) / 1000)}s ${cliName()} turn; locating the transcript it writes`);
   if (relocateUnreadClaudeTranscript(verdict.blindSinceMs)) {
@@ -10041,6 +10064,7 @@ function stopBridgeWatcher(): void {
   orcaClaudeWebHistorySignature = undefined;
   bridgeFingerprintScanLastMs.clear();
   bridgeBlindTurnWatch.reset();
+  claudeCompactionInputSnapshot = undefined;
   // Attribution belongs to the CLI generation whose transcript we watched.
   // A fresh backend must not inherit a terminal/fingerprint from the exited
   // process; durable replay is owned by the receiver with a new attempt.
@@ -31591,7 +31615,14 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'claude_compaction_start': {
+      handleClaudeCompactionSignal(msg.startedAtMs);
+      if (msg.requestId) send({ type: 'session_ready_ack', requestId: msg.requestId });
+      break;
+    }
+
     case 'session_ready': {
+      if (msg.source === 'compact') bridgeBlindTurnWatch.noteCompactionFinished();
       // Claude-family SessionStart hooks run in parallel. This signal proves
       // the startup selector is behind us, but a slower project hook can still
       // be running and Claude does not render its real prompt until ALL hooks

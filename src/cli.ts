@@ -17250,6 +17250,19 @@ async function cmdSessionReady(): Promise<void> {
   process.exit(0);
 }
 
+/** 独立版本化入口与路由：新 CLI / 旧 daemon / 旧 worker 混装时只能丢维护
+ *  信号，不能把它降级成 session-ready。 */
+async function cmdClaudeCompactionStart(): Promise<void> {
+  const startedAtMs = Math.floor(Date.now() - process.uptime() * 1000);
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (payload?.hook_event_name !== 'PreCompact') return;
+    await postSessionScopedSignal('/api/claude-compaction-start-v1', { startedAtMs });
+  } catch { /* hook best-effort，绝不阻塞 CLI */ }
+}
+
 // ─── 会话作用域信号投递（session-ready / turn-idle 共用） ──────────────────────
 //
 // 两条信号同构：会话归属只靠子进程继承的 env（worker spawn 时设的
@@ -20024,6 +20037,10 @@ switch (command) {
       workerOnline: isCodexNotifierWorkerStateFresh(worker),
       worker,
     }, null, 2));
+    break;
+  }
+  case '__claude-compaction-v1': {
+    await cmdClaudeCompactionStart();
     break;
   }
   case 'session-ready': {

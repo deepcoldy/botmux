@@ -121,6 +121,11 @@ export function sessionReadyHookCommand(): string {
   return renderShellCommand(undefined, 'session-ready');
 }
 
+/** 版本化维护入口：旧 CLI 不认识该命令时不发任何 ready 信号。 */
+export function claudeCompactionHookCommand(): string {
+  return renderShellCommand(undefined, '__claude-compaction-v1');
+}
+
 /**
  * 构造 `botmux zcode-session-hook` 的 **argv 形式** `{ cmd, args }`。
  *
