@@ -242,11 +242,54 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 
 > ZMX 无法执行文件沙盒或实际生效的读隔离，开启这些边界的配置组合会 fail closed，详见 [ZMX 后端边界](/zmx#不支持的组合)。
 
-### MIX actor write 灰度门禁
+### 受保护的本地 MCP 能力
 
-MIX 插件的 shared read 不依赖写入灰度。actor write 默认关闭；只有 daemon 启动环境同时设置 `BOTMUX_MIX_ACTOR_WRITE_ENABLED=1` 和非空 `BYTEDCLI_AI_AUTH_APP_KEY` 时，才会为启用 `mix` 插件的会话按 broker 提供独立的一次性 App Key 通道。App Key 不进入 worker、Mojo、per-bot 环境、插件通用环境或 argv。
+本地 stdio MCP 服务可以在插件私有的 `mcp/index.json` 中申请一个可选受保护能力。能力 ID 对 Botmux 是不透明数据；通用说明使用非业务 fixture：
 
-即使门禁开启，`actorWriteAllowed` 仍只会在 Linux、本地 PTY、`sandbox: "oncall"`、MCP Unix socket 已挂载、PID namespace 未降级，并且 `sandboxNetworkPolicy.private.mode` 为 `block` 且未使用 `trusted-egress` 时置为 true。任一条件不满足时会话保持只读；不得以关闭沙盒、放宽网络策略或代理出口换取写能力。该门禁只能在 PPE 完成双用户身份、`employeeId` / `updateUid` 归属和无权限不改状态验证后开启。
+```json
+{
+  "transport": "stdio",
+  "command": ["node", "./mcp/server.js"],
+  "protectedCapability": "fixture.secret.v1"
+}
+```
+
+Streamable HTTP MCP 服务不能申请 `protectedCapability`，同时声明两者的插件描述会被拒绝。插件描述不提供密钥来源、主体策略或隔离规则；这些绑定只来自机器级配置。
+
+在 `bots.json` 中，`plugins` 数组只负责为当前 Bot 启用已安装插件：
+
+```json
+{
+  "plugins": ["fixture-plugin"]
+}
+```
+
+不要在 `bots.json` 中保存受保护能力绑定、密钥来源、密钥值或灰度状态。运维人员在机器级 `~/.botmux/config.json` 中绑定不透明能力 ID：
+
+```json
+{
+  "protectedMcpCapabilities": {
+    "fixture.secret.v1": {
+      "enabled": false,
+      "allowedPluginIds": ["fixture-plugin"],
+      "secret": {
+        "source": "env",
+        "name": "FIXTURE_PROTECTED_SECRET"
+      },
+      "principal": "verified-human-email",
+      "containmentProfile": "local-stdio-secret-v1",
+      "isolation": {
+        "protectedHomePaths": [".fixture-credential"],
+        "redactEnv": ["FIXTURE_AUTH_TOKEN"]
+      }
+    }
+  }
+}
+```
+
+只有显式 JSON 布尔值 `true` 才会启用绑定。缺少 `enabled`、设为 `false`、字符串 `"true"`、数字 `1` 或任何其它值时均保持关闭。密钥值只存在于 daemon 启动环境，配置中只写环境变量名。Botmux 会从 worker 和插件通用环境删除该变量及 `redactEnv` 中的变量，并只通过全新的一次性文件描述符通道把已授权密钥交给本地 stdio MCP 进程，不放入 argv 或通用环境变量。
+
+能力关闭、所需的已验证真人主体缺失，或固定隔离配置无法生效时，Botmux 不授予能力、也不打开密钥通道。本地 stdio MCP 服务仍可启动并提供只读工具；受保护写入必须失败关闭。只要匹配的插件已启用，即使能力本身关闭，配置的隔离路径和环境变量清理仍然生效。
 
 ## 卡片与终端
 

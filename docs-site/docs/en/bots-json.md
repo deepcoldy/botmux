@@ -237,11 +237,54 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `sandboxNetwork` | Network policy. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` to block normal network egress |
 | `sandboxNetworkPolicy` | Granular destination IP policy object (Linux + PTY). Configures independent `public` and `private` IP filtering rules (`allow / block / allowlist / denylist`) and trusted proxy egress |
 
-### MIX actor-write rollout gate
+### Protected local MCP capabilities
 
-MIX shared reads do not depend on the write rollout. Actor writes are off by default. The daemon serves a fresh one-shot App Key channel for each MIX broker only when its startup environment contains both `BOTMUX_MIX_ACTOR_WRITE_ENABLED=1` and a non-empty `BYTEDCLI_AI_AUTH_APP_KEY`, and only for sessions enabling the `mix` plugin. The App Key is excluded from workers, Mojo, per-bot and generic plugin environments, and argv.
+A local stdio MCP server can request one optional protected capability in its plugin-private `mcp/index.json`. The capability ID is opaque to Botmux; use a non-business-specific fixture such as:
 
-Even with the gate enabled, `actorWriteAllowed` requires Linux, a new local PTY, `sandbox: "oncall"`, the mounted MCP Unix socket, a retained PID namespace, and a network policy with `private.mode: "block"` and no `trusted-egress`. Otherwise the session remains read-only. Enable the gate only after PPE validates two distinct users, `employeeId` / `updateUid` attribution, and denial without state change.
+```json
+{
+  "transport": "stdio",
+  "command": ["node", "./mcp/server.js"],
+  "protectedCapability": "fixture.secret.v1"
+}
+```
+
+`protectedCapability` is not supported for streamable HTTP MCP servers; a plugin descriptor that combines them is rejected. The descriptor does not supply the secret source, principal policy, or containment rules; those bindings come only from machine-level configuration.
+
+Within `bots.json`, the `plugins` array only enables installed plugins for that bot:
+
+```json
+{
+  "plugins": ["fixture-plugin"]
+}
+```
+
+Do not put protected capability bindings, secret sources, secret values, or rollout state in `bots.json`. Operators bind the opaque capability ID in the machine-level `~/.botmux/config.json`:
+
+```json
+{
+  "protectedMcpCapabilities": {
+    "fixture.secret.v1": {
+      "enabled": false,
+      "allowedPluginIds": ["fixture-plugin"],
+      "secret": {
+        "source": "env",
+        "name": "FIXTURE_PROTECTED_SECRET"
+      },
+      "principal": "verified-human-email",
+      "containmentProfile": "local-stdio-secret-v1",
+      "isolation": {
+        "protectedHomePaths": [".fixture-credential"],
+        "redactEnv": ["FIXTURE_AUTH_TOKEN"]
+      }
+    }
+  }
+}
+```
+
+Only the explicit JSON boolean `true` enables a binding. Missing `enabled`, `false`, the string `"true"`, numeric `1`, and every other value leave it disabled. The actual secret stays in the daemon startup environment; configuration stores only its environment-variable name. Botmux removes that variable and every configured `redactEnv` name from workers and generic plugin environments, and passes an authorized secret to the local stdio MCP process through a fresh one-shot file-descriptor channel instead of argv or a general environment variable.
+
+If the capability is disabled, a required verified human principal is missing, or the fixed containment profile cannot be enforced, Botmux grants no capability and opens no secret channel. The stdio MCP server can still start and expose read-only tools; protected writes must fail closed. Isolation paths and environment redaction remain active for a matching enabled plugin even while the capability itself is disabled.
 
 > ZMX cannot enforce the file sandbox or effective read isolation, so configurations that enable those boundaries fail closed; see [ZMX backend boundaries](/en/zmx#unsupported-combinations).
 
