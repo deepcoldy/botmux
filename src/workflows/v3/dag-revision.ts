@@ -314,6 +314,8 @@ export interface V3RevisionRecord {
   approvedBy?: string;
   rejected?: { by: string; reason: Extract<V3Event, { type: 'dagRevisionRejected' }>['reason']; detail?: string };
   effects?: V3RevisionEffects;
+  /** The proposal this one was carried from (see `dagRevisionProposed`). */
+  carriedFrom?: number;
 }
 
 export interface V3RevisionHistory {
@@ -370,6 +372,7 @@ export function foldV3Revisions(events: readonly StoredEvent[]): V3RevisionHisto
           ts: event.ts,
           reasons: [...event.reasons],
           touched: [...event.touched],
+          ...(event.carriedFrom !== undefined ? { carriedFrom: event.carriedFrom } : {}),
         };
         records.push(record);
         byRevision.set(event.revision, record);

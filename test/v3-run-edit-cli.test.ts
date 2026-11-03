@@ -81,6 +81,17 @@ describe('workflow edit responses', () => {
     expect(extra.filter((line) => mentions(line, 3))).toHaveLength(1);
     expect(extra.filter((line) => mentions(line, 4) && mentions(line, 6))).toHaveLength(1);
   });
+
+  it('says why each pending change was voided, and where each card ended up', () => {
+    const lineFor = (body: Record<string, unknown>) => respond(200, { ok: true, kind: 'applied', revision: 5, summary: 's', ...body })
+      .text.split('\n')[1]!;
+    const voided = (cause: string | undefined, card = 'frozen') => lineFor({ voidedProposals: [{ revision: 3, reason: 'stale', ...(cause ? { cause } : {}), card }] });
+    const causes = ['overlap', 'notApplicable', 'meaningChanged', 'carryFailed', undefined].map((cause) => voided(cause));
+    expect(new Set(causes).size).toBe(causes.length);
+    expect(voided('overlap', 'none')).not.toBe(voided('overlap', 'frozen'));
+    const carried = (card: string) => lineFor({ carriedProposals: [{ from: 4, revision: 6, card }] });
+    expect(new Set(['moved', 'posted', 'failed'].map(carried)).size).toBe(3);
+  });
 });
 
 describe('confirmation card', () => {

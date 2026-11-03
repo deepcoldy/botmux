@@ -152,6 +152,8 @@ export interface V3RevisionWait {
   /** Voided because a direct revision took effect first, but carried onto it
    *  unchanged as this revision: a decision on this one goes there. */
   carriedTo?: number;
+  /** Why a voided wait was voided (what its frozen card says). */
+  voidReason?: V3VoidedProposal['reason'];
 }
 
 export function v3RevisionWaitPath(runDir: string, revision: number): string {
@@ -190,7 +192,7 @@ function settleRevisionWaitOnce(
   revision: number,
   status: Exclude<V3RevisionWaitStatus, 'pending'>,
   by: string,
-  extra: Pick<V3RevisionWait, 'carriedTo'> = {},
+  extra: Pick<V3RevisionWait, 'carriedTo' | 'voidReason'> = {},
 ): { wait: V3RevisionWait; changed: boolean } | undefined {
   const path = v3RevisionWaitPath(runDir, revision);
   if (!existsSync(path)) return undefined;
@@ -281,9 +283,19 @@ export interface V3VoidedGate {
   cardMessageIds: string[];
 }
 
+/** Why a direct revision voided a pending proposal instead of carrying it:
+ *  `overlap` — the two involve the same nodes; `notApplicable` — on the new
+ *  version its patch no longer applies (e.g. a budget the direct revision
+ *  spent); `meaningChanged` — it would now change something else or need
+ *  other confirmation reasons than its card shows; `carryFailed` — carrying
+ *  it could not be recorded. */
+export type V3ProposalVoidCause = 'overlap' | 'notApplicable' | 'meaningChanged' | 'carryFailed';
+
 export interface V3VoidedProposal {
   revision: number;
   reason: 'stale' | 'superseded' | 'runEnded';
+  /** Set when a direct revision voided it (reason `stale`). */
+  cause?: V3ProposalVoidCause;
   view?: V3RevisionCardView;
   cardMessageIds: string[];
 }
@@ -421,13 +433,15 @@ function voidProposalWait(
   runDir: string,
   revision: number,
   reason: V3VoidedProposal['reason'],
+  cause?: V3ProposalVoidCause,
 ): V3VoidedProposal | undefined {
   try {
-    const settled = settleRevisionWaitOnce(runDir, revision, 'voided', 'system');
+    const settled = settleRevisionWaitOnce(runDir, revision, 'voided', 'system', { voidReason: reason });
     if (!settled?.changed) return undefined;
     return {
       revision,
       reason,
+      ...(cause ? { cause } : {}),
       view: settled.wait.view,
       cardMessageIds: settled.wait.cardMessageIds ?? [],
     };
@@ -479,7 +493,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
         baseRevision: number;
         plan: V3RevisionPlan;
         reasons: V3RevisionConfirmReason[];
-        voidedRevisions: Array<{ revision: number; reason: V3VoidedProposal['reason'] }>;
+        voidedRevisions: Array<{ revision: number; reason: V3VoidedProposal['reason']; cause?: V3ProposalVoidCause }>;
         carried: CarriedInJournal[];
       };
 
@@ -551,7 +565,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
     });
     const effects = remapAssignTargets(plan.effects, v3ApprovedBotScope(knownBots, newBots));
     const pending = effective.history.pending;
-    const voidedRevisions: Array<{ revision: number; reason: V3VoidedProposal['reason'] }> = [];
+    const voidedRevisions: Array<{ revision: number; reason: V3VoidedProposal['reason']; cause?: V3ProposalVoidCause }> = [];
     const carried: CarriedInJournal[] = [];
     if (direct) {
       const appended: StoredEvent[] = [];
@@ -587,7 +601,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
         // touched nodes stay held without a gap). One it overlaps — or that
         // no longer means exactly what its card showed — is void.
         const next = revision + 1;
-        let carry: ReturnType<typeof carryPendingProposal> = { ok: false };
+        let carry: ReturnType<typeof carryPendingProposal> = { ok: false, cause: 'carryFailed' };
         let carriedWritten: WrittenRevision | undefined;
         try {
           carry = carryPendingProposal({
@@ -608,16 +622,12 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
         } catch {
           // The direct revision is already journaled: a carry that cannot
           // be prepared falls back to voiding the proposal, never to failing.
-          carry = { ok: false };
+          carry = { ok: false, cause: 'carryFailed' };
         }
         if (carry.ok && carriedWritten) {
-          append({
-            type: 'dagRevisionRejected',
-            revision: pending.revision,
-            by: 'system',
-            reason: 'superseded',
-            detail: `revision ${revision} took effect first; carried onto it as ${next}`,
-          }, { durable: true });
+          // One line: the new proposal supersedes the old one as it lands
+          // (the fold marks the earlier pending proposal superseded), so a
+          // crash can never leave the old one closed without its successor.
           append({
             type: 'dagRevisionProposed',
             revision: next,
@@ -629,6 +639,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
             ...(pending.auto ? { auto: pending.auto } : {}),
             reasons: [...(pending.reasons ?? [])],
             touched: carry.plan.touched,
+            carriedFrom: pending.revision,
           }, { durable: true });
           carried.push({
             fromRevision: pending.revision,
@@ -641,9 +652,9 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
             revision: pending.revision,
             by: 'system',
             reason: 'stale',
-            detail: `revision ${revision} took effect first`,
+            detail: `revision ${revision} took effect first (${carry.ok ? 'carryFailed' : carry.cause})`,
           }, { durable: true });
-          voidedRevisions.push({ revision: pending.revision, reason: 'stale' });
+          voidedRevisions.push({ revision: pending.revision, reason: 'stale', cause: carry.ok ? 'carryFailed' : carry.cause });
         }
       }
     } else {
@@ -674,10 +685,22 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
   });
 
   if (locked.kind !== 'committed') return locked;
-  const voidedProposals = locked.voidedRevisions
-    .map((item) => voidProposalWait(runDir, item.revision, item.reason))
-    .filter((item): item is V3VoidedProposal => !!item);
+  // Every voided proposal is listed (so the caller can say why), with its
+  // card only when this call is the one that voided its wait.
+  const voidedProposals: V3VoidedProposal[] = locked.voidedRevisions.map((item) =>
+    voidProposalWait(runDir, item.revision, item.reason, item.cause) ?? {
+      revision: item.revision,
+      reason: item.reason,
+      ...(item.cause ? { cause: item.cause } : {}),
+      cardMessageIds: [],
+    });
   if (locked.direct) {
+    const carriedProposals: V3CarriedProposal[] = [];
+    for (const item of locked.carried) {
+      const moved = moveProposalWait(runDir, input.runId, run, item);
+      if (moved.kind === 'carried') carriedProposals.push(moved.carried);
+      else voidedProposals.push(moved.voided);
+    }
     return {
       kind: 'applied',
       revision: locked.revision,
@@ -685,7 +708,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
       changes: locked.plan.changes,
       voidedGates: voidGateWaits(runDir, locked.plan.effects),
       voidedProposals,
-      carriedProposals: locked.carried.map((item) => moveProposalWait(runDir, input.runId, run, item)),
+      carriedProposals,
     };
   }
   const view = cardView(
@@ -764,10 +787,12 @@ function carryPendingProposal(input: {
     events: readonly StoredEvent[];
     knownBots: ReadonlyMap<string, BotSnapshot>;
   };
-}): { ok: true; plan: V3RevisionPlan; patch: V3DagPatch; newBots: Map<string, BotSnapshot> } | { ok: false } {
+}):
+  | { ok: true; plan: V3RevisionPlan; patch: V3DagPatch; newBots: Map<string, BotSnapshot> }
+  | { ok: false; cause: V3ProposalVoidCause } {
   const { run, pending, before, direct } = input;
   const pinned = readPinnedProposal(run, pending);
-  if (!pinned.ok) return { ok: false };
+  if (!pinned.ok) return { ok: false, cause: 'carryFailed' };
   const shown = planV3DagRevision({
     dag: before.effective.dag,
     approvedDag: run.approvedDag,
@@ -776,9 +801,9 @@ function carryPendingProposal(input: {
     patch: pinned.patch,
     knownBots: before.knownBots,
   });
-  if (!shown.ok || v3RevisionDigest(dagFileBytes(shown.plan.dag)) !== pending.sha256) return { ok: false };
+  if (!shown.ok || v3RevisionDigest(dagFileBytes(shown.plan.dag)) !== pending.sha256) return { ok: false, cause: 'notApplicable' };
   const ours = v3RevisionInvolvedNodes(direct.plan);
-  for (const nodeId of v3RevisionInvolvedNodes(shown.plan)) if (ours.has(nodeId)) return { ok: false };
+  for (const nodeId of v3RevisionInvolvedNodes(shown.plan)) if (ours.has(nodeId)) return { ok: false, cause: 'overlap' };
   const rebased = planV3DagRevision({
     dag: direct.plan.dag,
     approvedDag: run.approvedDag,
@@ -787,47 +812,86 @@ function carryPendingProposal(input: {
     patch: pinned.patch,
     knownBots: direct.knownBots,
   });
-  if (!rebased.ok) return { ok: false };
+  if (!rebased.ok) return { ok: false, cause: 'notApplicable' };
   const reasons = v3ConfirmReasonsForTurn(proposalTurnClass(pending.by, run.initiatorOpenId), rebased.plan.reasons);
-  if (!sameReasons(reasons, pending.reasons ?? [])) return { ok: false };
-  if (JSON.stringify(rebased.plan.changes) !== JSON.stringify(shown.plan.changes)) return { ok: false };
+  if (!sameReasons(reasons, pending.reasons ?? [])) return { ok: false, cause: 'meaningChanged' };
+  if (JSON.stringify(rebased.plan.changes) !== JSON.stringify(shown.plan.changes)) return { ok: false, cause: 'meaningChanged' };
   return { ok: true, plan: rebased.plan, patch: pinned.patch, newBots: pinned.newBots };
 }
 
 /**
- * After the lock: the carried revision gets its wait first, then the old wait
- * is voided pointing at it — from then on a decision clicked on the old card
- * is taken for the carried revision. Only when that compare-and-set wins does
- * the carried revision take over the old card's messages (read from the very
- * state the CAS replaced), so its card is shown in place. If a click had
- * already decided the old wait, that card shows the click's outcome and the
- * carried revision gets a card of its own. A failed write here is healed by
- * cold attach (a pending proposal without a wait is recreated and re-posted).
+ * After the journal carried a proposal (live, right after the lock; or on cold
+ * attach, after a crash): the carried revision gets its wait first (kept if a
+ * crash left one), then the old wait is voided pointing at it — from then on a
+ * decision clicked on the old card is taken for the carried revision. Only
+ * when that compare-and-set wins does the carried revision take over the old
+ * card's messages (read from the very state the CAS replaced), so its card is
+ * shown in place; if a click had already decided the old wait, that card
+ * shows the click's outcome and the carried revision gets a card of its own.
+ *
+ * A carried revision whose wait cannot be written could never be decided (a
+ * click on its card would find nothing): it is voided in the journal, and the
+ * old wait is voided so its card freezes as void — reported as a voided
+ * proposal (`carryFailed`) instead.
  */
 function moveProposalWait(
   runDir: string,
   runId: string,
   run: LoadedEditableRun,
   item: CarriedInJournal,
-): V3CarriedProposal {
-  const out: V3CarriedProposal = { ...item, cardMessageIds: [] };
+): { kind: 'carried'; carried: V3CarriedProposal } | { kind: 'voided'; voided: V3VoidedProposal } {
   try {
-    writeRevisionWait(runDir, {
-      runId,
-      revision: item.revision,
-      status: 'pending',
-      ...(run.initiatorOpenId ? { initiatorOpenId: run.initiatorOpenId } : {}),
-      view: item.view,
-      createdAt: Date.now(),
-    });
-    const moved = settleRevisionWaitOnce(runDir, item.fromRevision, 'voided', 'system', { carriedTo: item.revision });
-    const inherited = moved?.changed ? moved.wait.cardMessageIds ?? [] : [];
-    for (const messageId of inherited) recordV3RevisionCardMessage(runDir, item.revision, messageId);
-    return { ...out, cardMessageIds: inherited };
+    if (!readV3RevisionWait(runDir, item.revision)) {
+      writeRevisionWait(runDir, {
+        runId,
+        revision: item.revision,
+        status: 'pending',
+        ...(run.initiatorOpenId ? { initiatorOpenId: run.initiatorOpenId } : {}),
+        view: item.view,
+        createdAt: Date.now(),
+      });
+    }
   } catch {
-    // See above: cold attach heals the wait; the daemon posts a fresh card.
-    return out;
+    return { kind: 'voided', voided: abandonCarriedProposal(runDir, item) };
   }
+  let inherited: string[] = [];
+  try {
+    const moved = settleRevisionWaitOnce(runDir, item.fromRevision, 'voided', 'system', {
+      carriedTo: item.revision,
+      voidReason: 'superseded',
+    });
+    inherited = moved?.changed ? moved.wait.cardMessageIds ?? [] : [];
+    for (const messageId of inherited) recordV3RevisionCardMessage(runDir, item.revision, messageId);
+  } catch {
+    // The old wait stays as it is: its card stays clickable and a click is
+    // refused as stale (its record was superseded); the new card is posted.
+  }
+  return { kind: 'carried', carried: { ...item, cardMessageIds: inherited } };
+}
+
+/** See {@link moveProposalWait}: void a carried revision nobody can decide. */
+function abandonCarriedProposal(runDir: string, item: CarriedInJournal): V3VoidedProposal {
+  try {
+    withJournalMutationSync(join(runDir, 'journal.ndjson'), ({ events, append }) => {
+      const record = foldV3Revisions(events).records.find((candidate) => candidate.revision === item.revision);
+      if (record?.state !== 'pending') return;
+      append({
+        type: 'dagRevisionRejected',
+        revision: item.revision,
+        by: 'system',
+        reason: 'stale',
+        detail: `carried from revision ${item.fromRevision}, but its wait could not be recorded`,
+      }, { durable: true });
+    });
+  } catch {
+    // Cold attach recreates a missing wait for a still-pending proposal.
+  }
+  return voidProposalWait(runDir, item.fromRevision, 'stale', 'carryFailed') ?? {
+    revision: item.fromRevision,
+    reason: 'stale',
+    cause: 'carryFailed',
+    cardMessageIds: [],
+  };
 }
 
 /** The patch file pins the ops plus provenance; only `{ ops, note }` is the
@@ -1031,7 +1095,7 @@ function finishDecision(
   try {
     withFileLockSync(v3RevisionWaitPath(run.runDir, revision), () => {
       const current = readV3RevisionWait(run.runDir, revision);
-      if (current) writeRevisionWait(run.runDir, { ...current, status: 'voided' });
+      if (current) writeRevisionWait(run.runDir, { ...current, status: 'voided', voidReason: 'stale' });
     });
   } catch {
     // Display state only.
@@ -1047,6 +1111,9 @@ export interface V3RevisionRecovery {
   binding?: RunChatBinding;
   /** Pending proposals whose card should be (re)posted. */
   repost: V3RevisionCardView[];
+  /** Carries a crash interrupted, finished now: show each in its old card's
+   *  messages (or post a card when there are none). */
+  moved: V3CarriedProposal[];
   /** Proposals voided while the daemon was down (freeze their cards). */
   voided: V3VoidedProposal[];
   /** A decision was healed into the journal → drive the run. */
@@ -1083,6 +1150,7 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
         runDir,
         ...(run.binding ? { binding: run.binding } : {}),
         repost: [],
+        moved: [],
         voided: [],
         resume: false,
       };
@@ -1107,14 +1175,34 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
       const history = foldV3Revisions(events);
       const snap = materialize(events);
       const active = snap.runStatus === 'running' || snap.runStatus === 'blocked';
+      // A carry the journal holds but whose waits never moved (crash right
+      // after its line): the old wait still waits for the move, not a void.
+      const unmoved = new Map<number, V3RevisionRecord>();
+      if (active) {
+        for (const record of history.records) {
+          if (record.state !== 'pending' || record.carriedFrom === undefined) continue;
+          if (readV3RevisionWait(runDir, record.carriedFrom)?.status === 'pending') unmoved.set(record.carriedFrom, record);
+        }
+      }
       for (const record of history.records) {
         if (!record.reasons) continue; // a direct revision, never a proposal
+        if (unmoved.has(record.revision)) continue; // moved below, with its successor
         const wait = readV3RevisionWait(runDir, record.revision);
         if (record.state === 'pending') {
           if (!active) {
             settleProposalInJournal(run, record.revision, 'reject', 'system');
             const voided = voidProposalWait(runDir, record.revision, 'runEnded');
             if (voided) rec.voided.push(voided);
+            continue;
+          }
+          if (record.carriedFrom !== undefined && (!wait || unmoved.has(record.carriedFrom))) {
+            const moved = moveProposalWait(runDir, runId, run, {
+              fromRevision: record.carriedFrom,
+              revision: record.revision,
+              view: wait?.view ?? proposalViewFromJournal(run, record, events, snap),
+            });
+            if (moved.kind === 'carried') rec.moved.push(moved.carried);
+            else rec.voided.push(moved.voided);
             continue;
           }
           if (!wait) {
@@ -1146,7 +1234,7 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
           if (voided) rec.voided.push(voided);
         }
       }
-      if (rec.repost.length > 0 || rec.voided.length > 0 || rec.resume || rec.followUpError) out.push(rec);
+      if (rec.repost.length > 0 || rec.moved.length > 0 || rec.voided.length > 0 || rec.resume || rec.followUpError) out.push(rec);
     } catch {
       // One corrupt run must not stop the scan (same posture as gates).
       continue;

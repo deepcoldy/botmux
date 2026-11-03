@@ -70,11 +70,19 @@ function reasonText(reasons: unknown): string {
     .join('；');
 }
 
-function revisionRefs(value: unknown): Array<{ revision: number; from?: unknown }> {
+function revisionRefs(value: unknown): Array<{ revision: number; from?: unknown; cause?: unknown; card?: unknown }> {
   if (!Array.isArray(value)) return [];
-  return value.filter((item): item is { revision: number; from?: unknown } =>
+  return value.filter((item): item is { revision: number; from?: unknown; cause?: unknown; card?: unknown } =>
     !!item && typeof item === 'object' && typeof (item as { revision?: unknown }).revision === 'number');
 }
+
+/** Why a direct edit voided a pending change (V3ProposalVoidCause). */
+const VOID_CAUSE_TEXT: Record<string, string> = {
+  overlap: '和这次修改涉及同一批节点',
+  notApplicable: '套到新版本上已无法生效（例如重做额度已被这次修改用完，或它依赖的节点变了）',
+  meaningChanged: '套到新版本上后，改动内容或需要确认的原因和确认卡上的不一样了',
+  carryFailed: '没能顺延到新版本（记录写入失败）',
+};
 
 /** Map the daemon's edit response to CLI output + exit code. */
 export function formatV3RunEditResponse(
@@ -90,10 +98,14 @@ export function formatV3RunEditResponse(
   if (response.ok && body.kind === 'applied') {
     const lines = [`✅ run ${runId} 已改为第 ${String(body.revision)} 版：${String(body.summary ?? '')}`];
     for (const item of revisionRefs(body.voidedProposals)) {
-      lines.push(`⚠️ 第 ${item.revision} 版待确认修改和这次修改涉及同一批节点，已作废（确认卡已冻结）；需要的话基于第 ${String(body.revision)} 版重新提。`);
+      const card = item.card === 'frozen' ? '（确认卡已冻结）' : item.card === 'failed' ? '（确认卡没能冻结，点了也不会生效）' : '';
+      lines.push(`⚠️ 第 ${item.revision} 版待确认修改${VOID_CAUSE_TEXT[String(item.cause)] ?? '在这次修改生效后已不再适用'}，已作废${card}；需要的话基于第 ${String(body.revision)} 版重新提。`);
     }
     for (const item of revisionRefs(body.carriedProposals)) {
-      lines.push(`⏳ 第 ${String(item.from)} 版待确认修改和这次修改不相关，顺延为第 ${item.revision} 版，继续等发起人确认（确认卡已更新）。`);
+      const card = item.card === 'moved' ? '原确认卡已更新为新版本'
+        : item.card === 'posted' ? '已发新的确认卡'
+          : '确认卡暂时没发出去，daemon 恢复后会重发';
+      lines.push(`⏳ 第 ${String(item.from)} 版待确认修改和这次修改不相关，顺延为第 ${item.revision} 版，继续等发起人确认（${card}）。`);
     }
     return { exitCode: 0, text: lines.join('\n') };
   }

@@ -184,6 +184,10 @@ export type V3Event =
       /** Existing nodes the proposal touches; they are not dispatched while
        *  it is pending (the rest of the run keeps going). */
       touched: string[];
+      /** The pending proposal this one carries onto a direct revision that
+       *  took effect first (same patch, same proposer, re-based): landing
+       *  supersedes it, and its card and wait move here. */
+      carriedFrom?: number;
     }
   | { type: 'dagRevisionApproved'; revision: number; by: string }
   | {

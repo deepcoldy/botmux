@@ -777,11 +777,17 @@ import {
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3RerunGrantCard, buildV3RevisionCard } from './im/lark/v3-revision-card.js';
 import {
+  createV3RevisionCardSync,
+  freezeV3VoidedRevisionCard,
+  moveV3CarriedRevisionCard,
+  type V3CarriedCardOutcome,
+  type V3VoidedCardOutcome,
+} from './im/lark/v3-revision-card-sync.js';
+import {
   applyV3RunEdit,
   postV3RerunGrantCardOnce,
   projectV3RunStatus,
   v3RunNeedsDriveAfterRevision,
-  readV3RevisionWait,
   recordV3RevisionCardMessage,
   type V3CarriedProposal,
   type V3RevisionCardView,
@@ -6914,7 +6920,8 @@ const v3GateRunner = createV3GateRunner({
     } catch { /* best effort */ }
   },
   postRevisionCard: (binding, view, runId) => postV3RevisionCard(binding, view, runId),
-  freezeRevisionCards: (binding, runId, voided) => freezeV3RevisionArtifacts(binding, runId, [], voided),
+  freezeRevisionCards: async (binding, runId, voided) => { await freezeV3RevisionArtifacts(binding, runId, [], voided); },
+  moveRevisionCards: async (binding, runId, carried) => { await moveV3RevisionCards(binding, runId, carried); },
   postBlockedCard: async (binding, info, runId) => {
     // Bot-executed runs get the 「改派」 section (re-probed now); every other
     // run gets exactly the plain card.
@@ -8045,17 +8052,25 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
     return reply(500, { ok: false, error: err instanceof Error ? err.message : String(err) });
   }
   switch (outcome.kind) {
-    case 'applied':
-      void freezeV3RevisionArtifacts(binding, runId, outcome.voidedGates, outcome.voidedProposals);
-      void moveV3RevisionCards(binding, runId, outcome.carriedProposals);
+    case 'applied': {
       if (v3RunNeedsDriveAfterRevision(v3DefaultBaseDir(), runId)) v3GateRunner.driveDetached(runId);
+      // The agent tells the user which pending changes this one voided (and
+      // why) and which keep waiting under a new number — and where their
+      // cards ended up, so the cards' effects are awaited before replying.
+      const [voidedCards, carriedCards] = await Promise.all([
+        freezeV3RevisionArtifacts(binding, runId, outcome.voidedGates, outcome.voidedProposals),
+        moveV3RevisionCards(binding, runId, outcome.carriedProposals),
+      ]);
       return reply(200, {
         ok: true, kind: 'applied', runId, revision: outcome.revision, summary: outcome.summary, changes: outcome.changes,
-        // So the agent can tell the user which pending changes this one
-        // voided, and which keep waiting under a new number.
-        voidedProposals: outcome.voidedProposals.map((item) => ({ revision: item.revision, reason: item.reason })),
-        carriedProposals: outcome.carriedProposals.map((item) => ({ from: item.fromRevision, revision: item.revision })),
+        voidedProposals: outcome.voidedProposals.map((item, index) => ({
+          revision: item.revision, reason: item.reason, ...(item.cause ? { cause: item.cause } : {}), card: voidedCards[index],
+        })),
+        carriedProposals: outcome.carriedProposals.map((item, index) => ({
+          from: item.fromRevision, revision: item.revision, card: carriedCards[index],
+        })),
       });
+    }
     case 'proposed': {
       void freezeV3RevisionArtifacts(binding, runId, [], outcome.voidedProposals);
       let cardPosted = true;
@@ -8182,45 +8197,48 @@ async function postV3RevisionCard(
   } catch { /* best effort */ }
 }
 
-/** A pending proposal carried onto a direct revision keeps its card: show
- *  the carried revision in the old card's messages; post a new card when
- *  there is none to reuse (or none could be updated). Never throws. */
+/** One serializer for every 「流程修改确认」card message this daemon updates
+ *  (moves of carried proposals, freezes of voided ones): see
+ *  v3-revision-card-sync for why one read before the update is not enough. */
+let v3RevisionCardSyncInstance: ReturnType<typeof createV3RevisionCardSync> | undefined;
+function v3RevisionCardSync(): ReturnType<typeof createV3RevisionCardSync> {
+  return v3RevisionCardSyncInstance ??= createV3RevisionCardSync({
+    runDir: (runId) => join(v3DefaultBaseDir(), runId),
+    updateMessage: (larkAppId, messageId, card) => updateMessage(larkAppId, messageId, card),
+    warn: (message) => logger.warn(message),
+  });
+}
+
+/** A pending proposal carried onto a direct revision keeps its card (moved in
+ *  place, or a new card when none can show it). Never throws. */
 async function moveV3RevisionCards(
   binding: import('./workflows/v3/grill-state.js').RunChatBinding,
   runId: string,
   carried: readonly V3CarriedProposal[],
-): Promise<void> {
-  for (const item of carried) {
-    // A click on the old card may already have decided it; that click's
-    // reply rendered the outcome there — do not put the buttons back.
-    let wait;
-    try { wait = readV3RevisionWait(join(v3DefaultBaseDir(), runId), item.revision); } catch { wait = undefined; }
-    if (wait && wait.status !== 'pending') continue;
-    const card = buildV3RevisionCard({ runId, view: item.view });
-    let shown = false;
-    for (const messageId of item.cardMessageIds) {
-      try {
-        await updateMessage(binding.larkAppId, messageId, card);
-        shown = true;
-      } catch (err) {
-        logger.warn(`[v3:${runId}] move revision card failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    if (shown) continue;
-    await postV3RevisionCard(binding, item.view, runId).catch((err: unknown) => {
-      logger.warn(`[v3:${runId}] carried revision card failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
-  }
+): Promise<V3CarriedCardOutcome[]> {
+  return Promise.all(carried.map((item) => moveV3CarriedRevisionCard({
+    sync: v3RevisionCardSync(),
+    runDir: join(v3DefaultBaseDir(), runId),
+    runId,
+    larkAppId: binding.larkAppId,
+    revision: item.revision,
+    cardMessageIds: item.cardMessageIds,
+    post: () => postV3RevisionCard(binding, item.view, runId),
+  }).catch((err: unknown): V3CarriedCardOutcome => {
+    logger.warn(`[v3:${runId}] carried revision card failed: ${err instanceof Error ? err.message : String(err)}`);
+    return 'failed';
+  })));
 }
 
 /** Freeze gate cards a revision voided (「流程已修改，本次审批作废」) and
- *  confirmation cards that went stale. Display only; never throws. */
+ *  confirmation cards that went void. Display only; never throws. Resolves
+ *  with how each voided proposal's card ended up. */
 async function freezeV3RevisionArtifacts(
   binding: import('./workflows/v3/grill-state.js').RunChatBinding,
   runId: string,
   gates: readonly V3VoidedGate[],
   proposals: readonly V3VoidedProposal[],
-): Promise<void> {
+): Promise<V3VoidedCardOutcome[]> {
   for (const gate of gates) {
     const card = buildV3GateCard({
       runId, waitId: gate.waitId, nodeId: gate.nodeId, prompt: gate.prompt, resolution: { kind: 'voided' },
@@ -8231,23 +8249,13 @@ async function freezeV3RevisionArtifacts(
       });
     }
   }
-  for (const proposal of proposals) {
-    if (!proposal.view) continue;
-    const card = buildV3RevisionCard({
-      runId,
-      view: proposal.view,
-      resolution: {
-        kind: 'void',
-        detail: proposal.reason === 'superseded' ? '已被新的修改替代'
-          : proposal.reason === 'runEnded' ? 'run 已结束' : '流程已先一步修改',
-      },
-    });
-    for (const messageId of proposal.cardMessageIds) {
-      await updateMessage(binding.larkAppId, messageId, card).catch((err: unknown) => {
-        logger.warn(`[v3:${runId}] freeze revision card failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
-    }
-  }
+  return Promise.all(proposals.map((proposal) => freezeV3VoidedRevisionCard({
+    sync: v3RevisionCardSync(),
+    runId,
+    larkAppId: binding.larkAppId,
+    revision: proposal.revision,
+    cardMessageIds: proposal.cardMessageIds,
+  }).catch((): V3VoidedCardOutcome => 'failed')));
 }
 
 // ─── report session relay：隔离 CLI 的 dispatch 完成回注 ──────────────────

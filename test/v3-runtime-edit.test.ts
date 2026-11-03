@@ -58,7 +58,7 @@ import {
   v3RevisionWaitPath,
   type V3RunEditCaller,
 } from '../src/workflows/v3/run-edit.js';
-import { v3RevisionDigest, v3RevisionFilePaths } from '../src/workflows/v3/dag-revision.js';
+import { foldV3Revisions, v3RevisionDigest, v3RevisionFilePaths } from '../src/workflows/v3/dag-revision.js';
 import { readWait, recordWaitCardMessage } from '../src/workflows/v3/human-gate.js';
 import {
   authorizeV3RunEditCommand,
@@ -1890,7 +1890,7 @@ describe('a direct revision while another change waits for confirmation', () => 
     const base = freshBase();
     memberProposal(base, 'run-carry-dep', [goal('a'), goal('b')], [{ op: 'addNode', node: goal('x', { depends: ['b'] }) }]);
     expect(edit(base, 'run-carry-dep', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1))
-      .toMatchObject({ kind: 'applied', voidedProposals: [{ revision: 2, reason: 'stale' }], carriedProposals: [] });
+      .toMatchObject({ kind: 'applied', voidedProposals: [{ revision: 2, reason: 'stale', cause: 'overlap' }], carriedProposals: [] });
     expect(projectV3RunStatus(base, 'run-carry-dep').pendingProposal).toBeUndefined();
   });
 
@@ -1906,7 +1906,7 @@ describe('a direct revision while another change waits for confirmation', () => 
     expect(applyV3RunEdit({
       baseDir: base, runId: 'run-carry-reasons', baseRevision: 1, caller: initiator,
       patch: [{ op: 'reassign', nodeId: 'b', bot: 'cli_fresh' }], resolveNewBotSnapshot: fresh,
-    })).toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2 }], carriedProposals: [] });
+    })).toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, cause: 'meaningChanged' }], carriedProposals: [] });
     expect(readV3RevisionWait(runDir, 2)).toMatchObject({ status: 'voided' });
   });
 
@@ -1917,7 +1917,7 @@ describe('a direct revision while another change waits for confirmation', () => 
     expect(projectV3RunStatus(base, 'run-carry-budget').pendingProposal?.reasons).toEqual(['callerNotInitiator']);
     // The initiator adds two unrelated nodes directly: four in effect, the proposal would make five.
     expect(edit(base, 'run-carry-budget', [{ op: 'addNode', node: goal('y') }, { op: 'addNode', node: goal('z') }], 1))
-      .toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, reason: 'stale' }], carriedProposals: [] });
+      .toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, reason: 'stale', cause: 'meaningChanged' }], carriedProposals: [] });
   });
 
   it('a proposal the direct revision changed (one of its two new bots is now approved) is voided', () => {
@@ -1933,7 +1933,7 @@ describe('a direct revision while another change waits for confirmation', () => 
     expect(applyV3RunEdit({
       baseDir: base, runId: 'run-carry-changes', baseRevision: 1, caller: initiator,
       patch: [{ op: 'reassign', nodeId: 'c', bot: 'cli_fresh' }], resolveNewBotSnapshot: fresh,
-    })).toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2 }], carriedProposals: [] });
+    })).toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, cause: 'meaningChanged' }], carriedProposals: [] });
   });
 
   it('a carry that cannot be written falls back to voiding the proposal; the direct revision stands', () => {
@@ -1942,29 +1942,130 @@ describe('a direct revision while another change waits for confirmation', () => 
     // The carried version's file cannot be created.
     mkdirSync(v3RevisionFilePaths(runDir, 4).dag, { recursive: true });
     expect(edit(base, 'run-carry-io', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1))
-      .toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, reason: 'stale' }], carriedProposals: [] });
+      .toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, reason: 'stale', cause: 'carryFailed' }], carriedProposals: [] });
     expect(effectiveGoals(runDir)).toEqual({ a: 'do a', b: 'from initiator' });
     expect(projectV3RunStatus(base, 'run-carry-io').pendingProposal).toBeUndefined();
   });
 
-  it('a crash before the waits moved: cold attach posts the carried card and freezes the old one', async () => {
+  /** Finish `nodeIds` once each (a real, empty manifest). */
+  function finishAll(runDir: string, nodeIds: string[]) {
+    writeJson(join(runDir, 'm.json'), { schemaVersion: 1, status: 'ok', summary: 'ok', files: [] });
+    for (const nodeId of nodeIds) {
+      const instanceId = `${nodeId}#001`;
+      const attemptId = `${instanceId}/attempts/001`;
+      appendEvent(join(runDir, 'journal.ndjson'), { type: 'nodeDispatched', nodeId, instanceId, attemptId });
+      appendEvent(join(runDir, 'journal.ndjson'), { type: 'nodeSucceeded', nodeId, instanceId, attemptId, manifestPath: join(runDir, 'm.json') });
+    }
+  }
+
+  it('a re-run replaces the downstream instances: a proposal building on one of them overlaps and is voided', () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-carry-cone', [goal('a'), goal('b', { depends: ['a'] }), goal('c')]);
+    finishAll(runDir, ['a', 'b']);
+    expect(edit(base, 'run-carry-cone', [{ op: 'addNode', node: goal('x', { depends: ['b'] }) }], 1, other))
+      .toMatchObject({ kind: 'proposed', revision: 2 });
+    // Re-running a replaces b's instance, which the proposal's new node reads.
+    expect(edit(base, 'run-carry-cone', [{ op: 'rerunNode', nodeId: 'a' }], 1))
+      .toMatchObject({ kind: 'applied', voidedProposals: [{ revision: 2, cause: 'overlap' }], carriedProposals: [] });
+  });
+
+  it('judged on the journal the direct revision left: a proposal its re-runs ran out of budget for is voided, not carried dead', () => {
+    const base = freshBase();
+    const others = Array.from({ length: DEFAULT_REVISIT_BUDGET_PER_RUN }, (_, i) => `o${i}`);
+    const runDir = seedRun(base, 'run-carry-budget-spent', ['c', ...others].map((id) => goal(id)));
+    finishAll(runDir, ['c', ...others]);
+    expect(edit(base, 'run-carry-budget-spent', [{ op: 'rerunNode', nodeId: 'c' }], 1, other))
+      .toMatchObject({ kind: 'proposed', revision: 2 });
+    expect(edit(base, 'run-carry-budget-spent', others.map((nodeId) => ({ op: 'rerunNode', nodeId })), 1))
+      .toMatchObject({ kind: 'applied', voidedProposals: [{ revision: 2, cause: 'notApplicable' }], carriedProposals: [] });
+  });
+
+  it('the main bot\'s own proposal is carried as the main bot\'s: same reasons, same provenance', () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-carry-mainbot', [goal('a'), goal('b')]);
+    expect(applyV3RunEdit({
+      baseDir: base, runId: 'run-carry-mainbot', baseRevision: 1, caller: mainBot,
+      patch: { ops: [{ op: 'reassign', nodeId: 'a', bot: 'cli_fresh' }], note: 'a keeps timing out on cli_worker' },
+      resolveNewBotSnapshot: (selector) => ({ larkAppId: selector, cliId: 'codex', workingDir: '/fresh' }) as never,
+    })).toMatchObject({ kind: 'proposed', revision: 2, reasons: ['newBot'] });
+    expect(edit(base, 'run-carry-mainbot', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1))
+      .toMatchObject({ kind: 'applied', revision: 3, carriedProposals: [{ fromRevision: 2, revision: 4, view: { reasons: ['newBot'] } }] });
+    expect(journal(runDir).find((event) => event.type === 'dagRevisionProposed' && event.revision === 4)).toMatchObject({
+      by: 'main_bot', reasons: ['newBot'], auto: { reason: 'a keeps timing out on cli_worker' }, carriedFrom: 2,
+    });
+    expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-carry-mainbot', revision: 2, decision: 'approve', by: INITIATOR }))
+      .toMatchObject({ kind: 'approved', revision: 4 });
+  });
+
+  it('a carried version whose wait cannot be written is voided, and the old card freezes as void', () => {
+    const base = freshBase();
+    const runDir = memberProposal(base, 'run-carry-nowait');
+    // Its wait file cannot be created: nobody could ever decide it.
+    mkdirSync(v3RevisionWaitPath(runDir, 4), { recursive: true });
+    expect(edit(base, 'run-carry-nowait', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1)).toMatchObject({
+      kind: 'applied', revision: 3, carriedProposals: [],
+      voidedProposals: [{ revision: 2, cause: 'carryFailed', cardMessageIds: ['om_card_2'] }],
+    });
+    expect(projectV3RunStatus(base, 'run-carry-nowait').pendingProposal).toBeUndefined();
+    expect(readV3RevisionWait(runDir, 2)).toMatchObject({ status: 'voided' });
+    expect(readV3RevisionWait(runDir, 2)).not.toHaveProperty('carriedTo');
+    expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-carry-nowait', revision: 2, decision: 'approve', by: INITIATOR }))
+      .toMatchObject({ kind: 'already-decided', status: 'voided' });
+    expect(effectiveGoals(runDir)).toEqual({ a: 'do a', b: 'from initiator' });
+  });
+
+  it('the carry is one journal line: no crash point loses the proposal, and cold attach finishes the move', async () => {
     const base = freshBase();
     const runDir = memberProposal(base, 'run-carry-crash');
+    const journalPath = join(runDir, 'journal.ndjson');
     const pendingWait = readV3RevisionWait(runDir, 2)!;
+    const before = readFileSync(journalPath, 'utf-8').trimEnd().split('\n');
     edit(base, 'run-carry-crash', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1);
+    const after = readFileSync(journalPath, 'utf-8').trimEnd().split('\n');
+    // Wherever the edit could have died, a proposal closed as superseded
+    // always has the pending successor that superseded it.
+    for (let cut = before.length; cut <= after.length; cut++) {
+      writeFileSync(journalPath, `${after.slice(0, cut).join('\n')}\n`);
+      const history = foldV3Revisions(journal(runDir));
+      const superseded = history.records.filter((record) => record.rejected?.reason === 'superseded');
+      for (const record of superseded) {
+        expect({ cut, successor: history.records.some((next) => next.carriedFrom === record.revision && next.state === 'pending') })
+          .toEqual({ cut, successor: true });
+      }
+    }
+    // Died right after the carry line, before either wait moved.
+    writeFileSync(journalPath, `${after.join('\n')}\n`);
     rmSync(v3RevisionWaitPath(runDir, 4));
     writeJson(v3RevisionWaitPath(runDir, 2), pendingWait);
-    const posted: number[] = [];
-    const recovered = reconcileV3RevisionProposals(base, BINDING.larkAppId);
-    expect(recovered).toEqual([expect.objectContaining({
-      runId: 'run-carry-crash',
-      repost: [expect.objectContaining({ revision: 4 })],
-      voided: [expect.objectContaining({ revision: 2, cardMessageIds: ['om_card_2'] })],
-    })]);
-    for (const view of recovered[0]!.repost) posted.push(view.revision);
-    expect(posted).toEqual([4]);
-    expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-carry-crash', revision: 4, decision: 'approve', by: INITIATOR }))
-      .toMatchObject({ kind: 'approved' });
+    const moved: number[] = [];
+    const reposted: number[] = [];
+    const frozen: number[] = [];
+    await runner(base, fakeWorkers().runNode, {
+      moveRevisionCards: async (_binding, _runId, carried) => { moved.push(...carried.map((item) => item.revision)); },
+      postRevisionCard: async (_binding, view) => { reposted.push(view.revision); },
+      freezeRevisionCards: async (_binding, _runId, voided) => { frozen.push(...voided.map((item) => item.revision)); },
+    }).coldAttach(BINDING.larkAppId);
+    expect({ moved, reposted, frozen }).toEqual({ moved: [4], reposted: [], frozen: [] });
+    expect(projectV3RunStatus(base, 'run-carry-crash').pendingProposal).toMatchObject({ revision: 4, baseRevision: 3, by: OTHER });
+    expect(readV3RevisionWait(runDir, 2)).toMatchObject({ status: 'voided', carriedTo: 4 });
+    expect(readV3RevisionWait(runDir, 4)).toMatchObject({ status: 'pending', cardMessageIds: ['om_card_2'] });
+    // The old card now decides the carried version.
+    expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-carry-crash', revision: 2, decision: 'approve', by: INITIATOR }))
+      .toMatchObject({ kind: 'approved', revision: 4 });
     expect(effectiveGoals(runDir)).toEqual({ a: 'from member', b: 'from initiator' });
+  });
+
+  it('a crash after the new wait was written but before the old one moved: cold attach finishes the move', () => {
+    const base = freshBase();
+    const runDir = memberProposal(base, 'run-carry-crash2');
+    const pendingWait = readV3RevisionWait(runDir, 2)!;
+    edit(base, 'run-carry-crash2', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1);
+    const { cardMessageIds: _taken, ...unmovedWait } = readV3RevisionWait(runDir, 4)!;
+    writeJson(v3RevisionWaitPath(runDir, 4), unmovedWait);
+    writeJson(v3RevisionWaitPath(runDir, 2), pendingWait);
+    expect(reconcileV3RevisionProposals(base, BINDING.larkAppId)).toEqual([expect.objectContaining({
+      runId: 'run-carry-crash2', repost: [], voided: [], moved: [expect.objectContaining({ fromRevision: 2, revision: 4, cardMessageIds: ['om_card_2'] })],
+    })]);
+    expect(readV3RevisionWait(runDir, 2)).toMatchObject({ status: 'voided', carriedTo: 4 });
   });
 });

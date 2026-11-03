@@ -85,6 +85,7 @@ import { loadEffectiveV3Dag, v3PendingProposalHolds } from './dag-revision.js';
 import {
   reconcileV3RevisionProposals,
   type V3RevisionCardView,
+  type V3CarriedProposal,
   type V3VoidedProposal,
 } from './run-edit.js';
 import { openV3WorkerAttempts } from './attempt-ledger.js';
@@ -1584,6 +1585,10 @@ export interface V3GateRunnerDeps {
   postRevisionCard?: (binding: RunChatBinding, view: V3RevisionCardView, runId: string) => Promise<void>;
   /** Freeze confirmation cards whose proposal went void while down. */
   freezeRevisionCards?: (binding: RunChatBinding, runId: string, voided: V3VoidedProposal[]) => Promise<void>;
+  /** Show proposals whose carry a crash interrupted (finished on cold
+   *  attach) in their old card's messages, or post a card. Without it they
+   *  are re-posted like any pending proposal. */
+  moveRevisionCards?: (binding: RunChatBinding, runId: string, carried: V3CarriedProposal[]) => Promise<void>;
   /** Notify a terminal run (optional, daemon-supplied). */
   notifyTerminal?: (binding: RunChatBinding | undefined, runId: string, outcome: V3TerminalOutcome) => Promise<void>;
   /** Best-effort observability hooks. They must never affect run semantics. */
@@ -1811,7 +1816,11 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
           if (rec.voided.length > 0) {
             await deps.freezeRevisionCards?.(rec.binding, rec.runId, rec.voided).catch((err) => deps.onError?.(rec.runId, err));
           }
-          for (const view of rec.repost) {
+          if (rec.moved.length > 0 && deps.moveRevisionCards) {
+            await deps.moveRevisionCards(rec.binding, rec.runId, rec.moved).catch((err) => deps.onError?.(rec.runId, err));
+          }
+          const reposts = deps.moveRevisionCards ? rec.repost : [...rec.repost, ...rec.moved.map((item) => item.view)];
+          for (const view of reposts) {
             try {
               await postOnce(rec.runId, `revision:${view.revision}`, () => deps.postRevisionCard
                 ? deps.postRevisionCard(rec.binding!, view, rec.runId)
