@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, larkToolPrompt, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
@@ -87,6 +87,25 @@ describe('managed lark-cli binding', () => {
     });
     expect(parseLarkToolInvocation(['docs', '+fetch'], { ...defaults, defaultAs: 'user' }).mode).toBe('user');
   });
+  it('binds new local headless runners without enabling other API-only sessions', () => {
+    const config = { sessionId: 'headless-session', larkAppId: 'cli_current',
+      chatId: 'headless_hl_11111111-1111-4111-8111-111111111111', backendType: 'pty' as const,
+      headless: { id: 'hl_11111111-1111-4111-8111-111111111111', source: 'cli' } };
+    expect(usesLarkToolBinding(config, dir)).toBe(true);
+    // Same lifecycle as ordinary sessions: resume re-evaluates the bot switch.
+    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: false }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, apiOnly: true }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, chatId: 'http_async_runner' }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, chatId: 'http_wait_runner' }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, headless: undefined }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, chatId: 'headless_forged-http-chat' }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, headless: { id: 'hl_invalid', source: 'cli' } }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, headless: { ...config.headless, source: 'webhook' } }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, adoptMode: true }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, backendType: 'riff' }, dir)).toBe(false);
+    expect(usesLarkToolBinding(config, dir, true)).toBe(false);
+  });
   it.each([
     ['--profile='], ['--as='], ['--as', 'owner'],
     ['--as', 'bot', '--as=user'], ['--profile=cli_current', '--profile=cli_current'],
@@ -141,6 +160,11 @@ describe('managed lark-cli binding', () => {
     expect(larkToolChildEnv(botEnv, first, { mode: 'bot', credential: 'bot-token', appId: 'cli_platform' }).LARKSUITE_CLI_APP_ID).toBe(defaults.appId);
     expect(larkToolPromptFromEnv('en', env)).toContain('lark-cli uses application cli_current');
     expect(larkToolPromptFromEnv('zh', env)).toContain('lark-cli 固定使用当前机器人的应用 cli_current');
+    const headlessEnv = { ...env, BOTMUX_CHAT_ID: 'headless_hl_runner' };
+    for (const locale of ['en', 'zh']) {
+      expect(larkToolPromptFromEnv(locale, headlessEnv)).toBe(larkToolPrompt(defaults.appId, locale, true));
+      expect(larkToolPromptFromEnv(locale, headlessEnv)).not.toBe(larkToolPrompt(defaults.appId, locale, false));
+    }
     expect(larkToolPromptFromEnv('en', {})).toBe('');
   });
   it('keeps the configured PATH when viewer setup repeats an RPC binding', () => {
