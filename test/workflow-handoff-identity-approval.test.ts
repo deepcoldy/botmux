@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -62,7 +62,8 @@ function identityPolicy(lookup: V3InitiatorUnionLookup | (() => never), tools: A
       asked.push([appId, openId]);
       return typeof lookup === 'function' ? lookup() : lookup;
     },
-    botTools: () => tools,
+    // Only the main bot runs tools as its trigger user (as in BOTS).
+    botTools: (appId) => (appId === MAIN ? tools : []),
   };
   return { policy, asked };
 }
@@ -166,13 +167,19 @@ describe('Gate-2 approve-dag', () => {
     ['a synthetic trigger', 'trg_0123456789'],
     ['a workflow event wake-up', 'workflow-event:r:7'],
     ['no authenticated turn', undefined],
-  ])('approval in %s turn is refused with the switch on, without a lookup', async (_label, turnId) => {
+  ])('approval in %s turn is approved without the initiator (no lookup), and says so', async (_label, turnId) => {
     const { base, runDir } = await dagReadyRun(GROUP_TOPIC);
     const { policy, asked } = identityPolicy({ status: 'resolved', unionId: 'on_owner' });
-    const refused = await approve(base, GROUP_TOPIC, { nodeExecutor: 'bot', handoffIdentity: true, policy, turnId: turnId ?? '' });
-    expect(String(refused.error)).toContain('不是发起人本人');
+    const approved = await approve(base, GROUP_TOPIC, { nodeExecutor: 'bot', handoffIdentity: true, policy, turnId: turnId ?? '' });
+    expect(approved.error).toBeUndefined();
     expect(asked).toEqual([]);
-    expect(existsSync(join(runDir, 'run.json'))).toBe(false);
+    const envelope = envelopeOf(runDir);
+    expect(envelope).toMatchObject({ nodeExecutor: 'bot', authorization: { handoffIdentity: { unavailable: 'not_human_turn' } } });
+    expect(frozenHandoffIdentity(envelope)).toBeUndefined();
+    // Names the node whose bot will ask for authorization later.
+    const line = approved.output.split('\n').find((text) => text.includes('不带发起人身份')) ?? '';
+    expect(line).toMatch(/这个 run 不带发起人身份：这次批准不是发起人本人.*inspect → bot\(cli_main\)/);
+    expect(line).not.toContain('cli_doc');
   });
 
   it('without the bot executor the identity switch has nothing to freeze', async () => {
@@ -186,13 +193,25 @@ describe('Gate-2 approve-dag', () => {
 
   it.each([
     ['a definitive miss', { status: 'unavailable' } as V3InitiatorUnionLookup, '通讯录权限'],
-    ['a transient failure', { status: 'retryable', error: 'timeout' } as V3InitiatorUnionLookup, '稍后重新批准'],
-  ])('%s refuses the approval and publishes nothing', async (_label, lookup, text) => {
+    ['a transient failure', { status: 'retryable', error: 'timeout' } as V3InitiatorUnionLookup, '查询发起人的跨应用身份失败'],
+  ])('%s still approves, without the initiator, saying why', async (_label, lookup, text) => {
     const { base, runDir } = await dagReadyRun(GROUP_TOPIC);
     const { policy } = identityPolicy(lookup);
-    const refused = await approve(base, GROUP_TOPIC, { nodeExecutor: 'bot', handoffIdentity: true, policy });
-    expect(String(refused.error)).toContain(text);
-    expect(existsSync(join(runDir, 'run.json'))).toBe(false);
+    const approved = await approve(base, GROUP_TOPIC, { nodeExecutor: 'bot', handoffIdentity: true, policy });
+    expect(approved.error).toBeUndefined();
+    expect(envelopeOf(runDir).authorization).toMatchObject({
+      handoffIdentity: { unavailable: lookup.status === 'unavailable' ? 'lookup_unavailable' : 'lookup_failed' },
+    });
+    expect(approved.output).toContain(text);
+  });
+
+  it('nothing to say when no node bot runs a tool as its trigger user', async () => {
+    const { base, runDir } = await dagReadyRun(GROUP_TOPIC);
+    const { policy } = identityPolicy({ status: 'resolved', unionId: 'on_owner' }, []);
+    const approved = await approve(base, GROUP_TOPIC, { nodeExecutor: 'bot', handoffIdentity: true, policy });
+    expect(approved.error).toBeUndefined();
+    expect(envelopeOf(runDir).authorization).toMatchObject({ handoffIdentity: { unavailable: 'no_tools' } });
+    expect(approved.output).not.toContain('发起人身份');
   });
 });
 
@@ -246,16 +265,17 @@ describe('Saved Workflow /workflow run', () => {
     expect(frozenHandoffIdentity(loadAuthorizedV3Run(run.runDir).envelope)).toBeUndefined();
   });
 
-  it('an unresolvable initiator refuses before anything is materialized', async () => {
+  it('an unresolvable initiator still materializes the run, recording why it carries none', async () => {
     const { policy } = identityPolicy({ status: 'unavailable' });
-    await expect(instantiate(executorPolicy(policy))).rejects.toMatchObject({ code: 'executor_ineligible' });
-    expect(existsSync(join(root, 'runs')) ? readdirNames(join(root, 'runs')) : []).toEqual([]);
+    const run = await instantiate(executorPolicy(policy));
+    const envelope = loadAuthorizedV3Run(run.runDir).envelope;
+    expect(envelope.authorization).toMatchObject({ handoffIdentity: { unavailable: 'lookup_unavailable' } });
+    expect(frozenHandoffIdentity(envelope)).toBeUndefined();
+    // The only node's bot runs no tool as its trigger user: nothing to say.
+    expect(run.executorNote ?? '').not.toContain('发起人身份');
   });
 });
 
-function readdirNames(dir: string): string[] {
-  return readdirSync(dir).filter((name) => !name.startsWith('.'));
-}
 
 describe('Dashboard switch workflow.handoffIdentity', () => {
   let home: string;

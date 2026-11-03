@@ -44,7 +44,8 @@ const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-use
 const { resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
 const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
 const { readDispatchRegistryLoose, revokeWorkflowHandoff, lookupWorkflowHandoff } = await import('../src/core/workflow-handoff-binding.js');
-const { workflowDelegationRefusal, checkWorkflowHandoffIdentityTarget } = await import('../src/core/workflow-handoff-identity.js');
+const { workflowDelegationRefusal, checkWorkflowHandoffIdentityTarget, inheritWorkflowDelegation } = await import('../src/core/workflow-handoff-identity.js');
+const { authorityForDispatch, deliverDispatchWithUser } = await import('../src/core/dispatch-user-delegation.js');
 const { workflowNodeMarkerFromBinding } = await import('../src/core/workflow-node-session.js');
 const { BotRun, cleanupBotRuns, reportDag, reportFiles } = await import('./helpers/v3-external-harness.js');
 const { CHAT, INITIATOR_MAIN_OU, INITIATOR_OU_IN, INITIATOR_UNION, MAIN, SECRET, authorizeRun, driveWith, identityWorld } =
@@ -84,13 +85,16 @@ function botConfig(appId: string, tools: Array<'lark-cli' | 'bytedcli'> | null) 
 }
 
 /** A handoff the main bot really signed, and the receiving bot's view of it. */
-async function receiver(opts: { self?: boolean } = {}) {
+async function receiver(opts: { self?: boolean; alsoApproved?: string[] } = {}) {
   const self = opts.self === true;
   const run = new BotRun(self
     ? validateDag({ schemaVersion: 2, runId: 'rcvd-self', nodes: [{ id: 'write', type: 'goal', goal: 'g', timeoutSec: 600 }] })
     : reportDag('rcvd'));
   const world = identityWorld();
-  const snapshots = authorizeRun(run, { identity: { unionId: INITIATOR_UNION, tools: ['bytedcli'] }, selectors: [self ? '' : 'cli_a'] });
+  const snapshots = authorizeRun(run, {
+    identity: { unionId: INITIATOR_UNION, tools: ['bytedcli'] },
+    selectors: [self ? '' : 'cli_a', ...(opts.alsoApproved ?? [])],
+  });
   await driveWith(run, world, snapshots);
   const attempt = run.openAttempt('write');
   const handoff = attempt.handoffMessageId!;
@@ -278,5 +282,108 @@ describe('the pre-handoff check runs the dispatch delegation check of this bot',
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toMatchObject({ status: 'unavailable' });
     h.scope.getBot = () => ({ config: botConfig('cli_a', null) });
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toEqual({ status: 'not_required' });
+  });
+});
+
+describe('a node bot passing the initiator on (`botmux dispatch` from the node session)', () => {
+  /** cli_a's node session dispatches to `target` with what its turn inherits. */
+  async function passOn(h: Awaited<ReturnType<typeof receiver>>, target: string, opts: { chatId?: string; allowed?: boolean } = {}) {
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    expect(inherited).toMatchObject({ workflow: { attemptId: h.attempt.attemptId } });
+    return inheritWorkflowDelegation({
+      inherited, targetAppIds: [target], chatId: opts.chatId ?? CHAT, baseDir: h.run.base,
+      targetUserAllowed: async () => opts.allowed ?? true,
+    });
+  }
+
+  it('to an approved bot in the run\'s chat: one more hop, tied to the same attempt, ending with it', async () => {
+    const h = await receiver({ alsoApproved: ['cli_b'] });
+    const passed = await passOn(h, 'cli_b');
+    expect(passed).toEqual({ inherit: true, workflow: expect.objectContaining({ attemptId: h.attempt.attemptId, nonce: nonceOf(h.attempt), hop: 1 }) });
+    if (!passed.inherit) throw new Error('unreachable');
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    // The dispatching bot narrows to its own tools, exactly as any dispatch.
+    const authority = await authorityForDispatch({
+      sourceAppId: 'cli_a', tools: ['bytedcli'], inherited: inherited.authority, resolveUnionId: async () => null,
+    });
+    await deliverDispatchWithUser({
+      dataDir: h.world.dataDir, secret: SECRET,
+      payload: { sourceAppId: 'cli_a', sourceSessionId: SESSION, sourceTurnId: h.handoff, rootId: 'om_grand_root',
+        chatId: CHAT, targetAppIds: ['cli_b'], authority: authority!, workflow: passed.workflow },
+      send: async () => 'om_grand',
+    });
+    const grand = await resolveDispatchUser({ dataDir: h.world.dataDir, secret: SECRET, appId: 'cli_b', chatId: CHAT, rootId: 'om_grand_root', turnId: 'om_grand', waitMs: 0 });
+    expect(grand).toMatchObject({ domain: 'botmux.dispatch-user.workflow.v1', workflow: { hop: 1 }, authority: { appId: MAIN, unionId: INITIATOR_UNION } });
+    const holds = () => workflowDelegationRefusal({
+      record: grand as any, turnId: 'om_grand', receiverLarkAppId: 'cli_b', chatId: CHAT, marker: undefined,
+      registry: readDispatchRegistryLoose(h.world.dataDir), secret: SECRET, baseDir: h.run.base,
+    });
+    expect(holds()).toBeUndefined();
+    // The grandchild's delegation ends with the node's attempt.
+    h.run.accept(h.attempt.attemptId, SESSION);
+    expect(await h.run.submit(h.attempt.attemptId, { sessionId: SESSION, ...reportFiles() })).toMatchObject({ ok: true });
+    expect(holds()).toBe('attempt_inactive');
+  });
+
+  it('the grandchild\'s turn publishes from it, and a refusal points at its dispatch root', async () => {
+    const h = await receiver({ alsoApproved: ['cli_b'] });
+    const passed = await passOn(h, 'cli_b');
+    if (!passed.inherit) throw new Error('unreachable');
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    await deliverDispatchWithUser({
+      dataDir: h.world.dataDir, secret: SECRET,
+      payload: { sourceAppId: 'cli_a', sourceSessionId: SESSION, sourceTurnId: h.handoff, rootId: 'om_groot',
+        chatId: CHAT, targetAppIds: ['cli_b'], authority: { ...inherited.authority }, workflow: passed.workflow },
+      send: async () => 'om_gmsg',
+    });
+    const grandchild: any = {
+      larkAppId: 'cli_b', chatId: CHAT, chatType: 'group', scope: 'thread',
+      session: { sessionId: SESSION, rootMessageId: 'om_groot', replyTargets: {
+        om_gmsg: { senderOpenId: 'ou_a_in_b', rootMessageId: 'om_groot', participants: [{ openId: 'ou_a_in_b', isBot: true }], updatedAt: new Date().toISOString() },
+      } },
+    };
+    // The initiator is not among cli_b's members in this world: refused.
+    await h.fns.refreshTurnCliIdentity(grandchild, 'om_gmsg');
+    expect(h.scope.resolveTargetAppOpenId).toHaveBeenCalledWith('cli_b', INITIATOR_UNION);
+    const body = recallProvenIdentityContent(h.world.dataDir, SESSION, 'om_gmsg', 'bytedcli') ?? '';
+    expect(body).toContain('--dispatch-root om_groot');
+    expect(body).not.toContain('--dispatch-root om_gmsg');
+  });
+
+  it('… and with the run cancelled (the handoff revoked)', async () => {
+    const h = await receiver({ alsoApproved: ['cli_b'] });
+    const passed = await passOn(h, 'cli_b');
+    if (!passed.inherit) throw new Error('unreachable');
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    await deliverDispatchWithUser({
+      dataDir: h.world.dataDir, secret: SECRET,
+      payload: { sourceAppId: 'cli_a', sourceSessionId: SESSION, sourceTurnId: h.handoff, chatId: CHAT,
+        targetAppIds: ['cli_b'], authority: { ...inherited.authority }, workflow: passed.workflow },
+      send: async () => 'om_grand_mention',
+    });
+    const grand = await resolveDispatchUser({ dataDir: h.world.dataDir, secret: SECRET, appId: 'cli_b', chatId: CHAT, turnId: 'om_grand_mention', waitMs: 0 });
+    await revokeWorkflowHandoff(h.world.dataDir, SECRET, nonceOf(h.attempt), 'runCancelled');
+    expect(workflowDelegationRefusal({
+      record: grand as any, turnId: 'om_grand_mention', receiverLarkAppId: 'cli_b', chatId: CHAT, marker: undefined,
+      registry: readDispatchRegistryLoose(h.world.dataDir), secret: SECRET, baseDir: h.run.base,
+    })).toBe('handoff_revoked');
+  });
+
+  it.each([
+    ['a bot outside the approved set', 'cli_c', {}],
+    ['another chat', 'cli_b', { chatId: 'oc_elsewhere' }],
+    ['a person this bot cannot vouch for here', 'cli_b', { allowed: false }],
+  ] as const)('to %s: the dispatch goes ahead without the initiator (not refused)', async (_label, target, opts) => {
+    const h = await receiver({ alsoApproved: ['cli_b'] });
+    expect(await passOn(h, target, opts)).toEqual({ inherit: false });
+  });
+
+  it('stops passing on after 16 hops', async () => {
+    const h = await receiver({ alsoApproved: ['cli_b'] });
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    expect(await inheritWorkflowDelegation({
+      inherited: { ...inherited, workflow: { ...inherited.workflow, hop: 16 } }, targetAppIds: ['cli_b'], chatId: CHAT,
+      baseDir: h.run.base, targetUserAllowed: async () => true,
+    })).toEqual({ inherit: false });
   });
 });

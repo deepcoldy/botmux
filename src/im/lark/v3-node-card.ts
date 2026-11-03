@@ -185,6 +185,9 @@ export interface V3HandoffCardInput {
   reassignedFrom?: string;
   /** Mention target, or the main bot itself (§6.5: no mention). */
   target: { kind: 'bot'; openId: string } | { kind: 'self' };
+  /** 交接带发起人身份 (design §10): why this handoff goes out without the
+   *  initiator's identity, in plain words. Absent = nothing to say. */
+  identityNote?: string;
 }
 
 /** The exact `botmux report` command lines for a handoff (also used in the
@@ -224,6 +227,7 @@ export function v3HandoffBodyText(input: V3HandoffCardInput): string {
     lines.push(`上次的情况：${reason}${input.retryOf.message ? `（${input.retryOf.message.slice(0, 300)}）` : ''}`, '');
   }
   if (input.reassignedFrom) lines.push('本节点已改派给你。', '');
+  if (input.identityNote) lines.push(`未带发起人身份：${input.identityNote}；需要个人授权的工具会在调用时提示授权，用不到就照常做。`, '');
   const preview = (text: string) => (input.overflowAttachment ? clip(text, OVERFLOW_PREVIEW_CHARS) : text);
   if (input.overflowAttachment) {
     lines.push(`要求较长，完整内容见附件 ${input.overflowAttachment}（已放进你的会话），以附件为准。`, '');

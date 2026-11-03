@@ -55,7 +55,7 @@ import {
   readRunEnvelope,
   type PublishRunEnvelopeResult,
   type V3AdHocRunEnvelope,
-  type V3HandoffIdentityFreeze,
+  type V3HandoffIdentityRecord,
 } from './run-envelope.js';
 import { V3_SUPPORTED_CLIS, isV3SupportedCli, type BotSnapshot } from './contract.js';
 import { isMultiTopicOrchestrationEnabled, workflowHandoffIdentityEnabled, workflowNodeExecutorMode } from '../../global-config.js';
@@ -477,7 +477,7 @@ export function authorizeAdHocRun(
   runDir: string,
   bots: BotConfig[],
   now: Date = new Date(),
-  opts: { workingDirOverride?: string; nodeExecutor?: 'bot'; handoffIdentity?: V3HandoffIdentityFreeze } = {},
+  opts: { workingDirOverride?: string; nodeExecutor?: 'bot'; handoffIdentity?: V3HandoffIdentityRecord } = {},
 ): AdHocRunAuthorizationResult {
   // The outer host lock prevents Gate-2 from racing any grill RMW / architect
   // attempt. The inner envelope lock serializes this producer with all other
@@ -880,7 +880,7 @@ export async function cmdWorkflowHost(
       // A replay of an already-published approval never re-decides it.
       const summary: string[] = [];
       let nodeExecutor: 'bot' | undefined;
-      let handoffIdentity: V3HandoffIdentityFreeze | undefined;
+      let handoffIdentity: V3HandoffIdentityRecord | undefined;
       if (before.kind === 'missing') {
         const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
         if (switchMode === 'bot') {
@@ -905,10 +905,11 @@ export async function cmdWorkflowHost(
                 plan.binding,
                 await (deps.handoffIdentityPolicy ?? liveHandoffIdentityPolicy)(bots),
                 { humanTurn: isHumanInboundTurnId((deps.resolveCurrentTurnId ?? currentTurnIdFromEnv)()) },
+                { targets: plan.targets, nameOf },
               );
-              if (identity.kind === 'refused') throw new HostGuardError(identity.message);
-              handoffIdentity = identity.identity;
-              summary.push(formatV3BotExecutorPlan(plan.targets, plan.binding.larkAppId, nameOf), identity.summary);
+              handoffIdentity = identity.record;
+              summary.push(formatV3BotExecutorPlan(plan.targets, plan.binding.larkAppId, nameOf));
+              if (identity.summary) summary.push(identity.summary);
             } else {
               summary.push(formatV3BotExecutorPlan(plan.targets, plan.binding.larkAppId, nameOf));
             }

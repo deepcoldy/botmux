@@ -116,13 +116,38 @@ export type V3HandoffIdentityTool = typeof V3_HANDOFF_IDENTITY_TOOLS[number];
  * the envelope through `.strict()`, so an older daemon never drives such a
  * run without honouring it.
  */
-const handoffIdentitySchema = z.object({
+const handoffIdentityFreezeSchema = z.object({
   unionId: z.string().regex(/^on_[A-Za-z0-9_-]{1,128}$/, 'must be a union_id (on_…)'),
-  tools: z.array(z.enum(V3_HANDOFF_IDENTITY_TOOLS)).max(V3_HANDOFF_IDENTITY_TOOLS.length)
+  tools: z.array(z.enum(V3_HANDOFF_IDENTITY_TOOLS)).min(1).max(V3_HANDOFF_IDENTITY_TOOLS.length)
     .refine((tools) => new Set(tools).size === tools.length, 'must not repeat a tool'),
 }).strict();
 
-export type V3HandoffIdentityFreeze = z.infer<typeof handoffIdentitySchema>;
+/** Why a run authorized with the switch on carries no initiator identity. The
+ *  run is approved all the same (identity is asked for only when a tool needs
+ *  it); its handoffs then go out without one and say why. */
+export const V3_HANDOFF_IDENTITY_UNAVAILABLE_REASONS = [
+  /** Approved in a scheduled task's or another synthetic turn. */
+  'not_human_turn',
+  /** No authenticated initiator on the run. */
+  'no_initiator',
+  /** The main bot's app may not see the initiator's union_id. */
+  'lookup_unavailable',
+  /** The union_id lookup failed at approval time. */
+  'lookup_failed',
+  /** The main bot runs no tool as its trigger user: nothing to hand on. */
+  'no_tools',
+] as const;
+export type V3HandoffIdentityUnavailableReason = typeof V3_HANDOFF_IDENTITY_UNAVAILABLE_REASONS[number];
+
+const handoffIdentitySchema = z.union([
+  handoffIdentityFreezeSchema,
+  z.object({ unavailable: z.enum(V3_HANDOFF_IDENTITY_UNAVAILABLE_REASONS) }).strict(),
+]);
+
+export type V3HandoffIdentityFreeze = z.infer<typeof handoffIdentityFreezeSchema>;
+/** What run.json records for 交接带发起人身份: the frozen initiator, or why
+ *  there is none. */
+export type V3HandoffIdentityRecord = z.infer<typeof handoffIdentitySchema>;
 
 const adHocEnvelopeSchema = z.object({
   ...baseShape,
@@ -238,7 +263,7 @@ export const V3RunEnvelopeSchema = z.union([
         message: 'requires nodeExecutor "bot"',
       });
     }
-    if (!initiatorOpenIdOf(envelope)) {
+    if ('unionId' in envelope.authorization.handoffIdentity && !initiatorOpenIdOf(envelope)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['authorization', 'handoffIdentity'],
@@ -348,10 +373,18 @@ export interface V3FrozenHandoffIdentity extends V3HandoffIdentityFreeze {
 }
 
 export function frozenHandoffIdentity(envelope: V3RunEnvelope): V3FrozenHandoffIdentity | undefined {
-  const frozen = 'handoffIdentity' in envelope.authorization ? envelope.authorization.handoffIdentity : undefined;
+  const frozen = handoffIdentityRecordOf(envelope);
   const openId = initiatorOpenIdOf(envelope);
-  if (!frozen || !openId || !('nodeExecutor' in envelope) || envelope.nodeExecutor !== 'bot') return undefined;
+  if (!frozen || !('unionId' in frozen) || !openId) return undefined;
   return { openId, unionId: frozen.unionId, tools: [...frozen.tools] };
+}
+
+/** The run's 交接带发起人身份 record (frozen or why not), or undefined when
+ *  the switch was off at authorization. */
+export function handoffIdentityRecordOf(envelope: V3RunEnvelope): V3HandoffIdentityRecord | undefined {
+  const record = 'handoffIdentity' in envelope.authorization ? envelope.authorization.handoffIdentity : undefined;
+  if (!record || !('nodeExecutor' in envelope) || envelope.nodeExecutor !== 'bot') return undefined;
+  return record;
 }
 export type V3AdHocRunEnvelope = Extract<V3RunEnvelope, { source: { kind: 'ad_hoc' } }>;
 export type V3SavedDefinitionRunEnvelope = Extract<V3RunEnvelope, { source: { kind: 'saved_definition' } }>;
@@ -887,7 +920,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
   authorizedByOpenId?: string;
   artifacts: V3AdHocRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
-  handoffIdentity?: V3HandoffIdentityFreeze;
+  handoffIdentity?: V3HandoffIdentityRecord;
 }): V3AdHocRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,
@@ -916,7 +949,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
   authorizedAt: string;
   artifacts: V3SavedDefinitionRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
-  handoffIdentity?: V3HandoffIdentityFreeze;
+  handoffIdentity?: V3HandoffIdentityRecord;
 }): V3SavedDefinitionRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,

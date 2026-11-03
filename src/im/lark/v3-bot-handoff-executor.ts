@@ -147,9 +147,9 @@ export interface V3BotHandoffExecutorDeps {
 
 /**
  * When the target bot's identity check cannot run (a lookup error, its
- * daemon unreachable), the handoff is retried after these delays before the
- * node blocks IDENTITY_UNAVAILABLE — about a minute in all. A definite
- * refusal (not in the chat, not approved, no tool) blocks at once. A wait of
+ * daemon unreachable), the handoff is retried after these delays before it
+ * goes out without the initiator — about a minute in all. A definite answer
+ * (not in the chat, not approved, no tool) decides at once. A wait of
  * at most {@link IDENTITY_CHECK_IN_CALL_WAIT_MAX_MS} happens inside the
  * dispatch call (well under the engine's 30 s per-call bound); a longer one
  * leaves the attempt prepared (nothing was sent) for the engine's next
@@ -314,17 +314,16 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
         if (wait > 0) await sleep(wait, request.signal);
       }
       const plan = await identityDeps.plan(request);
-      if (plan.kind !== 'reject' || !plan.transient) {
+      if (plan.kind !== 'unsigned' || !plan.transient) {
         identityRetries.delete(request.attemptId);
         return plan;
       }
       const next = { firstAt: state?.firstAt ?? now(), failures: (state?.failures ?? 0) + 1 };
       if (next.failures > IDENTITY_CHECK_RETRY_DELAYS_MS.length) {
+        // Still unable to check: hand off without the initiator (never block
+        // the node for an identity it may not need), saying why.
         identityRetries.delete(request.attemptId);
-        return {
-          kind: 'reject',
-          message: `${plan.message}；约 ${Math.round((now() - next.firstAt) / 1000)} 秒内自动重试 ${IDENTITY_CHECK_RETRY_DELAYS_MS.length} 次仍失败，请稍后点重试`,
-        };
+        return { kind: 'unsigned', note: `${plan.note}，已自动重试 ${IDENTITY_CHECK_RETRY_DELAYS_MS.length} 次` };
       }
       identityRetries.set(request.attemptId, next);
     }
@@ -380,23 +379,25 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       }
       mention = { kind: 'bot', openId: inChat.openId };
     }
-    // §10.3: a target that runs its tools as the trigger user is handed the
-    // node only with the initiator's delegation — never without it.
+    // §10: the initiator goes along when the target can carry them; when not,
+    // the node is handed off all the same, saying why (a tool that needs the
+    // person asks for authorization when it is called).
     const identity = await planIdentity(request);
-    if (identity.kind === 'reject') {
-      return { kind: 'rejected', code: 'IDENTITY_UNAVAILABLE', message: identity.message };
-    }
+    const identityNote = identity.kind === 'unsigned' ? { identityNote: identity.note } : {};
     request.signal.throwIfAborted();
 
     const context = readRunCardContext(request.runDir, request.runId);
     const sketchId = request.loop ? request.loop.bodyNodeId : request.nodeId;
-    const content = (handoffRef: string) => v3HandoffContent(
-      request,
-      { title: context.title, acceptance: context.acceptanceBySketch.get(sketchId) },
-      mention,
-      handoffRef,
-      nonce,
-    );
+    const content = (handoffRef: string): V3HandoffCardInput => ({
+      ...v3HandoffContent(
+        request,
+        { title: context.title, acceptance: context.acceptanceBySketch.get(sketchId) },
+        mention,
+        handoffRef,
+        nonce,
+      ),
+      ...identityNote,
+    });
     const nodeIndex = context.goalNodeIds.indexOf(request.loop ? request.loop.loopId : request.nodeId);
     const nodeCard = buildV3NodeCard({
       runTitle: context.title,

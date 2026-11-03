@@ -3,8 +3,9 @@
  * turn (ADR dispatch-user-delegation §7: scheduled and other synthetic turns
  * carry no delegation). A scheduled task's turn authenticates as the task's
  * creator; running `/workflow run <saved>` or `approve-dag` in it must not make
- * that creator the run's initiator — with the switch on such an approval is
- * refused (turn the switch off to approve it without an identity).
+ * that creator the run's initiator: the run is approved without an initiator
+ * (design §10 principle), run.json records why, and its handoffs go out
+ * unsigned (see workflow-handoff-identity.test.ts).
  *
  * Real components: the CLI process marker + persisted session rows +
  * schedules.json feeding the REAL current-turn provenance (`contextFromEnv`,
@@ -12,7 +13,7 @@
  * Saved Workflow materialization and Gate-2 authorization.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -103,19 +104,21 @@ describe('Saved Workflow run from a scheduled turn', () => {
       nameOf: (a) => a,
       handoffIdentity,
     };
-    const runsDir = join(root, 'runs');
     const run = instantiatePublishedSavedWorkflow({
-      dataDir: join(root, 'data'), ref: created.metadata.workflowId, bots: BOTS, baseDir: runsDir,
+      dataDir: join(root, 'data'), ref: created.metadata.workflowId, bots: BOTS, baseDir: join(root, 'runs'),
       context, nodeExecutorPolicy: policy,
     });
-    return { run, asked, runsDir };
+    return { run, asked };
   }
 
-  it('is refused with the switch on: the task creator is never frozen as initiator', async () => {
-    const { run, asked, runsDir } = await savedRun(SCHEDULED_TURN);
-    await expect(run).rejects.toMatchObject({ code: 'executor_ineligible', message: expect.stringContaining('不是发起人本人') });
+  it('is approved, but the task creator is never frozen as initiator', async () => {
+    const { run, asked } = await savedRun(SCHEDULED_TURN);
+    const materialized = await run;
     expect(asked).toEqual([]);
-    expect(existsSync(runsDir) ? readdirSync(runsDir).filter((name) => !name.startsWith('.')) : []).toEqual([]);
+    const envelope = loadAuthorizedV3Run(materialized.runDir).envelope;
+    expect(frozenHandoffIdentity(envelope)).toBeUndefined();
+    expect(envelope.authorization).toMatchObject({ handoffIdentity: { unavailable: 'not_human_turn' } });
+    expect(materialized.executorNote).toMatch(/这个 run 不带发起人身份.*write → cli_doc/);
   });
 
   it('the same person\'s own message does freeze them', async () => {
@@ -187,11 +190,13 @@ describe('Gate-2 approve-dag from a scheduled turn (default current-turn provena
     return { runDir, asked, error };
   }
 
-  it('is refused with the switch on; nothing is frozen or published', async () => {
+  it('is approved without the initiator: run.json holds no identity, only why', async () => {
     const { runDir, asked, error } = await approveIn(SCHEDULED_TURN);
-    expect(String(error)).toContain('不是发起人本人');
+    expect(error).toBeUndefined();
     expect(asked).toEqual([]);
-    expect(existsSync(join(runDir, 'run.json'))).toBe(false);
+    const envelope = loadAuthorizedV3Run(runDir).envelope;
+    expect(frozenHandoffIdentity(envelope)).toBeUndefined();
+    expect(envelope.authorization).toMatchObject({ handoffIdentity: { unavailable: 'not_human_turn' } });
   });
 
   it('the initiator\'s own message approves and freezes them', async () => {

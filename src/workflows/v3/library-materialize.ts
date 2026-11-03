@@ -55,7 +55,7 @@ import {
   makeSavedDefinitionRunEnvelope,
   publishRunEnvelopeOnce,
   type LoadedAuthorizedV3Run,
-  type V3HandoffIdentityFreeze,
+  type V3HandoffIdentityRecord,
   type V3SavedDefinitionRunEnvelope,
 } from './run-envelope.js';
 import type { BotSnapshot, Spec } from './contract.js';
@@ -271,7 +271,7 @@ export interface MaterializeSavedWorkflowRunInput {
   nodeExecutor?: 'bot';
   /** The initiator frozen for 交接带发起人身份 (design §10.2); only with
    *  `nodeExecutor: 'bot'`. The initiator is `context.chatBinding.ownerOpenId`. */
-  handoffIdentity?: V3HandoffIdentityFreeze;
+  handoffIdentity?: V3HandoffIdentityRecord;
 }
 
 export interface MaterializedSavedWorkflowRun {

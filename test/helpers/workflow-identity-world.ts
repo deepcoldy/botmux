@@ -22,7 +22,7 @@ import {
   artifactRef,
   makeAdHocRunEnvelope,
   publishRunEnvelopeOnce,
-  type V3HandoffIdentityFreeze,
+  type V3HandoffIdentityRecord,
   type V3HandoffIdentityTool,
 } from '../../src/workflows/v3/run-envelope.js';
 import { SPEC_SCHEMA_VERSION, type BotSnapshot } from '../../src/workflows/v3/contract.js';
@@ -58,7 +58,7 @@ export function policy(tools: V3HandoffIdentityTool[] | null): TriggerUserAuthCo
  * DAG uses. `identity: null` = authorized while the identity switch was off.
  */
 export function authorizeRun(run: BotRun, opts: {
-  identity: V3HandoffIdentityFreeze | null;
+  identity: V3HandoffIdentityRecord | null;
   selectors?: string[];
   chatBinding?: typeof BINDING;
 }): Map<string, BotSnapshot> {

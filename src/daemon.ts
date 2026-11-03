@@ -769,6 +769,7 @@ import { lookupWorkflowHandoff, readDispatchRegistryLoose } from './core/workflo
 import {
   WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE,
   checkWorkflowHandoffIdentityTarget,
+  inheritWorkflowDelegation,
   workflowDelegationRefusal,
   type WorkflowDelegationRefusal,
 } from './core/workflow-handoff-identity.js';
@@ -4598,8 +4599,10 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
         tools: [],
         // A top-level handoff has no thread; the handoff message itself is
         // what a refusal report points back at. A workflow node always
-        // reports to its handoff message, not to the node topic.
-        dispatchRoot: (workflow ? delegation.messageId : delegation.rootId) ?? delegation.messageId ?? turnId,
+        // reports to its handoff message, not to the node topic (a record
+        // passed on from a node follows the dispatch rule).
+        dispatchRoot: ('workflow' in delegation && !delegation.workflow.hop ? delegation.messageId : delegation.rootId)
+          ?? delegation.messageId ?? turnId,
         denialReason: 'target_access_denied',
         ...(workflow ? { workflowHandoff: true as const } : {}),
       };
@@ -8387,9 +8390,20 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // schedule:create; `--no-delegate schedule:create` keeps the caller's own
     // immediate tool delegation.
     const serviceGrant = scheduleCreateRequested ? botGrant : undefined;
-    const inherited = needsDelegation && turnId && !serviceGrant
+    let inherited = needsDelegation && turnId && !serviceGrant
       ? await dispatchUserForTurn(ds, turnId) : undefined;
-    if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
+    let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
+    if (inherited && 'workflow' in inherited) {
+      // A workflow node's delegation goes on only within its run (approved
+      // bots, the run's chat, the live attempt); otherwise this dispatch goes
+      // ahead without the initiator — never refused (design §10).
+      const passedOn = await inheritWorkflowDelegation({
+        inherited, targetAppIds, chatId, baseDir: v3DefaultBaseDir(),
+        targetUserAllowed: async (authority) => !!await targetUserForDelegation(ds, authority),
+      });
+      if (passedOn.inherit) inheritedWorkflow = passedOn.workflow;
+      else inherited = undefined;
+    } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return jsonRes(res, 403, { ok: false, error: 'delegated_caller_not_allowed' });
     }
     let authority = needsDelegation && turnId && !serviceGrant ? await authorityForDispatch({
@@ -8434,6 +8448,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           payload: {
             sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
             rootId, chatId, targetAppIds, authority,
+            ...(inheritedWorkflow && !scheduleCreateCapabilities(authority).length ? { workflow: inheritedWorkflow } : {}),
           }, send,
         })
       : await send();
@@ -8520,8 +8535,17 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     // lead that is handed a report by one bot can still hand the same person
     // on to the next. Re-checked against this chat and narrowed to this bot's
     // tools; a schedule or a plain bot-to-bot message still has no sender.
-    const inherited = await dispatchUserForTurn(ds, turnId);
-    if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
+    let inherited = await dispatchUserForTurn(ds, turnId);
+    let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
+    if (inherited && 'workflow' in inherited) {
+      // Same rule as `botmux dispatch` from a workflow node (design §10).
+      const passedOn = await inheritWorkflowDelegation({
+        inherited, targetAppIds: targets, chatId, baseDir: v3DefaultBaseDir(),
+        targetUserAllowed: async (authority) => !!await targetUserForDelegation(ds, authority),
+      });
+      if (passedOn.inherit) inheritedWorkflow = passedOn.workflow;
+      else inherited = undefined;
+    } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return skip('delegated_caller_not_allowed');
     }
     const authority = await authorityForDispatch({
@@ -8543,6 +8567,7 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
       payload: {
         sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
         chatId, targetAppIds: targets, authority,
+        ...(inheritedWorkflow ? { workflow: inheritedWorkflow } : {}),
       },
     });
     logger.info(

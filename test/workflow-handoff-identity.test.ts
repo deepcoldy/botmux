@@ -74,6 +74,26 @@ afterEach(() => cleanupBotRuns());
 
 const FROZEN = { unionId: INITIATOR_UNION, tools: ['lark-cli', 'bytedcli'] as Array<'lark-cli' | 'bytedcli'> };
 
+/** The visible text of the latest handoff card (as patched with its id). */
+function handoffText(world: { lark: { replies: Array<{ id: string; card: string }>; patches: Array<{ id: string; card: string }> } }): string {
+  const reply = world.lark.replies.at(-1)!;
+  const patched = [...world.lark.patches].reverse().find((patch) => patch.id === reply.id);
+  return JSON.stringify(JSON.parse((patched ?? reply).card));
+}
+
+/** Handed off as usual: sent, no delegation bound, the reason on the card. */
+function expectUnsignedHandoff(run: BotRun, world: Parameters<typeof handoffText>[0] & { dataDir: string }, reason: string | RegExp) {
+  const attempt = run.openAttempt('write');
+  expect(attempt.phase).toBe('sent');
+  expect(run.of('nodeBlocked')).toEqual([]);
+  expect(boundRecord(world.dataDir, attempt.handoffMessageId!)).toBeUndefined();
+  const text = handoffText(world);
+  expect(text).toContain('未带发起人身份：');
+  expect(text).toMatch(typeof reason === 'string' ? new RegExp(reason) : reason);
+  expect(text).toContain('需要个人授权的工具会在调用时提示授权');
+  expect(text).not.toContain('IDENTITY_UNAVAILABLE');
+}
+
 function store(dataDir: string): Record<string, unknown> {
   const path = dispatchUserStorePath(dataDir);
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf-8')) : {};
@@ -224,18 +244,29 @@ describe('each handoff is signed by the main bot from the run (star issuance)', 
   it.each([
     ['the initiator left the chat', (world: ReturnType<typeof identityWorld>) => { world.members.get('cli_a')!.clear(); }, '已不在本群'],
     ['the target governs none of the frozen tools', (world: ReturnType<typeof identityWorld>) => { world.policies.set('cli_a', policy(['bytedcli'])); }, '没有可交给'],
-  ])('%s: IDENTITY_UNAVAILABLE before anything is sent, never a send without the initiator', async (_label, arrange, text) => {
-    const run = new BotRun(reportDag(`id-refuse-${text.length}`));
+    ['the main bot no longer governs the frozen tool', (world: ReturnType<typeof identityWorld>) => { world.policies.set(MAIN, policy(['bytedcli'])); }, '没有可交给'],
+  ])('%s: handed off as usual without the initiator, the reason on the card', async (_label, arrange, text) => {
+    const run = new BotRun(reportDag(`id-unsigned-${_label.length}`));
     const world = identityWorld();
     const snapshots = authorizeRun(run, { identity: { unionId: INITIATOR_UNION, tools: ['lark-cli'] } });
     arrange(world);
-    expect(expectTerminal(await driveWith(run, world, snapshots)).runStatus).toBe('blocked');
-    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
-      errorCode: 'IDENTITY_UNAVAILABLE', message: expect.stringContaining(text),
-    })]);
-    expect(world.lark.sent).toEqual([]);
-    expect(world.lark.replies).toEqual([]);
+    expectAwaitingExternal(await driveWith(run, world, snapshots));
+    expectUnsignedHandoff(run, world, text);
     expect(store(world.dataDir)).toEqual({});
+  });
+
+  it('a run approved without the initiator hands off as usual and says why where it matters', async () => {
+    const governing = new BotRun(reportDag('id-approved-without'));
+    const world = identityWorld();
+    await driveWith(governing, world, authorizeRun(governing, { identity: { unavailable: 'not_human_turn' } }));
+    expectUnsignedHandoff(governing, world, '批准时没有取得发起人身份（这次批准不是发起人本人在群里发来的消息');
+    expect(world.identityChecks).toEqual([]);
+    // A bot that runs no tool as its trigger user has nothing to be told.
+    const plain = new BotRun(reportDag('id-approved-without-plain', { bot: 'cli_b' }));
+    const plainWorld = identityWorld();
+    await driveWith(plain, plainWorld, authorizeRun(plain, { identity: { unavailable: 'lookup_failed' }, selectors: ['cli_b'] }));
+    expect(plain.openAttempt('write').phase).toBe('sent');
+    expect(handoffText(plainWorld)).not.toContain('未带发起人身份');
   });
 
   it('only the run\'s own main bot signs, and only for the run\'s own chat', async () => {
@@ -243,18 +274,17 @@ describe('each handoff is signed by the main bot from the run (star issuance)', 
     const world = identityWorld();
     const snapshots = authorizeRun(run, { identity: FROZEN });
     // Another bot's daemon driving this run (it does not own it) …
-    expect(expectTerminal(await run.drive(world.daemons.get('cli_b')!.executor, {
+    expectAwaitingExternal(await run.drive(world.daemons.get('cli_b')!.executor, {
       opts: { chatBinding: BINDING, authorizedArtifacts: true, frozenBotSnapshots: snapshots },
-    })).runStatus).toBe('blocked');
-    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'IDENTITY_UNAVAILABLE' })]);
+    }));
+    expectUnsignedHandoff(run, world, '群或主 Bot 与批准时的不一致');
     // … and the owner handing off into a chat that is not the run's.
     const other = new BotRun(reportDag('id-wrong-chat'));
     const otherSnapshots = authorizeRun(other, { identity: FROZEN });
-    expect(expectTerminal(await other.drive(world.main.executor, {
+    expectAwaitingExternal(await other.drive(world.main.executor, {
       opts: { chatBinding: { ...BINDING, chatId: 'oc_elsewhere' }, authorizedArtifacts: true, frozenBotSnapshots: otherSnapshots },
-    })).runStatus).toBe('blocked');
-    expect(other.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'IDENTITY_UNAVAILABLE' })]);
-    expect(world.lark.sent).toEqual([]);
+    }));
+    expectUnsignedHandoff(other, world, '群或主 Bot 与批准时的不一致');
     expect(world.identityChecks).toEqual([]);
     expect(store(world.dataDir)).toEqual({});
   });
@@ -352,8 +382,11 @@ describe('each handoff is signed by the main bot from the run (star issuance)', 
 
     world.members.get('cli_a')!.clear(); // revoked in between: the next hop re-checks
     expect(requestV3Retry(run.base, run.dag.runId, { nodeId: 'write' })).toMatchObject({ kind: 'requested' });
+    expectAwaitingExternal(await driveWith(run, world, snapshots));
+    const second = run.openAttempt('write');
+    expect(boundRecord(world.dataDir, second.handoffMessageId!)).toBeUndefined(); // went out unsigned
+    expect(reportExternalBlocked(run.runDir, { attemptId: second.attemptId, reason: 'needs the person' })).toEqual({ ok: true });
     expect(expectTerminal(await driveWith(run, world, snapshots)).runStatus).toBe('blocked');
-    expect(run.of('nodeBlocked').at(-1)).toMatchObject({ errorCode: 'IDENTITY_UNAVAILABLE' });
 
     world.members.get('cli_a')!.add(INITIATOR_OU_IN.cli_a!);
     expect(requestV3Retry(run.base, run.dag.runId, { nodeId: 'write' })).toMatchObject({ kind: 'requested' });
@@ -369,7 +402,7 @@ describe('each handoff is signed by the main bot from the run (star issuance)', 
 
 // ─── a check that cannot run ───────────────────────────────────────────────
 
-describe('a target check that cannot run is retried for about a minute before the node blocks', () => {
+describe('a target check that cannot run is retried for about a minute, then the node goes out without the initiator', () => {
   async function stuck(runId: string) {
     const run = new BotRun(reportDag(runId));
     // The executor stamps handoff bindings with this clock too; the registry
@@ -407,35 +440,30 @@ describe('a target check that cannot run is retried for about a minute before th
     expect(world.identityChecks).toHaveLength(2);
   });
 
-  it('still failing after the schedule: IDENTITY_UNAVAILABLE with the reason, nothing sent', async () => {
+  it('still failing after the schedule: handed off without the initiator, saying it retried', async () => {
     const { run, world, drive } = await stuck('id-retry-exhausted');
     const t0 = run.clock.t;
     await drive(); // checks at +0 s, +5 s
     run.clock.t = t0 + 35_000;
     expectAwaitingExternal(await drive()); // check at +35 s; the last is due at +60 s
     expect(world.identityChecks).toHaveLength(3);
-    run.clock.t = t0 + 65_000;
-    expect(expectTerminal(await drive()).runStatus).toBe('blocked');
-    expect(world.identityChecks).toHaveLength(4);
-    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
-      errorCode: 'IDENTITY_UNAVAILABLE',
-      message: expect.stringMatching(/暂时无法.*contact lookup unavailable.*自动重试 3 次仍失败/),
-    })]);
     expect(world.lark.sent).toEqual([]);
+    run.clock.t = t0 + 65_000;
+    expectAwaitingExternal(await drive());
+    expect(world.identityChecks).toHaveLength(4);
+    expectUnsignedHandoff(run, world, /暂时无法.*contact lookup unavailable.*已自动重试 3 次/);
     expect(store(world.dataDir)).toEqual({});
   });
 
-  it('a definite refusal during the retries blocks at once', async () => {
+  it('a definite answer during the retries decides at once', async () => {
     const { run, world, drive } = await stuck('id-retry-then-denied');
     await drive();
     world.directoryDown.delete('cli_a');
     world.members.get('cli_a')!.clear();
     run.clock.t += 30_000;
-    expect(expectTerminal(await drive()).runStatus).toBe('blocked');
-    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
-      errorCode: 'IDENTITY_UNAVAILABLE', message: expect.stringContaining('已不在本群'),
-    })]);
+    expectAwaitingExternal(await drive());
     expect(world.identityChecks).toHaveLength(3);
+    expectUnsignedHandoff(run, world, '已不在本群');
   });
 });
 
@@ -557,6 +585,7 @@ describe('the signing plan', () => {
       sourceLarkAppId: MAIN,
       targetLarkAppId: 'cli_a',
       sourceBotTools: ['lark-cli', 'bytedcli'],
+      targetGovernsTools: true,
       botName: (appId) => appId,
       check: async (tools) => { offered.push(tools); return { status: 'ok', tools }; },
       ...overrides,
@@ -570,13 +599,21 @@ describe('the signing plan', () => {
     expect(offered).toEqual([]);
   });
 
-  it('a bot outside the approved set is offered nothing, so a governing target refuses', async () => {
+  it('a run approved without the initiator: unsigned for a governing target (no check), nothing for another', async () => {
+    const without: WorkflowHandoffIdentityRun = { unavailableReason: 'lookup_unavailable', approvedBots: new Set(['cli_a']), chatId: CHAT, sourceLarkAppId: MAIN };
+    const governing = plan({ run: without });
+    expect(await governing.result).toEqual({ kind: 'unsigned', note: expect.stringContaining('批准时没有取得发起人身份（主 Bot 查不到发起人的跨应用身份') });
+    expect(governing.offered).toEqual([]);
+    expect(await plan({ run: without, targetGovernsTools: false }).result).toEqual({ kind: 'none' });
+  });
+
+  it('a bot outside the approved set is offered nothing: it goes out unsigned', async () => {
     const offered: string[][] = [];
     const { result } = plan({
       targetLarkAppId: 'cli_x',
       check: async (tools) => { offered.push(tools); return tools.length ? { status: 'ok', tools } : { status: 'denied', reason: 'no_shared_tool' }; },
     });
-    expect(await result).toMatchObject({ kind: 'reject', message: expect.stringContaining('不是发起人批准时选定的 Bot') });
+    expect(await result).toEqual({ kind: 'unsigned', note: expect.stringContaining('不是发起人批准时选定的 Bot') });
     expect(offered).toEqual([[]]);
   });
 
@@ -585,9 +622,9 @@ describe('the signing plan', () => {
     expect(await result).toMatchObject({ kind: 'sign', authority: { tools: ['lark-cli'] } });
   });
 
-  it('a failing check refuses (fail closed)', async () => {
+  it('a failing check never signs: unsigned, marked for the retry', async () => {
     const { result } = plan({ check: async () => { throw new Error('ipc down'); } });
-    expect(await result).toMatchObject({ kind: 'reject', message: expect.stringContaining('ipc down') });
+    expect(await result).toEqual({ kind: 'unsigned', transient: true, note: expect.stringContaining('ipc down') });
   });
 });
 

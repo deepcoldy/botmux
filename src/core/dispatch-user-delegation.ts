@@ -85,12 +85,18 @@ const workflowRefSchema = z.object({
   revision: z.number().int().positive(),
   /** The handoff's binding nonce (core/workflow-handoff-binding). */
   nonce: z.string().regex(/^wfh_[A-Za-z0-9_-]{24}$/),
+  /** Absent: signed by the main bot for its handoff. n ≥ 1: passed on n
+   *  hops by node bots (`botmux dispatch` / `send --mention` from the node
+   *  session), still tied to the same attempt and narrowed at every hop. */
+  hop: z.number().int().min(1).max(16).optional(),
 }).strict();
 const payloadWorkflowSchema = z.object({
   domain: z.literal(DISPATCH_USER_WORKFLOW_DOMAIN),
   ...payloadBase,
-  rootId: identity('om_'),
-  targetAppIds: z.array(identity('cli_')).length(1),
+  /** The node topic for the main bot's handoff; a passed-on record follows
+   *  the dispatch's own rule (a thread, or none for a --mention handoff). */
+  rootId: identity('om_').optional(),
+  targetAppIds: z.array(identity('cli_')).min(1).max(64),
   workflow: workflowRefSchema,
   authority: authorityV1Schema,
 }).strict();

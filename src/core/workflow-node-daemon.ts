@@ -242,23 +242,26 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         const run = loadWorkflowHandoffIdentityRun(request.runDir);
         if (!run) return { kind: 'none' };
         const self = deps.selfLarkAppId();
-        // Only the run's own chat (§10.3): the request's binding IS the run's.
+        const targetGovernsTools = deps.handoffIdentity.botTools(request.targetLarkAppId).length > 0;
+        // Only the run's own main bot signs, only for the run's own chat
+        // (§10.3); anything else goes out without the initiator.
         const chatId = request.chatBinding?.chatId;
         if (!chatId || chatId !== run.chatId || run.sourceLarkAppId !== self) {
-          return { kind: 'reject', message: '这个 run 的群或主 Bot 与冻结的发起人身份不一致，节点未交接' };
+          return targetGovernsTools
+            ? { kind: 'unsigned', note: '这次交接的群或主 Bot 与批准时的不一致' }
+            : { kind: 'none' };
         }
+        const identity = run.identity;
         return planWorkflowHandoffIdentity({
           run,
           sourceLarkAppId: self,
           targetLarkAppId: request.targetLarkAppId,
           sourceBotTools: deps.handoffIdentity.botTools(self),
+          targetGovernsTools,
           botName: deps.botName,
-          check: (offered) => checkTargetIdentity(request.targetLarkAppId, {
-            chatId,
-            unionId: run.identity.unionId,
-            tools: offered,
-            sourceLarkAppId: self,
-          }),
+          check: (offered) => identity
+            ? checkTargetIdentity(request.targetLarkAppId, { chatId, unionId: identity.unionId, tools: offered, sourceLarkAppId: self })
+            : Promise.resolve({ status: 'not_required' } as const),
         });
       },
       deliver: (input) => deliverWorkflowHandoffWithUser({

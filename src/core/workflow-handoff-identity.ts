@@ -12,15 +12,21 @@
  * same host key, store, pending → bind steps, and the receiving daemon
  * publishes it through the same path a `botmux dispatch` delegation takes.
  *
+ * Principle (design §10): permission is asked for only when a tool really
+ * needs a person it does not have. No approval, handoff or dispatch is held
+ * back for an identity: what cannot carry the initiator goes ahead without
+ * them, saying why, and a tool that does need the person refuses and asks for
+ * authorization when it is called — never running as the bot or its owner.
+ *
  * This module holds the decisions, with every Lark / daemon effect injected:
  *  - the target bot's pre-handoff check (its own talk-permission and chat
  *    membership check, the one dispatch uses) and the main bot's signing plan
- *    built on it — a bot with `triggerUserAuth` whose check fails is never
- *    handed the node (it blocks IDENTITY_UNAVAILABLE instead of running as
- *    the bot or its owner);
+ *    built on it — sign, or hand off unsigned with a plain-words reason;
  *  - the receiver's additional workflow checks: the handoff is still this
  *    session's, unrevoked, its attempt still the run's live one, the bot one
- *    the initiator approved.
+ *    the initiator approved (re-checked on every use of the identity);
+ *  - passing the initiator on from a node session: only to approved bots in
+ *    the run's chat, tied to the same attempt.
  *
  * Runs without a frozen identity never reach any of it: switch off ⟹ no
  * record is signed and every handoff is sent exactly as before.
@@ -44,12 +50,15 @@ import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import {
   V3_HANDOFF_IDENTITY_TOOLS,
   frozenHandoffIdentity,
+  handoffIdentityRecordOf,
   loadAuthorizedV3Run,
   readRunEnvelope,
   type LoadedAuthorizedV3Run,
   type V3FrozenHandoffIdentity,
   type V3HandoffIdentityTool,
+  type V3HandoffIdentityUnavailableReason,
 } from '../workflows/v3/run-envelope.js';
+import { V3_HANDOFF_IDENTITY_UNAVAILABLE_TEXT } from '../workflows/v3/node-executor-mode.js';
 
 /** Main bot's daemon → target bot's daemon, before a handoff is sent. */
 export const WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE = '/api/workflow/handoff-identity-check';
@@ -57,7 +66,10 @@ export const WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE = '/api/workflow/handoff-iden
 // ─── The run's frozen identity and approved bots ────────────────────────────
 
 export interface WorkflowHandoffIdentityRun {
-  identity: V3FrozenHandoffIdentity;
+  /** The frozen initiator; absent when the run was approved without one. */
+  identity?: V3FrozenHandoffIdentity;
+  /** Why the run carries no identity (set exactly when `identity` is not). */
+  unavailableReason?: V3HandoffIdentityUnavailableReason;
   /** Bots that may receive the identity (§10.3). */
   approvedBots: ReadonlySet<string>;
   chatId?: string;
@@ -76,35 +88,36 @@ export interface WorkflowHandoffIdentityRun {
 export function approvedWorkflowBots(
   loaded: Pick<LoadedAuthorizedV3Run, 'botSnapshots'>,
   events: readonly StoredEvent[],
-  initiatorOpenId: string,
+  initiatorOpenId: string | undefined,
 ): Set<string> {
   const approved = new Set<string>();
   for (const snapshot of parseFrozenBotSnapshots(loaded.botSnapshots).values()) approved.add(snapshot.larkAppId);
   for (const event of events) {
-    if (event.type === 'nodeReassigned' && event.by === initiatorOpenId) approved.add(event.to);
+    if (event.type === 'nodeReassigned' && initiatorOpenId !== undefined && event.by === initiatorOpenId) approved.add(event.to);
   }
   return approved;
 }
 
 /**
- * The frozen identity of a run, or undefined when it has none (switch off at
- * authorization, an ephemeral run, or no run.json at all). An existing but
- * unreadable / tampered run.json or artifact throws: whether a run must carry
- * its initiator is never guessed.
+ * The run's 交接带发起人身份 record — its frozen initiator, or why it was
+ * approved without one — or undefined when the switch was off at
+ * authorization (or there is no run.json at all). An existing but unreadable
+ * / tampered run.json or artifact throws: a run's record is never guessed.
  */
 export function loadWorkflowHandoffIdentityRun(runDir: string): WorkflowHandoffIdentityRun | undefined {
   const read = readRunEnvelope(runDir);
   if (read.kind === 'missing') return undefined;
   if (read.kind === 'invalid') throw new Error(`run.json is invalid: ${read.problems.join('; ')}`);
-  // Cheap common case: nothing frozen, nothing else to verify.
-  if (!frozenHandoffIdentity(read.envelope)) return undefined;
+  // Cheap common case: switch off, nothing else to verify.
+  if (!handoffIdentityRecordOf(read.envelope)) return undefined;
   const loaded = loadAuthorizedV3Run(runDir);
+  const record = handoffIdentityRecordOf(loaded.envelope);
+  if (!record) return undefined;
   const identity = frozenHandoffIdentity(loaded.envelope);
-  if (!identity) return undefined;
   const events = readJournal(join(runDir, 'journal.ndjson'));
   return {
-    identity,
-    approvedBots: approvedWorkflowBots(loaded, events, identity.openId),
+    ...(identity ? { identity } : { unavailableReason: 'unavailable' in record ? record.unavailable : 'no_initiator' }),
+    approvedBots: approvedWorkflowBots(loaded, events, identity?.openId),
     ...(loaded.envelope.chatBinding?.chatId ? { chatId: loaded.envelope.chatBinding.chatId } : {}),
     ...(loaded.envelope.chatBinding?.larkAppId ? { sourceLarkAppId: loaded.envelope.chatBinding.larkAppId } : {}),
   };
@@ -216,13 +229,16 @@ export async function handleWorkflowHandoffIdentityCheck(
 // ─── Main bot side: sign, skip or refuse this handoff ───────────────────────
 
 export type WorkflowHandoffIdentityPlan =
-  /** No delegation: the run froze none, or the target needs none. The
-   *  handoff is sent exactly as without the feature. */
+  /** No delegation and nothing to say: the run froze none and the switch was
+   *  off, or the target runs no tool as its trigger user. The handoff is
+   *  sent exactly as without the feature. */
   | { kind: 'none' }
-  /** Refuse BEFORE sending anything: IDENTITY_UNAVAILABLE (§10.3).
-   *  `transient`: the check itself could not run (a lookup error, the target
-   *  daemon unreachable) — the sender retries for a while before blocking. */
-  | { kind: 'reject'; message: string; transient?: true }
+  /** Sent WITHOUT the initiator (design §10 principle: a node is never held
+   *  back for an identity it may not need). `note` says why, in plain words,
+   *  on the handoff; a tool that does need the person asks for authorization
+   *  when it is called. `transient`: the target's check could not run — the
+   *  sender retries it for a while first. */
+  | { kind: 'unsigned'; note: string; transient?: true }
   | { kind: 'sign'; authority: DispatchUserAuthority };
 
 /**
@@ -230,9 +246,9 @@ export type WorkflowHandoffIdentityPlan =
  * with a frozen identity can yield a delegation, always built from that
  * record; tools only narrow — the frozen ceiling ∩ what the main bot governs
  * now ∩ what the target governs — and a bot outside the approved set is
- * offered none. The target's own check decides; when the target governs
- * tools but cannot carry the initiator, the handoff is refused, never sent
- * without them.
+ * offered none. The target's own check decides. Whatever keeps the initiator
+ * from going along never stops the handoff: it goes out unsigned, saying why,
+ * and never runs as the bot or its owner instead (3.10).
  */
 export async function planWorkflowHandoffIdentity(input: {
   run: WorkflowHandoffIdentityRun | undefined;
@@ -240,11 +256,18 @@ export async function planWorkflowHandoffIdentity(input: {
   targetLarkAppId: string;
   /** The main bot's `triggerUserAuth` tools right now. */
   sourceBotTools: readonly V3HandoffIdentityTool[];
+  /** Whether the target runs any tool as its trigger user (bots.json). */
+  targetGovernsTools: boolean;
   botName: (larkAppId: string) => string;
   check: (offered: V3HandoffIdentityTool[]) => Promise<WorkflowHandoffIdentityCheck>;
 }): Promise<WorkflowHandoffIdentityPlan> {
   const run = input.run;
   if (!run) return { kind: 'none' };
+  if (!run.identity) {
+    return input.targetGovernsTools
+      ? { kind: 'unsigned', note: `批准时没有取得发起人身份（${V3_HANDOFF_IDENTITY_UNAVAILABLE_TEXT[run.unavailableReason ?? 'no_initiator']}）` }
+      : { kind: 'none' };
+  }
   const name = input.botName(input.targetLarkAppId);
   const approved = run.approvedBots.has(input.targetLarkAppId);
   const offered = approved ? run.identity.tools.filter((tool) => input.sourceBotTools.includes(tool)) : [];
@@ -256,22 +279,17 @@ export async function planWorkflowHandoffIdentity(input: {
   }
   if (checked.status === 'not_required') return { kind: 'none' };
   if (checked.status === 'unavailable') {
-    return { kind: 'reject', transient: true, message: `暂时无法在 ${name} 这边校验发起人身份（${checked.detail}），节点未交接` };
+    return { kind: 'unsigned', transient: true, note: `暂时无法在 ${name} 这边校验发起人身份（${checked.detail}）` };
   }
   if (checked.status === 'denied') {
-    if (!approved) {
-      return { kind: 'reject', message: `${name} 不是发起人批准时选定的 Bot，不能带发起人身份执行；它开了「按触发人鉴权」，节点未交接` };
-    }
+    if (!approved) return { kind: 'unsigned', note: `${name} 不是发起人批准时选定的 Bot` };
     if (checked.reason === 'no_shared_tool') {
-      const governed = checked.governed?.length ? checked.governed.join('、') : '工具';
-      return { kind: 'reject', message: `发起人在主 Bot 上没有可交给 ${name} 的工具身份（${name} 按触发人鉴权管着 ${governed}，委托只能比发起人在主 Bot 上的范围更窄），节点未交接` };
+      return { kind: 'unsigned', note: `发起人在主 Bot 上没有可交给 ${name} 的工具身份` };
     }
-    return { kind: 'reject', message: `发起人没有通过 ${name} 的身份校验（已不在本群、对 ${name} 没有对话权限，或 ${name} 查不到发起人），节点未交接` };
+    return { kind: 'unsigned', note: `发起人没有通过 ${name} 的身份校验（已不在本群、对它没有对话权限，或查不到发起人）` };
   }
   const tools = checked.tools.filter((tool) => offered.includes(tool));
-  if (tools.length === 0) {
-    return { kind: 'reject', message: `发起人在主 Bot 上没有可交给 ${name} 的工具身份，节点未交接` };
-  }
+  if (tools.length === 0) return { kind: 'unsigned', note: `发起人在主 Bot 上没有可交给 ${name} 的工具身份` };
   return {
     kind: 'sign',
     authority: {
@@ -358,21 +376,24 @@ export function workflowDelegationRefusal(input: {
 }): WorkflowDelegationRefusal | undefined {
   const { record, marker } = input;
   const ref = record.workflow;
+  // A record a node bot passed on (`hop`) names its own message, target and
+  // thread; it stays tied to the handoff's attempt through `ref`.
+  const passedOn = (ref.hop ?? 0) > 0;
   if (record.messageId !== input.turnId || record.chatId !== input.chatId
     || !record.targetAppIds.includes(input.receiverLarkAppId)) return 'not_this_handoff';
-  if (!marker || marker.handoffMessageId !== input.turnId || marker.nonce !== ref.nonce
+  if (!passedOn && (!marker || marker.handoffMessageId !== input.turnId || marker.nonce !== ref.nonce
     || marker.runId !== ref.runId || marker.attemptId !== ref.attemptId
-    || marker.publishRoot !== record.rootId || marker.orchestratorAppId !== record.sourceAppId) return 'not_this_handoff';
+    || marker.publishRoot !== record.rootId || marker.orchestratorAppId !== record.sourceAppId)) return 'not_this_handoff';
 
   const found = lookupWorkflowHandoffByNonce({ registry: input.registry, nonce: ref.nonce, secret: input.secret });
   if (found.kind !== 'workflow') return 'handoff_unbound';
   if (found.revoked) return 'handoff_revoked';
   const binding = found.binding;
-  if ((found.messageId && found.messageId !== input.turnId)
+  if ((!passedOn && ((found.messageId && found.messageId !== input.turnId)
     || binding.targetLarkAppId !== input.receiverLarkAppId
     || binding.targetChatId !== record.chatId
     || binding.publishRoot !== record.rootId
-    || binding.sourceLarkAppId !== record.sourceAppId
+    || binding.sourceLarkAppId !== record.sourceAppId))
     || binding.workflow.runId !== ref.runId
     || binding.workflow.nodeId !== ref.nodeId
     || binding.workflow.instanceId !== ref.instanceId
@@ -388,10 +409,10 @@ export function workflowDelegationRefusal(input: {
     return 'run_unreadable';
   }
   const authority = record.authority;
-  if (!run || run.identity.unionId !== authority.unionId || run.identity.openId !== authority.openId
-    || authority.appId !== record.sourceAppId
-    || authority.tools.some((tool) => !run!.identity.tools.includes(tool))) return 'identity_mismatch';
-  if (run.chatId !== record.chatId || run.sourceLarkAppId !== record.sourceAppId) return 'chat_mismatch';
+  if (!run?.identity || run.identity.unionId !== authority.unionId || run.identity.openId !== authority.openId
+    || authority.appId !== run.sourceLarkAppId
+    || authority.tools.some((tool) => !run!.identity!.tools.includes(tool))) return 'identity_mismatch';
+  if (run.chatId !== record.chatId || (!passedOn && run.sourceLarkAppId !== record.sourceAppId)) return 'chat_mismatch';
   if (!run.approvedBots.has(input.receiverLarkAppId)) return 'bot_not_approved';
 
   let current: ReturnType<typeof classifyExternalAttempt>;
@@ -405,6 +426,48 @@ export function workflowDelegationRefusal(input: {
     return 'run_unreadable';
   }
   if (!current.ok) return 'attempt_inactive';
-  if (current.attempt.nodeId !== ref.nodeId || current.attempt.targetLarkAppId !== input.receiverLarkAppId) return 'binding_mismatch';
+  if (current.attempt.nodeId !== ref.nodeId
+    || (!passedOn && current.attempt.targetLarkAppId !== input.receiverLarkAppId)) return 'binding_mismatch';
   return undefined;
+}
+
+// ─── Passing the initiator on from a node session ───────────────────────────
+
+/** Most hops a workflow delegation may be passed on (the record allows 16). */
+const MAX_WORKFLOW_DELEGATION_HOPS = 16;
+
+/**
+ * Whether a `botmux dispatch` / `send --mention` from a node session passes
+ * on the turn's workflow delegation (design §10.3: passing on is allowed,
+ * every hop only narrows — the caller still narrows tools to its own bot).
+ * `inherited` is the turn's own still-valid workflow delegation;
+ * `targetUserAllowed` is this bot's dispatch check of the person in its chat.
+ *
+ * It goes on only to bots of the run's approved set, in the run's chat, as a
+ * record tied to the same attempt (`workflow`, one more hop) — so it ends
+ * when that attempt or the run does. Otherwise the dispatch goes ahead
+ * WITHOUT the initiator: nothing is inherited and nothing is refused (design
+ * §10 principle). An ordinary dispatch delegation never comes here.
+ */
+export async function inheritWorkflowDelegation(input: {
+  inherited: WorkflowDispatchUserPayload;
+  targetAppIds: readonly string[];
+  chatId: string;
+  baseDir: string;
+  targetUserAllowed: (authority: DispatchUserAuthority) => Promise<boolean>;
+}): Promise<{ inherit: true; workflow: WorkflowDispatchUserRef } | { inherit: false }> {
+  const hop = (input.inherited.workflow.hop ?? 0) + 1;
+  if (hop > MAX_WORKFLOW_DELEGATION_HOPS) return { inherit: false };
+  let run: WorkflowHandoffIdentityRun | undefined;
+  try {
+    run = isValidRunId(input.inherited.workflow.runId)
+      ? loadWorkflowHandoffIdentityRun(join(input.baseDir, input.inherited.workflow.runId))
+      : undefined;
+  } catch {
+    run = undefined;
+  }
+  if (!run?.identity || input.chatId !== run.chatId || input.targetAppIds.length === 0
+    || input.targetAppIds.some((appId) => !run!.approvedBots.has(appId))) return { inherit: false };
+  if (!await input.targetUserAllowed(input.inherited.authority)) return { inherit: false };
+  return { inherit: true, workflow: { ...input.inherited.workflow, hop } };
 }
