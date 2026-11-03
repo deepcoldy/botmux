@@ -157,4 +157,112 @@ setInterval(() => {}, 1_000);
       { content: 'new answer' },
     ]);
   }, 30_000);
+
+  it('releases the restored stale turn when its boundary is outside the 16MB restart-scan tail', async () => {
+    root = mkdtempSync(join(tmpdir(), 'botmux-cold-resume-grok-tail-'));
+    const sessionDataDir = join(root, 'session');
+    const workDir = join(root, 'work');
+    const grokHome = join(root, '.grok');
+    const botmuxSessionId = randomUUID();
+    const nativeSessionId = randomUUID();
+    const oldPrompt = 'interrupted prompt beyond the scan tail';
+    const newPrompt = 'new cold-resume prompt';
+    const followUp = 'follow-up after cold recovery';
+    const oldAt = Date.now() - 5_000;
+    const nativeDir = join(grokHome, 'sessions', encodeURIComponent(workDir), nativeSessionId);
+    const updatesPath = join(nativeDir, 'updates.jsonl');
+    mkdirSync(sessionDataDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(nativeDir, { recursive: true });
+    writeFileSync(join(nativeDir, 'summary.json'), `${JSON.stringify({ session_id: nativeSessionId })}\n`);
+    // ~19MB of records the Grok drainer maps to NO events: the dead turn's
+    // user record stays outside scanRestartInterruption's 16MB tail window,
+    // while journal recovery (offsetAtMark=0) still restores it as started.
+    const pad = 'x'.repeat(900);
+    const records = [grokUpdate(nativeSessionId, {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: oldPrompt },
+    }, oldAt)];
+    for (let index = 0; index < 19_000; index++) {
+      records.push(grokUpdate(nativeSessionId, {
+        sessionUpdate: 'probe_filler_ignored', index, pad,
+      }, oldAt + 1 + index));
+    }
+    writeFileSync(updatesPath, records.join('\n') + '\n');
+    expect(statSync(updatesPath).size).toBeGreaterThan(17 * 1024 * 1024);
+    const marksDir = join(sessionDataDir, 'turn-marks');
+    mkdirSync(marksDir, { recursive: true });
+    writeFileSync(join(marksDir, `${botmuxSessionId}.json.structured`), `${JSON.stringify({
+      version: 1,
+      pending: [{
+        turnId: 'om_old',
+        markTimeMs: oldAt,
+        fingerprint: oldPrompt,
+        jsonlPath: updatesPath,
+        offsetAtMark: 0,
+      }],
+    })}\n`);
+
+    const fakeGrok = join(root, 'fake-grok');
+    const capturedInputPath = join(root, 'captured-input.txt');
+    writeFileSync(fakeGrok, `#!/usr/bin/env node
+const { writeFileSync, appendFileSync } = require('node:fs');
+writeFileSync(${JSON.stringify(capturedInputPath)}, '');
+process.stdin.on('data', chunk => appendFileSync(${JSON.stringify(capturedInputPath)}, chunk.toString()));
+setTimeout(() => process.stdout.write('❯ ready\\n'), 300);
+[700, 1100, 1500].forEach(ms => setTimeout(() => process.stdout.write('❯ ready\\n'), ms));
+process.stdin.resume();
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeGrok, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        GROK_HOME: grokHome,
+        SESSION_DATA_DIR: sessionDataDir,
+        BOTMUX_SESSION_ID: botmuxSessionId,
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'test-only',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init',
+      sessionId: botmuxSessionId,
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: workDir,
+      cliId: 'grok',
+      cliPathOverride: fakeGrok,
+      cliSessionId: nativeSessionId,
+      resume: true,
+      backendType: 'pty',
+      prompt: newPrompt,
+      larkAppId: 'app_test',
+      larkAppSecret: 'test-only',
+      turnId: 'om_new',
+    } satisfies DaemonToWorker);
+
+    // The tail scan cannot see the dead turn boundary; journal evidence must
+    // synthesise the interruption so the first prompt releases the stale turn.
+    await waitUntil(() => messages.some(message => message.type === 'prompt_ready'), logs, 20_000);
+    const text = logs.join('');
+    expect(text).toContain('Cleared 1 stale structured turn(s)');
+    expect(text).not.toContain('Cleared 2 stale structured turn(s)');
+    expect(messages.some(message => message.type === 'user_notify')).toBe(true);
+
+    child.send({ type: 'message', content: followUp, turnId: 'om_followup' } satisfies DaemonToWorker);
+    await waitUntil(() => {
+      try { return readFileSync(capturedInputPath, 'utf8').includes(followUp); }
+      catch { return false; }
+    }, logs, 20_000);
+  }, 45_000);
 });

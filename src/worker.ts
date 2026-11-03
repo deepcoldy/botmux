@@ -116,6 +116,7 @@ import {
   restartNoteInput,
   restartNoteMayPrefix,
   shouldSuppressRestartInterruptionScan,
+  shouldSynthesizeJournalInterruption,
   structuredTurnOpen,
   transcriptTailOffset,
   withoutReportedTasks,
@@ -332,7 +333,7 @@ import {
   SESSION_ID_FILENAME_RE,
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
-import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, type CodexPendingTurn } from './services/codex-bridge-queue.js';
+import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import { BridgeBlindTurnWatch, blindTurnNeedsNotice, type BridgeReadPosition } from './services/claude-bridge-blind-turn.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
@@ -7478,6 +7479,14 @@ function observeClaudeBackgroundTasks(events: readonly TranscriptEvent[]): void 
  *  transcript bridge consumes it at its baseline to read what the previous
  *  process left unfinished (scanRestartInterruption). */
 let restartInterruptionScanBeforeMs: number | undefined;
+/** Whether THIS spawn was eligible for the restart-interruption scan arm.
+ *  Computed from the exact same gate that arms restartInterruptionScanBeforeMs
+ *  in spawnCli (resume of a local, non-adopt, non-Codex-App/remote process,
+ *  outside the TraeX auto-model rotation). The journal-based interruption
+ *  synthesis in codexBridgeAttach may only run when a normal scan would have:
+ *  the rotation deliberately keeps the native turn alive across the restart,
+ *  so its journal-restored mark must not be retired as stale. */
+let restartInterruptionScanEligible = false;
 /** What the previous process left unfinished, held until the resumed CLI
  *  first reaches its prompt (deliverRestartInterruptionNote). */
 let pendingRestartInterruption: InterruptedWork | undefined;
@@ -7643,16 +7652,16 @@ function deliverRestartInterruptionNote(): void {
  * CLI has reached its first prompt, that old in-memory lifecycle can no longer
  * be completed by the dead process. Let the restart-interruption notice own
  * recovery instead of allowing the stale queue head to reject prompt-ready
- * forever. */
+ * forever.
+ *
+ * Interruption evidence normally comes from `scanRestartInterruption()` (the
+ * 16MB transcript-tail scan). A large mid-turn transcript can leave the dead
+ * turn's boundary outside that window; `codexBridgeAttach` then synthesises
+ * `pendingRestartInterruption` from the same journal-restored activity this
+ * helper selects, so the release does not silently fail in that shape. */
 function releaseInterruptedStructuredBridgeOnFirstPrompt(): void {
   if (!awaitingFirstPrompt || !pendingRestartInterruption || !codexBridgeFallbackActive()) return;
-  const stale = codexBridgeQueue.peek().filter(turn => turn.restoredFromJournal === true
-    && turn.finalText === undefined
-    && (turn.started
-      || turn.rpcActive
-      || turn.cliQueuedAtMs !== undefined
-      || turn.submitConfirmedAtMs !== undefined
-      || turn.submitVerificationStartedAtMs !== undefined));
+  const stale = selectStaleRestoredJournalTurns(codexBridgeQueue.peek());
   if (stale.length === 0) return;
   const dropped = stale.flatMap(turn => {
     const removed = codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
@@ -7662,6 +7671,7 @@ function releaseInterruptedStructuredBridgeOnFirstPrompt(): void {
   checkpointStructuredBridgeRecovery();
   log(`Cleared ${dropped.length} stale structured turn(s) from the previous CLI process before delivering the restart-interruption note`);
 }
+
 /** Journal-restore of interrupted Lark turns is allowed AT MOST ONCE per worker
  *  process, and only on the FIRST baseline this process runs. Rationale: the
  *  journal exists to recover a turn that a *cross-process* death (daemon
@@ -11096,6 +11106,27 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           codexBridgeQueue.absorb(history);
           codexBridgeQueue.ingest(live);
           if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
+          // The restart-interruption scan only reads the transcript's final
+          // 16MB. When the dead turn's user/start boundary (or a boundary at
+          // all) sits outside that window — large mid-turn tool output — the
+          // scan finds no open turn even though the journal this worker just
+          // replayed proves the previous process started one. Without evidence
+          // here, the first-prompt stale-turn release never fires and the
+          // lifecycle gate rejects prompt-ready forever. Synthesise the same
+          // interruption work from the journal proof so the release fires and
+          // the restart note owns continuation. The spawn gate excludes adopt,
+          // Codex App / remote backends and the TraeX auto-model rotation
+          // (whose native turn intentionally keeps running); a shared external
+          // app-server stays conservative as well.
+          if (shouldSynthesizeJournalInterruption({
+            scanEligible: restartInterruptionScanEligible,
+            existingAppServerEndpoint: !!lastInitConfig?.existingAppServerEndpoint,
+            pendingWork: pendingRestartInterruption,
+            hasStaleTurn: selectStaleRestoredJournalTurns(codexBridgeQueue.peek()).length > 0,
+          })) {
+            pendingRestartInterruption = { turnOpen: true, tasks: [] };
+            log('Structured journal restored an unfinished turn the restart-scan tail could not see; treating the previous process as interrupted for the first-prompt stale-turn release');
+          }
           emitReadyCodexTurns();
           if (live.some(event => event.kind === 'assistant_final')) {
             idleDetector?.fireIdle();
@@ -25661,9 +25692,10 @@ async function spawnCli(
     exactResumeSessionId: opts.exactResumeSessionId,
     effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
   });
-  if (lastSpawnEffectiveResume && !actuallyReattachedPersistent && !cfg.adoptMode
+  restartInterruptionScanEligible = lastSpawnEffectiveResume && !actuallyReattachedPersistent && !cfg.adoptMode
     && !isCodexAppCliId(cfg.cliId) && !isRemoteBackendType(effectiveBackendType)
-    && !plannedAutoModelResume) {
+    && !plannedAutoModelResume;
+  if (restartInterruptionScanEligible) {
     restartInterruptionScanBeforeMs = spawnStartedAtMs;
   }
   // A late same-named pane was reused, so the relay never ran to consume its plan.

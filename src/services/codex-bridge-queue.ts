@@ -147,6 +147,30 @@ export interface CodexPendingTurn {
   rpcActive?: boolean;
 }
 
+/** Journal-restored marks whose lifecycle the PREVIOUS worker process had
+ *  already accepted when it died: the replacement CLI cannot complete them, so
+ *  a cold-resume first prompt may retire them and let the restart-interruption
+ *  note own recovery.
+ *
+ *  The activity disjunction is load-bearing. `restorePendingTurns()` rebuilds
+ *  every mark as `started:false` with none of the submit/rpc flags. A mark
+ *  that never reached the transcript (its user record was still buffered when
+ *  the process died) must STAY queued: the resumed CLI may still emit that
+ *  user record — or genuinely run queued input — and a later ingest owns the
+ *  attribution. Only a mark the baseline replay proved the dead process had
+ *  already started / queued / confirmed is safe to retire. */
+export function selectStaleRestoredJournalTurns(
+  turns: readonly CodexPendingTurn[],
+): CodexPendingTurn[] {
+  return turns.filter(turn => turn.restoredFromJournal === true
+    && turn.finalText === undefined
+    && (turn.started
+      || turn.rpcActive === true
+      || turn.cliQueuedAtMs !== undefined
+      || turn.submitConfirmedAtMs !== undefined
+      || turn.submitVerificationStartedAtMs !== undefined));
+}
+
 export class CodexBridgeQueue {
   private seen = new Set<string>();
   private seenNativeUserMessages = new Map<string, true>();
