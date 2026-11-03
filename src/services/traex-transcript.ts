@@ -1042,13 +1042,12 @@ export function drainTraexRollout(
         if (text && claimUserTurn(sourceTurnId)) {
           events.push({ ...base, kind: 'user', text, sourceTurnId });
           if (!probe) {
-            // Scope the reset to THIS turn. A queued next turn's history
-            // mutation is persisted while the previous turn is still
-            // collecting (type-ahead); a whole-path clear would discard the
-            // prior turn's pending final so an empty last_agent_message at its
-            // terminal could no longer be recovered.
-            const pending = traexPendingAgentCache.get(path);
-            pending?.turns.delete(sourceTurnId);
+            // Forward the no-turn-id pending bucket to this turn, mirroring the
+            // legacy user_message / item_completed user edges. Do NOT delete any
+            // pending bucket: assistant evidence for this same turn can already
+            // be buffered (item_completed AgentMessage observed before the user
+            // edge), and a type-ahead next turn's edge must not discard the
+            // previous turn's pending final either.
             traexPendingAgentTurns(path).activeKey = sourceTurnId;
           }
         }
