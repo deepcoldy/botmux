@@ -17,16 +17,23 @@ describe('worker pane-switch env wiring (K3)', () => {
     // form are semantically identical); pinning the bare call shape would
     // redden harmless refactors. What matters is that BOTH env objects get it.
     const matches = worker
-      .match(/Object\.assign\(\s*(?:mergedEnv|childEnv)\s*,\s*paneSwitchEnv\([^)]*\)\s*\)/g)
+      .match(/Object\.assign\(\s*(mergedEnv|childEnv)\s*,\s*paneSwitchEnv\([^)]*\)\s*\)/g)
       ?? [];
+    // Exactly two apply sites overall, one per env object — so a duplicate of
+    // one (dropping the other) is caught even though the total is still 2.
     expect(matches).toHaveLength(2);
-    expect(worker).toContain('Object.assign(mergedEnv, paneSwitchEnv()');
-    expect(worker).toContain('Object.assign(childEnv, paneSwitchEnv()');
+    expect(matches.filter(m => m.includes('mergedEnv'))).toHaveLength(1);
+    expect(matches.filter(m => m.includes('childEnv'))).toHaveLength(1);
+    // Presence check stops at the opening paren so paneSwitchEnv(process.env)
+    // (an equivalent explicit-arg rewrite) stays green; the regex above still
+    // requires the call to close and the two target env objects to be present.
+    expect(worker).toContain('Object.assign(mergedEnv, paneSwitchEnv(');
+    expect(worker).toContain('Object.assign(childEnv, paneSwitchEnv(');
 
-    // The switches must reach panes only via the single projection; a per-key
-    // literal assignment would drift from the readers and silently drop the
-    // card switch when the projection list changes.
-    expect(worker).not.toContain('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED = ');
-    expect(worker).not.toContain('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=');
+    // The switches must reach panes only via the projection; forbid a real
+    // per-key assignment statement (not a comment mentioning the variable).
+    expect(worker).not.toMatch(
+      /^\s*(?:mergedEnv|childEnv)\.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED\s*=/m,
+    );
   });
 });
