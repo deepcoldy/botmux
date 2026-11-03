@@ -8,7 +8,7 @@ import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import {
   beginFeedbackMaintenance, freezeFeedbackSource, inspectFeedbackMaintenance,
   assertFeedbackAdmission, restoreFeedbackSource, retireFeedbackSource,
-  withFeedbackSendLease,
+  acquireFeedbackSendLease,
 } from '../src/services/feedback-maintenance.js';
 
 const directories: string[] = [];
@@ -69,12 +69,10 @@ describe('feedback maintenance', () => {
   });
   it('waits for a sending process before freezing', async () => {
     const { directory } = await fixture();
-    let finish!: () => void;
-    const sending = withFeedbackSendLease(directory, () => new Promise<void>(resolve => { finish = resolve; }));
+    const finish = acquireFeedbackSendLease(directory);
     await beginFeedbackMaintenance(directory, 'migration-one');
     await expect(freezeFeedbackSource(directory, 'migration-one')).rejects.toThrow('send_in_progress');
     finish();
-    await sending;
     await freezeFeedbackSource(directory, 'migration-one');
     expect((await inspectFeedbackMaintenance(directory, 'migration-one')).state).toBe('frozen');
   });

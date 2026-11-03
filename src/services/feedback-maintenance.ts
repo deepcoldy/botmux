@@ -45,10 +45,6 @@ export function assertFeedbackAdmission(dataDir: string): void {
 export function feedbackMaintenanceActive(dataDir: string): boolean {
   try { assertFeedbackAdmission(dataDir); return false; } catch { return true; }
 }
-export function withFeedbackSendLease<Result>(dataDir: string, operation: () => Promise<Result>): Promise<Result> {
-  const release = acquireFeedbackSendLease(dataDir);
-  return operation().then(result => { release(); return result; });
-}
 export function acquireFeedbackSendLease(dataDir: string): () => void {
   mkdirSync(dataDir, { recursive: true });
   const identity = readDurableProcessIdentity(process.pid);

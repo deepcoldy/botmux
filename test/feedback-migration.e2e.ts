@@ -11,6 +11,7 @@ import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedba
 import { restoreFeedbackSource } from '../src/services/feedback-maintenance.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { once } from 'node:events';
+import { openDatabaseSync } from '../src/services/sqlite-compat.js';
 
 describe('SQLite to PostgreSQL migration', () => {
   it.each(['normal', 'restored-source', 'crash-import', 'crash-retire'])('preserves source continuity and resumes safely: %s', async scenario => {
@@ -26,6 +27,17 @@ describe('SQLite to PostgreSQL migration', () => {
       const delivery = source.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'message' });
       source.recordFeedback({ platform: 'lark', platformAppId: 'app', platformMessageId: 'message', operatorSubjectId: 'user', result: 'helpful', callbackKey: 'first' });
       source.recordFeedback({ platform: 'lark', platformAppId: 'app', platformMessageId: 'message', operatorSubjectId: 'user', result: 'incorrect', callbackKey: 'second' });
+      const seed = await openDatabaseSync(join(directory, 'botmux-feedback.sqlite'));
+      seed.prepare('INSERT INTO skill_runs(skill_run_id,interaction_id,skill_ref,context_json,created_at) VALUES(?,?,?,?,?)')
+        .run('skill-run', 'original', 'review', '{"unicode":"你好"}', '2026-11-01T00:00:00.000Z');
+      seed.close();
+      source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'completed-turn', status: 'completed' });
+      source.recordTurnDelivery({
+        botAppId: 'app', sessionId: 'session', turnId: 'completed-turn', platform: 'lark',
+        platformAppId: 'app', platformMessageId: 'completed-message', content: 'completed answer',
+        cardMode: 'card', status: 'delivered', usage: { inputTokens: 2 },
+        webhookDestinations: [{ id: 'pending', enabled: true, url: 'https://example.com/hook', secretRef: 'secret-reference', eventTypes: ['turn.completed'] }],
+      });
       const before = source.listFeedbackRevisions(delivery.deliveryId, 'user');
       process.env.BOTMUX_MIGRATION_TEST_PASSWORD = decodeURIComponent(url.password) || 'unused';
       const config = await readFeedbackStorageConfig(directory);
@@ -71,6 +83,8 @@ describe('SQLite to PostgreSQL migration', () => {
       const target = await getFeedbackStorage(directory);
       expect(await target.store.listFeedbackRevisions(delivery.deliveryId, 'user')).toEqual(before);
       expect(await target.store.getResponse(response.responseId)).toMatchObject({ responseId: response.responseId });
+      expect(await target.store.listTurnCompletionEvents()).toHaveLength(1);
+      expect(await target.store.listFeedbackOutbox()).toMatchObject([{ status: 'pending' }]);
       expect((await resumeFeedbackMigration(directory, result.migrationId)).phase).toBe('complete');
       const jobPath = join(directory, 'feedback-migrations', `${result.migrationId}.json`);
       const saved = JSON.parse(await readFile(jobPath, 'utf8'));
