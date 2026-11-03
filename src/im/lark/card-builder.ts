@@ -1197,6 +1197,18 @@ export function buildStreamingCard(
   if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
     headerActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
   }
+  // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in 的闲置自动 /compact（core/idle-auto-compact.ts）。
+  // 状态随 usage 快照到卡（与 modelFallback 同理，所有调用点都已转发），快照里没有 ⇒ 该
+  // CLI/后端不支持，不渲染。跟随「压缩」按钮的隐藏配置：隐藏压缩即一并隐藏。按钮值带目标
+  // 状态 desired（而非「翻转」），旧卡片重复点击是幂等的。
+  const idleCompact = !adoptMode && !hidden.has('compact') ? usage?.idleAutoCompact : undefined;
+  if (idleCompact) {
+    headerActions.push(callbackButton(
+      t(idleCompact.enabled ? 'card.btn.idle_compact_on' : 'card.btn.idle_compact_off', { minutes: idleCompact.minutes }, locale),
+      'default',
+      { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
+  }
   // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
   // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
   // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
