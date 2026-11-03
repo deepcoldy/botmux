@@ -83,7 +83,11 @@ process.exit(child.status ?? 1);
       process.env.PATH = bin + delimiter + originalPath;
       await controller.apply(local, preview.token).catch(e => { error = e; });
     } finally { process.env.PATH = originalPath; }
-    expect(error).toMatchObject({ code: 'local_update_shared_deps', backupRef: expect.any(String) });
+    // Scalar matchers only: bun:test's toMatchObject (via the bun-leg shim)
+    // does not apply asymmetric matchers such as expect.any, which made this
+    // case deterministically red on the bun test leg.
+    expect(error?.code).toBe('local_update_shared_deps');
+    expect(error?.backupRef).toEqual(expect.any(String));
     expect(git(local, 'rev-parse', 'HEAD')).toBe(before);
     expect(() => readFileSync(resetLog)).toThrow();
     expect(git(local, 'rev-parse', `${error!.backupRef}/head`)).toBe(before);
