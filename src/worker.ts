@@ -104,7 +104,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -324,6 +324,7 @@ import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
   decideFingerprintSwitch,
+  foreignNativeSessionIds,
   shouldHealAbsentBaseline,
   pidRotationHistoryCutoffMs,
   shouldRecordPidStateSessionId,
@@ -7388,6 +7389,10 @@ let bridgeObservedCliSessionId: string | undefined;
  *  created — freshness/timestamp signals cannot prove pane ownership
  *  across siblings in the same project dir. */
 const bridgeKnownSessionIds = new Set<string>();
+/** Known ids this CLI's own pid state or open files showed it writing; see
+ *  `FingerprintSwitchInput.cliProvenSessionIds`. The spawn-time guess and ids
+ *  taken by a fingerprint switch are known but not in here. */
+const bridgeCliProvenSessionIds = new Set<string>();
 /** Set when the fingerprint fallback accepts a candidate whose sessionId
  *  doesn't match the pid file's current sessionId (Claude's pid file isn't
  *  refreshed by in-pane `/clear`, so it keeps reporting the spawn-time sid
@@ -8625,10 +8630,11 @@ function maybeEmitCodexAdoptPreamble(
  *  sessionId pattern so non-Claude jsonls in the project dir (accidental
  *  drops, third-party tooling) can't poison the trust set. No-op on
  *  parse failure. */
-function bridgeRememberSessionIdForPath(path: string | undefined): void {
+function bridgeRememberSessionIdForPath(path: string | undefined, evidence: 'cli' | 'unproven'): void {
   if (!path) return;
   const sid = sessionIdFromJsonlPath(path);
   if (!SESSION_ID_FILENAME_RE.test(sid)) return;
+  if (evidence === 'cli') bridgeCliProvenSessionIds.add(sid);
   bridgeKnownSessionIds.add(sid);
 }
 
@@ -8641,7 +8647,7 @@ function bridgeRememberSessionIdForPath(path: string | undefined): void {
 function bridgeProbeOpenSessionIds(): void {
   if (bridgeCliPid === undefined || !bridgeJsonlDir) return;
   const opened = findOpenJsonlsForPid(bridgeCliPid, bridgeJsonlDir);
-  for (const path of opened) bridgeRememberSessionIdForPath(path);
+  for (const path of opened) bridgeRememberSessionIdForPath(path, 'cli');
 }
 
 function bridgeShouldEmitAfterTranscriptQuiet(): boolean {
@@ -8817,6 +8823,8 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, bridgeJsonlPath);
+  // The old CLI's queue died with it: a replayed enqueue proves nothing now.
+  bridgeQueue.forgetCliQueue();
   observeModelFallbackEvents(bridgeJsonlPath, drained.events);
   bridgeBaselineDone = true;
   log(`Bridge restored ${restorable.length} interrupted turn(s) from journal (drain ${recoveryPlan.fromOffset}→${bridgeOffset}, absorbed=${history.length}, live=${live.length})`);
@@ -8899,7 +8907,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
   log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
-  bridgeRememberSessionIdForPath(matched);
+  bridgeRememberSessionIdForPath(matched, 'unproven');
   bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(matched));
   try {
     bridgeWatcher = fsWatch(matched, { persistent: false }, () => {
@@ -8932,22 +8940,9 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
  *
  *  Pending turns are preserved across the switch so the next ingest
  *  can match and start the turn in the new file. */
-/** Per-fingerprint rate limit for the full-directory fingerprint scan.
- *  Without this, a wedged pending turn (e.g. writeInput's Enter eaten by a
- *  Claude TUI prompt so the user line never lands in any jsonl) drives this
- *  function every 1s from the fallback timer and every idle tick — each
- *  call reads the trailing 1MB of every jsonl in the project dir (hundreds
- *  of files, 100s of MB total), pegging the worker at 99% CPU until
- *  restart. The cleanup paths in #1/#2 (dropPendingTurn / pruneExpired)
- *  are what actually *removes* the stuck mark; this rate limit just keeps
- *  the windows in between cheap.
- *
- *  10s is much wider than the milliseconds Claude needs to write a normal
- *  user line, but `maybeSwitchBridgeJsonl` is only consulted when the
- *  primary jsonl scan in `bridgeIngest` already failed to find the line —
- *  i.e. Claude rotated the file via `/clear` / `/resume`. Those rotations
- *  happen hours apart in practice, so a 10s detection delay is invisible. */
-const BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 10_000;
+// Per-mark rate limits for the full-directory fingerprint fallback (a wedged
+// mark otherwise rescans every jsonl each tick, 100s of MB at 99% CPU). The
+// values and rationale live with the queue-hold policy in bridge-turn-queue.ts.
 const bridgeFingerprintScanLastMs = new Map<string, number>();
 
 /** Pending+unstarted bridge marks expire after this long. Defensive TTL:
@@ -8958,15 +8953,35 @@ const bridgeFingerprintScanLastMs = new Map<string, number>();
  *  this long are real failures. */
 const BRIDGE_PENDING_TURN_TTL_MS = 120_000;
 
+/** Session ids of every other active botmux session (all bots share one data
+ *  dir). Read only on the rate-limited fingerprint fallback path. A store read
+ *  failure yields an empty set, i.e. the previous behaviour. */
+function bridgeForeignSessionIds(): Set<string> {
+  try {
+    const snapshot = sessionStore.loadAllSessionsSnapshot(
+      lastInitConfig?.larkAppId ? { fallbackAppId: lastInitConfig.larkAppId } : {},
+    );
+    return foreignNativeSessionIds(snapshot.values(), lastInitConfig?.sessionId);
+  } catch (err) {
+    log(`Bridge foreign-session lookup failed; sibling transcripts not excluded: ${err instanceof Error ? err.message : String(err)}`);
+    return new Set();
+  }
+}
+
 function maybeSwitchBridgeJsonl(): boolean {
   if (!bridgeJsonlDir) return false;
   const pending = bridgeQueue.peek();
   const candidate = pending.find(t => !t.started && !!t.contentFingerprint);
   if (!candidate || !candidate.contentFingerprint) return false;
   // Per-fingerprint rate limit — see BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS.
+  // An input Claude's own transcript shows queued is not lost, but an in-pane
+  // /clear while it waits moves it to a new file, so it is still scanned, rarely.
   const lastScan = bridgeFingerprintScanLastMs.get(candidate.contentFingerprint);
   const now = Date.now();
-  if (lastScan !== undefined && now - lastScan < BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS) {
+  const minInterval = isHeldInCliQueue(candidate)
+    ? BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS
+    : BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS;
+  if (lastScan !== undefined && now - lastScan < minInterval) {
     return false;
   }
   bridgeFingerprintScanLastMs.set(candidate.contentFingerprint, now);
@@ -8988,6 +9003,8 @@ function maybeSwitchBridgeJsonl(): boolean {
     contentFingerprint: candidate.contentFingerprint,
     contentNormalized: candidate.contentNormalized,
     knownSessionIds: bridgeKnownSessionIds,
+    cliProvenSessionIds: bridgeCliProvenSessionIds,
+    readForeignSessionIds: bridgeForeignSessionIds,
     findSubstring: (acceptCandidate) =>
       findJsonlContainingFingerprint(bridgeJsonlDir!, candidate.contentFingerprint!, {
         ...fingerprintScanOptions,
@@ -9212,7 +9229,7 @@ function maybeFollowQuietRotation(): void {
     // handshake; if a fd probe lands in that window, fingerprint
     // fallback can later accept the new sessionId on the user's next
     // Lark message.
-    for (const path of opened) bridgeRememberSessionIdForPath(path);
+    for (const path of opened) bridgeRememberSessionIdForPath(path, 'cli');
     const newest = newestPath(opened);
     if (newest && newest !== bridgeJsonlPath) {
       performRotationSwitch(newest, currentStat.mtimeMs, `pid fd → ${bridgeCliPid}`);
@@ -9300,7 +9317,7 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
   // Pid resolver always reports the spawn-time sessionId — this is a sid
   // that genuinely belongs to our adopted Claude pid, so remember it for
   // the sibling-pane hijack guard.
-  bridgeRememberSessionIdForPath(resolved.path);
+  bridgeRememberSessionIdForPath(resolved.path, 'cli');
   if (resolved.path === bridgeJsonlPath) {
     bridgePathConfirmedAtMs = Date.now();
     recordPidStateCliSessionId(resolved);
@@ -9440,7 +9457,7 @@ function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
   const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, bridgeDataDir);
   if (resolved && resolved.path !== bridgeJsonlPath && resolved.cliSessionId !== bridgeStalePidStateSessionId) {
     bridgeObservedCliSessionId = resolved.cliSessionId;
-    bridgeRememberSessionIdForPath(resolved.path);
+    bridgeRememberSessionIdForPath(resolved.path, 'cli');
     switchBridgeToPidStatePath(resolved.path, 'unread turn → pid state', confirmedAtMs);
     return true;
   }
@@ -9453,7 +9470,7 @@ function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
     .filter(path => path !== bridgeJsonlPath && (statSafe(path)?.mtimeMs ?? 0) >= confirmedAtMs);
   const newest = newestPath(written);
   if (!newest) return false;
-  bridgeRememberSessionIdForPath(newest);
+  bridgeRememberSessionIdForPath(newest, 'cli');
   switchBridgeToPidStatePath(newest, 'unread turn → open session files', confirmedAtMs);
   bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(newest));
   return true;
@@ -9545,6 +9562,7 @@ function makeBridgeTranscriptSettle(
  *  teardown/start and every in-process transcript switch. */
 function beginNewBridgeTranscriptGeneration(): void {
   disarmProvisionalExitWatch();
+  bridgeQueue.forgetCliQueue();
   // Pending turns are carried onto the new file; tag them so a watchdog
   // releasing one does not teach the new generation it is marker-less.
   bridgeQueue.markPendingTurnsCarriedAcrossGeneration();
@@ -9696,7 +9714,7 @@ function bridgeIngest(): void {
   for (const t of expired) {
     if (t.contentFingerprint) bridgeFingerprintScanLastMs.delete(t.contentFingerprint);
     journalBridgeTurnClear(t.turnId, t.dispatchAttempt);
-    log(`Bridge mark expired after ${Math.round(BRIDGE_PENDING_TURN_TTL_MS / 1000)}s without matching a jsonl user line (turnId=${t.turnId}) — dropped to prevent rotation-fallback scan loop.`);
+    log(`Bridge mark expired (${Math.round(BRIDGE_PENDING_TURN_TTL_MS / 1000)}s without a matching jsonl user line, or held past the queue cap) (turnId=${t.turnId}) — dropped to prevent rotation-fallback scan loop.`);
   }
   // Drain secondary paths first so any trailing assistant text on an old
   // jsonl reaches the queue before the rotation check considers retiring
@@ -9933,7 +9951,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, bridgeDataDir);
     if (resolved) {
       bridgeObservedCliSessionId = resolved.cliSessionId;
-      bridgeRememberSessionIdForPath(resolved.path);
+      bridgeRememberSessionIdForPath(resolved.path, 'cli');
       if (resolved.path !== bridgeJsonlPath) {
         log(`Bridge transcript adjusted at start (pid resolver): ${bridgeJsonlPath} → ${resolved.path}`);
         bridgeJsonlPath = resolved.path;
@@ -9959,7 +9977,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     const candidates: string[] = [];
     for (const sid of sids) {
       const path = claudeJsonlPathForSession(sid, bridgeCliCwd, bridgeDataDir);
-      bridgeRememberSessionIdForPath(path);
+      bridgeRememberSessionIdForPath(path, 'cli');
       if (existsSyncSafe(path)) candidates.push(path);
     }
     if (candidates.length > 0) {
@@ -9979,7 +9997,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // anchor for the sibling-pane hijack guard. Subsequent fingerprint
   // candidates are accepted only if their sessionId is in this set
   // (populated here, by pid resolver hits, and by per-tick fd probes).
-  bridgeRememberSessionIdForPath(bridgeJsonlPath);
+  bridgeRememberSessionIdForPath(bridgeJsonlPath, 'unproven');
   // Every watcher start re-arms marker verdicts for the transcript it is
   // about to watch. Teardown already resets for a clean generation change, but
   // a resume→fresh fallback can start a watcher without one. The
@@ -10041,6 +10059,7 @@ function stopBridgeWatcher(): void {
   bridgeCliCwd = undefined;
   bridgeObservedCliSessionId = undefined;
   bridgeKnownSessionIds.clear();
+  bridgeCliProvenSessionIds.clear();
   bridgeStalePidStateSessionId = undefined;
   bridgeSecondaryPaths.clear();
   orcaClaudeWebHistorySignature = undefined;
@@ -17923,6 +17942,7 @@ function markPromptReady(): void {
   isPromptReady = true;
   promptReadyEdges++;
   judgeClaudeBridgeTurn();
+  bridgeQueue.cliQueueDrained();
   settleSessionRenameOnPrompt();
   const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
   if (readyTransition(syncedFromDisk).advanceQueuedTurn) {

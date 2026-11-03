@@ -94,6 +94,14 @@ import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-
 import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
+import { handleWorkflowSidebar } from './dashboard/workflow-sidebar-api.js';
+import { publishDashboardH5Presence } from './core/dashboard-h5-presence.js';
+import {
+  WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+  WorkflowSidebarMembershipCache,
+  type WorkflowSidebarMembershipRequest,
+  type WorkflowViewerMembership,
+} from './core/workflow-sidebar-membership.js';
 import {
   defaultRunsDir as v3RunsDir,
   liveV3TerminalPortForSession,
@@ -135,6 +143,7 @@ import {
   createDashboardH5AuthController,
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
+  dashboardH5LoginUsable,
 } from './dashboard/h5-auth.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import { listLatestDiagnosticFiles } from './core/plugins/mcp/diagnostics-files.js';
@@ -262,6 +271,7 @@ import { withFileLock, FileLockTimeoutError } from './utils/file-lock.js';
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
 import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive, installDshProfileDeps } from './dashboard/managed-spawn.js';
+import { LocalDevForceUpdates } from './utils/local-dev-force-update.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -485,6 +495,31 @@ const dashboardH5Auth = createDashboardH5AuthController({
   audit: dashboardControlAudit,
 });
 const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
+const workflowSidebarMembership = new WorkflowSidebarMembershipCache();
+const WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS = 10_000;
+
+/** Ask the run's main bot daemon (its own app) whether the viewer is in the
+ *  run's chat. Offline daemon / any error → unavailable (the sidebar denies). */
+async function askWorkflowSidebarMembership(
+  mainLarkAppId: string,
+  request: WorkflowSidebarMembershipRequest,
+): Promise<WorkflowViewerMembership> {
+  try {
+    const response = await proxyToDaemon(mainLarkAppId, WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: request.chatId, ...request.principal }),
+      // The daemon makes up to one contact call plus the chat's member pages.
+      signal: AbortSignal.timeout(WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS),
+    });
+    if (!response.ok) return 'unavailable';
+    const body = await response.json().catch(() => null) as { ok?: unknown; member?: unknown } | null;
+    if (body?.ok !== true || typeof body.member !== 'boolean') return 'unavailable';
+    return body.member ? 'member' : 'not_member';
+  } catch {
+    return 'unavailable';
+  }
+}
 try {
   pluginResultArtifacts.sweepExpired();
 } catch (error) {
@@ -2217,7 +2252,9 @@ function currentInstalledVersion(): string {
  * the caller signals independently of `changed`. Rejects with a stable `code`
  * on the recoverable, UI-actionable failures.
  */
-async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string }> {
+const localDevForceUpdates = new LocalDevForceUpdates();
+
+async function runLocalDevUpdate(forceToken?: string): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string; backupRef?: string }> {
   const dir = resolveLocalDevCheckoutDir();
   if (!isGitWorktree(dir)) {
     throw Object.assign(new Error(`${dir} is not a git worktree`), { code: 'not_a_worktree', dir });
@@ -2228,19 +2265,29 @@ async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; old
   } catch (e) {
     throw Object.assign(new Error(e instanceof Error ? e.message : String(e)), { code: 'git_status_failed', dir });
   }
-  if (status) {
+  if (status && !forceToken) {
     throw Object.assign(new Error('working tree has uncommitted changes'), {
       code: 'dirty_worktree', dir, status,
     });
   }
   const before = gitHeadSha(dir);
   const oldVersion = resolveCurrentVersionAt(dir);
-  for (const { command, args } of localDevUpdateSteps()) {
-    await runLocalDevStep(dir, command, args);
+  let backupRef: string | undefined;
+  try {
+    if (forceToken) {
+      ({ backupRef } = await localDevForceUpdates.apply(dir, forceToken));
+      await runLocalDevStep(dir, 'bun', ['install', '--frozen-lockfile']);
+      await runLocalDevStep(dir, 'bun', ['run', 'build']);
+    } else {
+      for (const { command, args } of localDevUpdateSteps()) await runLocalDevStep(dir, command, args);
+    }
+  } catch (e) {
+    if (backupRef && e instanceof Error) Object.assign(e, { backupRef });
+    throw e;
   }
   const after = gitHeadSha(dir);
   const newVersion = resolveCurrentVersionAt(dir);
-  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after };
+  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after, backupRef };
 }
 
 /**
@@ -4141,6 +4188,23 @@ const server = createServer(async (req, res) => {
       },
     })) return;
 
+    // Workflow sidebar (design 2026-11-03 §11): the `/workflow/<app>/<run>`
+    // entry and its read-only data route own their D6 gate — admins see the
+    // full run, current chat members a server-trimmed view, everyone else 403.
+    // Mounted before the ordinary gate because the H5 session it accepts for
+    // non-allowlisted members is invisible to every other route.
+    if (await handleWorkflowSidebar(req, res, url, {
+      runsDir: v3RunsDir(),
+      identity: () => dashboardRequestIdentity(req),
+      h5: () => dashboardH5Auth.resolve(req),
+      h5Config: dashboardH5AuthConfig,
+      platformLoginUrl: returnTo => buildPlatformDashboardLoginUrl(returnTo),
+      membership: workflowSidebarMembership,
+      askMembership: askWorkflowSidebarMembership,
+      brand: appId => normalizeBrand(configuredBrands().get(appId)),
+      botName: v3RunBotNameResolver(),
+    })) return;
+
     // Session Web preview is an authenticated, same-origin reverse proxy to an
     // agent-registered literal loopback target. It owns its auth gate because
     // WebSocket upgrades do not pass through decideDashboardAuth; using one
@@ -5065,11 +5129,40 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/update/local-dev/preview') {
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (!isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'not_a_worktree' });
+      if (updateInFlight || hasActiveRestartLease()) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      updateInFlight = true;
+      try {
+        const preview = await withFileLock(globalInstallUpdateLockTarget(), async () => {
+          if (hasActiveRestartLease()) throw Object.assign(new Error('restart_in_flight'), { code: 'restart_in_flight' });
+          return localDevForceUpdates.preview(resolveLocalDevCheckoutDir());
+        }, { maxWaitMs: 2_000 });
+        return jsonRes(res, 200, { ok: true, ...preview });
+      } catch (e) {
+        const error = e instanceof FileLockTimeoutError ? 'update_in_flight' : (e as { code?: string }).code ?? 'install_failed';
+        return jsonRes(res, 409, { ok: false, error, detail: e instanceof Error ? e.message : String(e) });
+      } finally { updateInFlight = false; }
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       // owner-only：这条会 git pull + 重建，等于改机器上实际运行的代码。协管者的
       // `dashboard:manage` 只覆盖「运营配置」（settings/schedules/groups/autostart），
       // 不含「改代码并重启」——那属于 debug shell 同一档的整机控制权。
       if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      let forceToken: string | undefined;
+      if (req.headers['content-type']?.includes('application/json')) {
+        try {
+          const body = await readJsonBody(req, 4096) as { forceLocal?: unknown; previewToken?: unknown } | null;
+          if (body?.forceLocal !== undefined) {
+            if (body.forceLocal !== true || typeof body.previewToken !== 'string' || !body.previewToken || !isLocalDevInstall()) {
+              return jsonRes(res, 400, { ok: false, error: 'invalid_force_update' });
+            }
+            forceToken = body.previewToken;
+          }
+        } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      }
       // 本地 checkout：走 git pull --ff-only + bun run build（与 CLI cmdUpgradeLocalDev
       // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
       // /api/update/restart 的 lease/intent 路径。
@@ -5080,16 +5173,22 @@ const server = createServer(async (req, res) => {
         updateInFlight = true;
         let acquired = false;
         let blockedByRestart = false;
-        let result: { dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string } | undefined;
+        let result: Awaited<ReturnType<typeof runLocalDevUpdate>> | undefined;
         try {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
-            result = await runLocalDevUpdate();
+            pendingLocalDevRestart = undefined;
+            result = await runLocalDevUpdate(forceToken);
           }, { maxWaitMs: 2_000 });
         } catch (e) {
           if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
           const code = (e as { code?: string }).code;
+          const backupRef = (e as { backupRef?: string }).backupRef;
+          const backupStash = (e as { backupStash?: string }).backupStash;
+          if (typeof code === 'string' && code.startsWith('local_update_')) {
+            return jsonRes(res, 409, { ok: false, error: code, backupRef });
+          }
           if (code === 'dirty_worktree') {
             return jsonRes(res, 409, {
               ok: false, error: 'dirty_worktree',
@@ -5100,7 +5199,7 @@ const server = createServer(async (req, res) => {
           if (code === 'not_a_worktree') {
             return jsonRes(res, 400, { ok: false, error: 'not_a_worktree', dir: (e as { dir?: string }).dir ?? '' });
           }
-          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e), backupRef, backupStash });
         } finally {
           updateInFlight = false;
         }
@@ -5122,6 +5221,7 @@ const server = createServer(async (req, res) => {
           // have been pulled already and only needed a build).
           restartRequired: true,
           localDev: true,
+          backupRef: result?.backupRef,
         });
       }
       // 编译版独立二进制（install.sh 形态）：没有包管理器拥有这个文件，改为下载
@@ -8144,6 +8244,11 @@ listenWithProbe({
   boundDashboardPort = port;
   try { atomicWriteFileSync(PORT_PATH, String(port)); } catch (e) {
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
+  }
+  // Card builders (daemons / CLIs never see the H5 config) read this to pick
+  // the「工作流 ›」link: the Feishu sidebar only when H5 login can work there.
+  try { publishDashboardH5Presence(dashboardH5LoginUsable(dashboardH5AuthConfig)); } catch (e) {
+    logger.warn(`[dashboard] Failed to record H5 login availability: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
   // Reclaim any `.trash-*` skill trees left by an interrupted background unlink

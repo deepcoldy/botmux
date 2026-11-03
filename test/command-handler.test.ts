@@ -32,9 +32,20 @@ const BOTS_INFO = [
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
+  const { dirname, resolve, sep } = await import('node:path');
   return {
     ...actual,
-    existsSync: vi.fn(() => true),
+    existsSync: vi.fn((path) => {
+      // /botconfig uses real temporary bots.json fixtures. Keep existence checks
+      // in that directory real too: claiming every optional sidecar exists makes
+      // the real persistence path try to lstat/read files the fixture never made.
+      const botsFile = process.env.BOTS_CONFIG;
+      if (botsFile && typeof path === 'string'
+          && resolve(path).startsWith(dirname(resolve(botsFile)) + sep)) {
+        return actual.existsSync(path);
+      }
+      return true;
+    }),
     statSync: vi.fn(() => ({ isDirectory: () => true })),
     mkdirSync: vi.fn(),
     readFileSync: vi.fn((p: any, ...rest: any[]) => {

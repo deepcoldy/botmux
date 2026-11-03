@@ -66,6 +66,7 @@ function mockApi(options: {
   global?: unknown;
   otherGlobal?: () => Promise<Response>;
   customEnabled?: boolean;
+  chats?: Array<[string, string]>;
   put?: (request: Request) => Response | undefined;
 } = {}) {
   const requests: Request[] = [];
@@ -90,7 +91,9 @@ function mockApi(options: {
       if (chatId) groupState.set(chatId, { mode: request.body.mode, listener: request.body.listener ?? null });
       return response({ ok: true });
     }
-    if (url === '/api/groups') return response({ chats: [chat(INHERIT, 'Inherit group'), chat(CUSTOM, 'Custom group')] });
+    const chatList: Array<[string, string]> = options.chats
+      ?? [[INHERIT, 'Inherit group'], [CUSTOM, 'Custom group']];
+    if (url === '/api/groups') return response({ chats: chatList.map(([chatId, name]) => chat(chatId, name)) });
     if (url === `/api/global-message-listener/${BOT}`) return response({ listener: options.global ?? savedGlobal() });
     if (url === `/api/global-message-listener/${OTHER_BOT}`) return options.otherGlobal?.() ?? response({ listener: savedGlobal({ name: 'other rule' }) });
     if (url === `/api/group-message-listeners/${BOT}`) return response({ groups: [...groupState].map(([chatId, state]) => ({ chatId, ...state })) });
@@ -388,6 +391,49 @@ describe('effective state and confirmations', () => {
     await act(async () => { renderer.unmount(); });
   });
 
+});
+
+describe('group list ordering', () => {
+  beforeEach(() => { confirmMock.mockReset(); confirmMock.mockResolvedValue(true); });
+  afterEach(() => vi.restoreAllMocks());
+
+  const itemNames = (root: Instance) =>
+    byClass(root, 'message-listener-group-item').map(node => node.findByType('strong').children.join(''));
+
+  it('shows custom-rule groups first and keeps /api/groups order within each tier', async () => {
+    mockApi({
+      chats: [
+        [INHERIT, 'Inherit group'],
+        ['oc_plain_a', 'Plain A'],
+        [CUSTOM, 'Custom group'],
+        ['oc_plain_b', 'Plain B'],
+      ],
+    });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    // Source order is inherit, inherit, custom, inherit: the custom block moves
+    // to the top, while the three non-custom groups keep their relative order
+    // (the page relies on Array.prototype.sort stability).
+    expect(itemNames(root)).toEqual(['Custom group', 'Inherit group', 'Plain A', 'Plain B']);
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('keeps a paused custom rule in the top tier, and stays partitioned while searching', async () => {
+    mockApi({ customEnabled: false });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    // mode stays 'custom' with enabled=false: still a custom configuration, so
+    // it remains first even though the group currently does not listen.
+    expect(itemNames(root)).toEqual(['Custom group', 'Inherit group']);
+    expect(text(byClass(groupItem(root, 'Custom group'), 'message-listener-effective')[0]!)).toBe('未监听');
+
+    const search = byClass(root, 'message-listener-group-search')[0]!;
+    await act(async () => { search.props.onChange({ currentTarget: { value: 'inherit' } }); });
+    expect(itemNames(root)).toEqual(['Inherit group']);
+    await act(async () => { search.props.onChange({ currentTarget: { value: '' } }); });
+    expect(itemNames(root)).toEqual(['Custom group', 'Inherit group']);
+    await act(async () => { renderer.unmount(); });
+  });
 });
 
 describe('localization', () => {

@@ -1234,6 +1234,7 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
   'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark conversation via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
   'ai.followup.reminder_no_resend': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
+  'ai.followup.feishu_safe_emphasis': 'Prefer plain text for short progress updates. If emphasis is needed, wrap only a short phrase without CJK punctuation; keep punctuation and following prose outside `**`.',
   // No-transport follow-up (apiOnly bot / HTTP virtual session): a program-driven
   // request/response turn with no Lark conversation, no sibling bots, and no
   // `botmux send`. The nothing-to-send sentinel appears exactly once, in this

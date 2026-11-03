@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -513,6 +513,25 @@ describe('sandbox tree cleanup', () => {
 // blocker: only plain outbox basenames + allowlisted flags pass; raw argv /
 // path flags / sandbox-chosen session-id are rejected.
 describe('validateRelayRequest', () => {
+  it('rebuilds relayed images and files with their original media flags', () => {
+    expect(buildRelayHostArgs({
+      command: 'send',
+      flags: ['--no-mention'],
+      contentPath: '/stage/content',
+      imagePaths: ['/stage/preview.png'],
+      attachmentPaths: ['/stage/report.pdf'],
+      videoPaths: [],
+      videoCoverPaths: [],
+      sessionId: 'session-1',
+    })).toEqual([
+      '--no-mention',
+      '--content-file', '/stage/content',
+      '--images', '/stage/preview.png',
+      '--files', '/stage/report.pdf',
+      '--session-id', 'session-1',
+    ]);
+  });
+
   it('forces host-relayed cards to use probe-free lexical link repair', () => {
     expect(buildRelayHostEnv({
       BOTMUX_SEND_RELAY: '/sandbox/outbox',
@@ -536,7 +555,8 @@ describe('validateRelayRequest', () => {
       contentFile: 'c.content',
       preparedContentFile: 'c.card-content',
       completionProposalFile: 'c.completion-proposal.json',
-      attachments: ['a.png'],
+      images: ['preview.png'],
+      attachments: ['report.pdf'],
       videos: ['replay.mp4'],
       videoCovers: ['cover.png'],
       flags: ['--mention-back', '--mention', 'ou:X', '--voice'],
@@ -546,7 +566,8 @@ describe('validateRelayRequest', () => {
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.preparedContentName).toBe('c.card-content');
     expect(r.value.completionProposalName).toBe('c.completion-proposal.json');
-    expect(r.value.attachmentNames).toEqual(['a.png']);
+    expect(r.value.imageNames).toEqual(['preview.png']);
+    expect(r.value.attachmentNames).toEqual(['report.pdf']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
@@ -739,6 +760,7 @@ describe('validateRelayRequest', () => {
   it('rejects non-basename content / attachment names (../ traversal)', () => {
     expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', preparedContentFile: '../prepared' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', images: ['../preview.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', completionProposalFile: '../proposal.json' }).ok).toBe(false);
@@ -746,6 +768,17 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
     expect(validateRelayRequest({ /* missing contentFile */ flags: [] }).ok).toBe(false);
+  });
+
+  it('rejects cards and every media field on a dispatch relay (send-only payloads)', () => {
+    const dispatchBase = { command: 'dispatch' as const, contentFile: 'c.brief', flags: [] };
+    expect(validateRelayRequest({ ...dispatchBase, images: ['preview.png'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, attachments: ['report.pdf'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, videos: ['replay.mp4'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, videoCovers: ['cover.png'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, preparedContentFile: 'c.card-content' }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, cardFile: 'c.card.json' }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, completionProposalFile: 'c.proposal.json' }).ok).toBe(false);
   });
 });
 

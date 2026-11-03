@@ -171,6 +171,25 @@ async function managed(
   return () => calls;
 }
 
+/** Host-terminal shape: no session, a real loopback daemon IPC port and the
+ *  host secret on disk. The route itself is covered by
+ *  schedule-delegation-route.test.ts; what this pins is the CLI half — whether
+ *  `--run-as` actually reaches the request body in each flag form. */
+async function hostDaemon(f: ReturnType<typeof fixture>, observed: Array<Record<string, unknown>>) {
+  mkdirSync(join(f.root, '.botmux'), { recursive: true, mode: 0o700 });
+  writeFileSync(join(f.root, '.botmux', '.dashboard-secret'), 'host-secret', { mode: 0o600 });
+  const server = createServer(async (req, res) => {
+    const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+    if (!request) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad_json' })); }
+    observed.push(request);
+    res.statusCode = 201;
+    res.end(JSON.stringify({ ok: true, task: { ...(request.task as Record<string, unknown>), nextRunAt: null } }));
+  });
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  f.env.BOTMUX_DAEMON_IPC_PORT = String((server.address() as { port: number }).port);
+}
+
 describe('schedule CLI prompt updates', () => {
   it.each([
     ['add', 'schedule_working_dir_forbidden', '当前工作目录'],
@@ -186,6 +205,43 @@ describe('schedule CLI prompt updates', () => {
     expect(result.code, result.output).not.toBe(0);
     expect(result.output).toContain(text);
     expect(result.output).not.toContain(code);
+  });
+
+  it.each([
+    ['spaced', ['--run-as', 'ou_victim']],
+    ['equals', ['--run-as=ou_victim']],
+  ])('refuses %s --run-as inside a session before reaching the delegated add route', async (_label, flag) => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', observed);
+    const result = await f.run(['add', '0 12 * * *', 'new task', ...flag, '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('只能在宿主终端');
+    expect(f.read()['11223344']).toBeUndefined();
+    // Session detection may hit the attestation endpoint, but the task body
+    // must never reach SCHEDULE_DELEGATED_ADD_ROUTE.
+    expect(observed.some(request => 'task' in request)).toBe(false);
+  });
+
+  it.each([
+    ['spaced', ['--run-as', 'ou_runner'], 'ou_runner'],
+    ['equals', ['--run-as=ou_runner'], 'ou_runner'],
+  ])('sends the host-terminal %s --run-as to the delegated add route', async (_label, flag, expected) => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await hostDaemon(f, observed);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--chat-id', 'oc_chat', ...flag, '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(observed).toHaveLength(1);
+    expect((observed[0].task as Record<string, unknown>).runAs).toBe(expected);
+  });
+
+  it('omits runAs entirely when the host terminal names nobody', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await hostDaemon(f, observed);
+    expect((await f.run(['add', '0 12 * * *', 'new task', '--chat-id', 'oc_chat', '--id', '11223344'])).code).toBe(0);
+    expect(observed[0].task as Record<string, unknown>).not.toHaveProperty('runAs');
   });
 
   it.each(['--topic', '--follow-active'])('binds %s to the current topic in a reused chat session', async flag => {

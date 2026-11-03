@@ -4137,6 +4137,9 @@ interface SessionData {
   cliLaunchSnapshot?: import('./types.js').Session['cliLaunchSnapshot'];
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
+  /** Workflow node marker (Session.workflowNode): this session executes a
+   *  handed-off node of a bot-executed run. Only the run / main bot are read. */
+  workflowNode?: Pick<import('./types.js').WorkflowNodeSessionMarker, 'runId' | 'orchestratorAppId'>;
   /** Frozen file-sandbox decision from the persisted session (tri-state). */
   sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   dispatchLaunchSpec?: import('./types.js').Session['dispatchLaunchSpec'];
@@ -8564,7 +8567,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     const rawSchedule = trustedRemoteRunnerRelay ? structuredSchedule : positionalSchedule;
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL] [--until-done [--deadline TIME] [--retry-every DURATION]] [--notify failing,expired]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--run-as OPEN_ID|EMAIL] [--silent] [--model ID] [--reasoning-effort LEVEL] [--until-done [--deadline TIME] [--retry-every DURATION]] [--notify failing,expired]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -8579,6 +8582,17 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     if (!trustedRemoteRunnerRelay) {
       try { cur = await detectAuthenticatedCurrentSession() ?? cur; }
       catch (error) { creatorAuthError = error; }
+    }
+    // Match both `--run-as x` and `--run-as=x`: the includes() idiom used for
+    // other flags only catches the spaced form, and an agent in a session using
+    // the equals form would have the flag silently ignored by the daemon's
+    // session branch instead of getting this refusal.
+    const runAsFlagPresent = rest.some(a => a === '--run-as' || a.startsWith('--run-as='));
+    if (runAsFlagPresent && (cur || !argValue(rest, '--run-as'))) {
+      console.error(cur
+        ? '--run-as 只能在宿主终端使用；会话内创建的任务以当前发起人身份运行。'
+        : '--run-as 需要本 bot 应用下的 open_id（ou_ 开头）或飞书邮箱。');
+      process.exit(1);
     }
     const explicitTaskId = argValue(rest, '--id');
     if (rest.includes('--id') && !explicitTaskId) {
@@ -8784,6 +8798,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       }
       if (!cur && larkAppId) {
         const hostTaskId = explicitTaskId ?? randomBytes(4).toString('hex');
+        const runAs = argValue(rest, '--run-as');
         const response = await postCurrentSessionDaemonRoute({
           path: SCHEDULE_DELEGATED_ADD_ROUTE,
           sessionId: '',
@@ -8798,6 +8813,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             calendarDayType: normalizedDayType,
             ...(wantsFollowActive ? { followActive: true } : {}),
             ...(topicTitle ? { topicTitle } : {}),
+            ...(runAs ? { runAs } : {}),
             ...untilDoneFields,
           } },
         });
@@ -9577,11 +9593,14 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { materializeFeedbackPolicyForDelivery } from './services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
+import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from './im/lark/workflow-sidebar-entry.js';
+import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
 import { applyInlineMentions, applyInlineMentionsToCard } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import {
   effectiveDefaultWorkingDir,
   getBot,
+  getBotBrand,
   loadBotConfigs,
   resolveBrandLabel,
   resolveReplyStyleConfig,
@@ -9805,8 +9824,12 @@ async function relaySend(
     const base = `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`;
     try { writeFileSync(join(relayDir, base), readFileSync(p)); out.push(base); } catch { /* skip unreadable */ }
   };
+  const images: string[] = [];
+  for (const p of argValues(rest, '--image', '--images')) {
+    copyOutboxAttachment(p, images);
+  }
   const attachments: string[] = [];
-  for (const p of argValues(rest, '--image', '--images', '--file', '--files')) {
+  for (const p of argValues(rest, '--file', '--files')) {
     copyOutboxAttachment(p, attachments);
   }
   const videos: string[] = [];
@@ -9848,6 +9871,7 @@ async function relaySend(
     preparedContentFile: preparedContentBase,
     cardFile: cardBase,
     completionProposalFile: completionProposalBase,
+    images,
     attachments,
     videos,
     videoCovers,
@@ -11797,7 +11821,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   for (const path of [...images, ...files, ...videos, ...videoCovers]) {
     if (!existsSync(path)) { console.error(`文件不存在: ${path}`); process.exit(1); }
   }
-  for (const path of [...videos, ...videoCovers]) {
+  // images join videos/covers in requiring a regular file: a durable final
+  // hashes the bytes AND the upload reads them again, so a FIFO/process
+  // substitution (whose writer closes after one read) hangs forever on the
+  // second open. files stay out on purpose — they are read exactly once by
+  // uploadFile, and a one-shot FIFO worked before this change.
+  for (const path of [...images, ...videos, ...videoCovers]) {
     if (!statSync(path).isFile()) { console.error(`不是普通文件: ${path}`); process.exit(1); }
   }
   // Validate the exact presentation text before any TTS, upload, contact
@@ -11904,6 +11933,15 @@ async function cmdSend(rest: string[]): Promise<void> {
         dispatchAttempt: originDispatchAttempt,
       }
     : undefined;
+  // Relay staging paths and mtimes are attempt-local. Durable final replay must
+  // identify images by bytes so the same sandbox request can recover after a
+  // lost relay response without being rejected as a different attachment.
+  const durableImageIdentities = currentTurnId && effectiveResponseKind === 'final'
+    ? await Promise.all(images.map(async image => {
+        const inspection = await inspectFileOnlyAttachment(image, [], true);
+        return { sha256: inspection.sha256! };
+      }))
+    : images.map(sendAttachmentIdentity);
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -11963,7 +12001,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       urgent: urgent.requested ? urgent.mode : undefined,
     },
     attachments: {
-      images: images.map(sendAttachmentIdentity),
+      images: durableImageIdentities,
       files: fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
         ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
         : files.map(sendAttachmentIdentity),
@@ -12562,6 +12600,22 @@ async function cmdSend(rest: string[]): Promise<void> {
     const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
     if (attached !== card) oncallGroupCard = JSON.parse(attached);
     return attached;
+  };
+  // §11 / §5.5: a workflow node session's reply cards in its own topic carry
+  // the run's「工作流 ›」entry at the signature row's right end (after the
+  // on-call button). Top-level / cross-chat / --into publishes are not in the
+  // node's landing, so they stay as they are.
+  const withWorkflowEntry = (card: string): string => {
+    if (asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
+    return attachWorkflowSidebarEntry(card, workflowNodeSessionEntry(
+      s.workflowNode,
+      (mainLarkAppId, runId) => resolveWorkflowEntryLink({
+        mainLarkAppId,
+        runId,
+        brand: getBotBrand(s.larkAppId),
+        locale: localeForBot(s.larkAppId),
+      }),
+    ));
   };
   // `reviewers`/`everyone` audiences gate clicks without a human requester —
   // this is the bot-triggered auto-analysis case (issue #1178) where the exact
@@ -13551,8 +13605,10 @@ async function cmdSend(rest: string[]): Promise<void> {
       });
       reportCardRenderDiagnostics(renderDiagnostics);
       if (!budget.fits) console.error(`botmux send: 卡片请求体约 ${budget.bytes} 字节，超过飞书 30KB 上限，可能被拒收`);
-      const replyCardJson = withOncallGroup(JSON.stringify(canonicalCard));
+      const withOncall = withOncallGroup(JSON.stringify(canonicalCard));
+      const replyCardJson = withWorkflowEntry(withOncall);
       if (feedbackBaseCard && oncallGroupCard) feedbackBaseCard = oncallGroupCard;
+      if (feedbackBaseCard && replyCardJson !== withOncall) feedbackBaseCard = JSON.parse(replyCardJson);
       const replyStore = new TurnReplyCardStore(resolveDataDir());
       const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
       const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
@@ -19636,6 +19692,11 @@ if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
 }
 
 switch (command) {
+  case 'managed-directories': {
+    const { managedDirectoriesCommand } = await import('./cli/managed-directories.js');
+    await managedDirectoriesCommand(process.argv.slice(3));
+    break;
+  }
   case '--version':
   case '-v':      console.log(getVersion()); break;
   case '__pty-smoke': {

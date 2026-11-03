@@ -1,5 +1,5 @@
 /** Isolated Codex title home: provider wiring only, fail closed on anything odd. */
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -71,6 +71,10 @@ describe('provisionIsolatedTitleConfig', () => {
     expect(written).toContain('inline-secret');
     // Keep the exported list and the behaviour in lock-step.
     expect([...TITLE_CONFIG_INHERITED_KEYS]).toEqual(['model', 'model_provider', 'model_providers']);
+    // The inherited table may carry inline http_headers credentials, so it gets
+    // the same owner-only mode as the copied auth.json (defence in depth on top
+    // of the 0700 scratch home).
+    expect(statSync(join(target, 'config.toml')).mode & 0o777).toBe(0o600);
   });
 
   it('writes nothing when the source home has no config.toml', () => {

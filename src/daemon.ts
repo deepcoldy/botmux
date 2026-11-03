@@ -747,7 +747,8 @@ import {
   resolveV3SavedWorkflowMessageTargets,
   type V3SavedWorkflowExecutionEffect,
 } from './im/lark/v3-saved-workflow-handler.js';
-import { liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
+import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
+import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
 import { v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
 import { createWorkflowNodeDaemon } from './core/workflow-node-daemon.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
@@ -773,10 +774,14 @@ import {
   requestV3LoopGrant,
 } from './workflows/v3/daemon-run.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
-import { buildV3BlockedCard } from './im/lark/v3-blocked-card.js';
 import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
 import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
-import { buildV3ProgressCard } from './im/lark/v3-progress-card.js';
+import { buildV3ProgressCard, v3ProgressWorkflowEntry } from './im/lark/v3-progress-card.js';
+import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
+import {
+  workflowSidebarMembershipRoute,
+  WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+} from './core/workflow-sidebar-membership.js';
 import { V3ProgressCardManager } from './im/lark/v3-progress-card-manager.js';
 import { buildV3RunSaveActionValue } from './im/lark/v3-run-save-card.js';
 import { buildV3DistillationProposalCard } from './im/lark/v3-distillation-card.js';
@@ -973,7 +978,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
-import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from './services/codex-async-user-input.js';
+import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
@@ -6665,6 +6670,13 @@ async function executePluginSlashCommand(input: {
   });
 }
 
+/** §11: a bot-executed run's「工作流 ›」sidebar entry, as posted by this
+ *  daemon's bot (cards in one chat share its brand). No Dashboard address →
+ *  no entry; callers pass undefined and the card keeps its old shape. */
+function daemonWorkflowSidebarEntry(mainLarkAppId: string, runId: string) {
+  return resolveWorkflowEntryLink({ mainLarkAppId, runId, brand: getBotBrand(selfDaemonLarkAppId ?? mainLarkAppId) });
+}
+
 // Dependencies passed to card-handler
 // v3 run-level progress is a best-effort IM projection. journal.ndjson remains
 // the only execution truth; the manager persists only Lark delivery state.
@@ -6687,7 +6699,11 @@ const v3ProgressCardManager = new V3ProgressCardManager({
             chat: buildV3RunSaveActionValue(loaded.envelope, 'chat'),
           }
         : undefined;
-    return buildV3ProgressCard(view, saveActions ? { saveActions } : {});
+    const workflowEntry = v3ProgressWorkflowEntry(loaded.envelope, daemonWorkflowSidebarEntry);
+    return buildV3ProgressCard(view, {
+      ...(saveActions ? { saveActions } : {}),
+      ...(workflowEntry ? { workflowEntry } : {}),
+    });
   },
   onError: (runId, err) => {
     logger.warn(`[v3:${runId}] progress card failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -6811,8 +6827,22 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   loadRun: workflowLoadBotRun,
   drive: (runId) => v3GateRunner.driveDetached(runId),
   botName: (appId) => v3BotDisplayNameResolver()(appId),
+  workflowEntry: daemonWorkflowSidebarEntry,
   warn: (message) => logger.warn(message),
 });
+
+/** 「改派」 on bot-executed runs' blocked cards: the same live §6.1 probe the
+ *  approval uses, against the run's chat. */
+const v3BlockedReassignDeps: V3BlockedReassignDeps = {
+  probe: (binding) => createLiveV3BotEligibilityProbe({
+    orchestratorAppId: binding.larkAppId,
+    chatId: binding.chatId,
+    bots: loadBotConfigs(),
+  }),
+  nameOf: (appId) => v3BotDisplayNameResolver()(appId),
+  cliOf: (appId) => loadBotConfigs().find((bot) => bot.larkAppId === appId)?.cliId,
+  executor: workflowNodeDaemon.executor,
+};
 
 // v3 humanGate run-controller: drives daemon-side v3 runs, posts/​re-posts
 // approval cards to the run's bound topic, and re-arms pending gates on startup
@@ -6845,16 +6875,13 @@ const v3GateRunner = createV3GateRunner({
     }
   },
   postBlockedCard: async (binding, info, runId) => {
-    const card = buildV3BlockedCard({
+    // Bot-executed runs get the 「改派」 section (re-probed now); every other
+    // run gets exactly the plain card.
+    const card = await buildV3BlockedCardForRun({
+      runDir: join(v3DefaultBaseDir(), runId),
       runId,
-      nodeId: info.nodeId,
-      attemptId: info.attemptId,
-      errorClass: info.errorClass,
-      errorCode: info.errorCode,
-      message: info.message,
-      retryForbidden: info.retryForbidden,
-      // human-ask 受阻 → 渲染问题 + 选项按钮卡（替代纯重试卡）。
-      ...(info.ask ? { ask: info.ask } : {}),
+      info,
+      reassign: v3BlockedReassignDeps,
     });
     if (binding.rootMessageId) {
       await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
@@ -7496,6 +7523,7 @@ const cardDeps: CardHandlerDeps = {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     canResolve: (binding, operatorOpenId) =>
       binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
+    reassign: v3BlockedReassignDeps,
   },
   v3LoopGrantDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
@@ -8612,8 +8640,28 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (!trustedHost || task.larkAppId !== selfDaemonLarkAppId) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_host_admin_required' });
     }
+    // `--run-as`: the host admin names the person the task runs as. It becomes
+    // the task's creator identity only if that person may operate this bot
+    // now; every fire re-checks the same admission.
+    const { runAs, ownerOpenId: _ownerOpenId, ownerUnionId: _ownerUnionId, ...hostTask } = task;
+    let runAsOwner: { ownerOpenId: string; ownerUnionId: string; creatorLarkAppId: string } | undefined;
+    if (runAs !== undefined) {
+      if (!selfDaemonLarkAppId || typeof runAs !== 'string'
+        || !/^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/.test(runAs)) {
+        return jsonRes(res, 400, { ok: false, error: 'schedule_run_as_invalid' });
+      }
+      const openId = runAs.startsWith('ou_')
+        ? runAs
+        : (await resolveAllowedUsersWithMap(selfDaemonLarkAppId, [runAs])).map.get(runAs);
+      const unionId = openId ? await resolveUnionIdFromOpenId(selfDaemonLarkAppId, openId) : null;
+      if (!openId || !unionId) return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_unresolved' });
+      if (!canOperate(selfDaemonLarkAppId, task.chatId, openId, unionId)) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_not_allowed' });
+      }
+      runAsOwner = { ownerOpenId: openId, ownerUnionId: unionId, creatorLarkAppId: selfDaemonLarkAppId };
+    }
     try {
-      const created = scheduler.addTask({ ...task, ...untilDoneParams });
+      const created = scheduler.addTask({ ...hostTask, ...runAsOwner, ...untilDoneParams });
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     } catch (error) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_host_commit_failed',
@@ -9146,6 +9194,30 @@ ipcRoute('POST', WORKFLOW_HANDOFF_STOP_ROUTE, async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
   }
   const result = workflowNodeDaemon.stopRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Dashboard ← workflow sidebar (design 2026-11-03 §11.3): is this viewer a
+// current member of the run's chat, as this (main) bot's app sees it? Trusted
+// host only — the Dashboard asks on behalf of an H5 / platform identity it has
+// already authenticated; a failed lookup answers 503 and the Dashboard denies.
+ipcRoute('POST', WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, async (req, res) => {
+  const trustedHost = isTrustedHostIpcRequest(req);
+  let raw: unknown;
+  if (trustedHost) {
+    try {
+      raw = await readJsonBody<unknown>(req, 4 * 1024);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    }
+  }
+  const result = await workflowSidebarMembershipRoute(
+    { trustedHost, selfLarkAppId: selfDaemonLarkAppId, body: raw },
+    (appId) => ({
+      resolveOpenIdByUnionId: (unionId) => resolveTargetAppOpenId(appId, unionId),
+      listChatMemberOpenIds: (chatId) => listChatMemberOpenIds(appId, chatId),
+    }),
+  );
   return jsonRes(res, result.status, result.body);
 });
 
@@ -9871,17 +9943,22 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
           byType,
         );
         if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
-        const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, {
+        const steerFacts = {
           answerer: by, originalAnswerer: asyncCaller,
           human: byType === false && trustedCaller?.senderType === 'user'
             && trustedCaller.requestLarkAppId === boundAsk.larkAppId && trustedCaller.requestUserOpenId === by,
-          managedLark: !documentDelivery && asyncOriginTurn?.startsWith('om_') === true
+          // The audience was frozen from the exact origin's reply identity.
+          // An answer can ask another question; its synthetic origin must retain
+          // the same authenticated human route as an ordinary Lark message.
+          managedLark: !documentDelivery && audience?.kind === 'human'
+            && (asyncOriginTurn?.startsWith('om_') === true || asyncOriginTurn?.startsWith('codex-async-answer-') === true)
             && !askSession.adoptedFrom && !askSession.session.adoptedFrom && !askSession.session.vcMeetingReceiver
             && larkTransportEnabled({ chatId: askSession.chatId, apiOnly: bot.config.apiOnly }),
           cleanInputAccepted: codexAppCleanInputAcceptedForSession(askSession),
-        });
-        const steerable = steerTarget !== undefined && input.codexAppInput !== undefined;
-        if (steerable) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
+        };
+        const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, steerFacts);
+        const steerable = codexAsyncAnswerSteerable(steerFacts) && input.codexAppInput !== undefined;
+        if (steerable && steerTarget !== undefined) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
         if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
           trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) })) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
