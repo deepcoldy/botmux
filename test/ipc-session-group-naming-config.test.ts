@@ -40,7 +40,7 @@ describe('session-group naming configuration', () => {
     await request({ mode: 'ai-summary', model: '' });
     expect(botConfig.sessionGroup?.naming).toEqual({ mode: 'ai-summary', maxLen: 8 });
   });
-  it.each([{}, null, [], { mode: ['ai-summary'] }, { mode: 'unknown' }, { mode: 'truncate', model: 123 }, { mode: 'truncate', model: 'a\nb' }])('rejects invalid input without writing: %j', async body => {
+  it.each([{}, null, [[]], { mode: ['ai-summary'] }, { mode: 'unknown' }, { mode: 'truncate', model: 123 }, { mode: 'truncate', model: 'a\nb' }])('rejects invalid input without writing: %j', async body => {
     expect((await request(body)).status).toBe(400);
     expect(configStore.rmwBotEntry).not.toHaveBeenCalled();
   });
