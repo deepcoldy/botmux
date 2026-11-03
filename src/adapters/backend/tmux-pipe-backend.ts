@@ -7,9 +7,10 @@
  *
  * Architecture (no PTY, no attach):
  *   - mkfifo a unique fifo under /tmp
- *   - `${this.tmuxCmd} pipe-pane -O -t <pane> 'dd bs=65536 > <fifo>'` — tmux replicates every
+ *   - `${this.tmuxCmd} pipe-pane -O -t <pane> '<copy> > <fifo>'` — tmux replicates every
  *     byte the pane writes into the fifo (append-only, '-O' overwrites any
- *     existing pipe).
+ *     existing pipe). `<copy>` is `cat`, or a botmux relay where `cat` holds
+ *     short writes (see tmux-pipe-relay.ts).
  *   - fs.createReadStream(<fifo>) — we read tmux's verbatim ANSI stream.
  *   - All writes (sendText / sendSpecialKeys / pasteText / copy-mode keys)
  *     go through `tmux send-keys / paste-buffer -t <pane>` — so the pane's
@@ -49,6 +50,7 @@ import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
+import { pipePaneShellCommand } from './tmux-pipe-relay.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -769,12 +771,9 @@ export class TmuxPipeBackend implements SessionBackend {
     // Retrying is idempotent (-O overwrites any prior subscription); a
     // deterministic server-answered rejection (pane genuinely gone) is
     // re-thrown at once instead of delaying the same failure.
-    // uutils cat buffers short pipe writes (and ignores -u). A quiet runner's
-    // ready/final bytes can then sit here forever while its next input waits
-    // for those very bytes. dd writes each short read immediately; use only
-    // POSIX operands so GNU, BSD/macOS and uutils behave alike. No fullblock
-    // or sync conversion: preserve the exact byte stream without padding.
-    const pipePaneCommand = `pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(`dd bs=65536 > ${shellescape(this.fifoPath)} 2>/dev/null`)}`;
+    // The copier must forward short writes at once, or a quiet CLI's ready /
+    // final bytes never reach the worker and its next input queues forever.
+    const pipePaneCommand = `pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(pipePaneShellCommand(this.fifoPath))}`;
     // Same-boundary decision as the applied remain-on-exit value: it was
     // resolved against the RUNNING server (serverTmuxVersion) in
     // createDetachedSession/applySessionOptions before this attach. Guard
