@@ -55,6 +55,7 @@ import {
   readSessionRowCopiesAcrossStores,
   listActiveSessionIdsAcrossStores,
   listSessionsStrict,
+  readSessionsByRoots,
   SessionStoreSqliteUnavailableError,
   SessionStoreUnmigratedError,
 } from '../src/services/session-store.js';
@@ -598,5 +599,59 @@ describe('listActiveSessionIdsAcrossStores', () => {
 
     expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots }))
       .toThrow(SessionStoreSqliteUnavailableError);
+  });
+});
+
+describe('readSessionsByRoots (dispatch task-tree narrow read)', () => {
+  const PROJECTION = ['sessionId', 'larkAppId', 'rootMessageId', 'status'] as const;
+  const project = (sessions: Array<Record<string, unknown>>) =>
+    Object.fromEntries(sessions
+      .filter(s => typeof s.sessionId === 'string')
+      .map(s => [s.sessionId, Object.fromEntries(PROJECTION.map(k => [k, s[k]]))]));
+
+  it('equals the full snapshot restricted to the roots on tree fields, including app-id backfill for column-less rows', () => {
+    // Two stores: active + closed, rows written WITHOUT larkAppId (as older
+    // versions did), plus rows for roots outside the query set.
+    seedPersistedSessionRows(tempDir, 'appA', {
+      aActive: row('aActive', { rootMessageId: 'om_r1', larkAppId: undefined }),
+      aClosed: row('aClosed', { rootMessageId: 'om_r1', status: 'closed', closedAt: '2026-02-01T00:00:00.000Z', larkAppId: undefined }),
+      aTwo: row('aTwo', { rootMessageId: 'om_r2', larkAppId: undefined }),
+      aOther: row('aOther', { rootMessageId: 'om_other', larkAppId: undefined }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      bClosed: row('bClosed', { rootMessageId: 'om_r3', status: 'closed', closedAt: '2026-02-02T00:00:00.000Z' }),
+      bOther: row('bOther', { rootMessageId: 'om_other' }),
+    });
+    const roots = new Set(['om_r1', 'om_r2', 'om_r3']);
+    const narrow = project(readSessionsByRoots(roots, { dataDir: tempDir }));
+    const snapshotSubset = project(
+      [...loadAllSessionsSnapshot({ dataDir: tempDir }).values()]
+        .filter(s => typeof s.rootMessageId === 'string' && roots.has(s.rootMessageId))
+        .map(s => s as unknown as Record<string, unknown>),
+    );
+    expect(narrow).toEqual(snapshotSubset);
+    expect(narrow).toEqual({
+      aActive: { sessionId: 'aActive', larkAppId: 'appA', rootMessageId: 'om_r1', status: 'active' },
+      aClosed: { sessionId: 'aClosed', larkAppId: 'appA', rootMessageId: 'om_r1', status: 'closed' },
+      aTwo: { sessionId: 'aTwo', larkAppId: 'appA', rootMessageId: 'om_r2', status: 'active' },
+      bClosed: { sessionId: 'bClosed', larkAppId: 'appB', rootMessageId: 'om_r3', status: 'closed' },
+    });
+  });
+
+  it('backfills the owning app id for a column-less row served from its own live in-memory store', () => {
+    // Seed before init so the row enters the in-memory map through
+    // readOwnStoreAllRows (which only JSON.parses, no backfill).
+    seedPersistedSessionRows(tempDir, 'appMem', {
+      memChild: row('memChild', { rootMessageId: 'om_m', larkAppId: undefined }),
+    });
+    init('appMem');
+    const [got] = readSessionsByRoots(new Set(['om_m']), { dataDir: tempDir });
+    expect(got).toMatchObject({ sessionId: 'memChild', larkAppId: 'appMem', rootMessageId: 'om_m', status: 'active' });
+  });
+
+  it('returns nothing for an empty root set or unknown roots', () => {
+    seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { rootMessageId: 'om_r1' }) });
+    expect(readSessionsByRoots(new Set(), { dataDir: tempDir })).toEqual([]);
+    expect(readSessionsByRoots(new Set(['om_nope']), { dataDir: tempDir })).toEqual([]);
   });
 });
