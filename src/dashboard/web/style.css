@@ -35499,3 +35499,13 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .sessions-page .sessions-filter-chips .sessions-filter-clear:hover {
   text-decoration: underline;
 }
+
+/* Dedicated-group naming keeps mode, model and feedback readable at narrow widths. */
+.bd-sg-naming > .bd-field { display: grid; gap: 10px; min-width: 0; width: 100%; }
+.bd-sg-naming .bd-field-menu { width: min(280px, 100%); }
+.bd-sg-naming p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.bd-sg-naming label.bd-field { display: grid; gap: 6px; }
+.bd-sg-naming input[type=text] { max-width: 380px; box-sizing: border-box; }
+.bd-sg-naming small { color: var(--muted); line-height: 1.6; }
+.bd-sg-naming button.primary { justify-self: start; }
+.bd-sg-naming .bd-sg-naming-status:empty { display: none; }

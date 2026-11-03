@@ -156,6 +156,8 @@ export interface ReadCodexAppThreadMetadataOptions {
 export interface GenerateCodexAppThreadTitleOptions {
   sourceText: string;
   codexBin?: string;
+  /** Trusted wrapper prefix arguments, before the app-server subcommand. */
+  codexArgs?: readonly string[];
   env?: NodeJS.ProcessEnv;
   model?: string;
   timeoutMs?: number;
@@ -192,9 +194,10 @@ class CodexAppServerProbe {
     signal?: AbortSignal,
     detached = false,
     registerForceClose?: (forceClose: () => void) => (() => void),
+    prefixArgs: readonly string[] = [],
   ) {
     this.useProcessGroup = detached && process.platform !== 'win32';
-    this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
+    this.child = spawn(codexBin, [...prefixArgs, 'app-server', '--listen', 'stdio://'], {
       cwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -638,6 +641,7 @@ export async function generateCodexAppThreadTitle(
       undefined,
       opts.detached,
       opts.registerForceClose,
+      opts.codexArgs,
     );
     const wait = <T>(promise: Promise<T>, label: string): Promise<T> => (
       client!.withTimeout(withAbort(promise, opts.signal), remaining(), label)

@@ -33,7 +33,7 @@ function fakeCodexEnv(
 }
 
 describe('generateCodexAppThreadTitle', () => {
-  it('generates a structured semantic title in an isolated ephemeral thread', async () => {
+  it('generates an isolated semantic title through a launcher prefix', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-title-generate-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -41,7 +41,8 @@ describe('generateCodexAppThreadTitle', () => {
 
     const title = await generateCodexAppThreadTitle({
       sourceText: '请排查 image_safety 为什么没有返回错误码 12008',
-      codexBin: FAKE_CODEX,
+      codexBin: process.execPath,
+      codexArgs: [FAKE_CODEX],
       env: fakeCodexEnv(dir, {
         FAKE_CODEX_LOG: logPath,
         FAKE_CODEX_ENV_LOG: envLogPath,
