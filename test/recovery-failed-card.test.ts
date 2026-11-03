@@ -76,6 +76,15 @@ describe('recovery failure card', () => {
     });
   });
 
+  it('offers purge-and-continue for an image-poisoned ordinary recovery notice', () => {
+    const { buttons } = render({ retry: { kind: 'purge_images', turnId: 'om_A' } });
+    expect(buttons.some(b => b.value?.action === 'retry_recovery_turn')).toBe(false);
+    expect(buttons.some(b => b.value?.action === 'retry_turn')).toBe(false);
+    expect(buttons.find(b => b.value?.action === 'purge_images_continue')?.value).toMatchObject({
+      action: 'purge_images_continue', turn_id: 'om_A', session_id: 'sess-1', root_id: 'om_root',
+    });
+  });
+
   it('without re-delivery material offers no retry button', () => {
     for (const reason of ['no_input', 'scheduled', 'unsupported'] as const) {
       const { buttons, markdown } = render({ retry: { kind: 'none', reason } });

@@ -464,7 +464,7 @@ import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
 import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
-import { purgeUndersizedImages } from './services/transcript-image-purge.js';
+import { purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { detectCliStartupBlocker, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
@@ -30896,13 +30896,19 @@ process.on('message', async (raw: unknown) => {
         // 结构与 resume 语义不同）。
         let purgeRestartPromise: Promise<void> | undefined;
         if (msg.purgeUndersizedImages) {
-          const purgeJsonl = backend
-            ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend)
-              .claudeJsonlPath
-            : undefined;
+          // bridgeJsonlPath is the authoritative active transcript: it follows
+          // in-pane /clear rotations and points through the scratch merged view.
+          // backend.claudeJsonlPath is only the launch-time host-side guess.
+          const purgeTarget = resolvePurgeResumeTarget(
+            bridgeJsonlPath,
+            backend
+              ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend)
+                .claudeJsonlPath
+              : undefined,
+          );
           const purgeSupported = lastInitConfig?.cliId === 'claude-code'
-            && !!purgeJsonl && !cliRestartInProgress;
-          if (!purgeSupported || !purgeJsonl) {
+            && !!purgeTarget && !cliRestartInProgress;
+          if (!purgeSupported || !purgeTarget) {
             send({
               type: 'user_notify',
               message: t('worker.purge_images_unsupported'),
@@ -30913,7 +30919,7 @@ process.on('message', async (raw: unknown) => {
           }
           let purgedFiles: { file: string; removed: number }[];
           try {
-            purgedFiles = purgeUndersizedImages(purgeJsonl);
+            purgedFiles = purgeUndersizedImages(purgeTarget.jsonlPath);
           } catch (err) {
             send({
               type: 'user_notify',
@@ -30939,8 +30945,14 @@ process.on('message', async (raw: unknown) => {
             'purge undersized transcript images',
             // 用户显式发起的上下文恢复（同 cwd-move respawn）：不计入崩溃重启
             // 预算，否则「近期手动重启过 + 本次恢复」会被 tier-2 强制 FRESH，
-            // 反而丢掉刚救回来的会话上下文。
-            { immediate: true, preservePending: true, skipRestartBudget: true },
+            // 反而丢掉刚救回来的会话上下文。显式钉住当前 bridge transcript，
+            // 避免进程内 /clear 后 cfg 仍指向旧 A、清理 B 却恢复 A。
+            {
+              immediate: true,
+              preservePending: true,
+              skipRestartBudget: true,
+              exactResumeSessionId: purgeTarget.sessionId,
+            },
           );
           send({
             type: 'user_notify',

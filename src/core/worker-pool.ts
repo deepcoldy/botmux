@@ -2486,6 +2486,13 @@ export function buildOrdinaryRecoveryNoticeCard(
     failedAt: new Date(record.createdAt),
     retry: retried
       ? { kind: 'retried', byOpenId: retried.byOpenId, at: new Date(retried.at) }
+      : ds.session.lastFailedTurn?.turnId === record.logicalTurnId
+        && cliId === 'claude-code'
+        && (record.causeErrorCode === 'provider_image_too_small'
+          || record.errorCode === 'provider_image_too_small')
+        // A generic re-delivery repeats the poisoned history forever. The purge
+        // action must outrank record.retry for this specific terminal.
+        ? { kind: 'purge_images', turnId: record.logicalTurnId }
       : record.retry
         ? { kind: 'available' }
         : ds.session.lastFailedTurn?.turnId === record.logicalTurnId

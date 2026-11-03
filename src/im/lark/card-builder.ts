@@ -2201,6 +2201,9 @@ export interface RecoveryFailedCardOpts {
      *  very turn: keep the pre-existing admin「继续这一轮」button (retry_turn,
      *  continue mode) that recovery cards used to carry. */
     | { kind: 'continue_legacy'; turnId: string }
+    /** A poisoned-history image failure can be repaired in place even when the
+     *  ordinary recovery notice has no re-delivery envelope. */
+    | { kind: 'purge_images'; turnId: string }
     | { kind: 'none'; reason: 'no_input' | 'scheduled' | 'unsupported' };
   terminalUrl?: string;
   locale?: Locale;
@@ -2245,6 +2248,8 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
     ? t('card.recovery_failed.retry_hint', undefined, locale)
     : o.retry.kind === 'continue_legacy'
       ? t('card.turn_failed.retry_caveated', undefined, locale)
+    : o.retry.kind === 'purge_images'
+      ? t('card.turn_failed.image_too_small', undefined, locale)
     : o.retry.kind === 'retried'
       ? t('card.recovery_failed.retried', {
         who: `<at id=${o.retry.byOpenId}></at>`,
@@ -2279,6 +2284,20 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
         action: 'retry_turn',
         turn_id: o.retry.turnId,
         mode: 'continue',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.retry.kind === 'purge_images') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retry.turnId,
         root_id: o.rootId,
         session_id: o.sessionId,
         cli_id: o.cliId ?? 'claude-code',

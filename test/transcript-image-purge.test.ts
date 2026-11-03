@@ -3,13 +3,24 @@
  * undersized image blocks from a Claude Code session transcript so the
  * session can come back via `claude --resume` instead of `/clear`.
  */
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  atomicReplaceTranscript,
   measureImage,
   purgeUndersizedImages,
+  resolvePurgeResumeTarget,
   MIN_IMAGE_DIMENSION,
 } from '../src/services/transcript-image-purge.js';
 
@@ -90,6 +101,52 @@ describe('measureImage', () => {
   });
 });
 
+describe('resolvePurgeResumeTarget', () => {
+  it('prefers the active bridge transcript and resumes its rotated session id', () => {
+    const active = `/scratch/.claude/projects/x/${SID}.jsonl`;
+    expect(resolvePurgeResumeTarget(active, '/host/old-session.jsonl')).toEqual({
+      jsonlPath: active,
+      sessionId: SID,
+    });
+  });
+
+  it('fails closed for a path without a UUID session id', () => {
+    expect(resolvePurgeResumeTarget('/tmp/scratch.jsonl', undefined)).toBeUndefined();
+  });
+});
+
+describe('atomicReplaceTranscript', () => {
+  it('keeps the live transcript present when replacement fails', () => {
+    const root = makeTemp();
+    const live = join(root, 'live.jsonl');
+    const tmp = join(root, 'tmp.jsonl');
+    writeFileSync(live, 'original');
+    writeFileSync(tmp, 'replacement');
+
+    expect(() => atomicReplaceTranscript(tmp, live, () => {
+      expect(readFileSync(live, 'utf8')).toBe('original');
+      throw new Error('simulated rename failure');
+    })).toThrow('simulated rename failure');
+    expect(readFileSync(live, 'utf8')).toBe('original');
+    expect(() => readFileSync(tmp)).toThrow();
+  });
+
+  it('checks the snapshot immediately before replacement and preserves a concurrent append', () => {
+    const root = makeTemp();
+    const live = join(root, 'live.jsonl');
+    const tmp = join(root, 'tmp.jsonl');
+    writeFileSync(live, 'original');
+    writeFileSync(tmp, 'replacement');
+
+    expect(() => atomicReplaceTranscript(tmp, live, renameSync, () => {
+      writeFileSync(live, 'original\nconcurrent append');
+      throw new Error('transcript changed while purging');
+    })).toThrow('transcript changed while purging');
+    expect(readFileSync(live, 'utf8')).toContain('concurrent append');
+    expect(() => readFileSync(tmp)).toThrow();
+  });
+});
+
 describe('purgeUndersizedImages', () => {
   it('replaces undersized image blocks with text and backs up the original file', () => {
     const root = makeTemp();
@@ -147,6 +204,43 @@ describe('purgeUndersizedImages', () => {
     writeFileSync(join(fake, 'agent-x.jsonl'), imageRecord(png(1, 1).toString('base64')));
 
     expect(purgeUndersizedImages(main)).toEqual([]);
+  });
+
+  it('does not follow a main transcript symlink', () => {
+    const root = makeTemp();
+    const outside = join(root, 'outside.jsonl');
+    const before = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(outside, before);
+    const main = join(root, `${SID}.jsonl`);
+    symlinkSync(outside, main);
+
+    expect(purgeUndersizedImages(main)).toEqual([]);
+    expect(readFileSync(outside, 'utf8')).toBe(before);
+  });
+
+  it('does not follow a subagents directory or transcript symlink', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    writeFileSync(main, `${imageRecord(png(1024, 1024).toString('base64'))}\n`);
+    const outsideDir = join(root, 'outside');
+    mkdirSync(outsideDir);
+    const outside = join(outsideDir, 'agent-x.jsonl');
+    const before = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(outside, before);
+    mkdirSync(join(root, SID));
+    symlinkSync(outsideDir, join(root, SID, 'subagents'));
+
+    expect(purgeUndersizedImages(main)).toEqual([]);
+    expect(readFileSync(outside, 'utf8')).toBe(before);
+
+    mkdirSync(join(root, SID, 'subagents-real'));
+    const linked = join(root, SID, 'subagents-real', 'agent-linked.jsonl');
+    symlinkSync(outside, linked);
+    // Rename the real directory into the expected location after removing the symlink.
+    rmSync(join(root, SID, 'subagents'));
+    renameSync(join(root, SID, 'subagents-real'), join(root, SID, 'subagents'));
+    expect(purgeUndersizedImages(main)).toEqual([]);
+    expect(readFileSync(outside, 'utf8')).toBe(before);
   });
 
   it('preserves unparseable lines verbatim', () => {

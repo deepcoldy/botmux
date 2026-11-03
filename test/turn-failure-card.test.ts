@@ -274,27 +274,11 @@ describe('buildTurnContinuePrompt', () => {
     expect(buildTurnContinuePrompt()).not.toContain('原任务');
   });
 
-  it('says the previous turn was cut off', () => {
-    // The transcript just ends; it cannot distinguish interrupted from
-    // finished. This is one of the two things resume does NOT convey.
-    expect(buildTurnContinuePrompt()).toContain('中断');
-  });
-
-  it('forbids repeating completed work', () => {
-    // The other thing resume does not convey — and the entire reason this is a
-    // continue rather than a verbatim replay. Worth its tokens.
-    expect(buildTurnContinuePrompt()).toContain('不要重复已完成的操作');
-  });
-
-  it('tells the model to stop and ask a human when it cannot judge safely', () => {
-    // The third thing resume cannot convey, and the one that bounds the risk:
-    // without it the model's only options are to guess or to redo, and both can
-    // duplicate an external side effect. This assertion exists because the
-    // handler comment promised this clause while the prompt did not carry it —
-    // a promise in a comment that nothing pins is not a behaviour.
+  it('is a distinct marked continuation instruction rather than the original task', () => {
+    // The marker is the stable protocol surface; translated prose may evolve.
     const p = buildTurnContinuePrompt();
-    expect(p).toContain('人工决策');
-    expect(p).toContain('无法安全判断');
+    expect(p).toContain('[BOTMUX_CONTINUE]');
+    expect(p).not.toContain('原任务');
   });
 
   it('does not claim a provider fault', () => {

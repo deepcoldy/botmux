@@ -14,12 +14,18 @@
  * (Task/Agent transcripts). Every rewritten file gets a one-time
  * `.botmux-purge-bak-<ts>` backup; writes are atomic (tmp + rename).
  */
-import { createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import {
-  existsSync,
-  readdirSync,
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -34,6 +40,24 @@ export interface PurgedFile {
   file: string;
   removed: number;
   backup?: string;
+}
+
+export interface PurgeResumeTarget {
+  jsonlPath: string;
+  sessionId: string;
+}
+
+/** Pick the transcript the bridge is actively following (it tracks /clear and
+ * scratch views), falling back to the backend's launch-time path. */
+export function resolvePurgeResumeTarget(
+  activeBridgeJsonlPath: string | undefined,
+  backendJsonlPath: string | undefined,
+): PurgeResumeTarget | undefined {
+  const jsonlPath = activeBridgeJsonlPath ?? backendJsonlPath;
+  if (!jsonlPath) return undefined;
+  const sessionId = basename(jsonlPath).replace(/\.jsonl$/i, '');
+  if (!SESSION_SUBDIR_RE.test(sessionId)) return undefined;
+  return { jsonlPath, sessionId };
 }
 
 interface ImageBlock {
@@ -168,23 +192,66 @@ function timestamp(): string {
   return new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
 }
 
-function backupPathFor(file: string): string {
-  const stem = `${file}.botmux-purge-bak-${timestamp()}`;
-  if (!existsSync(stem)) return stem;
-  for (let i = 1; ; i += 1) {
-    const candidate = `${stem}-${i}`;
-    if (!existsSync(candidate)) return candidate;
+function writeExclusiveFile(stem: string, bytes: Buffer | string): string {
+  for (let i = 0; ; i += 1) {
+    const candidate = i === 0 ? stem : `${stem}-${i}`;
+    let fd: number;
+    try {
+      // O_EXCL prevents a pre-planted name from being followed or overwritten.
+      fd = openSync(candidate, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+        | (constants.O_NOFOLLOW ?? 0), 0o600);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') continue;
+      throw err;
+    }
+    try {
+      writeFileSync(fd, bytes);
+    } catch (err) {
+      try { closeSync(fd); } finally { rmSync(candidate, { force: true }); }
+      throw err;
+    }
+    closeSync(fd);
+    return candidate;
+  }
+}
+
+export function atomicReplaceTranscript(
+  tmp: string,
+  file: string,
+  replace: (source: string, destination: string) => void = renameSync,
+  beforeReplace?: () => void,
+): void {
+  try {
+    beforeReplace?.();
+    replace(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
   }
 }
 
 /** Rewrite one jsonl file, backing it up first. Returns undefined when the
  *  file is untouched (no backup, no write). */
-function purgeFile(file: string, minDimension: number): PurgedFile | undefined {
+function purgeFile(
+  file: string,
+  minDimension: number,
+  trustedRoot: string,
+): PurgedFile | undefined {
+  let fd: number | undefined;
   let raw: Buffer;
+  let initialStat: ReturnType<typeof fstatSync>;
   try {
-    raw = readFileSync(file);
+    const realFile = realpathSync(file);
+    if (realFile !== trustedRoot && !realFile.startsWith(`${trustedRoot}/`)) return undefined;
+    if (!lstatSync(file).isFile()) return undefined;
+    fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    initialStat = fstatSync(fd);
+    if (!initialStat.isFile()) return undefined;
+    raw = readFileSync(fd);
   } catch {
     return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
   if (raw.length === 0 || raw.length > MAX_FILE_BYTES) return undefined;
   const trailingNewline = raw[raw.length - 1] === 0x0a;
@@ -217,12 +284,27 @@ function purgeFile(file: string, minDimension: number): PurgedFile | undefined {
     }
   }
   if (removed === 0) return undefined;
-  const backup = backupPathFor(file);
-  const tmp = `${file}.tmp-purge-${createHash('sha1').update(file).digest('hex').slice(0, 10)}`;
-  writeFileSync(tmp, out.join('\n') + (trailingNewline ? '\n' : ''), 'utf8');
-  // Backup the ORIGINAL bytes first, then swap the temp file into place.
-  renameSync(file, backup);
-  renameSync(tmp, file);
+  const backup = writeExclusiveFile(`${file}.botmux-purge-bak-${timestamp()}`, raw);
+  const tmp = writeExclusiveFile(
+    `${file}.tmp-purge-${process.pid}-${randomBytes(6).toString('hex')}`,
+    out.join('\n') + (trailingNewline ? '\n' : ''),
+  );
+  // The live transcript is never moved out of place. rename(2) replaces it in
+  // one atomic step, so a crash before this point leaves the original visible
+  // and a crash after it leaves the sanitized transcript visible.
+  atomicReplaceTranscript(tmp, file, renameSync, () => {
+    // The CLI may still append while the restart begins. Never replace a newer
+    // transcript snapshot: abort and let the caller retry after the process is
+    // quiescent instead of silently deleting the appended records.
+    const current = lstatSync(file);
+    if (!current.isFile()
+      || current.dev !== initialStat.dev
+      || current.ino !== initialStat.ino
+      || current.size !== initialStat.size
+      || current.mtimeMs !== initialStat.mtimeMs) {
+      throw new Error(`transcript changed while purging: ${file}`);
+    }
+  });
   return { file, removed, backup };
 }
 
@@ -235,7 +317,13 @@ export function purgeUndersizedImages(
 ): PurgedFile[] {
   const minDimension = opts.minDimension ?? MIN_IMAGE_DIMENSION;
   const results: PurgedFile[] = [];
-  const main = purgeFile(mainJsonlPath, minDimension);
+  let trustedRoot: string;
+  try {
+    trustedRoot = realpathSync(dirname(mainJsonlPath));
+  } catch {
+    return results;
+  }
+  const main = purgeFile(mainJsonlPath, minDimension, trustedRoot);
   if (main) results.push(main);
 
   // Layout: <projectsRoot>/<cwdHash>/<sid>.jsonl with subagents at
@@ -245,13 +333,16 @@ export function purgeUndersizedImages(
     const subDir = join(dirname(mainJsonlPath), sid, 'subagents');
     let entries: string[];
     try {
+      // Do not let a transcript-controlled/session-adjacent symlink redirect the
+      // purge outside the pinned session tree.
+      if (!lstatSync(subDir).isDirectory()) return results;
       entries = readdirSync(subDir);
     } catch {
       return results;
     }
     for (const name of entries) {
       if (!name.endsWith('.jsonl')) continue;
-      const purged = purgeFile(join(subDir, name), minDimension);
+      const purged = purgeFile(join(subDir, name), minDimension, trustedRoot);
       if (purged) results.push(purged);
     }
   }
