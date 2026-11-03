@@ -34,6 +34,13 @@ export function parseWorkflowEventTurnId(turnId: string): WorkflowEventTurnRef |
   return { runId: match[1]!, eventSeq: Number(match[2]) };
 }
 
+/** A turn opened by an inbound chat message (a Lark message id, or the
+ *  auto-start join turn) — never a daemon-minted synthetic turn. When a wake
+ *  turn is overtaken, only such a turn may take over its request. */
+export function isInboundMessageTurnId(turnId: string): boolean {
+  return turnId.startsWith('om_') || turnId.startsWith('join_');
+}
+
 /** Run-bound verification of a workflow event turn (injected by the caller
  *  that owns the run's binding). */
 export type WorkflowEventTurnVerifier = (input: WorkflowEventTurnRef & {
@@ -43,8 +50,9 @@ export type WorkflowEventTurnVerifier = (input: WorkflowEventTurnRef & {
     larkAppId: string;
     chatId: string;
     rootMessageId?: string;
-    /** The session's live turn pointers. A human message arriving during the
-     *  event turn advances them; the verifier then refuses (generation join). */
+    /** The session's live turn pointers. A message arriving during the event
+     *  turn advances them; the verifier then reports `stale` (generation join)
+     *  and the caller authenticates the request as that newer turn. */
     quoteTargetId?: string;
     currentReplyTargetTurnId?: string;
   };

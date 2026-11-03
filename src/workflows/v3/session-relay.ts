@@ -24,7 +24,7 @@ import {
   V3DaemonCommandAuthorityError,
   workflowEventTurnVerifierFor,
 } from './cli-daemon-command-authority.js';
-import { parseWorkflowEventTurnId } from '../../core/workflow-event-turn.js';
+import { isInboundMessageTurnId, parseWorkflowEventTurnId } from '../../core/workflow-event-turn.js';
 import { isValidRunId } from './ops-projection.js';
 import {
   authorizeScheduledTurn,
@@ -195,6 +195,8 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
   // creator, never anything the request chooses.
   let callerOpenId: string;
   const workflowEvent = liveTurnId ? parseWorkflowEventTurnId(liveTurnId) : null;
+  /** The wake turn was overtaken; the request runs as the newer human turn. */
+  let overtakenWakeTurn = false;
   if (liveTurnId && workflowEvent) {
     // Daemon-minted turn for THIS run's own events (design §13.1): it acts
     // for the run's frozen initiator, so the owner tuple below is unchanged.
@@ -210,14 +212,27 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
         ...(current.currentReplyTargetTurnId ? { currentReplyTargetTurnId: current.currentReplyTargetTurnId } : {}),
       },
     });
-    if (!verdict.ok) {
-      // A human message overtook the wake turn: same refusal as a human turn
-      // whose pointers moved on (the caller re-runs in the newer turn).
-      return verdict.stale
-        ? { ok: false, status: 403, error: 'turn_provenance_stale', detail: verdict.reason }
-        : { ok: false, status: 403, error: 'workflow_event_turn_unauthorized', detail: verdict.reason };
+    if (verdict.ok) {
+      callerOpenId = verdict.callerOpenId;
+    } else if (!verdict.stale) {
+      return { ok: false, status: 403, error: 'workflow_event_turn_unauthorized', detail: verdict.reason };
+    } else {
+      // A newer inbound message overtook the wake turn (folded into it, or
+      // queued behind it): the request belongs to that message's sender.
+      // Authenticate it as the session's current generation — the same
+      // all-fields-one-generation rule as the human branch below, applied to
+      // the turn the pointers name — instead of refusing it (mirrors the host
+      // path in current-turn-provenance.ts).
+      const overtaking = current.quoteTargetId;
+      if (
+        !nonEmpty(overtaking) || !isInboundMessageTurnId(overtaking) || !nonEmpty(current.callerOpenId) ||
+        (current.currentReplyTargetTurnId !== undefined && current.currentReplyTargetTurnId !== overtaking)
+      ) {
+        return { ok: false, status: 403, error: 'turn_provenance_stale', detail: verdict.reason };
+      }
+      callerOpenId = current.callerOpenId;
+      overtakenWakeTurn = true;
     }
-    callerOpenId = verdict.callerOpenId;
   } else if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
     if (!input.loadScheduledTask) {
       return {
@@ -274,7 +289,7 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
     sessionId,
     current: current as RelayAuthenticated['current'],
     callerOpenId,
-    workflowEvent: !!workflowEvent,
+    workflowEvent: !!workflowEvent && !overtakenWakeTurn,
   };
 }
 

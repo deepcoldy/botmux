@@ -7,6 +7,7 @@ import {
   scheduledTurnAuthErrorMessage,
 } from './scheduled-turn-provenance.js';
 import {
+  isInboundMessageTurnId,
   parseWorkflowEventTurnId,
   type WorkflowEventTurnVerifier,
 } from './workflow-event-turn.js';
@@ -198,6 +199,15 @@ export function resolveCurrentTurnProvenance(
       },
     });
     if (!verdict.ok) {
+      // A newer inbound message overtook the wake turn (folded into it, or
+      // queued behind it). The request now belongs to that message's sender:
+      // authenticate it exactly as a command of that turn would be — the
+      // initiator's own message keeps the edit direct, anyone else's makes it
+      // a proposal (M1) — rather than failing a request the human just made.
+      const overtaking = session.quoteTargetId;
+      if (verdict.stale && nonEmpty(overtaking) && isInboundMessageTurnId(overtaking)) {
+        return authenticateHumanTurn(marker.sessionId, overtaking, session);
+      }
       throw new CurrentTurnProvenanceError(`workflow 事件回合校验失败：${verdict.reason}`);
     }
     return {
@@ -263,6 +273,22 @@ export function resolveCurrentTurnProvenance(
     };
   }
 
+  return authenticateHumanTurn(marker.sessionId, marker.turnId, session);
+}
+
+/** The human path: authenticate `turnId` of `sessionId` as the human who
+ *  opened it (generation join on the live quote/reply chain, or the durable
+ *  per-turn registry). */
+function authenticateHumanTurn(
+  sessionId: string,
+  turnId: string,
+  session: PersistedTurnSession,
+): CurrentTurnProvenance {
+  const marker = { sessionId, turnId };
+  const replyTarget = session.currentReplyTarget;
+  if (!nonEmpty(session.larkAppId) || !nonEmpty(session.chatId)) {
+    throw new CurrentTurnProvenanceError(`session ${sessionId} 缺少 larkAppId/chatId`);
+  }
   // quoteTargetId / currentReplyTarget are the live UI quote chain: a queued
   // follow-up (submitQueuedMessage) advances both to the NEXT turn's message
   // while this turn is still running, so they cannot vouch for the running

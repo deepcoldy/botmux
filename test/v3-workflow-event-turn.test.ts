@@ -38,6 +38,7 @@ import {
 } from '../src/workflows/v3/session-relay.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { recordV3MainWakeIssued } from '../src/workflows/v3/main-wake-ledger.js';
+import { applyV3RunEdit } from '../src/workflows/v3/run-edit.js';
 
 const RUN = 'wf-event-run';
 const BINDING = { larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real_root', ownerOpenId: 'ou_initiator' };
@@ -220,39 +221,125 @@ describe('event-woken turn of THIS run', () => {
   });
 });
 
-describe('a newer human message overtakes the wake turn (generation join)', () => {
-  it('relay: once the session pointers move past the wake turn, it no longer acts as the event turn', () => {
-    seedRun();
-    const turnId = issueWake(RUN, 2, { turnPointersAtIssue: { quoteTargetId: 'om_last_human_msg' } });
-    const capability = 'c'.repeat(64);
-    const relayEdit = (quoteTargetId: string) => authorizeV3SessionRunEditRequest({
+describe('a human message arrives while the main bot handles a wake turn', () => {
+  // The run's initiator and another member of the group.
+  const INITIATOR = 'ou_initiator';
+  const MEMBER = 'ou_member';
+  const capability = 'c'.repeat(64);
+  const patch = [{ op: 'updateNode', nodeId: 'a', set: { goal: 'as discussed in the topic' } }];
+  const apply = (caller: { openId: string; origin: 'human' | 'runEvent' }) => applyV3RunEdit({
+    baseDir, runId: RUN, patch, baseRevision: 1, caller,
+    resolveNewBotSnapshot: () => { throw new Error('no new bots'); },
+  });
+  /** The session after a message from `sender` landed in the main topic. */
+  const messageFrom = (sender: string, messageId: string) => ({
+    quoteTargetId: messageId,
+    lastCallerOpenId: sender,
+    currentReplyTarget: { turnId: messageId, rootMessageId: BINDING.rootMessageId },
+  });
+  const hostEdit = (sender: string, messageId: string, markerTurnId: string) => {
+    writeSession(messageFrom(sender, messageId));
+    writeMarker(markerTurnId);
+    const authority = editAs();
+    return { authority, outcome: apply({ openId: authority.callerOpenId, origin: authority.origin }) };
+  };
+  const relayEdit = (sender: string, messageId: string, liveTurnId: string) => {
+    const decision = authorizeV3SessionRunEditRequest({
       runId: RUN,
-      mutation: 'status',
-      raw: { sessionId: 'sess-main', originCapability: capability },
+      mutation: 'edit',
+      raw: { sessionId: 'sess-main', originCapability: capability, patch, base: 1 },
       trustedHost: false,
       session: {
         receiver: false,
-        liveOrigin: { capability, turnId, dispatchAttempt: 1 },
-        callerOpenId: 'ou_last_human',
+        liveOrigin: { capability, turnId: liveTurnId, dispatchAttempt: 1 },
+        callerOpenId: sender,
         chatId: BINDING.chatId,
         larkAppId: BINDING.larkAppId,
-        quoteTargetId,
+        quoteTargetId: messageId,
+        currentReplyTargetTurnId: messageId,
         rootMessageId: BINDING.rootMessageId,
       },
       selfLarkAppId: BINDING.larkAppId,
       baseDir,
     });
-    expect(relayEdit('om_last_human_msg')).toMatchObject({ ok: true });
-    expect(relayEdit(turnId)).toMatchObject({ ok: true });
-    expect(relayEdit('om_member_wrote_meanwhile')).toMatchObject({ ok: false, error: 'turn_provenance_stale' });
+    if (!decision.ok || !decision.edit) return { decision, outcome: undefined };
+    return { decision, outcome: apply(decision.edit.caller) };
+  };
+
+  it('host: the initiator\'s message absorbed into the wake turn → the edit is the initiator\'s own (M1 direct)', () => {
+    seedRun();
+    const wake = issueWake(RUN, 2);
+    const { authority, outcome } = hostEdit(INITIATOR, 'om_initiator_says', wake);
+    expect(authority).toMatchObject({ origin: 'human', callerOpenId: INITIATOR });
+    expect(outcome).toMatchObject({ kind: 'applied' });
   });
 
-  it('host path: the same overtaken wake turn is refused', () => {
+  it('host: the initiator\'s message opened a new turn → the same', () => {
     seedRun();
-    writeSession({ quoteTargetId: 'om_member_wrote_meanwhile' });
-    writeMarker(issueWake(RUN, 2, { turnPointersAtIssue: { quoteTargetId: 'om_last_human_msg' } }));
+    issueWake(RUN, 2);
+    const { authority, outcome } = hostEdit(INITIATOR, 'om_initiator_says', 'om_initiator_says');
+    expect(authority).toMatchObject({ origin: 'human', callerOpenId: INITIATOR });
+    expect(outcome).toMatchObject({ kind: 'applied' });
+  });
+
+  it('host: another member\'s message (absorbed or as a new turn) → a proposal for the initiator, not an error', () => {
+    seedRun();
+    const wake = issueWake(RUN, 2);
+    for (const markerTurnId of [wake, 'om_member_says']) {
+      const { authority, outcome } = hostEdit(MEMBER, 'om_member_says', markerTurnId);
+      expect(authority).toMatchObject({ origin: 'human', callerOpenId: MEMBER });
+      expect(outcome).toMatchObject({ kind: 'proposed', reasons: ['callerNotInitiator'] });
+      // Leave the next case a run without a pending proposal.
+      rmSync(join(baseDir, RUN), { recursive: true, force: true });
+      seedRun();
+      issueWake(RUN, 2);
+    }
+  });
+
+  it('relay: the same three cases', () => {
+    seedRun();
+    const wake = issueWake(RUN, 2);
+    expect(relayEdit(INITIATOR, 'om_initiator_says', wake)).toMatchObject({
+      decision: { ok: true, edit: { caller: { openId: INITIATOR, origin: 'human' } } }, outcome: { kind: 'applied' },
+    });
+    rmSync(join(baseDir, RUN), { recursive: true, force: true });
+    seedRun();
+    issueWake(RUN, 2);
+    expect(relayEdit(INITIATOR, 'om_initiator_says', 'om_initiator_says')).toMatchObject({ outcome: { kind: 'applied' } });
+    rmSync(join(baseDir, RUN), { recursive: true, force: true });
+    seedRun();
+    const wake2 = issueWake(RUN, 2);
+    for (const liveTurnId of [wake2, 'om_member_says']) {
+      expect(relayEdit(MEMBER, 'om_member_says', liveTurnId)).toMatchObject({
+        decision: { ok: true, edit: { caller: { openId: MEMBER, origin: 'human' } } },
+        outcome: { kind: 'proposed', reasons: ['callerNotInitiator'] },
+      });
+      rmSync(join(baseDir, RUN), { recursive: true, force: true });
+      seedRun();
+      issueWake(RUN, 2);
+    }
+  });
+
+  it('the overtaken wake turn never keeps acting as the initiator (generation join)', () => {
+    seedRun();
+    const wake = issueWake(RUN, 2);
+    // Not overtaken: the wake turn acts for the initiator.
+    writeSession();
+    writeMarker(wake);
+    expect(editAs()).toMatchObject({ origin: 'runEvent', callerOpenId: INITIATOR });
+    // Overtaken by a member: it is the member's edit now, not the initiator's.
+    writeSession(messageFrom(MEMBER, 'om_member_says'));
+    expect(editAs()).toMatchObject({ origin: 'human', callerOpenId: MEMBER });
+    expect(relayEdit(MEMBER, 'om_member_says', wake).decision).toMatchObject({ ok: true, edit: { caller: { openId: MEMBER } } });
+  });
+
+  it('when the newer turn names no human sender, the request is refused as stale', () => {
+    seedRun();
+    const wake = issueWake(RUN, 2);
+    writeSession({ quoteTargetId: 'om_unattributed', lastCallerOpenId: undefined });
+    writeMarker(wake);
     expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
-    writeSession({ quoteTargetId: 'om_last_human_msg' });
-    expect(editAs()).toMatchObject({ origin: 'runEvent' });
+    writeSession({ quoteTargetId: mintWorkflowEventTurnId(RUN, 3) });
+    expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
   });
 });

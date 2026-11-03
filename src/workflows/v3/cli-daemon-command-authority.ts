@@ -415,13 +415,15 @@ export function workflowEventTurnVerifierFor(
     ) {
       return { ok: false, reason: '该回合不是拥有该 run 的 daemon 签发的' };
     }
-    // Generation join (same rule as human turns): if a human message has
-    // advanced the session's turn pointers since the wake turn was issued,
-    // the session's identity now belongs to that newer turn. Deliberately
-    // strict: a record without `turnPointersAtIssue` is refused as soon as the
-    // session has a pointer, and a pointer moved by a synthetic turn (not a
-    // human) counts as advanced too — see V3MainWakeRecord for the issuer's
-    // contract and what PR 5b still has to decide.
+    // Generation join (same rule as human turns): if a message has advanced
+    // the session's turn pointers since the wake turn was issued, the
+    // session's identity now belongs to that newer turn — `stale` tells the
+    // caller to authenticate the request as that turn instead. Deliberately
+    // strict: a record without `turnPointersAtIssue` counts as overtaken as
+    // soon as the session has a pointer, and a pointer moved by a synthetic
+    // turn counts too (the caller then finds no human turn to fall back to
+    // and refuses) — see V3MainWakeRecord for the issuer's contract and what
+    // PR 5b still has to decide.
     const advanced = (pointer: string | undefined, atIssue: string | undefined): boolean =>
       pointer !== undefined && pointer !== turnId && pointer !== atIssue;
     if (
