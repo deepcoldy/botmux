@@ -426,9 +426,10 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 | `nodeHandoffSent` | 消息发出后 | 节点卡 id（如有）、交接消息 id、话题 id |
 | `nodeHandoffAccepted` | 子 Bot 会话登记了这条交接 | sessionId、截止时间 |
 | `nodeStalled` | 轮次结束但未提交，只影响显示 | 时间 |
-| `nodeReassigned` | 改派 | from、to、操作人 |
+| `nodeReassigned` | 改派 | from、to、操作人；主 Bot 自动改派时另有 `by: main_bot`、`reason`（13.6） |
+| `nodeHandedToHuman` | 主 Bot 决定把节点交给人（13.6） | nodeId、instanceId（如有）、attemptId（如有）、`reason`、`by: main_bot`、触发回合的 turnId |
 
-结束仍用现有的 `nodeSucceeded` / `nodeBlocked` / `nodeFailed` / `nodeCancelled`。新增错误码：`BOT_NOT_IN_CHAT`、`BOT_OFFLINE`、`COLLABORATION_DENIED`、`HANDOFF_NOT_ACCEPTED`、`HANDOFF_UNCERTAIN`、`BOT_REPORTED_BLOCKED`、`NODE_TIMEOUT`、`IDENTITY_UNAVAILABLE`。
+结束仍用现有的 `nodeSucceeded` / `nodeBlocked` / `nodeFailed` / `nodeCancelled`。新增错误码：`BOT_NOT_IN_CHAT`、`BOT_OFFLINE`、`COLLABORATION_DENIED`、`HANDOFF_NOT_ACCEPTED`、`HANDOFF_UNCERTAIN`、`BOT_REPORTED_BLOCKED`、`NODE_TIMEOUT`、`IDENTITY_UNAVAILABLE`、`HANDED_TO_HUMAN`（13.6）。
 
 `run.json` 增加 `nodeExecutor: "bot"`；没有这个字段的 run 一律按旧方式执行。流程版本相关事件见第 13 节。
 
@@ -597,7 +598,7 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 | 进行中 | `running`；子状态：交接中 / 已接单 / Bot 已停下未提交 |
 | 完成 | `done` |
 | 失败 | `failed` |
-| 等人工确认 | `gateWaiting`，需要人处理的 `blocked`（显示原因），被待确认修改挂起的节点 |
+| 等人工确认 | `gateWaiting`，需要人处理的 `blocked`（显示原因，含主 Bot 交给人的 `HANDED_TO_HUMAN`），被待确认修改挂起的节点 |
 | 跳过 / 已取消 / 已替代 | `skipped` / `cancelled` / `superseded`，灰色 |
 
 **节点框**：三行，依次是节点名；Bot 名字和落点标记（「话题」或「主话题」）；状态标签加耗时。进行中的耗时实时走秒。Loop 节点保留轮次圆点。
@@ -621,7 +622,6 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 ## 13. 运行中修改流程
 
 ### 13.1 谁能改（M1，已定）
-
 
 - **主 Bot（主会话）**：通过 `botmux workflow edit <runId> --patch-file <文件> --base <版本>` 提交修改。鉴权沿用现有创作命令：必须处在与 run 绑定的同一应用、群、主会话的已认证回合里。
   - 发起人本人触发的回合，或本 run 事件唤醒的回合（M6）：按 13.5 的分类直接生效或进入待确认。
@@ -693,7 +693,6 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 
 确认方式：主话题发一张「流程修改确认」卡，列出新增、删除、修改的节点，新 Bot，新的对外动作，Gate 的变化，只有发起人能点「同意」或「拒绝」。待确认期间，受影响的节点不派发，其余节点照常跑。卡片作废、重启重发都按 Gate 的现有做法。
 
-
 ### 13.6 主 Bot 什么时候参与调整（M3、M6 已定）
 
 - **唤醒时机（M6）**：主 Bot 的 daemon 在这几种时候往主会话投一条结构化事件（复用 report 回传的合成触发形态，正文按不可信数据处理）：
@@ -705,6 +704,10 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - **自动处理（M3，已定：不设次数上限）**：被唤醒后，主 Bot 可以自己重试、改派（在已批准的 Bot 内）或 `rerunNode`，也可以决定交给人。什么时候交给人，由主 Bot 按情况判断，例如反复失败、拿不准下一步、需要人提供信息或做取舍。
   - **必须写明理由**：主 Bot 每次自动处理都要带上理由，命令为 `botmux workflow retry|edit … --reason "<为什么自动处理>"`；交给人时运行 `botmux workflow ask-human <runId> --node <id> --reason "<为什么交给人>"`。理由记进运行记录：自动处理写在 `nodeRetryRequested` / `nodeReassigned` / `dagRevised` 事件的 `reason` 和 `by: main_bot` 字段，交给人写一条新事件 `nodeHandedToHuman`。
   - **由事件唤醒的回合缺理由就拒绝**：CLI 在这类回合里不带 `--reason` 时直接报错。人本人触发的回合可以不填。
+  - **交给人之后节点处于什么状态**：
+    - `ask-human` 会先停掉并关闭该节点正在进行的尝试（与超时同一条关闭路径），写 `nodeHandedToHuman`，再把节点置为 `blocked`，错误码 `HANDED_TO_HUMAN`，理由原样展示。
+    - 之后沿用现有阻塞卡（重试、改派、取消），不另设超时，等人处理。
+    - 人在主话题里回复，算发起人或其他人触发的普通回合，按 M1 区分能否直接改流程；处理完由人点卡片，或由主 Bot 在发起人回合里 `retry` / `edit`。
   - **在哪里展示**：节点卡上显示最近一次的「主 Bot 自动重试 / 改派 / 重做：<理由>」或「交给人决定：<理由>」；看板节点详情列出全部记录；交给人时节点状态显示为「等人工确认」。
   - **不设上限靠什么兜底**：Loop 轮数和 Revisit 额度照旧要人逐次授权；13.5 的确认清单照旧生效；每一次自动处理都可见、可追溯。
   - 回合本身由主 Bot 的模型执行，所以这些规则写在 workflow skill 的「运行中修改」一节，按需读取，不进常驻提示（3.6）。
@@ -769,7 +772,8 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - `/workflow` 和 `/workflow new｜save｜run｜list｜show｜cancel` 的语法和语义不变。
 - 新模式下，Gate-2 摘要多出「节点 → 子 Bot（落点，理由）」，阻塞卡多一个「改派」。
 - `botmux report` 新增 `--output`、`--result-file`，只对工作流节点的交接有效。
-- 新增 `botmux workflow edit`、`botmux workflow status`。
+- 新增 `botmux workflow edit`、`botmux workflow status`、`botmux workflow ask-human`。
+- `botmux workflow retry` 和 `botmux workflow edit` 新增 `--reason`。由本 run 事件唤醒的回合必须带它（13.6）；人触发的回合可以不带，不带时行为与现在相同。
 - **`approve-dag --working-dir`**：新模式下节点在子 Bot 自己的会话目录里跑。指定的目录必须在该 Bot 配置的目录范围内（`defaultWorkingDir` / `workingDirs`），由子 Bot 的 daemon 起会话时校验并应用；不在范围内就在 Gate-2 拒绝。
 - **节点的 `override.model`**：只有子 Bot 的 CLI 支持按派发指定模型时（目前是 Codex 的 dispatch 启动规格）才生效，否则 Gate-2 报错。
 - **节点的 `override.systemPromptAppend`**：拼进交接消息正文。
