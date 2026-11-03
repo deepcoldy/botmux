@@ -520,7 +520,8 @@ import {
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
 } from './core/dispatch-report-binding.js';
-import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
+import { recordDispatchRegistryEntry, updateDispatchRegistry } from './core/dispatch-registry.js';
+import { recordDispatchLastReport } from './core/dispatch-task-tree.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { applyDispatchLaunchBinding, registerDispatchLaunchBinding } from './core/dispatch-launch-binding.js';
 import { projectCoordinator } from './services/project-coordinator-runtime.js';
@@ -4615,6 +4616,34 @@ function sessionTopicWriteOptions(ds: DaemonSession, turnId?: string, verifiedSo
   } };
 }
 
+/** Record a child's report on its dispatch entry and patch the orchestrator's
+ *  task-tree card. Best effort: the report is delivered whether or not the card moves. */
+async function syncDispatchTaskTreeAfterReport(input: {
+  dispatchRoot: string; status?: unknown; content: string;
+  target: { larkAppId: string; sessionId: string };
+}): Promise<void> {
+  const warn = (error: unknown) => logger.warn(`[task-tree] refresh after report failed: ${error instanceof Error ? error.message : String(error)}`);
+  try {
+    let orchSessionId: string | undefined;
+    await updateDispatchRegistry(join(config.session.dataDir, 'orchestrate-dispatch.json'), registry => {
+      orchSessionId = recordDispatchLastReport(registry, input.dispatchRoot, {
+        status: input.status, content: input.content, at: new Date().toISOString(),
+      });
+    });
+    if (orchSessionId !== input.target.sessionId) return;
+    const orchDaemon = findOnlineDaemon(input.target.larkAppId);
+    if (!orchDaemon) return;
+    // Not awaited: the card patch is a Feishu round trip the report need not wait for.
+    void fetchDaemonIpc(orchDaemon.ipcPort, '/api/dispatch-tree/refresh', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ orchSessionId }),
+    }).catch(warn);
+  } catch (error) {
+    warn(error);
+  }
+}
+
 async function reportZeroPromptFinal(ds: DaemonSession, input: {
   turnId: string; content: string; dispatchRoot?: string;
 }): Promise<void> {
@@ -4637,7 +4666,10 @@ async function reportZeroPromptFinal(ds: DaemonSession, input: {
       decision, triggerMeta,
       beforeWrite: sourceTopicWriteOptions(ds.larkAppId, decision.dispatchRoot).beforeWrite,
       fetchTarget: (path, init) => fetchDaemonIpc(target.ipcPort, path, init),
-      postProjectUpdate: async () => ({ projectSynced: false }),
+      postProjectUpdate: async (landed) => {
+        await syncDispatchTaskTreeAfterReport({ dispatchRoot: decision.dispatchRoot, content: input.content, target: landed });
+        return { projectSynced: false };
+      },
     });
     if (delivered.status >= 400 || delivered.body.ok === false) {
       throw new Error(`zero-prompt report: ${delivered.body.error ?? delivered.status}`);
@@ -9043,6 +9075,14 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     receivedAt: new Date().toISOString(),
   };
   const postProjectUpdate = async (
+    target: { larkAppId: string; sessionId: string },
+  ): Promise<{ projectSynced: boolean; projectSyncError?: string }> => {
+    await syncDispatchTaskTreeAfterReport({
+      dispatchRoot: decision.dispatchRoot, status: decision.projectUpdate.status, content: decision.content, target,
+    });
+    return postProjectGroupUpdate(target);
+  };
+  const postProjectGroupUpdate = async (
     target: { larkAppId: string; sessionId: string },
   ): Promise<{ projectSynced: boolean; projectSyncError?: string }> => {
     const projectDaemon = target.larkAppId === decision.target.larkAppId
