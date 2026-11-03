@@ -48,6 +48,7 @@ import {
   type V3Node,
 } from './dag.js';
 import { loadDag } from './dag-loader.js';
+import { loadEffectiveV3Dag, snapshotForSelector } from './dag-revision.js';
 import type { StoredEvent, V3ErrorClass, V3LoopRef } from './event-contract.js';
 import {
   foldV3ExternalAttempts,
@@ -239,8 +240,16 @@ function journalPathOf(runDir: string): string {
   return join(runDir, 'journal.ndjson');
 }
 
-function dagFor(runDir: string, ctx: V3ExternalEngineContext | undefined): V3Dag {
-  return ctx?.dag ?? loadDag(join(runDir, 'dag.json'));
+/** The EFFECTIVE flow (authorized DAG + applied runtime revisions): a node a
+ *  revision changed is validated against its new contract. Without revisions
+ *  this is the authorized DAG itself. */
+function dagFor(
+  runDir: string,
+  ctx: V3ExternalEngineContext | undefined,
+  events: readonly StoredEvent[] = readJournal(journalPathOf(runDir)),
+): V3Dag {
+  const base = ctx?.dag ?? loadDag(join(runDir, 'dag.json'));
+  return loadEffectiveV3Dag(runDir, base, events).dag;
 }
 
 function clockOf(ctx: V3ExternalEngineContext | undefined): () => number {
@@ -1036,9 +1045,16 @@ export interface V3ReassignContext extends V3ExternalEngineContext {
 }
 
 function botSnapshotsFor(runDir: string, ctx: V3ReassignContext): ReadonlyMap<string, BotSnapshot> {
-  if (ctx.botSnapshots) return ctx.botSnapshots;
-  const raw = JSON.parse(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8')) as Record<string, BotSnapshot>;
-  return new Map(Object.entries(raw));
+  const frozen = ctx.botSnapshots ?? new Map(Object.entries(
+    JSON.parse(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8')) as Record<string, BotSnapshot>,
+  ));
+  // Bots an applied runtime revision brought in are part of the run's set.
+  const base = ctx.dag ?? loadDag(join(runDir, 'dag.json'));
+  const additions = loadEffectiveV3Dag(runDir, base, readJournal(journalPathOf(runDir))).botAdditions;
+  if (additions.size === 0) return frozen;
+  const merged = new Map(frozen);
+  for (const [selector, snapshot] of additions) if (!merged.has(selector)) merged.set(selector, snapshot);
+  return merged;
 }
 
 /** Which node-scoped definition a reassign targets: an authored goal node, or
@@ -1132,7 +1148,7 @@ export async function reassignNode(
   const before = readJournal(journalPath);
   const selector = reassignTargetSelector(dag, before, input.nodeId);
   if (selector === undefined) return { kind: 'rejected', reason: 'unknown-node' };
-  const frozenTarget = snapshots.get(selector)?.larkAppId;
+  const frozenTarget = snapshotForSelector(snapshots, selector)?.larkAppId;
   if (!frozenTarget) return { kind: 'rejected', reason: 'unknown-node' };
 
   const currentTarget = materialize(before).assignments.get(input.nodeId) ?? frozenTarget;

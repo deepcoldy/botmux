@@ -1787,6 +1787,21 @@ botmux workflow architect <runId>
 
 用户确认 → \`botmux workflow approve-dag <runId> [--working-dir <任务目录>]\`。可选 \`--working-dir\` 在首次 Gate-2 批准时冻结所有节点的工作目录；省略时使用各机器人的配置目录。已发布 run 重试复用原快照，后传目录不覆盖已有运行。然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
 
+## 运行中修改
+run 开跑后要调整流程（加/删/改节点、改依赖、改派、重做），只在本 run 的主话题里做：
+1. \`botmux workflow status <runId> --json\` 读当前版本（\`revision\`）、各节点状态、尝试次数和待确认的修改。
+2. 写 patch 文件（一组操作，整体生效或整体拒绝）：\`{"ops":[...],"note":"为什么改"}\`。操作：
+   - \`{"op":"addNode","node":{...完整节点，同 dag.json}}\` · \`{"op":"removeNode","nodeId":"x"}\`
+   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改）
+   - \`{"op":"setDepends","nodeId":"x","depends":[...],"inputs":[...]}\` · \`{"op":"reassign","nodeId":"x","bot":"<larkAppId>"}\` · \`{"op":"rerunNode","nodeId":"x"}\`
+3. \`botmux workflow edit <runId> --patch-file <文件> --base <revision>\`。版本冲突就重新 status 再改，不要硬重试。
+
+规则：已完成的节点只能 rerunNode（走 Revisit 额度）或在下游加节点；已开始的节点不能改依赖；运行中的 Loop 只能改轮数上限；跳过/取消的节点不能改，要就加新节点；删节点前先把下游依赖改掉。改正在跑或等审批的节点会作废当前这次执行/审批，按新定义重来。受阻的节点只改定义不会重跑——要重跑就在同一次 edit 里加 rerunNode；改派会直接重试。
+
+以下修改不会直接生效，而是在主话题发「流程修改确认」卡等发起人点同意：用到未批准的 Bot；新增或修改对外动作（host 节点）；去掉或放宽人工确认；扩大超时/轮数/节点总数；以及不是发起人本人触发的回合里提出的任何修改。等确认期间涉及的节点暂停，其余照常跑；把这个情况如实告诉用户。
+
+由 run 事件唤醒、你自己决定重试/改派/重做时，必须在 \`note\` 里写明理由；拿不准、反复失败或需要人取舍时，停下来问发起人。
+
 ## 关键纪律
 - 全程飞书一问一答，用 botmux send 对话。
 - \`runId\` 是贯穿全程的钥匙，每个命令都带对。

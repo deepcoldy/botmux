@@ -64,6 +64,47 @@ export interface V3HandoffIdempotency {
   handoff: string;
 }
 
+/**
+ * Why a runtime flow revision needs the initiator's confirmation before it
+ * takes effect (design §13.5 / M1). `callerNotInitiator` covers every edit
+ * made in a turn neither opened by the run's initiator nor woken by this
+ * run's own events; the rest are the §13.5 categories.
+ */
+export type V3RevisionConfirmReason =
+  | 'callerNotInitiator'
+  | 'newBot'
+  | 'hostNode'
+  | 'gateRelaxed'
+  | 'budgetExpanded';
+
+/**
+ * State changes a revision makes to already-dispatched work, folded
+ * atomically with its `dagRevised` event (one journal line, so a crash can
+ * never apply the new definition without its invalidations or vice versa).
+ */
+export interface V3RevisionEffects {
+  /** Current instances invalidated by a definition change, reassignment or
+   *  rerun — materialized exactly like `nodeInstanceSuperseded`: the node
+   *  re-dispatches a fresh instance (and re-passes its gate). `waitId` names a
+   *  pending gate wait voided by the change. */
+  supersede?: Array<{ nodeId: string; instanceId: string; waitId?: string }>;
+  /** Removed nodes that had already been dispatched or gated: neutral
+   *  cancellation of that exact instance/attempt. */
+  cancel?: Array<{ nodeId: string; instanceId?: string; attemptId?: string }>;
+  /** Done nodes re-run with Revisit semantics; each consumes revisit budget. */
+  rerun?: string[];
+  /** Bot reassignments; the external executor's target follows `to`. */
+  assign?: Array<{ nodeId: string; from?: string; to: string }>;
+}
+
+/** Set when the main bot made the change on its own in a turn woken by
+ *  this run's events (design §13.6). The reason becomes mandatory with the
+ *  wake-up wiring; until then it carries the edit's note (may be empty). */
+export interface V3AutoProvenance {
+  by: 'main_bot';
+  reason: string;
+}
+
 export type V3Event =
   | {
       type: 'runStarted';
@@ -81,6 +122,63 @@ export type V3Event =
        *  (`run.json` `nodeExecutor: "bot"`). Such attempts own no local worker
        *  process, so they never enter the worker attempt ledger. */
       nodeExecutor?: 'bot';
+      /** Flow revision the attempt was dispatched under. Absent = 1 (the
+       *  approved DAG), so runs that never revised keep their exact bytes. */
+      revision?: number;
+    }
+  | {
+      /** A flow revision took effect (design §13.3). `dag-revisions/<NNN>.json`
+       *  holds the full new DAG; every digest here is of the exact file bytes
+       *  and replay fails closed on a mismatch. */
+      type: 'dagRevised';
+      revision: number;
+      baseRevision: number;
+      sha256: string;
+      patchSha256: string;
+      /** `dag-revisions/<NNN>.bots.json`: snapshots of bots the revision
+       *  newly brought into the run (always initiator-confirmed). */
+      botsSha256?: string;
+      summary: string;
+      /** Free-text note supplied with the edit (display only). */
+      note?: string;
+      /** open_id the turn authenticated as. */
+      by: string;
+      auto?: V3AutoProvenance;
+      /** Present when the revision was a confirmed proposal. */
+      approval?: { by: string; proposedBy: string };
+      effects?: V3RevisionEffects;
+    }
+  | {
+      /** A revision that needs the initiator's confirmation (design §13.5).
+       *  Its files are already written; it takes effect only through a later
+       *  `dagRevised` carrying `approval`. A pending wait lives in
+       *  `waits/revisions/<NNN>.json`. */
+      type: 'dagRevisionProposed';
+      revision: number;
+      baseRevision: number;
+      sha256: string;
+      patchSha256: string;
+      botsSha256?: string;
+      summary: string;
+      note?: string;
+      by: string;
+      auto?: V3AutoProvenance;
+      reasons: V3RevisionConfirmReason[];
+      /** Existing nodes the proposal touches; they are not dispatched while
+       *  it is pending (the rest of the run keeps going). */
+      touched: string[];
+    }
+  | { type: 'dagRevisionApproved'; revision: number; by: string }
+  | {
+      type: 'dagRevisionRejected';
+      revision: number;
+      by: string;
+      /** `stale` = the flow moved on (another revision took effect, or the
+       *  proposal no longer applies to the current node states);
+       *  `superseded` = a newer proposal replaced it; `runEnded` = the run
+       *  left running/blocked before anyone decided. */
+      reason: 'rejected' | 'stale' | 'superseded' | 'runEnded';
+      detail?: string;
     }
   | {
       /** Durable intent written before any handoff message is sent. */

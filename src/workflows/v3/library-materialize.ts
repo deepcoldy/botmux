@@ -32,6 +32,7 @@ import {
   serializeFrozenBotSnapshots,
 } from './bot-resolve.js';
 import { readJournal } from './journal.js';
+import { loadEffectiveV3Dag } from './dag-revision.js';
 import { materialize } from './state.js';
 import { validateSpec } from './spec.js';
 import { mintV3RunId, type RunChatBinding } from './grill-state.js';
@@ -69,6 +70,9 @@ export interface CompiledSavedWorkflowFromRun {
   sourceStatus: 'succeeded' | 'failed' | 'blocked';
   publish: boolean;
   lintWarnings: string[];
+  /** Runtime flow revisions that took effect in the source run (design
+   *  §13.8): the saved definition is the FINAL effective flow. */
+  runtimeRevisions: number;
 }
 
 /**
@@ -228,7 +232,8 @@ export function compileSavedWorkflowFromRun(
   });
   const journalPath = join(runDir, 'journal.ndjson');
   if (!existsSync(journalPath)) throw new Error('cannot save workflow: source run has not started');
-  const status = materialize(readJournal(journalPath)).runStatus;
+  const events = readJournal(journalPath);
+  const status = materialize(events).runStatus;
   if (status !== 'succeeded' && status !== 'failed' && status !== 'blocked') {
     throw new Error(`cannot save workflow: source run is not terminal (status=${status})`);
   }
@@ -236,7 +241,20 @@ export function compileSavedWorkflowFromRun(
     throw new Error(`cannot publish workflow from a ${status} run; pass allowDraft to save it as draft`);
   }
 
-  const built = buildSavedWorkflowRevisionBaseline(loaded, opts);
+  // Save what actually ran: the final effective flow (authorized DAG plus
+  // every applied runtime revision, digest-verified) and the bots it used.
+  const effective = loadEffectiveV3Dag(runDir, loaded.dag, events);
+  const source: LoadedAuthorizedV3Run = effective.revision === 1
+    ? loaded
+    : {
+        ...loaded,
+        dag: effective.dag,
+        botSnapshots: {
+          ...(loaded.botSnapshots as Record<string, unknown>),
+          ...Object.fromEntries(effective.botAdditions),
+        },
+      };
+  const built = buildSavedWorkflowRevisionBaseline(source, opts);
   const { lintWarnings } = built;
   if (lintWarnings.length > 0 && opts.acknowledgeUnsafeLiterals !== true) {
     throw new SavedWorkflowUnsafeLiteralError(lintWarnings);
@@ -247,6 +265,7 @@ export function compileSavedWorkflowFromRun(
     sourceStatus: status,
     publish: status === 'succeeded',
     lintWarnings,
+    runtimeRevisions: effective.history.applied.length,
   };
 }
 

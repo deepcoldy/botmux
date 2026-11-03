@@ -34,6 +34,13 @@ export function revisitBudgetStatus(
     if (event.type === 'nodeRevisitRequested') {
       runUsed++;
       if (event.nodeId === sourceNodeId && event.toNodeId === toNodeId) pairUsed++;
+    } else if (event.type === 'dagRevised') {
+      // A runtime `rerunNode` is a revisit of the node onto itself (design
+      // §13.4): it spends the same budget instead of opening a new one.
+      for (const nodeId of event.effects?.rerun ?? []) {
+        runUsed++;
+        if (nodeId === sourceNodeId && nodeId === toNodeId) pairUsed++;
+      }
     } else if (event.type === 'revisitBudgetGranted') {
       if (event.sourceNodeId === sourceNodeId && event.toNodeId === toNodeId) pairGranted++;
       else if (event.sourceNodeId === undefined && event.toNodeId === undefined) runGranted++;

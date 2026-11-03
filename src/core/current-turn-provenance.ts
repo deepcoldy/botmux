@@ -6,6 +6,10 @@ import {
   parseScheduledTurnId,
   scheduledTurnAuthErrorMessage,
 } from './scheduled-turn-provenance.js';
+import {
+  parseWorkflowEventTurnId,
+  type WorkflowEventTurnVerifier,
+} from './workflow-event-turn.js';
 
 interface PersistedTurnSession {
   sessionId: string;
@@ -50,6 +54,12 @@ export interface CurrentTurnProvenance {
    * a chat-top-level turn deliberately has no root.
    */
   rootMessageId?: string;
+  /**
+   * Set only for a `workflow-event:<runId>:<seq>` turn (the daemon opened it
+   * to hand THIS run's own events to its main session, design §13.1/§13.6)
+   * that the caller's run-bound verifier accepted. Never from env/argv.
+   */
+  workflowRunEvent?: { runId: string };
 }
 
 export class CurrentTurnProvenanceError extends Error {
@@ -101,6 +111,9 @@ export interface ResolveCurrentTurnProvenanceOptions {
   startPid?: number;
   /** Exact daemon-backed liveness proof for an auto-disabled one-shot. */
   isScheduledTurnLive?: (turnId: string) => boolean;
+  /** Run-bound verifier for daemon-minted workflow event turns. Without it
+   *  such a turn is refused (it has no human sender to authenticate). */
+  verifyWorkflowEventTurn?: WorkflowEventTurnVerifier;
 }
 
 /**
@@ -152,6 +165,52 @@ export function resolveCurrentTurnProvenance(
   }
 
   const replyTarget = session.currentReplyTarget;
+
+  // Daemon-minted workflow event turn (`workflow-event:<runId>:<seq>`): no
+  // human message opened it. It authenticates only through the caller's
+  // run-bound verifier; every other command refuses it.
+  const workflowEvent = parseWorkflowEventTurnId(marker.turnId);
+  if (workflowEvent) {
+    if (!options.verifyWorkflowEventTurn) {
+      throw new CurrentTurnProvenanceError(
+        `turn ${marker.turnId} 是 workflow 事件唤醒的回合，只能用于该 run 的流程命令`,
+      );
+    }
+    let eventRootMessageId: string | undefined;
+    if ((session.scope ?? 'thread') === 'thread') {
+      if (!nonEmpty(session.rootMessageId)) {
+        throw new CurrentTurnProvenanceError(`thread session ${marker.sessionId} 缺少 rootMessageId`);
+      }
+      eventRootMessageId = session.rootMessageId;
+    } else if (replyTarget && nonEmpty(replyTarget.rootMessageId)) {
+      eventRootMessageId = replyTarget.rootMessageId;
+    }
+    const verdict = options.verifyWorkflowEventTurn({
+      ...workflowEvent,
+      turnId: marker.turnId,
+      session: {
+        sessionId: marker.sessionId,
+        larkAppId: session.larkAppId,
+        chatId: session.chatId,
+        ...(eventRootMessageId ? { rootMessageId: eventRootMessageId } : {}),
+      },
+    });
+    if (!verdict.ok) {
+      throw new CurrentTurnProvenanceError(`workflow 事件回合校验失败：${verdict.reason}`);
+    }
+    return {
+      sessionId: marker.sessionId,
+      turnId: marker.turnId,
+      callerOpenId: verdict.callerOpenId,
+      larkAppId: session.larkAppId,
+      chatId: session.chatId,
+      ...(session.chatType === 'group' || session.chatType === 'p2p'
+        ? { chatType: session.chatType }
+        : {}),
+      ...(eventRootMessageId ? { rootMessageId: eventRootMessageId } : {}),
+      workflowRunEvent: { runId: workflowEvent.runId },
+    };
+  }
 
   // Daemon-initiated scheduled turn (`schedule:<taskId>:<uuid>`): no human
   // inbound message exists, so quoteTargetId/lastCallerOpenId were never set

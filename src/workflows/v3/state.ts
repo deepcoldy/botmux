@@ -99,6 +99,9 @@ export interface V3RunSnapshot {
  *                        current running attempt, that attempt's node goes
  *                        pending (gate approval kept) so the next attempt
  *                        dispatches to the new bot
+ *   dagRevised         → its effects: supersede (as nodeInstanceSuperseded,
+ *                        voided gate waits can no longer resolve), cancel
+ *                        (removed dispatched nodes), assign (reassignment)
  *   nodeHandoffPrepared / Sent / Accepted / nodeStalled
  *                      → no node-status change: an external attempt is
  *                        `running` from its nodeDispatched; phase/deadlines
@@ -151,6 +154,26 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
       // settle of the CURRENT effective instance → reflect on the node view.
       const prev = nodes.get(nodeId)!;
       nodes.set(nodeId, { ...prev, status });
+    }
+  };
+
+  /** Revisit refresh and flow-revision invalidation share one rule: the
+   *  instance is frozen, the node re-dispatches a fresh instance (gate
+   *  approval dropped), and a blocked run on that node re-opens. */
+  const supersedeInstance = (nodeId: string, instanceId: string): void => {
+    instances.set(instanceId, { status: 'superseded' });
+    // If the superseded instance was the node's live one, the node re-
+    // dispatches a fresh instance: drop effectiveInstanceId + gateCleared
+    // (constraint 6: the fresh instance must re-approve its gate) and go
+    // pending so decideNext re-dispatches.
+    if (nodes.get(nodeId)?.effectiveInstanceId === instanceId) {
+      nodes.set(nodeId, { status: 'pending' });
+    }
+    // A refresh during a blocked run re-opens scheduling (analogue of
+    // nodeRetryRequested / loopIterationGranted).
+    if (runStatus === 'blocked' && blockedNodeId === nodeId) {
+      runStatus = 'running';
+      blockedNodeId = undefined;
     }
   };
 
@@ -213,6 +236,9 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         attempts.set(e.instanceId ?? e.nodeId, e.attemptId); // constraint 3: key by instance when present
         break;
       case 'hostInputPrepared':
+        // A flow revision may supersede a host instance while its input is
+        // still being prepared; the late preparation must not revive it.
+        if (instances.get(e.instanceId)?.status === 'superseded') break;
         // Preparation reserves an attempt id but is not execution: no provider
         // call can start before hostEffectIntent. It DOES establish the
         // instance as the node's effective pending instance so a preparation
@@ -227,6 +253,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         break;
       case 'hostEffectIntent':
         if (instances.get(e.instanceId)?.status === 'cancelled') break;
+        if (instances.get(e.instanceId)?.status === 'superseded') break;
         recordInstance(e.nodeId, e.instanceId, 'running', true);
         attempts.set(e.instanceId, e.attemptId);
         break;
@@ -302,21 +329,39 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         // right after do the actual state change.  Recorded for replay /
         // dashboard "why did this node refresh".
         break;
-      case 'nodeInstanceSuperseded': {
-        instances.set(e.instanceId, { status: 'superseded' });
-        // If the superseded instance was the node's live one, the node re-
-        // dispatches a fresh instance: drop effectiveInstanceId + gateCleared
-        // (constraint 6: the fresh instance must re-approve its gate) and go
-        // pending so decideNext re-dispatches.
-        if (nodes.get(e.nodeId)?.effectiveInstanceId === e.instanceId) {
-          nodes.set(e.nodeId, { status: 'pending' });
+      case 'nodeInstanceSuperseded':
+        supersedeInstance(e.nodeId, e.instanceId);
+        break;
+      case 'dagRevised': {
+        // One journal line carries the new definition AND its invalidations
+        // (design §13.3/§13.4), so replay can never see one without the other.
+        const effects = e.effects;
+        for (const item of effects?.supersede ?? []) {
+          // A voided gate wait must never be resolved by a late card click.
+          if (item.waitId) resolvedWaitIds.add(item.waitId);
+          supersedeInstance(item.nodeId, item.instanceId);
         }
-        // A refresh during a blocked run re-opens scheduling (analogue of
-        // nodeRetryRequested / loopIterationGranted).
-        if (runStatus === 'blocked' && blockedNodeId === e.nodeId) {
-          runStatus = 'running';
-          blockedNodeId = undefined;
+        for (const item of effects?.cancel ?? []) {
+          // Removed from the flow: neutral-cancel the exact live instance /
+          // attempt; its late settle stays audit-only (cancelledCovers).
+          cancelledAttempts.set(item.instanceId ?? item.nodeId, item.attemptId);
+          if (item.instanceId) instances.set(item.instanceId, { status: 'cancelled' });
+          const prev = nodes.get(item.nodeId);
+          nodes.set(item.nodeId, {
+            status: 'cancelled',
+            ...(item.instanceId ?? prev?.effectiveInstanceId
+              ? { effectiveInstanceId: item.instanceId ?? prev?.effectiveInstanceId }
+              : {}),
+          });
+          if (runStatus === 'blocked' && blockedNodeId === item.nodeId) {
+            runStatus = 'running';
+            blockedNodeId = undefined;
+          }
         }
+        for (const item of effects?.assign ?? []) assignments.set(item.nodeId, item.to);
+        // A blocked run whose blocked node a revision replaced or removed
+        // reopens through the effects above; the revision itself never
+        // changes run status.
         break;
       }
       case 'gateDispatched':

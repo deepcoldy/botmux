@@ -80,6 +80,12 @@ import {
   type V3ErrorClass,
 } from './journal.js';
 import { materialize } from './state.js';
+import { loadEffectiveV3Dag } from './dag-revision.js';
+import {
+  reconcileV3RevisionProposals,
+  type V3RevisionCardView,
+  type V3VoidedProposal,
+} from './run-edit.js';
 import { openV3WorkerAttempts } from './attempt-ledger.js';
 import { openV3ExternalAttempts } from './external-attempt-ledger.js';
 import {
@@ -582,9 +588,23 @@ export function readV3RunChatBinding(runDir: string): RunChatBinding | undefined
   return readGrillState(runDir)?.chatBinding;
 }
 
-/** Verified DAG for recovery/display logic, with the same missing-only legacy
- * fallback as the start path. */
+/** Verified EFFECTIVE DAG (authorized DAG + applied runtime revisions) for
+ * recovery/display logic, with the same missing-only legacy fallback as the
+ * start path. A revision that fails its digest check yields undefined, like
+ * any other integrity failure here. */
 export function loadV3RunDagForRecovery(runDir: string): V3Dag | undefined {
+  const base = loadV3RunAuthorizedDag(runDir);
+  if (!base) return undefined;
+  const journalPath = join(runDir, 'journal.ndjson');
+  try {
+    return loadEffectiveV3Dag(runDir, base, existsSync(journalPath) ? readJournal(journalPath) : []).dag;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Revision-1 (authorized) DAG with the legacy grill fallback. */
+export function loadV3RunAuthorizedDag(runDir: string): V3Dag | undefined {
   const envelope = readRunEnvelope(runDir);
   if (envelope.kind === 'ok') {
     try { return loadAuthorizedV3Run(runDir).dag; } catch { return undefined; }
@@ -947,7 +967,7 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     const revisitBudget = revisitBudgetBlockedInfoFor(events, outcome.blockedNodeId);
     if (isLoop && deps.postLoopGrantCard) {
       const info = loopExhaustedInfoFor(events, outcome.blockedNodeId);
-      const loopNode = dag.nodes.find((n) => n.id === outcome.blockedNodeId);
+      const loopNode = (loadV3RunDagForRecovery(runDir) ?? dag).nodes.find((n) => n.id === outcome.blockedNodeId);
       if (loopNode && isLoopNode(loopNode)) info.maxIterations = loopNode.maxIterations;
       await deps.postLoopGrantCard(binding, info, runId);
     } else if (revisitBudget && deps.postRevisitGrantCard) {
@@ -1473,6 +1493,10 @@ export interface V3GateRunnerDeps {
   postLoopGrantCard?: (binding: RunChatBinding, info: V3LoopExhaustedInfo, runId: string) => Promise<void>;
   /** Post (or re-post) a revisit-budget-exhausted node's grant card. */
   postRevisitGrantCard?: (binding: RunChatBinding, info: V3RevisitBudgetBlockedInfo, runId: string) => Promise<void>;
+  /** Re-post a pending 「流程修改确认」card on cold attach (design §9.5). */
+  postRevisionCard?: (binding: RunChatBinding, view: V3RevisionCardView, runId: string) => Promise<void>;
+  /** Freeze confirmation cards whose proposal went void while down. */
+  freezeRevisionCards?: (binding: RunChatBinding, runId: string, voided: V3VoidedProposal[]) => Promise<void>;
   /** Notify a terminal run (optional, daemon-supplied). */
   notifyTerminal?: (binding: RunChatBinding | undefined, runId: string, outcome: V3TerminalOutcome) => Promise<void>;
   /** Best-effort observability hooks. They must never affect run semantics. */
@@ -1687,6 +1711,29 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
   }
 
   async function coldAttach(ownerLarkAppId?: string): Promise<void> {
+    // Pending flow-revision proposals: re-post like pending gates, finish a
+    // decision whose journal half was lost, void proposals of ended runs.
+    try {
+      for (const rec of reconcileV3RevisionProposals(baseDir, ownerLarkAppId)) {
+        if (rec.binding) {
+          if (rec.voided.length > 0) {
+            await deps.freezeRevisionCards?.(rec.binding, rec.runId, rec.voided).catch((err) => deps.onError?.(rec.runId, err));
+          }
+          for (const view of rec.repost) {
+            try {
+              await postOnce(rec.runId, `revision:${view.revision}`, () => deps.postRevisionCard
+                ? deps.postRevisionCard(rec.binding!, view, rec.runId)
+                : Promise.resolve());
+            } catch (err) {
+              deps.onError?.(rec.runId, err);
+            }
+          }
+        }
+        if (rec.resume) driveDetached(rec.runId);
+      }
+    } catch (err) {
+      deps.onError?.('(cold-attach revisions)', err);
+    }
     let recs: V3GateRecovery[] = [];
     try {
       recs = reconcileV3PendingGates(baseDir, ownerLarkAppId);
@@ -2041,6 +2088,11 @@ function reconcileOneRun(
           ? { hostApproval: trustedHostGate.hostApproval }
           : wait.hostApproval ? { hostApproval: wait.hostApproval } : {}),
       });
+    } else if (wait.status === 'voided') {
+      // A revision voids a wait only after its dagRevised superseded the
+      // node, so a voided wait under a still-gateWaiting node is not a lost
+      // human decision: never heal it into an approval/rejection.
+      continue;
     } else {
       // resolved wait but node still gateWaiting → journal lost gateResolved → heal.
       // nodeId from the wait file (authoritative, codex #1).

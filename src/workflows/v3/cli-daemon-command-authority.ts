@@ -22,7 +22,10 @@ import {
   type RunChatBinding,
 } from './grill-state.js';
 import { isValidRunId } from './ops-projection.js';
-import { readRunEnvelope } from './run-envelope.js';
+import { readRunEnvelope, type V3RunEnvelope } from './run-envelope.js';
+import { readJournal } from './journal.js';
+import { materialize } from './state.js';
+import type { WorkflowEventTurnVerifier } from '../../core/workflow-event-turn.js';
 
 export type V3DaemonCommandBindingSource = 'run-envelope' | 'legacy-grill' | 'legacy-unbound';
 
@@ -51,6 +54,7 @@ export interface AuthorizeV3DaemonCommandOptions {
     dataDir: string;
     envSessionId?: string;
     startPid?: number;
+    verifyWorkflowEventTurn?: WorkflowEventTurnVerifier;
   }) => CurrentTurnProvenance | null;
 }
 
@@ -220,6 +224,9 @@ export function authorizeV3DaemonCommand(
     dataDir: options.dataDir,
     ...(options.envSessionId ? { envSessionId: options.envSessionId } : {}),
     ...(options.startPid !== undefined ? { startPid: options.startPid } : {}),
+    // A turn this run's own events woke acts for the run's frozen initiator,
+    // so the owner-tuple check below applies to it unchanged (design §13.1).
+    verifyWorkflowEventTurn: workflowEventTurnVerifierFor(options.runId, options.baseDir),
   });
   const runDir = join(options.baseDir ?? defaultBaseDir(), options.runId);
   const requested = options.requestedLarkAppId;
@@ -258,5 +265,158 @@ export function authorizeV3DaemonCommand(
     larkAppId: requested ?? '',
     mode: 'standalone',
     bindingSource: target.source,
+  };
+}
+
+// ─── Runtime flow edits (design §13.1, M1) ─────────────────────────────────
+
+/** Which kind of turn proposes a runtime flow edit. */
+export type V3RunEditTurnOrigin = 'human' | 'runEvent';
+
+export interface V3RunEditCurrentTuple extends V3RunMutationCurrentTuple {
+  sessionId?: string;
+  rootMessageId?: string;
+  /** Set only by a trusted resolver (see CurrentTurnProvenance). */
+  workflowRunEvent?: { runId: string };
+}
+
+export interface V3RunEditAuthority extends V3DaemonCommandAuthority {
+  /** Authenticated human of the current turn. */
+  callerOpenId: string;
+  /** `runEvent` only for a turn this run's own events woke (PR 5b). */
+  origin: V3RunEditTurnOrigin;
+}
+
+/**
+ * Authorize `botmux workflow status|edit` for the current turn: the turn must
+ * run in the run's main session — the same app and chat, and the bound topic
+ * root (or session, for chat-scope runs). Unlike start/cancel/retry/grant the
+ * caller need NOT be the owner: anyone talking to the main bot there may ask
+ * for an edit, but whether it applies directly or waits for the initiator's
+ * confirmation is decided later from {@link V3RunEditAuthority.origin} and
+ * {@link V3RunEditAuthority.callerOpenId} (M1).
+ */
+export function authorizeV3RunEditForCurrentTuple(options: {
+  runId: string;
+  baseDir?: string;
+  current: V3RunEditCurrentTuple;
+}): V3RunEditAuthority {
+  if (!isValidRunId(options.runId)) {
+    throw new V3DaemonCommandAuthorityError(`v3 runId 非法：${options.runId}`);
+  }
+  const runDir = join(options.baseDir ?? defaultBaseDir(), options.runId);
+  const target = readTargetBinding(runDir, options.runId);
+  const binding = target.binding;
+  if (!binding) {
+    throw new V3DaemonCommandAuthorityError(
+      `run ${options.runId} 是未绑定的 standalone/legacy run，不支持运行中修改`,
+    );
+  }
+  const { current } = options;
+  if (current.workflowRunEvent && current.workflowRunEvent.runId !== options.runId) {
+    // A wake-up belongs to exactly one run; it never lends its turn to another.
+    throw new V3DaemonCommandAuthorityError(
+      `该回合由 run ${current.workflowRunEvent.runId} 的事件唤醒，不能修改 run ${options.runId}`,
+    );
+  }
+  const mismatches: string[] = [];
+  if (current.chatId !== binding.chatId) mismatches.push('chatId');
+  if (current.larkAppId !== binding.larkAppId) mismatches.push('larkAppId');
+  if (binding.rootMessageId) {
+    if (current.rootMessageId !== binding.rootMessageId) mismatches.push('rootMessageId');
+  } else if (binding.sessionId) {
+    if (current.sessionId !== binding.sessionId) mismatches.push('sessionId');
+  } else if (!nonEmpty(binding.ownerOpenId) || current.callerOpenId !== binding.ownerOpenId) {
+    // Nothing identifies a main session: only the owner's own turn qualifies.
+    mismatches.push('callerOpenId');
+  }
+  if (mismatches.length > 0) {
+    throw new V3DaemonCommandAuthorityError(
+      `当前 turn 不在 run ${options.runId} 的主会话里：${mismatches.join(', ')}`,
+    );
+  }
+  return {
+    runDir,
+    larkAppId: binding.larkAppId,
+    mode: 'chat',
+    bindingSource: target.source,
+    callerOpenId: current.callerOpenId,
+    origin: current.workflowRunEvent?.runId === options.runId ? 'runEvent' : 'human',
+  };
+}
+
+/** CLI host path: authenticate the current turn from the process-tree
+ *  marker, then apply {@link authorizeV3RunEditForCurrentTuple}. Runtime
+ *  edits are chat-only — a standalone invocation is refused. */
+export function authorizeV3RunEditCommand(
+  options: Omit<AuthorizeV3DaemonCommandOptions, 'requestedLarkAppId' | 'allowStandaloneLocal'>,
+): V3RunEditAuthority {
+  if (!isValidRunId(options.runId)) {
+    throw new V3DaemonCommandAuthorityError(`v3 runId 非法：${options.runId}`);
+  }
+  const resolveProvenance = options.resolveProvenance ?? resolveCurrentTurnProvenance;
+  const current = resolveProvenance({
+    dataDir: options.dataDir,
+    ...(options.envSessionId ? { envSessionId: options.envSessionId } : {}),
+    ...(options.startPid !== undefined ? { startPid: options.startPid } : {}),
+    verifyWorkflowEventTurn: workflowEventTurnVerifierFor(options.runId, options.baseDir),
+  });
+  if (!current) {
+    throw new V3DaemonCommandAuthorityError(
+      'workflow status/edit 只能在 run 主会话的当前 botmux turn 里使用',
+    );
+  }
+  return authorizeV3RunEditForCurrentTuple({
+    runId: options.runId,
+    ...(options.baseDir ? { baseDir: options.baseDir } : {}),
+    current: {
+      callerOpenId: current.callerOpenId,
+      chatId: current.chatId,
+      larkAppId: current.larkAppId,
+      sessionId: current.sessionId,
+      ...(current.rootMessageId ? { rootMessageId: current.rootMessageId } : {}),
+      ...(current.workflowRunEvent ? { workflowRunEvent: current.workflowRunEvent } : {}),
+    },
+  });
+}
+
+/** The run's initiator: the Gate-2 approver of an ad-hoc run, otherwise the
+ *  authenticated owner the run was bound to (saved-workflow runs). */
+export function resolveV3RunInitiator(envelope: V3RunEnvelope): string | undefined {
+  if (envelope.authorization.kind === 'gate2' && envelope.authorization.authorizedByOpenId) {
+    return envelope.authorization.authorizedByOpenId;
+  }
+  return envelope.chatBinding?.ownerOpenId;
+}
+
+/**
+ * Verify a `workflow-event:<runId>:<seq>` turn for a status/edit of `runId`:
+ * the turn must belong to this very run, run in its main session (app, chat,
+ * topic root), and name an event that exists in a run that is still active.
+ * The turn then acts for the run's initiator; the edit path records it as the
+ * main bot (origin `runEvent`).
+ */
+export function workflowEventTurnVerifierFor(runId: string, baseDir?: string): WorkflowEventTurnVerifier {
+  return ({ runId: turnRunId, eventSeq, session }) => {
+    if (turnRunId !== runId) return { ok: false, reason: `回合属于 run ${turnRunId}` };
+    const runDir = join(baseDir ?? defaultBaseDir(), runId);
+    const envelope = readRunEnvelope(runDir, runId);
+    if (envelope.kind !== 'ok' || !envelope.envelope.chatBinding) {
+      return { ok: false, reason: 'run 没有可验证的 run.json 绑定' };
+    }
+    const binding = envelope.envelope.chatBinding;
+    if (session.larkAppId !== binding.larkAppId || session.chatId !== binding.chatId) {
+      return { ok: false, reason: '会话不属于该 run 的应用/群' };
+    }
+    if (binding.rootMessageId ? session.rootMessageId !== binding.rootMessageId : binding.sessionId !== session.sessionId) {
+      return { ok: false, reason: '会话不是该 run 的主会话' };
+    }
+    const events = readJournal(join(runDir, 'journal.ndjson'));
+    if (eventSeq > events.length) return { ok: false, reason: '唤醒事件不存在' };
+    const status = materialize(events).runStatus;
+    if (status !== 'running' && status !== 'blocked') return { ok: false, reason: `run 已是 ${status}` };
+    const initiator = resolveV3RunInitiator(envelope.envelope);
+    if (!initiator) return { ok: false, reason: 'run 没有已认证的发起人' };
+    return { ok: true, callerOpenId: initiator };
   };
 }

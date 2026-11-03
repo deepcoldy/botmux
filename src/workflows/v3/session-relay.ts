@@ -17,12 +17,13 @@ import { authorizeSessionScopedIpc } from '../../core/daemon-ipc-session-auth.js
 import {
   parseWorkflowDaemonMutationBody,
 } from './daemon-ipc-body.js';
-import type { WorkflowDaemonMutation } from './daemon-ipc-client.js';
 import type { ScheduledTask } from '../../types.js';
 import {
   authorizeV3RunMutationForCurrentTuple,
   V3DaemonCommandAuthorityError,
+  workflowEventTurnVerifierFor,
 } from './cli-daemon-command-authority.js';
+import { parseWorkflowEventTurnId } from '../../core/workflow-event-turn.js';
 import { isValidRunId } from './ops-projection.js';
 import {
   authorizeScheduledTurn,
@@ -32,9 +33,12 @@ import {
 
 export const V3_SESSION_RUN_MUTATION_ROUTE_PREFIX = '/api/v3/session-runs';
 
+// `edit` is deliberately not relayed: a runtime flow edit authenticates the
+// run's MAIN session (not the owner tuple below) and is host-path only.
 export const V3_SESSION_RUN_MUTATIONS = ['start', 'cancel', 'retry', 'grant'] as const;
+export type V3SessionRunMutation = typeof V3_SESSION_RUN_MUTATIONS[number];
 
-export function isV3SessionRunMutation(value: string): value is WorkflowDaemonMutation {
+export function isV3SessionRunMutation(value: string): value is V3SessionRunMutation {
   return (V3_SESSION_RUN_MUTATIONS as readonly string[]).includes(value);
 }
 
@@ -52,6 +56,9 @@ export interface V3SessionRelaySessionView {
   /** Chat-scope fold-back turn pointer (currentReplyTarget.turnId), advanced
    * together with quoteTargetId. */
   currentReplyTargetTurnId?: string;
+  /** The session's topic root (thread scope) or current reply-target root —
+   * binds a workflow event turn to its run's main session. */
+  rootMessageId?: string;
 }
 
 export type V3SessionRelayDecision =
@@ -70,7 +77,7 @@ function nonEmpty(value: unknown): value is string {
 
 /** Mutation payload keys the relay forwards; everything else is dropped so a
  * sandboxed caller cannot smuggle fields past the shared body parser. */
-const MUTATION_BODY_KEYS: Record<WorkflowDaemonMutation, readonly string[]> = {
+const MUTATION_BODY_KEYS: Record<V3SessionRunMutation, readonly string[]> = {
   start: [],
   cancel: ['reason'],
   retry: ['nodeId'],
@@ -176,7 +183,25 @@ export function authorizeV3SessionRunMutationRequest(input: {
   // scheduled-turn-provenance). The tuple's callerOpenId is the task's
   // creator, never anything the request chooses.
   let callerOpenId: string;
-  if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
+  const workflowEvent = liveTurnId ? parseWorkflowEventTurnId(liveTurnId) : null;
+  if (liveTurnId && workflowEvent) {
+    // Daemon-minted turn for THIS run's own events (design §13.1): it acts
+    // for the run's frozen initiator, so the owner tuple below is unchanged.
+    const verdict = workflowEventTurnVerifierFor(input.runId, input.baseDir)({
+      ...workflowEvent,
+      turnId: liveTurnId,
+      session: {
+        sessionId,
+        larkAppId: current.larkAppId,
+        chatId: current.chatId,
+        ...(current.rootMessageId ? { rootMessageId: current.rootMessageId } : {}),
+      },
+    });
+    if (!verdict.ok) {
+      return { ok: false, status: 403, error: 'workflow_event_turn_unauthorized', detail: verdict.reason };
+    }
+    callerOpenId = verdict.callerOpenId;
+  } else if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
     if (!input.loadScheduledTask) {
       return {
         ok: false, status: 403, error: 'schedule_turn_unauthorized',

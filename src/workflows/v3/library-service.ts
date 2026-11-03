@@ -150,6 +150,9 @@ export type SaveTerminalRunAsWorkflowIdempotentInput =
 export interface SaveTerminalRunAsWorkflowResult extends SavedWorkflowWriteResult {
   sourceStatus: 'succeeded' | 'failed' | 'blocked';
   created: boolean;
+  /** Runtime flow revisions in the source run; the saved definition is its
+   *  final effective flow (design §13.8). */
+  runtimeRevisions: number;
 }
 
 /**
@@ -572,7 +575,7 @@ export async function saveTerminalRunAsWorkflow(
       expectedLatestRevision: input.expectedLatestRevision,
       now: input.now,
     });
-    return { ...written, sourceStatus: compiled.sourceStatus, created: false };
+    return { ...written, sourceStatus: compiled.sourceStatus, created: false, runtimeRevisions: compiled.runtimeRevisions };
   }
 
   const scope: SavedWorkflowScope = input.scope === 'global'
@@ -587,7 +590,7 @@ export async function saveTerminalRunAsWorkflow(
     publish: compiled.publish,
     now: input.now,
   });
-  return { ...written, sourceStatus: compiled.sourceStatus, created: true };
+  return { ...written, sourceStatus: compiled.sourceStatus, created: true, runtimeRevisions: compiled.runtimeRevisions };
 }
 
 /**
@@ -623,7 +626,12 @@ export async function saveTerminalRunAsWorkflowIdempotent(
     context,
     now: input.now,
   });
-  return { ...written, sourceStatus: compiled.sourceStatus, created: written.created };
+  return {
+    ...written,
+    sourceStatus: compiled.sourceStatus,
+    created: written.created,
+    runtimeRevisions: compiled.runtimeRevisions,
+  };
 }
 
 /** List the current chat's workflows plus global workflows. */

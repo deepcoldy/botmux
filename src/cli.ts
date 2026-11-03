@@ -435,7 +435,10 @@ import {
   describePluginDependencyError,
   enabledPluginDependents,
 } from './core/plugins/dependencies.js';
-import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
+import {
+  authorizeV3DaemonCommand,
+  authorizeV3RunEditCommand,
+} from './workflows/v3/cli-daemon-command-authority.js';
 import {
   findOnlineDaemon,
   listOnlineDaemons as listOnlineDaemonsIn,
@@ -7179,6 +7182,89 @@ async function cmdWorkflowStart(runId: string | undefined, rest: string[]): Prom
   console.log(`✅ v3 run "${runId}" 已交 daemon 驱动；humanGate 会在话题里弹审批卡，点了才继续。`);
 }
 
+/** `botmux workflow status <runId>` — the main bot reads the run's effective
+ *  flow revision, node states, attempts and pending proposal (design §13.1).
+ *  Same main-session turn authentication as `workflow edit`. */
+async function cmdWorkflowStatusV3(runId: string | undefined, rest: string[]): Promise<void> {
+  const { V3_RUN_STATUS_USAGE } = await import('./cli/v3-run-edit.js');
+  if (!runId) {
+    console.error(V3_RUN_STATUS_USAGE);
+    process.exit(1);
+  }
+  const { projectV3RunStatus, formatV3RunStatus } = await import('./workflows/v3/run-edit.js');
+  const { defaultBaseDir: defaultV3BaseDir } = await import('./workflows/v3/grill-state.js');
+  try {
+    authorizeV3RunEditCommand({
+      runId,
+      dataDir: resolveDataDir(),
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+    const view = projectV3RunStatus(defaultV3BaseDir(), runId);
+    console.log(rest.includes('--json') ? JSON.stringify(view, null, 2) : formatV3RunStatus(view));
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+/** `botmux workflow edit <runId> --patch-file <f|-> --base <N>` — one atomic
+ *  list of ops (design §13.2). The CLI authenticates the current turn against
+ *  the run's main session; the owning daemon decides (under the journal lock)
+ *  whether it applies directly or waits for the initiator (M1/M2). */
+async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Promise<void> {
+  const {
+    V3_RUN_EDIT_USAGE,
+    formatV3RunEditResponse,
+    parseV3RunEditCliOptions,
+    readV3RunEditPatch,
+  } = await import('./cli/v3-run-edit.js');
+  if (!runId) {
+    console.error(V3_RUN_EDIT_USAGE);
+    process.exit(1);
+  }
+  const parsed = parseV3RunEditCliOptions(rest);
+  if (!parsed.ok) {
+    console.error(`❌ ${parsed.error}`);
+    console.error(V3_RUN_EDIT_USAGE);
+    process.exit(1);
+  }
+  let response: WorkflowDaemonMutationResponse;
+  try {
+    const patch = readV3RunEditPatch(parsed.patchFile);
+    const authority = authorizeV3RunEditCommand({
+      runId,
+      dataDir: resolveDataDir(),
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+    const daemon = findDaemon(authority.larkAppId);
+    if (!daemon) {
+      console.error('❌ 没有在线 daemon；运行中修改需要拥有该 run 的 daemon 执行。');
+      process.exit(1);
+    }
+    response = await postWorkflowDaemonMutation({
+      daemon,
+      runId,
+      mutation: 'edit',
+      body: {
+        patch,
+        base: parsed.base,
+        caller: { openId: authority.callerOpenId, origin: authority.origin },
+      },
+    });
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  if (parsed.json) {
+    console.log(response.bodyRaw);
+    if (!response.ok) process.exit(1);
+    return;
+  }
+  const out = formatV3RunEditResponse(runId, response);
+  (out.exitCode === 0 ? console.log : console.error)(out.text);
+  if (out.exitCode !== 0) process.exit(out.exitCode);
+}
+
 /** `botmux workflow retry <runId> [--node <id>]` — blocked 节点重试入口（CLI 侧）。
  *  走 daemon 的 retry IPC（journal 写入留在 daemon 进程内，单写者），daemon append
  *  `nodeRetryRequested` 后以新 attempt 重驱动；已退休的 v2 `resume` 不再参与分发。 */
@@ -7720,6 +7806,9 @@ ${SEND_HELP_BODY}
   workflow cancel <runId> [--reason <text>] [--bot <larkAppId>]
                                        持久化取消 v3 run 并中断活动节点
   workflow retry|grant [...]           处理受阻节点 / loop
+  workflow status <runId> [--json]     查看运行中流程的当前版本、节点状态和待确认修改
+  workflow edit <runId> --patch-file <文件|-> --base <版本>
+                                       运行中按版本修改流程（越界修改转发起人确认）
   template migrate-v3 [id|path ...] [--all] [--commit ...]
                                        v2 定义迁移：默认 dry-run，写入需显式 owner/app/scope
   template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]
@@ -18811,6 +18900,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'retry',
     'grant',
     'cancel',
+    'edit',
   ]);
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
   const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
@@ -20097,6 +20187,16 @@ switch (command) {
     if (wfSub === 'grant') {
       // v3 exhausted-loop grant (+1 iteration).
       await cmdWorkflowGrant(process.argv[4], process.argv.slice(5));
+      break;
+    }
+    if (wfSub === 'status') {
+      // v3 runtime flow status for the main bot (design §13.1).
+      await cmdWorkflowStatusV3(process.argv[4], process.argv.slice(5));
+      break;
+    }
+    if (wfSub === 'edit') {
+      // v3 runtime flow edit (design §13.2).
+      await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
       break;
     }
     const { cmdWorkflow } = await import('./cli/workflow.js');

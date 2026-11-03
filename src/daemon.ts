@@ -773,6 +773,17 @@ import {
   requestV3LoopGrant,
 } from './workflows/v3/daemon-run.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
+import { buildV3RevisionCard } from './im/lark/v3-revision-card.js';
+import {
+  applyV3RunEdit,
+  projectV3RunStatus,
+  v3RunNeedsDriveAfterRevision,
+  recordV3RevisionCardMessage,
+  type V3RevisionCardView,
+  type V3VoidedGate,
+  type V3VoidedProposal,
+} from './workflows/v3/run-edit.js';
+import { recordWaitCardMessage } from './workflows/v3/human-gate.js';
 import { buildV3BlockedCard } from './im/lark/v3-blocked-card.js';
 import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
 import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
@@ -796,7 +807,8 @@ import {
   runV3DistillationModel,
   sweepAbandonedV3DistillationScratch,
 } from './workflows/v3/distillation-runner.js';
-import { botToSnapshot } from './workflows/v3/bot-resolve.js';
+import { botToSnapshot, resolveBotConfig } from './workflows/v3/bot-resolve.js';
+import { isV3SupportedCli } from './workflows/v3/contract.js';
 import { isValidRunId as isValidV3RunId } from './workflows/v3/ops-projection.js';
 import {
   authorizeV3SessionRunMutationRequest,
@@ -6838,12 +6850,17 @@ const v3GateRunner = createV3GateRunner({
     // codex blocker #3: never silently skip — a missing rootMessageId would
     // leave the run stuck at awaitingGate forever.  Reply in-thread when we have
     // an anchor; otherwise post to the chat directly.
-    if (binding.rootMessageId) {
-      await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
-    } else {
-      await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
-    }
+    const messageId = binding.rootMessageId
+      ? await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId)
+      : await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+    // Remember the card so a runtime flow revision can freeze it in place
+    // as 「流程已修改，本次审批作废」 (design §13.4). Delivery state only.
+    try {
+      recordWaitCardMessage(join(v3DefaultBaseDir(), runId), gate.waitId, messageId);
+    } catch { /* best effort */ }
   },
+  postRevisionCard: (binding, view, runId) => postV3RevisionCard(binding, view, runId),
+  freezeRevisionCards: (binding, runId, voided) => freezeV3RevisionArtifacts(binding, runId, [], voided),
   postBlockedCard: async (binding, info, runId) => {
     const card = buildV3BlockedCard({
       runId,
@@ -7507,6 +7524,16 @@ const cardDeps: CardHandlerDeps = {
     canResolve: (binding, operatorOpenId) =>
       binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
   },
+  v3RevisionDeps: {
+    baseDir: v3DefaultBaseDir(),
+    driveRun: (runId) => {
+      if (v3RunNeedsDriveAfterRevision(v3DefaultBaseDir(), runId)) v3GateRunner.driveDetached(runId);
+    },
+    onVoidedGates: (runId, gates) => {
+      const binding = readV3RunChatBinding(join(v3DefaultBaseDir(), runId));
+      if (binding) void freezeV3RevisionArtifacts(binding, runId, gates, []);
+    },
+  },
   v3RunSaveDeps: {
     baseDir: v3DefaultBaseDir(),
     dataDir: dirname(v3DefaultBaseDir()),
@@ -7573,6 +7600,7 @@ interface WorkflowDaemonMutationBodies {
   cancel: { reason?: string };
   retry: { nodeId?: string };
   grant: { loopId?: string };
+  edit: import('./workflows/v3/daemon-ipc-body.js').WorkflowEditMutationBody;
 }
 
 type WorkflowDaemonMutationHandler<K extends WorkflowDaemonMutation> = (
@@ -7930,6 +7958,128 @@ workflowDaemonMutationRoute('grant', async (reply, params, body, identity) => {
   v3GateRunner.driveDetached(runId);
   return reply(202, { ok: true, runId, ...outcome });
 });
+
+// v3 runtime flow edit (design §13): the CLI authenticated the caller against
+// the run's main session; this daemon owns the run, applies or proposes the
+// revision under the journal lock, and re-drives. Body: { patch, base, caller }.
+workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
+  const runId = params.runId;
+  if (!isValidV3RunId(runId)) return reply(400, { ok: false, error: 'bad_run_id' });
+  const runDir = join(v3DefaultBaseDir(), runId);
+  const binding = readV3RunChatBinding(runDir);
+  if (!binding) return reply(404, { ok: false, error: 'unknown_run_or_no_binding' });
+  if (binding.larkAppId !== identity.larkAppId) {
+    return reply(409, { ok: false, error: 'wrong_daemon', ownerLarkAppId: binding.larkAppId });
+  }
+  let outcome;
+  try {
+    outcome = applyV3RunEdit({
+      baseDir: v3DefaultBaseDir(),
+      runId,
+      patch: body.patch,
+      baseRevision: body.base,
+      caller: body.caller,
+      resolveNewBotSnapshot: (selector) => {
+        const snapshot = botToSnapshot(resolveBotConfig(selector, loadBotConfigs()));
+        if (!isV3SupportedCli(snapshot.cliId)) {
+          throw new Error(`CLI ${snapshot.cliId} is not supported by workflow nodes`);
+        }
+        return snapshot;
+      },
+    });
+  } catch (err) {
+    return reply(500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+  switch (outcome.kind) {
+    case 'applied':
+      void freezeV3RevisionArtifacts(binding, runId, outcome.voidedGates, outcome.voidedProposals);
+      if (v3RunNeedsDriveAfterRevision(v3DefaultBaseDir(), runId)) v3GateRunner.driveDetached(runId);
+      return reply(200, {
+        ok: true, kind: 'applied', runId, revision: outcome.revision, summary: outcome.summary, changes: outcome.changes,
+      });
+    case 'proposed': {
+      void freezeV3RevisionArtifacts(binding, runId, [], outcome.voidedProposals);
+      let cardPosted = true;
+      try {
+        await postV3RevisionCard(binding, outcome.view, runId);
+      } catch (err) {
+        cardPosted = false;
+        logger.warn(`[v3:${runId}] revision card failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // A proposal adds no dispatchable work: an active drive wakes on the
+      // journal change and holds the touched nodes; a suspended run stays put.
+      return reply(202, {
+        ok: true, kind: 'proposed', runId, revision: outcome.revision, summary: outcome.summary,
+        reasons: outcome.reasons, cardPosted,
+      });
+    }
+    case 'conflict': {
+      let status: unknown;
+      try { status = projectV3RunStatus(v3DefaultBaseDir(), runId); } catch { /* best effort */ }
+      return reply(409, { ok: false, error: 'revision_conflict', currentRevision: outcome.currentRevision, status });
+    }
+    case 'invalid':
+      return reply(422, { ok: false, error: 'invalid_edit', problems: outcome.problems });
+    case 'rejected':
+      return reply(outcome.reason === 'missing' ? 404 : 409, {
+        ok: false, error: outcome.reason === 'missing' ? 'unknown_run' : 'run_not_editable',
+        ...(outcome.detail ? { detail: outcome.detail } : {}),
+      });
+  }
+});
+
+/** Post the 「流程修改确认」card into the run's main topic and remember its
+ *  message id so a later void/stale can freeze it in place. */
+async function postV3RevisionCard(
+  binding: import('./workflows/v3/grill-state.js').RunChatBinding,
+  view: V3RevisionCardView,
+  runId: string,
+): Promise<void> {
+  const card = buildV3RevisionCard({ runId, view });
+  const messageId = binding.rootMessageId
+    ? await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId)
+    : await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+  try {
+    recordV3RevisionCardMessage(join(v3DefaultBaseDir(), runId), view.revision, messageId);
+  } catch { /* best effort */ }
+}
+
+/** Freeze gate cards a revision voided (「流程已修改，本次审批作废」) and
+ *  confirmation cards that went stale. Display only; never throws. */
+async function freezeV3RevisionArtifacts(
+  binding: import('./workflows/v3/grill-state.js').RunChatBinding,
+  runId: string,
+  gates: readonly V3VoidedGate[],
+  proposals: readonly V3VoidedProposal[],
+): Promise<void> {
+  for (const gate of gates) {
+    const card = buildV3GateCard({
+      runId, waitId: gate.waitId, nodeId: gate.nodeId, prompt: gate.prompt, resolution: { kind: 'voided' },
+    });
+    for (const messageId of gate.cardMessageIds) {
+      await updateMessage(binding.larkAppId, messageId, card).catch((err: unknown) => {
+        logger.warn(`[v3:${runId}] freeze voided gate card failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+  }
+  for (const proposal of proposals) {
+    if (!proposal.view) continue;
+    const card = buildV3RevisionCard({
+      runId,
+      view: proposal.view,
+      resolution: {
+        kind: 'void',
+        detail: proposal.reason === 'superseded' ? '已被新的修改替代'
+          : proposal.reason === 'runEnded' ? 'run 已结束' : '流程已先一步修改',
+      },
+    });
+    for (const messageId of proposal.cardMessageIds) {
+      await updateMessage(binding.larkAppId, messageId, card).catch((err: unknown) => {
+        logger.warn(`[v3:${runId}] freeze revision card failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+  }
+}
 
 // ─── report session relay：隔离 CLI 的 dispatch 完成回注 ──────────────────
 //
@@ -9508,6 +9658,12 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
                 ? {
                     currentReplyTargetTurnId:
                       (ds.currentReplyTarget ?? ds.session.currentReplyTarget)!.turnId,
+                  }
+                : {}),
+              ...((ds.session.rootMessageId ?? (ds.currentReplyTarget ?? ds.session.currentReplyTarget)?.rootMessageId)
+                ? {
+                    rootMessageId: ds.session.rootMessageId
+                      ?? (ds.currentReplyTarget ?? ds.session.currentReplyTarget)!.rootMessageId,
                   }
                 : {}),
             }

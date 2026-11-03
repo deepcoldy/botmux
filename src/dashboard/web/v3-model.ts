@@ -190,6 +190,8 @@ export interface V3GraphEdgeLayout {
   y2: number;
   mx: number;
   live: boolean;
+  /** Edge exists only in a pending (unconfirmed) flow revision. */
+  pending: boolean;
 }
 
 export interface V3GraphLayout {
@@ -255,6 +257,7 @@ export function buildGraphLayout(view: RunView): V3GraphLayout {
         y2,
         mx: (x1 + x2) / 2,
         live: node.status === 'running',
+        pending: node.pendingChange === 'add',
       });
     }
   }
@@ -418,3 +421,26 @@ export function buildRoundMiniDagLayout(
     edges,
   };
 }
+
+/** Graph badge for a node a runtime flow revision added / changed, or one a
+ *  pending proposal would add / remove / change (design §13.7). */
+export function nodeRevisionBadge(node: RunNodeView): string | undefined {
+  if (node.pendingChange === 'add') return '待确认 · 新增';
+  if (node.pendingChange === 'remove') return '待确认 · 删除';
+  if (node.pendingChange === 'change') return '待确认 · 修改';
+  if (node.revisionMark === 'added') return '新增';
+  if (node.revisionMark === 'changed') return '已修改';
+  return undefined;
+}
+
+export const V3_REVISION_ROLE_LABEL: Record<NonNullable<RunView['revision']>['history'][number]['by'], string> = {
+  mainBot: '主 Bot',
+  initiator: '发起人',
+  other: '其他成员',
+};
+
+export const V3_REVISION_STATE_LABEL: Record<NonNullable<RunView['revision']>['history'][number]['state'], string> = {
+  applied: '已生效',
+  pending: '待确认',
+  rejected: '未生效',
+};
