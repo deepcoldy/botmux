@@ -514,6 +514,8 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
+  topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
   messageListenerAutoClose?: boolean;
@@ -2067,7 +2069,7 @@ type DaemonToWorkerBase =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
+  | { type: 'restart'; topicEffort?: import('./utils/traex-session-effort.js').TraexTopicEffortRestart; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
       traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig | null }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
@@ -2389,6 +2391,8 @@ export type WorkerToDaemon =
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
       type: 'restart_result';
+      untouched?: true;
+      topicEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort; variant: 'standard' | 'max' };
       attemptId: string;
       status: 'succeeded' | 'failed' | 'timed_out';
       category: 'prompt_ready' | 'spawn_failed' | 'runner_exited' | 'readiness_timeout';

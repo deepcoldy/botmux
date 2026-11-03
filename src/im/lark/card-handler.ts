@@ -94,7 +94,7 @@ import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -3352,6 +3352,44 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
         } : {}),
       };
+    }
+
+    if (actionType === 'session_effort_pick' || actionType === 'session_effort_apply') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      const warning = (key: string) => ({ toast: { type: 'warning', content: t(key, undefined, loc) } });
+      if (!ds || !operatorOpenId) return warning('card.reply_actions.session_gone');
+      let requested = false;
+      const mutation = await tryWithBotTurnMutation(ds.larkAppId, 1000, () => {
+        const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
+        const control = topicReasoningControl(ds);
+        if (current !== ds || ds.session.status !== 'active' || value.lark_app_id !== ds.larkAppId
+          || value.chat_id !== ds.chatId || rootId !== sessionAnchorId(ds)
+          || value.worker_generation !== String(ds.workerGeneration ?? 0) || value.cli_generation !== String(ds.cliReadyGeneration ?? 0)
+          || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId) || !control
+          || value.expected_model !== control.model
+          || value.expected_effort !== (ds.session.topicReasoningEffort?.effort ?? '')
+          || value.expected_effort_model !== (ds.session.topicReasoningEffort?.model ?? '')) return 'stale' as const;
+        if (actionType === 'session_effort_pick') return setTopicReasoningEffort(ds, action?.option);
+        const selected = ds.session.topicReasoningEffort;
+        if (!selected || value.effort !== selected.effort || !control.choices.includes(selected.effort)) return 'invalid' as const;
+        if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds)) return 'busy' as const;
+        if (!ds.session.cliSessionId) return 'unsupported' as const;
+        const result = requestSessionRestart(ds, {
+          source: 'card',
+          notify: async status => { await sessionReply(rootId, t(`card.topic_effort.restart_${status}`, undefined, loc)); },
+        }, { topicEffort: { model: control.model, effort: selected.effort, nativeSessionId: ds.session.cliSessionId } });
+        requested = !!result && !result.startFailure && !result.joined;
+        return requested ? 'saved' as const : 'busy' as const;
+      });
+      if (!mutation.acquired) return warning('card.effort.busy');
+      if (mutation.value !== 'saved') return warning(mutation.value === 'stale' ? 'card.topic_effort.stale' : `card.effort.${mutation.value}`);
+      if (requested) return { toast: { type: 'info', content: t('card.topic_effort.restart_in_progress', undefined, loc) } };
+      const models = await sessionModelChoices(ds);
+      if (getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) !== ds
+        || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) return warning('card.topic_effort.stale');
+      return { toast: { type: 'success', content: t('card.topic_effort.saved', undefined, loc) },
+        card: { type: 'raw' as const, data: JSON.parse(buildSessionModelPickerCard(ds, rootId, models,
+          ds.activeModel ?? ds.session.model, loc, 'session_model_pick')) } };
     }
 
     if (actionType === 'set_reasoning_effort') {

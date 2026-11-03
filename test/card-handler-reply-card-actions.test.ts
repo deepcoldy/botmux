@@ -67,6 +67,10 @@ vi.mock('../src/services/session-store.js', () => ({
 
 const readableTerminalUrlMock = vi.fn(() => 'https://example.com/term');
 const liveReadableTerminalUrlMock = vi.fn(() => 'https://example.com/term');
+const topicReasoningControlMock = vi.fn((..._a: any[]) => undefined as any);
+const setTopicReasoningEffortMock = vi.fn((..._a: any[]) => 'saved');
+const isSessionRestartInFlightMock = vi.fn((..._a: any[]) => false);
+const requestSessionRestartMock = vi.fn((..._a: any[]) => ({ attemptId: 'topic-restart', joined: false }));
 const isSessionTransferringMock = vi.fn(() => false);
 const sessionAcceptsDirectCommandMock = vi.fn(() => true);
 const closeSessionMock = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false }));
@@ -74,6 +78,9 @@ const deliverWriteLinkCardMock = vi.fn();
 const deliverEphemeralOrReplyMock = vi.fn(async (_ds: any, _who: string, card: string) => card);
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  topicReasoningControl: (...a: any[]) => topicReasoningControlMock(...a),
+  setTopicReasoningEffort: (...a: any[]) => setTopicReasoningEffortMock(...a),
+  isSessionRestartInFlight: (...a: any[]) => isSessionRestartInFlightMock(...a),
   setSessionReasoningEffort: vi.fn(),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
@@ -94,7 +101,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   deliverWriteLinkCard: (...args: any[]) => deliverWriteLinkCardMock(...args),
   deliverEphemeralOrReply: (...args: any[]) => deliverEphemeralOrReplyMock(...args),
   CARD_POSTING_SENTINEL: '__posting__',
-  requestSessionRestart: vi.fn(),
+  requestSessionRestart: (...a: any[]) => requestSessionRestartMock(...a),
   isSessionTransferring: (...args: any[]) => isSessionTransferringMock(...args),
   sessionAcceptsDirectCommand: (...args: any[]) => sessionAcceptsDirectCommandMock(...args),
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
@@ -256,6 +263,11 @@ function enableMenu(cliId = 'claude-code') {
 }
 
 beforeEach(() => {
+  topicReasoningControlMock.mockReset().mockReturnValue(undefined);
+  setTopicReasoningEffortMock.mockReset().mockReturnValue('saved');
+  isSessionRestartInFlightMock.mockReset().mockReturnValue(false);
+  requestSessionRestartMock.mockClear();
+
   vi.mocked(canOperate).mockReset().mockReturnValue(true);
   vi.mocked(getBot).mockReset().mockReturnValue({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
@@ -835,6 +847,66 @@ describe('/models bot defaults at top level', () => {
     const result = await handleCardAction(defaultPick(), depsWith(ds), LARK_APP_ID);
     expect(result.toast.type).toBe('error');
     expect(ds.session.model).toBe('session-model');
+  });
+});
+
+describe('/models topic reasoning effort', () => {
+  function setup() {
+    const ds = makeDs({ activeModel: 'sonnet', activeReasoningEffort: 'high', sessionOverrides: { cliId: 'traex', cliSessionId: 'native-topic' } });
+    topicReasoningControlMock.mockImplementation(() => ({ model: 'sonnet', choices: ['low', 'medium', 'high'],
+      selected: ds.session.topicReasoningEffort?.effort ?? 'high', active: 'high',
+      pending: !!ds.session.topicReasoningEffort && ds.session.topicReasoningEffort.effort !== 'high' }));
+    setTopicReasoningEffortMock.mockImplementation((_ds: any, effort: any) => {
+      ds.session.topicReasoningEffort = { model: 'sonnet', effort }; return 'saved';
+    });
+    return ds;
+  }
+  async function panel(ds: DaemonSession) {
+    const deps = depsWith(ds);
+    await handleCommand('/models', ROOT, { messageId: 'om_topic_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    return JSON.parse(deliverEphemeralOrReplyMock.mock.calls.at(-1)![2]);
+  }
+  function action(value: any, option?: string) {
+    return { operator: { open_id: OWNER }, action: { value, ...(option ? { option } : {}) }, context: { open_message_id: 'om_topic_panel' } };
+  }
+  it('renders effort choices in a topic and saves its preference without restarting or changing bot defaults', async () => {
+    const ds = setup(); const card = await panel(ds);
+    const effort = card.elements.filter((e: any) => e.tag === 'action')[1].actions[0];
+    expect(effort.value).toMatchObject({ action: 'session_effort_pick', session_id: SID, expected_model: 'sonnet' });
+    expect(effort.options.map((o: any) => o.value)).toEqual(['low', 'medium', 'high']);
+    const result = await handleCardAction(action(effort.value, 'low'), depsWith(ds), LARK_APP_ID);
+    expect(setTopicReasoningEffortMock).toHaveBeenCalledWith(ds, 'low');
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(result.card.data.elements.some((e: any) => e.tag === 'action' && e.actions.some((a: any) => a.value?.action === 'session_effort_apply'))).toBe(true);
+  });
+  it('only applies the saved effort after the explicit reload button', async () => {
+    const ds = setup(); ds.session.topicReasoningEffort = { model: 'sonnet', effort: 'low' };
+    const card = await panel(ds); const button = card.elements.find((e: any) => e.tag === 'action' && e.actions[0].value?.action === 'session_effort_apply').actions[0];
+    const result = await handleCardAction(action(button.value), depsWith(ds), LARK_APP_ID);
+    expect(requestSessionRestartMock).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }), {
+      topicEffort: { model: 'sonnet', effort: 'low', nativeSessionId: 'native-topic' },
+    });
+    expect(result.toast.type).toBe('info');
+  });
+  it.each(['model', 'chat', 'worker-generation', 'cli-generation', 'preference', 'permission'])('rejects a stale topic effort card: %s', async kind => {
+    const ds = setup(); const card = await panel(ds); const value = card.elements.filter((e: any) => e.tag === 'action')[1].actions[0].value;
+    if (kind === 'model') topicReasoningControlMock.mockReturnValue({ model: 'other-model', choices: ['low'] });
+    if (kind === 'chat') value.chat_id = 'other-chat';
+    if (kind === 'worker-generation') ds.workerGeneration = 2;
+    if (kind === 'cli-generation') ds.cliReadyGeneration = 2;
+    if (kind === 'preference') ds.session.topicReasoningEffort = { model: 'sonnet', effort: 'medium' };
+    if (kind === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    await handleCardAction(action(value, 'low'), depsWith(ds), LARK_APP_ID);
+    expect(setTopicReasoningEffortMock).not.toHaveBeenCalled();
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
+  });
+  it('does not reload while business input owns the session', async () => {
+    const ds = setup(); ds.session.topicReasoningEffort = { model: 'sonnet', effort: 'low' };
+    const card = await panel(ds); const button = card.elements.find((e: any) => e.tag === 'action' && e.actions[0].value?.action === 'session_effort_apply').actions[0];
+    sessionAcceptsDirectCommandMock.mockReturnValue(false);
+    await handleCardAction(action(button.value), depsWith(ds), LARK_APP_ID);
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
   });
 });
 

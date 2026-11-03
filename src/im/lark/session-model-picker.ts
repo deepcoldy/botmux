@@ -11,7 +11,7 @@ import { selectionKeyForBot } from '../../setup/cli-selection.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import { canOperate } from './event-dispatcher.js';
-import { deliverEphemeralOrReply, isSessionTransferring } from '../../core/worker-pool.js';
+import { deliverEphemeralOrReply, isSessionTransferring, topicReasoningControl } from '../../core/worker-pool.js';
 
 function sessionCliId(ds: DaemonSession) {
   return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
@@ -70,6 +70,31 @@ export function buildSessionModelPickerCard(
   // Only render slugs the inject path would accept: a live-detected catalogue
   // entry with exotic characters must not render into a dead option.
   const safeModels = models.filter(model => MODEL_SLUG_PATTERN.test(model));
+  const effort = action === 'session_model_pick' ? topicReasoningControl(ds) : undefined;
+  const effortBinding = {
+    session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId,
+    expected_model: currentModel ?? '',
+    expected_effort: ds.session.topicReasoningEffort?.effort ?? '',
+    expected_effort_model: ds.session.topicReasoningEffort?.model ?? '',
+    worker_generation: String(ds.workerGeneration ?? 0), cli_generation: String(ds.cliReadyGeneration ?? 0),
+  };
+  const effortElements = effort && effort.choices.length ? [
+    { tag: 'div', text: { tag: 'plain_text', content: t('card.topic_effort.title', undefined, loc) } },
+    { tag: 'action', actions: [{ tag: 'select_static',
+      placeholder: { tag: 'plain_text', content: effort.selected ?? t('card.topic_effort.title', undefined, loc) },
+      ...(effort.selected && effort.choices.includes(effort.selected) ? { initial_option: effort.selected } : {}),
+      options: effort.choices.map(level => ({ text: { tag: 'plain_text', content: level }, value: level })),
+      value: { action: 'session_effort_pick', ...effortBinding },
+    }] },
+    { tag: 'div', text: { tag: 'plain_text', content: t('card.topic_effort.state', { active: effort.active ?? '—', selected: effort.selected ?? '—' }, loc) } },
+    ...(effort.pending ? [
+      { tag: 'div', text: { tag: 'plain_text', content: t('card.topic_effort.reload_note', undefined, loc) } },
+      { tag: 'action', actions: [{ tag: 'button', type: 'primary',
+        text: { tag: 'plain_text', content: t('card.topic_effort.apply', undefined, loc) },
+        value: { action: 'session_effort_apply', effort: effort.selected, ...effortBinding },
+      }] },
+    ] : []),
+  ] : [];
   return JSON.stringify({
     config: { wide_screen_mode: true },
     elements: [
@@ -92,6 +117,7 @@ export function buildSessionModelPickerCard(
           value: { action, session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId },
         }],
       },
+      ...effortElements,
     ],
   });
 }
