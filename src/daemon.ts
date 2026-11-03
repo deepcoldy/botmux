@@ -53,6 +53,7 @@ import {
   readGlobalConfig,
   repoPickerScanOptions,
   isMultiTopicOrchestrationEnabled,
+  isDispatchTaskTreeCardEnabled,
   isWorkflowFeatureEnabled,
   SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
 } from './global-config.js';
@@ -4651,6 +4652,11 @@ async function syncDispatchTaskTreeAfterReport(input: {
   target: { larkAppId: string; sessionId: string };
 }): Promise<void> {
   const warn = (error: unknown) => logger.warn(`[task-tree] refresh after report failed: ${error instanceof Error ? error.message : String(error)}`);
+  // Default-off feature gate (3.2(c)): when the machine-wide task-tree card is
+  // off, this is exactly the pre-card path — no lastReport write into the
+  // dispatch registry and no orchestrator refresh. Same-machine bots share one
+  // ~/.botmux/config.json, so this equals the orchestrator's setting.
+  if (!isDispatchTaskTreeCardEnabled()) return;
   try {
     let orchSessionId: string | undefined;
     await updateDispatchRegistry(join(config.session.dataDir, 'orchestrate-dispatch.json'), registry => {

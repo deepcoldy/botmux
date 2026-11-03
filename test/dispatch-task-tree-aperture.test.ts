@@ -12,7 +12,7 @@
 // outer 401), and a live capability reaches the handler body (200). The
 // daemon-to-daemon refresh route stays behind the host HMAC (401).
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -43,6 +43,7 @@ async function post(path: string, body: Record<string, unknown>): Promise<Respon
 
 beforeEach(async () => {
   tempDir = mkdtempSync(join(tmpdir(), 'dispatch-tree-aperture-'));
+  delete process.env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
   process.env.SESSION_DATA_DIR = tempDir;
   activeSessions.clear();
   activeSessions.set(SESSION_ID, {
@@ -63,6 +64,7 @@ afterEach(async () => {
   setActiveSessionsRegistry(undefined);
   setIpcAuthSecret(null);
   delete process.env.SESSION_DATA_DIR;
+  delete process.env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
   rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -89,14 +91,43 @@ describe('dispatch-tree IPC aperture', () => {
     }
   });
 
-  it('the live per-turn capability reaches the handler body (200, not the outer 401)', async () => {
+  it('the live per-turn capability reaches the handler body when the card switch is on (200, not outer 401)', async () => {
+    process.env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED = 'true';
+    try {
+      const res = await post(`/api/sessions/${SESSION_ID}/dispatch-tree`, {
+        sessionId: SESSION_ID,
+        originCapability: CAP,
+        originTurnId: TURN_ID,
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, enabled: true, posted: false, nodes: 0 });
+    } finally {
+      delete process.env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
+    }
+  });
+
+  it('default-off: live capability gets enabled:false + hint and writes no card record and no kind label', async () => {
+    const registryPath = join(tempDir, 'orchestrate-dispatch.json');
+    writeFileSync(registryPath, JSON.stringify({
+      om_root: { orchSessionId: SESSION_ID, targetChatId: 'oc_x', targetAppIds: [APP_ID], title: 't', status: 'accepted', createdAt: '1' },
+    }));
+    const cardRecordPath = join(tempDir, 'dispatch-task-tree-cards.json');
     const res = await post(`/api/sessions/${SESSION_ID}/dispatch-tree`, {
       sessionId: SESSION_ID,
       originCapability: CAP,
       originTurnId: TURN_ID,
+      dispatchRoot: 'om_root',
+      kind: 'review',
     });
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ ok: true, posted: false, nodes: 0 });
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: true, enabled: false, posted: false, nodes: 0 });
+    expect(typeof body.hint).toBe('string');
+    expect(body.hint).toContain('任务树卡片');
+    // No card record file and the kind label was not persisted.
+    expect(existsSync(cardRecordPath)).toBe(false);
+    const entry = JSON.parse(readFileSync(registryPath, 'utf8')).om_root as Record<string, unknown>;
+    expect(entry.kind).toBeUndefined();
   });
 
   it('the daemon refresh route without the host secret stays at the outer 401', async () => {

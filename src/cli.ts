@@ -238,7 +238,7 @@ import { DEFERRED_TOPIC_CLAIM_ROUTE, type DeferredTopicClaimResponse } from './c
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
-import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled } from './global-config.js';
+import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled, isDispatchTaskTreeCardEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
   DASHBOARD_READY_WAIT_MS,
@@ -14657,7 +14657,7 @@ async function trySyncDispatchTaskTree(input: {
   taskId?: string;
   taskUrl?: string;
   originClaim?: ManagedOriginCapabilityClaim | null;
-}): Promise<{ ok: boolean; text?: string; messageId?: string | null; error?: string }> {
+}): Promise<{ ok: boolean; enabled?: boolean; hint?: string; text?: string; messageId?: string | null; error?: string }> {
   try {
     const response = await postCurrentSessionDaemonRoute({
       path: `/api/sessions/${encodeURIComponent(input.sessionId)}/dispatch-tree`,
@@ -14671,8 +14671,19 @@ async function trySyncDispatchTaskTree(input: {
       },
       ...(input.originClaim !== undefined ? { originClaim: input.originClaim } : {}),
     });
-    const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; text?: string; messageId?: string | null };
-    if (response.ok && body.ok) return { ok: true, ...(body.text !== undefined ? { text: body.text } : {}), messageId: body.messageId ?? null };
+    const body = await response.json().catch(() => ({})) as {
+      ok?: boolean; enabled?: boolean; hint?: string;
+      error?: string; text?: string; messageId?: string | null;
+    };
+    if (response.ok && body.ok) {
+      return {
+        ok: true,
+        ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+        ...(body.hint ? { hint: body.hint } : {}),
+        ...(body.text !== undefined ? { text: body.text } : {}),
+        messageId: body.messageId ?? null,
+      };
+    }
     return { ok: false, error: body.error ?? `HTTP ${response.status}` };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -14681,6 +14692,10 @@ async function trySyncDispatchTaskTree(input: {
 
 /** Best effort after a dispatch: the task tree is a view, never a reason to fail it. */
 async function syncDispatchTaskTreeAfterDispatch(input: Parameters<typeof trySyncDispatchTaskTree>[0]): Promise<void> {
+  // Default-off: skip even the local best-effort IPC so a disabled feature
+  // adds no dispatch-time call at all (the daemon gate is authoritative; this
+  // runs host-side or in a pane with the spawn-time env value).
+  if (!isDispatchTaskTreeCardEnabled()) return;
   const result = await trySyncDispatchTaskTree(input);
   if (!result.ok) console.error(`⚠️  子任务已派发，但任务树卡片更新失败: ${result.error}`);
 }
@@ -14693,7 +14708,8 @@ async function cmdDispatchTree(rest: string[]): Promise<void> {
   botmux dispatch tree [--task-id <需求id>] [--task-url <需求链接>] [--session-id <id>]
 
 说明:
-  首次 dispatch 后卡片会自动发到本会话所在话题，子话题接手、回报、完成、失败时原地更新；
+  任务树卡片默认关闭，先在 Dashboard「全局设置 → 多话题编排 → 任务树卡片」开启。
+  开启后首次 dispatch 卡片会自动发到本会话所在话题，子话题接手、回报、完成、失败时原地更新；
   这个命令只用于手动刷新。--task-id / --task-url 会记到卡片头部（之后的刷新沿用）。`);
     return;
   }
@@ -14735,6 +14751,13 @@ async function cmdDispatchTree(rest: string[]): Promise<void> {
   if (!result.ok) {
     console.error(`任务树刷新失败: ${result.error}`);
     process.exit(1);
+  }
+  // Default-off: the daemon (the only side that can read the host config in a
+  // sandbox) tells the CLI what to say; exit 0 so orchestration scripts that
+  // call this for a refresh do not treat "feature off" as a failure.
+  if (result.enabled === false) {
+    console.log(result.hint ?? '任务树卡片当前未开启。');
+    return;
   }
   console.log(result.text ?? '');
   console.log(result.messageId ? `\n卡片: ${result.messageId}` : '\n还没有派发记录，没有发卡片。');
@@ -14986,6 +15009,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const dispatchOriginClaim = freezeDispatchOriginClaim(sid);
   // Taken before anything is sent: a child's report from this attempt is never older.
   const dispatchAttemptStartedAt = new Date().toISOString();
+  // attemptAt only feeds the task-tree card (reportIsCurrent). With the card
+  // off (the default) skip writing it so dispatch registry entries stay
+  // byte-identical to the pre-card build. These persist sites run on the host
+  // re-exec (sandboxed --bot-app / credential-only dispatch is re-launched by
+  // the watcher before reaching them), where the global config is readable.
+  const taskTreeAttemptStartedAt = isDispatchTaskTreeCardEnabled()
+    ? dispatchAttemptStartedAt
+    : undefined;
   const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
@@ -15331,7 +15362,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       const receiptState = await persistDispatchLifecycle({
         dispatchRoot: intoRoot,
         sourceSessionId: sid,
-        attemptStartedAt: dispatchAttemptStartedAt,
+        attemptStartedAt: taskTreeAttemptStartedAt,
         status: lifecycleStatus,
         transportState: 'dispatched',
         acceptanceState,
@@ -15469,7 +15500,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const receiptState = await persistDispatchLifecycle({
       dispatchRoot: seedId,
       sourceSessionId: sid,
-      attemptStartedAt: dispatchAttemptStartedAt,
+      attemptStartedAt: taskTreeAttemptStartedAt,
       status: lifecycleStatus,
       transportState: 'dispatched',
       acceptanceState,
@@ -15539,7 +15570,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       receiptState = await persistDispatchLifecycle({
         dispatchRoot: dispatchRootForLifecycle,
         sourceSessionId: sid,
-        attemptStartedAt: dispatchAttemptStartedAt,
+        attemptStartedAt: taskTreeAttemptStartedAt,
         status: 'failed',
         transportState: 'failed',
         acceptanceState: 'failed',
