@@ -963,8 +963,12 @@ export function readSessionsByRoots(
   load();
   for (const session of sessions.values()) {
     if (session.rootMessageId && rootSet.has(session.rootMessageId) && !seen.has(session.sessionId)) {
+      // readOwnStoreAllRows only JSON.parses rows (no column backfill), so a
+      // live row missing the copy must inherit this process's own app id. This
+      // branch wins the dedup, so without it it would mask the corrected disk
+      // value. Project a copy: a read API must not mutate the live registry row.
       seen.add(session.sessionId);
-      out.push(session);
+      out.push(session.larkAppId ? session : { ...session, larkAppId: currentAppId });
     }
   }
   let refs: StoreFileRef[];
@@ -995,6 +999,14 @@ export function readSessionsByRoots(
           const session = JSON.parse(r.row) as Session;
           if (session && typeof session === 'object' && typeof session.sessionId === 'string'
             && !seen.has(session.sessionId)) {
+            // Backfill the owning bot from the store directory, exactly like
+            // loadAllSessionsSnapshot's readInto: rows written before the
+            // column copy existed omit larkAppId, and the task tree matches
+            // child sessions by it (a missing value drops a cross-bot closed
+            // child back to dispatched/running). No repairMissingChatScope
+            // here: it only repairs chat-scope rows (rootMessageId === chatId),
+            // these are always thread rows, and the task tree never reads scope.
+            if (!session.larkAppId) session.larkAppId = ref.appId;
             seen.add(session.sessionId);
             out.push(session);
           }

@@ -139,6 +139,20 @@ describe('task-tree card service', () => {
     expect(s.posts).toEqual(['om_card_1']);
   });
 
+  it('narrows the session lookup to this orchestrator\'s own dispatch roots', async () => {
+    const s = setup({
+      om_a: { orchSessionId: 'orch', targetAppIds: ['cli_local'], title: 'A', status: 'accepted', createdAt: '1' },
+      om_other: { orchSessionId: 'someone-else', targetAppIds: ['cli_local'], title: 'B', status: 'accepted', createdAt: '2' },
+    });
+    const queried: string[] = [];
+    const cards = createDispatchTaskTreeCards({
+      ...s.deps,
+      listSessions: (roots: ReadonlySet<string>) => { queried.push(...roots); return []; },
+    });
+    await cards.refresh(ORCH);
+    expect(queried).toEqual(['om_a']);
+  });
+
   it('reads a getter dataDir lazily on refresh, not at construction', async () => {
     const s = setup();
     let dataDir: string | undefined;

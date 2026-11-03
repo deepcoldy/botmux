@@ -239,6 +239,7 @@ import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './
 import { updateMessage } from '../im/lark/client.js';
 import { safeRequirementUrl } from './dispatch-task-tree.js';
 import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
+import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
 import { knownBotAppIds } from '../services/known-bot-app-ids.js';
 import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
@@ -3754,9 +3755,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
 
 const dispatchTaskTreeCards = createDispatchTaskTreeCards({
   dataDir: () => config.session.dataDir,
-  listSessions: roots => sessionStore.readSessionsByRoots(roots, { dataDir: config.session.dataDir }).map(s => ({
-    sessionId: s.sessionId, larkAppId: s.larkAppId, rootMessageId: s.rootMessageId, status: s.status,
-  })),
+  listSessions: roots => listDispatchTreeSessionRows(roots, config.session.dataDir),
   localAppIds: () => knownBotAppIds({ dataDir: config.session.dataDir }),
   resolveThreadId: (larkAppId, messageId) => getMessageThreadId(larkAppId, messageId),
   post: (orch, cardJson) => orch.rootMessageId
