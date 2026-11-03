@@ -1051,28 +1051,12 @@ export class SkillFeedbackStore {
   }
 }
 
-const stores = new Map<string, Promise<SkillFeedbackStore>>();
-
-export function getSkillFeedbackStore(dataDir: string): Promise<SkillFeedbackStore> {
-  let store = stores.get(dataDir);
-  if (!store) {
-    // Evict on rejection so a transient first-open failure (disk full, a
-    // concurrent cold-start lock that outlasted retries, corruption later
-    // repaired) is retried on the next call instead of poisoning the cache and
-    // silently disabling all feedback persistence for the rest of the process.
-    store = SkillFeedbackStore.open(dataDir).catch(error => {
-      if (stores.get(dataDir) === store) stores.delete(dataDir);
-      throw error;
-    });
-    stores.set(dataDir, store);
-  }
-  return store;
+export async function getSkillFeedbackStore(dataDir: string): Promise<import('./feedback-storage-types.js').FeedbackStore> {
+  const { getFeedbackStorage } = await import('./feedback-storage.js');
+  return (await getFeedbackStorage(dataDir)).store;
 }
 
 export async function __testOnly_closeSkillFeedbackStores(): Promise<void> {
-  const pending = [...stores.values()];
-  stores.clear();
-  for (const store of pending) {
-    try { (await store).close(); } catch { /* test cleanup only */ }
-  }
+  const { closeAllFeedbackStorage } = await import('./feedback-storage.js');
+  await closeAllFeedbackStorage();
 }

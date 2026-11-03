@@ -13765,7 +13765,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       try {
         const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
         const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
-        feedbackStore.recordTurnDelivery({
+        await feedbackStore.recordTurnDelivery({
           botAppId: appId,
           sessionId: sid,
           turnId: deliveryTurnId,

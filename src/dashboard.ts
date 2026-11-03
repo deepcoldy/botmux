@@ -130,7 +130,7 @@ import {
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
-import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
+import { getFeedbackStorage, closeFeedbackStorage } from './services/feedback-storage.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
@@ -4042,10 +4042,6 @@ const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
     logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
   },
 });
-let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
-function analyticsService(): FeedbackAnalyticsService {
-  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
-}
 
 const companionApi = (() => {
   try {
@@ -4609,7 +4605,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
-      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
       return;
     }
 
@@ -8436,7 +8432,7 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
 }
 
 // Graceful shutdown
-function shutdown(): void {
+async function shutdown(): Promise<void> {
   codexNotifierAbort.abort();
   stopAutoCleanup();
   for (const sub of subs.values()) sub.off();
@@ -8445,7 +8441,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   hostTerminalManager.shutdown();
-  feedbackAnalyticsService?.close();
+  await closeFeedbackStorage(config.session.dataDir);
   setDurableConfigCoordinator(undefined);
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => {

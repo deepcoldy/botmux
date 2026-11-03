@@ -1,6 +1,6 @@
 import type { DaemonSession } from './types.js';
 import type { FeedbackWebhookDestination } from '../services/feedback-outbox.js';
-import type { SkillFeedbackStore } from '../services/skill-feedback-store.js';
+import type { CompatibleFeedbackStore } from '../services/feedback-storage-types.js';
 
 /**
  * Daemon-side half of `botmux send --response-kind final` for a CLI that
@@ -36,13 +36,13 @@ export type RelayedTurnDeliveryResult =
   | { ok: true; deliveryId: string; duplicate: boolean }
   | { ok: false; status: 400 | 404 | 409; error: string };
 
-export function recordRelayedTurnDelivery(input: {
+export async function recordRelayedTurnDelivery(input: {
   ds: Pick<DaemonSession, 'session' | 'larkAppId' | 'chatId' | 'cliVersion' | 'managedTurnOrigin'> | undefined;
   body: Record<string, unknown>;
-  store: Pick<SkillFeedbackStore, 'findDeliveryByPlatformMessage' | 'recordTurnDelivery'>;
+  store: Pick<CompatibleFeedbackStore, 'findDeliveryByPlatformMessage' | 'recordTurnDelivery'>;
   webhookDestinations?: FeedbackWebhookDestination[];
   teamId?: string;
-}): RelayedTurnDeliveryResult {
+}): Promise<RelayedTurnDeliveryResult> {
   const { ds, body, store } = input;
   if (!ds || ds.session.status === 'closed') return { ok: false, status: 404, error: 'session_not_active' };
   const messageId = body.messageId;
@@ -58,13 +58,13 @@ export function recordRelayedTurnDelivery(input: {
   if (body.expectedTurnId !== undefined && body.expectedTurnId !== turnId) {
     return { ok: false, status: 409, error: 'turn_mismatch' };
   }
-  const existing = store.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId);
+  const existing = await store.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId);
   if (existing) {
     return existing.sessionId === ds.session.sessionId && existing.turnId === turnId
       ? { ok: true, deliveryId: existing.deliveryId, duplicate: true }
       : { ok: false, status: 409, error: 'message_already_recorded' };
   }
-  const delivery = store.recordTurnDelivery({
+  const delivery = await store.recordTurnDelivery({
     botAppId: ds.larkAppId,
     sessionId: ds.session.sessionId,
     turnId,

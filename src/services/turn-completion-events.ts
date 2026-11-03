@@ -2,9 +2,9 @@ import type { WorkerToDaemon } from '../types.js';
 import type { Session } from '../types.js';
 import {
   getSkillFeedbackStore,
-  type SkillFeedbackStore,
   type TurnCompletionEventPayload,
 } from './skill-feedback-store.js';
+import type { CompatibleFeedbackStore } from './feedback-storage-types.js';
 
 /** The terminal facts the persistence layer needs. Timing is carried end-to-end
  *  (worker → daemon → queue → store) so `completed_at` is the turn's REAL
@@ -39,7 +39,7 @@ export async function persistTurnTerminal(input: {
   botAppId: string;
   session: Pick<Session, 'sessionId'>;
   terminal: PersistedTurnTerminal;
-  store?: SkillFeedbackStore;
+  store?: CompatibleFeedbackStore;
 }): Promise<TurnCompletionEventPayload | undefined> {
   const store = input.store ?? await getSkillFeedbackStore(input.dataDir);
   return store.recordTurnTerminal({
@@ -92,6 +92,11 @@ const pending = new Map<string, PendingItem>();
 // stopped yet and onTurnTerminal could enqueue AFTER the snapshot, so the drain
 // could report 0 while a just-enqueued terminal is silently skipped.
 let admissionClosed = false;
+let failedPersistence = 0;
+
+export function getTurnTerminalPersistenceHealth(): { pending: number; failed: number; admissionClosed: boolean } {
+  return { pending: pending.size, failed: failedPersistence, admissionClosed };
+}
 
 function dedupeKey(i: EnqueueTurnTerminalInput): string {
   return `${i.botAppId}|${i.sessionId}|${i.terminal.turnId}|${i.terminal.dispatchAttempt ?? 0}`;
@@ -117,6 +122,7 @@ export function enqueueTurnTerminal(input: EnqueueTurnTerminalInput): Promise<vo
   const existing = pending.get(key);
   if (existing) {
     if (existing.input.terminal.status !== input.terminal.status) {
+      failedPersistence += 1;
       input.onError?.(new Error(
         `turn_terminal_status_conflict_enqueue:${input.terminal.turnId.slice(0, 12)}:`
         + `${existing.input.terminal.status}!=${input.terminal.status}`,
@@ -125,6 +131,7 @@ export function enqueueTurnTerminal(input: EnqueueTurnTerminalInput): Promise<vo
     return existing.promise;
   }
   if (admissionClosed) {
+    failedPersistence += 1;
     input.onError?.(new Error(`turn_terminal_persist_refused_shutdown:${input.terminal.turnId.slice(0, 12)}`));
     return Promise.resolve();
   }
@@ -159,7 +166,7 @@ async function attempt(key: string): Promise<void> {
   item.attempts += 1;
   try {
     const store = await getSkillFeedbackStore(input.dataDir);
-    const result = store.tryRecordTurnTerminal({
+    const result = await store.tryRecordTurnTerminal({
       botAppId: input.botAppId,
       sessionId: input.sessionId,
       turnId: input.terminal.turnId,
@@ -170,6 +177,7 @@ async function attempt(key: string): Promise<void> {
     if (result.done) { finish(key); return; }
     // Write lock busy: reschedule with capped backoff, yielding the loop.
     if (item.attempts >= maxAttempts) {
+      failedPersistence += 1;
       input.onError?.(new Error(`turn_terminal_persist_gave_up:${input.terminal.turnId.slice(0, 12)}:busy_after_${item.attempts}`));
       finish(key);
       return;
@@ -183,6 +191,7 @@ async function attempt(key: string): Promise<void> {
     // bounds; only a provably permanent error (schema newer, status conflict,
     // corruption) or exhausting the bound gives up.
     if (isPermanentPersistError(error) || item.attempts >= maxAttempts) {
+      failedPersistence += 1;
       input.onError?.(error);
       finish(key);
       return;
@@ -254,4 +263,5 @@ export function __testOnly_pendingTurnTerminalCount(): number {
 /** Test-only: reopen admission (drain closes it for the process otherwise). */
 export function __testOnly_reopenTurnTerminalAdmission(): void {
   admissionClosed = false;
+  failedPersistence = 0;
 }

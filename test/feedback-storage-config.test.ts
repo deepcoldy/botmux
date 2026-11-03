@@ -8,6 +8,7 @@ import {
   putFeedbackStorageSecret,
   readFeedbackStorageSecret,
 } from '../src/services/feedback-storage-config.js';
+import { closeAllFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
 
 const directories: string[] = [];
 async function directory() {
@@ -24,10 +25,24 @@ const target = {
   },
 };
 afterEach(async () => {
+  await closeAllFeedbackStorage();
   for (const path of directories.splice(0)) await rm(path, { recursive: true, force: true });
   delete process.env.BOTMUX_TEST_PG_PASSWORD;
 });
 describe('feedback storage configuration', () => {
+  it('routes writes and analytics to one store and closes stale generations', async () => {
+    const path = await directory();
+    const first = await getFeedbackStorage(path);
+    const response = await first.store.createResponse({ interactionId: 'interaction', content: 'answer' });
+    await first.store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'message' });
+    expect(await first.analytics.summary({ from: '2020-01-01', to: '2020-02-01' })).toMatchObject({ delivered: 0 });
+    const config = await readFeedbackStorageConfig(path);
+    await saveFeedbackStorageCandidate(path, config.generation, target);
+    const second = await getFeedbackStorage(path);
+    expect((await second.store.findDeliveryByPlatformMessage('lark', 'app', 'message'))?.responseId).toBe(response.responseId);
+    await expect(first.store.getResponse(response.responseId)).rejects.toThrow('feedback_storage_closed');
+    expect(second.generation).toBe(config.generation + 1);
+  });
   it('keeps one durable instance identity and defaults to SQLite', async () => {
     const path = await directory();
     const configs = await Promise.all([readFeedbackStorageConfig(path), readFeedbackStorageConfig(path)]);
