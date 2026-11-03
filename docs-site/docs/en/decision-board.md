@@ -19,7 +19,8 @@ In Feishu you can also run `/config set steward {"enabled":true,"chatId":"oc_…
 - In the steward chat each turn carries one extra system line pointing at the board and at `botmux board guide`; the rules themselves are not resident.
 - By default the steward posts in other chats **as its own bot** (`botmux send`). Target bots must accept the steward bot's messages (enable "receive messages that @ this bot from other bots" in the Feishu developer console, and grant the steward bot talk permission in botmux).
 - Anything it cannot decide, or anything irreversible, becomes a "needs decision" item with options, consequences and a recommendation.
-- Scheduled patrols are not part of this feature. Use a [scheduled task](./schedule.md) for the steward if you want one.
+- **Scheduled patrol**: tell the steward in its chat, for example, "patrol every day at 9:30", and it creates a silent [scheduled task](./schedule.md) in the steward chat. Each patrol first checks unfinished board items against reality (closing what is done), then looks at the owner's open PRs and new activity in linked chats from the last 7 days, writes what needs your decision as decision items, and reports only what is new; with nothing new it stays quiet. The rules are the "Scheduled patrol" section of `botmux board guide`; change them (for example the time window) in the custom prompt.
+- `botmux board add` with an existing dedupe key (`--key`) updates that item, but it is refused when the item is done or closed, so a patrol cannot bring old items back. Reopen with `botmux board set`.
 
 ## Adding the steward to new chats
 

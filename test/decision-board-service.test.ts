@@ -503,6 +503,25 @@ describe('事项关联群', () => {
     await cli({ action: 'set', ref: '1', fields: { stage: '在修' } });
   });
 
+  it('同 key 的 add 碰到已结束的事项时拒绝，不改它；set 照常能重开', async () => {
+    await cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1' }, noChat: '先建着' });
+    for (const state of ['done', 'closed']) {
+      await cli({ action: 'set', ref: '1', fields: { state } });
+      const err = await cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1', state: 'decide', question: '合不合？' } })
+        .catch((e: unknown) => e);
+      expect(boardErrorStatus(err)).toMatchObject({ status: 409, error: 'item_ended' });
+      expect((await cli({ action: 'show', ref: '1' })).item).toMatchObject({ state });
+      expect((await cli({ action: 'show', ref: '1' })).item.question).toBeUndefined();
+    }
+    const items = (await cli({ action: 'list' })).items;
+    expect(items).toHaveLength(1);
+    await cli({ action: 'set', ref: 'pr:o/r#1', fields: { state: 'decide' } });
+    expect((await cli({ action: 'show', ref: '1' })).item).toMatchObject({ state: 'decide' });
+    // 没结束的照旧按 set 更新。
+    expect(await cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1', stage: '在审' } }))
+      .toMatchObject({ created: false, item: { seq: 1, stage: '在审' } });
+  });
+
   it('写群前用本机 bot 核实：查到了用群名当默认标签，给了标签就用调用方的；第一个群是主群', async () => {
     const res = await cli({ action: 'add', title: 'PR #12', links: ['pr=o/r#12', 'chat=oc_task', 'chat=oc_review|PR 评审群'] });
     expect(lookups.sort()).toEqual(['oc_review', 'oc_task']);
