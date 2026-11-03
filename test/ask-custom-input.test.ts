@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { _resetForTest, applyAskForm, getAskSnapshot, registerAsk, registerHostAsk, setCanTalkChecker,
-  setCardDispatcher, setAskPersistStore, restorePersistedAsks } from '../src/core/ask-broker.js';
+  setCardDispatcher, setAskPersistStore, restorePersistedAsks, submitAskFromDesktop } from '../src/core/ask-broker.js';
 import { createAskPersistStore } from '../src/core/ask-persist-store.js';
 import type { CreateAskInput, PendingAsk, AskResult } from '../src/core/ask-types.js';
 import { handleAskCardAction, buildAskCard } from '../src/im/lark/ask-card.js';
@@ -176,6 +176,26 @@ describe('per-question custom form', () => {
     const result: AskResult = { kind: 'answered', answers: [[], ['b']], customAnswers: ['社区 C', null], comment: null, by: 'ou_owner', timedOut: false };
     expect(turnReplyAskSummary({ ask, result } as any)).toContain('社区 C');
     expect(JSON.stringify(JSON.parse(buildAskCard(ask, result)))).toContain('社区 C');
+  });
+
+  it('neutralises answerer markup in the settled standalone card summary', async () => {
+    const { ask } = await start();
+    const result: AskResult = { kind: 'answered', answers: [[], []],
+      customAnswers: ['<at id=ou_victim1234567890></at>', null], by: 'ou_owner', comment: null, timedOut: false };
+    const card = buildAskCard(ask, result);
+    expect(card).not.toMatch(/<at\s/);
+    expect(card).toContain('&lt;at');
+    expect(card).toContain('victim1234567890');
+  });
+
+  it('still accepts desktop selections before a draft, but blocks them once custom text exists', async () => {
+    const pre = await start({ requestId: 'desktop-before' });
+    expect(submitAskFromDesktop({ askId: pre.args.askId, selections: [['a'], ['a']] })).toBe('accepted');
+    sent.length = 0;
+    const { args } = await start({ requestId: 'desktop-after' });
+    applyAskForm({ ...args, fields: { custom_0: 'draft' }, toggle: { questionIndex: 1, key: 'b' } });
+    expect(submitAskFromDesktop({ askId: args.askId, selections: [['a'], ['b']] })).toBe('stale');
+    expect(getAskSnapshot(args.askId)?.settled).toBe(false);
   });
 
   it('keeps question identity in native Codex and independent CLI answer adapters', () => {

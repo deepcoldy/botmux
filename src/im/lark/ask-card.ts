@@ -839,7 +839,14 @@ function settleStatus(result: AskResult, ask: PendingAsk, locale?: Locale): stri
       const q = ask.questions[i];
       if (!q) return t('card.ask.q_unparseable', { n: i + 1 }, locale);
       const labels = keys.map((key) => q.options.find((o) => o.key === key)?.label ?? key);
-      return t('card.ask.q_summary_line', { n: i + 1, labels: result.customAnswers?.[i] ?? labels.join(', ') }, locale);
+      // Per-question custom text is answerer-controlled free text; the outer
+      // escapeMd keeps <at> mentions intact by design, so neutralise angle
+      // brackets HERE or a crafted answer would render a bot-authored mention.
+      const custom = result.customAnswers?.[i];
+      const display = custom
+        ? custom.replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        : labels.join(', ');
+      return t('card.ask.q_summary_line', { n: i + 1, labels: display }, locale);
     });
     const summary = lines.join('\n');
     const commentLine = result.comment ? `\n${t('card.ask.supplement', { comment: escapeMd(result.comment) }, locale)}` : '';

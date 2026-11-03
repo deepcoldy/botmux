@@ -1400,6 +1400,10 @@ export function submitAskFromDesktop(args: {
   if (ask.settled) return 'already_settled';
 
   if (hasAskForm(ask.questions)) return 'invalid_form';
+  // A per-question custom form may hold answerer text drafts this selections-only
+  // API cannot express. Once such a draft exists, desktop must not settle the ask
+  // with options and silently drop the typed answers.
+  if (ask.customRevision !== undefined) return 'stale';
 
   // 同 submitAsk：按 ask.questions 规范化，拒绝超长输入、缺失尾部补空集，越界槽不进结果。
   if (args.selections.length > ask.questions.length) return 'stale';
