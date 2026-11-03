@@ -113,6 +113,7 @@ interface GatewayConnection extends GatewayDescriptor {
   transport: Transport;
   capabilities: ServerCapabilities;
   uriPrefix: string;
+  protectedCapabilityId?: string;
 }
 
 interface NamedRoute {
@@ -437,6 +438,14 @@ export class PluginMcpGateway {
     return this.initializePromise;
   }
 
+  private provisionedProtectedCapability(pluginId: string, capabilityId: string | undefined) {
+    if (!capabilityId) return undefined;
+    return this.protectedMcpPolicy?.capabilities.find(capability => (
+      capability.id === capabilityId
+      && capability.allowedPluginIds.includes(pluginId)
+    ));
+  }
+
   private async initializeDownstreams(): Promise<void> {
     const { tasks: _tasks, ...clientCapabilities } = this.server.getClientCapabilities() ?? {};
     const settled = await Promise.all(this.descriptors.map(descriptor => this.connectDownstream(descriptor, clientCapabilities)));
@@ -449,6 +458,7 @@ export class PluginMcpGateway {
     clientCapabilities: ClientCapabilities,
   ): Promise<GatewayConnection | null> {
     let transport: Transport;
+    let activeProtectedCapabilityId: string | undefined;
     try {
       if (descriptor.server.transport === 'stdio') {
         const resolved = resolveStdioCommand(descriptor);
@@ -470,17 +480,33 @@ export class PluginMcpGateway {
           env: downstreamEnv,
           stderr: 'inherit',
         } as const;
-        const protectedCapability = descriptor.server.protectedCapability;
-        transport = protectedCapability && this.requestProtectedSecretChannel
-          ? new ProtectedSecretClientTransport({
+        const protectedCapability = this.provisionedProtectedCapability(
+          descriptor.pluginId,
+          descriptor.server.protectedCapability,
+        );
+        let protectedSecretChannel: Duplex | undefined;
+        if (protectedCapability && this.requestProtectedSecretChannel) {
+          try {
+            protectedSecretChannel = await this.requestProtectedSecretChannel(protectedCapability.id);
+          } catch {
+            // A protected capability is optional for process startup. When the
+            // daemon cannot provide its one-shot channel, keep the MCP online
+            // without fd 3; the connection also remains ineligible for grants.
+          }
+        }
+        if (protectedCapability && protectedSecretChannel) {
+          activeProtectedCapabilityId = protectedCapability.id;
+          transport = new ProtectedSecretClientTransport({
               ...parameters,
               env: {
                 ...parameters.env,
                 [PROTECTED_MCP_SECRET_FD_ENV]: String(PROTECTED_MCP_CHILD_SECRET_FD),
               },
-              requestSecretChannel: () => this.requestProtectedSecretChannel!(protectedCapability),
-            })
-          : new StdioClientTransport(parameters);
+              requestSecretChannel: async () => protectedSecretChannel,
+            });
+        } else {
+          transport = new StdioClientTransport(parameters);
+        }
       } else {
         const staticHeaders = descriptor.server.headers;
         transport = new StreamableHTTPClientTransport(new URL(descriptor.server.url), {
@@ -535,6 +561,7 @@ export class PluginMcpGateway {
         transport,
         capabilities: client.getServerCapabilities() ?? {},
         uriPrefix: uriPrefix(descriptor.key),
+        ...(activeProtectedCapabilityId ? { protectedCapabilityId: activeProtectedCapabilityId } : {}),
       };
       this.diagnostics.push({
         pluginId: descriptor.pluginId,
@@ -619,11 +646,12 @@ export class PluginMcpGateway {
     const server = connection.server;
     if (server.transport !== 'stdio'
       || !server.protectedCapability
+      || connection.protectedCapabilityId !== server.protectedCapability
       || identity?.protectedMcpContainmentActive !== true) return undefined;
-    const capability = this.protectedMcpPolicy?.capabilities.find(item => (
-      item.id === server.protectedCapability
-      && item.allowedPluginIds.includes(connection.pluginId)
-    ));
+    const capability = this.provisionedProtectedCapability(
+      connection.pluginId,
+      server.protectedCapability,
+    );
     if (!capability) return undefined;
     if (capability.principal !== 'verified-human-email') {
       return { capabilities: [capability.id] };

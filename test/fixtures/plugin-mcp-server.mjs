@@ -19,7 +19,7 @@ import {
 const serverName = process.argv[2] || 'fixture';
 if (serverName === 'fail') process.exit(17);
 let inheritedSecret = '';
-if (serverName === 'secret-fd') {
+if (serverName === 'secret-fd' && process.env.BOTMUX_PROTECTED_SECRET_FD === '3') {
   inheritedSecret = readFileSync(3, 'utf8').trim();
   closeSync(3);
 }
@@ -123,7 +123,8 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
         type: 'text',
         text: `secretFd=${inheritedSecret === 'fd-only-secret'}:`
           + `secretEnv=${process.env.FIXTURE_SECRET !== undefined}:`
-          + `secretArgv=${process.argv.includes('fd-only-secret')}`,
+          + `secretArgv=${process.argv.includes('fd-only-secret')}:`
+          + `meta=${JSON.stringify(request.params._meta ?? {})}`,
       }],
     };
   }
