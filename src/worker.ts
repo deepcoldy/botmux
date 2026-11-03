@@ -214,8 +214,9 @@ import { InputDeliveryEvidenceTracker } from './services/input-delivery-evidence
 import {
   appendBridgeTurnJournalEntry,
   BridgeRestoreGate,
+  claimRetiredGenerationEntries,
   clearBridgeTurnJournal,
-  entriesOfLaterGenerations,
+  entriesStillOwned,
   planBridgeTurnRecovery,
   readBridgeTurnJournal,
   removeBridgeTurnJournalEntry,
@@ -7660,10 +7661,13 @@ function deliverRestartInterruptionNote(): void {
  *  recovery owner. */
 const bridgeRestoreGate = new BridgeRestoreGate();
 /** When this worker process last retired a CLI generation's bridge watcher
- *  (undefined until one has run). The next generation's watcher drops the
- *  journal entries that generation left behind — see entriesOfLaterGenerations
- *  and pruneRetiredGenerationJournalEntries. */
+ *  (undefined until one has run). The next generation's watcher claims the
+ *  journal entries that generation left behind — see
+ *  claimRetiredGenerationJournalEntries. */
 let bridgeGenerationRetiredAtMs: number | undefined;
+/** The journal holds entries this worker claimed for the current generation
+ *  that its writes have not settled yet — see settleJournalTakeoverClaims. */
+let journalHasTakeoverClaims = false;
 /** Start time of the CLI the current bridge generation re-attached to (it
  *  survived the previous worker); undefined when this worker launched it. */
 let bridgeLiveCliStartedAtMs: number | undefined;
@@ -8311,25 +8315,46 @@ function journalBridgeTurnClear(turnId: string, dispatchAttempt?: number): void 
   }
 }
 
-/** A new CLI generation is starting in this worker process: the entries the
- *  retired one journaled belong to the carryover, which re-delivers its
- *  interrupted input (and marks it again). Left on disk they would be restored
- *  by the next worker process as turns IT interrupted, rewinding the replay to
- *  their old marks (#2727). A worker that exits instead never gets here, so its
- *  entries stay for the successor. */
-function pruneRetiredGenerationJournalEntries(): void {
+/** A new CLI generation is starting in this worker process. The entries the
+ *  retired one journaled are now this generation's to settle: its carryover
+ *  or restart note re-delivers an interrupted turn (and marks it again) once
+ *  the CLI is ready. Claim them instead of dropping them — until that write
+ *  the entry is the turn's only durable record, and a worker killed in
+ *  between must leave it to the next process (#2727). */
+function claimRetiredGenerationJournalEntries(): void {
   const retiredAtMs = bridgeGenerationRetiredAtMs;
   const path = bridgeTurnJournalFilePath();
   if (retiredAtMs === undefined || !path) return;
   try {
-    const entries = readBridgeTurnJournal(path);
-    const kept = entriesOfLaterGenerations(entries, retiredAtMs);
-    if (kept.length === entries.length) return;
-    if (kept.length === 0) clearBridgeTurnJournal(path);
-    else writeBridgeTurnJournal(path, kept);
-    log(`Bridge turn journal: dropped ${entries.length - kept.length} entr(ies) of the CLI generation retired in this worker; its carryover re-delivers interrupted input`);
+    const { entries, claimed } = claimRetiredGenerationEntries(readBridgeTurnJournal(path), retiredAtMs, Date.now());
+    if (claimed === 0) return;
+    writeBridgeTurnJournal(path, entries);
+    journalHasTakeoverClaims = true;
+    log(`Bridge turn journal: this CLI generation took over ${claimed} entr(ies) of the one retired in this worker`);
   } catch (err: any) {
-    log(`Bridge turn journal prune failed (${err.message})`);
+    log(`Bridge turn journal takeover claim failed (${err.message})`);
+  }
+}
+
+/** This generation is writing an input. Claimed entries whose
+ *  turn is no longer queued here were either taken over (the re-mark replaced
+ *  them) or never will be (no carryover, no restart note under their id) —
+ *  left on disk, the next worker process would restore them as turns IT
+ *  interrupted and rewind its replay to their old marks (#2727). Claims whose
+ *  turn is still queued stay until that turn is written. */
+function settleJournalTakeoverClaims(path: string): void {
+  if (!journalHasTakeoverClaims) return;
+  try {
+    const entries = readBridgeTurnJournal(path);
+    const queued = new Set(pendingMessages.flatMap(item => (item.turnId ? [item.turnId] : [])));
+    const owned = entriesStillOwned(entries, queued);
+    if (!owned.some(entry => entry.claimedAtMs !== undefined)) journalHasTakeoverClaims = false;
+    if (owned.length === entries.length) return;
+    if (owned.length === 0) clearBridgeTurnJournal(path);
+    else writeBridgeTurnJournal(path, owned);
+    log(`Bridge turn journal: released ${entries.length - owned.length} taken-over entr(ies) the new CLI generation no longer owes an answer for`);
+  } catch (err: any) {
+    log(`Bridge turn journal takeover settle failed (${err.message})`);
   }
 }
 
@@ -9960,7 +9985,7 @@ function performBridgeIngestAndScheduleQuietEmit(): void {
 }
 
 function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string; mode?: 'baseline-existing' | 'fresh-empty'; dataDir?: string; liveCliPid?: number }): void {
-  pruneRetiredGenerationJournalEntries();
+  claimRetiredGenerationJournalEntries();
   bridgeLiveCliStartedAtMs = opts?.liveCliPid ? readProcessStartTime(opts.liveCliPid) : undefined;
   bridgeJsonlPath = jsonlPath;
   bridgeJsonlDir = dirname(jsonlPath);
@@ -10201,6 +10226,10 @@ function bridgeMarkPendingTurn(
       offsetAtMark: bridgeOffset,
     });
   }
+  // Any input this generation writes — durable ones too, which are not
+  // journaled — means the takeover queue has started draining.
+  const journalPath = bridgeTurnJournalFilePath();
+  if (journalPath) settleJournalTakeoverClaims(journalPath);
   return turnId;
 }
 

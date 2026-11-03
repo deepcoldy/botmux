@@ -133,6 +133,48 @@ describe.skipIf(!runnable)('daemon restart after an in-worker CLI relaunch (#272
   }, 180_000);
 });
 
+/** SIGTERM after the in-worker relaunch started and before it wrote anything:
+ *  the carried-over turn lives only in the dying worker's memory and in the
+ *  journal. The next worker must still settle it — restored, or ended with an
+ *  explicit terminal — never drop it without a word. */
+async function sigtermBeforeRelaunchWrites(h: Harness, g: Generation): Promise<void> {
+  await g.waitFor(() => promptReadyCount(g) > 0, 'the CLI to be ready');
+  send(g, { type: 'message', content: 'HANG interrupted turn', turnId: 'om_interrupted' });
+  await g.waitFor(() => h.toolStartedAt('HANG interrupted turn') !== undefined, 'the turn to be running its tool');
+  h.crashCli();
+  await g.waitFor(() => g.messages.some(m => m.type === 'claude_exit'), 'the worker to see its CLI die');
+  send(g, { type: 'restart', reason: 'cli_crash', attemptId: 'crash-1' });
+  await g.waitFor(() => h.launches().length === 2, 'the relaunch');
+  // The relaunched CLI holds its prompt back for 20s: nothing has been
+  // written into it when the worker goes.
+  await sleep(3_000);
+  const exited = new Promise<void>(done => g.child.once('exit', () => done()));
+  g.child.kill('SIGTERM');
+  await Promise.race([exited, sleep(15_000)]);
+}
+
+const settledTurn = (g: Generation, turnId: string) => g.messages.some(m =>
+  (m.type === 'turn_terminal' || m.type === 'final_output') && m.turnId === turnId);
+
+describe.skipIf(!runnable)('daemon restart while an in-worker relaunch is starting (#2727)', () => {
+  it('re-attaching the still-starting pane settles the carried-over turn', async () => {
+    const h = setup({ turnMs: 500, programStatus: true, resumeReadyDelayMs: 20_000 });
+    const g = h.startWorker();
+    await sigtermBeforeRelaunchWrites(h, g);
+    const next = h.startWorker({ resume: true });
+    await next.waitFor(() => settledTurn(next, 'om_interrupted'), 'the interrupted turn to be settled', 60_000);
+  }, 180_000);
+
+  it('a cold start settles the carried-over turn', async () => {
+    const h = setup({ turnMs: 500, programStatus: true, resumeReadyDelayMs: 20_000 });
+    const g = h.startWorker();
+    await sigtermBeforeRelaunchWrites(h, g);
+    h.killCli();
+    const next = h.startWorker({ resume: true });
+    await next.waitFor(() => settledTurn(next, 'om_interrupted'), 'the interrupted turn to be settled', 60_000);
+  }, 180_000);
+});
+
 describe.skipIf(!runnable)('re-attaching a pane mid-tool (#2727)', () => {
   it('a running foreground tool is not taken for an idle prompt; the turn ends where it belongs', async () => {
     const h = setup({ turnMs: 500, programStatus: true });

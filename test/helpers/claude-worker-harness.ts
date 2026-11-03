@@ -248,6 +248,8 @@ const submit = () => {
   ev({ kind: 'command', text });
   render();
 };
+// A resumed launch can be held back from drawing its prompt, so nothing can be
+// written into it for that long.
 setTimeout(() => {
   render();
   process.stdin.on('data', buf => {
@@ -256,7 +258,7 @@ setTimeout(() => {
     composer += s.replace(/\\r/g, '\\n');
     render();
   });
-}, 300);
+}, resumed && cfg.resumeReadyDelayMs ? cfg.resumeReadyDelayMs : 300);
 // A background task finishing: Claude wakes up on its own and answers — a
 // terminal-local turn with no Lark message behind it.
 setInterval(() => {
@@ -344,6 +346,8 @@ export function setupFakeClaude(opts: {
   /** Report turns over OSC 7501 (working / idle), as Claude Code does once
    *  the terminal answered its program-status probe. */
   programStatus?: boolean;
+  /** How long a `--resume` launch waits before drawing its prompt. */
+  resumeReadyDelayMs?: number;
 }): Harness {
   mkdirSync(join(homedir(), '.botmux'), { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(tmpdir(), 'bmx-clear-restore-'));
@@ -377,6 +381,7 @@ export function setupFakeClaude(opts: {
     ...(opts.unknownLayer === 'cli-named-launcher' ? { commAsClaude: true } : {}),
     ...(opts.startupTicker ? { startupTicker: true } : {}),
     ...(opts.programStatus ? { programStatus: true } : {}),
+    ...(opts.resumeReadyDelayMs ? { resumeReadyDelayMs: opts.resumeReadyDelayMs } : {}),
   }));
   // An extensionless script follows the nearest package.json; never inherit a
   // stray `"type": "module"` from a parent directory.

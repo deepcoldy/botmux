@@ -54,6 +54,12 @@ export interface BridgeTurnJournalEntry {
    *  line can only exist at/after this byte, so restore re-drains from here
    *  instead of re-reading the whole file. Always a line boundary. */
   offsetAtMark: number;
+  /** Set when a later CLI generation of the same worker process took the
+   *  entry over: the turn's in-memory carryover or restart note is queued to
+   *  be written into that generation, and is marked again when it is. Until
+   *  then this entry is the turn's only durable record, so a restore treats it
+   *  as written into the claiming generation (#2727). */
+  claimedAtMs?: number;
   /** Plain IM inputs proven to share one native execution. This attribution
    * survives a checkpoint after the earlier queue heads were superseded. It
    * is revalidated against the native transcript identity when restored. */
@@ -159,7 +165,10 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
       || entry.linkRefMode === 'observe'
       || entry.linkRefMode === 'enabled'))
     .map(entry => {
-      const { mergedExecution, ...plain } = entry;
+      const { mergedExecution, claimedAtMs, ...rest } = entry;
+      const plain = typeof claimedAtMs === 'number' && Number.isFinite(claimedAtMs)
+        ? { ...rest, claimedAtMs }
+        : rest;
       // Invalid optional merge evidence must not discard the pending answer
       // or invent delivery credit. Older journals have no such field.
       if (!isJsonObject(mergedExecution)
@@ -227,10 +236,11 @@ export const LIVE_CLI_START_TOLERANCE_MS = 2_000;
  *
  *  `liveCliStartedAtMs`: when the worker re-attaches a CLI that survived the
  *  previous worker, an entry marked before that process started was written
- *  into an earlier CLI generation. That generation was replaced inside the old
- *  worker, whose carryover already owned its interrupted input; restoring it
- *  here would rewind the replay to that old mark and re-deliver everything the
- *  session answered since (#2727). */
+ *  into an earlier CLI generation that was replaced inside the old worker.
+ *  Unless that replacement claimed it (its takeover was still queued when the
+ *  old worker died), nothing will ever answer it again; restoring it would
+ *  rewind the replay to that old mark and re-deliver everything the session
+ *  answered since (#2727). */
 export function selectRestorableBridgeTurns(
   entries: readonly BridgeTurnJournalEntry[],
   opts: { currentJsonlPath: string; nowMs?: number; maxAgeMs?: number; liveCliStartedAtMs?: number },
@@ -242,7 +252,7 @@ export function selectRestorableBridgeTurns(
     .filter(entry => entry.jsonlPath === opts.currentJsonlPath
       && nowMs - entry.markTimeMs <= maxAgeMs
       && (liveCliStartedAtMs === undefined
-        || entry.markTimeMs >= liveCliStartedAtMs - LIVE_CLI_START_TOLERANCE_MS)
+        || (entry.claimedAtMs ?? entry.markTimeMs) >= liveCliStartedAtMs - LIVE_CLI_START_TOLERANCE_MS)
       // Only PLAIN Lark IM turns are restorable. Durable turns
       // (dispatchAttempt set) have their own cross-restart recovery owner (the
       // daemon's persisted queuedActivation* write-ahead + receipt
@@ -255,17 +265,39 @@ export function selectRestorableBridgeTurns(
     .sort((a, b) => a.markTimeMs - b.markTimeMs);
 }
 
-/** Entries that outlive the CLI generation they were written for once a new
- *  generation starts in the SAME worker process: everything marked at or
- *  before the old generation was retired. That generation's interrupted input
- *  is re-delivered by the carryover and marked again under the new one; the
- *  old entries would otherwise stay on disk until the age cap and be restored
- *  by the next worker process as if that process had interrupted them (#2727). */
-export function entriesOfLaterGenerations(
+/** A new CLI generation starts in the same worker process: every entry the
+ *  retired generation(s) left — marked, or last claimed, at or before the
+ *  retirement — is claimed by the new one at `claimedAtMs`. Nothing is
+ *  dropped here: until the new generation writes the carried-over input or
+ *  restart note (which marks the turn again), the entry is the turn's only
+ *  durable record, and a worker killed in that window must leave it to the
+ *  next process. Returns the entries and how many were claimed. */
+export function claimRetiredGenerationEntries(
   entries: readonly BridgeTurnJournalEntry[],
   retiredAtMs: number,
+  claimedAtMs: number,
+): { entries: BridgeTurnJournalEntry[]; claimed: number } {
+  let claimed = 0;
+  const next = entries.map(entry => {
+    if ((entry.claimedAtMs ?? entry.markTimeMs) > retiredAtMs) return entry;
+    claimed++;
+    return { ...entry, claimedAtMs };
+  });
+  return { entries: next, claimed };
+}
+
+/** After the claiming generation wrote an input: a claimed entry whose turn
+ *  is no longer queued in memory was either taken over — its re-mark already
+ *  replaced it — or never will be (no carryover, no restart note under its
+ *  id). Left on disk, the latter would be restored by the next worker process
+ *  as a turn IT interrupted, rewinding the replay to its old mark (#2727).
+ *  Keeps unclaimed entries and claims whose turn is still waiting to be
+ *  written. */
+export function entriesStillOwned(
+  entries: readonly BridgeTurnJournalEntry[],
+  queuedTurnIds: ReadonlySet<string>,
 ): BridgeTurnJournalEntry[] {
-  return entries.filter(entry => entry.markTimeMs > retiredAtMs);
+  return entries.filter(entry => entry.claimedAtMs === undefined || queuedTurnIds.has(entry.turnId));
 }
 
 /**

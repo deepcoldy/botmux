@@ -27,8 +27,9 @@ import {
   appendBridgeTurnJournalEntry,
   BRIDGE_TURN_RECOVERY_MAX_BYTES,
   BridgeRestoreGate,
+  claimRetiredGenerationEntries,
   clearBridgeTurnJournal,
-  entriesOfLaterGenerations,
+  entriesStillOwned,
   LIVE_CLI_START_TOLERANCE_MS,
   planBridgeTurnRecovery,
   readBridgeTurnJournal,
@@ -42,6 +43,7 @@ import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from '../sr
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import { logger } from '../src/utils/logger.js';
 import { splitTranscriptEventsByCutoff, type TranscriptEvent } from '../src/services/claude-transcript.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 function user(uuid: string, content: string, timestampMs: number): TranscriptEvent {
   return { type: 'user', uuid, timestamp: new Date(timestampMs).toISOString(), message: { role: 'user', content } };
@@ -207,14 +209,89 @@ describe('restore scope against CLI generations (#2727)', () => {
       .map(e => e.turnId)).toEqual(['within']);
   });
 
-  it('a new CLI generation in the same worker keeps only marks taken after the old one retired', () => {
+  it('a turn the relaunched CLI claimed is restored on re-attach, at its original mark', () => {
+    // Written into the crashed CLI; the relaunched one (still alive) claimed it
+    // and was killed before writing the carry-over.
+    const cliStartedAt = now - 60_000;
+    const entries = [
+      entry({ turnId: 'claimed', jsonlPath: '/a.jsonl', markTimeMs: cliStartedAt - 5 * 60_000, claimedAtMs: cliStartedAt + 500 }),
+      entry({ turnId: 'unclaimed', jsonlPath: '/a.jsonl', markTimeMs: cliStartedAt - 5 * 60_000 }),
+    ];
+    const restorable = selectRestorableBridgeTurns(entries, { currentJsonlPath: '/a.jsonl', nowMs: now, liveCliStartedAtMs: cliStartedAt });
+    expect(restorable.map(e => [e.turnId, e.markTimeMs])).toEqual([['claimed', cliStartedAt - 5 * 60_000]]);
+  });
+
+  it('a new CLI generation claims what the retired one left and drops nothing', () => {
     const retiredAt = 5_000;
     const entries = [
       entry({ turnId: 'old', markTimeMs: retiredAt - 1 }),
       entry({ turnId: 'at-retire', markTimeMs: retiredAt }),
+      entry({ turnId: 'claimed-before', markTimeMs: 1_000, claimedAtMs: retiredAt - 10 }),
       entry({ turnId: 'new', markTimeMs: retiredAt + 1 }),
     ];
-    expect(entriesOfLaterGenerations(entries, retiredAt).map(e => e.turnId)).toEqual(['new']);
+    const { entries: next, claimed } = claimRetiredGenerationEntries(entries, retiredAt, 9_000);
+    expect(claimed).toBe(3);
+    expect(next.map(e => [e.turnId, e.markTimeMs, e.claimedAtMs])).toEqual([
+      ['old', retiredAt - 1, 9_000],
+      ['at-retire', retiredAt, 9_000],
+      ['claimed-before', 1_000, 9_000],
+      ['new', retiredAt + 1, undefined],
+    ]);
+  });
+
+  it('once the claiming generation writes, only claims still queued for it survive', () => {
+    const entries = [
+      entry({ turnId: 'live', markTimeMs: 9_500 }),
+      entry({ turnId: 'queued', markTimeMs: 1_000, claimedAtMs: 9_000 }),
+      entry({ turnId: 'nobody', markTimeMs: 1_100, claimedAtMs: 9_000 }),
+    ];
+    expect(entriesStillOwned(entries, new Set(['queued'])).map(e => e.turnId)).toEqual(['live', 'queued']);
+  });
+
+  it('reads a claim back, and drops a malformed one without losing the entry', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bmx-claim-'));
+    try {
+      const path = join(dir, 'turn-marks', 's.json');
+      writeBridgeTurnJournal(path, [
+        entry({ turnId: 'claimed', claimedAtMs: 7_000 }),
+        { ...entry({ turnId: 'bad-claim' }), claimedAtMs: 'soon' } as unknown as BridgeTurnJournalEntry,
+      ]);
+      expect(readBridgeTurnJournal(path).map(e => [e.turnId, e.claimedAtMs])).toEqual([['claimed', 7_000], ['bad-claim', undefined]]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('worker: settling takeover claims as the new CLI generation writes (#2727)', () => {
+  it('keeps the claim of a turn still queued to be written, releases the rest, then that one once written', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bmx-settle-'));
+    try {
+      const path = join(dir, 'turn-marks', 's.json');
+      writeBridgeTurnJournal(path, [
+        entry({ turnId: 'om_queued', markTimeMs: 1_000, claimedAtMs: 9_000 }),
+        entry({ turnId: 'om_nobody', markTimeMs: 1_100, claimedAtMs: 9_000 }),
+        entry({ turnId: 'om_live', markTimeMs: 9_500 }),
+      ]);
+      const scope: Record<string, unknown> = {
+        journalHasTakeoverClaims: true,
+        pendingMessages: [{ turnId: 'om_queued', content: 'carried over' }],
+        readBridgeTurnJournal, writeBridgeTurnJournal, clearBridgeTurnJournal, entriesStillOwned,
+        log: () => {},
+      };
+      const settle = loadWorkerFunction<(path: string) => void>('settleJournalTakeoverClaims', scope);
+      settle(path);
+      expect(readBridgeTurnJournal(path).map(e => e.turnId)).toEqual(['om_queued', 'om_live']);
+      expect(scope.journalHasTakeoverClaims).toBe(true);
+      // The carried-over turn was written (its re-mark replaces the claim in
+      // production; here it simply leaves the queue unwritten-for).
+      scope.pendingMessages = [];
+      settle(path);
+      expect(readBridgeTurnJournal(path).map(e => e.turnId)).toEqual(['om_live']);
+      expect(scope.journalHasTakeoverClaims).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
