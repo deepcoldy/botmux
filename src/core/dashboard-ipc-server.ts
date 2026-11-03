@@ -9913,6 +9913,43 @@ ipcRoute('POST', '/api/session-group-tag-auth', requireBoundBot(async (_req, res
 // GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）+ 标签名。
 // tagName = 用户配置的自定义名（没配就是空串）；defaultTagName = 留空时实际生效的
 // 默认名「<bot 显示名>会话」，Dashboard 拿它做输入框 placeholder。
+/** Read the per-bot group naming policy; absence retains the existing AI-summary default. */
+ipcRoute('GET', '/api/session-group-naming-config', requireBoundBot(async (_req, res) => {
+  const naming = getBot(cachedLarkAppId).config.sessionGroup?.naming;
+  jsonRes(res, 200, { ok: true, mode: naming?.mode ?? 'ai-summary', model: naming?.model ?? '' });
+}));
+
+/** Persist a validated naming mode/model while retaining unrelated session-group settings. */
+ipcRoute('PUT', '/api/session-group-naming-config', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ mode?: unknown; model?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  if (!body || Array.isArray(body) || typeof body.mode !== 'string' || !['ai-summary', 'session-title', 'truncate'].includes(body.mode)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  }
+  const mode = body.mode as 'ai-summary' | 'session-title' | 'truncate';
+  if (body.model !== undefined && (typeof body.model !== 'string' || body.model.length > 200 || /[\u0000-\u001f]/.test(body.model))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_model' });
+  }
+  try {
+    const bot = getBot(cachedLarkAppId);
+    const result = await rmwBotEntry(cachedLarkAppId, entry => {
+      const group = (entry.sessionGroup ?? {}) as import('../bot-registry.js').SessionGroupConfig;
+      const naming = { ...group.naming, mode };
+      if (typeof body.model === 'string') {
+        if (body.model.trim()) naming.model = body.model.trim();
+        else delete naming.model;
+      }
+      entry.sessionGroup = { ...group, naming };
+      return { write: true, result: naming };
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    bot.config.sessionGroup = { ...bot.config.sessionGroup, naming: result.result };
+    jsonRes(res, 200, { ok: true, mode: result.result.mode, model: result.result.model ?? '' });
+  } catch (error: unknown) {
+    jsonRes(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}));
+
 ipcRoute('GET', '/api/session-group-tag-status', requireBoundBot(async (_req, res) => {
   try {
     const cfg = getBot(cachedLarkAppId).config;

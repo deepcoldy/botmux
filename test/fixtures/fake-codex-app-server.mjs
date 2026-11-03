@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, existsSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -58,10 +58,13 @@ if (process.env.FAKE_CODEX_INHERITED_STDIO) {
 }
 if (envLogPath) {
   const codexHome = process.env.CODEX_HOME ?? '';
+  const configPath = join(codexHome, 'config.toml');
   writeFileSync(envLogPath, JSON.stringify({
     codexHome,
     authExists: existsSync(join(codexHome, 'auth.json')),
-    configExists: existsSync(join(codexHome, 'config.toml')),
+    configExists: existsSync(configPath),
+    // 隔离 home 的实际落盘内容，用来断言白名单：只允许 provider 接线进来。
+    configText: existsSync(configPath) ? readFileSync(configPath, 'utf8') : null,
   }));
 }
 let inputBuffer = '';

@@ -822,6 +822,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { decideAutoRestart } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { acceptSessionGroupTitle } from '../services/session-group-title.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -17354,6 +17355,9 @@ function setupWorkerHandlers(
           ds.initConfig.nativeSessionTitlePrompt = undefined;
         }
         sessionStore.updateSession(ds.session);
+        if (ds.scope === 'chat' && ds.chatType === 'group') {
+          acceptSessionGroupTitle(ds.larkAppId, ds.session, title);
+        }
         break;
       }
 
