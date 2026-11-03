@@ -8,6 +8,7 @@ import {
   buildBridgeSendPreviewText,
   bridgePostText,
   composeFailedBridgeFallbackContent,
+  isBridgeSendCompletionNarration,
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldEmitFailedBridgeFallback,
@@ -347,6 +348,17 @@ describe('buildBridgeSendMarkerContent', () => {
 });
 
 describe('shouldSuppressBridgeEmit', () => {
+  it('recognizes only short botmux-send completion narration as internal final text', () => {
+    expect(isBridgeSendCompletionNarration('已通过 botmux 发出最终结论，并已把只读 DB 查询部分交接给 Celebi。'))
+      .toBe(true);
+    expect(isBridgeSendCompletionNarration('I have sent the final answer via botmux send.'))
+      .toBe(true);
+    expect(isBridgeSendCompletionNarration('botmux send --response-kind final 会写入 final marker。'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('这里是新的用户问题的真实答复，不应因为上一轮 final marker 被吞。'))
+      .toBe(false);
+  });
+
   it('compares visible marker/final lengths without memory citation metadata', () => {
     const visible = 'The answer already sent to the user.';
     const withCitation = `${visible}\n\n${memoryCitation()}`;
@@ -394,6 +406,46 @@ describe('shouldSuppressBridgeEmit', () => {
       { ...turn(100), finalText: `Codex acknowledged and is reviewing. Here is the summary you asked for.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
       undefined,
       [],
+      false,
+    )).toBe(false);
+  });
+
+  it('suppresses a queued-turn completion narration when a recent prior final marker already delivered the answer', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 220,
+      sessionId: 'session-source',
+      turnId: 'turn-original',
+      responseKind: 'final',
+      deliveryKind: 'current_session_send',
+      targetChatId: 'oc_source',
+      contentLength: 42,
+    };
+    const queuedTurn = {
+      markTimeMs: 100,
+      isLocal: false,
+      sessionId: 'session-source',
+      turnId: 'turn-queued',
+      chatId: 'oc_source',
+      rootMessageId: 'om_source_root',
+      finalText: '已通过 botmux 发出最终结论，并已把只读 DB 查询部分交接给 Celebi。',
+    };
+    expect(shouldSuppressBridgeEmit(queuedTurn, undefined, [marker], false)).toBe(true);
+
+    expect(shouldSuppressBridgeEmit(
+      {
+        ...queuedTurn,
+        finalText: '这是下一条排队输入的真实答复，不能借上一轮 final marker 吞掉。'
+          + '这段内容明显长于上一条 marker，旧基线的长度门禁也应该放行，避免把普通后继请求误判成发送完成自述。'
+          + '为了覆盖旧版长度阈值，这里继续补充足够多的业务正文：用户可能在下一条排队输入里要求继续分析日志、解释根因、给出修复方案、列出验证步骤，这些都是真实答复内容，而不是发送完成状态说明。',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      queuedTurn,
+      undefined,
+      [{ ...marker, sentAtMs: queuedTurn.markTimeMs - 11 * 60 * 1000 }],
       false,
     )).toBe(false);
   });

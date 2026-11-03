@@ -54,6 +54,7 @@ import { CODEX_RATE_LIMIT_ERROR_CODE } from './codex-transcript.js';
 
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
+const RECENT_PRIOR_FINAL_MARKER_WINDOW_MS = 10 * 60 * 1000;
 
 export const BRIDGE_NOTHING_TO_SEND_SENTINEL = 'BOTMUX_NOTHING_TO_SEND';
 /** Superseded token name. Instructions no longer teach it, but the matcher
@@ -193,18 +194,55 @@ export function bridgePostText(finalText: string, adoptMode: boolean): string {
 
 export interface BridgeSendMarker {
   sentAtMs: number;
+  /** Owning worker session. Older markers omit this and remain window-gated. */
+  sessionId?: string;
   messageId?: string;
+  /** Where the successful user-visible action went. */
+  deliveryKind?: 'current_session_send' | 'detoured_send' | 'dispatch_report';
+  targetChatId?: string;
+  targetRootMessageId?: string;
+  targetSessionId?: string;
+  responseKind?: 'progress' | 'final' | 'auxiliary';
   turnId?: string;
   dispatchAttempt?: number;
   /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
   replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
+  /** The send is explicitly an interim side effect and must never stand in for
+   * the turn's eventual final/failure delivery. */
+  terminalIndependent?: true;
   contentLength?: number;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */
   previewText?: string;
 }
 
+/** Only an explicit final response proves completion; progress, auxiliary,
+ *  and legacy markers without responseKind must not retire a pending turn. */
+export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'responseKind'>): boolean {
+  return marker.responseKind === 'final';
+}
+
+export function isBridgeSendCompletionNarration(finalText: string | undefined): boolean {
+  if (finalText === undefined) return false;
+  const visible = normaliseForFingerprint(bridgePostText(finalText, false));
+  if (!visible || visible.length > 240) return false;
+  const lower = visible.toLowerCase();
+  if (!lower.includes('botmux')) return false;
+  const mentionsFinal = /(?:最终|结论|答复|回复|final|answer|reply|result)/i.test(visible);
+  const mentionsDelivery = /(?:已通过|已经|已|发出|发送|投递|送达|sent|delivered|posted|called|used)/i.test(visible);
+  return mentionsFinal && mentionsDelivery;
+}
+
 export interface BridgeGateInput {
+  /** Owning chat, when the caller knows it. */
+  chatId?: string;
+  /** Owning topic root. */
+  rootMessageId?: string;
+  /** Owning BotMux session. */
+  sessionId?: string;
+  /** Exact BotMux turn identity. */
+  turnId?: string;
+  dispatchAttempt?: number;
   /** When the user message was queued — defines the lower bound of the
    *  send window. Undefined for legacy turns; the gate degrades to
    *  "never suppress" in that case. */
@@ -285,6 +323,62 @@ function markerSetCoversFinal(markers: readonly BridgeSendMarker[], finalText: s
   return !finalIsMateriallyLongerThanSends(finalNormalized.length, structuredMarkers);
 }
 
+function markerMatchesSession(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  return !turn.sessionId || !marker.sessionId || marker.sessionId === turn.sessionId;
+}
+
+function markerMatchesExactTurn(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  return !!turn.turnId
+    && marker.turnId === turn.turnId
+    && marker.dispatchAttempt === turn.dispatchAttempt
+    && markerMatchesSession(turn, marker);
+}
+
+function markerCoversOwnThread(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  if (marker.deliveryKind === undefined) return true;
+  if (turn.chatId && marker.targetChatId && marker.targetChatId !== turn.chatId) {
+    return false;
+  }
+  if (marker.deliveryKind !== 'current_session_send'
+    && turn.rootMessageId && marker.targetRootMessageId
+    && marker.targetRootMessageId !== turn.rootMessageId) {
+    return false;
+  }
+  if (marker.deliveryKind === 'current_session_send') return true;
+  if (!marker.targetChatId && marker.targetSessionId
+    && marker.targetSessionId === turn.sessionId) {
+    return true;
+  }
+  if (turn.chatId) return marker.targetChatId === turn.chatId;
+  return !marker.targetChatId
+    && !!marker.targetSessionId
+    && marker.targetSessionId === turn.sessionId;
+}
+
+function recentPriorFinalMarkerExplainsCompletionNarration(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+): boolean {
+  if (!isBridgeSendCompletionNarration(turn.finalText)) return false;
+  const lower = turn.markTimeMs !== undefined
+    ? turn.markTimeMs - RECENT_PRIOR_FINAL_MARKER_WINDOW_MS
+    : Number.NEGATIVE_INFINITY;
+  const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
+  return markers.some(marker => {
+    if (marker.terminalIndependent === true
+      || !isFinalBridgeSendMarker(marker)
+      || !markerMatchesSession(turn, marker)
+      || !markerCoversOwnThread(turn, marker)
+      || (marker.replyCardResponseKind !== undefined && marker.replyCardResponseKind !== 'final')) {
+      return false;
+    }
+    if (turn.turnId !== undefined && markerMatchesExactTurn(turn, marker)) return false;
+    if (marker.sentAtMs < lower || marker.sentAtMs >= upper) return false;
+    return true;
+  });
+}
+
 export function shouldSuppressBridgeEmit(
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,
@@ -294,6 +388,15 @@ export function shouldSuppressBridgeEmit(
   if (adoptMode) return false;
   if (isBridgeNothingToSendFinal(turn.finalText)) return true;
   if (turn.isLocal) return true;
+  // A botmux send can successfully deliver the prior turn's explicit final,
+  // advance the live PID marker to a queued successor, and then the model may
+  // append a short final_answer that merely narrates that it already sent the
+  // final. That narration is not the queued successor's answer. Exact-turn
+  // marker matching deliberately fails open for real successor content; only
+  // this narrow self-report shape may borrow the recent final marker.
+  if (recentPriorFinalMarkerExplainsCompletionNarration(turn, nextBoundaryMs, markers)) {
+    return true;
+  }
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
