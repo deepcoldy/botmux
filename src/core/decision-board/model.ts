@@ -486,7 +486,7 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
 - 不能自己定的、不可逆的、会推翻 owner 以前决定的事，写成待拍板：
   \`botmux board set <编号> --state decide --ask "要你定的问题" --option "A=做法 → 结果和风险" --option "B=…" --recommend A --reason "理由"\`。
   给两三个选项，写清后果和你的推荐。
-- 写完在管家群里用 \`botmux send --attention=decision --mention-back "…"\` 说一声，附上 \`botmux board list\` 给出的链接。
+- 写完在管家群里用 \`botmux send --attention=decision --mention-back "…"\` 说一声，附上 \`botmux board list\` 给出的链接；发出去之后给每项记一句 \`botmux board history <编号> "已报 owner"\`。
 
 ## 执行一批决定（收到「决策看板 · 批次」消息时）
 - 逐项处理：先 \`botmux board show <编号>\` 看最新内容，再按决定执行。
@@ -507,7 +507,7 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
     同一件事用同一个 key，add 会更新已有项。
   - 写之前核对现状：已合、已关、已经定了的，不写成待拍板。add 碰到已完成、已关闭的项会被拒绝；不要用 set 绕开，确实像要重开的写进汇总，由 owner 定。
   - 只有真要 owner 定的写成 decide，其余写 active 或 waiting。
-- 只报增量：本轮新建的和新转成待拍板的，汇总成一条 \`botmux send --attention=decision --mention-back "…"\`，附上链接；发出去之后给每项记一句 \`botmux board history <编号> "巡检已报"\`；已经在待拍板、报过、没有变化的不再提醒，没记过的这轮补报。没有增量就不发消息。
+- 只报增量：本轮新建的和新转成待拍板的，汇总成一条 \`botmux send --attention=decision --mention-back "…"\`，附上链接；发出去之后照「要 owner 拍板」一节给每项记「已报 owner」；已经在待拍板、记过「已报 owner」、没有变化的不再提醒，没记过的这轮补报。没有增量就不发消息。
 
 ## 推进标准
 （owner 没有写。只汇报和催办，不做不可逆操作。）`;
@@ -534,7 +534,7 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 ## Asking the owner to decide
 - Anything you cannot decide, anything irreversible, or anything that would overturn an earlier owner decision becomes a decision item:
   \`botmux board set <n> --state decide --ask "question" --option "A=approach → outcome and risk" --option "B=…" --recommend A --reason "why"\`.
-- Then tell the owner in the steward chat with \`botmux send --attention=decision --mention-back "…"\`, including the links from \`botmux board list\`.
+- Then tell the owner in the steward chat with \`botmux send --attention=decision --mention-back "…"\`, including the links from \`botmux board list\`; once sent, note \`botmux board history <n> "reported to owner"\` on each item.
 
 ## Executing a batch (when a "Decision board · batch" message arrives)
 - Item by item: \`botmux board show <n>\` for the latest state, then act on the decision.
@@ -555,7 +555,7 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
     The same thing always gets the same key, so add updates the existing item.
   - Check reality before writing: merged, closed or already decided things are not decision items. add refuses done and closed items; do not work around it with set — if something looks like it should reopen, put it in your summary for the owner.
   - Only things the owner really has to decide become decide; everything else is active or waiting.
-- Report only what is new: items created this run and items that newly became decide go into one \`botmux send --attention=decision --mention-back "…"\` with links; after sending, note \`botmux board history <n> "reported by patrol"\` on each. Items already waiting for a decision, reported, and unchanged are not repeated; ones without that note are reported this run. If nothing is new, send nothing.
+- Report only what is new: items created this run and items that newly became decide go into one \`botmux send --attention=decision --mention-back "…"\` with links; after sending, note "reported to owner" on each as in "Asking the owner to decide". Items already waiting for a decision with that note and no change are not repeated; ones without it are reported this run. If nothing is new, send nothing.
 
 ## Standard
 (The owner has not written one. Only report and nudge; take no irreversible action.)`;
