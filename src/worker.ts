@@ -453,6 +453,7 @@ import {
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { waitForProcessQuiescence } from './services/process-quiescence.js';
+import { transferSandboxCleanupOwnership } from './services/sandbox-cleanup-transfer.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
@@ -24855,8 +24856,18 @@ async function spawnCli(
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
       if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
-      sandboxCleanup = sbx.cleanup;
+      try {
+        sandboxCleanup = transferSandboxCleanupOwnership(
+          sandboxCleanup,
+          sbx.cleanup,
+          reusingRepairedScratch,
+        );
+      } catch {
+        // Ordinary replacement failed while retiring its old owner. The freshly
+        // prepared tree must not leak if ownership cannot be installed.
+        try { sbx.cleanup(); } catch { /* best effort */ }
+        throw new Error('failed to transfer scratch sandbox cleanup ownership');
+      }
       sandboxRelayOutbox = sbx.outbox;
       scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
       scratchHostHome = scratchHostView(sbx.mergedHostPath, scratchHome);
