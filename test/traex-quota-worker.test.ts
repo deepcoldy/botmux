@@ -28,6 +28,7 @@ function fixture(extra: Record<string, unknown> = {}) {
     publishActiveRuntime: vi.fn(), emitReadyCodexTurns: vi.fn(), idleDetector: { fireIdle: vi.fn() },
     t: (key: string) => key, ...extra,
   };
+  scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
   const recover = loadWorkerFunction<(turn: any) => boolean>('recoverTraexQuotaTurn', scope);
   const turn = { turnId: 'turn', sourceTurnId: 'native-turn', started: true,
     terminalStatus: 'failed', terminalErrorCode: TRAEX_QUOTA_ERROR_CODE };

@@ -4745,6 +4745,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
+      if (ds.session.pendingForkSession && sessionCliId(ds) === 'antigravity') {
+        return { toast: { type: 'warning', content: t('cmd.stop.fork_pending', undefined, locDs) } };
+      }
       if (isSessionTransferring(ds)) {
         return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
       }
@@ -5006,6 +5009,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
     // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.
     if (actionType === 'term_action' && ds) {
+      if (ds.session.pendingForkSession && sessionCliId(ds) === 'antigravity') {
+        return { toast: { type: 'warning', content: t('cmd.stop.fork_pending', undefined, localeForBot(ds.larkAppId)) } };
+      }
       if (isSessionTransferring(ds)) {
         return {
           toast: {
