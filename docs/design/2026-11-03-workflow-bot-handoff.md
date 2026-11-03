@@ -426,8 +426,8 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 | `nodeHandoffSent` | 消息发出后 | 节点卡 id（如有）、交接消息 id、话题 id |
 | `nodeHandoffAccepted` | 子 Bot 会话登记了这条交接 | sessionId、截止时间 |
 | `nodeStalled` | 轮次结束但未提交，只影响显示 | 时间 |
-| `nodeReassigned` | 改派 | from、to、操作人；主 Bot 自动改派时另有 `by: main_bot`、`reason`（13.6） |
-| `nodeHandedToHuman` | 主 Bot 决定把节点交给人（13.6） | nodeId、instanceId（如有）、attemptId（如有）、`reason`、`by: main_bot`、触发回合的 turnId |
+| `nodeReassigned` | 改派 | from、to、操作人；主 Bot 自动改派时另有 `auto: { by: 'main_bot', reason }`（13.6） |
+| `nodeHandedToHuman` | 主 Bot 决定把节点交给人（13.6）；只作记录，随后必写 `nodeBlocked(HANDED_TO_HUMAN)` | nodeId、instanceId（如有）、attemptId（如有）、`reason`、`by: main_bot`、触发回合的 turnId |
 
 结束仍用现有的 `nodeSucceeded` / `nodeBlocked` / `nodeFailed` / `nodeCancelled`。新增错误码：`BOT_NOT_IN_CHAT`、`BOT_OFFLINE`、`COLLABORATION_DENIED`、`HANDOFF_NOT_ACCEPTED`、`HANDOFF_UNCERTAIN`、`BOT_REPORTED_BLOCKED`、`NODE_TIMEOUT`、`IDENTITY_UNAVAILABLE`、`HANDED_TO_HUMAN`（13.6）。
 
@@ -623,9 +623,18 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 
 ### 13.1 谁能改（M1，已定）
 
-- **主 Bot（主会话）**：通过 `botmux workflow edit <runId> --patch-file <文件> --base <版本>` 提交修改。鉴权沿用现有创作命令：必须处在与 run 绑定的同一应用、群、主会话的已认证回合里。
+- **主 Bot（主会话）**：通过 `botmux workflow edit <runId> --patch-file <文件> --base <版本>` 提交修改。必须处在与 run 绑定的同一应用、群、主会话的已认证回合里。
   - 发起人本人触发的回合，或本 run 事件唤醒的回合（M6）：按 13.5 的分类直接生效或进入待确认。
   - 其他人触发的回合：所有修改一律转为待发起人确认。
+- **鉴权怎么实现**：现有鉴权对上面两类新回合都走不通，需要按以下方式改。
+  - **事件唤醒的回合**：
+    - 现有的合成触发 turnId 是 `trg_…`，`resolveCurrentTurnProvenance` 只认 `om_` / `join_` / `schedule:` 三类，会拒绝它（`src/core/reply-target.ts`）。
+    - 做法：照 `schedule:` 的先例（`src/core/current-turn-provenance.ts` 与 `session-relay.ts` 的 scheduled 分支）新增一类 turn 来源 `workflow-event:<runId>:<事件序号>`。它只能由拥有该 run 的 daemon 签发，并与主会话绑定，daemon 侧认它为「本 run 事件唤醒的回合」。
+    - 其它合成 turnId 仍然一律拒绝。
+  - **其他人的回合**：
+    - 现在 `authorizeV3RunMutationForCurrentTuple` 要求调用者等于 run 的 owner，非发起人会被直接拒绝。
+    - 做法：只对 `edit`，把校验放宽为「应用、群、主会话一致」，调用者身份只用来决定直接生效还是转待确认。
+    - `retry` / `grant` / `cancel` 的鉴权不变。
 - **人**：在主话题里跟主 Bot 说，由主 Bot 转成修改。第一版不在 Dashboard 上做编辑。
 - **子 Bot**：不能改流程。可以 `botmux report --status blocked` 说明做不了、给出建议，触发主 Bot 被唤醒。
 
@@ -649,7 +658,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - `dag.json` 保持为第 1 版，仍被 `run.json` 的摘要锁定，不改动。
 - 每次修改生成 `dag-revisions/<NNN>.json`（修改后的完整 DAG）和 `dag-revisions/<NNN>.patch.json`（本次的操作），都原子写入。
 - journal 事件：
-  - `dagRevised { revision, baseRevision, sha256, summary, by, approval? }`：修改生效；
+  - `dagRevised { revision, baseRevision, sha256, summary, by, approval?, auto? }`：修改生效。`auto` 是主 Bot 自动处理时的来源与理由（13.6）；
   - `dagRevisionProposed { revision, sha256, reasons[] }` 加一个等待记录（与 Gate 一样放在 `waits/`）：需要确认的修改；
   - `dagRevisionApproved`、`dagRevisionRejected`：确认结果。
 - 状态重放：按 journal 顺序取「第 1 版 + 已生效的修改」得到当前流程，`decideNext` 用当前版本调度。每个版本文件的 sha256 必须与事件里记录的一致，不一致就 fail closed。
@@ -662,6 +671,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 |---|---|---|
 | 未开始 | 全部 | 直接按新定义调度 |
 | 等人工确认（Gate 等待中） | 改定义、改派、删除 | 作废等待中的 Gate，卡片冻结为「流程已修改，本次审批作废」，再按新定义重新走 Gate |
+| 受阻（`blocked`，含 `NODE_TIMEOUT`、`BOT_REPORTED_BLOCKED`、`HANDED_TO_HUMAN`） | 改定义、改派、删除 | 效果与「进行中」相同，但此时没有在跑的尝试，不需要停轮 |
 | 进行中 | 改定义、改派、删除 | 作废当前尝试（停掉子 Bot 这一轮、作废登记）。改定义和改派会在原落点发新的交接，注明「要求已修改」；删除则写 `nodeCancelled`。依赖不能改（已经开始了） |
 | 已完成 | 只能 `rerunNode`，或在它下游加节点 | 不能删、不能改定义（产出可能已被下游用了）。`rerunNode` 按 Revisit 的方式建新实例，已经用过旧产出的下游节点一起标为已替代并重跑。这走 Revisit 预算，不另开额度 |
 | 跳过 / 已取消 / 已替代 | 不能改 | 需要的话加新节点 |
@@ -702,10 +712,10 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 
   检查点由 Architect 或主 Bot 在流程里标出，用在「做完这一步要看看结果再决定后面怎么走」的地方。不在每个节点完成时都唤醒，避免空耗和插话。唤醒只在新模式下发生。
 - **自动处理（M3，已定：不设次数上限）**：被唤醒后，主 Bot 可以自己重试、改派（在已批准的 Bot 内）或 `rerunNode`，也可以决定交给人。什么时候交给人，由主 Bot 按情况判断，例如反复失败、拿不准下一步、需要人提供信息或做取舍。
-  - **必须写明理由**：主 Bot 每次自动处理都要带上理由，命令为 `botmux workflow retry|edit … --reason "<为什么自动处理>"`；交给人时运行 `botmux workflow ask-human <runId> --node <id> --reason "<为什么交给人>"`。理由记进运行记录：自动处理写在 `nodeRetryRequested` / `nodeReassigned` / `dagRevised` 事件的 `reason` 和 `by: main_bot` 字段，交给人写一条新事件 `nodeHandedToHuman`。
+  - **必须写明理由**：主 Bot 每次自动处理都要带上理由，命令为 `botmux workflow retry|edit … --reason "<为什么自动处理>"`；交给人时运行 `botmux workflow ask-human <runId> --node <id> --reason "<为什么交给人>"`。理由记进运行记录：自动处理在 `nodeRetryRequested` / `nodeReassigned` / `dagRevised` 事件上新增独立字段 `auto: { by: 'main_bot', reason }`。`nodeRetryRequested` 已有的 `reason`（闭集取值 `blockedRetry`）不复用、不改；交给人写一条新事件 `nodeHandedToHuman`。
   - **由事件唤醒的回合缺理由就拒绝**：CLI 在这类回合里不带 `--reason` 时直接报错。人本人触发的回合可以不填。
   - **交给人之后节点处于什么状态**：
-    - `ask-human` 会先停掉并关闭该节点正在进行的尝试（与超时同一条关闭路径），写 `nodeHandedToHuman`，再把节点置为 `blocked`，错误码 `HANDED_TO_HUMAN`，理由原样展示。
+    - `ask-human` 在同一把 journal 锁内依次做三件事：先停掉该节点正在进行的尝试（与超时同一条关闭路径），再写 `nodeHandedToHuman`（只作记录），然后写 `nodeBlocked { errorCode: 'HANDED_TO_HUMAN' }`，理由原样展示。尝试的关账和节点状态都由这条 `nodeBlocked` 决定，与其它受阻原因一致；只写 `nodeHandedToHuman` 不会关闭尝试。
     - 之后沿用现有阻塞卡（重试、改派、取消），不另设超时，等人处理。
     - 人在主话题里回复，算发起人或其他人触发的普通回合，按 M1 区分能否直接改流程；处理完由人点卡片，或由主 Bot 在发起人回合里 `retry` / `edit`。
   - **在哪里展示**：节点卡上显示最近一次的「主 Bot 自动重试 / 改派 / 重做：<理由>」或「交给人决定：<理由>」；看板节点详情列出全部记录；交给人时节点状态显示为「等人工确认」。
@@ -812,7 +822,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 | 顺序 | PR | 内容 | 依赖 |
 |---|---|---|---|
 | 1 | `feat(dashboard): 工作流运行图显示负责 Bot、状态和耗时` | 本设计文档；`RunNodeView` 增加 bot、displayStatus、时间、attempts；SVG 节点框三行化；详情面板显示尝试记录。对旧 run 生效 | 无 |
-| 2 | `feat(workflow): workflow skill 改为确定使用时按需注入` | 第 4 节：去掉三个 skill 的常驻注入，改写发现提示，`/workflow` 改为按需读取；补「开关关闭时完全不注入」的回归测试。节点会话的跳过逻辑放到 PR 5 | 无 |
+| 2 | `feat(workflow): workflow skill 改为确定使用时按需注入` | 第 4 节：去掉三个 skill 的常驻注入，改写发现提示，`/workflow` 改为按需读取；补「开关关闭时完全不注入」的回归测试。节点会话的跳过逻辑放到 PR 5a | 无 |
 | 3 | `feat(workflow): 节点改为落盘等待的外部执行（引擎层）` | 第 9 节：`nodeExecutor`、新事件和重放、等待外部、冷启动对账、超时与可注入时钟、取消与迟到提交、计数 key 修正。传输层用假实现 | 1（文档） |
 | 4 | `feat(workflow): 运行中按版本修改流程` | 第 13 节：`workflow edit/status`、版本文件与事件、13.4 的处理规则、校验；M1 的回合鉴权（他人回合转待确认）；M2 的确认清单与确认卡；看板和进度卡的版本显示 | 3 |
 | 5a | `feat(workflow): 节点交给群里的 Bot 执行（默认关）` | 开关；只做节点话题落点；节点卡、交接、签名登记与撤销；chatGrant 与接单；附件输入；`report --output/--result-file` 与提交区（主 Bot 离线时暂存）；回报卡；停下、超时、取消；指派给自己；节点会话不注入 workflow 与编排类 skill（N3）；文档站更新 | 3 |
@@ -838,7 +848,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - **注入（PR 2）**：
   - 开关关 / 开 × 三种 skill 注入模式 × Claude 家族 / 其它 CLI，断言实际生成的提示和落盘的 skill 文件，不读源码文本。
   - `/workflow` 和自然语言确认两条路径各跑一次真实会话。
-- **飞书接线（PR 5–9）**：
+- **飞书接线（PR 5a、5b、6、7、9）**：
   - 在隔离环境用两到三个测试 Bot 实测：两种落点、接单、附件输入、提交被拒后补交、回报、超时、取消、主 Bot 的 daemon 重启、子 Bot 不在群、运行中修改。
   - 身份部分补全 ADR 验证清单里的多跳、撤权、换回合场景。
   - 侧边栏分三种身份实测：管理员、群成员、非群成员。
