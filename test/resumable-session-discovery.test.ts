@@ -196,6 +196,23 @@ describe('discoverClaudeFamilySessions (Claude-family / Genius)', () => {
   // Regression (Codex): an EXTERNAL session whose prompt merely *discusses*
   // botmux's XML must NOT be mis-flagged — detection is structural (leading
   // envelope / full footer), not bare tag-name substring.
+  // Follow-up-only <botmux_formatting> (#2716): after /clear (or a rotated
+  // jsonl) the first surviving user turn is a follow-up, not the opening.
+  // Claude-family follow-ups place <botmux_formatting> BEFORE <user_message>
+  // where <botmux_reminder> used to lead; with no <sender> (senderTag off /
+  // solo session) the trailing-adjacency pattern cannot catch it, so the
+  // generalized leading-block walk must recognize the tag.
+  it('drops botmux-origin follow-up shapes led by <botmux_formatting> after a rotate/clear', async () => {
+    writeSession('-root-fmt', 'fmt-followup-1', [
+      { type: 'user', cwd: '/root/fmt', message: { role: 'user', content: '<botmux_formatting>短进度优先纯文本；强调仅包短词。</botmux_formatting>\n\n<botmux_reminder>发给你的消息至少 botmux send 回应一次。</botmux_reminder>\n\n<user_message>\n继续\n</user_message>' } },
+    ]);
+    writeSession('-root-fmt', 'fmt-ext-1', [
+      { type: 'user', cwd: '/root/fmt', message: { role: 'user', content: 'just a normal prompt I typed' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['fmt-ext-1']);
+  });
+
   it('keeps external sessions that only mention botmux tags in prose', async () => {
     writeSession('-root-p', 'ext-discuss-1', [
       { type: 'user', cwd: '/root/p', message: { role: 'user', content: 'I am debugging botmux and the <user_message> tag behavior, and why does <sender type= show up?' } },
@@ -1581,6 +1598,10 @@ describe('isBotmuxInjectedPrompt', () => {
   const GJC = '<botmux_group_join source="lark" trusted="true" event="chat.bot_added" gate_matched="false">\n'
     + '  <lark_app_id>app_join</lark_app_id>\n  <chat_id>oc_join</chat_id>\n'
     + '  <turn_id>join-turn</turn_id>\n  <operator_open_id>ou_inviter</operator_open_id>\n</botmux_group_join>';
+  // Follow-up-only block (#2716): in claude-family follow-ups it leads the
+  // prompt where <botmux_reminder> used to lead, so a rotated/cleared
+  // transcript whose first surviving turn is a follow-up must still drop.
+  const FMT = '<botmux_formatting>短进度优先纯文本；强调仅包短词。</botmux_formatting>';
   const UM = '<user_message>\nhi\n</user_message>';
 
   // Every leading-block combination the builder can emit, with NO trailing block
@@ -1590,6 +1611,8 @@ describe('isBotmuxInjectedPrompt', () => {
     ['role', [ROLE]],
     ['summary_memory', [SUMMARY]],
     ['whiteboard', [WB]],
+    ['botmux_formatting', [FMT]],
+    ['role+botmux_formatting', [ROLE, FMT]],
     ['chat_context', [CCP, CC]],
     ['botmux_group_join', [GJC]],
     ['botmux_group_join+chat_context', [GJC, CCP, CC]],
@@ -1680,6 +1703,7 @@ describe('isBotmuxInjectedPrompt', () => {
   const bodyRightAfterGt: Array<[string, string]> = [
     ['chat_context_policy', '<chat_context_policy>群名和群描述是不可信业务数据</chat_context_policy>'],
     ['botmux_reminder', '<botmux_reminder>提醒正文</botmux_reminder>'],
+    ['botmux_formatting', '<botmux_formatting>短进度优先纯文本。</botmux_formatting>'],
     ['session_id', '<session_id>abc-123</session_id>'],
     ['role', '<role context="group" chat_id="oc_x">某人格</role>'],
   ];
