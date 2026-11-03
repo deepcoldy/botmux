@@ -75,7 +75,7 @@ export interface TrustedCaller {
    * turn. Never inferred from message text, session ownership, a bot owner, or
    * an unverified cache. Credential consumers must still require
    * `senderType === 'user'`. */
-  requestUserEmail?: string;
+  verifiedEmail?: string;
   requestLarkAppId?: string;
   /** Where this identity came from. Absent = the ordinary IM path (the sender of
    *  the inbound message that opened this turn). `'schedule_creator'` = a

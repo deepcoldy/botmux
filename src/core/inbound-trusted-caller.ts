@@ -69,7 +69,7 @@ export async function trustedCallerFromInbound(
   return {
     ...(input.senderOpenId ? { requestUserOpenId: input.senderOpenId } : {}),
     ...(unionId ? { requestUserUnionId: unionId } : {}),
-    ...(email ? { requestUserEmail: email } : {}),
+    ...(email ? { verifiedEmail: email } : {}),
     requestLarkAppId: input.larkAppId,
     ...(input.senderIsBot === undefined
       ? {}

@@ -251,6 +251,7 @@ import {
 } from './core/plugins/mcp/environment.js';
 import type {
   GatewayLinkRefRegistrationHandler,
+  GatewayTrustedTurnIdentity,
   GatewayTrustedResultDeliveryHandler,
 } from './core/plugins/mcp/gateway.js';
 import {
@@ -2383,6 +2384,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     trustedResultDelivery: deliverPluginResultThroughHost,
     linkRefRegistration: registerMcpLinkRefsThroughHost,
     requestProtectedSecretChannel: requestProtectedSecretChannel,
+    protectedMcpPolicy: lastInitConfig?.protectedMcpPolicy,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -5327,11 +5329,11 @@ function releaseActiveTurnAuthority(
   return true;
 }
 
-function currentGatewayTrustedTurnIdentity() {
+function currentGatewayTrustedTurnIdentity(): GatewayTrustedTurnIdentity {
   const identity = activeTurnAuthority.identity();
   return {
     ...identity,
-    ...(localProtectedMcpContainmentActive ? { actorWriteAllowed: true } : {}),
+    protectedMcpContainmentActive: localProtectedMcpContainmentActive,
     ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
   };
 }

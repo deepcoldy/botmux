@@ -78,6 +78,8 @@ import type {
 import {
   PROTECTED_MCP_CHILD_SECRET_FD,
   PROTECTED_MCP_SECRET_FD_ENV,
+  type ProtectedMcpWorkerPolicy,
+  type TrustedTurnPrincipal,
 } from '../../protected-mcp-capabilities.js';
 import { ProtectedSecretClientTransport } from './protected-secret-transport.js';
 
@@ -130,7 +132,7 @@ export interface GatewayTrustedTurnIdentity {
   identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
-  actorWriteAllowed?: boolean;
+  protectedMcpContainmentActive?: boolean;
 }
 
 export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
@@ -347,6 +349,7 @@ export class PluginMcpGateway {
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
   private readonly linkRefRegistration?: GatewayLinkRefRegistrationHandler;
   private readonly requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
+  private readonly protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -367,6 +370,7 @@ export class PluginMcpGateway {
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
       linkRefRegistration?: GatewayLinkRefRegistrationHandler;
       requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
+      protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
     } = {},
   ) {
     this.env = env;
@@ -374,6 +378,7 @@ export class PluginMcpGateway {
     this.trustedResultDelivery = opts.trustedResultDelivery;
     this.linkRefRegistration = opts.linkRefRegistration;
     this.requestProtectedSecretChannel = opts.requestProtectedSecretChannel;
+    this.protectedMcpPolicy = opts.protectedMcpPolicy;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -577,25 +582,13 @@ export class PluginMcpGateway {
     };
   }
 
-  private trustedTurnMeta(
-    identity: GatewayTrustedTurnIdentity | undefined,
-    includeLocalActorFields = false,
-  ): Record<string, unknown> | undefined {
+  private trustedTurnMeta(identity: GatewayTrustedTurnIdentity | undefined): Record<string, unknown> | undefined {
     const caller = identity?.caller;
     if (!caller && !identity?.turnId) return undefined;
     const hostCapabilities = this.trustedResultDelivery ? ['result_delivery_v1'] : [];
-    const actorBoundToEnvelope = !identity?.identityTurnId
-      || identity.identityTurnId === identity.turnId;
-    const includeActorWriteFields = includeLocalActorFields
-      && identity?.actorWriteAllowed === true
-      && actorBoundToEnvelope;
     return {
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
-      ...(includeActorWriteFields && caller?.requestUserEmail
-        ? { requestUserEmail: caller.requestUserEmail }
-        : {}),
-      ...(includeActorWriteFields ? { actorWriteAllowed: true } : {}),
       ...(caller?.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
       // Provenance travels with the identity so a plugin can tell "a human just
       // asked" from "a scheduled task is running as them". Deliberately NOT
@@ -615,17 +608,58 @@ export class PluginMcpGateway {
     };
   }
 
+  private protectedTurnGrant(
+    connection: GatewayConnection,
+    identity: GatewayTrustedTurnIdentity | undefined,
+  ): { principal?: TrustedTurnPrincipal; capabilities: string[] } | undefined {
+    const server = connection.server;
+    if (server.transport !== 'stdio'
+      || !server.protectedCapability
+      || identity?.protectedMcpContainmentActive !== true) return undefined;
+    const capability = this.protectedMcpPolicy?.capabilities.find(item => (
+      item.id === server.protectedCapability
+      && item.allowedPluginIds.includes(connection.pluginId)
+    ));
+    if (!capability) return undefined;
+    if (capability.principal !== 'verified-human-email') {
+      return { capabilities: [capability.id] };
+    }
+
+    const caller = identity.caller;
+    const actorBoundToEnvelope = !identity.identityTurnId
+      || identity.identityTurnId === identity.turnId;
+    if (!actorBoundToEnvelope
+      || !identity.turnId
+      || caller?.senderType !== 'user'
+      || caller.source !== undefined
+      || !caller.verifiedEmail
+      || !caller.requestLarkAppId) return undefined;
+    return {
+      principal: {
+        type: 'human',
+        ...(caller.requestUserOpenId ? { openId: caller.requestUserOpenId } : {}),
+        ...(caller.requestUserUnionId ? { unionId: caller.requestUserUnionId } : {}),
+        verifiedEmail: caller.verifiedEmail,
+        appId: caller.requestLarkAppId,
+        turnId: identity.turnId,
+        ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+      },
+      capabilities: [capability.id],
+    };
+  }
+
   private withTrustedTurnMeta<T extends { _meta?: Record<string, unknown> }>(
     params: T,
     identity: GatewayTrustedTurnIdentity | undefined,
-    includeLocalActorFields = false,
+    connection: GatewayConnection,
   ): T {
-    const trusted = this.trustedTurnMeta(identity, includeLocalActorFields);
+    const trusted = this.trustedTurnMeta(identity);
+    const grant = this.protectedTurnGrant(connection, identity);
     const cleanedMeta = Object.fromEntries(
       Object.entries(params._meta ?? {})
         .filter(([key]) => !key.toLowerCase().startsWith(BOTMUX_META_RESERVED_PREFIX)),
     );
-    if (!trusted) {
+    if (!trusted && !grant) {
       return Object.keys(cleanedMeta).length > 0
         ? { ...params, _meta: cleanedMeta }
         : { ...params, _meta: undefined };
@@ -634,7 +668,9 @@ export class PluginMcpGateway {
       ...params,
       _meta: {
         ...cleanedMeta,
-        botmuxTrustedCaller: trusted,
+        ...(trusted ? { botmuxTrustedCaller: trusted } : {}),
+        ...(grant?.principal ? { botmuxTrustedPrincipal: grant.principal } : {}),
+        ...(grant ? { botmuxGrantedCapabilities: grant.capabilities } : {}),
       },
     };
   }
@@ -804,7 +840,7 @@ export class PluginMcpGateway {
         this.withTrustedTurnMeta(
           { ...request.params, name: route.originalName },
           identity,
-          route.connection.server.transport === 'stdio',
+          route.connection,
         ),
         undefined,
         this.requestOptions(request, extra, route.connection.toolTimeoutMs),

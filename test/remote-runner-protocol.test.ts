@@ -14,11 +14,12 @@ import {
 } from '../src/adapters/backend/remote-runner-protocol.js';
 
 describe('remote runner protocol', () => {
-  it('never serializes the local actor email to a remote provider', () => {
+  it('never serializes a verified local principal or capability to a remote provider', () => {
     expect(projectRemoteRunnerTrustedCaller({
       requestUserOpenId: 'ou_actor',
       requestUserUnionId: 'on_actor',
-      requestUserEmail: 'actor@bytedance.com',
+      verifiedEmail: 'actor@bytedance.com',
+      botmuxGrantedCapabilities: ['fixture.secret.v1'],
       requestLarkAppId: 'cli_app',
       senderType: 'user',
     })).toEqual({

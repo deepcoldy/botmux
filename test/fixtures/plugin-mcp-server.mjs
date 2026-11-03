@@ -122,7 +122,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       content: [{
         type: 'text',
         text: `secretFd=${inheritedSecret === 'fd-only-secret'}:`
-          + `secretEnv=${process.env.BYTEDCLI_AI_AUTH_APP_KEY !== undefined}:`
+          + `secretEnv=${process.env.FIXTURE_SECRET !== undefined}:`
           + `secretArgv=${process.argv.includes('fd-only-secret')}`,
       }],
     };

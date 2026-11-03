@@ -15,7 +15,7 @@ describe('inbound trusted caller union-id repair', () => {
       resolveVerifiedUserEmail,
     })).resolves.toMatchObject({
       requestUserOpenId: 'ou_human_sender',
-      requestUserEmail: 'alice@bytedance.com',
+      verifiedEmail: 'alice@bytedance.com',
       senderType: 'user',
     });
     expect(resolveVerifiedUserEmail).toHaveBeenCalledWith('cli_receiver', 'ou_human_sender');
@@ -33,7 +33,7 @@ describe('inbound trusted caller union-id repair', () => {
         resolveMessageSenderUnionId: async () => null,
         resolveVerifiedUserEmail,
       });
-      expect(caller?.requestUserEmail).toBeUndefined();
+      expect(caller?.verifiedEmail).toBeUndefined();
       expect(resolveVerifiedUserEmail).not.toHaveBeenCalled();
     }
   });
@@ -53,7 +53,7 @@ describe('inbound trusted caller union-id repair', () => {
         resolveVerifiedUserEmail,
       });
       expect(caller).toMatchObject({ requestUserOpenId: 'ou_human_sender', senderType: 'user' });
-      expect(caller?.requestUserEmail).toBeUndefined();
+      expect(caller?.verifiedEmail).toBeUndefined();
     }
   });
 

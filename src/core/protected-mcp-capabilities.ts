@@ -48,6 +48,21 @@ export interface ProtectedMcpWorkerPolicy {
   redactEnv: string[];
 }
 
+export interface TrustedTurnPrincipal {
+  type: 'human';
+  openId?: string;
+  unionId?: string;
+  verifiedEmail: string;
+  appId: string;
+  turnId: string;
+  dispatchAttempt?: number;
+}
+
+export interface GrantedMcpCapability {
+  id: string;
+  principal?: TrustedTurnPrincipal;
+}
+
 export interface ProtectedMcpWorkerProvisioning {
   workerPolicy: ProtectedMcpWorkerPolicy;
   secrets: Map<string, string>;
