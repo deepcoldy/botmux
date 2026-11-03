@@ -1,4 +1,4 @@
-import { guardSessionDirectoryWrites } from './managed-directory-retention.js';
+import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
 import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
@@ -1208,6 +1208,12 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* no leftover from a crashed import */ }
   }
   const entries = readJsonEntriesForImport(jsonFp);
+  // The rename below is the first moment every historical row becomes visible
+  // in a SQLite store (the staging db is a private tmp path no scanner reads).
+  // Register all rows' managed references for the staging-and-rename sequence,
+  // so a collection begun during the JSON→SQLite upgrade cannot retire a
+  // version a restored session is about to name.
+  const releaseImport = reserveManagedDirectories(entries.map(([, value]) => value));
   const tmp = openDatabaseSyncOrThrow(tmpFp);
   try {
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
@@ -1252,6 +1258,8 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
       try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* best-effort orphan cleanup */ }
     }
     throw err;
+  } finally {
+    releaseImport();
   }
 }
 

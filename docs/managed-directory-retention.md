@@ -21,10 +21,24 @@
 必须停止无此能力的旧进程后再启用，不能仅更新 CLI 二进制便宣称旧 daemon 已受保护。
 未配置的普通安装不参与该协议。声明配置后解析或写入错误会明确失败，不忽略引用。
 
-Botmux 的会话 SQLite 写入、Bot 配置写入、定时任务写入、Skill 注册及本地 Skill 源复制均参与。
-新引用在发布前持久登记，未提交事务在 COMMIT/ROLLBACK 前保持登记；扫描开始时继承在途登记。
-精确 CAS 没有改变目录引用时不产生维护状态写入，普通消息状态更新不与回收争夺文件锁。
-扫描不持有 Botmux 锁；只有登记、退役提交和原子改名使用短互斥。
+Botmux 的以下持久写入均参与屏障，新引用在发布前持久登记，未提交事务在
+COMMIT/ROLLBACK 前保持登记；扫描开始时继承在途登记：
+
+- 会话主库 `sessions.db`（全部 `sessions` 表 INSERT/UPDATE 路径，含离线 CAS 与恢复回填）
+- 首次启动的 JSON→SQLite 导入：登记覆盖 staging 库构建到 `rename` 发布的全程
+- 权威定时任务库 `schedule-authority.sqlite`（direct/delegated 新建、编辑、legacy 回填）
+  及其 JSON 投影 `schedules.json`
+- Bot 配置 `bots.json`（setup、daemon、dashboard 全部原子写路径）
+- Skill 注册表与本地 Skill 源复制
+- headless 会话记录、文档订阅注册表、白板 meta 与索引
+
+精确 CAS 没有改变目录引用时不产生维护状态写入。引用了**当前不存在**的版本目录
+（从未安装、已隔离、从别处恢复的备份）只跳过该条登记，不会让整快照写入失败；
+而指向仍存在但已退役 inode 的引用仍明确拒绝。扫描不持有 Botmux 锁；只有登记、
+退役提交和原子改名使用短互斥。
+
+配置根可以经过符号链接的父目录（如 `/srv/versions` 实际指向 `/data/srv/versions`）：
+加载时按 realpath 归一化，literal 与 real 两种拼写在登记、退役和 `resume` 中等价。
 
 ## 收集协议
 
@@ -66,5 +80,8 @@ Botmux 的会话 SQLite 写入、Bot 配置写入、定时任务写入、Skill �
 部署方的安装器也必须使用安装锁，并在复用已退役版本前完成 `resume`。
 不能以协议成功推断物理空间已释放，实际删除结果和运行影响须由回收器记录并验收。
 本协议只适用于本地主机/共享文件系统上的目录，不承担远端 Mojo/Riff 工作区的生命周期。
+
+首次启用建议先干跑：全部参与者升级重启后执行一轮 `begin`/`retire`，核对
+`quarantined` 为空（或仅含确认无用的候选），再让回收器删除隔离目录。
 
 测试使用临时目录、真实 SQLite 事务和自建写入进程；不访问飞书或重启现有 daemon。

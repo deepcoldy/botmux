@@ -259,8 +259,8 @@ export class ScheduleAuthorityStore {
     // projection: register their managed references for the whole commit so a
     // collection begun during startup cannot retire a backfilled version.
     const releaseInit = reserveManagedDirectories(validated);
-    this.db.exec('BEGIN IMMEDIATE;');
     try {
+      this.db.exec('BEGIN IMMEDIATE;');
       const initialized = this.db.prepare(
         'SELECT 1 AS present FROM schedule_authority_apps WHERE app_id = ?',
       ).get(appId) as { present?: number } | undefined;
@@ -366,8 +366,8 @@ export class ScheduleAuthorityStore {
     // scanning concurrently must already mark them. The JSON projection is
     // written only afterwards and cannot fence this commit by itself.
     const release = reserveManagedDirectories(task);
-    this.db.exec('BEGIN IMMEDIATE;');
     try {
+      this.db.exec('BEGIN IMMEDIATE;');
       const existing = this.getRecord(appId, task.id);
       if (existing) {
         if (existing.state === 'revoked') throw new Error('schedule_task_id_conflict');
@@ -425,8 +425,8 @@ export class ScheduleAuthorityStore {
     // Delegated tasks are published straight into the authority DB; register
     // the references for the whole transaction like createDirect.
     const releaseDelegated = reserveManagedDirectories(input.task);
-    this.db.exec('BEGIN IMMEDIATE;');
     try {
+      this.db.exec('BEGIN IMMEDIATE;');
       const prior = this.db.prepare(`
         SELECT app_id, task_id, request_hash, task_json FROM schedule_authority_tasks
         WHERE grant_id = ? AND request_hash = ?

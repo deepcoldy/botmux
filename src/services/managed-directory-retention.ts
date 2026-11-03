@@ -13,7 +13,10 @@ import type { DatabaseSyncLike, StatementLike } from './sqlite-compat.js';
 export interface ManagedDirectoryConfig {
   schemaVersion: 1;
   statePath: string;
-  roots: { path: string; hashLength: 40 | 64 }[];
+  /** `path` is the realpath-normalized root; `literalPath` is the configured
+   * spelling, so references persisted through a symlinked ancestor keep
+   * matching after the root is canonicalized at load time. */
+  roots: { path: string; literalPath?: string; hashLength: 40 | 64 }[];
 }
 export interface DirectoryCandidate { path: string; dev: string; ino: string; ctimeNs: string; references: string[] }
 interface Reservation { pid: number; identity?: string; paths: string[] }
@@ -38,11 +41,25 @@ export function loadManagedDirectoryConfig(botsFile?: string): ManagedDirectoryC
   if (!info.isFile() || (info.mode & 0o077) !== 0) throw new Error('unsafe_managed_directory_config');
   const config = JSON.parse(readFileSync(path, 'utf8')) as ManagedDirectoryConfig;
   if (config.schemaVersion !== 1 || !isAbsolute(config.statePath)
-      || !Array.isArray(config.roots) || config.roots.length === 0
-      || config.roots.some(r => !isAbsolute(r.path) || normalize(r.path) !== r.path
-        || ![40, 64].includes(r.hashLength))) throw new Error('invalid_managed_directory_config');
-  configurations.set(path, config);
-  return config;
+      || !Array.isArray(config.roots) || config.roots.length === 0) {
+    throw new Error('invalid_managed_directory_config');
+  }
+  const roots = config.roots.map(r => {
+    if (!isAbsolute(r.path) || normalize(r.path) !== r.path
+      || ![40, 64].includes(r.hashLength)) throw new Error('invalid_managed_directory_config');
+    // A root reached through a symlinked ancestor (/srv -> /data/srv) is a
+    // normal deployment shape. Retirement identity is recorded by realpath, so
+    // both the literal and real spellings must resolve to the same root.
+    let canonical = r.path;
+    try { canonical = realpathSync(r.path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    return { path: canonical, literalPath: r.path, hashLength: r.hashLength };
+  });
+  const normalized: ManagedDirectoryConfig = { schemaVersion: 1, statePath: config.statePath, roots };
+  configurations.set(path, normalized);
+  return normalized;
 }
 
 function loadState(config: ManagedDirectoryConfig): State {
@@ -68,9 +85,55 @@ function saveState(config: ManagedDirectoryConfig, state: State): void {
   }
 }
 
+function rootNames(root: { path: string; literalPath?: string }): string[] {
+  return root.literalPath && root.literalPath !== root.path
+    ? [root.path, root.literalPath]
+    : [root.path];
+}
+
 function managedPath(config: ManagedDirectoryConfig, path: string): boolean {
-  return config.roots.some(r => dirname(path) === r.path
-    && new RegExp(`^[0-9a-f]{${r.hashLength}}$`).test(path.slice(r.path.length + 1)));
+  return config.roots.some(r => rootNames(r).some(prefix => dirname(path) === prefix
+    && new RegExp(`^[0-9a-f]{${r.hashLength}}$`).test(path.slice(prefix.length + 1))));
+}
+
+/** Canonical key for a path that names a managed version: the realpath form
+ * while the inode exists, the lexical form once it is gone. Returns undefined
+ * for paths outside every configured root or non-hex siblings. */
+function canonicalManagedPath(config: ManagedDirectoryConfig, path: string): string | undefined {
+  if (!managedPath(config, path)) return undefined;
+  try {
+    const real = realpathSync(path);
+    return managedPath(config, real) ? real : undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return normalize(path);
+    throw error;
+  }
+}
+
+/** Every lexical spelling of one managed version across a root's real and
+ * configured names, WITHOUT touching the filesystem. Collector-supplied sets
+ * (retained, reference edges, resume targets) use this: the symlink at a root
+ * can disappear between the external scan and retire, so a literal-spelling
+ * assertion must still match the real-spelling candidate (and vice versa). */
+function lexicalManagedKeys(config: ManagedDirectoryConfig, path: string): string[] {
+  const out = new Set<string>();
+  for (const root of config.roots) {
+    const names = rootNames(root);
+    let base: string | undefined;
+    for (const prefix of names) {
+      if (dirname(path) === prefix) { base = path.slice(prefix.length + 1); break; }
+    }
+    if (base === undefined || !new RegExp(`^[0-9a-f]{${root.hashLength}}$`).test(base)) continue;
+    for (const name of names) out.add(join(name, base));
+  }
+  return [...out];
+}
+
+/** Collector-provided path/edge spelling(s) resolved to state keys. */
+function collectorKeys(config: ManagedDirectoryConfig, path: string): string[] {
+  return lexicalManagedKeys(config, path)
+    .map(key => canonicalManagedPath(config, key))
+    .filter((key): key is string => !!key);
 }
 
 export function managedReferences(config: ManagedDirectoryConfig, value: unknown): Set<string> {
@@ -82,14 +145,19 @@ export function managedReferences(config: ManagedDirectoryConfig, value: unknown
     const texts = [v];
     if (isAbsolute(v) && !v.includes('\n')) {
       texts.push(normalize(v));
-      if (!config.roots.some(r => v.startsWith(r.path + '/'))) {
+      if (!config.roots.some(r => rootNames(r).some(prefix => v.startsWith(prefix + '/')))) {
         try { texts.push(realpathSync(v)); } catch { /* lexical check still applies to missing paths */ }
       }
     }
     for (const r of config.roots) {
-      const escaped = r.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const pattern = new RegExp(`${escaped}/[0-9a-f]{${r.hashLength}}(?![0-9a-f])`, 'g');
-      for (const text of texts) for (const match of text.matchAll(pattern)) found.add(match[0]);
+      for (const rootName of rootNames(r)) {
+        const escaped = rootName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(`${escaped}/[0-9a-f]{${r.hashLength}}(?![0-9a-f])`, 'g');
+        for (const text of texts) for (const match of text.matchAll(pattern)) {
+          const canonical = canonicalManagedPath(config, match[0]);
+          if (canonical) found.add(canonical);
+        }
+      }
     }
     if (/^\s*[\[{]/.test(v)) { try { visit(JSON.parse(v)); } catch { /* ordinary text */ } }
   };
@@ -115,20 +183,40 @@ export function reserveManagedDirectories(value: unknown, previous?: unknown, bo
   const paths = [...managedReferences(config, value)].filter(p => !old.has(p));
   if (!paths.length) return () => {};
   const token = randomUUID();
-  withFileLockSync(config.statePath, () => {
+  const registered = withFileLockSync(config.statePath, () => {
     const state = loadState(config);
+    const present: string[] = [];
     for (const path of paths) {
-      const info = lstatSync(path, { bigint: true });
+      let info;
+      try {
+        info = lstatSync(path, { bigint: true });
+      } catch (error) {
+        // A record naming a version that is absent (never installed, already
+        // quarantined, restored from a backup made elsewhere) has nothing to
+        // protect and must not make whole-snapshot writes fail forever.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
       const retired = state.retired[path];
-      if (!info.isDirectory() || realpathSync(path) !== path
+      let real = path;
+      try { real = realpathSync(path); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; // removed between the two calls
+        throw error;
+      }
+      if (!info.isDirectory() || real !== path
           || (retired?.dev === String(info.dev) && retired.ino === String(info.ino) && retired.ctimeNs === String(info.ctimeNs))) {
         throw new Error('managed_directory_retired_or_unsafe');
       }
+      present.push(path);
     }
-    state.pending[token] = { pid: process.pid, identity: readDurableProcessIdentity(process.pid), paths };
-    if (state.cycle) state.cycle.marked = [...new Set([...state.cycle.marked, ...paths])];
+    if (!present.length) return false;
+    state.pending[token] = { pid: process.pid, identity: readDurableProcessIdentity(process.pid), paths: present };
+    if (state.cycle) state.cycle.marked = [...new Set([...state.cycle.marked, ...present])];
     saveState(config, state);
+    return true;
   });
+  if (!registered) return () => {};
   return () => withFileLockSync(config.statePath, () => {
     const state = loadState(config);
     delete state.pending[token];
@@ -169,20 +257,36 @@ export function retireManagedDirectories(id: string, candidates: DirectoryCandid
   return withFileLockSync(config.statePath, () => {
     const state = loadState(config);
     if (state.cycle?.id !== id) throw new Error('stale_directory_collection');
-    if (new Set(candidates.map(c => c.path)).size !== candidates.length) throw new Error('duplicate_candidate');
-    const byPath = new Map(candidates.map(c => [c.path, c]));
-    const keep = new Set([...retained, ...state.cycle.marked, ...Object.values(state.pending).flatMap(p => p.paths)]);
-    for (const path of keep) for (const ref of byPath.get(path)?.references ?? []) keep.add(ref);
-    const victims = candidates.filter(c => !keep.has(c.path));
+    // Everything is keyed by the canonical (realpath while present) spelling,
+    // so a collector that hands over the symlinked form and one that hands
+    // over the real form describe the same candidate.
+    const normalized: { path: string; candidate: DirectoryCandidate }[] = [];
     for (const candidate of candidates) {
-      if (!managedPath(config, candidate.path) || !Array.isArray(candidate.references)) throw new Error('invalid_candidate');
+      if (!Array.isArray(candidate.references)) throw new Error('invalid_candidate');
+      const path = canonicalManagedPath(config, candidate.path);
+      if (!path) throw new Error('invalid_candidate');
+      normalized.push({ path, candidate: { ...candidate, path } });
     }
-    for (const candidate of victims) {
-      const info = lstatSync(candidate.path, { bigint: true });
+    if (new Set(normalized.map(c => c.path)).size !== normalized.length) throw new Error('duplicate_candidate');
+    const byPath = new Map(normalized.map(c => [c.path, c.candidate]));
+    const canonicalReferences = (refs: readonly string[]): string[] =>
+      refs.flatMap(ref => collectorKeys(config, ref));
+    for (const entry of normalized) entry.candidate.references = canonicalReferences(entry.candidate.references);
+    const keep = new Set<string>([
+      ...retained.flatMap(r => collectorKeys(config, r)),
+      ...state.cycle.marked,
+      ...Object.values(state.pending).flatMap(p => p.paths),
+    ]);
+    for (const path of [...keep]) for (const ref of byPath.get(path)?.references ?? []) keep.add(ref);
+    const victims = normalized.filter(c => !keep.has(c.path));
+    for (const { path, candidate } of victims) {
+      const info = lstatSync(path, { bigint: true });
       if (!info.isDirectory() || String(info.dev) !== candidate.dev || String(info.ino) !== candidate.ino || String(info.ctimeNs) !== candidate.ctimeNs
-          || realpathSync(candidate.path) !== candidate.path) throw new Error('candidate_changed');
+          || realpathSync(path) !== path) throw new Error('candidate_changed');
     }
-    for (const c of victims) state.retired[c.path] = { dev: c.dev, ino: c.ino, ctimeNs: c.ctimeNs };
+    for (const { path, candidate } of victims) {
+      state.retired[path] = { dev: candidate.dev, ino: candidate.ino, ctimeNs: candidate.ctimeNs };
+    }
     delete state.cycle;
     saveState(config, state);
     return victims.map(c => quarantine(config, state, c.path));
@@ -207,25 +311,49 @@ export function resumeDirectoryRetirement(path?: string): string[] {
   if (!config) throw new Error('managed_directories_not_configured');
   return withFileLockSync(config.statePath, () => {
     const state = loadState(config);
-    if (path && !managedPath(config, path)) throw new Error('invalid_candidate');
-    return Object.keys(state.retired).filter(p => !path || p === path).map(p => quarantine(config, state, p));
+    let wanted: string[] | undefined;
+    if (path) {
+      wanted = collectorKeys(config, path);
+      if (!wanted.length) throw new Error('invalid_candidate');
+    }
+    return Object.keys(state.retired).filter(p => !wanted || wanted.includes(p)).map(p => quarantine(config, state, p));
   });
 }
 
 /** All session INSERT/UPDATE paths share this adapter, including offline CAS
  * writers and migration. Reservations remain until COMMIT/ROLLBACK/close, so
  * an uncommitted new workingDir cannot fall between two collection cycles.
- * Exact row CAS may skip unchanged references; ordinary whole-row writes may not. */
+ * Exact row CAS may skip unchanged references; ordinary whole-row writes may not.
+ *
+ * Transaction state MUST converge even when the engine call throws: a
+ * statement that rolls back the whole transaction (ON CONFLICT ROLLBACK,
+ * SQLITE_FULL/IOERR) makes the caller's defensive ROLLBACK fail with "no
+ * transaction is active" on both SQLite engines. Updating `transaction` only
+ * after a successful exec would then leave it stuck at true and leak every
+ * later reservation. Sessions writes must therefore use plain BEGIN/COMMIT/
+ * ROLLBACK single statements (never SAVEPOINT or multi-statement strings). */
 export function guardSessionDirectoryWrites(db: DatabaseSyncLike): DatabaseSyncLike {
   if (!loadManagedDirectoryConfig()) return db;
   let transaction = false;
   const pending: (() => void)[] = [];
   const release = () => { for (const done of pending.splice(0)) done(); };
+  const finishTransaction = () => { transaction = false; release(); };
   return {
     exec(sql) {
+      if (/^\s*BEGIN\b/i.test(sql)) {
+        // On failure the transaction never opened: leave the state false so a
+        // caller's follow-up ROLLBACK is a harmless no-op release.
+        db.exec(sql);
+        transaction = true;
+        return;
+      }
+      if (/^\s*(?:COMMIT|ROLLBACK|END)\s*;?\s*$/i.test(sql)) {
+        // Converge regardless of whether the engine still considers a
+        // transaction active — it may already have been rolled back implicitly.
+        try { db.exec(sql); } finally { finishTransaction(); }
+        return;
+      }
       db.exec(sql);
-      if (/^\s*BEGIN\b/i.test(sql)) transaction = true;
-      if (/^\s*(COMMIT|ROLLBACK|END)\s*;?\s*$/i.test(sql)) { transaction = false; release(); }
     },
     prepare(sql): StatementLike {
       const statement = db.prepare(sql);
