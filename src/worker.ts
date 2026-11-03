@@ -285,6 +285,7 @@ import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
   isMultiTopicOrchestrationEnabled,
+  isDispatchTaskTreeCardEnabled,
   isWorkflowFeatureEnabled,
   isRemoteAccessEnabled,
 } from './global-config.js';
@@ -21758,6 +21759,7 @@ async function spawnCli(
     // way; this keeps the in-pane defense-in-depth honest on the riff path too.
     mergedEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
     mergedEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
+    mergedEnv.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED = isDispatchTaskTreeCardEnabled() ? 'true' : 'false';
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
@@ -23799,6 +23801,7 @@ async function spawnCli(
   // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
   childEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
   childEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
+  childEnv.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED = isDispatchTaskTreeCardEnabled() ? 'true' : 'false';
   if (cfg.workflowNodeSession === true) childEnv[WORKFLOW_NODE_SESSION_ENV] = '1';
   else delete childEnv[WORKFLOW_NODE_SESSION_ENV];
   if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();

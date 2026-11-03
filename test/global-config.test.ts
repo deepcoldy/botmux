@@ -774,6 +774,19 @@ describe('dispatch task-tree card switch (multiTopic.taskTreeCard)', () => {
     expect(isDispatchTaskTreeCardEnabled()).toBe(false);
   });
 
+  it('env override wins even when the global config file is unreadable/absent (file-sandboxed CLI)', () => {
+    // A file-sandboxed CLI cannot read ~/.botmux/config.json (readRawConfig
+    // silently returns {}); the daemon projects the value via env, which the
+    // reader must honour without needing the file.
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'does-not-exist.json'));
+    invalidateGlobalConfigCache();
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', 'true');
+    expect(isDispatchTaskTreeCardEnabled()).toBe(true);
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', 'false');
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+  });
+
   it('normalizes the nested field and keeps it when the parent enabled toggle flips', () => {
     mergeGlobalConfig({ multiTopic: { enabled: true, taskTreeCard: true } });
     expect(readGlobalConfig().multiTopic).toEqual({ enabled: true, taskTreeCard: true });

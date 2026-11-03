@@ -14692,6 +14692,10 @@ async function trySyncDispatchTaskTree(input: {
 
 /** Best effort after a dispatch: the task tree is a view, never a reason to fail it. */
 async function syncDispatchTaskTreeAfterDispatch(input: Parameters<typeof trySyncDispatchTaskTree>[0]): Promise<void> {
+  // Default-off: skip even the local best-effort IPC so a disabled feature
+  // adds no dispatch-time call at all (the daemon gate is authoritative; this
+  // runs host-side or in a pane with the spawn-time env value).
+  if (!isDispatchTaskTreeCardEnabled()) return;
   const result = await trySyncDispatchTaskTree(input);
   if (!result.ok) console.error(`⚠️  子任务已派发，但任务树卡片更新失败: ${result.error}`);
 }

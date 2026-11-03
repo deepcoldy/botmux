@@ -1166,10 +1166,14 @@ export function isMultiTopicOrchestrationEnabled(env: NodeJS.ProcessEnv = proces
 /** Machine-wide dispatch task-tree card switch. Defaults OFF: a fresh install
  *  sends no task-tree card (3.2(c) — a feature that adds a message must be
  *  opted in). `BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED` wins when set, otherwise
- *  the Dashboard toggle `multiTopic.taskTreeCard`. Read live from the short-TTL
- *  (~2s) global-config cache, so flipping it applies to the next dispatch /
- *  report shortly afterwards without a restart (each daemon process expires its
- *  own cache; the Dashboard write only invalidates its own process). */
+ *  the Dashboard toggle `multiTopic.taskTreeCard`. The DAEMON side (card post /
+ *  patch, report recording) reads it live from the short-TTL (~2s) global-config
+ *  cache, each daemon expiring its own (a Dashboard write invalidates only its
+ *  own process), so card behaviour follows the toggle within ~2s without a
+ *  restart. A CLI inside a sandboxed/file-isolated pane cannot read the config
+ *  file; the worker projects the value into spawn-time env, so the in-pane
+ *  `attemptAt` decision for an already-running session follows the NEXT session
+ *  (new spawn), while new dispatch-time card gating on the daemon is live. */
 export function isDispatchTaskTreeCardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const flag = env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
   if (flag != null && flag !== '') {
