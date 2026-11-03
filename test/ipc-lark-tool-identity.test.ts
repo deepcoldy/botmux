@@ -109,9 +109,14 @@ describe('session application identity route', () => {
     expect(await identity()).toMatchObject({ status: 'verified', env: expect.stringContaining('alice-cloud') });
     refusal = 'handoff_revoked';
     const after = await identity();
+    // Capture the primitive BEFORE the asymmetric-matcher assertion: Bun's
+    // toMatchObject replaces the matched nested field on the RECEIVED object
+    // with the matcher instance (measured on Bun 1.4), so reading after.env
+    // after the expectation hands back an ExpectStringContaining, not a string.
+    const afterEnv: string = after.env;
     expect(after).toMatchObject({ status: 'verified', env: expect.stringContaining('no longer active') });
-    expect(after.env).not.toContain('alice-cloud');
-    expect(after.env).toContain('--dispatch-root om_handoff');
+    expect(afterEnv).not.toContain('alice-cloud');
+    expect(afterEnv).toContain('--dispatch-root om_handoff');
   });
   it('uses the verified delegated human’s target-app authorization, never the dispatch bot or source token', async () => {
     await delegate();
