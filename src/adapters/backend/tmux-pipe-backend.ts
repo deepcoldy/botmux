@@ -7,7 +7,7 @@
  *
  * Architecture (no PTY, no attach):
  *   - mkfifo a unique fifo under /tmp
- *   - `${this.tmuxCmd} pipe-pane -O -t <pane> 'cat > <fifo>'` — tmux replicates every
+ *   - `${this.tmuxCmd} pipe-pane -O -t <pane> 'dd bs=65536 > <fifo>'` — tmux replicates every
  *     byte the pane writes into the fifo (append-only, '-O' overwrites any
  *     existing pipe).
  *   - fs.createReadStream(<fifo>) — we read tmux's verbatim ANSI stream.
@@ -769,7 +769,12 @@ export class TmuxPipeBackend implements SessionBackend {
     // Retrying is idempotent (-O overwrites any prior subscription); a
     // deterministic server-answered rejection (pane genuinely gone) is
     // re-thrown at once instead of delaying the same failure.
-    const pipePaneCommand = `pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(`cat > ${shellescape(this.fifoPath)}`)}`;
+    // uutils cat buffers short pipe writes (and ignores -u). A quiet runner's
+    // ready/final bytes can then sit here forever while its next input waits
+    // for those very bytes. dd writes each short read immediately; use only
+    // POSIX operands so GNU, BSD/macOS and uutils behave alike. No fullblock
+    // or sync conversion: preserve the exact byte stream without padding.
+    const pipePaneCommand = `pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(`dd bs=65536 > ${shellescape(this.fifoPath)} 2>/dev/null`)}`;
     // Same-boundary decision as the applied remain-on-exit value: it was
     // resolved against the RUNNING server (serverTmuxVersion) in
     // createDetachedSession/applySessionOptions before this attach. Guard
@@ -794,7 +799,7 @@ export class TmuxPipeBackend implements SessionBackend {
           }
         } else {
           execSync(
-            `${this.tmuxCmd} pipe-pane -O -t ${shellescape(this.paneTarget)} 'cat > ${shellescape(this.fifoPath)}'`,
+            `${this.tmuxCmd} ${pipePaneCommand}`,
             { stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, env: tmuxEnv() },
           );
         }
