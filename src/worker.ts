@@ -5003,8 +5003,8 @@ async function preflightTraexAutoModelBeforeSpawn(
       timeoutMs: controller.config.preflightTimeoutMs
         ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
       env: {
-        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset),
-        ...botInjectedEnv(cfg.env, cfg.envPolicy),
+        ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+        ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
       },
     });
   } catch (error) {
@@ -5242,8 +5242,8 @@ function currentTraexLoadSnapshot(timeoutMs: number): Promise<TraexModelLoadSnap
     cwd: config.workingDir,
     timeoutMs,
     env: {
-      ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset),
-      ...botInjectedEnv(config.env, config.envPolicy),
+      ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset, config.protectedMcpPolicy),
+      ...botInjectedEnv(config.env, config.envPolicy, config.protectedMcpPolicy),
     },
   });
 }
