@@ -321,6 +321,8 @@ import {
   listHeadlessSessions,
   readHeadlessSession,
   updateHeadlessSession,
+  headlessChatId,
+  isHeadlessId,
   type HeadlessSessionRecord,
 } from '../services/headless-session-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
@@ -3272,11 +3274,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
   const targetLarkAppId = ds?.larkAppId ?? detachedScheduled?.larkAppId;
   const targetChatId = ds?.chatId ?? detachedScheduled?.chatId;
+  const validHeadlessSession = !!ds?.session.headless
+    && ds.session.headless.source === 'cli'
+    && isHeadlessId(ds.session.headless.id)
+    && headlessChatId(ds.session.headless.id) === ds.chatId;
   let botConfig: { larkToolBinding?: boolean } | undefined;
   try { botConfig = targetLarkAppId ? getBot(targetLarkAppId).config : undefined; } catch { /* bot missing */ }
   if ((!ds && !detachedScheduled)
     || (ds && ds.session.status !== 'active')
-    || (targetChatId !== undefined && !isHeadlessSessionChatId(targetChatId)
+    || (targetChatId !== undefined && !validHeadlessSession && !isHeadlessSessionChatId(targetChatId)
       && sessionTransportDisabled({ chatId: targetChatId, larkAppId: targetLarkAppId }))
     || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
@@ -3288,6 +3294,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   let bot: ReturnType<typeof getBot>['config'];
   try { bot = getBot(targetLarkAppId!).config; }
   catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+  if (body.mode === 'user' && validHeadlessSession) {
+    return jsonRes(res, 403, { ok: false, error: 'lark_tool_user_transport_required' });
+  }
   if (body.mode === 'bot') {
     let token: unknown;
     try {
