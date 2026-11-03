@@ -5355,6 +5355,9 @@ export async function deliverWorkflowNodeTurn(
   input: WorkflowNodeTurnInput,
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
+  /** Only for a handoff that carries the run initiator's delegation (design
+   *  §10): publish the turn's tool identity before the CLI gets the turn. */
+  runtime?: { prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void> },
 ): Promise<{ sessionId: string }> {
   const bot = getAllBots().find(b => b.config.larkAppId === input.larkAppId);
   if (!bot) throw new Error(`workflow node bot ${input.larkAppId} is not loaded`);
@@ -5377,6 +5380,7 @@ export async function deliverWorkflowNodeTurn(
       if (isRelayableRealSession(existing) || existing.session.suspendedColdResume) {
         existing.session.workflowNode = input.marker;
         sessionStore.updateSession(existing.session);
+        await runtime?.prepareTurnIdentity?.(existing, turnId);
         markSessionActivity(existing, Date.now(), { human: false });
         const payload = buildFollowUpCliInput(input.prompt, existing.session.sessionId, {
           isAdoptMode: false,
@@ -5443,6 +5447,12 @@ export async function deliverWorkflowNodeTurn(
         turnId,
         workflowNodeSession: true,
       });
+    try {
+      await runtime?.prepareTurnIdentity?.(ds, turnId);
+    } catch (err) {
+      sessionStore.closeSession(session.sessionId);
+      throw err;
+    }
     if (!setActiveSessionIfActive(activeSessions, key, ds)) {
       await closeSession(session.sessionId);
       throw new Error(`workflow node turn lost active-session registration for ${anchor}`);

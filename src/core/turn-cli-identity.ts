@@ -66,7 +66,9 @@ export interface DelegatedCliIdentity {
   unionId: string;
   tools: TriggerUserAuthTool[];
   dispatchRoot: string;
-  denialReason?: 'target_access_denied' | 'target_validation_unavailable';
+  /** `delegation_inactive`: a workflow handoff's delegation whose run attempt
+   *  ended, or whose handoff was withdrawn (design 2026-11-03 §10.3). */
+  denialReason?: 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive';
 }
 
 export interface PublishTurnIdentityArgs {
@@ -157,7 +159,9 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
     ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
     : user.denialReason === 'target_access_denied'
       ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
-      : 'The source must ask the original human to authorize.';
+      : user.denialReason === 'delegation_inactive'
+        ? 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn), so the requester\'s identity no longer applies; do not request another login.'
+        : 'The source must ask the original human to authorize.';
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),

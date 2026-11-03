@@ -101,6 +101,29 @@ const baseShape = {
  */
 const nodeExecutorSchema = z.literal('bot').optional();
 
+/** Tools the initiator could run as themselves on the main bot (mirrors
+ *  `TRIGGER_USER_AUTH_TOOLS`; kept literal so this module stays host-neutral). */
+export const V3_HANDOFF_IDENTITY_TOOLS = ['lark-cli', 'bytedcli'] as const;
+export type V3HandoffIdentityTool = typeof V3_HANDOFF_IDENTITY_TOOLS[number];
+
+/**
+ * 交接带发起人身份 (design 2026-11-03 §10.2, D5), frozen at authorization
+ * next to the initiator's open_id: their tenant-stable union_id and the tools
+ * they had on the main bot at that moment (its `triggerUserAuth.tools`; may
+ * be empty). Every handoff of the run is signed from this record by the main
+ * bot's daemon, never from a node's report. Present only on a bot-executed
+ * run authorized while the switch was on; a reader without this key rejects
+ * the envelope through `.strict()`, so an older daemon never drives such a
+ * run without honouring it.
+ */
+const handoffIdentitySchema = z.object({
+  unionId: z.string().regex(/^on_[A-Za-z0-9_-]{1,128}$/, 'must be a union_id (on_…)'),
+  tools: z.array(z.enum(V3_HANDOFF_IDENTITY_TOOLS)).max(V3_HANDOFF_IDENTITY_TOOLS.length)
+    .refine((tools) => new Set(tools).size === tools.length, 'must not repeat a tool'),
+}).strict();
+
+export type V3HandoffIdentityFreeze = z.infer<typeof handoffIdentitySchema>;
+
 const adHocEnvelopeSchema = z.object({
   ...baseShape,
   nodeExecutor: nodeExecutorSchema,
@@ -119,6 +142,7 @@ const adHocEnvelopeSchema = z.object({
     authorizedByOpenId: nonEmptyString.optional(),
     dagSha256: sha256Schema,
     specSha256: sha256Schema,
+    handoffIdentity: handoffIdentitySchema.optional(),
   }).strict(),
 }).strict();
 
@@ -146,6 +170,7 @@ const savedDefinitionEnvelopeSchema = z.object({
     definitionSnapshotSha256: sha256Schema,
     dagSha256: sha256Schema,
     specSha256: sha256Schema,
+    handoffIdentity: handoffIdentitySchema.optional(),
   }).strict(),
 }).strict();
 
@@ -200,6 +225,26 @@ export const V3RunEnvelopeSchema = z.union([
       path: ['authorization', 'dagSha256'],
       message: 'must match artifacts.dag.sha256',
     });
+  }
+
+  // A frozen initiator identity only means something for a bot-executed run
+  // that names its initiator (the open_id the union_id was resolved from).
+  if ('handoffIdentity' in envelope.authorization && envelope.authorization.handoffIdentity) {
+    const executor = 'nodeExecutor' in envelope ? envelope.nodeExecutor : undefined;
+    if (executor !== 'bot') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['authorization', 'handoffIdentity'],
+        message: 'requires nodeExecutor "bot"',
+      });
+    }
+    if (!initiatorOpenIdOf(envelope)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['authorization', 'handoffIdentity'],
+        message: 'requires the authenticated initiator (authorizedByOpenId / chatBinding.ownerOpenId)',
+      });
+    }
   }
 
   if (envelope.authorization.kind === 'gate2') {
@@ -279,7 +324,35 @@ export const V3RunEnvelopeSchema = z.union([
   }
 });
 
+/**
+ * The authenticated initiator of a chat-authorized run, as the run's own (main)
+ * bot app sees them: Gate-2's approver for an ad-hoc run, the sender of
+ * `/workflow run` for a Saved Workflow run (design §13.1). App-scoped.
+ */
+function initiatorOpenIdOf(envelope: {
+  authorization: { kind: string; authorizedByOpenId?: string };
+  chatBinding?: { ownerOpenId?: string };
+}): string | undefined {
+  if (envelope.authorization.kind === 'gate2') return envelope.authorization.authorizedByOpenId;
+  if (envelope.authorization.kind === 'published_revision') return envelope.chatBinding?.ownerOpenId;
+  return undefined;
+}
+
 export type V3RunEnvelope = z.infer<typeof V3RunEnvelopeSchema>;
+
+/** The frozen initiator identity a handoff may carry (design §10.2), or
+ *  undefined when the run was not authorized with it. `openId` belongs to the
+ *  run's main bot app only. */
+export interface V3FrozenHandoffIdentity extends V3HandoffIdentityFreeze {
+  openId: string;
+}
+
+export function frozenHandoffIdentity(envelope: V3RunEnvelope): V3FrozenHandoffIdentity | undefined {
+  const frozen = 'handoffIdentity' in envelope.authorization ? envelope.authorization.handoffIdentity : undefined;
+  const openId = initiatorOpenIdOf(envelope);
+  if (!frozen || !openId || !('nodeExecutor' in envelope) || envelope.nodeExecutor !== 'bot') return undefined;
+  return { openId, unionId: frozen.unionId, tools: [...frozen.tools] };
+}
 export type V3AdHocRunEnvelope = Extract<V3RunEnvelope, { source: { kind: 'ad_hoc' } }>;
 export type V3SavedDefinitionRunEnvelope = Extract<V3RunEnvelope, { source: { kind: 'saved_definition' } }>;
 export type V3ManualCliRunEnvelope = Extract<V3RunEnvelope, { source: { kind: 'manual_cli' } }>;
@@ -814,6 +887,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
   authorizedByOpenId?: string;
   artifacts: V3AdHocRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
+  handoffIdentity?: V3HandoffIdentityFreeze;
 }): V3AdHocRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,
@@ -830,6 +904,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
       ...(input.authorizedByOpenId ? { authorizedByOpenId: input.authorizedByOpenId } : {}),
       dagSha256: input.artifacts.dag.sha256,
       specSha256: input.artifacts.spec.sha256,
+      ...(input.handoffIdentity ? { handoffIdentity: input.handoffIdentity } : {}),
     },
   }) as V3AdHocRunEnvelope;
 }
@@ -841,6 +916,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
   authorizedAt: string;
   artifacts: V3SavedDefinitionRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
+  handoffIdentity?: V3HandoffIdentityFreeze;
 }): V3SavedDefinitionRunEnvelope {
   return validateRunEnvelope({
     schemaVersion: V3_RUN_ENVELOPE_SCHEMA_VERSION,
@@ -864,6 +940,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
       definitionSnapshotSha256: input.artifacts.definitionSnapshot.sha256,
       dagSha256: input.artifacts.dag.sha256,
       specSha256: input.artifacts.spec.sha256,
+      ...(input.handoffIdentity ? { handoffIdentity: input.handoffIdentity } : {}),
     },
   }) as V3SavedDefinitionRunEnvelope;
 }

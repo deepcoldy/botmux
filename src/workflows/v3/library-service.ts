@@ -792,6 +792,7 @@ export async function instantiatePublishedSavedWorkflow(
     runId: input.runId,
     now: input.now,
     ...(executor.kind === 'bot' ? { nodeExecutor: 'bot' as const } : {}),
+    ...(executor.kind === 'bot' && executor.handoffIdentity ? { handoffIdentity: executor.handoffIdentity } : {}),
   });
   const executorNote = executor.kind === 'bot' ? executor.summary : executor.note;
   return executorNote ? { ...materialized, executorNote } : materialized;

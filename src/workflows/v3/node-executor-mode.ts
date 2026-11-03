@@ -15,6 +15,7 @@
 import type { BotSnapshot } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
+import type { V3HandoffIdentityFreeze, V3HandoffIdentityTool } from './run-envelope.js';
 
 export type V3NodeExecutorSwitch = 'ephemeral' | 'bot';
 
@@ -250,6 +251,65 @@ export function formatV3BotExecutorPlan(
   ].join('\n');
 }
 
+// ─── 交接带发起人身份 (design §10.2, D5): frozen at authorization ─────────
+
+/** open_id → union_id through the main bot's own app (`resolveUnionIdFromOpenIdStrict`). */
+export type V3InitiatorUnionLookup =
+  | { status: 'resolved'; unionId: string }
+  /** Definitive: the app may not see this person's union_id (scope / visibility). */
+  | { status: 'unavailable' }
+  | { status: 'retryable'; error: string };
+
+/** Live seams for freezing the initiator; present only while the switch is on. */
+export interface V3HandoffIdentityPolicy {
+  lookupUnionId(larkAppId: string, openId: string): Promise<V3InitiatorUnionLookup>;
+  /** The tools a sender runs as themselves on this bot right now
+   *  (`triggerUserAuth.tools` when enabled, else none). */
+  botTools(larkAppId: string): V3HandoffIdentityTool[];
+}
+
+export type V3HandoffIdentityResolution =
+  | { kind: 'frozen'; identity: V3HandoffIdentityFreeze; summary: string }
+  | { kind: 'refused'; message: string };
+
+const HANDOFF_IDENTITY_OFF_HINT = '或在 Dashboard 关闭「交接带发起人身份」后重新批准';
+
+/**
+ * Freeze the initiator of a bot-executed run (design §10.2 item 1): the
+ * authenticated person of the authorizing turn (`binding.ownerOpenId`, the
+ * main bot's view), their union_id resolved now through the main bot's app,
+ * and the tools they had on the main bot now — the ceiling every later
+ * handoff's delegation is narrowed from (§10.2 item 5). Anything that keeps
+ * the identity from being frozen refuses the authorization: a run that was
+ * approved to carry its initiator must never quietly run without them.
+ */
+export async function resolveV3HandoffIdentity(
+  binding: RunChatBinding,
+  policy: V3HandoffIdentityPolicy,
+): Promise<V3HandoffIdentityResolution> {
+  const prefix = '「交接带发起人身份」已开启';
+  if (!binding.ownerOpenId) {
+    return { kind: 'refused', message: `${prefix}，但这个 run 没有经过认证的发起人，无法冻结发起人身份。请由发起人本人在群里批准，${HANDOFF_IDENTITY_OFF_HINT}。` };
+  }
+  let lookup: V3InitiatorUnionLookup;
+  try {
+    lookup = await policy.lookupUnionId(binding.larkAppId, binding.ownerOpenId);
+  } catch (err) {
+    lookup = { status: 'retryable', error: err instanceof Error ? err.message : String(err) };
+  }
+  if (lookup.status === 'retryable') {
+    return { kind: 'refused', message: `${prefix}，但暂时查不到发起人的跨应用身份（union_id：${lookup.error}），已拒绝批准。请稍后重新批准。` };
+  }
+  if (lookup.status === 'unavailable') {
+    return { kind: 'refused', message: `${prefix}，但主 Bot 查不到发起人的跨应用身份（union_id；通常是缺少通讯录权限，或发起人对本应用不可见），交接无法带上发起人身份，已拒绝批准。请检查主 Bot 的通讯录权限，${HANDOFF_IDENTITY_OFF_HINT}。` };
+  }
+  const tools = [...new Set(policy.botTools(binding.larkAppId))];
+  const summary = tools.length > 0
+    ? `交接带发起人身份：开。开了「按触发人鉴权」的子 Bot 以发起人本人的身份执行，可委托工具不超过：${tools.join('、')}；交接前校验不过的节点会受阻，不会改用 Bot 身份执行`
+    : '交接带发起人身份：开，但主 Bot 没开「按触发人鉴权」，发起人没有可委托的工具；指派给开了「按触发人鉴权」的子 Bot 的节点会因无法取得执行身份而受阻';
+  return { kind: 'frozen', identity: { unionId: lookup.unionId, tools }, summary };
+}
+
 /** Everything an authorization entry point needs to decide the executor. */
 export interface V3NodeExecutorPolicy {
   switchMode: V3NodeExecutorSwitch;
@@ -257,13 +317,16 @@ export interface V3NodeExecutorPolicy {
   /** Built only for a `bot` decision (it may talk to Lark / daemons). */
   probe: (binding: RunChatBinding) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
   nameOf: (larkAppId: string) => string;
+  /** 交接带发起人身份 switch: present only while it is on. */
+  handoffIdentity?: V3HandoffIdentityPolicy;
 }
 
 export type V3NodeExecutorResolution =
   /** `note` explains a fallback when the switch is on (P4 / §6.1 item 5). */
   | { kind: 'ephemeral'; note?: string }
-  /** `summary` lists node → executing bot for the Gate-2 / command reply. */
-  | { kind: 'bot'; targets: V3NodeExecutorTarget[]; summary: string }
+  /** `summary` lists node → executing bot for the Gate-2 / command reply;
+   *  `handoffIdentity` is the initiator to freeze when that switch is on. */
+  | { kind: 'bot'; targets: V3NodeExecutorTarget[]; summary: string; handoffIdentity?: V3HandoffIdentityFreeze }
   /** Refuse the authorization; `message` lists node → bot: reason. */
   | { kind: 'refused'; problems: V3BotEligibilityProblem[]; message: string };
 
@@ -300,7 +363,11 @@ export async function resolveV3NodeExecutor(input: {
       message: formatV3BotEligibilityRefusal(checked.problems, input.policy.nameOf),
     };
   }
-  return { kind: 'bot', targets, summary: formatV3BotExecutorPlan(targets, binding.larkAppId, input.policy.nameOf) };
+  const summary = formatV3BotExecutorPlan(targets, binding.larkAppId, input.policy.nameOf);
+  if (!input.policy.handoffIdentity) return { kind: 'bot', targets, summary };
+  const identity = await resolveV3HandoffIdentity(binding, input.policy.handoffIdentity);
+  if (identity.kind === 'refused') return { kind: 'refused', problems: [], message: identity.message };
+  return { kind: 'bot', targets, summary: `${summary}\n${identity.summary}`, handoffIdentity: identity.identity };
 }
 
 /**

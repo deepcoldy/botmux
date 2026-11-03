@@ -147,6 +147,13 @@ export interface WorkflowFeatureGlobalConfig {
    *  Frozen into `run.json` at authorization, so flipping it never changes a
    *  run that already started. Only the non-default value is ever stored. */
   nodeExecutor?: 'bot';
+  /** Experimental (design 2026-11-03 §10, §15.5, D5): a bot-executed run
+   *  authorized from now on freezes its initiator's identity, and every
+   *  handoff of that run carries a delegation signed from it, so the node bot
+   *  runs its `triggerUserAuth` tools as the initiator. Absent = off (the node
+   *  bot runs as itself). Frozen into `run.json` at authorization; only `true`
+   *  is ever stored. */
+  handoffIdentity?: true;
 }
 
 export type WorkflowNodeExecutorMode = 'ephemeral' | 'bot';
@@ -868,6 +875,7 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   const out: WorkflowFeatureGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   if (v.nodeExecutor === 'bot') out.nodeExecutor = 'bot';
+  if (v.handoffIdentity === true) out.handoffIdentity = true;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1142,6 +1150,14 @@ export function isCrossPrincipalInterruptionEnabled(
  *  is frozen into `run.json`. */
 export function workflowNodeExecutorMode(): WorkflowNodeExecutorMode {
   return readGlobalConfig().workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral';
+}
+
+/** Experimental Workflow switch (Dashboard 全局设置 → 实验性配置 → Workflow):
+ *  whether bot-executed runs authorized from now on hand their initiator's
+ *  identity to the node bots. Read live; only consulted at authorization,
+ *  where the outcome is frozen into `run.json`. */
+export function workflowHandoffIdentityEnabled(): boolean {
+  return readGlobalConfig().workflow?.handoffIdentity === true;
 }
 
 /** Machine-wide multi-topic orchestration switch. Defaults ON for backwards

@@ -55,6 +55,7 @@ import {
   makeSavedDefinitionRunEnvelope,
   publishRunEnvelopeOnce,
   type LoadedAuthorizedV3Run,
+  type V3HandoffIdentityFreeze,
   type V3SavedDefinitionRunEnvelope,
 } from './run-envelope.js';
 import type { BotSnapshot, Spec } from './contract.js';
@@ -268,6 +269,9 @@ export interface MaterializeSavedWorkflowRunInput {
    *  `bot` is executed by the run's own bot rather than the first configured
    *  supported bot. Absent = today's ephemeral execution, unchanged. */
   nodeExecutor?: 'bot';
+  /** The initiator frozen for 交接带发起人身份 (design §10.2); only with
+   *  `nodeExecutor: 'bot'`. The initiator is `context.chatBinding.ownerOpenId`. */
+  handoffIdentity?: V3HandoffIdentityFreeze;
 }
 
 export interface MaterializedSavedWorkflowRun {
@@ -422,6 +426,7 @@ export function materializeSavedWorkflowRun(
         authorizedAt: now.toISOString(),
         ...(input.context?.chatBinding ? { chatBinding: input.context.chatBinding } : {}),
         ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
+        ...(input.nodeExecutor && input.handoffIdentity ? { handoffIdentity: input.handoffIdentity } : {}),
         artifacts,
       });
       publishRunEnvelopeOnce(stagedRunDir, envelope);

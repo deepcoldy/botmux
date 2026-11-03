@@ -48,6 +48,17 @@ import {
   type WorkflowHandoffEvent,
   type WorkflowNodeReportSession,
 } from './workflow-handoff-routes.js';
+import {
+  WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE,
+  deliverWorkflowHandoffWithUser,
+  handleWorkflowHandoffIdentityCheck,
+  loadWorkflowHandoffIdentityRun,
+  parseWorkflowHandoffIdentityCheck,
+  planWorkflowHandoffIdentity,
+  type WorkflowHandoffIdentityCheck,
+  type WorkflowHandoffIdentityCheckRequest,
+} from './workflow-handoff-identity.js';
+import type { V3HandoffIdentityTool } from '../workflows/v3/run-envelope.js';
 import { createV3BotHandoffExecutor, readV3HandoffTopics, type V3SelfTurnRequest } from '../im/lark/v3-bot-handoff-executor.js';
 import { createV3NodeCardSync } from '../im/lark/v3-node-card-sync.js';
 import { buildV3NodeReportCard } from '../im/lark/v3-node-card.js';
@@ -79,6 +90,10 @@ export interface WorkflowNodeDaemonDeps {
    *  `evenIfIdle`: the turn is known to have just been handed in (its screen
    *  may not show it yet) — used only for a handoff revoked under it. */
   interruptTurn(ds: DaemonSession, opts?: { evenIfIdle?: boolean }): boolean;
+  /** The handoff `turnId` of `ds` was stopped: withdraw the tool identity a
+   *  workflow delegation published for it (design §10.3: the delegation ends
+   *  with the attempt even when ^C cannot reach the CLI). Best-effort. */
+  withdrawHandoffIdentity?(ds: DaemonSession, turnId: string): Promise<void>;
   /** Positive proof that an inbound message's sender is `sourceLarkAppId`'s
    *  bot in this chat, as seen by `receiverLarkAppId` (app-scoped open_id).
    *  Unknown / failed lookups must answer false. */
@@ -94,12 +109,24 @@ export interface WorkflowNodeDaemonDeps {
     prompt: string;
     attachments: LarkAttachment[];
     sessionTitle: string;
+    /** Publish the turn's tool identity from its signed delegation first. */
+    identityDelegated?: true;
   }): Promise<{ sessionId: string }>;
   attachmentsDir(larkAppId: string, messageId: string): string;
   loadRun(runDir: string): { dag: V3Dag; nodeExecutor?: 'bot'; chatId?: string; title: string } | undefined;
   drive(runId: string): void;
   botName(larkAppId: string): string;
   warn(message: string): void;
+  /** 交接带发起人身份 (design §10): consulted only for runs whose run.json
+   *  froze an initiator. */
+  handoffIdentity: {
+    /** A bot's `triggerUserAuth.tools` right now (this daemon's own bot when
+     *  signing: the ceiling can only narrow). */
+    botTools(larkAppId: string): V3HandoffIdentityTool[];
+    /** This daemon's own bot's check of the initiator in `chatId` (the
+     *  dispatch delegation check). Serves the identity-check route too. */
+    checkSelf(request: WorkflowHandoffIdentityCheckRequest): Promise<WorkflowHandoffIdentityCheck>;
+  };
 }
 
 export interface WorkflowNodeDaemon {
@@ -108,6 +135,8 @@ export interface WorkflowNodeDaemon {
   eventRoute(raw: unknown): Promise<RouteResult>;
   reportRoute(raw: unknown, authorize: (raw: unknown) => { ok: true; session: WorkflowNodeReportSession } | { ok: false; status: number; error: string }): Promise<RouteResult>;
   stopRoute(raw: unknown): RouteResult;
+  /** Target side of 交接带发起人身份: would this bot carry the initiator? */
+  identityCheckRoute(raw: unknown): Promise<RouteResult>;
   /** Whether an inbound bot message in a thread addressed to
    *  `receiverLarkAppId` (the bot whose routing context received it) is a
    *  workflow handoff — or a revoked one, which must be dropped. */
@@ -164,6 +193,10 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       const marker = ds.session.workflowNode;
       if (!marker || marker.nonce !== nonce) continue;
       if (sessionId && ds.session.sessionId !== sessionId) continue;
+      if (deps.withdrawHandoffIdentity) {
+        void deps.withdrawHandoffIdentity(ds, marker.handoffMessageId)
+          .catch((err) => deps.warn(`[workflow] withdrawing identity of ${marker.handoffMessageId} failed: ${err instanceof Error ? err.message : String(err)}`));
+      }
       return deps.interruptTurn(ds, opts);
     }
     return false;
@@ -173,9 +206,55 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     return isWorkflowHandoffRevoked(readDispatchRegistryLoose(deps.dataDir()), nonce, deps.bindingSecret());
   }
 
+  /** The target bot's own check, in-process for the main bot itself, else
+   *  over the host-trusted daemon IPC. */
+  async function checkTargetIdentity(targetLarkAppId: string, request: WorkflowHandoffIdentityCheckRequest): Promise<WorkflowHandoffIdentityCheck> {
+    if (targetLarkAppId === deps.selfLarkAppId()) return deps.handoffIdentity.checkSelf(request);
+    // A bot that governs no tool needs no delegation; asked only when it does.
+    if (deps.handoffIdentity.botTools(targetLarkAppId).length === 0) return { status: 'not_required' };
+    const port = deps.daemonPort(targetLarkAppId);
+    if (!port) return { status: 'unavailable', detail: `${deps.botName(targetLarkAppId)} 的 daemon 不在线` };
+    const result = await deps.postDaemon(port, WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE, request, deps.hostSecret());
+    if (result.status !== 200) {
+      return { status: 'unavailable', detail: `${deps.botName(targetLarkAppId)} 的 daemon 无法校验（${String(result.body.error ?? result.status)}）` };
+    }
+    return parseWorkflowHandoffIdentityCheck(result.body);
+  }
+
   const executor = createV3BotHandoffExecutor({
     get selfLarkAppId() { return deps.selfLarkAppId(); },
     get dataDir() { return deps.dataDir(); },
+    handoffIdentity: {
+      plan: async (request) => {
+        const run = loadWorkflowHandoffIdentityRun(request.runDir);
+        if (!run) return { kind: 'none' };
+        const self = deps.selfLarkAppId();
+        // Only the run's own chat (§10.3): the request's binding IS the run's.
+        const chatId = request.chatBinding?.chatId;
+        if (!chatId || chatId !== run.chatId || run.sourceLarkAppId !== self) {
+          return { kind: 'reject', message: '这个 run 的群或主 Bot 与冻结的发起人身份不一致，节点未交接' };
+        }
+        return planWorkflowHandoffIdentity({
+          run,
+          sourceLarkAppId: self,
+          targetLarkAppId: request.targetLarkAppId,
+          sourceBotTools: deps.handoffIdentity.botTools(self),
+          botName: deps.botName,
+          check: (offered) => checkTargetIdentity(request.targetLarkAppId, {
+            chatId,
+            unionId: run.identity.unionId,
+            tools: offered,
+            sourceLarkAppId: self,
+          }),
+        });
+      },
+      deliver: (input) => deliverWorkflowHandoffWithUser({
+        dataDir: deps.dataDir(),
+        secret: deps.bindingSecret(),
+        sourceLarkAppId: deps.selfLarkAppId(),
+        ...input,
+      }),
+    },
     transport: {
       sendCard: deps.sendCard,
       replyCard: (root, card, uuid) => deps.replyCard(root, card, uuid),
@@ -237,6 +316,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         prompt: input.prompt,
         attachments: staged.attachments,
         sessionTitle: input.sessionTitle,
+        ...(input.identityDelegated ? { identityDelegated: true as const } : {}),
       });
       // The session registered the handoff: record acceptance now rather than
       // at the acceptance deadline's probe (which would find the same marker).
@@ -359,6 +439,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         }));
       },
     }),
+    identityCheckRoute: (raw) => handleWorkflowHandoffIdentityCheck(raw, deps.handoffIdentity.checkSelf),
     stopRoute: (raw) => handleWorkflowHandoffStop(raw, {
       selfLarkAppId: deps.selfLarkAppId(),
       readRegistry: () => readDispatchRegistryLoose(deps.dataDir()),

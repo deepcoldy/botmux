@@ -63,6 +63,16 @@ By default each node runs in a temporary CLI process the daemon starts and disca
 - **Timeouts and cancellation** stop the executing bot's current turn (its session is kept).
 - Private-chat runs, runs without a topic root, or a disabled multi-topic switch keep temporary processes; the approval says why. Approval is refused (with a per-node reason) when a node's bot is not configured on this host, not in the chat, offline, cannot get the in-chat collaboration grant, or (in a normal group) folds topics into one group session (reply mode chat / shared); nodes with directory outputs are refused too. Bots are never added to chats automatically. `approve-dag --working-dir` is not supported in this mode yet. A submission made while the main bot is offline is staged and committed when it comes back.
 
+#### Hand the initiator's identity to node bots (experimental, off by default)
+
+A second switch in the same block, **Hand the initiator's identity to node bots**, applies only to runs whose nodes are handed to bots:
+
+- **Off (the default)**: node bots run as themselves, exactly as without the switch.
+- **Runs approved while it is on** freeze the initiator (the person who approved Gate-2 for an ad-hoc run, or who sent `/workflow run` for a Saved Workflow) and the tools that person could use as themselves on the main bot at that time (the main bot's trigger-user-auth tools). Every handoff then carries its own delegation, signed by the main bot from that record; a node bot with trigger-user auth runs those tools as the initiator. The delegation can only be narrower than what the initiator had on the main bot, and is never passed on through a node's report.
+- **Where it is valid**: while the run is going and this handoff has not been cancelled, timed out, retried or reassigned; in this chat and this node topic; and only for bots chosen at approval (or a bot the initiator reassigned the node to). Stopping the handoff (cancel, timeout, reassignment) withdraws the identity the node bot's current turn was given; once the node is done, the initiator's identity is never published for it again.
+- **When a node blocks on identity**: if the node bot has trigger-user auth and its own check of the initiator fails before the handoff — the initiator left the chat, may not talk to that bot, cannot be resolved across apps, had none of the tools that bot governs on the main bot, or the bot is outside the approved set — the node is not handed off and blocks (no execution identity); it never runs as the bot or its owner instead. Fix it and tap retry. A node bot missing the initiator's personal authorization uses the usual `botmux auth request` flow.
+- Approval is refused, with the reason, when the initiator's cross-app identity cannot be resolved (usually the main bot lacks the contact scope).
+
 ### Limits
 
 - An ad-hoc workflow's nodes can currently only use bots on the **claude-code / codex / seed** CLIs; orchestrating to a bot on another CLI errors out at startup.

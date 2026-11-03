@@ -1,0 +1,244 @@
+/**
+ * 交接带发起人身份 on the receiving bot's daemon (design 2026-11-03 §10.2
+ * items 3–4, §10.3): the REAL daemon.ts turn-identity functions (cut out and
+ * run against an injected scope, as the dispatch-delegation tests do) given a
+ * handoff the REAL main-bot daemon signed for a real authorized run.
+ *
+ * - managed-Agent: the node turn runs the initiator's tools, resolved to THIS
+ *   app's open_id from the union_id; the issuing app's open_id is only the
+ *   local credential-store key and never presented as an identity here;
+ * - the dispatch checks still apply (initiator left the chat → refusal that
+ *   points the node at its handoff, not at the node topic);
+ * - a revoked / ended handoff publishes an explicit refusal and is never
+ *   inherited by a dispatch from the node session;
+ * - a later human turn in the node topic runs as that human (no carry-over);
+ * - the pre-handoff check and the withdrawal on stop use the same functions.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+const bytedcliJwts = new Map<string, { cloudJwt: string }>();
+// The rest of these modules stays real; only the credential providers are scripted.
+vi.mock('../src/utils/user-token.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/utils/user-token.js')>()),
+  resolveUserToken: vi.fn(async () => null),
+}));
+vi.mock('../src/services/bytedcli-auth.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/bytedcli-auth.js')>()),
+  renewBytedcliJwts: vi.fn(async () => null),
+  mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
+  beginBytedcliLogin: vi.fn(async () => ({ authUrl: 'https://cloud.example.com/auth', completeToken: 'tok' })),
+}));
+vi.mock('../src/services/lark-cli-auth.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/lark-cli-auth.js')>()),
+  resolveLarkCliHomeForTurn: vi.fn(async () => null),
+  pendingLarkCliChallenge: vi.fn(() => null),
+  beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
+}));
+
+const ts = (await import('typescript')).default;
+const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+const { recallProvenIdentityContent } = await import('../src/core/cli-identity.js');
+const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+const { resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
+const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
+const { readDispatchRegistryLoose, revokeWorkflowHandoff, lookupWorkflowHandoff } = await import('../src/core/workflow-handoff-binding.js');
+const { workflowDelegationRefusal, checkWorkflowHandoffIdentityTarget } = await import('../src/core/workflow-handoff-identity.js');
+const { workflowNodeMarkerFromBinding } = await import('../src/core/workflow-node-session.js');
+const { BotRun, cleanupBotRuns, reportDag } = await import('./helpers/v3-external-harness.js');
+const { CHAT, INITIATOR_MAIN_OU, INITIATOR_OU_IN, INITIATOR_UNION, MAIN, SECRET, authorizeRun, driveWith, identityWorld } =
+  await import('./helpers/workflow-identity-world.js');
+const { nonceOf } = await import('./helpers/workflow-handoff-harness.js');
+const { validateDag } = await import('../src/workflows/v3/dag.js');
+
+const SESSION = 'sess-node';
+const MAIN_BOT_IN_A = 'ou_main_bot_in_a';
+
+beforeEach(() => bytedcliJwts.clear());
+afterEach(() => cleanupBotRuns());
+
+const DAEMON_FUNCTIONS = [
+  'triggerUserAuthEnabledFor', 'prepareTurnCliIdentity', 'dispatchUserForTurn', 'workflowDelegationRefusalFor',
+  'targetUserForDelegation', 'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
+  'workflowHandoffIdentityCheck', 'withdrawWorkflowHandoffIdentity',
+];
+
+/** The production functions, evaluated against `scope` (no daemon import). */
+function daemonFunctions(scope: Record<string, unknown>) {
+  const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+  const code = DAEMON_FUNCTIONS.map((name) => {
+    const fn = source.statements.find((n) => ts.isFunctionDeclaration(n) && n.name?.text === name);
+    if (!fn) throw new Error(`Missing production function ${name}`);
+    return ts.transpileModule(fn.getText(source).replace(/^export\s+/, ''), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  }).join('\n');
+  return new Function('scope', `with (scope) { ${code}; return { ${DAEMON_FUNCTIONS.join(', ')} }; }`)(scope) as Record<string, (...args: any[]) => any>;
+}
+
+function botConfig(appId: string, tools: Array<'lark-cli' | 'bytedcli'> | null) {
+  return {
+    larkAppId: appId, larkAppSecret: 'secret', brand: 'feishu' as const,
+    ...(tools ? { triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools }) ?? undefined } : {}),
+  } as any;
+}
+
+/** A handoff the main bot really signed, and the receiving bot's view of it. */
+async function receiver(opts: { self?: boolean } = {}) {
+  const self = opts.self === true;
+  const run = new BotRun(self
+    ? validateDag({ schemaVersion: 2, runId: 'rcvd-self', nodes: [{ id: 'write', type: 'goal', goal: 'g', timeoutSec: 600 }] })
+    : reportDag('rcvd'));
+  const world = identityWorld();
+  const snapshots = authorizeRun(run, { identity: { unionId: INITIATOR_UNION, tools: ['bytedcli'] }, selectors: [self ? '' : 'cli_a'] });
+  await driveWith(run, world, snapshots);
+  const attempt = run.openAttempt('write');
+  const handoff = attempt.handoffMessageId!;
+  const nodeCard = attempt.nodeCardMessageId!;
+  const appId = self ? MAIN : 'cli_a';
+  const found = lookupWorkflowHandoff({ registry: readDispatchRegistryLoose(world.dataDir), dispatchRoot: handoff, secret: SECRET });
+  if (found.kind !== 'workflow') throw new Error('handoff binding missing');
+  const ds: any = {
+    larkAppId: appId, chatId: CHAT, chatType: 'group', scope: 'thread',
+    session: {
+      sessionId: SESSION, rootMessageId: nodeCard,
+      workflowNode: workflowNodeMarkerFromBinding(found.binding, handoff),
+      // Lark delivers another bot's handoff as a bot message; the main bot's
+      // own node has no inbound message at all (§6.5).
+      replyTargets: self ? {} : {
+        [handoff]: { senderOpenId: MAIN_BOT_IN_A, rootMessageId: nodeCard, participants: [{ openId: MAIN_BOT_IN_A, isBot: true }], updatedAt: new Date().toISOString() },
+      },
+    },
+  };
+  const members = new Set([INITIATOR_OU_IN[appId]!]);
+  const scope: Record<string, any> = {
+    config: { session: { dataDir: world.dataDir } },
+    pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
+    getBot: () => ({ config: botConfig(appId, ['bytedcli', 'lark-cli']) }),
+    loadOrCreateDispatchReportBindingSecret: () => SECRET,
+    // The target app's own contact directory: union_id → ITS open_id.
+    resolveTargetAppOpenId: vi.fn(async (app: string, unionId: string) => unionId === INITIATOR_UNION
+      ? { status: 'resolved', openId: INITIATOR_OU_IN[app] } : { status: 'definitive' }),
+    evaluateTalk: () => ({ allowed: true }),
+    listChatMemberOpenIds: vi.fn(async () => [...members]),
+    publishTurnCliIdentity, localeForBot: () => 'en',
+    logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+    identityStorageModelForDaemonSession: () => 'proven',
+    identityDecisionConflict: () => undefined,
+    workflowDelegationRefusal, readDispatchRegistryLoose, v3DefaultBaseDir: () => run.base,
+    checkWorkflowHandoffIdentityTarget, workflowSelfAppId: () => appId,
+    identityDecisionTurnIsLive: vi.fn(() => true),
+  };
+  const fns = daemonFunctions(scope);
+  const identity = (turnId = handoff) => recallProvenIdentityContent(world.dataDir, SESSION, turnId, 'bytedcli') ?? '';
+  return { run, world, attempt, handoff, nodeCard, ds, scope, fns, members, identity, snapshots };
+}
+
+describe('a node turn under a workflow delegation', () => {
+  it('managed-Agent: runs the initiator\'s tools under this app\'s own open_id for them', async () => {
+    const h = await receiver();
+    // The issuing app's open_id keys the initiator's local credentials.
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'alice-cloud' });
+    await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
+    expect(h.scope.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith('cli_a', INITIATOR_UNION);
+    const body = h.identity();
+    expect(body).toContain('alice-cloud');
+    expect(body).toContain(INITIATOR_OU_IN.cli_a);
+    expect(body).not.toContain(INITIATOR_MAIN_OU);
+    expect(h.scope.logger.info).toHaveBeenCalledWith(expect.stringMatching(
+      new RegExp(`^\\[dispatch-user:audit\\] receive source=${MAIN} target=cli_a union=${INITIATOR_UNION} .*turn=${h.handoff} .*result=delegated$`),
+    ));
+  });
+
+  it('the initiator left the chat: refused, and the refusal points the node at its handoff', async () => {
+    const h = await receiver();
+    h.members.clear();
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'must-not-leak' });
+    await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
+    const body = h.identity();
+    expect(body).not.toContain('must-not-leak');
+    expect(body).toContain(`report --dispatch-root ${h.handoff}`);
+    expect(body).not.toContain(`--dispatch-root ${h.nodeCard}`);
+  });
+
+  it('a revoked handoff: explicit refusal, no lookup, and nothing for a dispatch from the node session to inherit', async () => {
+    const h = await receiver();
+    await revokeWorkflowHandoff(h.world.dataDir, SECRET, nonceOf(h.attempt), 'runCancelled');
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'must-not-leak' });
+    await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
+    const body = h.identity();
+    expect(body).not.toContain('must-not-leak');
+    expect(body).toContain('no longer active');
+    expect(h.scope.resolveTargetAppOpenId).not.toHaveBeenCalled();
+    expect(await h.fns.dispatchUserForTurn(h.ds, h.handoff)).toBeUndefined();
+  });
+
+  it('while it holds, a dispatch from the node session inherits it (the multi-hop rules then narrow it)', async () => {
+    const h = await receiver();
+    expect(await h.fns.dispatchUserForTurn(h.ds, h.handoff)).toMatchObject({ workflow: { attemptId: h.attempt.attemptId } });
+  });
+
+  it('a later human turn in the node topic runs as that human, never as the initiator', async () => {
+    const h = await receiver();
+    h.ds.session.replyTargets.om_human = {
+      senderOpenId: 'ou_bob_in_a', rootMessageId: h.nodeCard, participants: [{ openId: 'ou_bob_in_a', isBot: false }],
+      updatedAt: new Date().toISOString(),
+    };
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'must-not-leak' });
+    bytedcliJwts.set('ou_bob_in_a', { cloudJwt: 'bob-cloud' });
+    await h.fns.refreshTurnCliIdentity(h.ds, 'om_human');
+    expect(h.identity('om_human')).toContain('bob-cloud');
+    expect(h.identity('om_human')).not.toContain('must-not-leak');
+  });
+
+  it('the main bot\'s own node turn (no inbound message) carries the delegation too', async () => {
+    const h = await receiver({ self: true });
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'alice-cloud' });
+    await h.fns.prepareTurnCliIdentity(h.ds, h.handoff);
+    expect(h.identity()).toContain('alice-cloud');
+    expect(h.scope.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith(MAIN, INITIATOR_UNION);
+  });
+
+  it('stopping the handoff withdraws the identity its turn was given', async () => {
+    const h = await receiver();
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'alice-cloud' });
+    await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
+    expect(h.identity()).toContain('alice-cloud');
+    await revokeWorkflowHandoff(h.world.dataDir, SECRET, nonceOf(h.attempt), 'timeout');
+    await h.fns.withdrawWorkflowHandoffIdentity(h.ds, h.handoff);
+    expect(h.identity()).not.toContain('alice-cloud');
+    expect(h.identity()).toContain('no longer active');
+  });
+
+  it('a turn that already ended is not re-published on stop', async () => {
+    const h = await receiver();
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'alice-cloud' });
+    await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
+    h.scope.identityDecisionTurnIsLive.mockReturnValue(false);
+    h.scope.resolveTargetAppOpenId.mockClear();
+    await revokeWorkflowHandoff(h.world.dataDir, SECRET, nonceOf(h.attempt), 'timeout');
+    await h.fns.withdrawWorkflowHandoffIdentity(h.ds, h.handoff);
+    expect(h.scope.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('workflow delegation inactive'));
+  });
+});
+
+describe('the pre-handoff check runs the dispatch delegation check of this bot', () => {
+  const request = { chatId: CHAT, unionId: INITIATOR_UNION, tools: ['bytedcli' as const], sourceLarkAppId: MAIN };
+
+  it('accepts a member it can resolve, narrowed to what it governs', async () => {
+    const h = await receiver();
+    h.scope.getBot = () => ({ config: botConfig('cli_a', ['bytedcli']) });
+    expect(await h.fns.workflowHandoffIdentityCheck({ ...request, tools: ['lark-cli', 'bytedcli'] }))
+      .toEqual({ status: 'ok', tools: ['bytedcli'] });
+    expect(h.scope.resolveTargetAppOpenId).toHaveBeenCalledWith('cli_a', INITIATOR_UNION);
+  });
+
+  it('denies someone who left the chat; unavailable when membership cannot be read; not required without trigger-user auth', async () => {
+    const h = await receiver();
+    h.members.clear();
+    expect(await h.fns.workflowHandoffIdentityCheck(request)).toEqual({ status: 'denied', reason: 'target_access_denied' });
+    h.scope.listChatMemberOpenIds.mockRejectedValueOnce(new Error('member list exceeds 2000 members'));
+    expect(await h.fns.workflowHandoffIdentityCheck(request)).toMatchObject({ status: 'unavailable' });
+    h.scope.getBot = () => ({ config: botConfig('cli_a', null) });
+    expect(await h.fns.workflowHandoffIdentityCheck(request)).toEqual({ status: 'not_required' });
+  });
+});

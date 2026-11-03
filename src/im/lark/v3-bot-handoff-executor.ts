@@ -48,6 +48,8 @@ import {
   workflowHandoffNonce,
 } from '../../core/workflow-handoff-binding.js';
 import { WORKFLOW_HANDOFF_TASK_FILE } from '../../core/workflow-node-session.js';
+import type { DispatchUserAuthority, WorkflowDispatchUserRef } from '../../core/dispatch-user-delegation.js';
+import type { WorkflowHandoffIdentityPlan } from '../../core/workflow-handoff-identity.js';
 import type { WorkflowNodeSessionMarker } from '../../types.js';
 import { foldV3ExternalAttempts } from '../../workflows/v3/external-attempt-ledger.js';
 import { readJournal } from '../../workflows/v3/journal.js';
@@ -84,6 +86,26 @@ export interface V3SelfTurnRequest {
   sessionTitle: string;
   inputs: GoalInputs;
   runDir: string;
+  /** The handoff carries the initiator's signed delegation (design §10):
+   *  the turn's tool identity must be published from it before it starts. */
+  identityDelegated?: true;
+}
+
+/** 交接带发起人身份 (design §10). Absent, or a `none` plan: every handoff is
+ *  sent exactly as without the feature. */
+export interface V3HandoffIdentityDeps {
+  /** Decided after the target checks and before anything is posted. */
+  plan(request: V3ExternalDispatchRequest): Promise<WorkflowHandoffIdentityPlan>;
+  /** Sign the delegation around the handoff send (pending → send → bind to
+   *  the message id) and return that id. */
+  deliver(input: {
+    authority: DispatchUserAuthority;
+    targetLarkAppId: string;
+    chatId: string;
+    rootId: string;
+    workflow: WorkflowDispatchUserRef;
+    send: () => Promise<string>;
+  }): Promise<string>;
 }
 
 export interface V3BotHandoffExecutorDeps {
@@ -117,6 +139,7 @@ export interface V3BotHandoffExecutorDeps {
   }): Promise<void>;
   /** §6.5: open the main bot's own node session; idempotent per handoff. */
   startSelfTurn(input: V3SelfTurnRequest): Promise<{ sessionId: string }>;
+  handoffIdentity?: V3HandoffIdentityDeps;
   now?(): number;
 }
 
@@ -295,6 +318,14 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       }
       mention = { kind: 'bot', openId: inChat.openId };
     }
+    // §10.3: a target that runs its tools as the trigger user is handed the
+    // node only with the initiator's delegation — never without it.
+    const identity: WorkflowHandoffIdentityPlan = deps.handoffIdentity
+      ? await deps.handoffIdentity.plan(request)
+      : { kind: 'none' };
+    if (identity.kind === 'reject') {
+      return { kind: 'rejected', code: 'IDENTITY_UNAVAILABLE', message: identity.message };
+    }
     request.signal.throwIfAborted();
 
     const context = readRunCardContext(request.runDir, request.runId);
@@ -362,7 +393,25 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       writeFileSync(join(request.attemptDir, WORKFLOW_HANDOFF_TASK_FILE), planned.overflowTask, { mode: 0o600 });
     }
     const overflow = planned.overflowTask !== undefined ? { overflowAttachment: WORKFLOW_HANDOFF_TASK_FILE } : {};
-    const handoffMessageId = await deps.transport.replyCard(nodeCardMessageId, planned.card, request.idempotency.handoff);
+    const sendHandoff = () => deps.transport.replyCard(nodeCardMessageId, planned.card, request.idempotency.handoff);
+    // Star issuance (§10.2): signed here, from the run, for this attempt only.
+    const handoffMessageId = identity.kind === 'sign'
+      ? await deps.handoffIdentity!.deliver({
+          authority: identity.authority,
+          targetLarkAppId: target,
+          chatId,
+          rootId: nodeCardMessageId,
+          workflow: {
+            runId: request.runId,
+            nodeId: request.nodeId,
+            ...(request.instanceId ? { instanceId: request.instanceId } : {}),
+            attemptId: request.attemptId,
+            revision: request.revision,
+            nonce,
+          },
+          send: sendHandoff,
+        })
+      : await sendHandoff();
     await linkWorkflowHandoffMessage(deps.dataDir, secret, nonce, handoffMessageId);
 
     // Show the real id in the visible commands (best-effort: the receiving
@@ -397,6 +446,7 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
         sessionTitle: `工作流 ${context.title} · ${sketchId}`,
         inputs: request.inputs,
         runDir: request.runDir,
+        ...(identity.kind === 'sign' ? { identityDelegated: true as const } : {}),
       });
     }
     return { kind: 'sent', handoffMessageId, nodeCardMessageId };
