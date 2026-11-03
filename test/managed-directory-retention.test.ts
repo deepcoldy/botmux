@@ -8,6 +8,8 @@ import {
   type DirectoryCandidate, type ManagedDirectoryConfig,
 } from '../src/services/managed-directory-retention.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import { createTask } from '../src/services/schedule-store.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { once } from 'node:events';
 
@@ -29,10 +31,12 @@ beforeEach(() => {
   config = { schemaVersion: 1, statePath, roots: [{ path: assets, hashLength: 40 }] };
   previousConfig = process.env.BOTS_CONFIG;
   process.env.BOTS_CONFIG = join(root, 'bots.json');
+  process.env.SESSION_DATA_DIR = join(root, 'data');
   writeFileSync(join(root, '.managed-directories.json'), JSON.stringify(config), { mode: 0o600 });
 });
 afterEach(() => {
   if (previousConfig === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previousConfig;
+  delete process.env.SESSION_DATA_DIR;
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -61,6 +65,27 @@ describe('managed directory write barrier', () => {
     writeFileSync(join(root, 'session.json'), JSON.stringify({ workingDir: a })); done();
     expect(retireManagedDirectories(id, [candidate(a, [b]), candidate(b)], [])).toEqual([]);
     expect(existsSync(a) && existsSync(b)).toBe(true);
+  });
+
+  it('registers authoritative schedule DB commits and edit-time reference deltas', () => {
+    const APP = 'cli_app_retention';
+    const store = ScheduleAuthorityStore.open(join(root, 'data'));
+    store.initializeApp(APP, []);
+    const task = createTask({
+      id: 't1', name: 'task', schedule: 'every 1h', prompt: 'run',
+      workingDir: a, chatId: 'oc_x', larkAppId: APP,
+    });
+    // The cycle starts after the JSON projection was published, so the
+    // authority INSERT is the only reference publication inside the window.
+    const first = beginDirectoryCollection();
+    store.createDirect(task);
+    expect(retireManagedDirectories(first, [candidate(a)], [])).toEqual([]);
+    expect(existsSync(a)).toBe(true);
+    // An edit that newly names another managed version registers the delta.
+    const second = beginDirectoryCollection();
+    store.updateTask(APP, 't1', current => ({ ...current, prompt: `inspect ${b}` }));
+    expect(retireManagedDirectories(second, [candidate(b)], [])).toEqual([]);
+    expect(existsSync(b)).toBe(true);
   });
 
   it('keeps a pending write across successive scans until publication completes', () => {

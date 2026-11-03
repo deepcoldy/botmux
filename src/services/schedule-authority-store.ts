@@ -17,6 +17,7 @@ import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.
 import { backgroundAuthorityKey, backgroundPeerBelongsToJob, type BackgroundExecutionRegistration } from '../core/background-execution-policy.js';
 import { cleanupBackgroundJobHome } from './bytedcli-home.js';
 import { isAutoCompletedSchedule } from './schedule-until-done.js';
+import { reserveManagedDirectories } from './managed-directory-retention.js';
 
 export type ScheduleAuthorityKind = 'legacy' | 'direct' | 'delegated';
 export type ScheduleAuthorityState = 'active' | 'paused' | 'completed' | 'revoked';
@@ -254,6 +255,10 @@ export class ScheduleAuthorityStore {
     // authoritative read path cannot subsequently parse. Legacy ownerless rows
     // are valid for the primary daemon, but an explicit different app id is not.
     const validated = existing.map(task => parseTask(JSON.stringify(task), appId));
+    // Bulk publication of tasks that previously existed only in the JSON
+    // projection: register their managed references for the whole commit so a
+    // collection begun during startup cannot retire a backfilled version.
+    const releaseInit = reserveManagedDirectories(validated);
     this.db.exec('BEGIN IMMEDIATE;');
     try {
       const initialized = this.db.prepare(
@@ -281,6 +286,8 @@ export class ScheduleAuthorityStore {
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
       throw error;
+    } finally {
+      releaseInit();
     }
   }
 
@@ -354,6 +361,11 @@ export class ScheduleAuthorityStore {
       throw new Error('schedule_authority_invalid_task_limit');
     }
     const now = new Date().toISOString();
+    // Register before the transaction opens: the SQLite COMMIT is the first
+    // durable publication of this task's references, so a collection cycle
+    // scanning concurrently must already mark them. The JSON projection is
+    // written only afterwards and cannot fence this commit by itself.
+    const release = reserveManagedDirectories(task);
     this.db.exec('BEGIN IMMEDIATE;');
     try {
       const existing = this.getRecord(appId, task.id);
@@ -389,6 +401,8 @@ export class ScheduleAuthorityStore {
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
       throw error;
+    } finally {
+      release();
     }
   }
 
@@ -408,6 +422,9 @@ export class ScheduleAuthorityStore {
       throw new Error('schedule_authority_invalid_task_limit');
     }
     const now = new Date().toISOString();
+    // Delegated tasks are published straight into the authority DB; register
+    // the references for the whole transaction like createDirect.
+    const releaseDelegated = reserveManagedDirectories(input.task);
     this.db.exec('BEGIN IMMEDIATE;');
     try {
       const prior = this.db.prepare(`
@@ -459,12 +476,15 @@ export class ScheduleAuthorityStore {
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
       throw error;
+    } finally {
+      releaseDelegated();
     }
   }
 
   updateTask(appId: string, taskId: string, mutate: (task: ScheduledTask) => ScheduledTask | undefined): ScheduledTask | undefined {
     this.db.exec('BEGIN IMMEDIATE;');
     let retired: string[] = [];
+    let releaseEdit: (() => void) | undefined;
     try {
       const record = this.getRecord(appId, taskId);
       if (!record || record.state === 'revoked') {
@@ -476,6 +496,9 @@ export class ScheduleAuthorityStore {
         this.db.exec('COMMIT;');
         return record.task;
       }
+      // An edit (e.g. a prompt that now names a managed version) publishes new
+      // references with the UPDATE; register only the delta vs the old row.
+      releaseEdit = reserveManagedDirectories(next, record.task);
       const state = stateFor(next);
       if ((state !== 'active' && !(state === 'completed' && isAutoCompletedSchedule(next)))
         || backgroundAuthorityKey(next) !== backgroundAuthorityKey(record.task)) {
@@ -505,6 +528,8 @@ export class ScheduleAuthorityStore {
     } catch (error) {
       try { this.db.exec('ROLLBACK;'); } catch { /* no-op */ }
       throw error;
+    } finally {
+      releaseEdit?.();
     }
   }
 
