@@ -53,7 +53,7 @@
 | 复用 Agent 会话标题（`session-title`，新增） | 使用当前常驻 Agent 发布的会话标题，不额外调用模型；标题未就绪时保留占位名。 |
 | 仅截断原文（`truncate`） | 保留首条消息的截断群名。 |
 
-Codex 的 AI 摘要复用隔离的 app-server 标题生成器，替代 `codex exec`：固定 low 推理，临时 `CODEX_HOME` 只复制登录凭证，不复制用户配置；关闭 hooks、插件、MCP、工具与项目指令加载。可在「摘要模型（Codex）」填写账号可用的轻量模型 ID；留空沿用 Bot 模型。此覆盖只用于专属群 AI 摘要，不改变对话模型或原生会话标题模型。其他 CLI 的摘要生成路径保持原样。共享生成器也用于 `/g` 的 Codex 摘要，`/g` 继续沿用 Bot 模型及原有权限门控。
+Codex 的 AI 摘要复用隔离的 app-server 标题生成器，替代 `codex exec`：固定 low 推理，临时 `CODEX_HOME` 只复制登录凭证与 provider 接线（源 `config.toml` 的 `model` / `model_provider` / `model_providers`），其余用户配置（hooks、插件、MCP、`projects`/信任、`profiles`、features 等）一律不复制；关闭 hooks、插件、MCP、工具与项目指令加载。之所以必须带上 provider：只复制凭证会让走自定义网关（`base_url` / `env_key` / 内联 `http_headers`）的 Bot 掉回 Codex 内置 `openai` provider，要么直接失败只能保留占位名，要么改用宿主账号在默认端点计费。源 `config.toml` 存在却无法安全读取（符号链接、多硬链接、超限、读取期间被改动）或解析失败时，宁可不改名也不生成标题——不会静默走错 provider。可在「摘要模型（Codex）」填写账号可用的轻量模型 ID；留空沿用 Bot 模型。此覆盖只用于专属群 AI 摘要，不改变对话模型或原生会话标题模型。其他 CLI 的摘要生成路径保持原样。共享生成器也用于 `/g` 的 Codex 摘要，`/g` 继续沿用 Bot 模型及原有权限门控。
 
 也可在对应 Bot 的 `bots.json` 设置：
 

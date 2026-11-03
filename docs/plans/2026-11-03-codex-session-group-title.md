@@ -36,3 +36,19 @@ Dashboard 使用真实 React 组件、模拟配置 API 在 ego-lite 验证保存
 变异复验：临时移除人工群名 CAS、结束后的新候选重调度、自动写入基线推进、部分成功补记四类守卫，相关用例均失败；源码恢复后 8/8 时序回归通过。
 
 最终定向回归：14 个文件，676 passed / 7 既有 skipped；Dashboard 390px 宽度无横向溢出，摘要模型清空后保存可恢复 Bot 默认。
+
+## 补充：隔离标题 home 的 provider 接线（P2 修复）
+
+`isolatedCodexTitleEnv` 原实现只复制 `auth.json`。这在生成器仅服务 Codex 内部语义标题时是 latent，但本 PR 把默认 `ai-summary` 整条接上后成为回归：源 `config.toml` 里的 `model_provider` + `[model_providers.*]` 是自定义网关 Bot 唯一的 provider 来源，缺了它会掉回 Codex 内置 `openai` provider——要么直接失败（永久占位名），要么改用宿主 ChatGPT 账号在默认端点计费。
+
+新模块 `src/services/codex-title-config.ts` 只继承白名单三键 `model` / `model_provider` / `model_providers`，写进同样的 0700 临时 home，`0600`（provider 段可能带内联 `http_headers` 凭证，与 `auth.json` 同一边界）。读取口径对齐 `codex-profiles.readToml`：拒绝 symlink/多硬链接、256 KiB 上限、读取前后身份复核、解析异常不外泄片段。`model_reasoning_effort` 仍由 `thread/start` 的 `config` 固定为 `low`；调用方的 `model`（`naming.model` / Bot 模型）在线程级 `config.model` 注入，优先级最高。
+
+**fail closed**：源 `config.toml` 存在但读不安全/解析失败时不生成标题（记 warn 后返回 `undefined`），而不是带着默认 provider 继续——走错 provider 的代价（悄悄吃别人额度）高于少一次改名。
+
+探针（本机 codex-cli 0.164.0 + 本地假网关，逐项串行）：
+- 自定义 `model_providers` + 内联 `http_headers`：网关收到请求，`x-gw-key: inline-secret-ok`，`model=local-model`，标题正常生成。
+- `env_key` 型 provider：请求带 `Authorization`（来自透传 env），标题正常生成。
+- 仅 `auth.json`、无 `config.toml`：不发生任何宿主 provider 命中（假 `$HOME/.codex` 配好网关后网关零请求），保持原有无标题行为。
+- `config.toml` 额外带 `mcp_servers` / `features.hooks` / `projects`：MCP 命令未执行，隔离 home 落盘仅白名单三键。
+- 调用方 `model` 覆盖：网关收到 `model=override-model` 且 `effort=low`（源文件的 `xhigh` 未泄漏）。
+- 源 config 损坏：`codex` 进程根本没起（fail closed 在 spawn 前生效）。
