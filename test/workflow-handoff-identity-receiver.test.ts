@@ -39,7 +39,11 @@ vi.mock('../src/services/lark-cli-auth.js', async (importOriginal) => ({
 
 const ts = (await import('typescript')).default;
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
-const { recallProvenIdentityContent } = await import('../src/core/cli-identity.js');
+const { recallProvenIdentityContent, renderIdentityWrapper, publishActiveTurn } = await import('../src/core/cli-identity.js');
+const { execFileSync } = await import('node:child_process');
+const fs = await import('node:fs');
+const nodePath = await import('node:path');
+const nodeOs = await import('node:os');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
 const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
@@ -385,5 +389,122 @@ describe('a node bot passing the initiator on (`botmux dispatch` from the node s
       inherited: { ...inherited, workflow: { ...inherited.workflow, hop: 16 } }, targetAppIds: ['cli_b'], chatId: CHAT,
       baseDir: h.run.base, targetUserAllowed: async () => true,
     })).toEqual({ inherit: false });
+  });
+});
+
+// ─── passed on into a session that keeps identities in files ────────────────
+
+/** Run the REAL rendered single-model bytedcli wrapper of `sessionId` with a
+ *  fake binary that prints the JWT it was handed. */
+function runFileWrapper(dataDir: string, sessionId: string): string {
+  const dir = fs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'wf-id-wrap-'));
+  try {
+    const fake = nodePath.join(dir, 'real-bytedcli');
+    fs.writeFileSync(fake, '#!/bin/sh\necho "RAN jwt=${BYTEDCLI_USER_CLOUD_JWT:-none}"\n', { mode: 0o755 });
+    const wrapper = nodePath.join(dir, 'bytedcli');
+    fs.writeFileSync(wrapper, renderIdentityWrapper('bytedcli', fake, 'single'), { mode: 0o755 });
+    try {
+      return execFileSync('/bin/sh', [wrapper, 'tce', 'list'], {
+        env: { PATH: '/usr/bin:/bin', HOME: dir, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId },
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+    } catch (err: any) {
+      return `${String(err.stdout ?? '')}${String(err.stderr ?? '')}`.trim();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('a passed-on workflow delegation is only honoured where every use is re-checked', () => {
+  /** cli_a's node session dispatches to cli_b (approved, a member); cli_b's
+   *  session stores identities as `model`. */
+  async function grandchild(model: 'single' | 'proven') {
+    const h = await receiver({ alsoApproved: ['cli_b'] });
+    h.members.add(INITIATOR_OU_IN.cli_b!);
+    h.scope.getBot = (appId: string) => ({ config: botConfig(appId, ['lark-cli', 'bytedcli']) });
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    const passed = await inheritWorkflowDelegation({
+      inherited, targetAppIds: ['cli_b'], chatId: CHAT, baseDir: h.run.base, targetUserAllowed: async () => true,
+    });
+    if (!passed.inherit) throw new Error('expected the delegation to be passed on');
+    const authority = await authorityForDispatch({
+      sourceAppId: 'cli_a', tools: ['lark-cli', 'bytedcli'], inherited: inherited.authority, resolveUnionId: async () => null,
+    });
+    await deliverDispatchWithUser({
+      dataDir: h.world.dataDir, secret: SECRET,
+      payload: { sourceAppId: 'cli_a', sourceSessionId: SESSION, sourceTurnId: h.handoff, rootId: 'om_groot',
+        chatId: CHAT, targetAppIds: ['cli_b'], authority: authority!, workflow: passed.workflow },
+      send: async () => 'om_gmsg',
+    });
+    const sessionId = `sess-grand-${model}`;
+    const ds: any = {
+      larkAppId: 'cli_b', chatId: CHAT, chatType: 'group', scope: 'thread',
+      session: { sessionId, rootMessageId: 'om_groot', replyTargets: {
+        om_gmsg: { senderOpenId: 'ou_a_in_b', rootMessageId: 'om_groot', participants: [{ openId: 'ou_a_in_b', isBot: true }], updatedAt: new Date().toISOString() },
+      } },
+    };
+    h.scope.identityStorageModelForDaemonSession = () => model;
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'JWT-ALICE' });
+    return { h, ds, sessionId };
+  }
+
+  it('file-stored session: an explicit refusal is published, never the credentials (nothing could withdraw them later)', async () => {
+    const { h, ds, sessionId } = await grandchild('single');
+    await h.fns.refreshTurnCliIdentity(ds, 'om_gmsg');
+    publishActiveTurn(h.world.dataDir, sessionId, 'om_gmsg', 1, 'ou_a_in_b');
+    const out = runFileWrapper(h.world.dataDir, sessionId);
+    expect(out).not.toContain('JWT-ALICE');
+    expect(out).not.toMatch(/RAN/);
+    expect(out).toContain('passed on by another bot');
+    expect(h.scope.resolveTargetAppOpenId).not.toHaveBeenCalledWith('cli_b', INITIATOR_UNION);
+  });
+
+  it('file-stored session: the node bot\'s own handoff still carries the identity there (only passed-on records are refused)', async () => {
+    const h = await receiver();
+    h.scope.identityStorageModelForDaemonSession = () => 'single';
+    bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'JWT-ALICE' });
+    await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
+    publishActiveTurn(h.world.dataDir, SESSION, h.handoff, 1, MAIN_BOT_IN_A);
+    expect(runFileWrapper(h.world.dataDir, SESSION)).toContain('RAN jwt=JWT-ALICE');
+  });
+
+  it('re-checked session: honoured, and ends the moment the handoff is revoked', async () => {
+    const { h, ds, sessionId } = await grandchild('proven');
+    await h.fns.refreshTurnCliIdentity(ds, 'om_gmsg');
+    expect(currentLarkToolDelegation(h.world.dataDir, sessionId, 'om_gmsg')).toMatchObject({ targetOpenId: INITIATOR_OU_IN.cli_b });
+    expect(recallProvenIdentityContent(h.world.dataDir, sessionId, 'om_gmsg', 'bytedcli')).toContain('JWT-ALICE');
+    await revokeWorkflowHandoff(h.world.dataDir, SECRET, nonceOf(h.attempt), 'runCancelled');
+    expect(currentLarkToolDelegation(h.world.dataDir, sessionId, 'om_gmsg')).toMatchObject({ denialReason: 'delegation_inactive', tools: [] });
+    clearLarkToolDelegations(h.world.dataDir, sessionId);
+  });
+});
+
+describe('passing on: every target must be approved, and the identity must still be the main bot\'s', () => {
+  it('one unapproved bot among the targets: nothing is passed on', async () => {
+    const h = await receiver({ alsoApproved: ['cli_b'] });
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    expect(await inheritWorkflowDelegation({
+      inherited, targetAppIds: ['cli_b', 'cli_c'], chatId: CHAT, baseDir: h.run.base, targetUserAllowed: async () => true,
+    })).toEqual({ inherit: false });
+    expect(await inheritWorkflowDelegation({
+      inherited, targetAppIds: ['cli_c', 'cli_b'], chatId: CHAT, baseDir: h.run.base, targetUserAllowed: async () => true,
+    })).toEqual({ inherit: false });
+  });
+
+  it('a passed-on record whose authority is not the main bot\'s frozen one is refused on receipt', async () => {
+    const h = await receiver({ alsoApproved: ['cli_b'] });
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    await deliverDispatchWithUser({
+      dataDir: h.world.dataDir, secret: SECRET,
+      payload: { sourceAppId: 'cli_a', sourceSessionId: SESSION, sourceTurnId: h.handoff, rootId: 'om_r4', chatId: CHAT,
+        targetAppIds: ['cli_b'], authority: { ...inherited.authority, appId: 'cli_a' }, workflow: { ...inherited.workflow, hop: 1 } },
+      send: async () => 'om_m4',
+    });
+    const record = await resolveDispatchUser({ dataDir: h.world.dataDir, secret: SECRET, appId: 'cli_b', chatId: CHAT, rootId: 'om_r4', turnId: 'om_m4', waitMs: 0 });
+    expect(workflowDelegationRefusal({
+      record: record as any, turnId: 'om_m4', receiverLarkAppId: 'cli_b', chatId: CHAT, marker: undefined,
+      registry: readDispatchRegistryLoose(h.world.dataDir), secret: SECRET, baseDir: h.run.base,
+    })).toBe('identity_mismatch');
   });
 });

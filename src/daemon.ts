@@ -4617,7 +4617,18 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
         delegatedIdentity.denialReason = 'delegation_inactive';
         logger.info(`[dispatch-user:audit] workflow delegation inactive target=${ds.larkAppId} turn=${turnId} reason=${workflowRefusal}`);
       }
-      const targetOpenId = workflowRefusal ? undefined : await targetUserForDelegation(ds, delegation.authority);
+      // A workflow delegation passed on from a node session (`hop`) has no
+      // stop path to this session: it ends only through the per-use re-check,
+      // which identities kept on disk (the single model) never go through.
+      // Such a session gets an explicit refusal, never the credentials.
+      const passedOnToFileSession = !workflowRefusal && 'workflow' in delegation && !!delegation.workflow.hop
+        && identityStorageModelForDaemonSession(ds) !== 'proven';
+      if (passedOnToFileSession) {
+        delegatedIdentity.denialReason = 'passed_on_unsupported';
+        logger.info(`[dispatch-user:audit] workflow delegation passed on into a file-identity session target=${ds.larkAppId} turn=${turnId}`);
+      }
+      const targetOpenId = workflowRefusal || passedOnToFileSession
+        ? undefined : await targetUserForDelegation(ds, delegation.authority);
       if (targetOpenId) delegatedIdentity = {
         ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
         denialReason: undefined,
