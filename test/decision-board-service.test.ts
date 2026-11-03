@@ -522,6 +522,22 @@ describe('事项关联群', () => {
       .toMatchObject({ created: false, item: { seq: 1, stage: '在审' } });
   });
 
+  it('add 等查群期间事项被关掉：放行后照样拒绝，不改回待拍板', async () => {
+    await cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1' }, noChat: '先建着' });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    lookupImpl = async chatId => { await gate; return { ok: true, chatId, appId: APP, name: `群名-${chatId}` }; };
+    const pending = cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1', state: 'decide', question: '合不合？' },
+      links: ['chat=oc_a'] }).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(lookups).toEqual(['oc_a']));
+    await cli({ action: 'set', ref: '1', fields: { state: 'closed' } });
+    release();
+    expect(boardErrorStatus(await pending)).toMatchObject({ status: 409, error: 'item_ended' });
+    const item = (await cli({ action: 'show', ref: '1' })).item;
+    expect(item.state).toBe('closed');
+    expect(item.question).toBeUndefined();
+  });
+
   it('写群前用本机 bot 核实：查到了用群名当默认标签，给了标签就用调用方的；第一个群是主群', async () => {
     const res = await cli({ action: 'add', title: 'PR #12', links: ['pr=o/r#12', 'chat=oc_task', 'chat=oc_review|PR 评审群'] });
     expect(lookups.sort()).toEqual(['oc_review', 'oc_task']);

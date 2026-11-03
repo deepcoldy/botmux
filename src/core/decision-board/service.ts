@@ -402,13 +402,7 @@ export class DecisionBoardService {
         if (!title?.trim()) throw new BoardError('title_required', '缺少标题');
         // 只在真正新建时强制带群：带已有 key 的 add 等于 set，存量事项不强制。
         const existingSeq = patch.key ? store.resolveSeq(app, { key: patch.key }) : undefined;
-        // 同 key 命中已结束的事项时不借 add 改它：巡检按来源反复 add，误判一次就会把关掉的旧事改回待拍板。重开走 set。
-        const existingState = existingSeq !== undefined ? store.getItem(app, existingSeq)!.state : undefined;
-        if (existingState === 'done' || existingState === 'closed') {
-          throw new BoardError('item_ended',
-            `#${existingSeq} ${BOARD_STATE_LABELS.zh[existingState]}，add 不改已结束的事项；确实要重开用 botmux board set ${existingSeq} --state …`);
-        }
-        if (existingSeq === undefined &&!patch.links?.some(l => l.kind === 'chat') && patch.noChatReason === undefined) {
+        if (existingSeq === undefined && !patch.links?.some(l => l.kind === 'chat') && patch.noChatReason === undefined) {
           throw new BoardError('chat_required', ADD_CHAT_REQUIRED_MESSAGE);
         }
         const existing = existingSeq !== undefined ? store.links(app, existingSeq) : [];
