@@ -147,6 +147,7 @@ import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/fi
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
+import { defaultStatFile, parseSendInvocation, validateClientSendInvocation, type ClientSendPlan } from './cli/send-invocation.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { isCodexReasoningEffort, type CodexReasoningEffort } from './services/codex-reasoning-effort.js';
@@ -9667,7 +9668,20 @@ async function relaySend(
   rest: string[],
   relayDir: string,
   replyLayout?: ReplyLayout,
+  preflightPlan?: ClientSendPlan,
 ): Promise<void> {
+  const resolved = preflightPlan
+    ? { kind: 'plan' as const, plan: preflightPlan }
+    : await preflightSendInvocation(rest);
+  if (resolved.kind === 'help') {
+    console.log(SEND_HELP_BODY);
+    return;
+  }
+  if (resolved.kind === 'error') {
+    console.error(resolved.message);
+    process.exit(2);
+  }
+  const plan = resolved.plan;
   if (flagPresentButValueMissing(rest, '--completion-proposal-file')) {
     console.error('relay: --completion-proposal-file 需要路径参数');
     process.exit(2);
@@ -9736,22 +9750,16 @@ async function relaySend(
     cardContent = readFileSync(cardFile, 'utf-8');
   }
   // Resolve content with the same precedence as cmdSend (content-file > positional > stdin)
-  const contentFile = argValue(rest, '--content-file');
+  const contentFile = plan.contentFile;
   let content = '';
   if (cardJsonArg !== undefined || cardFile !== undefined) {
     content = '';
   } else if (contentFile) {
     content = existsSync(contentFile) ? readFileSync(contentFile, 'utf-8') : '';
+  } else if (plan.invocation.bodySource === 'stdin') {
+    content = plan.stdinContent ?? await readStdin();
   } else {
-    // NOTE: `--attention` is deliberately NOT excluded here. The relay flag
-    // allowlist (below) doesn't forward it, so sandbox `--attention` can't raise
-    // the dashboard hand anyway; excluding it would silently send the reason as a
-    // bare message instead of the original loud "no content" failure. Plumbing
-    // `--attention` through the relay is a separate change, out of this scope.
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent', '--schedule-remove-self']);
-    content = pos.length > 0
-      ? normalizePositionalSendContent(pos.join(' '))
-      : await readStdin();
+    content = normalizePositionalSendContent(plan.invocation.positionals.join(' '));
   }
   content = stripTrailingOaiMemoryCitation(content);
   if (diffInput) {
@@ -9819,19 +9827,19 @@ async function relaySend(
     try { writeFileSync(join(relayDir, base), readFileSync(p)); out.push(base); } catch { /* skip unreadable */ }
   };
   const images: string[] = [];
-  for (const p of argValues(rest, '--image', '--images')) {
+  for (const p of plan.attachments.images) {
     copyOutboxAttachment(p, images);
   }
   const attachments: string[] = [];
-  for (const p of argValues(rest, '--file', '--files')) {
+  for (const p of plan.attachments.files) {
     copyOutboxAttachment(p, attachments);
   }
   const videos: string[] = [];
-  for (const p of argValues(rest, '--video', '--videos')) {
+  for (const p of plan.attachments.videos) {
     copyOutboxAttachment(p, videos);
   }
   const videoCovers: string[] = [];
-  for (const p of argValues(rest, '--video-cover', '--video-covers')) {
+  for (const p of plan.attachments.videoCovers) {
     copyOutboxAttachment(p, videoCovers);
   }
 
@@ -10397,7 +10405,65 @@ function buildSendDiffCard(input: SendDiffInput, summary: string): DiffCardResul
   }
 }
 
-async function sendDryRun(rest: string[]): Promise<void> {
+type SendPreflight =
+  | { kind: 'help' }
+  | { kind: 'error'; message: string }
+  | { kind: 'plan'; plan: ClientSendPlan };
+
+/** Earliest send gate. Runs before Riff dispatch and before any session,
+ *  relay, marker or transport resolution so a rejected argv cannot mutate
+ *  state. The order is part of the contract:
+ *  provider guard → pure parse → raw exact `--` → free help → client validation. */
+async function preflightSendInvocation(rest: string[]): Promise<SendPreflight> {
+  if (rest.includes('--remote-runner-outbound')
+    && argValues(rest, '--mention').some(isCliFlagShapedRemoteRunnerValue)) {
+    return { kind: 'error', message: 'botmux send refused: --remote-runner-outbound mention values must not look like CLI flags' };
+  }
+  const invocation = parseSendInvocation(rest);
+  if (invocation.rawDoubleDashToken) {
+    return { kind: 'error', message: "botmux send: '--' 分隔符尚未支持；正文以 -- 开头请用 --content-file 或 heredoc。" };
+  }
+  if (invocation.freeHelpRequested) return { kind: 'help' };
+  const validated = validateClientSendInvocation(invocation, {
+    cwd: process.cwd(),
+    statFile: defaultStatFile,
+  });
+  if (!validated.ok) return { kind: 'error', message: validated.message };
+  const plan = validated.plan;
+  if (plan.invocation.bodySource !== 'stdin') return { kind: 'plan', plan };
+
+  // Read stdin before session/ledger/marker resolution. This is the same read
+  // the command used to perform later, but doing it here keeps a rejected body
+  // from advancing a queued turn or copying an open socket into a transport.
+  const stdinContent = await readStdin();
+  const loneDash = plan.invocation.positionals.length === 1 && plan.invocation.positionals[0] === '-';
+  if (loneDash && !stdinContent.trim()) {
+    return {
+      kind: 'error',
+      message: "botmux send: 位置参数 '-' 表示从 stdin 读正文，但 stdin 没有内容；多行正文请直接用 botmux send <<'EOF' … EOF。",
+    };
+  }
+  const hasAttachments = plan.attachments.images.length + plan.attachments.files.length
+    + plan.attachments.videos.length + plan.attachments.videoCovers.length > 0;
+  if (!loneDash && !stdinContent.trim() && !hasAttachments && !Object.hasOwn(plan.invocation.flags, '--diff')) {
+    return { kind: 'error', message: 'botmux send: 正文为空（stdin 没有内容）。' };
+  }
+  return { kind: 'plan', plan: { ...plan, stdinContent } };
+}
+
+async function sendDryRun(rest: string[], preflightPlan?: ClientSendPlan): Promise<void> {
+  const resolved = preflightPlan
+    ? { kind: 'plan' as const, plan: preflightPlan }
+    : await preflightSendInvocation(rest);
+  if (resolved.kind === 'help') {
+    console.log(SEND_HELP_BODY);
+    return;
+  }
+  if (resolved.kind === 'error') {
+    console.error(resolved.message);
+    process.exit(2);
+  }
+  const plan = resolved.plan;
   const diff = parseDiffFlag(rest);
   if (diff.error) { console.error(`botmux send: ${diff.error}`); process.exit(2); }
   const diffError = diffUsageError({
@@ -10415,16 +10481,15 @@ async function sendDryRun(rest: string[]): Promise<void> {
   for (const flag of ['--images', '--files', '--videos', '--voice']) {
     if (rest.includes(flag)) console.error(`botmux send --dry-run: 已忽略 ${flag}（dry-run 只渲染正文）`);
   }
-  const contentFile = argValue(rest, '--content-file');
+  const contentFile = plan.contentFile;
   let content: string;
   if (contentFile) {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
+  } else if (plan.invocation.bodySource === 'stdin') {
+    content = plan.stdinContent ?? await readStdin();
   } else {
-    const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--schedule-remove-self']);
-    content = pos.length > 0
-      ? normalizePositionalSendContent(pos.join(' '))
-      : await readStdin();
+    content = normalizePositionalSendContent(plan.invocation.positionals.join(' '));
   }
   content = extractCardText(stripTrailingOaiMemoryCitation(content));
   if (!content.trim() && !diffInput) {
@@ -10445,35 +10510,29 @@ async function sendDryRun(rest: string[]): Promise<void> {
   console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, ...(rendered ? { diff: { stats: rendered.stats, statsScope: rendered.statsScope, preview: rendered.preview } } : {}), card }, null, 2));
 }
 
-async function cmdSend(rest: string[]): Promise<void> {
+async function cmdSend(rest: string[], preflight?: SendPreflight): Promise<void> {
+  const resolved = preflight ?? await preflightSendInvocation(rest);
+  if (resolved.kind === 'help') {
+    console.log(SEND_HELP_BODY);
+    return;
+  }
+  if (resolved.kind === 'error') {
+    console.error(resolved.message);
+    process.exit(2);
+  }
+  const sendPlan = resolved.plan;
   const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
-  // Provider values are opaque argv tokens, but flag-shaped mention values can
-  // otherwise trigger the help/dry-run early exits below before the outbound
-  // policy guard runs. Reject them at the final CLI boundary as well as in the
-  // Remote Runner protocol parser so direct/replayed outbound mention values
-  // fail closed.
+  // Defense in depth for direct callers that pass a plan; the earliest gate
+  // already enforces this before help/dry-run.
   if (remoteRunnerOutbound
     && argValues(rest, '--mention').some(isCliFlagShapedRemoteRunnerValue)) {
     console.error('botmux send refused: --remote-runner-outbound mention values must not look like CLI flags');
     process.exit(2);
   }
-  // `--help` wins over every ordinary flag and over all content resolution.
-  // It must stay the first generic early exit after the narrow provider-value
-  // shape check above: content resolution below
-  // falls through to readStdin() when there is no positional/--content-file,
-  // and positionals() filters `--help` out as a flag, so anything placed
-  // after it turns `botmux send --help` into a stdin wait instead of help —
-  // and stdin that never reaches EOF (an open socket) hangs the process
-  // indefinitely, taking the calling shell with it. Printing help is a
-  // success, so this exits 0 rather than falling into the usage error.
-  if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(SEND_HELP_BODY);
-    return;
-  }
   // `--dry-run` renders locally and exits before any session, relay or
   // transport resolution: it must never be able to deliver anything.
   if (rest.includes('--dry-run')) {
-    await sendDryRun(rest);
+    await sendDryRun(rest, sendPlan);
     return;
   }
   const ancestorCtx = findAncestorSessionContext();
@@ -10623,7 +10682,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         replyLayout = undefined;
       }
     }
-    await relaySend(rest, relayDir, replyLayout);
+    await relaySend(rest, relayDir, replyLayout, sendPlan);
     return;
   }
   if (relayDir && (linuxKernelIsolationDetected || !liveMarkerCtx?.sessionId)) {
@@ -10908,10 +10967,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --image-mode 仅支持 fit_horizontal|medium|small|tiny');
     process.exit(2);
   }
-  const images = argValues(rest, '--image', '--images');
-  const files = argValues(rest, '--file', '--files');
-  const videos = argValues(rest, '--video', '--videos');
-  const videoCovers = argValues(rest, '--video-cover', '--video-covers');
+  const { images, files, videos, videoCovers } = sendPlan.attachments;
   const diffError = diffUsageError({
     requested: diff.requested,
     customCardRequested: cardJsonArg !== undefined || cardFile !== undefined,
@@ -10944,7 +11000,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(1);
   }
   const mentionArgs = argValues(rest, '--mention');  // "open_id:Display Name"
-  const contentFile = argValue(rest, '--content-file');
+  const contentFile = sendPlan.contentFile;
   if (customCardRequested && !diff.requested && contentFile) {
     console.error('botmux send: --card-file/--card-json 不能与 --content-file 混用');
     process.exit(2);
@@ -11575,7 +11631,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested && !diff.requested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--remote-runner-outbound', '--schedule-remove-self']);
+    const unexpectedText = sendPlan.invocation.positionals;
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -11652,13 +11708,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   } else if (contentFile) {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
+  } else if (sendPlan.invocation.bodySource === 'stdin') {
+    content = sendPlan.stdinContent ?? await readStdin();
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound', '--schedule-remove-self']);
-    if (pos.length > 0) {
-      content = normalizePositionalSendContent(pos.join(' '));
-    } else {
-      content = await readStdin();
-    }
+    content = normalizePositionalSendContent(sendPlan.invocation.positionals.join(' '));
   }
   if (diffInput) {
     customCard = { ...buildSendDiffCard(diffInput, extractCardText(stripTrailingOaiMemoryCitation(content))).card };
@@ -18557,14 +18610,29 @@ function getVersion(): string {
 
 const command = process.argv[2];
 
+let sendPreflight: SendPreflight | undefined;
+if (command === 'send') {
+  sendPreflight = await preflightSendInvocation(process.argv.slice(3));
+  if (sendPreflight.kind === 'help') {
+    console.log(SEND_HELP_BODY);
+    process.exit(0);
+  }
+  if (sendPreflight.kind === 'error') {
+    console.error(sendPreflight.message);
+    process.exit(2);
+  }
+}
+
 // Riff runs on a different machine. Dispatch its stateful helpers on the owning
 // host before any command can accidentally read/write sandbox-local stores.
 if (process.env.BOTMUX_SESSION_ID && !command?.startsWith('__')
   && (command === 'riff-host-bind' || process.env.BOTMUX_RIFF_HOST_TOOLS === '1'
     || process.env.BOTMUX_RIFF_HOST_BINDING || process.env.BOTMUX_LARK_APP_SECRET)) {
   try {
-    const { maybeRunRiffHostTool } = await import('./cli/riff-host-tools.js');
-    if (await maybeRunRiffHostTool(process.argv.slice(2), readStdin)) process.exit(process.exitCode ?? 0);
+    const { makeRiffStdinReader, maybeRunRiffHostTool } = await import('./cli/riff-host-tools.js');
+    const cachedStdin = sendPreflight?.kind === 'plan' ? sendPreflight.plan.stdinContent : undefined;
+    const riffStdin = makeRiffStdinReader(cachedStdin, readStdin);
+    if (await maybeRunRiffHostTool(process.argv.slice(2), riffStdin)) process.exit(process.exitCode ?? 0);
   } catch (error) {
     console.error(`botmux Riff host: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
@@ -20187,7 +20255,7 @@ switch (command) {
     break;
   }
   case 'send': {
-    try { await cmdSend(process.argv.slice(3)); }
+    try { await cmdSend(process.argv.slice(3), sendPreflight); }
     catch (error) {
       if (!(error instanceof TopicSendError)) throw error;
       console.error(`botmux send refused: ${error.message}`);
