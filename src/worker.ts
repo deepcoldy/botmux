@@ -356,6 +356,7 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
+import { doubaoTrajectoryPathForSession } from './services/doubao-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
@@ -10620,6 +10621,15 @@ function structuredBridgeIngestPath(
       // transcript text verbatim, so a synthesised token would leak into Lark.
       adoptMode: lastInitConfig?.adoptMode === true,
       state: structuredBridgeDriverState,
+      // Doubao's two-file drainer (assignment.md at submit / trajectory.jsonl
+      // at completion) needs the count of turns the QUEUE holds open: the
+      // files alone cannot see turns retired without a record (Esc interrupt)
+      // or pre-attach history the queue no longer owns. Measured BEFORE this
+      // drain so the boundary describes prior turns, not the events being
+      // ingested now. Other drivers ignore the field.
+      openTurns: structuredBridgeIs('doubao')
+        ? codexBridgeQueue.peek().filter(turn => turn.started && turn.finalText === undefined).length
+        : undefined,
       // The two flags are never set for the "other" driver: every caller sits
       // under its own structuredBridgeIs('oh-my-pi' | 'antigravity') guard.
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
@@ -11062,6 +11072,25 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset}, skipTail=true)`);
   } else if (existsSync(rolloutPath)) {
+    if (structuredBridgeIs('doubao')) {
+      // Doubao keeps TWO native logs (trajectory.jsonl + assignment.md) and
+      // has its own resume semantics: `--resume <snowflake>` rehydrates the
+      // conversation inside the CLI. A spawn-time baseline must therefore
+      // touch NEITHER file's history — no restart-interruption scan (it would
+      // misread the previous session's tool calls as an interrupted botmux
+      // turn and inject a note that wedges the first write), no journal
+      // recovery. Cursor both cursors to EOF, including the drainer's own
+      // two-file state, so the first ingest only sees the resumed live turn.
+      const traj = baselineJsonlCursor(rolloutPath);
+      codexBridgeOffset = traj.newOffset;
+      codexBridgePendingTail = traj.pendingTail;
+      let assignmentOffset = 0;
+      try { assignmentOffset = statSync(rolloutPath.replace(/\/trajectory\.jsonl$/, '/assignment.md')).size; } catch { /* no assignment yet */ }
+      structuredBridgeDriverState = { assignmentOffset, trajectoryOffset: traj.newOffset };
+      codexBridgeBaselineDone = true;
+      structuredBridgeRecoveryAttempted = true;
+      log(`Codex bridge baselined (doubao two-file): ${rolloutPath} (trajectoryOffset=${traj.newOffset}, assignmentOffset=${assignmentOffset})`);
+    } else {
     if (!lastInitConfig?.adoptMode) scanRestartInterruption(rolloutPath, 'structured');
     const journalPath = structuredBridgeJournalPath() ?? codexAdoptJournalPath();
     // Cursor's JSONL transcript lacks per-event timestamps and stamps wall-clock Date.now() on drain;
@@ -11138,6 +11167,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       codexBridgePendingTail = cursor.pendingTail;
       codexBridgeBaselineDone = true;
       log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+    }
     }
   } else {
     // baseline-existing requested but file missing — degrade to fresh
@@ -14419,6 +14449,43 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
   return false;
 }
 
+/** Retire the structured-bridge mark of a Doubao turn whose explicit STOP was
+ *  just delivered. Doubao writes NO trajectory.jsonl record for an
+ *  Esc-interrupted turn (the TUI prints `Stopped` and returns to the
+ *  composer), so without this the mark stays counted as an open turn on every
+ *  drain: the next fast turn's final then closes the dead turn and every later
+ *  fast turn shifts by one.
+ *
+ *  The mark need NOT be started yet: the mark is built in flushPending before
+ *  writeInput, and the first assignment.md section is only read on the next
+ *  1s poll, so a stop pressed within that sub-second window must still retire
+ *  it (turnId is the worker's current turn — a type-ahead successor carries a
+ *  different id and is never matched). Only a turn that ALREADY has a final is
+ *  left untouched.
+ *
+ *  Shared by the explicit-stop entries — the daemon's exact-turn interrupt
+ *  and `handleTermAction` when the requested key is ctrlc (card ⏹ / the ^C
+ *  quick key / `/stop`). A bare terminal `esc` (card Esc quick key, a physical
+ *  Esc in the Web terminal) is NOT an explicit stop: in the TUI it often just
+ *  dismisses a menu (e.g. /model), and retiring there would swallow the still
+ *  running turn's answer. */
+function retireDoubaoBridgeTurnOnInterrupt(turnId: string | undefined, dispatchAttempt?: number): boolean {
+  if (!structuredBridgeIs('doubao') || !turnId) return false;
+  const target = codexBridgeQueue.peek().find(turn =>
+    turn.turnId === turnId
+    && (dispatchAttempt === undefined || turn.dispatchAttempt === dispatchAttempt)
+    && turn.finalText === undefined);
+  if (!target) return false;
+  const dropped = codexBridgeQueue.dropPendingTurn(turnId, target.dispatchAttempt, true);
+  if (!dropped) return false;
+  log(`Doubao interrupted turn retired from structured bridge: ${turnId.slice(0, 12)}`);
+  // replayBuffered inside the drop can release a successor user/final pair
+  // already buffered behind the retired mark; ingest it immediately.
+  codexBridgeIngest();
+  if (isPromptReady) emitReadyCodexTurns();
+  return true;
+}
+
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
   // 中断类键按适配器归一。卡片「⏹ 停止」与 `/stop` 都硬编码发 ctrlc，但 ZCode
@@ -14525,6 +14592,14 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
     traexQuotaPending = undefined;
     emitReadyCodexTurns([failedTurn]);
   }
+  // A delivered ctrlc is an explicit STOP (card ⏹ / ^C quick key / `/stop`):
+  // retire doubao's record-less interrupted mark, the same retirement
+  // handleExactTurnInterrupt runs for an exact-turn stop. A bare terminal
+  // `esc` is not treated as stop — it commonly just dismisses a TUI menu (e.g.
+  // /model), and retiring there would swallow the still-running turn.
+  if (criticalInterrupt && requestedKey === 'ctrlc') {
+    retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+  }
   // ESC/Ctrl-C/Enter likely ends an active TUI prompt. Un-wedge the blocking
   // flag here — without this, dismissing an AskUserQuestion dialog via the
   // quick-key button leaves tuiPromptBlocking=true forever and silently queues
@@ -14538,8 +14613,8 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
 }
 
 /** Deliver Ctrl+C only when the daemon's requested turn is still the worker's
- * active turn. This is deliberately separate from card `term_action`: a stale
- * HTTP request must never interrupt a newer turn that reused this CLI process. */
+ *  active turn. This is deliberately separate from card `term_action`: a stale
+ *  HTTP request must never interrupt a newer turn that reused this CLI process. */
 async function handleExactTurnInterrupt(requestId: string, turnId: string): Promise<void> {
   if (turnId !== currentBotmuxTurnId) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
@@ -14592,8 +14667,9 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     inflightInputs.retireTurn(turnId);
     traexAutoModelController?.endTurn(turnId);
     for (let i = pendingMessages.length - 1; i >= 0; i--) {
-      if (pendingMessages[i].turnId === turnId) pendingMessages.splice(i, 1);
+      if (pendingMessages[i]!.turnId === turnId) pendingMessages.splice(i, 1);
     }
+    retireDoubaoBridgeTurnOnInterrupt(turnId, currentBotmuxDispatchAttempt);
   }
   send({ type: 'turn_interrupt_result', requestId, turnId, delivered, ...(delivered ? {} : { reason: 'delivery_failed' as const }) });
   if (delivered) {
@@ -26169,6 +26245,31 @@ async function spawnCli(
     const eventsPath = cocoEventsPathForSession(effectiveAdapterSessionId);
     codexBridgeAttach(eventsPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
     codexBridgeStartTimer();
+  } else if (cfg.cliId === 'doubao') {
+    // Doubao's native snowflake session id is unknown until the first submit
+    // (writeInput discovers it from assignment.md). A resumed spawn already
+    // has the id: bind its trajectory now; a fresh spawn arms the 1s late-
+    // attach poller and writeInput's notify attaches the moment the id lands.
+    const doubaoPath = effectiveCliSessionId
+      ? doubaoTrajectoryPathForSession(effectiveCliSessionId)
+      : undefined;
+    if (doubaoPath) {
+      codexBridgeAttach(doubaoPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+      codexBridgeStartTimer();
+    } else {
+      // Resumed session whose trajectory.jsonl does not exist yet (e.g. the
+      // pre-restart conversation was interrupted before any assistant record):
+      // precise resume disarms writeInput's capture, so nothing else would ever
+      // report this sid and the bridge would stay unbound for the whole session.
+      // Arm it for the 1s late-attach poller; doubao writing the file after
+      // resume can only contain post-restart records (no file = no prior
+      // assistant history), so its generic fresh-empty attach cannot replay
+      // old finals.
+      if (effectiveResume && effectiveCliSessionId) {
+        codexBridgePendingSessionId = effectiveCliSessionId;
+      }
+      codexBridgeStartTimer();
+    }
   } else if (cfg.cliId === 'mtr') {
     const mtrSessionId = effectiveCliSessionId ?? mtrSessionIdForBotmuxSession(effectiveAdapterSessionId);
     codexBridgePendingSessionId = mtrSessionId;
