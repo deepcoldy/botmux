@@ -9,14 +9,18 @@ export interface QuiescenceScheduler {
 export async function waitForProcessQuiescence(
   pid: number | undefined,
   scheduler: QuiescenceScheduler,
-  opts: { timeoutMs?: number; pollMs?: number } = {},
+  opts: { timeoutMs?: number; pollMs?: number; ownedPids?: readonly number[] } = {},
 ): Promise<void> {
   if (!pid || pid <= 0) throw new Error('cannot prove CLI exit without a valid pid');
+  const owned = [...new Set([pid, ...(opts.ownedPids ?? [])].filter(candidate => candidate > 0))];
   const timeoutMs = opts.timeoutMs ?? 5_000;
   const pollMs = opts.pollMs ?? 25;
   const deadline = scheduler.now() + timeoutMs;
-  while (!scheduler.provablyGone(pid)) {
-    if (scheduler.now() >= deadline) throw new Error(`CLI process ${pid} did not exit before purge`);
+  while (owned.some(candidate => !scheduler.provablyGone(candidate))) {
+    if (scheduler.now() >= deadline) {
+      const live = owned.filter(candidate => !scheduler.provablyGone(candidate));
+      throw new Error(`CLI process scope did not exit before purge: ${live.join(',')}`);
+    }
     await scheduler.wait(pollMs);
   }
 }

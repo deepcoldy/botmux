@@ -442,6 +442,7 @@ import {
   findLaunchedCliPid,
   findCliProcess,
   scheduleWrapperRealCliPid,
+  snapshotChildPids,
   readComm,
   cliIdForComm,
   isBareShellComm,
@@ -1913,7 +1914,7 @@ let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
-let reuseScratchSandboxOnNextSpawn = false;          // in-worker purge restart reattaches repaired COW view instead of preparing a fresh one
+let preserveExistingScratchOnNextPrepare = false;    // prepare rebuilds confinement argv around the repaired existing COW view
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
 const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
@@ -24735,8 +24736,7 @@ async function spawnCli(
     scratchNativeCodexHome = nativeCodexHome;
     scratchNativeTraeHome = nativeTraeHome;
 
-    if (reuseScratchSandboxOnNextSpawn || willReattachPersistent) {
-      reuseScratchSandboxOnNextSpawn = false;
+    if (willReattachPersistent) {
       // Live pane across a daemon restart: the overlay/clone + pane survive;
       // only re-wire the outbox watcher. Never remount/re-clone here.
       if (process.platform === 'darwin') {
@@ -24778,6 +24778,12 @@ async function spawnCli(
         log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
       }
     } else if (process.platform === 'darwin') {
+      // APFS scratch does not yet have a fresh-process launcher reconstruction
+      // API. Never consume the one-shot into an unsandboxed launch.
+      if (preserveExistingScratchOnNextPrepare) {
+        preserveExistingScratchOnNextPrepare = false;
+        throw new Error('scratch purge respawn cannot safely reuse a macOS clone yet');
+      }
       // ── macOS: APFS clonefile COW clone + Seatbelt ──
       const prepared = prepareMacScratchSandboxDetailed({
         sessionId: cfg.sessionId,
@@ -24814,6 +24820,11 @@ async function spawnCli(
     } else {
       // ── Linux: full-root COW overlay ──
       const storage: ScratchStorage = cfg.scratchStorage === 'disk' ? 'disk' : 'tmpfs';
+      // prepareScratchSandboxDetailed is the fresh-process reuse API: for an
+      // existing matching tree it keeps upper/work/merged state but reconstructs
+      // the full bwrap launcher, env, masks and relay bindings.
+      const reusingRepairedScratch = preserveExistingScratchOnNextPrepare;
+      preserveExistingScratchOnNextPrepare = false;
       const prepared = prepareScratchSandboxDetailed({
         sessionId: cfg.sessionId,
         dataDir: scratchDataDir,
@@ -24834,7 +24845,9 @@ async function spawnCli(
         useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!prepared.ok) {
-        log(`scratch sandbox (${storage}) could not be established: ${prepared.failure.reason}${prepared.failure.detail ? ` (${prepared.failure.detail})` : ''}`);
+        // one-shot was consumed before prepare so a later unrelated spawn cannot
+        // inherit stale reuse intent after this failure.
+        log(`scratch sandbox (${storage})${reusingRepairedScratch ? ' reuse' : ''} could not be established: ${prepared.failure.reason}${prepared.failure.detail ? ` (${prepared.failure.detail})` : ''}`);
         throw new Error(scratchFailureNotice(prepared.failure));
       }
       const sbx = prepared.spawn;
@@ -27124,9 +27137,10 @@ function killCli(opts: {
     sandboxCleanup = null;
     sandboxTeardownDone = true;
   } else if (opts.preserveSandboxForRespawn) {
-    // Keep the existing cleanup owner and tree. spawnCli reattaches the same
-    // merged/clone view so repaired transcript state remains the resume source.
-    reuseScratchSandboxOnNextSpawn = true;
+    // Keep the existing cleanup owner and tree. The next prepare call rebuilds
+    // confinement argv around this same COW state (never the live-pane attach
+    // path, which supplies no launcher).
+    preserveExistingScratchOnNextPrepare = true;
   } else if (sandboxCleanup) {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;
@@ -27231,6 +27245,19 @@ async function restartCliProcess(
       const rpcThreadId = remoteThreadId;
       const restartingBackend = backend;
       const retiringCliPid = restartingBackend?.getChildPid?.();
+      const retiringProcessScope: number[] = [];
+      if (retiringCliPid) {
+        const childrenOf = snapshotChildPids();
+        const pending = [retiringCliPid];
+        const seen = new Set<number>();
+        while (pending.length > 0 && seen.size < 256) {
+          const current = pending.shift()!;
+          if (seen.has(current)) continue;
+          seen.add(current);
+          retiringProcessScope.push(current);
+          pending.push(...childrenOf(current));
+        }
+      }
       if (restartingBackend) intentionalRestartBackend = restartingBackend;
       const teardown = restartingBackend?.destroySession?.();
       let teardownOutcome: RestartTeardownOutcome = { kind: 'absent' };
@@ -27290,7 +27317,7 @@ async function restartCliProcess(
           now: () => Date.now(),
           wait: ms => delay(ms),
           provablyGone: pid => !pidNotProvablyGone(pid),
-        });
+        }, { ownedPids: retiringProcessScope });
         opts.afterQuiesceBeforeRespawn();
       }
       // A normal restart cannot observe activity from the retired process.

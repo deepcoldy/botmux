@@ -23,6 +23,19 @@ describe('waitForProcessQuiescence', () => {
     expect(events.filter(e => e === 'wait:25')).toHaveLength(6);
   });
 
+  it('waits for delayed descendant writers after the root process exits', async () => {
+    let now = 0;
+    const events: string[] = [];
+    await waitForProcessQuiescence(100, {
+      now: () => now,
+      wait: async ms => { events.push(`wait:${ms}`); now += ms; },
+      provablyGone: pid => pid === 100 ? now >= 25 : now >= 150,
+    }, { timeoutMs: 500, pollMs: 25, ownedPids: [100, 101, 102] });
+    events.push('purge');
+    expect(events.at(-1)).toBe('purge');
+    expect(events.filter(e => e === 'wait:25')).toHaveLength(6);
+  });
+
   it('fails closed on timeout instead of permitting an active-writer purge', async () => {
     const { scheduler, events } = fakeScheduler(undefined);
     await expect(waitForProcessQuiescence(4242, scheduler, {
