@@ -32,6 +32,7 @@ import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -1311,7 +1312,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
       if (promptInjection === 'none') return args;
-      args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
+      args.push('--plugin-dir', builtinPluginDirForSession(CLAUDE_PLUGIN_DIR));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。

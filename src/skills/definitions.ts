@@ -1960,6 +1960,22 @@ export const WORKFLOW_FEATURE_SKILLS: SkillDef[] = [
 export const WORKFLOW_FEATURE_SKILL_NAMES: string[] =
   WORKFLOW_FEATURE_SKILLS.map((s) => s.name);
 
+/** Built-ins whose purpose is handing work to OTHER bots or opening sub-project
+ *  topics: `botmux-orchestrate` (multi-bot, multi-topic projects via `botmux
+ *  dispatch`) and `botmux-handoff` (pass the current task to another bot).
+ *  `botmux-bots` stays: it is a read-only roster the routing block also teaches. */
+export const MULTI_BOT_DISPATCH_SKILL_NAMES: readonly string[] = ['botmux-orchestrate', 'botmux-handoff'];
+
+/** Skills a workflow node session is never offered (design 2026-11-03 §4.2,
+ *  N3): it executes one node of an approved run and submits it with `botmux
+ *  report`, so it neither starts workflows nor re-dispatches its work to other
+ *  bots. Applies to every channel — prompt catalog, `botmux skill list/show`,
+ *  and the node-session copy of the native plugin dirs. */
+export const WORKFLOW_NODE_WITHHELD_SKILL_NAMES: readonly string[] = [
+  ...WORKFLOW_FEATURE_SKILL_NAMES,
+  ...MULTI_BOT_DISPATCH_SKILL_NAMES,
+];
+
 /** Skills that earlier botmux versions installed but no longer ship. The
  *  installer cleans these up so renamed skills don't linger as duplicates
  *  in the CLI's skills directory. */

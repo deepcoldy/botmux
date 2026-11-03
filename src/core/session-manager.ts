@@ -1473,11 +1473,11 @@ function buildNewTopicBlocks(
         whiteboardEnabled: whiteboardEnabled(),
         chatManagerEnabled: chatManagerEnabledForApp(opts?.larkAppId),
         excludeRoutingCovered: true,
-        ...(opts?.workflowNodeSession ? { workflowEnabled: false } : {}),
+        workflowNodeSession: opts?.workflowNodeSession === true,
       });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
-      skillBlock = builtinSkillHelpPointer(locale);
+      skillBlock = builtinSkillHelpPointer(locale, opts?.workflowNodeSession ? { workflowEnabled: false } : {});
     }
   }
 

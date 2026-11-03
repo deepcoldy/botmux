@@ -14,6 +14,7 @@ import { findLatestJsonl } from '../../services/claude-transcript.js';
 import { drainOmpTranscript, type OmpTranscriptState } from '../../services/omp-transcript.js';
 import { delay } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
 
 export const OMP_PLUGIN_DIR = join(homedir(), '.botmux', 'omp-plugin');
 
@@ -204,7 +205,7 @@ export function createOhMyPiAdapter(
       if (model?.trim()) args.push('--model', model.trim());
       if (workingDir) args.push('--cwd', workingDir);
       if (promptInjection !== 'none') {
-        args.push('--plugin-dir', OMP_PLUGIN_DIR);
+        args.push('--plugin-dir', builtinPluginDirForSession(OMP_PLUGIN_DIR));
         if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       }
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;

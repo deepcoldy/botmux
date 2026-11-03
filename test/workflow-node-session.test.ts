@@ -87,8 +87,10 @@ describe('node session marker suppresses workflow injection', () => {
       expect(builtinSkillContent(name, { ...process.env })).toBeUndefined();
       expect(builtinSkillContent(name, { ...process.env, [WORKFLOW_NODE_SESSION_ENV]: '' })).toBeDefined();
     }
-    // Only the workflow family is removed.
-    expect(node).toEqual(ordinary.filter((name) => !WORKFLOW_FEATURE_SKILL_NAMES.includes(name)));
+    // Besides the multi-bot dispatch skills (test/workflow-node-skills.test.ts),
+    // only the workflow family is removed.
+    expect(node).toEqual(ordinary.filter((name) => !WORKFLOW_FEATURE_SKILL_NAMES.includes(name)
+      && name !== 'botmux-orchestrate' && name !== 'botmux-handoff'));
   });
 });
 

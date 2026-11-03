@@ -34,7 +34,9 @@ import { isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from '../g
 import { isWorkflowNodeSessionEnv } from '../workflows/node-session-env.js';
 import {
   BUILTIN_SKILLS,
+  MULTI_BOT_DISPATCH_SKILL_NAMES,
   WORKFLOW_FEATURE_SKILLS,
+  WORKFLOW_NODE_WITHHELD_SKILL_NAMES,
   ASK_SKILL, ASK_SKILL_NAME,
   WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME,
   CHAT_MANAGER_SKILL, CHAT_MANAGER_SKILL_NAME,
@@ -51,11 +53,20 @@ import { renderBotmuxSendSkill } from './reply-style-guide.js';
  *  workflow switch is ON. Splicing rather than appending keeps the ENABLED-path
  *  catalog byte-for-byte identical to before the family was factored out; when
  *  the switch is OFF the family is simply absent. The independent multi-topic
- *  switch similarly filters `botmux-orchestrate`. */
-function baseBuiltinSkills(workflowEnabled: boolean, multiTopicEnabled: boolean): typeof BUILTIN_SKILLS {
-  const builtins = multiTopicEnabled
+ *  switch similarly filters `botmux-orchestrate`; a workflow node session gets
+ *  neither the family nor the multi-bot dispatch skills. */
+function baseBuiltinSkills(
+  workflowEnabled: boolean,
+  multiTopicEnabled: boolean,
+  workflowNodeSession = false,
+): typeof BUILTIN_SKILLS {
+  let builtins = multiTopicEnabled
     ? [...BUILTIN_SKILLS]
     : BUILTIN_SKILLS.filter(skill => skill.name !== 'botmux-orchestrate');
+  if (workflowNodeSession) {
+    builtins = builtins.filter((skill) => !MULTI_BOT_DISPATCH_SKILL_NAMES.includes(skill.name));
+    return builtins;
+  }
   if (!workflowEnabled) return builtins;
   const anchor = builtins.findIndex((s) => s.name === 'botmux-handoff');
   const at = anchor >= 0 ? anchor + 1 : builtins.length;
@@ -206,14 +217,20 @@ export function builtinSkillEntries(opts: {
   workflowEnabled?: boolean;
   /** Machine-wide multi-topic orchestration switch. Explicit for tests. */
   multiTopicEnabled?: boolean;
+  /** A workflow node session (no workflow family, no multi-bot dispatch
+   *  skills). Defaults to the marker in this process's env (in-worker
+   *  callers); the daemon passes the session row's marker explicitly. */
+  workflowNodeSession?: boolean;
   /** Per-bot 群负责人开关（默认关）。开启时才在 prompt 目录里暴露该技能。 */
   chatManagerEnabled?: boolean;
 }): BuiltinSkillEntry[] {
-  // A workflow node session never gets the workflow family (design §4.2);
-  // in-worker callers see the marker in env, daemon callers pass false.
-  const workflowEnabled = opts.workflowEnabled ?? (isWorkflowFeatureEnabled() && !isWorkflowNodeSessionEnv());
+  // A workflow node session never gets the workflow family nor the multi-bot
+  // dispatch skills (design §4.2, N3); in-worker callers see the marker in
+  // env, daemon callers pass it from the session row.
+  const workflowNodeSession = opts.workflowNodeSession ?? isWorkflowNodeSessionEnv();
+  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
   const multiTopicEnabled = opts.multiTopicEnabled ?? isMultiTopicOrchestrationEnabled();
-  let defs = baseBuiltinSkills(workflowEnabled, multiTopicEnabled);
+  let defs = baseBuiltinSkills(workflowEnabled, multiTopicEnabled, workflowNodeSession);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
   if (opts.chatManagerEnabled === true) defs.push({ name: CHAT_MANAGER_SKILL_NAME, content: CHAT_MANAGER_SKILL });
@@ -222,6 +239,15 @@ export function builtinSkillEntries(opts: {
   // Byte-identical to the pre-feature list when nothing is customized.
   defs = effectiveBuiltinSkills(defs);
   return defs.map((d) => ({ name: d.name, description: frontmatterDescription(d.content), content: d.content }));
+}
+
+/** A built-in this workflow node session must not be offered (`botmux skill
+ *  show` refuses it with a reason instead of "not found"). */
+export function isWithheldFromWorkflowNodeSession(
+  name: string,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return isWorkflowNodeSessionEnv(env) && WORKFLOW_NODE_WITHHELD_SKILL_NAMES.includes(name);
 }
 
 /** Full SKILL.md body for a built-in skill name — backs `botmux skill show`
@@ -236,8 +262,9 @@ export function builtinSkillContent(
 ): string | undefined {
   const all = [
     ...baseBuiltinSkills(
-      isWorkflowFeatureEnabled() && !isWorkflowNodeSessionEnv(env),
+      isWorkflowFeatureEnabled(),
       isMultiTopicOrchestrationEnabled(env),
+      isWorkflowNodeSessionEnv(env),
     ),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },
     { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
@@ -299,7 +326,7 @@ export function builtinSkillHelpPointer(
 ): string {
   const en = locale === 'en';
   const hasRouting = opts.hasRoutingBlock !== false;
-  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
+  const workflowEnabled = opts.workflowEnabled ?? (isWorkflowFeatureEnabled() && !isWorkflowNodeSessionEnv());
   // Only list `workflow` among the discoverable capabilities when the feature is
   // on — a disabled host must not point the model at a subcommand that refuses.
   const wf = (zh: string, enText: string) => (workflowEnabled ? (en ? enText : zh) : '');
