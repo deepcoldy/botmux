@@ -288,6 +288,7 @@ import {
   isWorkflowFeatureEnabled,
   isRemoteAccessEnabled,
 } from './global-config.js';
+import { WORKFLOW_NODE_SESSION_ENV } from './workflows/session-kind.js';
 import {
   prepareSessionScopedLaunch,
   stopAllSessionScopes,
@@ -23702,6 +23703,8 @@ async function spawnCli(
   // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
   childEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
   childEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
+  if (cfg.workflowNodeSession === true) childEnv[WORKFLOW_NODE_SESSION_ENV] = '1';
+  else delete childEnv[WORKFLOW_NODE_SESSION_ENV];
   if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
   // Opt-in structured turn completion (dsh-tui). An inherited copy would point
   // at another session's IPC route, so it is only ever set from THIS spawn's
@@ -30264,6 +30267,12 @@ process.on('message', async (raw: unknown) => {
         }
         return;
       }
+      // Workflow node session marker (design 2026-11-03 §4.2): exported before
+      // any adapter builds its system prompt in this process, and inherited
+      // by the CLI child for `botmux skill show`. Never inherited from the
+      // daemon's own env: the daemon does not set it for other sessions.
+      if (msg.workflowNodeSession === true) process.env[WORKFLOW_NODE_SESSION_ENV] = '1';
+      else delete process.env[WORKFLOW_NODE_SESSION_ENV];
       if (ordinaryImTurnId) {
         const duplicateState = receiveOrdinaryImTurn(ordinaryImTurnId);
         // Receipt is the daemon ↔ worker transport boundary. Publish it before

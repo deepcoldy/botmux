@@ -52,6 +52,17 @@ Changed your mind: requirement → `botmux workflow revise-spec <runId>` (steps 
 
 > The three "continue" entry points are not interchangeable: a blocked node uses `retry`, a loop out of iterations uses `grant`; and "revisit budget exhausted" can **only be permitted by tapping the Feishu card — there's no CLI command for it**.
 
+### Hand nodes to bots in the chat (experimental, off by default)
+
+By default each node runs in a temporary CLI process the daemon starts and discards. The Dashboard's global settings have an experimental switch next to "Enable the workflow feature": **Hand workflow nodes to bots in the chat**. When it is on:
+
+- **Only runs approved afterwards are affected**: the executor is frozen into the run at Gate-2 approval (or Saved Workflow launch); runs already in flight keep theirs.
+- **One topic per node**: the main bot posts a node card as a new topic (no mention), then a handoff card in it that mentions the bot executing the node (the main bot itself when none is assigned). The handoff lists the goal, acceptance, inputs (upstream products arrive as attachments), required outputs, deadline and the exact submit command; the node card is updated in place as the node progresses.
+- **Completion is the structured submission**: the bot runs `botmux report --dispatch-root <handoff message id> --status completed --output <key>=<path> --result-file result.json --content-file summary.md`; the node completes only when it validates, otherwise the command lists what is missing and the bot can resubmit in the same turn. `--status blocked "reason"` blocks the node. Files are capped at 4 MiB each and 8 MiB per submission — put branch names or links for bigger products into result.json.
+- **The node's session only does that node**: it is not offered the workflow skills or the skills that pass work on to other bots (`botmux-orchestrate`, `botmux-handoff`), and `botmux skill show` refuses them. Two exceptions: an existing session reused for a handoff in the main topic (it loaded them when it started), and CLIs whose skill injection is set to the global directory (the files live in a directory shared by every session on the host).
+- **Timeouts and cancellation** stop the executing bot's current turn (its session is kept).
+- Private-chat runs, runs without a topic root, or a disabled multi-topic switch keep temporary processes; the approval says why. Approval is refused (with a per-node reason) when a node's bot is not configured on this host, not in the chat, offline, cannot get the in-chat collaboration grant, or (in a normal group) folds topics into one group session (reply mode chat / shared); nodes with directory outputs are refused too. Bots are never added to chats automatically. `approve-dag --working-dir` is not supported in this mode yet. A submission made while the main bot is offline is staged and committed when it comes back.
+
 ### Limits
 
 - An ad-hoc workflow's nodes can currently only use bots on the **claude-code / codex / seed** CLIs; orchestrating to a bot on another CLI errors out at startup.

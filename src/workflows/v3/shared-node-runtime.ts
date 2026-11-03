@@ -538,6 +538,20 @@ const PROBE_UNCERTAIN_AFTER_MS = 10 * 60_000;
  */
 const probeFailures = new Map<string, { firstFailedAt: number; retryAt: number }>();
 
+function forgetProbeFailuresOf(runDir: string): void {
+  const prefix = `${runDir}\0`;
+  for (const key of probeFailures.keys()) {
+    if (key.startsWith(prefix)) probeFailures.delete(key);
+  }
+}
+
+/** Since when this process has failed to learn whether the target bot
+ *  accepted `attemptId`'s handoff (engine clock), or undefined. The node card
+ *  shows it as "acceptance unknown, retrying" instead of a plain wait. */
+export function v3AcceptanceProbeUnknownSince(runDir: string, attemptId: string): number | undefined {
+  return probeFailures.get(`${runDir}\0${attemptId}`)?.firstFailedAt;
+}
+
 // ─── Main loop ───────────────────────────────────────────────────────────
 
 /**
@@ -1084,6 +1098,10 @@ export async function runWorkflow(
     if (inFlight.size > 0) await waitForInFlightOrDurableCancellation();
   }
 
+  // Every external binding is closed at a run boundary (the terminal sweep
+  // drains them first), so no attempt of this run is probed again: drop its
+  // process-wide unknown-probe bookkeeping instead of keeping it forever.
+  forgetProbeFailuresOf(runDir);
   const finalSnap = materialize(readJournal(journalPath));
   return {
     reason: 'terminal',

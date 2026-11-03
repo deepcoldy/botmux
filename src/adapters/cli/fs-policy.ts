@@ -382,6 +382,8 @@ function commonHomeBaseline(h: string): FsRule[] {
     rw(`${h}/.cache`), rw(`${h}/.npm`), rw(`${h}/.local/state`),
     // The daemon-written botmux wrapper (head of PATH) + skill plugin dir.
     ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`), ro(`${h}/.botmux/cursor-plugin`),
+    // Their workflow-node-session copies (skills/workflow-node-plugin-dir.ts).
+    ro(`${h}/.botmux/claude-plugin-workflow-node`), ro(`${h}/.botmux/cursor-plugin-workflow-node`),
     // Installed-plugin registry. Secret-free BY CONTRACT: `assertPublicPluginRegistry`
     // refuses to persist a record carrying `command`/`env`/`url`/`headers`, and a
     // plugin's real MCP descriptor lives in its own `private/mcp.json` — which stays
@@ -979,6 +981,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/cursor-plugin`,      // skill/plugin dir (cursor --plugin-dir); no secrets
     `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
     `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets
+    // Workflow-node-session copies of the four dirs above (same skills minus
+    // the withheld ones; skills/workflow-node-plugin-dir.ts); no secrets.
+    `${bh}/claude-plugin-workflow-node`,
+    `${bh}/cursor-plugin-workflow-node`,
+    `${bh}/omp-plugin-workflow-node`,
+    `${bh}/pi-skills-workflow-node`,
     `${bh}/lark-scopes.json`,   // static scope catalog
     // dashboard-daemons (sibling IPC port table) is the discovery half of the
     // trusted-host escalation — a no-transport turn must NOT get it (paired with

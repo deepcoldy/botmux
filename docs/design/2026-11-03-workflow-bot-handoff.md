@@ -56,7 +56,7 @@
 | P4 | 没有主话题根的 run（私聊、整群一个会话的群） | 私聊 run 仍走旧方式（其他 Bot 进不了私聊）；整群会话的群里所有节点都开话题 | 按推荐做 |
 | N1 | 开关打开后，普通会话里还保不保留一行发现提示 | 保留一行（改写为「先征得同意，再按需读取」）；否则主 Bot 无从判断是否该提议用工作流 | 按推荐做 |
 | N2 | 要不要加「本 Bot 可发起工作流」的单 Bot 开关 | 不加。子 Bot 的节点会话本来就不注入；普通会话只多一行提示 | 按推荐做 |
-| N3 | 子 Bot 的节点会话除 workflow 家族外，要不要再去掉多 Bot 编排类 skill（`botmux-orchestrate` 等） | 去掉。节点里再派子任务，等于把发起人的委托再往外传一跳 | **等确认**（权限）。先只去掉 workflow 家族 |
+| N3 | 子 Bot 的节点会话除 workflow 家族外，要不要再去掉多 Bot 编排类 skill（`botmux-orchestrate` 等） | 去掉。节点里再派子任务，等于把发起人的委托再往外传一跳 | **已确认去掉**：两类节点会话（子 Bot 节点会话、旧模式临时 Worker）都不提供 `botmux-orchestrate`、`botmux-handoff`；判定统一在 `src/workflows/session-kind.ts` |
 | M1 | 谁能改运行中的流程 | 主 Bot，仅限两类回合：发起人本人触发的回合；本 run 的事件唤醒的回合。其他人触发的回合里提出的修改，一律转为待发起人确认 | **等确认**（权限）。先只放行发起人本人的回合，其余拒绝 |
 | M2 | 哪些修改要发起人重新确认 | 见 13.5 的清单 | **等确认**（审批边界）。确认前，清单里的修改一律拒绝 |
 | M3 | 主 Bot 自动重试 / 改派 / 重做的次数上限 | 每个节点最多 2 次，之后只能由人操作 | **等确认**（审批边界）。确认前主 Bot 不能自动重试或改派 |
@@ -166,8 +166,8 @@ sequenceDiagram
 | 用户发 `/workflow …` | 改写后的提示直接要求先运行 `botmux skill show botmux-workflow`，再进入 Grill |
 | 主 Bot 判断任务适合工作流 | 先问用户；用户同意后，主 Bot 按发现提示读取 skill，再运行 `botmux workflow new` |
 | 运行中主 Bot 被事件唤醒（M6） | 唤醒消息里带一行：需要改流程时先读 skill 的「运行中修改」一节 |
-| 子 Bot 的节点会话 | 不给发现提示，不给 workflow skill 家族；节点要求全部写在交接消息里（N3：是否再去掉多 Bot 编排类 skill，等确认） |
-| 旧模式的临时 Worker | 不变；`botmux-goal-ask` 只在这里需要，改为只在临时 Worker 里提供 |
+| 子 Bot 的节点会话 | 不给发现提示，不给 workflow skill 家族（连 `botmux-goal-ask` 也不给，节点在群里问人），也不给多 Bot 编排类 skill（N3）；节点要求全部写在交接消息里 |
+| 旧模式的临时 Worker | 不给发现提示；`botmux-goal-ask` 只在这里需要，改为只在临时 Worker 里提供；也不给多 Bot 编排类 skill（N3） |
 
 实现要点：
 
@@ -517,7 +517,7 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 - 只有发起人能改派。
 - 子 Bot 开了「按触发人鉴权」（`triggerUserAuth`）而委托校验失败时，**不发交接**，节点转 blocked（`IDENTITY_UNAVAILABLE`），不降级为用 Bot 或 owner 的身份去跑（3.10）。
 - 目标应用缺个人授权时，沿用 `botmux auth request` 流程。
-- 节点里的 Bot 再用 `botmux dispatch` 转派，沿用现有多跳规则（N3 若去掉编排类 skill，这条路径在提示层面也不再暴露）。
+- 节点里的 Bot 再用 `botmux dispatch` 转派，沿用现有多跳规则；N3 已去掉编排类 skill，这条路径在提示层面不再暴露（命令本身没有拦）。
 - 开关：Dashboard「全局设置 → 实验性配置 → Workflow」，默认关。关闭时，节点用 Bot 自己的身份执行。
 
 ---

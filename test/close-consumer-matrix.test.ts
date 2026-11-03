@@ -178,6 +178,15 @@ const CONSUMERS: Record<string, Rule> = {
       + 'surface: a refusal leaves the row active and is logged by closeSession itself.',
     count: 2,
   },
+  'core/session-manager.ts::deliverWorkflowNodeTurn::closeSession': {
+    category: 'background',
+    why: 'A workflow node turn the main bot starts for itself reclaims either a '
+      + 'disposable scratch at the node topic or its own candidate that lost the '
+      + 'active-session CAS (same shape as the decision-board batch). No user surface: '
+      + 'a refusal leaves the row active and is logged by closeSession itself; the '
+      + 'handoff is re-sent with the same keys or blocks for a human.',
+    count: 2,
+  },
   'core/failed-turn-recovery.ts::recoverFailedTurn::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Host recovery uses the native background wrapper to log refusal and '

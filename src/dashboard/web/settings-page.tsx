@@ -109,7 +109,7 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
-  workflow: { enabled: boolean };
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   promptCache: PromptCacheConfig | null;
   multiTopic: { enabled: boolean };
@@ -281,7 +281,10 @@ function parseSettings(s: any): DashboardSettings {
     localDevInstall: s?.localDevInstall === true,
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
-    workflow: { enabled: s?.workflow?.enabled === true },
+    workflow: {
+      enabled: s?.workflow?.enabled === true,
+      nodeExecutor: s?.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral',
+    },
     sessionCleanup: {
       archiveCodex: s?.sessionCleanup?.archiveCodex === true,
       enabled: s?.sessionCleanup?.enabled === true,
@@ -1129,7 +1132,17 @@ export function SettingsBody(props: {
             checked={settings.workflow.enabled}
             disabled={dis || savingKey === 'workflow'}
             onChange={value => {
-              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { enabled: value } }));
+              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { ...s.workflow, enabled: value } }));
+            }}
+          />
+          <ToggleRow
+            title={tr('settings.workflowNodeExecutorBot')}
+            help={tr('settings.workflowNodeExecutorBotHelp')}
+            checked={settings.workflow.nodeExecutor === 'bot'}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              const nodeExecutor = value ? 'bot' as const : 'ephemeral' as const;
+              void props.onSave('workflow', { workflow: { nodeExecutor } }, s => ({ ...s, workflow: { ...s.workflow, nodeExecutor } }));
             }}
           />
         </SettingsBlock>
