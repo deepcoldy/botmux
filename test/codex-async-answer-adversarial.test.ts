@@ -358,8 +358,14 @@ describe('independent async-answer overlap review probes', () => {
       throw new Error('identity-write-failed');
     };
     const pending = delivery(scope)('answer', 'ou_owner');
-    const failure = expect(pending).rejects.toThrow('identity-write-failed');
-    await vi.advanceTimersByTimeAsync(0); await vi.advanceTimersByTimeAsync(30_000); await failure;
+    // Attach a plain handler before the rejecting fake timer fires: bun:test's
+    // expect().rejects matcher subscribed pre-rejection never settles, while a
+    // late handler trips vitest's unhandled-rejection reporting.
+    const captured: unknown[] = [];
+    const settled = pending.catch(error => { captured.push(error); });
+    await vi.advanceTimersByTimeAsync(0); await vi.advanceTimersByTimeAsync(30_000);
+    await settled;
+    expect((captured[0] as Error).message).toBe('identity-write-failed');
     expect(scope.identityPrepared).toBe(true);
     expect(scope.sendWorkerInput).not.toHaveBeenCalled();
     expect(scope.beginNewTurn).not.toHaveBeenCalled();
@@ -369,10 +375,16 @@ describe('independent async-answer overlap review probes', () => {
     scope.noteTurnReceived = async () => new Promise(resolve => setTimeout(resolve, 20));
     scope.sessionStore.updateSession = () => { throw new Error('disk-write-failed'); };
     const pending = delivery(scope)('answer', 'ou_owner');
-    const failure = expect(pending).rejects.toThrow('disk-write-failed');
+    // Attach a plain handler before the rejecting fake timer fires: bun:test's
+    // expect().rejects matcher subscribed pre-rejection never settles, while a
+    // late handler trips vitest's unhandled-rejection reporting.
+    const captured: unknown[] = [];
+    const settled = pending.catch(error => { captured.push(error); });
     await vi.advanceTimersByTimeAsync(0);
     expect(scope.sendWorkerInput).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(20); await failure;
+    await vi.advanceTimersByTimeAsync(20);
+    await settled;
+    expect((captured[0] as Error).message).toBe('disk-write-failed');
     expect(scope.sendWorkerInput).toHaveBeenCalledTimes(1);
     const [, payload, turnId, opts] = scope.sendWorkerInput.mock.calls[0];
     expect(opts.codexAppSteerable).toBe(true);
