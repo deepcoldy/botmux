@@ -67,6 +67,7 @@ export async function workingFeedbackSnapshot(snapshotPath: string): Promise<Dat
   try {
     for (const table of FEEDBACK_TABLES) for (const operation of ['insert', 'update', 'delete']) database.exec(`DROP TRIGGER IF EXISTS feedback_guard_${table}_${operation}`);
     database.exec('DROP TABLE IF EXISTS feedback_source_guard');
+    database.exec('DROP TABLE IF EXISTS feedback_source_restorations');
   } finally { database.close(); }
   const upgraded = await SkillFeedbackStore.open(directory);
   try {

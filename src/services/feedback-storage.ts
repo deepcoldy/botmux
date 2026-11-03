@@ -82,9 +82,13 @@ export async function getFeedbackStorage(dataDir: string): Promise<FeedbackStora
   try { key = realpathSync(dataDir); } catch {}
   return serialized(key, async () => {
     const config = await readFeedbackStorageConfig(key);
-    const identity = JSON.stringify([config.generation, config.instanceId, config.active]);
+    const identity = JSON.stringify([config.instanceId, config.active]);
     const existing = entries.get(key);
-    if (existing?.identity === identity) return existing.value;
+    if (existing?.identity === identity) {
+      const storage = await existing.value;
+      storage.generation = config.generation;
+      return storage;
+    }
     if (existing) {
       entries.delete(key);
       try { await (await existing.value).store.close(); } catch {}

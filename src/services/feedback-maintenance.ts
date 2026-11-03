@@ -46,6 +46,10 @@ export function feedbackMaintenanceActive(dataDir: string): boolean {
   try { assertFeedbackAdmission(dataDir); return false; } catch { return true; }
 }
 export function withFeedbackSendLease<Result>(dataDir: string, operation: () => Promise<Result>): Promise<Result> {
+  const release = acquireFeedbackSendLease(dataDir);
+  return operation().then(result => { release(); return result; });
+}
+export function acquireFeedbackSendLease(dataDir: string): () => void {
   mkdirSync(dataDir, { recursive: true });
   const identity = readDurableProcessIdentity(process.pid);
   if (!identity) throw new Error('feedback_process_identity_unavailable');
@@ -56,7 +60,7 @@ export function withFeedbackSendLease<Result>(dataDir: string, operation: () => 
     assertFeedbackAdmission(dataDir);
     atomicWriteFileSync(path, JSON.stringify({ processId: process.pid, processStartId: identity }), { mode: 0o600, durable: true, followTargetSymlink: false });
   });
-  return operation().finally(() => { try { unlinkSync(path); } catch {} });
+  return () => { try { unlinkSync(path); } catch {} };
 }
 export function writeFeedbackParticipant(dataDir: string, input: Omit<Participant, 'processId' | 'processStartId' | 'updatedAt'>): void {
   const identity = readDurableProcessIdentity(process.pid);
@@ -154,7 +158,7 @@ export async function inspectFeedbackMaintenance(dataDir: string, migrationId: s
     const fleet = JSON.parse(readFileSync(fleetPath, 'utf8'));
     if (!Array.isArray(fleet.procs)) throw new Error('feedback_fleet_state_invalid');
     for (const processState of fleet.procs) {
-      if (!/^botmux-\d+$/.test(processState.name) || !processState.pid) continue;
+      if (processState.name === 'botmux-dashboard' || processState.entry === 'dashboard' || processState.external || !processState.pid) continue;
       const identity = readDurableProcessIdentity(processState.pid);
       if (!identity) continue;
       if (!participants.some(participant => participant.processId === processState.pid && participant.processStartId === identity)) {
@@ -176,11 +180,18 @@ export async function freezeFeedbackSource(dataDir: string, migrationId: string)
   try {
     database.exec('BEGIN IMMEDIATE');
     if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_outbox'").get()) {
-      const inflight = database.prepare("SELECT COUNT(*) count FROM feedback_outbox WHERE status='inflight'").get() as { count: number };
+      const inflight = database.prepare("SELECT COUNT(*) count FROM feedback_outbox WHERE status='inflight' OR last_error LIKE 'webhook_outcome_unknown:%'").get() as { count: number };
       if (inflight.count) throw new Error('feedback_outbox_unsettled');
     }
     const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
     if (version < 1 || version > 8) throw new Error('feedback_source_schema_unsupported');
+    const known = new Set<string>([...FEEDBACK_TABLES, 'feedback_source_guard', 'feedback_source_restorations']);
+    const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
+    if (tables.some(table => !known.has(table.name))) throw new Error('feedback_source_schema_unsupported');
+    if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_source_restorations'").get()
+      && database.prepare('SELECT 1 FROM feedback_source_restorations WHERE migration_id=?').get(migrationId)) {
+      throw new Error('feedback_migration_source_restored');
+    }
     database.exec("CREATE TABLE IF NOT EXISTS feedback_source_guard(singleton INTEGER PRIMARY KEY CHECK(singleton=1),migration_id TEXT NOT NULL,state TEXT NOT NULL)");
     const guard = database.prepare('SELECT * FROM feedback_source_guard WHERE singleton=1').get() as { migration_id: string; state: string } | undefined;
     if (guard && guard.migration_id !== migrationId) throw new Error('feedback_migration_identity_conflict');
@@ -206,12 +217,16 @@ export async function retireFeedbackSource(dataDir: string, migrationId: string)
   } finally { database.close(); }
 }
 export async function restoreFeedbackSource(dataDir: string, migrationId: string): Promise<void> {
+  const control = readControl(dataDir);
+  if (!control || control.migrationId !== migrationId) throw new Error('feedback_migration_identity_conflict');
   const database = await source(dataDir);
   try {
     database.exec('BEGIN IMMEDIATE');
     const guard = database.prepare('SELECT * FROM feedback_source_guard WHERE singleton=1').get() as { migration_id: string; state: string } | undefined;
     if (!guard || guard.migration_id !== migrationId) throw new Error('feedback_migration_identity_conflict');
     if (guard.state === 'retired') throw new Error('feedback_source_retired');
+    database.exec('CREATE TABLE IF NOT EXISTS feedback_source_restorations(migration_id TEXT PRIMARY KEY)');
+    database.prepare('INSERT OR IGNORE INTO feedback_source_restorations VALUES(?)').run(migrationId);
     for (const table of FEEDBACK_TABLES) {
       for (const action of ['insert', 'update', 'delete']) database.exec(`DROP TRIGGER IF EXISTS feedback_guard_${table}_${action}`);
     }

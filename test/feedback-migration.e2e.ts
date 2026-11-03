@@ -2,15 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Pool } from 'pg';
+import { Pool, Client } from 'pg';
 import { describe, expect, it } from 'vitest';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { readFeedbackStorageConfig, saveFeedbackStorageCandidate } from '../src/services/feedback-storage-config.js';
 import { startFeedbackMigration, resumeFeedbackMigration, prepareFeedbackMigration } from '../src/services/feedback-migration.js';
 import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
+import { restoreFeedbackSource } from '../src/services/feedback-maintenance.js';
 
 describe('SQLite to PostgreSQL migration', () => {
-  it('preserves records and revisions, activates PostgreSQL, and resumes without duplicate import', async () => {
+  it.each(['normal', 'restored-source'])('preserves source continuity and resumes safely: %s', async scenario => {
     const address = process.env.BOTMUX_TEST_POSTGRES_URL;
     if (!address) throw new Error('BOTMUX_TEST_POSTGRES_URL_required');
     const url = new URL(address);
@@ -36,6 +37,27 @@ describe('SQLite to PostgreSQL migration', () => {
       });
       const prepared = await prepareFeedbackMigration(directory, { requestId: 'migration-test', expectedGeneration: candidate.generation, maintenanceConfirmed: true });
       expect(await prepareFeedbackMigration(directory, { requestId: 'migration-test', expectedGeneration: candidate.generation, maintenanceConfirmed: true })).toEqual(prepared);
+      if (scenario === 'restored-source') {
+        const original = Client.prototype.query;
+        let injected = false;
+        Client.prototype.query = function (...args: any[]) {
+          if (!injected && typeof args[0] === 'string' && args[0].startsWith('INSERT INTO interactions(')) {
+            injected = true;
+            return Promise.reject(new Error('test_import_interrupted'));
+          }
+          return (original as any).apply(this, args);
+        } as any;
+        try {
+          expect((await resumeFeedbackMigration(directory, prepared.migrationId)).phase).toBe('blocked');
+        } finally { Client.prototype.query = original; }
+        await restoreFeedbackSource(directory, prepared.migrationId);
+        const later = source.createResponse({ interactionId: 'after-restore', content: 'must retain' });
+        const resumed = await resumeFeedbackMigration(directory, prepared.migrationId);
+        expect(resumed).toMatchObject({ phase: 'blocked', blockers: ['feedback_migration_source_restored'] });
+        expect((await readFeedbackStorageConfig(directory)).active.backend).toBe('sqlite');
+        expect(source.getResponse(later.responseId)).toHaveProperty('responseId', later.responseId);
+        return;
+      }
       const result = await startFeedbackMigration(directory, { requestId: 'migration-test', expectedGeneration: candidate.generation, maintenanceConfirmed: true });
       expect(result.phase).toBe('complete');
       expect((await readFeedbackStorageConfig(directory)).active.backend).toBe('postgresql');

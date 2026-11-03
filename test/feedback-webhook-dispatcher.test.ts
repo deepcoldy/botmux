@@ -13,6 +13,7 @@ import {
 } from '../src/services/feedback-webhook-dispatcher.js';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
+import { beginFeedbackMaintenance, freezeFeedbackSource } from '../src/services/feedback-maintenance.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -60,6 +61,26 @@ describe('feedback webhook destination and secret safety', () => {
 });
 
 describe('feedback webhook attempt contract', () => {
+  it('retains unknown request outcome and blocks migration after a transport reset', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-unknown-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    db.recordTurnDelivery({
+      botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+      content: 'answer', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://8.8.8.8/hook', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+    });
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: db, readSecret: () => 'secret',
+      dispatch: input => dispatchWebhookAttempt({ ...input, request: async () => { throw new Error('ECONNRESET_after_receiver_commit'); } }),
+    });
+    await dispatcher.ready;
+    await dispatcher.quiesce();
+    await beginFeedbackMaintenance(dir, 'unknown-webhook');
+    try {
+      await expect(freezeFeedbackSource(dir, 'unknown-webhook')).rejects.toThrow('feedback_outbox_unsettled');
+    } finally { db.close(); }
+  });
   it('maintenance quiescence waits for an in-flight request without aborting it', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-quiesce-')); dirs.push(dir);
     const db = await SkillFeedbackStore.open(dir);

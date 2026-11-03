@@ -4,12 +4,16 @@ import type { PostgresTarget } from './feedback-storage-types.js';
 export function feedbackPostgresPool(target: PostgresTarget, password: string, ca?: string): Pool {
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(target.schema)) throw new Error('feedback_storage_schema_invalid');
   if (target.tls.caRef && !ca) throw new Error('feedback_storage_ca_missing');
-  return new Pool({
+  const pool = new Pool({
     host: target.host, port: target.port, database: target.database, user: target.user, password,
     ssl: target.tls.mode === 'disable' ? false : { rejectUnauthorized: true, ...(ca ? { ca } : {}) },
     connectionTimeoutMillis: target.connectTimeoutMs, idleTimeoutMillis: 10000, max: 5,
     statement_timeout: 30000, options: `-c search_path=${target.schema},pg_catalog`,
   });
+  pool.on('error', () => {
+    process.stderr.write('[feedback] PostgreSQL idle connection lost; reconnecting on next operation\n');
+  });
+  return pool;
 }
 
 export const FEEDBACK_TABLES = [
@@ -17,7 +21,7 @@ export const FEEDBACK_TABLES = [
   'turn_terminals', 'turn_completion_events', 'feedback_events', 'feedback_outbox',
 ] as const;
 
-export async function ensurePostgresFeedbackSchema(client: PoolClient, schema: string, instanceId: string, migrationId?: string): Promise<void> {
+export async function ensurePostgresFeedbackSchema(client: PoolClient, schema: string, instanceId: string, migrationId?: string, provision = false): Promise<void> {
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new Error('feedback_storage_schema_invalid');
   await client.query('BEGIN');
   try {
@@ -32,6 +36,7 @@ export async function ensurePostgresFeedbackSchema(client: PoolClient, schema: s
       await client.query('COMMIT');
       return;
     }
+    if (!migrationId && !provision) throw new Error('feedback_storage_schema_missing');
     await client.query(`CREATE SCHEMA "${schema}"`);
     await client.query(`
       CREATE TABLE feedback_storage_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,instance_id TEXT NOT NULL,state TEXT NOT NULL,migration_id TEXT,source_fingerprint TEXT,verified INTEGER NOT NULL DEFAULT 0);

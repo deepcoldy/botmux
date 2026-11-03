@@ -143,7 +143,7 @@ export async function dispatchWebhookAttempt(input: {
       headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)), 'User-Agent': 'botmux-feedback-webhook/1', 'X-Botmux-Event-Id': input.event.eventId, 'X-Botmux-Event-Type': input.event.type, 'X-Botmux-Timestamp': timestamp, 'X-Botmux-Signature': `v1=${signature}` },
     });
     return { kind: classifyWebhookResponse(response.status), status: response.status, ...(response.headers['retry-after'] ? { retryAfter: response.headers['retry-after'] } : {}) };
-  } catch (error) { return { kind: 'retry', error: String((error as Error)?.message ?? error).slice(0, 500) }; }
+  } catch { return { kind: 'retry', error: 'webhook_outcome_unknown' }; }
 }
 
 export function startFeedbackWebhookDispatcher(options: {
@@ -168,7 +168,7 @@ export function startFeedbackWebhookDispatcher(options: {
           const result = await dispatch({ destination: row.destination, event: row.event, secret, allowPrivateNetworks: options.allowPrivateNetworks, signal: controller.signal });
           if (result.kind === 'delivered') { await options.store.trySettleFeedbackOutboxDelivered(row.outboxId, claimToken, result.status ?? 200, new Date().toISOString()); return; }
           const delay = result.kind === 'retry' ? computeRetryDelay({ attempts: row.attempts, retryAfter: result.retryAfter }) : 0;
-          await options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: result.error ?? `webhook_http_${result.status ?? 0}`, httpStatus: result.status, permanent: result.kind === 'failed' });
+          await options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: result.error === 'webhook_outcome_unknown' ? `webhook_outcome_unknown:${claimToken}` : result.error ?? `webhook_http_${result.status ?? 0}`, httpStatus: result.status, permanent: result.kind === 'failed' });
         } catch (error) {
           options.onError?.(error);
           const delay = computeRetryDelay({ attempts: row.attempts });

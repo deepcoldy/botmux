@@ -25,6 +25,36 @@ async function fixture() {
   return { directory, store };
 }
 describe('feedback maintenance', () => {
+  it('rejects unknown business tables before freezing known tables', async () => {
+    const { directory, store } = await fixture();
+    const { openDatabaseSync } = await import('../src/services/sqlite-compat.js');
+    const database = await openDatabaseSync(join(directory, 'botmux-feedback.sqlite'));
+    database.exec('CREATE TABLE extension_history(value TEXT); INSERT INTO extension_history VALUES(\'keep\')');
+    database.close();
+    await beginFeedbackMaintenance(directory, 'unknown-table');
+    await expect(freezeFeedbackSource(directory, 'unknown-table')).rejects.toThrow('feedback_source_schema_unsupported');
+    expect(store.createResponse({ interactionId: 'not-frozen', content: 'safe' })).toHaveProperty('responseId');
+  });
+  it('rejects reusing a restored migration snapshot identity after accepting new source writes', async () => {
+    const { directory, store } = await fixture();
+    await beginFeedbackMaintenance(directory, 'old-migration');
+    await freezeFeedbackSource(directory, 'old-migration');
+    await restoreFeedbackSource(directory, 'old-migration');
+    store.createResponse({ interactionId: 'new-source-write', content: 'retain' });
+    await beginFeedbackMaintenance(directory, 'old-migration');
+    await expect(freezeFeedbackSource(directory, 'old-migration')).rejects.toThrow('feedback_migration_source_restored');
+  });
+  it('blocks live named daemons that have not acknowledged maintenance', async () => {
+    const { directory } = await fixture();
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const home = process.env.HOME!;
+    await mkdir(join(home, '.botmux'), { recursive: true });
+    await writeFile(join(home, '.botmux', 'fleet-state.json'), JSON.stringify({ procs: [{ name: 'botmux-production', pid: process.pid, entry: 'daemon' }] }));
+    try {
+      await beginFeedbackMaintenance(directory, 'named-daemon');
+      expect((await inspectFeedbackMaintenance(directory, 'named-daemon')).blockers).toContain(`unsupported_daemon:${process.pid}`);
+    } finally { await rm(join(home, '.botmux', 'fleet-state.json')); }
+  });
   it('fences a connection already open in another process', async () => {
     const { directory } = await fixture();
     const child = spawnTsScript('test/helpers/feedback-maintenance-child.ts', [directory], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });

@@ -42,4 +42,3 @@ export type CompatibleFeedbackStore = {
   [Method in keyof FeedbackStore]: FeedbackStore[Method] extends (...args: infer Args) => Promise<infer Result>
     ? (...args: Args) => Result | Promise<Result> : never;
 };
-

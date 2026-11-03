@@ -50,6 +50,8 @@ Migration freezes the source, creates a WAL-consistent snapshot, imports all nin
 
 Do not remove migration files or guards to bypass a blocker. PostgreSQL is never automatically replaced with the old SQLite database: once new feedback arrives, that would hide new records. Reverse migration and merging independent installations are unsupported.
 
+Restoring a pre-activation source invalidates that migration's snapshot identity. Its old job cannot subsequently retire the source or reuse the snapshot after new SQLite writes. Unknown webhook attempt outcomes remain migration blockers even when a retry is no longer in flight.
+
 ## Dashboard
 
 Open **Feedback → Feedback storage**. The panel separates active and candidate backends and provides connection testing, migration, empty initialization and recovery. Host administrator authentication is required; writes also require the Dashboard CSRF token.

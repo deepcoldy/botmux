@@ -770,7 +770,7 @@ export class SkillFeedbackStore {
   }
 
   rescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): boolean {
-    return this.db.prepare(`UPDATE feedback_outbox SET status=?,next_attempt_at=?,last_error=?,last_http_status=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(input.permanent ? 'failed' : 'pending', input.nextAttemptAt, input.error.slice(0, 500), input.httpStatus ?? null, outboxId, claimToken).changes === 1;
+    return this.db.prepare(`UPDATE feedback_outbox SET status=?,next_attempt_at=?,last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE ? END,last_http_status=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(input.permanent ? 'failed' : 'pending', input.nextAttemptAt, input.error.slice(0, 500), input.httpStatus ?? null, outboxId, claimToken).changes === 1;
   }
   tryRescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): { done: true; changed: boolean } | { done: false; busy: true } {
     return this.withNonblockingBusy(

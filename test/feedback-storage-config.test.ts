@@ -30,7 +30,7 @@ afterEach(async () => {
   delete process.env.BOTMUX_TEST_PG_PASSWORD;
 });
 describe('feedback storage configuration', () => {
-  it('routes writes and analytics to one store and closes stale generations', async () => {
+  it('keeps captured stores live when only the candidate configuration changes', async () => {
     const path = await directory();
     const first = await getFeedbackStorage(path);
     const response = await first.store.createResponse({ interactionId: 'interaction', content: 'answer' });
@@ -40,7 +40,8 @@ describe('feedback storage configuration', () => {
     await saveFeedbackStorageCandidate(path, config.generation, target);
     const second = await getFeedbackStorage(path);
     expect((await second.store.findDeliveryByPlatformMessage('lark', 'app', 'message'))?.responseId).toBe(response.responseId);
-    await expect(first.store.getResponse(response.responseId)).rejects.toThrow('feedback_storage_closed');
+    expect(await first.store.getResponse(response.responseId)).toMatchObject({ responseId: response.responseId });
+    expect(second.store).toBe(first.store);
     expect(second.generation).toBe(config.generation + 1);
   });
   it('keeps one durable instance identity and defaults to SQLite', async () => {

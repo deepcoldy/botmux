@@ -10463,7 +10463,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
   console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, ...(rendered ? { diff: { stats: rendered.stats, statsScope: rendered.statsScope, preview: rendered.preview } } : {}), card }, null, 2));
 }
 
-async function cmdSend(rest: string[]): Promise<void> {
+async function cmdSend(rest: string[], beginFeedbackEffect?: () => void): Promise<void> {
   const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
   // Provider values are opaque argv tokens, but flag-shaped mention values can
   // otherwise trigger the help/dry-run early exits below before the outbound
@@ -11443,7 +11443,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
     await checkSendTopics?.(lookup);
-    return revalidateIsolatedOrigin();
+    const origin = await revalidateIsolatedOrigin();
+    beginFeedbackEffect?.();
+    return origin;
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
     await revalidateIsolatedOriginBeforeEffect(lookup);
@@ -20362,7 +20364,13 @@ switch (command) {
     break;
   }
   case 'send': {
-    try { await withFeedbackSendLease(resolveDataDir(), () => cmdSend(process.argv.slice(3))); }
+    let releaseFeedbackEffect: (() => void) | undefined;
+    try {
+      await cmdSend(process.argv.slice(3), () => {
+        releaseFeedbackEffect ??= acquireFeedbackSendLease(resolveDataDir());
+      });
+      releaseFeedbackEffect?.();
+    }
     catch (error) {
       if (!(error instanceof TopicSendError)) throw error;
       console.error(`botmux send refused: ${error.message}`);
@@ -20455,4 +20463,4 @@ switch (command) {
     if (!await runPluginCommandByName(command, process.argv.slice(3))) showHelp();
     break;
 }
-import { withFeedbackSendLease } from './services/feedback-maintenance.js';
+import { acquireFeedbackSendLease } from './services/feedback-maintenance.js';

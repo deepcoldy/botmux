@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { FeedbackAnalyticsService } from '../src/services/feedback-analytics.js';
+import { feedbackPostgresPool } from '../src/services/feedback-postgres-schema.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { once } from 'node:events';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
 import { openPostgresFeedbackStore } from '../src/services/feedback-postgres-store.js';
@@ -18,7 +21,7 @@ const stores: FeedbackStore[] = [];
 afterAll(async () => { await admin?.end(); });
 afterEach(async () => {
   await Promise.all(stores.splice(0).map(store => store.close()));
-  for (const schema of schemas.splice(0)) await admin!.query(`DROP SCHEMA "${schema}" CASCADE`);
+  for (const schema of schemas.splice(0)) await admin!.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
 });
 async function fixture() {
   if (!connectionString) throw new Error('BOTMUX_TEST_POSTGRES_URL_required');
@@ -32,12 +35,44 @@ async function fixture() {
   };
   const password = decodeURIComponent(url.password);
   const instanceId = randomUUID();
-  const store = await openPostgresFeedbackStore(target, password, instanceId);
+  const store = await openPostgresFeedbackStore(target, password, instanceId, undefined, true);
   stores.push(store);
   return { target, password, instanceId, store };
 }
 
 describe('PostgreSQL feedback integration', () => {
+  it('survives an idle disconnect in a child without leaking the password to stderr', async () => {
+    const child = spawnTsScript('test/helpers/feedback-pg-idle-child.ts', [], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    let errors = '';
+    child.stderr!.on('data', chunk => { errors += String(chunk); });
+    try {
+      const [ready] = await once(child, 'message');
+      await admin!.query('SELECT pg_terminate_backend($1)', [ready.backend]);
+      const result = once(child, 'message');
+      child.send('reconnect');
+      expect((await result)[0]).toEqual({ recovered: true });
+      expect(errors).not.toContain('synthetic-idle-secret');
+    } finally { child.kill(); }
+  });
+  it('does not provision an empty replacement when an active schema disappears', async () => {
+    const { store, target, password, instanceId } = await fixture();
+    await store.createResponse({ interactionId: 'retain', content: 'retain' });
+    await admin!.query(`DROP SCHEMA "${target.schema}" CASCADE`);
+    await expect(openPostgresFeedbackStore(target, password, instanceId)).rejects.toThrow('feedback_storage_schema_missing');
+  });
+  it('handles idle PostgreSQL errors without exposing credentials and reconnects', async () => {
+    const { target, password } = await fixture();
+    const pool = feedbackPostgresPool(target, password);
+    try {
+      expect(pool.listenerCount('error')).toBeGreaterThan(0);
+      const client = await pool.connect();
+      const backend = (await client.query('SELECT pg_backend_pid() id')).rows[0].id;
+      client.release();
+      await admin!.query('SELECT pg_terminate_backend($1)', [backend]);
+      await new Promise(resolve => setTimeout(resolve, 80));
+      expect((await pool.query('SELECT 42 value')).rows[0].value).toBe(42);
+    } finally { await pool.end(); }
+  });
   it('matches SQLite analytics for the same delivery and multi-user revision cohort', async () => {
     const { store, target, password } = await fixture();
     const directory = await mkdtemp(join(tmpdir(), 'pg-parity-'));
