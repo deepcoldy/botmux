@@ -213,6 +213,19 @@ describe('discoverClaudeFamilySessions (Claude-family / Genius)', () => {
     expect(out.map((s) => s.cliSessionId)).toEqual(['fmt-ext-1']);
   });
 
+  // #2716: the bare (transcript + solo) follow-up shape is not recognized as
+  // botmux-origin (no envelope — a pre-existing gap), so it CAN appear in the
+  // picker; when it does, its title must be the user's text alone, without the
+  // formatting block appended after it.
+  it('titles an envelope-less bare follow-up without the <botmux_formatting> block', async () => {
+    writeSession('-root-fmt', 'fmt-bare-title-1', [
+      { type: 'user', cwd: '/root/fmt', message: { role: 'user', content: '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ cliSessionId: 'fmt-bare-title-1', title: '继续看一下这个 PR' });
+  });
+
   it('keeps external sessions that only mention botmux tags in prose', async () => {
     writeSession('-root-p', 'ext-discuss-1', [
       { type: 'user', cwd: '/root/p', message: { role: 'user', content: 'I am debugging botmux and the <user_message> tag behavior, and why does <sender type= show up?' } },
@@ -549,6 +562,65 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, name), jsonl(...lines));
   }
+
+  // #2716: envelope-less bare (transcript + solo) follow-ups are not matched as
+  // botmux-origin (pre-existing gap), so they may reach the title assignment.
+  // The <botmux_formatting> block appended after the user text must be stripped
+  // from every title path. The leading <session_id> is pre-existing on this
+  // shape and intentionally stays (master had it there before this feature).
+  const BARE_FMT = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+  const BARE_CODEX = `<session_id>sid-rx</session_id>\n\n${BARE_FMT}`;
+
+  it('strips the bare formatting block from the legacy event_msg title (codex)', async () => {
+    writeRollout('2026/11/01', 'rollout-bare-legacy.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-legacy', cwd: '/root/fmt' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: BARE_CODEX } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out).toEqual([expect.objectContaining({
+      cliSessionId: 'sid-bare-legacy',
+      title: '<session_id>sid-rx</session_id> 继续看一下这个 PR',
+    })]);
+  });
+
+  it('strips the bare formatting block from the new-format response_item weak title (codex)', async () => {
+    writeRollout('2026/11/02', 'rollout-bare-response-item.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-ri', cwd: '/root/fmt' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: BARE_CODEX }] } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out).toEqual([expect.objectContaining({
+      cliSessionId: 'sid-bare-ri',
+      title: '<session_id>sid-rx</session_id> 继续看一下这个 PR',
+    })]);
+  });
+
+  it('strips the bare formatting block from the traex canonical fallback title', async () => {
+    writeRollout('2026/11/03', 'rollout-bare-traex-canonical.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-traex-c', cwd: '/root/fmt' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: BARE_FMT, turn_id: 'turn-1' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX);
+    expect(out).toEqual([expect.objectContaining({
+      cliSessionId: 'sid-bare-traex-c',
+      title: '继续看一下这个 PR',
+    })]);
+  });
+
+  it('strips the bare formatting block from the traex weak history title', async () => {
+    writeRollout('2026/11/04', 'rollout-bare-traex-weak.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-traex-w', cwd: '/root/fmt' } },
+      { type: 'history_mutation', payload: { operation: 'append', turn_id: 'turn-1', items: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: BARE_FMT }] },
+      ] } },
+      { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX);
+    expect(out).toEqual([expect.objectContaining({
+      cliSessionId: 'sid-bare-traex-w',
+      title: '继续看一下这个 PR',
+    })]);
+  });
 
   it('reads resume id + cwd from session_meta and title from the first user_message event', async () => {
     writeRollout('2026/06/13', 'rollout-2026-06-13T07-02-46-019ebfca.jsonl', [

@@ -25,6 +25,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { TrustedCaller } from '../types.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import {
   ordinaryTurnRecoveryCauseCode,
   type OrdinaryTurnRecoveryState,
@@ -260,9 +261,7 @@ export function userMessageExcerpt(cliInput: string, maxChars = 80): string | un
     ? blocks.map(match => match[1]).join(' ')
     // bare（transcript + solo）续轮没有 <user_message> 壳：先整块剥掉追加在
     // 正文后的 <botmux_formatting>（含块体），再退化为去标签文本。
-    : stripRetryPrefix(cliInput)
-      .replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, ' ')
-      .replace(/<[^>]+>/g, ' ');
+    : stripBotmuxDisplayBlocks(stripRetryPrefix(cliInput)).replace(/<[^>]+>/g, ' ');
   const text = decodeXmlEntities(raw).replace(/\s+/g, ' ').trim();
   if (!text) return undefined;
   return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;

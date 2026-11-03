@@ -12,6 +12,8 @@
  * runtime that consumes it.
  */
 
+import { stripBotmuxDisplayBlocks } from './utils/prompt-display-strip.js';
+
 function decodeXmlEntities(text: string): string {
   return text
     .replace(/&lt;/g, '<')
@@ -158,7 +160,7 @@ export function normalizeMircliPrompt(content: string): string {
   if (!userMessage) {
     // Envelope-less input (zero-prompt, or a future bare transcript shape):
     // never surface internal botmux blocks raw — drop them and keep the prose.
-    return content.replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, '').trim();
+    return stripBotmuxDisplayBlocks(content).replace(/\s+/g, ' ').trim();
   }
 
   const context = [
