@@ -108,9 +108,24 @@ describe('doubao transcript bridge', () => {
   });
 });
 
-/** Stateful cursor helper: replays what the worker's 1s ticker does. */
-function tickDrain(trajectory: string, cursor: { offset: number; state: unknown }) {
-  const r = drainDoubaoTranscript(trajectory, cursor.offset, { state: cursor.state });
+/** Stateful cursor helper: replays what the worker's 1s ticker does. Drains
+ *  through the adapter's registered spec (not the service function directly)
+ *  so the ctx/openTurns forwarding in `doubaoBridgeSpec` is covered too. The
+ *  open-turn count is measured from the REAL queue immediately before each
+ *  drain, exactly like structuredBridgeIngestPath in the worker. */
+function tickDrain(
+  trajectory: string,
+  cursor: { offset: number; state: unknown },
+  queue?: CodexBridgeQueue,
+) {
+  const openTurns = queue
+    ? queue.peek().filter(turn => turn.started && turn.finalText === undefined).length
+    : undefined;
+  const r = doubaoBridgeSpec.drain(trajectory, cursor.offset, {
+    adoptMode: false,
+    state: cursor.state,
+    openTurns,
+  });
   cursor.offset = r.newOffset;
   cursor.state = r.state;
   return r;
@@ -137,7 +152,7 @@ describe('doubao two-file cross-window ordering', () => {
     const cursor = { offset: 0, state: undefined as unknown };
 
     // tick 1: turn-1's prompt starts its queue head.
-    let r = tickDrain(trajectory, cursor);
+    let r = tickDrain(trajectory, cursor, queue);
     queue.ingest(r.events);
     expect(r.events.map(e => e.kind)).toEqual(['user']);
 
@@ -145,20 +160,19 @@ describe('doubao two-file cross-window ordering', () => {
     writeFileSync(assignment, heading(t2, '问题二：只回复 ANSWER_TWO'), { flag: 'a' });
     writeFileSync(trajectory, finalRow('ANSWER_ONE'));
 
-    // tick 2: collision window — only ANSWER_ONE may be emitted; turn-2's
-    // prompt is held (its section offset parked for re-parse).
-    r = tickDrain(trajectory, cursor);
-    expect(r.events.map(e => e.kind)).toEqual(['assistant_final']);
+    // tick 2: the queue holds turn-1 open, so the final closes it FIRST and
+    // turn-2's prompt starts afterwards in the same window — no hold needed.
+    r = tickDrain(trajectory, cursor, queue);
+    expect(r.events.map(e => e.kind)).toEqual(['assistant_final', 'user']);
     expect(r.events[0]!.text).toBe('ANSWER_ONE');
     queue.ingest(r.events);
     let ready = queue.drainEmittable();
     expect(ready.map(t => [t.turnId, t.finalText])).toEqual([['turn-1', 'ANSWER_ONE']]);
 
-    // tick 3: the held prompt re-parses and pairs with its own final (which
-    // may land in the same window — still zero extra delay once paired).
+    // tick 3: turn-2's own final lands and closes it.
     writeFileSync(trajectory, finalRow('ANSWER_TWO'), { flag: 'a' });
-    r = tickDrain(trajectory, cursor);
-    expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    r = tickDrain(trajectory, cursor, queue);
+    expect(r.events.map(e => e.kind)).toEqual(['assistant_final']);
     queue.ingest(r.events);
     ready = queue.drainEmittable();
     expect(ready.map(t => [t.turnId, t.finalText])).toEqual([['turn-2', 'ANSWER_TWO']]);
@@ -173,7 +187,7 @@ describe('doubao two-file cross-window ordering', () => {
     writeFileSync(assignment, heading(ts, '快问快答：只回复 FAST_OK'));
     writeFileSync(trajectory, finalRow('FAST_OK'));
 
-    const r = drainDoubaoTranscript(trajectory, 0, {});
+    const r = drainDoubaoTranscript(trajectory, 0, { openTurns: 0 });
     expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
     queue.ingest(r.events);
     expect(queue.drainEmittable().map(t => [t.turnId, t.finalText]))
@@ -184,9 +198,80 @@ describe('doubao two-file cross-window ordering', () => {
     const root = join(tmpdir(), `doubao-prompt-only-${process.pid}`);
     const { assignment, trajectory } = makeSession(root);
     writeFileSync(assignment, heading('2026-11-03T03:00:00.000Z', '只有问题还没有回答'));
-    const r = drainDoubaoTranscript(trajectory, 0, {});
+    const r = drainDoubaoTranscript(trajectory, 0, { openTurns: 0 });
     expect(r.events.map(e => e.kind)).toEqual(['user']);
-    expect((r.state as { openUserCount: number }).openUserCount).toBe(1);
+    // No balance is kept in driver state: the queue is the sole owner of which
+    // turns are open (a file-derived counter could never see Esc retirement).
+    expect(r.state).toEqual({
+      assignmentOffset: expect.any(Number),
+      trajectoryOffset: 0,
+    });
+  });
+
+  it('does not let an Esc-interrupted turn with no transcript record steal later fast-turn answers', () => {
+    // doubao writes nothing to trajectory.jsonl after Esc (`Stopped`, no
+    // records). The worker retires that queue mark; the next two turns complete
+    // fast (prompt + final in one window each). A file-derived balance would
+    // keep counting the dead turn and shift every answer by one.
+    const root = join(tmpdir(), `doubao-interrupted-${process.pid}`);
+    const { assignment, trajectory } = makeSession(root);
+    const queue = new CodexBridgeQueue(() => Date.now());
+    const cursor = { offset: 0, state: undefined as unknown };
+    const emitted: Array<[string, string?]> = [];
+    const tick = () => {
+      const r = tickDrain(trajectory, cursor, queue);
+      queue.ingest(r.events);
+      for (const t of queue.drainEmittable()) emitted.push([t.turnId, t.finalText]);
+      return r;
+    };
+
+    queue.mark('turn-1', '问题一：只回复 A1');
+    writeFileSync(assignment, heading(new Date().toISOString(), '问题一：只回复 A1'));
+    tick();
+    // Esc: doubao appends no record; the worker retires the mark exactly as
+    // handleExactTurnInterrupt does.
+    expect(queue.dropPendingTurn('turn-1', undefined, true)).not.toBeNull();
+
+    for (const [id, q, a] of [
+      ['turn-2', '问题二：只回复 A2', 'A2'],
+      ['turn-3', '问题三：只回复 A3', 'A3'],
+    ] as const) {
+      queue.mark(id, q);
+      writeFileSync(assignment, heading(new Date(Date.now() + 1_000).toISOString(), q), { flag: 'a' });
+      writeFileSync(trajectory, finalRow(a), { flag: 'a' });
+      tick();
+    }
+    expect(emitted).toEqual([['turn-2', 'A2'], ['turn-3', 'A3']]);
+  });
+
+  it('pairs the post-resume fast turn even when assignment.md already holds pre-restart history', () => {
+    // Fresh-empty late attach over a resumed session: trajectory.jsonl does not
+    // exist yet, but assignment.md still contains the pre-restart prompt. Its
+    // user event matches no queue mark, so the queue reports zero open turns;
+    // it must not steal the first post-resume final when that turn completes
+    // in one window.
+    const root = join(tmpdir(), `doubao-resume-history-${process.pid}`);
+    const { assignment, trajectory } = makeSession(root);
+    const tOld = '2026-11-03T06:00:00.000Z';
+    const tNew = '2026-11-03T06:00:05.000Z';
+    const queue = new CodexBridgeQueue(() => Date.parse(tNew));
+    const cursor = { offset: 0, state: undefined as unknown };
+    const tick = () => {
+      const r = tickDrain(trajectory, cursor, queue);
+      queue.ingest(r.events);
+      const out = queue.drainEmittable().map(t => [t.turnId, t.finalText] as [string, string?]);
+      return { r, out };
+    };
+
+    // Attach tick: trajectory absent; only the old prompt section is read.
+    writeFileSync(assignment, heading(tOld, '重启前的问题：只回复 OLD_ANSWER'));
+    expect(tick().out).toEqual([]);
+
+    // First post-restart turn is fast and creates trajectory.jsonl.
+    queue.mark('turn-new', '新问题：只回复 NEW_ANSWER', Date.parse(tNew));
+    writeFileSync(assignment, heading(tNew, '新问题：只回复 NEW_ANSWER'), { flag: 'a' });
+    writeFileSync(trajectory, finalRow('NEW_ANSWER'));
+    expect(tick().out).toEqual([['turn-new', 'NEW_ANSWER']]);
   });
 });
 
@@ -199,20 +284,28 @@ describe('doubao assignment heading/body split write', () => {
     const root = join(tmpdir(), `doubao-torn-heading-${process.pid}`);
     const { assignment, trajectory } = makeSession(root);
     const ts = '2026-11-03T04:00:00.000Z';
+    const queue = new CodexBridgeQueue(() => Date.parse(ts));
+    queue.mark('turn-1', '撕裂写入的正文：只回复 SPLIT_OK', Date.parse(ts));
     const cursor = { offset: 0, state: undefined as unknown };
+    const tick = () => {
+      const r = tickDrain(trajectory, cursor, queue);
+      queue.ingest(r.events);
+      return { r, ready: queue.drainEmittable() };
+    };
 
     writeFileSync(assignment, heading(ts, '').trimEnd() + '\n');
-    let r = tickDrain(trajectory, cursor);
-    expect(r.events).toEqual([]);
-    expect((r.state as { assignmentOffset: number }).assignmentOffset).toBe(0);
+    let t = tick();
+    expect(t.r.events).toEqual([]);
+    expect((t.r.state as { assignmentOffset: number }).assignmentOffset).toBe(0);
 
     writeFileSync(assignment, '撕裂写入的正文：只回复 SPLIT_OK\n', { flag: 'a' });
-    r = tickDrain(trajectory, cursor);
-    expect(r.events.map(e => e.kind)).toEqual(['user']);
-    expect(r.events[0]!.text).toBe('撕裂写入的正文：只回复 SPLIT_OK');
+    t = tick();
+    expect(t.r.events.map(e => e.kind)).toEqual(['user']);
+    expect(t.r.events[0]!.text).toBe('撕裂写入的正文：只回复 SPLIT_OK');
 
     writeFileSync(trajectory, finalRow('SPLIT_OK'));
-    r = tickDrain(trajectory, cursor);
-    expect(r.events.map(e => e.kind)).toEqual(['assistant_final']);
+    t = tick();
+    expect(t.r.events.map(e => e.kind)).toEqual(['assistant_final']);
+    expect(t.ready.map(x => [x.turnId, x.finalText])).toEqual([['turn-1', 'SPLIT_OK']]);
   });
 });

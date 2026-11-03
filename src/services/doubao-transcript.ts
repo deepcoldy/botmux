@@ -44,13 +44,14 @@ export interface DoubaoBridgeDrainState {
   assignmentOffset: number;
   /** Byte frontier in trajectory.jsonl. */
   trajectoryOffset: number;
-  /** Native turns already emitted as `user` events whose terminal final has not
-   *  been emitted yet. The two files append at DIFFERENT moments of the turn
-   *  cycle (assignment at submit, trajectory at completion), so a single drain
-   *  window can contain BOTH the previous turn's final AND the next turn's
-   *  prompt section; the balance decides which finals close an earlier turn and
-   *  which pair with prompts inside this window. Never negative. */
-  openUserCount?: number;
+}
+
+/** Drain context understood by the doubao driver (beyond the shared fields). */
+export interface DoubaoBridgeDrainContext {
+  state?: unknown;
+  /** Started, unterminated turns in the attribution queue, measured by the
+   *  worker at drain time. See StructuredBridgeDrainContext.openTurns. */
+  openTurns?: number;
 }
 
 export interface DoubaoDrainResult {
@@ -229,27 +230,36 @@ function parseTrajectoryLine(path: string, line: string, lineStart: number): Cod
  *  turn's final landing together with the next turn's prompt. The queue pairs
  *  an assistant_final onto whatever turn is collecting, so emitting the new
  *  user section before that final would start the new turn first, misattribute
- *  the old answer to it (and HOL-drop the old turn). To stay correct with no
- *  native timestamps on finals, keep a running balance of user sections whose
- *  final has not been seen (`openUserCount`):
- *    1. finals that close previously-open turns are emitted FIRST;
- *    2. remaining prompts/finals fully inside this window alternate
- *       user→final so a sub-second turn still pairs in zero extra ticks;
- *    3. only when step 1 closed an earlier turn, leftover prompt sections are
- *       HELD (assignment offset parked at the section start) and re-parsed on
- *       the next tick — one second later, never misattributed.
- *  A window with no finals keeps today's behaviour exactly (the prompt starts
- *  / HOL-drops as the queue already decides). */
+ *  the old answer to it (and HOL-drop the old turn).
+ *
+ *  The boundary can NOT be inferred from the two files' increments: a turn
+ *  can be retired WITHOUT any trajectory record (Esc interrupt — doubao writes
+ *  nothing after `Stopped`), and on resume the reader attaches over
+ *  assignment.md history whose turns the queue no longer holds. A counter
+ *  derived from file bytes would over-count in both shapes forever. The worker
+ *  therefore passes `ctx.openTurns`: the number of turns the attribution queue
+ *  currently holds as STARTED with no terminal — the only component that knows
+ *  the real turn lifecycle. With K = openTurns:
+ *    1. the first K finals in the window close those previously-started turns
+ *       and are emitted FIRST (before any prompt section that could steal them);
+ *    2. remaining prompt→final pairs fully inside the window alternate
+ *       user→final, so a sub-second turn pairs with zero extra ticks — simply
+ *       reversing to finals-first would strand these;
+ *    3. trailing prompt sections with no final in the window are emitted after
+ *       the closing finals (they then start the next turns); any final beyond
+ *       K + the paired prompts has no owner and is not emitted.
+ *  When openTurns is omitted (standalone use) K = 0: every final must pair
+ *  with a prompt in the same or a later window. */
 export function drainDoubaoTranscript(
   path: string,
   fromOffset: number,
-  ctx: { state?: unknown } = {},
+  ctx: DoubaoBridgeDrainContext = {},
 ): DoubaoDrainResult {
   const systemDir = dirname(path);
   const assignmentPath = join(systemDir, ASSIGNMENT_FILE);
   const prevState = (ctx.state as DoubaoBridgeDrainState | undefined)
     ?? { assignmentOffset: 0, trajectoryOffset: 0 };
-  let openUserCount = Math.max(0, Math.trunc(prevState.openUserCount ?? 0));
+  const openTurns = Math.max(0, Math.trunc(ctx.openTurns ?? 0));
 
   // ── assignment.md: user turns ────────────────────────────────────────────
   let assignmentOffset = prevState.assignmentOffset ?? 0;
@@ -258,7 +268,7 @@ export function drainDoubaoTranscript(
   try {
     if (existsSync(assignmentPath)) {
       const size = statSync(assignmentPath).size;
-      if (size < assignmentOffset) { assignmentOffset = 0; openUserCount = 0; }
+      if (size < assignmentOffset) assignmentOffset = 0;
       if (size > assignmentOffset) {
         const window = readJsonlWindow(assignmentPath, assignmentOffset, size);
         parsedSections = parseAssignmentSections(assignmentPath, window.completeText, assignmentOffset);
@@ -284,7 +294,7 @@ export function drainDoubaoTranscript(
   try {
     if (existsSync(path)) {
       const size = statSync(path).size;
-      if (size < trajectoryOffset) { trajectoryOffset = 0; openUserCount = 0; }
+      if (size < trajectoryOffset) trajectoryOffset = 0;
       if (size > trajectoryOffset) {
         const window = readJsonlWindow(path, trajectoryOffset, size);
         finals = parseTrajectoryWindow(path, window.completeText, trajectoryOffset);
@@ -296,40 +306,26 @@ export function drainDoubaoTranscript(
     logger.warn(`[doubao-transcript] trajectory drain failed for ${path}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // ── pair the two streams (see function doc) ──────────────────────────────
+  // ── pair the two streams against queue-owned open turns ──────────────────
   const events: CodexBridgeEvent[] = [];
-  const finalsForOpen = Math.min(finals.length, openUserCount);
-  const paired = Math.min(Math.max(finals.length - finalsForOpen, 0), userSections.length);
+  const finalsForOpen = Math.min(finals.length, openTurns);
+  const paired = Math.min(finals.length - finalsForOpen, userSections.length);
+  // 1. Close previously-started turns first so a prompt section in the same
+  //    window cannot HOL-drop and steal their final.
   for (let i = 0; i < finalsForOpen; i++) events.push(finals[i]!.event);
+  // 2. Turns wholly inside this window: prompt then its own final.
   for (let i = 0; i < paired; i++) {
     events.push(userSections[i]!.event!);
     events.push(finals[finalsForOpen + i]!.event);
   }
-  // Trailing prompts with no final in this window: emit them now when no
-  // earlier turn is being closed (ordinary start / type-ahead); when an
-  // earlier turn IS being closed above, hold them so their sections cannot be
-  // observed before that final is paired.
-  const firstHeldSection = finalsForOpen > 0 && userSections.length > paired
-    ? userSections[paired]!
-    : null;
-  if (!firstHeldSection) {
-    for (let i = paired; i < userSections.length; i++) events.push(userSections[i]!.event!);
-  }
+  // 3. Submitted prompts whose final has not landed yet. The queue turn they
+  //    start is measured fresh on the next drain, so they need no hold here.
+  for (let i = paired; i < userSections.length; i++) events.push(userSections[i]!.event!);
 
-  // Commit assignment bytes only up to the first section we are not emitting
-  // yet (a held paired prompt, or the torn trailing heading).
-  let holdAt: number | null = null;
-  if (firstHeldSection) holdAt = firstHeldSection.start;
-  if (trailingIncomplete && (holdAt === null || trailingIncomplete.start < holdAt)) {
-    holdAt = trailingIncomplete.start;
-  }
-  if (holdAt !== null) assignmentOffset = holdAt;
+  // Park assignment bytes at a torn trailing heading, if any; every complete
+  // section above has been emitted and its bytes may be committed.
+  if (trailingIncomplete) assignmentOffset = trailingIncomplete.start;
   else assignmentOffset = assignmentWindowEnd;
-
-  const emittedUserCount = firstHeldSection
-    ? paired
-    : userSections.length;
-  const nextOpenCount = Math.max(0, openUserCount + emittedUserCount - finals.length);
 
   return {
     events,
@@ -338,6 +334,6 @@ export function drainDoubaoTranscript(
     // be re-drained on the next tick either; take the max of the two frontiers.
     newOffset: Math.max(trajectoryOffset, fromOffset),
     pendingTail,
-    state: { assignmentOffset, trajectoryOffset, openUserCount: nextOpenCount },
+    state: { assignmentOffset, trajectoryOffset },
   };
 }

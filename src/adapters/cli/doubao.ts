@@ -150,7 +150,10 @@ export function parseDoubaoAvailableModels(output: string): string[] | null {
  *  trajectory.jsonl (and the user prompts from assignment.md). */
 export const doubaoBridgeSpec: StructuredBridgeSpec = {
   stateCommit: 'drain',
-  drain: (path, offset, ctx) => drainDoubaoTranscript(path, offset, { state: ctx.state }),
+  drain: (path, offset, ctx) => drainDoubaoTranscript(path, offset, {
+    state: ctx.state,
+    openTurns: ctx.openTurns,
+  }),
   locate: {
     bySessionId: sessionId => doubaoTrajectoryPathForSession(sessionId),
   },

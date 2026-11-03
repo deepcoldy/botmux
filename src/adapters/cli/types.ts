@@ -1101,6 +1101,16 @@ export interface StructuredBridgeDrainContext {
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
+  /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
+   *  terminal yet, measured by the worker immediately before the drain.
+   *  Drivers whose user and final records live in SEPARATE files (doubao:
+   *  assignment.md appends at submit, trajectory.jsonl at completion) use this
+   *  to decide how many finals in the window close previously-started turns
+   *  versus pairing with prompts inside the window. A driver must NOT derive
+   *  this balance from its own file increments: a turn can be retired without
+   *  any transcript record (Esc interrupt), which a file-derived counter can
+   *  never observe and would then over-count forever. */
+  openTurns?: number;
 }
 
 /**

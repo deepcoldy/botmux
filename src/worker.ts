@@ -10378,6 +10378,15 @@ function structuredBridgeIngestPath(
       // transcript text verbatim, so a synthesised token would leak into Lark.
       adoptMode: lastInitConfig?.adoptMode === true,
       state: structuredBridgeDriverState,
+      // Doubao's two-file drainer (assignment.md at submit / trajectory.jsonl
+      // at completion) needs the count of turns the QUEUE holds open: the
+      // files alone cannot see turns retired without a record (Esc interrupt)
+      // or pre-attach history the queue no longer owns. Measured BEFORE this
+      // drain so the boundary describes prior turns, not the events being
+      // ingested now. Other drivers ignore the field.
+      openTurns: structuredBridgeIs('doubao')
+        ? codexBridgeQueue.peek().filter(turn => turn.started && turn.finalText === undefined).length
+        : undefined,
       // The two flags are never set for the "other" driver: every caller sits
       // under its own structuredBridgeIs('oh-my-pi' | 'antigravity') guard.
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
@@ -14342,7 +14351,22 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     inflightInputs.retireTurn(turnId);
     traexAutoModelController?.endTurn(turnId);
     for (let i = pendingMessages.length - 1; i >= 0; i--) {
-      if (pendingMessages[i].turnId === turnId) pendingMessages.splice(i, 1);
+      if (pendingMessages[i]!.turnId === turnId) pendingMessages.splice(i, 1);
+    }
+    // Doubao writes NO transcript record for an Esc-interrupted turn (nothing
+    // follows `Stopped` in trajectory.jsonl), so its structured-bridge mark
+    // would otherwise stay started-without-final indefinitely and be counted
+    // as an open turn on every later drain — the next fast turn's answer would
+    // close the retired turn and every subsequent fast turn shifts by one.
+    // Retire the mark now; replayBuffered inside the drop releases a successor
+    // user/final pair already buffered behind it.
+    if (structuredBridgeIs('doubao') && currentBotmuxTurnId === turnId) {
+      const dropped = codexBridgeQueue.dropPendingTurn(turnId, currentBotmuxDispatchAttempt, true);
+      if (dropped) {
+        log(`Doubao interrupted turn retired from structured bridge: ${turnId.slice(0, 12)}`);
+        codexBridgeIngest();
+        if (isPromptReady) emitReadyCodexTurns();
+      }
     }
   }
   send({ type: 'turn_interrupt_result', requestId, turnId, delivered, ...(delivered ? {} : { reason: 'delivery_failed' as const }) });
