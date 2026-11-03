@@ -26,6 +26,7 @@ import { readRunEnvelope, type V3RunEnvelope } from './run-envelope.js';
 import { readJournal } from './journal.js';
 import { materialize } from './state.js';
 import type { WorkflowEventTurnVerifier } from '../../core/workflow-event-turn.js';
+import { parseScheduledTurnId } from '../../core/scheduled-turn-provenance.js';
 import { readV3MainWakeIssued } from './main-wake-ledger.js';
 
 export type V3DaemonCommandBindingSource = 'run-envelope' | 'legacy-grill' | 'legacy-unbound';
@@ -92,7 +93,7 @@ function assertLegacyBindingShape(binding: RunChatBinding, runId: string): void 
 function readTargetBinding(
   runDir: string,
   runId: string,
-): { binding?: RunChatBinding; source: V3DaemonCommandBindingSource } {
+): { binding?: RunChatBinding; source: V3DaemonCommandBindingSource; initiatorOpenId?: string } {
   let stat;
   try {
     stat = lstatSync(runDir);
@@ -105,9 +106,11 @@ function readTargetBinding(
 
   const envelope = readRunEnvelope(runDir, runId);
   if (envelope.kind === 'ok') {
+    const initiatorOpenId = resolveV3RunInitiator(envelope.envelope);
     return {
       ...(envelope.envelope.chatBinding ? { binding: envelope.envelope.chatBinding } : {}),
       source: 'run-envelope',
+      ...(initiatorOpenId ? { initiatorOpenId } : {}),
     };
   }
   if (envelope.kind === 'invalid') {
@@ -271,7 +274,10 @@ export function authorizeV3DaemonCommand(
 
 // ─── Runtime flow edits (design §13.1, M1) ─────────────────────────────────
 
-/** Which kind of turn proposes a runtime flow edit. */
+/** Who decided a runtime flow edit: `human` — the caller, in a turn their own
+ *  message opened; `runEvent` — the main bot on its own, acting for the run's
+ *  initiator (a turn this run's events woke, or another turn no message of
+ *  the initiator opened; see {@link authorizeV3RunEditForCurrentTuple}). */
 export type V3RunEditTurnOrigin = 'human' | 'runEvent';
 
 export interface V3RunEditCurrentTuple extends V3RunMutationCurrentTuple {
@@ -279,12 +285,19 @@ export interface V3RunEditCurrentTuple extends V3RunMutationCurrentTuple {
   rootMessageId?: string;
   /** Set only by a trusted resolver (see CurrentTurnProvenance). */
   workflowRunEvent?: { runId: string };
+  /** Set only by a trusted resolver: the turn is this run's wake turn, which
+   *  a newer message of `callerOpenId` overtook (see CurrentTurnProvenance). */
+  overtakenWorkflowRunEvent?: { runId: string };
+  /** Set only by a trusted resolver: a scheduled turn
+   *  (`schedule:<taskId>:<uuid>`) of a task `callerOpenId` created. */
+  scheduledTurn?: boolean;
 }
 
 export interface V3RunEditAuthority extends V3DaemonCommandAuthority {
   /** Authenticated human of the current turn. */
   callerOpenId: string;
-  /** `runEvent` only for a turn this run's own events woke (PR 5b). */
+  /** `runEvent` whenever the main bot decided on its own for the initiator;
+   *  `human` only for a turn the caller's own message opened. */
   origin: V3RunEditTurnOrigin;
 }
 
@@ -314,10 +327,11 @@ export function authorizeV3RunEditForCurrentTuple(options: {
     );
   }
   const { current } = options;
-  if (current.workflowRunEvent && current.workflowRunEvent.runId !== options.runId) {
+  const wake = current.workflowRunEvent ?? current.overtakenWorkflowRunEvent;
+  if (wake && wake.runId !== options.runId) {
     // A wake-up belongs to exactly one run; it never lends its turn to another.
     throw new V3DaemonCommandAuthorityError(
-      `该回合由 run ${current.workflowRunEvent.runId} 的事件唤醒，不能修改 run ${options.runId}`,
+      `该回合由 run ${wake.runId} 的事件唤醒，不能修改 run ${options.runId}`,
     );
   }
   const mismatches: string[] = [];
@@ -342,8 +356,28 @@ export function authorizeV3RunEditForCurrentTuple(options: {
     mode: 'chat',
     bindingSource: target.source,
     callerOpenId: current.callerOpenId,
-    origin: current.workflowRunEvent?.runId === options.runId ? 'runEvent' : 'human',
+    origin: v3RunEditOrigin(options.runId, current, target.initiatorOpenId ?? binding.ownerOpenId),
   };
+}
+
+/**
+ * Who decided the edit (M2 乙). Only a turn opened by the caller's own
+ * message is the caller's own decision. A turn this run's events woke is the
+ * main bot's — and so is that wake turn after a newer message overtook it,
+ * and a scheduled turn: the identity they carry is authenticated, but nobody
+ * at the keyboard made this request. For the initiator's identity such a
+ * turn therefore counts as the main bot acting for the run (`runEvent`: the
+ * full §13.5 list, no automatic rerun budget, recorded as `main_bot`); for
+ * anyone else's it stays that person's turn (M1: always a proposal).
+ */
+function v3RunEditOrigin(
+  runId: string,
+  current: V3RunEditCurrentTuple,
+  initiatorOpenId: string | undefined,
+): V3RunEditTurnOrigin {
+  if (current.workflowRunEvent?.runId === runId) return 'runEvent';
+  const unattended = current.scheduledTurn === true || current.overtakenWorkflowRunEvent?.runId === runId;
+  return unattended && nonEmpty(initiatorOpenId) && current.callerOpenId === initiatorOpenId ? 'runEvent' : 'human';
 }
 
 /** CLI host path: authenticate the current turn from the process-tree
@@ -377,6 +411,8 @@ export function authorizeV3RunEditCommand(
       sessionId: current.sessionId,
       ...(current.rootMessageId ? { rootMessageId: current.rootMessageId } : {}),
       ...(current.workflowRunEvent ? { workflowRunEvent: current.workflowRunEvent } : {}),
+      ...(current.overtakenWorkflowRunEvent ? { overtakenWorkflowRunEvent: current.overtakenWorkflowRunEvent } : {}),
+      ...(parseScheduledTurnId(current.turnId) ? { scheduledTurn: true } : {}),
     },
   });
 }

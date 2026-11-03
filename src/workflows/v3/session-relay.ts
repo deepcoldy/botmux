@@ -127,6 +127,11 @@ type RelayAuthenticated = {
   current: V3SessionRelaySessionView & { chatId: string; larkAppId: string };
   callerOpenId: string;
   workflowEvent: boolean;
+  /** Run of the wake turn the newer message `callerOpenId` sent overtook:
+   *  authenticated as that sender, decided by the main bot. */
+  overtakenWakeRunId?: string;
+  /** A scheduled turn of a task `callerOpenId` created. */
+  scheduledTurn: boolean;
 };
 
 /** Capability → live session → current-turn caller, shared by every relay
@@ -197,6 +202,7 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
   const workflowEvent = liveTurnId ? parseWorkflowEventTurnId(liveTurnId) : null;
   /** The wake turn was overtaken; the request runs as the newer human turn. */
   let overtakenWakeTurn = false;
+  let scheduledTurn = false;
   if (liveTurnId && workflowEvent) {
     // Daemon-minted turn for THIS run's own events (design §13.1): it acts
     // for the run's frozen initiator, so the owner tuple below is unchanged.
@@ -218,10 +224,11 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
       return { ok: false, status: 403, error: 'workflow_event_turn_unauthorized', detail: verdict.reason };
     } else {
       // A newer inbound message overtook the wake turn (folded into it, or
-      // queued behind it): the request belongs to that message's sender.
+      // queued behind it): the request runs as that message's sender.
       // Authenticate it as the session's current generation — the same
       // all-fields-one-generation rule as the human branch below, applied to
-      // the turn the pointers name — instead of refusing it (mirrors the host
+      // the turn the pointers name — instead of refusing it, and keep the
+      // mark that the main bot, not that sender, decided it (mirrors the host
       // path in current-turn-provenance.ts).
       const overtaking = current.quoteTargetId;
       if (
@@ -259,6 +266,7 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
       };
     }
     callerOpenId = auth.ownerOpenId;
+    scheduledTurn = true;
   } else {
     // Generation join, mirroring the host path (current-turn-provenance.ts):
     // lastCallerOpenId/quoteTargetId advance the moment the NEXT inbound message
@@ -290,6 +298,8 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
     current: current as RelayAuthenticated['current'],
     callerOpenId,
     workflowEvent: !!workflowEvent && !overtakenWakeTurn,
+    ...(overtakenWakeTurn && workflowEvent ? { overtakenWakeRunId: workflowEvent.runId } : {}),
+    scheduledTurn,
   };
 }
 
@@ -382,6 +392,8 @@ export function authorizeV3SessionRunEditRequest(
         sessionId,
         ...(current.rootMessageId ? { rootMessageId: current.rootMessageId } : {}),
         ...(authenticated.workflowEvent ? { workflowRunEvent: { runId: input.runId } } : {}),
+        ...(authenticated.overtakenWakeRunId ? { overtakenWorkflowRunEvent: { runId: authenticated.overtakenWakeRunId } } : {}),
+        ...(authenticated.scheduledTurn ? { scheduledTurn: true } : {}),
       },
     });
   } catch (err) {

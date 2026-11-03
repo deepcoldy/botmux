@@ -70,6 +70,12 @@ function reasonText(reasons: unknown): string {
     .join('；');
 }
 
+function revisionRefs(value: unknown): Array<{ revision: number; from?: unknown }> {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is { revision: number; from?: unknown } =>
+    !!item && typeof item === 'object' && typeof (item as { revision?: unknown }).revision === 'number');
+}
+
 /** Map the daemon's edit response to CLI output + exit code. */
 export function formatV3RunEditResponse(
   runId: string,
@@ -82,10 +88,14 @@ export function formatV3RunEditResponse(
     // fall through with the raw body
   }
   if (response.ok && body.kind === 'applied') {
-    return {
-      exitCode: 0,
-      text: `✅ run ${runId} 已改为第 ${String(body.revision)} 版：${String(body.summary ?? '')}`,
-    };
+    const lines = [`✅ run ${runId} 已改为第 ${String(body.revision)} 版：${String(body.summary ?? '')}`];
+    for (const item of revisionRefs(body.voidedProposals)) {
+      lines.push(`⚠️ 第 ${item.revision} 版待确认修改和这次修改涉及同一批节点，已作废（确认卡已冻结）；需要的话基于第 ${String(body.revision)} 版重新提。`);
+    }
+    for (const item of revisionRefs(body.carriedProposals)) {
+      lines.push(`⏳ 第 ${String(item.from)} 版待确认修改和这次修改不相关，顺延为第 ${item.revision} 版，继续等发起人确认（确认卡已更新）。`);
+    }
+    return { exitCode: 0, text: lines.join('\n') };
   }
   if (response.ok && body.kind === 'proposed') {
     return {

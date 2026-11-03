@@ -54,6 +54,7 @@ import {
   projectV3RunStatus,
   readV3RevisionWait,
   reconcileV3RevisionProposals,
+  recordV3RevisionCardMessage,
   v3RevisionWaitPath,
   type V3RunEditCaller,
 } from '../src/workflows/v3/run-edit.js';
@@ -96,6 +97,8 @@ import {
 import { blockedInfoFor } from '../src/workflows/v3/daemon-run.js';
 import type { V3RerunBudgetBlock } from '../src/workflows/v3/dag-revision.js';
 import { V3_REVISION_RERUN_GRANT_ACTION, v3RerunGrantCardNonce } from '../src/im/lark/v3-revision-card.js';
+import { revisitBudgetStatus } from '../src/workflows/v3/core-control.js';
+import { DEFAULT_REVISIT_BUDGET_PER_RUN } from '../src/workflows/v3/dag.js';
 
 const INITIATOR = 'ou_initiator';
 const OTHER = 'ou_other_member';
@@ -611,12 +614,14 @@ describe('optimistic concurrency and crash windows', () => {
     expect(loadEffectiveV3Dag(runDir, loaded.dag, journal(runDir)).dag.nodes[0]?.goal).toBe('z');
   });
 
-  it('a direct edit landing first makes the pending proposal stale; its later approval is refused', () => {
+  it('a direct edit of the same node landing first makes the pending proposal stale; its later approval is refused', () => {
     const base = freshBase();
     const runDir = seedRun(base, 'run-race', [goal('a'), goal('b')]);
     edit(base, 'run-race', [{ op: 'updateNode', nodeId: 'a', set: { goal: 'from member' } }], 1, other);
-    const direct = edit(base, 'run-race', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1);
-    expect(direct).toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, reason: 'stale' }] });
+    const direct = edit(base, 'run-race', [{ op: 'updateNode', nodeId: 'a', set: { goal: 'from initiator' } }], 1);
+    expect(direct).toMatchObject({
+      kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, reason: 'stale' }], carriedProposals: [],
+    });
     expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-race', revision: 2, decision: 'approve', by: INITIATOR }))
       .toMatchObject({ kind: 'already-decided', status: 'voided' });
     expect(journal(runDir).some((event) => event.type === 'dagRevised' && event.revision === 2)).toBe(false);
@@ -1016,8 +1021,8 @@ describe('P3-5 / P3-6 — who may leave a proposal pending', () => {
     // The main bot (event turn) proposes in its place …
     expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'a', set: { humanGate: null } }], 1, mainBot))
       .toMatchObject({ kind: 'proposed', revision: 3, voidedProposals: [{ revision: 2, reason: 'superseded' }] });
-    // … and the initiator's own change takes effect, voiding what was pending.
-    expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'the initiator decides' } }], 1))
+    // … and the initiator's own change of the same node takes effect, voiding what was pending.
+    expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'a', set: { goal: 'the initiator decides' } }], 1))
       .toMatchObject({ kind: 'applied', revision: 4, voidedProposals: [{ revision: 3, reason: 'stale' }] });
   });
 });
@@ -1653,32 +1658,313 @@ describe('M2 乙 — which turn needs the confirmation card', () => {
       return runDir;
     }
 
-    it('the initiator\'s own turn adds one more and applies — recorded as theirs, with no grant card', () => {
+    it('the initiator\'s own turn adds one more and applies — recorded as theirs, in the revision itself, with no grant card', () => {
       const base = freshBase();
       const runDir = spentRun(base, 'run-lift');
       const out = edit(base, 'run-lift', [{ op: 'rerunNode', nodeId: 'a' }], 2);
       expect(out).toMatchObject({ kind: 'applied', revision: 3 });
       expect(out).not.toHaveProperty('rerunBudget');
       const events = journal(runDir);
-      const granted = events.findIndex((event) => event.type === 'revisitBudgetGranted');
-      expect(events[granted]).toMatchObject({ sourceNodeId: 'a', toNodeId: 'a', by: INITIATOR, reason: 'rerunNode', revision: 3 });
-      expect(events[granted + 1]).toMatchObject({ type: 'dagRevised', revision: 3, effects: { rerun: ['a'] } });
+      expect(events.some((event) => event.type === 'revisitBudgetGranted')).toBe(false);
+      expect(events.at(-1)).toMatchObject({
+        type: 'dagRevised', revision: 3, by: INITIATOR, effects: { rerun: ['a'], budgetGrants: [{ nodeId: 'a', tier: 'pair' }] },
+      });
+      // Exactly the one revisit it used: spent again afterwards.
+      expect(revisitBudgetStatus(events, 'a', 'a')).toMatchObject({ ok: false, tier: 'pair' });
     });
 
     it('the main bot\'s own turn is refused with the grant card instead', () => {
       const base = freshBase();
       const runDir = spentRun(base, 'run-lift-event');
+      const before = journal(runDir).length;
       expect(edit(base, 'run-lift-event', [{ op: 'rerunNode', nodeId: 'a' }], 2, mainBot))
         .toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
-      expect(journal(runDir).some((event) => event.type === 'revisitBudgetGranted')).toBe(false);
+      expect(journal(runDir)).toHaveLength(before);
     });
 
     it('a change of the initiator that waits for the card does not lift the budget', () => {
       const base = freshBase();
       const runDir = spentRun(base, 'run-lift-host');
+      const before = journal(runDir).length;
       expect(edit(base, 'run-lift-host', [{ op: 'rerunNode', nodeId: 'a' }, { op: 'addNode', node: HOST }], 2))
         .toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
-      expect(journal(runDir).some((event) => event.type === 'revisitBudgetGranted')).toBe(false);
+      expect(journal(runDir)).toHaveLength(before);
     });
+  });
+});
+
+describe('rerun budget across one patch — every re-run of the patch is counted', () => {
+  const RUN_LIMIT = DEFAULT_REVISIT_BUDGET_PER_RUN;
+  /** Independent count over the journal's event shapes: run-wide revisits
+   *  spent, and how many are allowed. */
+  const runBudget = (events: StoredEvent[]) => {
+    let used = 0;
+    let granted = 0;
+    for (const event of events) {
+      if (event.type === 'nodeRevisitRequested') used++;
+      if (event.type === 'revisitBudgetGranted' && event.sourceNodeId === undefined && event.toNodeId === undefined) granted++;
+      if (event.type === 'dagRevised') {
+        used += event.effects?.rerun?.length ?? 0;
+        granted += (event.effects?.budgetGrants ?? []).filter((grant) => grant.tier === 'run').length;
+      }
+    }
+    return { used, limit: RUN_LIMIT + granted };
+  };
+  const ids = (count: number, from = 0) => Array.from({ length: count }, (_, i) => `n${from + i}`);
+  const reruns = (nodeIds: string[]) => nodeIds.map((nodeId) => ({ op: 'rerunNode', nodeId }));
+  function doneRun(base: string, runId: string, nodeIds: string[]) {
+    const runDir = seedRun(base, runId, nodeIds.map((id) => goal(id)));
+    const finished = new Map<string, number>();
+    const finish = (nodeId: string) => {
+      const n = (finished.get(nodeId) ?? 0) + 1;
+      finished.set(nodeId, n);
+      const instanceId = `${nodeId}#${String(n).padStart(3, '0')}`;
+      const attemptId = `${instanceId}/attempts/001`;
+      appendEvent(join(runDir, 'journal.ndjson'), { type: 'nodeDispatched', nodeId, instanceId, attemptId });
+      appendEvent(join(runDir, 'journal.ndjson'), { type: 'nodeSucceeded', nodeId, instanceId, attemptId, manifestPath: join(runDir, 'm.json') });
+    };
+    for (const id of nodeIds) finish(id);
+    return { runDir, finish };
+  }
+
+  it('the main bot\'s own turn cannot re-run more nodes in one patch than the run-wide budget allows', () => {
+    const base = freshBase();
+    const { runDir } = doneRun(base, 'run-many', ids(RUN_LIMIT + 1));
+    const before = journal(runDir).length;
+    expect(edit(base, 'run-many', reruns(ids(RUN_LIMIT + 1)), 1, mainBot))
+      .toMatchObject({ kind: 'invalid', rerunBudget: { tier: 'run' } });
+    expect(journal(runDir)).toHaveLength(before);
+    expect(edit(base, 'run-many', reruns(ids(RUN_LIMIT)), 1, mainBot)).toMatchObject({ kind: 'applied' });
+    expect(runBudget(journal(runDir))).toEqual({ used: RUN_LIMIT, limit: RUN_LIMIT });
+  });
+
+  it('the initiator\'s own turn lifts one revisit per re-run it needs; a grant card click then unlocks exactly one more', async () => {
+    const base = freshBase();
+    const { runDir } = doneRun(base, 'run-lift-many', ids(RUN_LIMIT + 4));
+    expect(edit(base, 'run-lift-many', reruns(ids(RUN_LIMIT)), 1)).toMatchObject({ kind: 'applied', revision: 2 });
+    expect(edit(base, 'run-lift-many', reruns(ids(3, RUN_LIMIT)), 2)).toMatchObject({ kind: 'applied', revision: 3 });
+    expect(runBudget(journal(runDir))).toEqual({ used: RUN_LIMIT + 3, limit: RUN_LIMIT + 3 });
+    // The main bot's next re-run gets the card; one click is one more re-run.
+    const last = `n${RUN_LIMIT + 3}`;
+    const refused = edit(base, 'run-lift-many', reruns([last]), 3, mainBot);
+    expect(refused).toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: last, tier: 'run' } });
+    const block = (refused as { rerunBudget: V3RerunBudgetBlock }).rerunBudget;
+    expect(await postV3RerunGrantCardOnce({ baseDir: base, runId: 'run-lift-many', block, post: async () => 'om_grant' })).toBe('posted');
+    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-lift-many', nodeId: last, tier: block.tier, epoch: block.epoch, by: INITIATOR }))
+      .toMatchObject({ kind: 'granted' });
+    expect(edit(base, 'run-lift-many', reruns([last]), 3, mainBot)).toMatchObject({ kind: 'applied', revision: 4 });
+    expect(runBudget(journal(runDir))).toEqual({ used: RUN_LIMIT + 4, limit: RUN_LIMIT + 4 });
+  });
+
+  it('one node named twice in a patch is one re-run, lifted once', () => {
+    const base = freshBase();
+    const { runDir, finish } = doneRun(base, 'run-twice', ['a']);
+    expect(edit(base, 'run-twice', reruns(['a']), 1)).toMatchObject({ kind: 'applied', revision: 2 });
+    finish('a');
+    expect(edit(base, 'run-twice', reruns(['a', 'a']), 2)).toMatchObject({ kind: 'applied', revision: 3, changes: { rerun: ['a'] } });
+    expect(journal(runDir).at(-1)).toMatchObject({
+      type: 'dagRevised', effects: { rerun: ['a'], budgetGrants: [{ nodeId: 'a', tier: 'pair' }] },
+    });
+  });
+
+  it('a node whose own and run-wide budgets are both spent gets both lifted, so neither is overspent', () => {
+    const base = freshBase();
+    const others = ids(RUN_LIMIT - 1);
+    const { runDir, finish } = doneRun(base, 'run-both', ['a', ...others]);
+    expect(edit(base, 'run-both', reruns(['a']), 1)).toMatchObject({ kind: 'applied', revision: 2 });
+    expect(edit(base, 'run-both', reruns(others), 2)).toMatchObject({ kind: 'applied', revision: 3 });
+    finish('a');
+    expect(revisitBudgetStatus(journal(runDir), 'a', 'a')).toMatchObject({ ok: false, tier: 'pair' });
+    expect(edit(base, 'run-both', reruns(['a']), 3)).toMatchObject({ kind: 'applied', revision: 4 });
+    const events = journal(runDir);
+    expect((events.at(-1) as Extract<StoredEvent, { type: 'dagRevised' }>).effects?.budgetGrants)
+      .toEqual(expect.arrayContaining([{ nodeId: 'a', tier: 'pair' }, { nodeId: 'a', tier: 'run' }]));
+    expect(runBudget(events)).toEqual({ used: RUN_LIMIT + 1, limit: RUN_LIMIT + 1 });
+  });
+
+  it('a grant card posted before the initiator\'s own lift expires once that lift took care of it — never a double grant', async () => {
+    const base = freshBase();
+    const { runDir, finish } = doneRun(base, 'run-old-card', ['a']);
+    expect(edit(base, 'run-old-card', reruns(['a']), 1)).toMatchObject({ kind: 'applied', revision: 2 });
+    finish('a');
+    const refused = edit(base, 'run-old-card', reruns(['a']), 2, mainBot);
+    const block = (refused as { rerunBudget: V3RerunBudgetBlock }).rerunBudget;
+    expect(block).toMatchObject({ nodeId: 'a', tier: 'pair' });
+    expect(await postV3RerunGrantCardOnce({ baseDir: base, runId: 'run-old-card', block, post: async () => 'om_old' })).toBe('posted');
+    // The initiator re-runs it themselves before anyone taps the card.
+    expect(edit(base, 'run-old-card', reruns(['a']), 2)).toMatchObject({ kind: 'applied', revision: 3 });
+    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-old-card', nodeId: 'a', tier: block.tier, epoch: block.epoch, by: INITIATOR }))
+      .toMatchObject({ kind: 'expired' });
+    expect(revisitBudgetStatus(journal(runDir), 'a', 'a')).toMatchObject({ ok: false, tier: 'pair' });
+  });
+
+  it('the lift is part of the revision line: no prefix of the edit\'s writes holds a lift without its revision', () => {
+    const base = freshBase();
+    const { runDir, finish } = doneRun(base, 'run-torn', ['a']);
+    expect(edit(base, 'run-torn', reruns(['a']), 1)).toMatchObject({ kind: 'applied', revision: 2 });
+    finish('a');
+    const journalPath = join(runDir, 'journal.ndjson');
+    const before = readFileSync(journalPath, 'utf-8').trimEnd().split('\n');
+    expect(edit(base, 'run-torn', reruns(['a']), 2)).toMatchObject({ kind: 'applied', revision: 3 });
+    const after = readFileSync(journalPath, 'utf-8').trimEnd().split('\n');
+    const lifts = (events: StoredEvent[]) => events.reduce((n, event) =>
+      n + (event.type === 'revisitBudgetGranted' ? 1 : 0) +
+      (event.type === 'dagRevised' ? event.effects?.budgetGrants?.length ?? 0 : 0), 0);
+    for (let cut = before.length; cut <= after.length; cut++) {
+      writeFileSync(journalPath, `${after.slice(0, cut).join('\n')}\n`);
+      const events = journal(runDir);
+      const revised = events.some((event) => event.type === 'dagRevised' && event.revision === 3);
+      expect({ cut, lifted: lifts(events) > 0 }).toEqual({ cut, lifted: revised });
+    }
+    // Crash before the revision landed: the main bot's own re-run still needs the card.
+    writeFileSync(journalPath, `${before.join('\n')}\n`);
+    expect(edit(base, 'run-torn', reruns(['a']), 2, mainBot)).toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
+  });
+});
+
+describe('a direct revision while another change waits for confirmation', () => {
+  const effectiveGoals = (runDir: string) => Object.fromEntries(
+    loadEffectiveV3Dag(runDir, loadAuthorizedV3Run(runDir).dag, journal(runDir)).dag.nodes.map((node) => [node.id, node.goal]),
+  );
+  /** A member's proposal for `a`, its card posted as `om_card_2`. */
+  function memberProposal(base: string, runId: string, nodes = [goal('a'), goal('b')], patch: unknown = [
+    { op: 'updateNode', nodeId: 'a', set: { goal: 'from member' } },
+  ]) {
+    const runDir = seedRun(base, runId, nodes);
+    expect(edit(base, runId, patch, 1, other)).toMatchObject({ kind: 'proposed', revision: 2 });
+    recordV3RevisionCardMessage(runDir, 2, 'om_card_2');
+    return runDir;
+  }
+
+  it('one that involves other nodes keeps waiting, carried onto the new version with its card', () => {
+    const base = freshBase();
+    const runDir = memberProposal(base, 'run-carry');
+    const direct = edit(base, 'run-carry', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1);
+    expect(direct).toMatchObject({
+      kind: 'applied', revision: 3, voidedProposals: [],
+      carriedProposals: [{
+        fromRevision: 2, revision: 4, cardMessageIds: ['om_card_2'],
+        view: { revision: 4, baseRevision: 3, reasons: ['callerNotInitiator'], changes: { changed: ['a'] }, proposedBy: OTHER },
+      }],
+    });
+    expect(projectV3RunStatus(base, 'run-carry')).toMatchObject({
+      revision: 3,
+      pendingProposal: { revision: 4, baseRevision: 3, touched: ['a'], reasons: ['callerNotInitiator'], by: OTHER },
+    });
+    expect(readV3RevisionWait(runDir, 4)).toMatchObject({ status: 'pending', cardMessageIds: ['om_card_2'] });
+    // The initiator taps the card as it was first posted: that decides the carried version.
+    expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-carry', revision: 2, decision: 'approve', by: INITIATOR }))
+      .toMatchObject({ kind: 'approved', revision: 4 });
+    expect(effectiveGoals(runDir)).toEqual({ a: 'from member', b: 'from initiator' });
+    expect(projectV3RunStatus(base, 'run-carry').revision).toBe(4);
+  });
+
+  it('the old card\'s button still works through the card handler', async () => {
+    const base = freshBase();
+    const runDir = memberProposal(base, 'run-carry-card');
+    edit(base, 'run-carry-card', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1);
+    const drives: string[] = [];
+    const card = await handleV3RevisionAction(
+      { action: V3_REVISION_REJECT_ACTION, runId: 'run-carry-card', revision: 2, nonce: v3RevisionCardNonce('run-carry-card', 2) },
+      INITIATOR,
+      { baseDir: base, driveRun: (id) => { drives.push(id); } },
+    );
+    expect(JSON.stringify(card)).not.toContain('toast');
+    expect(readV3RevisionWait(runDir, 4)).toMatchObject({ status: 'rejected', by: INITIATOR });
+    expect(effectiveGoals(runDir)).toEqual({ a: 'do a', b: 'from initiator' });
+    expect(drives).toEqual(['run-carry-card']);
+  });
+
+  it('a click that decided the old card first keeps its own result; the carried version gets a card of its own', () => {
+    const base = freshBase();
+    const runDir = memberProposal(base, 'run-carry-race');
+    // The click's wait half landed just before the edit took the journal lock.
+    writeJson(v3RevisionWaitPath(runDir, 2), { ...readV3RevisionWait(runDir, 2)!, status: 'approved', by: INITIATOR });
+    const direct = edit(base, 'run-carry-race', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1);
+    expect(direct).toMatchObject({ kind: 'applied', carriedProposals: [{ fromRevision: 2, revision: 4, cardMessageIds: [] }] });
+    expect(readV3RevisionWait(runDir, 4)).toMatchObject({ status: 'pending' });
+    expect(readV3RevisionWait(runDir, 4)).not.toHaveProperty('cardMessageIds');
+  });
+
+  it('a proposal whose new node depends on a node the direct revision changed is voided', () => {
+    const base = freshBase();
+    memberProposal(base, 'run-carry-dep', [goal('a'), goal('b')], [{ op: 'addNode', node: goal('x', { depends: ['b'] }) }]);
+    expect(edit(base, 'run-carry-dep', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1))
+      .toMatchObject({ kind: 'applied', voidedProposals: [{ revision: 2, reason: 'stale' }], carriedProposals: [] });
+    expect(projectV3RunStatus(base, 'run-carry-dep').pendingProposal).toBeUndefined();
+  });
+
+  it('a proposal the direct revision changed the meaning of (no longer the reasons on its card) is voided', () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-carry-reasons', [goal('a'), goal('b')]);
+    const fresh = (selector: string) => ({ larkAppId: selector, cliId: 'codex', workingDir: '/fresh' }) as never;
+    expect(applyV3RunEdit({
+      baseDir: base, runId: 'run-carry-reasons', baseRevision: 1, caller: mainBot,
+      patch: [{ op: 'reassign', nodeId: 'a', bot: 'cli_fresh' }], resolveNewBotSnapshot: fresh,
+    })).toMatchObject({ kind: 'proposed', revision: 2, reasons: ['newBot'] });
+    // The initiator brings the same bot in directly, for another node.
+    expect(applyV3RunEdit({
+      baseDir: base, runId: 'run-carry-reasons', baseRevision: 1, caller: initiator,
+      patch: [{ op: 'reassign', nodeId: 'b', bot: 'cli_fresh' }], resolveNewBotSnapshot: fresh,
+    })).toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2 }], carriedProposals: [] });
+    expect(readV3RevisionWait(runDir, 2)).toMatchObject({ status: 'voided' });
+  });
+
+  it('a proposal that on the new version would need another reason (node total past twice the approved) is voided', () => {
+    const base = freshBase();
+    // Two approved nodes: up to four take effect without a budget reason.
+    memberProposal(base, 'run-carry-budget', [goal('a'), goal('b')], [{ op: 'addNode', node: goal('x') }]);
+    expect(projectV3RunStatus(base, 'run-carry-budget').pendingProposal?.reasons).toEqual(['callerNotInitiator']);
+    // The initiator adds two unrelated nodes directly: four in effect, the proposal would make five.
+    expect(edit(base, 'run-carry-budget', [{ op: 'addNode', node: goal('y') }, { op: 'addNode', node: goal('z') }], 1))
+      .toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, reason: 'stale' }], carriedProposals: [] });
+  });
+
+  it('a proposal the direct revision changed (one of its two new bots is now approved) is voided', () => {
+    const base = freshBase();
+    seedRun(base, 'run-carry-changes', [goal('a'), goal('b'), goal('c')]);
+    const fresh = (selector: string) => ({ larkAppId: selector, cliId: 'codex', workingDir: '/fresh' }) as never;
+    expect(applyV3RunEdit({
+      baseDir: base, runId: 'run-carry-changes', baseRevision: 1, caller: other,
+      patch: [{ op: 'reassign', nodeId: 'a', bot: 'cli_fresh' }, { op: 'reassign', nodeId: 'b', bot: 'cli_fresh_2' }],
+      resolveNewBotSnapshot: fresh,
+    })).toMatchObject({ kind: 'proposed', revision: 2, reasons: ['callerNotInitiator', 'newBot'] });
+    // Same reasons on top of the new version, but its card would no longer list cli_fresh.
+    expect(applyV3RunEdit({
+      baseDir: base, runId: 'run-carry-changes', baseRevision: 1, caller: initiator,
+      patch: [{ op: 'reassign', nodeId: 'c', bot: 'cli_fresh' }], resolveNewBotSnapshot: fresh,
+    })).toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2 }], carriedProposals: [] });
+  });
+
+  it('a carry that cannot be written falls back to voiding the proposal; the direct revision stands', () => {
+    const base = freshBase();
+    const runDir = memberProposal(base, 'run-carry-io');
+    // The carried version's file cannot be created.
+    mkdirSync(v3RevisionFilePaths(runDir, 4).dag, { recursive: true });
+    expect(edit(base, 'run-carry-io', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1))
+      .toMatchObject({ kind: 'applied', revision: 3, voidedProposals: [{ revision: 2, reason: 'stale' }], carriedProposals: [] });
+    expect(effectiveGoals(runDir)).toEqual({ a: 'do a', b: 'from initiator' });
+    expect(projectV3RunStatus(base, 'run-carry-io').pendingProposal).toBeUndefined();
+  });
+
+  it('a crash before the waits moved: cold attach posts the carried card and freezes the old one', async () => {
+    const base = freshBase();
+    const runDir = memberProposal(base, 'run-carry-crash');
+    const pendingWait = readV3RevisionWait(runDir, 2)!;
+    edit(base, 'run-carry-crash', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from initiator' } }], 1);
+    rmSync(v3RevisionWaitPath(runDir, 4));
+    writeJson(v3RevisionWaitPath(runDir, 2), pendingWait);
+    const posted: number[] = [];
+    const recovered = reconcileV3RevisionProposals(base, BINDING.larkAppId);
+    expect(recovered).toEqual([expect.objectContaining({
+      runId: 'run-carry-crash',
+      repost: [expect.objectContaining({ revision: 4 })],
+      voided: [expect.objectContaining({ revision: 2, cardMessageIds: ['om_card_2'] })],
+    })]);
+    for (const view of recovered[0]!.repost) posted.push(view.revision);
+    expect(posted).toEqual([4]);
+    expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-carry-crash', revision: 4, decision: 'approve', by: INITIATOR }))
+      .toMatchObject({ kind: 'approved' });
+    expect(effectiveGoals(runDir)).toEqual({ a: 'from member', b: 'from initiator' });
   });
 });

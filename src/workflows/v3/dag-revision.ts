@@ -721,8 +721,9 @@ export interface V3RevisionPlan {
   /** Conditional edges from already-done sources, resolved once now. */
   edges: Array<Extract<V3Event, { type: 'edgeResolved' }>>;
   /** Rerun budget this revision lifts by itself (only when the planner was
-   *  allowed to — the initiator's own edit, M2 乙): one more revisit for
-   *  each, journaled as `revisitBudgetGranted` with the revision. */
+   *  allowed to — the initiator's own edit, M2 乙): one more revisit per
+   *  entry, as many as its re-runs need. Also in `effects.budgetGrants`, so
+   *  the lift is journaled in the same line as the revision. */
   budgetGrants: Array<{ nodeId: string; tier: 'pair' | 'run' }>;
   /** Blocked nodes to re-run: journaled as `nodeRetryRequested` right after
    *  the revision (attempt ids are allocated under the journal lock). */
@@ -775,6 +776,13 @@ export function v3RevisitBudgetEpoch(
 ): number {
   let epoch = 0;
   for (const event of events) {
+    if (event.type === 'dagRevised') {
+      // An initiator's edit that lifted the budget itself (M2 乙).
+      for (const grant of event.effects?.budgetGrants ?? []) {
+        if (tier === 'run' ? grant.tier === 'run' : grant.tier === 'pair' && grant.nodeId === nodeId) epoch++;
+      }
+      continue;
+    }
     if (event.type !== 'revisitBudgetGranted') continue;
     const runWide = event.sourceNodeId === undefined && event.toNodeId === undefined;
     if (tier === 'run' ? runWide : event.sourceNodeId === nodeId && event.toNodeId === nodeId) epoch++;
@@ -841,6 +849,11 @@ function resolveSelectorKey(
     if (snapshot.larkAppId === selector) return { key, known: true };
   }
   return { key: selector, known: false };
+}
+
+/** The bot selector a goal/loop node's definition names. */
+function definedBotOf(node: V3Node | undefined): string | undefined {
+  return node && (node.type === 'goal' || node.type === 'loop') ? node.bot : undefined;
 }
 
 function hasHistory(snap: V3RunSnapshot, nodeId: string, events: readonly StoredEvent[]): boolean {
@@ -928,11 +941,27 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
   const updated = new Set<string>();
   const dependsChanged = new Set<string>();
   const reassigned = new Map<string, { from?: string; to: string }>();
+  /** Who executed each node a reassign op names, read ONCE, before any op
+   *  of this patch ran (a blocked-card 改派 first, then the bot its
+   *  definition names): every op of the patch compares against the same
+   *  starting point, never against an earlier op's target. */
+  const executorAtStart = new Map<string, string | undefined>();
+  /** The last reassign target per existing node; resolved into `reassigned`
+   *  once every op ran (a round trip back to the start is no move at all). */
+  const reassignTargets = new Map<string, string>();
   const rerun = new Set<string>();
   let rerunBudget: V3RerunBudgetBlock | undefined;
   const budgetGrants: V3RevisionPlan['budgetGrants'] = [];
-  /** The grants above, as events, so later ops of this patch see them. */
-  const liftedBudget: StoredEvent[] = [];
+  /** The journal as it will read once this revision took effect, as far as
+   *  the revisit budget is concerned: this patch's accepted reruns spend it
+   *  and its lifts extend it (exactly what the `dagRevised` effects record),
+   *  so every later op of the patch is checked against both. */
+  const budgetLedger = (): StoredEvent[] => [
+    ...events,
+    ...(rerun.size > 0 || budgetGrants.length > 0
+      ? [{ type: 'dagRevised', effects: { rerun: [...rerun], budgetGrants: [...budgetGrants] } } as unknown as StoredEvent]
+      : []),
+  ];
   /** Blocked nodes the patch asks to run again (rerunNode, or a reassign). */
   const retryBlocked = new Set<string>();
   const rerunBlockedOps = new Set<string>();
@@ -1011,7 +1040,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
         else removed.add(op.nodeId);
         updated.delete(op.nodeId);
         dependsChanged.delete(op.nodeId);
-        reassigned.delete(op.nodeId);
+        reassignTargets.delete(op.nodeId);
         return;
       }
       case 'updateNode': {
@@ -1068,18 +1097,17 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
           node.bot = target;
           return;
         }
-        // Who executes the node NOW: a blocked-card reassignment moves it
-        // without touching its definition, so the definition's bot is only
-        // the fallback. Compared as app ids, after selector resolution.
-        const defined = typeof node.bot === 'string' ? node.bot : undefined;
-        const actualApp = v3CurrentExecutorApp(snap, knownBots, op.nodeId, defined);
-        const targetApp = snapshotForSelector(knownBots, target)?.larkAppId;
-        if (targetApp !== undefined && targetApp === actualApp) return; // already runs there: nothing changes
+        // Who executes the node now: a blocked-card reassignment moves it
+        // without touching its definition, so the definition's bot (as it
+        // was before this patch) is only the fallback.
+        if (!executorAtStart.has(op.nodeId)) {
+          executorAtStart.set(
+            op.nodeId,
+            v3CurrentExecutorApp(snap, knownBots, op.nodeId, definedBotOf(originalById.get(op.nodeId))),
+          );
+        }
         node.bot = target;
-        const prior = reassigned.get(op.nodeId);
-        const from = prior?.from ??
-          (actualApp !== undefined ? resolveSelectorKey(knownBots, actualApp).key : defined);
-        reassigned.set(op.nodeId, { ...(from ? { from } : {}), to: target });
+        reassignTargets.set(op.nodeId, target);
         return;
       }
       case 'rerunNode': {
@@ -1104,15 +1132,17 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
           problems.push(`${where}: only goal nodes can be re-run (re-running a ${original.type} node would replay it)`);
           return;
         }
-        const budget = revisitBudgetStatus([...events, ...liftedBudget], op.nodeId, op.nodeId);
-        if (!budget.ok && input.liftSpentRerunBudget) {
+        // The same node named twice is still one re-run: one revisit spent.
+        if (rerun.has(op.nodeId)) return;
+        let budget = revisitBudgetStatus(budgetLedger(), op.nodeId, op.nodeId);
+        // The initiator's own edit lifts whatever this one re-run needs —
+        // its own pair tier and/or the run tier, one revisit each — so the
+        // revision never leaves the budget overspent.
+        for (let tiers = 0; !budget.ok && input.liftSpentRerunBudget && tiers < 2; tiers++) {
           budgetGrants.push({ nodeId: op.nodeId, tier: budget.tier });
-          liftedBudget.push({
-            type: 'revisitBudgetGranted',
-            ...(budget.tier === 'pair' ? { sourceNodeId: op.nodeId, toNodeId: op.nodeId } : {}),
-            by: 'planned',
-          } as StoredEvent);
-        } else if (!budget.ok) {
+          budget = revisitBudgetStatus(budgetLedger(), op.nodeId, op.nodeId);
+        }
+        if (!budget.ok) {
           problems.push(
             `${where}: 节点 "${op.nodeId}" 的重做额度已用完（${budget.tier === 'pair' ? '本节点' : '整个 run'}的 Revisit 额度）；` +
             '需要发起人在「追加重做额度」卡上同意后再提交这次修改',
@@ -1125,6 +1155,24 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
       }
     }
   });
+  // Every reassign op ran: what moves is only the net change, from where the
+  // node executed when the patch began to its last target. A node that ends
+  // where it started is not moved (its running turn is not stopped) and its
+  // definition keeps the bot it had. Compared as app ids, after selector
+  // resolution; an unresolvable target is always a move.
+  for (const [nodeId, target] of reassignTargets) {
+    const startApp = executorAtStart.get(nodeId);
+    const original = definedBotOf(originalById.get(nodeId));
+    const targetApp = snapshotForSelector(knownBots, target)?.larkAppId;
+    if (targetApp !== undefined && targetApp === startApp) {
+      const node = raw[indexOf(nodeId)]!;
+      if (original === undefined) delete node.bot;
+      else node.bot = original;
+      continue;
+    }
+    const from = startApp !== undefined ? resolveSelectorKey(knownBots, startApp).key : original;
+    reassigned.set(nodeId, { ...(from ? { from } : {}), to: target });
+  }
   if (problems.length > 0) return { ok: false, problems, ...(rerunBudget ? { rerunBudget } : {}) };
 
   let next: V3Dag;
@@ -1394,6 +1442,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
     ...(supersede.size > 0 ? { supersede: [...supersede.values()] } : {}),
     ...(cancel.length > 0 ? { cancel } : {}),
     ...(rerun.size > 0 ? { rerun: [...rerun] } : {}),
+    ...(budgetGrants.length > 0 ? { budgetGrants: [...budgetGrants] } : {}),
     ...(regate.length > 0 ? { regate } : {}),
     ...(retries.length > 0
       ? { retry: retries.map((retry) => ({ nodeId: retry.nodeId, ...(retry.instanceId ? { instanceId: retry.instanceId } : {}) })) }
@@ -1426,6 +1475,31 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
       retries,
     },
   };
+}
+
+/**
+ * Every node a revision involves: the existing nodes it touches (changed,
+ * rewired, reassigned, removed, re-run — with the downstream instances a
+ * re-run replaces), the nodes it adds, and every node an added or rewired
+ * node now depends on. Two revisions with disjoint sets change separate parts
+ * of the flow: one taking effect leaves the other's meaning intact.
+ */
+export function v3RevisionInvolvedNodes(plan: Pick<V3RevisionPlan, 'dag' | 'changes' | 'touched'>): Set<string> {
+  const involved = new Set<string>([
+    ...plan.touched,
+    ...plan.changes.added,
+    ...plan.changes.removed,
+    ...plan.changes.changed,
+    ...plan.changes.dependsChanged,
+    ...plan.changes.reassigned.map((item) => item.nodeId),
+    ...plan.changes.rerun,
+  ]);
+  const wired = new Set([...plan.changes.added, ...plan.changes.dependsChanged]);
+  for (const node of plan.dag.nodes) {
+    if (!wired.has(node.id)) continue;
+    for (const dep of node.depends) involved.add(dep.from);
+  }
+  return involved;
 }
 
 /** Is a node (or a loop body instance of it) held back by a pending

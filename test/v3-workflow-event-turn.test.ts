@@ -10,7 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   CurrentTurnProvenanceError,
@@ -31,7 +31,7 @@ import {
   makeAdHocRunEnvelope,
   publishRunEnvelopeOnce,
 } from '../src/workflows/v3/run-envelope.js';
-import { appendEvent } from '../src/workflows/v3/journal.js';
+import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import {
   authorizeV3SessionRunEditRequest,
   authorizeV3SessionRunMutationRequest,
@@ -39,6 +39,7 @@ import {
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { recordV3MainWakeIssued } from '../src/workflows/v3/main-wake-ledger.js';
 import { applyV3RunEdit } from '../src/workflows/v3/run-edit.js';
+import { botHomePath } from '../src/adapters/cli/read-isolation.js';
 
 const RUN = 'wf-event-run';
 const BINDING = { larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real_root', ownerOpenId: 'ou_initiator' };
@@ -266,15 +267,17 @@ describe('a human message arrives while the main bot handles a wake turn', () =>
     return { decision, outcome: apply(decision.edit.caller) };
   };
 
-  it('host: the initiator\'s message absorbed into the wake turn → the edit is the initiator\'s own (M1 direct)', () => {
+  it('host: the initiator\'s message overtakes the wake turn → accepted, but still the main bot\'s own decision', () => {
     seedRun();
     const wake = issueWake(RUN, 2);
     const { authority, outcome } = hostEdit(INITIATOR, 'om_initiator_says', wake);
-    expect(authority).toMatchObject({ origin: 'human', callerOpenId: INITIATOR });
+    expect(authority).toMatchObject({ origin: 'runEvent', callerOpenId: INITIATOR });
     expect(outcome).toMatchObject({ kind: 'applied' });
+    expect(readJournal(join(baseDir, RUN, 'journal.ndjson')).find((event) => event.type === 'dagRevised'))
+      .toMatchObject({ by: 'main_bot', auto: expect.anything() });
   });
 
-  it('host: the initiator\'s message opened a new turn → the same', () => {
+  it('host: the initiator\'s message opened a new turn → the initiator\'s own edit', () => {
     seedRun();
     issueWake(RUN, 2);
     const { authority, outcome } = hostEdit(INITIATOR, 'om_initiator_says', 'om_initiator_says');
@@ -300,12 +303,14 @@ describe('a human message arrives while the main bot handles a wake turn', () =>
     seedRun();
     const wake = issueWake(RUN, 2);
     expect(relayEdit(INITIATOR, 'om_initiator_says', wake)).toMatchObject({
-      decision: { ok: true, edit: { caller: { openId: INITIATOR, origin: 'human' } } }, outcome: { kind: 'applied' },
+      decision: { ok: true, edit: { caller: { openId: INITIATOR, origin: 'runEvent' } } }, outcome: { kind: 'applied' },
     });
     rmSync(join(baseDir, RUN), { recursive: true, force: true });
     seedRun();
     issueWake(RUN, 2);
-    expect(relayEdit(INITIATOR, 'om_initiator_says', 'om_initiator_says')).toMatchObject({ outcome: { kind: 'applied' } });
+    expect(relayEdit(INITIATOR, 'om_initiator_says', 'om_initiator_says')).toMatchObject({
+      decision: { ok: true, edit: { caller: { openId: INITIATOR, origin: 'human' } } }, outcome: { kind: 'applied' },
+    });
     rmSync(join(baseDir, RUN), { recursive: true, force: true });
     seedRun();
     const wake2 = issueWake(RUN, 2);
@@ -367,5 +372,192 @@ describe('a human message arrives while the main bot handles a wake turn', () =>
     ]) {
       expect(relayStatus(session)).toMatchObject({ ok: false, error: 'turn_provenance_stale' });
     }
+  });
+});
+
+/**
+ * M2 乙 grades a runtime edit by who decided it. Only a turn the initiator's
+ * own message opened is the initiator's decision; a wake turn a newer message
+ * of the initiator overtook, and a scheduled turn of the initiator's task,
+ * stay the main bot's own decision: the full §13.5 list, no automatic rerun
+ * budget, recorded as `main_bot`. Real marker + session store + relay +
+ * engine.
+ */
+describe('who decided the edit: an overtaken wake turn or a scheduled turn is the main bot\'s', () => {
+  const INITIATOR = 'ou_initiator';
+  const MEMBER = 'ou_member';
+  const capability = 'c'.repeat(64);
+  const SCHEDULE_TURN = 'schedule:task1:12345678-1234-1234-1234-123456789abc';
+
+  /** a: blocked · g: gated, not started · d: done, its rerun budget spent. */
+  function seedRiskRun(): void {
+    const runDir = join(baseDir, RUN);
+    mkdirSync(runDir, { recursive: true });
+    const write = (name: string, value: unknown) => writeFileSync(join(runDir, name), `${JSON.stringify(value, null, 2)}\n`);
+    write('dag.json', { schemaVersion: 2, runId: RUN, nodes: [
+      { id: 'a', type: 'goal', goal: 'a', bot: 'cli_w', depends: [], inputs: [] },
+      { id: 'g', type: 'goal', goal: 'g', bot: 'cli_w', depends: [], inputs: [], humanGate: { prompt: 'ok?' } },
+      { id: 'd', type: 'goal', goal: 'd', bot: 'cli_w', depends: [], inputs: [] },
+    ] });
+    write('spec.json', {
+      schemaVersion: 1, runId: RUN, title: 't', requirement: 'r',
+      nodes: [{ sketchId: 'a', goal: 'a', input_needs: [], expected_outputs: ['o'], acceptance: 'x', risk_gate: false, unknowns: [] }],
+    });
+    write('bots.snapshot.json', { cli_w: { larkAppId: 'cli_w', cliId: 'claude-code', workingDir: '/w' } });
+    publishRunEnvelopeOnce(runDir, makeAdHocRunEnvelope({
+      runId: RUN, createdAt: '2026-11-03T08:00:00.000Z', authorizedAt: '2026-11-03T08:01:00.000Z',
+      authorizedByOpenId: INITIATOR, chatBinding: BINDING,
+      artifacts: { dag: artifactRef(runDir, 'dag.json'), spec: artifactRef(runDir, 'spec.json'), botSnapshots: artifactRef(runDir, 'bots.snapshot.json') },
+    }));
+    const journalPath = join(runDir, 'journal.ndjson');
+    appendEvent(journalPath, { type: 'runStarted', runId: RUN });
+    appendEvent(journalPath, { type: 'nodeBlocked', nodeId: 'a', attemptId: 'a/attempts/001', errorClass: 'workerError' });
+    const finishD = (instanceId: string) => {
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'd', instanceId, attemptId: `${instanceId}/attempts/001` });
+      appendEvent(journalPath, { type: 'nodeSucceeded', nodeId: 'd', instanceId, attemptId: `${instanceId}/attempts/001`, manifestPath: join(runDir, 'm.json') });
+    };
+    finishD('d#001');
+    // The initiator's own earlier re-run spends d's one revisit.
+    expect(applyEdit([{ op: 'rerunNode', nodeId: 'd' }], { openId: INITIATOR, origin: 'human' }, 1)).toMatchObject({ kind: 'applied', revision: 2 });
+    finishD('d#002');
+  }
+
+  /** The main bot, on its own, brings in an unapproved bot and drops a gate. */
+  const RISKY = [
+    { op: 'reassign', nodeId: 'a', bot: 'cli_fresh' },
+    { op: 'updateNode', nodeId: 'g', set: { humanGate: null } },
+  ];
+  const RERUN_SPENT = [{ op: 'rerunNode', nodeId: 'd' }];
+  const BENIGN = [{ op: 'updateNode', nodeId: 'g', set: { goal: 'g, as discussed' } }];
+
+  function applyEdit(patch: unknown, caller: { openId: string; origin: 'human' | 'runEvent' }, base = 2) {
+    return applyV3RunEdit({
+      baseDir, runId: RUN, patch, baseRevision: base, caller,
+      resolveNewBotSnapshot: (selector) => ({ larkAppId: selector, cliId: 'codex', workingDir: '/fresh' }) as never,
+    });
+  }
+  const lastRevision = () => readJournal(join(baseDir, RUN, 'journal.ndjson')).filter((event) => event.type === 'dagRevised').at(-1);
+
+  /** The three things only the initiator's own turn may do directly.
+   *  `prepare` seeds a fresh run (and whatever the turn needs on it). */
+  function expectMainBotGrade(caller: () => { openId: string; origin: 'human' | 'runEvent' }, prepare: () => void): void {
+    prepare();
+    expect(applyEdit(RISKY, caller())).toMatchObject({ kind: 'proposed', reasons: expect.arrayContaining(['newBot', 'gateRelaxed']) });
+    rmSync(join(baseDir, RUN), { recursive: true, force: true });
+    prepare();
+    expect(applyEdit(RERUN_SPENT, caller())).toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'd', tier: 'pair' } });
+    expect(applyEdit(BENIGN, caller())).toMatchObject({ kind: 'applied', revision: 3 });
+    expect(lastRevision()).toMatchObject({ revision: 3, by: 'main_bot', auto: expect.anything() });
+  }
+
+  const initiatorMessage = {
+    quoteTargetId: 'om_initiator_ack', lastCallerOpenId: INITIATOR,
+    currentReplyTarget: { turnId: 'om_initiator_ack', rootMessageId: BINDING.rootMessageId },
+  };
+  const relayAs = (liveTurnId: string, session: { callerOpenId?: string; quoteTargetId?: string; currentReplyTargetTurnId?: string }, extra: Record<string, unknown> = {}) => {
+    const decision = authorizeV3SessionRunEditRequest({
+      runId: RUN, mutation: 'edit',
+      raw: { sessionId: 'sess-main', originCapability: capability, patch: BENIGN, base: 2 },
+      trustedHost: false,
+      session: {
+        receiver: false, liveOrigin: { capability, turnId: liveTurnId, dispatchAttempt: 1 },
+        chatId: BINDING.chatId, larkAppId: BINDING.larkAppId, rootMessageId: BINDING.rootMessageId, ...session,
+      },
+      selfLarkAppId: BINDING.larkAppId, baseDir, ...extra,
+    });
+    if (!decision.ok || !decision.edit) throw new Error(`relay refused: ${JSON.stringify(decision)}`);
+    return decision.edit.caller;
+  };
+
+  const prepareWake = () => {
+    seedRiskRun();
+    issueWake(RUN, 2);
+  };
+
+  it('host: the initiator\'s queued message overtakes the wake turn — the wake turn still decides as the main bot', () => {
+    writeSession(initiatorMessage);
+    writeMarker(mintWorkflowEventTurnId(RUN, 2));
+    const caller = () => {
+      const authority = editAs();
+      return { openId: authority.callerOpenId, origin: authority.origin };
+    };
+    prepareWake();
+    expect(caller()).toEqual({ openId: INITIATOR, origin: 'runEvent' });
+    rmSync(join(baseDir, RUN), { recursive: true, force: true });
+    expectMainBotGrade(caller, prepareWake);
+  });
+
+  it('relay: the same', () => {
+    const caller = () => relayAs(mintWorkflowEventTurnId(RUN, 2), {
+      callerOpenId: INITIATOR, quoteTargetId: 'om_initiator_ack', currentReplyTargetTurnId: 'om_initiator_ack',
+    });
+    prepareWake();
+    expect(caller()).toEqual({ openId: INITIATOR, origin: 'runEvent' });
+    rmSync(join(baseDir, RUN), { recursive: true, force: true });
+    expectMainBotGrade(caller, prepareWake);
+  });
+
+  it('the initiator\'s own message opening the turn is the one case that applies all of it directly', () => {
+    seedRiskRun();
+    issueWake(RUN, 2);
+    writeSession(initiatorMessage);
+    writeMarker('om_initiator_ack');
+    const authority = editAs();
+    expect(authority).toMatchObject({ origin: 'human', callerOpenId: INITIATOR });
+    expect(applyEdit([...RISKY, ...RERUN_SPENT], { openId: authority.callerOpenId, origin: authority.origin }))
+      .toMatchObject({ kind: 'applied', revision: 3 });
+    expect(lastRevision()).toMatchObject({ by: INITIATOR, effects: { budgetGrants: [{ nodeId: 'd', tier: 'pair' }] } });
+    expect(lastRevision()).not.toHaveProperty('auto');
+  });
+
+  describe('a scheduled turn', () => {
+    const task = (ownerOpenId: string) => ({
+      id: 'task1', larkAppId: BINDING.larkAppId, chatId: BINDING.chatId, rootMessageId: BINDING.rootMessageId,
+      ownerOpenId, enabled: true, prompt: '每 30 分钟看一下 run，有失败就处理', schedule: '*/30 * * * *',
+    });
+    /** Host path: the CLI-side preflight reads the bot's schedules.json. */
+    const writeTask = (ownerOpenId: string) => {
+      const botHome = botHomePath(dirname(dataDir), BINDING.larkAppId);
+      mkdirSync(botHome, { recursive: true });
+      writeFileSync(join(botHome, 'schedules.json'), JSON.stringify({ task1: task(ownerOpenId) }));
+    };
+    const relaySchedule = (ownerOpenId: string) => () => relayAs(SCHEDULE_TURN, {}, {
+      loadScheduledTask: () => task(ownerOpenId), isScheduleOwnerAllowed: () => true,
+    });
+
+    it('host: of the initiator\'s task — decided by the main bot, not the initiator', () => {
+      writeTask(INITIATOR);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeMarker(SCHEDULE_TURN);
+      const caller = () => {
+        const authority = editAs();
+        return { openId: authority.callerOpenId, origin: authority.origin };
+      };
+      seedRiskRun();
+      expect(caller()).toEqual({ openId: INITIATOR, origin: 'runEvent' });
+      rmSync(join(baseDir, RUN), { recursive: true, force: true });
+      expectMainBotGrade(caller, seedRiskRun);
+    });
+
+    it('relay: the same', () => {
+      seedRiskRun();
+      expect(relaySchedule(INITIATOR)()).toEqual({ openId: INITIATOR, origin: 'runEvent' });
+      rmSync(join(baseDir, RUN), { recursive: true, force: true });
+      expectMainBotGrade(relaySchedule(INITIATOR), seedRiskRun);
+    });
+
+    it('of another member\'s task: that member\'s turn — every edit waits for the initiator', () => {
+      seedRiskRun();
+      writeTask(MEMBER);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeMarker(SCHEDULE_TURN);
+      const authority = editAs();
+      expect(authority).toMatchObject({ origin: 'human', callerOpenId: MEMBER });
+      expect(applyEdit(BENIGN, { openId: authority.callerOpenId, origin: authority.origin }))
+        .toMatchObject({ kind: 'proposed', reasons: ['callerNotInitiator'] });
+      rmSync(join(baseDir, RUN), { recursive: true, force: true });
+      seedRiskRun();
+      expect(applyEdit(BENIGN, relaySchedule(MEMBER)())).toMatchObject({ kind: 'proposed', reasons: ['callerNotInitiator'] });
+    });
   });
 });

@@ -138,6 +138,22 @@ describe('sidebar page', () => {
     act(() => forbidden.unmount());
   });
 
+  it('an edge into a node a pending change would add is drawn as pending, the others as usual', async () => {
+    const payload: WorkflowSidebarAdminPayload = {
+      ...adminPayload(),
+      view: view([node('a', [], { status: 'done' }), node('b', ['a'], { pendingChange: 'add' }), node('c', ['a'])]),
+    };
+    const r = await render(fetchOf(200, payload));
+    const layout = buildVerticalGraphLayout(payload.view, 360);
+    const drawn = r.root.findAll((el) => el.type === 'path' && typeof el.props.className === 'string' && el.props.className.split(' ').includes('v3r-edge'));
+    // Drawn in layout order (the page measures the same 360px container).
+    expect(drawn.map((el) => el.props.className.split(' ').includes('pending')))
+      .toEqual(layout.edges.map((edge) => edge.pending));
+    expect(layout.edges.some((edge) => edge.pending)).toBe(true);
+    expect(layout.edges.some((edge) => !edge.pending)).toBe(true);
+    act(() => r.unmount());
+  });
+
   it('fetches the sidebar data route for the target and maps member nodes for the graph', async () => {
     const seen: string[] = [];
     const result = await fetchWorkflowSidebar({ appId: 'cli_main', runId: 'run-1' }, async (input) => {

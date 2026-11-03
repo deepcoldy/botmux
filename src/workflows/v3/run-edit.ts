@@ -42,6 +42,7 @@ import {
   snapshotForSelector,
   v3CurrentExecutorApp,
   v3RevisionFollowUps,
+  v3RevisionInvolvedNodes,
   v3RevisionDigest,
   v3RevisionFilePaths,
   V3_DAG_REVISIONS_DIR,
@@ -148,6 +149,9 @@ export interface V3RevisionWait {
   resolvedAt?: number;
   by?: string;
   cardMessageIds?: string[];
+  /** Voided because a direct revision took effect first, but carried onto it
+   *  unchanged as this revision: a decision on this one goes there. */
+  carriedTo?: number;
 }
 
 export function v3RevisionWaitPath(runDir: string, revision: number): string {
@@ -186,6 +190,7 @@ function settleRevisionWaitOnce(
   revision: number,
   status: Exclude<V3RevisionWaitStatus, 'pending'>,
   by: string,
+  extra: Pick<V3RevisionWait, 'carriedTo'> = {},
 ): { wait: V3RevisionWait; changed: boolean } | undefined {
   const path = v3RevisionWaitPath(runDir, revision);
   if (!existsSync(path)) return undefined;
@@ -193,7 +198,7 @@ function settleRevisionWaitOnce(
     const wait = readV3RevisionWait(runDir, revision);
     if (!wait) return undefined;
     if (wait.status !== 'pending') return { wait, changed: false };
-    const next: V3RevisionWait = { ...wait, status, resolvedAt: Date.now(), by };
+    const next: V3RevisionWait = { ...wait, status, resolvedAt: Date.now(), by, ...extra };
     writeRevisionWait(runDir, next);
     return { wait: next, changed: true };
   });
@@ -283,6 +288,17 @@ export interface V3VoidedProposal {
   cardMessageIds: string[];
 }
 
+/** A pending proposal a direct revision did not overlap: it keeps waiting,
+ *  re-based onto that revision under the next number. Its card moves along:
+ *  `cardMessageIds` are the old card's messages to show `view` in place
+ *  (empty: post a new card). */
+export interface V3CarriedProposal {
+  fromRevision: number;
+  revision: number;
+  view: V3RevisionCardView;
+  cardMessageIds: string[];
+}
+
 export type V3RunEditOutcome =
   | {
       kind: 'applied';
@@ -290,7 +306,9 @@ export type V3RunEditOutcome =
       summary: string;
       changes: V3RevisionChanges;
       voidedGates: V3VoidedGate[];
+      /** Pending proposals this revision overlapped: no longer valid. */
       voidedProposals: V3VoidedProposal[];
+      carriedProposals: V3CarriedProposal[];
     }
   | {
       kind: 'proposed';
@@ -462,6 +480,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
         plan: V3RevisionPlan;
         reasons: V3RevisionConfirmReason[];
         voidedRevisions: Array<{ revision: number; reason: V3VoidedProposal['reason'] }>;
+        carried: CarriedInJournal[];
       };
 
   const locked = withJournalMutationSync(journalPath, ({ events, append }): Locked => {
@@ -533,19 +552,16 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
     const effects = remapAssignTargets(plan.effects, v3ApprovedBotScope(knownBots, newBots));
     const pending = effective.history.pending;
     const voidedRevisions: Array<{ revision: number; reason: V3VoidedProposal['reason'] }> = [];
+    const carried: CarriedInJournal[] = [];
     if (direct) {
-      // Rerun budget the initiator's own edit lifted: one more revisit each,
-      // recorded as theirs and tied to this revision (no grant card).
-      for (const grant of plan.budgetGrants) {
-        append({
-          type: 'revisitBudgetGranted',
-          ...(grant.tier === 'pair' ? { sourceNodeId: grant.nodeId, toNodeId: grant.nodeId } : {}),
-          by: actor,
-          reason: 'rerunNode',
-          revision,
-        }, { durable: true });
-      }
-      append({
+      const appended: StoredEvent[] = [];
+      const record = (event: Parameters<typeof append>[0]): void => {
+        appended.push(append(event, { durable: true }));
+      };
+      // Rerun budget the initiator's own edit lifted travels in the
+      // revision's own effects (`budgetGrants`, no grant card): one line, so
+      // a crash never leaves a lift without the revision that made it.
+      record({
         type: 'dagRevised',
         revision,
         baseRevision: effective.revision,
@@ -555,8 +571,8 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
         by: actor,
         ...auto,
         ...(Object.keys(effects).length > 0 ? { effects } : {}),
-      }, { durable: true });
-      for (const edge of plan.edges) append(edge, { durable: true });
+      });
+      for (const edge of plan.edges) record(edge);
       // Reassign / blocked re-run advance state through their dedicated
       // events, in this same lock (design §13.3).
       for (const followUp of v3RevisionFollowUps(events, {
@@ -564,16 +580,71 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
         assign: effects.assign,
         by: actor,
         ...autoOf(auto),
-      })) append(followUp, { durable: true });
+      })) record(followUp);
       if (pending) {
-        append({
-          type: 'dagRevisionRejected',
-          revision: pending.revision,
-          by: 'system',
-          reason: 'stale',
-          detail: `revision ${revision} took effect first`,
-        }, { durable: true });
-        voidedRevisions.push({ revision: pending.revision, reason: 'stale' });
+        // A pending proposal this revision does not overlap keeps waiting:
+        // re-based onto it under the next number, in this same lock (its
+        // touched nodes stay held without a gap). One it overlaps — or that
+        // no longer means exactly what its card showed — is void.
+        const next = revision + 1;
+        let carry: ReturnType<typeof carryPendingProposal> = { ok: false };
+        let carriedWritten: WrittenRevision | undefined;
+        try {
+          carry = carryPendingProposal({
+            run,
+            pending,
+            before: { events, snap, effective, knownBots },
+            direct: { plan, revision, events: [...events, ...appended], knownBots: v3ApprovedBotScope(knownBots, newBots) },
+          });
+          if (carry.ok) {
+            carriedWritten = writeRevisionFiles(runDir, next, {
+              dag: carry.plan.dag,
+              patch: carry.patch,
+              baseRevision: revision,
+              by: pending.by,
+              newBots: carry.newBots,
+            });
+          }
+        } catch {
+          // The direct revision is already journaled: a carry that cannot
+          // be prepared falls back to voiding the proposal, never to failing.
+          carry = { ok: false };
+        }
+        if (carry.ok && carriedWritten) {
+          append({
+            type: 'dagRevisionRejected',
+            revision: pending.revision,
+            by: 'system',
+            reason: 'superseded',
+            detail: `revision ${revision} took effect first; carried onto it as ${next}`,
+          }, { durable: true });
+          append({
+            type: 'dagRevisionProposed',
+            revision: next,
+            baseRevision: revision,
+            ...carriedWritten,
+            summary: carry.plan.summary,
+            ...(pending.note ? { note: pending.note } : {}),
+            by: pending.by,
+            ...(pending.auto ? { auto: pending.auto } : {}),
+            reasons: [...(pending.reasons ?? [])],
+            touched: carry.plan.touched,
+          }, { durable: true });
+          carried.push({
+            fromRevision: pending.revision,
+            revision: next,
+            view: cardView(next, revision, carry.plan, [...(pending.reasons ?? [])], pending.note, pending.by),
+          });
+        } else {
+          append({
+            type: 'dagRevisionRejected',
+            revision: pending.revision,
+            by: 'system',
+            reason: 'stale',
+            detail: `revision ${revision} took effect first`,
+          }, { durable: true });
+          voidedRevisions.push({ revision: pending.revision, reason: 'stale' });
+        }
       }
     } else {
       if (pending) {
@@ -599,7 +670,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
         touched: plan.touched,
       }, { durable: true });
     }
-    return { kind: 'committed', direct, revision, baseRevision: effective.revision, plan, reasons, voidedRevisions };
+    return { kind: 'committed', direct, revision, baseRevision: effective.revision, plan, reasons, voidedRevisions, carried };
   });
 
   if (locked.kind !== 'committed') return locked;
@@ -614,6 +685,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
       changes: locked.plan.changes,
       voidedGates: voidGateWaits(runDir, locked.plan.effects),
       voidedProposals,
+      carriedProposals: locked.carried.map((item) => moveProposalWait(runDir, input.runId, run, item)),
     };
   }
   const view = cardView(
@@ -643,6 +715,119 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
     ...(run.binding ? { binding: run.binding } : {}),
     voidedProposals,
   };
+}
+
+/** A proposal the journal carried onto a direct revision (see
+ *  {@link carryPendingProposal}); its wait moves after the lock. */
+interface CarriedInJournal {
+  fromRevision: number;
+  revision: number;
+  view: V3RevisionCardView;
+}
+
+/** The turn class a proposal was filed in, read back from who filed it. */
+function proposalTurnClass(by: string, initiatorOpenId: string | undefined): V3RunEditTurnClass {
+  if (by === 'main_bot') return 'runEvent';
+  return initiatorOpenId !== undefined && by === initiatorOpenId ? 'initiator' : 'other';
+}
+
+function dagFileBytes(dag: V3Dag): Buffer {
+  return Buffer.from(`${JSON.stringify(dag, null, 2)}\n`, 'utf-8');
+}
+
+function sameReasons(a: readonly V3RevisionConfirmReason[], b: readonly V3RevisionConfirmReason[]): boolean {
+  return a.length === b.length && a.every((reason) => b.includes(reason));
+}
+
+/**
+ * Inside the journal lock, right after a direct revision was appended: may
+ * the pending proposal keep waiting on top of it? Only when the two involve
+ * disjoint nodes ({@link v3RevisionInvolvedNodes}) and the proposal, re-based
+ * onto the new flow, still means exactly what its card shows — the same
+ * changes and the same confirmation reasons for the turn that filed it.
+ * Anything else voids it, as before.
+ */
+function carryPendingProposal(input: {
+  run: LoadedEditableRun;
+  pending: V3RevisionRecord;
+  /** The flow and journal the proposal was filed against. */
+  before: {
+    events: readonly StoredEvent[];
+    snap: V3RunSnapshot;
+    effective: { dag: V3Dag };
+    knownBots: ReadonlyMap<string, BotSnapshot>;
+  };
+  /** The direct revision just appended, and the journal including it. */
+  direct: {
+    plan: V3RevisionPlan;
+    revision: number;
+    events: readonly StoredEvent[];
+    knownBots: ReadonlyMap<string, BotSnapshot>;
+  };
+}): { ok: true; plan: V3RevisionPlan; patch: V3DagPatch; newBots: Map<string, BotSnapshot> } | { ok: false } {
+  const { run, pending, before, direct } = input;
+  const pinned = readPinnedProposal(run, pending);
+  if (!pinned.ok) return { ok: false };
+  const shown = planV3DagRevision({
+    dag: before.effective.dag,
+    approvedDag: run.approvedDag,
+    events: before.events,
+    snap: before.snap,
+    patch: pinned.patch,
+    knownBots: before.knownBots,
+  });
+  if (!shown.ok || v3RevisionDigest(dagFileBytes(shown.plan.dag)) !== pending.sha256) return { ok: false };
+  const ours = v3RevisionInvolvedNodes(direct.plan);
+  for (const nodeId of v3RevisionInvolvedNodes(shown.plan)) if (ours.has(nodeId)) return { ok: false };
+  const rebased = planV3DagRevision({
+    dag: direct.plan.dag,
+    approvedDag: run.approvedDag,
+    events: direct.events,
+    snap: materialize([...direct.events]),
+    patch: pinned.patch,
+    knownBots: direct.knownBots,
+  });
+  if (!rebased.ok) return { ok: false };
+  const reasons = v3ConfirmReasonsForTurn(proposalTurnClass(pending.by, run.initiatorOpenId), rebased.plan.reasons);
+  if (!sameReasons(reasons, pending.reasons ?? [])) return { ok: false };
+  if (JSON.stringify(rebased.plan.changes) !== JSON.stringify(shown.plan.changes)) return { ok: false };
+  return { ok: true, plan: rebased.plan, patch: pinned.patch, newBots: pinned.newBots };
+}
+
+/**
+ * After the lock: the carried revision gets its wait first, then the old wait
+ * is voided pointing at it — from then on a decision clicked on the old card
+ * is taken for the carried revision. Only when that compare-and-set wins does
+ * the carried revision take over the old card's messages (read from the very
+ * state the CAS replaced), so its card is shown in place. If a click had
+ * already decided the old wait, that card shows the click's outcome and the
+ * carried revision gets a card of its own. A failed write here is healed by
+ * cold attach (a pending proposal without a wait is recreated and re-posted).
+ */
+function moveProposalWait(
+  runDir: string,
+  runId: string,
+  run: LoadedEditableRun,
+  item: CarriedInJournal,
+): V3CarriedProposal {
+  const out: V3CarriedProposal = { ...item, cardMessageIds: [] };
+  try {
+    writeRevisionWait(runDir, {
+      runId,
+      revision: item.revision,
+      status: 'pending',
+      ...(run.initiatorOpenId ? { initiatorOpenId: run.initiatorOpenId } : {}),
+      view: item.view,
+      createdAt: Date.now(),
+    });
+    const moved = settleRevisionWaitOnce(runDir, item.fromRevision, 'voided', 'system', { carriedTo: item.revision });
+    const inherited = moved?.changed ? moved.wait.cardMessageIds ?? [] : [];
+    for (const messageId of inherited) recordV3RevisionCardMessage(runDir, item.revision, messageId);
+    return { ...out, cardMessageIds: inherited };
+  } catch {
+    // See above: cold attach heals the wait; the daemon posts a fresh card.
+    return out;
+  }
 }
 
 /** The patch file pins the ops plus provenance; only `{ ops, note }` is the
@@ -721,6 +906,28 @@ function settleProposalInJournal(
   });
 }
 
+/** A proposal's pinned patch and new-bot sidecar, digest-verified. */
+function readPinnedProposal(
+  run: LoadedEditableRun,
+  record: Pick<V3RevisionRecord, 'revision' | 'patchSha256' | 'botsSha256'>,
+): { ok: true; patch: V3DagPatch; newBots: Map<string, BotSnapshot> } | { ok: false; detail: string } {
+  const paths = v3RevisionFilePaths(run.runDir, record.revision);
+  try {
+    const patchBytes = readFileSync(paths.patch);
+    if (v3RevisionDigest(patchBytes) !== record.patchSha256) return { ok: false, detail: 'patch file digest mismatch' };
+    const patch = parsePinnedPatch(patchBytes);
+    let newBots = new Map<string, BotSnapshot>();
+    if (record.botsSha256) {
+      const botBytes = readFileSync(paths.bots);
+      if (v3RevisionDigest(botBytes) !== record.botsSha256) return { ok: false, detail: 'bot snapshot digest mismatch' };
+      newBots = new Map(Object.entries(JSON.parse(botBytes.toString('utf-8')) as Record<string, BotSnapshot>));
+    }
+    return { ok: true, patch, newBots };
+  } catch (err) {
+    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 /** Re-run the proposal's pinned patch against the flow and node states as
  *  they are NOW. The resulting DAG must be byte-identical to what the
  *  initiator was shown; effects (what to stop/re-gate) are recomputed. */
@@ -742,20 +949,9 @@ function replanProposal(
     return { ok: false, detail: `flow moved to revision ${effective.revision}` };
   }
   const paths = v3RevisionFilePaths(run.runDir, record.revision);
-  let patch: V3DagPatch;
-  let newBots = new Map<string, BotSnapshot>();
-  try {
-    const patchBytes = readFileSync(paths.patch);
-    if (v3RevisionDigest(patchBytes) !== record.patchSha256) return { ok: false, detail: 'patch file digest mismatch' };
-    patch = parsePinnedPatch(patchBytes);
-    if (record.botsSha256) {
-      const botBytes = readFileSync(paths.bots);
-      if (v3RevisionDigest(botBytes) !== record.botsSha256) return { ok: false, detail: 'bot snapshot digest mismatch' };
-      newBots = new Map(Object.entries(JSON.parse(botBytes.toString('utf-8')) as Record<string, BotSnapshot>));
-    }
-  } catch (err) {
-    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
-  }
+  const pinned = readPinnedProposal(run, record);
+  if (!pinned.ok) return pinned;
+  const { patch, newBots } = pinned;
   const knownBots = v3ApprovedBotScope(run.frozenBots, effective.botAdditions);
   const planned = planV3DagRevision({
     dag: effective.dag,
@@ -766,7 +962,7 @@ function replanProposal(
     knownBots,
   });
   if (!planned.ok) return { ok: false, detail: planned.problems.join('; ') };
-  const dagBytes = Buffer.from(`${JSON.stringify(planned.plan.dag, null, 2)}\n`, 'utf-8');
+  const dagBytes = dagFileBytes(planned.plan.dag);
   if (v3RevisionDigest(dagBytes) !== record.sha256) {
     return { ok: false, detail: 'the proposal no longer produces the flow that was shown' };
   }
@@ -790,7 +986,7 @@ export function decideV3RevisionProposal(input: {
   revision: number;
   decision: 'approve' | 'reject';
   by: string;
-}): V3RevisionDecisionOutcome {
+}, hops = 0): V3RevisionDecisionOutcome {
   let run: LoadedEditableRun;
   try {
     run = loadEditableRun(input.baseDir, input.runId);
@@ -808,6 +1004,12 @@ export function decideV3RevisionProposal(input: {
   );
   if (!settled) return { kind: 'missing' };
   if (!settled.changed) {
+    // Carried, unchanged, onto a direct revision that took effect first: the
+    // click on the old card is a decision on what it showed, i.e. on the
+    // carried revision (bounded: a proposal is carried once per revision).
+    if (settled.wait.status === 'voided' && settled.wait.carriedTo !== undefined && hops < 16) {
+      return decideV3RevisionProposal({ ...input, revision: settled.wait.carriedTo }, hops + 1);
+    }
     return { kind: 'already-decided', revision: input.revision, status: settled.wait.status, view: settled.wait.view };
   }
   return finishDecision(run, input.revision, input.decision, input.by, settled.wait.view);

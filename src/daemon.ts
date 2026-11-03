@@ -781,7 +781,9 @@ import {
   postV3RerunGrantCardOnce,
   projectV3RunStatus,
   v3RunNeedsDriveAfterRevision,
+  readV3RevisionWait,
   recordV3RevisionCardMessage,
+  type V3CarriedProposal,
   type V3RevisionCardView,
   type V3VoidedGate,
   type V3VoidedProposal,
@@ -8045,9 +8047,14 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
   switch (outcome.kind) {
     case 'applied':
       void freezeV3RevisionArtifacts(binding, runId, outcome.voidedGates, outcome.voidedProposals);
+      void moveV3RevisionCards(binding, runId, outcome.carriedProposals);
       if (v3RunNeedsDriveAfterRevision(v3DefaultBaseDir(), runId)) v3GateRunner.driveDetached(runId);
       return reply(200, {
         ok: true, kind: 'applied', runId, revision: outcome.revision, summary: outcome.summary, changes: outcome.changes,
+        // So the agent can tell the user which pending changes this one
+        // voided, and which keep waiting under a new number.
+        voidedProposals: outcome.voidedProposals.map((item) => ({ revision: item.revision, reason: item.reason })),
+        carriedProposals: outcome.carriedProposals.map((item) => ({ from: item.fromRevision, revision: item.revision })),
       });
     case 'proposed': {
       void freezeV3RevisionArtifacts(binding, runId, [], outcome.voidedProposals);
@@ -8173,6 +8180,37 @@ async function postV3RevisionCard(
   try {
     recordV3RevisionCardMessage(join(v3DefaultBaseDir(), runId), view.revision, messageId);
   } catch { /* best effort */ }
+}
+
+/** A pending proposal carried onto a direct revision keeps its card: show
+ *  the carried revision in the old card's messages; post a new card when
+ *  there is none to reuse (or none could be updated). Never throws. */
+async function moveV3RevisionCards(
+  binding: import('./workflows/v3/grill-state.js').RunChatBinding,
+  runId: string,
+  carried: readonly V3CarriedProposal[],
+): Promise<void> {
+  for (const item of carried) {
+    // A click on the old card may already have decided it; that click's
+    // reply rendered the outcome there — do not put the buttons back.
+    let wait;
+    try { wait = readV3RevisionWait(join(v3DefaultBaseDir(), runId), item.revision); } catch { wait = undefined; }
+    if (wait && wait.status !== 'pending') continue;
+    const card = buildV3RevisionCard({ runId, view: item.view });
+    let shown = false;
+    for (const messageId of item.cardMessageIds) {
+      try {
+        await updateMessage(binding.larkAppId, messageId, card);
+        shown = true;
+      } catch (err) {
+        logger.warn(`[v3:${runId}] move revision card failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (shown) continue;
+    await postV3RevisionCard(binding, item.view, runId).catch((err: unknown) => {
+      logger.warn(`[v3:${runId}] carried revision card failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
 }
 
 /** Freeze gate cards a revision voided (「流程已修改，本次审批作废」) and

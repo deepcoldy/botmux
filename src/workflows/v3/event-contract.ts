@@ -98,6 +98,12 @@ export interface V3RevisionEffects {
   regate?: Array<{ nodeId: string; instanceId: string }>;
   /** Done nodes re-run with Revisit semantics; each consumes revisit budget. */
   rerun?: string[];
+  /** Revisit budget the initiator's own edit lifted for its re-runs (M2 乙):
+   *  each entry is one more revisit, counted exactly like a
+   *  `revisitBudgetGranted` (`pair` = that node onto itself, `run` =
+   *  run-wide) and attributed to this revision's `by`. In this event, never
+   *  a separate line, so a crash cannot leave a lift without its revision. */
+  budgetGrants?: Array<{ nodeId: string; tier: 'pair' | 'run' }>;
   /** RECORD ONLY: blocked nodes re-run by this revision. State advances
    *  through the `nodeRetryRequested` written in the same lock; replay never
    *  applies this list, reconciliation re-appends a lost retry from it. */
@@ -429,10 +435,6 @@ export type V3Event =
       toNodeId?: string;
       by: string;
       reason?: string;
-      /** Granted by the initiator inside their own runtime edit that took
-       *  effect as this revision (its `rerunNode` found the budget spent,
-       *  M2 乙) — not on a grant card. */
-      revision?: number;
     }
   | { type: 'loopStarted'; loopId: string }
   | { type: 'loopIterationStarted'; loopId: string; iteration: number }

@@ -67,6 +67,20 @@ describe('workflow edit responses', () => {
     expect(conflict.exitCode).not.toBe(0);
     expect(invalid.text).toContain('p1');
   });
+
+  it('an applied edit names every pending change it voided and every one it carried onto a new version', () => {
+    const mentions = (line: string, revision: number) => new RegExp(`(^|\\D)${revision}(\\D|$)`).test(line);
+    const plain = respond(200, { ok: true, kind: 'applied', revision: 5, summary: '改 1 节点' }).text.split('\n');
+    const out = respond(200, {
+      ok: true, kind: 'applied', revision: 5, summary: '改 1 节点',
+      voidedProposals: [{ revision: 3, reason: 'stale' }], carriedProposals: [{ from: 4, revision: 6 }],
+    });
+    expect(out.exitCode).toBe(0);
+    const extra = out.text.split('\n').slice(plain.length);
+    expect(extra).toHaveLength(2);
+    expect(extra.filter((line) => mentions(line, 3))).toHaveLength(1);
+    expect(extra.filter((line) => mentions(line, 4) && mentions(line, 6))).toHaveLength(1);
+  });
 });
 
 describe('confirmation card', () => {

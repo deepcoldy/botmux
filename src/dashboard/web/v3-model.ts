@@ -506,6 +506,58 @@ export function nodeRevisionBadge(node: RunNodeView): string | undefined {
   return undefined;
 }
 
+/** One-character form of {@link nodeRevisionBadge} for a box too narrow for
+ *  the full badge (the box styling still tells add / remove / change apart). */
+function nodeRevisionMark(node: RunNodeView): string | undefined {
+  if (node.pendingChange) return '待';
+  if (node.revisionMark === 'added') return '新';
+  if (node.revisionMark === 'changed') return '改';
+  return undefined;
+}
+
+/** Text geometry of a plain node box's first line: the id at `inset`, the
+ *  badge right-aligned `badgeInset` from the edge. Width estimates are upper
+ *  bounds: the id is 12px monospace (0.6em per character); the badge is 10px,
+ *  CJK at 1em and anything else at most 0.6em. */
+export const V3_NODE_HEADING = {
+  inset: 14,
+  badgeInset: 10,
+  gap: 6,
+  idCharPx: 7.2,
+  /** Below this many id characters beside the full badge, use the short one. */
+  minIdChars: 8,
+} as const;
+
+function badgeWidthPx(text: string): number {
+  let px = 0;
+  for (const ch of text) px += /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/.test(ch) ? 10 : 6;
+  return px;
+}
+
+/**
+ * The first line of a node box: how many id characters fit, and which badge
+ * goes beside them. The id gets whatever the box width leaves after the
+ * badge, so the two never overlap; when the full badge would squeeze the id
+ * below a readable share, a one-character mark replaces it and the full text
+ * moves to the node's tooltip. `plainIdChars` is the id budget without a badge.
+ */
+export function nodeBoxHeading(
+  node: RunNodeView,
+  boxWidth: number,
+  plainIdChars: number,
+): { idChars: number; badge?: string; badgeTitle?: string } {
+  const full = nodeRevisionBadge(node);
+  if (!full) return { idChars: plainIdChars };
+  const H = V3_NODE_HEADING;
+  const room = (badge: string) =>
+    Math.floor((boxWidth - H.inset - H.badgeInset - H.gap - badgeWidthPx(badge)) / H.idCharPx);
+  if (room(full) >= Math.min(node.id.length, H.minIdChars)) {
+    return { idChars: Math.max(1, Math.min(plainIdChars, room(full))), badge: full };
+  }
+  const short = nodeRevisionMark(node) ?? full;
+  return { idChars: Math.max(1, Math.min(plainIdChars, room(short))), badge: short, badgeTitle: full };
+}
+
 export const V3_REVISION_ROLE_LABEL: Record<NonNullable<RunView['revision']>['history'][number]['by'], string> = {
   mainBot: '主 Bot',
   initiator: '发起人',

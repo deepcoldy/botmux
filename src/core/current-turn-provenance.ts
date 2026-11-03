@@ -61,6 +61,15 @@ export interface CurrentTurnProvenance {
    * that the caller's run-bound verifier accepted. Never from env/argv.
    */
   workflowRunEvent?: { runId: string };
+  /**
+   * Set when the process marker is a `workflow-event:<runId>:<seq>` turn that
+   * a newer inbound message overtook, so the request was authenticated as
+   * that message's turn instead (identity = its sender). The CLI still runs
+   * inside the wake turn: the main bot, not that sender, decided what this
+   * request does — a consumer that grades "the caller's own turn" must not
+   * count it as one (design §13.1).
+   */
+  overtakenWorkflowRunEvent?: { runId: string };
 }
 
 export class CurrentTurnProvenanceError extends Error {
@@ -200,13 +209,18 @@ export function resolveCurrentTurnProvenance(
     });
     if (!verdict.ok) {
       // A newer inbound message overtook the wake turn (folded into it, or
-      // queued behind it). The request now belongs to that message's sender:
-      // authenticate it exactly as a command of that turn would be — the
-      // initiator's own message keeps the edit direct, anyone else's makes it
-      // a proposal (M1) — rather than failing a request the human just made.
+      // queued behind it). The request now runs as that message's sender:
+      // authenticate it exactly as a command of that turn would be, rather
+      // than failing a request the human may just have made — but mark it,
+      // because the marker is still the wake turn and the model there acts
+      // on its own: a runtime edit grades it as the main bot's turn when the
+      // sender is the initiator, and as that member's turn otherwise (M1).
       const overtaking = session.quoteTargetId;
       if (verdict.stale && nonEmpty(overtaking) && isInboundMessageTurnId(overtaking)) {
-        return authenticateHumanTurn(marker.sessionId, overtaking, session);
+        return {
+          ...authenticateHumanTurn(marker.sessionId, overtaking, session),
+          overtakenWorkflowRunEvent: { runId: workflowEvent.runId },
+        };
       }
       throw new CurrentTurnProvenanceError(`workflow 事件回合校验失败：${verdict.reason}`);
     }

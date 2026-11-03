@@ -29,7 +29,9 @@ import {
   resolveLoopTerminalNode,
   trunc,
   v3RunIdFromHash,
+  nodeBoxHeading,
   nodeRevisionBadge,
+  V3_NODE_HEADING,
   V3_REVISION_ROLE_LABEL,
   V3_REVISION_STATE_LABEL,
 } from './v3-model.js';
@@ -426,18 +428,19 @@ export function DagNode(props: {
     return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} />;
   }
   const botLine = nodeBotLine(node);
-  const badge = nodeRevisionBadge(node);
   const fit = boxTextFit(box.width);
+  const heading = nodeBoxHeading(node, box.width, fit(22));
   return (
     <g
       className={`v3r-node st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}${node.pendingChange ? ` pending pending-${node.pendingChange}` : ''}${node.revisionMark ? ` rev-${node.revisionMark}` : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
     >
+      {heading.badgeTitle ? <title>{heading.badgeTitle}</title> : null}
       <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.plainHeight} rx="10" />
-      <text className="v3r-nid" x={box.x + 14} y={box.y + 20}>{trunc(node.id, fit(badge ? 14 : 22))}</text>
-      {badge ? (
-        <text className="v3r-nrev" x={box.x + box.width - 10} y={box.y + 20} textAnchor="end">{badge}</text>
+      <text className="v3r-nid" x={box.x + V3_NODE_HEADING.inset} y={box.y + 20}>{trunc(node.id, heading.idChars)}</text>
+      {heading.badge ? (
+        <text className="v3r-nrev" x={box.x + box.width - V3_NODE_HEADING.badgeInset} y={box.y + 20} textAnchor="end">{heading.badge}</text>
       ) : null}
       <text className={`v3r-nbot${botLine ? '' : ' empty'}`} x={box.x + 14} y={box.y + 38}>
         {botLine ? trunc(botLine, fit(24)) : '—'}

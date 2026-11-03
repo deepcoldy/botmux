@@ -734,6 +734,50 @@ describe('after a blocked-card 改派, flow edits and status see who executes th
     expect(journalOf(run.runDir).slice(before).some((event) => event.type === 'nodeReassigned' || event.type === 'dagRevised')).toBe(false);
     expect(run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)).toBe(running);
   });
+
+  // One patch naming the same node several times: only the net move counts,
+  // measured from where the node ran when the patch began.
+  it('several reassigns of one node in a patch: the last target wins, "from" is where it ran before the patch', async () => {
+    const run = await blockedBotRun('rs-multi');
+    await run.click(OWNER, 'cli_b');
+    expect(editRun(run.base, run.runId, [
+      { op: 'reassign', nodeId: 'write', bot: 'cli_a' },
+      { op: 'reassign', nodeId: 'write', bot: 'cli_c' },
+    ], 1)).toMatchObject({ kind: 'applied', changes: { reassigned: [{ nodeId: 'write', from: 'cli_b', to: 'cli_c' }] } });
+    expect(reassignedEvents(run.runDir).at(-1)).toMatchObject({ from: 'cli_b', to: 'cli_c' });
+    expect(statusBot(run)).toBe('cli_c');
+  });
+
+  it('moving a node away and back to where it already runs, in one patch, is no move', async () => {
+    const run = await blockedBotRun('rs-roundtrip');
+    // Before any 改派: away and back to the bot its definition names.
+    expect(editRun(run.base, run.runId, [
+      { op: 'reassign', nodeId: 'write', bot: 'cli_b' },
+      { op: 'reassign', nodeId: 'write', bot: 'cli_a' },
+    ], 1)).toMatchObject({ kind: 'invalid' });
+    expect(statusBot(run)).toBe('cli_a');
+    await run.click(OWNER, 'cli_b');
+    // Back to its definition's bot first, then to where it runs now: the
+    // node stays on cli_b (the last op's target).
+    const before = journalOf(run.runDir).length;
+    expect(editRun(run.base, run.runId, [
+      { op: 'reassign', nodeId: 'write', bot: 'cli_a' },
+      { op: 'reassign', nodeId: 'write', bot: 'cli_b' },
+    ], 1)).toMatchObject({ kind: 'invalid' });
+    expect(journalOf(run.runDir).slice(before).some((event) => event.type === 'nodeReassigned' || event.type === 'dagRevised')).toBe(false);
+    expect(statusBot(run)).toBe('cli_b');
+    // A running turn is not stopped by a round trip either.
+    await run.runner.drive(run.runId);
+    const running = run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)!;
+    expect(running).toMatchObject({ targetLarkAppId: 'cli_b' });
+    expect(editRun(run.base, run.runId, [
+      { op: 'reassign', nodeId: 'write', bot: 'cli_c' },
+      { op: 'reassign', nodeId: 'write', bot: 'cli_b' },
+    ], 1)).toMatchObject({ kind: 'invalid' });
+    await run.runner.drive(run.runId);
+    expect(run.executor.stops).toEqual([]);
+    expect(run.executor.dispatches.filter((req) => req.nodeId === 'write').at(-1)).toBe(running);
+  });
 });
 
 describe('改派 hardening — windows around the chat grant', () => {
