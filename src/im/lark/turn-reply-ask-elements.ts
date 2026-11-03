@@ -7,6 +7,9 @@ import { askOptionLayoutForBot } from './ask-option-layout.js';
 const safe = (text: string) => text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
   .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+const INLINE_DESCRIPTION_MAX_CHARS = 400;
+const INLINE_DESCRIPTIONS_TOTAL_CHARS = 2_000;
+
 /** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0. */
 export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 'zh'): Array<Record<string, any>> {
   const { ask } = entry;
@@ -14,6 +17,13 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   const textReplyRequired = ask.questions.some(q => q.inputMode === 'text');
   const submit = textReplyRequired || ask.questions.length > 1 || ask.questions.some(q => q.multiSelect || q.defaultSelectedKeys !== undefined);
   const elements: Array<Record<string, any>> = [];
+  let descriptionCharsLeft = INLINE_DESCRIPTIONS_TOTAL_CHARS;
+  const inlineDescription = (text: string) => {
+    const cap = Math.min(INLINE_DESCRIPTION_MAX_CHARS, descriptionCharsLeft);
+    if (cap <= 0) return '';
+    descriptionCharsLeft -= Math.min(text.length, cap);
+    return text.length <= cap ? text : `${text.slice(0, cap)}…`;
+  };
   const button = (label: string, value: Record<string, string>, type = 'default') => ({
     tag: 'button', text: { tag: 'plain_text', content: label }, type,
     behaviors: [{ type: 'callback', value: { ...value, ask_id: ask.askId, nonce: ask.nonce } }],
@@ -29,9 +39,23 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   });
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   ask.questions.forEach((q, i) => {
-    elements.push({ tag: 'markdown', content: safe(textReplyRequired && q.options.length
-      ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt) });
+    // 显式 `botmux ask --mention` 的点名（daemon 已剔除 bot open_id）：嵌入
+    // turn-reply 卡时同样要保留真实 <at>，不能走 safe()——safe 会把 at 抹成
+    // [mention]，通知触达丢失。仅第一问前注入一次。
+    const mentionPrefix = i === 0 && ask.mentionedOpenId
+      ? `<at id=${ask.mentionedOpenId}></at>\n`
+      : '';
+    const described = q.options.map(option => ({ option, description: option.description?.trim()
+      ? inlineDescription(option.description.trim()) : '' })).filter(item => item.description);
+    const choices = q.options.map(option => {
+      const description = described.find(item => item.option === option)?.description;
+      return description ? `${option.label}：${description}` : option.label;
+    }).join('\n');
+    const prompt = textReplyRequired && q.options.length
+      ? `${q.prompt}\n\n${choices}` : q.prompt;
+    elements.push({ tag: 'markdown', content: `${mentionPrefix}${safe(prompt)}` });
     if (textReplyRequired) return; // Keep the batch intact; answer it with one text reply.
+
     const selected = new Set(ask.selections?.[i] ?? []);
     const buttons = q.options.map(option => ({
       ...button(option.label,
@@ -44,6 +68,15 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
       for (const b of buttons) elements.push(verticalRow(b));
     } else {
       for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
+    }
+    // 选项详细说明（Claude Code AskUserQuestion options[].description）：按钮无副标题，
+    // 在按钮行下用小字列出。safe() 已做转义，这里仅按 label 加粗。缺省不渲染。
+    if (described.length) {
+      elements.push({
+        tag: 'markdown',
+        text_size: 'notation',
+        content: described.map(({ option, description }) => `**${safe(option.label)}**：${safe(description)}`).join('\n'),
+      });
     }
   });
   if (submit && !textReplyRequired) {

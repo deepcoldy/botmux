@@ -85,6 +85,13 @@ function optionButton(key: string) {
   ).find((element: any) => element.behaviors?.some((behavior: any) =>
     ['ask_select', 'ask_toggle'].includes(behavior.value?.action) && behavior.value?.key === key));
 }
+
+function inlineAskWithQuestions(questions: PendingAsk['questions']): Parameters<typeof buildTurnReplyAskElements>[0] {
+  return { ask: {
+    askId: 'ask-inline', nonce: 'nonce-inline', larkAppId: 'app', chatId: 'oc_chat', rootMessageId: 'om_root',
+    sessionId: 'sid', questions, createdAt: 1_000, deadlineAt: 61_000, settled: false,
+  } };
+}
 async function click(snapshot: PendingAsk, value: Record<string, string>, by = 'ou_owner', messageId = 'om_reply') {
   const response = await handleAskCardAction({
     operator: { open_id: by }, context: { open_message_id: messageId },
@@ -376,6 +383,36 @@ describe('Ask inside the running reply card', () => {
 // ─── 内嵌 ask 的 askOptionLayout 受控（PR #1587 评审建议同批项） ─────────────
 // unified/final-only 模式下 ask 内嵌在实时回复卡（Card JSON 2.0，独立渲染路径），
 // 必须与独立卡读同一个 per-bot 布局配置。
+describe('buildTurnReplyAskElements — 选项说明', () => {
+  it('混合 choice/input 批次在文字作答视图保留 choice descriptions', () => {
+    const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
+      { prompt: '发布方式', multiSelect: false, options: [
+        { key: 'gray', label: '灰度', description: '先放 5% 流量观察' },
+        { key: 'full', label: '全量', description: '立即放开所有流量' },
+      ] },
+      { prompt: '补充说明', multiSelect: false, options: [], inputMode: 'text' },
+    ]));
+    const blob = JSON.stringify(elements);
+    expect(blob).toContain('灰度：先放 5% 流量观察');
+    expect(blob).toContain('全量：立即放开所有流量');
+    expect(blob).not.toContain('ask_select');
+  });
+
+  it('把每条 inline description 截到展示上限，避免合法载荷挤爆卡片预算', () => {
+    const marker = 'TAIL-MARKER';
+    const description = `${'详'.repeat(900)}${marker}`;
+    const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
+      { prompt: '选择', multiSelect: true, options: Array.from({ length: 10 }, (_, i) => (
+        { key: `k${i}`, label: `选项 ${i}`, description }
+      )) },
+    ]));
+    const blob = JSON.stringify(elements);
+    expect(blob).toContain(`${'详'.repeat(400)}…`);
+    expect(blob).not.toContain(marker);
+    expect(Buffer.byteLength(blob, 'utf8')).toBeLessThan(15_000);
+  });
+});
+
 describe('buildTurnReplyAskElements — askOptionLayout 受控', () => {
   function makeInlineAsk(): any {
     return {

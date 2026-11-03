@@ -16720,7 +16720,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, AskArgsError } =
+  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -16739,6 +16739,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const answererOpenId = argValue(rest, '--answerer');
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
+  const mentionRaw = argValue(rest, '--mention');
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
   const positionalArgs = positionals(rest, ['--json', '--multi']);
@@ -16746,6 +16747,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   let options;
   let questions;
   let timeoutMs;
+  let mentionedOpenId;
   try {
     if (rest.some(a => a === '--answerer' || a.startsWith('--answerer='))
       && (!answererOpenId || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(answererOpenId))) {
@@ -16762,6 +16764,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       questions = parseAskQuestionsFile(raw);
     } else options = parseAskOptions(optionsRaw);
     timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
+    mentionedOpenId = parseAskMention(mentionRaw);
   } catch (err) {
     if (err instanceof AskArgsError) {
       console.error(`botmux ask: ${err.message}`);
@@ -16808,6 +16811,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
       : {}),
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
+    // `botmux ask --mention <open_id>`：daemon 在卡片问题正文前注入真实 <at>，
+    // 让被点名者收到通知（卡片本身不像回复消息天然带 @）。bot open_id 由
+    // daemon 侧识别剔除，避免飞书卡片 100290。
+    ...(mentionedOpenId ? { mentionedOpenId } : {}),
   };
 
   const protectAskWait = () => {
