@@ -1,6 +1,6 @@
 # Workflow v3：节点改由群里的 Bot 接力执行（设计）
 
-状态：D1–D8 已由维护者确认（D2 有修改）。新增的三项要求（交接落点由主 Bot 决定、按需进入工作流编排、运行中动态修改）里冒出的新选择列在 0.3：涉及身份、权限、审批边界的，等维护者确认后再实现；其余按推荐实施。
+状态：D1–D8 已由维护者确认（D2 有修改）。新增的三项要求（交接落点由主 Bot 决定、按需进入工作流编排、运行中动态修改）里冒出的新选择列在 0.3，已全部定下：N3、M1、M2 按推荐，M3 改为不设硬上限、由主 Bot 自行判断并记录理由（13.6）。
 
 相关文档：
 
@@ -46,7 +46,7 @@
 
 ### 0.3 新冒出来的选择
 
-「等确认」的项目会先做成拒绝或保持现状，确认后再实现。
+以下选择已全部定下（11-03）：N3、M1、M2 按推荐，M3 改为不设硬上限。
 
 | # | 问题 | 推荐 | 处理 |
 |---|---|---|---|
@@ -56,10 +56,10 @@
 | P4 | 没有主话题根的 run（私聊、整群一个会话的群） | 私聊 run 仍走旧方式（其他 Bot 进不了私聊）；整群会话的群里所有节点都开话题 | 按推荐做 |
 | N1 | 开关打开后，普通会话里还保不保留一行发现提示 | 保留一行（改写为「先征得同意，再按需读取」）；否则主 Bot 无从判断是否该提议用工作流 | 按推荐做 |
 | N2 | 要不要加「本 Bot 可发起工作流」的单 Bot 开关 | 不加。子 Bot 的节点会话本来就不注入；普通会话只多一行提示 | 按推荐做 |
-| N3 | 子 Bot 的节点会话除 workflow 家族外，要不要再去掉多 Bot 编排类 skill（`botmux-orchestrate` 等） | 去掉。节点里再派子任务，等于把发起人的委托再往外传一跳 | **等确认**（权限）。先只去掉 workflow 家族 |
-| M1 | 谁能改运行中的流程 | 主 Bot，仅限两类回合：发起人本人触发的回合；本 run 的事件唤醒的回合。其他人触发的回合里提出的修改，一律转为待发起人确认 | **等确认**（权限）。先只放行发起人本人的回合，其余拒绝 |
-| M2 | 哪些修改要发起人重新确认 | 见 13.5 的清单 | **等确认**（审批边界）。确认前，清单里的修改一律拒绝 |
-| M3 | 主 Bot 自动重试 / 改派 / 重做的次数上限 | 每个节点最多 2 次，之后只能由人操作 | **等确认**（审批边界）。确认前主 Bot 不能自动重试或改派 |
+| N3 | 子 Bot 的节点会话除 workflow 家族外，要不要再去掉多 Bot 编排类 skill（`botmux-orchestrate` 等） | 去掉。节点里再派子任务，等于把发起人的委托再往外传一跳 | **已定：去掉**（11-03）。两类节点会话（子 Bot 节点会话、旧模式临时 Worker）都不提供 `botmux-orchestrate`、`botmux-handoff`；判定统一在 `src/workflows/session-kind.ts`（#2710） |
+| M1 | 谁能改运行中的流程 | 主 Bot，仅限两类回合：发起人本人触发的回合；本 run 的事件唤醒的回合。其他人触发的回合里提出的修改，一律转为待发起人确认 | **已定：按推荐**（11-03） |
+| M2 | 哪些修改要发起人重新确认 | 见 13.5 的清单 | **已定：按推荐**（11-03） |
+| M3 | 主 Bot 自动重试 / 改派 / 重做的次数上限 | 原推荐每个节点最多 2 次 | **已定：不设硬上限**（11-03）。何时交给人决定由主 Bot 按情况判断（反复失败、拿不准、需要人提供信息等），每次自动处理和每次交给人都要在节点卡和运行记录里写明理由，见 13.6 |
 | M4 | 修改怎么记录 | 每次修改生成一个完整的流程版本文件，日志里记版本号、摘要和操作人（13.3） | 按推荐做 |
 | M5 | 已完成 / 进行中的节点怎么处理 | 见 13.4 的表 | 按推荐做 |
 | M6 | 主 Bot 什么时候被唤醒去调整流程 | 只在这几种时候：节点卡住或失败、子 Bot 报做不了、标记为检查点的节点完成；不在每个节点完成时都唤醒 | 按推荐做 |
@@ -166,8 +166,8 @@ sequenceDiagram
 | 用户发 `/workflow …` | 改写后的提示直接要求先运行 `botmux skill show botmux-workflow`，再进入 Grill |
 | 主 Bot 判断任务适合工作流 | 先问用户；用户同意后，主 Bot 按发现提示读取 skill，再运行 `botmux workflow new` |
 | 运行中主 Bot 被事件唤醒（M6） | 唤醒消息里带一行：需要改流程时先读 skill 的「运行中修改」一节 |
-| 子 Bot 的节点会话 | 不给发现提示，不给 workflow skill 家族；节点要求全部写在交接消息里（N3：是否再去掉多 Bot 编排类 skill，等确认） |
-| 旧模式的临时 Worker | 不变；`botmux-goal-ask` 只在这里需要，改为只在临时 Worker 里提供 |
+| 子 Bot 的节点会话 | 不给发现提示，不给 workflow skill 家族（连 `botmux-goal-ask` 也不给，节点在群里问人），也不给多 Bot 编排类 skill（N3）；节点要求全部写在交接消息里 |
+| 旧模式的临时 Worker | 不给发现提示；`botmux-goal-ask` 只在这里需要，改为只在临时 Worker 里提供；也不给多 Bot 编排类 skill（N3） |
 
 实现要点：
 
@@ -426,9 +426,10 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 | `nodeHandoffSent` | 消息发出后 | 节点卡 id（如有）、交接消息 id、话题 id |
 | `nodeHandoffAccepted` | 子 Bot 会话登记了这条交接 | sessionId、截止时间 |
 | `nodeStalled` | 轮次结束但未提交，只影响显示 | 时间 |
-| `nodeReassigned` | 改派 | from、to、操作人 |
+| `nodeReassigned` | 改派 | from、to、操作人 `by`（主 Bot 自动改派时为 `main_bot`，并带 `auto: { reason }`，13.6） |
+| `nodeHandedToHuman` | 主 Bot 决定把节点交给人（13.6）；只作记录，随后必写 `nodeBlocked(HANDED_TO_HUMAN)` | nodeId、instanceId（如有）、attemptId（如有）、`reason`、`by: main_bot`、触发回合的 turnId |
 
-结束仍用现有的 `nodeSucceeded` / `nodeBlocked` / `nodeFailed` / `nodeCancelled`。新增错误码：`BOT_NOT_IN_CHAT`、`BOT_OFFLINE`、`COLLABORATION_DENIED`、`HANDOFF_NOT_ACCEPTED`、`HANDOFF_UNCERTAIN`、`BOT_REPORTED_BLOCKED`、`NODE_TIMEOUT`、`IDENTITY_UNAVAILABLE`。
+结束仍用现有的 `nodeSucceeded` / `nodeBlocked` / `nodeFailed` / `nodeCancelled`。新增错误码：`BOT_NOT_IN_CHAT`、`BOT_OFFLINE`、`COLLABORATION_DENIED`、`HANDOFF_NOT_ACCEPTED`、`HANDOFF_UNCERTAIN`、`BOT_REPORTED_BLOCKED`、`NODE_TIMEOUT`、`IDENTITY_UNAVAILABLE`、`HANDED_TO_HUMAN`（13.6）。
 
 `run.json` 增加 `nodeExecutor: "bot"`；没有这个字段的 run 一律按旧方式执行。流程版本相关事件见第 13 节。
 
@@ -475,6 +476,7 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 | 写了 `Accepted` | 按截止时间重挂超时定时器 |
 | 提交区有文件，journal 里没有结果 | 复核后补写 |
 | 有待确认的流程修改（13.5） | 和待审批的 Gate 一样，重发确认卡 |
+| 有 `nodeHandedToHuman`，没有随后的 `nodeBlocked`（13.6 的两次写入之间崩溃） | 补写 `nodeBlocked(HANDED_TO_HUMAN)`，原因取 `nodeHandedToHuman` 里的理由；不等运行期限 |
 | 有等待中的 Gate、阻塞卡 | 和现在一样重发 |
 
 ### 9.6 子 Bot 的 daemon 重启，或会话没了
@@ -517,7 +519,7 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 - 只有发起人能改派。
 - 子 Bot 开了「按触发人鉴权」（`triggerUserAuth`）而委托校验失败时，**不发交接**，节点转 blocked（`IDENTITY_UNAVAILABLE`），不降级为用 Bot 或 owner 的身份去跑（3.10）。
 - 目标应用缺个人授权时，沿用 `botmux auth request` 流程。
-- 节点里的 Bot 再用 `botmux dispatch` 转派，沿用现有多跳规则（N3 若去掉编排类 skill，这条路径在提示层面也不再暴露）。
+- 节点会话不提供多 Bot 编排类 skill（N3），提示层面不再引导子 Bot 转派。子 Bot 若仍自行运行 `botmux dispatch`，沿用现有多跳规则：每跳重新检查，只能收窄（命令本身没有拦）。
 - 开关：Dashboard「全局设置 → 实验性配置 → Workflow」，默认关。关闭时，节点用 Bot 自己的身份执行。
 
 ---
@@ -597,7 +599,7 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 | 进行中 | `running`；子状态：交接中 / 已接单 / Bot 已停下未提交 |
 | 完成 | `done` |
 | 失败 | `failed` |
-| 等人工确认 | `gateWaiting`，需要人处理的 `blocked`（显示原因），被待确认修改挂起的节点 |
+| 等人工确认 | `gateWaiting`，需要人处理的 `blocked`（显示原因，含主 Bot 交给人的 `HANDED_TO_HUMAN`），被待确认修改挂起的节点 |
 | 跳过 / 已取消 / 已替代 | `skipped` / `cancelled` / `superseded`，灰色 |
 
 **节点框**：三行，依次是节点名；Bot 名字和落点标记（「话题」或「主话题」）；状态标签加耗时。进行中的耗时实时走秒。Loop 节点保留轮次圆点。
@@ -620,17 +622,23 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 
 ## 13. 运行中修改流程
 
-### 13.1 谁能改（M1，等确认）
+### 13.1 谁能改（M1，已定）
 
-推荐：
-
-- **主 Bot（主会话）**：通过 `botmux workflow edit <runId> --patch-file <文件> --base <版本>` 提交修改。鉴权沿用现有创作命令：必须处在与 run 绑定的同一应用、群、主会话的已认证回合里。
+- **主 Bot（主会话）**：通过 `botmux workflow edit <runId> --patch-file <文件> --base <版本>` 提交修改。必须处在与 run 绑定的同一应用、群、主会话的已认证回合里。
   - 发起人本人触发的回合，或本 run 事件唤醒的回合（M6）：按 13.5 的分类直接生效或进入待确认。
   - 其他人触发的回合：所有修改一律转为待发起人确认。
+- **鉴权怎么实现**：现有鉴权对上面两类新回合都走不通，需要按以下方式改。
+  - **事件唤醒的回合**：
+    - 现有的合成触发 turnId 是 `trg_…`，`resolveCurrentTurnProvenance` 只认 `om_` / `join_` / `schedule:` 三类，会拒绝它。判定在 `src/core/current-turn-provenance.ts` 的 `resolveCurrentTurnProvenance`，实际拒绝点是它调用的 `src/core/reply-target.ts` `registryTurnMayAuthenticateHuman`。
+    - 做法：照 `schedule:` 的先例（`src/core/current-turn-provenance.ts` 与 `session-relay.ts` 的 scheduled 分支）新增一类 turn 来源 `workflow-event:<runId>:<事件序号>`。它只能由拥有该 run 的 daemon 签发，并与主会话绑定，daemon 侧认它为「本 run 事件唤醒的回合」。
+    - 身份：这类回合的调用者身份取 run 冻结的发起人。即兴 run 取 `run.json` 的 `authorization.authorizedByOpenId`；Saved Workflow 的 run 授权段没有这个字段，取 `chatBinding.ownerOpenId`（发出 `/workflow run` 的人，10.2）。两者都来自认证过的当前回合，语义相同。所以 `retry`、`ask-human` 等命令现有的「调用者等于发起人」校验不用改，语义就是「主 Bot 以发起人的名义处理本 run」。
+    - 其它合成 turnId 仍然一律拒绝。
+  - **其他人的回合**：
+    - 现在 `authorizeV3RunMutationForCurrentTuple` 要求调用者等于 run 的 owner，非发起人会被直接拒绝。
+    - 做法：只对 `edit`，把校验放宽为「应用、群、主会话一致」，调用者身份只用来决定直接生效还是转待确认。
+    - `retry` / `grant` / `cancel` 的鉴权不变。新命令 `ask-human` 与 `retry` 一样严格校验：只在发起人本人触发的回合，或本 run 事件唤醒的回合可用。
 - **人**：在主话题里跟主 Bot 说，由主 Bot 转成修改。第一版不在 Dashboard 上做编辑。
 - **子 Bot**：不能改流程。可以 `botmux report --status blocked` 说明做不了、给出建议，触发主 Bot 被唤醒。
-
-确认前先只放行发起人本人触发的回合，其余拒绝。
 
 另外新增 `botmux workflow status <runId>`，给主 Bot 读当前生效的流程版本和各节点状态。现有的 `workflow show` 只针对已保存的定义，没有让 agent 读运行状态的入口。
 
@@ -652,7 +660,14 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - `dag.json` 保持为第 1 版，仍被 `run.json` 的摘要锁定，不改动。
 - 每次修改生成 `dag-revisions/<NNN>.json`（修改后的完整 DAG）和 `dag-revisions/<NNN>.patch.json`（本次的操作），都原子写入。
 - journal 事件：
-  - `dagRevised { revision, baseRevision, sha256, summary, by, approval? }`：修改生效；
+  - `dagRevised { revision, baseRevision, sha256, summary, by, approval?, auto?, effects? }`：修改生效。
+    - `by` 记操作人，主 Bot 自动处理时为 `main_bot`；`auto` 只放理由 `{ reason }`（13.6）。
+    - `effects` 是本次修改带来的作废、取消、重跑、指派，写在同一条事件里，崩溃时不会出现「定义改了、作废没写」的半截状态。
+    - effects 与专用事件的分工：
+      - 取消：只由 effects 生效，不再另写 `nodeCancelled`；
+      - 重跑、指派：仍由专用事件 `nodeRetryRequested` / `nodeReassigned` 推进状态，在同一把锁里与 `dagRevised` 一起写，effects 里只做记录、重放时不重复推进。
+      - 作废（13.4「进行中」节点的「作废当前尝试、作废登记」）：在同一把锁里写 `nodeAttemptDrained { reason: 'obsoleteAttempt' }` 关闭旧尝试，effects 里只记录，不额外写 `nodeCancelled`。只写 `nodeRetryRequested` 关不掉旧尝试：它不带 attemptId，旧绑定会一直留在 open 状态，占用全局并发名额，还挡住 run 的终态发布。
+    - 取消的节点中如果有受阻节点，`dagRevised` 生效时同时解除 run 的 blocked：`runStatus` 恢复为 running，清空 `blockedNodeId`，与 `nodeRetryRequested` 的现有做法一致。否则驱动循环在 run 级 blocked 时直接退出，下游的跳过动作不会执行，run 会一直停在 blocked。
   - `dagRevisionProposed { revision, sha256, reasons[] }` 加一个等待记录（与 Gate 一样放在 `waits/`）：需要确认的修改；
   - `dagRevisionApproved`、`dagRevisionRejected`：确认结果。
 - 状态重放：按 journal 顺序取「第 1 版 + 已生效的修改」得到当前流程，`decideNext` 用当前版本调度。每个版本文件的 sha256 必须与事件里记录的一致，不一致就 fail closed。
@@ -665,7 +680,8 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 |---|---|---|
 | 未开始 | 全部 | 直接按新定义调度 |
 | 等人工确认（Gate 等待中） | 改定义、改派、删除 | 作废等待中的 Gate，卡片冻结为「流程已修改，本次审批作废」，再按新定义重新走 Gate |
-| 进行中 | 改定义、改派、删除 | 作废当前尝试（停掉子 Bot 这一轮、作废登记）。改定义和改派会在原落点发新的交接，注明「要求已修改」；删除则写 `nodeCancelled`。依赖不能改（已经开始了） |
+| 受阻（`blocked`，含 `NODE_TIMEOUT`、`BOT_REPORTED_BLOCKED`、`HANDED_TO_HUMAN`） | 改定义、改派、删除 | 此时没有在跑的尝试，不需要停轮。<br>改派、改定义并要求重跑：与现有改派同一路径，一并写 `nodeRetryRequested`，把 run 从 blocked 恢复为 running 后再发新交接；只写新定义的话，run 处于 blocked 时派不出交接。<br>只改定义、不要求重跑：节点保持受阻，等人或主 Bot 之后重试。<br>删除：作为 `dagRevised` 的取消效果生效，重放时把受阻节点也收成「已取消」；下游按现有规则跳过或失败。注意：不能只追加一条 `nodeCancelled`，现有重放把 blocked 当终态，这样写不会生效，而且 `nodeCancelled` 的 reason 是闭集（`earlyReleaseLoser` / `runCancelled`） |
+| 进行中 | 改定义、改派、删除 | 作废当前尝试（停掉子 Bot 这一轮、作废登记）。改定义和改派会在原落点发新的交接，注明「要求已修改」；删除作为 `dagRevised` 的取消效果生效（同上）。依赖不能改（已经开始了） |
 | 已完成 | 只能 `rerunNode`，或在它下游加节点 | 不能删、不能改定义（产出可能已被下游用了）。`rerunNode` 按 Revisit 的方式建新实例，已经用过旧产出的下游节点一起标为已替代并重跑。这走 Revisit 预算，不另开额度 |
 | 跳过 / 已取消 / 已替代 | 不能改 | 需要的话加新节点 |
 | Loop 运行中 | 不能改 body；可以改 Loop 下游 | 改 body 要等 Loop 结束，或者删掉整个 Loop 再加新的 |
@@ -676,9 +692,9 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - 新加节点依赖已完成的节点时，引用的产出必须在该节点的 manifest 里；
 - 从已完成节点出发的新条件边，在生效时按其 `result.json` 求值一次，并写 `edgeResolved`，以后不再重算。
 
-### 13.5 哪些修改要发起人重新确认（M2，等确认）
+### 13.5 哪些修改要发起人重新确认（M2，已定）
 
-推荐清单。命中任一条就进入待确认，否则直接生效：
+命中任一条就进入待确认，否则直接生效：
 
 1. 用到不在已批准范围里的 Bot（新增节点或改派）。开着委托时，这还意味着发起人身份会交给新的 Bot。
 2. 新增或修改 Host 节点，或修改 Host 节点的输入（对外的副作用：发消息、建定时任务）。
@@ -696,9 +712,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 
 确认方式：主话题发一张「流程修改确认」卡，列出新增、删除、修改的节点，新 Bot，新的对外动作，Gate 的变化，只有发起人能点「同意」或「拒绝」。待确认期间，受影响的节点不派发，其余节点照常跑。卡片作废、重启重发都按 Gate 的现有做法。
 
-确认前，命中清单的修改一律拒绝，并提示「这类修改需要确认流程，暂不支持」。
-
-### 13.6 主 Bot 什么时候参与调整（M3 等确认，M6 按推荐）
+### 13.6 主 Bot 什么时候参与调整（M3、M6 已定）
 
 - **唤醒时机（M6）**：主 Bot 的 daemon 在这几种时候往主会话投一条结构化事件（复用 report 回传的合成触发形态，正文按不可信数据处理）：
   - 节点卡住或失败；
@@ -706,7 +720,17 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
   - 标了 `checkpoint: true` 的节点完成。
 
   检查点由 Architect 或主 Bot 在流程里标出，用在「做完这一步要看看结果再决定后面怎么走」的地方。不在每个节点完成时都唤醒，避免空耗和插话。唤醒只在新模式下发生。
-- **自动处理的上限（M3，等确认）**：被唤醒后，主 Bot 可以自己重试、改派（在已批准的 Bot 内）或 `rerunNode`，每个节点合计最多 2 次，之后只能由人操作。确认前，主 Bot 被唤醒后只能在主话题里说明情况、给出建议，由人点卡片处理。
+- **自动处理（M3，已定：不设次数上限）**：被唤醒后，主 Bot 可以自己重试、改派（在已批准的 Bot 内）或 `rerunNode`，也可以决定交给人。什么时候交给人，由主 Bot 按情况判断，例如反复失败、拿不准下一步、需要人提供信息或做取舍。
+  - **必须写明理由**：主 Bot 每次自动处理都要带上理由，命令为 `botmux workflow retry|edit … --reason "<为什么自动处理>"`；交给人时运行 `botmux workflow ask-human <runId> --node <id> --reason "<为什么交给人>"`。理由记进运行记录：自动处理在 `nodeRetryRequested` / `nodeReassigned` / `dagRevised` 事件上记 `by: 'main_bot'`，理由放独立字段 `auto: { reason }`（`nodeRetryRequested` 原本没有 `by`，一并加上）。`nodeRetryRequested` 已有的 `reason`（闭集取值 `blockedRetry`）不复用、不改；交给人写一条新事件 `nodeHandedToHuman`。
+  - **由事件唤醒的回合缺理由就拒绝**：CLI 在这类回合里不带 `--reason` 时直接报错。人本人触发的回合可以不填。
+  - **交给人之后节点处于什么状态**：
+    - `ask-human` 只用于有在跑尝试、或有最近一次尝试的节点。从未派发的 pending 节点没有 attemptId，命令直接拒绝；这种节点要先补信息，就改它的定义。
+    - `ask-human` 在同一把 journal 锁内依次做三件事：先停掉该节点正在进行的尝试（与超时同一条关闭路径），再写 `nodeHandedToHuman`（只作记录），然后写 `nodeBlocked { errorClass: 'workerError', recovery: 'retry', errorCode: 'HANDED_TO_HUMAN' }`（与其它外部受阻原因相同的取值，不新增错误类别），理由原样展示。尝试的关账和节点状态都由这条 `nodeBlocked` 决定，与其它受阻原因一致；只写 `nodeHandedToHuman` 不会关闭尝试。
+    - 之后沿用现有阻塞卡（重试、改派、取消），不另设超时，等人处理。
+    - 人在主话题里回复，算发起人或其他人触发的普通回合，按 M1 区分能否直接改流程；处理完由人点卡片，或由主 Bot 在发起人回合里 `retry` / `edit`。
+  - **在哪里展示**：节点卡上显示最近一次的「主 Bot 自动重试 / 改派 / 重做：<理由>」或「交给人决定：<理由>」；看板节点详情列出全部记录；交给人时节点状态显示为「等人工确认」。
+  - **不设上限靠什么兜底**：Loop 轮数和 Revisit 额度照旧要人逐次授权；13.5 的确认清单照旧生效；每一次自动处理都可见、可追溯。
+  - 回合本身由主 Bot 的模型执行，所以这些规则写在 workflow skill 的「运行中修改」一节，按需读取，不进常驻提示（3.6）。
 - 主 Bot 和人同时操作时，靠版本 base 和 journal 先到先得解决冲突。
 
 ### 13.7 看板和侧边栏怎么实时反映
@@ -768,7 +792,8 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - `/workflow` 和 `/workflow new｜save｜run｜list｜show｜cancel` 的语法和语义不变。
 - 新模式下，Gate-2 摘要多出「节点 → 子 Bot（落点，理由）」，阻塞卡多一个「改派」。
 - `botmux report` 新增 `--output`、`--result-file`，只对工作流节点的交接有效。
-- 新增 `botmux workflow edit`、`botmux workflow status`。
+- 新增 `botmux workflow edit`、`botmux workflow status`、`botmux workflow ask-human`。
+- `botmux workflow retry` 和 `botmux workflow edit` 新增 `--reason`。由本 run 事件唤醒的回合必须带它（13.6）；人触发的回合可以不带，不带时行为与现在相同。
 - **`approve-dag --working-dir`**：新模式下节点在子 Bot 自己的会话目录里跑。指定的目录必须在该 Bot 配置的目录范围内（`defaultWorkingDir` / `workingDirs`），由子 Bot 的 daemon 起会话时校验并应用；不在范围内就在 Gate-2 拒绝。
 - **节点的 `override.model`**：只有子 Bot 的 CLI 支持按派发指定模型时（目前是 Codex 的 dispatch 启动规格）才生效，否则 Gate-2 报错。
 - **节点的 `override.systemPromptAppend`**：拼进交接消息正文。
@@ -802,22 +827,22 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 
 ## 16. PR 拆分与顺序
 
-每个 PR 单独可合。「等确认」的部分在维护者确认 0.3 的对应项之前不实现（代码里先拒绝或保持现状）。
+每个 PR 单独可合。0.3 的选择已全部定下（11-03）。原第 5 行拆成 5a、5b；原第 8 行的内容并入第 4 行和 5b，不再单列。
 
 | 顺序 | PR | 内容 | 依赖 |
 |---|---|---|---|
 | 1 | `feat(dashboard): 工作流运行图显示负责 Bot、状态和耗时` | 本设计文档；`RunNodeView` 增加 bot、displayStatus、时间、attempts；SVG 节点框三行化；详情面板显示尝试记录。对旧 run 生效 | 无 |
-| 2 | `feat(workflow): workflow skill 改为确定使用时按需注入` | 第 4 节：去掉三个 skill 的常驻注入，改写发现提示，`/workflow` 改为按需读取；补「开关关闭时完全不注入」的回归测试。节点会话的跳过逻辑放到 PR 5 | 无 |
+| 2 | `feat(workflow): workflow skill 改为确定使用时按需注入` | 第 4 节：去掉三个 skill 的常驻注入，改写发现提示，`/workflow` 改为按需读取；补「开关关闭时完全不注入」的回归测试。节点会话的跳过逻辑放到 PR 5a | 无 |
 | 3 | `feat(workflow): 节点改为落盘等待的外部执行（引擎层）` | 第 9 节：`nodeExecutor`、新事件和重放、等待外部、冷启动对账、超时与可注入时钟、取消与迟到提交、计数 key 修正。传输层用假实现 | 1（文档） |
-| 4 | `feat(workflow): 运行中按版本修改流程` | 第 13 节中不涉及审批边界的部分：`workflow edit/status`、版本文件与事件、13.4 的处理规则、校验、看板和进度卡的版本显示。13.5 清单内的修改先一律拒绝 | 3 |
-| 5 | `feat(workflow): 节点交给群里的 Bot 执行（默认关）` | 开关；两种落点和硬规则；节点卡、交接、按消息 id 的登记；chatGrant 与接单；附件输入；`report --output/--result-file` 与提交区；回报卡；停下、超时、取消；指派给自己；`--working-dir` 以目标为准；节点会话跳过 workflow 注入；主 Bot 唤醒（M6）；文档站更新 | 3 |
+| 4 | `feat(workflow): 运行中按版本修改流程` | 第 13 节：`workflow edit/status`、版本文件与事件、13.4 的处理规则、校验；M1 的回合鉴权（他人回合转待确认）；新增 `workflow-event` turn 来源（本 PR 的 `edit` 与 5b 的 `retry` / `ask-human` 共用，在本 PR 落地）；M2 的确认清单与确认卡；看板和进度卡的版本显示 | 3 |
+| 5a | `feat(workflow): 节点交给群里的 Bot 执行（默认关）` | 开关；只做节点话题落点；节点卡、交接、签名登记与撤销；chatGrant 与接单；附件输入；`report --output/--result-file` 与提交区（主 Bot 离线时暂存）；回报卡；停下、超时、取消；指派给自己；节点会话不注入 workflow 与编排类 skill（N3）；文档站更新 | 3 |
+| 5b | `feat(workflow): 主话题交接与主 Bot 按事件调整` | 落点字段与主话题落点的硬规则；主 Bot 唤醒（M6）；自动处理与交给人的理由记录（M3）；`--working-dir` 以目标为准 | 5a、4 |
 | 6 | `feat(workflow): 按群成员和能力给节点分配 Bot` | `assignee`；Architect 名单、理由和落点依据；`approve-dag` 合格检查；Gate-2 摘要；阻塞卡改派 | 5 |
 | 7 | `feat(workflow): 交接带上发起人身份（默认关）` | 第 10 节 | 5 |
-| 8 | `feat(workflow): 运行中修改的确认与主 Bot 自动处理上限` | 13.1 的其他人回合、13.5 的确认卡、13.6 的自动处理上限、N3 | 4、5，以及维护者确认 M1–M3、N3 |
 | 9 | `feat(workflow): 任务消息签名行加工作流侧边栏入口` | 第 11 节：签名行按钮、入口跳转、侧栏版式、D6 的鉴权与精简视图、进度卡入口切换 | 5 |
 | 单独 | `fix(workflow): /workflow resume 报错指向可用的重试方式` | 15.4 提到的问题 | 无 |
 
-推荐合入顺序：1、2 → 3 → 4、5 → 6、7、9 → 8。逗号隔开的可以并行。
+推荐合入顺序：1、2 → 3 → 4、5a → 5b、6、7、9。逗号隔开的可以并行。表中第 6、7、9 行依赖的「5」指 5a。
 
 ---
 
@@ -833,7 +858,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 - **注入（PR 2）**：
   - 开关关 / 开 × 三种 skill 注入模式 × Claude 家族 / 其它 CLI，断言实际生成的提示和落盘的 skill 文件，不读源码文本。
   - `/workflow` 和自然语言确认两条路径各跑一次真实会话。
-- **飞书接线（PR 5–9）**：
+- **飞书接线（PR 5a、5b、6、7、9）**：
   - 在隔离环境用两到三个测试 Bot 实测：两种落点、接单、附件输入、提交被拒后补交、回报、超时、取消、主 Bot 的 daemon 重启、子 Bot 不在群、运行中修改。
   - 身份部分补全 ADR 验证清单里的多跳、撤权、换回合场景。
   - 侧边栏分三种身份实测：管理员、群成员、非群成员。

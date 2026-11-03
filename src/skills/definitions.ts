@@ -1761,6 +1761,7 @@ botmux workflow new "<把用户目标浓缩成一句话>"
 - \`input_needs\` 是**自由文本**描述"这步需要什么信息/产物"，**绝不要写成上游 sketchId 列表**——画依赖边是 architect 的活，不是你的。
 - \`risk_gate: true\` = 这步执行期要人工审批（如对外发送）。
 - \`unknowns\` 放没跟用户定死、用了默认的点。
+- 第 1 步返回里有 \`"nodeExecutor": "bot"\`（节点交给群里的 Bot 执行）时，用户明确点名某步由哪个 Bot 做，就在该节点加 \`"assignee": "<Bot 名或 larkAppId>"\`；没点名或没有这个字段就不写。
 
 ### 4. 校验 spec
 \`\`\`bash
@@ -1782,7 +1783,7 @@ botmux workflow architect <runId>
 系统自动把 spec 编译成 dag.json 并**由 host 校验**。成功 → 命令打印 \`dagPath\`/\`notesPath\`，进下一步。失败（退回 spec_approved + 打印 problems）→ 多半是 spec 还有问题：\`botmux workflow revise-spec <runId>\` 退回 grilling，按 problems 改 spec.md，再 spec-finalize → approve-spec → architect。（若判断只是 architect 偶发失败、spec 没问题，可直接重跑 architect。）
 
 ### 7. Gate-2：确认流程
-读 architect 产出的 dag.json + architect-notes.md（用第 6 步打印的路径），给用户讲清楚流程：有哪些节点、依赖顺序、哪些节点执行期会停下等人批。问：
+读 architect 产出的 dag.json + architect-notes.md（用第 6 步打印的路径），给用户讲清楚流程：有哪些节点、依赖顺序、哪些节点执行期会停下等人批。第 6 步若打印了「节点交给群里的 Bot 执行」清单，逐个列出节点 → 执行 Bot 和理由，⚠️ 行要明说；用户要改派就 revise-spec 后改 \`assignee\`。问：
 
 > 编排好的流程是这样，对吗？确认就开跑。
 
@@ -1960,6 +1961,22 @@ export const WORKFLOW_FEATURE_SKILLS: SkillDef[] = [
  *  filtering when the workflow feature is off. */
 export const WORKFLOW_FEATURE_SKILL_NAMES: string[] =
   WORKFLOW_FEATURE_SKILLS.map((s) => s.name);
+
+/** Built-ins whose purpose is handing work to OTHER bots or opening sub-project
+ *  topics: `botmux-orchestrate` (multi-bot, multi-topic projects via `botmux
+ *  dispatch`) and `botmux-handoff` (pass the current task to another bot).
+ *  `botmux-bots` stays: it is a read-only roster the routing block also teaches. */
+export const MULTI_BOT_DISPATCH_SKILL_NAMES: readonly string[] = ['botmux-orchestrate', 'botmux-handoff'];
+
+/** Skills a workflow node session is never offered (design 2026-11-03 §4.2,
+ *  N3): it executes one node of an approved run and submits it with `botmux
+ *  report`, so it neither starts workflows nor re-dispatches its work to other
+ *  bots. Applies to every channel — prompt catalog, `botmux skill list/show`,
+ *  and the node-session copy of the native plugin dirs. */
+export const WORKFLOW_NODE_WITHHELD_SKILL_NAMES: readonly string[] = [
+  ...WORKFLOW_FEATURE_SKILL_NAMES,
+  ...MULTI_BOT_DISPATCH_SKILL_NAMES,
+];
 
 /** Skills that earlier botmux versions installed but no longer ship. The
  *  installer cleans these up so renamed skills don't linger as duplicates

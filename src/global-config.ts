@@ -133,14 +133,23 @@ export interface WorkflowFeatureGlobalConfig {
   /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== true`
    *  keeps the feature OFF (disabled by default). Set true to turn the whole
    *  workflow feature on for this host: the `/workflow` grill + Saved-Workflow
-   *  run/save entries are accepted, the `botmux-workflow` family of skills is
-   *  advertised/installed, and the CLI authoring/run subcommands work.
+   *  run/save entries are accepted, the `botmux-workflow` family of skills can
+   *  be read on demand (`botmux skill show`; never resident in session prompts),
+   *  and the CLI authoring/run subcommands work.
    *  In-flight run management (cancel / retry / grant) stays available so a run
    *  started before a flip can still be wound down. The multi-bot
    *  `botmux-orchestrate` skill is intentionally NOT gated by this — it is a
    *  separate long-running-orchestration capability, not a v3 workflow. */
   enabled?: boolean;
+  /** Experimental (design 2026-11-03 §15.5): who executes goal nodes of runs
+   *  authorized from now on. Absent = `ephemeral` (today's temporary CLI
+   *  workers). `bot` hands each node to a bot's own session in the run's chat.
+   *  Frozen into `run.json` at authorization, so flipping it never changes a
+   *  run that already started. Only the non-default value is ever stored. */
+  nodeExecutor?: 'bot';
 }
+
+export type WorkflowNodeExecutorMode = 'ephemeral' | 'bot';
 
 export interface MultiTopicGlobalConfig {
   /** Machine-wide multi-topic orchestration switch. Missing means enabled for
@@ -858,6 +867,7 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   const v = raw as Record<string, unknown>;
   const out: WorkflowFeatureGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (v.nodeExecutor === 'bot') out.nodeExecutor = 'bot';
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1124,6 +1134,14 @@ export function isCrossPrincipalInterruptionEnabled(
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().dashboard?.crossPrincipalInterruption === true;
+}
+
+/** Experimental Workflow switch (Dashboard 全局设置 → 实验性配置 → Workflow):
+ *  who executes goal nodes of runs authorized from now on. Read live like the
+ *  other dashboard toggles; the value only matters at authorization, where it
+ *  is frozen into `run.json`. */
+export function workflowNodeExecutorMode(): WorkflowNodeExecutorMode {
+  return readGlobalConfig().workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral';
 }
 
 /** Machine-wide multi-topic orchestration switch. Defaults ON for backwards

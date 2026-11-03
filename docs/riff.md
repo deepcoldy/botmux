@@ -105,6 +105,20 @@ POST 受理后以操作 ID 查询结果；相同 ID 和内容的重复请求不�
 
 沙箱必须安装支持 `riff_host_tools_v1` 的同版本 botmux，可用 `botmux capabilities --json` 核对。Linux x64 编译版宿主机会提供受当前轮次凭据保护的同构建 CLI 下载，自动引导安装前校验 SHA-256；源码及其它平台部署仍需通过 npm 等方式提供兼容的 Linux CLI。升级后已有 Riff 会话在下一次追问时重新绑定。
 
+#### 排查：群里收不到回复，任务输出里有 502 等错误
+
+普通 Riff 会话的回复只经宿主工具入口发出。沙箱访问不到入口时，`botmux send` 等命令全部失败，这一轮回复不会送达群里。宿主侧无法可靠区分「沙箱连不上入口」和「这一轮模型本就没调用 botmux」（例如静默定时任务由模型决定是否发消息），所以不会在群里补发失败提示；请在「📖 显示输出」的任务日志里查看命令的报错：
+
+| 任务日志里的报错 | 含义 |
+|------|------|
+| `riff_host_http_502: Bad Gateway`（或 503/504、HTML 错误页摘录、`<empty body>`） | 沙箱连到了网关或反向代理，但网关后面没有可用的 botmux worker |
+| `riff_host_response_invalid (HTTP 200): …` | 入口地址返回的不是 botmux 的应答，例如登录页 |
+| `riff_host_transport_unknown (ECONNREFUSED)`（或 `ENOTFOUND`、`timeout` 等） | 沙箱连不上入口地址：端口不通、域名解析失败或超时 |
+| `riff_host_cli_download_failed` | 编译版宿主机的 CLI 下载失败，上一行 `curl:` 报错给出状态码 |
+| `riff_host_http_403: riff_host_turn_unavailable` | 请求已到达 worker，但不是当前轮次的绑定（例如沿用了上一轮的命令），不是网络问题 |
+
+前四类都说明沙箱访问不到宿主工具入口。报错只含状态码和响应体开头一小段（已截断、去掉控制字符），不含轮次凭据。入口地址按以下顺序选取：`riff.hostToolsUrl` → 已绑定平台且开启「远程访问」时的平台转发地址 → `BOTMUX_PUBLIC_URL` → worker 的 advertised 地址（`WEB_EXTERNAL_HOST`，未设置时为本机局域网 IP，加 worker 端口）。处理方法：检查 `riff.hostToolsUrl` 或平台远程访问，在沙箱能直达的位置提供转发并把 `riff.hostToolsUrl` 配成它；转发须保留 `x-riff-host-token` 请求头，不能重定向到登录页。
+
 通道不开放宿主机管理员命令、任意 shell、跨会话投递、`preview` 或原始终端控制。Completion Proposal 的后端可恢复性检查维持原有规则，仍可能降级为文字；不会因工具桥接而自动开放。已有但从未在宿主机登记的历史反馈卡片需要另行核验并补登记，本改动不会按当前权限策略自动认领旧卡。
 
 | 按钮 | 作用 |
@@ -117,7 +131,7 @@ POST 受理后以操作 ID 查询结果；相同 ID 和内容的重复请求不�
 
 | 现象 | 原因与处理 |
 |------|-----------|
-| 发消息后没回复 | ① JWT 过期（见上）② 模型名不在支持清单（非法值会 400 并回显完整清单）③ 打开「Web 终端」日志页看 `[riff] 错误` 行 |
+| 发消息后没回复 | ① JWT 过期（见上）② 模型名不在支持清单（非法值会 400 并回显完整清单）③ 打开「Web 终端」日志页看 `[riff] 错误` 行 ④ 日志里有 `riff_host_http_502`、`riff_host_transport_unknown` 等报错：沙箱访问不到宿主工具入口，见「宿主机工具通道」的排查说明 |
 | 报「仓库 xxx 不存在」 | Base URL 环境与仓库不匹配，或填了外部仓库；确认是内部 Git 仓库上的 `group/repo` |
 | 保存配置报 invalid_base_url | Base URL 必填且必须以 http(s) 开头 |
 | 继续对话每轮都要几分钟 | 正常应为秒级（follow-up 复用暖沙箱）；若每轮冷启动，检查是否每次 /close 后重开、或配置中途被改 |

@@ -15,6 +15,7 @@ import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
 import { detectImageFormat } from '../../core/attachment-image-format.js';
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import type { RiffHostBinding } from '../../services/riff-host-tools.js';
+import { RIFF_HOST_UNREACHABLE_HINT } from '../../services/riff-host-hint.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -2062,7 +2063,7 @@ export class RiffBackend implements SessionBackend {
       unavailable = true;
     }
     const install = binding?.cliSha256
-      ? `set -e; target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g)")"; if [ "$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)" != ${shellQuote(binding.cliSha256)} ]; then artifact="$(mktemp)"; curl --noproxy '*' --fail --silent --show-error --max-time 180 -H ${shellQuote(`x-riff-host-token: ${binding.token}`)} ${shellQuote(`${binding.url}?artifact=cli`)} -o "$artifact"; printf '%s  %s\\n' ${shellQuote(binding.cliSha256)} "$artifact" | sha256sum -c -; chmod 755 "$artifact"; mv -f "$artifact" "$target"; fi; `
+      ? `set -e; target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g)")"; if [ "$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)" != ${shellQuote(binding.cliSha256)} ]; then artifact="$(mktemp)"; curl --noproxy '*' --fail --silent --show-error --max-time 180 -H ${shellQuote(`x-riff-host-token: ${binding.token}`)} ${shellQuote(`${binding.url}?artifact=cli`)} -o "$artifact" || { printf '%s\\n' ${shellQuote(`riff_host_cli_download_failed (see the curl error above): ${RIFF_HOST_UNREACHABLE_HINT}`)} >&2; exit 1; }; printf '%s  %s\\n' ${shellQuote(binding.cliSha256)} "$artifact" | sha256sum -c -; chmod 755 "$artifact"; mv -f "$artifact" "$target"; fi; `
       : '';
     const host = binding
       ? `\n\n<botmux_host_tools>\nBefore ANY botmux helper in this turn, run this exact bootstrap command once (also on follow-ups). It installs the verified host build before binding:\n${install}BOTMUX_RIFF_HOST_TOOLS=1 botmux riff-host-bind ${Buffer.from(JSON.stringify(binding)).toString('base64url')}\nFor EVERY following botmux helper, also use the explicit prefix BOTMUX_RIFF_HOST_TOOLS=1 (including in existing tasks whose creation-time environment cannot change).\nAll stateful botmux helpers execute on the owning host. Card stream open/write/snapshot/reanchor/finish are supported. Whiteboard supports status only; skip other whiteboard operations even if a generic skill describes them.\nNever print or forward this private binding. If the host is unavailable, report the error; do not call Lark directly or start a sandbox daemon.\n</botmux_host_tools>`

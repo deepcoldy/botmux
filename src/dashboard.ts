@@ -262,6 +262,7 @@ import { withFileLock, FileLockTimeoutError } from './utils/file-lock.js';
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
 import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive, installDshProfileDeps } from './dashboard/managed-spawn.js';
+import { LocalDevForceUpdates } from './utils/local-dev-force-update.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -1211,8 +1212,9 @@ interface ResolvedDashboardSettings {
   whiteboard: WhiteboardConfig;
   /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
-   *  family, and the CLI authoring/run subcommands host-wide. */
-  workflow: { enabled: boolean };
+   *  family, and the CLI authoring/run subcommands host-wide. `nodeExecutor`
+   *  is the experimental executor frozen into newly authorized runs. */
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
@@ -1854,7 +1856,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     // false for every compiled binary, because its package root is "/".
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || isAutoUpdateSupportedInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
-    workflow: { enabled: global.workflow?.enabled === true }, // default OFF
+    workflow: {
+      enabled: global.workflow?.enabled === true, // default OFF
+      nodeExecutor: global.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral', // default ephemeral
+    },
     sessionCleanup: {
       archiveCodex: global.sessionCleanup?.archiveCodex === true,
       enabled: global.sessionCleanup?.enabled === true, // default OFF
@@ -2213,7 +2218,9 @@ function currentInstalledVersion(): string {
  * the caller signals independently of `changed`. Rejects with a stable `code`
  * on the recoverable, UI-actionable failures.
  */
-async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string }> {
+const localDevForceUpdates = new LocalDevForceUpdates();
+
+async function runLocalDevUpdate(forceToken?: string): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string; backupRef?: string }> {
   const dir = resolveLocalDevCheckoutDir();
   if (!isGitWorktree(dir)) {
     throw Object.assign(new Error(`${dir} is not a git worktree`), { code: 'not_a_worktree', dir });
@@ -2224,19 +2231,29 @@ async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; old
   } catch (e) {
     throw Object.assign(new Error(e instanceof Error ? e.message : String(e)), { code: 'git_status_failed', dir });
   }
-  if (status) {
+  if (status && !forceToken) {
     throw Object.assign(new Error('working tree has uncommitted changes'), {
       code: 'dirty_worktree', dir, status,
     });
   }
   const before = gitHeadSha(dir);
   const oldVersion = resolveCurrentVersionAt(dir);
-  for (const { command, args } of localDevUpdateSteps()) {
-    await runLocalDevStep(dir, command, args);
+  let backupRef: string | undefined;
+  try {
+    if (forceToken) {
+      ({ backupRef } = await localDevForceUpdates.apply(dir, forceToken));
+      await runLocalDevStep(dir, 'bun', ['install', '--frozen-lockfile']);
+      await runLocalDevStep(dir, 'bun', ['run', 'build']);
+    } else {
+      for (const { command, args } of localDevUpdateSteps()) await runLocalDevStep(dir, command, args);
+    }
+  } catch (e) {
+    if (backupRef && e instanceof Error) Object.assign(e, { backupRef });
+    throw e;
   }
   const after = gitHeadSha(dir);
   const newVersion = resolveCurrentVersionAt(dir);
-  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after };
+  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after, backupRef };
 }
 
 /**
@@ -5061,11 +5078,40 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/update/local-dev/preview') {
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (!isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'not_a_worktree' });
+      if (updateInFlight || hasActiveRestartLease()) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      updateInFlight = true;
+      try {
+        const preview = await withFileLock(globalInstallUpdateLockTarget(), async () => {
+          if (hasActiveRestartLease()) throw Object.assign(new Error('restart_in_flight'), { code: 'restart_in_flight' });
+          return localDevForceUpdates.preview(resolveLocalDevCheckoutDir());
+        }, { maxWaitMs: 2_000 });
+        return jsonRes(res, 200, { ok: true, ...preview });
+      } catch (e) {
+        const error = e instanceof FileLockTimeoutError ? 'update_in_flight' : (e as { code?: string }).code ?? 'install_failed';
+        return jsonRes(res, 409, { ok: false, error, detail: e instanceof Error ? e.message : String(e) });
+      } finally { updateInFlight = false; }
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       // owner-only：这条会 git pull + 重建，等于改机器上实际运行的代码。协管者的
       // `dashboard:manage` 只覆盖「运营配置」（settings/schedules/groups/autostart），
       // 不含「改代码并重启」——那属于 debug shell 同一档的整机控制权。
       if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      let forceToken: string | undefined;
+      if (req.headers['content-type']?.includes('application/json')) {
+        try {
+          const body = await readJsonBody(req, 4096) as { forceLocal?: unknown; previewToken?: unknown } | null;
+          if (body?.forceLocal !== undefined) {
+            if (body.forceLocal !== true || typeof body.previewToken !== 'string' || !body.previewToken || !isLocalDevInstall()) {
+              return jsonRes(res, 400, { ok: false, error: 'invalid_force_update' });
+            }
+            forceToken = body.previewToken;
+          }
+        } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      }
       // 本地 checkout：走 git pull --ff-only + bun run build（与 CLI cmdUpgradeLocalDev
       // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
       // /api/update/restart 的 lease/intent 路径。
@@ -5076,16 +5122,22 @@ const server = createServer(async (req, res) => {
         updateInFlight = true;
         let acquired = false;
         let blockedByRestart = false;
-        let result: { dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string } | undefined;
+        let result: Awaited<ReturnType<typeof runLocalDevUpdate>> | undefined;
         try {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
-            result = await runLocalDevUpdate();
+            pendingLocalDevRestart = undefined;
+            result = await runLocalDevUpdate(forceToken);
           }, { maxWaitMs: 2_000 });
         } catch (e) {
           if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
           const code = (e as { code?: string }).code;
+          const backupRef = (e as { backupRef?: string }).backupRef;
+          const backupStash = (e as { backupStash?: string }).backupStash;
+          if (typeof code === 'string' && code.startsWith('local_update_')) {
+            return jsonRes(res, 409, { ok: false, error: code, backupRef });
+          }
           if (code === 'dirty_worktree') {
             return jsonRes(res, 409, {
               ok: false, error: 'dirty_worktree',
@@ -5096,7 +5148,7 @@ const server = createServer(async (req, res) => {
           if (code === 'not_a_worktree') {
             return jsonRes(res, 400, { ok: false, error: 'not_a_worktree', dir: (e as { dir?: string }).dir ?? '' });
           }
-          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e), backupRef, backupStash });
         } finally {
           updateInFlight = false;
         }
@@ -5118,6 +5170,7 @@ const server = createServer(async (req, res) => {
           // have been pulled already and only needed a build).
           restartRequired: true,
           localDev: true,
+          backupRef: result?.backupRef,
         });
       }
       // 编译版独立二进制（install.sh 形态）：没有包管理器拥有这个文件，改为下载

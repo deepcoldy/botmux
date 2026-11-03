@@ -927,6 +927,66 @@ export async function ingestExternalSubmission(
   }
 }
 
+export type V3ExternalStageOutcome =
+  | { ok: true; kind: 'staged' }
+  | { ok: false; reason: V3ExternalAttemptRejection }
+  | { ok: false; reason: 'invalid'; problems: string[] }
+  /** Another staged submission already waits for the run's owner. */
+  | { ok: false; reason: 'pending' };
+
+/**
+ * Design §7.2 step 3 / §9.5 row 4 for a run whose owning daemon is offline:
+ * validate a submission exactly like {@link ingestExternalSubmission}, then
+ * leave it as a durable install intent in the attempt's staging area WITHOUT
+ * touching the journal. The owner commits it on its next drive (cold attach
+ * included) through the crash-recovery path ({@link settleExternalInstallIntent}),
+ * which re-checks that the attempt is still current and re-validates the bytes;
+ * until then no deadline can close the attempt over it. The journal lock is
+ * held only to serialize with a concurrent install.
+ */
+export async function stageExternalSubmissionForInstall(
+  runDir: string,
+  submission: V3ExternalSubmission,
+  ctx?: V3ExternalEngineContext,
+): Promise<V3ExternalStageOutcome> {
+  const journalPath = journalPathOf(runDir);
+  const expect = callerExpectation(submission);
+  const pre = classifyExternalAttempt(readJournal(journalPath), submission.attemptId, expect);
+  if (!pre.ok) return { ok: false, reason: pre.reason };
+  const dag = dagFor(runDir, ctx);
+  const node = externalAttemptNode(dag, pre.attempt);
+  if (!node || !isGoalNode(node)) return { ok: false, reason: 'unknown-attempt' };
+  const planned = planSubmissionFiles(node, submission);
+  if (!planned.ok) return { ok: false, reason: 'invalid', problems: planned.problems };
+
+  const attemptDir = safeExternalAttemptDir(runDir, submission.attemptId);
+  if (existsSync(submissionIntentPath(attemptDir))) return { ok: false, reason: 'pending' };
+  const stageTag = randomUUID();
+  const stageDir = join(attemptDir, 'submissions', stageTag);
+  let staged = false;
+  try {
+    const stagedManifestPath = stageSubmission(stageDir, planned.files, submission.summary);
+    let manifest: Manifest;
+    try {
+      manifest = await readAndValidateManifest(stagedManifestPath, join(stageDir, 'work'));
+    } catch (err) {
+      return { ok: false, reason: 'invalid', problems: err instanceof ManifestValidationError ? err.problems : [String(err)] };
+    }
+    const verdict = judgeStagedSubmission(node, manifest, join(stageDir, 'work'));
+    if (verdict.kind === 'invalid') return { ok: false, reason: 'invalid', problems: verdict.problems };
+    return withJournalMutationSync(journalPath, ({ events }): V3ExternalStageOutcome => {
+      const current = classifyExternalAttempt(events, submission.attemptId, expect);
+      if (!current.ok) return { ok: false, reason: current.reason };
+      if (existsSync(submissionIntentPath(attemptDir))) return { ok: false, reason: 'pending' };
+      writeSubmissionIntent(attemptDir, { schemaVersion: 1, attemptId: submission.attemptId, stageTag });
+      staged = true;
+      return { ok: true, kind: 'staged' };
+    });
+  } finally {
+    if (!staged) rmSync(stageDir, { recursive: true, force: true });
+  }
+}
+
 // ─── Reassignment ──────────────────────────────────────────────────────────
 
 export type V3ReassignOutcome =
@@ -1056,7 +1116,16 @@ function planReassign(events: readonly StoredEvent[], nodeId: string, expectedAt
  */
 export async function reassignNode(
   runDir: string,
-  input: { nodeId: string; toLarkAppId: string; by: string; expectedAttemptId?: string },
+  input: {
+    nodeId: string;
+    toLarkAppId: string;
+    by: string;
+    expectedAttemptId?: string;
+    /** Only move a blocked node (a blocked-card click must never retarget a
+     *  running or pending one). The locked re-plan below must then find the
+     *  same blocked state, so this holds under the journal lock too. */
+    requireBlocked?: boolean;
+  },
   ctx: V3ReassignContext = {},
 ): Promise<V3ReassignOutcome> {
   const journalPath = journalPathOf(runDir);
@@ -1079,6 +1148,7 @@ export async function reassignNode(
   if (currentTarget === input.toLarkAppId) return { kind: 'rejected', reason: 'same-bot' };
   const plan = planReassign(before, input.nodeId, input.expectedAttemptId);
   if (plan.kind === 'rejected') return plan;
+  if (input.requireBlocked && plan.kind !== 'blocked') return { kind: 'rejected', reason: 'not-reassignable' };
   if (plan.kind === 'blocked' && plan.reviseRequired) {
     return { kind: 'rejected', reason: 'revise-workflow-required' };
   }

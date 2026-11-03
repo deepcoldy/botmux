@@ -12,6 +12,8 @@ import {
   classifyOtherUpdate,
   observedInstallCompleted,
   binaryProgressText,
+  confirmLocalForceUpdate,
+  localForceUpdateError,
 } from './update-action.js';
 import { ui } from './ui.js';
 import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
@@ -109,7 +111,7 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
-  workflow: { enabled: boolean };
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   promptCache: PromptCacheConfig | null;
   multiTopic: { enabled: boolean };
@@ -281,7 +283,10 @@ function parseSettings(s: any): DashboardSettings {
     localDevInstall: s?.localDevInstall === true,
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
-    workflow: { enabled: s?.workflow?.enabled === true },
+    workflow: {
+      enabled: s?.workflow?.enabled === true,
+      nodeExecutor: s?.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral',
+    },
     sessionCleanup: {
       archiveCodex: s?.sessionCleanup?.archiveCodex === true,
       enabled: s?.sessionCleanup?.enabled === true,
@@ -642,7 +647,7 @@ function SettingsPage() {
     pollReconnect();
   }
 
-  async function doUpdate(): Promise<void> {
+  async function doUpdate(forceLocal = false): Promise<void> {
     const s = upStatus;
     if (!s) return;
     if (!s.node.ok) {
@@ -660,12 +665,24 @@ function SettingsPage() {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
       if (!await confirm({ title: tr('update.confirmMultiInstallTitle'), message: tr('update.confirmMultiInstall', { paths }), confirmLabel: tr('update.btnContinue'), cancelLabel: tr('update.btnCancel') })) return;
     }
+    let forceToken: string | null = null;
+    if (forceLocal) {
+      if (!localDev) return;
+      setUpBusy(true);
+      setUpMsg({ text: tr('update.forcePreviewing') });
+      try { forceToken = await confirmLocalForceUpdate(fetch, confirm, tr); }
+      catch (e) {
+        setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
+        return;
+      } finally { if (mountedRef.current) setUpBusy(false); }
+      if (!forceToken || !mountedRef.current) return;
+    }
     const confirmMsg = localDev
       ? tr('update.confirmUpdateLocalDev')
       : s.latest
         ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand! })
         : tr('update.confirmUpdateNoVer', { command: s.updateCommand! });
-    if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
+    if (!forceLocal && !await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
     const stopUpdatePoll = (): void => {
@@ -680,7 +697,10 @@ function SettingsPage() {
       }
     }, 1000);
     try {
-      const r = await fetch('/api/update/run', { method: 'POST' });
+      const r = await fetch('/api/update/run', forceToken ? {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ forceLocal: true, previewToken: forceToken }),
+      } : { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!mountedRef.current) { stopUpdatePoll(); return; }
       if (!r.ok || body.ok === false) {
@@ -726,7 +746,9 @@ function SettingsPage() {
           setUpMsg({ text: tr('update.dirtyWorktree', { detail: String(body.detail ?? '') }), cls: 'hint-warn-inline' });
           return;
         }
-        const detail = body?.detail ?? body?.error ?? `HTTP ${r.status}`;
+        const detail = localForceUpdateError(body, tr)
+          + (body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '')
+          + (body.backupStash ? '\n' + tr('update.forceBackupFallback', { ref: String(body.backupStash) }) : '');
         setUpBusy(false);
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
@@ -736,20 +758,21 @@ function SettingsPage() {
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
       const needsRestart = updateResponseNeedsRestart(body);
+      const backupNotice = body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '';
       if (needsRestart) {
         setUpBusy(false);
         // `changed` reflects whether the source actually advanced; a build-only
         // local-dev update (HEAD unchanged) still needs a restart to apply.
         setUpMsg({
-          text: body.changed
+          text: (body.changed
             ? tr('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` })
-            : tr('update.builtNeedsRestart'),
+            : tr('update.builtNeedsRestart')) + backupNotice,
           cls: 'hint-ok',
         });
         if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnLater') })) {
           await doRestart({ oldVersion: body.oldVersion, newVersion: body.newVersion });
         } else if (mountedRef.current) {
-          setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+          setUpMsg({ text: tr('update.noRestartHint') + backupNotice, cls: 'hint-ok' });
         }
       } else {
         setUpBusy(false);
@@ -803,6 +826,7 @@ function SettingsPage() {
         if (next && upChangelog === null) void loadChangelog();
       }}
       onUpdate={() => void doUpdate()}
+      onForceUpdate={() => void doUpdate(true)}
       onRestart={() => { void (async () => { if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmPlainRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnCancel') })) void doRestart(null); })(); }}
     />
   );
@@ -1129,7 +1153,17 @@ export function SettingsBody(props: {
             checked={settings.workflow.enabled}
             disabled={dis || savingKey === 'workflow'}
             onChange={value => {
-              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { enabled: value } }));
+              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { ...s.workflow, enabled: value } }));
+            }}
+          />
+          <ToggleRow
+            title={tr('settings.workflowNodeExecutorBot')}
+            help={tr('settings.workflowNodeExecutorBotHelp')}
+            checked={settings.workflow.nodeExecutor === 'bot'}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              const nodeExecutor = value ? 'bot' as const : 'ephemeral' as const;
+              void props.onSave('workflow', { workflow: { nodeExecutor } }, s => ({ ...s, workflow: { ...s.workflow, nodeExecutor } }));
             }}
           />
         </SettingsBlock>
@@ -2188,6 +2222,7 @@ export function UpdateCard(props: {
   onCheck(): void;
   onToggleChangelog(): void;
   onUpdate(): void;
+  onForceUpdate?(): void;
   onRestart(): void;
 }) {
   const tr = useT();
@@ -2229,8 +2264,10 @@ export function UpdateCard(props: {
             {props.changelogOpen ? tr('update.btnChangelogHide') : tr('update.btnChangelog')}
           </button>
           <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{updateLabel}</button>
+          {s.localDevInstall && props.onForceUpdate ? <button type="button" data-up="force-update" disabled={updateDisabled} onClick={props.onForceUpdate}>{tr('update.forceButton')}</button> : null}
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
+        {s.localDevInstall && props.onForceUpdate ? <p className="hint-warn">{tr('update.forceHint')}</p> : null}
         {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
         {props.changelogOpen ? (
           <ChangelogPanel

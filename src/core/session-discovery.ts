@@ -13,6 +13,7 @@ import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
 import { readClaudeSessionMeta } from '../services/claude-transcript.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
+import { isZombieProcess } from './session-scope.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
@@ -288,10 +289,14 @@ export function cliIdForComm(
 }
 
 /** /proc/<pid>/cmdline → argv (Linux fast path; ps fallback for macOS). */
-export function readCmdline(pid: number): string[] {
+export function readCmdline(pid: number, options: { exact?: boolean } = {}): string[] {
   try {
     return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').split('\0').filter(Boolean);
   } catch {
+    // `ps args` loses argv boundaries. It remains useful for executable
+    // discovery, but cannot distinguish a command from words inside a prompt
+    // or an option value (macOS and procfs-denied Linux).
+    if (options.exact) return [];
     try {
       const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], {
         encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
@@ -300,6 +305,37 @@ export function readCmdline(pid: number): string[] {
       return out.trim().split(/\s+/).filter(Boolean);
     } catch { return []; }
   }
+}
+
+const CODEX_VALUE_OPTIONS = new Set([
+  '-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox',
+  '-a', '--ask-for-approval', '-C', '--cd', '-i', '--image', '--add-dir',
+  '--enable', '--disable', '--local-provider', '--remote', '--remote-auth-token-env',
+]);
+const CODEX_NONINTERACTIVE_COMMANDS = new Set([
+  'debug', 'completion', 'exec', 'e', 'review', 'login', 'logout', 'mcp',
+  'mcp-server', 'app-server', 'exec-server', 'app', 'sandbox', 'apply', 'a',
+  'cloud', 'features', 'help', 'update', 'doctor', 'plugin', 'remote-control',
+  'queue', 'archive', 'unarchive', 'delete', 'migrate-rollouts', 'migrate-nfs-db',
+]);
+
+/** A wrapper may run a Codex metadata command before starting the actual TUI.
+ *  Inspect only the root command, skipping known option values: a model/profile
+ *  called "debug", or a prompt after `--`, must not look like a probe. Missing
+ *  argv retains the comm-based contract used when process inspection is denied. */
+export function isNonInteractiveCodexArgv(argv: string[]): boolean {
+  let interactiveSubcommand = false;
+  for (let index = 1; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') return false;
+    if (CODEX_VALUE_OPTIONS.has(arg)) { index++; continue; }
+    if (arg === '--help' || arg === '-h' || arg === '--version' || arg === '-V') return true;
+    if (arg.startsWith('-')) continue;
+    if (interactiveSubcommand) continue;
+    if (arg === 'resume' || arg === 'fork') { interactiveSubcommand = true; continue; }
+    return CODEX_NONINTERACTIVE_COMMANDS.has(arg);
+  }
+  return false;
 }
 
 /**
@@ -595,11 +631,12 @@ function hasCliProcess(
  * session-id discovery and leaves the JSONL bridge watching a path the real CLI
  * never writes. This walks the launcher's DESCENDANTS to find the actual CLI.
  *
- * Matching is by process `comm` ONLY — deliberately NOT argv. The launcher's own
+ * Executable matching is by process `comm`, not by searching argv. The launcher's own
  * argv carries the target name as a literal token (`aiden x claude` → "claude"
  * is in argv), so argv-scanning (cliIdFromCommArgv) would misidentify the
  * launcher itself as the CLI. The real CLI process has the binary as its comm
- * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`).
+ * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`). Codex
+ * additionally excludes noninteractive commands such as `debug models`.
  *
  * BFS starts at the launcher's children (never the launcher node) and returns
  * the shallowest descendant recognized as `targetCliId`, or null if none exists
@@ -610,11 +647,18 @@ export function findLaunchedCliPid(
   targetCliId: CliId,
   maxDepth = 6,
   // Injectable process probes (defaults hit the real OS); tests pass fakes.
-  probes: { childrenOf?: (pid: number) => number[]; commOf?: (pid: number) => string | undefined } = {},
+  probes: {
+    childrenOf?: (pid: number) => number[];
+    commOf?: (pid: number) => string | undefined;
+    cmdlineOf?: (pid: number) => string[];
+    isZombie?: (pid: number) => boolean;
+  } = {},
   filterExecutable?: string,
 ): number | null {
   const childrenOf = probes.childrenOf ?? getChildPids;
   const commOf = probes.commOf ?? readComm;
+  const cmdlineOf = probes.cmdlineOf ?? (pid => readCmdline(pid, { exact: true }));
+  const isZombie = probes.isZombie ?? isZombieProcess;
   let frontier = childrenOf(launcherPid);
   const seen = new Set<number>([launcherPid]);
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
@@ -623,7 +667,11 @@ export function findLaunchedCliPid(
       if (seen.has(pid)) continue;
       seen.add(pid);
       const comm = commOf(pid);
-      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) return pid;
+      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
+        if (targetCliId === 'codex'
+          && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
+        return pid;
+      }
       next.push(...childrenOf(pid));
     }
     frontier = next;
