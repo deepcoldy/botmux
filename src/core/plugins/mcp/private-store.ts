@@ -22,6 +22,7 @@ import type {
   PluginMcpContribution,
   PluginMcpServer,
 } from '../types.js';
+import { isValidProtectedMcpCapabilityId } from '../../protected-mcp-capabilities.js';
 
 export const PLUGIN_MCP_PRIVATE_REF = 'private/mcp.json';
 
@@ -52,8 +53,8 @@ export function isPluginMcpServer(value: unknown): value is PluginMcpServer {
       && server.command.length > 0
       && server.command.every(part => typeof part === 'string' && part.length > 0)
       && (server.env === undefined || isStringRecord(server.env))
-      && (server.hostSecret === undefined
-        || (server.name === 'mix' && server.hostSecret === 'bytedcli-ai-auth-app-key'));
+      && (server.protectedCapability === undefined
+        || isValidProtectedMcpCapabilityId(server.protectedCapability));
   }
   if (server.transport === 'streamable-http') {
     if (typeof server.url !== 'string' || !server.url) return false;

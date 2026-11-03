@@ -76,11 +76,10 @@ import type {
   LinkRefMode,
 } from '../../../services/link-ref-types.js';
 import {
-  MIX_BROKER_APP_KEY_ENV,
-  MIX_BROKER_CHILD_SECRET_FD,
-  MIX_BROKER_SECRET_FD_ENV,
-} from '../../mix-broker-security.js';
-import { ProtectedStdioClientTransport } from './protected-stdio-transport.js';
+  PROTECTED_MCP_CHILD_SECRET_FD,
+  PROTECTED_MCP_SECRET_FD_ENV,
+} from '../../protected-mcp-capabilities.js';
+import { ProtectedSecretClientTransport } from './protected-secret-transport.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -347,7 +346,7 @@ export class PluginMcpGateway {
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
   private readonly linkRefRegistration?: GatewayLinkRefRegistrationHandler;
-  private readonly requestHostSecretChannel?: () => Promise<Duplex>;
+  private readonly requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -367,14 +366,14 @@ export class PluginMcpGateway {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
       linkRefRegistration?: GatewayLinkRefRegistrationHandler;
-      requestHostSecretChannel?: () => Promise<Duplex>;
+      requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
     } = {},
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
     this.linkRefRegistration = opts.linkRefRegistration;
-    this.requestHostSecretChannel = opts.requestHostSecretChannel;
+    this.requestProtectedSecretChannel = opts.requestProtectedSecretChannel;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -455,7 +454,6 @@ export class PluginMcpGateway {
           BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
           ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
         };
-        delete downstreamEnv[MIX_BROKER_APP_KEY_ENV];
         const parameters = {
           command: resolved.command,
           args: resolved.args,
@@ -463,15 +461,15 @@ export class PluginMcpGateway {
           env: downstreamEnv,
           stderr: 'inherit',
         } as const;
-        transport = descriptor.server.hostSecret === 'bytedcli-ai-auth-app-key'
-          && this.requestHostSecretChannel
-          ? new ProtectedStdioClientTransport({
+        const protectedCapability = descriptor.server.protectedCapability;
+        transport = protectedCapability && this.requestProtectedSecretChannel
+          ? new ProtectedSecretClientTransport({
               ...parameters,
               env: {
                 ...parameters.env,
-                [MIX_BROKER_SECRET_FD_ENV]: String(MIX_BROKER_CHILD_SECRET_FD),
+                [PROTECTED_MCP_SECRET_FD_ENV]: String(PROTECTED_MCP_CHILD_SECRET_FD),
               },
-              requestSecretChannel: this.requestHostSecretChannel,
+              requestSecretChannel: () => this.requestProtectedSecretChannel!(protectedCapability),
             })
           : new StdioClientTransport(parameters);
       } else {

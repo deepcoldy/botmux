@@ -5,9 +5,8 @@ import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/c
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
 import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
 import {
-  actorWriteCapabilityEnabled,
-  mixBrokerSecretChannelEnabled,
-} from './core/mix-broker-security.js';
+  protectedMcpContainmentActive,
+} from './core/protected-mcp-capabilities.js';
 import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
@@ -1908,7 +1907,7 @@ let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
-let localActorWriteContainmentActive = false;
+let localProtectedMcpContainmentActive = false;
 const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
   reject: (error: Error) => void;
@@ -1925,7 +1924,7 @@ const pendingLinkRefModeRestores = new Map<string, {
   resolve: (mode: 'enabled' | undefined) => void;
   reject: (error: Error) => void;
 }>();
-const pendingMixBrokerSecretChannels = new Map<string, {
+const pendingProtectedSecretChannels = new Map<string, {
   resolve: (channel: Duplex) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
@@ -1939,26 +1938,32 @@ function isDuplexHandle(value: unknown): value is Duplex {
     && typeof candidate.on === 'function';
 }
 
-function requestMixBrokerSecretChannel(): Promise<Duplex> {
-  if (!mixBrokerSecretChannelEnabled() || !process.send) {
-    return Promise.reject(new Error('MIX broker secret channel is unavailable'));
+function requestProtectedSecretChannel(capabilityId: string): Promise<Duplex> {
+  const capabilityConfigured = lastInitConfig?.protectedMcpPolicy?.capabilities
+    .some(capability => capability.id === capabilityId) === true;
+  if (!capabilityConfigured || !process.send) {
+    return Promise.reject(new Error('protected MCP secret channel is unavailable'));
   }
   const requestId = randomUUID();
   return new Promise<Duplex>((resolve, reject) => {
     const timeout = setTimeout(() => {
-      const pending = pendingMixBrokerSecretChannels.get(requestId);
+      const pending = pendingProtectedSecretChannels.get(requestId);
       if (!pending) return;
-      pendingMixBrokerSecretChannels.delete(requestId);
-      pending.reject(new Error('MIX broker secret channel timed out'));
+      pendingProtectedSecretChannels.delete(requestId);
+      pending.reject(new Error('protected MCP secret channel timed out'));
     }, 10_000);
     timeout.unref();
-    pendingMixBrokerSecretChannels.set(requestId, { resolve, reject, timeout });
-    process.send?.({ type: 'mix_broker_secret_channel_request', requestId } satisfies WorkerToDaemon,
+    pendingProtectedSecretChannels.set(requestId, { resolve, reject, timeout });
+    process.send?.({
+      type: 'protected_mcp_secret_channel_request',
+      requestId,
+      capabilityId,
+    } satisfies WorkerToDaemon,
       error => {
         if (!error) return;
-        const pending = pendingMixBrokerSecretChannels.get(requestId);
+        const pending = pendingProtectedSecretChannels.get(requestId);
         if (!pending) return;
-        pendingMixBrokerSecretChannels.delete(requestId);
+        pendingProtectedSecretChannels.delete(requestId);
         clearTimeout(pending.timeout);
         pending.reject(error);
       });
@@ -2220,7 +2225,7 @@ function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
 function stopSessionMcpGatewayHost(): void {
   const host = sessionMcpGatewayHost;
   sessionMcpGatewayHost = null;
-  localActorWriteContainmentActive = false;
+  localProtectedMcpContainmentActive = false;
   if (!host) return;
   void host.close().catch((error) => {
     log(`[mcp-gateway] host shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -2377,9 +2382,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
     linkRefRegistration: registerMcpLinkRefsThroughHost,
-    requestHostSecretChannel: mixBrokerSecretChannelEnabled()
-      ? requestMixBrokerSecretChannel
-      : undefined,
+    requestProtectedSecretChannel: requestProtectedSecretChannel,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -5328,7 +5331,7 @@ function currentGatewayTrustedTurnIdentity() {
   const identity = activeTurnAuthority.identity();
   return {
     ...identity,
-    ...(localActorWriteContainmentActive ? { actorWriteAllowed: true } : {}),
+    ...(localProtectedMcpContainmentActive ? { actorWriteAllowed: true } : {}),
     ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
   };
 }
@@ -20782,7 +20785,7 @@ async function spawnCli(
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
-  localActorWriteContainmentActive = false;
+  localProtectedMcpContainmentActive = false;
   const spawnStartedAtMs = Date.now();
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
@@ -24485,10 +24488,9 @@ async function spawnCli(
       if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
-      localActorWriteContainmentActive = actorWriteCapabilityEnabled({
+      localProtectedMcpContainmentActive = protectedMcpContainmentActive({
         platform: process.platform,
-        mixPluginEnabled: mixBrokerSecretChannelEnabled(),
-        secretChannelEnabled: mixBrokerSecretChannelEnabled(),
+        provisionedCapabilityCount: cfg.protectedMcpPolicy?.capabilities.length ?? 0,
         sandboxEngaged: true,
         mcpSocketMounted: !!sessionMcpGatewayHost?.socketPath,
         pidNamespaceRetained: !coreOnlyPidNamespaceDegrade({
@@ -30005,18 +30007,18 @@ process.on('message', async (raw: unknown, handle: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
-    case 'mix_broker_secret_channel_result': {
-      const pending = pendingMixBrokerSecretChannels.get(msg.requestId);
+    case 'protected_mcp_secret_channel_result': {
+      const pending = pendingProtectedSecretChannels.get(msg.requestId);
       if (!pending) {
         if (isDuplexHandle(handle)) handle.destroy();
         break;
       }
-      pendingMixBrokerSecretChannels.delete(msg.requestId);
+      pendingProtectedSecretChannels.delete(msg.requestId);
       clearTimeout(pending.timeout);
       if (msg.ok && isDuplexHandle(handle)) pending.resolve(handle);
       else {
         if (isDuplexHandle(handle)) handle.destroy();
-        pending.reject(new Error(msg.error ?? 'MIX broker secret channel is unavailable'));
+        pending.reject(new Error(msg.error ?? 'protected MCP secret channel is unavailable'));
       }
       break;
     }

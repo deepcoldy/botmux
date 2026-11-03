@@ -4,7 +4,7 @@ import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/sdk/shared/s
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 
-export interface ProtectedStdioServerParameters {
+export interface ProtectedSecretServerParameters {
   command: string;
   args?: string[];
   env: Record<string, string>;
@@ -14,7 +14,7 @@ export interface ProtectedStdioServerParameters {
 }
 
 /** Stdio MCP transport with one daemon-served, per-child channel mapped to fd 3. */
-export class ProtectedStdioClientTransport implements Transport {
+export class ProtectedSecretClientTransport implements Transport {
   onclose?: () => void;
   onerror?: (error: Error) => void;
   onmessage?: (message: JSONRPCMessage) => void;
@@ -22,14 +22,14 @@ export class ProtectedStdioClientTransport implements Transport {
   private readonly readBuffer = new ReadBuffer();
   private readonly stderrStream: PassThrough | null;
 
-  constructor(private readonly server: ProtectedStdioServerParameters) {
+  constructor(private readonly server: ProtectedSecretServerParameters) {
     this.stderrStream = server.stderr === 'pipe' || server.stderr === 'overlapped'
       ? new PassThrough()
       : null;
   }
 
   async start(): Promise<void> {
-    if (this.process) throw new Error('ProtectedStdioClientTransport already started');
+    if (this.process) throw new Error('ProtectedSecretClientTransport already started');
     const secretChannel = await this.server.requestSecretChannel();
     await new Promise<void>((resolve, reject) => {
       const child = spawn(this.server.command, this.server.args ?? [], {

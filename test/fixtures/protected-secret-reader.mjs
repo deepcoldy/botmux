@@ -55,8 +55,9 @@ try {
   process.stdout.write(`${JSON.stringify({
     id,
     secret,
-    appKeyInEnv: process.env.BYTEDCLI_AI_AUTH_APP_KEY !== undefined,
+    secretInEnv: process.env.FIXTURE_SECRET !== undefined,
     secretInArgv: process.argv.includes(secret),
+    fdEnv: process.env.BOTMUX_PROTECTED_SECRET_FD,
   })}\n`);
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);

@@ -105,14 +105,11 @@ import { sanitizePerBotEnv } from './per-bot-env.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { buildBotWorkerEnv, type EnvPolicy } from './env-policy.js';
 import {
-  MIX_ACTOR_WRITE_ROLLOUT_ENV,
-  MIX_BROKER_APP_KEY_ENV,
-  MIX_BROKER_SECRET_CHANNEL_ENV,
-  MIX_BROKER_SECRET_FD_ENV,
-  actorWriteContainmentConfigured,
-  prepareMixBrokerWorkerChannel,
-  serveMixBrokerSecret,
-} from './mix-broker-security.js';
+  PROTECTED_MCP_SECRET_FD_ENV,
+  prepareProtectedMcpWorkerProvisioning,
+  protectedMcpContainmentConfigured,
+  serveProtectedMcpSecrets,
+} from './protected-mcp-capabilities.js';
 import { resolveSessionEnv, type ResolvedSessionEnv } from './session-env-resolve.js';
 import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
@@ -930,11 +927,12 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', MIX_BROKER_APP_KEY_ENV, MIX_ACTOR_WRITE_ROLLOUT_ENV, MIX_BROKER_SECRET_CHANNEL_ENV, MIX_BROKER_SECRET_FD_ENV] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', PROTECTED_MCP_SECRET_FD_ENV] as const;
 
-function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+function workerForkEnv(base: NodeJS.ProcessEnv, protectedEnvKeys: readonly string[] = []): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
+  for (const key of protectedEnvKeys) delete env[key];
   // Defense in depth for a daemon started from a contaminated PM2 snapshot.
   // Genuine workflow workers bypass this pool and receive their markers from
   // workflows/v3/ephemeral-pool.ts.
@@ -14727,17 +14725,22 @@ export function forkWorker(
   const botmuxBinDir = resolveBotmuxWrapperBinDir(process.env);
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
-  const forkEnv = workerForkEnv(buildBotWorkerEnv(process.env, botCfg.envPolicy));
-  const mixBrokerChannel = prepareMixBrokerWorkerChannel(
-    resolveEffectivePluginIds(botCfg, readGlobalConfig()),
+  const globalConfig = readGlobalConfig();
+  const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
+    resolveEffectivePluginIds(botCfg, globalConfig),
     process.env,
-    actorWriteContainmentConfigured({
+    globalConfig.protectedMcpCapabilities,
+    protectedMcpContainmentConfigured({
       platform: process.platform,
       backendType: resolvedBackendType,
       sandboxMode: frozenSessionSandboxMode(ds.session.sandbox),
       networkPolicy: ds.session.sandboxNetworkPolicy,
       adopt: false,
     }),
+  );
+  const forkEnv = workerForkEnv(
+    buildBotWorkerEnv(process.env, botCfg.envPolicy),
+    protectedMcpProvisioning.workerPolicy.redactEnv,
   );
   // Dequeue only after every earlier launch-preparation write has finished.
   // The exact input remains journaled until the worker confirms its adapter
@@ -14879,7 +14882,7 @@ export function forkWorker(
     distDir: join(__dirname, '..'),
     cwd,
     execArgv: workerForkExecArgv(),
-    stdio: mixBrokerChannel.stdio,
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     env: {
       ...forkEnv,
       PATH: pathWithBotmux,
@@ -14888,7 +14891,6 @@ export function forkWorker(
       SESSION_DATA_DIR: config.session.dataDir,
       BOTMUX_SESSION_ID: ds.session.sessionId,
       LARK_APP_ID: botCfg.larkAppId,
-      ...(mixBrokerChannel.secret ? { [MIX_BROKER_SECRET_CHANNEL_ENV]: 'ipc' } : {}),
       // Withhold the real secret from the worker's own CLI env for a no-transport
       // session (apiOnly bot or HTTP virtual chat). SEPARATE leak from the
       // init-message larkAppSecret — the spawned CLI env carries it directly from
@@ -14896,7 +14898,7 @@ export function forkWorker(
       LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     } as NodeJS.ProcessEnv,
   });
-  serveMixBrokerSecret(worker, mixBrokerChannel.secret);
+  serveProtectedMcpSecrets(worker, protectedMcpProvisioning.secrets);
   spawnedWorker = worker;
   startupState = {
     ready: false, failureNotified: false,
@@ -15274,6 +15276,7 @@ export function forkWorker(
     ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
     ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     pluginBindings: botCfg.plugins,
+    protectedMcpPolicy: protectedMcpProvisioning.workerPolicy,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
       ? { runnerBuildId: runtimeIdentity.id }
@@ -22109,11 +22112,16 @@ export function forkAdoptWorker(
   const rawAdoptCwd = adopted.cwd ?? ds.workingDir ?? process.cwd();
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
-  const forkEnv = workerForkEnv(buildBotWorkerEnv(process.env, botCfg.envPolicy));
-  const mixBrokerChannel = prepareMixBrokerWorkerChannel(
-    resolveEffectivePluginIds(botCfg, readGlobalConfig()),
+  const globalConfig = readGlobalConfig();
+  const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
+    resolveEffectivePluginIds(botCfg, globalConfig),
     process.env,
+    globalConfig.protectedMcpCapabilities,
     false,
+  );
+  const forkEnv = workerForkEnv(
+    buildBotWorkerEnv(process.env, botCfg.envPolicy),
+    protectedMcpProvisioning.workerPolicy.redactEnv,
   );
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
   // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).
@@ -22121,19 +22129,18 @@ export function forkAdoptWorker(
     distDir: join(__dirname, '..'),
     cwd: adoptCwd,
     execArgv: workerForkExecArgv(),
-    stdio: mixBrokerChannel.stdio,
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     env: {
       ...forkEnv,
       CLAUDECODE: undefined,
       BOTMUX: '1',
       LARK_APP_ID: botCfg.larkAppId,
-      ...(mixBrokerChannel.secret ? { [MIX_BROKER_SECRET_CHANNEL_ENV]: 'ipc' } : {}),
       // Withhold the real secret from the adopt worker's CLI env for a
       // no-transport session — same rationale as forkWorker above.
       LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     } as NodeJS.ProcessEnv,
   });
-  serveMixBrokerSecret(worker, mixBrokerChannel.secret);
+  serveProtectedMcpSecrets(worker, protectedMcpProvisioning.secrets);
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   let initMsg!: DaemonToWorker;
@@ -22317,6 +22324,7 @@ export function forkAdoptWorker(
     backendType: adoptBackendType,
     adoptMode: true,
     envPolicy: botCfg.envPolicy,
+    protectedMcpPolicy: protectedMcpProvisioning.workerPolicy,
     adoptSource: adopted.source ?? adoptBackendType,
     adoptTmuxTarget: adopted.tmuxTarget,
     adoptHerdrSessionName: adopted.herdrSessionName,

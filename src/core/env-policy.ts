@@ -1,12 +1,7 @@
 import { sanitizePerBotEnv, isReservedPerBotEnvKey } from './per-bot-env.js';
 import { BOTMUX_INJECTED_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS, redactChildEnv } from '../utils/child-env.js';
 import { applySessionEnvUnset } from './session-env.js';
-import {
-  MIX_ACTOR_WRITE_ROLLOUT_ENV,
-  MIX_BROKER_APP_KEY_ENV,
-  MIX_BROKER_SECRET_CHANNEL_ENV,
-  MIX_BROKER_SECRET_FD_ENV,
-} from './mix-broker-security.js';
+import { PROTECTED_MCP_SECRET_FD_ENV } from './protected-mcp-capabilities.js';
 
 /** Secret-free per-bot inheritance policy. Missing means historical inheritance. */
 export interface EnvPolicy {
@@ -83,10 +78,7 @@ export function buildSessionChildEnv(
 /** Worker control process retains Botmux control knobs, never business env. */
 export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): NodeJS.ProcessEnv {
   const env = inheritBotEnv(base, policy);
-  delete env[MIX_BROKER_APP_KEY_ENV];
-  delete env[MIX_ACTOR_WRITE_ROLLOUT_ENV];
-  delete env[MIX_BROKER_SECRET_CHANNEL_ENV];
-  delete env[MIX_BROKER_SECRET_FD_ENV];
+  delete env[PROTECTED_MCP_SECRET_FD_ENV];
   if (policy?.mode === 'strict') {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS,
       'BOTMUX_SANDBOX', 'BOTMUX_CORE_ONLY', 'BOTMUX_HOME', 'BOTMUX_CONFIG_DIR',

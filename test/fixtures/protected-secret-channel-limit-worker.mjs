@@ -1,10 +1,11 @@
 const channelCount = Number(process.argv[2] ?? 129);
+const capabilityId = process.argv[3] ?? 'fixture.secret.v1';
 const channels = [];
 let successes = 0;
 let failures = 0;
 
 process.on('message', (message, handle) => {
-  if (message?.type !== 'mix_broker_secret_channel_result') return;
+  if (message?.type !== 'protected_mcp_secret_channel_result') return;
   if (message.ok && handle) {
     successes += 1;
     channels.push(handle);
@@ -20,7 +21,8 @@ process.on('message', (message, handle) => {
 
 for (let index = 0; index < channelCount; index += 1) {
   process.send({
-    type: 'mix_broker_secret_channel_request',
+    type: 'protected_mcp_secret_channel_request',
     requestId: String(index),
+    capabilityId,
   });
 }

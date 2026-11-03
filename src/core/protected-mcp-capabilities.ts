@@ -1,10 +1,18 @@
+import type { ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
+import { createConnection, createServer, type Socket } from 'node:net';
 import { isValidPluginId } from './plugins/ids.js';
+import {
+  privateBrokerContainmentEnabled,
+  type SandboxNetworkPolicy,
+} from './sandbox-network-policy.js';
 
 const PROTECTED_MCP_CAPABILITY_ID = /^[a-z][a-z0-9._:-]{0,127}$/;
 const ENVIRONMENT_VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export const PROTECTED_MCP_CONTAINMENT_PROFILE = 'local-stdio-secret-v1' as const;
 export const PROTECTED_MCP_SECRET_FD_ENV = 'BOTMUX_PROTECTED_SECRET_FD' as const;
+export const PROTECTED_MCP_CHILD_SECRET_FD = 3;
 
 export interface ProtectedMcpCapabilityConfig {
   enabled: boolean;
@@ -27,6 +35,22 @@ export interface ProtectedMcpIsolationPolicy {
   protectedHomePaths: string[];
   secretEnvNames: string[];
   redactEnv: string[];
+}
+
+export interface ProtectedMcpWorkerPolicy {
+  capabilities: Array<{
+    id: string;
+    allowedPluginIds: string[];
+    principal?: 'verified-human-email';
+    containmentProfile: typeof PROTECTED_MCP_CONTAINMENT_PROFILE;
+  }>;
+  protectedHomePaths: string[];
+  redactEnv: string[];
+}
+
+export interface ProtectedMcpWorkerProvisioning {
+  workerPolicy: ProtectedMcpWorkerPolicy;
+  secrets: Map<string, string>;
 }
 
 export function isValidProtectedMcpCapabilityId(value: unknown): value is string {
@@ -134,4 +158,196 @@ export function protectedMcpIsolationPolicy(
     secretEnvNames: [...secretEnvNames],
     redactEnv: [...redactEnv],
   };
+}
+
+export function prepareProtectedMcpWorkerProvisioning(
+  pluginIds: readonly string[] | undefined,
+  env: NodeJS.ProcessEnv,
+  config: ProtectedMcpCapabilityConfigMap | undefined,
+  containmentConfigured: boolean,
+): ProtectedMcpWorkerProvisioning {
+  const isolation = protectedMcpIsolationPolicy(pluginIds, config);
+  const workerPolicy: ProtectedMcpWorkerPolicy = {
+    capabilities: [],
+    protectedHomePaths: isolation.protectedHomePaths,
+    redactEnv: [...new Set([...isolation.secretEnvNames, ...isolation.redactEnv])],
+  };
+  const secrets = new Map<string, string>();
+  const enabledPlugins = new Set(pluginIds ?? []);
+  if (!containmentConfigured) return { workerPolicy, secrets };
+
+  for (const [id, capability] of Object.entries(config ?? {})) {
+    if (!capability.enabled) continue;
+    if (!capability.allowedPluginIds.some(pluginId => enabledPlugins.has(pluginId))) continue;
+    const secret = env[capability.secret.name]?.trim();
+    if (!secret) continue;
+    workerPolicy.capabilities.push({
+      id,
+      allowedPluginIds: [...capability.allowedPluginIds],
+      ...(capability.principal ? { principal: capability.principal } : {}),
+      containmentProfile: capability.containmentProfile,
+    });
+    secrets.set(id, secret);
+  }
+  return { workerPolicy, secrets };
+}
+
+export function protectedMcpContainmentConfigured(input: {
+  platform: string;
+  backendType: string;
+  sandboxMode: 'off' | 'oncall' | 'scratch';
+  networkPolicy: SandboxNetworkPolicy | undefined;
+  adopt: boolean;
+}): boolean {
+  return input.platform === 'linux'
+    && input.backendType === 'pty'
+    && input.sandboxMode === 'oncall'
+    && !input.adopt
+    && privateBrokerContainmentEnabled(input.networkPolicy);
+}
+
+export function protectedMcpContainmentActive(input: {
+  platform: string;
+  provisionedCapabilityCount: number;
+  sandboxEngaged: boolean;
+  mcpSocketMounted: boolean;
+  pidNamespaceRetained: boolean;
+  networkPolicy: SandboxNetworkPolicy | undefined;
+}): boolean {
+  return input.platform === 'linux'
+    && input.provisionedCapabilityCount > 0
+    && input.sandboxEngaged
+    && input.mcpSocketMounted
+    && input.pidNamespaceRetained
+    && privateBrokerContainmentEnabled(input.networkPolicy);
+}
+
+export function serveProtectedMcpSecrets(
+  child: Pick<ChildProcess, 'connected' | 'on' | 'off' | 'send'>,
+  secrets: ReadonlyMap<string, string>,
+): void {
+  if (secrets.size === 0) return;
+  const active = new Set<Socket>();
+  let reservedChannels = 0;
+  const sendFailure = (requestId: string, error: string) => {
+    if (!child.connected) return;
+    child.send({
+      type: 'protected_mcp_secret_channel_result',
+      requestId,
+      ok: false,
+      error,
+    });
+  };
+  const onMessage = (raw: unknown) => {
+    const message = raw && typeof raw === 'object' ? raw as Record<string, unknown> : undefined;
+    if (message?.type !== 'protected_mcp_secret_channel_request'
+      || typeof message.requestId !== 'string'
+      || typeof message.capabilityId !== 'string') return;
+    const requestId = message.requestId;
+    const secret = secrets.get(message.capabilityId);
+    if (!secret) {
+      sendFailure(requestId, 'protected_mcp_capability_unavailable');
+      return;
+    }
+    if (reservedChannels >= 128) {
+      sendFailure(requestId, 'protected_mcp_secret_channel_limit');
+      return;
+    }
+    reservedChannels += 1;
+    void createProtectedSecretSocketPair().then(({ daemonSocket, workerSocket }) => {
+      if (!child.connected) {
+        reservedChannels -= 1;
+        daemonSocket.destroy();
+        workerSocket.destroy();
+        return;
+      }
+      active.add(daemonSocket);
+      daemonSocket.once('close', () => {
+        if (active.delete(daemonSocket)) reservedChannels -= 1;
+      });
+      serveOneShotProtectedSecret(daemonSocket, secret);
+      child.send({
+        type: 'protected_mcp_secret_channel_result',
+        requestId,
+        ok: true,
+      }, workerSocket, error => {
+        workerSocket.destroy();
+        if (error) daemonSocket.destroy();
+      });
+    }).catch(() => {
+      reservedChannels -= 1;
+      sendFailure(requestId, 'protected_mcp_secret_channel_unavailable');
+    });
+  };
+  const cleanup = () => {
+    child.off('message', onMessage);
+    for (const socket of active) socket.destroy();
+    active.clear();
+  };
+  child.on('message', onMessage);
+  child.on('exit', cleanup);
+}
+
+async function createProtectedSecretSocketPair(): Promise<{
+  daemonSocket: Socket;
+  workerSocket: Socket;
+}> {
+  const server = createServer();
+  try {
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('protected MCP channel address unavailable');
+    }
+    const accepted = once(server, 'connection') as Promise<[Socket]>;
+    const workerSocket = createConnection({ host: '127.0.0.1', port: address.port });
+    await once(workerSocket, 'connect');
+    const [daemonSocket] = await accepted;
+    daemonSocket.setNoDelay(true);
+    workerSocket.setNoDelay(true);
+    return { daemonSocket, workerSocket };
+  } finally {
+    if (server.listening) server.close();
+  }
+}
+
+function serveOneShotProtectedSecret(socket: Socket, secret: string): void {
+  const response = Buffer.from(`${Buffer.byteLength(secret)}\n${secret}`, 'utf8');
+  let request = '';
+  let settled = false;
+  const clear = () => {
+    response.fill(0);
+    request = '';
+  };
+  const fail = () => {
+    if (settled) return;
+    settled = true;
+    clear();
+    socket.destroy();
+  };
+  const timeout = setTimeout(fail, 10_000);
+  timeout.unref();
+  socket.on('error', fail);
+  socket.on('close', () => {
+    clearTimeout(timeout);
+    clear();
+  });
+  socket.on('data', chunk => {
+    if (settled) return;
+    request += String(chunk);
+    if (request.length > 16) {
+      fail();
+      return;
+    }
+    const newline = request.indexOf('\n');
+    if (newline < 0) return;
+    if (request.slice(0, newline) !== 'KEY' || request.slice(newline + 1).length > 0) {
+      fail();
+      return;
+    }
+    settled = true;
+    clearTimeout(timeout);
+    socket.end(response, clear);
+  });
 }
