@@ -230,7 +230,7 @@ export function renderGoalFile(
     ...artifactSection,
     '## How to complete this node',
     'You are an autonomous agent completing exactly ONE botmux v3 workflow node.',
-    'Work toward the goal above until it is done, then stop. Do NOT ask the user with interactive tools (they are disabled in this mode). If you genuinely need a human DECISION to proceed, use the human-ask escape hatch described below (also available as the `botmux-goal-ask` skill).',
+    'Work toward the goal above until it is done, then stop. Do NOT ask the user with interactive tools (they are disabled in this mode). If you genuinely need a human DECISION to proceed, use the human-ask escape hatch described below (the same protocol is available via `botmux skill show botmux-goal-ask`).',
     '',
     `- Upstream inputs: the file at $${E.INPUTS_PATH} is a JSON object \`{ "inputs": [...] }\` listing upstream products, each with an absolute \`path\`. Read only the ones the goal needs (it may be empty). If it includes an input entry \`{ "from": "human", "name": "answer", "path": "..." }\`, read that JSON file before continuing. If an \`omitted\` array is present, those declared inputs were intentionally not produced (their workflow branch was not taken) — treat their absence as by-design, do NOT invent their content.`,
     `- Revisit feedback: if any input has \`"from": "revisit"\`, a DOWNSTREAM node sent this node back because its product was inadequate. You MUST read these before doing anything else: \`reason\` (why you were sent back), \`source:*\` (the downstream node's output — the evidence of what was wrong), and \`previous:*\` (YOUR OWN previous output — edit/fix it, do not rewrite from scratch). Address the reason; do not just reproduce the prior output.`,

@@ -32,6 +32,7 @@ import type { Locale } from '../i18n/index.js';
 import { escapeXmlText } from '../utils/xml.js';
 import { isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from '../global-config.js';
 import { isWorkflowNodeSessionEnv } from '../workflows/node-session-env.js';
+import { isWorkflowSubagentEnv } from '../workflows/subagent-env.js';
 import {
   BUILTIN_SKILLS,
   MULTI_BOT_DISPATCH_SKILL_NAMES,
@@ -48,29 +49,48 @@ import {
 } from './effective-builtins.js';
 import { renderBotmuxSendSkill } from './reply-style-guide.js';
 
-/** The unconditional built-ins with the v3 Workflow family spliced back in at
- *  their historical position (right after `botmux-handoff`) when the machine-wide
- *  workflow switch is ON. Splicing rather than appending keeps the ENABLED-path
- *  catalog byte-for-byte identical to before the family was factored out; when
- *  the switch is OFF the family is simply absent. The independent multi-topic
- *  switch similarly filters `botmux-orchestrate`; a workflow node session gets
- *  neither the family nor the multi-bot dispatch skills. */
-function baseBuiltinSkills(
-  workflowEnabled: boolean,
-  multiTopicEnabled: boolean,
-  workflowNodeSession = false,
-): typeof BUILTIN_SKILLS {
-  let builtins = multiTopicEnabled
+/** Built-ins the model is told about up front (prompt catalog / `botmux skill
+ *  list`). The independent multi-topic switch filters `botmux-orchestrate`; a
+ *  workflow node session also loses the multi-bot dispatch skills.
+ *
+ *  The v3 Workflow family is deliberately NEVER here, even with the workflow
+ *  switch ON: a session only needs it once a workflow is actually decided (the
+ *  user sent `/workflow`, or agreed to the routing hint's offer), and then it
+ *  reads the body on demand via `botmux skill show botmux-workflow`. Keeping
+ *  ~770 characters of workflow trigger text out of every session prompt is the
+ *  point; see docs/design/2026-11-03-workflow-bot-handoff.md §4. */
+function catalogBuiltinSkills(multiTopicEnabled: boolean, workflowNodeSession = false): typeof BUILTIN_SKILLS {
+  const builtins = multiTopicEnabled
     ? [...BUILTIN_SKILLS]
     : BUILTIN_SKILLS.filter(skill => skill.name !== 'botmux-orchestrate');
-  if (workflowNodeSession) {
-    builtins = builtins.filter((skill) => !MULTI_BOT_DISPATCH_SKILL_NAMES.includes(skill.name));
-    return builtins;
-  }
-  if (!workflowEnabled) return builtins;
-  const anchor = builtins.findIndex((s) => s.name === 'botmux-handoff');
-  const at = anchor >= 0 ? anchor + 1 : builtins.length;
-  return [...builtins.slice(0, at), ...WORKFLOW_FEATURE_SKILLS, ...builtins.slice(at)];
+  return workflowNodeSession
+    ? builtins.filter((skill) => !MULTI_BOT_DISPATCH_SKILL_NAMES.includes(skill.name))
+    : builtins;
+}
+
+const GOAL_ASK_SKILL_NAME = 'botmux-goal-ask';
+
+/** Everything `botmux skill show` may resolve: the catalog plus, while the
+ *  machine-wide workflow switch is ON, the on-demand v3 Workflow skills for
+ *  this kind of session. A disabled host can't pull a workflow skill at all.
+ *
+ *  - Ordinary session (may become a workflow's main bot): the orchestration
+ *    skills (`botmux-workflow`, the v2 `botmux-workflow-create` helper), never
+ *    the goal-worker ask protocol.
+ *  - Workflow sub-session (goal worker / Architect): only `botmux-goal-ask`,
+ *    the one workflow skill a node needs; no orchestration skills.
+ *  - Workflow node session (a bot executing a handed-off node): none. */
+function showableBuiltinSkills(
+  workflowEnabled: boolean,
+  multiTopicEnabled: boolean,
+  subagent: boolean,
+  workflowNodeSession = false,
+): typeof BUILTIN_SKILLS {
+  const catalog = catalogBuiltinSkills(multiTopicEnabled, workflowNodeSession);
+  if (!workflowEnabled || workflowNodeSession) return catalog;
+  const forSession = WORKFLOW_FEATURE_SKILLS.filter((skill) =>
+    subagent ? skill.name === GOAL_ASK_SKILL_NAME : skill.name !== GOAL_ASK_SKILL_NAME);
+  return [...catalog, ...forSession];
 }
 
 export type SkillInjectionMode = 'global' | 'prompt' | 'off';
@@ -211,10 +231,6 @@ export function builtinSkillEntries(opts: {
    *  Send remains as an on-demand complex-delivery skill. Set for the prompt-mode
    *  catalog; leave off for `botmux skill list`, which surfaces everything. */
   excludeRoutingCovered?: boolean;
-  /** Machine-wide v3 Workflow switch. Defaults to the live accessor
-   *  (`isWorkflowFeatureEnabled`); when off, the botmux-workflow family is not
-   *  advertised. Explicit for tests. */
-  workflowEnabled?: boolean;
   /** Machine-wide multi-topic orchestration switch. Explicit for tests. */
   multiTopicEnabled?: boolean;
   /** A workflow node session (no workflow family, no multi-bot dispatch
@@ -224,13 +240,12 @@ export function builtinSkillEntries(opts: {
   /** Per-bot 群负责人开关（默认关）。开启时才在 prompt 目录里暴露该技能。 */
   chatManagerEnabled?: boolean;
 }): BuiltinSkillEntry[] {
-  // A workflow node session never gets the workflow family nor the multi-bot
-  // dispatch skills (design §4.2, N3); in-worker callers see the marker in
-  // env, daemon callers pass it from the session row.
+  // A workflow node session never gets the multi-bot dispatch skills (design
+  // §4.2, N3); in-worker callers see the marker in env, daemon callers pass it
+  // from the session row.
   const workflowNodeSession = opts.workflowNodeSession ?? isWorkflowNodeSessionEnv();
-  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
   const multiTopicEnabled = opts.multiTopicEnabled ?? isMultiTopicOrchestrationEnabled();
-  let defs = baseBuiltinSkills(workflowEnabled, multiTopicEnabled, workflowNodeSession);
+  let defs = catalogBuiltinSkills(multiTopicEnabled, workflowNodeSession);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
   if (opts.chatManagerEnabled === true) defs.push({ name: CHAT_MANAGER_SKILL_NAME, content: CHAT_MANAGER_SKILL });
@@ -261,9 +276,10 @@ export function builtinSkillContent(
   env: Record<string, string | undefined> = process.env,
 ): string | undefined {
   const all = [
-    ...baseBuiltinSkills(
+    ...showableBuiltinSkills(
       isWorkflowFeatureEnabled(),
       isMultiTopicOrchestrationEnabled(env),
+      isWorkflowSubagentEnv(env),
       isWorkflowNodeSessionEnv(env),
     ),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },

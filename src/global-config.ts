@@ -133,8 +133,9 @@ export interface WorkflowFeatureGlobalConfig {
   /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== true`
    *  keeps the feature OFF (disabled by default). Set true to turn the whole
    *  workflow feature on for this host: the `/workflow` grill + Saved-Workflow
-   *  run/save entries are accepted, the `botmux-workflow` family of skills is
-   *  advertised/installed, and the CLI authoring/run subcommands work.
+   *  run/save entries are accepted, the `botmux-workflow` family of skills can
+   *  be read on demand (`botmux skill show`; never resident in session prompts),
+   *  and the CLI authoring/run subcommands work.
    *  In-flight run management (cancel / retry / grant) stays available so a run
    *  started before a flip can still be wound down. The multi-bot
    *  `botmux-orchestrate` skill is intentionally NOT gated by this — it is a

@@ -35,7 +35,7 @@ import { join } from 'node:path';
 
 import { builtinSkillContent, builtinSkillEntries, builtinSkillHelpPointer } from '../src/skills/injection-mode.js';
 import { WORKFLOW_FEATURE_SKILL_NAMES } from '../src/skills/definitions.js';
-import { ensurePluginSkills, ensureWorkflowSkills } from '../src/skills/installer.js';
+import { ensurePluginSkills } from '../src/skills/installer.js';
 import { builtinPluginDirForSession, syncWorkflowNodePluginDir, workflowNodePluginDir } from '../src/skills/workflow-node-plugin-dir.js';
 import { runSkillSessionCommand } from '../src/core/skills/cli-session-command.js';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
@@ -66,12 +66,12 @@ afterEach(() => {
 const names = () => builtinSkillEntries({ asksViaHook: false }).map((entry) => entry.name);
 
 describe('prompt catalog and `botmux skill list/show`', () => {
-  it('in-worker catalog: a node session loses the dispatch skills (and the workflow family), nothing else', () => {
+  it('in-worker catalog: a node session loses the dispatch skills, nothing else', () => {
     const ordinary = names();
     vi.stubEnv(WORKFLOW_NODE_SESSION_ENV, '1');
     const node = names();
-    expect(ordinary).toEqual(expect.arrayContaining([...DISPATCH, ...KEPT, ...WORKFLOW_FEATURE_SKILL_NAMES]));
-    expect(node).toEqual(ordinary.filter((name) => !DISPATCH.includes(name) && !WORKFLOW_FEATURE_SKILL_NAMES.includes(name)));
+    expect(ordinary).toEqual(expect.arrayContaining([...DISPATCH, ...KEPT]));
+    expect(node).toEqual(ordinary.filter((name) => !DISPATCH.includes(name)));
   });
 
   it('daemon-built opening input (prompt-catalog CLI): only a session row carrying the marker loses them', () => {
@@ -131,7 +131,9 @@ describe('native plugin dirs', () => {
   const skillsIn = (dir: string) => readdirSync(join(dir, 'skills')).sort();
   const prepare = (cliId: string, dir: string) => {
     ensurePluginSkills(cliId, dir);
-    ensureWorkflowSkills(cliId, join(dir, 'skills'), true);
+    // A workflow skill an older build left in the shared dir.
+    mkdirSync(join(dir, 'skills', 'botmux-workflow'), { recursive: true });
+    writeFileSync(join(dir, 'skills', 'botmux-workflow', 'SKILL.md'), '---\nname: botmux-workflow\n---\n');
   };
 
   it.each([

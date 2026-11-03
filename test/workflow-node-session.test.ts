@@ -77,20 +77,21 @@ describe('node session marker suppresses workflow injection', () => {
     }
   });
 
-  it('skill catalog and `botmux skill show`: no workflow family for a node session', () => {
+  it('skill catalog and `botmux skill show`: no workflow skill at all for a node session', () => {
     const ordinary = builtinSkillEntries({ asksViaHook: false }).map((entry) => entry.name);
     process.env[WORKFLOW_NODE_SESSION_ENV] = '1';
     const node = builtinSkillEntries({ asksViaHook: false }).map((entry) => entry.name);
+    // Never resident in a catalog (read on demand); an ordinary session can
+    // read the main-bot ones, a node session none — not even botmux-goal-ask.
     for (const name of WORKFLOW_FEATURE_SKILL_NAMES) {
-      expect(ordinary).toContain(name);
+      expect(ordinary).not.toContain(name);
       expect(node).not.toContain(name);
       expect(builtinSkillContent(name, { ...process.env })).toBeUndefined();
-      expect(builtinSkillContent(name, { ...process.env, [WORKFLOW_NODE_SESSION_ENV]: '' })).toBeDefined();
     }
-    // Besides the multi-bot dispatch skills (test/workflow-node-skills.test.ts),
-    // only the workflow family is removed.
-    expect(node).toEqual(ordinary.filter((name) => !WORKFLOW_FEATURE_SKILL_NAMES.includes(name)
-      && name !== 'botmux-orchestrate' && name !== 'botmux-handoff'));
+    expect(builtinSkillContent('botmux-workflow', { ...process.env, [WORKFLOW_NODE_SESSION_ENV]: '' })).toBeDefined();
+    // Besides the multi-bot dispatch skills (test/workflow-node-skills.test.ts)
+    // the catalog is unchanged.
+    expect(node).toEqual(ordinary.filter((name) => name !== 'botmux-orchestrate' && name !== 'botmux-handoff'));
   });
 });
 

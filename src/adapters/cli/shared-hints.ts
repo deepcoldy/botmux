@@ -16,6 +16,7 @@ import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { isWorkflowNodeSessionEnv } from '../../workflows/node-session-env.js';
+import { isWorkflowSubagentEnv } from '../../workflows/subagent-env.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
@@ -50,9 +51,11 @@ function workflowDiscoveryHintText(locale?: Locale): string {
 
 /** Keep Workflow discoverable even when the full skill catalog is not injected.
  *  Gated by the machine-wide workflow switch (isWorkflowFeatureEnabled) so a
- *  disabled host never advertises `/workflow`; returns undefined when off. */
+ *  disabled host never advertises `/workflow`; returns undefined when off.
+ *  A workflow sub-session (goal worker / Architect) is executing one step of a
+ *  workflow and must not be told to offer starting one, so it never gets it. */
 function workflowDiscoveryHint(locale?: Locale, opts: { workflowNodeSession?: boolean } = {}): string | undefined {
-  if (!isWorkflowFeatureEnabled()) return undefined;
+  if (!isWorkflowFeatureEnabled() || isWorkflowSubagentEnv()) return undefined;
   // A workflow node session executes one node of an approved run; offering to
   // start a workflow there is noise (design 2026-11-03 §4.2). The worker
   // process carries the marker in its env; daemon-side builders pass it.
