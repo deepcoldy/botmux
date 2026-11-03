@@ -203,6 +203,8 @@ import { removeSessionMcpGatewayDir } from './plugins/mcp/socket-dir.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { materializeFeedbackPolicyForDelivery } from '../services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import { attachWorkflowSidebarEntry, workflowNodeSessionEntry, workflowSidebarEntryLink } from '../im/lark/workflow-sidebar-entry.js';
+import { resolveDashboardOrigin } from './workbench-link.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
 import { TurnResultStore } from '../services/turn-result-store.js';
@@ -21769,6 +21771,18 @@ function deliverFinalOutput(
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
       }
+      // §11 / §5.5: a node session's replies carry the run's「工作流 ›」entry
+      // at the signature row's right end (after the on-call button).
+      cardJson = attachWorkflowSidebarEntry(cardJson, workflowNodeSessionEntry(
+        ds.session.workflowNode,
+        (mainLarkAppId, runId) => workflowSidebarEntryLink({
+          dashboardOrigin: resolveDashboardOrigin(),
+          mainLarkAppId,
+          runId,
+          brand: getBotBrand(ds.larkAppId),
+          locale: localeForBot(ds.larkAppId),
+        }),
+      ));
       const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {

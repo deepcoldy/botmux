@@ -420,22 +420,29 @@ export function DagNode(props: {
     return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} />;
   }
   const botLine = nodeBotLine(node);
+  const fit = boxTextFit(box.width);
   return (
     <g
       className={`v3r-node st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
     >
-      <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.plainHeight} rx="10" />
-      <text className="v3r-nid" x={box.x + 14} y={box.y + 20}>{trunc(node.id, 22)}</text>
+      <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.plainHeight} rx="10" />
+      <text className="v3r-nid" x={box.x + 14} y={box.y + 20}>{trunc(node.id, fit(22))}</text>
       <text className={`v3r-nbot${botLine ? '' : ' empty'}`} x={box.x + 14} y={box.y + 38}>
-        {botLine ? trunc(botLine, 24) : '—'}
+        {botLine ? trunc(botLine, fit(24)) : '—'}
       </text>
       <text className="v3r-nstatus" x={box.x + 14} y={box.y + 55}>
-        {trunc(nodeStatusLine(node, props.generatedAt), 22)}
+        {trunc(nodeStatusLine(node, props.generatedAt), fit(22))}
       </text>
     </g>
   );
+}
+
+/** Truncation budget for a box narrower than the standard width (the sidebar's
+ *  vertical layout); the standard box keeps its historical budgets. */
+function boxTextFit(width: number): (chars: number) => number {
+  return (chars) => (width >= V3_GRAPH.nodeWidth ? chars : Math.max(8, Math.floor(chars * width / V3_GRAPH.nodeWidth)));
 }
 
 function LoopGraphNode(props: {
@@ -463,10 +470,10 @@ function LoopGraphNode(props: {
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
     >
-      <rect className="v3r-cap" x={box.x - 4} y={box.y - 4} width={V3_GRAPH.nodeWidth + 8} height={V3_GRAPH.loopHeight + 8} rx="14" />
-      <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.loopHeight} rx="10" />
+      <rect className="v3r-cap" x={box.x - 4} y={box.y - 4} width={box.width + 8} height={V3_GRAPH.loopHeight + 8} rx="14" />
+      <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.loopHeight} rx="10" />
       <text className="v3r-spin" x={box.x + 14} y={box.y + 21}>⟳</text>
-      <text className="v3r-nid" x={box.x + 30} y={box.y + 21}>{trunc(node.id, 20)}</text>
+      <text className="v3r-nid" x={box.x + 30} y={box.y + 21}>{trunc(node.id, boxTextFit(box.width)(20))}</text>
       <text className="v3r-nstatus" x={box.x + 14} y={box.y + 39}>{statusLine}</text>
       {ls && budget !== undefined && budget <= V3_GRAPH.maxDots ? (
         <LoopBudgetDots node={node} x={box.x} y={box.y} budget={budget} maxIterations={maxIterations} />
@@ -615,7 +622,7 @@ export function NodeExecution(props: { node: RunNodeView; generatedAt: number | 
   );
 }
 
-function NodeErrorLine(props: { node: RunNodeView }): React.JSX.Element {
+export function NodeErrorLine(props: { node: RunNodeView }): React.JSX.Element {
   const node = props.node;
   return (
     <p className="v3r-err">
@@ -751,7 +758,7 @@ function RoundMiniDag(props: {
   );
 }
 
-function TerminalSlot(props: { runId: string; node: RunNodeView | null }): React.JSX.Element {
+export function TerminalSlot(props: { runId: string; node: RunNodeView | null }): React.JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
   const renderedSignatureRef = useRef<string | null>(null);
   const signature = props.node ? `${props.runId}|${props.node.id}|${nodeTerminalSignature(props.node)}` : null;

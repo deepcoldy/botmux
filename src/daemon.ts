@@ -776,7 +776,13 @@ import {
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
 import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
-import { buildV3ProgressCard } from './im/lark/v3-progress-card.js';
+import { buildV3ProgressCard, v3ProgressWorkflowEntry } from './im/lark/v3-progress-card.js';
+import { workflowSidebarEntryLink } from './im/lark/workflow-sidebar-entry.js';
+import {
+  checkWorkflowViewerChatMembership,
+  parseWorkflowSidebarMembershipRequest,
+  WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+} from './core/workflow-sidebar-membership.js';
 import { V3ProgressCardManager } from './im/lark/v3-progress-card-manager.js';
 import { buildV3RunSaveActionValue } from './im/lark/v3-run-save-card.js';
 import { buildV3DistillationProposalCard } from './im/lark/v3-distillation-card.js';
@@ -6665,6 +6671,18 @@ async function executePluginSlashCommand(input: {
   });
 }
 
+/** §11: a bot-executed run's「工作流 ›」sidebar entry, as posted by this
+ *  daemon's bot (cards in one chat share its brand). No Dashboard address →
+ *  no entry; callers pass undefined and the card keeps its old shape. */
+function daemonWorkflowSidebarEntry(mainLarkAppId: string, runId: string) {
+  return workflowSidebarEntryLink({
+    dashboardOrigin: resolveDashboardOrigin(),
+    mainLarkAppId,
+    runId,
+    brand: getBotBrand(selfDaemonLarkAppId ?? mainLarkAppId),
+  });
+}
+
 // Dependencies passed to card-handler
 // v3 run-level progress is a best-effort IM projection. journal.ndjson remains
 // the only execution truth; the manager persists only Lark delivery state.
@@ -6687,7 +6705,11 @@ const v3ProgressCardManager = new V3ProgressCardManager({
             chat: buildV3RunSaveActionValue(loaded.envelope, 'chat'),
           }
         : undefined;
-    return buildV3ProgressCard(view, saveActions ? { saveActions } : {});
+    const workflowEntry = v3ProgressWorkflowEntry(loaded.envelope, daemonWorkflowSidebarEntry);
+    return buildV3ProgressCard(view, {
+      ...(saveActions ? { saveActions } : {}),
+      ...(workflowEntry ? { workflowEntry } : {}),
+    });
   },
   onError: (runId, err) => {
     logger.warn(`[v3:${runId}] progress card failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -6811,6 +6833,7 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   loadRun: workflowLoadBotRun,
   drive: (runId) => v3GateRunner.driveDetached(runId),
   botName: (appId) => v3BotDisplayNameResolver()(appId),
+  workflowEntry: daemonWorkflowSidebarEntry,
   warn: (message) => logger.warn(message),
 });
 
@@ -9158,6 +9181,30 @@ ipcRoute('POST', WORKFLOW_HANDOFF_STOP_ROUTE, async (req, res) => {
   }
   const result = workflowNodeDaemon.stopRoute(raw);
   return jsonRes(res, result.status, result.body);
+});
+
+// Dashboard ← workflow sidebar (design 2026-11-03 §11.3): is this viewer a
+// current member of the run's chat, as this (main) bot's app sees it? Trusted
+// host only — the Dashboard asks on behalf of an H5 / platform identity it has
+// already authenticated; a failed lookup answers 503 and the Dashboard denies.
+ipcRoute('POST', WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  if (!selfDaemonLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const appId = selfDaemonLarkAppId;
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 4 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const request = parseWorkflowSidebarMembershipRequest(raw);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  const verdict = await checkWorkflowViewerChatMembership(request, {
+    resolveOpenIdByUnionId: (unionId) => resolveTargetAppOpenId(appId, unionId),
+    listChatMemberOpenIds: (chatId) => listChatMemberOpenIds(appId, chatId),
+  });
+  if (verdict === 'unavailable') return jsonRes(res, 503, { ok: false, error: 'membership_unavailable' });
+  return jsonRes(res, 200, { ok: true, member: verdict === 'member' });
 });
 
 // Executing bot's daemon ← its own CLI (`botmux report --dispatch-root

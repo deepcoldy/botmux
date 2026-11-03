@@ -2132,6 +2132,7 @@ export const messages: Record<string, string> = {
   'card.duration_hours': '{hours}h',
   'card.sent_to': 'Sent to: ',
   'card.reply_console': 'Console',
+  'card.workflow_sidebar_entry': 'Workflow ›',
   'card.usage.context': 'Context',
   // Claude Code statusline quota segment (plain `ctx 23% · 5h 18% · 7d 5%`); same in both locales.
   'card.usage.ctx': 'ctx',

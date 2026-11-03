@@ -94,6 +94,13 @@ import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-
 import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
+import { handleWorkflowSidebar } from './dashboard/workflow-sidebar-api.js';
+import {
+  WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+  WorkflowSidebarMembershipCache,
+  type WorkflowSidebarMembershipRequest,
+  type WorkflowViewerMembership,
+} from './core/workflow-sidebar-membership.js';
 import {
   defaultRunsDir as v3RunsDir,
   liveV3TerminalPortForSession,
@@ -486,6 +493,28 @@ const dashboardH5Auth = createDashboardH5AuthController({
   audit: dashboardControlAudit,
 });
 const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
+const workflowSidebarMembership = new WorkflowSidebarMembershipCache();
+
+/** Ask the run's main bot daemon (its own app) whether the viewer is in the
+ *  run's chat. Offline daemon / any error → unavailable (the sidebar denies). */
+async function askWorkflowSidebarMembership(
+  mainLarkAppId: string,
+  request: WorkflowSidebarMembershipRequest,
+): Promise<WorkflowViewerMembership> {
+  try {
+    const response = await proxyToDaemon(mainLarkAppId, WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: request.chatId, ...request.principal }),
+    });
+    if (!response.ok) return 'unavailable';
+    const body = await response.json().catch(() => null) as { ok?: unknown; member?: unknown } | null;
+    if (body?.ok !== true || typeof body.member !== 'boolean') return 'unavailable';
+    return body.member ? 'member' : 'not_member';
+  } catch {
+    return 'unavailable';
+  }
+}
 try {
   pluginResultArtifacts.sweepExpired();
 } catch (error) {
@@ -4152,6 +4181,23 @@ const server = createServer(async (req, res) => {
         if (!dashboardH5AuthConfig.enabled) return undefined;
         return `${dashboardH5AuthConfig.entryPath}?returnTo=${encodeURIComponent(returnTo)}`;
       },
+    })) return;
+
+    // Workflow sidebar (design 2026-11-03 §11): the `/workflow/<app>/<run>`
+    // entry and its read-only data route own their D6 gate — admins see the
+    // full run, current chat members a server-trimmed view, everyone else 403.
+    // Mounted before the ordinary gate because the H5 session it accepts for
+    // non-allowlisted members is invisible to every other route.
+    if (await handleWorkflowSidebar(req, res, url, {
+      runsDir: v3RunsDir(),
+      identity: () => dashboardRequestIdentity(req),
+      h5: () => dashboardH5Auth.resolve(req),
+      h5Config: dashboardH5AuthConfig,
+      platformLoginUrl: returnTo => buildPlatformDashboardLoginUrl(returnTo),
+      membership: workflowSidebarMembership,
+      askMembership: askWorkflowSidebarMembership,
+      brand: appId => normalizeBrand(configuredBrands().get(appId)),
+      botName: v3RunBotNameResolver(),
     })) return;
 
     // Session Web preview is an authenticated, same-origin reverse proxy to an

@@ -6,6 +6,7 @@ import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
   REPLY_CARD_HEADING_ELEMENT_ID_RE,
+  WORKFLOW_SIDEBAR_ENTRY_ELEMENT_ID,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
@@ -2081,6 +2082,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // botmux's own callback buttons (🔊 语音总结 …) are dropped entirely.
   if (tag === 'button') {
     if (isBotmuxCallbackButton(el)) return;
+    // The workflow sidebar entry is signature-row navigation, like the footer.
+    if (el.element_id === WORKFLOW_SIDEBAR_ENTRY_ELEMENT_ID) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
     if (btnText) {
       const url = buttonOpenUrl(el);
