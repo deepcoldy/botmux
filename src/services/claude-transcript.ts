@@ -133,9 +133,13 @@ export interface TranscriptEvent {
    *  Background launches are read from here — see {@link backgroundTaskLaunches}. */
   toolUseResult?: unknown;
   /** `type:"queue-operation"` lines: `enqueue` / `dequeue` / `remove` on Claude
-   *  Code's input queue, with the queued text in the top-level `content`. */
+   *  Code's input queue, with the queued text in the top-level `content`.
+   *  `remove` records additionally carry the queued item's `commandUuid`
+   *  (and often its `deliveryId`); `enqueue` / `dequeue` carry neither. */
   operation?: string;
   content?: unknown;
+  commandUuid?: string;
+  deliveryId?: string;
 }
 
 /**

@@ -135,6 +135,98 @@ to "no dedup" or answers a retryable 503 rather than growing without limit.
 If some upstream reuses one id for genuinely **different** events, the feature
 can be turned off for that connector.
 
+## Async triggers and result polling (programmatic callers)
+
+A plain POST is fire-and-forget: the bot runs in the group and its final answer
+goes only to Feishu. Programmatic systems (task orchestrators, CI pipelines)
+that want the **session id and the final output** add a query parameter:
+
+```bash
+curl -X POST 'http://<host>/webhook/<id>/<token>?async=1' \
+  -H 'content-type: application/json' \
+  -d '{"event":"..."}'
+```
+
+It returns immediately:
+
+```json
+{ "ok": true, "action": "queued",
+  "triggerId": "trg_…",
+  "target": { "kind": "turn", "sessionId": "2eed60c4-…" },
+  "async": { "status": "pending", "sessionId": "2eed60c4-…" } }
+```
+
+Then poll for the result (same connector credential; for HMAC the GET has an
+empty body, so sign over an empty payload):
+
+```bash
+curl 'http://<host>/webhook/<id>/<token>?sessionId=<sessionId>&triggerId=<triggerId>'
+```
+
+> ⚠️ The webhook polling route carries a legacy-consumer adapter: `failed` /
+> `not_found` come back as **404 + `ok:false`** (the `.state` field is kept).
+> The four states (`running` / `completed` / `failed` / `interrupted` /
+> `not_found`) and their fields are documented in the
+> [trigger-result section](/api-task-trigger#8-polling-the-result-four-state-contract)
+> of the API trigger guide — branch on `.state`.
+
+### Durable at-most-once: `durable=1`
+
+Plain `async=1` has no cross-process dedup; retrying after a lost response can
+start a second run. With `durable=1` the turn uses the **daemon's on-disk
+dispatch lease** (survives dashboard/daemon restarts): a retry with the same
+idempotency key **always returns the first run's `sessionId` / `triggerId`** and
+is never dispatched twice.
+
+```bash
+curl -X POST '…/webhook/<id>/<token>?async=1&durable=1' \
+  -H 'content-type: application/json' \
+  -H 'idempotency-key: <unique-task-id>' \
+  -d '{"event":"..."}'
+```
+
+Requirements (any violation is a `400` with no dispatch):
+
+- The connector uses **token verification**, targets a **dynamic turn**
+  (`mode=dynamic`, `kind=turn`), and has idempotency enabled.
+- `async=1` and an idempotency key (non-empty, ≤200 chars) are required;
+  `wait=1` / `dryRun=1` cannot be combined with it.
+- The request must **not** carry `chatId` / `sessionId` / `rootMessageId` —
+  every durable turn is a fresh virtual session; the target comes solely from
+  the connector configuration.
+
+Behaviour notes:
+
+- The lease key sent to the daemon is `whapi:` +
+  `sha256([connectorId, yourIdempotencyKey])`; the response carries
+  `durableAsync: true`.
+- The key binds the **full business request**: same key with a different body or
+  handling instruction makes the daemon answer `409 idempotency_conflict`
+  rather than silently reuse the turn.
+- The connector's **forwarded-header allowlist is not applied** in durable mode.
+  Headers like `x-request-id` or gateway delivery ids vary per delivery; on the
+  normal path they reach the model context, but for durable retries they would
+  change the request fingerprint and collide as 409, so they are dropped. Only
+  allowlist headers that are genuinely stable if you need them.
+- If the daemon crashes mid-dispatch, the key converges to a terminal `failed`
+  (`no_output`: previous dispatch outcome unknown, at-most-once means no rerun).
+  Two same-key requests arriving **simultaneously** can also make the second
+  observe `failed` during the millisecond reservation window — keep polling
+  `trigger-result`; that is the source of truth.
+
+### Capability probe: `GET ?capabilities=1`
+
+Before submitting, a caller can check whether the connector supports durable
+async (credentials required):
+
+```bash
+curl 'http://<host>/webhook/<id>/<token>?capabilities=1'
+# { "ok": true, "capabilities": { "async": true, "durableAsync": true } }
+```
+
+`durableAsync` is `true` exactly when: token verification + dynamic turn +
+idempotency enabled.
+
 ## Which group to deliver to
 
 ### Fixed group

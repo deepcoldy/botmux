@@ -61,6 +61,7 @@ import {
 import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
 import { NAV_GROUPS, NAV_ITEMS, NAV_SUBPAGES, type NavItem } from './nav-items.js';
 import { DECISION_BOARD_CHANGED_EVENT, boardsFromResponse } from './decision-board-model.js';
+import { parseWorkflowSidebarHash } from '../../core/workflow-sidebar-link.js';
 import type { PalettePageEntry, PaletteShellContext } from './command-palette-sources.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
@@ -1937,6 +1938,20 @@ void (async () => {
   initFloatingScrollbars(host);
   initIconTooltips();
   appRoot = createRoot(host);
+
+  // 工作流侧边栏（任务消息签名行「工作流 ›」→ /workflow/<app>/<run> 302 到这里）：飞书侧栏只有
+  // 350–800px，访问者多半是群成员而不是 Dashboard 管理员。只挂这一页、不探 /api/settings、不拉
+  // 会话快照：那些接口对群成员本就是 401，探了只会盖上登录浮层。权限完全由页面自己的只读接口判。
+  const workflowSidebar = parseWorkflowSidebarHash(location.search, location.hash);
+  if (workflowSidebar) {
+    const { WorkflowSidebarPage } = await import('./workflow-sidebar-page.js');
+    appRoot.render(
+      <div className="workbench-route-host" data-workbench-surface="workflow">
+        <main id="root"><WorkflowSidebarPage target={workflowSidebar} fetcher={origFetch} /></main>
+      </div>,
+    );
+    return;
+  }
   renderShell();
 
   ui.on(() => {

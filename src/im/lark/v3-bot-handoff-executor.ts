@@ -59,6 +59,7 @@ import {
   v3HandoffBodyText,
   type V3HandoffCardInput,
 } from './v3-node-card.js';
+import type { WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
 export interface V3BotHandoffTransport {
   /** New top-level message in the chat (the node topic's root). */
@@ -117,6 +118,9 @@ export interface V3BotHandoffExecutorDeps {
   }): Promise<void>;
   /** §6.5: open the main bot's own node session; idempotent per handoff. */
   startSelfTurn(input: V3SelfTurnRequest): Promise<{ sessionId: string }>;
+  /** §11: this run's「工作流 ›」sidebar entry (the main bot is this daemon's
+   *  bot); undefined = no Dashboard address, the cards carry no entry. */
+  workflowEntry?(runId: string): WorkflowSidebarEntryLink | undefined;
   now?(): number;
 }
 
@@ -299,13 +303,17 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
 
     const context = readRunCardContext(request.runDir, request.runId);
     const sketchId = request.loop ? request.loop.bodyNodeId : request.nodeId;
-    const content = (handoffRef: string) => v3HandoffContent(
-      request,
-      { title: context.title, acceptance: context.acceptanceBySketch.get(sketchId) },
-      mention,
-      handoffRef,
-      nonce,
-    );
+    const entry = deps.workflowEntry?.(request.runId);
+    const content = (handoffRef: string): V3HandoffCardInput => ({
+      ...v3HandoffContent(
+        request,
+        { title: context.title, acceptance: context.acceptanceBySketch.get(sketchId) },
+        mention,
+        handoffRef,
+        nonce,
+      ),
+      ...(entry ? { entry } : {}),
+    });
     const nodeIndex = context.goalNodeIds.indexOf(request.loop ? request.loop.loopId : request.nodeId);
     const nodeCard = buildV3NodeCard({
       runTitle: context.title,
@@ -319,6 +327,7 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       status: { kind: 'handing_off' },
       upstream: request.node.depends.map((dep) => ({ nodeId: dep.from, done: true })),
       now: now(),
+      ...(entry ? { entry } : {}),
     });
     // Retries, revisits and later loop rounds of a node hand off again in the
     // node's existing topic (§5.4); only its first attempt opens one.

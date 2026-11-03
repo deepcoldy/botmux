@@ -25,6 +25,7 @@ import { promisify } from 'node:util';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
 import { join } from 'node:path';
+import { updateDispatchRegistry } from './dispatch-registry.js';
 import { logger } from '../utils/logger.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
 import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.js';
@@ -239,6 +240,11 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
+import { updateMessage } from '../im/lark/client.js';
+import { safeRequirementUrl } from './dispatch-task-tree.js';
+import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
+import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
+import { knownBotAppIds } from '../services/known-bot-app-ids.js';
 import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
@@ -1176,7 +1182,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -3852,6 +3858,83 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
           || detail === 'project_workstream_title_required' || detail === 'project_workstream_title_too_long' ? 400
           : 502;
     return jsonRes(res, status, { ok: false, error: detail });
+  }
+});
+
+// ─── 编排任务树卡片 ──────────────────────────────────────────────────────────
+
+const dispatchTaskTreeCards = createDispatchTaskTreeCards({
+  dataDir: () => config.session.dataDir,
+  listSessions: roots => listDispatchTreeSessionRows(roots, config.session.dataDir),
+  localAppIds: () => knownBotAppIds({ dataDir: config.session.dataDir }),
+  resolveThreadId: (larkAppId, messageId) => getMessageThreadId(larkAppId, messageId),
+  post: (orch, cardJson) => orch.rootMessageId
+    ? replyMessage(orch.larkAppId, orch.rootMessageId, cardJson, 'interactive', true)
+    : sendMessage(orch.larkAppId, orch.chatId, cardJson, 'interactive'),
+  update: (larkAppId, messageId, cardJson) => updateMessage(larkAppId, messageId, cardJson),
+  isMessageGone: isTaskTreeCardGone,
+  brand: larkAppId => getBotBrand(larkAppId),
+  log: message => logger.warn(message),
+});
+
+function taskTreeOrchestrator(ds: NonNullable<ReturnType<typeof findActiveBySessionId>>): TaskTreeOrchestrator {
+  const scope = ds.scope ?? ds.session.scope ?? 'thread';
+  return {
+    sessionId: ds.session.sessionId,
+    larkAppId: ds.larkAppId,
+    chatId: ds.chatId,
+    ...(scope !== 'chat' && ds.session.rootMessageId ? { rootMessageId: ds.session.rootMessageId } : {}),
+    title: ds.session.title,
+  };
+}
+
+function taskTreeRequirement(body: Record<string, unknown> | undefined): { id?: string; url?: string } | undefined {
+  const id = typeof body?.taskId === 'string' && body.taskId.trim() ? body.taskId.trim().slice(0, 128) : undefined;
+  const url = typeof body?.taskUrl === 'string' ? safeRequirementUrl(body.taskUrl.slice(0, 2048)) : undefined;
+  return id || url ? { ...(id ? { id } : {}), ...(url ? { url } : {}) } : undefined;
+}
+
+/** `botmux dispatch tree` and the dispatch CLI: refresh (or first post) this
+ *  orchestrating session's task-tree card. Same session-scoped auth as /project. */
+ipcRoute('POST', '/api/sessions/:sessionId/dispatch-tree', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  const requirement = taskTreeRequirement(body);
+  try {
+    const dispatchRoot = typeof body?.dispatchRoot === 'string' ? body.dispatchRoot : '';
+    if (dispatchRoot && (body?.kind === 'review' || body?.kind === 'task')) {
+      // Only this session's own dispatch entries can be labelled.
+      await updateDispatchRegistry(join(config.session.dataDir, 'orchestrate-dispatch.json'), registry => {
+        const entry = registry[dispatchRoot] as Record<string, unknown> | undefined;
+        if (entry && entry.orchSessionId === ds.session.sessionId) entry.kind = body.kind;
+      });
+    }
+    const result = await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds), requirement ? { requirement } : {});
+    return jsonRes(res, 200, { ok: true, text: result.text, messageId: result.messageId ?? null, posted: result.posted, nodes: result.tree.nodes.length });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(error) });
+  }
+});
+
+/** A child's report landed (recorded on the dispatch entry by the reporting
+ *  daemon): patch the orchestrator's card. Host-local callers only. */
+ipcRoute('POST', '/api/dispatch-tree/refresh', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  const sessionId = typeof body?.orchSessionId === 'string' ? body.orchSessionId : '';
+  const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
+  if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  try {
+    const result = await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds));
+    return jsonRes(res, 200, { ok: true, messageId: result.messageId ?? null, posted: result.posted });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(error) });
   }
 });
 

@@ -723,7 +723,8 @@ export function boardErrorStatus(error: unknown): { status: number; error: strin
     const status = error.code === 'not_steward' ? 409
       : error.code === 'item_not_found' || error.code === 'batch_not_found' ? 404
         : error.code === 'storage_unavailable' ? 503
-          : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict' ? 409
+          : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict'
+            || error.code === 'item_ended' ? 409
             : 400;
     return { status, error: error.code, message: error.message };
   }

@@ -1038,6 +1038,32 @@ export function drainTraexRollout(
       events.push({ ...base, kind: 'turn_started', text: '', sourceTurnId });
       continue;
     }
+    // New TraeX rollouts persist genuine user input only in history_mutation.
+    // Require the runtime's user.text provenance and matching native turn ID:
+    // plain role=user also includes AGENTS/environment/runtime injections.
+    if (obj.type === 'history_mutation' && payload.operation === 'append'
+      && sourceTurnId && Array.isArray(payload.items)) {
+      for (const item of payload.items) {
+        const meta = item?.internal_chat_message_metadata_passthrough;
+        if (item?.type !== 'message' || item.role !== 'user'
+          || meta?.turn_id !== sourceTurnId || !Array.isArray(meta.content_item_kinds)
+          || !meta.content_item_kinds.includes('user.text') || !Array.isArray(item.content)) continue;
+        const text = item.content.flatMap((block: any) => block?.type === 'input_text'
+          && typeof block.text === 'string' ? [block.text] : []).join('');
+        if (text && claimUserTurn(sourceTurnId)) {
+          events.push({ ...base, kind: 'user', text, sourceTurnId });
+          if (!probe) {
+            // Forward the no-turn-id pending bucket to this turn, mirroring the
+            // legacy user_message / item_completed user edges. Do NOT delete any
+            // pending bucket: assistant evidence for this same turn can already
+            // be buffered (item_completed AgentMessage observed before the user
+            // edge), and a type-ahead next turn's edge must not discard the
+            // previous turn's pending final either.
+            traexPendingAgentTurns(path).activeKey = sourceTurnId;
+          }
+        }
+      }
+    }
     // The append-only history is TraeX's canonical model/tool timeline. Its
     // event_msg records mirror reasoning and tool completion, so consuming
     // those too would duplicate nodes. One mutation can carry parallel calls
