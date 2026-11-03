@@ -67,7 +67,7 @@ Equivalent per-Bot `bots.json` configuration:
 
 For a separate summary model, use `"naming": { "mode": "ai-summary", "model": "your-available-lightweight-model-id" }`.
 
-Reuse accepts Codex native semantic titles or titles published through Botmux session rename; it does not scan every CLI's private title store. The `[BotMux·Lark]` prefix is removed before applying length limits and `sessionGroup.namePrefix`. Naming stops after the first success. Ordinary groups and subtopics are unaffected. Manual group names are protected; legacy entries without a trusted birth name remain unchanged. Failed renames retain the candidate for bounded retries on later group messages.
+Reuse accepts Codex native semantic titles or titles published through Botmux session rename (including Agent renames and renames initiated by the user from the Dashboard or inside a session); it does not scan every CLI's private title store. The `[BotMux·Lark]` prefix is removed before applying length limits and `sessionGroup.namePrefix`. Naming stops after the first success. Ordinary groups and subtopics are unaffected. Manual group names are protected; legacy entries without a trusted birth name remain unchanged. Failed renames retain the candidate for bounded retries on later group messages.
 
 ## DM-created session groups: change the tag on close
 

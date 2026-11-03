@@ -78,19 +78,37 @@ describe('Codex session-group native title reuse', () => {
     expect(getSessionGroup(CHAT)?.titleAttempts).toBeUndefined();
   });
 
-  it('uses the semantic core, configured prefix and length cap exactly once', async () => {
+  it('applies the configured prefix and the exact length cap, only once', async () => {
     state.cfg.sessionGroup = { namePrefix: '任务·', naming: { mode: 'session-title', maxLen: 3 } };
     const s = state.sessions.get('s1')!;
     acceptSessionGroupTitle(APP, s, '[BotMux·Lark] 排查超时');
     acceptSessionGroupTitle(APP, s, '[BotMux·Lark] 排查超时');
     await settle();
     expect(state.rename).toHaveBeenCalledTimes(1);
-    expect(state.rename).toHaveBeenCalledWith(APP, CHAT, '任务·排查超时', expect.objectContaining({ expectedOldName: 'placeholder' }));
+    expect(state.rename).toHaveBeenCalledWith(APP, CHAT, '任务·排查超', expect.objectContaining({ expectedOldName: 'placeholder' }));
     expect(state.exec).not.toHaveBeenCalled();
     expect(getSessionGroup(CHAT)).toMatchObject({ titled: true, pendingNativeTitle: undefined });
     schedule();
     await settle();
     expect(state.rename).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['42', '---', '2026'])('accepts a title the CLI-stdout sanitizer would reject: %s', async core => {
+    const s = state.sessions.get('s1')!;
+    s.nativeSessionTitle = `[BotMux·Lark] ${core}`;
+    acceptSessionGroupTitle(APP, s, `[BotMux·Lark] ${core}`);
+    await settle();
+    expect(state.rename).toHaveBeenCalledWith(APP, CHAT, core, expect.anything());
+  });
+
+  it('truncates a long reused title to the configured maxLen, not the loose stdout ceiling', async () => {
+    const longTitle = '排查支付链路上游超时的根因分析与修复方案';
+    const s = state.sessions.get('s1')!;
+    s.nativeSessionTitle = `[BotMux·Lark] ${longTitle}`;
+    acceptSessionGroupTitle(APP, s, `[BotMux·Lark] ${longTitle}`);
+    await settle();
+    const applied = (state.rename.mock.calls[0] as unknown[])[2];
+    expect(Array.from(String(applied)).length).toBe(12);
   });
 
   it.each([

@@ -166,6 +166,19 @@ export function sanitizeTitleOutput(stdout: string, maxLen: number): string | nu
   return capped || null;
 }
 
+/** Reused Agent titles are already single-line display strings (the worker
+ *  parser rejects newlines; canonical session renames normalise to one line),
+ *  so they must NOT pass through the CLI-stdout sanitizer: its log-line
+ *  heuristics reject legitimate names such as "42" or "---". Apply the
+ *  configured maxLen exactly, unlike one-shot output whose loose 2x ceiling
+ *  compensates for a model that ignores the length instruction. */
+export function reuseTitleForChat(raw: string, maxLen: number): string | null {
+  const core = raw.replace(/\s+/g, ' ').trim();
+  const limit = Math.max(1, Math.floor(maxLen));
+  const capped = Array.from(core).slice(0, limit).join('');
+  return capped || null;
+}
+
 /** Whether this CLI has a one-shot print mode the title generator can drive. */
 export function supportsOneShotTitle(cliId: string): boolean {
   return Object.prototype.hasOwnProperty.call(ONE_SHOT_ARGV, cliId);
@@ -394,7 +407,7 @@ export function scheduleSessionGroupTitle(opts: {
       const maxLen = sg.naming?.maxLen && sg.naming.maxLen > 0 ? sg.naming.maxLen : DEFAULT_TITLE_MAX_LEN;
 
       const title = reuseNative
-        ? sanitizeTitleOutput(candidate!.title, maxLen)
+        ? reuseTitleForChat(candidate!.title, maxLen)
         : await generateOneShotTitle({ larkAppId, chatId, userText, maxLen, logTag: 'session-group', model: sg.naming?.model });
       if (!title || !eligible()) return;
       const prefix = sg.namePrefix ?? '';
