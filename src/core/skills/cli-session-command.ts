@@ -3,7 +3,7 @@ import { listSkillResources, readSkillEntrypoint, readSkillResource } from './re
 import { builtinSkillContent, builtinSkillEntries, isWithheldFromWorkflowNodeSession } from '../../skills/injection-mode.js';
 import type { SessionSkillManifest } from './types.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
-import { isWorkflowNodeSessionEnv } from '../../workflows/node-session-env.js';
+import { workflowSessionKind } from '../../workflows/session-kind.js';
 
 export interface SkillCommandResult {
   code: number;
@@ -22,7 +22,7 @@ function builtinListLines(env: Record<string, string | undefined>): string[] {
   return builtinSkillEntries({
     asksViaHook: false,
     whiteboardEnabled: whiteboardEnabled(),
-    workflowNodeSession: isWorkflowNodeSessionEnv(env),
+    sessionKind: workflowSessionKind(env),
   }).map((e) => `${e.name}\t${e.description}`.trimEnd());
 }
 
@@ -31,15 +31,15 @@ export function runSkillSessionCommand(
   env: Record<string, string | undefined> = process.env,
 ): SkillCommandResult {
   const sub = args[0] ?? 'list';
-  // A workflow node session runs one node and submits it with `botmux report`:
-  // it is not offered the workflow family or the multi-bot dispatch skills, and
-  // asking for one by name gets the reason instead of a misleading "not found".
+  // A session executing a workflow node does that node itself: it is not
+  // offered the multi-bot dispatch skills or the workflow skills its kind does
+  // not use, and asking for one by name gets the reason instead of "not found".
   if ((sub === 'show' || sub === 'resources' || sub === 'read') && args[1]
     && isWithheldFromWorkflowNodeSession(args[1], env)) {
     return {
       code: 1,
       stdout: '',
-      stderr: `${args[1]} is not available in a workflow node session: do this node's work here and submit it with \`botmux report\` (see the handoff message).\n`,
+      stderr: `${args[1]} is not available while executing a workflow node: do this node's work in this session instead of starting a workflow or handing it to another bot.\n`,
     };
   }
   // Built-in botmux bridge skills are delivered by prompt-catalog (no user-skill

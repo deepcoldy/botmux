@@ -4,7 +4,9 @@
  * The plugin-dir CLIs (Claude family / Cursor / Oh My Pi via `--plugin-dir`,
  * Pi via `--skill`) load botmux's built-ins from ONE per-machine directory
  * that every session's CLI reads at startup, so it cannot be filtered per
- * session. A workflow node session is pointed at a sibling copy instead —
+ * session. A session executing a workflow node (bot node session or legacy
+ * goal worker / Architect, workflows/session-kind.ts) is pointed at a sibling
+ * copy instead —
  * `<pluginDir>-workflow-node` — holding the same reconciled skills minus
  * {@link WORKFLOW_NODE_WITHHELD_SKILL_NAMES}. The copy is refreshed from the
  * shared dir right before such a session's CLI is spawned, so user overrides,
@@ -18,7 +20,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } fr
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import { isWorkflowNodeSessionEnv } from '../workflows/node-session-env.js';
+import { workflowSessionKind, workflowSessionPolicy } from '../workflows/session-kind.js';
 import { WORKFLOW_NODE_WITHHELD_SKILL_NAMES } from './definitions.js';
 
 export const WORKFLOW_NODE_PLUGIN_DIR_SUFFIX = '-workflow-node';
@@ -72,8 +74,8 @@ export function syncWorkflowNodePluginDir(pluginDir: string): string {
 
 /**
  * The built-in plugin dir this session's CLI should load: the shared one for
- * ordinary sessions, the node-session copy (refreshed now) for a workflow node
- * session. If the copy cannot be prepared the shared dir is used — skills are
+ * ordinary sessions, the node-session copy (refreshed now) for either kind of
+ * workflow node session. If the copy cannot be prepared the shared dir is used — skills are
  * guidance, and a CLI without its built-ins would be worse than one that also
  * lists the withheld ones.
  */
@@ -81,7 +83,7 @@ export function builtinPluginDirForSession(
   pluginDir: string,
   env: Record<string, string | undefined> = process.env,
 ): string {
-  if (!isWorkflowNodeSessionEnv(env)) return pluginDir;
+  if (!workflowSessionPolicy(workflowSessionKind(env)).nodePluginDir) return pluginDir;
   try {
     return syncWorkflowNodePluginDir(pluginDir);
   } catch (err) {

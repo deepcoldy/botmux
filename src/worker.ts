@@ -288,7 +288,7 @@ import {
   isWorkflowFeatureEnabled,
   isRemoteAccessEnabled,
 } from './global-config.js';
-import { WORKFLOW_NODE_SESSION_ENV } from './workflows/node-session-env.js';
+import { WORKFLOW_NODE_SESSION_ENV } from './workflows/session-kind.js';
 import {
   prepareSessionScopedLaunch,
   stopAllSessionScopes,

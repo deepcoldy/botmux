@@ -1,10 +1,13 @@
 /**
- * Workflow node sessions and multi-bot dispatch skills (design 2026-11-03
- * §4.2, N3). A node session executes one node of an approved run and submits
- * it with `botmux report`, so it is offered neither the workflow family nor
- * the skills that hand work to other bots (botmux-orchestrate, botmux-handoff)
- * — not in the prompt catalog, not via `botmux skill list/show`, and not in the
- * native plugin dirs its CLI loads. Ordinary sessions keep everything.
+ * Sessions executing a workflow node (design 2026-11-03 §4.2, N3) — both kinds
+ * of workflows/session-kind.ts: a bot's own node session and the legacy
+ * ephemeral goal worker / Architect. Neither starts workflows nor hands its
+ * work to other bots, so neither is offered the discovery hint or the multi-bot
+ * dispatch skills (botmux-orchestrate, botmux-handoff) — not in the prompt
+ * catalog, not via `botmux skill list/show`, and not in the native plugin dirs
+ * its CLI loads. The workflow skills differ by kind: a legacy worker keeps
+ * botmux-goal-ask, a bot node session gets none. Ordinary sessions keep
+ * everything.
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -39,7 +42,8 @@ import { ensurePluginSkills } from '../src/skills/installer.js';
 import { builtinPluginDirForSession, syncWorkflowNodePluginDir, workflowNodePluginDir } from '../src/skills/workflow-node-plugin-dir.js';
 import { runSkillSessionCommand } from '../src/core/skills/cli-session-command.js';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
-import { WORKFLOW_NODE_SESSION_ENV } from '../src/workflows/node-session-env.js';
+import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
+import { WORKFLOW_NODE_SESSION_ENV, workflowSessionKind } from '../src/workflows/session-kind.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
@@ -48,6 +52,7 @@ import { createPiAdapter } from '../src/adapters/cli/pi.js';
 const DISPATCH = ['botmux-orchestrate', 'botmux-handoff'];
 const KEPT = ['botmux-send', 'botmux-bots', 'botmux-schedule'];
 const NODE = { [WORKFLOW_NODE_SESSION_ENV]: '1' };
+const LEGACY_WORKERS = [{ BOTMUX_V3_GOAL: '1' }, { BOTMUX_WORKFLOW: '1' }];
 
 beforeAll(() => mkdirSync(HOME, { recursive: true }));
 afterAll(() => rmSync(HOME, { recursive: true, force: true }));
@@ -56,6 +61,8 @@ beforeEach(() => {
   vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', 'true');
   vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'true');
   vi.stubEnv(WORKFLOW_NODE_SESSION_ENV, '');
+  vi.stubEnv('BOTMUX_V3_GOAL', '');
+  vi.stubEnv('BOTMUX_WORKFLOW', '');
   injection.mode = 'prompt';
 });
 afterEach(() => {
@@ -124,6 +131,52 @@ describe('prompt catalog and `botmux skill list/show`', () => {
       expect(builtinSkillContent(name, node)).toBeUndefined();
     }
     expect(runSkillSessionCommand(['show', 'botmux-send'], node)).toMatchObject({ code: 0 });
+  });
+});
+
+describe('one classification for every kind of session', () => {
+  const ON = { BOTMUX_WORKFLOW_ENABLED: 'true', BOTMUX_MULTI_TOPIC_ENABLED: 'true' };
+  const KINDS = [
+    ['ordinary', {}],
+    ['legacyNodeWorker', LEGACY_WORKERS[0]!],
+    ['legacyNodeWorker', LEGACY_WORKERS[1]!],
+    ['botNode', NODE],
+    ['botNode', { ...NODE, ...LEGACY_WORKERS[0]! }], // the stricter kind wins
+  ] as const;
+  const withEnv = <T>(env: Record<string, string>, read: () => T): T => {
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+    try { return read(); } finally { for (const key of Object.keys(env)) vi.stubEnv(key, ''); }
+  };
+  // 0 = shown, 1 = refused with the reason (withheld from this kind),
+  // 2 = not a skill of this session at all.
+  const shown = (env: Record<string, string>, name: string) =>
+    runSkillSessionCommand(['show', name], { BOTMUX_SESSION_ID: 's-kind', ...ON, ...env }).code;
+
+  it.each(KINDS)('%s %j: discovery hint, catalog, `skill show`, help pointer and plugin dir follow the kind', (kind, env) => {
+    vi.stubEnv('SESSION_DATA_DIR', mkdtempSync(join(tmpdir(), 'wf-node-skills-data-')));
+    expect(workflowSessionKind(env)).toBe(kind);
+    const ordinary = kind === 'ordinary';
+    // Routing discovery hint (both injection paths) and the injection-off pointer.
+    const hinted = withEnv(env, () => [
+      buildBotmuxShellHints('en').some((line) => line.startsWith('Workflow:')),
+      buildBotmuxSystemPromptText({ locale: 'en' }).includes('Workflow:'),
+      builtinSkillHelpPointer('en') === builtinSkillHelpPointer('en', { workflowEnabled: true }),
+    ]);
+    expect(hinted).toEqual([ordinary, ordinary, ordinary]);
+    // Catalog and `skill show`: the dispatch skills only for ordinary sessions.
+    const catalog = withEnv(env, () => names());
+    for (const name of DISPATCH) {
+      expect(catalog.includes(name)).toBe(ordinary);
+      expect(shown(env, name)).toBe(ordinary ? 0 : 1);
+    }
+    // Workflow skills by kind: main-bot ones / goal-ask only / none.
+    expect([shown(env, 'botmux-workflow'), shown(env, 'botmux-workflow-create'), shown(env, 'botmux-goal-ask')])
+      .toEqual(kind === 'ordinary' ? [0, 0, 2] : kind === 'legacyNodeWorker' ? [1, 1, 0] : [1, 1, 1]);
+    for (const name of KEPT) expect(shown(env, name)).toBe(0);
+    // Native plugin dir: the node copy for both node kinds.
+    const shared = join(mkdtempSync(join(tmpdir(), 'wf-node-plugin-')), 'plugin');
+    ensurePluginSkills('claude-code', shared);
+    expect(builtinPluginDirForSession(shared, env)).toBe(ordinary ? shared : workflowNodePluginDir(shared));
   });
 });
 

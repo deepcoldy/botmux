@@ -114,6 +114,7 @@ import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
+import type { WorkflowSessionKind } from '../workflows/session-kind.js';
 import {
   reconcileXpiSharedCwdRecovery,
   type XpiSharedCwdStartupNotice,
@@ -1431,13 +1432,14 @@ function buildNewTopicBlocks(
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
   const bare = replyDelivery === 'transcript' && opts?.solo === true;
+  // Built by the daemon, whose own env never carries a session marker: the
+  // session row decides (a legacy node worker never comes through here).
+  const sessionKind: WorkflowSessionKind = opts?.workflowNodeSession ? 'botNode' : 'ordinary';
   // cliId only adds the Cursor background-task note (#1504); every other CLI's
   // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, {
-        workflowNodeSession: opts?.workflowNodeSession === true,
-      });
+    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind });
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1473,11 +1475,11 @@ function buildNewTopicBlocks(
         whiteboardEnabled: whiteboardEnabled(),
         chatManagerEnabled: chatManagerEnabledForApp(opts?.larkAppId),
         excludeRoutingCovered: true,
-        workflowNodeSession: opts?.workflowNodeSession === true,
+        sessionKind,
       });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
-      skillBlock = builtinSkillHelpPointer(locale, opts?.workflowNodeSession ? { workflowEnabled: false } : {});
+      skillBlock = builtinSkillHelpPointer(locale, { sessionKind });
     }
   }
 

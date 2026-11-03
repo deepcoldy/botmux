@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import { builtinSkillContent, builtinSkillEntries } from '../src/skills/injection-mode.js';
 import { WORKFLOW_FEATURE_SKILL_NAMES } from '../src/skills/definitions.js';
-import { WORKFLOW_NODE_SESSION_ENV } from '../src/workflows/node-session-env.js';
+import { WORKFLOW_NODE_SESSION_ENV } from '../src/workflows/session-kind.js';
 import {
   findWorkflowHandoffAcceptance,
   readWorkflowAttemptInputs,
@@ -45,7 +45,7 @@ describe('node session marker suppresses workflow injection', () => {
 
   it('daemon-built routing hints: a node session gets exactly the workflow-off hints', () => {
     const ordinary = buildBotmuxShellHints('zh');
-    const node = buildBotmuxShellHints('zh', false, undefined, undefined, { workflowNodeSession: true });
+    const node = buildBotmuxShellHints('zh', false, undefined, undefined, { sessionKind: 'botNode' });
     process.env.BOTMUX_WORKFLOW_ENABLED = 'false';
     const workflowOff = buildBotmuxShellHints('zh');
     expect(ordinary).not.toEqual(workflowOff); // the switch is on: ordinary sessions keep the hint

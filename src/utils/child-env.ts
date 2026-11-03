@@ -611,7 +611,7 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_LARK_APP_ID',
   // cjadk wrapper-branch knob, set/deleted per spawn by the worker.
   'CJADK_INTERACTIVE',
-  // Workflow node session marker (workflows/node-session-env.ts), set per
+  // Workflow node session marker (workflows/session-kind.ts), set per
   // session by the worker. An inherited copy (e.g. `botmux restart` issued
   // from a node session) would silently strip the workflow hint and skills
   // from every ordinary session the daemon then starts.
