@@ -6,8 +6,11 @@ import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
   REPLY_CARD_HEADING_ELEMENT_ID_RE,
+  WORKFLOW_SIDEBAR_ENTRY_ELEMENT_ID,
+  WORKFLOW_SIDEBAR_ENTRY_LABEL,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
+import { isWorkflowSidebarEntryUrl } from '../../core/workflow-sidebar-link.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
 import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
@@ -1294,12 +1297,31 @@ function isSignedFormatBFooterLine(line: string): boolean {
   return inner !== null && (hasCurrentFooterMarker(inner) || hasExactMarkerMarkdown(inner));
 }
 
+/** The「工作流 ›」labels in every locale the entry is rendered in. */
+const WORKFLOW_SIDEBAR_ENTRY_LABELS: ReadonlySet<string> = new Set(Object.values(WORKFLOW_SIDEBAR_ENTRY_LABEL));
+
+/**
+ * The workflow sidebar entry botmux puts at the right end of a task card's
+ * signature row. The full card (Format B) keeps its element id; the
+ * simplified rendering (Format A) may not, so there the label has to match
+ * and any link it carries must be a workflow entry — a third-party button
+ * that merely shares the label but points elsewhere is kept.
+ */
+function isWorkflowSidebarEntryButton(el: any): boolean {
+  if (el?.element_id === WORKFLOW_SIDEBAR_ENTRY_ELEMENT_ID) return true;
+  const label = typeof el?.text === 'string' ? el.text : el?.text?.content;
+  if (typeof label !== 'string' || !WORKFLOW_SIDEBAR_ENTRY_LABELS.has(label.trim())) return false;
+  const url = buttonOpenUrl(el);
+  return url === undefined || isWorkflowSidebarEntryUrl(url);
+}
+
 /** Strict compatibility recognizer for Format A cards emitted before the
  * versioned marker existed. Recipient chrome is required; without it, the old
  * default-brand-only footer is indistinguishable from a real repository link. */
 function isMeaningfulFormatANode(node: unknown): boolean {
   if (!node || typeof node !== 'object') return false;
   const value = node as any;
+  if (value.tag === 'button' && isWorkflowSidebarEntryButton(value)) return false;
   if (value.tag === 'text') return typeof value.text === 'string' && value.text.trim().length > 0;
   return true;
 }
@@ -1474,6 +1496,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
               // via the Format A list view WITHOUT a resolve pass, so dropping
               // the URL here would lose button links on that main path.
               if (isBotmuxCallbackButton(node)) continue;
+              if (isWorkflowSidebarEntryButton(node)) continue;
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
               if (btnText) {
                 const url = buttonOpenUrl(node);
@@ -1798,7 +1821,7 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
   'retry_last_task', 'takeover', 'term_action', 'toggle_display',
   'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
-  'reply_card_menu', 'reply_model_pick', 'reply_menu_cancel',
+  'reply_card_menu', 'reply_model_pick', 'session_model_pick', 'session_effort_pick', 'session_effort_apply', 'models_default_pick', 'models_default_effort_pick', 'reply_menu_cancel',
   // pendingRepo gates
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
   'worktree_toggle_mode', 'repo_rebuild_worktree',
@@ -2081,6 +2104,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // botmux's own callback buttons (🔊 语音总结 …) are dropped entirely.
   if (tag === 'button') {
     if (isBotmuxCallbackButton(el)) return;
+    // The workflow sidebar entry is signature-row navigation, like the footer.
+    if (isWorkflowSidebarEntryButton(el)) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
     if (btnText) {
       const url = buttonOpenUrl(el);

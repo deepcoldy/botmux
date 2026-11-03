@@ -67,6 +67,10 @@ vi.mock('../src/services/session-store.js', () => ({
 
 const readableTerminalUrlMock = vi.fn(() => 'https://example.com/term');
 const liveReadableTerminalUrlMock = vi.fn(() => 'https://example.com/term');
+const topicReasoningControlMock = vi.fn((..._a: any[]) => undefined as any);
+const setTopicReasoningEffortMock = vi.fn((..._a: any[]) => 'saved');
+const isSessionRestartInFlightMock = vi.fn((..._a: any[]) => false);
+const requestSessionRestartMock = vi.fn((..._a: any[]) => ({ attemptId: 'topic-restart', joined: false }));
 const isSessionTransferringMock = vi.fn(() => false);
 const sessionAcceptsDirectCommandMock = vi.fn(() => true);
 const closeSessionMock = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false }));
@@ -74,6 +78,9 @@ const deliverWriteLinkCardMock = vi.fn();
 const deliverEphemeralOrReplyMock = vi.fn(async (_ds: any, _who: string, card: string) => card);
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  topicReasoningControl: (...a: any[]) => topicReasoningControlMock(...a),
+  setTopicReasoningEffort: (...a: any[]) => setTopicReasoningEffortMock(...a),
+  isSessionRestartInFlight: (...a: any[]) => isSessionRestartInFlightMock(...a),
   setSessionReasoningEffort: vi.fn(),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
@@ -94,7 +101,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   deliverWriteLinkCard: (...args: any[]) => deliverWriteLinkCardMock(...args),
   deliverEphemeralOrReply: (...args: any[]) => deliverEphemeralOrReplyMock(...args),
   CARD_POSTING_SENTINEL: '__posting__',
-  requestSessionRestart: vi.fn(),
+  requestSessionRestart: (...a: any[]) => requestSessionRestartMock(...a),
   isSessionTransferring: (...args: any[]) => isSessionTransferringMock(...args),
   sessionAcceptsDirectCommand: (...args: any[]) => sessionAcceptsDirectCommandMock(...args),
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
@@ -159,10 +166,13 @@ vi.mock('../src/services/model-catalog.js', () => ({
   runtimeExecutableForBotSelection: () => undefined,
 }));
 
+import { buildDefaultModelPickerCard, showSessionModelPicker } from '../src/im/lark/session-model-picker.js';
+import { handleCommand } from '../src/core/command-handler.js';
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { setTerminalProxyPort, resetTerminalProxy } from '../src/core/terminal-url.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
+import { findConfigField, applyConfigField, coerceConfigValue } from '../src/services/bot-config-store.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 
@@ -253,6 +263,11 @@ function enableMenu(cliId = 'claude-code') {
 }
 
 beforeEach(() => {
+  topicReasoningControlMock.mockReset().mockReturnValue(undefined);
+  setTopicReasoningEffortMock.mockReset().mockReturnValue('saved');
+  isSessionRestartInFlightMock.mockReset().mockReturnValue(false);
+  requestSessionRestartMock.mockClear();
+
   vi.mocked(canOperate).mockReset().mockReturnValue(true);
   vi.mocked(getBot).mockReset().mockReturnValue({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
@@ -260,6 +275,9 @@ beforeEach(() => {
     botName: 'testbot',
     botOpenId: 'ou_bot',
   } as any);
+  vi.mocked(findConfigField).mockReset();
+  vi.mocked(applyConfigField).mockReset();
+  vi.mocked(coerceConfigValue).mockReset();
   isSessionTransferringMock.mockReset().mockReturnValue(false);
   readableTerminalUrlMock.mockReset().mockReturnValue('https://example.com/term');
   liveReadableTerminalUrlMock.mockReset().mockReturnValue('https://example.com/term');
@@ -473,6 +491,422 @@ describe('reply_model_pick action', () => {
     const result = await handleCardAction(pickData('sonnet'), depsWith(ds, deliver), LARK_APP_ID);
     expect(result).toBeUndefined();
     expect(deliver).not.toHaveBeenCalled();
+  });
+});
+
+describe('/models shortcut', () => {
+  it('opens a session-bound picker through the real command handler while reply menus are disabled', async () => {
+    const ds = makeDs({ activeModel: 'sonnet' });
+    const deps = depsWith(ds);
+    await handleCommand('/models', ROOT, { messageId: 'om_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.value).toMatchObject({ action: 'session_model_pick', session_id: SID, lark_app_id: LARK_APP_ID, root_id: ROOT, chat_id: 'oc_chat' });
+    expect(select.initial_option).toBe('sonnet');
+    expect(select.options.map((o: any) => o.value)).toContain('sonnet');
+    expect(ds.activeModel).toBe('sonnet');
+  });
+
+  it('does not create or start a session when no session exists', async () => {
+    const deps = depsWith(undefined);
+    await handleCommand('/models', ROOT, { messageId: 'om_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+    expect(deps.activeSessions.size).toBe(0);
+  });
+
+  it('rechecks operator permission before probing models', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const reply = vi.fn(async () => 'om_reply');
+    await showSessionModelPicker(makeDs(), ROOT, OWNER, undefined, reply, 'zh');
+    expect(reply).toHaveBeenCalled();
+    expect(detectModelsMock).not.toHaveBeenCalled();
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['codex-app', 'minimax', 'mira'])('does not offer a raw model picker for %s', async cliId => {
+    const reply = vi.fn(async () => 'om_reply');
+    await showSessionModelPicker(makeDs({ sessionOverrides: { cliId } as any }), ROOT, OWNER, undefined, reply, 'zh');
+    expect(reply).toHaveBeenCalled();
+    expect(detectModelsMock).not.toHaveBeenCalled();
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('uses the session CLI after the bot defaults change', async () => {
+    enableMenu('codex-app');
+    const ds = makeDs();
+    await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    expect(detectModelsMock).toHaveBeenCalledWith('claude-code', expect.anything());
+    expect(deliverEphemeralOrReplyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a notice instead of an empty select when no usable model slugs exist', async () => {
+    detectModelsMock.mockResolvedValue(['bad model', 'bad\nmodel']);
+    await showSessionModelPicker(makeDs(), ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    expect(card.elements.some((e: any) => e.tag === 'action')).toBe(false);
+  });
+
+  function shortcutPick(slug: string) {
+    const data = pickData(slug);
+    data.action.value.action = 'session_model_pick';
+    return data;
+  }
+
+  it('selecting the shortcut sends the chosen model while reply menus are disabled', async () => {
+    const deliver = vi.fn();
+    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), deliver), LARK_APP_ID);
+    expect(deliver).toHaveBeenCalledWith(expect.anything(), '/model sonnet', expect.objectContaining({ senderOpenId: OWNER, senderIsBot: false }));
+    expect(result.toast.type).toBe('success');
+  });
+
+  it.each(['permission', 'busy', 'replacement', 'dead', 'transfer', 'generation'])('revalidates after model discovery: %s', async reason => {
+    let resolve!: (models: string[] | null) => void;
+    detectModelsMock.mockImplementation(() => new Promise<string[] | null>(r => { resolve = r; }));
+    const ds = makeDs();
+    const deliver = vi.fn();
+    const deps = depsWith(ds, deliver);
+    const pending = handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
+    // Detection is reached synchronously before the handler's first await.
+    if (reason === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    if (reason === 'busy') sessionAcceptsDirectCommandMock.mockReturnValue(false);
+    if (reason === 'replacement') deps.activeSessions.set(sessionKey(ROOT, LARK_APP_ID), makeDs({ sessionOverrides: { sessionId: 'replacement' } }));
+    if (reason === 'dead') ds.worker = { killed: true } as any;
+    if (reason === 'transfer') isSessionTransferringMock.mockReturnValue(true);
+    if (reason === 'generation') ds.workerGeneration = 2;
+    resolve(null);
+    const result = await pending;
+    expect(deliver).not.toHaveBeenCalled();
+    expect(result.toast.type).toBe('warning');
+  });
+
+  it('refuses a second concurrent model choice once the first starts a turn', async () => {
+    let resolve!: (models: string[] | null) => void;
+    const probe = new Promise<string[] | null>(r => { resolve = r; });
+    detectModelsMock.mockImplementation(() => probe);
+    const ds = makeDs();
+    const deliver = vi.fn(() => { sessionAcceptsDirectCommandMock.mockReturnValue(false); return true; });
+    const deps = depsWith(ds, deliver);
+    const first = handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
+    const second = handleCardAction(shortcutPick('opus'), deps, LARK_APP_ID);
+    resolve(null);
+    const results = await Promise.all([first, second]);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(results.map(r => r.toast.type)).toEqual(['success', 'warning']);
+  });
+
+  it('gives later selections from the same card distinct turn identifiers', async () => {
+    const ds = makeDs();
+    const deliver = vi.fn(() => true);
+    const deps = depsWith(ds, deliver);
+    await handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
+    await handleCardAction(shortcutPick('opus'), deps, LARK_APP_ID);
+    const ids = deliver.mock.calls.map((c: any) => c[2].turnId);
+    expect(new Set(ids).size).toBe(2);
+    expect(deliver.mock.calls.map((c: any) => c[2].messageId)).toEqual(['om_picker_card', 'om_picker_card']);
+  });
+
+  it('reports a rejected worker enqueue as a warning', async () => {
+    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), vi.fn(() => false)), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+  });
+
+  it('does not invite a retry when bookkeeping throws after the worker accepted the command', async () => {
+    const deliver = vi.fn((_ds: any, _cmd: string, opts: any) => { opts.onDelivered(); throw new Error('bookkeeping failed'); });
+    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), deliver), LARK_APP_ID);
+    expect(result.toast.type).toBe('success');
+  });
+
+  it('does not pass a chat id as the reply message when switching in a flat group session', async () => {
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat' } });
+    const deliver = vi.fn();
+    const data = shortcutPick('sonnet');
+    data.action.value.root_id = 'oc_chat';
+    await handleCardAction(data, depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver.mock.calls[0][2].replyRootId).toBeUndefined();
+  });
+
+  it.each(['busy', 'permission', 'invalid', 'unsupported', 'dead', 'transfer'])('retains the existing model switch guard: %s', async reason => {
+    const ds = makeDs();
+    if (reason === 'busy') sessionAcceptsDirectCommandMock.mockReturnValue(false);
+    if (reason === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    if (reason === 'unsupported') ds.session.cliId = 'codex-app';
+    if (reason === 'dead') ds.worker = { killed: true } as any;
+    if (reason === 'transfer') isSessionTransferringMock.mockReturnValue(true);
+    const deliver = vi.fn();
+    await handleCardAction(shortcutPick(reason === 'invalid' ? 'sonnet\n/clear' : 'sonnet'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver).not.toHaveBeenCalled();
+  });
+});
+
+describe('/models bot defaults at top level', () => {
+  function adminBot() {
+    const bot = getBot(LARK_APP_ID) as any;
+    bot.resolvedAllowedUsers = [OWNER];
+    bot.config.model = 'opus';
+    return bot;
+  }
+  function defaultPick(model = 'haiku', extra = {}) {
+    return { operator: { open_id: OWNER },
+      action: { value: { action: 'models_default_pick', lark_app_id: LARK_APP_ID, selection_key: 'claude-code', ...extra }, option: model },
+      context: { open_message_id: 'om_defaults' } };
+  }
+  const modelSpec = { key: 'model', kind: 'string', configKey: 'model', clearable: true } as any;
+
+  it.each([false, true])('top-level /models shows bot defaults with an existing flat session: %s', async existing => {
+    adminBot();
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { model: 'session-model' } });
+    const deps = depsWith(existing ? ds : undefined);
+    deps.invocationContext = 'new-topic';
+    await handleCommand('/models', ROOT, { messageId: 'om_top', chatId: 'oc_chat', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    const card = JSON.parse(deps.sessionReply.mock.calls[0][1]);
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.value).toMatchObject({ action: 'models_default_pick', lark_app_id: LARK_APP_ID, selection_key: 'claude-code' });
+    expect(select.initial_option).toBe('opus');
+    expect(select.value.session_id).toBeUndefined();
+    expect(ds.session.model).toBe('session-model');
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('topic replies keep selecting the session model', async () => {
+    adminBot();
+    const deps = depsWith(makeDs());
+    deps.invocationContext = 'thread';
+    await handleCommand('/models', ROOT, { messageId: 'om_in_topic', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    expect(card.elements.find((e: any) => e.tag === 'action').actions[0].value.action).toBe('session_model_pick');
+  });
+
+  it('chat-level operate permission does not allow opening bot defaults', async () => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const deps = depsWith(undefined);
+    deps.invocationContext = 'new-topic';
+    await handleCommand('/models', ROOT, { messageId: 'om_top', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    expect(detectModelsMock).not.toHaveBeenCalled();
+    expect(deps.sessionReply.mock.calls[0][2]).not.toBe('interactive');
+  });
+
+  it('updates only this bot model default through the existing config store', async () => {
+    const bot = adminBot();
+    const ds = makeDs({ activeModel: 'session-model', sessionOverrides: { model: 'session-model' } });
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'haiku' } as any);
+    vi.mocked(applyConfigField).mockImplementation(async (_app, _spec, model) => {
+      bot.config.model = model;
+      return { ok: true, newText: 'haiku', effect: 'next-session' } as any;
+    });
+    const result = await handleCardAction(defaultPick('haiku', { field: 'cli' }), depsWith(ds), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, 'haiku', { selectionKey: 'claude-code', requireLaunchModelSupport: true, actorOpenId: OWNER });
+    expect(bot.config.model).toBe('haiku');
+    expect(ds.session.model).toBe('session-model');
+    expect(ds.activeModel).toBe('session-model');
+    expect(result.toast.type).toBe('success');
+    expect(result.card.data.elements.find((e: any) => e.tag === 'action').actions[0].initial_option).toBe('haiku');
+  });
+
+  it.each(['permission', 'wrong-app', 'changed-cli', 'bad-model', 'unsupported'])('rejects a default model selection: %s', async reason => {
+    const bot = adminBot();
+    const data = defaultPick();
+    if (reason === 'permission') bot.resolvedAllowedUsers = [];
+    if (reason === 'wrong-app') data.action.value.lark_app_id = 'other-app';
+    if (reason === 'changed-cli') bot.config.cliId = 'codex';
+    if (reason === 'bad-model') data.action.option = 'haiku\n/clear';
+    if (reason === 'unsupported') bot.config.backendType = 'riff';
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    const result = await handleCardAction(data, depsWith(makeDs()), LARK_APP_ID);
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(result.toast.type).not.toBe('success');
+  });
+
+  it.each(['cli', 'backend'])('does not stamp old model choices with changed defaults after saving: %s', async change => {
+    const bot = adminBot();
+    let resolve!: (models: string[] | null) => void;
+    let started!: () => void;
+    const detectionStarted = new Promise<void>(r => { started = r; });
+    detectModelsMock.mockImplementation(() => { started(); return new Promise(r => { resolve = r; }); });
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'haiku' } as any);
+    vi.mocked(applyConfigField).mockImplementation(async () => { bot.config.model = 'haiku'; return { ok: true, newText: 'haiku', effect: 'next-session' } as any; });
+    const pending = handleCardAction(defaultPick(), depsWith(undefined), LARK_APP_ID);
+    await detectionStarted;
+    if (change === 'cli') bot.config.cliId = 'codex';
+    else bot.config.backendType = 'riff';
+    resolve(['opus', 'sonnet']);
+    const result = await pending;
+    expect(result.toast.type).toBe('success');
+    expect(result.card).toBeUndefined();
+    expect(bot.config.model).toBe('haiku');
+  });
+
+  it.each([
+    ['traex', 'GPT-6.1-Sol', ['low', 'medium', 'high', 'xhigh']],
+    ['claude-code', 'sonnet', ['low', 'medium', 'high', 'xhigh', 'max']],
+    ['claude-code', 'haiku', []],
+  ])('offers model-supported effort choices for %s / %s', (cliId, model, expected) => {
+    const card = JSON.parse(buildDefaultModelPickerCard(LARK_APP_ID, [model as string], model as string, 'zh', cliId as string, { cliId: cliId as string, effort: 'high' }));
+    const select = card.elements.filter((e: any) => e.tag === 'action')[1].actions[0];
+    expect(select.value).toMatchObject({ action: 'models_default_effort_pick', expected_model: model, selection_key: cliId });
+    expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', ...expected as string[]]);
+    expect(select.initial_option).toBe((expected as string[]).includes('high') ? 'high' : '__unset__');
+  });
+
+  function effortPick(effort = 'high', model = 'opus') {
+    const data = defaultPick(effort, { field: 'model' });
+    data.action.value.action = 'models_default_effort_pick';
+    (data.action.value as any).expected_model = model;
+    return data;
+  }
+  const effortSpec = { key: 'reasoningEffort', kind: 'enum', configKey: 'reasoningEffort', clearable: true } as any;
+
+  it('writes default effort with a model precondition and keeps active session effort', async () => {
+    const bot = adminBot();
+    const ds = makeDs({ sessionOverrides: { reasoningEffort: 'low' } });
+    vi.mocked(findConfigField).mockReturnValue(effortSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'high' } as any);
+    vi.mocked(applyConfigField).mockImplementation(async (_app, _spec, effort) => {
+      bot.config.reasoningEffort = effort;
+      return { ok: true, newText: 'high', effect: 'next-session' } as any;
+    });
+    const result = await handleCardAction(effortPick(), depsWith(ds), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, effortSpec, 'high', { selectionKey: 'claude-code', model: 'opus', requireLaunchModelSupport: true, actorOpenId: OWNER });
+    expect(ds.session.reasoningEffort).toBe('low');
+    const select = result.card.data.elements.filter((e: any) => e.tag === 'action')[1].actions[0];
+    expect(select.initial_option).toBe('high');
+  });
+
+  it('clears default effort without changing the model', async () => {
+    const bot = adminBot();
+    bot.config.reasoningEffort = 'high';
+    vi.mocked(findConfigField).mockReturnValue(effortSpec);
+    vi.mocked(applyConfigField).mockImplementation(async () => { bot.config.reasoningEffort = undefined; return { ok: true, newText: 'default' } as any; });
+    const result = await handleCardAction(effortPick('__unset__'), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, effortSpec, null, { selectionKey: 'claude-code', model: 'opus', requireLaunchModelSupport: true, actorOpenId: OWNER });
+    expect(bot.config.model).toBe('opus');
+    expect(result.toast.type).toBe('success');
+  });
+
+  it('rejects an effort card after the default model changed', async () => {
+    const bot = adminBot();
+    bot.config.model = 'sonnet';
+    const result = await handleCardAction(effortPick('high', 'opus'), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(result.toast.type).toBe('warning');
+  });
+
+  it('turns a locked selection conflict into a refresh prompt without a success card', async () => {
+    adminBot();
+    vi.mocked(findConfigField).mockReturnValue(effortSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'high' } as any);
+    vi.mocked(applyConfigField).mockResolvedValue({ ok: false, reason: 'config_selection_changed' } as any);
+    const result = await handleCardAction(effortPick(), depsWith(undefined), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(result.card).toBeUndefined();
+  });
+
+  it('keeps the old model and exposes an effort reset when a model pairing is incompatible', async () => {
+    const bot = adminBot();
+    bot.config.reasoningEffort = 'max';
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'haiku' } as any);
+    vi.mocked(applyConfigField).mockResolvedValue({ ok: false, reason: 'reasoning_effort_not_supported_by_model' } as any);
+    const result = await handleCardAction(defaultPick(), depsWith(undefined), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(bot.config.model).toBe('opus');
+    const effort = result.card.data.elements.filter((e: any) => e.tag === 'action')[1].actions[0];
+    expect(effort.options[0].value).toBe('__unset__');
+  });
+
+  it('keeps the current default selectable when the catalogue exceeds the Lark option limit', () => {
+    const models = Array.from({ length: 75 }, (_, i) => `model-${i}`);
+    const card = JSON.parse(buildDefaultModelPickerCard(LARK_APP_ID, models, 'model-74', 'zh', 'claude-code'));
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.length).toBeLessThanOrEqual(50);
+    expect(select.initial_option).toBe('model-74');
+    expect(select.options.map((o: any) => o.value)).toContain('model-74');
+  });
+
+  it('clears the default through the same model field', async () => {
+    const bot = adminBot();
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(applyConfigField).mockImplementation(async (_app, _spec, model) => {
+      bot.config.model = model ?? undefined;
+      return { ok: true, newText: 'default', effect: 'next-session' } as any;
+    });
+    const result = await handleCardAction(defaultPick('__unset__'), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, null, { selectionKey: 'claude-code', requireLaunchModelSupport: true, actorOpenId: OWNER });
+    expect(result.toast.type).toBe('success');
+  });
+
+  it('reports default persistence failure without changing the active session', async () => {
+    adminBot();
+    const ds = makeDs({ sessionOverrides: { model: 'session-model' } });
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'haiku' } as any);
+    vi.mocked(applyConfigField).mockResolvedValue({ ok: false, reason: 'disk full' } as any);
+    const result = await handleCardAction(defaultPick(), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('error');
+    expect(ds.session.model).toBe('session-model');
+  });
+});
+
+describe('/models topic reasoning effort', () => {
+  function setup() {
+    const ds = makeDs({ activeModel: 'sonnet', activeReasoningEffort: 'high', sessionOverrides: { cliId: 'traex', cliSessionId: 'native-topic' } });
+    topicReasoningControlMock.mockImplementation(() => ({ model: 'sonnet', choices: ['low', 'medium', 'high'],
+      selected: ds.session.topicReasoningEffort?.effort ?? 'high', active: 'high',
+      pending: !!ds.session.topicReasoningEffort && ds.session.topicReasoningEffort.effort !== 'high' }));
+    setTopicReasoningEffortMock.mockImplementation((_ds: any, effort: any) => {
+      ds.session.topicReasoningEffort = { model: 'sonnet', effort }; return 'saved';
+    });
+    return ds;
+  }
+  async function panel(ds: DaemonSession) {
+    const deps = depsWith(ds);
+    await handleCommand('/models', ROOT, { messageId: 'om_topic_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    return JSON.parse(deliverEphemeralOrReplyMock.mock.calls.at(-1)![2]);
+  }
+  function action(value: any, option?: string) {
+    return { operator: { open_id: OWNER }, action: { value, ...(option ? { option } : {}) }, context: { open_message_id: 'om_topic_panel' } };
+  }
+  it('renders effort choices in a topic and saves its preference without restarting or changing bot defaults', async () => {
+    const ds = setup(); const card = await panel(ds);
+    const effort = card.elements.filter((e: any) => e.tag === 'action')[1].actions[0];
+    expect(effort.value).toMatchObject({ action: 'session_effort_pick', session_id: SID, expected_model: 'sonnet' });
+    expect(effort.options.map((o: any) => o.value)).toEqual(['low', 'medium', 'high']);
+    const result = await handleCardAction(action(effort.value, 'low'), depsWith(ds), LARK_APP_ID);
+    expect(setTopicReasoningEffortMock).toHaveBeenCalledWith(ds, 'low');
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(result.card.data.elements.some((e: any) => e.tag === 'action' && e.actions.some((a: any) => a.value?.action === 'session_effort_apply'))).toBe(true);
+  });
+  it('only applies the saved effort after the explicit reload button', async () => {
+    const ds = setup(); ds.session.topicReasoningEffort = { model: 'sonnet', effort: 'low' };
+    const card = await panel(ds); const button = card.elements.find((e: any) => e.tag === 'action' && e.actions[0].value?.action === 'session_effort_apply').actions[0];
+    const result = await handleCardAction(action(button.value), depsWith(ds), LARK_APP_ID);
+    expect(requestSessionRestartMock).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }), {
+      topicEffort: { model: 'sonnet', effort: 'low', nativeSessionId: 'native-topic' },
+    });
+    expect(result.toast.type).toBe('info');
+  });
+  it.each(['model', 'chat', 'worker-generation', 'cli-generation', 'preference', 'permission'])('rejects a stale topic effort card: %s', async kind => {
+    const ds = setup(); const card = await panel(ds); const value = card.elements.filter((e: any) => e.tag === 'action')[1].actions[0].value;
+    if (kind === 'model') topicReasoningControlMock.mockReturnValue({ model: 'other-model', choices: ['low'] });
+    if (kind === 'chat') value.chat_id = 'other-chat';
+    if (kind === 'worker-generation') ds.workerGeneration = 2;
+    if (kind === 'cli-generation') ds.cliReadyGeneration = 2;
+    if (kind === 'preference') ds.session.topicReasoningEffort = { model: 'sonnet', effort: 'medium' };
+    if (kind === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    await handleCardAction(action(value, 'low'), depsWith(ds), LARK_APP_ID);
+    expect(setTopicReasoningEffortMock).not.toHaveBeenCalled();
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
+  });
+  it('does not reload while business input owns the session', async () => {
+    const ds = setup(); ds.session.topicReasoningEffort = { model: 'sonnet', effort: 'low' };
+    const card = await panel(ds); const button = card.elements.find((e: any) => e.tag === 'action' && e.actions[0].value?.action === 'session_effort_apply').actions[0];
+    sessionAcceptsDirectCommandMock.mockReturnValue(false);
+    await handleCardAction(action(button.value), depsWith(ds), LARK_APP_ID);
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
   });
 });
 

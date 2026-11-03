@@ -22,9 +22,13 @@ function fixture(extra: Record<string, unknown> = {}) {
     activeTurnAuthority: authority, currentBotmuxTurnId: 'turn', cliSpawnGeneration: 1,
     lastInitConfig: { cliSessionId: 'native', model: 'first' }, TRAEX_QUOTA_ERROR_CODE,
     currentTraexQuotas: vi.fn(() => catalog), executeTraexAutoModelSwitch: vi.fn(() => true),
+    // handleTermAction calls the shared doubao retirement hook on a delivered
+    // ctrlc; this fixture is a traex scope, so the hook must inertly no-op.
+    retireDoubaoBridgeTurnOnInterrupt: vi.fn(() => false),
     publishActiveRuntime: vi.fn(), emitReadyCodexTurns: vi.fn(), idleDetector: { fireIdle: vi.fn() },
     t: (key: string) => key, ...extra,
   };
+  scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
   const recover = loadWorkerFunction<(turn: any) => boolean>('recoverTraexQuotaTurn', scope);
   const turn = { turnId: 'turn', sourceTurnId: 'native-turn', started: true,
     terminalStatus: 'failed', terminalErrorCode: TRAEX_QUOTA_ERROR_CODE };

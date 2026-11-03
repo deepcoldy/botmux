@@ -81,7 +81,7 @@ const read = () => resolveDispatchUser({ dataDir, secret, appId: 'cli_target', c
 // Run the actual worker screen-ready gate against a real transcript queue.
 // Stop at its release boundary: the remainder only schedules UI/input work.
 const workerSource = ts.createSourceFile('worker.ts', readFileSync('src/worker.ts', 'utf8'), ts.ScriptTarget.Latest, true);
-const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'traexFirstPromptViewportRejects', 'markPromptReady'].map(name => {
+const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'traexFirstPromptViewportRejects', 'nativeSessionForkPending', 'holdForNativeSessionFork', 'markPromptReady'].map(name => {
   const node = workerSource.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
   if (!node) throw new Error(`missing worker function ${name}`);
   return node.getText(workerSource);
@@ -98,6 +98,9 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
     stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,
+    // This fixture exercises lifecycle/delegation, not a live process tree.
+    // Root refresh and publication are covered by worker-codex-execution-root.
+    currentCodexObservedPid: vi.fn(),
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,

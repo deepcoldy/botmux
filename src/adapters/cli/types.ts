@@ -465,6 +465,20 @@ export interface CliAdapter {
    *  e.g. claude-code/grok) or that ignore resume entirely leave this unset. */
   readonly resumeRequiresCliSessionId?: boolean;
 
+  /** Native CLIs with an interactive fork command run it before the worker
+   * publishes prompt_ready or admits input. Return only the independently
+   * confirmed child id; a stale generation must never publish a result. */
+  forkSessionAfterReady?(opts: {
+    sourceSessionId: string;
+    sendCommand: (command: string) => Promise<void>;
+    captureScreen: () => string;
+    isCurrent: () => boolean;
+  }): Promise<string>;
+
+  /** Exact active identity for a CLI which retains retired conversation DB
+   * handles (Antigravity after /fork). Prefer over the generic first-FD probe. */
+  resolveActiveSessionId?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined;
+
   /** True when this adapter finds the native session to resume by itself
    *  from the botmux session id (Kimi: its index + wire logs; the
    *  session it was started under), so no `cliSessionId` is needed. Whether a
@@ -1101,6 +1115,16 @@ export interface StructuredBridgeDrainContext {
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
+  /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
+   *  terminal yet, measured by the worker immediately before the drain.
+   *  Drivers whose user and final records live in SEPARATE files (doubao:
+   *  assignment.md appends at submit, trajectory.jsonl at completion) use this
+   *  to decide how many finals in the window close previously-started turns
+   *  versus pairing with prompts inside the window. A driver must NOT derive
+   *  this balance from its own file increments: a turn can be retired without
+   *  any transcript record (Esc interrupt), which a file-derived counter can
+   *  never observe and would then over-count forever. */
+  openTurns?: number;
 }
 
 /**
@@ -1161,7 +1185,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode' | 'doubao';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。

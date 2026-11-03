@@ -61,8 +61,10 @@ import {
 
 /** Room kept for chrome that callers attach *after* a card is built and
  * fitted — today the on-call group button (≈483B of request body), added by
- * `attachOncallGroupButton` in both `botmux send` and the daemon. Reserved
- * unconditionally; it costs nothing when no button is attached. */
+ * `attachOncallGroupButton` in both `botmux send` and the daemon, and a
+ * workflow node session's「工作流 ›」entry (≈0.8KB raw, ≈1KB escaped, with a
+ * 128-char run id; `attachWorkflowSidebarEntry`). Reserved unconditionally;
+ * it costs nothing when no button is attached. */
 export const CARD_LATE_CHROME_RESERVE_BYTES = 2_000;
 
 export type { CardRenderDiagnostic } from './vega-lite-chart.js';

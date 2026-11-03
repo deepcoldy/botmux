@@ -523,7 +523,8 @@ import {
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
 } from './core/dispatch-report-binding.js';
-import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
+import { recordDispatchRegistryEntry, updateDispatchRegistry } from './core/dispatch-registry.js';
+import { recordDispatchLastReport } from './core/dispatch-task-tree.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { applyDispatchLaunchBinding, registerDispatchLaunchBinding } from './core/dispatch-launch-binding.js';
 import { projectCoordinator } from './services/project-coordinator-runtime.js';
@@ -776,7 +777,12 @@ import {
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
 import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
-import { buildV3ProgressCard } from './im/lark/v3-progress-card.js';
+import { buildV3ProgressCard, v3ProgressWorkflowEntry } from './im/lark/v3-progress-card.js';
+import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
+import {
+  workflowSidebarMembershipRoute,
+  WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+} from './core/workflow-sidebar-membership.js';
 import { V3ProgressCardManager } from './im/lark/v3-progress-card-manager.js';
 import { buildV3RunSaveActionValue } from './im/lark/v3-run-save-card.js';
 import { buildV3DistillationProposalCard } from './im/lark/v3-distillation-card.js';
@@ -973,7 +979,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
-import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from './services/codex-async-user-input.js';
+import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
@@ -1012,7 +1018,7 @@ import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
-import { scheduleSessionGroupTitle } from './services/session-group-title.js';
+import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
@@ -4638,6 +4644,34 @@ function sessionTopicWriteOptions(ds: DaemonSession, turnId?: string, verifiedSo
   } };
 }
 
+/** Record a child's report on its dispatch entry and patch the orchestrator's
+ *  task-tree card. Best effort: the report is delivered whether or not the card moves. */
+async function syncDispatchTaskTreeAfterReport(input: {
+  dispatchRoot: string; status?: unknown; content: string;
+  target: { larkAppId: string; sessionId: string };
+}): Promise<void> {
+  const warn = (error: unknown) => logger.warn(`[task-tree] refresh after report failed: ${error instanceof Error ? error.message : String(error)}`);
+  try {
+    let orchSessionId: string | undefined;
+    await updateDispatchRegistry(join(config.session.dataDir, 'orchestrate-dispatch.json'), registry => {
+      orchSessionId = recordDispatchLastReport(registry, input.dispatchRoot, {
+        status: input.status, content: input.content, at: new Date().toISOString(),
+      });
+    });
+    if (orchSessionId !== input.target.sessionId) return;
+    const orchDaemon = findOnlineDaemon(input.target.larkAppId);
+    if (!orchDaemon) return;
+    // Not awaited: the card patch is a Feishu round trip the report need not wait for.
+    void fetchDaemonIpc(orchDaemon.ipcPort, '/api/dispatch-tree/refresh', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ orchSessionId }),
+    }).catch(warn);
+  } catch (error) {
+    warn(error);
+  }
+}
+
 async function reportZeroPromptFinal(ds: DaemonSession, input: {
   turnId: string; content: string; dispatchRoot?: string;
 }): Promise<void> {
@@ -4660,7 +4694,10 @@ async function reportZeroPromptFinal(ds: DaemonSession, input: {
       decision, triggerMeta,
       beforeWrite: sourceTopicWriteOptions(ds.larkAppId, decision.dispatchRoot).beforeWrite,
       fetchTarget: (path, init) => fetchDaemonIpc(target.ipcPort, path, init),
-      postProjectUpdate: async () => ({ projectSynced: false }),
+      postProjectUpdate: async (landed) => {
+        await syncDispatchTaskTreeAfterReport({ dispatchRoot: decision.dispatchRoot, content: input.content, target: landed });
+        return { projectSynced: false };
+      },
     });
     if (delivered.status >= 400 || delivered.body.ok === false) {
       throw new Error(`zero-prompt report: ${delivered.body.error ?? delivered.status}`);
@@ -6523,6 +6560,7 @@ const commandDeps: CommandHandlerDeps = {
  * replace their session before replying, so mutable session state cannot be
  * the authority for placement here. */
 function commandDepsForInvocation(input: {
+  context?: 'new-topic' | 'thread';
   scope: 'chat' | 'thread';
   chatId: string;
   anchor: string;
@@ -6537,6 +6575,7 @@ function commandDepsForInvocation(input: {
   });
   return {
     ...commandDeps,
+    invocationContext: input.context,
     invocationReplyTarget: replyTarget,
     sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
       sessionReply(
@@ -6665,6 +6704,13 @@ async function executePluginSlashCommand(input: {
   });
 }
 
+/** §11: a bot-executed run's「工作流 ›」sidebar entry, as posted by this
+ *  daemon's bot (cards in one chat share its brand). No Dashboard address →
+ *  no entry; callers pass undefined and the card keeps its old shape. */
+function daemonWorkflowSidebarEntry(mainLarkAppId: string, runId: string) {
+  return resolveWorkflowEntryLink({ mainLarkAppId, runId, brand: getBotBrand(selfDaemonLarkAppId ?? mainLarkAppId) });
+}
+
 // Dependencies passed to card-handler
 // v3 run-level progress is a best-effort IM projection. journal.ndjson remains
 // the only execution truth; the manager persists only Lark delivery state.
@@ -6687,7 +6733,11 @@ const v3ProgressCardManager = new V3ProgressCardManager({
             chat: buildV3RunSaveActionValue(loaded.envelope, 'chat'),
           }
         : undefined;
-    return buildV3ProgressCard(view, saveActions ? { saveActions } : {});
+    const workflowEntry = v3ProgressWorkflowEntry(loaded.envelope, daemonWorkflowSidebarEntry);
+    return buildV3ProgressCard(view, {
+      ...(saveActions ? { saveActions } : {}),
+      ...(workflowEntry ? { workflowEntry } : {}),
+    });
   },
   onError: (runId, err) => {
     logger.warn(`[v3:${runId}] progress card failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -6811,6 +6861,7 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   loadRun: workflowLoadBotRun,
   drive: (runId) => v3GateRunner.driveDetached(runId),
   botName: (appId) => v3BotDisplayNameResolver()(appId),
+  workflowEntry: daemonWorkflowSidebarEntry,
   warn: (message) => logger.warn(message),
 });
 
@@ -7549,6 +7600,8 @@ const cardDeps: CardHandlerDeps = {
   deliverPassthroughCommand: (ds, cmd, opts) =>
     deliverPassthroughToExistingSession(ds, cmd, cmd, opts.anchor, ds.larkAppId, {
       messageId: opts.messageId,
+      turnId: opts.turnId,
+      onDelivered: opts.onDelivered,
       replyRootId: opts.replyRootId,
       senderOpenId: opts.senderOpenId,
       senderIsBot: opts.senderIsBot,
@@ -8623,8 +8676,28 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (!trustedHost || task.larkAppId !== selfDaemonLarkAppId) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_host_admin_required' });
     }
+    // `--run-as`: the host admin names the person the task runs as. It becomes
+    // the task's creator identity only if that person may operate this bot
+    // now; every fire re-checks the same admission.
+    const { runAs, ownerOpenId: _ownerOpenId, ownerUnionId: _ownerUnionId, ...hostTask } = task;
+    let runAsOwner: { ownerOpenId: string; ownerUnionId: string; creatorLarkAppId: string } | undefined;
+    if (runAs !== undefined) {
+      if (!selfDaemonLarkAppId || typeof runAs !== 'string'
+        || !/^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/.test(runAs)) {
+        return jsonRes(res, 400, { ok: false, error: 'schedule_run_as_invalid' });
+      }
+      const openId = runAs.startsWith('ou_')
+        ? runAs
+        : (await resolveAllowedUsersWithMap(selfDaemonLarkAppId, [runAs])).map.get(runAs);
+      const unionId = openId ? await resolveUnionIdFromOpenId(selfDaemonLarkAppId, openId) : null;
+      if (!openId || !unionId) return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_unresolved' });
+      if (!canOperate(selfDaemonLarkAppId, task.chatId, openId, unionId)) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_not_allowed' });
+      }
+      runAsOwner = { ownerOpenId: openId, ownerUnionId: unionId, creatorLarkAppId: selfDaemonLarkAppId };
+    }
     try {
-      const created = scheduler.addTask({ ...task, ...untilDoneParams });
+      const created = scheduler.addTask({ ...hostTask, ...runAsOwner, ...untilDoneParams });
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     } catch (error) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_host_commit_failed',
@@ -9160,6 +9233,30 @@ ipcRoute('POST', WORKFLOW_HANDOFF_STOP_ROUTE, async (req, res) => {
   return jsonRes(res, result.status, result.body);
 });
 
+// Dashboard ← workflow sidebar (design 2026-11-03 §11.3): is this viewer a
+// current member of the run's chat, as this (main) bot's app sees it? Trusted
+// host only — the Dashboard asks on behalf of an H5 / platform identity it has
+// already authenticated; a failed lookup answers 503 and the Dashboard denies.
+ipcRoute('POST', WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, async (req, res) => {
+  const trustedHost = isTrustedHostIpcRequest(req);
+  let raw: unknown;
+  if (trustedHost) {
+    try {
+      raw = await readJsonBody<unknown>(req, 4 * 1024);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    }
+  }
+  const result = await workflowSidebarMembershipRoute(
+    { trustedHost, selfLarkAppId: selfDaemonLarkAppId, body: raw },
+    (appId) => ({
+      resolveOpenIdByUnionId: (unionId) => resolveTargetAppOpenId(appId, unionId),
+      listChatMemberOpenIds: (chatId) => listChatMemberOpenIds(appId, chatId),
+    }),
+  );
+  return jsonRes(res, result.status, result.body);
+});
+
 // Executing bot's daemon ← its own CLI (`botmux report --dispatch-root
 // <handoff> …`). Session-scoped: the live turn capability (or the host secret)
 // proves the caller is this session's CLI.
@@ -9362,6 +9459,14 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     receivedAt: new Date().toISOString(),
   };
   const postProjectUpdate = async (
+    target: { larkAppId: string; sessionId: string },
+  ): Promise<{ projectSynced: boolean; projectSyncError?: string }> => {
+    await syncDispatchTaskTreeAfterReport({
+      dispatchRoot: decision.dispatchRoot, status: decision.projectUpdate.status, content: decision.content, target,
+    });
+    return postProjectGroupUpdate(target);
+  };
+  const postProjectGroupUpdate = async (
     target: { larkAppId: string; sessionId: string },
   ): Promise<{ projectSynced: boolean; projectSyncError?: string }> => {
     const projectDaemon = target.larkAppId === decision.target.larkAppId
@@ -9882,17 +9987,22 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
           byType,
         );
         if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
-        const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, {
+        const steerFacts = {
           answerer: by, originalAnswerer: asyncCaller,
           human: byType === false && trustedCaller?.senderType === 'user'
             && trustedCaller.requestLarkAppId === boundAsk.larkAppId && trustedCaller.requestUserOpenId === by,
-          managedLark: !documentDelivery && asyncOriginTurn?.startsWith('om_') === true
+          // The audience was frozen from the exact origin's reply identity.
+          // An answer can ask another question; its synthetic origin must retain
+          // the same authenticated human route as an ordinary Lark message.
+          managedLark: !documentDelivery && audience?.kind === 'human'
+            && (asyncOriginTurn?.startsWith('om_') === true || asyncOriginTurn?.startsWith('codex-async-answer-') === true)
             && !askSession.adoptedFrom && !askSession.session.adoptedFrom && !askSession.session.vcMeetingReceiver
             && larkTransportEnabled({ chatId: askSession.chatId, apiOnly: bot.config.apiOnly }),
           cleanInputAccepted: codexAppCleanInputAcceptedForSession(askSession),
-        });
-        const steerable = steerTarget !== undefined && input.codexAppInput !== undefined;
-        if (steerable) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
+        };
+        const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, steerFacts);
+        const steerable = codexAsyncAnswerSteerable(steerFacts) && input.codexAppInput !== undefined;
+        if (steerable && steerTarget !== undefined) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
         if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
           trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) })) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
@@ -24362,9 +24472,25 @@ function deliverPassthroughToExistingSession(
      * the real, empty CLI composer is visible. */
     requireSafeComposer?: true;
   },
-): void {
+): boolean {
   const turnId = turn.turnId ?? turn.messageId;
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
+    // A failed IPC enqueue must not replace the business turn's reply binding.
+    // beginReplyTargetTurn replaces its maps rather than mutating the old maps.
+    const sessionBindingKeys = ['quoteTargetId', 'quoteTargetSenderOpenId', 'quoteTargetSenderIsBot',
+      'turnReplyContexts', 'replyTargets', 'replyTargetsPrunedThrough', 'replyThreadAliases',
+      'currentReplyTarget', 'lastCallerOpenId'];
+    const savedBinding = [
+      ...sessionBindingKeys.map(key => ({ target: ds.session, key, descriptor: Object.getOwnPropertyDescriptor(ds.session, key) })),
+      ...['replyThreadAliases', 'currentReplyTarget'].map(key => ({ target: ds, key, descriptor: Object.getOwnPropertyDescriptor(ds, key) })),
+    ];
+    const restoreBinding = () => {
+      for (const { target, key, descriptor } of savedBinding) {
+        if (descriptor) Object.defineProperty(target, key, descriptor);
+        else Reflect.deleteProperty(target, key);
+      }
+      sessionStore.updateSession(ds.session);
+    };
     // Passthrough commands bypass the normal message-forwarding block, so bind
     // the accepted Lark turn before the worker rotates its marker at the PTY
     // write boundary. This helper also covers a cold-start registration race.
@@ -24387,7 +24513,8 @@ function deliverPassthroughToExistingSession(
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
     }
-    sessionStore.updateSession(ds.session);
+    try { sessionStore.updateSession(ds.session); }
+    catch (err) { restoreBinding(); throw err; }
     // Compatibility note (empty-start opening): a raw passthrough is a
     // LITERAL CLI command — its contract is that the CLI sees exactly the
     // bytes the user typed, never a botmux XML envelope. So it deliberately
@@ -24396,7 +24523,8 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    const accepted = sendWorkerSessionInput(ds, {
+    let accepted: boolean;
+    try { accepted = sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
       ...(trustedSessionController(ds)
@@ -24407,10 +24535,11 @@ function deliverPassthroughToExistingSession(
       ...(mojoLivePatchForSession(ds) ?? {}),
       turnId,
       ...(turn.requireSafeComposer ? { requireSafeComposer: true as const } : {}),
-    });
+    }); } catch (err) { restoreBinding(); throw err; }
     if (!accepted) {
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
-      return;
+      restoreBinding();
+      return false;
     }
     // The worker has the turn from here on: report delivery before the
     // bookkeeping below, so a throw in beginNewTurn (e.g. a transient session
@@ -24421,7 +24550,7 @@ function deliverPassthroughToExistingSession(
     beginNewTurn(ds, commandContent, turnId);
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
-    return;
+    return true;
   }
   void sessionReply(
     anchor,
@@ -24429,6 +24558,7 @@ function deliverPassthroughToExistingSession(
     'text',
     larkAppId,
   );
+  return false;
 }
 
 export const __testOnly_deliverPassthroughToExistingSession =
@@ -26167,6 +26297,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
   if (isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
+      context: 'new-topic',
       scope,
       chatId,
       anchor,
@@ -29898,6 +30029,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   if (slashDecision && isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
+      context: 'thread',
       scope,
       chatId: routingChatId,
       anchor,
@@ -31558,6 +31690,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   chatFirstSeenStore.init(cfg.larkAppId);
   initSessionGroups(cfg.larkAppId);
+  subscribeSessionGroupTitles();
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
     config.session.dataDir,
     { receiverBootId: getDaemonBootId(), agentAppId: cfg.larkAppId },
