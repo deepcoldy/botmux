@@ -21,6 +21,7 @@ import {
   ignoredScheduleBotGrantCount,
 } from '../src/global-config.js';
 import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
+import { protectedMcpIsolationPolicy } from '../src/core/protected-mcp-capabilities.js';
 
 describe('global dashboard config', () => {
   let home: string;
@@ -119,6 +120,99 @@ describe('global dashboard config', () => {
   it('rejects a relative operator-provided global config path', () => {
     vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
     expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('reads protected MCP capabilities from machine-wide config with writes default-off', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.secret.v1': {
+          allowedPluginIds: ['fixture-plugin', 'fixture-plugin'],
+          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          principal: 'verified-human-email',
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: {
+            protectedHomePaths: ['.fixture-credential', '.fixture-credential'],
+            redactEnv: ['FIXTURE_TOKEN', 'FIXTURE_TOKEN'],
+          },
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.secret.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'env', name: 'FIXTURE_SECRET' },
+        principal: 'verified-human-email',
+        containmentProfile: 'local-stdio-secret-v1',
+        isolation: {
+          protectedHomePaths: ['.fixture-credential'],
+          redactEnv: ['FIXTURE_TOKEN'],
+        },
+      },
+    });
+  });
+
+  it('drops malformed protected MCP capability entries without widening access', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        '../escape': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.absolute-path.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: { protectedHomePaths: ['/tmp/credential'] },
+        },
+        'fixture.bad-env.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'BAD-NAME' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.unknown-profile.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'FIXTURE_SECRET' },
+          containmentProfile: 'operator-composed-profile',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toBeUndefined();
+  });
+
+  it('keeps matching protected MCP isolation active while the capability is disabled', () => {
+    const config = {
+      'fixture.secret.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'env' as const, name: 'FIXTURE_SECRET' },
+        containmentProfile: 'local-stdio-secret-v1' as const,
+        isolation: {
+          protectedHomePaths: ['.fixture-credential'],
+          redactEnv: ['FIXTURE_TOKEN'],
+        },
+      },
+    };
+
+    expect(protectedMcpIsolationPolicy(['fixture-plugin'], config)).toEqual({
+      protectedHomePaths: ['.fixture-credential'],
+      secretEnvNames: ['FIXTURE_SECRET'],
+      redactEnv: ['FIXTURE_TOKEN'],
+    });
+    expect(protectedMcpIsolationPolicy(['other-plugin'], config)).toEqual({
+      protectedHomePaths: [],
+      secretEnvNames: [],
+      redactEnv: [],
+    });
   });
 
   it('rejects an uncoordinated global config write in primary mode', () => {

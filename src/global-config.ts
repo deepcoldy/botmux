@@ -29,6 +29,10 @@ import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, typ
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
 import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
+import {
+  normalizeProtectedMcpCapabilities,
+  type ProtectedMcpCapabilityConfigMap,
+} from './core/protected-mcp-capabilities.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -299,6 +303,8 @@ export interface GlobalConfig {
   skills?: GlobalSkillConfig;
   /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
   plugins?: string[];
+  /** Operator-owned bindings for optional protected local MCP capabilities. */
+  protectedMcpCapabilities?: ProtectedMcpCapabilityConfigMap;
   /** Host-wide ceiling for per-plugin MCP tool calls. Missing defaults to 10 minutes. */
   mcpGatewayMaxToolTimeoutMs?: number;
   /** 远程访问. When true (and this machine is bound to the central platform),
@@ -961,6 +967,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (skills) out.skills = skills;
   const plugins = normalizePluginIdList(raw.plugins);
   if (plugins) out.plugins = plugins;
+  const protectedMcpCapabilities = normalizeProtectedMcpCapabilities(raw.protectedMcpCapabilities);
+  if (protectedMcpCapabilities) out.protectedMcpCapabilities = protectedMcpCapabilities;
   const mcpGatewayMaxToolTimeoutMs = normalizeMcpGatewayMaxToolTimeoutMs(raw.mcpGatewayMaxToolTimeoutMs);
   if (mcpGatewayMaxToolTimeoutMs !== undefined) out.mcpGatewayMaxToolTimeoutMs = mcpGatewayMaxToolTimeoutMs;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;

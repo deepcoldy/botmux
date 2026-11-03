@@ -17,7 +17,7 @@ export interface PluginStdioMcpServer {
   transport: 'stdio';
   command: string[];
   env?: Record<string, string>;
-  hostSecret?: 'bytedcli-ai-auth-app-key';
+  protectedCapability?: string;
 }
 
 export interface PluginStreamableHttpMcpServer {

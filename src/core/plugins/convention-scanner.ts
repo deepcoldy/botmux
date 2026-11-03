@@ -15,6 +15,10 @@ import type {
   PluginServiceMode,
   ScannedPluginContributions,
 } from './types.js';
+import {
+  isValidProtectedMcpCapabilityId,
+  PROTECTED_MCP_SECRET_FD_ENV,
+} from '../protected-mcp-capabilities.js';
 
 function isFile(path: string): boolean {
   try {
@@ -83,6 +87,9 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
   const record = optionalRecord(raw, `mcp_${source}`);
   const transport = record.transport === undefined ? 'stdio' : record.transport;
   if (transport === 'streamable-http') {
+    if (record.protectedCapability !== undefined) {
+      throw new Error(`protected_capability_requires_stdio:${name}`);
+    }
     const url = optionalString(record.url);
     if (!url) throw new Error(`invalid_plugin_mcp_url:${name}`);
     let parsed: URL;
@@ -96,13 +103,12 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
   if (transport !== 'stdio') throw new Error(`invalid_plugin_mcp_transport:${name}`);
   const command = readCommand(record.command, `mcp_command_${name}`);
   const env = readEnv(record.env, `mcp_env_${name}`);
-  if (env?.BYTEDCLI_AI_AUTH_APP_KEY !== undefined) {
-    throw new Error(`reserved_plugin_mcp_env:BYTEDCLI_AI_AUTH_APP_KEY`);
+  if (env?.[PROTECTED_MCP_SECRET_FD_ENV] !== undefined) {
+    throw new Error(`reserved_plugin_mcp_env:${PROTECTED_MCP_SECRET_FD_ENV}`);
   }
-  const hostSecret = record.hostSecret;
-  if (hostSecret !== undefined
-    && (name !== 'mix' || hostSecret !== 'bytedcli-ai-auth-app-key')) {
-    throw new Error(`invalid_plugin_mcp_host_secret:${name}`);
+  const protectedCapability = record.protectedCapability;
+  if (protectedCapability !== undefined && !isValidProtectedMcpCapabilityId(protectedCapability)) {
+    throw new Error(`invalid_plugin_mcp_protected_capability:${name}`);
   }
   const templated = [...command, ...Object.values(env ?? {})].find(value => /\$\{[^}]+\}/.test(value));
   if (templated) throw new Error(`unsupported_plugin_mcp_runtime_template:${name}`);
@@ -116,7 +122,7 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
     transport,
     command,
     ...(env ? { env } : {}),
-    ...(hostSecret ? { hostSecret } : {}),
+    ...(protectedCapability ? { protectedCapability } : {}),
   };
 }
 

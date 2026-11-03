@@ -217,7 +217,7 @@ describe('plugin manifest and registry basics', () => {
     )).toThrow(/unsupported_plugin_mcp_runtime_template/);
   });
 
-  it('reserves the protected App Key channel for the MIX plugin only', () => {
+  it('accepts opaque protected capabilities only for local stdio MCP servers', () => {
     const makeSource = (name: string, descriptor: Record<string, unknown>) => {
       const root = join(home, name);
       mkdirSync(join(root, 'mcp'), { recursive: true });
@@ -230,17 +230,29 @@ describe('plugin manifest and registry basics', () => {
     };
 
     expect(scanPluginContributions(
-      makeSource('mix-protected-secret', { hostSecret: 'bytedcli-ai-auth-app-key' }),
-      { schemaVersion: 1, id: 'mix' },
-    ).mcp).toMatchObject({ hostSecret: 'bytedcli-ai-auth-app-key' });
+      makeSource('fixture-protected-secret', { protectedCapability: 'fixture.secret.v1' }),
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    ).mcp).toMatchObject({ protectedCapability: 'fixture.secret.v1' });
     expect(() => scanPluginContributions(
-      makeSource('other-protected-secret', { hostSecret: 'bytedcli-ai-auth-app-key' }),
-      { schemaVersion: 1, id: 'other' },
-    )).toThrow(/invalid_plugin_mcp_host_secret/);
+      makeSource('invalid-protected-secret', { protectedCapability: '../escape' }),
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    )).toThrow(/invalid_plugin_mcp_protected_capability/);
     expect(() => scanPluginContributions(
-      makeSource('generic-app-key-env', { env: { BYTEDCLI_AI_AUTH_APP_KEY: 'forbidden' } }),
-      { schemaVersion: 1, id: 'mix' },
-    )).toThrow(/reserved_plugin_mcp_env:BYTEDCLI_AI_AUTH_APP_KEY/);
+      makeSource('protected-fd-env', { env: { BOTMUX_PROTECTED_SECRET_FD: '9' } }),
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    )).toThrow(/reserved_plugin_mcp_env:BOTMUX_PROTECTED_SECRET_FD/);
+
+    const httpRoot = join(home, 'http-protected-secret');
+    mkdirSync(join(httpRoot, 'mcp'), { recursive: true });
+    writeFileSync(join(httpRoot, 'mcp', 'index.json'), JSON.stringify({
+      transport: 'streamable-http',
+      url: 'https://mcp.example.test/api',
+      protectedCapability: 'fixture.secret.v1',
+    }));
+    expect(() => scanPluginContributions(
+      httpRoot,
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    )).toThrow(/protected_capability_requires_stdio/);
   });
 
   it('scans Lark slash command declarations and rejects reserved names', () => {
