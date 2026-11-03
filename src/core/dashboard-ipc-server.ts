@@ -4344,7 +4344,6 @@ function findSessionRecord(sessionId: string): Session | undefined {
  *  getBotClient (which only throws for apiOnly) cannot. Accepts a live
  *  DaemonSession or a stored Session record. Never throws. */
 function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): boolean {
-  if (isHeadlessSessionChatId(s.chatId)) return false;
   const appId = s.larkAppId;
   let apiOnly = false;
   if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }

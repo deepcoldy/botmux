@@ -6,7 +6,7 @@ import { config } from '../src/config.js';
 import { createHeadlessSession } from '../src/core/session-manager.js';
 import { triggerSessionTurn } from '../src/core/trigger-session.js';
 import { sessionKey } from '../src/core/types.js';
-import { usesLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { larkToolPrompt, usesLarkToolBinding } from '../src/core/lark-tool-binding.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const state = vi.hoisted(() => ({ rows: new Map<string, any>(), fork: vi.fn() }));
@@ -62,9 +62,11 @@ it('real create-then-run dispatches bot-only inline guidance and durable headles
   expect(ds.session.headless).toMatchObject({ id: created.headlessId, source: 'cli' });
   expect(ds).toBe(activeSessions.get(sessionKey(ds.chatId, appId)));
   expect(options.resume).toBe(false);
-  expect(input.content).toContain('没有真人授权通道');
-  expect(input.content).toContain(appId);
-  expect(input.content).not.toContain('botmux auth request');
+  const expectedPolicy = larkToolPrompt(appId, 'zh', true);
+  const interactivePolicy = larkToolPrompt(appId, 'zh', false);
+  expect(expectedPolicy).not.toBe(interactivePolicy);
+  expect(input.content).toContain(`<botmux_lark_tool>\n  ${expectedPolicy}\n</botmux_lark_tool>`);
+  expect(input.content).not.toContain(interactivePolicy);
   expect(usesLarkToolBinding({ sessionId: created.sessionId, larkAppId: appId, chatId: ds.chatId,
     headless: ds.session.headless, backendType: 'pty', resume: options.resume }, root)).toBe(true);
 });

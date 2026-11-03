@@ -22,6 +22,7 @@ import {
 import { buildNewTopicPrompt, buildFollowUpCliInput } from '../src/core/session-manager.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
 
 const policy = parseTriggerUserAuthConfig({ enabled: true })!;
 
@@ -210,11 +211,12 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
       const firstRun = buildFollowUpCliInput('read the linked doc', 'headless-session', {
         larkAppId: appId, chatId: `headless_${headlessId}`, cliId: 'codex', locale,
       }).content;
+      const expectedPolicy = larkToolPrompt(appId, locale, true);
+      const interactivePolicy = larkToolPrompt(appId, locale, false);
+      expect(expectedPolicy).not.toBe(interactivePolicy);
       for (const prompt of [system, inline, firstRun]) {
-        expect(prompt).toContain(appId);
-        expect(prompt).toContain(locale === 'zh' ? '没有真人授权通道' : 'no human authorization channel');
-        expect(prompt).not.toContain('botmux auth request');
-        expect(prompt).not.toContain(locale === 'zh' ? '可用 --as user' : 'use --as user with');
+        expect(prompt).toContain(`<botmux_lark_tool>\n  ${expectedPolicy}\n</botmux_lark_tool>`);
+        expect(prompt).not.toContain(interactivePolicy);
       }
     } finally { stubbedBots.delete(appId); }
   });

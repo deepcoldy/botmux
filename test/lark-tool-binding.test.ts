@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, larkToolPrompt, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
@@ -161,9 +161,10 @@ describe('managed lark-cli binding', () => {
     expect(larkToolPromptFromEnv('en', env)).toContain('lark-cli uses application cli_current');
     expect(larkToolPromptFromEnv('zh', env)).toContain('lark-cli 固定使用当前机器人的应用 cli_current');
     const headlessEnv = { ...env, BOTMUX_CHAT_ID: 'headless_hl_runner' };
-    expect(larkToolPromptFromEnv('en', headlessEnv)).toContain('no human authorization channel');
-    expect(larkToolPromptFromEnv('zh', headlessEnv)).toContain('没有真人授权通道');
-    expect(larkToolPromptFromEnv('en', headlessEnv)).not.toContain('botmux auth request');
+    for (const locale of ['en', 'zh']) {
+      expect(larkToolPromptFromEnv(locale, headlessEnv)).toBe(larkToolPrompt(defaults.appId, locale, true));
+      expect(larkToolPromptFromEnv(locale, headlessEnv)).not.toBe(larkToolPrompt(defaults.appId, locale, false));
+    }
     expect(larkToolPromptFromEnv('en', {})).toBe('');
   });
   it('keeps the configured PATH when viewer setup repeats an RPC binding', () => {

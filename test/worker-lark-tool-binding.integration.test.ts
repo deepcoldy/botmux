@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
+import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
 const headlessId = 'hl_11111111-1111-4111-8111-111111111111';
 const headlessChat = `headless_${headlessId}`;
 
@@ -151,10 +152,11 @@ setInterval(()=>{},1000);
     expect(prompt).toContain('默认以 bot 身份调用');
     expect(prompt).toContain('--as user');
     if (headless) {
-      const larkPrompt = prompt.slice(prompt.indexOf('<botmux_lark_tool>'), prompt.indexOf('</botmux_lark_tool>'));
-      expect(larkPrompt).toContain('没有真人授权通道');
-      expect(larkPrompt).not.toContain('可用 --as user');
-      expect(larkPrompt).not.toContain('botmux auth request');
+      const expectedPolicy = larkToolPrompt('cli_current_app', 'zh', true);
+      const interactivePolicy = larkToolPrompt('cli_current_app', 'zh', false);
+      expect(expectedPolicy).not.toBe(interactivePolicy);
+      expect(prompt).toContain(`<botmux_lark_tool>\n  ${expectedPolicy}\n</botmux_lark_tool>`);
+      expect(prompt).not.toContain(interactivePolicy);
     }
     expect(prompt).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
     expect(prompt).not.toContain('已为 lark-cli / bytedcli 启用');
