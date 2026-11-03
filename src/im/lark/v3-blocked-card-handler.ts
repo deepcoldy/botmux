@@ -14,6 +14,7 @@ import {
   V3_BLOCKED_ASK_TEXT_FIELD,
   V3_BLOCKED_REASSIGN_ACTION,
   buildV3BlockedCard,
+  buildV3BlockedCardForInfo,
   v3BlockedCardNonce,
   type V3BlockedActionValue,
   type V3AskAnswerActionValue,
@@ -133,6 +134,21 @@ export async function handleV3BlockedAction(
     };
   }
 
+  if (outcome.kind === 'stale-run' && outcome.reason === 'revised') {
+    // The answer would reach an instance that no longer runs: turn the card
+    // into the voided state (no answer buttons; only the explicit re-run, which
+    // goes through the gate again) so nobody believes it was delivered.
+    const info = blockedInfoFor(readJournal(join(runDir, 'journal.ndjson')), value.nodeId);
+    return JSON.parse(buildV3BlockedCardForInfo(value.runId, {
+      ...info,
+      attemptId: value.attemptId,
+      askVoided: true,
+    }));
+  }
+  if (outcome.kind === 'stale-run' && outcome.reason === 'revision-pending') {
+    // Toast only: the card stays answerable once the proposal is decided.
+    return { toast: { type: 'warning', content: '这个节点有待确认的流程修改，请先处理修改确认卡' } };
+  }
   if (outcome.kind === 'stale-run') {
     return {
       toast: {

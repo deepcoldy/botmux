@@ -43,6 +43,11 @@ import {
   handleV3RunSaveAction,
   isV3RunSaveAction,
 } from './v3-run-save-card-handler.js';
+import {
+  handleV3RevisionAction,
+  isV3RevisionAction,
+} from './v3-revision-card-handler.js';
+import type { V3RevisionActionValue } from './v3-revision-card.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
 import {
   handleV3DistillationAction,
@@ -138,7 +143,7 @@ export interface V3CardRoute {
   run(ctx: V3CardActionContext): Promise<any> | undefined;
 }
 
-/** 原 if 链顺序：gate → blocked → revisit → loop → runSave → distillation。 */
+/** 原 if 链顺序：gate → blocked → revisit → loop → revision → runSave → distillation。 */
 export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
   {
     name: 'gate',
@@ -169,6 +174,12 @@ export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
     matches: isV3LoopGrantAction,
     run: ctx => ctx.deps.v3LoopGrantDeps
       && handleV3LoopGrantAction(ctx.value as unknown as V3LoopGrantActionValue, ctx.operatorOpenId, ctx.deps.v3LoopGrantDeps),
+  },
+  {
+    name: 'revision',
+    matches: isV3RevisionAction,
+    run: ctx => ctx.deps.v3RevisionDeps
+      && handleV3RevisionAction(ctx.value as unknown as V3RevisionActionValue, ctx.operatorOpenId, ctx.deps.v3RevisionDeps),
   },
   {
     name: 'runSave',

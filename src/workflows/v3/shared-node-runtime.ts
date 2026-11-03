@@ -51,6 +51,16 @@ export {
 import { decideNext, type V3Action } from './orchestrator.js';
 import { planV3Revisit } from './revisit-plan.js';
 import {
+  currentV3Revision,
+  foldV3Revisions,
+  appendMissingV3RevisionFollowUps,
+  loadEffectiveV3Dag,
+  missingV3RevisionFollowUps,
+  snapshotForSelector,
+  v3ApprovedBotScope,
+  v3NodeHeldByProposal,
+} from './dag-revision.js';
+import {
   appendEvent,
   appendEventDurable,
   readJournal,
@@ -456,7 +466,14 @@ export type V3RunOutcome =
       uncertainHostEffects?: V3UncertainHostEffect[];
       runDir: string;
     }
-  | { reason: 'awaitingGate'; pendingWaits: V3PendingGate[]; runDir: string }
+  | {
+      reason: 'awaitingGate';
+      pendingWaits: V3PendingGate[];
+      /** A flow-revision proposal awaiting the initiator holds back the
+       *  nodes it touches (design §13.5); the rest of the run is idle. */
+      pendingRevision?: number;
+      runDir: string;
+    }
   | {
       /** Nothing is dispatchable now and at least one external attempt is
        *  open. The run is suspended on disk; re-drive on a settle event, a
@@ -465,6 +482,7 @@ export type V3RunOutcome =
       reason: 'awaitingExternal';
       pendingWaits: V3PendingGate[];
       externalAttempts: V3ExternalWait[];
+      pendingRevision?: number;
       wakeAt?: number;
       runDir: string;
     };
@@ -560,10 +578,14 @@ export function v3AcceptanceProbeUnknownSince(runDir: string, attemptId: string)
  * instead of re-running completed nodes.
  */
 export async function runWorkflow(
-  dag: V3Dag,
+  authorizedDag: V3Dag,
   deps: V3RuntimeDeps,
   opts: V3RuntimeOptions,
 ): Promise<V3RunOutcome> {
+  // `dag` is the EFFECTIVE flow: the authorized DAG plus every revision the
+  // journal applied (design §13.3). It is re-derived each tick, so closures
+  // below always see the definition the current decision was made on.
+  let dag = authorizedDag;
   const runDir = join(opts.baseDir, dag.runId);
   mkdirSync(runDir, { recursive: true });
   const journalPath = join(runDir, 'journal.ndjson');
@@ -599,7 +621,14 @@ export async function runWorkflow(
   }
   const probeKey = (attemptId: string): string => `${runDir}\0${attemptId}`;
 
-  const nodesById = new Map(dag.nodes.map((n) => [n.id, n]));
+  let nodesById = new Map(dag.nodes.map((n) => [n.id, n]));
+  // Revision the current tick decided on; every journal claim re-checks it
+  // under the lock so a concurrent edit can never be overtaken by a stale
+  // decision (dispatching an old definition, skipping on old wiring, …).
+  let dagRevision = 1;
+  // Nodes held back by a pending proposal (design §13.5).
+  let pendingTouched: ReadonlySet<string> | undefined;
+  let pendingRevision: number | undefined;
 
   // Freeze bot snapshots once, keyed by the node's `bot` field (''=default),
   // and persist for audit / resume.  Re-resolving mid-run would let a drifted
@@ -632,7 +661,7 @@ export async function runWorkflow(
   // CLI-scope guard: goal-mode rides the native `/goal` command.  Fail the
   // whole run up front — clearly — rather than spawning a worker on a CLI that
   // has not been verified to understand `/goal`.
-  for (const [key, snap] of botSnapshots) {
+  const validateSnapshot = (key: string, snap: BotSnapshot): void => {
     if (deps.validateExecutionSnapshot) {
       deps.validateExecutionSnapshot(snap, key);
     } else if (!isV3SupportedCli(snap.cliId)) {
@@ -641,7 +670,84 @@ export async function runWorkflow(
         `which is not supported by v3 goal-mode (supported: ${V3_SUPPORTED_CLIS.join(', ')})`,
       );
     }
-  }
+  };
+  for (const [key, snap] of botSnapshots) validateSnapshot(key, snap);
+
+  /** The frozen snapshot a node runs on. Revisions only ever reference
+   *  approved selectors or bots their own pinned sidecar brought in. */
+  const botSnapshotFor = (selector: string | undefined): BotSnapshot => {
+    const snap = snapshotForSelector(botSnapshots, selector);
+    if (!snap) {
+      throw new Error(`v3 runtime: no frozen bot snapshot for selector "${selector || '<default>'}"`);
+    }
+    return snap;
+  };
+
+  /**
+   * Fold the journal's flow revisions into the effective DAG. Without any
+   * revision this is a no-op (the authorized DAG, no extra IO). A digest or
+   * chain mismatch throws: the run fails closed rather than schedule a flow
+   * nobody authorized.
+   */
+  const refreshEffectiveDag = (events: readonly StoredEvent[]): void => {
+    const history = foldV3Revisions(events);
+    pendingTouched = history.pending ? new Set(history.pending.touched) : undefined;
+    pendingRevision = history.pending?.revision;
+    if (history.current === dagRevision) return;
+    const effective = loadEffectiveV3Dag(runDir, authorizedDag, events);
+    // The run's approved bot scope grows only through confirmed revisions.
+    for (const [selector, snap] of v3ApprovedBotScope(botSnapshots, effective.botAdditions)) {
+      if (botSnapshots.has(selector)) continue;
+      validateSnapshot(selector, snap);
+      botSnapshots.set(selector, snap);
+    }
+    for (const node of effective.dag.nodes) {
+      if (isHostNode(node) && !deps.hostExecutors?.has(node.executor)) {
+        throw new Error(`v3 runtime: host executor "${node.executor}" is not registered`);
+      }
+      if (isGoalNode(node)) botSnapshotFor(node.bot);
+      if (isLoopNode(node)) for (const body of node.body.nodes) botSnapshotFor(body.bot ?? node.bot);
+    }
+    dag = effective.dag;
+    nodesById = new Map(dag.nodes.map((n) => [n.id, n]));
+    dagRevision = effective.revision;
+  };
+
+  /** Under the journal lock: does the decision this tick made still stand?
+   *  False when a revision took effect since, or a new proposal now holds
+   *  the node back. */
+  const decisionStillCurrent = (
+    latest: readonly StoredEvent[],
+    nodeId?: string,
+    loopId?: string,
+  ): boolean => {
+    if (currentV3Revision(latest) !== dagRevision) return false;
+    if (nodeId === undefined) return true;
+    const pending = foldV3Revisions(latest).pending;
+    return !pending || !v3NodeHeldByProposal(new Set(pending.touched), nodeId, loopId);
+  };
+
+  /** Append one control-sweep event only if the flow it was decided on is
+   *  still the effective one. */
+  const appendControlEvent = (event: V3Event): boolean =>
+    withJournalMutationSync(journalPath, ({ events, append }) => {
+      if (!decisionStillCurrent(events)) return false;
+      append(event);
+      return true;
+    });
+
+  const heldByProposal = (nodeId: string, loopId?: string): boolean =>
+    v3NodeHeldByProposal(pendingTouched, nodeId, loopId);
+
+  /** A revision's reassign / blocked re-run whose dedicated event was lost
+   *  to a crash between two appends is re-appended (idempotent, §13.3). */
+  const reconcileRevisionFollowUps = (events: readonly StoredEvent[]): boolean => {
+    const live = new Set(dag.nodes.map((node) => node.id));
+    if (missingV3RevisionFollowUps(events, live).length === 0) return false;
+    const result = appendMissingV3RevisionFollowUps(journalPath, { revision: dagRevision, liveNodeIds: live });
+    // stale → a newer flow landed: re-read it before deciding again.
+    return result.kind === 'stale' || result.count > 0;
+  };
 
   if (!opts.authorizedArtifacts) {
     assertOrCreateFrozenJson(
@@ -769,6 +875,8 @@ export async function runWorkflow(
 
   while (true) {
     const events = readJournal(journalPath);
+    refreshEffectiveDag(events);
+    if (reconcileRevisionFollowUps(events)) continue;
     const snap = materialize(events);
     writeState(statePath, snap);
 
@@ -943,6 +1051,15 @@ export async function runWorkflow(
         a.kind === 'completeRunBlocked',
     );
     if (terminal) {
+      // A pending proposal may still re-run or extend finished work: the run
+      // does not declare success until the initiator decides (design §13.5).
+      if (terminal.kind === 'completeRunSucceeded' && pendingRevision !== undefined) {
+        if (inFlight.size > 0) {
+          await waitForInFlightOrDurableCancellation();
+          continue;
+        }
+        return { reason: 'awaitingGate', pendingWaits: [], pendingRevision, runDir };
+      }
       // Gate promises have no process to drain and their guarded callbacks turn
       // stale once this boundary commits. Worker attempts, however, must prove
       // outer close before the terminal event can be published.
@@ -976,7 +1093,7 @@ export async function runWorkflow(
     // the terminal sweep.  Work dispatches in the same action list simply
     // re-emerge next tick.  Edge resolution is deliberately serial/control
     // phase (H8): no inFlight, no concurrency slot, no AbortController.
-    const controls = actions.filter(
+    const allControls = actions.filter(
       (a): a is
         | Extract<V3Action, { loopId: string }>
         | Extract<V3Action, { kind: 'resolveEdge' | 'skipNode' }> =>
@@ -987,12 +1104,18 @@ export async function runWorkflow(
         a.kind === 'resolveEdge' ||
         a.kind === 'skipNode',
     );
+    // A node a pending proposal touches neither starts nor settles its wiring
+    // until the initiator decides (design §13.5).
+    const controls = allControls.filter((a) => !heldByProposal(
+      a.kind === 'resolveEdge' ? a.to : a.kind === 'skipNode' ? a.nodeId : a.loopId,
+    ));
+    const heldControls = allControls.length - controls.length;
     if (controls.length > 0) {
       const eventsForControl = readJournal(journalPath);
       for (const a of controls) {
         if (a.kind === 'resolveEdge') applyResolveEdge(a, eventsForControl);
         else if (a.kind === 'skipNode') {
-          appendEvent(journalPath, {
+          appendControlEvent({
             type: 'nodeSkipped',
             nodeId: a.nodeId,
             reason: 'triggerRuleUnsatisfied',
@@ -1020,8 +1143,16 @@ export async function runWorkflow(
       inFlight.size - [...inFlight.keys()].filter((key) => key.endsWith('::handoff')).length + externalOccupancy;
 
     let startedThisTick = 0;
+    let heldThisTick = heldControls;
     for (const a of actions) {
       if (occupancy() >= globalCap) break;
+      if (
+        (a.kind === 'dispatchWork' || a.kind === 'dispatchGate') &&
+        heldByProposal(a.nodeId, a.kind === 'dispatchWork' ? a.loop?.loopId : undefined)
+      ) {
+        heldThisTick++;
+        continue;
+      }
       if (a.kind === 'dispatchWork') {
         // Loop body instances are synthesized from the body definition; the
         // instance id is theirs alone (attempt dirs, journal events, retry).
@@ -1030,7 +1161,7 @@ export async function runWorkflow(
           if (!a.instanceId) throw new Error(`v3 runtime: host node "${node.id}" has no runtime instance`);
           if (startHost(node, events, a.instanceId)) startedThisTick++;
         } else {
-          const botSnap = botSnapshots.get(node.bot ?? '')!;
+          const botSnap = botSnapshotFor(node.bot);
           if (externalMode) {
             // Bot sessions are managed by each bot's daemon: no per-CLI cap.
             const target = snap.assignments.get(node.id) ?? botSnap.larkAppId;
@@ -1057,7 +1188,7 @@ export async function runWorkflow(
     }
 
     const cancels = actions.filter((a): a is Extract<V3Action, { kind: 'cancelNode' }> =>
-      a.kind === 'cancelNode');
+      a.kind === 'cancelNode' && !heldByProposal(a.nodeId));
     let cancelledThisTick = false;
     for (const a of cancels) {
       cancelledThisTick = applyCancelNode(a) || cancelledThisTick;
@@ -1076,7 +1207,10 @@ export async function runWorkflow(
         // rather than report a stale suspension (or a false "no progress").
         if (externalMode && latestEvents.length !== events.length) continue;
         const waitingExternal = openV3ExternalAttempts(latestEvents);
-        if (pendingWaits.length > 0 || waitingExternal.length > 0) {
+        // A proposal can arrive after this tick read the journal: re-decide
+        // rather than report a stale suspension.
+        if (latestEvents.length !== events.length && currentV3Revision(latestEvents) !== dagRevision) continue;
+        if (pendingWaits.length > 0 || waitingExternal.length > 0 || heldThisTick > 0) {
           const open = openV3WorkerAttempts(events);
           if (open.length > 0) {
             const drained = await quiesceAttempts(open, 'orphanRecovery');
@@ -1084,7 +1218,12 @@ export async function runWorkflow(
             continue;
           }
           if (waitingExternal.length > 0) return awaitingExternalOutcome(waitingExternal, pendingWaits);
-          return { reason: 'awaitingGate', pendingWaits, runDir };
+          return {
+            reason: 'awaitingGate',
+            pendingWaits,
+            ...(heldThisTick > 0 && pendingRevision !== undefined ? { pendingRevision } : {}),
+            runDir,
+          };
         }
         // Not terminal, nothing running, nothing dispatchable — a correct
         // decideNext never gets here; guard against an infinite spin.
@@ -1144,9 +1283,13 @@ export async function runWorkflow(
    *  Cancellation/dispatch races therefore linearize against the same lock. */
   function appendRunTerminalIfQuiescent(): boolean {
     return withJournalMutationSync(journalPath, ({ events, append }) => {
+      // A revision that landed since this tick decided may add or rewire
+      // nodes: never publish a run boundary decided on an older flow.
+      if (!decisionStillCurrent(events)) return false;
       const snap = materialize([...events]);
       if (snap.runStatus !== 'running') return false;
       if (openV3WorkerAttempts(events).length > 0) return false;
+      const pendingProposal = foldV3Revisions(events).pending;
       if (openV3HostEffects(events).length > 0) return false;
       if (openV3ExternalAttempts(events).length > 0) return false;
       const terminal = decideNext(dag, snap.nodes, snap.loops, snap.edges, snap.instances).find(
@@ -1156,6 +1299,7 @@ export async function runWorkflow(
           action.kind === 'completeRunBlocked',
       );
       if (!terminal) return false;
+      if (terminal.kind === 'completeRunSucceeded' && pendingProposal) return false;
       const event: Extract<V3Event, { type: 'runSucceeded' | 'runFailed' | 'runBlocked' }> =
         terminal.kind === 'completeRunSucceeded'
           ? { type: 'runSucceeded' }
@@ -1180,13 +1324,49 @@ export async function runWorkflow(
     { type: 'nodeDispatched' | 'gateDispatched' }
   >): boolean {
     return withJournalMutationSync(journalPath, ({ events, append }) => {
+      if (!decisionStillCurrent(
+        events,
+        event.nodeId,
+        event.type === 'nodeDispatched' ? event.loop?.loopId : undefined,
+      )) return false;
       const snap = materialize([...events]);
       if (snap.runStatus !== 'running') return false;
       const status = snap.nodes.get(event.nodeId)?.status ?? 'pending';
       if (status !== 'pending') return false;
+      // A wait id is single-use: replay ignores a re-dispatch of a gate that
+      // was already decided (or voided), so the node would stay pending and
+      // this loop would re-dispatch it forever. Never spin — fail loudly.
+      if (event.type === 'gateDispatched' && gateWaitAlreadyDecided(events, event.waitId)) {
+        throw new Error(
+          `v3 runtime: gate ${event.waitId} of node "${event.nodeId}" was already decided, ` +
+          'but the node has no approval to run on; refusing to re-dispatch the same gate',
+        );
+      }
       append(event, { durable: true });
       return true;
     });
+  }
+
+  function gateWaitAlreadyDecided(events: readonly StoredEvent[], waitId: string): boolean {
+    return events.some((event) =>
+      (event.type === 'gateResolved' && event.waitId === waitId) ||
+      (event.type === 'dagRevised' && (
+        event.effects?.supersede?.some((item) => item.waitId === waitId) === true ||
+        event.effects?.cancel?.some((item) => item.waitId === waitId) === true
+      )));
+  }
+
+  /** Changes whenever a revision is applied, proposed or decided. */
+  function revisionSignature(events: readonly StoredEvent[]): number {
+    let count = 0;
+    for (const event of events) {
+      if (
+        event.type === 'dagRevised' ||
+        event.type === 'dagRevisionProposed' ||
+        event.type === 'dagRevisionRejected'
+      ) count++;
+    }
+    return count;
   }
 
   function isRunCancelling(): boolean {
@@ -1203,6 +1383,11 @@ export async function runWorkflow(
   async function waitForInFlightOrDurableCancellation(): Promise<void> {
     const active = [...inFlight.values()];
     if (active.length === 0) return;
+    // A flow revision (or a proposal decision) appended while workers run
+    // must be acted on now — e.g. stop a worker whose instance it superseded
+    // — not when an unrelated worker happens to settle. Runs that never
+    // revise keep a constant signature, so their wake-ups are unchanged.
+    const revisionSignatureAtStart = revisionSignature(readJournal(journalPath));
     await new Promise<void>((resolve, reject) => {
       let done = false;
       let timer: NodeJS.Timeout | undefined;
@@ -1218,7 +1403,12 @@ export async function runWorkflow(
       const poll = (): void => {
         if (done) return;
         try {
-          if (signal?.aborted || isRunCancelling()) {
+          const latest = readJournal(journalPath);
+          if (
+            signal?.aborted ||
+            materialize(latest).runStatus === 'cancelling' ||
+            revisionSignature(latest) !== revisionSignatureAtStart
+          ) {
             finish();
             return;
           }
@@ -1720,6 +1910,7 @@ export async function runWorkflow(
           executionContext,
         });
         const committed = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          if (!decisionStillCurrent(latest, node.id)) return false;
           const current = materialize([...latest]);
           if (current.runStatus !== 'running') return false;
           if ((current.nodes.get(node.id)?.status ?? 'pending') !== 'pending') return false;
@@ -1798,6 +1989,9 @@ export async function runWorkflow(
           executionContext,
         });
         withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          // Prepared for a definition a revision has since replaced: drop it;
+          // the fresh instance prepares again from the new input.
+          if (!decisionStillCurrent(latest, node.id)) return;
           const current = materialize([...latest]);
           if (current.runStatus !== 'running') return;
           const status = current.nodes.get(node.id)?.status ?? 'pending';
@@ -1926,6 +2120,7 @@ export async function runWorkflow(
       return blocked;
     }
     const claimed = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+      if (!decisionStillCurrent(latest, node.id)) return false;
       const current = materialize([...latest]);
       if (current.runStatus !== 'running') return false;
       const state = current.nodes.get(node.id);
@@ -2505,17 +2700,24 @@ export async function runWorkflow(
       JSON.stringify(buildInputs(node, events, attemptId, loopRef, omitted, workflowDataPath), null, 2),
     );
     const claimed = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+      if (!decisionStillCurrent(latest, node.id, loopRef?.loopId)) return false;
       const current = materialize([...latest]);
       if (current.runStatus !== 'running') return false;
       if ((current.nodes.get(node.id)?.status ?? 'pending') !== 'pending') return false;
       const identity = { nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId };
-      append({ type: 'nodeDispatched', ...identity, loop: loopRef, nodeExecutor: 'bot' }, { durable: true });
+      append({
+        type: 'nodeDispatched',
+        ...identity,
+        loop: loopRef,
+        nodeExecutor: 'bot',
+        ...(dagRevision > 1 ? { revision: dagRevision } : {}),
+      }, { durable: true });
       append({
         type: 'nodeHandoffPrepared',
         ...identity,
         targetLarkAppId: current.assignments.get(node.id) ?? botSnap.larkAppId,
         placement: 'topic',
-        revision: 1,
+        revision: dagRevision,
         idempotency: { nodeCard: randomUUID(), handoff: randomUUID() },
         preparedAt: clock(),
       }, { durable: true });
@@ -2531,11 +2733,14 @@ export async function runWorkflow(
    *  message can exist yet (the intent precedes every send). */
   function appendMissingHandoffIntent(attempt: V3ExternalAttempt): boolean {
     const node = externalNodeFor(attempt);
-    const frozen = node ? botSnapshots.get(node.bot ?? '') : undefined;
+    const frozen = node ? snapshotForSelector(botSnapshots, node.bot) : undefined;
     if (!frozen) return false;
     return withJournalMutationSync(journalPath, ({ events, append }) => {
       const current = classifyExternalAttempt(events, attempt.attemptId);
       if (!current.ok || current.attempt.phase !== 'dispatched') return false;
+      // The intent belongs to the revision the attempt was dispatched under.
+      const dispatched = events.find((event): event is StoredEvent & { type: 'nodeDispatched' } =>
+        event.type === 'nodeDispatched' && event.attemptId === attempt.attemptId);
       append({
         type: 'nodeHandoffPrepared',
         nodeId: attempt.nodeId,
@@ -2543,7 +2748,7 @@ export async function runWorkflow(
         attemptId: attempt.attemptId,
         targetLarkAppId: current.snap.assignments.get(attempt.nodeId) ?? frozen.larkAppId,
         placement: 'topic',
-        revision: 1,
+        revision: dispatched?.revision ?? 1,
         idempotency: { nodeCard: randomUUID(), handoff: randomUUID() },
         preparedAt: clock(),
       }, { durable: true });
@@ -2584,6 +2789,17 @@ export async function runWorkflow(
         event.nodeId === attempt.nodeId &&
         event.to === ref.targetLarkAppId,
     );
+    // The latest revision that invalidated this node's earlier work or moved
+    // it to this bot: the handoff tells the bot the requirements changed.
+    const revised = [...events].reverse().find(
+      (event): event is StoredEvent & { type: 'dagRevised' } =>
+        event.type === 'dagRevised' &&
+        event.revision <= ref.revision &&
+        (event.effects?.supersede?.some((item) => item.nodeId === attempt.nodeId) === true ||
+          event.effects?.assign?.some((item) => item.nodeId === attempt.nodeId) === true),
+    );
+    const revisedAssign = revised?.effects?.assign?.find((item) =>
+      item.nodeId === attempt.nodeId && item.to === ref.targetLarkAppId);
     return {
       ...ref,
       idempotency: attempt.idempotency,
@@ -2606,7 +2822,10 @@ export async function runWorkflow(
             },
           }
         : {}),
-      ...(reassigned ? { reassignedFrom: reassigned.from } : {}),
+      ...(reassigned
+        ? { reassignedFrom: reassigned.from }
+        : revisedAssign?.from ? { reassignedFrom: revisedAssign.from } : {}),
+      ...(revised ? { revisedBy: { revision: revised.revision, summary: revised.summary } } : {}),
       signal,
     };
   }
@@ -3024,6 +3243,7 @@ export async function runWorkflow(
       ...(instanceId ? { instanceId } : {}),
       attemptId,
       loop: loopRef,
+      ...(dagRevision > 1 ? { revision: dagRevision } : {}),
     })) return false;
 
     const leaseBinding: AttemptLeaseBinding = {
@@ -3552,11 +3772,11 @@ export async function runWorkflow(
   /** Translate one loop-control action into its single journal append. */
   function applyLoopControl(a: Extract<V3Action, { loopId: string }>): void {
     if (a.kind === 'startLoop') {
-      appendEvent(journalPath, { type: 'loopStarted', loopId: a.loopId });
+      appendControlEvent({ type: 'loopStarted', loopId: a.loopId });
       return;
     }
     if (a.kind === 'startLoopIteration') {
-      appendEvent(journalPath, { type: 'loopIterationStarted', loopId: a.loopId, iteration: a.iteration });
+      appendControlEvent({ type: 'loopIterationStarted', loopId: a.loopId, iteration: a.iteration });
       return;
     }
     const loopNode = nodesById.get(a.loopId) as V3LoopNode;
@@ -3573,14 +3793,14 @@ export async function runWorkflow(
       if (!succ) {
         // Engine anomaly — the decision said exit but the output instance has
         // no success record.  Fail loudly rather than fabricate a product.
-        appendEvent(journalPath, {
+        appendControlEvent({
           type: 'nodeFailed', nodeId: a.loopId, attemptId: `${a.loopId}/iterations/${String(a.iteration).padStart(3, '0')}`,
           errorClass: 'workerError',
           message: `loop "${a.loopId}" decided exit but output node "${outInstId}" has no nodeSucceeded`,
         });
         return;
       }
-      appendEvent(journalPath, {
+      appendControlEvent({
         type: 'nodeSucceeded', nodeId: a.loopId, attemptId: succ.attemptId, manifestPath: succ.manifestPath,
       });
       return;
@@ -3620,7 +3840,7 @@ export async function runWorkflow(
     const effectiveMax = loopNode.maxIterations + granted;
     const anomalous = observed.endsWith('<unreadable>');
     const decision = matched ? 'exit' : !anomalous && a.iteration < effectiveMax ? 'continue' : 'exhausted';
-    appendEvent(journalPath, {
+    appendControlEvent({
       type: 'loopIterationDecision', loopId: a.loopId, iteration: a.iteration, decision,
       detail: `${observed} (iteration ${a.iteration}/${effectiveMax})`,
     });
@@ -3643,7 +3863,7 @@ export async function runWorkflow(
     const target = nodesById.get(a.to);
     const dep = target?.depends.find((d) => d.from === a.from);
     if (!target || !dep?.when) {
-      appendEvent(journalPath, {
+      appendControlEvent({
         type: 'edgeResolved',
         from: a.from,
         to: a.to,
@@ -3679,7 +3899,7 @@ export async function runWorkflow(
         // progressing deterministically and surface the anomaly in detail.
       }
     }
-    appendEvent(journalPath, {
+    appendControlEvent({
       type: 'edgeResolved',
       from: a.from,
       to: a.to,
@@ -3700,7 +3920,7 @@ export async function runWorkflow(
     // settles freely — the cancel suppression in materialize keys by instance.
     const instanceId = snap.nodes.get(a.nodeId)?.effectiveInstanceId;
     const attemptId = latestAttemptIdFor(events, instanceId ?? a.nodeId);
-    appendEvent(journalPath, {
+    const appended = appendControlEvent({
       type: 'nodeCancelled',
       nodeId: a.nodeId,
       ...(instanceId ? { instanceId } : {}),
@@ -3709,6 +3929,8 @@ export async function runWorkflow(
       byNodeId: a.byNodeId,
       detail: a.detail,
     });
+    // A revision landed since the decision: re-decide on the new flow.
+    if (!appended) return true;
 
     const controller = nodeControllers.get(instanceId ?? a.nodeId);
     if (controller && !controller.signal.aborted) {
