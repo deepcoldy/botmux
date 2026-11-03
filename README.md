@@ -89,7 +89,7 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 通过 `bots.json` 里的 `cliId` 一键切换。内置 **20+ 适配器**，覆盖本地 CLI（独立进程隔离，`tmux attach` 可直接接入调试）以及 API / 云 Agent：
 
-`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) · `doubao` ([Doubao CLI 安装与使用](docs/doubao.md)) …
 
 - **会话级 CLI 切换**：会话尚未启动前，可通过 `/cli <cliId>` 为当前会话临时指定已注册的 CLI。
 - **Codex 多账号与实例池**：同一 Bot 支持通过 [会话级 Codex 实例](docs/codex-instances.md) 配置多登录目录与分配策略。
@@ -97,6 +97,22 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 - **共享记忆（可选）**：通过 [OpenViking 共享记忆示例](examples/openviking-memory/README.md) 让多个本地 Agent 共享用户与项目级长期记忆。
 
 完整 `cliId` 列表与网关 / wrapper 详细配置见 [多 CLI 适配器文档](https://deepcoldy.github.io/botmux/adapters)。
+
+### Doubao CLI 快速接入
+
+需要包含 `doubao` 适配器的 Botmux 版本。先安装 Doubao CLI 并在运行 Botmux 的同一系统用户下完成原生登录，再配置 Bot：
+
+```bash
+npm install -g '@bytedance/doubao-cli' --registry=https://registry.npmjs.org
+doubao --version
+doubao                      # 完成登录并确认输入框可用，再 /exit
+botmux setup                # CLI 选 Doubao，选择实际项目目录
+botmux start
+```
+
+已有 Bot 可在 Dashboard 选择 Doubao，或在原 `bots.json` 条目中设置 `"cliId": "doubao"` 和实际 `workingDir`，保留应用凭证与其他配置；保存后重启并新建会话。`model` 可省略，指定时使用原生 `/model` 的当前账号显示名。
+
+多行任务一次提交，Web 终端按 **Esc** 打断；最终回答自动从原生日志回收，重启按原生数字 ID 精确续聊，不猜“最近会话”。默认传 `--permission-mode always_allow`，应限制为可信用户/项目；**Botmux 二进制不依赖 Node，但 Doubao 的 npm 安装与 launcher 需要 Node/npm**。内网安装、本机 HTTP 试用、权限说明和当前限制见 [Doubao 使用指南](docs/doubao.md)。Linux 原生运行/文件沙箱与既有终端 `/adopt` 专用桥接未完成实机验收，勿将普通对话支持等同于全部能力支持。
 
 ## 设计理念：直接桥接 CLI，不做 SDK wrapper
 

@@ -1101,6 +1101,16 @@ export interface StructuredBridgeDrainContext {
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
+  /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
+   *  terminal yet, measured by the worker immediately before the drain.
+   *  Drivers whose user and final records live in SEPARATE files (doubao:
+   *  assignment.md appends at submit, trajectory.jsonl at completion) use this
+   *  to decide how many finals in the window close previously-started turns
+   *  versus pairing with prompts inside the window. A driver must NOT derive
+   *  this balance from its own file increments: a turn can be retired without
+   *  any transcript record (Esc interrupt), which a file-derived counter can
+   *  never observe and would then over-count forever. */
+  openTurns?: number;
 }
 
 /**
@@ -1161,7 +1171,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode' | 'doubao';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。
