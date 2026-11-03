@@ -70,6 +70,7 @@ import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
 import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
@@ -253,8 +254,18 @@ function normalizeTraexThreadDetails(row: TraexThreadRow | undefined): TraexThre
   const botmuxOrigin = firstUserMessage !== undefined && isBotmuxShapedText(firstUserMessage);
   // Display safety, not origin: a title that is itself an envelope / the goal
   // objective (≤0.207 defaulted the title to the first prompt) is never shown.
-  const title = [nonEmptyString(row?.name), nonEmptyString(row?.title)]
+  // An envelope-less bare (transcript + solo) follow-up also defaults to the
+  // first prompt on ≤0.207 DBs; structural origin detection can't see that
+  // shape, so strip botmux's appended internal <botmux_formatting> block from
+  // the display title here (#2716). This one normalizer feeds both the picker
+  // resume row (RolloutSessionMetadata.title) and readTraexThreadTitle.
+  const rawTitle = [nonEmptyString(row?.name), nonEmptyString(row?.title)]
     .find(text => text !== undefined && !isBotmuxShapedText(text));
+  // Consumers (readTraexThreadTitle, discovery truncateTitle) already collapse
+  // whitespace, so keep the strip block-only here. A title that consisted
+  // entirely of internal blocks drops to undefined (same as an empty title).
+  const strippedTitle = rawTitle === undefined ? undefined : stripBotmuxDisplayBlocks(rawTitle);
+  const title = strippedTitle !== undefined && strippedTitle.trim() ? strippedTitle : undefined;
   return {
     id,
     ...(title ? { title } : {}),
@@ -1570,7 +1581,12 @@ export function findTraexThreadByPid(
       .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
     const selected = candidates.find(row => row.source === 'user') ?? candidates[0];
     if (!selected?.id) return undefined;
-    const title = String(selected.title || selected.firstMessage || '').replace(/\s+/g, ' ').trim();
+    // Both columns can mirror the first prompt on ≤0.207/0.210 DBs; an
+    // envelope-less bare (transcript + solo) follow-up there carries the
+    // appended <botmux_formatting> block — strip before it reaches the orca
+    // live /adopt card title (#2716).
+    const rawTitleSource = String(selected.title || selected.firstMessage || '');
+    const title = stripBotmuxDisplayBlocks(rawTitleSource).replace(/\s+/g, ' ').trim();
     const titleChars = Array.from(title);
     return {
       cliSessionId: selected.id,

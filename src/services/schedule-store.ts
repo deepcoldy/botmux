@@ -1,3 +1,4 @@
+import { withManagedDirectories } from './managed-directory-retention.js';
 import {
   closeSync,
   constants,
@@ -535,7 +536,7 @@ function persistDiskSnapshot(fp: string, map: ReadonlyMap<string, ScheduledTask>
     closeSync(fd);
     fd = undefined;
     beforeRenameTestHook?.();
-    renameSync(tmpFp, fp);
+    withManagedDirectories([...map.values()], () => renameSync(tmpFp, fp));
     renamed = true;
     fsyncDirectorySyncPortable(parent);
   } finally {

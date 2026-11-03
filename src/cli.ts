@@ -9917,8 +9917,12 @@ async function relaySend(
     const base = `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`;
     try { writeFileSync(join(relayDir, base), readFileSync(p)); out.push(base); } catch { /* skip unreadable */ }
   };
+  const images: string[] = [];
+  for (const p of argValues(rest, '--image', '--images')) {
+    copyOutboxAttachment(p, images);
+  }
   const attachments: string[] = [];
-  for (const p of argValues(rest, '--image', '--images', '--file', '--files')) {
+  for (const p of argValues(rest, '--file', '--files')) {
     copyOutboxAttachment(p, attachments);
   }
   const videos: string[] = [];
@@ -9960,6 +9964,7 @@ async function relaySend(
     preparedContentFile: preparedContentBase,
     cardFile: cardBase,
     completionProposalFile: completionProposalBase,
+    images,
     attachments,
     videos,
     videoCovers,
@@ -11909,7 +11914,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   for (const path of [...images, ...files, ...videos, ...videoCovers]) {
     if (!existsSync(path)) { console.error(`文件不存在: ${path}`); process.exit(1); }
   }
-  for (const path of [...videos, ...videoCovers]) {
+  // images join videos/covers in requiring a regular file: a durable final
+  // hashes the bytes AND the upload reads them again, so a FIFO/process
+  // substitution (whose writer closes after one read) hangs forever on the
+  // second open. files stay out on purpose — they are read exactly once by
+  // uploadFile, and a one-shot FIFO worked before this change.
+  for (const path of [...images, ...videos, ...videoCovers]) {
     if (!statSync(path).isFile()) { console.error(`不是普通文件: ${path}`); process.exit(1); }
   }
   // Validate the exact presentation text before any TTS, upload, contact
@@ -12016,6 +12026,15 @@ async function cmdSend(rest: string[]): Promise<void> {
         dispatchAttempt: originDispatchAttempt,
       }
     : undefined;
+  // Relay staging paths and mtimes are attempt-local. Durable final replay must
+  // identify images by bytes so the same sandbox request can recover after a
+  // lost relay response without being rejected as a different attachment.
+  const durableImageIdentities = currentTurnId && effectiveResponseKind === 'final'
+    ? await Promise.all(images.map(async image => {
+        const inspection = await inspectFileOnlyAttachment(image, [], true);
+        return { sha256: inspection.sha256! };
+      }))
+    : images.map(sendAttachmentIdentity);
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -12075,7 +12094,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       urgent: urgent.requested ? urgent.mode : undefined,
     },
     attachments: {
-      images: images.map(sendAttachmentIdentity),
+      images: durableImageIdentities,
       files: fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
         ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
         : files.map(sendAttachmentIdentity),
@@ -19749,6 +19768,11 @@ if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
 }
 
 switch (command) {
+  case 'managed-directories': {
+    const { managedDirectoriesCommand } = await import('./cli/managed-directories.js');
+    await managedDirectoriesCommand(process.argv.slice(3));
+    break;
+  }
   case '--version':
   case '-v':      console.log(getVersion()); break;
   case '__pty-smoke': {

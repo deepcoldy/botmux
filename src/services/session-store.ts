@@ -1,3 +1,4 @@
+import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
 import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
@@ -504,7 +505,7 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   ensurePrincipalLaneWorktreeCommonDirColumns(db);
   ensureMessageProvenanceTrustFenceIdentityColumns(db);
   db.exec(OCCUPANCY_SCHEMA_SQL);
-  return db;
+  return guardSessionDirectoryWrites(db);
 }
 
 /** `0d6ab50d1` could create this sidecar before the common-dir proof columns
@@ -1207,8 +1208,15 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* no leftover from a crashed import */ }
   }
   const entries = readJsonEntriesForImport(jsonFp);
-  const tmp = openDatabaseSyncOrThrow(tmpFp);
+  // The rename below is the first moment every historical row becomes visible
+  // in a SQLite store (the staging db is a private tmp path no scanner reads).
+  // Register all rows' managed references for the staging-and-rename sequence,
+  // so a collection begun during the JSON→SQLite upgrade cannot retire a
+  // version a restored session is about to name.
+  const releaseImport = reserveManagedDirectories(entries.map(([, value]) => value));
+  let tmp: SqliteDatabaseLike | undefined;
   try {
+    tmp = openDatabaseSyncOrThrow(tmpFp);
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     // The staging database is deliberately NOT in WAL mode. `renameSync` below
     // publishes ONE file, so every imported row has to live inside it by the
@@ -1246,11 +1254,13 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     renameSync(tmpFp, dbFp);
     return entries.length;
   } catch (err) {
-    try { tmp.close(); } catch { /* already closed */ }
+    try { tmp?.close(); } catch { /* already closed or open failed */ }
     for (const suffix of ['', '-journal', '-wal', '-shm']) {
       try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* best-effort orphan cleanup */ }
     }
     throw err;
+  } finally {
+    releaseImport();
   }
 }
 

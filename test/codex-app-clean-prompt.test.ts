@@ -17,6 +17,7 @@ import {
   mergeQueuedCodexAppTurn,
 } from '../src/core/session-create.js';
 import { registerBot } from '../src/bot-registry.js';
+import { t } from '../src/i18n/index.js';
 
 describe('Codex App clean prompt sidecar', () => {
   it('keeps the legacy envelope while exposing only raw user text in the sidecar', () => {
@@ -181,6 +182,13 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.content).toContain('<botmux_reminder>');
     expect(built.codexAppInput?.text).toBe('继续看一下');
     expect(JSON.stringify(built.codexAppInput?.additionalContext)).not.toContain('botmux_reminder');
+    expect(built.codexAppInput?.additionalContext?.botmux_formatting).toEqual({
+      kind: 'application',
+      value: expect.stringContaining('<botmux_formatting>'),
+    });
+    expect(built.codexAppInput?.additionalContext?.botmux_formatting.value).toContain(
+      t('ai.followup.feishu_safe_emphasis', undefined, 'zh'),
+    );
     expect(built.codexAppInput?.additionalContext?.botmux_attachments.value).toContain('/tmp/readme.md');
   });
 

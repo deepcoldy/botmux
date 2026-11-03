@@ -1132,7 +1132,16 @@ function planReassign(events: readonly StoredEvent[], nodeId: string, expectedAt
  */
 export async function reassignNode(
   runDir: string,
-  input: { nodeId: string; toLarkAppId: string; by: string; expectedAttemptId?: string },
+  input: {
+    nodeId: string;
+    toLarkAppId: string;
+    by: string;
+    expectedAttemptId?: string;
+    /** Only move a blocked node (a blocked-card click must never retarget a
+     *  running or pending one). The locked re-plan below must then find the
+     *  same blocked state, so this holds under the journal lock too. */
+    requireBlocked?: boolean;
+  },
   ctx: V3ReassignContext = {},
 ): Promise<V3ReassignOutcome> {
   const journalPath = journalPathOf(runDir);
@@ -1155,6 +1164,7 @@ export async function reassignNode(
   if (currentTarget === input.toLarkAppId) return { kind: 'rejected', reason: 'same-bot' };
   const plan = planReassign(before, input.nodeId, input.expectedAttemptId);
   if (plan.kind === 'rejected') return plan;
+  if (input.requireBlocked && plan.kind !== 'blocked') return { kind: 'rejected', reason: 'not-reassignable' };
   if (plan.kind === 'blocked' && plan.reviseRequired) {
     return { kind: 'rejected', reason: 'revise-workflow-required' };
   }

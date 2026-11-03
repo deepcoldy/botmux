@@ -1401,6 +1401,19 @@ Fix the test suite failure on CI
     expect(res).toContain('safe content');
   });
 
+  it('extractMessageContentForFingerprint strips the follow-up <botmux_formatting> block without an envelope', () => {
+    // #2716: bare transcript / hook fallback shapes carry no <user_message>;
+    // the new follow-up-only block must be isolated from the user payload just
+    // like <botmux_reminder>, instead of taking over the 30-char fingerprint of
+    // a short message.
+    const bare = '继续\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    expect(extractMessageContentForFingerprint(bare)).toBe('继续');
+    expect(makeSubmitFingerprint(bare, 30)).toBe('继续');
+
+    const ledByFormatting = '<botmux_formatting>短进度优先纯文本。</botmux_formatting>\n\n<user_message>\n继续看一下\n</user_message>';
+    expect(extractMessageContentForFingerprint(ledByFormatting)).toBe('继续看一下');
+  });
+
   it('stripBotmuxEnvelopeBlocks stays linear and preserves later blocks on malformed tag soup', () => {
     // An unclosed recognized open tag must NOT make the scanner give up: later,
     // independent well-formed blocks are still stripped (a naive "break on
