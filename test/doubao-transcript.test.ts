@@ -274,6 +274,38 @@ describe('doubao two-file cross-window ordering', () => {
     expect(tick().out).toEqual([['turn-new', 'NEW_ANSWER']]);
   });
 
+  it('does not strand the next turn when stop arrives before the first drain started the mark', () => {
+    // flushPending builds the mark BEFORE writeInput; the first assignment.md
+    // section is read only on the next 1s tick. A ctrlc stop landing inside
+    // that window must retire the UNSTARTED mark: when its prompt section is
+    // drained afterwards it must not start a dead open turn, or the next fast
+    // turn's answer misattributes to it and shifts every later fast turn.
+    const root = join(tmpdir(), `doubao-stop-before-start-${process.pid}`);
+    const { assignment, trajectory } = makeSession(root);
+    const queue = new CodexBridgeQueue(Date.now);
+    const cursor = { offset: 0, state: undefined as unknown };
+    const emitted: Array<[string, string?]> = [];
+    const tick = () => {
+      const r = tickDrain(trajectory, cursor, queue);
+      queue.ingest(r.events);
+      for (const t of queue.drainEmittable()) emitted.push([t.turnId, t.finalText]);
+    };
+
+    // Mark built (message submitted) but no drain has happened yet; the user
+    // presses the explicit Stop control within the sub-second window.
+    queue.mark('om_1', '问题一：只回复 A1');
+    expect(queue.dropPendingTurn('om_1', undefined, true)).not.toBeNull();
+    // Its prompt section is only observed NOW (next poll) — must match no mark.
+    writeFileSync(assignment, heading(new Date().toISOString(), '问题一：只回复 A1'));
+    tick();
+    // The following fast turn must pair with its own answer normally.
+    queue.mark('om_2', '问题二：只回复 A2');
+    writeFileSync(assignment, heading(new Date(Date.now() + 1_000).toISOString(), '问题二：只回复 A2'), { flag: 'a' });
+    writeFileSync(trajectory, finalRow('A2'));
+    tick();
+    expect(emitted).toEqual([['om_2', 'A2']]);
+  });
+
   it('does not deliver a late terminal answer that lands after the turn was interrupted', () => {
     // Documented stop semantics (docs/doubao §3/§6): Esc settles the turn as
     // stopped and the mark is retired; a terminal answer the model writes at

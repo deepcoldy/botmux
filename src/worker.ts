@@ -14178,6 +14178,43 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
   return false;
 }
 
+/** Retire the structured-bridge mark of a Doubao turn whose explicit STOP was
+ *  just delivered. Doubao writes NO trajectory.jsonl record for an
+ *  Esc-interrupted turn (the TUI prints `Stopped` and returns to the
+ *  composer), so without this the mark stays counted as an open turn on every
+ *  drain: the next fast turn's final then closes the dead turn and every later
+ *  fast turn shifts by one.
+ *
+ *  The mark need NOT be started yet: the mark is built in flushPending before
+ *  writeInput, and the first assignment.md section is only read on the next
+ *  1s poll, so a stop pressed within that sub-second window must still retire
+ *  it (turnId is the worker's current turn — a type-ahead successor carries a
+ *  different id and is never matched). Only a turn that ALREADY has a final is
+ *  left untouched.
+ *
+ *  Shared by the explicit-stop entries — the daemon's exact-turn interrupt
+ *  and `handleTermAction` when the requested key is ctrlc (card ⏹ / the ^C
+ *  quick key / `/stop`). A bare terminal `esc` (card Esc quick key, a physical
+ *  Esc in the Web terminal) is NOT an explicit stop: in the TUI it often just
+ *  dismisses a menu (e.g. /model), and retiring there would swallow the still
+ *  running turn's answer. */
+function retireDoubaoBridgeTurnOnInterrupt(turnId: string | undefined, dispatchAttempt?: number): boolean {
+  if (!structuredBridgeIs('doubao') || !turnId) return false;
+  const target = codexBridgeQueue.peek().find(turn =>
+    turn.turnId === turnId
+    && (dispatchAttempt === undefined || turn.dispatchAttempt === dispatchAttempt)
+    && turn.finalText === undefined);
+  if (!target) return false;
+  const dropped = codexBridgeQueue.dropPendingTurn(turnId, target.dispatchAttempt, true);
+  if (!dropped) return false;
+  log(`Doubao interrupted turn retired from structured bridge: ${turnId.slice(0, 12)}`);
+  // replayBuffered inside the drop can release a successor user/final pair
+  // already buffered behind the retired mark; ingest it immediately.
+  codexBridgeIngest();
+  if (isPromptReady) emitReadyCodexTurns();
+  return true;
+}
+
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
   // 中断类键按适配器归一。卡片「⏹ 停止」与 `/stop` 都硬编码发 ctrlc，但 ZCode
@@ -14284,13 +14321,12 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
     traexQuotaPending = undefined;
     emitReadyCodexTurns([failedTurn]);
   }
-  // A delivered Esc/Ctrl-C ends the CURRENT turn at the terminal. For doubao
-  // that interrupt leaves no transcript record, so retire its bridge mark here
-  // — the same retirement handleExactTurnInterrupt runs for an exact-turn
-  // stop. Card ⏹, /stop and a manually pressed Esc in the Web terminal all
-  // enter through this function, so doing it only in the exact-turn path
-  // would leave the identical next-turn misattribution live on these entries.
-  if (criticalInterrupt) {
+  // A delivered ctrlc is an explicit STOP (card ⏹ / ^C quick key / `/stop`):
+  // retire doubao's record-less interrupted mark, the same retirement
+  // handleExactTurnInterrupt runs for an exact-turn stop. A bare terminal
+  // `esc` is not treated as stop — it commonly just dismisses a TUI menu (e.g.
+  // /model), and retiring there would swallow the still-running turn.
+  if (criticalInterrupt && requestedKey === 'ctrlc') {
     retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
   }
   // ESC/Ctrl-C/Enter likely ends an active TUI prompt. Un-wedge the blocking
@@ -14306,39 +14342,8 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
 }
 
 /** Deliver Ctrl+C only when the daemon's requested turn is still the worker's
- * active turn. This is deliberately separate from card `term_action`: a stale
- * HTTP request must never interrupt a newer turn that reused this CLI process. */
-/** Retire the structured-bridge mark of a Doubao turn whose interrupt key was
- *  just delivered. Doubao writes NO trajectory.jsonl record for an
- *  Esc-interrupted turn (the TUI prints `Stopped` and returns to the
- *  composer), so without this the mark stays started-without-final forever and
- *  is counted as an open turn on every drain: the next fast turn's final then
- *  closes the dead turn and every later fast turn shifts by one.
- *
- *  Shared by BOTH user-visible interrupt entries — the daemon's exact-turn
- *  interrupt (card stop on an exact turn) and `handleTermAction` (card ⏹ /
- *  `/stop` / a manually pressed Esc in the Web terminal); wiring only one of
- *  them leaves the identical misattribution live on the other path. Only a
- *  STARTED, final-less mark for the named current turn is retired: an Esc at
- *  the idle composer must not kill a turn whose prompt has not landed yet. */
-function retireDoubaoBridgeTurnOnInterrupt(turnId: string | undefined, dispatchAttempt?: number): boolean {
-  if (!structuredBridgeIs('doubao') || !turnId) return false;
-  const target = codexBridgeQueue.peek().find(turn =>
-    turn.turnId === turnId
-    && (dispatchAttempt === undefined || turn.dispatchAttempt === dispatchAttempt)
-    && turn.started
-    && turn.finalText === undefined);
-  if (!target) return false;
-  const dropped = codexBridgeQueue.dropPendingTurn(turnId, target.dispatchAttempt, true);
-  if (!dropped) return false;
-  log(`Doubao interrupted turn retired from structured bridge: ${turnId.slice(0, 12)}`);
-  // replayBuffered inside the drop can release a successor user/final pair
-  // already buffered behind the retired mark; ingest it immediately.
-  codexBridgeIngest();
-  if (isPromptReady) emitReadyCodexTurns();
-  return true;
-}
-
+ *  active turn. This is deliberately separate from card `term_action`: a stale
+ *  HTTP request must never interrupt a newer turn that reused this CLI process. */
 async function handleExactTurnInterrupt(requestId: string, turnId: string): Promise<void> {
   if (turnId !== currentBotmuxTurnId) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
