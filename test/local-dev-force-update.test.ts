@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -16,13 +16,121 @@ beforeEach(() => {
   git(upstream, 'init');
   writeFileSync(join(upstream, 'package.json'), '{"name":"botmux"}');
   writeFileSync(join(upstream, 'feature.txt'), 'official');
-  writeFileSync(join(upstream, '.gitignore'), 'ignored/\n');
+  writeFileSync(join(upstream, '.gitignore'), 'node_modules\nignored/\n');
   git(upstream, 'add', '.'); git(upstream, 'commit', '-m', 'official');
   git(root, 'clone', upstream, local);
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe('confirmed local overwrite', () => {
+  it.skipIf(process.platform === 'win32')('rejects linked dependencies already present at preview (t1)', async () => {
+    symlinkSync(upstream, join(local, 'node_modules'), 'dir');
+    const before = git(local, 'rev-parse', 'HEAD');
+    await expect(new LocalDevForceUpdates().preview(local)).rejects.toMatchObject({ code: 'local_update_shared_deps' });
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(before);
+    expect(git(local, 'for-each-ref', 'refs/botmux/update-backups')).toBe('');
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects dependencies linked after preview before creating backups (t2)', async () => {
+    writeFileSync(join(upstream, 'feature.txt'), 'updated');
+    git(upstream, 'add', '.'); git(upstream, 'commit', '-m', 'advance');
+    const controller = new LocalDevForceUpdates();
+    const preview = await controller.preview(local);
+    const before = git(local, 'rev-parse', 'HEAD');
+    symlinkSync(upstream, join(local, 'node_modules'), 'dir');
+    await expect(controller.apply(local, preview.token)).rejects.toMatchObject({ code: 'local_update_shared_deps' });
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(before);
+    expect(git(local, 'for-each-ref', 'refs/botmux/update-backups')).toBe('');
+  });
+
+  it.skipIf(process.platform === 'win32').each(['dangling', 'self'] as const)('rejects %s dependency links through the full update flow (t3)', async kind => {
+    symlinkSync(kind === 'self' ? 'node_modules' : join(root, 'missing'), join(local, 'node_modules'), 'dir');
+    const controller = new LocalDevForceUpdates();
+    const before = git(local, 'rev-parse', 'HEAD');
+    const update = async () => {
+      const preview = await controller.preview(local);
+      await controller.apply(local, preview.token);
+    };
+    await expect(update()).rejects.toMatchObject({ code: 'local_update_shared_deps' });
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(before);
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects dependencies linked during stash before reset and retains backups (t4)', async () => {
+    writeFileSync(join(local, 'feature.txt'), 'draft');
+    writeFileSync(join(upstream, 'feature.txt'), 'updated');
+    git(upstream, 'add', '.'); git(upstream, 'commit', '-m', 'advance');
+    const controller = new LocalDevForceUpdates();
+    const preview = await controller.preview(local);
+    const before = git(local, 'rev-parse', 'HEAD');
+    expect(preview.status).not.toBe('');
+    const bin = join(root, 'bin'); mkdirSync(bin);
+    const originalPath = process.env.PATH;
+    const resetLog = join(root, 'reset-called');
+    writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const {symlinkSync,writeFileSync}=require('node:fs');
+const args=process.argv.slice(2);
+if(args.includes('reset')) writeFileSync(${JSON.stringify(resetLog)}, 'reset');
+const child=spawnSync('git',args,{env:{...process.env,PATH:${JSON.stringify(originalPath)}},stdio:'inherit'});
+if(child.status===0 && args.includes('stash') && args.includes('push')) {
+  symlinkSync(${JSON.stringify(upstream)}, 'node_modules', 'dir');
+}
+process.exit(child.status ?? 1);
+`);
+    chmodSync(join(bin, 'git'), 0o755);
+    let error: (Error & { code: string; backupRef: string }) | undefined;
+    try {
+      process.env.PATH = bin + delimiter + originalPath;
+      await controller.apply(local, preview.token).catch(e => { error = e; });
+    } finally { process.env.PATH = originalPath; }
+    expect(error).toMatchObject({ code: 'local_update_shared_deps', backupRef: expect.any(String) });
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(before);
+    expect(() => readFileSync(resetLog)).toThrow();
+    expect(git(local, 'rev-parse', `${error!.backupRef}/head`)).toBe(before);
+    expect(git(local, 'show', `${error!.backupRef}/worktree:feature.txt`)).toBe('draft');
+  });
+
+  it.skipIf(process.platform === 'win32').each(['tracked', 'unignored', 'dist'] as const)('backs up %s symbolic links through the normal Git flow', async kind => {
+    const name = kind === 'dist' ? 'dist' : 'node_modules';
+    if (kind === 'unignored') writeFileSync(join(local, '.gitignore'), 'ignored/\n');
+    if (kind === 'dist') writeFileSync(join(local, '.gitignore'), 'node_modules\ndist/\nignored/\n');
+    symlinkSync(upstream, join(local, name), 'dir');
+    if (kind === 'tracked') { git(local, 'add', '-f', name); git(local, 'commit', '-m', 'track link'); }
+    const controller = new LocalDevForceUpdates();
+    const preview = await controller.preview(local);
+    const { backupRef } = await controller.apply(local, preview.token);
+    const entry = kind === 'tracked' ? `${backupRef}/head:${name}` : `${backupRef}/worktree^3:${name}`;
+    expect(git(local, 'show', entry)).toBe(upstream);
+    expect(readFileSync(join(upstream, 'feature.txt'), 'utf8')).toBe('official');
+  });
+
+  it('consumes a token even when the clean checkout already matches upstream', async () => {
+    const controller = new LocalDevForceUpdates();
+    const preview = await controller.preview(local);
+    expect(preview.status).toBe('');
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(preview.targetHead);
+    const { backupRef } = await controller.apply(local, preview.token);
+    const refs = git(local, 'for-each-ref', '--format=%(refname)', 'refs/botmux/update-backups');
+    expect(refs).toBe(`${backupRef}/head`);
+    await expect(controller.apply(local, preview.token)).rejects.toMatchObject({ code: 'local_update_preview_stale' });
+    expect(git(local, 'for-each-ref', '--format=%(refname)', 'refs/botmux/update-backups')).toBe(refs);
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(preview.targetHead);
+  });
+
+  it.each(['preview', 'apply'] as const)('reports a stable error for an untracked nested repository during %s', async phase => {
+    const controller = new LocalDevForceUpdates();
+    const preview = phase === 'apply' ? await controller.preview(local) : null;
+    const nested = join(local, 'nested'); mkdirSync(nested);
+    git(nested, 'init'); writeFileSync(join(nested, 'file'), 'nested');
+    git(nested, 'add', '.'); git(nested, 'commit', '-m', 'nested');
+    const before = git(local, 'rev-parse', 'HEAD');
+    await expect(preview ? controller.apply(local, preview.token) : controller.preview(local))
+      .rejects.toMatchObject({ code: 'local_update_untracked_directory' });
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(before);
+    expect(readFileSync(join(nested, 'file'), 'utf8')).toBe('nested');
+    expect(git(local, 'for-each-ref', 'refs/botmux/update-backups')).toBe('');
+  });
+
   it.skipIf(process.platform === 'win32').each(['tracked', 'ignored'] as const)('preserves a %s edit made during backup creation instead of discarding it from a clean plan', async kind => {
     if (kind === 'ignored') {
       mkdirSync(join(upstream, 'ignored'));

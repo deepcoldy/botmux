@@ -283,7 +283,7 @@ export async function updateAndRestartBotmux(
 
 export function localForceUpdateError(body: { error?: string; detail?: string }, tr: (key: string, args?: Record<string, string>) => string): string {
   const codes = new Set(['local_update_preview_stale', 'local_update_operation_in_progress', 'local_update_no_upstream',
-    'local_update_ignored_collision', 'local_update_backup_incomplete']);
+    'local_update_ignored_collision', 'local_update_backup_incomplete', 'local_update_shared_deps', 'local_update_untracked_directory']);
   return codes.has(body.error ?? '') ? tr(`update.${body.error}`) : String(body.detail ?? body.error ?? 'update_failed');
 }
 

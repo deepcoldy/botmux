@@ -2,7 +2,7 @@ import React, { type ComponentProps } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { UpdateCard } from '../src/dashboard/web/settings-page.js';
-import { confirmLocalForceUpdate } from '../src/dashboard/web/update-action.js';
+import { confirmLocalForceUpdate, localForceUpdateError } from '../src/dashboard/web/update-action.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -11,6 +11,18 @@ const preview = { ok: true, token: 'confirmation', dir: '/source', target: 'refs
   targetHead: '0123456789abcdef', status: ' M feature.txt\n?? draft.txt', localCommits: '1234567 custom feature' };
 
 describe('force update confirmation', () => {
+  it.each(['local_update_shared_deps', 'local_update_untracked_directory'])('translates %s instead of exposing filesystem errors', async code => {
+    for (const locale of ['zh', 'en'] as const) {
+      const translate = createDashboardTranslator(locale);
+      const expected = translate(`update.${code}`);
+      expect(expected).not.toBe(`update.${code}`);
+      expect(localForceUpdateError({ error: code, detail: 'raw filesystem error' }, translate)).toBe(expected);
+      const confirmImpl = vi.fn();
+      await expect(confirmLocalForceUpdate(vi.fn().mockResolvedValue(Response.json({ error: code, detail: 'raw filesystem error' }, { status: 409 })), confirmImpl, translate)).rejects.toThrow(expected);
+      expect(confirmImpl).not.toHaveBeenCalled();
+    }
+  });
+
   it.each([false, true])('returns a single-use token only when accepted=%s, after showing files and commits', async accepted => {
     const fetchImpl = vi.fn().mockResolvedValue(Response.json(preview));
     const confirmImpl = vi.fn().mockResolvedValue(accepted);

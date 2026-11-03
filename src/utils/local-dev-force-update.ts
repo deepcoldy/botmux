@@ -27,6 +27,25 @@ async function assertNoGitOperation(dir: string): Promise<void> {
   }
 }
 
+async function assertNoLinkedDeps(dir: string): Promise<void> {
+  let stat;
+  try { stat = await lstat(join(dir, 'node_modules')); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw e;
+  }
+  if (!stat.isSymbolicLink()) return;
+  // Only ignored, untracked node_modules links are invisible to the snapshot
+  // and stash. Tracked links and non-ignored links follow normal Git backup.
+  try { await git(dir, ['check-ignore', '--quiet', '--', 'node_modules']); } catch (e) {
+    if ((e as { code?: unknown }).code === 1) return;
+    throw e;
+  }
+  // Install may rewrite another checkout's dependencies, which Git backups
+  // cannot restore. Conservatively reject even when its lockfile might match;
+  // lstat also catches dangling/self links without resolving their targets.
+  fail('local_update_shared_deps');
+}
+
 interface Snapshot {
   head: string;
   branch: string;
@@ -48,6 +67,7 @@ async function snapshot(dir: string): Promise<Snapshot> {
   for (const path of paths) {
     const file = join(dir, path);
     const stat = await lstat(file);
+    if (stat.isDirectory()) fail('local_update_untracked_directory');
     hash.update(path).update(String(stat.mode));
     hash.update(stat.isSymbolicLink() ? await readlink(file) : await readFile(file));
   }
@@ -96,6 +116,7 @@ export class LocalDevForceUpdates {
     const state = await snapshot(dir);
     // An unresolved merge/rebase is a separate operation; do not erase it.
     await assertNoGitOperation(dir);
+    await assertNoLinkedDeps(dir);
     let remote = 'origin';
     let branch = '';
     if (state.branch !== 'HEAD') {
@@ -135,6 +156,7 @@ export class LocalDevForceUpdates {
     if (plan.expiresAt < this.now()) fail('local_update_preview_stale');
     await assertIgnoredFilesPreserved(plan.dir, plan.targetHead);
     await assertNoGitOperation(plan.dir);
+    await assertNoLinkedDeps(plan.dir);
     const backupRef = `refs/botmux/update-backups/${randomUUID()}`;
     // Commit history is recoverable even with a clean worktree or detached HEAD.
     await git(plan.dir, ['update-ref', `${backupRef}/head`, plan.state.head]);
@@ -162,6 +184,7 @@ export class LocalDevForceUpdates {
       }
       await assertNoGitOperation(plan.dir);
       await assertIgnoredFilesPreserved(plan.dir, plan.targetHead);
+      await assertNoLinkedDeps(plan.dir);
       // Creating backup refs/stashing yields to other processes. Require the
       // original HEAD/config and exactly the expected clean index/worktree
       // immediately before reset, including plans that initially had no edits.
