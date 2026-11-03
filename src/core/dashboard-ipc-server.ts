@@ -3278,11 +3278,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     && ds.session.headless.source === 'cli'
     && isHeadlessId(ds.session.headless.id)
     && headlessChatId(ds.session.headless.id) === ds.chatId;
-  let botConfig: { larkToolBinding?: boolean } | undefined;
+  let botConfig: { larkToolBinding?: boolean; apiOnly?: boolean } | undefined;
   try { botConfig = targetLarkAppId ? getBot(targetLarkAppId).config : undefined; } catch { /* bot missing */ }
   if ((!ds && !detachedScheduled)
     || (ds && ds.session.status !== 'active')
-    || (targetChatId !== undefined && !validHeadlessSession && !isHeadlessSessionChatId(targetChatId)
+    || (isHeadlessSessionChatId(targetChatId) && !validHeadlessSession)
+    || botConfig?.apiOnly === true
+    || (targetChatId !== undefined && !validHeadlessSession
       && sessionTransportDisabled({ chatId: targetChatId, larkAppId: targetLarkAppId }))
     || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
