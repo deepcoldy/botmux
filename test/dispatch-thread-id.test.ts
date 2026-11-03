@@ -31,6 +31,7 @@ function harness(mode: Mode, options: {
   threadId?: unknown;
   failure?: 'permission' | 'network' | 'timeout' | 'send';
   acceptance?: 'accepted' | 'timed_out';
+  taskTreeCardEnabled?: boolean;
 } = {}) {
   const root = mode === 'into' ? 'om_existing' : 'om_seed';
   const stdout: string[] = [];
@@ -97,6 +98,10 @@ function harness(mode: Mode, options: {
     // own refusal path is covered by multi-topic-feature-gate.test.ts, so this
     // receipt/thread-id harness keeps the default-enabled behavior.
     isMultiTopicOrchestrationEnabled: () => true,
+    // Task-tree card gate inside extracted cmdDispatch. Default-enabled here so
+    // the receipt/thread-id harness exercises the normal path; a mode flips it
+    // off to assert attemptAt is not persisted when the card is disabled.
+    isDispatchTaskTreeCardEnabled: () => options.taskTreeCardEnabled !== false,
     loadSessions: () => new Map([['source', { sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
     requireSessionById: async (sid: string) => ({
       sessionId: sid, chatId: 'oc_chat', larkAppId: 'cli_source',
@@ -167,6 +172,11 @@ for (const chatMode of ['normal', 'topic'] as const) {
         expect(oldFields).toEqual(oldReceipt(mode));
         expect(h.steps).toEqual(mode === 'into' ? ['reply', 'lookup'] : ['seed', 'reply', 'lookup']);
         expect(h.postCurrentSessionDaemonRoute).toHaveBeenCalledTimes(mode === 'dispatch' ? 2 : 1);
+        // Card enabled (harness default): the dispatch attempt timestamp is
+        // persisted so the card can tell this attempt's reports from older ones.
+        expect(h.persistDispatchLifecycle.mock.calls[0]![0]).toMatchObject({
+          attemptStartedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        });
         expect(h.request).toHaveBeenCalledExactlyOnceWith({
           method: 'GET', url: '/open-apis/im/v1/messages/' + h.root,
           params: { with_sender_name: 'true' }, timeout: 2_000, signal: h.timeoutSignals[0].signal,
@@ -174,6 +184,19 @@ for (const chatMode of ['normal', 'topic'] as const) {
         expect(h.state.process.exitCode).toBe(0);
       });
     }
+  });
+}
+
+for (const mode of ['dispatch', 'standby', 'into'] as const) {
+  describe(mode + ' task-tree card gate on attemptAt', () => {
+    it('does not persist attemptStartedAt when the card switch is off (pre-card registry shape)', async () => {
+      const h = harness(mode, { taskTreeCardEnabled: false });
+      await h.run();
+      expect(h.persistDispatchLifecycle).toHaveBeenCalledTimes(1);
+      for (const call of h.persistDispatchLifecycle.mock.calls) {
+        expect((call[0] as Record<string, unknown>).attemptStartedAt).toBeUndefined();
+      }
+    });
   });
 }
 

@@ -360,6 +360,25 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ multiTopic: { enabled: false, futureFlag: 1 } });
   });
 
+  it('writes the nested taskTreeCard switch while preserving enabled and other siblings', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ multiTopic: { enabled: true, taskTreeCard: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith(
+      { multiTopic: { enabled: true, futureFlag: 1, taskTreeCard: true } },
+    );
+  });
+
+  it('rejects a non-boolean nested taskTreeCard', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true } })),
+    });
+    expect(await applySettingsWrite({ multiTopic: { enabled: true, taskTreeCard: 'yes' } }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic_taskTreeCard' });
+  });
+
   it('rejects invalid multiTopic patches', async () => {
     const deps = makeDeps();
     expect(await applySettingsWrite({ multiTopic: 'off' }, deps))

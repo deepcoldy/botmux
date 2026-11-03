@@ -156,6 +156,12 @@ export interface MultiTopicGlobalConfig {
    *  backwards compatibility. When disabled, botmux-orchestrate is hidden and
    *  `botmux dispatch` may only append to an existing topic via `--into`. */
   enabled?: boolean;
+  /** Dispatch task-tree card. Default OFF (missing !== true): the first
+   *  dispatch posts no card, no dispatch-task-tree-cards.json is written, and
+   *  reports record nothing — exactly the pre-card behaviour. Opt in from
+   *  Dashboard 全局设置 → 多话题编排 → 任务树卡片. Read live, so turning it
+   *  off stops new card posts/updates immediately (a kill switch). */
+  taskTreeCard?: boolean;
 }
 
 export interface WorkerConfig {
@@ -876,6 +882,7 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
   const v = raw as Record<string, unknown>;
   const out: MultiTopicGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (typeof v.taskTreeCard === 'boolean') out.taskTreeCard = v.taskTreeCard;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1154,6 +1161,22 @@ export function isMultiTopicOrchestrationEnabled(env: NodeJS.ProcessEnv = proces
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().multiTopic?.enabled !== false;
+}
+
+/** Machine-wide dispatch task-tree card switch. Defaults OFF: a fresh install
+ *  sends no task-tree card (3.2(c) — a feature that adds a message must be
+ *  opted in). `BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED` wins when set, otherwise
+ *  the Dashboard toggle `multiTopic.taskTreeCard`. Read live from the short-TTL
+ *  (~2s) global-config cache, so flipping it applies to the next dispatch /
+ *  report shortly afterwards without a restart (each daemon process expires its
+ *  own cache; the Dashboard write only invalidates its own process). */
+export function isDispatchTaskTreeCardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().multiTopic?.taskTreeCard === true;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

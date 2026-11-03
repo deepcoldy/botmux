@@ -10,6 +10,7 @@ import {
   isGlobalVcMeetingAgentEnabled,
   invalidateGlobalConfigCache,
   isMultiTopicOrchestrationEnabled,
+  isDispatchTaskTreeCardEnabled,
   isWorkflowFeatureEnabled,
   mergeDashboardConfig,
   mergeGlobalConfig,
@@ -732,5 +733,51 @@ describe('global sessionCleanup config', () => {
       sessionCleanup: { enabled: 'yes', olderThanHours: 24 },
     }));
     expect(readGlobalConfig().sessionCleanup).toEqual({ olderThanHours: 24 });
+  });
+});
+
+describe('dispatch task-tree card switch (multiTopic.taskTreeCard)', () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-global-config-tree-'));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+    vi.stubEnv('BOTS_CONFIG', join(home, 'bots.json'));
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', '');
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+    invalidateGlobalConfigCache();
+  });
+  afterEach(() => invalidateGlobalConfigCache());
+
+  const writeConfig = (obj: unknown) => { writeFileSync(globalConfigPath(), JSON.stringify(obj)); invalidateGlobalConfigCache(); };
+
+  it('defaults OFF with no config and when the field is absent', () => {
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+    writeConfig({ multiTopic: { enabled: true } });
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+  });
+
+  it('is ON only when multiTopic.taskTreeCard === true', () => {
+    writeConfig({ multiTopic: { enabled: true, taskTreeCard: true } });
+    expect(isDispatchTaskTreeCardEnabled()).toBe(true);
+    writeConfig({ multiTopic: { enabled: true, taskTreeCard: false } });
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+  });
+
+  it('lets the env override win over the saved config', () => {
+    writeConfig({ multiTopic: { enabled: true, taskTreeCard: false } });
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', 'true');
+    expect(isDispatchTaskTreeCardEnabled()).toBe(true);
+    writeConfig({ multiTopic: { enabled: true, taskTreeCard: true } });
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', 'false');
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+  });
+
+  it('normalizes the nested field and keeps it when the parent enabled toggle flips', () => {
+    mergeGlobalConfig({ multiTopic: { enabled: true, taskTreeCard: true } });
+    expect(readGlobalConfig().multiTopic).toEqual({ enabled: true, taskTreeCard: true });
+    mergeGlobalConfig({ multiTopic: { enabled: false, taskTreeCard: true } });
+    expect(readGlobalConfig().multiTopic).toEqual({ enabled: false, taskTreeCard: true });
   });
 });

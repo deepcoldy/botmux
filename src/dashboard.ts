@@ -1259,8 +1259,9 @@ interface ResolvedDashboardSettings {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON; the nested
+   *  dispatch task-tree card switch is default OFF. */
+  multiTopic: { enabled: boolean; taskTreeCard: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1901,7 +1902,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
     promptCache: global.promptCache ?? null,
-    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
+    multiTopic: {
+      enabled: global.multiTopic?.enabled !== false, // default ON
+      taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
+    },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     httpProxy: global.httpProxy ?? null,

@@ -211,7 +211,7 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig } from '../global-config.js';
+import { readGlobalConfig, isDispatchTaskTreeCardEnabled } from '../global-config.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -3863,6 +3863,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
 
 // ─── 编排任务树卡片 ──────────────────────────────────────────────────────────
 
+/** Shown (via the CLI) when the default-off task-tree card is invoked while
+ *  disabled. Produced by the daemon because sandboxed/read-isolated CLIs cannot
+ *  read the host global config themselves. */
+const DISPATCH_TASK_TREE_DISABLED_HINT = '任务树卡片默认关闭：在 Dashboard「全局设置 → 多话题编排 → 任务树卡片」开启，或设 BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=true。';
+
 const dispatchTaskTreeCards = createDispatchTaskTreeCards({
   dataDir: () => config.session.dataDir,
   listSessions: roots => listDispatchTreeSessionRows(roots, config.session.dataDir),
@@ -3904,6 +3909,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/dispatch-tree', async (req, res, para
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
   if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  // Default-off feature gate (3.2(c)): when off, behave exactly as the
+  // pre-card build — no entry label write, no card record file, no post/patch.
+  if (!isDispatchTaskTreeCardEnabled()) {
+    return jsonRes(res, 200, { ok: true, enabled: false, hint: DISPATCH_TASK_TREE_DISABLED_HINT, text: '', messageId: null, posted: false, nodes: 0 });
+  }
   const requirement = taskTreeRequirement(body);
   try {
     const dispatchRoot = typeof body?.dispatchRoot === 'string' ? body.dispatchRoot : '';
@@ -3915,7 +3925,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/dispatch-tree', async (req, res, para
       });
     }
     const result = await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds), requirement ? { requirement } : {});
-    return jsonRes(res, 200, { ok: true, text: result.text, messageId: result.messageId ?? null, posted: result.posted, nodes: result.tree.nodes.length });
+    return jsonRes(res, 200, { ok: true, enabled: true, text: result.text, messageId: result.messageId ?? null, posted: result.posted, nodes: result.tree.nodes.length });
   } catch (error) {
     return jsonRes(res, 502, { ok: false, error: ipcErrorText(error) });
   }
@@ -3930,9 +3940,13 @@ ipcRoute('POST', '/api/dispatch-tree/refresh', async (req, res) => {
   const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
   if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  // Default-off: no card refresh (and no card record write) when disabled.
+  if (!isDispatchTaskTreeCardEnabled()) {
+    return jsonRes(res, 200, { ok: true, enabled: false, hint: DISPATCH_TASK_TREE_DISABLED_HINT, messageId: null, posted: false });
+  }
   try {
     const result = await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds));
-    return jsonRes(res, 200, { ok: true, messageId: result.messageId ?? null, posted: result.posted });
+    return jsonRes(res, 200, { ok: true, enabled: true, messageId: result.messageId ?? null, posted: result.posted });
   } catch (error) {
     return jsonRes(res, 502, { ok: false, error: ipcErrorText(error) });
   }
