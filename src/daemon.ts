@@ -828,6 +828,8 @@ import { isValidRunId as isValidV3RunId } from './workflows/v3/ops-projection.js
 import {
   authorizeV3SessionRunEditRequest,
   authorizeV3SessionRunMutationRequest,
+  v3RelayScheduleBotHasAllowlist,
+  v3ScheduleTurnRelayAuth,
   V3_SESSION_RUN_MUTATIONS,
   V3_SESSION_RUN_MUTATION_ROUTE_PREFIX,
 } from './workflows/v3/session-relay.js';
@@ -7585,6 +7587,8 @@ const cardDeps: CardHandlerDeps = {
   },
   v3RevisionDeps: {
     baseDir: v3DefaultBaseDir(),
+    canResolve: (binding, operatorOpenId) =>
+      binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
     driveRun: (runId) => {
       if (v3RunNeedsDriveAfterRevision(v3DefaultBaseDir(), runId)) v3GateRunner.driveDetached(runId);
     },
@@ -8157,6 +8161,7 @@ for (const relayVerb of ['edit', 'status'] as const) {
       session: ds ? v3RelaySessionView(ds) : undefined,
       selfLarkAppId: selfV3LarkAppId,
       baseDir: v3DefaultBaseDir(),
+      ...v3RelayScheduleAuth(ds),
     });
     if (!decision.ok) {
       return jsonRes(res, decision.status, { ok: false, error: decision.error, ...(decision.detail ? { detail: decision.detail } : {}) });
@@ -9866,6 +9871,25 @@ function v3RelaySessionView(ds: DaemonSession): import('./workflows/v3/session-r
   };
 }
 
+/** Scheduled-turn authentication primitives for EVERY workflow session relay
+ *  route (start/cancel/retry/grant and status/edit). Both verb families must
+ *  construct them here — a sandboxed main session cannot authenticate a
+ *  `schedule:` turn without them, and an ad-hoc copy per route already let
+ *  status/edit ship without them (the initiator's scheduled turns 403'd). */
+function v3RelayScheduleAuth(ds: DaemonSession | undefined) {
+  return v3ScheduleTurnRelayAuth({
+    loadTask: (appId, taskId) => readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
+    // Mirror canOperate: a bot with no allowlist configured is open; a
+    // locked-down bot admits only dashboard admins.
+    isOwnerAllowed: (larkAppId, ownerOpenId) => {
+      const bot = getBot(larkAppId);
+      if (!v3RelayScheduleBotHasAllowlist(bot.config)) return true;
+      return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
+    },
+    isTurnLive: turnId => ds?.scheduledTurnCallers?.has(turnId) === true,
+  });
+}
+
 for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
   ipcRoute(
     'POST',
@@ -9891,24 +9915,7 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
         session: ds ? v3RelaySessionView(ds) : undefined,
         selfLarkAppId: selfV3LarkAppId,
         baseDir: v3DefaultBaseDir(),
-        loadScheduledTask: (appId, taskId) =>
-          readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
-        // Live owner gate for scheduled turns: the task creator must still be
-        // in the bot's resolvedAllowedUsers, so removing a creator revokes
-        // their scheduled tasks' workflow authority immediately.
-        // 镜像 canOperate 语义：未配白名单的开放 bot 恒放行（否则开放 bot 的
-        // 定时 workflow 会被一律拒绝且报误导性「不在授权名单」错误）。
-        isScheduleOwnerAllowed: (larkAppId, ownerOpenId) => {
-          const bot = getBot(larkAppId);
-          const hasAllowlist = (bot.config.allowedUsers?.length ?? 0) > 0
-            || (bot.config.allowedChatGroups?.length ?? 0) > 0
-            || (bot.config.globalGrants?.length ?? 0) > 0
-            || !!bot.config.ownerOpenId
-            || bot.config.p2pOpen === true;
-          if (!hasAllowlist) return true;
-          return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
-        },
-        isScheduledTurnLive: turnId => ds?.scheduledTurnCallers?.has(turnId) === true,
+        ...v3RelayScheduleAuth(ds),
       });
       if (!decision.ok) {
         return jsonRes(res, decision.status, {

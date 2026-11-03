@@ -34,13 +34,56 @@ import {
 
 export const V3_SESSION_RUN_MUTATION_ROUTE_PREFIX = '/api/v3/session-runs';
 
-// `edit` is deliberately not relayed: a runtime flow edit authenticates the
-// run's MAIN session (not the owner tuple below) and is host-path only.
 export const V3_SESSION_RUN_MUTATIONS = ['start', 'cancel', 'retry', 'grant'] as const;
 export type V3SessionRunMutation = typeof V3_SESSION_RUN_MUTATIONS[number];
 
 export function isV3SessionRunMutation(value: string): value is V3SessionRunMutation {
   return (V3_SESSION_RUN_MUTATIONS as readonly string[]).includes(value);
+}
+
+/** The scheduled-turn primitives a relayed workflow route must supply. A
+ *  sandboxed CLI presenting a `schedule:` turn cannot be distinguished from a
+ *  forged one without all three, so EVERY relayed verb (start/cancel/retry/
+ *  grant AND status/edit) constructs its auth input through one factory —
+ *  {@link v3ScheduleTurnRelayAuth} — never ad hoc: a new verb that omitted
+ *  them would make the initiator's own scheduled turns fail closed (403) on
+ *  sandboxed main sessions. */
+export type V3RelayScheduleAuth = Pick<
+  V3SessionRelayAuthInput,
+  'loadScheduledTask' | 'isScheduleOwnerAllowed' | 'isScheduledTurnLive'
+>;
+
+/** Single construction point for the scheduled-turn primitives of every
+ *  relayed workflow route (see {@link V3RelayScheduleAuth}). */
+export function v3ScheduleTurnRelayAuth(input: {
+  loadTask: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
+  isOwnerAllowed: (larkAppId: string, ownerOpenId: string) => boolean;
+  isTurnLive: (turnId: string) => boolean;
+}): V3RelayScheduleAuth {
+  return {
+    loadScheduledTask: input.loadTask,
+    isScheduleOwnerAllowed: input.isOwnerAllowed,
+    isScheduledTurnLive: input.isTurnLive,
+  };
+}
+
+/** Live owner gate for scheduled turns on the relay, mirroring `canOperate`:
+ *  a bot configured with NO allowlist at all is open to every chat member; a
+ *  bot that has any restriction admits only its dashboard admins. Removing a
+ *  task creator from the bot therefore revokes that creator's scheduled
+ *  workflow authority on the next fire. */
+export function v3RelayScheduleBotHasAllowlist(bot: {
+  allowedUsers?: unknown[];
+  allowedChatGroups?: unknown[];
+  globalGrants?: unknown[];
+  ownerOpenId?: string;
+  p2pOpen?: boolean;
+}): boolean {
+  return (bot.allowedUsers?.length ?? 0) > 0
+    || (bot.allowedChatGroups?.length ?? 0) > 0
+    || (bot.globalGrants?.length ?? 0) > 0
+    || !!bot.ownerOpenId
+    || bot.p2pOpen === true;
 }
 
 /** Live view of the claimed session, provided by the daemon's own registry. */

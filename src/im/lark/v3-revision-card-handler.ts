@@ -10,6 +10,9 @@ import {
   type V3VoidedGate,
 } from '../../workflows/v3/run-edit.js';
 import { defaultBaseDir } from '../../workflows/v3/grill-state.js';
+import { readV3RunChatBinding } from '../../workflows/v3/daemon-run.js';
+import type { RunChatBinding } from '../../workflows/v3/grill-state.js';
+import { join } from 'node:path';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 import {
   V3_REVISION_APPROVE_ACTION,
@@ -33,6 +36,10 @@ export function isV3RevisionAction(action: unknown): boolean {
 export interface V3RevisionCardHandlerDeps {
   baseDir?: string;
   driveRun: (runId: string) => void;
+  /** Permission gate for the card's owning app/group (canOperate). The
+   *  initiator equality check below is app-scoped open_id; this binds the
+   *  click to the run's own app and group, same as every other v3 card. */
+  canResolve?: (binding: RunChatBinding | undefined, operatorOpenId: string | undefined) => boolean;
   /** Freeze the cards of gates the approved revision voided (best effort). */
   onVoidedGates?: (runId: string, gates: V3VoidedGate[]) => void;
   /** Test seam. */
@@ -59,8 +66,13 @@ async function handleRerunGrant(
     return { toast: { type: 'warning', content: '重做额度卡已失效' } };
   }
   if (!operatorOpenId) return { toast: { type: 'warning', content: '无法识别操作人' } };
+  const baseDir = deps.baseDir ?? defaultBaseDir();
+  const binding = readV3RunChatBinding(join(baseDir, value.runId));
+  if (deps.canResolve && !deps.canResolve(binding, operatorOpenId)) {
+    return { toast: { type: 'warning', content: '你没有权限操作这个流程的重做额度' } };
+  }
   const outcome = grantV3RerunBudget({
-    baseDir: deps.baseDir ?? defaultBaseDir(),
+    baseDir,
     runId: value.runId,
     nodeId: value.nodeId,
     tier: value.tier,
@@ -106,11 +118,16 @@ async function handleDecision(
     return { toast: { type: 'warning', content: '流程修改卡已失效（nonce 不匹配）' } };
   }
   if (!operatorOpenId) return { toast: { type: 'warning', content: '无法识别操作人' } };
+  const baseDir = deps.baseDir ?? defaultBaseDir();
+  const binding = readV3RunChatBinding(join(baseDir, value.runId));
+  if (deps.canResolve && !deps.canResolve(binding, operatorOpenId)) {
+    return { toast: { type: 'warning', content: '你没有权限确认这个流程的修改' } };
+  }
   const decide = deps.decide ?? decideV3RevisionProposal;
   let outcome: V3RevisionDecisionOutcome;
   try {
     outcome = decide({
-      baseDir: deps.baseDir ?? defaultBaseDir(),
+      baseDir,
       runId: value.runId,
       revision: value.revision,
       decision: value.action === V3_REVISION_APPROVE_ACTION ? 'approve' : 'reject',

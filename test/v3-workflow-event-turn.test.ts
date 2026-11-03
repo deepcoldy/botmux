@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -35,6 +35,8 @@ import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import {
   authorizeV3SessionRunEditRequest,
   authorizeV3SessionRunMutationRequest,
+  v3RelayScheduleBotHasAllowlist,
+  v3ScheduleTurnRelayAuth,
 } from '../src/workflows/v3/session-relay.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { recordV3MainWakeIssued } from '../src/workflows/v3/main-wake-ledger.js';
@@ -521,9 +523,16 @@ describe('who decided the edit: an overtaken wake turn or a scheduled turn is th
       mkdirSync(botHome, { recursive: true });
       writeFileSync(join(botHome, 'schedules.json'), JSON.stringify({ task1: task(ownerOpenId) }));
     };
-    const relaySchedule = (ownerOpenId: string) => () => relayAs(SCHEDULE_TURN, {}, {
-      loadScheduledTask: () => task(ownerOpenId), isScheduleOwnerAllowed: () => true,
+    /** The daemon wires BOTH relay verb families (start/cancel/retry/grant and
+     *  status/edit) through the one schedule-auth factory — build the options
+     *  exactly that way so the test fails if the factory stops carrying a
+     *  primitive a scheduled turn needs. */
+    const scheduleAuth = (ownerOpenId: string, isTurnLive = true) => v3ScheduleTurnRelayAuth({
+      loadTask: () => task(ownerOpenId),
+      isOwnerAllowed: () => true,
+      isTurnLive: () => isTurnLive,
     });
+    const relaySchedule = (ownerOpenId: string) => () => relayAs(SCHEDULE_TURN, {}, scheduleAuth(ownerOpenId));
 
     it('host: of the initiator\'s task — decided by the main bot, not the initiator', () => {
       writeTask(INITIATOR);
@@ -558,6 +567,76 @@ describe('who decided the edit: an overtaken wake turn or a scheduled turn is th
       rmSync(join(baseDir, RUN), { recursive: true, force: true });
       seedRiskRun();
       expect(applyEdit(BENIGN, relaySchedule(MEMBER)())).toMatchObject({ kind: 'proposed', reasons: ['callerNotInitiator'] });
+    });
+
+    it('relay: status/edit and a mutation route authenticate the initiator\'s scheduled turn with the SAME factory primitives', () => {
+      seedRiskRun();
+      // status/edit over the relay (the verbs that initially shipped without
+      // the scheduled-turn wiring).
+      const statusDecision = authorizeV3SessionRunEditRequest({
+        runId: RUN, mutation: 'status',
+        raw: { sessionId: 'sess-main', originCapability: capability },
+        trustedHost: false,
+        session: {
+          receiver: false, liveOrigin: { capability, turnId: SCHEDULE_TURN, dispatchAttempt: 1 },
+          chatId: BINDING.chatId, larkAppId: BINDING.larkAppId, rootMessageId: BINDING.rootMessageId,
+        },
+        selfLarkAppId: BINDING.larkAppId, baseDir, ...scheduleAuth(INITIATOR),
+      });
+      expect(statusDecision).toMatchObject({ ok: true });
+      // start/cancel/retry/grant through the mutation route with the same
+      // factory output.
+      const mutationDecision = authorizeV3SessionRunMutationRequest({
+        runId: RUN, mutation: 'cancel',
+        raw: { sessionId: 'sess-main', originCapability: capability },
+        trustedHost: false,
+        session: {
+          receiver: false, liveOrigin: { capability, turnId: SCHEDULE_TURN, dispatchAttempt: 1 },
+          chatId: BINDING.chatId, larkAppId: BINDING.larkAppId, rootMessageId: BINDING.rootMessageId,
+        },
+        selfLarkAppId: BINDING.larkAppId, baseDir, ...scheduleAuth(INITIATOR),
+      });
+      expect(mutationDecision).toMatchObject({ ok: true });
+    });
+
+    it('relay: without the factory primitives a scheduled turn fails closed for status/edit too', () => {
+      seedRiskRun();
+      const refused = authorizeV3SessionRunEditRequest({
+        runId: RUN, mutation: 'edit',
+        raw: { sessionId: 'sess-main', originCapability: capability, patch: BENIGN, base: 2 },
+        trustedHost: false,
+        session: {
+          receiver: false, liveOrigin: { capability, turnId: SCHEDULE_TURN, dispatchAttempt: 1 },
+          chatId: BINDING.chatId, larkAppId: BINDING.larkAppId, rootMessageId: BINDING.rootMessageId,
+        },
+        selfLarkAppId: BINDING.larkAppId, baseDir,
+      });
+      expect(refused).toMatchObject({ ok: false, status: 403, error: 'schedule_turn_unauthorized' });
+    });
+
+    it('the schedule owner gate: open bot admits everyone, a locked-down bot only its admins', () => {
+      expect(v3RelayScheduleBotHasAllowlist({})).toBe(false);
+      expect(v3RelayScheduleBotHasAllowlist({ p2pOpen: true })).toBe(true);
+      expect(v3RelayScheduleBotHasAllowlist({ ownerOpenId: 'ou_owner' })).toBe(true);
+      expect(v3RelayScheduleBotHasAllowlist({ allowedUsers: ['ou_owner'] })).toBe(true);
+      expect(v3RelayScheduleBotHasAllowlist({ allowedChatGroups: ['oc_g'] })).toBe(true);
+      expect(v3RelayScheduleBotHasAllowlist({ globalGrants: [{}] })).toBe(true);
+      expect(v3RelayScheduleBotHasAllowlist({ allowedUsers: [], p2pOpen: false })).toBe(false);
+    });
+
+    // 源码结构护栏(K3)：status/edit relay 第一次上线就是漏了这三个定时回合
+    // 依赖（沙盒主会话在发起人定时任务回合必 403）。两条 relay 路由都在
+    // daemon.ts 闭包内、没有可起 daemon 的轻量行为 seam；钉死它们都必须经
+    // 共享的 v3RelayScheduleAuth，不能各自手写一份。
+    it('daemon wires BOTH relay verb families (mutations and status/edit) through the shared schedule-auth factory', () => {
+      const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+      const spreadCount = source.match(/\.\.\.v3RelayScheduleAuth\(ds\)/g)?.length ?? 0;
+      // One loop registers start/cancel/retry/grant, one loop registers
+      // edit/status: exactly two call sites, zero ad-hoc copies.
+      expect(spreadCount).toBe(2);
+      expect(source).not.toContain('isScheduledTurnLive: turnId =>');
+      expect(source).not.toContain('isScheduleOwnerAllowed: (larkAppId, ownerOpenId)');
+      expect(source).not.toContain('loadScheduledTask: (appId, taskId)');
     });
   });
 });
