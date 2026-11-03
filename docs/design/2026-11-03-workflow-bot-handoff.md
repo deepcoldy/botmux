@@ -663,6 +663,10 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
   - `dagRevised { revision, baseRevision, sha256, summary, by, approval?, auto?, effects? }`：修改生效。
     - `by` 记操作人，主 Bot 自动处理时为 `main_bot`；`auto` 只放理由 `{ reason }`（13.6）。
     - `effects` 是本次修改带来的作废、取消、重跑、指派，写在同一条事件里，崩溃时不会出现「定义改了、作废没写」的半截状态。
+    - effects 与专用事件的分工：
+      - 取消：只由 effects 生效，不再另写 `nodeCancelled`；
+      - 重跑、指派：仍由专用事件 `nodeRetryRequested` / `nodeReassigned` 推进状态，在同一把锁里与 `dagRevised` 一起写，effects 里只做记录、重放时不重复推进。
+    - 取消的节点中如果有受阻节点，`dagRevised` 生效时同时解除 run 的 blocked：`runStatus` 恢复为 running，清空 `blockedNodeId`，与 `nodeRetryRequested` 的现有做法一致。否则驱动循环在 run 级 blocked 时直接退出，下游的跳过动作不会执行，run 会一直停在 blocked。
   - `dagRevisionProposed { revision, sha256, reasons[] }` 加一个等待记录（与 Gate 一样放在 `waits/`）：需要确认的修改；
   - `dagRevisionApproved`、`dagRevisionRejected`：确认结果。
 - 状态重放：按 journal 顺序取「第 1 版 + 已生效的修改」得到当前流程，`decideNext` 用当前版本调度。每个版本文件的 sha256 必须与事件里记录的一致，不一致就 fail closed。
@@ -719,6 +723,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
   - **必须写明理由**：主 Bot 每次自动处理都要带上理由，命令为 `botmux workflow retry|edit … --reason "<为什么自动处理>"`；交给人时运行 `botmux workflow ask-human <runId> --node <id> --reason "<为什么交给人>"`。理由记进运行记录：自动处理在 `nodeRetryRequested` / `nodeReassigned` / `dagRevised` 事件上记 `by: 'main_bot'`，理由放独立字段 `auto: { reason }`（`nodeRetryRequested` 原本没有 `by`，一并加上）。`nodeRetryRequested` 已有的 `reason`（闭集取值 `blockedRetry`）不复用、不改；交给人写一条新事件 `nodeHandedToHuman`。
   - **由事件唤醒的回合缺理由就拒绝**：CLI 在这类回合里不带 `--reason` 时直接报错。人本人触发的回合可以不填。
   - **交给人之后节点处于什么状态**：
+    - `ask-human` 只用于有在跑尝试、或有最近一次尝试的节点。从未派发的 pending 节点没有 attemptId，命令直接拒绝；这种节点要先补信息，就改它的定义。
     - `ask-human` 在同一把 journal 锁内依次做三件事：先停掉该节点正在进行的尝试（与超时同一条关闭路径），再写 `nodeHandedToHuman`（只作记录），然后写 `nodeBlocked { errorClass: 'workerError', recovery: 'retry', errorCode: 'HANDED_TO_HUMAN' }`（与其它外部受阻原因相同的取值，不新增错误类别），理由原样展示。尝试的关账和节点状态都由这条 `nodeBlocked` 决定，与其它受阻原因一致；只写 `nodeHandedToHuman` 不会关闭尝试。
     - 之后沿用现有阻塞卡（重试、改派、取消），不另设超时，等人处理。
     - 人在主话题里回复，算发起人或其他人触发的普通回合，按 M1 区分能否直接改流程；处理完由人点卡片，或由主 Bot 在发起人回合里 `retry` / `edit`。
