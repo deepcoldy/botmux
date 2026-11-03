@@ -151,7 +151,7 @@ async function start(runsDir: string, h5Overrides: Partial<DashboardH5AuthConfig
       // Stands for every other Dashboard route behind the ordinary gate.
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, reached: url.pathname }));
-    })().catch((err) => { res.writeHead(500); res.end(String(err)); });
+    })().catch((err) => { console.error(err); res.writeHead(500); res.end('internal test error'); });
   });
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
   world.base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
@@ -463,7 +463,13 @@ describe('the /workflow/<app>/<run> entry', () => {
     const bodies: Array<Record<string, unknown>> = [];
     for (const returnTo of [`/workflow/${SIDEBAR_MAIN}/${runId}`, '/#/agent-workbench']) {
       const html = await (await get(world, `/auth/feishu?returnTo=${encodeURIComponent(returnTo)}`)).text();
-      const script = /<script>([\s\S]*)<\/script>/.exec(html)![1]!;
+      // Extract the inline script the server itself emitted (plain string
+      // bounds, not an HTML filter: the template carries exactly one script).
+      const openTag = html.indexOf('<script>');
+      const closeTag = html.lastIndexOf('</script>');
+      expect(openTag).toBeGreaterThanOrEqual(0);
+      expect(closeTag).toBeGreaterThan(openTag);
+      const script = html.slice(openTag + '<script>'.length, closeTag);
       const element = () => ({ textContent: '', hidden: false, addEventListener: () => {} });
       await new Promise<void>((resolve) => {
         const window: Record<string, unknown> = {
