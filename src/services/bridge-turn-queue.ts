@@ -196,6 +196,17 @@ export const CLI_QUEUE_HOLD_MAX_MS = 30 * 60_000;
  *  after the mark, but clocks and write order can differ slightly. */
 const CLI_QUEUE_MARK_SKEW_MS = 5_000;
 
+/** Minimum gap between the worker's sibling-jsonl fingerprint fallback scans
+ *  for one mark. 10s is far wider than the milliseconds Claude needs to write
+ *  a normal user line, and the fallback only runs after the primary jsonl scan
+ *  already missed the line — i.e. Claude rotated via `/clear` / `/resume`,
+ *  which happens hours apart, so the delay is invisible. */
+export const BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 10_000;
+/** A held mark is proven to wait inside Claude's queue, so its fallback runs
+ *  even less often — but not never: an in-pane `/clear` while the input waits
+ *  moves it to another file. Must stay strictly larger than the normal gap. */
+export const BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 60_000;
+
 /** Claude's own transcript proves this input is waiting in its queue. There is
  *  nothing to search other transcripts for, and no reason to expire the mark:
  *  the record that binds it arrives when Claude takes the input. */
@@ -862,7 +873,12 @@ export class BridgeTurnQueue {
     // Several dequeues can share one millisecond; replaying them is harmless
     // because a transcript switch empties the mirror first.
     if (ev.operation !== 'dequeue') {
-      const key = `queue:${ev.operation}:${ev.timestamp}:${text.length}`;
+      // Same-millisecond records of equal length but DIFFERENT content really
+      // occur (same-ms removes carrying distinct commandUuid: 14 groups in
+      // fleet transcripts), so the identity is the record's own id, falling
+      // back to the full normalised text — never the text's length.
+      const identity = ev.commandUuid ?? ev.deliveryId ?? text;
+      const key = `queue:${ev.operation}:${ev.timestamp}:${identity}`;
       if (this.seen.has(key)) return;
       this.seen.add(key);
     }

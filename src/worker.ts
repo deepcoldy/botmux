@@ -100,7 +100,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -8700,23 +8700,9 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
  *
  *  Pending turns are preserved across the switch so the next ingest
  *  can match and start the turn in the new file. */
-/** Per-fingerprint rate limit for the full-directory fingerprint scan.
- *  Without this, a wedged pending turn (e.g. writeInput's Enter eaten by a
- *  Claude TUI prompt so the user line never lands in any jsonl) drives this
- *  function every 1s from the fallback timer and every idle tick — each
- *  call reads the trailing 1MB of every jsonl in the project dir (hundreds
- *  of files, 100s of MB total), pegging the worker at 99% CPU until
- *  restart. The cleanup paths in #1/#2 (dropPendingTurn / pruneExpired)
- *  are what actually *removes* the stuck mark; this rate limit just keeps
- *  the windows in between cheap.
- *
- *  10s is much wider than the milliseconds Claude needs to write a normal
- *  user line, but `maybeSwitchBridgeJsonl` is only consulted when the
- *  primary jsonl scan in `bridgeIngest` already failed to find the line —
- *  i.e. Claude rotated the file via `/clear` / `/resume`. Those rotations
- *  happen hours apart in practice, so a 10s detection delay is invisible. */
-const BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 10_000;
-const BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 60_000;
+// Per-mark rate limits for the full-directory fingerprint fallback (a wedged
+// mark otherwise rescans every jsonl each tick, 100s of MB at 99% CPU). The
+// values and rationale live with the queue-hold policy in bridge-turn-queue.ts.
 const bridgeFingerprintScanLastMs = new Map<string, number>();
 
 /** Pending+unstarted bridge marks expire after this long. Defensive TTL:

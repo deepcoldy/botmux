@@ -1998,9 +1998,9 @@ describe('input held in Claude\'s own queue', () => {
   const markAt = Date.parse('2026-10-31T12:20:38.866Z');
   const iso = (offsetMs: number) => new Date(markAt + offsetMs).toISOString();
   const text = '<botmux_reminder>r</botmux_reminder> <user_message>do it in parallel</user_message>';
-  const queueOp = (operation: string, offsetMs: number, content?: string, reason?: string) => ({
+  const queueOp = (operation: string, offsetMs: number, content?: string, reason?: string, extra?: Record<string, unknown>) => ({
     type: 'queue-operation', operation, timestamp: iso(offsetMs),
-    ...(content === undefined ? {} : { content }), ...(reason ? { reason } : {}),
+    ...(content === undefined ? {} : { content }), ...(reason ? { reason } : {}), ...extra,
   }) as unknown as TranscriptEvent;
   const absorbed = (uuid: string, prompt: string, offsetMs: number) => ({
     type: 'attachment', uuid, timestamp: iso(offsetMs),
@@ -2148,5 +2148,58 @@ describe('input held in Claude\'s own queue', () => {
     q.forgetCliQueue(markAt + 10_000);
     expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
     expect(q.pruneExpired(TTL, markAt + 10_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('does not fold same-millisecond equal-length records with different content or command ids', () => {
+    // Fleet transcripts contain 14 groups of same-ms records whose texts are
+    // equal length but different (each remove carries its own commandUuid).
+    // A length-based dedup key discarded the second record and drifted the
+    // queue mirror: the second mark never held, or its release never applied.
+    const A = 'please alpha the bridge module now';
+    const B = 'please bravo the bridge module now';
+    expect(A).not.toBe(B);
+    expect(A.length).toBe(B.length);
+    const q = new BridgeTurnQueue();
+    q.mark('t1', makeFingerprint(A), markAt, normaliseForFingerprint(A));
+    q.mark('t2', makeFingerprint(B), markAt, normaliseForFingerprint(B));
+    q.ingest([
+      queueOp('enqueue', 1_000, A, undefined, { commandUuid: 'u-A' }),
+      queueOp('enqueue', 1_000, B, undefined, { commandUuid: 'u-B' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+    q.ingest([
+      queueOp('remove', 2_000, A, 'cancelled', { commandUuid: 'u-A', deliveryId: 'd-A' }),
+      queueOp('remove', 2_000, B, 'cancelled', { commandUuid: 'u-B', deliveryId: 'd-B' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+  });
+
+  it('distinguishes same-ms same-content removes of distinct commands by commandUuid', () => {
+    // Fleet transcripts also contain 5 groups of same-ms removes with IDENTICAL
+    // text but different commandUuid (separate commands), vs 1 group sharing a
+    // commandUuid (a genuine replay). A text-only key would fold the former.
+    const q = marked();
+    q.mark('t2', makeFingerprint(text), markAt + 100, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+    q.ingest([
+      queueOp('remove', 3_000, text, 'absorbed_mid_turn', { commandUuid: 'u-1', deliveryId: 'd-1' }),
+      queueOp('remove', 3_000, text, 'absorbed_mid_turn', { commandUuid: 'u-2', deliveryId: 'd-2' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+  });
+
+  it('treats a same-ms same-content enqueue with no command id as a replay, leaving no ghost slot', () => {
+    // enqueues carry no commandUuid: the same ms+text record replayed across a
+    // transcript switch must fold to ONE mirror slot, or a later dequeue order
+    // shifts and the next mark's release lands on the wrong item.
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('enqueue', 1_000, text)]);
+    q.ingest([queueOp('dequeue', 2_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    q.mark('t2', makeFingerprint(text), markAt + 2_500, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 3_000, text), queueOp('dequeue', 3_500)]);
+    expect(q.peek().map(turn => [turn.turnId, isHeldInCliQueue(turn)]))
+      .toEqual([['t1', false], ['t2', false]]);
   });
 });

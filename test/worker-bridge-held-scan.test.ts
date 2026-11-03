@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
-import { BridgeTurnQueue, isHeldInCliQueue, makeFingerprint, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import {
+  BridgeTurnQueue,
+  BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS,
+  BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS,
+  isHeldInCliQueue,
+  makeFingerprint,
+  normaliseForFingerprint,
+} from '../src/services/bridge-turn-queue.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
 // The worker's fingerprint fallback for an input Claude's own transcript shows
@@ -21,7 +28,10 @@ function fixture(held: boolean) {
   const scope: Record<string, unknown> = {
     bridgeJsonlDir: '/nowhere', bridgeJsonlPath: '/nowhere/own.jsonl', bridgeQueue: queue,
     bridgeFingerprintScanLastMs: new Map<string, number>(),
-    BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS: 10_000, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS: 60_000,
+    // The real production constants: a copy here would stay green while the
+    // worker's own values drifted (the harness resolves free names from scope).
+    BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS,
+    BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS,
     isHeldInCliQueue, bridgeKnownSessionIds: new Set<string>(),
     decideFingerprintSwitch: () => { scans += 1; return { action: 'no-match' }; },
     findJsonlContainingFingerprint: () => null, findJsonlsContainingExactContent: () => [],
@@ -35,5 +45,10 @@ describe('worker fingerprint fallback while Claude holds the input in its queue'
   it('scans a held input once a minute instead of every 10 seconds', () => {
     expect(fixture(true).scanFor(120_000)).toBe(3);
     expect(fixture(false).scanFor(120_000)).toBe(13);
+  });
+
+  it('keeps the held interval strictly wider than the normal interval', () => {
+    expect(BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS)
+      .toBeGreaterThan(BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS);
   });
 });
