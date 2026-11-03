@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -254,6 +255,43 @@ describe('botmux send per-turn final idempotency', () => {
       expect(changed.result.status).toBe(2);
       expect(String(changed.result.stderr)).toContain('本次请求的目标、提及或附件与已投递请求不同');
       expect(changed.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it('rejects a FIFO passed as --images on a durable final instead of hanging on the second read', () => {
+    const f = createFixture();
+    const fifo = join(f.root, 'pipe.png');
+    try { execFileSync('mkfifo', [fifo], { stdio: 'ignore' }); }
+    catch { rmSync(f.root, { recursive: true, force: true }); return; } // mkfifo unavailable — skip
+    // One-shot writer blocks until the reader opens the FIFO — the same shape
+    // as shell process substitution <(...). It is killed if send never opens it.
+    const writer = spawn('sh', ['-c', `printf png-bytes > '${fifo}'`], { stdio: 'ignore' });
+    try {
+      const start = Date.now();
+      const r = f.run('final', '', ['--images', fifo]);
+      const ms = Date.now() - start;
+      expect(r.result.status, String(r.result.stderr)).toBe(1);
+      expect(String(r.result.stderr)).toContain('不是普通文件');
+      expect(r.requests).toHaveLength(0);
+      // Without the regular-file gate send blocks in uploadImage's second read
+      // of the one-shot FIFO and only dies on the spawn timeout (30s).
+      expect(ms).toBeLessThan(10_000);
+    } finally {
+      writer.kill('SIGKILL');
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it('reports a directory passed as --images with the regular-file error instead of an uncaught stack', () => {
+    const f = createFixture();
+    const dir = join(f.root, 'adir.png');
+    mkdirSync(dir);
+    try {
+      const r = f.run('final', '', ['--images', dir]);
+      expect(r.result.status, String(r.result.stderr)).toBe(1);
+      expect(String(r.result.stderr)).toContain('不是普通文件');
+      expect(String(r.result.stderr)).not.toContain('triggerUncaughtException');
+      expect(r.requests).toHaveLength(0);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
 

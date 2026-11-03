@@ -11796,7 +11796,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   for (const path of [...images, ...files, ...videos, ...videoCovers]) {
     if (!existsSync(path)) { console.error(`文件不存在: ${path}`); process.exit(1); }
   }
-  for (const path of [...videos, ...videoCovers]) {
+  // images join videos/covers in requiring a regular file: a durable final
+  // hashes the bytes AND the upload reads them again, so a FIFO/process
+  // substitution (whose writer closes after one read) hangs forever on the
+  // second open. files stay out on purpose — they are read exactly once by
+  // uploadFile, and a one-shot FIFO worked before this change.
+  for (const path of [...images, ...videos, ...videoCovers]) {
     if (!statSync(path).isFile()) { console.error(`不是普通文件: ${path}`); process.exit(1); }
   }
   // Validate the exact presentation text before any TTS, upload, contact
