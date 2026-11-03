@@ -14,6 +14,10 @@ export const V3_BLOCKED_RETRY_ACTION = 'v3_blocked_retry';
 /** 运行时 human-ask 选项按钮的 action（与「重试」同卡不同 namespace）。 */
 export const V3_BLOCKED_ASK_ANSWER_ACTION = 'v3_blocked_ask_answer';
 export const V3_BLOCKED_ASK_TEXT_FIELD = 'v3_blocked_ask_text';
+/** 「改派」确认按钮的 action（只在节点交给群里 Bot 执行的 run 上出现）。 */
+export const V3_BLOCKED_REASSIGN_ACTION = 'v3_blocked_reassign';
+/** 改派下拉框的 form 字段名：选中的是目标 Bot 的 larkAppId。 */
+export const V3_BLOCKED_REASSIGN_FIELD = 'v3_blocked_reassign_bot';
 
 /** card 按钮回传的 value 形态——v3-blocked-card-handler 据此解析。 */
 export interface V3BlockedActionValue {
@@ -23,6 +27,26 @@ export interface V3BlockedActionValue {
   /** 受阻的 attemptId —— nonce 按它推导，旧 attempt 的 stale 卡天然失效。 */
   attemptId: string;
   nonce: string;
+}
+
+/** 改派回传的 value —— 目标 Bot 走 form_value[V3_BLOCKED_REASSIGN_FIELD]，
+ *  不塞进 button value；nonce 与重试按钮同一个（按受阻 attempt 推导）。 */
+export interface V3ReassignActionValue {
+  action: typeof V3_BLOCKED_REASSIGN_ACTION;
+  runId: string;
+  nodeId: string;
+  attemptId: string;
+  nonce: string;
+}
+
+/** 节点交给群里 Bot 执行的 run 上，受阻卡附带的改派选项（渲染时现查）。 */
+export interface V3BlockedReassignOffer {
+  /** 当前执行这个节点的 Bot 名。 */
+  currentName: string;
+  /** 现在能改派过去的 Bot（本 run 批准时选定的 Bot 里、当前合格的）。 */
+  candidates: Array<{ larkAppId: string; label: string }>;
+  /** 批准时选定、但现在不能用的 Bot 及原因。 */
+  unavailable: Array<{ label: string; why: string }>;
 }
 
 /** ask 回传的 value —— 人的答案 + 受阻 attempt（freshness）。 */
@@ -64,6 +88,10 @@ export interface V3BlockedCardInput {
   ask?: { question: string; options?: string[]; freeText?: boolean };
   /** 有值 → 渲染冻结的「已回答」卡（ask 专用，无按钮）。 */
   answered?: { selected?: string; text?: string; nextAttemptId: string; by?: string };
+  /** 节点交给群里 Bot 执行的 run 才有：在重试下方加「改派」区。 */
+  reassign?: V3BlockedReassignOffer;
+  /** 有值 → 渲染冻结的「已改派」卡（无按钮）。 */
+  reassigned?: { toName: string; nextAttemptId?: string; by?: string };
 }
 
 const DEFAULT_MESSAGE_MAX_CHARS = 500;
@@ -74,11 +102,68 @@ export function v3BlockedCardNonce(runId: string, nodeId: string, attemptId: str
   return `v3blocked:${runId}:${nodeId}:${attemptId}`;
 }
 
+/** 「改派」区：说明 + 下拉框 + 确认按钮（form 提交，选中项走 form_value）。 */
+function reassignElements(input: V3BlockedCardInput, nonce: string): Array<Record<string, unknown>> {
+  const offer = input.reassign!;
+  const unavailable = offer.unavailable.map((entry) =>
+    `\n· ${escapeMd(short(entry.label, 40))}：${escapeMd(short(entry.why, 80))}`).join('');
+  const out: Array<Record<string, unknown>> = [
+    { tag: 'hr' },
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content:
+          `**改派**（只有发起人能操作）\n当前执行：${escapeMd(short(offer.currentName, 40))}。` +
+          '只能改派给本 run 批准时选定的 Bot，暂不支持改派给其他 Bot。' +
+          (unavailable ? `\n以下 Bot 现在不能接手：${unavailable}` : ''),
+      },
+    },
+  ];
+  if (offer.candidates.length === 0) {
+    out.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: '没有可以改派的 Bot。' },
+    });
+    return out;
+  }
+  out.push({
+    tag: 'form',
+    name: 'v3_blocked_reassign_form',
+    elements: [
+      {
+        tag: 'select_static',
+        name: V3_BLOCKED_REASSIGN_FIELD,
+        placeholder: { tag: 'plain_text', content: '选择接手的 Bot' },
+        options: offer.candidates.map((candidate) => ({
+          text: { tag: 'plain_text', content: short(candidate.label, 60) },
+          value: candidate.larkAppId,
+        })),
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '🔀 确认改派' },
+        type: 'default',
+        name: 'v3_blocked_reassign_submit',
+        action_type: 'form_submit',
+        value: {
+          action: V3_BLOCKED_REASSIGN_ACTION,
+          runId: input.runId,
+          nodeId: input.nodeId,
+          attemptId: input.attemptId,
+          nonce,
+        } satisfies V3ReassignActionValue,
+      },
+    ],
+  });
+  return out;
+}
+
 export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   const nonce = input.nonce ?? v3BlockedCardNonce(input.runId, input.nodeId, input.attemptId);
   const webDetailUrl = input.webDetailUrl ?? v3RunDetailUrl(input.runId);
   const msgMax = input.messageMaxChars ?? DEFAULT_MESSAGE_MAX_CHARS;
-  const { retried, ask, answered } = input;
+  const { retried, ask, answered, reassigned } = input;
 
   // 四态共用一张卡，header 决定语气：蓝=等人拍板 / 绿=已回答·已重试 / 橙=受阻待重试。
   let title: string;
@@ -86,6 +171,7 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   if (answered) { title = `已回答：节点 ${input.nodeId}`; template = 'green'; }
   else if (ask) { title = `需要你拍板：节点 ${input.nodeId}`; template = 'blue'; }
   else if (retried) { title = `已重试：节点 ${input.nodeId}`; template = 'green'; }
+  else if (reassigned) { title = `已改派：节点 ${input.nodeId}`; template = 'green'; }
   else if (input.retryForbidden === 'host-effect-uncertain') {
     title = `外部效果待核实：${input.nodeId}`;
     template = 'red';
@@ -197,6 +283,20 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
             (retried.by ? ` · by ${escapeMd(short(retried.by, 20))}` : ''),
         },
       });
+    } else if (reassigned) {
+      elements.push({ tag: 'hr' });
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content:
+            `🔀 已改派给 ${escapeMd(short(reassigned.toName, 40))}` +
+            (reassigned.nextAttemptId
+              ? ` → ${escapeMd(reassigned.nextAttemptId.slice(reassigned.nextAttemptId.lastIndexOf('/') + 1))}`
+              : '') +
+            (reassigned.by ? ` · by ${escapeMd(short(reassigned.by, 20))}` : ''),
+        },
+      });
     } else if (input.retryForbidden === 'host-effect-uncertain') {
       elements.push({
         tag: 'div',
@@ -242,6 +342,7 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
           },
         ],
       });
+      if (input.reassign) elements.push(...reassignElements(input, nonce));
     }
   }
 

@@ -166,7 +166,7 @@ export async function checkV3BotExecutorEligibility(input: {
   for (const target of input.targets) {
     const appId = target.larkAppId;
     if (appId === input.orchestratorAppId || verdicts.has(appId)) continue;
-    verdicts.set(appId, await judgeBot(appId, input.probe));
+    verdicts.set(appId, await judgeV3BotEligibility(appId, input.probe));
   }
   const problems: V3BotEligibilityProblem[] = [];
   for (const target of input.targets) {
@@ -180,9 +180,16 @@ export async function checkV3BotExecutorEligibility(input: {
   return problems.length === 0 ? { ok: true } : { ok: false, problems };
 }
 
-async function judgeBot(
+/**
+ * §6.1 items 1–4 (plus 7) for one non-main bot; `null` = eligible. With
+ * `grant: false` the check stays read-only (no chat grant is written) — for
+ * listing candidates that may never be used; whoever commits to a bot checks
+ * with the grant.
+ */
+export async function judgeV3BotEligibility(
   appId: string,
   probe: V3BotEligibilityProbe,
+  opts: { grant?: boolean } = {},
 ): Promise<{ code: V3BotEligibilityCode; detail?: string } | null> {
   if (!probe.isConfigured(appId)) return { code: 'BOT_NOT_CONFIGURED' };
   if (!probe.isDaemonOnline(appId)) return { code: 'BOT_OFFLINE' };
@@ -202,6 +209,7 @@ async function judgeBot(
   }
   if (topics === 'no') return { code: 'NO_TOPIC_SESSION' };
   if (topics !== 'yes') return { code: 'TOPIC_SESSION_UNKNOWN', detail: topics.unknown };
+  if (opts.grant === false) return null;
   try {
     await probe.ensureGrant(appId);
   } catch (err) {
@@ -220,6 +228,11 @@ const PROBLEM_TEXT: Record<V3BotEligibilityCode, string> = {
   TOPIC_SESSION_UNKNOWN: '暂时查不到本群是话题群还是普通群，请稍后重试',
   DIRECTORY_OUTPUT: '节点声明了目录型产出，交给 Bot 执行时无法提交目录；请改成文件产出，或在 Dashboard 关闭该开关改用临时进程执行',
 };
+
+/** One user-facing reason for an eligibility code. */
+export function describeV3BotEligibilityCode(code: V3BotEligibilityCode): string {
+  return PROBLEM_TEXT[code];
+}
 
 /** "Node → bot: reason" lines for a refused approval. */
 export function formatV3BotEligibilityRefusal(

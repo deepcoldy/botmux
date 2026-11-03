@@ -747,7 +747,8 @@ import {
   resolveV3SavedWorkflowMessageTargets,
   type V3SavedWorkflowExecutionEffect,
 } from './im/lark/v3-saved-workflow-handler.js';
-import { liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
+import { createLiveV3BotEligibilityProbe, liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
+import { buildV3BlockedCardForRun, type V3BlockedReassignDeps } from './im/lark/v3-blocked-reassign.js';
 import { v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
 import { createWorkflowNodeDaemon } from './core/workflow-node-daemon.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
@@ -773,7 +774,6 @@ import {
   requestV3LoopGrant,
 } from './workflows/v3/daemon-run.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
-import { buildV3BlockedCard } from './im/lark/v3-blocked-card.js';
 import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
 import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
 import { buildV3ProgressCard } from './im/lark/v3-progress-card.js';
@@ -6814,6 +6814,19 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   warn: (message) => logger.warn(message),
 });
 
+/** 「改派」 on bot-executed runs' blocked cards: the same live §6.1 probe the
+ *  approval uses, against the run's chat. */
+const v3BlockedReassignDeps: V3BlockedReassignDeps = {
+  probe: (binding) => createLiveV3BotEligibilityProbe({
+    orchestratorAppId: binding.larkAppId,
+    chatId: binding.chatId,
+    bots: loadBotConfigs(),
+  }),
+  nameOf: (appId) => v3BotDisplayNameResolver()(appId),
+  cliOf: (appId) => loadBotConfigs().find((bot) => bot.larkAppId === appId)?.cliId,
+  executor: workflowNodeDaemon.executor,
+};
+
 // v3 humanGate run-controller: drives daemon-side v3 runs, posts/​re-posts
 // approval cards to the run's bound topic, and re-arms pending gates on startup
 // (cold-attach).  postCard / notifyTerminal use the daemon's Lark sender; the
@@ -6845,16 +6858,13 @@ const v3GateRunner = createV3GateRunner({
     }
   },
   postBlockedCard: async (binding, info, runId) => {
-    const card = buildV3BlockedCard({
+    // Bot-executed runs get the 「改派」 section (re-probed now); every other
+    // run gets exactly the plain card.
+    const card = await buildV3BlockedCardForRun({
+      runDir: join(v3DefaultBaseDir(), runId),
       runId,
-      nodeId: info.nodeId,
-      attemptId: info.attemptId,
-      errorClass: info.errorClass,
-      errorCode: info.errorCode,
-      message: info.message,
-      retryForbidden: info.retryForbidden,
-      // human-ask 受阻 → 渲染问题 + 选项按钮卡（替代纯重试卡）。
-      ...(info.ask ? { ask: info.ask } : {}),
+      info,
+      reassign: v3BlockedReassignDeps,
     });
     if (binding.rootMessageId) {
       await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
@@ -7496,6 +7506,7 @@ const cardDeps: CardHandlerDeps = {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     canResolve: (binding, operatorOpenId) =>
       binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
+    reassign: v3BlockedReassignDeps,
   },
   v3LoopGrantDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
