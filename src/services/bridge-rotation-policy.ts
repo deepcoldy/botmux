@@ -225,7 +225,19 @@ export interface FingerprintSwitchInput {
 /** Native Claude session ids owned by OTHER active botmux sessions: their
  *  botmux session id (Claude is spawned with it), the CLI session id they last
  *  published, and the id of the pane they adopted. An id a session has not
- *  published yet is not here. */
+ *  published yet is not here.
+ *
+ *  Known over-inclusion, deliberately kept: while a fork child's first spawn
+ *  is pending (`Session.pendingForkSession`), its published `cliSessionId` is
+ *  the PARENT's native id — the child resumes it and forks forward. From the
+ *  parent's row that id then looks foreign. The damage cannot reach a switch:
+ *  both scanners exclude the bridge's current path, which is the parent's own
+ *  file, and once the child's fd probes prove its own new id the borrowed id
+ *  stops mattering. The only effect is that a parent ALREADY switched off its
+ *  file cannot be pulled back to it during that window, which is the intended
+ *  "one wrong switch must not stick" behaviour. Skipping the borrowed id would
+ *  require this helper to know about `pendingForkSession` and would let two
+ *  live CLIs follow the same transcript again. */
 export function foreignNativeSessionIds(
   sessions: Iterable<{ sessionId: string; status?: string; cliSessionId?: string; adoptedFrom?: { sessionId?: string } }>,
   ownSessionId: string | undefined,

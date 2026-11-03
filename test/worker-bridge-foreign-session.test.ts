@@ -142,3 +142,173 @@ describe('worker trust set: what the CLI proved vs what was only guessed or swit
     expect([...(scope.bridgeCliProvenSessionIds as Set<string>)]).toEqual([]);
   });
 });
+
+// Every production site that feeds bridgeCliProvenSessionIds. Demoting one of
+// these to 'unproven' lets a foreign session's claim override this CLI's own
+// pid/fd evidence — Phase 1 then silently stops following files this CLI is in
+// fact writing — so each site needs a behaviour test that goes red on that
+// demotion, not just the pure-function semantics in bridge-rotation-policy.
+describe('proven trust-set: the whole pid/fd producer chain', () => {
+  const PID_SID = '66666666-6666-4666-8666-666666666666';
+  const FD_SID = '77777777-7777-4777-8777-777777777777';
+  const ANCHOR_SID = '88888888-8888-4888-8888-888888888888';
+
+  function chainScope() {
+    const scope: Record<string, unknown> = {
+      bridgeKnownSessionIds: new Set<string>(),
+      bridgeCliProvenSessionIds: new Set<string>(),
+      sessionIdFromJsonlPath, SESSION_ID_FILENAME_RE,
+      log: () => {},
+    };
+    scope.bridgeRememberSessionIdForPath = loadWorkerFunction('bridgeRememberSessionIdForPath', scope);
+    return scope;
+  }
+  const proven = (scope: Record<string, unknown>) => scope.bridgeCliProvenSessionIds as Set<string>;
+  const known = (scope: Record<string, unknown>) => scope.bridgeKnownSessionIds as Set<string>;
+
+  it('the per-tick open-file probe proves every jsonl the CLI pid holds', () => {
+    const scope = chainScope();
+    Object.assign(scope, {
+      bridgeCliPid: 4242, bridgeJsonlDir: '/d',
+      findOpenJsonlsForPid: () => [`/d/${PID_SID}.jsonl`],
+    });
+    loadWorkerFunction('bridgeProbeOpenSessionIds', scope)();
+    expect([...proven(scope)]).toEqual([PID_SID]);
+  });
+
+  it('the quiet-rotation fd branch proves open jsonls without rotating when they match', () => {
+    const scope = chainScope();
+    Object.assign(scope, {
+      bridgeJsonlDir: '/d', bridgeJsonlPath: `/d/${PID_SID}.jsonl`, bridgeCliPid: 4242,
+      isPidAlive: () => true,
+      statSafe: () => ({ mtimeMs: 1, size: 1 }),
+      findOpenJsonlsForPid: () => [`/d/${PID_SID}.jsonl`],
+      newestPath: (paths: string[]) => paths[0],
+      performRotationSwitch: () => { throw new Error('same path must not rotate'); },
+    });
+    loadWorkerFunction('maybeFollowQuietRotation', scope)();
+    expect([...proven(scope)]).toEqual([PID_SID]);
+  });
+
+  it('the pid resolver proves the session id it reports on a same-path tick', () => {
+    const scope = chainScope();
+    Object.assign(scope, {
+      bridgeCliPid: 4242, bridgeCliCwd: '/proj', bridgeDataDir: '/d',
+      bridgeJsonlPath: `/d/${PID_SID}.jsonl`,
+      bridgeObservedCliSessionId: undefined, bridgePathConfirmedAtMs: 0,
+      resolveJsonlFromPid: () => ({ path: `/d/${PID_SID}.jsonl`, cliSessionId: PID_SID }),
+      recordPidStateCliSessionId: () => {},
+    });
+    const result = loadWorkerFunction<() => string>('maybeFollowSessionRotationViaPid', scope)();
+    expect(result).toBe('same');
+    expect([...proven(scope)]).toEqual([PID_SID]);
+  });
+
+  it('the blind-turn relocation proves both its pid-state and open-file branches', () => {
+    function relocationScope() {
+      const scope = chainScope();
+      Object.assign(scope, {
+        lastInitConfig: { cliId: 'claude-code' },
+        bridgeCliPid: 4242, bridgeCliCwd: '/proj', bridgeDataDir: '/d',
+        bridgeJsonlPath: `/d/${ANCHOR_SID}.jsonl`,
+        bridgePathConfirmedAtMs: 1000, bridgeStalePidStateSessionId: undefined,
+        PENDING_MARK_SKEW_MS: 5_000,
+        switchBridgeToPidStatePath: () => {},
+        bridgeMarkStalePidStateForAcceptedSid: () => {},
+        statSafe: () => ({ mtimeMs: 5_000, size: 1 }),
+        findOpenClaudeSessionIds: () => [FD_SID],
+        claudeJsonlPathForSession: (sid: string) => `/d/${sid}.jsonl`,
+        newestPath: (paths: string[]) => paths[0],
+      });
+      return scope;
+    }
+    // Branch 1: pid state names a different transcript.
+    const viaPid = relocationScope();
+    Object.assign(viaPid, {
+      resolveJsonlFromPid: () => ({ path: `/d/${PID_SID}.jsonl`, cliSessionId: PID_SID }),
+      findOpenClaudeSessionIds: () => [],
+    });
+    expect(loadWorkerFunction<(since: number) => boolean>('relocateUnreadClaudeTranscript', viaPid)(100_000)).toBe(true);
+    expect([...proven(viaPid)]).toEqual([PID_SID]);
+    // Branch 2: pid state silent, an open session file is newer than the cutoff.
+    const viaFd = relocationScope();
+    Object.assign(viaFd, { resolveJsonlFromPid: () => null });
+    expect(loadWorkerFunction<(since: number) => boolean>('relocateUnreadClaudeTranscript', viaFd)(100_000)).toBe(true);
+    expect([...proven(viaFd)]).toEqual([FD_SID]);
+  });
+
+  it('startBridgeWatcher proves pid-resolver and fd-probe ids but leaves the attach anchor unproven', () => {
+    // Evidence present: pid resolver names PID_SID, an fd probe sees FD_SID.
+    const withEvidence = chainScope();
+    Object.assign(withEvidence, {
+      bridgeCliPid: undefined, bridgeCliCwd: undefined, bridgeDataDir: '/d',
+      bridgeJsonlPath: undefined, bridgeJsonlDir: undefined,
+      bridgeObservedCliSessionId: undefined, bridgeBaselineDone: false, bridgeOffset: 0,
+      bridgeWatcher: null, bridgeFallbackTimer: null, bridgeStalePidStateSessionId: undefined,
+      dirname: (p: string) => p.slice(0, p.lastIndexOf('/')),
+      resolveJsonlFromPid: () => ({ path: `/d/${PID_SID}.jsonl`, cliSessionId: PID_SID }),
+      findOpenClaudeSessionIds: () => [FD_SID],
+      claudeJsonlPathForSession: (sid: string) => `/d/${sid}.jsonl`,
+      existsSyncSafe: () => false,
+      newestPath: (paths: string[]) => paths[0],
+      bridgeMarkStalePidStateForAcceptedSid: () => {},
+      beginNewBridgeTranscriptGeneration: () => {},
+      seedModelFallbackFromTranscript: () => {},
+      fsWatch: () => ({ close: () => {} }),
+      performBridgeIngestAndScheduleQuietEmit: () => {},
+      setInterval: () => 0,
+    });
+    loadWorkerFunction('startBridgeWatcher', withEvidence)(`/d/${ANCHOR_SID}.jsonl`, {
+      cliPid: 4242, cliCwd: '/proj', dataDir: '/d',
+    });
+    expect([...proven(withEvidence)].sort()).toEqual([FD_SID, PID_SID].sort());
+    // The probes moved the pinned path before the anchor line ran, so the
+    // anchor here is the fd-proven file; the dedicated anchor case below pins
+    // the anchor's evidence class.
+
+    // No pid/fd evidence (fresh worker): the attach anchor is trusted for the
+    // hijack guard but must NOT count as proven — a fork child starts pinned to
+    // its parent's id, and the spawn-time guess can be a file this CLI never
+    // writes.
+    const anchorOnly = chainScope();
+    Object.assign(anchorOnly, {
+      bridgeCliPid: undefined, bridgeCliCwd: undefined, bridgeDataDir: '/d',
+      bridgeJsonlPath: undefined, bridgeJsonlDir: undefined,
+      bridgeBaselineDone: false, bridgeOffset: 0,
+      bridgeWatcher: null, bridgeFallbackTimer: null,
+      dirname: (p: string) => p.slice(0, p.lastIndexOf('/')),
+      existsSyncSafe: () => false,
+      beginNewBridgeTranscriptGeneration: () => {},
+      seedModelFallbackFromTranscript: () => {},
+      fsWatch: () => ({ close: () => {} }),
+      performBridgeIngestAndScheduleQuietEmit: () => {},
+      setInterval: () => 0,
+    });
+    loadWorkerFunction('startBridgeWatcher', anchorOnly)(`/d/${ANCHOR_SID}.jsonl`, { dataDir: '/d' });
+    expect(known(anchorOnly).has(ANCHOR_SID)).toBe(true);
+    expect(proven(anchorOnly).has(ANCHOR_SID)).toBe(false);
+  });
+
+  it('stopBridgeWatcher clears the proven set so the next CLI generation starts clean', () => {
+    const scope = chainScope();
+    proven(scope).add(PID_SID);
+    known(scope).add(PID_SID);
+    Object.assign(scope, {
+      bridgeJsonlPath: null, bridgeWatcher: null, bridgeFallbackTimer: null,
+      bridgeCliPid: 1, bridgeCliCwd: '/p', bridgeObservedCliSessionId: 'x',
+      bridgeStalePidStateSessionId: undefined,
+      bridgeSecondaryPaths: new Map(), orcaClaudeWebHistorySignature: undefined,
+      bridgeFingerprintScanLastMs: new Map(),
+      bridgeBlindTurnWatch: { reset: () => {} },
+      bridgeQueue: { clearPending: () => {} },
+      beginNewBridgeTranscriptGeneration: () => {},
+      bridgeRestoreGate: { markGenerationRetired: () => {} },
+      clearHerdrAdoptBridgeQuietTimer: () => {},
+      resetThinkingChannel: () => {},
+      bridgePreambleSent: true,
+    });
+    loadWorkerFunction('stopBridgeWatcher', scope)();
+    expect([...proven(scope)]).toEqual([]);
+    expect([...known(scope)]).toEqual([]);
+  });
+});
