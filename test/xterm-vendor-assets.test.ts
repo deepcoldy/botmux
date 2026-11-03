@@ -126,7 +126,7 @@ describe('Dashboard 只在根路径提供', () => {
 
   it('v3 终端回放页引用的每个资源都由 Dashboard 提供，且不引用任何外部地址', async () => {
     const srcdoc = buildReplayTerminalSrcdoc('/api/v3/runs/r/nodes/n/pty-log', 'r / n');
-    const refs = [...srcdoc.matchAll(/<(?:script|link)\b[^>]*\b(?:src|href)="([^"]+)"/g)].map((m) => m[1]);
+    const refs = [...srcdoc.matchAll(/<(?:script|link)\b[^>]*\b(?:src|href)="([^"]+)"/gi)].map((m) => m[1]);
     expect(refs.length).toBeGreaterThan(0);
     for (const ref of refs) {
       expect(ref, ref).toMatch(/^\//);
@@ -182,10 +182,10 @@ function runLoader(assets: readonly XtermVendorAsset[], loc: { protocol: string;
   const ctx = { location: loc, document: { write: (s: string) => { html += s; } } };
   vm.createContext(ctx);
   vm.runInContext(xtermVendorDocumentWriteSource(assets), ctx);
-  const refs = [...html.matchAll(/<(script|link)\b([^>]*)>/g)].map((m) => {
-    const attr = /\b(?:src|href)="([^"]*)"/.exec(m[2]);
+  const refs = [...html.matchAll(/<(script|link)\b([^>]*)>/gi)].map((m) => {
+    const attr = /\b(?:src|href)="([^"]*)"/i.exec(m[2]);
     const url = (attr?.[1] ?? '').replace(/&#(\d+);/g, (_s, n: string) => String.fromCharCode(Number(n)));
-    return { tag: m[1], url };
+    return { tag: m[1].toLowerCase(), url };
   });
   return { html, refs };
 }
@@ -225,7 +225,7 @@ describe('终端页按自己的路径拼资源地址', () => {
   it('路径里夹带引号/尖括号/实体也闭合不了属性、写不出额外标签', () => {
     const pathname = `/s/x"><img src=x onerror=alert(1)>&quot;'/`;
     const { html, refs } = runLoader(scripts, { protocol: 'https:', host: 't.example', pathname });
-    expect(html).not.toContain('<img');
+    expect(html).not.toMatch(/<img/i);
     expect(refs).toHaveLength(scripts.length);
     expect(refs[0].url).toBe(`https://t.example/s/x"><img src=x onerror=alert(1)>&quot;'/__botmux/vendor/${scripts[0].path}`);
   });
