@@ -69,6 +69,11 @@ import {
   RunEnvelopeValidationError,
 } from '../src/workflows/v3/run-envelope.js';
 import type { StoredEvent } from '../src/workflows/v3/journal.js';
+import { buildV3HandoffCard, type V3HandoffCardInput } from '../src/im/lark/v3-node-card.js';
+import { extractCardContent } from '../src/im/lark/message-parser.js';
+import { workflowSidebarEntryLink } from '../src/im/lark/workflow-sidebar-entry.js';
+import { handleV3BlockedReassign } from '../src/im/lark/v3-blocked-reassign.js';
+import { V3_BLOCKED_REASSIGN_ACTION, V3_BLOCKED_REASSIGN_FIELD, v3BlockedCardNonce } from '../src/im/lark/v3-blocked-card.js';
 
 afterEach(() => cleanupBotRuns());
 
@@ -662,5 +667,74 @@ describe('the identity-check route', () => {
     }
     expect(await world.main.identityCheckRoute({ chatId: CHAT, unionId: INITIATOR_UNION, tools: ['lark-cli'], sourceLarkAppId: MAIN }))
       .toEqual({ status: 200, body: { ok: true, check: { status: 'ok', tools: ['lark-cli'] } } });
+  });
+});
+
+// ─── with #2728 (blocked-card reassignment) and #2750 (sidebar entry) ──────
+
+describe('the initiator reassigning a blocked node on its card (#2728)', () => {
+  it('a handoff to the approved bot they picked carries their identity', async () => {
+    const run = new BotRun(reportDag('id-card-reassign'));
+    const world = identityWorld();
+    world.policies.set('cli_b', policy(['lark-cli', 'bytedcli']));
+    const snapshots = authorizeRun(run, { identity: FROZEN, selectors: ['cli_a', 'cli_b'] });
+    await driveWith(run, world, snapshots);
+    const first = run.openAttempt('write');
+    expect(reportExternalBlocked(run.runDir, { attemptId: first.attemptId, reason: 'cannot' })).toEqual({ ok: true });
+    expect(expectTerminal(await driveWith(run, world, snapshots)).runStatus).toBe('blocked');
+
+    const drives: string[] = [];
+    const clicked = await handleV3BlockedReassign(
+      { action: V3_BLOCKED_REASSIGN_ACTION, runId: run.dag.runId, nodeId: 'write', attemptId: first.attemptId,
+        nonce: v3BlockedCardNonce(run.dag.runId, 'write', first.attemptId) },
+      INITIATOR_MAIN_OU, MAIN, { [V3_BLOCKED_REASSIGN_FIELD]: 'cli_b' },
+      {
+        baseDir: run.base, driveRun: (runId) => { drives.push(runId); }, canResolve: () => true,
+        reassign: {
+          probe: () => ({ isConfigured: () => true, isDaemonOnline: () => true, inChat: async () => 'yes', opensTopicSessions: async () => 'yes', ensureGrant: async () => {} }),
+          nameOf: (appId) => appId,
+          executor: world.main.executor,
+        },
+      },
+    );
+    expect(drives).toEqual([run.dag.runId]);
+    expect(run.of('nodeReassigned')).toEqual([expect.objectContaining({ to: 'cli_b', by: INITIATOR_MAIN_OU })]);
+    expect(clicked).not.toHaveProperty('toast');
+
+    await driveWith(run, world, snapshots);
+    const second = run.openAttempt('write');
+    expect(second.targetLarkAppId).toBe('cli_b');
+    expect(boundRecord(world.dataDir, second.handoffMessageId!)).toMatchObject({
+      targetAppIds: ['cli_b'], workflow: { attemptId: second.attemptId },
+      authority: { openId: INITIATOR_MAIN_OU, unionId: INITIATOR_UNION },
+    });
+    expect(workflowDelegationRefusal(receiverInputs(world, run, second, 'cli_b'))).toBeUndefined();
+  });
+});
+
+describe('the handoff card with the sidebar entry (#2750)', () => {
+  const input: V3HandoffCardInput = {
+    runTitle: '代码风险报告', nodeId: 'write', attemptNumber: 1, goal: 'write the report', inputs: [], omitted: [],
+    outputs: [{ key: 'report', path: 'report.md', kind: 'markdown' }], resultFields: [], timeoutSec: 600,
+    handoffRef: 'om_handoff', nonce: `wfh_${'a'.repeat(24)}`, target: { kind: 'bot', openId: 'ou_bot_a' },
+    entry: workflowSidebarEntryLink({ dashboardOrigin: 'https://dash.example.test', mainLarkAppId: MAIN, runId: 'r1', brand: 'feishu', sidebar: true })!,
+  };
+  const NOTE = '发起人已不在本群';
+
+  it('the executing bot reads exactly one more line: the reason it carries no identity', () => {
+    const plain = extractCardContent(buildV3HandoffCard(input));
+    const withNote = extractCardContent(buildV3HandoffCard({ ...input, identityNote: NOTE }));
+    const noteLine = `未带发起人身份：${NOTE}；需要个人授权的工具会在调用时提示授权，用不到就照常做。`;
+    expect(withNote).toContain(noteLine);
+    // Take the line (and the blank line after it) out again: what is left is
+    // exactly what the bot reads without it.
+    expect(withNote.replace(`${noteLine}\n\n`, '')).toBe(plain);
+    expect(withNote).not.toContain('/workflow/');
+  });
+
+  it('the signature row (the @ that wakes the bot, and the entry) is untouched by the note', () => {
+    const footer = (card: string) => JSON.stringify(JSON.parse(card).body.elements.at(-1));
+    expect(footer(buildV3HandoffCard({ ...input, identityNote: NOTE }))).toBe(footer(buildV3HandoffCard(input)));
+    expect(footer(buildV3HandoffCard(input))).toContain('<at id=ou_bot_a>');
   });
 });
