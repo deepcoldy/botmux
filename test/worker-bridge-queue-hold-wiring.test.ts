@@ -48,6 +48,11 @@ describe('worker events that end a queue hold', () => {
     // predicate returns false without touching backend/cliAdapter.
     scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
     scope.holdForNativeSessionFork = loadWorkerFunction('holdForNativeSessionFork', scope);
+    // The cold-resume stale-turn release is a first-prompt-only early gate;
+    // this scope never sets awaitingFirstPrompt, so the real function returns
+    // at its first guard without touching any queue state.
+    scope.releaseInterruptedStructuredBridgeOnFirstPrompt
+      = loadWorkerFunction('releaseInterruptedStructuredBridgeOnFirstPrompt', scope);
     expect(() => loadWorkerFunction<() => void>('markPromptReady', scope)()).toThrow(stop);
     expect(isHeldInCliQueue(bridgeQueue.peek()[0])).toBe(false);
   });
