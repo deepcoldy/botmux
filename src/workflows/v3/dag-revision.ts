@@ -48,6 +48,7 @@ import { normalizeGateWaitInput } from './gate-policy.js';
 import { matchLoopExitWhen, revisitBudgetStatus } from './core-control.js';
 import { latestAttemptIdFor, nextAttemptIdFor } from './attempt-numbering.js';
 import { materialize } from './state.js';
+import { withJournalMutationSync } from './journal.js';
 import { affectedNodesFrom } from './revisit-plan.js';
 import type { V3RunSnapshot } from './state.js';
 
@@ -741,17 +742,22 @@ export interface V3RerunBudgetBlock {
   epoch: number;
 }
 
-/** Which exhaustion of `nodeId`'s rerun budget this is: the number of grants
- *  that could have lifted it (its own pair grants plus run-wide grants). An
- *  exhausted budget only reopens through a grant, so repeated refusals of the
- *  same exhaustion share one epoch, and a grant for another node's pair does
- *  not expire this node's card. */
-export function v3RevisitBudgetEpoch(events: readonly StoredEvent[], nodeId: string): number {
+/** Which exhaustion of `nodeId`'s rerun budget at `tier` this is: the number
+ *  of grants that lift exactly that tier — the node's own pair grants for
+ *  `pair`, run-wide grants for `run`. An exhausted tier only reopens through
+ *  such a grant, so repeated refusals of one exhaustion share an epoch, and a
+ *  grant that cannot lift it (another node's pair, or a run-wide grant while
+ *  this node's own pair is spent) leaves its card valid. */
+export function v3RevisitBudgetEpoch(
+  events: readonly StoredEvent[],
+  nodeId: string,
+  tier: 'pair' | 'run',
+): number {
   let epoch = 0;
   for (const event of events) {
     if (event.type !== 'revisitBudgetGranted') continue;
     const runWide = event.sourceNodeId === undefined && event.toNodeId === undefined;
-    if (runWide || (event.sourceNodeId === nodeId && event.toNodeId === nodeId)) epoch++;
+    if (tier === 'run' ? runWide : event.sourceNodeId === nodeId && event.toNodeId === nodeId) epoch++;
   }
   return epoch;
 }
@@ -1070,7 +1076,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
             `${where}: 节点 "${op.nodeId}" 的重做额度已用完（${budget.tier === 'pair' ? '本节点' : '整个 run'}的 Revisit 额度）；` +
             '需要发起人在「追加重做额度」卡上同意后再提交这次修改',
           );
-          rerunBudget = { nodeId: op.nodeId, tier: budget.tier, epoch: v3RevisitBudgetEpoch(events, op.nodeId) };
+          rerunBudget = { nodeId: op.nodeId, tier: budget.tier, epoch: v3RevisitBudgetEpoch(events, op.nodeId, budget.tier) };
           return;
         }
         rerun.add(op.nodeId);
@@ -1483,4 +1489,23 @@ export function missingV3RevisionFollowUps(
     }));
   });
   return missing;
+}
+
+/**
+ * Append the follow-ups revisions still owe, under the journal lock — but only
+ * while the flow is still the one `liveNodeIds` was read from. A newer
+ * revision landing between the caller's read and this lock may have removed a
+ * node that never started (so nothing marks it cancelled): `stale` tells the
+ * caller to re-read the flow and try again.
+ */
+export function appendMissingV3RevisionFollowUps(
+  journalPath: string,
+  scope: { revision: number; liveNodeIds: ReadonlySet<string> },
+): { kind: 'appended'; count: number } | { kind: 'stale' } {
+  return withJournalMutationSync(journalPath, ({ events, append }) => {
+    if (currentV3Revision(events) !== scope.revision) return { kind: 'stale' as const };
+    const missing = missingV3RevisionFollowUps(events, scope.liveNodeIds);
+    for (const event of missing) append(event, { durable: true });
+    return { kind: 'appended' as const, count: missing.length };
+  });
 }

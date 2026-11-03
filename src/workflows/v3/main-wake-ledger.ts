@@ -28,7 +28,18 @@ export interface V3MainWakeRecord {
   issuedAt: number;
   /** The session's turn pointers when the wake turn was issued. A later
    *  human inbound message advances them past both these values and the
-   *  wake turn's own id — the wake turn then no longer owns the session. */
+   *  wake turn's own id — the wake turn then no longer owns the session.
+   *
+   *  Contract for the issuer (the M6 wake-up, PR 5b): it MUST record this
+   *  snapshot when it opens the wake turn. A record without it is refused
+   *  whenever the session has any pointer (the verifier cannot tell an old
+   *  pointer from a newer human message, so it fails closed).
+   *
+   *  Open for 5b: the verifier cannot tell WHO advanced a pointer. A synthetic
+   *  turn that moves them (e.g. a `trg_` report relay opening a turn in the
+   *  main session) also makes the wake turn stale. Whether such turns should
+   *  leave the pointers alone, record their own provenance, or re-issue the
+   *  wake turn is the issuer's decision; this PR keeps the strict rule. */
   turnPointersAtIssue?: { quoteTargetId?: string; currentReplyTargetTurnId?: string };
 }
 

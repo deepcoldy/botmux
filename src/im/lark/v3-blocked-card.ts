@@ -64,7 +64,8 @@ export interface V3BlockedCardInput {
   ask?: { question: string; options?: string[]; freeText?: boolean };
   /** 有值 → 渲染冻结的「已回答」卡（ask 专用，无按钮）。 */
   answered?: { selected?: string; text?: string; nextAttemptId: string; by?: string };
-  /** 流程修改后这个问题作废（ask 专用，无按钮）：节点要重新走审批，答案不会送达。 */
+  /** 流程修改后这个问题作废（ask 专用）：答案不会送达，卡上只留「按新定义重跑」
+   *  （普通重试，节点以新实例重新走审批；不点不会自动开始）。 */
   askVoided?: boolean;
 }
 
@@ -74,6 +75,25 @@ const DEFAULT_MESSAGE_MAX_CHARS = 500;
  *  attempt 入 nonce —— 重试后旧卡的 nonce 对不上新 attempt，不会误触。 */
 export function v3BlockedCardNonce(runId: string, nodeId: string, attemptId: string): string {
   return `v3blocked:${runId}:${nodeId}:${attemptId}`;
+}
+
+/** The card the daemon posts (or re-posts) for a blocked node. */
+export function buildV3BlockedCardForInfo(
+  runId: string,
+  info: Pick<V3BlockedCardInput, 'nodeId' | 'attemptId' | 'errorClass' | 'errorCode' | 'message' | 'retryForbidden' | 'ask' | 'askVoided'>,
+): string {
+  return buildV3BlockedCard({
+    runId,
+    nodeId: info.nodeId,
+    attemptId: info.attemptId,
+    errorClass: info.errorClass,
+    errorCode: info.errorCode,
+    message: info.message,
+    retryForbidden: info.retryForbidden,
+    // human-ask 受阻 → 渲染问题 + 选项按钮卡（替代纯重试卡）；已作废 → 只留重跑。
+    ...(info.ask ? { ask: info.ask } : {}),
+    ...(info.askVoided ? { askVoided: true } : {}),
+  });
 }
 
 export function buildV3BlockedCard(input: V3BlockedCardInput): string {
@@ -122,7 +142,26 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
       elements.push({ tag: 'hr' });
       elements.push({
         tag: 'div',
-        text: { tag: 'plain_text', content: '⏹️ 流程已修改，这个问题已作废；节点会按新的定义重新审批，届时请重新回答。' },
+        text: {
+          tag: 'plain_text',
+          content: '⏹️ 流程已修改，这个问题已作废，答案不会送达。点「按新定义重跑」后，节点会按新的定义重新走审批；' +
+            '不点不会自动开始。',
+        },
+      });
+      elements.push({
+        tag: 'action',
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '🔄 按新定义重跑（需重新审批）' },
+          type: 'primary',
+          value: {
+            action: V3_BLOCKED_RETRY_ACTION,
+            runId: input.runId,
+            nodeId: input.nodeId,
+            attemptId: input.attemptId,
+            nonce,
+          } satisfies V3BlockedActionValue,
+        }],
       });
     } else if (answered) {
       const answerPreview = answered.text ?? answered.selected ?? '';

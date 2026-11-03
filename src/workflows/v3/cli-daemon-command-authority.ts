@@ -417,7 +417,11 @@ export function workflowEventTurnVerifierFor(
     }
     // Generation join (same rule as human turns): if a human message has
     // advanced the session's turn pointers since the wake turn was issued,
-    // the session's identity now belongs to that newer turn.
+    // the session's identity now belongs to that newer turn. Deliberately
+    // strict: a record without `turnPointersAtIssue` is refused as soon as the
+    // session has a pointer, and a pointer moved by a synthetic turn (not a
+    // human) counts as advanced too — see V3MainWakeRecord for the issuer's
+    // contract and what PR 5b still has to decide.
     const advanced = (pointer: string | undefined, atIssue: string | undefined): boolean =>
       pointer !== undefined && pointer !== turnId && pointer !== atIssue;
     if (

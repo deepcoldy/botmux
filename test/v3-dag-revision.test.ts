@@ -246,25 +246,37 @@ describe('§13.4 node-state rules', () => {
     expect(revisitBudgetStatus(after, 'a', 'a').ok).toBe(false);
     const second = plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]);
     expect(second.ok).toBe(false);
-    const epoch = v3RevisitBudgetEpoch(after, 'a');
+    const epoch = v3RevisitBudgetEpoch(after, 'a', 'pair');
     expect(!second.ok && second.rerunBudget).toEqual({ nodeId: 'a', tier: 'pair', epoch });
     // Refused again while still exhausted: same exhaustion, same epoch.
     const third = plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]);
     expect(!third.ok && third.rerunBudget?.epoch).toBe(epoch);
     after.push(ev({ type: 'revisitBudgetGranted', sourceNodeId: 'a', toNodeId: 'a', by: 'ou_i' }));
-    expect(v3RevisitBudgetEpoch(after, 'a')).not.toBe(epoch);
+    expect(v3RevisitBudgetEpoch(after, 'a', 'pair')).not.toBe(epoch);
     expect(plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]).ok).toBe(true);
   });
 
-  it('a grant for one node does not move another node\'s budget epoch; a run-wide grant moves every node\'s', () => {
+  it('a grant moves only the epoch of the exhaustion it can lift', () => {
     const base = [...started()];
-    const a0 = v3RevisitBudgetEpoch(base, 'a');
-    const b0 = v3RevisitBudgetEpoch(base, 'b');
+    const epochs = (events: StoredEvent[]) => ({
+      aPair: v3RevisitBudgetEpoch(events, 'a', 'pair'),
+      bPair: v3RevisitBudgetEpoch(events, 'b', 'pair'),
+      aRun: v3RevisitBudgetEpoch(events, 'a', 'run'),
+      bRun: v3RevisitBudgetEpoch(events, 'b', 'run'),
+    });
+    const e0 = epochs(base);
+    // a's own pair grant: lifts a's pair tier only.
     const pairA = [...base, ev({ type: 'revisitBudgetGranted', sourceNodeId: 'a', toNodeId: 'a', by: 'ou_i' })];
-    expect(v3RevisitBudgetEpoch(pairA, 'a')).not.toBe(a0);
-    expect(v3RevisitBudgetEpoch(pairA, 'b')).toBe(b0);
+    const e1 = epochs(pairA);
+    expect(e1.aPair).not.toBe(e0.aPair);
+    expect([e1.bPair, e1.aRun, e1.bRun]).toEqual([e0.bPair, e0.aRun, e0.bRun]);
+    // A run-wide grant (e.g. clicked on b's card): lifts every node's run
+    // tier, never a node's own spent pair tier.
     const runWide = [...pairA, ev({ type: 'revisitBudgetGranted', by: 'ou_i' })];
-    expect(v3RevisitBudgetEpoch(runWide, 'b')).not.toBe(b0);
+    const e2 = epochs(runWide);
+    expect(e2.aRun).not.toBe(e1.aRun);
+    expect(e2.bRun).not.toBe(e1.bRun);
+    expect([e2.aPair, e2.bPair]).toEqual([e1.aPair, e1.bPair]);
   });
 
   it('skipped / cancelled nodes cannot change and their ids cannot be reused', () => {

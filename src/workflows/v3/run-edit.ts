@@ -22,7 +22,6 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -34,6 +33,7 @@ import { isGoalNode, isHostNode, isLoopNode, type V3Dag } from './dag.js';
 import type { BotSnapshot } from './contract.js';
 import {
   foldV3Revisions,
+  appendMissingV3RevisionFollowUps,
   loadEffectiveV3Dag,
   parseV3DagPatch,
   planV3DagRevision,
@@ -815,6 +815,10 @@ export interface V3RevisionRecovery {
   voided: V3VoidedProposal[];
   /** A decision was healed into the journal → drive the run. */
   resume: boolean;
+  /** The run owes a revision's lost follow-ups, but its effective flow could
+   *  not be loaded, so they were left alone (the caller logs this; proposals
+   *  were still reconciled). */
+  followUpError?: string;
 }
 
 /**
@@ -834,11 +838,9 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
       if (!existsSync(journalPath)) continue;
       let events = readJournal(journalPath);
       const hasProposals = events.some((event) => event.type === 'dagRevisionProposed');
-      if (!hasProposals && missingV3RevisionFollowUps(events).length === 0) continue;
+      const mayOweFollowUps = missingV3RevisionFollowUps(events).length > 0;
+      if (!hasProposals && !mayOweFollowUps) continue;
       const run = loadEditableRun(baseDir, runId);
-      const liveNodeIds = new Set(loadEffectiveV3Dag(runDir, run.approvedDag, events).dag.nodes.map((node) => node.id));
-      const owesFollowUps = missingV3RevisionFollowUps(events, liveNodeIds).length > 0;
-      if (!hasProposals && !owesFollowUps) continue;
       if (ownerLarkAppId && run.binding?.larkAppId !== ownerLarkAppId) continue;
       const rec: V3RevisionRecovery = {
         runId,
@@ -848,15 +850,22 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
         voided: [],
         resume: false,
       };
-      if (owesFollowUps) {
+      if (mayOweFollowUps) {
         // A revision's reassign / re-run lost its dedicated event to a crash:
-        // finish it so the run resumes instead of re-announcing a block.
-        const appended = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
-          const missing = missingV3RevisionFollowUps(latest, liveNodeIds);
-          for (const event of missing) append(event, { durable: true });
-          return missing.length;
-        });
-        if (appended > 0) rec.resume = true;
+        // finish it so the run resumes instead of re-announcing a block. Only
+        // nodes of the effective flow are owed anything; if that flow cannot
+        // be loaded, leave the follow-ups alone (the drive fails closed on
+        // the same error) but still reconcile the proposals below.
+        try {
+          const effective = loadEffectiveV3Dag(runDir, run.approvedDag, events);
+          const result = appendMissingV3RevisionFollowUps(journalPath, {
+            revision: effective.revision,
+            liveNodeIds: new Set(effective.dag.nodes.map((node) => node.id)),
+          });
+          if (result.kind === 'stale' || result.count > 0) rec.resume = true;
+        } catch (err) {
+          rec.followUpError = err instanceof Error ? err.message : String(err);
+        }
         events = readJournal(journalPath);
       }
       const history = foldV3Revisions(events);
@@ -901,7 +910,7 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
           if (voided) rec.voided.push(voided);
         }
       }
-      if (rec.repost.length > 0 || rec.voided.length > 0 || rec.resume) out.push(rec);
+      if (rec.repost.length > 0 || rec.voided.length > 0 || rec.resume || rec.followUpError) out.push(rec);
     } catch {
       // One corrupt run must not stop the scan (same posture as gates).
       continue;
@@ -1125,35 +1134,75 @@ export function formatV3RunStatus(view: V3RunStatusView): string {
 
 // ─── Rerun budget grant (「追加重做额度」card) ─────────────────────────────
 
-/** One grant card per (node, exhaustion epoch): create-once marker. True when
- *  this call claimed the right to post (repeated refusals do not re-post). */
-export function claimV3RerunGrantCard(baseDir: string, runId: string, nodeId: string, epoch: number): boolean {
-  const dir = join(runDirFor(baseDir, runId), 'waits', 'rerun-grants');
-  ensurePrivateDir(join(runDirFor(baseDir, runId), 'waits'));
-  ensurePrivateDir(dir);
-  try {
-    writeFileSync(join(dir, `${nodeId}.${epoch}.json`), `${JSON.stringify({ nodeId, epoch, at: Date.now() })}\n`, { flag: 'wx', mode: 0o600 });
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
-    throw err;
-  }
+function rerunGrantCardMarkerPath(baseDir: string, runId: string, block: V3RerunBudgetBlock): string {
+  return join(runDirFor(baseDir, runId), 'waits', 'rerun-grants', `${block.nodeId}.${block.tier}.${block.epoch}.json`);
 }
 
-/** The card could not be posted: let the next refusal try again. */
-export function releaseV3RerunGrantCard(baseDir: string, runId: string, nodeId: string, epoch: number): void {
+/** Has a grant card for this exact exhaustion (node, tier, epoch) been posted? */
+export function v3RerunGrantCardPosted(baseDir: string, runId: string, block: V3RerunBudgetBlock): boolean {
+  return existsSync(rerunGrantCardMarkerPath(baseDir, runId, block));
+}
+
+/** In-process: grant cards being posted right now, by (run, node, tier, epoch). */
+const rerunGrantCardsInFlight = new Set<string>();
+
+/** Test isolation: forget in-flight posts (a daemon restart does the same). */
+export function resetV3RerunGrantCardsInFlight(): void {
+  rerunGrantCardsInFlight.clear();
+}
+
+export type V3RerunGrantCardPostOutcome = 'posted' | 'already' | 'failed';
+
+/**
+ * One grant card per exhaustion. The card is posted FIRST and the marker
+ * (with its message id) written after: a crash or a failed post leaves no
+ * marker, so the next refusal of the same exhaustion posts again. A crash
+ * between the post and the marker can at worst post a second card for the
+ * same epoch — harmless, granting is idempotent (`already-granted`).
+ * Concurrent refusals inside this process share one post (in-flight key).
+ */
+export async function postV3RerunGrantCardOnce(input: {
+  baseDir: string;
+  runId: string;
+  block: V3RerunBudgetBlock;
+  /** Posts the card; resolves to its message id. */
+  post: () => Promise<string | undefined>;
+}): Promise<V3RerunGrantCardPostOutcome> {
+  const { block } = input;
+  const key = `${input.runId}\u0000${block.nodeId}\u0000${block.tier}\u0000${block.epoch}`;
+  if (rerunGrantCardsInFlight.has(key) || v3RerunGrantCardPosted(input.baseDir, input.runId, block)) return 'already';
+  rerunGrantCardsInFlight.add(key);
   try {
-    rmSync(join(runDirFor(baseDir, runId), 'waits', 'rerun-grants', `${nodeId}.${epoch}.json`), { force: true });
-  } catch {
-    // best effort
+    let messageId: string | undefined;
+    try {
+      messageId = await input.post();
+    } catch {
+      return 'failed';
+    }
+    const runDir = runDirFor(input.baseDir, input.runId);
+    ensurePrivateDir(join(runDir, 'waits'));
+    ensurePrivateDir(join(runDir, 'waits', 'rerun-grants'));
+    try {
+      writeFileSync(
+        rerunGrantCardMarkerPath(input.baseDir, input.runId, block),
+        `${JSON.stringify({ ...block, ...(messageId ? { messageId } : {}), at: Date.now() })}\n`,
+        { flag: 'wx', mode: 0o600 },
+      );
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    return 'posted';
+  } finally {
+    rerunGrantCardsInFlight.delete(key);
   }
 }
 
 export type V3RerunBudgetGrantOutcome =
   | { kind: 'granted'; tier: 'pair' | 'run' }
   | { kind: 'already-granted' }
-  /** The card belongs to an earlier exhaustion; a newer card was posted. */
-  | { kind: 'expired' }
+  /** The card belongs to an exhaustion the budget has since moved past.
+   *  `newerCardPosted`: a card for the current exhaustion is already out. */
+  | { kind: 'expired'; newerCardPosted: boolean }
   | { kind: 'unauthorized' }
   | { kind: 'stale'; detail: string }
   | { kind: 'missing' };
@@ -1167,7 +1216,8 @@ export function grantV3RerunBudget(input: {
   baseDir: string;
   runId: string;
   nodeId: string;
-  /** Exhaustion epoch the card was posted for. */
+  /** Exhaustion the card was posted for: which budget tier, which epoch. */
+  tier: 'pair' | 'run';
   epoch: number;
   by: string;
 }): V3RerunBudgetGrantOutcome {
@@ -1183,7 +1233,12 @@ export function grantV3RerunBudget(input: {
     if (status !== 'running' && status !== 'blocked') return { kind: 'stale', detail: `run is ${status}` };
     const budget = revisitBudgetStatus([...events], input.nodeId, input.nodeId);
     if (budget.ok) return { kind: 'already-granted' };
-    if (v3RevisitBudgetEpoch(events, input.nodeId) !== input.epoch) return { kind: 'expired' };
+    const current: V3RerunBudgetBlock = {
+      nodeId: input.nodeId, tier: budget.tier, epoch: v3RevisitBudgetEpoch(events, input.nodeId, budget.tier),
+    };
+    if (current.tier !== input.tier || current.epoch !== input.epoch) {
+      return { kind: 'expired', newerCardPosted: v3RerunGrantCardPosted(input.baseDir, input.runId, current) };
+    }
     append({
       type: 'revisitBudgetGranted',
       ...(budget.tier === 'pair' ? { sourceNodeId: input.nodeId, toNodeId: input.nodeId } : {}),

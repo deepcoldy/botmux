@@ -53,6 +53,7 @@ import { planV3Revisit } from './revisit-plan.js';
 import {
   currentV3Revision,
   foldV3Revisions,
+  appendMissingV3RevisionFollowUps,
   loadEffectiveV3Dag,
   missingV3RevisionFollowUps,
   snapshotForSelector,
@@ -741,12 +742,9 @@ export async function runWorkflow(
   const reconcileRevisionFollowUps = (events: readonly StoredEvent[]): boolean => {
     const live = new Set(dag.nodes.map((node) => node.id));
     if (missingV3RevisionFollowUps(events, live).length === 0) return false;
-    return withJournalMutationSync(journalPath, ({ events: latest, append }) => {
-      if (!decisionStillCurrent(latest)) return true; // re-read the newer flow first
-      const missing = missingV3RevisionFollowUps(latest, live);
-      for (const event of missing) append(event, { durable: true });
-      return missing.length > 0;
-    });
+    const result = appendMissingV3RevisionFollowUps(journalPath, { revision: dagRevision, liveNodeIds: live });
+    // stale → a newer flow landed: re-read it before deciding again.
+    return result.kind === 'stale' || result.count > 0;
   };
 
   if (!opts.authorizedArtifacts) {

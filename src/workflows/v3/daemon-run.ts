@@ -81,7 +81,7 @@ import {
   type V3ErrorClass,
 } from './journal.js';
 import { materialize } from './state.js';
-import { loadEffectiveV3Dag } from './dag-revision.js';
+import { foldV3Revisions, loadEffectiveV3Dag, v3NodeHeldByProposal } from './dag-revision.js';
 import {
   reconcileV3RevisionProposals,
   type V3RevisionCardView,
@@ -745,12 +745,26 @@ export interface V3BlockedInfo {
   revisitTo?: string;
   /** No generic retry may mint a fresh idempotency key for this attempt. */
   retryForbidden?: 'host-effect-uncertain' | 'revise-workflow-required';
+  /** The ask is moot: a flow revision changed this node after its gate was
+   *  passed, so its next run is a fresh instance that must pass the gate again
+   *  (an answer would never reach it). The card offers the re-run instead. */
+  askVoided?: boolean;
 }
 
 /** Latest `nodeBlocked` details for a node (card content).  Falls back to a
  *  bare nodeId/attempt when the journal has no blocked event (shouldn't
  *  happen for a blocked run, but the card must still render). */
 export function blockedInfoFor(events: StoredEvent[], nodeId: string): V3BlockedInfo {
+  const found = lastBlockedInfoFor(events, nodeId);
+  if (found?.ask) {
+    const snap = materialize(events);
+    const instanceId = snap.nodes.get(nodeId)?.effectiveInstanceId;
+    if (instanceId && snap.regatePending?.has(instanceId)) return { ...found, askVoided: true };
+  }
+  return found ?? { nodeId, attemptId: latestAttemptIdFor(events, nodeId) ?? `${nodeId}/attempts/001` };
+}
+
+function lastBlockedInfoFor(events: StoredEvent[], nodeId: string): V3BlockedInfo | undefined {
   let found: V3BlockedInfo | undefined;
   for (const e of events) {
     if (e.type === 'nodeBlocked' && e.nodeId === nodeId) {
@@ -775,7 +789,7 @@ export function blockedInfoFor(events: StoredEvent[], nodeId: string): V3Blocked
       };
     }
   }
-  return found ?? { nodeId, attemptId: latestAttemptIdFor(events, nodeId) ?? `${nodeId}/attempts/001` };
+  return found;
 }
 
 /** What the daemon needs to render a revisit-budget grant card.  Derived from
@@ -1213,7 +1227,16 @@ export function requestV3RunCancel(
 export type V3RetryOutcome =
   | { kind: 'requested'; nodeId: string; previousAttemptId: string; nextAttemptId: string }
   | { kind: 'already-requested'; nodeId: string }
-  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' | 'host-effect-uncertain' | 'revise-workflow-required' | 'revised' };
+  | {
+    kind: 'stale-run';
+    reason:
+      | 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer'
+      | 'host-effect-uncertain' | 'revise-workflow-required'
+      /** The answer's instance was revised: it re-runs fresh through its gate. */
+      | 'revised'
+      /** A pending flow-revision proposal touches this node: decide it first. */
+      | 'revision-pending';
+  };
 
 type V3RetryAnswerInput =
   | { selected: string; by: string }
@@ -1333,6 +1356,16 @@ export function requestV3Retry(
   // of reporting an answer that is silently dropped.
   if (input.answer && instanceId && snap.regatePending?.has(instanceId)) {
     return { kind: 'stale-run', reason: 'revised' };
+  }
+  // A pending proposal touching this node would, once approved, re-run it as
+  // a fresh instance — the answer would be silently dropped. Keep the card
+  // answerable and ask for the proposal to be decided first.
+  if (input.answer) {
+    const pending = foldV3Revisions(events).pending;
+    const loopId = [...snap.loops.keys()].find((id) => nodeId.startsWith(`${id}.i`));
+    if (pending && v3NodeHeldByProposal(new Set(pending.touched), nodeId, loopId)) {
+      return { kind: 'stale-run', reason: 'revision-pending' };
+    }
   }
   let answer: { path: string; preview: string; by: string } | undefined;
   if (input.answer) {
@@ -1773,6 +1806,11 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
     // decision whose journal half was lost, void proposals of ended runs.
     try {
       for (const rec of reconcileV3RevisionProposals(baseDir, ownerLarkAppId)) {
+        if (rec.followUpError) {
+          deps.onError?.(rec.runId, new Error(
+            `cold attach: a flow revision's lost reassign / re-run was not finished — the effective flow failed to load: ${rec.followUpError}`,
+          ));
+        }
         if (rec.binding) {
           if (rec.voided.length > 0) {
             await deps.freezeRevisionCards?.(rec.binding, rec.runId, rec.voided).catch((err) => deps.onError?.(rec.runId, err));
