@@ -96,6 +96,14 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
   if (transport !== 'stdio') throw new Error(`invalid_plugin_mcp_transport:${name}`);
   const command = readCommand(record.command, `mcp_command_${name}`);
   const env = readEnv(record.env, `mcp_env_${name}`);
+  if (env?.BYTEDCLI_AI_AUTH_APP_KEY !== undefined) {
+    throw new Error(`reserved_plugin_mcp_env:BYTEDCLI_AI_AUTH_APP_KEY`);
+  }
+  const hostSecret = record.hostSecret;
+  if (hostSecret !== undefined
+    && (name !== 'mix' || hostSecret !== 'bytedcli-ai-auth-app-key')) {
+    throw new Error(`invalid_plugin_mcp_host_secret:${name}`);
+  }
   const templated = [...command, ...Object.values(env ?? {})].find(value => /\$\{[^}]+\}/.test(value));
   if (templated) throw new Error(`unsupported_plugin_mcp_runtime_template:${name}`);
   for (const part of command) {
@@ -103,7 +111,13 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
     const target = resolvePluginPath(runtimeDir, part, `mcp_command_${name}`);
     if (!existsSync(target)) throw new Error(`plugin_mcp_command_path_not_found:${name}:${part}`);
   }
-  return { name, transport, command, ...(env ? { env } : {}) };
+  return {
+    name,
+    transport,
+    command,
+    ...(env ? { env } : {}),
+    ...(hostSecret ? { hostSecret } : {}),
+  };
 }
 
 function readCliCommands(raw: unknown): PluginCliCommandIndexEntry[] {

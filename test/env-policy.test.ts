@@ -15,6 +15,16 @@ const host = { HOME: '/test/home', PATH: '/usr/bin', LANG: 'C.UTF-8',
 };
 
 describe('per-bot environment policy', () => {
+  it('never places the MIX App Key or rollout switch in any generic worker environment', () => {
+    const worker = buildBotWorkerEnv({
+      BYTEDCLI_AI_AUTH_APP_KEY: 'host-secret',
+      BOTMUX_MIX_ACTOR_WRITE_ENABLED: '1',
+      KEEP: 'visible',
+    });
+    expect(worker.BYTEDCLI_AI_AUTH_APP_KEY).toBeUndefined();
+    expect(worker.BOTMUX_MIX_ACTOR_WRITE_ENABLED).toBeUndefined();
+    expect(worker.KEEP).toBe('visible');
+  });
   it('defaults to historical inheritance plus mandatory redaction', () => {
     const env = buildSessionChildEnv(host);
     expect(env.UNLISTED_CLOUD_CREDENTIAL === host.UNLISTED_CLOUD_CREDENTIAL).toBe(true);

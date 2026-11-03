@@ -74,6 +74,12 @@ import type {
   LinkRefExtractionStats,
   LinkRefMode,
 } from '../../../services/link-ref-types.js';
+import {
+  MIX_BROKER_APP_KEY_ENV,
+  MIX_BROKER_CHILD_SECRET_FD,
+  MIX_BROKER_SECRET_FD_ENV,
+} from '../../mix-broker-security.js';
+import { ProtectedStdioClientTransport } from './protected-stdio-transport.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -340,6 +346,7 @@ export class PluginMcpGateway {
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
   private readonly linkRefRegistration?: GatewayLinkRefRegistrationHandler;
+  private readonly hostSecretFd?: number;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -359,12 +366,14 @@ export class PluginMcpGateway {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
       linkRefRegistration?: GatewayLinkRefRegistrationHandler;
+      hostSecretFd?: number;
     } = {},
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
     this.linkRefRegistration = opts.linkRefRegistration;
+    this.hostSecretFd = opts.hostSecretFd;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -437,20 +446,33 @@ export class PluginMcpGateway {
     try {
       if (descriptor.server.transport === 'stdio') {
         const resolved = resolveStdioCommand(descriptor);
-        transport = new StdioClientTransport({
+        const downstreamEnv: Record<string, string> = {
+          ...getDefaultEnvironment(),
+          ...descriptor.server.env,
+          BOTMUX_PLUGIN_ID: descriptor.pluginId,
+          BOTMUX_PLUGIN_DIR: descriptor.pluginDir,
+          BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
+          ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
+        };
+        delete downstreamEnv[MIX_BROKER_APP_KEY_ENV];
+        const parameters = {
           command: resolved.command,
           args: resolved.args,
           cwd: descriptor.pluginDir,
-          env: {
-            ...getDefaultEnvironment(),
-            ...descriptor.server.env,
-            BOTMUX_PLUGIN_ID: descriptor.pluginId,
-            BOTMUX_PLUGIN_DIR: descriptor.pluginDir,
-            BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
-            ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
-          },
+          env: downstreamEnv,
           stderr: 'inherit',
-        });
+        } as const;
+        transport = descriptor.server.hostSecret === 'bytedcli-ai-auth-app-key'
+          && this.hostSecretFd !== undefined
+          ? new ProtectedStdioClientTransport({
+              ...parameters,
+              env: {
+                ...parameters.env,
+                [MIX_BROKER_SECRET_FD_ENV]: String(MIX_BROKER_CHILD_SECRET_FD),
+              },
+              inheritedSecretFd: this.hostSecretFd,
+            })
+          : new StdioClientTransport(parameters);
       } else {
         const staticHeaders = descriptor.server.headers;
         transport = new StreamableHTTPClientTransport(new URL(descriptor.server.url), {
@@ -588,6 +610,7 @@ export class PluginMcpGateway {
       // it, an unrelated HTTP-transport server does not.
       ...(caller?.senderType ? { senderType: caller.senderType } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
+      ...(this.env.BOTMUX_SESSION_ID ? { sessionId: this.env.BOTMUX_SESSION_ID } : {}),
       ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
       ...(hostCapabilities.length > 0 ? { hostCapabilities } : {}),
     };

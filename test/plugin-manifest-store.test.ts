@@ -217,6 +217,32 @@ describe('plugin manifest and registry basics', () => {
     )).toThrow(/unsupported_plugin_mcp_runtime_template/);
   });
 
+  it('reserves the protected App Key channel for the MIX plugin only', () => {
+    const makeSource = (name: string, descriptor: Record<string, unknown>) => {
+      const root = join(home, name);
+      mkdirSync(join(root, 'mcp'), { recursive: true });
+      writeFileSync(join(root, 'mcp', 'server.js'), 'process.stdin.resume();\n');
+      writeFileSync(join(root, 'mcp', 'index.json'), JSON.stringify({
+        command: ['node', './mcp/server.js'],
+        ...descriptor,
+      }));
+      return root;
+    };
+
+    expect(scanPluginContributions(
+      makeSource('mix-protected-secret', { hostSecret: 'bytedcli-ai-auth-app-key' }),
+      { schemaVersion: 1, id: 'mix' },
+    ).mcp).toMatchObject({ hostSecret: 'bytedcli-ai-auth-app-key' });
+    expect(() => scanPluginContributions(
+      makeSource('other-protected-secret', { hostSecret: 'bytedcli-ai-auth-app-key' }),
+      { schemaVersion: 1, id: 'other' },
+    )).toThrow(/invalid_plugin_mcp_host_secret/);
+    expect(() => scanPluginContributions(
+      makeSource('generic-app-key-env', { env: { BYTEDCLI_AI_AUTH_APP_KEY: 'forbidden' } }),
+      { schemaVersion: 1, id: 'mix' },
+    )).toThrow(/reserved_plugin_mcp_env:BYTEDCLI_AI_AUTH_APP_KEY/);
+  });
+
   it('scans Lark slash command declarations and rejects reserved names', () => {
     const makeSource = (name: string, commands: unknown[]) => {
       const root = join(home, name);

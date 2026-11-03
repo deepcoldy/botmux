@@ -83,6 +83,7 @@ export async function startSessionMcpGatewayHost(opts: {
   trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
   linkRefRegistration?: GatewayLinkRefRegistrationHandler;
+  hostSecretFd?: number;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -117,6 +118,7 @@ export async function startSessionMcpGatewayHost(opts: {
         trustedTurnIdentity: opts.trustedTurnIdentity,
         trustedResultDelivery: opts.trustedResultDelivery,
         linkRefRegistration: opts.linkRefRegistration,
+        hostSecretFd: opts.hostSecretFd,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

@@ -95,6 +95,8 @@ const RESERVED_ENV_KEYS = new Set<string>([
   'CJADK_INTERACTIVE',
   'MIX_AUTH_TOKEN',
   'BYTEDCLI_AI_AUTH_APP_KEY',
+  'BOTMUX_MIX_ACTOR_WRITE_ENABLED',
+  'BOTMUX_MIX_BROKER_SECRET_FD',
 ]);
 
 /** Whether `key` is botmux-controlled and therefore rejected from per-bot env. */

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -184,7 +184,12 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
-  function installFixturePlugin(pluginId: string, fixtureName: string, env?: Record<string, string>) {
+  function installFixturePlugin(
+    pluginId: string,
+    fixtureName: string,
+    env?: Record<string, string>,
+    hostSecret?: 'bytedcli-ai-auth-app-key',
+  ) {
     const source = join(home, `${pluginId}-src`);
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
     writeFileSync(join(source, 'package.json'), JSON.stringify({
@@ -198,6 +203,7 @@ describe('plugin MCP Gateway', () => {
       transport: 'stdio',
       command: [process.execPath, fixture, fixtureName],
       ...(env ? { env } : {}),
+      ...(hostSecret ? { hostSecret } : {}),
     }));
     installLocalPlugin(source);
   }
@@ -326,6 +332,34 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
+  it('delivers the MIX App Key only through an inherited broker fd', async () => {
+    installFixturePlugin('mix', 'secret-fd', undefined, 'bytedcli-ai-auth-app-key');
+    const secretPath = join(home, 'mix-app-key');
+    writeFileSync(secretPath, 'fd-only-secret');
+    const secretFd = openSync(secretPath, 'r');
+    const gateway = new PluginMcpGateway(
+      ['mix'],
+      {
+        ...process.env,
+        BYTEDCLI_AI_AUTH_APP_KEY: 'generic-env-must-be-removed',
+      },
+      { hostSecretFd: secretFd },
+    );
+    const client = new Client({ name: 'gateway-secret-fd-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const result = await client.callTool({ name: 'echo', arguments: {} });
+      expect((result.content[0] as { text: string }).text).toContain(
+        'secretFd=true:secretEnv=false:secretArgv=false',
+      );
+    } finally {
+      await client.close();
+      await gateway.close();
+      closeSync(secretFd);
+    }
+  });
+
   it('injects host-owned per-turn trusted caller metadata and overrides caller supplied metadata', async () => {
     installFixturePlugin('plugin-a', 'alpha');
     const gateway = new PluginMcpGateway(
@@ -375,6 +409,7 @@ describe('plugin MCP Gateway', () => {
     expect(text).toContain('"turnId":"om_turn"');
     expect(text).toContain('"dispatchAttempt":2');
     expect(text).toContain('"actorWriteAllowed":true');
+    expect(text).toContain('"sessionId":"session-trusted"');
     expect(text).toContain('"customTrace":"keep-me"');
     expect(text).not.toContain('ou_forged');
     expect(text).not.toContain('on_forged');

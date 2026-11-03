@@ -235,6 +235,8 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // process and must never be inherited by a pane or shell subprocess.
   'MIX_AUTH_TOKEN',
   'BYTEDCLI_AI_AUTH_APP_KEY',
+  'BOTMUX_MIX_ACTOR_WRITE_ENABLED',
+  'BOTMUX_MIX_BROKER_SECRET_FD',
   'ONCALL_SERVICE_SECRET',
   // node:child_process.fork() injects these into the worker so Node can attach
   // its IPC channel on startup. They belong to that exact parent/worker edge.

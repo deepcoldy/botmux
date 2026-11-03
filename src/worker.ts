@@ -3,7 +3,11 @@ import { deploymentContinuationTemplate } from './services/deployment-continuati
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
-import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError, privateBrokerContainmentEnabled } from './core/sandbox-network-policy.js';
+import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
+import {
+  actorWriteCapabilityEnabled,
+  inheritedMixBrokerSecretFd,
+} from './core/mix-broker-security.js';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
@@ -2333,6 +2337,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
     linkRefRegistration: registerMcpLinkRefsThroughHost,
+    hostSecretFd: inheritedMixBrokerSecretFd(),
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -24438,8 +24443,17 @@ async function spawnCli(
       if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
-      localActorWriteContainmentActive = !!sessionMcpGatewayHost
-        && privateBrokerContainmentEnabled(cfg.sandboxNetworkPolicy);
+      localActorWriteContainmentActive = actorWriteCapabilityEnabled({
+        platform: process.platform,
+        mixPluginEnabled: inheritedMixBrokerSecretFd() !== undefined,
+        inheritedSecretFd: inheritedMixBrokerSecretFd(),
+        sandboxEngaged: true,
+        mcpSocketMounted: !!sessionMcpGatewayHost?.socketPath,
+        pidNamespaceRetained: !coreOnlyPidNamespaceDegrade({
+          credentialBearingMcp: !!sessionMcpGatewayHost?.socketPath,
+        }),
+        networkPolicy: cfg.sandboxNetworkPolicy,
+      });
       // session-id is FORCED here so a relayed send can't target another session.
       sandboxStopWatcher = startOutboxWatcher(
         sbx.outbox,

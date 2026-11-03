@@ -242,6 +242,12 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 
 > ZMX 无法执行文件沙盒或实际生效的读隔离，开启这些边界的配置组合会 fail closed，详见 [ZMX 后端边界](/zmx#不支持的组合)。
 
+### MIX actor write 灰度门禁
+
+MIX 插件的 shared read 不依赖写入灰度。actor write 默认关闭；只有 daemon 启动环境同时设置 `BOTMUX_MIX_ACTOR_WRITE_ENABLED=1` 和非空 `BYTEDCLI_AI_AUTH_APP_KEY` 时，才会为启用 `mix` 插件的会话建立 daemon 持有的专用密钥管道。App Key 不进入 worker、Mojo、per-bot 环境、插件通用环境或 argv。
+
+即使门禁开启，`actorWriteAllowed` 仍只会在 Linux、本地 PTY、`sandbox: "oncall"`、MCP Unix socket 已挂载、PID namespace 未降级，并且 `sandboxNetworkPolicy.private.mode` 为 `block` 且未使用 `trusted-egress` 时置为 true。任一条件不满足时会话保持只读；不得以关闭沙盒、放宽网络策略或代理出口换取写能力。该门禁只能在 PPE 完成双用户身份、`employeeId` / `updateUid` 归属和无权限不改状态验证后开启。
+
 ## 卡片与终端
 
 | 字段 | 说明 |

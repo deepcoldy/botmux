@@ -237,6 +237,12 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `sandboxNetwork` | Network policy. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` to block normal network egress |
 | `sandboxNetworkPolicy` | Granular destination IP policy object (Linux + PTY). Configures independent `public` and `private` IP filtering rules (`allow / block / allowlist / denylist`) and trusted proxy egress |
 
+### MIX actor-write rollout gate
+
+MIX shared reads do not depend on the write rollout. Actor writes are off by default. The daemon creates the dedicated App Key pipe only when its startup environment contains both `BOTMUX_MIX_ACTOR_WRITE_ENABLED=1` and a non-empty `BYTEDCLI_AI_AUTH_APP_KEY`, and only for sessions enabling the `mix` plugin. The App Key is excluded from workers, Mojo, per-bot and generic plugin environments, and argv.
+
+Even with the gate enabled, `actorWriteAllowed` requires Linux, a new local PTY, `sandbox: "oncall"`, the mounted MCP Unix socket, a retained PID namespace, and a network policy with `private.mode: "block"` and no `trusted-egress`. Otherwise the session remains read-only. Enable the gate only after PPE validates two distinct users, `employeeId` / `updateUid` attribution, and denial without state change.
+
 > ZMX cannot enforce the file sandbox or effective read isolation, so configurations that enable those boundaries fail closed; see [ZMX backend boundaries](/en/zmx#unsupported-combinations).
 
 ## Cards and terminal
