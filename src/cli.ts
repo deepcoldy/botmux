@@ -8564,7 +8564,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     const rawSchedule = trustedRemoteRunnerRelay ? structuredSchedule : positionalSchedule;
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL] [--until-done [--deadline TIME] [--retry-every DURATION]] [--notify failing,expired]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--run-as OPEN_ID|EMAIL] [--silent] [--model ID] [--reasoning-effort LEVEL] [--until-done [--deadline TIME] [--retry-every DURATION]] [--notify failing,expired]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -8579,6 +8579,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     if (!trustedRemoteRunnerRelay) {
       try { cur = await detectAuthenticatedCurrentSession() ?? cur; }
       catch (error) { creatorAuthError = error; }
+    }
+    if (rest.includes('--run-as') && (cur || !argValue(rest, '--run-as'))) {
+      console.error(cur
+        ? '--run-as 只能在宿主终端使用；会话内创建的任务以当前发起人身份运行。'
+        : '--run-as 需要本 bot 应用下的 open_id（ou_ 开头）或飞书邮箱。');
+      process.exit(1);
     }
     const explicitTaskId = argValue(rest, '--id');
     if (rest.includes('--id') && !explicitTaskId) {
@@ -8784,6 +8790,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       }
       if (!cur && larkAppId) {
         const hostTaskId = explicitTaskId ?? randomBytes(4).toString('hex');
+        const runAs = argValue(rest, '--run-as');
         const response = await postCurrentSessionDaemonRoute({
           path: SCHEDULE_DELEGATED_ADD_ROUTE,
           sessionId: '',
@@ -8798,6 +8805,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             calendarDayType: normalizedDayType,
             ...(wantsFollowActive ? { followActive: true } : {}),
             ...(topicTitle ? { topicTitle } : {}),
+            ...(runAs ? { runAs } : {}),
             ...untilDoneFields,
           } },
         });
