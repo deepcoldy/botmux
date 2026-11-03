@@ -64,13 +64,13 @@ Once a run has started its flow can still change: add or remove nodes, change a 
   - Using a bot this run has not approved also takes effect directly, and the bot becomes part of the run's approved bots — the blocked card's reassign picker offers it from then on.
   - Removing or relaxing a human approval, raising a loop's maximum rounds, a longer timeout, or more than twice as many nodes as were originally approved all take effect directly.
 - A change asked for by **anyone else** in the chat always becomes a "flow change" card for the initiator to approve or reject; nothing changes until then.
-- A change the **main bot decides on by itself** from how the run is going needs the initiator's confirmation if it does any of these, and takes effect directly otherwise:
+- A change the **main bot decides on by itself** from how the run is going (including in a turn a scheduled task started) needs the initiator's confirmation if it does any of these, and takes effect directly otherwise:
   - uses a bot this run has not approved (in a new node or a reassignment) — once approved, the bot is part of the run's approved bots too;
   - adds or changes a node with an external action;
   - removes or relaxes a human approval: removing it, changing its options, or changing who may approve (adding one needs no confirmation);
   - raises a budget: a loop's maximum rounds, a timeout longer than the node had, or more than twice as many nodes as were originally approved.
 
-Whether a change is "the initiator's" depends on who sent the message that started that turn: an initiator chiming in while the main bot is busy counts as the initiator. The card lists the nodes added, removed and changed, the new bots, and why it needs confirmation. While it waits, the nodes it touches are not dispatched and everything else keeps running; questions on those nodes cannot be answered and their blocked cards cannot reassign until the card is decided.
+Whether a change is "the initiator's" depends on who sent the message that started that turn. A turn the main bot started by itself, for a run event or a scheduled task, stays the main bot's decision even if the initiator chimes in meanwhile (the bot may not have read that message yet); anyone else chiming in makes it that person's change. The card lists the nodes added, removed and changed, the new bots, and why it needs confirmation. While it waits, the nodes it touches are not dispatched and everything else keeps running; questions on those nodes cannot be answered and their blocked cards cannot reassign until the card is decided. If another change takes effect directly in the meantime: when both involve the same nodes, the waiting card is voided; when they are unrelated, the waiting change moves on to a new version and keeps waiting — its card updates in place, and tapping the old card still counts.
 
 **What happens to a node that is running or waiting for approval**
 
@@ -84,7 +84,7 @@ Whether a change is "the initiator's" depends on who sent the message that start
 
 A finished node cannot be removed or redefined (downstream nodes may already use its products); it can only be redone, or get new nodes after it. Redoing it also re-runs the downstream nodes that used its old products, and spends revisit budget (shared with automatic rework: by default once per node, 8 times per run). When the budget is spent:
 
-- A redo the initiator asks for adds one more by itself and takes effect, recorded as added by the initiator — no card to tap.
+- A redo the initiator asks for adds what it needs by itself and takes effect (one more per node redone), recorded as added by the initiator — no card to tap.
 - Otherwise (a redo the main bot decided on, or a change that still waits for confirmation) a "more redo budget" card appears in the main topic: once the initiator taps "➕ Add 1", have the main bot submit the change again. One card is posted per exhaustion; when the budget runs out again a new card is posted, and the old one says it has expired.
 
 **Seeing the version**
