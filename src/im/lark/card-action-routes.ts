@@ -262,6 +262,9 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   // 普通回复卡右下角操作菜单（#1877）：展开菜单与模型选择注入都必须过 canOperate。
   ['reply_card_menu', NO_META],
   ['reply_model_pick', NO_META],
+  ['session_model_pick', NO_META],
+  ['session_effort_pick', NO_META],
+  ['session_effort_apply', NO_META],
 ]);
 
 /** 该 action 是否过 canOperate 门；非字符串 / 未登记一律 undefined。 */

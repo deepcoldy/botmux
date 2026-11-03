@@ -181,6 +181,14 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
     body: RAW,
     decodeAppId: 'on-path-match',
   },
+  {
+    method: 'GET', path: botPath('session-group-naming-config'),
+    upstream: '/api/session-group-naming-config', body: { kind: 'none' },
+  },
+  {
+    method: 'PUT', path: botPath('session-group-naming-config'),
+    upstream: '/api/session-group-naming-config', body: RAW,
+  },
   // p2p-mode：`{ p2pMode: 'chat'|'thread'|'group' }`（其余值清回扁平连续 chat 默认）。
   putBotConfig('p2p-mode'),
   // envelope-injection：`{ envelopeInjection: 'auto'|'off'|'' }`（#794：hook 注入 per-turn 上下文）。

@@ -49,6 +49,8 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/substitute-mode', '/api/bot-substitute-mode', 'raw'],
   ['POST', '/api/bots/cli_a/substitute-targets/resolve', '/api/bot-substitute-targets/resolve', 'raw'],
   ['PUT', '/api/bots/cli_a/summary-range', '/api/bot-summary-range', 'raw'],
+  ['GET', '/api/bots/cli_a/session-group-naming-config', '/api/session-group-naming-config', 'none'],
+  ['PUT', '/api/bots/cli_a/session-group-naming-config', '/api/session-group-naming-config', 'raw'],
   ['GET', '/api/bots/cli_a/session-group-tag-status', '/api/session-group-tag-status', 'none'],
   ['POST', '/api/bots/cli_a/session-group-tag-auth', '/api/session-group-tag-auth', 'raw'],
   ['PUT', '/api/bots/cli_a/session-group-tag-config', '/api/session-group-tag-config', 'raw'],

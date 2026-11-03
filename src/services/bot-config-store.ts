@@ -1,3 +1,4 @@
+import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
@@ -422,28 +423,40 @@ export async function applyBotSessionEnvOps(
  * 调用方负责按 kind 校验后再传值；本函数只负责落盘 + 同步内存。
  * 不处理 allowedUsers（异步，见 {@link setBotAllowedUsers}）。
  */
+/** Optional picker snapshot, checked inside the same file lock as the write. */
+export interface ConfigSelectionPrecondition {
+  selectionKey: string;
+  /** null means the CLI default model; omitted means no model condition. */
+  model?: string | null;
+  requireLaunchModelSupport?: boolean;
+  actorOpenId?: string;
+}
+
 export async function applyConfigField(
   larkAppId: string,
   spec: ConfigFieldSpec,
   value: unknown,
+  precondition?: ConfigSelectionPrecondition,
 ): Promise<ApplyFieldResult> {
   if (spec.configKey === 'pinStreamingCard') {
     return serializePinStreamingCardConfigChange(
       larkAppId,
-      () => applyConfigFieldInternal(larkAppId, spec, value),
+      () => applyConfigFieldInternal(larkAppId, spec, value, precondition),
     );
   }
-  return applyConfigFieldInternal(larkAppId, spec, value);
+  return applyConfigFieldInternal(larkAppId, spec, value, precondition);
 }
 
 async function applyConfigFieldInternal(
   larkAppId: string,
   spec: ConfigFieldSpec,
   value: unknown,
+  precondition?: ConfigSelectionPrecondition,
 ): Promise<ApplyFieldResult> {
   if (spec.kind === 'allowedUsers') return { ok: false, reason: 'use_setBotAllowedUsers' };
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const expectedAllowedUsers = precondition?.actorOpenId ? JSON.stringify(bot.config.allowedUsers ?? []) : undefined;
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
   }
@@ -523,6 +536,21 @@ async function applyConfigFieldInternal(
     const currentModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
       : undefined;
+    if (precondition) {
+      if (precondition.actorOpenId && (!bot.resolvedAllowedUsers.length
+        || !bot.resolvedAllowedUsers.includes(precondition.actorOpenId)
+        || JSON.stringify(entry.allowedUsers ?? []) !== expectedAllowedUsers)) {
+        return { write: false, result: 'config_selection_changed' };
+      }
+      const currentSelectionKey = selectionKeyForBot(currentCliId,
+        typeof entry.wrapperCli === 'string' ? entry.wrapperCli : undefined,
+        entry.cliLaunchMode as BotConfig['cliLaunchMode']);
+      if (currentSelectionKey !== precondition.selectionKey
+        || (Object.hasOwn(precondition, 'model') && (currentModel ?? null) !== precondition.model)
+        || (precondition.requireLaunchModelSupport && !botAcceptsLaunchModel({ cliId: currentCliId as BotConfig['cliId'], backendType: entry.backendType }))) {
+        return { write: false, result: 'config_selection_changed' };
+      }
+    }
     const zeroPrompt = spec.configKey === 'promptInjection'
       ? effective === 'none'
       : entry.promptInjection === 'none';

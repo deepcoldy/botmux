@@ -44,6 +44,7 @@ function harness(
     backend,
     effectiveBackendType: backendType,
     isRemoteBackendType: () => false,
+    nativeSessionForkPending: () => false,
     cliLifetimeNonce: 1,
     codexCliEffortOperation: undefined,
     currentBotmuxTurnId: 'om_turn',

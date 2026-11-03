@@ -43,6 +43,32 @@ If you'd rather not use commands, the **Groups** panel in `botmux dashboard` can
 ![Create Group in Dashboard](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033300986_dash-newgroup.png)
 <p class="cap">"New Group": fill in the group name, bind a directory, and check the bots to pull into the group</p>
 
+## Automatic names for DM-created session groups
+
+Choose and save a mode under Dashboard **Bot config → Sessions → Private chat / dedicated group → Dedicated group naming**. Settings apply per Bot; **AI summary** remains the default.
+
+| Option | Behavior |
+| --- | --- |
+| AI summary (`ai-summary`, default) | Create a placeholder, then independently generate a short title. |
+| Reuse Agent session title (`session-title`, new) | Use the title published by the current resident Agent without another model call. Keep the placeholder until ready. |
+| Truncate first message (`truncate`) | Keep the truncated first-message group name. |
+
+Codex AI summaries now use the isolated app-server title generator instead of `codex exec`: low reasoning, a temporary `CODEX_HOME` containing the copied login credentials plus only the provider wiring from the source `config.toml` (`model` / `model_provider` / `model_providers`), and disabled hooks, plugins, MCP, tools and project instructions. Copying only the credentials would drop a gateway Bot's provider (`base_url` / `env_key` / inline `http_headers`) and silently fall back to Codex's built-in `openai` provider — either failing outright (placeholder kept) or billing the host account on the default endpoint. Every other user setting (hooks, plugins, MCP servers, `projects`/trust, `profiles`, features) is still excluded. If the source `config.toml` exists but cannot be read safely (symlink, hard link, oversized, changed mid-read) or does not parse, no title is generated at all rather than falling back to a provider the Bot never configured. Enter an available lightweight model ID in **Summary model (Codex)**, or leave it blank to inherit the Bot model. The override only applies to dedicated-group AI summaries; it does not change conversation or native-session-title models. Other CLIs retain their existing summary path. The shared generator also serves Codex `/g` summaries, which retain the Bot model and their existing launch eligibility gates.
+
+Equivalent per-Bot `bots.json` configuration:
+
+```json
+{
+  "sessionGroup": {
+    "naming": { "mode": "session-title", "maxLen": 12 }
+  }
+}
+```
+
+For a separate summary model, use `"naming": { "mode": "ai-summary", "model": "your-available-lightweight-model-id" }`.
+
+Reuse accepts Codex native semantic titles or titles published through Botmux session rename (including Agent renames and renames initiated by the user from the Dashboard or inside a session); it does not scan every CLI's private title store. The `[BotMux·Lark]` prefix is removed before applying length limits and `sessionGroup.namePrefix`. Naming stops after the first success. Ordinary groups and subtopics are unaffected. Manual group names are protected; legacy entries without a trusted birth name remain unchanged. Failed renames retain the candidate for bounded retries on later group messages.
+
 ## DM-created session groups: change the tag on close
 
 With `p2pMode: "group"`, set **Tag after closing** under Dashboard **Bot configuration → Sessions → Session mode → DM dedicated group → Session-group tag**, for example “Closed”. Leave it empty to retain the current behavior. The equivalent per-bot `bots.json` configuration is:

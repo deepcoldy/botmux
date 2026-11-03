@@ -1392,12 +1392,15 @@ export interface SessionGroupConfig {
   naming?: {
     /**
      * 'ai-summary' (default): create with a truncated placeholder name, then
-     * asynchronously ask the bot's own CLI (one-shot headless call) for a
-     * short title and rename the chat when it lands. Falls back to the
+     * asynchronously generate a short title through the configured CLI. Codex
+     * uses an isolated, low-effort title call. Falls back to the
      * placeholder on failure/timeout.
+     * 'session-title': reuse the resident Agent's published session title; no extra model call.
      * 'truncate': placeholder only — zero cost, zero delay.
      */
-    mode?: 'ai-summary' | 'truncate';
+    mode?: 'ai-summary' | 'session-title' | 'truncate';
+    /** Optional model for Codex AI-summary calls; absent inherits the bot model. */
+    model?: string;
     /** Max title length in characters for the AI summary (12). */
     maxLen?: number;
   };

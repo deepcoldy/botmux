@@ -10,7 +10,9 @@ const parsed = ts.createSourceFile('worker.ts', readFileSync(new URL('../src/wor
 function evaluate<T>(name: string, state: Record<string, any>): T {
   const declaration = parsed.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
   if (!declaration) throw new Error(`Missing worker function: ${name}`);
-  const code = ts.transpileModule(declaration.getText(parsed), {
+  const forkGate = parsed.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'nativeSessionForkPending');
+  if (!forkGate) throw new Error('Missing native fork input gate');
+  const code = ts.transpileModule(`${forkGate.getText(parsed)}\n${declaration.getText(parsed)}`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText;
   return new Function('state', `with (state) { ${code}; return ${name}; }`)(state) as T;
@@ -39,6 +41,7 @@ describe('Codex effort menu input ownership', () => {
 
   it('fences an in-place CLI restart even when the backend object stays the same', async () => {
     const state: Record<string, any> = {
+      lastInitConfig: null,
       backend: {}, cliAdapter: {}, cliLifetimeNonce: 1, codexCliEffortOperation: {},
       cancelCodexCliEffort: async () => { state.cliLifetimeNonce++; },
     };

@@ -514,6 +514,8 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
+  topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
   messageListenerAutoClose?: boolean;
@@ -2067,7 +2069,7 @@ type DaemonToWorkerBase =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
+  | { type: 'restart'; topicEffort?: import('./utils/traex-session-effort.js').TraexTopicEffortRestart; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string; mojoLivePatch?: MojoLivePatch; model?: string | null; larkToolBinding?: boolean | null; codexRpcInput?: boolean;
       traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig | null }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
@@ -2389,6 +2391,8 @@ export type WorkerToDaemon =
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
       type: 'restart_result';
+      untouched?: true;
+      topicEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort; variant: 'standard' | 'max' };
       attemptId: string;
       status: 'succeeded' | 'failed' | 'timed_out';
       category: 'prompt_ready' | 'spawn_failed' | 'runner_exited' | 'readiness_timeout';
@@ -2449,7 +2453,7 @@ export type WorkerToDaemon =
          *  working→idle edge PATCH may have been lost, and nothing else would
          *  ever correct a card still claiming the unsubmitted turn runs. */
         | 'input_not_submitted' }
-  | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' }
+  | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' | 'fork_pending' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
    * botmux/Lark reply route. This must never enter the attention path. */

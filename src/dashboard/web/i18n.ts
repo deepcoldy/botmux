@@ -5,6 +5,17 @@ type DashboardMessages = Record<string, string>;
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
 const zh = {
+  "botDefaults.sgNaming": "专属群命名方式",
+  "botDefaults.sgNamingAi": "AI 摘要（默认）",
+  "botDefaults.sgNamingReuse": "复用 Agent 会话标题",
+  "botDefaults.sgNamingTruncate": "仅截断原文",
+  "botDefaults.sgNamingReuseHelp": "使用当前 Agent 发布的会话标题，不额外调用模型。标题未就绪时保留占位名；自动命名成功后不再追随修改。",
+  "botDefaults.sgNamingTruncateHelp": "只用首条消息的截断内容作为群名，不自动生成标题。",
+  "botDefaults.sgNamingAiHelp": "先创建占位群名，再独立生成简短摘要。Codex 使用隔离的标题调用。",
+  "botDefaults.sgNamingModel": "摘要模型（Codex）",
+  "botDefaults.sgNamingModelPlaceholder": "留空沿用 Bot 模型",
+  "botDefaults.sgNamingModelHelp": "填写该账号可用的轻量模型 ID，仅用于 AI 摘要。固定 low 推理，不加载用户 hooks、插件、MCP 或项目指令。",
+
   'app.name': 'botmux',
   'app.subtitle': '飞书 AI CLI 控制台',
   'nav.docs': '文档',
@@ -4097,6 +4108,17 @@ const zh = {
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
+  'botDefaults.sgNaming': 'Dedicated group naming',
+  'botDefaults.sgNamingAi': 'AI summary (default)',
+  'botDefaults.sgNamingReuse': 'Reuse Agent session title',
+  'botDefaults.sgNamingTruncate': 'Truncate first message',
+  'botDefaults.sgNamingReuseHelp': 'Use the title published by the active Agent without another model call. Keep the placeholder until ready; stop after the first successful rename.',
+  'botDefaults.sgNamingTruncateHelp': 'Keep the truncated first message as the group name without generating a title.',
+  'botDefaults.sgNamingAiHelp': 'Create a placeholder, then generate a short summary. Codex uses an isolated title call.',
+  'botDefaults.sgNamingModel': 'Summary model (Codex)',
+  'botDefaults.sgNamingModelPlaceholder': 'Leave blank to use the Bot model',
+  'botDefaults.sgNamingModelHelp': 'Enter an available lightweight model ID for AI summaries. Uses low reasoning without user hooks, plugins, MCP or project instructions.',
+
   'app.name': 'botmux',
   'app.subtitle': 'Feishu AI CLI Control',
   'nav.docs': 'Docs',

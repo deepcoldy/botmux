@@ -465,6 +465,20 @@ export interface CliAdapter {
    *  e.g. claude-code/grok) or that ignore resume entirely leave this unset. */
   readonly resumeRequiresCliSessionId?: boolean;
 
+  /** Native CLIs with an interactive fork command run it before the worker
+   * publishes prompt_ready or admits input. Return only the independently
+   * confirmed child id; a stale generation must never publish a result. */
+  forkSessionAfterReady?(opts: {
+    sourceSessionId: string;
+    sendCommand: (command: string) => Promise<void>;
+    captureScreen: () => string;
+    isCurrent: () => boolean;
+  }): Promise<string>;
+
+  /** Exact active identity for a CLI which retains retired conversation DB
+   * handles (Antigravity after /fork). Prefer over the generic first-FD probe. */
+  resolveActiveSessionId?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined;
+
   /** True when this adapter finds the native session to resume by itself
    *  from the botmux session id (Kimi: its index + wire logs; the
    *  session it was started under), so no `cliSessionId` is needed. Whether a

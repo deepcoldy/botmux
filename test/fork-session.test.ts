@@ -162,11 +162,15 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex / traex / grok (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok'] as const) {
+  it('accepts native fork-capable CLIs on a local terminal', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok', 'antigravity'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
+  });
+
+  it('refuses Antigravity on a remote backend without a local native terminal', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', backendType: 'remote-runner' }))).toBe(false);
   });
 
   it('refuses aiden because its adapter has no native fork contract', () => {
