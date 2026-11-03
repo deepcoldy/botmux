@@ -44,6 +44,8 @@ import { lookupWorkflowHandoffByNonce } from './workflow-handoff-binding.js';
 import type { WorkflowNodeSessionMarker } from '../types.js';
 import type { TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { parseFrozenBotSnapshots } from '../workflows/v3/bot-resolve.js';
+import { loadEffectiveV3Dag, v3ApprovedBotScope } from '../workflows/v3/dag-revision.js';
+import type { BotSnapshot } from '../workflows/v3/contract.js';
 import { classifyExternalAttempt } from '../workflows/v3/external-control.js';
 import { readJournal, type StoredEvent } from '../workflows/v3/journal.js';
 import { isValidRunId } from '../workflows/v3/ops-projection.js';
@@ -78,20 +80,32 @@ export interface WorkflowHandoffIdentityRun {
 }
 
 /**
- * Bots the initiator approved to act for them (design §10.3): every bot the
- * run's frozen snapshot assigns a node to (what Gate-2 / `/workflow run`
- * approved), plus any bot the initiator reassigned a node to themselves
- * (`nodeReassigned` whose `by` is their own open_id). Another kind of
- * initiator-confirmed addition (runtime flow edits, §13.5) extends this one
- * function; anyone else's reassignment never adds a bot.
+ * Bots the initiator approved to act for them (design §10.3, §13.5): the
+ * run's approved bot scope ({@link v3ApprovedBotScope}: the frozen snapshot
+ * Gate-2 / `/workflow run` approved, plus every bot an applied flow revision
+ * brought in — applied directly in the initiator's own turn, or after the
+ * initiator confirmed the revision card), plus any bot the initiator
+ * reassigned a node to themselves on a blocked card (`nodeReassigned` whose
+ * `by` is their own open_id). A proposal still waiting for confirmation adds
+ * nothing, and anyone else's reassignment never adds a bot.
+ *
+ * Fail closed: when an applied revision's files do not verify, the scope is
+ * the frozen snapshot alone — a broken revision never widens it.
  */
 export function approvedWorkflowBots(
-  loaded: Pick<LoadedAuthorizedV3Run, 'botSnapshots'>,
+  runDir: string,
+  loaded: Pick<LoadedAuthorizedV3Run, 'botSnapshots' | 'dag'>,
   events: readonly StoredEvent[],
   initiatorOpenId: string | undefined,
 ): Set<string> {
-  const approved = new Set<string>();
-  for (const snapshot of parseFrozenBotSnapshots(loaded.botSnapshots).values()) approved.add(snapshot.larkAppId);
+  const frozen = parseFrozenBotSnapshots(loaded.botSnapshots);
+  let scope: ReadonlyMap<string, BotSnapshot>;
+  try {
+    scope = v3ApprovedBotScope(frozen, loadEffectiveV3Dag(runDir, loaded.dag, events).botAdditions);
+  } catch {
+    return new Set([...frozen.values()].map((snapshot) => snapshot.larkAppId));
+  }
+  const approved = new Set([...scope.values()].map((snapshot) => snapshot.larkAppId));
   for (const event of events) {
     if (event.type === 'nodeReassigned' && initiatorOpenId !== undefined && event.by === initiatorOpenId) approved.add(event.to);
   }
@@ -117,7 +131,7 @@ export function loadWorkflowHandoffIdentityRun(runDir: string): WorkflowHandoffI
   const events = readJournal(join(runDir, 'journal.ndjson'));
   return {
     ...(identity ? { identity } : { unavailableReason: 'unavailable' in record ? record.unavailable : 'no_initiator' }),
-    approvedBots: approvedWorkflowBots(loaded, events, identity?.openId),
+    approvedBots: approvedWorkflowBots(runDir, loaded, events, identity?.openId),
     ...(loaded.envelope.chatBinding?.chatId ? { chatId: loaded.envelope.chatBinding.chatId } : {}),
     ...(loaded.envelope.chatBinding?.larkAppId ? { sourceLarkAppId: loaded.envelope.chatBinding.larkAppId } : {}),
   };
@@ -282,7 +296,7 @@ export async function planWorkflowHandoffIdentity(input: {
     return { kind: 'unsigned', transient: true, note: `暂时无法在 ${name} 这边校验发起人身份（${checked.detail}）` };
   }
   if (checked.status === 'denied') {
-    if (!approved) return { kind: 'unsigned', note: `${name} 不是发起人批准时选定的 Bot` };
+    if (!approved) return { kind: 'unsigned', note: `${name} 不在本 run 发起人批准的 Bot 范围内` };
     if (checked.reason === 'no_shared_tool') {
       return { kind: 'unsigned', note: `发起人在主 Bot 上没有可交给 ${name} 的工具身份` };
     }

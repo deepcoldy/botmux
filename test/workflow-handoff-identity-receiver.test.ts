@@ -51,7 +51,8 @@ const { readDispatchRegistryLoose, revokeWorkflowHandoff, lookupWorkflowHandoff 
 const { workflowDelegationRefusal, checkWorkflowHandoffIdentityTarget, inheritWorkflowDelegation } = await import('../src/core/workflow-handoff-identity.js');
 const { authorityForDispatch, deliverDispatchWithUser } = await import('../src/core/dispatch-user-delegation.js');
 const { workflowNodeMarkerFromBinding } = await import('../src/core/workflow-node-session.js');
-const { BotRun, cleanupBotRuns, reportDag, reportFiles } = await import('./helpers/v3-external-harness.js');
+const { BotRun, cleanupBotRuns, reportDag, reportFiles, snapshotFor } = await import('./helpers/v3-external-harness.js');
+const { applyV3RunEdit, decideV3RevisionProposal } = await import('../src/workflows/v3/run-edit.js');
 const { CHAT, INITIATOR_MAIN_OU, INITIATOR_OU_IN, INITIATOR_UNION, MAIN, SECRET, authorizeRun, driveWith, identityWorld } =
   await import('./helpers/workflow-identity-world.js');
 const { nonceOf } = await import('./helpers/workflow-handoff-harness.js');
@@ -380,6 +381,35 @@ describe('a node bot passing the initiator on (`botmux dispatch` from the node s
   ] as const)('to %s: the dispatch goes ahead without the initiator (not refused)', async (_label, target, opts) => {
     const h = await receiver({ alsoApproved: ['cli_b'] });
     expect(await passOn(h, target, opts)).toEqual({ inherit: false });
+  });
+
+  it('to a bot in someone else\'s unconfirmed flow edit: not passed on, not honoured; once the initiator confirms it, both', async () => {
+    const h = await receiver();
+    expect(applyV3RunEdit({
+      baseDir: h.run.base, runId: h.run.dag.runId, baseRevision: 1, caller: { openId: 'ou_member_in_main', origin: 'human' },
+      patch: [{ op: 'addNode', node: { id: 'check', type: 'goal', goal: 'check the report', bot: 'cli_c', depends: [], inputs: [] } }],
+      resolveNewBotSnapshot: snapshotFor,
+    })).toMatchObject({ kind: 'proposed', reasons: ['callerNotInitiator', 'newBot'] });
+    expect(await passOn(h, 'cli_c')).toEqual({ inherit: false });
+    // A record passed on to cli_c regardless is refused there, by the same scope.
+    const inherited = await h.fns.dispatchUserForTurn(h.ds, h.handoff);
+    await deliverDispatchWithUser({
+      dataDir: h.world.dataDir, secret: SECRET,
+      payload: { sourceAppId: 'cli_a', sourceSessionId: SESSION, sourceTurnId: h.handoff, rootId: 'om_c_root', chatId: CHAT,
+        targetAppIds: ['cli_c'], authority: { ...inherited.authority }, workflow: { ...inherited.workflow, hop: 1 } },
+      send: async () => 'om_c_msg',
+    });
+    const record = await resolveDispatchUser({ dataDir: h.world.dataDir, secret: SECRET, appId: 'cli_c', chatId: CHAT, rootId: 'om_c_root', turnId: 'om_c_msg', waitMs: 0 });
+    const refusal = () => workflowDelegationRefusal({
+      record: record as any, turnId: 'om_c_msg', receiverLarkAppId: 'cli_c', chatId: CHAT, marker: undefined,
+      registry: readDispatchRegistryLoose(h.world.dataDir), secret: SECRET, baseDir: h.run.base,
+    });
+    expect(refusal()).toBe('bot_not_approved');
+
+    expect(decideV3RevisionProposal({ baseDir: h.run.base, runId: h.run.dag.runId, revision: 2, decision: 'approve', by: INITIATOR_MAIN_OU }))
+      .toMatchObject({ kind: 'approved' });
+    expect(await passOn(h, 'cli_c')).toEqual({ inherit: true, workflow: expect.objectContaining({ attemptId: h.attempt.attemptId, hop: 1 }) });
+    expect(refusal()).toBeUndefined();
   });
 
   it('stops passing on after 16 hops', async () => {

@@ -14,7 +14,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -24,6 +24,7 @@ import {
   expectTerminal,
   reportDag,
   reportFiles,
+  snapshotFor,
 } from './helpers/v3-external-harness.js';
 import { handoffWorld, nonceOf } from './helpers/workflow-handoff-harness.js';
 import {
@@ -52,6 +53,7 @@ import {
   approvedWorkflowBots,
   checkWorkflowHandoffIdentityTarget,
   deliverWorkflowHandoffWithUser,
+  loadWorkflowHandoffIdentityRun,
   planWorkflowHandoffIdentity,
   workflowDelegationRefusal,
   type WorkflowHandoffIdentityRun,
@@ -68,7 +70,10 @@ import {
   validateRunEnvelope,
   RunEnvelopeValidationError,
 } from '../src/workflows/v3/run-envelope.js';
-import type { StoredEvent } from '../src/workflows/v3/journal.js';
+import { appendEvent, type StoredEvent } from '../src/workflows/v3/journal.js';
+import { applyV3RunEdit, decideV3RevisionProposal } from '../src/workflows/v3/run-edit.js';
+import { v3RevisionFilePaths } from '../src/workflows/v3/dag-revision.js';
+import type { BotSnapshot } from '../src/workflows/v3/contract.js';
 import { buildV3HandoffCard, type V3HandoffCardInput } from '../src/im/lark/v3-node-card.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { workflowSidebarEntryLink } from '../src/im/lark/workflow-sidebar-entry.js';
@@ -563,16 +568,18 @@ describe('the receiver honours a workflow delegation only while its handoff hold
 // ─── pieces ────────────────────────────────────────────────────────────────
 
 describe('approved bots', () => {
-  const loaded = { botSnapshots: { cli_a: { larkAppId: 'cli_a', cliId: 'claude-code', workingDir: '/tmp' } } };
+  // No flow revision in these journals: nothing is read from the run dir.
+  const loaded = { botSnapshots: { cli_a: { larkAppId: 'cli_a', cliId: 'claude-code', workingDir: '/tmp' } }, dag: reportDag('approved-set') };
   const reassigned = (by: string): StoredEvent => ({ type: 'nodeReassigned', nodeId: 'write', from: 'cli_a', to: 'cli_x', by, seq: 1, ts: '' } as unknown as StoredEvent);
+  const approved = (events: StoredEvent[]) => [...approvedWorkflowBots('/nonexistent-run-dir', loaded, events, INITIATOR_MAIN_OU)];
 
   it('are the bots approval assigned, plus a bot the initiator reassigned a node to themselves', () => {
-    expect([...approvedWorkflowBots(loaded, [], INITIATOR_MAIN_OU)]).toEqual(['cli_a']);
-    expect([...approvedWorkflowBots(loaded, [reassigned(INITIATOR_MAIN_OU)], INITIATOR_MAIN_OU)]).toEqual(['cli_a', 'cli_x']);
+    expect(approved([])).toEqual(['cli_a']);
+    expect(approved([reassigned(INITIATOR_MAIN_OU)])).toEqual(['cli_a', 'cli_x']);
   });
 
   it('anyone else\'s reassignment never adds a bot', () => {
-    expect([...approvedWorkflowBots(loaded, [reassigned('ou_someone_else'), reassigned('main_bot')], INITIATOR_MAIN_OU)]).toEqual(['cli_a']);
+    expect(approved([reassigned('ou_someone_else'), reassigned('main_bot')])).toEqual(['cli_a']);
   });
 });
 
@@ -618,7 +625,7 @@ describe('the signing plan', () => {
       targetLarkAppId: 'cli_x',
       check: async (tools) => { offered.push(tools); return tools.length ? { status: 'ok', tools } : { status: 'denied', reason: 'no_shared_tool' }; },
     });
-    expect(await result).toEqual({ kind: 'unsigned', note: expect.stringContaining('不是发起人批准时选定的 Bot') });
+    expect(await result).toEqual({ kind: 'unsigned', note: expect.stringContaining('不在本 run 发起人批准的 Bot 范围内') });
     expect(offered).toEqual([[]]);
   });
 
@@ -709,6 +716,62 @@ describe('the initiator reassigning a blocked node on its card (#2728)', () => {
       authority: { openId: INITIATOR_MAIN_OU, unionId: INITIATOR_UNION },
     });
     expect(workflowDelegationRefusal(receiverInputs(world, run, second, 'cli_b'))).toBeUndefined();
+  });
+});
+
+describe('a bot a flow edit brought in (#2763)', () => {
+  /** A started run whose `write` has not been handed off yet; cli_c, a bot
+   *  outside its approval, would carry the initiator's tools. */
+  function startedRun(id: string) {
+    const run = new BotRun(reportDag(id));
+    const world = identityWorld();
+    world.policies.set('cli_c', policy(['lark-cli', 'bytedcli']));
+    const snapshots = authorizeRun(run, { identity: FROZEN });
+    appendEvent(run.journalPath, { type: 'runStarted', runId: run.dag.runId, nodeExecutor: 'bot' });
+    return { run, world, snapshots };
+  }
+  const editRun = (run: BotRun, openId: string, patch: unknown[]) => applyV3RunEdit({
+    baseDir: run.base, runId: run.dag.runId, baseRevision: 1, caller: { openId, origin: 'human' }, patch, resolveNewBotSnapshot: snapshotFor,
+  });
+  const moveWriteToC = (run: BotRun, openId: string) => editRun(run, openId, [{ op: 'reassign', nodeId: 'write', bot: 'cli_c' }]);
+  // A new node records no reassignment: only the revision's own bots bring cli_c in.
+  const addCheckOnC = (run: BotRun, openId: string) => editRun(run, openId, [{ op: 'addNode', node: {
+    id: 'check', type: 'goal', goal: 'check the report', bot: 'cli_c', depends: [], inputs: [], timeoutSec: 600,
+    outputs: { review: { path: 'review.md', kind: 'markdown' } },
+  } }]);
+  async function expectSignedToC(run: BotRun, world: ReturnType<typeof identityWorld>, snapshots: Map<string, BotSnapshot>, nodeId: string) {
+    await driveWith(run, world, snapshots);
+    const attempt = run.openAttempt(nodeId);
+    expect(attempt.targetLarkAppId).toBe('cli_c');
+    expect(boundRecord(world.dataDir, attempt.handoffMessageId!)).toMatchObject({
+      targetAppIds: ['cli_c'], workflow: { attemptId: attempt.attemptId },
+      authority: { openId: INITIATOR_MAIN_OU, unionId: INITIATOR_UNION, tools: ['lark-cli', 'bytedcli'] },
+    });
+    expect(workflowDelegationRefusal(receiverInputs(world, run, attempt, 'cli_c'))).toBeUndefined();
+  }
+
+  it('someone else\'s edit, confirmed by the initiator on the revision card: the handoff carries their identity', async () => {
+    const { run, world, snapshots } = startedRun('id-edit-confirmed');
+    expect(moveWriteToC(run, 'ou_member_in_main')).toMatchObject({ kind: 'proposed', reasons: ['callerNotInitiator', 'newBot'] });
+    // Unconfirmed, it widens nothing.
+    expect([...loadWorkflowHandoffIdentityRun(run.runDir)!.approvedBots]).toEqual(['cli_a']);
+    expect(decideV3RevisionProposal({ baseDir: run.base, runId: run.dag.runId, revision: 2, decision: 'approve', by: INITIATOR_MAIN_OU }))
+      .toMatchObject({ kind: 'approved' });
+    await expectSignedToC(run, world, snapshots, 'write');
+  });
+
+  it('the initiator\'s own edit, applied directly: the handoff carries their identity', async () => {
+    const { run, world, snapshots } = startedRun('id-edit-direct');
+    expect(addCheckOnC(run, INITIATOR_MAIN_OU)).toMatchObject({ kind: 'applied', revision: 2 });
+    await expectSignedToC(run, world, snapshots, 'check');
+  });
+
+  it('a revision that no longer verifies never widens the scope: the approval\'s bots only', () => {
+    const { run } = startedRun('id-edit-tampered');
+    expect(addCheckOnC(run, INITIATOR_MAIN_OU)).toMatchObject({ kind: 'applied', revision: 2 });
+    expect([...loadWorkflowHandoffIdentityRun(run.runDir)!.approvedBots]).toEqual(['cli_a', 'cli_c']);
+    writeFileSync(v3RevisionFilePaths(run.runDir, 2).bots, `${JSON.stringify({ cli_c: snapshotFor('cli_b') })}\n`);
+    expect([...loadWorkflowHandoffIdentityRun(run.runDir)!.approvedBots]).toEqual(['cli_a']);
   });
 });
 
