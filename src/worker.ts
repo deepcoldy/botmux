@@ -1913,6 +1913,7 @@ let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
+let reuseScratchSandboxOnNextSpawn = false;          // in-worker purge restart reattaches repaired COW view instead of preparing a fresh one
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
 const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
@@ -24734,7 +24735,8 @@ async function spawnCli(
     scratchNativeCodexHome = nativeCodexHome;
     scratchNativeTraeHome = nativeTraeHome;
 
-    if (willReattachPersistent) {
+    if (reuseScratchSandboxOnNextSpawn || willReattachPersistent) {
+      reuseScratchSandboxOnNextSpawn = false;
       // Live pane across a daemon restart: the overlay/clone + pane survive;
       // only re-wire the outbox watcher. Never remount/re-clone here.
       if (process.platform === 'darwin') {
@@ -27023,6 +27025,9 @@ function killCli(opts: {
   /** The replacement worker reuses this logical session's sandbox tree. Stop
    * this worker's watcher but leave the tree/mountpoints for that replacement. */
   preserveSandbox?: boolean;
+  /** In-process respawn: retain both tree and cleanup ownership so spawnCli can
+   * reattach the same repaired scratch view, then clean it at final teardown. */
+  preserveSandboxForRespawn?: boolean;
   /** The CLI keeps running in its persistent pane: leave its PID marker (the
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
@@ -27118,6 +27123,10 @@ function killCli(opts: {
     // replacement will reuse.
     sandboxCleanup = null;
     sandboxTeardownDone = true;
+  } else if (opts.preserveSandboxForRespawn) {
+    // Keep the existing cleanup owner and tree. spawnCli reattaches the same
+    // merged/clone view so repaired transcript state remains the resume source.
+    reuseScratchSandboxOnNextSpawn = true;
   } else if (sandboxCleanup) {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;
@@ -27222,8 +27231,6 @@ async function restartCliProcess(
       const rpcThreadId = remoteThreadId;
       const restartingBackend = backend;
       const retiringCliPid = restartingBackend?.getChildPid?.();
-      const deferredSandboxCleanup = opts.preserveSandboxUntilMaintenance ? sandboxCleanup : null;
-      if (opts.preserveSandboxUntilMaintenance) sandboxCleanup = null;
       if (restartingBackend) intentionalRestartBackend = restartingBackend;
       const teardown = restartingBackend?.destroySession?.();
       let teardownOutcome: RestartTeardownOutcome = { kind: 'absent' };
@@ -27272,6 +27279,7 @@ async function restartCliProcess(
       killCli({
         preservePending: opts.preservePending,
         preservePolicyCapability: true,
+        preserveSandboxForRespawn: opts.preserveSandboxUntilMaintenance,
       });
       // Destructive transcript maintenance must happen only after destroy+kill
       // AND positive process death: node-pty kill() returns before its child has
@@ -27284,9 +27292,6 @@ async function restartCliProcess(
           provablyGone: pid => !pidNotProvablyGone(pid),
         });
         opts.afterQuiesceBeforeRespawn();
-      }
-      if (deferredSandboxCleanup) {
-        try { deferredSandboxCleanup(); } finally { sandboxTeardownDone = true; }
       }
       // A normal restart cannot observe activity from the retired process.
       // Only capacity-model rotation carries that waiting latch forward.
