@@ -1057,7 +1057,9 @@ function botSnapshotsFor(runDir: string, ctx: V3ReassignContext): ReadonlyMap<st
   ));
   // Bots an applied runtime revision brought in are part of the run's set.
   const base = ctx.dag ?? loadDag(join(runDir, 'dag.json'));
-  return v3ApprovedBotScope(frozen, loadEffectiveV3Dag(runDir, base, readJournal(journalPathOf(runDir))).botAdditions);
+  const additions = loadEffectiveV3Dag(runDir, base, readJournal(journalPathOf(runDir))).botAdditions;
+  // No revision brought a bot in: the caller's map is the scope as-is.
+  return additions.size === 0 ? frozen : v3ApprovedBotScope(frozen, additions);
 }
 
 /** Which node-scoped definition a reassign targets: an authored goal node, or
