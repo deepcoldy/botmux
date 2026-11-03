@@ -24,6 +24,10 @@ describe('worker pane-switch env wiring (K3)', () => {
     expect(matches).toHaveLength(2);
     expect(matches.filter(m => m.includes('mergedEnv'))).toHaveLength(1);
     expect(matches.filter(m => m.includes('childEnv'))).toHaveLength(1);
+    // Each matched text must be a fully closed call: if the regex's closing
+    // paren were dropped, match() could return a truncated `…paneSwitchEnv(`
+    // fragment and the per-env filters above would still pass.
+    expect(matches.every(m => m.trim().endsWith(')'))).toBe(true);
     // Presence check stops at the opening paren so paneSwitchEnv(process.env)
     // (an equivalent explicit-arg rewrite) stays green; the regex above still
     // requires the call to close and the two target env objects to be present.
@@ -31,7 +35,11 @@ describe('worker pane-switch env wiring (K3)', () => {
     expect(worker).toContain('Object.assign(childEnv, paneSwitchEnv(');
 
     // The switches must reach panes only via the projection; forbid a real
-    // per-key assignment statement (not a comment mentioning the variable).
+    // per-key assignment statement of the `env.KEY =` form (not a comment that
+    // merely mentions the variable). Known limit: an inline
+    // `Object.assign(childEnv, { KEY: 'true' })` bypass is a different shape and
+    // is NOT caught here — the projection call asserts above remain the guard
+    // for that route.
     expect(worker).not.toMatch(
       /^\s*(?:mergedEnv|childEnv)\.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED\s*=/m,
     );
