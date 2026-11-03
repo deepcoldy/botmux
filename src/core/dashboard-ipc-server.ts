@@ -3285,7 +3285,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
   res.setHeader('cache-control', 'no-store');
-  const bot = getBot(targetLarkAppId!).config;
+  let bot: ReturnType<typeof getBot>['config'];
+  try { bot = getBot(targetLarkAppId!).config; }
+  catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
   if (body.mode === 'bot') {
     let token: unknown;
     try {
@@ -4327,6 +4329,7 @@ function findSessionRecord(sessionId: string): Session | undefined {
  *  getBotClient (which only throws for apiOnly) cannot. Accepts a live
  *  DaemonSession or a stored Session record. Never throws. */
 function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): boolean {
+  if (isHeadlessSessionChatId(s.chatId)) return false;
   const appId = s.larkAppId;
   let apiOnly = false;
   if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
