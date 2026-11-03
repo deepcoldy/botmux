@@ -44,6 +44,13 @@ export interface DoubaoBridgeDrainState {
   assignmentOffset: number;
   /** Byte frontier in trajectory.jsonl. */
   trajectoryOffset: number;
+  /** Native turns already emitted as `user` events whose terminal final has not
+   *  been emitted yet. The two files append at DIFFERENT moments of the turn
+   *  cycle (assignment at submit, trajectory at completion), so a single drain
+   *  window can contain BOTH the previous turn's final AND the next turn's
+   *  prompt section; the balance decides which finals close an earlier turn and
+   *  which pair with prompts inside this window. Never negative. */
+  openUserCount?: number;
 }
 
 export interface DoubaoDrainResult {
@@ -108,30 +115,47 @@ function parseHeadingTimestamp(raw: string): number {
   return Number.isFinite(ms) ? ms : Date.now();
 }
 
+/** One parsed assignment.md turn section with its byte range. `event` is null
+ *  for a whitespace-only body (no real prompt); `incomplete` marks a heading
+ *  whose body has not been appended yet — the torn-write shape. */
+interface ParsedAssignmentSection {
+  start: number;
+  end: number;
+  event: CodexBridgeEvent | null;
+  incomplete: boolean;
+}
+
 /** Split a complete (newline-terminated) assignment.md slice into turn bodies.
- *  A body is emitted only once the following heading is seen (or EOF at a line
- *  boundary), so a half-appended prompt is never parsed. */
+ *  Returns every section with the byte range it occupies. A body is only
+ *  COMPLETE once the following heading is seen, a non-empty body line is
+ *  present, or — for the last section — its prompt bytes exist; a bare heading
+ *  at the window end is reported `incomplete` so the caller holds the offset at
+ *  its start and re-parses the whole section once the body lands. */
 function parseAssignmentSections(
   path: string,
   completeText: string,
   startOffset: number,
-): CodexBridgeEvent[] {
-  const events: CodexBridgeEvent[] = [];
-  let sectionStart = -1;       // byte offset of the current heading line
-  let headingTs: string | undefined;
-  let bodyLines: string[] = [];
+): ParsedAssignmentSection[] {
+  const sections: ParsedAssignmentSection[] = [];
+  let current: { start: number; headingTs: string; bodyLines: string[] } | undefined;
 
-  const flush = (): void => {
-    if (sectionStart < 0 || bodyLines.length === 0) return;
-    const text = bodyLines.join('').replace(/\n+$/, '');
-    if (text.trim()) {
-      events.push({
-        uuid: `${path}:${sectionStart}`,
-        timestampMs: parseHeadingTimestamp(headingTs!),
-        kind: 'user',
-        text,
-      });
-    }
+  const flush = (end: number): void => {
+    if (!current) return;
+    const text = current.bodyLines.join('').replace(/\n+$/, '');
+    sections.push({
+      start: current.start,
+      end,
+      event: text.trim()
+        ? {
+          uuid: `${path}:${current.start}`,
+          timestampMs: parseHeadingTimestamp(current.headingTs),
+          kind: 'user',
+          text,
+        }
+        : null,
+      incomplete: false,
+    });
+    current = undefined;
   };
 
   let byteCursor = startOffset;
@@ -143,21 +167,43 @@ function parseAssignmentSections(
     byteCursor += Buffer.byteLength(line, 'utf8');
     const m = SECTION_HEADING_RE.exec(rawLine);
     if (m) {
-      flush();
-      sectionStart = lineStart;
-      headingTs = m[1];
-      bodyLines = [];
+      flush(lineStart);
+      current = { start: lineStart, headingTs: m[1]!, bodyLines: [] };
       continue;
     }
-    if (sectionStart >= 0) bodyLines.push(line);
+    if (current) current.bodyLines.push(line);
   }
-  // The slice ends exactly at a line boundary (completeText ends with '\n').
-  // The last section is complete if its body was terminated by that newline —
-  // doubao writes the whole prompt + trailing newline in one append before the
-  // turn starts, so emitting it here is safe; a genuinely half-written last
-  // line would lack its '\n' and never reach this parser.
-  flush();
-  return events;
+  if (current) {
+    // doubao appends prompt body after the heading. A heading whose only
+    // following bytes are blank lines at EOF is the torn half of a split
+    // write: hold at the heading start and re-parse after the body lands.
+    const bodyText = current.bodyLines.join('');
+    if (bodyText.trim() === '') {
+      sections.push({ start: current.start, end: byteCursor, event: null, incomplete: true });
+    } else {
+      flush(byteCursor);
+    }
+  }
+  return sections;
+}
+
+interface ParsedTrajectoryEvent {
+  event: CodexBridgeEvent;
+  start: number;
+}
+
+function parseTrajectoryWindow(path: string, completeText: string, startOffset: number): ParsedTrajectoryEvent[] {
+  const out: ParsedTrajectoryEvent[] = [];
+  let lineStart = startOffset;
+  for (const rawLine of completeText.split('\n')) {
+    const line = `${rawLine}\n`;
+    const start = lineStart;
+    lineStart += Buffer.byteLength(line, 'utf8');
+    if (rawLine.length === 0) continue;
+    const event = parseTrajectoryLine(path, rawLine, start);
+    if (event) out.push({ event, start });
+  }
+  return out;
 }
 
 function parseTrajectoryLine(path: string, line: string, lineStart: number): CodexBridgeEvent | null {
@@ -175,7 +221,25 @@ function parseTrajectoryLine(path: string, line: string, lineStart: number): Cod
 
 /** Incrementally drain BOTH native logs for a bound session.
  *  `path` is the trajectory.jsonl path (what locate resolves); assignment.md
- *  is its sibling. */
+ *  is its sibling.
+ *
+ *  Cross-file ordering: assignment.md appends the user section at SUBMIT time,
+ *  trajectory.jsonl appends the terminal answer at COMPLETION time, and the
+ *  shared 1s poll can observe both in one window — including the previous
+ *  turn's final landing together with the next turn's prompt. The queue pairs
+ *  an assistant_final onto whatever turn is collecting, so emitting the new
+ *  user section before that final would start the new turn first, misattribute
+ *  the old answer to it (and HOL-drop the old turn). To stay correct with no
+ *  native timestamps on finals, keep a running balance of user sections whose
+ *  final has not been seen (`openUserCount`):
+ *    1. finals that close previously-open turns are emitted FIRST;
+ *    2. remaining prompts/finals fully inside this window alternate
+ *       user→final so a sub-second turn still pairs in zero extra ticks;
+ *    3. only when step 1 closed an earlier turn, leftover prompt sections are
+ *       HELD (assignment offset parked at the section start) and re-parsed on
+ *       the next tick — one second later, never misattributed.
+ *  A window with no finals keeps today's behaviour exactly (the prompt starts
+ *  / HOL-drops as the queue already decides). */
 export function drainDoubaoTranscript(
   path: string,
   fromOffset: number,
@@ -185,44 +249,45 @@ export function drainDoubaoTranscript(
   const assignmentPath = join(systemDir, ASSIGNMENT_FILE);
   const prevState = (ctx.state as DoubaoBridgeDrainState | undefined)
     ?? { assignmentOffset: 0, trajectoryOffset: 0 };
+  let openUserCount = Math.max(0, Math.trunc(prevState.openUserCount ?? 0));
 
   // ── assignment.md: user turns ────────────────────────────────────────────
-  const events: CodexBridgeEvent[] = [];
   let assignmentOffset = prevState.assignmentOffset ?? 0;
+  let parsedSections: ParsedAssignmentSection[] = [];
+  let assignmentWindowEnd = assignmentOffset;
   try {
     if (existsSync(assignmentPath)) {
       const size = statSync(assignmentPath).size;
-      if (size < assignmentOffset) assignmentOffset = 0;
+      if (size < assignmentOffset) { assignmentOffset = 0; openUserCount = 0; }
       if (size > assignmentOffset) {
         const window = readJsonlWindow(assignmentPath, assignmentOffset, size);
-        // assignment.md is markdown, but readJsonlWindow's byte-window / last
-        // newline contract is exactly what a line-based reader needs.
-        events.push(...parseAssignmentSections(assignmentPath, window.completeText, assignmentOffset));
-        assignmentOffset = window.newOffset;
+        parsedSections = parseAssignmentSections(assignmentPath, window.completeText, assignmentOffset);
+        assignmentWindowEnd = window.newOffset;
       }
     }
   } catch (err) {
     logger.warn(`[doubao-transcript] assignment drain failed for ${assignmentPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // A trailing heading with no body is a torn split write: park the frontier
+  // at its heading start so the whole section re-parses after the body lands.
+  const trailingIncomplete = parsedSections.length > 0 && parsedSections[parsedSections.length - 1]!.incomplete
+    ? parsedSections[parsedSections.length - 1]!
+    : null;
+  const completeSections = trailingIncomplete ? parsedSections.slice(0, -1) : parsedSections;
+  const userSections = completeSections.filter(s => s.event !== null);
+
   // ── trajectory.jsonl: final assistant answers ────────────────────────────
   let trajectoryOffset = prevState.trajectoryOffset ?? 0;
   let pendingTail = '';
+  let finals: ParsedTrajectoryEvent[] = [];
   try {
     if (existsSync(path)) {
       const size = statSync(path).size;
-      if (size < trajectoryOffset) trajectoryOffset = 0;
+      if (size < trajectoryOffset) { trajectoryOffset = 0; openUserCount = 0; }
       if (size > trajectoryOffset) {
         const window = readJsonlWindow(path, trajectoryOffset, size);
-        let lineStart = trajectoryOffset;
-        for (const rawLine of window.completeText.split('\n')) {
-          const line = `${rawLine}\n`;
-          const start = lineStart;
-          lineStart += Buffer.byteLength(line, 'utf8');
-          if (rawLine.length === 0) continue;
-          const event = parseTrajectoryLine(path, rawLine, start);
-          if (event) events.push(event);
-        }
+        finals = parseTrajectoryWindow(path, window.completeText, trajectoryOffset);
         trajectoryOffset = window.newOffset;
         pendingTail = window.pendingTail;
       }
@@ -231,8 +296,41 @@ export function drainDoubaoTranscript(
     logger.warn(`[doubao-transcript] trajectory drain failed for ${path}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // Emit user events before assistant events even when both landed in the same
-  // drain window (the parser already orders them that way: assignment first).
+  // ── pair the two streams (see function doc) ──────────────────────────────
+  const events: CodexBridgeEvent[] = [];
+  const finalsForOpen = Math.min(finals.length, openUserCount);
+  const paired = Math.min(Math.max(finals.length - finalsForOpen, 0), userSections.length);
+  for (let i = 0; i < finalsForOpen; i++) events.push(finals[i]!.event);
+  for (let i = 0; i < paired; i++) {
+    events.push(userSections[i]!.event!);
+    events.push(finals[finalsForOpen + i]!.event);
+  }
+  // Trailing prompts with no final in this window: emit them now when no
+  // earlier turn is being closed (ordinary start / type-ahead); when an
+  // earlier turn IS being closed above, hold them so their sections cannot be
+  // observed before that final is paired.
+  const firstHeldSection = finalsForOpen > 0 && userSections.length > paired
+    ? userSections[paired]!
+    : null;
+  if (!firstHeldSection) {
+    for (let i = paired; i < userSections.length; i++) events.push(userSections[i]!.event!);
+  }
+
+  // Commit assignment bytes only up to the first section we are not emitting
+  // yet (a held paired prompt, or the torn trailing heading).
+  let holdAt: number | null = null;
+  if (firstHeldSection) holdAt = firstHeldSection.start;
+  if (trailingIncomplete && (holdAt === null || trailingIncomplete.start < holdAt)) {
+    holdAt = trailingIncomplete.start;
+  }
+  if (holdAt !== null) assignmentOffset = holdAt;
+  else assignmentOffset = assignmentWindowEnd;
+
+  const emittedUserCount = firstHeldSection
+    ? paired
+    : userSections.length;
+  const nextOpenCount = Math.max(0, openUserCount + emittedUserCount - finals.length);
+
   return {
     events,
     // The shared cursor must advance whenever EITHER file grows. Trajectory
@@ -240,6 +338,6 @@ export function drainDoubaoTranscript(
     // be re-drained on the next tick either; take the max of the two frontiers.
     newOffset: Math.max(trajectoryOffset, fromOffset),
     pendingTail,
-    state: { assignmentOffset, trajectoryOffset },
+    state: { assignmentOffset, trajectoryOffset, openUserCount: nextOpenCount },
   };
 }

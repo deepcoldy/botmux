@@ -18,6 +18,7 @@ import {
   drainDoubaoTranscript,
 } from '../src/services/doubao-transcript.js';
 import { doubaoBridgeSpec } from '../src/adapters/cli/doubao.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
 const SID = '38459999999999999';
 const AGENT = 'm_agent1';
@@ -104,5 +105,114 @@ describe('doubao transcript bridge', () => {
     ].join('\n') + '\n');
     const r = drainDoubaoTranscript(trajectory, 0);
     expect(r.events.map(e => e.kind)).toEqual(['user']);
+  });
+});
+
+/** Stateful cursor helper: replays what the worker's 1s ticker does. */
+function tickDrain(trajectory: string, cursor: { offset: number; state: unknown }) {
+  const r = drainDoubaoTranscript(trajectory, cursor.offset, { state: cursor.state });
+  cursor.offset = r.newOffset;
+  cursor.state = r.state;
+  return r;
+}
+
+const heading = (ts: string, body: string) => `## [${ts}] 需求\n${body}\n`;
+const finalRow = (text: string) => JSON.stringify({ role: 'assistant', content: text }) + '\n';
+
+describe('doubao two-file cross-window ordering', () => {
+  it('delivers the previous final before starting the next prompt seen in the same drain window', () => {
+    // Real failure shape: assignment appends at SUBMIT, trajectory appends at
+    // COMPLETION, so one poll can see the next prompt and the previous final
+    // together. Emitting the prompt first starts the new turn, the queue HOL-
+    // drops the old one, and the old answer closes the NEW turn while the new
+    // answer is later stranded.
+    const root = join(tmpdir(), `doubao-cross-window-${process.pid}`);
+    const { assignment, trajectory } = makeSession(root);
+    const t1 = '2026-11-03T01:00:00.000Z';
+    const t2 = '2026-11-03T01:00:10.000Z';
+    const clock = Date.parse(t1);
+    const queue = new CodexBridgeQueue(() => clock);
+    queue.mark('turn-1', '问题一：只回复 ANSWER_ONE', clock);
+    writeFileSync(assignment, heading(t1, '问题一：只回复 ANSWER_ONE'));
+    const cursor = { offset: 0, state: undefined as unknown };
+
+    // tick 1: turn-1's prompt starts its queue head.
+    let r = tickDrain(trajectory, cursor);
+    queue.ingest(r.events);
+    expect(r.events.map(e => e.kind)).toEqual(['user']);
+
+    queue.mark('turn-2', '问题二：只回复 ANSWER_TWO', clock + 10_000);
+    writeFileSync(assignment, heading(t2, '问题二：只回复 ANSWER_TWO'), { flag: 'a' });
+    writeFileSync(trajectory, finalRow('ANSWER_ONE'));
+
+    // tick 2: collision window — only ANSWER_ONE may be emitted; turn-2's
+    // prompt is held (its section offset parked for re-parse).
+    r = tickDrain(trajectory, cursor);
+    expect(r.events.map(e => e.kind)).toEqual(['assistant_final']);
+    expect(r.events[0]!.text).toBe('ANSWER_ONE');
+    queue.ingest(r.events);
+    let ready = queue.drainEmittable();
+    expect(ready.map(t => [t.turnId, t.finalText])).toEqual([['turn-1', 'ANSWER_ONE']]);
+
+    // tick 3: the held prompt re-parses and pairs with its own final (which
+    // may land in the same window — still zero extra delay once paired).
+    writeFileSync(trajectory, finalRow('ANSWER_TWO'), { flag: 'a' });
+    r = tickDrain(trajectory, cursor);
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    queue.ingest(r.events);
+    ready = queue.drainEmittable();
+    expect(ready.map(t => [t.turnId, t.finalText])).toEqual([['turn-2', 'ANSWER_TWO']]);
+  });
+
+  it('pairs a prompt and its own final that both land in one window with no extra tick', () => {
+    const root = join(tmpdir(), `doubao-fast-turn-${process.pid}`);
+    const { assignment, trajectory } = makeSession(root);
+    const ts = '2026-11-03T02:00:00.000Z';
+    const queue = new CodexBridgeQueue(() => Date.parse(ts));
+    queue.mark('turn-1', '快问快答：只回复 FAST_OK', Date.parse(ts));
+    writeFileSync(assignment, heading(ts, '快问快答：只回复 FAST_OK'));
+    writeFileSync(trajectory, finalRow('FAST_OK'));
+
+    const r = drainDoubaoTranscript(trajectory, 0, {});
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    queue.ingest(r.events);
+    expect(queue.drainEmittable().map(t => [t.turnId, t.finalText]))
+      .toEqual([['turn-1', 'FAST_OK']]);
+  });
+
+  it('still emits a prompt with no final in the window (preserves the existing start path)', () => {
+    const root = join(tmpdir(), `doubao-prompt-only-${process.pid}`);
+    const { assignment, trajectory } = makeSession(root);
+    writeFileSync(assignment, heading('2026-11-03T03:00:00.000Z', '只有问题还没有回答'));
+    const r = drainDoubaoTranscript(trajectory, 0, {});
+    expect(r.events.map(e => e.kind)).toEqual(['user']);
+    expect((r.state as { openUserCount: number }).openUserCount).toBe(1);
+  });
+});
+
+describe('doubao assignment heading/body split write', () => {
+  it('holds at the heading when the body lands in a later append, then parses the whole turn', () => {
+    // doubao's buffered writer can flush heading and body separately. The old
+    // parser committed the offset past the body-less heading, so the body was
+    // skipped forever: that Lark turn never started and its final could never
+    // be attributed.
+    const root = join(tmpdir(), `doubao-torn-heading-${process.pid}`);
+    const { assignment, trajectory } = makeSession(root);
+    const ts = '2026-11-03T04:00:00.000Z';
+    const cursor = { offset: 0, state: undefined as unknown };
+
+    writeFileSync(assignment, heading(ts, '').trimEnd() + '\n');
+    let r = tickDrain(trajectory, cursor);
+    expect(r.events).toEqual([]);
+    expect((r.state as { assignmentOffset: number }).assignmentOffset).toBe(0);
+
+    writeFileSync(assignment, '撕裂写入的正文：只回复 SPLIT_OK\n', { flag: 'a' });
+    r = tickDrain(trajectory, cursor);
+    expect(r.events.map(e => e.kind)).toEqual(['user']);
+    expect(r.events[0]!.text).toBe('撕裂写入的正文：只回复 SPLIT_OK');
+
+    writeFileSync(trajectory, finalRow('SPLIT_OK'));
+    r = tickDrain(trajectory, cursor);
+    expect(r.events.map(e => e.kind)).toEqual(['assistant_final']);
   });
 });
