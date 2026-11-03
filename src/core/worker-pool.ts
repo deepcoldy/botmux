@@ -107,11 +107,13 @@ import { buildBotWorkerEnv, type EnvPolicy } from './env-policy.js';
 import {
   PROTECTED_MCP_SECRET_FD_ENV,
   prepareProtectedMcpWorkerProvisioning,
+  protectedMcpDaemonRedactedEnvKeys,
   protectedMcpDaemonSecretEnvironment,
   protectedMcpContainmentConfigured,
   serveProtectedMcpSecrets,
 } from './protected-mcp-capabilities.js';
 import { resolveSessionEnv, type ResolvedSessionEnv } from './session-env-resolve.js';
+import { sessionEnvFingerprint } from '../services/session-env-stamp.js';
 import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 import {
@@ -6900,7 +6902,7 @@ export function resolveSessionEnvForSession(
   botCfg: BotConfig,
   backendType: BackendType = sessionEnvBackendType(ds, botCfg),
 ): ResolvedSessionEnv {
-  return resolveSessionEnv({
+  const resolved = resolveSessionEnv({
     bot: botCfg,
     backendType,
     skipBotSet: !!(ds.session?.cliLaunchSnapshot || ds.session?.cliInstanceBinding),
@@ -6910,6 +6912,23 @@ export function resolveSessionEnvForSession(
         || ds.session?.existingAppServerEndpoint !== undefined,
     },
   });
+  const protectedKeys = new Set([
+    PROTECTED_MCP_SECRET_FD_ENV,
+    ...protectedMcpDaemonRedactedEnvKeys(),
+  ]);
+  const set = Object.fromEntries(
+    Object.entries(resolved.composed.set).filter(([key]) => !protectedKeys.has(key)),
+  );
+  const unset = resolved.composed.unset.filter(key => !protectedKeys.has(key));
+  if (Object.keys(set).length === Object.keys(resolved.composed.set).length
+    && unset.length === resolved.composed.unset.length) return resolved;
+  const composed = { set, unset };
+  return {
+    composed,
+    ...(Object.keys(set).length ? { env: set } : {}),
+    ...(unset.length ? { envUnset: unset } : {}),
+    fingerprint: sessionEnvFingerprint(composed, botCfg.envPolicy),
+  };
 }
 
 /**

@@ -45,6 +45,7 @@ import {
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
+import { captureProtectedMcpDaemonEnvironment } from '../src/core/protected-mcp-capabilities.js';
 
 let sessionCounter = 0;
 
@@ -90,6 +91,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  captureProtectedMcpDaemonEnvironment(undefined, {});
   __testOnly_resetRestartCoordinator();
 });
 
@@ -161,6 +163,27 @@ describe('latestSessionEnvForRestart (daemon-side env snapshot carrier)', () => 
 // ─── 2. daemon behavioral：live-worker restart 消息带 env ────────────────────
 
 describe('requestSessionRestart live-worker branch carries env (behavioral)', () => {
+  it('removes daemon-protected values from the restart payload after live bot reinjection', () => {
+    captureProtectedMcpDaemonEnvironment(undefined, {}, [
+      'FIXTURE_PROTECTED_SECRET',
+      'FIXTURE_PROTECTED_REDACTED',
+    ]);
+    getBotMock.mockReturnValue({ config: { env: {
+      FIXTURE_PROTECTED_SECRET: 'restart-secret',
+      FIXTURE_PROTECTED_REDACTED: 'restart-token',
+      SAFE_VISIBLE_VALUE: 'visible',
+    } } });
+    const { ds, send } = makeDs();
+
+    requestSessionRestart(ds, observer());
+
+    const msg = send.mock.calls[0][0];
+    expect(msg.type).toBe('restart');
+    expect(msg.env).toEqual({ SAFE_VISIBLE_VALUE: 'visible' });
+    expect(JSON.stringify(msg)).not.toContain('restart-secret');
+    expect(JSON.stringify(msg)).not.toContain('restart-token');
+  });
+
   it('sends {type:restart, attemptId, env} with the latest bots.json env', () => {
     getBotMock.mockReturnValue({ config: { env: { HTTPS_PROXY: 'http://p:7890' } } });
     const { ds, send } = makeDs();

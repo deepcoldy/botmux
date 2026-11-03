@@ -261,6 +261,7 @@ import { readWorkerProcessStart } from '../src/core/session-worker-identity.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { getBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { captureProtectedMcpDaemonEnvironment } from '../src/core/protected-mcp-capabilities.js';
 import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
@@ -372,12 +373,39 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  captureProtectedMcpDaemonEnvironment(undefined, {});
   __testOnly_setSuspendBackingVerifier();
   delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   disposeReadonlyTaskContinuation({ sessionId: 'sid-start-test' });
   setActiveSessionsRegistry(undefined);
   setLinkRefRuntime(undefined);
+});
+
+describe('protected MCP env stays out of ordinary worker IPC', () => {
+  it('removes daemon-protected values from the initial worker payload after live bot reinjection', () => {
+    captureProtectedMcpDaemonEnvironment(undefined, {}, [
+      'FIXTURE_PROTECTED_SECRET',
+      'FIXTURE_PROTECTED_REDACTED',
+    ]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      env: {
+        FIXTURE_PROTECTED_SECRET: 'reintroduced-secret',
+        FIXTURE_PROTECTED_REDACTED: 'reintroduced-token',
+        SAFE_VISIBLE_VALUE: 'visible',
+      },
+    }));
+    const ds = makeDs();
+
+    forkWorker(ds, 'ordinary protected env payload', { turnId: 'om_protected_init' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.type).toBe('init');
+    expect(init.env).toEqual({ SAFE_VISIBLE_VALUE: 'visible' });
+    expect(JSON.stringify(init)).not.toContain('reintroduced-secret');
+    expect(JSON.stringify(init)).not.toContain('reintroduced-token');
+  });
 });
 
 describe('LinkRef turn admission mode freeze', () => {
