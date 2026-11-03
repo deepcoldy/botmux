@@ -41,6 +41,14 @@ async function fixture() {
 }
 
 describe('PostgreSQL feedback integration', () => {
+  it('connects to the PostgreSQL major version selected by the test environment', async () => {
+    if (!admin) throw new Error('BOTMUX_TEST_POSTGRES_URL_required');
+    const version = Number((await admin.query('SHOW server_version_num')).rows[0].server_version_num);
+    const major = Math.floor(version / 10000);
+    const expected = process.env.BOTMUX_TEST_POSTGRES_MAJOR;
+    if (expected) expect(major).toBe(Number(expected));
+    else expect(major).toBeGreaterThanOrEqual(15);
+  });
   it('survives an idle disconnect in a child without leaking the password to stderr', async () => {
     const child = spawnTsScript('test/helpers/feedback-pg-idle-child.ts', [], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
     let errors = '';

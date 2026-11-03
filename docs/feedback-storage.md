@@ -2,6 +2,14 @@
 
 SQLite remains the default. The backend is selected per BotMux data directory, shared by all its bots, CLI sends and Dashboard analytics. Session and scheduler databases are unaffected.
 
+## PostgreSQL compatibility
+
+PostgreSQL 17 is supported. Storage, TLS certificate validation, concurrent feedback, analytics, SQLite migration and crash recovery have been exercised against PostgreSQL 17.11 with Node and Bun. These checks required no PostgreSQL-specific runtime SQL changes.
+
+CI runs the same integration suite against PostgreSQL 15 and 17. Set `BOTMUX_TEST_POSTGRES_MAJOR=17` when verifying a PostgreSQL 17 endpoint; the test checks the server's actual `server_version_num` so accidentally connecting to another major version fails validation.
+
+The backend version selection is independent of production credentials and schema permissions. Compatibility testing does not upgrade or migrate an existing production database.
+
 ## Configure
 
 On a new interactive `botmux start`, select SQLite or PostgreSQL. Existing installations continue without a prompt. PostgreSQL accepts a JSON configuration file containing a credential reference:

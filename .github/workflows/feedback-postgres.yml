@@ -16,8 +16,13 @@ permissions:
 
 jobs:
   integration:
+    name: PostgreSQL ${{ matrix.postgres }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['15', '17']
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -38,7 +43,7 @@ jobs:
           docker run --detach --name feedback-pg -p 127.0.0.1:55439:5432 \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -v "$RUNNER_TEMP/feedback-pg:/certs" \
-            --entrypoint bash postgres:15 \
+            --entrypoint bash postgres:${{ matrix.postgres }} \
             -c 'cp /certs/server.* /tmp/; chown postgres:postgres /tmp/server.*; chmod 600 /tmp/server.key; exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key'
           for attempt in $(seq 1 60); do
             if docker exec feedback-pg pg_isready -U postgres; then exit 0; fi
@@ -49,6 +54,7 @@ jobs:
       - name: Test real backends and migration
         env:
           BOTMUX_TEST_POSTGRES_URL: postgresql://postgres@127.0.0.1:55439/postgres
+          BOTMUX_TEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
         run: |
           export BOTMUX_TEST_POSTGRES_CA="$RUNNER_TEMP/feedback-pg/server.crt"
           export HOME="$RUNNER_TEMP/feedback-home"
