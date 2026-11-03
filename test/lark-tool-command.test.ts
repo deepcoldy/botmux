@@ -25,6 +25,25 @@ describe('lark-cli argv metadata', () => {
     }
   });
 
+  it.each([
+    ['--signature-id', 'mail +signature'],
+    ['--writes', '{sheet_name|sheet_id, range, cells}'],
+    ['--border-styles', '{ top|bottom|left|right }'],
+    ['--properties', '+cond-format-create --properties'],
+    ['--sort-keys', '[{"column":"<col letter>","order":"asc"}]'],
+  ])('reads %s when its help type contains spaces', (flag, type) => {
+    const readHelp = (cmd: readonly string[]) => {
+      const help = readLarkToolHelp(cmd);
+      return cmd.join(' ') === 'docs +fetch'
+        ? help.replace('      --dry-run', `      ${flag} ${type}   Value with a structured type\n      --dry-run`)
+        : help;
+    };
+    const args = ['docs', '+fetch', flag, '--as=user', '--dry-run'];
+    const invocation = parseLarkToolInvocation(args, binding, readHelp);
+    expect(invocation.mode).toBe('bot');
+    expect(larkToolExecutionArgs(invocation)).toEqual([...args, '--as', 'bot']);
+  });
+
   it('resolves a lone subcommand listed with Cobra single-space padding', () => {
     const readHelp = (cmd: readonly string[]) => {
       const key = cmd.join(' ');
