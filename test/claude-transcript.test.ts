@@ -701,6 +701,7 @@ describe('findJsonlContainingFingerprint', () => {
     const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
     const ev = {
       type: 'user',
+      isMeta: true,
       timestamp: '2026-09-17T03:39:54.000Z',
       message: {
         role: 'user',
@@ -714,6 +715,34 @@ describe('findJsonlContainingFingerprint', () => {
     expect(findJsonlContainingFingerprint(projectDir, '那先提交&push 一波把', {
       includeSubagentTranscripts: true,
     })).toBe(subagent);
+  });
+
+  it('does not treat the initial subagent task instruction as forwarded delivery', () => {
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const subDir = join(projectDir, sid, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
+    const submittedFingerprint = 'review the exact submission marker';
+    writeFileSync(subagent, [
+      JSON.stringify({
+        type: 'user',
+        isSidechain: true,
+        timestamp: '2026-09-17T03:39:54.000Z',
+        message: { role: 'user', content: `Initial agent task: ${submittedFingerprint}` },
+      }),
+      JSON.stringify({
+        type: 'user',
+        isSidechain: true,
+        isMeta: true,
+        timestamp: '2026-09-17T03:39:55.000Z',
+        message: { role: 'user', content: 'The user sent a new message while you were working: unrelated follow-up' },
+      }),
+    ].join('\n') + '\n');
+    utimesSync(subagent, 2_000_000, 2_000_000);
+
+    expect(findJsonlContainingFingerprint(projectDir, submittedFingerprint, {
+      includeSubagentTranscripts: true,
+    })).toBeNull();
   });
 
   it('respects minMtimeMs for subagent transcripts', () => {
