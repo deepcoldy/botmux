@@ -785,7 +785,9 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 ### 15.3 正在跑的 run
 
 - **没有 `nodeExecutor` 字段的 run**：按旧方式跑完，包括之后的重试、Loop 追加、Revisit。开关切换不影响已经开始的 run。
-- **降级到旧版本时**：新模式写出的 `run.json`，以及带流程版本的 run，旧版本 daemon 读到会因 schema 的 `.strict()` 校验失败而拒绝驱动，不会被误当成旧方式执行。这一点在 PR 里用旧版本构建实测一次。
+- **降级到旧版本时（新模式的 run）**：新模式写出的 `run.json`，旧版本 daemon 读到会因 schema 的 `.strict()` 校验失败而拒绝驱动，不会被误当成旧方式执行。这一点在 PR 里用旧版本构建实测一次。
+- **降级到旧版本时（改过流程的 run）**：`.strict()` 拦不住，旧版本 daemon 会照常驱动。原因是流程版本不写进 `run.json`：版本记录在 journal 的事件（`dagRevised`、`dagRevisionProposed` 等）和 run 目录下的 `dag-revisions/` 文件里，`run.json` 和 `dag.json`（第 1 版）都不变。旧版本重放 journal 时不认识这些事件，直接跳过，于是按第 1 版继续执行：可能执行已经删掉的节点、按改前的定义跑改过的节点，也会绕过还在等发起人确认的修改（旧版本不知道要停住修改涉及的节点）。
+  - 对用户的建议：改过流程的 run（run 目录下有 `dag-revisions/`，看板上显示的版本大于 1）不要降级 daemon。确实要降级，先把这些 run 取消（进度卡上的取消，或 `botmux workflow cancel <runId>`），或者等它们结束后再降级。
 
 ### 15.4 `/workflow` 命令和 CLI
 
@@ -835,7 +837,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 | 2 | `feat(workflow): workflow skill 改为确定使用时按需注入` | 第 4 节：去掉三个 skill 的常驻注入，改写发现提示，`/workflow` 改为按需读取；补「开关关闭时完全不注入」的回归测试。节点会话的跳过逻辑放到 PR 5a | 无 |
 | 3 | `feat(workflow): 节点改为落盘等待的外部执行（引擎层）` | 第 9 节：`nodeExecutor`、新事件和重放、等待外部、冷启动对账、超时与可注入时钟、取消与迟到提交、计数 key 修正。传输层用假实现 | 1（文档） |
 | 4 | `feat(workflow): 运行中按版本修改流程` | 第 13 节：`workflow edit/status`、版本文件与事件、13.4 的处理规则、校验；M1 的回合鉴权（他人回合转待确认）；新增 `workflow-event` turn 来源（本 PR 的 `edit` 与 5b 的 `retry` / `ask-human` 共用，在本 PR 落地）；M2 的确认清单与确认卡；看板和进度卡的版本显示 | 3 |
-| 5a | `feat(workflow): 节点交给群里的 Bot 执行（默认关）` | 开关；只做节点话题落点；节点卡、交接、签名登记与撤销；chatGrant 与接单；附件输入；`report --output/--result-file` 与提交区（主 Bot 离线时暂存）；回报卡；停下、超时、取消；指派给自己；节点会话不注入 workflow 与编排类 skill（N3）；文档站更新 | 3 |
+| 5a | `feat(workflow): 节点交给群里的 Bot 执行（默认关）`（已完成：#2710） | 开关；只做节点话题落点；节点卡、交接、签名登记与撤销；chatGrant 与接单；附件输入；`report --output/--result-file` 与提交区（主 Bot 离线时暂存）；回报卡；停下、超时、取消；指派给自己；节点会话不注入 workflow 与编排类 skill（N3）；文档站更新 | 3 |
 | 5b | `feat(workflow): 主话题交接与主 Bot 按事件调整` | 落点字段与主话题落点的硬规则；主 Bot 唤醒（M6）；自动处理与交给人的理由记录（M3）；`--working-dir` 以目标为准 | 5a、4 |
 | 6 | `feat(workflow): 按群成员和能力给节点分配 Bot` | `assignee`；Architect 名单、理由和落点依据；`approve-dag` 合格检查；Gate-2 摘要；阻塞卡改派 | 5 |
 | 7 | `feat(workflow): 交接带上发起人身份（默认关）` | 第 10 节 | 5 |
