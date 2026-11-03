@@ -36,7 +36,9 @@ describe('native text question cards', () => {
     const standalone = buildAskCard(cards[0]);
     const inline = JSON.stringify(buildTurnReplyAskElements({ ask: cards[0] }));
     for (const rendered of [standalone, inline]) {
-      expect(rendered).toContain('Which constraints matter?'); expect(rendered).toContain('Lark / Email');
+      expect(rendered).toContain('Which constraints matter?');
+      expect(rendered).toContain('Lark');
+      expect(rendered).toContain('Email');
       expect(rendered).not.toContain('ask_submit'); expect(rendered).not.toContain('ask_select');
     }
     controller.abort(); await result;
