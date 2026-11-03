@@ -5,7 +5,6 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
-import { createRedactor, redactTree, secretValues } from './midscene-redact.mjs';
 import {
   attemptResultCases,
   feishuLaneProject,
@@ -282,12 +281,7 @@ function landingPage(cases, videosByCase) {
 </html>`;
 }
 
-/**
- * @param {Record<string, string>} options command-line options
- * @param {{ env?: Record<string, string | undefined> }} [context] where the
- *        Midscene model configuration to mask is read from
- */
-export async function prepareMidscenePages(options, { env = process.env } = {}) {
+export async function prepareMidscenePages(options) {
   const dashboardKey = 'dashboard-report-root' in options ? 'dashboard-report-root' : 'report-root';
   const dashboardReportRoot = required(options, dashboardKey);
   const skippedCasesDir = required(options, 'skipped-cases-dir');
@@ -352,15 +346,9 @@ export async function prepareMidscenePages(options, { env = process.env } = {}) 
 
   const passed = new Set(cases.filter((testCase) => testCase.status === 'success').map((testCase) => testCase.name));
   const videosByCase = await videoSources(options['videos-dir'], output, (name) => !passed.has(name));
-  // Everything below is published; the model configuration is masked first
-  // (the manifest also feeds the failure comments on pull requests).
-  const secrets = secretValues(env);
-  const redact = createRedactor(secrets);
-  const manifest = JSON.parse(redact(JSON.stringify({ schemaVersion: 1, cases })));
+  const manifest = { schemaVersion: 1, cases };
   await writeFile(path.join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-  await writeFile(path.join(output, 'index.html'), landingPage(manifest.cases, videosByCase));
-  const redacted = await redactTree(output, secrets);
-  if (redacted.length > 0) process.stdout.write(`Masked the Midscene model configuration in ${redacted.length} published file(s).\n`);
+  await writeFile(path.join(output, 'index.html'), landingPage(cases, videosByCase));
   process.stdout.write(`Prepared ${cases.length} Midscene cases for publication.\n`);
   return manifest;
 }

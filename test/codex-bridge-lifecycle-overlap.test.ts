@@ -45,6 +45,18 @@ function replay() {
     close: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
+function startMergedTurnWithActivePredecessor(h: ReturnType<typeof replay>) {
+  h.queue.mark('z', 'Zero report', 90);
+  h.line('session_meta', { id: 'provider' }, 95);
+  h.line('event_msg', { type: 'task_started', turn_id: 'X0' }, 100);
+  h.line('response_item', user('Zero report'), 200);
+  h.queue.mark('a', 'Alpha report', 290);
+  h.line('event_msg', { type: 'task_started', turn_id: 'X' }, 300);
+  h.line('response_item', user('Alpha report'), 400);
+  h.queue.mark('b', 'Bravo report', 490);
+  h.line('response_item', user('Bravo report'), 500);
+}
+
 describe('Codex merged lifecycle overlaps with pending input', () => {
   const cases = (['task_complete', 'turn_aborted'] as const).flatMap(terminal =>
     (['none', 'before-start', 'after-start'] as const).flatMap(recovery =>
@@ -81,6 +93,95 @@ describe('Codex merged lifecycle overlaps with pending input', () => {
         h.line('event_msg', { type: 'task_complete', turn_id: 'Z', last_agent_message: 'C answer' }, 980);
         expect(h.queue.drainEmittable().map(turn => [turn.turnId, turn.finalText])).toEqual([['c', 'C answer']]);
       }
+      expect(h.queue.size()).toBe(0);
+    } finally { h.close(); }
+  });
+
+  it('does not deliver a late X abort after replacement user handoff and Y completion', () => {
+    const h = replay();
+    try {
+      h.setup();
+      h.queue.mark('c', 'Third report', 390);
+      h.line('event_msg', { type: 'task_started', turn_id: 'Y' }, 400);
+      h.line('response_item', user('Third report'), 500);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'Y', last_agent_message: 'C answer' }, 900);
+      const ready = h.queue.drainEmittable();
+      expect(ready.map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+        ['c', 'Y', 'C answer'],
+      ]);
+      expect(ready[0].supersededTurns).toBeUndefined();
+      h.queue.mark('d', 'Fourth report', 905);
+      h.line('event_msg', { type: 'turn_aborted', turn_id: 'X' }, 910);
+      expect(h.queue.drainEmittable()).toEqual([]);
+      expect(h.queue.peek().map(turn => [turn.turnId, turn.started])).toEqual([['d', false]]);
+      h.line('event_msg', { type: 'task_started', turn_id: 'Z' }, 940);
+      h.line('response_item', user('Fourth report'), 950);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'Z', last_agent_message: 'D answer' }, 980);
+      expect(h.queue.drainEmittable().map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+        ['d', 'Z', 'D answer'],
+      ]);
+      expect(h.queue.size()).toBe(0);
+    } finally { h.close(); }
+  });
+
+  it.each(['task_complete', 'turn_aborted'] as const)('settles exact X on %s while Y is only a replacement candidate', terminal => {
+    const h = replay();
+    try {
+      h.setup();
+      h.queue.mark('c', 'Third report', 390);
+      h.line('event_msg', { type: 'task_started', turn_id: 'Y' }, 400);
+      // No user handoff has happened: the HOL successor still owns X.
+      h.line('event_msg', { type: terminal, turn_id: 'X', last_agent_message: 'B answer' }, 450);
+      const ready = h.queue.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0]).toMatchObject({ turnId: 'b', sourceTurnId: 'X',
+        finalText: terminal === 'task_complete' ? 'B answer' : '',
+        ...(terminal === 'turn_aborted' ? { terminalStatus: 'ambiguous' } : {}) });
+      expect(h.queue.peek().map(turn => [turn.turnId, turn.started])).toEqual([['c', false]]);
+      h.line('event_msg', { type: 'task_started', turn_id: 'Z' }, 600);
+      h.line('response_item', user('Third report'), 700);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'Z', last_agent_message: 'C answer' }, 900);
+      expect(h.queue.drainEmittable().map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+        ['c', 'Z', 'C answer'],
+      ]);
+      expect(h.queue.size()).toBe(0);
+    } finally { h.close(); }
+  });
+
+  it('preserves independent replies when a replacement start meets multiple active turns', () => {
+    const h = replay();
+    try {
+      startMergedTurnWithActivePredecessor(h);
+      h.queue.mark('c', 'Charlie report', 590);
+      h.line('event_msg', { type: 'task_started', turn_id: 'Y' }, 600);
+      h.line('response_item', user('Charlie report'), 700);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'X0', last_agent_message: 'Z answer' }, 750);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'X', last_agent_message: 'AB answer' }, 800);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'Y', last_agent_message: 'C answer' }, 900);
+      expect(h.queue.drainEmittable().map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+        ['z', 'X0', 'Z answer'], ['b', 'X', 'AB answer'], ['c', 'Y', 'C answer'],
+      ]);
+      expect(h.queue.size()).toBe(0);
+    } finally { h.close(); }
+  });
+
+  it('waits for exact terminal evidence when multiple active turns make replacement ambiguous', () => {
+    const h = replay();
+    try {
+      startMergedTurnWithActivePredecessor(h);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'Y', last_agent_message: 'Unattributed answer' }, 600);
+      expect(h.queue.drainEmittable()).toEqual([]);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'X0', last_agent_message: 'Z answer' }, 700);
+      expect(h.queue.drainEmittable().map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+        ['z', 'X0', 'Z answer'],
+      ]);
+      expect(h.queue.peek().map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+        ['b', 'X', undefined],
+      ]);
+      h.line('event_msg', { type: 'task_complete', turn_id: 'X', last_agent_message: 'AB answer' }, 800);
+      expect(h.queue.drainEmittable().map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+        ['b', 'X', 'AB answer'],
+      ]);
       expect(h.queue.size()).toBe(0);
     } finally { h.close(); }
   });

@@ -17,7 +17,7 @@ import { materialize } from '../src/workflows/v3/state.js';
 import { readAndValidateManifest } from '../src/workflows/v3/manifest.js';
 import { openV3WorkerAttempts } from '../src/workflows/v3/attempt-ledger.js';
 import { openV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
-import { runWorkflow } from '../src/workflows/v3/runtime.js';
+import { runWorkflow, v3AcceptanceProbeUnknownSince } from '../src/workflows/v3/runtime.js';
 import {
   V3_HANDOFF_IDEMPOTENCY_WINDOW_MS,
   type V3ExternalNodeExecutor,
@@ -28,6 +28,7 @@ import {
   recordExternalAccepted,
   recordExternalStalled,
   reportExternalBlocked,
+  stageExternalSubmissionForInstall,
 } from '../src/workflows/v3/external-control.js';
 import { requestV3Retry } from '../src/workflows/v3/daemon-run.js';
 import type { RunNode } from '../src/workflows/v3/contract.js';
@@ -1308,5 +1309,111 @@ describe('external goal nodes — review regressions', () => {
     const attemptId = run.openAttempt('write').attemptId;
     expect(recordExternalAccepted(run.runDir, { attemptId, sessionId: 's', acceptedAt: run.clock.t + 3_600_000 }, run.ctx()))
       .toMatchObject({ ok: true, deadlineAt: run.clock.t + TIMEOUT_SEC * 1000 });
+  });
+});
+
+describe('external goal nodes — engine follow-ups', () => {
+  const twoBots = new Map([
+    ['cli_a', { larkAppId: 'cli_a', cliId: 'claude-code' as const, workingDir: '/tmp' }],
+    ['cli_b', { larkAppId: 'cli_b', cliId: 'claude-code' as const, workingDir: '/tmp' }],
+  ]);
+
+  it('reassignNode: a validated envelope pinning "bot" is enough, even without a journal stamp', async () => {
+    const base = trackTempDir(mkdtempSync(join(tmpdir(), 'v3-ext-pinned-bot-')));
+    const runDir = join(base, 'rv-pinned-bot');
+    mkdirSync(runDir);
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId: 'rv-pinned-bot' });
+    const outcome = await reassignNode(runDir, { nodeId: 'write', toLarkAppId: 'cli_b', by: 'ou_owner' }, {
+      dag: reportDag('rv-pinned-bot'),
+      botSnapshots: twoBots,
+      nodeExecutor: 'bot',
+    });
+    expect(outcome).toMatchObject({ kind: 'reassigned', from: 'cli_a', to: 'cli_b' });
+    expect(readJournal(join(runDir, 'journal.ndjson')).map((event) => event.type)).toEqual(['runStarted', 'nodeReassigned']);
+  });
+
+  it('reassignNode: an envelope without the field (null) refuses even when the journal is stamped "bot"', async () => {
+    const run = new BotRun(reportDag('rv-pinned-null'));
+    await run.drive(new FakeExecutor());
+    expect(run.of('runStarted')).toEqual([expect.objectContaining({ nodeExecutor: 'bot' })]);
+    const before = run.events().length;
+    expect(await reassignNode(run.runDir, { nodeId: 'write', toLarkAppId: 'cli_b', by: 'ou_owner' }, {
+      ...run.ctx(),
+      botSnapshots: twoBots,
+      nodeExecutor: null,
+    })).toEqual({ kind: 'rejected', reason: 'not-bot-run' });
+    expect(run.events()).toHaveLength(before);
+  });
+
+  it('unknown-probe bookkeeping of a run is dropped once the run reaches a terminal state', async () => {
+    const run = new BotRun(reportDag('rv-probe-cleanup'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = run.openAttempt('write').attemptId;
+    executor.onProbe = () => { throw new Error('session store unreadable'); };
+    run.clock.t = run.openAttempt('write').acceptDeadlineAt!;
+    expectAwaitingExternal(await run.drive(executor));
+    expect(v3AcceptanceProbeUnknownSince(run.runDir, attemptId)).toBe(run.clock.t);
+
+    // The bot submits anyway; the run completes.
+    expect(await run.submit(attemptId, reportFiles())).toMatchObject({ ok: true });
+    expect(expectTerminal(await run.drive(executor)).runStatus).toBe('succeeded');
+    expect(v3AcceptanceProbeUnknownSince(run.runDir, attemptId)).toBeUndefined();
+  });
+});
+
+describe('external goal nodes — staged submission while the run owner is offline (review P2-2)', () => {
+  it('stages only a valid submission, never journals, and the next drive commits it — even past the deadline', async () => {
+    const run = new BotRun(reportDag('rv-stage'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = run.openAttempt('write').attemptId;
+    run.accept(attemptId, 'sess-1');
+    const before = run.events().length;
+
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-1', files: [{ key: 'report', data: Buffer.from('# r') }], result: { message: 1 }, summary: 's',
+    }, run.ctx())).toMatchObject({ ok: false, reason: 'invalid' });
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-other', ...reportFiles(), summary: 's',
+    }, run.ctx())).toEqual({ ok: false, reason: 'session-mismatch' });
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-1', ...reportFiles(), summary: 's',
+    }, run.ctx())).toEqual({ ok: true, kind: 'staged' });
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-1', ...reportFiles(), summary: 's',
+    }, run.ctx())).toEqual({ ok: false, reason: 'pending' });
+    expect(run.events()).toHaveLength(before);
+
+    run.clock.t = run.openAttempt('write').deadlineAt! + 60_000;
+    expect(expectTerminal(await run.drive(executor)).runStatus).toBe('succeeded');
+    expect(run.of('nodeBlocked')).toEqual([]);
+  });
+
+  it('M17: an attempt that closes while the submission is being validated is not staged', async () => {
+    const run = new BotRun(reportDag('rv-stage-race'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = run.openAttempt('write').attemptId;
+    run.accept(attemptId, 'sess-1');
+    const staging = stageExternalSubmissionForInstall(run.runDir, { attemptId, sessionId: 'sess-1', ...reportFiles(), summary: 's' }, run.ctx());
+    // Lands after the cheap pre-check, before the locked commit of the intent.
+    appendEvent(run.journalPath, { type: 'runCancelRequested', cancelRequestId: 'c-race', by: 'ou' });
+    expect(await staging).toEqual({ ok: false, reason: 'cancelled' });
+    expect(existsSync(join(run.runDir, attemptId, 'submission.intent.json'))).toBe(false);
+  });
+
+  it('a staged submission for an attempt that closed meanwhile is discarded on install', async () => {
+    const run = new BotRun(reportDag('rv-stage-late'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = run.openAttempt('write').attemptId;
+    run.accept(attemptId, 'sess-1');
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-1', ...reportFiles(), summary: 's',
+    }, run.ctx())).toMatchObject({ ok: true });
+    appendEvent(run.journalPath, { type: 'runCancelRequested', cancelRequestId: 'c-1', by: 'ou' });
+    expect(expectTerminal(await run.drive(executor)).runStatus).toBe('cancelled');
+    expect(run.of('nodeSucceeded')).toEqual([]);
   });
 });

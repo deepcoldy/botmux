@@ -439,7 +439,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       false,
       // 17th arg: streaming-card usage snapshot (no transcript in this test →
       // empty; turnTokens is always present, null when no turn delta is known).
-      { context: null, tokens: null, turnTokens: null },
+      // A supported Claude session also carries the idle auto-compact toggle state.
+      { context: null, tokens: null, turnTokens: null, idleAutoCompact: { enabled: false, minutes: 55 } },
       // 18th arg: no configured runtime display name for this Claude fixture.
       undefined,
       // 19th arg: Codex Fast tier badge — undefined for this non-Codex fixture.

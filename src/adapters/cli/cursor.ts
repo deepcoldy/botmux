@@ -7,6 +7,7 @@ import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type S
 
 import { delay } from '../../utils/timing.js';
 import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
  *  cursor-agent's TUI is still doing its startup render, so it needs a longer
@@ -74,7 +75,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
         base.push('--model', model.trim());
       }
       if (promptInjection !== 'none') {
-        base.push('--plugin-dir', CURSOR_PLUGIN_DIR);
+        base.push('--plugin-dir', builtinPluginDirForSession(CURSOR_PLUGIN_DIR));
         if (skillPluginDir) base.push('--plugin-dir', skillPluginDir);
       }
       if (!resume) {

@@ -470,10 +470,6 @@ jobs:
         env:
           FEISHU_OUTCOME: ${{ steps.outcomes.outputs.feishu }}
           FEISHU_CASES: ${{ steps.outcomes.outputs.feishu-cases }}
-          # Masked out of everything published (scripts/midscene-redact.mjs).
-          MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
-          MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
-          MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
         run: |
           arguments=(
             --dashboard-report-root test/midscene/midscene_run
@@ -498,10 +494,6 @@ jobs:
           FEISHU_OUTCOME: ${{ steps.outcomes.outputs.feishu }}
           FEISHU_CASES: ${{ steps.outcomes.outputs.feishu-cases }}
           REPORT_SITE_URL: ${{ steps.report_target.outputs.site-url }}
-          # Masked out of everything published (scripts/midscene-redact.mjs).
-          MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
-          MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
-          MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
         run: |
           node scripts/render-midscene-summary.mjs \
             --results midscene_run/dashboard/results \
