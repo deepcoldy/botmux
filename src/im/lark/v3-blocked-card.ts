@@ -64,6 +64,8 @@ export interface V3BlockedCardInput {
   ask?: { question: string; options?: string[]; freeText?: boolean };
   /** 有值 → 渲染冻结的「已回答」卡（ask 专用，无按钮）。 */
   answered?: { selected?: string; text?: string; nextAttemptId: string; by?: string };
+  /** 流程修改后这个问题作废（ask 专用，无按钮）：节点要重新走审批，答案不会送达。 */
+  askVoided?: boolean;
 }
 
 const DEFAULT_MESSAGE_MAX_CHARS = 500;
@@ -83,7 +85,8 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   // 四态共用一张卡，header 决定语气：蓝=等人拍板 / 绿=已回答·已重试 / 橙=受阻待重试。
   let title: string;
   let template: string;
-  if (answered) { title = `已回答：节点 ${input.nodeId}`; template = 'green'; }
+  if (input.askVoided) { title = `问题已作废：节点 ${input.nodeId}`; template = 'grey'; }
+  else if (answered) { title = `已回答：节点 ${input.nodeId}`; template = 'green'; }
   else if (ask) { title = `需要你拍板：节点 ${input.nodeId}`; template = 'blue'; }
   else if (retried) { title = `已重试：节点 ${input.nodeId}`; template = 'green'; }
   else if (input.retryForbidden === 'host-effect-uncertain') {
@@ -115,7 +118,13 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
         text: { tag: 'lark_md', content: `**${escapeMd(truncate(question, msgMax))}**` },
       });
     }
-    if (answered) {
+    if (input.askVoided) {
+      elements.push({ tag: 'hr' });
+      elements.push({
+        tag: 'div',
+        text: { tag: 'plain_text', content: '⏹️ 流程已修改，这个问题已作废；节点会按新的定义重新审批，届时请重新回答。' },
+      });
+    } else if (answered) {
       const answerPreview = answered.text ?? answered.selected ?? '';
       elements.push({ tag: 'hr' });
       elements.push({

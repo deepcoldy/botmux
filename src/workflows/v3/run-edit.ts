@@ -22,7 +22,9 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
+  writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -44,6 +46,7 @@ import {
   V3DagPatchError,
   type V3DagPatch,
   type V3RerunBudgetBlock,
+  v3RevisitBudgetEpoch,
   type V3RevisionChanges,
   type V3RevisionPlan,
   type V3RevisionRecord,
@@ -831,9 +834,11 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
       if (!existsSync(journalPath)) continue;
       let events = readJournal(journalPath);
       const hasProposals = events.some((event) => event.type === 'dagRevisionProposed');
-      const owesFollowUps = missingV3RevisionFollowUps(events).length > 0;
-      if (!hasProposals && !owesFollowUps) continue;
+      if (!hasProposals && missingV3RevisionFollowUps(events).length === 0) continue;
       const run = loadEditableRun(baseDir, runId);
+      const liveNodeIds = new Set(loadEffectiveV3Dag(runDir, run.approvedDag, events).dag.nodes.map((node) => node.id));
+      const owesFollowUps = missingV3RevisionFollowUps(events, liveNodeIds).length > 0;
+      if (!hasProposals && !owesFollowUps) continue;
       if (ownerLarkAppId && run.binding?.larkAppId !== ownerLarkAppId) continue;
       const rec: V3RevisionRecovery = {
         runId,
@@ -847,7 +852,7 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
         // A revision's reassign / re-run lost its dedicated event to a crash:
         // finish it so the run resumes instead of re-announcing a block.
         const appended = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
-          const missing = missingV3RevisionFollowUps(latest);
+          const missing = missingV3RevisionFollowUps(latest, liveNodeIds);
           for (const event of missing) append(event, { durable: true });
           return missing.length;
         });
@@ -1120,9 +1125,35 @@ export function formatV3RunStatus(view: V3RunStatusView): string {
 
 // ─── Rerun budget grant (「追加重做额度」card) ─────────────────────────────
 
+/** One grant card per (node, exhaustion epoch): create-once marker. True when
+ *  this call claimed the right to post (repeated refusals do not re-post). */
+export function claimV3RerunGrantCard(baseDir: string, runId: string, nodeId: string, epoch: number): boolean {
+  const dir = join(runDirFor(baseDir, runId), 'waits', 'rerun-grants');
+  ensurePrivateDir(join(runDirFor(baseDir, runId), 'waits'));
+  ensurePrivateDir(dir);
+  try {
+    writeFileSync(join(dir, `${nodeId}.${epoch}.json`), `${JSON.stringify({ nodeId, epoch, at: Date.now() })}\n`, { flag: 'wx', mode: 0o600 });
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw err;
+  }
+}
+
+/** The card could not be posted: let the next refusal try again. */
+export function releaseV3RerunGrantCard(baseDir: string, runId: string, nodeId: string, epoch: number): void {
+  try {
+    rmSync(join(runDirFor(baseDir, runId), 'waits', 'rerun-grants', `${nodeId}.${epoch}.json`), { force: true });
+  } catch {
+    // best effort
+  }
+}
+
 export type V3RerunBudgetGrantOutcome =
   | { kind: 'granted'; tier: 'pair' | 'run' }
   | { kind: 'already-granted' }
+  /** The card belongs to an earlier exhaustion; a newer card was posted. */
+  | { kind: 'expired' }
   | { kind: 'unauthorized' }
   | { kind: 'stale'; detail: string }
   | { kind: 'missing' };
@@ -1136,6 +1167,8 @@ export function grantV3RerunBudget(input: {
   baseDir: string;
   runId: string;
   nodeId: string;
+  /** Exhaustion epoch the card was posted for. */
+  epoch: number;
   by: string;
 }): V3RerunBudgetGrantOutcome {
   let run: LoadedEditableRun;
@@ -1150,6 +1183,7 @@ export function grantV3RerunBudget(input: {
     if (status !== 'running' && status !== 'blocked') return { kind: 'stale', detail: `run is ${status}` };
     const budget = revisitBudgetStatus([...events], input.nodeId, input.nodeId);
     if (budget.ok) return { kind: 'already-granted' };
+    if (v3RevisitBudgetEpoch(events) !== input.epoch) return { kind: 'expired' };
     append({
       type: 'revisitBudgetGranted',
       ...(budget.tier === 'pair' ? { sourceNodeId: input.nodeId, toNodeId: input.nodeId } : {}),

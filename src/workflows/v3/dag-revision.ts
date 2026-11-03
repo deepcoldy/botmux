@@ -736,6 +736,20 @@ export interface PlanV3DagRevisionInput {
 export interface V3RerunBudgetBlock {
   nodeId: string;
   tier: 'pair' | 'run';
+  /** Which exhaustion this is (see {@link v3RevisitBudgetEpoch}): one grant
+   *  card per epoch; a card from an older epoch is expired. */
+  epoch: number;
+}
+
+/** Changes whenever the revisit budget is spent or granted. While the budget
+ *  stays exhausted it stays the same, so repeated refusals share one epoch. */
+export function v3RevisitBudgetEpoch(events: readonly StoredEvent[]): number {
+  let epoch = 0;
+  for (const event of events) {
+    if (event.type === 'nodeRevisitRequested' || event.type === 'revisitBudgetGranted') epoch++;
+    else if (event.type === 'dagRevised') epoch += event.effects?.rerun?.length ?? 0;
+  }
+  return epoch;
 }
 
 export type PlanV3DagRevisionResult =
@@ -1052,7 +1066,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
             `${where}: 节点 "${op.nodeId}" 的重做额度已用完（${budget.tier === 'pair' ? '本节点' : '整个 run'}的 Revisit 额度）；` +
             '需要发起人在「追加重做额度」卡上同意后再提交这次修改',
           );
-          rerunBudget = { nodeId: op.nodeId, tier: budget.tier };
+          rerunBudget = { nodeId: op.nodeId, tier: budget.tier, epoch: v3RevisitBudgetEpoch(events) };
           return;
         }
         rerun.add(op.nodeId);
@@ -1390,12 +1404,18 @@ export function v3RevisionFollowUps(
     assign?: ReadonlyArray<{ nodeId: string; from?: string; to: string }>;
     by: string;
     auto?: V3AutoProvenance;
+    /** Node ids of the effective flow, when known: follow-ups for nodes no
+     *  longer in it are skipped. */
+    liveNodeIds?: ReadonlySet<string>;
   },
 ): FollowUpEvent[] {
   const out: FollowUpEvent[] = [];
   const provenance = { by: input.by, ...(input.auto ? { auto: input.auto } : {}) };
   const snap = materialize([...events]);
   for (const item of input.assign ?? []) {
+    // A node a later revision removed is never reassigned after the fact.
+    if (snap.nodes.get(item.nodeId)?.status === 'cancelled') continue;
+    if (input.liveNodeIds && !input.liveNodeIds.has(item.nodeId)) continue;
     out.push({
       type: 'nodeReassigned',
       nodeId: item.nodeId,
@@ -1433,7 +1453,10 @@ export function v3RevisionFollowUps(
  * lost its second append. Returns the missing events (idempotent: once
  * appended they satisfy the check). Nothing is owed after a cancel request.
  */
-export function missingV3RevisionFollowUps(events: readonly StoredEvent[]): FollowUpEvent[] {
+export function missingV3RevisionFollowUps(
+  events: readonly StoredEvent[],
+  liveNodeIds?: ReadonlySet<string>,
+): FollowUpEvent[] {
   if (!events.some((event) => event.type === 'dagRevised' && (event.effects?.retry || event.effects?.assign))) return [];
   const snap = materialize([...events]);
   if (snap.runStatus !== 'running' && snap.runStatus !== 'blocked') return [];
@@ -1452,6 +1475,7 @@ export function missingV3RevisionFollowUps(events: readonly StoredEvent[]): Foll
       retry,
       by: event.by,
       ...(event.auto ? { auto: event.auto } : {}),
+      ...(liveNodeIds ? { liveNodeIds } : {}),
     }));
   });
   return missing;

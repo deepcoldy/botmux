@@ -1213,7 +1213,7 @@ export function requestV3RunCancel(
 export type V3RetryOutcome =
   | { kind: 'requested'; nodeId: string; previousAttemptId: string; nextAttemptId: string }
   | { kind: 'already-requested'; nodeId: string }
-  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' | 'host-effect-uncertain' | 'revise-workflow-required' };
+  | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' | 'host-effect-uncertain' | 'revise-workflow-required' | 'revised' };
 
 type V3RetryAnswerInput =
   | { selected: string; by: string }
@@ -1327,6 +1327,13 @@ export function requestV3Retry(
   // blocked retries pass no answer and this whole block is skipped.  Core
   // validates membership against the current ask, because a card nonce proves
   // freshness/integrity but not that `selected` is one of the authored options.
+  // A flow revision changed this node after its gate was passed: its next
+  // retry is a fresh instance that must pass the gate again, so an answer to
+  // the OLD instance's question would never reach it. Refuse visibly instead
+  // of reporting an answer that is silently dropped.
+  if (input.answer && instanceId && snap.regatePending?.has(instanceId)) {
+    return { kind: 'stale-run', reason: 'revised' };
+  }
   let answer: { path: string; preview: string; by: string } | undefined;
   if (input.answer) {
     if (!info.ask) {

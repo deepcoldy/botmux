@@ -111,7 +111,9 @@ export function formatV3RunEditResponse(
     const grant = body.rerunBudget
       ? body.grantCardPosted === false
         ? '\n追加重做额度卡发送失败，请让发起人稍后重试。'
-        : '\n已在主话题发「追加重做额度」卡；发起人同意后，用同样的 patch 重新提交。'
+        : body.grantCardPosted === 'already'
+          ? '\n主话题里已有这次的「追加重做额度」卡，等发起人处理，不要反复提交。'
+          : '\n已在主话题发「追加重做额度」卡；发起人同意后，用同样的 patch 重新提交。'
       : '';
     return { exitCode: 2, text: `❌ 修改未通过校验：\n  - ${(body.problems as unknown[]).map(String).join('\n  - ')}${grant}` };
   }

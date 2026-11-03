@@ -31,7 +31,7 @@ import { artifactRef, makeAdHocRunEnvelope, publishRunEnvelopeOnce } from '../sr
 import { createV3GateRunner } from '../src/workflows/v3/daemon-run.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { readWait } from '../src/workflows/v3/human-gate.js';
-import { applyV3RunEdit } from '../src/workflows/v3/run-edit.js';
+import { applyV3RunEdit, decideV3RevisionProposal } from '../src/workflows/v3/run-edit.js';
 import { handleV3GateAction } from '../src/im/lark/v3-gate-card-handler.js';
 import { V3_GATE_APPROVE_ACTION, v3GateCardNonce } from '../src/im/lark/v3-gate-card.js';
 import type { RunNode } from '../src/workflows/v3/contract.js';
@@ -47,7 +47,10 @@ function seed(base: string, runId: string): string {
   const write = (name: string, value: unknown) => writeFileSync(join(runDir, name), `${JSON.stringify(value, null, 2)}\n`);
   write('dag.json', {
     schemaVersion: 2, runId,
-    nodes: [{ id: 'g', type: 'goal', goal: 'ship', bot: 'cli_w', depends: [], inputs: [], humanGate: { prompt: 'ship?' } }],
+    nodes: [
+      { id: 'g', type: 'goal', goal: 'ship', bot: 'cli_w', depends: [], inputs: [], humanGate: { prompt: 'ship?' } },
+      { id: 'z', type: 'goal', goal: 'other work', bot: 'cli_w', depends: ['g'], inputs: [] },
+    ],
   });
   write('spec.json', {
     schemaVersion: 1, runId, title: 't', requirement: 'r',
@@ -96,5 +99,39 @@ describe('gate click racing a flow edit', () => {
 
     await runner.drive('run-race');
     expect(posted).toEqual(['g#001-gate', 'g#002-gate']);
+  });
+});
+
+describe('gate click racing the removal of its node', () => {
+  it('the click CAS wins, then a confirmed removal of the gated node lands: the click is voided', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-gate-race-rm-'));
+    dirs.push(base);
+    const runDir = seed(base, 'run-race-rm');
+    const posted: string[] = [];
+    const runner = createV3GateRunner({
+      baseDir: base, loadBots: () => [], makeRunNode: () => async () => { throw new Error('must not run'); },
+      postCard: async (_binding, gate) => { posted.push(gate.waitId); },
+    });
+    await runner.drive('run-race-rm');
+    expect(posted).toEqual(['g#001-gate']);
+    // Removing a node whose gate has not been passed needs the initiator.
+    expect(applyV3RunEdit({
+      baseDir: base, runId: 'run-race-rm', baseRevision: 1,
+      patch: [{ op: 'removeNode', nodeId: 'g' }, { op: 'setDepends', nodeId: 'z', depends: [] }],
+      caller: { openId: INITIATOR, origin: 'human' },
+      resolveNewBotSnapshot: () => { throw new Error('no new bots'); },
+    })).toMatchObject({ kind: 'proposed' });
+    hooks.afterCas = () => {
+      expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-race-rm', revision: 2, decision: 'approve', by: INITIATOR }))
+        .toMatchObject({ kind: 'approved' });
+    };
+    const card = await handleV3GateAction({
+      action: V3_GATE_APPROVE_ACTION, runId: 'run-race-rm', waitId: 'g#001-gate', nodeId: 'g',
+      nonce: v3GateCardNonce('run-race-rm', 'g#001-gate'),
+    }, INITIATOR, { baseDir: base, driveRun: () => {} }) as { elements?: Array<{ actions?: Array<{ value?: unknown }> }> };
+    expect(hooks.afterCas).toBeUndefined();
+    expect(card.elements?.some((element) => element.actions?.some((action) => action.value !== undefined))).toBe(false);
+    expect(readWait(runDir, 'g#001-gate')?.status).toBe('voided');
+    expect(readJournal(join(runDir, 'journal.ndjson')).some((event) => event.type === 'gateResolved')).toBe(false);
   });
 });

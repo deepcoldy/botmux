@@ -54,7 +54,7 @@ async function handleRerunGrant(
   deps: V3RevisionCardHandlerDeps,
 ): Promise<unknown> {
   if (!isValidRunId(value.runId) || typeof value.nodeId !== 'string' || !V3_DAG_SEGMENT_RE.test(value.nodeId) ||
-    value.nonce !== v3RerunGrantCardNonce(value.runId, value.nodeId)) {
+    !Number.isSafeInteger(value.epoch) || value.nonce !== v3RerunGrantCardNonce(value.runId, value.nodeId, value.epoch)) {
     return { toast: { type: 'warning', content: '重做额度卡已失效' } };
   }
   if (!operatorOpenId) return { toast: { type: 'warning', content: '无法识别操作人' } };
@@ -62,9 +62,12 @@ async function handleRerunGrant(
     baseDir: deps.baseDir ?? defaultBaseDir(),
     runId: value.runId,
     nodeId: value.nodeId,
+    epoch: value.epoch,
     by: operatorOpenId,
   });
   switch (outcome.kind) {
+    case 'expired':
+      return { toast: { type: 'warning', content: '这张卡已过期，请看主话题里最新的「追加重做额度」卡' } };
     case 'unauthorized':
       return { toast: { type: 'warning', content: '只有本流程的发起人能追加重做额度' } };
     case 'missing':
@@ -73,11 +76,11 @@ async function handleRerunGrant(
       return { toast: { type: 'info', content: '额度已经够用，请重新提交修改' } };
     case 'stale':
       return JSON.parse(buildV3RerunGrantCard({
-        runId: value.runId, nodeId: value.nodeId, tier: 'pair', resolution: { kind: 'void', detail: outcome.detail },
+        runId: value.runId, nodeId: value.nodeId, tier: 'pair', epoch: value.epoch, resolution: { kind: 'void', detail: outcome.detail },
       }));
     case 'granted':
       return JSON.parse(buildV3RerunGrantCard({
-        runId: value.runId, nodeId: value.nodeId, tier: outcome.tier, resolution: { kind: 'granted', by: operatorOpenId },
+        runId: value.runId, nodeId: value.nodeId, tier: outcome.tier, epoch: value.epoch, resolution: { kind: 'granted', by: operatorOpenId },
       }));
   }
 }

@@ -153,17 +153,20 @@ export interface V3RerunGrantActionValue {
   action: typeof V3_REVISION_RERUN_GRANT_ACTION;
   runId: string;
   nodeId: string;
+  /** The exhaustion this card was posted for (newer cards expire it). */
+  epoch: number;
   nonce: string;
 }
 
-export function v3RerunGrantCardNonce(runId: string, nodeId: string): string {
-  return `v3revrerun:${runId}:${nodeId}`;
+export function v3RerunGrantCardNonce(runId: string, nodeId: string, epoch: number): string {
+  return `v3revrerun:${runId}:${nodeId}:${epoch}`;
 }
 
 export function buildV3RerunGrantCard(input: {
   runId: string;
   nodeId: string;
   tier: 'pair' | 'run';
+  epoch: number;
   webDetailUrl?: string;
   resolution?: { kind: 'granted' | 'void'; by?: string; detail?: string };
 }): string {
@@ -196,7 +199,8 @@ export function buildV3RerunGrantCard(input: {
       action: V3_REVISION_RERUN_GRANT_ACTION,
       runId: input.runId,
       nodeId: input.nodeId,
-      nonce: v3RerunGrantCardNonce(input.runId, input.nodeId),
+      epoch: input.epoch,
+      nonce: v3RerunGrantCardNonce(input.runId, input.nodeId, input.epoch),
     };
     elements.push({ tag: 'action', actions: [button('➕ 追加 1 次', 'primary', value)] });
   }

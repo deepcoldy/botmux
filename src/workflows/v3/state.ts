@@ -73,6 +73,10 @@ export interface V3RunSnapshot {
   /** nodeId → larkAppId the node was reassigned to (latest `nodeReassigned`).
    *  Absent = the frozen bot snapshot's larkAppId. External executor only. */
   assignments: Map<string, string>;
+  /** Blocked instances a revision changed after their gate was passed: the
+   *  next retry runs as a fresh instance that must pass the gate again
+   *  (dagRevised effects.regate). Not persisted in STATE. */
+  regatePending?: ReadonlySet<string>;
 }
 
 // ─── Materialize (replay) ────────────────────────────────────────────────
@@ -373,12 +377,19 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
               ? { effectiveInstanceId: item.instanceId ?? prev?.effectiveInstanceId }
               : {}),
           });
-          // Cancelling a blocked node unblocks the run, like a retry does, so
-          // the next drive applies the downstream skip / fail rules (§13.3).
-          if (runStatus === 'blocked' && (prev?.status === 'blocked' || blockedNodeId === item.nodeId)) {
-            runStatus = 'running';
-            blockedNodeId = undefined;
-          }
+        }
+        // Removing the node the run is blocked on unblocks it (like a retry,
+        // so the next drive applies the downstream skip / fail rules, §13.3);
+        // removing some OTHER blocked node keeps the run blocked on the one
+        // still in the way — unblocking would only re-block and re-announce.
+        if (
+          runStatus === 'blocked' &&
+          (effects?.cancel ?? []).length > 0 &&
+          ((effects?.cancel ?? []).some((item) => item.nodeId === blockedNodeId) ||
+            ![...nodes.values()].some((state) => state.status === 'blocked'))
+        ) {
+          runStatus = 'running';
+          blockedNodeId = undefined;
         }
         for (const item of effects?.regate ?? []) {
           const prev = nodes.get(item.nodeId);
@@ -614,6 +625,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     loops,
     edges,
     assignments,
+    ...(regateInstances.size > 0 ? { regatePending: regateInstances } : {}),
   };
 }
 

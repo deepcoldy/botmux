@@ -776,7 +776,9 @@ import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3RerunGrantCard, buildV3RevisionCard } from './im/lark/v3-revision-card.js';
 import {
   applyV3RunEdit,
+  claimV3RerunGrantCard,
   projectV3RunStatus,
+  releaseV3RerunGrantCard,
   v3RunNeedsDriveAfterRevision,
   recordV3RevisionCardMessage,
   type V3RevisionCardView,
@@ -7912,6 +7914,7 @@ workflowDaemonMutationRoute('retry', async (reply, params, body, identity) => {
         : outcome.reason === 'loop-node' ? 'loop_node_use_grant'
         : outcome.reason === 'host-effect-uncertain' ? 'host_effect_reconcile_required'
         : outcome.reason === 'revise-workflow-required' ? 'workflow_revision_required'
+        : outcome.reason === 'revised' ? 'answer_voided_by_revision'
         : 'not_blocked',
     });
   }
@@ -8010,15 +8013,22 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
     case 'invalid': {
       // A rerun the revisit budget refused: put the grant in the initiator's
       // hands (one click unlocks one more rerun; the bot then re-submits).
-      let grantCardPosted: boolean | undefined;
-      if (outcome.rerunBudget) {
+      // One card per exhaustion: a bot re-submitting the same refused rerun
+      // does not flood the topic (the earlier card is still valid).
+      let grantCardPosted: boolean | 'already' | undefined;
+      if (outcome.rerunBudget && !claimV3RerunGrantCard(v3DefaultBaseDir(), runId, outcome.rerunBudget.nodeId, outcome.rerunBudget.epoch)) {
+        grantCardPosted = 'already';
+      } else if (outcome.rerunBudget) {
         grantCardPosted = true;
         try {
-          const card = buildV3RerunGrantCard({ runId, nodeId: outcome.rerunBudget.nodeId, tier: outcome.rerunBudget.tier });
+          const card = buildV3RerunGrantCard({
+            runId, nodeId: outcome.rerunBudget.nodeId, tier: outcome.rerunBudget.tier, epoch: outcome.rerunBudget.epoch,
+          });
           if (binding.rootMessageId) await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
           else await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
         } catch (err) {
           grantCardPosted = false;
+          releaseV3RerunGrantCard(v3DefaultBaseDir(), runId, outcome.rerunBudget.nodeId, outcome.rerunBudget.epoch);
           logger.warn(`[v3:${runId}] rerun grant card failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }

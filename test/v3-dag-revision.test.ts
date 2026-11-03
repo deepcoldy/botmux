@@ -26,6 +26,7 @@ import {
   v3RevisionFilePaths,
   V3DagPatchError,
   V3RevisionIntegrityError,
+  v3RevisitBudgetEpoch,
   type V3DoneNodeProducts,
 } from '../src/workflows/v3/dag-revision.js';
 
@@ -245,8 +246,13 @@ describe('§13.4 node-state rules', () => {
     expect(revisitBudgetStatus(after, 'a', 'a').ok).toBe(false);
     const second = plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]);
     expect(second.ok).toBe(false);
-    expect(!second.ok && second.rerunBudget).toEqual({ nodeId: 'a', tier: 'pair' });
+    const epoch = v3RevisitBudgetEpoch(after);
+    expect(!second.ok && second.rerunBudget).toEqual({ nodeId: 'a', tier: 'pair', epoch });
+    // Refused again while still exhausted: same exhaustion, same epoch.
+    const third = plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]);
+    expect(!third.ok && third.rerunBudget?.epoch).toBe(epoch);
     after.push(ev({ type: 'revisitBudgetGranted', sourceNodeId: 'a', toNodeId: 'a', by: 'ou_i' }));
+    expect(v3RevisitBudgetEpoch(after)).not.toBe(epoch);
     expect(plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]).ok).toBe(true);
   });
 
@@ -420,22 +426,31 @@ describe('review regressions (engine)', () => {
     expect(moved.ok && moved.plan.effects.regate).toBeUndefined();
   });
 
-  it('(b) cancelling any blocked node unblocks the run, like a retry', () => {
-    const events = [
+  it('(b) removing the node the run is blocked on unblocks it; removing another blocked node does not', () => {
+    const blockedPair = [
       ...started(),
       ...running('a'),
       ...running('c'),
       ev({ type: 'nodeBlocked', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001', errorClass: 'workerError' }),
       ev({ type: 'nodeBlocked', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', errorClass: 'workerError' }),
       ev({ type: 'runBlocked', blockedNodeId: 'a' }),
-      ev({
-        type: 'dagRevised', revision: 2, baseRevision: 1, sha256: 's', patchSha256: 'p', summary: '-1 节点', by: 'ou',
-        effects: { cancel: [{ nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001' }] },
-      }),
     ];
-    const snap = materialize(events);
-    expect(snap.runStatus).toBe('running');
-    expect(snap.blockedNodeId).toBeUndefined();
+    const cancelOf = (nodeId: string) => ev({
+      type: 'dagRevised', revision: 2, baseRevision: 1, sha256: 's', patchSha256: 'p', summary: '-1 节点', by: 'ou',
+      effects: { cancel: [{ nodeId, instanceId: `${nodeId}#001`, attemptId: `${nodeId}#001/attempts/001` }] },
+    });
+    // Another blocked node is still in the way: no unblock → re-block churn.
+    expect(materialize([...blockedPair, cancelOf('c')])).toMatchObject({ runStatus: 'blocked', blockedNodeId: 'a' });
+    // The blocker itself is gone: the run reopens (and re-decides).
+    expect(materialize([...blockedPair, cancelOf('a')])).toMatchObject({ runStatus: 'running' });
+    // A non-blocker blocked node, and it was the last blocked one.
+    const single = [
+      ...started(),
+      ...running('c'),
+      ev({ type: 'nodeBlocked', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', errorClass: 'workerError' }),
+      ev({ type: 'runBlocked', blockedNodeId: 'x' }),
+    ];
+    expect(materialize([...single, cancelOf('c')]).runStatus).toBe('running');
   });
 
   it('a rerun also spends the RUN-wide revisit budget', () => {

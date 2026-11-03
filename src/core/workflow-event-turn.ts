@@ -38,5 +38,14 @@ export function parseWorkflowEventTurnId(turnId: string): WorkflowEventTurnRef |
  *  that owns the run's binding). */
 export type WorkflowEventTurnVerifier = (input: WorkflowEventTurnRef & {
   turnId: string;
-  session: { sessionId: string; larkAppId: string; chatId: string; rootMessageId?: string };
-}) => { ok: true; callerOpenId: string } | { ok: false; reason: string };
+  session: {
+    sessionId: string;
+    larkAppId: string;
+    chatId: string;
+    rootMessageId?: string;
+    /** The session's live turn pointers. A human message arriving during the
+     *  event turn advances them; the verifier then refuses (generation join). */
+    quoteTargetId?: string;
+    currentReplyTargetTurnId?: string;
+  };
+}) => { ok: true; callerOpenId: string } | { ok: false; reason: string; stale?: boolean };

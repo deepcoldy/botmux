@@ -206,10 +206,16 @@ function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenti
         larkAppId: current.larkAppId,
         chatId: current.chatId,
         ...(current.rootMessageId ? { rootMessageId: current.rootMessageId } : {}),
+        ...(current.quoteTargetId ? { quoteTargetId: current.quoteTargetId } : {}),
+        ...(current.currentReplyTargetTurnId ? { currentReplyTargetTurnId: current.currentReplyTargetTurnId } : {}),
       },
     });
     if (!verdict.ok) {
-      return { ok: false, status: 403, error: 'workflow_event_turn_unauthorized', detail: verdict.reason };
+      // A human message overtook the wake turn: same refusal as a human turn
+      // whose pointers moved on (the caller re-runs in the newer turn).
+      return verdict.stale
+        ? { ok: false, status: 403, error: 'turn_provenance_stale', detail: verdict.reason }
+        : { ok: false, status: 403, error: 'workflow_event_turn_unauthorized', detail: verdict.reason };
     }
     callerOpenId = verdict.callerOpenId;
   } else if (liveTurnId && parseScheduledTurnId(liveTurnId)) {

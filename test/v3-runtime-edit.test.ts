@@ -64,7 +64,10 @@ import {
 } from '../src/im/lark/v3-revision-card.js';
 import { parseWorkflowDaemonMutationBody } from '../src/workflows/v3/daemon-ipc-body.js';
 import { authorizeV3SessionRunEditRequest } from '../src/workflows/v3/session-relay.js';
-import { grantV3RerunBudget } from '../src/workflows/v3/run-edit.js';
+import { claimV3RerunGrantCard, grantV3RerunBudget } from '../src/workflows/v3/run-edit.js';
+import { missingV3RevisionFollowUps } from '../src/workflows/v3/dag-revision.js';
+import { handleV3BlockedAction } from '../src/im/lark/v3-blocked-card-handler.js';
+import { V3_BLOCKED_ASK_ANSWER_ACTION, v3BlockedCardNonce } from '../src/im/lark/v3-blocked-card.js';
 import { V3_REVISION_RERUN_GRANT_ACTION, v3RerunGrantCardNonce } from '../src/im/lark/v3-revision-card.js';
 
 const INITIATOR = 'ou_initiator';
@@ -841,15 +844,33 @@ describe('P2 — a rerun refused for revisit budget can be unlocked by the initi
     appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'b', instanceId: 'b#001', attemptId: 'b#001/attempts/001' });
     expect(edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 1)).toMatchObject({ kind: 'applied', revision: 2 });
     finish('a#002');
-    expect(edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2))
-      .toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
+    const refused = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2);
+    expect(refused).toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
+    const epoch = refused.kind === 'invalid' ? refused.rerunBudget!.epoch : -1;
+    // One card per exhaustion: the bot re-submitting does not post again.
+    expect(claimV3RerunGrantCard(base, 'run-budget', 'a', epoch)).toBe(true);
+    const again = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2);
+    expect(again.kind === 'invalid' && again.rerunBudget?.epoch).toBe(epoch);
+    expect(claimV3RerunGrantCard(base, 'run-budget', 'a', epoch)).toBe(false);
 
-    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', by: OTHER })).toEqual({ kind: 'unauthorized' });
-    const value = { action: V3_REVISION_RERUN_GRANT_ACTION, runId: 'run-budget', nodeId: 'a', nonce: v3RerunGrantCardNonce('run-budget', 'a') } as const;
+    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', epoch, by: OTHER })).toEqual({ kind: 'unauthorized' });
+    const value = {
+      action: V3_REVISION_RERUN_GRANT_ACTION, runId: 'run-budget', nodeId: 'a', epoch,
+      nonce: v3RerunGrantCardNonce('run-budget', 'a', epoch),
+    } as const;
     expect(await handleV3RevisionAction(value, INITIATOR, { baseDir: base, driveRun: () => {} })).toMatchObject({ header: expect.anything() });
     // A second click cannot add a second rerun.
-    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', by: INITIATOR })).toEqual({ kind: 'already-granted' });
+    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', epoch, by: INITIATOR })).toEqual({ kind: 'already-granted' });
     expect(edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2)).toMatchObject({ kind: 'applied', revision: 3 });
+
+    // Spent again → a NEW exhaustion: a new card, and the old one is expired.
+    finish('a#003');
+    const second = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 3);
+    const secondEpoch = second.kind === 'invalid' ? second.rerunBudget!.epoch : -1;
+    expect(secondEpoch).not.toBe(epoch);
+    expect(claimV3RerunGrantCard(base, 'run-budget', 'a', secondEpoch)).toBe(true);
+    expect(await handleV3RevisionAction(value, INITIATOR, { baseDir: base, driveRun: () => {} })).toMatchObject({ toast: expect.anything() });
+    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', epoch, by: INITIATOR })).toEqual({ kind: 'expired' });
   });
 });
 
@@ -1035,5 +1056,123 @@ describe('the workflow-node layer reads the effective flow', () => {
     expect(loadV3BotExecutedRun(runDir)?.dag.nodes[0]?.goal).toBe('revised contract');
     writeFileSync(v3RevisionFilePaths(runDir, 2).dag, readFileSync(join(runDir, 'dag.json')));
     expect(loadV3BotExecutedRun(runDir)).toBeUndefined();
+  });
+});
+
+// ─── Second review round ────────────────────────────────────────────────────
+
+describe('round 2 — an ask answered after its node was revised is refused visibly', () => {
+  it('the answer is not reported as delivered and no retry is recorded', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-ask', [goal('g', { humanGate: { prompt: 'ship?' } })], 'bot');
+    const driver = botDriver(base);
+    await driveV3Run('run-ask', driver.deps);
+    resolveV3GateClick(base, 'run-ask', { waitId: 'g#001-gate', selected: 'approve', by: INITIATOR });
+    await driveV3Run('run-ask', driver.deps);
+    const attemptId = driver.dispatches[0]!.attemptId;
+    appendEvent(join(runDir, 'journal.ndjson'), {
+      type: 'nodeBlocked', nodeId: 'g', instanceId: 'g#001', attemptId, errorClass: 'workerError', errorCode: 'ASK_HUMAN',
+      ask: { question: 'which region?', options: ['sg', 'us'] },
+    });
+    await driveV3Run('run-ask', driver.deps);
+    expect(edit(base, 'run-ask', [{ op: 'updateNode', nodeId: 'g', set: { goal: 'ship to the new region list' } }], 1))
+      .toMatchObject({ kind: 'applied' });
+    const before = journal(runDir).length;
+
+    expect(requestV3Retry(base, 'run-ask', { nodeId: 'g', answer: { selected: 'sg', by: INITIATOR } }))
+      .toEqual({ kind: 'stale-run', reason: 'revised' });
+    const card = await handleV3BlockedAction({
+      action: V3_BLOCKED_ASK_ANSWER_ACTION, runId: 'run-ask', nodeId: 'g', attemptId, selected: 'sg',
+      nonce: v3BlockedCardNonce('run-ask', 'g', attemptId),
+    }, INITIATOR, { baseDir: base, driveRun: () => {} }) as { header?: unknown; elements?: Array<{ actions?: Array<{ value?: unknown }> }> };
+    expect(card.header).toBeDefined();
+    expect(card.elements?.some((element) => element.actions?.some((action) => action.value !== undefined))).toBe(false);
+    expect(journal(runDir)).toHaveLength(before);
+    expect(existsSync(join(runDir, attemptId, 'answer.json'))).toBe(false);
+    // A plain retry still works — through a fresh gate.
+    expect(requestV3Retry(base, 'run-ask', { nodeId: 'g' })).toMatchObject({ kind: 'requested' });
+    await driveV3Run('run-ask', driver.deps);
+    expect(driver.gates.at(-1)).toBe('g#002-gate');
+  });
+});
+
+describe('round 2 — lost follow-ups never resurrect or outlive the run', () => {
+  async function lostRetry(base: string, runId: string) {
+    const runDir = seedRun(base, runId, [goal('a'), goal('z', { bot: 'cli_other' })], 'bot');
+    const driver = botDriver(base);
+    await driveV3Run(runId, driver.deps);
+    const a = driver.dispatches.find((req) => req.nodeId === 'a')!;
+    blockAttempt(runDir, 'a', 'a#001', a.attemptId);
+    edit(base, runId, [{ op: 'reassign', nodeId: 'a', bot: 'cli_other' }], 1);
+    const journalPath = join(runDir, 'journal.ndjson');
+    const lines = readFileSync(journalPath, 'utf-8').trimEnd().split('\n');
+    writeFileSync(journalPath, `${lines.filter((line) => !/"type":"node(Reassigned|RetryRequested)"/.test(line)).join('\n')}\n`);
+    return { runDir, driver };
+  }
+
+  it('a lost re-run of a node a later revision removed is not reconciled back to life', async () => {
+    const base = freshBase();
+    const { runDir, driver } = await lostRetry(base, 'run-lost-removed');
+    expect(edit(base, 'run-lost-removed', [{ op: 'removeNode', nodeId: 'a' }], 2)).toMatchObject({ kind: 'applied' });
+    await driveV3Run('run-lost-removed', driver.deps);
+    const events = journal(runDir);
+    expect(events.some((event) => event.type === 'nodeRetryRequested' || event.type === 'nodeReassigned')).toBe(false);
+    expect(projectV3RunStatus(base, 'run-lost-removed').nodes.map((node) => node.id)).toEqual(['z']);
+    expect(driver.dispatches.filter((req) => req.nodeId === 'a')).toHaveLength(1);
+  });
+
+  it('a lost reassignment of a not-yet-started node a later revision removed is skipped', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-lost-pending', [goal('a'), goal('y', { depends: ['a'] })], 'bot');
+    const driver = botDriver(base);
+    await driveV3Run('run-lost-pending', driver.deps);
+    blockAttempt(runDir, 'a', 'a#001', driver.dispatches[0]!.attemptId);
+    expect(edit(base, 'run-lost-pending', [{ op: 'reassign', nodeId: 'y', bot: 'cli_other' }], 1)).toMatchObject({ kind: 'applied' });
+    const journalPath = join(runDir, 'journal.ndjson');
+    const lines = readFileSync(journalPath, 'utf-8').trimEnd().split('\n');
+    writeFileSync(journalPath, `${lines.filter((line) => !/"type":"nodeReassigned"/.test(line)).join('\n')}\n`);
+    expect(missingV3RevisionFollowUps(journal(runDir)).map((event) => event.type)).toEqual(['nodeReassigned']);
+    expect(edit(base, 'run-lost-pending', [{ op: 'removeNode', nodeId: 'y' }], 2)).toMatchObject({ kind: 'applied' });
+    await driveV3Run('run-lost-pending', driver.deps);
+    expect(journal(runDir).some((event) => event.type === 'nodeReassigned')).toBe(false);
+  });
+
+  it('nothing is owed once the run is being cancelled', async () => {
+    const base = freshBase();
+    const { runDir } = await lostRetry(base, 'run-lost-cancel');
+    expect(missingV3RevisionFollowUps(journal(runDir)).length).toBeGreaterThan(0);
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runCancelRequested', cancelRequestId: 'c1', by: INITIATOR });
+    expect(missingV3RevisionFollowUps(journal(runDir))).toEqual([]);
+  });
+});
+
+describe('round 2 — a gate whose wait was already decided is never re-dispatched in a loop', () => {
+  it('the drive fails loudly instead of spinning', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-gate-spin', [goal('g', { humanGate: { prompt: 'ok?' } })]);
+    const journalPath = join(runDir, 'journal.ndjson');
+    appendEvent(journalPath, { type: 'gateDispatched', nodeId: 'g', instanceId: 'g#001', waitId: 'g#001-gate' });
+    appendEvent(journalPath, {
+      type: 'gateResolved', nodeId: 'g', instanceId: 'g#001', waitId: 'g#001-gate', resolution: 'approved', by: INITIATOR,
+    });
+    // Corrupt combination: approval dropped while the instance stays the same.
+    appendEvent(journalPath, {
+      type: 'dagRevised', revision: 2, baseRevision: 1, sha256: 's', patchSha256: 'p', summary: 'x', by: INITIATOR,
+      effects: { regate: [{ nodeId: 'g', instanceId: 'g#001' }] },
+    });
+    const dag = JSON.parse(readFileSync(join(runDir, 'dag.json'), 'utf-8'));
+    const bytes = `${JSON.stringify(dag, null, 2)}\n`;
+    mkdirSync(join(runDir, 'dag-revisions'), { recursive: true });
+    writeFileSync(v3RevisionFilePaths(runDir, 2).dag, bytes);
+    writeFileSync(v3RevisionFilePaths(runDir, 2).patch, '{}\n');
+    // Re-pin the event to the files just written.
+    const lines = readFileSync(journalPath, 'utf-8').trimEnd().split('\n');
+    const last = JSON.parse(lines.pop()!);
+    last.sha256 = v3RevisionDigest(bytes);
+    last.patchSha256 = v3RevisionDigest('{}\n');
+    writeFileSync(journalPath, `${[...lines, JSON.stringify(last)].join('\n')}\n`);
+    await expect(driveV3Run('run-gate-spin', {
+      baseDir: base, loadBots: () => [], makeRunNode: () => fakeWorkers().runNode, postGateCard: async () => {},
+    })).rejects.toThrow(/already decided/);
   });
 });

@@ -32,7 +32,10 @@ import {
   publishRunEnvelopeOnce,
 } from '../src/workflows/v3/run-envelope.js';
 import { appendEvent } from '../src/workflows/v3/journal.js';
-import { authorizeV3SessionRunMutationRequest } from '../src/workflows/v3/session-relay.js';
+import {
+  authorizeV3SessionRunEditRequest,
+  authorizeV3SessionRunMutationRequest,
+} from '../src/workflows/v3/session-relay.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { recordV3MainWakeIssued } from '../src/workflows/v3/main-wake-ledger.js';
 
@@ -110,7 +113,10 @@ function issueWake(runId: string, eventSeq: number, overrides: Record<string, un
   const turnId = mintWorkflowEventTurnId(runId, eventSeq);
   recordV3MainWakeIssued(join(baseDir, runId), {
     runId, eventSeq, turnId, sessionId: 'sess-main', larkAppId: BINDING.larkAppId, chatId: BINDING.chatId,
-    rootMessageId: BINDING.rootMessageId, issuedAt: Date.now() - 1_000, ...overrides,
+    rootMessageId: BINDING.rootMessageId, issuedAt: Date.now() - 1_000,
+    // The issuer snapshots the session's turn pointers as they were when it
+    // opened the wake turn (the seeded session's last human message).
+    turnPointersAtIssue: { quoteTargetId: 'om_last_human_msg' }, ...overrides,
   } as never);
   return turnId;
 }
@@ -211,5 +217,42 @@ describe('event-woken turn of THIS run', () => {
     expect(editAs()).toMatchObject({ origin: 'human', callerOpenId: 'ou_last_human' });
     writeSession({ rootMessageId: 'om_unrelated_topic' });
     expect(() => editAs()).toThrow(V3DaemonCommandAuthorityError);
+  });
+});
+
+describe('a newer human message overtakes the wake turn (generation join)', () => {
+  it('relay: once the session pointers move past the wake turn, it no longer acts as the event turn', () => {
+    seedRun();
+    const turnId = issueWake(RUN, 2, { turnPointersAtIssue: { quoteTargetId: 'om_last_human_msg' } });
+    const capability = 'c'.repeat(64);
+    const relayEdit = (quoteTargetId: string) => authorizeV3SessionRunEditRequest({
+      runId: RUN,
+      mutation: 'status',
+      raw: { sessionId: 'sess-main', originCapability: capability },
+      trustedHost: false,
+      session: {
+        receiver: false,
+        liveOrigin: { capability, turnId, dispatchAttempt: 1 },
+        callerOpenId: 'ou_last_human',
+        chatId: BINDING.chatId,
+        larkAppId: BINDING.larkAppId,
+        quoteTargetId,
+        rootMessageId: BINDING.rootMessageId,
+      },
+      selfLarkAppId: BINDING.larkAppId,
+      baseDir,
+    });
+    expect(relayEdit('om_last_human_msg')).toMatchObject({ ok: true });
+    expect(relayEdit(turnId)).toMatchObject({ ok: true });
+    expect(relayEdit('om_member_wrote_meanwhile')).toMatchObject({ ok: false, error: 'turn_provenance_stale' });
+  });
+
+  it('host path: the same overtaken wake turn is refused', () => {
+    seedRun();
+    writeSession({ quoteTargetId: 'om_member_wrote_meanwhile' });
+    writeMarker(issueWake(RUN, 2, { turnPointersAtIssue: { quoteTargetId: 'om_last_human_msg' } }));
+    expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
+    writeSession({ quoteTargetId: 'om_last_human_msg' });
+    expect(editAs()).toMatchObject({ origin: 'runEvent' });
   });
 });

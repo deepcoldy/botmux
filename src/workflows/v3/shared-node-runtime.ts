@@ -739,9 +739,11 @@ export async function runWorkflow(
   /** A revision's reassign / blocked re-run whose dedicated event was lost
    *  to a crash between two appends is re-appended (idempotent, §13.3). */
   const reconcileRevisionFollowUps = (events: readonly StoredEvent[]): boolean => {
-    if (missingV3RevisionFollowUps(events).length === 0) return false;
+    const live = new Set(dag.nodes.map((node) => node.id));
+    if (missingV3RevisionFollowUps(events, live).length === 0) return false;
     return withJournalMutationSync(journalPath, ({ events: latest, append }) => {
-      const missing = missingV3RevisionFollowUps(latest);
+      if (!decisionStillCurrent(latest)) return true; // re-read the newer flow first
+      const missing = missingV3RevisionFollowUps(latest, live);
       for (const event of missing) append(event, { durable: true });
       return missing.length > 0;
     });
@@ -1331,9 +1333,27 @@ export async function runWorkflow(
       if (snap.runStatus !== 'running') return false;
       const status = snap.nodes.get(event.nodeId)?.status ?? 'pending';
       if (status !== 'pending') return false;
+      // A wait id is single-use: replay ignores a re-dispatch of a gate that
+      // was already decided (or voided), so the node would stay pending and
+      // this loop would re-dispatch it forever. Never spin — fail loudly.
+      if (event.type === 'gateDispatched' && gateWaitAlreadyDecided(events, event.waitId)) {
+        throw new Error(
+          `v3 runtime: gate ${event.waitId} of node "${event.nodeId}" was already decided, ` +
+          'but the node has no approval to run on; refusing to re-dispatch the same gate',
+        );
+      }
       append(event, { durable: true });
       return true;
     });
+  }
+
+  function gateWaitAlreadyDecided(events: readonly StoredEvent[], waitId: string): boolean {
+    return events.some((event) =>
+      (event.type === 'gateResolved' && event.waitId === waitId) ||
+      (event.type === 'dagRevised' && (
+        event.effects?.supersede?.some((item) => item.waitId === waitId) === true ||
+        event.effects?.cancel?.some((item) => item.waitId === waitId) === true
+      )));
   }
 
   /** Changes whenever a revision is applied, proposed or decided. */

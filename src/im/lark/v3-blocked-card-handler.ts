@@ -116,6 +116,18 @@ export async function handleV3BlockedAction(
     };
   }
 
+  if (outcome.kind === 'stale-run' && outcome.reason === 'revised') {
+    // The answer would reach an instance that no longer runs: freeze the card
+    // so nobody believes it was delivered.
+    const info = blockedInfoFor(readJournal(join(runDir, 'journal.ndjson')), value.nodeId);
+    return JSON.parse(buildV3BlockedCard({
+      runId: value.runId,
+      nodeId: value.nodeId,
+      attemptId: value.attemptId,
+      ...(info.ask ? { ask: info.ask } : {}),
+      askVoided: true,
+    }));
+  }
   if (outcome.kind === 'stale-run') {
     return {
       toast: {

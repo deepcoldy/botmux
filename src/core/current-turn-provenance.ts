@@ -193,6 +193,8 @@ export function resolveCurrentTurnProvenance(
         larkAppId: session.larkAppId,
         chatId: session.chatId,
         ...(eventRootMessageId ? { rootMessageId: eventRootMessageId } : {}),
+        ...(nonEmpty(session.quoteTargetId) ? { quoteTargetId: session.quoteTargetId } : {}),
+        ...(nonEmpty(replyTarget?.turnId) ? { currentReplyTargetTurnId: replyTarget!.turnId } : {}),
       },
     });
     if (!verdict.ok) {

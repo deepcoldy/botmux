@@ -415,6 +415,17 @@ export function workflowEventTurnVerifierFor(
     ) {
       return { ok: false, reason: '该回合不是拥有该 run 的 daemon 签发的' };
     }
+    // Generation join (same rule as human turns): if a human message has
+    // advanced the session's turn pointers since the wake turn was issued,
+    // the session's identity now belongs to that newer turn.
+    const advanced = (pointer: string | undefined, atIssue: string | undefined): boolean =>
+      pointer !== undefined && pointer !== turnId && pointer !== atIssue;
+    if (
+      advanced(session.quoteTargetId, issued.turnPointersAtIssue?.quoteTargetId) ||
+      advanced(session.currentReplyTargetTurnId, issued.turnPointersAtIssue?.currentReplyTargetTurnId)
+    ) {
+      return { ok: false, reason: '主会话已有更新的人类消息，事件回合不再代表当前回合', stale: true };
+    }
     const envelope = readRunEnvelope(runDir, runId);
     if (envelope.kind !== 'ok' || !envelope.envelope.chatBinding) {
       return { ok: false, reason: 'run 没有可验证的 run.json 绑定' };

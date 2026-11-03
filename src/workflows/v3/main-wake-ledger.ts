@@ -26,6 +26,10 @@ export interface V3MainWakeRecord {
   rootMessageId?: string;
   /** Epoch ms. */
   issuedAt: number;
+  /** The session's turn pointers when the wake turn was issued. A later
+   *  human inbound message advances them past both these values and the
+   *  wake turn's own id — the wake turn then no longer owns the session. */
+  turnPointersAtIssue?: { quoteTargetId?: string; currentReplyTargetTurnId?: string };
 }
 
 const MAIN_WAKES_DIR = 'main-wakes';
