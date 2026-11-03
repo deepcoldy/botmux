@@ -17,7 +17,7 @@ export const FEEDBACK_TABLES = [
   'turn_terminals', 'turn_completion_events', 'feedback_events', 'feedback_outbox',
 ] as const;
 
-export async function ensurePostgresFeedbackSchema(client: PoolClient, schema: string, instanceId: string): Promise<void> {
+export async function ensurePostgresFeedbackSchema(client: PoolClient, schema: string, instanceId: string, migrationId?: string): Promise<void> {
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new Error('feedback_storage_schema_invalid');
   await client.query('BEGIN');
   try {
@@ -26,15 +26,15 @@ export async function ensurePostgresFeedbackSchema(client: PoolClient, schema: s
     if (exists.rowCount) {
       const meta = await client.query('SELECT to_regclass($1) name', [`${schema}.feedback_storage_meta`]);
       if (!meta.rows[0].name) throw new Error('feedback_storage_target_not_empty');
-      const result = await client.query('SELECT version,instance_id,state FROM feedback_storage_meta WHERE singleton=1');
+      const result = await client.query('SELECT version,instance_id,state,migration_id FROM feedback_storage_meta WHERE singleton=1');
       if (result.rows[0]?.instance_id !== instanceId || result.rows[0]?.version !== 1) throw new Error('feedback_storage_target_identity_conflict');
-      if (result.rows[0]?.state !== 'active') throw new Error('feedback_storage_target_not_active');
+      if (migrationId ? result.rows[0]?.migration_id !== migrationId : result.rows[0]?.state !== 'active') throw new Error('feedback_storage_target_not_active');
       await client.query('COMMIT');
       return;
     }
     await client.query(`CREATE SCHEMA "${schema}"`);
     await client.query(`
-      CREATE TABLE feedback_storage_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,instance_id TEXT NOT NULL,state TEXT NOT NULL);
+      CREATE TABLE feedback_storage_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,instance_id TEXT NOT NULL,state TEXT NOT NULL,migration_id TEXT,source_fingerprint TEXT,verified INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE interactions(interaction_id TEXT PRIMARY KEY,context_json TEXT,created_at TEXT NOT NULL);
       CREATE TABLE skill_runs(skill_run_id TEXT PRIMARY KEY,interaction_id TEXT NOT NULL REFERENCES interactions,skill_ref TEXT NOT NULL,context_json TEXT,created_at TEXT NOT NULL);
       CREATE TABLE responses(response_id TEXT PRIMARY KEY,interaction_id TEXT NOT NULL REFERENCES interactions,skill_run_id TEXT REFERENCES skill_runs,content_hash TEXT NOT NULL,content_ref TEXT,created_at TEXT NOT NULL,UNIQUE(interaction_id,content_hash));
@@ -69,7 +69,7 @@ export async function ensurePostgresFeedbackSchema(client: PoolClient, schema: s
         last_http_status INTEGER,last_error TEXT,delivered_at TEXT,created_at TEXT NOT NULL,UNIQUE(event_id,destination_id));
       CREATE INDEX feedback_outbox_due ON feedback_outbox(status,next_attempt_at);
     `);
-    await client.query('INSERT INTO feedback_storage_meta VALUES(1,1,$1,$2)', [instanceId, 'active']);
+    await client.query('INSERT INTO feedback_storage_meta(singleton,version,instance_id,state,migration_id) VALUES(1,1,$1,$2,$3)', [instanceId, migrationId ? 'migrating' : 'active', migrationId ?? null]);
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});

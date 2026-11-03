@@ -175,8 +175,10 @@ export async function freezeFeedbackSource(dataDir: string, migrationId: string)
   const database = await source(dataDir);
   try {
     database.exec('BEGIN IMMEDIATE');
-    const inflight = database.prepare("SELECT COUNT(*) count FROM feedback_outbox WHERE status='inflight'").get() as { count: number };
-    if (inflight.count) throw new Error('feedback_outbox_unsettled');
+    if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_outbox'").get()) {
+      const inflight = database.prepare("SELECT COUNT(*) count FROM feedback_outbox WHERE status='inflight'").get() as { count: number };
+      if (inflight.count) throw new Error('feedback_outbox_unsettled');
+    }
     const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
     if (version < 1 || version > 8) throw new Error('feedback_source_schema_unsupported');
     database.exec("CREATE TABLE IF NOT EXISTS feedback_source_guard(singleton INTEGER PRIMARY KEY CHECK(singleton=1),migration_id TEXT NOT NULL,state TEXT NOT NULL)");
