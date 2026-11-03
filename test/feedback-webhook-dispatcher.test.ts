@@ -60,6 +60,32 @@ describe('feedback webhook destination and secret safety', () => {
 });
 
 describe('feedback webhook attempt contract', () => {
+  it('maintenance quiescence waits for an in-flight request without aborting it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-quiesce-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    db.recordTurnDelivery({
+      botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+      content: 'answer', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+    });
+    const started = deferred<AbortSignal | undefined>();
+    const request = deferred<{ kind: 'delivered'; status: number }>();
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: db, readSecret: () => 'secret',
+      dispatch: async input => { started.resolve(input.signal); return request.promise; },
+    });
+    const signal = await started.promise;
+    let quiesced = false;
+    const stopping = dispatcher.quiesce().then(() => { quiesced = true; });
+    await Promise.resolve();
+    expect(quiesced).toBe(false);
+    expect(signal?.aborted).toBe(false);
+    request.resolve({ kind: 'delivered', status: 200 });
+    await stopping;
+    expect(db.listFeedbackOutbox()[0].status).toBe('delivered');
+    db.close();
+  });
   it('recovers stale claims, immediately dispatches due rows, and stops boundedly', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-pump-')); dirs.push(dir);
     const db = await SkillFeedbackStore.open(dir);
@@ -165,3 +191,4 @@ describe('feedback webhook attempt contract', () => {
     expect(computeRetryDelay({ attempts: 2, random: () => 0.5, baseDelayMs: 1000, maxDelayMs: 300_000 })).toBe(1000);
   });
 });
+import { deferred } from './helpers/feedback-deferred.js';

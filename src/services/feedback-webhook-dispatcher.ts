@@ -150,7 +150,7 @@ export function startFeedbackWebhookDispatcher(options: {
   store: CompatibleFeedbackStore; readSecret: (ref: string) => string | undefined;
   dispatch?: typeof dispatchWebhookAttempt; intervalMs?: number; staleClaimMs?: number; batchSize?: number; shutdownMs?: number;
   allowPrivateNetworks?: boolean; onError?: (error: unknown) => void;
-}): { ready: Promise<void>; stop: (timeoutMs?: number) => Promise<void> } {
+}): { ready: Promise<void>; stop: (timeoutMs?: number) => Promise<void>; quiesce: () => Promise<void> } {
   let stopped = false, timer: NodeJS.Timeout | undefined, running: Promise<void> | undefined;
   const controller = new AbortController();
   const dispatch = options.dispatch ?? dispatchWebhookAttempt;
@@ -204,7 +204,12 @@ export function startFeedbackWebhookDispatcher(options: {
       installInterval();
     }
   })();
-  return { ready, stop: async (timeoutMs?: number) => {
+  return { ready, quiesce: async () => {
+    stopped = true;
+    if (timer) clearInterval(timer);
+    await ready;
+    await running;
+  }, stop: async (timeoutMs?: number) => {
     stopped = true; if (timer) clearInterval(timer); controller.abort();
     // Caller (daemon shutdown) passes the REMAINING shared deadline budget so
     // this stop cannot add its own default window on top of the total shutdown

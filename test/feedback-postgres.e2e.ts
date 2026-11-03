@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
+import { FeedbackAnalyticsService } from '../src/services/feedback-analytics.js';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
 import { openPostgresFeedbackStore } from '../src/services/feedback-postgres-store.js';
@@ -33,6 +38,43 @@ async function fixture() {
 }
 
 describe('PostgreSQL feedback integration', () => {
+  it('matches SQLite analytics for the same delivery and multi-user revision cohort', async () => {
+    const { store, target, password } = await fixture();
+    const directory = await mkdtemp(join(tmpdir(), 'pg-parity-'));
+    const sqlite = await SkillFeedbackStore.open(directory);
+    const pgAnalytics = await openPostgresFeedbackAnalytics(target, password);
+    const sqliteAnalytics = new FeedbackAnalyticsService(directory);
+    try {
+      for (const backend of [sqlite, store]) {
+        await backend.recordTurnDelivery({
+          botAppId: 'app', sessionId: 'session', turnId: 'turn', platform: 'lark', platformAppId: 'app',
+          platformMessageId: 'message', content: 'answer', cardMode: 'card', status: 'delivered',
+          createdAt: '2026-11-01T12:00:00.000Z', chatId: 'chat', model: 'model', context: { teamId: 'team' },
+        });
+        const input = { platform: 'lark', platformAppId: 'app', platformMessageId: 'message', operatorSubjectId: 'first', callbackKey: 'first', result: 'helpful', semantic: 'positive' as const };
+        await backend.recordFeedback(input);
+        await backend.recordFeedback({ ...input, callbackKey: 'revised', result: 'incorrect', semantic: 'negative', reasonKey: 'wrong' });
+        await backend.recordFeedback({ ...input, callbackKey: 'second', operatorSubjectId: 'second' });
+      }
+      for (const filters of [
+        { from: '2026-11-01', to: '2026-11-03' },
+        { from: '2026-11-01', to: '2026-11-03', teamId: 'team', chatId: 'chat', model: 'model' },
+        { from: '2026-11-01', to: '2026-11-03', semantic: 'negative', reasonKey: 'wrong' },
+        { from: '2026-11-01', to: '2026-11-03', botAppId: 'missing' },
+      ]) {
+        expect(await pgAnalytics.summary(filters)).toEqual(sqliteAnalytics.summary(filters));
+        expect(await pgAnalytics.trend(filters)).toEqual(sqliteAnalytics.trend(filters));
+        expect(await pgAnalytics.reasons(filters)).toEqual(sqliteAnalytics.reasons(filters));
+        const postgresPage = await pgAnalytics.deliveries(filters);
+        const sqlitePage = sqliteAnalytics.deliveries(filters);
+        const order = (left: { semantic?: string }, right: { semantic?: string }) => (left.semantic ?? '').localeCompare(right.semantic ?? '');
+        expect({ ...postgresPage, items: postgresPage.items.sort(order) }).toEqual({ ...sqlitePage, items: sqlitePage.items.sort(order) });
+      }
+    } finally {
+      await pgAnalytics.close(); sqliteAnalytics.close(); sqlite.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   it('verifies TLS and accepts only the configured certificate authority', async () => {
     const { target, password, instanceId } = await fixture();
     const secured = { ...target, tls: { mode: 'verify-full' as const } };

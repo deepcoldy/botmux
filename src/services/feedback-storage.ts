@@ -1,4 +1,6 @@
 import { realpath } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { SkillFeedbackStore } from './skill-feedback-store.js';
 import { FeedbackAnalyticsService } from './feedback-analytics.js';
 import { readFeedbackStorageConfig, readFeedbackStorageSecret } from './feedback-storage-config.js';
@@ -76,9 +78,10 @@ async function openStorage(dataDir: string, config: FeedbackStorageConfig): Prom
 }
 
 export async function getFeedbackStorage(dataDir: string): Promise<FeedbackStorage> {
-  const config = await readFeedbackStorageConfig(dataDir);
-  const key = await realpath(dataDir);
+  let key = resolve(dataDir);
+  try { key = realpathSync(dataDir); } catch {}
   return serialized(key, async () => {
+    const config = await readFeedbackStorageConfig(key);
     const identity = JSON.stringify([config.generation, config.instanceId, config.active]);
     const existing = entries.get(key);
     if (existing?.identity === identity) return existing.value;
@@ -108,5 +111,6 @@ export async function closeFeedbackStorage(dataDir: string): Promise<void> {
 }
 
 export async function closeAllFeedbackStorage(): Promise<void> {
+  await Promise.allSettled([...operations.values()]);
   await Promise.all([...entries.keys()].map(closeFeedbackStorage));
 }

@@ -13366,6 +13366,7 @@ export function sendWorkerInput(
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+  if (feedbackMaintenanceActive(config.session.dataDir)) return false;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
@@ -14349,6 +14350,10 @@ export function forkWorker(
   resumeOrTurnId: ForkResumeOrTurnId = false,
   opts: ForkWorkerOptions = {},
 ): boolean {
+  if (feedbackMaintenanceActive(config.session.dataDir)) {
+    opts.onAdmission?.('rejected');
+    return false;
+  }
   let admissionReported = false;
   const reportAdmission = (admission: WorkerForkAdmission): void => {
     if (admissionReported) return;
@@ -23418,3 +23423,4 @@ export function setCurrentCliVersion(v: string, runtimeKey?: string): void {
 export function getCurrentCliVersion(runtimeKey?: string): string {
   return runtimeKey ? currentCliVersions.get(runtimeKey) ?? 'unknown' : currentCliVersion;
 }
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';

@@ -20361,7 +20361,7 @@ switch (command) {
     break;
   }
   case 'send': {
-    try { await cmdSend(process.argv.slice(3)); }
+    try { await withFeedbackSendLease(resolveDataDir(), () => cmdSend(process.argv.slice(3))); }
     catch (error) {
       if (!(error instanceof TopicSendError)) throw error;
       console.error(`botmux send refused: ${error.message}`);
@@ -20448,3 +20448,4 @@ switch (command) {
     if (!await runPluginCommandByName(command, process.argv.slice(3))) showHelp();
     break;
 }
+import { withFeedbackSendLease } from './services/feedback-maintenance.js';

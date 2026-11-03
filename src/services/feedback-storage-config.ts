@@ -134,3 +134,20 @@ export async function readFeedbackStorageSecret(dataDir: string, reference: stri
     throw new Error('feedback_storage_secret_missing');
   }
 }
+
+export async function activateFeedbackStorageCandidate(
+  dataDir: string, expectedGeneration: number,
+): Promise<FeedbackStorageConfig> {
+  const path = join(await canonicalDirectory(dataDir), 'feedback-storage.json');
+  return withFileLock(path, async () => {
+    const current = await readConfig(path);
+    if (!current || current.generation !== expectedGeneration || !current.candidate) {
+      throw new Error('feedback_storage_generation_conflict');
+    }
+    const next: FeedbackStorageConfig = {
+      version: 1, instanceId: current.instanceId, generation: current.generation + 1, active: current.candidate,
+    };
+    await persistConfig(path, next);
+    return next;
+  });
+}

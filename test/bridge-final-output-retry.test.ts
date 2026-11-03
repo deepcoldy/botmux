@@ -1444,7 +1444,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
     expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+    const delivery = await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_oncall_answer');
     expect(delivery).toMatchObject({ cardMode: 'card' });
     expect(delivery?.policy).toBeUndefined();
@@ -1471,13 +1471,15 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toBeUndefined();
+    expect(await feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toBeUndefined();
     await vi.advanceTimersByTimeAsync(10);
 
-    expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toMatchObject({
-      platformMessageId: 'om_feedback_answer',
-      policy: expect.objectContaining({ enabled: true }),
-      baseCard: expect.objectContaining({ schema: '2.0' }),
+    await vi.waitFor(async () => {
+      expect(await feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toMatchObject({
+        platformMessageId: 'om_feedback_answer',
+        policy: expect.objectContaining({ enabled: true }),
+        baseCard: expect.objectContaining({ schema: '2.0' }),
+      });
     });
   });
 
@@ -1544,7 +1546,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    expect((await getSkillFeedbackStore(config.session.dataDir))
+    expect(await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_everyone_feedback'))
       .toMatchObject({ policy: { audience: 'everyone', reviewers: [] } });
   });
@@ -1571,7 +1573,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(resolveAllowedUsersWithMapMock).toHaveBeenCalledWith('app_test', ['reviewer@example.com']);
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+    const delivery = await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_email_feedback');
     expect(delivery?.policy?.reviewers).toEqual(['ou_email_reviewer']);
     expect(JSON.stringify(delivery?.policy)).not.toContain('reviewer@example.com');
@@ -1630,7 +1632,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // The card still ships (control visible) and the snapshot keeps the cached
     // id, so the configured real reviewer is not rejected.
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+    const delivery = await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_transient_feedback');
     expect(delivery?.policy?.reviewers).toEqual(['ou_oncall_cached']);
   });
@@ -1670,7 +1672,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    expect((await getSkillFeedbackStore(config.session.dataDir))
+    expect(await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_empty_reviewers_feedback'))
       .toMatchObject({ policy: { audience: 'reviewers', reviewers: [] } });
   });
@@ -1687,7 +1689,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // But the delivery is still recorded so a later turn_terminal correlates to
     // a turn.completed event — feedback is independent of completion bookkeeping.
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+    const delivery = await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_plain_answer');
     expect(delivery).toMatchObject({ cardMode: 'card' });
     expect(delivery?.policy).toBeUndefined();
@@ -4134,7 +4136,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       targetChatId: ds.chatId,
     })).toEqual(['om_meeting_fallback']);
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    expect((await getSkillFeedbackStore(config.session.dataDir)).findDeliveryByPlatformMessage(
+    expect(await (await getSkillFeedbackStore(config.session.dataDir)).findDeliveryByPlatformMessage(
       'lark', ds.larkAppId, 'om_meeting_fallback',
     )).toBeUndefined();
   });
