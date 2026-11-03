@@ -25911,6 +25911,17 @@ async function spawnCli(
       codexBridgeAttach(doubaoPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
       codexBridgeStartTimer();
     } else {
+      // Resumed session whose trajectory.jsonl does not exist yet (e.g. the
+      // pre-restart conversation was interrupted before any assistant record):
+      // precise resume disarms writeInput's capture, so nothing else would ever
+      // report this sid and the bridge would stay unbound for the whole session.
+      // Arm it for the 1s late-attach poller; doubao writing the file after
+      // resume can only contain post-restart records (no file = no prior
+      // assistant history), so its generic fresh-empty attach cannot replay
+      // old finals.
+      if (effectiveResume && effectiveCliSessionId) {
+        codexBridgePendingSessionId = effectiveCliSessionId;
+      }
       codexBridgeStartTimer();
     }
   } else if (cfg.cliId === 'mtr') {
