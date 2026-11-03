@@ -27,6 +27,8 @@ import {
   V3DagPatchError,
   V3RevisionIntegrityError,
   v3RevisitBudgetEpoch,
+  v3PendingProposalHolds,
+  v3ApprovedBotScope,
   type V3DoneNodeProducts,
 } from '../src/workflows/v3/dag-revision.js';
 
@@ -616,5 +618,31 @@ describe('replay folds revision effects', () => {
       }),
     ];
     expect(materialize(events).nodes.get('a')?.status).toBe('running');
+  });
+});
+
+describe('approved scope and proposal holds (shared by edits, answers and 改派)', () => {
+  it('the approved scope is the frozen snapshots plus revision-approved bots; frozen wins a clash', () => {
+    const frozen = new Map([['cli_a', { larkAppId: 'cli_a', cliId: 'claude-code', workingDir: '/w' }]]);
+    const additions = new Map([
+      ['cli_x', { larkAppId: 'cli_x', cliId: 'codex', workingDir: '/x' }],
+      ['cli_a', { larkAppId: 'cli_a', cliId: 'other', workingDir: '/elsewhere' }],
+    ]);
+    const scope = v3ApprovedBotScope(frozen as never, additions as never);
+    expect([...scope.keys()]).toEqual(['cli_a', 'cli_x']);
+    expect(scope.get('cli_a')).toEqual(frozen.get('cli_a'));
+  });
+
+  it('a pending proposal holds the nodes it touches, and every body node of a touched loop', () => {
+    const events = [
+      ...started(),
+      ev({ type: 'nodeDispatched', nodeId: 'l.i001.w', attemptId: 'l.i001.w/attempts/001', loop: { loopId: 'l', iteration: 1, bodyNodeId: 'w' } }),
+      ev({ type: 'dagRevisionProposed', revision: 2, baseRevision: 1, sha256: 's2', patchSha256: 'p2', summary: 'x', by: 'ou_o', reasons: ['callerNotInitiator'], touched: ['a', 'l'] }),
+    ];
+    expect(v3PendingProposalHolds(events, 'a')).toBe(true);
+    expect(v3PendingProposalHolds(events, 'l.i001.w')).toBe(true);
+    expect(v3PendingProposalHolds(events, 'b')).toBe(false);
+    // Decided → nothing held.
+    expect(v3PendingProposalHolds([...events, ev({ type: 'dagRevisionRejected', revision: 2, by: 'ou_i', reason: 'rejected' })], 'a')).toBe(false);
   });
 });

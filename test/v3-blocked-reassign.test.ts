@@ -622,6 +622,18 @@ describe('改派 while a flow revision touching the node waits for confirmation'
     expect(reassignedEvents(run.runDir)).toHaveLength(1);
   });
 
+  it('the engine refuses before stopping an open attempt the proposal holds', async () => {
+    const run = await customBotRun('rs-held-open', [NODES[0], NODES[1]], () => false);
+    await run.runner.drive(run.runId);
+    const open = run.executor.dispatches.find((req) => req.nodeId === 'write')!;
+    expect(editRun(run.base, run.runId, [{ op: 'updateNode', nodeId: 'write', set: { goal: 'member idea' } }], 1, MEMBER))
+      .toMatchObject({ kind: 'proposed' });
+    expect(await reassignNode(run.runDir, {
+      nodeId: 'write', toLarkAppId: 'cli_b', by: OWNER, expectedAttemptId: open.attemptId,
+    }, { nodeExecutor: 'bot', executor: run.executor })).toEqual({ kind: 'rejected', reason: 'revision-pending' });
+    expect(run.executor.stops).toEqual([]);
+  });
+
   it('the engine re-checks under the journal lock (a proposal filed while the open attempt is being stopped)', async () => {
     const run = await customBotRun('rs-held-lock', [NODES[0], NODES[1]], () => false);
     await run.runner.drive(run.runId);
