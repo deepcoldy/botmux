@@ -564,6 +564,7 @@ import {
   restoreActiveSessions,
   executeScheduledTask,
   deliverOwnerBatchTurn,
+  deliverWorkflowNodeTurn,
   persistStreamCardState,
   rememberLastCliInput,
   ensureTerminalWorkerPort,
@@ -746,6 +747,22 @@ import {
   resolveV3SavedWorkflowMessageTargets,
   type V3SavedWorkflowExecutionEffect,
 } from './im/lark/v3-saved-workflow-handler.js';
+import { liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
+import { createWorkflowNodeDaemon } from './core/workflow-node-daemon.js';
+import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
+import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
+import { isRemoteCliId } from './core/remote-cli-ids.js';
+import { loadAuthorizedV3Run, readRunEnvelope } from './workflows/v3/run-envelope.js';
+import {
+  WORKFLOW_HANDOFF_EVENT_MAX_BODY_BYTES,
+  WORKFLOW_HANDOFF_EVENT_ROUTE,
+  WORKFLOW_HANDOFF_STOP_ROUTE,
+  WORKFLOW_NODE_REPORT_MAX_BODY_BYTES,
+  WORKFLOW_NODE_REPORT_ROUTE,
+} from './core/workflow-node-report.js';
+import { WORKFLOW_HANDOFF_ID_PLACEHOLDER } from './im/lark/v3-node-card.js';
+import { substituteWorkflowHandoffPlaceholder, workflowNodeMarkerFromBinding } from './core/workflow-node-session.js';
+import { lookupWorkflowHandoff, readDispatchRegistryLoose } from './core/workflow-handoff-binding.js';
 import {
   createV3GateRunner,
   preflightV3RunStart,
@@ -6067,6 +6084,7 @@ async function handleV3SavedWorkflowCommandIfAny(
       driveDetached: (runId) => v3GateRunner.driveDetached(runId),
       cancelAndDrive: (runId, cancelRequestId) =>
         v3GateRunner.cancelAndDrive(runId, cancelRequestId),
+      nodeExecutorPolicy: () => liveV3NodeExecutorPolicy(loadBotConfigs()),
     },
   );
   await deliverV3SavedWorkflowNotification(
@@ -6675,11 +6693,106 @@ const v3ProgressCardManager = new V3ProgressCardManager({
   },
 });
 
+// ─── Workflow v3: nodes handed to bots in the chat (design 2026-11-03) ────────
+// Consulted only for runs whose run.json pins nodeExecutor "bot" (possible only
+// after the experimental switch was on at authorization) and for inbound
+// messages / reports / turns that carry a host-signed workflow handoff.
+function workflowLoadBotRun(runDir: string) {
+  try {
+    const read = readRunEnvelope(runDir);
+    if (read.kind !== 'ok' || !('nodeExecutor' in read.envelope) || read.envelope.nodeExecutor !== 'bot') return undefined;
+    const loaded = loadAuthorizedV3Run(runDir);
+    return {
+      dag: loaded.dag,
+      nodeExecutor: 'bot' as const,
+      ...(loaded.envelope.chatBinding?.chatId ? { chatId: loaded.envelope.chatBinding.chatId } : {}),
+      title: loaded.spec?.title?.trim() || basename(runDir),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** The "停止" path (^C to the session's CLI, session kept), with the same
+ *  refusals as `/stop`. */
+function interruptWorkflowNodeTurn(ds: DaemonSession): boolean {
+  if (isSessionTransferring(ds)) return false;
+  const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  if (ds.initConfig?.codexRpcInput === true || isCodexAppCliId(cliId) || isRemoteCliId(cliId) || isRemoteBackendSession(ds)) return false;
+  if (!ds.worker || ds.worker.killed) return false;
+  // Nothing is running: a ^C to an idle prompt stops nothing and a second one
+  // could make some CLIs exit, so an idle session is left alone.
+  if (ds.lastScreenStatus === 'idle') return false;
+  sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
+  logger.info(`[workflow] node turn stopped (session ${ds.session.sessionId.slice(0, 8)}, kept alive)`);
+  return true;
+}
+
+function workflowSelfAppId(): string {
+  if (!selfDaemonLarkAppId) throw new Error('daemon bot identity is not bound yet');
+  return selfDaemonLarkAppId;
+}
+
+const workflowNodeDaemon = createWorkflowNodeDaemon({
+  selfLarkAppId: workflowSelfAppId,
+  dataDir: () => config.session.dataDir,
+  baseDir: () => v3DefaultBaseDir(),
+  sendCard: (chatId, card, uuid) => sendMessage(workflowSelfAppId(), chatId, card, 'interactive', uuid),
+  replyCard: (root, card, uuid) => replyMessage(workflowSelfAppId(), root, card, 'interactive', true, uuid),
+  patchCard: async (messageId, card) => { await updateMessage(workflowSelfAppId(), messageId, card); },
+  resolveBotInChat: async (chatId, target) => {
+    const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(workflowSelfAppId(), chatId, [target]);
+    if (resolved.ok) {
+      const mapping = resolved.mappings.find((entry) => entry.larkAppId === target);
+      return mapping ? { ok: true, openId: mapping.subjectOpenId } : { ok: false, notInChat: true, message: 'not in chat' };
+    }
+    return { ok: false, notInChat: resolved.error === 'subject_lark_app_not_in_chat', message: `${resolved.error}: ${resolved.message}` };
+  },
+  daemonPort: (appId) => findOnlineDaemon(appId)?.ipcPort,
+  hostSecret: () => loadDaemonIpcSecret(),
+  bindingSecret: () => loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+  postDaemon: async (port, path, body, secret) => {
+    const response = await fetchDaemonIpc(port, path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }, secret);
+    const parsed: unknown = await response.json().catch(() => ({}));
+    return {
+      status: response.status,
+      body: parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {},
+    };
+  },
+  ensureGrant: async (chatId, appIds) => {
+    await ensureBotChatGrantMatrix(chatId, appIds, {
+      findDaemon: (appId) => findOnlineDaemon(appId),
+      secret: () => loadDaemonIpcSecret(),
+    });
+  },
+  loadSessions: () => sessionStore.loadAllSessionsSnapshot({ dataDir: config.session.dataDir }).values(),
+  isProcessAlive: isWorkflowWorkerAlive,
+  activeSessions: () => activeSessions.values(),
+  updateSession: (ds) => sessionStore.updateSession(ds.session),
+  interruptTurn: interruptWorkflowNodeTurn,
+  deliverSelfTurn: (input) => withBotTurnAdmission(input.larkAppId,
+    () => deliverWorkflowNodeTurn(input, activeSessions, refreshCliVersion)),
+  attachmentsDir: getAttachmentsDir,
+  loadRun: workflowLoadBotRun,
+  drive: (runId) => v3GateRunner.driveDetached(runId),
+  botName: (appId) => v3BotDisplayNameResolver()(appId),
+  warn: (message) => logger.warn(message),
+});
+
 // v3 humanGate run-controller: drives daemon-side v3 runs, posts/​re-posts
 // approval cards to the run's bound topic, and re-arms pending gates on startup
 // (cold-attach).  postCard / notifyTerminal use the daemon's Lark sender; the
 // run logic + in-flight guard live in createV3GateRunner.
 const v3GateRunner = createV3GateRunner({
+  // Handed to the runtime only for runs whose run.json pins nodeExecutor "bot".
+  externalExecutor: workflowNodeDaemon.executor,
+  onExternalError: (error, context) => {
+    logger.warn(`[v3] external ${context.operation} for ${context.attemptId} failed: ${error instanceof Error ? error.message : String(error)}`);
+  },
   postCard: async (binding, gate, runId) => {
     const card = buildV3GateCard({
       runId,
@@ -6770,7 +6883,14 @@ const v3GateRunner = createV3GateRunner({
     }
   },
   onDriveBegin: (runId) => v3ProgressCardManager.observe(runId),
-  onDriveEnd: (runId) => v3ProgressCardManager.stopAndRefresh(runId).then(() => undefined),
+  onDriveEnd: async (runId) => {
+    // Node cards exist only for bot-executed runs; the sync returns at once
+    // for every other run.
+    await Promise.all([
+      v3ProgressCardManager.stopAndRefresh(runId),
+      workflowNodeDaemon.syncNodeCards(runId),
+    ]);
+  },
   onError: (runId, err) => {
     logger.warn(`[v3:${runId}] drive failed: ${err instanceof Error ? err.message : String(err)}`);
   },
@@ -8968,6 +9088,79 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   return jsonRes(res, ok ? 200 : 409, { ok, ...(error ? { error } : !ok ? { error: 'not_found_or_denied' } : {}) });
 });
 
+// ─── Workflow node handoff routes (design 2026-11-03 §7.2, §9.3) ─────────────
+// Main bot's daemon ← executing bot's daemon: accepted / stalled / blocked /
+// submit for one handoff. Trusted host only (the outer HMAC gate also applies).
+ipcRoute('POST', WORKFLOW_HANDOFF_EVENT_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, WORKFLOW_HANDOFF_EVENT_MAX_BODY_BYTES);
+  } catch (error) {
+    return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, {
+      ok: false, error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json',
+    });
+  }
+  const result = await workflowNodeDaemon.eventRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Executing bot's daemon ← main bot's daemon: stop this handoff's turn.
+ipcRoute('POST', WORKFLOW_HANDOFF_STOP_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, 16 * 1024);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const result = workflowNodeDaemon.stopRoute(raw);
+  return jsonRes(res, result.status, result.body);
+});
+
+// Executing bot's daemon ← its own CLI (`botmux report --dispatch-root
+// <handoff> …`). Session-scoped: the live turn capability (or the host secret)
+// proves the caller is this session's CLI.
+ipcRoute('POST', WORKFLOW_NODE_REPORT_ROUTE, async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, WORKFLOW_NODE_REPORT_MAX_BODY_BYTES);
+  } catch (error) {
+    return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, {
+      ok: false, error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json',
+    });
+  }
+  const result = await workflowNodeDaemon.reportRoute(raw, (body) => {
+    const record = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    const sessionId = typeof record.sessionId === 'string' ? record.sessionId : '';
+    const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: isTrustedHostIpcRequest(req),
+      sessionExists: !!ds && ds.session.sessionId === sessionId,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      ...(ds?.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
+      ...(typeof record.originCapability === 'string' ? { claimedCapability: record.originCapability } : {}),
+      ...(typeof record.originTurnId === 'string' ? { claimedTurnId: record.originTurnId } : {}),
+      ...(typeof record.originDispatchAttempt === 'number' ? { claimedDispatchAttempt: record.originDispatchAttempt } : {}),
+    });
+    if (!verified.ok) return { ok: false, status: 403, error: verified.error };
+    if (!ds || !ds.larkAppId || !ds.chatId) return { ok: false, status: 404, error: 'session_not_found' };
+    return {
+      ok: true,
+      session: {
+        sessionId: ds.session.sessionId,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        scope: ds.scope ?? ds.session.scope,
+        ...(ds.session.rootMessageId ? { rootMessageId: ds.session.rootMessageId } : {}),
+      },
+    };
+  });
+  return jsonRes(res, result.status, result.body);
+});
+
 ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   let raw: unknown;
   try {
@@ -8977,6 +9170,20 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
     }
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  // A workflow node's handoff is reported through its own route (structured
+  // submission, engine verdict); point the CLI there instead of relaying.
+  {
+    const dispatchRoot = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).dispatchRoot
+      : undefined;
+    if (typeof dispatchRoot === 'string' && lookupWorkflowHandoff({
+      registry: readDispatchRegistryLoose(config.session.dataDir),
+      dispatchRoot,
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+    }).kind !== 'none') {
+      return jsonRes(res, 409, { ok: false, error: 'workflow_handoff_root', route: WORKFLOW_NODE_REPORT_ROUTE });
+    }
   }
   const claimedSessionId = raw && typeof raw === 'object' && !Array.isArray(raw)
     ? (raw as Record<string, unknown>).sessionId
@@ -27399,6 +27606,16 @@ async function handleThreadReplyAdmitted(
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
+  // Workflow node handoff (design 2026-11-03 §5.4): only a bot message whose
+  // exact id carries a host-signed binding for this bot, chat and topic. It
+  // marks the session as a node session, stages the node's inputs and shows
+  // the CLI the handoff's real id in the `botmux report` commands.
+  const workflowHandoff = isForeignBot && scope === 'thread' && !ctx.completionProposalContinuation && ctxChatId
+    ? await workflowNodeDaemon.resolveInbound({ receiverLarkAppId: larkAppId, messageId: parsed.messageId, chatId: ctxChatId, threadRootId: anchor })
+    : undefined;
+  if (workflowHandoff) {
+    parsed.content = substituteWorkflowHandoffPlaceholder(parsed.content, parsed.messageId, WORKFLOW_HANDOFF_ID_PLACEHOLDER);
+  }
   // 免@ 斜杠命令（续聊路径）：与新话题路径同源、同理由——模板渲染结果只进 CLI
   // 正文，命令解析车道（下面的 cmdContent）保留闸门校验过的触发词原文。
   const threadCommandPrompt = ctx.commandTrigger
@@ -27771,6 +27988,13 @@ async function handleThreadReplyAdmitted(
 
   let ds = activeSessions.get(runtimeSessionKey);
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
+  // A retry / later round handed off into a node topic this bot already has
+  // a session in: the session now reports to the new handoff.
+  if (ds && workflowHandoff) {
+    ds.session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff);
+    sessionStore.updateSession(ds.session);
+    workflowNodeDaemon.onRegistered(ds.session.sessionId, ds.session.workflowNode);
+  }
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
@@ -27953,6 +28177,7 @@ async function handleThreadReplyAdmitted(
   } else {
     const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId);
     attachments = downloaded.attachments;
+    if (workflowHandoff) attachments = [...attachments, ...workflowNodeDaemon.stageInbound(workflowHandoff)];
     if (attachments.length > 0) {
       parsed.attachments = attachments;
     }
@@ -28380,6 +28605,11 @@ async function handleThreadReplyAdmitted(
     session.lastMessageAt = new Date(now).toISOString();
     if (parsed.senderType === 'user' && !isForeignBot) stampHumanActivity(session, now);
     session.scope = scope;
+    // Verified workflow handoff → node session (no workflow hint / skills).
+    if (workflowHandoff) {
+      session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff);
+      workflowNodeDaemon.onRegistered(session.sessionId, session.workflowNode);
+    }
     fillNativeTopicId(session, scope, parsed.threadId);
     applyDispatchLaunchBinding(
       config.session.dataDir,
@@ -31837,6 +32067,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
+    },
+    // Workflow node sessions only (verified handoff marker): tell the main
+    // bot's daemon the node was accepted / the turn stopped without a valid
+    // submission. Best-effort; the journal and the acceptance probe remain
+    // authoritative.
+    onWorkflowNodeInputCommitted(ds, context) {
+      workflowNodeDaemon.onInputCommitted(ds, context);
+    },
+    onWorkflowNodeTurnSettled(ds, context) {
+      workflowNodeDaemon.onTurnSettled(ds, context);
     },
     onIdentityDecision(ds, context) {
       // Fire-and-forget (the IPC switch must not serialize behind possibly

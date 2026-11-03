@@ -31,6 +31,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import type { Locale } from '../i18n/index.js';
 import { escapeXmlText } from '../utils/xml.js';
 import { isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from '../global-config.js';
+import { isWorkflowNodeSessionEnv } from '../workflows/node-session-env.js';
 import {
   BUILTIN_SKILLS,
   WORKFLOW_FEATURE_SKILLS,
@@ -208,7 +209,9 @@ export function builtinSkillEntries(opts: {
   /** Per-bot 群负责人开关（默认关）。开启时才在 prompt 目录里暴露该技能。 */
   chatManagerEnabled?: boolean;
 }): BuiltinSkillEntry[] {
-  const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
+  // A workflow node session never gets the workflow family (design §4.2);
+  // in-worker callers see the marker in env, daemon callers pass false.
+  const workflowEnabled = opts.workflowEnabled ?? (isWorkflowFeatureEnabled() && !isWorkflowNodeSessionEnv());
   const multiTopicEnabled = opts.multiTopicEnabled ?? isMultiTopicOrchestrationEnabled();
   let defs = baseBuiltinSkills(workflowEnabled, multiTopicEnabled);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
@@ -232,7 +235,10 @@ export function builtinSkillContent(
   env: Record<string, string | undefined> = process.env,
 ): string | undefined {
   const all = [
-    ...baseBuiltinSkills(isWorkflowFeatureEnabled(), isMultiTopicOrchestrationEnabled(env)),
+    ...baseBuiltinSkills(
+      isWorkflowFeatureEnabled() && !isWorkflowNodeSessionEnv(env),
+      isMultiTopicOrchestrationEnabled(env),
+    ),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },
     { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
     { name: CHAT_MANAGER_SKILL_NAME, content: CHAT_MANAGER_SKILL },

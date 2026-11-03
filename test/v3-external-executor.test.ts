@@ -17,7 +17,7 @@ import { materialize } from '../src/workflows/v3/state.js';
 import { readAndValidateManifest } from '../src/workflows/v3/manifest.js';
 import { openV3WorkerAttempts } from '../src/workflows/v3/attempt-ledger.js';
 import { openV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
-import { runWorkflow } from '../src/workflows/v3/runtime.js';
+import { runWorkflow, v3AcceptanceProbeUnknownSince } from '../src/workflows/v3/runtime.js';
 import {
   V3_HANDOFF_IDEMPOTENCY_WINDOW_MS,
   type V3ExternalNodeExecutor,
@@ -1308,5 +1308,55 @@ describe('external goal nodes — review regressions', () => {
     const attemptId = run.openAttempt('write').attemptId;
     expect(recordExternalAccepted(run.runDir, { attemptId, sessionId: 's', acceptedAt: run.clock.t + 3_600_000 }, run.ctx()))
       .toMatchObject({ ok: true, deadlineAt: run.clock.t + TIMEOUT_SEC * 1000 });
+  });
+});
+
+describe('external goal nodes — engine follow-ups', () => {
+  const twoBots = new Map([
+    ['cli_a', { larkAppId: 'cli_a', cliId: 'claude-code' as const, workingDir: '/tmp' }],
+    ['cli_b', { larkAppId: 'cli_b', cliId: 'claude-code' as const, workingDir: '/tmp' }],
+  ]);
+
+  it('reassignNode: a validated envelope pinning "bot" is enough, even without a journal stamp', async () => {
+    const base = trackTempDir(mkdtempSync(join(tmpdir(), 'v3-ext-pinned-bot-')));
+    const runDir = join(base, 'rv-pinned-bot');
+    mkdirSync(runDir);
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runStarted', runId: 'rv-pinned-bot' });
+    const outcome = await reassignNode(runDir, { nodeId: 'write', toLarkAppId: 'cli_b', by: 'ou_owner' }, {
+      dag: reportDag('rv-pinned-bot'),
+      botSnapshots: twoBots,
+      nodeExecutor: 'bot',
+    });
+    expect(outcome).toMatchObject({ kind: 'reassigned', from: 'cli_a', to: 'cli_b' });
+    expect(readJournal(join(runDir, 'journal.ndjson')).map((event) => event.type)).toEqual(['runStarted', 'nodeReassigned']);
+  });
+
+  it('reassignNode: an envelope without the field (null) refuses even when the journal is stamped "bot"', async () => {
+    const run = new BotRun(reportDag('rv-pinned-null'));
+    await run.drive(new FakeExecutor());
+    expect(run.of('runStarted')).toEqual([expect.objectContaining({ nodeExecutor: 'bot' })]);
+    const before = run.events().length;
+    expect(await reassignNode(run.runDir, { nodeId: 'write', toLarkAppId: 'cli_b', by: 'ou_owner' }, {
+      ...run.ctx(),
+      botSnapshots: twoBots,
+      nodeExecutor: null,
+    })).toEqual({ kind: 'rejected', reason: 'not-bot-run' });
+    expect(run.events()).toHaveLength(before);
+  });
+
+  it('unknown-probe bookkeeping of a run is dropped once the run reaches a terminal state', async () => {
+    const run = new BotRun(reportDag('rv-probe-cleanup'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = run.openAttempt('write').attemptId;
+    executor.onProbe = () => { throw new Error('session store unreadable'); };
+    run.clock.t = run.openAttempt('write').acceptDeadlineAt!;
+    expectAwaitingExternal(await run.drive(executor));
+    expect(v3AcceptanceProbeUnknownSince(run.runDir, attemptId)).toBe(run.clock.t);
+
+    // The bot submits anyway; the run completes.
+    expect(await run.submit(attemptId, reportFiles())).toMatchObject({ ok: true });
+    expect(expectTerminal(await run.drive(executor)).runStatus).toBe('succeeded');
+    expect(v3AcceptanceProbeUnknownSince(run.runDir, attemptId)).toBeUndefined();
   });
 });

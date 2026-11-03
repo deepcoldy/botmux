@@ -22,6 +22,7 @@ import {
   requestV3RunCancel,
   safeRunDir,
 } from '../../workflows/v3/daemon-run.js';
+import type { V3NodeExecutorPolicy } from '../../workflows/v3/node-executor-mode.js';
 import type { V3SavedWorkflowCommand } from './v3-saved-workflow-command.js';
 import { v3SavedWorkflowAdHocRunEscapeHint } from './v3-saved-workflow-command.js';
 
@@ -114,6 +115,9 @@ export interface V3SavedWorkflowExecutionDeps {
   readRunBinding(runDir: string): RunChatBinding | undefined;
   requestCancel: typeof requestV3RunCancel;
   cancelAndDrive(runId: string, cancelRequestId: string): void;
+  /** Experimental node-executor policy for a materialized run (design §6.3).
+   *  Omitted = today's ephemeral execution, unchanged. */
+  nodeExecutorPolicy?(): V3NodeExecutorPolicy | undefined;
 }
 
 export type V3SavedWorkflowExecutionEffect =
@@ -275,6 +279,7 @@ export async function executeV3SavedWorkflowCommand(
     for (const [name, value] of Object.entries(command.rawParams)) {
       rawParams[name] = { kind: 'string', value };
     }
+    const nodeExecutorPolicy = deps.nodeExecutorPolicy?.();
     const materialized = await deps.instantiate({
       dataDir,
       ref: command.ref,
@@ -282,7 +287,9 @@ export async function executeV3SavedWorkflowCommand(
       rawParams,
       bots: deps.loadBots(),
       baseDir,
+      ...(nodeExecutorPolicy ? { nodeExecutorPolicy } : {}),
     });
+    const executorNote = materialized.executorNote ? `\n${materialized.executorNote}` : '';
     try {
       deps.persistStartIntent(materialized.runId, materialized.runDir);
       deps.driveDetached(materialized.runId);
@@ -292,14 +299,16 @@ export async function executeV3SavedWorkflowCommand(
         message:
           `⚠️ Saved Workflow 已物化但未启动：${materialized.runId}\n` +
           `原因：${err instanceof Error ? err.message : String(err)}\n` +
-          `修复后可执行 botmux workflow start ${materialized.runId}，不要重复创建。`,
+          `修复后可执行 botmux workflow start ${materialized.runId}，不要重复创建。` +
+          executorNote,
       };
     }
     return {
       effect: 'run_started',
       message:
         `✅ Saved Workflow 已启动：${materialized.runId}\n` +
-        `definition: ${materialized.envelope.source.workflowId} v${materialized.envelope.source.humanVersion}`,
+        `definition: ${materialized.envelope.source.workflowId} v${materialized.envelope.source.humanVersion}` +
+        executorNote,
     };
   } catch (err) {
     return { effect: 'failed', message: formatExecutionError(command, err) };

@@ -33,6 +33,7 @@ import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-aut
 import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
+import { WORKFLOW_NODE_REPORT_ROUTE } from './workflow-node-report.js';
 import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
@@ -1187,6 +1188,9 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // validates the current session's rotating capability, binds the dispatch
   // root server-side, then lets the trusted daemon relay to the orchestrator.
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
+  // Same posture for a workflow node's structured submission: the handler
+  // verifies the session's rotating capability and the signed handoff binding.
+  if (method === 'POST' && pathname === WORKFLOW_NODE_REPORT_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_USER_DELIVERY_ROUTE) return true;
   // `botmux send --mention` handoff: an isolated CLI (macOS read isolation)

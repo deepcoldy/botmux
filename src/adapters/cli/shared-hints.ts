@@ -15,6 +15,7 @@
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
+import { isWorkflowNodeSessionEnv } from '../../workflows/node-session-env.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
@@ -50,8 +51,12 @@ function workflowDiscoveryHintText(locale?: Locale): string {
 /** Keep Workflow discoverable even when the full skill catalog is not injected.
  *  Gated by the machine-wide workflow switch (isWorkflowFeatureEnabled) so a
  *  disabled host never advertises `/workflow`; returns undefined when off. */
-function workflowDiscoveryHint(locale?: Locale): string | undefined {
+function workflowDiscoveryHint(locale?: Locale, opts: { workflowNodeSession?: boolean } = {}): string | undefined {
   if (!isWorkflowFeatureEnabled()) return undefined;
+  // A workflow node session executes one node of an approved run; offering to
+  // start a workflow there is noise (design 2026-11-03 §4.2). The worker
+  // process carries the marker in its env; daemon-side builders pass it.
+  if (opts.workflowNodeSession || isWorkflowNodeSessionEnv()) return undefined;
   return workflowDiscoveryHintText(locale);
 }
 
@@ -116,6 +121,7 @@ export function buildBotmuxShellHints(
   noTransport?: boolean,
   replyDelivery?: ReplyDelivery,
   cliId?: CliId,
+  opts: { workflowNodeSession?: boolean } = {},
 ): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
@@ -134,7 +140,7 @@ export function buildBotmuxShellHints(
   // mention_gate / feedback / 反重发提示全部不注入（附件、跨 bot @ 等场景模型可经
   // 内置 botmux-send skill 自行发现）。缺省 / 'send' 时下面每一行与改动前逐字相同。
   const transcript = replyDelivery === 'transcript';
-  const workflowHint = workflowDiscoveryHint(locale);
+  const workflowHint = workflowDiscoveryHint(locale, opts);
   const hints = (transcript
     ? [
       t('ai.shell.intro_transcript', undefined, locale),
