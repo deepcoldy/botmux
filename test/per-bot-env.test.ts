@@ -64,6 +64,7 @@ describe('sanitizePerBotEnv()', () => {
         CJADK_INTERACTIVE: '1',
         MIX_AUTH_TOKEN: 'machine-mix-token',
         BYTEDCLI_AI_AUTH_APP_KEY: 'host-ai-auth-key',
+        BOTMUX_MIX_BROKER_SECRET_CHANNEL: 'ipc',
         IS_SANDBOX: '1',
         SESSION_DATA_DIR: '/tmp',
         TMPDIR: '/tmp/shared',

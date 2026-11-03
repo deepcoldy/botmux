@@ -4,6 +4,7 @@ import { createConnection, type Socket as NetSocket } from 'node:net';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import type { Duplex } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -346,7 +347,7 @@ export class PluginMcpGateway {
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
   private readonly linkRefRegistration?: GatewayLinkRefRegistrationHandler;
-  private readonly hostSecretFd?: number;
+  private readonly requestHostSecretChannel?: () => Promise<Duplex>;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -366,14 +367,14 @@ export class PluginMcpGateway {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
       linkRefRegistration?: GatewayLinkRefRegistrationHandler;
-      hostSecretFd?: number;
+      requestHostSecretChannel?: () => Promise<Duplex>;
     } = {},
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
     this.linkRefRegistration = opts.linkRefRegistration;
-    this.hostSecretFd = opts.hostSecretFd;
+    this.requestHostSecretChannel = opts.requestHostSecretChannel;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -463,14 +464,14 @@ export class PluginMcpGateway {
           stderr: 'inherit',
         } as const;
         transport = descriptor.server.hostSecret === 'bytedcli-ai-auth-app-key'
-          && this.hostSecretFd !== undefined
+          && this.requestHostSecretChannel
           ? new ProtectedStdioClientTransport({
               ...parameters,
               env: {
                 ...parameters.env,
                 [MIX_BROKER_SECRET_FD_ENV]: String(MIX_BROKER_CHILD_SECRET_FD),
               },
-              inheritedSecretFd: this.hostSecretFd,
+              requestSecretChannel: this.requestHostSecretChannel,
             })
           : new StdioClientTransport(parameters);
       } else {

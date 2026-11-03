@@ -4,6 +4,7 @@ import { applySessionEnvUnset } from './session-env.js';
 import {
   MIX_ACTOR_WRITE_ROLLOUT_ENV,
   MIX_BROKER_APP_KEY_ENV,
+  MIX_BROKER_SECRET_CHANNEL_ENV,
   MIX_BROKER_SECRET_FD_ENV,
 } from './mix-broker-security.js';
 
@@ -84,6 +85,7 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
   const env = inheritBotEnv(base, policy);
   delete env[MIX_BROKER_APP_KEY_ENV];
   delete env[MIX_ACTOR_WRITE_ROLLOUT_ENV];
+  delete env[MIX_BROKER_SECRET_CHANNEL_ENV];
   delete env[MIX_BROKER_SECRET_FD_ENV];
   if (policy?.mode === 'strict') {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS,

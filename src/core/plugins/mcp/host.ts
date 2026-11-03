@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer, type Server as NetServer, type Socket } from 'node:net';
+import type { Duplex } from 'node:stream';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   PluginMcpGateway,
@@ -83,7 +84,7 @@ export async function startSessionMcpGatewayHost(opts: {
   trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
   linkRefRegistration?: GatewayLinkRefRegistrationHandler;
-  hostSecretFd?: number;
+  requestHostSecretChannel?: () => Promise<Duplex>;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -118,7 +119,7 @@ export async function startSessionMcpGatewayHost(opts: {
         trustedTurnIdentity: opts.trustedTurnIdentity,
         trustedResultDelivery: opts.trustedResultDelivery,
         linkRefRegistration: opts.linkRefRegistration,
-        hostSecretFd: opts.hostSecretFd,
+        requestHostSecretChannel: opts.requestHostSecretChannel,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams, type IOType } from 'node:child_process';
-import { PassThrough, type Stream } from 'node:stream';
+import { PassThrough, type Duplex, type Stream } from 'node:stream';
 import { ReadBuffer, serializeMessage } from '@modelcontextprotocol/sdk/shared/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
@@ -10,10 +10,10 @@ export interface ProtectedStdioServerParameters {
   env: Record<string, string>;
   cwd?: string;
   stderr?: IOType | Stream | number;
-  inheritedSecretFd: number;
+  requestSecretChannel: () => Promise<Duplex>;
 }
 
-/** Stdio MCP transport with one read-only host fd mapped to child fd 3. */
+/** Stdio MCP transport with one daemon-served, per-child channel mapped to fd 3. */
 export class ProtectedStdioClientTransport implements Transport {
   onclose?: () => void;
   onerror?: (error: Error) => void;
@@ -30,20 +30,25 @@ export class ProtectedStdioClientTransport implements Transport {
 
   async start(): Promise<void> {
     if (this.process) throw new Error('ProtectedStdioClientTransport already started');
+    const secretChannel = await this.server.requestSecretChannel();
     await new Promise<void>((resolve, reject) => {
       const child = spawn(this.server.command, this.server.args ?? [], {
         env: this.server.env,
-        stdio: ['pipe', 'pipe', this.server.stderr ?? 'inherit', this.server.inheritedSecretFd],
+        stdio: ['pipe', 'pipe', this.server.stderr ?? 'inherit', secretChannel],
         shell: false,
         windowsHide: true,
         cwd: this.server.cwd,
       });
       this.process = child as ChildProcessWithoutNullStreams;
       child.once('error', error => {
+        secretChannel.destroy();
         reject(error);
         this.onerror?.(error);
       });
-      child.once('spawn', resolve);
+      child.once('spawn', () => {
+        secretChannel.destroy();
+        resolve();
+      });
       child.once('close', () => {
         this.process = undefined;
         this.onclose?.();

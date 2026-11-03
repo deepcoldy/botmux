@@ -239,7 +239,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 
 ### MIX actor-write rollout gate
 
-MIX shared reads do not depend on the write rollout. Actor writes are off by default. The daemon creates the dedicated App Key pipe only when its startup environment contains both `BOTMUX_MIX_ACTOR_WRITE_ENABLED=1` and a non-empty `BYTEDCLI_AI_AUTH_APP_KEY`, and only for sessions enabling the `mix` plugin. The App Key is excluded from workers, Mojo, per-bot and generic plugin environments, and argv.
+MIX shared reads do not depend on the write rollout. Actor writes are off by default. The daemon serves a fresh one-shot App Key channel for each MIX broker only when its startup environment contains both `BOTMUX_MIX_ACTOR_WRITE_ENABLED=1` and a non-empty `BYTEDCLI_AI_AUTH_APP_KEY`, and only for sessions enabling the `mix` plugin. The App Key is excluded from workers, Mojo, per-bot and generic plugin environments, and argv.
 
 Even with the gate enabled, `actorWriteAllowed` requires Linux, a new local PTY, `sandbox: "oncall"`, the mounted MCP Unix socket, a retained PID namespace, and a network policy with `private.mode: "block"` and no `trusted-egress`. Otherwise the session remains read-only. Enable the gate only after PPE validates two distinct users, `employeeId` / `updateUid` attribution, and denial without state change.
 

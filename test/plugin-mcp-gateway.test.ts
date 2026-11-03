@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -336,14 +336,18 @@ describe('plugin MCP Gateway', () => {
     installFixturePlugin('mix', 'secret-fd', undefined, 'bytedcli-ai-auth-app-key');
     const secretPath = join(home, 'mix-app-key');
     writeFileSync(secretPath, 'fd-only-secret');
-    const secretFd = openSync(secretPath, 'r');
     const gateway = new PluginMcpGateway(
       ['mix'],
       {
         ...process.env,
         BYTEDCLI_AI_AUTH_APP_KEY: 'generic-env-must-be-removed',
       },
-      { hostSecretFd: secretFd },
+      {
+        requestHostSecretChannel: async () => createReadStream(secretPath, {
+          fd: openSync(secretPath, 'r'),
+          autoClose: true,
+        }) as any,
+      },
     );
     const client = new Client({ name: 'gateway-secret-fd-test', version: '1.0.0' });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -356,7 +360,6 @@ describe('plugin MCP Gateway', () => {
     } finally {
       await client.close();
       await gateway.close();
-      closeSync(secretFd);
     }
   });
 

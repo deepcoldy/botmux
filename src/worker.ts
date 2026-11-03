@@ -6,8 +6,9 @@ import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
 import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
 import {
   actorWriteCapabilityEnabled,
-  inheritedMixBrokerSecretFd,
+  mixBrokerSecretChannelEnabled,
 } from './core/mix-broker-security.js';
+import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
@@ -1924,6 +1925,45 @@ const pendingLinkRefModeRestores = new Map<string, {
   resolve: (mode: 'enabled' | undefined) => void;
   reject: (error: Error) => void;
 }>();
+const pendingMixBrokerSecretChannels = new Map<string, {
+  resolve: (channel: Duplex) => void;
+  reject: (error: Error) => void;
+  timeout: NodeJS.Timeout;
+}>();
+
+function isDuplexHandle(value: unknown): value is Duplex {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<Duplex>;
+  return typeof candidate.write === 'function'
+    && typeof candidate.destroy === 'function'
+    && typeof candidate.on === 'function';
+}
+
+function requestMixBrokerSecretChannel(): Promise<Duplex> {
+  if (!mixBrokerSecretChannelEnabled() || !process.send) {
+    return Promise.reject(new Error('MIX broker secret channel is unavailable'));
+  }
+  const requestId = randomUUID();
+  return new Promise<Duplex>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      const pending = pendingMixBrokerSecretChannels.get(requestId);
+      if (!pending) return;
+      pendingMixBrokerSecretChannels.delete(requestId);
+      pending.reject(new Error('MIX broker secret channel timed out'));
+    }, 10_000);
+    timeout.unref();
+    pendingMixBrokerSecretChannels.set(requestId, { resolve, reject, timeout });
+    process.send?.({ type: 'mix_broker_secret_channel_request', requestId } satisfies WorkerToDaemon,
+      error => {
+        if (!error) return;
+        const pending = pendingMixBrokerSecretChannels.get(requestId);
+        if (!pending) return;
+        pendingMixBrokerSecretChannels.delete(requestId);
+        clearTimeout(pending.timeout);
+        pending.reject(error);
+      });
+  });
+}
 
 function restoreLinkRefModeThroughHost(input: {
   turnId: string;
@@ -2337,7 +2377,9 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
     linkRefRegistration: registerMcpLinkRefsThroughHost,
-    hostSecretFd: inheritedMixBrokerSecretFd(),
+    requestHostSecretChannel: mixBrokerSecretChannelEnabled()
+      ? requestMixBrokerSecretChannel
+      : undefined,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -24445,8 +24487,8 @@ async function spawnCli(
       sandboxRelayOutbox = sbx.outbox;
       localActorWriteContainmentActive = actorWriteCapabilityEnabled({
         platform: process.platform,
-        mixPluginEnabled: inheritedMixBrokerSecretFd() !== undefined,
-        inheritedSecretFd: inheritedMixBrokerSecretFd(),
+        mixPluginEnabled: mixBrokerSecretChannelEnabled(),
+        secretChannelEnabled: mixBrokerSecretChannelEnabled(),
         sandboxEngaged: true,
         mcpSocketMounted: !!sessionMcpGatewayHost?.socketPath,
         pidNamespaceRetained: !coreOnlyPidNamespaceDegrade({
@@ -29959,10 +30001,25 @@ function unattendedRawInputRefusal(
 
 // ─── IPC Message Handler ─────────────────────────────────────────────────────
 
-process.on('message', async (raw: unknown) => {
+process.on('message', async (raw: unknown, handle: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'mix_broker_secret_channel_result': {
+      const pending = pendingMixBrokerSecretChannels.get(msg.requestId);
+      if (!pending) {
+        if (isDuplexHandle(handle)) handle.destroy();
+        break;
+      }
+      pendingMixBrokerSecretChannels.delete(msg.requestId);
+      clearTimeout(pending.timeout);
+      if (msg.ok && isDuplexHandle(handle)) pending.resolve(handle);
+      else {
+        if (isDuplexHandle(handle)) handle.destroy();
+        pending.reject(new Error(msg.error ?? 'MIX broker secret channel is unavailable'));
+      }
+      break;
+    }
     case 'link_ref_register_result': {
       const pending = pendingLinkRefRegistrations.get(msg.requestId);
       if (!pending) break;

@@ -139,9 +139,10 @@ describe('redactChildEnv()', () => {
     const out = redactChildEnv({
       MIX_AUTH_TOKEN: 'machine-jwt',
       BYTEDCLI_AI_AUTH_APP_KEY: 'ai-auth-app-key',
+      BOTMUX_MIX_BROKER_SECRET_CHANNEL: 'ipc',
       KEEP: 'v',
     });
-    for (const key of ['MIX_AUTH_TOKEN', 'BYTEDCLI_AI_AUTH_APP_KEY']) {
+    for (const key of ['MIX_AUTH_TOKEN', 'BYTEDCLI_AI_AUTH_APP_KEY', 'BOTMUX_MIX_BROKER_SECRET_CHANNEL']) {
       expect(key in out, key).toBe(false);
       expect(REDACTED_CHILD_ENV_KEYS, key).toContain(key);
     }

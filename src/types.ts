@@ -1981,6 +1981,7 @@ type DaemonToWorkerBase =
   | { type: 'codex_cli_effort_cancel'; requestId: string }
   | { type: 'codex_app_effort'; requestId: string; effort: string }
   | { type: 'worker_ipc_probe' }
+  | { type: 'mix_broker_secret_channel_result'; requestId: string; ok: boolean; error?: string }
   | { type: 'plugin_result_delivery_result'; requestId: string; ok: boolean; messageIds?: string[]; error?: string }
   | { type: 'link_ref_register_result'; requestId: string; ok: boolean; companion?: string; stats?: Partial<import('./services/link-ref-types.js').LinkRefExtractionStats>; error?: string }
   | { type: 'link_ref_resolve_result'; requestId: string; ok: boolean; payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs; error?: string }
@@ -2192,6 +2193,7 @@ export interface ModelFallbackState {
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | { type: 'cancel_deployment_continuation'; requestId: string }
+  | { type: 'mix_broker_secret_channel_request'; requestId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
   | { type: 'worker_ipc_ready' }

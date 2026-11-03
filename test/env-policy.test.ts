@@ -19,10 +19,12 @@ describe('per-bot environment policy', () => {
     const worker = buildBotWorkerEnv({
       BYTEDCLI_AI_AUTH_APP_KEY: 'host-secret',
       BOTMUX_MIX_ACTOR_WRITE_ENABLED: '1',
+      BOTMUX_MIX_BROKER_SECRET_CHANNEL: 'ipc',
       KEEP: 'visible',
     });
     expect(worker.BYTEDCLI_AI_AUTH_APP_KEY).toBeUndefined();
     expect(worker.BOTMUX_MIX_ACTOR_WRITE_ENABLED).toBeUndefined();
+    expect(worker.BOTMUX_MIX_BROKER_SECRET_CHANNEL).toBeUndefined();
     expect(worker.KEEP).toBe('visible');
   });
   it('defaults to historical inheritance plus mandatory redaction', () => {

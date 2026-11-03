@@ -107,7 +107,7 @@ import { buildBotWorkerEnv, type EnvPolicy } from './env-policy.js';
 import {
   MIX_ACTOR_WRITE_ROLLOUT_ENV,
   MIX_BROKER_APP_KEY_ENV,
-  MIX_BROKER_SECRET_FD,
+  MIX_BROKER_SECRET_CHANNEL_ENV,
   MIX_BROKER_SECRET_FD_ENV,
   actorWriteContainmentConfigured,
   prepareMixBrokerWorkerChannel,
@@ -930,7 +930,7 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', MIX_BROKER_APP_KEY_ENV, MIX_ACTOR_WRITE_ROLLOUT_ENV, MIX_BROKER_SECRET_FD_ENV] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', MIX_BROKER_APP_KEY_ENV, MIX_ACTOR_WRITE_ROLLOUT_ENV, MIX_BROKER_SECRET_CHANNEL_ENV, MIX_BROKER_SECRET_FD_ENV] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -14888,7 +14888,7 @@ export function forkWorker(
       SESSION_DATA_DIR: config.session.dataDir,
       BOTMUX_SESSION_ID: ds.session.sessionId,
       LARK_APP_ID: botCfg.larkAppId,
-      ...(mixBrokerChannel.secret ? { [MIX_BROKER_SECRET_FD_ENV]: String(MIX_BROKER_SECRET_FD) } : {}),
+      ...(mixBrokerChannel.secret ? { [MIX_BROKER_SECRET_CHANNEL_ENV]: 'ipc' } : {}),
       // Withhold the real secret from the worker's own CLI env for a no-transport
       // session (apiOnly bot or HTTP virtual chat). SEPARATE leak from the
       // init-message larkAppSecret — the spawned CLI env carries it directly from
@@ -22127,7 +22127,7 @@ export function forkAdoptWorker(
       CLAUDECODE: undefined,
       BOTMUX: '1',
       LARK_APP_ID: botCfg.larkAppId,
-      ...(mixBrokerChannel.secret ? { [MIX_BROKER_SECRET_FD_ENV]: String(MIX_BROKER_SECRET_FD) } : {}),
+      ...(mixBrokerChannel.secret ? { [MIX_BROKER_SECRET_CHANNEL_ENV]: 'ipc' } : {}),
       // Withhold the real secret from the adopt worker's CLI env for a
       // no-transport session — same rationale as forkWorker above.
       LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
