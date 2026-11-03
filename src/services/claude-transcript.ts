@@ -1987,10 +1987,7 @@ function jsonlTailMatchFingerprint(
         // the full rationale. Required to keep short fingerprints
         // ("hello", "test") from matching old user lines in unrelated
         // sibling jsonls.
-        if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-          const evMs = Date.parse(ev.timestamp);
-          if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-        }
+        if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
         const role = ev.message?.role ?? ev.type;
         let text = '';
         if (role === 'user') {
