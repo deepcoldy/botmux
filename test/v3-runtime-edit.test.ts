@@ -1367,6 +1367,48 @@ async function askBlocked(base: string, runId: string) {
   return { runDir, driver, cards, attemptId, answer, rerun };
 }
 
+describe('round 3 — a grant card grants only the tier and exhaustion it was posted for', () => {
+  it('a pair card cannot be reused for the run-wide tier; a later run-wide exhaustion has its own card', async () => {
+    const base = freshBase();
+    const runId = 'run-tiers';
+    const extra = ['b', 'c', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7'];
+    const { runDir, block: pairA } = exhaustPair(base, runId, extra);
+    let rev = 2;
+    for (const id of extra.slice(2)) {
+      expect(edit(base, runId, [{ op: 'rerunNode', nodeId: id }], rev)).toMatchObject({ kind: 'applied' });
+      rev++;
+    }
+    const refuse = (nodeId: string) => {
+      const out = edit(base, runId, [{ op: 'rerunNode', nodeId }], rev);
+      if (out.kind !== 'invalid' || !out.rerunBudget) throw new Error(JSON.stringify(out));
+      return out.rerunBudget;
+    };
+    const click = (block: V3RerunBudgetBlock) => handleV3RevisionAction({
+      action: V3_REVISION_RERUN_GRANT_ACTION, runId, nodeId: block.nodeId, tier: block.tier, epoch: block.epoch,
+      nonce: v3RerunGrantCardNonce(runId, block.nodeId, block.tier, block.epoch),
+    }, INITIATOR, { baseDir: base, driveRun: () => {} });
+    // a's own budget and the run-wide budget are both spent.
+    expect(pairA.tier).toBe('pair');
+    expect(await click(pairA)).toMatchObject({ header: expect.anything() });
+    const runA = refuse('a');
+    expect(runA.tier).toBe('run');
+    // The pair card does not unlock the run-wide tier, even at the same epoch.
+    const before = journal(runDir).length;
+    expect(await click(pairA)).toMatchObject({ toast: expect.anything() });
+    expect(journal(runDir)).toHaveLength(before);
+    // b's run-wide card lifts it; b re-runs and spends the run-wide budget again.
+    expect(await click(refuse('b'))).toMatchObject({ header: expect.anything() });
+    expect(edit(base, runId, [{ op: 'rerunNode', nodeId: 'b' }], rev)).toMatchObject({ kind: 'applied' });
+    rev++;
+    // That second run-wide exhaustion gets its own card, which grants.
+    const runC = refuse('c');
+    expect(runC).toMatchObject({ tier: 'run' });
+    expect(runC.epoch).not.toBe(runA.epoch);
+    expect(await click(runC)).toMatchObject({ header: expect.anything() });
+    expect(edit(base, runId, [{ op: 'rerunNode', nodeId: 'c' }], rev)).toMatchObject({ kind: 'applied' });
+  });
+});
+
 describe('round 3 — a voided ask card offers the re-run (ADV-D)', () => {
   it('re-posted cards render voided; the button re-runs the node through a fresh gate', async () => {
     const base = freshBase();
@@ -1472,21 +1514,34 @@ describe('round 3 — follow-up reconciliation never acts on an outdated flow', 
 
   it('cold attach still reconciles proposals when the effective flow cannot be loaded, and says so', async () => {
     const base = freshBase();
-    const { runDir } = await lostPendingReassign(base, 'run-cold-broken');
-    expect(edit(base, 'run-cold-broken', [{ op: 'reassign', nodeId: 'y', bot: 'cli_other' }], 1)).toMatchObject({ kind: 'applied' });
-    dropLostFollowUps(runDir);
-    expect(edit(base, 'run-cold-broken', [{ op: 'updateNode', nodeId: 'y', set: { goal: 'member idea' } }], 2, other))
-      .toMatchObject({ kind: 'proposed' });
-    // The applied revision's file no longer matches its digest.
-    writeFileSync(v3RevisionFilePaths(runDir, 2).dag, readFileSync(join(runDir, 'dag.json')));
+    // Two runs owe a lost reassignment and have a broken applied revision;
+    // one of them also has a pending proposal.
+    const broken = async (runId: string, withProposal: boolean) => {
+      const { runDir } = await lostPendingReassign(base, runId);
+      expect(edit(base, runId, [{ op: 'reassign', nodeId: 'y', bot: 'cli_other' }], 1)).toMatchObject({ kind: 'applied' });
+      dropLostFollowUps(runDir);
+      if (withProposal) {
+        expect(edit(base, runId, [{ op: 'updateNode', nodeId: 'y', set: { goal: 'member idea' } }], 2, other))
+          .toMatchObject({ kind: 'proposed' });
+      }
+      // The applied revision's file no longer matches its digest.
+      writeFileSync(v3RevisionFilePaths(runDir, 2).dag, readFileSync(join(runDir, 'dag.json')));
+      return runDir;
+    };
+    const withProposal = await broken('run-cold-broken', true);
+    const followUpsOnly = await broken('run-cold-broken-2', false);
     const reposted: number[] = [];
-    const errors: string[] = [];
+    const errors: Array<{ runId: string; message: string }> = [];
     await runner(base, fakeWorkers().runNode, {
       postRevisionCard: async (_binding, view) => { reposted.push(view.revision); },
-      onError: (_runId, err) => { errors.push(err instanceof Error ? err.message : String(err)); },
+      onError: (runId, err) => { errors.push({ runId, message: err instanceof Error ? err.message : String(err) }); },
     }).coldAttach(BINDING.larkAppId);
     expect(reposted).toEqual([3]);
-    expect(errors.some((message) => /digest mismatch/.test(message))).toBe(true);
-    expect(journal(runDir).some((event) => event.type === 'nodeReassigned')).toBe(false);
+    for (const runId of ['run-cold-broken', 'run-cold-broken-2']) {
+      expect(errors.some((error) => error.runId === runId && /digest mismatch/.test(error.message))).toBe(true);
+    }
+    for (const runDir of [withProposal, followUpsOnly]) {
+      expect(journal(runDir).some((event) => event.type === 'nodeReassigned')).toBe(false);
+    }
   });
 });
