@@ -858,6 +858,13 @@ describe('P2 — a rerun refused for revisit budget can be unlocked by the initi
       action: V3_REVISION_RERUN_GRANT_ACTION, runId: 'run-budget', nodeId: 'a', epoch,
       nonce: v3RerunGrantCardNonce('run-budget', 'a', epoch),
     } as const;
+    // The card value is bound to its exhaustion: a value whose nonce does not
+    // match its run/node/epoch is refused before anything is granted.
+    const beforeForged = journal(runDir).length;
+    expect(await handleV3RevisionAction({ ...value, nonce: v3RerunGrantCardNonce('run-budget', 'a', epoch + 1) }, INITIATOR, {
+      baseDir: base, driveRun: () => {},
+    })).toMatchObject({ toast: expect.anything() });
+    expect(journal(runDir)).toHaveLength(beforeForged);
     expect(await handleV3RevisionAction(value, INITIATOR, { baseDir: base, driveRun: () => {} })).toMatchObject({ header: expect.anything() });
     // A second click cannot add a second rerun.
     expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', epoch, by: INITIATOR })).toEqual({ kind: 'already-granted' });
@@ -1118,6 +1125,8 @@ describe('round 2 — lost follow-ups never resurrect or outlive the run', () =>
     const events = journal(runDir);
     expect(events.some((event) => event.type === 'nodeRetryRequested' || event.type === 'nodeReassigned')).toBe(false);
     expect(projectV3RunStatus(base, 'run-lost-removed').nodes.map((node) => node.id)).toEqual(['z']);
+    // Even without the effective flow at hand, a removed node is owed nothing.
+    expect(missingV3RevisionFollowUps(events)).toEqual([]);
     expect(driver.dispatches.filter((req) => req.nodeId === 'a')).toHaveLength(1);
   });
 
@@ -1133,6 +1142,9 @@ describe('round 2 — lost follow-ups never resurrect or outlive the run', () =>
     writeFileSync(journalPath, `${lines.filter((line) => !/"type":"nodeReassigned"/.test(line)).join('\n')}\n`);
     expect(missingV3RevisionFollowUps(journal(runDir)).map((event) => event.type)).toEqual(['nodeReassigned']);
     expect(edit(base, 'run-lost-pending', [{ op: 'removeNode', nodeId: 'y' }], 2)).toMatchObject({ kind: 'applied' });
+    // Cold attach and the drive both check against the effective flow.
+    reconcileV3RevisionProposals(base, BINDING.larkAppId);
+    expect(journal(runDir).some((event) => event.type === 'nodeReassigned')).toBe(false);
     await driveV3Run('run-lost-pending', driver.deps);
     expect(journal(runDir).some((event) => event.type === 'nodeReassigned')).toBe(false);
   });

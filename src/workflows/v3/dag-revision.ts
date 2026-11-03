@@ -741,13 +741,17 @@ export interface V3RerunBudgetBlock {
   epoch: number;
 }
 
-/** Changes whenever the revisit budget is spent or granted. While the budget
- *  stays exhausted it stays the same, so repeated refusals share one epoch. */
-export function v3RevisitBudgetEpoch(events: readonly StoredEvent[]): number {
+/** Which exhaustion of `nodeId`'s rerun budget this is: the number of grants
+ *  that could have lifted it (its own pair grants plus run-wide grants). An
+ *  exhausted budget only reopens through a grant, so repeated refusals of the
+ *  same exhaustion share one epoch, and a grant for another node's pair does
+ *  not expire this node's card. */
+export function v3RevisitBudgetEpoch(events: readonly StoredEvent[], nodeId: string): number {
   let epoch = 0;
   for (const event of events) {
-    if (event.type === 'nodeRevisitRequested' || event.type === 'revisitBudgetGranted') epoch++;
-    else if (event.type === 'dagRevised') epoch += event.effects?.rerun?.length ?? 0;
+    if (event.type !== 'revisitBudgetGranted') continue;
+    const runWide = event.sourceNodeId === undefined && event.toNodeId === undefined;
+    if (runWide || (event.sourceNodeId === nodeId && event.toNodeId === nodeId)) epoch++;
   }
   return epoch;
 }
@@ -1066,7 +1070,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
             `${where}: 节点 "${op.nodeId}" 的重做额度已用完（${budget.tier === 'pair' ? '本节点' : '整个 run'}的 Revisit 额度）；` +
             '需要发起人在「追加重做额度」卡上同意后再提交这次修改',
           );
-          rerunBudget = { nodeId: op.nodeId, tier: budget.tier, epoch: v3RevisitBudgetEpoch(events) };
+          rerunBudget = { nodeId: op.nodeId, tier: budget.tier, epoch: v3RevisitBudgetEpoch(events, op.nodeId) };
           return;
         }
         rerun.add(op.nodeId);

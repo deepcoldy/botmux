@@ -1183,7 +1183,7 @@ export function grantV3RerunBudget(input: {
     if (status !== 'running' && status !== 'blocked') return { kind: 'stale', detail: `run is ${status}` };
     const budget = revisitBudgetStatus([...events], input.nodeId, input.nodeId);
     if (budget.ok) return { kind: 'already-granted' };
-    if (v3RevisitBudgetEpoch(events) !== input.epoch) return { kind: 'expired' };
+    if (v3RevisitBudgetEpoch(events, input.nodeId) !== input.epoch) return { kind: 'expired' };
     append({
       type: 'revisitBudgetGranted',
       ...(budget.tier === 'pair' ? { sourceNodeId: input.nodeId, toNodeId: input.nodeId } : {}),

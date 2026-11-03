@@ -246,14 +246,25 @@ describe('§13.4 node-state rules', () => {
     expect(revisitBudgetStatus(after, 'a', 'a').ok).toBe(false);
     const second = plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]);
     expect(second.ok).toBe(false);
-    const epoch = v3RevisitBudgetEpoch(after);
+    const epoch = v3RevisitBudgetEpoch(after, 'a');
     expect(!second.ok && second.rerunBudget).toEqual({ nodeId: 'a', tier: 'pair', epoch });
     // Refused again while still exhausted: same exhaustion, same epoch.
     const third = plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]);
     expect(!third.ok && third.rerunBudget?.epoch).toBe(epoch);
     after.push(ev({ type: 'revisitBudgetGranted', sourceNodeId: 'a', toNodeId: 'a', by: 'ou_i' }));
-    expect(v3RevisitBudgetEpoch(after)).not.toBe(epoch);
+    expect(v3RevisitBudgetEpoch(after, 'a')).not.toBe(epoch);
     expect(plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]).ok).toBe(true);
+  });
+
+  it('a grant for one node does not move another node\'s budget epoch; a run-wide grant moves every node\'s', () => {
+    const base = [...started()];
+    const a0 = v3RevisitBudgetEpoch(base, 'a');
+    const b0 = v3RevisitBudgetEpoch(base, 'b');
+    const pairA = [...base, ev({ type: 'revisitBudgetGranted', sourceNodeId: 'a', toNodeId: 'a', by: 'ou_i' })];
+    expect(v3RevisitBudgetEpoch(pairA, 'a')).not.toBe(a0);
+    expect(v3RevisitBudgetEpoch(pairA, 'b')).toBe(b0);
+    const runWide = [...pairA, ev({ type: 'revisitBudgetGranted', by: 'ou_i' })];
+    expect(v3RevisitBudgetEpoch(runWide, 'b')).not.toBe(b0);
   });
 
   it('skipped / cancelled nodes cannot change and their ids cannot be reused', () => {
@@ -451,6 +462,13 @@ describe('review regressions (engine)', () => {
       ev({ type: 'runBlocked', blockedNodeId: 'x' }),
     ];
     expect(materialize([...single, cancelOf('c')]).runStatus).toBe('running');
+    // A revision that removes nothing never reopens a blocked run.
+    expect(materialize([...started(), ev({ type: 'runBlocked', blockedNodeId: 'x' }), ev({
+      type: 'dagRevised', revision: 2, baseRevision: 1, sha256: 's', patchSha256: 'p', summary: '改 1 节点', by: 'ou',
+    })]).runStatus).toBe('blocked');
+    expect(materialize([...single, ev({
+      type: 'dagRevised', revision: 2, baseRevision: 1, sha256: 's', patchSha256: 'p', summary: '改 1 节点', by: 'ou',
+    })]).runStatus).toBe('blocked');
   });
 
   it('a rerun also spends the RUN-wide revisit budget', () => {
