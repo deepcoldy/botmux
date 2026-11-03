@@ -219,8 +219,10 @@ export type WorkflowHandoffIdentityPlan =
   /** No delegation: the run froze none, or the target needs none. The
    *  handoff is sent exactly as without the feature. */
   | { kind: 'none' }
-  /** Refuse BEFORE sending anything: IDENTITY_UNAVAILABLE (§10.3). */
-  | { kind: 'reject'; message: string }
+  /** Refuse BEFORE sending anything: IDENTITY_UNAVAILABLE (§10.3).
+   *  `transient`: the check itself could not run (a lookup error, the target
+   *  daemon unreachable) — the sender retries for a while before blocking. */
+  | { kind: 'reject'; message: string; transient?: true }
   | { kind: 'sign'; authority: DispatchUserAuthority };
 
 /**
@@ -254,7 +256,7 @@ export async function planWorkflowHandoffIdentity(input: {
   }
   if (checked.status === 'not_required') return { kind: 'none' };
   if (checked.status === 'unavailable') {
-    return { kind: 'reject', message: `暂时无法在 ${name} 这边校验发起人身份（${checked.detail}），节点未交接；稍后点重试` };
+    return { kind: 'reject', transient: true, message: `暂时无法在 ${name} 这边校验发起人身份（${checked.detail}），节点未交接` };
   }
   if (checked.status === 'denied') {
     if (!approved) {

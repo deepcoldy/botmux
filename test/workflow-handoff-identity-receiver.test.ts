@@ -46,11 +46,12 @@ const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
 const { readDispatchRegistryLoose, revokeWorkflowHandoff, lookupWorkflowHandoff } = await import('../src/core/workflow-handoff-binding.js');
 const { workflowDelegationRefusal, checkWorkflowHandoffIdentityTarget } = await import('../src/core/workflow-handoff-identity.js');
 const { workflowNodeMarkerFromBinding } = await import('../src/core/workflow-node-session.js');
-const { BotRun, cleanupBotRuns, reportDag } = await import('./helpers/v3-external-harness.js');
+const { BotRun, cleanupBotRuns, reportDag, reportFiles } = await import('./helpers/v3-external-harness.js');
 const { CHAT, INITIATOR_MAIN_OU, INITIATOR_OU_IN, INITIATOR_UNION, MAIN, SECRET, authorizeRun, driveWith, identityWorld } =
   await import('./helpers/workflow-identity-world.js');
 const { nonceOf } = await import('./helpers/workflow-handoff-harness.js');
 const { validateDag } = await import('../src/workflows/v3/dag.js');
+const { getLarkToolDelegation, currentLarkToolDelegation, clearLarkToolDelegations } = await import('../src/core/lark-tool-delegation.js');
 
 const SESSION = 'sess-node';
 const MAIN_BOT_IN_A = 'ou_main_bot_in_a';
@@ -127,6 +128,7 @@ async function receiver(opts: { self?: boolean } = {}) {
     workflowDelegationRefusal, readDispatchRegistryLoose, v3DefaultBaseDir: () => run.base,
     checkWorkflowHandoffIdentityTarget, workflowSelfAppId: () => appId,
     identityDecisionTurnIsLive: vi.fn(() => true),
+    getLarkToolDelegation,
   };
   const fns = daemonFunctions(scope);
   const identity = (turnId = handoff) => recallProvenIdentityContent(world.dataDir, SESSION, turnId, 'bytedcli') ?? '';
@@ -214,10 +216,46 @@ describe('a node turn under a workflow delegation', () => {
     bytedcliJwts.set(INITIATOR_MAIN_OU, { cloudJwt: 'alice-cloud' });
     await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
     h.scope.identityDecisionTurnIsLive.mockReturnValue(false);
-    h.scope.resolveTargetAppOpenId.mockClear();
-    await revokeWorkflowHandoff(h.world.dataDir, SECRET, nonceOf(h.attempt), 'timeout');
     await h.fns.withdrawWorkflowHandoffIdentity(h.ds, h.handoff);
-    expect(h.scope.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('workflow delegation inactive'));
+    expect(h.identity()).toContain('alice-cloud');
+  });
+});
+
+describe('a published workflow delegation is re-checked on every use', () => {
+  it('holds while the attempt is live', async () => {
+    const h = await receiver();
+    await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
+    expect(currentLarkToolDelegation(h.world.dataDir, SESSION, h.handoff))
+      .toMatchObject({ workflowHandoff: true, targetOpenId: INITIATOR_OU_IN.cli_a, denialReason: undefined });
+    clearLarkToolDelegations(h.world.dataDir, SESSION);
+  });
+
+  it.each([
+    ['the stop never reached this daemon', async (h: Awaited<ReturnType<typeof receiver>>) => {
+      await revokeWorkflowHandoff(h.world.dataDir, SECRET, nonceOf(h.attempt), 'runCancelled');
+    }],
+    ['the node already completed', async (h: Awaited<ReturnType<typeof receiver>>) => {
+      h.run.accept(h.attempt.attemptId, SESSION);
+      expect(await h.run.submit(h.attempt.attemptId, { sessionId: SESSION, ...reportFiles() })).toMatchObject({ ok: true });
+    }],
+  ])('%s: the next use gets a refusal, for good', async (_label, end) => {
+    const h = await receiver();
+    await h.fns.refreshTurnCliIdentity(h.ds, h.handoff);
+    await end(h);
+    const denied = currentLarkToolDelegation(h.world.dataDir, SESSION, h.handoff);
+    expect(denied).toMatchObject({ workflowHandoff: true, denialReason: 'delegation_inactive', tools: [] });
+    expect(denied).not.toHaveProperty('targetOpenId');
+    expect(getLarkToolDelegation(h.world.dataDir, SESSION, h.handoff)).toEqual(denied);
+    clearLarkToolDelegations(h.world.dataDir, SESSION);
+  });
+
+  it('an ordinary dispatch delegation is served as remembered (no workflow re-check)', async () => {
+    const { rememberLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
+    const h = await receiver();
+    const plain = { credentialOpenId: 'ou_x', unionId: 'on_x', targetOpenId: 'ou_y', tools: ['lark-cli' as const], dispatchRoot: 'om_r' };
+    rememberLarkToolDelegation(h.world.dataDir, SESSION, 'om_plain', plain);
+    expect(currentLarkToolDelegation(h.world.dataDir, SESSION, 'om_plain')).toEqual(plain);
+    clearLarkToolDelegations(h.world.dataDir, SESSION);
   });
 });
 

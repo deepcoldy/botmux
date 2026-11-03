@@ -100,6 +100,9 @@ export interface WorkflowNodeDaemonDeps {
   proveBotSender(input: { receiverLarkAppId: string; chatId: string; senderOpenId: string | undefined; sourceLarkAppId: string }): Promise<boolean>;
   /** Re-try a best-effort notice once after this many ms (default 3 s). */
   noticeRetryMs?: number;
+  /** Engine-aligned clock / wait for the handoff executor (tests). */
+  now?(): number;
+  sleep?(ms: number, signal: AbortSignal): Promise<void>;
   deliverSelfTurn(input: {
     larkAppId: string;
     chatId: string;
@@ -109,14 +112,18 @@ export interface WorkflowNodeDaemonDeps {
     prompt: string;
     attachments: LarkAttachment[];
     sessionTitle: string;
-    /** Publish the turn's tool identity from its signed delegation first. */
-    identityDelegated?: true;
+    /** Present only when the handoff carries the initiator's delegation:
+     *  publish the turn's tool identity before the CLI gets the turn. */
+    prepareTurnIdentity?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
   }): Promise<{ sessionId: string }>;
   attachmentsDir(larkAppId: string, messageId: string): string;
   loadRun(runDir: string): { dag: V3Dag; nodeExecutor?: 'bot'; chatId?: string; title: string } | undefined;
   drive(runId: string): void;
   botName(larkAppId: string): string;
   warn(message: string): void;
+  /** Publish a turn's tool identity (the daemon's per-turn preparation,
+   *  which resolves a signed delegation for it). */
+  prepareTurnIdentity(ds: DaemonSession, turnId: string): void | Promise<void>;
   /** 交接带发起人身份 (design §10): consulted only for runs whose run.json
    *  froze an initiator. */
   handoffIdentity: {
@@ -188,15 +195,19 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     });
   }
 
+  /** End the workflow delegation a handoff turn was given (best-effort). */
+  function withdrawIdentity(ds: DaemonSession, turnId: string): void {
+    if (!deps.withdrawHandoffIdentity) return;
+    void deps.withdrawHandoffIdentity(ds, turnId)
+      .catch((err) => deps.warn(`[workflow] withdrawing identity of ${turnId} failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
   function stopHandoffTurn(nonce: string, sessionId: string | undefined, opts?: { evenIfIdle?: boolean }): boolean {
     for (const ds of deps.activeSessions()) {
       const marker = ds.session.workflowNode;
       if (!marker || marker.nonce !== nonce) continue;
       if (sessionId && ds.session.sessionId !== sessionId) continue;
-      if (deps.withdrawHandoffIdentity) {
-        void deps.withdrawHandoffIdentity(ds, marker.handoffMessageId)
-          .catch((err) => deps.warn(`[workflow] withdrawing identity of ${marker.handoffMessageId} failed: ${err instanceof Error ? err.message : String(err)}`));
-      }
+      withdrawIdentity(ds, marker.handoffMessageId);
       return deps.interruptTurn(ds, opts);
     }
     return false;
@@ -224,6 +235,8 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
   const executor = createV3BotHandoffExecutor({
     get selfLarkAppId() { return deps.selfLarkAppId(); },
     get dataDir() { return deps.dataDir(); },
+    ...(deps.now ? { now: deps.now } : {}),
+    ...(deps.sleep ? { sleep: deps.sleep } : {}),
     handoffIdentity: {
       plan: async (request) => {
         const run = loadWorkflowHandoffIdentityRun(request.runDir);
@@ -316,7 +329,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         prompt: input.prompt,
         attachments: staged.attachments,
         sessionTitle: input.sessionTitle,
-        ...(input.identityDelegated ? { identityDelegated: true as const } : {}),
+        ...(input.identityDelegated ? { prepareTurnIdentity: deps.prepareTurnIdentity } : {}),
       });
       // The session registered the handoff: record acceptance now rather than
       // at the acceptance deadline's probe (which would find the same marker).
@@ -429,6 +442,8 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
           if (ds.session.sessionId !== sessionId || ds.session.workflowNode?.nonce !== nonce) continue;
           ds.session.workflowNode = { ...ds.session.workflowNode, submittedAt: new Date().toISOString() };
           deps.updateSession(ds);
+          // The node handed in its work: its delegation ends now (design §10.3).
+          withdrawIdentity(ds, ds.session.workflowNode.handoffMessageId);
         }
       },
       postReportCard: async (binding, input) => {

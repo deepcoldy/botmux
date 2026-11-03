@@ -102,6 +102,8 @@ async function approve(base: string, binding: RunChatBinding, opts: {
   nodeExecutor: 'ephemeral' | 'bot';
   handoffIdentity: boolean;
   policy?: V3HandoffIdentityPolicy;
+  /** The approving turn (default: the owner's own message). */
+  turnId?: string;
 }) {
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
   const policyFactory = vi.fn(() => opts.policy ?? identityPolicy({ status: 'resolved', unionId: 'on_owner' }).policy);
@@ -119,6 +121,7 @@ async function approve(base: string, binding: RunChatBinding, opts: {
       botDisplayName: () => (appId) => `bot(${appId})`,
       handoffIdentitySwitch: () => opts.handoffIdentity,
       handoffIdentityPolicy: policyFactory,
+      resolveCurrentTurnId: () => opts.turnId ?? 'om_owner_approves',
     }).catch((err: unknown) => { error = err; });
     return { output: log.mock.calls.flat().join('\n'), policyFactory, error };
   } finally {
@@ -156,6 +159,20 @@ describe('Gate-2 approve-dag', () => {
     const replay = await approve(base, GROUP_TOPIC, { nodeExecutor: 'bot', handoffIdentity: false });
     expect(replay.error).toBeUndefined();
     expect(frozenHandoffIdentity(envelopeOf(runDir))).toEqual({ openId: OWNER, unionId: 'on_owner', tools: ['lark-cli'] });
+  });
+
+  it.each([
+    ['a scheduled task', 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc'],
+    ['a synthetic trigger', 'trg_0123456789'],
+    ['a workflow event wake-up', 'workflow-event:r:7'],
+    ['no authenticated turn', undefined],
+  ])('approval in %s turn is refused with the switch on, without a lookup', async (_label, turnId) => {
+    const { base, runDir } = await dagReadyRun(GROUP_TOPIC);
+    const { policy, asked } = identityPolicy({ status: 'resolved', unionId: 'on_owner' });
+    const refused = await approve(base, GROUP_TOPIC, { nodeExecutor: 'bot', handoffIdentity: true, policy, turnId: turnId ?? '' });
+    expect(String(refused.error)).toContain('不是发起人本人');
+    expect(asked).toEqual([]);
+    expect(existsSync(join(runDir, 'run.json'))).toBe(false);
   });
 
   it('without the bot executor the identity switch has nothing to freeze', async () => {
@@ -211,7 +228,7 @@ describe('Saved Workflow /workflow run', () => {
   });
   const instantiate = (policy: V3NodeExecutorPolicy) => instantiatePublishedSavedWorkflow({
     dataDir: join(root, 'data'), ref: workflowId, bots: BOTS, baseDir: join(root, 'runs'),
-    context: { actor: SENDER, chatId: 'oc_a', chatType: 'group', rootMessageId: 'om_root', sessionId: 's' },
+    context: { actor: SENDER, chatId: 'oc_a', chatType: 'group', rootMessageId: 'om_root', sessionId: 's', humanTurn: true },
     nodeExecutorPolicy: policy,
   });
 

@@ -104,8 +104,12 @@ export interface IdentityWorld {
   directoryDown: Set<string>;
   /** Every identity-check request a target daemon received over IPC. */
   identityChecks: Array<{ target: string; body: WorkflowHandoffIdentityCheckRequest }>;
-  selfTurns: Array<V3SelfTurnRequest & { identityDelegated?: true }>;
+  selfTurns: Array<V3SelfTurnRequest & { prepareTurnIdentity?: unknown }>;
   main: ReturnType<typeof createWorkflowNodeDaemon>;
+  /** Every bot's daemon wiring, by app id (`main` is MAIN's). */
+  daemons: Map<string, ReturnType<typeof createWorkflowNodeDaemon>>;
+  /** The per-turn identity preparation the daemons were given. */
+  prepareTurnIdentity: (ds: unknown, turnId: string) => Promise<void>;
 }
 
 /** The pre-handoff check a bot's daemon runs (mirrors daemon.ts's
@@ -122,7 +126,7 @@ function targetCheck(world: IdentityWorld, appId: string) {
   });
 }
 
-export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, opts: { dataDir?: string } = {}): IdentityWorld {
+export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, opts: { dataDir?: string; clock?: { t: number } } = {}): IdentityWorld {
   const dataDir = opts.dataDir ?? trackTempDir(mkdtempSync(join(tmpdir(), 'wf-identity-data-')));
   const world = {
     dataDir,
@@ -142,6 +146,7 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
     directoryDown: new Set<string>(),
     identityChecks: [],
     selfTurns: [],
+    prepareTurnIdentity: async () => {},
   } as unknown as IdentityWorld;
   const ports = new Map([[MAIN, 4100], ['cli_a', 4101], ['cli_b', 4102], ['cli_c', 4103]]);
   const targets = new Map([...ports].map(([appId, port]) => [port, appId]));
@@ -159,6 +164,7 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
     hostSecret: () => 'host-ipc-secret',
     bindingSecret: () => SECRET,
     postDaemon: async (port, path, body) => {
+      await new Promise((resolve) => setImmediate(resolve)); // a real hop yields
       const target = targets.get(port)!;
       if (path !== WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE) return { status: 404, body: { ok: false, error: 'not_found' } };
       world.identityChecks.push({ target, body: body as WorkflowHandoffIdentityCheckRequest });
@@ -180,6 +186,14 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
     drive: () => {},
     botName: (appId) => `bot(${appId})`,
     warn: () => {},
+    prepareTurnIdentity: world.prepareTurnIdentity,
+    // The engine's fake clock; an in-call wait just advances it.
+    ...(opts.clock ? {
+      now: () => opts.clock!.t,
+      // Yields to the event loop, so a retry loop that never ends fails on
+      // the test timeout instead of starving it.
+      sleep: async (ms: number) => { opts.clock!.t += ms; await new Promise((resolve) => setImmediate(resolve)); },
+    } : {}),
     handoffIdentity: {
       botTools: (appId) => {
         const p = world.policies.get(appId);
@@ -191,6 +205,7 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
   });
   for (const appId of ports.keys()) routes.set(appId, daemonFor(appId));
   world.main = routes.get(MAIN)!;
+  world.daemons = routes;
   return world;
 }
 

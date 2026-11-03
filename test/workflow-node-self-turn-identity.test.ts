@@ -96,7 +96,7 @@ const prepare = () => vi.fn(async (ds: any, turnId: string) => {
 describe('deliverWorkflowNodeTurn identity step', () => {
   it('a delegated handoff publishes the identity before the new session\'s first turn', async () => {
     const prepareTurnIdentity = prepare();
-    await deliverWorkflowNodeTurn(INPUT, new Map(), () => false, { prepareTurnIdentity });
+    await deliverWorkflowNodeTurn({ ...INPUT, prepareTurnIdentity }, new Map(), () => false);
     expect(prepareTurnIdentity).toHaveBeenCalledTimes(1);
     expect(order).toEqual(['identity:om_handoff', 'fork:om_handoff']);
   });
@@ -110,7 +110,7 @@ describe('deliverWorkflowNodeTurn identity step', () => {
       session, worker: { killed: false }, larkAppId: 'cli_main', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
     });
     const prepareTurnIdentity = prepare();
-    await deliverWorkflowNodeTurn(INPUT, map, () => false, { prepareTurnIdentity });
+    await deliverWorkflowNodeTurn({ ...INPUT, prepareTurnIdentity }, map, () => false);
     expect(order).toEqual(['identity:om_handoff', 'send:om_handoff']);
   });
 

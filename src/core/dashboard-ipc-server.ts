@@ -520,7 +520,8 @@ import { noteSenderUnionId } from './platform-credential-source.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
-import { getLarkToolDelegation } from './lark-tool-delegation.js';
+import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
+import { publishDelegationRefusal } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1545,6 +1546,16 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     const ds = findActiveBySessionId(sessionId);
     if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return jsonRes(res, 403, blocked);
     const identityTurnId = document.identityTurnId ?? document.turnId;
+    // A workflow handoff's delegation is re-checked on every use: once its
+    // attempt ended or it was withdrawn, this turn's tool refuses from now on
+    // (even if the stop never reached this daemon).
+    const delegation = currentLarkToolDelegation(config.session.dataDir, sessionId, identityTurnId);
+    if (delegation?.workflowHandoff && delegation.denialReason === 'delegation_inactive') {
+      publishDelegationRefusal({
+        sessionDataDir: config.session.dataDir, sessionId, turnId: identityTurnId,
+        tool: tool === 'codebase' ? 'bytedcli' : tool, delegated: delegation, storageModel: 'proven',
+      });
+    }
     const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
     if (env) {
       return jsonRes(res, 200, {
@@ -3341,7 +3352,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
   }
   const delegated = detachedForUser ? undefined
-    : getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId);
+    : currentLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId);
   const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
   if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
     || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
@@ -3484,7 +3495,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const requestingUser = (): string | undefined => {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
-      const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.identityTurnId ?? liveOrigin.turnId);
+      const grant = currentLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.identityTurnId ?? liveOrigin.turnId);
       if (!grant) return liveOrigin.callerOpenId;
       if (grant.denialReason || !grant.targetOpenId || !grant.tools.includes('lark-cli')
         || !triggerUserAuthApplies(getBot(ds.larkAppId).config.triggerUserAuth, 'lark-cli')) return undefined;

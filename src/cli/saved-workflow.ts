@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 
 import { loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { resolveCurrentTurnProvenance } from '../core/current-turn-provenance.js';
+import { isHumanInboundTurnId } from '../core/reply-target.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import type { RawParamInput } from '../workflows/shared/params.js';
 import { defaultBaseDir } from '../workflows/v3/grill-state.js';
@@ -128,6 +129,7 @@ export function contextFromEnv(
     ...(provenance.chatType ? { chatType: provenance.chatType } : {}),
     ...(provenance.rootMessageId ? { rootMessageId: provenance.rootMessageId } : {}),
     sessionId: provenance.sessionId,
+    humanTurn: isHumanInboundTurnId(provenance.turnId),
   };
 }
 

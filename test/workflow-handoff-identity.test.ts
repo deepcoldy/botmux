@@ -223,7 +223,6 @@ describe('each handoff is signed by the main bot from the run (star issuance)', 
 
   it.each([
     ['the initiator left the chat', (world: ReturnType<typeof identityWorld>) => { world.members.get('cli_a')!.clear(); }, '已不在本群'],
-    ['the target cannot check right now', (world: ReturnType<typeof identityWorld>) => { world.directoryDown.add('cli_a'); }, '暂时无法'],
     ['the target governs none of the frozen tools', (world: ReturnType<typeof identityWorld>) => { world.policies.set('cli_a', policy(['bytedcli'])); }, '没有可交给'],
   ])('%s: IDENTITY_UNAVAILABLE before anything is sent, never a send without the initiator', async (_label, arrange, text) => {
     const run = new BotRun(reportDag(`id-refuse-${text.length}`));
@@ -237,6 +236,37 @@ describe('each handoff is signed by the main bot from the run (star issuance)', 
     expect(world.lark.sent).toEqual([]);
     expect(world.lark.replies).toEqual([]);
     expect(store(world.dataDir)).toEqual({});
+  });
+
+  it('only the run\'s own main bot signs, and only for the run\'s own chat', async () => {
+    const run = new BotRun(reportDag('id-wrong-signer'));
+    const world = identityWorld();
+    const snapshots = authorizeRun(run, { identity: FROZEN });
+    // Another bot's daemon driving this run (it does not own it) …
+    expect(expectTerminal(await run.drive(world.daemons.get('cli_b')!.executor, {
+      opts: { chatBinding: BINDING, authorizedArtifacts: true, frozenBotSnapshots: snapshots },
+    })).runStatus).toBe('blocked');
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'IDENTITY_UNAVAILABLE' })]);
+    // … and the owner handing off into a chat that is not the run's.
+    const other = new BotRun(reportDag('id-wrong-chat'));
+    const otherSnapshots = authorizeRun(other, { identity: FROZEN });
+    expect(expectTerminal(await other.drive(world.main.executor, {
+      opts: { chatBinding: { ...BINDING, chatId: 'oc_elsewhere' }, authorizedArtifacts: true, frozenBotSnapshots: otherSnapshots },
+    })).runStatus).toBe('blocked');
+    expect(other.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'IDENTITY_UNAVAILABLE' })]);
+    expect(world.lark.sent).toEqual([]);
+    expect(world.identityChecks).toEqual([]);
+    expect(store(world.dataDir)).toEqual({});
+  });
+
+  it('a self node of a run frozen without an identity starts its turn with no identity step', async () => {
+    const run = new BotRun(validateDag({
+      schemaVersion: 2, runId: 'id-self-off', nodes: [{ id: 'write', type: 'goal', goal: 'summarize', timeoutSec: 600 }],
+    }));
+    const world = identityWorld();
+    await driveWith(run, world, authorizeRun(run, { identity: null, selectors: [''] }));
+    expect(world.selfTurns).toHaveLength(1);
+    expect(world.selfTurns[0]).not.toHaveProperty('prepareTurnIdentity');
   });
 
   it('tools only narrow: frozen ceiling ∩ what the main bot governs now ∩ what the target governs', async () => {
@@ -261,7 +291,10 @@ describe('each handoff is signed by the main bot from the run (star issuance)', 
     const attempt = run.openAttempt('write');
     expect(attempt.targetLarkAppId).toBe(MAIN);
     expect(world.identityChecks).toEqual([]);
-    expect(world.selfTurns).toEqual([expect.objectContaining({ handoffMessageId: attempt.handoffMessageId, identityDelegated: true })]);
+    // The in-process turn publishes its identity (the daemon's per-turn
+    // preparation, which resolves the signed record) before the CLI gets it.
+    expect(world.selfTurns).toEqual([expect.objectContaining({ handoffMessageId: attempt.handoffMessageId })]);
+    expect(world.selfTurns[0]!.prepareTurnIdentity).toBe(world.prepareTurnIdentity);
     expect(boundRecord(world.dataDir, attempt.handoffMessageId!)).toMatchObject({ targetAppIds: [MAIN] });
     expect(workflowDelegationRefusal(receiverInputs(world, run, attempt, MAIN))).toBeUndefined();
   });
@@ -331,6 +364,78 @@ describe('each handoff is signed by the main bot from the run (star issuance)', 
     expect(record.workflow.nonce).toBe(nonceOf(third));
     expect(record.authority).toEqual(boundRecord(world.dataDir, first.handoffMessageId!)!.authority);
     expect(workflowDelegationRefusal(receiverInputs(world, run, third))).toBeUndefined();
+  });
+});
+
+// ─── a check that cannot run ───────────────────────────────────────────────
+
+describe('a target check that cannot run is retried for about a minute before the node blocks', () => {
+  async function stuck(runId: string) {
+    const run = new BotRun(reportDag(runId));
+    // The executor stamps handoff bindings with this clock too; the registry
+    // prunes entries by real time, so the fake clock starts at real time.
+    run.clock.t = Date.now();
+    const world = identityWorld({}, { clock: run.clock });
+    const snapshots = authorizeRun(run, { identity: FROZEN });
+    world.directoryDown.add('cli_a');
+    return { run, world, snapshots, drive: () => driveWith(run, world, snapshots) };
+  }
+
+  it('clears within the window: the handoff goes out with the delegation', async () => {
+    const { run, world, drive } = await stuck('id-retry-clears');
+    const t0 = run.clock.t;
+    // Fails, waits 5 s in the call, fails again; the next try is due at +20 s.
+    expectAwaitingExternal(await drive());
+    expect(world.identityChecks).toHaveLength(2);
+    expect(run.clock.t - t0).toBe(5_000);
+    expect(run.openAttempt('write').phase).toBe('prepared');
+    expect(world.lark.sent).toEqual([]);
+    world.directoryDown.delete('cli_a');
+    run.clock.t = t0 + 35_000; // the engine's next same-key re-send
+    expectAwaitingExternal(await drive());
+    const attempt = run.openAttempt('write');
+    expect(attempt.phase).toBe('sent');
+    expect(boundRecord(world.dataDir, attempt.handoffMessageId!)).toMatchObject({ targetAppIds: ['cli_a'] });
+  });
+
+  it('a re-send before the next try is due does not check again', async () => {
+    const { run, world, drive } = await stuck('id-retry-early');
+    const t0 = run.clock.t;
+    await drive();
+    run.clock.t = t0 + 6_000; // a drive for something else, 14 s before the next try
+    expectAwaitingExternal(await drive());
+    expect(world.identityChecks).toHaveLength(2);
+  });
+
+  it('still failing after the schedule: IDENTITY_UNAVAILABLE with the reason, nothing sent', async () => {
+    const { run, world, drive } = await stuck('id-retry-exhausted');
+    const t0 = run.clock.t;
+    await drive(); // checks at +0 s, +5 s
+    run.clock.t = t0 + 35_000;
+    expectAwaitingExternal(await drive()); // check at +35 s; the last is due at +60 s
+    expect(world.identityChecks).toHaveLength(3);
+    run.clock.t = t0 + 65_000;
+    expect(expectTerminal(await drive()).runStatus).toBe('blocked');
+    expect(world.identityChecks).toHaveLength(4);
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
+      errorCode: 'IDENTITY_UNAVAILABLE',
+      message: expect.stringMatching(/暂时无法.*contact lookup unavailable.*自动重试 3 次仍失败/),
+    })]);
+    expect(world.lark.sent).toEqual([]);
+    expect(store(world.dataDir)).toEqual({});
+  });
+
+  it('a definite refusal during the retries blocks at once', async () => {
+    const { run, world, drive } = await stuck('id-retry-then-denied');
+    await drive();
+    world.directoryDown.delete('cli_a');
+    world.members.get('cli_a')!.clear();
+    run.clock.t += 30_000;
+    expect(expectTerminal(await drive()).runStatus).toBe('blocked');
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
+      errorCode: 'IDENTITY_UNAVAILABLE', message: expect.stringContaining('已不在本群'),
+    })]);
+    expect(world.identityChecks).toHaveLength(3);
   });
 });
 

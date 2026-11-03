@@ -286,8 +286,16 @@ const HANDOFF_IDENTITY_OFF_HINT = '或在 Dashboard 关闭「交接带发起人�
 export async function resolveV3HandoffIdentity(
   binding: RunChatBinding,
   policy: V3HandoffIdentityPolicy,
+  /** The authorizing turn was opened by a human message (`om_…` / `join_…`).
+   *  A scheduled task, an event wake-up or any other synthetic turn names a
+   *  person (the task creator, the session owner) who did not take part:
+   *  ADR dispatch-user-delegation §7 — such turns carry no delegation. */
+  turn: { humanTurn: boolean },
 ): Promise<V3HandoffIdentityResolution> {
   const prefix = '「交接带发起人身份」已开启';
+  if (!turn.humanTurn) {
+    return { kind: 'refused', message: `${prefix}，但这次批准不是发起人本人在群里发来的消息（定时任务、事件唤醒等自动回合没有真人），不能冻结发起人身份，已拒绝批准。请由发起人本人在群里批准，${HANDOFF_IDENTITY_OFF_HINT}。` };
+  }
   if (!binding.ownerOpenId) {
     return { kind: 'refused', message: `${prefix}，但这个 run 没有经过认证的发起人，无法冻结发起人身份。请由发起人本人在群里批准，${HANDOFF_IDENTITY_OFF_HINT}。` };
   }
@@ -339,6 +347,8 @@ export async function resolveV3NodeExecutor(input: {
   policy: V3NodeExecutorPolicy;
   binding: RunChatBinding | undefined;
   targetsFor: (binding: RunChatBinding) => V3NodeExecutorTarget[];
+  /** See {@link resolveV3HandoffIdentity}; absent = not proven human. */
+  humanTurn?: boolean;
 }): Promise<V3NodeExecutorResolution> {
   const decision = decideV3NodeExecutor({
     switchMode: input.policy.switchMode,
@@ -365,7 +375,7 @@ export async function resolveV3NodeExecutor(input: {
   }
   const summary = formatV3BotExecutorPlan(targets, binding.larkAppId, input.policy.nameOf);
   if (!input.policy.handoffIdentity) return { kind: 'bot', targets, summary };
-  const identity = await resolveV3HandoffIdentity(binding, input.policy.handoffIdentity);
+  const identity = await resolveV3HandoffIdentity(binding, input.policy.handoffIdentity, { humanTurn: input.humanTurn === true });
   if (identity.kind === 'refused') return { kind: 'refused', problems: [], message: identity.message };
   return { kind: 'bot', targets, summary: `${summary}\n${identity.summary}`, handoffIdentity: identity.identity };
 }

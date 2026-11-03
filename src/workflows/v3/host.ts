@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { resolveCurrentTurnProvenance } from '../../core/current-turn-provenance.js';
+import { isHumanInboundTurnId } from '../../core/reply-target.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import {
@@ -96,6 +97,20 @@ export function hostNew(opts: {
  * A genuine standalone/dev invocation (no session claim or marker) keeps the
  * old minimal env binding for card experiments, but never claims an owner.
  */
+/** The current authenticated turn's id (undefined for a standalone/dev
+ *  invocation). Same proof as {@link chatBindingFromEnv}. */
+export function currentTurnIdFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  startPid: number = process.ppid,
+): string | undefined {
+  if (!env.SESSION_DATA_DIR) return undefined;
+  return resolveCurrentTurnProvenance({
+    dataDir: env.SESSION_DATA_DIR,
+    envSessionId: env.BOTMUX_SESSION_ID,
+    startPid,
+  })?.turnId;
+}
+
 export function chatBindingFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   startPid: number = process.ppid,
@@ -711,6 +726,9 @@ export interface WorkflowHostCommandDeps {
   /** Seams that freeze the initiator (default: the main bot's live Lark app
    *  + bots.json). Only built while that switch is on. */
   handoffIdentityPolicy?: (bots: BotConfig[]) => V3HandoffIdentityPolicy | Promise<V3HandoffIdentityPolicy>;
+  /** The current turn's id (default: fresh current-turn provenance). Read
+   *  only to freeze the initiator: only a human-opened turn may. */
+  resolveCurrentTurnId?: () => string | undefined;
 }
 
 async function liveHandoffIdentityPolicy(bots: BotConfig[]): Promise<V3HandoffIdentityPolicy> {
@@ -886,6 +904,7 @@ export async function cmdWorkflowHost(
               const identity = await resolveV3HandoffIdentity(
                 plan.binding,
                 await (deps.handoffIdentityPolicy ?? liveHandoffIdentityPolicy)(bots),
+                { humanTurn: isHumanInboundTurnId((deps.resolveCurrentTurnId ?? currentTurnIdFromEnv)()) },
               );
               if (identity.kind === 'refused') throw new HostGuardError(identity.message);
               handoffIdentity = identity.identity;

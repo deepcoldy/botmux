@@ -141,6 +141,30 @@ export interface V3BotHandoffExecutorDeps {
   startSelfTurn(input: V3SelfTurnRequest): Promise<{ sessionId: string }>;
   handoffIdentity?: V3HandoffIdentityDeps;
   now?(): number;
+  /** Wait inside a dispatch call (identity-check retries); rejects on abort. */
+  sleep?(ms: number, signal: AbortSignal): Promise<void>;
+}
+
+/**
+ * When the target bot's identity check cannot run (a lookup error, its
+ * daemon unreachable), the handoff is retried after these delays before the
+ * node blocks IDENTITY_UNAVAILABLE — about a minute in all. A definite
+ * refusal (not in the chat, not approved, no tool) blocks at once. A wait of
+ * at most {@link IDENTITY_CHECK_IN_CALL_WAIT_MAX_MS} happens inside the
+ * dispatch call (well under the engine's 30 s per-call bound); a longer one
+ * leaves the attempt prepared (nothing was sent) for the engine's next
+ * same-key re-send.
+ */
+export const IDENTITY_CHECK_RETRY_DELAYS_MS = [5_000, 15_000, 40_000] as const;
+export const IDENTITY_CHECK_IN_CALL_WAIT_MAX_MS = 10_000;
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason ?? new Error('aborted')); return; }
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason ?? new Error('aborted')); };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 interface RunCardContext {
@@ -267,6 +291,44 @@ function previousNodeTopic(request: V3ExternalDispatchRequest): string | undefin
 
 export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3ExternalNodeExecutor {
   const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? abortableSleep;
+  /** attemptId → the identity check's transient failures so far. */
+  const identityRetries = new Map<string, { firstAt: number; failures: number }>();
+
+  /** The handoff's identity plan, retrying a check that could not run. */
+  async function planIdentity(request: V3ExternalDispatchRequest): Promise<WorkflowHandoffIdentityPlan> {
+    const identityDeps = deps.handoffIdentity;
+    if (!identityDeps) return { kind: 'none' };
+    for (const [attemptId, state] of identityRetries) {
+      if (now() - state.firstAt > 10 * 60_000) identityRetries.delete(attemptId);
+    }
+    for (;;) {
+      const state = identityRetries.get(request.attemptId);
+      if (state) {
+        const dueAt = state.firstAt + IDENTITY_CHECK_RETRY_DELAYS_MS.slice(0, state.failures).reduce((sum, ms) => sum + ms, 0);
+        const wait = dueAt - now();
+        // Nothing has been sent: an unknown outcome the engine re-sends later.
+        if (wait > IDENTITY_CHECK_IN_CALL_WAIT_MAX_MS) {
+          throw new Error(`identity check unavailable; retrying in ${Math.ceil(wait / 1000)} s`);
+        }
+        if (wait > 0) await sleep(wait, request.signal);
+      }
+      const plan = await identityDeps.plan(request);
+      if (plan.kind !== 'reject' || !plan.transient) {
+        identityRetries.delete(request.attemptId);
+        return plan;
+      }
+      const next = { firstAt: state?.firstAt ?? now(), failures: (state?.failures ?? 0) + 1 };
+      if (next.failures > IDENTITY_CHECK_RETRY_DELAYS_MS.length) {
+        identityRetries.delete(request.attemptId);
+        return {
+          kind: 'reject',
+          message: `${plan.message}；约 ${Math.round((now() - next.firstAt) / 1000)} 秒内自动重试 ${IDENTITY_CHECK_RETRY_DELAYS_MS.length} 次仍失败，请稍后点重试`,
+        };
+      }
+      identityRetries.set(request.attemptId, next);
+    }
+  }
 
   async function dispatch(request: V3ExternalDispatchRequest): Promise<V3ExternalDispatchOutcome> {
     const binding = request.chatBinding;
@@ -320,9 +382,7 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
     }
     // §10.3: a target that runs its tools as the trigger user is handed the
     // node only with the initiator's delegation — never without it.
-    const identity: WorkflowHandoffIdentityPlan = deps.handoffIdentity
-      ? await deps.handoffIdentity.plan(request)
-      : { kind: 'none' };
+    const identity = await planIdentity(request);
     if (identity.kind === 'reject') {
       return { kind: 'rejected', code: 'IDENTITY_UNAVAILABLE', message: identity.message };
     }

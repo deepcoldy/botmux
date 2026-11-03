@@ -578,6 +578,7 @@ import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-c
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
+import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
@@ -745,6 +746,7 @@ import {
   deliverV3SavedWorkflowNotification,
   executeV3SavedWorkflowCommand,
   resolveV3SavedWorkflowMessageTargets,
+  v3SavedWorkflowMessageContext,
   type V3SavedWorkflowExecutionEffect,
 } from './im/lark/v3-saved-workflow-handler.js';
 import { liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
@@ -4599,6 +4601,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
         // reports to its handoff message, not to the node topic.
         dispatchRoot: (workflow ? delegation.messageId : delegation.rootId) ?? delegation.messageId ?? turnId,
         denialReason: 'target_access_denied',
+        ...(workflow ? { workflowHandoff: true as const } : {}),
       };
       const workflowRefusal = workflow ? workflowDelegationRefusalFor(ds, turnId, delegation) : undefined;
       if (workflowRefusal) {
@@ -4609,6 +4612,9 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
       if (targetOpenId) delegatedIdentity = {
         ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
         denialReason: undefined,
+        // Re-checked on every use (dashboard-ipc-server): the run attempt can
+        // end, or the handoff be withdrawn, while this turn still runs.
+        ...(workflow ? { recheck: () => workflowDelegationRefusalFor(ds, turnId, delegation) } : {}),
       };
     }
   } catch (error) {
@@ -6067,12 +6073,9 @@ async function handleV3SavedWorkflowCommandIfAny(
     return true;
   }
 
-  const context: SavedWorkflowActorContext = {
-    actor: { openId: initiatorOpenId, larkAppId },
-    chatId,
-    chatType,
-    rootMessageId: targets.runRootMessageId,
-  };
+  const context: SavedWorkflowActorContext = v3SavedWorkflowMessageContext({
+    initiatorOpenId, larkAppId, chatId, chatType, runRootMessageId: targets.runRootMessageId, messageId, botSender,
+  });
   const dataDir = dirname(v3DefaultBaseDir());
   const baseDir = v3DefaultBaseDir();
   if (command.kind === 'save' && command.distill) {
@@ -6859,10 +6862,8 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   withdrawHandoffIdentity: withdrawWorkflowHandoffIdentity,
   proveBotSender: proveWorkflowBotSender,
   deliverSelfTurn: (input) => withBotTurnAdmission(input.larkAppId,
-    () => deliverWorkflowNodeTurn(input, activeSessions, refreshCliVersion,
-      // Only a handoff signed with the initiator's delegation (design §10):
-      // its turn's tools run as them, published before the turn starts.
-      input.identityDelegated ? { prepareTurnIdentity: (ds, turnId) => prepareTurnCliIdentity(ds, turnId) } : undefined)),
+    () => deliverWorkflowNodeTurn(input, activeSessions, refreshCliVersion)),
+  prepareTurnIdentity: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   attachmentsDir: getAttachmentsDir,
   loadRun: workflowLoadBotRun,
   drive: (runId) => v3GateRunner.driveDetached(runId),
@@ -6884,14 +6885,21 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
 async function withdrawWorkflowHandoffIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   // A finished turn holds nothing to withdraw (and a restore re-resolves it).
   if (!triggerUserAuthEnabledFor(ds) || !identityDecisionTurnIsLive(ds, turnId)) return;
-  const record = await resolveDispatchUser({
-    dataDir: config.session.dataDir,
-    secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
-    appId: ds.larkAppId, chatId: ds.chatId, turnId,
-    rootId: ds.session.workflowNode?.publishRoot, waitMs: 0,
+  const remembered = getLarkToolDelegation(config.session.dataDir, ds.session.sessionId, turnId);
+  if (!remembered?.workflowHandoff) return;
+  // Unconditionally: a submitted node may still be waiting for the main bot
+  // (its attempt not yet closed), yet its delegation is done.
+  const { recheck: _recheck, targetOpenId: _target, ...rest } = remembered;
+  await publishTurnCliIdentity({
+    botConfig: getBot(ds.larkAppId).config,
+    sessionDataDir: config.session.dataDir,
+    sessionId: ds.session.sessionId,
+    senderOpenId: undefined,
+    delegatedIdentity: { ...rest, tools: [], denialReason: 'delegation_inactive' },
+    locale: localeForBot(ds.larkAppId),
+    turnId,
+    storageModel: identityModelForPublication(ds),
   });
-  if (!record || !('workflow' in record)) return;
-  await refreshTurnCliIdentity(ds, turnId);
 }
 
 /**

@@ -69,6 +69,34 @@ export interface DelegatedCliIdentity {
   /** `delegation_inactive`: a workflow handoff's delegation whose run attempt
    *  ended, or whose handoff was withdrawn (design 2026-11-03 §10.3). */
   denialReason?: 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive';
+  /** A workflow handoff's delegation (design 2026-11-03 §10). */
+  workflowHandoff?: true;
+  /** Workflow handoff only: re-run its run / attempt / revocation checks
+   *  (local reads) and say why it no longer holds. Consulted on every use,
+   *  so a stop that never reached this daemon still ends it. Daemon memory
+   *  only; never serialized. */
+  recheck?: () => string | undefined;
+}
+
+/** Replace one tool's published identity for `turnId` with the refusal for
+ *  `delegated` (its `denialReason` explains it). Used when a workflow
+ *  delegation stops holding while its turn is still running. */
+export function publishDelegationRefusal(args: {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  tool: TriggerUserAuthTool;
+  delegated: DelegatedCliIdentity;
+  storageModel: IdentityStorageModel;
+}): void {
+  denyDelegated(args.tool, {
+    botConfig: {} as BotConfig,
+    sessionDataDir: args.sessionDataDir,
+    sessionId: args.sessionId,
+    senderOpenId: undefined,
+    turnId: args.turnId,
+    storageModel: args.storageModel,
+  }, args.delegated);
 }
 
 export interface PublishTurnIdentityArgs {
