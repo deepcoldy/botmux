@@ -40,6 +40,7 @@ import {
   planV3DagRevision,
   missingV3RevisionFollowUps,
   snapshotForSelector,
+  v3CurrentExecutorApp,
   v3RevisionFollowUps,
   v3RevisionDigest,
   v3RevisionFilePaths,
@@ -1035,7 +1036,15 @@ export function projectV3RunStatus(baseDir: string, runId: string): V3RunStatusV
     const state = snap.nodes.get(node.id);
     const instanceId = state?.effectiveInstanceId;
     const attemptId = snap.attempts.get(instanceId ?? node.id);
-    const bot = isGoalNode(node) || isLoopNode(node) ? snapshotForSelector(bots, node.bot) : undefined;
+    // The bot that executes it now (a blocked-card 改派 moves it without
+    // touching the definition) — what an edit's reassign is compared with.
+    const executorApp = isGoalNode(node) || isLoopNode(node)
+      ? v3CurrentExecutorApp(snap, bots, node.id, node.bot)
+      : undefined;
+    const bot = executorApp ? snapshotForSelector(bots, executorApp) : undefined;
+    const selector = executorApp && executorApp !== snapshotForSelector(bots, node.bot)?.larkAppId
+      ? [...bots.entries()].find(([, snapshot]) => snapshot.larkAppId === executorApp)?.[0] ?? executorApp
+      : node.bot;
     const loopState = snap.loops.get(node.id);
     return {
       id: node.id,
@@ -1043,7 +1052,7 @@ export function projectV3RunStatus(baseDir: string, runId: string): V3RunStatusV
       status: state?.status ?? 'pending',
       depends: node.depends.map((dep) => dep.from),
       ...(node.goal ? { goal: node.goal } : {}),
-      ...(bot || node.bot ? { bot: { ...(node.bot ? { selector: node.bot } : {}), ...(bot ? { larkAppId: bot.larkAppId } : {}) } } : {}),
+      ...(bot || selector ? { bot: { ...(selector ? { selector } : {}), ...(bot ? { larkAppId: bot.larkAppId } : {}) } } : {}),
       ...(isHostNode(node) ? { executor: node.executor } : {}),
       ...(node.humanGate ? { humanGate: true } : {}),
       ...(instanceId ? { instanceId } : {}),

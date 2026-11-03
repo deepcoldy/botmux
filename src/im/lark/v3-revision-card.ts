@@ -73,7 +73,9 @@ export function buildV3RevisionCard(input: V3RevisionCardInput): string {
   if (changes.changed.length) lines.push(`修改节点：${list(changes.changed)}`);
   if (changes.dependsChanged.length) lines.push(`改依赖：${list(changes.dependsChanged)}`);
   if (changes.reassigned.length) {
-    lines.push(`改派：${changes.reassigned.map((item) => `${item.nodeId} → ${item.to}`).join('、')}`);
+    // `from` is who executes the node now (a blocked-card 改派 included).
+    lines.push(`改派：${changes.reassigned.map((item) =>
+      `${item.nodeId}（${item.from ? `${item.from} → ` : ''}${item.to}）`).join('、')}`);
   }
   if (changes.rerun.length) lines.push(`重做：${list(changes.rerun)}`);
   if (changes.newBots.length) lines.push(`新 Bot：${list(changes.newBots)}`);

@@ -578,6 +578,18 @@ export function tryLoadEffectiveV3Dag(
 /** Snapshot lookup for a node's bot selector: exact selector first, then a
  *  snapshot whose larkAppId equals the selector (revisions normalize to the
  *  selector key, but saved/legacy DAGs may carry app ids). */
+/** The app id that executes `nodeId` now: the latest reassignment (the
+ *  blocked-card 改派 or an applied revision's reassign), else the bot its
+ *  definition names. `undefined` when neither resolves. */
+export function v3CurrentExecutorApp(
+  snap: Pick<V3RunSnapshot, 'assignments'>,
+  bots: ReadonlyMap<string, BotSnapshot>,
+  nodeId: string,
+  definedSelector: string | undefined,
+): string | undefined {
+  return snap.assignments.get(nodeId) ?? snapshotForSelector(bots, definedSelector)?.larkAppId;
+}
+
 export function snapshotForSelector(
   snapshots: ReadonlyMap<string, BotSnapshot>,
   selector: string | undefined,
@@ -1040,12 +1052,23 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
           problems.push(`${where}: loop "${op.nodeId}" is running — its body cannot move to another bot`);
           return;
         }
-        const from = typeof node.bot === 'string' ? node.bot : undefined;
-        node.bot = normalizeBot(op.bot);
-        if (!added.has(op.nodeId) && node.bot !== from) {
-          const prior = reassigned.get(op.nodeId);
-          reassigned.set(op.nodeId, { ...(prior?.from ?? from ? { from: prior?.from ?? from } : {}), to: node.bot as string });
+        const target = normalizeBot(op.bot);
+        if (added.has(op.nodeId)) {
+          node.bot = target;
+          return;
         }
+        // Who executes the node NOW: a blocked-card reassignment moves it
+        // without touching its definition, so the definition's bot is only
+        // the fallback. Compared as app ids, after selector resolution.
+        const defined = typeof node.bot === 'string' ? node.bot : undefined;
+        const actualApp = v3CurrentExecutorApp(snap, knownBots, op.nodeId, defined);
+        const targetApp = snapshotForSelector(knownBots, target)?.larkAppId;
+        if (targetApp !== undefined && targetApp === actualApp) return; // already runs there: nothing changes
+        node.bot = target;
+        const prior = reassigned.get(op.nodeId);
+        const from = prior?.from ??
+          (actualApp !== undefined ? resolveSelectorKey(knownBots, actualApp).key : defined);
+        reassigned.set(op.nodeId, { ...(from ? { from } : {}), to: target });
         return;
       }
       case 'rerunNode': {

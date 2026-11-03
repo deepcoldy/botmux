@@ -228,7 +228,17 @@ type V3ClickState =
   | { kind: 'moved'; current?: string }
   /** A pending revision proposal touches the node. */
   | { kind: 'held' }
+  /** An applied flow revision removed the node. */
+  | { kind: 'removed' }
   | { kind: 'blocked'; current?: string };
+
+/** The node (or the loop it ran in) is no longer in the effective flow. */
+function removedByRevision(view: V3BotRunView, events: readonly StoredEvent[], nodeId: string): boolean {
+  if (view.dag.nodes.some((node) => node.id === nodeId)) return false;
+  const loopId = events.find((event): event is StoredEvent & { type: 'nodeDispatched' } =>
+    event.type === 'nodeDispatched' && event.nodeId === nodeId && !!event.loop)?.loop?.loopId;
+  return loopId === undefined || !view.dag.nodes.some((node) => node.id === loopId);
+}
 
 /** Where the run and the card's node stand now, from the journal alone. */
 function clickState(runDir: string, view: V3BotRunView, nodeId: string, attemptId: string): V3ClickState {
@@ -237,6 +247,7 @@ function clickState(runDir: string, view: V3BotRunView, nodeId: string, attemptI
   const events = readJournal(journalPath);
   const snap = materialize([...events]);
   if (snap.runStatus !== 'running' && snap.runStatus !== 'blocked') return { kind: 'run-over' };
+  if (removedByRevision(view, events, nodeId)) return { kind: 'removed' };
   if (v3PendingProposalHolds(events, nodeId)) return { kind: 'held' };
   const current = currentTarget(view, events, nodeId);
   const node = snap.nodes.get(nodeId);
@@ -319,6 +330,7 @@ export async function handleV3BlockedReassign(
   const state = clickState(runDir, view, value.nodeId, value.attemptId);
   if (state.kind === 'missing') return toast('warning', REJECTION_TEXT.missing);
   if (state.kind === 'run-over') return toast('warning', REJECTION_TEXT['run-not-running']);
+  if (state.kind === 'removed') return toast('warning', '这个节点已被流程修改删除，这张卡已失效');
   // Before the chat grant: nothing is written for a node a proposal holds.
   if (state.kind === 'held') return toast('warning', REJECTION_TEXT['revision-pending']);
   if (state.kind === 'moved') {
@@ -335,6 +347,13 @@ export async function handleV3BlockedReassign(
     why = err instanceof Error ? err.message : String(err);
   }
   if (why) return toast('warning', `不能改派给 ${name}：${why}`);
+  // The chat grant was an await: a proposal touching the node may have been
+  // filed meanwhile. Re-check before finishing a half-written reassignment or
+  // calling the engine (which re-checks under its lock too). The grant itself
+  // is idempotent and stays.
+  if (v3PendingProposalHolds(readJournal(join(runDir, 'journal.ndjson')), value.nodeId)) {
+    return toast('warning', REJECTION_TEXT['revision-pending']);
+  }
 
   if (state.current === target) {
     // Still blocked although already assigned to this bot: an earlier
