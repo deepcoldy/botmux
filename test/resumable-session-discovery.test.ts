@@ -9,7 +9,8 @@ import {
   isBotmuxInjectedPrompt,
   claudeFirstUserTurn,
 } from '../src/services/resumable-session-discovery.js';
-import { traexRolloutUserInputs, traexSessionIdFromRolloutPath } from '../src/services/traex-transcript.js';
+import { traexRolloutUserInputs, traexSessionIdFromRolloutPath, readTraexThreadDetails } from '../src/services/traex-transcript.js';
+import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import { GOAL_COMMAND, GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
 
 /** What the TraeX adapter passes: verified user inputs decide origin, raw model
@@ -620,6 +621,44 @@ describe('discoverRolloutSessions (codex / traex)', () => {
       cliSessionId: 'sid-bare-traex-w',
       title: '继续看一下这个 PR',
     })]);
+  });
+
+  it('strips the bare formatting block from the traex DB thread title overriding the rollout title', async () => {
+    // #2716: on ≤0.207 TraeX DBs threads.title defaults to the first prompt;
+    // for an envelope-less bare (transcript + solo) follow-up it carries the
+    // appended <botmux_formatting> block. The native index title wins over the
+    // rollout-derived (already stripped) title, so the strip must happen in the
+    // DB normalizer. Uses the REAL reader as loadSessionDetails, matching the
+    // production wiring in the traex adapter.
+    const dbDir = join(sessionsRoot, '_db');
+    mkdirSync(dbDir, { recursive: true });
+    const dbPath = join(dbDir, 'state_5.sqlite');
+    const db = openDatabaseSyncNow(dbPath)!;
+    const bareTitle = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL,',
+      '  updated_at INTEGER NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL,',
+      "  first_user_message TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', name TEXT",
+      ');',
+    ].join('\n'));
+    db.prepare(
+      'INSERT INTO threads (id, rollout_path, created_at, updated_at, cwd, title, first_user_message, preview, name) '
+      + 'VALUES (?, ?, 1, 2, ?, ?, ?, ?, NULL)',
+    ).run('sid-bare-db', '', '/root/fmt', bareTitle, '', '');
+    db.close();
+    writeRollout('2026/11/05', 'rollout-sid-bare-db.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-db', cwd: '/root/fmt' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续看一下这个 PR' }] },
+      ] } },
+      { type: 'event_msg', payload: { type: 'task_complete' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, {
+      dialect: 'traex',
+      loadSessionDetails: (ids) => readTraexThreadDetails(ids, dbPath),
+    });
+    expect(out).toEqual([expect.objectContaining({ cliSessionId: 'sid-bare-db', title: '继续看一下这个 PR' })]);
   });
 
   it('reads resume id + cwd from session_meta and title from the first user_message event', async () => {
