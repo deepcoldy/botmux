@@ -48,4 +48,39 @@ describe('TraeX provenance-tagged history users', () => {
     expect(first.events.map(e => e.kind)).toEqual(['user']);
     expect(drainTraexRollout(path, first.newOffset).events.map(e => e.kind)).toEqual(['assistant_final']);
   });
+  it('keeps a prior turn pending final when a queued next turn user edge arrives first', () => {
+    // Type-ahead: turn B's input is persisted before turn A's terminal. Turn B's
+    // user edge must reset only B's own pending bucket — clearing the whole
+    // path dropped A's recovered final and surfaced an empty answer.
+    const turnA = 'native-turn-a';
+    const turnB = 'native-turn-b';
+    const userHistory = (t: string, text: string) => ({
+      timestamp: '2026-10-23T05:00:01Z', type: 'history_mutation',
+      payload: { operation: 'append', turn_id: t, items: [{
+        type: 'message', role: 'user', content: [{ type: 'input_text', text }],
+        internal_chat_message_metadata_passthrough: { turn_id: t, content_item_kinds: ['user.text'] },
+      }] },
+    });
+    const started = (t: string) => ({ timestamp: '2026-10-23T05:00:00Z', type: 'event_msg',
+      payload: { type: 'task_started', turn_id: t, root_turn_id: t } });
+    const result = drainTraexRollout(file(
+      started(turnA),
+      userHistory(turnA, 'first task'),
+      { timestamp: '2026-10-23T05:00:02Z', type: 'event_msg', payload: {
+        type: 'agent_message', turn_id: turnA, phase: 'final_answer', message: 'FIRST ANSWER',
+      } },
+      started(turnB),
+      userHistory(turnB, 'queued next task'),
+      { timestamp: '2026-10-23T05:00:04Z', type: 'event_msg', payload: {
+        type: 'task_complete', turn_id: turnA, last_agent_message: '',
+      } },
+      { timestamp: '2026-10-23T05:00:05Z', type: 'event_msg', payload: {
+        type: 'task_complete', turn_id: turnB, last_agent_message: 'SECOND ANSWER',
+      } },
+    ), 0);
+    expect(result.events.filter(e => e.kind === 'assistant_final').map(e => [e.sourceTurnId, e.text])).toEqual([
+      [turnA, 'FIRST ANSWER'],
+      [turnB, 'SECOND ANSWER'],
+    ]);
+  });
 });

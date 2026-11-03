@@ -1041,7 +1041,16 @@ export function drainTraexRollout(
           && typeof block.text === 'string' ? [block.text] : []).join('');
         if (text && claimUserTurn(sourceTurnId)) {
           events.push({ ...base, kind: 'user', text, sourceTurnId });
-          if (!probe) traexPendingAgentCache.delete(path);
+          if (!probe) {
+            // Scope the reset to THIS turn. A queued next turn's history
+            // mutation is persisted while the previous turn is still
+            // collecting (type-ahead); a whole-path clear would discard the
+            // prior turn's pending final so an empty last_agent_message at its
+            // terminal could no longer be recovered.
+            const pending = traexPendingAgentCache.get(path);
+            pending?.turns.delete(sourceTurnId);
+            traexPendingAgentTurns(path).activeKey = sourceTurnId;
+          }
         }
       }
     }
