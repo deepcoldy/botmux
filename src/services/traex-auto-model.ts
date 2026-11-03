@@ -1,10 +1,19 @@
 import type { TraexQuotaEvidence } from './traex-quota.js';
+import {
+  reasoningEffortsForCliModel,
+  type CodexReasoningEffort,
+} from './codex-reasoning-effort.js';
 
 export const TRAEX_AUTO_MODEL_ID = 'auto';
 export const TRAEX_AUTO_MODEL_DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
 export const TRAEX_AUTO_MODEL_MIN_QUEUE_TIMEOUT_MS = 5_000;
 export const TRAEX_AUTO_MODEL_MAX_QUEUE_TIMEOUT_MS = 300_000;
 export const TRAEX_AUTO_MODEL_DEFAULT_SWITCH_COOLDOWN_MS = 60_000;
+export const TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT = 100;
+export const TRAEX_AUTO_MODEL_MAX_OVERLOAD_THRESHOLD_PERCENT = 65_535;
+export const TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS = 8_000;
+export const TRAEX_AUTO_MODEL_MIN_PREFLIGHT_TIMEOUT_MS = 100;
+export const TRAEX_AUTO_MODEL_MAX_PREFLIGHT_TIMEOUT_MS = 30_000;
 
 export interface TraexAutoModelSettings {
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -25,6 +34,16 @@ export interface TraexAutoModelConfig {
   modelSettings?: Record<string, TraexAutoModelSettings>;
   /** Off by default: a topic retains its selected model across turns. */
   reselectPerTurn?: boolean;
+  /** Off by default for compatibility. Capacity mode only. */
+  preflightLoadCheck?: boolean;
+  /** A load is overloaded only when it is strictly greater than this value. */
+  overloadThresholdPercent?: number;
+  /** Bounded native model/list read before an independent turn. */
+  preflightTimeoutMs?: number;
+  /** Unknown candidates never outrank a later known-available candidate. */
+  unknownLoadPolicy?: 'skip';
+  /** Deterministic fallback when every known pool load is above the threshold. */
+  allOverloadedPolicy?: 'lowest_load';
   /** Dashboard restores these overrides when Auto is disabled. Missing fields
    * inherit defaults; older configs without a snapshot also inherit. This is
    * editor metadata and does not participate in the runtime switching policy. */
@@ -159,6 +178,33 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
   if (value.reselectPerTurn !== undefined && typeof value.reselectPerTurn !== 'boolean') {
     return { error: 'traexAutoModel.reselectPerTurn must be a boolean' };
   }
+  if (value.preflightLoadCheck !== undefined && typeof value.preflightLoadCheck !== 'boolean') {
+    return { error: 'traexAutoModel.preflightLoadCheck must be a boolean' };
+  }
+  const preflightLoadCheck = value.preflightLoadCheck === true;
+  if (preflightLoadCheck && value.trigger === 'quota') {
+    return { error: 'traexAutoModel.preflightLoadCheck is supported only for capacity mode' };
+  }
+  const overloadThresholdPercent = value.overloadThresholdPercent
+    ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
+  if (!Number.isInteger(overloadThresholdPercent)
+    || (overloadThresholdPercent as number) < 0
+    || (overloadThresholdPercent as number) > TRAEX_AUTO_MODEL_MAX_OVERLOAD_THRESHOLD_PERCENT) {
+    return { error: `traexAutoModel.overloadThresholdPercent must be an integer between 0 and ${TRAEX_AUTO_MODEL_MAX_OVERLOAD_THRESHOLD_PERCENT}` };
+  }
+  const preflightTimeoutMs = value.preflightTimeoutMs
+    ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS;
+  if (!Number.isInteger(preflightTimeoutMs)
+    || (preflightTimeoutMs as number) < TRAEX_AUTO_MODEL_MIN_PREFLIGHT_TIMEOUT_MS
+    || (preflightTimeoutMs as number) > TRAEX_AUTO_MODEL_MAX_PREFLIGHT_TIMEOUT_MS) {
+    return { error: `traexAutoModel.preflightTimeoutMs must be an integer between ${TRAEX_AUTO_MODEL_MIN_PREFLIGHT_TIMEOUT_MS} and ${TRAEX_AUTO_MODEL_MAX_PREFLIGHT_TIMEOUT_MS}` };
+  }
+  if (value.unknownLoadPolicy !== undefined && value.unknownLoadPolicy !== 'skip') {
+    return { error: 'traexAutoModel.unknownLoadPolicy must be skip' };
+  }
+  if (value.allOverloadedPolicy !== undefined && value.allOverloadedPolicy !== 'lowest_load') {
+    return { error: 'traexAutoModel.allOverloadedPolicy must be lowest_load' };
+  }
   if (cooldown !== undefined && (!Number.isInteger(cooldown)
     || (cooldown as number) < 5_000 || (cooldown as number) > 300_000)) {
     return { error: 'traexAutoModel.switchCooldownMs must be an integer between 5000 and 300000' };
@@ -171,6 +217,15 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
       ...(value.trigger !== undefined ? { trigger: value.trigger as 'capacity' | 'quota' } : {}),
       ...(modelSettings ? { modelSettings } : {}),
       ...(value.reselectPerTurn !== undefined ? { reselectPerTurn: value.reselectPerTurn as boolean } : {}),
+      ...(value.preflightLoadCheck !== undefined ? { preflightLoadCheck } : {}),
+      ...(preflightLoadCheck || value.overloadThresholdPercent !== undefined
+        ? { overloadThresholdPercent: overloadThresholdPercent as number } : {}),
+      ...(preflightLoadCheck || value.preflightTimeoutMs !== undefined
+        ? { preflightTimeoutMs: preflightTimeoutMs as number } : {}),
+      ...(preflightLoadCheck || value.unknownLoadPolicy !== undefined
+        ? { unknownLoadPolicy: 'skip' as const } : {}),
+      ...(preflightLoadCheck || value.allOverloadedPolicy !== undefined
+        ? { allOverloadedPolicy: 'lowest_load' as const } : {}),
       ...(previousSettings !== undefined ? { previousSettings } : {}),
       queueTimeoutMs: queueTimeoutMs as number,
       ...(cooldown !== undefined ? { switchCooldownMs: cooldown as number } : {}),
@@ -187,6 +242,35 @@ export function resolveTraexAutoModelSettings(
     ([key]) => key.toLowerCase() === model.toLowerCase(),
   );
   return { ...(entry ? entry[1] : legacy) };
+}
+
+export function traexAutoModelPreflightEnabled(config: TraexAutoModelConfig): boolean {
+  return config.trigger !== 'quota' && config.preflightLoadCheck === true;
+}
+
+/** Prefer max/xhigh for the deep-reasoning models that advertise them, while
+ * still honoring the actual highest effort of every other catalog model. */
+export function strongestTraexPreflightReasoningEffort(
+  model: string,
+  advertised?: readonly string[],
+): CodexReasoningEffort | undefined {
+  const efforts = advertised ?? reasoningEffortsForCliModel('traex', model);
+  return (['max', 'xhigh', 'high', 'medium', 'low'] as const)
+    .find(effort => efforts.includes(effort));
+}
+
+export function resolveTraexAutoModelRuntimeSettings(
+  config: TraexAutoModelConfig,
+  model: string,
+  legacy: TraexAutoModelSettings = {},
+  advertised?: readonly CodexReasoningEffort[],
+): TraexAutoModelSettings {
+  const settings = resolveTraexAutoModelSettings(config, model, legacy);
+  if (!traexAutoModelPreflightEnabled(config)) return settings;
+  const strongest = advertised === undefined && settings.reasoningEffort === 'max'
+    ? 'max'
+    : strongestTraexPreflightReasoningEffort(model, advertised);
+  return strongest ? { ...settings, reasoningEffort: strongest } : settings;
 }
 
 export interface TraexAutoModelRuntimeState {
@@ -206,7 +290,16 @@ export function traexAutoModelPolicyKey(config: TraexAutoModelConfig): string {
       const settings = resolveTraexAutoModelSettings(config, model);
       return [Object.prototype.hasOwnProperty.call(config.modelSettings ?? {}, model),
         settings.reasoningEffort ?? null, settings.modelBackendVariant ?? null];
-    }), ...(config.trigger === 'quota' ? ['quota'] : [])]);
+    }), ...(config.trigger === 'quota' ? ['quota'] : []),
+    ...(traexAutoModelPreflightEnabled(config) ? [{
+      preflightLoadCheck: true,
+      overloadThresholdPercent: config.overloadThresholdPercent
+        ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
+      preflightTimeoutMs: config.preflightTimeoutMs
+        ?? TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
+      unknownLoadPolicy: config.unknownLoadPolicy ?? 'skip',
+      allOverloadedPolicy: config.allOverloadedPolicy ?? 'lowest_load',
+    }] : [])]);
 }
 
 export function validTraexAutoModelRuntime(
@@ -223,7 +316,7 @@ export type TraexAutoModelAction =
   | { kind: 'load_check'; turnId: string }
   | {
       kind: 'switch';
-      reason: 'new_turn' | 'quota_exhausted' | 'capacity_timeout' | 'queued_backup' | 'available_model' | 'shortest_queue' | 'lowest_load';
+      reason: 'new_turn' | 'quota_exhausted' | 'capacity_timeout' | 'queued_backup' | 'available_model' | 'shortest_queue' | 'lowest_load' | 'preflight_available' | 'preflight_lowest_load';
       turnId: string;
       fromModel: string;
       toModel: string;
@@ -239,6 +332,29 @@ export type TraexAutoModelAction =
       queuePosition?: number;
       loadPercent?: number;
     };
+
+export type TraexAutoModelPreflightDecision =
+  | {
+      kind: 'keep';
+      reason: 'disabled' | 'load_unavailable' | 'within_threshold';
+      model: string;
+      checkedModel: string;
+      checkedLoadPercent?: number;
+      loadPercent?: number;
+    }
+  | {
+      kind: 'hold';
+      reason: 'lowest_load';
+      model: string;
+      checkedModel: string;
+      checkedLoadPercent: number;
+      loadPercent: number;
+    }
+  | (Extract<TraexAutoModelAction, { kind: 'switch' }> & {
+      reason: 'preflight_available' | 'preflight_lowest_load';
+      checkedModel: string;
+      checkedLoadPercent: number;
+    });
 
 /**
  * Worker-local ordered pool state.
@@ -309,6 +425,80 @@ export class TraexAutoModelController {
 
   currentModelIndex(): number {
     return this.currentIndex;
+  }
+
+  /** Read-only admission decision for one independent turn. Unknown loads are
+   * skipped; if no known model is under the threshold, known loads are ranked
+   * with pool order as the stable tie-breaker. The caller commits a switch only
+   * after it has proven that the exact queued input and native session remain
+   * eligible. */
+  preflightDecision(
+    turnId: string,
+    loads: ReadonlyMap<string, number> | null,
+    options: { preferFirstModel?: boolean } = {},
+  ): TraexAutoModelPreflightDecision {
+    const currentModel = this.currentModel();
+    const checkedIndex = options.preferFirstModel ? 0 : this.currentIndex;
+    const checkedModel = this.config.models[checkedIndex]!;
+    if (!traexAutoModelPreflightEnabled(this.config)) {
+      return { kind: 'keep', reason: 'disabled', model: currentModel, checkedModel };
+    }
+    const threshold = this.config.overloadThresholdPercent
+      ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
+    const loadAt = (index: number): number | undefined => {
+      const value = loads?.get(this.config.models[index]!.toLowerCase());
+      return value !== undefined && Number.isFinite(value) && value >= 0 ? value : undefined;
+    };
+    const checkedLoad = loadAt(checkedIndex);
+    if (checkedLoad === undefined) {
+      return { kind: 'keep', reason: 'load_unavailable', model: currentModel, checkedModel };
+    }
+
+    let selectedIndex = checkedIndex;
+    let selectedLoad = checkedLoad;
+    let reason: 'preflight_available' | 'preflight_lowest_load' = 'preflight_available';
+    if (checkedLoad > threshold) {
+      selectedIndex = -1;
+      for (let index = 0; index < this.config.models.length; index++) {
+        if (index === checkedIndex) continue;
+        const candidateLoad = loadAt(index);
+        if (candidateLoad !== undefined && candidateLoad <= threshold) {
+          selectedIndex = index;
+          selectedLoad = candidateLoad;
+          break;
+        }
+      }
+      if (selectedIndex < 0) {
+        reason = 'preflight_lowest_load';
+        selectedIndex = -1;
+        selectedLoad = Infinity;
+        for (let index = 0; index < this.config.models.length; index++) {
+          const candidateLoad = loadAt(index);
+          if (candidateLoad !== undefined && candidateLoad < selectedLoad) {
+            selectedIndex = index;
+            selectedLoad = candidateLoad;
+          }
+        }
+        if (selectedIndex < 0) {
+          selectedIndex = checkedIndex;
+          selectedLoad = checkedLoad;
+        }
+      }
+    }
+
+    if (selectedIndex === this.currentIndex) {
+      if (reason === 'preflight_lowest_load') {
+        return { kind: 'hold', reason: 'lowest_load', model: currentModel, checkedModel,
+          checkedLoadPercent: checkedLoad, loadPercent: selectedLoad };
+      }
+      return { kind: 'keep', reason: 'within_threshold', model: currentModel, checkedModel,
+        checkedLoadPercent: checkedLoad, loadPercent: selectedLoad };
+    }
+    return {
+      kind: 'switch', reason, turnId, fromModel: currentModel,
+      toModel: this.config.models[selectedIndex]!, toIndex: selectedIndex,
+      loadPercent: selectedLoad, checkedModel, checkedLoadPercent: checkedLoad,
+    };
   }
 
   hasQuotaBlocks(): boolean {
@@ -423,9 +613,12 @@ export class TraexAutoModelController {
   /** Advance only after the host has admitted the exact native-session restart.
    * Refused proposals leave the real running model and controller in agreement. */
   commitSwitch(action: Extract<TraexAutoModelAction, { kind: 'switch' }>, nowMs = Date.now()): boolean {
+    const admissionSwitch = action.reason === 'new_turn'
+      || action.reason === 'preflight_available'
+      || action.reason === 'preflight_lowest_load';
     if (action.fromModel !== this.currentModel()
       || this.config.models[action.toIndex] !== action.toModel
-      || (action.reason !== 'new_turn' && action.turnId !== this.turnId)) {
+      || (!admissionSwitch && action.turnId !== this.turnId)) {
       return false;
     }
     this.currentIndex = action.toIndex;
@@ -433,10 +626,13 @@ export class TraexAutoModelController {
     this.queueSinceMs = undefined;
     this.liveCapacityQueued = false;
     this.exhausted = action.reason === 'shortest_queue' || action.reason === 'lowest_load';
-    this.searchingBackups = action.reason !== 'new_turn' && !this.exhausted;
-    this.awaitingActivity = action.reason !== 'new_turn';
+    const preflight = action.reason === 'preflight_available' || action.reason === 'preflight_lowest_load';
+    this.searchingBackups = action.reason !== 'new_turn' && !preflight && !this.exhausted;
+    this.awaitingActivity = action.reason !== 'new_turn' && !preflight;
     this.progressSinceMs = undefined;
-    this.lastSwitchAtMs = nowMs;
+    // Admission happens before inference and is not a completed queue episode;
+    // it must not consume the runtime queue fallback's cooldown window.
+    this.lastSwitchAtMs = preflight ? undefined : nowMs;
     this.loadCheckDone = false;
     this.loadCheckPending = false;
     if (action.reason === 'new_turn') {

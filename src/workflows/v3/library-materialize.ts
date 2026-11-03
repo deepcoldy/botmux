@@ -264,6 +264,10 @@ export interface MaterializeSavedWorkflowRunInput {
   baseDir: string;
   runId?: string;
   now?: Date;
+  /** Frozen into run.json (design §6.3). With `bot`, a node without its own
+   *  `bot` is executed by the run's own bot rather than the first configured
+   *  supported bot. Absent = today's ephemeral execution, unchanged. */
+  nodeExecutor?: 'bot';
 }
 
 export interface MaterializedSavedWorkflowRun {
@@ -365,7 +369,9 @@ export function materializeSavedWorkflowRun(
     nodes: cloneNodes(input.revision.payload.dagTemplate.nodes),
   });
   const spec = validateSpec({ ...input.revision.payload.specTemplate, runId });
-  const botSnapshots = freezeDagBotSnapshots(dag, input.bots);
+  const botSnapshots = freezeDagBotSnapshots(dag, input.bots, input.nodeExecutor === 'bot'
+    ? { defaultSelector: input.context?.chatBinding?.larkAppId }
+    : {});
 
   // Reserve the final run id across cooperating CLI/daemon processes. A plain
   // exists+rename sequence can replace an empty directory on POSIX when two
@@ -415,6 +421,7 @@ export function materializeSavedWorkflowRun(
         createdAt: now.toISOString(),
         authorizedAt: now.toISOString(),
         ...(input.context?.chatBinding ? { chatBinding: input.context.chatBinding } : {}),
+        ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
         artifacts,
       });
       publishRunEnvelopeOnce(stagedRunDir, envelope);

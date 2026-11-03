@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { cliIdForComm, findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { cliIdForComm, findLaunchedCliPid, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
 import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from '../src/core/traex-leaf-pid.js';
@@ -46,6 +46,9 @@ function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; 
   runInNewContext(leafFnsSource, {
     ...sandbox,
     readComm: deps.readComm,
+    readCmdline: () => [],
+    isNonInteractiveCodexArgv,
+    isZombieProcess: () => false,
     cliIdForComm,
     findLaunchedCliPid: deps.findReal,
   });
@@ -86,10 +89,16 @@ function runWorkerWiring(late: boolean, options: {
   scopePayloadAfterProbe?: number;
   /** Children of pids other than the pane (100); a synthetic launch chain. */
   children?: Record<number, number[]>;
+  /** Herdr/ZMX shape: getChildPid() reports the MUTABLE cliPid, which gets
+   *  rewired to the discovered leaf, rather than the stable pane/launcher pid. */
+  aliasedChildPid?: boolean;
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
-  const backend = { cliPid: 100, getChildPid: () => 100 };
+  const backend: { cliPid: number; getChildPid: () => number } = {
+    cliPid: 100,
+    getChildPid: () => (options.aliasedChildPid ? backend.cliPid : 100),
+  };
   const findLaunchedCliPidMock = vi.fn(function (this: unknown, ..._args: unknown[]) {
     return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
   });
@@ -111,6 +120,8 @@ function runWorkerWiring(late: boolean, options: {
     scopePayloadLauncherActive: options.scopeLaunched ?? options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,
+    lastSpawnCodexLauncherPid: undefined,
+    codexOwnershipAttestationPending: false,
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
     process: { env: {} }, cliPidMarker: undefined,
@@ -378,6 +389,24 @@ describe('worker wrapper PID wiring', () => {
     expect(result.backend.cliPid).toBe(200);
     expect(result.bridgeCliPid).toBeUndefined();
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('keeps the Codex retry loop alive when getChildPid aliases the mutable cliPid (Herdr/ZMX) (late PID=%s)', late => {
+    // Herdr/ZMX report the rewired ownership pid from getChildPid(). The
+    // synchronous resolve already moves cliPid from the launcher (100) to the
+    // discovered leaf (200), so asking backend.getChildPid() on the first retry
+    // tick returns 200 — launcherRetryStillValid's same-pid gate would abort the
+    // whole loop before the scheduled apply ever runs. The codex resolver must
+    // hand the gate the STABLE launcher pid captured at spawn instead.
+    const result = runWorkerWiring(late, { wrapperCli: '', aliasedChildPid: true });
+    expect(result.log).toHaveBeenCalledWith(
+      expect.stringContaining('Codex launcher: resolved real codex leaf pid 200 under launcher 100'),
+    );
+    // Rooted at the stable launcher twice: the synchronous resolve and the one
+    // successful retry tick (never from the aliased 200).
+    const rootedCalls = result.findLaunchedCliPid.mock.calls.filter((call: unknown[]) =>
+      call.length === 5 && call[0] === 100 && call[1] === 'codex');
+    expect(rootedCalls.length).toBe(2);
   });
 
   it.each([false, true])('forwards the configured custom codex executable to BOTH resolve sites (late PID=%s)', late => {

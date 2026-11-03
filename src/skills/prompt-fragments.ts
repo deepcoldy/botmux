@@ -373,6 +373,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   // ───────────────────── stage: 每条新消息 (followup) ──────────────────────
 
   { key: 'ai.followup.reminder', block: 'followup', stage: 'followup', label: '续轮提醒（默认）', kind: 'editable' },
+  { key: 'ai.followup.feishu_safe_emphasis', block: 'followup', stage: 'followup', label: '飞书安全强调格式', kind: 'editable' },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',
     label: '续轮提醒（Claude Code hook 离带注入版）',

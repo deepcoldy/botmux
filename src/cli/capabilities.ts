@@ -3,6 +3,7 @@ export const BOTMUX_CAPABILITIES_SCHEMA_VERSION = 1 as const;
 export interface BotmuxCapabilitiesDocument {
   schemaVersion: typeof BOTMUX_CAPABILITIES_SCHEMA_VERSION;
   capabilities: {
+    managed_directory_retention_v1: true;
     exact_chat_grant_v1: true;
     stable_app_dispatch_v1: true;
     stable_dispatch_acceptance_v1: true;
@@ -40,6 +41,7 @@ export function botmuxCapabilities(): BotmuxCapabilitiesDocument {
   return {
     schemaVersion: BOTMUX_CAPABILITIES_SCHEMA_VERSION,
     capabilities: {
+      managed_directory_retention_v1: true,
       exact_chat_grant_v1: true,
       stable_app_dispatch_v1: true,
       stable_dispatch_acceptance_v1: true,

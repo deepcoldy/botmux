@@ -25,7 +25,7 @@ import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
-import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from '../src/services/codex-async-user-input.js';
+import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from '../src/services/codex-async-user-input.js';
 import type { PendingAsk } from '../src/core/ask-types.js';
 import {
   CodexAppControlFinalAssembler,
@@ -1530,7 +1530,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('steers a follow-up into a start turn proven by an exact turn/started BEFORE the start response returns (B1 start-response-last)', async () => {
+  it.each(['om_sr_root', 'codex-async-answer-legacy'])('steers a human follow-up into %s before the start response returns', async rootTurnId => {
     // B1: the app-server may publish an exact-client `turn/started` before it
     // replies to `turn/start`. That exact match proves the canonical native id,
     // so a follow-up must be able to steer into the SAME turn during the pending
@@ -1554,7 +1554,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         `legacy:${text}`,
         { text, clientUserMessageId: replyTurnId },
         replyTurnId,
-        true,
+        replyTurnId === rootTurnId && rootTurnId.startsWith('codex-async-answer-')
+          ? codexAsyncAnswerSteerable({ answerer: 'ou_owner', originalAnswerer: 'ou_owner',
+            human: true, managedLark: true, cleanInputAccepted: true }) : true,
       );
       harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
     };
@@ -1564,7 +1566,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       // Root: turn/started (exact clientId) arrives ~immediately; the start
       // response is delayed 120ms. Wait until the runner logged the turn/start
       // request so the follow-up races the pending response.
-      send('root', 'om_sr_root');
+      send('root', rootTurnId);
       await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
       // Follow-up arrives while the root start response is STILL pending.
       send('follow', 'om_sr_follow');
@@ -1583,7 +1585,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         clientUserMessageId: 'om_sr_follow',
       });
       expect(control.finals).toEqual([
-        expect.objectContaining({ turnId: 'om_sr_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: rootTurnId, content: '', disposition: 'steer_superseded' }),
         expect.objectContaining({ turnId: 'om_sr_follow', content: 'fake answer 1' }),
       ]);
       // steer lifecycle emitted for the follow-up.
@@ -2085,7 +2087,10 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         + `await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_CODEX_LAUNCH_DELAY_MS ?? '100')));\n`
         + `const child = spawn(${JSON.stringify(fakeCodex)}, process.argv.slice(2), { stdio: 'inherit' });\n`
         + `for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));\n`
-        + `child.on('exit', code => process.exit(code ?? 1));\n`);
+        // A real launcher exits some time after its native child: Node first
+        // reaps the child, then tears itself down. Make that gap fixed and
+        // visible, so an input sent inside it fails every run, not under load.
+        + `child.on('exit', code => setTimeout(() => process.exit(code ?? 1), Number(process.env.FAKE_CODEX_LAUNCHER_EXIT_DELAY_MS ?? '0')));\n`);
       chmodSync(codexBin, 0o755);
     }
     const published: any[] = [];
@@ -2157,7 +2162,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         // Wide enough that the control re-acceptance below lands inside the
         // replacement client's initialize() window, before the launcher has
         // spawned the native engine.
-        ...(launchMode === 'node-launcher' ? { FAKE_CODEX_LAUNCH_DELAY_MS: '1200',
+        ...(launchMode === 'node-launcher' ? { FAKE_CODEX_LAUNCH_DELAY_MS: '1200', FAKE_CODEX_LAUNCHER_EXIT_DELAY_MS: '300',
           FAKE_CODEX_LAUNCHER_PID_PATH: launcherPidPath } : {}) } });
     const enginePublications = () => published.filter((entry: any) => entry?.enginePid !== undefined);
     const waitForNative = async (predicate: () => boolean) => {
@@ -2225,10 +2230,21 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       for (const [index, turnId] of ['om_native_before', 'om_native_after', 'om_native_next'].entries()) {
         if (index === 1) {
           const pid = Number(readFileSync(pidPath, 'utf8'));
+          // The runner treats its engine as gone only once its OWN child's exit
+          // handler has run (`client.hasExited`); that handler logs the line
+          // counted below. A dead engine pid is not that signal: with the npm
+          // launcher the runner's child is the launcher, which exits after it
+          // has reaped the native engine, and even a reaped child can reach the
+          // runner's exit handler after its stdin. Input sent before the line
+          // finds a "live" client, turn/start goes into the dead engine's pipe,
+          // and the unknown outcome fences the generation (#2676).
+          const exitLines = () => harness!.stdout.split('[codex-app] app-server exited').length - 1;
+          const exitedBefore = exitLines();
           process.kill(pid, 'SIGTERM');
           await waitForNative(() => {
             try { process.kill(pid, 0); return false; }
-            catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true; throw error; }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+            return exitLines() > exitedBefore;
           });
           probeInitWindow = launchMode === 'node-launcher';
         }
@@ -2323,14 +2339,18 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       send('om_before_exit');
       await waitFor(harness, () => control.finals.length === 1 && control.states.at(-1)?.busy === false);
       const pid = Number(readFileSync(pidPath, 'utf8'));
+      const exitedBefore = harness.stdout.split('[codex-app] app-server exited').length - 1;
       process.kill(pid, 'SIGTERM');
       // The fixture's PID is a real child of the runner, not a mocked RPC rejection.
+      // A gone pid is not enough: the next input must also wait for the runner's
+      // own exit handler (its log line), or it can reach a client the runner
+      // still believes alive (#2676).
       await waitFor(harness, () => {
         try { process.kill(pid, 0); return false; }
         catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
-          throw error;
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
         }
+        return harness.stdout.split('[codex-app] app-server exited').length - 1 > exitedBefore;
       });
       send('om_after_exit');
       await waitFor(harness, () => control.finals.length === 2
@@ -3404,6 +3424,130 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       await control.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('rediscovers a disconnected browser within the same native runner', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'browser-reconnect-runner-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const plugin = join(dir, 'plugin'); mkdirSync(join(plugin, 'scripts'), { recursive: true });
+    writeFileSync(join(plugin, 'scripts', 'browser-service.mjs'), 'export async function handleRpc(){return {}}');
+    writeFileSync(join(plugin, 'scripts', 'browser-client.mjs'), `
+      let setupCount=0,discoveries=0;
+      export async function setupBrowserRuntime(){setupCount++;return {browsers:{get:async family=>{
+        if(family!=='chrome')throw new Error('wrong browser family');
+        const id=String(++discoveries);
+        const tab={id:'7',title:async()=> 'Example',url:async()=> 'https://example.test',
+          dom_cua:{get_visible_dom:async()=>{if(id==='1')throw new Error('Browser is not available: 1');
+            return {connected:id,setupCount};}}};
+        return {browserId:id,nameSession:async()=>{},
+          user:{openTabs:async()=>[{id:'7'}],claimTab:async()=>tab},
+          tabs:{get:async()=>tab}};
+      }}}}
+    `);
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+      const fs=require('node:fs'),readline=require('node:readline');
+      if(process.argv.includes('--version')){console.log('codex 0.162.1');process.exit(0)}
+      const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+      const notify=(method,params)=>send({method,params});
+      const ops=[{operation:'list_tabs'},{operation:'claim_tab',tabId:'7'},
+        {operation:'snapshot',tabId:'7'},{operation:'list_tabs'},
+        {operation:'snapshot',tabId:'7'},{operation:'claim_tab',tabId:'7'},
+        {operation:'snapshot',tabId:'7'}];
+      let index=0;
+      const tool=()=>send({id:9000+index,method:'item/tool/call',params:{threadId:'thread-browser',
+        turnId:'turn-browser',callId:'browser-'+index,tool:'botmux_browser',arguments:ops[index]}});
+      readline.createInterface({input:process.stdin}).on('line',line=>{
+        const q=JSON.parse(line);fs.appendFileSync(process.env.FAKE_CODEX_LOG,JSON.stringify(q)+'\\n');
+        if(q.id>=9000&&q.result){
+          if(++index<ops.length){tool();return;}
+          const item={type:'agentMessage',id:'answer',text:'Browser recovered'};
+          notify('item/completed',{threadId:'thread-browser',turnId:'turn-browser',item});
+          notify('turn/completed',{threadId:'thread-browser',turn:{id:'turn-browser',status:'completed',items:[item]}});return;
+        }
+        if(q.id===undefined)return;
+        let result={};
+        if(q.method==='initialize')result={userAgent:'fake-codex'};
+        if(q.method==='thread/start')result={thread:{id:'thread-browser',turns:[]}};
+        if(q.method==='turn/start')result={turn:{id:'turn-browser'}};
+        send({id:q.id,result});
+        if(q.method==='turn/start'){
+          notify('turn/started',{threadId:'thread-browser',turn:{id:'turn-browser'}});tool();
+        }
+      });
+    `); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'browser-reconnect', control.bootstrap.path, {
+      extraArgs: ['--browser-family', 'chrome', '--browser-plugin-root', plugin],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('read browser', { text: 'read browser' })}\r`);
+      await waitFor(harness, () => control.finals.length === 1);
+      const results = readRequests(logPath).filter(r => r.id >= 9000 && r.result).map(r => r.result);
+      expect(results.map(r => r.success)).toEqual([true, true, false, true, false, true, true]);
+      expect(results[2].contentItems[0].text).toContain('Browser is not available: 1');
+      expect(JSON.parse(results[6].contentItems[0].text).snapshot).toEqual({ connected: '2', setupCount: 1 });
+      expect(readRequests(logPath).filter(r => r.method === 'turn/start')).toHaveLength(1);
+    } finally { await stopChild(harness.child); await control.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([false, true])('loads bot origin delegation through the real runner argv: %s', async automatic => {
+    const dir = mkdtempSync(join(tmpdir(), 'site-policy-runner-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const plugin = join(dir, 'plugin'); mkdirSync(join(plugin, 'scripts'), { recursive: true });
+    writeFileSync(join(plugin, 'scripts', 'browser-service.mjs'), 'export async function handleRpc(){return {}}');
+    writeFileSync(join(plugin, 'scripts', 'browser-client.mjs'), `
+      export async function setupBrowserRuntime(){return {browsers:{get:async()=>({
+        browserId:'test',nameSession:async()=>{},user:{openTabs:async()=>{
+          const answer=await globalThis.nodeRepl.createElicitation({meta:{codex_approval_kind:'mcp_tool_call',
+            connector_id:'browser-use',tool_name:'access_browser_origin',origin:'https://example.test',persist:'always'}});
+          return [{id:answer.action,title:answer.meta?.persist??'none'}];
+        }}
+      })}}}
+    `);
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+      const fs=require('node:fs'),readline=require('node:readline');
+      if(process.argv.includes('--version')){console.log('codex 0.162.1');process.exit(0)}
+      const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+      const notify=(method,params)=>send({method,params});
+      readline.createInterface({input:process.stdin}).on('line',line=>{
+        const q=JSON.parse(line);fs.appendFileSync(process.env.FAKE_CODEX_LOG,JSON.stringify(q)+'\\n');
+        if(q.id===9009){
+          const item={type:'agentMessage',id:'answer',text:JSON.stringify(q.result)};
+          notify('item/completed',{threadId:'thread-site',turnId:'turn-site',item});
+          notify('turn/completed',{threadId:'thread-site',turn:{id:'turn-site',status:'completed',items:[item]}});return;
+        }
+        if(q.id===undefined)return;
+        let result={};
+        if(q.method==='initialize')result={userAgent:'fake-codex'};
+        if(q.method==='thread/start')result={thread:{id:'thread-site',turns:[]}};
+        if(q.method==='turn/start')result={turn:{id:'turn-site'}};
+        send({id:q.id,result});
+        if(q.method==='turn/start'){
+          notify('turn/started',{threadId:'thread-site',turn:{id:'turn-site'}});
+          send({id:9009,method:'item/tool/call',params:{threadId:'thread-site',turnId:'turn-site',
+            callId:'site-call',tool:'botmux_browser',arguments:{operation:'list_tabs'}}});
+        }
+      });
+    `); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'site-policy', control.bootstrap.path, {
+      extraArgs: ['--browser-family', 'chrome', '--browser-plugin-root', plugin,
+        ...(automatic ? ['--browser-auto-approve-origins'] : [])],
+      // The default path must cancel before any real Ask transport can run.
+      env: { BOTMUX_SESSION_ID: '', BOTMUX_CHAT_ID: '', BOTMUX_LARK_APP_ID: '', BOTMUX_ROOT_MESSAGE_ID: '' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('check site', { text: 'check site' })}\r`);
+      await waitFor(harness, () => control.finals.length === 1);
+      const answer = readRequests(logPath).find(r => r.id === 9009 && r.result)?.result;
+      expect(answer?.success).toBe(true);
+      const text = answer.contentItems.find((item: any) => item.type === 'inputText').text;
+      expect(JSON.parse(text).tabs).toEqual([{ id: automatic ? 'accept' : 'cancel', title: automatic ? 'session' : 'none' }]);
+    } finally { await stopChild(harness.child); await control.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('registers the bounded browser dynamic tool only when the bridge is enabled', async () => {

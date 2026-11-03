@@ -18,6 +18,7 @@
 | `SESSION_DATA_DIR` | `~/.botmux/data` | 会话和队列存储目录 |
 | `BACKEND_TYPE` | _(默认 tmux)_ | 显式设 `pty` 用纯 pty 后端兜底（默认始终 tmux，不再自动回落 pty；tmux 不可用会硬拦截弹卡）。pty 不跨 daemon 重启存活 |
 | `BOTMUX_FORWARD_FOLLOWUP_WAIT_MS` | `1500` | 话题群新消息等待补充说明的毫秒数；命中同用户、同群且 `root_id` 指向首条消息时合并，设为 `0` 关闭，最大 `10000` |
+| `BOTMUX_SENDER_RESOLVE_TIMEOUT_MS` | `800` | Sender Identity 显示信息查询的单步预算（毫秒）：通讯录查询、IM 姓名回查分别计时。接受 `1`～`2147483647` 的整数，非法值回退默认。慢网络可设为 `3000`，两步都超时最多等待 6 秒；不改变严格 owner 身份校验的独立 3 秒预算。写入本机 `~/.botmux/.env` 后重启生效，不是会话环境变量。 |
 | `BOTMUX_ALLOW_UNKNOWN_SCOPES` | _(未设置)_ | 设为 `1` 放行未在 `lark-scopes.json` 目录中收录的飞书权限名（仅做语法校验）。用于飞书开放平台推出新权限但 botmux 尚未发版收录时的逃生通道。 |
 | `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
 | `GITHUB_TOKEN` | _(未设置)_ | GitHub Releases API 认证 token。用于 Dashboard changelog、更新检查、restart-report 等 botmux 自身发起的 GitHub 请求。优先级高于 `GH_TOKEN`。 |

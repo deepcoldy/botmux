@@ -1,8 +1,9 @@
 import { readSessionSkillManifest, SkillManifestReadError, SkillManifestParseError } from './manifest-store.js';
 import { listSkillResources, readSkillEntrypoint, readSkillResource } from './resource-reader.js';
-import { builtinSkillContent, builtinSkillEntries } from '../../skills/injection-mode.js';
+import { builtinSkillContent, builtinSkillEntries, isWithheldFromWorkflowNodeSession } from '../../skills/injection-mode.js';
 import type { SessionSkillManifest } from './types.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
+import { workflowSessionKind } from '../../workflows/session-kind.js';
 
 export interface SkillCommandResult {
   code: number;
@@ -17,9 +18,12 @@ function sessionIdFromEnv(env: Record<string, string | undefined>): string | und
 /** name\tdescription lines for the built-in botmux bridge skills — the ones the
  *  `prompt`-mode catalog advertises, so `botmux skill list` stays consistent
  *  with what the model was told even when there is no user-skill manifest. */
-function builtinListLines(): string[] {
-  return builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: whiteboardEnabled() })
-    .map((e) => `${e.name}\t${e.description}`.trimEnd());
+function builtinListLines(env: Record<string, string | undefined>): string[] {
+  return builtinSkillEntries({
+    asksViaHook: false,
+    whiteboardEnabled: whiteboardEnabled(),
+    sessionKind: workflowSessionKind(env),
+  }).map((e) => `${e.name}\t${e.description}`.trimEnd());
 }
 
 export function runSkillSessionCommand(
@@ -27,6 +31,17 @@ export function runSkillSessionCommand(
   env: Record<string, string | undefined> = process.env,
 ): SkillCommandResult {
   const sub = args[0] ?? 'list';
+  // A session executing a workflow node does that node itself: it is not
+  // offered the multi-bot dispatch skills or the workflow skills its kind does
+  // not use, and asking for one by name gets the reason instead of "not found".
+  if ((sub === 'show' || sub === 'resources' || sub === 'read') && args[1]
+    && isWithheldFromWorkflowNodeSession(args[1], env)) {
+    return {
+      code: 1,
+      stdout: '',
+      stderr: `${args[1]} is not available while executing a workflow node: do this node's work in this session instead of starting a workflow or handing it to another bot.\n`,
+    };
+  }
   // Built-in botmux bridge skills are delivered by prompt-catalog (no user-skill
   // manifest), so `show <builtin>` must resolve even when a session has no user
   // skills registered. Check built-ins first for `show`.
@@ -84,7 +99,7 @@ export function runSkillSessionCommand(
   if (!manifest) {
     // No user-skill manifest — still surface built-ins for discovery.
     if (sub === 'list') {
-      const lines = builtinListLines();
+      const lines = builtinListLines(env);
       return { code: 0, stdout: lines.join('\n') + (lines.length > 0 ? '\n' : ''), stderr: '' };
     }
     return { code: 2, stdout: '', stderr: `skill manifest not found for session ${sessionId}\n` };
@@ -92,7 +107,7 @@ export function runSkillSessionCommand(
   try {
     if (sub === 'list') {
       const userLines = manifest.prioritySkills.map((skill) => `${skill.name}\t${skill.description ?? ''}`.trimEnd());
-      const lines = [...userLines, ...builtinListLines()];
+      const lines = [...userLines, ...builtinListLines(env)];
       return { code: 0, stdout: lines.join('\n') + (lines.length > 0 ? '\n' : ''), stderr: '' };
     }
     if (sub === 'show') {

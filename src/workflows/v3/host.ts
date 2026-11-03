@@ -55,6 +55,31 @@ import {
   type V3AdHocRunEnvelope,
 } from './run-envelope.js';
 import { V3_SUPPORTED_CLIS, isV3SupportedCli, type BotSnapshot } from './contract.js';
+import { isMultiTopicOrchestrationEnabled, workflowNodeExecutorMode } from '../../global-config.js';
+import {
+  buildV3BotRoster,
+  checkV3Assignees,
+  formatV3Gate2BotPlan,
+  parseV3AssignmentReasons,
+  planV3SketchAssignees,
+  v3AssigneeProblems,
+  v3RosterSelectorProblems,
+  type V3ArchitectBotAssignment,
+  type V3BotRoster,
+} from './bot-assignment.js';
+import type { V3Dag } from './dag.js';
+import {
+  checkV3BotExecutorEligibility,
+  decideV3NodeExecutor,
+  describeV3EphemeralFallback,
+  formatV3BotEligibilityRefusal,
+  v3BotExecutorTargets,
+  type V3BotEligibilityProbe,
+  type V3BotEligibilityProblem,
+  type V3NodeExecutorDecision,
+  type V3NodeExecutorSwitch,
+  type V3NodeExecutorTarget,
+} from './node-executor-mode.js';
 
 // ─── Core operations (dep-injected, pure of CLI / process concerns) ─────────
 
@@ -297,6 +322,9 @@ export interface ArchitectDeps {
   resolveLarkAppSecret: (larkAppId: string) => string | undefined | Promise<string | undefined>;
   timeoutMs?: number;
   cancelSignal?: AbortSignal;
+  /** Bot runs only (design 2026-11-03 §6): the roster the Architect assigns
+   *  from; its dag is then also checked to use roster bots only. */
+  botAssignment?: V3ArchitectBotAssignment;
 }
 
 export interface ArchitectOutcome {
@@ -341,6 +369,7 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
         resolveLarkAppSecret: deps.resolveLarkAppSecret,
         timeoutMs: deps.timeoutMs,
         cancelSignal: deps.cancelSignal,
+        ...(deps.botAssignment ? { botAssignment: deps.botAssignment } : {}),
       });
     } catch (err) {
       // Defense in depth: intended Gate-2 publication also takes this host
@@ -367,6 +396,13 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
       const dag = deps.loadDag(res.dagPath);
       if (typeof dag !== 'object' || dag === null || (dag as { schemaVersion?: unknown }).schemaVersion !== 2) {
         throw new DagValidationError(['architect dag.json must use schemaVersion 2']);
+      }
+      if (deps.botAssignment) {
+        const problems = [
+          ...v3RosterSelectorProblems(dag as V3Dag, deps.botAssignment.roster),
+          ...v3AssigneeProblems(dag as V3Dag, deps.botAssignment),
+        ];
+        if (problems.length > 0) throw new DagValidationError(problems);
       }
     } catch (err) {
       const problems = (err as { problems?: string[] }).problems ?? [err instanceof Error ? err.message : String(err)];
@@ -444,7 +480,7 @@ export function authorizeAdHocRun(
   runDir: string,
   bots: BotConfig[],
   now: Date = new Date(),
-  opts: { workingDirOverride?: string } = {},
+  opts: { workingDirOverride?: string; nodeExecutor?: 'bot' } = {},
 ): AdHocRunAuthorizationResult {
   // The outer host lock prevents Gate-2 from racing any grill RMW / architect
   // attempt. The inner envelope lock serializes this producer with all other
@@ -523,6 +559,7 @@ export function authorizeAdHocRun(
       authorizedAt: now.toISOString(),
       ...(cur.chatBinding ? { chatBinding: cur.chatBinding } : {}),
       ...(cur.chatBinding?.ownerOpenId ? { authorizedByOpenId: cur.chatBinding.ownerOpenId } : {}),
+      ...(opts.nodeExecutor ? { nodeExecutor: opts.nodeExecutor } : {}),
       artifacts: {
         dag: artifactRef(runDir, 'dag.json'),
         spec: artifactRef(runDir, 'spec.json'),
@@ -532,6 +569,157 @@ export function authorizeAdHocRun(
     const publication = publishRunEnvelopeOnce(runDir, envelope);
     return { dagPath, envelope, publication };
   }));
+}
+
+export interface AdHocNodeExecutorPlanInput {
+  switchMode: V3NodeExecutorSwitch;
+  multiTopicEnabled: boolean;
+  workingDirOverride?: string;
+  /** Live §6.1 probe for the run's chat; only built for a `bot` decision. */
+  probe: (binding: RunChatBinding) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
+}
+
+export type AdHocNodeExecutorPlan =
+  | { kind: 'ephemeral'; decision: Extract<V3NodeExecutorDecision, { mode: 'ephemeral' }> }
+  | { kind: 'bot'; binding: RunChatBinding; targets: V3NodeExecutorTarget[] }
+  | { kind: 'refused'; binding: RunChatBinding; targets: V3NodeExecutorTarget[]; problems: V3BotEligibilityProblem[] };
+
+/**
+ * Gate-2 executor decision for a not-yet-authorized ad-hoc run (design §6.3):
+ * the experimental switch, the run's chat shape and — for a `bot` decision —
+ * each goal node's executing bot (frozen exactly as {@link authorizeAdHocRun}
+ * will freeze it, default = the bot the grill was born in) checked against
+ * §6.1 items 1–4. Read-only: nothing is published here.
+ */
+export async function planAdHocNodeExecutor(
+  runDir: string,
+  bots: BotConfig[],
+  input: AdHocNodeExecutorPlanInput,
+): Promise<AdHocNodeExecutorPlan> {
+  const cur = mustRead(runDir);
+  const decision = decideV3NodeExecutor({
+    switchMode: input.switchMode,
+    binding: cur.chatBinding,
+    multiTopicEnabled: input.multiTopicEnabled,
+  });
+  if (decision.mode === 'ephemeral') return { kind: 'ephemeral', decision };
+  // Bot-executed nodes run in each bot's own session directory; a Gate-2
+  // working dir would be frozen into the snapshot yet silently ignored. Until
+  // target-authoritative working dirs exist (§15.4), refuse it explicitly.
+  if (input.workingDirOverride !== undefined) {
+    throw new HostGuardError(
+      '「节点交给群里的 Bot 执行」已开启：节点在执行 Bot 自己的会话目录（它配置的默认工作目录）里跑，' +
+      '暂不支持 approve-dag --working-dir。请去掉 --working-dir 重新批准；需要指定目录时，在 Dashboard 关闭该开关后再批准。',
+    );
+  }
+  const binding = cur.chatBinding!;
+  if (!cur.dagPath) throw new Error('dag_ready 状态缺 dagPath（内部不一致）');
+  const dag = loadDag(cur.dagPath);
+  const snapshots = freezeDagBotSnapshots(dag, bots, {
+    defaultSelector: binding.larkAppId,
+    workingDirOverride: input.workingDirOverride,
+  });
+  const targets = v3BotExecutorTargets(dag, snapshots);
+  const checked = await checkV3BotExecutorEligibility({
+    orchestratorAppId: binding.larkAppId,
+    targets,
+    probe: await input.probe(binding),
+  });
+  return checked.ok
+    ? { kind: 'bot', binding, targets }
+    : { kind: 'refused', binding, targets, problems: checked.problems };
+}
+
+/**
+ * The Architect's bot roster for a run that will be bot-executed (design
+ * 2026-11-03 §6.1/§6.2), or `undefined` for any other run — then nothing is
+ * probed and the Architect gets today's prompt. Same decision as Gate-2
+ * (switch, chat shape, multi-topic switch), taken from the grill binding.
+ */
+export async function planArchitectBotAssignment(
+  runDir: string,
+  bots: BotConfig[],
+  input: {
+    switchMode: V3NodeExecutorSwitch;
+    multiTopicEnabled: boolean;
+    probe: (binding: RunChatBinding) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
+    nameOf: (larkAppId: string) => string;
+    /** Capability labels; only built for a bot run. */
+    roleOf?: () => ((larkAppId: string) => string | undefined) | Promise<(larkAppId: string) => string | undefined>;
+  },
+): Promise<V3ArchitectBotAssignment | undefined> {
+  const cur = mustRead(runDir);
+  const decision = decideV3NodeExecutor({
+    switchMode: input.switchMode,
+    binding: cur.chatBinding,
+    multiTopicEnabled: input.multiTopicEnabled,
+  });
+  if (decision.mode !== 'bot') return undefined;
+  const binding = cur.chatBinding!;
+  const roster = await buildV3BotRoster({
+    orchestratorAppId: binding.larkAppId,
+    bots,
+    probe: await input.probe(binding),
+    nameOf: input.nameOf,
+    ...(input.roleOf ? { roleOf: await input.roleOf() } : {}),
+  });
+  const spec = validateSpec(JSON.parse(readFileSync(cur.specJsonPath, 'utf-8')) as unknown);
+  return { roster, assignees: planV3SketchAssignees(spec, roster, bots, input.nameOf) };
+}
+
+/**
+ * Gate-2 lines for a bot run (design §6.2): node → bot (name, CLI), the
+ * Architect's reason from architect-notes.md, and every named bot (`assignee`)
+ * the assignment does not honour. Read-only; unreadable notes or spec only
+ * drop the reasons / checks.
+ */
+export function describeAdHocBotPlan(
+  runDir: string,
+  targets: readonly V3NodeExecutorTarget[],
+  orchestratorAppId: string,
+  bots: readonly BotConfig[],
+  nameOf: (larkAppId: string) => string,
+  roster?: V3BotRoster,
+): string {
+  const cur = readGrillState(runDir);
+  let reasons = new Map<string, { bot: string; reason: string }>();
+  try {
+    if (cur?.notesPath) reasons = parseV3AssignmentReasons(readFileSync(cur.notesPath, 'utf-8'));
+  } catch { /* no reasons */ }
+  let assignees: ReturnType<typeof checkV3Assignees> = [];
+  try {
+    if (cur) {
+      const spec = validateSpec(JSON.parse(readFileSync(cur.specJsonPath, 'utf-8')) as unknown);
+      const excluded = new Map(roster?.excluded.map((entry) => [entry.larkAppId, entry.why]) ?? []);
+      assignees = checkV3Assignees({ spec, targets, bots, nameOf, unavailableWhy: (appId) => excluded.get(appId) });
+    }
+  } catch { /* no checks */ }
+  return formatV3Gate2BotPlan({
+    targets,
+    orchestratorAppId,
+    nameOf,
+    cliOf: (appId) => bots.find((bot) => bot.larkAppId === appId)?.cliId,
+    reasons,
+    assignees,
+  });
+}
+
+/**
+ * When the run's nodes stay on temporary processes, the bots named in the
+ * spec (`assignee`) have no effect; say so at Gate-2 instead of silently
+ * ignoring them. `undefined` when the spec names nobody.
+ */
+export function describeIgnoredAssignees(runDir: string): string | undefined {
+  try {
+    const cur = readGrillState(runDir);
+    if (!cur) return undefined;
+    const spec = validateSpec(JSON.parse(readFileSync(cur.specJsonPath, 'utf-8')) as unknown);
+    const named = spec.nodes.filter((sketch) => sketch.assignee);
+    if (named.length === 0) return undefined;
+    return `本次节点不交给群里的 Bot 执行，spec 里的点名不生效：${named.map((sketch) => `${sketch.sketchId} →「${sketch.assignee}」`).join('、')}`;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -619,6 +807,56 @@ export interface WorkflowHostCommandDeps {
   loadBots?: () => BotConfig[];
   /** Test/dev seam; production resolves fresh current-turn provenance. */
   resolveChatBinding?: () => RunChatBinding | undefined;
+  /** Experimental node-executor switch (default: live global config). */
+  nodeExecutorSwitch?: () => V3NodeExecutorSwitch;
+  /** Machine-wide multi-topic switch (default: live global config). */
+  multiTopicEnabled?: () => boolean;
+  /** §6.1 probe factory (default: live Lark + daemon registry + chat grants). */
+  botEligibilityProbe?: (binding: RunChatBinding, bots: BotConfig[]) => V3BotEligibilityProbe | Promise<V3BotEligibilityProbe>;
+  /** Bot display names for the Gate-2 summary (default: bots-info.json). */
+  botDisplayName?: () => (larkAppId: string) => string;
+  /** Capability labels for the Architect roster (default: bot profiles). */
+  botRole?: () => (larkAppId: string) => string | undefined;
+  /** Test seam for the architect worker (default: the real ephemeral pool). */
+  runArchitect?: ArchitectDeps['runArchitect'];
+}
+
+async function liveBotEligibilityProbe(binding: RunChatBinding, bots: BotConfig[]): Promise<V3BotEligibilityProbe> {
+  // The strict membership resolver talks through the main bot's own Lark app;
+  // a CLI process has to register the configured apps first (as dispatch does).
+  const { registerBot } = await import('../../bot-registry.js');
+  for (const bot of bots) {
+    try { registerBot(bot); } catch { /* an unusable entry simply fails its own probe */ }
+  }
+  const { createLiveV3BotEligibilityProbe } = await import('../../im/lark/v3-bot-eligibility.js');
+  return createLiveV3BotEligibilityProbe({
+    orchestratorAppId: binding.larkAppId,
+    chatId: binding.chatId,
+    bots,
+  });
+}
+
+/** A probe that accepts every bot: the architect preview lists assignments
+ *  only; eligibility is checked for real at approve-dag. */
+const PREVIEW_PROBE: V3BotEligibilityProbe = {
+  isConfigured: () => true,
+  isDaemonOnline: () => true,
+  inChat: async () => 'yes',
+  opensTopicSessions: async () => 'yes',
+  ensureGrant: async () => {},
+};
+
+async function liveBotDisplayName(): Promise<(larkAppId: string) => string> {
+  const { v3BotDisplayNameResolver } = await import('../../im/lark/v3-bot-eligibility.js');
+  return v3BotDisplayNameResolver();
+}
+
+async function liveBotRole(): Promise<(larkAppId: string) => string | undefined> {
+  const [{ getBotCapability }, { config }] = await Promise.all([
+    import('../../services/bot-profile-store.js'),
+    import('../../config.js'),
+  ]);
+  return (larkAppId) => getBotCapability(config.session.dataDir, larkAppId) ?? undefined;
 }
 
 export async function cmdWorkflowHost(
@@ -642,9 +880,17 @@ export async function cmdWorkflowHost(
       // daemon humanGate 发审批卡用（CLI/dev 出生无 env → undefined，不影响）。
       const chatBinding = (deps.resolveChatBinding ?? chatBindingFromEnv)();
       const { runId, runDir, state } = hostNew({ goal, baseDir, chatBinding });
+      // Tells the grill whether named bots (`assignee`) will matter; approve-dag
+      // decides for real.
+      const botExecuted = decideV3NodeExecutor({
+        switchMode: (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)(),
+        binding: chatBinding,
+        multiTopicEnabled: (deps.multiTopicEnabled ?? (() => isMultiTopicOrchestrationEnabled()))(),
+      }).mode === 'bot';
       console.log(JSON.stringify({
         runId, runDir, status: state.status, specPath: state.specPath,
         chatBound: !!chatBinding,
+        ...(botExecuted ? { nodeExecutor: 'bot' } : {}),
       }, null, 2));
       return;
     }
@@ -681,14 +927,77 @@ export async function cmdWorkflowHost(
     }
     case 'architect': {
       const runId = requireRunId(rest);
-      guardedRunDir(runId);
-      const out = await runArchitectCli(runId, baseDir, rest);
+      const runDir = guardedRunDir(runId);
+      const bots = (deps.loadBots ?? loadBotConfigs)();
+      const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
+      const multiTopicEnabled = (): boolean => (deps.multiTopicEnabled ?? (() => isMultiTopicOrchestrationEnabled()))();
+      // Bot runs only (design §6.2): the Architect assigns every goal node a
+      // bot from the chat's roster. Any other run gets today's prompt without
+      // a single probe.
+      let botAssignment: V3ArchitectBotAssignment | undefined;
+      let nameOf: ((larkAppId: string) => string) | undefined;
+      if (switchMode === 'bot') {
+        nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
+        try {
+          botAssignment = await planArchitectBotAssignment(runDir, bots, {
+            switchMode,
+            multiTopicEnabled: multiTopicEnabled(),
+            probe: (binding) => (deps.botEligibilityProbe ?? liveBotEligibilityProbe)(binding, bots),
+            nameOf,
+            roleOf: deps.botRole ?? liveBotRole,
+          });
+        } catch (err) {
+          // Without a roster every node stays on the main bot (the default
+          // selector) — the same outcome as an Architect that is unsure.
+          const binding = mustRead(runDir).chatBinding;
+          if (binding?.larkAppId) {
+            botAssignment = {
+              roster: {
+                mainLarkAppId: binding.larkAppId,
+                bots: [{ larkAppId: binding.larkAppId, name: nameOf(binding.larkAppId), cli: bots.find((bot) => bot.larkAppId === binding.larkAppId)?.cliId ?? 'unknown', main: true }],
+                excluded: [],
+              },
+              assignees: [],
+            };
+          }
+          console.error(`（没能取到群里可用的 Bot 名单，本次节点都交给主 Bot：${err instanceof Error ? err.message : String(err)}）`);
+        }
+      }
+      const out = await runArchitectCli(runId, baseDir, rest, {
+        bots,
+        ...(botAssignment ? { botAssignment } : {}),
+        ...(deps.runArchitect ? { runArchitect: deps.runArchitect } : {}),
+      });
       if (!out.ok) {
         console.error(`architect/validateDag 失败（已退回 spec_approved，可修 spec 重跑）:\n  - ${out.problems!.join('\n  - ')}`);
         process.exitCode = 1;
         return;
       }
       console.log(JSON.stringify({ runId, status: out.state.status, dagPath: out.state.dagPath, notesPath: out.state.notesPath }, null, 2));
+      if (!botAssignment) {
+        const ignored = describeIgnoredAssignees(runDir);
+        if (ignored) console.log(`\n${ignored}`);
+      }
+      // Gate-2 preview: with the experimental executor switch on, show who
+      // will execute each node so the summary can list it before approval
+      // (approve-dag re-decides and checks eligibility; this never blocks).
+      if (switchMode === 'bot') {
+        try {
+          const preview = await planAdHocNodeExecutor(runDir, bots, {
+            switchMode: 'bot',
+            multiTopicEnabled: multiTopicEnabled(),
+            workingDirOverride: argValue(rest, '--working-dir'),
+            probe: () => PREVIEW_PROBE,
+          });
+          if (preview.kind === 'ephemeral') {
+            const fallback = describeV3EphemeralFallback(preview.decision);
+            if (fallback) console.log(`\n${fallback}`);
+          } else {
+            console.log(`\n${describeAdHocBotPlan(runDir, preview.targets, preview.binding.larkAppId, bots, nameOf!, botAssignment?.roster)}`);
+            console.log('（批准时会再检查每个执行 Bot 是否在本群、daemon 是否在线）');
+          }
+        } catch { /* preview only */ }
+      }
       return;
     }
     case 'approve-dag': {
@@ -704,10 +1013,53 @@ export async function cmdWorkflowHost(
       // authoritative; this read only decides whether bot snapshots are needed.
       const before = readRunEnvelope(runDir, runId);
       const bots = before.kind === 'missing' ? (deps.loadBots ?? loadBotConfigs)() : [];
-      const authorized = authorizeAdHocRun(runDir, bots, now, { workingDirOverride });
+      // Executor (design §6.3, D1): decided once, here, and frozen into run.json.
+      // A replay of an already-published approval never re-decides it.
+      const summary: string[] = [];
+      let nodeExecutor: 'bot' | undefined;
+      if (before.kind === 'missing') {
+        const switchMode = (deps.nodeExecutorSwitch ?? workflowNodeExecutorMode)();
+        if (switchMode === 'bot') {
+          const plan = await planAdHocNodeExecutor(runDir, bots, {
+            switchMode,
+            multiTopicEnabled: (deps.multiTopicEnabled ?? (() => isMultiTopicOrchestrationEnabled()))(),
+            workingDirOverride,
+            probe: (binding) => (deps.botEligibilityProbe ?? liveBotEligibilityProbe)(binding, bots),
+          });
+          if (plan.kind === 'ephemeral') {
+            const fallback = describeV3EphemeralFallback(plan.decision);
+            if (fallback) summary.push(fallback);
+            const ignored = describeIgnoredAssignees(runDir);
+            if (ignored) summary.push(ignored);
+          } else {
+            const nameOf = await (deps.botDisplayName ?? liveBotDisplayName)();
+            if (plan.kind === 'refused') {
+              throw new HostGuardError(formatV3BotEligibilityRefusal(plan.problems, nameOf));
+            }
+            nodeExecutor = 'bot';
+            summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
+          }
+        } else {
+          const ignored = describeIgnoredAssignees(runDir);
+          if (ignored) summary.push(ignored);
+        }
+      } else if (before.kind === 'ok' && 'nodeExecutor' in before.envelope && before.envelope.nodeExecutor === 'bot') {
+        summary.push('执行方式：节点交给群里的 Bot 执行（已在首次批准时冻结）');
+      }
+      const authorized = authorizeAdHocRun(runDir, bots, now, {
+        workingDirOverride,
+        ...(nodeExecutor ? { nodeExecutor } : {}),
+      });
       const { state } = hostApproveDag(runDir, now);
       const dagPath = authorized.dagPath;
-      console.log(JSON.stringify({ runId, status: state.status, dagPath }, null, 2));
+      const frozenExecutor = 'nodeExecutor' in authorized.envelope ? authorized.envelope.nodeExecutor : undefined;
+      console.log(JSON.stringify({
+        runId,
+        status: state.status,
+        dagPath,
+        ...(frozenExecutor ? { nodeExecutor: frozenExecutor } : {}),
+      }, null, 2));
+      for (const line of summary) console.log(`\n${line}`);
       console.log(`\n✅ DAG 已批准。开跑：botmux workflow start ${runId}`);
       return;
     }
@@ -751,8 +1103,17 @@ export function resolveArchitectBotSnapshot(
   return snapshot;
 }
 
-async function runArchitectCli(runId: string, baseDir: string, rest: string[]): Promise<ArchitectOutcome> {
-  const bots = loadBotConfigs();
+async function runArchitectCli(
+  runId: string,
+  baseDir: string,
+  rest: string[],
+  opts: {
+    bots: BotConfig[];
+    botAssignment?: V3ArchitectBotAssignment;
+    runArchitect?: ArchitectDeps['runArchitect'];
+  },
+): Promise<ArchitectOutcome> {
+  const bots = opts.bots;
   const secretById = new Map(bots.map((b) => [b.larkAppId, b.larkAppSecret]));
   // The authoritative constructor rejects disableCliBypass=true: architect and
   // goal workers both require CLI bypass permissions by product contract.
@@ -765,10 +1126,11 @@ async function runArchitectCli(runId: string, baseDir: string, rest: string[]): 
   );
 
   return hostArchitect(runDir, {
-    runArchitect: realRunArchitect,
+    runArchitect: opts.runArchitect ?? realRunArchitect,
     loadDag,
     botSnapshot,
     resolveLarkAppSecret: (id: string) => secretById.get(id),
+    ...(opts.botAssignment ? { botAssignment: opts.botAssignment } : {}),
   });
 }
 

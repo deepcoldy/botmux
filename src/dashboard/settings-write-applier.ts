@@ -123,8 +123,10 @@ export interface ResolvedDashboardSettingsView {
   localDevInstall: boolean;
   autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
-  /** Machine-wide v3 Workflow feature switch. Default ON. */
-  workflow: { enabled: boolean };
+  /** Machine-wide v3 Workflow feature switch (default OFF) and the
+   *  experimental node executor for newly authorized runs (default
+   *  `ephemeral`). */
+  workflow: { enabled: boolean; nodeExecutor?: 'ephemeral' | 'bot' };
   /** Machine-wide Claude Code prompt-cache default (TTL + idle keep-alive);
    *  null = not configured (off). Bots override it field by field. */
   promptCache: PromptCacheConfig | null;
@@ -301,6 +303,7 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent_listenerBotAppId'
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
+  | 'invalid_workflow_nodeExecutor'
   | 'invalid_promptCache'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
@@ -731,12 +734,24 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_workflow' };
     }
     const wf = raw as Record<string, unknown>;
-    if (typeof wf.enabled !== 'boolean') {
+    const hasEnabled = 'enabled' in wf;
+    const hasNodeExecutor = 'nodeExecutor' in wf;
+    if ((hasEnabled || !hasNodeExecutor) && typeof wf.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_workflow_enabled' };
     }
+    if (hasNodeExecutor && wf.nodeExecutor !== 'ephemeral' && wf.nodeExecutor !== 'bot') {
+      return { ok: false, error: 'invalid_workflow_nodeExecutor' };
+    }
     // Merge over existing so a future sibling key in the workflow block survives.
-    const current = deps.readGlobalConfig().workflow ?? {};
-    deps.mergeGlobalConfig({ workflow: { ...current, enabled: wf.enabled } });
+    const next: Record<string, unknown> = { ...(deps.readGlobalConfig().workflow ?? {}) };
+    if (hasEnabled) next.enabled = wf.enabled;
+    if (hasNodeExecutor) {
+      // Only the non-default value is stored: switching back to `ephemeral`
+      // removes the key so an untouched install keeps no trace of it.
+      if (wf.nodeExecutor === 'bot') next.nodeExecutor = 'bot';
+      else delete next.nodeExecutor;
+    }
+    deps.mergeGlobalConfig({ workflow: Object.keys(next).length > 0 ? next as GlobalConfig['workflow'] : null });
     touched = true;
   }
 

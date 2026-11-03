@@ -1633,6 +1633,7 @@ export interface RelayRequest {
   preparedContentFile?: unknown;
   cardFile?: unknown;
   completionProposalFile?: unknown;
+  images?: unknown;
   attachments?: unknown;
   videos?: unknown;
   videoCovers?: unknown;
@@ -1676,6 +1677,7 @@ export interface ValidatedRelay {
   preparedContentName?: string;
   cardName?: string;
   completionProposalName?: string;
+  imageNames: string[];
   attachmentNames: string[];
   videoNames: string[];
   videoCoverNames: string[];
@@ -1688,7 +1690,7 @@ export interface ValidatedRelay {
 /**
  * PURE validation of an outbox relay request (schema + flag allowlist only — no
  * filesystem access, so it's deterministically testable):
- *  - contentFile/preparedContentFile/cardFile/attachments/videos/videoCovers
+ *  - contentFile/preparedContentFile/cardFile/images/attachments/videos/videoCovers
  *    must be plain basenames (no `/`, `\`, `..`).
  *  - only allowlisted presentation flags pass; any other flag → reject (this
  *    rejects raw `--content-file`/`--session-id`/path flags etc.).
@@ -1725,6 +1727,11 @@ export function validateRelayRequest(
   if (completionProposalName === null) {
     return { ok: false, error: 'completionProposalFile must be a plain outbox basename' };
   }
+  const imageNames: string[] = [];
+  for (const image of Array.isArray(req.images) ? req.images : []) {
+    if (!safeName(image)) return { ok: false, error: 'image must be a plain outbox basename' };
+    imageNames.push(image);
+  }
   const attachmentNames: string[] = [];
   for (const a of Array.isArray(req.attachments) ? req.attachments : []) {
     if (!safeName(a)) return { ok: false, error: 'attachment must be a plain outbox basename' };
@@ -1750,6 +1757,7 @@ export function validateRelayRequest(
     preparedContentName !== undefined
     || cardName !== undefined
     || completionProposalName !== undefined
+    || imageNames.length > 0
     || attachmentNames.length > 0
     || videoNames.length > 0
     || videoCoverNames.length > 0
@@ -1873,6 +1881,7 @@ export function validateRelayRequest(
       preparedContentName,
       cardName,
       completionProposalName,
+      imageNames,
       attachmentNames,
       videoNames,
       videoCoverNames,
@@ -1952,6 +1961,34 @@ export function buildRelayHostEnv(
     env.BOTMUX_CARD_LOCAL_LINK_MODE = 'lexical';
   }
   return env;
+}
+
+export function buildRelayHostArgs(opts: {
+  command: 'send' | 'dispatch';
+  flags: string[];
+  contentPath: string;
+  cardPath?: string;
+  completionProposalPath?: string;
+  imagePaths: string[];
+  attachmentPaths: string[];
+  videoPaths: string[];
+  videoCoverPaths: string[];
+  sessionId: string;
+}): string[] {
+  return [
+    ...opts.flags,
+    ...(opts.command === 'dispatch'
+      ? ['--brief-file', opts.contentPath]
+      : opts.cardPath ? ['--card-file', opts.cardPath] : ['--content-file', opts.contentPath]),
+    ...(opts.command === 'send' && opts.completionProposalPath
+      ? ['--completion-proposal-file', opts.completionProposalPath]
+      : []),
+    ...(opts.command === 'send' ? opts.imagePaths.flatMap(image => ['--images', image]) : []),
+    ...(opts.command === 'send' ? opts.attachmentPaths.flatMap(attachment => ['--files', attachment]) : []),
+    ...(opts.command === 'send' ? opts.videoPaths.flatMap(video => ['--videos', video]) : []),
+    ...(opts.command === 'send' ? opts.videoCoverPaths.flatMap(cover => ['--video-covers', cover]) : []),
+    '--session-id', opts.sessionId,
+  ];
 }
 
 export function startOutboxWatcher(
@@ -2059,6 +2096,15 @@ export function startOutboxWatcher(
         }
         staged.push(completionProposalPath);
       }
+      let imageBad = false;
+      const imagePaths: string[] = [];
+      v.value.imageNames.forEach((imageName, i) => {
+        if (imageBad) return;
+        const dest = join(staging, `${id}-image${i}-${imageName}`);
+        if (!materializeOutboxFile(outbox, imageName, dest)) { imageBad = true; return; }
+        staged.push(dest); imagePaths.push(dest);
+      });
+      if (imageBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: image not a regular file in outbox'); continue; }
       let attBad = false;
       const attPaths: string[] = [];
       v.value.attachmentNames.forEach((an, i) => {
@@ -2087,19 +2133,18 @@ export function startOutboxWatcher(
       });
       if (coverBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: video cover not a regular file in outbox'); continue; }
 
-      const hostArgs = [
-        ...v.value.flags,
-        ...(v.value.command === 'dispatch'
-          ? ['--brief-file', contentDest]
-          : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
-        ...(v.value.command === 'send' && completionProposalPath
-          ? ['--completion-proposal-file', completionProposalPath]
-          : []),
-        ...(v.value.command === 'send' ? attPaths.flatMap(a => ['--files', a]) : []),
-        ...(v.value.command === 'send' ? videoPaths.flatMap(a => ['--videos', a]) : []),
-        ...(v.value.command === 'send' ? videoCoverPaths.flatMap(a => ['--video-covers', a]) : []),
-        '--session-id', sessionId,  // forced — sandbox cannot target another session
-      ];
+      const hostArgs = buildRelayHostArgs({
+        command: v.value.command,
+        flags: v.value.flags,
+        contentPath: contentDest,
+        cardPath,
+        completionProposalPath,
+        imagePaths,
+        attachmentPaths: attPaths,
+        videoPaths,
+        videoCoverPaths,
+        sessionId,
+      });
       // Fail closed: a durable origin (turnId/dispatchAttempt) may come ONLY
       // from a host-side authorize decision. The sandbox controls every byte of
       // the relay request, so its originTurnId/dispatchAttempt are never trusted

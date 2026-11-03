@@ -199,7 +199,7 @@ describe('敏感动作清单', () => {
     'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
     'repo_manual_submit', 'repo_rebuild_worktree', 'repo_worktree_submit', 'restart', 'resume',
     'retry_last_task', 'retry_turn', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
-    'toggle_display', 'toggle_stream', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
+    'toggle_display', 'toggle_idle_compact', 'toggle_stream', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
     'worktree_toggle_mode',
   ];
 
@@ -217,13 +217,14 @@ describe('敏感动作清单', () => {
     }
   });
 
-  it('拒绝时给 toast 的只有「取权 / 打开」类动作和关闭卡的清理 worktree，key 与原实现一致', () => {
+  it('拒绝时给 toast 的只有「取权 / 打开」类动作、闲置自动压缩开关和关闭卡的清理 worktree，key 与原实现一致', () => {
     const withToast = [...SENSITIVE_CARD_ACTIONS].filter(([, m]) => m.denyToastKey).map(([a, m]) => [a, m.denyToastKey]);
     expect(withToast.sort()).toEqual([
       ['cleanup_session_worktree', 'card.worktree_cleanup.no_permission'],
       ['get_write_link', 'card.action.write_link_no_permission'],
       ['open_local_cli', 'card.action.local_cli_no_permission'],
       ['open_local_terminal', 'card.action.local_terminal_no_permission'],
+      ['toggle_idle_compact', 'card.idle_compact.no_permission'],
     ]);
   });
 
