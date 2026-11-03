@@ -146,6 +146,23 @@ describe('Codex ownership PID refresh', () => {
     expect(scope.publishLocalProcessAttestation).not.toHaveBeenCalled();
   });
 
+  it('replaces a zombie probe instead of preserving it while the native leaf is missing', () => {
+    // The bounded resolver once wired a `codex debug`-style probe (pid 200) that
+    // has now exited unreaped (zombie); rediscovery reaches only the live wrapper
+    // (pid 100) because the interactive leaf has not forked yet. A zombie holds
+    // no rollout fds, so preserving the wired pid would pin every ownership
+    // check to a dead process — the live wrapper must win, and later observations
+    // re-resolve the leaf from the same managed tree.
+    const { scope, current } = fixture();
+    scope.readComm.mockImplementation((pid: number) => pid === 200 ? 'codex' : 'sh');
+    scope.isZombieProcess = (pid: number) => pid === 200;
+    scope.resolveCodexOwnershipPid.mockReturnValue(100);
+    expect(current()).toBe(100);
+    expect(scope.backend.cliPid).toBe(100);
+    expect(scope.bridgeCliPid).toBe(100);
+    expect(scope.publishLocalProcessAttestation).toHaveBeenCalledWith(100);
+  });
+
   it('retries a failed identity publication without returning to the retired PID', () => {
     const { scope, current } = fixture();
     scope.publishLocalProcessAttestation.mockReturnValueOnce(false);

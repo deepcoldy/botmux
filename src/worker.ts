@@ -25738,6 +25738,12 @@ async function spawnCli(
       findRealPid: (lp) => findLaunchedCliPid(lp, 'codex', 6, {}, codexFilterExecutable),
       isDirectLeaf: (lp) => codexProcessIsNativeLeaf(lp, codexFilterExecutable),
       getBackend: () => backend,
+      // Deliberately the stable spawn-time launcher pid, not backend.getChildPid():
+      // Herdr/ZMX alias that accessor to the mutable cliPid, which the synchronous
+      // resolve rewires to the leaf before the first retry tick, so the same-pid
+      // arm of launcherRetryStillValid would kill the loop forever. Cross-generation
+      // safety still comes from the backend-identity arm; same-pid stays valid by
+      // construction for this captured root.
       getChildPid: () => lastSpawnCodexLauncherPid,
       applyRealPid: (realPid) => {
         log(`Codex launcher: resolved real codex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
