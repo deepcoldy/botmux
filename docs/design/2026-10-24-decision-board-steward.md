@@ -275,7 +275,7 @@ botmux board show <编号|key> [--json]                           # 全部字段
 botmux board add <标题> [--key K] [--state S] [--stage 阶段] [--kind 类型] [--repo 仓库]
                  [--summary 一句话] [--progress 进展]
                  [--ask 问题 --option "A=做法 → 结果" ... --recommend A --reason 理由]
-                 [--link pr=owner/repo#N | chat=oc_… | thread=om_… | session=<id> | commit=owner/repo@sha | url=…]...
+                 [--link pr=owner/repo#N | chat=oc_… | thread=oc_…/omt_… | session=<id> | commit=owner/repo@sha | url=…]...
                  [--note 一句话]                                 # 同 key 已存在时按 set 更新，并给出提示
 botmux board set <编号|key> [字段同上] [--clear-ask] [--note 一句话]   # 改状态和字段会自动记进历史
                  [--unlink kind=ref]...                          # 删关联；先删后加，--unlink 旧 --link 新 = 替换
@@ -370,6 +370,8 @@ botmux board guide                                               # 打印管家�
 | 很久以前的旧事被翻出来 | 只看最近 7 天有动静的；更早的、看板上没有的不翻 |
 
 **代码护栏（唯一的行为改动）**：`board add` 命中已有 key、而那一项已结束（done / closed）时拒绝（`item_ended`，409），不改它。原来同 key 的 add 等于 set，巡检误判一次就能把关掉的旧事改回待拍板，靠 prompt 拦不住。重开要显式 `board set`。
+
+**巡检上报命令（复审修正）**：巡检回合是 `--silent` 定时任务在管家群的 chat 级回合，daemon 不发 banner、不播种这一回合的 reply-target，CLI 侧没有「触发消息发送者」，`botmux send --mention-back` 会被 @ 决策门禁拒绝（exit 2）。所以 guide 里巡检的汇总上报固定写 `botmux send --attention=decision --no-mention "…"`：消息照常发到管家群，`--attention=decision` 把会话举进 dashboard「需要你」列；确实要飞书里 @ owner 时显式写 `--mention <owner 的 open_id>`。「要 owner 拍板」一节保留 `--mention-back`，那一节发生在真人回合，有触发消息发送者。
 
 botmux 本身仍不调 GitHub API，PR 由管家用仓库自己的工具（如 gh）查。
 
