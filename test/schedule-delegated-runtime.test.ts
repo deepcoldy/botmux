@@ -118,6 +118,18 @@ describe('delegated schedule runtime authorization', () => {
         selfManageEnabled: false, targetChatId: 'oc_chat', adminOpenIds: [], ...lookups,
       })).rejects.toThrow(`schedule authority state is ${state}`);
     }
+
+    // A naturally completed until-done task keeps one live cleanup turn; the
+    // completedRunStillLive state gate is evaluated before the exemption and
+    // no controller lookup may happen.
+    await expect(authorizeScheduleSelfManage({
+      ...hostTask, state: 'completed',
+      task: { ...hostTask.task, enabled: false, disabledReason: 'once_completed' as const },
+    }, {
+      selfManageEnabled: false, targetChatId: 'oc_chat', adminOpenIds: [], ...lookups,
+    })).resolves.toBeUndefined();
+    expect(lookups.resolveTargetOpenId).not.toHaveBeenCalled();
+    expect(lookups.listChatMemberOpenIds).not.toHaveBeenCalled();
   });
 
   it.each([

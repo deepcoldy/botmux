@@ -587,6 +587,20 @@ describe('managed schedule mutation route', () => {
     expect(h.scheduler.completeTask).not.toHaveBeenCalled();
   });
 
+  it('lets a controllerless naturally completed until-done task remove itself through the real authorizer', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('remove', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    Object.assign(h.record, { kind: 'direct', state: 'completed', runScopes: [] });
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO, enabled: false,
+      disabledReason: 'once_completed', untilDone: { status: 'done', attempts: 3 } };
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    h.scope.getDashboardAdminOpenIds = () => [];
+    h.scope.readGlobalConfig = () => ({});
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.scheduler.removeTask).toHaveBeenCalledWith('a1b2c3d4');
+  });
+
   it('reports a repeated done as a replay and a plain task as not until-done', async () => {
     const replay = harness('done');
     replay.record.kind = 'direct';
