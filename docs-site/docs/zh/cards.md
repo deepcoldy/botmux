@@ -9,7 +9,9 @@ Dashboard → 机器人默认设置 → 卡片 → **回答展示方式**提供�
 | 默认模式 | 保持原有独立状态卡、CoT 和普通发送行为；现有机器人默认使用此模式 |
 | 动态单卡模式 | 同一轮的进度、执行过程、Ask 提问和最终答复原地更新；下一轮创建新卡，上一轮答复保留 |
 
-动态单卡支持**未启用文件沙盒**的 Claude Code / Codex 普通飞书对话，包括普通群和话题。模式从**下一轮**生效。可由管理员执行 `/botconfig set replyCardMode unified` 开启，`/botconfig set replyCardMode legacy` 恢复默认模式。
+动态单卡支持**未启用文件沙盒**的 Claude Code / Codex / Grok / TraeX / Pi 普通飞书对话，包括普通群和话题。模式从**下一轮**生效。可由管理员执行 `/botconfig set replyCardMode unified` 开启，`/botconfig set replyCardMode legacy` 恢复默认模式。
+
+TraeX 和 Pi 复用各自已有的结构化转录桥，按原生轮次归属更新过程与最终答复。Pi 的可重试错误不会立即结束卡片，等待原生结算标记或既有错误超时规则；自定义工具若以 `terminate:true` 结束且没有写入终态记录，卡片可能保持执行中，直到后续输入接续。
 
 文件沙盒会话（含旧版 `readIsolation`、全局 `BOTMUX_SANDBOX=1`）暂时沿用默认模式，`send`、CoT 和 Ask 保持原交付方式。即使机器人配置为动态单卡，也不会为这些会话创建动态答复卡。沙盒状态以会话和 Worker 已冻结的配置为准；修改机器人沙盒开关不会改变正在运行的会话。当前实现需要多个进程共享卡片记录与文件锁，不能为此开放整个记录目录的写权限。
 
