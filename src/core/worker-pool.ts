@@ -1192,9 +1192,10 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { turnId: string; source: 'terminal' | 'idle'; errorCode?: string },
   ) => void | Promise<void>;
-  /** Workflow node session (design 2026-11-03 §6.3): the handoff turn was
-   *  committed to the CLI input queue — the node is accepted. Only fired for
-   *  sessions carrying a verified `workflowNode` marker. */
+  /** Workflow node session (design 2026-11-03 §6.3): a turn was committed to
+   *  the CLI input queue — the handoff's own turn is the acceptance, a later
+   *  one means the bot works again. Only fired for sessions carrying a
+   *  verified `workflowNode` marker. */
   onWorkflowNodeInputCommitted?: (ds: DaemonSession, context: { turnId: string; committedAt: number }) => void;
   /** Workflow node session (§8): a turn went from working to idle while the
    *  node's handoff has no accepted submission — shown as "Bot 已停下，未提交". */
@@ -16487,7 +16488,7 @@ function setupWorkerHandlers(
           if (msg.turnId.startsWith('mlrp_turn_')) {
             markMessageListenerRunPreviewRunning(msg.turnId);
           }
-          if (ds.session.workflowNode?.handoffMessageId === msg.turnId) {
+          if (ds.session.workflowNode) {
             cb.onWorkflowNodeInputCommitted?.(ds, { turnId: msg.turnId, committedAt: Date.now() });
           }
         } else {

@@ -28,6 +28,7 @@ import {
   recordExternalAccepted,
   recordExternalStalled,
   reportExternalBlocked,
+  stageExternalSubmissionForInstall,
 } from '../src/workflows/v3/external-control.js';
 import { requestV3Retry } from '../src/workflows/v3/daemon-run.js';
 import type { RunNode } from '../src/workflows/v3/contract.js';
@@ -1358,5 +1359,48 @@ describe('external goal nodes — engine follow-ups', () => {
     expect(await run.submit(attemptId, reportFiles())).toMatchObject({ ok: true });
     expect(expectTerminal(await run.drive(executor)).runStatus).toBe('succeeded');
     expect(v3AcceptanceProbeUnknownSince(run.runDir, attemptId)).toBeUndefined();
+  });
+});
+
+describe('external goal nodes — staged submission while the run owner is offline (review P2-2)', () => {
+  it('stages only a valid submission, never journals, and the next drive commits it — even past the deadline', async () => {
+    const run = new BotRun(reportDag('rv-stage'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = run.openAttempt('write').attemptId;
+    run.accept(attemptId, 'sess-1');
+    const before = run.events().length;
+
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-1', files: [{ key: 'report', data: Buffer.from('# r') }], result: { message: 1 }, summary: 's',
+    }, run.ctx())).toMatchObject({ ok: false, reason: 'invalid' });
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-other', ...reportFiles(), summary: 's',
+    }, run.ctx())).toEqual({ ok: false, reason: 'session-mismatch' });
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-1', ...reportFiles(), summary: 's',
+    }, run.ctx())).toEqual({ ok: true, kind: 'staged' });
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-1', ...reportFiles(), summary: 's',
+    }, run.ctx())).toEqual({ ok: false, reason: 'pending' });
+    expect(run.events()).toHaveLength(before);
+
+    run.clock.t = run.openAttempt('write').deadlineAt! + 60_000;
+    expect(expectTerminal(await run.drive(executor)).runStatus).toBe('succeeded');
+    expect(run.of('nodeBlocked')).toEqual([]);
+  });
+
+  it('a staged submission for an attempt that closed meanwhile is discarded on install', async () => {
+    const run = new BotRun(reportDag('rv-stage-late'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = run.openAttempt('write').attemptId;
+    run.accept(attemptId, 'sess-1');
+    expect(await stageExternalSubmissionForInstall(run.runDir, {
+      attemptId, sessionId: 'sess-1', ...reportFiles(), summary: 's',
+    }, run.ctx())).toMatchObject({ ok: true });
+    appendEvent(run.journalPath, { type: 'runCancelRequested', cancelRequestId: 'c-1', by: 'ou' });
+    expect(expectTerminal(await run.drive(executor)).runStatus).toBe('cancelled');
+    expect(run.of('nodeSucceeded')).toEqual([]);
   });
 });

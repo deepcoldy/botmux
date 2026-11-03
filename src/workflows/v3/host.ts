@@ -581,6 +581,15 @@ export async function planAdHocNodeExecutor(
     multiTopicEnabled: input.multiTopicEnabled,
   });
   if (decision.mode === 'ephemeral') return { kind: 'ephemeral', decision };
+  // Bot-executed nodes run in each bot's own session directory; a Gate-2
+  // working dir would be frozen into the snapshot yet silently ignored. Until
+  // target-authoritative working dirs exist (§15.4), refuse it explicitly.
+  if (input.workingDirOverride !== undefined) {
+    throw new HostGuardError(
+      '「节点交给群里的 Bot 执行」已开启：节点在执行 Bot 自己的会话目录（它配置的默认工作目录）里跑，' +
+      '暂不支持 approve-dag --working-dir。请去掉 --working-dir 重新批准；需要指定目录时，在 Dashboard 关闭该开关后再批准。',
+    );
+  }
   const binding = cur.chatBinding!;
   if (!cur.dagPath) throw new Error('dag_ready 状态缺 dagPath（内部不一致）');
   const dag = loadDag(cur.dagPath);
@@ -705,7 +714,7 @@ async function liveBotEligibilityProbe(binding: RunChatBinding, bots: BotConfig[
   return createLiveV3BotEligibilityProbe({
     orchestratorAppId: binding.larkAppId,
     chatId: binding.chatId,
-    configuredAppIds: new Set(bots.map((bot) => bot.larkAppId)),
+    bots,
   });
 }
 
@@ -715,6 +724,7 @@ const PREVIEW_PROBE: V3BotEligibilityProbe = {
   isConfigured: () => true,
   isDaemonOnline: () => true,
   inChat: async () => 'yes',
+  opensTopicSessions: async () => 'yes',
   ensureGrant: async () => {},
 };
 

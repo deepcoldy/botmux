@@ -30,6 +30,7 @@ export function v3NodeCardStatusFor(
   events: readonly StoredEvent[],
   instanceStatus: string | undefined,
   acceptanceUnknownSince?: number,
+  activeAt?: number,
 ): V3NodeCardStatus {
   const closed = attempt.closed;
   if (!closed) {
@@ -39,6 +40,7 @@ export function v3NodeCardStatusFor(
         acceptedAt: attempt.acceptedAt!,
         ...(attempt.deadlineAt !== undefined ? { deadlineAt: attempt.deadlineAt } : {}),
         ...(attempt.stalledAt !== undefined ? { stalledAt: attempt.stalledAt } : {}),
+        ...(activeAt !== undefined ? { activeAt } : {}),
       };
     }
     return acceptanceUnknownSince !== undefined
@@ -85,6 +87,10 @@ export interface V3NodeCardSyncDeps {
   botName(larkAppId: string): string;
   selfLarkAppId: string;
   acceptanceUnknownSince?(runDir: string, attemptId: string): number | undefined;
+  /** Display-only activity of an attempt (a later turn started). */
+  activity?(runDir: string, attemptId: string): { activeAt?: number };
+  /** Node cards by topic key, recorded when each card was sent. */
+  topicCards?(runDir: string): Record<string, string>;
   now?(): number;
 }
 
@@ -96,16 +102,33 @@ function nodeTopicKey(attempt: V3ExternalAttempt): string {
 export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
   const shown = new Map<string, string>();
   const now = deps.now ?? Date.now;
+  // Drives end concurrently; each sync reads the journal when it RUNS, and
+  // runs one at a time per run, so the last patch always reflects the latest
+  // journal (an older read can never land after a newer one).
+  const chains = new Map<string, Promise<void>>();
 
-  return async function syncV3NodeCards(runId: string): Promise<void> {
+  return function syncV3NodeCards(runId: string): Promise<void> {
+    const previous = chains.get(runId) ?? Promise.resolve();
+    const run = previous.then(() => syncOnce(runId), () => syncOnce(runId));
+    const tail = run.then(() => undefined, () => undefined);
+    chains.set(runId, tail);
+    void tail.then(() => { if (chains.get(runId) === tail) chains.delete(runId); });
+    return run;
+  };
+
+  async function syncOnce(runId: string): Promise<void> {
     const runDir = join(deps.baseDir, runId);
     const run = deps.loadRun(runDir);
     if (!run || run.nodeExecutor !== 'bot') return;
     const events = readJournal(join(runDir, 'journal.ndjson'));
     const snap = materialize([...events]);
+    const topicCards = deps.topicCards?.(runDir) ?? {};
     const latestByCard = new Map<string, V3ExternalAttempt>();
     for (const attempt of foldV3ExternalAttempts(events).values()) {
-      if (attempt.nodeCardMessageId) latestByCard.set(attempt.nodeCardMessageId, attempt);
+      // An attempt whose Sent never reached the journal still owns the card
+      // its node topic was opened with.
+      const cardId = attempt.nodeCardMessageId ?? (attempt.phase !== 'dispatched' ? topicCards[nodeTopicKey(attempt)] : undefined);
+      if (cardId) latestByCard.set(cardId, attempt);
     }
     const goalIds = run.dag.nodes.filter((node) => isGoalNode(node)).map((node) => node.id);
     for (const [messageId, attempt] of latestByCard) {
@@ -117,6 +140,7 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
         events,
         instanceStatus,
         deps.acceptanceUnknownSince?.(runDir, attempt.attemptId),
+        deps.activity?.(runDir, attempt.attemptId).activeAt,
       );
       const authored = run.dag.nodes.find((node) => node.id === (attempt.loop ? attempt.loop.loopId : attempt.nodeId));
       const upstream = (authored?.depends ?? []).map((dep) => ({
@@ -145,5 +169,5 @@ export function createV3NodeCardSync(deps: V3NodeCardSyncDeps) {
       await deps.patchCard(messageId, buildV3NodeCard(view));
       shown.set(messageId, signature);
     }
-  };
+  }
 }

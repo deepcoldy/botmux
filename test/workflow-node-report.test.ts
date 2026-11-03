@@ -65,6 +65,11 @@ describe('report CLI arguments', () => {
   it('daemons re-check the decoded bytes, never trusting the CLI', () => {
     const big = Buffer.alloc(WORKFLOW_SUBMISSION_MAX_FILE_BYTES + 1).toString('base64');
     expect(decodeWorkflowSubmission({ files: [{ key: 'a', name: 'a', data: big }] })).toEqual({ ok: false, error: 'file_too_large' });
+    // M11: files each within the per-file bound but together over the total.
+    const atBound = Buffer.alloc(WORKFLOW_SUBMISSION_MAX_FILE_BYTES).toString('base64');
+    const count = Math.floor(WORKFLOW_SUBMISSION_MAX_TOTAL_BYTES / WORKFLOW_SUBMISSION_MAX_FILE_BYTES) + 1;
+    expect(decodeWorkflowSubmission({ files: Array.from({ length: count }, (_v, i) => ({ key: `k${i}`, name: 'f', data: atBound })) }))
+      .toEqual({ ok: false, error: 'submission_too_large' });
     expect(decodeWorkflowSubmission({ files: [{ key: '../x', name: 'a', data: '' }] })).toEqual({ ok: false, error: 'bad_output_key' });
     expect(decodeWorkflowSubmission({ files: 'nope' })).toEqual({ ok: false, error: 'bad_files' });
   });
@@ -210,6 +215,37 @@ describe('end-to-end submission through the main bot\'s daemon', () => {
       .toMatchObject({ status: 200 });
     expect(run.openAttempt('write').stalledAt).toBe(run.clock.t);
     expect(run.snap().nodes.get('write')?.status).toBe('running');
+  });
+
+  it('P2-1: once the attempt was stopped (binding revoked) a report is refused, even if the journal still has it open', async () => {
+    const { run, attempt, world, target, session } = await acceptedRun('rep-revoked');
+    await world.executor.stop({
+      runId: run.dag.runId, nodeId: 'write', instanceId: attempt.instanceId, attemptId: attempt.attemptId, revision: 1,
+      targetLarkAppId: 'cli_a', placement: 'topic', reason: 'timeout', idempotency: attempt.idempotency,
+      handoffMessageId: attempt.handoffMessageId, sessionId: 'sess-a',
+    });
+    const before = run.events().length;
+    expect(await target.report({
+      dispatchRoot: attempt.handoffMessageId, status: 'completed', content: 'x', files: [file('report', 'x')], resultText: '{"message":"ok"}',
+    }, session)).toMatchObject({ status: 409, body: { error: 'handoff_revoked' } });
+    expect(run.events()).toHaveLength(before);
+  });
+
+  it('M8: the event route refuses a run that is not bot-executed', async () => {
+    const { attempt, world, run } = await acceptedRun('rep-not-bot');
+    const result = await handleWorkflowHandoffEvent(
+      { kind: 'stalled', dispatchRoot: attempt.handoffMessageId, sessionId: 'sess-a' },
+      {
+        selfLarkAppId: MAIN,
+        baseDir: run.base,
+        readRegistry: () => readDispatchRegistryLoose(world.dataDir),
+        secret: () => SECRET,
+        loadRun: () => ({ dag: run.dag }),
+        drive: () => {},
+      },
+    );
+    expect(result).toMatchObject({ status: 409, body: { error: 'run_not_bot_executed' } });
+    expect(run.openAttempt('write').stalledAt).toBeUndefined();
   });
 
   it('the event route only serves its own runs', async () => {

@@ -495,8 +495,10 @@ export interface WorkflowNodeSessionMarker {
   nodeId: string;
   instanceId?: string;
   attemptId: string;
-  /** The handoff message (binding key / `--dispatch-root`). */
+  /** The handoff message (`--dispatch-root`). */
   handoffMessageId: string;
+  /** The handoff's binding nonce (carried in the card). */
+  nonce: string;
   /** Node topic root the handoff lives under. */
   publishRoot: string;
   /** The orchestrating main bot. */

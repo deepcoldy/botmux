@@ -69,6 +69,15 @@ export interface V3NodeExecutorTarget {
   nodeId: string;
   /** The bot that will execute it (the frozen snapshot's app id). */
   larkAppId: string;
+  /** Declared outputs of kind `directory`: a bot cannot submit a directory
+   *  (`botmux report --output` carries files), so such a node can never
+   *  complete when handed to a bot. */
+  directoryOutputs?: string[];
+}
+
+function directoryOutputsOf(outputs: Record<string, { kind: string }> | undefined): string[] | undefined {
+  const keys = Object.entries(outputs ?? {}).filter(([, declaration]) => declaration.kind === 'directory').map(([key]) => key);
+  return keys.length > 0 ? keys : undefined;
 }
 
 /**
@@ -86,12 +95,16 @@ export function v3BotExecutorTargets(
     if (!snapshot) throw new Error(`v3 node executor: no frozen bot for node "${nodeId}"`);
     return snapshot.larkAppId;
   };
+  const withOutputs = (target: V3NodeExecutorTarget, outputs: Record<string, { kind: string }> | undefined) => {
+    const directoryOutputs = directoryOutputsOf(outputs);
+    return directoryOutputs ? { ...target, directoryOutputs } : target;
+  };
   for (const node of dag.nodes) {
-    if (isGoalNode(node)) out.push({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) });
+    if (isGoalNode(node)) out.push(withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs));
     if (isLoopNode(node)) {
       for (const body of node.body.nodes) {
         const nodeId = `${node.id}.${body.id}`;
-        out.push({ nodeId, larkAppId: targetOf(body.bot ?? node.bot, nodeId) });
+        out.push(withOutputs({ nodeId, larkAppId: targetOf(body.bot ?? node.bot, nodeId) }, body.outputs));
       }
     }
   }
@@ -103,7 +116,13 @@ export type V3BotEligibilityCode =
   | 'BOT_NOT_IN_CHAT'
   | 'BOT_OFFLINE'
   | 'COLLABORATION_DENIED'
-  | 'MEMBERSHIP_UNKNOWN';
+  | 'MEMBERSHIP_UNKNOWN'
+  /** §6.1 item 7: in this normal group the bot folds topic replies into one
+   *  group-wide session, so it can never run (or submit from) a node topic. */
+  | 'NO_TOPIC_SESSION'
+  | 'TOPIC_SESSION_UNKNOWN'
+  /** The node declares a directory output, which a bot cannot submit. */
+  | 'DIRECTORY_OUTPUT';
 
 export interface V3BotEligibilityProblem {
   nodeId: string;
@@ -122,6 +141,9 @@ export interface V3BotEligibilityProbe {
   /** §6.1 item 2: a current member of the run's chat (`unknown` = could not
    *  be determined; refused, never assumed). */
   inChat(larkAppId: string): Promise<'yes' | 'no' | { unknown: string }>;
+  /** §6.1 item 7: whether a reply in a node topic of this chat reaches this
+   *  bot as its own topic session (`no` = it folds into the group session). */
+  opensTopicSessions(larkAppId: string): Promise<'yes' | 'no' | { unknown: string }>;
   /** §6.1 item 4: establish (idempotently) the talk-only chat grant between
    *  the main bot and this bot, the same matrix `dispatch --bot-app` writes.
    *  Throws with a readable message when it cannot. */
@@ -148,6 +170,10 @@ export async function checkV3BotExecutorEligibility(input: {
   }
   const problems: V3BotEligibilityProblem[] = [];
   for (const target of input.targets) {
+    // Applies to every bot, the main bot included: no bot can submit it.
+    if (target.directoryOutputs) {
+      problems.push({ nodeId: target.nodeId, larkAppId: target.larkAppId, code: 'DIRECTORY_OUTPUT', detail: target.directoryOutputs.join(', ') });
+    }
     const verdict = verdicts.get(target.larkAppId);
     if (verdict) problems.push({ nodeId: target.nodeId, larkAppId: target.larkAppId, ...verdict });
   }
@@ -168,6 +194,14 @@ async function judgeBot(
   }
   if (membership === 'no') return { code: 'BOT_NOT_IN_CHAT' };
   if (membership !== 'yes') return { code: 'MEMBERSHIP_UNKNOWN', detail: membership.unknown };
+  let topics: Awaited<ReturnType<V3BotEligibilityProbe['opensTopicSessions']>>;
+  try {
+    topics = await probe.opensTopicSessions(appId);
+  } catch (err) {
+    topics = { unknown: err instanceof Error ? err.message : String(err) };
+  }
+  if (topics === 'no') return { code: 'NO_TOPIC_SESSION' };
+  if (topics !== 'yes') return { code: 'TOPIC_SESSION_UNKNOWN', detail: topics.unknown };
   try {
     await probe.ensureGrant(appId);
   } catch (err) {
@@ -182,6 +216,9 @@ const PROBLEM_TEXT: Record<V3BotEligibilityCode, string> = {
   BOT_OFFLINE: '它的 daemon 不在线',
   COLLABORATION_DENIED: '无法和主 Bot 建立群内协作授权',
   MEMBERSHIP_UNKNOWN: '暂时查不到它是否在本群，请稍后重试',
+  NO_TOPIC_SESSION: '它在本群设成了「整群一个会话」（chat / shared），节点话题里的交接会并进群会话，无法提交；请把它在本群的回复模式改成 new-topic 或 chat-topic，或改派',
+  TOPIC_SESSION_UNKNOWN: '暂时查不到本群是话题群还是普通群，请稍后重试',
+  DIRECTORY_OUTPUT: '节点声明了目录型产出，交给 Bot 执行时无法提交目录；请改成文件产出，或在 Dashboard 关闭该开关改用临时进程执行',
 };
 
 /** "Node → bot: reason" lines for a refused approval. */
@@ -264,4 +301,23 @@ export async function resolveV3NodeExecutor(input: {
     };
   }
   return { kind: 'bot', targets, summary: formatV3BotExecutorPlan(targets, binding.larkAppId, input.policy.nameOf) };
+}
+
+/**
+ * §6.1 item 7 as a pure rule: does a reply inside a node topic of this chat
+ * reach `botConfig` as its own topic-scoped session? In a topic chat always;
+ * in a normal group only when the bot's reply mode for this chat keeps native
+ * topics apart (`new-topic` / `chat-topic`) — `chat` and `shared` fold them
+ * into one group-wide session (event-dispatcher's regular-group fold).
+ */
+export function v3OpensTopicSessions(
+  chatMode: 'group' | 'topic' | 'p2p' | 'unknown',
+  botConfig: { regularGroupReplyMode?: string; chatReplyModes?: Record<string, string> } | undefined,
+  chatId: string,
+): 'yes' | 'no' | { unknown: string } {
+  if (chatMode === 'unknown') return { unknown: 'chat mode unavailable' };
+  if (chatMode === 'topic') return 'yes';
+  if (chatMode === 'p2p') return 'no';
+  const mode = botConfig?.chatReplyModes?.[chatId] ?? botConfig?.regularGroupReplyMode ?? 'chat-topic';
+  return mode === 'new-topic' || mode === 'chat-topic' ? 'yes' : 'no';
 }

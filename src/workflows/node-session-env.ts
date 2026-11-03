@@ -13,6 +13,9 @@
  * `botmux send` / `botmux ask` working, which those markers forbid.
  */
 export const WORKFLOW_NODE_SESSION_ENV = 'BOTMUX_WORKFLOW_NODE_SESSION';
+// Process boundaries: SESSION_TURN_MARKER_ENV_KEYS scrubs it (daemon /
+// supervisor / dashboard boot), BOTMUX_INJECTED_ENV_KEYS carries it into
+// tmux / zellij panes (utils/child-env.ts).
 
 export function isWorkflowNodeSessionEnv(env: Record<string, string | undefined> = process.env): boolean {
   return env[WORKFLOW_NODE_SESSION_ENV] === '1';

@@ -25,7 +25,8 @@ export const WORKFLOW_HANDOFF_ID_PLACEHOLDER = 'om_<本条消息>';
 export type V3NodeCardStatus =
   | { kind: 'handing_off' }
   | { kind: 'acceptance_unknown'; since: number }
-  | { kind: 'running'; acceptedAt: number; deadlineAt?: number; stalledAt?: number }
+  /** `stalledAt` is shown only when no later turn started (`activeAt`). */
+  | { kind: 'running'; acceptedAt: number; deadlineAt?: number; stalledAt?: number; activeAt?: number }
   | { kind: 'done'; elapsedMs?: number }
   | { kind: 'blocked'; errorCode?: string; message?: string }
   | { kind: 'cancelled' }
@@ -62,6 +63,20 @@ function escapeMarkdown(text: string): string {
   return text.replace(/[\\*_~`[\]<>]/g, (c) => `\\${c}`);
 }
 
+/** "Stopped without submitting" until a later turn starts in the session. */
+export function v3NodeStalled(status: Extract<V3NodeCardStatus, { kind: 'running' }>): boolean {
+  if (status.stalledAt === undefined || status.stalledAt < status.acceptedAt) return false;
+  return status.activeAt === undefined || status.activeAt <= status.stalledAt;
+}
+
+export function formatV3StartTime(ms: number): string {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date(ms));
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+  return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
+}
+
 export function formatV3Elapsed(ms: number): string {
   const minutes = Math.max(0, Math.floor(ms / 60_000));
   if (minutes < 1) return '不到 1 分钟';
@@ -91,10 +106,12 @@ function statusLine(view: V3NodeCardView): { text: string; template: string } {
     case 'acceptance_unknown':
       return { text: `交接中 · 暂时查不到是否接单，正在重试 ${attempt}`, template: 'blue' };
     case 'running': {
-      const elapsed = `已用 ${formatV3Elapsed(view.now - status.acceptedAt)}`;
-      return status.stalledAt !== undefined && status.stalledAt >= status.acceptedAt
-        ? { text: `进行中 · Bot 已停下，未提交 · ${elapsed} ${attempt}`, template: 'orange' }
-        : { text: `进行中 · ${elapsed} ${attempt}`, template: 'blue' };
+      // A start time, not a running "已用 X 分钟": the card is patched on
+      // state changes only, so an elapsed figure would go stale silently.
+      const started = `${formatV3StartTime(status.acceptedAt)} 开始`;
+      return v3NodeStalled(status)
+        ? { text: `进行中 · Bot 已停下，未提交 · ${started} ${attempt}`, template: 'orange' }
+        : { text: `进行中 · ${started} ${attempt}`, template: 'blue' };
     }
     case 'done':
       return {
@@ -159,6 +176,11 @@ export interface V3HandoffCardInput {
   timeoutSec: number;
   /** The real handoff id, or {@link WORKFLOW_HANDOFF_ID_PLACEHOLDER}. */
   handoffRef: string;
+  /** The binding nonce the receiving daemon recognizes this handoff by. */
+  nonce: string;
+  /** Set when the full goal / acceptance / instructions did not fit the card
+   *  and travel as this attachment instead. */
+  overflowAttachment?: string;
   retryOf?: { errorCode?: string; message?: string };
   reassignedFrom?: string;
   /** Mention target, or the main bot itself (§6.5: no mention). */
@@ -184,12 +206,14 @@ export function v3HandoffReportCommands(input: Pick<V3HandoffCardInput, 'handoff
   };
 }
 
-/** Card payloads are size-bounded by Lark; authored text is clipped well
- *  below that rather than letting a long goal fail the whole handoff. */
-const AUTHORED_TEXT_MAX_CHARS = 6000;
+/** Feishu rejects interactive cards around 30 KB. The handoff card is kept
+ *  under this many UTF-8 bytes of serialized JSON (footer included). */
+export const V3_HANDOFF_CARD_MAX_BYTES = 24 * 1024;
+/** Preview length of authored text when the full text travels as a file. */
+const OVERFLOW_PREVIEW_CHARS = 600;
 
-function clip(text: string): string {
-  return text.length <= AUTHORED_TEXT_MAX_CHARS ? text : `${text.slice(0, AUTHORED_TEXT_MAX_CHARS)}…（已截断）`;
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
 /** Plain-text body of a handoff (the card body and the self-executed prompt). */
@@ -200,9 +224,13 @@ export function v3HandoffBodyText(input: V3HandoffCardInput): string {
     lines.push(`上次的情况：${reason}${input.retryOf.message ? `（${input.retryOf.message.slice(0, 300)}）` : ''}`, '');
   }
   if (input.reassignedFrom) lines.push('本节点已改派给你。', '');
-  lines.push('要做什么：', clip(input.goal.trim()), '');
-  if (input.acceptance?.trim()) lines.push(`完成标准：${clip(input.acceptance.trim())}`, '');
-  if (input.extraInstructions?.trim()) lines.push('补充要求：', clip(input.extraInstructions.trim()), '');
+  const preview = (text: string) => (input.overflowAttachment ? clip(text, OVERFLOW_PREVIEW_CHARS) : text);
+  if (input.overflowAttachment) {
+    lines.push(`要求较长，完整内容见附件 ${input.overflowAttachment}（已放进你的会话），以附件为准。`, '');
+  }
+  lines.push('要做什么：', preview(input.goal.trim()), '');
+  if (input.acceptance?.trim()) lines.push(`完成标准：${preview(input.acceptance.trim())}`, '');
+  if (input.extraInstructions?.trim()) lines.push('补充要求：', preview(input.extraInstructions.trim()), '');
   if (input.inputs.length > 0 || input.omitted.length > 0) {
     lines.push('输入（已作为本条消息的附件放进你的会话）：');
     for (const item of input.inputs) {
@@ -230,7 +258,53 @@ export function v3HandoffBodyText(input: V3HandoffCardInput): string {
   lines.push('怎么交：', '做完运行', `  ${commands.completed}`, `做不了：${commands.blocked}`);
   lines.push('提交被拒时命令会列出缺什么，补齐后在本轮重新提交即可。');
   lines.push('需要问人：直接在这里问，发起人会在这里回复。');
+  lines.push('', `交接编号：${input.nonce}`);
   return lines.join('\n');
+}
+
+/** The full authored text, for the overflow attachment. */
+export function v3HandoffTaskMarkdown(input: V3HandoffCardInput): string {
+  return [
+    `# 【工作流任务】${input.runTitle} · ${input.nodeId}`,
+    '',
+    '## 要做什么',
+    input.goal.trim(),
+    ...(input.acceptance?.trim() ? ['', '## 完成标准', input.acceptance.trim()] : []),
+    ...(input.extraInstructions?.trim() ? ['', '## 补充要求', input.extraInstructions.trim()] : []),
+    '',
+  ].join('\n');
+}
+
+/**
+ * The handoff card within {@link V3_HANDOFF_CARD_MAX_BYTES}: when the authored
+ * text does not fit, the card carries a preview and `overflowTask` holds the
+ * full text for the caller to stage as `overflowName`.
+ */
+export function planV3HandoffCard(input: V3HandoffCardInput, overflowName: string): {
+  card: string;
+  overflowTask?: string;
+} {
+  const full = buildV3HandoffCard(input);
+  if (Buffer.byteLength(full) <= V3_HANDOFF_CARD_MAX_BYTES) return { card: full };
+  const overflowTask = v3HandoffTaskMarkdown(input);
+  let reduced: V3HandoffCardInput = { ...input, overflowAttachment: overflowName };
+  let card = buildV3HandoffCard(reduced);
+  // Long declared lists (inputs / outputs / omitted) are trimmed last.
+  for (const keep of [40, 20, 10, 5, 0]) {
+    if (Buffer.byteLength(card) <= V3_HANDOFF_CARD_MAX_BYTES) break;
+    reduced = {
+      ...reduced,
+      inputs: input.inputs.slice(0, keep),
+      omitted: input.omitted.slice(0, keep),
+      outputs: input.outputs.slice(0, keep),
+      resultFields: input.resultFields.slice(0, keep),
+    };
+    card = buildV3HandoffCard(reduced);
+  }
+  if (Buffer.byteLength(card) > V3_HANDOFF_CARD_MAX_BYTES) {
+    throw new Error('v3 handoff card does not fit the card size budget');
+  }
+  return { card, overflowTask };
 }
 
 /** The handoff card (first reply in the node topic). */

@@ -1,10 +1,10 @@
 /**
  * Workflow handoff bindings (design 2026-11-03 §5.4, P3): the receiving bot's
- * daemon treats an inbound bot message as a workflow handoff only when its
- * EXACT message id carries a host-signed binding naming this bot, this chat
- * and this topic. Forged, foreign, misrouted and cross-protocol entries are
- * plain messages; a pending marker only makes the receiver wait briefly for a
- * binding the sender is about to publish.
+ * daemon treats an inbound bot message as a workflow handoff only when it
+ * carries a host-signed binding (registered BEFORE the send, keyed by the
+ * nonce in the card; linked to the message id after the send) naming this
+ * bot, this chat and this topic. Forged, foreign, misrouted, cross-protocol
+ * and echoed entries are plain messages; a revoked handoff is dropped.
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -14,11 +14,14 @@ import { join } from 'node:path';
 
 import {
   createWorkflowHandoffBinding,
+  linkWorkflowHandoffMessage,
   lookupWorkflowHandoff,
+  lookupWorkflowHandoffByNonce,
   readDispatchRegistryLoose,
   recordWorkflowHandoffBinding,
-  recordWorkflowHandoffPending,
   resolveInboundWorkflowHandoff,
+  revokeWorkflowHandoff,
+  workflowHandoffNonce,
 } from '../src/core/workflow-handoff-binding.js';
 import {
   createDispatchReportBinding,
@@ -26,6 +29,7 @@ import {
 } from '../src/core/dispatch-report-binding.js';
 
 const SECRET = 'host-secret';
+const NONCE = workflowHandoffNonce(SECRET, 'idempotency-uuid-1');
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
@@ -39,7 +43,7 @@ const ROUTE = { chatId: 'oc_chat', threadRootId: 'om_card', selfLarkAppId: 'cli_
 
 function binding(overrides: Record<string, unknown> = {}, secret = SECRET) {
   return createWorkflowHandoffBinding(secret, {
-    dispatchRoot: 'om_handoff',
+    nonce: NONCE,
     publishRoot: 'om_card',
     targetLarkAppId: 'cli_doc',
     targetChatId: 'oc_chat',
@@ -49,120 +53,123 @@ function binding(overrides: Record<string, unknown> = {}, secret = SECRET) {
   } as any);
 }
 
-function inbound(dir: string, messageId: string, overrides: Partial<typeof ROUTE> = {}, clock?: { t: number }) {
+function inbound(dir: string, messageId: string, content: string, overrides: Record<string, unknown> = {}) {
   return resolveInboundWorkflowHandoff({
-    readRegistry: () => readDispatchRegistryLoose(dir),
+    registry: readDispatchRegistryLoose(dir),
     secret: () => SECRET,
     messageId,
+    content,
     ...ROUTE,
     ...overrides,
-    ...(clock ? {
-      now: () => clock.t,
-      sleep: async (ms: number) => { clock.t += ms; },
-    } : {}),
   });
 }
 
+const CARD_TEXT = `【工作流任务】… 交接编号：${NONCE}`;
+
 describe('inbound workflow handoff verification', () => {
-  it('accepts exactly the bound message, for this bot, chat and topic', async () => {
+  it('P3-9a: recognizes the handoff from the nonce in the card before its id is linked (no waiting)', async () => {
     const dir = dataDir();
-    await recordWorkflowHandoffBinding(dir, 'uuid-1', binding());
-    expect(await inbound(dir, 'om_handoff')).toMatchObject({
-      dispatchRoot: 'om_handoff',
-      workflow: { runId: 'run-1', attemptId: 'write#001/attempts/001' },
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    expect(inbound(dir, 'om_handoff', CARD_TEXT)).toMatchObject({
+      kind: 'handoff',
+      binding: { nonce: NONCE, workflow: { runId: 'run-1', attemptId: 'write#001/attempts/001' } },
     });
   });
 
+  it('once linked, the message id alone identifies it — and only that message', async () => {
+    const dir = dataDir();
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    await linkWorkflowHandoffMessage(dir, SECRET, NONCE, 'om_handoff');
+    expect(inbound(dir, 'om_handoff', 'card text without the nonce')).toMatchObject({ kind: 'handoff' });
+    // Another message echoing the nonce is not the handoff.
+    expect(inbound(dir, 'om_echo', CARD_TEXT)).toBeUndefined();
+    expect(lookupWorkflowHandoff({ registry: readDispatchRegistryLoose(dir), dispatchRoot: 'om_handoff', secret: SECRET }))
+      .toMatchObject({ kind: 'workflow', messageId: 'om_handoff', revoked: false });
+  });
+
   it.each([
-    ['another message id', { messageId: 'om_other' }],
     ['another receiving bot', { selfLarkAppId: 'cli_test' }],
     ['another chat', { chatId: 'oc_elsewhere' }],
     ['another topic', { threadRootId: 'om_other_card' }],
+    ['a sender proven to be another app', { senderLarkAppId: 'cli_other' }],
   ])('refuses %s', async (_label, overrides) => {
     const dir = dataDir();
-    await recordWorkflowHandoffBinding(dir, 'uuid-1', binding());
-    const { messageId, ...route } = { messageId: 'om_handoff', ...overrides } as { messageId: string } & Partial<typeof ROUTE>;
-    expect(await inbound(dir, messageId, route)).toBeUndefined();
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    expect(inbound(dir, 'om_handoff', CARD_TEXT, overrides)).toBeUndefined();
+  });
+
+  it('a message without a nonce or link is decided at once as ordinary', () => {
+    expect(inbound(dataDir(), 'om_plain', 'hello @bot')).toBeUndefined();
   });
 
   it('refuses a binding signed with another secret (forged)', async () => {
     const dir = dataDir();
-    await recordWorkflowHandoffBinding(dir, 'uuid-1', binding({}, 'attacker-secret'));
-    expect(await inbound(dir, 'om_handoff')).toBeUndefined();
-    expect(lookupWorkflowHandoff({ registry: readDispatchRegistryLoose(dir), dispatchRoot: 'om_handoff', secret: SECRET }))
+    await recordWorkflowHandoffBinding(dir, SECRET, binding({}, 'attacker-secret'));
+    expect(inbound(dir, 'om_handoff', CARD_TEXT)).toBeUndefined();
+    expect(lookupWorkflowHandoffByNonce({ registry: readDispatchRegistryLoose(dir), nonce: NONCE, secret: SECRET }))
       .toEqual({ kind: 'unproven' });
   });
 
-  it('refuses a valid binding re-filed under another message id', async () => {
+  it('refuses a message-id alias re-pointed at another message', async () => {
     const dir = dataDir();
-    const signed = binding();
-    await recordWorkflowHandoffBinding(dir, 'uuid-1', { ...signed, payload: { ...signed.payload } });
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    await linkWorkflowHandoffMessage(dir, SECRET, NONCE, 'om_handoff');
     const registry = readDispatchRegistryLoose(dir);
-    const moved = { om_other: registry.om_handoff };
+    const moved = { ...registry, om_other: registry.om_handoff };
     expect(lookupWorkflowHandoff({ registry: moved, dispatchRoot: 'om_other', secret: SECRET })).toEqual({ kind: 'unproven' });
   });
 
-  it('keeps the two binding protocols apart', () => {
+  it('P2-1: a revoked handoff is reported as revoked (to be dropped), also when revoked before it was registered', async () => {
+    const dir = dataDir();
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    await revokeWorkflowHandoff(dir, SECRET, NONCE, 'runCancelled');
+    expect(inbound(dir, 'om_handoff', CARD_TEXT)).toMatchObject({ kind: 'revoked' });
+
+    const early = dataDir();
+    await revokeWorkflowHandoff(early, SECRET, NONCE, 'runCancelled');
+    expect(await recordWorkflowHandoffBinding(early, SECRET, binding())).toEqual({ revoked: true });
+    expect(inbound(early, 'om_handoff', CARD_TEXT)).toMatchObject({ kind: 'revoked' });
+  });
+
+  it('a revocation tombstone without a valid signature revokes nothing', async () => {
+    const dir = dataDir();
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    const registry = readDispatchRegistryLoose(dir) as Record<string, any>;
+    registry[`workflow-handoff:${NONCE}`].revoked = { at: new Date().toISOString(), reason: 'x', signature: 'forged' };
+    expect(lookupWorkflowHandoffByNonce({ registry, nonce: NONCE, secret: SECRET })).toMatchObject({ kind: 'workflow', revoked: false });
+  });
+
+  it('M15: a nonce can never be re-bound to a different binding; re-recording the same one is idempotent', async () => {
+    const dir = dataDir();
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    await expect(recordWorkflowHandoffBinding(dir, SECRET, binding())).resolves.toEqual({ revoked: false });
+    await expect(recordWorkflowHandoffBinding(dir, SECRET, binding({
+      workflow: { runId: 'run-1', nodeId: 'write', instanceId: 'write#001', attemptId: 'write#001/attempts/002', revision: 1 },
+    }))).rejects.toThrow();
+    await linkWorkflowHandoffMessage(dir, SECRET, NONCE, 'om_handoff');
+    await expect(linkWorkflowHandoffMessage(dir, SECRET, NONCE, 'om_other')).rejects.toThrow();
+    expect(lookupWorkflowHandoffByNonce({ registry: readDispatchRegistryLoose(dir), nonce: NONCE, secret: SECRET }))
+      .toMatchObject({ binding: { workflow: { attemptId: 'write#001/attempts/001' } }, messageId: 'om_handoff' });
+  });
+
+  it('keeps the two binding protocols apart', async () => {
+    const dir = dataDir();
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    await linkWorkflowHandoffMessage(dir, SECRET, NONCE, 'om_handoff');
     const dispatch = createDispatchReportBinding(SECRET, {
-      dispatchRoot: 'om_handoff', targetLarkAppId: 'cli_main', targetSessionId: 's1', sourceName: 'x', issuedAt: new Date().toISOString(),
+      dispatchRoot: 'om_seed', targetLarkAppId: 'cli_main', targetSessionId: 's1', sourceName: 'x', issuedAt: new Date().toISOString(),
     });
-    // A dispatch report binding is not a workflow handoff …
-    expect(lookupWorkflowHandoff({ registry: { om_handoff: { workflowHandoff: dispatch } }, dispatchRoot: 'om_handoff', secret: SECRET }))
-      .toEqual({ kind: 'unproven' });
-    expect(lookupWorkflowHandoff({ registry: { om_handoff: { reportBinding: dispatch } }, dispatchRoot: 'om_handoff', secret: SECRET }))
+    // An ordinary dispatch entry is not a workflow handoff …
+    expect(lookupWorkflowHandoff({ registry: { om_seed: { reportBinding: dispatch } }, dispatchRoot: 'om_seed', secret: SECRET }))
       .toEqual({ kind: 'none' });
     // … and a workflow handoff never routes an ordinary dispatch report.
-    expect(resolveVerifiedDispatchReportTarget({ registry: { om_handoff: { reportBinding: binding() } }, dispatchRoot: 'om_handoff', secret: SECRET }))
+    expect(resolveVerifiedDispatchReportTarget({ registry: readDispatchRegistryLoose(dir), dispatchRoot: 'om_handoff', secret: SECRET }))
       .toEqual({ ok: false, error: 'dispatch_binding_unproven' });
   });
 
-  it('a message in a topic without a pending marker is decided at once (no wait)', async () => {
-    const dir = dataDir();
-    const clock = { t: 1_000 };
-    expect(await inbound(dir, 'om_handoff', {}, clock)).toBeUndefined();
-    expect(clock.t).toBe(1_000);
-  });
-
-  it('waits for a binding announced by a pending marker, then gives up at the bound', async () => {
-    const dir = dataDir();
-    await recordWorkflowHandoffPending(dir, 'uuid-1', {
-      chatId: 'oc_chat', publishRoot: 'om_card', targetLarkAppId: 'cli_doc', expiresAt: Date.now() + 60_000,
-    });
-    const clock = { t: 1_000 };
-    let publishedAt: number | undefined;
-    const late = resolveInboundWorkflowHandoff({
-      readRegistry: () => {
-        if (publishedAt === undefined && clock.t >= 1_300) {
-          publishedAt = clock.t;
-          // The sender publishes after Lark returned the id.
-          void recordWorkflowHandoffBinding(dir, 'uuid-1', binding());
-        }
-        return readDispatchRegistryLoose(dir);
-      },
-      secret: () => SECRET,
-      messageId: 'om_handoff',
-      ...ROUTE,
-      now: () => clock.t,
-      sleep: async (ms) => { clock.t += ms; await new Promise((resolve) => setTimeout(resolve, 5)); },
-    });
-    expect(await late).toMatchObject({ dispatchRoot: 'om_handoff' });
-
-    const never = dataDir();
-    await recordWorkflowHandoffPending(never, 'uuid-2', {
-      chatId: 'oc_chat', publishRoot: 'om_card', targetLarkAppId: 'cli_doc', expiresAt: Date.now() + 60_000,
-    });
-    const neverClock = { t: 0 };
-    expect(await inbound(never, 'om_handoff', {}, neverClock)).toBeUndefined();
-    expect(neverClock.t).toBeGreaterThanOrEqual(5_000);
-  });
-
-  it('publishing the binding consumes its pending marker; re-publishing is idempotent', async () => {
-    const dir = dataDir();
-    await recordWorkflowHandoffPending(dir, 'uuid-1', {
-      chatId: 'oc_chat', publishRoot: 'om_card', targetLarkAppId: 'cli_doc', expiresAt: Date.now() + 60_000,
-    });
-    await recordWorkflowHandoffBinding(dir, 'uuid-1', binding());
-    await recordWorkflowHandoffBinding(dir, 'uuid-1', binding());
-    expect(Object.keys(readDispatchRegistryLoose(dir))).toEqual(['om_handoff']);
+  it('the nonce is stable per idempotency key and unguessable without the host secret', () => {
+    expect(workflowHandoffNonce(SECRET, 'k')).toBe(workflowHandoffNonce(SECRET, 'k'));
+    expect(workflowHandoffNonce(SECRET, 'k')).not.toBe(workflowHandoffNonce('other-secret', 'k'));
+    expect(workflowHandoffNonce(SECRET, 'k')).not.toBe(workflowHandoffNonce(SECRET, 'k2'));
   });
 });

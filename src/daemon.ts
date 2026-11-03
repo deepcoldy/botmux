@@ -748,6 +748,8 @@ import {
   type V3SavedWorkflowExecutionEffect,
 } from './im/lark/v3-saved-workflow-handler.js';
 import { liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
+import { v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
+import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { createWorkflowNodeDaemon } from './core/workflow-node-daemon.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
@@ -6728,6 +6730,25 @@ function interruptWorkflowNodeTurn(ds: DaemonSession): boolean {
   return true;
 }
 
+/** The sibling bot app (same host) a bot sender's union_id proves, if any —
+ *  used only to refuse a handoff nonce echoed by a different app. */
+function workflowSiblingAppByUnionId(receiverLarkAppId: string, senderUnionId: string | undefined): string | undefined {
+  const unionId = senderUnionId?.trim();
+  if (!unionId) return undefined;
+  let found: string | undefined;
+  try {
+    for (const bot of loadBotConfigs()) {
+      if (bot.larkAppId === receiverLarkAppId) continue;
+      if (getBotUnionId(config.session.dataDir, bot.larkAppId) !== unionId) continue;
+      if (found) return undefined;
+      found = bot.larkAppId;
+    }
+  } catch {
+    return undefined;
+  }
+  return found;
+}
+
 function workflowSelfAppId(): string {
   if (!selfDaemonLarkAppId) throw new Error('daemon bot identity is not bound yet');
   return selfDaemonLarkAppId;
@@ -6748,6 +6769,11 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
     }
     return { ok: false, notInChat: resolved.error === 'subject_lark_app_not_in_chat', message: `${resolved.error}: ${resolved.message}` };
   },
+  targetOpensTopicSessions: async (chatId, target) => v3OpensTopicSessions(
+    await getChatModeStrict(workflowSelfAppId(), chatId),
+    loadBotConfigs().find((bot) => bot.larkAppId === target),
+    chatId,
+  ),
   daemonPort: (appId) => findOnlineDaemon(appId)?.ipcPort,
   hostSecret: () => loadDaemonIpcSecret(),
   bindingSecret: () => loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
@@ -9155,6 +9181,9 @@ ipcRoute('POST', WORKFLOW_NODE_REPORT_ROUTE, async (req, res) => {
         chatId: ds.chatId,
         scope: ds.scope ?? ds.session.scope,
         ...(ds.session.rootMessageId ? { rootMessageId: ds.session.rootMessageId } : {}),
+        ...(ds.session.workflowNode ? {
+          workflowNode: { handoffMessageId: ds.session.workflowNode.handoffMessageId, nonce: ds.session.workflowNode.nonce },
+        } : {}),
       },
     };
   });
@@ -27610,9 +27639,24 @@ async function handleThreadReplyAdmitted(
   // exact id carries a host-signed binding for this bot, chat and topic. It
   // marks the session as a node session, stages the node's inputs and shows
   // the CLI the handoff's real id in the `botmux report` commands.
-  const workflowHandoff = isForeignBot && scope === 'thread' && !ctx.completionProposalContinuation && ctxChatId
-    ? await workflowNodeDaemon.resolveInbound({ receiverLarkAppId: larkAppId, messageId: parsed.messageId, chatId: ctxChatId, threadRootId: anchor })
+  const inboundHandoff = isForeignBot && scope === 'thread' && !ctx.completionProposalContinuation && ctxChatId
+    ? workflowNodeDaemon.resolveInbound({
+        receiverLarkAppId: larkAppId,
+        messageId: parsed.messageId,
+        content: parsed.content,
+        chatId: ctxChatId,
+        threadRootId: anchor,
+        senderLarkAppId: workflowSiblingAppByUnionId(larkAppId, parsed.senderUnionId || data?.sender?.sender_id?.union_id),
+      })
     : undefined;
+  if (inboundHandoff?.kind === 'revoked') {
+    // The main bot stopped this attempt (cancel / timeout / reassignment)
+    // before the handoff reached us: never start a turn for it.
+    logger.info(`[${larkAppId}] dropped revoked workflow handoff ${parsed.messageId} (run ${inboundHandoff.binding.workflow.runId})`);
+    markIngressAdmitted(ctx);
+    return;
+  }
+  const workflowHandoff = inboundHandoff?.binding;
   if (workflowHandoff) {
     parsed.content = substituteWorkflowHandoffPlaceholder(parsed.content, parsed.messageId, WORKFLOW_HANDOFF_ID_PLACEHOLDER);
   }
@@ -27991,7 +28035,7 @@ async function handleThreadReplyAdmitted(
   // A retry / later round handed off into a node topic this bot already has
   // a session in: the session now reports to the new handoff.
   if (ds && workflowHandoff) {
-    ds.session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff);
+    ds.session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff, parsed.messageId);
     sessionStore.updateSession(ds.session);
     workflowNodeDaemon.onRegistered(ds.session.sessionId, ds.session.workflowNode);
   }
@@ -28177,7 +28221,7 @@ async function handleThreadReplyAdmitted(
   } else {
     const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId);
     attachments = downloaded.attachments;
-    if (workflowHandoff) attachments = [...attachments, ...workflowNodeDaemon.stageInbound(workflowHandoff)];
+    if (workflowHandoff) attachments = [...attachments, ...workflowNodeDaemon.stageInbound(workflowHandoff, parsed.messageId)];
     if (attachments.length > 0) {
       parsed.attachments = attachments;
     }
@@ -28607,7 +28651,7 @@ async function handleThreadReplyAdmitted(
     session.scope = scope;
     // Verified workflow handoff → node session (no workflow hint / skills).
     if (workflowHandoff) {
-      session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff);
+      session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff, parsed.messageId);
       workflowNodeDaemon.onRegistered(session.sessionId, session.workflowNode);
     }
     fillNativeTopicId(session, scope, parsed.threadId);

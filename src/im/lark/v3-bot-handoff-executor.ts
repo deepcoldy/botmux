@@ -21,7 +21,7 @@
  * Everything that touches Lark, daemons or sessions is injected.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { GoalInputs, Spec } from '../../workflows/v3/contract.js';
@@ -35,15 +35,19 @@ import type {
   V3ExternalStopReason,
   V3ExternalStopRequest,
 } from '../../workflows/v3/external-executor.js';
+import { classifyExternalAttempt } from '../../workflows/v3/external-control.js';
 import {
-  WORKFLOW_HANDOFF_PENDING_TTL_MS,
   createWorkflowHandoffBinding,
+  isWorkflowHandoffRevoked,
+  linkWorkflowHandoffMessage,
   lookupWorkflowHandoff,
-  recordWorkflowHandoffBinding,
-  recordWorkflowHandoffPending,
+  lookupWorkflowHandoffByNonce,
   readDispatchRegistryLoose,
-  type WorkflowHandoffBindingPayload,
+  recordWorkflowHandoffBinding,
+  revokeWorkflowHandoff,
+  workflowHandoffNonce,
 } from '../../core/workflow-handoff-binding.js';
+import { WORKFLOW_HANDOFF_TASK_FILE } from '../../core/workflow-node-session.js';
 import type { WorkflowNodeSessionMarker } from '../../types.js';
 import { foldV3ExternalAttempts } from '../../workflows/v3/external-attempt-ledger.js';
 import { readJournal } from '../../workflows/v3/journal.js';
@@ -51,6 +55,7 @@ import {
   WORKFLOW_HANDOFF_ID_PLACEHOLDER,
   buildV3HandoffCard,
   buildV3NodeCard,
+  planV3HandoffCard,
   v3HandoffBodyText,
   type V3HandoffCardInput,
 } from './v3-node-card.js';
@@ -87,6 +92,9 @@ export interface V3BotHandoffExecutorDeps {
   transport: V3BotHandoffTransport;
   resolveTargetInChat(chatId: string, targetLarkAppId: string): Promise<V3TargetInChat>;
   isDaemonOnline(larkAppId: string): boolean;
+  /** §6.1 item 7: does a reply in a node topic of this chat reach the
+   *  target as its own topic session (`no` = folds into the group session)? */
+  targetOpensTopicSessions(chatId: string, targetLarkAppId: string): Promise<'yes' | 'no' | { unknown: string }>;
   /** Same talk-only grant matrix `botmux dispatch --bot-app` writes. */
   ensureGrant(chatId: string, targetLarkAppId: string): Promise<void>;
   bindingSecret(): string;
@@ -98,10 +106,12 @@ export interface V3BotHandoffExecutorDeps {
     publishRoot: string;
     handoffMessageId: string;
   }): { sessionId: string; acceptedAt?: number } | undefined;
-  /** Stop the target's current turn for this handoff (best-effort). */
+  /** Stop the target's current turn for this handoff (best-effort). The
+   *  binding is already revoked when this is called. */
   stopTarget(input: {
     targetLarkAppId: string;
-    handoffMessageId: string;
+    nonce: string;
+    handoffMessageId?: string;
     sessionId?: string;
     reason: V3ExternalStopReason;
   }): Promise<void>;
@@ -142,6 +152,7 @@ export function v3HandoffContent(
   context: { title: string; acceptance?: string },
   target: V3HandoffCardInput['target'],
   handoffRef: string,
+  nonce: string,
 ): V3HandoffCardInput {
   const node: V3GoalNode = request.node;
   const resultFields = node.resultSchema
@@ -175,6 +186,7 @@ export function v3HandoffContent(
     ...(node.revisitTo && node.revisitTo.length > 0 ? { revisitTo: [...node.revisitTo] } : {}),
     timeoutSec: request.timeoutSec,
     handoffRef,
+    nonce,
     ...(request.retryOf ? {
       retryOf: {
         ...(request.retryOf.errorCode ? { errorCode: request.retryOf.errorCode } : {}),
@@ -186,43 +198,52 @@ export function v3HandoffContent(
   };
 }
 
-/** The node card of an earlier attempt of the same node (same authored node,
- *  or the same loop body across rounds), newest first. */
-function previousNodeTopic(request: V3ExternalDispatchRequest): string | undefined {
-  let attempts;
+/** Topic key of a node: retries, revisits and later loop rounds share it. */
+export function v3NodeTopicKey(attempt: { nodeId: string; loop?: { loopId: string; bodyNodeId: string } }): string {
+  return attempt.loop ? `${attempt.loop.loopId}/${attempt.loop.bodyNodeId}` : attempt.nodeId;
+}
+
+/** Node cards this run has posted, by topic key — written the moment a card
+ *  is sent, so a node whose handoff never got a Sent record (e.g. it ended
+ *  HANDOFF_UNCERTAIN) still keeps a single topic and an up-to-date card. */
+export const V3_HANDOFF_TOPICS_FILE = 'handoff-topics.json';
+
+export function readV3HandoffTopics(runDir: string): Record<string, string> {
   try {
-    attempts = [...foldV3ExternalAttempts(readJournal(join(request.runDir, 'journal.ndjson'))).values()];
+    const raw = JSON.parse(readFileSync(join(runDir, V3_HANDOFF_TOPICS_FILE), 'utf-8')) as unknown;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    return Object.fromEntries(Object.entries(raw as Record<string, unknown>)
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string' && /^om_[A-Za-z0-9_-]{1,128}$/.test(entry[1])));
   } catch {
-    return undefined;
+    return {};
   }
-  const key = (attempt: { nodeId: string; loop?: { loopId: string; bodyNodeId: string } }) =>
-    attempt.loop ? `${attempt.loop.loopId}/${attempt.loop.bodyNodeId}` : attempt.nodeId;
-  const wanted = key(request);
-  for (const attempt of attempts.reverse()) {
-    if (attempt.attemptId === request.attemptId || !attempt.nodeCardMessageId) continue;
-    if (key(attempt) === wanted) return attempt.nodeCardMessageId;
-  }
-  return undefined;
+}
+
+function recordV3HandoffTopic(runDir: string, topicKey: string, nodeCardMessageId: string): void {
+  const topics = readV3HandoffTopics(runDir);
+  if (topics[topicKey] === nodeCardMessageId) return;
+  topics[topicKey] = nodeCardMessageId;
+  const path = join(runDir, V3_HANDOFF_TOPICS_FILE);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(topics, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
+}
+
+/** The node card of an earlier attempt of the same node. */
+function previousNodeTopic(request: V3ExternalDispatchRequest): string | undefined {
+  const wanted = v3NodeTopicKey(request);
+  try {
+    const attempts = [...foldV3ExternalAttempts(readJournal(join(request.runDir, 'journal.ndjson'))).values()];
+    for (const attempt of attempts.reverse()) {
+      if (attempt.attemptId === request.attemptId || !attempt.nodeCardMessageId) continue;
+      if (v3NodeTopicKey(attempt) === wanted) return attempt.nodeCardMessageId;
+    }
+  } catch { /* fall back to the topic record */ }
+  return readV3HandoffTopics(request.runDir)[wanted];
 }
 
 export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3ExternalNodeExecutor {
   const now = deps.now ?? Date.now;
-  // handoff id → where it lives. Rebuilt from the signed registry after a
-  // restart; the journal never needs it.
-  const placements = new Map<string, Pick<WorkflowHandoffBindingPayload, 'targetChatId' | 'publishRoot' | 'targetLarkAppId'>>();
-
-  function placementOf(handoffMessageId: string) {
-    const cached = placements.get(handoffMessageId);
-    if (cached) return cached;
-    const found = lookupWorkflowHandoff({
-      registry: readDispatchRegistryLoose(deps.dataDir),
-      dispatchRoot: handoffMessageId,
-      secret: deps.bindingSecret(),
-    });
-    if (found.kind !== 'workflow' || found.binding.sourceLarkAppId !== deps.selfLarkAppId) return undefined;
-    placements.set(handoffMessageId, found.binding);
-    return found.binding;
-  }
 
   async function dispatch(request: V3ExternalDispatchRequest): Promise<V3ExternalDispatchOutcome> {
     const binding = request.chatBinding;
@@ -237,6 +258,11 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       // Main-topic placement is a later change; nothing is sent for it here.
       return { kind: 'rejected', code: 'COLLABORATION_DENIED', message: `placement "${request.placement}" is not supported yet` };
     }
+    const secret = deps.bindingSecret();
+    const nonce = workflowHandoffNonce(secret, request.idempotency.handoff);
+    if (lookupWorkflowHandoffByNonceRevoked(nonce)) {
+      return { kind: 'rejected', code: 'COLLABORATION_DENIED', message: 'the handoff was revoked before it was sent' };
+    }
 
     // §6.3: re-check the target right before sending anything.
     let mention: V3HandoffCardInput['target'] = { kind: 'self' };
@@ -249,6 +275,15 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
         if (inChat.code === 'UNKNOWN') throw new Error(`target membership unknown: ${inChat.message}`);
         return { kind: 'rejected', code: inChat.code, message: inChat.message };
       }
+      const topics = await deps.targetOpensTopicSessions(chatId, target);
+      if (topics === 'no') {
+        return {
+          kind: 'rejected',
+          code: 'COLLABORATION_DENIED',
+          message: `${deps.botName(target)} 在本群是「整群一个会话」模式，节点话题里的交接无法单独执行`,
+        };
+      }
+      if (topics !== 'yes') throw new Error(`target topic sessions unknown: ${topics.unknown}`);
       try {
         await deps.ensureGrant(chatId, target);
       } catch (err) {
@@ -269,12 +304,13 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       { title: context.title, acceptance: context.acceptanceBySketch.get(sketchId) },
       mention,
       handoffRef,
+      nonce,
     );
     const nodeIndex = context.goalNodeIds.indexOf(request.loop ? request.loop.loopId : request.nodeId);
     const nodeCard = buildV3NodeCard({
       runTitle: context.title,
       runId: request.runId,
-      nodeId: content(WORKFLOW_HANDOFF_ID_PLACEHOLDER).nodeId,
+      nodeId: sketchId,
       ...(nodeIndex >= 0 ? { nodeIndex: nodeIndex + 1, nodeCount: context.goalNodeIds.length } : {}),
       botName: deps.botName(target),
       selfExecuted,
@@ -286,6 +322,7 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
     });
     // Retries, revisits and later loop rounds of a node hand off again in the
     // node's existing topic (§5.4); only its first attempt opens one.
+    const topicKey = v3NodeTopicKey(request);
     const existingTopic = previousNodeTopic(request);
     let nodeCardMessageId: string;
     if (existingTopic) {
@@ -293,25 +330,14 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       await deps.transport.patchCard(nodeCardMessageId, nodeCard).catch(() => undefined);
     } else {
       nodeCardMessageId = await deps.transport.sendCard(chatId, nodeCard, nodeCardUuid);
+      recordV3HandoffTopic(request.runDir, topicKey, nodeCardMessageId);
     }
     request.signal.throwIfAborted();
 
-    if (!selfExecuted) {
-      await recordWorkflowHandoffPending(deps.dataDir, request.idempotency.handoff, {
-        chatId,
-        publishRoot: nodeCardMessageId,
-        targetLarkAppId: target,
-        expiresAt: now() + WORKFLOW_HANDOFF_PENDING_TTL_MS,
-      }, now());
-    }
-    const handoffMessageId = await deps.transport.replyCard(
-      nodeCardMessageId,
-      buildV3HandoffCard(content(WORKFLOW_HANDOFF_ID_PLACEHOLDER)),
-      request.idempotency.handoff,
-    );
-
-    const signed = createWorkflowHandoffBinding(deps.bindingSecret(), {
-      dispatchRoot: handoffMessageId,
+    // Register the binding BEFORE the handoff exists: the receiver recognizes
+    // the handoff by the nonce in the card and never waits for the id.
+    const signed = createWorkflowHandoffBinding(secret, {
+      nonce,
       publishRoot: nodeCardMessageId,
       targetLarkAppId: target,
       targetChatId: chatId,
@@ -325,15 +351,33 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       },
       issuedAt: new Date(now()).toISOString(),
     });
-    await recordWorkflowHandoffBinding(deps.dataDir, request.idempotency.handoff, signed, now());
-    placements.set(handoffMessageId, signed.payload);
+    const recorded = await recordWorkflowHandoffBinding(deps.dataDir, secret, signed);
+    if (recorded.revoked) {
+      return { kind: 'rejected', code: 'COLLABORATION_DENIED', message: 'the handoff was revoked before it was sent' };
+    }
+
+    const planned = planV3HandoffCard(content(WORKFLOW_HANDOFF_ID_PLACEHOLDER), WORKFLOW_HANDOFF_TASK_FILE);
+    if (planned.overflowTask !== undefined) {
+      // The receiver stages it next to the inputs (readWorkflowAttemptInputs).
+      writeFileSync(join(request.attemptDir, WORKFLOW_HANDOFF_TASK_FILE), planned.overflowTask, { mode: 0o600 });
+    }
+    const overflow = planned.overflowTask !== undefined ? { overflowAttachment: WORKFLOW_HANDOFF_TASK_FILE } : {};
+    const handoffMessageId = await deps.transport.replyCard(nodeCardMessageId, planned.card, request.idempotency.handoff);
+    await linkWorkflowHandoffMessage(deps.dataDir, secret, nonce, handoffMessageId);
 
     // Show the real id in the visible commands (best-effort: the receiving
     // daemon substitutes it in the turn either way).
-    await deps.transport.patchCard(handoffMessageId, buildV3HandoffCard(content(handoffMessageId))).catch(() => undefined);
+    await deps.transport.patchCard(handoffMessageId, buildV3HandoffCard({ ...content(handoffMessageId), ...overflow }))
+      .catch(() => undefined);
 
     if (selfExecuted) {
-      const body = v3HandoffBodyText(content(handoffMessageId));
+      // A cancel / timeout / reassignment may have landed while the cards were
+      // in flight; its stop() revoked the binding. Never start a stale turn.
+      request.signal.throwIfAborted();
+      if (lookupWorkflowHandoffByNonceRevoked(nonce)) return { kind: 'sent', handoffMessageId, nodeCardMessageId };
+      const current = classifyExternalAttempt(readJournal(join(request.runDir, 'journal.ndjson')), request.attemptId);
+      if (!current.ok) return { kind: 'sent', handoffMessageId, nodeCardMessageId };
+      const body = v3HandoffBodyText({ ...content(handoffMessageId), ...overflow });
       await deps.startSelfTurn({
         chatId,
         publishRoot: nodeCardMessageId,
@@ -344,12 +388,13 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
           ...(request.instanceId ? { instanceId: request.instanceId } : {}),
           attemptId: request.attemptId,
           handoffMessageId,
+          nonce,
           publishRoot: nodeCardMessageId,
           orchestratorAppId: deps.selfLarkAppId,
           registeredAt: new Date(now()).toISOString(),
         },
-        prompt: `【工作流任务】${context.title} · ${content(handoffMessageId).nodeId}（第 ${request.attemptNumber} 次）\n\n${body}`,
-        sessionTitle: `工作流 ${context.title} · ${content(handoffMessageId).nodeId}`,
+        prompt: `【工作流任务】${context.title} · ${sketchId}（第 ${request.attemptNumber} 次）\n\n${body}`,
+        sessionTitle: `工作流 ${context.title} · ${sketchId}`,
         inputs: request.inputs,
         runDir: request.runDir,
       });
@@ -357,15 +402,26 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
     return { kind: 'sent', handoffMessageId, nodeCardMessageId };
   }
 
+  /** A revocation can precede the binding (stop before the send finished). */
+  function lookupWorkflowHandoffByNonceRevoked(nonce: string): boolean {
+    return isWorkflowHandoffRevoked(readDispatchRegistryLoose(deps.dataDir), nonce, deps.bindingSecret());
+  }
+
   async function probeAcceptance(
     ref: V3ExternalAttemptRef & { handoffMessageId: string },
   ): Promise<V3ExternalAcceptanceProbe> {
-    const placement = placementOf(ref.handoffMessageId);
-    if (!placement) throw new Error(`no workflow handoff binding for ${ref.handoffMessageId}`);
+    const found = lookupWorkflowHandoff({
+      registry: readDispatchRegistryLoose(deps.dataDir),
+      dispatchRoot: ref.handoffMessageId,
+      secret: deps.bindingSecret(),
+    });
+    if (found.kind !== 'workflow' || found.binding.sourceLarkAppId !== deps.selfLarkAppId) {
+      throw new Error(`no workflow handoff binding for ${ref.handoffMessageId}`);
+    }
     const accepted = deps.findAcceptance({
       targetLarkAppId: ref.targetLarkAppId,
-      chatId: placement.targetChatId,
-      publishRoot: placement.publishRoot,
+      chatId: found.binding.targetChatId,
+      publishRoot: found.binding.publishRoot,
       handoffMessageId: ref.handoffMessageId,
     });
     return accepted
@@ -374,11 +430,20 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
   }
 
   async function stop(request: V3ExternalStopRequest): Promise<void> {
-    // Without a handoff id nothing reached a session this host can name.
-    if (!request.handoffMessageId) return;
+    // Before Prepared nothing can have been sent (the engine never calls us
+    // then); the idempotency keys always name the handoff's nonce.
+    if (!request.idempotency) return;
+    const secret = deps.bindingSecret();
+    const nonce = workflowHandoffNonce(secret, request.idempotency.handoff);
+    // Revoke first: the receiver drops a not-yet-delivered handoff, and every
+    // report for it is refused, whatever happens to the stop below.
+    await revokeWorkflowHandoff(deps.dataDir, secret, nonce, request.reason, now());
+    const found = lookupWorkflowHandoffByNonce({ registry: readDispatchRegistryLoose(deps.dataDir), nonce, secret });
+    const handoffMessageId = request.handoffMessageId ?? (found.kind === 'workflow' ? found.messageId : undefined);
     await deps.stopTarget({
       targetLarkAppId: request.targetLarkAppId,
-      handoffMessageId: request.handoffMessageId,
+      nonce,
+      ...(handoffMessageId ? { handoffMessageId } : {}),
       ...(request.sessionId ? { sessionId: request.sessionId } : {}),
       reason: request.reason,
     });

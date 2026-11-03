@@ -76,12 +76,12 @@ async function dagReadyRun(binding: RunChatBinding | undefined, nodes: unknown[]
   await hostArchitect(runDir, architect);
   const dagPath = readGrillState(runDir)!.dagPath!;
   mkdirSync(dirname(dagPath), { recursive: true });
-  writeFileSync(dagPath, JSON.stringify({ runId: 'r', nodes }));
+  writeFileSync(dagPath, JSON.stringify({ schemaVersion: 2, runId: 'r', nodes }));
   return { base, runDir };
 }
 
 /** A probe that records what it was asked and answers from a table. */
-function tableProbe(table: Partial<Record<string, { offline?: boolean; notInChat?: boolean; grantError?: string; unknown?: boolean }>>) {
+function tableProbe(table: Partial<Record<string, { offline?: boolean; notInChat?: boolean; grantError?: string; unknown?: boolean; foldsTopics?: boolean }>>) {
   const asked: string[] = [];
   const probe: V3BotEligibilityProbe = {
     isConfigured: (appId) => BOTS.some((bot) => bot.larkAppId === appId),
@@ -90,6 +90,10 @@ function tableProbe(table: Partial<Record<string, { offline?: boolean; notInChat
       asked.push(`inChat:${appId}`);
       if (table[appId]?.unknown) return { unknown: 'api timeout' };
       return table[appId]?.notInChat ? 'no' : 'yes';
+    },
+    opensTopicSessions: async (appId) => {
+      asked.push(`topics:${appId}`);
+      return table[appId]?.foldsTopics ? 'no' : 'yes';
     },
     ensureGrant: async (appId) => {
       asked.push(`grant:${appId}`);
@@ -199,6 +203,74 @@ describe('approve-dag freezes the node executor', () => {
   });
 });
 
+describe('approve-dag refusals added by review (P2-3 / P2-4 / P2-5)', () => {
+  async function refusal(nodes: unknown[], probe: V3BotEligibilityProbe, extraArgs: string[] = []) {
+    const { base, runDir } = await dagReadyRun(GROUP_TOPIC, nodes);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await cmdWorkflowHost('approve-dag', ['r', '--base-dir', base, ...extraArgs], {
+        loadBots: () => BOTS,
+        resolveChatBinding: () => GROUP_TOPIC,
+        nodeExecutorSwitch: () => 'bot',
+        multiTopicEnabled: () => true,
+        botEligibilityProbe: () => probe,
+        botDisplayName: () => (appId) => `bot(${appId})`,
+      });
+      return { error: undefined as unknown, runDir };
+    } catch (error) {
+      return { error, runDir };
+    } finally {
+      log.mockRestore();
+    }
+  }
+
+  it('P2-3: a normal-group bot that folds topic replies into one session is refused (§6.1 item 7)', async () => {
+    const { probe } = tableProbe({ cli_doc: { foldsTopics: true } });
+    const { error, runDir } = await refusal(NODES, probe);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/write → bot\(cli_doc\)/);
+    expect((error as Error).message).not.toMatch(/verify →/);
+    expect(readRunEnvelope(runDir).kind).toBe('missing');
+  });
+
+  it('P2-4: a node with a directory output is refused, whoever executes it', async () => {
+    const nodes = [
+      { id: 'inspect', type: 'goal', goal: 'inspect', depends: [], inputs: [], outputs: { tree: { path: 'tree', kind: 'directory' } } },
+      { id: 'write', type: 'goal', goal: 'write', bot: 'cli_doc', depends: ['inspect'], inputs: [] },
+    ];
+    const { error, runDir } = await refusal(nodes, tableProbe({}).probe);
+    expect((error as Error).message).toMatch(/inspect → bot\(cli_main\)/);
+    expect((error as Error).message).toContain('tree');
+    expect(readRunEnvelope(runDir).kind).toBe('missing');
+  });
+
+  it('P2-5: --working-dir is refused in bot mode before any probe runs; still frozen when the switch is off', async () => {
+    const probeFactory = vi.fn(() => tableProbe({}).probe);
+    const { base, runDir } = await dagReadyRun(GROUP_TOPIC);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await expect(cmdWorkflowHost('approve-dag', ['r', '--base-dir', base, '--working-dir', '/srv/task'], {
+        loadBots: () => BOTS,
+        resolveChatBinding: () => GROUP_TOPIC,
+        nodeExecutorSwitch: () => 'bot',
+        multiTopicEnabled: () => true,
+        botEligibilityProbe: probeFactory,
+        botDisplayName: () => (appId) => appId,
+      })).rejects.toThrow(/--working-dir/);
+      expect(probeFactory).not.toHaveBeenCalled();
+      expect(readRunEnvelope(runDir).kind).toBe('missing');
+      await cmdWorkflowHost('approve-dag', ['r', '--base-dir', base, '--working-dir', '/srv/task'], {
+        loadBots: () => BOTS,
+        resolveChatBinding: () => GROUP_TOPIC,
+        nodeExecutorSwitch: () => 'ephemeral',
+      });
+      expect(frozenExecutor(readRunEnvelope(runDir))).toBeUndefined();
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
 describe('§6.1 eligibility (items 1–4)', () => {
   it('checks each distinct non-main bot once and reports every affected node', async () => {
     const { probe, asked } = tableProbe({ cli_doc: { grantError: 'receiver daemon offline' } });
@@ -220,8 +292,17 @@ describe('§6.1 eligibility (items 1–4)', () => {
         { nodeId: 'd', larkAppId: 'cli_ghost', code: 'BOT_NOT_CONFIGURED' },
       ],
     });
-    expect(asked.filter((entry) => entry.endsWith(':cli_doc'))).toEqual(['online:cli_doc', 'inChat:cli_doc', 'grant:cli_doc']);
+    expect(asked.filter((entry) => entry.endsWith(':cli_doc'))).toEqual(['online:cli_doc', 'inChat:cli_doc', 'topics:cli_doc', 'grant:cli_doc']);
     expect(asked.some((entry) => entry.endsWith(`:${MAIN}`))).toBe(false);
+  });
+
+  it('P2-3: a bot that folds topic replies is told apart from an undeterminable chat mode', async () => {
+    const folding = tableProbe({ cli_doc: { foldsTopics: true } }).probe;
+    expect(await checkV3BotExecutorEligibility({ orchestratorAppId: MAIN, targets: [{ nodeId: 'a', larkAppId: 'cli_doc' }], probe: folding }))
+      .toEqual({ ok: false, problems: [{ nodeId: 'a', larkAppId: 'cli_doc', code: 'NO_TOPIC_SESSION' }] });
+    const unknown = { ...folding, opensTopicSessions: async () => ({ unknown: 'chat api down' }) };
+    expect(await checkV3BotExecutorEligibility({ orchestratorAppId: MAIN, targets: [{ nodeId: 'a', larkAppId: 'cli_doc' }], probe: unknown }))
+      .toEqual({ ok: false, problems: [{ nodeId: 'a', larkAppId: 'cli_doc', code: 'TOPIC_SESSION_UNKNOWN', detail: 'chat api down' }] });
   });
 
   it('an unknown membership answer refuses (never assumed present)', async () => {

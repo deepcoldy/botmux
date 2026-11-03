@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { BotRun, cleanupBotRuns, expectTerminal, reportDag, reportFiles } from './helpers/v3-external-harness.js';
 import { CHAT, MAIN, handoffWorld } from './helpers/workflow-handoff-harness.js';
 import { createV3NodeCardSync, v3NodeCardStatusFor } from '../src/im/lark/v3-node-card-sync.js';
+import { buildV3NodeCard, v3NodeStalled } from '../src/im/lark/v3-node-card.js';
 import { foldV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
 import { recordExternalStalled, reportExternalBlocked } from '../src/workflows/v3/external-control.js';
 import { requestV3RunCancel } from '../src/workflows/v3/daemon-run.js';
@@ -68,6 +69,70 @@ describe('node card follows the journal', () => {
     expect(status()).toMatchObject({ kind: 'done' });
     expect(patches).toHaveLength(4);
     expect(new Set(patches.map((patch) => patch.card)).size).toBe(4);
+  });
+
+  it('P3-8: a later turn clears "stopped without submitting"; the card shows a start time, not a stale elapsed', async () => {
+    const { run, patches, sync } = await started('card-active');
+    const attempt = run.openAttempt('write');
+    run.accept(attempt.attemptId, 'sess-a');
+    run.clock.t += 60_000;
+    recordExternalStalled(run.runDir, { attemptId: attempt.attemptId, sessionId: 'sess-a' }, run.ctx());
+    const stalledAt = run.clock.t;
+    const syncWith = (activeAt?: number) => createV3NodeCardSync({
+      baseDir: run.base,
+      selfLarkAppId: MAIN,
+      loadRun: () => ({ dag: run.dag, nodeExecutor: 'bot', title: 'report' }),
+      patchCard: async (id, card) => { patches.push({ id, card }); },
+      botName: (appId) => appId,
+      activity: () => (activeAt !== undefined ? { activeAt } : {}),
+      now: () => run.clock.t,
+    });
+    const stalledStatus = v3NodeCardStatusFor(run.openAttempt('write'), run.events(), 'running');
+    expect(v3NodeStalled(stalledStatus as any)).toBe(true);
+    const resumed = v3NodeCardStatusFor(run.openAttempt('write'), run.events(), 'running', undefined, stalledAt + 1);
+    expect(v3NodeStalled(resumed as any)).toBe(false);
+
+    // A card synced long after acceptance shows the same text as one synced
+    // right away: no elapsed figure goes stale between state changes.
+    const early = syncWith(stalledAt + 1);
+    await early('card-active');
+    const cardEarly = patches.at(-1)!.card;
+    run.clock.t += 6 * 3600_000;
+    const late = syncWith(stalledAt + 1);
+    await late('card-active');
+    expect(patches.at(-1)!.card).toBe(cardEarly);
+    void sync;
+  });
+
+  it('P3-10: overlapping syncs patch in journal order — the last patch shows the latest state', async () => {
+    const { run } = await started('card-overlap');
+    const attempt = run.openAttempt('write');
+    run.accept(attempt.attemptId, 'sess-a');
+    const patched: string[] = [];
+    let releaseFirst: (() => void) | undefined;
+    const sync = createV3NodeCardSync({
+      baseDir: run.base,
+      selfLarkAppId: MAIN,
+      loadRun: () => ({ dag: run.dag, nodeExecutor: 'bot', title: 'report' }),
+      patchCard: async (_id, card) => {
+        if (!releaseFirst && patched.length === 0) await new Promise<void>((resolve) => { releaseFirst = resolve; });
+        patched.push(card);
+      },
+      botName: (appId) => appId,
+      now: () => run.clock.t,
+    });
+    const first = sync('card-overlap'); // reads "running", its patch is slow
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(await run.submit(attempt.attemptId, { ...reportFiles(), sessionId: 'sess-a' })).toMatchObject({ ok: true });
+    const second = sync('card-overlap'); // must not overtake the first
+    releaseFirst!();
+    await Promise.all([first, second]);
+    const finalCard = patched.at(-1)!;
+    const doneCard = buildV3NodeCard({
+      runTitle: 'report', runId: 'card-overlap', nodeId: 'write', nodeIndex: 1, nodeCount: 1, botName: 'cli_a',
+      selfExecuted: false, attemptNumber: 1, status: v3NodeCardStatusFor([...foldV3ExternalAttempts(run.events()).values()].at(-1)!, run.events(), 'done'), upstream: [], now: run.clock.t,
+    });
+    expect(finalCard).toBe(doneCard);
   });
 
   it('a bot-reported block shows its reason; a timeout shows as such', async () => {

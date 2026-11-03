@@ -14,6 +14,7 @@ import type { LarkAttachment, WorkflowNodeSessionMarker } from '../types.js';
 
 export function workflowNodeMarkerFromBinding(
   binding: WorkflowHandoffBindingPayload,
+  handoffMessageId: string,
   registeredAt: Date = new Date(),
 ): WorkflowNodeSessionMarker {
   return {
@@ -21,7 +22,8 @@ export function workflowNodeMarkerFromBinding(
     nodeId: binding.workflow.nodeId,
     ...(binding.workflow.instanceId ? { instanceId: binding.workflow.instanceId } : {}),
     attemptId: binding.workflow.attemptId,
-    handoffMessageId: binding.dispatchRoot,
+    handoffMessageId,
+    nonce: binding.nonce,
     publishRoot: binding.publishRoot,
     orchestratorAppId: binding.sourceLarkAppId,
     registeredAt: registeredAt.toISOString(),
@@ -100,17 +102,30 @@ export function stageWorkflowNodeInputs(input: {
   return { attachments, skipped };
 }
 
-/** Read the attempt's resolved inputs (`<attemptDir>/inputs.json`). */
+/** The full handoff text, written next to the attempt when it does not fit
+ *  the card (the card says so; the receiver stages it as an attachment). */
+export const WORKFLOW_HANDOFF_TASK_FILE = 'handoff-task.md';
+
+/** Read the attempt's resolved inputs (`<attemptDir>/inputs.json`), plus the
+ *  overflow handoff text when the card could not carry all of it. */
 export function readWorkflowAttemptInputs(runDir: string, attemptId: string): GoalInputs | undefined {
   const root = resolve(runDir);
   const attemptDir = resolve(root, attemptId);
   if (!insideRoot(root, attemptDir)) return undefined;
+  let parsed: GoalInputs;
   try {
-    const parsed = JSON.parse(readFileSync(join(attemptDir, 'inputs.json'), 'utf-8')) as GoalInputs;
-    return parsed && Array.isArray(parsed.inputs) ? parsed : undefined;
+    parsed = JSON.parse(readFileSync(join(attemptDir, 'inputs.json'), 'utf-8')) as GoalInputs;
+    if (!parsed || !Array.isArray(parsed.inputs)) return undefined;
   } catch {
     return undefined;
   }
+  const task = join(attemptDir, WORKFLOW_HANDOFF_TASK_FILE);
+  try {
+    if (lstatSync(task).isFile()) {
+      return { ...parsed, inputs: [...parsed.inputs, { from: 'handoff', name: WORKFLOW_HANDOFF_TASK_FILE, path: task, kind: 'markdown' }] };
+    }
+  } catch { /* no overflow text */ }
+  return parsed;
 }
 
 export interface HandoffAcceptanceSession {

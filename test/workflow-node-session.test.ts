@@ -33,6 +33,8 @@ import {
 } from '../src/core/workflow-node-session.js';
 import { WORKFLOW_HANDOFF_ID_PLACEHOLDER } from '../src/im/lark/v3-node-card.js';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
+import { scrubSessionTurnMarkerEnv } from '../src/utils/child-env.js';
+import { buildBotmuxEnvAssignments } from '../src/adapters/backend/tmux-backend.js';
 
 describe('node session marker suppresses workflow injection', () => {
   beforeEach(() => { process.env.BOTMUX_WORKFLOW_ENABLED = 'true'; });
@@ -87,6 +89,20 @@ describe('node session marker suppresses workflow injection', () => {
     }
     // Only the workflow family is removed.
     expect(node).toEqual(ordinary.filter((name) => !WORKFLOW_FEATURE_SKILL_NAMES.includes(name)));
+  });
+});
+
+describe('P2-6: the node marker never crosses a process boundary by accident', () => {
+  it('daemon / supervisor / dashboard boot scrubs an inherited marker', () => {
+    const env: NodeJS.ProcessEnv = { [WORKFLOW_NODE_SESSION_ENV]: '1', PATH: '/usr/bin' };
+    scrubSessionTurnMarkerEnv(env);
+    expect(env[WORKFLOW_NODE_SESSION_ENV]).toBeUndefined();
+    expect(env.PATH).toBe('/usr/bin');
+  });
+
+  it('a tmux / zellij pane receives it from a node session and never from an ordinary one', () => {
+    expect(buildBotmuxEnvAssignments({ [WORKFLOW_NODE_SESSION_ENV]: '1' })).toContain(`${WORKFLOW_NODE_SESSION_ENV}=1`);
+    expect(buildBotmuxEnvAssignments({}).some((arg) => arg.startsWith(`${WORKFLOW_NODE_SESSION_ENV}=`))).toBe(false);
   });
 });
 

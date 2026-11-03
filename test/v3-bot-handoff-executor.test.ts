@@ -8,19 +8,33 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 import {
   BotRun,
+  FakeExecutor,
   cleanupBotRuns,
   expectAwaitingExternal,
   expectTerminal,
   reportDag,
 } from './helpers/v3-external-harness.js';
-import { CHAT, MAIN, SECRET, handoffWorld, orchestratorEvent } from './helpers/workflow-handoff-harness.js';
-import { lookupWorkflowHandoff, readDispatchRegistryLoose } from '../src/core/workflow-handoff-binding.js';
+import { CHAT, MAIN, SECRET, handoffWorld, nonceOf, orchestratorEvent } from './helpers/workflow-handoff-harness.js';
+import {
+  lookupWorkflowHandoff,
+  lookupWorkflowHandoffByNonce,
+  readDispatchRegistryLoose,
+  resolveInboundWorkflowHandoff,
+} from '../src/core/workflow-handoff-binding.js';
+import { V3_HANDOFF_CARD_MAX_BYTES } from '../src/im/lark/v3-node-card.js';
+import { readWorkflowAttemptInputs } from '../src/core/workflow-node-session.js';
+import { appendEvent } from '../src/workflows/v3/journal.js';
+import { V3_HANDOFF_IDEMPOTENCY_WINDOW_MS } from '../src/workflows/v3/external-executor.js';
+import { requestV3RunCancel } from '../src/workflows/v3/daemon-run.js';
 import { requestV3Retry } from '../src/workflows/v3/daemon-run.js';
 import { reportExternalBlocked } from '../src/workflows/v3/external-control.js';
 import { validateDag } from '../src/workflows/v3/dag.js';
+import { foldV3ExternalAttempts } from '../src/workflows/v3/external-attempt-ledger.js';
+import type { V3ExternalDispatchRequest } from '../src/workflows/v3/external-executor.js';
 
 afterEach(() => cleanupBotRuns());
 
@@ -62,13 +76,20 @@ describe('handoff to another bot (topic placement)', () => {
     expect(world.grants).toEqual([{ chatId: CHAT, target: 'cli_a' }]);
   });
 
-  it('registers a host-signed binding keyed by the handoff id', async () => {
+  it('registers a host-signed binding before the send and links the handoff id after it', async () => {
     const run = new BotRun(reportDag('h-binding'));
     const world = handoffWorld();
+    let atReply: ReturnType<typeof lookupWorkflowHandoffByNonce> | undefined;
+    world.lark.onReply = () => {
+      atReply = lookupWorkflowHandoffByNonce({ registry: readDispatchRegistryLoose(world.dataDir), nonce: nonceOf(run.openAttempt('write')), secret: SECRET });
+    };
     await drive(run, world);
     const attempt = run.openAttempt('write');
+    // The card carries the nonce the binding was registered under.
+    expect(cardText(world.lark.replies[0]!.card)).toContain(nonceOf(attempt));
+    expect(atReply).toMatchObject({ kind: 'workflow', revoked: false });
+    expect(atReply).not.toHaveProperty('messageId');
     const registry = readDispatchRegistryLoose(world.dataDir);
-    expect(Object.keys(registry)).toEqual([attempt.handoffMessageId]);
     const found = lookupWorkflowHandoff({ registry, dispatchRoot: attempt.handoffMessageId!, secret: SECRET });
     expect(found).toMatchObject({
       kind: 'workflow',
@@ -95,7 +116,8 @@ describe('handoff to another bot (topic placement)', () => {
     expect(world.lark.replies).toHaveLength(1);
     const attempt = run.openAttempt('write');
     expect(attempt).toMatchObject({ phase: 'sent', handoffMessageId: world.lark.replies[0]!.id });
-    expect(Object.keys(readDispatchRegistryLoose(world.dataDir))).toEqual([attempt.handoffMessageId]);
+    expect(lookupWorkflowHandoff({ registry: readDispatchRegistryLoose(world.dataDir), dispatchRoot: attempt.handoffMessageId!, secret: SECRET }))
+      .toMatchObject({ kind: 'workflow', messageId: attempt.handoffMessageId });
   });
 
   it.each([
@@ -143,7 +165,7 @@ describe('handoff to another bot (topic placement)', () => {
     run.accept(attempt.attemptId, 'sess-a');
     run.clock.t = run.openAttempt('write').deadlineAt!;
     expect(expectTerminal(await drive(run, world)).runStatus).toBe('blocked');
-    expect(world.stops).toEqual([{ targetLarkAppId: 'cli_a', handoffMessageId: attempt.handoffMessageId, sessionId: 'sess-a', reason: 'timeout' }]);
+    expect(world.stops).toEqual([{ targetLarkAppId: 'cli_a', nonce: nonceOf(attempt), handoffMessageId: attempt.handoffMessageId, sessionId: 'sess-a', reason: 'timeout' }]);
   });
 
   it('a retry hands off again inside the node\'s existing topic', async () => {
@@ -189,8 +211,8 @@ describe('the main bot executes its own node (§6.5)', () => {
     });
     expect(turn.prompt).toContain('summarize the thread');
     expect(turn.prompt).toContain(`--dispatch-root ${attempt.handoffMessageId}`);
-    // No receiver event exists for a bot's own message: no pending marker.
-    expect(Object.keys(readDispatchRegistryLoose(world.dataDir))).toEqual([attempt.handoffMessageId]);
+    expect(lookupWorkflowHandoff({ registry: readDispatchRegistryLoose(world.dataDir), dispatchRoot: attempt.handoffMessageId!, secret: SECRET }))
+      .toMatchObject({ kind: 'workflow', binding: { targetLarkAppId: MAIN } });
   });
 
   it('acceptance reported by the in-process session settles through the event route', async () => {
@@ -206,3 +228,126 @@ describe('the main bot executes its own node (§6.5)', () => {
     expect(run.openAttempt('sum')).toMatchObject({ phase: 'accepted', sessionId: 'self-session' });
   });
 });
+
+describe('review regressions (PR 5a adversarial review)', () => {
+  /** What the target daemon decides for the delivered handoff card. */
+  const receiverView = (world: ReturnType<typeof handoffWorld>, run: BotRun, overrides: Record<string, unknown> = {}) => {
+    const reply = world.lark.replies.at(-1)!;
+    const attempt = [...readJournalAttempts(run)].at(-1)!;
+    return resolveInboundWorkflowHandoff({
+      registry: readDispatchRegistryLoose(world.dataDir),
+      secret: () => SECRET,
+      messageId: reply.id,
+      content: cardText(reply.card),
+      chatId: CHAT,
+      threadRootId: reply.root,
+      selfLarkAppId: attempt.targetLarkAppId!,
+      ...overrides,
+    });
+  };
+
+  it('P2-1a: after a run cancel the delivered handoff is revoked — the receiver drops it', async () => {
+    const run = new BotRun(reportDag('rv-p21a'));
+    const world = handoffWorld();
+    await drive(run, world);
+    expect(receiverView(world, run)).toMatchObject({ kind: 'handoff' });
+    requestV3RunCancel(run.base, run.dag.runId, { by: 'ou_owner' });
+    expect(expectTerminal(await drive(run, world)).runStatus).toBe('cancelled');
+    expect(world.stops).toEqual([expect.objectContaining({ reason: 'runCancelled' })]);
+    expect(receiverView(world, run)).toMatchObject({ kind: 'revoked' });
+  });
+
+  it('P2-1b: HANDOFF_NOT_ACCEPTED revokes the handoff', async () => {
+    const run = new BotRun(reportDag('rv-p21b'));
+    const world = handoffWorld();
+    await drive(run, world);
+    run.clock.t = run.openAttempt('write').acceptDeadlineAt!;
+    expect(expectTerminal(await drive(run, world)).runStatus).toBe('blocked');
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'HANDOFF_NOT_ACCEPTED' })]);
+    expect(receiverView(world, run)).toMatchObject({ kind: 'revoked' });
+  });
+
+  it('P2-1c: a cancel landing during the self handoff send never starts the turn', async () => {
+    const dag = validateDag({ schemaVersion: 2, runId: 'rv-p21c', nodes: [{ id: 'sum', type: 'goal', goal: 'g', timeoutSec: 600 }] });
+    const run = new BotRun(dag);
+    const world = handoffWorld();
+    world.lark.onReply = () => {
+      world.lark.onReply = undefined;
+      requestV3RunCancel(run.base, run.dag.runId, { by: 'ou_owner' });
+    };
+    await drive(run, world);
+    for (let i = 0; i < 3 && run.snap().runStatus !== 'cancelled'; i++) await drive(run, world);
+    expect(run.snap().runStatus).toBe('cancelled');
+    expect(world.calls).not.toContain('startSelfTurn');
+    expect(world.selfTurns).toEqual([]);
+  });
+
+  it('P2-1c: a journal already cancelled before the self turn starts is honoured even without an abort signal', async () => {
+    const dag = validateDag({ schemaVersion: 2, runId: 'rv-p21c-journal', nodes: [{ id: 'sum', type: 'goal', goal: 'g', timeoutSec: 600 }] });
+    const run = new BotRun(dag);
+    const world = handoffWorld();
+    world.lark.onReply = () => {
+      world.lark.onReply = undefined;
+      appendEvent(run.journalPath, { type: 'runCancelRequested', cancelRequestId: 'c-1', by: 'ou_owner' });
+    };
+    await world.executor.dispatch({
+      ...(await firstDispatchRequest(run, dag)),
+      signal: new AbortController().signal,
+    });
+    expect(world.selfTurns).toEqual([]);
+  });
+
+  it('P2-3: a target that folds node-topic replies into its group session is refused before anything is sent', async () => {
+    const run = new BotRun(reportDag('rv-p23'));
+    const world = handoffWorld();
+    world.foldsTopics.add('cli_a');
+    expect(expectTerminal(await drive(run, world)).runStatus).toBe('blocked');
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'COLLABORATION_DENIED' })]);
+    expect(world.lark.sent).toEqual([]);
+  });
+
+  it('P3-7: a node whose handoff never got through keeps one topic; the retry reuses and updates its card', async () => {
+    const run = new BotRun(reportDag('rv-p37'));
+    const world = handoffWorld();
+    world.lark.failReplies = 1_000;
+    await drive(run, world);
+    run.clock.t = run.openAttempt('write').preparedAt! + V3_HANDOFF_IDEMPOTENCY_WINDOW_MS;
+    expect(expectTerminal(await drive(run, world)).runStatus).toBe('blocked');
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'HANDOFF_UNCERTAIN' })]);
+    world.lark.failReplies = 0;
+    expect(requestV3Retry(run.base, run.dag.runId, { nodeId: 'write' })).toMatchObject({ kind: 'requested' });
+    await drive(run, world);
+    expect(world.lark.sent).toHaveLength(1);
+    expect(world.lark.replies.map((reply) => reply.root)).toEqual([world.lark.sent[0]!.id]);
+    expect(world.lark.patches.some((patch) => patch.id === world.lark.sent[0]!.id)).toBe(true);
+  });
+
+  it('P3-9b: a long Chinese goal keeps the card within the byte budget and travels in full as an attachment', async () => {
+    const goal = '请审阅全部改动并写出风险报告，'.repeat(2_000);
+    const run = new BotRun(reportDag('rv-p39b', { goal }));
+    const world = handoffWorld();
+    await drive(run, world);
+    const attempt = run.openAttempt('write');
+    for (const reply of world.lark.replies) expect(Buffer.byteLength(reply.card)).toBeLessThanOrEqual(V3_HANDOFF_CARD_MAX_BYTES);
+    for (const patch of world.lark.patches) expect(Buffer.byteLength(patch.card)).toBeLessThanOrEqual(V3_HANDOFF_CARD_MAX_BYTES);
+    const inputs = readWorkflowAttemptInputs(run.runDir, attempt.attemptId)!;
+    const task = inputs.inputs.find((input) => input.from === 'handoff')!;
+    expect(task).toBeDefined();
+    expect(readFileSync(task.path, 'utf-8')).toContain(goal);
+  });
+});
+
+function readJournalAttempts(run: BotRun) {
+  return foldV3ExternalAttempts(run.events()).values();
+}
+
+/** The dispatch request the runtime would build for the first attempt. */
+async function firstDispatchRequest(run: BotRun, dag: ReturnType<typeof validateDag>) {
+  const captured: V3ExternalDispatchRequest[] = [];
+  const probe = new FakeExecutor();
+  probe.onDispatch = (req) => { captured.push(req); throw new Error('capture only'); };
+  await run.drive(probe, { opts: { chatBinding: BINDING } });
+  const req = captured[0]!;
+  expect(req.node.id).toBe(dag.nodes[0]!.id);
+  return req;
+}

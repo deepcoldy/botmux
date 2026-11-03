@@ -64,6 +64,7 @@ function policy(overrides: Partial<V3NodeExecutorPolicy> = {}, notInChat: string
       isConfigured: () => true,
       isDaemonOnline: () => true,
       inChat: async (appId) => (notInChat.includes(appId) ? 'no' : 'yes'),
+      opensTopicSessions: async () => 'yes',
       ensureGrant: async () => {},
     }),
     nameOf: (appId) => `bot(${appId})`,
@@ -123,6 +124,20 @@ describe('Saved Workflow materialization — node executor', () => {
   it('an ineligible node bot refuses before anything is materialized', async () => {
     await expect(instantiate({ nodeExecutorPolicy: policy({}, ['cli_doc']) }))
       .rejects.toMatchObject({ code: 'executor_ineligible', message: expect.stringMatching(/write → bot\(cli_doc\)/) });
+    expect(existsSync(runsDir) ? readdirSync(runsDir).filter((name) => !name.startsWith('.')) : []).toEqual([]);
+  });
+
+  it('P2-4: a revision with a directory output is refused before anything is materialized', async () => {
+    const draft = revision();
+    (draft.dagTemplate.nodes[1] as any).outputs = { site: { path: 'site', kind: 'directory' } };
+    draft.safety.gateDigest = computeSavedWorkflowGateDigest(draft.dagTemplate);
+    const created = await createSavedWorkflow(dataDir, {
+      displayName: '站点', owner: OWNER, scope: { kind: 'chat', chatId: 'oc_a' }, revision: draft, publish: true,
+      workflowId: 'wf_2234567890abcdef1234567890abcdef',
+    });
+    await expect(instantiatePublishedSavedWorkflow({
+      dataDir, ref: created.metadata.workflowId, context: context(), bots: BOTS, baseDir: runsDir, nodeExecutorPolicy: policy(),
+    })).rejects.toMatchObject({ code: 'executor_ineligible', message: expect.stringContaining('site') });
     expect(existsSync(runsDir) ? readdirSync(runsDir).filter((name) => !name.startsWith('.')) : []).toEqual([]);
   });
 
