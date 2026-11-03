@@ -8,7 +8,7 @@ import { parseAskBody } from '../src/core/ask-api.js';
 import { parseAskFormValues } from '../src/core/ask-form.js';
 import { buildAskCard, handleAskCardAction } from '../src/im/lark/ask-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from '../src/im/lark/turn-reply-ask-elements.js';
-import { _resetForTest, _getPending, registerAsk, setCardDispatcher, setCanTalkChecker, submitAsk, submitAskForm, submitCustomReply, submitAskFromDesktop, toggleAsk, registerHostAsk } from '../src/core/ask-broker.js';
+import { _resetForTest, _getPending, applyAskForm, registerAsk, setCardDispatcher, setCanTalkChecker, submitAsk, submitAskForm, submitCustomReply, submitAskFromDesktop, toggleAsk, registerHostAsk } from '../src/core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from '../src/core/explicit-ask-continuation.js';
 import type { AskQuestion, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
 
@@ -87,6 +87,16 @@ describe('form schema and callback validation', () => {
 });
 
 describe('production broker and card callback', () => {
+  it('keeps native input forms isolated from per-question custom callbacks', async () => {
+    const result = registerAsk(base); await vi.advanceTimersByTimeAsync(0);
+    const form = JSON.parse(buildAskCard(sent));
+    expect(JSON.stringify(form)).toContain('ask_form_submit');
+    expect(JSON.stringify(form)).not.toContain('custom_0');
+    expect(applyAskForm({ ...args(), revision: 0, fields: { custom_0: 'override' }, toggle: { questionIndex: 0, key: 'yes' } })).toBe('stale');
+    expect(_getPending(sent.askId)?.settled).toBe(false);
+    expect(submitAskForm({ ...args(), values })).toBe('accepted');
+    expect(await result).toMatchObject({ answers: [['no'], [], []], inputs: [null, '0.5', ' extra details '] });
+  });
   it('rejects coerced input types and preserves text whitespace', () => {
     expect(parseAskQuestions([{ prompt: 'Text', options: [], multiSelect: false, input: { type: ['text'] } }])).toBe('bad_input');
     const qs: AskQuestion[] = [{ prompt: 'Text', options: [], multiSelect: false, input: { type: 'text' } }];
