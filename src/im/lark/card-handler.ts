@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { MODEL_SLUG_PATTERN, sessionModelChoices, buildSessionModelPickerCard } from './session-model-picker.js';
 /**
  * Lark card action handler — processes button clicks and dropdown selections
  * from Feishu interactive cards.
@@ -88,9 +90,6 @@ import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js'
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { staticModelChoices, detectModels, mergeModelChoices } from '../../services/model-catalog.js';
-import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.js';
-import { selectionKeyForBot } from '../../setup/cli-selection.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
 import { setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
@@ -180,8 +179,10 @@ export interface CardHandlerDeps {
       senderIsBot: boolean;
       messageId: string;
       replyRootId?: string;
+      turnId?: string;
+      onDelivered?: () => void;
     },
-  ) => void;
+  ) => boolean | void;
   /** Signed single-use button. The handler admits the clicker and returns a
    *  continuation that starts the turn after the card callback is acked. */
   cardClickTurn?: (input: {
@@ -1359,49 +1360,6 @@ async function cardReplyOptions(
 
 // ── Reply-card overflow action menu (reply_card_menu) helpers ──────────────
 
-const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
-
-/**
- * Resolve the model-catalogue selection for THIS session's frozen CLI shape.
- * The catalogue functions take a "selection key" (cliId + wrapperCli +
- * launchMode), not a bare cliId — probing a `ttadk codex` session with the
- * bare 'codex' key returns the native codex list instead of the gateway's.
- * Probe inputs (custom executable, injected env, runtime cache identity) are
- * derived through the same helper as the dashboard endpoint so the menu sees
- * exactly the runtime the session is running.
- */
-function resolveReplyMenuModelCatalogue(ds: DaemonSession): {
-  key: string;
-  staticChoices: readonly string[];
-  detect: () => Promise<readonly string[] | null>;
-} {
-  const cliId = sessionCliId(ds);
-  const key = selectionKeyForBot(cliId, ds.session.wrapperCli, ds.session.cliLaunchMode);
-  const probe = modelCatalogProbeContext(key, getBot(ds.larkAppId).config, process.env);
-  return {
-    key,
-    staticChoices: staticModelChoices(key),
-    detect: () => detectModels(key, {
-      runtimeContext: probe.runtimeContext,
-      probeEnv: probe.probeEnv,
-      runtimeExecutable: probe.runtimeExecutable,
-      adapterFactory: requestedCliId => createCliAdapterSync(
-        requestedCliId,
-        requestedCliId === probe.cliId ? probe.runtimeExecutable : undefined,
-      ),
-    }),
-  };
-}
-
-/** One accept rule shared by the picker render and the submission whitelist:
- * live non-empty wins, otherwise the curated static list. Building both from
- * this keeps the offered options and the inject whitelist on identical terms. */
-async function replyMenuModelChoices(ds: DaemonSession): Promise<readonly string[]> {
-  const catalogue = resolveReplyMenuModelCatalogue(ds);
-  const live = await catalogue.detect().catch(() => null);
-  return mergeModelChoices(catalogue.staticChoices, live).models;
-}
-
 type SessionReplyFn = (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
 
 function replyMenuBinding(ds: DaemonSession, rootId: string): Record<string, string> {
@@ -1528,41 +1486,6 @@ function buildMenuCloseConfirmCard(ds: DaemonSession, rootId: string, loc: Local
   });
 }
 
-function buildMenuModelPickerCard(
-  ds: DaemonSession,
-  rootId: string,
-  models: readonly string[],
-  currentModel: string | undefined,
-  loc: Locale,
-): string {
-  // Only render slugs the inject path would accept: a live-detected catalogue
-  // entry with exotic characters must not render into a dead option.
-  const safeModels = models.filter(model => MODEL_SLUG_PATTERN.test(model));
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    elements: [
-      { tag: 'markdown', content: `**${t('card.reply_actions.model_title', undefined, loc)}**` },
-      {
-        tag: 'action',
-        actions: [{
-          tag: 'select_static',
-          placeholder: { tag: 'plain_text', content: currentModel || t('card.reply_actions.model', undefined, loc) },
-          ...(currentModel && safeModels.includes(currentModel) ? { initial_option: currentModel } : {}),
-          options: safeModels.slice(0, 50).map(model => ({
-            text: {
-              tag: 'plain_text',
-              content: model === currentModel
-                ? `${model} ${t('card.reply_actions.model_current', undefined, loc)}`
-                : model,
-            },
-            value: model,
-          })),
-          value: { action: 'reply_model_pick', ...replyMenuBinding(ds, rootId) },
-        }],
-      },
-    ],
-  });
-}
 
 function cardClickTurnToastKey(reason: string): string {
   switch (reason) {
@@ -4890,9 +4813,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return {
           toast: { type: 'info', content: t('card.reply_actions.model_loading', undefined, loc) },
           afterAck: async () => {
-            const models = await replyMenuModelChoices(pickerDs);
+            const models = await sessionModelChoices(pickerDs);
             const cardJson = models.length > 0
-              ? buildMenuModelPickerCard(
+              ? buildSessionModelPickerCard(
                 pickerDs,
                 rootId,
                 models,
@@ -4911,12 +4834,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // Model pick from the reply-card menu. Passthrough `/model <slug>` into the
     // live session, gated like compact_session plus an idle boundary and a
     // strict slug whitelist (PTY injection must never carry free text).
-    if (actionType === 'reply_model_pick') {
+    if (actionType === 'reply_model_pick' || actionType === 'session_model_pick') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.reply_actions.session_gone', undefined, loc) } };
       }
-      if (getBot(ds.larkAppId).config.replyCardActions !== true) {
+      if (actionType === 'reply_model_pick' && getBot(ds.larkAppId).config.replyCardActions !== true) {
         return { toast: { type: 'warning', content: t('card.reply_actions.disabled', undefined, loc) } };
       }
       if (isSessionTransferring(ds)) {
@@ -4939,17 +4862,57 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // Same catalogue terms the picker offered (same selection key + live
       // wins/static fallback); a slug not in the current list is refused even
       // if the 10-minute probe cache flipped since the picker rendered.
-      const allowed = new Set<string>(await replyMenuModelChoices(ds));
+      const worker = ds.worker;
+      const workerGeneration = ds.workerGeneration;
+      const sessionWorkerGeneration = ds.session.workerGeneration;
+      const cliId = sessionCliId(ds);
+      const allowed = new Set<string>(await sessionModelChoices(ds));
       if (!allowed.has(slug)) {
         return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
       }
-      deps.deliverPassthroughCommand(ds, `/model ${slug}`, {
-        anchor: sessionAnchorId(ds),
-        senderOpenId: operatorOpenId,
-        senderIsBot: false,
-        messageId: cardMessageId ?? `reply-model-${Date.now()}`,
-        replyRootId: rootId,
-      });
+      // Model discovery can yield to a business turn, permission revocation or
+      // session replacement. Revalidate immediately before the synchronous send.
+      if (getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) !== ds
+        || ds.session.status !== 'active' || ds.worker !== worker
+        || ds.workerGeneration !== workerGeneration || ds.session.workerGeneration !== sessionWorkerGeneration
+        || !ds.worker || ds.worker.killed
+        || !validatePrincipalLaneCardActionAuthority(ds, cardMessageId, activeSessions)) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.session_gone', undefined, loc) } };
+      }
+      if (!operatorOpenId || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+        return { toast: { type: 'warning', content: t('daemon.cmd_allowed_users_only', { cmd: '/models' }, loc) } };
+      }
+      if (actionType === 'reply_model_pick' && getBot(ds.larkAppId).config.replyCardActions !== true) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.disabled', undefined, loc) } };
+      }
+      if (isSessionTransferring(ds) || !sessionAcceptsDirectCommand(ds)) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_busy', undefined, loc) } };
+      }
+      if (sessionCliId(ds) !== cliId
+        || cliHasNoRawPassthroughSurface(cliId, { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
+      }
+      let delivered = false;
+      try {
+        const accepted = deps.deliverPassthroughCommand(ds, `/model ${slug}`, {
+          anchor: sessionAnchorId(ds),
+          senderOpenId: operatorOpenId,
+          senderIsBot: false,
+          messageId: cardMessageId ?? `reply-model-${Date.now()}`,
+          // Each click is a distinct command, even when reusing a picker card.
+          turnId: `${cardMessageId ?? 'model'}#model-${randomUUID()}`,
+          // A chat-scope anchor is a chat id, not a replyable message id.
+          replyRootId: ds.scope === 'chat' ? undefined : rootId,
+          onDelivered: () => { delivered = true; },
+        });
+        // Legacy injected dependencies return void; the daemon returns a boolean.
+        delivered ||= accepted !== false;
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] model command delivery failed: ${String(err)}`);
+      }
+      if (!delivered) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_failed', undefined, loc) } };
+      }
       logger.info(`[${tag(ds)}] reply-card menu: /model ${slug} passthrough sent`);
       return { toast: { type: 'success', content: t('card.reply_actions.model_sent', { model: slug }, loc) } };
     }

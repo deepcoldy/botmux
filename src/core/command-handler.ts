@@ -1,3 +1,4 @@
+import { showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -1869,6 +1870,15 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/models': {
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
+        await showSessionModelPicker(ds, rootId, message.senderId, message.senderUnionId, sessionReply, loc);
+        break;
+      }
+
       case '/queue': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -6760,6 +6770,7 @@ export async function handleCommand(
           t('help.repo_wt', undefined, loc),
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.models', undefined, loc),
           t('help.retry', undefined, loc),
           t('help.rewind', undefined, loc),
           t('help.idlecompact', undefined, loc),

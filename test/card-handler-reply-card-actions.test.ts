@@ -159,6 +159,8 @@ vi.mock('../src/services/model-catalog.js', () => ({
   runtimeExecutableForBotSelection: () => undefined,
 }));
 
+import { showSessionModelPicker } from '../src/im/lark/session-model-picker.js';
+import { handleCommand } from '../src/core/command-handler.js';
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { setTerminalProxyPort, resetTerminalProxy } from '../src/core/terminal-url.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
@@ -472,6 +474,152 @@ describe('reply_model_pick action', () => {
     const deliver = vi.fn();
     const result = await handleCardAction(pickData('sonnet'), depsWith(ds, deliver), LARK_APP_ID);
     expect(result).toBeUndefined();
+    expect(deliver).not.toHaveBeenCalled();
+  });
+});
+
+describe('/models shortcut', () => {
+  it('opens a session-bound picker through the real command handler while reply menus are disabled', async () => {
+    const ds = makeDs({ activeModel: 'sonnet' });
+    const deps = depsWith(ds);
+    await handleCommand('/models', ROOT, { messageId: 'om_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.value).toMatchObject({ action: 'session_model_pick', session_id: SID, lark_app_id: LARK_APP_ID, root_id: ROOT, chat_id: 'oc_chat' });
+    expect(select.initial_option).toBe('sonnet');
+    expect(select.options.map((o: any) => o.value)).toContain('sonnet');
+    expect(ds.activeModel).toBe('sonnet');
+  });
+
+  it('does not create or start a session when no session exists', async () => {
+    const deps = depsWith(undefined);
+    await handleCommand('/models', ROOT, { messageId: 'om_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+    expect(deps.activeSessions.size).toBe(0);
+  });
+
+  it('rechecks operator permission before probing models', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const reply = vi.fn(async () => 'om_reply');
+    await showSessionModelPicker(makeDs(), ROOT, OWNER, undefined, reply, 'zh');
+    expect(reply).toHaveBeenCalled();
+    expect(detectModelsMock).not.toHaveBeenCalled();
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['codex-app', 'minimax', 'mira'])('does not offer a raw model picker for %s', async cliId => {
+    const reply = vi.fn(async () => 'om_reply');
+    await showSessionModelPicker(makeDs({ sessionOverrides: { cliId } as any }), ROOT, OWNER, undefined, reply, 'zh');
+    expect(reply).toHaveBeenCalled();
+    expect(detectModelsMock).not.toHaveBeenCalled();
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('uses the session CLI after the bot defaults change', async () => {
+    enableMenu('codex-app');
+    const ds = makeDs();
+    await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    expect(detectModelsMock).toHaveBeenCalledWith('claude-code', expect.anything());
+    expect(deliverEphemeralOrReplyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a notice instead of an empty select when no usable model slugs exist', async () => {
+    detectModelsMock.mockResolvedValue(['bad model', 'bad\nmodel']);
+    await showSessionModelPicker(makeDs(), ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    expect(card.elements.some((e: any) => e.tag === 'action')).toBe(false);
+  });
+
+  function shortcutPick(slug: string) {
+    const data = pickData(slug);
+    data.action.value.action = 'session_model_pick';
+    return data;
+  }
+
+  it('selecting the shortcut sends the chosen model while reply menus are disabled', async () => {
+    const deliver = vi.fn();
+    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), deliver), LARK_APP_ID);
+    expect(deliver).toHaveBeenCalledWith(expect.anything(), '/model sonnet', expect.objectContaining({ senderOpenId: OWNER, senderIsBot: false }));
+    expect(result.toast.type).toBe('success');
+  });
+
+  it.each(['permission', 'busy', 'replacement', 'dead', 'transfer', 'generation'])('revalidates after model discovery: %s', async reason => {
+    let resolve!: (models: string[] | null) => void;
+    detectModelsMock.mockImplementation(() => new Promise<string[] | null>(r => { resolve = r; }));
+    const ds = makeDs();
+    const deliver = vi.fn();
+    const deps = depsWith(ds, deliver);
+    const pending = handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
+    // Detection is reached synchronously before the handler's first await.
+    if (reason === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    if (reason === 'busy') sessionAcceptsDirectCommandMock.mockReturnValue(false);
+    if (reason === 'replacement') deps.activeSessions.set(sessionKey(ROOT, LARK_APP_ID), makeDs({ sessionOverrides: { sessionId: 'replacement' } }));
+    if (reason === 'dead') ds.worker = { killed: true } as any;
+    if (reason === 'transfer') isSessionTransferringMock.mockReturnValue(true);
+    if (reason === 'generation') ds.workerGeneration = 2;
+    resolve(null);
+    const result = await pending;
+    expect(deliver).not.toHaveBeenCalled();
+    expect(result.toast.type).toBe('warning');
+  });
+
+  it('refuses a second concurrent model choice once the first starts a turn', async () => {
+    let resolve!: (models: string[] | null) => void;
+    const probe = new Promise<string[] | null>(r => { resolve = r; });
+    detectModelsMock.mockImplementation(() => probe);
+    const ds = makeDs();
+    const deliver = vi.fn(() => { sessionAcceptsDirectCommandMock.mockReturnValue(false); return true; });
+    const deps = depsWith(ds, deliver);
+    const first = handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
+    const second = handleCardAction(shortcutPick('opus'), deps, LARK_APP_ID);
+    resolve(null);
+    const results = await Promise.all([first, second]);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(results.map(r => r.toast.type)).toEqual(['success', 'warning']);
+  });
+
+  it('gives later selections from the same card distinct turn identifiers', async () => {
+    const ds = makeDs();
+    const deliver = vi.fn(() => true);
+    const deps = depsWith(ds, deliver);
+    await handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
+    await handleCardAction(shortcutPick('opus'), deps, LARK_APP_ID);
+    const ids = deliver.mock.calls.map((c: any) => c[2].turnId);
+    expect(new Set(ids).size).toBe(2);
+    expect(deliver.mock.calls.map((c: any) => c[2].messageId)).toEqual(['om_picker_card', 'om_picker_card']);
+  });
+
+  it('reports a rejected worker enqueue as a warning', async () => {
+    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), vi.fn(() => false)), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+  });
+
+  it('does not invite a retry when bookkeeping throws after the worker accepted the command', async () => {
+    const deliver = vi.fn((_ds: any, _cmd: string, opts: any) => { opts.onDelivered(); throw new Error('bookkeeping failed'); });
+    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), deliver), LARK_APP_ID);
+    expect(result.toast.type).toBe('success');
+  });
+
+  it('does not pass a chat id as the reply message when switching in a flat group session', async () => {
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat' } });
+    const deliver = vi.fn();
+    const data = shortcutPick('sonnet');
+    data.action.value.root_id = 'oc_chat';
+    await handleCardAction(data, depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver.mock.calls[0][2].replyRootId).toBeUndefined();
+  });
+
+  it.each(['busy', 'permission', 'invalid', 'unsupported', 'dead', 'transfer'])('retains the existing model switch guard: %s', async reason => {
+    const ds = makeDs();
+    if (reason === 'busy') sessionAcceptsDirectCommandMock.mockReturnValue(false);
+    if (reason === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    if (reason === 'unsupported') ds.session.cliId = 'codex-app';
+    if (reason === 'dead') ds.worker = { killed: true } as any;
+    if (reason === 'transfer') isSessionTransferringMock.mockReturnValue(true);
+    const deliver = vi.fn();
+    await handleCardAction(shortcutPick(reason === 'invalid' ? 'sonnet\n/clear' : 'sonnet'), depsWith(ds, deliver), LARK_APP_ID);
     expect(deliver).not.toHaveBeenCalled();
   });
 });
