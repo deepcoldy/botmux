@@ -55,6 +55,9 @@ function harness(interruptKey?: 'esc', backendType: 'pty' | 'tmux' = 'pty', adap
     traexQuotaPending: undefined,
     emitReadyCodexTurns: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
+    // Shared interrupt hook: handleTermAction must retire a doubao mark here
+    // exactly like handleExactTurnInterrupt does.
+    retireDoubaoBridgeTurnOnInterrupt: vi.fn(() => false),
   };
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
   const handler = factory(state) as { handleTermAction: (key: string) => Promise<void> };
@@ -112,4 +115,30 @@ describe('handleTermAction for Pi', () => {
       expect(backendType === 'tmux' ? h.specialKeys : h.written).toEqual([backendType === 'tmux' ? 'Escape' : '\x1b']);
     });
   }
+});
+
+// Doubao leaves no trajectory record after Esc, so EVERY user-visible stop
+// entry that runs through handleTermAction (card ⏹ / /stop / a manually
+// pressed Esc in the Web terminal) must retire its structured-bridge mark at
+// the shared delivery point — wiring only handleExactTurnInterrupt leaves the
+// identical next-turn answer misattribution on these entries.
+describe('handleTermAction doubao bridge-mark retirement', () => {
+  it.each(['ctrlc', 'esc'] as const)('retires the current turn mark after a delivered %s', async key => {
+    const h = harness('esc', 'pty', { id: 'doubao', interruptKey: 'esc' });
+    await h.handle(key);
+    expect(h.state.retireDoubaoBridgeTurnOnInterrupt).toHaveBeenCalledWith('om_turn', 1);
+  });
+
+  it('does not retire anything for a non-interrupt key', async () => {
+    const h = harness('esc', 'pty', { id: 'doubao', interruptKey: 'esc' });
+    await h.handle('enter');
+    expect(h.state.retireDoubaoBridgeTurnOnInterrupt).not.toHaveBeenCalled();
+  });
+
+  it('still invokes the shared hook for other esc-interrupt CLIs (the helper gates internally)', async () => {
+    const h = harness('esc');
+    await h.handle('ctrlc');
+    expect(h.state.retireDoubaoBridgeTurnOnInterrupt).toHaveBeenCalledWith('om_turn', 1);
+    expect(h.state.retireDoubaoBridgeTurnOnInterrupt.mock.results[0]!.value).toBe(false);
+  });
 });

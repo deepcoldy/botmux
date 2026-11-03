@@ -273,6 +273,21 @@ describe('doubao two-file cross-window ordering', () => {
     writeFileSync(trajectory, finalRow('NEW_ANSWER'));
     expect(tick().out).toEqual([['turn-new', 'NEW_ANSWER']]);
   });
+
+  it('does not deliver a late terminal answer that lands after the turn was interrupted', () => {
+    // Documented stop semantics (docs/doubao §3/§6): Esc settles the turn as
+    // stopped and the mark is retired; a terminal answer the model writes at
+    // almost the same moment has no owner (openTurns=0, no prompt in the
+    // window) and must NOT be emitted as a Lark reply. The text stays visible
+    // in the native terminal/logs; other structured bridges behave the same.
+    const root = join(tmpdir(), `doubao-late-final-${process.pid}`);
+    const { trajectory } = makeSession(root);
+    // No assignment delta in this window (its prompt was drained earlier);
+    // queue reports zero open turns because Esc retired the mark.
+    writeFileSync(trajectory, finalRow('迟到的回答'));
+    const r = drainDoubaoTranscript(trajectory, 0, { openTurns: 0 });
+    expect(r.events).toEqual([]);
+  });
 });
 
 describe('doubao assignment heading/body split write', () => {
