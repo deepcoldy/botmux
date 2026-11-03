@@ -58,21 +58,19 @@ Changed your mind: requirement → `botmux workflow revise-spec <runId>` (steps 
 
 Once a run has started its flow can still change: add or remove nodes, change a node's goal / acceptance / outputs / timeout / approval, change dependencies, move a node to another bot, or redo a finished node. Just tell the main bot in the main topic what to change; it reads the current version and submits the change. Every change makes a new version (version 2, 3, …), and the parts of one change take effect together or not at all. When two people change the flow at the same time the first one wins; the main bot re-reads the latest version and resubmits the other.
 
-**Who can change it**
+**Who can change it, and when a confirmation is needed**
 
-- In the main topic, a change the **initiator** asks for takes effect directly, or becomes a confirmation card under the rules below.
-- A change asked for by **anyone else** in the chat always becomes a "flow change" confirmation card for the initiator to approve or reject; nothing changes until then.
+- A change the **initiator** asks for in the main topic takes effect directly. The one exception is adding or changing a node with an external action (host nodes such as sending a Feishu message or creating a scheduled task): that posts a "flow change" card in the main topic for the initiator to approve.
+  - Using a bot this run has not approved also takes effect directly, and the bot becomes part of the run's approved bots — the blocked card's reassign picker offers it from then on.
+  - Removing or relaxing a human approval, raising a loop's maximum rounds, a longer timeout, or more than twice as many nodes as were originally approved all take effect directly.
+- A change asked for by **anyone else** in the chat always becomes a "flow change" card for the initiator to approve or reject; nothing changes until then.
+- A change the **main bot decides on by itself** from how the run is going needs the initiator's confirmation if it does any of these, and takes effect directly otherwise:
+  - uses a bot this run has not approved (in a new node or a reassignment) — once approved, the bot is part of the run's approved bots too;
+  - adds or changes a node with an external action;
+  - removes or relaxes a human approval: removing it, changing its options, or changing who may approve (adding one needs no confirmation);
+  - raises a budget: a loop's maximum rounds, a timeout longer than the node had, or more than twice as many nodes as were originally approved.
 
-**Changes the initiator must confirm**
-
-Any of these posts a "flow change" card in the main topic that only the initiator can decide; everything else takes effect directly:
-
-- Using a bot this run has not approved (in a new node or a reassignment). Once the initiator approves it on the card, the bot is part of the run's approved bots: using it again, or picking it on a blocked card's reassign picker, needs no further confirmation.
-- Adding or changing a node with an external action (host nodes such as sending a Feishu message or creating a scheduled task).
-- Removing or relaxing a human approval: removing it, changing its options, or changing who may approve. Adding an approval needs no confirmation.
-- Raising a budget: a loop's maximum rounds, a timeout longer than the node had, or more than twice as many nodes as were originally approved.
-
-The card lists the nodes added, removed and changed, and any new bots. While it waits, the nodes it touches are not dispatched and everything else keeps running; questions on those nodes cannot be answered and their blocked cards cannot reassign until the card is decided.
+Whether a change is "the initiator's" depends on who sent the message that started that turn: an initiator chiming in while the main bot is busy counts as the initiator. The card lists the nodes added, removed and changed, the new bots, and why it needs confirmation. While it waits, the nodes it touches are not dispatched and everything else keeps running; questions on those nodes cannot be answered and their blocked cards cannot reassign until the card is decided.
 
 **What happens to a node that is running or waiting for approval**
 
@@ -84,7 +82,10 @@ The card lists the nodes added, removed and changed, and any new bots. While it 
 
 **A finished node can only be redone**
 
-A finished node cannot be removed or redefined (downstream nodes may already use its products); it can only be redone, or get new nodes after it. Redoing it also re-runs the downstream nodes that used its old products, and spends revisit budget (shared with automatic rework: by default once per node, 8 times per run). When the budget is spent, a "more redo budget" card appears in the main topic: once the initiator taps "➕ Add 1", have the main bot submit the change again. One card is posted per exhaustion; when the budget runs out again a new card is posted, and the old one says it has expired.
+A finished node cannot be removed or redefined (downstream nodes may already use its products); it can only be redone, or get new nodes after it. Redoing it also re-runs the downstream nodes that used its old products, and spends revisit budget (shared with automatic rework: by default once per node, 8 times per run). When the budget is spent:
+
+- A redo the initiator asks for adds one more by itself and takes effect, recorded as added by the initiator — no card to tap.
+- Otherwise (a redo the main bot decided on, or a change that still waits for confirmation) a "more redo budget" card appears in the main topic: once the initiator taps "➕ Add 1", have the main bot submit the change again. One card is posted per exhaustion; when the budget runs out again a new card is posted, and the old one says it has expired.
 
 **Seeing the version**
 
