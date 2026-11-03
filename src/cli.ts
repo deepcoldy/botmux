@@ -16770,7 +16770,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     throw err;
   }
 
-  const prompt = positionalArgs.join(' ').trim();
+  const prompt = normalizePositionalSendContent(positionalArgs.join(' ')).trim();
   if (!questions && !prompt) {
     console.error(
       'botmux ask: 缺少 prompt。用法: botmux ask buttons --options "yes,no" "继续发版吗？"',
