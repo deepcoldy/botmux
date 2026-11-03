@@ -341,5 +341,31 @@ describe('a human message arrives while the main bot handles a wake turn', () =>
     expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
     writeSession({ quoteTargetId: mintWorkflowEventTurnId(RUN, 3) });
     expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
+    // Relay: the session's fields must name one human generation.
+    const relayStatus = (session: { callerOpenId?: string; quoteTargetId?: string; currentReplyTargetTurnId?: string }) =>
+      authorizeV3SessionRunEditRequest({
+        runId: RUN,
+        mutation: 'status',
+        raw: { sessionId: 'sess-main', originCapability: capability },
+        trustedHost: false,
+        session: {
+          receiver: false,
+          liveOrigin: { capability, turnId: wake, dispatchAttempt: 1 },
+          chatId: BINDING.chatId,
+          larkAppId: BINDING.larkAppId,
+          rootMessageId: BINDING.rootMessageId,
+          ...session,
+        },
+        selfLarkAppId: BINDING.larkAppId,
+        baseDir,
+      });
+    expect(relayStatus({ callerOpenId: MEMBER, quoteTargetId: 'om_member_says' })).toMatchObject({ ok: true });
+    for (const session of [
+      { quoteTargetId: 'om_member_says' },
+      { callerOpenId: MEMBER, quoteTargetId: mintWorkflowEventTurnId(RUN, 3) },
+      { callerOpenId: MEMBER, quoteTargetId: 'om_member_says', currentReplyTargetTurnId: 'om_someone_else' },
+    ]) {
+      expect(relayStatus(session)).toMatchObject({ ok: false, error: 'turn_provenance_stale' });
+    }
   });
 });
