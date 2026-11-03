@@ -88,7 +88,7 @@ describe('parseBoardArgs', () => {
     }
   });
 
-  it('guide 里 botmux send 示例都过得了 @ 决策门禁：巡检节是定时回合、没有触发发送者，上报只能 --no-mention（或显式 --mention），--mention-back 必被拒', () => {
+  it('guide 里 botmux send 示例都过得了 @ 决策门禁：巡检节是定时回合、没有触发发送者，--mention-back 必被拒', () => {
     for (const locale of ['zh', 'en'] as const) {
       const sections = stewardGuidePreset(locale).split(/^## /m);
       for (const section of sections) {
@@ -109,14 +109,14 @@ describe('parseBoardArgs', () => {
           expect(decision.ok, `${locale} ${isPatrol ? 'patrol' : 'human'}: ${command}\n${decision.error ?? ''}`).toBe(true);
         }
       }
-      // 巡检节的 decision 上报必须是定时回合里确定可用的写法（--no-mention 配
-      // --attention 的 dashboard 举手），不能写回模型无法兜底的 --mention-back。
+      // 巡检节必须真有一条 decision 上报；它用哪种合法写法（--no-mention 或显式
+      // --mention）由上面的真实门禁校验，这里只钉硬不变量：定时回合没有触发发送者，
+      // 巡检节不能出现 --mention-back（它在这种回合确定性 exit 2）。
       const patrol = sections.find(s => /定时巡检|Scheduled patrol/.test(s.split('\n')[0] ?? ''));
       expect(patrol, `${locale}: guide 缺巡检节`).toBeTruthy();
       const patrolDecisionSends = [...patrol!.matchAll(/`(botmux send [^`]*--attention=decision[^`]*)`/g)].map(m => m[1]!);
       expect(patrolDecisionSends.length).toBeGreaterThan(0);
       for (const command of patrolDecisionSends) {
-        expect(command).toContain('--no-mention');
         expect(command).not.toContain('--mention-back');
       }
     }
