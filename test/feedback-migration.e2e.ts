@@ -9,9 +9,11 @@ import { readFeedbackStorageConfig, saveFeedbackStorageCandidate } from '../src/
 import { startFeedbackMigration, resumeFeedbackMigration, prepareFeedbackMigration } from '../src/services/feedback-migration.js';
 import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
 import { restoreFeedbackSource } from '../src/services/feedback-maintenance.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { once } from 'node:events';
 
 describe('SQLite to PostgreSQL migration', () => {
-  it.each(['normal', 'restored-source'])('preserves source continuity and resumes safely: %s', async scenario => {
+  it.each(['normal', 'restored-source', 'crash-import', 'crash-retire'])('preserves source continuity and resumes safely: %s', async scenario => {
     const address = process.env.BOTMUX_TEST_POSTGRES_URL;
     if (!address) throw new Error('BOTMUX_TEST_POSTGRES_URL_required');
     const url = new URL(address);
@@ -57,6 +59,11 @@ describe('SQLite to PostgreSQL migration', () => {
         expect((await readFeedbackStorageConfig(directory)).active.backend).toBe('sqlite');
         expect(source.getResponse(later.responseId)).toHaveProperty('responseId', later.responseId);
         return;
+      }
+      if (scenario.startsWith('crash-')) {
+        const child = spawnTsScript('test/helpers/feedback-migration-crash-child.ts', [directory, prepared.migrationId, scenario === 'crash-import' ? 'import' : 'retire'], { stdio: ['ignore', 'ignore', 'pipe'] });
+        const [, signal] = await once(child, 'exit');
+        expect(signal).toBe('SIGKILL');
       }
       const result = await startFeedbackMigration(directory, { requestId: 'migration-test', expectedGeneration: candidate.generation, maintenanceConfirmed: true });
       expect(result.phase).toBe('complete');
