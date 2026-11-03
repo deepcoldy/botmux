@@ -200,6 +200,22 @@ describe('one reply card per turn', () => {
     expect(store.read(key)?.recoveryHideFinal).toBeUndefined();
   });
 
+  it('replaying the ambiguous settle card never marks an unseen final as delivered', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValue(new Error('PATCH unavailable'));
+    // A non-terminal turn whose final PATCH was never acknowledged; the process
+    // dies before the terminal event, so startup recovery settles the still-
+    // working card as ambiguous and hides the unproven final.
+    await expect(store.update(key, finalEvent('UNSEEN-ANSWER-PROBE'), io)).rejects.toThrow();
+    expect(store.read(key)?.phase).toBe('working');
+    await expect(store.update(key, { kind: 'recover' }, io)).rejects.toThrow();
+    expect(store.read(key)).toMatchObject({ phase: 'ambiguous', pendingPatch: { final: false } });
+    vi.mocked(io.patch).mockImplementation(async (id, content) => { cards.set(id, content); });
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    expect(cards.get(store.read(key)!.messageId!)).not.toContain('UNSEEN-ANSWER-PROBE');
+  });
+
   it('settles a superseded turn after its in-flight initial POST is acknowledged', async () => {
     let acknowledge!: () => void;
     const send = io.send;
