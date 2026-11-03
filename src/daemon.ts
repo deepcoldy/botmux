@@ -6560,6 +6560,7 @@ const commandDeps: CommandHandlerDeps = {
  * replace their session before replying, so mutable session state cannot be
  * the authority for placement here. */
 function commandDepsForInvocation(input: {
+  context?: 'new-topic' | 'thread';
   scope: 'chat' | 'thread';
   chatId: string;
   anchor: string;
@@ -6574,6 +6575,7 @@ function commandDepsForInvocation(input: {
   });
   return {
     ...commandDeps,
+    invocationContext: input.context,
     invocationReplyTarget: replyTarget,
     sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
       sessionReply(
@@ -7598,6 +7600,8 @@ const cardDeps: CardHandlerDeps = {
   deliverPassthroughCommand: (ds, cmd, opts) =>
     deliverPassthroughToExistingSession(ds, cmd, cmd, opts.anchor, ds.larkAppId, {
       messageId: opts.messageId,
+      turnId: opts.turnId,
+      onDelivered: opts.onDelivered,
       replyRootId: opts.replyRootId,
       senderOpenId: opts.senderOpenId,
       senderIsBot: opts.senderIsBot,
@@ -24468,9 +24472,25 @@ function deliverPassthroughToExistingSession(
      * the real, empty CLI composer is visible. */
     requireSafeComposer?: true;
   },
-): void {
+): boolean {
   const turnId = turn.turnId ?? turn.messageId;
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
+    // A failed IPC enqueue must not replace the business turn's reply binding.
+    // beginReplyTargetTurn replaces its maps rather than mutating the old maps.
+    const sessionBindingKeys = ['quoteTargetId', 'quoteTargetSenderOpenId', 'quoteTargetSenderIsBot',
+      'turnReplyContexts', 'replyTargets', 'replyTargetsPrunedThrough', 'replyThreadAliases',
+      'currentReplyTarget', 'lastCallerOpenId'];
+    const savedBinding = [
+      ...sessionBindingKeys.map(key => ({ target: ds.session, key, descriptor: Object.getOwnPropertyDescriptor(ds.session, key) })),
+      ...['replyThreadAliases', 'currentReplyTarget'].map(key => ({ target: ds, key, descriptor: Object.getOwnPropertyDescriptor(ds, key) })),
+    ];
+    const restoreBinding = () => {
+      for (const { target, key, descriptor } of savedBinding) {
+        if (descriptor) Object.defineProperty(target, key, descriptor);
+        else Reflect.deleteProperty(target, key);
+      }
+      sessionStore.updateSession(ds.session);
+    };
     // Passthrough commands bypass the normal message-forwarding block, so bind
     // the accepted Lark turn before the worker rotates its marker at the PTY
     // write boundary. This helper also covers a cold-start registration race.
@@ -24493,7 +24513,8 @@ function deliverPassthroughToExistingSession(
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
     }
-    sessionStore.updateSession(ds.session);
+    try { sessionStore.updateSession(ds.session); }
+    catch (err) { restoreBinding(); throw err; }
     // Compatibility note (empty-start opening): a raw passthrough is a
     // LITERAL CLI command — its contract is that the CLI sees exactly the
     // bytes the user typed, never a botmux XML envelope. So it deliberately
@@ -24502,7 +24523,8 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    const accepted = sendWorkerSessionInput(ds, {
+    let accepted: boolean;
+    try { accepted = sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
       ...(trustedSessionController(ds)
@@ -24513,10 +24535,11 @@ function deliverPassthroughToExistingSession(
       ...(mojoLivePatchForSession(ds) ?? {}),
       turnId,
       ...(turn.requireSafeComposer ? { requireSafeComposer: true as const } : {}),
-    });
+    }); } catch (err) { restoreBinding(); throw err; }
     if (!accepted) {
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
-      return;
+      restoreBinding();
+      return false;
     }
     // The worker has the turn from here on: report delivery before the
     // bookkeeping below, so a throw in beginNewTurn (e.g. a transient session
@@ -24527,7 +24550,7 @@ function deliverPassthroughToExistingSession(
     beginNewTurn(ds, commandContent, turnId);
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
-    return;
+    return true;
   }
   void sessionReply(
     anchor,
@@ -24535,6 +24558,7 @@ function deliverPassthroughToExistingSession(
     'text',
     larkAppId,
   );
+  return false;
 }
 
 export const __testOnly_deliverPassthroughToExistingSession =
@@ -26273,6 +26297,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
   if (isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
+      context: 'new-topic',
       scope,
       chatId,
       anchor,
@@ -30004,6 +30029,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   if (slashDecision && isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
+      context: 'thread',
       scope,
       chatId: routingChatId,
       anchor,

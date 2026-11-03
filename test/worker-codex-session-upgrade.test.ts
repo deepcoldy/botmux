@@ -103,6 +103,7 @@ function harness() {
     clearTimeout,
     // Correlated restart attempt bookkeeping (#1863).
     activeRestartAttemptId: undefined,
+    pendingTopicEffortRestart: undefined,
     restartWindowLaunch: undefined,
     pendingLaunchConvergence: undefined,
     decideRestartReceipt,
