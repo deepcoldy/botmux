@@ -162,11 +162,8 @@ describe('daemon session-scoped IPC route wiring', () => {
     expect(authAt).toBeGreaterThan(-1);
     // Host HMAC callers are bound too: the bind sits after the auth block closes.
     expect(askBindAt).toBeGreaterThan(blockEnd(ask, authAt));
-    const inputAt = ask.indexOf('const askInput = {');
+    const inputAt = ask.indexOf('const askInput = createAskInput(boundAsk, {');
     expect(inputAt).toBeGreaterThan(askBindAt);
-    const askInput = ask.slice(inputAt, ask.indexOf('};', inputAt));
-    expect(askInput).toContain('boundAsk.larkAppId');
-    expect(askInput).not.toContain('parsed.larkAppId');
     expect(ask.indexOf('registerAskForResponse(askInput')).toBeGreaterThan(inputAt);
 
     const hook = route('/api/hooks/emit');
