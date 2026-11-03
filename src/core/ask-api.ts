@@ -195,6 +195,22 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
 
 /** The response, not IncomingMessage.close, tracks the long-poll lifetime:
  * a fully read POST body may close while the client is still waiting. */
+export function createAskInput(body: AskApiBody, extra: Partial<CreateAskInput> = {}): CreateAskInput {
+  return {
+    larkAppId: body.larkAppId,
+    chatId: body.chatId,
+    rootMessageId: body.rootMessageId,
+    sessionId: body.sessionId,
+    questions: body.questions,
+    timeoutMs: body.timeoutMs,
+    requestId: body.requestId,
+    originKind: body.originKind,
+    answererOpenId: body.answererOpenId,
+    mentionedOpenId: body.mentionedOpenId,
+    ...extra,
+  };
+}
+
 export async function registerAskForResponse(
   input: CreateAskInput,
   res: ServerResponse,

@@ -954,7 +954,7 @@ import {
 } from './core/completion-proposal.js';
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
-import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
+import { createAskInput, parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
@@ -9543,20 +9543,11 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  const askInput = {
-    larkAppId: boundAsk.larkAppId,
-    chatId: boundAsk.chatId,
-    rootMessageId: boundAsk.rootMessageId,
-    sessionId: boundAsk.sessionId,
-    questions: boundAsk.questions,
+  const askInput = createAskInput(boundAsk, {
     // Async asks outlive their originating reply card; document asks are delivered privately.
     replyCardTarget: asyncInput || documentDelivery ? undefined : replyCardAskTarget(askSession, boundAsk, body),
     deliveryTarget: documentDelivery,
-    timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
-    // Invocation identity (from the hook; enables cross-restart re-attach).
-    requestId: boundAsk.requestId,
-    originKind: boundAsk.originKind,
     ...((documentDelivery?.openId ?? asyncCaller ?? boundAsk.answererOpenId)
       ? { answererOpenId: documentDelivery?.openId ?? asyncCaller ?? boundAsk.answererOpenId } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the
@@ -9565,7 +9556,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
-  };
+  });
   const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
   const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
   if (body.acknowledge === true) {

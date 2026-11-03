@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { parseAskBody } from '../src/core/ask-api.js';
+import { createAskInput, parseAskBody } from '../src/core/ask-api.js';
 
 function validBody(over: Record<string, unknown> = {}) {
   return {
@@ -213,6 +213,14 @@ describe('parseAskBody — mentionedOpenId (--mention)', () => {
     expect('error' in out).toBe(false);
     if (!('error' in out)) {
       expect(out.mentionedOpenId).toBe('ou_humanTarget0001');
+    }
+  });
+
+  it('daemon 注册输入保留 mentionedOpenId', () => {
+    const parsed = parseAskBody(validBody({ mentionedOpenId: 'ou_humanTarget0001' }));
+    expect('error' in parsed).toBe(false);
+    if (!('error' in parsed)) {
+      expect(createAskInput(parsed).mentionedOpenId).toBe('ou_humanTarget0001');
     }
   });
 
