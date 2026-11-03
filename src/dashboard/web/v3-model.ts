@@ -189,6 +189,8 @@ export interface V3GraphEdgeLayout {
   x2: number;
   y2: number;
   mx: number;
+  /** Vertical layouts only: the curve's vertical midpoint (edges run top → bottom). */
+  my?: number;
   live: boolean;
 }
 
@@ -259,6 +261,77 @@ export function buildGraphLayout(view: RunView): V3GraphLayout {
     }
   }
 
+  return { width, height, nodes: laidOutNodes, edges };
+}
+
+/** Spacing of the sidebar's top-to-bottom layout (design §11.4, 350–800px). */
+export const V3_VERTICAL_GRAPH = {
+  padding: 10,
+  horizontalGap: 10,
+  verticalGap: 34,
+  /** Three parallel nodes still fit the narrowest (350px) sidebar's graph area. */
+  minNodeWidth: 88,
+} as const;
+
+/**
+ * Top-to-bottom variant of {@link buildGraphLayout} for the Feishu sidebar
+ * (350–800px wide): one row per depth, rows centered, a uniform box width that
+ * shrinks to fit the widest row into `containerWidth` (never below
+ * `minNodeWidth` — a wider row scrolls sideways instead of becoming unreadable).
+ */
+export function buildVerticalGraphLayout(view: RunView, containerWidth: number): V3GraphLayout {
+  const nodes = graphNodes(view);
+  const depthOf = computeDepth(nodes);
+  const byDepth = new Map<number, RunNodeView[]>();
+  for (const node of nodes) {
+    const depth = depthOf.get(node.id) ?? 0;
+    const bucket = byDepth.get(depth);
+    if (bucket) bucket.push(node);
+    else byDepth.set(depth, [node]);
+  }
+  const depths = [...byDepth.keys()].sort((a, b) => a - b);
+  const G = V3_VERTICAL_GRAPH;
+  const widest = Math.max(1, ...depths.map((depth) => byDepth.get(depth)!.length));
+  const avail = Math.max(G.minNodeWidth, Math.floor(containerWidth) - G.padding * 2);
+  const nodeWidth = Math.max(
+    G.minNodeWidth,
+    Math.min(V3_GRAPH.nodeWidth, Math.floor((avail - (widest - 1) * G.horizontalGap) / widest)),
+  );
+  const rowWidth = (count: number) => count * nodeWidth + Math.max(0, count - 1) * G.horizontalGap;
+  const width = Math.max(Math.floor(containerWidth), G.padding * 2 + rowWidth(widest));
+
+  const laidOutNodes: V3GraphNodeLayout[] = [];
+  const pos = new Map<string, V3GraphNodeLayout>();
+  let y = G.padding;
+  for (const depth of depths) {
+    const row = byDepth.get(depth)!;
+    let x = Math.round((width - rowWidth(row.length)) / 2);
+    let rowHeight = 0;
+    for (const node of row) {
+      const box = { node, x, y, width: nodeWidth, height: nodeHeight(node) };
+      laidOutNodes.push(box);
+      pos.set(node.id, box);
+      x += nodeWidth + G.horizontalGap;
+      rowHeight = Math.max(rowHeight, box.height);
+    }
+    y += rowHeight + G.verticalGap;
+  }
+  const height = depths.length ? y - G.verticalGap + G.padding : G.padding * 2;
+
+  const edges: V3GraphEdgeLayout[] = [];
+  for (const node of nodes) {
+    const to = pos.get(node.id);
+    if (!to) continue;
+    for (const dep of node.depends) {
+      const from = pos.get(dep);
+      if (!from) continue;
+      const x1 = from.x + from.width / 2;
+      const y1 = from.y + from.height;
+      const x2 = to.x + to.width / 2;
+      const y2 = to.y;
+      edges.push({ fromId: dep, toId: node.id, x1, y1, x2, y2, mx: (x1 + x2) / 2, my: (y1 + y2) / 2, live: node.status === 'running' });
+    }
+  }
   return { width, height, nodes: laidOutNodes, edges };
 }
 

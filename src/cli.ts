@@ -4138,6 +4138,9 @@ interface SessionData {
   cliLaunchSnapshot?: import('./types.js').Session['cliLaunchSnapshot'];
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
+  /** Workflow node marker (Session.workflowNode): this session executes a
+   *  handed-off node of a bot-executed run. Only the run / main bot are read. */
+  workflowNode?: Pick<import('./types.js').WorkflowNodeSessionMarker, 'runId' | 'orchestratorAppId'>;
   /** Frozen file-sandbox decision from the persisted session (tri-state). */
   sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   dispatchLaunchSpec?: import('./types.js').Session['dispatchLaunchSpec'];
@@ -9591,11 +9594,14 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { materializeFeedbackPolicyForDelivery } from './services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
+import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from './im/lark/workflow-sidebar-entry.js';
+import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
 import { applyInlineMentions, applyInlineMentionsToCard } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import {
   effectiveDefaultWorkingDir,
   getBot,
+  getBotBrand,
   loadBotConfigs,
   resolveBrandLabel,
   resolveReplyStyleConfig,
@@ -12606,6 +12612,22 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (attached !== card) oncallGroupCard = JSON.parse(attached);
     return attached;
   };
+  // §11 / §5.5: a workflow node session's reply cards in its own topic carry
+  // the run's「工作流 ›」entry at the signature row's right end (after the
+  // on-call button). Top-level / cross-chat / --into publishes are not in the
+  // node's landing, so they stay as they are.
+  const withWorkflowEntry = (card: string): string => {
+    if (asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
+    return attachWorkflowSidebarEntry(card, workflowNodeSessionEntry(
+      s.workflowNode,
+      (mainLarkAppId, runId) => resolveWorkflowEntryLink({
+        mainLarkAppId,
+        runId,
+        brand: getBotBrand(s.larkAppId),
+        locale: localeForBot(s.larkAppId),
+      }),
+    ));
+  };
   // `reviewers`/`everyone` audiences gate clicks without a human requester —
   // this is the bot-triggered auto-analysis case (issue #1178) where the exact
   // turn sender is another bot. Only the `requester` audience needs a resolvable
@@ -13594,8 +13616,10 @@ async function cmdSend(rest: string[]): Promise<void> {
       });
       reportCardRenderDiagnostics(renderDiagnostics);
       if (!budget.fits) console.error(`botmux send: 卡片请求体约 ${budget.bytes} 字节，超过飞书 30KB 上限，可能被拒收`);
-      const replyCardJson = withOncallGroup(JSON.stringify(canonicalCard));
+      const withOncall = withOncallGroup(JSON.stringify(canonicalCard));
+      const replyCardJson = withWorkflowEntry(withOncall);
       if (feedbackBaseCard && oncallGroupCard) feedbackBaseCard = oncallGroupCard;
+      if (feedbackBaseCard && replyCardJson !== withOncall) feedbackBaseCard = JSON.parse(replyCardJson);
       const replyStore = new TurnReplyCardStore(resolveDataDir());
       const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
       const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
