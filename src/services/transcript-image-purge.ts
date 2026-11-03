@@ -28,7 +28,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 
 /** API-side floor quoted in the 400 ("Minimum allowed dimension: 14 pixels"). */
 export const MIN_IMAGE_DIMENSION = 14;
@@ -313,13 +313,18 @@ const SESSION_SUBDIR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 /** Purge the pinned session transcript and its Task/Agent subagent files. */
 export function purgeUndersizedImages(
   mainJsonlPath: string,
-  opts: { minDimension?: number } = {},
+  opts: { minDimension?: number; trustedProjectsRoot?: string } = {},
 ): PurgedFile[] {
   const minDimension = opts.minDimension ?? MIN_IMAGE_DIMENSION;
   const results: PurgedFile[] = [];
   let trustedRoot: string;
   try {
-    trustedRoot = realpathSync(dirname(mainJsonlPath));
+    trustedRoot = realpathSync(opts.trustedProjectsRoot ?? dirname(mainJsonlPath));
+    const lexicalMain = resolve(mainJsonlPath);
+    const lexicalRelative = relative(resolve(opts.trustedProjectsRoot ?? dirname(mainJsonlPath)), lexicalMain);
+    if (lexicalRelative.startsWith('..') || lexicalRelative.includes('/../')) return results;
+    const realMain = realpathSync(mainJsonlPath);
+    if (realMain !== trustedRoot && !realMain.startsWith(`${trustedRoot}/`)) return results;
   } catch {
     return results;
   }

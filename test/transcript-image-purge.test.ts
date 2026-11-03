@@ -206,6 +206,23 @@ describe('purgeUndersizedImages', () => {
     expect(purgeUndersizedImages(main)).toEqual([]);
   });
 
+  it('rejects an ancestor alias that escapes an independently trusted projects root', () => {
+    const root = makeTemp();
+    const projects = join(root, 'projects');
+    mkdirSync(projects);
+    const outside = makeTemp();
+    const outsideFile = join(outside, `${SID}.jsonl`);
+    const before = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(outsideFile, before);
+    const alias = join(projects, 'aliased-project');
+    symlinkSync(outside, alias);
+
+    expect(purgeUndersizedImages(join(alias, `${SID}.jsonl`), {
+      trustedProjectsRoot: projects,
+    })).toEqual([]);
+    expect(readFileSync(outsideFile, 'utf8')).toBe(before);
+  });
+
   it('does not follow a main transcript symlink', () => {
     const root = makeTemp();
     const outside = join(root, 'outside.jsonl');

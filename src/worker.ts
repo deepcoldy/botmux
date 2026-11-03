@@ -27169,7 +27169,7 @@ function stopOwnedSessionScope(reason: string): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause; afterQuiesceBeforeRespawn?: () => void } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
     codexAutoUpgrade.reject?.(new Error(reason));
@@ -27268,6 +27268,11 @@ async function restartCliProcess(
         preservePending: opts.preservePending,
         preservePolicyCapability: true,
       });
+      // Destructive transcript maintenance must happen only after destroy+kill:
+      // otherwise Claude may append through its old fd after our rename and the
+      // append lands on an unlinked inode. Throwing here aborts the replacement;
+      // the queued continuation remains fenced and is rejected by worker exit.
+      opts.afterQuiesceBeforeRespawn?.();
       // A normal restart cannot observe activity from the retired process.
       // Only capacity-model rotation carries that waiting latch forward.
       traexAutoModelController?.noteProcessExited(opts.restartCause === 'traex-auto-model');
@@ -30917,30 +30922,7 @@ process.on('message', async (raw: unknown) => {
             if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
             break;
           }
-          let purgedFiles: { file: string; removed: number }[];
-          try {
-            purgedFiles = purgeUndersizedImages(purgeTarget.jsonlPath);
-          } catch (err) {
-            send({
-              type: 'user_notify',
-              message: t('worker.purge_images_failed', {
-                reason: err instanceof Error ? err.message : String(err),
-              }),
-              turnId: msg.turnId,
-            });
-            if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
-            break;
-          }
-          const removedTotal = purgedFiles.reduce((n, f) => n + f.removed, 0);
-          if (removedTotal === 0) {
-            send({
-              type: 'user_notify',
-              message: t('worker.purge_images_none'),
-              turnId: msg.turnId,
-            });
-            if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
-            break;
-          }
+          let purgeSucceeded = false;
           purgeRestartPromise = restartCliProcess(
             'purge undersized transcript images',
             // 用户显式发起的上下文恢复（同 cwd-move respawn）：不计入崩溃重启
@@ -30952,24 +30934,38 @@ process.on('message', async (raw: unknown) => {
               preservePending: true,
               skipRestartBudget: true,
               exactResumeSessionId: purgeTarget.sessionId,
+              afterQuiesceBeforeRespawn: () => {
+                const purgedFiles = purgeUndersizedImages(purgeTarget.jsonlPath, {
+                  // <claudeDataDir>/projects/<cwd-key>/<sid>.jsonl. Pin the
+                  // independently known projects root so an ancestor alias in
+                  // the supplied transcript path cannot redefine containment.
+                  trustedProjectsRoot: dirname(dirname(purgeTarget.jsonlPath)),
+                });
+                const removedTotal = purgedFiles.reduce((n, f) => n + f.removed, 0);
+                if (removedTotal === 0) throw new Error(t('worker.purge_images_none'));
+                purgeSucceeded = true;
+                send({
+                  type: 'user_notify',
+                  message: t('worker.purge_images_done', {
+                    files: String(purgedFiles.length),
+                    removed: String(removedTotal),
+                  }),
+                  turnId: msg.turnId,
+                });
+              },
             },
           );
-          send({
-            type: 'user_notify',
-            message: t('worker.purge_images_done', {
-              files: String(purgedFiles.length),
-              removed: String(removedTotal),
-            }),
-            turnId: msg.turnId,
-          });
           purgeRestartPromise.catch(err => {
             send({
               type: 'user_notify',
-              message: t('worker.purge_images_restart_failed', {
+              message: t(purgeSucceeded
+                ? 'worker.purge_images_restart_failed'
+                : 'worker.purge_images_failed', {
                 reason: err instanceof Error ? err.message : String(err),
               }),
               turnId: msg.turnId,
             });
+            if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
           });
         }
         // Non-adopt: enqueue only. Bridge mark is deferred to flushPending
