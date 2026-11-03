@@ -2749,6 +2749,7 @@ async function cmdStart(): Promise<void> {
   // FIRST STATEMENT, before any await or dependency probe: those run as child
   // processes and would inherit the marker. See consumeAutostartUnitMarker.
   const bootHookStart = consumeAutostartUnitMarker();
+  await (await import('./setup/feedback-storage.js')).configureFeedbackStorage(resolveDataDir());
   applyCompanionOptions(process.argv.slice(3));
   // `--systemd-service` and the PM2-God ownership gating that used to live here
   // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
@@ -20367,6 +20368,12 @@ switch (command) {
       console.error(`botmux send refused: ${error.message}`);
       process.exitCode = 2;
     }
+    break;
+  }
+  case 'feedback': {
+    if (process.argv[3] !== 'storage') throw new Error('feedback_storage_command_required');
+    const { runFeedbackStorageCommand } = await import('./cli/feedback-storage.js');
+    process.exitCode = await runFeedbackStorageCommand(process.argv.slice(4), { input: process.stdin, output: process.stdout, error: process.stderr }, resolveDataDir());
     break;
   }
   case 'auth':     await cmdAuth(process.argv.slice(3)); break;
