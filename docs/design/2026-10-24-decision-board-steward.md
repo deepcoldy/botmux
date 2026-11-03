@@ -8,7 +8,7 @@
 - 页面放进 Dashboard：`#/board` 是汇总页（待你拍板 / 进行中 / 全部），`#/board/<bot>/<编号>` 是详情页。权限沿用 Dashboard 登录，不另做一套。
 - 每个事项一条链接：PC 用飞书 applink `web_url/open?mode=sidebar-semi` 在右侧栏打开，手机打开原链接。绑了平台的走 m-<machineId> + 飞书 SSO；开源部署走已有的 H5 免登，没配 H5 就是普通 Dashboard 登录。
 - 草稿存在服务端、自动保存、不发出去。点一次「提交」生成一个批次，**马上**送进管家会话：一条消息、一个回合。管家空闲就立刻开始读；正在跑就排在当前回合后面。投递复用定时任务的回合投递路径。
-- 这是通用功能：任何 botmux 用户都能把自己的一个 bot 设成管家，推进自己的开发任务。管家的活来自两处：owner 在管家群里交代的事，和 owner 提交的批次。**定时巡检不在本功能里**，是独立功能，后面单独做；想先用的话，现有定时任务就能配。
+- 这是通用功能：任何 botmux 用户都能把自己的一个 bot 设成管家，推进自己的开发任务。管家的活来自两处：owner 在管家群里交代的事，和 owner 提交的批次。**定时巡检**不新建调度：在管家群建一条普通定时任务叫醒管家，巡检规则写进预置 guide（见第 11 节，2026-11-03 追加）。
 - 管家在 Bot 配置里开，每个 bot 默认关。可配：管家所在群、提示词（预置 + 追加或替换）。预置规则由 `botmux board guide` 按需输出；只在管家群里常驻一行提示（约 50 token），告诉它有看板、规则去哪读。
 - 管家写看板用 `botmux board add/set/history/attach/list/show/pending/guide`。
 
@@ -275,7 +275,7 @@ botmux board show <编号|key> [--json]                           # 全部字段
 botmux board add <标题> [--key K] [--state S] [--stage 阶段] [--kind 类型] [--repo 仓库]
                  [--summary 一句话] [--progress 进展]
                  [--ask 问题 --option "A=做法 → 结果" ... --recommend A --reason 理由]
-                 [--link pr=owner/repo#N | chat=oc_… | thread=om_… | session=<id> | commit=owner/repo@sha | url=…]...
+                 [--link pr=owner/repo#N | chat=oc_… | thread=oc_…/omt_… | session=<id> | commit=owner/repo@sha | url=…]...
                  [--note 一句话]                                 # 同 key 已存在时按 set 更新，并给出提示
 botmux board set <编号|key> [字段同上] [--clear-ask] [--note 一句话]   # 改状态和字段会自动记进历史
                  [--unlink kind=ref]...                          # 删关联；先删后加，--unlink 旧 --link 新 = 替换
@@ -324,7 +324,7 @@ botmux board guide                                               # 打印管家�
 - 飞书侧栏的真机体验要你来看。
 
 **后续**：
-- 定时巡检（独立功能）：按频率叫醒管家，扫 owner 名下未完成的会话和 PR，把要拍板的写进看板。在那之前，可以用现有定时任务手配一条，prompt 里写巡检要求即可，看板这边不用改。
+- ~~定时巡检~~：已做，见第 11 节。
 - 和项目群模式打通：项目主控遇到要 owner 拍板的阻塞时写进管家看板，事项关联到项目群。
 - 管家群里放一张就地更新的「看板摘要卡」（待拍板数 + 打开看板按钮），代替每轮的长汇报。
 - 在卡片上直接点 A/B 写草稿（仍然要点提交）。
@@ -353,3 +353,25 @@ botmux board guide                                               # 打印管家�
 5. **和项目群模式的关系**：A（推荐）分开做，后续让项目主控把要拍板的阻塞写进管家看板；B 把看板做成项目群模式的一部分（每个项目一张），管家就是项目主控。
 
 参考：[飞书开放平台：在飞书内打开网页（web_url/open）](https://open.feishu.cn/document/common-capabilities/applink-protocol/supported-protocol/open-the-web-view-in-feishu-to-access-the-specified-url?lang=zh-CN)
+
+## 11. 定时巡检（2026-11-03 追加）
+
+按频率叫醒管家，扫 owner 名下没完成的事，把要拍板的写进看板。方案讨论见 [issue #2731](https://github.com/deepcoldy/botmux/issues/2731)。
+
+**触发**：复用定时任务，不加调度器、不加 `steward` 字段、不加表。巡检就是建在管家群的一条普通定时任务（`--silent`，没有新情况不发消息），prompt 固定一句「【决策看板 · 巡检】按 botmux board guide 里「定时巡检」一节执行」。owner 在管家群里说要巡检，管家按 guide 用 `botmux schedule add` 建；改频率、暂停、删除走 `botmux schedule` 和 Dashboard 定时任务页。巡检回合和批次落在同一个管家群 chat 级会话，赶上管家在跑就按现有机制排队。
+
+**规则（预置 guide「定时巡检」一节）**，来自手配回扫时踩过的四个坑：
+
+| 坑 | 规则 |
+|---|---|
+| 没有原文链接的事项进了看板 | 原文 = 触发这件事的飞书消息或话题（owner 判断时要看的上下文）。每项带能直接跳过去的定位链接：话题 `thread=oc_…/omt_…`、单条消息 `url=`、botmux 会话 `session=`、PR / issue `pr=` / `issue=`；找不到原文的不写 |
+| 已经办完的又被报出来 | 先收口再发现：没结束的项逐项核对现状；写之前核对，已合 / 已关 / 已定的不写成待拍板 |
+| 同一件事报了两次 | `--key` 与原文来源一一对应、格式固定（`thread:omt_…`、`msg:om_…`、`session:<id>`、`pr:owner/repo#N`、`issue:owner/repo#N`）；只报增量，报过的项记一句历史，已在待拍板、报过、没变化的不再提醒，没报出去的下一轮补报 |
+| 很久以前的旧事被翻出来 | 只看最近 7 天有动静的；更早的、看板上没有的不翻 |
+
+**代码护栏（唯一的行为改动）**：`board add` 命中已有 key、而那一项已结束（done / closed）时拒绝（`item_ended`，409），不改它。原来同 key 的 add 等于 set，巡检误判一次就能把关掉的旧事改回待拍板，靠 prompt 拦不住。重开要显式 `board set`。
+
+**巡检上报命令（复审修正）**：巡检回合是 `--silent` 定时任务在管家群的 chat 级回合，daemon 不发 banner、不播种这一回合的 reply-target，CLI 侧没有「触发消息发送者」，`botmux send --mention-back` 会被 @ 决策门禁拒绝（exit 2）。所以 guide 里巡检的汇总上报固定写 `botmux send --attention=decision --no-mention "…"`：消息照常发到管家群，`--attention=decision` 把会话举进 dashboard「需要你」列；确实要飞书里 @ owner 时显式写 `--mention <owner 的 open_id>`。「要 owner 拍板」一节保留 `--mention-back`，那一节发生在真人回合，有触发消息发送者。
+
+botmux 本身仍不调 GitHub API，PR 由管家用仓库自己的工具（如 gh）查。
+

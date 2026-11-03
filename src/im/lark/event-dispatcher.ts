@@ -97,6 +97,7 @@ import { sessionKey } from '../../core/types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { readBotsInfoJson } from '../../services/bots-info-cache.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry, type BotsInfoObjectEntry } from '../../services/bots-info-shape.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
 import type { DurableInboxEvent, DurableInboxStore } from '../../services/durable-coordination.js';
@@ -1446,12 +1447,6 @@ export function isTrustedSameOwnerSiblingBot(
   return true;
 }
 
-type BotsInfoNameEntry = { larkAppId?: unknown; botName?: unknown };
-
-function isBotsInfoNameEntry(entry: unknown): entry is BotsInfoNameEntry {
-  return typeof entry === 'object' && entry !== null;
-}
-
 /**
  * 同 owner 腿（evaluateTalk 的 sameOwnerBot）放行的，是本 bot 还没学到 open_id 的兄弟 bot：它绕过了
  * @ 闸门里的冷启动自愈，就在这里替自愈做它会做的那件事——把「名字 → 本 bot 视角的 open_id」记进
@@ -1469,10 +1464,9 @@ export function learnSameOwnerSiblingCrossRef(
   if (!senderOpenId) return false;
   const sibling = resolveLocalSiblingBotByUnionId(dataDir, larkAppId, senderUnionId);
   if (!sibling) return false;
-  let entries: BotsInfoNameEntry[] = [];
+  let entries: BotsInfoObjectEntry[] = [];
   try {
-    const raw = readBotsInfoJson(dataDir);
-    if (Array.isArray(raw)) entries = raw.filter(isBotsInfoNameEntry);
+    entries = botsInfoObjectEntries(readBotsInfoJson(dataDir));
   } catch {
     return false;
   }
@@ -1550,12 +1544,9 @@ export function resolveSiblingBotNameByUnionId(
 
   // appId → current botName from the shared, rename-fresh bots-info.json.
   try {
-    const raw = readBotsInfoJson(dataDir);
-    if (Array.isArray(raw)) {
-      const entries = raw.filter(isBotsInfoNameEntry);
-      const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
-      if (typeof name === 'string' && name.trim()) return name.trim();
-    }
+    const entries = botsInfoObjectEntries(readBotsInfoJson(dataDir));
+    const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
+    if (typeof name === 'string' && name.trim()) return name.trim();
   } catch { /* fall through to caller's cross-ref path */ }
   return undefined;
 }
@@ -1607,14 +1598,9 @@ export function updateBotOpenIdCrossRef(
   // Read known bot names from bots-info.json
   const knownBotNames = new Set<string>();
   try {
-    const raw = readBotsInfoJson(dataDir);
-    if (Array.isArray(raw)) {
-      const entries = raw.filter(isBotsInfoNameEntry);
-      for (const e of entries) {
-        if (typeof e.botName === 'string' && e.botName) {
-          knownBotNames.add(e.botName.toLowerCase());
-        }
-      }
+    const entries = botsInfoObjectEntries(readBotsInfoJson(dataDir)).filter(isBotsInfoNameEntry);
+    for (const e of entries) {
+      knownBotNames.add(e.botName.toLowerCase());
     }
   } catch { /* ignore */ }
   if (knownBotNames.size === 0) return;

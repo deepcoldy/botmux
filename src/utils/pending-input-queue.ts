@@ -64,6 +64,10 @@ export interface PendingCliInput {
    * the original turn id for reply attribution but is never merged with a
    * later user input. */
   traexAutoModelRecovery?: true;
+  /** This still-queued independent turn has completed its read-only TraeX load
+   * admission. It survives an intentional exact-resume model restart so the
+   * original prompt is submitted once without repeating the preflight. */
+  traexAutoModelPreflightDone?: true;
   taskContinuation?: TaskContinuationDispatchMarker;
   /** `content` as it was before a restart note was put in front of it (see
    *  services/restart-interruption.ts). Lets a replay of this input after a
@@ -260,7 +264,7 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
  * Riff (and any queue-after-spawn adapter) has passesInitialPromptViaArgs=false
  * — must return false, or the first markPromptReady would clear isPromptReady
  * and leave the post-spawn queue flush never firing.
- * Gemini/Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
+ * Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
  * idle signal — first ready IS completion; must return false or they stick
  * (use {@link shouldTrackArgvBakedFirstPrompt} + seed working→idle instead).
  *

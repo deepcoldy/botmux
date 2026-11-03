@@ -138,7 +138,7 @@ describe('zeroPromptInjectionUnsupportedReason', () => {
     ['claude-code', {}, null],
     ['codex', { backendType: 'tmux' }, null],
     ['cursor', { sandbox: 'oncall' }, null],
-    ['gemini', {}, 'cli_unsupported'],
+    ['opencode', {}, 'cli_unsupported'],
     [undefined, {}, 'cli_unsupported'],
     ['claude-code', { backendType: 'riff' }, 'backend_unsupported'],
     ['cursor', { sandbox: 'scratch' }, 'scratch_unsupported_for_cli'],

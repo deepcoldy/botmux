@@ -14,7 +14,6 @@ import { createCocoAdapter, cocoBridgeSpec } from './coco.js';
 import { createCodexAdapter, codexBridgeSpec } from './codex.js';
 import { createCodexAppAdapter } from './codex-app.js';
 import { createCursorAdapter, cursorBridgeSpec } from './cursor.js';
-import { createGeminiAdapter } from './gemini.js';
 import { createGeniusAdapter } from './genius.js';
 import { createOpenCodeAdapter } from './opencode.js';
 import { createOpenCode2Adapter } from './opencode2.js';
@@ -41,6 +40,7 @@ import { createMojoAdapter } from './mojo.js';
 import { createMinimaxAdapter } from './minimax.js';
 import { createRemoteRunnerAdapter } from './remote-runner.js';
 import { createZcodeAdapter } from './zcode.js';
+import { retiredCli, retiredCliNotice } from './retired-cli.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -59,7 +59,6 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // second-stage dependency.
   'codex-app': 'codex',
   cursor: 'cursor-agent',
-  gemini: 'gemini',
   genius: 'genius',
   opencode: 'opencode',
   opencode2: 'opencode2',
@@ -314,7 +313,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string, opts?: 
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createCodemAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter, createZcodeAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createCodemAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter, createZcodeAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): CliAdapter {
@@ -327,7 +326,6 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
     case 'codex': return createCodexAdapter(pathOverride);
     case 'codex-app': return createCodexAppAdapter(pathOverride);
     case 'cursor': return createCursorAdapter(pathOverride);
-    case 'gemini': return createGeminiAdapter(pathOverride);
     case 'genius': return createGeniusAdapter(pathOverride);
     case 'opencode': return createOpenCodeAdapter(pathOverride);
     case 'opencode2': return createOpenCode2Adapter(pathOverride);
@@ -354,7 +352,11 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
     case 'minimax': return createMinimaxAdapter(pathOverride);
     case 'remote-runner': return createRemoteRunnerAdapter(pathOverride);
     case 'zcode': return createZcodeAdapter(pathOverride);
-    default: throw new Error(`Unknown CLI adapter: ${id}`);
+    default:
+      // A session persisted on a removed CLI (e.g. switched with `/cli gemini`)
+      // fails with the migration notice, not a bare "unknown adapter".
+      if (retiredCli(id)) throw new Error(retiredCliNotice(id));
+      throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }
 

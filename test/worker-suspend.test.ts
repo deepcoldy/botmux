@@ -40,7 +40,6 @@ const CLI_IDS: CliId[] = [
   'codex',
   'codex-app',
   'cursor',
-  'gemini',
   'opencode',
   'antigravity',
   'mtr',

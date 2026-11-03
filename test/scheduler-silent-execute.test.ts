@@ -1649,7 +1649,7 @@ describe('executeScheduledTask — per-task model / reasoning effort', () => {
   });
 
   it('drops both when the bot now runs a CLI without the override contract', async () => {
-    cliOf('gemini');
+    cliOf('opencode');
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(
       baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'high' }),

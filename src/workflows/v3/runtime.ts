@@ -26,6 +26,7 @@ export {
   readRevisitRequest,
   renderGoalFile,
   revisitBudgetStatus,
+  v3AcceptanceProbeUnknownSince,
   validateResult,
 } from './shared-node-runtime.js';
 export type {

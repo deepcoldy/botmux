@@ -89,7 +89,7 @@ const tagOf = () => randomBytes(5).toString('hex');
 /** The probe the model runs through the CLI's shell tool on the first turn. */
 /** The probe script the first turn runs (written into the working dir by the
  *  harness, so the tool call itself is one plain `bash ./sbx-<tag>.sh` line:
- *  CLIs with their own command policies reject `$(...)` (Gemini) or ask before
+ *  CLIs with their own command policies may reject `$(...)` or ask before
  *  touching paths outside the workdir (OpenCode), neither of which is what this
  *  matrix measures). */
 function firstProbeScript(tag: string): string {

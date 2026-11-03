@@ -9,8 +9,6 @@ type Props = {
   chatId: string;
   appId: string;
   botName: string;
-  /** 可见标题；按 bot 分栏展示时传设置名，缺省显示 botName。 */
-  label?: string;
   cliId?: string;
   botModel?: string;
   botEffort?: string;
@@ -22,7 +20,7 @@ type Props = {
 /** The CLI is display-only and always follows the bot's Agent configuration. */
 export function GroupDefaultModelsRow(props: Props) {
   if (props.cliId !== 'codex' && props.cliId !== 'claude-code') {
-    return <p>{props.label ?? props.botName} · CLI：{props.cliId ?? '未加载'}（暂不支持群级模型配置）</p>;
+    return <p className="group-default-models-cli">CLI：{props.cliId ?? '未加载'}（暂不支持群级模型配置）</p>;
   }
   return <GroupAgentDefaults key={`${props.appId}:${props.cliId}`} {...props} cliId={props.cliId} />;
 }
@@ -82,7 +80,7 @@ function GroupAgentDefaults(props: Props & { cliId: 'codex' | 'claude-code' }) {
 
   const id = `group-${props.appId}`;
   return <form onSubmit={save} className="group-default-models-row">
-    <strong>{props.label ?? props.botName} · CLI：{props.cliId === 'codex' ? 'Codex' : 'Claude'}（跟随 Agent 配置）</strong>
+    <small className="group-default-models-cli">CLI：{props.cliId === 'codex' ? 'Codex' : 'Claude'}（跟随 Agent 配置）</small>
     <div className="group-default-models-field"><span>模型</span>
       <ModelPickerField value={settings.model ?? ''} onChange={changeModel} options={options}
         disabled={props.disabled || saving} busy={detecting} dataInput={`${id}-model`}

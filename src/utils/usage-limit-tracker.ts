@@ -132,8 +132,8 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
    *    run 7 more turns / 12 more user messages afterwards. Unlike the 429 path
    *    (one appended record per refusal), a usage refusal is recorded once.
    *
-   * Consequence, deliberately: CLIs that never reach noteTurnCompleted (gemini
-   * is not in STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) keep the previous behavior
+   * Consequence, deliberately: CLIs that never reach noteTurnCompleted (those
+   * not in STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) keep the previous behavior
    * exactly. Those are the CLIs with no authoritative limit signal at all, where
    * suppressing a repeated banner would risk hiding a real block.
    */

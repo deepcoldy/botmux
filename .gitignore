@@ -19,8 +19,6 @@ docs/specs/
 storageState.json
 midscene_run/
 .midscene/
-# Diagnostic artifact written by the mock LLM's Gemini shell-tool probe (core-clis lane).
-.e2e-gemini-shell-env.log
 .codex
 .claude/
 .codegraph/

@@ -228,7 +228,7 @@ describe('usage-limit tracker — 屏幕上的旧限额横幅不得每轮重新�
   // 另一个 CLI 家族的「带明确重置时刻的 rate 限额」（仓库既有真路径，见
   // cli-usage-limit.test.ts）。它走 parseMeridiemTime 拿固定钟点，不走 5 分钟
   // 分桶，所以 key 不会自己递进——这类必须保持原语义，绝不能被抑制。
-  const GEMINI_RATE_BANNER = 'Rate limit exceeded. Try again at 10:36 PM.';
+  const RESET_TIME_RATE_BANNER = 'Rate limit exceeded. Try again at 10:36 PM.';
 
   // 把时钟钉在 8:45 PM 之前，让 retryReady 稳定为 false（回归的前提条件）。
   // 不钉时钟的话，用例在每天 20:45 之后会因为 retryReady 变 true 而「自己变
@@ -243,7 +243,7 @@ describe('usage-limit tracker — 屏幕上的旧限额横幅不得每轮重新�
     isRateKindSuppressed: () => true,
     isOutputActive: () => false,
   });
-  /** 非结构化 CLI（gemini/grok/traex…）：rate 扫屏在用，且没有结构化兜底。 */
+  /** 非结构化 CLI（grok/traex…）：rate 扫屏在用，且没有结构化兜底。 */
   const plainTracker = () => createUsageLimitTracker({
     isRateKindSuppressed: () => false,
     isOutputActive: () => false,
@@ -426,19 +426,19 @@ describe('usage-limit tracker — 屏幕上的旧限额横幅不得每轮重新�
   });
 
   it('非结构化 CLI 的带钟点限额：重试仍被拒时必须继续上报', () => {
-    // 无结构化兜底的 CLI（gemini/grok/traex…）：其带明确钟点的限额走固定
+    // 无结构化兜底的 CLI（grok/traex…）：其带明确钟点的限额走固定
     // retryAtMs、不走 5 分钟分桶，key 不会自己递进。用户在真限额期间重试、
     // CLI 以同文案再拒时，必须照报——否则真限额被静默到跨日。
     const tracker = plainTracker();
-    tracker.beginTurn(GEMINI_RATE_BANNER);
-    expect(tracker.classify(GEMINI_RATE_BANNER, 'idle').status).toBe('limited');
+    tracker.beginTurn(RESET_TIME_RATE_BANNER);
+    expect(tracker.classify(RESET_TIME_RATE_BANNER, 'idle').status).toBe('limited');
   });
 
   it('非结构化 CLI 连续多轮重试都要上报', () => {
     const tracker = plainTracker();
     for (let turn = 0; turn < 5; turn++) {
-      tracker.beginTurn(GEMINI_RATE_BANNER);
-      expect(tracker.classify(GEMINI_RATE_BANNER, 'idle').status).toBe('limited');
+      tracker.beginTurn(RESET_TIME_RATE_BANNER);
+      expect(tracker.classify(RESET_TIME_RATE_BANNER, 'idle').status).toBe('limited');
     }
   });
 

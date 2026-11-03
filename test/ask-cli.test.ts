@@ -61,6 +61,60 @@ function runAsk(
 }
 
 describe('botmux ask — CLI boundary', () => {
+  it('normalizes literal paragraph separators in a positional prompt', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-newlines-'));
+    tempDirs.push(dataDir);
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer(async (req, res) => {
+      const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (body !== undefined) requestBody = body;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir, { recursive: true });
+      writeFileSync(join(registryDir, 'cli_test.json'), JSON.stringify({
+        larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now(),
+      }));
+      const result = await runAsk(dataDir, [
+        'ask', 'buttons', '--options', 'yes,no', '第一段\\n\\n第二段',
+      ]);
+      expect(result.status).toBe(0);
+      expect(requestBody?.prompt).toBe('第一段\n\n第二段');
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it('preserves a bare-alias prompt that starts with the word buttons', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-buttons-prompt-'));
+    tempDirs.push(dataDir);
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer(async (req, res) => {
+      const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (body !== undefined) requestBody = body;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir, { recursive: true });
+      writeFileSync(join(registryDir, 'cli_test.json'), JSON.stringify({
+        larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now(),
+      }));
+      const result = await runAsk(dataDir, [
+        'ask', '--options', 'yes,no', 'buttons', '是否继续？',
+      ]);
+      expect(result.status).toBe(0);
+      expect(requestBody?.prompt).toBe('buttons 是否继续？');
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it.each([undefined, 'om_project_card'])('chat scope sends a top-level ask with root=%s', async (root) => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-chat-'));
     tempDirs.push(dataDir);

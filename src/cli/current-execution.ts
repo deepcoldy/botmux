@@ -1,4 +1,5 @@
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
+import { findOnlineDaemon, parseDaemonIpcPort } from '../utils/daemon-discovery.js';
 
 export const CURRENT_EXECUTION_SCHEMA = 'botmux.current-execution.v1' as const;
 export const CURRENT_EXECUTION_ROUTE = '/api/current-execution';
@@ -143,11 +144,15 @@ export async function resolveCurrentExecutionIdentity(options: {
   }
   let response: Response;
   try {
+    // Discovery updates routing after daemon restart. It never supplies turn
+    // authority: the destination still attests the actual socket process.
+    const ipcPort = options.fetchImpl ? options.ipcPort
+      : parseDaemonIpcPort(findOnlineDaemon(options.larkAppId)?.ipcPort) ?? options.ipcPort;
     response = await (options.fetchImpl ?? loopbackFetchImpl)(
-      `http://127.0.0.1:${options.ipcPort}${CURRENT_EXECUTION_IDENTITY_ROUTE}`, {
+      `http://127.0.0.1:${ipcPort}${CURRENT_EXECUTION_IDENTITY_ROUTE}`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId: options.sessionId, tool: options.tool }),
-        redirect: 'error', signal: AbortSignal.timeout(5000),
+        redirect: 'error', signal: AbortSignal.timeout(20_000),
       },
     );
   } catch (error) {

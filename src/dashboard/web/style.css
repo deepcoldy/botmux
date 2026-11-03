@@ -2016,7 +2016,7 @@ button.primary {
 .cli-codex       { background: #fff0df; color: #a14c11; border-color: #ffd8ad; }
 .cli-codex-app   { background: #e9f7ff; color: #11638f; border-color: #bde4fa; }
 .cli-cursor      { background: #ece9ff; color: #5b4ac7; border-color: #d9d2ff; }
-.cli-gemini      { background: #fde7f1; color: #a13268; border-color: #fac8df; }
+.cli-antigravity { background: #fde7f1; color: #a13268; border-color: #fac8df; }
 .cli-opencode    { background: #e7f7ec; color: #176b36; border-color: #bfe8ce; }
 .cli-mtr         { background: #e5f5ff; color: #0f6388; border-color: #b8e2f7; }
 .cli-hermes      { background: #f0f4e4; color: #546b14; border-color: #d9e9a8; }
@@ -2030,7 +2030,7 @@ button.primary {
 :root[data-theme="dark"] .cli-codex,
 :root[data-theme="dark"] .cli-codex-app,
 :root[data-theme="dark"] .cli-cursor,
-:root[data-theme="dark"] .cli-gemini,
+:root[data-theme="dark"] .cli-antigravity,
 :root[data-theme="dark"] .cli-opencode,
 :root[data-theme="dark"] .cli-mtr,
 :root[data-theme="dark"] .cli-hermes,
@@ -6518,6 +6518,18 @@ dialog.onboarding-dialog::backdrop {
   border: none;
 }
 
+/* 回复模式块的标题已经是「普通群回复模式」，下拉框自己的「回复模式」标签只留给读屏。
+   按 data 属性定向：只有调用方显式传了字段标签时才隐藏，避免未来新增不传 label
+   的调用点时把 botName 视觉隐藏。 */
+#g-drawer .g-setting-body .group-reply-mode-row > label[data-reply-mode-label] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 #g-drawer .g-role-line {
   display: flex;
   align-items: center;
@@ -6579,18 +6591,73 @@ dialog.onboarding-dialog::backdrop {
   }
 }
 
-.groups-session-section > summary {
-  padding: 10px 4px;
-  color: var(--fg);
-  font-weight: 600;
-  cursor: pointer;
-  opacity: 0.85;
+/* 会话群行：标题 + 会话状态；第二行是机器人、最近活跃、创建时间。 */
+.groups-page .groups-session-state {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
-.groups-session-section > summary > span {
-  margin-left: 8px;
+.groups-page .groups-session-state-active {
+  border-color: color-mix(in srgb, var(--success) 34%, var(--border-soft));
+  background: color-mix(in srgb, var(--success) 8%, var(--surface));
+  color: var(--success);
+}
+
+.groups-page .groups-session-state-closed {
+  border-style: dashed;
+  color: var(--faint);
+}
+
+.groups-page .groups-session-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-width: 0;
   color: var(--muted);
-  font-weight: 400;
+  font-size: 12px;
+}
+
+.groups-page .groups-session-bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 220px;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.groups-page .groups-session-bot > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.groups-page .groups-session-bot .orb-avatar-sm {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.groups-page .groups-session-bot:hover,
+.groups-page .groups-session-bot:focus-visible {
+  color: var(--accent-strong);
 }
 
 @media (max-width: 720px) {
@@ -6703,6 +6770,22 @@ dialog.onboarding-dialog::backdrop {
   background: color-mix(in srgb, var(--warning) 8%, transparent);
   border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
 }
+
+/* Shared-bot sandbox advice: one short line per fact, verified CLIs folded. */
+.bd-section-note.bd-shared-sandbox-advice {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  line-height: 1.55;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, transparent);
+}
+.bd-shared-sandbox-advice p { margin: 0; }
+.bd-shared-sandbox-advice p + p { margin-top: 2px; }
+.bd-shared-sandbox-advice details { margin-top: 4px; }
+.bd-shared-sandbox-advice summary { cursor: pointer; width: fit-content; }
+.bd-shared-sandbox-advice details p { margin-top: 2px; color: var(--muted); }
 
 /* ── Sandbox directory whitelist tree ── */
 .bd-sbx-tree { margin-top: 10px; max-height: 380px; overflow: auto; border: 1px solid var(--border-soft); border-radius: 9px; padding: 8px; font-size: 13px; }
@@ -14017,7 +14100,7 @@ tbody tr[data-chat]:hover {
   }
 }
 
-.groups-page .groups-list-row .overview-list-tail button {
+.groups-page .groups-list-row .overview-list-tail :is(button, .btn-link) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -14052,13 +14135,13 @@ tbody tr[data-chat]:hover {
   color: var(--accent-strong);
 }
 
-.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat) {
+.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat, .groups-list-row .open-chat, .groups-list-row .open-session) {
   border-color: var(--border-soft);
   background: var(--surface);
   color: var(--muted);
 }
 
-.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat):hover:not(:disabled) {
+.groups-page :where(.groups-list-row .clone-chat, .groups-list-row .manage-chat, .groups-list-row .open-chat, .groups-list-row .open-session):hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface));
   color: var(--accent-strong);
@@ -15655,6 +15738,53 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .groups-toolbar {
   align-items: center;
+}
+
+/* 普通群 / 会话群切换：工具栏最左侧，两侧各带数量。 */
+.groups-view-switch {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+}
+
+.groups-page .groups-view-switch button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: calc(var(--button-height) - 8px);
+  padding: 0 14px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  transition: background-color 80ms ease, color 80ms ease;
+}
+
+.groups-page .groups-view-switch button small {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.groups-page .groups-view-switch button:hover:not(.active) {
+  color: var(--fg);
+}
+
+.groups-page .groups-view-switch button.active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.groups-page .groups-view-switch button.active small {
+  color: inherit;
+  opacity: .8;
 }
 
 .groups-toolbar input[type="search"] {
@@ -19186,7 +19316,7 @@ button.webhook-log-row.active {
 :root[data-skin="cyber"] .cli-codex,
 :root[data-skin="cyber"] .cli-codex-app,
 :root[data-skin="cyber"] .cli-cursor,
-:root[data-skin="cyber"] .cli-gemini,
+:root[data-skin="cyber"] .cli-antigravity,
 :root[data-skin="cyber"] .cli-opencode,
 :root[data-skin="cyber"] .cli-mtr,
 :root[data-skin="cyber"] .cli-hermes,
@@ -19811,6 +19941,15 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .st-cancelled   { --ns: var(--v3r-skipped); }
 .st-blocked     { --ns: var(--v3r-blocked); }
 .st-failed      { --ns: var(--v3r-failed); }
+/* Display buckets (等待 / 进行中 / 完成 / 失败 / 等人工确认 …). Declared after
+   .st-* so a node carrying both classes is colored by its display bucket:
+   gate waits and blocked nodes both read as "needs a person". */
+.ds-waiting     { --ns: var(--v3r-pending); }
+.ds-running     { --ns: var(--v3r-running); }
+.ds-done        { --ns: var(--v3r-done); }
+.ds-failed      { --ns: var(--v3r-failed); }
+.ds-needsHuman  { --ns: var(--v3r-gate); }
+.ds-skipped, .ds-cancelled, .ds-superseded { --ns: var(--v3r-skipped); }
 /* skipped 整体降透明度 + 虚线盒 — 一眼读出"这条路没走"，与 pending 区分 */
 .v3r-node.st-skipped, .v3r-node.st-cancelled { opacity: .55; }
 .v3r-node.st-skipped .v3r-box, .v3r-node.st-cancelled .v3r-box { stroke-dasharray: 4 3; }
@@ -19867,6 +20006,10 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-node .v3r-nid {
   fill: var(--fg); font-family: var(--mono); font-size: 12px; font-weight: 600;
 }
+.v3r-node .v3r-nbot {
+  fill: var(--muted); font-size: 11px;
+}
+.v3r-node .v3r-nbot.empty { fill: var(--faint, var(--muted)); }
 .v3r-node .v3r-nstatus {
   fill: var(--ns); font-size: 10.5px; font-weight: 600;
   font-variant-numeric: tabular-nums;
@@ -20261,6 +20404,41 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-deps {
   margin: 0;
 }
+
+.v3r-exec {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+.v3r-exec-row {
+  margin: 0;
+  display: flex;
+  gap: .6em;
+  align-items: baseline;
+}
+.v3r-exec-row > span:first-child {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.v3r-attempts {
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.v3r-attempts li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .8em;
+  color: var(--muted);
+}
+.v3r-attempts .n { color: var(--fg); }
+.v3r-attempts .o-succeeded { color: var(--v3r-done); }
+.v3r-attempts .o-failed { color: var(--v3r-failed); }
+.v3r-attempts .o-blocked { color: var(--v3r-blocked); }
+.v3r-attempts .o-running { color: var(--v3r-running); }
 
 .v3r-dep,
 .v3r-granted-tag,
@@ -33166,7 +33344,13 @@ a.card-menu-item {
   gap: 12px;
   padding: 12px 0;
 }
-.group-default-models-row > strong { flex-basis: 100%; }
+/* 两个分支（不支持配置时的裸 <p>、可配置时行内的 <small>）都用同一弱化样式，
+   不依赖外层是不是 .group-default-models-row。 */
+.group-default-models-cli {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+}
 .group-default-models-field { display: grid; gap: 6px; flex: 1 1 180px; }
 .group-default-models-row input { width: 100%; min-width: 0; }
 .group-default-models-row > small { flex-basis: 100%; }

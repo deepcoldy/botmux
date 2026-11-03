@@ -1,7 +1,7 @@
 /**
  * E2E test: OpenCode CLI first-input submission.
  *
- * Root cause (same class as Gemini): OpenCode uses Bubble Tea TUI which has
+ * Root cause (async TUI startup): OpenCode uses Bubble Tea TUI which has
  * an async startup phase.  Writing to stdin during this window may be silently
  * lost because the text input component hasn't mounted yet.
  *

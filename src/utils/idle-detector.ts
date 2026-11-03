@@ -135,8 +135,15 @@ export class IdleDetector {
   private programStatusErrorMsg: string | undefined;
   /** Wall clock of the last accepted OSC 7501 report (0 = none yet). */
   private programStatusLastAtMs = 0;
+  /** CliAdapter.programStatusSubmitAwaitsBusy. */
+  private readonly submitAwaitsBusy: boolean;
+  /** Deadline set by reset() when submitAwaitsBusy (0 = not waiting). Until a
+   *  `working` / `blocked` report arrives, a terminal report is left over from
+   *  before the submit and does not complete the turn. */
+  private submitBusyDeadlineMs = 0;
 
   constructor(cli: CliAdapter, private readonly captureStartupScreen?: () => string) {
+    this.submitAwaitsBusy = cli.programStatusSubmitAwaitsBusy === true;
     this.completionPattern = cli.completionPattern;
     this.idleToBusyPattern = cli.idleToBusyPattern;
     this.staticBusyPattern = cli.staticBusyPattern;
@@ -180,7 +187,7 @@ export class IdleDetector {
       // edge while the worker's ready gate still holds, the worker drops it,
       // and every caller of this method is one still waiting for an edge.
       // Skipping it left the first prompt to the 15s timeout (#2178).
-      if (!this.isTerminalProgramStatus()) return false;
+      if (!this.isTerminalProgramStatus() || this.submitBusyDeadlineMs !== 0) return false;
       this.markIdle('program-status');
       return true;
     }
@@ -352,6 +359,7 @@ export class IdleDetector {
     this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = Date.now();
     this.clearTimer();
+    this.submitBusyDeadlineMs = this.submitAwaitsBusy ? Date.now() + PROGRAM_STATUS_FALLBACK_MS : 0;
     // A new submit invalidates the previous snapshot. Stale terminal states
     // (idle / done / error) must not immediately complete the turn we just started.
     // If any working or blocked record remains, keep authority and do not arm
@@ -390,7 +398,8 @@ export class IdleDetector {
     // armed before this call, sees a fresh program-status edge. A working
     // or blocked snapshot stays busy; Claude emits `idle` when the prompt
     // is actually ready.
-    const republishTerminal = this.programStatusAuthority && this.isTerminalProgramStatus();
+    const republishTerminal = this.programStatusAuthority && this.isTerminalProgramStatus()
+      && this.submitBusyDeadlineMs === 0;
     this.isIdle = false;
     this.busyTransitionArmed = false;
     this.outputTail = '';
@@ -416,12 +425,24 @@ export class IdleDetector {
 
     if (event.state === 'clear') {
       if (event.id === undefined) {
-        this.exitProgramStatusAuthority();
+        // A bare `clear` empties the whole state table.
+        this.programStatusRecords.clear();
+        this.evictedBusyIds.clear();
+        this.programStatusBlockInfo = null;
+        this.programStatusErrorMsg = undefined;
+        // programStatusSubmitAwaitsBusy: Kimi's cold-start session reset emits
+        // this `clear` between the submit and the first busy report. Dropping
+        // authority here would hand the turn to the 2s screen-quiet path while
+        // a static approval dialog may already be painted. Keep authority until
+        // the busy report or the submit deadline.
+        if (!this.armSubmitBusyFallback()) this.exitProgramStatusAuthority();
         return;
       }
       this.deleteProgramStatusSubtree(event.id);
       if (this.programStatusRecords.size === 0 && this.evictedBusyIds.size === 0) {
-        this.exitProgramStatusAuthority();
+        if (!this.armSubmitBusyFallback()) {
+          this.exitProgramStatusAuthority();
+        }
         return;
       }
       this.programStatusAuthority = true;
@@ -455,6 +476,7 @@ export class IdleDetector {
       app,
       at: ++this.programStatusClock,
     });
+    if (event.state === 'working' || event.state === 'blocked') this.submitBusyDeadlineMs = 0;
     this.evictProgramStatusRecords();
     this.programStatusAuthority = true;
     this.clearProgramStatusFallback();
@@ -789,7 +811,41 @@ export class IdleDetector {
   private publishHeldProgramStatusTerminal(): void {
     if (!this.programStatusAuthority || this.isStartupPending()) return;
     if (!this.isTerminalProgramStatus() || this.isIdle) return;
+    if (this.holdTerminalForSubmitBusy()) return;
     this.markIdle('program-status');
+  }
+
+  /** programStatusSubmitAwaitsBusy: whether this terminal report must wait for
+   *  the submit's busy report. While it waits, a fallback timer runs to the
+   *  deadline fixed at reset(); repeated reports re-arm it for the remaining
+   *  time only. At the deadline the detector leaves authority and the screen
+   *  decides. */
+  private holdTerminalForSubmitBusy(): boolean {
+    return this.armSubmitBusyFallback();
+  }
+
+  /** While a submit is waiting for its first busy report, keep authority alive
+   *  to the deadline fixed at reset() and arm (or re-arm for the remaining time
+   *  only) the timer that drops it. Returns false when no submit is waiting
+   *  (opt-in off, busy already seen, or deadline passed); the caller then takes
+   *  the ordinary path (publish the terminal, or leave authority). A `clear`
+   *  that empties the records must call this: reset() withholds its own timer
+   *  while a busy record is held, so the record the clear just removed leaves
+   *  nothing that would otherwise release the hold. */
+  private armSubmitBusyFallback(): boolean {
+    if (this.submitBusyDeadlineMs === 0) return false;
+    const remaining = this.submitBusyDeadlineMs - Date.now();
+    if (remaining <= 0) {
+      this.submitBusyDeadlineMs = 0;
+      return false;
+    }
+    this.clearProgramStatusFallback();
+    this.programStatusFallbackTimer = setTimeout(() => {
+      this.programStatusFallbackTimer = null;
+      this.submitBusyDeadlineMs = 0;
+      this.exitProgramStatusAuthority();
+    }, remaining);
+    return true;
   }
 
   private applyProgramStatus(): void {
@@ -817,6 +873,7 @@ export class IdleDetector {
       // must not retire that hold; the ready banner publishes the turn.
       if (this.isStartupPending()) return;
       this.markStartupComplete();
+      if (this.holdTerminalForSubmitBusy()) return;
       if (!this.isIdle) this.markIdle('program-status');
     }
   }

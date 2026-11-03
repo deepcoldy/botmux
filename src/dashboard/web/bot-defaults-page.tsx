@@ -101,12 +101,14 @@ import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../servi
 import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
+import { allowlistSandboxVerifiedClis, sharedBotSandboxAdvice } from '../../core/shared-bot-sandbox-advice.js';
+import { lookupCliDisplayName } from '../../adapters/cli/display-names.js';
 import { fetchAgents } from './agents-api.js';
 import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings, type TraexAutoModelPreviousSettings } from '../../services/traex-auto-model.js';
 import { TraexAutoModelEditor } from './traex-auto-model-editor.js';
 import {
   autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
-  strongestTraexModelSettings, type TraexAutoModelDraft,
+  strongestTraexModelSettings, strongestTraexPreflightModelSettings, type TraexAutoModelDraft,
 } from './traex-auto-model-preferences.js';
 import { AGENT_SECTIONS } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
@@ -639,6 +641,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
     codexBrowser: body.codexBrowser,
+    codexBrowserAutoApproveOrigins: body.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
@@ -999,7 +1002,7 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
         <b><OverflowText text={name} showPopover={false} textClassName="bd-roster-name" /></b>
         <span>{cli || bot.larkAppId.slice(0, 14)}</span>
       </div>
-      {bot.startupBlocked?.reason === 'quota_fallback_cycle'
+      {bot.startupBlocked
         ? <span className="bd-roster-flag bd-roster-flag-blocked">{tr('botDefaults.startupBlockedBadge')}</span>
         : bot.online === false ? <span className="bd-roster-flag">{tr('botDefaults.offlineBadge')}</span>
         : bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
@@ -1083,8 +1086,8 @@ function BotDefaultsCard(props: {
               patchBot={patchBot}
               meta={(
                 <>
-                  {bot.startupBlocked?.reason === 'quota_fallback_cycle'
-                    ? <small className="bd-meta-blocked">● {tr('botDefaults.metaStartupBlocked')}</small>
+                  {bot.startupBlocked
+                    ? <small className="bd-meta-blocked">● {tr(bot.startupBlocked.reason === 'retired_cli' ? 'botDefaults.metaRetiredCli' : 'botDefaults.metaStartupBlocked')}</small>
                     : bot.online === false ? <small>● {tr('botDefaults.metaOffline')}</small>
                     : <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>}
                   {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
@@ -1101,6 +1104,11 @@ function BotDefaultsCard(props: {
         <div className="bd-startup-blocked" role="alert" data-startup-blocked>
           <strong>{tr('botDefaults.startupBlockedTitle')}</strong>
           <span>{tr('botDefaults.startupBlockedHelp', { cycle: bot.startupBlocked.cycle.join(' → ') })}</span>
+        </div>
+      ) : bot.startupBlocked?.reason === 'retired_cli' ? (
+        <div className="bd-startup-blocked" role="alert" data-startup-blocked>
+          <strong>{tr('botDefaults.retiredCliTitle', { cliId: bot.startupBlocked.cliId })}</strong>
+          <span>{tr('botDefaults.retiredCliHelp', { cliId: bot.startupBlocked.cliId, replacement: bot.startupBlocked.replacement })}</span>
         </div>
       ) : null}
       {props.linkedAgent ? (
@@ -2405,6 +2413,11 @@ export function BotAgentSection(props: {
   const [autoModelEnabled, setAutoModelEnabled] = useState(autoDraftRef.current.enabled);
   const [autoReselectPerTurn, setAutoReselectPerTurn] = useState(autoDraftRef.current.reselectPerTurn);
   const [autoTrigger, setAutoTrigger] = useState(autoDraftRef.current.trigger ?? 'capacity');
+  const [autoPreflightLoadCheck, setAutoPreflightLoadCheck] = useState(autoDraftRef.current.preflightLoadCheck === true);
+  const [autoOverloadThresholdPercent, setAutoOverloadThresholdPercent] = useState(autoDraftRef.current.overloadThresholdPercent ?? '100');
+  const [autoPreflightTimeoutSeconds, setAutoPreflightTimeoutSeconds] = useState(autoDraftRef.current.preflightTimeoutSeconds ?? '8');
+  const [autoUnknownLoadPolicy, setAutoUnknownLoadPolicy] = useState<'skip'>(autoDraftRef.current.unknownLoadPolicy ?? 'skip');
+  const [autoAllOverloadedPolicy, setAutoAllOverloadedPolicy] = useState<'lowest_load'>(autoDraftRef.current.allOverloadedPolicy ?? 'lowest_load');
   const [autoModelTouched, setAutoModelTouched] = useState(!!initialAutoDraft.current);
   const [autoModels, setAutoModels] = useState(autoDraftRef.current.models);
   const [autoModelSettings, setAutoModelSettings] = useState(autoDraftRef.current.modelSettings);
@@ -2423,6 +2436,11 @@ export function BotAgentSection(props: {
     setAutoModelEnabled(draft.enabled);
     setAutoReselectPerTurn(draft.reselectPerTurn);
     setAutoTrigger(draft.trigger ?? 'capacity');
+    setAutoPreflightLoadCheck(draft.preflightLoadCheck === true);
+    setAutoOverloadThresholdPercent(draft.overloadThresholdPercent ?? '100');
+    setAutoPreflightTimeoutSeconds(draft.preflightTimeoutSeconds ?? '8');
+    setAutoUnknownLoadPolicy(draft.unknownLoadPolicy ?? 'skip');
+    setAutoAllOverloadedPolicy(draft.allOverloadedPolicy ?? 'lowest_load');
     setAutoModels(draft.models);
     setAutoModelSettings(draft.modelSettings);
     setAutoTimeoutSeconds(draft.timeoutSeconds);
@@ -2709,16 +2727,38 @@ export function BotAgentSection(props: {
     }
     const trimmedNativeModel = nativeModel.trim();
     const saveCliId = selectedAgentCliId(cliKey);
+    const overloadThresholdPercent = autoOverloadThresholdPercent.trim() === ''
+      ? 100 : Number(autoOverloadThresholdPercent);
+    const preflightTimeoutSeconds = autoPreflightTimeoutSeconds.trim() === ''
+      ? 8 : Number(autoPreflightTimeoutSeconds);
+    const preflightTimeoutMs = Math.round(preflightTimeoutSeconds * 1_000);
+    if (autoModelEnabled && autoPreflightLoadCheck
+      && (!Number.isInteger(overloadThresholdPercent) || overloadThresholdPercent < 0
+        || overloadThresholdPercent > 65_535 || !Number.isFinite(preflightTimeoutSeconds)
+        || preflightTimeoutSeconds < 0.1 || preflightTimeoutSeconds > 30)) {
+      setAgentStatus({ text: `✗ ${tr('botDefaults.autoModelInvalid')}` });
+      return;
+    }
     const autoConfig = normalizeTraexAutoModelConfig(autoModelEnabled ? {
       enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
       trigger: autoTrigger,
+      preflightLoadCheck: autoPreflightLoadCheck,
+      overloadThresholdPercent,
+      preflightTimeoutMs,
+      unknownLoadPolicy: autoUnknownLoadPolicy,
+      allOverloadedPolicy: autoAllOverloadedPolicy,
       reselectPerTurn: autoReselectPerTurn,
       switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
       previousSettings: previousAutoSettings.current,
-      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => [model,
-        resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
-          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined }),
-      ])),
+      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => {
+        const configured = resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
+          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined });
+        const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
+        const requiredEffort = strongestTraexPreflightModelSettings(model, capability).reasoningEffort;
+        return [model, autoPreflightLoadCheck && requiredEffort
+          ? { ...configured, reasoningEffort: requiredEffort }
+          : configured];
+      })),
     } : null);
     if (saveCliId === 'traex' && autoConfig.error) {
       setAgentStatus({ text: `✗ ${tr('botDefaults.autoModelInvalid')}` });
@@ -3273,7 +3313,18 @@ export function BotAgentSection(props: {
         <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
           reselectPerTurn={autoReselectPerTurn}
           trigger={autoTrigger}
-          onTrigger={trigger => editAutoDraft({ trigger })}
+          preflightLoadCheck={autoPreflightLoadCheck}
+          overloadThresholdPercent={autoOverloadThresholdPercent}
+          preflightTimeoutSeconds={autoPreflightTimeoutSeconds}
+          unknownLoadPolicy={autoUnknownLoadPolicy}
+          allOverloadedPolicy={autoAllOverloadedPolicy}
+          onTrigger={trigger => editAutoDraft({ trigger,
+            ...(trigger === 'quota' ? { preflightLoadCheck: false } : {}) })}
+          onPreflightLoadCheck={enabled => editAutoDraft({ preflightLoadCheck: enabled })}
+          onOverloadThresholdPercent={value => editAutoDraft({ overloadThresholdPercent: value })}
+          onPreflightTimeoutSeconds={value => editAutoDraft({ preflightTimeoutSeconds: value })}
+          onUnknownLoadPolicy={value => editAutoDraft({ unknownLoadPolicy: value })}
+          onAllOverloadedPolicy={value => editAutoDraft({ allOverloadedPolicy: value })}
           onReselectPerTurn={enabled => editAutoDraft({ reselectPerTurn: enabled })}
           modelSettings={autoModelSettings} capabilities={detectedModels?.modelCapabilities}
           timeoutSeconds={autoTimeoutSeconds} cooldownSeconds={autoCooldownSeconds}
@@ -4449,6 +4500,7 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   return (
     <section className="bd-section" data-sandbox-mode={selected}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandbox')}</h3>
+      <SharedBotSandboxAdvice bot={bot} />
       <AgentManagedLock lock={props.lock} section="sandbox">
       <SandboxModeFields
         mode={selected}
@@ -4500,6 +4552,78 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       </div>
       </AgentManagedLock>
     </section>
+  );
+}
+
+/**
+ * Shown on a bot that other people use while the allowlist sandbox is off
+ * (core/shared-bot-sandbox-advice.ts). Display only: it changes no default.
+ * The verified-CLI list comes from the same table the advice reads.
+ */
+export function SharedBotSandboxAdvice(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const { bot } = props;
+  const advice = sharedBotSandboxAdvice({
+    // Prefer the daemon's spawn-effective view (global env / readIsolation
+    // folded in); old daemons only report the config value.
+    sandboxMode: bot.effectiveSandboxMode ?? bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off'),
+    cliId: bot.cliId,
+    // Old daemons report the raw binding count (includes session-group pins).
+    oncallChatCount: bot.oncallSharedChatCount ?? bot.oncallChatCount,
+    allowedChatGroupsCount: bot.allowedChatGroupsCount,
+    defaultOncallEnabled: bot.defaultOncall?.enabled,
+    allowedUsersCount: bot.allowedUsersCount,
+    triggerUserAuthEnabled: bot.triggerUserAuth?.enabled,
+    wrapperCli: bot.wrapperCli,
+    cliRuntimeConfigured: !!bot.cliRuntime,
+    // null = old daemon: assume the backend accepts a sandbox (historical).
+    sandboxCapable: bot.sandboxCapable ?? true,
+    // null = old daemon: assume local (the historical behaviour).
+    localSandboxApplies: bot.localSandboxApplies ?? true,
+    // The daemon's host platform (the page itself has no `process`).
+    platform: bot.sandboxNetworkPolicyPlatform ?? undefined,
+  });
+  if (!advice) return null;
+  const name = (id: string) => lookupCliDisplayName(id) ?? id;
+  const cli = name(bot.cliId ?? '');
+  // Literal tr() calls on purpose: the dashboard-i18n structural test only
+  // sees literal keys, and every reason must stay translated in both locales.
+  const reasonText = (r: typeof advice.reasons[number]): string => {
+    if (r === 'oncall') return tr('botDefaults.sharedSandboxReason.oncall');
+    if (r === 'allowedChatGroups') return tr('botDefaults.sharedSandboxReason.allowedChatGroups');
+    if (r === 'allowedUsers') return tr('botDefaults.sharedSandboxReason.allowedUsers');
+    return tr('botDefaults.sharedSandboxReason.triggerUserAuth');
+  };
+  // This backend refuses to spawn under a sandbox: do not say "turn it on
+  // below" — point at tmux/pty instead, and hide the matrix list.
+  const backendBlocked = advice.cliSupport === 'blocked';
+  const cliLine = advice.cliSupport === 'verified'
+    ? tr('botDefaults.sharedSandboxCliVerified', { cli })
+    : advice.cliSupport === 'unsupported'
+      ? tr('botDefaults.sharedSandboxCliUnsupported', { cli })
+      : advice.cliSupport === 'wrapper'
+        ? tr('botDefaults.sharedSandboxCliWrapper', { cli })
+        : advice.cliSupport === 'blocked'
+          ? tr('botDefaults.sharedSandboxCliBlocked')
+          : tr('botDefaults.sharedSandboxCliUnverified', { cli });
+  // Short lines, one fact each: why, how to turn it on, the current CLI; the
+  // verified list folds away.
+  return (
+    <div className="bd-section-note bd-warn bd-shared-sandbox-advice" role="note" data-shared-sandbox-advice={advice.cliSupport}>
+      <p><strong>⚠️ {tr('botDefaults.sharedSandboxTitle')}</strong></p>
+      <p>{tr('botDefaults.sharedSandboxAdvice')}</p>
+      <p>{tr('botDefaults.sharedSandboxReasons', { reasons: advice.reasons.map(reasonText).join(tr('agents.listSep')) })}</p>
+      {!backendBlocked && (
+        <p>{tr('botDefaults.sharedSandboxAction', { mode: tr('botDefaults.sandboxModeOncall') })}</p>
+      )}
+      <p>{cliLine}</p>
+      {!backendBlocked && (
+        <details>
+          <summary>{tr('botDefaults.sharedSandboxVerified')}</summary>
+          <p>{allowlistSandboxVerifiedClis().map(name).join(tr('agents.listSep'))}</p>
+        </details>
+      )}
+    </div>
   );
 }
 
@@ -4744,6 +4868,11 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       {bot.sandboxPathsForbiddenReadWrite?.length ? (
         <p className="hint-warn" data-sandbox-paths-forbidden-rw="">
           {tr('botDefaults.sbxPathsForbiddenRw', { paths: bot.sandboxPathsForbiddenReadWrite.join('、') })}
+        </p>
+      ) : null}
+      {bot.sandboxPathsReadOnlyRoot?.length ? (
+        <p className="hint-warn" data-sandbox-paths-readonly-root="">
+          {tr('botDefaults.sbxPathsReadOnlyRoot', { paths: bot.sandboxPathsReadOnlyRoot.join('、') })}
         </p>
       ) : null}
       <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
@@ -5554,9 +5683,10 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
   const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
+  const [autoApproveOrigins, setAutoApproveOrigins] = useState(props.bot.codexBrowserAutoApproveOrigins === true);
   const [cliNudge, setCliNudge] = useState(props.bot.noProgressNotify?.cliEnabled === true);
   const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState<'clean-input' | 'browser' | 'no-progress' | null>(null);
+  const [busy, setBusy] = useState<'clean-input' | 'browser' | 'browser-approval' | 'no-progress' | null>(null);
   // 无进展提醒（#1162）：null 配置 = 默认（开启，90s）。UI 状态与 bot 配置同步，
   // 两个控件独立保存但总是提交完整对象，避免 toggle 顺手丢掉已配置的阈值。
   const noProgress = props.bot.noProgressNotify ?? null;
@@ -5573,6 +5703,7 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
   useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
+  useEffect(() => setAutoApproveOrigins(props.bot.codexBrowserAutoApproveOrigins === true), [props.bot.codexBrowserAutoApproveOrigins]);
   useEffect(() => setCliNudge(props.bot.noProgressNotify?.cliEnabled === true), [props.bot.noProgressNotify]);
 
   async function saveCleanInput(checked: boolean): Promise<void> {
@@ -5598,6 +5729,19 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       setBusy: on => setBusy(on ? 'browser' : null),
       saved: tr('botDefaults.cardPrefSaved'),
       rollback: () => setBrowserEnabled(previous),
+    });
+  }
+
+  async function saveBrowserApproval(checked: boolean): Promise<void> {
+    const previous = autoApproveOrigins;
+    setAutoApproveOrigins(checked);
+    await saveBotField({
+      request: () => props.putCardPref({ codexBrowserAutoApproveOrigins: checked }),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? 'browser-approval' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      rollback: () => setAutoApproveOrigins(previous),
     });
   }
 
@@ -5652,6 +5796,15 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
           description={tr('botDefaults.codexBrowserDescription')}
           help={tr('botDefaults.codexBrowserHelp')}
           onChange={checked => void saveBrowser(checked)}
+        />
+        <ToggleRow
+          checked={browserEnabled && autoApproveOrigins}
+          disabled={busy !== null || !browserEnabled}
+          dataAction="toggle-codex-browser-auto-approve-origins"
+          title={tr('botDefaults.codexBrowserAutoApproveOrigins')}
+          description={tr('botDefaults.codexBrowserAutoApproveOriginsDescription')}
+          help={tr('botDefaults.codexBrowserAutoApproveOriginsHelp')}
+          onChange={checked => void saveBrowserApproval(checked)}
         />
         <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
         <ToggleRow

@@ -6,17 +6,26 @@ import { useT } from './react-hooks.js';
 import { ui } from './ui.js';
 import { cancelV3Run, fetchV3RunDetail, fetchV3Runs } from './v3-api.js';
 import {
+  V3_ATTEMPT_OUTCOME_LABEL,
   V3_DECISION_LABEL,
+  V3_DISPLAY_LABEL,
+  V3_DISPLAY_LEGEND,
+  V3_DISPLAY_STATUS,
   V3_GRAPH,
   V3_NODE_LABEL,
   V3_POLL_MS,
   buildGraphLayout,
   buildRoundMiniDagLayout,
+  formatV3Duration,
   graphNodes,
   isTerminalRunStatus,
   loopBudget,
   loopInstances,
   loopRounds,
+  nodeBotLine,
+  nodeElapsedMs,
+  nodeStatusLine,
+  nodeWaitingMs,
   resolveLoopTerminalNode,
   trunc,
   v3RunIdFromHash,
@@ -269,9 +278,10 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           <SectionHeader
             title="节点详情"
             hint={selectedNode ? (
-              <span className={`v3r-pill v3r-node-status-pill st-${selectedNode.status}`}>
+              <span className={`v3r-pill v3r-node-status-pill st-${selectedNode.status} ds-${V3_DISPLAY_STATUS[selectedNode.status]}`}>
                 <i className="dot" />
-                {V3_NODE_LABEL[selectedNode.status]}
+                {V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[selectedNode.status]]}
+                {V3_DISPLAY_STATUS[selectedNode.status] === 'needsHuman' ? `（${V3_NODE_LABEL[selectedNode.status]}）` : ''}
               </span>
             ) : '选择一个节点'}
           />
@@ -315,17 +325,12 @@ export function V3CancelButton(props: {
   );
 }
 
-function V3Legend(): React.JSX.Element {
+export function V3Legend(): React.JSX.Element {
   return (
     <div className="v3r-legend">
-      <span className="lg st-pending">待机</span>
-      <span className="lg st-running">运行中</span>
-      <span className="lg st-gateWaiting">等审批</span>
-      <span className="lg st-done">完成</span>
-      <span className="lg st-skipped">已跳过</span>
-      <span className="lg st-cancelled">已取消</span>
-      <span className="lg st-blocked">受阻</span>
-      <span className="lg st-failed">失败</span>
+      {V3_DISPLAY_LEGEND.map((status) => (
+        <span key={status} className={`lg ds-${status}`}>{V3_DISPLAY_LABEL[status]}</span>
+      ))}
       <span className="lg lg-loop">⟳ 循环容器</span>
     </div>
   );
@@ -391,6 +396,7 @@ function DagGraph(props: {
               <DagNode
                 key={box.node.id}
                 box={box}
+                generatedAt={props.view?.generatedAt}
                 selected={box.node.id === props.selectedId}
                 onSelect={props.onSelect}
               />
@@ -402,31 +408,39 @@ function DagGraph(props: {
   );
 }
 
-function DagNode(props: {
+export function DagNode(props: {
   box: ReturnType<typeof buildGraphLayout>['nodes'][number];
+  generatedAt: number | undefined;
   selected: boolean;
   onSelect: (nodeId: string) => void;
 }): React.JSX.Element {
   const { box, selected } = props;
   const node = box.node;
   if (node.isLoop) {
-    return <LoopGraphNode box={box} selected={selected} onSelect={props.onSelect} />;
+    return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} />;
   }
+  const botLine = nodeBotLine(node);
   return (
     <g
-      className={`v3r-node st-${node.status}${selected ? ' sel' : ''}`}
+      className={`v3r-node st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
     >
       <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.plainHeight} rx="10" />
-      <text className="v3r-nid" x={box.x + 14} y={box.y + 20}>{trunc(node.id, 18)}</text>
-      <text className="v3r-nstatus" x={box.x + 14} y={box.y + 37}>{V3_NODE_LABEL[node.status]}</text>
+      <text className="v3r-nid" x={box.x + 14} y={box.y + 20}>{trunc(node.id, 22)}</text>
+      <text className={`v3r-nbot${botLine ? '' : ' empty'}`} x={box.x + 14} y={box.y + 38}>
+        {botLine ? trunc(botLine, 24) : '—'}
+      </text>
+      <text className="v3r-nstatus" x={box.x + 14} y={box.y + 55}>
+        {trunc(nodeStatusLine(node, props.generatedAt), 22)}
+      </text>
     </g>
   );
 }
 
 function LoopGraphNode(props: {
   box: ReturnType<typeof buildGraphLayout>['nodes'][number];
+  generatedAt: number | undefined;
   selected: boolean;
   onSelect: (nodeId: string) => void;
 }): React.JSX.Element {
@@ -434,21 +448,25 @@ function LoopGraphNode(props: {
   const node = box.node;
   const ls = node.loopState;
   const budget = loopBudget(node);
-  const statusLine = ls
-    ? `${V3_NODE_LABEL[node.status]} · 第${ls.iteration}${budget !== undefined ? `/${budget}` : ''}轮`
-    : `${V3_NODE_LABEL[node.status]} · loop`;
+  const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
+  const elapsed = props.generatedAt !== undefined ? nodeElapsedMs(node, props.generatedAt) : undefined;
+  const statusLine = [
+    label,
+    ls ? `第${ls.iteration}${budget !== undefined ? `/${budget}` : ''}轮` : 'loop',
+    ...(elapsed !== undefined ? [formatV3Duration(elapsed)] : []),
+  ].join(' · ');
   const maxIterations = ls?.maxIterations;
 
   return (
     <g
-      className={`v3r-node v3r-loopnode st-${node.status}${selected ? ' sel' : ''}`}
+      className={`v3r-node v3r-loopnode st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
     >
       <rect className="v3r-cap" x={box.x - 4} y={box.y - 4} width={V3_GRAPH.nodeWidth + 8} height={V3_GRAPH.loopHeight + 8} rx="14" />
       <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.loopHeight} rx="10" />
       <text className="v3r-spin" x={box.x + 14} y={box.y + 21}>⟳</text>
-      <text className="v3r-nid" x={box.x + 30} y={box.y + 21}>{trunc(node.id, 16)}</text>
+      <text className="v3r-nid" x={box.x + 30} y={box.y + 21}>{trunc(node.id, 20)}</text>
       <text className="v3r-nstatus" x={box.x + 14} y={box.y + 39}>{statusLine}</text>
       {ls && budget !== undefined && budget <= V3_GRAPH.maxDots ? (
         <LoopBudgetDots node={node} x={box.x} y={box.y} budget={budget} maxIterations={maxIterations} />
@@ -519,6 +537,7 @@ function NodePanel(props: {
     <div id="v3-node-panel" className="v3r-panel">
       <div id="v3-node-meta">
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
+        <NodeExecution node={node} generatedAt={props.view?.generatedAt} />
         {node.depends.length ? (
           <p className="v3r-deps">
             <span>依赖</span>
@@ -542,6 +561,56 @@ function NodePanel(props: {
         ) : null}
       </div>
       <TerminalSlot runId={props.runId} node={termNode} />
+    </div>
+  );
+}
+
+function formatClock(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/** Who runs the node, how long it took / has been waiting, and every attempt. */
+export function NodeExecution(props: { node: RunNodeView; generatedAt: number | undefined }): React.JSX.Element | null {
+  const { node, generatedAt } = props;
+  const botLine = nodeBotLine(node);
+  const elapsed = generatedAt !== undefined ? nodeElapsedMs(node, generatedAt) : undefined;
+  const waiting = generatedAt !== undefined ? nodeWaitingMs(node, generatedAt) : undefined;
+  if (!botLine && elapsed === undefined && waiting === undefined && node.attempts.length === 0) return null;
+  return (
+    <div className="v3r-exec">
+      {botLine ? (
+        <p className="v3r-exec-row"><span>执行</span>{botLine}{node.bot?.model ? ` · ${node.bot.model}` : ''}</p>
+      ) : null}
+      {elapsed !== undefined ? (
+        <p className="v3r-exec-row">
+          <span>耗时</span>{formatV3Duration(elapsed)}{node.status === 'running' ? '（进行中）' : ''}
+        </p>
+      ) : null}
+      {waiting !== undefined ? (
+        <p className="v3r-exec-row">
+          <span>等人</span>已等 {formatV3Duration(waiting)}（{node.status === 'gateWaiting' ? '等审批' : '受阻，等人处理'}）
+        </p>
+      ) : null}
+      {node.attempts.length > 1 || node.attempts.some((attempt) => attempt.outcome && attempt.outcome !== 'succeeded') ? (
+        <ol className="v3r-attempts">
+          {node.attempts.map((attempt, index) => {
+            const end = attempt.endedAt ?? (attempt.outcome === undefined ? generatedAt : undefined);
+            return (
+              <li key={attempt.attemptId}>
+                <span className="n">第 {index + 1} 次</span>
+                <span className="t">{formatClock(attempt.startedAt)}</span>
+                {end !== undefined ? <span className="d">{formatV3Duration(end - attempt.startedAt)}</span> : null}
+                <span className={`o${attempt.outcome ? ` o-${attempt.outcome}` : ' o-running'}`}>
+                  {attempt.outcome ? V3_ATTEMPT_OUTCOME_LABEL[attempt.outcome] ?? attempt.outcome : '进行中'}
+                  {attempt.errorCode ? ` (${attempt.errorCode})` : ''}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
     </div>
   );
 }

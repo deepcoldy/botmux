@@ -54,6 +54,14 @@ export interface BridgeTurnJournalEntry {
    *  line can only exist at/after this byte, so restore re-drains from here
    *  instead of re-reading the whole file. Always a line boundary. */
   offsetAtMark: number;
+  /** Plain IM inputs proven to share one native execution. This attribution
+   * survives a checkpoint after the earlier queue heads were superseded. It
+   * is revalidated against the native transcript identity when restored. */
+  mergedExecution?: {
+    sourceTurnId: string;
+    sourceSessionId?: string;
+    supersededTurnIds: string[];
+  };
 }
 
 /** Entries older than this are dropped at restore instead of re-marked: a
@@ -149,7 +157,23 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
     && typeof entry?.offsetAtMark === 'number'
     && (entry?.linkRefMode === undefined
       || entry.linkRefMode === 'observe'
-      || entry.linkRefMode === 'enabled'));
+      || entry.linkRefMode === 'enabled'))
+    .map(entry => {
+      const { mergedExecution, ...plain } = entry;
+      // Invalid optional merge evidence must not discard the pending answer
+      // or invent delivery credit. Older journals have no such field.
+      if (!isJsonObject(mergedExecution)
+        || typeof mergedExecution.sourceTurnId !== 'string' || !mergedExecution.sourceTurnId
+        || (mergedExecution.sourceSessionId !== undefined && typeof mergedExecution.sourceSessionId !== 'string')
+        || !Array.isArray(mergedExecution.supersededTurnIds)
+        || !mergedExecution.supersededTurnIds.length
+        || !mergedExecution.supersededTurnIds.every(id => typeof id === 'string' && id.length > 0)) return plain;
+      return { ...plain, mergedExecution: {
+        sourceTurnId: mergedExecution.sourceTurnId,
+        ...(mergedExecution.sourceSessionId ? { sourceSessionId: mergedExecution.sourceSessionId } : {}),
+        supersededTurnIds: [...new Set(mergedExecution.supersededTurnIds)],
+      } };
+    });
 }
 
 export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[]): void {

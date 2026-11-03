@@ -133,9 +133,13 @@ export interface TranscriptEvent {
    *  Background launches are read from here — see {@link backgroundTaskLaunches}. */
   toolUseResult?: unknown;
   /** `type:"queue-operation"` lines: `enqueue` / `dequeue` / `remove` on Claude
-   *  Code's input queue, with the queued text in the top-level `content`. */
+   *  Code's input queue, with the queued text in the top-level `content`.
+   *  `remove` records additionally carry the queued item's `commandUuid`
+   *  (and often its `deliveryId`); `enqueue` / `dequeue` carry neither. */
   operation?: string;
   content?: unknown;
+  commandUuid?: string;
+  deliveryId?: string;
 }
 
 /**
@@ -1827,7 +1831,9 @@ export interface JsonlFingerprintSearchOptions {
   /** Drop events whose `timestamp` field is older than this (millis since
    *  epoch). Defends against short fingerprints ("hello", "test") matching
    *  old user lines in unrelated sibling jsonls — file mtime alone isn't
-   *  enough since a sibling Claude pane could be actively writing. */
+   *  enough since a sibling Claude pane could be actively writing. Events
+   *  with no parseable timestamp are dropped as well (see
+   *  {@link eventAtOrAfter}). */
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
@@ -1839,6 +1845,18 @@ export interface JsonlFingerprintSearchOptions {
    *  under a busier sibling. Default (no callback): accept the first
    *  fingerprint match like the original behaviour. */
   acceptCandidate?: (path: string) => boolean;
+}
+
+/** True when the event carries a parseable timestamp at or after `floorMs`.
+ *  An event without one cannot be placed after the floor: Claude Code writes
+ *  `api-request-blob` records (a copy of a request's user content, no
+ *  timestamp) next to the original prompt, so letting them through matched a
+ *  new Lark turn against an hours-old identical prompt in another session's
+ *  file. */
+function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
+  if (typeof ev.timestamp !== 'string') return false;
+  const evMs = Date.parse(ev.timestamp);
+  return Number.isFinite(evMs) && evMs >= floorMs;
 }
 
 /** Scan a single jsonl file's tail for a Lark message fingerprint. Same
@@ -1886,10 +1904,7 @@ export function jsonlContainsFingerprint(
     // mtime can be recent if a sibling Claude pane is actively writing
     // its own turns). We compare against `event.timestamp` rather than
     // file mtime to be precise.
-    if (minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-      const evMs = Date.parse(ev.timestamp);
-      if (Number.isFinite(evMs) && evMs < minEventTimestampMs) continue;
-    }
+    if (minEventTimestampMs !== undefined && !eventAtOrAfter(ev, minEventTimestampMs)) continue;
     const role = ev.message?.role ?? ev.type;
     let lineText = '';
     if (role === 'user') {
@@ -1978,10 +1993,7 @@ export function findJsonlContainingFingerprint(
           // the full rationale. Required to keep short fingerprints
           // ("hello", "test") from matching old user lines in unrelated
           // sibling jsonls.
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
+          if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
           const role = ev.message?.role ?? ev.type;
           let text = '';
           if (role === 'user') {
@@ -2091,10 +2103,7 @@ export function findJsonlsContainingExactContent(
           let ev: any;
           try { ev = JSON.parse(line); } catch { continue; }
           if (!ev || typeof ev !== 'object') continue;
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
+          if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
           const role = ev.message?.role ?? ev.type;
           let raw = '';
           if (role === 'user') {
