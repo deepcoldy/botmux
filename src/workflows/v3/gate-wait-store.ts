@@ -327,6 +327,21 @@ export function voidWaitOnce(runDir: string, waitId: string, by: string): { wait
   });
 }
 
+/** A decision a runtime flow revision overtook (the click's CAS won the wait
+ *  but the revision voided the gate in the journal first): record the wait as
+ *  voided so every later read agrees with the journal. */
+export function markWaitVoided(runDir: string, waitId: string, by: string): GateWait | undefined {
+  const path = waitPath(runDir, waitId);
+  if (!existsSync(path)) return undefined;
+  return withFileLockSync(path, () => {
+    const existing = readWait(runDir, waitId);
+    if (!existing) return undefined;
+    const voided: GateWait = { ...existing, status: 'voided', resolvedAt: Date.now(), by };
+    atomicWriteJson(path, voided);
+    return voided;
+  });
+}
+
 /** Remember an approval card's message id on its wait (best effort). */
 export function recordWaitCardMessage(runDir: string, waitId: string, messageId: string): void {
   const path = waitPath(runDir, waitId);

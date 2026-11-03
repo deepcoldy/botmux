@@ -35,12 +35,15 @@ import {
   loadEffectiveV3Dag,
   parseV3DagPatch,
   planV3DagRevision,
+  missingV3RevisionFollowUps,
   snapshotForSelector,
+  v3RevisionFollowUps,
   v3RevisionDigest,
   v3RevisionFilePaths,
   V3_DAG_REVISIONS_DIR,
   V3DagPatchError,
   type V3DagPatch,
+  type V3RerunBudgetBlock,
   type V3RevisionChanges,
   type V3RevisionPlan,
   type V3RevisionRecord,
@@ -50,8 +53,8 @@ import type {
   V3RevisionConfirmReason,
   V3RevisionEffects,
 } from './event-contract.js';
-import { readJournal, withJournalMutationSync, type JournalMutation } from './journal.js';
-import { latestAttemptIdFor, nextAttemptIdFor } from './attempt-numbering.js';
+import { readJournal, withJournalMutationSync } from './journal.js';
+import { revisitBudgetStatus } from './core-control.js';
 import { materialize, type V3RunSnapshot } from './state.js';
 import { loadAuthorizedV3Run, type V3RunEnvelope } from './run-envelope.js';
 import { parseFrozenBotSnapshots } from './bot-resolve.js';
@@ -83,9 +86,20 @@ export function classifyV3RunEditTurn(
   return 'other';
 }
 
-/** Main-bot provenance for an edit made in an event-woken turn (§13.6). */
-function autoProvenance(caller: V3RunEditCaller, note: string | undefined) {
-  return caller.origin === 'runEvent' ? { auto: { by: 'main_bot' as const, reason: note ?? '' } } : {};
+/** Operator recorded on a revision: `main_bot` for a change the main bot
+ *  made on its own in an event-woken turn, otherwise the turn's open_id. */
+export function v3RevisionActor(caller: V3RunEditCaller): string {
+  return caller.origin === 'runEvent' ? 'main_bot' : caller.openId;
+}
+
+/** Why the main bot acted (§13.6). The reason becomes mandatory with the
+ *  wake-up wiring; until then it is the edit's note (may be empty). */
+function autoProvenance(caller: V3RunEditCaller, note: string | undefined): { auto?: { reason: string } } {
+  return caller.origin === 'runEvent' ? { auto: { reason: note ?? '' } } : {};
+}
+
+function autoOf(value: { auto?: { reason: string } }): { auto?: { reason: string } } {
+  return value.auto ? { auto: value.auto } : {};
 }
 
 // ─── Proposal waits (waits/revisions/<NNN>.json) ──────────────────────────
@@ -238,33 +252,6 @@ function remapAssignTargets(
   };
 }
 
-/** Re-run the blocked nodes a revision asked for (§13.4 blocked row): the
- *  same `nodeRetryRequested` the existing retry/reassign paths write, so the
- *  run goes blocked → running and the next attempt follows the new flow.
- *  `events` is the journal read before this critical section's appends. */
-function appendRevisionRetries(
-  events: readonly StoredEvent[],
-  append: JournalMutation['append'],
-  retries: V3RevisionPlan['retries'],
-): void {
-  for (const retry of retries) {
-    const key = retry.instanceId ?? retry.nodeId;
-    const previousAttemptId = latestAttemptIdFor([...events], key);
-    if (!previousAttemptId) continue;
-    append({
-      type: 'nodeRetryRequested',
-      nodeId: retry.nodeId,
-      ...(retry.instanceId ? { instanceId: retry.instanceId } : {}),
-      previousAttemptId,
-      nextAttemptId: nextAttemptIdFor([...events], key),
-      reason: 'blockedRetry',
-      ...(retry.previousErrorClass ? { previousErrorClass: retry.previousErrorClass } : {}),
-      ...(retry.previousErrorCode ? { previousErrorCode: retry.previousErrorCode } : {}),
-      ...(retry.resetGate ? { resetGate: true } : {}),
-    }, { durable: true });
-  }
-}
-
 // ─── Edit ─────────────────────────────────────────────────────────────────
 
 export interface V3VoidedGate {
@@ -300,8 +287,8 @@ export type V3RunEditOutcome =
       voidedProposals: V3VoidedProposal[];
     }
   | { kind: 'conflict'; currentRevision: number }
-  | { kind: 'invalid'; problems: string[] }
-  | { kind: 'rejected'; reason: 'missing' | 'not-editable'; detail?: string };
+  | { kind: 'invalid'; problems: string[]; rerunBudget?: V3RerunBudgetBlock }
+  | { kind: 'rejected'; reason: 'missing' | 'not-editable' | 'proposal-pending'; detail?: string };
 
 export interface ApplyV3RunEditInput {
   baseDir: string;
@@ -377,7 +364,8 @@ function cardView(
 
 function voidGateWaits(runDir: string, effects: V3RevisionEffects | undefined): V3VoidedGate[] {
   const out: V3VoidedGate[] = [];
-  for (const item of effects?.supersede ?? []) {
+  // Changed (supersede) and deleted (cancel) gated nodes both void their wait.
+  for (const item of [...(effects?.supersede ?? []), ...(effects?.cancel ?? [])]) {
     if (!item.waitId) continue;
     try {
       const voided = voidWaitOnce(runDir, item.waitId, 'system-flow-revision');
@@ -436,8 +424,17 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
   } catch (err) {
     return { kind: 'rejected', reason: 'not-editable', detail: err instanceof Error ? err.message : String(err) };
   }
+  if (!run.initiatorOpenId) {
+    // Nobody could ever confirm a proposal here, and its touched nodes would
+    // pause forever: refuse runtime edits outright.
+    return {
+      kind: 'rejected',
+      reason: 'not-editable',
+      detail: '该 run 没有已认证的发起人，无法确认运行中的修改',
+    };
+  }
   const turn = classifyV3RunEditTurn(run.initiatorOpenId, input.caller);
-  const actor = input.caller.openId;
+  const actor = v3RevisionActor(input.caller);
   const auto = autoProvenance(input.caller, patch.note);
 
   type Locked =
@@ -470,7 +467,9 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
       patch,
       knownBots,
     });
-    if (!planned.ok) return { kind: 'invalid', problems: planned.problems };
+    if (!planned.ok) {
+      return { kind: 'invalid', problems: planned.problems, ...(planned.rerunBudget ? { rerunBudget: planned.rerunBudget } : {}) };
+    }
     const plan = planned.plan;
     if (!hasChanges(plan.changes)) return { kind: 'invalid', problems: ['the patch changes nothing'] };
 
@@ -488,6 +487,15 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
     const reasons: V3RevisionConfirmReason[] = [...plan.reasons];
     if (turn === 'other') reasons.unshift('callerNotInitiator');
     const direct = reasons.length === 0;
+    // Only the initiator (or a turn acting for them) may replace a pending
+    // proposal; another member's proposal must not void it.
+    if (!direct && turn === 'other' && effective.history.pending) {
+      return {
+        kind: 'rejected',
+        reason: 'proposal-pending',
+        detail: `已有待确认的修改（第 ${effective.history.pending.revision} 版），请等发起人处理后再提`,
+      };
+    }
     const revision = effective.history.maxRevision + 1;
     const written = writeRevisionFiles(runDir, revision, {
       dag: plan.dag,
@@ -512,7 +520,14 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
         ...(Object.keys(effects).length > 0 ? { effects } : {}),
       }, { durable: true });
       for (const edge of plan.edges) append(edge, { durable: true });
-      appendRevisionRetries(events, append, plan.retries);
+      // Reassign / blocked re-run advance state through their dedicated
+      // events, in this same lock (design §13.3).
+      for (const followUp of v3RevisionFollowUps(events, {
+        retry: effects.retry,
+        assign: effects.assign,
+        by: actor,
+        ...autoOf(auto),
+      })) append(followUp, { durable: true });
       if (pending) {
         append({
           type: 'dagRevisionRejected',
@@ -659,7 +674,12 @@ function settleProposalInJournal(
     }, { durable: true });
     append({ type: 'dagRevisionApproved', revision, by }, { durable: true });
     for (const edge of replanned.edges) append(edge, { durable: true });
-    appendRevisionRetries(events, append, replanned.retries);
+    for (const followUp of v3RevisionFollowUps(events, {
+      retry: replanned.effects.retry,
+      assign: replanned.effects.assign,
+      by: record.by,
+      ...(record.auto ? { auto: record.auto } : {}),
+    })) append(followUp, { durable: true });
     return { kind: 'approved', effects: replanned.effects };
   });
 }
@@ -809,8 +829,10 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
       if (!statSync(runDir).isDirectory()) continue;
       const journalPath = join(runDir, 'journal.ndjson');
       if (!existsSync(journalPath)) continue;
-      const events = readJournal(journalPath);
-      if (!events.some((event) => event.type === 'dagRevisionProposed')) continue;
+      let events = readJournal(journalPath);
+      const hasProposals = events.some((event) => event.type === 'dagRevisionProposed');
+      const owesFollowUps = missingV3RevisionFollowUps(events).length > 0;
+      if (!hasProposals && !owesFollowUps) continue;
       const run = loadEditableRun(baseDir, runId);
       if (ownerLarkAppId && run.binding?.larkAppId !== ownerLarkAppId) continue;
       const rec: V3RevisionRecovery = {
@@ -821,6 +843,17 @@ export function reconcileV3RevisionProposals(baseDir: string, ownerLarkAppId?: s
         voided: [],
         resume: false,
       };
+      if (owesFollowUps) {
+        // A revision's reassign / re-run lost its dedicated event to a crash:
+        // finish it so the run resumes instead of re-announcing a block.
+        const appended = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+          const missing = missingV3RevisionFollowUps(latest);
+          for (const event of missing) append(event, { durable: true });
+          return missing.length;
+        });
+        if (appended > 0) rec.resume = true;
+        events = readJournal(journalPath);
+      }
       const history = foldV3Revisions(events);
       const snap = materialize(events);
       const active = snap.runStatus === 'running' || snap.runStatus === 'blocked';
@@ -1079,8 +1112,50 @@ export function formatV3RunStatus(view: V3RunStatusView): string {
   if (history.length > 0) {
     lines.push('修改历史：');
     for (const item of history) {
-      lines.push(`  - 第 ${item.revision} 版 ${item.state}${item.approvedBy ? '（已确认）' : ''} · ${item.summary}${item.note ? ` · ${item.note}` : ''} · by ${item.auto ? 'main_bot' : item.by}`);
+      lines.push(`  - 第 ${item.revision} 版 ${item.state}${item.approvedBy ? '（已确认）' : ''} · ${item.summary}${item.note ? ` · ${item.note}` : ''} · by ${item.by}`);
     }
   }
   return lines.join('\n');
+}
+
+// ─── Rerun budget grant (「追加重做额度」card) ─────────────────────────────
+
+export type V3RerunBudgetGrantOutcome =
+  | { kind: 'granted'; tier: 'pair' | 'run' }
+  | { kind: 'already-granted' }
+  | { kind: 'unauthorized' }
+  | { kind: 'stale'; detail: string }
+  | { kind: 'missing' };
+
+/**
+ * One more revisit for a `rerunNode` the budget refused. Initiator only.
+ * Idempotent: it grants only while the budget for that node is still spent,
+ * and grants exactly the tier that is spent now.
+ */
+export function grantV3RerunBudget(input: {
+  baseDir: string;
+  runId: string;
+  nodeId: string;
+  by: string;
+}): V3RerunBudgetGrantOutcome {
+  let run: LoadedEditableRun;
+  try {
+    run = loadEditableRun(input.baseDir, input.runId);
+  } catch {
+    return { kind: 'missing' };
+  }
+  if (!run.initiatorOpenId || input.by !== run.initiatorOpenId) return { kind: 'unauthorized' };
+  return withJournalMutationSync(join(run.runDir, 'journal.ndjson'), ({ events, append }): V3RerunBudgetGrantOutcome => {
+    const status = materialize([...events]).runStatus;
+    if (status !== 'running' && status !== 'blocked') return { kind: 'stale', detail: `run is ${status}` };
+    const budget = revisitBudgetStatus([...events], input.nodeId, input.nodeId);
+    if (budget.ok) return { kind: 'already-granted' };
+    append({
+      type: 'revisitBudgetGranted',
+      ...(budget.tier === 'pair' ? { sourceNodeId: input.nodeId, toNodeId: input.nodeId } : {}),
+      by: input.by,
+      reason: 'rerunNode',
+    }, { durable: true });
+    return { kind: 'granted', tier: budget.tier };
+  });
 }

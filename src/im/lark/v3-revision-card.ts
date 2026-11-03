@@ -141,6 +141,80 @@ export function buildV3RevisionCard(input: V3RevisionCardInput): string {
   });
 }
 
-function button(label: string, type: 'primary' | 'danger', value: V3RevisionActionValue): Record<string, unknown> {
+function button(label: string, type: 'primary' | 'danger', value: V3RevisionActionValue | V3RerunGrantActionValue): Record<string, unknown> {
   return { tag: 'button', text: { tag: 'plain_text', content: label }, type, value };
+}
+
+// ─── 「追加重做额度」card (rerunNode refused for revisit budget) ─────────────
+
+export const V3_REVISION_RERUN_GRANT_ACTION = 'v3_revision_rerun_grant';
+
+export interface V3RerunGrantActionValue {
+  action: typeof V3_REVISION_RERUN_GRANT_ACTION;
+  runId: string;
+  nodeId: string;
+  nonce: string;
+}
+
+export function v3RerunGrantCardNonce(runId: string, nodeId: string): string {
+  return `v3revrerun:${runId}:${nodeId}`;
+}
+
+export function buildV3RerunGrantCard(input: {
+  runId: string;
+  nodeId: string;
+  tier: 'pair' | 'run';
+  webDetailUrl?: string;
+  resolution?: { kind: 'granted' | 'void'; by?: string; detail?: string };
+}): string {
+  const webDetailUrl = input.webDetailUrl ?? v3RunDetailUrl(input.runId);
+  const resolution = input.resolution;
+  const scope = input.tier === 'pair' ? `节点 ${input.nodeId} 的` : '整个 run 的';
+  const elements: Array<Record<string, unknown>> = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'plain_text',
+        content: `Run ${short(input.runId, 24)} 想重做节点 ${input.nodeId}，但${scope} Revisit 额度已用完。` +
+          '追加 1 次后，主 Bot 可以重新提交这次修改。只有发起人能追加。',
+      },
+    },
+    { tag: 'hr' },
+  ];
+  if (resolution) {
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'plain_text',
+        content: resolution.kind === 'granted'
+          ? `✅ 已追加 1 次重做额度${resolution.by ? ` · by ${short(resolution.by, 20)}` : ''}`
+          : `⏹️ 本卡已失效${resolution.detail ? `（${short(resolution.detail, 120)}）` : ''}`,
+      },
+    });
+  } else {
+    const value: V3RerunGrantActionValue = {
+      action: V3_REVISION_RERUN_GRANT_ACTION,
+      runId: input.runId,
+      nodeId: input.nodeId,
+      nonce: v3RerunGrantCardNonce(input.runId, input.nodeId),
+    };
+    elements.push({ tag: 'action', actions: [button('➕ 追加 1 次', 'primary', value)] });
+  }
+  elements.push({
+    tag: 'action',
+    actions: [{
+      tag: 'button',
+      text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
+      type: 'default',
+      multi_url: { url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl },
+    }],
+  });
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      template: resolution ? (resolution.kind === 'granted' ? 'green' : 'grey') : 'orange',
+      title: { tag: 'plain_text', content: resolution?.kind === 'granted' ? '已追加重做额度' : '重做额度已用完' },
+    },
+    elements,
+  });
 }

@@ -26,6 +26,7 @@ import { readRunEnvelope, type V3RunEnvelope } from './run-envelope.js';
 import { readJournal } from './journal.js';
 import { materialize } from './state.js';
 import type { WorkflowEventTurnVerifier } from '../../core/workflow-event-turn.js';
+import { readV3MainWakeIssued } from './main-wake-ledger.js';
 
 export type V3DaemonCommandBindingSource = 'run-envelope' | 'legacy-grill' | 'legacy-unbound';
 
@@ -396,10 +397,24 @@ export function resolveV3RunInitiator(envelope: V3RunEnvelope): string | undefin
  * The turn then acts for the run's initiator; the edit path records it as the
  * main bot (origin `runEvent`).
  */
-export function workflowEventTurnVerifierFor(runId: string, baseDir?: string): WorkflowEventTurnVerifier {
-  return ({ runId: turnRunId, eventSeq, session }) => {
+export function workflowEventTurnVerifierFor(
+  runId: string,
+  baseDir?: string,
+  now: () => number = Date.now,
+): WorkflowEventTurnVerifier {
+  return ({ runId: turnRunId, eventSeq, turnId, session }) => {
     if (turnRunId !== runId) return { ok: false, reason: `回合属于 run ${turnRunId}` };
     const runDir = join(baseDir ?? defaultBaseDir(), runId);
+    // Only a turn the run-owning daemon recorded as issued to THIS session.
+    const issued = readV3MainWakeIssued(runDir, eventSeq);
+    if (
+      !issued || issued.runId !== runId || issued.turnId !== turnId ||
+      issued.sessionId !== session.sessionId || issued.larkAppId !== session.larkAppId ||
+      issued.chatId !== session.chatId || (issued.rootMessageId ?? undefined) !== session.rootMessageId ||
+      issued.issuedAt > now()
+    ) {
+      return { ok: false, reason: '该回合不是拥有该 run 的 daemon 签发的' };
+    }
     const envelope = readRunEnvelope(runDir, runId);
     if (envelope.kind !== 'ok' || !envelope.envelope.chatBinding) {
       return { ok: false, reason: 'run 没有可验证的 run.json 绑定' };

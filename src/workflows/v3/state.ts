@@ -101,7 +101,11 @@ export interface V3RunSnapshot {
  *                        dispatches to the new bot
  *   dagRevised         → its effects: supersede (as nodeInstanceSuperseded,
  *                        voided gate waits can no longer resolve), cancel
- *                        (removed dispatched nodes), assign (reassignment)
+ *                        (removed nodes; a cancelled blocked node unblocks
+ *                        the run), regate (drop a blocked node's approval:
+ *                        its next nodeRetryRequested becomes a fresh
+ *                        instance). retry / assign are records only — the
+ *                        nodeRetryRequested / nodeReassigned beside it apply
  *   nodeHandoffPrepared / Sent / Accepted / nodeStalled
  *                      → no node-status change: an external attempt is
  *                        `running` from its nodeDispatched; phase/deadlines
@@ -123,6 +127,8 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
   let blockedNodeId: string | undefined;
   let uncertainHostEffects: V3UncertainHostEffect[] | undefined;
   const cancelledAttempts = new Map<string, string | undefined>();
+  /** Instances whose gate approval a revision voided (effects.regate). */
+  const regateInstances = new Set<string>();
   const resolvedWaitIds = new Set<string>();
 
   const set = (id: string, status: V3NodeStatus, gateCleared?: boolean): void => {
@@ -302,6 +308,19 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         else set(e.nodeId, 'blocked');
         break;
       case 'nodeRetryRequested':
+        if (e.instanceId && regateInstances.has(e.instanceId)) {
+          // A revision changed this blocked node after its gate was passed:
+          // whatever triggers the retry, it runs as a fresh instance that must
+          // pass the gate again (a gate is per instance), never on the old
+          // approval.
+          regateInstances.delete(e.instanceId);
+          supersedeInstance(e.nodeId, e.instanceId);
+          if (runStatus === 'blocked') {
+            runStatus = 'running';
+            blockedNodeId = undefined;
+          }
+          break;
+        }
         // Replay-correct unblock (codex blocker #1 of the blocked design):
         // the retry is a journal event, so a fresh materialize() yields
         // pending — NOT a memory-only patch that evaporates on next replay.
@@ -343,7 +362,8 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         }
         for (const item of effects?.cancel ?? []) {
           // Removed from the flow: neutral-cancel the exact live instance /
-          // attempt; its late settle stays audit-only (cancelledCovers).
+          // attempt; its late settle stays audit-only (cancelledCovers) and a
+          // late gate click is ignored because the node is cancelled.
           cancelledAttempts.set(item.instanceId ?? item.nodeId, item.attemptId);
           if (item.instanceId) instances.set(item.instanceId, { status: 'cancelled' });
           const prev = nodes.get(item.nodeId);
@@ -353,15 +373,27 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
               ? { effectiveInstanceId: item.instanceId ?? prev?.effectiveInstanceId }
               : {}),
           });
-          if (runStatus === 'blocked' && blockedNodeId === item.nodeId) {
+          // Cancelling a blocked node unblocks the run, like a retry does, so
+          // the next drive applies the downstream skip / fail rules (§13.3).
+          if (runStatus === 'blocked' && (prev?.status === 'blocked' || blockedNodeId === item.nodeId)) {
             runStatus = 'running';
             blockedNodeId = undefined;
           }
         }
-        for (const item of effects?.assign ?? []) assignments.set(item.nodeId, item.to);
-        // A blocked run whose blocked node a revision replaced or removed
-        // reopens through the effects above; the revision itself never
-        // changes run status.
+        for (const item of effects?.regate ?? []) {
+          const prev = nodes.get(item.nodeId);
+          if (prev?.effectiveInstanceId !== item.instanceId) continue;
+          const { gateCleared: _dropped, ...rest } = prev;
+          nodes.set(item.nodeId, rest);
+          const instance = instances.get(item.instanceId);
+          if (instance) {
+            const { gateCleared: _instanceDropped, ...instanceRest } = instance;
+            instances.set(item.instanceId, instanceRest);
+          }
+          regateInstances.add(item.instanceId);
+        }
+        // `retry` / `assign` are records: their nodeRetryRequested /
+        // nodeReassigned (same lock) advance state.
         break;
       }
       case 'gateDispatched':

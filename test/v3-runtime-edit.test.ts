@@ -19,6 +19,8 @@ import {
 import {
   createV3GateRunner,
   driveV3Run,
+  loadV3BotExecutedRun,
+  requestV3Retry,
   resolveV3GateClick,
   type V3DaemonRunDeps,
 } from '../src/workflows/v3/daemon-run.js';
@@ -40,7 +42,7 @@ import {
   v3RevisionWaitPath,
   type V3RunEditCaller,
 } from '../src/workflows/v3/run-edit.js';
-import { v3RevisionFilePaths } from '../src/workflows/v3/dag-revision.js';
+import { v3RevisionDigest, v3RevisionFilePaths } from '../src/workflows/v3/dag-revision.js';
 import { readWait, recordWaitCardMessage } from '../src/workflows/v3/human-gate.js';
 import {
   authorizeV3RunEditCommand,
@@ -61,6 +63,9 @@ import {
   v3RevisionCardNonce,
 } from '../src/im/lark/v3-revision-card.js';
 import { parseWorkflowDaemonMutationBody } from '../src/workflows/v3/daemon-ipc-body.js';
+import { authorizeV3SessionRunEditRequest } from '../src/workflows/v3/session-relay.js';
+import { grantV3RerunBudget } from '../src/workflows/v3/run-edit.js';
+import { V3_REVISION_RERUN_GRANT_ACTION, v3RerunGrantCardNonce } from '../src/im/lark/v3-revision-card.js';
 
 const INITIATOR = 'ou_initiator';
 const OTHER = 'ou_other_member';
@@ -98,7 +103,13 @@ function goal(id: string, extra: Record<string, unknown> = {}): Record<string, u
   return { id, type: 'goal', goal: `do ${id}`, bot: 'cli_worker', depends: [], inputs: [], ...extra };
 }
 
-function seedRun(base: string, runId: string, nodes: unknown[], nodeExecutor?: 'bot'): string {
+function seedRun(
+  base: string,
+  runId: string,
+  nodes: unknown[],
+  nodeExecutor?: 'bot',
+  opts: { ownerless?: boolean } = {},
+): string {
   const runDir = join(base, runId);
   mkdirSync(runDir, { recursive: true });
   writeJson(join(runDir, 'dag.json'), { schemaVersion: 2, runId, nodes });
@@ -117,8 +128,8 @@ function seedRun(base: string, runId: string, nodes: unknown[], nodeExecutor?: '
     runId,
     createdAt: '2026-11-03T08:00:00.000Z',
     authorizedAt: '2026-11-03T08:01:00.000Z',
-    authorizedByOpenId: INITIATOR,
-    chatBinding: BINDING,
+    ...(opts.ownerless ? {} : { authorizedByOpenId: INITIATOR }),
+    chatBinding: opts.ownerless ? { larkAppId: BINDING.larkAppId, chatId: BINDING.chatId, rootMessageId: BINDING.rootMessageId } : BINDING,
     artifacts: {
       dag: artifactRef(runDir, 'dag.json'),
       spec: artifactRef(runDir, 'spec.json'),
@@ -491,7 +502,7 @@ describe('M1 turn classes and M2 confirmation', () => {
     });
     expect(out).toMatchObject({ kind: 'applied' });
     expect(journal(runDir).find((event) => event.type === 'dagRevised')).toMatchObject({
-      by: OTHER, auto: { by: 'main_bot' },
+      by: 'main_bot', auto: { reason: '' },
     });
     expect(projectRun('run-event', runDir).revision?.history[0]).toMatchObject({ by: 'mainBot' });
 
@@ -581,10 +592,11 @@ describe('optimistic concurrency and crash windows', () => {
     third.nodes[1]!.goal = 'from elsewhere';
     const bytes = `${JSON.stringify(third, null, 2)}\n`;
     writeFileSync(v3RevisionFilePaths(runDir, 3).dag, bytes);
-    const { createHash } = require('node:crypto') as typeof import('node:crypto');
+    const patchBytes = `${JSON.stringify({ revision: 3, ops: [{ op: 'updateNode', nodeId: 'b', set: { goal: 'from elsewhere' } }] })}\n`;
+    writeFileSync(v3RevisionFilePaths(runDir, 3).patch, patchBytes);
     appendEvent(join(runDir, 'journal.ndjson'), {
       type: 'dagRevised', revision: 3, baseRevision: 1,
-      sha256: `sha256:${createHash('sha256').update(bytes).digest('hex')}`, patchSha256: 'sha256:x', summary: '改 1 节点', by: INITIATOR,
+      sha256: v3RevisionDigest(bytes), patchSha256: v3RevisionDigest(patchBytes), summary: '改 1 节点', by: INITIATOR,
     });
     expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-race2', revision: 2, decision: 'approve', by: INITIATOR }))
       .toMatchObject({ kind: 'stale' });
@@ -704,5 +716,324 @@ describe('save, projections and the old-run regression', () => {
     expect(projectV3Progress({ envelope: loaded.envelope, dag: loaded.dag, events }).revision).toBeUndefined();
     expect(compileSavedWorkflowFromRun(runDir).runtimeRevisions).toBe(0);
     expect(statusOf(runDir, 'b')).toBe('done');
+  });
+});
+
+// ─── Review regressions ─────────────────────────────────────────────────────
+
+/** A bot-mode driver that records handoffs and posted gates. */
+function botDriver(base: string, now: () => number = () => 1_000) {
+  const dispatches: V3ExternalDispatchRequest[] = [];
+  const gates: string[] = [];
+  const deps: V3DaemonRunDeps = {
+    baseDir: base,
+    loadBots: () => [],
+    makeRunNode: () => async () => { throw new Error('no ephemeral workers'); },
+    postGateCard: async (_binding, gate) => { gates.push(gate.waitId); },
+    postBlockedCard: async () => {},
+    externalExecutor: {
+      dispatch: async (req) => { dispatches.push(req); return { kind: 'sent', handoffMessageId: `om_${req.attemptId}` }; },
+      probeAcceptance: async () => ({ status: 'notAccepted' }),
+      stop: async () => {},
+    },
+    now,
+  };
+  return { deps, dispatches, gates };
+}
+
+function blockAttempt(runDir: string, nodeId: string, instanceId: string, attemptId: string): void {
+  appendEvent(join(runDir, 'journal.ndjson'), {
+    type: 'nodeBlocked', nodeId, instanceId, attemptId, errorClass: 'workerError', errorCode: 'BOT_REPORTED_BLOCKED',
+  });
+}
+
+describe('P1 — a passed gate never covers a changed blocked node', () => {
+  async function blockedAfterApprovedGate(base: string, runId: string) {
+    const runDir = seedRun(base, runId, [goal('g', { humanGate: { prompt: 'ship?' } })], 'bot');
+    const driver = botDriver(base);
+    await driveV3Run(runId, driver.deps);
+    expect(resolveV3GateClick(base, runId, { waitId: 'g#001-gate', selected: 'approve', by: INITIATOR }))
+      .toMatchObject({ kind: 'resolved', resolution: 'approved' });
+    await driveV3Run(runId, driver.deps);
+    expect(driver.dispatches).toHaveLength(1);
+    blockAttempt(runDir, 'g', 'g#001', driver.dispatches[0]!.attemptId);
+    await driveV3Run(runId, driver.deps);
+    return { runDir, driver };
+  }
+
+  it('definition-only edit, then a plain retry: the new goal waits for a fresh gate', async () => {
+    const base = freshBase();
+    const { driver } = await blockedAfterApprovedGate(base, 'run-p1');
+    expect(edit(base, 'run-p1', [{ op: 'updateNode', nodeId: 'g', set: { goal: 'DELETE PROD' } }], 1))
+      .toMatchObject({ kind: 'applied' });
+    expect(requestV3Retry(base, 'run-p1', { nodeId: 'g' })).toMatchObject({ kind: 'requested' });
+    await driveV3Run('run-p1', driver.deps);
+    expect(driver.gates).toEqual(['g#001-gate', 'g#002-gate']);
+    expect(driver.dispatches).toHaveLength(1);
+  });
+
+  it('a confirmed approver change asks the new approvers before the retry runs', async () => {
+    const base = freshBase();
+    const { runDir, driver } = await blockedAfterApprovedGate(base, 'run-p1b');
+    expect(edit(base, 'run-p1b', [{ op: 'updateNode', nodeId: 'g', set: { humanGate: { prompt: 'ship?', approvers: ['ou_security'] } } }], 1))
+      .toMatchObject({ kind: 'proposed', reasons: ['gateRelaxed'] });
+    expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-p1b', revision: 2, decision: 'approve', by: INITIATOR }))
+      .toMatchObject({ kind: 'approved' });
+    requestV3Retry(base, 'run-p1b', { nodeId: 'g' });
+    await driveV3Run('run-p1b', driver.deps);
+    expect(driver.gates.at(-1)).toBe('g#002-gate');
+    expect(readWait(runDir, 'g#002-gate')?.approvers).toEqual(['ou_security']);
+    expect(driver.dispatches).toHaveLength(1);
+  });
+});
+
+describe('P2 — isolated main sessions reach status / edit through the relay', () => {
+  const capability = 'c'.repeat(64);
+  const relay = (base: string, runId: string, mutation: 'edit' | 'status', raw: Record<string, unknown> = {}, rootMessageId = BINDING.rootMessageId) =>
+    authorizeV3SessionRunEditRequest({
+      runId,
+      mutation,
+      raw: { sessionId: 'sess-main', originCapability: capability, ...raw },
+      trustedHost: false,
+      session: {
+        receiver: false,
+        liveOrigin: { capability, turnId: 'om_member_turn', dispatchAttempt: 1 },
+        callerOpenId: OTHER,
+        chatId: BINDING.chatId,
+        larkAppId: BINDING.larkAppId,
+        quoteTargetId: 'om_member_turn',
+        rootMessageId,
+      },
+      selfLarkAppId: BINDING.larkAppId,
+      baseDir: base,
+    });
+
+  it('derives the caller from the live session (never the body) and classifies it with M1', () => {
+    const base = freshBase();
+    seedRun(base, 'run-relay', [goal('a')]);
+    expect(relay(base, 'run-relay', 'status')).toMatchObject({ ok: true, larkAppId: BINDING.larkAppId });
+    const decision = relay(base, 'run-relay', 'edit', {
+      patch: [{ op: 'updateNode', nodeId: 'a', set: { goal: 'member idea' } }],
+      base: 1,
+      caller: { openId: INITIATOR, origin: 'runEvent' },
+    });
+    if (!decision.ok || !decision.edit) throw new Error(JSON.stringify(decision));
+    expect(decision.edit.caller).toEqual({ openId: OTHER, origin: 'human' });
+    expect(applyV3RunEdit({
+      baseDir: base, runId: 'run-relay', patch: decision.edit.patch, baseRevision: decision.edit.base,
+      caller: decision.edit.caller, resolveNewBotSnapshot: noNewBots,
+    })).toMatchObject({ kind: 'proposed', reasons: ['callerNotInitiator'] });
+    expect(relay(base, 'run-relay', 'status', {}, 'om_other_topic')).toMatchObject({ ok: false, error: 'run_binding_mismatch' });
+  });
+});
+
+describe('P2 — a rerun refused for revisit budget can be unlocked by the initiator', () => {
+  it('posts a grant the initiator can click once; the same edit then applies', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-budget', [goal('a'), goal('b')]);
+    const journalPath = join(runDir, 'journal.ndjson');
+    const finish = (instanceId: string) => {
+      const attemptId = `${instanceId}/attempts/001`;
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'a', instanceId, attemptId });
+      appendEvent(journalPath, { type: 'nodeSucceeded', nodeId: 'a', instanceId, attemptId, manifestPath: join(runDir, 'm.json') });
+    };
+    finish('a#001');
+    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'b', instanceId: 'b#001', attemptId: 'b#001/attempts/001' });
+    expect(edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 1)).toMatchObject({ kind: 'applied', revision: 2 });
+    finish('a#002');
+    expect(edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2))
+      .toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
+
+    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', by: OTHER })).toEqual({ kind: 'unauthorized' });
+    const value = { action: V3_REVISION_RERUN_GRANT_ACTION, runId: 'run-budget', nodeId: 'a', nonce: v3RerunGrantCardNonce('run-budget', 'a') } as const;
+    expect(await handleV3RevisionAction(value, INITIATOR, { baseDir: base, driveRun: () => {} })).toMatchObject({ header: expect.anything() });
+    // A second click cannot add a second rerun.
+    expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', by: INITIATOR })).toEqual({ kind: 'already-granted' });
+    expect(edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2)).toMatchObject({ kind: 'applied', revision: 3 });
+  });
+});
+
+describe('P3-1 — deleting a node waiting at its gate voids that gate', () => {
+  it('the wait is voided and its card listed for freezing once the deletion takes effect', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-del-gate', [goal('g', { humanGate: { prompt: 'ok?' } }), goal('z')]);
+    await runner(base, fakeWorkers().runNode).drive('run-del-gate');
+    recordWaitCardMessage(runDir, 'g#001-gate', 'om_gate_card');
+    expect(edit(base, 'run-del-gate', [{ op: 'removeNode', nodeId: 'g' }], 1)).toMatchObject({ kind: 'proposed', reasons: ['gateRelaxed'] });
+    expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-del-gate', revision: 2, decision: 'approve', by: INITIATOR }))
+      .toMatchObject({ kind: 'approved', voidedGates: [{ waitId: 'g#001-gate', cardMessageIds: ['om_gate_card'] }] });
+    expect(readWait(runDir, 'g#001-gate')?.status).toBe('voided');
+    expect(resolveV3GateClick(base, 'run-del-gate', { waitId: 'g#001-gate', selected: 'approve', by: INITIATOR }))
+      .toEqual({ kind: 'already-settled', status: 'voided' });
+    await runner(base, fakeWorkers().runNode).drive('run-del-gate');
+    expect(journal(runDir).at(-1)).toMatchObject({ type: 'runSucceeded' });
+  });
+});
+
+describe('P3-4 — a reassign / re-run lost between its two appends is reconciled', () => {
+  async function blockedThenReassigned(base: string, runId: string) {
+    const runDir = seedRun(base, runId, [goal('a')], 'bot');
+    const driver = botDriver(base);
+    await driveV3Run(runId, driver.deps);
+    blockAttempt(runDir, 'a', 'a#001', driver.dispatches[0]!.attemptId);
+    await driveV3Run(runId, driver.deps);
+    edit(base, runId, [{ op: 'reassign', nodeId: 'a', bot: 'cli_other' }], 1);
+    // Crash after the durable dagRevised: its dedicated events never landed.
+    const journalPath = join(runDir, 'journal.ndjson');
+    const lines = readFileSync(journalPath, 'utf-8').trimEnd().split('\n');
+    const kept = lines.filter((line) => !/"type":"node(Reassigned|RetryRequested)"/.test(line));
+    expect(kept.length).toBe(lines.length - 2);
+    writeFileSync(journalPath, `${kept.join('\n')}\n`);
+    expect(projectV3RunStatus(base, runId).runStatus).toBe('blocked');
+    return { runDir, driver };
+  }
+
+  it('the next drive re-appends them and the node is handed to the new bot', async () => {
+    const base = freshBase();
+    const { runDir, driver } = await blockedThenReassigned(base, 'run-lost');
+    await driveV3Run('run-lost', driver.deps);
+    expect(journal(runDir).filter((event) => event.type === 'nodeRetryRequested')).toHaveLength(1);
+    expect(driver.dispatches.at(-1)).toMatchObject({ attemptId: 'a#001/attempts/002', targetLarkAppId: 'cli_other' });
+  });
+
+  it('cold attach finishes them once and resumes the run', async () => {
+    const base = freshBase();
+    const { runDir } = await blockedThenReassigned(base, 'run-lost-cold');
+    expect(reconcileV3RevisionProposals(base, BINDING.larkAppId)).toEqual([expect.objectContaining({ runId: 'run-lost-cold', resume: true })]);
+    expect(reconcileV3RevisionProposals(base, BINDING.larkAppId)).toEqual([]);
+    expect(journal(runDir).filter((event) => event.type === 'nodeReassigned')).toHaveLength(1);
+    expect(projectV3RunStatus(base, 'run-lost-cold').runStatus).toBe('running');
+  });
+});
+
+describe('P3-5 / P3-6 — who may leave a proposal pending', () => {
+  it('a run without an authenticated initiator refuses runtime edits', () => {
+    const base = freshBase();
+    seedRun(base, 'run-ownerless', [goal('a')], undefined, { ownerless: true });
+    expect(edit(base, 'run-ownerless', [{ op: 'updateNode', nodeId: 'a', set: { goal: 'x' } }], 1))
+      .toMatchObject({ kind: 'rejected', reason: 'not-editable' });
+  });
+
+  it('another member cannot replace a pending proposal; the initiator can', () => {
+    const base = freshBase();
+    seedRun(base, 'run-pending', [goal('a', { humanGate: { prompt: 'ok?' } }), goal('b')]);
+    expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'first idea' } }], 1, other))
+      .toMatchObject({ kind: 'proposed', revision: 2 });
+    expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'second idea' } }], 1, other))
+      .toMatchObject({ kind: 'rejected', reason: 'proposal-pending' });
+    expect(projectV3RunStatus(base, 'run-pending').pendingProposal?.revision).toBe(2);
+    expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'a', set: { humanGate: null } }], 1))
+      .toMatchObject({ kind: 'proposed', revision: 3, voidedProposals: [{ revision: 2, reason: 'superseded' }] });
+  });
+});
+
+describe('decision → edit → claim interleaving', () => {
+  it('a revision landing after the tick decided is never overtaken: the claim re-decides on the new flow', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-race-claim', [
+      goal('x'),
+      goal('z', { bot: 'cli_other' }),
+      goal('y', { depends: ['x'] }),
+    ], 'bot');
+    const driver = botDriver(base);
+    await driveV3Run('run-race-claim', driver.deps);
+    const byNode = Object.fromEntries(driver.dispatches.map((req) => [req.nodeId, req]));
+    expect(Object.keys(byNode).sort()).toEqual(['x', 'z']);
+    expect(recordExternalAccepted(runDir, { attemptId: byNode.z!.attemptId, sessionId: 'sess-z', acceptedAt: 1_000 }, { now: () => 1_000 }))
+      .toMatchObject({ ok: true });
+    writeJson(join(runDir, 'x-manifest.json'), { schemaVersion: 1, status: 'ok', summary: 'ok', files: [] });
+    appendEvent(join(runDir, 'journal.ndjson'), {
+      type: 'nodeSucceeded', nodeId: 'x', instanceId: 'x#001', attemptId: byNode.x!.attemptId, manifestPath: join(runDir, 'x-manifest.json'),
+    });
+    // The engine clock is read while reconciling z — after this tick read the
+    // journal, before it claims y. The edit lands exactly there.
+    let armed = true;
+    const trapped = botDriver(base, () => {
+      if (armed) {
+        armed = false;
+        expect(edit(base, 'run-race-claim', [{ op: 'updateNode', nodeId: 'y', set: { goal: 'y, revised' } }], 1))
+          .toMatchObject({ kind: 'applied', revision: 2 });
+      }
+      return 1_000;
+    });
+    await driveV3Run('run-race-claim', trapped.deps);
+    expect(armed).toBe(false);
+    expect(trapped.dispatches).toEqual([expect.objectContaining({ nodeId: 'y', revision: 2, node: expect.objectContaining({ goal: 'y, revised' }) })]);
+    expect(journal(runDir).find((event) => event.type === 'nodeDispatched' && event.nodeId === 'y')).toMatchObject({ revision: 2 });
+  });
+});
+
+describe('editing a running bot node closes the old binding (no ghost slots)', () => {
+  it('five edits of a running node: never more than one open external, and the run still finishes', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-ghost', [goal('a'), goal('b', { depends: ['a'] })], 'bot');
+    const stops: string[] = [];
+    const driver = botDriver(base);
+    driver.deps.externalExecutor = {
+      ...driver.deps.externalExecutor!,
+      stop: async (req) => { stops.push(req.attemptId); },
+    };
+    await driveV3Run('run-ghost', driver.deps);
+    for (let round = 1; round <= 5; round++) {
+      expect(edit(base, 'run-ghost', [{ op: 'updateNode', nodeId: 'a', set: { goal: `a, take ${round}` } }], round))
+        .toMatchObject({ kind: 'applied', revision: round + 1 });
+      await driveV3Run('run-ghost', driver.deps);
+      const open = openV3ExternalAttempts(journal(runDir));
+      expect(open).toHaveLength(1);
+      expect(open[0]).toMatchObject({ nodeId: 'a', instanceId: `a#00${round + 1}` });
+    }
+    // Every superseded attempt was stopped and closed by an obsolete drain.
+    const drained = journal(runDir).filter((event) => event.type === 'nodeAttemptDrained' && event.reason === 'obsoleteAttempt');
+    expect(drained.map((event) => (event as { attemptId: string }).attemptId)).toEqual(
+      [1, 2, 3, 4, 5].map((n) => `a#00${n}/attempts/001`),
+    );
+    expect(stops).toEqual(drained.map((event) => (event as { attemptId: string }).attemptId));
+    expect(driver.dispatches.at(-1)).toMatchObject({ instanceId: 'a#006', node: expect.objectContaining({ goal: 'a, take 5' }) });
+
+    const settle = (nodeId: string) => {
+      const attempt = openV3ExternalAttempts(journal(runDir))[0]!;
+      expect(attempt.nodeId).toBe(nodeId);
+      writeJson(join(runDir, `${nodeId}-manifest.json`), { schemaVersion: 1, status: 'ok', summary: 'ok', files: [] });
+      appendEvent(join(runDir, 'journal.ndjson'), {
+        type: 'nodeSucceeded', nodeId, instanceId: attempt.instanceId!, attemptId: attempt.attemptId,
+        manifestPath: join(runDir, `${nodeId}-manifest.json`),
+      });
+    };
+    settle('a');
+    await driveV3Run('run-ghost', driver.deps);
+    settle('b');
+    await driveV3Run('run-ghost', driver.deps);
+    expect(journal(runDir).at(-1)).toMatchObject({ type: 'runSucceeded' });
+    expect(openV3ExternalAttempts(journal(runDir))).toEqual([]);
+  });
+
+  it('the ephemeral path closes the superseded worker before its replacement runs', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-ghost-eph', [goal('a')]);
+    const workers = fakeWorkers(['a']);
+    const driving = runner(base, workers.runNode).drive('run-ghost-eph');
+    for (let round = 1; round <= 3; round++) {
+      await vi.waitFor(() => expect(workers.calls).toHaveLength(round), { timeout: 5_000 });
+      expect(edit(base, 'run-ghost-eph', [{ op: 'updateNode', nodeId: 'a', set: { goal: `a${round}` } }], round))
+        .toMatchObject({ kind: 'applied' });
+    }
+    await vi.waitFor(() => expect(workers.calls).toHaveLength(4), { timeout: 5_000 });
+    workers.releases.get(workers.calls[3]!.attemptId)!();
+    await driving;
+    const events = journal(runDir);
+    expect(events.filter((event) => event.type === 'nodeAttemptDrained' && event.reason === 'obsoleteAttempt')).toHaveLength(3);
+    expect(events.at(-1)).toMatchObject({ type: 'runSucceeded' });
+  });
+});
+
+describe('the workflow-node layer reads the effective flow', () => {
+  it('a bot run loads with its revised node contract, and refuses to load when a revision is tampered', () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-node-layer', [goal('a', { timeoutSec: 300 })], 'bot');
+    expect(edit(base, 'run-node-layer', [{ op: 'updateNode', nodeId: 'a', set: { goal: 'revised contract' } }], 1))
+      .toMatchObject({ kind: 'applied' });
+    expect(loadV3BotExecutedRun(runDir)?.dag.nodes[0]?.goal).toBe('revised contract');
+    writeFileSync(v3RevisionFilePaths(runDir, 2).dag, readFileSync(join(runDir, 'dag.json')));
+    expect(loadV3BotExecutedRun(runDir)).toBeUndefined();
   });
 });

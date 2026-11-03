@@ -54,6 +54,7 @@ import {
   currentV3Revision,
   foldV3Revisions,
   loadEffectiveV3Dag,
+  missingV3RevisionFollowUps,
   snapshotForSelector,
   v3NodeHeldByProposal,
 } from './dag-revision.js';
@@ -735,6 +736,17 @@ export async function runWorkflow(
   const heldByProposal = (nodeId: string, loopId?: string): boolean =>
     v3NodeHeldByProposal(pendingTouched, nodeId, loopId);
 
+  /** A revision's reassign / blocked re-run whose dedicated event was lost
+   *  to a crash between two appends is re-appended (idempotent, §13.3). */
+  const reconcileRevisionFollowUps = (events: readonly StoredEvent[]): boolean => {
+    if (missingV3RevisionFollowUps(events).length === 0) return false;
+    return withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+      const missing = missingV3RevisionFollowUps(latest);
+      for (const event of missing) append(event, { durable: true });
+      return missing.length > 0;
+    });
+  };
+
   if (!opts.authorizedArtifacts) {
     assertOrCreateFrozenJson(
       join(runDir, 'bots.snapshot.json'),
@@ -862,6 +874,7 @@ export async function runWorkflow(
   while (true) {
     const events = readJournal(journalPath);
     refreshEffectiveDag(events);
+    if (reconcileRevisionFollowUps(events)) continue;
     const snap = materialize(events);
     writeState(statePath, snap);
 

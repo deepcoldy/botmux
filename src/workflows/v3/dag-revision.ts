@@ -37,6 +37,7 @@ import {
 } from './dag.js';
 import type {
   StoredEvent,
+  V3AutoProvenance,
   V3Event,
   V3RevisionConfirmReason,
   V3RevisionEffects,
@@ -45,6 +46,8 @@ import type { BotSnapshot } from './contract.js';
 import type { Manifest } from './artifact-contract.js';
 import { normalizeGateWaitInput } from './gate-policy.js';
 import { matchLoopExitWhen, revisitBudgetStatus } from './core-control.js';
+import { latestAttemptIdFor, nextAttemptIdFor } from './attempt-numbering.js';
+import { materialize } from './state.js';
 import { affectedNodesFrom } from './revisit-plan.js';
 import type { V3RunSnapshot } from './state.js';
 
@@ -298,8 +301,8 @@ export interface V3RevisionRecord {
   note?: string;
   /** Who made the change (proposer, for confirmed proposals). */
   by: string;
-  /** The main bot changed the flow on its own (event-woken turn). */
-  auto?: { by: 'main_bot'; reason: string };
+  /** Reason the main bot gave for an automatic change (`by: 'main_bot'`). */
+  auto?: { reason: string };
   state: V3RevisionState;
   /** Journal time the revision was first recorded. */
   ts: number;
@@ -512,12 +515,15 @@ export function parseRevisionBotSnapshots(raw: unknown, label = 'revision bot sn
 /** Read one revision's files, verifying every digest the journal pinned. */
 export function readVerifiedV3Revision(
   runDir: string,
-  record: Pick<V3RevisionRecord, 'revision' | 'sha256' | 'botsSha256'>,
+  record: Pick<V3RevisionRecord, 'revision' | 'sha256' | 'patchSha256' | 'botsSha256'>,
   base: V3Dag,
 ): { dag: V3Dag; bots: Map<string, BotSnapshot> } {
   const paths = v3RevisionFilePaths(runDir, record.revision);
   const label = `dag-revisions/${v3RevisionStem(record.revision)}`;
   const dag = parseRevisionDag(readPinnedFile(paths.dag, record.sha256, `${label}.json`), base, `${label}.json`);
+  // The patch is the audit record of what changed and who asked: it is
+  // pinned like the DAG, so a rewritten `.patch.json` fails closed too.
+  readPinnedFile(paths.patch, record.patchSha256, `${label}.patch.json`);
   let bots = new Map<string, BotSnapshot>();
   if (record.botsSha256) {
     const bytes = readPinnedFile(paths.bots, record.botsSha256, `${label}.bots.json`);
@@ -706,7 +712,6 @@ export interface V3RevisionPlan {
   retries: Array<{
     nodeId: string;
     instanceId?: string;
-    resetGate: boolean;
     previousErrorClass?: Extract<V3Event, { type: 'nodeBlocked' }>['errorClass'];
     previousErrorCode?: string;
   }>;
@@ -726,9 +731,16 @@ export interface PlanV3DagRevisionInput {
   readProducts?: (nodeId: string) => V3DoneNodeProducts | undefined;
 }
 
+/** A rerun refused because the revisit budget is spent: the initiator can
+ *  grant one more through the 「追加重做额度」card. */
+export interface V3RerunBudgetBlock {
+  nodeId: string;
+  tier: 'pair' | 'run';
+}
+
 export type PlanV3DagRevisionResult =
   | { ok: true; plan: V3RevisionPlan }
-  | { ok: false; problems: string[] };
+  | { ok: false; problems: string[]; rerunBudget?: V3RerunBudgetBlock };
 
 type RawNode = Record<string, unknown> & { id: string };
 
@@ -873,6 +885,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
   const dependsChanged = new Set<string>();
   const reassigned = new Map<string, { from?: string; to: string }>();
   const rerun = new Set<string>();
+  let rerunBudget: V3RerunBudgetBlock | undefined;
   /** Blocked nodes the patch asks to run again (rerunNode, or a reassign). */
   const retryBlocked = new Set<string>();
   const rerunBlockedOps = new Set<string>();
@@ -1035,7 +1048,11 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
         }
         const budget = revisitBudgetStatus([...events], op.nodeId, op.nodeId);
         if (!budget.ok) {
-          problems.push(`${where}: ${budget.detail}`);
+          problems.push(
+            `${where}: 节点 "${op.nodeId}" 的重做额度已用完（${budget.tier === 'pair' ? '本节点' : '整个 run'}的 Revisit 额度）；` +
+            '需要发起人在「追加重做额度」卡上同意后再提交这次修改',
+          );
+          rerunBudget = { nodeId: op.nodeId, tier: budget.tier };
           return;
         }
         rerun.add(op.nodeId);
@@ -1043,7 +1060,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
       }
     }
   });
-  if (problems.length > 0) return { ok: false, problems };
+  if (problems.length > 0) return { ok: false, problems, ...(rerunBudget ? { rerunBudget } : {}) };
 
   let next: V3Dag;
   try {
@@ -1149,9 +1166,16 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
   // existing reassign), as a retry that reopens the run; a definition-only
   // change leaves it blocked for a later retry.
   const retries: V3RevisionPlan['retries'] = [];
-  for (const nodeId of [...changed, ...reassigned.keys()]) {
+  const regate: NonNullable<V3RevisionEffects['regate']> = [];
+  for (const nodeId of [...new Set([...changed, ...reassigned.keys()])]) {
     if (v3NodeLifecycle(snap, originalById.get(nodeId)!) === 'blocked') {
       if (reassigned.has(nodeId)) retryBlocked.add(nodeId);
+      // Its gate approval covered the OLD definition: however the node is
+      // retried later, it must pass the (new) gate again.
+      const state = snap.nodes.get(nodeId);
+      if (changed.includes(nodeId) && state?.gateCleared && state.effectiveInstanceId && nextById.get(nodeId)?.humanGate) {
+        regate.push({ nodeId, instanceId: state.effectiveInstanceId });
+      }
       continue;
     }
     addSupersede(nodeId);
@@ -1168,12 +1192,11 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
       continue;
     }
     const instanceId = snap.nodes.get(nodeId)?.effectiveInstanceId;
+    // A changed definition re-passes its gate through `regate` (a fresh
+    // instance); a pure reassign keeps the approval, like the existing path.
     retries.push({
       nodeId,
       ...(instanceId ? { instanceId } : {}),
-      // A changed definition must pass its gate again; a pure reassign keeps
-      // the approval, exactly like the existing reassign path.
-      resetGate: changed.includes(nodeId),
       ...(blockedEvent?.errorClass ? { previousErrorClass: blockedEvent.errorClass } : {}),
       ...(blockedEvent?.errorCode ? { previousErrorCode: blockedEvent.errorCode } : {}),
     });
@@ -1215,10 +1238,13 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
     }
     const instanceId = state?.effectiveInstanceId;
     const attemptId = snap.attempts.get(instanceId ?? nodeId);
+    const waitId = lifecycle === 'gateWaiting' && instanceId ? latestGateWaitId(events, nodeId, instanceId) : undefined;
     cancel.push({
       nodeId,
       ...(instanceId ? { instanceId } : {}),
       ...(attemptId && (lifecycle === 'running' || lifecycle === 'blocked') ? { attemptId } : {}),
+      // Deleting a node voids its pending approval exactly like changing it.
+      ...(waitId ? { waitId } : {}),
     });
   }
   if (problems.length > 0) return { ok: false, problems };
@@ -1258,16 +1284,30 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
     }
   }
   for (const nodeId of added) if (nextById.get(nodeId)?.humanGate) gateChanges.push({ nodeId, change: 'added' });
+  // Deleting a gated node whose gate has not been passed yet deletes a human
+  // approval (§13.5 category 3).
+  for (const nodeId of removed) {
+    if (!originalById.get(nodeId)?.humanGate || snap.nodes.get(nodeId)?.gateCleared) continue;
+    gateChanges.push({ nodeId, change: 'removed' });
+    reasons.add('gateRelaxed');
+  }
+  const timeoutRaised = (after: V3Node, before: V3Node, baseline: V3Node): boolean =>
+    effectiveTimeout(after) > Math.max(effectiveTimeout(baseline), effectiveTimeout(before));
   for (const nodeId of changed) {
     const before = originalById.get(nodeId)!;
     const after = nextById.get(nodeId)!;
     const baseline = approvedById.get(nodeId) ?? before;
-    if (after.type === 'goal' && effectiveTimeout(after) > Math.max(effectiveTimeout(baseline), effectiveTimeout(before))) {
-      reasons.add('budgetExpanded');
-    }
+    if (after.type === 'goal' && timeoutRaised(after, before, baseline)) reasons.add('budgetExpanded');
     if (isLoopNode(after) && isLoopNode(before)) {
       const baselineMax = isLoopNode(baseline) ? baseline.maxIterations : before.maxIterations;
       if (after.maxIterations > Math.max(baselineMax, before.maxIterations)) reasons.add('budgetExpanded');
+      // Category 4 covers the loop's body nodes too.
+      for (const body of after.body.nodes) {
+        const priorBody = before.body.nodes.find((candidate) => candidate.id === body.id);
+        if (!priorBody) continue;
+        const baselineBody = (isLoopNode(baseline) ? baseline.body.nodes.find((candidate) => candidate.id === body.id) : undefined) ?? priorBody;
+        if (timeoutRaised(body, priorBody, baselineBody)) reasons.add('budgetExpanded');
+      }
     }
   }
   if (next.nodes.length > approvedDag.nodes.length * 2) reasons.add('budgetExpanded');
@@ -1289,6 +1329,10 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
     ...(supersede.size > 0 ? { supersede: [...supersede.values()] } : {}),
     ...(cancel.length > 0 ? { cancel } : {}),
     ...(rerun.size > 0 ? { rerun: [...rerun] } : {}),
+    ...(regate.length > 0 ? { regate } : {}),
+    ...(retries.length > 0
+      ? { retry: retries.map((retry) => ({ nodeId: retry.nodeId, ...(retry.instanceId ? { instanceId: retry.instanceId } : {}) })) }
+      : {}),
     ...(reassigned.size > 0
       ? {
           assign: [...reassigned.entries()].map(([nodeId, value]) => {
@@ -1327,4 +1371,88 @@ export function v3NodeHeldByProposal(
 ): boolean {
   if (!pendingTouched || pendingTouched.size === 0) return false;
   return pendingTouched.has(nodeId) || (loopId !== undefined && pendingTouched.has(loopId));
+}
+
+// ─── Dedicated follow-up events (design §13.3) ────────────────────────────
+
+type FollowUpEvent = Extract<V3Event, { type: 'nodeRetryRequested' | 'nodeReassigned' }>;
+
+/**
+ * The dedicated events a revision's reassignments and blocked re-runs
+ * advance state through, written in the same journal lock right after its
+ * `dagRevised`. `events` is the journal BEFORE that lock's appends. A retry is
+ * produced only while its node is still blocked on the recorded instance.
+ */
+export function v3RevisionFollowUps(
+  events: readonly StoredEvent[],
+  input: {
+    retry?: ReadonlyArray<{ nodeId: string; instanceId?: string }>;
+    assign?: ReadonlyArray<{ nodeId: string; from?: string; to: string }>;
+    by: string;
+    auto?: V3AutoProvenance;
+  },
+): FollowUpEvent[] {
+  const out: FollowUpEvent[] = [];
+  const provenance = { by: input.by, ...(input.auto ? { auto: input.auto } : {}) };
+  const snap = materialize([...events]);
+  for (const item of input.assign ?? []) {
+    out.push({
+      type: 'nodeReassigned',
+      nodeId: item.nodeId,
+      ...(snap.nodes.get(item.nodeId)?.effectiveInstanceId ? { instanceId: snap.nodes.get(item.nodeId)!.effectiveInstanceId } : {}),
+      from: item.from ?? snap.assignments.get(item.nodeId) ?? '',
+      to: item.to,
+      ...provenance,
+    });
+  }
+  for (const item of input.retry ?? []) {
+    const state = snap.nodes.get(item.nodeId);
+    if (state?.status !== 'blocked' || state.effectiveInstanceId !== item.instanceId) continue;
+    const key = item.instanceId ?? item.nodeId;
+    const previousAttemptId = latestAttemptIdFor([...events], key);
+    if (!previousAttemptId) continue;
+    const blocked = latestBlockOf(events, snap, item.nodeId);
+    out.push({
+      type: 'nodeRetryRequested',
+      nodeId: item.nodeId,
+      ...(item.instanceId ? { instanceId: item.instanceId } : {}),
+      previousAttemptId,
+      nextAttemptId: nextAttemptIdFor([...events], key),
+      reason: 'blockedRetry',
+      ...(blocked?.kind === 'nodeBlocked' && blocked.errorClass ? { previousErrorClass: blocked.errorClass } : {}),
+      ...(blocked?.kind === 'nodeBlocked' && blocked.errorCode ? { previousErrorCode: blocked.errorCode } : {}),
+      ...provenance,
+    });
+  }
+  return out;
+}
+
+/**
+ * Crash reconciliation (drive and cold attach): a `dagRevised` whose
+ * recorded reassignment / blocked re-run has no dedicated event after it
+ * lost its second append. Returns the missing events (idempotent: once
+ * appended they satisfy the check). Nothing is owed after a cancel request.
+ */
+export function missingV3RevisionFollowUps(events: readonly StoredEvent[]): FollowUpEvent[] {
+  if (!events.some((event) => event.type === 'dagRevised' && (event.effects?.retry || event.effects?.assign))) return [];
+  const snap = materialize([...events]);
+  if (snap.runStatus !== 'running' && snap.runStatus !== 'blocked') return [];
+  const missing: FollowUpEvent[] = [];
+  events.forEach((event, index) => {
+    if (event.type !== 'dagRevised' || (!event.effects?.retry && !event.effects?.assign)) return;
+    const later = events.slice(index + 1);
+    const assign = (event.effects.assign ?? []).filter((item) => !later.some((after) =>
+      (after.type === 'nodeReassigned' && after.nodeId === item.nodeId) ||
+      (after.type === 'dagRevised' && after.effects?.assign?.some((other) => other.nodeId === item.nodeId))));
+    const retry = (event.effects.retry ?? []).filter((item) => !later.some((after) =>
+      after.type === 'nodeRetryRequested' && after.nodeId === item.nodeId));
+    if (assign.length === 0 && retry.length === 0) return;
+    missing.push(...v3RevisionFollowUps(events, {
+      assign,
+      retry,
+      by: event.by,
+      ...(event.auto ? { auto: event.auto } : {}),
+    }));
+  });
+  return missing;
 }

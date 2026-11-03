@@ -108,7 +108,15 @@ export function formatV3RunEditResponse(
     };
   }
   if (response.status === 422 && Array.isArray(body.problems)) {
-    return { exitCode: 2, text: `❌ 修改未通过校验：\n  - ${(body.problems as unknown[]).map(String).join('\n  - ')}` };
+    const grant = body.rerunBudget
+      ? body.grantCardPosted === false
+        ? '\n追加重做额度卡发送失败，请让发起人稍后重试。'
+        : '\n已在主话题发「追加重做额度」卡；发起人同意后，用同样的 patch 重新提交。'
+      : '';
+    return { exitCode: 2, text: `❌ 修改未通过校验：\n  - ${(body.problems as unknown[]).map(String).join('\n  - ')}${grant}` };
+  }
+  if (body.error === 'proposal_pending') {
+    return { exitCode: 1, text: `❌ ${String(body.detail ?? '已有待确认的修改，请等发起人处理')}` };
   }
   if (body.error === 'run_not_editable') {
     return { exitCode: 1, text: `❌ run ${runId} 当前不能修改${body.detail ? `：${String(body.detail)}` : ''}` };

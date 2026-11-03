@@ -19,6 +19,7 @@ import {
 } from './daemon-ipc-body.js';
 import type { ScheduledTask } from '../../types.js';
 import {
+  authorizeV3RunEditForCurrentTuple,
   authorizeV3RunMutationForCurrentTuple,
   V3DaemonCommandAuthorityError,
   workflowEventTurnVerifierFor,
@@ -89,7 +90,7 @@ const MUTATION_BODY_KEYS: Record<V3SessionRunMutation, readonly string[]> = {
  * supplies the live session view and trusted-host flag, so the full
  * capability → session → run-binding chain is unit-testable without HTTP.
  */
-export function authorizeV3SessionRunMutationRequest(input: {
+export interface V3SessionRelayAuthInput {
   runId: string;
   mutation: string;
   /** Parsed JSON request body (untrusted). */
@@ -117,10 +118,20 @@ export function authorizeV3SessionRunMutationRequest(input: {
   isScheduleOwnerAllowed?: (larkAppId: string, ownerOpenId: string) => boolean;
   /** Exact daemon-owned in-flight registry check for auto-disabled one-shots. */
   isScheduledTurnLive?: (turnId: string) => boolean;
-}): V3SessionRelayDecision {
-  if (!isV3SessionRunMutation(input.mutation)) {
-    return { ok: false, status: 404, error: 'unknown_mutation' };
-  }
+}
+
+type RelayAuthenticated = {
+  ok: true;
+  body: Record<string, unknown>;
+  sessionId: string;
+  current: V3SessionRelaySessionView & { chatId: string; larkAppId: string };
+  callerOpenId: string;
+  workflowEvent: boolean;
+};
+
+/** Capability → live session → current-turn caller, shared by every relay
+ *  route. Identity comes only from the daemon's own session record. */
+function authenticateRelaySession(input: V3SessionRelayAuthInput): RelayAuthenticated | Extract<V3SessionRelayDecision, { ok: false }> {
   if (!isValidRunId(input.runId)) {
     return { ok: false, status: 400, error: 'bad_run_id' };
   }
@@ -251,6 +262,24 @@ export function authorizeV3SessionRunMutationRequest(input: {
     callerOpenId = current.callerOpenId;
   }
 
+  return {
+    ok: true,
+    body,
+    sessionId,
+    current: current as RelayAuthenticated['current'],
+    callerOpenId,
+    workflowEvent: !!workflowEvent,
+  };
+}
+
+export function authorizeV3SessionRunMutationRequest(input: V3SessionRelayAuthInput): V3SessionRelayDecision {
+  if (!isV3SessionRunMutation(input.mutation)) {
+    return { ok: false, status: 404, error: 'unknown_mutation' };
+  }
+  const authenticated = authenticateRelaySession(input);
+  if (!authenticated.ok) return authenticated;
+  const { body, current, callerOpenId } = authenticated;
+
   let authority;
   try {
     authority = authorizeV3RunMutationForCurrentTuple({
@@ -280,10 +309,10 @@ export function authorizeV3SessionRunMutationRequest(input: {
   // Re-validate the payload with the exact same parser the signed-envelope
   // route uses, from an allowlisted subset only.
   const subset: Record<string, unknown> = {};
-  for (const key of MUTATION_BODY_KEYS[input.mutation]) {
+  for (const key of MUTATION_BODY_KEYS[input.mutation as V3SessionRunMutation]) {
     if (body[key] !== undefined) subset[key] = body[key];
   }
-  const parsed = parseWorkflowDaemonMutationBody(input.mutation, JSON.stringify(subset));
+  const parsed = parseWorkflowDaemonMutationBody(input.mutation as V3SessionRunMutation, JSON.stringify(subset));
   if (!parsed.ok) return { ok: false, status: 400, error: parsed.error };
 
   return {
@@ -292,4 +321,65 @@ export function authorizeV3SessionRunMutationRequest(input: {
     runDir: authority.runDir,
     larkAppId: authority.larkAppId,
   };
+}
+
+// ─── Runtime flow edits over the relay (design §13.1) ──────────────────────
+
+export type V3SessionRunEditDecision =
+  | {
+      ok: true;
+      runDir: string;
+      larkAppId: string;
+      /** For `edit`: the strictly re-parsed body with the server-derived
+       *  caller; absent for `status`. */
+      edit?: import('./daemon-ipc-body.js').WorkflowEditMutationBody;
+    }
+  | Extract<V3SessionRelayDecision, { ok: false }>;
+
+/**
+ * `workflow status` / `workflow edit` from an isolated main session. Same
+ * capability → live session → caller derivation as the other relayed
+ * commands, then the edit-specific main-session check (app, chat, topic root)
+ * instead of the owner tuple. The caller and its origin (human / this run's
+ * event-woken turn) come from the daemon's session record, never the body.
+ */
+export function authorizeV3SessionRunEditRequest(
+  input: Omit<V3SessionRelayAuthInput, 'mutation'> & { mutation: 'edit' | 'status' },
+): V3SessionRunEditDecision {
+  const authenticated = authenticateRelaySession(input);
+  if (!authenticated.ok) return authenticated;
+  const { body, current, callerOpenId, sessionId } = authenticated;
+  let authority;
+  try {
+    authority = authorizeV3RunEditForCurrentTuple({
+      runId: input.runId,
+      baseDir: input.baseDir,
+      current: {
+        callerOpenId,
+        chatId: current.chatId,
+        larkAppId: current.larkAppId,
+        sessionId,
+        ...(current.rootMessageId ? { rootMessageId: current.rootMessageId } : {}),
+        ...(authenticated.workflowEvent ? { workflowRunEvent: { runId: input.runId } } : {}),
+      },
+    });
+  } catch (err) {
+    if (err instanceof V3DaemonCommandAuthorityError) {
+      return { ok: false, status: 403, error: 'run_binding_mismatch', detail: err.message };
+    }
+    throw err;
+  }
+  if (authority.larkAppId !== input.selfLarkAppId) {
+    return { ok: false, status: 409, error: 'wrong_daemon', detail: `run 归属 ${authority.larkAppId}` };
+  }
+  if (input.mutation === 'status') return { ok: true, runDir: authority.runDir, larkAppId: authority.larkAppId };
+  const parsed = parseWorkflowDaemonMutationBody('edit', JSON.stringify({
+    patch: body.patch,
+    base: body.base,
+    caller: { openId: authority.callerOpenId, origin: authority.origin },
+  }));
+  if (!parsed.ok || parsed.body.mutation !== 'edit') {
+    return { ok: false, status: 400, error: parsed.ok ? 'bad_edit' : parsed.error };
+  }
+  return { ok: true, runDir: authority.runDir, larkAppId: authority.larkAppId, edit: parsed.body.value };
 }

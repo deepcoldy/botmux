@@ -65,6 +65,7 @@ import {
   canResolveGateWait,
   normalizeGateWaitInput,
   readWait,
+  markWaitVoided,
   resolveWaitOnce,
   selectedResolution,
   v3GateWaitId,
@@ -603,6 +604,32 @@ export function loadV3RunDagForRecovery(runDir: string): V3Dag | undefined {
   }
 }
 
+/**
+ * A bot-executed run as the workflow-node layer sees it (handoff contracts,
+ * submissions, node cards). Its DAG is the EFFECTIVE flow (design §13.3), so a
+ * node a revision changed is validated against its new contract; a revision
+ * failing its digest check makes the run unloadable (fail closed).
+ */
+export function loadV3BotExecutedRun(runDir: string):
+  | { dag: V3Dag; nodeExecutor: 'bot'; chatId?: string; title: string }
+  | undefined {
+  try {
+    const read = readRunEnvelope(runDir);
+    if (read.kind !== 'ok' || !('nodeExecutor' in read.envelope) || read.envelope.nodeExecutor !== 'bot') return undefined;
+    const loaded = loadAuthorizedV3Run(runDir);
+    const journalPath = join(runDir, 'journal.ndjson');
+    const effective = loadEffectiveV3Dag(runDir, loaded.dag, existsSync(journalPath) ? readJournal(journalPath) : []);
+    return {
+      dag: effective.dag,
+      nodeExecutor: 'bot',
+      ...(loaded.envelope.chatBinding?.chatId ? { chatId: loaded.envelope.chatBinding.chatId } : {}),
+      title: loaded.spec?.title?.trim() || basename(runDir),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Revision-1 (authorized) DAG with the legacy grill fallback. */
 export function loadV3RunAuthorizedDag(runDir: string): V3Dag | undefined {
   const envelope = readRunEnvelope(runDir);
@@ -1003,6 +1030,9 @@ function defaultMakeRunNode(
 
 export type V3GateClickOutcome =
   | { kind: 'resolved'; resolution: 'approved' | 'rejected' }
+  /** A runtime flow revision voided this gate before the decision reached
+   *  the journal: the click changed nothing. */
+  | { kind: 'voided' }
   | { kind: 'already-settled'; status: GateWaitStatus }
   | { kind: 'unauthorized' }
   | { kind: 'stale-run'; reason: 'terminal' | 'missing' | 'no-wait' | 'stale-node' };
@@ -1084,22 +1114,43 @@ export function resolveV3GateClick(
     return { kind: 'resolved', resolution: 'rejected' };
   }
   const instanceId = snap.nodes.get(resolvedWait.nodeId)?.effectiveInstanceId;
-  appendEvent(journalPath, {
-    type: 'gateResolved',
-    // nodeId from the WAIT FILE, not caller input (codex review #1): the wait is
-    // the authoritative state — a wrong/stale caller nodeId must not let us write
-    // gateResolved for a different node.
-    nodeId: resolvedWait.nodeId,
-    ...(instanceId ? { instanceId } : {}),
-    waitId: input.waitId,
-    resolution,
-    by: input.by,
-    selected: input.selected,
-    ...(trustedHost
-      ? { hostApproval: trustedHost.hostApproval }
-      : resolvedWait.hostApproval ? { hostApproval: resolvedWait.hostApproval } : {}),
+  // Re-check under the journal lock: an edit may have voided this gate
+  // between the wait CAS and here (design §13.4). Then the decision is moot —
+  // the node re-gates under its new definition — and the wait must say so.
+  const recorded = withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+    if (gateVoidedByRevision(latest, input.waitId)) return false;
+    append({
+      type: 'gateResolved',
+      // nodeId from the WAIT FILE, not caller input (codex review #1): the wait is
+      // the authoritative state — a wrong/stale caller nodeId must not let us write
+      // gateResolved for a different node.
+      nodeId: resolvedWait.nodeId,
+      ...(instanceId ? { instanceId } : {}),
+      waitId: input.waitId,
+      resolution,
+      by: input.by,
+      selected: input.selected,
+      ...(trustedHost
+        ? { hostApproval: trustedHost.hostApproval }
+        : resolvedWait.hostApproval ? { hostApproval: resolvedWait.hostApproval } : {}),
+    });
+    return true;
   });
+  if (!recorded) {
+    markWaitVoided(runDir, input.waitId, 'system-flow-revision');
+    return { kind: 'voided' };
+  }
   return { kind: 'resolved', resolution };
+}
+
+/** Did a runtime flow revision void this gate wait (changed or removed its
+ *  node while it was pending)? */
+function gateVoidedByRevision(events: readonly StoredEvent[], waitId: string): boolean {
+  return events.some((event) =>
+    event.type === 'dagRevised' && (
+      event.effects?.supersede?.some((item) => item.waitId === waitId) === true ||
+      event.effects?.cancel?.some((item) => item.waitId === waitId) === true
+    ));
 }
 
 export type V3RunCancelOutcome =

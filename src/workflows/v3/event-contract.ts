@@ -89,11 +89,21 @@ export interface V3RevisionEffects {
    *  pending gate wait voided by the change. */
   supersede?: Array<{ nodeId: string; instanceId: string; waitId?: string }>;
   /** Removed nodes that had already been dispatched or gated: neutral
-   *  cancellation of that exact instance/attempt. */
-  cancel?: Array<{ nodeId: string; instanceId?: string; attemptId?: string }>;
+   *  cancellation of that exact instance/attempt (only ever via this effect,
+   *  never a separate `nodeCancelled`). `waitId` = a pending gate it voids. */
+  cancel?: Array<{ nodeId: string; instanceId?: string; attemptId?: string; waitId?: string }>;
+  /** Blocked instances whose gate approval no longer covers their changed
+   *  definition: the approval is dropped and their next retry runs as a
+   *  fresh instance that must pass the gate again, however it is triggered. */
+  regate?: Array<{ nodeId: string; instanceId: string }>;
   /** Done nodes re-run with Revisit semantics; each consumes revisit budget. */
   rerun?: string[];
-  /** Bot reassignments; the external executor's target follows `to`. */
+  /** RECORD ONLY: blocked nodes re-run by this revision. State advances
+   *  through the `nodeRetryRequested` written in the same lock; replay never
+   *  applies this list, reconciliation re-appends a lost retry from it. */
+  retry?: Array<{ nodeId: string; instanceId?: string }>;
+  /** RECORD ONLY: reassignments, applied by the `nodeReassigned` written in
+   *  the same lock (reconciled the same way as `retry`). */
   assign?: Array<{ nodeId: string; from?: string; to: string }>;
 }
 
@@ -101,7 +111,6 @@ export interface V3RevisionEffects {
  *  this run's events (design §13.6). The reason becomes mandatory with the
  *  wake-up wiring; until then it carries the edit's note (may be empty). */
 export interface V3AutoProvenance {
-  by: 'main_bot';
   reason: string;
 }
 
@@ -141,8 +150,10 @@ export type V3Event =
       summary: string;
       /** Free-text note supplied with the edit (display only). */
       note?: string;
-      /** open_id the turn authenticated as. */
+      /** Operator: the turn's open_id, or `main_bot` for a change the main
+       *  bot made on its own in a turn this run's events woke. */
       by: string;
+      /** Only with `by: 'main_bot'`: why it acted (design §13.6). */
       auto?: V3AutoProvenance;
       /** Present when the revision was a confirmed proposal. */
       approval?: { by: string; proposedBy: string };
@@ -233,6 +244,8 @@ export type V3Event =
       from: string;
       to: string;
       by: string;
+      /** Main-bot provenance of an automatic change (design §13.6). */
+      auto?: V3AutoProvenance;
     }
   | {
       type: 'hostInputPrepared';
@@ -338,6 +351,9 @@ export type V3Event =
       previousErrorCode?: string;
       resetGate?: boolean;
       answer?: { path: string; preview: string; by: string };
+      /** Operator (`main_bot` for an automatic retry), when recorded. */
+      by?: string;
+      auto?: V3AutoProvenance;
     }
   | {
       type: 'gateDispatched';

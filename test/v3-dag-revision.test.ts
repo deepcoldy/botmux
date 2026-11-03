@@ -6,7 +6,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,6 +16,7 @@ import type { StoredEvent, V3Event } from '../src/workflows/v3/event-contract.js
 import { materialize } from '../src/workflows/v3/state.js';
 import { decideNext } from '../src/workflows/v3/orchestrator.js';
 import { revisitBudgetStatus } from '../src/workflows/v3/core-control.js';
+import { DEFAULT_REVISIT_BUDGET_PER_RUN } from '../src/workflows/v3/dag.js';
 import {
   foldV3Revisions,
   loadEffectiveV3Dag,
@@ -166,17 +167,18 @@ describe('§13.4 node-state rules', () => {
     ]);
     if (!changedAndRerun.ok) throw new Error(changedAndRerun.problems.join('; '));
     expect(changedAndRerun.plan.retries).toEqual([
-      { nodeId: 'a', instanceId: 'a#001', resetGate: true, previousErrorClass: 'resultInvalid', previousErrorCode: 'X' },
+      { nodeId: 'a', instanceId: 'a#001', previousErrorClass: 'resultInvalid', previousErrorCode: 'X' },
     ]);
+    expect(changedAndRerun.plan.effects.retry).toEqual([{ nodeId: 'a', instanceId: 'a#001' }]);
     const moved = plan(dag, events, [{ op: 'reassign', nodeId: 'a', bot: 'cli_b' }]);
-    expect(moved.ok && moved.plan.retries).toEqual([expect.objectContaining({ nodeId: 'a', resetGate: false })]);
+    expect(moved.ok && moved.plan.retries).toEqual([expect.objectContaining({ nodeId: 'a' })]);
     expect(moved.ok && moved.plan.effects.supersede).toBeUndefined();
     const removed = plan(dag, events, [{ op: 'removeNode', nodeId: 'a' }]);
     expect(removed.ok && removed.plan.effects.cancel).toEqual([{ nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001' }]);
     expect(plan(dag, events, [{ op: 'setDepends', nodeId: 'a', depends: [] }]).ok).toBe(false);
 
     // Replayed with the retry the editor appends: the run reopens and the
-    // same instance re-dispatches (gate first — its definition changed).
+    // same instance re-dispatches (its gate was never passed, so gate first).
     const after = [
       ...events,
       ev({
@@ -184,7 +186,7 @@ describe('§13.4 node-state rules', () => {
       }),
       ev({
         type: 'nodeRetryRequested', nodeId: 'a', instanceId: 'a#001', previousAttemptId: 'a#001/attempts/001',
-        nextAttemptId: 'a#001/attempts/002', reason: 'blockedRetry', resetGate: true,
+        nextAttemptId: 'a#001/attempts/002', reason: 'blockedRetry',
       }),
     ];
     const snap = materialize(after);
@@ -243,7 +245,7 @@ describe('§13.4 node-state rules', () => {
     expect(revisitBudgetStatus(after, 'a', 'a').ok).toBe(false);
     const second = plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]);
     expect(second.ok).toBe(false);
-    expect(!second.ok && second.problems.join(' ')).toMatch(/budget/);
+    expect(!second.ok && second.rerunBudget).toEqual({ nodeId: 'a', tier: 'pair' });
     after.push(ev({ type: 'revisitBudgetGranted', sourceNodeId: 'a', toNodeId: 'a', by: 'ou_i' }));
     expect(plan(dag, after, [{ op: 'rerunNode', nodeId: 'a' }]).ok).toBe(true);
   });
@@ -335,7 +337,7 @@ describe('§13.5 confirmation categories', () => {
   it('direct: goal/outputs edits, approved-bot reassign, removing or rewiring not-started nodes, adding a gate', () => {
     expect(reasonsOf([{ op: 'updateNode', nodeId: 'a', set: { goal: 'better' } }])).toEqual([]);
     expect(reasonsOf([{ op: 'reassign', nodeId: 'a', bot: 'alias_b' }])).toEqual([]);
-    expect(reasonsOf([{ op: 'removeNode', nodeId: 'g' }])).toEqual([]);
+    expect(reasonsOf([{ op: 'removeNode', nodeId: 'a' }])).toEqual([]);
     expect(reasonsOf([{ op: 'updateNode', nodeId: 'a', set: { humanGate: { prompt: 'check' } } }])).toEqual([]);
     expect(reasonsOf([{ op: 'updateNode', nodeId: 'g', set: { humanGate: { prompt: 'reworded', approvers: ['ou_x'] } } }])).toEqual([]);
     expect(reasonsOf([{ op: 'updateNode', nodeId: 'a', set: { timeoutSec: 300 } }])).toEqual([]);
@@ -358,8 +360,9 @@ describe('§13.5 confirmation categories', () => {
       .toEqual(['hostNode']);
   });
 
-  it('gate removed or relaxed', () => {
+  it('gate removed or relaxed — including deleting a node whose gate was not passed yet', () => {
     expect(reasonsOf([{ op: 'updateNode', nodeId: 'g', set: { humanGate: null } }])).toEqual(['gateRelaxed']);
+    expect(reasonsOf([{ op: 'removeNode', nodeId: 'g' }])).toEqual(['gateRelaxed']);
     expect(reasonsOf([{ op: 'updateNode', nodeId: 'g', set: { humanGate: { prompt: 'ok?', approvers: [] } } }]))
       .toEqual(['gateRelaxed']);
   });
@@ -372,16 +375,91 @@ describe('§13.5 confirmation categories', () => {
   });
 });
 
+describe('review regressions (engine)', () => {
+  it('P3-7: raising a loop BODY node timeout is a budget expansion', () => {
+    const schema = { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] };
+    const body = (timeoutSec: number) => ({ nodes: [goal('w', { timeoutSec, resultSchema: schema })] });
+    const loop = (timeoutSec: number) => ({
+      id: 'l', type: 'loop', maxIterations: 2, depends: [], inputs: [],
+      body: body(timeoutSec), exit: { node: 'w', when: { path: 'result.ok', equals: true } },
+    });
+    const dag = dagOf([loop(60)]);
+    const raised = plan(dag, started(), [{ op: 'updateNode', nodeId: 'l', set: { body: body(14_000) } }]);
+    expect(raised.ok && raised.plan.reasons).toEqual(['budgetExpanded']);
+    const lowered = plan(dag, started(), [{ op: 'updateNode', nodeId: 'l', set: { body: body(30) } }]);
+    expect(lowered.ok && lowered.plan.reasons).toEqual([]);
+  });
+
+  it('P1: a definition change on a blocked node whose gate was passed drops that approval (regate)', () => {
+    const dag = dagOf([goal('g', { humanGate: { prompt: 'ship?' } })]);
+    const events = [
+      ...started(),
+      ev({ type: 'gateDispatched', nodeId: 'g', instanceId: 'g#001', waitId: 'g#001-gate' }),
+      ev({ type: 'gateResolved', nodeId: 'g', instanceId: 'g#001', waitId: 'g#001-gate', resolution: 'approved', by: 'ou_i' }),
+      ...running('g'),
+      ev({ type: 'nodeBlocked', nodeId: 'g', instanceId: 'g#001', attemptId: 'g#001/attempts/001', errorClass: 'workerError' }),
+      ev({ type: 'runBlocked', blockedNodeId: 'g' }),
+    ];
+    const changed = plan(dag, events, [{ op: 'updateNode', nodeId: 'g', set: { goal: 'DELETE PROD' } }]);
+    if (!changed.ok) throw new Error(changed.problems.join('; '));
+    expect(changed.plan.effects.regate).toEqual([{ nodeId: 'g', instanceId: 'g#001' }]);
+    expect(changed.plan.retries).toEqual([]);
+    // Any later retry — here a plain operator retry — re-asks the gate on a
+    // fresh instance instead of running the new goal on the old approval.
+    const after = [
+      ...events,
+      ev({ type: 'dagRevised', revision: 2, baseRevision: 1, sha256: 's', patchSha256: 'p', summary: '改 1 节点', by: 'ou_i', effects: changed.plan.effects }),
+      ev({ type: 'nodeRetryRequested', nodeId: 'g', instanceId: 'g#001', previousAttemptId: 'g#001/attempts/001', nextAttemptId: 'g#001/attempts/002', reason: 'blockedRetry' }),
+    ];
+    const snap = materialize(after);
+    expect(snap.runStatus).toBe('running');
+    expect(decideNext(changed.plan.dag, snap.nodes, snap.loops, snap.edges, snap.instances))
+      .toEqual([{ kind: 'dispatchGate', nodeId: 'g', instanceId: 'g#002' }]);
+    // A pure reassign keeps the approval (existing reassign semantics).
+    const moved = plan(dag, events, [{ op: 'reassign', nodeId: 'g', bot: 'cli_b' }]);
+    expect(moved.ok && moved.plan.effects.regate).toBeUndefined();
+  });
+
+  it('(b) cancelling any blocked node unblocks the run, like a retry', () => {
+    const events = [
+      ...started(),
+      ...running('a'),
+      ...running('c'),
+      ev({ type: 'nodeBlocked', nodeId: 'a', instanceId: 'a#001', attemptId: 'a#001/attempts/001', errorClass: 'workerError' }),
+      ev({ type: 'nodeBlocked', nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001', errorClass: 'workerError' }),
+      ev({ type: 'runBlocked', blockedNodeId: 'a' }),
+      ev({
+        type: 'dagRevised', revision: 2, baseRevision: 1, sha256: 's', patchSha256: 'p', summary: '-1 节点', by: 'ou',
+        effects: { cancel: [{ nodeId: 'c', instanceId: 'c#001', attemptId: 'c#001/attempts/001' }] },
+      }),
+    ];
+    const snap = materialize(events);
+    expect(snap.runStatus).toBe('running');
+    expect(snap.blockedNodeId).toBeUndefined();
+  });
+
+  it('a rerun also spends the RUN-wide revisit budget', () => {
+    const reruns = Array.from({ length: DEFAULT_REVISIT_BUDGET_PER_RUN }, (_, i) => ev({
+      type: 'dagRevised', revision: i + 2, baseRevision: i + 1, sha256: 's', patchSha256: 'p', summary: '重做 1', by: 'ou',
+      effects: { rerun: [`n${i}`] },
+    }));
+    const status = revisitBudgetStatus([...started(), ...reruns], 'fresh', 'fresh');
+    expect(status).toMatchObject({ ok: false, tier: 'run' });
+  });
+});
+
 describe('revision fold and the effective DAG', () => {
   const dirs: string[] = [];
   afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-  function writeRevision(runDir: string, revision: number, dag: V3Dag): string {
+  function writeRevision(runDir: string, revision: number, dag: V3Dag): { sha256: string; patchSha256: string } {
     const paths = v3RevisionFilePaths(runDir, revision);
     mkdirSync(join(runDir, 'dag-revisions'), { recursive: true });
     const bytes = `${JSON.stringify(dag, null, 2)}\n`;
     writeFileSync(paths.dag, bytes);
-    return v3RevisionDigest(bytes);
+    const patch = `${JSON.stringify({ revision, ops: [{ op: 'addNode', node: { id: 'b' } }], by: 'ou_i' })}\n`;
+    writeFileSync(paths.patch, patch);
+    return { sha256: v3RevisionDigest(bytes), patchSha256: v3RevisionDigest(patch) };
   }
 
   it('without revisions the authorized DAG is returned as-is and no file is read', () => {
@@ -396,15 +474,20 @@ describe('revision fold and the effective DAG', () => {
     dirs.push(runDir);
     const base = dagOf([goal('a')]);
     const second = dagOf([goal('a'), goal('b')]);
-    const sha = writeRevision(runDir, 2, second);
+    const digests = writeRevision(runDir, 2, second);
     const events = [
       ...started(),
-      ev({ type: 'dagRevised', revision: 2, baseRevision: 1, sha256: sha, patchSha256: 'p', summary: '+1 节点', by: 'ou_i' }),
+      ev({ type: 'dagRevised', revision: 2, baseRevision: 1, ...digests, summary: '+1 节点', by: 'ou_i' }),
     ];
     const effective = loadEffectiveV3Dag(runDir, base, events);
     expect(effective.revision).toBe(2);
     expect(effective.dag.nodes.map((node) => node.id)).toEqual(['a', 'b']);
+    const genuine = readFileSync(v3RevisionFilePaths(runDir, 2).dag);
     writeFileSync(v3RevisionFilePaths(runDir, 2).dag, `${JSON.stringify(dagOf([goal('a'), goal('evil')]), null, 2)}\n`);
+    expect(() => loadEffectiveV3Dag(runDir, base, events)).toThrow(V3RevisionIntegrityError);
+    // The patch (who changed what) is pinned too (§13.3).
+    writeFileSync(v3RevisionFilePaths(runDir, 2).dag, genuine);
+    writeFileSync(v3RevisionFilePaths(runDir, 2).patch, '{"by":"ou_someone_else","ops":[]}\n');
     expect(() => loadEffectiveV3Dag(runDir, base, events)).toThrow(V3RevisionIntegrityError);
   });
 

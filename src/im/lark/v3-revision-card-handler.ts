@@ -5,6 +5,7 @@
 
 import {
   decideV3RevisionProposal,
+  grantV3RerunBudget,
   type V3RevisionDecisionOutcome,
   type V3VoidedGate,
 } from '../../workflows/v3/run-edit.js';
@@ -13,13 +14,20 @@ import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 import {
   V3_REVISION_APPROVE_ACTION,
   V3_REVISION_REJECT_ACTION,
+  V3_REVISION_RERUN_GRANT_ACTION,
+  buildV3RerunGrantCard,
   buildV3RevisionCard,
+  v3RerunGrantCardNonce,
   v3RevisionCardNonce,
+  type V3RerunGrantActionValue,
   type V3RevisionActionValue,
 } from './v3-revision-card.js';
+import { V3_DAG_SEGMENT_RE } from '../../workflows/v3/dag.js';
 
 export function isV3RevisionAction(action: unknown): boolean {
-  return action === V3_REVISION_APPROVE_ACTION || action === V3_REVISION_REJECT_ACTION;
+  return action === V3_REVISION_APPROVE_ACTION ||
+    action === V3_REVISION_REJECT_ACTION ||
+    action === V3_REVISION_RERUN_GRANT_ACTION;
 }
 
 export interface V3RevisionCardHandlerDeps {
@@ -32,6 +40,49 @@ export interface V3RevisionCardHandlerDeps {
 }
 
 export async function handleV3RevisionAction(
+  value: V3RevisionActionValue | V3RerunGrantActionValue,
+  operatorOpenId: string | undefined,
+  deps: V3RevisionCardHandlerDeps,
+): Promise<unknown> {
+  if (value.action === V3_REVISION_RERUN_GRANT_ACTION) return handleRerunGrant(value, operatorOpenId, deps);
+  return handleDecision(value, operatorOpenId, deps);
+}
+
+async function handleRerunGrant(
+  value: V3RerunGrantActionValue,
+  operatorOpenId: string | undefined,
+  deps: V3RevisionCardHandlerDeps,
+): Promise<unknown> {
+  if (!isValidRunId(value.runId) || typeof value.nodeId !== 'string' || !V3_DAG_SEGMENT_RE.test(value.nodeId) ||
+    value.nonce !== v3RerunGrantCardNonce(value.runId, value.nodeId)) {
+    return { toast: { type: 'warning', content: '重做额度卡已失效' } };
+  }
+  if (!operatorOpenId) return { toast: { type: 'warning', content: '无法识别操作人' } };
+  const outcome = grantV3RerunBudget({
+    baseDir: deps.baseDir ?? defaultBaseDir(),
+    runId: value.runId,
+    nodeId: value.nodeId,
+    by: operatorOpenId,
+  });
+  switch (outcome.kind) {
+    case 'unauthorized':
+      return { toast: { type: 'warning', content: '只有本流程的发起人能追加重做额度' } };
+    case 'missing':
+      return { toast: { type: 'warning', content: '找不到这个 run' } };
+    case 'already-granted':
+      return { toast: { type: 'info', content: '额度已经够用，请重新提交修改' } };
+    case 'stale':
+      return JSON.parse(buildV3RerunGrantCard({
+        runId: value.runId, nodeId: value.nodeId, tier: 'pair', resolution: { kind: 'void', detail: outcome.detail },
+      }));
+    case 'granted':
+      return JSON.parse(buildV3RerunGrantCard({
+        runId: value.runId, nodeId: value.nodeId, tier: outcome.tier, resolution: { kind: 'granted', by: operatorOpenId },
+      }));
+  }
+}
+
+async function handleDecision(
   value: V3RevisionActionValue,
   operatorOpenId: string | undefined,
   deps: V3RevisionCardHandlerDeps,

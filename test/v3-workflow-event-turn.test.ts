@@ -34,6 +34,7 @@ import {
 import { appendEvent } from '../src/workflows/v3/journal.js';
 import { authorizeV3SessionRunMutationRequest } from '../src/workflows/v3/session-relay.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
+import { recordV3MainWakeIssued } from '../src/workflows/v3/main-wake-ledger.js';
 
 const RUN = 'wf-event-run';
 const BINDING = { larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real_root', ownerOpenId: 'ou_initiator' };
@@ -104,6 +105,16 @@ function seedRun(runId = RUN): void {
   });
 }
 
+/** Fake issuer: what the run-owning daemon records before opening a wake turn. */
+function issueWake(runId: string, eventSeq: number, overrides: Record<string, unknown> = {}): string {
+  const turnId = mintWorkflowEventTurnId(runId, eventSeq);
+  recordV3MainWakeIssued(join(baseDir, runId), {
+    runId, eventSeq, turnId, sessionId: 'sess-main', larkAppId: BINDING.larkAppId, chatId: BINDING.chatId,
+    rootMessageId: BINDING.rootMessageId, issuedAt: Date.now() - 1_000, ...overrides,
+  } as never);
+  return turnId;
+}
+
 const editAs = (runId = RUN) => authorizeV3RunEditCommand({ runId, baseDir, dataDir, envSessionId: 'sess-main', startPid: process.pid });
 
 describe('workflow event turn ids', () => {
@@ -119,22 +130,31 @@ describe('event-woken turn of THIS run', () => {
   it('may run status/edit for its own run as the main bot, acting for the initiator', () => {
     seedRun();
     writeSession();
-    writeMarker(mintWorkflowEventTurnId(RUN, 2));
+    writeMarker(issueWake(RUN, 2));
     expect(editAs()).toMatchObject({ origin: 'runEvent', callerOpenId: 'ou_initiator' });
+  });
+
+  it('is recognised only when the run-owning daemon recorded issuing it to this session', () => {
+    seedRun();
+    writeSession();
+    writeMarker(mintWorkflowEventTurnId(RUN, 2)); // well-formed, never issued
+    expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
+    issueWake(RUN, 2, { sessionId: 'sess-another' });
+    expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
   });
 
   it('is refused for another run, outside the main session, for a missing event, or after the run ended', () => {
     seedRun();
     seedRun('other-run');
     writeSession();
-    writeMarker(mintWorkflowEventTurnId('other-run', 2));
+    writeMarker(issueWake('other-run', 2));
     expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
 
-    writeMarker(mintWorkflowEventTurnId(RUN, 99));
+    writeMarker(issueWake(RUN, 99));
     expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
 
     writeSession({ rootMessageId: 'om_some_other_topic' });
-    writeMarker(mintWorkflowEventTurnId(RUN, 2));
+    writeMarker(issueWake(RUN, 2));
     expect(() => editAs()).toThrow(CurrentTurnProvenanceError);
 
     writeSession();
@@ -146,7 +166,7 @@ describe('event-woken turn of THIS run', () => {
     seedRun();
     seedRun('other-run');
     writeSession();
-    writeMarker(mintWorkflowEventTurnId(RUN, 2));
+    writeMarker(issueWake(RUN, 2));
     expect(authorizeV3DaemonCommand({ runId: RUN, baseDir, dataDir, envSessionId: 'sess-main', startPid: process.pid }))
       .toMatchObject({ mode: 'chat', larkAppId: BINDING.larkAppId });
     // Never for another run, and never for a command without a run-bound verifier.
@@ -159,6 +179,7 @@ describe('event-woken turn of THIS run', () => {
   it('the sandbox relay recognises it the same way and still refuses other synthetic turns', () => {
     seedRun();
     seedRun('other-run');
+    issueWake(RUN, 2);
     const capability = 'c'.repeat(64);
     const relay = (runId: string, turnId: string, rootMessageId = BINDING.rootMessageId) => authorizeV3SessionRunMutationRequest({
       runId,

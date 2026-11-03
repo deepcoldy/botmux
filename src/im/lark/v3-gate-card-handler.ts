@@ -101,7 +101,7 @@ export async function handleV3GateAction(
       },
     };
   }
-  if (outcome.kind === 'already-settled' && outcome.status === 'voided') {
+  if (outcome.kind === 'voided' || (outcome.kind === 'already-settled' && outcome.status === 'voided')) {
     // A runtime flow revision replaced this node before anyone decided: show
     // the card frozen as void instead of a misleading "already decided" toast.
     const wait = readWait(runDir, value.waitId);

@@ -753,7 +753,6 @@ import { createWorkflowNodeDaemon } from './core/workflow-node-daemon.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
 import { isRemoteCliId } from './core/remote-cli-ids.js';
-import { loadAuthorizedV3Run, readRunEnvelope } from './workflows/v3/run-envelope.js';
 import {
   WORKFLOW_HANDOFF_EVENT_MAX_BODY_BYTES,
   WORKFLOW_HANDOFF_EVENT_ROUTE,
@@ -766,6 +765,7 @@ import { substituteWorkflowHandoffPlaceholder, workflowNodeMarkerFromBinding } f
 import { lookupWorkflowHandoff, readDispatchRegistryLoose } from './core/workflow-handoff-binding.js';
 import {
   createV3GateRunner,
+  loadV3BotExecutedRun,
   preflightV3RunStart,
   readV3RunChatBinding,
   requestV3RunCancel,
@@ -773,7 +773,7 @@ import {
   requestV3LoopGrant,
 } from './workflows/v3/daemon-run.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
-import { buildV3RevisionCard } from './im/lark/v3-revision-card.js';
+import { buildV3RerunGrantCard, buildV3RevisionCard } from './im/lark/v3-revision-card.js';
 import {
   applyV3RunEdit,
   projectV3RunStatus,
@@ -811,6 +811,7 @@ import { botToSnapshot, resolveBotConfig } from './workflows/v3/bot-resolve.js';
 import { isV3SupportedCli } from './workflows/v3/contract.js';
 import { isValidRunId as isValidV3RunId } from './workflows/v3/ops-projection.js';
 import {
+  authorizeV3SessionRunEditRequest,
   authorizeV3SessionRunMutationRequest,
   V3_SESSION_RUN_MUTATIONS,
   V3_SESSION_RUN_MUTATION_ROUTE_PREFIX,
@@ -6711,19 +6712,7 @@ const v3ProgressCardManager = new V3ProgressCardManager({
 // after the experimental switch was on at authorization) and for inbound
 // messages / reports / turns that carry a host-signed workflow handoff.
 function workflowLoadBotRun(runDir: string) {
-  try {
-    const read = readRunEnvelope(runDir);
-    if (read.kind !== 'ok' || !('nodeExecutor' in read.envelope) || read.envelope.nodeExecutor !== 'bot') return undefined;
-    const loaded = loadAuthorizedV3Run(runDir);
-    return {
-      dag: loaded.dag,
-      nodeExecutor: 'bot' as const,
-      ...(loaded.envelope.chatBinding?.chatId ? { chatId: loaded.envelope.chatBinding.chatId } : {}),
-      title: loaded.spec?.title?.trim() || basename(runDir),
-    };
-  } catch {
-    return undefined;
-  }
+  return loadV3BotExecutedRun(runDir);
 }
 
 /** The "停止" path (^C to the session's CLI, session kept), with the same
@@ -8018,15 +8007,83 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
       try { status = projectV3RunStatus(v3DefaultBaseDir(), runId); } catch { /* best effort */ }
       return reply(409, { ok: false, error: 'revision_conflict', currentRevision: outcome.currentRevision, status });
     }
-    case 'invalid':
-      return reply(422, { ok: false, error: 'invalid_edit', problems: outcome.problems });
+    case 'invalid': {
+      // A rerun the revisit budget refused: put the grant in the initiator's
+      // hands (one click unlocks one more rerun; the bot then re-submits).
+      let grantCardPosted: boolean | undefined;
+      if (outcome.rerunBudget) {
+        grantCardPosted = true;
+        try {
+          const card = buildV3RerunGrantCard({ runId, nodeId: outcome.rerunBudget.nodeId, tier: outcome.rerunBudget.tier });
+          if (binding.rootMessageId) await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
+          else await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+        } catch (err) {
+          grantCardPosted = false;
+          logger.warn(`[v3:${runId}] rerun grant card failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return reply(422, {
+        ok: false, error: 'invalid_edit', problems: outcome.problems,
+        ...(outcome.rerunBudget ? { rerunBudget: outcome.rerunBudget, grantCardPosted } : {}),
+      });
+    }
     case 'rejected':
       return reply(outcome.reason === 'missing' ? 404 : 409, {
-        ok: false, error: outcome.reason === 'missing' ? 'unknown_run' : 'run_not_editable',
+        ok: false,
+        error: outcome.reason === 'missing' ? 'unknown_run'
+          : outcome.reason === 'proposal-pending' ? 'proposal_pending' : 'run_not_editable',
         ...(outcome.detail ? { detail: outcome.detail } : {}),
       });
   }
 });
+
+// Isolated (sandboxed / read-isolated) main sessions reach status / edit
+// through the session relay: the daemon derives the caller tuple from its own
+// live session record, then applies the same main-session check and M1
+// classification as the host path (design §13.1).
+for (const relayVerb of ['edit', 'status'] as const) {
+  ipcRoute('POST', `${V3_SESSION_RUN_MUTATION_ROUTE_PREFIX}/:runId/${relayVerb}`, async (req: IncomingMessage, res, params) => {
+    let raw: unknown;
+    try {
+      raw = await readJsonBody<unknown>(req);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    }
+    const claimedSessionId = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).sessionId
+      : undefined;
+    const ds = typeof claimedSessionId === 'string' ? findActiveBySessionId(claimedSessionId) : undefined;
+    const decision = authorizeV3SessionRunEditRequest({
+      runId: params.runId,
+      mutation: relayVerb,
+      raw,
+      trustedHost: isTrustedHostIpcRequest(req),
+      session: ds ? v3RelaySessionView(ds) : undefined,
+      selfLarkAppId: selfV3LarkAppId,
+      baseDir: v3DefaultBaseDir(),
+    });
+    if (!decision.ok) {
+      return jsonRes(res, decision.status, { ok: false, error: decision.error, ...(decision.detail ? { detail: decision.detail } : {}) });
+    }
+    if (relayVerb === 'status') {
+      try {
+        return jsonRes(res, 200, { ok: true, status: projectV3RunStatus(v3DefaultBaseDir(), params.runId) });
+      } catch (err) {
+        return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    const executor = v3RunMutationExecutors.edit;
+    if (!executor || !decision.edit || !selfV3LarkAppId || !selfV3BootInstanceId) {
+      return jsonRes(res, 503, { ok: false, error: 'workflow_ipc_identity_unavailable' });
+    }
+    return executor(
+      (status, payload) => jsonRes(res, status, payload),
+      { runId: params.runId },
+      decision.edit,
+      { larkAppId: selfV3LarkAppId, bootInstanceId: selfV3BootInstanceId },
+    );
+  });
+}
 
 /** Post the 「流程修改确认」card into the run's main topic and remember its
  *  message id so a later void/stale can freeze it in place. */
@@ -9617,6 +9674,26 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
 // 活跃会话记录反推 (caller, chat, bot) 三元组——请求体选不了身份——再按与 CLI
 // 宿主路径完全相同的 run 绑定规则授权，最后调用同一个 mutation 执行器。
 // narrow-untrusted 白名单见 dashboard-ipc-server 的 routeHasNarrowUntrustedAuth。
+/** The live session view every workflow relay route authenticates against. */
+function v3RelaySessionView(ds: DaemonSession): import('./workflows/v3/session-relay.js').V3SessionRelaySessionView {
+  const replyTarget = ds.currentReplyTarget ?? ds.session.currentReplyTarget;
+  const rootMessageId = ds.session.rootMessageId ?? replyTarget?.rootMessageId;
+  return {
+    receiver: !!ds.session.vcMeetingReceiver,
+    ...(ds.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
+    ...(ds.session.lastCallerOpenId ? { callerOpenId: ds.session.lastCallerOpenId } : {}),
+    ...(ds.chatId ? { chatId: ds.chatId } : {}),
+    ...(ds.larkAppId ? { larkAppId: ds.larkAppId } : {}),
+    // Current-turn pointers for the generation join: the authorizer rejects a
+    // capability whose turn is no longer the session's current inbound turn
+    // (a queued message already advanced these).
+    ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+    ...(replyTarget?.turnId ? { currentReplyTargetTurnId: replyTarget.turnId } : {}),
+    // Binds a workflow event turn / status-edit to the run's main session.
+    ...(rootMessageId ? { rootMessageId } : {}),
+  };
+}
+
 for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
   ipcRoute(
     'POST',
@@ -9639,35 +9716,7 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
         mutation: sessionRelayMutation,
         raw,
         trustedHost: isTrustedHostIpcRequest(req),
-        session: ds
-          ? {
-              receiver: !!ds.session.vcMeetingReceiver,
-              ...(ds.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
-              ...(ds.session.lastCallerOpenId
-                ? { callerOpenId: ds.session.lastCallerOpenId }
-                : {}),
-              ...(ds.chatId ? { chatId: ds.chatId } : {}),
-              ...(ds.larkAppId ? { larkAppId: ds.larkAppId } : {}),
-              // Current-turn pointers for the generation join: the authorizer
-              // rejects a capability whose turn is no longer the session's
-              // current inbound turn (a queued message already advanced these).
-              ...(ds.session.quoteTargetId
-                ? { quoteTargetId: ds.session.quoteTargetId }
-                : {}),
-              ...((ds.currentReplyTarget ?? ds.session.currentReplyTarget)?.turnId
-                ? {
-                    currentReplyTargetTurnId:
-                      (ds.currentReplyTarget ?? ds.session.currentReplyTarget)!.turnId,
-                  }
-                : {}),
-              ...((ds.session.rootMessageId ?? (ds.currentReplyTarget ?? ds.session.currentReplyTarget)?.rootMessageId)
-                ? {
-                    rootMessageId: ds.session.rootMessageId
-                      ?? (ds.currentReplyTarget ?? ds.session.currentReplyTarget)!.rootMessageId,
-                  }
-                : {}),
-            }
-          : undefined,
+        session: ds ? v3RelaySessionView(ds) : undefined,
         selfLarkAppId: selfV3LarkAppId,
         baseDir: v3DefaultBaseDir(),
         loadScheduledTask: (appId, taskId) =>

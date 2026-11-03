@@ -6945,7 +6945,7 @@ function authorizeWorkflowDaemonCommand(runId: string, rest: string[]): string {
  */
 async function tryWorkflowSessionRelayMutation(
   runId: string,
-  mutation: WorkflowDaemonMutation,
+  mutation: WorkflowDaemonMutation | 'status',
   body?: Record<string, unknown>,
 ): Promise<WorkflowDaemonMutationResponse | null> {
   const context = readWorkflowSessionRelayContext({
@@ -7193,6 +7193,19 @@ async function cmdWorkflowStatusV3(runId: string | undefined, rest: string[]): P
   }
   const { projectV3RunStatus, formatV3RunStatus } = await import('./workflows/v3/run-edit.js');
   const { defaultBaseDir: defaultV3BaseDir } = await import('./workflows/v3/grill-state.js');
+  // An isolated main session cannot read the run directory: ask the daemon,
+  // which authenticates the session from its own live record.
+  const relayed = await tryWorkflowSessionRelayMutation(runId, 'status');
+  if (relayed) {
+    let body: { ok?: boolean; status?: Parameters<typeof formatV3RunStatus>[0] } = {};
+    try { body = JSON.parse(relayed.bodyRaw) as typeof body; } catch { /* reported below */ }
+    if (!relayed.ok || !body.status) {
+      console.error(`❌ status 失败 (HTTP ${relayed.status}): ${relayed.bodyRaw}`);
+      process.exit(1);
+    }
+    console.log(rest.includes('--json') ? JSON.stringify(body.status, null, 2) : formatV3RunStatus(body.status));
+    return;
+  }
   try {
     authorizeV3RunEditCommand({
       runId,
@@ -7229,8 +7242,18 @@ async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Pro
     process.exit(1);
   }
   let response: WorkflowDaemonMutationResponse;
+  let patch: unknown;
   try {
-    const patch = readV3RunEditPatch(parsed.patchFile);
+    patch = readV3RunEditPatch(parsed.patchFile);
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  // Isolated main session → session relay (the daemon derives the caller).
+  const relayed = await tryWorkflowSessionRelayMutation(runId, 'edit', { patch, base: parsed.base });
+  if (relayed) {
+    response = relayed;
+  } else try {
     const authority = authorizeV3RunEditCommand({
       runId,
       dataDir: resolveDataDir(),

@@ -656,8 +656,8 @@ function projectRevisions(
   }
   if (history.records.length === 0) return undefined;
   const initiator = readInitiatorOpenId(runDir);
-  const role = (record: { by: string; auto?: unknown }): RunRevisionEntryView['by'] =>
-    record.auto ? 'mainBot' : record.by === initiator ? 'initiator' : 'other';
+  const role = (record: { by: string }): RunRevisionEntryView['by'] =>
+    record.by === 'main_bot' ? 'mainBot' : record.by === initiator ? 'initiator' : 'other';
   let integrityError = false;
   let effectiveNodes: DagNodeLite[] | undefined;
   let verifiedRevision = 1;
