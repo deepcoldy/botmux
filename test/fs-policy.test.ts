@@ -31,6 +31,7 @@ import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { buildPiArgs, createPiAdapter } from '../src/adapters/cli/pi.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
+import { protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
 import { sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
 import { sessionSkillSnapshotRoot } from '../src/core/skills/snapshot.js';
 
@@ -392,7 +393,6 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/usr/bin/env').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/private/var/folders/ab/T/x').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.ssh/id_rsa').access).toBe('deny');
-    expect(accessForPath(p.rules, '/Users/u/.mixrc').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/appsecret.enc').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/Library/Keychains/login.keychain').access).toBe('deny');
     // ~/.botmux is NOT exposed wholesale (deny-by-default) — cross-bot secrets
@@ -2087,9 +2087,19 @@ describe('buildFsPolicy — session skill manifest + skill snapshot', () => {
   });
 
   it('oncall + device-credential boundary: the credential masks hide neither the manifest nor the snapshot', () => {
+    const protectedPaths = protectedMcpHomePaths('/Users/u', {
+      capabilities: [],
+      protectedHomePaths: ['.fixture-credential'],
+      redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+    } satisfies ProtectedMcpWorkerPolicy);
     for (const platform of ['darwin', 'linux'] as const) {
-      const cred = buildCredentialIsolationRules({ homeDir: '/Users/u', botmuxHome: '/Users/u/.botmux' });
+      const cred = buildCredentialIsolationRules(
+        { homeDir: '/Users/u', botmuxHome: '/Users/u/.botmux' },
+        protectedPaths,
+      );
       const p = buildFsPolicy(skillCtx({ platform, mandatoryDenyPaths: cred.denyPaths, mandatoryDenyRegexes: cred.denyRegexes }));
+      expect(accessForPath(p.rules, '/Users/u/.fixture-credential').access).toBe('deny');
+      expect((p.denyRegexes ?? []).some(rx => new RegExp(rx).test('/Users/u/.fixture-credential.tmp'))).toBe(true);
       for (const path of [ownManifest, `${snapshot}/deploy/SKILL.md`]) {
         expect(accessForPath(p.rules, path).access).toBe('readOnly');
         expect((p.denyRegexes ?? []).some(rx => new RegExp(rx).test(path))).toBe(false);

@@ -14739,7 +14739,7 @@ export function forkWorker(
     }),
   );
   const forkEnv = workerForkEnv(
-    buildBotWorkerEnv(process.env, botCfg.envPolicy),
+    buildBotWorkerEnv(process.env, botCfg.envPolicy, protectedMcpProvisioning.workerPolicy),
     protectedMcpProvisioning.workerPolicy.redactEnv,
   );
   // Dequeue only after every earlier launch-preparation write has finished.
@@ -22120,7 +22120,7 @@ export function forkAdoptWorker(
     false,
   );
   const forkEnv = workerForkEnv(
-    buildBotWorkerEnv(process.env, botCfg.envPolicy),
+    buildBotWorkerEnv(process.env, botCfg.envPolicy, protectedMcpProvisioning.workerPolicy),
     protectedMcpProvisioning.workerPolicy.redactEnv,
   );
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the

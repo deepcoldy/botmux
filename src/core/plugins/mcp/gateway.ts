@@ -78,6 +78,7 @@ import type {
 import {
   PROTECTED_MCP_CHILD_SECRET_FD,
   PROTECTED_MCP_SECRET_FD_ENV,
+  protectedMcpRedactedEnvKeys,
   type ProtectedMcpWorkerPolicy,
   type TrustedTurnPrincipal,
 } from '../../protected-mcp-capabilities.js';
@@ -459,6 +460,9 @@ export class PluginMcpGateway {
           BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
           ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
         };
+        for (const key of protectedMcpRedactedEnvKeys(this.protectedMcpPolicy)) {
+          delete downstreamEnv[key];
+        }
         const parameters = {
           command: resolved.command,
           args: resolved.args,

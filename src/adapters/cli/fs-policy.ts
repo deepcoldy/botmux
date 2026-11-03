@@ -398,7 +398,6 @@ function commonHomeBaseline(h: string): FsRule[] {
     deny(`${h}/.netrc`), deny(`${h}/.config/gh`), deny(`${h}/.config/glab-cli`),
     deny(`${h}/.config/gcloud`), deny(`${h}/.config/op`), deny(`${h}/.config/1Password`),
     deny(`${h}/.1password`), deny(`${h}/.password-store`), deny(`${h}/.git-credentials`),
-    deny(`${h}/.mixrc`),
     deny(`${h}/.npmrc`), deny(`${h}/.pypirc`), deny(`${h}/.docker/config.json`), deny(`${h}/.kube`),
     deny(`${h}/.lark-cli`),
   ];

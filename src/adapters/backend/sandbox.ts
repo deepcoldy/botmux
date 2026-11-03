@@ -1258,7 +1258,12 @@ export function prepareDirectSandbox(opts: {
   const filePaths = new Set<string>();
   for (const r of policy.rules) {
     if (r.access !== 'deny') continue;
-    try { if (statSync(r.path).isFile()) filePaths.add(r.path); } catch { /* absent → dir-shaped mask */ }
+    try {
+      const entry = lstatSync(r.path);
+      // Never follow a denied leaf symlink to classify/mask its target. A
+      // symlink or other special leaf is file-shaped for the lexical mask.
+      if (!entry.isDirectory()) filePaths.add(r.path);
+    } catch { /* absent → dir-shaped mask */ }
   }
 
   const compiled = compileToBwrap(policy, {

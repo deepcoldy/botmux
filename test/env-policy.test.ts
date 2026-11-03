@@ -5,6 +5,7 @@ import { envPolicyId, envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPo
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
 
 const strict = { mode: 'strict' as const, inherit: ['HTTPS_PROXY', 'NODE_EXTRA_CA_CERTS', 'TOOLCHAIN_ROOT'] };
 const host = { HOME: '/test/home', PATH: '/usr/bin', LANG: 'C.UTF-8',
@@ -13,19 +14,29 @@ const host = { HOME: '/test/home', PATH: '/usr/bin', LANG: 'C.UTF-8',
   TOOLCHAIN_ROOT: 'tool-sentinel', GITHUB_TOKEN: 'daemon-sentinel', LARK_APP_SECRET: 'im-sentinel',
   BASH_ENV: '/test/poison', BOTMUX_DASHBOARD_FEISHU_H5_FUTURE: 'h5-sentinel',
 };
+const protectedPolicy: ProtectedMcpWorkerPolicy = {
+  capabilities: [],
+  protectedHomePaths: ['.fixture-credential'],
+  redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+};
 
 describe('per-bot environment policy', () => {
-  it('never places the MIX App Key or rollout switch in any generic worker environment', () => {
+  it('removes protected MCP credentials from worker, child, and configured injection environments', () => {
     const worker = buildBotWorkerEnv({
-      BYTEDCLI_AI_AUTH_APP_KEY: 'host-secret',
-      BOTMUX_MIX_ACTOR_WRITE_ENABLED: '1',
-      BOTMUX_MIX_BROKER_SECRET_CHANNEL: 'ipc',
+      FIXTURE_SECRET: 'host-secret',
+      FIXTURE_TOKEN: 'host-token',
+      BOTMUX_PROTECTED_SECRET_FD: '3',
       KEEP: 'visible',
-    });
-    expect(worker.BYTEDCLI_AI_AUTH_APP_KEY).toBeUndefined();
-    expect(worker.BOTMUX_MIX_ACTOR_WRITE_ENABLED).toBeUndefined();
-    expect(worker.BOTMUX_MIX_BROKER_SECRET_CHANNEL).toBeUndefined();
+    }, undefined, protectedPolicy);
+    const child = buildSessionChildEnv({ ...worker, FIXTURE_SECRET: 'rcfile-secret' }, undefined, undefined, protectedPolicy);
+    const injected = botInjectedEnv({ FIXTURE_TOKEN: 'configured-token', KEEP_INJECTED: 'yes' }, undefined, protectedPolicy);
+    for (const key of ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'BOTMUX_PROTECTED_SECRET_FD']) {
+      expect(worker[key], `worker ${key}`).toBeUndefined();
+      expect(child[key], `child ${key}`).toBeUndefined();
+      expect(injected[key], `injected ${key}`).toBeUndefined();
+    }
     expect(worker.KEEP).toBe('visible');
+    expect(injected.KEEP_INJECTED).toBe('yes');
   });
   it('defaults to historical inheritance plus mandatory redaction', () => {
     const env = buildSessionChildEnv(host);

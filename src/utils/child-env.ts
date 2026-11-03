@@ -230,14 +230,6 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
-  // Host-side MIX Broker credentials. The model CLI receives only the local
-  // MCP Gateway capability; machine/AI-auth credentials stay in the host MCP
-  // process and must never be inherited by a pane or shell subprocess.
-  'MIX_AUTH_TOKEN',
-  'BYTEDCLI_AI_AUTH_APP_KEY',
-  'BOTMUX_MIX_ACTOR_WRITE_ENABLED',
-  'BOTMUX_MIX_BROKER_SECRET_CHANNEL',
-  'BOTMUX_MIX_BROKER_SECRET_FD',
   'ONCALL_SERVICE_SECRET',
   // node:child_process.fork() injects these into the worker so Node can attach
   // its IPC channel on startup. They belong to that exact parent/worker edge.
@@ -772,9 +764,13 @@ export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
  *
  * Returns a fresh object; the input env is not mutated.
  */
-export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function redactChildEnv(
+  base: NodeJS.ProcessEnv,
+  additionalKeys: readonly string[] = [],
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of REDACTED_CHILD_ENV_KEYS) delete env[key];
+  for (const key of additionalKeys) delete env[key];
   // Minimum-exposure sweep for the Dashboard-only H5 login family: the named
   // keys above are already gone, this also catches any BOTMUX_DASHBOARD_FEISHU_H5_*
   // knob added later. No CLI child ever consumes one, so a prefix-wide strip

@@ -24,7 +24,15 @@ import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE } from '../platform/device-paths.js';
 import { cliConfigDirEnvKey } from '../core/cli-config-dir.js';
 import { botOneShotEnv, type SessionEnvBotInput } from '../core/session-env-resolve.js';
+import { resolveEffectivePluginIds } from '../core/plugins/effective.js';
+import {
+  protectedMcpHomePaths,
+  protectedMcpIsolationPolicy,
+  protectedMcpRedactedEnvKeys,
+  type ProtectedMcpWorkerPolicy,
+} from '../core/protected-mcp-capabilities.js';
 import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
+import { readGlobalConfig } from '../global-config.js';
 import { renameChat } from './groups-store.js';
 import {
   getSessionGroup,
@@ -104,8 +112,27 @@ export function resolveOneShotCommand(
   return { argv: [...template] };
 }
 
-export function buildOneShotEnv(bot: SessionEnvBotInput = {}): NodeJS.ProcessEnv {
+type OneShotEnvBotInput = SessionEnvBotInput & { plugins?: string[] };
+
+function matchingProtectedMcpPolicy(plugins?: string[]): ProtectedMcpWorkerPolicy {
+  const global = readGlobalConfig();
+  const isolation = protectedMcpIsolationPolicy(
+    resolveEffectivePluginIds({ plugins }, global),
+    global.protectedMcpCapabilities,
+  );
+  return {
+    capabilities: [],
+    protectedHomePaths: isolation.protectedHomePaths,
+    redactEnv: [...new Set([...isolation.secretEnvNames, ...isolation.redactEnv])],
+  };
+}
+
+export function buildOneShotEnv(
+  bot: OneShotEnvBotInput = {},
+  protectedMcpPolicy: ProtectedMcpWorkerPolicy = matchingProtectedMcpPolicy(bot.plugins),
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = botOneShotEnv(process.env, bot);
+  for (const key of protectedMcpRedactedEnvKeys(protectedMcpPolicy)) delete env[key];
   // Never let the one-shot inherit a botmux session identity (redundant with
   // the marker scrub above, kept as an explicit invariant).
   delete env.BOTMUX_SESSION_ID;
@@ -168,8 +195,10 @@ export function supportsOneShotTitle(cliId: string): boolean {
 
 /** Mandatory device-credential isolation on this host — the same marker /
  *  device-credential probe worker.ts runs before every local spawn. */
-function hostRequiresCredentialIsolation(): boolean {
+function hostRequiresCredentialIsolation(plugins?: string[]): boolean {
   const home = homedir();
+  const protectedPolicy = matchingProtectedMcpPolicy(plugins);
+  const protectedHomePaths = protectedMcpHomePaths(home, protectedPolicy);
   const exists = (path: string): boolean => {
     try { lstatSync(path); return true; } catch { return false; }
   };
@@ -179,7 +208,7 @@ function hostRequiresCredentialIsolation(): boolean {
     markerExists: exists(deviceCredentialIsolationMarkerPath(home)),
     deviceCredentialExists: [...roots].some(root => exists(join(root, DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE))
       || exists(join(root, DEVICE_CREDENTIAL_FILE))),
-    mixCredentialExists: exists(join(home, '.mixrc')),
+    protectedHomePaths,
   });
 }
 
@@ -200,6 +229,7 @@ export function oneShotTitleAllowed(cfg: {
   cliLaunchMode?: string;
   codexAuthSync?: string;
   codexInstancePool?: unknown;
+  plugins?: string[];
 }): boolean {
   if (!supportsOneShotTitle(cfg.cliId)) return false;
   if (cfg.cliLaunchMode || cfg.codexAuthSync === 'isolated' || cfg.codexInstancePool) return false;
@@ -209,7 +239,7 @@ export function oneShotTitleAllowed(cfg: {
       readIsolation: cfg.readIsolation === true,
       envValue: process.env.BOTMUX_SANDBOX,
     }) !== 'off') return false;
-    return !hostRequiresCredentialIsolation();
+    return !hostRequiresCredentialIsolation(cfg.plugins);
   } catch {
     return false;
   }

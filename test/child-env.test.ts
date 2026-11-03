@@ -29,6 +29,17 @@ import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
 import { COMPANION_BOT_APP_ID_ENV, COMPANION_SECRET_FILE_ENV } from '../src/config.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
+import {
+  PROTECTED_MCP_SECRET_FD_ENV,
+  protectedMcpRedactedEnvKeys,
+  type ProtectedMcpWorkerPolicy,
+} from '../src/core/protected-mcp-capabilities.js';
+
+const fixtureProtectedPolicy: ProtectedMcpWorkerPolicy = {
+  capabilities: [],
+  protectedHomePaths: ['.fixture-credential'],
+  redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+};
 
 describe('applySessionOwnerEnv()', () => {
   it('injects both the public contract and legacy owner names', () => {
@@ -135,16 +146,17 @@ describe('redactChildEnv()', () => {
     expect(out.KEEP).toBe('v');
   });
 
-  it('removes machine MIX and AI Auth credentials from child env', () => {
+  it('removes configured protected MCP credentials from child env', () => {
+    const protectedKeys = protectedMcpRedactedEnvKeys(fixtureProtectedPolicy);
     const out = redactChildEnv({
-      MIX_AUTH_TOKEN: 'machine-jwt',
-      BYTEDCLI_AI_AUTH_APP_KEY: 'ai-auth-app-key',
-      BOTMUX_MIX_BROKER_SECRET_CHANNEL: 'ipc',
+      FIXTURE_SECRET: 'machine-secret',
+      FIXTURE_TOKEN: 'machine-token',
+      [PROTECTED_MCP_SECRET_FD_ENV]: '3',
       KEEP: 'v',
-    });
-    for (const key of ['MIX_AUTH_TOKEN', 'BYTEDCLI_AI_AUTH_APP_KEY', 'BOTMUX_MIX_BROKER_SECRET_CHANNEL']) {
+    }, protectedKeys);
+    for (const key of ['FIXTURE_SECRET', 'FIXTURE_TOKEN', PROTECTED_MCP_SECRET_FD_ENV]) {
       expect(key in out, key).toBe(false);
-      expect(REDACTED_CHILD_ENV_KEYS, key).toContain(key);
+      expect(protectedKeys, key).toContain(key);
     }
     expect(out.KEEP).toBe('v');
   });
@@ -690,6 +702,8 @@ describe('process-boundary env scrub call sites', () => {
   it('worker routes child envs through the shared redaction builder and freezes the session owner', () => {
     const worker = read('worker.ts');
     expect(worker).toMatch(/\bchildEnv\s*=\s*buildSessionChildEnv\(\s*process\.env\b/);
+    expect(worker).toMatch(/\bprotectedMcpRedactedEnvKeys\(/);
+    expect(worker).toMatch(/\bprotectedMcpHomePaths\(/);
     expect(worker).toMatch(/\bzellijEnv\(\s*redactChildEnv\(\s*process\.env\s*\)/);
     for (const target of ['process\\.env', 'childEnv', 'engineEnv', 'mergedEnv']) {
       expect(worker, target).toMatch(new RegExp(`\\bapplySessionOwnerEnv\\(\\s*${target}\\s*,`));

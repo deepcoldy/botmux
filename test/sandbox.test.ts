@@ -10,10 +10,12 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, lstatSync, chmodSync, utimesSync } from 'node:fs';
 import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
+import { protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -106,6 +108,54 @@ describe('credential-only managed-origin carve-out', () => {
       cliBin: '/usr/bin/true',
       cliArgs: [],
     })).toThrow(/must be below/);
+  });
+});
+
+describe('configured protected MCP credential masks', () => {
+  const policy: ProtectedMcpWorkerPolicy = {
+    capabilities: [],
+    protectedHomePaths: ['.fixture-credential', '.missing-fixture-credential'],
+    redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+  };
+
+  it('keeps missing declared Home paths in credential-only deny masks', () => {
+    const home = '/home/fixture';
+    const protectedPaths = protectedMcpHomePaths(home, policy);
+    const rules = buildCredentialIsolationRules({ homeDir: home, botmuxHome: `${home}/.botmux` }, protectedPaths);
+    const missing = `${home}/.missing-fixture-credential`;
+    expect(rules.denyPaths).toContain(missing);
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: [missing],
+      hideFiles: [],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    });
+    expect(args.slice(args.indexOf('--tmpfs', args.indexOf('--dev')))).toContain(missing);
+  });
+
+  it('keeps a protected symlink path lexical instead of resolving to its target', () => {
+    const home = mkdtempSync(join(tmpdir(), 'protected-home-'));
+    const target = join(home, 'credential-target');
+    const link = join(home, '.fixture-credential');
+    writeFileSync(target, 'secret');
+    symlinkSync(target, link);
+    try {
+      const [protectedPath] = protectedMcpHomePaths(home, policy);
+      expect(protectedPath).toBe(link);
+      expect(lstatSync(protectedPath).isSymbolicLink()).toBe(true);
+      const args = buildCredentialOnlySandboxArgs({
+        hideDirectories: [],
+        hideFiles: [protectedPath],
+        workingDir: home,
+        cliBin: '/usr/bin/true',
+        cliArgs: [],
+      });
+      expect(args).toContain(link);
+      expect(args).not.toContain(realpathSync(link));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

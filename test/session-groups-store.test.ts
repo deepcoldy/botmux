@@ -220,6 +220,25 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
     const env = buildOneShotEnv({ env: { BOTMUX_SESSION_ID: 'evil' } });
     expect(env.BOTMUX_SESSION_ID).toBeUndefined();
   });
+
+  it('strips configured protected MCP keys from inherited and per-bot env', () => {
+    process.env.FIXTURE_SECRET = 'daemon-secret';
+    try {
+      const env = buildOneShotEnv(
+        { env: { FIXTURE_TOKEN: 'configured-token', KEEP: 'visible' } },
+        {
+          capabilities: [],
+          protectedHomePaths: ['.fixture-credential'],
+          redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+        },
+      );
+      expect(env.FIXTURE_SECRET).toBeUndefined();
+      expect(env.FIXTURE_TOKEN).toBeUndefined();
+      expect(env.KEEP).toBe('visible');
+    } finally {
+      delete process.env.FIXTURE_SECRET;
+    }
+  });
 });
 
 describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', () => {

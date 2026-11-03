@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { createConnection, createServer, type Socket } from 'node:net';
+import { resolve, sep } from 'node:path';
 import { isValidPluginId } from './plugins/ids.js';
 import {
   privateBrokerContainmentEnabled,
@@ -173,6 +174,33 @@ export function protectedMcpIsolationPolicy(
     secretEnvNames: [...secretEnvNames],
     redactEnv: [...redactEnv],
   };
+}
+
+/** Environment names that must stay daemon-only for this worker generation. */
+export function protectedMcpRedactedEnvKeys(
+  policy: Pick<ProtectedMcpWorkerPolicy, 'redactEnv'> | undefined,
+): string[] {
+  const keys = new Set<string>([PROTECTED_MCP_SECRET_FD_ENV]);
+  for (const key of policy?.redactEnv ?? []) {
+    if (isValidEnvironmentVariableName(key)) keys.add(key);
+  }
+  return [...keys];
+}
+
+/** Resolve validated capability-relative paths beneath the daemon account Home. */
+export function protectedMcpHomePaths(
+  home: string,
+  policy: Pick<ProtectedMcpWorkerPolicy, 'protectedHomePaths'> | undefined,
+): string[] {
+  const root = resolve(home);
+  const prefix = root.endsWith(sep) ? root : `${root}${sep}`;
+  const paths = new Set<string>();
+  for (const relativePath of policy?.protectedHomePaths ?? []) {
+    if (!isProtectedHomeRelativePath(relativePath)) continue;
+    const path = resolve(root, relativePath);
+    if (path.startsWith(prefix)) paths.add(path);
+  }
+  return [...paths];
 }
 
 export function prepareProtectedMcpWorkerProvisioning(
