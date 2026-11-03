@@ -120,10 +120,20 @@ const other: V3RunEditCaller = { openId: OTHER, origin: 'human' };
 
 const bases: string[] = [];
 const driveErrors: string[] = [];
-afterEach(() => {
+/** Drives started through `runner()` that have not finished yet. A drive the
+ *  runner kicks off on its own (coldAttach resuming a run) keeps writing into
+ *  the run directory after the test body returns; removing the directory
+ *  under it fails with ENOTEMPTY. */
+let liveDrives = 0;
+afterEach(async () => {
   journalLockBudget.remaining = undefined;
   resetV3RerunGrantCardsInFlight();
-  for (const base of bases.splice(0)) rmSync(base, { recursive: true, force: true });
+  // Let background drives finish before deleting their directories. A test
+  // that deliberately leaves a worker hanging never finishes its drive, so
+  // this only waits a bounded time; such a drive is parked, not writing.
+  const settleBy = Date.now() + 3_000;
+  while (liveDrives > 0 && Date.now() < settleBy) await new Promise((done) => setTimeout(done, 10));
+  for (const base of bases.splice(0)) rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   driveErrors.splice(0);
 });
 
@@ -220,6 +230,8 @@ function runner(base: string, runNode: RunNode, extra: Partial<Parameters<typeof
     validateManifest: async () => ({ ok: true, manifest: { schemaVersion: 1, status: 'ok', summary: '', files: [] } }),
     postCard: async () => {},
     onError: (runId, err) => { driveErrors.push(`${runId}: ${err instanceof Error ? err.message : String(err)}`); },
+    onDriveBegin: () => { liveDrives += 1; },
+    onDriveEnd: () => { liveDrives -= 1; },
     ...extra,
   });
 }
