@@ -25,7 +25,7 @@ import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
-import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from '../src/services/codex-async-user-input.js';
+import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from '../src/services/codex-async-user-input.js';
 import type { PendingAsk } from '../src/core/ask-types.js';
 import {
   CodexAppControlFinalAssembler,
@@ -1530,7 +1530,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('steers a follow-up into a start turn proven by an exact turn/started BEFORE the start response returns (B1 start-response-last)', async () => {
+  it.each(['om_sr_root', 'codex-async-answer-legacy'])('steers a human follow-up into %s before the start response returns', async rootTurnId => {
     // B1: the app-server may publish an exact-client `turn/started` before it
     // replies to `turn/start`. That exact match proves the canonical native id,
     // so a follow-up must be able to steer into the SAME turn during the pending
@@ -1554,7 +1554,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         `legacy:${text}`,
         { text, clientUserMessageId: replyTurnId },
         replyTurnId,
-        true,
+        replyTurnId === rootTurnId && rootTurnId.startsWith('codex-async-answer-')
+          ? codexAsyncAnswerSteerable({ answerer: 'ou_owner', originalAnswerer: 'ou_owner',
+            human: true, managedLark: true, cleanInputAccepted: true }) : true,
       );
       harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
     };
@@ -1564,7 +1566,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       // Root: turn/started (exact clientId) arrives ~immediately; the start
       // response is delayed 120ms. Wait until the runner logged the turn/start
       // request so the follow-up races the pending response.
-      send('root', 'om_sr_root');
+      send('root', rootTurnId);
       await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
       // Follow-up arrives while the root start response is STILL pending.
       send('follow', 'om_sr_follow');
@@ -1583,7 +1585,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         clientUserMessageId: 'om_sr_follow',
       });
       expect(control.finals).toEqual([
-        expect.objectContaining({ turnId: 'om_sr_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: rootTurnId, content: '', disposition: 'steer_superseded' }),
         expect.objectContaining({ turnId: 'om_sr_follow', content: 'fake answer 1' }),
       ]);
       // steer lifecycle emitted for the follow-up.

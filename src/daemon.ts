@@ -973,7 +973,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
-import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from './services/codex-async-user-input.js';
+import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
@@ -9882,17 +9882,22 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
           byType,
         );
         if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
-        const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, {
+        const steerFacts = {
           answerer: by, originalAnswerer: asyncCaller,
           human: byType === false && trustedCaller?.senderType === 'user'
             && trustedCaller.requestLarkAppId === boundAsk.larkAppId && trustedCaller.requestUserOpenId === by,
-          managedLark: !documentDelivery && asyncOriginTurn?.startsWith('om_') === true
+          // The audience was frozen from the exact origin's reply identity.
+          // An answer can ask another question; its synthetic origin must retain
+          // the same authenticated human route as an ordinary Lark message.
+          managedLark: !documentDelivery && audience?.kind === 'human'
+            && (asyncOriginTurn?.startsWith('om_') === true || asyncOriginTurn?.startsWith('codex-async-answer-') === true)
             && !askSession.adoptedFrom && !askSession.session.adoptedFrom && !askSession.session.vcMeetingReceiver
             && larkTransportEnabled({ chatId: askSession.chatId, apiOnly: bot.config.apiOnly }),
           cleanInputAccepted: codexAppCleanInputAcceptedForSession(askSession),
-        });
-        const steerable = steerTarget !== undefined && input.codexAppInput !== undefined;
-        if (steerable) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
+        };
+        const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, steerFacts);
+        const steerable = codexAsyncAnswerSteerable(steerFacts) && input.codexAppInput !== undefined;
+        if (steerable && steerTarget !== undefined) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
         if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
           trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) })) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
