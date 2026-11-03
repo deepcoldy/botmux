@@ -56,6 +56,9 @@ export function summarizeUserText(text: string): string {
   const m = /<user_message>([\s\S]*?)<\/user_message>/i.exec(body);
   if (m) body = m[1] ?? '';
   body = body
+    // bare（transcript + solo）续轮没有 <user_message> 壳，<botmux_formatting>
+    // 被追加在用户正文之后；块体也要整块剥掉，否则内部提示会混进预览文案。
+    .replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();

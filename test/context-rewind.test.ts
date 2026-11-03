@@ -320,4 +320,11 @@ describe('summarizeUserText', () => {
   it('剥掉 botmux 注入的标签只留用户原话', () => {
     expect(summarizeUserText('<user_message>\n  @steve 帮我看下  \n</user_message>\n<sender name="x"/>')).toBe('@steve 帮我看下');
   });
+
+  // #2716: bare（transcript + solo）续轮没有 <user_message> 壳，格式提示块被
+  // 追加在用户正文之后；块体必须随标签一起剥掉，不能混进 /rewind 预览。
+  it('bare 续轮追加在正文后的 <botmux_formatting> 块体不进预览', () => {
+    const bare = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    expect(summarizeUserText(bare)).toBe('继续看一下这个 PR');
+  });
 });

@@ -50,6 +50,9 @@ export function extractBotmuxLarkNativeSessionTitlePrompt(
     userMessage
       .replace(/^\s*\[用户引用了消息[^\n]*\]\s*$/gm, '')
       .replace(/^\s*\[来自[^\n]*@mention[^\n]*\]\s*$/gm, '')
+      // bare（transcript + solo）续轮无 <user_message> 壳时走 rawContent 兜底，
+      // 追加在正文后的格式提示块（含块体）不能进语义标题。
+      .replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, ' ')
       .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
       .replace(/\s+/g, ' '),
     mentions,
