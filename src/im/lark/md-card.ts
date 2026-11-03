@@ -440,6 +440,10 @@ export interface CardUsageSnapshot {
    *  上下文段改渲染纯百分比 `ctx N%`，并追加 `5h N%` / `7d N%` 账号配额段。
    *  缺省 / null ⇒ 与无 statusline 时逐字节相同（只看 `context`）。 */
   quota?: StatuslineQuota | null;
+  /** Per-session idle auto-compact toggle (core/idle-auto-compact.ts). Rides
+   *  this snapshot for the same reason as `modelFallback`: every live-card call
+   *  site already forwards it. Absent ⇒ unsupported here, toggle not rendered. */
+  idleAutoCompact?: { enabled: boolean; minutes: number };
   /** bots.json `cardFooterExtension` 命令给出的自定义段（已收成短单行纯文本），
    *  渲染时转义并接在用量段末尾。缺省 ⇒ 与未配置时逐字节相同。 */
   extensionSegments?: string[];

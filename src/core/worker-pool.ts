@@ -33,20 +33,21 @@ import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
 import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureChatManagerSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
+import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureChatManagerSkill, removeWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
+import { clearIdleAutoCompactStretch, idleAutoCompactMinutes, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
 import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
-import { readGlobalConfig, isWorkflowFeatureEnabled } from '../global-config.js';
+import { readGlobalConfig } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
@@ -595,11 +596,36 @@ export function getDaemonStreamingCardUsageSnapshot(
   // The fallback warning and effort controls belong to the live status card.
   const modelFallback = ds.modelFallback;
   const reasoningControl = sessionReasoningControl(ds);
+  const idleAutoCompact = idleAutoCompactCardState(ds);
   return {
     ...withCardRuntimeIdentity(ds, snapshot, effectiveCliId),
     ...(modelFallback ? { modelFallback } : {}),
     ...(reasoningControl ? { reasoningControl } : {}),
+    ...(idleAutoCompact ? { idleAutoCompact } : {}),
   };
+}
+
+/** Whether this session can take the per-session idle auto-compact
+ *  (core/idle-auto-compact.ts): same CLI/runtime set as unattended native
+ *  compaction, and only sessions botmux owns. */
+export function sessionSupportsIdleAutoCompact(ds: DaemonSession): boolean {
+  try {
+    return supportsIdleAutoCompact({
+      cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId,
+      backendType: ds.initConfig?.backendType ?? ds.session.backendType,
+      codexRpcInput: ds.initConfig?.codexRpcInput === true,
+      adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom || ds.initConfig?.adoptMode === true,
+      headless: !!ds.session.headless,
+      vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+    });
+  } catch { return false; }
+}
+
+/** Live-card toggle state; absent ⇒ the toggle is not rendered. */
+export function idleAutoCompactCardState(ds: DaemonSession): CardUsageSnapshot['idleAutoCompact'] {
+  if (!sessionSupportsIdleAutoCompact(ds)) return undefined;
+  const setting = ds.session.idleAutoCompact;
+  return { enabled: setting?.enabled === true, minutes: idleAutoCompactMinutes(setting) };
 }
 
 /**
@@ -1688,7 +1714,7 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 
 /** PATCH the live card when the executor reports a different active runtime.
  * Runtime identity stays attached to the streaming usage line. */
-function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
+export function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
   if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingActiveRuntimeCardRefresh = undefined;
     return false;
@@ -6525,9 +6551,9 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
     // 群负责人 skill：plugin-dir 机器共享，任一 bot 开启即落盘；真正 per-bot
     // 授权在 daemon IPC，关闭开关的 bot 调 set 会被拒。每次 spawn 重新评估。
     ensureChatManagerSkill(cliId, pluginSkillsDir, getAllBots().some(b => b.config.chatManagerEnabled === true));
-    // Workflow skill 家族同理：跟随机器级 workflow 开关，每次 spawn 重新评估，
-    // 关闭时删除已装的三个 skill，下一个会话即生效。
-    ensureWorkflowSkills(cliId, pluginSkillsDir, isWorkflowFeatureEnabled());
+    // Workflow skill 家族不常驻：只在确定要用工作流时由 agent 按需
+    // `botmux skill show`。每次 spawn 清掉旧版本写进插件目录的残留。
+    removeWorkflowSkills(cliId, pluginSkillsDir);
     // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
     // ——与上面白板 / workflow 同样放在 once-cache 之前，否则改了 skill 正文或
     // 停用某 skill 后，claude 家族（--plugin-dir）的新会话仍读旧文件、要等 daemon
@@ -6567,9 +6593,9 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());
   // 群负责人 skill 同理：仅 global 模式落共享盘，且任一 bot 开启才落。
   ensureChatManagerSkill(cliId, skillsDir, globalInstall && getAllBots().some(b => b.config.chatManagerEnabled === true));
-  // Workflow skill 家族：仅 global 模式落全局盘，且跟随机器级 workflow 开关。
-  // 非 global（prompt/off）由上面的 removeGlobalBotmuxSkills 前缀清理兜底。
-  ensureWorkflowSkills(cliId, skillsDir, globalInstall && isWorkflowFeatureEnabled());
+  // Workflow skill 家族不常驻（global 模式也不落盘），按需 `botmux skill show`；
+  // 清掉旧版本在 global 模式下写进共享目录的残留。
+  removeWorkflowSkills(cliId, skillsDir);
   if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
   // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
   // ——同白板 / workflow 放在 once-cache 之前。global 模式落全局盘；幂等（内容相同
@@ -9413,6 +9439,12 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // edge, otherwise a stale stamp could get the new worker TTL-suspended almost
   // immediately after resume.
   ds.idleSinceAt = undefined;
+  // Drop the persisted idle auto-compact stretch too: a message-less cold
+  // resume must not immediately /compact a freshly started CLI reading its
+  // whole context without a warm prompt cache (core/idle-auto-compact.ts).
+  clearIdleAutoCompactStretch(ds.session);
+  ds.idleAutoCompactPendingNotice = undefined;
+  ds.idleAutoCompactDispatchedTurnId = undefined;
   ds.session.webPort = undefined;
   // The daemon already destroyed the exact backing session + CLI and verified
   // it missing before reaching this state. The worker's suspend handler now
@@ -14079,7 +14111,7 @@ const marginalAdmissionRetries = new WeakMap<DaemonSession, Promise<import('./ad
  * screenshot_uploaded, crash diagnostic park, limited→idle recovery) so the TTL
  * clock cannot be missed.
  */
-function stampIdleSinceAt(
+export function stampIdleSinceAt(
   ds: DaemonSession,
   prev: DaemonSession['lastScreenStatus'],
   now: number = Date.now(),
@@ -14092,6 +14124,13 @@ function stampIdleSinceAt(
   // A prompt-cache keep-alive's own busy period is not activity: restore the
   // idle stretch's original start so idleSuspendMinutes keeps counting.
   notePromptCacheKeepaliveScreenStatus(ds, prev, now);
+  // Idle auto-compact stretch bookkeeping (after the keep-alive restore so a
+  // keep-alive never looks like a new stretch). Persisted only while opted in.
+  if (noteIdleAutoCompactScreenStatus(ds, prev, now)) {
+    try { sessionStore.updateSession(ds.session); } catch (err) {
+      logger.warn(`[${ds.session.sessionId.slice(0, 8)}] idle auto-compact state save failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 /** Central quarantine decision for one fork boundary — the SINGLE authority that
@@ -19044,6 +19083,9 @@ function setupWorkerHandlers(
         trimOldest(terminalSet, TERMINAL_RECEIPT_DEDUPE_MAX);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         if (settleAutoCompactSafeComposerRefusal(ds, msg)) {
+          if (noteIdleAutoCompactRefused(ds, msg.turnId)) {
+            try { sessionStore.updateSession(ds.session); } catch { /* next status edge re-saves */ }
+          }
           // The worker deliberately refused an unattended maintenance write.
           // Clear this synthetic turn's pending-card marker immediately and
           // surface one cooldown-bounded operational warning; do not wait for
@@ -19054,6 +19096,13 @@ function setupWorkerHandlers(
             `[${t}] Auto compact skipped: live empty composer evidence was unavailable `
             + `(turn=${msg.turnId.substring(0, 20)})`,
           );
+        }
+        // Any other non-completed end of our idle auto-compact turn (Ctrl-C,
+        // crash, ambiguous) must not be announced as a successful compact. The
+        // refusal branch above already settled the safe-composer case, so this
+        // is a no-op for it.
+        if (noteIdleAutoCompactTurnEnded(ds, msg.turnId, msg.status)) {
+          try { sessionStore.updateSession(ds.session); } catch { /* next status edge re-saves */ }
         }
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at

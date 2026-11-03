@@ -32,6 +32,8 @@ export type V3RunsApiDeps = {
   runsDir: string;
   /** Route a mutation to the daemon that owns the immutable run binding. */
   proxyToDaemon: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
+  /** Feishu display name for a bot app id, used for the per-node bot label. */
+  botName?: (larkAppId: string) => string | undefined;
 };
 
 /** Cap a single pty-log response so a runaway log can't exhaust the dashboard. */
@@ -68,7 +70,7 @@ export async function handleV3RunsApi(
       jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
       return true;
     }
-    const view = projectRunById(deps.runsDir, runId);
+    const view = projectRunById(deps.runsDir, runId, { botName: deps.botName });
     if (!view) {
       jsonRes(res, 404, { error: 'unknown_run' });
       return true;
