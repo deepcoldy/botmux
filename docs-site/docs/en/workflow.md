@@ -47,10 +47,59 @@ Besides tapping cards, you can drive it by command (`runId` is the key throughou
 | `botmux workflow retry <runId> [--node <id>]` | Re-run a blocked node |
 | `botmux workflow grant <runId> [--loop <id>]` | Grant one more round to a loop that ran out of iterations |
 | `botmux workflow cancel <runId> [--reason <text>]` | Cancel an in-flight run |
+| `botmux workflow status <runId> [--json]` | Show a running flow's current version, node states and any change awaiting confirmation (used in the run's main topic, normally by the main bot) |
+| `botmux workflow edit <runId> --patch-file <file\|-> --base <version>` | Change a running flow: one set of changes that takes effect as a whole or not at all; `--base` is the current version read with `status` (normally used by the main bot, see the next section) |
 
 Changed your mind: requirement → `botmux workflow revise-spec <runId>` (steps back to re-clarify, old DAG discarded); flow only → `botmux workflow revise-dag <runId>` (re-orchestrate only).
 
 > The three "continue" entry points are not interchangeable: a blocked node uses `retry`, a loop out of iterations uses `grant`; and "revisit budget exhausted" can **only be permitted by tapping the Feishu card — there's no CLI command for it**.
+
+### Changing a flow while it runs
+
+Once a run has started its flow can still change: add or remove nodes, change a node's goal / acceptance / outputs / timeout / approval, change dependencies, move a node to another bot, or redo a finished node. Just tell the main bot in the main topic what to change; it reads the current version and submits the change. Every change makes a new version (version 2, 3, …), and the parts of one change take effect together or not at all. When two people change the flow at the same time the first one wins; the main bot re-reads the latest version and resubmits the other.
+
+**Who can change it**
+
+- In the main topic, a change the **initiator** asks for takes effect directly, or becomes a confirmation card under the rules below.
+- A change asked for by **anyone else** in the chat always becomes a "flow change" confirmation card for the initiator to approve or reject; nothing changes until then.
+
+**Changes the initiator must confirm**
+
+Any of these posts a "flow change" card in the main topic that only the initiator can decide; everything else takes effect directly:
+
+- Using a bot this run has not approved (in a new node or a reassignment). Once the initiator approves it on the card, the bot is part of the run's approved bots: using it again, or picking it on a blocked card's reassign picker, needs no further confirmation.
+- Adding or changing a node with an external action (host nodes such as sending a Feishu message or creating a scheduled task).
+- Removing or relaxing a human approval: removing it, changing its options, or changing who may approve. Adding an approval needs no confirmation.
+- Raising a budget: a loop's maximum rounds, a timeout longer than the node had, or more than twice as many nodes as were originally approved.
+
+The card lists the nodes added, removed and changed, and any new bots. While it waits, the nodes it touches are not dispatched and everything else keeps running; questions on those nodes cannot be answered and their blocked cards cannot reassign until the card is decided.
+
+**What happens to a node that is running or waiting for approval**
+
+- **Running**: the current round is voided (the process or the bot's current turn is stopped, and anything it submits afterwards no longer counts), and the node starts over with the new definition.
+- **Waiting for approval**: that approval card is voided — frozen as "the flow changed, this approval no longer applies" — and the node goes through approval again with the new definition.
+- **Blocked**: a definition-only change leaves it blocked for a later retry; a reassignment re-runs it on the new bot right away. If its approval had already passed, a changed definition needs approval again: a retry or reassignment first posts a new approval card and runs only once it is approved. A question it had asked is voided too: the card keeps only "🔄 Re-run with the new definition (needs approval again)", and nothing starts until someone taps it.
+- **Not started**: scheduled with the new definition.
+- Skipped and cancelled nodes cannot change (add a new node instead); a running loop's body cannot change, but what comes after the loop can.
+
+**A finished node can only be redone**
+
+A finished node cannot be removed or redefined (downstream nodes may already use its products); it can only be redone, or get new nodes after it. Redoing it also re-runs the downstream nodes that used its old products, and spends revisit budget (shared with automatic rework: by default once per node, 8 times per run). When the budget is spent, a "more redo budget" card appears in the main topic: once the initiator taps "➕ Add 1", have the main bot submit the change again. One card is posted per exhaustion; when the budget runs out again a new card is posted, and the old one says it has expired.
+
+**Seeing the version**
+
+- **Progress card**: shows "version N · last change: …"; while a change awaits confirmation it adds "version N awaits the initiator's confirmation; the nodes it touches are paused".
+- **Board (Dashboard v3 view)**: drawn from the version in effect; added, changed and pending nodes are marked, and the "flow versions" panel lists each version's time, author, summary and whether it was confirmed.
+
+**Saving as a Saved Workflow**
+
+`/workflow save last` saves the run's **final version in effect** — the flow that actually ran — and the save confirmation card says how many times the run was changed while running. A run started from a Saved Workflow can be changed while running too; that only affects the run. To update the saved definition, save again.
+
+**Both execution modes**
+
+Changing a running flow works whether nodes run in temporary processes or are handed to bots in the chat (next section). For a node handed to a bot, a changed definition or a reassignment sends a new handoff in the same place, saying the requirements changed.
+
+> ⚠️ **Do not downgrade the daemon under a run whose flow was changed.** An older daemon does not know about versions: it ignores the changes and keeps running version 1 — it may run nodes that were removed, run changed nodes with their old definition, and skip changes still waiting for confirmation. If you must downgrade, cancel those runs first or wait for them to finish. Runs whose version on the board is above 1 are the changed ones.
 
 ### Hand nodes to bots in the chat (experimental, off by default)
 
