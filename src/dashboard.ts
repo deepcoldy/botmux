@@ -15,6 +15,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
+import { handleXtermVendorHttp } from './core/xterm-vendor-serve.js';
 import { currentUpdateStrategy, replaceStandaloneBinary, applyStandaloneUpdate, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
@@ -4143,6 +4144,14 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/__health') {
       return jsonRes(res, 200, { ok: true });
     }
+
+    // Pinned xterm 5.5.0 browser bundle (the #1940 set) for pages rendered at
+    // the Dashboard root — the v3 terminal replay iframe — instead of a public
+    // CDN. Public library files, so no auth (same as the worker's copy under
+    // `/s/<id>/`, which still reaches the worker through the front proxy).
+    if (handleXtermVendorHttp(req, res, url.pathname, 'root', (err) => {
+      logger.warn(`[dashboard] xterm vendor asset failed: ${err instanceof Error ? err.message : String(err)}`);
+    })) return;
 
     // Desktop shell compatibility probe (read-only, no token required). Keep it
     // outside the browser auth gate so packaged desktop apps can decide whether
