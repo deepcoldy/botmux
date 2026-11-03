@@ -289,7 +289,9 @@ Streamable HTTP MCP 服务不能申请 `protectedCapability`，同时声明两�
 
 只有显式 JSON 布尔值 `true` 才会启用绑定。缺少 `enabled`、设为 `false`、字符串 `"true"`、数字 `1` 或任何其它值时均保持关闭。密钥值只存在于 daemon 启动环境，配置中只写环境变量名。Botmux 会从 worker 和插件通用环境删除该变量及 `redactEnv` 中的变量，并只通过全新的一次性文件描述符通道把已授权密钥交给本地 stdio MCP 进程，不放入 argv 或通用环境变量。
 
-能力关闭、所需的已验证真人主体缺失，或固定隔离配置无法生效时，Botmux 不授予能力、也不打开密钥通道。本地 stdio MCP 服务仍可启动并提供只读工具；受保护写入必须失败关闭。只要匹配的插件已启用，即使能力本身关闭，配置的隔离路径和环境变量清理仍然生效。
+MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allowedPluginIds` 中、配置的隔离前提不满足，或 daemon 无法提供一次性通道，Botmux 会改用不带受保护密钥文件描述符的普通 stdio transport 启动服务。服务仍可启动并提供只读工具；该连接上的 `tools/call` 不会收到 `botmuxTrustedPrincipal` 或 `botmuxGrantedCapabilities`，插件必须对受保护写入失败关闭。
+
+`principal` 是每次 `tools/call` 的授权条件，不是 MCP 进程启动条件。如果全局绑定、插件 allowlist、隔离前提和 daemon 通道在启动时均已成功，长驻 MCP 进程可能已持有一次性密钥，即使后续某次调用缺少所需的已验证真人主体或其它调用级授权条件。Botmux 会在该次调用中省略 `botmuxTrustedPrincipal` 和 `botmuxGrantedCapabilities`，插件必须拒绝受保护写入。只要匹配的插件已启用，即使能力本身关闭，配置的隔离路径和环境变量清理仍然生效。
 
 ## 卡片与终端
 

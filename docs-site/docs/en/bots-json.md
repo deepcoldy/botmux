@@ -237,6 +237,8 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `sandboxNetwork` | Network policy. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` to block normal network egress |
 | `sandboxNetworkPolicy` | Granular destination IP policy object (Linux + PTY). Configures independent `public` and `private` IP filtering rules (`allow / block / allowlist / denylist`) and trusted proxy egress |
 
+> ZMX cannot enforce the file sandbox or effective read isolation, so configurations that enable those boundaries fail closed; see [ZMX backend boundaries](/en/zmx#unsupported-combinations).
+
 ### Protected local MCP capabilities
 
 A local stdio MCP server can request one optional protected capability in its plugin-private `mcp/index.json`. The capability ID is opaque to Botmux; use a non-business-specific fixture such as:
@@ -284,9 +286,9 @@ Do not put protected capability bindings, secret sources, secret values, or roll
 
 Only the explicit JSON boolean `true` enables a binding. Missing `enabled`, `false`, the string `"true"`, numeric `1`, and every other value leave it disabled. The actual secret stays in the daemon startup environment; configuration stores only its environment-variable name. Botmux removes that variable and every configured `redactEnv` name from workers and generic plugin environments, and passes an authorized secret to the local stdio MCP process through a fresh one-shot file-descriptor channel instead of argv or a general environment variable.
 
-If the capability is disabled, a required verified human principal is missing, or the fixed containment profile cannot be enforced, Botmux grants no capability and opens no secret channel. The stdio MCP server can still start and expose read-only tools; protected writes must fail closed. Isolation paths and environment redaction remain active for a matching enabled plugin even while the capability itself is disabled.
+At MCP process startup, Botmux uses the ordinary stdio transport without a protected secret file descriptor if the capability is disabled or not provisioned, the plugin is outside `allowedPluginIds`, the configured containment prerequisites are not satisfied, or the daemon cannot provide the one-shot channel. The server can still start and expose read-only tools. A `tools/call` on that connection receives neither `botmuxTrustedPrincipal` nor `botmuxGrantedCapabilities`; the plugin must fail closed for protected writes.
 
-> ZMX cannot enforce the file sandbox or effective read isolation, so configurations that enable those boundaries fail closed; see [ZMX backend boundaries](/en/zmx#unsupported-combinations).
+`principal` is evaluated for each `tools/call`, not when the MCP process starts. If the global binding, plugin allowlist, containment prerequisites, and daemon channel all succeeded at startup, the long-lived process may already hold the one-shot secret even when a later call lacks its required verified human principal or other call-time grant condition. Botmux omits `botmuxTrustedPrincipal` and `botmuxGrantedCapabilities` from that call, and the plugin must reject the protected write. Isolation paths and environment redaction remain active for a matching enabled plugin even while the capability itself is disabled.
 
 ## Cards and terminal
 
