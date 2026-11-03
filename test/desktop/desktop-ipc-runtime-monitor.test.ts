@@ -31,7 +31,6 @@ const desktopPaths = {
   botmuxHome: '/tmp/botmux',
   dataDir: '/tmp/botmux/data',
   logsDir: '/tmp/botmux/logs',
-  pm2Home: '/tmp/botmux/pm2',
 };
 
 describe('desktop IPC runtime monitor', () => {

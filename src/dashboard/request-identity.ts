@@ -40,6 +40,8 @@ export interface DashboardRequestIdentity extends TerminalDashboardActor {
    * 二者原本是同一个变量，机器协管者要求把它们分开。
    */
   canManageHost: boolean;
+  /** Cross-app stable human identity. Absent for legacy/local-only sessions. */
+  principalUnionId?: string;
 }
 
 export interface DashboardIdentityInput {
@@ -199,6 +201,11 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
         terminalCapability: platformRole === 'owner' ? 'owner' : 'readonly',
         previewCapability: platformRole === 'owner' ? 'operate' : 'readonly',
         canManageHost,
+        ...(actorScope?.startsWith('on_') ? { principalUnionId: actorScope } : {}),
+        // 平台终端子域默认免登录只读：没有 actor 的非 owner 就是没登录的访客（#2004）。
+        // 老版本平台对已登录的人也不注入 actor，此时两者无法区分 ⇒ 一律按免登录处理
+        // （能看、不能唤醒挂起会话）。这是有意的 fail-closed，不是漏判。
+        ...(!actorScope && platformRole !== 'owner' ? { anonymous: true as const } : {}),
       };
     }
     return {
@@ -213,8 +220,9 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       canManageHost: true,
     };
   }
-  return input.h5 ? {
+  return input.h5 && !input.h5.resultOnly ? {
     ...input.h5,
+    ...(input.h5.unionId ? { principalUnionId: input.h5.unionId } : {}),
     terminalCapability: 'controlled',
     previewCapability: 'operate',
     // H5 会话是 workbench 身份，从不继承本机管理能力（P1-7 的既有口径）。

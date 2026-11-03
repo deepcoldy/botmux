@@ -198,7 +198,7 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
   });
 
   it('is hidden for the runner CLIs specifically (mira/mir/dsh/ebsd — /compact would be dropped or sent as a user message)', () => {
-    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd']) {
+    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd', 'minimax']) {
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       expect(findButton(headerActions(card), 'compact_session'), `cliId=${cliId}`).toBeFalsy();
     }
@@ -386,5 +386,81 @@ describe('buildStreamingCard: signature stability', () => {
     expect(findButton(headerActions(card), 'compact_session')).toBeTruthy();
     // 没有 usage ⟹ 不渲染任何上下文文字（不会凭空冒出百分比或「建议压缩」）。
     expect(card.elements.some((e: any) => e.tag === 'markdown' && e.content.includes('上下文'))).toBe(false);
+  });
+});
+
+
+describe('session reasoning selector', () => {
+  it('shows next-turn scope for a confirmed CLI menu preference while displaying actual current effort', () => {
+    const card = build({ cliId: 'codex', usage: {
+      context: null, tokens: null, reasoningEffort: 'high',
+      reasoningControl: { choices: ['high', 'max'], selected: 'max', pending: true, nextTurn: true },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select.initial_option).toBe('high');
+    expect(JSON.stringify(card)).toContain('下一轮生效');
+    expect(JSON.stringify(card)).not.toContain('下次冷启动');
+  });
+
+  it.each([undefined, 'unrecognized'])('falls back to the saved choice when reported effort is %s', reasoningEffort => {
+    const card = build({ cliId: 'codex', usage: {
+      context: null, tokens: null, reasoningEffort,
+      reasoningControl: { choices: ['low', 'high', 'xhigh'], selected: 'high', pending: true },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select.initial_option).toBe('high');
+    expect(select.value.expected_effort).toBe('high');
+  });
+  it('renders a session-bound selector and distinguishes saved settings from executed effort', () => {
+    const card = build({ cliId: 'codex', usage: {
+      context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'ultra',
+      reasoningControl: { choices: ['low', 'high', 'ultra'], selected: 'high', pending: true },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select.options.find((o: any) => o.value === 'high').text.content).toBe('思考强度: 高');
+    expect(select.initial_option).toBe('ultra');
+    expect(select.value).toMatchObject({ action: 'set_reasoning_effort', root_id: ROOT, session_id: SID, expected_effort: 'high' });
+    expect(select.options.map((o: any) => o.value)).toEqual(['low', 'high', 'ultra']);
+    expect(JSON.stringify(card)).toContain('待生效');
+  });
+
+  it('does not invent a control without verified runtime support', () => {
+    const card = build({ cliId: 'codex', usage: { context: null, tokens: null, reasoningEffort: 'high' } });
+    expect(JSON.stringify(card)).not.toContain('set_reasoning_effort');
+  });
+});
+
+describe('buildStreamingCard: idle auto-compact toggle (toggle_idle_compact)', () => {
+  const usageWith = (enabled: boolean) => ({ context: null, tokens: null, idleAutoCompact: { enabled, minutes: 55 } });
+
+  it('renders in the main control row next to compact, showing the current state', () => {
+    const off = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) })), 'toggle_idle_compact');
+    expect(off.text.content).toContain('关');
+    expect(off.value.desired).toBe('on');
+    expect(off.value.session_id).toBe(SID);
+    const on = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true) })), 'toggle_idle_compact');
+    expect(on.text.content).toContain('开');
+    expect(on.value.desired).toBe('off');
+    const actions = headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) })).map((a: any) => a.value?.action);
+    expect(actions.indexOf('toggle_idle_compact')).toBe(actions.indexOf('compact_session') + 1);
+  });
+
+  it('localises the label', () => {
+    const btn = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true), locale: 'en' })), 'toggle_idle_compact');
+    expect(btn.text.content).toMatch(/idle/i);
+  });
+
+  it('is not rendered when the snapshot carries no toggle state (unsupported CLI/backend)', () => {
+    const card = build({ status: 'idle', cliId: 'gemini', usage: { context: null, tokens: null } });
+    expect(findButton(headerActions(card), 'toggle_idle_compact')).toBeFalsy();
+  });
+
+  it('follows the compact button\'s hidden-button setting', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle' as any, 'claude-code' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined, undefined, undefined, false,
+      usageWith(true) as any, undefined, undefined, undefined, undefined, ['compact'],
+    ));
+    expect(findButton(headerActions(card), 'toggle_idle_compact')).toBeFalsy();
   });
 });

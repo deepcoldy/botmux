@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 import { useT } from './react-hooks.js';
 import {
   InfoTip,
@@ -325,37 +326,13 @@ function ExpandableTrendCell(props: { label: string; onOpen(): void; children: R
 
 function ResourceDetailModal(props: { detail: ResourceDetail | null; onClose(): void }) {
   const tr = useT();
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (props.detail) {
-      if (!dialog.open) {
-        try { dialog.showModal(); } catch { /* dialog already opening */ }
-      }
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [props.detail]);
-
-  useEffect(() => () => {
-    const dialog = dialogRef.current;
-    if (dialog?.open) dialog.close();
-  }, []);
 
   return (
-    <dialog
-      ref={dialogRef}
+    <ModalDialog
+      open={!!props.detail}
       className="resource-detail-modal"
-      onCancel={event => {
-        event.preventDefault();
-        props.onClose();
-      }}
       onClose={props.onClose}
-      onClick={event => {
-        if (event.target === event.currentTarget) props.onClose();
-      }}
+      onRequestClose={props.onClose}
     >
       {props.detail ? (
         <article className="resource-detail-modal-card">
@@ -388,7 +365,7 @@ function ResourceDetailModal(props: { detail: ResourceDetail | null; onClose(): 
           </div>
         </article>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 

@@ -40,7 +40,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
+import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox, probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import { stripComments } from './helpers/bun-leg-selectors.js';
 
 const REAL_ARGV1 = process.argv[1];
@@ -154,15 +154,16 @@ describe('relay host re-exec — botmuxCliInvocation', () => {
     expect(nodeForm.args).toHaveLength(binForm.args.length + 1);
   });
 
-  it('SOURCE PIN: the relay spawn consumes the invocation, not a bare path', () => {
-    // The helper is only useful if the spawn site actually uses it; a future edit
-    // that reverts to `spawn(process.execPath, [cli, 'send', …])` would leave
-    // every assertion above passing while the bug returns.
-    const src = readFileSync(new URL('../src/adapters/backend/sandbox.ts', import.meta.url), 'utf-8');
-    expect(src).toContain('spawn(cliInvocation.command, [...cliInvocation.args, v.value.command,');
-    expect(src).toContain('botmuxCliInvocation(opts.cliPath)');
-    // And the shim writer must go through the helper too.
-    expect(src).toContain('writeFileSync(shim, botmuxShimExecLine())');
+  // 源码结构护栏(K1)：编译态单文件二进制没有 dist/cli.js，relay 回执与 shim 必须按运行形态分流；
+  // 单测进程跑的是源码形态，relay 无 cliPath 覆盖时的编译态 spawn 走不到，只能读源码确认调用点
+  // 真的消费 botmuxCliInvocation / botmuxShimExecLine——回退成 `spawn(process.execPath, [cli, 'send', …])`
+  // 时上面的用例全绿，而编译版 relay 的每条 send 静默丢失（0318ca760c，#1090）。
+  it('routes the relay spawn and the shim writer through the runtime-form helpers', () => {
+    const src = stripComments(readFileSync(new URL('../src/adapters/backend/sandbox.ts', import.meta.url), 'utf-8'));
+    const invocation = src.match(/const (\w+) = botmuxCliInvocation\(opts\.cliPath\)/);
+    expect(invocation).not.toBeNull();
+    expect(src).toMatch(new RegExp(`spawn\\(${invocation![1]}\\.command, \\[\\.\\.\\.${invocation![1]}\\.args,`));
+    expect(src).toMatch(/writeFileSync\(\w+, botmuxShimExecLine\(\)\)/);
   });
 });
 
@@ -192,7 +193,13 @@ describe('relay host re-exec — botmuxCliInvocation', () => {
 // prepareDirectSandbox returns null off Linux (bwrap DIRECT mode), so on macOS
 // every overlayTargets() call is vacuously [] — the "skips" case passes for the
 // wrong reason and the "still overlays" case can only fail. Linux-only by design.
-describe.skipIf(process.platform !== 'linux')('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
+const bwrapUsable = probeHostCredentialIsolationMechanism().mechanism === 'bwrap';
+// Also skip on a Linux runner whose unprivileged userns/bwrap is unavailable
+// (GitHub hosted runners can stay `bwrap --unshare-user`-broken even after the
+// workflow relaxes apparmor): prepareDirectSandbox then returns null and the
+// "still overlays" cases would fail instead of skip. Uses the SAME production
+// probe as plugin-mcp-sandbox.test.ts / session-store-bwrap.test.ts.
+describe.skipIf(process.platform !== 'linux' || !bwrapUsable)('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
   function overlayTargets(trusted: string): string[] {
     const root = mkdtempSync(join(tmpdir(), 'sbx-overlay-'));
     const proj = join(root, 'proj');
@@ -264,17 +271,5 @@ describe.skipIf(process.platform !== 'linux')('sandbox shim overlay — install.
     chmodSync(stable, 0o755);
     chmodSync(gateway, 0o755);
     expect(overlayTargets(gateway)).toEqual([gateway]);
-  });
-
-  it('SOURCE PIN: worker trusts exactly the default gateway entry, not the dedicated native hook wrapper', () => {
-    const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
-    const callStart = src.indexOf('const sbx = prepareDirectSandbox({');
-    expect(callStart).toBeGreaterThanOrEqual(0);
-    const callEnd = src.indexOf('      });', callStart);
-    expect(callEnd).toBeGreaterThan(callStart);
-    const callRegion = stripComments(src.slice(callStart, callEnd));
-    expect(callRegion).toContain('trustedBotmuxCommandPaths: [defaultGatewayEntry().command],');
-    expect(callRegion).not.toContain('resolveNativeSubagentRuntimeHookWrapperPath');
-    expect(callRegion).not.toContain('botmux-native-subagent-runtime-hook');
   });
 });

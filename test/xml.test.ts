@@ -1,9 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { escapeXmlTagLikeTokens, escapeXmlText } from '../src/utils/xml.js';
+import { escapeXmlAttr, escapeXmlTagLikeTokens, escapeXmlText } from '../src/utils/xml.js';
 
 describe('escapeXmlText', () => {
   it('escapes XML text delimiters once and in the correct order', () => {
     expect(escapeXmlText('<tag>A & B</tag>')).toBe('&lt;tag&gt;A &amp; B&lt;/tag&gt;');
+  });
+});
+
+describe('escapeXmlAttr', () => {
+  it('escapes quotes that would break out of an attribute', () => {
+    expect(escapeXmlAttr('a"b\'c<d>&')).toBe('a&quot;b&apos;c&lt;d&gt;&amp;');
   });
 });
 

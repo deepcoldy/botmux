@@ -2,7 +2,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readProcessStartIdentity, resolveSessionContext } from '../src/core/session-marker.js';
+import {
+  advanceAncestorSessionTurn,
+  findAncestorSessionMarkerContext,
+  findAuthenticatedAncestorSessionContext,
+  markerBelongsToLiveProcess,
+  readProcessStartIdentity,
+  resolveSessionContext,
+} from '../src/core/session-marker.js';
 import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
@@ -54,6 +61,18 @@ describe('resolveSessionContext()', () => {
     }));
     const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
     expect(ctx).toEqual({ sessionId: 'env-sid', turnId: 'turn-9', dispatchAttempt: 2 });
+  });
+
+  it('exposes current-turn capability only through a birth-bound authenticated marker', () => {
+    const procStart = readProcessStartIdentity(process.pid);
+    expect(procStart).toBeTruthy();
+    const marker = { sessionId: 'env-sid', turnId: 'om_live', dispatchAttempt: 1,
+      capability: 'ab'.repeat(32), procStart };
+    writeMarker(process.pid, JSON.stringify(marker));
+    expect(findAuthenticatedAncestorSessionContext(dir, process.pid)).toMatchObject(marker);
+    expect(resolveSessionContext(dir, 'env-sid', process.pid)).not.toHaveProperty('capability');
+    writeMarker(process.pid, JSON.stringify({ ...marker, procStart: 'stale' }));
+    expect(() => findAuthenticatedAncestorSessionContext(dir, process.pid)).toThrow();
   });
 
   it.each([0, -1, 1.5, '2', Number.MAX_SAFE_INTEGER + 1])(
@@ -218,5 +237,132 @@ describe('resolveSessionContext()', () => {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
     }
+  });
+
+  it('parses queued type-ahead turns and advances to the next turn', () => {
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-1',
+      dispatchAttempt: 1,
+      queuedTurnId: 'turn-2',
+      queuedTurns: [
+        { turnId: 'turn-2', dispatchAttempt: 2 },
+        { turnId: 'turn-3', dispatchAttempt: 1 },
+      ],
+    }));
+
+    const markerCtx = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(markerCtx).toEqual({
+      sessionId: 'env-sid',
+      turnId: 'turn-1',
+      dispatchAttempt: 1,
+      markerPid: process.pid,
+      queuedTurnId: 'turn-2',
+      queuedTurns: [
+        { turnId: 'turn-2', dispatchAttempt: 2 },
+        { turnId: 'turn-3', dispatchAttempt: 1 },
+      ],
+    });
+
+    // Mismatched consumed turn does not advance
+    const mismatch = advanceAncestorSessionTurn(dir, process.pid, 'wrong-turn');
+    expect(mismatch).toEqual({ advanced: false, turnId: 'turn-1' });
+
+    // Matching consumed turn advances to turn-2
+    const adv1 = advanceAncestorSessionTurn(dir, process.pid, 'turn-1');
+    expect(adv1).toEqual({ advanced: true, turnId: 'turn-2' });
+
+    const step1 = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(step1?.turnId).toBe('turn-2');
+    expect(step1?.dispatchAttempt).toBe(2);
+    expect(step1?.queuedTurnId).toBe('turn-3');
+    expect(step1?.queuedTurns).toEqual([{ turnId: 'turn-3', dispatchAttempt: 1 }]);
+
+    // Advances to turn-3
+    const adv2 = advanceAncestorSessionTurn(dir, process.pid, 'turn-2');
+    expect(adv2).toEqual({ advanced: true, turnId: 'turn-3' });
+
+    const step2 = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(step2?.turnId).toBe('turn-3');
+    expect(step2?.dispatchAttempt).toBe(1);
+    expect(step2?.queuedTurnId).toBeUndefined();
+    expect(step2?.queuedTurns).toBeUndefined();
+
+    // No more queued turns
+    const adv3 = advanceAncestorSessionTurn(dir, process.pid, 'turn-3');
+    expect(adv3).toEqual({ advanced: false, turnId: 'turn-3' });
+  });
+
+  it('handles single legacy queuedTurnId when advancing turn', () => {
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-old',
+      queuedTurnId: 'turn-next',
+    }));
+
+    const adv = advanceAncestorSessionTurn(dir, process.pid, 'turn-old');
+    expect(adv).toEqual({ advanced: true, turnId: 'turn-next' });
+
+    const step = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(step?.turnId).toBe('turn-next');
+    expect(step?.queuedTurnId).toBeUndefined();
+    expect(step?.queuedTurns).toBeUndefined();
+  });
+
+  it('preserves trustedCaller and trustedController across queued turns when advancing', () => {
+    const callerA = {
+      requestUserOpenId: 'ou_caller_a',
+      requestUserUnionId: 'on_caller_a',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user' as const,
+    };
+    const callerB = {
+      requestUserOpenId: 'ou_caller_b',
+      requestUserUnionId: 'on_caller_b',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user' as const,
+    };
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-1',
+      trustedCaller: callerA,
+      queuedTurns: [
+        { turnId: 'turn-2', dispatchAttempt: 1, trustedCaller: callerB },
+      ],
+    }));
+
+    const adv = advanceAncestorSessionTurn(dir, process.pid, 'turn-1');
+    expect(adv).toEqual({ advanced: true, turnId: 'turn-2' });
+
+    const step = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(step?.turnId).toBe('turn-2');
+    expect(step?.trustedCaller).toEqual(callerB);
+    expect(step?.steerPromotedTurn).toBe(true);
+  });
+});
+
+// A successor worker adopts the turn a reattached CLI's marker records, so the
+// marker must have been written for THIS live process of THIS session.
+describe('markerBelongsToLiveProcess()', () => {
+  const liveStart = readProcessStartIdentity(process.pid);
+  const marker = (body: Record<string, unknown>): string =>
+    JSON.stringify({ sessionId: 'sid', turnId: 'turn-1', ...body });
+
+  it('accepts the marker this session wrote for the live process', () => {
+    expect(liveStart).toBeTruthy();
+    expect(markerBelongsToLiveProcess(marker({ procStart: liveStart }), { sessionId: 'sid', procStart: liveStart }))
+      .toBe(true);
+  });
+
+  it('rejects a recycled PID leftover, another session, and a marker without a birth stamp', () => {
+    const live = { sessionId: 'sid', procStart: liveStart };
+    expect(markerBelongsToLiveProcess(marker({ procStart: '1' }), live)).toBe(false);
+    expect(markerBelongsToLiveProcess(marker({ procStart: liveStart, sessionId: 'other-sid' }), live)).toBe(false);
+    expect(markerBelongsToLiveProcess(marker({}), live)).toBe(false);
+    expect(markerBelongsToLiveProcess('sid', live)).toBe(false); // legacy plain-text marker
+  });
+
+  it('rejects an unstamped marker when the live birth time is unreadable too', () => {
+    expect(markerBelongsToLiveProcess(marker({}), { sessionId: 'sid', procStart: undefined })).toBe(false);
   });
 });

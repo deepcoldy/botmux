@@ -39,7 +39,7 @@ export function detectCodexComposerState(
   const firstCandidateRow = Math.max(0, cursor.y - 12);
   for (let row = cursor.y; row >= firstCandidateRow; row -= 1) {
     const line = lines[row] ?? '';
-    const marker = /^(\s*)›/.exec(line);
+    const marker = /^(\s*)[›»]/.exec(line);
     if (!marker) continue;
     // NOTE on Codex's update picker (`› 1. Update now` / `› 2. Skip`): we do
     // NOT special-case it. The adapter's readyPattern excludes it so a queued

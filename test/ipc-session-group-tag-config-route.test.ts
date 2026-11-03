@@ -117,3 +117,33 @@ describe('PUT /api/session-group-tag-config —— 标签名', () => {
     expect(vi.mocked(configStore.rmwBotEntry)).not.toHaveBeenCalled();
   });
 });
+
+
+describe('PUT /api/session-group-tag-config — closedName', () => {
+  it('persists and hot-reloads a separately configured destination without changing the active tag', async () => {
+    entry.sessionGroup = { tag: { name: 'Active', mode: 'feed-group' } };
+    botConfig.sessionGroup = { tag: { name: 'Active', mode: 'feed-group' } };
+    const result = await put({ closedName: '  Closed  ' });
+    expect(result.status).toBe(200);
+    expect(result.json).toMatchObject({ tagName: 'Active', closedTagName: 'Closed', tagMode: 'feed-group' });
+    expect(entry.sessionGroup.tag).toEqual({ name: 'Active', mode: 'feed-group', closedName: 'Closed' });
+    expect(botConfig.sessionGroup.tag).toEqual(entry.sessionGroup.tag);
+    await put({ name: 'New active' });
+    expect(entry.sessionGroup.tag.closedName).toBe('Closed');
+  });
+
+  it('clears the opt-in and clamps names by Unicode codepoint', async () => {
+    const result = await put({ closedName: '🗂'.repeat(100) });
+    expect(result.json.closedTagName).toBe('🗂'.repeat(60));
+    await put({ closedName: '   ' });
+    expect(entry.sessionGroup.tag.closedName).toBeUndefined();
+    expect(botConfig.sessionGroup.tag.closedName).toBeUndefined();
+  });
+
+  it.each([42, null, {}, [[]]])('rejects invalid closedName without writing: %j', async closedName => {
+    const result = await put({ name: 'Active', closedName });
+    expect(result.status).toBe(400);
+    expect(result.json.error).toBe('invalid_closed_name');
+    expect(configStore.rmwBotEntry).not.toHaveBeenCalled();
+  });
+});

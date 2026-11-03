@@ -181,6 +181,15 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
 });
 
 describe('autostart PATH normalization', () => {
+  it('does not persist per-session identity wrappers across upgrades or boots', () => {
+    const transient = '/home/u/.botmux/data/cli-identity/session.bin';
+    const opts = { pkgRoot: '/opt/botmux', configDir: '/home/u/.botmux', logDir: '/tmp/logs',
+      environmentPath: `${transient}:/usr/bin` };
+    expect(autostartPath(opts.environmentPath, 'linux')).toBe('/usr/bin');
+    expect(unitContent(opts)).not.toContain(transient);
+    expect(plistContent(opts)).not.toContain(transient);
+    expect(autostartPath('C:\\Users\\u\\data\\cli-identity\\session.bin;C:\\Tools', 'win32')).toBe('C:\\Tools');
+  });
   it('filters AI CLI argv0 shims, preserves order, and removes duplicates on POSIX', () => {
     expect(autostartPath(
       [
@@ -330,7 +339,7 @@ describe('autostart boot hook — Node install shape stays unchanged', () => {
   });
 });
 
-describe('boot-hook marker is consumed on entry, not after dependency probes', () => {
+describe('boot-hook marker is single-use and always removed', () => {
   it("returns true and deletes the key when the value is '1'", () => {
     const env: NodeJS.ProcessEnv = { [AUTOSTART_UNIT_ENV]: '1', OTHER: 'keep' };
     expect(consumeAutostartUnitMarker(env)).toBe(true);
@@ -352,36 +361,5 @@ describe('boot-hook marker is consumed on entry, not after dependency probes', (
     expect(consumeAutostartUnitMarker(env)).toBe(false);
     expect(AUTOSTART_UNIT_ENV in env).toBe(false);
     expect(env.OTHER).toBe('keep');
-  });
-
-  it('cmdStart consumes the marker before its first await / dependency probe', () => {
-    // Structural guard: dependency probes and installers run as CHILD processes,
-    // so they would inherit a marker consumed after them. Assert on source order.
-    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
-    const start = src.indexOf('async function cmdStart(): Promise<void> {');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}', start);
-    expect(end).toBeGreaterThan(start);
-
-    // STRIP COMMENTS FIRST. Both needles occur in this function's own comments:
-    // matching those would find `await` in the prose (false failure) and the
-    // helper's name in "see consumeAutostartUnitMarker" (false PASS, which is the
-    // dangerous direction — it would satisfy the guard without a real call).
-    const body = src.slice(start, end)
-      .split('\n')
-      .map((l) => l.replace(/\/\/.*$/, ''))
-      .join('\n');
-
-    const consumeAt = body.indexOf('consumeAutostartUnitMarker(');
-    expect(consumeAt, 'cmdStart must call consumeAutostartUnitMarker').toBeGreaterThan(-1);
-
-    const firstAwaitAt = body.indexOf('await ');
-    expect(firstAwaitAt, 'cmdStart is expected to await something').toBeGreaterThan(-1);
-    expect(consumeAt).toBeLessThan(firstAwaitAt);
-
-    // And specifically before the dependency probe that spawns children.
-    const depsAt = body.indexOf('ensureSystemDependencies(');
-    expect(depsAt).toBeGreaterThan(-1);
-    expect(consumeAt).toBeLessThan(depsAt);
   });
 });

@@ -548,8 +548,46 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
 
     expect(finalOutputs(messages), `duplicate reply delivered\n${logs}`).toHaveLength(0);
     expect(logs).toContain('model already called botmux send');
-    // The suppressed turn still tells observers which message WAS the reply.
-    expect(messages.some(m => m.type === 'explicit_reply_observed')).toBe(true);
+    // A legacy marker without an exact turn id may suppress the duplicate
+    // fallback, but it cannot authorize trusted outbound provenance.
+    expect(messages.some(m => m.type === 'explicit_reply_observed')).toBe(false);
+  }, 40_000);
+
+  it('reports every explicit progress and final message for the same turn', async () => {
+    const writeMultipleSendMarkers = `node -e '
+  const fs = require("fs"), p = require("path");
+  const dir = p.join(process.env.SESSION_DATA_DIR, "turn-sends");
+  fs.mkdirSync(dir, { recursive: true });
+  const markerPath = p.join(dir, process.env.BOTMUX_SESSION_ID + ".jsonl");
+  for (const marker of [
+    { messageId: "om_progress", responseKind: "progress" },
+    { messageId: "om_final", responseKind: "final" },
+    { messageId: "om_wrong_turn", responseKind: "final", turnId: "om_other_turn" },
+  ]) fs.appendFileSync(markerPath, JSON.stringify({
+    sentAtMs: Date.now(), turnId: "om_bridge_turn", contentLength: 10, ...marker,
+  }) + "\\n");
+'`;
+    const { messages, logs } = await runWorker({
+      fakeStream: [
+        `echo '{"type":"system","subtype":"init","session_id":"sid-bridge-multi"}'`,
+        writeMultipleSendMarkers,
+        `echo '{"type":"result","status":"ok","result":"已完成","session_id":"sid-bridge-multi","warnings":[]}'`,
+      ].join('\n'),
+      init: { turnId: 'om_bridge_turn' },
+      awaitLog: TURN_SETTLED_LOG,
+    });
+
+    expect(messages.filter(m => m.type === 'explicit_reply_observed')).toEqual([
+      expect.objectContaining({
+        type: 'explicit_reply_observed', turnId: 'om_bridge_turn',
+        messageId: 'om_progress', responseKind: 'progress',
+      }),
+      expect.objectContaining({
+        type: 'explicit_reply_observed', turnId: 'om_bridge_turn',
+        messageId: 'om_final', responseKind: 'final',
+      }),
+    ]);
+    expect(logs).toContain('model already called botmux send');
   }, 40_000);
 
   it('delivers nothing when the answer is the nothing-to-send sentinel', async () => {
@@ -958,6 +996,8 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     let child: ChildProcess | undefined;
     const logs: string[] = [];
     const dump = join(root, 'jwts.txt');
+    // The fake mojo appends while this polls: a line without its newline is not written yet.
+    const dumpedLines = () => (existsSync(dump) ? readFileSync(dump, 'utf-8').split('\n').slice(0, -1) : []);
     try {
       const appId = 'app_mojo_clear';
       const botsPath = join(root, 'bots.json');
@@ -1006,7 +1046,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       } as DaemonToWorker);
 
       await waitFor(
-        () => existsSync(dump) && readFileSync(dump, 'utf-8').trim().split('\n').length >= 1,
+        () => dumpedLines().length >= 1,
         20_000,
         () => `first turn never ran\n${logs.join('')}`,
       );
@@ -1020,12 +1060,12 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       } as DaemonToWorker);
 
       await waitFor(
-        () => readFileSync(dump, 'utf-8').trim().split('\n').length >= 2,
+        () => dumpedLines().length >= 2,
         20_000,
         () => `second turn never ran\n${logs.join('')}`,
       );
 
-      const seen = readFileSync(dump, 'utf-8').trim().split('\n');
+      const seen = dumpedLines();
       expect(seen[0]).toBe('[stale-A]');
       // Cleared means cleared: neither the jwtEnv value nor the ambient token may
       // stand in for it.

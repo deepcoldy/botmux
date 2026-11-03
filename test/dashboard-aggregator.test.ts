@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { Aggregator, subscribeDaemon } from '../src/dashboard/aggregator.js';
-import { reconcileDaemonSnapshot } from '../src/dashboard/daemon-reconcile.js';
+import { reconcileDaemonSessions, reconcileDaemonSnapshot } from '../src/dashboard/daemon-reconcile.js';
 
 describe('Aggregator cache merge', () => {
   it('upsert via session.spawned and session.update', () => {
@@ -205,6 +205,47 @@ describe('Aggregator cache merge', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0].larkAppId).toBe('appB');
     expect(seen[0].type).toBe('session.spawned');
+  });
+});
+
+describe('primary dashboard Session refresh', () => {
+  const daemon = { larkAppId: 'appA', ipcPort: 19999, botName: 'A' } as any;
+
+  it('hydrates a canonical Session that this replica never observed locally', async () => {
+    const agg = new Aggregator();
+    const rows = await reconcileDaemonSessions(
+      daemon,
+      agg,
+      new AbortController().signal,
+      async () => ({ sessions: [{ sessionId: 'canonical-only', status: 'idle' }] }),
+    );
+
+    expect(rows).toEqual([{ sessionId: 'canonical-only', status: 'idle' }]);
+    expect(agg.getSession('canonical-only')).toMatchObject({
+      sessionId: 'canonical-only',
+      larkAppId: 'appA',
+      status: 'idle',
+    });
+  });
+
+  it('does not clobber the cache when the request is aborted in flight', async () => {
+    const agg = new Aggregator();
+    agg.hydrateSessions('appA', [{ sessionId: 'new', status: 'idle' } as any]);
+    const controller = new AbortController();
+    const refresh = reconcileDaemonSessions(
+      daemon,
+      agg,
+      controller.signal,
+      async () => {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return { sessions: [{ sessionId: 'stale', status: 'working' }] };
+      },
+    );
+    controller.abort();
+
+    await expect(refresh).resolves.toBeUndefined();
+    expect(agg.getSession('new')).toBeDefined();
+    expect(agg.getSession('stale')).toBeUndefined();
   });
 });
 

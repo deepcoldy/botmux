@@ -1,20 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { clientArgsMock, userGetMock, batchGetIdMock } = {
+const { clientArgsMock, userGetMock, batchGetIdMock, generatedUserGetMock } = {
   clientArgsMock: vi.fn(),
   userGetMock: vi.fn(),
   batchGetIdMock: vi.fn(),
+  /** When set, replaces the generated contact.v3.user.get (which sends a `{}` GET body). */
+  generatedUserGetMock: vi.fn(),
 };
+
+/** SDK generic request() — the no-body GET path (larkGet) — routed to the same user lookup mock. */
+function routeContactGet(req: any) {
+  const m = /^\/open-apis\/contact\/v3\/users\/([^/?]+)$/.exec(req?.url ?? '');
+  if (req?.method !== 'GET' || !m || 'data' in req) throw new Error(`unexpected request ${JSON.stringify(req)}`);
+  return userGetMock({ path: { user_id: decodeURIComponent(m[1]) }, params: req.params });
+}
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class {
     constructor(args: unknown) {
       clientArgsMock(args);
     }
+    request = (req: unknown) => routeContactGet(req);
     contact = {
       v3: {
         user: {
-          get: userGetMock,
+          get: (...args: unknown[]) => (generatedUserGetMock.getMockImplementation()
+            ? generatedUserGetMock(...args)
+            : userGetMock(...args)),
           batchGetId: batchGetIdMock,
         },
       },
@@ -33,6 +45,7 @@ describe('scripted setup owner identity', () => {
     clientArgsMock.mockReset();
     userGetMock.mockReset();
     batchGetIdMock.mockReset();
+    generatedUserGetMock.mockReset();
   });
 
   it('replaces the managed source-bot open_id with a stable union_id before creating another app', async () => {
@@ -112,6 +125,25 @@ describe('scripted setup owner identity', () => {
     await expect(detectUnusableOwnerEntries(
       'cli_target', 'secret', 'feishu', ['ou_source'],
     )).resolves.toEqual(['ou_source']);
+  });
+
+  // A gateway that rejects GET-with-body answers HTTP 411 to the SDK's generated
+  // contact.v3.user.get (it sends `{}` as the body). That throw is inconclusive,
+  // so the probe must use the no-body larkGet path or a foreign ou_ slips through.
+  it('still rejects a cross-app open_id behind a gateway that 411s GET-with-body', async () => {
+    generatedUserGetMock.mockRejectedValue(Object.assign(new Error('Request failed with status code 411'), {
+      response: { status: 411, data: 'Length Required' },
+    }));
+    userGetMock.mockResolvedValue({ code: 99992361, msg: 'cross app' });
+
+    await expect(detectUnusableOwnerEntries(
+      'cli_target', 'secret', 'feishu', ['ou_source'],
+    )).resolves.toEqual(['ou_source']);
+    expect(userGetMock).toHaveBeenCalledWith({
+      path: { user_id: 'ou_source' },
+      params: { user_id_type: 'open_id' },
+    });
+    expect(generatedUserGetMock).not.toHaveBeenCalled();
   });
 
   it('rejects the same definitive cross-app error when the SDK throws Axios-style', async () => {

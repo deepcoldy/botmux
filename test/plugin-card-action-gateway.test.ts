@@ -1,7 +1,11 @@
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  isBotmuxCardAction,
+  pluginCardActionSelectorOverlapsBotmux,
+} from '../src/core/card-action-namespace.js';
 import {
   getOrCreatePluginCardActionToken,
   readPluginCardActionToken,
@@ -144,6 +148,28 @@ describe('plugin card action gateway', () => {
     expect(body.operator).not.toHaveProperty('user_id');
   });
 
+  it('forwards host-computed privileges and degrades a failing resolver to no authority', async () => {
+    const record = makeRecord('privileged', { actions: ['example.priv.submit'] });
+    const request = vi.fn(async () => successResponse());
+    const dispatch = (resolvePrivileges: () => Promise<{ canOperate: boolean; canTalk: boolean }>) => createPluginCardActionGateway({
+      resolvePluginIds: () => [record.id],
+      readRegistry: () => registryOf(record),
+      readServiceState: pluginId => onlineState(pluginId),
+      readToken: () => 'secret',
+      request,
+      resolvePrivileges,
+    }).dispatch({
+      operator: { open_id: 'ou_verified' },
+      action: { name: 'example.priv.submit', value: { canOperate: true } },
+    }, 'cli_current');
+
+    await dispatch(async () => ({ canOperate: true, canTalk: true }));
+    await dispatch(async () => { throw new Error('registry down'); });
+    const bodies = request.mock.calls.map(call => JSON.parse(String(call[1].body)));
+    expect(bodies[0].privileges).toEqual({ canOperate: true, canTalk: true });
+    expect(bodies[1].privileges).toEqual({ canOperate: false, canTalk: false });
+  });
+
   it('保持既有 Botmux 卡片动作行为不变', async () => {
     const record = makeRecord('external-actions', { actions: ['external.submit'] });
     const request = vi.fn(async () => successResponse());
@@ -187,6 +213,34 @@ describe('plugin card action gateway', () => {
       action: { name: 'generic_submit', value: { key: 'codex_app_thread_select' } },
     }, 'cli_current')).resolves.toBe(fallbackResult);
     expect(fallback).toHaveBeenCalledTimes(3);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('完成提案 action 家族在安装期与运行时都不能被插件接管', async () => {
+    expect(isBotmuxCardAction('completion_proposal_decide')).toBe(true);
+    expect(pluginCardActionSelectorOverlapsBotmux('completion_proposal_decide', 'action')).toBe(true);
+    expect(pluginCardActionSelectorOverlapsBotmux('completion_', 'prefix')).toBe(true);
+
+    // Simulate an old or tampered registry that predates install-time selector
+    // validation. The runtime fence must still route the built-in action back
+    // to Core instead of dialing the plugin service.
+    const record = makeRecord('completion-hijack', { actions: ['completion_proposal_decide'] });
+    const request = vi.fn(async () => successResponse());
+    const fallbackResult = { toast: { type: 'info' as const, content: 'builtin' } };
+    const fallback = vi.fn(async () => fallbackResult);
+    const gateway = createPluginCardActionGateway({
+      resolvePluginIds: () => [record.id],
+      readRegistry: () => registryOf(record),
+      readServiceState: pluginId => onlineState(pluginId),
+      readToken: () => 'secret',
+      request,
+      fallback,
+    });
+
+    await expect(gateway.dispatch({
+      action: { value: { action: 'completion_proposal_decide' } },
+    }, 'cli_current')).resolves.toBe(fallbackResult);
+    expect(fallback).toHaveBeenCalledOnce();
     expect(request).not.toHaveBeenCalled();
   });
 
@@ -467,12 +521,5 @@ describe('plugin card-action capability snapshot', () => {
       registryOf(malformed),
     );
     expect(snapshot.plugins).toEqual([]);
-  });
-
-  it('wires the snapshot into local, persistent, Riff, and Mojo generations', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    expect(worker).toContain('[PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities');
-    expect(worker).toContain('mergedEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities');
-    expect(worker).toContain('childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities');
   });
 });

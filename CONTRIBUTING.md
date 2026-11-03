@@ -8,17 +8,17 @@ cd botmux
 bun install --frozen-lockfile
 bun run build
 
-# Run directly (no PM2)
+# Run directly (foreground)
 bun run daemon
 
-# Or with PM2
+# Or under the built-in supervisor
 bun run daemon:start
 bun run daemon:logs
 ```
 
 > Every code change requires `bun run build` then `bun run daemon:restart`.
 
-> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.2`,
+> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.3`,
 > lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep
 > `node-pty`: bun does not run dependency lifecycle scripts by default, and
 > `node-pty` needs its install hook to build `build/Release/pty.node` — without
@@ -32,6 +32,36 @@ bun run daemon:logs
 > (see `InstallKind` in `src/utils/install-diagnostics.ts`), so don't "convert"
 > those to bun.
 
+## Midscene Test · Feishu browser E2E
+
+The existing Feishu browser scenarios in `test/e2e-browser/` run through
+`@midscene/test`. Their Playwright and Midscene Web assertions are registered as
+native YAML cases, preserving the original scenario behavior while adding
+Midscene Test selection, retries, summaries, and unified reports.
+
+Create `storageState.json` and provide the Feishu and `MIDSCENE_MODEL_*`
+variables shown in `.env.example`, then run:
+
+```bash
+bun run test:midscene:typecheck
+bun run test:e2e-browser
+```
+
+Each invocation writes its replayable report below the gitignored
+`midscene_run/runs/<run-id>/` directory.
+
+## 调试飞书卡片回调
+
+设置 `BOTMUX_CARD_ACTION_DIAGNOSTICS=1` 启动或重启待验证的 daemon，点击卡片后查找
+`[card-action-diagnostics]` 日志。`dispatcher` 记录归一化之前的字段结构，`handler`
+记录进入业务处理时的结构；两者均包含外层是否有 `event`、action 字段名、value 类型，
+以及解析后的 `action`、`result`、`expected_feedback_id`。完整事件载荷、token、用户与
+消息标识、表单正文不会输出。该开关默认关闭，排查结束后取消设置并重启。
+
+归一化必须先于动作分类和去重。回归测试应通过真实反馈存储验证 revision 和同卡更新，
+同时验证下拉/表单字段、身份校验及重复点击行为。卡片定义里的 `behaviors[].value`
+不能代替实际回调载荷；未拿到线上原始结构时，PR 应明确标注尚未完成线上实测。
+
 ## Architecture
 
 ```
@@ -39,6 +69,7 @@ Lark WebSocket Events
     |
 Daemon (daemon.ts → core/ modules)
     |-- im/lark/event-dispatcher: event routing
+    |-- im/lark/transport/connection: WebSocket connection and failed-state recovery
     |-- im/lark/card-handler: card interactions
     |-- core/worker-pool: worker process pool
     |-- core/command-handler: slash commands
@@ -46,7 +77,7 @@ Daemon (daemon.ts → core/ modules)
     |-- core/scheduler: cron scheduling
     |
 Worker (worker.ts) -- forked per session
-    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / Gemini / OpenCode)
+    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / OpenCode / Antigravity / ...)
     |-- adapters/backend: PtyBackend or TmuxBackend
     |-- utils/idle-detector: idle detection
     |-- HTTP + WebSocket: xterm.js web terminal
@@ -54,7 +85,7 @@ Worker (worker.ts) -- forked per session
     |-- IPC: daemon communication
     |
 AI Coding CLI (interactive TTY)
-    |-- Auto-installed Skills (~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/)
+    |-- Auto-installed Skills (~/.claude/skills/, ~/.config/opencode/skills/, ...)
     |-- ~/.botmux/bin/botmux wrapper on PATH → `botmux send/schedule/bots/thread` subcommands
     |
 Lark API
@@ -77,7 +108,7 @@ src/
       registry.ts           # Adapter factory + resolveCommand
       claude-code.ts        # Claude Code adapter
       codex.ts              # Codex adapter
-      gemini.ts             # Gemini CLI adapter
+      antigravity.ts        # Antigravity adapter
     backend/
       types.ts              # SessionBackend interface
       pty-backend.ts        # node-pty backend
@@ -94,6 +125,7 @@ src/
     lark/
       client.ts             # Lark API wrapper
       event-dispatcher.ts   # Lark WebSocket event routing
+      transport/connection.ts # WebSocket connection, proxy and failed-state recovery
       card-handler.ts       # Lark card interaction handling
       card-builder.ts       # Lark interactive card builders
       message-parser.ts     # Lark event message parsing
@@ -121,8 +153,8 @@ teach the agent when/how to use them.
 **Runtime setup per CLI worker spawn** (see `src/core/worker-pool.ts`):
 
 1. `ensureCliSkills(cliId)` — writes `src/skills/definitions.ts` content
-   into the CLI's native skill dir (`~/.claude/skills/`, `~/.gemini/skills/`,
-   `~/.config/opencode/skills/`). Synchronous, idempotent per lifecycle.
+   into the CLI's native skill dir (`~/.claude/skills/`,
+   `~/.config/opencode/skills/`, ...). Synchronous, idempotent per lifecycle.
 2. Worker `PATH` is prepended with `~/.botmux/bin`, which contains a
    `botmux` shell wrapper written by the daemon at startup (points at the
    running daemon's `dist/cli.js` — always in sync).
@@ -180,17 +212,21 @@ Tests are split into two Vitest projects with different execution profiles
 
 - **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
   Runs with **file parallelism on** (one process per file). This is what
-  `bun run test` runs, so the default is fast (~10s) and needs no real CLI binary
-  or browser.
-- **`e2e`** (`*.e2e.ts`) — spawns real CLIs / drives the Feishu web UI through a
-  shared daemon, so files run **sequentially**. Opt-in only.
+  `bun run test` runs; it needs no real CLI binary or browser. The full project
+  takes minutes, not seconds (CI splits it into four shards balanced by recorded
+  per-file duration, see `scripts/duration-shards.mjs`), so while iterating run
+  only the files you touched: `bun run test -- test/<name>.test.ts`.
+- **`e2e`** (`*.e2e.ts`, excluding `test/e2e-browser/`) — spawns real CLIs and
+  runs sequentially. Opt-in only.
+- **Feishu browser E2E** (`test/e2e-browser/cases/*.yaml`) — runs through
+  `@midscene/test` against a shared daemon and logged-in browser session.
 
 ```bash
-bun run test                # Unit tests only — parallel, ~10s (default)
+bun run test                # Unit tests only — parallel (default)
 bun run test:all            # Unit + E2E (needs real CLIs / browser session)
 bun run test:e2e            # All *.e2e.ts (sequential)
+bun run test:e2e-browser    # Feishu browser cases through Midscene Test
 bun run test:codex          # Codex input E2E
-bun run test:gemini         # Gemini CLI input E2E
 bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
 bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
@@ -200,6 +236,25 @@ bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 > `src/utils/timing.ts`, default `1` = unchanged in production) multiplies every
 > such delay. Filesystem-mocked unit tests set it small to collapse those waits.
 > See [`docs/test-benchmark.md`](docs/test-benchmark.md).
+
+### What Makes a Test Worth Keeping
+
+Tests must prove **behavior**, not photograph the implementation. Before writing
+one, ask: will it fail on a real behavioral regression, and will it stay green
+through a harmless refactor, copy edit or tuning change? The full rules live in
+the "测试原则" section of [`CLAUDE.md`](CLAUDE.md); in short:
+
+- Do not read `src/` files as text and assert on their contents. Extract the
+  logic into an exported function and test that instead. The few genuine
+  structural guards (import boundaries, compiled-binary constraints, security
+  guards without a behavioral seam, high-severity regression tripwires,
+  machine-checkable consistency) must carry a `// 源码结构护栏(Kx)：…` comment
+  (or `// 非文本断言：…` when a src asset is only used as a fixture);
+  `test/test-hygiene.test.ts` rejects unmarked ones.
+- Do not pin documentation wording, UI copy or internal tuning constants.
+  External protocol values and relationships between constants are fine.
+- Do not keep production exports alive just for their tests: wire them in or
+  delete both.
 
 ### Timing-Sensitive Test Contract
 

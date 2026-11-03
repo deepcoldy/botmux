@@ -10,6 +10,7 @@ const botConfig = vi.hoisted(() => ({
   },
   cliPathOverride: '/opt/current-codex',
   wrapperCli: undefined as string | undefined,
+  cliLaunchMode: undefined as 'forge-traex' | undefined,
   model: undefined as string | undefined,
 }));
 
@@ -71,6 +72,7 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     };
     botConfig.cliPathOverride = '/opt/current-codex';
     botConfig.wrapperCli = undefined;
+    botConfig.cliLaunchMode = undefined;
     botConfig.model = undefined;
   });
 
@@ -91,6 +93,29 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     expect(content).toContain("'/opt/frozen codex' resume codex-thread");
     expect(content).not.toContain('Current Codex');
     expect(content).not.toContain('/opt/current-codex');
+  });
+
+  it('rebuilds the Resume button from a persisted closed Session after rollback', () => {
+    const ds = makeSession();
+    ds.session.status = 'closed';
+    ds.session.closedAt = '2026-10-10T00:00:00.000Z';
+    ds.session.larkAppId = 'app_test';
+
+    const card = JSON.parse(buildClosedSessionCard(ds.session, 'zh')) as {
+      elements: Array<{
+        tag: string;
+        actions?: Array<{ value?: Record<string, unknown> }>;
+      }>;
+    };
+    const resume = card.elements
+      .find(element => element.tag === 'action')
+      ?.actions?.[0]?.value;
+
+    expect(resume).toMatchObject({
+      action: 'resume',
+      session_id: 'botmux-session',
+      root_id: 'om_root',
+    });
   });
 
   it('keeps legacy product copy while using the session-frozen executable', () => {
@@ -132,5 +157,19 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     expect(content).not.toContain('Current Codex');
     expect(content).not.toContain('ttadk');
     expect(content).not.toContain('new-model');
+  });
+
+  it('prints Forge x TraeX resume command for a frozen Forge launch session', () => {
+    const ds = makeSession();
+    ds.session.cliId = 'traex';
+    ds.session.cliRuntime = undefined;
+    ds.session.cliPathOverride = undefined;
+    ds.session.cliLaunchMode = 'forge-traex';
+    ds.session.cliSessionId = 'trae-thread-1';
+
+    const content = markdown(buildClosedSessionCard(ds, 'en'));
+
+    expect(content).toContain("forge run --agent traex --agent-args 'resume trae-thread-1'");
+    expect(content).not.toContain('traex resume trae-thread-1');
   });
 });

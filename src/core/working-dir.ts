@@ -3,12 +3,16 @@
  * can import them without dragging in the daemon graph (worker-pool, PTY, …).
  */
 import { existsSync, statSync, mkdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { resolve } from 'node:path';
 import { t, type Locale } from '../i18n/index.js';
+import { expandHomePath } from '../utils/working-dir.js';
 
+/** `~` / `~/x` / `~x` → under the home dir (delegates to utils/working-dir's
+ *  expandHomePath; this is the name the daemon-side callers import). A
+ *  call-time wrapper, not a `const` alias, so a partial mock of the source
+ *  module cannot break this module's load. */
 export function expandHome(p: string): string {
-  return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
+  return expandHomePath(p);
 }
 
 /**

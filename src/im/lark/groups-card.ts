@@ -33,6 +33,7 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import { type Locale, t } from '../../i18n/index.js';
 
 import type { CardActionData } from './card-handler.js';
+import { BACK_TO_OVERVIEW_ACTION, DASH_PAGE_SIZE, JUMP_PAGE_MAX_OPTIONS, ackToast, errorToast, escapeLarkMd, type DashCardHandlerResult } from './dash-card-common.js';
 
 export const GROUPS_ACTION_REFRESH = 'dash_groups_refresh' as const;
 export const GROUPS_ACTION_PAGE = 'dash_groups_page' as const;
@@ -46,20 +47,8 @@ export const GROUPS_ACTION_ROLE_OPEN = 'dash_groups_role_open' as const;
 export const GROUPS_ACTION_ROLE_SAVE = 'dash_groups_role_save' as const;
 export const GROUPS_ACTION_ROLE_DELETE = 'dash_groups_role_delete' as const;
 export const GROUPS_ACTION_PROJECT_ROLES = 'dash_groups_project_roles' as const;
-/** Action emitted by the "🔙 返回总览" button on overview-origin sub-cards.
- *  Same string as overview-card's OVERVIEW_ACTION_REFRESH (avoids a circular
- *  import). card-handler routes by action prefix, so dispatch lands on the
- *  overview handler regardless of which sub-card emitted it. */
-const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
-/** Default page size for standalone and overview-drilldown list cards. */
-const PAGE_SIZE = 5;
 const MAX_PAGE_SIZE = 100;
-
-/** Hard cap on `select_static` option count for the "jump to page" picker.
- *  Lark caps select options around this; we also keep payload small. Above
- *  the cap we fall back to prev/next only. */
-const JUMP_PAGE_MAX_OPTIONS = 50;
 
 /** Mapping from coverage status to a stable colour-emoji prefix. Pure. */
 function statusIcon(status: string): string {
@@ -118,7 +107,7 @@ type GroupsMatrix = {
 };
 
 function clampPageSize(pageSize: number | undefined): number {
-  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return PAGE_SIZE;
+  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return DASH_PAGE_SIZE;
   return Math.min(Math.floor(pageSize), MAX_PAGE_SIZE);
 }
 
@@ -137,7 +126,7 @@ function buildNavFields(opts: {
     if (opts.projectCoordinatorAppId) navFields.project_coordinator_app_id = opts.projectCoordinatorAppId;
     if (opts.projectWorkerAppIds?.length) navFields.project_worker_app_ids = opts.projectWorkerAppIds.join(',');
   }
-  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (effectivePageSize !== DASH_PAGE_SIZE) navFields.page_size = String(effectivePageSize);
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
   return navFields;
 }
@@ -779,24 +768,6 @@ function aggregateCoverageStatus(cells: ReadonlyArray<GroupRowDto['coverage'][nu
   return 'out';
 }
 
-/**
- * Sanitize chat name / chatIdSuffix / workingDir for lark_md inclusion.
- *
- * Chat names are user-controlled (group titles), chatIdSuffix is bot-supplied
- * but echoed near user content, and workingDir comes from the filesystem. All
- * three flow into a `<font color="grey">…</font>` wrapper; without escaping,
- * a payload like `</font><at id=ou_x></at>` would close our wrapper and
- * inject @mention-looking content. Order matters: `&` first so a later `<`
- * → `&lt;` doesn't get re-encoded as `&amp;lt;`.
- */
-function escapeLarkMd(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/([*_~`])/g, '\\$1');
-}
-
 /** ─── Handler ─────────────────────────────────────────────────────────── */
 
 export interface GroupsCardHandlerDeps {
@@ -806,22 +777,7 @@ export interface GroupsCardHandlerDeps {
   locale?: Locale;
 }
 
-export interface GroupsCardHandlerResult {
-  toast?: { type: 'info' | 'success' | 'error'; content: string };
-  card?: { type: 'raw'; data: Record<string, unknown> };
-}
-
-function ackToast(textKey: string, locale: Locale): GroupsCardHandlerResult {
-  return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
-}
-
-function errorToast(
-  textKey: string,
-  params: Record<string, string> | undefined,
-  locale: Locale,
-): GroupsCardHandlerResult {
-  return { toast: { type: 'error', content: t(textKey, params, locale) } };
-}
+export type GroupsCardHandlerResult = DashCardHandlerResult;
 
 function cardResult(cardJson: string): GroupsCardHandlerResult {
   return {

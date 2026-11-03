@@ -8,6 +8,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
 
 const LEASE_SUFFIX = '.jsonl.lease.json';
 
@@ -45,7 +46,10 @@ export function isDescendantOf(pid: number, ancestorPid: number): boolean {
     return false;
   }
   try {
-    const raw = execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf-8' });
+    const raw = execFileSync('ps', ['-axo', 'pid=,ppid='], {
+      encoding: 'utf-8',
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
+    });
     const ppidOf = new Map<number, number>();
     for (const line of raw.split('\n')) {
       const m = line.trim().match(/^(\d+)\s+(\d+)$/);
@@ -214,5 +218,3 @@ export function createReasonixAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['reasonix'],
   };
 }
-
-export const create = createReasonixAdapter;

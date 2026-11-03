@@ -1,0 +1,19 @@
+# Lane: the shared multi-bot group. Kept serial on purpose — the no-mention
+# case asserts that no bot answered, which a concurrent group case would break.
+cases:
+  - name: Group message without a mention
+    tags: [group, routing]
+    steps:
+      - feishu.runScenario: { scenario: group-without-mention }
+  - name: Group message with one bot mention
+    tags: [group, routing]
+    steps:
+      - feishu.runScenario: { scenario: group-single-mention }
+  - name: Group chat topic reply
+    tags: [group, topic]
+    steps:
+      - feishu.runScenario: { scenario: group-topic-reply }
+  - name: Aiden and CoCo collaboration
+    tags: [bot, group, collaboration]
+    steps:
+      - feishu.runScenario: { scenario: bot-collaboration }

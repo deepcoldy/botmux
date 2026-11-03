@@ -20,7 +20,7 @@
 
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 import type { V3Dag } from './dag.js';
@@ -350,7 +350,7 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
     return botToSnapshot(bot, args.workingDir);
   };
 
-  const { runNode } = createEphemeralPool({ resolveLarkAppSecret });
+  const { runNode } = createEphemeralPool({ resolveLarkAppSecret, resolveBot: appId => bots.find(bot => bot.larkAppId === appId) });
   const resolveGate = createFileGate({ awaitDecision: makeAwaitDecision(args.autoApproveGates) });
 
   let dag: V3Dag;
@@ -425,6 +425,11 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
       `\n⏸️  run 正在等待 humanGate：${outcome.pendingWaits.map(w => `${w.nodeId}(${w.waitId})`).join(', ')}`,
     );
     console.error(`   CLI 默认应使用 blocking gate；若看到此消息，请改用 daemon 驱动或检查 gateMode。`);
+    process.exit(1);
+  }
+  if (outcome.reason === 'awaitingExternal') {
+    // The CLI never pins nodeExecutor "bot"; keep the union total.
+    console.error(`\n⏸️  run 正在等待外部 Bot 执行节点；CLI 不驱动这种执行方式，请改用 daemon 驱动。`);
     process.exit(1);
   }
   if (outcome.runStatus === 'succeeded') {

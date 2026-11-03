@@ -38,6 +38,17 @@
  * Custom entries never enter LLM context (`sessionEntryToContextMessages`
  * returns [] for them), so this cannot perturb the model.
  *
+ * ## Queued input
+ *
+ * Input submitted while Pi is busy is not written to the session until Pi
+ * dequeues it (a steer after the current assistant turn, a follow-up after the
+ * pending work), which can be minutes later. Pi fires `input` at submit time
+ * with `streamingBehavior` set in exactly that case, so we append
+ *
+ *   {"type":"custom","customType":"botmux-input-queued","data":{"behavior":"steer"}}
+ *
+ * at once. It tells the bridge the turn is queued inside Pi, not lost.
+ *
  * Loaded per-invocation via `--extension`, so it applies ONLY to Pi processes
  * Botmux spawns — a Pi the user starts by hand in a terminal is unaffected.
  */
@@ -47,6 +58,17 @@ export const PI_TURN_BOUNDARY_CUSTOM_TYPE = 'botmux-turn-settled';
 /** Value written when the settled turn's last agent run ended in a provider
  *  error. The reader treats exactly this value as "report the failure". */
 export const PI_TURN_BOUNDARY_STOP_REASON_ERROR = 'error';
+
+/** Custom entry appended when Pi accepts an input while busy and queues it. */
+export const PI_INPUT_QUEUED_CUSTOM_TYPE = 'botmux-input-queued';
+
+export interface PiInputQueuedEntryData {
+  /** How Pi will deliver the queued input: after the current assistant turn
+   *  (`steer`) or after all pending work (`followUp`). */
+  behavior: 'steer' | 'followUp';
+}
+
+import { existsSync, readFileSync } from 'node:fs';
 
 export interface PiTurnBoundaryEntryData {
   /** Stop reason of the final assistant message in the settled turn, or null
@@ -58,6 +80,8 @@ interface PiTurnBoundaryExtensionApi {
   on(event: 'session_start', handler: (event: unknown) => void): void;
   on(event: 'agent_end', handler: (event: unknown) => void): void;
   on(event: 'agent_settled', handler: (event: unknown) => void): void;
+  on(event: 'before_agent_start', handler: (event: unknown) => { systemPrompt?: string | string[] } | void | Promise<{ systemPrompt?: string | string[] } | void>): void;
+  on(event: 'input', handler: (event: unknown) => void): void;
   appendEntry(customType: string, data?: unknown): void;
 }
 
@@ -116,5 +140,48 @@ export default function registerBotmuxTurnBoundaryExtension(pi: PiTurnBoundaryEx
       // degrades to the reader's timeout backstop, which is the same state as
       // an extension that failed to load at all.
     }
+  });
+
+  // `streamingBehavior` is set only when Pi is busy and will hold the input;
+  // idle input is written to the session straight away and needs no marker.
+  // oh-my-pi shares this extension; its `input` event has no
+  // streamingBehavior, so it never writes the marker. A Pi build that rejects
+  // the event name keeps everything else working.
+  try {
+    pi.on('input', (event) => {
+      const behavior = (event as { streamingBehavior?: unknown } | undefined)?.streamingBehavior;
+      if (behavior !== 'steer' && behavior !== 'followUp') return;
+      try {
+        const data: PiInputQueuedEntryData = { behavior };
+        pi.appendEntry(PI_INPUT_QUEUED_CUSTOM_TYPE, data);
+      } catch { /* see the agent_settled handler */ }
+    });
+  } catch { /* older Pi without the input event: behave as before */ }
+
+  // Append Botmux routing rules after CLI native resource discovery and final
+  // runtime project trust resolution are completed. This preserves existing
+  // project/user APPEND_SYSTEM.md auto-discovery, respects interactive session
+  // trust decisions and project_trust extensions, while injecting the session's
+  // Botmux system prompt into every turn.
+  pi.on('before_agent_start', (event: unknown) => {
+    let prompt = process.env.BOTMUX_APPEND_SYSTEM_PROMPT;
+    const promptFile = process.env.BOTMUX_APPEND_SYSTEM_PROMPT_FILE;
+    if (!prompt && promptFile && existsSync(promptFile)) {
+      try {
+        prompt = readFileSync(promptFile, 'utf-8');
+      } catch {
+        // ignore read failure
+      }
+    }
+    if (!prompt) return;
+    const current = (event as { systemPrompt?: string | string[] } | undefined)?.systemPrompt;
+    if (Array.isArray(current)) {
+      return {
+        systemPrompt: [...current, prompt],
+      };
+    }
+    return {
+      systemPrompt: current ? `${current}\n\n${prompt}` : prompt,
+    };
   });
 }

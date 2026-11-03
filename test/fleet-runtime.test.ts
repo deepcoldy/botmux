@@ -8,9 +8,12 @@ import {
   readFleetDaemonEnvFile,
   waitFleetOnline,
   resolveFleetDaemonEnv,
+  inspectSupervisorState,
+  liveSupervisorTarget,
 } from '../src/core/fleet-runtime.js';
 import { writeFleetState } from '../src/core/fleet-state-store.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
+import { sessionTempDir } from '../src/core/session-temp.js';
 
 const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-runtime-')); dirs.push(d); return d; }
@@ -56,8 +59,89 @@ describe('projectFleetStatus', () => {
   });
 });
 
+describe('inspectSupervisorState', () => {
+  const base: FleetState = {
+    supervisorPid: 61, supervisorStartedAt: 'T', supervisorEntry: '/opt/botmux',
+    supervisorProcessStart: 'boot-a:123', supervisorCommand: '/opt/botmux __supervisor', procs: [],
+  };
+  const runtime = (identity: string | undefined, command: string | undefined) => ({
+    readIdentity: () => identity, readCommandLine: () => command, pidExists: () => true,
+    readPidNamespace: () => undefined,
+  });
+
+  it('rejects the document incident shape: live pid belongs to an unrelated process', () => {
+    expect(inspectSupervisorState(base, runtime('boot-a:999', '[ksoftirqd/9]'))).toEqual({ status: 'stale' });
+  });
+
+  it('accepts only the exact persisted supervisor generation and command', () => {
+    expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
+    expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/other __supervisor'))).toEqual({ status: 'stale' });
+  });
+
+  it('rejects an otherwise identical supervisor from another PID namespace', () => {
+    const namespaced = { ...base, supervisorPidNamespace: 'pid:[100]' };
+    const deps = runtime('boot-a:123', '/opt/botmux __supervisor');
+    deps.readPidNamespace = () => 'pid:[999]';
+    expect(inspectSupervisorState(namespaced, deps)).toEqual({ status: 'stale' });
+  });
+
+  it('supports legacy state only when its recorded entry still identifies a supervisor', () => {
+    const legacy = { ...base, supervisorProcessStart: undefined, supervisorCommand: undefined };
+    expect(inspectSupervisorState(legacy, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
+    expect(inspectSupervisorState(legacy, runtime('boot-a:123', '[ksoftirqd/9]'))).toEqual({ status: 'stale' });
+  });
+
+  it('supports pre-identity state only when the live command is a built-in supervisor entry', () => {
+    const malformed = { ...base, supervisorProcessStart: undefined, supervisorCommand: undefined, supervisorEntry: undefined };
+    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
+    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/other __daemon'))).toEqual({ status: 'stale' });
+  });
+});
+
+describe('liveSupervisorTarget', () => {
+  it('migrates a pre-identity state row after attesting the built-in supervisor command', () => {
+    const p = join(tmp(), 'fleet.json');
+    writeFleetState(p, {
+      supervisorPid: process.pid,
+      supervisorStartedAt: 'T',
+      procs: [],
+    });
+    const runtime = {
+      readIdentity: () => 'boot-a:123',
+      readCommandLine: () => '/opt/botmux __supervisor',
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+
+    expect(liveSupervisorTarget(p, runtime)).toEqual({
+      pid: process.pid,
+      processStart: 'boot-a:123',
+      commandLine: '/opt/botmux __supervisor',
+    });
+  });
+
+  it('still fails closed when a pre-identity supervisor command is unreadable', () => {
+    const p = join(tmp(), 'fleet.json');
+    writeFleetState(p, {
+      supervisorPid: process.pid,
+      supervisorStartedAt: 'T',
+      procs: [],
+    });
+    const runtime = {
+      readIdentity: () => 'boot-a:123',
+      readCommandLine: () => undefined,
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+
+    expect(() => liveSupervisorTarget(p, runtime)).toThrow(
+      `fleet: 无法核验 supervisor pid ${process.pid} 的进程身份；为避免双实例，已中止操作`,
+    );
+  });
+});
+
 describe('readFleetStatus (path-injected)', () => {
-  it('reads and projects a state file', () => {
+  it('does not call an arbitrary live pid a supervisor without matching identity', () => {
     const p = join(tmp(), 'fleet.json');
     // Use our own pid so the liveness cross-check sees it alive.
     writeFleetState(p, {
@@ -66,7 +150,7 @@ describe('readFleetStatus (path-injected)', () => {
       procs: [online('botmux-0', process.pid)],
     });
     const status = readFleetStatus(p);
-    expect(status.supervisorAlive).toBe(true);
+    expect(status.supervisorAlive).toBe(false);
     expect(status.rows[0]).toMatchObject({ name: 'botmux-0', alive: true, status: 'online' });
   });
 
@@ -84,7 +168,7 @@ describe('waitFleetOnline', () => {
     expect(r).toMatchObject({ healthy: true, online: 0, expected: 0, pending: [] });
   });
 
-  it('returns healthy at once when the file already shows all online+alive', () => {
+  it('does not accept live member pids while the supervisor identity is stale', () => {
     const p = join(tmp(), 'fleet.json');
     // Two DISTINCT live pids (projection identity forbids a shared live pid):
     // our own pid and our parent's, both alive for the duration of the test.
@@ -93,8 +177,10 @@ describe('waitFleetOnline', () => {
       supervisorStartedAt: 'T',
       procs: [online('botmux-0', process.pid), online('botmux-1', process.ppid)],
     });
-    const r = waitFleetOnline(['botmux-0', 'botmux-1'], 2000, p);
-    expect(r).toMatchObject({ healthy: true, online: 2, expected: 2, pending: [] });
+    const r = waitFleetOnline(['botmux-0', 'botmux-1'], 0, p);
+    expect(r).toEqual({
+      healthy: false, online: 0, expected: 2, pending: ['botmux-0', 'botmux-1'],
+    });
   });
 
   it('times out reporting the pending (never-online) bots', () => {
@@ -108,8 +194,8 @@ describe('waitFleetOnline', () => {
     const r = waitFleetOnline(['botmux-0', 'botmux-1'], 300, p);
     expect(r.healthy).toBe(false);
     expect(r.expected).toBe(2);
-    expect(r.online).toBe(1);
-    expect(r.pending).toEqual(['botmux-1']);
+    expect(r.online).toBe(0);
+    expect(r.pending).toEqual(['botmux-0', 'botmux-1']);
   });
 
   it('times out when the state file is absent', () => {
@@ -149,6 +235,41 @@ describe('resolveFleetDaemonEnv (migration: SESSION_DATA_DIR must survive pm2→
     vi.stubEnv('SESSION_DATA_DIR', '/custom/data/root');
     const env = resolveFleetDaemonEnv(process.env, '');
     expect(env.SESSION_DATA_DIR).toBe('/custom/data/root'); // ambient override wins
+  });
+
+  it('drops a session scratch TMPDIR inherited from a restart run inside a session', () => {
+    // `botmux restart` from a session shell carries that session's scratch as
+    // TMPDIR/TMP/TEMP. Workers pin their Gateway socket root from it, so it
+    // must not reach the fleet or g.sock exceeds macOS's AF_UNIX limit again.
+    const home = mkdtempSync(join(tmpdir(), 'fleet-home-'));
+    dirs.push(home);
+    vi.stubEnv('HOME', home);
+    const scratch = sessionTempDir(join(home, '.botmux', 'data'), '6c255026-e993-495d-80ec-85d2c3c440dc');
+    const env = resolveFleetDaemonEnv({
+      BOTMUX_SESSION_ID: 'session-1',
+      SESSION_DATA_DIR: '/custom/data/root',
+      TMPDIR: `${scratch}/`,
+      TMP: scratch,
+      TEMP: scratch,
+    }, '');
+
+    expect(env.TMPDIR).toBeUndefined();
+    expect(env.TMP).toBeUndefined();
+    expect(env.TEMP).toBeUndefined();
+  });
+
+  it('keeps an operator-chosen TMPDIR outside the session scratch tree', () => {
+    const home = mkdtempSync(join(tmpdir(), 'fleet-home-'));
+    dirs.push(home);
+    vi.stubEnv('HOME', home);
+    const env = resolveFleetDaemonEnv({
+      SESSION_DATA_DIR: '/custom/data/root',
+      TMPDIR: '/var/tmp/botmux/',
+      TMP: join(home, '.cache', 'botmux', 'session-tmp-other'),
+    }, '');
+
+    expect(env.TMPDIR).toBe('/var/tmp/botmux/');
+    expect(env.TMP).toBe(join(home, '.cache', 'botmux', 'session-tmp-other'));
   });
 
   it('reloads WEB_HOST from .env before a session-origin restart spawns the supervisor', () => {

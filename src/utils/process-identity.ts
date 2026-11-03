@@ -1,6 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 
+import { procStatStartTime } from './proc-stat.js';
+
 const LINUX_BOOT_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -42,19 +44,32 @@ export function readLinuxBootIdentity(): string | undefined {
  * Stable process-birth identity used to reject stale locks after PID reuse.
  */
 export function readProcessStartIdentity(pid: number): string | undefined {
-  if (!Number.isInteger(pid) || pid <= 1) return undefined;
+  if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
   if (process.platform === 'linux') {
     try {
-      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const closeParen = raw.lastIndexOf(')');
-      if (closeParen >= 0) {
-        const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-        if (fields[19]) return fields[19];
-      }
+      return procStatStartTime(readFileSync(`/proc/${pid}/stat`, 'utf8'));
     } catch {
       // Disappeared or unreadable: never fall through to ambient ps.
     }
     return undefined;
+  }
+  if (process.platform === 'win32') {
+    try {
+      const started = execFileSync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$p = Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\"; `
+          + 'if ($p) { $p.CreationDate.ToUniversalTime().Ticks }',
+      ], {
+        encoding: 'utf-8',
+        timeout: 2_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return started || undefined;
+    } catch {
+      return undefined;
+    }
   }
   const ps = systemPsBin();
   if (!ps) return undefined;

@@ -126,6 +126,40 @@ describe('ActiveTurnAuthority', () => {
     expect(authority.blocks({ turnId: 'unknown-b' })).toBe(true);
   });
 
+  it('keeps execution credentials across a cross-person envelope and switches after release', () => {
+    const authority = new ActiveTurnAuthority();
+    const first = { turnId: 'a', caller: humanA };
+    const humanB = { ...humanA, requestUserOpenId: 'ou_b', requestUserUnionId: 'on_b' };
+    authority.reserve(first);
+    authority.markStarted(first);
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'b', caller: humanB });
+    expect(authority.identity()).toEqual({ turnId: 'b', identityTurnId: 'a', caller: humanA });
+    authority.markStarted(authority.identity());
+    expect(authority.identity().identityTurnId).toBe('a');
+    authority.releaseExact({ turnId: 'b' });
+    authority.reserve({ turnId: 'c', caller: humanB });
+    authority.markStarted({ turnId: 'c', caller: humanB });
+    expect(authority.identity()).toEqual({ turnId: 'c', caller: humanB });
+  });
+
+  it('uses a new actorless execution identity after the previous execution ends', () => {
+    const authority = new ActiveTurnAuthority();
+    authority.reserve({ turnId: 'a', identityTurnId: 'grant-a' });
+    authority.markStarted({ turnId: 'a', identityTurnId: 'grant-a' });
+    authority.releaseExact({ turnId: 'a' });
+    authority.reserve({ turnId: 'b' });
+    authority.markStarted({ turnId: 'b' });
+    expect(authority.identity()).toEqual({ turnId: 'b' });
+  });
+
+  it('retains an actorless delegated execution when a human supplies a new envelope', () => {
+    const authority = new ActiveTurnAuthority();
+    authority.reserve({ turnId: 'schedule-a' });
+    authority.markStarted({ turnId: 'schedule-a' });
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'message-b', caller: humanA });
+    expect(authority.identity()).toEqual({ turnId: 'message-b', identityTurnId: 'schedule-a' });
+  });
+
   it('lets raw control inherit an active authenticated authority', () => {
     const authority = new ActiveTurnAuthority();
     authority.reserve({ turnId: 'human-a', caller: humanA });
@@ -193,4 +227,41 @@ describe('ActiveTurnAuthority', () => {
       expect(authority.identity()).toEqual({});
     }
   });
+
+  it('allows same-principal queued steer turn rotation when caller identity is preserved', () => {
+    const authority = new ActiveTurnAuthority();
+    const active = { turnId: 'turn-active', caller: humanA };
+    expect(authority.reserve(active)).toBe(true);
+    expect(authority.markStarted(active)).toBe(true);
+
+    // Caller-less turn would be rejected when active turn has humanA caller
+    const callerLess = { turnId: 'turn-queued' };
+    expect(authority.reserve(callerLess)).toBe(false);
+    expect(authority.markStarted(callerLess)).toBe(false);
+
+    // Queued turn with preserved caller is accepted and successfully rotates
+    const queuedWithCaller = { turnId: 'turn-queued', caller: humanA };
+    expect(authority.reserve(queuedWithCaller)).toBe(true);
+    expect(authority.markStarted(queuedWithCaller)).toBe(true);
+    expect(authority.identity()).toEqual(queuedWithCaller);
+  });
 });
+
+for (const caller of [humanA, { ...humanA, requestUserOpenId: 'ou_b', requestUserUnionId: 'on_b' }]) {
+  it(`serializes collaborative turns from ${caller.requestUserOpenId} without changing the active sender`, () => {
+    const authority = new ActiveTurnAuthority();
+    const first = { turnId: 'a', caller: humanA };
+    const next = { turnId: 'b', caller, queueAfterActiveTurn: true as const };
+    authority.reserve(first);
+    authority.markStarted(first);
+    expect(authority.blocks(next)).toBe(true);
+    expect(authority.reserve(next)).toBe(false);
+    expect(authority.markStarted(next)).toBe(false);
+    expect(authority.identity()).toEqual(first);
+    authority.releaseExact(first);
+    expect(authority.blocks(next)).toBe(false);
+    expect(authority.reserve(next)).toBe(true);
+    expect(authority.markStarted(next)).toBe(true);
+    expect(authority.identity()).toEqual({ turnId: 'b', caller });
+  });
+}

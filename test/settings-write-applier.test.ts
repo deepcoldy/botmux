@@ -25,9 +25,11 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     enableLocalCliOpen: false,
     localCliOpenMode: 'attach',
     chatBotDiscovery: true,
+    cardBrandLabel: true,
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
     codexRpcInput: false,
     autoUpgradeCodexSessions: true,
+    reapOrphanTmuxServers: false,
     codexNotifier: {
       enabled: false,
       targetBotAppId: null,
@@ -43,6 +45,9 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     },
     vcMeetingAgent: { enabled: true },
     workflow: { enabled: true },
+    sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
+    promptCache: null,
+    multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
   };
@@ -61,6 +66,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     writeHostOverloadAlertConfig: vi.fn((config) => {
       storedGlobal.hostOverloadAlert = config;
     }),
+    writeScheduleBotGrantConfig: vi.fn(),
     mergeMaintenanceConfig: vi.fn((patch) => {
       Object.assign(storedMaintenance, patch);
       return storedMaintenance;
@@ -120,6 +126,16 @@ describe('resolveCodexNotifierRecipientView', () => {
 });
 
 describe('applySettingsWrite happy paths', () => {
+  it('runs the complete settings write inside one injected config transaction', async () => {
+    const runConfigMutation = vi.fn(async <T>(mutation: () => Promise<T>) => mutation());
+    const deps = makeDeps({ runConfigMutation });
+    const result = await applySettingsWrite({ publicReadOnly: true, repoPickerMode: 'repos' }, deps);
+    expect(result.ok).toBe(true);
+    expect(runConfigMutation).toHaveBeenCalledOnce();
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ publicReadOnly: true });
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ repoPickerMode: 'repos' });
+  });
+
   it('preserves separator whitespace in groupNamePrefix', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ groupNamePrefix: '[AI] ' }, deps);
@@ -171,6 +187,13 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ chatBotDiscovery: false });
   });
 
+  it.each([false, true])('writes cardBrandLabel=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ cardBrandLabel: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ cardBrandLabel: enabled });
+  });
+
   it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ noVisibleOutputHint: true }, deps);
@@ -183,6 +206,13 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: enabled }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ autoUpgradeCodexSessions: enabled });
+  });
+
+  it.each([false, true])('writes reapOrphanTmuxServers=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ reapOrphanTmuxServers: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ reapOrphanTmuxServers: enabled });
   });
 
   it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
@@ -205,6 +235,47 @@ describe('applySettingsWrite happy paths', () => {
     const result = await applySettingsWrite({ hideCodexRateLimitModelNudge: enabled }, deps);
     expect(result.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ hideCodexRateLimitModelNudge: enabled });
+  });
+
+  it('terminalises daemon queues only after persisting XPI=false', async () => {
+    const calls: string[] = [];
+    const deps = makeDeps({
+      mergeDashboardConfig: vi.fn((patch) => {
+        calls.push(`persist:${String(patch.crossPrincipalInterruption)}`);
+        return patch;
+      }),
+      disableCrossPrincipalInterruptionOnAllDaemons: vi.fn(async () => {
+        calls.push('disable-runtime');
+      }),
+    });
+    const r = await applySettingsWrite({ crossPrincipalInterruption: false }, deps);
+    expect(r.ok).toBe(true);
+    expect(calls).toEqual(['persist:false', 'disable-runtime']);
+  });
+
+  it('does not run disable cleanup when XPI is enabled or unrelated settings change', async () => {
+    const disable = vi.fn(async () => undefined);
+    const deps = makeDeps({ disableCrossPrincipalInterruptionOnAllDaemons: disable });
+    expect((await applySettingsWrite({ crossPrincipalInterruption: true }, deps)).ok).toBe(true);
+    expect((await applySettingsWrite({ publicReadOnly: true }, deps)).ok).toBe(true);
+    expect(disable).not.toHaveBeenCalled();
+  });
+
+  it('does not claim success when runtime XPI cleanup fails after persistence', async () => {
+    const calls: string[] = [];
+    const deps = makeDeps({
+      mergeDashboardConfig: vi.fn((patch) => {
+        calls.push(`persist:${String(patch.crossPrincipalInterruption)}`);
+        return patch;
+      }),
+      disableCrossPrincipalInterruptionOnAllDaemons: vi.fn(async () => {
+        calls.push('disable-runtime');
+        throw new Error('daemon cleanup incomplete');
+      }),
+    });
+    await expect(applySettingsWrite({ crossPrincipalInterruption: false }, deps))
+      .rejects.toThrow('daemon cleanup incomplete');
+    expect(calls).toEqual(['persist:false', 'disable-runtime']);
   });
 
   it('rejects malformed model-nudge settings without writing', async () => {
@@ -278,6 +349,23 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ workflow: { enabled: 'yes' } }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_workflow_enabled' });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('writes multiTopic.enabled toggle while preserving sibling keys', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ multiTopic: { enabled: false } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ multiTopic: { enabled: false, futureFlag: 1 } });
+  });
+
+  it('rejects invalid multiTopic patches', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ multiTopic: 'off' }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic' });
+    expect(await applySettingsWrite({ multiTopic: { enabled: 'no' } }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic_enabled' });
   });
 
   it('writes vcMeetingAgent.enabled toggle via mergeGlobalConfig', async () => {
@@ -469,6 +557,15 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.error).toBe('invalid_chatBotDiscovery');
   });
 
+  it('rejects non-boolean cardBrandLabel → invalid_cardBrandLabel (no merge)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ cardBrandLabel: 'off' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_cardBrandLabel');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
   it('rejects non-boolean noVisibleOutputHint → invalid_noVisibleOutputHint', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ noVisibleOutputHint: 'yes' }, deps);
@@ -482,6 +579,13 @@ describe('applySettingsWrite — validation errors', () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: value }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_autoUpgradeCodexSessions' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', 1, null])('rejects invalid reapOrphanTmuxServers=%s without writing settings', async (value) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ reapOrphanTmuxServers: value }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_reapOrphanTmuxServers' });
     expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
@@ -948,6 +1052,52 @@ describe('applySettingsWrite — oauthRedirectBase', () => {
   }
 });
 
+// httpProxy 是二进制自更新从 GitHub Releases 下载时的出站代理（release-download 用它建
+// CONNECT 隧道，且总是以明文 HTTP 连代理）。只收 http://[user:pass@]host[:port]，凭证允许，
+// https:// / 路径 / query 拒。
+describe('applySettingsWrite — httpProxy', () => {
+  for (const [label, value, stored] of [
+    ['a plain http proxy', 'http://127.0.0.1:7890', 'http://127.0.0.1:7890'],
+    ['embedded credentials', 'http://user:p%40ss@proxy.example.com:8080', 'http://user:p%40ss@proxy.example.com:8080'],
+    ['surrounding whitespace and trailing slashes', '  http://127.0.0.1:7890//  ', 'http://127.0.0.1:7890'],
+  ] as Array<[string, string, string]>) {
+    it(`persists ${label}`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(true);
+      expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ httpProxy: stored });
+    });
+  }
+
+  for (const value of ['', '   ', null]) {
+    it(`clears the setting on ${JSON.stringify(value)}`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(true);
+      expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ httpProxy: null });
+    });
+  }
+
+  for (const [label, value] of [
+    ['a bare host without a scheme', '127.0.0.1:7890'],
+    ['a socks scheme (release-download only tunnels over HTTP CONNECT)', 'socks5://127.0.0.1:1080'],
+    ['an https:// proxy (the CONNECT tunnel dials the proxy over plain HTTP)', 'https://proxy.example.com:8443'],
+    ['a path', 'http://127.0.0.1:7890/proxy'],
+    ['a query string', 'http://127.0.0.1:7890?x=1'],
+    ['a scheme with no host', 'http://'],
+    ['a non-string value', 7890],
+  ] as Array<[string, unknown]>) {
+    it(`rejects ${label} → invalid_httpProxy (no write)`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('unreachable');
+      expect(r.error).toBe('invalid_httpProxy');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    });
+  }
+});
+
 describe('applySettingsWrite — IO surface', () => {
   it('does not touch maintenance merge when only dashboard fields are present', async () => {
     const deps = makeDeps();
@@ -981,6 +1131,73 @@ describe('applySettingsWrite — IO surface', () => {
     const deps = makeDeps();
     await applySettingsWrite({ publicReadOnly: true }, deps);
     expect(deps.readGlobalConfig).not.toHaveBeenCalled(); // only called for autoUpdate cross-check
+  });
+});
+
+describe('applySettingsWrite — scheduleBotGrants', () => {
+  const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_a', 'cli_b'],
+    chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+
+  it('writes the switches and the whole grant list through the bot-grant writer', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleBotGrants: {
+      createEnabled: true, selfManageEnabled: false, grants: [grant], baseGrants: [] } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({
+      createEnabled: true, selfManageEnabled: false, botGrants: [grant] });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('clears the list with an empty array', async () => {
+    const deps = makeDeps();
+    expect((await applySettingsWrite({ scheduleBotGrants: { grants: [], baseGrants: [] } }, deps)).ok).toBe(true);
+    expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({ botGrants: [] });
+  });
+
+  it.each([
+    [{ createEnabled: 'yes' }, 'invalid_scheduleBotGrants_createEnabled'],
+    [{ selfManageEnabled: 1 }, 'invalid_scheduleBotGrants_selfManageEnabled'],
+    [{}, 'invalid_scheduleBotGrants'],
+    [{ grants: 'team' }, 'invalid_scheduleBotGrants_grant'],
+    // An app-scoped open_id is never a cross-app controller identity.
+    [{ grants: [{ ...grant, controllerUnionId: 'ou_admin' }] }, 'invalid_scheduleBotGrants_grant'],
+    [{ grants: [grant, { ...grant, sourceAppId: 'cli_other' }] }, 'scheduleBotGrants_duplicate_id'],
+    // Shares source, chat and target cli_b with `team`: matching would be ambiguous.
+    [{ grants: [grant, { ...grant, id: 'other', targetAppIds: ['cli_b', 'cli_c'] }] }, 'scheduleBotGrants_overlap'],
+  ])('refuses %j without writing anything', async (scheduleBotGrants, error) => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ scheduleBotGrants }, deps)).toEqual({ ok: false, error });
+    expect(deps.writeScheduleBotGrantConfig).not.toHaveBeenCalled();
+  });
+
+  it('accepts grants that share a source but differ in chat or target', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleBotGrants: { baseGrants: [], grants: [grant,
+      { ...grant, id: 'other-chat', chatIds: ['oc_other'] },
+      { ...grant, id: 'other-target', targetAppIds: ['cli_c'] }] } }, deps);
+    expect(r.ok).toBe(true);
+  });
+
+  // A page that loaded before another tab (or a hand edit) revoked a grant
+  // must not write that grant back with its stale copy of the list.
+  it('refuses a list edited from a copy that is no longer what is on disk', async () => {
+    const other = { ...grant, id: 'other', chatIds: ['oc_other'] };
+    const deps = makeDeps({ readGlobalConfig: vi.fn(() => ({ scheduleDelegation: { botGrants: [grant] } })) });
+    for (const baseGrants of [[grant, other], [], undefined, ['team']]) {
+      expect(await applySettingsWrite({ scheduleBotGrants: { grants: [grant, other], baseGrants } }, deps))
+        .toEqual({ ok: false, error: 'scheduleBotGrants_stale' });
+    }
+    expect(deps.writeScheduleBotGrantConfig).not.toHaveBeenCalled();
+    // The same edit made on the current list goes through; the switches need no base.
+    expect((await applySettingsWrite({ scheduleBotGrants: { grants: [grant, other], baseGrants: [grant] } }, deps)).ok).toBe(true);
+    expect((await applySettingsWrite({ scheduleBotGrants: { createEnabled: false } }, deps)).ok).toBe(true);
+  });
+
+  it('does not write the grants when another field of the same request is invalid', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ scheduleBotGrants: { grants: [grant], baseGrants: [] }, repoPickerMode: 'bad' }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_repoPickerMode' });
+    expect(deps.writeScheduleBotGrantConfig).not.toHaveBeenCalled();
   });
 });
 
@@ -1080,5 +1297,108 @@ describe('applySettingsWrite — hostOverloadAlert', () => {
     }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ enabled: false });
+  });
+});
+
+describe('applySettingsWrite promptCache', () => {
+  it('writes a normalized block and clears it with null', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      promptCache: { ttl: '1h', keepalive: { enabled: true, activeHours: '10:00-23:00' } },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      promptCache: { ttl: '1h', keepalive: { enabled: true, activeHours: '10:00-23:00' } },
+    });
+    const cleared = await applySettingsWrite({ promptCache: null }, deps);
+    expect(cleared.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenLastCalledWith({ promptCache: null });
+  });
+
+  it('rejects typos instead of silently falling back to defaults', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ promptCache: { keepalive: { idleMinutes: 90 } } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_promptCache' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('applySettingsWrite sessionCleanup', () => {
+  it('writes a full sessionCleanup block', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    });
+  });
+
+  it('merges a partial patch over the stored block (toggle only keeps threshold)', async () => {
+    const deps = makeDeps();
+    // Seed stored config with an existing block.
+    deps.mergeGlobalConfig({ sessionCleanup: { enabled: false, olderThanHours: 24, intervalMinutes: 15 } });
+    (deps.mergeGlobalConfig as ReturnType<typeof vi.fn>).mockClear();
+    const r = await applySettingsWrite({ sessionCleanup: { enabled: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { enabled: true, olderThanHours: 24, intervalMinutes: 15 },
+    });
+  });
+
+  it('rejects an unsupported olderThanHours', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { olderThanHours: 12 } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_olderThanHours' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a sub-floor intervalMinutes', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { intervalMinutes: 1 } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_intervalMinutes' });
+  });
+
+  it('rejects a non-boolean enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { enabled: 'yes' } as never }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_enabled' });
+  });
+
+  it('rejects a non-object sessionCleanup', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: 'nope' as never }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup' });
+  });
+
+  it('rejects an empty sessionCleanup patch', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: {} }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup' });
+  });
+
+  it('floors a fractional intervalMinutes', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { intervalMinutes: 90.7 } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { intervalMinutes: 90 },
+    });
+  });
+});
+
+
+describe('Codex idle cleanup setting', () => {
+  it('accepts a standalone opt-in patch and preserves scheduled cleanup fields', async () => {
+    const deps = makeDeps({ readGlobalConfig: () => ({ sessionCleanup: { enabled: true, olderThanHours: 72 } }) });
+    const r = await applySettingsWrite({ sessionCleanup: { archiveCodex: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ sessionCleanup: { enabled: true, olderThanHours: 72, archiveCodex: true } });
+  });
+  it('rejects nonboolean values', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ sessionCleanup: { archiveCodex: 'true' } }, deps)).toEqual({ ok: false, error: 'invalid_sessionCleanup_archiveCodex' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 });

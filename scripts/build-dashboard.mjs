@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { cp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync, watch } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { build } from 'esbuild';
+
+const require = createRequire(import.meta.url);
 
 const webSrc = 'src/dashboard/web';
 const outDir = 'dist/dashboard-web';
@@ -33,11 +36,12 @@ async function copyStatic() {
     cp(join(webSrc, 'index.html'), join(outDir, 'index.html')),
     cp(join(webSrc, 'style.css'), join(outDir, 'style.css')),
     cp(join(webSrc, 'design-tokens.css'), join(outDir, 'design-tokens.css')),
+    // 「终端」页的 xterm 样式：页面懒加载时以 /assets/xterm.css 挂进来（JS 走 esbuild 分包）。
+    cp(require.resolve('@xterm/xterm/css/xterm.css'), join(outDir, 'xterm.css')),
     cp(join(webSrc, 'brand-logo.png'), join(outDir, 'brand-logo.png')),
     cp(join(webSrc, 'favicon.png'), join(outDir, 'favicon.png')),
     cp(join(webSrc, 'apple-touch-icon.png'), join(outDir, 'apple-touch-icon.png')),
     copyIfExists(join(webSrc, 'skins'), join(outDir, 'skins'), { recursive: true }),
-    copyIfExists(join(webSrc, 'game'), join(outDir, 'game'), { recursive: true }),
   ]);
 }
 

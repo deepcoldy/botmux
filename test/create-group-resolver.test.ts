@@ -13,6 +13,7 @@ import { describe, it, expect } from 'vitest';
 import {
   createGroupCompletionStatus,
   resolveBotRefs,
+  resolveChatMode,
   resolveKickoff,
   shouldWriteCreateGroupCompletionStatus,
 } from '../src/cli/create-group-resolver.js';
@@ -38,6 +39,25 @@ describe('resolveBotRefs', () => {
   it('resolves botName case-insensitively', () => {
     const r = resolveBotRefs(['claude', 'CODEX'], [CFG_CLAUDE, CFG_CODEX], [INFO_CLAUDE, INFO_CODEX]);
     expect(r.larkAppIds).toEqual(['cli_claude_1', 'cli_codex_1']);
+  });
+
+  it.each([42, {}, true])('ignores a truthy non-string botName before a valid match: %j', botName => {
+    const r = resolveBotRefs(
+      ['Codex'],
+      [CFG_CODEX],
+      [{ larkAppId: 'cli_malformed', botName }, INFO_CODEX],
+    );
+    expect(r.larkAppIds).toEqual(['cli_codex_1']);
+    expect(r.invalid).toEqual([]);
+  });
+
+  it('ignores null and scalar registry rows before a valid match', () => {
+    const r = resolveBotRefs(
+      ['Codex'],
+      [CFG_CODEX],
+      [null, 42, 'x', INFO_CODEX],
+    );
+    expect(r.larkAppIds).toEqual(['cli_codex_1']);
   });
 
   it('resolves multiple bots preserving input order', () => {
@@ -120,6 +140,28 @@ describe('resolveBotRefs', () => {
   });
 });
 
+describe('resolveChatMode', () => {
+  it('omits chatMode when the flag is absent or blank', () => {
+    expect(resolveChatMode(undefined)).toEqual({ ok: true });
+    expect(resolveChatMode('')).toEqual({ ok: true });
+    expect(resolveChatMode('   ')).toEqual({ ok: true });
+  });
+
+  it('accepts group and topic, trimming and lowercasing', () => {
+    expect(resolveChatMode('group')).toEqual({ ok: true, chatMode: 'group' });
+    expect(resolveChatMode('topic')).toEqual({ ok: true, chatMode: 'topic' });
+    expect(resolveChatMode('  TOPIC ')).toEqual({ ok: true, chatMode: 'topic' });
+  });
+
+  it('rejects any other value (including p2p, which is not a creatable group)', () => {
+    for (const bad of ['p2p', 'thread', 'Topic Group', '话题']) {
+      const r = resolveChatMode(bad);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain('--chat-mode');
+    }
+  });
+});
+
 describe('resolveKickoff', () => {
   const selected = ['cli_creator', 'cli_reviewer'];
   const botInfo = [
@@ -184,7 +226,7 @@ describe('createGroupCompletionStatus', () => {
     });
   });
 
-  it('reports completion only after collaboration and requested kickoff both succeed', () => {
+  it('reports completion once a requested kickoff was sent', () => {
     expect(createGroupCompletionStatus({
       chatId: 'oc_created',
       collaborationReady: true,
@@ -196,6 +238,11 @@ describe('createGroupCompletionStatus', () => {
       collaborationReady: true,
       kickoffAccepted: true,
     });
+  });
+
+  it('reports missing bot-to-bot grants without failing the created group', () => {
+    // The grants are best-effort: a non-zero exit here would make callers that
+    // retry on failure create a second group.
     expect(createGroupCompletionStatus({
       chatId: 'oc_created',
       collaborationReady: false,
@@ -203,7 +250,18 @@ describe('createGroupCompletionStatus', () => {
       kickoffMessageId: null,
       kickoffError: null,
     })).toMatchObject({
-      success: false,
+      success: true,
+      collaborationReady: false,
+      kickoffAccepted: true,
+    });
+    expect(createGroupCompletionStatus({
+      chatId: 'oc_created',
+      collaborationReady: false,
+      kickoffRequested: true,
+      kickoffMessageId: 'om_kickoff',
+      kickoffError: null,
+    })).toMatchObject({
+      success: true,
       collaborationReady: false,
       kickoffAccepted: true,
     });

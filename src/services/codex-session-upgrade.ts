@@ -7,6 +7,7 @@ import { isNewerVersion } from '../core/update-check.js';
 import { readProcessStartIdentity } from '../utils/process-identity.js';
 import { readCmdline } from '../core/session-discovery.js';
 import { parseWrapperCliEntry } from '../utils/local-dev-update.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 
 const exec = promisify(execFile);
 const observedProcesses = new Map<number, CodexProcess>();
@@ -59,7 +60,7 @@ export function upgradeProcessTree(rows: readonly ProcessRow[], roots: readonly 
 /** Failure is unknown, never an empty (apparently idle) process tree. */
 export async function readUpgradeProcessTable(): Promise<ProcessRow[]> {
   const { stdout } = await exec('/bin/ps', ['-axo', 'pid=,ppid=,comm='], {
-    timeout: 5_000, maxBuffer: 4 * 1024 * 1024,
+    timeout: 5_000, maxBuffer: PROCESS_TABLE_MAX_BUFFER,
   });
   const rows = parseUpgradeProcessTable(stdout);
   if (!rows.length) throw new Error('Unable to inspect Codex process tree');

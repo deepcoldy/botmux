@@ -8,7 +8,6 @@ import {
   SavedWorkflowConflictError,
   SavedWorkflowPermissionError,
   appendSavedWorkflowRevision,
-  archiveSavedWorkflow,
   createOrRecoverExactSavedWorkflow,
   verifyExactSavedWorkflowOrigin,
   createSavedWorkflow,
@@ -16,7 +15,6 @@ import {
   loadCurrentSavedWorkflow,
   publishLatestSavedWorkflow,
   readSavedWorkflowRevision,
-  resolveSavedWorkflowRef,
   savedWorkflowMetadataPath,
   savedWorkflowRevisionPath,
   workflowLibraryRoot,
@@ -144,8 +142,8 @@ describe('v3 Saved Workflow library store', () => {
       .toBe(appended.revision.revisionId);
   });
 
-  it('enforces owner-only mutation and preserves history when archiving', async () => {
-    const created = await createSavedWorkflow(dataDir, {
+  it('enforces owner-only mutation', async () => {
+    await createSavedWorkflow(dataDir, {
       workflowId: IDS.one,
       displayName: '周报',
       owner: OWNER,
@@ -157,17 +155,9 @@ describe('v3 Saved Workflow library store', () => {
       actor: OTHER,
       revision: revisionDraft('越权修改'),
     })).rejects.toBeInstanceOf(SavedWorkflowPermissionError);
-
-    const archived = await archiveSavedWorkflow(dataDir, IDS.one, {
-      actor: OWNER,
-      now: new Date('2026-07-10T11:00:00.000Z'),
-    });
-    expect(archived.status).toBe('archived');
-    expect((await readSavedWorkflowRevision(dataDir, IDS.one, created.revision.revisionId)).revisionId)
-      .toBe(created.revision.revisionId);
   });
 
-  it('filters chat scope, keeps global visible, and reports ambiguous names instead of guessing', async () => {
+  it('filters chat scope and keeps global visible', async () => {
     await createSavedWorkflow(dataDir, {
       workflowId: IDS.one,
       displayName: '周报',
@@ -194,17 +184,9 @@ describe('v3 Saved Workflow library store', () => {
     const inA = await listSavedWorkflows(dataDir, { chatId: 'oc_a', actor: OWNER });
     expect(inA.entries.map((entry) => entry.workflowId).sort()).toEqual([IDS.one, IDS.two]);
     expect(inA.invalid).toEqual([]);
-    expect(await resolveSavedWorkflowRef(dataDir, '周报', { chatId: 'oc_a', actor: OWNER }))
-      .toMatchObject({ kind: 'ambiguous', matches: [{ workflowId: IDS.one }, { workflowId: IDS.two }] });
-    expect(await resolveSavedWorkflowRef(dataDir, 'weekly', { chatId: 'oc_b', actor: OWNER }))
-      .toMatchObject({ kind: 'resolved', metadata: { workflowId: IDS.one } });
-    expect(await resolveSavedWorkflowRef(dataDir, IDS.three, { chatId: 'oc_a', actor: OWNER }))
-      .toEqual({ kind: 'not_found' });
 
     const fromOtherApp = await listSavedWorkflows(dataDir, { chatId: 'oc_a', actor: OTHER_APP });
     expect(fromOtherApp.entries).toEqual([]);
-    expect(await resolveSavedWorkflowRef(dataDir, IDS.one, { chatId: 'oc_a', actor: OTHER_APP }))
-      .toEqual({ kind: 'not_found' });
     expect((await listSavedWorkflows(dataDir, { chatId: 'oc_a' })).entries).toEqual([]);
   });
 

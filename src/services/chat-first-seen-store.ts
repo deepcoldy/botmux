@@ -13,9 +13,11 @@
  * `${config.session.dataDir}/chat-first-seen-${appId}.json`, written
  * atomically via tmp + rename.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 import { logger } from '../utils/logger.js';
 
 let firstSeen: Map<string, number> = new Map();
@@ -48,27 +50,22 @@ function ensureDir(): void {
 function load(): void {
   if (loaded) return;
   ensureDir();
-  const fp = getFilePath();
-  if (existsSync(fp)) {
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, number>;
-      firstSeen = new Map(Object.entries(data));
-    } catch (err) {
-      logger.error(`[chat-first-seen] failed to load ${fp}: ${err}`);
-      firstSeen = new Map();
-    }
-  }
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次 save 覆盖，把全部 firstSeenAt 抹掉），
+  // 见 utils/json-file.ts。
+  const data = readJsonFileSoft<Record<string, number>>(getFilePath(), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'chat-first-seen-store',
+  });
+  firstSeen = new Map(Object.entries(data));
   loaded = true;
 }
 
 function save(): void {
   ensureDir();
-  const fp = getFilePath();
-  const tmpFp = fp + '.tmp';
   const obj: Record<string, number> = {};
   for (const [k, v] of firstSeen) obj[k] = v;
-  writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
-  renameSync(tmpFp, fp);
+  atomicWriteFileSync(getFilePath(), JSON.stringify(obj, null, 2), { followTargetSymlink: false });
 }
 
 /**

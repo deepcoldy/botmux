@@ -1,24 +1,47 @@
 # Session Adopt
 
-Seamlessly adopt a CLI process that's **already running in your local tmux** into botmux, so you can view progress and interact via Lark on your phone. Typical scenario: Claude Code is running halfway through a task in the tmux on your office computer and you have to leave — send `/adopt` from Lark on your phone and keep watching and sending.
+Seamlessly adopt a CLI process that's **already running in tmux, Zellij, Herdr, or Orca** into botmux, so you can view progress and interact via Lark on your phone. If a CLI is halfway through a task when you have to leave, send `/adopt` from Lark and keep watching and sending.
 
 <video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421531476_adopt-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
 
 ```
-/adopt              # Scan the local tmux and pop up a selection card
+/adopt              # Scan adoptable sessions and pop up a selection card
 /adopt 0:2.0        # Adopt the specified tmux pane directly (session:window.pane)
+/adopt orca:term_xxx # Adopt the specified Orca terminal directly
 ```
 
 > The selection card lists only sessions for the **CLI this bot is bound to** (a Pi bot won't list Codex/TRAE panes), and excludes botmux's own `bmx-*` persistent sessions.
 
+For tmux, Zellij, and Herdr, picker headings show the workspace while “Target” shows the session/pane locator. Orca headings show the terminal or CLI session title directly, avoiding a duplicate of the working path below. Lists and restore logs retain the title snapshot from adoption; later renames never affect handle identity checks. Orca's internal handle remains the confirm/restore key but is not shown to users.
+
+> **Orca (experimental)**: Current coverage includes Orca server and same-host SSH relay. Cross-host relays still require the desktop client to remain online. Compatibility can vary with Orca/relay versions, terminal redraw behavior, and each CLI's transcript format; after an upgrade, re-adopt the session and report version details if discovery, rendering, or structured replies regress.
+
+Orca supports server mode (a persistent orcad on Linux, with its CLI at `~/.orca/cli/bin/orca`) and SSH-relay mode. When Botmux and the SSH terminal run on the same Linux host, Botmux connects directly to the local relay that owns the original PTY and prefers this route over the desktop CLI. You can close your Mac and then send `/adopt` to continue the original session; discovery, validation, and input work without the desktop client. Cross-host SSH relays still use the desktop CLI and require the desktop to stay connected. Adoption checks the terminal handle, PTY incarnation, workspace, and local process ownership. Older relays without incarnation metadata cannot use direct control. Sessions previously adopted through the desktop relay need to be adopted again once to select the direct local route.
+
+Web Terminal retains text screen snapshots: viewing and input work, while source colors, exact cursor state, and mouse modes are not preserved. After desktop disconnection, local relays reconstruct the screen from retained output; a replay beginning partway through a redraw can leave the screen incomplete. Structured replies use the exact CLI process and transcript binding. Trae, Claude Code, and Codex also reconstruct scrollable user/assistant history from that transcript.
+
+MTR, Hermes, and other unverified CLIs currently provide basic terminal access only: the live TUI, Lark input, and Web Terminal remain available, but structured transcript replies and scrollable history are not guaranteed. This is a transcript-ownership limitation, not a terminal I/O limitation. MTR's cwd fallback can be ambiguous when several sessions share one directory, while an externally started Hermes session has no Botmux session marker. Botmux does not guess from the newest session in the same directory because that could expose another terminal's conversation.
+
 ## It's a "bridge," not a takeover
 
-Adopt uses a **zero-touch bridge**: botmux only observes the pane out of band (`tmux pipe-pane` to read output, `send-keys` to write input) and **never attaches, zooms, or groups** your local tmux — your session in iTerm2 is unaffected the whole time.
+Adopt uses a **zero-touch bridge**: botmux observes and writes to the selected terminal out of band and **never changes the original terminal's focus, layout, or size**. Your local terminal and Orca UI remain unaffected.
 
 - **Shared mode**: after adopting, the local terminal (e.g., iTerm2) and Lark sync bidirectionally — the streaming card shows terminal output in real time, and input from the Lark chat box passes straight through to the terminal. The local tmux stays connected and untouched throughout.
 - **Safe disconnect**: tap "⏏ Disconnect" on the streaming card (or send `/close`), and botmux stops observing and tears down only its own side's worker — it **never ends your CLI**; the original process keeps running in your local tmux.
 
 > ⚠️ The old "🔄 Adopt Over" button on the card is **retired**: it's no longer rendered in bridge mode, and clicking it on a historical card is a no-op. Full rebuild into a standard botmux session via `--resume` (`/adopt --takeover`) is still on the roadmap and not yet shipped. Today, adopt is always the "shared bridge" form.
+
+## Codex shared background server compatibility
+
+When Codex uses a shared background server, BotMux still sends input to the original tmux pane. On adoption and before each message, if the foreground process does not own a rollout file, BotMux reads the current thread ID from the live status line for submission confirmation and reply observation. Enable `thread-id` (legacy name `session-id`) in Codex's `/statusline` at the end of the list by default. Keep the full ID visible by widening the pane or reducing other display items if necessary. When no complete ID is visible, BotMux tries to locate the config using the original Codex process environment (`CODEX_HOME` or that process’s `HOME/.codex`) and places the ID last in `tui.status_line` (preserving an existing ID alias and removing duplicates). Existing items, comments, and other settings are preserved; when no custom list exists, the built-in default items are retained. Before the first edit, the original file is backed up with the suffix `.botmux-statusline.bak`. If the directory cannot be identified, the layout cannot be edited safely, or writing fails, BotMux preserves the original file and provides manual instructions.
+
+BotMux reports whether the config was updated, already configured, or could not be changed. Saving the file does not mean the running Codex TUI has applied it: future launches using that config will read the setting; for the current session, enable the ID in `/statusline` and save, widening the pane if necessary. No new session is needed, and BotMux does not restart the original Codex process.
+
+BotMux never automatically types `/status`. Even after saving the config, it stops before writing the message until the live status line exposes a complete ID. This does not require `existingAppServer`; older or embedded runtimes retain process-owned rollout discovery without a version setting.
+
+If the composer has a draft, a dialog or loading state is present, or the terminal layout cannot be recognized reliably, BotMux also stops before writing the message. Resolve the state in the original Terminal before retrying. After a local `/new` or `/resume`, the next Lark input reads the ID again and switches the reply observer.
+
+If foreground rollout enumeration is unavailable (for example, macOS without `lsof`), BotMux preserves the legacy discovery path. Live status-line identity is required only when enumeration confirms that the foreground owns no rollout files. Both the inline layout and the separate status/hints rows are supported, including busy spinners; UUIDs embedded in working-directory paths are not treated as thread IDs.
 
 ## Boundaries and caveats
 
@@ -28,6 +51,7 @@ An adopted session's lifecycle lives **on your machine**, outside botmux's contr
 - **Cannot resume**: an adopted session doesn't support `--resume` rebuild.
 - **Ends when the CLI exits**: in adopt mode botmux does **not** auto-restart — once the adopted CLI exits on its own, the session ends with it (card frozen, worker reaped) rather than respawning like a persistent session.
 - **Sandbox bots can't adopt**: a sandbox has to wrap a CLI it starts from scratch and can't wrap an already-running process (fail-closed rejection).
+- **Orca identity must be verifiable**: a target must expose at least an incarnation or PTY identity. Targets without stable identity are not listed or restored, preventing a reused terminal handle from receiving input.
 - **Restore after a daemon restart is careful**: on restart botmux first re-validates whether the adopted host CLI is still alive — it only closes the session if the target is confirmed gone; on an inconclusive (transient) probe it keeps the session closed and **re-validates on the next restore pass (e.g. another daemon restart)**, not automatically when the next message arrives.
 
 ## Typical usage

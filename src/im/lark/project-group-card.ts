@@ -1,4 +1,6 @@
+import { t, type Locale } from '../../i18n/index.js';
 import { threadAppLink, type Brand } from './lark-hosts.js';
+import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
   projectRemainingSummary,
   type ProjectGroupState,
@@ -34,6 +36,17 @@ function escapeMarkdown(value: string): string {
 function truncate(value: string, max: number): string {
   const text = value.trim();
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+const TASK_TITLE_MARKER_RE = /\s*\[task:[a-f0-9]{32}\]\s*$/i;
+
+function displayProjectTitle(value: string): string {
+  const title = value.replace(TASK_TITLE_MARKER_RE, '').trim();
+  return truncate(title || '项目进度', 42);
+}
+
+function displayProjectGoal(value: string): string {
+  return truncate(value.replace(/\s+/g, ' ').trim(), 120);
 }
 
 function topicLink(project: ProjectGroupState, item: ProjectWorkstream, brand: Brand): string | undefined {
@@ -78,6 +91,11 @@ function uniquePlanItems(items: string[]): string[] {
 
 function projectProgressSummary(project: ProjectGroupState): string {
   if (project.status === 'completed') return '目标已完成';
+  if (project.workstreams.length === 0) {
+    if (project.blockers.length > 0) return `${project.blockers.length} 项阻塞`;
+    if (project.status === 'paused') return '项目已暂停';
+    return '项目按当前阶段推进';
+  }
   const counts = project.workstreams.reduce((acc, item) => {
     acc[item.status] += 1;
     return acc;
@@ -95,7 +113,7 @@ function projectProgressSummary(project: ProjectGroupState): string {
     }
     return parts.join(' · ');
   }
-  return '等待拆解首批任务';
+  return '项目按当前阶段推进';
 }
 
 function heroElement(label: string, content: string, color: string, background: string): Record<string, unknown> {
@@ -108,6 +126,16 @@ function heroElement(label: string, content: string, color: string, background: 
       { tag: 'markdown', content: `<font color='${color}'>**${label}**</font>`, text_align: 'left', text_size: 'notation' },
       { tag: 'markdown', content: `**${escapeMarkdown(content)}**`, text_align: 'left', text_size: 'heading-3' },
     ],
+  };
+}
+
+/** Replace an obsolete setup guide after the live progress card is published. */
+export function buildProjectGroupStartedNoticeCard(locale?: Locale): Record<string, unknown> {
+  return {
+    schema: '2.0',
+    config: { update_multi: true, summary: { content: t('project.started.summary', undefined, locale) } },
+    header: { template: 'blue', title: { tag: 'plain_text', content: t('project.started.title', undefined, locale) } },
+    body: { elements: [{ tag: 'markdown', content: t('project.started.body', undefined, locale) }] },
   };
 }
 
@@ -192,10 +220,9 @@ function planSurface(
   background: string,
   marker: string,
   items: string[],
-  emptyText: string,
 ): Record<string, unknown> {
   const visible = items.slice(0, 4);
-  const more = items.length > visible.length ? `\n<font color='grey'>另有 ${items.length - visible.length} 项，见下方子任务表</font>` : '';
+  const more = items.length > visible.length ? `\n<font color='grey'>另有 ${items.length - visible.length} 项</font>` : '';
   return {
     tag: 'interactive_container', behaviors: [], width: 'fill', height: 'auto', corner_radius: '8px',
     has_border: false, disabled: false, background_style: background, padding: '10px 12px 10px 12px',
@@ -203,7 +230,7 @@ function planSurface(
     horizontal_align: 'left', vertical_align: 'top', margin: '6px 0px 0px 0px',
     elements: [{
       tag: 'markdown',
-      content: `<font color='${color}'>**${label} · ${items.length}**</font>\n${visible.length > 0 ? visible.map(item => `${marker} ${item}`).join('\n') : `<font color='grey'>${emptyText}</font>`}${more}`,
+      content: `<font color='${color}'>**${label} · ${items.length}**</font>\n${visible.map(item => `${marker} ${item}`).join('\n')}${more}`,
       text_align: 'left', text_size: 'normal', margin: '0px 0px 0px 0px',
     }],
   };
@@ -228,10 +255,14 @@ function planElements(project: ProjectGroupState, brand: Brand): Array<Record<st
       text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
     },
     ...(doing.length > 0
-      ? [planSurface('进行中', 'blue', 'blue-50', '<font color=\'blue\'>●</font>', doing, '当前没有进行中事项')]
+      ? [planSurface('进行中', 'blue', 'blue-50', '<font color=\'blue\'>●</font>', doing)]
       : []),
-    planSurface('待办计划', 'purple', 'grey-50', '<font color=\'purple\'>○</font>', todo, '当前没有待办事项'),
-    planSurface('完成记录', 'green', 'green-50', '<font color=\'green\'>✓</font>', done, '尚无已完成事项'),
+    ...(todo.length > 0
+      ? [planSurface('待办计划', 'purple', 'grey-50', '<font color=\'purple\'>○</font>', todo)]
+      : []),
+    ...(done.length > 0
+      ? [planSurface('完成记录', 'green', 'green-50', '<font color=\'green\'>✓</font>', done)]
+      : []),
   ];
 }
 
@@ -278,7 +309,7 @@ function sectionEnabled(config: ProjectProgressCardConfig, section: ProjectProgr
 function focusElements(project: ProjectGroupState, config: ProjectProgressCardConfig): Array<Record<string, unknown>> {
   return [
     ...(sectionEnabled(config, 'goal')
-      ? [heroElement('目标', project.goal, 'indigo', 'indigo-50')]
+      ? [heroElement('目标', displayProjectGoal(project.goal), 'indigo', 'indigo-50')]
       : []),
     heroElement('当前推进', project.focus || '等待更新', 'blue', 'blue-50'),
   ];
@@ -311,30 +342,25 @@ function statusDashboardBody(context: TemplateBodyContext): Array<Record<string,
     ...planElements(project, brand),
   ];
   if (sectionEnabled(config, 'blockers') && project.blockers.length > 0) body.push(blockerElement(project));
-  if (sectionEnabled(config, 'workstreams')) {
+  if (sectionEnabled(config, 'workstreams') && project.workstreams.length > 0) {
     body.push({
       tag: 'markdown', content: `<font color='blue'>**子任务状态（${project.workstreams.length}）**</font>`,
       text_align: 'left', text_size: 'normal', margin: '12px 0px 0px 0px',
     });
-    if (project.workstreams.length > 0) {
-      body.push({
-        tag: 'table',
-        columns: [
-          { data_type: 'markdown', name: 'wf', display_name: '子任务', horizontal_align: 'left', width: 'auto' },
-          { data_type: 'markdown', name: 'status', display_name: '状态 / 话题', horizontal_align: 'left', width: 'auto' },
-        ],
-        rows: workstreamRows(project, brand), row_height: 'auto',
-        header_style: { text_align: 'left', background_style: 'blue-50', text_color: 'blue', bold: true },
-        page_size: Math.min(10, Math.max(1, project.workstreams.length)), margin: '8px 0px 0px 0px',
-      });
-    } else {
-      body.push({
-        tag: 'markdown', content: "<font color='grey'>尚未派发子任务。使用 botmux dispatch 后会自动登记到这里。</font>",
-        text_align: 'left', text_size: 'normal', margin: '8px 0px 0px 0px',
-      });
-    }
+    body.push({
+      tag: 'table',
+      columns: [
+        { data_type: 'markdown', name: 'wf', display_name: '子任务', horizontal_align: 'left', width: 'auto' },
+        { data_type: 'markdown', name: 'status', display_name: '状态 / 话题', horizontal_align: 'left', width: 'auto' },
+      ],
+      rows: workstreamRows(project, brand), ...TABLE_AUTO_ROW_HEIGHT,
+      header_style: { text_align: 'left', background_style: 'blue-50', text_color: 'blue', bold: true },
+      page_size: Math.min(10, project.workstreams.length), margin: '8px 0px 0px 0px',
+    });
   }
-  if (sectionEnabled(config, 'milestones')) body.push(milestonePanel(project, config.milestonesExpanded));
+  if (sectionEnabled(config, 'milestones') && (project.milestones.length > 0 || project.nextMilestone)) {
+    body.push(milestonePanel(project, config.milestonesExpanded));
+  }
   return body;
 }
 
@@ -355,21 +381,21 @@ function compactListBody(context: TemplateBodyContext): Array<Record<string, unk
     },
   ];
   if (sectionEnabled(config, 'blockers') && project.blockers.length > 0) body.push(blockerElement(project));
-  if (sectionEnabled(config, 'workstreams')) {
-    const rows = project.workstreams.length > 0
-      ? displayWorkstreams(project).map(item => {
-          const status = STATUS_META[item.status];
-          const owner = truncate(item.owners.join('、') || '待认领', 32);
-          const link = topicLink(project, item, brand);
-          return `- <text_tag color='${status.color}'>${status.label}</text_tag> **<font color='indigo'>${escapeMarkdown(workstreamTitle(item))}</font>** · <font color='purple'>${escapeMarkdown(owner)}</font>${link ? ` · ${link}` : ''}`;
-        }).join('\n')
-      : "<font color='grey'>尚未派发子任务。</font>";
+  if (sectionEnabled(config, 'workstreams') && project.workstreams.length > 0) {
+    const rows = displayWorkstreams(project).map(item => {
+      const status = STATUS_META[item.status];
+      const owner = truncate(item.owners.join('、') || '待认领', 32);
+      const link = topicLink(project, item, brand);
+      return `- <text_tag color='${status.color}'>${status.label}</text_tag> **<font color='indigo'>${escapeMarkdown(workstreamTitle(item))}</font>** · <font color='purple'>${escapeMarkdown(owner)}</font>${link ? ` · ${link}` : ''}`;
+    }).join('\n');
     body.push({
       tag: 'markdown', content: `<font color='blue'>**子任务（${project.workstreams.length}）**</font>\n${rows}`,
       text_align: 'left', text_size: 'normal', margin: '10px 0px 0px 0px',
     });
   }
-  if (sectionEnabled(config, 'milestones')) body.push(milestonePanel(project, config.milestonesExpanded));
+  if (sectionEnabled(config, 'milestones') && (project.milestones.length > 0 || project.nextMilestone)) {
+    body.push(milestonePanel(project, config.milestonesExpanded));
+  }
   return body;
 }
 
@@ -395,6 +421,7 @@ export function buildProjectGroupCard(
     : project.status === 'paused'
       ? { label: '已暂停', color: 'neutral', header: 'grey' }
       : { label: '进行中', color: 'blue', header: 'blue' };
+  const title = displayProjectTitle(project.title);
   const body = TEMPLATE_BODY_BUILDERS[config.templateId]({ project, brand, config });
   body.push(
     { tag: 'hr', margin: '12px 0px 0px 0px' },
@@ -409,11 +436,11 @@ export function buildProjectGroupCard(
     config: {
       update_multi: true, compact_width: false, enable_forward: true,
       streaming_mode: false, width_mode: 'fill',
-      summary: { content: truncate(`${project.title} · ${projectProgressSummary(project)} · 当前 ${project.focus}`, 60) },
+      summary: { content: truncate(`${title} · ${projectProgressSummary(project)} · 当前 ${project.focus}`, 60) },
     },
     header: {
       template: statusMeta.header,
-      title: { tag: 'plain_text', content: project.title, text_align: 'left' },
+      title: { tag: 'plain_text', content: title, text_align: 'left' },
       subtitle: { tag: 'plain_text', content: `项目控制面 · 更新于 ${updatedLabel}`, text_align: 'left' },
       text_tag_list: [{
         tag: 'text_tag', text: { tag: 'plain_text', content: statusMeta.label, text_align: 'left' }, color: statusMeta.color,

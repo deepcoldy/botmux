@@ -17,7 +17,6 @@ import {
   normalizeWorkbenchLayout,
   paneTreeForLayout,
   parseWorkbenchHash,
-  safeWorkbenchReturnTo,
   workbenchExternalTerminalHref,
   workbenchListItemHeight,
   workbenchPreviewHref,
@@ -47,8 +46,6 @@ describe('Agent Workbench pure model', () => {
     expect(parseWorkbenchHash('#/agent-workbench/a%2Fb%20c')).toEqual({ surface: 'main', sessionId: 'a/b c' });
     expect(parseWorkbenchHash('#/agent-workbench-dock/a%2Fb%20c')).toEqual({ surface: 'dock', sessionId: 'a/b c' });
     expect(parseWorkbenchHash('#/agent-workbench/%E0%A4%A')).toBeNull();
-    expect(safeWorkbenchReturnTo('/#/agent-workbench-dock/a%2Fb')).toBe('/#/agent-workbench-dock/a%2Fb');
-    expect(safeWorkbenchReturnTo('/#/settings')).toBe('/');
   });
 
   it('keeps a 200px default rail, clamps persistence, and limits the pane tree to Terminal/Web', () => {
@@ -326,7 +323,7 @@ describe('Agent Workbench 六维分组', () => {
       expect(idsIn(perDimension, 'needs-you'), option.value).toEqual(['session-4', 'session-2']);
     }
     expect(WORKBENCH_GROUP_DIMENSIONS.map(option => option.value))
-      .toEqual(['status', 'bot', 'chat', 'kind', 'cli', 'time']);
+      .toEqual(['status', 'bot', 'chat', 'kind', 'cli', 'time', 'worktree']);
     expect(WORKBENCH_GROUP_DIMENSIONS.every(option => isWorkbenchGroupDimension(option.value))).toBe(true);
     for (const bad of ['repo', '', 'STATUS', null, 42, ['bot']]) {
       expect(isWorkbenchGroupDimension(bad), String(bad)).toBe(false);

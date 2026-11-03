@@ -33,7 +33,9 @@ describe('reserved command tables', () => {
   // 链接期就会 SyntaxError（vitest 容忍、bun 不容忍）。故拆到无 mock 的文件里。
 
   it('classifies daemon / passthrough / force-topic / free commands', () => {
+    expect(DAEMON_COMMANDS.has('/stop')).toBe(true);
     expect(reservedCommandKind('/close')).toBe('daemon');
+    expect(reservedCommandKind('/stop')).toBe('daemon');
     expect(reservedCommandKind('/rename')).toBe('daemon');
     expect(reservedCommandKind('/clear')).toBe('passthrough');
     expect(reservedCommandKind('/t')).toBe('force-topic');

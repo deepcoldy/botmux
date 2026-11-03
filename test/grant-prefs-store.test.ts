@@ -163,8 +163,11 @@ describe('grant-prefs store', () => {
       restrictGrantCommands: false,
       autoGrantRequestCards: true,
       p2pOpen: false,
+      grantRequestToOwnerDm: false,
       messageQuotaDefaultLimit: null,
       grantDefaultDurationMs: null,
+      trustSameOwnerBots: true,
+      grantDelegateBots: [],
     });
   });
 
@@ -217,6 +220,142 @@ describe('grant-prefs store', () => {
     expect(disk.restrictGrantCommands).toBe(true);
     expect(disk.p2pOpen).toBe(true);
     expect(registry.getBot('app_default').config.p2pOpen).toBe(true);
+  });
+
+  it('defaults grantRequestToOwnerDm to false when unset', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotGrantPrefs('app_default').grantRequestToOwnerDm).toBe(false);
+  });
+
+  it('persists grantRequestToOwnerDm=true and syncs in-memory config', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotGrantPrefs('app_default', { grantRequestToOwnerDm: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.grantRequestToOwnerDm).toBe(true);
+
+    expect(readConfig().grantRequestToOwnerDm).toBe(true);
+    // 申请卡路由逐条读内存 config：不同步这里，开关要等 daemon 重启才生效。
+    expect(registry.getBot('app_default').config.grantRequestToOwnerDm).toBe(true);
+  });
+
+  it('removes the grantRequestToOwnerDm key when toggled off (keeps bots.json tidy)', async () => {
+    writeConfig({ grantRequestToOwnerDm: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotGrantPrefs('app_default').grantRequestToOwnerDm).toBe(true);
+
+    const r = await store.updateBotGrantPrefs('app_default', { grantRequestToOwnerDm: false });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.grantRequestToOwnerDm).toBe(false);
+
+    expect(readConfig().grantRequestToOwnerDm).toBeUndefined();
+    expect(registry.getBot('app_default').config.grantRequestToOwnerDm).toBeUndefined();
+  });
+
+  it('partial patch preserves an explicit grantRequestToOwnerDm=true', async () => {
+    writeConfig({ grantRequestToOwnerDm: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    await store.updateBotGrantPrefs('app_default', { autoGrantRequestCards: false });
+
+    const disk = readConfig();
+    expect(disk.autoGrantRequestCards).toBe(false);
+    expect(disk.grantRequestToOwnerDm).toBe(true);
+    expect(registry.getBot('app_default').config.grantRequestToOwnerDm).toBe(true);
+  });
+
+  it('defaults trustSameOwnerBots to true when unset (also for an unknown bot)', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotGrantPrefs('app_default').trustSameOwnerBots).toBe(true);
+    expect(store.getBotGrantPrefs('app_unknown').trustSameOwnerBots).toBe(true);
+  });
+
+  it('parses an explicit trustSameOwnerBots=false from bots.json; true is the default and not kept', async () => {
+    writeConfig({ trustSameOwnerBots: false });
+    let { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotGrantPrefs('app_default').trustSameOwnerBots).toBe(false);
+
+    writeConfig({ trustSameOwnerBots: true });
+    ({ registry, store } = await freshModules());
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(registry.getBot('app_default').config.trustSameOwnerBots).toBeUndefined();
+    expect(store.getBotGrantPrefs('app_default').trustSameOwnerBots).toBe(true);
+  });
+
+  it('persists trustSameOwnerBots=false, syncs in-memory config, and drops the key when turned back on', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const off = await store.updateBotGrantPrefs('app_default', { trustSameOwnerBots: false });
+    expect(off.ok && off.prefs.trustSameOwnerBots).toBe(false);
+    expect(readConfig().trustSameOwnerBots).toBe(false);
+    expect(registry.getBot('app_default').config.trustSameOwnerBots).toBe(false);
+
+    // 其它字段的局部修改不能把显式关闭冲掉。
+    await store.updateBotGrantPrefs('app_default', { restrictGrantCommands: true });
+    expect(readConfig().trustSameOwnerBots).toBe(false);
+
+    const on = await store.updateBotGrantPrefs('app_default', { trustSameOwnerBots: true });
+    expect(on.ok && on.prefs.trustSameOwnerBots).toBe(true);
+    expect(readConfig().trustSameOwnerBots).toBeUndefined();
+    expect(registry.getBot('app_default').config.trustSameOwnerBots).toBeUndefined();
+  });
+
+  it('defaults grantDelegateBots to [] when unset (also for an unknown bot)', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotGrantPrefs('app_default').grantDelegateBots).toEqual([]);
+    expect(store.getBotGrantPrefs('app_unknown').grantDelegateBots).toEqual([]);
+  });
+
+  it('persists grantDelegateBots normalized (trim, blank entries dropped, deduped) and syncs in-memory config', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotGrantPrefs('app_default', {
+      grantDelegateBots: [' ou_platform_bot ', '', '   ', 'cli_platform', 'ou_platform_bot'],
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.grantDelegateBots).toEqual(['ou_platform_bot', 'cli_platform']);
+
+    expect(readConfig().grantDelegateBots).toEqual(['ou_platform_bot', 'cli_platform']);
+    // resolveGrantDelegator 读的是内存 config：不同步这里，名单要等 daemon 重启才生效。
+    expect(registry.getBot('app_default').config.grantDelegateBots).toEqual(['ou_platform_bot', 'cli_platform']);
+  });
+
+  it('an empty grantDelegateBots save removes the key (empty list never persisted)', async () => {
+    writeConfig({ grantDelegateBots: ['ou_platform_bot'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    // Sanity: the configured list is parsed before we clear it.
+    expect(store.getBotGrantPrefs('app_default').grantDelegateBots).toEqual(['ou_platform_bot']);
+
+    const r = await store.updateBotGrantPrefs('app_default', { grantDelegateBots: ['  ', ''] });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.grantDelegateBots).toEqual([]);
+
+    expect(readConfig().grantDelegateBots).toBeUndefined();
+    expect(registry.getBot('app_default').config.grantDelegateBots).toBeUndefined();
+
+    // 其它字段的局部修改不能把名单冲掉。
+    await store.updateBotGrantPrefs('app_default', { grantDelegateBots: ['cli_platform'] });
+    await store.updateBotGrantPrefs('app_default', { restrictGrantCommands: true });
+    expect(readConfig().grantDelegateBots).toEqual(['cli_platform']);
   });
 
   it('null defaultLimit deletes messageQuota but preserves quotaState counters', async () => {

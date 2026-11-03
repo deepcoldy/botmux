@@ -2,6 +2,7 @@ import type { Session } from '../types.js';
 import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { normalizeSessionTitle } from './session-board.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 
 export type SessionTitleSource = 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
 
@@ -44,8 +45,11 @@ export function extractBotmuxLarkNativeSessionTitlePrompt(
   mentions?: readonly { name: string }[],
 ): string | undefined {
   if (typeof rawContent !== 'string') return undefined;
+  // 非 bare 路径取 <user_message> 内文（格式块在壳外，天然排除）；bare
+  // （transcript + solo）续轮没有壳、走 rawContent 兜底，先整块剥掉追加在
+  // 正文后的 <botmux_formatting>（连标签带块体），不能让它进语义标题。
   const userMessage = rawContent.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1]
-    ?? rawContent;
+    ?? stripBotmuxDisplayBlocks(rawContent);
   const content = stripLeadingKnownMentions(
     userMessage
       .replace(/^\s*\[用户引用了消息[^\n]*\]\s*$/gm, '')

@@ -15,6 +15,12 @@ import { createPortal } from 'react-dom';
 export type DropdownOption<T extends string> = {
   value: T;
   label: ReactNode;
+  /**
+   * Optional second line under the label, shown in the popup only (the
+   * collapsed trigger keeps rendering `label` alone via dropdownLabel).
+   * Lets option lists double as inline help for hard-to-name settings.
+   */
+  hint?: ReactNode;
   /** Non-selectable informational entry (e.g. a mode the current CLI can't use). */
   disabled?: boolean;
 };
@@ -352,6 +358,48 @@ export function FieldTitle(props: {
   );
 }
 
+/**
+ * 开关行：`<label.toggle-row>` = 复选框 + 滑块 + 「标题（带 ? 提示）+ 可选说明」。
+ * bot-defaults 页与 settings 页共用；两页的差别只在标题用哪一套 FieldTitle
+ * （bot-defaults 的 `bd-*` 页面作用域样式 vs 本文件的 `ui-*`），由 `TitleComponent`
+ * 注入，默认是本文件的 {@link FieldTitle}。
+ */
+export function ToggleRow(props: {
+  checked: boolean;
+  disabled?: boolean;
+  title: ReactNode;
+  help?: ReactNode;
+  description?: ReactNode;
+  className?: string;
+  /** 透传到 `<input data-action>`，供测试/事件委托钉点。 */
+  dataAction?: string;
+  /** 追加到默认 FieldTitle 的 class；使用自定义 `TitleComponent` 时忽略。 */
+  titleClassName?: string;
+  TitleComponent?: (p: { children: ReactNode; help?: ReactNode }) => React.JSX.Element;
+  onChange(checked: boolean): void;
+}): React.JSX.Element {
+  return (
+    <label className={props.className ? `toggle-row ${props.className}` : 'toggle-row'}>
+      <input
+        type="checkbox"
+        data-action={props.dataAction}
+        checked={props.checked}
+        disabled={props.disabled}
+        onChange={event => props.onChange(event.currentTarget.checked)}
+      />
+      <span className="switch" aria-hidden="true" />
+      <span className="toggle-tx">
+        <strong>
+          {props.TitleComponent
+            ? <props.TitleComponent help={props.help}>{props.title}</props.TitleComponent>
+            : <FieldTitle className={props.titleClassName} help={props.help}>{props.title}</FieldTitle>}
+        </strong>
+        {props.description ? <small>{props.description}</small> : null}
+      </span>
+    </label>
+  );
+}
+
 export function OverviewList(props: {
   id?: string;
   className?: string;
@@ -388,6 +436,8 @@ type DropdownMenuProps<T extends string> = {
   value: T;
   options: DropdownOption<T>[];
   onChange: (value: T) => void;
+  /** Manual-save selectors may need to distinguish an explicit same-value choice. */
+  notifyOnReselect?: boolean;
   /** Filter box at the top of the popup, for long option lists (e.g. 20+ CLIs). */
   searchable?: boolean;
   searchPlaceholder?: string;
@@ -544,7 +594,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     setOpen(false);
     // Re-selecting the already-active value is a no-op: close the menu but skip
     // onChange, so auto-saving dropdowns don't fire a redundant write + "saved" flash.
-    if (next === props.value) return;
+    if (next === props.value && !props.notifyOnReselect) return;
     props.onChange(next);
   };
   const queryNorm = query.trim().toLowerCase();
@@ -633,7 +683,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     };
   }, []);
   useEffect(() => {
-    if (!props.disabled) return;
+    if (props.disabled) return;
     if (detailsRef.current?.open) detailsRef.current.open = false;
     // Third programmatic close path — keep it in sync too (see choose()).
     setOpen(false);
@@ -701,7 +751,12 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
             aria-current={props.value === option.value ? 'true' : undefined}
             onClick={() => choose(option.value)}
           >
-            {option.label}
+            {option.hint ? (
+              <span className="sect-sort-option">
+                <span className="sect-sort-option-title">{option.label}</span>
+                <span className="sect-sort-option-hint">{option.hint}</span>
+              </span>
+            ) : option.label}
           </button>
         ))}
         {props.searchable && visibleOptions.length === 0

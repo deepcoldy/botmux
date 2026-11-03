@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   resolveQuoteTarget,
+  shouldSuppressImplicitReplyTarget,
   shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
   classifyMentionIdentifiers,
@@ -9,12 +10,17 @@ import {
   mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
+  parseDiffFlag,
+  diffUsageError,
+  parseUrgentFlag,
+  urgentUsageError,
   managedVcQuoteError,
   managedVcCustomCardError,
   managedVcSendControlError,
   managedVcSendPayloadError,
   containsLarkAtTag,
   neutralizeLarkAtTags,
+  matchUniqueChatMemberOpenId,
 } from '../src/services/send-policy.js';
 
 describe('resolveQuoteTarget', () => {
@@ -43,6 +49,56 @@ describe('resolveQuoteTarget', () => {
 
   it('--top-level never quotes', () => {
     expect(resolveQuoteTarget({ ...base, sendTopLevel: true, sessionQuoteTargetId: 'om_a' })).toBeNull();
+  });
+});
+
+describe('shouldSuppressImplicitReplyTarget', () => {
+  it('drops the implicit reply when an explicit recipient excludes the caller', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: ['ou_actual_handler'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(true);
+  });
+
+  it('keeps the reply when the caller is explicitly included', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: ['ou_triggering_bot', 'ou_other'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(false);
+  });
+
+  it('preserves an explicit --quote', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      explicitQuote: 'om_explicit',
+      mentionOpenIds: ['ou_actual_handler'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(false);
+  });
+
+  it('keeps the default reply when no recipient was selected', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: [],
+      replyTargetSenderOpenId: 'ou_human',
+    })).toBe(false);
+  });
+});
+
+describe('matchUniqueChatMemberOpenId', () => {
+  const members = [
+    { openId: 'ou_owner', name: '汪睿麟' },
+    { openId: 'ou_other', name: '其他人' },
+  ];
+
+  it('resolves an exact unique member name', () => {
+    expect(matchUniqueChatMemberOpenId('汪睿麟', members)).toBe('ou_owner');
+  });
+
+  it('does not guess on missing or ambiguous names', () => {
+    expect(matchUniqueChatMemberOpenId('不存在', members)).toBeUndefined();
+    expect(matchUniqueChatMemberOpenId('同名', [
+      { openId: 'ou_a', name: '同名' },
+      { openId: 'ou_b', name: '同名' },
+    ])).toBeUndefined();
   });
 });
 
@@ -117,6 +173,7 @@ describe('managedVcSendControlError', () => {
       { ...safe, overrideChatId: 'oc_other' },
       { ...safe, sendInto: 'om_other' },
       { ...safe, attentionRequested: true },
+      { ...safe, urgentRequested: true },
     ]) {
       const error = managedVcSendControlError(input);
       if (!error) providerCall();
@@ -365,6 +422,46 @@ describe('attentionUsageError', () => {
   });
 });
 
+describe('parseUrgentFlag', () => {
+  it('defaults a bare flag to in-app Buzz without eating the message', () => {
+    expect(parseUrgentFlag(['--urgent', 'please respond'])).toEqual({
+      requested: true,
+      mode: 'app',
+    });
+  });
+
+  it('accepts explicit app, sms and phone modes', () => {
+    expect(parseUrgentFlag(['--urgent=app'])).toMatchObject({ requested: true, mode: 'app' });
+    expect(parseUrgentFlag(['--urgent=sms'])).toMatchObject({ requested: true, mode: 'sms' });
+    expect(parseUrgentFlag(['--urgent=phone'])).toMatchObject({ requested: true, mode: 'phone' });
+  });
+
+  it('rejects unknown or repeated modes instead of choosing a costly channel', () => {
+    expect(parseUrgentFlag(['--urgent=all']).error).toMatch(/app\|sms\|phone/);
+    expect(parseUrgentFlag(['--urgent', '--urgent=phone']).error).toMatch(/只能指定一次/);
+  });
+});
+
+describe('urgentUsageError', () => {
+  const ok = {
+    requested: true,
+    mentionBack: true,
+    sendTopLevel: false,
+  };
+
+  it('requires the exact turn sender and accepts an ordinary reply', () => {
+    expect(urgentUsageError(ok)).toBeNull();
+    expect(urgentUsageError({ ...ok, mentionBack: false })).toMatch(/--mention-back/);
+  });
+
+  it('rejects detoured and voice sends', () => {
+    expect(urgentUsageError({ ...ok, sendTopLevel: true })).toMatch(/--top-level/);
+    expect(urgentUsageError({ ...ok, overrideChatId: 'oc_other' })).toMatch(/--chat-id/);
+    expect(urgentUsageError({ ...ok, sendInto: 'om_other' })).toMatch(/--into/);
+    expect(urgentUsageError({ ...ok, asVoice: true })).toMatch(/--voice/);
+  });
+});
+
 describe('shouldDropAfterTheFactTopicQuote', () => {
   // 「顶层 @ 之后那条消息才被开成话题」的发送侧半边：quote 会继承被引用消息
   // **此刻**的话题归属，所以必须在这种情况下放弃 quote、改平铺。
@@ -480,5 +577,26 @@ describe('outsidersForMembership', () => {
       new Set<string>(),
     );
     expect(out).toHaveLength(1);
+  });
+});
+
+describe('core --diff policy', () => {
+  it('parses absent, separate and equals values like other send flags', () => {
+    expect(parseDiffFlag(['hello'])).toEqual({ requested: false });
+    expect(parseDiffFlag(['--diff', '/tmp/有 空格.diff'])).toEqual({ requested: true, path: '/tmp/有 空格.diff' });
+    expect(parseDiffFlag(['--diff=/tmp/a.diff'])).toEqual({ requested: true, path: '/tmp/a.diff' });
+  });
+
+  it.each([['--diff'], ['--diff='], ['--diff', '--no-mention'], ['--diff', '-'], ['--diff', '/dev/stdin'], ['--diff=x', '--diff=y']].map(args => ({ args })))('rejects missing/ambiguous paths $args', ({ args }) => {
+    expect(parseDiffFlag(args)).toMatchObject({ requested: true, error: expect.any(String) });
+  });
+
+  it('rejects incompatible display modes without changing ordinary send', () => {
+    const defaults = { requested: true, customCardRequested: false, mediaRequested: false, voice: false, slash: false };
+    expect(diffUsageError(defaults)).toBeNull();
+    for (const option of ['customCardRequested', 'mediaRequested', 'voice', 'slash']) {
+      expect(diffUsageError({ ...defaults, [option]: true })).toEqual(expect.any(String));
+    }
+    expect(diffUsageError({ ...defaults, requested: false, mediaRequested: true })).toBeNull();
   });
 });

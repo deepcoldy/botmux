@@ -2,12 +2,13 @@
  * Team-level bot capability label store.
  * Run: pnpm vitest run test/bot-profile-store.test.ts
  */
-import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { logger } from '../src/utils/logger.js';
 import {
-  getBotProfile, getBotCapability, setBotCapability, clearBotCapability, listBotProfiles,
+  getBotProfile, getBotCapability, setBotCapability, clearBotCapability,
   getBotSpecialties, setBotSpecialties,
 } from '../src/services/bot-profile-store.js';
 
@@ -46,14 +47,6 @@ describe('bot-profile-store', () => {
     expect(clearBotCapability(dataDir, 'app1')).toBe(false); // already gone
   });
 
-  it('listBotProfiles returns the full map', () => {
-    setBotCapability(dataDir, 'app1', 'A');
-    setBotCapability(dataDir, 'app2', 'B');
-    const all = listBotProfiles(dataDir);
-    expect(Object.keys(all).sort()).toEqual(['app1', 'app2']);
-    expect(all.app1.capability).toBe('A');
-  });
-
   it('persists one JSON file per bot', () => {
     setBotCapability(dataDir, 'app1', 'hi', 'ou_caller');
     const raw = JSON.parse(readFileSync(join(dataDir, 'bot-profiles', 'app1.json'), 'utf-8'));
@@ -67,8 +60,7 @@ describe('bot-profile-store', () => {
     setBotCapability(dataDir, 'app1', 'A');
     setBotCapability(dataDir, 'app2', 'B');
     setBotCapability(dataDir, 'app3', 'C');
-    const all = listBotProfiles(dataDir);
-    expect(Object.keys(all).sort()).toEqual(['app1', 'app2', 'app3']);
+    expect(['app1', 'app2', 'app3'].map(id => getBotCapability(dataDir, id))).toEqual(['A', 'B', 'C']);
   });
 });
 
@@ -137,5 +129,24 @@ describe('bot-profile-store specialties', () => {
     raw.specialties = ['ok', 'ok', 42, '', '  dup ', 'dup'];
     writeFileSync(fp, JSON.stringify(raw));
     expect(getBotSpecialties(dataDir, 'app1')).toEqual(['ok', 'dup']);
+  });
+});
+
+describe('bot-profile-store: corrupt file is quarantined, not overwritten', () => {
+  beforeEach(() => { vi.spyOn(logger, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('keeps the corrupt profile as <appId>.json.corrupt-* after the next write', () => {
+    mkdirSync(join(dataDir, 'bot-profiles'), { recursive: true });
+    const corrupt = '{"capability":"后端 bot","specialties":["backend","pr-rev';
+    writeFileSync(join(dataDir, 'bot-profiles', 'app1.json'), corrupt);
+
+    expect(getBotProfile(dataDir, 'app1')).toBeNull(); // degraded read: treated as absent
+    setBotSpecialties(dataDir, 'app1', ['backend']);
+
+    const quarantined = readdirSync(join(dataDir, 'bot-profiles')).filter(f => f.startsWith('app1.json.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+    expect(readFileSync(join(dataDir, 'bot-profiles', quarantined[0]), 'utf-8')).toBe(corrupt);
+    expect(getBotSpecialties(dataDir, 'app1')).toEqual(['backend']);
   });
 });

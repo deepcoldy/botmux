@@ -11,28 +11,40 @@
 | `/repo <路径\|项目名>` | 直接指定路径或 workingDir 下的一级项目名 |
 | `/cd <路径>` | 切换工作目录并重启 CLI 进程 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
+| `/lane status` | 查看本人的独立 principal lane，包括分支、worktree、脏状态和未推送提交数（复用现有 bot 级 XPI 开关启用 principal lane 时可用） |
+| `/lane close` | 安全关闭本人的独立 principal lane：有运行中/排队任务或未提交文件时拒绝，回收前先推送未发布提交，且不会自动合并或删除分支 |
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
+| `/rewind [n\|n confirm]` | 回退会话上下文：不带参数列出最近检查点；`n` 预览、`n confirm` 回退到第 n 轮之前。仅 Claude Code，执行前自动备份 transcript，下条消息冷启动续上下文 |
+| `/idlecompact [on\|off\|分钟]` | 本会话闲置自动压缩：开启后 CLI 闲置 N 分钟（默认 55，可设 1–59）自动发送 `/compact`，趁 1 小时提示缓存未过期压缩上下文；上下文低于 100k tokens 时跳过。不带参数查看状态，等价于流式卡片「⏲️ 闲置自动压缩」按钮。仅 Claude Code 与 tmux 后端的 Codex |
+| `/queue <消息>` | Codex App 活会话：将文字消息作为独立一轮排队，等当前任务结束后执行；空闲时直接开始。支持多行纯文本，暂不支持富文本和附件；需命令操作权限（可通过 canTalkDaemonCommands 授权）。无会话、尚未就绪或其它 CLI 会明确拒绝 开启 trigger-user 按人凭证时会在接纳前刷新本轮身份；但后续消息可覆盖单槽凭证，等待轮的 bytedcli/lark-cli 仍可能被 turn-mismatch 拒绝，需要重试。 |
+| `/stop` | 中断当前 turn，保留会话；等价于流式卡片里的「停止」按钮 |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
-| `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
+| `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令）。关闭后再发消息会开新会话 |
+| `/resume [会话id]` | 本话题/本群**没有会话**时恢复已关闭的会话：不带参数恢复这里最近关闭的一个；带别处的会话 id 时像 `/fork` 一样复制到这里继续（继承完整上下文，原会话不动；仅支持可 fork 的 CLI；Codex / TraeX 的已关闭会话无法确认启动形态，需到原处恢复）。**有会话时**原样交给 CLI 自带的 `/resume`。有对话权限即可使用；跨位置复制凭会话 id（只在原聊天可见、不可猜），信任级别同 `/fork` |
+| `/dismiss` | 专属会话群顶层专用：二次确认后关闭会话并解散整个群（仅建群者本人且具备操作权限；代码与 worktree 保留；私聊、普通群、子话题、adopt 会话不支持）。只想关闭会话、保留群聊请用 `/close` |
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
-| `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（仅 Claude 系 / Codex 终端模式） |
+| `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
 | `/fork --create <群名>` | 不建子话题，改为把当前会话分身到一个新建群 |
 | `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
-| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（仅 Claude 系 / Codex 终端模式；需在源会话所在话题内发起） |
-| `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关 |
-| `/cot` | 思考过程消息开关：`/cot off` 关闭本群的思考气泡，`/cot on` 恢复，`/cot show` 在开关关闭时临时召唤一次当前回合的思考气泡，`/cot status` 查看状态（bot 级总开关 `thinkingCard` 默认 on；支持 claude-code / codex / traex） |
+| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（Claude 系 / Codex 或 TraeX 终端模式；Hybrid RPC / 外部 app-server 会话不支持；需在源会话内发起） |
+| `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关。仅 `allowedUsers` 可执行（开关影响全群，飞书没有按人视图） |
+| `/cot` | CoT 开关：`/cot off` 关闭本群的思考与工具过程，`/cot on` 恢复，`/cot show` 在开关关闭时临时展示一次当前回合，`/cot status` 查看状态（bot 级总开关 `cotEnabled` 默认 on；支持 claude-code / codex / traex）。仅 `allowedUsers` 可执行 |
+| `/mention-mode [always\|topic\|never\|ambient\|status]` | 普通群的 @ 策略：什么时候可以不 @ 也回应。查询需对话权、修改需操作权；**仅普通群可设**（私聊/话题群/会话群会被拒绝）。四模式语义与 8 个免 @ 例外见 [@ 策略](/mention-mode) |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
 | `/quote` | 弹出本群话题选择卡，选一个就把那个话题的聊天记录读进当前会话。补的是飞书本身的缺口——飞书的「引用」只能引单条消息，没有「引用整个话题」的入口。读完只回一句确认（多少条、时间跨度、主题），等你下一条指令 |
 | `/quote <指令>` | 同上，但选完话题直接执行你的指令，省一个来回。话题内容仍然会被明确标注为「资料而不是指令」注入 |
 | `/sessions` | 列出当前机器人在本群的活跃话题会话，可直接回到原话题（旧会话安全降级为定位通知） |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
+| `/dash` | 等价于 `/dashboard link`：私密返回当前 Dashboard 管理首页完整链接 `http://<主机>:<端口>/?t=<token>#/`（普通群仅你可见的临时卡，话题群/话题回复/单聊走私聊；仅 allowedUsers；不创建会话或 worktree；token 轮换后重发即得新链接） |
 | `@机器人 /project enable\|status\|roles\|disable` | 在当前普通群启用、查看、配置 Agent 角色或退出项目群模式（仅 owner/allowedUsers；不占用会话槽位） |
+| `@机器人 /context-sharing on\|off\|status` | 开启、关闭或查看当前群的后台上下文共享（默认关闭；仅 owner/allowedUsers；不创建会话或启动额外模型回合） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/vc prepare <会议链接或会议号>` | 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话 |
 | `/introduce` | 让本群机器人互相登记 `open_id`，用于协作时精确 @ 对方 |
 | `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时）。若该 bot 开启了 `summaryMemory`，总结会追加写入配置的记忆文件（`summaryMemoryPath`，默认 `summary.md`），且 `/summary` 后跟随的文字会作为「只总结从这条起」的硬边界；未开启记忆时，后随文字仅作为本次总结的侧重提示 |
-| `[标题] /t [/repo <仓库>] [/model <模型>] [/effort <档位>] [<首轮任务>]`（别名 `/topic`） | 普通群内强制新开话题，一条消息把标题、仓库、模型、推理强度、首轮任务一次交代完。换行等价于空格；标题写在 `/t` **之前**（飞书话题列表显示的是原消息，机器人改不了）；带空格的路径用双引号；任一项写错整条不生效并回一句用法错误。裸 `/t` 进入话题设置 |
+| `[标题] /t [/repo <仓库> \| /repo wt <仓库> [分支]] [/model <模型>] [/effort <档位>] [<首轮任务>]`（别名 `/topic`） | 普通群内强制新开话题，一条消息把标题、仓库（或在仓库上新建 worktree）、模型、推理强度、首轮任务一次交代完。换行等价于空格；标题写在 `/t` **之前**（飞书话题列表显示的是原消息，机器人改不了）；带空格的路径用双引号；任一项写错整条不生效并回一句用法错误。裸 `/t` 进入话题设置 |
+| `/th [<首轮任务>]`、`/tw [<首轮任务>]`（等价 `/t here …` / `/t worktree …`） | 生命周期变体：`/th` 在**当前群会话的工作目录**里开新话题；`/tw` 先从该目录建一个按话题确定性命名、可被多 bot 共享的 worktree 再开话题。可与标题、`/model`、`/effort` 同用，但**不与 `/repo` 同用**（一个说用当前目录、一个点名仓库，相斥即拒） |
 | `/issue` | 打开 Issue Board 看板卡片，直接在卡片上领取 botmux 平台任务：选好仓库后自动建群、拉你进去、绑定平台任务并开工。需要本机已绑定平台，且发起人在该 bot 的 `allowedUsers` 里；卡片只有发起人能操作 |
 | `/issue status` | 在任务群里发，查这个群绑着哪条平台任务、现在什么状态：平台状态 / 领取人 / 本机绑定 / 有没有回写还堵在发件箱里。只读，同样限该 bot 的 `allowedUsers` |
 | `/issue done` | 在任务群里发，**验收通过**，把任务推到平台终态。agent 交付只能到「待验收」，标完成是人的决策。完成后 claim 被平台清掉，这条领取不能再释放。同样限该 bot 的 `allowedUsers` |
@@ -44,10 +56,11 @@
 
 裸 `/t` 的选仓/固定目录分支见[会话与话题模型](/session-model)。
 
-指令头的三条指令：
+指令头的几条指令：
 
 - `/repo <路径|项目名>` —— 直接钉仓库，跳过选仓卡片。注意**只吃一个 token**：带空格的路径要写成 `/repo "~/Code/my project"`。
 - `/repo`（不带参数）—— 直接在默认工作目录开会话，等同选仓卡片上的「直接开始」。
+- `/repo wt <路径|项目名> [分支]` —— 先在该仓库上新建一个 worktree（基于远端默认分支），再在里面开会话。分支可省略（按标题/首轮任务自动命名）；写了分支时**只认与仓库同一行、长得像分支名的下一个词**（`ci/temp_split` 这类），中文正文不会被误吃，但英文开头的正文请换行再写。分支名不合法、目标目录已存在都会在开话题前拒绝；git 侧创建失败则话题已建、会话停在待选仓状态。创建还在进行时重发会提示进行中；失败之后在话题内发 `/repo <路径|项目名>` 或 `/repo wt <仓库> [分支]` 即可，此前的消息已暂存。
 - `/model <模型>` —— 本次启动用哪个模型。只对启动参数里带得动模型的 CLI 有效，带不动的会被拒绝而不是静默忽略。
 - `/effort <档位>` —— 推理强度（`low`/`medium`/`high`/`xhigh`/`max`/`ultra`），按本次实际使用的模型校验。
 
@@ -71,9 +84,24 @@ botmux 日常运维
 几条边界：
 
 - 指令头只在**新话题的第一条消息**里生效。进行中的话题里要换仓库/模型/推理档位，请分别单独发 `/repo`、`/model`、`/effort`；改标题用 `/rename`。
-- 建 worktree 不能写进头部（`/repo` 只吃一个 token）。先用 `/t` 开话题，再在话题内发 `/repo wt <编号|项目名> [分支]`。
+- 头部的 `/repo wt` 不接受编号形式（编号只在选仓卡片上有意义）；会话内的 `/repo wt <编号|项目名> [分支]` 仍可用。
 - 会话中途单独发的 `/repo` 仍然吃整行，与头部里的单 token 规则不同。
 
+Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set codexCapacityRecovery on` 开启，`/botconfig set codexCapacityRecovery off` 关闭。开启后，Botmux 管理的 Codex / Codex App 飞书会话遇到明确的模型容量错误（`server_overloaded`）时，会在 15 秒、45 秒后各自动续跑一次。每次续跑会向原生会话追加一条恢复提示（每个任务最多两条），可能保留在模型上下文中，关闭开关不会删除已有历史。关闭时若存在待执行的恢复，会保存取消状态并只提示一次；重新开启或重启不会自动恢复这条旧任务。这不是只针对 modelhub 的识别，也不保证错误会在短时间内恢复。续跑沿用当前会话进度，不重发原始任务；新消息、`/stop` 或关闭会话会停止旧轮恢复。进程重启后，尚未执行的恢复与交接结果未知的恢复均停止并提示人工继续；已在执行的任务仍可正常交付成功结果，但晚到的容量失败不会再自动续跑，避免重放未能保存的取消操作。两次仍未恢复时显示失败卡，可稍后点击重试继续。普通 503、断流、鉴权和限额错误不进入这条恢复链，外部 adopt、HTTP 和会议接收会话也不受影响。
+
+## 群负责人（Agent 工具）
+
+在普通群里 @ 目标机器人说“执行 botmux manager set”即可设置负责人；取消用“执行 botmux manager clear”，查询可让机器人运行 `botmux manager status`。这不是 daemon 的 `/manager` 斜杠命令，而是内置 `botmux-chat-manager` skill 调用会话 IPC。
+
+**默认关闭，按机器人单独开启**：在 Dashboard「机器人配置 → 会话与 @ 策略」里打开「群负责人（默认接待者）」（或 `/botconfig set chatManagerEnabled on`）后，该机器人才会在会话内提供这个工具、并允许 `set`。关闭后该机器人不再免 @ 接话、也不能 `set`；但不会自动改群名或群描述，`clear` 与 `status` 仍可用，已保存的负责人记录保留（重新打开即恢复）。
+
+设置/取消要求当前轮真实发送者明确命中该机器人的管理员名单。会话 owner、其他机器人、定时任务和过期轮次不能代替真人授权。只作用于当前普通群，不支持跨群指定目标，也不接管自动管理的会话群。
+
+负责人接有对话权限的人的群顶层未 @ 消息；只点名其他成员时让路，@all 不算转交。群名追加机器人名，取消时保留人工改名。原有 ambient、never 和 reply-mode 独立生效；负责人是群级身份与交接，不是新的响应模式，也不保证全群只有一个机器人回复。
+
+切换时先让旧负责人 clear，成功后再让新负责人 set。每次负责人免 @ 放行都核对群描述标记，读取失败不沿用旧状态；必须同时存在本地管理员启用记录。描述超长拒绝，不截断人写的说明。
+
+飞书没有跨机器条件写入，不承诺并发抢占的强一致性。网络异常或 `chat_update_unconfirmed` 后先查 status。本地记录在数据目录 `chat-managers/` 下，权限 0600，应随数据目录备份。
 ## 💬 回复模式（`/reply-mode`）
 
 控制 bot 被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改需 `canOperate`，仅查看需 `canTalk`。群聊中均需 @ 目标 bot 才生效，多 bot 群须 @ 到具体 bot。仅普通群与 1:1 私聊支持；话题群无需设置（本就是话题），命令会被拒绝。
@@ -85,7 +113,7 @@ botmux 日常运维
 | `/reply-mode` `/reply-mode status` | 查看当前私聊会话模式 |
 | `/reply-mode chat` | 每个 1:1 私聊内部扁平连续会话，同一 DM 的消息共用一个会话（**默认**） |
 | `/reply-mode topic` `/reply-mode new-topic` | 每条**顶层** DM 开独立会话/线程；同一已有 thread 内的回复继续该 thread 会话 |
-| `/reply-mode group` | 每条**顶层** DM 自动创建一个「你+bot」专属会话群并把会话落在群里（AI 自动命名、回群续聊自动恢复上下文；详见私聊会话模式 `p2pMode=group`） |
+| `/reply-mode group` | 每条**顶层** DM 自动创建一个「你+bot」专属会话群并把会话落在群里（AI 自动命名；会话关闭后回群再说话会开新会话，要接着聊点关闭卡「恢复会话」或发 `/resume`；详见私聊会话模式 `p2pMode=group`） |
 
 `shared` / `chat-topic` 依赖群内原生话题，私聊不支持，会被拒绝。
 
@@ -93,15 +121,23 @@ botmux 日常运维
 
 | 命令 | 说明 |
 |------|------|
-| `/reply-mode` `/reply-mode status` | 查看当前群回复模式 |
+| `/reply-mode` `/reply-mode status` | 查看当前群回复模式，并标明来源（继承 Bot 默认 / 本群覆盖） |
+| `/reply-mode inherit` | 清除本群覆盖，恢复跟随 Bot 默认（别名 `default` / `reset` / `clear`） |
 | `/reply-mode chat` | 整群连续会话（顶层 @ 都进同一个会话） |
 | `/reply-mode chat-topic` | 顶层连续、原生话题各自独立会话 |
 | `/reply-mode new-topic` | 每次 @ 新建话题与独立会话 |
 | `/reply-mode topic` `/reply-mode shared` | 话题展示但共享同一会话（`topic` 是 `shared` 的兼容别名） |
 
-群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
+群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值；显式设置即使与当前默认相同也会保留为覆盖（之后改 Bot 默认不影响本群），要重新跟随默认请用 `/reply-mode inherit`。也可以在 dashboard「群组 → 管理」里按机器人逐个选择。设置新模式需要确认当前是普通群；查看与清除覆盖不受此限制。
 
 `/substitute [status|on|off]` —— 查看或切换当前群的**替身模式**开关（修改需 owner）。
+
+## 📢 @ 策略（`/mention-mode`，仅普通群）
+
+`/mention-mode always|topic|never|ambient` 切换本群策略，`/mention-mode status`（或不带参数）查看。仅普通群可设：私聊天然不需要 @，话题群与 `/group` 会话群会被拒绝。查询只要对话权，修改需操作权（`allowedUsers`）。
+
+- `always`：必须 @ 才回应（默认）；`topic`：本 bot 自有话题内回复免 @；`never`：全群免 @；`ambient`：免 @，但消息明确 @ 了其他人/bot 时让路。
+- 免 @ 不等于免权限，且仍有 8 个免 @ 例外（话题内回复、替身、消息监听器等）——完整语义见 [@ 策略](/mention-mode)。
 
 ## 📑 群标签页
 
@@ -124,15 +160,46 @@ botmux tabs add "https://example.com/project/releases/2026" \
 
 CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会话时可传 `--session-id`，要覆盖目标群可传 `--chat-id`。`add` 按 URL 幂等：同一个页面已有 Tab 时复用，并按需更新名称，适用于 MR、项目看板、发布页等自动化场景。后台还可使用 `botmux tabs list|update|remove|sort`。
 
+## Codex App 会话内调整推理强度
+
+已有 Codex App 会话可发送 `/effort low|medium|high|xhigh|max|ultra`，档位按当前模型通告的信息校验。命令保存后续轮次的设置，不会追加模型消息或中断任务。
+
+**更新正在运行的当前轮需要显式启用 Codex 实验特性 `step_model_switching`。** 在已核对的 Codex 0.160 / 0.162.1 中，该特性为 UnderDevelopment，默认关闭，Botmux 不自动开启。希望启用时，在该会话 app-server 实际使用的 `CODEX_HOME/config.toml` 中合并以下配置，并在 app-server 下次启动后使用（已有 `[features]` 表时只添加或修改对应键）：
+
+```toml
+[features]
+step_model_switching = true
+```
+
+未开启时，运行中发送命令仍可保存后续轮次设置，并明确提示当前轮因未开特性而未更新；目标轮次已经结束或不可用时会给出不同提示。只有原生接口返回 `applied` 才确认服务端接受当前轮更新；已经发出的模型请求保持原参数，当前轮也可能没有后续推理步骤。
+
+## Codex CLI 会话内调整推理强度
+
+在已有的本地 Codex CLI 会话中发送 `/effort low|medium|high|xhigh|max|ultra`，Botmux 会操作原生 `/model` 菜单，保留当前模型，并以 **session-only** 方式选择档位。成功后保存当前会话的启动设置，回执明确说明 **从下一轮生效，正在执行的这一轮保持原强度**；即使启用了 `step_model_switching`，菜单路径也不会更新当前轮。
+
+此功能支持受 Botmux 管理的本地 PTY / tmux 会话，要求原生菜单提供 `s session` 操作和 `thread_settings_applied` 设置确认记录（已在 Codex 0.162.1 验证）。RPC 输入、远程后端、wrapper、adopt、sandbox/read-isolation 不使用此路径。遇到未发送草稿、其它菜单、输入冲突或无法确认的界面时会拒绝操作；不会清空草稿或重启任务。用户仍可直接使用 `/model` 手动选择。
+
+Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
+
 ## 🔀 透传给底层 CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理。
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex CLI / App 的 `/effort` 例外，见上文）。
 
 `/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
 
 部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
 
 想放行更多命令，给该 bot 配 [`customPassthroughCommands`](/bots-json)（如 `["/export"]`）即可在上面白名单之外按需扩展。会遮蔽 botmux daemon 命令的项（如 `/status`、`/help`、`/cd`）会被自动丢弃——daemon 命令始终保留自身语义，无法被透传覆盖。
+
+**一条消息里级联多条透传命令**（会话内，CLI 已在跑）：每行一条透传命令，最后可以接正文，botmux 会按书写顺序逐条送出，每条之间等 CLI 空闲——
+
+```text
+/model opus
+/clear
+接下来看一下 PR #1361 的评审意见
+```
+
+规则：只有连续的前缀行是透传命令时才算级联（中间出现 `/cd` 这类 botmux 命令或不认识的 `/xxx` 则整条按今天的规则当普通文本转发）；正文从第一条不以 `/` 开头的行起，之后再出现的 `/xxx` 都算正文；单行 `/model opus 然后继续修` 仍是整行原样送给 CLI，不会拆。等 CLI 空闲最长 120 秒，超时会把剩余条目直接发出并提示一句。远端沙箱后端（riff / mojo）与接管的外部会话不支持级联，会回一句「请分条发送」；带附件的消息也不切级联。
 
 ## 🧩 查看可用命令
 
@@ -145,22 +212,31 @@ CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会�
 
 权限同 `/help`，不占用会话槽位。
 
+Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还有一个可选的「飞书原生命令面板」：把 botmux 自有命令（含别名，直接从命令注册表推导）作为候选项，标出每一项在飞书后台是已同步、待新增还是待更新；是否注册由用户通过每行的「同步」按钮决定。飞书后台额外存在的命令也会列出，可逐条删除。「全部同步到飞书」是显式批量操作，只新增缺失命令并更新说明，不会隐式删除。CLI 透传命令（`/compact`、`/model` 等）因不同 CLI 与输入后端的支持并不一致，暂不进入候选。
+
+该面板需要可选权限 `application:app_slash_command:read` / `application:app_slash_command:write`，它们**不在**默认权限清单里，也不会被启动自检自动补开；未开通或租户未进飞书灰度（需 7.70+ PC 端及 FG 白名单）时，面板只显示「暂不可用」与开通链接，Bot 的其它功能不受影响。飞书客户端的原生 `/` 面板可能需要约 5 分钟刷新。按工作目录发现的 `.claude` 命令、skill、插件和 MCP prompt 不是应用级稳定能力，因此仍只在 `/slash` 卡片里展示，不会注册到飞书后台。
+
 ## 📡 会话接入
 
 | 命令 | 说明 |
 |------|------|
-| `/adopt` | 扫描本机 tmux，弹卡片选择要接入的已运行会话 |
-| `/adopt <tmux_pane>` | 直接接入指定 pane（如 `/adopt 0:2.0`） |
+| `/adopt` | 扫描本机 tmux、Zellij、Herdr 和 Orca，弹卡片选择已运行会话；Orca 支持为实验性能力 |
+| `/adopt <target>` | 直接接入指定 tmux / Zellij / Herdr 会话（如 `/adopt 0:2.0`） |
+| `/adopt orca:<terminal>` | 直接接入指定 Orca 会话（实验性） |
 | `/detach` | 断开本话题与 adopt 会话的桥接（原 CLI 不受影响，`/disconnect` 同义） |
 
 ## 🔐 用户授权
 
 | 命令 | 说明 |
 |------|------|
-| `/login` | 飞书用户授权，授权后可下载第三方卡片图片、以你身份调云文档/日历等 API |
+| `/login` | 飞书基础用户授权：消息读取、资源访问和授权续期；不默认申请云文档、通讯录或日历权限 |
+| `/login --scope <权限名>... [--force]` | 在基础权限上按需追加指定权限，例如 `/login --scope docx:document:readonly`；加 `--force` 跳过本地目录校验（仅做语法校验）以支持未收录新权限 |
 | `/login status` | 查看授权状态 |
+| `/logout` | 撤销你自己在这台机器上的触发人授权（lark-cli / bytedcli 登录，以及该机器人名下的用户 token）。不会撤销其他成员 |
 | `/login tags` | 会话群标签专项授权（消息分组权限），授权后新建会话群自动进入侧边栏分组（p2pMode=group + feed-group 标签模式用，feed-group 为默认标签模式） |
 | `/pair <配对码>` | 把 Web/Dashboard 端的会话与你的飞书身份配对（在网页端拿配对码，话题里发 `/pair <码>` 认领） |
+
+基础授权需要应用开通 `im:message:readonly`、`im:resource`、`offline_access`。其它操作若返回 `missing_scope`，按错误中的权限名使用 `/login --scope ...` 补授权，并由应用管理员先在开发者后台开通相应的用户权限。资源不可见或无访问权需要处理该资源的授权，重复 `/login` 不能解决。
 
 ## 🎭 角色（人设）
 
@@ -192,13 +268,15 @@ CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会�
 
 `/oncall bind <path>` · `/oncall unbind` · `/oncall status`
 
-## 🔑 使用授权（owner 专用）
+## 🔑 使用授权（owner / 管理员）
 
 | 命令 | 说明 |
 |------|------|
-| `@机器人 /grant @某人` | 授权对方在本群对话；`/grant`（不带人）则授权**本群所有成员**对话 |
-| `@机器人 /revoke @某人` | 撤销对方本群对话权；`/revoke`（不带人）撤销整群授权 |
+| `@机器人 /grant`（或 `/grant all`） | 授权**本群所有成员**对话（写入 `allowedChatGroups`，无额度无期限；话题群按 `oc_` 群生效、覆盖全部话题）；裸 `/revoke` 收回 |
+| `@机器人 /grant @某人 [N]` | 发卡给指定成员授权**本群对话**，默认每人 3 条 / 1 小时，卡上可选 1 小时 / 8 小时 / 1 天 / 7 天 / 永久与额度（留空不限）；owner 主动发起的卡还可「全局授权对话」。`@机器人 /revoke @某人` 一并撤销本群访客授权、全局访客授权；若对方同时在 `allowedUsers` 名单里也会移除（撤 owner 本人或撤到再无管理员会被拒绝，回执注明作用域） |
 | `/vc-auth @成员` | 会议监听中临时授权本场指令源；`/vc-auth revoke @成员` 撤销；`/vc-auth list` 查看 |
+
+分层、额度、授权申请卡与黑名单详见 [权限与授权](/permissions)。注意：**把 bot 拉进群不等于授权**，限制态 bot 仍只接受名单成员。
 
 ## ⚙️ 远程改配置 & 技能（owner 专用）
 
@@ -213,6 +291,8 @@ CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会�
 ## 🆕 一键新建会话群
 
 `/group <群名>`（别名 `/g`）：自动新建飞书群、邀请你进群、转让群主，整个群作为一个独立 CLI 会话。`@botA @botB /g <群名>` 可把多个机器人一并拉进新群。
+
+新群默认像群聊模式的会话群一样用渐变 logo 头像；不写群名时会在第一条消息后按内容自动改群名。
 
 加上 `--role-profile <profile>` 可以在新群里自动 bootstrap 一套按 bot 区分的角色：
 
@@ -239,6 +319,24 @@ CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会�
 - `@机器人 /project disable`：退出项目群模式；未启动的指引卡会取消置顶，已有项目数据会保留以便重新启用后继续。
 
 该命令只支持普通群，且仅 Bot 的 owner/allowedUsers 可以执行。重复执行 `enable` 不会覆盖已在 Dashboard 精选的 Worker 列表或自动纳入策略。Dashboard 可关闭“自动纳入新 Bot”，关闭后严格保留显式 Worker 名单；项目群配置区也会列出同一批 Agent，并可直接跳转到对应群角色编辑器。两种入口没有第二份角色配置。
+
+## 🧠 群上下文共享
+
+在真实飞书群中 @任一由当前部署管理的 Bot：
+
+```text
+@机器人 /context-sharing on
+@机器人 /context-sharing status
+@机器人 /context-sharing off
+```
+
+开关按群生效，默认关闭。开启后，当前部署管理的 Bot 会旁听并保存本群已发布的消息；未被 @ 的 Bot 不会因此启动。它在下一次按原有 @ 规则正常唤醒时，收到自己遗漏的、带来源标注的背景。开关不会改变 @ 提及策略，也不会为补背景额外创建模型回合或会话。
+
+只有该 Bot 的真人 owner/`allowedUsers` 可以查看或修改开关；普通对话授权和其他 Bot 均不具备权限。私聊、API 虚拟会话不支持。配置 `promptInjection=none` 的会话明确不接收自动背景。
+
+默认每轮背景上限为 24,000 字符；保存上限为每群 30 天或 10,000 条。背景占用被唤醒模型的输入 token，但旁听本身不调用模型。范围只含已发布的群消息和资源引用，不含私聊、隐藏推理、未发布工具结果或私有文件。平台历史补拉失败、权限不足或超出保留期时，背景会带不完整范围提示，不会把缺失内容伪装成完整历史。
+
+`status` 和开启结果还会显示撤回事件订阅诊断。只有诊断原因为 `subscribed` 才表示应用配置已验证包含 `im.message.recalled_v1`；这不承诺平台推送 100% 到达。`update_submitted` 表示更新已提交但仍须在飞书开放平台发布新版本。未知、登录会话不可用或过期结果表示历史背景可能暂时保留已撤回消息，应检查该事件订阅后重试。关闭操作不会触发订阅检查或设置流程。
 
 ## 📄 飞书文档评论入口
 

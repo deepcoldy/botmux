@@ -7,21 +7,29 @@
  * determined later by validating BOTMUX_GOAL_MANIFEST_PATH.
  */
 
-import { existsSync, statSync } from 'node:fs';
+import { buildBotWorkerEnv } from '../../core/env-policy.js';
+import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
+import { getBot } from '../../bot-registry.js';
+import { statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { WorkerToDaemon } from '../../types.js';
+import type { BackendType } from '../../adapters/backend/types.js';
+import { config } from '../../config.js';
+import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
-  forkWorkerJsFactory,
   syntheticSessionUuid,
   type WorkerHandle,
   type WorkerProcessFactory,
 } from '../shared/worker-process.js';
 import {
+  GOAL_COMMAND,
+  GOAL_COMMAND_OBJECTIVE,
   GOAL_ENV,
+  cliTakesNativeGoalCommand,
   type RunNode,
   type RunNodeRequest,
   type RunNodeResult,
@@ -29,6 +37,7 @@ import {
 } from './contract.js';
 import { workflowSandboxInitFields } from '../shared/sandbox-policy.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
+import { removeSessionSkillRuntime } from '../../core/skills/snapshot.js';
 import {
   armV3AttemptWorkerFence,
   bindV3AttemptWorkerFence,
@@ -40,7 +49,14 @@ import {
 
 type WorkerEvent = WorkerToDaemon;
 
-export const GOAL_COMMAND = '/goal';
+export { GOAL_COMMAND } from './contract.js';
+
+/**
+ * Cushion between a workflow node's outer wall-clock deadline and an
+ * adapter-internal turn timer (mcode ACP runner). The outer pool deadline
+ * plus its SIGTERM/SIGKILL escalation (~5.3s) must win; keep a wide margin.
+ */
+const WORKFLOW_INNER_TURN_GRACE_MS = 60_000;
 
 export interface EphemeralPoolDeps {
   /**
@@ -48,6 +64,10 @@ export interface EphemeralPoolDeps {
    * secret by the frozen larkAppId at spawn time.
    */
   resolveLarkAppSecret(larkAppId: string): string | undefined | Promise<string | undefined>;
+  /** Resolve the live bot config at spawn time so env values (session-env
+   *  layers, core/session-env.ts) are never persisted in snapshots. Defaults
+   *  to the daemon's bot registry. */
+  resolveBot?: (larkAppId: string) => SessionEnvBotInput | undefined;
   factory?: WorkerProcessFactory;
   workerPath?: string;
   quiesceMs?: number;
@@ -56,8 +76,24 @@ export interface EphemeralPoolDeps {
   manifestSettleMs?: number;
 }
 
+/** Session env overlay for a workflow worker, from the live bot config. */
+function v3WorkerSessionEnv(
+  larkAppId: string,
+  resolveBot: EphemeralPoolDeps['resolveBot'],
+): { env?: Record<string, string>; envUnset?: string[] } {
+  let bot: SessionEnvBotInput | undefined;
+  try { bot = resolveBot ? resolveBot(larkAppId) : getBot(larkAppId).config; } catch { bot = undefined; }
+  if (!bot) return {};
+  // Workflow workers never install the identity wrappers (usesLarkToolBinding).
+  const resolved = resolveSessionEnv({ bot, backendType: v3WorkerBackendType(), facts: { unwrapped: true } });
+  return {
+    ...(resolved.env ? { env: resolved.env } : {}),
+    ...(resolved.envUnset ? { envUnset: resolved.envUnset } : {}),
+  };
+}
+
 export function createEphemeralPool(deps: EphemeralPoolDeps): { runNode: RunNode } {
-  const factory = deps.factory ?? forkWorkerJsFactory;
+  const factory = deps.factory ?? spawnWorkerFactory;
   const workerPath = deps.workerPath ?? defaultWorkerPath();
   const quiesceMs = deps.quiesceMs ?? 500;
   const cancelGraceMs = deps.cancelGraceMs ?? 5000;
@@ -77,7 +113,7 @@ export function createEphemeralPool(deps: EphemeralPoolDeps): { runNode: RunNode
 }
 
 type RunNodeInternalDeps = Required<Pick<EphemeralPoolDeps, 'factory' | 'workerPath' | 'quiesceMs' | 'cancelGraceMs' | 'manifestPollMs' | 'manifestSettleMs'>> &
-  Pick<EphemeralPoolDeps, 'resolveLarkAppSecret'>;
+  Pick<EphemeralPoolDeps, 'resolveLarkAppSecret' | 'resolveBot'>;
 
 async function runNodeImpl(
   req: RunNodeRequest,
@@ -135,25 +171,29 @@ async function runNodeImpl(
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
   const sessionId = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
+  const workerEnv: Record<string, string | undefined> = {
+    // v3 ephemeral workers fork straight from the daemon here (not via
+    // workerForkEnv), so strip the PM2 graceful-exit sentinel to keep the
+    // "only daemon/dashboard carry the marker" invariant — harmless today
+    // (the worker doesn't read the graceful helper and its CLI children go
+    // through redactChildEnv), but this keeps the boundary honest.
+    ...stripPm2GracefulExitMarker(buildBotWorkerEnv(process.env, req.botSnapshot.envPolicy)),
+    ...req.env,
+    [GOAL_ENV.V3_MARKER]: '1',
+    BOTMUX_WORKFLOW: '1',
+    BOTMUX_WORKFLOW_PTY_LOG_PATH: ptyLogPath,
+    BOTMUX_WORKFLOW_RUN_ID: req.runId,
+    BOTMUX_WORKFLOW_NODE_ID: req.node.id,
+  };
+  // Where the worker writes this attempt's skill manifest + snapshot (its own
+  // SESSION_DATA_DIR, i.e. config.session.dataDir unless req.env overrides it).
+  const workerDataDir = workerEnv.SESSION_DATA_DIR || config.session.dataDir;
   let worker: WorkerHandle;
   try {
     worker = deps.factory.spawn({
       workerPath: deps.workerPath,
       cwd,
-      env: {
-        // v3 ephemeral workers fork straight from the daemon here (not via
-        // workerForkEnv), so strip the PM2 graceful-exit sentinel to keep the
-        // "only daemon/dashboard carry the marker" invariant — harmless today
-        // (the worker doesn't read the graceful helper and its CLI children go
-        // through redactChildEnv), but this keeps the boundary honest.
-        ...stripPm2GracefulExitMarker(process.env),
-        ...req.env,
-        [GOAL_ENV.V3_MARKER]: '1',
-        BOTMUX_WORKFLOW: '1',
-        BOTMUX_WORKFLOW_PTY_LOG_PATH: ptyLogPath,
-        BOTMUX_WORKFLOW_RUN_ID: req.runId,
-        BOTMUX_WORKFLOW_NODE_ID: req.node.id,
-      },
+      env: workerEnv,
     });
   } catch (err) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'spawn_threw');
@@ -170,6 +210,12 @@ async function runNodeImpl(
     resolveOuterClose = resolve;
     worker.on('close', () => {
       outerCloseSeen = true;
+      // The attempt's synthetic session has no persistent row, so
+      // sessionStore.closeSession() never runs for it: reclaim its skill
+      // manifest + runtime-skills snapshot here, once the worker process
+      // (and with it the CLI that read them) has actually exited — on every
+      // outcome (ok / fail / timeout / cancelled / bind failure).
+      try { removeSessionSkillRuntime(sessionId, workerDataDir); } catch { /* best effort */ }
       resolve();
     });
   });
@@ -242,12 +288,28 @@ async function runNodeImpl(
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
+    wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
+    envPolicy: req.botSnapshot.envPolicy,
+    ...v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot),
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,
+    // The mcode runner caps each ACP turn at buildArgs' turnTimeoutMs
+    // (runner default 10min when unset). Goal nodes own a much larger wall
+    // budget (up to MAX_NODE_TIMEOUT_SEC), so hand the runner a deadline
+    // OUTSIDE this node's own hard deadline: the pool's SIGTERM at
+    // req.timeoutMs stays the authority for runaway nodes, while a healthy
+    // long node is never cut off by the runner first. Only the minimax (and
+    // dsh, not v3-admitted) adapters read this field, so the override stays
+    // scoped instead of changing every adapter's spawn.
+    ...(req.botSnapshot.cliId === 'minimax'
+      ? { turnTimeoutMs: req.timeoutMs + WORKFLOW_INNER_TURN_GRACE_MS }
+      : {}),
     ...workflowSandboxInitFields(req.botSnapshot),
-    backendType: 'pty' as const,
+    // Local terminal backend only: tmux when the daemon runs tmux, otherwise
+    // PTY (see v3WorkerBackendType for why it is never the daemon backend as-is).
+    backendType: v3WorkerBackendType(),
     prompt: '',
     resume: false,
     larkAppId: req.botSnapshot.larkAppId,
@@ -487,16 +549,105 @@ async function runNodeImpl(
   });
 }
 
+/**
+ * First-turn input for a goal-mode worker.
+ *
+ * Native-`/goal` CLIs get the short `/goal <objective>` line so their native
+ * autonomous goal mode handles the turn. Programmatic-session CLIs (mcode's
+ * ACP runner, …) have NO verified slash-command surface on the
+ * session/prompt path — a literal `/goal` token there is at best inert and at
+ * worst an "unknown command" reply — so they receive the bare objective. It
+ * is a complete single-line instruction (read goal.txt, write products,
+ * write the manifest) either way, and `isBotmuxGoalObjective` matches both
+ * shapes.
+ */
 export function buildGoalCommand(req: RunNodeRequest): string {
-  const env = GOAL_ENV;
-  return `${GOAL_COMMAND} Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+  const cliId = req.botSnapshot.cliId;
+  return cliTakesNativeGoalCommand(cliId)
+    ? `${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`
+    : GOAL_COMMAND_OBJECTIVE;
 }
 
+/**
+ * Default worker factory for the v3 pool.
+ *
+ * Delegates to {@link spawnWorker}, which is the ONLY correct way to launch our
+ * own worker entry across both runtime shapes:
+ *   • Node (npm/dev): `fork(<distDir>/worker.js)` — byte-for-byte the old
+ *     `forkWorkerJsFactory` behavior.
+ *   • Bun single-file binary: there is no `worker.js` on disk, so re-exec THIS
+ *     binary with the hidden `__worker` subcommand over the same IPC channel.
+ *
+ * The pre-fix `forkWorkerJsFactory` blindly `fork()`ed `deps.workerPath`, and
+ * in a compiled binary `defaultWorkerPath()` resolved that to a bogus
+ * `.../src/worker.ts`; `fork` then re-exec'd the binary with that path as a
+ * subcommand, which the workflow worker-fence allowlist rejected (exit 2). Here
+ * `opts.workerPath` is the dist directory (see {@link defaultWorkerPath}); a
+ * standalone binary ignores it and uses the `__worker` subcommand instead.
+ */
+export const spawnWorkerFactory: WorkerProcessFactory = {
+  spawn(opts) {
+    const child = spawnWorker({
+      distDir: opts.workerPath,
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    return {
+      send: (message) => child.send(message as never),
+      on: (event: string, cb: (...args: unknown[]) => void) => {
+        child.on(event as never, cb);
+      },
+      kill: (signal) => {
+        // `child.killed` flips to true when kill(2) is *sent*, not when the
+        // process exits; guarding on it would suppress TERM/KILL escalation
+        // after an ignored SIGINT. Only an observed exit is terminal.
+        if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+      },
+      get pid() {
+        return child.pid;
+      },
+      get stdout() {
+        return child.stdout;
+      },
+      get stderr() {
+        return child.stderr;
+      },
+    } as WorkerHandle;
+  },
+};
+
+/**
+ * Terminal backend for a v3 ephemeral worker.
+ *
+ * Previously hardcoded to `'pty'`, which forced every workflow worker onto
+ * node-pty. Under the compiled single-file binary on macOS that path is
+ * unusable (even with the spawn-helper materialized, the helper stalls in
+ * `open(ttyname(stdin))` under the Bun host), so when the daemon runs tmux the
+ * worker follows it — the daemon's own sessions already run there and
+ * workflow-worker mode has a dedicated non-PTY branch.
+ *
+ * Any other daemon backend keeps the old PTY behavior. In particular the pool
+ * must never inherit a remote backend (riff/mojo): it has no DaemonSession and
+ * sends raw_input without a credential snapshot (see the exemption in
+ * test/mojo-wiring.test.ts), and the other multiplexers are not exercised by
+ * goal-mode workers.
+ */
+export function v3WorkerBackendType(daemonBackend: BackendType = config.daemon.backendType): 'tmux' | 'pty' {
+  return daemonBackend === 'tmux' ? 'tmux' : 'pty';
+}
+
+/**
+ * The dist directory whose `worker.js` the Node path forks. `spawnWorker`
+ * resolves the actual entry: `<distDir>/worker.js` under Node, or the hidden
+ * `__worker` subcommand of the running binary when standalone (where no
+ * `worker.js` exists on disk and this path is ignored). `deps.workerPath` stays
+ * injectable for tests.
+ */
 function defaultWorkerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
-  const candidate = join(here, '..', '..', 'worker.js');
-  if (existsSync(candidate)) return candidate;
-  return join(here, '..', '..', '..', 'src', 'worker.ts');
+  // src/workflows/v3 → dist root (matches worker-pool.ts `join(__dirname, '..')`).
+  return join(here, '..', '..');
 }
 
 function stdoutPath(req: RunNodeRequest): string {

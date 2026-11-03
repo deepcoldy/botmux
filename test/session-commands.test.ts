@@ -25,6 +25,17 @@ describe('close', () => {
       queuedAttachments: [{ type: 'image', path: '/d/q.png', name: 'q.png' }],
       previewTarget: { host: '127.0.0.1', port: 4173, registeredAt: '2026-08-11T12:00:00.000Z', owner: 'agent', workerGeneration: 1 } as Session['previewTarget'],
       mojoCloseJournal: { phase: 'prepared' } as Session['mojoCloseJournal'],
+      principalLaneQueuedTurns: [{
+        version: 1,
+        turnId: 'om_queued',
+        caller: { requestUserOpenId: 'ou_b', senderType: 'user' },
+        userPrompt: 'queued',
+        title: 'queued',
+        cliInput: { content: 'queued' },
+        createdAt: '2026-09-06T11:59:00.000Z',
+        resume: true,
+        dispatchState: 'attempting',
+      }],
       codexAppDispatchLedger: [],
       workerGeneration: 3,
     });
@@ -38,6 +49,7 @@ describe('close', () => {
     expect(r.dashboardAttachments).toBeUndefined();
     expect(r.queuedAttachments).toBeUndefined();
     expect(r.previewTarget).toBeUndefined();
+    expect(r.principalLaneQueuedTurns).toBeUndefined();
     // Not a snapshot the caller sampled → not written (a host that cannot
     // resolve the transcript must not pin a permanent null).
     expect('tokenUsage' in r && r.tokenUsage !== undefined).toBe(false);

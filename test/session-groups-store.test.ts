@@ -11,9 +11,9 @@
  * Run:  pnpm vitest run test/session-groups-store.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 let tempDir: string;
 
@@ -38,9 +38,8 @@ import {
   markSessionGroupTitled,
   markSessionGroupTitleFailed,
   removeSessionGroup,
-  listSessionGroups,
 } from '../src/services/session-groups-store.js';
-import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand } from '../src/services/session-group-title.js';
+import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand, ONE_SHOT_ARGV, oneShotTitleAllowed, oneShotProfileEnv } from '../src/services/session-group-title.js';
 import {
   resolveTagMode,
   resolveSessionTagName,
@@ -141,7 +140,6 @@ describe('session-groups-store', () => {
     registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
     removeSessionGroup('oc_a');
     expect(isSessionGroup('oc_a')).toBe(false);
-    expect(listSessionGroups()).toHaveLength(0);
   });
 
   it('never throws when not initialised', async () => {
@@ -150,7 +148,6 @@ describe('session-groups-store', () => {
     initSessionGroups('cli_testapp');
     expect(isSessionGroup('oc_x')).toBe(false);
     expect(getSessionGroup('oc_x')).toBeUndefined();
-    expect(listSessionGroups()).toEqual([]);
   });
 });
 
@@ -196,7 +193,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
     process.env.BOTMUX_SESSION_ID = 'sess-123';
     process.env.TMUX = '/tmp/tmux-socket';
     try {
-      const env = buildOneShotEnv(undefined);
+      const env = buildOneShotEnv();
       expect(env.LARK_APP_SECRET).toBeUndefined();
       expect(env.GITHUB_TOKEN).toBeUndefined();
       expect(env.BOTMUX_SESSION_ID).toBeUndefined();
@@ -210,7 +207,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
   });
 
   it('layers the per-bot provider env on top (multi-provider correctness)', () => {
-    const env = buildOneShotEnv({ ANTHROPIC_BASE_URL: 'https://proxy.example', ANTHROPIC_AUTH_TOKEN: 'bot-token' });
+    const env = buildOneShotEnv({ env: { ANTHROPIC_BASE_URL: 'https://proxy.example', ANTHROPIC_AUTH_TOKEN: 'bot-token' } });
     expect(env.ANTHROPIC_BASE_URL).toBe('https://proxy.example');
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('bot-token');
     // Inherited harmless vars still flow through (PATH etc.).
@@ -220,7 +217,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
   it('per-bot env cannot smuggle reserved botmux keys past the sanitizer', () => {
     // PATH deliberately IS overridable per bot (same as the worker path);
     // reserved BOTMUX_* identity keys are not.
-    const env = buildOneShotEnv({ BOTMUX_SESSION_ID: 'evil' } as any);
+    const env = buildOneShotEnv({ env: { BOTMUX_SESSION_ID: 'evil' } });
     expect(env.BOTMUX_SESSION_ID).toBeUndefined();
   });
 });
@@ -260,6 +257,48 @@ describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', ()
 
   it('falls back to the template verbatim', () => {
     expect(resolveOneShotCommand({}, template)).toEqual({ argv: ['claude', '-p'] });
+  });
+
+  it('pins claude-code to dontAsk so a bypassPermissions profile cannot leak in', () => {
+    const argv = ONE_SHOT_ARGV['claude-code'];
+    expect(argv).toEqual(['claude', '-p', '--permission-mode', 'dontAsk']);
+    // Wrappers forward the pin to the underlying claude.
+    expect(resolveOneShotCommand({ wrapperCli: 'aiden x claude' }, argv).argv)
+      .toEqual(['aiden', 'x', 'claude', '-p', '--permission-mode', 'dontAsk']);
+    expect(resolveOneShotCommand({ cliPathOverride: '/opt/claude' }, argv).argv)
+      .toEqual(['/opt/claude', '-p', '--permission-mode', 'dontAsk']);
+  });
+
+  it('supports antigravity in ONE_SHOT_ARGV with agy -p', () => {
+    expect(ONE_SHOT_ARGV.antigravity).toEqual(['agy', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.antigravity)).toEqual({ argv: ['agy', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/agy' }, ONE_SHOT_ARGV.antigravity)).toEqual({
+      argv: ['/custom/bin/agy', '-p'],
+    });
+  });
+
+  it('supports grok in ONE_SHOT_ARGV with grok -p', () => {
+    expect(ONE_SHOT_ARGV.grok).toEqual(['grok', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.grok)).toEqual({ argv: ['grok', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/grok' }, ONE_SHOT_ARGV.grok)).toEqual({
+      argv: ['/custom/bin/grok', '-p'],
+    });
+  });
+
+  it('supports pi in ONE_SHOT_ARGV with pi -p', () => {
+    expect(ONE_SHOT_ARGV.pi).toEqual(['pi', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.pi)).toEqual({ argv: ['pi', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/pi' }, ONE_SHOT_ARGV.pi)).toEqual({
+      argv: ['/custom/bin/pi', '-p'],
+    });
+  });
+
+  it('supports oh-my-pi in ONE_SHOT_ARGV with omp -p', () => {
+    expect(ONE_SHOT_ARGV['oh-my-pi']).toEqual(['omp', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV['oh-my-pi'])).toEqual({ argv: ['omp', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/omp' }, ONE_SHOT_ARGV['oh-my-pi'])).toEqual({
+      argv: ['/custom/bin/omp', '-p'],
+    });
   });
 });
 
@@ -330,5 +369,66 @@ describe('resolveSessionTagName（标签名回落链）', () => {
   it('clampSessionTagName 对全空白返回空串（= 清除配置回默认）', () => {
     expect(clampSessionTagName('   ')).toBe('');
     expect(clampSessionTagName(' 工作 ')).toBe('工作');
+  });
+});
+
+describe('oneShotTitleAllowed (/g auto title runs on the host)', () => {
+  let home = '';
+  const saved = { HOME: process.env.HOME, SESSION_DATA_DIR: process.env.SESSION_DATA_DIR };
+  beforeEach(() => {
+    // Hermetic host: no device enrollment unless a case creates it.
+    home = mkdtempSync(join(tmpdir(), 'one-shot-home-'));
+    process.env.HOME = home;
+    delete process.env.SESSION_DATA_DIR;
+  });
+  afterEach(() => {
+    process.env.HOME = saved.HOME;
+    if (saved.SESSION_DATA_DIR === undefined) delete process.env.SESSION_DATA_DIR; else process.env.SESSION_DATA_DIR = saved.SESSION_DATA_DIR;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('refuses launch variants the one-shot cannot reproduce', () => {
+    expect(oneShotTitleAllowed({ cliId: 'traex', cliLaunchMode: 'forge-traex' })).toBe(false);
+    expect(oneShotTitleAllowed({ cliId: 'codex', codexAuthSync: 'isolated' })).toBe(false);
+    expect(oneShotTitleAllowed({ cliId: 'codex', codexInstancePool: { instances: [] } })).toBe(false);
+    expect(oneShotTitleAllowed({ cliId: 'codex', codexAuthSync: 'shared' })).toBe(true);
+  });
+
+  it('refuses on a host with mandatory device-credential isolation', () => {
+    expect(oneShotTitleAllowed({ cliId: 'claude-code' })).toBe(true);
+    mkdirSync(join(home, '.botmux', 'device-auth'), { recursive: true });
+    writeFileSync(join(home, '.botmux', 'device-auth', 'device.json'), '{}');
+    expect(oneShotTitleAllowed({ cliId: 'claude-code' })).toBe(false);
+  });
+
+  it('allows only unsandboxed bots on a CLI with a one-shot mode, failing closed', () => {
+    const prev = process.env.BOTMUX_SANDBOX;
+    delete process.env.BOTMUX_SANDBOX;
+    try {
+      expect(oneShotTitleAllowed({ cliId: 'claude-code' })).toBe(true);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: 'off' })).toBe(true);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: true })).toBe(false);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: 'scratch' })).toBe(false);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', readIsolation: true })).toBe(false);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: 'typo' })).toBe(false);
+      expect(oneShotTitleAllowed({ cliId: 'aiden' })).toBe(false);
+      process.env.BOTMUX_SANDBOX = '1';
+      expect(oneShotTitleAllowed({ cliId: 'claude-code' })).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SANDBOX; else process.env.BOTMUX_SANDBOX = prev;
+    }
+  });
+});
+
+describe('oneShotProfileEnv (cliConfigDir parity with the worker)', () => {
+  it('carries a Claude profile as CLAUDE_CONFIG_DIR, expanding ~', () => {
+    expect(oneShotProfileEnv({ cliId: 'claude-code', cliConfigDir: '~/.claude-api' })).toEqual({
+      CLAUDE_CONFIG_DIR: join(homedir(), '.claude-api'),
+    });
+    expect(oneShotProfileEnv({ cliId: 'claude-code', cliConfigDir: '/opt/claude-profile' })).toEqual({
+      CLAUDE_CONFIG_DIR: '/opt/claude-profile',
+    });
+    expect(oneShotProfileEnv({ cliId: 'claude-code' })).toEqual({});
+    expect(oneShotProfileEnv({ cliId: 'codex', cliConfigDir: '~/.codex-x' })).toEqual({});
   });
 });

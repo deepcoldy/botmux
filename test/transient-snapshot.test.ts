@@ -168,6 +168,8 @@ describe('snapshotToPng', () => {
     // Transient renderer must be sized off the live pane, not the fallback.
     const opts = mockedCaptureToPng.mock.calls[0][1];
     expect(opts).toEqual({ cols: 200, rows: 60, startY: 0 });
+    // Callers key their dedup on this grid: same ANSI, new canvas → new frame.
+    expect(result).toMatchObject({ cols: 200, rows: 60 });
   });
 });
 
@@ -188,5 +190,6 @@ describe('snapshotToText', () => {
     expect(result).not.toBeNull();
     expect(result!.content).toContain('line one');
     expect(result!.content).toContain('line two');
+    expect(result).toMatchObject({ cols: 200, rows: 60 });
   });
 });

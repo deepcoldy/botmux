@@ -12,6 +12,8 @@
     "test/mtr-transcript.test.ts",
     "test/tmux-pipe-backend.test.ts",
     "test/transient-snapshot.test.ts",
-    "test/vc-agent-polling-source.test.ts"
+    "test/vc-agent-polling-source.test.ts",
+    "test/helpers/mock-llm-server/**/*",
+    "test/mock-llm-server.test.ts"
   ]
 }

@@ -3,9 +3,16 @@
  * bridge (CodexBridgeQueue path in the worker).
  *
  * Split intentionally:
- *   - ALWAYS: harvested whenever the CLI is botmux-spawned (or adopted)
- *   - CURSOR: adopt-only — botmux-spawned cursor replies via `botmux send`,
- *     so the transcript bridge stays off outside adopt mode
+ *   - ALWAYS: harvested whenever the CLI is botmux-spawned (or adopted).
+ *     cursor rides the same always-on fallback as codex since #932: a
+ *     botmux-spawned cursor turn that forgets `botmux send` is harvested from
+ *     its agent-transcript JSONL, and the send-marker gate in
+ *     bridge-fallback-gate.ts suppresses the transcript emit when the model
+ *     did send — exactly like the other structured CLIs.
+ *   - ZERO_PROMPT: CLIs whose bridge exists ONLY for zero-prompt spawns —
+ *     antigravity has no /adopt bridge at all; its brain transcript.jsonl is
+ *     drained just for final-reply harvest when the model cannot be taught a
+ *     send command.
  *
  * File-path resolution for JSONL-style bridges lives in
  * `resolveFileBridgePath` (same module family, worker-facing). Hermes/MTR
@@ -26,6 +33,7 @@ export const STRUCTURED_BRIDGE_ALWAYS_CLI_IDS = [
   'oh-my-pi',
   'ebsd',
   'grok',
+  'cursor',
 ] as const satisfies readonly CliId[];
 
 /** Adopt must forward pid/cwd/cliSessionId for these (CLIs whose worker
@@ -51,9 +59,33 @@ export const STRUCTURED_BRIDGE_ADOPT_CLI_IDS = [
 const ALWAYS_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS);
 const ADOPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ADOPT_CLI_IDS);
 
+/** Botmux-spawned CLIs that gain the structured bridge SOLELY under zero-prompt
+ *  injection (`promptInjection: 'none'`): in ordinary mode the model delivers
+ *  through `botmux send` and harvesting transcript finals would double-post.
+ *  A local-PTY-only CLI (no remote backend) with an append-only transcript
+ *  that can be distilled to the user → assistant_final shape:
+ *
+ *   - antigravity: `brain/<id>/.system_generated/logs/transcript.jsonl`
+ *     (`drainAntigravityTranscript`). No /adopt path exists for it today.
+ *
+ *  cursor USED to be listed here; it now rides the ALWAYS fallback (#932) —
+ *  its send-marker gate makes zero-prompt vs ordinary mode irrelevant.
+ *
+ *  Neither driver has a complete interrupted/error terminal contract, so it
+ *  stays OUT of STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS — the screen-ready
+ *  heuristic keeps owning turn boundaries. */
+export const STRUCTURED_BRIDGE_ZERO_PROMPT_CLI_IDS = [
+  'antigravity',
+] as const satisfies readonly CliId[];
+
+const ZERO_PROMPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ZERO_PROMPT_CLI_IDS);
+
 /** Drivers whose transcript contract exposes every terminal edge needed for a
  *  strong started-turn status gate. Codex has final_answer plus explicit
- *  turn_aborted parsing. Pi's drainPiTranscript closes a turn on
+ *  turn_aborted parsing. TRAE has task_complete (including error) and
+ *  turn_aborted; intermediate assistant messages are not terminal records.
+ *  Keep its caller authority alive through quiet tool/model waits too.
+ *  Pi's drainPiTranscript closes a turn on
  *  stop/length-without-toolcall and on the hard error/aborted edges (verified
  *  against pi 0.84.2: `terminate:true` is still not persisted and the newer
  *  pending/deferred StopReasons never reach the session JSONL), so a started
@@ -75,6 +107,7 @@ const ADOPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ADOPT_CLI_IDS);
  *  yet complete enough to let a started turn suppress screen-ready forever. */
 export const STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS = [
   'codex',
+  'traex',
   'pi',
   'oh-my-pi',
   'ebsd',
@@ -87,15 +120,41 @@ export function isStructuredBridgeLifecycleBlockingCli(cliId: string | undefined
   return !!cliId && LIFECYCLE_BLOCKING_SET.has(cliId);
 }
 
-/** Worker `codexBridgeFallbackActive` — cursor only when adoptMode. */
+/** Worker `codexBridgeFallbackActive` — the ALWAYS CLIs (including cursor, in
+ *  every mode), plus antigravity only under zero-prompt (it has no /adopt
+ *  bridge — never active in adopt mode even if both flags are passed). */
 export function isStructuredBridgeFallbackActive(
   cliId: string | undefined,
   adoptMode?: boolean,
+  /** The observing session runs with promptInjection:'none'. Antigravity's
+   *  bridge exists only with it. */
+  zeroPrompt?: boolean,
 ): boolean {
   if (!cliId) return false;
   if (ALWAYS_SET.has(cliId)) return true;
-  if (cliId === 'cursor') return adoptMode === true;
+  if (cliId === 'antigravity') return adoptMode !== true && zeroPrompt === true;
   return false;
+}
+
+/** Automatic final replies for botmux-spawned CLI sessions, WITHOUT an adopt
+ *  context: claude uses its own transcript bridge; the structured drivers that
+ *  are always on plus the zero-prompt-only CLIs above. The latter MUST still be
+ *  gated on promptInjection:'none' by the caller (see
+ *  core/prompt-injection.supportsZeroPromptInjection) — this predicate only
+ *  states that a harvestable transcript exists. */
+export function supportsZeroPromptStructuredBridge(cliId: string | undefined): boolean {
+  return !!cliId && (ALWAYS_SET.has(cliId) || ZERO_PROMPT_SET.has(cliId));
+}
+
+/** Automatic final replies for ordinary bot-spawned CLI sessions. Claude uses
+ * its own transcript bridge; the remaining drivers share the structured one.
+ * Deliberately EXCLUDES antigravity (the sole remaining zero-prompt-only
+ *  CLI): in default mode it replies via `botmux send`, so callers must not
+ *  expect transcript delivery from it. Note this only governs the opt-in
+ *  `replyDelivery: transcript` mode — the ALWAYS CLIs' send-marker-gated
+ *  fallback harvest (including cursor) runs regardless of this setting. */
+export function supportsTranscriptReplyDelivery(cliId: string | undefined): boolean {
+  return cliId === 'claude-code' || (!!cliId && ALWAYS_SET.has(cliId));
 }
 
 /** Daemon adopt path — forward transcript bind fields. */

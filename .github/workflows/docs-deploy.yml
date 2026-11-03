@@ -10,6 +10,7 @@ on:
     paths:
       - 'docs-site/**'
       - '.github/workflows/docs-deploy.yml'
+      - 'scripts/publish-gh-pages.sh'
   workflow_dispatch:
 
 permissions:
@@ -52,16 +53,10 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
-          git clone --depth 1 --branch gh-pages git@github.com:deepcoldy/deepcoldy.github.io.git pages
-          rm -rf pages/botmux
-          cp -a docs-site/doc_build pages/botmux
-          cd pages
-          git config user.name "botmux-docs-bot"
-          git config user.email "docs-bot@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "文档无变化，跳过发布。"
-            exit 0
-          fi
-          git commit -m "docs: 自动部署 /botmux/ (botmux@${GITHUB_SHA::7})"
-          git push origin gh-pages
+          export GIT_AUTHOR_NAME="botmux-docs-bot" GIT_COMMITTER_NAME="botmux-docs-bot"
+          export GIT_AUTHOR_EMAIL="docs-bot@users.noreply.github.com" GIT_COMMITTER_EMAIL="docs-bot@users.noreply.github.com"
+          # Single-commit publish shared with the Midscene report deploy: gh-pages
+          # keeps no history, and concurrent publishers retry instead of clobbering.
+          PAGES_REMOTE=git@github.com:deepcoldy/deepcoldy.github.io.git \
+            bash scripts/publish-gh-pages.sh docs-site/doc_build botmux \
+            "docs: 自动部署 /botmux/ (botmux@${GITHUB_SHA::7})"

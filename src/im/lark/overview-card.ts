@@ -28,8 +28,9 @@ import {
   type WorkbenchButtonLinks,
 } from '../../core/workbench-link.js';
 import type { CardActionData } from './card-handler.js';
+import { BACK_TO_OVERVIEW_ACTION, ackToast, errorToast, escapeLarkMd, type DashCardHandlerResult } from './dash-card-common.js';
 
-export const OVERVIEW_ACTION_REFRESH = 'dash_overview_refresh' as const;
+export const OVERVIEW_ACTION_REFRESH = BACK_TO_OVERVIEW_ACTION;
 export const OVERVIEW_ACTION_GOTO_SESSIONS = 'dash_overview_goto_sessions' as const;
 export const OVERVIEW_ACTION_GOTO_SCHEDULES = 'dash_overview_goto_schedules' as const;
 export const OVERVIEW_ACTION_GOTO_SETTINGS = 'dash_overview_goto_settings' as const;
@@ -154,18 +155,6 @@ function formatTime(time: string | undefined | null): string {
   const trimmed = time.trim();
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(trimmed)) return '04:00';
   return trimmed;
-}
-
-/**
- * Sanitize user/filesystem-supplied text for inclusion in lark_md. See
- * sessions-card.ts:escapeLarkMd for the escaping order rationale.
- */
-function escapeLarkMd(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/([*_~`])/g, '\\$1');
 }
 
 export interface BuildOverviewCardOpts {
@@ -427,22 +416,7 @@ export interface OverviewCardHandlerDeps {
   resolveWorkbench?: (larkAppId: string) => WorkbenchButtonLinks | undefined;
 }
 
-export interface OverviewCardHandlerResult {
-  toast?: { type: 'info' | 'success' | 'error'; content: string };
-  card?: { type: 'raw'; data: Record<string, unknown> };
-}
-
-function ackToast(textKey: string, locale: Locale): OverviewCardHandlerResult {
-  return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
-}
-
-function errorToast(
-  textKey: string,
-  params: Record<string, string> | undefined,
-  locale: Locale,
-): OverviewCardHandlerResult {
-  return { toast: { type: 'error', content: t(textKey, params, locale) } };
-}
+export type OverviewCardHandlerResult = DashCardHandlerResult;
 
 /**
  * Shape of `/__daemon/overview-snapshot` response body. Locally redeclared

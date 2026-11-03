@@ -73,6 +73,7 @@ export interface VcMeetingAgentOptionDto {
   /** 这个 bot 是否接收会议事件（bots.json vcMeetingAgent.enabled）。缺省视为
    *  开启——VC 对每个连着飞书的 bot 默认可用，`enabled: false` 是显式退出。 */
   vcEnabled: boolean;
+  inviterManagementEnabled?: boolean;
   /** apiOnly（无飞书连接）的 bot 结构上不可能收会议事件，UI 需要禁用它的开关。 */
   vcEligible: boolean;
   /** Configured per-bot in-meeting output policies (bots.json
@@ -96,6 +97,7 @@ export interface VcMeetingBotOutputPolicyPatch {
   appId: string;
   /** 会议事件接收开关（vcMeetingAgent.enabled）。 */
   vcEnabled: boolean;
+  inviterManagementEnabled?: boolean;
   /** null clears the override back to the daemon default. */
   textOutputPolicy: VcMeetingOutputPolicyValue | null;
   voiceOutputPolicy: VcMeetingOutputPolicyValue | null;
@@ -388,6 +390,7 @@ export function buildVcMeetingAgentOptions(
       sandboxIsolated: deps.sandboxIsolated(bot),
       // 缺省 = 开启：VC 对每个连着飞书的 bot 默认可用，enabled:false 才是退出。
       vcEnabled: vcEligible && vc?.enabled !== false,
+      inviterManagementEnabled: vc?.inviterManagementEnabled === true,
       vcEligible,
       textOutputPolicy,
       voiceOutputPolicy,
@@ -450,6 +453,10 @@ function parseBotOutputPolicyPatches(
       fieldErrors.push({ path: path('realtimeVoiceEnabled'), message: '必须是布尔值' });
       return;
     }
+    if (record.inviterManagementEnabled !== undefined && typeof record.inviterManagementEnabled !== 'boolean') {
+      fieldErrors.push({ path: path('inviterManagementEnabled'), message: '必须是布尔值' });
+      return;
+    }
     // 老客户端不发 vcEnabled：缺省保持「接收」，与 vcMeetingAgent.enabled 缺省
     // 语义一致，绝不能把没提交这个字段解释成「关闭接收」。
     if (record.vcEnabled !== undefined && typeof record.vcEnabled !== 'boolean') {
@@ -474,6 +481,7 @@ function parseBotOutputPolicyPatches(
       textOutputPolicy,
       voiceOutputPolicy,
       realtimeVoiceEnabled: record.realtimeVoiceEnabled,
+      ...(typeof record.inviterManagementEnabled === 'boolean' ? { inviterManagementEnabled: record.inviterManagementEnabled } : {}),
       catalogDefaultConsumerId,
     });
   });

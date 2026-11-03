@@ -1,8 +1,8 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { writeTextThenEnter } from './tui-input.js';
+import type { CliAdapter } from './types.js';
 
-import { delay } from '../../utils/timing.js';
 
 export function createAidenAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -30,22 +30,10 @@ export function createAidenAdapter(pathOverride?: string): CliAdapter {
       return `aiden --resume ${sessionId}`;
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
-        await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(content);
-        await delay(1000);
-        pty.write('\r');
-      }
-    },
+    writeInput: writeTextThenEnter,
 
     completionPattern: undefined,  // quiescence only
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: false,
   };
 }
-
-export const create = createAidenAdapter;

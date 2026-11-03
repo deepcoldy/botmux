@@ -3,12 +3,18 @@ import { createHmac } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from './helpers/node-ws.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
+import {
+  deriveTerminalCardViewToken,
+  deriveTerminalWriteToken,
+} from '../src/core/terminal-write-auth.js';
+import { dashboardSecretPath } from '../src/core/dashboard-secret.js';
+import { buildTerminalUrl, resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
 import {
   deriveWorkerViewGeneration,
   issueTerminalControlGrant,
@@ -183,6 +189,8 @@ setInterval(() => {}, 1_000);
       prompt: '',
       larkAppId: 'app_terminal_auth',
       larkAppSecret: 'secret',
+      terminalCardEpoch: 'terminal-auth-card-epoch',
+      locale: 'en',
     };
     child.send(init);
     const ready = await waitForReady(child, logs);
@@ -192,6 +200,9 @@ setInterval(() => {}, 1_000);
     // session expiry and worker restarts all left it valid forever).
     expect(ready.viewToken).toBeTruthy();
     expect(ready.viewToken).not.toBe(retiredStableViewToken(secret, sessionId));
+    expect(ready.cardViewToken).toBe(
+      deriveTerminalCardViewToken(secret, sessionId, 'terminal-auth-card-epoch'),
+    );
     // The operate/write link must still be the stable HMAC (not a random boot
     // token), so an already-issued 「操作链接」survives a worker restart that
     // re-runs init → refreshTerminalWriteToken → ready (P1-6: write-capability
@@ -201,12 +212,20 @@ setInterval(() => {}, 1_000);
 
     const scanner = await fetch(`${base}/`);
     expect(scanner.status).toBe(403);
-    expect(await scanner.text()).toBe('Forbidden');
+    const scannerHtml = await scanner.text();
+    expect(scannerHtml).toContain('Terminal link expired');
+    expect(scannerHtml).toContain('<html lang="en">');
+    expect(scannerHtml).not.toMatch(/[\u3400-\u9fff]/);
 
     const view = await fetch(`${base}/?viewToken=${encodeURIComponent(ready.viewToken!)}`);
     expect(view.status).toBe(200);
     const viewHtml = await view.text();
     expect(viewHtml).toContain('var hasToken=false');
+    const cardView = await fetch(
+      `${base}/?viewToken=${encodeURIComponent(ready.cardViewToken!)}`,
+    );
+    expect(cardView.status).toBe(200);
+    expect(await cardView.text()).toContain('var hasToken=false');
     // The browser must carry the view capability into its WS connection too.
     expect(viewHtml).toContain("base+'/'+location.search");
     // 无平台提示头时按本地只读渲染（readonly 横幅，不是 SSO 登录引导）。
@@ -361,8 +380,10 @@ setInterval(() => {}, 1_000);
       text => text.includes(Buffer.from(controlledInput).toString('hex')),
     );
     expect(controlledWritten).toContain(Buffer.from(controlledInput).toString('hex'));
-    const auditText = await waitForFileText(controlAuditLog, text => text.includes('terminal.input'));
-    const auditRows = auditText.trim().split('\n').map(line => JSON.parse(line));
+    // The worker is still appending audit rows: wait for the whole input row.
+    await waitForFileText(controlAuditLog, () => readJsonLines(controlAuditLog).some(row => row.action === 'terminal.input'));
+    const auditText = readFileSync(controlAuditLog, 'utf8');
+    const auditRows = readJsonLines(controlAuditLog);
     expect(auditRows).toContainEqual(expect.objectContaining({
       timestamp: expect.any(String),
       user: 'ou_h5_owner',
@@ -386,7 +407,9 @@ setInterval(() => {}, 1_000);
     expect(written).toContain(Buffer.from('WRITE_OK\n').toString('hex'));
     writeWs.close();
 
+    const childExit = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
     child.send({ type: 'close' } satisfies DaemonToWorker);
+    await childExit;
   }, 25_000);
 
   // P1-5 第二轮：view grant 只有「经中央前门」才算数。之前的实现里，view-link 返回的
@@ -493,16 +516,18 @@ setInterval(() => {}, 1_000);
       headers: centralForwardHeaders(secret, wrongGeneration),
     })).status).toBe(403);
 
-    // 7) 飞书卡片那条链路（worker 每 boot 明文 token）语义不变，仍然直连可读——
-    //    收紧的只是签名 grant，不是所有只读入口。
+    // 7) Worker 每 boot 的内部 token 仍然直连可读——收紧的只是签名 grant，
+    //    不是所有只读入口。
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(boot)}`)).status).toBe(200);
 
+    const childExit = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
     child.send({ type: 'close' } satisfies DaemonToWorker);
+    await childExit;
   }, 25_000);
 
-  // P1-5 回归矩阵的收尾一格：worker 重启后，重启前发出的一切读 token（旧稳定
-  // HMAC、上一代 boot token）全部失效；而显式写能力（操作链接）跨重启存活不变。
-  it('a worker restart invalidates every prior read capability while the operate link survives', async () => {
+  // P1-5 回归矩阵的收尾一格：worker 重启后，上一代 boot token 与中央 grant
+  // 失效；卡片 token 在同一 session 生命周期内保持稳定；操作链接也继续存活。
+  it('a worker restart invalidates boot grants while the card link and operate link survive', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-terminal-restart-'));
     tempDirs.add(root);
     const dataDir = join(root, 'session');
@@ -532,8 +557,11 @@ setInterval(() => {}, 1_000);
       prompt: '',
       larkAppId: 'app_terminal_restart',
       larkAppSecret: 'secret',
+      terminalCardEpoch: 'terminal-card-lifecycle-1',
     };
-    const spawnWorker = async (): Promise<{ child: ChildProcess; ready: Extract<WorkerToDaemon, { type: 'ready' }> }> => {
+    const spawnWorker = async (
+      message: DaemonToWorker = init,
+    ): Promise<{ child: ChildProcess; ready: Extract<WorkerToDaemon, { type: 'ready' }> }> => {
       const logs: string[] = [];
       const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
@@ -550,12 +578,16 @@ setInterval(() => {}, 1_000);
       children.add(child);
       child.stdout?.on('data', chunk => logs.push(chunk.toString()));
       child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-      child.send(init);
+      child.send(message);
       return { child, ready: await waitForReady(child, logs) };
     };
 
     const first = await spawnWorker();
     const firstViewToken = first.ready.viewToken!;
+    const firstCardViewToken = first.ready.cardViewToken!;
+    expect(firstCardViewToken).toBe(
+      deriveTerminalCardViewToken(secret, sessionId, 'terminal-card-lifecycle-1'),
+    );
     expect(first.ready.token).toBe(deriveTerminalWriteToken(secret, sessionId));
     // 重启前中央签发的一条 view capability（含会签）。它在这一代是好使的。
     const firstGenerationCapability = centralViewCapability(secret, sessionId, firstViewToken, {
@@ -568,19 +600,21 @@ setInterval(() => {}, 1_000);
     );
     expect(beforeRestart.status).toBe(200);
     const firstExit = new Promise<void>(resolvePromise => first.child.once('exit', () => resolvePromise()));
-    first.child.kill('SIGKILL');
+    first.child.send({ type: 'close' } satisfies DaemonToWorker);
     await firstExit;
 
     const second = await spawnWorker();
     // 新一代 boot token 与上一代不同；写 token 稳定不变。
     expect(second.ready.viewToken).toBeTruthy();
     expect(second.ready.viewToken).not.toBe(firstViewToken);
+    expect(second.ready.cardViewToken).toBe(firstCardViewToken);
     expect(second.ready.token).toBe(first.ready.token);
 
     const base = `http://127.0.0.1:${second.ready.port}`;
     // 重启前的读能力（上一代 boot token、退役的稳定 HMAC）全部 403。
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(firstViewToken)}`)).status).toBe(403);
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(retiredStableViewToken(secret, sessionId))}`)).status).toBe(403);
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(firstCardViewToken)}`)).status).toBe(200);
     // P1-5：重启前签发的中央 view capability 也一起死掉——同一把 .dashboard-secret
     // 仍在，签名和有效期都还成立，但它钉的 generation 属于上一代 worker，且会签也不
     // 会让它复活。旧 grant 跨 worker restart 继续读终端的路就此封死。
@@ -605,7 +639,117 @@ setInterval(() => {}, 1_000);
     expect(write.status).toBe(200);
     expect(await write.text()).toContain('var hasToken=true');
 
+    const secondExit = new Promise<void>(resolvePromise => second.child.once('exit', () => resolvePromise()));
     second.child.send({ type: 'close' } satisfies DaemonToWorker);
+    await secondExit;
+
+    const third = await spawnWorker({
+      ...init,
+      terminalCardEpoch: 'terminal-card-lifecycle-2',
+    });
+    expect(third.ready.cardViewToken).not.toBe(firstCardViewToken);
+    const thirdBase = `http://127.0.0.1:${third.ready.port}`;
+    expect((await fetch(
+      `${thirdBase}/?viewToken=${encodeURIComponent(firstCardViewToken)}`,
+    )).status).toBe(403);
+    expect((await fetch(
+      `${thirdBase}/?viewToken=${encodeURIComponent(third.ready.cardViewToken!)}`,
+    )).status).toBe(200);
+
+    const thirdExit = new Promise<void>(resolvePromise => third.child.once('exit', () => resolvePromise()));
+    third.child.send({ type: 'close' } satisfies DaemonToWorker);
+    await thirdExit;
+  }, 45_000);
+
+  // #2279：daemon 重启后、下一次 fork 之前重建的卡片，worker 的 ready token 已不在
+  // daemon 内存里。链接改由 daemon 按落盘 epoch 派生 card 读能力——这里拿它去连一个
+  // 「被这条链接唤醒」的真实 worker，证明 worker 侧读权限判定认它；修复前同一张卡上
+  // 的裸链接会被同一个 worker 403。
+  it('#2279: a card rebuilt before the restored session re-forks still opens read-only on the woken worker', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-terminal-restored-card-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const secret = 'integration-restored-card-secret';
+    const botmuxDir = join(root, '.botmux');
+    mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(botmuxDir, '.dashboard-secret'), secret, { mode: 0o600 });
+    // daemon 侧（本进程）读同一把 host-only secret；单测进程的 HOME 被 unit-setup
+    // 围到另一个临时目录，所以在那边放同样的值。
+    mkdirSync(dirname(dashboardSecretPath()), { recursive: true, mode: 0o700 });
+    writeFileSync(dashboardSecretPath(), secret, { mode: 0o600 });
+    const fakeCli = join(root, 'fake-claude');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+process.stdin.setRawMode?.(true);
+process.stdin.resume();
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const sessionId = 'terminal-restored-card-session';
+    const epoch = 'restored-card-lifecycle';
+    // 恢复后的会话：没有 worker，ready 时上报的 token 全部为空，只剩落盘的 epoch。
+    setTerminalProxyPort(18_801);
+    let rebuiltLink: string;
+    try {
+      rebuiltLink = buildTerminalUrl({
+        session: { sessionId, terminalCardEpoch: epoch },
+        workerPort: null,
+        workerToken: null,
+        workerViewToken: null,
+        workerCardViewToken: null,
+      });
+    } finally {
+      resetTerminalProxy();
+      rmSync(dashboardSecretPath(), { force: true });
+    }
+    const viewToken = new URL(rebuiltLink).searchParams.get('viewToken');
+    expect(viewToken).toBeTruthy();
+
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_terminal_restored_card',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_terminal_restored_card',
+      rootMessageId: 'om_terminal_restored_card',
+      workingDir: dataDir,
+      cliId: 'claude-code',
+      cliPathOverride: fakeCli,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_terminal_restored_card',
+      larkAppSecret: 'secret',
+      terminalCardEpoch: epoch,
+    } satisfies DaemonToWorker);
+    const ready = await waitForReady(child, logs);
+    const base = `http://127.0.0.1:${ready.port}`;
+
+    const page = await fetch(`${base}/?viewToken=${encodeURIComponent(viewToken!)}`);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain('var hasToken=false');
+    const ws = await rawWsHandshake(ready.port, `/?viewToken=${encodeURIComponent(viewToken!)}`);
+    expect(ws).toMatch(/^HTTP\/1\.1 101 /);
+    // 修复前重建出的裸链接：同一个 worker、没有登录态 → 403。
+    expect((await fetch(`${base}/`)).status).toBe(403);
+
+    const exit = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
+    child.send({ type: 'close' } satisfies DaemonToWorker);
+    await exit;
   }, 45_000);
 
   // ── P1-3：握手前放行 ≠ 登记那一刻仍然有效 ────────────────────────────────────
@@ -773,6 +917,8 @@ setInterval(() => {}, 1_000);
       centralForwardHeaders(secret, currentGeneration),
     )).toContain('101 Switching Protocols');
 
+    const childExit = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
     child.send({ type: 'close' } satisfies DaemonToWorker);
+    await childExit;
   }, 90_000);
 });

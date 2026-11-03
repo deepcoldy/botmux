@@ -1,4 +1,5 @@
 node_modules
+.worktrees/
 .pnpm-store/
 dist/
 # 编译版单文件二进制（bun build --compile，每个 ~170MB）。CI 与发版都往这里写，
@@ -17,8 +18,10 @@ docs/superpowers/
 docs/specs/
 storageState.json
 midscene_run/
+.midscene/
 .codex
 .claude/
+.codegraph/
 .antigravitycli/
 .cjadk/
 .trae/
@@ -26,11 +29,6 @@ midscene_run/
 .magic-token
 .magic-apps.json
 docs-site/.magic-token
-
-# HD2D office runtime binaries — downloaded on demand from GitHub Release
-# (hd2d-assets-*), never committed. See src/dashboard/hd2d-assets.ts
-src/dashboard/web/game/index.wasm
-src/dashboard/web/game/index.pck
 
 # Playwright MCP verification artifacts
 .playwright-mcp/
@@ -53,3 +51,9 @@ src/desktop/assets/*.png
 
 # OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
 .omo/
+# no-mistakes 评测代理产物（coverage/profile、stdout/stderr、manifest），本地留存
+.no-mistakes/
+test-bots.json
+
+# tmux 客户端调试日志（曾被误提交）
+tmux-client-*.log

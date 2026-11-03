@@ -27,6 +27,12 @@ import type { PtyHandle } from '../src/adapters/cli/types.js';
 // both: mid-turn submits queue and append only on flushQueue(), and a bare
 // Enter on an empty composer with a non-empty queue counts a send-now
 // cancellation instead of pretending to be a no-op.
+//
+// What a queued submit DOES produce at once (measured 1.0.5–1.0.70): a
+// `prompt.enqueue` line in $GROK_HOME/logs/unified.jsonl carrying the Grok
+// process pid and the submitted body's UTF-8 byte length. The mock writes it
+// on every committing Enter, idle or mid-turn, unless `enqueueLog` says the
+// line is missing (no receipt on this host) or held back (flushed late).
 
 const SID = '00000000-0000-7000-8000-00000000aaaa';
 const CWD = '/fake/grok-project';
@@ -47,6 +53,19 @@ function appendPrompt(sid: string, prompt: string): void {
   );
 }
 
+/** Grok's composer rewrite of a pasted body (measured): tab → 4 spaces, \r → \n. */
+function composerText(body: string): string {
+  return body.replace(/\t/g, '    ').replace(/\r/g, '\n');
+}
+
+function appendEnqueue(pid: number, body: string, atMs = Date.now()): void {
+  mkdirSync(join(grokHome, 'logs'), { recursive: true });
+  appendFileSync(join(grokHome, 'logs', 'unified.jsonl'), `${JSON.stringify({
+    ts: new Date(atMs).toISOString(), src: 'grok-pager', pid, ver: '1.0.70', lvl: 'info',
+    msg: 'prompt.enqueue', ctx: { len: Buffer.byteLength(composerText(body)) },
+  })}\n`);
+}
+
 /** A pty whose composer behaves like grok 1.0.5: pasted text accumulates; a
  *  "swallowed" Enter becomes a soft newline in the composer (the legacy
  *  send-keys failure mode); a committing Enter either records the WHOLE
@@ -55,25 +74,43 @@ function appendPrompt(sid: string, prompt: string): void {
  *  previous turn completing (dequeue-time append, measured on 1.0.5). A bare
  *  Enter on an empty composer while the queue is non-empty is send-now: it
  *  cancels the running turn (measured; NOT a no-op). */
-function makePty(opts: { cwd?: string; sid?: string; swallowEnters?: number; midTurn?: boolean } = {}): PtyHandle & {
+function makePty(opts: {
+  cwd?: string;
+  sid?: string;
+  swallowEnters?: number;
+  midTurn?: boolean;
+  enqueueLog?: 'immediate' | 'missing' | 'held';
+} = {}): PtyHandle & {
   pasteText: ReturnType<typeof vi.fn>;
   sendText: ReturnType<typeof vi.fn>;
   sendSpecialKeys: ReturnType<typeof vi.fn>;
   composer(): string;
   sendNowCancels(): number;
   flushQueue(): void;
+  flushEnqueueLog(): void;
 } {
   let composer = '';
   let swallowLeft = opts.swallowEnters ?? 0;
   const queued: string[] = [];
+  const heldEnqueues: Array<{ body: string; atMs: number }> = [];
   let sendNowCancels = 0;
+  const cliPid = process.pid;
+  const enqueued = (body: string) => {
+    if (opts.enqueueLog === 'missing') return;
+    if (opts.enqueueLog === 'held') heldEnqueues.push({ body, atMs: Date.now() });
+    else appendEnqueue(cliPid, body);
+  };
   return {
     write: vi.fn(),
     cliCwd: opts.cwd ?? CWD,
+    cliPid,
     composer: () => composer,
     sendNowCancels: () => sendNowCancels,
     flushQueue: () => {
-      for (const body of queued.splice(0)) appendPrompt(opts.sid ?? SID, body);
+      for (const body of queued.splice(0)) appendPrompt(opts.sid ?? SID, composerText(body).trim());
+    },
+    flushEnqueueLog: () => {
+      for (const { body, atMs } of heldEnqueues.splice(0)) appendEnqueue(cliPid, body, atMs);
     },
     pasteText: vi.fn((text: string) => { composer += text; }),
     sendText: vi.fn(),
@@ -90,12 +127,13 @@ function makePty(opts: { cwd?: string; sid?: string; swallowEnters?: number; mid
         if (queued.length > 0) sendNowCancels += 1;
         return;
       }
+      enqueued(composer);
       if (opts.midTurn) {
         queued.push(composer); // Enter:queue — appends only at dequeue
         composer = '';
         return;
       }
-      appendPrompt(opts.sid ?? SID, composer);
+      appendPrompt(opts.sid ?? SID, composerText(composer).trim());
       composer = '';
     }),
   };
@@ -155,15 +193,57 @@ describe.sequential('grok adapter submit delivery (prompt_history.jsonl)', () =>
     expect(await (result as any).recheck()).toEqual({ submitted: true, cliSessionId: SID });
   });
 
-  it('REGRESSION: a resend after a mid-turn verify miss re-pastes the body — never a bare Enter (send-now cancel)', async () => {
-    // Mid-turn a submit parks in grok's own queue: the composer is EMPTY and
-    // prompt_history appends only at dequeue, so verify misses (measured 6/6
-    // on 1.0.5) and the caller is told「提交未确认」. If the adapter kept an
-    // Enter-only memory for the "unconfirmed" body, the user's manual resend
-    // of the same text would fire a bare Enter at `Enter:send now` — grok
-    // cancels the running turn AND the resent message is never delivered.
+  it('confirms a mid-turn follow-up from its enqueue receipt — before dequeue, with one paste and one Enter', async () => {
+    // #1016: the follow-up is parked in grok's queue behind a turn that may
+    // run for minutes; prompt_history only gets it at dequeue. Its receipt is
+    // the enqueue line, so the caller must not be told「提交未确认」.
     const adapter = createGrokAdapter('/bin/grok');
     const pty = makePty({ midTurn: true });
+
+    const result = await adapter.writeInput(pty, '忙时追加\n第二行');
+
+    expect(result).toEqual({ submitted: true });
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(pty.sendNowCancels()).toBe(0);
+  });
+
+  it('a late-flushed enqueue line confirms through the deferred recheck; a sibling Grok process line never does', async () => {
+    const adapter = createGrokAdapter('/bin/grok');
+    const pty = makePty({ midTurn: true, enqueueLog: 'held' });
+    const body = '排队中的追加消息';
+
+    const result = await adapter.writeInput(pty, body);
+    expect(result).toMatchObject({ submitted: false });
+
+    // Another Grok under the same GROK_HOME queues an identical body.
+    appendEnqueue(pty.cliPid! + 1, body);
+    expect(await (result as any).recheck()).toBe(false);
+
+    pty.flushEnqueueLog();
+    expect(await (result as any).recheck()).toBe(true);
+  });
+
+  it('confirms an idle body containing tabs from prompt_history, with its session id', async () => {
+    // Grok stores the composer form (tab → four spaces), never the pasted text.
+    const adapter = createGrokAdapter('/bin/grok');
+    const pty = makePty();
+
+    const result = await adapter.writeInput(pty, 'func main() {\n\tfmt.Println(1)\n}');
+
+    expect(result).toEqual({ submitted: true, cliSessionId: SID });
+  });
+
+  it('REGRESSION: a resend after a mid-turn verify miss re-pastes the body — never a bare Enter (send-now cancel)', async () => {
+    // Without an enqueue receipt (no unified log line for this pid, e.g. a
+    // PID-namespaced sandbox) a mid-turn submit still verifies only at
+    // dequeue: the composer is EMPTY and the caller is told「提交未确认」.
+    // If the adapter kept an Enter-only memory for the "unconfirmed" body,
+    // the user's manual resend of the same text would fire a bare Enter at
+    // `Enter:send now` — grok cancels the running turn AND the resent message
+    // is never delivered.
+    const adapter = createGrokAdapter('/bin/grok');
+    const pty = makePty({ midTurn: true, enqueueLog: 'missing' });
     const body = '[卡片: critical 报警]\n多行正文 padding';
 
     const first = await adapter.writeInput(pty, body);

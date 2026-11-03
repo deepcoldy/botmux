@@ -89,10 +89,10 @@ async function assertBundledCanvasArchitectures() {
  * Copy node-pty into the staged runtime tree.
  *
  * WHY A COPY INSTEAD OF A DEPENDENCY: node-pty is a devDependency on purpose. It has
- * an `install` script (`node scripts/prebuild.js || node-gyp rebuild`) and ships NO
- * linux prebuild, so any placement npm/bun would install for an end user turns a
- * node-gyp toolchain into an install prerequisite — measured: `npm i -g botmux` then
- * compiles pty.node from source on every machine that has a compiler. The CLI does
+ * an `install` script (`node scripts/prebuild.js || node-gyp rebuild`) that, on any
+ * host without a matching prebuild (every linux host before 1.2.0-beta.15), turns a
+ * node-gyp toolchain into an install prerequisite — measured with 1.1.0: `npm i -g
+ * botmux` compiled pty.node from source on every machine that has a compiler. The CLI does
  * not need it installed at all (the single-file binary embeds pty.node at compile
  * time), and the desktop app does not need it BUILT: node-pty's loader tries
  * `build/Release` → `build/Debug` → `prebuilds/<platform>-<arch>` (lib/utils.js), and
@@ -123,8 +123,8 @@ async function stageNodePty() {
   // How a stray build/ appears: node-pty's install script (scripts/prebuild.js)
   // exits 0 when `prebuilds/<platform>-<arch>` exists and only falls through to
   // `node-gyp rebuild` when it does not. So the release runner (macOS, prebuilds
-  // present) normally has no build/ — but a Linux dev box does (no linux prebuild),
-  // `npm_config_build_from_source=true` forces one, and a future node-pty could drop
+  // present) normally has no build/ — but a Linux dev box on node-pty < 1.2.0-beta.15
+  // did, `npm_config_build_from_source=true` forces one, and a future node-pty could drop
   // a darwin prebuild. Any of those leaves an artifact for this cp to pick up.
   //
   // Worst case is silent and arch-specific: a macOS builder produces a SINGLE-arch

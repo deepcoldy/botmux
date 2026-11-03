@@ -17,6 +17,10 @@ function tmp(): string {
 afterEach(() => {
   delete process.env.BOTMUX_DSH_ASK_BRIDGE;
   delete process.env.DSH_HOME;
+  delete process.env.BOTMUX_DSH_ASK_TIMEOUT_MS;
+  delete process.env.BOTMUX_SESSION_ID;
+  delete process.env.BOTMUX_CHAT_ID;
+  delete process.env.BOTMUX_LARK_APP_ID;
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.clear();
 });
@@ -224,7 +228,7 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ 
     process.env.BOTMUX_SESSION_ID = 's';
     process.env.BOTMUX_CHAT_ID = 'c';
     process.env.BOTMUX_LARK_APP_ID = 'app';
-    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '10';
+    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '5000';
     const request = { questions: [{ id: 'q', question: 'Q?', options: [{ label: 'Yes' }, { label: 'No' }] }] };
     const runOfficial = async (home: string, hookCommand: { cmd: string; args: string[] }, salt: string, signal?: AbortSignal) => {
       const result = ensureDshQuestionBridgePatch({ cliId: 'dsh', homeDir: home, hookCommand, buildSalt: salt })!;
@@ -243,11 +247,13 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ 
     await expect(runOfficial(nonzeroHome, { cmd: process.execPath, args: [nonzero] }, 'nonzero'))
       .rejects.toThrow(/nonzero-exit/);
 
+    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '10';
     const timeoutHome = tmp();
     const hang = makeHookScript(timeoutHome, `setTimeout(() => {}, 10000);`);
     await expect(runOfficial(timeoutHome, { cmd: process.execPath, args: [hang] }, 'timeout'))
       .rejects.toThrow(/timeout/);
 
+    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '5000';
     const abortHome = tmp();
     const abortScript = makeHookScript(abortHome, `setTimeout(() => {}, 10000);`);
     const controller = new AbortController();
@@ -264,6 +270,29 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ 
     delete process.env.BOTMUX_CHAT_ID;
     delete process.env.BOTMUX_LARK_APP_ID;
     delete process.env.BOTMUX_DSH_ASK_TIMEOUT_MS;
+  });
+
+  it('generated ordinary bridge survives a hook that exits without reading its request', async () => {
+    // A request larger than the pipe buffer keeps the stdin write pending until
+    // the hook reads it; a hook that exits first turns that write into EPIPE.
+    // Without a listener the stream error is thrown at process level (the dsh
+    // TUI dies); the bridge must report the hook's exit instead.
+    process.env.BOTMUX_SESSION_ID = 's';
+    process.env.BOTMUX_CHAT_ID = 'c';
+    process.env.BOTMUX_LARK_APP_ID = 'app';
+    const home = tmp();
+    const hook = makeHookScript(home, `process.exit(7);`);
+    const result = ensureDshQuestionBridgePatch({
+      cliId: 'dsh',
+      homeDir: home,
+      hookCommand: { cmd: process.execPath, args: [hook] },
+      buildSalt: 'early-exit-epipe',
+    })!;
+    const mod = await import(`${pathToFileURL(result.pluginPath).href}?case=${Date.now()}`);
+    let listener: ((request: any, next: () => Promise<any>) => Promise<any>) | undefined;
+    mod.apply({ get: () => undefined, on: (_name: string, fn: typeof listener) => { listener = fn; return () => true; } });
+    const request = { questions: [{ id: 'q', question: 'Q?', detail: 'x'.repeat(256 * 1024), options: [{ label: 'Yes' }, { label: 'No' }] }] };
+    await expect(listener!(request, async () => ({ answers: [] }))).rejects.toThrow(/nonzero-exit/);
   });
 
   it('generated ordinary bridge throws visible errors on passthrough and malformed hook output', async () => {

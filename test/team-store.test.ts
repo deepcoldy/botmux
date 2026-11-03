@@ -3,13 +3,14 @@
  * matchable on any identifier.
  * Run: pnpm vitest run test/team-store.test.ts
  */
-import { mkdtempSync, existsSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { logger } from '../src/utils/logger.js';
 import {
   DEFAULT_TEAM_ID, listTeams, getTeam, getDefaultTeam, ensureDefaultTeam,
-  createTeam, addMember, removeMember, isMember, deleteTeam, listTeamsForMember,
+  createTeam, addMember, removeMember, isMember, deleteTeam,
 } from '../src/services/team-store.js';
 
 let dataDir: string;
@@ -90,16 +91,28 @@ describe('team-store', () => {
     expect(listTeams(dataDir).map(t => t.id)).toEqual([b.id]);
     expect(deleteTeam(dataDir, 'nope')).toBe(false);
   });
+});
 
-  it('listTeamsForMember returns only teams the identity belongs to', () => {
-    const a = createTeam(dataDir, 'A');
-    const b = createTeam(dataDir, 'B');
-    createTeam(dataDir, 'C');
-    addMember(dataDir, a.id, { unionId: 'on_1' });
-    addMember(dataDir, b.id, { unionId: 'on_1' });
-    addMember(dataDir, b.id, { unionId: 'on_2' });
-    expect(listTeamsForMember(dataDir, { unionId: 'on_1' }).map(t => t.id).sort()).toEqual([a.id, b.id].sort());
-    expect(listTeamsForMember(dataDir, { unionId: 'on_2' }).map(t => t.id)).toEqual([b.id]);
-    expect(listTeamsForMember(dataDir, {})).toEqual([]);
+describe('team-store: corrupt file is quarantined, not overwritten', () => {
+  beforeEach(() => { vi.spyOn(logger, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('a corrupt teams.json (all teams + members) survives as teams.json.corrupt-* after the next write', () => {
+    const corrupt = '{"version":1,"teams":[{"id":"default","name":"x","members":[{"unionId":"on_1"';
+    writeFileSync(join(dataDir, 'teams.json'), corrupt);
+
+    expect(listTeams(dataDir)).toEqual([]);
+    const t = createTeam(dataDir, 'new team');
+    expect(listTeams(dataDir).map(x => x.id)).toEqual([t.id]);
+
+    const quarantined = readdirSync(dataDir).filter(f => f.startsWith('teams.json.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+    expect(readFileSync(join(dataDir, quarantined[0]), 'utf-8')).toBe(corrupt);
+  });
+
+  it('valid JSON without a teams array is treated as corrupt (shape check preserved)', () => {
+    writeFileSync(join(dataDir, 'teams.json'), '{"version":1,"teams":"nope"}');
+    expect(listTeams(dataDir)).toEqual([]);
+    expect(readdirSync(dataDir).filter(f => f.startsWith('teams.json.corrupt-'))).toHaveLength(1);
   });
 });

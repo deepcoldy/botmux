@@ -210,10 +210,10 @@ function validEntry(raw: unknown): ValidatedStoreEntry | null {
     ? v.updateCommand.trim()
     : null;
   const updateCommand = provider !== 'auto' && !autoUnmanaged
-    ? persistedUpdateCommand
+    ? normalizeUpdateCommand(persistedUpdateCommand)
     : null;
   return {
-    needsRewrite: provider === 'auto' && persistedUpdateCommand !== null,
+    needsRewrite: updateCommand !== persistedUpdateCommand,
     entry: {
       cliId: 'codex',
       runtimeId,
@@ -303,11 +303,19 @@ function versionFromText(raw: unknown): string | null {
   return match && parseVersion(match[0]) ? match[0] : null;
 }
 
+/** Doctor uses status labels when it cannot identify an update command. */
+function normalizeUpdateCommand(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const command = value.trim();
+  if (!command || /^(?:manual(?: or unknown)?|standalone installer|unknown|unavailable|unsupported|none|n\/a)$/i.test(command)) return null;
+  return command;
+}
+
 function doctorUpdateDetails(raw: string): {
   current: string | null;
   probedLatest: string | null;
   cachedLatest: string | null;
-  updateCommand?: string;
+  updateCommand: string | null;
   installTarget?: string;
 } {
   const parsed = JSON.parse(raw) as Record<string, unknown>;
@@ -326,9 +334,7 @@ function doctorUpdateDetails(raw: string): {
     current: versionFromText(parsed.codexVersion),
     probedLatest: versionFromText(details['latest version probe']) ?? versionFromText(details['latest version']),
     cachedLatest: versionFromText(details['cached latest version']),
-    ...(typeof details['update action'] === 'string' && details['update action'].trim()
-      ? { updateCommand: details['update action'].trim() }
-      : {}),
+    updateCommand: normalizeUpdateCommand(details['update action']),
     ...(installTargetKey && typeof details[installTargetKey] === 'string' && details[installTargetKey]
       ? { installTarget: details[installTargetKey] as string }
       : {}),
@@ -435,12 +441,6 @@ function refreshAutoTargetProvenance(
   }
 }
 
-function shellQuote(value: string): string {
-  return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value)
-    ? value
-    : `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
 /** Read-only provider-aware probe. The official provider alone may fall back
  * to @openai/codex. `auto` requires exact npm-bin provenance; if provenance
  * cannot identify an update stream, it is reported unmanaged and remains
@@ -486,7 +486,7 @@ export async function probeCliRuntimeUpdate(
         current,
         latest: trustedDoctor.probedLatest,
         managed: true,
-        updateCommand: trustedDoctor.updateCommand ?? `${shellQuote(target.binPath)} update`,
+        updateCommand: trustedDoctor.updateCommand,
         ...(trustedDoctor.installTarget ? { installTarget: trustedDoctor.installTarget } : {}),
       };
     }
@@ -495,7 +495,7 @@ export async function probeCliRuntimeUpdate(
       current,
       latest: latest ?? trustedDoctor?.cachedLatest ?? null,
       managed: true,
-      updateCommand: trustedDoctor?.updateCommand ?? `${shellQuote(target.binPath)} update`,
+      updateCommand: trustedDoctor?.updateCommand ?? null,
       ...(trustedDoctor?.installTarget ? { installTarget: trustedDoctor.installTarget } : {}),
     };
   }
@@ -952,7 +952,12 @@ export function buildCliRuntimeUpdateCard(
     t('cli_update.binary', { path: `\`${inlineCode(entry.binPath)}\`` }, locale),
   ];
   if (entry.installTarget) lines.push(t('cli_update.install_target', { path: `\`${inlineCode(entry.installTarget)}\`` }, locale));
-  if (entry.updateCommand) lines.push(t('cli_update.command', { command: `\`${inlineCode(entry.updateCommand)}\`` }, locale));
+  const updateCommand = normalizeUpdateCommand(entry.updateCommand);
+  if (updateCommand) {
+    lines.push(t('cli_update.command', { command: `\`${inlineCode(updateCommand)}\`` }, locale));
+  } else {
+    lines.push(t('cli_update.command_unknown', undefined, locale));
+  }
   lines.push(t('cli_update.manual_only', undefined, locale));
   if (opts.dashboardUrl) lines.push(t('cli_update.dashboard', { url: opts.dashboardUrl }, locale));
   return JSON.stringify({

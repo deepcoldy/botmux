@@ -103,10 +103,61 @@ describe('canRunDaemonCommand gate', () => {
     expect(canRunDaemonCommand('ct1', 'oc_other', 'ou_stranger', undefined, '/status')).toBe(false);
   });
 
+  it('schema talk-level command (/resume) needs only canTalk, without any downgrade list', () => {
+    getBot('ct1').config.canTalkDaemonCommands = undefined;
+    expect(canOperate('ct1', 'oc_1', 'ou_guest')).toBe(false);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/resume')).toBe(true);
+    expect(canRunDaemonCommand('ct1', 'oc_oncall', 'ou_stranger', undefined, '/resume')).toBe(true);
+    // Still gated on talk: a sender who cannot talk here cannot resume either.
+    expect(canRunDaemonCommand('ct1', 'oc_other', 'ou_stranger', undefined, '/resume')).toBe(false);
+    // Other commands keep the operator gate.
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/restart')).toBe(false);
+  });
+
   it('no list configured → behaves exactly like canOperate', () => {
     getBot('ct1').config.canTalkDaemonCommands = undefined;
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/status')).toBe(false);
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_owner', undefined, '/status')).toBe(true);
+  });
+
+  it('trigger-user auth enabled → talk-only sender can run /login without an explicit downgrade', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.triggerUserAuth = {
+      enabled: true,
+      tools: ['bytedcli'],
+      fallback: 'bot-identity',
+    };
+
+    expect(canTalk('ct1', 'oc_1', 'ou_guest')).toBe(true);
+    expect(canOperate('ct1', 'oc_1', 'ou_guest')).toBe(false);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(true);
+  });
+
+  it('trigger-user auth disabled → /login remains operator-only', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.triggerUserAuth = {
+      enabled: false,
+      tools: ['bytedcli'],
+      fallback: 'bot-identity',
+    };
+
+    expect(canTalk('ct1', 'oc_1', 'ou_guest')).toBe(true);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(false);
+  });
+
+  it('trigger-user auth never lowers unrelated daemon commands to canTalk', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.triggerUserAuth = {
+      enabled: true,
+      tools: ['bytedcli'],
+      fallback: 'bot-identity',
+    };
+
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/restart')).toBe(false);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/botconfig')).toBe(false);
   });
 
   it('p2pOpen leg works only when chatType is passed (fail-closed without)', () => {

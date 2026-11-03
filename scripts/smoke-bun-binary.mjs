@@ -63,8 +63,10 @@ if (!existsSync(binary)) {
 const PORTS = { ipc: 19950, proxy: 19800, dashboard: 19891 };
 const DASHBOARD_ONLINE_TIMEOUT_MS = 30_000;
 /** Separate budget for "the HTTP listener is bound": fleet-state `online` only
- *  proves the process spawned, so this waits on the socket after that. */
-const DASHBOARD_HTTP_TIMEOUT_MS = 20_000;
+ *  proves the process spawned, so this waits on the socket after that. ARM64
+ *  musl release runners have taken longer than 20s to load the compiled binary
+ *  and bind the listener, so keep enough headroom for the slow shipped leg. */
+const DASHBOARD_HTTP_TIMEOUT_MS = 40_000;
 
 const home = mkdtempSync(join(tmpdir(), 'botmux-bun-smoke-'));
 mkdirSync(join(home, '.botmux'), { recursive: true });
@@ -457,6 +459,19 @@ for (;;) {
   await delay(250);
 }
 console.log(`smoke: ✅ http — dashboard is serving (status ${served})`);
+const dashboardOutPath = join(home, '.botmux', 'logs', 'dashboard-out.log');
+// Serving HTTP and flushing stdout to the supervisor's log file are separate
+// readiness signals. Allow the write to land without accepting a missing log.
+const dashboardLogDeadline = Date.now() + 5_000;
+while (true) {
+  const dashboardOut = existsSync(dashboardOutPath) ? readFileSync(dashboardOutPath, 'utf8') : '';
+  if (dashboardOut.includes('[INFO] [dashboard] listening on')) break;
+  if (supervisor.exitCode !== null || !alive(row.pid) || Date.now() >= dashboardLogDeadline) {
+    fail('logging', 'compiled dashboard served HTTP but its normal startup log was suppressed');
+  }
+  await delay(50);
+}
+console.log('smoke: ✅ logging — compiled fleet entry preserves normal startup logs');
 
 // ── 4b. the embedded frontend must actually be there ─────────────────────────
 // REGRESSION GUARD for a shipped bug this smoke test walked straight past.

@@ -40,6 +40,7 @@ describe('buildDocCommentPrompt', () => {
     expect(prompt).toContain('这个结论有什么依据');
     expect(prompt).toContain('先使用当前可用的飞书文档工具');
     expect(prompt).toContain('不要调用文档评论、回复或 reaction API');
+    expect(prompt).toContain('botmux send --response-kind final');
     expect(prompt).toContain('默认进入“仅文档”模式');
     expect(prompt).toContain('不要读取或引用本机上的其它项目');
   });
@@ -56,6 +57,7 @@ describe('buildDocCommentPrompt', () => {
 
     expect(prompt).toContain('https://larksuite.com/sheet/sheet_token');
     expect(prompt).toContain('Answer the current comment using the document as the primary context.');
+    expect(prompt).toContain('botmux send --response-kind final');
   });
 });
 
@@ -83,12 +85,59 @@ describe('clean Codex App document-comment input', () => {
     },
   } as any);
 
+  it.each(['live', 'refork'] as const)('carries the current author as the execution principal on %s input', mode => {
+    const ds = frozenCodexSession();
+    const { cliInput } = buildDocCommentTurnInput({ ds, promptInput,
+      botCliId: 'codex', sender, mode, turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toEqual({
+      requestLarkAppId: 'cli_app', requestUserOpenId: 'ou_author', senderType: 'user',
+    });
+  });
+
+  it.each(['codex', 'claude-code'] as const)('carries the comment principal for %s without changing visible content', cliId => {
+    const ds = frozenCodexSession();
+    ds.session.cliId = cliId;
+    const { cliInput } = buildDocCommentTurnInput({ ds, promptInput,
+      botCliId: cliId, sender, mode: 'live', turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toMatchObject({ requestLarkAppId: 'cli_app', requestUserOpenId: 'ou_author', senderType: 'user' });
+    expect(cliInput.content).toContain(promptInput.question);
+  });
+
+  it.each(['live', 'refork'] as const)('does not substitute the owner when %s input has no author', mode => {
+    const ds = frozenCodexSession();
+    ds.session.ownerOpenId = 'ou_owner';
+    const { cliInput } = buildDocCommentTurnInput({ ds, promptInput,
+      botCliId: 'codex', mode, turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toBeUndefined();
+  });
+
+  it('does not label a resolved bot author as a human', () => {
+    const { cliInput } = buildDocCommentTurnInput({ ds: frozenCodexSession(), promptInput,
+      botCliId: 'codex', sender: { openId: 'ou_peer', type: 'bot' }, mode: 'live', turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toEqual({ requestLarkAppId: 'cli_app', requestUserOpenId: 'ou_peer', senderType: 'bot' });
+  });
+
+  it.each(['live', 'refork'] as const)('keeps legacy adopted %s input without an execution principal', mode => {
+    const ds = frozenCodexSession();
+    ds.adoptedFrom = { session: 'adopted' };
+    const { cliInput } = buildDocCommentTurnInput({ ds, promptInput,
+      botCliId: 'codex', sender, mode, turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toBeUndefined();
+  });
+
+  it('does not manufacture a principal without an exact turn id', () => {
+    const { cliInput } = buildDocCommentTurnInput({ ds: frozenCodexSession(), promptInput,
+      botCliId: 'codex', sender, mode: 'live' });
+    expect(cliInput.trustedCaller).toBeUndefined();
+  });
+
   it('separates trusted rules from untrusted document/thread references without repeating the current comment', () => {
     const application = buildDocCommentApplicationContext(promptInput);
     const message = buildDocCommentMessageContext(promptInput);
 
     expect(application).toContain('Botmux 文档评论轮次规则');
     expect(application).toContain('原评论串投递和表情由 Botmux 统一负责');
+    expect(application).toContain('botmux send --response-kind final');
     expect(application).not.toContain(promptInput.question);
     expect(message).toContain('https://feishu.cn/docx/doc_clean_123');
     expect(message).toContain(promptInput.selectedText);

@@ -116,9 +116,14 @@ describe('applyPlatformTeamSync', () => {
     const applied = applyPlatformTeamSync(dataDir, payload('rev1', [
       null,
       { teamName: 'no-id' },
-      team('ok', ['oc_x'], [{ appId: '' }, { appId: 'cli_a', unionId: 'on_a' }]),
+      team('ok', ['oc_x'], [{ appId: '' }, {
+        appId: 'cli_a', unionId: 'on_a', ownerUnionId: 'on_untrusted',
+      } as unknown as { appId: string; unionId?: string }]),
     ]));
+    // Owner-looking fields remain untrusted platform metadata and are dropped;
+    // credential attribution reads only the target Bot's local config.
     expect(applied?.teams).toHaveLength(1);
     expect(applied?.teams[0].bots).toEqual([{ appId: 'cli_a', unionId: 'on_a', name: undefined }]);
   });
+
 });

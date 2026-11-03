@@ -5,9 +5,8 @@ import {
   computeButtonAvailability,
   computeDeliveryButtonAvailability,
   computeNextNRuns,
-  filterAndPaginateSchedules,
   filterSchedules,
-  kindCounts,
+  nextScheduleExecutionPosition,
   paginateSchedules,
   resolveScheduleExecutionPlacement,
   toScheduleDetailDto,
@@ -128,6 +127,17 @@ describe('schedule-card-model · toScheduleRowDto', () => {
     expect(enabledRow.actions.pause.enabled).toBe(true);
     expect(enabledRow.actions.resume.enabled).toBe(false);
   });
+
+  it('disables run-now while the task has a durable running claim', () => {
+    const row = toScheduleRowDto(
+      makeTask({ lastStatus: 'running' }),
+      { nowMs: FIXED_NOW },
+    );
+    expect(row.actions.runNow).toEqual({
+      enabled: false,
+      reasonKey: 'schedules.action.run.alreadyRunning',
+    });
+  });
 });
 
 describe('schedule-card-model · toScheduleDetailDto', () => {
@@ -206,6 +216,27 @@ describe('schedule-card-model · invariants', () => {
       .toEqual({ enabled: true });
   });
 
+  it('derives the dedicated-task placement and its cycle button states', () => {
+    // Rootless task: dedicated placement, next step parks at top level.
+    const task = makeTask({ executionPosition: 'task', scope: 'thread' });
+    expect(resolveScheduleExecutionPlacement(task)).toBe('task');
+    expect(nextScheduleExecutionPosition(task)).toBe('top-level');
+    // A materialized task (first-fire root written back) presents as an
+    // ordinary thread placement.
+    const materialized = makeTask({ executionPosition: 'task', scope: 'thread', rootMessageId: 'om_task' });
+    expect(resolveScheduleExecutionPlacement(materialized)).toBe('thread');
+    // Re-entering the same dedicated position is disabled with its own reason.
+    expect(computeDeliveryButtonAvailability(task, 'task'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.alreadyTask' });
+    // A single-chat fresh-topic task offers the dedicated-task step.
+    const fresh = makeTask({ executionPosition: 'new-topic', scope: 'chat' });
+    expect(computeDeliveryButtonAvailability(fresh, 'task')).toEqual({ enabled: true });
+    // The dedicated position is impossible for a multi-chat task.
+    const multi = makeTask({ executionPosition: 'new-topic', scope: 'chat', chatIds: ['oc_a', 'oc_b'] });
+    expect(computeDeliveryButtonAvailability(multi, 'task'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.taskMultiChat' });
+  });
+
   it('filter / paginate / toRow do not mutate the input list', () => {
     const tasks = [
       makeTask({ id: 'a', enabled: true, parsed: interval(15) }),
@@ -219,35 +250,9 @@ describe('schedule-card-model · invariants', () => {
     expect(frozen.map(t => t.id)).toEqual(snapshot);
   });
 
-  it('filterAndPaginateSchedules composes filter/paginate/counts and is JSON-serialisable', () => {
-    const tasks = [
-      makeTask({ id: 'a', parsed: cron('0 * * * *') }),
-      makeTask({ id: 'b', parsed: interval(30), enabled: false }),
-      makeTask({ id: 'c', parsed: once(new Date(FIXED_NOW + 3600_000).toISOString()) }),
-    ];
-    const page = filterAndPaginateSchedules(
-      tasks,
-      { kind: 'all', page: 1, pageSize: 10 },
-      { nowMs: FIXED_NOW, timezone: TZ },
-    );
-    expect(page.meta.total).toBe(3);
-    expect(page.kindCounts).toEqual({ all: 3, once: 1, interval: 1, cron: 1 });
-    expect(page.rows.map(r => r.id)).toEqual(['a', 'b', 'c']);
-    expect(JSON.parse(JSON.stringify(page))).toEqual(page);
-  });
-
   it('computeButtonAvailability is consistent with toScheduleRowDto.actions', () => {
     const t = makeTask({ enabled: false });
     expect(toScheduleRowDto(t, { nowMs: FIXED_NOW }).actions).toEqual(computeButtonAvailability(t));
-  });
-
-  it('kindCounts tallies parsed.kind across the full pool (not just one page)', () => {
-    const tasks = [
-      makeTask({ parsed: cron('0 * * * *') }),
-      makeTask({ parsed: cron('15 * * * *') }),
-      makeTask({ parsed: interval(5) }),
-    ];
-    expect(kindCounts(tasks)).toEqual({ all: 3, once: 0, interval: 1, cron: 2 });
   });
 
   it('row and detail DTOs pass `repeat` through unchanged (object shape matches ScheduledTask.repeat)', () => {

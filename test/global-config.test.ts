@@ -9,6 +9,7 @@ import {
   globalConfigPath,
   isGlobalVcMeetingAgentEnabled,
   invalidateGlobalConfigCache,
+  isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
   mergeDashboardConfig,
   mergeGlobalConfig,
@@ -16,6 +17,8 @@ import {
   readGlobalConfig,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  writeScheduleBotGrantConfig,
+  ignoredScheduleBotGrantCount,
 } from '../src/global-config.js';
 import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
 
@@ -25,13 +28,44 @@ describe('global dashboard config', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+    vi.stubEnv('BOTS_CONFIG', join(home, 'bots.json'));
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', '');
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  });
+
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' }, asr: { enabled: true } }, { volcengine: null, asr: { enabled: true } }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { apiKey: '' } }, { volcengine: { apiKey: '' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides on disk, row %#', (voice, expected) => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ voice }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().voice).toEqual(expected);
   });
 
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('keeps unrelated settings and the kill switch when meeting policy is malformed', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', vcMeetingAgent: { enabled: false, listenerPolicy: { rawMessages: 'false' } } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: false, listenerPolicy: { rawMessages: false, finalSummary: false, allowSummarySharing: false } });
+  });
+
+  it('round-trips global meeting listener defaults without changing consumer selection', () => {
+    const listenerPolicy = { rawMessages: false, finalSummary: true, allowSummarySharing: true };
+    writeFileSync(globalConfigPath(), JSON.stringify({ vcMeetingAgent: { enabled: true, listenerPolicy } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerPolicy });
   });
 
   it('reads only boolean dashboard settings', () => {
@@ -51,6 +85,48 @@ describe('global dashboard config', () => {
     });
   });
 
+  it('validates idle auto-compaction dashboard settings', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: {
+        autoCompactEnabled: true,
+        autoCompactThreshold: 75.4,
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().dashboard).toEqual({
+      autoCompactEnabled: true,
+      autoCompactThreshold: 75,
+    });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { autoCompactEnabled: false, autoCompactThreshold: 101 },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard).toEqual({ autoCompactEnabled: false });
+  });
+
+  it('uses an absolute operator-provided global config path', () => {
+    const shared = join(home, 'control', 'config.json');
+    mkdirSync(dirname(shared), { recursive: true });
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', shared);
+    writeFileSync(shared, JSON.stringify({ repoPickerMode: 'repos' }));
+    invalidateGlobalConfigCache();
+    expect(globalConfigPath()).toBe(shared);
+    expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('rejects a relative operator-provided global config path', () => {
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
+    expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('rejects an uncoordinated global config write in primary mode', () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    expect(() => mergeGlobalConfig({ repoPickerMode: 'repos' }))
+      .toThrow('durable_config_coordinator_required');
+  });
+
   it('drops invalid dashboard.localCliOpenMode values', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: {
@@ -68,6 +144,35 @@ describe('global dashboard config', () => {
     }));
 
     expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
+  });
+
+  it('reads a MiniMax voice engine configuration', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: {
+        engine: 'minimax',
+        speaker: 'voice-id',
+        minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().voice).toEqual({
+      engine: 'minimax',
+      speaker: 'voice-id',
+      minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+    });
+  });
+
+  it('sanitizes a mistyped MiniMax region instead of routing on it', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: { engine: 'minimax', minimax: { apiKey: 'key', region: 'cnn' } },
+    }));
+    invalidateGlobalConfigCache();
+
+    // 'cnn' 既不是 'cn' 也不是 'global'：丢弃该字段（适配器兜底 global），
+    // 而不是把脏值原样保留、静默打到海外端点。
+    expect(readGlobalConfig().voice?.minimax).toEqual({ apiKey: 'key' });
+    expect(readGlobalConfig().voice?.minimax?.region).toBeUndefined();
   });
 
   it('reads dashboard.noVisibleOutputHint as a boolean (on)', () => {
@@ -103,18 +208,6 @@ describe('global dashboard config', () => {
       enabled: true,
       source: 'owner/repo/subdir',
       ref: 'reviewed-sha',
-    });
-  });
-
-  it('reads the review-only legacy spec as source/ref for compatibility', () => {
-    writeFileSync(globalConfigPath(), JSON.stringify({
-      dashboard: { herdrTraexPlugin: { enabled: true, spec: ' owner/repo#tag ' } },
-    }));
-
-    expect(readGlobalConfig().dashboard?.herdrTraexPlugin).toEqual({
-      enabled: true,
-      source: 'owner/repo',
-      ref: 'tag',
     });
   });
 
@@ -260,6 +353,27 @@ describe('global dashboard config', () => {
     expect(isWorkflowFeatureEnabled()).toBe(false);
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
     expect(isWorkflowFeatureEnabled()).toBe(true); // blank ⇒ fall through to config (enabled)
+  });
+
+  it('multi-topic orchestration defaults ON and supports config/env opt-out', () => {
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+    expect(readGlobalConfig().multiTopic).toBeUndefined();
+
+    mergeGlobalConfig({ multiTopic: { enabled: false } });
+    expect(readGlobalConfig().multiTopic).toEqual({ enabled: false });
+    expect(isMultiTopicOrchestrationEnabled()).toBe(false);
+
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'true');
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'false');
+    expect(isMultiTopicOrchestrationEnabled()).toBe(false);
+  });
+
+  it('ignores a non-boolean multiTopic.enabled and preserves the default ON', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ multiTopic: { enabled: 'no' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().multiTopic).toBeUndefined();
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
   });
 
   it('keeps codexNotifier strictly disabled by default', () => {
@@ -424,6 +538,14 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().plugins).toEqual(['agent-chrome', 'gitlab']);
   });
 
+  it('reads a valid MCP Gateway timeout ceiling and drops unsafe values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 900_000 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBe(900_000);
+    invalidateGlobalConfigCache();
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 2_147_483_648 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBeUndefined();
+  });
+
   it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { publicReadOnly: true } }));
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(true); // primes the TTL cache
@@ -432,15 +554,72 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
   });
 
-  it('httpProxy survives a merge→read roundtrip (HD2D office download proxy)', () => {
-    // Regression: readGlobalConfig() used to drop httpProxy, so the office-tab
-    // proxy persisted by mergeGlobalConfig was never read back by the downloader.
+  it('httpProxy survives a merge→read roundtrip (binary self-update download proxy)', () => {
+    // Regression: readGlobalConfig() used to drop httpProxy, so a proxy persisted
+    // by mergeGlobalConfig was never read back by the downloader.
     expect(readGlobalConfig().httpProxy).toBeUndefined();
     mergeGlobalConfig({ httpProxy: 'http://127.0.0.1:7890' });
     expect(readGlobalConfig().httpProxy).toBe('http://127.0.0.1:7890');
     // Clearing (null) removes it again.
     mergeGlobalConfig({ httpProxy: null });
     expect(readGlobalConfig().httpProxy).toBeUndefined();
+  });
+
+  it('loads explicit bot scheduling scopes without accepting malformed or ambiguous grants', () => {
+    const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],
+      chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+    writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: { botGrants: [
+      grant, { ...grant, id: 'bad', controllerUnionId: 'ou_app_scoped' },
+      { ...grant, id: 'duplicate' }, { ...grant, id: 'duplicate' },
+    ] } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation?.botGrants).toEqual([{ ...grant, targetAppIds: ['cli_target'] }]);
+    // The Dashboard is told how many hand-edited entries it cannot show.
+    expect(ignoredScheduleBotGrantCount()).toBe(3);
+  });
+  it('writes the Dashboard bot-grant entry without storing defaults or touching other delegation keys', () => {
+    const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],
+      chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+    const disk = () => JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh' }));
+    // Turning things off on a host that never had them leaves the file as it was.
+    writeScheduleBotGrantConfig({ createEnabled: false, selfManageEnabled: false, botGrants: [] });
+    expect(disk()).toEqual({ lang: 'zh' });
+
+    writeScheduleBotGrantConfig({ createEnabled: true, botGrants: [grant] });
+    expect(disk().scheduleDelegation).toEqual({ createEnabled: true,
+      botGrants: [{ ...grant, targetAppIds: ['cli_target'] }] });
+
+    // Hand-edited keys this entry does not own survive every write.
+    writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: {
+      ...disk().scheduleDelegation, runEnabled: false, runScopes: ['bytedcli'], futureKey: 1 } }));
+    writeScheduleBotGrantConfig({ selfManageEnabled: true });
+    writeScheduleBotGrantConfig({ createEnabled: false, botGrants: [] });
+    expect(disk().scheduleDelegation).toEqual({ selfManageEnabled: true, runEnabled: false,
+      runScopes: ['bytedcli'], futureKey: 1 });
+
+    // Back to every default: the whole block goes.
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', scheduleDelegation: { selfManageEnabled: true } }));
+    writeScheduleBotGrantConfig({ selfManageEnabled: false });
+    expect(disk()).toEqual({ lang: 'zh' });
+    expect(readGlobalConfig().scheduleDelegation).toBeUndefined();
+  });
+  it('keeps schedule delegation issuance and execution revocation independent', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      scheduleDelegation: { createEnabled: true, runEnabled: false,
+        defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'],
+        maxTasksPerTurn: 128, runScopes: ['bytedcli', 'lark-cli', 'unknown', 'bytedcli'],
+        selfManageEnabled: true, ignored: true },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation).toEqual({
+      createEnabled: true,
+      runEnabled: false,
+      defaultOnDispatchFromBotAppIds: ['cli_orchestrator'],
+      maxTasksPerTurn: 128,
+      runScopes: ['bytedcli'],
+      selfManageEnabled: true,
+    });
   });
 
   it('ignores a non-string / blank httpProxy', () => {
@@ -489,5 +668,69 @@ describe('global dashboard config', () => {
     expect(raw.dashboard.publicReadOnly).toBe(false);
     expect(raw.dashboard.openTerminalInFeishu).toBe(true);
     expect(raw.dashboard.localCliOpenMode).toBe('attach');
+  });
+});
+
+describe('global sessionCleanup config', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-session-cleanup-config-'));
+    vi.stubEnv('HOME', home);
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('strictly reads the opt-in Codex archive flag', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ archiveCodex: true });
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: 'true' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
+  });
+
+  it('reads a full sessionCleanup block', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({
+      enabled: true, olderThanHours: 72, intervalMinutes: 30,
+    });
+  });
+
+  it('drops an unsupported olderThanHours but keeps the rest', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 12, intervalMinutes: 15 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 15 });
+  });
+
+  it('drops a sub-floor intervalMinutes and floors a fractional one', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 1 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 90.7 },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 90 });
+  });
+
+  it('ignores a non-object sessionCleanup', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: 'nope' }));
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
+  });
+
+  it('drops a non-boolean enabled', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: 'yes', olderThanHours: 24 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ olderThanHours: 24 });
   });
 });

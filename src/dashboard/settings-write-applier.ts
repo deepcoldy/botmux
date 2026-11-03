@@ -25,12 +25,20 @@ import {
   setGlobalLocale,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  writeScheduleBotGrantConfig,
+  type ScheduleBotGrant,
+  SESSION_CLEANUP_HOUR_OPTIONS,
+  SESSION_CLEANUP_MIN_INTERVAL_MINUTES,
+  type SessionCleanupGlobalConfig,
+  type SessionCleanupHours,
 } from '../global-config.js';
 import {
   installCodexNotifierHook,
   isCodexNotifierHookInstalled,
 } from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
+import { canonicalScheduleBotGrant, isScheduleBotGrant, overlappingScheduleBotGrants } from '../core/schedule-bot-grant.js';
+import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
 import { isValidTimeZone } from '../utils/timezone.js';
@@ -51,8 +59,11 @@ export interface ResolvedDashboardSettingsView {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  reapOrphanTmuxServers: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
+  /** Machine-wide reply-card footer brand signature switch. Default ON. */
+  cardBrandLabel: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -93,6 +104,15 @@ export interface ResolvedDashboardSettingsView {
     targetDaemonOnline?: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
+  /** Cross-bot schedule delegation switches and host bot grants. */
+  scheduleBotGrants?: {
+    createEnabled: boolean;
+    selfManageEnabled: boolean;
+    grants: ScheduleBotGrant[];
+    ignoredCount?: number;
+    botOptions?: Array<{ larkAppId: string; botName: string | null }>;
+  };
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -103,10 +123,27 @@ export interface ResolvedDashboardSettingsView {
   localDevInstall: boolean;
   autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
-  /** Machine-wide v3 Workflow feature switch. Default ON. */
-  workflow: { enabled: boolean };
+  /** Machine-wide v3 Workflow feature switch (default OFF) and the
+   *  experimental node executor for newly authorized runs (default
+   *  `ephemeral`). */
+  workflow: { enabled: boolean; nodeExecutor?: 'ephemeral' | 'bot' };
+  /** Machine-wide Claude Code prompt-cache default (TTL + idle keep-alive);
+   *  null = not configured (off). Bots override it field by field. */
+  promptCache: PromptCacheConfig | null;
+  /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
+   *  生效值（含默认回退），供设置页回显。 */
+  sessionCleanup: {
+    archiveCodex?: boolean;
+    enabled: boolean;
+    olderThanHours: SessionCleanupHours;
+    intervalMinutes: number;
+  };
+  /** Machine-wide multi-topic orchestration switch. Default ON. */
+  multiTopic: { enabled: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
+  /** Proxy for binary self-update downloads, null/absent = unset. */
+  httpProxy?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
@@ -123,6 +160,8 @@ export type ParseMaintenanceResult =
 
 /** All IO this helper needs — injected so tests use mocks, production wires real impls. */
 export interface SettingsWriteApplierDeps {
+  /** Optional outer transaction used by durable multi-replica deployments. */
+  runConfigMutation?: <T>(mutation: () => Promise<T>) => Promise<T>;
   /** Snapshot of `~/.botmux/config.json`. Used to look up the persisted autoUpdate state when the incoming patch doesn't change it. */
   readGlobalConfig: () => GlobalConfig;
   /** Atomic write of dashboard-level fields. */
@@ -134,6 +173,8 @@ export interface SettingsWriteApplierDeps {
   writeCodexNotifierConfig: (config: import('../global-config.js').CodexNotifierGlobalConfig) => void;
   /** Replace known host-overload-alert fields while preserving future sibling keys. */
   writeHostOverloadAlertConfig: (config: import('../global-config.js').HostOverloadAlertGlobalConfig) => void;
+  /** Write the bot-grant entry; defaults are removed, other scheduleDelegation keys kept. */
+  writeScheduleBotGrantConfig: (patch: Parameters<typeof writeScheduleBotGrantConfig>[0]) => void;
   /** Atomic write of maintenance-level fields (autoUpdate / autoRestart). */
   mergeMaintenanceConfig: (patch: MaintenanceConfig) => MaintenanceConfig;
   /** Set global UI locale (null = clear). Fans out to daemons via IPC. */
@@ -150,6 +191,9 @@ export interface SettingsWriteApplierDeps {
   isLocale: (v: unknown) => v is 'zh' | 'en';
   /** Fan out locale reload to all online daemons. */
   reloadLocaleOnAllDaemons?: () => Promise<void>;
+  /** After persisting XPI=false, terminalise every daemon's staged runtime
+   * queue so historical records cannot keep notifying or revive later. */
+  disableCrossPrincipalInterruptionOnAllDaemons?: () => Promise<void>;
   /** 校验通知 Bot；保存关闭态配置时只校验静态配置，启用时再要求 daemon 与收件人就绪。 */
   validateCodexNotifierTargetBotAppId?: (
     appId: string,
@@ -171,6 +215,7 @@ export interface SettingsWriteApplierDeps {
 export function defaultSettingsWriteApplierDeps(
   resolveDashboardSettings: () => ResolvedDashboardSettingsView,
   reloadLocaleOnAllDaemons?: () => Promise<void>,
+  disableCrossPrincipalInterruptionOnAllDaemons?: () => Promise<void>,
 ): SettingsWriteApplierDeps {
   return {
     readGlobalConfig,
@@ -178,6 +223,7 @@ export function defaultSettingsWriteApplierDeps(
     mergeGlobalConfig,
     writeCodexNotifierConfig,
     writeHostOverloadAlertConfig,
+    writeScheduleBotGrantConfig,
     mergeMaintenanceConfig,
     setGlobalLocale,
     parseMaintenancePatch,
@@ -186,6 +232,7 @@ export function defaultSettingsWriteApplierDeps(
     resolveDashboardSettings,
     isLocale,
     reloadLocaleOnAllDaemons,
+    disableCrossPrincipalInterruptionOnAllDaemons,
     installCodexNotifierHook: () => {
       installCodexNotifierHook();
       if (!isCodexNotifierHookInstalled()) throw new Error('codex_notifier_hook_not_executable');
@@ -216,8 +263,10 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
+  | 'invalid_reapOrphanTmuxServers'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
+  | 'invalid_cardBrandLabel'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -239,6 +288,14 @@ export type ApplySettingsWriteError =
   | 'hostOverloadAlert_target_owner_missing'
   | 'hostOverloadAlert_target_offline'
   | 'invalid_noVisibleOutputHint'
+  | 'invalid_crossPrincipalInterruption'
+  | 'invalid_scheduleBotGrants'
+  | 'invalid_scheduleBotGrants_createEnabled'
+  | 'invalid_scheduleBotGrants_selfManageEnabled'
+  | 'invalid_scheduleBotGrants_grant'
+  | 'scheduleBotGrants_duplicate_id'
+  | 'scheduleBotGrants_overlap'
+  | 'scheduleBotGrants_stale'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -246,8 +303,16 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent_listenerBotAppId'
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
+  | 'invalid_workflow_nodeExecutor'
+  | 'invalid_promptCache'
+  | 'invalid_sessionCleanup'
+  | 'invalid_sessionCleanup_enabled'
+  | 'invalid_sessionCleanup_archiveCodex'
+  | 'invalid_sessionCleanup_olderThanHours'
+  | 'invalid_sessionCleanup_intervalMinutes'
   | 'invalid_scheduleTimeZone'
   | 'invalid_oauthRedirectBase'
+  | 'invalid_httpProxy'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
@@ -347,6 +412,10 @@ export async function applySettingsWrite(
   body: unknown,
   deps: SettingsWriteApplierDeps,
 ): Promise<ApplySettingsWriteResult> {
+  if (deps.runConfigMutation) {
+    const { runConfigMutation, ...innerDeps } = deps;
+    return runConfigMutation(() => applySettingsWrite(body, innerDeps));
+  }
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};
@@ -441,6 +510,12 @@ export async function applySettingsWrite(
     }
     patch.autoUpgradeCodexSessions = obj.autoUpgradeCodexSessions;
   }
+  if ('reapOrphanTmuxServers' in obj) {
+    if (typeof obj.reapOrphanTmuxServers !== 'boolean') {
+      return { ok: false, error: 'invalid_reapOrphanTmuxServers' };
+    }
+    patch.reapOrphanTmuxServers = obj.reapOrphanTmuxServers;
+  }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {
       return { ok: false, error: 'invalid_bypassCodexHookTrust' };
@@ -453,11 +528,24 @@ export async function applySettingsWrite(
     }
     patch.hideCodexRateLimitModelNudge = obj.hideCodexRateLimitModelNudge;
   }
+  if ('cardBrandLabel' in obj) {
+    if (typeof obj.cardBrandLabel !== 'boolean') {
+      return { ok: false, error: 'invalid_cardBrandLabel' };
+    }
+    patch.cardBrandLabel = obj.cardBrandLabel;
+  }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {
       return { ok: false, error: 'invalid_noVisibleOutputHint' };
     }
     patch.noVisibleOutputHint = obj.noVisibleOutputHint;
+  }
+
+  if ('crossPrincipalInterruption' in obj) {
+    if (typeof obj.crossPrincipalInterruption !== 'boolean') {
+      return { ok: false, error: 'invalid_crossPrincipalInterruption' };
+    }
+    patch.crossPrincipalInterruption = obj.crossPrincipalInterruption;
   }
 
   let codexNotifierPatch: import('../global-config.js').CodexNotifierGlobalConfig | undefined;
@@ -576,6 +664,48 @@ export async function applySettingsWrite(
     hostOverloadAlertPatch = next;
   }
 
+  let scheduleBotGrantPatch: Parameters<typeof writeScheduleBotGrantConfig>[0] | undefined;
+  if ('scheduleBotGrants' in obj) {
+    const raw = obj.scheduleBotGrants;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_scheduleBotGrants' };
+    }
+    const incoming = raw as Record<string, unknown>;
+    const next: Parameters<typeof writeScheduleBotGrantConfig>[0] = {};
+    for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+      if (!(key in incoming)) continue;
+      if (typeof incoming[key] !== 'boolean') return { ok: false, error: `invalid_scheduleBotGrants_${key}` };
+      next[key] = incoming[key] as boolean;
+    }
+    if ('grants' in incoming) {
+      // Unlike the config reader, which drops a bad entry and keeps the rest,
+      // a Dashboard save is refused as a whole: the editor must not appear to
+      // keep a grant that would never apply.
+      const grants = incoming.grants;
+      if (!Array.isArray(grants) || !grants.every(isScheduleBotGrant)) {
+        return { ok: false, error: 'invalid_scheduleBotGrants_grant' };
+      }
+      if (new Set(grants.map(grant => grant.id)).size !== grants.length) {
+        return { ok: false, error: 'scheduleBotGrants_duplicate_id' };
+      }
+      if (overlappingScheduleBotGrants(grants).length > 0) {
+        return { ok: false, error: 'scheduleBotGrants_overlap' };
+      }
+      // The list is written whole, so it must be based on what is on disk now:
+      // a page opened before another tab (or a hand edit) revoked a grant would
+      // otherwise write that grant straight back.
+      const base = incoming.baseGrants;
+      const onDisk = deps.readGlobalConfig().scheduleDelegation?.botGrants ?? [];
+      const canonical = (list: ScheduleBotGrant[]) => JSON.stringify(list.map(canonicalScheduleBotGrant));
+      if (!Array.isArray(base) || !base.every(isScheduleBotGrant) || canonical(base) !== canonical(onDisk)) {
+        return { ok: false, error: 'scheduleBotGrants_stale' };
+      }
+      next.botGrants = grants;
+    }
+    if (Object.keys(next).length === 0) return { ok: false, error: 'invalid_scheduleBotGrants' };
+    scheduleBotGrantPatch = next;
+  }
+
   let touched = false;
   if (Object.keys(patch).length > 0) {
     deps.mergeDashboardConfig(patch);
@@ -604,12 +734,95 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_workflow' };
     }
     const wf = raw as Record<string, unknown>;
-    if (typeof wf.enabled !== 'boolean') {
+    const hasEnabled = 'enabled' in wf;
+    const hasNodeExecutor = 'nodeExecutor' in wf;
+    if ((hasEnabled || !hasNodeExecutor) && typeof wf.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_workflow_enabled' };
     }
+    if (hasNodeExecutor && wf.nodeExecutor !== 'ephemeral' && wf.nodeExecutor !== 'bot') {
+      return { ok: false, error: 'invalid_workflow_nodeExecutor' };
+    }
     // Merge over existing so a future sibling key in the workflow block survives.
-    const current = deps.readGlobalConfig().workflow ?? {};
-    deps.mergeGlobalConfig({ workflow: { ...current, enabled: wf.enabled } });
+    const next: Record<string, unknown> = { ...(deps.readGlobalConfig().workflow ?? {}) };
+    if (hasEnabled) next.enabled = wf.enabled;
+    if (hasNodeExecutor) {
+      // Only the non-default value is stored: switching back to `ephemeral`
+      // removes the key so an untouched install keeps no trace of it.
+      if (wf.nodeExecutor === 'bot') next.nodeExecutor = 'bot';
+      else delete next.nodeExecutor;
+    }
+    deps.mergeGlobalConfig({ workflow: Object.keys(next).length > 0 ? next as GlobalConfig['workflow'] : null });
+    touched = true;
+  }
+
+  if ('sessionCleanup' in obj) {
+    const raw = obj.sessionCleanup;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_sessionCleanup' };
+    }
+    const sc = raw as Record<string, unknown>;
+    // Merge over the validated existing block so a partial patch (e.g. just the
+    // toggle) keeps the other supported fields.
+    const next: SessionCleanupGlobalConfig = { ...(deps.readGlobalConfig().sessionCleanup ?? {}) };
+    if ('archiveCodex' in sc) {
+      if (typeof sc.archiveCodex !== 'boolean') return { ok: false, error: 'invalid_sessionCleanup_archiveCodex' };
+      next.archiveCodex = sc.archiveCodex;
+    }
+    if ('enabled' in sc) {
+      if (typeof sc.enabled !== 'boolean') {
+        return { ok: false, error: 'invalid_sessionCleanup_enabled' };
+      }
+      next.enabled = sc.enabled;
+    }
+    if ('olderThanHours' in sc) {
+      if (
+        typeof sc.olderThanHours !== 'number'
+        || !(SESSION_CLEANUP_HOUR_OPTIONS as readonly number[]).includes(sc.olderThanHours)
+      ) {
+        return { ok: false, error: 'invalid_sessionCleanup_olderThanHours' };
+      }
+      next.olderThanHours = sc.olderThanHours as SessionCleanupHours;
+    }
+    if ('intervalMinutes' in sc) {
+      if (
+        typeof sc.intervalMinutes !== 'number'
+        || !Number.isFinite(sc.intervalMinutes)
+        || sc.intervalMinutes < SESSION_CLEANUP_MIN_INTERVAL_MINUTES
+      ) {
+        return { ok: false, error: 'invalid_sessionCleanup_intervalMinutes' };
+      }
+      next.intervalMinutes = Math.floor(sc.intervalMinutes);
+    }
+    if (!('archiveCodex' in sc) && !('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
+      return { ok: false, error: 'invalid_sessionCleanup' };
+    }
+    deps.mergeGlobalConfig({ sessionCleanup: next });
+    touched = true;
+  }
+
+  if ('promptCache' in obj) {
+    // Whole-block replacement (the Settings form always sends every field it
+    // shows); null clears the machine-wide default. Same strict normalizer as
+    // the per-bot layer, so both doors reject the same typos.
+    let next: PromptCacheConfig | undefined;
+    try { next = normalizePromptCacheConfig(obj.promptCache); } catch {
+      return { ok: false, error: 'invalid_promptCache' };
+    }
+    deps.mergeGlobalConfig({ promptCache: next ?? null });
+    touched = true;
+  }
+
+  if ('multiTopic' in obj) {
+    const raw = obj.multiTopic;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_multiTopic' };
+    }
+    const multiTopic = raw as Record<string, unknown>;
+    if (typeof multiTopic.enabled !== 'boolean') {
+      return { ok: false, error: 'invalid_multiTopic_enabled' };
+    }
+    const current = deps.readGlobalConfig().multiTopic ?? {};
+    deps.mergeGlobalConfig({ multiTopic: { ...current, enabled: multiTopic.enabled } });
     touched = true;
   }
 
@@ -666,6 +879,22 @@ export async function applySettingsWrite(
       touched = true;
     } else {
       return { ok: false, error: 'invalid_oauthRedirectBase' };
+    }
+  }
+
+  if ('httpProxy' in obj) {
+    const v = obj.httpProxy;
+    if (v === null || (typeof v === 'string' && v.trim() === '')) {
+      // 清除 → release-download 退回 HTTPS_PROXY / HTTP_PROXY 环境变量。
+      deps.mergeGlobalConfig({ httpProxy: null });
+      touched = true;
+    } else if (typeof v === 'string') {
+      const normalized = normalizeHttpProxy(v);
+      if (!normalized) return { ok: false, error: 'invalid_httpProxy' };
+      deps.mergeGlobalConfig({ httpProxy: normalized });
+      touched = true;
+    } else {
+      return { ok: false, error: 'invalid_httpProxy' };
     }
   }
 
@@ -742,6 +971,30 @@ export async function applySettingsWrite(
     touched = true;
   }
 
+  if (scheduleBotGrantPatch) {
+    deps.writeScheduleBotGrantConfig(scheduleBotGrantPatch);
+    touched = true;
+  }
+
+  if (patch.crossPrincipalInterruption === false
+    && deps.disableCrossPrincipalInterruptionOnAllDaemons) {
+    await deps.disableCrossPrincipalInterruptionOnAllDaemons();
+  }
+
   if (!touched) return { ok: false, error: 'empty_patch' };
   return { ok: true, settings: deps.resolveDashboardSettings() };
+}
+
+/** `http://[user:pass@]host[:port]` with no path / query — what
+ *  release-download's CONNECT tunnel accepts. It always dials the proxy over
+ *  plain HTTP (then TLS to GitHub inside the tunnel), so an `https://` proxy
+ *  URL would only fail later with an opaque socket error; reject it here.
+ *  Returns the trimmed value without a trailing slash, or null. */
+export function normalizeHttpProxy(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  let url: URL;
+  try { url = new URL(trimmed); } catch { return null; }
+  if (url.protocol !== 'http:') return null;
+  if (!url.hostname || url.pathname !== '/' || url.search || url.hash) return null;
+  return trimmed;
 }

@@ -1,0 +1,34 @@
+# Lane: Codex private chat. Codex clicks 「直接开启会话」 before any
+# streaming-card wait, so it has no streaming-card / output phases.
+# openAndSend may first wait for the Codex DM lease (DM-mode cases).
+cases:
+  - name: Codex basic bot flow
+    tags: [bot, smoke, codex, core]
+    steps:
+      - feishu.openAndSend:
+          scenario: bot-codex-basic
+          $:
+            timeout: 1_800_000
+      - feishu.waitForBotResponse:
+          scenario: bot-codex-basic
+          $:
+            timeout: 300_000
+      - feishu.close:
+          scenario: bot-codex-basic
+          $:
+            timeout: 60_000
+  - name: Codex prompt submission
+    tags: [bot, codex, core]
+    steps:
+      - feishu.openAndSend:
+          scenario: bot-codex-prompt
+          $:
+            timeout: 1_800_000
+      - feishu.waitForBotResponse:
+          scenario: bot-codex-prompt
+          $:
+            timeout: 300_000
+      - feishu.close:
+          scenario: bot-codex-prompt
+          $:
+            timeout: 60_000

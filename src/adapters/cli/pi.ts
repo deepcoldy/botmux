@@ -1,13 +1,29 @@
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
+import { resolvePiModel } from './pi-model.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 
 import { delay } from '../../utils/timing.js';
+import { logger } from '../../utils/logger.js';
+import { drainPiTranscript, findPiTranscriptBySessionId, findPiTranscriptByPid, piBotmuxSessionTranscript } from '../../services/pi-transcript.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+
+/** botmux ships its built-in skills for Pi here and injects it per-session via
+ *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
+ *  standalone `pi` never surfaces (and mis-fires) them. Single source of truth
+ *  for both the adapter's `pluginDir` field and the spawn-time flag. */
+export const PI_PLUGIN_DIR = join(homedir(), '.botmux', 'pi-skills');
+export const PI_BUILTIN_SKILLS_DIR = join(PI_PLUGIN_DIR, 'skills');
 
 /** Absolute path to the turn-boundary extension handed to Pi via `--extension`,
  *  or `undefined` when no readable copy exists on disk.
@@ -19,22 +35,76 @@ import { delay } from '../../utils/timing.js';
  *  caller therefore omits the flag entirely in that case and the reader falls
  *  back to its timeout backstop — degraded, not broken.
  *
- *  The case is real, not theoretical: inside a `bun build --compile` binary the
- *  module graph lives in the virtual `/$bunfs/` root, so both `__dirname`-derived
- *  candidates resolve to paths that exist only inside this process — measured
- *  `/$bunfs/root/pi-turn-boundary-extension.{js,ts}`, neither present on disk.
- *  See CLAUDE.md on why a `__dirname` path must never be handed to another
- *  process. Resolved lazily at spawn time so constructing the adapter never
- *  touches the filesystem. */
+ *  Inside a `bun build --compile` binary the module graph lives in the virtual
+ *  `/$bunfs/` root, so `__dirname`-derived candidates resolve to paths that exist
+ *  only inside this process. To ensure external `pi` processes and sandboxes can
+ *  load the extension in compiled form, we materialize the embedded JS source to
+ *  a real path on disk inside `PI_PLUGIN_DIR/extensions/` (which is whitelisted
+ *  as read-only in fs-policy). */
 export function piTurnBoundaryExtensionPath(): string | undefined {
   const here = dirname(fileURLToPath(import.meta.url));
   for (const candidate of [
     resolve(here, 'pi-turn-boundary-extension.js'),
+    resolve(here, 'pi-turn-boundary-extension.mjs'),
     resolve(here, 'pi-turn-boundary-extension.ts'),
   ]) {
     if (existsSync(candidate)) return candidate;
   }
-  return undefined;
+
+  // Inside a compiled binary, materialize the embedded extension source
+  // to a real path on disk that the child process can load and the file-sandbox permits.
+  return materializePiTurnBoundaryExtension();
+}
+
+/** Materializes the embedded turn-boundary extension JS file into
+ *  `PI_PLUGIN_DIR/extensions/pi-turn-boundary-extension.js`. */
+export function materializePiTurnBoundaryExtension(): string | undefined {
+  const extDir = join(PI_PLUGIN_DIR, 'extensions');
+  const extPath = join(extDir, 'pi-turn-boundary-extension.js');
+  try {
+    if (!existsSync(extPath) || readFileSync(extPath, 'utf8') !== PI_TURN_BOUNDARY_EXTENSION_SOURCE) {
+      mkdirSync(extDir, { recursive: true, mode: 0o755 });
+      writeFileSync(extPath, PI_TURN_BOUNDARY_EXTENSION_SOURCE, { encoding: 'utf8', mode: 0o644 });
+    }
+    return extPath;
+  } catch {
+    // If writing fails (e.g. read-only mount) but a readable copy is already present on disk, use it
+    if (existsSync(extPath)) {
+      try {
+        readFileSync(extPath, 'utf8');
+        return extPath;
+      } catch {
+        // unreadable
+      }
+    }
+    return undefined;
+  }
+}
+
+/**
+ * Transcript dir of ONE botmux session under the oncall file sandbox:
+ * `~/.pi/agent/sessions/botmux/<sessionId>` (the oh-my-pi / ebsd shape). The
+ * sandbox grants Pi's agent dir read-write (settings / trust / models stores
+ * take proper-lockfile locks next to their files), masks the shared
+ * `sessions/` tree and re-opens only this dir, so a sandboxed Pi cannot read
+ * sibling sessions' transcripts. Unsandboxed Pi keeps its native cwd buckets
+ * (no `--session-dir`), so existing sessions resume exactly as before. The
+ * layout then follows the session, not the current sandbox setting: a
+ * sandboxed resume first copies the native transcript into this dir
+ * (adoptPiTranscriptIntoBotmuxDir), an unsandboxed restart of a session that
+ * has one keeps using it, and the bridge prefers it.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function piSandboxSessionDir(sessionId: string): string {
+  if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
+    throw new Error(`Invalid Botmux session id for Pi: ${sessionId}`);
+  }
+  let home = homedir();
+  try { home = realpathSync(home); } catch { /* lexical fallback */ }
+  return join(home, '.pi', 'agent', 'sessions', 'botmux', sessionId);
 }
 
 /** Launch argv for Pi. Split out from `buildArgs` so the extension-missing
@@ -44,10 +114,15 @@ export function piTurnBoundaryExtensionPath(): string | undefined {
  *  BOTH sides without stubbing the filesystem. */
 export function buildPiArgs(opts: {
   sessionId: string;
+  resume?: boolean;
+  /** Exact per-session transcript dir (oncall sandbox only, see piSandboxSessionDir). */
+  sessionDir?: string;
   initialPrompt?: string;
   nativeSessionTitle?: string;
   model?: string;
   turnBoundaryExtension: string | undefined;
+  builtinSkillsDir?: string;
+  skillPluginDir?: string;
 }): string[] {
   const args: string[] = [];
   // Pi's `stopReason:"error"` is a PER-REQUEST failure that its agent loop
@@ -58,12 +133,109 @@ export function buildPiArgs(opts: {
   // only in the argv we build). See pi-turn-boundary-extension.ts.
   if (opts.turnBoundaryExtension) args.push('--extension', opts.turnBoundaryExtension);
   args.push('--session-id', opts.sessionId);
-  if (opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
+  if (opts.sessionDir) args.push('--session-dir', opts.sessionDir);
+  // Resume opens the existing session file and then appends session_info.
+  // Pi takes the name from the last record, so `--name` on resume overwrites a
+  // title the user changed inside the CLI. Fresh spawns are the only ones that
+  // should stamp the Botmux title.
+  if (!opts.resume && opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
   if (opts.model?.trim()) args.push('--model', opts.model.trim());
+  if (opts.builtinSkillsDir) args.push('--skill', opts.builtinSkillsDir);
+  if (opts.skillPluginDir) args.push('--skill', opts.skillPluginDir);
   // Pi's interactive mode processes positional initial messages after TUI
   // startup, avoiding stdin races while keeping the native TUI visible.
   if (opts.initialPrompt) args.push(opts.initialPrompt);
   return args;
+}
+
+/**
+ * Resolve BotConfig.model to pi's --model flag against the ENV the pi process
+ * will actually be spawned with, and log every implicit decision. The rewrite
+ * crosses a config boundary (bots.json slug → pi-side settings.defaultProvider),
+ * so silence would make "configured X but argv says Y" unauditable; the bare
+ * passthrough additionally warns how pi itself fails on a cross-provider id.
+ */
+export function resolvePiModelForSpawn(
+  model: string | undefined,
+  childEnv: NodeJS.ProcessEnv,
+): string | undefined {
+  const resolution = resolvePiModel(model, { env: childEnv });
+  switch (resolution.kind) {
+    case 'none':
+      return undefined;
+    case 'qualified':
+      logger.debug(`pi: --model "${resolution.flag}" already provider-qualified; passed as-is`);
+      return resolution.flag;
+    case 'prefixed':
+      logger.info(
+        `pi: --model "${model!.trim()}" → "${resolution.flag}" ` +
+          `(qualified with settings.defaultProvider="${resolution.provider}" from ${resolution.settingsPath})`,
+      );
+      return resolution.flag;
+    case 'bare': {
+      const ambiguityHint = 'pi exits when this id is ambiguous across authenticated providers (use provider/id)';
+      if (resolution.state === 'invalid') {
+        logger.warn(
+          `pi: --model "${resolution.flag}" left unqualified: settings file ${resolution.settingsPath} is unreadable; ${ambiguityHint}`,
+        );
+      } else {
+        logger.info(
+          `pi: --model "${resolution.flag}" left unqualified (no defaultProvider in ${resolution.settingsPath}); ${ambiguityHint}`,
+        );
+      }
+      return resolution.flag;
+    }
+  }
+}
+
+/** Pi's busy status line, matched against ANSI-stripped PTY / viewport text.
+ *  Pi 1.x renders pi-tui's Loader as `<frame> <message>`: a braille spinner
+ *  frame, a space, then the default message `Working` with no ellipsis — on
+ *  1.3.0 it sits in the editor's top border as `── ⠴ Working ───`, repainted
+ *  every 80ms while the turn runs. Older builds printed `Working...`. The
+ *  spinner frame is required so prose like "Working through the fix" in a
+ *  reply cannot pass for the status line. */
+export const PI_BUSY_PATTERN = /[\u2800-\u28FF] Working\b|Working\.\.\./;
+
+/** Pi's own warning that the install it runs from was upgraded underneath it
+ *  (a global `npm i -g` while the session was open). Pi checks this after a
+ *  failed request, because code it loads on demand then fails with "Cannot
+ *  find module" until the process restarts, and renders it as its own line:
+ *  `Warning: pi was updated to <installed> while this session was running
+ *  (<running>). …`. Matched on ANSI-stripped PTY text, where a wrapped line
+ *  can lose the space at the wrap, hence the `\s*` between words; both
+ *  versions must look like versions, so source code or docs that merely quote
+ *  the sentence do not match. */
+const PI_INSTALL_UPDATED_PATTERN =
+  /Warning:\s*pi\s*was\s*updated\s*to\s*(\d[\w.+-]*?)\s*while\s*this\s*session\s*was\s*running\s*\((\d[\w.+-]*)\)/;
+
+export function parsePiInstallUpdatedNotice(text: string): { installedVersion: string; runningVersion: string } | undefined {
+  const match = PI_INSTALL_UPDATED_PATTERN.exec(text);
+  return match ? { installedVersion: match[1]!, runningVersion: match[2]! } : undefined;
+}
+
+/** Version of the Pi install `bin` runs from, read from that package's
+ *  package.json — the file Pi itself re-reads for the warning above. Undefined
+ *  when `bin` does not lead into a Pi package (a wrapper script, say). */
+export function readPiInstallVersion(bin: string): string | undefined {
+  let dir: string;
+  try {
+    dir = dirname(realpathSync(bin));
+  } catch {
+    return undefined;
+  }
+  for (let depth = 0; depth < 6; depth++) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+      if (typeof pkg?.name === 'string' && /(?:^|\/)pi-coding-agent$/.test(pkg.name)) {
+        return typeof pkg.version === 'string' ? pkg.version : undefined;
+      }
+    } catch { /* not the package root yet — keep walking up */ }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
 }
 
 /** Adapter for Pi coding-agent's native TUI (`pi`).
@@ -109,8 +281,8 @@ export function buildPiArgs(opts: {
  *       has no on-disk end marker.
  *  Setting `reliableTurnTerminal` would (a) claim VC-meeting delivery eligibility
  *  Pi can't honor and (b) suppress the busy-marker idle probe Pi actually relies
- *  on, so it stays unset — keeping Pi on its proven quiescence + `Working...`
- *  busy-marker idle path. (Pi's screen `rate` verdict is NOT at risk here:
+ *  on, so it stays unset — keeping Pi on its proven quiescence + busy-line
+ *  ({@link PI_BUSY_PATTERN}) idle path. (Pi's screen `rate` verdict is NOT at risk here:
  *  `structuredRateLimitAuthoritative` gates on `claudeDataDir` /
  *  `emitsStructuredRateLimit`, neither of which Pi sets — Pi has no structured
  *  rate-limit emit, so it correctly keeps screen-scanning real 429s.)
@@ -120,13 +292,13 @@ export function buildPiArgs(opts: {
  *  Without `reliableTurnTerminal` the worker keeps the post-submit busy-marker
  *  idle probe and the reattach probe (`scheduleReattachIdleProbe`, gated on
  *  `busyPattern`), so a turn — and a reattached persistent pane with no new PTY
- *  output — is marked ready via the `Working...` marker exactly as before this
+ *  output — is marked ready via the busy-line marker exactly as before this
  *  change. `assistant_final` events additionally fire idle when they land.
  *  Three guards keep quiescence honest (the raw heuristic alone mis-fires):
  *    1. Startup window: the TUI renders its input box seconds before the CLI
  *       begins consuming an argv-baked first prompt (extension/model loading).
  *       The worker holds the first ready until the turn has visibly started —
- *       `Working...` seen on PTY, or the transcript's first user record
+ *       the busy line seen on PTY, or the transcript's first user record
  *       (worker `spawnArgvTurnStartEvidenceSeen` gate).
  *    2. Mid-turn: pi is in STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS, so a
  *       transcript-started turn without a terminal suppresses screen idle
@@ -134,25 +306,122 @@ export function buildPiArgs(opts: {
  *       hard error/aborted edges — see pi-transcript.ts for the accepted
  *       custom-tool `terminate:true` gap).
  *    3. Post-idle: `idleToBusyPattern` flips a falsely published ready back to
- *       working when `Working...` reappears. */
-export function createPiAdapter(pathOverride?: string): CliAdapter {
+ *       working when the busy line reappears. */
+/** Pi session JSONL. botmux passes `--session-id`, so the adapter session id is a valid
+ *  first lookup key even before the native id is known. */
+export const piBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainPiTranscript(path, offset),
+  locate: {
+    bySessionId: (sessionId, cwd) => findPiTranscriptBySessionId(sessionId, cwd),
+    byPid: pid => findPiTranscriptByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+  adopt: { attach: 'split-live' },
+};
+
+export function createPiAdapter(
+  pathOverride?: string,
+  resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
+): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'pi');
   return {
     id: 'pi',
-    authPaths: ['~/.pi/agent/auth.json'],
+    bridgeSpec: piBridgeSpec,
+    // Whole agent dir, not just auth.json: under the oncall sandbox Pi must see
+    // its models.json / settings.json (else it falls back to a built-in
+    // provider and never reaches the configured one), and its settings / trust
+    // stores lock via `<file>.lock` dirs created next to the files. The shared
+    // `sessions/` tree inside it is masked again per session by the worker
+    // (piSandboxSessionDir).
+    authPaths: ['~/.pi/agent'],
     resolvedBin: bin,
 
-    buildArgs({ sessionId, initialPrompt, nativeSessionTitle, model }) {
+    buildArgs({
+      sessionId,
+      resume,
+      initialPrompt,
+      nativeSessionTitle,
+      model,
+      botName,
+      botOpenId,
+      locale,
+      noTransport,
+      triggerUserAuth,
+      larkToolAppId,
+      replyDelivery,
+      solo,
+      skillPluginDir,
+      workingDir,
+      env,
+      extraArgs,
+      trustOverride,
+      projectTrusted,
+      promptInjection,
+      sandboxSessionDir,
+    }) {
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      const botmuxAppendPrompt = promptInjection === 'none' ? '' : buildBotmuxSystemPromptText({
+        locale,
+        botName,
+        botOpenId,
+        noTransport,
+        triggerUserAuth,
+        larkToolAppId,
+        replyDelivery: effectiveReplyDelivery,
+        solo,
+      });
+
+      // Inject the Botmux routing prompt into the process environment so that
+      // pi-turn-boundary-extension can append it during `before_agent_start`.
+      // We deliberately do NOT pass `--append-system-prompt` via argv: Pi's CLI
+      // disables native automatic discovery of project/user APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict runtime project trust decisions. Appending via the extension
+      // after native discovery completes preserves 100% faithful native project trust
+      // resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = resolveExtensionPath();
+      if (!turnBoundaryExt) {
+        throw new Error(
+          'Failed to resolve or materialize Pi turn-boundary extension; ' +
+          'refusing to start without extension to avoid suppressing native APPEND_SYSTEM.md discovery',
+        );
+      }
+
+      if (env && promptInjection === 'none') clearBotmuxPromptEnv(env);
+      else if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
+      }
+
+      // Resolve against the child env (per-bot env wins over daemon env), the
+      // same env pi sees, so an agent-dir overlay / HOME redirect is honored.
+      const resolvedModel = resolvePiModelForSpawn(model, { ...process.env, ...env });
+
       return buildPiArgs({
         sessionId,
+        resume,
+        // A session that ran sandboxed keeps its history in its own dir; an
+        // unsandboxed restart must keep using it (Pi only resumes inside
+        // --session-dir), or it silently starts over.
+        sessionDir: sandboxSessionDir
+          ?? (piBotmuxSessionTranscript(sessionId) ? piSandboxSessionDir(sessionId) : undefined),
         initialPrompt,
         nativeSessionTitle,
-        model,
-        turnBoundaryExtension: piTurnBoundaryExtensionPath(),
+        model: resolvedModel,
+        turnBoundaryExtension: turnBoundaryExt,
+        builtinSkillsDir: promptInjection === 'none' ? undefined : join(builtinPluginDirForSession(PI_PLUGIN_DIR), 'skills'),
+        skillPluginDir: promptInjection === 'none' ? undefined : skillPluginDir,
       });
     },
 
+    injectsSessionContext: true,
+    pluginDir: PI_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'skill-root', supportsScopedSession: true, supportsExclusive: false },
+
     buildResumeCommand({ sessionId }) {
+      // A session that keeps its history in its own dir only resumes there.
+      if (piBotmuxSessionTranscript(sessionId)) {
+        return `pi --session-id ${shellQuote(sessionId)} --session-dir ${shellQuote(piSandboxSessionDir(sessionId))}`;
+      }
       return `pi --session-id ${sessionId}`;
     },
 
@@ -165,7 +434,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
       return {
         initialPrompt: prepared.initialPromptArg,
         readonlyRoots: prepared.readonlyRoot ? [prepared.readonlyRoot] : undefined,
-        cleanupPaths: prepared.filePath ? [prepared.filePath] : undefined,
+        cleanupPaths: prepared.filePath ? [prepared.filePath, prepared.extensionPath!] : undefined,
         cleanupDirs: prepared.cleanupDir ? [prepared.cleanupDir] : undefined,
         deferredInput: prepared.deferredInput,
       };
@@ -180,33 +449,42 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
         await delay(200);
         pty.sendSpecialKeys('Enter');
       } else {
-        pty.write(`\x1b[200~${content}\x1b[201~`);
+        pty.write(wrapBracketedPaste(content));
         await delay(1000);
         pty.write('\r');
       }
     },
 
     completionPattern: undefined,
-    busyPattern: /Working\.\.\./,
+    busyPattern: PI_BUSY_PATTERN,
     // Self-heal for a falsely published ready (e.g. a startup-window quiescence
-    // idle slipping past the gates): if `Working...` renders AFTER an idle was
+    // idle slipping past the gates): if the busy line renders AFTER an idle was
     // reported, IdleDetector fires onBusy and the worker pulls isPromptReady
     // back to false + republishes working. Safe as an idle→busy edge marker:
-    // Pi's `Working...` is an ephemeral status line, never part of transcript
+    // Pi's busy line is an ephemeral status line, never part of transcript
     // history redraws, so a completed turn cannot revive a closed card.
-    idleToBusyPattern: /Working\.\.\./,
+    idleToBusyPattern: PI_BUSY_PATTERN,
     readyPattern: undefined,
     // Pi's native Message Queue parks/steers submit-while-busy input; the JSONL
-    // transcript bridge (drainPiTranscript) + the `Working...` busy marker are
+    // transcript bridge (drainPiTranscript) + the busy-line marker are
     // enough to attribute the reply per turn. No mergeQueuedInput: one card per
     // Lark turn. No reliableTurnTerminal: Pi holds no session fd and a
     // custom-terminate turn has no on-disk boundary — see the header for why
     // that stronger promise is unsafe (and why type-ahead does not need it).
     supportsTypeAhead: true,
-    systemHints: BOTMUX_SHELL_HINTS,
+    // Pi interrupts on Escape (`app.interrupt`: stop the run, cancel a retry
+    // backoff or a compaction). Ctrl+C is `app.clear` — it only clears the
+    // editor, and a second one within 500ms quits Pi (verified on 1.3.0) — so
+    // the card's Stop button and `/stop` did not stop a running Pi turn.
+    interruptKey: 'esc',
+    supportsProgramStatus: true,
+    systemHints: [],
     altScreen: true,
+    // Pi >= 1.0 defaults to fullscreen mode, where Pi owns the transcript and
+    // xterm/tmux have no usable scrollback. Let read-only Web Terminal viewers
+    // use the worker's validated, rate-limited SGR wheel-only path.
+    readOnlyRemoteScroll: true,
     skillsDir: '~/.pi/agent/skills',
+    sandboxSessionDir: piSandboxSessionDir,
   };
 }
-
-export const create = createPiAdapter;

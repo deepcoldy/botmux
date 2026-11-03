@@ -98,6 +98,7 @@ describe('tmuxEnv()', () => {
     for (const leaked of [
       'BOTMUX', 'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID',
       'BOTMUX_MCP_GATEWAY_SOCKET', 'BOTMUX_MCP_GATEWAY_REQUIRED',
+      'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED',
       'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_BOT_INDEX', 'BOTMUX_QUIET_RESTART',
       'SESSION_DATA_DIR', 'IS_SANDBOX', 'CLAUDE_CONFIG_DIR', '__OWNER_OPEN_ID',
       'CODEX_HOME', 'HERMES_HOME', 'HERMES_BOTMUX_SOURCE_HOME',
@@ -402,6 +403,53 @@ describe('tmux subcommand with stale $TMUX', () => {
       } finally {
         spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
         rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  // 源码结构护栏(K2)：这条守的是"daemon 启动修复不得改写用户自有共享 tmux
+  // server 的通用 env 表"这一安全不变量。GIT_CONFIG_KEY_<n> 是用户可自有的
+  // 变量名（与 GITHUB_TOKEN 同类），只能 pane 本地 unset，不能进 server-global
+  // 修复谓词；没有行为 seam 能在不真起 tmux server 的情况下验证删/留差异，
+  // 故这里起私有 -L server 做真进程断言。
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub keeps a user-owned GIT_CONFIG_KEY_<n> on the shared server but removes COUNT',
+    () => {
+      const sock = `bmx-scrub-gitcfg-${process.pid}-${Date.now()}`;
+      try {
+        // Seed the server global env the way a user's own environment would:
+        // a numbered pair plus COUNT are copied in at server boot.
+        const seededEnv = { ...process.env };
+        delete seededEnv.TMUX;
+        delete seededEnv.TMUX_PANE;
+        Object.assign(seededEnv, {
+          GIT_CONFIG_COUNT: '3',
+          GIT_CONFIG_KEY_7: 'user.section',
+          GIT_CONFIG_VALUE_7: 'user-value',
+        });
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+        expect(scrub.failed).toEqual([]);
+        // COUNT rides the botmux injected allowlist and is repaired; the
+        // user-owned numbered pair must not appear in the removal list.
+        expect(scrub.removed).toContain('GIT_CONFIG_COUNT');
+        expect(scrub.removed).not.toContain('GIT_CONFIG_KEY_7');
+        expect(scrub.removed).not.toContain('GIT_CONFIG_VALUE_7');
+
+        const globalEnv = spawnSync('tmux', ['-L', sock, 'show-environment', '-g'], {
+          env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
+        });
+        expect(globalEnv.status, globalEnv.stderr).toBe(0);
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_KEY_7=user.section');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_VALUE_7=user-value');
+        expect(globalEnv.stdout).not.toMatch(/(?:^|\n)-?GIT_CONFIG_COUNT(?:=|\n|$)/);
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
       }
     },
     30_000,

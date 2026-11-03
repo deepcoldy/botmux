@@ -281,7 +281,32 @@ provides:
 - `getServiceStatus()`;
 - `startService()`;
 - `stopService()`;
-- `restartService()`.
+- `restartService()`;
+
+- `react`: the host React instance (use it instead of bundling another copy);
+- `getSettings()`: read the adapter's browser-safe settings;
+- `saveSettings(value)`: save a JSON value through the adapter;
+- `listBots()`: list the manageable bots.
+
+Settings require an explicit `dist/server/settings.js` ES module exporting both methods:
+
+```ts
+export function getSettings(api: { config: PluginConfigApi }): unknown | Promise<unknown>;
+export function saveSettings(api: { config: PluginConfigApi }, value: unknown): unknown | Promise<unknown>;
+```
+
+`api` contains **only `config`**, with `get(key?)`, `set(key, value)`,
+`replace(object)` and `path`. It is not `baseApi`: there is no `runtime`,
+`logger`, `resolve`, or `settingsPath`. Use the controlled config API and
+explicitly select safe fields; never return the raw `config.json` or secrets.
+Both methods may return a JSON-serializable value or void; null/undefined
+is normalized to `{ ok: true }`. Malformed request JSON returns 400; missing
+plugins/adapters return 404; unsupported methods return 405. Adapter failures,
+invalid exports and non-serializable results return a complete 500 JSON response
+with the generic `plugin_settings_failed` code, never the internal exception.
+The adapter exports are checked when requested, without executing plugin code
+in the convention scanner.
+
 
 Dashboard code runs inside the authority boundary of the user who installed
 Botmux. Do not render sensitive configuration into the page or browser logs.

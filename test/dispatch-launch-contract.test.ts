@@ -4,7 +4,6 @@ import {
   DISPATCH_LAUNCH_ADMISSION_SCHEMA_VERSION,
   DISPATCH_LAUNCH_CONTROL_LIMITS,
   DISPATCH_LAUNCH_OPERATION_SCHEMA_VERSION,
-  DISPATCH_LAUNCH_OVERRIDE_SCHEMA_VERSION,
   DISPATCH_LAUNCH_POLICY_SCHEMA_VERSION,
   DISPATCH_LAUNCH_KICKOFF_LIMITS,
   canonicalizeDispatchLaunchKickoff,
@@ -14,7 +13,6 @@ import {
   normalizeDispatchLaunchPolicy,
   parseDispatchLaunchAdmissionReceipt,
   parseDispatchLaunchOperation,
-  parseDispatchLaunchOverrideSnapshot,
   parseDispatchLaunchPrepareRequest,
   resolveDispatchLaunchOverride,
   type DispatchLaunchIdentityV1,
@@ -208,65 +206,10 @@ describe('dispatch launch versioned codecs', () => {
     expect(() => parseDispatchLaunchOperation(tampered)).toThrow('canonicalization mismatch');
   });
 
-  it('requires same-turn, same-generation proof before success', () => {
-    expect(() => parseDispatchLaunchOperation({ ...operation(), state: 'succeeded' })).toThrow('Required');
-    const mismatched = {
-      ...operation(),
-      state: 'succeeded',
-      rootMessageId: 'root',
-      targetSessionId: 's',
-      kickoffTurnId: 't',
-      workerGeneration: 3,
-      proof: {
-        inputCommitted: { sessionId: 's', kickoffTurnId: 't', workerGeneration: 3, observedAt: NOW },
-        runtimeObserved: {
-          sessionId: 's', kickoffTurnId: 'other', workerGeneration: 3, observedAt: NOW, model: 'gpt-5.6-sol',
-          reasoningEffort: 'high',
-        },
-      },
-    };
-    expect(() => parseDispatchLaunchOperation(mismatched)).toThrow('same session, kickoff turn and worker generation');
-
-    const succeeded = {
-      ...mismatched,
-      proof: {
-        ...mismatched.proof,
-        runtimeObserved: {
-          ...mismatched.proof.runtimeObserved,
-          kickoffTurnId: 't',
-        },
-      },
-    };
-    expect(parseDispatchLaunchOperation(succeeded).state).toBe('succeeded');
-    expect(() => parseDispatchLaunchOperation({ ...succeeded, kickoffTurnId: 'other' }))
-      .toThrow('proof does not match operation launch identity');
-  });
-
-  it.each([
-    ['model mismatch', { model: 'wrong-model', reasoningEffort: 'high' }],
-    ['effort missing', { model: 'gpt-5.6-sol' }],
-    ['effort mismatch', { model: 'gpt-5.6-sol', reasoningEffort: 'low' }],
-  ])('rejects succeeded runtime proof with %s', (_label, runtime) => {
+  it('rejects the removed succeeded/proof operation state', () => {
     const base = operation();
     expect(() => parseDispatchLaunchOperation({
       ...base,
-      state: 'succeeded',
-      rootMessageId: 'root', targetSessionId: 's', kickoffTurnId: 't', workerGeneration: 1,
-      proof: {
-        inputCommitted: { sessionId: 's', kickoffTurnId: 't', workerGeneration: 1, observedAt: NOW },
-        runtimeObserved: {
-          sessionId: 's', kickoffTurnId: 't', workerGeneration: 1, observedAt: NOW, ...runtime,
-        },
-      },
-    })).toThrow('runtime proof does not match effective override');
-  });
-
-  it('rejects an observed effort when the effective tuple has none', () => {
-    const base = operation();
-    expect(() => parseDispatchLaunchOperation({
-      ...base,
-      requestedOverride: { model: 'gpt-5.6-sol' },
-      effectiveOverride: { model: 'gpt-5.6-sol' },
       state: 'succeeded',
       rootMessageId: 'root', targetSessionId: 's', kickoffTurnId: 't', workerGeneration: 1,
       proof: {
@@ -276,24 +219,7 @@ describe('dispatch launch versioned codecs', () => {
           model: 'gpt-5.6-sol', reasoningEffort: 'high',
         },
       },
-    })).toThrow('runtime proof does not match effective override');
-  });
-
-  it('accepts a fully matching tuple with no explicit effort', () => {
-    const base = operation();
-    expect(parseDispatchLaunchOperation({
-      ...base,
-      requestedOverride: { model: 'gpt-5.6-sol' },
-      effectiveOverride: { model: 'gpt-5.6-sol' },
-      state: 'succeeded',
-      rootMessageId: 'root', targetSessionId: 's', kickoffTurnId: 't', workerGeneration: 1,
-      proof: {
-        inputCommitted: { sessionId: 's', kickoffTurnId: 't', workerGeneration: 1, observedAt: NOW },
-        runtimeObserved: {
-          sessionId: 's', kickoffTurnId: 't', workerGeneration: 1, observedAt: NOW, model: 'gpt-5.6-sol',
-        },
-      },
-    }).state).toBe('succeeded');
+    })).toThrow();
   });
 
   it('rejects requested/effective drift, unsupported identity, and invalid generations', () => {
@@ -418,15 +344,5 @@ describe('dispatch launch versioned codecs', () => {
       talkAuthorizationReceiptId: 'talk', quotaReceiptId: 'quota', workingDir: '/repo',
       capacityReservationId: 'slot', createdAt: NOW, committedAt: LATER,
     })).toThrow('authorized receipt must be unsettled');
-
-    expect(() => parseDispatchLaunchOverrideSnapshot({
-      schemaVersion: DISPATCH_LAUNCH_OVERRIDE_SCHEMA_VERSION,
-      provenanceId: 'provenance',
-      dispatchId: base.dispatchId,
-      inheritedFromDispatchId: base.dispatchId,
-      effective: base.effectiveOverride,
-      launchIdentity: identity,
-      createdAt: NOW,
-    })).toThrow('exactly one');
   });
 });

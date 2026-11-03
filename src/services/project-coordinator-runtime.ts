@@ -17,5 +17,6 @@ export const projectCoordinator = new ProjectCoordinator({
   unpinMessage: async (larkAppId, messageId) => !!(await unpinMessage(larkAppId, messageId)),
   resolveThreadId: (larkAppId, dispatchRoot) => getMessageThreadId(larkAppId, dispatchRoot),
   isMessageWithdrawn: error => error instanceof Error && error.name === 'MessageWithdrawnError',
+  isMessageUpdateExpired: error => error instanceof Error && error.name === 'MessageUpdateExpiredError',
   brand: larkAppId => getBotBrand(larkAppId),
 });

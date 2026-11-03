@@ -42,13 +42,13 @@ import {
     acquireContainmentHandle,
     containmentHandles,
     hasUnprovenContainment,
-    inheritContainmentHandles,
     proveContainmentQuiescent,
     readProcLiveness,
     recordContainmentHandle,
 } from '../src/core/mojo-containment.js';
 import { MOJO_TREE_NONCE_ENV, scanMojoTree } from '../src/adapters/backend/mojo-process-tree.js';
 import { isLinux } from './helpers/synthetic-proc.js';
+import { waitForPidFile } from './helpers/pid-file.js';
 
 /** Linux-only: real setsid escape + real /proc liveness. */
 const describeLinux = describe.runIf(isLinux);
@@ -59,7 +59,10 @@ const findings: string[] = [];
 
 beforeAll(() => { binDir = mkdtempSync(join(tmpdir(), 'mojo-task9-')); });
 afterAll(() => {
-    for (const pid of strays) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+    for (const pid of strays) {
+        if (!Number.isSafeInteger(pid) || pid <= 1) continue;
+        try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+    }
     rmSync(binDir, { recursive: true, force: true });
     // Printed as one block so the report can quote observed values verbatim.
     console.log('\n===== TASK 9 PROBE OBSERVATIONS =====');
@@ -107,8 +110,7 @@ exit 0`);
         const backend = new FastProofBackend({ bin }, 'probe1-session');
         backend.spawn('', [], {} as never);
         backend.write('leave a descendant behind');
-        expect(await waitFor(() => existsSync(pidFile))).toBe(true);
-        const escaped = Number(readFileSync(pidFile, 'utf8').trim());
+        const escaped = await waitForPidFile(pidFile);
         strays.push(escaped);
         expect(await waitFor(() => alive(escaped))).toBe(true);
         note(`P1: escaped setsid descendant pid=${escaped}, alive=${alive(escaped)}`);
@@ -146,8 +148,7 @@ exit 0`);
             + `setsid bash -c 'trap "" TERM; echo $$ > "${binDir}/p1b.pid"; exec sleep 120' </dev/null >/dev/null 2>&1 &\nexit 0\n`);
         chmodSync(script, 0o755);
         spawnSync(script, [], { env: { ...process.env, [MOJO_TREE_NONCE_ENV]: nonce }, timeout: 10_000 });
-        expect(await waitFor(() => existsSync(`${binDir}/p1b.pid`))).toBe(true);
-        const escaped = Number(readFileSync(`${binDir}/p1b.pid`, 'utf8').trim());
+        const escaped = await waitForPidFile(`${binDir}/p1b.pid`);
         strays.push(escaped);
 
         const handle = acquireContainmentHandle(
@@ -208,8 +209,7 @@ exit 0`);
         const gen1 = new FastProofBackend({ bin }, 'probe2-session');
         gen1.spawn('', [], {} as never);
         gen1.write('turn that leaks a descendant');
-        expect(await waitFor(() => existsSync(pidFile))).toBe(true);
-        const escaped = Number(readFileSync(pidFile, 'utf8').trim());
+        const escaped = await waitForPidFile(pidFile);
         strays.push(escaped);
         expect(await waitFor(() => alive(escaped))).toBe(true);
 
@@ -318,18 +318,17 @@ exit 0`);
             + `setsid bash -c 'trap "" TERM; echo $$ > "${binDir}/p2b.pid"; exec sleep 120' </dev/null >/dev/null 2>&1 &\nexit 0\n`);
         chmodSync(script, 0o755);
         spawnSync(script, [], { env: { ...process.env, [MOJO_TREE_NONCE_ENV]: nonce }, timeout: 10_000 });
-        expect(await waitFor(() => existsSync(`${binDir}/p2b.pid`))).toBe(true);
-        const escaped = Number(readFileSync(`${binDir}/p2b.pid`, 'utf8').trim());
+        const escaped = await waitForPidFile(`${binDir}/p2b.pid`);
         strays.push(escaped);
 
         const h = acquireContainmentHandle({ sessionId: 'probe2b', generation: 1, rootPid: escaped, nonce }, {});
         recordContainmentHandle(h, dataDir);
         // Generation 2 reads ONLY the store — nothing in memory.
-        const inherited = inheritContainmentHandles('probe2b', 2, dataDir);
-        note(`P2b: gen2 inherited ${inherited.length} handle(s) from a cold store; `
+        const stored = containmentHandles('probe2b', dataDir);
+        note(`P2b: gen2 read ${stored.length} handle(s) from a cold store; `
             + `blocker_retained=${hasUnprovenContainment('probe2b', dataDir)}`);
-        expect(inherited).toHaveLength(1);
-        expect(containmentHandles('probe2b', dataDir)[0]).toMatchObject({ rootPid: escaped });
+        expect(stored).toHaveLength(1);
+        expect(stored[0]).toMatchObject({ rootPid: escaped });
         expect(hasUnprovenContainment('probe2b', dataDir)).toBe(true);
 
         try { process.kill(escaped, 'SIGKILL'); } catch { /* gone */ }

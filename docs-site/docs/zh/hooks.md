@@ -2,7 +2,7 @@
 
 botmux 可以在关键生命周期事件发生时调用外部命令。默认是**异步**的：命令失败、超时或不存在只会写日志，不阻塞 botmux 主流程。
 
-另有一类**同步前置校验闸**（`mode: "sync"`，仅 `prompt.submit` 事件支持）：daemon 会等它跑完，并按它的裁决决定这条消息要不要提交给 CLI。见下文[同步前置校验闸](#同步前置校验闸-promptsubmit)。
+另有一类**同步前置校验闸**（`mode: "sync"`）：`prompt.submit` 可决定消息是否提交给 CLI；`chat.bot_added` 可决定已开启的入群自动开工是否继续。见下文[同步前置校验闸](#同步前置校验闸)。
 
 ## 配置位置
 
@@ -54,10 +54,11 @@ tail -f /tmp/botmux-hook.log
 | `event` | string | 必填。订阅的事件名（见下表） |
 | `command` | string | 必填。外部可执行命令；支持参数，但不经 shell 执行 |
 | `timeoutMs` | number | 可选。默认 5000；超时先 `SIGTERM`，再兜底 `SIGKILL` |
-| `mode` | `"sync"`｜`"async"` | 可选。默认 `async`（通知，不阻塞）。`sync`（等裁决、可拦截）**仅 gate 事件支持**（当前为 `prompt.submit`）；其它事件写 `sync` 会降级为 `async` 并在日志告警。**gate 事件同样支持 `async`**——同一事件上可以既挂通知又挂裁决 |
+| `mode` | `"sync"`｜`"async"` | 可选。默认 `async`（通知，不阻塞）。`sync`（等裁决、可拦截）**仅 gate 事件支持**（当前为 `prompt.submit`、`chat.bot_added`）；其它事件写 `sync` 会降级为 `async` 并在日志告警。**gate 事件同样支持 `async`**——同一事件上可以既挂通知又挂裁决 |
 | `onError` | `"allow"`｜`"deny"` | 可选，仅 `mode:"sync"` 有意义。hook 自身失败（超时/找不到命令/崩溃）时的兜底方向，默认 `allow`（fail-open） |
+| `filter.larkAppId` | string｜string[] | 可选。只匹配指定 Bot 应用；同义字段 `lark_app_id` 只作兼容输入，归一化后统一使用 camelCase |
 | `filter.chatId` | string｜string[] | 可选。只匹配指定飞书群 / 话题所在 chat |
-| `filter.senderOpenId` | string｜string[] | 可选。只匹配指定发送者 open_id |
+| `filter.senderOpenId` | string｜string[] | 可选。只匹配指定发送者 open_id；不适用于只有 `operatorOpenId` 的 `chat.bot_added` |
 | `redact.fullContentEvents` | string[] | 可选。默认截断长文本；列入 allowlist 的事件透传全文 |
 
 > **`outbound.send` / `outbound.reply` 不能用来拦截。** 它们的发射点在飞书 API 调用**成功之后**（需先拿到 `messageId`），那一刻消息已经在群里了；加 `mode:"sync"` 也只能事后撤回，不是拦截。这两个事件写 `sync` 会降级为 async 并告警。
@@ -66,9 +67,10 @@ tail -f /tmp/botmux-hook.log
 
 | 事件 | 触发时机 |
 |------|----------|
+| `chat.bot_added` | bot 被拉进一个群（需在飞书后台订阅 `im.chat.member.bot.added_v1`）。异步观察 payload 含 `larkAppId`、`chatId`、`operatorOpenId`；同步 gate 还会收到宿主读取的 `chatName`、`chatDescription`、`chatMode`、`chatFetchStatus`，并在入群自动开工创建会话／seed 前裁决。只想给某个 bot 配独立入群脚本时，也可以用 bots.json 的 `groupJoinCommand`（Dashboard 主动开工里可编辑） |
 | `topic.new` | 收到新话题 / @mention |
 | `thread.reply` | 收到已有话题回复 |
-| `prompt.submit` | 消息通过内置权限校验、**即将提交给 CLI 之前**。既可当普通通知（默认 `async`），也是唯一支持 `mode:"sync"` 前置拦截的事件 |
+| `prompt.submit` | 消息通过内置权限校验、**即将提交给 CLI 之前**。既可当普通通知（默认 `async`），也可用 `mode:"sync"` 前置拦截 |
 | `outbound.send` | botmux 发送普通消息成功 |
 | `outbound.reply` | botmux 回复话题消息成功 |
 | `schedule.fired` | 定时任务的前置检查与提交结束（成功、跳过或报错） |
@@ -76,6 +78,7 @@ tail -f /tmp/botmux-hook.log
 | `session.exit` | worker 退出、崩溃或会话被关闭（daemon shutdown 默认静音） |
 | `session.idle` | session 进入或离开 idle，按 session + 状态 10s 去重 |
 | `session.requires_attention` | TUI prompt 或 worker `user_notify` 需要用户处理 |
+| `turn.finished` | worker 的 `turn_terminal` 已被持久化回调接受。只是通知。去重、VC 会话、以及谁能收到 SSE 帧见下文 |
 
 ## Payload 字段
 
@@ -85,6 +88,7 @@ tail -f /tmp/botmux-hook.log
 
 | 事件 | 额外字段 |
 |------|----------|
+| `chat.bot_added` | 观察通知：`larkAppId`、`chatId`、`operatorOpenId`；同步 gate 另含 `chatName`、`chatDescription`、`chatMode`、`chatFetchStatus` |
 | `topic.new` | `messageId`、`senderOpenId`、`senderType`、`msgType`、`content` |
 | `prompt.submit` | `messageId`、`chatId`、`chatType`、`anchor`、`senderOpenId`、`senderUnionId`、`memberUnionId`、`botSender`、`talkReason`、`content`、`attachments`（`[{type,name}]`，仅元信息） |
 | `thread.reply` | `messageId`、`rootId`、`parentId`、`senderOpenId`、`senderType`、`msgType`、`content` |
@@ -95,16 +99,35 @@ tail -f /tmp/botmux-hook.log
 | `session.exit` | `reason`、`code`（worker 退出路径；`dashboard_close` 为 `null`） |
 | `session.idle` | `prevState`、`newState`、`transition`、`source` |
 | `session.requires_attention` | `reason`、`description`、`optionsCount`、`optionsPreview`、`multiSelect`、`message` |
+| `turn.finished` | `turnId`、`status`（`success` 或 `error`）、`terminalStatus`（`completed`、`failed`、`cancelled` 或 `ambiguous`）、`senderOpenId`（这一轮的 reply target 发送者；Codex App 结算改用接单时冻结的 ledger 发送者）、`dispatchAttempt`（有则带） |
 
 `schedule.fired.status` 与任务的 `lastStatus` 使用 `ok`、`error`、`skipped`：`ok` 表示已交给执行器，不代表模型已完成或消息已送达；`error` 表示前置检查或提交报错；`skipped` 表示前置条件未通过、未调用模型。跳过不消耗重复次数，也不删除任务、前置配置或执行日志。已启用的一次性任务跳过后保持启用，等待至少 30 秒后由调度器重新检查；若提前手动运行被跳过，后续自动检查不会早于原定执行时间。周期任务仍按原周期检查。
 
 `skipped` 是新增状态，旧任务无需迁移；只接受 `ok/error` 的自定义 Hook 需增加该分支，不能把它当作执行成功。
 
+`turn.finished` 是 hook 和 daemon 本机 `GET /api/events` 上的通知：一轮 `turn_terminal` 已被持久化回调接受。它不是 `turn.completed`。后者是反馈 webhook 出站事件，要等已投递的回答再和 terminal 对上，并带时长、用量和 delivery id。`turn.finished` 不等这次关联，也不带用量。
+
+`status` 把 `completed` 记为 `success`，把 `failed`、`cancelled`、`ambiguous` 记为 `error`。`terminalStatus` 保留 worker 的原枚举，因此取消和失败不是同一个值。`senderOpenId` 来自这一轮自己的 reply target；Codex App 结算发布时改用接单时冻结在 ledger 里的发送者。两边都没有发送者时字段不出现，不会用会话 owner、创建者或上一位调用者填上。
+
+同一 session、turn、dispatch attempt 在一个 daemon 进程内只发一次，内存里按 4096 条 FIFO 记住。进程重启后同一条 terminal 可能再发一次。持久化回调返回之后才发布；回调抛错则不发，也不占用这条内存去重。worker 没发出 `turn_terminal` 就退出时不会补这一条（进程退出仍走 `session.exit`）。
+
+专用 VC 接收会话仍会发到 daemon 本机总线（这条总线本来就有这些会话行），但不会跑用户 hook。公开 Dashboard 的 `GET /events` 对匿名和 workbench 观众丢掉这一帧。已登录的本机管理会话仍能看到。Dashboard 界面本身不渲染这一帧。
+
 默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 **600 字符**，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` 内的事件透传全文。
 
-## 同步前置校验闸（prompt.submit）
+## 同步前置校验闸
 
-普通 hook 是「通知」——跑完没人看结果。`prompt.submit` + `mode: "sync"` 是「裁决」：daemon 等它、读它、按它放行或拒绝。用于在消息进入 CLI 前做一层**自定义权限校验**（内部权限服务、工作时间限制、高危指令拦截等）。
+`chat.bot_added` 可用 `filter.larkAppId`、`filter.chatId` 限定范围；邀请人判断应在 gate 命令内读取 `operatorOpenId`。不要用 `filter.senderOpenId` 过滤入群事件：它不会匹配邀请人，且在 `autoStartOnGroupJoinGateRequired: true` 时会使自动开工静默停止。
+
+`<botmux_group_join>` 块、邀请人 `<sender>` 与首轮可信 caller **仅在 `autoStartOnGroupJoinGateRequired: true` 时注入**；未开启该开关时，入群首轮与历史行为逐字一致（同步 gate 的放行/拒绝仍按配置生效）。
+
+可信 `botmux_group_join` 块只证明宿主观察到的入群生命周期、opening 上下文及 turn 归属，**不证明首轮 caller 已认证为真人**。没有平台 bot 证据时，首轮 caller 不带 `senderType`，因此不会获得要求 user caller 的自动续跑租约、用户级派发、失败恢复及 `schedule:create` 直连等特权。下游仍须在需要时独立核验身份和授权；一次 contact 查询不能替代这些 turn 级检查。事件缺少 `operatorOpenId` 时，只要 gate 放行仍可自动开工，但 opening 不含 `<sender>`、`operator_open_id`，也没有可信 caller。
+
+已知邀请人是应用或机器人时（身份缓存 `type` 为 `app`/`bot`，或同机 peer cross-ref），不会把该操作人写成会话 owner / `lastCallerOpenId`，也不会把首轮 reply target 登记成 `isBot: false` 的真人 sender。因此 `trustedSessionController` 不会为这次入群铸出 user 型 controller，回合结束后的 schedule / dispatch 恢复也不会把该操作人当成真人发起人。这条拒绝与 `autoStartOnGroupJoinGateRequired` 无关：gate 关闭时首轮 prompt 仍与旧版本逐字一致，但应用/机器人操作人同样不获得真人身份。没有这类证据时，仍按既有入群语义把操作人登记为真人 sender 与 owner。显式开启实验性 `crossPrincipalInterruption`（默认关闭）后，只有真正登记下来的真人 owner 才会走 user 型 controller。
+
+普通 hook 是「通知」——跑完没人看结果。gate 事件 + `mode: "sync"` 是「裁决」：daemon 等它、读它、按它放行或拒绝。`prompt.submit` 用于消息进入 CLI 前的自定义权限校验；`chat.bot_added` 只裁决 `autoStartOnGroupJoin`，不会阻止异步观察 hook、`groupJoinCommand` 或 owner 自动入群。
+
+对需要“非目标群零可见副作用”的入群自动化，建议同时设置 Bot 的 `autoStartOnGroupJoinGateRequired: true`，并给 gate 配 `onError: "deny"`。这样 hook 缺失、无匹配、超时或崩溃都不会退化为对全部新群开工。显式 `forcePrompt` 的人工入口不走这道入群 gate。
 
 ```json
 [

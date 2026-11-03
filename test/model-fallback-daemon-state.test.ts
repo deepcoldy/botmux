@@ -28,7 +28,7 @@ vi.mock('../src/services/session-store.js', async importOriginal => ({
   updateSession,
 }));
 
-const { getDaemonStreamingCardUsageSnapshot, mergeModelFallbackObservation } = await import('../src/core/worker-pool.js');
+const { getDaemonStreamingCardUsageSnapshot, getDaemonReplyCardUsageSnapshot, mergeModelFallbackObservation } = await import('../src/core/worker-pool.js');
 const { persistStreamCardState } = await import('../src/core/session-manager.js');
 
 const SID = 'a9bc732e-0000-0000-0000-000000000000';
@@ -73,12 +73,35 @@ describe('getDaemonStreamingCardUsageSnapshot: model fallback', () => {
     }
   });
 
+  it('keeps a live fallback notice off the final reply card snapshot', () => {
+    // The final reply card is the answer; the notice belongs on the live status
+    // card only — whichever card shows the usage footer.
+    for (const mode of ['streaming', 'footer', 'off']) {
+      usageDisplay.mode = mode;
+      const ds = makeSession(BOUND);
+      expect(getDaemonStreamingCardUsageSnapshot(ds).modelFallback, mode).toEqual(BOUND);
+      expect(getDaemonReplyCardUsageSnapshot(ds), mode).not.toHaveProperty('modelFallback');
+    }
+  });
+
   it('omits the key entirely when there is no fallback', () => {
     for (const mode of ['streaming', 'off']) {
       usageDisplay.mode = mode;
       expect(getDaemonStreamingCardUsageSnapshot(makeSession()), mode)
         .not.toHaveProperty('modelFallback');
     }
+  });
+
+  it.each(['streaming', 'footer', 'off'])('keeps runtime identity in both card kinds with usageDisplay=%s', mode => {
+    usageDisplay.mode = mode;
+    const ds = makeSession();
+    ds.session.model = 'configured-model';
+    ds.activeModel = 'observed-model';
+    ds.activeReasoningEffort = 'high';
+    for (const snapshot of [getDaemonStreamingCardUsageSnapshot(ds), getDaemonReplyCardUsageSnapshot(ds)]) {
+      expect(snapshot).toMatchObject({ model: 'observed-model', reasoningEffort: 'high' });
+    }
+    expect(getDaemonReplyCardUsageSnapshot(ds)).not.toHaveProperty('modelFallback');
   });
 
   it('P1-4: the usage line shows the serving model, not the launch config', () => {

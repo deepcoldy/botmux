@@ -39,6 +39,7 @@ const mocks = vi.hoisted(() => {
     runAutoWorktreeCommit: vi.fn(async () => undefined),
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_intro'),
+    forwardMessage: vi.fn(async () => 'om_forwarded'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveSender: vi.fn(async (_appId: string, openId?: string) => (
@@ -98,6 +99,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    forwardMessage: (...args: any[]) => mocks.forwardMessage(...args),
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
     getChatInfo: vi.fn(async () => ({ userCount: 1, botCount: 1 })),
@@ -181,6 +183,8 @@ function createGroupResult(overrides: Record<string, unknown> = {}): any {
     invalidOwnerUnionIds: [],
     ownerTransferredTo: null,
     transferError: null,
+    managersAdded: [],
+    managerError: null,
     notifyMessageId: null,
     notifyError: null,
     shareLink: null,
@@ -224,6 +228,7 @@ beforeEach(() => {
   mocks.createdSessions.length = 0;
   mocks.replyMessage.mockResolvedValue('om_reply');
   mocks.sendMessage.mockResolvedValue('om_intro');
+  mocks.forwardMessage.mockResolvedValue('om_forwarded');
   mocks.getChatMode.mockResolvedValue('group');
   mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
@@ -317,5 +322,22 @@ describe('会话群出生：显式 sessionGroup.workingDir 模板目录', () => 
     expect(ds.chatId).toBe(BORN_GROUP);
     expect(ds.workingDir).toBe(tplDir);
     expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+  });
+});
+
+describe('会话群出生：自动赋予发起人群管理员权限', () => {
+  it('出生时自动将发起人设为群管理员（managerUserIds: [senderOpenId]）', async () => {
+    registerAppBot({
+      defaultWorkingDir: join(mocks.dataDir, 'default-dir'),
+      sessionGroup: { tag: { mode: 'off' }, avatar: 'off' },
+    });
+    mocks.createGroupWithBots.mockResolvedValue(createGroupResult({ managersAdded: [OWNER] }));
+
+    await handleNewTopic(dmEvent('帮我看下代码', 'om_mgr_auto'), dmCtx('om_mgr_auto'));
+
+    expect(mocks.createGroupWithBots).toHaveBeenCalledTimes(1);
+    const opts = mocks.createGroupWithBots.mock.calls[0][0];
+    expect(opts.managerUserIds).toEqual([OWNER]);
+    expect(opts.transferOwnerTo).toBeUndefined();
   });
 });

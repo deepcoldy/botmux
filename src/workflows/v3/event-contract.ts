@@ -53,14 +53,88 @@ export interface V3LoopRef {
   bodyNodeId: string;
 }
 
+/** Where an external goal-node handoff is delivered (design §5.1). */
+export type V3ExternalPlacement = 'topic' | 'main';
+
+/** Per-message idempotency keys, frozen in `nodeHandoffPrepared` so a
+ *  re-dispatch after a crash reuses the exact same keys. */
+export interface V3HandoffIdempotency {
+  /** Node card (topic placement only). */
+  nodeCard?: string;
+  handoff: string;
+}
+
 export type V3Event =
-  | { type: 'runStarted'; runId: string }
+  | {
+      type: 'runStarted';
+      runId: string;
+      /** Stamped by a runtime executing goal nodes through bot sessions. */
+      nodeExecutor?: 'bot';
+    }
   | {
       type: 'nodeDispatched';
       nodeId: string;
       instanceId?: string;
       attemptId: string;
       loop?: V3LoopRef;
+      /** Present when the attempt is executed by an external bot session
+       *  (`run.json` `nodeExecutor: "bot"`). Such attempts own no local worker
+       *  process, so they never enter the worker attempt ledger. */
+      nodeExecutor?: 'bot';
+    }
+  | {
+      /** Durable intent written before any handoff message is sent. */
+      type: 'nodeHandoffPrepared';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      targetLarkAppId: string;
+      placement: V3ExternalPlacement;
+      /** Flow revision the attempt was dispatched under (1 = approved DAG). */
+      revision: number;
+      idempotency: V3HandoffIdempotency;
+      /** Engine clock (ms) at preparation; bounds same-key re-dispatch. */
+      preparedAt: number;
+    }
+  | {
+      type: 'nodeHandoffSent';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      handoffMessageId: string;
+      nodeCardMessageId?: string;
+      threadId?: string;
+      sentAt: number;
+      /** Absolute engine-clock deadline for the target bot to accept. */
+      acceptDeadlineAt: number;
+    }
+  | {
+      type: 'nodeHandoffAccepted';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      sessionId: string;
+      acceptedAt: number;
+      /** Absolute engine-clock deadline = acceptedAt + node timeoutSec. */
+      deadlineAt: number;
+    }
+  | {
+      /** The bot's turn ended without a valid submission (display only). */
+      type: 'nodeStalled';
+      nodeId: string;
+      instanceId?: string;
+      attemptId: string;
+      at: number;
+    }
+  | {
+      type: 'nodeReassigned';
+      nodeId: string;
+      instanceId?: string;
+      /** The open external attempt this reassignment closed, if any. */
+      attemptId?: string;
+      from: string;
+      to: string;
+      by: string;
     }
   | {
       type: 'hostInputPrepared';

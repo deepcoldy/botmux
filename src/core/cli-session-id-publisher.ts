@@ -2,6 +2,7 @@ import type { WorkerToDaemon } from '../types.js';
 
 export interface CliSessionIdPublisherInput {
   cliSessionId: string;
+  codexCleanupTarget?: Extract<WorkerToDaemon, { type: 'cli_session_id' }>['codexCleanupTarget'];
   sessionId: string | undefined;
   initConfig: { cliSessionId?: string } | null | undefined;
   turnId: string | undefined;
@@ -22,6 +23,7 @@ export function publishCliSessionIdToDaemon(input: CliSessionIdPublisherInput): 
   input.send({
     type: 'cli_session_id',
     cliSessionId: input.cliSessionId,
+    ...(input.codexCleanupTarget ? { codexCleanupTarget: input.codexCleanupTarget } : {}),
     turnId: input.turnId,
     dispatchAttempt: input.dispatchAttempt,
   });

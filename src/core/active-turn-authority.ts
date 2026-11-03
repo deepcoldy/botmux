@@ -1,7 +1,10 @@
 import type { TrustedCaller } from '../types.js';
 
 export interface TurnAuthorityIdentity {
+  /** Authenticated collaborative input must wait even when sent by the same caller. */
+  queueAfterActiveTurn?: true;
   turnId?: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   caller?: TrustedCaller;
   /** Stable controller of the surrounding task/session. The active caller may
@@ -77,6 +80,18 @@ export function sameTrustedPrincipal(
  */
 export class ActiveTurnAuthority {
   private active?: ActiveTurnAuthoritySnapshot;
+  private executionActive = false;
+
+  constructor(private readonly onActiveEnvelopeChanged?: (previousTurnId: string, turnId: string) => void) {}
+
+  /** Only a live execution can pass its output policy to an interruption.
+   * Reservations and turns started after release have no execution to inherit. */
+  private notifyActiveEnvelopeChanged(previous: ActiveTurnAuthoritySnapshot | undefined): void {
+    if (this.executionActive && previous?.turnId && this.active?.turnId
+      && previous.turnId !== this.active.turnId) {
+      this.onActiveEnvelopeChanged?.(previous.turnId, this.active.turnId);
+    }
+  }
 
   snapshot(): ActiveTurnAuthoritySnapshot | undefined {
     if (!this.active) return undefined;
@@ -93,6 +108,7 @@ export class ActiveTurnAuthority {
       ...(this.active.caller ? { caller: this.active.caller } : {}),
       ...(this.active.controller ? { controller: this.active.controller } : {}),
       ...(this.active.turnId ? { turnId: this.active.turnId } : {}),
+      ...(this.active.identityTurnId ? { identityTurnId: this.active.identityTurnId } : {}),
       ...(this.active.dispatchAttempt !== undefined
         ? { dispatchAttempt: this.active.dispatchAttempt }
         : {}),
@@ -103,11 +119,11 @@ export class ActiveTurnAuthority {
   reserve(identity: TurnAuthorityIdentity, nowMs = Date.now()): boolean {
     if (!identity.turnId) return false;
     if (this.active) {
-      return this.matches(identity)
-        || mayControlActiveTurn(this.active, identity);
+      return !this.blocks(identity);
     }
     this.active = Object.freeze({
       turnId: identity.turnId,
+      ...(identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
       ...(identity.dispatchAttempt !== undefined
         ? { dispatchAttempt: identity.dispatchAttempt }
         : {}),
@@ -119,13 +135,56 @@ export class ActiveTurnAuthority {
     return true;
   }
 
+  /**
+   * Replace only the active turn envelope while retaining the authenticated
+   * principal that opened the in-flight turn. This is the compatibility path
+   * for cross-principal type-ahead when isolation is disabled: the incoming
+   * message owns reply/turn attribution, but tools must continue to run as the
+   * principal whose work is already executing.
+   *
+   * The caller decides whether this policy is allowed. Enforcing paths must
+   * continue to use reserve()/markStarted(), which reject a different caller.
+   */
+  adoptEnvelopePreservingPrincipal(
+    identity: TurnAuthorityIdentity,
+    nowMs = Date.now(),
+  ): boolean {
+    if (!identity.turnId) return false;
+    const active = this.active;
+    this.active = Object.freeze({
+      turnId: identity.turnId,
+      ...(active
+        ? { identityTurnId: active.identityTurnId ?? active.turnId }
+        : identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
+      ...(identity.dispatchAttempt !== undefined
+        ? { dispatchAttempt: identity.dispatchAttempt }
+        : {}),
+      ...(active
+        ? active.caller ? { caller: active.caller } : {}
+        : identity.caller
+        ? { caller: frozenCaller(identity.caller) }
+        : {}),
+      ...(active?.controller
+        ? { controller: active.controller }
+        : identity.controller
+        ? { controller: frozenCaller(identity.controller) }
+        : {}),
+      started: false,
+      reservedAtMs: nowMs,
+    });
+    this.notifyActiveEnvelopeChanged(active);
+    return true;
+  }
+
   /** Mark the reserved tuple as having crossed the literal CLI submission edge. */
   markStarted(identity: TurnAuthorityIdentity): boolean {
     if (!this.active) return false;
     if (!this.matches(identity)) {
-      if (!mayControlActiveTurn(this.active, identity)) return false;
+      if (this.blocks(identity)) return false;
+      const previous = this.active;
       this.active = Object.freeze({
         turnId: identity.turnId,
+        ...(identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
         ...(identity.dispatchAttempt !== undefined
           ? { dispatchAttempt: identity.dispatchAttempt }
           : {}),
@@ -138,16 +197,19 @@ export class ActiveTurnAuthority {
         started: true,
         reservedAtMs: Date.now(),
       });
+      this.notifyActiveEnvelopeChanged(previous);
+      this.executionActive = true;
       return true;
     }
     if (!this.active.started) this.active = Object.freeze({ ...this.active, started: true });
+    this.executionActive = true;
     return true;
   }
 
   blocks(identity: TurnAuthorityIdentity): boolean {
     return !!this.active
       && !this.matches(identity)
-      && !mayControlActiveTurn(this.active, identity);
+      && (identity.queueAfterActiveTurn === true || !mayControlActiveTurn(this.active, identity));
   }
 
   /**
@@ -182,6 +244,7 @@ export class ActiveTurnAuthority {
   clear(): ActiveTurnAuthoritySnapshot | undefined {
     const prior = this.active;
     this.active = undefined;
+    this.executionActive = false;
     return prior;
   }
 }

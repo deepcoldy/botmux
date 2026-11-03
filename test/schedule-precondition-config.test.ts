@@ -17,7 +17,6 @@ import {
   resolveSchedulePrecondition,
   schedulePreconditionPath,
   schedulePreconditionRoot,
-  schedulePreconditionTrustedFileExamplePath,
   schedulePreconditionTrustedFilesRoot,
   stageSchedulePrecondition,
 } from '../src/services/schedule-precondition-store.js';
@@ -70,8 +69,8 @@ function createLegacySixChatTask() {
   });
 }
 
-function createLegacyFileTask(path: string, enabled = true, label = 'legacy-file') {
-  const id = `${label}-${enabled ? 'enabled' : 'disabled'}`;
+function createLegacyFileTask(path: string, enabled = true, label = 'legacy_file') {
+  const id = `${label}_${enabled ? 'enabled' : 'disabled'}`;
   const staged = stageSchedulePrecondition(APP_ID, id, {
     enabled,
     source: { kind: 'file', path },
@@ -90,7 +89,7 @@ function createLegacyRelativeFileTask(enabled = true) {
   return createLegacyFileTask(
     'scripts/legacy-guard.sh',
     enabled,
-    'legacy-relative',
+    'legacy_relative',
   );
 }
 
@@ -304,10 +303,6 @@ describe('trusted schedule precondition configuration', () => {
       'schedule-preconditions',
       'trusted-files',
     ));
-    expect(schedulePreconditionTrustedFileExamplePath()).toBe(join(
-      schedulePreconditionTrustedFilesRoot(),
-      'check-ready.sh',
-    ));
     expect(existsSync(schedulePreconditionTrustedFilesRoot())).toBe(true);
   });
 
@@ -420,7 +415,7 @@ describe('trusted schedule precondition configuration', () => {
     )).toThrow('must be inside the daemon trusted-files directory');
     expect(getTask(inline.id, APP_ID)).toEqual(inlineBefore);
 
-    const legacy = createLegacyFileTask(outsidePath, false, 'legacy-outside');
+    const legacy = createLegacyFileTask(outsidePath, false, 'legacy_outside');
     expect(resolveSchedulePrecondition(legacy, APP_ID)).toMatchObject({
       kind: 'configured',
       enabled: false,
@@ -436,7 +431,7 @@ describe('trusted schedule precondition configuration', () => {
 
     // Directly persisted legacy records stay parseable, but an enabled one is
     // rejected before Bash or the model continuation can run.
-    const enabledLegacy = createLegacyFileTask(outsidePath, true, 'legacy-outside-runtime');
+    const enabledLegacy = createLegacyFileTask(outsidePath, true, 'legacy_outside_runtime');
     const continuation = vi.fn(async () => undefined);
     await expect(executeScheduledTaskWithPrecondition(
       enabledLegacy,
@@ -467,7 +462,7 @@ describe('trusted schedule precondition configuration', () => {
     });
     expect(disabled.task?.preconditionRef).toBe(created.preconditionRef);
 
-    const trustedFilePath = schedulePreconditionTrustedFileExamplePath();
+    const trustedFilePath = join(schedulePreconditionTrustedFilesRoot(), 'check-ready.sh');
     const replacedAndEnabled = updateTaskWithOptionalPrecondition(
       created.id,
       {},
@@ -618,4 +613,19 @@ describe('trusted schedule precondition configuration', () => {
     expect(getTask(task.id, APP_ID)).toBeUndefined();
     expect(listTasks(APP_ID)).toHaveLength(0);
   });
+});
+
+it('rebinds the protected Bash input after a Dashboard calendar edit', () => {
+  const task = createTaskWithOptionalPrecondition(createParams(), APP_ID, {
+    enabled: true, source: { kind: 'inline', script: 'printf 1' },
+  });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendar: 'demo' }, APP_ID)).toMatchObject({ ok: true });
+  const after = getTask(task.id)!;
+  expect(after.calendar).toBe('demo');
+  expect(resolveSchedulePrecondition(after, APP_ID)).toMatchObject({ kind: 'configured', enabled: true });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendarDayType: 'restday' }, APP_ID)).toMatchObject({ ok: true });
+  expect(getTask(task.id)?.calendarDayType).toBe('restday');
+  expect(resolveSchedulePrecondition(getTask(task.id)!, APP_ID)).toMatchObject({ kind: 'configured', enabled: true });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendar: null }, APP_ID)).toMatchObject({ ok: true });
+  expect(resolveSchedulePrecondition(getTask(task.id)!, APP_ID)).toMatchObject({ kind: 'configured' });
 });

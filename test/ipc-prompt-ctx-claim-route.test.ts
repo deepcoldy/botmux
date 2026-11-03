@@ -67,11 +67,12 @@ async function postClaim(sessionId: string, body: Record<string, unknown>, opts:
   });
 }
 
-function mockSession(sessionId: string, opts: { capability?: string; turnId?: string } = {}) {
+function mockSession(sessionId: string, opts: { capability?: string; turnId?: string; worker?: any; status?: string } = {}) {
   vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
-    session: { sessionId },
-    managedTurnOrigin: { capability: opts.capability ?? CAP, turnId: opts.turnId ?? 'turn-1' },
+    session: { sessionId, status: opts.status ?? 'active' },
+    managedTurnOrigin: opts.turnId === null ? undefined : { capability: opts.capability ?? CAP, turnId: opts.turnId ?? 'turn-1' },
     larkAppId: 'app-1',
+    worker: opts.worker,
   } as any);
 }
 
@@ -191,5 +192,67 @@ describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, envelope: '<botmux_reminder>提醒</botmux_reminder>' });
     expect(claimMock).toHaveBeenCalledWith('s-receiver', 'turn-1', 'a'.repeat(64), 'some-prefix');
+  });
+
+  it('notifies worker with prompt_submitted and suppressing callback even when no active turn (web terminal prompt)', async () => {
+    const workerSend = vi.fn();
+    mockSession('s-web-terminal', { worker: { send: workerSend, killed: false, connected: true }, turnId: null });
+
+    const res = await postClaim('s-web-terminal', VALID_BODY, { auth: 'signed' });
+
+    // Web terminal has no managed turn id, so claim returns 404
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ ok: false, error: 'no_active_turn' });
+    // Worker is notified with a callback to suppress asynchronous child error events
+    expect(workerSend).toHaveBeenCalledWith({ type: 'prompt_submitted' }, expect.any(Function));
+  });
+
+  it('notifies worker with prompt_submitted on active turn', async () => {
+    const workerSend = vi.fn();
+    mockSession('s-active-turn', { worker: { send: workerSend, killed: false, connected: true }, turnId: 'turn-1' });
+    claimMock.mockReturnValue('envelope-content');
+
+    const res = await postClaim('s-active-turn', VALID_BODY, { auth: 'signed' });
+
+    expect(res.status).toBe(200);
+    expect(workerSend).toHaveBeenCalledWith({ type: 'prompt_submitted' }, expect.any(Function));
+  });
+
+  it('does not notify worker when worker is killed or disconnected', async () => {
+    const killedSend = vi.fn();
+    mockSession('s-killed', { worker: { send: killedSend, killed: true, connected: true }, turnId: null });
+    await postClaim('s-killed', VALID_BODY, { auth: 'signed' });
+    expect(killedSend).not.toHaveBeenCalled();
+
+    const disconnectedSend = vi.fn();
+    mockSession('s-disconnected', { worker: { send: disconnectedSend, killed: false, connected: false }, turnId: null });
+    await postClaim('s-disconnected', VALID_BODY, { auth: 'signed' });
+    expect(disconnectedSend).not.toHaveBeenCalled();
+  });
+
+  it('does not notify worker when session is not active', async () => {
+    const workerSend = vi.fn();
+    mockSession('s-stopped', { worker: { send: workerSend, killed: false, connected: true }, status: 'stopped', turnId: null });
+    await postClaim('s-stopped', VALID_BODY, { auth: 'signed' });
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
+  it('safely handles worker.send callback error and synchronous throw without crashing', async () => {
+    // 1. Asynchronous error passed to callback
+    let capturedCallback: ((err?: Error) => void) | undefined;
+    const asyncFailSend = vi.fn((_msg: any, cb: (err?: Error) => void) => {
+      capturedCallback = cb;
+    });
+    mockSession('s-async-fail', { worker: { send: asyncFailSend, killed: false, connected: true }, turnId: null });
+    const resAsync = await postClaim('s-async-fail', VALID_BODY, { auth: 'signed' });
+    expect(resAsync.status).toBe(404);
+    expect(capturedCallback).toBeDefined();
+    expect(() => capturedCallback!(new Error('Channel closed'))).not.toThrow();
+
+    // 2. Synchronous throw
+    const syncThrowSend = vi.fn(() => { throw new Error('IPC sync error'); });
+    mockSession('s-sync-throw', { worker: { send: syncThrowSend, killed: false, connected: true }, turnId: null });
+    const resSync = await postClaim('s-sync-throw', VALID_BODY, { auth: 'signed' });
+    expect(resSync.status).toBe(404);
   });
 });

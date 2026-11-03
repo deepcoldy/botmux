@@ -3,7 +3,10 @@ import type { CliId } from './types.js';
 /** Static model metadata shared by adapters and the Dashboard.
  * Keep this module free of adapter construction, executable lookup and I/O:
  * option enumeration runs synchronously on the Dashboard request thread. */
-const CODEX_MODEL_CHOICES = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.2'] as const;
+const CODEX_MODEL_CHOICES = [
+  'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
+  'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
+] as const;
 const DSH_MODEL_CHOICES = ['deepseek-v4-flash', 'deepseek-v4-pro'] as const;
 
 /** Explicitly account for every CLI; undefined means it has no curated list. */
@@ -21,7 +24,6 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
   'codex': CODEX_MODEL_CHOICES,
   'codex-app': CODEX_MODEL_CHOICES,
   'cursor': ['auto', 'claude-4-sonnet', 'claude-4-opus', 'gpt-5'],
-  'gemini': ['gemini-2.5-pro', 'gemini-2.5-flash'],
   'genius': ['gpt-5.5'],
   'opencode': [
     'anthropic/claude-sonnet-4',
@@ -30,7 +32,20 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'google/gemini-2.5-pro',
   ],
   'opencode2': undefined,
-  'antigravity': undefined,
+  'mimocode': [
+    'xiaomi/mimo-v2.5-pro',
+    'xiaomi/mimo-v2.5-pro-ultraspeed',
+  ],
+  'antigravity': [
+    'gemini-3.8-flash-high',
+    'gemini-3.8-flash-medium',
+    'gemini-3.8-flash-low',
+    'gemini-3.7-flash-high',
+    'gemini-3.7-flash-medium',
+    'gemini-3.5-flash',
+    'gemini-3.1-pro-low-thinking',
+    'claude-opus-4-6-thinking',
+  ],
   'mtr': undefined,
   'hermes': undefined,
   'mira': undefined,
@@ -74,8 +89,13 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'gpt-5.5-ptu',
   ],
   'minimax': [
-    'MiniMax-M3',
-    'MiniMax-M2.7',
-    'MiniMax-M2.7-highspeed',
+    'minimax/MiniMax-M3.1-Flash-Preview',
+    'minimax/MiniMax-M3',
+    'minimax/MiniMax-M2.7',
+    'minimax/MiniMax-M2.7-highspeed',
   ],
+  'remote-runner': undefined,
+  'codem': undefined,
+  // Personal providers are discovered on demand; never perform I/O here.
+  zcode: undefined,
 };

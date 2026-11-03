@@ -23,6 +23,24 @@
 
 想让哪些 bot 参与协作，先把它们拉进这个群、确保能被 @ 到（见 [多机器人协作](/multi-bot)）。其余的——在哪个仓库干活、怎么开话题派活——主 bot 都会自动处理，你不用预先配置（不需要先开 OnCall 之类的）。
 
+## 派发中的用户身份
+
+启用 `triggerUserAuth` 后，`botmux dispatch --bot-app` 通过当前真人回合建立消息绑定的身份委托；接收方仍需校验目标应用的用户映射、群成员资格和工具授权。普通 Bot 消息不会自动获得真人权限。
+
+TRAE 会话以结构化日志中的 `task_complete`（成功或失败）或 `turn_aborted` 结束已开始的回合。工具执行期间的终端空闲画面不会撤销当前用户身份。若来源回合已失效，受保护派发会返回 `dispatch_turn_unproven`，不会把缺少身份的任务当作成功派出；不能用会话 Owner 或历史发送者替代当前发起人。
+
+## 关闭功能
+
+多话题协作默认开启。若当前机器不需要该功能，可在 Dashboard 的「设置 → 多话题协作」中关闭「启用多话题协作」。设置从下一个会话开始生效，无需重启。
+
+关闭后：
+
+- Agent 不再看到 `botmux-orchestrate` Skill。
+- `botmux dispatch` 不能新建子项目话题。
+- `botmux dispatch --into <话题根消息 ID>` 仍可向已有话题追加内容，不影响普通 Bot 接力。
+
+部署环境也可设置 `BOTMUX_MULTI_TOPIC_ENABLED=false`。环境变量优先于 Dashboard 中保存的配置。
+
 ## 效果
 
 ![多话题协作 · 飞书任务面板当共享进度板](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780419243796_multitopic-board.png)

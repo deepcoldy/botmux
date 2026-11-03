@@ -10,7 +10,6 @@ import {
   V3_DISTILL_REJECT_ACTION,
   buildV3DistillationCommittedCard,
   buildV3DistillationRejectedCard,
-  isV3DistillationAction,
   parseV3DistillationActionValue,
 } from './v3-distillation-card.js';
 

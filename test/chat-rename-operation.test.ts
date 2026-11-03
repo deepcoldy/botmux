@@ -57,6 +57,7 @@ describe('executeChatRename', () => {
     ['bot_not_in_chat', 403],
     ['permission_denied', 403],
     ['rate_limited', 429],
+    ['name_changed', 409],
     ['lark_api_error', 502],
   ] as const)('maps %s to HTTP %i without mutating projections', async (error, status) => {
     const active = session('s-one', 'oc_target', 'Old');
@@ -73,6 +74,14 @@ describe('executeChatRename', () => {
     expect(response.body).toEqual({ ok: false, error });
     expect(active.chatDisplayName).toBe('Old');
     expect(operationDeps.persistSession).not.toHaveBeenCalled();
+  });
+
+  it('forwards expectedOldName only when the caller sets it', async () => {
+    const operationDeps = deps({ ok: true, oldName: 'Old', newName: 'New', changed: true });
+    await executeChatRename({ larkAppId: 'cli_app', chatId: 'oc_target', name: 'New', trigger: 'auto_title', expectedOldName: 'Old' }, operationDeps);
+    await executeChatRename({ larkAppId: 'cli_app', chatId: 'oc_target', name: 'New', trigger: 'host_api' }, operationDeps);
+    expect(operationDeps.renameChat).toHaveBeenNthCalledWith(1, 'cli_app', 'oc_target', 'New', { beforeUpdate: undefined, expectedOldName: 'Old' });
+    expect(operationDeps.renameChat).toHaveBeenNthCalledWith(2, 'cli_app', 'oc_target', 'New', { beforeUpdate: undefined });
   });
 
   it('keeps a successful Lark write successful when one projection cannot persist', async () => {

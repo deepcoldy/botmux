@@ -109,10 +109,7 @@ export function createTaskWithOptionalPrecondition(
       // effort because either residue (pending sidecar or marker-only task)
       // fails closed; the original error remains the actionable one.
       try {
-        const current = scheduleStore.getTask(id, appId);
-        if (current?.preconditionRef === staged.preconditionRef) {
-          scheduleStore.removeTask(id, appId);
-        }
+        scheduler.rollbackUnpublishedRuntimeTask(id, appId, staged.preconditionRef);
       } catch (cleanupError) {
         logRollbackFailure(id, 'task-row cleanup after create failure', cleanupError);
       }
@@ -203,6 +200,7 @@ function restoreUpdatedTaskRow(
   before: ScheduledTask,
   updates: ScheduleUpdateParams,
   appId: string,
+  identityBefore?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'>,
 ): void {
   const patch: Parameters<typeof scheduleStore.updateTask>[1] = {
     preconditionRef: before.preconditionRef,
@@ -232,7 +230,20 @@ function restoreUpdatedTaskRow(
     patch.chatIds = before.chatIds ?? null;
   }
   if (updates.topicTitle !== undefined) patch.topicTitle = before.topicTitle;
-  scheduleStore.updateTask(before.id, patch, appId);
+  if (updates.model !== undefined) patch.model = before.model;
+  if (updates.reasoningEffort !== undefined) patch.reasoningEffort = before.reasoningEffort;
+  scheduler.updateRuntimeTaskState(before.id, {
+    ...patch,
+    chatIds: patch.chatIds === null || patch.chatIds === undefined ? undefined : [...patch.chatIds],
+    // An edit that recorded a new creator also replaced who the task runs as
+    // and dropped its claim. A failed edit must not keep either. (The host
+    // authority re-derives a non-delegated task's control columns from these.)
+    ...(updates.creator && identityBefore ? {
+      ownerOpenId: identityBefore.ownerOpenId,
+      ownerUnionId: identityBefore.ownerUnionId,
+      runAsClaim: identityBefore.runAsClaim,
+    } : {}),
+  }, appId);
 }
 
 function resultForTask(task: ScheduledTask, appId: string): SchedulePreconditionUpdateResult {
@@ -324,7 +335,7 @@ export function updateTaskWithOptionalPrecondition(
         // means the only observable intermediate is marker-without-sidecar,
         // which resolve treats as an error rather than an absent condition.
         removeSchedulePrecondition(appId, id);
-        scheduleStore.updateTask(id, { preconditionRef: undefined }, appId);
+        scheduler.updateRuntimeTaskState(id, { preconditionRef: undefined }, appId);
       }
     } else if (mutation.action === 'set-enabled') {
       if (!existing) throw new Error('schedule_precondition_not_configured');
@@ -334,7 +345,7 @@ export function updateTaskWithOptionalPrecondition(
       setSchedulePreconditionEnabled(task, appId, mutation.enabled);
     } else {
       if (!staged) throw new Error('schedule_precondition_stage_missing');
-      scheduleStore.updateTask(id, { preconditionRef: staged.preconditionRef }, appId);
+      scheduler.updateRuntimeTaskState(id, { preconditionRef: staged.preconditionRef }, appId);
       task = scheduleStore.getTask(id, appId);
       if (!task) throw new Error('schedule_missing_during_precondition_update');
       activateSchedulePrecondition(task, appId);
@@ -343,7 +354,7 @@ export function updateTaskWithOptionalPrecondition(
     // Restore only fields this operation could have changed; runtime status
     // may have advanced concurrently and must not be clobbered.
     try {
-      restoreUpdatedTaskRow(before, updates, appId);
+      restoreUpdatedTaskRow(before, updates, appId, updated.previousRunAs);
     } catch (rollbackError) {
       logRollbackFailure(id, 'task-row rollback after update failure', rollbackError);
     }

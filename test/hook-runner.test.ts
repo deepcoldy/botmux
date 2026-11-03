@@ -17,6 +17,7 @@ import {
   parseHookCommand,
   prepareHookPayload,
   runHookCommandForTest,
+  runGroupJoinCommand,
   type HookConfig,
 } from '../src/services/hook-runner.js';
 
@@ -220,7 +221,7 @@ describe('prepareHookPayload', () => {
   });
 
   it('truncates long text/label in the real optionsPreview field too', () => {
-    // Mirror the path actually emitted by worker-pool.ts tui_prompt
+    // Mirror the shape the retired worker-pool.ts tui_prompt path emitted
     // (`optionsPreview: ...`) — the previous fix only covered the synthetic
     // `options` alias, leaving the production emit shape unredacted.
     const longText = 'p'.repeat(700);
@@ -279,6 +280,45 @@ describe('filterMatches', () => {
 
   it('treats absent filters as a match', () => {
     expect(filterMatches(undefined, { event: 'schedule.fired', chatId: 'oc_1' })).toBe(true);
+  });
+});
+
+describe('runGroupJoinCommand', () => {
+  it('passes the join payload on stdin and BOTMUX_JOIN_* env without leaking secrets', async () => {
+    const script = join(tmpDir, 'join-writer.js');
+    const output = join(tmpDir, 'join.json');
+    writeFileSync(script, `
+      import { writeFileSync } from 'node:fs';
+      let input = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', chunk => { input += chunk; });
+      process.stdin.on('end', () => writeFileSync(process.argv[2], JSON.stringify({ input: JSON.parse(input), env: process.env })));
+    `);
+    process.env.LARK_APP_SECRET = 'super-secret';
+    try {
+      runGroupJoinCommand(`${process.execPath} ${script} ${output}`, {
+        larkAppId: 'cli_app', chatId: 'oc_join', operatorOpenId: 'ou_op',
+      });
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(output) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+      await new Promise(r => setTimeout(r, 50));
+      const got = JSON.parse(readFileSync(output, 'utf-8'));
+      expect(got.input).toMatchObject({ event: 'chat.bot_added', larkAppId: 'cli_app', chatId: 'oc_join', operatorOpenId: 'ou_op' });
+      expect(got.env).toMatchObject({
+        BOTMUX_HOOK_EVENT: 'chat.bot_added',
+        BOTMUX_JOIN_CHAT_ID: 'oc_join',
+        BOTMUX_JOIN_LARK_APP_ID: 'cli_app',
+        BOTMUX_JOIN_OPERATOR_OPEN_ID: 'ou_op',
+      });
+      expect(got.env.LARK_APP_SECRET).toBeUndefined();
+      expect(got.env.BOTMUX_SESSION_ID).toBeUndefined();
+    } finally {
+      delete process.env.LARK_APP_SECRET;
+    }
+  });
+
+  it('never throws on an unparsable command', () => {
+    expect(() => runGroupJoinCommand('bash "unterminated', { larkAppId: 'a', chatId: 'oc_x' })).not.toThrow();
   });
 });
 
@@ -480,7 +520,7 @@ describe('runHookCommandForTest', () => {
 
 // ─── 同步前置校验闸（sync gate hooks） ──────────────────────────────────────
 
-describe('sync gate hooks (prompt.submit)', () => {
+describe('sync gate hooks', () => {
   /** 写一个按参数决定行为的 hook 脚本，返回可直接放进 command 的路径。 */
   function writeHook(name: string, body: string, dir = tmpDir): string {
     const script = join(dir, name);
@@ -525,6 +565,32 @@ describe('sync gate hooks (prompt.submit)', () => {
     gateHooks([{ event: 'prompt.submit', command: '/bin/false', mode: 'async' }]);
     const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
     expect(decision.allowed).toBe(true);
+  });
+
+  it('reports whether a matching sync hook actually adjudicated the event', async () => {
+    gateHooks([{
+      event: 'chat.bot_added',
+      mode: 'sync',
+      command: writeHook('allow-join.js', `console.log(JSON.stringify({ decision: 'allow' }));`),
+      filter: { larkAppId: 'cli_target' },
+    }]);
+    const unmatched = await evaluatePromptGate('chat.bot_added', { larkAppId: 'cli_other' });
+    expect(unmatched).toMatchObject({ allowed: true });
+    expect(unmatched.matched).not.toBe(true);
+
+    const matched = await evaluatePromptGate('chat.bot_added', { larkAppId: 'cli_target' });
+    expect(matched).toMatchObject({ allowed: true, matched: true });
+  });
+
+  it('honours larkAppId compatibility filters for per-bot lifecycle gates', async () => {
+    gateHooks([{
+      event: 'chat.bot_added',
+      mode: 'sync',
+      command: writeHook('deny-target-join.js', `console.log(JSON.stringify({ decision: 'deny' }));`),
+      filter: { lark_app_id: 'cli_target' },
+    }]);
+    expect((await evaluatePromptGate('chat.bot_added', { larkAppId: 'cli_other' })).allowed).toBe(true);
+    expect((await evaluatePromptGate('chat.bot_added', { larkAppId: 'cli_target' })).allowed).toBe(false);
   });
 
   it('denies on a JSON verdict and surfaces the reason to the caller', async () => {
@@ -770,11 +836,13 @@ describe('sync gate hooks (prompt.submit)', () => {
         BOTMUX_HOOKS_JSON: JSON.stringify([
           { event: 'session.start', command: '/bin/true', mode: 'sync' },
           { event: 'prompt.submit', command: '/bin/true', mode: 'sync' },
+          { event: 'chat.bot_added', command: '/bin/true', mode: 'sync' },
         ]),
       },
     });
     expect(hooks.find(h => h.event === 'session.start')?.mode).toBe('async');
     expect(hooks.find(h => h.event === 'prompt.submit')?.mode).toBe('sync');
+    expect(hooks.find(h => h.event === 'chat.bot_added')?.mode).toBe('sync');
   });
 
   it('never runs a sync gate hook a second time as a fire-and-forget notification', async () => {
@@ -856,11 +924,16 @@ describe('sync gate hooks (prompt.submit)', () => {
     gateHooks([{
       event: 'prompt.submit',
       command: writeHook('observer-payload.js', `
-        import { writeFileSync } from 'node:fs';
+        import { writeFileSync, renameSync } from 'node:fs';
         let input = '';
         process.stdin.setEncoding('utf8');
         process.stdin.on('data', c => { input += c; });
-        process.stdin.on('end', () => { writeFileSync(${JSON.stringify(seen)}, input); });
+        process.stdin.on('end', () => {
+          // Existence is the completion signal read by the parent. Publish only
+          // after the entire payload is written, not at open/truncate time.
+          writeFileSync(${JSON.stringify(seen + '.tmp')}, input);
+          renameSync(${JSON.stringify(seen + '.tmp')}, ${JSON.stringify(seen)});
+        });
       `, dir),
     }]);
     await evaluatePromptGate('prompt.submit', { content: 'Z'.repeat(900) });

@@ -47,7 +47,7 @@ let wrapperDir: string;
 const announcedFifoPaths = new Set<string>();
 
 /** Run the fixture; resolve with how it ended. `timedOut` means it wedged. */
-type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit' | 'wakefail' | 'drain';
+type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit' | 'wakefail' | 'drain' | 'reuse';
 
 async function runFixture(mode: FixtureMode): Promise<{
   timedOut: boolean;
@@ -107,7 +107,7 @@ beforeAll(() => {
   fakeBinDir = mkdtempSync(join(tmpdir(), 'botmux-fake-tmux-'));
   const fake = join(fakeBinDir, 'tmux');
   // `pipe-pane` must succeed (exit 0) or spawn() throws before a fifo exists.
-  writeFileSync(fake, '#!/bin/sh\nexit 0\n');
+  writeFileSync(fake, '#!/bin/sh\nif [ "$1" = "-V" ]; then echo "tmux 3.2"; fi\nexit 0\n');
   chmodSync(fake, 0o755);
 
   // A tmux whose pipe-pane fails NON-retryably, so spawn() gives up at once
@@ -120,6 +120,7 @@ beforeAll(() => {
     failing,
     '#!/bin/sh\n'
     + 'case "$1" in\n'
+    + '  -V) echo "tmux 3.2"; exit 0 ;;\n'
     + "  pipe-pane) echo \"can't find pane: bmx-exit-fixture\" >&2; exit 1 ;;\n"
     + '  *) exit 0 ;;\n'
     + 'esac\n',
@@ -147,6 +148,16 @@ afterAll(() => {
 });
 
 describe('TmuxPipeBackend fifo teardown', () => {
+  it('does not close a new fd after an in-flight reader is torn down', async () => {
+    const r = await runFixture('reuse');
+
+    expect(r.stdout).toContain('TEARDOWN');
+    expect(r.stdout).toContain('REPLACEMENT_FDS_INTACT');
+    expect(r.stdout).toContain('LEAKED_READERS=0 FIFO_LEFT=false');
+    expect(r.timedOut).toBe(false);
+    expect(r.code).toBe(0);
+  }, EXIT_TIMEOUT_MS + 15_000);
+
   it('lets the event loop drain after kill() without process.exit()', async () => {
     const r = await runFixture('drain');
 

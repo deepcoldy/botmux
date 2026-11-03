@@ -89,6 +89,23 @@ export function platformMachineBaseUrl(): string | null {
 }
 
 /**
+ * 绑定平台后，Web 终端对外可达的「终端子域」基址
+ * `https://t-<machineId>.<平台域名>`。管理 Dashboard 继续走 m-，但平台把
+ * `/s/<sessionId>` 终端页挂在独立的 t- 子域；把卡片终端链接发到 m- 会在平台前门
+ * 被拒，表现为浏览器打开后 Forbidden。
+ */
+export function platformTerminalBaseUrl(): string | null {
+  const b = readPlatformBinding();
+  if (!b) return null;
+  try {
+    const u = new URL(b.platformUrl);
+    return `${u.protocol}//t-${b.machineId}.${u.host}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 平台面向浏览器的、本机可信子域 authority 列表（`host` 形式，不含 scheme）。
  *
  * 中心平台把本机放在 `<前缀>-<machineId>.<平台域名>` 子域下,再经隧道反代回本机

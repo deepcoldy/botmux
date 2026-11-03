@@ -43,7 +43,6 @@ import {
 } from '../utils/install-info.js';
 import {
   resolveGlobalInstallPlan,
-  formatGlobalInstallCommand,
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from '../utils/global-install.js';
@@ -53,10 +52,9 @@ import { isStandaloneBinary } from './self-spawn.js';
 import {
   currentUpdateStrategy,
   currentBinaryInstallShape,
-  replaceStandaloneBinary,
   type BinaryInstallShape,
-  type UpdateStrategy,
 } from './binary-self-update.js';
+import { compareVersions, fetchLatestVersion } from './update-check.js';
 import { globalWrapperPath } from '../utils/local-dev-update.js';
 import {
   captureDetachedRestartEnvFallback,
@@ -114,6 +112,19 @@ export interface MaintenanceDeps {
    * and behaviour is byte-identical to before.
    */
   installedVersion?: () => string;
+  /**
+   * The registry's `latest` version, looked up before this tick (the tick itself
+   * is synchronous), or null when unknown — the lookup failed or was not made.
+   *
+   * When it equals the current version the install is skipped. Reinstalling the
+   * same version is not a no-op: `npm install -g botmux@latest` rewrites every
+   * file of the install ("changed 170 packages"), including the compiled binary
+   * the running daemon was started from. The daemon keeps its old image while
+   * `after === before` means no restart, and workers forked afterwards from the
+   * rewritten file exit before ready (`An unknown error occurred (Unexpected)`).
+   * null keeps the previous behaviour (install, then compare versions).
+   */
+  latestVersion?: () => string | null;
   writeIntent: (intent: RestartIntent) => void;
   /** Spawn a detached `botmux restart` (this process is then killed by pm2). */
   triggerRestart: () => void;
@@ -128,6 +139,13 @@ export interface MaintenanceDeps {
  * the next day; auto-restart off ⇒ install only (applied on the next restart).
  * Pure orchestration over injected deps.
  */
+/** Would `runMaintenanceTick` run the update right now? Read-only (marks nothing). */
+export function autoUpdateDueNow(deps: Pick<MaintenanceDeps, 'readConfig' | 'readState' | 'now'>): boolean {
+  const cfg = deps.readConfig();
+  if (!cfg?.autoUpdate?.enabled) return false;
+  return evaluateDue(cfg.autoUpdate, deps.readState().autoUpdate?.lastDate, deps.now()).decision === 'due';
+}
+
 export function runMaintenanceTick(deps: MaintenanceDeps): void {
   const cfg = deps.readConfig();
   if (!cfg?.autoUpdate?.enabled) return; // auto-restart has no schedule of its own
@@ -154,10 +172,15 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
 
   let before = '';
   let after = '';
+  let skipped = false;
   let restartFailed = false;
   try {
     deps.withUpdateLock(() => {
       before = deps.currentVersion();
+      if (deps.latestVersion?.() === before) {
+        skipped = true;
+        return;
+      }
       deps.runUpdate();
       // Both strategies report what they installed: a compiled binary's baked
       // version shadows the disk on BOTH paths (see MaintenanceDeps.installedVersion).
@@ -180,6 +203,10 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
     });
   } catch (e) {
     log(`auto-update failed: ${e instanceof Error ? e.message : e}`);
+    return;
+  }
+  if (skipped) {
+    log(`auto-update: already on the latest version (${before}), install skipped`);
     return;
   }
   if (after === before) {
@@ -258,36 +285,6 @@ export function installLatestBotmuxSync(plan: GlobalInstallPlan = resolveGlobalI
   if (result.status !== 0) {
     throw new Error(`${plan.manager} install exited with ${result.status ?? result.signal ?? 'unknown status'}`);
   }
-}
-
-/**
- * Apply an update for whatever install shape this process is, resolving the
- * strategy first so a compiled binary is handled instead of being rejected as an
- * "unsupported install".
- *
- * Shared by the CLI (`botmux update`), the dashboard's `/api/update/run` and the
- * scheduled auto-update so the three cannot drift — they previously all funnelled
- * into `resolveGlobalInstallPlan`, which is exactly the call that fails in
- * compiled mode.
- *
- * @param spec  the version spec for the package-manager path, and the version to
- *              download for the self-replace path ('latest' resolves upstream).
- */
-export async function applyBotmuxUpdate(
-  installRoot: string,
-  version: string,
-): Promise<{ strategy: UpdateStrategy['kind']; detail: string }> {
-  const strategy = currentUpdateStrategy(installRoot);
-  if (strategy.kind === 'unsupported') {
-    throw new UnsupportedGlobalInstallError('unknown', process.execPath);
-  }
-  if (strategy.kind === 'self-replace') {
-    const r = await replaceStandaloneBinary(version, strategy.target);
-    return { strategy: 'self-replace', detail: `${r.asset} → ${r.target}` };
-  }
-  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, `botmux@${version}`);
-  installLatestBotmuxSync(plan);
-  return { strategy: 'package-manager', detail: formatGlobalInstallCommand(plan) };
 }
 
 /**
@@ -530,12 +527,30 @@ export function resolveRestartInvocation(
   launcherPath: string,
   launcherExists: boolean,
   localDev = false,
+  updatedBinary?: string,
 ): { executable: string; selfDispatching: boolean } {
+  if (updatedBinary) return { executable: updatedBinary, selfDispatching: true };
   const executable = resolveStandaloneRestartExecutable(
     standalone, execPath, shape, launcherPath, launcherExists, localDev,
   );
   // The compiled binary IS the CLI; the launcher shim `exec`s it with "$@".
   return { executable, selfDispatching: standalone || executable === launcherPath };
+}
+
+/**
+ * 校验待重启目标仍是可用的官方二进制，返回它实际报告的版本。精确匹配是安装后的
+ * 常态；若重启前被带外升级（如手动跑了更新的 install.sh），接受不低于预期的版
+ * 本并交调用方刷新 pending；更旧、无法执行或不报告合法 semver 版本一律拒绝。
+ */
+export function verifyBinaryRestartTarget(update: { target: string; version: string }): string {
+  const result = spawnSync(update.target, ['--version'], {
+    encoding: 'utf-8',
+    timeout: 30_000,
+    env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
+  });
+  const actual = result.error || result.status !== 0 ? '' : result.stdout.trim();
+  if (actual && compareVersions(actual, update.version) >= 0) return actual;
+  throw new Error(`待重启的二进制未通过版本校验：${update.target}（预期不低于 ${update.version}，实际 ${actual || '无法执行'}）`);
 }
 
 /**
@@ -551,6 +566,7 @@ export function spawnDetachedRestart(
   reason: string,
   activePackageRoot?: string,
   restartLeaseId?: string,
+  updatedBinary?: string,
 ): ReturnType<typeof spawn> {
   const logFile = maintenanceRestartLogPath();
   let fd: number | undefined;
@@ -579,6 +595,7 @@ export function spawnDetachedRestart(
     launcher,
     existsSync(launcher),
     isLocalDevInstall(),
+    updatedBinary,
   );
   const { cmd, args } = buildRestartLauncher(executable, cliEntry, setsidAvailable(), selfDispatching);
   const child = spawn(cmd, args, {
@@ -634,11 +651,15 @@ export function runSelfReplaceBlocking(version = 'latest'): string {
     const detail = (result.stderr || result.stdout || '').trim().split('\n').slice(-3).join('; ');
     throw new Error(`self-update exited with ${result.status ?? result.signal ?? 'unknown status'}${detail ? `: ${detail}` : ''}`);
   }
+  // The child is captured, so forward its outcome/source for scheduled updates.
+  for (const line of `${result.stdout || ''}\n${result.stderr || ''}`.split('\n')) {
+    if (line.startsWith('__self-update:')) logger.info(`[maintenance] ${line}`);
+  }
   const m = /BOTMUX_SELF_UPDATE_VERSION=(\S+)/.exec(result.stdout || '');
   return m?.[1] ?? '';
 }
 
-function productionDeps(): MaintenanceDeps {
+function productionDeps(latestVersion: () => string | null = () => null): MaintenanceDeps {
   // Kept after a successful resolve so post-pnpm-update version/restart lookups
   // use the stable global node_modules/botmux symlink, not the removed
   // .pnpm/botmux@old runtime realpath.
@@ -662,7 +683,7 @@ function productionDeps(): MaintenanceDeps {
     runUpdate: () => {
       installedTo = '';
       const strategy = currentUpdateStrategy(botmuxInstallRoot());
-      if (strategy.kind === 'unsupported') {
+      if (strategy.kind === 'unsupported' || strategy.kind === 'install-release') {
         throw new UnsupportedGlobalInstallError('unknown', process.execPath);
       }
       if (strategy.kind === 'self-replace') {
@@ -686,6 +707,7 @@ function productionDeps(): MaintenanceDeps {
       installedTo = diskVersionAt(installPlan.activePackageRoot);
     },
     installedVersion: () => installedTo,
+    latestVersion,
     writeIntent: (intent) => writeRestartIntent(intent),
     triggerRestart: () => {
       const leaseId = claimRestartLease();
@@ -707,9 +729,20 @@ let timer: NodeJS.Timeout | undefined;
 /** Start the maintenance loop. Call only on the primary daemon (bot-0). */
 export function startMaintenance(): void {
   if (timer) return;
-  const deps = productionDeps();
-  const tick = () => {
-    try { runMaintenanceTick(deps); } catch (e) {
+  let latest: string | null = null;
+  const deps = productionDeps(() => latest);
+  const tick = async () => {
+    try {
+      // Only look the registry up on the tick that will actually run the update,
+      // and only for a package-manager install: a self-replace already skips an
+      // equal version itself, and resolves its target from the public registry
+      // first — a lagging mirror here would wrongly skip a real update.
+      latest = autoUpdateDueNow(deps) && currentUpdateStrategy(botmuxInstallRoot()).kind === 'package-manager'
+        ? await fetchLatestVersion()
+        : null;
+      if (!timer) return; // stopped while the lookup was in flight
+      runMaintenanceTick(deps);
+    } catch (e) {
       logger.warn(`[maintenance] tick failed: ${e instanceof Error ? e.message : e}`);
     }
   };

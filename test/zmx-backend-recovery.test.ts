@@ -442,6 +442,25 @@ describe('ZmxBackend history-authoritative transport', () => {
       .toBe(String(state.launchPid));
   });
 
+  it('creates the session through a TERM-pinned client while control clients keep the invoker env', () => {
+    // The invoker env carries no TERM (the pm2-boundary scrub removes it). The
+    // session PTY inherits the one-shot create client's env verbatim, so that
+    // client must supply TERM; get/set/list/kill clients must not be altered.
+    spawnBackend();
+    expect(childMocks.spawnSync).toHaveBeenCalledTimes(1);
+    const createEnv = childMocks.spawnSync.mock.calls[0]![2]?.env as NodeJS.ProcessEnv;
+    expect(createEnv.TERM).toBe('xterm-256color');
+    expect(createEnv.BOTMUX_SESSION_ID).toBeUndefined();
+    expect(createEnv.PROVIDER_TEST_TOKEN).toBeUndefined();
+
+    const controlCalls = childMocks.execFileSync.mock.calls.filter(([file]) => file === 'zmx');
+    expect(controlCalls.length).toBeGreaterThan(0);
+    for (const [, argv, options] of controlCalls) {
+      expect((options as { env?: NodeJS.ProcessEnv }).env, argv.join(' ')).toBeDefined();
+      expect((options as { env: NodeJS.ProcessEnv }).env.TERM, argv.join(' ')).toBeUndefined();
+    }
+  });
+
   it('tears down an exact fresh session when the gate dies before release acknowledgement', () => {
     state.releaseBehavior = 'die';
 

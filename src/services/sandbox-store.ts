@@ -7,29 +7,97 @@
 import { rmwBotEntry } from './config-store.js';
 import { getBot } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
+import {
+  findForbiddenReadWritePaths,
+  findNonAbsoluteSandboxEntries,
+  findReadOnlyLauncherMountCovers,
+  readOnlyLauncherMountMessage,
+  forbiddenReadWriteMessage,
+  nonAbsoluteSandboxEntriesMessage,
+  type ForbiddenReadWritePath,
+} from './sandbox-path-guard.js';
+import {
+  normalizeSandboxMode,
+  normalizeScratchStorage,
+  type SandboxMode,
+} from '../adapters/cli/sandbox-mode.js';
 
-/** Current configured file-sandbox flag for a bot. */
-export function getBotSandbox(larkAppId: string): boolean {
-  try { return getBot(larkAppId).config.sandbox === true; } catch { return false; }
+/** Current configured sandbox mode for a bot. */
+export function getBotSandboxMode(larkAppId: string): SandboxMode {
+  try { return normalizeSandboxMode(getBot(larkAppId).config.sandbox); } catch { return 'off'; }
 }
 
+/** Back-compat boolean view (oncall/scratch both count as sandboxed). */
+export function getBotSandbox(larkAppId: string): boolean {
+  return getBotSandboxMode(larkAppId) !== 'off';
+}
+
+/** Persist the tri-state sandbox selection (+ scratch sub-options) for a bot.
+ *  Atomic bots.json write + in-memory sync, next new session生效. Writing
+ *  'off' omits the key (absent = off, the historical contract). */
+export async function updateBotSandboxMode(
+  larkAppId: string,
+  mode: SandboxMode,
+  scratch?: { storage?: 'tmpfs' | 'disk'; tmpfsSizeMb?: number; denyPaths?: string[] },
+): Promise<{ ok: true; sandbox: SandboxMode } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const storage = normalizeScratchStorage(scratch?.storage);
+  const tmpfsSizeMb = typeof scratch?.tmpfsSizeMb === 'number'
+    && Number.isFinite(scratch.tmpfsSizeMb) && scratch.tmpfsSizeMb > 0
+    ? Math.floor(scratch.tmpfsSizeMb)
+    : undefined;
+  const denyPaths = Array.isArray(scratch?.denyPaths)
+    ? [...new Set(scratch!.denyPaths.filter((p): p is string => typeof p === 'string' && !!p.trim()).map(p => p.trim()))]
+    : undefined;
+
+  const r = await rmwBotEntry<SandboxMode>(larkAppId, (entry) => {
+    if (mode === 'off') {
+      delete entry.sandbox;
+    } else {
+      entry.sandbox = mode;
+    }
+    if (mode === 'scratch') {
+      entry.scratchStorage = storage;
+      if (tmpfsSizeMb) entry.scratchTmpfsSizeMb = tmpfsSizeMb;
+      else delete entry.scratchTmpfsSizeMb;
+      if (denyPaths?.length) entry.scratchDenyPaths = denyPaths;
+      else delete entry.scratchDenyPaths;
+    } else {
+      delete entry.scratchStorage;
+      delete entry.scratchTmpfsSizeMb;
+      delete entry.scratchDenyPaths;
+    }
+    return { write: true, result: mode };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  const cfg = bot.config;
+  if (mode === 'off') delete cfg.sandbox;
+  else cfg.sandbox = mode;
+  if (mode === 'scratch') {
+    cfg.scratchStorage = storage;
+    if (tmpfsSizeMb) cfg.scratchTmpfsSizeMb = tmpfsSizeMb;
+    else delete cfg.scratchTmpfsSizeMb;
+    if (denyPaths?.length) cfg.scratchDenyPaths = denyPaths;
+    else delete cfg.scratchDenyPaths;
+  } else {
+    delete cfg.scratchStorage;
+    delete cfg.scratchTmpfsSizeMb;
+    delete cfg.scratchDenyPaths;
+  }
+  logger.info(`[sandbox:${larkAppId}] sandbox mode → ${mode}`);
+  return { ok: true, sandbox: mode };
+}
+
+/** Back-compat boolean toggle (used by the old dashboard route). */
 export async function updateBotSandbox(
   larkAppId: string,
   enabled: boolean,
 ): Promise<{ ok: true; sandbox: boolean } | { ok: false; reason: string }> {
-  let bot;
-  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-
-  const r = await rmwBotEntry<boolean>(larkAppId, (entry) => {
-    if (enabled) entry.sandbox = true;
-    else delete entry.sandbox;  // omit key when off → preserves "absent = off"
-    return { write: true, result: enabled };
-  });
-  if (!r.ok) return { ok: false, reason: r.reason };
-
-  bot.config.sandbox = enabled;
-  logger.info(`[sandbox:${larkAppId}] sandbox → ${enabled}`);
-  return { ok: true, sandbox: enabled };
+  const r = await updateBotSandboxMode(larkAppId, enabled ? 'oncall' : 'off');
+  return r.ok ? { ok: true, sandbox: r.sandbox !== 'off' } : r;
 }
 
 /** Current configured read-isolation flag for a bot. */
@@ -147,11 +215,46 @@ export function normalizeSandboxPaths(tiers: SandboxPathTiers): SandboxPathTiers
 export async function updateBotSandboxPaths(
   larkAppId: string,
   tiers: SandboxPathTiers,
-): Promise<{ ok: true; sandboxPaths?: SandboxPathTiers } | { ok: false; reason: string }> {
+): Promise<
+  | { ok: true; sandboxPaths?: SandboxPathTiers }
+  | { ok: false; reason: string; message?: string; forbiddenReadWrite?: ForbiddenReadWritePath[] }
+> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
   const normalized = normalizeSandboxPaths(tiers);
+  // `/`, HOME, the botmux data root or an ancestor of them as readWrite would
+  // make the deny-by-default sandbox writable across the host — never stored.
+  const forbiddenReadWrite = findForbiddenReadWritePaths(normalized.readWrite);
+  if (forbiddenReadWrite.length) {
+    return {
+      ok: false,
+      reason: 'sandbox_paths_forbidden_read_write',
+      message: forbiddenReadWriteMessage(forbiddenReadWrite),
+      forbiddenReadWrite,
+    };
+  }
+  // A read-only `/` or `/run` makes the Linux sandbox exit at launch (the
+  // launcher's own mount points cannot be created under it) — never stored.
+  const readOnlyLauncherMounts = findReadOnlyLauncherMountCovers(normalized.readOnly);
+  if (readOnlyLauncherMounts.length) {
+    return {
+      ok: false,
+      reason: 'sandbox_paths_readonly_launcher_mount',
+      message: readOnlyLauncherMountMessage(readOnlyLauncherMounts),
+    };
+  }
+  // Relative entries resolve against the session working directory at spawn,
+  // so their granted location changes per session and can land on HOME or `/`
+  // (`..` from ~/proj). Never stored, in ANY tier.
+  const nonAbsolute = findNonAbsoluteSandboxEntries(normalized);
+  if (nonAbsolute.length) {
+    return {
+      ok: false,
+      reason: 'sandbox_paths_relative_entry',
+      message: nonAbsoluteSandboxEntriesMessage(nonAbsolute),
+    };
+  }
   const isEmpty = !normalized.readWrite && !normalized.readOnly && !normalized.deny;
 
   const r = await rmwBotEntry<SandboxPathTiers | undefined>(larkAppId, (entry) => {

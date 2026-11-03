@@ -238,6 +238,60 @@ describe('applyBotConfigEdits', () => {
     expect(out.wrapperCli).toBe('aiden x claude');
   });
 
+  it('sets Forge x TraeX launch mode and clears stale wrapperCli', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'traex',
+      wrapperCli: 'old wrapper',
+    }, {
+      cliChoice: 'traex',
+      cliLaunchMode: 'forge-traex',
+    });
+
+    expect(out.cliId).toBe('traex');
+    expect(out.cliLaunchMode).toBe('forge-traex');
+    expect(out.wrapperCli).toBeUndefined();
+  });
+
+  it('clears Forge x TraeX launch mode when switching to a plain launch', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    }, {
+      cliChoice: 'traex',
+      cliLaunchMode: null,
+    });
+
+    expect(out.cliId).toBe('traex');
+    expect(out.cliLaunchMode).toBeUndefined();
+  });
+
+  it('rejects unsupported Forge x TraeX config combinations', () => {
+    const base = { larkAppId: 'app', larkAppSecret: 'secret', cliId: 'traex' };
+    expect(() => applyBotConfigEdits(base, {
+      cliChoice: 'codex',
+      cliLaunchMode: 'forge-traex',
+    })).toThrow(/supported only for cliId "traex"/);
+    expect(() => applyBotConfigEdits({
+      ...base,
+      wrapperCli: 'aiden x traex',
+      cliLaunchMode: 'forge-traex',
+    }, {})).toThrow(/cannot be combined with wrapperCli/);
+    expect(() => applyBotConfigEdits({
+      ...base,
+      cliPathOverride: '/opt/traex',
+      cliLaunchMode: 'forge-traex',
+    }, {})).toThrow(/cannot be combined with cliPathOverride/);
+    expect(() => applyBotConfigEdits({
+      ...base,
+      sandbox: true,
+      cliLaunchMode: 'forge-traex',
+    }, {})).toThrow(/sandbox or readIsolation/);
+  });
+
   it('sets and normalizes cliRuntime with an equal downgrade path shadow', () => {
     const out = applyBotConfigEdits({
       larkAppId: 'app',
@@ -337,6 +391,26 @@ describe('applyBotConfigEdits', () => {
     expect(out.cliPathOverride).toBeUndefined();
   });
 
+  it('configures and preserves a named Kimi-compatible CodeM distribution', () => {
+    const cliRuntime = { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper', update: { provider: 'none' as const } };
+    const configured = applyBotConfigEdits({ larkAppId: 'app', larkAppSecret: 'secret', cliId: 'kimi' }, { cliRuntime });
+    expect(configured.cliRuntime).toEqual(cliRuntime);
+    expect(configured.cliPathOverride).toBe(cliRuntime.executable);
+    expect(applyBotConfigEdits(configured, { model: null }).cliRuntime).toEqual(cliRuntime);
+  });
+
+  it('clears the old distribution when changing between supported adapter families', () => {
+    for (const [from, to] of [['codex', 'kimi'], ['kimi', 'codex']]) {
+      const switched = applyBotConfigEdits({
+        larkAppId: 'app', larkAppSecret: 'secret', cliId: from,
+        cliRuntime: { id: 'custom', executable: '/opt/custom' }, cliPathOverride: '/opt/custom',
+      }, { cliChoice: to });
+      expect(switched.cliId).toBe(to);
+      expect(switched.cliRuntime).toBeUndefined();
+      expect(switched.cliPathOverride).toBeUndefined();
+    }
+  });
+
   it('does not strand a runtime shadow when TUI switches to a non-Codex adapter with a blank path answer', () => {
     const out = applyBotConfigEdits({
       larkAppId: 'app',
@@ -416,6 +490,15 @@ describe('applyBotConfigEdits', () => {
       larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
     }, { backendType: 'zmx' });
     expect(edited.backendType).toBe('zmx');
+  });
+
+  it('accepts remote-runner as a backendType', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'cli_remote_runner',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+    }, { backendType: 'remote-runner' });
+    expect(edited.backendType).toBe('remote-runner');
   });
 
   it('keeps fields unchanged on empty input and clears optional fields with dash', () => {
@@ -536,6 +619,9 @@ describe('resolveCliId', () => {
     expect(resolveCliId('22')).toBe('grok');
     expect(resolveCliId('23')).toBe('kiro-cli');
     expect(resolveCliId('29')).toBe('ebsd');
+    expect(resolveCliId('30')).toBe('minimax'); // v3.21.0 起已发布，禁止移位
+    expect(resolveCliId('31')).toBe('mimocode');
+    expect(resolveCliId('32')).toBe('remote-runner');
   });
 
   it('passes through literal cliIds unchanged', () => {

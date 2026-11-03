@@ -28,15 +28,17 @@
 
 ### B. 别人不能用 / 弹授权卡
 
-botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)）：**对话权**（谁能问）和**操作权**（谁能 `/cd` `/restart` 点按钮）。默认只有 owner 有对话权，所以别人 @ 会被拒 / 弹授权卡。
+botmux 权限分两层（完整分层见 [权限与授权](/permissions)，速查见下 [权限怎么分](#权限怎么分谁能操作)）：**对话权**（谁能问）和**操作权**（谁能 `/cd` `/restart` 点按钮）。默认只有 `allowedUsers` 名单内的人有对话权，所以别人 @ 会被拒 / 弹授权卡。**把 bot 拉进群本身不会授权任何成员。**
 
-- **让整个群都能用**：给 bot 配 `allowedChatGroups`（该群全员可对话），或用 `/grant` 授权指定群。
-- **群 @ 策略**（必须 @ vs 免 @）：默认多人群必须 @；话题内免 @ / 全群免 @ 可在群 @ 策略里配。注意「1 个人 + 1 个 bot」的 1v1 群本来就免 @。
+- **让整个群都能用**：群里裸发 `@bot /grant`（写入 `allowedChatGroups`，全员即时生效、无额度），或 Dashboard「群组 → 管理」里**整群一键授权**；不必逐个加人。
+- **只给个别人试用**：`@bot /grant @某人` 发卡，默认 3 条 / 1 小时，卡上可调额度与有效期；Dashboard 群成员弹层还能多选**批量授权**（≤50 人）。
+- **群 @ 策略**（必须 @ vs 免 @）：默认多人群必须 @；`/mention-mode topic|never|ambient` 可改，语义与 8 个免 @ 例外见 [@ 策略](/mention-mode)。注意「1 个人 + 1 个 bot」的 1v1 群本来就免 @。
 - **oncall 场景**（每工单一个新群、全员免 @ 直接问）：见 [Oncall 模式](/oncall)。
+- **拉黑某人**：Dashboard「Bot 配置 → `blockedUsers`」，群聊私聊全局拦截且不再弹申请卡。
 
 ### C. 终端有输出但没发飞书
 
-**这条只针对需要显式发送的终端 CLI 会话**（Claude Code / Codex CLI / Gemini / CoCo 等）：终端 stdout ≠ 已发飞书，模型必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。只 `echo`/`print` 或忘调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
+**这条只针对需要显式发送的终端 CLI 会话**（Claude Code / Codex CLI / Antigravity / CoCo 等）：终端 stdout ≠ 已发飞书，模型必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。只 `echo`/`print` 或忘调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
 
 > ⚠️ **例外：`codex-app`（Codex App app-server 协议）**——它的最终 assistant message 由 botmux **自动转发**回飞书，**常规回复不要调 `botmux send`**（否则会重复发送），仅在中途主动推送 / 发附件 / 跨 bot @ 时才用。
 
@@ -83,6 +85,19 @@ botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)�
 
 装了 **tmux** 就不会——tmux 是默认后端，CLI 进程常驻 tmux session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。⚠️ 没装 tmux **不会自动降级 pty**，而是硬拦截弹卡让你装 tmux；只有显式 `BACKEND_TYPE=pty`（或 per-bot `backendType:"pty"`）才用 pty，且 pty 会话**不跨 daemon 重启存活**、重启会重载。
 
+## CLI 中途被重启，进行中的工作会怎样？
+
+CLI 进程意外退出（崩溃、tmux server 掉线等）后，botmux 会在同一 worker 内用原上下文重新拉起它，并读旧进程留下的 transcript，看有没有被打断的工作：
+
+- **上一轮还没做完**（例如复审跑到一半）；
+- **后台任务随旧进程一起被终止**（Claude Code 的 `run_in_background` 命令、Monitor、后台子代理）。
+
+有的话，恢复后的 CLI 会先收到一条简短说明（重启过、哪些后台任务中断了、请核对后继续），话题里也会出现一次提示。挂起或 daemon 重启后冷启动时同样检查（这时没有旧进程结束时刻的记录，空闲会话里在终端手动停掉的后台任务也可能被当成中断报出），说明放在下一条消息前面一起交给 CLI（Pi 这类把首条消息放进启动参数的 CLI 无法前置，只发话题提示）。判断只看 transcript，不读屏幕；目前覆盖 Claude Code 和 Pi、Codex 等结构化 transcript 的 CLI（后者只判断回合）。没有被打断的工作就什么都不发。
+
+重启前收到、还没送进 CLI 的消息也不会悄悄丢掉：首条消息作为启动参数交给 CLI、CLI 还没开始处理就退出的，重启后会重新输入一次；daemon 重启时还排在队列里的消息，由同一会话的下一个 worker 补投（若这次重启恰好又带了一条新消息、且 CLI 以启动参数接收首条消息，新消息先执行）。超过 24 小时的不再补投，改为在话题里说明没送达；补投途中又遇到重启、无法确认是否送达的，同样在话题里说明。反过来，已经送进 CLI、CLI 自己的记录也显示开始处理的消息，重启后不会再输入一遍（以前会让 CLI 把同一件事重做一轮），而是用上面的说明提醒它接着做；只有重启后只能开新会话、旧上下文不在了的情况，才会重新输入。
+
+另外，主回合已结束、但还有后台任务在跑的会话（卡片显示「⏳ 主回合已结束 · 后台子任务运行中（N）」）不会被活跃会话上限或空闲超时自动挂起：挂起会杀掉这些任务，冷启动也没法让它们回来。
+
 ## 会话不关会一直跑吗？有自动回收吗？
 
 会一直跑，**目前无空闲 TTL 自动回收**。用 `/close`、Dashboard 批量关闭、或 `botmux delete stopped`/`all` 清理。
@@ -95,7 +110,27 @@ botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)�
 
 ## 权限怎么分？谁能操作？
 
-三层：`allowedChatGroups` / `globalGrants` 给**对话权**（群内全员可问）；`allowedUsers` 给**操作权**（owner 才能 `/cd` `/restart` `/close` 点按钮）。配了 `allowedChatGroups` 时 `allowedUsers` 至少要有一个 owner。
+速查：`allowedUsers` 给**操作权**（owner 与管理员，能 `/cd` `/restart` `/close` 点按钮、改 `/card` `/cot` `/mention-mode`）；`allowedChatGroups`（裸 `/grant`，整群无额度）、oncall（整群恒放行 + 绑目录）、`chatGrants` / `globalGrants`（按人、默认 3 条 / 1 小时）给**对话权**；`blockedUsers` 是优先于一切放行腿的全局否决。完整分层、额度、有效期、申请卡见 [权限与授权](/permissions)。
+
+## 怎么让整个群都能用，不用逐个授权？
+
+群里裸发 `@bot /grant`（等价 `/grant all`）：一次性把该群加入 `allowedChatGroups`，群里所有人立即能对话，无额度、无期限，新成员自动生效、退群自动失权；收回用裸 `/revoke`。话题群里按 `oc_` 群生效，覆盖群内全部话题。Dashboard「群组 → 管理」也有**整群一键授权**。注意它只给对话权，操作权仍只在 `allowedUsers`。
+
+## 只想让某人先试 3 条消息怎么配？
+
+`@bot /grant @某人`，bot 回的授权卡默认就是**每人 3 条 / 1 小时**；想直接指定条数用 `@bot /grant @某人 20`，时长与额度都能在卡上改（1 小时 / 8 小时 / 1 天 / 7 天 / 永久；额度留空表示不限）。
+
+## oncall 和裸 `/grant` 有什么区别？
+
+两者都只给对话权、不给操作权、都不限额。区别在目录：`/oncall bind <目录>` 还把群锚定到工作目录，新话题跳过选仓库直接开工；裸 `/grant` 只放开对话、不绑目录。值班答疑用 oncall，只想让群成员能在已选好仓库的话题里提问用 `/grant`。
+
+## 为什么群里必须 @ 机器人？能不能免 @？
+
+默认 `always` 模式下，普通群里明确 @ 才回应，避免多 bot / 多人群里乱抢答。群里发 `/mention-mode` 可改：`topic`（自有话题内免 @）、`never`（全群免 @）、`ambient`（免 @ 但点名叫别人时让路）。修改需操作权，仅普通群可设；另有 8 个免 @ 例外（1 人 1 bot 群、消息监听器等），见 [@ 策略](/mention-mode)。
+
+## 能禁止别人把这个 bot 拉进群吗？
+
+「谁能把机器人加进群」由**飞书平台侧**控制（应用可用范围 / 群机器人添加权限），botmux 没有、也伪造不了这个开关。bot 侧能做的两件事：① Dashboard「Bot 默认 → 主动开工」关掉「**被拉进新群自动开工**」（`autoStartOnGroupJoin`，且该闸本身还要求群里有授权用户）；② 保持限制态——**拉群不等于授权**，非名单成员 @ 它会被拦并弹申请卡给 owner。是否自动把 owner 拉进新群由 `autoInviteOwnerOnGroupAdd` 控制（默认开）：可在 Dashboard「Bot 默认 → 主动开工」关、飞书 `/botconfig set autoInviteOwnerOnGroupAdd off` 关，也可写 `bots.json`；关闭适用于告警/oncall 平台批量把 bot 拉进事件群、不想打扰 owner 的场景。
 
 ## 运行中的会话能临时追问 / 打断吗？
 
@@ -140,7 +175,29 @@ v2.95.0 起 botmux 会检测这种"会话没真正起来"的情况并发一张�
 
 ## 怎么升级？
 
-`botmux upgrade`——它会按你的安装方式自动选路：curl 安装的原地换二进制，npm 安装的交回 `npm i -g botmux@latest`。curl 用户也可以直接重跑一遍安装命令（同样是原地升级，不会重复写 PATH）。会话内的 `botmux` wrapper 版本始终跟 daemon 一致，无需单独升级。升级后记得 `botmux restart` 让新版本生效。
+**一律重跑安装命令（curl），与当初怎么装的无关**——npm / pnpm 全局安装的也用它升：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+```
+
+它把自包含二进制原地替换到 `~/.botmux/bin/botmux`：下载后先在本机试跑，跑不起来会明确报错并**保留旧版本**；幂等，不会重复写 PATH；全程不需要 Node。装完**开一个新终端**再执行 `botmux restart`——installer 已把 `~/.botmux/bin` 前置到 PATH，新终端才能保证 `botmux` 命中新版本（老 npm 安装的当前 shell 里，`botmux` 可能仍指向 npm 全局目录）。会话内的 `botmux` wrapper 始终跟 daemon 同版本，无需单独升级。
+
+**装指定版本**（回滚 / 锁版本同理；版本标签必须带 `v` 前缀）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh
+```
+
+> ⚠️ `BOTMUX_VERSION` 必须写在管道**右侧的 `sh` 前面**。写成 `BOTMUX_VERSION=… curl … | sh` 时变量只对 curl 生效、`sh` 收不到，会静默改装最新版。
+
+### 为什么 v3.18.0 之前的老版本不能用 npm 升级？
+
+v3.18.0 起 npm 包从「Node + `dist/` 源码」改成**平台二进制子包**，`node-pty` 移出了依赖。老版本自带的 `botmux upgrade` 当时就是交回 npm；npm 跨这个边界安装时会把旧目录里的 `node-pty` 清掉，而旧 daemon 重启的第一步仍是 `node …/dist/cli.js restart`——该文件仍静态 import `node-pty`，于是 `ERR_MODULE_NOT_FOUND`、重启驱动死掉、整个 daemon 舰队起不回来（输出里却可能已经提示「正在重启以应用更新」）。curl 直接落新二进制并让启动器指向它，不经过旧目录、也不看 npm 怎么剪依赖，是跨这个边界唯一稳妥的方式。≥3.18 的二进制安装上 `botmux upgrade` 与重跑 curl 等价；不确定自己是什么安装形态时，统一用 curl 即可。
+
+## 原来 `cliId: "gemini"` 的 bot 起不来？
+
+Gemini CLI 已下线，`gemini` 适配器已移除。这个 bot 会拒绝启动并提示改用 Antigravity，其它 bot 照常运行。装好 `agy` 并用 Google 账号登录（或在 `~/.gemini/antigravity-cli/settings.json` 设 `modelProvider: "gemini"` 并提供 `GEMINI_API_KEY`），再把 `cliId` 改成 `"antigravity"`（改 `bots.json` 或用 `botmux setup`），然后 `botmux restart`。原来的 `cliPathOverride` / `wrapperCli`（如 `ttadk gemini`）、Gemini `model` 名、`GEMINI_CLI_HOME` 不会沿用。详见 [Gemini CLI 已下线](/adapters#gemini-cli-已下线)。
 
 ## CoCo 忙时发消息丢失？
 

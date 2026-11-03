@@ -1,14 +1,36 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
+import { DropdownMenu, FieldTitle, LoadingState, ToggleRow as BaseToggleRow, dropdownLabel } from './dashboard-components.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import { store } from './store.js';
-import { updateResponseNeedsRestart } from './update-action.js';
+import {
+  updateResponseNeedsRestart,
+  pollUpdateStatus,
+  classifyOtherUpdate,
+  observedInstallCompleted,
+  binaryProgressText,
+  confirmLocalForceUpdate,
+  localForceUpdateError,
+} from './update-action.js';
 import { ui } from './ui.js';
+import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
+import { ScheduleBotGrantsEditor, type ScheduleBotGrantBotOption } from './schedule-bot-grants-editor.js';
+import type { ScheduleBotGrant } from '../../global-config.js';
+import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
+import { PromptCacheEditor } from './prompt-cache-editor.js';
+import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
+import {
+  IDLE_CLEANUP_HOUR_OPTIONS,
+  idleCleanupHoursLabel,
+  type IdleCleanupHours,
+} from '../session-cleanup.js';
+
+const GLOBAL_SESSION_ENV_SCOPE: SessionEnvScope = { kind: 'global' };
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -29,8 +51,10 @@ interface DashboardSettings {
   };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  reapOrphanTmuxServers: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
+  cardBrandLabel: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -67,6 +91,15 @@ interface DashboardSettings {
     targetDaemonOnline: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
+  /** scheduleDelegation.createEnabled / selfManageEnabled / botGrants. */
+  scheduleBotGrants: {
+    createEnabled: boolean;
+    selfManageEnabled: boolean;
+    grants: ScheduleBotGrant[];
+    ignoredCount: number;
+    botOptions: ScheduleBotGrantBotOption[];
+  };
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -78,10 +111,15 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
-  workflow: { enabled: boolean };
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
+  sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  promptCache: PromptCacheConfig | null;
+  multiTopic: { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
+  /** GitHub Release 下载代理（二进制自更新）；'' = 未配置（读 HTTPS_PROXY / HTTP_PROXY）。 */
+  httpProxy: string;
   scheduleTimeZone: string;
   hostTimeZone: string;
   effectiveScheduleTimeZone: string;
@@ -113,6 +151,7 @@ interface CliRuntimeUpdateStatus {
 interface UpdateStatus {
   current: string;
   latest: string | null;
+  latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
   behind: boolean;
   cliBehind: boolean;
   cliUpdates: CliRuntimeUpdateStatus[];
@@ -120,12 +159,15 @@ interface UpdateStatus {
   /** Local-dev checkout is a git worktree → self-update via git pull + build. */
   localDevUpdatable?: boolean;
   updateSupported: boolean;
+  releaseInstallRequired?: boolean;
   // 'binary' = 编译版独立二进制（install.sh 形态），不归任何包管理器所有，
   // 自己下载 release 资产替换自身。
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'binary' | 'unknown';
   updateCommand: string | null;
   node: NodeCheck;
   installs: { entries: InstallEntry[]; multiple: boolean };
+  runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+  runningDaemonRestartHint?: string;
 }
 interface ReleaseNote { version: string; name: string; body: string; url: string; publishedAt: string | null }
 
@@ -180,9 +222,12 @@ function parseSettings(s: any): DashboardSettings {
     },
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
+    reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
+    // default ON — only an explicit persisted false disables (server snapshot)
+    cardBrandLabel: s?.cardBrandLabel !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -217,6 +262,16 @@ function parseSettings(s: any): DashboardSettings {
       targetDaemonOnline: s?.hostOverloadAlert?.targetDaemonOnline === true,
     },
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
+    crossPrincipalInterruption: s?.crossPrincipalInterruption === true,
+    scheduleBotGrants: {
+      createEnabled: s?.scheduleBotGrants?.createEnabled === true,
+      selfManageEnabled: s?.scheduleBotGrants?.selfManageEnabled === true,
+      grants: Array.isArray(s?.scheduleBotGrants?.grants) ? s.scheduleBotGrants.grants : [],
+      ignoredCount: Number.isSafeInteger(s?.scheduleBotGrants?.ignoredCount)
+        ? Math.max(0, s.scheduleBotGrants.ignoredCount)
+        : 0,
+      botOptions: Array.isArray(s?.scheduleBotGrants?.botOptions) ? s.scheduleBotGrants.botOptions : [],
+    },
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
@@ -228,9 +283,25 @@ function parseSettings(s: any): DashboardSettings {
     localDevInstall: s?.localDevInstall === true,
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
-    workflow: { enabled: s?.workflow?.enabled === true },
+    workflow: {
+      enabled: s?.workflow?.enabled === true,
+      nodeExecutor: s?.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral',
+    },
+    sessionCleanup: {
+      archiveCodex: s?.sessionCleanup?.archiveCodex === true,
+      enabled: s?.sessionCleanup?.enabled === true,
+      olderThanHours: (IDLE_CLEANUP_HOUR_OPTIONS as readonly unknown[]).includes(s?.sessionCleanup?.olderThanHours)
+        ? s.sessionCleanup.olderThanHours as IdleCleanupHours
+        : 168,
+      intervalMinutes: typeof s?.sessionCleanup?.intervalMinutes === 'number' && s.sessionCleanup.intervalMinutes >= 5
+        ? Math.floor(s.sessionCleanup.intervalMinutes)
+        : 60,
+    },
+    promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
+    multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
+    httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
     effectiveScheduleTimeZone:
@@ -260,6 +331,7 @@ function SettingsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
   const timersRef = useRef<Set<number>>(new Set());
+  const updatePollStopRef = useRef<(() => void) | null>(null);
   const [settings, setSettings] = useState<DashboardSettings | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -284,6 +356,22 @@ function SettingsPage() {
   const [autostartError, setAutostartError] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [autostartMsg, setAutostartMsg] = useState<StatusMessage>(null);
+
+  // `#/settings?section=<区块 id>&field=<字段标题 i18n key>`（⌘K 全局搜索）：区块要等
+  // /api/settings 回来才渲染，所以在 settings 首次就绪后滚过去并闪烁定位，然后清掉参数。
+  const focusTargetRef = useRef<{ section: string; field: string | null } | null>(null);
+  if (focusTargetRef.current === null && !settings) {
+    const section = hashQueryParam('section');
+    if (section) focusTargetRef.current = { section, field: hashQueryParam('field') };
+  }
+  useEffect(() => {
+    const target = focusTargetRef.current;
+    if (!settings || !target) return;
+    focusTargetRef.current = null;
+    clearHashQueryParam('section');
+    clearHashQueryParam('field');
+    window.requestAnimationFrame(() => focusSettingsTarget(target.section, target.field ? tr(target.field) : null));
+  }, [settings, tr]);
 
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
@@ -366,6 +454,8 @@ function SettingsPage() {
     return () => {
       mountedRef.current = false;
       clearTimers();
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
     };
   }, [clearTimers, loadSettings]);
 
@@ -463,7 +553,10 @@ function SettingsPage() {
       } catch { /* still offline: fall back to the pre-save snapshot */ }
       if (!mountedRef.current) return;
       if (!reconciled) setSettings(before);
-      const detail = e instanceof Error ? e.message : String(e);
+      const code = e instanceof Error ? e.message : String(e);
+      // Known error codes have a sentence; anything else is shown as is.
+      const known = tr(`settings.saveError.${code}`);
+      const detail = known === `settings.saveError.${code}` ? code : known;
       setSettingsMsg({
         text: reconciled
           ? `${tr('settings.saveReconciled')}: ${detail}`
@@ -554,7 +647,7 @@ function SettingsPage() {
     pollReconnect();
   }
 
-  async function doUpdate(): Promise<void> {
+  async function doUpdate(forceLocal = false): Promise<void> {
     const s = upStatus;
     if (!s) return;
     if (!s.node.ok) {
@@ -572,48 +665,114 @@ function SettingsPage() {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
       if (!await confirm({ title: tr('update.confirmMultiInstallTitle'), message: tr('update.confirmMultiInstall', { paths }), confirmLabel: tr('update.btnContinue'), cancelLabel: tr('update.btnCancel') })) return;
     }
+    let forceToken: string | null = null;
+    if (forceLocal) {
+      if (!localDev) return;
+      setUpBusy(true);
+      setUpMsg({ text: tr('update.forcePreviewing') });
+      try { forceToken = await confirmLocalForceUpdate(fetch, confirm, tr); }
+      catch (e) {
+        setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
+        return;
+      } finally { if (mountedRef.current) setUpBusy(false); }
+      if (!forceToken || !mountedRef.current) return;
+    }
     const confirmMsg = localDev
       ? tr('update.confirmUpdateLocalDev')
       : s.latest
         ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand! })
         : tr('update.confirmUpdateNoVer', { command: s.updateCommand! });
-    if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
+    if (!forceLocal && !await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
+    const stopUpdatePoll = (): void => {
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
+    };
+    // Standalone-binary updates download a ~174MB asset; surface measured byte
+    // progress from /api/update/status while the long POST is in flight.
+    updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+      if (mountedRef.current && snap.binaryUpdate) {
+        setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+      }
+    }, 1000);
     try {
-      const r = await fetch('/api/update/run', { method: 'POST' });
+      const r = await fetch('/api/update/run', forceToken ? {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ forceLocal: true, previewToken: forceToken }),
+      } : { method: 'POST' });
       const body = await r.json().catch(() => ({}));
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) { stopUpdatePoll(); return; }
       if (!r.ok || body.ok === false) {
+        // Another update (another dashboard tab, the CLI, or scheduled
+        // maintenance) owns the shared install lock. Track it via status rather
+        // than reporting a failure: the cross-process flag is invisible, so
+        // install completion is decided from version state. "Installed" does NOT
+        // reload the page — the winner may be sitting on its own restart
+        // confirmation, and a CLI update never restarts; surface the pending
+        // restart and let the existing restart flow apply it.
+        if (body?.error === 'update_in_flight') {
+          const startVersion = String(s.current);
+          stopUpdatePoll();
+          updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+            if (!mountedRef.current) return;
+            const kind = classifyOtherUpdate(snap);
+            if (observedInstallCompleted(snap, startVersion, false)) {
+              stopUpdatePoll();
+              setUpBusy(false);
+              setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+              void fetchStatus();
+              return;
+            }
+            if (kind === 'progress' && snap.binaryUpdate) {
+              setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+            } else {
+              setUpMsg({ text: tr(kind === 'busy' ? 'update.inProgressBusy' : 'update.inProgressExternal') });
+            }
+          }, 1000, 10 * 60_000, () => {
+            // Independent of status responses: persistent 503s, a dead
+            // network, or a hung request must still reach this terminal state.
+            if (!mountedRef.current) return;
+            updatePollStopRef.current = null;
+            setUpBusy(false);
+            setUpMsg({ text: tr('update.inProgressSlow'), cls: 'hint-warn-inline' });
+          });
+          return;
+        }
+        stopUpdatePoll();
         // Dirty worktree fails closed — surface the file list so the user can act.
         if (body?.error === 'dirty_worktree') {
           setUpBusy(false);
           setUpMsg({ text: tr('update.dirtyWorktree', { detail: String(body.detail ?? '') }), cls: 'hint-warn-inline' });
           return;
         }
-        const detail = body?.detail ?? body?.error ?? `HTTP ${r.status}`;
+        const detail = localForceUpdateError(body, tr)
+          + (body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '')
+          + (body.backupStash ? '\n' + tr('update.forceBackupFallback', { ref: String(body.backupStash) }) : '');
         setUpBusy(false);
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
       }
+      stopUpdatePoll();
       // A restart is needed when the server says so (local-dev build always
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
       const needsRestart = updateResponseNeedsRestart(body);
+      const backupNotice = body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '';
       if (needsRestart) {
         setUpBusy(false);
         // `changed` reflects whether the source actually advanced; a build-only
         // local-dev update (HEAD unchanged) still needs a restart to apply.
         setUpMsg({
-          text: body.changed
+          text: (body.changed
             ? tr('update.updatedChanged', { old: `v${body.oldVersion}`, new: `v${body.newVersion}` })
-            : tr('update.builtNeedsRestart'),
+            : tr('update.builtNeedsRestart')) + backupNotice,
           cls: 'hint-ok',
         });
         if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnLater') })) {
           await doRestart({ oldVersion: body.oldVersion, newVersion: body.newVersion });
         } else if (mountedRef.current) {
-          setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+          setUpMsg({ text: tr('update.noRestartHint') + backupNotice, cls: 'hint-ok' });
         }
       } else {
         setUpBusy(false);
@@ -621,6 +780,7 @@ function SettingsPage() {
         await fetchStatus();
       }
     } catch (e) {
+      stopUpdatePoll();
       if (!mountedRef.current) return;
       setUpBusy(false);
       setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
@@ -666,6 +826,7 @@ function SettingsPage() {
         if (next && upChangelog === null) void loadChangelog();
       }}
       onUpdate={() => void doUpdate()}
+      onForceUpdate={() => void doUpdate(true)}
       onRestart={() => { void (async () => { if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmPlainRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnCancel') })) void doRestart(null); })(); }}
     />
   );
@@ -703,7 +864,19 @@ function SettingsPage() {
   );
 }
 
-function SettingsBody(props: {
+type ScheduleBotGrantsPatch = Partial<Pick<DashboardSettings['scheduleBotGrants'], 'createEnabled' | 'selfManageEnabled' | 'grants'>>;
+
+/** PUT body for the bot-grant entry. A list write names the list it was edited
+ *  from, so the server can refuse it (and the page re-reads) when that is no
+ *  longer what is on disk — e.g. another tab revoked a grant meanwhile. */
+export function scheduleBotGrantsPayload(
+  shown: ScheduleBotGrant[],
+  patch: ScheduleBotGrantsPatch,
+): ScheduleBotGrantsPatch & { baseGrants?: ScheduleBotGrant[] } {
+  return patch.grants ? { ...patch, baseGrants: shown } : patch;
+}
+
+export function SettingsBody(props: {
   settings: DashboardSettings;
   canWrite: boolean;
   bound: boolean;
@@ -724,7 +897,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -746,6 +919,13 @@ function SettingsBody(props: {
       'hostOverloadAlert',
       { hostOverloadAlert: patch },
       s => ({ ...s, hostOverloadAlert: { ...s.hostOverloadAlert, ...patch } }),
+    );
+  };
+  const saveScheduleBotGrants = (patch: ScheduleBotGrantsPatch) => {
+    return props.onSave(
+      'scheduleBotGrants',
+      { scheduleBotGrants: scheduleBotGrantsPayload(settings.scheduleBotGrants.grants, patch) },
+      s => ({ ...s, scheduleBotGrants: { ...s.scheduleBotGrants, ...patch } }),
     );
   };
   const repoModeOptions = useMemo(() => [
@@ -798,6 +978,13 @@ function SettingsBody(props: {
           />
         </SettingsBlock>
         <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
+          <ToggleRow
+            title={tr('settings.cardBrandLabel')}
+            help={tr('settings.cardBrandLabelHelp')}
+            checked={settings.cardBrandLabel}
+            disabled={dis || savingKey === 'cardBrandLabel'}
+            onChange={value => saveBoolean('cardBrandLabel', value)}
+          />
           <ToggleRow
             title={tr('settings.openTerminalInFeishu')}
             help={tr('settings.openTerminalInFeishuHelp')}
@@ -875,6 +1062,13 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('autoUpgradeCodexSessions', value)}
           />
           <ToggleRow
+            title={tr('settings.reapOrphanTmuxServers')}
+            help={tr('settings.reapOrphanTmuxServersHelp')}
+            checked={settings.reapOrphanTmuxServers}
+            disabled={dis || savingKey === 'reapOrphanTmuxServers'}
+            onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
+          />
+          <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
             help={tr('settings.bypassCodexHookTrustHelp')}
             checked={settings.bypassCodexHookTrust}
@@ -901,6 +1095,37 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'noVisibleOutputHint'}
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
           />
+          <ToggleRow
+            title={tr('settings.crossPrincipalInterruption')}
+            help={tr('settings.crossPrincipalInterruptionHelp')}
+            checked={settings.crossPrincipalInterruption}
+            disabled={dis || savingKey === 'crossPrincipalInterruption'}
+            onChange={value => saveBoolean('crossPrincipalInterruption', value)}
+          />
+          <ToggleRow
+            title={tr('settings.scheduleDelegationCreate')}
+            dataAction="toggle-schedule-delegation-create"
+            help={tr('settings.scheduleDelegationCreateHelp')}
+            checked={settings.scheduleBotGrants.createEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onChange={value => { void saveScheduleBotGrants({ createEnabled: value }); }}
+          />
+          <ToggleRow
+            title={tr('settings.scheduleDelegationSelfManage')}
+            dataAction="toggle-schedule-delegation-self-manage"
+            help={tr('settings.scheduleDelegationSelfManageHelp')}
+            checked={settings.scheduleBotGrants.selfManageEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onChange={value => { void saveScheduleBotGrants({ selfManageEnabled: value }); }}
+          />
+          <ScheduleBotGrantsEditor
+            grants={settings.scheduleBotGrants.grants}
+            ignoredCount={settings.scheduleBotGrants.ignoredCount}
+            botOptions={settings.scheduleBotGrants.botOptions}
+            createEnabled={settings.scheduleBotGrants.createEnabled}
+            disabled={dis || savingKey === 'scheduleBotGrants'}
+            onSave={grants => saveScheduleBotGrants({ grants })}
+          />
         </SettingsBlock>
         <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>
           <HostOverloadAlertSettingsEditor
@@ -921,14 +1146,35 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionWorkflow')}>
+        <SettingsBlock id="settings-workflow" title={tr('settings.sectionWorkflow')}>
           <ToggleRow
             title={tr('settings.workflowEnable')}
             help={tr('settings.workflowEnableHelp')}
             checked={settings.workflow.enabled}
             disabled={dis || savingKey === 'workflow'}
             onChange={value => {
-              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { enabled: value } }));
+              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { ...s.workflow, enabled: value } }));
+            }}
+          />
+          <ToggleRow
+            title={tr('settings.workflowNodeExecutorBot')}
+            help={tr('settings.workflowNodeExecutorBotHelp')}
+            checked={settings.workflow.nodeExecutor === 'bot'}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              const nodeExecutor = value ? 'bot' as const : 'ephemeral' as const;
+              void props.onSave('workflow', { workflow: { nodeExecutor } }, s => ({ ...s, workflow: { ...s.workflow, nodeExecutor } }));
+            }}
+          />
+        </SettingsBlock>
+        <SettingsBlock id="settings-multi-topic" title={tr('settings.sectionMultiTopic')}>
+          <ToggleRow
+            title={tr('settings.multiTopicEnable')}
+            help={tr('settings.multiTopicEnableHelp')}
+            checked={settings.multiTopic.enabled}
+            disabled={dis || savingKey === 'multiTopic'}
+            onChange={value => {
+              void props.onSave('multiTopic', { multiTopic: { enabled: value } }, s => ({ ...s, multiTopic: { enabled: value } }));
             }}
           />
         </SettingsBlock>
@@ -962,6 +1208,32 @@ function SettingsBody(props: {
               );
             }}
           />
+          <SessionCleanupRow
+            value={settings.sessionCleanup}
+            disabled={dis || savingKey === 'sessionCleanup'}
+            onSave={patch => {
+              void props.onSave(
+                'sessionCleanup',
+                { sessionCleanup: patch },
+                s => ({ ...s, sessionCleanup: { ...s.sessionCleanup, ...patch } }),
+              );
+            }}
+          />
+        </SettingsBlock>
+        <SettingsBlock id="settings-prompt-cache" title={tr('settings.sectionPromptCache')}>
+          <p className="settings-help">{tr('settings.promptCacheNote')}</p>
+          <PromptCacheEditor
+            scope="global"
+            value={settings.promptCache}
+            disabled={dis || savingKey === 'promptCache'}
+            onSave={next => props.onSave('promptCache', { promptCache: next }, s => ({ ...s, promptCache: next }))}
+          />
+        </SettingsBlock>
+      </SettingsGroup>
+      {/* 表格型区块：不进上面的瀑布流窄栏，单独一组占满宽度。 */}
+      <SettingsGroup className="settings-group-session-env">
+        <SettingsBlock id="settings-session-env" title={tr('sessionEnv.sectionTitle')}>
+          <SessionEnvEditor scope={GLOBAL_SESSION_ENV_SCOPE} />
         </SettingsBlock>
       </SettingsGroup>
       </SettingsModule>
@@ -1071,8 +1343,17 @@ function SettingsBody(props: {
               />
             </div>
           </div>
+          <HttpProxyRow
+            value={settings.httpProxy}
+            disabled={!canWrite || savingKey === 'httpProxy'}
+            onSave={value => props.onSave(
+              'httpProxy',
+              { httpProxy: value },
+              st => ({ ...st, httpProxy: value }),
+            )}
+          />
         </SettingsBlock>
-        <div id="settings-update">{props.updateBlock}</div>
+        <div>{props.updateBlock}</div>
       </SettingsGroup>
       </SettingsModule>
       <div className="settings-status-row">
@@ -1083,51 +1364,49 @@ function SettingsBody(props: {
   );
 }
 
-function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
+/** 滚到区块（有字段标题时定位到那一行）并闪一下，让人一眼看到落点。 */
+function focusSettingsTarget(sectionId: string, fieldTitle: string | null): void {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+  let target: HTMLElement = section;
+  if (fieldTitle) {
+    const title = [...section.querySelectorAll<HTMLElement>('.ui-field-title-text')]
+      .find(el => el.textContent?.trim() === fieldTitle);
+    const row = title?.closest<HTMLElement>('.toggle-row, .settings-field-row, .settings-subfield') ?? title;
+    if (row) target = row;
+  }
+  target.scrollIntoView({ behavior: 'smooth', block: target === section ? 'start' : 'center' });
+  target.classList.remove('palette-target-flash');
+  void target.offsetWidth;
+  target.classList.add('palette-target-flash');
+  window.setTimeout(() => target.classList.remove('palette-target-flash'), 2_400);
+}
+
+/** 导航按 SETTINGS_SECTIONS 生成：它的顺序就是页面区块的顺序，导航与区块一一对应。 */
+export function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
   const tr = props.tr;
-  const groups = [
-    {
-      label: tr('settings.moduleGeneral'),
-      items: [
-        { id: 'settings-access', label: tr('settings.sectionAccess') },
-        { id: 'settings-cards', label: tr('settings.sectionCards') },
-        { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
-        { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
-        { id: 'settings-overload', label: tr('settings.sectionHostOverloadAlert') },
-        { id: 'settings-whiteboard', label: tr('settings.sectionWhiteboard') },
-        { id: 'settings-repo-picker', label: tr('settings.sectionRepoPicker') },
-        { id: 'settings-schedule', label: tr('settings.sectionSchedule') },
-      ],
-    },
-    {
-      label: tr('settings.moduleMeeting'),
-      items: [
-        { id: 'settings-vc', label: tr('settings.sectionVcMeetingAgent') },
-      ],
-    },
-    {
-      label: tr('settings.moduleSystem'),
-      items: [
-        { id: 'settings-maintenance', label: tr('settings.sectionMaintenance') },
-        { id: 'settings-update', label: tr('settings.sectionUpdate') },
-      ],
-    },
-  ];
+  const groups: Array<{ module: string; items: SettingsSection[] }> = [];
+  for (const section of SETTINGS_SECTIONS) {
+    const last = groups[groups.length - 1];
+    if (last?.module === section.module) last.items.push(section);
+    else groups.push({ module: section.module, items: [section] });
+  }
   return (
     <nav className="settings-nav" aria-label={tr('settings.title')}>
       {groups.map(group => (
-        <div key={group.label} className="settings-nav-group">
-          <p className="settings-nav-group-label">{group.label}</p>
+        <div key={group.module} className="settings-nav-group">
+          <p className="settings-nav-group-label">{tr(group.module)}</p>
           {group.items.map(item => (
             <button
               key={item.id}
               type="button"
               className="settings-nav-link"
+              data-section={item.id}
               onClick={() => {
                 document.getElementById(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
               }}
             >
-              {item.label}
+              {tr(item.section)}
             </button>
           ))}
         </div>
@@ -1495,30 +1774,87 @@ export function TimeZoneRow(props: {
   );
 }
 
-function ToggleRow(props: {
-  title: string;
-  help: string;
-  checked: boolean;
-  disabled: boolean;
-  onChange(value: boolean): void;
-}) {
-  return (
-    <label className="toggle-row">
-      <input
-        type="checkbox"
-        checked={props.checked}
-        disabled={props.disabled}
-        onChange={e => props.onChange(e.currentTarget.checked)}
-      />
-      <span className="switch" aria-hidden="true" />
-      <span className="toggle-tx">
-        <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
-      </span>
-    </label>
-  );
+/** settings 页的开关行：共享 ToggleRow + 本页的标题样式钩子。 */
+function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleComponent' | 'titleClassName'>) {
+  return <BaseToggleRow {...props} titleClassName="settings-toggle-title" />;
 }
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
+
+/** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
+function SessionCleanupRow(props: {
+  value: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  disabled: boolean;
+  onSave(patch: { archiveCodex?: boolean; enabled?: boolean; olderThanHours?: IdleCleanupHours; intervalMinutes?: number }): void;
+}) {
+  const tr = useT();
+  const [intervalDraft, setIntervalDraft] = useState(String(props.value.intervalMinutes));
+  useEffect(() => setIntervalDraft(String(props.value.intervalMinutes)), [props.value.intervalMinutes]);
+
+  const parsedInterval = Number(intervalDraft);
+  const intervalValid = Number.isFinite(parsedInterval) && parsedInterval >= 5 && Number.isInteger(parsedInterval);
+  const intervalDirty = intervalValid && Math.floor(parsedInterval) !== props.value.intervalMinutes;
+
+  return (
+    <div className="settings-session-cleanup">
+      <ToggleRow
+        title={tr('settings.sessionCleanupArchiveCodex')}
+        help={tr('settings.sessionCleanupArchiveCodexHelp')}
+        checked={props.value.archiveCodex === true}
+        disabled={props.disabled}
+        onChange={value => props.onSave({ archiveCodex: value })}
+      />
+      <ToggleRow
+        title={tr('settings.sessionCleanupEnable')}
+        help={tr('settings.sessionCleanupEnableHelp')}
+        checked={props.value.enabled}
+        disabled={props.disabled}
+        onChange={value => props.onSave({ enabled: value })}
+      />
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.sessionCleanupOlderThanHelp')}>{tr('settings.sessionCleanupOlderThan')}</FieldTitle>
+        <div
+          className="idle-cleanup-threshold-options"
+          role="radiogroup"
+          aria-label={tr('settings.sessionCleanupOlderThan')}
+        >
+          {IDLE_CLEANUP_HOUR_OPTIONS.map(hours => {
+            const active = hours === props.value.olderThanHours;
+            return (
+              <button
+                type="button"
+                key={hours}
+                className={active ? 'active' : undefined}
+                aria-pressed={active ? 'true' : 'false'}
+                disabled={props.disabled || !props.value.enabled}
+                onClick={() => { if (hours !== props.value.olderThanHours) props.onSave({ olderThanHours: hours }); }}
+              >
+                {idleCleanupHoursLabel(hours)}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.sessionCleanupIntervalHelp')}>{tr('settings.sessionCleanupInterval')}</FieldTitle>
+        <input
+          type="number"
+          min={5}
+          step={1}
+          inputMode="numeric"
+          value={intervalDraft}
+          disabled={props.disabled || !props.value.enabled}
+          onChange={e => setIntervalDraft(e.currentTarget.value)}
+          onBlur={() => {
+            if (intervalDirty) props.onSave({ intervalMinutes: Math.floor(parsedInterval) });
+            else setIntervalDraft(String(props.value.intervalMinutes));
+          }}
+          onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+        />
+      </div>
+    </div>
+  );
+}
 
 export function GroupNamePrefixRow(props: {
   value: string;
@@ -1589,6 +1925,75 @@ export function currentBrowserOrigin(): string {
 
 /** 与服务端 `normalizeOAuthRedirectBase` 同一套判定（http(s) origin，不带路径/
  *  query/fragment），只是提前到前端，避免用户点了保存才吃一个 error code。 */
+/** Mirrors the server's normalizeHttpProxy: `http://[user:pass@]host[:port]`,
+ *  no path / query (the download tunnel dials the proxy over plain HTTP). */
+export function isValidHttpProxy(raw: string): boolean {
+  const value = raw.trim().replace(/\/+$/, '');
+  if (!/^http:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return !!url.hostname && url.pathname === '/' && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+/** Proxy for downloading new botmux binaries from GitHub Releases. */
+export function HttpProxyRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const trimmed = draft.trim().replace(/\/+$/, '');
+  // 空串合法（= 清除配置，退回环境变量）。
+  const valid = trimmed === '' || isValidHttpProxy(trimmed);
+  const dirty = trimmed !== props.value.trim().replace(/\/+$/, '');
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(trimmed);
+  };
+
+  return (
+    <div className="settings-subfield settings-http-proxy-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.httpProxyHelp')}>{tr('settings.httpProxy')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          data-input="httpProxy"
+          value={draft}
+          placeholder={tr('settings.httpProxyPlaceholder')}
+          disabled={props.disabled}
+          autoComplete="off"
+          spellCheck={false}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-http-proxy-hint>
+        {trimmed === ''
+          ? tr('settings.httpProxyUnset')
+          : valid ? tr('settings.httpProxyActive') : tr('settings.httpProxyInvalid')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          data-action="http-proxy-save"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.httpProxySave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function isValidOAuthRedirectBase(raw: string): boolean {
   const value = raw.trim();
   if (!/^https?:\/\//i.test(value)) return false;
@@ -1751,7 +2156,7 @@ function TraexPluginEditor(props: {
   );
 }
 
-function AutostartCard(props: {
+export function AutostartCard(props: {
   canWrite: boolean;
   state: AutostartState | null;
   loading: boolean;
@@ -1800,10 +2205,10 @@ function AutostartCard(props: {
     content = null;
   }
 
-  return <SettingsBlock title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
+  return <SettingsBlock id="settings-autostart" title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
 }
 
-function UpdateCard(props: {
+export function UpdateCard(props: {
   canWrite: boolean;
   status: UpdateStatus | null;
   statusError: string | null;
@@ -1817,6 +2222,7 @@ function UpdateCard(props: {
   onCheck(): void;
   onToggleChangelog(): void;
   onUpdate(): void;
+  onForceUpdate?(): void;
   onRestart(): void;
 }) {
   const tr = useT();
@@ -1846,8 +2252,10 @@ function UpdateCard(props: {
           <span>{tr('update.current')}: <strong>v{s.current}</strong></span>{' '}
           <UpdateBadge status={s} />
         </p>
+        {s.runningDaemonRestartHint ? <p className="hint-warn">{s.runningDaemonRestartHint}</p> : null}
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
+        {s.releaseInstallRequired ? <p className="hint">{tr('update.installReleaseHint')}</p> : null}
         {s.localDevInstall ? <p className="hint">{s.localDevUpdatable ? tr('update.localDevUpdatable') : tr('update.localDev')}</p> : null}
         {s.installs.multiple ? <MultiInstallWarning entries={s.installs.entries} /> : null}
         <div className="update-actions">
@@ -1856,8 +2264,10 @@ function UpdateCard(props: {
             {props.changelogOpen ? tr('update.btnChangelogHide') : tr('update.btnChangelog')}
           </button>
           <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{updateLabel}</button>
+          {s.localDevInstall && props.onForceUpdate ? <button type="button" data-up="force-update" disabled={updateDisabled} onClick={props.onForceUpdate}>{tr('update.forceButton')}</button> : null}
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
+        {s.localDevInstall && props.onForceUpdate ? <p className="hint-warn">{tr('update.forceHint')}</p> : null}
         {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
         {props.changelogOpen ? (
           <ChangelogPanel
@@ -1873,6 +2283,7 @@ function UpdateCard(props: {
   }
   return (
     <SettingsBlock
+      id="settings-update"
       className="settings-update-block"
       title={tr('update.section')}
       titleExtra={props.status?.localDevInstall
@@ -1886,7 +2297,7 @@ function UpdateCard(props: {
   );
 }
 
-function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
+export function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
   const tr = useT();
   return (
     <div className="cli-runtime-updates">
@@ -1911,6 +2322,8 @@ function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
             <code>{entry.binPath}</code>
             {entry.updateAvailable && entry.updateCommand ? (
               <small>{tr('update.runtimeCommand')}: <code>{entry.updateCommand}</code></small>
+            ) : entry.updateAvailable ? (
+              <small>{tr('update.runtimeCommandUnknown')}</small>
             ) : null}
           </li>
         ))}
@@ -1920,10 +2333,15 @@ function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
   );
 }
 
-function UpdateBadge(props: { status: UpdateStatus }) {
+export function UpdateBadge(props: { status: UpdateStatus }) {
   const tr = useT();
   const s = props.status;
   if (!s.latest) return <span className="hint-warn-inline">{tr('update.checkUnavailable')}</span>;
+  if (s.latestSource === 'configured-fallback') {
+    return s.behind
+      ? <span className="update-badge update-badge-new">{tr('update.mirrorNewAvailable', { version: `v${s.latest}` })}</span>
+      : <span className="update-badge update-badge-ok">{tr('update.mirrorUpToDate')}</span>;
+  }
   return s.behind
     ? <span className="update-badge update-badge-new">{tr('update.newAvailable', { version: `v${s.latest}` })}</span>
     : <span className="update-badge update-badge-ok">{tr('update.upToDate')}</span>;

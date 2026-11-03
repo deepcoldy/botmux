@@ -33,7 +33,7 @@ function makeRangeHintFn(): (isChatScope: boolean, effectiveScope: string) => st
   const src = readFileSync(DIST_CLI, 'utf8');
   const start = src.indexOf('const rangeHint =');
   expect(start, 'rangeHint must be present in dist/cli.js — rebuild if this fails').toBeGreaterThan(-1);
-  const end = src.indexOf('console.log(JSON.stringify({', start);
+  const end = src.indexOf('const historyResult =', start);
   expect(end).toBeGreaterThan(start);
   const expr = src.slice(start, end).trim().replace(/;$/, '');
   // eslint-disable-next-line no-new-func
@@ -72,7 +72,7 @@ describe('botmux history — rangeHint range guidance', () => {
   });
 
   it('describes an OBSERVABLE trigger, not daemon-side invocations the model never sees', () => {
-    // `/t` (parseForceTopicInvocation) is consumed by the daemon and stripped
+    // `/t` (parseTopicHeader) is consumed by the daemon and stripped
     // before the prompt is built, so the model has never seen that token. Naming
     // it would read as an instruction the model cannot act on. The trigger must
     // be phrased as something visible from inside the session instead.

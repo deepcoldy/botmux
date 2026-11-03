@@ -12,7 +12,12 @@
  *
  * What this module authenticates:
  *   1. The turn id is a well-formed scheduled turn.
- *   2. The task still exists, is enabled, and carries a creator (ownerOpenId).
+ *   2. The task still exists and carries a creator (ownerOpenId). The daemon
+ *      reads it from the host authority store; the CLI-side resolver can only
+ *      read the schedules.json projection and is a preflight, not a boundary. An enabled
+ *      task is accepted directly. A one-shot that the scheduler auto-disabled
+ *      after dispatch is accepted only while the daemon independently proves
+ *      this exact turn is still live. Manual/legacy disables stay denied.
  *   3. The session presenting the turn is bound to the task's target
  *      (larkAppId/chatId) — the task cannot authorize a workflow command in a
  *      session belonging to another chat/bot.
@@ -31,12 +36,19 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
+import { effectiveScheduleChatIds } from '../services/schedule-store.js';
+import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 import type { ScheduledTask, TrustedCaller } from '../types.js';
+import { parseScheduleRunAsClaim, scheduledTaskRunAs } from './schedule-run-as.js';
 
-/** Scheduled turn ids: `schedule:<8-hex-taskId>:<uuid>`. Task ids are minted
- *  by schedule-store as `randomUUID().substring(0, 8)`; the strict shape keeps
- *  a crafted marker turnId from smuggling through the exemption. */
-const SCHEDULED_TURN_RE = /^schedule:([0-9a-f]{8}):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Scheduled turn ids: `schedule:<taskId>:<uuid>`. Task ids come from two
+ *  producers (see schedule-store.createTask): legacy `randomUUID().substring(0,
+ *  8)` hex ids and workflow idempotency keys `wf_<47hex>` / `wf3_<46hex>`
+ *  (total width 50). The strict [0-9a-z_]{1,50} shape keeps a crafted marker
+ *  turnId from smuggling through the exemption; parsing alone never authorizes
+ *  — the task is still looked up by id in the presenting bot's own
+ *  schedules.json, so a forged id simply misses. */
+const SCHEDULED_TURN_RE = /^schedule:([0-9a-z_]{1,50}):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Returns the task id embedded in a scheduled turn id, or null for any other
  *  turn id shape. */
@@ -62,28 +74,36 @@ export function mintScheduledContinuationTurnId(
 }
 
 /**
- * Identity a scheduled turn runs as: the task's creator, as captured at
- * creation time. The turn itself is authenticated by the daemon-minted
+ * Identity a scheduled turn runs as: the person who claimed the task from the
+ * claim card, otherwise the task's creator as captured at creation time (see
+ * scheduledTaskRunAs). The turn itself is authenticated by the daemon-minted
  * `schedule:<taskId>:<uuid>` turn id (authorizeScheduledTurn above) — this
  * only decides WHICH identity that authenticated turn carries. Shared by the
  * scheduler fire path and the ordinary-turn recovery continuation so a
  * continuation runs as exactly the identity its original fire ran as.
  *
- * Returns undefined when the task has no creator union_id (legacy tasks,
- * CLI-created tasks, bot-created tasks). That is deliberate and is the whole
- * fail-closed story: with no identity on the turn, identity-bound tools refuse
- * to run instead of falling back to the bot's own access, while everything that
- * does not need a user identity keeps working.
+ * Returns undefined when the task has neither a claim nor a creator union_id
+ * (legacy tasks, CLI-created tasks, bot-created tasks). That is deliberate and
+ * is the whole fail-closed story: with no identity on the turn, identity-bound
+ * tools refuse to run instead of falling back to the bot's own access, while
+ * everything that does not need a user identity keeps working.
  */
 export function trustedCallerForScheduledTask(
   task: ScheduledTask,
   larkAppId: string,
 ): TrustedCaller | undefined {
-  if (!task.ownerUnionId) return undefined;
+  const runAs = scheduledTaskRunAs(task, larkAppId);
+  if (!runAs) return undefined;
   return {
-    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
-    requestUserUnionId: task.ownerUnionId,
-    requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
+    ...(runAs.openId ? { requestUserOpenId: runAs.openId } : {}),
+    requestUserUnionId: runAs.unionId,
+    requestLarkAppId: runAs.larkAppId,
+    // A persisted ownerUnionId is written only for a daemon-authenticated
+    // human creator, and a claim only from a Lark-verified card operator.
+    // Preserve that positive fact on the synthetic fire so strict Remote
+    // Runner transports do not downgrade the scheduled turn to an unknown
+    // caller (bot-created / legacy tasks returned above).
+    senderType: 'user',
     source: 'schedule_creator',
     taskId: task.id,
   };
@@ -92,9 +112,12 @@ export function trustedCallerForScheduledTask(
 /**
  * Read a task straight from the per-bot schedules.json
  * (`<botmuxHome>/bots/<appId>/schedules.json`). Read-only, no global store
- * state — safe inside the sandboxed CLI (the file lives under the bot's own
- * home dir, same as `botmux schedule list`) and in tests (takes the dataDir
- * explicitly instead of the global config).
+ * state — usable inside the sandboxed CLI (the file lives under the bot's own
+ * home dir, same as `botmux schedule list`).
+ *
+ * That same property is why the daemon must not use it: the file is a
+ * projection of the host authority store, and a sandboxed CLI can rewrite it.
+ * Daemon-side identity decisions read readScheduledTaskFromAuthority instead.
  */
 export function readScheduledTaskForProvenance(
   dataDir: string,
@@ -111,6 +134,36 @@ export function readScheduledTaskForProvenance(
   } catch {
     // Corrupt/unreadable schedules.json must not grant an exemption — the
     // caller falls back to the ordinary (failing) human-turn checks.
+    return undefined;
+  }
+}
+
+/** Minimal read view of the host-only schedule authority store. */
+export interface ScheduleAuthorityReader {
+  getRecord(appId: string, taskId: string): { state: string; task: ScheduledTask } | undefined;
+}
+
+/**
+ * Read a task from the host-only authority store for an identity decision
+ * (who a scheduled turn runs as, which chat it is bound to).
+ *
+ * Deliberately has NO schedules.json fallback: that file is a projection the
+ * daemon rewrites from the authority store, and it lives in BOT_HOME, which a
+ * sandboxed CLI can write. A missing store, an unreadable row or a revoked
+ * task yields undefined — the same fail-closed outcome as a deleted task.
+ * Paused/completed rows are returned as-is; callers judge `enabled` exactly
+ * like they judged the projection row.
+ */
+export function readScheduledTaskFromAuthority(
+  store: ScheduleAuthorityReader | null | undefined,
+  larkAppId: string,
+  taskId: string,
+): ScheduledTask | undefined {
+  if (!store) return undefined;
+  try {
+    const record = store.getRecord(larkAppId, taskId);
+    return record && record.state !== 'revoked' ? record.task : undefined;
+  } catch {
     return undefined;
   }
 }
@@ -136,20 +189,44 @@ export interface ScheduledTurnAuth {
  */
 export function authorizeScheduledTurn(input: {
   turnId: string;
-  dataDir: string;
   sessionLarkAppId: string;
   sessionChatId: string;
   isOwnerAllowed: (larkAppId: string, ownerOpenId: string) => boolean;
-}): ScheduledTurnAuth | { error: ScheduledTurnAuthError } {
+  /** Daemon-owned exact-turn liveness. Omit on paths that cannot prove it. */
+  isScheduledTurnLive?: (turnId: string) => boolean;
+} & (
+  /** Daemon callers: read the task from the host authority store. */
+  | { loadTask: (larkAppId: string, taskId: string) => ScheduledTask | undefined; dataDir?: never }
+  /** CLI-side preflight only: the per-bot schedules.json projection. Inside a
+   *  sandbox that file is agent-writable, so a result read this way must never
+   *  be the last check before a daemon-side effect. */
+  | { dataDir: string; loadTask?: never }
+)): ScheduledTurnAuth | { error: ScheduledTurnAuthError } {
   const taskId = parseScheduledTurnId(input.turnId);
   if (!taskId) return { error: 'task_not_found' };
   if (!input.sessionLarkAppId || !input.sessionChatId) return { error: 'binding_mismatch' };
 
-  const task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
+  const task = input.loadTask
+    ? input.loadTask(input.sessionLarkAppId, taskId)
+    : readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
-  if (task.enabled === false) return { error: 'task_disabled' };
+  if (task.enabled === false) {
+    // A one-shot that ran, or an until-done task closed by its own run, keeps
+    // authority for that exact still-live turn.
+    const autoCompletedStillLive = isAutoCompletedSchedule(task)
+      && input.isScheduledTurnLive?.(input.turnId) === true;
+    if (!autoCompletedStillLive) return { error: 'task_disabled' };
+  }
 
-  const ownerOpenId = typeof task.ownerOpenId === 'string' ? task.ownerOpenId.trim() : '';
+  // A claim from the claim card replaces the creator as the acting identity.
+  // Its open_id was issued to the bot that received the card callback, so it
+  // only binds that bot's turns.
+  const claim = parseScheduleRunAsClaim(task.runAsClaim);
+  if (claim && claim.larkAppId !== (task.larkAppId ?? input.sessionLarkAppId)) {
+    return { error: 'binding_mismatch' };
+  }
+  const ownerOpenId = claim?.openId
+    ?? (typeof task.ownerOpenId === 'string' ? task.ownerOpenId.trim() : '');
   if (!ownerOpenId) return { error: 'task_owner_missing' };
 
   // The task must be bound to the presenting session's bot/chat. A task
@@ -158,7 +235,18 @@ export function authorizeScheduledTurn(input: {
   if (task.larkAppId && task.larkAppId !== input.sessionLarkAppId) {
     return { error: 'binding_mismatch' };
   }
-  if (task.chatId !== input.sessionChatId) {
+  // Multi-chat tasks may legitimately fire into any of their target chats, so
+  // bind against the full effective list (single-chat legacy rows collapse to
+  // their one chatId). The provenance reader does not migrate rows, so a
+  // hand-corrupted chatIds shape must fail closed as a binding mismatch rather
+  // than throw out of the error-code contract.
+  let boundChatIds: string[];
+  try {
+    boundChatIds = effectiveScheduleChatIds(task);
+  } catch {
+    return { error: 'binding_mismatch' };
+  }
+  if (!boundChatIds.includes(input.sessionChatId)) {
     return { error: 'binding_mismatch' };
   }
 

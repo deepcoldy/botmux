@@ -2,7 +2,7 @@
  * card-handler 群内授权动作：owner 强闸门 + nonce + 撤回卡/通知/兜底 patch。
  * Run: pnpm vitest run test/card-handler-grant.test.ts
  */
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -18,6 +18,8 @@ const deleteMock = vi.fn(async () => true);  // deleteMessage now returns boolea
 const getMessageDetailMock = vi.fn(async () => ({ items: [{ thread_id: 'omt_thread' }] }));
 // 默认所有 open_id 判为「非真人」（bot）→ 全部登记花名册；需要模拟真人用 mockImplementation。
 const isHumanMock = vi.fn(async () => false);
+// 转投私聊的申请卡处置后，回告原会话申请人走 sendMessage（fire-and-forget）。
+const sendMock = vi.fn(async () => 'om_sent');
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return {
@@ -26,6 +28,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
     deleteMessage: (...a: any[]) => deleteMock(...a),
     getMessageDetail: (...a: any[]) => getMessageDetailMock(...a),
     isHumanOpenId: (...a: any[]) => isHumanMock(...a),
+    sendMessage: (...a: any[]) => sendMock(...a),
   };
 });
 
@@ -44,11 +47,14 @@ const deps = { activeSessions: new Map(), sessionReply: vi.fn(async () => 'mid')
 // 一次宏任务（setTimeout 0）会等整条后台微任务链排空，再断言后台副作用（reply/delete）。
 const flushBackground = () => new Promise(resolve => setTimeout(resolve, 0));
 
-async function fresh() {
+// 每次 fresh() 都是一份全新的模块图（≈ 新起一个 daemon 进程）。grant-pending 现在落盘，
+// 默认把上一个用例留下的文件一并清掉；keepPersisted 用来模拟「daemon 重启」。
+async function fresh(opts: { keepPersisted?: boolean } = {}) {
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
   const pending = await import('../src/im/lark/grant-pending.js');
   const handler = await import('../src/im/lark/card-handler.js');
+  if (!opts.keepPersisted) pending._resetForTest();
   registry.loadBotConfigs().forEach(c => registry.registerBot(c));
   return { registry, pending, handler };
 }
@@ -64,6 +70,7 @@ beforeEach(() => {
   getMessageDetailMock.mockClear(); getMessageDetailMock.mockImplementation(async () => ({ items: [{ thread_id: 'omt_thread' }] }));
   recordObservedMock.mockClear();
   isHumanMock.mockClear(); isHumanMock.mockImplementation(async () => false);
+  sendMock.mockClear();
   const dir = mkdtempSync(join(tmpdir(), 'botmux-cardgrant-'));
   configPath = join(dir, 'bots.json');
   writeFileSync(configPath, JSON.stringify([{ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] }], null, 2));
@@ -78,6 +85,66 @@ describe('card-handler grant actions', () => {
     const res = await handler.handleCardAction(action('grant_chat', { operator: 'ou_x', nonce }), deps, 'h1');
     expect(res?.toast?.type).toBe('error');
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+  });
+
+  it('card delivered before a daemon restart still grants afterwards and replays the original message', async () => {
+    const before = await fresh();
+    const messageData = { message: { message_id: 'om_trigger', chat_id: 'oc_1', chat_type: 'group', content: '{"text":"@bot hi"}' }, sender: { sender_id: { open_id: 'ou_g' } } };
+    const nonce = before.pending.openPending('h1', 'oc_1', 'ou_g', 3, messageData, 60 * 60 * 1000);
+    before.pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+
+    const after = await fresh({ keepPersisted: true });
+    const replayGrantedMessage = vi.fn();
+    const res = await after.handler.handleCardAction(
+      action('grant_chat', { nonce }, 'om_card'),
+      { ...deps, replayGrantedMessage },
+      'h1',
+    );
+    expect(res?.toast).toBeUndefined();
+    expect(JSON.stringify(res)).toContain('ou_g');
+    const cfg = after.registry.getBot('h1').config;
+    expect(cfg.chatGrants).toEqual({ oc_1: ['ou_g'] });
+    expect(cfg.quotaState?.['chat:oc_1:ou_g']).toEqual({ limit: 3, used: 0 });
+    expect(replayGrantedMessage).toHaveBeenCalledWith(messageData, 'h1');
+    // 已处置的卡在下一次重启后也不会复活
+    const later = await fresh({ keepPersisted: true });
+    expect(later.pending.checkNonce('h1', 'oc_1', 'ou_g', nonce)).toBe(false);
+  });
+
+  it('deny on a card delivered before a daemon restart works afterwards', async () => {
+    const before = await fresh();
+    const nonce = before.pending.openPending('h1', 'oc_1', 'ou_g');
+    before.pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+
+    const after = await fresh({ keepPersisted: true });
+    const res = await after.handler.handleCardAction(action('grant_deny', { nonce }, 'om_card'), deps, 'h1');
+    expect(res?.toast).toBeUndefined();
+    expect(res?.body?.elements).toBeTruthy();
+    expect(after.registry.getBot('h1').config.chatGrants).toBeUndefined();
+    const later = await fresh({ keepPersisted: true });
+    expect(later.pending.throttleReason('h1', 'oc_1', 'ou_g')).toBe('denied');
+  });
+
+  it('grant/deny are refused (card stays actionable) when the handled state cannot be saved', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+    // 目标路径被非空目录占住：既写不进也删不掉 → 核销无法落盘
+    const path = pending._filePathForTest('h1');
+    rmSync(path, { force: true });
+    mkdirSync(path);
+    writeFileSync(join(path, 'occupied'), '');
+    try {
+      const unsaved = '授权状态保存失败，本次操作未生效，请稍后重试';
+      const deny = await handler.handleCardAction(action('grant_deny', { nonce }, 'om_card'), deps, 'h1');
+      expect(deny?.toast).toEqual({ type: 'error', content: unsaved });
+      const grant = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
+      expect(grant?.toast).toEqual({ type: 'error', content: unsaved });
+      expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+      expect(pending.checkNonce('h1', 'oc_1', 'ou_g', nonce)).toBe(true);
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
   });
 
   it('stale nonce → expired toast, no grant', async () => {
@@ -167,6 +234,9 @@ describe('card-handler grant actions', () => {
     expect(deleteMock).not.toHaveBeenCalled();
     expect(pending.isThrottled('h1', 'oc_1', 'ou_g')).toBe(true);
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+    await flushBackground();
+    // 群内卡（无 delivery）申请人自己看得到终态卡，不另发回告
+    expect(sendMock).not.toHaveBeenCalled();
   });
 
   it('owner grant_global → writes globalGrants (not chatGrants/allowedUsers), 就地 patch 终态卡(@ 被授权人)，不发通知不撤回', async () => {
@@ -318,5 +388,81 @@ describe('card-handler grant actions', () => {
     const res = await handler.handleCardAction(action('grant_chat', { operator: 'ou_coowner', nonce }), deps, 'h1');
     expect(res?.toast?.type).toBeUndefined();
     expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
+  });
+});
+
+describe('card-handler grant actions — request card forwarded to the approver DM', () => {
+  function dmAction(a: string, nonce: string, delivery: 'dm_p2p' | 'dm_group', extra: Record<string, any> = {}) {
+    return {
+      operator: { open_id: 'ou_owner' },
+      context: { open_message_id: 'om_dm_card' },
+      action: { value: { action: a, target_open_ids: ['ou_g'], target_names: ['张三'], chat_id: 'oc_origin', nonce, mode: 'request', delivery, ...extra } },
+    } as any;
+  }
+
+  it('dm_p2p grant → grants the origin p2p chat, owner card names DM scope, requester gets a notice in the origin chat', async () => {
+    const { registry, pending, handler } = await fresh();
+    isHumanMock.mockImplementation(async () => true);
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g', 3);
+    const res = await handler.handleCardAction(dmAction('grant_chat', nonce, 'dm_p2p'), deps, 'h1');
+    expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_origin: ['ou_g'] });
+    const resultText = JSON.stringify(res);
+    expect(resultText).toContain('私聊');
+    expect(resultText).not.toContain('在本群');
+    await flushBackground();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    const [appId, chatId, content, msgType] = sendMock.mock.calls[0] as any[];
+    expect([appId, chatId, msgType]).toEqual(['h1', 'oc_origin', 'interactive']);
+    expect(content).toContain('管理员已同意');
+    expect(content).not.toContain('<at');
+    // 在 owner 私聊里点的卡，不往那个私聊 reply 额外消息
+    expect(replyMock).not.toHaveBeenCalled();
+  });
+
+  it('dm_group grant → owner card shows the origin chat name, requester is @-ed in the origin group', async () => {
+    const { pending, handler } = await fresh();
+    isHumanMock.mockImplementation(async () => true);
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g', 3);
+    const res = await handler.handleCardAction(dmAction('grant_chat', nonce, 'dm_group', { chat_name: '值班群' }), deps, 'h1');
+    expect(JSON.stringify(res)).toContain('值班群');
+    await flushBackground();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    const [, chatId, content] = sendMock.mock.calls[0] as any[];
+    expect(chatId).toBe('oc_origin');
+    expect(content).toContain('<at id=ou_g></at>');
+  });
+
+  it('dm_p2p deny → cooldown + neutral "not approved" notice in the origin chat, no grant', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g');
+    const res = await handler.handleCardAction(dmAction('grant_deny', nonce, 'dm_p2p'), deps, 'h1');
+    expect(res?.body?.elements).toBeTruthy();
+    expect(pending.isThrottled('h1', 'oc_origin', 'ou_g')).toBe(true);
+    expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+    await flushBackground();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    const [, chatId, content] = sendMock.mock.calls[0] as any[];
+    expect(chatId).toBe('oc_origin');
+    expect(content).toContain('未通过');
+    expect(content).not.toContain('<at');
+  });
+
+  it('dm_group deny → bot requester is named in plain text, not @-ed', async () => {
+    const { pending, handler } = await fresh();
+    isHumanMock.mockImplementation(async () => false);
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g');
+    await handler.handleCardAction(dmAction('grant_deny', nonce, 'dm_group'), deps, 'h1');
+    await flushBackground();
+    const [, , content] = sendMock.mock.calls[0] as any[];
+    expect(content).toContain('张三');
+    expect(content).not.toContain('<at id=ou_g');
+  });
+
+  it('forged delivery value is ignored (only dm_p2p / dm_group are honored)', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g');
+    await handler.handleCardAction(dmAction('grant_chat', nonce, 'bogus' as any), deps, 'h1');
+    await flushBackground();
+    expect(sendMock).not.toHaveBeenCalled();
   });
 });

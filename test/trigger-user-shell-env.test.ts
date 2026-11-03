@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ts from 'typescript';
+import { larkToolBindingPath } from '../src/core/lark-tool-binding.js';
 import { describe, expect, it } from 'vitest';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
@@ -10,6 +11,7 @@ import {
   GIT_ASKPASS_BASENAME,
   IDENTITY_DENIED_EXIT_CODE,
   installIdentityWrapper,
+  prepareTriggerUserCliEnv,
   publishActiveTurn,
   sessionIdentityBinDir,
   writeSessionIdentity,
@@ -18,20 +20,20 @@ import {
 // worker.ts is a process entrypoint: execute its actual environment-assembly
 // block without starting a worker, rather than recreating that block in a fixture.
 const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const start = worker.indexOf('const identityShellEnv: Record<string, string> = {};');
+const start = worker.indexOf('const identityShellEnv: Record<string, string> = {');
 const end = worker.indexOf('const args = cliAdapter.buildArgs({', start);
 if (start < 0 || end <= start) throw new Error('Cannot locate worker identity environment assembly');
 const assembly = ts.transpileModule(worker.slice(start, end), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
-  'effectiveAdapterSessionId', `${assembly}\nreturn identityShellEnv;`);
+  'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir', `${assembly}\nreturn identityShellEnv;`);
 
-function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli']): Record<string, string> {
+function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false): Record<string, string> {
   return assemble(
-    { sessionId: 'botmux-session', triggerUserAuth: { enabled, tools } },
-    { env: sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir } },
-    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session',
+    { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', triggerUserAuth: { enabled, tools } },
+    { env: sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' } },
+    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
   );
 }
 
@@ -45,11 +47,13 @@ function shellOverrides(args: string[]): Record<string, string> {
   }));
 }
 
+const routingEnv = { BOTMUX_SESSION_ID: 'botmux-session', BOTMUX_CHAT_ID: 'oc_chat', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_SESSION_SCOPE: 'chat' };
+
 describe('worker trigger-user shell contract', () => {
   it('uses the credential file identity, not the native CLI resume identity', () => {
     const dataDir = '/tmp/data "quoted"';
     expect(workerShellEnv(dataDir)).toEqual({
-      BOTMUX_SESSION_ID: 'botmux-session',
+      ...routingEnv,
       SESSION_DATA_DIR: dataDir,
       BOTMUX_IDENTITY_BIN: sessionIdentityBinDir(dataDir, 'botmux-session'),
       ZDOTDIR: join(sessionIdentityBinDir(dataDir, 'botmux-session'), 'shell'),
@@ -58,9 +62,23 @@ describe('worker trigger-user shell contract', () => {
     });
   });
 
-  it('does not request an environment when trigger-user auth is off or has no data root', () => {
-    expect(workerShellEnv('/tmp/data', false)).toEqual({});
-    expect(workerShellEnv(undefined)).toEqual({});
+  it('retains routing without identity wrappers when auth is off or has no data root', () => {
+    expect(workerShellEnv('/tmp/data', false)).toEqual(routingEnv);
+    expect(workerShellEnv(undefined)).toEqual(routingEnv);
+  });
+
+  it.each([false, true])('forwards a bound lark entry with trigger-user auth enabled=%s', (enabled) => {
+    const dataDir = '/tmp/data "quoted"';
+    const bin = sessionIdentityBinDir(dataDir, 'botmux-session');
+    expect(workerShellEnv(dataDir, enabled, ['lark-cli'], true)).toEqual({
+      ...routingEnv,
+      SESSION_DATA_DIR: dataDir,
+      BOTMUX_IDENTITY_BIN: bin,
+      ZDOTDIR: join(bin, 'shell'),
+      BASH_ENV: join(bin, 'shell', 'bash_env.sh'),
+      BOTMUX_LARK_TOOL_BINDING: larkToolBindingPath(dataDir, 'botmux-session'),
+      BOTMUX_DAEMON_IPC_PORT: '12345',
+    });
   });
 
   it('does not request git askpass for lark-only authentication', () => {
@@ -68,17 +86,71 @@ describe('worker trigger-user shell contract', () => {
   });
 });
 
+describe('wrapper rendering model (review gate: no resolver argv on legacy paths)', () => {
+  function install(model: 'single' | 'proven', execution?: { appId: string; ipcPort?: number }): string {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-wrapper-model-'));
+    const realTool = join(dataDir, 'bytedcli');
+    writeFileSync(realTool, '#!/bin/sh\nprintf ok\n', { mode: 0o755 });
+    const shellEnv: Record<string, string> = { PATH: dataDir };
+    const log = () => {};
+    prepareTriggerUserCliEnv(
+      shellEnv, dataDir, 'gate-session',
+      { enabled: true, tools: ['bytedcli'] } as any, log, model, execution,
+    );
+    const wrapper = join(shellEnv.BOTMUX_IDENTITY_BIN!, 'bytedcli');
+    return readFileSync(wrapper, 'utf8');
+  }
+
+  it('renders NO cli-identity-runner argv and NO --ipc-port for the single model', () => {
+    const text = install('single');
+    expect(text).not.toContain('cli-identity-runner');
+    expect(text).not.toContain('--ipc-port');
+    // It uses the legacy single-file source block instead.
+    expect(text).toContain('.data"');
+  });
+
+  it('renders the runner argv and eval block for the proven model', () => {
+    const text = install('proven', { appId: 'cli_app', ipcPort: 12345 });
+    expect(text).toContain('cli-identity-runner');
+    expect(text).toContain('--ipc-port');
+    expect(text).toContain('12345');
+    expect(text).toContain('eval "$__botmux_cred_body"');
+    // Proven wrapper must never name a turns/ path or source a disk file.
+    expect(text).not.toContain('turns/');
+    expect(text).not.toContain('. "$__botmux_cred"');
+  });
+});
+
 describe.each([
   ['traex', createTraexAdapter],
   ['codex', createCodexAdapter],
 ] as const)('%s explicit identity environment', (_name, createAdapter) => {
+  it('emits each routing override once and skips undefined config values', () => {
+    const args = createAdapter('/bin/cli').buildArgs({
+      sessionId: 'native-session',
+      shellSubprocessEnv: { ...routingEnv, UNSET: undefined } as unknown as Record<string, string>,
+    });
+    expect(args.filter(arg => arg.startsWith('shell_environment_policy.set.BOTMUX_SESSION_ID='))).toHaveLength(1);
+    expect(shellOverrides(args)).toMatchObject(routingEnv);
+    expect(shellOverrides(args)).not.toHaveProperty('UNSET');
+  });
+
+  it('forwards the bound lark entry to shell commands without legacy authentication', () => {
+    const shellEnv = workerShellEnv('/tmp/bound-lark', false, [], true);
+    const args = createAdapter('/bin/cli').buildArgs({
+      sessionId: 'native-session', shellSubprocessEnv: shellEnv,
+    });
+    expect(shellOverrides(args)).toEqual(shellEnv);
+    expect(args.filter(arg => arg.startsWith('shell_environment_policy.set.BOTMUX_LARK_TOOL_BINDING='))).toHaveLength(1);
+  });
+
   it.each([false, true])('runs the real wrapper without inherited identity variables, resume=%s', (resume) => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-shell-env-'));
     try {
       const shellEnv = workerShellEnv(dataDir);
       const realTool = join(dataDir, 'real-tool');
       writeFileSync(realTool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n', { mode: 0o755 });
-      const wrapper = installIdentityWrapper(shellEnv.BOTMUX_IDENTITY_BIN, 'bytedcli', realTool)!;
+      const wrapper = installIdentityWrapper(shellEnv.BOTMUX_IDENTITY_BIN, 'bytedcli', realTool, 'single')!;
       const args = createAdapter('/bin/cli').buildArgs({
         sessionId: 'native-session',
         resume,
@@ -107,6 +179,11 @@ describe.each([
         expect(run(missing)).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
       }
       publishActiveTurn(dataDir, 'botmux-session', 'turn-a');
+      // Single-snapshot model: B's publication overwrote the only file (stamped
+      // turn-b), so pointing the marker back at turn-a is a mismatch and denies.
+      // Per-turn tail access across overwrite is the proven model's contract.
+      expect(run()).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
+      publishActiveTurn(dataDir, 'botmux-session', 'turn-unprepared');
       expect(run()).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
     } finally {
       rmSync(dataDir, { recursive: true, force: true });

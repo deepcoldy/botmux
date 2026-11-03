@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
+import { decorateResumeForCliLaunchMode } from '../core/cli-launch-mode.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { localTerminalCapable } from '../core/local-terminal-opener.js';
 import type { DaemonSession } from '../core/types.js';
@@ -21,6 +22,7 @@ export const LOCAL_CLI_IDS = [
   'genius',
   'opencode',
   'opencode2',
+  'mimocode',
   'antigravity',
   'mtr',
   'hermes',
@@ -30,6 +32,7 @@ export const LOCAL_CLI_IDS = [
   'oh-my-pi',
   'kimi',
   'grok',
+  'zcode',
 ] as const satisfies readonly CliId[];
 
 export type LocalCliId = typeof LOCAL_CLI_IDS[number];
@@ -47,14 +50,17 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'genius': 'genius --resume',
   'opencode': 'opencode -s',
   'opencode2': 'opencode2 -s',
+  'mimocode': 'mimo -s',
   'antigravity': 'agy --conversation',
   'mtr': 'mtr --session',
   'hermes': 'hermes --resume',
   'traex': 'traex resume',
   'pi': 'pi --session-id',
   'copilot': 'copilot --resume',
-  'kimi': 'kimi --resume',
+  // Kimi 0.31 has no --resume; -S/--session resumes an existing session_<uuid>.
+  'kimi': 'kimi --session',
   'grok': 'grok --resume',
+  'zcode': 'zcode --resume',
 };
 
 type AdoptedMetadata = NonNullable<DaemonSession['adoptedFrom']> | NonNullable<DaemonSession['session']['adoptedFrom']>;
@@ -198,6 +204,16 @@ function quoteKnownResumeCommand(cliId: LocalCliId, raw: string): string | null 
     };
     return decodePath(match[1]) !== null && decodePath(match[2]) !== null ? raw : null;
   }
+  if (cliId === 'pi' && raw.includes(' --session-dir ')) {
+    // A session that keeps its history in its own dir (it ran under the file
+    // sandbox): both values come quoted from the adapter.
+    const quoted = String.raw`'(?:[^']|'\\'')*'`;
+    const match = new RegExp(`^pi --session-id (${quoted}) --session-dir (${quoted})(?![\\s\\S])`).exec(raw);
+    if (!match) return null;
+    const decode = (token: string): string => token.slice(1, -1).split("'\\''").join("'");
+    const dir = decode(match[2]);
+    return decode(match[1]) && isAbsolute(dir) && shellQuote(dir) === match[2] ? raw : null;
+  }
   const prefix = `${RESUME_COMMAND_PREFIXES[cliId]} `;
   if (!raw.startsWith(prefix)) return null;
   const sid = raw.slice(prefix.length).trim();
@@ -264,7 +280,12 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
     return fail('missing_attach_target', 'This session has no persistent backend attach target.');
   }
   if (backendType === 'tmux') {
-    return { ok: true, command: `tmux attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
+    // A session created after the dedicated socket lives on `-L <socketName>`;
+    // older rows (no socketName) stay on the default server.
+    const socket = target.backendType === 'tmux' && target.socketName !== undefined
+      ? ` -L ${shellQuote(target.socketName)}`
+      : '';
+    return { ok: true, command: `tmux${socket} attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
   }
   if (backendType === 'herdr') {
     if (target.backendType === 'herdr' && target.agentName) {
@@ -275,8 +296,8 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
     }
     return { ok: true, command: `herdr session attach ${shellQuote(target.sessionName)}` };
   }
-  if (backendType === 'zmx') {
-    const socketEnv = ['ZMX_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR']
+  if (target.backendType === 'zmx') {
+    const socketEnv = (target.socketDir === undefined ? ['ZMX_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR'] : [])
       .flatMap((key) => process.env[key] ? [`export ${key}=${shellQuote(process.env[key]!)}`] : []);
     const prelude = [
       'unset ZMX_SESSION ZMX_SESSION_PREFIX',
@@ -288,6 +309,7 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
       '__zmx-attach-managed',
       shellQuote(target.sessionName),
       shellQuote(ds.session.sessionId),
+      ...(target.socketDir !== undefined ? [shellQuote(target.socketDir)] : []),
     ].join(' ');
     return {
       ok: true,
@@ -350,8 +372,10 @@ function buildLocalCliResumeCommand(
   const quotedResumeCommand = quoteKnownResumeCommand(cliId, rawResume);
   if (!quotedResumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
   const resumeCommand = replaceFrozenResumeExecutable(cliId, quotedResumeCommand, runtimeExecutable);
+  const launchMode = ds.session.cliLaunchMode ?? ds.initConfig?.cliLaunchMode;
+  const decoratedResumeCommand = decorateResumeForCliLaunchMode(resumeCommand, launchMode);
 
-  return { ok: true, command: `cd ${shellQuote(workingDir)} && ${resumeCommand}` };
+  return { ok: true, command: `cd ${shellQuote(workingDir)} && ${decoratedResumeCommand}` };
 }
 
 /** Pure preflight for local CLI opening. It performs the same attach/resume

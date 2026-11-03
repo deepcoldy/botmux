@@ -1,10 +1,10 @@
 import type React from 'react';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
-import { createPortal } from 'react-dom';
-import { FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader } from './dashboard-components.js';
-import { botAvatarHtml } from './ui.js';
+import { FieldTitle, LoadingState, RefreshIconButton, SectionHeader } from './dashboard-components.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
+import { ModalDialog } from './modal-dialog.js';
 import { SkillPacksTab } from './skills/skill-packs-tab.js';
 import { detectSourceType, SkillLibraryTab } from './skills/skill-library-tab.js';
 import { BotAssignmentsTab } from './skills/bot-assignments-tab.js';
@@ -22,9 +22,9 @@ import {
 } from './skills/shared.js';
 import { useSkillsData } from './skills/use-skills-data.js';
 import { toast } from './toast.js';
+import { requestJson } from './dashboard-api.js';
 import type {
   BotRow,
-  DashboardRequestError,
   DeliveryMode,
   InstallSkillCandidate,
   ProjectTrustMode,
@@ -42,21 +42,6 @@ function installedSkillsColumnCount(width: number): number {
   if (width <= 620) return 1;
   if (width <= 980) return 2;
   return 3;
-}
-
-async function jsonRequest(url: string, init: RequestInit): Promise<any> {
-  const r = await fetch(url, {
-    ...init,
-    headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
-  });
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok || body.ok === false) {
-    const err = new Error(body?.error ?? `HTTP ${r.status}`) as DashboardRequestError;
-    err.status = r.status;
-    err.body = body;
-    throw err;
-  }
-  return body;
 }
 
 function statusClass(status: StatusMessage): string {
@@ -116,6 +101,24 @@ interface SkillsInstallPanelProps {
   onCloseInstallSelection?: () => void;
   onInstall: () => void;
   onOpenNativeDiscovery: () => void;
+}
+
+/**
+ * 更新一个已安装 Skill：起 update 任务并等它跑完。成功后提示「运行中的会话要 /restart
+ * 或新开会话」——运行中的会话用的是技能快照（core/skills/snapshot.ts），更新不会推给它们。
+ * 失败原样抛给调用方（toast）。
+ */
+export async function runSkillUpdate(name: string, deps: {
+  request(url: string, init: { method: string; body: string }): Promise<any>;
+  waitForJob(job: SkillJob): Promise<SkillJob | null>;
+  isMounted(): boolean;
+  setStatus(status: StatusMessage): void;
+  tr(key: string): string;
+}): Promise<void> {
+  const body = await deps.request(`/api/skills/${encodeURIComponent(name)}/update`, { method: 'POST', body: '{}' });
+  if (!deps.isMounted()) return;
+  const done = await deps.waitForJob(body.job as SkillJob);
+  if (done && deps.isMounted()) deps.setStatus({ text: `${deps.tr('skills.saved')} ${deps.tr('skills.updateRestartHint')}`, ok: true });
 }
 
 export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
@@ -809,35 +812,19 @@ export function RemoveSkillsDialog(props: {
   onConfirm(force: boolean): void;
 }): React.JSX.Element {
   const tr = useT();
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
   const names = props.names ?? [];
   const force = props.references.length > 0;
   const visibleNames = names.slice(0, 3);
   const referencedBotCount = new Set(props.references.flatMap(reference => reference.bots)).size;
   const referencedPackCount = new Set(props.references.flatMap(reference => reference.packs)).size;
 
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    if (props.names && !dialog.open) {
-      try { dialog.showModal(); } catch { /* dialog may already be opening */ }
-    } else if (!props.names && dialog.open) {
-      dialog.close();
-    }
-  }, [props.names]);
-
   return (
-    <dialog
+    <ModalDialog
       className="skills-remove-dialog"
       data-remove-skills-dialog
-      ref={dialogRef}
-      onCancel={event => {
-        event.preventDefault();
-        if (!props.busy) props.onCancel();
-      }}
-      onClick={event => {
-        if (event.target === event.currentTarget && !props.busy) props.onCancel();
-      }}
+      open={!!props.names}
+      // busy 时 Esc / 遮罩点击都不关（Esc 仍被拦截，避免浏览器自己关掉）
+      onRequestClose={() => { if (!props.busy) props.onCancel(); }}
     >
       <article>
         <header>
@@ -901,7 +888,7 @@ export function RemoveSkillsDialog(props: {
           </button>
         </footer>
       </article>
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -911,7 +898,6 @@ export function SkillsPage() {
   const tr = useT();
   const mountedRef = useRef(true);
   const timersRef = useRef<Set<number>>(new Set());
-  const discoveryDialogRef = useRef<HTMLDialogElement | null>(null);
 
   const {
     skills, nativeSkillGroups, bots, packs, trustProjectSkills, delivery,
@@ -922,7 +908,12 @@ export function SkillsPage() {
   // Cross-tab navigation: a chip click in one table jumps to another tab with
   // context (search prefill / focused entity). The target tab consumes the
   // intent once so it doesn't re-apply on later visits.
-  const [navIntent, setNavIntent] = useState<SkillsNavIntent | null>(null);
+  // `#/skills?skill=<name>`（⌘K 全局搜索）：落在 Skill 库并只看这一个（可清除的名字筛选）。
+  const [navIntent, setNavIntent] = useState<SkillsNavIntent | null>(() => {
+    const skill = hashQueryParam('skill');
+    return skill ? { tab: 'library', libraryFilterSkills: [skill] } : null;
+  });
+  useEffect(() => { clearHashQueryParam('skill'); }, []);
   // Sticky install target: when a missing skill sends the user to the install
   // wizard, the discovery result preselects just that skill. Prefill only —
   // installing still requires the user to point at a source and confirm.
@@ -1030,16 +1021,6 @@ export function SkillsPage() {
     return () => window.clearTimeout(id);
   }, [installedStatus, removingNames]);
 
-  useEffect(() => {
-    const dialog = discoveryDialogRef.current;
-    if (!dialog) return;
-    if (discoveryOpen && !dialog.open) {
-      try { dialog.showModal(); } catch { /* dialog may already be closing */ }
-    } else if (!discoveryOpen && dialog.open) {
-      dialog.close();
-    }
-  }, [discoveryOpen, activeKey]);
-
   async function waitForSkillJob(job: SkillJob, setStatus: (status: StatusMessage) => void, refreshOnSuccess = true): Promise<SkillJob | null> {
     let current = job;
     setStatus({ text: tr('skills.jobRunning'), ok: true });
@@ -1055,7 +1036,7 @@ export function SkillsPage() {
       }
       await delay(800);
       if (!mountedRef.current) return null;
-      const body = await jsonRequest(`/api/skills/jobs/${encodeURIComponent(current.id)}`, { method: 'GET' });
+      const body = await requestJson(`/api/skills/jobs/${encodeURIComponent(current.id)}`, { method: 'GET' });
       if (!mountedRef.current) return null;
       current = body.job as SkillJob;
     }
@@ -1111,7 +1092,7 @@ export function SkillsPage() {
     setInstallDiscovering(true);
     setInstallStatus({ text: tr('skills.scanning'), ok: true });
     try {
-      const body = await jsonRequest('/api/skills/discover', {
+      const body = await requestJson('/api/skills/discover', {
         method: 'POST',
         body: JSON.stringify(sourceRequestBody()),
       });
@@ -1159,7 +1140,7 @@ export function SkillsPage() {
   ): Promise<string[] | null> {
     setInstallBusy(true);
     try {
-      const body = await jsonRequest('/api/skills/install', {
+      const body = await requestJson('/api/skills/install', {
         method: 'POST',
         body: JSON.stringify(installRequestBody(skillNames, fullDepth)),
       });
@@ -1241,7 +1222,7 @@ export function SkillsPage() {
   }
 
   async function createPackFromInstalledSkills(input: { id: string; name: string; skillNames: string[] }): Promise<void> {
-    await jsonRequest('/api/skill-packs', {
+    await requestJson('/api/skill-packs', {
       method: 'POST',
       body: JSON.stringify({
         id: input.id,
@@ -1263,7 +1244,7 @@ export function SkillsPage() {
     setDiscoveryBusy(true);
     try {
       setInstallStatus({ text: tr('skills.discoverRegisteringBatch', { total: selected.length }), ok: true });
-      await jsonRequest('/api/skills/install-local-links', {
+      await requestJson('/api/skills/install-local-links', {
         method: 'POST',
         body: JSON.stringify({ sources: selected }),
       });
@@ -1282,7 +1263,7 @@ export function SkillsPage() {
     if (trustProjectSkills === next) return;
     setGlobalBusy('project');
     try {
-      const body = await jsonRequest('/api/skills/global', {
+      const body = await requestJson('/api/skills/global', {
         method: 'PUT',
         body: JSON.stringify({ trustProjectSkills: next }),
       });
@@ -1299,7 +1280,7 @@ export function SkillsPage() {
     if (delivery === next) return;
     setGlobalBusy('delivery');
     try {
-      const body = await jsonRequest('/api/skills/global', {
+      const body = await requestJson('/api/skills/global', {
         method: 'PUT',
         body: JSON.stringify({ delivery: next }),
       });
@@ -1315,9 +1296,13 @@ export function SkillsPage() {
   async function updateSkill(name: string): Promise<void> {
     setSkillBusy(`${name}:update`);
     try {
-      const body = await jsonRequest(`/api/skills/${encodeURIComponent(name)}/update`, { method: 'POST', body: '{}' });
-      if (!mountedRef.current) return;
-      await waitForSkillJob(body.job as SkillJob, setInstallStatus);
+      await runSkillUpdate(name, {
+        request: requestJson,
+        waitForJob: job => waitForSkillJob(job, setInstallStatus),
+        isMounted: () => mountedRef.current,
+        setStatus: setInstallStatus,
+        tr,
+      });
     } catch (err: any) {
       if (mountedRef.current) toast(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, { kind: 'error' });
     } finally {
@@ -1352,7 +1337,7 @@ export function SkillsPage() {
     try {
       // POST, not DELETE: the platform dashboard proxy drops DELETE request
       // bodies (hangs the machine-side read until the gateway 504s).
-      const body = await jsonRequest('/api/skills/remove', {
+      const body = await requestJson('/api/skills/remove', {
         method: 'POST',
         body: JSON.stringify({ names, force }),
       });
@@ -1422,7 +1407,7 @@ export function SkillsPage() {
       // selectors (e.g. set via CLI) are retained for forward/downgrade compat.
       const currentBot = botsRef.current.find(bot => bot.larkAppId === appId);
       const mergedInclude = mergeBotAssignmentSelectors(currentBot?.skills, skillNames, packIdsList);
-      const body = await jsonRequest(`/api/bots/${encodeURIComponent(appId)}/skills`, {
+      const body = await requestJson(`/api/bots/${encodeURIComponent(appId)}/skills`, {
         method: 'PUT',
         body: JSON.stringify({
           action: 'set',
@@ -1478,7 +1463,7 @@ export function SkillsPage() {
   async function setBotInjection(appId: string, value: 'global' | 'prompt' | 'off'): Promise<void> {
     setBotStatuses(statuses => ({ ...statuses, [appId]: null }));
     try {
-      await jsonRequest(`/api/bots/${encodeURIComponent(appId)}/skill-injection`, {
+      await requestJson(`/api/bots/${encodeURIComponent(appId)}/skill-injection`, {
         method: 'PUT',
         body: JSON.stringify({ skillInjection: value }),
       });
@@ -1702,14 +1687,11 @@ export function SkillsPage() {
             />
           )}
 
-          <dialog
+          <ModalDialog
             className="skills-discovery-dialog"
             id="skills-discovery-dialog"
-            ref={discoveryDialogRef}
+            open={discoveryOpen}
             onClose={() => setDiscoveryOpen(false)}
-            onClick={event => {
-              if (event.target === event.currentTarget) setDiscoveryOpen(false);
-            }}
           >
             <article>
               <header>
@@ -1817,7 +1799,7 @@ export function SkillsPage() {
                 </button>
               </footer>
             </article>
-          </dialog>
+          </ModalDialog>
         </>
       )}
     </div>
@@ -1834,267 +1816,6 @@ export function SkillsPage() {
       </div>
       <div id="skills-body">{body}</div>
     </section>
-  );
-}
-
-function sameSkillSelection(left: Set<string>, right: string[]): boolean {
-  return left.size === right.length && right.every(name => left.has(name));
-}
-
-export function SkillMultiPicker(props: {
-  botId: string;
-  names: string[];
-  installedNames: Set<string>;
-  skills: SkillRow[];
-  busy: boolean;
-  onSave(names: string[]): Promise<void>;
-}): React.JSX.Element {
-  const tr = useT();
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const [draft, setDraft] = useState<Set<string>>(() => new Set(props.names));
-  const [position, setPosition] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
-  const currentNamesKey = props.names.join('\n');
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  const options = useMemo(() => {
-    const byName = new Map(props.skills.map(skill => [skill.name, skill]));
-    for (const name of props.names) {
-      if (!byName.has(name)) byName.set(name, { name });
-    }
-    return [...byName.values()].sort((left, right) => left.name.localeCompare(right.name));
-  }, [props.names, props.skills]);
-  const filteredOptions = useMemo(() => {
-    if (!normalizedQuery) return options;
-    return options.filter(skill => `${skill.name} ${skill.description || ''}`.toLocaleLowerCase().includes(normalizedQuery));
-  }, [normalizedQuery, options]);
-  const dirty = !sameSkillSelection(draft, props.names);
-
-  const updatePosition = useCallback(() => {
-    const trigger = triggerRef.current;
-    if (!trigger || typeof window === 'undefined') return;
-    const rect = trigger.getBoundingClientRect();
-    const edge = 12;
-    const gap = 7;
-    const width = Math.min(370, Math.max(260, window.innerWidth - edge * 2));
-    const left = Math.min(Math.max(edge, rect.left), Math.max(edge, window.innerWidth - width - edge));
-    const spaceAbove = Math.max(0, rect.top - gap - edge);
-    const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - gap - edge);
-    const placeAbove = spaceAbove > spaceBelow;
-    const available = placeAbove ? spaceAbove : spaceBelow;
-    const desired = 118 + Math.min(options.length, 5) * 42;
-    const height = Math.max(180, Math.min(desired, available));
-    setPosition({
-      left,
-      top: placeAbove ? Math.max(edge, rect.top - gap - height) : rect.bottom + gap,
-      width,
-      height,
-    });
-  }, [options.length]);
-
-  useEffect(() => {
-    if (!open) setDraft(new Set(props.names));
-  }, [currentNamesKey, open]);
-
-  useEffect(() => {
-    if (!open || typeof document === 'undefined') return undefined;
-    const closeOnOutsideClick = (event: PointerEvent) => {
-      if (rootRef.current?.contains(event.target as Node) || popoverRef.current?.contains(event.target as Node)) return;
-      setOpen(false);
-      setQuery('');
-      setDraft(new Set(props.names));
-    };
-    document.addEventListener('pointerdown', closeOnOutsideClick);
-    window.addEventListener('resize', updatePosition);
-    window.addEventListener('scroll', updatePosition, true);
-    updatePosition();
-    return () => {
-      document.removeEventListener('pointerdown', closeOnOutsideClick);
-      window.removeEventListener('resize', updatePosition);
-      window.removeEventListener('scroll', updatePosition, true);
-    };
-  }, [currentNamesKey, open, updatePosition]);
-
-  function openPicker(): void {
-    setDraft(new Set(props.names));
-    setQuery('');
-    updatePosition();
-    setOpen(true);
-  }
-
-  function cancel(): void {
-    setDraft(new Set(props.names));
-    setQuery('');
-    setOpen(false);
-  }
-
-  function toggle(name: string): void {
-    setDraft(current => {
-      const next = new Set(current);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      return next;
-    });
-  }
-
-  async function save(): Promise<void> {
-    const names = [...draft].sort((left, right) => left.localeCompare(right));
-    try {
-      await props.onSave(names);
-      setQuery('');
-      setOpen(false);
-    } catch {
-      // The card-level status message explains the failure; keep the draft open for retry.
-    }
-  }
-
-  const triggerLabel = props.names.length === 0
-    ? tr('skills.pickerPlaceholder')
-    : props.names.length === 1
-      ? props.names[0]
-      : tr('skills.pickerSelectedCount', { count: props.names.length });
-
-  const popover = open ? (
-    <div
-      ref={popoverRef}
-      className="skills-multi-picker-popover"
-      style={position ? { left: position.left, top: position.top, width: position.width, height: position.height } : undefined}
-    >
-      <div className="skills-multi-picker-head">
-        <label className="skills-multi-picker-search">
-          <span className="skills-multi-picker-search-icon" aria-hidden="true" />
-          <input
-            type="search"
-            data-action="search-skills"
-            autoFocus
-            autoComplete="off"
-            value={query}
-            placeholder={tr('skills.pickerSearchPlaceholder')}
-            onChange={event => setQuery(event.currentTarget.value)}
-            onKeyDown={event => {
-              if (event.key === 'Escape') {
-                event.preventDefault();
-                cancel();
-              }
-            }}
-          />
-        </label>
-        <div className="skills-multi-picker-meta">
-          <span>{tr('skills.pickerSelectionMeta', { selected: draft.size, total: options.length })}</span>
-          {draft.size > 0 ? (
-            <button type="button" className="skills-multi-picker-clear" data-action="clear-skill-selection" onClick={() => setDraft(new Set())}>
-              {tr('skills.pickerClear')}
-            </button>
-          ) : null}
-        </div>
-      </div>
-      <div className="skills-multi-picker-options" role="listbox" aria-label={tr('skills.priority')} aria-multiselectable="true">
-        {filteredOptions.map(skill => {
-          const selected = draft.has(skill.name);
-          const dangling = !props.installedNames.has(skill.name);
-          return (
-            <button
-              type="button"
-              className={`skills-multi-picker-option${selected ? ' selected' : ''}${dangling ? ' dangling' : ''}`}
-              role="option"
-              aria-selected={selected}
-              data-skill-name={skill.name}
-              key={skill.name}
-              onClick={() => toggle(skill.name)}
-            >
-              <span className="skills-multi-picker-check" aria-hidden="true" />
-              <span className="skills-multi-picker-option-copy">
-                <span><b>{skill.name}</b>{dangling ? <em>{tr('skills.dangling')}</em> : null}</span>
-                {skill.description ? <small>{skill.description}</small> : null}
-              </span>
-            </button>
-          );
-        })}
-        {filteredOptions.length === 0 ? <p className="skills-multi-picker-empty">{tr('skills.pickerNoResults')}</p> : null}
-      </div>
-      <footer className="skills-multi-picker-actions">
-        <button type="button" className="ghost" data-action="cancel-skill-selection" disabled={props.busy} onClick={cancel}>{tr('skills.cancel')}</button>
-        <button type="button" className="primary" data-action="save-skill-selection" disabled={!dirty || props.busy} onClick={() => void save()}>
-          {props.busy ? tr('skills.saving') : tr('skills.saveSelection')}
-        </button>
-      </footer>
-    </div>
-  ) : null;
-
-  return (
-    <div ref={rootRef} className={`skills-multi-picker${open ? ' open' : ''}`} data-skill-picker={props.botId}>
-      <button
-        ref={triggerRef}
-        type="button"
-        className="skills-multi-picker-trigger"
-        data-action="open-skill-picker"
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        disabled={props.busy}
-        onClick={() => open ? cancel() : openPicker()}
-      >
-        <span className="skills-multi-picker-trigger-copy">
-          <b>{triggerLabel}</b>
-          <small>{tr('skills.pickerTriggerHint')}</small>
-        </span>
-        <span className="skills-multi-picker-chevron" aria-hidden="true" />
-      </button>
-      {popover && typeof document !== 'undefined' ? createPortal(popover, document.body) : popover}
-    </div>
-  );
-}
-
-export function BotPolicyCard(props: {
-  bot: BotRow;
-  installedNames: Set<string>;
-  skills: SkillRow[];
-  status: StatusMessage;
-  busyKey: string | null;
-  onSave(appId: string, names: string[]): Promise<void>;
-}) {
-  const tr = useT();
-  const { bot, installedNames, skills, status, busyKey, onSave } = props;
-  const label = bot.botName ?? bot.larkAppId;
-  const names = priorityNames(bot.skills);
-
-  if (bot.error) {
-    return (
-      <article className="bd-card skills-bot-card" data-appid={bot.larkAppId}>
-        <header>
-          <Html html={botAvatarHtml({ name: label, larkAppId: bot.larkAppId, size: 'sm' })} />
-          <strong>{label}</strong>
-        </header>
-        <p className="hint-warn-inline">{bot.error}</p>
-      </article>
-    );
-  }
-
-  return (
-    <article className="bd-card skills-bot-card" data-appid={bot.larkAppId}>
-      <header className="skills-bot-head">
-        <Html html={botAvatarHtml({ name: label, larkAppId: bot.larkAppId, size: 'sm', dot: 'ok' })} />
-        <div className="skills-bot-title-line">
-          <strong>{label}</strong>
-          <span className="skills-count-pill">{tr('skills.skillCount', { count: names.length })}</span>
-        </div>
-      </header>
-      <section className="skills-policy-panel">
-        <div className="skills-priority-head">
-          <h3 className="skills-priority-title">{tr('skills.priority')}</h3>
-        </div>
-        <SkillMultiPicker
-          botId={bot.larkAppId}
-          names={names}
-          installedNames={installedNames}
-          skills={skills}
-          busy={busyKey === `${bot.larkAppId}:set`}
-          onSave={next => onSave(bot.larkAppId, next)}
-        />
-      </section>
-      <span className={statusClass(status)} data-bot-status>{status?.text ?? ''}</span>
-    </article>
   );
 }
 

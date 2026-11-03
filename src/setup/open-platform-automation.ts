@@ -10,7 +10,6 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import bundledScopeManifest from './lark-scopes.json' with { type: 'json' };
 // Plain ESM import, deliberately: `--compile` traces it into the binary, while tsc /
@@ -42,6 +41,12 @@ export const BOT_BASELINE_APP_EVENTS = [
   'im.message.reaction.deleted_v1',
 ] as const;
 
+/** 消息编辑事件名（用户「修改」已发送消息时推送）。 */
+export const MESSAGE_UPDATED_EVENT = 'im.message.updated_v1';
+
+/** 消息撤回事件名（撤回已发送消息时推送）。群聊上下文共享据此给记录写 tombstone。 */
+export const MESSAGE_RECALLED_EVENT = 'im.message.recalled_v1';
+
 /**
  * Best-effort app events: subscribed alongside the baseline but NEVER part of
  * the fail-closed verification (missingBaselineEvents / MANAGED_VERIFIED_EVENT_COUNT).
@@ -53,6 +58,16 @@ export const BOT_BASELINE_APP_EVENTS = [
 export const BOT_OPTIONAL_APP_EVENTS = [
   'im.chat.member.user.added_v1',
   'im.chat.member.user.deleted_v1',
+  // 消息编辑（修改已发送消息，典型场景：发出时没 @ bot，编辑补 @ 后期望触发任务）。
+  // 放 OPTIONAL 而非 BASELINE：① dispatcher 对缺订阅天然静默降级（只是编辑补 @ 不生效，
+  // 不影响收消息主链路）；② 不增加 MANAGED_VERIFIED_EVENT_COUNT，避免把存量 bot 已落账
+  // 的 managed activation 校验打回。新建 bot 会随清单一起订阅；存量 bot 由启动时的
+  // ensureMessageUpdatedEventSubscribed 经缓存开放平台登录态增量补订阅。
+  MESSAGE_UPDATED_EVENT,
+  // 消息撤回：只服务群聊上下文共享的 tombstone，缺订阅时记录里撤回的消息会一直保留
+  //（dispatcher 对缺订阅同样静默降级）。存量 bot 由启动时的
+  // ensureMessageRecalledEventSubscribed 增量补订阅，并返回是否覆盖的状态。
+  MESSAGE_RECALLED_EVENT,
 ] as const;
 
 /** 缺了它 daemon 完全收不到消息——回读确认失败时整个自动配置 fail-closed。 */
@@ -322,6 +337,11 @@ export interface OpenPlatformAutomationOptions {
   grantedScopeNames?: { tenant: string[]; user: string[] };
   pollIntervalMs?: number;
   maxWaitMs?: number;
+  /**
+   * 回调白名单恢复流程的总截止时间（毫秒），缺省仍为 15 秒。
+   * 调用方可传更紧的预算；测试也用它验证在飞请求的取消。
+   */
+  redirectWriteTimeoutMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
   /** Emitted once only after Feishu reports this exact QR as scanned. */
   onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
@@ -884,7 +904,11 @@ export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | nu
 }
 
 /** `automateOpenPlatformSetup` 内联 postJson / `OpenPlatformApiClient.postJson` 的公共形状。 */
-export type OpenPlatformPostJson = (path: string, body?: unknown) => Promise<unknown>;
+export interface OpenPlatformPostOptions {
+  signal?: AbortSignal;
+}
+
+export type OpenPlatformPostJson = (path: string, body?: unknown, options?: OpenPlatformPostOptions) => Promise<unknown>;
 
 export interface RedirectWhitelistWriteResult {
   /**
@@ -926,6 +950,8 @@ export function missingRedirectUrls(wanted: string[], written: string[]): string
 }
 
 export interface WriteRedirectWhitelistOptions {
+  /** 整个读→合并→写→回读及恢复流程的截止时间，默认 15 秒。 */
+  timeoutMs?: number;
   /**
    * 允许「读不出线上现值时直接全量覆盖写」。
    *
@@ -957,10 +983,12 @@ export interface WriteRedirectWhitelistOptions {
  * `<origin>/app`，可对任意 appId 调用），而不是 `automateOpenPlatformSetup` 里那份
  * referer 绑死单个 appId 的内联 postJson。
  *
- * 写失败时**只在「URL 被 console 判非法」这一类错误上**兜底重试一次「线上现值 ∪
+ * 瞬态写入失败会在总截止时间内恢复至多两轮，每轮先重新读取现值再合并写；
+ * 写成功后必须读回确认。权限/登录拒绝不重试，创建/发布等其它 POST 不受影响。
+ * **只在「URL 被 console 判非法」这一类错误上**兜底写一次「线上现值 ∪
  * 127.0.0.1 那条」：`wanted` 里某条 URL 的格式被拒时整批会一起失败，最小集能保住
- * 最核心的粘贴回调链路。网络抖动 / 403 鉴权失败不做第二次改写（见
- * {@link isRedirectUrlRejectedError}）。两次都失败才抛出，由调用方记成 warning
+ * 最核心的粘贴回调链路。网络抖动 / 403 鉴权失败不触发最小集兜底（见
+ * {@link isRedirectUrlRejectedError}）；瞬态恢复由外层重读后合并完成。兜底仍失败则抛出，由调用方记成 warning
  * （不阻断建 bot）。
  */
 export async function writeRedirectWhitelist(
@@ -968,6 +996,82 @@ export async function writeRedirectWhitelist(
   appId: string,
   wanted: string[] = collectBotmuxRedirectUrls(),
   options: WriteRedirectWhitelistOptions = {},
+): Promise<RedirectWhitelistWriteResult> {
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  const deadline = setTimeout(() => controller.abort(new Error('回调白名单配置超时')), timeoutMs);
+  deadline.unref?.();
+  const boundedPostJson: OpenPlatformPostJson = async (path, body) => {
+    controller.signal.throwIfAborted();
+    const result = await postJson(path, body, { signal: controller.signal });
+    controller.signal.throwIfAborted();
+    return result;
+  };
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        // 每一轮都重读现值；结果未知时可能已写入，也可能有人新增了自定义地址。
+        const result = await writeRedirectWhitelistOnce(boundedPostJson, appId, wanted, {
+          ...options,
+          // 新应用允许的初始盲写不能延伸到恢复阶段：前一轮可能已经落地。
+          allowBlindWrite: attempt === 0 && options.allowBlindWrite === true,
+        });
+        controller.signal.throwIfAborted();
+        if (result.status === 'skipped_unreadable') return result;
+        if (result.status === 'unchanged') {
+          // 前一轮可能已写入、但响应丢失；保守计作变更，避免调用方跳过发版。
+          return attempt === 0 ? result : { ...result, status: 'updated' };
+        }
+        const live = extractOpenPlatformRedirectUrls(
+          await boundedPostJson(`/developers/v1/safe_setting/${appId}`, {}),
+        );
+        if (live === null) throw new Error('回调白名单写入已提交，但无法读回确认');
+        if (missingRedirectUrls(result.redirectUrls, live).length > 0) {
+          throw new RedirectWhitelistNotConfirmedError('回调白名单写入已提交，但回读仍缺少地址');
+        }
+        return { ...result, redirectUrls: live };
+      } catch (err) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isRetryableRedirectWriteError(err)) throw err;
+        await waitForRedirectRetry(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt], controller.signal);
+      }
+    }
+  } finally {
+    clearTimeout(deadline);
+  }
+}
+
+class RedirectWhitelistNotConfirmedError extends Error {}
+
+function isRetryableRedirectWriteError(err: unknown): boolean {
+  if (openPlatformWebSessionExpired(err) || openPlatformOwnerAccessDenied(err)) return false;
+  if (err instanceof OpenPlatformApiError) {
+    if (err.status === 401 || err.status === 403) return false;
+    return err.status >= 500 || asRecord(err.payload).code === 10008;
+  }
+  return err instanceof RedirectWhitelistNotConfirmedError || isLikelyTransientNetworkError(err);
+}
+
+function waitForRedirectRetry(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
+async function writeRedirectWhitelistOnce(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  wanted: string[],
+  options: WriteRedirectWhitelistOptions,
 ): Promise<RedirectWhitelistWriteResult> {
   let existing: string[] | null = null;
   let readError: string | undefined;
@@ -1410,7 +1514,7 @@ export async function automateOpenPlatformSetup(
     };
   }
 
-  const postJson = async (path: string, body?: unknown): Promise<unknown> => {
+  const postJson = async (path: string, body?: unknown, options: OpenPlatformPostOptions = {}): Promise<unknown> => {
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -1422,6 +1526,7 @@ export async function automateOpenPlatformSetup(
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     let data: any;
     try {
@@ -1462,6 +1567,7 @@ export async function automateOpenPlatformSetup(
     const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
       // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
       allowBlindWrite: options.appJustCreated === true,
+      timeoutMs: options.redirectWriteTimeoutMs,
     });
     // 只有真的发了写请求（updated / updated_fallback）才算改过；unchanged（幂等
     // 短路）与 skipped_unreadable（一次都没写）都不置位。
@@ -2047,7 +2153,7 @@ export interface OpenPlatformAppSummary {
 
 export interface OpenPlatformApiClient {
   apiOrigin: string;
-  postJson(path: string, body?: unknown): Promise<unknown>;
+  postJson: OpenPlatformPostJson;
   /**
    * 语义幂等的 console POST（重复调用无副作用：设值型 switch、只读拉取）。
    * 与 GET/HEAD 同权享受完整的瞬态错误退避重试，且**预算只在 fetchRaw 这一层**
@@ -2094,7 +2200,7 @@ export async function createOpenPlatformApiClient(
   }
 
   const request = async (
-    path: string, body?: BodyInit, contentType?: string, opts: { idempotent?: boolean } = {},
+    path: string, body?: BodyInit, contentType?: string, opts: { idempotent?: boolean; signal?: AbortSignal } = {},
   ): Promise<unknown> => {
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
@@ -2107,6 +2213,7 @@ export async function createOpenPlatformApiClient(
         ...(contentType ? { 'content-type': contentType } : {}),
       },
       body,
+      ...(opts.signal ? { signal: opts.signal } : {}),
     }, 10, opts);
     let data: any;
     try {
@@ -2123,8 +2230,8 @@ export async function createOpenPlatformApiClient(
     return data;
   };
 
-  const postJson = async (path: string, body?: unknown): Promise<unknown> =>
-    request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json');
+  const postJson: OpenPlatformPostJson = async (path, body, opts = {}) =>
+    request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json', opts);
   const postJsonIdempotent = async (path: string, body?: unknown): Promise<unknown> =>
     request(
       path,
@@ -2203,7 +2310,7 @@ export type CreateFeishuOpenPlatformAppResult =
 export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOptions {
   name: string;
   description?: string;
-  /** 测试/定制图标；默认复用 botmux dashboard 的 512x512 favicon。 */
+  /** 测试/定制图标；默认随机一种会话群同款渐变底色 + botmux logo（512x512，见 defaultAppIcon）。 */
   iconFilePath?: string;
   /** Dashboard 表单打开时显示过的缓存身份；创建前必须仍是同一人、同一企业。 */
   expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
@@ -2221,7 +2328,8 @@ class CreatedOpenPlatformAppError extends Error {
 }
 
 /**
- * The default Feishu app icon bytes (512×512 PNG).
+ * The plain botmux favicon (512×512 PNG): the fallback app icon when the random
+ * gradient icon cannot be rendered (see defaultAppIcon).
  *
  * ⚠️ THIS USED TO BE A DISK PATH AND THAT BROKE THE COMPILED BINARY. The old
  * implementation derived candidates from `import.meta.url`:
@@ -2256,6 +2364,21 @@ function defaultBotmuxAppIcon() {
     throw new Error(`botmux 默认应用图标解码后长度异常（${icon.length} != ${BOTMUX_APP_ICON_BYTES}）`);
   }
   return icon;
+}
+
+/**
+ * 新应用的默认图标：沿用会话群/`/g` 建群的头像——botmux logo + 十色渐变底色随机挑一种，
+ * 按开放平台上传要求渲染成 512×512。图标只是装饰，渲染异常时退回纯 favicon，
+ * 不能因此把建 bot 判死。
+ */
+async function defaultAppIcon(): Promise<Uint8Array> {
+  try {
+    const { renderBotAppIconPng } = await import('../services/bot-app-icon.js');
+    return renderBotAppIconPng();
+  } catch (err) {
+    console.warn(`随机渐变应用图标渲染失败，改用 botmux 默认图标: ${safeErrorMessage(err)}`);
+    return defaultBotmuxAppIcon();
+  }
 }
 
 /** The custom/test icon override, read off disk. Fails with the path in the message
@@ -2335,16 +2458,14 @@ export async function createOpenPlatformAppWithClient(
   // `iconFilePath` stays a DISK path: it is the test/custom-icon override, always
   // supplied by a caller that knows the file exists. Only the DEFAULT moved into the
   // module graph — that is the one that has to work inside the compiled binary.
-  //
-  // No explicit `Buffer` annotation on purpose: it widens to `Buffer<ArrayBufferLike>`,
-  // which tsc rejects as a `BlobPart` (SharedArrayBuffer is in that union). Inference
-  // keeps the narrower `Buffer<ArrayBuffer>` both branches actually produce.
   const icon = options.iconFilePath
     ? readIconFile(options.iconFilePath)
-    : defaultBotmuxAppIcon();
+    : await defaultAppIcon();
 
   const form = new FormData();
-  form.append('file', new Blob([icon], { type: 'image/png' }), 'botmux.png');
+  // Copy into a fresh Uint8Array: tsc rejects `Uint8Array<ArrayBufferLike>` as a
+  // `BlobPart` (SharedArrayBuffer is in that union).
+  form.append('file', new Blob([new Uint8Array(icon)], { type: 'image/png' }), 'botmux.png');
   form.append('uploadType', '4'); // Open Platform console enum: Icon
   form.append('isIsv', 'false'); // 企业自建应用
   form.append('scale', JSON.stringify({ width: 512, height: 512 }));
@@ -2439,22 +2560,31 @@ export async function createOpenPlatformAppWithClient(
   }
 }
 
-/**
- * Read-only probe: are this app's VC meeting events (vc.bot.meeting_* +
- * participant_meeting_joined) subscribed, and is event mode the long connection?
- * Uses ONLY the cached Feishu Web session (disableQrLogin) and never publishes a
- * version — so it is safe to call at daemon startup. The caller decides whether
- * to run the full (publishing) automateOpenPlatformSetup based on the result:
- * only when events are actually missing / mode is wrong.
- */
 export type VcMeetingEventProbeResult =
   | { ok: true; missingVcEvents: string[]; eventModeReady: boolean; sessionFile?: string }
   | { ok: false; reason: string; message: string; sessionFile?: string };
 
-export async function probeVcMeetingEventSubscription(
+/**
+ * Read-only probe: which of `eventNames` are missing from this app's event
+ * subscription, and is event mode the long connection? Uses ONLY the cached
+ * Feishu Web session (disableQrLogin) and never publishes a version — safe to
+ * call at daemon startup. The caller decides whether to run the full
+ * (publishing) automateOpenPlatformSetup based on the result.
+ */
+export type AppEventSubscriptionProbeResult =
+  | { ok: true; missingEvents: string[]; eventModeReady: boolean; sessionFile?: string }
+  | { ok: false; reason: string; message: string; sessionFile?: string };
+
+export type AppEventSubscriptionEnsureResult = AppEventSubscriptionProbeResult & {
+  /** Whether event/update returned success, not whether it persisted or was published. */
+  updateSubmitted: boolean;
+};
+
+export async function probeAppEventSubscriptions(
   appId: string,
+  eventNames: readonly string[],
   options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
-): Promise<VcMeetingEventProbeResult> {
+): Promise<AppEventSubscriptionProbeResult> {
   const prepared = await prepareFeishuWebSession({
     ...options,
     disableQrLogin: true,
@@ -2474,13 +2604,79 @@ export async function probeVcMeetingEventSubscription(
     const has = (name: string) => eventState.events.includes(name);
     return {
       ok: true,
-      missingVcEvents: VC_MEETING_BOT_EVENTS.filter(name => !has(name)),
+      missingEvents: eventNames.filter(name => !has(name)),
       eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
       sessionFile: prepared.sessionFile,
     };
   } catch (err: any) {
     return { ok: false, reason: 'api_error', message: `读取事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile };
   }
+}
+
+/**
+ * Add only the requested missing app events using the cached Web session.
+ * Startup repair must not switch transport modes or publish an existing draft:
+ * the event subscription endpoint is the only write allowed here.
+ * Readback describes configuration only; it does not verify publication or delivery.
+ */
+export async function ensureAppEventSubscriptions(
+  appId: string,
+  eventNames: readonly string[],
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<AppEventSubscriptionEnsureResult> {
+  const prepared = await prepareFeishuWebSession({
+    ...options,
+    disableQrLogin: true,
+    disableBytedcliFallback: true,
+  });
+  if (!prepared.ok) {
+    return { ok: false, reason: prepared.reason, message: prepared.message, sessionFile: prepared.sessionFile, updateSubmitted: false };
+  }
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return { ok: false, reason: clientResult.reason, message: clientResult.message, sessionFile: prepared.sessionFile, updateSubmitted: false };
+  }
+  const readEventState = async () => extractOpenPlatformEventState(
+    await clientResult.client.postJson(`/developers/v1/event/${appId}`, { needEventDetail: true }),
+  );
+  const missingEvents = (state: OpenPlatformEventState) => eventNames.filter(name => !state.events.includes(name));
+  let updateSubmitted = false;
+  try {
+    let eventState = await readEventState();
+    const missing = missingEvents(eventState);
+    if (eventState.eventMode === LONG_CONNECTION_EVENT_MODE && missing.length > 0) {
+      await clientResult.client.postJson(
+        `/developers/v1/event/update/${appId}`,
+        buildEventSubscriptionPayload(appId, eventState.eventMode, missing, []),
+      );
+      updateSubmitted = true;
+      // A successful update may not persist; read back the configured events and mode.
+      eventState = await readEventState();
+    }
+    return {
+      ok: true,
+      missingEvents: missingEvents(eventState),
+      eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
+      sessionFile: prepared.sessionFile,
+      updateSubmitted,
+    };
+  } catch (err) {
+    return { ok: false, reason: 'api_error', message: `补齐事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile, updateSubmitted };
+  }
+}
+
+export async function probeVcMeetingEventSubscription(
+  appId: string,
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<VcMeetingEventProbeResult> {
+  const probed = await probeAppEventSubscriptions(appId, VC_MEETING_BOT_EVENTS, options);
+  if (!probed.ok) return probed;
+  return {
+    ok: true,
+    missingVcEvents: probed.missingEvents,
+    eventModeReady: probed.eventModeReady,
+    sessionFile: probed.sessionFile,
+  };
 }
 
 /**

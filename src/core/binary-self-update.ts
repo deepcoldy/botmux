@@ -28,9 +28,9 @@
  * ── THE KEY INSIGHT: BOTH INSTALLERS SHIP THE SAME BINARY ─────────────────────
  * It is tempting to think “npm users update with npm, curl users update with
  * curl”, i.e. that the two installers produce different artifacts. They do not.
- * `npm i -g botmux` has NO `bin` field any more (removed in #1047): it downloads
- * a platform subpackage and its postinstall writes `~/.botmux/bin/botmux` as a
- * launcher that `exec`s that subpackage's compiled binary. `install.sh` downloads
+ * `npm i -g botmux` downloads a platform subpackage; its `bin` is a sh launcher
+ * that resolves and `exec`s that subpackage's compiled binary, and its postinstall
+ * additionally writes `~/.botmux/bin/botmux` as a launcher onto the same binary. `install.sh` downloads
  * the very same compiled binary from the GitHub Release. Same bytes, different
  * location — which is exactly why classifying by MODULE GRAPH cannot work (both
  * report `/`) and classifying by LOCATION can.
@@ -53,25 +53,35 @@
  *           must NOT rewrite the binary ourselves: npm owns that tree, and a
  *           hand-written file there would be clobbered (or worse, left behind at
  *           a version npm's metadata disagrees with).
- *  · curl → replace the binary in place, the same way install.sh does: download
- *           the matching asset, verify its published SHA-256, then atomically
- *           rename over the target. Nothing else owns that path.
+ *  · curl → replace the binary in place. Prefer the configured registry's exact
+ *           platform package (compressed, typically much faster on a local
+ *           mirror), verify its SHA-512 integrity and runtime version, then
+ *           atomically rename. Any registry-path failure falls back to the
+ *           matching GitHub asset + published SHA-256. Nothing else owns that
+ *           path.
  *
- * A shape we cannot positively identify returns null, and every caller keeps its
- * existing "unsupported install" behaviour. Fail closed: guessing wrong here
- * means either writing into a tree npm owns, or downloading a binary for the
- * wrong libc.
+ * Other binary locations require a manual release installation at the default
+ * launcher path. The original binary is retained; scheduled updates are disabled
+ * until the installed release is running.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync,
-  renameSync, rmSync, statSync, chmodSync,
+  createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync,
+  readdirSync, renameSync, rmSync, statSync, chmodSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { GITHUB_REPO } from './restart-report.js';
 import { getReleaseStream, resolveHttpProxy } from './release-download.js';
+import {
+  fetchConfiguredPackageArtifact,
+  parseUpdateTarget,
+  shouldApplySelfUpdate,
+  type ParsedUpdateTarget,
+  type RegistryPackageArtifact,
+} from './update-check.js';
 
 /**
  * Where the running compiled binary lives, and therefore who owns updating it.
@@ -167,6 +177,12 @@ async function sha256File(path: string): Promise<string> {
   return hash.digest('hex');
 }
 
+async function sha512FileBase64(path: string): Promise<string> {
+  const hash = createHash('sha512');
+  await pipeline(createReadStream(path), hash);
+  return hash.digest('base64');
+}
+
 export interface BinarySelfUpdateResult {
   /** The asset that was installed. */
   asset: string;
@@ -174,6 +190,21 @@ export interface BinarySelfUpdateResult {
   target: string;
   /** Bytes written. */
   bytes: number;
+  /** Transport used for the candidate. Registry packages are compressed and
+   *  usually faster on configured mirrors; GitHub remains the fail-safe. */
+  source: 'registry-package' | 'github-release';
+}
+
+export type BinaryUpdatePhase = 'download' | 'checksum' | 'probe' | 'swap';
+
+export interface BinaryUpdateProgress {
+  /** Current stage. `download` events carry live byte counts; later stages
+   *  report the fully-downloaded size so the UI stays busy past 100%. */
+  phase: BinaryUpdatePhase;
+  bytesReceived: number;
+  /** Asset size from the response's Content-Length, or null when the
+   *  (injected or chunked) stream does not announce one. */
+  bytesTotal: number | null;
 }
 
 export interface BinarySelfUpdateDeps {
@@ -181,8 +212,69 @@ export interface BinarySelfUpdateDeps {
   fetchStream?: (url: string) => Promise<NodeJS.ReadableStream>;
   /** Read the published checksum for `asset`, or null when none is published. */
   fetchChecksum?: (url: string) => Promise<string | null>;
+  /** Resolve the exact platform package from the configured registry. Supplying
+   *  `fetchStream` without this hook keeps legacy transport tests offline. */
+  resolveRegistryArtifact?: (
+    packageName: string,
+    version: string,
+  ) => Promise<RegistryPackageArtifact | null>;
+  /** Fetch the configured-registry package tarball (injected for tests). */
+  fetchRegistryStream?: (url: string) => Promise<NodeJS.ReadableStream>;
+  /** Extract package/botmux from a verified npm tarball (injected for tests). */
+  extractRegistryBinary?: (archive: string, destinationDir: string) => string;
   /** Execute the downloaded candidate before activation (injected for tests). */
-  probeBinary?: (path: string) => { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stderr?: string | Buffer | null };
+  probeBinary?: (path: string) => { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stdout?: string | Buffer | null; stderr?: string | Buffer | null };
+  /** Observe download byte counts and stage transitions (dashboard progress). */
+  onProgress?: (progress: BinaryUpdateProgress) => void;
+}
+
+function extractRegistryBinaryWithTar(archive: string, destinationDir: string): string {
+  // SHA-512 pins the archive to the registry manifest. Intermediate archive
+  // members rely on the host tar's path protections; check the final file below.
+  const result = spawnSync('tar', [
+    '-xzf', archive,
+    '-C', destinationDir,
+    'package/botmux',
+  ], {
+    encoding: 'utf-8',
+    timeout: 30_000,
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) {
+    const detail = String(result.error?.message || result.stderr || `exit ${result.status}`).trim();
+    throw new Error(`registry package extraction failed: ${detail}`);
+  }
+  const candidate = join(destinationDir, 'package', 'botmux');
+  const stat = lstatSync(candidate);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error('registry package candidate is not a regular file');
+  }
+  return candidate;
+}
+
+/** Shared direction guard for implicit latest updates, before any download or
+ * filesystem mutation. Explicit versions may reinstall or roll back. */
+export async function applyStandaloneUpdate(
+  version: string,
+  request: {
+    currentVersion: string;
+    target?: string;
+    updateTarget?: ParsedUpdateTarget;
+  },
+  deps: BinarySelfUpdateDeps = {},
+): Promise<({ skipped: false } & BinarySelfUpdateResult) | {
+  skipped: true;
+  reason: 'already_latest' | 'already_at_target';
+}> {
+  const updateTarget = request.updateTarget ?? parseUpdateTarget()!;
+  const decision = shouldApplySelfUpdate(updateTarget, version, request.currentVersion);
+  const reinstall = version === request.currentVersion
+    && updateTarget.isExplicit && !updateTarget.isChannel;
+  if (!decision.proceed && !reinstall) {
+    return { skipped: true, reason: decision.reason! };
+  }
+  const result = await replaceStandaloneBinary(version, request.target, deps);
+  return { skipped: false, ...result };
 }
 
 /**
@@ -203,9 +295,10 @@ export interface BinarySelfUpdateDeps {
  * would reintroduce the torn-file window this avoids).
  *
  * Checksum verification happens BEFORE the rename, so a truncated or tampered
- * download is discarded while the working binary is still in place. A release
- * that publishes no `.sha256` is a warning, not a failure — matching install.sh,
- * which has always tolerated that.
+ * download is discarded while the working binary is still in place. Registry
+ * packages require their manifest's SHA-512 integrity; the GitHub fallback keeps
+ * its existing `.sha256` verification (missing checksum remains a warning,
+ * matching install.sh, with size + runtime probes still required).
  *
  * ── WHY NO `realpathSync(target)` ─────────────────────────────────────────────
  * Renaming over a SYMLINK replaces the link itself and orphans its target
@@ -227,8 +320,16 @@ export async function replaceStandaloneBinary(
   }
   const base = releaseAssetBaseUrl(version);
   const proxy = resolveHttpProxy();
+  const registryProxy = resolveHttpProxy({ includeConfig: false });
   const fetchStream = deps.fetchStream
     ?? (async (url: string) => await getReleaseStream(url, proxy, SELF_UPDATE_UA));
+  const fetchRegistryStream = deps.fetchRegistryStream
+    ?? (async (url: string) => await getReleaseStream(url, registryProxy, SELF_UPDATE_UA, 5, { respectNoProxy: true }));
+  // Existing tests inject the GitHub stream. Treat that as a complete transport
+  // override unless they explicitly opt into the registry-package path too.
+  const resolveRegistryArtifact = deps.resolveRegistryArtifact
+    ?? (deps.fetchStream ? async () => null : fetchConfiguredPackageArtifact);
+  const extractRegistryBinary = deps.extractRegistryBinary ?? extractRegistryBinaryWithTar;
   const fetchChecksum = deps.fetchChecksum ?? (async (url: string) => {
     try {
       const res = await getReleaseStream(url, proxy, SELF_UPDATE_UA);
@@ -250,16 +351,73 @@ export async function replaceStandaloneBinary(
   // Same directory as the target: keeps the rename intra-filesystem (EXDEV).
   const dir = dirname(target);
   mkdirSync(dir, { recursive: true });
-  const tmp = join(dir, `.botmux-update.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  const token = `${process.pid}.${randomBytes(4).toString('hex')}`;
+  const tmp = join(dir, `.botmux-update.${token}.tmp`);
+  let bytesReceived = 0;
+  let bytesTotal: number | null = null;
+  const emit = (phase: BinaryUpdatePhase): void => {
+    deps.onProgress?.({ phase, bytesReceived, bytesTotal });
+  };
+  const downloadTo = async (res: NodeJS.ReadableStream, destination: string): Promise<void> => {
+    const headers = (res as { headers?: Record<string, string | string[] | undefined> }).headers;
+    const declared = headers
+      ? Number(Array.isArray(headers['content-length']) ? headers['content-length'][0] : headers['content-length'])
+      : NaN;
+    bytesTotal = Number.isFinite(declared) && declared > 0 ? declared : null;
+    bytesReceived = 0;
+    const counter = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        bytesReceived += chunk.length;
+        emit('download');
+        callback(null, chunk);
+      },
+    });
+    emit('download');
+    await pipeline(res, counter, createWriteStream(destination));
+  };
 
   try {
-    const res = await fetchStream(`${base}/${asset}`);
-    await pipeline(res, createWriteStream(tmp));
-    const expected = await fetchChecksum(`${base}/${asset}.sha256`);
-    if (expected) {
-      const actual = await sha256File(tmp);
-      if (actual !== expected) {
-        throw new Error(`${asset} SHA-256 校验不通过（期望 ${expected}，实际 ${actual}）`);
+    let source: BinarySelfUpdateResult['source'] = 'github-release';
+    let registryInstalled = false;
+    const archive = join(dir, `.botmux-update.${token}.tgz`);
+    let extractDir: string | null = null;
+    try {
+      const artifact = await resolveRegistryArtifact(asset, version);
+      if (artifact) {
+        const res = await fetchRegistryStream(artifact.tarball);
+        await downloadTo(res, archive);
+        emit('checksum');
+        const expected = artifact.integrity.slice('sha512-'.length);
+        const actual = await sha512FileBase64(archive);
+        if (actual !== expected) {
+          throw new Error(`${asset} registry SHA-512 integrity mismatch`);
+        }
+        extractDir = mkdtempSync(join(dir, '.botmux-registry-'));
+        const candidate = extractRegistryBinary(archive, extractDir);
+        renameSync(candidate, tmp);
+        registryInstalled = true;
+        source = 'registry-package';
+      }
+    } catch {
+      // Registry transport is an optimization. Any manifest, download,
+      // integrity, extraction or filesystem failure falls back to the existing
+      // GitHub Release + SHA-256 path without touching the working binary.
+      rmSync(tmp, { force: true });
+    } finally {
+      rmSync(archive, { force: true });
+      if (extractDir) rmSync(extractDir, { recursive: true, force: true });
+    }
+
+    if (!registryInstalled) {
+      const res = await fetchStream(`${base}/${asset}`);
+      await downloadTo(res, tmp);
+      emit('checksum');
+      const expected = await fetchChecksum(`${base}/${asset}.sha256`);
+      if (expected) {
+        const actual = await sha256File(tmp);
+        if (actual !== expected) {
+          throw new Error(`${asset} SHA-256 校验不通过（期望 ${expected}，实际 ${actual}）`);
+        }
       }
     }
     const bytes = statSync(tmp).size;
@@ -275,15 +433,21 @@ export async function replaceStandaloneBinary(
     // floor; an embedded native built on a newer distro can still fail at dlopen.
     // Probe the complete module graph before the atomic rename so self-update has
     // the same fail-safe contract as npm postinstall and install.sh.
+    emit('probe');
     const probe = probeBinary(tmp);
     if (probe.error || probe.status !== 0) {
       const raw = probe.error?.message || probe.stderr || `exit ${probe.status ?? probe.signal ?? 'unknown'}`;
       const detail = String(raw).trim().split('\n').slice(0, 8).join(' | ');
       throw new Error(`${asset} 与当前主机不兼容，保留现有版本：${detail || 'candidate probe failed'}`);
     }
+    const candidateVersion = String(probe.stdout ?? '').trim();
+    if (candidateVersion !== version) {
+      throw new Error(`${asset} 版本校验失败（期望 ${version}，实际 ${candidateVersion || 'unknown'}），保留现有版本`);
+    }
     // Atomic swap. NOT a write to `target` — that is ETXTBSY (see header).
+    emit('swap');
     renameSync(tmp, target);
-    return { asset, target, bytes };
+    return { asset, target, bytes, source };
   } catch (error) {
     rmSync(tmp, { force: true });
     throw error;

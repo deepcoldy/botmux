@@ -77,7 +77,8 @@ describe('local-cli-opener', () => {
   it('resume mode supports every adapter with a portable local resume command', () => {
     for (const cliId of LOCAL_CLI_IDS) {
       const result = buildLocalCliOpenCommand(ds({
-        session: { ...ds().session, cliId, cliSessionId: 'ses_nativeid' },
+        // Kimi only resumes its own session_<uuid> ids.
+        session: { ...ds().session, cliId, cliSessionId: cliId === 'kimi' ? 'session_nativeid' : 'ses_nativeid' },
       }), {
         mode: 'resume',
         adapterFactory: (id) => id === 'oh-my-pi'
@@ -91,9 +92,19 @@ describe('local-cli-opener', () => {
         expect(result.command).not.toContain('attach-session');
       }
     }
-    for (const cliId of ['codex-app', 'gemini', 'mira', 'mir']) {
+    for (const cliId of ['codex-app', 'dsh', 'mira', 'mir']) {
       expect(supportsLocalCliOpen(cliId)).toBe(false);
     }
+  });
+
+  it('opens a Kimi session with the flag Kimi 0.31 actually has', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: { ...ds().session, cliId: 'kimi', cliSessionId: 'session_0a1b2c3d-0000-4000-8000-000000000000' },
+    }), { mode: 'resume', adapterFactory: (id) => createCliAdapterSync(id, '/bin/echo') });
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && kimi --session 'session_0a1b2c3d-0000-4000-8000-000000000000'",
+    });
   });
 
   it('quotes shell arguments for cwd and resume id', () => {
@@ -110,6 +121,26 @@ describe('local-cli-opener', () => {
       ok: true,
       command: "cd '/tmp/project'\\''s dir' && codex resume 'native'\\''id'",
     });
+  });
+
+  it('keeps a Pi resume command that points at the session\'s own dir, and nothing looser', () => {
+    const session = ds({ session: { ...ds().session, cliId: 'pi', cliSessionId: undefined } });
+    const open = (raw: string) => buildLocalCliOpenCommand(session, {
+      mode: 'resume',
+      adapterFactory: () => ({ buildResumeCommand: () => raw }),
+    });
+    const valid = "pi --session-id 'bm-1' --session-dir '/home/u/.pi/agent/sessions/botmux/bm-1'";
+    expect(open(valid)).toEqual({ ok: true, command: `cd '/tmp/project'\\''s dir' && ${valid}` });
+    // The plain form still gets its id quoted as before.
+    expect(open('pi --session-id bm-1')).toEqual({ ok: true, command: "cd '/tmp/project'\\''s dir' && pi --session-id 'bm-1'" });
+    for (const raw of [
+      "pi --session-id 'bm-1' --session-dir '/home/u/x'; touch /tmp/pwn",
+      "pi --session-id 'bm-1' --session-dir 'relative/dir'",
+      "pi --session-id bm-1 --session-dir '/home/u/x'",
+      "pi --session-id 'bm-1' --session-dir '/home/u/x' --model extra",
+    ]) {
+      expect(open(raw)).toMatchObject({ ok: false, error: 'missing_resume_id' });
+    }
   });
 
   it('accepts only the exact shell-quoted OMP resume command shape', () => {
@@ -229,6 +260,23 @@ describe('local-cli-opener', () => {
     expect(result.ok && result.command).not.toContain('/opt/legacy/custom-traex');
   });
 
+  it('attach mode addresses the dedicated tmux server a session was created on', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'tmux',
+        cliSessionId: undefined,
+        persistentBackendTarget: { backendType: 'tmux', sessionName: 'bmx-abcdef12', socketName: 'botmux' },
+      },
+    }), { mode: 'attach' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "tmux -L 'botmux' attach-session -t '=bmx-abcdef12'",
+    });
+  });
+
   it('attach mode opens a managed tmux session with exact target syntax', () => {
     const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
     const result = buildLocalCliOpenCommand(ds({
@@ -278,6 +326,26 @@ describe('local-cli-opener', () => {
       ok: true,
       command: "herdr --session 'work' agent attach 'botmux-abcdef12'",
     });
+  });
+
+  it('opens the persisted ZMX directory even when the caller selects another namespace', () => {
+    vi.stubEnv('ZMX_DIR', '/tmp/caller-zmx');
+    vi.stubEnv('TMPDIR', '/tmp/caller-tmp');
+    try {
+      const result = buildLocalCliOpenCommand(ds({
+        session: {
+          ...ds().session,
+          sessionId: 'abcdef123456',
+          backendType: 'zmx',
+          persistentBackendTarget: { backendType: 'zmx', sessionName: 'bmx-owned', socketDir: "/tmp/owner's zmx" },
+        },
+      }), { mode: 'attach' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.command).toContain("__zmx-attach-managed 'bmx-owned' 'abcdef123456' '/tmp/owner'\\''s zmx'");
+        expect(result.command).not.toContain('/tmp/caller');
+      }
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it('attach mode delegates ZMX to the identity-verifying CLI helper with the complete session id', () => {

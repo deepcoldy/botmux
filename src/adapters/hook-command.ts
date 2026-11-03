@@ -28,51 +28,67 @@
  *
  * 不从 worker-pool 导入，也不从 adapter 导入 worker-pool——避免循环依赖。
  */
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { shellQuote } from '../core/cli-launch-mode.js';
 import { isStandaloneBinary } from '../core/self-spawn.js';
 import { resolveNativeSubagentRuntimeHookWrapperPath } from '../core/botmux-wrapper.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 
 /**
  * 一条 botmux 子命令的 argv 形式。
  *
  * 编译态：`[<binary>, ...subcommand]`——没有脚本路径这一项。
- * Node 态：`[<node>, <dist/cli.js>, ...subcommand]`。
+ * Bun 源码态：`[<bun>, <src/cli.ts>, ...subcommand]`。
+ * Node 编译态：`[<node>, <dist/cli.js>, ...subcommand]`。
  *
- * 单一出口：三个导出全部经由它，避免「同一个判据三份实现各自漂移」——
- * 本文件此前正是三处各拼一遍 `join(__dirname,'..','cli.js')`。
+ * 可注入 moduleUrl/runtime 让测试验证源码态与 dist 态路径，而不改全局 argv。
  */
-function botmuxInvocation(
+export function botmuxInvocation(
   subcommand: string[],
   standalone: boolean = isStandaloneBinary(),
+  moduleUrl: string = import.meta.url,
+  bunRuntime: boolean = 'Bun' in globalThis,
 ): { cmd: string; args: string[] } {
   if (standalone) {
     // process.execPath 是**真实磁盘路径**（编译态下也是），所以对别的进程有效。
     return { cmd: process.execPath, args: [...subcommand] };
   }
-  return { cmd: process.execPath, args: [join(__dirname, '..', 'cli.js'), ...subcommand] };
+  if (moduleUrl.endsWith('.ts')) {
+    const cli = fileURLToPath(new URL('../cli.ts', moduleUrl));
+    // `tsx src/index-daemon.ts` is also a supported source-mode daemon. A Node
+    // parent therefore must carry the loader into the hook child; Bun can run
+    // the TypeScript entry directly.
+    return bunRuntime
+      ? { cmd: process.execPath, args: [cli, ...subcommand] }
+      : { cmd: process.execPath, args: ['--import', require.resolve('tsx'), cli, ...subcommand] };
+  }
+  const moduleDir = dirname(fileURLToPath(moduleUrl));
+  return { cmd: process.execPath, args: [join(moduleDir, '..', 'cli.js'), ...subcommand] };
+}
+
+export function botmuxShellCommand(
+  subcommand: string[],
+  standalone: boolean = isStandaloneBinary(),
+  moduleUrl: string = import.meta.url,
+  bunRuntime: boolean = 'Bun' in globalThis,
+): string {
+  const { cmd, args } = botmuxInvocation(subcommand, standalone, moduleUrl, bunRuntime);
+  const prefix = [cmd, ...args.slice(0, args.length - subcommand.length)];
+  const suffix = subcommand.map(arg => /^[A-Za-z0-9_-]+$/.test(arg) ? arg : shellQuote(arg));
+  return [...prefix.map(shellQuote), ...suffix].join(' ');
 }
 
 /**
- * 把一条调用渲染成 **shell 命令字符串**：只给可执行路径与脚本路径加引号（容忍空格），
- * 子命令名与其参数不加引号。
+ * 把一条调用渲染成 **POSIX shell 命令字符串**。可执行文件和每个参数都独立引用，
+ * 使空格及 shell 元字符保持为字面值，同时保留 argv 边界。
  *
- * 用于「按 shell 字符串执行」的场景（Claude 家族的 settings.json `command` 字段）。
- * 需要 argv 的场景请用 `hookCommandParts`，切勿对本字符串再 `.split(' ')`。
+ * 用于 CLI 配置里的 shell command 字段；有 argv API 的调用方应直接用 hookCommandParts。
  */
 function renderShellCommand(cliId?: string, ...subcommand: string[]): string {
-  // 判一次形态两处用：`botmuxInvocation` 决定 argv 里有没有脚本路径，这里决定给不给
-  // 它加引号——两者必须看到同一个答案，各调一次 `isStandaloneBinary()` 只是让同一个
-  // 判据有两个求值点。
-  const standalone = isStandaloneBinary();
-  const { cmd, args } = botmuxInvocation(cliId === undefined ? subcommand : [...subcommand, cliId], standalone);
-  if (standalone) {
-    // 只有可执行路径需要引号；子命令是字面量 token。
-    return `"${cmd}" ${args.join(' ')}`;
-  }
-  return `"${cmd}" "${args[0]}" ${args.slice(1).join(' ')}`;
+  return botmuxShellCommand(cliId === undefined ? subcommand : [...subcommand, cliId]);
 }
 
 /**
@@ -106,6 +122,49 @@ export function sessionReadyHookCommand(): string {
 }
 
 /**
+ * 构造 `botmux zcode-session-hook` 的 **argv 形式** `{ cmd, args }`。
+ *
+ * 与 `hookCommandParts`（`botmux hook <cliId>`，走 askUserQuestion 转发）不同，
+ * 这个子命令是 ZCode 的生命周期桥：只记录 native session id 与每轮提交回执，
+ * 不参与 ask。它必须按 argv 写入 ZCode 的 `hooks.events.*.hooks[]`
+ * （`{type:'process', command, args}`），因为 ZCode 直接 exec 数组、不过 shell。
+ */
+export function zcodeSessionHookCommandParts(): { cmd: string; args: string[] } {
+  return botmuxInvocation(['zcode-session-hook']);
+}
+
+/**
+ * 构造 dsh-tui 结构化回合空闲上报的 **shell 命令字符串** → `botmux __turn-idle-v2`。
+ * 与 `sessionReadyHookCommand` 同源的路径解析与加引号策略：同样写进 CLI 进程的
+ * env（`BOTMUX_TURN_IDLE_COMMAND`），由 dsh-tui 的 cordis wrapper 插件在
+ * `agent/status` 落到 idle 时按 shell 字符串执行一次。CLI 侧靠子进程继承的
+ * `BOTMUX_SESSION_ID` / `BOTMUX_LARK_APP_ID` 定位会话与 owning daemon，
+ * 不需要 cliId。
+ *
+ * 子命令名带协议版本是**跨版本混装的 fail-closed 开关**，不是装饰：
+ * 长命的 dsh-tui 进程里跑的是生成时那份 wrapper 插件（v2，会把事件时冻结的
+ * turn/attempt/token 放进 payload），而命令指向的 `<dist>/cli.js` 会被 in-place
+ * update / rollback 换成**任意版本**。若沿用不带版本的 `turn-idle`，v1 CLI 会
+ * 完全不看 payload 里的 v2 身份，改读**执行时**的 marker/capability —— 那时 worker
+ * 可能已经旋到下一轮 B，于是 A 轮的 idle 报告自称 B，tuple 与 token 都「确实是当前
+ * B」，worker 的精确匹配 fence 通过，B 还在跑就 fireIdle()（真实提前放行）。
+ * 仅靠 payload 里的 `v` 字段挡不住：v1 parser 根本不解析它。
+ * 换成 v1 不认识的子命令后，混装只会「命令无法解释 → 一个请求都不发」（插件
+ * fire-and-forget，静默 fail-closed），该轮退回既有兜底路径，绝不误判空闲。
+ *
+ * 名字用 `__` 前缀（本仓库内部子命令的既有形态，如 `__pty-smoke`）是为了**结构上
+ * 不可能被插件命中**：v1 CLI 的 default 分支是 `runPluginCommandByName(command, …)`
+ * 按**精确名**匹配已安装插件声明的 CLI 命令，而插件命令名的语法是
+ * `^[a-z][a-z0-9._:-]{0,63}$`（core/plugins/convention-scanner.ts:114，首字符必须是
+ * 小写字母）——`__` 开头的名字插件无法声明，因此这条命令在任何插件环境下都只会落到
+ * `showHelp()`。若沿用 `turn-idle-v2` 这种合规名字，理论上存在「插件恰好声明同名
+ * 命令」时被执行的余地（实测本机无插件、无同名，但那是环境事实，不是语法保证）。
+ */
+export function turnIdleHookCommand(): string {
+  return renderShellCommand(undefined, '__turn-idle-v2');
+}
+
+/**
  * 构造 Claude 家族 `UserPromptSubmit` hook 的 shell 命令字符串 → `botmux user-prompt-hook`。
  * 与 sessionReadyHookCommand 同策略：写进全局 settings.json（aiden wrapper 会剥进程级
  * --settings，全局是唯一可靠渠道）。hook 子进程靠继承的 BOTMUX_SESSION_ID /
@@ -114,6 +173,30 @@ export function sessionReadyHookCommand(): string {
  */
 export function userPromptHookCommand(): string {
   return renderShellCommand(undefined, 'user-prompt-hook');
+}
+
+/**
+ * 构造 Claude Code `StopFailure` hook 的 shell 命令字符串 → `botmux __claude-stop-failure-v1`。
+ * 与 userPromptHookCommand 同策略写全局 settings.json。Claude 只在回合因 API 错误结束时
+ * 跑它（这条路径不跑 Stop hook），hook 子进程靠继承的 BOTMUX_SESSION_ID /
+ * BOTMUX_LARK_APP_ID 上报给本会话 worker，worker 在 transcript 没收口该回合时兜底。
+ * 缺 env / daemon 不可达时静默 exit 0；StopFailure 的输出与退出码 Claude 本就忽略。
+ * 子命令名带版本、`__` 前缀，与 `__turn-idle-v2` 同理：载荷形状变了就换名字，
+ * 新旧混装时旧 CLI 不认识新名字，一个请求都不发。
+ */
+export function claudeStopFailureHookCommand(): string {
+  return renderShellCommand(undefined, '__claude-stop-failure-v1');
+}
+
+/**
+ * 构造 Claude Code `statusLine.command` 的 shell 命令字符串 → `botmux statusline`。
+ * 与 sessionReadyHookCommand 同策略，但写进**进程级** `--settings`（不写全局：全局只能
+ * 有一个 statusLine，写进去会覆盖用户自己的；被 wrapperCli 剥掉时卡片省略即可）。
+ * 子进程靠继承的 BOTMUX_SESSION_ID 定位落盘目录、靠 BOTMUX_STATUSLINE_CHAIN 转发
+ * 用户原有的 statusline 命令；缺 env 时静默 exit 0。
+ */
+export function statuslineHookCommand(): string {
+  return renderShellCommand(undefined, 'statusline');
 }
 
 /**
@@ -126,4 +209,14 @@ export function nativeSubagentRuntimeHookCommand(
   platform: NodeJS.Platform = process.platform,
 ): string {
   return `"${resolveNativeSubagentRuntimeHookWrapperPath(env, platform)}"`;
+}
+
+/** Cursor stop callback: same Node/standalone dispatch contract as other hooks. */
+export function cursorUsageHookCommand(platform: NodeJS.Platform = process.platform): string {
+  const command = renderShellCommand(undefined, '__cursor-usage-v1');
+  // A user-level Cursor hook also sees standalone sessions. Skip before even
+  // launching Botmux, including after the installation path has been removed.
+  return platform === 'win32'
+    ? `if defined BOTMUX_SESSION_ID if defined SESSION_DATA_DIR ${command}`
+    : `[ -z "$BOTMUX_SESSION_ID" ] || [ -z "$SESSION_DATA_DIR" ] || ${command}`;
 }

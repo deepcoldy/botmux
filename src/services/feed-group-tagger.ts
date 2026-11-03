@@ -37,11 +37,12 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { getBot, getBotClient, effectiveBotDisplayName, type BotState } from '../bot-registry.js';
 import { config } from '../config.js';
-import { resolveOwnerUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { resolveOwnerUserToken, resolveUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { larkHosts, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { sendUserMessage } from '../im/lark/client.js';
 import { t, localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
+import { getSessionGroup, setSessionGroupFeedGroup } from './session-groups-store.js';
 
 /** 连 bot 显示名都拿不到时的最后兜底（多 bot 下毫无区分度，仅作保底）。 */
 const DEFAULT_TAG_NAME = 'Botmux群会话';
@@ -441,10 +442,12 @@ async function callFeedGroupApi(
   method: 'POST' | 'PUT',
   path: string,
   body: unknown,
+  signal: AbortSignal = AbortSignal.timeout(10_000),
 ): Promise<LarkApiResult> {
   try {
     const res = await fetch(`${brandHost}${path}`, {
       method,
+      signal,
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
@@ -452,8 +455,8 @@ async function callFeedGroupApi(
       body: JSON.stringify(body),
     });
     const json: any = await res.json().catch(() => ({}));
-    const code = typeof json.code === 'number' ? json.code : (res.ok ? 0 : res.status);
-    if (code === 0) return { ok: true, code, data: json.data };
+    const code = typeof json.code === 'number' ? json.code : res.status;
+    if (res.ok && code === 0) return { ok: true, code, data: json.data };
     const authProblem = AUTH_ERROR_CODES.includes(code) || res.status === 401 || res.status === 403;
     // Feishu puts the actionable detail in error.message (e.g. 230001 is just
     // "param is invalid" while error.message says "name already exists") —
@@ -508,24 +511,38 @@ async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, re
  *  Reuse-before-create keeps multi-bot / reinstall setups from spawning
  *  duplicate same-name sidebar groups — feed groups have no server-side
  *  name-dedup of their own. */
-async function findFeedGroupByName(brandHost: string, userToken: string, name: string): Promise<string | null> {
+async function findFeedGroupByName(brandHost: string, userToken: string, name: string, signal: AbortSignal = AbortSignal.timeout(10_000), strict = false): Promise<string | null> {
   let pageToken = '';
   for (let page = 0; page < 3; page++) {
     try {
-      const qs = new URLSearchParams({ page_size: '50', ...(pageToken ? { page_token: pageToken } : {}) });
+      // Feishu requires page_token even for the first page; omission returns 9499.
+      const qs = new URLSearchParams({ page_size: '50', page_token: pageToken });
       const res = await fetch(`${brandHost}/open-apis/im/v1/groups?${qs}`, {
+        signal,
         headers: { Authorization: `Bearer ${userToken}` },
       });
       const json: any = await res.json().catch(() => ({}));
-      if (json.code !== 0) return null;
+      if (!res.ok || json.code !== 0 || (strict && !Array.isArray(json.data?.groups))) {
+        if (strict) {
+          // Keep diagnostic fields only, never request headers or token-bearing URLs.
+          const message = typeof json.msg === 'string' && json.msg
+            ? json.msg.replace(/[\r\n]/g, ' ').slice(0, 500) : 'invalid response';
+          const logId = typeof json.error?.log_id === 'string'
+            ? json.error.log_id.replace(/[\r\n]/g, ' ').slice(0, 128) : 'unknown';
+          throw new Error(`feed group lookup failed: status=${res.status} code=${json.code} msg=${message} log_id=${logId}`);
+        }
+        return null;
+      }
       const hit = (json.data?.groups ?? []).find((g: any) => g?.name === name && g?.group_id);
       if (hit) return hit.group_id as string;
       if (!json.data?.has_more || !json.data?.page_token) return null;
       pageToken = json.data.page_token;
-    } catch {
+    } catch (err) {
+      if (strict) throw err;
       return null;
     }
   }
+  if (strict) throw new Error('feed group lookup exceeded page limit');
   return null;
 }
 
@@ -732,7 +749,48 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
     logger.warn(`[session-tag] feed group add ${chatId.substring(0, 12)} partially failed: ${JSON.stringify(failed)}`);
     return;
   }
+  setSessionGroupFeedGroup(chatId, ownerOpenId, group.groupId);
   logger.info(`[session-tag] tagged ${chatId.substring(0, 12)} into feed group "${group.actualName}" (${group.groupId})`);
+}
+
+/** Explicit /g tag: belongs to the invoking user, never the configured owner.
+ * No per-app cache: callers can request different names/users on every call. */
+export async function addCreatedChatToFeedGroup(larkAppId: string, chatId: string, openId: string, name: string): Promise<void> {
+  if (!openId || !name.trim() || [...name.trim()].length > 60) throw new Error('Invalid tag user or name');
+  const cfg = getBot(larkAppId).config;
+  const brand = normalizeBrand(cfg.brand);
+  const host = larkHosts(brand).openApi;
+  const signal = AbortSignal.timeout(10_000);
+  const token = await resolveUserToken(larkAppId, cfg.larkAppSecret, brand, openId, signal);
+  signal.throwIfAborted();
+  if (!token) throw new Error('User authorization required: /login --scope im:feed_group_v1:read im:feed_group_v1:write offline_access');
+  let groupId = await findFeedGroupByName(host, token, name, signal, true);
+  if (!groupId) {
+    const created = await callFeedGroupApi(host, token, 'POST', '/open-apis/im/v1/groups', {
+      feed_group_creator: { type: 'normal', name },
+    }, signal);
+    if (!created.ok) {
+      // Another request can have created the same name after our lookup.
+      if (created.code === PARAM_INVALID_CODE && /already exists/i.test(created.msg ?? '')) {
+        groupId = await findFeedGroupByName(host, token, name, signal, true);
+      }
+      if (!groupId) throw new Error(`Tag creation failed: ${created.code ?? ''} ${created.msg ?? ''}`);
+    } else groupId = created.data?.group_id;
+  }
+  if (!groupId) throw new Error('Tag creation returned no group ID');
+  const item = { feed_id: chatId, feed_type: 'chat' };
+  const path = `/open-apis/im/v1/groups/${encodeURIComponent(groupId)}`;
+  const added = await callFeedGroupApi(host, token, 'POST', `${path}/batch_add_item`, { items: [item] }, signal);
+  if (!added.ok || added.data?.failed_items?.length) throw new Error(`Tag insertion failed: ${added.code ?? ''} ${added.msg ?? ''}`);
+  const readback = await callFeedGroupApi(host, token, 'POST', `${path}/batch_query_item`, { items: [item] }, signal);
+  const items = readback.data?.items ?? readback.data?.feeds;
+  if (!readback.ok || readback.data?.failed_items?.length || !Array.isArray(items)
+    || !items.some((x: any) => {
+      const item = x.feed ?? x.item ?? x;
+      return item.feed_id === chatId && (item.feed_type === undefined || item.feed_type === 'chat');
+    })) {
+    throw new Error(`Tag membership could not be verified: ${readback.code ?? ''} ${readback.msg ?? ''}`);
+  }
 }
 
 // ─── entry point ─────────────────────────────────────────────────────────────
@@ -753,7 +811,7 @@ export function resolveTagMode(
  * Tag one freshly-born session group per the bot's `sessionGroup.tag` config.
  * Fire-and-forget from the birth flow — never throws.
  */
-export async function tagSessionGroup(larkAppId: string, chatId: string, ownerOpenId: string): Promise<void> {
+async function applySessionGroupTag(larkAppId: string, chatId: string, ownerOpenId: string): Promise<void> {
   try {
     const state = getBot(larkAppId);
     const tag = state.config.sessionGroup?.tag ?? {};
@@ -772,5 +830,95 @@ export async function tagSessionGroup(larkAppId: string, chatId: string, ownerOp
     await tagViaChatTag(larkAppId, chatId, ownerOpenId, name);
   } catch (err) {
     logger.warn(`[session-tag] tagging ${chatId.substring(0, 12)} threw: ${err}`);
+  }
+}
+
+/** In-flight birth tagging; close must not race a late add to the original group. */
+const pendingTags = new Map<string, Promise<void>>();
+
+/** Tag at birth, retaining the promise until close can safely follow its writes. */
+export async function tagSessionGroup(larkAppId: string, chatId: string, ownerOpenId: string): Promise<void> {
+  const key = JSON.stringify([larkAppId, chatId, ownerOpenId]);
+  const pending = (pendingTags.get(key) ?? Promise.resolve()).then(() => applySessionGroupTag(larkAppId, chatId, ownerOpenId));
+  pendingTags.set(key, pending);
+  try { await pending; }
+  finally { if (pendingTags.get(key) === pending) pendingTags.delete(key); }
+}
+
+/** Outcome is separate from session closure: a labeling failure never reopens it. */
+export type ClosedSessionTagResult =
+  | { status: 'skipped' }
+  | { status: 'updated'; name: string }
+  | { status: 'failed' };
+
+/**
+ * Move one successfully closed session group's chat into its configured personal
+ * feed group. Uses the birth owner's OAuth, adds before removing, and never
+ * renames/deletes the shared active group. Called only by explicit /close.
+ */
+export async function tagClosedSessionGroup(larkAppId: string, chatId: string, sessionId: string): Promise<ClosedSessionTagResult> {
+  try {
+    const state = getBot(larkAppId);
+    const tag = state.config.sessionGroup?.tag;
+    const name = clampSessionTagName(tag?.closedName ?? '');
+    if (!name || resolveTagMode(tag) !== 'feed-group') return { status: 'skipped' };
+    const entry = getSessionGroup(chatId);
+    if (!entry || entry.lastSessionId !== sessionId) {
+      return { status: 'skipped' };
+    }
+    const owner = entry.ownerOpenId;
+    await pendingTags.get(JSON.stringify([larkAppId, chatId, owner]));
+    const cfg = state.config;
+    const brand = normalizeBrand(cfg.brand);
+    const host = larkHosts(brand).openApi;
+    const token = await resolveOwnerUserToken(cfg.larkAppId, cfg.larkAppSecret, brand, owner);
+    if (!token) {
+      void maybeNudgeOwnerForAuth(larkAppId, owner, 'no_token');
+      return { status: 'failed' };
+    }
+    const signal = AbortSignal.timeout(10_000);
+    // Older groups have no per-chat snapshot. Resolve their active name in this
+    // owner's inbox rather than trusting another user's app-wide cached ID.
+    const activeName = loadCache(larkAppId).name ?? resolveSessionTagName({
+      configuredName: tag?.name, botDisplayName: botDisplayLabel(state), locale: localeForBot(larkAppId),
+    });
+    const current = getSessionGroup(chatId);
+    if (!current || current.ownerOpenId !== owner || current.lastSessionId !== sessionId) return { status: 'skipped' };
+    const sourceId = current.feedGroupId
+      ?? await findFeedGroupByName(host, token, activeName, signal, true);
+    let targetId = await findFeedGroupByName(host, token, name, signal, true);
+    if (!targetId) {
+      const created = await callFeedGroupApi(host, token, 'POST', '/open-apis/im/v1/groups', {
+        feed_group_creator: { type: 'normal', name },
+      }, signal);
+      if (created.ok && typeof created.data?.group_id === 'string') targetId = created.data.group_id;
+      // A concurrent close may have created the exact target. Never fall back
+      // to the active tag's name (the birth helper's fallback is unsuitable).
+      else if (created.code === PARAM_INVALID_CODE && /already exists/i.test(created.msg ?? '')) {
+        targetId = await findFeedGroupByName(host, token, name, signal, true);
+      }
+      if (!targetId) return { status: 'failed' };
+    }
+    const items = { items: [{ feed_id: chatId, feed_type: 'chat' }] };
+    const added = await callFeedGroupApi(host, token, 'POST',
+      `/open-apis/im/v1/groups/${encodeURIComponent(targetId)}/batch_add_item`, items, signal);
+    if (!added.ok || (Array.isArray(added.data?.failed_items) && added.data.failed_items.length > 0)) {
+      logger.warn(`[session-tag] closed group add failed: code=${added.code}`);
+      return { status: 'failed' };
+    }
+    if (sourceId && sourceId !== targetId) {
+      const removed = await callFeedGroupApi(host, token, 'POST',
+        `/open-apis/im/v1/groups/${encodeURIComponent(sourceId)}/batch_remove_item`, items, signal);
+      if ((!removed.ok && !isFeedGroupGone(removed))
+        || (Array.isArray(removed.data?.failed_items) && removed.data.failed_items.length > 0)) {
+        logger.warn(`[session-tag] active group removal failed: code=${removed.code}`);
+        return { status: 'failed' };
+      }
+    }
+    logger.info(`[session-tag] moved closed chat ${chatId.substring(0, 12)} into "${name}"`);
+    return { status: 'updated', name };
+  } catch (err) {
+    logger.warn(`[session-tag] closed group tagging failed: ${err}`);
+    return { status: 'failed' };
   }
 }

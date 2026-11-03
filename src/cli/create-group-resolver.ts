@@ -13,6 +13,9 @@
  * keeping first occurrence. Unresolvable ref → reported in `invalid` list.
  */
 
+import type { ChatMode } from '../services/groups-store.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from '../services/bots-info-shape.js';
+
 export interface BotConfigForResolve {
   larkAppId: string;
   cliId: string;
@@ -52,9 +55,11 @@ export interface CreateGroupCompletionStatus {
   kickoffError: string | null;
 }
 
-/** Build the machine-readable terminal status for create-group. A created chat
- * is not a successful group initialization until collaboration is ready and an
- * explicitly requested kickoff was accepted. */
+/** Build the machine-readable terminal status for create-group. Success means
+ * an explicitly requested kickoff (if any) was sent. `collaborationReady` reports
+ * whether the best-effort bot-to-bot grants were written: a miss there is a
+ * warning, and must not make callers that retry on failure create a second
+ * group. */
 export function createGroupCompletionStatus(input: {
   chatId: string;
   collaborationReady: boolean;
@@ -65,7 +70,7 @@ export function createGroupCompletionStatus(input: {
   const kickoffAccepted = !input.kickoffRequested
     || (!!input.kickoffMessageId && !input.kickoffError);
   return {
-    success: input.collaborationReady && kickoffAccepted,
+    success: kickoffAccepted,
     chatCreated: true,
     chatId: input.chatId,
     collaborationReady: input.collaborationReady,
@@ -86,11 +91,32 @@ export function shouldWriteCreateGroupCompletionStatus(
   return explicitJsonStatus;
 }
 
+export type ResolvedChatMode =
+  | { ok: true; chatMode?: ChatMode }
+  | { ok: false; error: string };
+
+/**
+ * Parse the optional `--chat-mode` flag for `botmux create-group`.
+ *
+ * Absent/empty → `{ ok: true }` with no `chatMode`, so the request omits
+ * `chat_mode` and keeps Feishu's default (普通群). Only the two creation-time
+ * topologies are accepted; `p2p` is a direct message, not a creatable group.
+ */
+export function resolveChatMode(raw: string | undefined): ResolvedChatMode {
+  const value = raw?.trim().toLowerCase();
+  if (!value) return { ok: true };
+  if (value === 'group' || value === 'topic') return { ok: true, chatMode: value };
+  return { ok: false, error: `--chat-mode 只支持 group 或 topic，收到: "${raw}"。` };
+}
+
 export function resolveBotRefs(
   refs: string[],
   botConfigs: BotConfigForResolve[],
-  botInfo: BotInfoForResolve[],
+  botInfo: unknown[],
 ): ResolvedBots {
+  const safeBotInfo: BotInfoForResolve[] = botsInfoObjectEntries(botInfo)
+    .filter(isBotsInfoRouteEntry)
+    .map(entry => ({ larkAppId: entry.larkAppId, botName: entry.botName ?? null }));
   const out: string[] = [];
   const seen = new Set<string>();
   const invalid: string[] = [];
@@ -115,7 +141,7 @@ export function resolveBotRefs(
       //    set of name-matched entries.
       const lower = trimmed.toLowerCase();
       const nameMatchSet = new Set(
-        botInfo.filter(b => b.botName?.toLowerCase() === lower).map(b => b.larkAppId),
+        safeBotInfo.filter(b => b.botName?.toLowerCase() === lower).map(b => b.larkAppId),
       );
       const byNameAll = botConfigs.filter(c => nameMatchSet.has(c.larkAppId));
       if (byNameAll.length > 0) {

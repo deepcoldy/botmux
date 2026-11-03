@@ -28,15 +28,17 @@ Check these in order (PersonalAgent comes configured correctly by default; norma
 
 ### B. Others can't use it / auth card
 
-botmux has two permission layers (see [permissions](#how-are-permissions-divided-who-can-operate-it)): **talk permission** (who can ask) and **operate permission** (who can `/cd` `/restart` / tap buttons). By default only the owner has talk permission, so others get refused / see an auth card.
+botmux has two permission layers (the full layer model is in [Permissions & Access](/en/permissions); quick reference below in [How are permissions divided](#how-are-permissions-divided-who-can-operate-it)): **talk permission** (who can ask) and **operate permission** (who can `/cd` `/restart` / tap buttons). By default only people on the `allowedUsers` list have talk permission, so others get refused / see an auth card. **Being added to a group does not authorize any member.**
 
-- **Let a whole group use it**: give the bot `allowedChatGroups` (everyone in that group can talk), or authorize a specific group with `/grant`.
-- **Group @ policy** (must-@ vs no-@): multi-person groups require @ by default; no-@-in-topic / no-@-whole-group can be configured in the group @ policy. Note a 1-on-1 "you + 1 bot" group is @-free already.
+- **Let a whole group use it**: send bare `@bot /grant` in the group (writes `allowedChatGroups`; everyone takes effect immediately, no quota), or use **authorize the whole group in one click** in Dashboard **Groups → Manage**; no need to add people one by one.
+- **Trial access for specific people**: `@bot /grant @someone` opens a card defaulting to 3 messages / 1 hour, with quota and duration adjustable on the card; the Dashboard group-member modal also supports multi-select **batch grant** (up to 50).
+- **Group @ policy** (must-@ vs no-@): multi-person groups require @ by default; `/mention-mode topic|never|ambient` changes it, and the four modes plus the 8 no-@ exceptions are explained in [Mention Policy](/en/mention-mode). A 1-on-1 "you + 1 bot" group is @-free already.
 - **On-call scenario** (a new group per ticket, everyone asks @-free): see [On-Call Mode](/en/oncall).
+- **Block someone**: Dashboard **Bot Config → `blockedUsers`** — denied globally in groups and DMs, with no more request cards.
 
 ### C. Terminal has output but nothing sent to Lark
 
-**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Gemini / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Antigravity / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
 
 > ⚠️ **Exception: `codex-app` (Codex App app-server protocol)** — its final assistant message is **auto-forwarded** back to Lark by botmux, so **don't call `botmux send` for normal replies** (that would double-send); use it only for mid-turn pushes / attachments / cross-bot @mentions.
 
@@ -83,6 +85,19 @@ See [Multi-bot Collaboration](/en/multi-bot) for details.
 
 With **tmux** installed, no — tmux is the default backend, the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. ⚠️ Without tmux it does **not** silently downgrade to pty; it hard-gates and posts a card asking you to install tmux. Only an explicit `BACKEND_TYPE=pty` (or per-bot `backendType:"pty"`) uses pty, and pty sessions **do not survive daemon restarts** — a restart reloads everything.
 
+## What happens to work in progress when the CLI is restarted mid-way?
+
+When the CLI process exits unexpectedly (a crash, the tmux server going away, …), botmux relaunches it in the same worker with its previous context and reads the transcript the old process left behind to see whether work was cut off:
+
+- **the previous turn had not finished** (say, a review half-way through);
+- **background tasks were terminated with the old process** (Claude Code `run_in_background` commands, Monitors, background agents).
+
+If so, the resumed CLI first receives a short note (it was restarted, which background tasks were interrupted, check them and continue), and the thread gets one notice. A cold resume after a suspend or a daemon restart is checked the same way (without a record of when the old process ended, a background task stopped by hand in the terminal on an idle session may also be reported as interrupted), with the note placed in front of the next message the CLI receives (a CLI that takes its first message as a launch argument, such as Pi, only gets the thread notice). Only the transcript is read, never the screen; this covers Claude Code and CLIs with structured transcripts such as Pi and Codex (for those, only the turn). Nothing is posted when nothing was interrupted.
+
+Messages received before a restart but not yet handed to the CLI are not dropped either: a first message passed to the CLI as a launch argument that the CLI exited before starting is typed in again after the restart, and messages still queued when the daemon restarts are delivered by the session's next worker (if that restart also brings a new message and the CLI takes its first message as a launch argument, the new one runs first). Ones more than 24 hours old are reported in the thread as not delivered instead, and so are ones caught by another restart part-way through being re-delivered, whose delivery cannot be confirmed. Conversely, a message the CLI had already received and started on (its own record shows the turn began) is not typed in again after a restart — that used to make the CLI redo the same work — but picked up through the note above; it is only re-sent when the restart has to open a fresh session without the old context.
+
+Also, a session whose main turn has ended while background tasks keep running (the card shows "⏳ Main turn ended · background tasks running (N)") is not suspended by the live-session cap or the idle timeout: suspending would kill those tasks, and a cold resume cannot bring them back.
+
 ## Does a session keep running if I don't close it? Is there automatic reclamation?
 
 It keeps running, and there is **currently no idle-TTL automatic reclamation**. Use `/close`, batch-close via the Dashboard, or `botmux delete stopped`/`all` to clean up.
@@ -95,7 +110,27 @@ It keeps running, and there is **currently no idle-TTL automatic reclamation**. 
 
 ## How are permissions divided? Who can operate it?
 
-Three layers: `allowedChatGroups` / `globalGrants` grant **conversation rights** (everyone in the group can ask); `allowedUsers` grants **operation rights** (only the owner can `/cd`, `/restart`, `/close`, click buttons). When `allowedChatGroups` is configured, `allowedUsers` must have at least one owner.
+Quick reference: `allowedUsers` grants **operate rights** (owner and admins — `/cd`, `/restart`, `/close`, card buttons, and changing `/card`, `/cot`, `/mention-mode`); `allowedChatGroups` (bare `/grant`, whole group, no quota), on-call (whole group, always allowed + directory bound), and `chatGrants` / `globalGrants` (per person, default 3 messages / 1 hour) grant **talk rights**; `blockedUsers` is the global deny that precedes every allow leg. Layers, quotas, expiry, and request cards are fully documented in [Permissions & Access](/en/permissions).
+
+## How do I let the whole group use it without authorizing people one by one?
+
+Send bare `@bot /grant` (equivalent to `/grant all`) in the group: it adds the group to `allowedChatGroups` in one step, so everyone in the group can talk immediately, with no quota and no expiry; new members take effect automatically and leaving the group revokes access. Revoke with bare `/revoke`. In a topic group it is keyed by the `oc_` group and covers all its topics. Dashboard **Groups → Manage** also has **authorize the whole group in one click**. It grants talk only; operate rights remain with `allowedUsers`.
+
+## How do I give someone just a 3-message trial?
+
+`@bot /grant @someone` — the grant card defaults to **3 messages / 1 hour** per person. To set the count directly use `@bot /grant @someone 20`; both duration and quota are editable on the card (1 hour / 8 hours / 1 day / 7 days / permanent; leave the quota blank for unlimited).
+
+## What's the difference between on-call and bare `/grant`?
+
+Both grant talk only (never operate) and neither is quota-limited. The difference is the directory: `/oncall bind <dir>` also anchors the group to a working directory, so new topics skip repository picking and start immediately; bare `/grant` only opens talk and binds no directory. Use on-call for duty Q&A, and `/grant` when the group just needs to ask in topics whose repo is already chosen.
+
+## Why must I @ the bot in a group? Can it answer without an @?
+
+In the default `always` mode, regular groups respond only to explicit @-mentions, which prevents bots from answering over each other in multi-bot / multi-person groups. Send `/mention-mode` in the group to change it: `topic` (no @ inside its own topics), `never` (no @ group-wide), `ambient` (no @, but yields when someone else is named). Changing it requires operate rights and works in regular groups only; 8 further no-@ exceptions exist (1-person-1-bot groups, the message listener, and more) — see [Mention Policy](/en/mention-mode).
+
+## Can I forbid people from adding this bot to groups?
+
+"Who can add the bot to a group" is controlled on the **Lark platform side** (app availability scope / who can add bots); botmux has no such switch and cannot fake one. Two things the bot side can do: ① turn off **Auto-start when added to a new group** (`autoStartOnGroupJoin`, Dashboard **Bot Defaults → Proactive Start** — and that gate itself still requires an authorized user in the group); ② keep the bot restricted — **being added is not authorization**, so a non-listed member @-mentioning it is blocked and the owner gets a request card instead. Whether the owner is auto-invited into new groups is controlled by `autoInviteOwnerOnGroupAdd` (on by default): turn it off in Dashboard → Bot Defaults → Proactive Start, via `/botconfig set autoInviteOwnerOnGroupAdd off`, or in `bots.json`. Turn it off when an alert/on-call platform batch-adds the bot to incident chats and the owner should not be pulled into every one.
 
 ## Can I ask a follow-up / interrupt a running session?
 
@@ -140,7 +175,29 @@ It hasn't been verified on native Windows, but WSL2 should be fine.
 
 ## How do I upgrade?
 
-`botmux upgrade` — it routes by how you installed: a curl install gets its binary replaced in place, an npm install is handed back to `npm i -g botmux@latest`. curl users can equally just re-run the install command (also an in-place upgrade, and it won't write a second PATH line). The `botmux` wrapper version inside sessions always stays in sync with the daemon, so it doesn't need to be upgraded separately. Run `botmux restart` afterwards to pick up the new version.
+**Re-run the install command (curl), no matter how you originally installed** — this upgrades npm/pnpm global installs too:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+```
+
+It replaces the self-contained binary in place at `~/.botmux/bin/botmux`: the downloaded binary is smoke-run on this host first, and if it cannot run the installer fails explicitly and **preserves your existing version**; it is idempotent (no second PATH line) and never needs Node. Then open a **new terminal** and run `botmux restart` — the installer prepends `~/.botmux/bin` to PATH, and only a new shell guarantees `botmux` resolves to the new version (in an old npm user's current shell it may still point at the npm global directory). The `botmux` wrapper inside sessions always tracks the daemon version, so it needs no separate upgrade.
+
+**Installing a pinned version** (same mechanism for rollbacks / version pinning; the tag needs the `v` prefix):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh
+```
+
+> ⚠️ `BOTMUX_VERSION` must precede the `sh` on the **right** side of the pipe. Written as `BOTMUX_VERSION=… curl … | sh`, the variable only reaches curl — `sh` never sees it and the installer silently falls back to latest.
+
+### Why can't I npm-upgrade from a release older than v3.18.0?
+
+Starting with v3.18.0 the npm package changed form, from "Node + `dist/` sources" to a **platform binary subpackage**, and `node-pty` left `dependencies`. Old builds shipped a `botmux upgrade` that simply delegated to npm; when npm installs across that boundary it prunes `node-pty` from the old tree, while the old daemon's first restart step is still `node …/dist/cli.js restart` — and that file still statically imports `node-pty`. The driver dies on `ERR_MODULE_NOT_FOUND` and the whole daemon fleet never comes back, even though output may already have said "restarting to apply". The curl route drops in the new binary and points the launcher at it without touching the old directory or depending on what npm prunes, which makes it the one reliable way across this boundary. On current (≥3.18) binary installs `botmux upgrade` is equivalent to re-running curl; when you don't remember your install form, curl always works.
+
+## A bot with `cliId: "gemini"` no longer starts?
+
+Gemini CLI has been retired and the `gemini` adapter removed. That bot refuses to start with a hint to switch to Antigravity; other bots keep running. Install `agy` and sign in with a Google account (or set `modelProvider: "gemini"` in `~/.gemini/antigravity-cli/settings.json` and provide `GEMINI_API_KEY`), then change `cliId` to `"antigravity"` (in `bots.json` or with `botmux setup`) and run `botmux restart`. The old `cliPathOverride` / `wrapperCli` (e.g. `ttadk gemini`), Gemini `model` names and `GEMINI_CLI_HOME` do not carry over. See [Gemini CLI has been removed](/en/adapters#gemini-cli-has-been-removed).
 
 ## CoCo loses messages while busy?
 

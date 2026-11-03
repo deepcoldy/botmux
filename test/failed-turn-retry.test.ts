@@ -5,7 +5,6 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  RETRY_COOLDOWN_MS,
   shouldRecordFailedTurn,
   buildFailedTurnRecord,
   retryCooldownRemaining,
@@ -159,11 +158,5 @@ describe('markRetryAttempt', () => {
     const session: { lastFailedTurn?: FailedTurnRecord } = {};
     expect(() => markRetryAttempt(session)).not.toThrow();
     expect(session.lastFailedTurn).toBeUndefined();
-  });
-});
-
-describe('RETRY_COOLDOWN_MS', () => {
-  it('is 10 seconds', () => {
-    expect(RETRY_COOLDOWN_MS).toBe(10_000);
   });
 });

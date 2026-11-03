@@ -6,7 +6,7 @@ import {
 } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { requestLiteralLoopback } from '../core/loopback-target.js';
-import { TERMINAL_VIEW_FORWARD_HEADER } from '../core/terminal-control-grant.js';
+import { TERMINAL_VIEW_FORWARD_HEADER, TERMINAL_WAKE_HEADER } from '../core/terminal-control-grant.js';
 import { TERMINAL_PLATFORM_READONLY_HINT_HEADER } from '../core/terminal-write-auth.js';
 import type {
   TerminalControlManager,
@@ -60,6 +60,10 @@ export interface TerminalFrontProxyOptions {
    * the worker refuses the capability, which is what makes a raw view URL
    * aimed at the worker port or the daemon's own `/s/` proxy fail closed. */
   viewCapabilityForwardProof?(viewToken: string): string | undefined;
+  /** #2004: sign the "this requester is authenticated" proof the daemon's
+   * terminal proxy needs before it wakes a suspended session. Only attached for
+   * a signed-in actor; the worker never reads it. */
+  wakeProof?(sessionId: string): string | null | undefined;
 }
 
 function safeDecodeSessionId(raw: string): string | undefined {
@@ -103,6 +107,7 @@ export function terminalForwardHeaders(
     // internal grant header itself.
     const forwarded = { ...headers };
     delete forwarded[TERMINAL_CONTROL_HEADER];
+    delete forwarded[TERMINAL_WAKE_HEADER];
     return forwarded;
   }
   const forwarded: OutgoingHttpHeaders = {};
@@ -253,6 +258,14 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     // terminalForwardHeaders 之后，客户端自带的同名头已被整片丢弃、无法夹带。
     if (actor?.terminalCapability === 'readonly') {
       headers[TERMINAL_PLATFORM_READONLY_HINT_HEADER] = '1';
+    }
+    // #2004：daemon 唤醒挂起会话前先认身份。显式 query capability 会让上面剥掉全部
+    // 浏览器凭据，daemon 看不出「这是登录过的人」，所以对已鉴权的身份（本机登录 /
+    // H5 / 平台 SSO，含只读访客）另附一枚唤醒证明；平台免登录访客不附。同样设在
+    // terminalForwardHeaders 之后，客户端自带的同名头已被丢弃。
+    if (actor && !actor.anonymous) {
+      const proof = options.wakeProof?.(parsed.sessionId);
+      if (proof) headers[TERMINAL_WAKE_HEADER] = proof;
     }
     return { ...parsed, port, revoked: false, actor, proxyGrant, readAuthSessionId, headers };
   };

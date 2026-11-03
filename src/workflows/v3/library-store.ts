@@ -26,7 +26,6 @@ import {
   canonicalJsonStringify,
   loadSavedWorkflowRevision,
   mintSavedWorkflowId,
-  normalizeSavedWorkflowLookupKey,
   validateSavedWorkflowMetadata,
   type LoadedSavedWorkflowRevision,
   type SavedWorkflowMetadata,
@@ -118,11 +117,6 @@ export interface SavedWorkflowListResult {
   entries: SavedWorkflowMetadata[];
   invalid: Array<{ workflowId: string; error: string }>;
 }
-
-export type SavedWorkflowResolution =
-  | { kind: 'not_found' }
-  | { kind: 'resolved'; metadata: SavedWorkflowMetadata }
-  | { kind: 'ambiguous'; matches: SavedWorkflowMetadata[] };
 
 export function workflowLibraryRoot(dataDir: string): string {
   if (!dataDir) throw new Error('dataDir is required');
@@ -747,24 +741,6 @@ export async function publishLatestSavedWorkflow(
   });
 }
 
-export async function archiveSavedWorkflow(
-  dataDir: string,
-  workflowId: string,
-  input: { actor: SavedWorkflowOwner; now?: Date },
-): Promise<SavedWorkflowMetadata> {
-  return withExistingSavedWorkflowMutationLock(dataDir, workflowId, async () => {
-    const metadata = await readSavedWorkflowMetadata(dataDir, workflowId);
-    assertOwner(metadata, input.actor);
-    const next = validateSavedWorkflowMetadata({
-      ...metadata,
-      status: 'archived',
-      updatedAt: (input.now ?? new Date()).toISOString(),
-    });
-    await writeMetadata(dataDir, next);
-    return next;
-  });
-}
-
 export async function listSavedWorkflows(
   dataDir: string,
   opts: ListSavedWorkflowOptions = {},
@@ -804,22 +780,6 @@ function isVisible(metadata: SavedWorkflowMetadata, opts: ListSavedWorkflowOptio
     if (!sameOwner(opts.actor, metadata.owner)) return false;
   }
   return true;
-}
-
-export async function resolveSavedWorkflowRef(
-  dataDir: string,
-  ref: string,
-  opts: ListSavedWorkflowOptions = {},
-): Promise<SavedWorkflowResolution> {
-  const normalized = normalizeSavedWorkflowLookupKey(ref);
-  const { entries } = await listSavedWorkflows(dataDir, opts);
-  const matches = entries.filter((metadata) =>
-    metadata.workflowId === ref ||
-    normalizeSavedWorkflowLookupKey(metadata.displayName) === normalized ||
-    metadata.aliases.some((alias) => normalizeSavedWorkflowLookupKey(alias) === normalized));
-  if (matches.length === 0) return { kind: 'not_found' };
-  if (matches.length > 1) return { kind: 'ambiguous', matches };
-  return { kind: 'resolved', metadata: matches[0]! };
 }
 
 async function writeMetadata(dataDir: string, metadata: SavedWorkflowMetadata): Promise<void> {

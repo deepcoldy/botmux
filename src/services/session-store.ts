@@ -1,14 +1,20 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
+import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
+import { resolveCodexProfileHome } from './codex-profiles.js';
+import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { pidExistsEpermAlive } from '../utils/process-alive.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
+import { removeStatuslineDir } from './statusline-snapshot.js';
+import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
+import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
   type HostSessionCommand,
@@ -21,10 +27,46 @@ import {
   type DatabaseSyncLike,
   type StatementLike,
 } from './sqlite-compat.js';
-import type { Session } from '../types.js';
+import type {
+  HumanLaneIdentityEvidence,
+  HumanLanePrincipal,
+  InboundPrincipal,
+  MessageProvenance,
+  PrincipalLaneBinding,
+  PrincipalLaneDisplayTarget,
+  PrincipalLaneSourceState,
+  PrincipalLaneWorktreeProof,
+  Session,
+} from '../types.js';
+import {
+  decideLegacySourceMigration,
+  lanePrincipalKey,
+  parsePrincipalLaneBinding,
+  parsePrincipalLaneSourceState,
+  sourceSessionDisplayTarget,
+} from '../core/principal-lane-routing.js';
+import {
+  materializePrincipalLaneWorktree,
+  parsePrincipalLaneWorktreeProof,
+  principalLaneWorktreeMaterializationId,
+  readPrincipalLaneGitIdentity,
+  type PrincipalLaneWorktreeMaterialization,
+} from '../core/principal-lane-worktree.js';
+import {
+  PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION,
+  parsePrincipalWorkspaceGroup,
+  parsePrincipalWorkspaceMember,
+  principalWorkspaceGroupIdV2,
+  type PrincipalWorkspaceGroup,
+  type PrincipalWorkspaceMember,
+} from '../core/principal-workspace-admission.js';
 import { configuredCodexInstanceBot, newSessionCodexInstanceState, legacyCodexInstanceBinding, type SessionCreationSource } from './codex-instance-pool.js';
+import { isCodexServiceTierCliId } from './codex-service-tier.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
+import type { HolderReason } from './session-store-copy.js';
+import { knownBotAppIds } from './known-bot-app-ids.js';
+export type { HolderReason } from './session-store-copy.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
@@ -56,6 +98,7 @@ export class SessionStoreUnavailableError extends Error {
  * mutation was published. */
 export class SessionStoreBusyError extends Error {
   override readonly name = 'SessionStoreBusyError';
+  readonly code = 'session_store_busy';
 
   constructor(readonly storeError: unknown) {
     super(`session store is busy: ${storeError instanceof Error ? storeError.message : String(storeError)}`);
@@ -74,22 +117,19 @@ function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
 }
 
 // ─── SQLite engine ───────────────────────────────────────────────────────────
-// Per-bot session rows live in `session-stores/<appId>/sessions.db` (legacy
-// no-appId store: `sessions.db`), one table, whole-row JSON column. The TS
-// `Session` type stays the schema authority; the generated columns below only
-// serve hot lookups.
+// Per-bot session rows live in `session-stores/<appId>/sessions.db`, one table,
+// whole-row JSON column. The TS `Session` type stays the schema authority; the
+// generated columns below only serve hot lookups.
 //
 // SQLite is the only engine the OWNING DAEMON ever writes. It imports its
-// pre-SQLite `sessions*.json` once at first load and never writes JSON again.
+// pre-SQLite `sessions-<appId>.json` once at first load and never writes JSON
+// again.
 //
-// The cross-process surface (worker reads, CLI reads, CLI offline writes) still
-// resolves each store as "use the .db when it exists, else the .json". That is
-// not leftover indecision — it is the upgrade window. `npm i -g` replaces dist
-// and repoints ~/.botmux/bin/botmux immediately, while the daemon that owns the
-// rows keeps running the OLD code (auto-update is off by default and `botmux
-// upgrade` tells the operator to restart by hand), so a store can legitimately
-// have no `.db` for hours or weeks. Dropping the JSON read seam would leave
-// every live session's `botmux send` unable to find itself until that restart.
+// Cross-process readers and host writers open the `.db` or nothing. A leftover
+// `sessions-<appId>.json` without a `.db` means the owning daemon still runs a
+// pre-SQLite build: that store is `unmigrated` (existence only, never parsed)
+// and every cross-process caller fails closed with a restart hint — see
+// docs/design/2026-08-12-session-restage-store-first.md §3.3.
 //
 // The frozen JSON is deliberately never deleted: it is also the only artifact a
 // downgrade to a pre-SQLite botmux can read, and it costs a few hundred KB.
@@ -124,6 +164,260 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_root_message_id ON sessions(root_message_id, status);
 CREATE INDEX IF NOT EXISTS idx_sessions_chat_scope ON sessions(chat_id, scope, status);
+`;
+
+/** Principal-lane sidecars are intentionally separate from the whole Session
+ * JSON row. They provide one durable owner for lane indexes, workspace epochs,
+ * quote provenance, and migration audits before the runtime routing feature is
+ * enabled. CREATE IF NOT EXISTS is the migration: legacy stores remain fully
+ * readable and keep their original single-principal behavior until an owner
+ * identity passes the explicit migration gate. */
+export const PRINCIPAL_LANE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS principal_lane_sources (
+  source_session_id TEXT PRIMARY KEY,
+  source_principal_key TEXT NOT NULL,
+  canonical_cwd TEXT NOT NULL,
+  workspace_epoch INTEGER NOT NULL CHECK(workspace_epoch >= 1),
+  workspace_group_id TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  row TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS principal_lanes (
+  lane_id TEXT NOT NULL,
+  source_session_id TEXT NOT NULL,
+  session_id TEXT NOT NULL UNIQUE,
+  principal_key TEXT NOT NULL,
+  routing_anchor TEXT NOT NULL,
+  workspace_epoch INTEGER NOT NULL CHECK(workspace_epoch >= 1),
+  phase TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  row TEXT NOT NULL,
+  PRIMARY KEY(source_session_id, lane_id),
+  UNIQUE(source_session_id, principal_key),
+  UNIQUE(source_session_id, routing_anchor)
+);
+CREATE INDEX IF NOT EXISTS idx_principal_lanes_source
+  ON principal_lanes(source_session_id, phase);
+CREATE INDEX IF NOT EXISTS idx_principal_lanes_routing_anchor
+  ON principal_lanes(routing_anchor, phase);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_principal_lanes_source_routing_anchor
+  ON principal_lanes(source_session_id, routing_anchor);
+CREATE TABLE IF NOT EXISTS principal_lane_worktrees (
+  materialization_id TEXT PRIMARY KEY,
+  source_session_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  session_id TEXT NOT NULL UNIQUE,
+  principal_key TEXT NOT NULL,
+  workspace_epoch INTEGER NOT NULL CHECK(workspace_epoch >= 1),
+  source_repo_root TEXT NOT NULL,
+  source_git_common_dir TEXT NOT NULL,
+  worktree_root TEXT NOT NULL UNIQUE,
+  worktree_git_common_dir TEXT NOT NULL,
+  working_dir TEXT NOT NULL UNIQUE,
+  branch TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK(phase IN ('ready', 'quarantined')),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  row TEXT NOT NULL,
+  UNIQUE(source_session_id, lane_id),
+  UNIQUE(source_session_id, principal_key)
+);
+CREATE INDEX IF NOT EXISTS idx_principal_lane_worktrees_source
+  ON principal_lane_worktrees(source_session_id, phase);
+CREATE TABLE IF NOT EXISTS principal_lane_aliases (
+  source_session_id TEXT NOT NULL,
+  alias_key TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  canonical_principal_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(source_session_id, alias_key)
+);
+CREATE INDEX IF NOT EXISTS idx_principal_lane_aliases_lane
+  ON principal_lane_aliases(source_session_id, lane_id);
+CREATE TABLE IF NOT EXISTS principal_lane_identity_audit (
+  audit_id TEXT PRIMARY KEY,
+  source_session_id TEXT NOT NULL,
+  lane_id TEXT,
+  event TEXT NOT NULL CHECK(event IN ('created', 'upgraded', 'conflict')),
+  from_principal_key TEXT,
+  to_principal_key TEXT,
+  detail TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_principal_lane_identity_audit_source
+  ON principal_lane_identity_audit(source_session_id, created_at);
+CREATE TABLE IF NOT EXISTS principal_lane_identity_conflicts (
+  conflict_id TEXT PRIMARY KEY,
+  source_session_id TEXT NOT NULL,
+  left_alias_key TEXT NOT NULL,
+  right_alias_key TEXT NOT NULL,
+  left_lane_id TEXT NOT NULL,
+  right_lane_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(source_session_id, left_alias_key, right_alias_key)
+);
+CREATE INDEX IF NOT EXISTS idx_principal_lane_identity_conflicts_aliases
+  ON principal_lane_identity_conflicts(source_session_id, left_alias_key, right_alias_key);
+CREATE TABLE IF NOT EXISTS message_provenance (
+  message_id TEXT PRIMARY KEY,
+  lark_app_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  display_root_id TEXT,
+  source_session_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  principal_key TEXT NOT NULL,
+  worker_generation INTEGER NOT NULL CHECK(worker_generation >= 1),
+  direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+  trust_state TEXT NOT NULL CHECK(trust_state IN ('trusted', 'untrusted')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_provenance_turn
+  ON message_provenance(source_session_id, turn_id, worker_generation);
+CREATE INDEX IF NOT EXISTS idx_message_provenance_gc
+  ON message_provenance(updated_at, trust_state);
+CREATE TABLE IF NOT EXISTS message_provenance_trust_fences (
+  message_id TEXT PRIMARY KEY,
+  lark_app_id TEXT NOT NULL,
+  source_session_id TEXT NOT NULL,
+  session_id TEXT,
+  turn_id TEXT,
+  worker_generation INTEGER,
+  attempt_id TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS message_provenance_conflicts (
+  audit_id TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK(reason IN ('identity_conflict')),
+  existing_identity TEXT NOT NULL,
+  incoming_identity TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_provenance_conflicts_message
+  ON message_provenance_conflicts(message_id, created_at);
+CREATE TABLE IF NOT EXISTS principal_lane_migration_audit (
+  audit_id TEXT PRIMARY KEY,
+  source_session_id TEXT NOT NULL,
+  lark_app_id TEXT NOT NULL,
+  principal_key TEXT,
+  outcome TEXT NOT NULL CHECK(outcome IN ('bound', 'disabled')),
+  evidence TEXT CHECK(evidence IN ('owner_union_id', 'same_app_owner_open_id')),
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_principal_lane_migration_source
+  ON principal_lane_migration_audit(source_session_id, created_at);
+CREATE TABLE IF NOT EXISTS principal_workspace_groups (
+  group_id TEXT PRIMARY KEY,
+  group_key_version INTEGER NOT NULL CHECK(group_key_version = 2),
+  lark_app_id TEXT NOT NULL,
+  canonical_cwd TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK(phase IN ('active', 'closing', 'closed', 'quarantined')),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  last_lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(last_lease_generation >= 0),
+  row TEXT NOT NULL,
+  UNIQUE(group_key_version, lark_app_id, canonical_cwd)
+);
+CREATE TABLE IF NOT EXISTS principal_workspace_members (
+  source_session_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  session_id TEXT NOT NULL UNIQUE,
+  group_id TEXT NOT NULL,
+  workspace_epoch INTEGER NOT NULL CHECK(workspace_epoch >= 1),
+  membership_phase TEXT NOT NULL CHECK(membership_phase IN ('active', 'closing', 'closed', 'quarantined')),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  row TEXT NOT NULL,
+  PRIMARY KEY(source_session_id, lane_id)
+);
+CREATE INDEX IF NOT EXISTS idx_principal_workspace_members_group
+  ON principal_workspace_members(group_id, membership_phase);
+CREATE TABLE IF NOT EXISTS principal_workspace_migration_audit (
+  audit_id TEXT PRIMARY KEY,
+  source_session_id TEXT NOT NULL,
+  event TEXT NOT NULL CHECK(event IN ('created', 'migrated', 'conflict')),
+  from_group_id TEXT,
+  target_group_id TEXT,
+  from_revision INTEGER,
+  from_epoch INTEGER,
+  detail TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_principal_workspace_migration_source
+  ON principal_workspace_migration_audit(source_session_id, created_at);
+CREATE TABLE IF NOT EXISTS principal_workspace_member_conflicts (
+  conflict_id TEXT PRIMARY KEY,
+  source_session_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  existing_identity TEXT,
+  incoming_identity TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_principal_workspace_member_conflicts_source
+  ON principal_workspace_member_conflicts(source_session_id, created_at);
+CREATE TABLE IF NOT EXISTS principal_workspace_ticket_sequences (
+  group_id TEXT PRIMARY KEY,
+  last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0 AND last_sequence <= 9007199254740991),
+  revision INTEGER NOT NULL CHECK(revision >= 1 AND revision <= 9007199254740991),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  row TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS principal_workspace_tickets (
+  ticket_id TEXT PRIMARY KEY,
+  group_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK(sequence >= 1 AND sequence <= 9007199254740991),
+  source_session_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  workspace_epoch INTEGER NOT NULL CHECK(workspace_epoch >= 1),
+  turn_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('queued', 'attempting', 'completed', 'cancelled', 'unknown')),
+  revision INTEGER NOT NULL CHECK(revision >= 1 AND revision <= 9007199254740991),
+  namespace_version INTEGER NOT NULL CHECK(namespace_version = 1),
+  namespace TEXT NOT NULL,
+  record_version INTEGER NOT NULL CHECK(record_version = 1),
+  record_id TEXT NOT NULL,
+  payload_encoding TEXT NOT NULL CHECK(payload_encoding = 'canonical-json-utf8-base64'),
+  payload_hash TEXT NOT NULL,
+  exact_file_length INTEGER NOT NULL CHECK(exact_file_length >= 1 AND exact_file_length <= 2097152),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  row TEXT NOT NULL,
+  UNIQUE(group_id, sequence),
+  UNIQUE(source_session_id, lane_id, session_id, turn_id),
+  UNIQUE(namespace_version, namespace, record_version, record_id)
+);
+CREATE INDEX IF NOT EXISTS idx_principal_workspace_tickets_group_fifo
+  ON principal_workspace_tickets(group_id, status, sequence);
+CREATE INDEX IF NOT EXISTS idx_principal_workspace_tickets_namespace
+  ON principal_workspace_tickets(namespace_version, namespace, sequence);
+CREATE TABLE IF NOT EXISTS principal_workspace_ticket_audit (
+  audit_id TEXT PRIMARY KEY,
+  group_id TEXT NOT NULL,
+  ticket_id TEXT,
+  source_session_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  event TEXT NOT NULL CHECK(event IN (
+    'enqueued', 'turn_record_conflict', 'record_ticket_conflict',
+    'ticket_id_collision', 'ticket_row_corruption', 'sequence_corruption',
+    'counter_corruption'
+  )),
+  detail TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_principal_workspace_ticket_audit_ticket
+  ON principal_workspace_ticket_audit(ticket_id, event, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_principal_workspace_ticket_audit_enqueued
+  ON principal_workspace_ticket_audit(ticket_id) WHERE event = 'enqueued';
+CREATE INDEX IF NOT EXISTS idx_principal_workspace_ticket_audit_group
+  ON principal_workspace_ticket_audit(group_id, event, created_at);
 `;
 
 /** Per-bot occupancy (grain directory). v1 uses a single `bot` row; the
@@ -207,8 +501,58 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
   db.exec(SESSIONS_SCHEMA_SQL);
+  db.exec(PRINCIPAL_LANE_SCHEMA_SQL);
+  ensurePrincipalLaneWorktreeCommonDirColumns(db);
+  ensureMessageProvenanceTrustFenceIdentityColumns(db);
   db.exec(OCCUPANCY_SCHEMA_SQL);
-  return db;
+  return guardSessionDirectoryWrites(db);
+}
+
+/** `0d6ab50d1` could create this sidecar before the common-dir proof columns
+ * existed. SQLite cannot add NOT NULL columns to a populated table without a
+ * fabricated default, so upgrades add nullable columns and deliberately leave
+ * old rows NULL. The parser rejects those rows; only a fresh materialization
+ * can publish usable proof. */
+function ensurePrincipalLaneWorktreeCommonDirColumns(db: SqliteDatabaseLike): void {
+  const columns = db.prepare('PRAGMA table_info(principal_lane_worktrees)').all() as Array<{
+    name: string;
+  }>;
+  const names = new Set(columns.map(column => column.name));
+  const addIfMissing = (name: string) => {
+    if (names.has(name)) return;
+    try { db.exec(`ALTER TABLE principal_lane_worktrees ADD COLUMN ${name} TEXT;`); }
+    catch (error) {
+      if (!/duplicate column name/i.test(error instanceof Error ? error.message : String(error))) {
+        throw error;
+      }
+    }
+  };
+  addIfMissing('source_git_common_dir');
+  addIfMissing('worktree_git_common_dir');
+}
+
+/** Older staged stores created provenance fences before an exact dispatch
+ * identity/token was part of the schema. Leave legacy rows NULL so they remain
+ * permanently fail-closed; only a fresh begin attempt may create a releasable
+ * fence. */
+function ensureMessageProvenanceTrustFenceIdentityColumns(db: SqliteDatabaseLike): void {
+  const columns = db.prepare('PRAGMA table_info(message_provenance_trust_fences)').all() as Array<{
+    name: string;
+  }>;
+  const names = new Set(columns.map(column => column.name));
+  const addIfMissing = (name: string, type: string) => {
+    if (names.has(name)) return;
+    try { db.exec(`ALTER TABLE message_provenance_trust_fences ADD COLUMN ${name} ${type};`); }
+    catch (error) {
+      if (!/duplicate column name/i.test(error instanceof Error ? error.message : String(error))) {
+        throw error;
+      }
+    }
+  };
+  addIfMissing('session_id', 'TEXT');
+  addIfMissing('turn_id', 'TEXT');
+  addIfMissing('worker_generation', 'INTEGER');
+  addIfMissing('attempt_id', 'TEXT');
 }
 
 /** Open somebody's store for reading. Read-write first so a stale WAL left by
@@ -243,6 +587,7 @@ interface OwnSqliteStore {
   updateExact: SqliteStatementLike;
   insertNew: SqliteStatementLike;
 }
+type SqliteReadStore = Pick<OwnSqliteStore, 'db'>;
 let ownStore: OwnSqliteStore | undefined;
 
 /** Lock/busy contention is retryable. Swallowing it into loadFailure would let
@@ -318,7 +663,9 @@ function readOccupancyInTxn(db: SqliteDatabaseLike): OccupancyLease | undefined 
   }
 }
 
-/** True when a lease row is present and still inside its TTL. */
+/** True when a lease row is present and still inside its TTL.
+ *  Daemon claim/takeover uses this (unexpired AND owner alive). Host writers
+ *  use {@link hostOccupancyLeaseHeld} instead. */
 export function occupancyLeaseIsActive(
   lease: OccupancyLease | undefined,
   now: number = Date.now(),
@@ -326,15 +673,19 @@ export function occupancyLeaseIsActive(
   return !!lease && lease.leaseUntil > now;
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM: the process exists but is not ours to signal — still alive.
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
+/** Host-side lease: unexpired OR the owner pid is still alive.
+ *  Fail-closed — a wedged process whose TTL lapsed still blocks offline writes.
+ *  PID reuse can false-positive (host cannot close until the next TTL); a
+ *  start-identity column is C-13 and not in this PR. */
+export function hostOccupancyLeaseHeld(
+  lease: OccupancyLease | undefined,
+  now: number = Date.now(),
+): boolean {
+  return !!lease && (lease.leaseUntil > now || processAlive(lease.ownerPid));
 }
+
+// EPERM: the process exists but is not ours to signal — still alive.
+const processAlive = pidExistsEpermAlive;
 
 export type OccupancyClaimResult =
   /** This process holds the lease (claimed, taken over, or renewed). */
@@ -392,31 +743,18 @@ function claimOccupancyOnLoad(db: SqliteDatabaseLike, now: number): void {
   }
 }
 
-/**
- * SQLite ownership: a live lease blocks the write outright. Without a live
- * lease (row absent or expired) `abortIf` — the descriptor-heartbeat probe —
- * still decides. That fallback is the upgrade window: a daemon that writes
- * SQLite but not occupancy (a pre-Stage-1 build, or a rollback after a newer
- * build crashed and left a stale row) is visible only by heartbeat. Either
- * signal fails closed; only "no live lease AND no fresh heartbeat" lets an
- * offline writer publish.
- */
-function sqliteOccupancyBlocksWrite(
-  lease: OccupancyLease | undefined,
-  now: number,
-  abortIf?: () => boolean,
-): boolean {
-  return occupancyLeaseIsActive(lease, now) || !!abortIf?.();
+function holderFromLease(lease: OccupancyLease | undefined, now: number): HolderReason | undefined {
+  return hostOccupancyLeaseHeld(lease, now) ? 'lease' : undefined;
 }
 
-/** Point-read the bot-scope lease. JSON stores and pre-occupancy DBs → undefined. */
+/** Point-read the bot-scope lease. Missing .db or pre-occupancy DBs → undefined. */
 export function readOccupancyLease(
   larkAppId: string,
   dataDir: string = config.session.dataDir,
 ): OccupancyLease | undefined {
-  const ref = resolveStoreFile(larkAppId, dataDir);
-  if (ref.kind !== 'sqlite' || !existsSync(ref.path)) return undefined;
-  const db = openDbForRead(ref.path);
+  const dbPath = storeDbPath(larkAppId, dataDir);
+  if (!existsSync(dbPath)) return undefined;
+  const db = openDbForRead(dbPath);
   try {
     return readOccupancyInTxn(db);
   } finally {
@@ -457,20 +795,47 @@ function sessionStatusText(value: unknown): string {
 }
 
 let testOnlyBeforeRowPersist: ((sessionId: string) => void) | undefined;
+let testOnlyBeforePrincipalLaneCreateTransaction: (() => void) | undefined;
+let testOnlyBeforePrincipalLaneWorktreeCommit: (() => void) | undefined;
+let testOnlyAfterPrincipalLaneWorktreeCommit: (() => void) | undefined;
 /** Failure injection for the SQLite row write (the JSON engine was injectable
  *  through a node:fs mock; the sqlite-compat handle bypasses node:fs). */
 export function __testOnly_setBeforeRowPersist(hook: ((sessionId: string) => void) | undefined): void {
   testOnlyBeforeRowPersist = hook;
 }
 
-// ─── Store resolution (db-else-json, cross-process only) ─────────────────────
+/** Failure/race injection between the authority snapshot and the write
+ * transaction. Production code never assigns this hook. */
+export function __testOnly_setBeforePrincipalLaneCreateTransaction(
+  hook: (() => void) | undefined,
+): void {
+  testOnlyBeforePrincipalLaneCreateTransaction = hook;
+}
+
+export function __testOnly_setBeforePrincipalLaneWorktreeCommit(
+  hook: (() => void) | undefined,
+): void {
+  testOnlyBeforePrincipalLaneWorktreeCommit = hook;
+}
+
+export function __testOnly_setAfterPrincipalLaneWorktreeCommit(
+  hook: (() => void) | undefined,
+): void {
+  testOnlyAfterPrincipalLaneWorktreeCommit = hook;
+}
+
+// ─── Store resolution (SQLite only for cross-process readers) ────────────────
 
 type StoreFileRef = {
-  /** undefined = the legacy no-appId store. */
-  appId?: string;
-  kind: 'sqlite' | 'json';
+  appId: string;
   path: string;
 };
+
+export type StorePresence = 'ready' | 'unmigrated' | 'absent';
+
+export class SessionStoreUnmigratedError extends Error {
+  override readonly name = 'SessionStoreUnmigratedError';
+}
 
 /** Per-bot SQLite stores live in their OWN directory
  *  (`session-stores/<appId>/sessions.db`), not as flat sibling files: the CLI
@@ -479,49 +844,56 @@ type StoreFileRef = {
  *  when the last connection closes — a persistent pane surviving a daemon
  *  restart would keep reading the dead WAL forever (or a corrupt hybrid once
  *  checkpoints recycle it). Directory binds resolve names live, so the pane
- *  always sees the current sidecars. The legacy no-appId store (tests /
- *  single-bot dev) stays flat `sessions.db` — it is never sandbox-granted. */
+ *  always sees the current sidecars. */
 const PER_BOT_STORE_DIRNAME = 'session-stores';
 
 export function sessionStoreSqliteDir(appId: string, dataDir: string = config.session.dataDir): string {
   return join(dataDir, PER_BOT_STORE_DIRNAME, appId);
 }
 
-function storeDbPath(appId: string | undefined, dataDir: string): string {
-  return appId ? join(sessionStoreSqliteDir(appId, dataDir), 'sessions.db') : join(dataDir, 'sessions.db');
+function storeDbPath(appId: string, dataDir: string): string {
+  return join(sessionStoreSqliteDir(appId, dataDir), 'sessions.db');
 }
 
 /** The pre-SQLite file for a store: the daemon's one-shot import source, and
- *  the cross-process read seam until that daemon restarts. */
-function storeJsonFileName(appId: string | undefined): string {
-  return appId ? `sessions-${appId}.json` : 'sessions.json';
+ *  the unmigrated existence probe (never parsed by cross-process readers). */
+function storeJsonFileName(appId: string): string {
+  return `sessions-${appId}.json`;
 }
 
-/** Per-store rule for every cross-process reader and CLI offline writer:
- *  use the .db when it exists, else the .json (see the upgrade-window note at
- *  the top of the engine section). */
-function resolveStoreFile(appId: string | undefined, dataDir: string): StoreFileRef {
+export function classifyStorePresence(appId: string, dataDir: string): StorePresence {
+  if (existsSync(storeDbPath(appId, dataDir))) return 'ready';
+  if (existsSync(join(dataDir, storeJsonFileName(appId)))) return 'unmigrated';
+  return 'absent';
+}
+
+/** Per-store rule for every cross-process reader: the .db, or nothing. */
+function resolveStoreFile(appId: string, dataDir: string): StoreFileRef | undefined {
   const dbPath = storeDbPath(appId, dataDir);
-  if (existsSync(dbPath)) return { appId, kind: 'sqlite', path: dbPath };
-  return { appId, kind: 'json', path: join(dataDir, storeJsonFileName(appId)) };
+  if (existsSync(dbPath)) return { appId, path: dbPath };
+  return undefined;
 }
 
-/** One ref per store identity across the whole data dir, .db winning: flat
- *  legacy files + per-bot JSON files + per-bot SQLite store directories.
- *  `strict` propagates an unlistable `session-stores/` dir (fail-closed
- *  callers must not mistake an unreadable store set for an empty one);
- *  otherwise it degrades to the JSON view. */
+/** App ids whose `sessions-<id>.json` exists and whose `.db` does not.
+ *  Existence only — the JSON is never parsed. */
+export function listUnmigratedAppIds(dataDir: string, opts: { strict?: boolean } = {}): string[] {
+  let names: string[] = [];
+  try { names = readdirSync(dataDir); } catch (error) { if (opts.strict) throw error; return []; }
+  const ids: string[] = [];
+  for (const name of names) {
+    if (!name.startsWith('sessions-') || !name.endsWith('.json')) continue;
+    const appId = name.slice('sessions-'.length, -'.json'.length);
+    if (appId && classifyStorePresence(appId, dataDir) === 'unmigrated') ids.push(appId);
+  }
+  return ids;
+}
+
+/** One ref per SQLite store identity. `strict` propagates an unlistable
+ *  `session-stores/` dir (fail-closed callers must not mistake an unreadable
+ *  store set for an empty one). */
 function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreFileRef[] {
   const names = readdirSync(dataDir);
-  const dbPaths = new Map<string, string>();
-  const jsonPaths = new Map<string, string>();
-  for (const name of names) {
-    if (name === 'sessions.db') dbPaths.set('', join(dataDir, name));
-    else if (name === 'sessions.json') jsonPaths.set('', join(dataDir, name));
-    else if (name.startsWith('sessions-') && name.endsWith('.json')) {
-      jsonPaths.set(name.slice('sessions-'.length, -'.json'.length), join(dataDir, name));
-    }
-  }
+  const refs: StoreFileRef[] = [];
   if (names.includes(PER_BOT_STORE_DIRNAME)) {
     let appIds: string[] = [];
     try {
@@ -531,35 +903,22 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
     }
     for (const appId of appIds) {
       const dbPath = storeDbPath(appId, dataDir);
-      if (existsSync(dbPath)) dbPaths.set(appId, dbPath);
+      if (existsSync(dbPath)) refs.push({ appId, path: dbPath });
     }
-  }
-  const refs: StoreFileRef[] = [];
-  for (const key of new Set([...dbPaths.keys(), ...jsonPaths.keys()])) {
-    const dbPath = dbPaths.get(key);
-    refs.push({
-      appId: key === '' ? undefined : key,
-      kind: dbPath ? 'sqlite' : 'json',
-      path: dbPath ?? jsonPaths.get(key)!,
-    });
   }
   return refs;
 }
 
 /** All [key, value] entries of one store. Throws on an unreadable store;
  *  callers decide skip-vs-propagate (capability errors always propagate). */
-function readStoreEntries(ref: StoreFileRef): [string, Session][] {
-  if (ref.kind === 'json') {
-    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return [];
-    return Object.entries(parsed as Record<string, Session>);
-  }
+function readStoreEntries(ref: StoreFileRef, strict = false): [string, Session][] {
   const db = openDbForRead(ref.path);
   try {
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
     const entries: [string, Session][] = [];
     for (const r of rows) {
-      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { /* skip unparseable row */ }
+      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); }
+      catch (error) { if (strict) throw error; /* display readers skip unparseable rows */ }
     }
     return entries;
   } finally {
@@ -569,11 +928,6 @@ function readStoreEntries(ref: StoreFileRef): [string, Session][] {
 
 /** Point-read one key from one store. Throws on an unreadable store. */
 function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | undefined {
-  if (ref.kind === 'json') {
-    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-    return (parsed as Record<string, Session>)[sessionId];
-  }
   // The daemon's hot freshness reads hit its own store — reuse the attached
   // connection instead of opening one per call.
   if (ownStore && loaded && ref.appId === currentAppId && ref.path === getDbPath()) {
@@ -595,24 +949,6 @@ function readStoreActiveRows(
   hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
   opts: { strict?: boolean } = {},
 ): Session[] {
-  if (ref.kind === 'json') {
-    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      if (opts.strict) throw new Error(`malformed active session store in ${ref.path}`);
-      return [];
-    }
-    const out: Session[] = [];
-    for (const value of Object.values(parsed as Record<string, unknown>)) {
-      if (!value || typeof value !== 'object' || (value as { status?: unknown }).status !== 'active') continue;
-      const session = value as Partial<Session>;
-      if (typeof session.sessionId !== 'string') {
-        if (opts.strict) throw new Error(`malformed active session row in ${ref.path}: invalid session object`);
-        continue;
-      }
-      out.push(session as Session);
-    }
-    return out;
-  }
   const db = openDbForRead(ref.path);
   try {
     let sql = "SELECT row FROM sessions WHERE status = 'active'";
@@ -703,26 +1039,20 @@ function remoteOwnersEqual(left: RemoteDurableOwner, right: RemoteDurableOwner):
     && left.backendType === right.backendType;
 }
 
-let testOnlyAfterRemoteBatchRename: (() => void) | undefined;
-export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefined): void {
-  testOnlyAfterRemoteBatchRename = hook;
-}
-
 /**
- * Initialise session store for a specific bot (multi-daemon mode).
- * When appId is set, sessions are stored in `session-stores/{appId}/sessions.db`.
- * When unset, uses the legacy no-appId store (`sessions.db`).
+ * Initialise session store for a specific bot.
+ * Sessions are stored in `session-stores/{appId}/sessions.db`.
  *
- * `owner: false` marks a non-owning process (worker): it reads whichever
- * engine exists (db-else-json) but never bootstraps/imports the SQLite store —
- * an old daemon can spawn workers from a newer dist during the upgrade window,
- * and only the daemon itself may flip the on-disk engine.
+ * `owner: false` marks a non-owning process (worker): it never bootstraps or
+ * imports the SQLite store. Only the owning daemon may create the on-disk
+ * engine.
  */
-export function init(appId?: string, opts: {
+export function init(appId: string, opts: {
   owner?: boolean;
   occupancy?: OccupancyHolder;
   groupDefaultModels?: (chatId: string) => Session['groupDefaultModels'];
 } = {}): void {
+  if (!appId) throw new Error('session store init(appId) requires a non-empty appId');
   migratedCodexInstanceConfig = undefined;
   currentAppId = appId;
   resolveGroupDefaultModels = opts.groupDefaultModels;
@@ -737,13 +1067,20 @@ export function init(appId?: string, opts: {
   }
 }
 
+function requireCurrentAppId(): string {
+  if (!currentAppId) {
+    throw new Error('session store is not initialized; init(appId) is required');
+  }
+  return currentAppId;
+}
+
 /** Pre-SQLite JSON file for this store — the one-shot import source. */
 function getImportJsonPath(): string {
-  return join(config.session.dataDir, storeJsonFileName(currentAppId));
+  return join(config.session.dataDir, storeJsonFileName(requireCurrentAppId()));
 }
 
 function getDbPath(): string {
-  return storeDbPath(currentAppId, config.session.dataDir);
+  return storeDbPath(requireCurrentAppId(), config.session.dataDir);
 }
 
 function ensureDir(): void {
@@ -784,47 +1121,75 @@ function parseSessionsProjectionStrict(raw: string, fp: string): Record<string, 
 }
 
 /** Which snapshot file a recovery/import read actually resolved. `none` means no
- *  readable snapshot existed at all — distinct from "a readable snapshot that
+ *  readable snapshot for THIS bot — distinct from "a readable snapshot that
  *  legitimately holds zero rows for this bot", which IS evidence. */
 type FrozenSnapshotSource = 'per-bot' | 'legacy' | 'none';
 
-/** The JSON rows today's load()/migration would have produced for this store,
- *  plus WHICH file they came from. The source matters to recovery: a legacy
- *  `sessions.json` that parses fine but filters down to zero rows for this bot
- *  proves the store held nothing, whereas a missing file proves nothing. */
-function readFrozenSnapshotForImport(jsonFp: string): {
-  entries: [string, Session][];
-  source: FrozenSnapshotSource;
-} {
-  let entries: [string, Session][] = [];
-  let source: FrozenSnapshotSource = 'none';
-  if (existsSync(jsonFp)) {
-    const data = parseSessionsProjectionStrict(readFileSync(jsonFp, 'utf-8'), jsonFp);
-    entries = Object.entries(data);
-    source = 'per-bot';
-  } else if (currentAppId) {
-    const legacyFp = join(config.session.dataDir, 'sessions.json');
-    if (!existsSync(legacyFp)) return { entries: [], source: 'none' };
-    const data = parseSessionsProjectionStrict(readFileSync(legacyFp, 'utf-8'), legacyFp);
-    entries = Object.entries(data).filter(([, v]) => v?.larkAppId === currentAppId);
-    source = 'legacy';
-  } else {
-    return { entries: [], source: 'none' };
-  }
+function repairImportedRows(entries: [string, Session][]): void {
   for (const [, value] of entries) {
     if (value && typeof value === 'object') {
       repairMissingChatScope(value);
       stripLegacyPendingCardFields(value as unknown as Record<string, unknown>);
     }
   }
-  return { entries, source };
 }
 
-/** The JSON rows today's load()/migration would have produced for this store:
- *  the per-bot file's entries when it exists, else the legacy `sessions.json`
- *  rows belonging to this bot; scope repair applied, legacy card fields
- *  stripped, closed rows included. Parse failures degrade to an empty store —
- *  exactly like the previous loader. */
+/** The JSON rows today's load()/migration would have produced for this store,
+ *  plus WHICH file they came from. The source matters to recovery: a snapshot
+ *  that was actually READ (per-bot, or a legacy file filtering to zero rows
+ *  for this bot) attests the store; a missing/unreadable file proves nothing. */
+function readFrozenSnapshotForImport(jsonFp: string): {
+  entries: [string, Session][];
+  source: FrozenSnapshotSource;
+} {
+  // The bot's OWN per-bot frozen JSON is the normal one-shot import source. It
+  // parses STRICT: a malformed own source must fail closed, never build an
+  // empty store that would silently swallow every pre-SQLite row.
+  if (existsSync(jsonFp)) {
+    const data = parseSessionsProjectionStrict(readFileSync(jsonFp, 'utf-8'), jsonFp);
+    const entries = Object.entries(data);
+    repairImportedRows(entries);
+    return { entries, source: 'per-bot' };
+  }
+
+  const appId = currentAppId;
+  if (!appId) return { entries: [], source: 'none' };
+
+  // Narrowed legacy rescue (A-8): the flat `sessions.json` written by builds
+  // 1.8.0–1.12.x (2026-03-13…20, before the per-bot split landed in 1.13.0)
+  // carried `larkAppId` on every row. A deployment that ran ONLY those builds
+  // and jumps straight to a SQLite release still gets its rows imported once;
+  // rows without `larkAppId` (the pre-release first 11 days) are abandoned.
+  //
+  // This file is a SHARED, foreign artifact — not this bot's own import source
+  // — so it must never hold this bot's first start hostage. A malformed or
+  // non-object legacy file degrades to "no attested rows" instead of throwing:
+  // the empty store builds and the file is left untouched. The own-file branch
+  // above stays strict.
+  const legacyFp = join(config.session.dataDir, 'sessions.json');
+  if (!existsSync(legacyFp)) return { entries: [], source: 'none' };
+  let legacy: Record<string, Session>;
+  try {
+    legacy = parseSessionsProjectionStrict(readFileSync(legacyFp, 'utf-8'), legacyFp);
+  } catch (err) {
+    logger.warn(
+      `Ignoring unreadable legacy ${legacyFp} for ${appId} first import: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { entries: [], source: 'none' };
+  }
+  // Parsed (even when it filters down to zero rows for this bot) = the file WAS
+  // read, which attests what this store held; that is `legacy`, not `none`.
+  const entries = Object.entries(legacy).filter(([, value]) => value?.larkAppId === appId);
+  repairImportedRows(entries);
+  return { entries, source: 'legacy' };
+}
+
+/** The JSON rows today's load()/migration would have produced for this store
+ *  from `sessions-<appId>.json` (or the narrowed legacy rescue); scope repair
+ *  applied, legacy card fields stripped, closed rows included. Parse failures
+ *  of the OWN file throw (load() fails closed); an unreadable shared legacy
+ *  file degrades to no rows. */
 function readJsonEntriesForImport(jsonFp: string): [string, Session][] {
   return readFrozenSnapshotForImport(jsonFp).entries;
 }
@@ -843,8 +1208,15 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* no leftover from a crashed import */ }
   }
   const entries = readJsonEntriesForImport(jsonFp);
-  const tmp = openDatabaseSyncOrThrow(tmpFp);
+  // The rename below is the first moment every historical row becomes visible
+  // in a SQLite store (the staging db is a private tmp path no scanner reads).
+  // Register all rows' managed references for the staging-and-rename sequence,
+  // so a collection begun during the JSON→SQLite upgrade cannot retire a
+  // version a restored session is about to name.
+  const releaseImport = reserveManagedDirectories(entries.map(([, value]) => value));
+  let tmp: SqliteDatabaseLike | undefined;
   try {
+    tmp = openDatabaseSyncOrThrow(tmpFp);
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     // The staging database is deliberately NOT in WAL mode. `renameSync` below
     // publishes ONE file, so every imported row has to live inside it by the
@@ -882,11 +1254,13 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     renameSync(tmpFp, dbFp);
     return entries.length;
   } catch (err) {
-    try { tmp.close(); } catch { /* already closed */ }
+    try { tmp?.close(); } catch { /* already closed or open failed */ }
     for (const suffix of ['', '-journal', '-wal', '-shm']) {
       try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* best-effort orphan cleanup */ }
     }
     throw err;
+  } finally {
+    releaseImport();
   }
 }
 
@@ -1119,9 +1493,8 @@ function readStrandedImportRows(dbFp: string): {
  *    held. Three things can supply it:
  *      • the orphan demonstrably replayed rows;
  *      • a snapshot file was actually READ — about the source, not the row
- *        count: a legacy `sessions.json` that parses and filters down to zero
- *        rows for this bot proves the store held nothing, while a MISSING file
- *        proves nothing at all;
+ *        count: a `sessions-<appId>.json` that parses (even to zero rows)
+ *        proves the store held nothing, while a MISSING file proves nothing;
  *      • a RECEIPT for this exact orphan digest, written by an earlier pass in
  *        the same transaction as its merge — the only proof that survives a
  *        crash, and the one that lets an interrupted cleanup finish.
@@ -1291,35 +1664,14 @@ function recoverPoisonedSqliteStore(dbFp: string, jsonFp: string): {
   return { merged, archivedEvidence };
 }
 
-/** Read this store's pre-SQLite JSON into the in-memory projection WITHOUT
- *  writing anything back. Only for a non-owning process during the upgrade
- *  window (see `load()`); the owning daemon imports instead. */
-function loadFromFrozenJson(): void {
-  const jsonFp = getImportJsonPath();
-  const legacyFp = join(config.session.dataDir, 'sessions.json');
-  const sourceFp = existsSync(jsonFp) ? jsonFp
-    : currentAppId && existsSync(legacyFp) ? legacyFp
-      : undefined;
-  sessions = new Map();
-  if (!sourceFp) return;
-  try {
-    const data = parseSessionsProjectionStrict(readFileSync(sourceFp, 'utf-8'), sourceFp);
-    for (const [key, value] of Object.entries(data)) {
-      if (sourceFp === legacyFp && value?.larkAppId !== currentAppId) continue;
-      repairMissingChatScope(value);
-      sessions.set(key, value);
-    }
-    logger.info(`Loaded ${sessions.size} sessions from ${sourceFp} (store not imported yet)`);
-  } catch (err) {
-    logger.error(`Failed to load sessions: ${err}`);
-    loadFailure = err instanceof Error ? err : new Error(String(err));
-    sessions = new Map();
-  }
-}
-
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
   if (loaded) return;
+  if (!currentAppId) {
+    sessions = new Map();
+    loaded = true;
+    return;
+  }
   ensureDir();
   const dbFp = getDbPath();
   const jsonFp = getImportJsonPath();
@@ -1376,13 +1728,15 @@ function load(): void {
 
   if (!existsSync(dbFp)) {
     if (!sqliteBootstrapAllowed) {
-      // `owner: false` (a worker) and no store yet: the daemon that spawned it
-      // still runs the pre-SQLite build and keeps writing its JSON, so this
-      // process reads THAT — creating a .db behind that daemon's back would
-      // fork the two representations. Read-only: the repairs and the
-      // legacy→per-bot migration are the owning daemon's job, and it does them
-      // once, as the import.
-      loadFromFrozenJson();
+      // `owner: false` (a worker) must not create a .db or parse frozen JSON.
+      // A leftover sessions-*.json without a .db is unmigrated — fail closed.
+      const appId = requireCurrentAppId();
+      if (classifyStorePresence(appId, config.session.dataDir) === 'unmigrated') {
+        loadFailure = new SessionStoreUnmigratedError(
+          `会话库尚未迁移到 SQLite（${storeJsonFileName(appId)} 仍在，sessions.db 不存在）`,
+        );
+      }
+      sessions = new Map();
       loaded = true;
       return;
     }
@@ -1676,7 +2030,6 @@ export function persistActiveRemoteLineagesExactBatch(
       }
       if (changed) {
         published = true;
-        testOnlyAfterRemoteBatchRename?.();
       }
 
       // Read back the committed rows before any worker may exit.
@@ -1731,13 +2084,34 @@ function persistRow(session: Session): void {
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
     throw new SessionStoreUnavailableError(
-      new Error(`session store ${getDbPath()} is not attached`),
+      new Error(`session store ${currentAppId ? getDbPath() : '<uninitialized>'} is not attached`),
     );
   }
+  // Retirement is a terminal invariant even when the durable row has no marker yet.
+  if (session.workspaceRetirement && session.status !== 'closed') throw new Error('workspace_retired');
   testOnlyBeforeRowPersist?.(session.sessionId);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    if (durable.workspaceRetirement) {
+      if (session.status !== 'closed') throw new Error('workspace_retired');
+      // Late whole-row writers may hold a pre-close copy. Retirement cannot
+      // be erased by a stale metadata write or by changing workingDir.
+      session = { ...session, workspaceRetirement: durable.workspaceRetirement };
+    }
+    // Task continuation has its own compare-and-set writer. Metadata writers
+    // holding an old row must neither erase a live task nor resurrect a stop.
+    session = { ...session, deploymentContinuation: durable.deploymentContinuation };
+    // Pre-migration whole-row writers must not erase the frozen input policy.
+    if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
+      session = { ...session, promptInjection: durable.promptInjection };
+    }
+    if (durable.codexProfile !== undefined) {
+      session = { ...session, codexProfile: durable.codexProfile, codexProfileHome: durable.codexProfileHome };
+    }
+    if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
+      session = { ...session, serviceTier: durable.serviceTier };
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -1746,7 +2120,7 @@ function persistRow(session: Session): void {
       // complete routing identity rather than letting them erase one field.
       session = { ...session, cliInstanceBinding: durable.cliInstanceBinding, creationSource: durable.creationSource,
         cliId: durable.cliId, cliRuntime: durable.cliRuntime, cliPathOverride: durable.cliPathOverride,
-        wrapperCli: durable.wrapperCli, agentFrozen: durable.agentFrozen };
+        wrapperCli: durable.wrapperCli, cliLaunchMode: durable.cliLaunchMode, agentFrozen: durable.agentFrozen };
     }
   }
   const json = JSON.stringify(session);
@@ -1772,7 +2146,7 @@ function buildNewSession(
   const initial = intent.inherit ? {
     cliInstanceBinding: intent.inherit.cliInstanceBinding,
     cliId: intent.inherit.cliId, cliRuntime: intent.inherit.cliRuntime, cliPathOverride: intent.inherit.cliPathOverride,
-    wrapperCli: intent.inherit.wrapperCli, agentFrozen: intent.inherit.agentFrozen, creationSource: 'fork' as const,
+    wrapperCli: intent.inherit.wrapperCli, cliLaunchMode: intent.inherit.cliLaunchMode, agentFrozen: intent.inherit.agentFrozen, creationSource: 'fork' as const,
   } : bot ? newSessionCodexInstanceState(bot, source) : {};
   const session: Session = {
     sessionId: randomUUID(),
@@ -1784,8 +2158,17 @@ function buildNewSession(
     status: 'active',
     createdAt: new Date().toISOString(),
     creationSource: source,
+    codexProfile: intent.inherit ? intent.inherit.codexProfile ?? null : source === 'external' ? null : bot?.codexProfile ?? null,
+    codexProfileHome: intent.inherit ? intent.inherit.codexProfileHome : source !== 'external' && bot?.codexProfile ? resolveCodexProfileHome(bot) : undefined,
+    promptInjection: intent.inherit ? intent.inherit.promptInjection ?? 'default'
+      : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
   };
+  if (source !== 'external' && isCodexServiceTierCliId(bot?.cliId)) {
+    session.serviceTier = bot?.serviceTier ?? 'inherit';
+  } else {
+    delete session.serviceTier;
+  }
   if (chatType !== 'p2p' && scope !== 'chat') {
     const models = resolveGroupDefaultModels?.(chatId);
     if (models && Object.keys(models).length) session.groupDefaultModels = structuredClone(models);
@@ -1876,8 +2259,42 @@ export function createSessionWithOwnedMutation<T>(
   return { session: created, result, rows: fresh };
 }
 
+/** Create the target-side dispatch session with its durable owner marker in one row write. */
+export function createDispatchLaunchSession(input: {
+  dispatchId: string;
+  chatId: string;
+  rootMessageId: string;
+  title: string;
+  chatType: 'group' | 'p2p';
+  workingDir: string;
+  larkAppId: string;
+  requestedOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchRequestedOverride;
+  effectiveOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchEffectiveOverride;
+  createdAt: string;
+  expiresAt: string;
+}): Session {
+  loadForWrite();
+  const session: Session = {
+    sessionId: randomUUID(), dispatchLaunchId: input.dispatchId, chatId: input.chatId,
+    chatType: input.chatType, rootMessageId: input.rootMessageId, scope: 'thread',
+    title: input.title, status: 'active', createdAt: new Date().toISOString(),
+    workingDir: input.workingDir, larkAppId: input.larkAppId,
+    reasoningEffort: input.effectiveOverride.reasoningEffort,
+    dispatchLaunchSpec: {
+      version: 1, targetLarkAppId: input.larkAppId, chatId: input.chatId,
+      rootMessageId: input.rootMessageId, requested: input.requestedOverride,
+      effective: input.effectiveOverride, createdAt: input.createdAt, expiresAt: input.expiresAt,
+    },
+  };
+  sessions.set(session.sessionId, session);
+  persistRow(session);
+  logger.info(`Created dispatch launch session ${session.sessionId} (thread: ${input.rootMessageId})`);
+  return session;
+}
+
 export function getSession(sessionId: string): Session | undefined {
   load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
 }
 
@@ -1913,30 +2330,23 @@ export function getOwnedSession(sessionId: string): Session | undefined {
 }
 
 /** Cross-process fresh read. SQLite: a point SELECT observes the last committed
- *  write (WAL orders the daemon against offline CLI writers). JSON (a store the
- *  owning daemon has not imported yet): ordered after writers by the shared file
- *  lock, as before. */
+ *  write (WAL orders the daemon against offline CLI writers). */
 export function getSessionFresh(sessionId: string): Session | undefined {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  // Same rule as load(): a process that never called init() (a workflow worker
+  // whose sessions are synthetic) has no store and simply sees no row.
+  if (!currentAppId) return undefined;
   ensureDir();
   const dbFp = getDbPath();
-  if (existsSync(dbFp)) {
-    try {
-      return readStoreRowByKey({ appId: currentAppId, kind: 'sqlite', path: dbFp }, sessionId);
-    } catch (err) {
-      if (err instanceof SessionStoreSqliteUnavailableError) throw err;
-      return undefined;
-    }
+  if (!existsSync(dbFp)) return undefined;
+  try {
+    return readStoreRowByKey({ appId: requireCurrentAppId(), path: dbFp }, sessionId);
+  } catch (err) {
+    if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+    if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+    return undefined;
   }
-  const fp = getImportJsonPath();
-  return withFileLockSync(fp, () => {
-    if (!existsSync(fp)) return undefined;
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
-      return data[sessionId];
-    } catch {
-      return undefined;
-    }
-  });
 }
 
 /**
@@ -2264,7 +2674,9 @@ export function markMojoCloseUnresolved(
 export function closeSession(
   sessionId: string,
   opts: {
+    backgroundExecutionCleanup?: boolean;
     cleanupBridgeMarkers?: boolean;
+    workspaceRetirement?: Session['workspaceRetirement'];
     clearRiffParentTaskId?: boolean;
     /**
      * Park an uncancellable mojo lineage as PART of this transaction.
@@ -2321,8 +2733,10 @@ export function closeSession(
     const next: Session = { ...session };
     const applied = applySessionRowCommand(next, {
       type: 'close',
+      ...(opts.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
       ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
+      ...(opts.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
       ...(opts.parkMojoLineage ? { parkMojoLineage: opts.parkMojoLineage } : {}),
       ...(opts.parkLocalResidual ? { parkLocalResidual: opts.parkLocalResidual } : {}),
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
@@ -2347,6 +2761,14 @@ export function closeSession(
     // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
     // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
     removePromptContextDir(sessionId);
+    // Claude statusline 快照目录同生命周期（best-effort，内部吞错）。
+    removeStatuslineDir(config.session.dataDir, sessionId);
+    // tmux 启动文件目录（pane-launch.ts）：正常情况下 pane 读完即删，这里兜住
+    // 一个 shell 没来得及读的文件——它带着该 bot 注入的环境变量值。
+    removePaneLaunchDir(config.session.dataDir, sessionId);
+    // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
+    // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
+    removeSessionSkillRuntime(sessionId, config.session.dataDir);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }
@@ -2366,10 +2788,11 @@ export function closeSession(
 export function reactivateClosedSession(
   sessionId: string,
 ): { ok: true; session: Session }
-| { ok: false; error: 'not_found' | 'not_closed' } {
+| { ok: false; error: 'not_found' | 'not_closed' | 'workspace_retired' } {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
+  if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
   // Durable first (see closeSession): the reactivated row is committed before
@@ -2379,6 +2802,7 @@ export function reactivateClosedSession(
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
+  next.backgroundExecutionCleanupClosedAt = undefined;
   next.lastMessageAt = new Date().toISOString();
   next.codexAppDispatchLedger = undefined;
   next.codexAppGenerationCommits = undefined;
@@ -2394,8 +2818,10 @@ export function reactivateClosedSession(
   next.queuedActivationResume = undefined;
   next.queuedActivationTail = undefined;
   next.queuedActivationTailNextOrder = undefined;
+  next.principalLaneQueuedTurns = undefined;
   next.pendingRepoSetup = undefined;
   next.previewTarget = undefined;
+  next.crossPrincipalInterruptions = undefined;
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 
@@ -2405,13 +2831,41 @@ export function reactivateClosedSession(
 }
 
 
-export function updateSessionPid(sessionId: string, pid: number | null): void {
+export function updateSessionPid(sessionId: string, pid: number | null, procStart?: string): void {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
     session.pid = pid ?? undefined;
+    session.pidProcStart = pid === null ? undefined : procStart;
     persistRow(session);
   }
+}
+
+/**
+ * Clear recorded worker pids in one transaction, each only if its row still
+ * records exactly that pid/identity pair — a worker forked for the session
+ * since the caller's snapshot keeps its fresh record. Only `pid` and
+ * `pidProcStart` change. Returns the number of rows cleared.
+ */
+export function clearSessionPidsIfUnchanged(
+  expected: ReadonlyArray<{ sessionId: string; pid: number; procStart: string | undefined }>,
+): number {
+  loadForWrite();
+  const targets = expected.flatMap(e => {
+    const session = sessions.get(e.sessionId);
+    return session && session.pid === e.pid && session.pidProcStart === e.procStart ? [session] : [];
+  });
+  if (targets.length === 0 || !ownStore) return 0;
+  ownStore.db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const session of targets) persistRow({ ...session, pid: undefined, pidProcStart: undefined });
+    ownStore.db.exec('COMMIT');
+  } catch (error) { ownStore.db.exec('ROLLBACK'); throw error; }
+  for (const session of targets) {
+    session.pid = undefined;
+    session.pidProcStart = undefined;
+  }
+  return targets.length;
 }
 
 export function updateSession(session: Session): void {
@@ -2432,6 +2886,28 @@ export function updateSession(session: Session): void {
   const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (durable) Object.assign(session, JSON.parse(durable.row));
   sessions.set(session.sessionId, session);
+}
+
+/** Exact task authority mutation; ordinary metadata updates cannot write it. */
+export function updateDeploymentContinuation(
+  session: Session,
+  expected: Session['deploymentContinuation'],
+): void {
+  loadForWrite();
+  const db = ownStore;
+  if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  const hit = db.selectRow.get(session.sessionId) as { row: string } | undefined;
+  if (!hit) throw new Error('continuation session is missing');
+  const durable = JSON.parse(hit.row) as Session;
+  if (durable.status !== 'active'
+    || JSON.stringify(durable.deploymentContinuation) !== JSON.stringify(expected)) {
+    throw new Error('continuation authority changed');
+  }
+  durable.deploymentContinuation = structuredClone(session.deploymentContinuation);
+  const result = db.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), session.sessionId, hit.row);
+  if (Number(result.changes) !== 1) throw new Error('continuation session changed concurrently');
+  const cached = sessions.get(session.sessionId);
+  if (cached) cached.deploymentContinuation = structuredClone(durable.deploymentContinuation);
 }
 
 /**
@@ -2481,6 +2957,2585 @@ export function mutateOwnedSessionsAtomically<T>(
     }
   }
   return { result, rows: fresh };
+}
+
+export type EnsurePrincipalLaneSourceResult =
+  | { status: 'ready'; source: PrincipalLaneSourceState; lane: PrincipalLaneBinding }
+  | { status: 'retry'; reason: 'canonical_cwd_unavailable' | 'workspace_migration_busy' }
+  | { status: 'disabled'; reason: 'caller_identity_unproven' }
+  | { status: 'quarantined'; reason: string };
+
+interface PrincipalLaneSourceSidecarRow {
+  source_principal_key: string;
+  canonical_cwd: string;
+  workspace_epoch: number;
+  workspace_group_id: string;
+  phase: string;
+  revision: number;
+  row: string;
+}
+
+interface PrincipalLaneSidecarRow {
+  lane_id: string;
+  session_id: string;
+  principal_key: string;
+  routing_anchor: string;
+  workspace_epoch: number;
+  phase: string;
+  revision: number;
+  row: string;
+}
+
+interface PrincipalLaneWorktreeSidecarRow {
+  materialization_id: string;
+  source_session_id: string;
+  lane_id: string;
+  session_id: string;
+  principal_key: string;
+  workspace_epoch: number;
+  source_repo_root: string;
+  source_git_common_dir: string;
+  worktree_root: string;
+  worktree_git_common_dir: string;
+  working_dir: string;
+  branch: string;
+  phase: string;
+  revision: number;
+  row: string;
+}
+
+type ParsedPrincipalLaneSidecar = {
+  binding: PrincipalLaneBinding;
+  sessionId: string;
+};
+
+function parseSourceSidecar(
+  hit: PrincipalLaneSourceSidecarRow | undefined,
+  displayTarget: PrincipalLaneDisplayTarget,
+  sourceSessionId: string,
+): { ok: true; value: PrincipalLaneSourceState } | { ok: false; error: string } {
+  if (!hit) return { ok: false, error: 'missing_sidecar' };
+  if (hit.phase === 'quarantined') return { ok: false, error: 'stored_quarantine' };
+  let raw: unknown;
+  try { raw = JSON.parse(hit.row); } catch { return { ok: false, error: 'invalid_json' }; }
+  const parsed = parsePrincipalLaneSourceState(raw, displayTarget, sourceSessionId);
+  if (!parsed.ok) return parsed;
+  const value = parsed.value;
+  if (hit.source_principal_key !== value.sourcePrincipalKey
+      || hit.canonical_cwd !== value.canonicalCwd
+      || Number(hit.workspace_epoch) !== value.workspaceEpoch
+      || hit.workspace_group_id !== value.workspaceGroupId
+      || hit.phase !== value.phase
+      || Number(hit.revision) !== value.revision) {
+    return { ok: false, error: 'indexed_value_mismatch' };
+  }
+  return { ok: true, value };
+}
+
+function parseLaneSidecar(
+  hit: PrincipalLaneSidecarRow | undefined,
+  expected: { displayTarget: PrincipalLaneDisplayTarget; sourceSessionId: string },
+): { ok: true; value: ParsedPrincipalLaneSidecar } | { ok: false; error: string } {
+  if (!hit) return { ok: false, error: 'missing_sidecar' };
+  if (hit.phase === 'quarantined') return { ok: false, error: 'stored_quarantine' };
+  let raw: unknown;
+  try { raw = JSON.parse(hit.row); } catch { return { ok: false, error: 'invalid_json' }; }
+  const parsed = parsePrincipalLaneBinding(raw, expected);
+  if (!parsed.ok) return parsed;
+  const value = parsed.value;
+  if (hit.lane_id !== value.laneId
+      || hit.principal_key !== value.principalKey
+      || hit.routing_anchor !== value.routingAnchor
+      || Number(hit.workspace_epoch) !== value.workspaceEpoch
+      || hit.phase !== value.phase
+      || Number(hit.revision) !== value.revision
+      || typeof hit.session_id !== 'string'
+      || hit.session_id.length === 0) {
+    return { ok: false, error: 'indexed_value_mismatch' };
+  }
+  return { ok: true, value: { binding: value, sessionId: hit.session_id } };
+}
+
+function parseWorktreeSidecar(
+  hit: PrincipalLaneWorktreeSidecarRow | undefined,
+  expected: {
+    sourceSessionId: string;
+    laneId: string;
+    sessionId: string;
+    principalKey: string;
+    workspaceEpoch: number;
+  },
+): { ok: true; value: PrincipalLaneWorktreeProof } | { ok: false; error: string } {
+  if (!hit) return { ok: false, error: 'missing_sidecar' };
+  if (hit.phase === 'quarantined') return { ok: false, error: 'stored_quarantine' };
+  let raw: unknown;
+  try { raw = JSON.parse(hit.row); } catch { return { ok: false, error: 'invalid_json' }; }
+  const parsed = parsePrincipalLaneWorktreeProof(raw, expected);
+  if (!parsed.ok) return parsed;
+  const value = parsed.value;
+  if (hit.materialization_id !== value.materializationId
+      || hit.source_session_id !== value.sourceSessionId
+      || hit.lane_id !== value.laneId
+      || hit.session_id !== value.sessionId
+      || hit.principal_key !== value.principalKey
+      || Number(hit.workspace_epoch) !== value.workspaceEpoch
+      || hit.source_repo_root !== value.sourceRepoRoot
+      || hit.source_git_common_dir !== value.sourceGitCommonDir
+      || hit.worktree_root !== value.worktreeRoot
+      || hit.worktree_git_common_dir !== value.worktreeGitCommonDir
+      || hit.working_dir !== value.workingDir
+      || hit.branch !== value.branch
+      || hit.phase !== value.phase
+      || Number(hit.revision) !== value.revision) {
+    return { ok: false, error: 'indexed_value_mismatch' };
+  }
+  return { ok: true, value };
+}
+
+function readPrincipalLaneWorktreeRow(
+  store: SqliteReadStore,
+  sourceSessionId: string,
+  laneId: string,
+): PrincipalLaneWorktreeSidecarRow | undefined {
+  return store.db.prepare(
+    'SELECT materialization_id, source_session_id, lane_id, session_id, principal_key, '
+    + 'workspace_epoch, source_repo_root, source_git_common_dir, worktree_root, '
+    + 'worktree_git_common_dir, working_dir, branch, phase, revision, row '
+    + 'FROM principal_lane_worktrees WHERE source_session_id = ? AND lane_id = ?',
+  ).get(sourceSessionId, laneId) as PrincipalLaneWorktreeSidecarRow | undefined;
+}
+
+function quarantinePrincipalLaneWorktree(
+  store: OwnSqliteStore,
+  sourceSessionId: string,
+  laneId: string,
+): void {
+  store.db.prepare(
+    "UPDATE principal_lane_worktrees SET phase = 'quarantined' "
+    + 'WHERE source_session_id = ? AND lane_id = ?',
+  ).run(sourceSessionId, laneId);
+}
+
+function quarantinePrincipalLaneSource(store: OwnSqliteStore, sourceSessionId: string): void {
+  store.db.prepare(
+    "UPDATE principal_lane_sources SET phase = 'quarantined' WHERE source_session_id = ?",
+  ).run(sourceSessionId);
+}
+
+function quarantinePrincipalLane(
+  store: OwnSqliteStore,
+  sourceSessionId: string,
+  laneId = 'source',
+): void {
+  store.db.prepare(
+    "UPDATE principal_lanes SET phase = 'quarantined' WHERE source_session_id = ? AND lane_id = ?",
+  ).run(sourceSessionId, laneId);
+}
+
+function canonicalSessionCwd(session: Session): string {
+  const cwd = resolve(session.workingDir || process.cwd());
+  try { return realpathSync(cwd); } catch { return cwd; }
+}
+
+function strictCanonicalSessionCwd(session: Session): string | undefined {
+  try { return realpathSync(resolve(session.workingDir || process.cwd())); }
+  catch { return undefined; }
+}
+
+function sourceRoutingAnchor(target: PrincipalLaneDisplayTarget): string {
+  return target.scope === 'chat' ? target.chatId : target.rootMessageId;
+}
+
+function initialPrincipalWorkspaceGroup(
+  larkAppId: string,
+  canonicalCwd: string,
+  now: string,
+): PrincipalWorkspaceGroup {
+  return {
+    version: 1,
+    groupId: principalWorkspaceGroupIdV2(larkAppId, canonicalCwd),
+    groupKeyVersion: PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION,
+    larkAppId,
+    canonicalCwd,
+    phase: 'active',
+    revision: 1,
+    lastLeaseGeneration: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function initialPrincipalWorkspaceMember(args: {
+  sourceSessionId: string;
+  laneId: string;
+  sessionId: string;
+  groupId: string;
+  workspaceEpoch: number;
+  now: string;
+}): PrincipalWorkspaceMember {
+  return {
+    version: 1,
+    sourceSessionId: args.sourceSessionId,
+    laneId: args.laneId,
+    sessionId: args.sessionId,
+    groupId: args.groupId,
+    workspaceEpoch: args.workspaceEpoch,
+    membershipPhase: 'active',
+    revision: 1,
+    createdAt: args.now,
+    updatedAt: args.now,
+  };
+}
+
+function insertPrincipalWorkspaceGroup(
+  store: OwnSqliteStore,
+  group: PrincipalWorkspaceGroup,
+): void {
+  store.db.prepare(
+    'INSERT INTO principal_workspace_groups '
+    + '(group_id, group_key_version, lark_app_id, canonical_cwd, phase, revision, '
+    + 'last_lease_generation, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run(
+    group.groupId, group.groupKeyVersion, group.larkAppId, group.canonicalCwd,
+    group.phase, group.revision, group.lastLeaseGeneration, JSON.stringify(group),
+  );
+}
+
+function insertPrincipalWorkspaceMember(
+  store: OwnSqliteStore,
+  member: PrincipalWorkspaceMember,
+): void {
+  store.db.prepare(
+    'INSERT INTO principal_workspace_members '
+    + '(source_session_id, lane_id, session_id, group_id, workspace_epoch, '
+    + 'membership_phase, revision, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run(
+    member.sourceSessionId, member.laneId, member.sessionId, member.groupId,
+    member.workspaceEpoch, member.membershipPhase, member.revision, JSON.stringify(member),
+  );
+}
+
+interface PrincipalWorkspaceGroupRow {
+  group_id: string;
+  group_key_version: number;
+  lark_app_id: string;
+  canonical_cwd: string;
+  phase: string;
+  revision: number;
+  last_lease_generation: number;
+  row: string;
+}
+
+interface PrincipalWorkspaceMemberRow {
+  source_session_id: string;
+  lane_id: string;
+  session_id: string;
+  group_id: string;
+  workspace_epoch: number;
+  membership_phase: string;
+  revision: number;
+  row: string;
+}
+
+function parseWorkspaceGroupSidecar(hit: PrincipalWorkspaceGroupRow | undefined):
+  | { ok: true; value: PrincipalWorkspaceGroup }
+  | { ok: false; error: string } {
+  if (!hit) return { ok: false, error: 'missing_group' };
+  if (hit.phase === 'quarantined') return { ok: false, error: 'stored_quarantine' };
+  let raw: unknown;
+  try { raw = JSON.parse(hit.row); } catch { return { ok: false, error: 'invalid_json' }; }
+  const parsed = parsePrincipalWorkspaceGroup(raw);
+  if (!parsed.ok) return parsed;
+  const value = parsed.value;
+  if (hit.group_id !== value.groupId
+      || Number(hit.group_key_version) !== value.groupKeyVersion
+      || hit.lark_app_id !== value.larkAppId
+      || hit.canonical_cwd !== value.canonicalCwd
+      || hit.phase !== value.phase
+      || Number(hit.revision) !== value.revision
+      || Number(hit.last_lease_generation) !== value.lastLeaseGeneration) {
+    return { ok: false, error: 'indexed_value_mismatch' };
+  }
+  return { ok: true, value };
+}
+
+function parseWorkspaceMemberSidecar(hit: PrincipalWorkspaceMemberRow | undefined):
+  | { ok: true; value: PrincipalWorkspaceMember }
+  | { ok: false; error: string } {
+  if (!hit) return { ok: false, error: 'missing_member' };
+  if (hit.membership_phase === 'quarantined') {
+    return { ok: false, error: 'stored_quarantine' };
+  }
+  let raw: unknown;
+  try { raw = JSON.parse(hit.row); } catch { return { ok: false, error: 'invalid_json' }; }
+  const parsed = parsePrincipalWorkspaceMember(raw);
+  if (!parsed.ok) return parsed;
+  const value = parsed.value;
+  if (hit.source_session_id !== value.sourceSessionId
+      || hit.lane_id !== value.laneId
+      || hit.session_id !== value.sessionId
+      || hit.group_id !== value.groupId
+      || Number(hit.workspace_epoch) !== value.workspaceEpoch
+      || hit.membership_phase !== value.membershipPhase
+      || Number(hit.revision) !== value.revision) {
+    return { ok: false, error: 'indexed_value_mismatch' };
+  }
+  return { ok: true, value };
+}
+
+function readWorkspaceGroupRow(
+  store: SqliteReadStore,
+  groupId: string,
+): PrincipalWorkspaceGroupRow | undefined {
+  return store.db.prepare(
+    'SELECT group_id, group_key_version, lark_app_id, canonical_cwd, phase, revision, '
+    + 'last_lease_generation, row FROM principal_workspace_groups WHERE group_id = ?',
+  ).get(groupId) as PrincipalWorkspaceGroupRow | undefined;
+}
+
+function readWorkspaceMemberRow(
+  store: SqliteReadStore,
+  sourceSessionId: string,
+  laneId: string,
+): PrincipalWorkspaceMemberRow | undefined {
+  return store.db.prepare(
+    'SELECT source_session_id, lane_id, session_id, group_id, workspace_epoch, '
+    + 'membership_phase, revision, row FROM principal_workspace_members '
+    + 'WHERE source_session_id = ? AND lane_id = ?',
+  ).get(sourceSessionId, laneId) as PrincipalWorkspaceMemberRow | undefined;
+}
+
+function quarantinePrincipalWorkspaceGroup(store: OwnSqliteStore, groupId: string): void {
+  store.db.prepare(
+    "UPDATE principal_workspace_groups SET phase = 'quarantined' WHERE group_id = ?",
+  ).run(groupId);
+}
+
+function quarantinePrincipalWorkspaceMember(
+  store: OwnSqliteStore,
+  sourceSessionId: string,
+  laneId: string,
+): void {
+  store.db.prepare(
+    "UPDATE principal_workspace_members SET membership_phase = 'quarantined' "
+    + 'WHERE source_session_id = ? AND lane_id = ?',
+  ).run(sourceSessionId, laneId);
+}
+
+function principalWorkspaceMemberIdentityMatchesLane(
+  member: PrincipalWorkspaceMember,
+  lane: ParsedPrincipalLaneSidecar,
+  source: PrincipalLaneSourceState,
+): boolean {
+  return member.sourceSessionId === lane.binding.sourceSessionId
+    && member.laneId === lane.binding.laneId
+    && member.sessionId === lane.sessionId
+    && member.groupId === source.workspaceGroupId
+    && member.workspaceEpoch === source.workspaceEpoch;
+}
+
+/**
+ * Atomically bind a legacy source to human lane 0 and create its workspace
+ * epoch/index sidecars. The authoritative display target is derived from the
+ * persisted source row, never from the inbound event. An unproven caller only
+ * disables principal-lane routing for this source; the legacy session remains
+ * active and otherwise unchanged.
+ */
+export function ensurePrincipalLaneSource(args: {
+  sourceSessionId: string;
+  caller: InboundPrincipal;
+  now?: string;
+}): EnsurePrincipalLaneSourceResult {
+  loadForWrite();
+  if (args.caller.senderType !== 'user') {
+    throw new Error('bot principal cannot initialize a human principal lane');
+  }
+  const store = ownStore;
+  if (!store || !currentAppId) {
+    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
+  }
+  const now = args.now ?? new Date().toISOString();
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(nowMs) || new Date(nowMs).toISOString() !== now) {
+    throw new Error('invalid principal-lane migration timestamp');
+  }
+  let nextSession: Session | undefined;
+  const result = runOwnedWriteTransaction(store, false, (): EnsurePrincipalLaneSourceResult => {
+    const hit = store.selectRow.get(args.sourceSessionId) as { row: string } | undefined;
+    if (!hit) throw new Error(`principal-lane source session not found: ${args.sourceSessionId}`);
+    const sourceSession = JSON.parse(hit.row) as Session;
+    if (sourceSession.status !== 'active') throw new Error('principal-lane source session is not active');
+    if (sourceSession.principalLaneDisabledReason) {
+      return { status: 'disabled', reason: sourceSession.principalLaneDisabledReason };
+    }
+    if (sourceSession.principalLaneQuarantineReason) {
+      return { status: 'quarantined', reason: sourceSession.principalLaneQuarantineReason };
+    }
+    const displayTarget = sourceSessionDisplayTarget(sourceSession, currentAppId!);
+    if (!displayTarget) {
+      nextSession = { ...sourceSession, principalLaneQuarantineReason: 'invalid_source_display_target' };
+      const update = store.updateExact.run(
+        sessionStatusText(nextSession), JSON.stringify(nextSession), nextSession.sessionId, hit.row,
+      );
+      if (Number(update.changes) !== 1) {
+        throw new Error('source session changed during lane quarantine');
+      }
+      return { status: 'quarantined', reason: 'invalid_source_display_target' };
+    }
+
+    const sourceHit = store.db.prepare(
+      'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
+      + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
+    ).get(args.sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
+    const laneHit = store.db.prepare(
+      'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+      + "phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+    ).get(args.sourceSessionId) as PrincipalLaneSidecarRow | undefined;
+    if (sourceHit || laneHit) {
+      const parsedSource = parseSourceSidecar(sourceHit, displayTarget, args.sourceSessionId);
+      const parsedLane = parseLaneSidecar(laneHit, { displayTarget, sourceSessionId: args.sourceSessionId });
+      if (!parsedSource.ok || !parsedLane.ok
+          || parsedLane.value.binding.laneId !== 'source'
+          || parsedLane.value.sessionId !== args.sourceSessionId
+          || parsedSource.value.sourcePrincipalKey !== parsedLane.value.binding.principalKey
+          || parsedSource.value.workspaceEpoch !== parsedLane.value.binding.workspaceEpoch) {
+        const sourceLaneMismatch = parsedSource.ok && parsedLane.ok;
+        const reason = !parsedSource.ok
+          ? `source:${parsedSource.error}`
+          : !parsedLane.ok ? `lane:${parsedLane.error}` : 'source_lane_mismatch';
+        if (!parsedSource.ok) quarantinePrincipalLaneSource(store, args.sourceSessionId);
+        if (!parsedLane.ok || sourceLaneMismatch) quarantinePrincipalLane(store, args.sourceSessionId);
+        return { status: 'quarantined', reason };
+      }
+      return { status: 'ready', source: parsedSource.value, lane: parsedLane.value.binding };
+    }
+
+    const migration = decideLegacySourceMigration({
+      session: sourceSession,
+      inboundLarkAppId: currentAppId!,
+      caller: args.caller,
+    });
+    if (migration.kind === 'disable_principal_lanes') {
+      nextSession = { ...sourceSession, principalLaneDisabledReason: migration.reason };
+      const update = store.updateExact.run(
+        sessionStatusText(nextSession), JSON.stringify(nextSession),
+        nextSession.sessionId, hit.row,
+      );
+      if (Number(update.changes) !== 1) throw new Error('source session changed during lane migration');
+      store.db.prepare(
+        'INSERT INTO principal_lane_migration_audit '
+        + '(audit_id, source_session_id, lark_app_id, outcome, reason, created_at) '
+        + 'VALUES (?, ?, ?, ?, ?, ?)',
+      ).run(randomUUID(), sourceSession.sessionId, currentAppId!, 'disabled', migration.reason, now);
+      return { status: 'disabled', reason: migration.reason };
+    }
+
+    const canonicalCwd = strictCanonicalSessionCwd(sourceSession);
+    if (!canonicalCwd) return { status: 'retry', reason: 'canonical_cwd_unavailable' };
+    const workspaceEpoch = 1;
+    const workspaceGroup = initialPrincipalWorkspaceGroup(currentAppId!, canonicalCwd, now);
+    const source: PrincipalLaneSourceState = {
+      version: 1,
+      sourcePrincipalKey: migration.principalKey,
+      displayTarget,
+      canonicalCwd,
+      workspaceEpoch,
+      workspaceGroupId: workspaceGroup.groupId,
+      workspaceGroupKeyVersion: PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION,
+      phase: 'active',
+      revision: 1,
+      updatedAt: now,
+      migrationAudit: {
+        evidence: migration.evidence,
+        migratedAt: now,
+        larkAppId: currentAppId!,
+      },
+    };
+    const lane: PrincipalLaneBinding = {
+      version: 1,
+      laneId: 'source',
+      sourceSessionId: sourceSession.sessionId,
+      principalKey: migration.principalKey,
+      principal: migration.principal,
+      routingAnchor: sourceRoutingAnchor(displayTarget),
+      displayTarget,
+      workspaceEpoch,
+      phase: 'active',
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const groupById = readWorkspaceGroupRow(store, workspaceGroup.groupId);
+    const groupByIdentity = store.db.prepare(
+      'SELECT group_id, group_key_version, lark_app_id, canonical_cwd, phase, revision, '
+      + 'last_lease_generation, row FROM principal_workspace_groups '
+      + 'WHERE group_key_version = ? AND lark_app_id = ? AND canonical_cwd = ?',
+    ).get(
+      PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION, currentAppId!, canonicalCwd,
+    ) as PrincipalWorkspaceGroupRow | undefined;
+    if (groupById && groupByIdentity && groupById.group_id !== groupByIdentity.group_id) {
+      quarantinePrincipalWorkspaceGroup(store, groupById.group_id);
+      quarantinePrincipalWorkspaceGroup(store, groupByIdentity.group_id);
+      return { status: 'quarantined', reason: 'group:identity_collision' };
+    }
+    const existingGroup = groupById ?? groupByIdentity;
+    if (existingGroup) {
+      const parsedGroup = parseWorkspaceGroupSidecar(existingGroup);
+      if (!parsedGroup.ok) {
+        quarantinePrincipalWorkspaceGroup(store, existingGroup.group_id);
+        return { status: 'quarantined', reason: `group:${parsedGroup.error}` };
+      }
+      if (parsedGroup.value.groupId !== workspaceGroup.groupId
+          || parsedGroup.value.larkAppId !== workspaceGroup.larkAppId
+          || parsedGroup.value.canonicalCwd !== workspaceGroup.canonicalCwd) {
+        quarantinePrincipalWorkspaceGroup(store, existingGroup.group_id);
+        return { status: 'quarantined', reason: 'group:identity_conflict' };
+      }
+      if (parsedGroup.value.phase !== 'active') {
+        return { status: 'retry', reason: 'workspace_migration_busy' };
+      }
+    }
+    store.db.prepare(
+      'INSERT INTO principal_lane_sources '
+      + '(source_session_id, source_principal_key, canonical_cwd, workspace_epoch, '
+      + 'workspace_group_id, phase, revision, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      sourceSession.sessionId, source.sourcePrincipalKey, source.canonicalCwd,
+      source.workspaceEpoch, source.workspaceGroupId, source.phase, source.revision,
+      JSON.stringify(source),
+    );
+    store.db.prepare(
+      'INSERT INTO principal_lanes '
+      + '(lane_id, source_session_id, session_id, principal_key, routing_anchor, '
+      + 'workspace_epoch, phase, revision, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      lane.laneId, lane.sourceSessionId, sourceSession.sessionId, lane.principalKey,
+      lane.routingAnchor, lane.workspaceEpoch, lane.phase, lane.revision, JSON.stringify(lane),
+    );
+    if (!existingGroup) {
+      insertPrincipalWorkspaceGroup(store, workspaceGroup);
+    }
+    insertPrincipalWorkspaceMember(store, initialPrincipalWorkspaceMember({
+      sourceSessionId: sourceSession.sessionId,
+      laneId: lane.laneId,
+      sessionId: sourceSession.sessionId,
+      groupId: workspaceGroup.groupId,
+      workspaceEpoch,
+      now,
+    }));
+    store.db.prepare(
+      'INSERT INTO principal_lane_aliases '
+      + '(source_session_id, alias_key, lane_id, canonical_principal_key, created_at, updated_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(
+      sourceSession.sessionId, lane.principalKey, lane.laneId, lane.principalKey, now, now,
+    );
+    nextSession = {
+      ...sourceSession,
+      principalLane: lane,
+      principalLaneSource: source,
+      principalLaneDisabledReason: undefined,
+    };
+    const update = store.updateExact.run(
+      sessionStatusText(nextSession), JSON.stringify(nextSession), nextSession.sessionId, hit.row,
+    );
+    if (Number(update.changes) !== 1) throw new Error('source session changed during lane migration');
+    store.db.prepare(
+      'INSERT INTO principal_lane_migration_audit '
+      + '(audit_id, source_session_id, lark_app_id, principal_key, outcome, evidence, created_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      randomUUID(), sourceSession.sessionId, currentAppId!, migration.principalKey,
+      'bound', migration.evidence, now,
+    );
+    store.db.prepare(
+      'INSERT INTO principal_workspace_migration_audit '
+      + '(audit_id, source_session_id, event, target_group_id, from_revision, from_epoch, '
+      + 'detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      randomUUID(), sourceSession.sessionId, 'created', workspaceGroup.groupId,
+      0, workspaceEpoch, JSON.stringify({ laneCount: 1 }), now,
+    );
+    return { status: 'ready', source, lane };
+  });
+  if (nextSession) {
+    const cached = sessions.get(args.sourceSessionId);
+    if (cached) Object.assign(cached, structuredClone(nextSession));
+    else sessions.set(args.sourceSessionId, nextSession);
+  }
+  return result;
+}
+
+/** Explicit ingress name for the only supported source bootstrap gate. The
+ * persisted legacy owner remains authoritative; a B/C first message cannot
+ * nominate itself as source owner. */
+export type BootstrapPrincipalLaneSourceForIngressResult =
+  | EnsurePrincipalLaneSourceResult
+  | { status: 'retry'; reason: 'source_owner_mismatch' };
+
+export function bootstrapPrincipalLaneSourceForIngress(args: {
+  sourceSessionId: string;
+  caller: InboundPrincipal;
+  now?: string;
+}): BootstrapPrincipalLaneSourceForIngressResult {
+  loadForWrite();
+  const store = ownStore;
+  if (!store || !currentAppId) {
+    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
+  }
+  const existing = store.db.prepare(
+    'SELECT 1 AS hit FROM principal_lane_sources WHERE source_session_id = ?',
+  ).get(args.sourceSessionId) as { hit: number } | undefined;
+  if (!existing) {
+    const hit = store.selectRow.get(args.sourceSessionId) as { row: string } | undefined;
+    if (!hit) throw new Error(`principal-lane source session not found: ${args.sourceSessionId}`);
+    let session: Session;
+    try { session = JSON.parse(hit.row) as Session; }
+    catch { return { status: 'retry', reason: 'source_owner_mismatch' }; }
+    if (decideLegacySourceMigration({
+      session,
+      inboundLarkAppId: currentAppId,
+      caller: args.caller,
+    }).kind !== 'bind') {
+      return { status: 'retry', reason: 'source_owner_mismatch' };
+    }
+  }
+  return ensurePrincipalLaneSource(args);
+}
+
+export function readPrincipalLaneSource(
+  sourceSessionId: string,
+): EnsurePrincipalLaneSourceResult | undefined {
+  loadForWrite();
+  const sourceSession = sessions.get(sourceSessionId);
+  if (!sourceSession || !currentAppId || !ownStore) return undefined;
+  if (sourceSession.principalLaneDisabledReason) {
+    return { status: 'disabled', reason: sourceSession.principalLaneDisabledReason };
+  }
+  if (sourceSession.principalLaneQuarantineReason) {
+    return { status: 'quarantined', reason: sourceSession.principalLaneQuarantineReason };
+  }
+  const displayTarget = sourceSessionDisplayTarget(sourceSession, currentAppId);
+  if (!displayTarget) {
+    mutateOwnedSessionsAtomically([sourceSessionId], rows => {
+      const fresh = rows.get(sourceSessionId);
+      if (!fresh) throw new Error(`principal-lane source session not found: ${sourceSessionId}`);
+      fresh.principalLaneQuarantineReason = 'invalid_source_display_target';
+    });
+    return { status: 'quarantined', reason: 'invalid_source_display_target' };
+  }
+  const sourceHit = ownStore.db.prepare(
+    'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
+    + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
+  ).get(sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
+  const laneHit = ownStore.db.prepare(
+    'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+    + "phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+  ).get(sourceSessionId) as PrincipalLaneSidecarRow | undefined;
+  if (!sourceHit && !laneHit) return undefined;
+  const source = parseSourceSidecar(sourceHit, displayTarget, sourceSessionId);
+  const lane = parseLaneSidecar(laneHit, { displayTarget, sourceSessionId });
+  if (!source.ok || !lane.ok
+      || lane.value.binding.laneId !== 'source'
+      || lane.value.sessionId !== sourceSessionId
+      || source.value.sourcePrincipalKey !== lane.value.binding.principalKey
+      || source.value.workspaceEpoch !== lane.value.binding.workspaceEpoch) {
+    const sourceLaneMismatch = source.ok && lane.ok;
+    runOwnedWriteTransaction(ownStore, false, () => {
+      if (!source.ok) quarantinePrincipalLaneSource(ownStore!, sourceSessionId);
+      if (!lane.ok || sourceLaneMismatch) quarantinePrincipalLane(ownStore!, sourceSessionId);
+    });
+    if (!source.ok) return { status: 'quarantined', reason: `source:${source.error}` };
+    if (!lane.ok) return { status: 'quarantined', reason: `lane:${lane.error}` };
+    return { status: 'quarantined', reason: 'source_lane_mismatch' };
+  }
+  return { status: 'ready', source: source.value, lane: lane.value.binding };
+}
+
+export type ResolvePrincipalLaneForIngressResult =
+  | { status: 'ready'; laneId: string; routingAnchor: string }
+  | { status: 'missing' }
+  | { status: 'identity_conflict'; reason: 'identity_evidence_conflict' }
+  | { status: 'retry'; reason: 'source_not_active' | 'lane_not_active' };
+
+/** Resolve only the durable identity index. The returned lane id is not an
+ * activation capability; callers must still run hydratePrincipalLaneForIngress
+ * under lane admission before publishing a runtime session. */
+export function resolvePrincipalLaneForIngress(args: {
+  sourceSessionId: string;
+  identity: HumanLaneIdentityEvidence;
+}): ResolvePrincipalLaneForIngressResult {
+  loadForWrite();
+  if (!ownStore || !currentAppId) {
+    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
+  }
+  const source = readPrincipalLaneSource(args.sourceSessionId);
+  if (!source || source.status !== 'ready' || source.source.phase !== 'active') {
+    return { status: 'retry', reason: 'source_not_active' };
+  }
+  const evidence = resolveHumanLaneEvidence(args.identity, currentAppId);
+  if (!evidence) return { status: 'missing' };
+  if (evidence.canonicalKey === source.source.sourcePrincipalKey) {
+    return { status: 'ready', laneId: 'source', routingAnchor: source.lane.routingAnchor };
+  }
+  const rows = evidence.aliasKeys.map(aliasKey => ownStore!.db.prepare(
+    'SELECT lane_id, canonical_principal_key FROM principal_lane_aliases '
+    + 'WHERE source_session_id = ? AND alias_key = ?',
+  ).get(args.sourceSessionId, aliasKey) as {
+    lane_id: string; canonical_principal_key: string;
+  } | undefined).filter((row): row is { lane_id: string; canonical_principal_key: string } => !!row);
+  const laneIds = new Set(rows.map(row => row.lane_id));
+  const canonicalKeys = new Set(rows.map(row => row.canonical_principal_key));
+  if (laneIds.size > 1 || canonicalKeys.size > 1) {
+    return { status: 'identity_conflict', reason: 'identity_evidence_conflict' };
+  }
+  const row = rows[0];
+  if (!row) return { status: 'missing' };
+  const lane = ownStore.db.prepare(
+    'SELECT routing_anchor FROM principal_lanes WHERE source_session_id = ? AND lane_id = ?',
+  ).get(args.sourceSessionId, row.lane_id) as { routing_anchor: string } | undefined;
+  return lane?.routing_anchor
+    ? { status: 'ready', laneId: row.lane_id, routingAnchor: lane.routing_anchor }
+    : { status: 'retry', reason: 'lane_not_active' };
+}
+
+export type EnsureShadowPrincipalLaneResult =
+  | {
+      status: 'ready';
+      created: boolean;
+      lane: PrincipalLaneBinding;
+      session: Session;
+      worktree?: PrincipalLaneWorktreeProof;
+    }
+  | { status: 'retry'; reason: 'source_authority_changed' | 'source_not_active'
+      | 'lane_not_active' | 'workspace_migration_required' | 'workspace_migration_busy'
+      | 'worktree_not_committed' | 'store_busy' }
+  | { status: 'identity_conflict'; reason: 'identity_evidence_conflict' }
+  | { status: 'quarantined'; reason: string }
+  | { status: 'unknown'; reason: 'worktree_publication_unknown' };
+
+export interface ExpectedPrincipalLaneSourceAuthority {
+  sourcePrincipalKey: string;
+  sourceRevision: number;
+  sourceLaneRevision: number;
+  workspaceEpoch: number;
+  canonicalCwd: string;
+  workspaceGroupId: string;
+  workspaceGroupKeyVersion: 2 | undefined;
+  displayTarget: PrincipalLaneDisplayTarget;
+}
+
+type ValidatedPrincipalLaneWorkspace =
+  | { ok: true; worktree?: PrincipalLaneWorktreeProof }
+  | { ok: false; reason: string };
+
+/** Validate the durable workspace carrier for one lane. Source and legacy
+ * shadow lanes retain the canonical source cwd; D-live shadow lanes must have
+ * one exact embedded+indexed worktree proof. */
+function validatePrincipalLaneWorkspace(
+  store: SqliteReadStore,
+  source: PrincipalLaneSourceState,
+  lane: ParsedPrincipalLaneSidecar,
+  session: Session,
+): ValidatedPrincipalLaneWorkspace {
+  if (lane.binding.laneId === 'source') {
+    return canonicalSessionCwd(session) === source.canonicalCwd
+      ? { ok: true }
+      : { ok: false, reason: 'source_session_cwd_mismatch' };
+  }
+  const proofHit = readPrincipalLaneWorktreeRow(
+    store, lane.binding.sourceSessionId, lane.binding.laneId,
+  );
+  if (!proofHit && !session.principalLaneWorktree) {
+    return canonicalSessionCwd(session) === source.canonicalCwd
+      ? { ok: true }
+      : { ok: false, reason: 'legacy_lane_session_cwd_mismatch' };
+  }
+  const indexed = parseWorktreeSidecar(proofHit, {
+    sourceSessionId: lane.binding.sourceSessionId,
+    laneId: lane.binding.laneId,
+    sessionId: lane.sessionId,
+    principalKey: lane.binding.principalKey,
+    workspaceEpoch: lane.binding.workspaceEpoch,
+  });
+  const embedded = session.principalLaneWorktree
+    ? parsePrincipalLaneWorktreeProof(session.principalLaneWorktree, {
+      sourceSessionId: lane.binding.sourceSessionId,
+      laneId: lane.binding.laneId,
+      sessionId: lane.sessionId,
+      principalKey: lane.binding.principalKey,
+      workspaceEpoch: lane.binding.workspaceEpoch,
+    })
+    : { ok: false as const, error: 'missing_embedded_proof' };
+  if (!indexed.ok) return { ok: false, reason: `worktree:${indexed.error}` };
+  if (!embedded.ok) return { ok: false, reason: `worktree:${embedded.error}` };
+  if (JSON.stringify(indexed.value) !== JSON.stringify(embedded.value)
+      || indexed.value.sourceCanonicalCwd !== source.canonicalCwd
+      || canonicalSessionCwd(session) !== indexed.value.workingDir) {
+    return { ok: false, reason: 'worktree_session_sidecar_mismatch' };
+  }
+  return { ok: true, worktree: indexed.value };
+}
+
+async function principalLaneWorktreeGitCarrierIsIntact(proof: Pick<
+  PrincipalLaneWorktreeProof,
+  'sourceRepoRoot' | 'sourceGitCommonDir' | 'worktreeRoot' | 'worktreeGitCommonDir'
+    | 'workingDir' | 'branch'
+>): Promise<boolean> {
+  try {
+    const [sourceGit, worktreeGit] = await Promise.all([
+      readPrincipalLaneGitIdentity(proof.sourceRepoRoot),
+      readPrincipalLaneGitIdentity(proof.worktreeRoot),
+    ]);
+    return proof.sourceRepoRoot !== proof.worktreeRoot
+      && proof.sourceGitCommonDir === proof.worktreeGitCommonDir
+      && sourceGit.repoRoot === proof.sourceRepoRoot
+      && sourceGit.gitCommonDir === proof.sourceGitCommonDir
+      && worktreeGit.repoRoot === proof.worktreeRoot
+      && worktreeGit.gitCommonDir === proof.worktreeGitCommonDir
+      && worktreeGit.gitCommonDir === sourceGit.gitCommonDir
+      && worktreeGit.branch === proof.branch
+      && realpathSync(proof.sourceRepoRoot) === proof.sourceRepoRoot
+      && realpathSync(proof.worktreeRoot) === proof.worktreeRoot
+      && realpathSync(proof.workingDir) === proof.workingDir;
+  } catch {
+    return false;
+  }
+}
+
+class PrincipalLaneAuthorityChangedError extends Error {}
+
+type ResolvedHumanLaneEvidence = {
+  canonicalPrincipal: HumanLanePrincipal;
+  canonicalKey: string;
+  aliasKeys: string[];
+  unionId?: string;
+  openId?: string;
+};
+
+function resolveHumanLaneEvidence(
+  evidence: HumanLaneIdentityEvidence,
+  expectedLarkAppId: string,
+): ResolvedHumanLaneEvidence | undefined {
+  if (evidence.larkAppId !== expectedLarkAppId) return undefined;
+  const unionId = evidence.unionId?.trim() || undefined;
+  const openId = evidence.openId?.trim() || undefined;
+  if (!unionId && !openId) return undefined;
+  const canonicalPrincipal: HumanLanePrincipal = unionId
+    ? { senderType: 'user', kind: 'union', unionId }
+    : { senderType: 'user', kind: 'app_open', larkAppId: expectedLarkAppId, openId: openId! };
+  const canonicalKey = lanePrincipalKey(canonicalPrincipal);
+  const aliasKeys = [canonicalKey];
+  if (openId) {
+    const openKey = lanePrincipalKey({
+      senderType: 'user', kind: 'app_open', larkAppId: expectedLarkAppId, openId,
+    });
+    if (openKey !== canonicalKey) aliasKeys.push(openKey);
+  }
+  return { canonicalPrincipal, canonicalKey, aliasKeys, unionId, openId };
+}
+
+function samePrincipalDisplayTarget(
+  left: PrincipalLaneDisplayTarget,
+  right: PrincipalLaneDisplayTarget,
+): boolean {
+  return left.scope === right.scope
+    && left.larkAppId === right.larkAppId
+    && left.chatId === right.chatId
+    && (left.scope !== 'thread'
+      || (right.scope === 'thread' && left.rootMessageId === right.rootMessageId));
+}
+
+function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
+  return `principal-lane:${createHash('sha256')
+    .update(`${sourceSessionId}\0${laneId}`)
+    .digest('hex').slice(0, 32)}`;
+}
+
+const PRINCIPAL_LANE_RUNTIME_KEYS = [
+  'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
+  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
+  'sandbox', 'sandboxPaths', 'sandboxHidePaths',
+  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
+] as const satisfies readonly (keyof Session)[];
+
+function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {
+  const sourceRecord = source as unknown as Record<string, unknown>;
+  const targetRecord = target as unknown as Record<string, unknown>;
+  for (const key of PRINCIPAL_LANE_RUNTIME_KEYS) {
+    if (sourceRecord[key] !== undefined) targetRecord[key] = structuredClone(sourceRecord[key]);
+  }
+}
+
+function buildShadowPrincipalSession(args: {
+  source: Session;
+  sourceState: PrincipalLaneSourceState;
+  displayTarget: PrincipalLaneDisplayTarget;
+  evidence: ResolvedHumanLaneEvidence;
+  lane: PrincipalLaneBinding;
+  title: string;
+  now: string;
+}): Session {
+  const session: Session = {
+    sessionId: randomUUID(),
+    chatId: args.displayTarget.chatId,
+    chatType: args.source.chatType,
+    rootMessageId: args.displayTarget.scope === 'thread'
+      ? args.displayTarget.rootMessageId
+      : args.source.rootMessageId,
+    scope: args.displayTarget.scope,
+    title: args.title,
+    nativeSessionTitle: args.title,
+    nativeSessionTitleUserDefined: false,
+    status: 'active',
+    createdAt: args.now,
+    creationSource: 'fork',
+    larkAppId: args.displayTarget.larkAppId,
+    workingDir: args.sourceState.canonicalCwd,
+    ownerUnionId: args.evidence.unionId,
+    ownerOpenId: args.evidence.openId,
+    creatorOpenId: args.evidence.openId,
+    lastCallerOpenId: args.evidence.openId,
+    principalLane: args.lane,
+  };
+  copyPrincipalLaneRuntimeConfig(args.source, session);
+  return session;
+}
+
+function buildPrincipalLaneWorktreeProof(args: {
+  materialization: PrincipalLaneWorktreeMaterialization;
+  lane: PrincipalLaneBinding;
+  sessionId: string;
+  now: string;
+}): PrincipalLaneWorktreeProof {
+  return {
+    version: 1,
+    materializationId: args.materialization.materializationId,
+    sourceSessionId: args.lane.sourceSessionId,
+    laneId: args.lane.laneId,
+    sessionId: args.sessionId,
+    principalKey: args.lane.principalKey,
+    workspaceEpoch: args.lane.workspaceEpoch,
+    sourceCanonicalCwd: args.materialization.sourceCanonicalCwd,
+    sourceRepoRoot: args.materialization.sourceRepoRoot,
+    sourceGitCommonDir: args.materialization.sourceGitCommonDir,
+    sourceRelativeCwd: args.materialization.sourceRelativeCwd,
+    worktreeRoot: args.materialization.worktreeRoot,
+    worktreeGitCommonDir: args.materialization.worktreeGitCommonDir,
+    workingDir: args.materialization.workingDir,
+    branch: args.materialization.branch,
+    baseRef: args.materialization.baseRef,
+    phase: 'ready',
+    revision: 1,
+    createdAt: args.materialization.createdAt,
+    updatedAt: args.now,
+  };
+}
+
+function materializationMatchesSource(
+  materialization: PrincipalLaneWorktreeMaterialization,
+  sourceSessionId: string,
+  source: PrincipalLaneSourceState,
+  principalKey: string,
+): boolean {
+  return materialization.version === 1
+    && materialization.materializationId === principalLaneWorktreeMaterializationId({
+      sourceSessionId,
+      principalKey,
+      workspaceEpoch: source.workspaceEpoch,
+      sourceCanonicalCwd: source.canonicalCwd,
+    })
+    && materialization.sourceSessionId === sourceSessionId
+    && materialization.principalKey === principalKey
+    && materialization.workspaceEpoch === source.workspaceEpoch
+    && materialization.sourceCanonicalCwd === source.canonicalCwd
+    && canonicalIso(materialization.createdAt)
+    && typeof materialization.branch === 'string'
+    && materialization.branch.length > 0
+    && typeof materialization.baseRef === 'string'
+    && materialization.baseRef.length > 0
+    && typeof materialization.sourceRelativeCwd === 'string'
+    && !isAbsolute(materialization.sourceRelativeCwd)
+    && materialization.sourceRelativeCwd !== '..'
+    && !materialization.sourceRelativeCwd.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+    && isAbsolute(materialization.sourceRepoRoot)
+    && isAbsolute(materialization.sourceGitCommonDir)
+    && isAbsolute(materialization.worktreeRoot)
+    && isAbsolute(materialization.worktreeGitCommonDir)
+    && isAbsolute(materialization.workingDir)
+    && materialization.sourceRepoRoot !== materialization.worktreeRoot
+    && materialization.sourceGitCommonDir === materialization.worktreeGitCommonDir
+    && materialization.sourceCanonicalCwd !== materialization.workingDir
+    && resolve(materialization.sourceRepoRoot, materialization.sourceRelativeCwd)
+      === materialization.sourceCanonicalCwd
+    && resolve(materialization.worktreeRoot, materialization.sourceRelativeCwd)
+      === materialization.workingDir;
+}
+
+function insertPrincipalLaneWorktreeProof(
+  store: OwnSqliteStore,
+  proof: PrincipalLaneWorktreeProof,
+): void {
+  store.db.prepare(
+    'INSERT INTO principal_lane_worktrees '
+    + '(materialization_id, source_session_id, lane_id, session_id, principal_key, '
+    + 'workspace_epoch, source_repo_root, source_git_common_dir, worktree_root, '
+    + 'worktree_git_common_dir, working_dir, branch, phase, revision, row) '
+    + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run(
+    proof.materializationId, proof.sourceSessionId, proof.laneId, proof.sessionId,
+    proof.principalKey, proof.workspaceEpoch, proof.sourceRepoRoot, proof.sourceGitCommonDir,
+    proof.worktreeRoot, proof.worktreeGitCommonDir, proof.workingDir, proof.branch,
+    proof.phase, proof.revision, JSON.stringify(proof),
+  );
+}
+
+function proofMatchesMaterialization(
+  proof: PrincipalLaneWorktreeProof,
+  materialization: PrincipalLaneWorktreeMaterialization,
+): boolean {
+  return proof.materializationId === materialization.materializationId
+    && proof.sourceSessionId === materialization.sourceSessionId
+    && proof.principalKey === materialization.principalKey
+    && proof.workspaceEpoch === materialization.workspaceEpoch
+    && proof.sourceCanonicalCwd === materialization.sourceCanonicalCwd
+    && proof.sourceRepoRoot === materialization.sourceRepoRoot
+    && proof.sourceGitCommonDir === materialization.sourceGitCommonDir
+    && proof.sourceRelativeCwd === materialization.sourceRelativeCwd
+    && proof.worktreeRoot === materialization.worktreeRoot
+    && proof.worktreeGitCommonDir === materialization.worktreeGitCommonDir
+    && proof.workingDir === materialization.workingDir
+    && proof.branch === materialization.branch;
+}
+
+async function recoverPrincipalLaneWorktreePublication(
+  materialization: PrincipalLaneWorktreeMaterialization,
+): Promise<EnsureShadowPrincipalLaneResult> {
+  let db: SqliteDatabaseLike;
+  try { db = openDbForRead(getDbPath()); }
+  catch { return { status: 'unknown', reason: 'worktree_publication_unknown' }; }
+  try {
+    db.exec('BEGIN');
+    const proofHit = db.prepare(
+      'SELECT materialization_id, source_session_id, lane_id, session_id, principal_key, '
+      + 'workspace_epoch, source_repo_root, source_git_common_dir, worktree_root, '
+      + 'worktree_git_common_dir, working_dir, branch, phase, revision, row '
+      + 'FROM principal_lane_worktrees WHERE materialization_id = ?',
+    ).get(materialization.materializationId) as PrincipalLaneWorktreeSidecarRow | undefined;
+    if (!proofHit) {
+      const laneHit = db.prepare(
+        'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, phase, revision, row '
+        + 'FROM principal_lanes WHERE source_session_id = ? AND principal_key = ?',
+      ).get(
+        materialization.sourceSessionId, materialization.principalKey,
+      ) as PrincipalLaneSidecarRow | undefined;
+      if (!laneHit) {
+        const identityTrace = db.prepare(
+          'SELECT 1 AS hit FROM principal_lane_aliases '
+          + 'WHERE source_session_id = ? AND (alias_key = ? OR canonical_principal_key = ?) LIMIT 1',
+        ).get(
+          materialization.sourceSessionId, materialization.principalKey,
+          materialization.principalKey,
+        ) as { hit: number } | undefined;
+        db.exec('COMMIT');
+        return identityTrace
+          ? { status: 'unknown', reason: 'worktree_publication_unknown' }
+          : { status: 'retry', reason: 'worktree_not_committed' };
+      }
+      const legacy = currentAppId
+        ? readPrincipalLaneHydrationSnapshot(
+          { db }, currentAppId, materialization.sourceSessionId, laneHit.lane_id,
+        )
+        : { status: 'quarantined' as const, reason: 'missing_app_identity' };
+      db.exec('COMMIT');
+      return legacy.status === 'retry' && legacy.reason === 'worktree_not_materialized'
+        ? { status: 'retry', reason: 'worktree_not_committed' }
+        : { status: 'unknown', reason: 'worktree_publication_unknown' };
+    }
+    const parsedProof = parseWorktreeSidecar(proofHit, {
+      sourceSessionId: proofHit.source_session_id,
+      laneId: proofHit.lane_id,
+      sessionId: proofHit.session_id,
+      principalKey: proofHit.principal_key,
+      workspaceEpoch: Number(proofHit.workspace_epoch),
+    });
+    if (!parsedProof.ok || !proofMatchesMaterialization(parsedProof.value, materialization)) {
+      db.exec('COMMIT');
+      return { status: 'unknown', reason: 'worktree_publication_unknown' };
+    }
+    db.exec('COMMIT');
+    const hydrated = currentAppId
+      ? await readPrincipalLaneHydrationWithGitFence(
+        { db }, currentAppId, materialization.sourceSessionId, parsedProof.value.laneId,
+      )
+      : { status: 'quarantined' as const, reason: 'missing_app_identity' };
+    if (hydrated.status !== 'ready' || !hydrated.worktree
+        || !proofMatchesMaterialization(hydrated.worktree, materialization)
+        || hydrated.lane.laneId !== parsedProof.value.laneId
+        || hydrated.lane.principalKey !== parsedProof.value.principalKey
+        || hydrated.lane.workspaceEpoch !== parsedProof.value.workspaceEpoch
+        || hydrated.session.sessionId !== parsedProof.value.sessionId
+        || JSON.stringify(hydrated.worktree) !== JSON.stringify(parsedProof.value)) {
+      return { status: 'unknown', reason: 'worktree_publication_unknown' };
+    }
+    return {
+      status: 'ready',
+      created: false,
+      lane: hydrated.lane,
+      session: hydrated.session,
+      worktree: hydrated.worktree,
+    };
+  } catch {
+    try { db.exec('ROLLBACK'); } catch { /* read transaction already gone */ }
+    return { status: 'unknown', reason: 'worktree_publication_unknown' };
+  } finally {
+    db.close();
+  }
+}
+
+function runPrincipalLaneWorktreePublicationTransaction(
+  store: OwnSqliteStore,
+  materialization: PrincipalLaneWorktreeMaterialization,
+  operation: () => EnsureShadowPrincipalLaneResult,
+): EnsureShadowPrincipalLaneResult {
+  let began = false;
+  let commitAttempted = false;
+  try {
+    store.db.exec('BEGIN IMMEDIATE');
+    began = true;
+    const result = operation();
+    testOnlyBeforePrincipalLaneWorktreeCommit?.();
+    commitAttempted = true;
+    store.db.exec('COMMIT');
+    began = false;
+    testOnlyAfterPrincipalLaneWorktreeCommit?.();
+    return result;
+  } catch (error) {
+    if (!commitAttempted) {
+      if (!began) {
+        return isTransientStoreContentionError(error)
+          ? { status: 'retry', reason: 'store_busy' }
+          : { status: 'retry', reason: 'worktree_not_committed' };
+      }
+      try {
+        store.db.exec('ROLLBACK');
+        began = false;
+        return { status: 'retry', reason: 'worktree_not_committed' };
+      } catch {
+        return { status: 'unknown', reason: 'worktree_publication_unknown' };
+      }
+    }
+    return { status: 'unknown', reason: 'worktree_publication_unknown' };
+  }
+}
+
+function principalLaneBindingsEqual(left: PrincipalLaneBinding, right: PrincipalLaneBinding): boolean {
+  return left.laneId === right.laneId
+    && left.sourceSessionId === right.sourceSessionId
+    && left.principalKey === right.principalKey
+    && left.routingAnchor === right.routingAnchor
+    && left.workspaceEpoch === right.workspaceEpoch
+    && left.phase === right.phase
+    && left.revision === right.revision
+    && left.createdAt === right.createdAt
+    && left.updatedAt === right.updatedAt
+    && left.quarantineReason === right.quarantineReason
+    && samePrincipalDisplayTarget(left.displayTarget, right.displayTarget);
+}
+
+function principalLaneSourcesEqual(
+  left: PrincipalLaneSourceState,
+  right: PrincipalLaneSourceState,
+): boolean {
+  return left.version === right.version
+    && left.sourcePrincipalKey === right.sourcePrincipalKey
+    && samePrincipalDisplayTarget(left.displayTarget, right.displayTarget)
+    && left.canonicalCwd === right.canonicalCwd
+    && left.workspaceEpoch === right.workspaceEpoch
+    && left.workspaceGroupId === right.workspaceGroupId
+    && left.workspaceGroupKeyVersion === right.workspaceGroupKeyVersion
+    && left.phase === right.phase
+    && left.revision === right.revision
+    && left.updatedAt === right.updatedAt
+    && left.leaseOwner === right.leaseOwner
+    && left.leaseGeneration === right.leaseGeneration
+    && left.principalLaneDisabledReason === right.principalLaneDisabledReason
+    && JSON.stringify(left.migrationAudit) === JSON.stringify(right.migrationAudit);
+}
+
+function upsertPrincipalLaneAlias(
+  store: OwnSqliteStore,
+  sourceSessionId: string,
+  aliasKey: string,
+  laneId: string,
+  canonicalPrincipalKey: string,
+  now: string,
+): void {
+  store.db.prepare(
+    'INSERT INTO principal_lane_aliases '
+    + '(source_session_id, alias_key, lane_id, canonical_principal_key, created_at, updated_at) '
+    + 'VALUES (?, ?, ?, ?, ?, ?) '
+    + 'ON CONFLICT(source_session_id, alias_key) DO UPDATE SET '
+    + 'lane_id = excluded.lane_id, canonical_principal_key = excluded.canonical_principal_key, '
+    + 'updated_at = excluded.updated_at',
+  ).run(sourceSessionId, aliasKey, laneId, canonicalPrincipalKey, now, now);
+}
+
+function persistPrincipalLaneIdentityConflict(
+  store: OwnSqliteStore,
+  args: {
+    sourceSessionId: string;
+    leftAliasKey: string;
+    rightAliasKey: string;
+    leftLaneId: string;
+    rightLaneId: string;
+    now: string;
+  },
+): void {
+  const ordered = [
+    { aliasKey: args.leftAliasKey, laneId: args.leftLaneId },
+    { aliasKey: args.rightAliasKey, laneId: args.rightLaneId },
+  ].sort((left, right) => left.aliasKey.localeCompare(right.aliasKey)
+    || left.laneId.localeCompare(right.laneId));
+  const inserted = store.db.prepare(
+    'INSERT OR IGNORE INTO principal_lane_identity_conflicts '
+    + '(conflict_id, source_session_id, left_alias_key, right_alias_key, '
+    + 'left_lane_id, right_lane_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  ).run(
+    randomUUID(), args.sourceSessionId, ordered[0]!.aliasKey, ordered[1]!.aliasKey,
+    ordered[0]!.laneId, ordered[1]!.laneId, args.now,
+  );
+  if (Number(inserted.changes) === 0) return;
+  store.db.prepare(
+    'INSERT INTO principal_lane_identity_audit '
+    + '(audit_id, source_session_id, event, detail, created_at) VALUES (?, ?, ?, ?, ?)',
+  ).run(randomUUID(), args.sourceSessionId, 'conflict', JSON.stringify({
+    leftAlias: ordered[0]!.aliasKey,
+    rightAlias: ordered[1]!.aliasKey,
+    leftLaneId: ordered[0]!.laneId,
+    rightLaneId: ordered[1]!.laneId,
+  }), args.now);
+}
+
+/** Atomically reuses, upgrades, or creates one human principal lane. It does
+ * not publish a runtime DaemonSession and never feeds routingAnchor to Lark. */
+export function ensureShadowPrincipalLane(args: {
+  sourceSessionId: string;
+  identity: HumanLaneIdentityEvidence;
+  title?: string;
+  now?: string;
+  expectedSource?: ExpectedPrincipalLaneSourceAuthority;
+  /** D-live publication path. When present, lane/session/proof commit atomically;
+   * callers must not register the returned session unless status is ready. */
+  worktree?: PrincipalLaneWorktreeMaterialization;
+}): EnsureShadowPrincipalLaneResult {
+  loadForWrite();
+  const store = ownStore;
+  if (!store || !currentAppId) {
+    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
+  }
+  const evidence = resolveHumanLaneEvidence(args.identity, currentAppId);
+  if (!evidence) throw new Error('invalid human lane identity evidence');
+  const now = args.now ?? new Date().toISOString();
+  if (!canonicalIso(now)) throw new Error('invalid principal-lane creation timestamp');
+
+  const snapshot = readPrincipalLaneSource(args.sourceSessionId);
+  if (!snapshot || snapshot.status === 'disabled') {
+    return { status: 'retry', reason: 'source_not_active' };
+  }
+  if (snapshot.status === 'retry') return { status: 'retry', reason: 'source_authority_changed' };
+  if (snapshot.status === 'quarantined') return snapshot;
+  if (snapshot.source.phase !== 'active') return { status: 'retry', reason: 'source_not_active' };
+
+  testOnlyBeforePrincipalLaneCreateTransaction?.();
+
+  let result: EnsureShadowPrincipalLaneResult;
+  try {
+    const operation = (): EnsureShadowPrincipalLaneResult => {
+    const sourceSessionHit = store.selectRow.get(args.sourceSessionId) as { row: string } | undefined;
+    if (!sourceSessionHit) return { status: 'retry', reason: 'source_authority_changed' };
+    let sourceSession: Session;
+    try { sourceSession = JSON.parse(sourceSessionHit.row) as Session; }
+    catch {
+      quarantinePrincipalLaneSource(store, args.sourceSessionId);
+      return { status: 'quarantined', reason: 'invalid_source_session_json' };
+    }
+    if (sourceSession.status !== 'active') return { status: 'retry', reason: 'source_not_active' };
+    const displayTarget = sourceSessionDisplayTarget(sourceSession, currentAppId!);
+    if (!displayTarget) {
+      quarantinePrincipalLaneSource(store, args.sourceSessionId);
+      return { status: 'quarantined', reason: 'invalid_source_display_target' };
+    }
+
+    const sourceHit = store.db.prepare(
+      'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
+      + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
+    ).get(args.sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
+    const sourceLaneHit = store.db.prepare(
+      'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+      + "phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+    ).get(args.sourceSessionId) as PrincipalLaneSidecarRow | undefined;
+    const sourceState = parseSourceSidecar(sourceHit, displayTarget, args.sourceSessionId);
+    const sourceLane = parseLaneSidecar(sourceLaneHit, {
+      displayTarget, sourceSessionId: args.sourceSessionId,
+    });
+    if (!sourceState.ok) {
+      quarantinePrincipalLaneSource(store, args.sourceSessionId);
+      return { status: 'quarantined', reason: `source:${sourceState.error}` };
+    }
+    if (!sourceLane.ok || sourceLane.value.binding.laneId !== 'source'
+        || sourceLane.value.sessionId !== args.sourceSessionId
+        || sourceLane.value.binding.principalKey !== sourceState.value.sourcePrincipalKey
+        || sourceLane.value.binding.workspaceEpoch !== sourceState.value.workspaceEpoch) {
+      quarantinePrincipalLane(store, args.sourceSessionId);
+      return { status: 'quarantined', reason: !sourceLane.ok
+        ? `lane:${sourceLane.error}` : 'source_lane_mismatch' };
+    }
+    const embeddedSourceState = sourceSession.principalLaneSource
+      ? parsePrincipalLaneSourceState(
+        sourceSession.principalLaneSource, displayTarget, args.sourceSessionId,
+      )
+      : { ok: false as const, error: 'not_object' as const };
+    const embeddedSourceLane = sourceSession.principalLane
+      ? parsePrincipalLaneBinding(sourceSession.principalLane, {
+        displayTarget,
+        sourceSessionId: args.sourceSessionId,
+      })
+      : { ok: false as const, error: 'not_object' as const };
+    if (!embeddedSourceState.ok || !embeddedSourceLane.ok
+        || !principalLaneSourcesEqual(embeddedSourceState.value, sourceState.value)
+        || !principalLaneBindingsEqual(embeddedSourceLane.value, sourceLane.value.binding)) {
+      quarantinePrincipalLaneSource(store, args.sourceSessionId);
+      quarantinePrincipalLane(store, args.sourceSessionId);
+      return { status: 'quarantined', reason: 'source_session_mismatch' };
+    }
+    if (sourceState.value.phase !== 'active' || sourceLane.value.binding.phase !== 'active') {
+      return { status: 'retry', reason: 'source_not_active' };
+    }
+    if (args.worktree && !materializationMatchesSource(
+      args.worktree,
+      args.sourceSessionId,
+      sourceState.value,
+      evidence.canonicalKey,
+    )) {
+      return { status: 'quarantined', reason: 'worktree_materialization_mismatch' };
+    }
+    if (!principalLaneSourcesEqual(sourceState.value, snapshot.source)
+        || !principalLaneBindingsEqual(sourceLane.value.binding, snapshot.lane)
+        || canonicalSessionCwd(sourceSession) !== sourceState.value.canonicalCwd) {
+      return { status: 'retry', reason: 'source_authority_changed' };
+    }
+    const expectedSource = args.expectedSource;
+    if (expectedSource
+        && (sourceState.value.sourcePrincipalKey !== expectedSource.sourcePrincipalKey
+          || sourceState.value.revision !== expectedSource.sourceRevision
+          || sourceLane.value.binding.revision !== expectedSource.sourceLaneRevision
+          || sourceState.value.workspaceEpoch !== expectedSource.workspaceEpoch
+          || sourceState.value.canonicalCwd !== expectedSource.canonicalCwd
+          || sourceState.value.workspaceGroupId !== expectedSource.workspaceGroupId
+          || sourceState.value.workspaceGroupKeyVersion
+            !== expectedSource.workspaceGroupKeyVersion
+          || !samePrincipalDisplayTarget(
+            sourceState.value.displayTarget,
+            expectedSource.displayTarget,
+          ))) {
+      return { status: 'retry', reason: 'source_authority_changed' };
+    }
+    if (sourceState.value.workspaceGroupKeyVersion
+        !== PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION) {
+      return { status: 'retry', reason: 'workspace_migration_required' };
+    }
+    const groupHit = readWorkspaceGroupRow(store, sourceState.value.workspaceGroupId);
+    const parsedGroup = parseWorkspaceGroupSidecar(groupHit);
+    if (!parsedGroup.ok) {
+      if (groupHit) quarantinePrincipalWorkspaceGroup(store, sourceState.value.workspaceGroupId);
+      return { status: 'quarantined', reason: `group:${parsedGroup.error}` };
+    }
+    if (parsedGroup.value.larkAppId !== currentAppId
+        || parsedGroup.value.canonicalCwd !== sourceState.value.canonicalCwd
+        || parsedGroup.value.groupId !== sourceState.value.workspaceGroupId) {
+      return { status: 'retry', reason: 'source_authority_changed' };
+    }
+    if (parsedGroup.value.phase !== 'active') {
+      return { status: 'retry', reason: 'workspace_migration_busy' };
+    }
+    const sourceMemberHit = readWorkspaceMemberRow(store, args.sourceSessionId, 'source');
+    const sourceMember = parseWorkspaceMemberSidecar(sourceMemberHit);
+    if (!sourceMember.ok) {
+      if (sourceMemberHit) quarantinePrincipalWorkspaceMember(store, args.sourceSessionId, 'source');
+      return { status: 'quarantined', reason: `member:${sourceMember.error}` };
+    }
+    if (!principalWorkspaceMemberIdentityMatchesLane(
+      sourceMember.value, sourceLane.value, sourceState.value,
+    )) {
+      quarantinePrincipalWorkspaceMember(store, args.sourceSessionId, 'source');
+      return { status: 'quarantined', reason: 'member:source_membership_mismatch' };
+    }
+    if (sourceMember.value.membershipPhase !== 'active') {
+      return { status: 'retry', reason: 'lane_not_active' };
+    }
+
+    for (const aliasKey of evidence.aliasKeys) {
+      const conflict = store.db.prepare(
+        'SELECT 1 AS hit FROM principal_lane_identity_conflicts '
+        + 'WHERE source_session_id = ? AND (left_alias_key = ? OR right_alias_key = ?) LIMIT 1',
+      ).get(args.sourceSessionId, aliasKey, aliasKey) as { hit: number } | undefined;
+      if (conflict) return { status: 'identity_conflict', reason: 'identity_evidence_conflict' };
+    }
+
+    const identityMatches: Array<{
+      aliasKey: string;
+      laneId: string;
+      via: 'alias' | 'direct';
+      canonicalPrincipalKey?: string;
+    }> = [];
+    for (const aliasKey of evidence.aliasKeys) {
+      const alias = store.db.prepare(
+        'SELECT lane_id, canonical_principal_key FROM principal_lane_aliases '
+        + 'WHERE source_session_id = ? AND alias_key = ?',
+      ).get(args.sourceSessionId, aliasKey) as {
+        lane_id: string;
+        canonical_principal_key: string;
+      } | undefined;
+      const direct = store.db.prepare(
+        'SELECT lane_id FROM principal_lanes WHERE source_session_id = ? AND principal_key = ?',
+      ).get(args.sourceSessionId, aliasKey) as { lane_id: string } | undefined;
+      if (alias) identityMatches.push({
+        aliasKey,
+        laneId: alias.lane_id,
+        via: 'alias',
+        canonicalPrincipalKey: alias.canonical_principal_key,
+      });
+      if (direct) identityMatches.push({ aliasKey, laneId: direct.lane_id, via: 'direct' });
+    }
+    const candidateLaneIds = [...new Set(identityMatches.map(match => match.laneId))];
+    if (candidateLaneIds.length > 1) {
+      const left = identityMatches.find(match => match.laneId === candidateLaneIds[0])!;
+      const right = identityMatches.find(match => match.laneId !== left.laneId)!;
+      persistPrincipalLaneIdentityConflict(store, {
+        sourceSessionId: args.sourceSessionId,
+        leftAliasKey: left.aliasKey,
+        rightAliasKey: right.aliasKey,
+        leftLaneId: left.laneId,
+        rightLaneId: right.laneId,
+        now,
+      });
+      return { status: 'identity_conflict', reason: 'identity_evidence_conflict' };
+    }
+
+    if (candidateLaneIds.length === 1) {
+      const laneId = candidateLaneIds[0]!;
+      const hit = store.db.prepare(
+        'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+        + 'phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = ?',
+      ).get(args.sourceSessionId, laneId) as PrincipalLaneSidecarRow | undefined;
+      const parsed = parseLaneSidecar(hit, { displayTarget, sourceSessionId: args.sourceSessionId });
+      if (!parsed.ok) {
+        quarantinePrincipalLane(store, args.sourceSessionId, laneId);
+        return { status: 'quarantined', reason: `lane:${parsed.error}` };
+      }
+      let binding = parsed.value.binding;
+      const memberHit = readWorkspaceMemberRow(store, args.sourceSessionId, laneId);
+      const member = parseWorkspaceMemberSidecar(memberHit);
+      if (!member.ok) {
+        if (memberHit) quarantinePrincipalWorkspaceMember(store, args.sourceSessionId, laneId);
+        return { status: 'quarantined', reason: `member:${member.error}` };
+      }
+      if (!principalWorkspaceMemberIdentityMatchesLane(member.value, parsed.value, sourceState.value)) {
+        quarantinePrincipalWorkspaceMember(store, args.sourceSessionId, laneId);
+        return { status: 'quarantined', reason: 'member:lane_membership_mismatch' };
+      }
+      if (member.value.membershipPhase !== 'active') {
+        return { status: 'retry', reason: 'lane_not_active' };
+      }
+      const mismatchedAlias = identityMatches.find(match => match.via === 'alias'
+        && match.laneId === laneId
+        && match.canonicalPrincipalKey !== binding.principalKey);
+      if (mismatchedAlias) {
+        persistPrincipalLaneIdentityConflict(store, {
+          sourceSessionId: args.sourceSessionId,
+          leftAliasKey: mismatchedAlias.aliasKey,
+          rightAliasKey: mismatchedAlias.canonicalPrincipalKey!,
+          leftLaneId: laneId,
+          rightLaneId: laneId,
+          now,
+        });
+        return { status: 'identity_conflict', reason: 'identity_evidence_conflict' };
+      }
+      if (binding.workspaceEpoch !== sourceState.value.workspaceEpoch) {
+        return { status: 'retry', reason: 'source_authority_changed' };
+      }
+      if (binding.phase !== 'active' && binding.phase !== 'dormant') {
+        return { status: 'retry', reason: 'lane_not_active' };
+      }
+      const childHit = store.selectRow.get(parsed.value.sessionId) as { row: string } | undefined;
+      let child: Session | undefined;
+      try { child = childHit ? JSON.parse(childHit.row) as Session : undefined; } catch { child = undefined; }
+      const embedded = child?.principalLane
+        ? parsePrincipalLaneBinding(child.principalLane, { displayTarget, sourceSessionId: args.sourceSessionId })
+        : { ok: false as const, error: 'not_object' as const };
+      const childDisplayTarget = child
+        ? sourceSessionDisplayTarget(child, currentAppId!)
+        : undefined;
+      if (!child || child.status !== 'active' || !embedded.ok
+          || !principalLaneBindingsEqual(embedded.value, binding)
+          || child.larkAppId !== currentAppId
+          || !childDisplayTarget
+          || !samePrincipalDisplayTarget(childDisplayTarget, displayTarget)) {
+        quarantinePrincipalLane(store, args.sourceSessionId, laneId);
+        return { status: 'quarantined', reason: 'lane_session_mismatch' };
+      }
+      const workspace = validatePrincipalLaneWorkspace(
+        store, sourceState.value, parsed.value, child,
+      );
+      if (!workspace.ok) {
+        quarantinePrincipalLane(store, args.sourceSessionId, laneId);
+        if (readPrincipalLaneWorktreeRow(store, args.sourceSessionId, laneId)) {
+          quarantinePrincipalLaneWorktree(store, args.sourceSessionId, laneId);
+        }
+        return { status: 'quarantined', reason: workspace.reason };
+      }
+      if (args.worktree && workspace.worktree
+          && !proofMatchesMaterialization(workspace.worktree, args.worktree)) {
+        return { status: 'quarantined', reason: 'worktree_materialization_conflict' };
+      }
+      if (workspace.worktree && binding.principalKey !== evidence.canonicalKey) {
+        return { status: 'quarantined', reason: 'worktree_identity_upgrade_requires_migration' };
+      }
+
+      if (binding.principalKey !== evidence.canonicalKey) {
+        const openKey = evidence.openId ? lanePrincipalKey({
+          senderType: 'user', kind: 'app_open', larkAppId: currentAppId!, openId: evidence.openId,
+        }) : undefined;
+        if (!evidence.unionId || !openKey || binding.principalKey !== openKey
+            || binding.principal.kind !== 'app_open') {
+          persistPrincipalLaneIdentityConflict(store, {
+            sourceSessionId: args.sourceSessionId,
+            leftAliasKey: binding.principalKey,
+            rightAliasKey: evidence.canonicalKey,
+            leftLaneId: laneId,
+            rightLaneId: laneId,
+            now,
+          });
+          return { status: 'identity_conflict', reason: 'identity_evidence_conflict' };
+        }
+        const previousKey = binding.principalKey;
+        binding = {
+          ...binding,
+          principal: evidence.canonicalPrincipal,
+          principalKey: evidence.canonicalKey,
+          revision: binding.revision + 1,
+          updatedAt: now,
+        };
+        child.principalLane = binding;
+        child.ownerUnionId = evidence.unionId;
+        child.ownerOpenId = evidence.openId;
+        child.creatorOpenId = evidence.openId;
+        child.lastCallerOpenId = evidence.openId;
+        if (laneId === 'source') {
+          const nextSource = {
+            ...sourceState.value,
+            sourcePrincipalKey: evidence.canonicalKey,
+            revision: sourceState.value.revision + 1,
+            updatedAt: now,
+          };
+          child.principalLaneSource = nextSource;
+          const sourceUpdated = store.db.prepare(
+            'UPDATE principal_lane_sources SET source_principal_key = ?, revision = ?, row = ? '
+            + 'WHERE source_session_id = ? AND revision = ?',
+          ).run(
+            nextSource.sourcePrincipalKey, nextSource.revision, JSON.stringify(nextSource),
+            args.sourceSessionId, sourceState.value.revision,
+          );
+          if (Number(sourceUpdated.changes) !== 1) throw new PrincipalLaneAuthorityChangedError();
+        }
+        const updated = store.db.prepare(
+          'UPDATE principal_lanes SET principal_key = ?, revision = ?, row = ? '
+          + 'WHERE source_session_id = ? AND lane_id = ? AND revision = ?',
+        ).run(
+          binding.principalKey, binding.revision, JSON.stringify(binding),
+          args.sourceSessionId, laneId, parsed.value.binding.revision,
+        );
+        if (Number(updated.changes) !== 1) throw new PrincipalLaneAuthorityChangedError();
+        persistRow(child);
+        store.db.prepare(
+          'INSERT INTO principal_lane_identity_audit '
+          + '(audit_id, source_session_id, lane_id, event, from_principal_key, '
+          + 'to_principal_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        ).run(
+          randomUUID(), args.sourceSessionId, laneId, 'upgraded',
+          previousKey, evidence.canonicalKey, now,
+        );
+      }
+      let worktree = workspace.worktree;
+      if (args.worktree && !worktree) {
+        worktree = buildPrincipalLaneWorktreeProof({
+          materialization: args.worktree,
+          lane: binding,
+          sessionId: child.sessionId,
+          now,
+        });
+        child.workingDir = worktree.workingDir;
+        child.principalLaneWorktree = worktree;
+        persistRow(child);
+        insertPrincipalLaneWorktreeProof(store, worktree);
+      }
+      for (const aliasKey of evidence.aliasKeys) {
+        upsertPrincipalLaneAlias(store, args.sourceSessionId, aliasKey, laneId, binding.principalKey, now);
+      }
+      store.db.prepare(
+        'UPDATE principal_lane_aliases SET canonical_principal_key = ?, updated_at = ? '
+        + 'WHERE source_session_id = ? AND lane_id = ?',
+      ).run(binding.principalKey, now, args.sourceSessionId, laneId);
+      return { status: 'ready', created: false, lane: binding, session: child, worktree };
+    }
+
+    const laneId = `lane_${randomUUID()}`;
+    const binding: PrincipalLaneBinding = {
+      version: 1,
+      laneId,
+      sourceSessionId: args.sourceSessionId,
+      principalKey: evidence.canonicalKey,
+      principal: evidence.canonicalPrincipal,
+      routingAnchor: shadowRoutingAnchor(args.sourceSessionId, laneId),
+      displayTarget,
+      workspaceEpoch: sourceState.value.workspaceEpoch,
+      phase: 'active',
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const title = args.title?.trim().slice(0, 100) || '独立任务';
+    const child = buildShadowPrincipalSession({
+      source: sourceSession,
+      sourceState: sourceState.value,
+      displayTarget,
+      evidence,
+      lane: binding,
+      title,
+      now,
+    });
+    let worktree: PrincipalLaneWorktreeProof | undefined;
+    if (args.worktree) {
+      worktree = buildPrincipalLaneWorktreeProof({
+        materialization: args.worktree,
+        lane: binding,
+        sessionId: child.sessionId,
+        now,
+      });
+      child.workingDir = worktree.workingDir;
+      child.principalLaneWorktree = worktree;
+    }
+    persistRow(child);
+    store.db.prepare(
+      'INSERT INTO principal_lanes '
+      + '(lane_id, source_session_id, session_id, principal_key, routing_anchor, '
+      + 'workspace_epoch, phase, revision, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      binding.laneId, binding.sourceSessionId, child.sessionId, binding.principalKey,
+      binding.routingAnchor, binding.workspaceEpoch, binding.phase, binding.revision,
+      JSON.stringify(binding),
+    );
+    if (worktree) insertPrincipalLaneWorktreeProof(store, worktree);
+    insertPrincipalWorkspaceMember(store, initialPrincipalWorkspaceMember({
+      sourceSessionId: args.sourceSessionId,
+      laneId,
+      sessionId: child.sessionId,
+      groupId: sourceState.value.workspaceGroupId,
+      workspaceEpoch: sourceState.value.workspaceEpoch,
+      now,
+    }));
+    for (const aliasKey of evidence.aliasKeys) {
+      upsertPrincipalLaneAlias(
+        store, args.sourceSessionId, aliasKey, laneId, binding.principalKey, now,
+      );
+    }
+    store.db.prepare(
+      'INSERT INTO principal_lane_identity_audit '
+      + '(audit_id, source_session_id, lane_id, event, to_principal_key, created_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(randomUUID(), args.sourceSessionId, laneId, 'created', binding.principalKey, now);
+      return { status: 'ready', created: true, lane: binding, session: child, worktree };
+    };
+    result = args.worktree
+      ? runPrincipalLaneWorktreePublicationTransaction(store, args.worktree, operation)
+      : runOwnedWriteTransaction(store, false, operation);
+  } catch (error) {
+    if (error instanceof PrincipalLaneAuthorityChangedError) {
+      return { status: 'retry', reason: 'source_authority_changed' };
+    }
+    throw error;
+  }
+
+  if (result.status === 'ready') {
+    const cached = sessions.get(result.session.sessionId);
+    if (cached) {
+      for (const key of Object.keys(cached)) delete (cached as unknown as Record<string, unknown>)[key];
+      Object.assign(cached, structuredClone(result.session));
+      result.session = cached;
+    } else {
+      sessions.set(result.session.sessionId, result.session);
+    }
+  }
+  return result;
+}
+
+export type HydratePrincipalLaneForIngressResult =
+  | {
+      status: 'ready';
+      source: PrincipalLaneSourceState;
+      lane: PrincipalLaneBinding;
+      session: Session;
+      runtimeRoutingAnchor: string;
+      worktree?: PrincipalLaneWorktreeProof;
+    }
+  | {
+      status: 'retry';
+      reason: 'source_not_active' | 'lane_not_active' | 'worktree_not_materialized'
+        | 'store_busy' | 'authority_changed';
+    }
+  | { status: 'missing'; reason: 'source_missing' | 'lane_missing' | 'session_missing' }
+  | { status: 'quarantined'; reason: string };
+
+export type PrepareShadowPrincipalLaneForIngressResult =
+  | Extract<EnsureShadowPrincipalLaneResult, { status: 'ready' }>
+  | {
+      status: 'retry';
+      reason: string;
+      detail?: string;
+      orphan?: PrincipalLaneWorktreeOrphan;
+    }
+  | {
+      status: 'unknown';
+      reason: 'worktree_materialization_unknown' | 'worktree_publication_unknown';
+      detail?: string;
+      orphan: PrincipalLaneWorktreeOrphan;
+    }
+  | {
+      status: 'identity_conflict';
+      reason: string;
+      orphan: PrincipalLaneWorktreeOrphan;
+    }
+  | {
+      status: 'quarantined';
+      reason: string;
+      orphan?: PrincipalLaneWorktreeOrphan;
+    };
+
+export interface PrincipalLaneWorktreeOrphan {
+  worktreePath: string;
+  branch: string;
+  materializationId: string;
+}
+
+/** Full fail-closed D-live admission preparation, still deliberately detached
+ * from event-dispatch and activeSessions. Any directory that exists without a
+ * proven ready publication is reported as an orphan and never deleted or
+ * reused as a capability by this API. */
+export async function prepareShadowPrincipalLaneForIngress(args: {
+  sourceSessionId: string;
+  identity: HumanLaneIdentityEvidence;
+  title?: string;
+  now?: string;
+}): Promise<PrepareShadowPrincipalLaneForIngressResult> {
+  const source = readPrincipalLaneSource(args.sourceSessionId);
+  if (!source || source.status !== 'ready') {
+    return source?.status === 'quarantined'
+      ? { status: 'quarantined', reason: `source:${source.reason}` }
+      : { status: 'retry', reason: source?.status === 'retry'
+        ? source.reason : 'source_not_active' };
+  }
+  const expectedSource: ExpectedPrincipalLaneSourceAuthority = {
+    sourcePrincipalKey: source.source.sourcePrincipalKey,
+    sourceRevision: source.source.revision,
+    sourceLaneRevision: source.lane.revision,
+    workspaceEpoch: source.source.workspaceEpoch,
+    canonicalCwd: source.source.canonicalCwd,
+    workspaceGroupId: source.source.workspaceGroupId,
+    workspaceGroupKeyVersion: source.source.workspaceGroupKeyVersion,
+    displayTarget: source.source.displayTarget,
+  };
+  const materialized = await materializePrincipalLaneWorktree({
+    sourceSessionId: args.sourceSessionId,
+    source: source.source,
+    identity: args.identity,
+    now: args.now,
+    commit: worktree => ensureShadowPrincipalLane({
+      sourceSessionId: args.sourceSessionId,
+      identity: args.identity,
+      title: args.title,
+      now: args.now,
+      expectedSource,
+      worktree,
+    }),
+  });
+  if (materialized.status === 'retry') {
+    return { status: 'retry', reason: materialized.reason, detail: materialized.detail };
+  }
+  if (materialized.status === 'unknown') {
+    return {
+      status: 'unknown', reason: 'worktree_materialization_unknown',
+      detail: materialized.detail, orphan: materialized.orphan,
+    };
+  }
+  const orphan: PrincipalLaneWorktreeOrphan = {
+    worktreePath: materialized.materialization.worktreeRoot,
+    branch: materialized.materialization.branch,
+    materializationId: materialized.materialization.materializationId,
+  };
+  if (materialized.value.status === 'unknown') {
+    const recovered = await recoverPrincipalLaneWorktreePublication(materialized.materialization);
+    return recovered.status === 'ready' ? recovered : { ...recovered, orphan };
+  }
+  if (materialized.value.status === 'ready') {
+    const hydrated = await hydratePrincipalLaneForIngress(
+      args.sourceSessionId, materialized.value.lane.laneId,
+    );
+    if (hydrated.status === 'ready' && hydrated.worktree
+        && hydrated.session.sessionId === materialized.value.session.sessionId
+        && JSON.stringify(hydrated.lane) === JSON.stringify(materialized.value.lane)
+        && proofMatchesMaterialization(hydrated.worktree, materialized.materialization)) {
+      return materialized.value;
+    }
+    return { status: 'unknown', reason: 'worktree_publication_unknown', orphan };
+  }
+  return { ...materialized.value, orphan };
+}
+
+/** Read exactly one lane from one SQLite snapshot for on-demand ingress
+ * activation. This does not scan at startup, mutate rows, publish an
+ * activeSessions entry, or fork a worker. Shadow lanes without durable
+ * worktree proof are intentionally non-hydratable. */
+function readPrincipalLaneHydrationSnapshot(
+  store: SqliteReadStore,
+  appId: string,
+  sourceSessionId: string,
+  laneId: string,
+): HydratePrincipalLaneForIngressResult {
+  const readSession = (sessionId: string) => store.db.prepare(
+    'SELECT row FROM sessions WHERE session_id = ?',
+  ).get(sessionId) as { row: string } | undefined;
+  const sourceSessionHit = readSession(sourceSessionId);
+  if (!sourceSessionHit) return { status: 'missing', reason: 'source_missing' };
+  let sourceSession: Session;
+  try { sourceSession = JSON.parse(sourceSessionHit.row) as Session; }
+  catch { return { status: 'quarantined', reason: 'invalid_source_session_json' }; }
+  if (sourceSession.status !== 'active') return { status: 'retry', reason: 'source_not_active' };
+  const displayTarget = sourceSessionDisplayTarget(sourceSession, appId);
+  if (!displayTarget) return { status: 'quarantined', reason: 'invalid_source_display_target' };
+  const sourceHit = store.db.prepare(
+    'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
+    + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
+  ).get(sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
+  const parsedSource = parseSourceSidecar(sourceHit, displayTarget, sourceSessionId);
+  if (!parsedSource.ok) return { status: 'quarantined', reason: `source:${parsedSource.error}` };
+  if (parsedSource.value.phase !== 'active') return { status: 'retry', reason: 'source_not_active' };
+  const sourceLaneHit = store.db.prepare(
+    'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+    + "phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+  ).get(sourceSessionId) as PrincipalLaneSidecarRow | undefined;
+  const parsedSourceLane = parseLaneSidecar(sourceLaneHit, { displayTarget, sourceSessionId });
+  const embeddedSource = sourceSession.principalLaneSource
+    ? parsePrincipalLaneSourceState(sourceSession.principalLaneSource, displayTarget, sourceSessionId)
+    : { ok: false as const, error: 'missing_embedded_source' };
+  const embeddedSourceLane = sourceSession.principalLane
+    ? parsePrincipalLaneBinding(sourceSession.principalLane, { displayTarget, sourceSessionId })
+    : { ok: false as const, error: 'missing_embedded_source_lane' };
+  if (!parsedSourceLane.ok || parsedSourceLane.value.binding.laneId !== 'source'
+      || parsedSourceLane.value.sessionId !== sourceSessionId
+      || !embeddedSource.ok || !embeddedSourceLane.ok
+      || !principalLaneSourcesEqual(embeddedSource.value, parsedSource.value)
+      || !principalLaneBindingsEqual(embeddedSourceLane.value, parsedSourceLane.value.binding)
+      || canonicalSessionCwd(sourceSession) !== parsedSource.value.canonicalCwd) {
+    return { status: 'quarantined', reason: 'source_session_sidecar_mismatch' };
+  }
+  const laneHit = store.db.prepare(
+    'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+    + 'phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = ?',
+  ).get(sourceSessionId, laneId) as PrincipalLaneSidecarRow | undefined;
+  if (!laneHit) return { status: 'missing', reason: 'lane_missing' };
+  const parsedLane = parseLaneSidecar(laneHit, { displayTarget, sourceSessionId });
+  if (!parsedLane.ok
+      || parsedLane.value.binding.workspaceEpoch !== parsedSource.value.workspaceEpoch) {
+    return { status: 'quarantined', reason: !parsedLane.ok
+      ? `lane:${parsedLane.error}` : 'lane_workspace_epoch_mismatch' };
+  }
+  if (parsedLane.value.binding.phase !== 'active'
+      && parsedLane.value.binding.phase !== 'dormant') {
+    return { status: 'retry', reason: 'lane_not_active' };
+  }
+  const childHit = parsedLane.value.sessionId === sourceSessionId
+    ? sourceSessionHit
+    : readSession(parsedLane.value.sessionId);
+  if (!childHit) return { status: 'missing', reason: 'session_missing' };
+  let child: Session;
+  try { child = JSON.parse(childHit.row) as Session; }
+  catch { return { status: 'quarantined', reason: 'invalid_lane_session_json' }; }
+  const embeddedLane = child.principalLane
+    ? parsePrincipalLaneBinding(child.principalLane, { displayTarget, sourceSessionId })
+    : { ok: false as const, error: 'missing_embedded_lane' };
+  if (child.sessionId !== parsedLane.value.sessionId || !embeddedLane.ok
+      || !principalLaneBindingsEqual(embeddedLane.value, parsedLane.value.binding)) {
+    return { status: 'quarantined', reason: 'lane_session_sidecar_mismatch' };
+  }
+  const childDisplay = parsedLane.value.binding.laneId === 'source'
+    ? sourceSessionDisplayTarget(child, appId)
+    : child.larkAppId === displayTarget.larkAppId
+      && child.scope === displayTarget.scope
+      && child.chatId === displayTarget.chatId
+      && (displayTarget.scope === 'chat' || child.rootMessageId === displayTarget.rootMessageId)
+      ? displayTarget
+      : undefined;
+  if (!childDisplay || !samePrincipalDisplayTarget(childDisplay, displayTarget)) {
+    return { status: 'quarantined', reason: 'lane_session_display_mismatch' };
+  }
+  if (child.status !== 'active') return { status: 'retry', reason: 'lane_not_active' };
+  const workspace = validatePrincipalLaneWorkspace(store, parsedSource.value, parsedLane.value, child);
+  if (!workspace.ok) return { status: 'quarantined', reason: workspace.reason };
+  if (laneId !== 'source' && !workspace.worktree) {
+    return { status: 'retry', reason: 'worktree_not_materialized' };
+  }
+  const memberHit = readWorkspaceMemberRow(store, sourceSessionId, laneId);
+  const member = parseWorkspaceMemberSidecar(memberHit);
+  if (!member.ok || !principalWorkspaceMemberIdentityMatchesLane(
+    member.value, parsedLane.value, parsedSource.value,
+  )) {
+    return { status: 'quarantined', reason: !member.ok
+      ? `member:${member.error}` : 'member:lane_membership_mismatch' };
+  }
+  if (member.value.membershipPhase !== 'active') {
+    return { status: 'retry', reason: 'lane_not_active' };
+  }
+  const groupHit = readWorkspaceGroupRow(store, parsedSource.value.workspaceGroupId);
+  const group = parseWorkspaceGroupSidecar(groupHit);
+  if (!group.ok || group.value.phase !== 'active'
+      || group.value.larkAppId !== appId
+      || group.value.groupId !== member.value.groupId
+      || group.value.canonicalCwd !== parsedSource.value.canonicalCwd) {
+    return { status: 'quarantined', reason: !group.ok
+      ? `group:${group.error}` : 'group_source_mismatch' };
+  }
+  return {
+    status: 'ready',
+    source: parsedSource.value,
+    lane: parsedLane.value.binding,
+    session: child,
+    runtimeRoutingAnchor: parsedLane.value.binding.routingAnchor,
+    worktree: workspace.worktree,
+  };
+}
+
+function readPrincipalLaneHydrationTransaction(
+  store: SqliteReadStore,
+  appId: string,
+  sourceSessionId: string,
+  laneId: string,
+): HydratePrincipalLaneForIngressResult {
+  let began = false;
+  try {
+    store.db.exec('BEGIN');
+    began = true;
+    const result = readPrincipalLaneHydrationSnapshot(store, appId, sourceSessionId, laneId);
+    store.db.exec('COMMIT');
+    began = false;
+    return result;
+  } catch (error) {
+    if (began) {
+      try { store.db.exec('ROLLBACK'); } catch { /* read snapshot already gone */ }
+    }
+    throw error;
+  }
+}
+
+async function readPrincipalLaneHydrationWithGitFence(
+  store: SqliteReadStore,
+  appId: string,
+  sourceSessionId: string,
+  laneId: string,
+): Promise<HydratePrincipalLaneForIngressResult> {
+  const before = readPrincipalLaneHydrationTransaction(store, appId, sourceSessionId, laneId);
+  if (before.status !== 'ready' || !before.worktree) return before;
+  const gitIdentityIsIntact = await principalLaneWorktreeGitCarrierIsIntact(before.worktree);
+  const after = readPrincipalLaneHydrationTransaction(store, appId, sourceSessionId, laneId);
+  if (after.status !== 'ready' || !after.worktree) {
+    return { status: 'retry', reason: 'authority_changed' };
+  }
+  if (JSON.stringify(after) !== JSON.stringify(before)) {
+    return { status: 'retry', reason: 'authority_changed' };
+  }
+  return gitIdentityIsIntact
+    ? after
+    : { status: 'quarantined', reason: 'worktree_session_sidecar_mismatch' };
+}
+
+export async function hydratePrincipalLaneForIngress(
+  sourceSessionId: string,
+  laneId: string,
+): Promise<HydratePrincipalLaneForIngressResult> {
+  loadForWrite();
+  const store = ownStore;
+  if (!store || !currentAppId) {
+    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
+  }
+  try {
+    return await readPrincipalLaneHydrationWithGitFence(
+      store, currentAppId, sourceSessionId, laneId,
+    );
+  } catch (error) {
+    if (isTransientStoreContentionError(error)) {
+      return { status: 'retry', reason: 'store_busy' };
+    }
+    return { status: 'quarantined', reason: 'hydrate_read_failed' };
+  }
+}
+
+export type RetirePrincipalLaneResult =
+  | { status: 'ready' }
+  | { status: 'retired' }
+  | { status: 'retry'; reason: 'store_busy' | 'session_not_closed' | 'active_workspace_ticket' }
+  | { status: 'missing'; reason: 'lane_missing' }
+  | { status: 'quarantined'; reason: string };
+
+/** Remove the durable routing/materialization records for one closed shadow
+ * lane. The closed Session row and ticket/audit history are intentionally kept
+ * for observability; only records that could route future traffic back into the
+ * retired worktree are deleted. Physical worktree removal happens afterwards,
+ * under the git target lock, so a failed store transaction can never orphan a
+ * live directory from its authority record. */
+export function retirePrincipalLane(args: {
+  sourceSessionId: string;
+  laneId: string;
+  sessionId: string;
+  materializationId: string;
+  dryRun?: boolean;
+}): RetirePrincipalLaneResult {
+  loadForWrite();
+  const store = ownStore;
+  if (!store || !currentAppId) {
+    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
+  }
+  if (args.laneId === 'source') {
+    return { status: 'quarantined', reason: 'source_lane_cannot_be_retired' };
+  }
+
+  let began = false;
+  try {
+    store.db.exec('BEGIN IMMEDIATE');
+    began = true;
+    const sessionHit = store.db.prepare(
+      'SELECT status, row FROM sessions WHERE session_id = ?',
+    ).get(args.sessionId) as { status: string; row: string } | undefined;
+    const sourceSessionHit = store.db.prepare(
+      'SELECT status, row FROM sessions WHERE session_id = ?',
+    ).get(args.sourceSessionId) as { status: string; row: string } | undefined;
+    const laneHit = store.db.prepare(
+      'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+      + 'phase, revision, row FROM principal_lanes '
+      + 'WHERE source_session_id = ? AND lane_id = ?',
+    ).get(args.sourceSessionId, args.laneId) as PrincipalLaneSidecarRow | undefined;
+    if (!laneHit) {
+      store.db.exec('COMMIT');
+      began = false;
+      return { status: 'missing', reason: 'lane_missing' };
+    }
+    const sourceHit = store.db.prepare(
+      'SELECT source_principal_key, canonical_cwd, workspace_epoch, workspace_group_id, '
+      + 'phase, revision, row FROM principal_lane_sources WHERE source_session_id = ?',
+    ).get(args.sourceSessionId) as PrincipalLaneSourceSidecarRow | undefined;
+    const memberHit = readWorkspaceMemberRow(store, args.sourceSessionId, args.laneId);
+
+    let sessionRow: Session | undefined;
+    let sourceSessionRow: Session | undefined;
+    try {
+      sessionRow = sessionHit ? JSON.parse(sessionHit.row) as Session : undefined;
+      sourceSessionRow = sourceSessionHit
+        ? JSON.parse(sourceSessionHit.row) as Session
+        : undefined;
+    } catch {
+      store.db.exec('ROLLBACK');
+      began = false;
+      return { status: 'quarantined', reason: 'invalid_lane_sidecar_json' };
+    }
+    const expectedSessionStatus = args.dryRun ? 'active' : 'closed';
+    if (!sessionHit || !sessionRow
+        || sessionHit.status !== expectedSessionStatus
+        || sessionRow.status !== expectedSessionStatus) {
+      store.db.exec('ROLLBACK');
+      began = false;
+      return { status: 'retry', reason: 'session_not_closed' };
+    }
+    const displayTarget = sourceSessionRow
+      ? sourceSessionDisplayTarget(sourceSessionRow, currentAppId)
+      : undefined;
+    const source = displayTarget
+      ? parseSourceSidecar(sourceHit, displayTarget, args.sourceSessionId)
+      : { ok: false as const, error: 'invalid_source_display_target' };
+    const lane = displayTarget
+      ? parseLaneSidecar(laneHit, { displayTarget, sourceSessionId: args.sourceSessionId })
+      : { ok: false as const, error: 'invalid_source_display_target' };
+    const embeddedLane = sessionRow.principalLane && displayTarget
+      ? parsePrincipalLaneBinding(sessionRow.principalLane, {
+        displayTarget, sourceSessionId: args.sourceSessionId,
+      })
+      : { ok: false as const, error: 'missing_embedded_lane' };
+    const workspace = source.ok && lane.ok
+      ? validatePrincipalLaneWorkspace(store, source.value, lane.value, sessionRow)
+      : { ok: false as const, reason: 'invalid_lane_authority' };
+    const member = parseWorkspaceMemberSidecar(memberHit);
+    const exactAuthority = !!sourceSessionHit
+      && sourceSessionHit.status === 'active'
+      && sourceSessionRow?.status === 'active'
+      && source.ok
+      && source.value.phase === 'active'
+      && lane.ok
+      && lane.value.sessionId === args.sessionId
+      && lane.value.binding.phase === 'active'
+      && lane.value.binding.workspaceEpoch === source.value.workspaceEpoch
+      && embeddedLane.ok
+      && principalLaneBindingsEqual(embeddedLane.value, lane.value.binding)
+      && workspace.ok
+      && !!workspace.worktree
+      && workspace.worktree.materializationId === args.materializationId
+      && workspace.worktree.sourceCanonicalCwd === source.value.canonicalCwd
+      && member.ok
+      && member.value.membershipPhase === 'active'
+      && principalWorkspaceMemberIdentityMatchesLane(member.value, lane.value, source.value);
+    if (!exactAuthority) {
+      store.db.exec('ROLLBACK');
+      began = false;
+      return { status: 'quarantined', reason: 'lane_retirement_authority_mismatch' };
+    }
+    const activeTicket = store.db.prepare(
+      "SELECT 1 AS hit FROM principal_workspace_tickets WHERE source_session_id = ? "
+      + "AND lane_id = ? AND session_id = ? AND status IN ('queued', 'attempting', 'unknown') LIMIT 1",
+    ).get(args.sourceSessionId, args.laneId, args.sessionId) as { hit: number } | undefined;
+    if (activeTicket) {
+      store.db.exec('ROLLBACK');
+      began = false;
+      return { status: 'retry', reason: 'active_workspace_ticket' };
+    }
+    if (args.dryRun) {
+      store.db.exec('COMMIT');
+      began = false;
+      return { status: 'ready' };
+    }
+
+    store.db.prepare(
+      'DELETE FROM principal_lane_aliases WHERE source_session_id = ? AND lane_id = ?',
+    ).run(args.sourceSessionId, args.laneId);
+    store.db.prepare(
+      'DELETE FROM principal_lane_worktrees WHERE materialization_id = ? '
+      + 'AND source_session_id = ? AND lane_id = ? AND session_id = ?',
+    ).run(args.materializationId, args.sourceSessionId, args.laneId, args.sessionId);
+    store.db.prepare(
+      'DELETE FROM principal_workspace_members WHERE source_session_id = ? AND lane_id = ? AND session_id = ?',
+    ).run(args.sourceSessionId, args.laneId, args.sessionId);
+    store.db.prepare(
+      'DELETE FROM principal_lanes WHERE source_session_id = ? AND lane_id = ? AND session_id = ?',
+    ).run(args.sourceSessionId, args.laneId, args.sessionId);
+    store.db.exec('COMMIT');
+    began = false;
+    return { status: 'retired' };
+  } catch (error) {
+    if (began) {
+      try { store.db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+    }
+    if (isTransientStoreContentionError(error)) {
+      return { status: 'retry', reason: 'store_busy' };
+    }
+    return {
+      status: 'quarantined',
+      reason: error instanceof Error ? `lane_retirement_failed:${error.message}` : 'lane_retirement_failed',
+    };
+  }
+}
+
+function provenanceMatchesDisplay(
+  provenance: Pick<MessageProvenance, 'larkAppId' | 'chatId' | 'displayRootId'>,
+  target: PrincipalLaneDisplayTarget,
+): boolean {
+  return provenance.larkAppId === target.larkAppId
+    && provenance.chatId === target.chatId
+    && (target.scope === 'thread'
+      ? provenance.displayRootId === target.rootMessageId
+      : provenance.displayRootId === undefined);
+}
+
+function canonicalIso(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function provenanceFromRow(row: Record<string, unknown>): MessageProvenance | undefined {
+  const direction = row.direction;
+  const trustState = row.trust_state;
+  if (typeof row.message_id !== 'string' || row.message_id.length === 0
+      || typeof row.lark_app_id !== 'string' || row.lark_app_id.length === 0
+      || typeof row.chat_id !== 'string' || row.chat_id.length === 0
+      || (row.display_root_id !== null && row.display_root_id !== undefined && typeof row.display_root_id !== 'string')
+      || typeof row.source_session_id !== 'string' || row.source_session_id.length === 0
+      || typeof row.lane_id !== 'string' || row.lane_id.length === 0
+      || typeof row.session_id !== 'string' || row.session_id.length === 0
+      || typeof row.turn_id !== 'string' || row.turn_id.length === 0
+      || typeof row.principal_key !== 'string' || row.principal_key.length === 0
+      || !Number.isSafeInteger(row.worker_generation) || Number(row.worker_generation) < 1
+      || (direction !== 'inbound' && direction !== 'outbound')
+      || (trustState !== 'trusted' && trustState !== 'untrusted')
+      || !canonicalIso(row.created_at)
+      || !canonicalIso(row.updated_at)
+      || Date.parse(row.updated_at) < Date.parse(row.created_at)) return undefined;
+  return {
+    messageId: row.message_id,
+    larkAppId: row.lark_app_id,
+    chatId: row.chat_id,
+    ...(typeof row.display_root_id === 'string' ? { displayRootId: row.display_root_id } : {}),
+    sourceSessionId: row.source_session_id,
+    laneId: row.lane_id,
+    sessionId: row.session_id,
+    turnId: row.turn_id,
+    principalKey: row.principal_key,
+    workerGeneration: Number(row.worker_generation),
+    direction,
+    trustState,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function sameProvenanceIdentity(a: MessageProvenance, b: MessageProvenance): boolean {
+  // createdAt records when a caller observed the message, not who owns it.
+  // Retries may reconstruct the same authority a few milliseconds later; the
+  // persisted row keeps the first createdAt while updatedAt advances below.
+  return a.messageId === b.messageId
+    && a.larkAppId === b.larkAppId
+    && a.chatId === b.chatId
+    && a.displayRootId === b.displayRootId
+    && a.sourceSessionId === b.sourceSessionId
+    && a.laneId === b.laneId
+    && a.sessionId === b.sessionId
+    && a.turnId === b.turnId
+    && a.principalKey === b.principalKey
+    && a.workerGeneration === b.workerGeneration
+    && a.direction === b.direction;
+}
+
+function laterIsoTimestamp(first: string, second: string): string {
+  return Date.parse(first) >= Date.parse(second) ? first : second;
+}
+
+type ProvenanceCommitResult =
+  | { ok: true; value: MessageProvenance }
+  | { ok: false; error: 'identity_conflict' | 'trust_elevation_refused' };
+
+type MessageProvenanceTrustFenceRow = {
+  message_id: string;
+  lark_app_id: string;
+  source_session_id: string;
+  session_id: string | null;
+  turn_id: string | null;
+  worker_generation: number | null;
+  attempt_id: string | null;
+};
+
+export class MessageProvenanceFencedError extends Error {
+  readonly code = 'trust_commit_unknown';
+  constructor(readonly messageId: string) {
+    super(`message provenance ${messageId} is fenced by an unresolved trust attempt`);
+    this.name = 'MessageProvenanceFencedError';
+  }
+}
+
+function trustFenceMatchesAttempt(
+  fence: MessageProvenanceTrustFenceRow,
+  provenance: MessageProvenance,
+  attemptId: string | undefined,
+): boolean {
+  return !!attemptId
+    && fence.attempt_id === attemptId
+    && fence.lark_app_id === provenance.larkAppId
+    && fence.source_session_id === provenance.sourceSessionId
+    && fence.session_id === provenance.sessionId
+    && fence.turn_id === provenance.turnId
+    && fence.worker_generation === provenance.workerGeneration;
+}
+
+/** Idempotent provenance commit. Conflicting reuse of a Lark message id, or an
+ * attempted untrusted→trusted elevation, fails closed. The caller may mark an
+ * API-success/persist-failure message untrusted in a later explicit audit, but
+ * no read path will ever treat that row as authority. */
+export function recordMessageProvenance(
+  provenance: MessageProvenance,
+  trustAttemptId?: string,
+): MessageProvenance {
+  loadForWrite();
+  if (!ownStore || !currentAppId) {
+    throw new SessionStoreUnavailableError(new Error('owned app-scoped session store is not attached'));
+  }
+  const createdAtMs = Date.parse(provenance.createdAt);
+  const updatedAtMs = Date.parse(provenance.updatedAt);
+  if (provenance.larkAppId !== currentAppId
+      || !provenance.messageId
+      || !provenance.turnId
+      || !Number.isSafeInteger(provenance.workerGeneration)
+      || provenance.workerGeneration < 1
+      || !Number.isFinite(createdAtMs)
+      || !Number.isFinite(updatedAtMs)
+      || new Date(createdAtMs).toISOString() !== provenance.createdAt
+      || new Date(updatedAtMs).toISOString() !== provenance.updatedAt
+      || updatedAtMs < createdAtMs) {
+    throw new Error('invalid message provenance');
+  }
+  const bundle = readPrincipalLaneSource(provenance.sourceSessionId);
+  if (!bundle || bundle.status !== 'ready') throw new Error('principal-lane source is not ready');
+  if (!provenanceMatchesDisplay(provenance, bundle.source.displayTarget)) {
+    throw new Error('message provenance display target mismatch');
+  }
+
+  // A tokenized outbound trust attempt already has a durable deny fence. Keep
+  // its trusted write nonblocking so SQLITE_BUSY is classified as proven
+  // pre-commit and the exact fence can be safely aborted by the caller.
+  const nonblockingTrustAttempt = trustAttemptId !== undefined;
+  const committed = runOwnedWriteTransaction(ownStore, nonblockingTrustAttempt, (): ProvenanceCommitResult => {
+    const fence = ownStore!.db.prepare(
+      'SELECT message_id, lark_app_id, source_session_id, session_id, turn_id, '
+      + 'worker_generation, attempt_id FROM message_provenance_trust_fences WHERE message_id = ?',
+    ).get(provenance.messageId) as MessageProvenanceTrustFenceRow | undefined;
+    if (fence && !trustFenceMatchesAttempt(fence, provenance, trustAttemptId)) {
+      throw new MessageProvenanceFencedError(provenance.messageId);
+    }
+    const laneHit = ownStore!.db.prepare(
+      'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+      + 'phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = ?',
+    ).get(provenance.sourceSessionId, provenance.laneId) as PrincipalLaneSidecarRow | undefined;
+    const parsedLane = parseLaneSidecar(laneHit, {
+      displayTarget: bundle.source.displayTarget,
+      sourceSessionId: provenance.sourceSessionId,
+    });
+    if (!parsedLane.ok || parsedLane.value.binding.principalKey !== provenance.principalKey) {
+      throw new Error('message provenance lane authority mismatch');
+    }
+    if (parsedLane.value.sessionId !== provenance.sessionId) {
+      throw new Error('message provenance session authority mismatch');
+    }
+    if (bundle.source.phase !== 'active'
+        || parsedLane.value.binding.phase !== 'active'
+        || parsedLane.value.binding.workspaceEpoch !== bundle.source.workspaceEpoch) {
+      throw new Error('message provenance lane is not admissible');
+    }
+
+    const existingRow = ownStore!.db.prepare(
+      'SELECT * FROM message_provenance WHERE message_id = ?',
+    ).get(provenance.messageId) as Record<string, unknown> | undefined;
+    if (existingRow) {
+      const existing = provenanceFromRow(existingRow);
+      if (!existing || !sameProvenanceIdentity(existing, provenance)) {
+        const durableUpdatedAt = canonicalIso(existingRow.updated_at)
+          ? laterIsoTimestamp(existingRow.updated_at, provenance.updatedAt)
+          : provenance.updatedAt;
+        ownStore!.db.prepare(
+          "UPDATE message_provenance SET trust_state = 'untrusted', updated_at = ? WHERE message_id = ?",
+        ).run(durableUpdatedAt, provenance.messageId);
+        ownStore!.db.prepare(
+          'INSERT INTO message_provenance_conflicts '
+          + '(audit_id, message_id, reason, existing_identity, incoming_identity, created_at) '
+          + 'VALUES (?, ?, ?, ?, ?, ?)',
+        ).run(
+          randomUUID(), provenance.messageId, 'identity_conflict',
+          JSON.stringify(existingRow), JSON.stringify(provenance), new Date().toISOString(),
+        );
+        return { ok: false, error: 'identity_conflict' };
+      }
+      if (existing.trustState === 'untrusted' && provenance.trustState === 'trusted') {
+        return { ok: false, error: 'trust_elevation_refused' };
+      }
+      const durableUpdatedAt = laterIsoTimestamp(existing.updatedAt, provenance.updatedAt);
+      ownStore!.db.prepare(
+        'UPDATE message_provenance SET updated_at = ? WHERE message_id = ?',
+      ).run(durableUpdatedAt, provenance.messageId);
+      return { ok: true, value: { ...existing, updatedAt: durableUpdatedAt } };
+    }
+    ownStore!.db.prepare(
+      'INSERT INTO message_provenance '
+      + '(message_id, lark_app_id, chat_id, display_root_id, source_session_id, lane_id, '
+      + 'session_id, turn_id, principal_key, worker_generation, direction, trust_state, created_at, updated_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      provenance.messageId, provenance.larkAppId, provenance.chatId,
+      provenance.displayRootId ?? null, provenance.sourceSessionId, provenance.laneId,
+      provenance.sessionId, provenance.turnId, provenance.principalKey,
+      provenance.workerGeneration, provenance.direction, provenance.trustState,
+      provenance.createdAt, provenance.updatedAt,
+    );
+    return { ok: true, value: provenance };
+  });
+  if (!committed.ok) {
+    if (committed.error === 'identity_conflict') {
+      throw new Error('message provenance identity conflict');
+    }
+    throw new Error('message provenance trust elevation refused');
+  }
+  return committed.value;
+}
+
+function messageProvenanceIsDurablyDenied(messageId: string): boolean {
+  if (!ownStore) return true;
+  const fence = ownStore.db.prepare(
+    'SELECT source_session_id FROM message_provenance_trust_fences WHERE message_id = ?',
+  ).get(messageId) as { source_session_id: unknown } | undefined;
+  // A message id is globally unique. A fence for another source is therefore
+  // an identity conflict, not permission to ignore the fence.
+  return fence !== undefined;
+}
+
+export function beginMessageProvenanceTrustAttempt(provenance: MessageProvenance): string {
+  loadForWrite();
+  if (!ownStore) throw new SessionStoreUnavailableError(
+    new Error('owned app-scoped session store is not attached'),
+  );
+  const attemptId = randomUUID();
+  runOwnedWriteTransaction(ownStore, true, () => {
+    const existing = ownStore!.db.prepare(
+      'SELECT message_id FROM message_provenance_trust_fences WHERE message_id = ?',
+    ).get(provenance.messageId) as { message_id: string } | undefined;
+    if (existing) throw new MessageProvenanceFencedError(provenance.messageId);
+    ownStore!.db.prepare(
+      'INSERT INTO message_provenance_trust_fences '
+      + '(message_id, lark_app_id, source_session_id, session_id, turn_id, worker_generation, '
+      + 'attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      provenance.messageId,
+      provenance.larkAppId,
+      provenance.sourceSessionId,
+      provenance.sessionId,
+      provenance.turnId,
+      provenance.workerGeneration,
+      attemptId,
+      new Date().toISOString(),
+    );
+  });
+  return attemptId;
+}
+
+export function completeMessageProvenanceTrustAttempt(
+  provenance: MessageProvenance,
+  attemptId: string,
+): void {
+  loadForWrite();
+  if (!ownStore) throw new SessionStoreUnavailableError(
+    new Error('owned app-scoped session store is not attached'),
+  );
+  runOwnedWriteTransaction(ownStore, true, () => {
+    const result = ownStore!.db.prepare(
+      'DELETE FROM message_provenance_trust_fences '
+      + 'WHERE message_id = ? AND lark_app_id = ? AND source_session_id = ? '
+      + 'AND session_id = ? AND turn_id = ? AND worker_generation = ? AND attempt_id = ?',
+    ).run(
+      provenance.messageId,
+      provenance.larkAppId,
+      provenance.sourceSessionId,
+      provenance.sessionId,
+      provenance.turnId,
+      provenance.workerGeneration,
+      attemptId,
+    );
+    if (Number(result.changes) !== 1) {
+      throw new MessageProvenanceFencedError(provenance.messageId);
+    }
+  });
+}
+
+/** Releases only the exact trust-attempt fence after a proven pre-commit
+ * failure (for example, a nonblocking SQLITE_BUSY before the trusted write
+ * began). This must never be used for commit-unknown failures. */
+export function abortMessageProvenanceTrustAttempt(
+  provenance: MessageProvenance,
+  attemptId: string,
+): void {
+  loadForWrite();
+  if (!ownStore) throw new SessionStoreUnavailableError(
+    new Error('owned app-scoped session store is not attached'),
+  );
+  runOwnedWriteTransaction(ownStore, false, () => {
+    const result = ownStore!.db.prepare(
+      'DELETE FROM message_provenance_trust_fences '
+      + 'WHERE message_id = ? AND lark_app_id = ? AND source_session_id = ? '
+      + 'AND session_id = ? AND turn_id = ? AND worker_generation = ? AND attempt_id = ?',
+    ).run(
+      provenance.messageId,
+      provenance.larkAppId,
+      provenance.sourceSessionId,
+      provenance.sessionId,
+      provenance.turnId,
+      provenance.workerGeneration,
+      attemptId,
+    );
+    if (Number(result.changes) !== 1) {
+      throw new MessageProvenanceFencedError(provenance.messageId);
+    }
+  });
+}
+
+let testOnlyAfterProvenanceDenyFence: (() => void) | undefined;
+export function __testOnly_setAfterProvenanceDenyFence(
+  hook: (() => void) | undefined,
+): void {
+  testOnlyAfterProvenanceDenyFence = hook;
+}
+
+/** Permanently removes one message id from the trusted-reference surface.
+ * This is used after the Lark API has already accepted an outbound message but
+ * its trusted provenance commit could not be proved.  A second write may still
+ * fail (for example while the store is unavailable); in that case the caller
+ * must keep the transport success and fail closed when the message is later
+ * referenced.  The explicit UPDATE covers the commit-unknown shape where the
+ * first write actually committed a trusted row before throwing. */
+export function markMessageProvenanceUntrusted(provenance: MessageProvenance): void {
+  loadForWrite();
+  if (!ownStore) throw new SessionStoreUnavailableError(
+    new Error('owned app-scoped session store is not attached'),
+  );
+  // A surviving fence already makes the message unreadable and means the
+  // earlier trusted commit outcome is unknown. Never convert that ambiguity
+  // into a permanent downgrade of a possibly healthy trusted row.
+  if (messageProvenanceIsDurablyDenied(provenance.messageId)) return;
+  testOnlyAfterProvenanceDenyFence?.();
+  const untrusted: MessageProvenance = { ...provenance, trustState: 'untrusted' };
+  recordMessageProvenance(untrusted);
+}
+
+export function readTrustedMessageProvenance(
+  messageId: string,
+  sourceSessionId: string,
+): MessageProvenance | undefined {
+  loadForWrite();
+  if (!ownStore) return undefined;
+  if (messageProvenanceIsDurablyDenied(messageId)) return undefined;
+  const bundle = readPrincipalLaneSource(sourceSessionId);
+  if (!bundle || bundle.status !== 'ready') return undefined;
+  const row = ownStore.db.prepare(
+    "SELECT * FROM message_provenance WHERE message_id = ? AND trust_state = 'trusted'",
+  ).get(messageId) as Record<string, unknown> | undefined;
+  const provenance = row ? provenanceFromRow(row) : undefined;
+  if (!provenance
+      || provenance.sourceSessionId !== sourceSessionId
+      || !provenanceMatchesDisplay(provenance, bundle.source.displayTarget)) return undefined;
+  const laneHit = ownStore.db.prepare(
+    'SELECT lane_id, session_id, principal_key, routing_anchor, workspace_epoch, '
+    + 'phase, revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = ?',
+  ).get(sourceSessionId, provenance.laneId) as PrincipalLaneSidecarRow | undefined;
+  const lane = parseLaneSidecar(laneHit, {
+    displayTarget: bundle.source.displayTarget,
+    sourceSessionId,
+  });
+  if (!lane.ok
+      || lane.value.sessionId !== provenance.sessionId
+      || lane.value.binding.principalKey !== provenance.principalKey
+      || bundle.source.phase !== 'active'
+      || lane.value.binding.phase !== 'active'
+      || lane.value.binding.workspaceEpoch !== bundle.source.workspaceEpoch) return undefined;
+  return provenance;
 }
 
 /**
@@ -2579,23 +5634,14 @@ export function listSessionsStrict(): Session[] {
 
 /** Read-only configuration-change guard; unlike display snapshots, malformed rows fail closed. */
 export function readBotSessionsStrict(appId: string, dataDir = config.session.dataDir): Session[] {
-  const result: Session[] = [];
-  for (const id of [undefined, appId]) {
-    const ref = resolveStoreFile(id, dataDir);
-    if (!existsSync(ref.path)) continue;
-    if (ref.kind === 'json') {
-      const parsed = JSON.parse(readFileSync(ref.path, 'utf8')) as Record<string, Session>;
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid session store');
-      result.push(...Object.values(parsed).filter(s => id === appId || s.larkAppId === appId));
-    } else {
-      const db = openDbForRead(ref.path);
-      try {
-        const rows = db.prepare('SELECT row FROM sessions').all() as { row: string }[];
-        result.push(...rows.map(row => JSON.parse(row.row) as Session).filter(s => id === appId || s.larkAppId === appId));
-      } finally { db.close(); }
-    }
+  if (classifyStorePresence(appId, dataDir) === 'unmigrated') {
+    throw new SessionStoreUnmigratedError(
+      `会话库尚未迁移到 SQLite（${storeJsonFileName(appId)} 仍在，sessions.db 不存在）`,
+    );
   }
-  return result;
+  const ref = resolveStoreFile(appId, dataDir);
+  if (!ref) return [];
+  return readStoreEntries(ref).map(([, session]) => session);
 }
 
 /**
@@ -2632,14 +5678,63 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
   );
 }
 
+/**
+ * Fail-closed cross-bot inventory before deleting a chat, including its topics.
+ * Known peers must have migrated to SQLite; never parse legacy JSON or treat
+ * an unreadable bot inventory as proof that an unmigrated peer was removed.
+ */
+export function findActiveSessionsByChatStrict(chatId: string): Session[] {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  const dataDir = config.session.dataDir;
+  const pending = listUnmigratedAppIds(dataDir).filter(id => id && id !== currentAppId);
+  if (pending.length > 0) {
+    const known = knownBotAppIds({ dataDir, strict: true });
+    const unmigrated = pending.filter(id => known.has(id));
+    if (unmigrated.length > 0) {
+      throw new SessionStoreUnmigratedError(
+        `会话库尚未迁移到 SQLite（${unmigrated.map(id => storeJsonFileName(id)).join('、')} 仍在，对应 sessions.db 不存在）`,
+      );
+    }
+  }
+  const matches = [...sessions.values()].filter(s => s.chatId === chatId && s.status === 'active');
+  for (const ref of listStoreRefs(dataDir, { strict: true })) {
+    if (ref.appId === currentAppId) continue;
+    for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
+      // The store filename owns legacy rows that predate larkAppId persistence.
+      if (session.chatId === chatId) matches.push({ ...session, larkAppId: ref.appId ?? session.larkAppId });
+    }
+  }
+  return matches;
+}
+
 export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {
   return findActiveSessionsMatching(s => s.workingDir === workingDir);
 }
 
-/** Destructive-worktree inventory: unlike ordinary discovery this is fail-closed. */
-export function findActiveSessionsByWorkingDirStrict(workingDir: string): Session[] {
+/** Destructive-worktree inventory: unlike ordinary discovery this is fail-closed.
+ *  A still-unmigrated store of a bot that exists on this machine holds rows no
+ *  cross-process reader may parse, so it fails closed too. Which bots exist is
+ *  decided conclusively — `knownAppIds`, else `services/known-bot-app-ids.ts`
+ *  in strict mode: an unreadable bots.json or daemon registry throws rather
+ *  than quietly reclassifying a pending migration as abandoned data. */
+export function findActiveSessionsByWorkingDirStrict(
+  workingDir: string,
+  opts: { knownAppIds?: ReadonlySet<string> } = {},
+): Session[] {
   load();
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  const dataDir = config.session.dataDir;
+  const pending = listUnmigratedAppIds(dataDir).filter(id => id && id !== currentAppId);
+  if (pending.length > 0) {
+    const known = opts.knownAppIds ?? knownBotAppIds({ dataDir, strict: true });
+    const unmigrated = pending.filter(id => known.has(id));
+    if (unmigrated.length > 0) {
+      throw new SessionStoreUnmigratedError(
+        `会话库尚未迁移到 SQLite（${unmigrated.map(id => storeJsonFileName(id)).join('、')} 仍在，对应 sessions.db 不存在）`,
+      );
+    }
+  }
   const target = resolve(workingDir);
   const matches: Session[] = [];
   const targetReal = realpathSync(target);
@@ -2652,7 +5747,7 @@ export function findActiveSessionsByWorkingDirStrict(workingDir: string): Sessio
     return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
   };
   for (const session of sessions.values()) if (matchesDir(session)) matches.push(session);
-  for (const ref of listStoreRefs(config.session.dataDir, { strict: true })) {
+  for (const ref of listStoreRefs(dataDir, { strict: true })) {
     if (ref.appId === currentAppId) continue;
     for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
       if (matchesDir(session)) matches.push(session);
@@ -2696,17 +5791,12 @@ export function countActiveSessionsOnDisk(dataDir: string = config.session.dataD
   let n = 0;
   for (const ref of refs) {
     try {
-      if (ref.kind === 'sqlite') {
-        const db = openDbForRead(ref.path);
-        try {
-          const hit = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as { n: number };
-          n += hit.n;
-        } finally {
-          db.close();
-        }
-      } else {
-        const data: Record<string, Session> = JSON.parse(readFileSync(ref.path, 'utf-8'));
-        for (const s of Object.values(data)) if (s?.status === 'active') n++;
+      const db = openDbForRead(ref.path);
+      try {
+        const hit = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as { n: number };
+        n += hit.n;
+      } finally {
+        db.close();
       }
     } catch (err) {
       if (err instanceof SessionStoreSqliteUnavailableError) throw err;
@@ -2756,33 +5846,43 @@ export function collectBotmuxSessionIdentities(dataDir: string = config.session.
 
 // ─── Cross-process offline access ───────────────────────────────────────────
 // The only sanctioned ways to touch session rows from OUTSIDE the owning
-// daemon process (agent-facing CLI subcommands, caller-identity proofs). Until
-// 2026-08 the CLI kept its own parallel copies of these (loadSessions /
-// saveSession / mutateSessionOffline in cli.ts) — one of which wrote the whole
-// file WITHOUT the lock; they were absorbed here so persistence mechanics
-// (store layout, lock/transaction, legacy-field strip) stay private to this
-// module. Every entry point resolves each store as db-else-json (mixed
-// upgrade window: npm already replaced dist, daemon still running old code).
+// daemon process (agent-facing CLI subcommands, caller-identity proofs).
+// Cross-process readers only open SQLite stores. A leftover
+// `sessions-<appId>.json` without a `.db` is `unmigrated` (existence only).
+
+export type SessionsSnapshot = Map<string, Session> & { unmigratedAppIds: string[] };
+
+function emptySnapshot(unmigratedAppIds: string[]): SessionsSnapshot {
+  const out = new Map<string, Session>() as SessionsSnapshot;
+  out.unmigratedAppIds = unmigratedAppIds;
+  return out;
+}
 
 /**
- * Read-only snapshot of every session row across the legacy store and all
- * per-bot stores. Per-bot rows win duplicate sessionIds and get `larkAppId`
- * stamped from their filename so a later offline mutation resolves the owning
- * store. Deliberately lock-free: atomic publication (tmp+rename for JSON,
- * WAL transactions for SQLite) keeps each store self-consistent, and snapshot
- * composition must stay a pure reader (an older CLI opportunistically migrated
- * legacy rows here, which made even `botmux list` a whole-file writer able to
- * race a daemon save).
+ * Read-only snapshot of every session row across all per-bot SQLite stores.
+ * A row missing `larkAppId` gets it stamped from its store's directory name so
+ * a later offline mutation resolves the owning store. The same sessionId in
+ * two stores has no defined winner here — cross-store duplicates are the job
+ * of `readSessionRowCopiesAcrossStores`. Deliberately lock-free: WAL
+ * transactions keep each store self-consistent.
  */
 export function loadAllSessionsSnapshot(options: {
   dataDir?: string;
   /** Per-bot fallback when the data dir cannot be enumerated (the CLI file
    *  sandbox exposes this bot's own store but NOT a listing of data/). */
   fallbackAppId?: string;
-} = {}): Map<string, Session> {
+  /** When given, only these app ids (plus `fallbackAppId`) can be reported as
+   *  `unmigrated`. A leftover JSON of a bot that no longer exists is abandoned
+   *  data, not a pending migration — see `services/known-bot-app-ids.ts`. */
+  knownAppIds?: ReadonlySet<string>;
+} = {}): SessionsSnapshot {
   const dataDir = options.dataDir ?? config.session.dataDir;
-  const out = new Map<string, Session>();
-  const readInto = (ref: StoreFileRef): void => {
+  const out = emptySnapshot([]);
+  const onlyKnown = (ids: string[]): string[] => options.knownAppIds
+    ? ids.filter(id => options.knownAppIds!.has(id) || id === options.fallbackAppId)
+    : ids;
+  const readInto = (ref: StoreFileRef | undefined): void => {
+    if (!ref) return;
     let entries: [string, Session][];
     try {
       entries = readStoreEntries(ref);
@@ -2790,129 +5890,176 @@ export function loadAllSessionsSnapshot(options: {
       if (err instanceof SessionStoreSqliteUnavailableError) throw err;
       return; /* absent or corrupt store → skip */
     }
-    // Arrays are deliberately tolerated on the JSON side (Object.entries
-    // yields their rows): the historical CLI loader accepted array-shaped
-    // files and existing fixtures/tools rely on that.
     for (const [, value] of entries) {
       const session = value as Session;
       if (!session || typeof session !== 'object' || !session.sessionId) continue;
       repairMissingChatScope(session);
-      if (ref.appId && !session.larkAppId) session.larkAppId = ref.appId;
+      if (!session.larkAppId) session.larkAppId = ref.appId;
       out.set(session.sessionId, session);
     }
   };
-  readInto(resolveStoreFile(undefined, dataDir));
   let refs: StoreFileRef[];
   try {
     refs = listStoreRefs(dataDir);
+    out.unmigratedAppIds = onlyKnown(listUnmigratedAppIds(dataDir));
   } catch {
     if (options.fallbackAppId) {
       readInto(resolveStoreFile(options.fallbackAppId, dataDir));
+      out.unmigratedAppIds =
+        classifyStorePresence(options.fallbackAppId, dataDir) === 'unmigrated'
+          ? [options.fallbackAppId]
+          : [];
     }
     return out;
   }
-  for (const ref of refs) {
-    if (ref.appId) readInto(ref);
-  }
+  for (const ref of refs) readInto(ref);
   return out;
+}
+
+/** Destructive lifecycle discovery must account for every store, including
+ * corrupt stores and duplicate owners. Unlike the display snapshot this does
+ * not skip errors or collapse two copies of the same session id. Pure reader. */
+export function loadAllSessionsStrict(dataDir = config.session.dataDir): Session[] {
+  // Display readers may omit unmigrated stores; destructive discovery cannot.
+  // Probe existence only, preserving the SQLite-only cross-process contract.
+  const refs = listStoreRefs(dataDir, { strict: true });
+  const unmigrated = listUnmigratedAppIds(dataDir, { strict: true });
+  if (unmigrated.length) {
+    throw new SessionStoreUnmigratedError(`Unmigrated session stores: ${unmigrated.join(', ')}`);
+  }
+  // The shared legacy projection has no authoritative owner index. Require
+  // explicit migration/removal before claiming complete discovery coverage.
+  if (existsSync(join(dataDir, 'sessions.json'))) {
+    throw new SessionStoreUnmigratedError('Legacy session store prevents complete workspace discovery');
+  }
+  const result: Session[] = [];
+  for (const ref of refs) {
+    for (const [key, raw] of readStoreEntries(ref, true)) {
+      const session = raw as Session;
+      if (!session || typeof session !== 'object' || Array.isArray(session)
+          || session.sessionId !== key || !['active', 'closed'].includes(session.status)) {
+        throw new Error(`Invalid session identity in ${ref.path}`);
+      }
+      if (ref.appId && session.larkAppId && session.larkAppId !== ref.appId) {
+        throw new Error(`Session owner mismatch in ${ref.path}`);
+      }
+      result.push({ ...session, larkAppId: ref.appId ?? session.larkAppId });
+    }
+  }
+  return result;
+}
+
+/**
+ * Session ids of every ACTIVE row in every per-bot SQLite store under
+ * `dataDir`, closed rows excluded. This is the protection set for sweeps over
+ * trees that every bot on the machine shares (sandbox trees, session scratch):
+ * all daemons run on one dataDir, so a suspended session of ANOTHER bot is as
+ * live as one of ours. Reads only the indexed `status` column.
+ *
+ * Fail-closed for destructive callers: an unlistable store dir, any unreadable
+ * store, or a not-yet-imported `sessions-<appId>.json` of a bot that still
+ * exists THROWS — the caller must skip its round rather than treat a partial
+ * set as complete. A leftover JSON of a bot removed from this machine is
+ * abandoned data (no daemon will ever import or serve it), see
+ * `services/known-bot-app-ids.ts`; the shared pre-1.13 `sessions.json` is only a
+ * first-import rescue source and never held rows a daemon serves.
+ */
+export function listActiveSessionIdsAcrossStores(
+  dataDir: string = config.session.dataDir,
+  opts: { knownAppIds?: () => ReadonlySet<string> } = {},
+): Set<string> {
+  const refs = listStoreRefs(dataDir, { strict: true });
+  const unmigrated = listUnmigratedAppIds(dataDir, { strict: true });
+  if (unmigrated.length > 0) {
+    const known = (opts.knownAppIds ?? (() => knownBotAppIds({ dataDir, strict: true })))();
+    const pending = unmigrated.filter(appId => known.has(appId));
+    if (pending.length > 0) {
+      throw new SessionStoreUnmigratedError(`Unmigrated session stores: ${pending.join(', ')}`);
+    }
+  }
+  const ids = new Set<string>();
+  for (const ref of refs) {
+    const db = openDbForRead(ref.path);
+    try {
+      const rows = db.prepare("SELECT session_id FROM sessions WHERE status = 'active'").all() as { session_id: string }[];
+      for (const r of rows) ids.add(r.session_id);
+    } finally {
+      db.close();
+    }
+  }
+  return ids;
 }
 
 /**
  * Unlocked point-read of one row straight from disk, bypassing this process's
- * in-memory cache: the owning per-bot store first, then the legacy store.
- * Atomic publication keeps each store self-consistent, so this never blocks
- * on (or throws from) the store lock — safe on hot paths that only need a
- * freshness hint.
+ * in-memory cache. Atomic publication keeps each store self-consistent, so
+ * this never blocks on (or throws from) the store lock — safe on hot paths
+ * that only need a freshness hint.
  */
 export function readSessionRowFromDisk(
   sessionId: string,
-  larkAppId?: string,
+  larkAppId: string,
   dataDir: string = config.session.dataDir,
 ): Session | undefined {
-  const stores = larkAppId
-    ? [resolveStoreFile(larkAppId, dataDir), resolveStoreFile(undefined, dataDir)]
-    : [resolveStoreFile(undefined, dataDir)];
-  for (const ref of stores) {
-    if (!existsSync(ref.path)) continue;
-    try {
-      const hit = readStoreRowByKey(ref, sessionId);
-      if (hit) return hit;
-    } catch (err) {
-      if (err instanceof SessionStoreSqliteUnavailableError) throw err;
-      /* ignore corrupt/racing session store */
-    }
+  const ref = resolveStoreFile(larkAppId, dataDir);
+  if (!ref) return undefined;
+  try {
+    return readStoreRowByKey(ref, sessionId);
+  } catch (err) {
+    if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+    return undefined;
   }
-  return undefined;
 }
 
 /**
- * Fail-closed identity scan: every store's copy of one session row across the
- * legacy and all per-bot stores — one entry per store that holds the id (a
- * per-bot store is its .db when that exists, else its .json; a frozen
- * pre-import JSON file is superseded, not a second copy). An unlistable data
- * dir THROWS: a caller proving "this row resolves exactly once" must not
- * mistake an unreadable store for an empty one. A corrupt individual store is
- * skipped: an unrelated bot's bad file must neither block nor impersonate a
- * valid record; the target row still has to resolve from a readable store.
+ * Fail-closed identity scan: every SQLite store's copy of one session row.
+ * An unlistable data dir THROWS. A corrupt individual store increments
+ * `unreadableStores` and is skipped so an unrelated bot's bad file can
+ * neither block nor impersonate a valid record.
  */
 export function readSessionRowCopiesAcrossStores(
   sessionId: string,
   dataDir: string = config.session.dataDir,
-): Session[] {
+): { matches: Session[]; unreadableStores: number } {
   const refs = listStoreRefs(dataDir, { strict: true });
   const matches: Session[] = [];
+  let unreadableStores = 0;
   for (const ref of refs) {
     let session: Session | undefined;
     try {
       session = readStoreRowByKey(ref, sessionId);
     } catch (err) {
       if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+      unreadableStores++;
       continue;
     }
     if (!session || typeof session !== 'object' || Array.isArray(session)) continue;
     if (session.sessionId !== sessionId) continue;
     matches.push(session);
   }
-  return matches;
+  return { matches, unreadableStores };
 }
 
 // ─── Temporary host activation (daemon absent) ──────────────────────────────
 //
 // A process that owns no store may still act on one exact row while no daemon
-// holds it: `botmux delete` / `list` auto-prune / `whiteboard` from a host
-// shell, and the dashboard's board deletion. The activation is ONE exclusive
-// store transaction — the SQLite `BEGIN IMMEDIATE`, or the shared file lock of
-// a store still on JSON (upgrade window) — inside which ownership is judged,
-// the FRESH row is read, the shared command apply (session-commands.ts) runs,
-// and the row is published. Nothing else is expressible here: there is no
-// closure that could write an arbitrary field list.
+// holds it. The activation is ONE exclusive SQLite `BEGIN IMMEDIATE` inside
+// which ownership is judged, the FRESH row is read, the shared command apply
+// runs, and the row is published.
 //
-// SQLite ownership is the occupancy row read in this same transaction. A live
-// lease yields. Without one (row absent or expired) `abortIf` — the
-// descriptor-heartbeat probe, also a test hook — still decides; that is the
-// upgrade window for daemons that write SQLite but not occupancy. `abortIf`
-// is evaluated at entry and again immediately before publication (the lease
-// row itself cannot change under this transaction). JSON stores use `abortIf`
-// only (no occupancy table). SQLite's own locking does NOT replace occupancy:
-// it orders writers, but cannot detect that a daemon holding a stale
-// in-memory cache has come alive.
+// Ownership: a live lease (TTL or live ownerPid) yields `owned{lease}`.
+// Without one, `probeHolder` (fresh descriptor) still refuses — it never
+// permits a write. Probe once, before `openDbForOwnStore`, so a v3.18.x
+// store is not given an occupancy table just to be rejected. Inside the
+// write transaction the lease is re-read (race); the probe is not repeated.
 //
-// No lease row is written by the temporary host: a claim + release inside a
-// single exclusive transaction is unobservable to every other connection, and
-// holding one ACROSS the steps of a multi-step command (the offline abandon)
-// would only leave a daemon that boots meanwhile `displaced` until its next
-// heartbeat tick. Each step re-judges ownership in its own transaction.
+// No lease row is written by the temporary host.
 
 /** Why the activation yielded without touching the row. */
 export type UnownedRowBlocked =
-  /** A live lease, or a fresh heartbeat while no live lease exists, holds the store. */
-  | { outcome: 'owned' }
-  /** No such row — or no store file at all (never created here: an empty
-   *  store would disable the daemon's one-shot JSON import gate). */
+  | { outcome: 'owned'; heldBy: HolderReason }
   | { outcome: 'missing' }
-  /** The store's write lock could not be taken (another writer holds it past
-   *  busy_timeout / the file-lock wait). Same "do not publish" as `owned`;
-   *  reported apart so a caller never claims a live row is gone. */
+  | { outcome: 'unmigrated' }
   | { outcome: 'contended' };
 
 export type UnownedRowRead =
@@ -2925,90 +6072,69 @@ export type UnownedRowApply =
   | { outcome: 'refused'; reason: SessionRowRefusal | 'row_changed'; row: Session }
   | UnownedRowBlocked;
 
-type UnownedRowOptions = { dataDir?: string; abortIf?: () => boolean };
+type UnownedRowOptions = {
+  dataDir?: string;
+  probeHolder?: () => HolderReason | undefined;
+};
 
 /** One step over the fresh row: whether to publish it, and what to report. */
 type UnownedRowStep<T> = (current: Session) => { publish: boolean; result: T };
 
+function owned(heldBy: HolderReason): UnownedRowBlocked {
+  return { outcome: 'owned', heldBy };
+}
+
 function runUnownedRowTxn<T>(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   options: UnownedRowOptions,
   step: UnownedRowStep<T>,
 ): T | UnownedRowBlocked {
   const dataDir = options.dataDir ?? config.session.dataDir;
-  const ref = resolveStoreFile(target.larkAppId, dataDir);
+  const presence = classifyStorePresence(target.larkAppId, dataDir);
+  if (presence === 'unmigrated') return { outcome: 'unmigrated' };
+  if (presence === 'absent') return { outcome: 'missing' };
 
-  if (ref.kind === 'sqlite') {
-    // resolveStoreFile already probed existsSync, but a read-write open CREATES
-    // a missing file. The window between that probe and this open must not
-    // plant an empty store: that would make the daemon's import gate skip the
-    // one-shot JSON import and silently drop every pre-SQLite row.
-    if (!existsSync(ref.path)) return { outcome: 'missing' };
-    let db: SqliteDatabaseLike | undefined;
-    let inTxn = false;
-    try {
-      // openDbForOwnStore (schema ensure) and BEGIN IMMEDIATE both take the
-      // write lock. Contention here is "someone else is publishing", not a
-      // broken store — same yield as a live occupancy row.
-      db = openDbForOwnStore(ref.path);
-      db.exec('BEGIN IMMEDIATE');
-      inTxn = true;
-      const lease = readOccupancyInTxn(db);
-      if (sqliteOccupancyBlocksWrite(lease, Date.now(), options.abortIf)) return { outcome: 'owned' };
-      const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
-        .get(target.sessionId) as { row: string } | undefined;
-      if (!hit) return { outcome: 'missing' };
-      const current = JSON.parse(hit.row) as Session;
-      const { publish, result } = step(current);
-      if (!publish) return result;
-      if (sqliteOccupancyBlocksWrite(lease, Date.now(), options.abortIf)) return { outcome: 'owned' };
-      db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
-        .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
-      db.exec('COMMIT');
-      inTxn = false;
-      return result;
-    } catch (err) {
-      if (isTransientStoreContentionError(err)) return { outcome: 'contended' };
-      throw err;
-    } finally {
-      if (inTxn) { try { db?.exec('ROLLBACK'); } catch { /* txn already gone */ } }
-      try { db?.close(); } catch { /* already closed */ }
-    }
-  }
-
-  // Upgrade window: this store's owning daemon still runs the pre-SQLite build
-  // and keeps writing the JSON, so an offline command has to land there too —
-  // creating a .db here would fork the two representations behind that daemon's
-  // back. Same file lock the old build takes.
-  const fp = ref.path;
+  const dbPath = storeDbPath(target.larkAppId, dataDir);
+  let lease: OccupancyLease | undefined;
   try {
-    return withFileLockSync(fp, (): T | UnownedRowBlocked => {
-      if (options.abortIf?.()) return { outcome: 'owned' };
-      let data: Record<string, Session> = {};
-      if (existsSync(fp)) {
-        try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
-      }
-      const current = data[target.sessionId];
-      if (!current) return { outcome: 'missing' };
-      const { publish, result } = step(current);
-      if (!publish) return result;
-      data[target.sessionId] = current;
-      for (const [key, val] of Object.entries(data)) {
-        if (val && typeof val === 'object' && 'sessionId' in val && (val as Session).sessionId !== key) {
-          delete data[key];
-          continue;
-        }
-        if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
-      }
-      if (options.abortIf?.()) return { outcome: 'owned' };
-      const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-      writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
-      renameSync(tmpFp, fp);
-      return result;
-    });
+    const readDb = openDbForRead(dbPath);
+    try { lease = readOccupancyInTxn(readDb); }
+    finally { readDb.close(); }
   } catch (err) {
     if (isTransientStoreContentionError(err)) return { outcome: 'contended' };
+    return owned('store_unreadable');
+  }
+
+  const held = holderFromLease(lease, Date.now()) ?? options.probeHolder?.();
+  if (held) return owned(held);
+
+  let db: SqliteDatabaseLike | undefined;
+  let inTxn = false;
+  try {
+    db = openDbForOwnStore(dbPath);
+    db.exec('BEGIN IMMEDIATE');
+    inTxn = true;
+    const leaseInTxn = readOccupancyInTxn(db);
+    const raced = holderFromLease(leaseInTxn, Date.now());
+    if (raced) return owned(raced);
+    const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
+      .get(target.sessionId) as { row: string } | undefined;
+    if (!hit) return { outcome: 'missing' };
+    const current = JSON.parse(hit.row) as Session;
+    const { publish, result } = step(current);
+    if (!publish) return result;
+    db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
+      .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
+    db.exec('COMMIT');
+    inTxn = false;
+    return result;
+  } catch (err) {
+    if (isTransientStoreContentionError(err)) return { outcome: 'contended' };
+    if (err instanceof SessionStoreSqliteUnavailableError) return owned('store_unreadable');
     throw err;
+  } finally {
+    if (inTxn) { try { db?.exec('ROLLBACK'); } catch { /* txn already gone */ } }
+    try { db?.close(); } catch { /* already closed */ }
   }
 }
 
@@ -3024,7 +6150,7 @@ function sessionRowIsAdopted(row: Session): boolean {
  * backing, close) can re-judge ownership before each irreversible step.
  */
 export function readSessionRowUnowned(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   options: UnownedRowOptions = {},
 ): UnownedRowRead {
   return runUnownedRowTxn(target, options, current => ({
@@ -3034,17 +6160,17 @@ export function readSessionRowUnowned(
 }
 
 /**
- * Apply one host command to the FRESH row of its owning store (per-bot when the
- * caller-observed row carries `larkAppId`, the legacy store otherwise) while
+ * Apply one host command to the FRESH row of its owning per-bot store while
  * no daemon holds it, and publish the result. The caller's snapshot is never
- * written back.
+ * written back. The target names the owning store (`larkAppId` is required);
+ * a caller-observed row without one is rejected by the caller, not here.
  *
  * `expectAdopted` is a fail-closed precondition for multi-step host commands:
  * the row must still be (non-)adopted exactly as the caller last read it,
  * otherwise the step is `refused` with `row_changed`.
  */
 export function applySessionCommandUnowned(
-  target: { sessionId: string; larkAppId?: string },
+  target: { sessionId: string; larkAppId: string },
   command: HostSessionCommand,
   options: UnownedRowOptions & { expectAdopted?: boolean } = {},
 ): UnownedRowApply {

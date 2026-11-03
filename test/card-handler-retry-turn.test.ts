@@ -94,6 +94,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   workerHasInitialized: vi.fn(() => true),
   sessionSupportsWebTerminal: vi.fn(() => true),
   readableTerminalUrlFor: vi.fn(() => 'https://example.com/term'),
+  liveReadableTerminalUrlFor: vi.fn(() => 'https://example.com/term'),
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: vi.fn(),
   deliverEphemeralOrReply: vi.fn(),
@@ -104,6 +105,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
   withActiveSessionKeyLock: vi.fn(async (_m: any, _k: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(),
   silentIdleCardFlag: vi.fn(() => false),
+  idleCardLabel: vi.fn(() => undefined),
+  streamCardLabel: vi.fn(() => undefined),
 }));
 
 const rememberLastCliInputMock = vi.fn();
@@ -151,14 +154,18 @@ vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
 }));
 
+const recoveryRetryClickMock = vi.fn(async (..._a: any[]) => ({ toast: { type: 'success', content: 'ok' } }));
+vi.mock('../src/core/ordinary-recovery-retry.js', () => ({
+  handleOrdinaryRecoveryRetryClick: (...a: any[]) => recoveryRetryClickMock(...a),
+}));
+
 // ─── Imports (after mocks) ────────────────────────────────────────────────
 
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session, FailedTurnRecord } from '../src/types.js';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -436,14 +443,13 @@ describe('retry_turn — refusal branches', () => {
 });
 
 describe('retry_turn — permission gate', () => {
-  it('is registered as a sensitive action in the source gate', () => {
-    // Source-lock: the isSensitive allowlist is a plain string array with no
-    // type-level enforcement, so an action dropped from it silently becomes
-    // clickable by anyone in the chat. Pin membership here.
-    const src = readFileSync(resolve(__dirname, '../src/im/lark/card-handler.ts'), 'utf8');
-    const line = src.split('\n').find(l => l.includes('const isSensitive'));
-    expect(line).toBeTruthy();
-    expect(line).toContain("'retry_turn'");
+  it('is registered as a sensitive action in the permission gate table', () => {
+    // The sensitive-action allowlist has no type-level enforcement, so an action
+    // dropped from it silently becomes clickable by anyone in the chat. Pin
+    // membership here. (This used to grep the `const isSensitive` source line; the
+    // list now lives in SENSITIVE_CARD_ACTIONS, so assert on the table itself —
+    // the behavioural deny test right below covers the gate wiring.)
+    expect(sensitiveCardActionMeta('retry_turn')).toBeDefined();
   });
 
   it('does not resubmit when canOperate denies the operator', async () => {
@@ -452,5 +458,40 @@ describe('retry_turn — permission gate', () => {
     await handleCardAction(actionData(), depsWith(ds), LARK_APP_ID);
     expect(sendWorkerInputMock).not.toHaveBeenCalled();
     expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('retry_recovery_turn — routing', () => {
+  function recoveryClick(operator: string): any {
+    return {
+      operator: { open_id: operator, union_id: 'on_operator' },
+      action: {
+        value: { action: 'retry_recovery_turn', root_id: ROOT, session_id: SID, logical_turn_id: 'om_A' },
+      },
+      context: { open_message_id: 'om_card' },
+    };
+  }
+
+  it('reaches its own sender-or-admin gate even when the generic operator gate would deny the clicker', async () => {
+    // The original sender is usually a talk-only member of an oncall group:
+    // the generic canOperate card gate must not swallow their click.
+    recoveryRetryClickMock.mockClear();
+    vi.mocked(canOperate).mockReturnValue(false);
+    const ds = makeDs();
+    const res = await handleCardAction(recoveryClick('ou_asker'), depsWith(ds), LARK_APP_ID);
+    expect(recoveryRetryClickMock).toHaveBeenCalledTimes(1);
+    expect(recoveryRetryClickMock).toHaveBeenCalledWith(ds, {
+      logicalTurnId: 'om_A', operatorOpenId: 'ou_asker', operatorUnionId: 'on_operator',
+    });
+    expect(res?.toast?.type).toBe('success');
+    // And it never takes the lastFailedTurn-based retry_turn path.
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+  });
+
+  it('answers a click on a card whose session is gone without dispatching anything', async () => {
+    recoveryRetryClickMock.mockClear();
+    const res = await handleCardAction(recoveryClick('ou_asker'), depsWith(undefined), LARK_APP_ID);
+    expect(res?.toast?.type).toBe('warning');
+    expect(recoveryRetryClickMock).not.toHaveBeenCalled();
   });
 });

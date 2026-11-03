@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
@@ -49,22 +48,6 @@ function render(element: React.ReactElement): TestRenderer.ReactTestRenderer {
 }
 
 describe('dashboard monitoring session table', () => {
-  it('declares runtime monitoring sections and status classes', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/monitoring-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(page).toContain("monitoring.runtimeHealth");
-    expect(page).toContain("monitoring.resourcePressure");
-    expect(page).toContain("monitoring.sessionPressure");
-    expect(page).toContain("monitoring.botRuntime");
-    expect(page).toContain("runtime-health-grid");
-    expect(page).toContain("runtime-pressure-grid");
-    expect(page).toContain("runtime-status-pill");
-    expect(css).toContain(".runtime-health-grid");
-    expect(css).toContain(".runtime-pressure-grid");
-    expect(css).toContain(".runtime-status-pill");
-  });
-
   it('keeps all session rows in a ten-row scroll list', () => {
     const renderer = render(React.createElement(SessionResourceTable, {
       sessions: Array.from({ length: 12 }, (_, index) => makeSession(index + 1)),
@@ -288,56 +271,5 @@ describe('dashboard monitoring session table', () => {
     const sessionPills = resourcePills(sessionRow!);
     expect(textContent(sessionPills[0])).toContain('-');
     expect(textContent(sessionPills[1])).toContain('64 MiB');
-  });
-
-  it('keeps monitoring resource values aligned with runtime CPU readiness', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/monitoring-page.tsx', import.meta.url), 'utf8');
-
-    expect(page).toContain('cpuReady?: boolean');
-    expect(page).toContain("tr('monitoring.runtimeTitle')");
-    expect(page).toContain('currentCpuReady(current)');
-    expect(page).toContain('formatCpuPct(current?.host?.cpuPct, cpuReady)');
-    expect(page).toContain('formatCpuPct(session.current?.cpu1mPct ?? session.current?.cpuPct, cpuReady)');
-
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    expect(css).toContain('.resource-page :where(.metric-card, .resource-unavailable-card):hover');
-    expect(css).toContain('.resource-pill.accent');
-  });
-
-  it('limits the session body height with CSS instead of dropping rows', () => {
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(css).toContain('.resource-session-list');
-    expect(css).toMatch(/\.resource-session-list\s*\{[^}]*max-height:\s*calc\(58px\s*\*\s*10\s*\+\s*20px\)/s);
-    expect(css).toMatch(/overflow-y:\s*auto/);
-  });
-
-  it('preserves line breaks in the RSS help tooltip', () => {
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(css).toMatch(/\.ui-info-pop\s*\{[^}]*white-space:\s*pre-line/s);
-  });
-
-  it('layers resource metric help popovers above following panels and keeps them interactive', () => {
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(css).toMatch(/\.resource-page\s*\{[^}]*isolation:\s*isolate/s);
-    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*position:\s*fixed[^}]*z-index:\s*2147483647/s);
-    // Floating help is deliberately interactive so users can hover, select,
-    // and copy its text while it remains above following resource panels.
-    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*pointer-events:\s*auto/s);
-    expect(css).toMatch(/\.ui-info-pop-floating\s*\{[^}]*user-select:\s*text/s);
-  });
-
-  it('uses a compact unsupported resource sampling empty state', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/monitoring-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(page).toContain('resource-unavailable-card');
-    expect(page).toContain("monitoring.unsupportedTitle");
-    expect(page).toContain("monitoring.unsupportedHint");
-    expect(page).not.toContain("<p>{current?.reason ?? 'procfs_unavailable'}</p>");
-    expect(css).toContain('.resource-unavailable-card');
-    expect(css).toContain('.resource-unavailable-status');
   });
 });

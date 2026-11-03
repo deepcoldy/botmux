@@ -26,6 +26,9 @@ import type { LarkAttachment, Session } from '../types.js';
 
 /** Close inputs only the owning daemon can produce. */
 type DaemonCloseOptions = {
+  /** Only trusted scheduled host cleanup may preserve already-registered jobs. */
+  backgroundExecutionCleanup?: boolean;
+  workspaceRetirement?: Session['workspaceRetirement'];
   /**
    * Close-time token snapshot, sampled by the caller BEFORE the write (the
    * daemon's transcript scan, never run under the store lock). Omit to leave
@@ -86,8 +89,9 @@ type Assert<T extends true> = T;
 /** Compile-time proof of the host boundary (checked by the build's `tsc`):
  *  a daemon close command must never be assignable to a host command, so no
  *  daemon-only option can become nameable by a host. Widening
- *  `HostSessionCommand` turns this into a TS2344 error. */
-type _HostCloseCannotNameDaemonOptions =
+ *  `HostSessionCommand` turns this into a TS2344 error.
+ *  `export` 仅为让这条纯编译期断言不被 noUnusedLocals 当作未使用的局部类型，别无调用方。 */
+export type _HostCloseCannotNameDaemonOptions =
   Assert<SessionCloseCommand extends HostSessionCommand ? false : true>;
 
 export type SessionRowRefusal =
@@ -146,6 +150,7 @@ export function applySessionRowCommand(
     case 'worker-exited':
       if (row.pid !== command.pid) return { outcome: 'refused', reason: 'worker_changed' };
       row.pid = undefined;
+      row.pidProcStart = undefined;
       return { outcome: 'applied', released: {} };
   }
 }
@@ -156,6 +161,10 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
   // The materialised images are cleaned up AFTER the row commits, so the list
   // is handed back before it is dropped from the row.
   const released: SessionRowReleased = {};
+  if (command.workspaceRetirement && !row.workspaceRetirement) {
+    row.workspaceRetirement = { ...command.workspaceRetirement };
+    changed = true;
+  }
 
   if (!alreadyClosed) {
     if (row.dashboardAttachments?.length) {
@@ -182,6 +191,25 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
     row.queuedAttachments = undefined;
     changed = true;
   }
+  const previousCleanup = row.backgroundExecutionCleanupClosedAt;
+  const cleanup = command.backgroundExecutionCleanup
+    ? (alreadyClosed ? previousCleanup : row.closedAt) : undefined;
+  if (previousCleanup !== cleanup) {
+    row.backgroundExecutionCleanupClosedAt = cleanup;
+    changed = true;
+  }
+  // Manual close is durable revocation even if no job asks for credentials
+  // before a later resume. Repeating an already-manual close stays a no-op.
+  if (!command.backgroundExecutionCleanup && (!alreadyClosed || previousCleanup !== undefined)) {
+    row.backgroundExecutionEpoch = (row.backgroundExecutionEpoch ?? 0) + 1;
+    changed = true;
+  }
+  // Closing ends the principal-lane lifecycle. No queued human turn may cross
+  // that boundary or be replayed by a later explicit resume.
+  if (row.principalLaneQueuedTurns !== undefined) {
+    row.principalLaneQueuedTurns = undefined;
+    changed = true;
+  }
 
   // `previewTarget` is a live loopback (host, port) the session's agent
   // registered with `botmux preview <port>` for its CURRENT worker generation —
@@ -193,6 +221,13 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
   // service. Drop it on every close, including re-close of a legacy closed row.
   if (row.previewTarget !== undefined) {
     row.previewTarget = undefined;
+    changed = true;
+  }
+
+  // Explicit close cancels staged protocol work, including legacy closed rows.
+  // Resuming the conversation must not replay its old cross-principal queue.
+  if (row.crossPrincipalInterruptions !== undefined) {
+    row.crossPrincipalInterruptions = undefined;
     changed = true;
   }
 

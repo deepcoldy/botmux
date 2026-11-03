@@ -27,22 +27,8 @@ vi.mock('node:fs', async (importOriginal) => {
     appendFileSync: (p: string, data: string, _enc?: string) => {
       files[p] = (files[p] ?? '') + data;
     },
-    readFileSync: (p: string, _enc?: string) => {
-      if (!(p in files)) throw new Error(`ENOENT: ${p}`);
-      return files[p];
-    },
   };
 });
-
-// This suite owns the queue semantics, not atomic-write's fd/fsync machinery.
-// Keep persistence in the same in-memory store while atomic-write has its own
-// dedicated tests. This avoids duplicating every current/future node:fs syscall
-// in a fragile full-module mock.
-vi.mock('../src/utils/atomic-write.js', () => ({
-  atomicWriteFileSync: (path: string, data: string | Buffer) => {
-    files[path] = Buffer.isBuffer(data) ? data.toString('utf8') : data;
-  },
-}));
 
 vi.mock('../src/config.js', () => ({
   config: {
@@ -63,9 +49,6 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   ensureQueue,
   appendMessage,
-  readUnread,
-  rewindOffset,
-  getOffset,
 } from '../src/services/message-queue.js';
 import type { LarkMessage } from '../src/types.js';
 
@@ -124,127 +107,5 @@ describe('appendMessage', () => {
     expect(lines).toHaveLength(2);
     expect(JSON.parse(lines[0]).messageId).toBe('m1');
     expect(JSON.parse(lines[1]).messageId).toBe('m2');
-  });
-});
-
-describe('readUnread', () => {
-  it('returns all messages when nothing has been read yet', () => {
-    appendMessage('root_c', makeMessage('m1', 'first'));
-    appendMessage('root_c', makeMessage('m2', 'second'));
-
-    const msgs = readUnread('root_c');
-    expect(msgs).toHaveLength(2);
-    expect(msgs[0].content).toBe('first');
-    expect(msgs[1].content).toBe('second');
-  });
-
-  it('advances offset so subsequent call returns empty', () => {
-    appendMessage('root_d', makeMessage('m1'));
-    const first = readUnread('root_d');
-    expect(first).toHaveLength(1);
-
-    const second = readUnread('root_d');
-    expect(second).toHaveLength(0);
-  });
-
-  it('returns only new messages after offset advances', () => {
-    appendMessage('root_e', makeMessage('m1'));
-    readUnread('root_e'); // consume m1
-
-    appendMessage('root_e', makeMessage('m2', 'new'));
-    const msgs = readUnread('root_e');
-    expect(msgs).toHaveLength(1);
-    expect(msgs[0].content).toBe('new');
-  });
-
-  it('returns empty array for a non-existent queue', () => {
-    expect(readUnread('nonexistent')).toEqual([]);
-  });
-
-  it('returns empty array when queue file exists but is empty', () => {
-    ensureQueue('root_empty');
-    expect(readUnread('root_empty')).toEqual([]);
-  });
-});
-
-describe('rewindOffset', () => {
-  it('resets offset to 0 so all messages are re-read', () => {
-    appendMessage('root_f', makeMessage('m1'));
-    appendMessage('root_f', makeMessage('m2'));
-    readUnread('root_f'); // consume both
-
-    rewindOffset('root_f');
-
-    const msgs = readUnread('root_f');
-    expect(msgs).toHaveLength(2);
-  });
-
-  it('resets offset to a specific byte position', () => {
-    appendMessage('root_g', makeMessage('m1'));
-    const afterFirst = getOffset('root_g'); // still 0
-
-    // Read once to advance offset past m1.
-    readUnread('root_g');
-    const midpoint = getOffset('root_g');
-    expect(midpoint).toBeGreaterThan(0);
-
-    appendMessage('root_g', makeMessage('m2'));
-    readUnread('root_g'); // consume m2
-
-    // Rewind to midpoint — only m2 should be visible.
-    rewindOffset('root_g', midpoint);
-    const msgs = readUnread('root_g');
-    expect(msgs).toHaveLength(1);
-    expect(msgs[0].messageId).toBe('m2');
-  });
-});
-
-describe('getOffset', () => {
-  it('returns 0 when no offset file exists', () => {
-    expect(getOffset('root_new')).toBe(0);
-  });
-
-  it('returns current byte offset after reading', () => {
-    appendMessage('root_h', makeMessage('m1'));
-    readUnread('root_h');
-    expect(getOffset('root_h')).toBeGreaterThan(0);
-  });
-
-  it('returns 0 after rewindOffset()', () => {
-    appendMessage('root_i', makeMessage('m1'));
-    readUnread('root_i');
-    rewindOffset('root_i');
-    expect(getOffset('root_i')).toBe(0);
-  });
-});
-
-describe('key isolation', () => {
-  it('separate keys maintain independent queues and offsets', () => {
-    appendMessage('key_a', makeMessage('a1', 'alpha'));
-    appendMessage('key_b', makeMessage('b1', 'beta'));
-
-    const msgsA = readUnread('key_a');
-    expect(msgsA).toHaveLength(1);
-    expect(msgsA[0].content).toBe('alpha');
-
-    const msgsB = readUnread('key_b');
-    expect(msgsB).toHaveLength(1);
-    expect(msgsB[0].content).toBe('beta');
-
-    // Reading key_a again yields nothing — offset was advanced independently.
-    expect(readUnread('key_a')).toHaveLength(0);
-  });
-
-  it('rewinding one key does not affect another', () => {
-    appendMessage('key_x', makeMessage('x1'));
-    appendMessage('key_y', makeMessage('y1'));
-
-    readUnread('key_x');
-    readUnread('key_y');
-
-    rewindOffset('key_x');
-
-    expect(readUnread('key_x')).toHaveLength(1);
-    expect(readUnread('key_y')).toHaveLength(0);
   });
 });

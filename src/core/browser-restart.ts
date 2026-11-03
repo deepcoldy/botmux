@@ -24,6 +24,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 
 const pExecFile = promisify(execFile);
 
@@ -146,7 +147,7 @@ export async function detectRunningBrowsers(
   // on any other platform there's nothing to offer, so skip the probe entirely
   // instead of spawning mdfind/ps for no reason.
   if ((deps.platform ?? process.platform) !== 'darwin') return [];
-  const psList = deps.psList ?? (async () => (await pExecFile('ps', ['-Axo', 'rss=,command='], { timeout: 8_000, maxBuffer: 32 * 1024 * 1024 })).stdout);
+  const psList = deps.psList ?? (async () => (await pExecFile('ps', ['-Axo', 'rss=,command='], { timeout: 8_000, maxBuffer: PROCESS_TABLE_MAX_BUFFER })).stdout);
   const appPathFor = deps.appPathFor ?? appPathForBundleId;
   let psOut = '';
   try { psOut = await psList(); } catch { return []; }
@@ -198,7 +199,7 @@ export async function restartBrowser(
     appPathFor?: (bundleId: string) => Promise<string>;
   } = {},
 ): Promise<RestartResult> {
-  const run = opts.run ?? (async (file, args) => pExecFile(file, args, { timeout: 15_000 }));
+  const run = opts.run ?? (async (file, args) => pExecFile(file, args, { timeout: 15_000, maxBuffer: PROCESS_TABLE_MAX_BUFFER }));
   const sleep = opts.sleep ?? ((ms) => new Promise<void>(r => setTimeout(r, ms)));
   const now = opts.now ?? (() => Date.now());
   const quitTimeoutMs = opts.quitTimeoutMs ?? 12_000;

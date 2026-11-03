@@ -11,7 +11,7 @@
  * the last DAEMON_HEARTBEAT_STALE_MS (utils/daemon-heartbeat.ts — shared with
  * dashboard/registry.ts and the session-store occupancy lease TTL).
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from './daemon-heartbeat.js';
@@ -23,6 +23,12 @@ export interface OnlineDaemonInfo {
   bootInstanceId?: string;
   /** Auth protocol advertised atomically with bootInstanceId + ipcPort. */
   workflowIpcProtocol?: string;
+  /** Internal target-authoritative dispatch launch protocol. */
+  dispatchLaunchIpcProtocol?: 'v1';
+  /** Presence-based session-store capability. Copy only; never a write permit. */
+  sessionStoreProtocol?: string;
+  /** Running binary version. Copy only; never compared by size. */
+  botmuxVersion?: string;
   botName?: string;
   cliId?: string;
   pid?: number;
@@ -61,13 +67,20 @@ export function resolveDaemonIpcPort(
 }
 
 /** List every daemon whose descriptor file is fresh (heartbeat within STALE_MS). */
-export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
+/** `strict`: an unlistable registry dir throws instead of reading as "nobody
+ *  online" — for callers that must not mistake an unreadable registry for an
+ *  empty one. Malformed individual descriptors are skipped either way. */
+export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } = {}): OnlineDaemonInfo[] {
   const dir = registryDir(dataDir);
-  if (!existsSync(dir)) return [];
+  // No existsSync pre-check: it also answers false on EACCES, which strict
+  // mode must surface. A registry that was never created (ENOENT) is empty.
   const now = Date.now();
   const out: OnlineDaemonInfo[] = [];
   let names: string[] = [];
-  try { names = readdirSync(dir); } catch { return []; }
+  try { names = readdirSync(dir); } catch (err) {
+    if (opts.strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    return [];
+  }
   for (const f of names) {
     if (!f.endsWith('.json')) continue;
     try {
@@ -83,6 +96,15 @@ export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
           : {}),
         ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
           ? { workflowIpcProtocol: d.workflowIpcProtocol }
+          : {}),
+        ...(d.dispatchLaunchIpcProtocol === 'v1'
+          ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
+          : {}),
+        ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol
+          ? { sessionStoreProtocol: d.sessionStoreProtocol }
+          : {}),
+        ...(typeof d.botmuxVersion === 'string' && d.botmuxVersion
+          ? { botmuxVersion: d.botmuxVersion }
           : {}),
         ...(typeof d.botName === 'string' && d.botName.trim() ? { botName: d.botName.trim() } : {}),
         ...(typeof d.cliId === 'string' && d.cliId.trim() ? { cliId: d.cliId.trim() } : {}),

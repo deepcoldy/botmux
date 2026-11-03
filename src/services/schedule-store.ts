@@ -1,3 +1,4 @@
+import { withManagedDirectories } from './managed-directory-retention.js';
 import {
   closeSync,
   constants,
@@ -21,7 +22,17 @@ import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunStats, ScheduleUntilDone } from '../types.js';
+import { parseScheduleRunAsClaim } from '../core/schedule-run-as.js';
+import {
+  absorbLegacyFailureStats,
+  normalizeScheduleNotify,
+  normalizeUntilDone,
+  recordRunOutcome,
+  SCHEDULE_FAILING_THRESHOLD,
+  settleUntilDoneRun,
+  settleUntilDoneSkip,
+} from './schedule-until-done.js';
 
 /** Reasoning levels a task may pin. Mirrors CODEX_REASONING_EFFORTS; spelled out
  *  here because this module is the storage layer and must not depend on the CLI
@@ -73,7 +84,7 @@ export class IdempotencyConflictError extends Error {
  * Includes only the fields that callers control as task **input** (events
  * doc v0.1.2 §3.5 ScheduleCanonicalInput).  Excludes:
  *   - `creator*` (audit metadata, not input)
- *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastError`,
+ *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastRunId`, `lastError`,
  *     `lastDeliveryError` (runtime state, mutates over task lifetime)
  *   - `createdAt` (metadata)
  *   - `repeat.completed` (counter, mutates per run)
@@ -87,6 +98,8 @@ export class IdempotencyConflictError extends Error {
  * whichever of `parsed.runAt`/`parsed.minutes`/`parsed.expr` applies).
  */
 export function canonicalScheduleInput(t: {
+  calendar?: string;
+  calendarDayType?: import('./work-calendar.js').CalendarDayType;
   name: string;
   schedule: string;
   parsed?: ParsedSchedule;
@@ -106,9 +119,17 @@ export function canonicalScheduleInput(t: {
   followActive?: boolean;
   model?: string;
   reasoningEffort?: ScheduleReasoningEffort;
+  /** Human creator whose scheduled turns authenticate workflow commands (see
+   *  scheduled-turn-provenance). Part of canonical input: the same workflow
+   *  attempt run as a different creator is a different schedule. */
+  ownerOpenId?: string;
+  untilDone?: Pick<ScheduleUntilDone, 'deadline' | 'retryMinutes'>;
+  notify?: readonly ScheduleNotifyEvent[];
 }): unknown {
   const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
+    calendar: t.calendar,
+    calendarDayType: t.calendar && t.calendarDayType !== 'workday' ? t.calendarDayType : undefined,
     name: t.name,
     schedule: t.schedule,
     parsed: t.parsed
@@ -150,6 +171,17 @@ export function canonicalScheduleInput(t: {
     // and their canonical JSON stays byte-for-byte what it was.
     model: t.model?.trim() || undefined,
     reasoningEffort: t.reasoningEffort,
+    // Absent/blank on every pre-existing and ownerless task, so the undefined
+    // slot is dropped by computeInputHash and their canonical JSON is
+    // byte-for-byte unchanged.
+    ownerOpenId: t.ownerOpenId?.trim() || undefined,
+    // Until-done configuration is caller intent; its runtime state (status,
+    // attempts, closing-run bookkeeping) is not. Both are absent on every
+    // pre-existing task, so their canonical JSON stays byte-for-byte the same.
+    untilDone: t.untilDone
+      ? { deadline: t.untilDone.deadline, retryMinutes: t.untilDone.retryMinutes }
+      : undefined,
+    notify: t.notify?.length ? [...t.notify] : undefined,
   };
 }
 
@@ -307,7 +339,7 @@ function migrate(raw: any): ScheduledTask | null {
   }
 
   const executionPosition: ScheduleExecutionPosition | undefined =
-    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic'
+    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic' || raw.executionPosition === 'task'
       ? raw.executionPosition
       : raw.deliver === 'new-topic'
         ? 'new-topic'
@@ -331,6 +363,11 @@ function migrate(raw: any): ScheduledTask | null {
 
   return {
     id: raw.id,
+    // Preserve malformed bindings so runtime fails closed instead of dropping the gate.
+    calendar: raw.calendar,
+    calendarDayType: raw.calendarDayType,
+    lastCalendarCheck: raw.lastCalendarCheck,
+    manualRunRequested: raw.manualRunRequested === true ? true : undefined,
     preconditionRef: typeof raw.preconditionRef === 'string' && raw.preconditionRef
       ? raw.preconditionRef
       : undefined,
@@ -359,13 +396,24 @@ function migrate(raw: any): ScheduledTask | null {
     // "no creator".
     ownerOpenId: raw.ownerOpenId,
     ownerUnionId: raw.ownerUnionId,
+    // Same trap as the creator pair above: a claim that is not rebuilt here is
+    // dropped on the next reload and the task falls back to having no identity.
+    runAsClaim: parseScheduleRunAsClaim(raw.runAsClaim),
     enabled: raw.enabled !== false,
+    disabledReason: raw.disabledReason === 'once_completed' || raw.disabledReason === 'manual'
+      ? raw.disabledReason
+      : undefined,
     createdAt: raw.createdAt,
     lastRunAt: raw.lastRunAt,
     nextRunAt: raw.nextRunAt,
     lastStatus: raw.lastStatus,
+    lastRunId: raw.lastRunId,
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
+    // #2334 shipped the admin-DM watermark top-level; it stays there (written
+    // at settlement, not gated on delivery). The old top-level counter is gone
+    // from the model — absorbLegacyFailureStats folds it into the ledger.
+    failureAlertSent: raw.failureAlertSent === true ? true : undefined,
     repeat: raw.repeat,
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
@@ -377,6 +425,13 @@ function migrate(raw: any): ScheduledTask | null {
     // than carried to fire time, where it could only produce a CLI error.
     model: typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : undefined,
     reasoningEffort: isScheduleReasoningEffort(raw.reasoningEffort) ? raw.reasoningEffort : undefined,
+    // Rebuilt explicitly for the same reason as the fields above: a reload must
+    // not silently drop the ledger or turn an until-done task into a plain one.
+    // absorbLegacyFailureStats also folds #2334's persisted top-level
+    // `consecutiveFailures` into the ledger so an upgrade never resets a streak.
+    runStats: absorbLegacyFailureStats(raw.runStats, raw.consecutiveFailures),
+    untilDone: normalizeUntilDone(raw.untilDone),
+    notify: normalizeScheduleNotify(raw.notify),
   };
 }
 
@@ -414,6 +469,33 @@ function serializeTasks(map: ReadonlyMap<string, ScheduledTask>): string {
   const obj: Record<string, ScheduledTask> = {};
   for (const [id, task] of map) obj[id] = task;
   return JSON.stringify(obj, null, 2);
+}
+
+/** Rewrite the untrusted JSON projection from a host-authoritative task row.
+ * This intentionally bypasses create idempotency: the authority store owns the
+ * exact runtime state and the projection is merely repaired to match it. */
+export function projectAuthoritativeTask(task: ScheduledTask, appId?: string): void {
+  mutateTasks(working => {
+    working.set(task.id, structuredClone(task));
+    return { result: undefined, changed: true };
+  }, appId ?? task.larkAppId);
+}
+
+/** Remove only the JSON projection. A protected tombstone remains in the
+ * authority database, preventing task-id reuse or legacy downgrade. */
+export function removeAuthoritativeTaskProjection(id: string, appId?: string): void {
+  mutateTasks(working => {
+    const changed = working.delete(id);
+    return { result: undefined, changed };
+  }, appId);
+}
+
+export function replaceAuthoritativeProjection(tasks: readonly ScheduledTask[], appId?: string): void {
+  mutateTasks(working => {
+    working.clear();
+    for (const task of tasks) working.set(task.id, structuredClone(task));
+    return { result: undefined, changed: true };
+  }, appId);
 }
 
 // Deliberately inert outside Vitest. This lets the durability regression test
@@ -454,7 +536,7 @@ function persistDiskSnapshot(fp: string, map: ReadonlyMap<string, ScheduledTask>
     closeSync(fd);
     fd = undefined;
     beforeRenameTestHook?.();
-    renameSync(tmpFp, fp);
+    withManagedDirectories([...map.values()], () => renameSync(tmpFp, fp));
     renamed = true;
     fsyncDirectorySyncPortable(parent);
   } finally {
@@ -546,6 +628,47 @@ function load(appId?: string): void {
   installSnapshot(nextMap, fp);
 }
 
+/** Allowed task id alphabet/width. Producers are the 8-hex legacy ids and the
+ *  workflow idempotency keys (`wf_`/`wf3_` + truncated sha256 hex, width 50);
+ *  task ids are used as schedules.json keys and per-task output-dir segments,
+ *  so anything outside [0-9a-z_] (path separators, dots, spaces) is rejected
+ *  up front. */
+const TASK_ID_RE = /^[0-9a-z_]{1,50}$/;
+
+/** 周期任务连续失败达到此次数后发出一次管理员告警（成功即清零）。
+ *  #2334 引入的名字，与 owner 通知（--notify failing）的判定阈值统一为
+ *  同一个常量：两套通知共用一段失败串，不允许多两套阈值漂移。保留导出名
+ *  作为兼容别名。 */
+export const SCHEDULE_FAILURE_ALERT_THRESHOLD = SCHEDULE_FAILING_THRESHOLD;
+
+/**
+ * 连续失败计数 / 告警判定的唯一推进规则，schedule-store（JSON legacy 路径）
+ * 与 scheduler（authority store 生产路径）共用，避免两份实现漂移。
+ * 计数即执行账本 runStats.consecutiveFailures（唯一事实源：成功清零、失败
+ * +1，owner 侧 failingNotifiedAt 水印由 recordRunOutcome 一并维护）：
+ *  - crossedFailureThreshold 由结算前后的账本推导（after≥阈值 且 before<阈值），
+ *    每段失败串恰好越过一次，由调用方据此投递一次管理员告警；
+ *  - 管理员侧的顶层 failureAlertSent 水印（落盘即记账）与 owner 侧的
+ *    failingNotifiedAt（投递成功才记账）语义不同，由各结算点自行维护，不合并。
+ */
+export function nextFailureTracking(
+  current: ScheduleRunStats | undefined,
+  success: boolean,
+): { runStats: ScheduleRunStats; consecutiveFailures: number; crossedFailureThreshold: boolean } {
+  const runStats = recordRunOutcome(current, success ? 'dispatched' : 'failed');
+  const consecutiveFailures = runStats.consecutiveFailures;
+  const crossedFailureThreshold = !success
+    && consecutiveFailures >= SCHEDULE_FAILURE_ALERT_THRESHOLD
+    && (current?.consecutiveFailures ?? 0) < SCHEDULE_FAILURE_ALERT_THRESHOLD;
+  return { runStats, consecutiveFailures, crossedFailureThreshold };
+}
+
+function assertValidTaskId(id: string): void {
+  if (!TASK_ID_RE.test(id)) {
+    throw new TypeError(`invalid schedule task id: ${JSON.stringify(id)}`);
+  }
+}
+
 /**
  * Create a scheduled task — or return the existing one with the same input
  * when called with a workflow-supplied `id` that already exists.
@@ -565,6 +688,8 @@ function load(appId?: string): void {
 export function createTask(params: {
   id?: string;
   preconditionRef?: string;
+  calendar?: string;
+  calendarDayType?: import('./work-calendar.js').CalendarDayType;
   name: string;
   schedule: string;
   parsed: ParsedSchedule;
@@ -590,8 +715,29 @@ export function createTask(params: {
   followActive?: boolean;
   model?: string;
   reasoningEffort?: ScheduleReasoningEffort;
-}): ScheduledTask {
+  /** Initial until-done state, already validated by scheduler.addTask. */
+  untilDone?: ScheduleUntilDone;
+  notify?: ScheduleNotifyEvent[];
+}, authoritativeCreate?: (task: ScheduledTask) => ScheduledTask): ScheduledTask {
   const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
+  if (params.id) assertValidTaskId(params.id);
+  if (authoritativeCreate) {
+    // Authority owns idempotency and runtime state. Do not read or write the
+    // projection before it accepts this candidate.
+    const task: ScheduledTask = {
+      ...params,
+      chatId: targets.chatId,
+      chatIds: targets.chatIds,
+      id: params.id ?? randomUUID().substring(0, 8),
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      deliver: params.deliver === 'local' ? 'local' : 'origin',
+      silent: params.silent === true ? true : undefined,
+      followActive: params.followActive === true ? true : undefined,
+      model: params.model?.trim() || undefined,
+    };
+    return authoritativeCreate(task);
+  }
   // Route to the OWNING bot's file: a task explicitly created for another bot
   // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
   // its daemon (the only one that executes it) can see it. Sandboxed callers
@@ -623,9 +769,12 @@ export function createTask(params: {
 
     let id = params.id ?? randomUUID().substring(0, 8);
     while (!params.id && working.has(id)) id = randomUUID().substring(0, 8);
+    assertValidTaskId(id);
     const task: ScheduledTask = {
       id,
       preconditionRef: params.preconditionRef,
+      calendar: params.calendar,
+      calendarDayType: params.calendarDayType,
       name: params.name,
       schedule: params.schedule,
       parsed: params.parsed,
@@ -655,6 +804,8 @@ export function createTask(params: {
       followActive: params.followActive === true ? true : undefined,
       model: params.model?.trim() || undefined,
       reasoningEffort: params.reasoningEffort,
+      untilDone: params.untilDone,
+      notify: params.notify,
     };
     working.set(task.id, task);
     return { result: task, changed: true };
@@ -678,13 +829,14 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'failureAlertSent' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    | 'runStats' | 'untilDone' | 'notify'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
-): void {
-  mutateTasks(working => {
+): boolean {
+  return mutateTasks(working => {
     const task = working.get(id);
-    if (!task) return { result: undefined, changed: false };
+    if (!task) return { result: false, changed: false };
     const targetUpdate = updates.chatId !== undefined || updates.chatIds !== undefined;
     const targets = targetUpdate
       ? normalizeScheduleChatTargets({
@@ -701,26 +853,87 @@ export function updateTask(
         ? { ...ordinaryUpdates, deliver: 'origin' as const }
         : ordinaryUpdates,
     );
+    // Generic enable/disable writes are operator actions. Automatic one-shot
+    // completion is written directly by markRun below so the two states remain
+    // distinguishable for exact in-flight scheduled-turn authorization.
+    if (updates.enabled === true) delete task.disabledReason;
+    else if (updates.enabled === false && updates.disabledReason === undefined) {
+      task.disabledReason = 'manual';
+    }
     if (targets) {
       task.chatId = targets.chatId;
       if (targets.chatIds) task.chatIds = targets.chatIds;
       else delete task.chatIds;
     }
-    return { result: undefined, changed: true };
+    return { result: true, changed: true };
+  }, appId);
+}
+
+export type ScheduleRunClaimResult =
+  | { ok: true; task: ScheduledTask }
+  | { ok: false; error: 'not_found' | 'already_running' };
+
+/** Atomically claim a task for dispatch. The file lock makes this the single
+ * admission point shared by natural ticks and Dashboard run-now requests. */
+export function claimRun(
+  id: string,
+  claim: Pick<ScheduledTask, 'lastRunAt' | 'nextRunAt' | 'lastRunId'> & Partial<Pick<ScheduledTask, 'untilDone'>>,
+  appId?: string,
+): ScheduleRunClaimResult {
+  return mutateTasks<ScheduleRunClaimResult>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    const manualRunRequested = task.manualRunRequested;
+    delete task.manualRunRequested;
+    Object.assign(task, claim, {
+      lastStatus: 'running' as const,
+      lastError: undefined,
+      lastDeliveryError: undefined,
+    });
+    return { result: { ok: true, task: { ...task, manualRunRequested } } as const, changed: true };
+  }, appId);
+}
+
+/** Atomically make a task due without re-arming one that is already running. */
+export function requestRunNow(
+  id: string,
+  nextRunAt = new Date().toISOString(),
+  appId?: string,
+): { ok: true } | { ok: false; error: 'not_found' | 'already_running' | 'disabled' } {
+  return mutateTasks<{ ok: true } | { ok: false; error: 'not_found' | 'already_running' | 'disabled' }>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    if (task.enabled === false) {
+      return { result: { ok: false, error: 'disabled' } as const, changed: false };
+    }
+    task.nextRunAt = nextRunAt;
+    task.manualRunRequested = true;
+    return { result: { ok: true } as const, changed: true };
   }, appId);
 }
 
 /** Record a skipped check without consuming a run or disabling a one-shot. */
-export function markSkipped(id: string, nextRunAt?: string): void {
+export function markSkipped(id: string, nextRunAt?: string, runId?: string): void {
   mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
 
     task.lastRunAt = new Date().toISOString();
     task.lastStatus = 'skipped';
     task.lastError = undefined;
     task.lastDeliveryError = undefined;
+    task.runStats = recordRunOutcome(task.runStats, 'skipped');
     if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
+    working.set(id, settleUntilDoneSkip(task, runId, Date.now()));
     return { result: undefined, changed: true };
   });
 }
@@ -729,16 +942,45 @@ export function markSkipped(id: string, nextRunAt?: string): void {
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
  */
-export function markRun(id: string, success: boolean, error?: string, deliveryError?: string): void {
+export function markRun(
+  id: string,
+  success: boolean,
+  error?: string,
+  deliveryError?: string,
+  runId?: string,
+): { removedAfterTimes?: number; crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
+  let crossedFailureThreshold = false;
+  let consecutiveFailures = 0;
   const completedRepeat = mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
 
     const now = new Date().toISOString();
     task.lastRunAt = now;
     task.lastStatus = success ? 'ok' : 'error';
     task.lastError = success ? undefined : error;
     task.lastDeliveryError = deliveryError;
+
+    // Shared failure counter lives in the ledger (before any early return, so
+    // until-done settlements advance it too). Admin watermark: recorded when
+    // the row is written, unlike the owner's delivery-confirmed marker.
+    const tracking = nextFailureTracking(task.runStats, success);
+    task.runStats = tracking.runStats;
+    task.failureAlertSent = success
+      ? undefined
+      : (task.failureAlertSent === true || tracking.crossedFailureThreshold) ? true : undefined;
+    crossedFailureThreshold = tracking.crossedFailureThreshold;
+    consecutiveFailures = tracking.consecutiveFailures;
+
+    // Until-done tasks are not consumed by a run: they stay until marked done
+    // or their deadline's closing run (see schedule-until-done.ts).
+    if (task.untilDone) {
+      working.set(id, settleUntilDoneRun(task, { success, runId, nowMs: Date.parse(now) }));
+      return { result: undefined, changed: true };
+    }
 
     // Advance repeat counter
     if (task.repeat) {
@@ -753,6 +995,7 @@ export function markRun(id: string, success: boolean, error?: string, deliveryEr
     // One-shot: disable after run. Otherwise next_run was already advanced by scheduler.
     if (task.parsed.kind === 'once') {
       task.enabled = false;
+      task.disabledReason = 'once_completed';
       task.nextRunAt = undefined;
     }
     return { result: undefined, changed: true };
@@ -760,6 +1003,9 @@ export function markRun(id: string, success: boolean, error?: string, deliveryEr
   if (completedRepeat !== undefined) {
     logger.info(`[schedule-store] Task ${id} removed after completing ${completedRepeat} runs`);
   }
+  return completedRepeat !== undefined
+    ? { removedAfterTimes: completedRepeat, crossedFailureThreshold, consecutiveFailures }
+    : { crossedFailureThreshold, consecutiveFailures };
 }
 
 export function listTasks(appId?: string): ScheduledTask[] {
@@ -917,4 +1163,36 @@ export function startExternalWriteWatcher(): void {
   } catch (err: any) {
     logger.warn(`[schedule-store] Failed to start file watcher: ${err.message}`);
   }
+}
+
+/** Settle a calendar block without counting a model run. Matching claims only.
+ *  A calendar `error` counts as a failed ledger run and crosses the same shared
+ *  failure counter — it can trigger the admin alert too, same rule as a
+ *  dispatch failure. */
+export function markCalendarBlocked(
+  id: string,
+  check: NonNullable<ScheduledTask['lastCalendarCheck']>,
+  runId: string,
+): { crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
+  let crossedFailureThreshold = false;
+  let consecutiveFailures = 0;
+  mutateTasks(working => {
+    const task = working.get(id);
+    if (!task || task.lastRunId !== runId) return { result: undefined, changed: false };
+    task.lastStatus = check.status === 'error' ? 'error' : 'skipped';
+    task.lastCalendarCheck = check;
+    task.lastError = check.status === 'error' ? check.reason : undefined;
+    task.lastDeliveryError = undefined;
+    if (check.status === 'error') {
+      const tracking = nextFailureTracking(task.runStats, false);
+      task.runStats = tracking.runStats;
+      task.failureAlertSent = (task.failureAlertSent === true || tracking.crossedFailureThreshold) ? true : undefined;
+      crossedFailureThreshold = tracking.crossedFailureThreshold;
+      consecutiveFailures = tracking.consecutiveFailures;
+    } else {
+      task.runStats = recordRunOutcome(task.runStats, 'skipped');
+    }
+    return { result: undefined, changed: true };
+  });
+  return { crossedFailureThreshold, consecutiveFailures };
 }

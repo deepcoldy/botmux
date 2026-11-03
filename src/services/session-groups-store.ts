@@ -10,9 +10,10 @@
  *
  * Registry answers three questions:
  *   1. isSessionGroup(chatId)      — typing / feature gating
- *   2. lastSessionId for a chatId  — same-group resume: a new message in a
- *      session group whose session was /close'd resumes that session instead
- *      of spawning a fresh one (的话题内续聊同款体验).
+ *   2. lastSessionId for a chatId  — the group's current chat-scope resident
+ *      (what /dismiss and AI titling act on). Closing does NOT auto-resume: a
+ *      later message starts a fresh session, which becomes the resident once
+ *      it wins registration; any successful resume re-points it.
  *   3. ownerOpenId                 — the DM user the group was born for.
  *   4. origin* provenance          — WHICH authorization birthed the group, so
  *      the dispatcher can keep charging that same quota/expiry instead of
@@ -32,7 +33,7 @@ import { logger } from '../utils/logger.js';
 export interface SessionGroupEntry {
   /** The DM user this group was born for (open_id in the bot's app scope). */
   ownerOpenId: string;
-  /** Most recent session anchored in this group; same-group resume target. */
+  /** The group's chat-scope resident session (the last one created or resumed here). */
   lastSessionId: string;
   /** Epoch ms the group was created. */
   createdAt: number;
@@ -65,6 +66,8 @@ export interface SessionGroupEntry {
   originChatId?: string;
   /** True once the async AI title has been applied to the chat name. */
   titled?: boolean;
+  /** Actual automatic feed group joined by this chat, scoped to ownerOpenId. */
+  feedGroupId?: string;
   /** Failed scheduling rounds (each round contains the service's bounded
    * in-call retry). Persisted so later messages cannot spawn unbounded CLIs. */
   titleAttempts?: number;
@@ -132,6 +135,7 @@ export function registerSessionGroup(chatId: string, entry: Omit<SessionGroupEnt
     originQuotaKey: entry.originQuotaKey,
     originChatId: entry.originChatId,
     titled: entry.titled,
+    feedGroupId: entry.feedGroupId,
     titleAttempts: entry.titleAttempts,
     titleRetryAt: entry.titleRetryAt,
   });
@@ -149,6 +153,38 @@ export function getSessionGroup(chatId: string): SessionGroupEntry | undefined {
   if (!currentAppId) return undefined;
   load();
   return entries.get(chatId);
+}
+
+/** 群组管理页「会话群」视图要的摘要：排序、状态和「查看会话」入口。 */
+export interface SessionGroupBoardMeta {
+  createdAt: number;
+  /** 注册表时间与当前会话最后一条消息里较新的那个——注册表只在建群 / 恢复 / 换新会话时更新，
+   *  会话里每来一条消息只会推进会话自己的 lastMessageAt。 */
+  lastActiveAt: number;
+  sessionId?: string;
+  sessionStatus?: 'active' | 'closed';
+}
+
+export function sessionGroupBoardMeta(
+  entry: SessionGroupEntry,
+  session?: { status?: string; lastMessageAt?: string } | null,
+): SessionGroupBoardMeta {
+  const sessionActiveAt = session?.lastMessageAt ? Date.parse(session.lastMessageAt) : NaN;
+  const status = session?.status === 'active' || session?.status === 'closed' ? session.status : undefined;
+  return {
+    createdAt: entry.createdAt,
+    lastActiveAt: Number.isFinite(sessionActiveAt) ? Math.max(entry.lastActiveAt, sessionActiveAt) : entry.lastActiveAt,
+    ...(entry.lastSessionId ? { sessionId: entry.lastSessionId } : {}),
+    ...(status ? { sessionStatus: status } : {}),
+  };
+}
+
+/** Remember the automatic group only for the user who owns this session group. */
+export function setSessionGroupFeedGroup(chatId: string, ownerOpenId: string, feedGroupId: string): void {
+  const entry = getSessionGroup(chatId);
+  if (!entry || entry.ownerOpenId !== ownerOpenId || entry.feedGroupId === feedGroupId) return;
+  entry.feedGroupId = feedGroupId;
+  persist();
 }
 
 /** Point the registry at the session currently living in this group. */
@@ -189,10 +225,4 @@ export function markSessionGroupTitleFailed(chatId: string, failedAt = Date.now(
 export function removeSessionGroup(chatId: string): void {
   load();
   if (entries.delete(chatId)) persist();
-}
-
-export function listSessionGroups(): Array<{ chatId: string } & SessionGroupEntry> {
-  if (!currentAppId) return [];
-  load();
-  return Array.from(entries.entries()).map(([chatId, v]) => ({ chatId, ...v }));
 }

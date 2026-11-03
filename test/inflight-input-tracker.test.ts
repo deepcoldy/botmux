@@ -18,6 +18,25 @@ import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 const item = (content: string, turnId?: string) => ({ content, turnId });
 
 describe('InflightInputTracker', () => {
+  it('retires an interrupted turn before CLI exit without dropping its next task', () => {
+    const tracker = new InflightInputTracker();
+    tracker.onWrite(item('interrupted', 'stop'));
+    tracker.onWrite(item('next task', 'next'));
+    tracker.retireTurn('stop');
+    expect(tracker.onCliExit()).toBe(1);
+    expect(tracker.takeCarryOver()).toEqual([item('next task', 'next')]);
+  });
+
+  it('retires an interrupted turn already moved to carry-over before restart', () => {
+    const tracker = new InflightInputTracker();
+    tracker.onWrite(item('interrupted', 'stop'));
+    tracker.onWrite(item('next task', 'next'));
+    tracker.onCliExit();
+    tracker.retireTurn('stop');
+    tracker.retireTurn('stop');
+    expect(tracker.takeCarryOver()).toEqual([item('next task', 'next')]);
+  });
+
   it('incident shape: write → CLI crash → respawn re-queues the lost input', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('review PR #159', 'turn-1'));
@@ -200,5 +219,56 @@ describe('InflightInputTracker', () => {
     t.onTurnComplete();
     expect(t.onCliExit()).toBe(0);
     expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('a turn whose user record reached the transcript is kept apart: resumed CLIs do not get it again', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('review PR 1650', 'started'));
+    t.onWrite(item('queued follow-up', 'unseen'));
+    t.onTurnStarted('started');
+    expect(t.onCliExit()).toBe(1);
+    // Re-delivered as before: only the input the CLI never recorded.
+    expect(t.takeCarryOver()).toEqual([item('queued follow-up', 'unseen')]);
+    // The started one is held for a respawn that cannot resume (fresh session).
+    expect(t.takeStartedCarryOver()).toEqual([item('review PR 1650', 'started')]);
+    expect(t.takeStartedCarryOver()).toEqual([]);
+  });
+
+  it('a finished turn, a retired turn, or a forgotten input leaves nothing started to replay', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('a', 'a'));
+    t.onTurnStarted('a');
+    t.onTurnComplete();
+    t.onCliExit();
+    expect(t.takeStartedCarryOver()).toEqual([]);
+
+    const b = item('b', 'b');
+    t.onWrite(b);
+    t.onTurnStarted('b');
+    t.onCliExit();
+    t.retireTurn('b');
+    expect(t.takeStartedCarryOver()).toEqual([]);
+
+    const c = item('c', 'c');
+    t.onWrite(c);
+    t.onTurnStarted('c');
+    expect(t.retire(c)).toBe(true);
+    t.onCliExit();
+    expect(t.takeStartedCarryOver()).toEqual([]);
+
+    const d = item('d', 'd');
+    t.onWrite(d);
+    t.onTurnStarted('d');
+    t.onCliExit();
+    t.forget(d);
+    expect(t.takeStartedCarryOver()).toEqual([]);
+  });
+
+  it('started inputs obey the same no-replay predicate on exit', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'keyed', turnId: 'k', noReplay: true });
+    t.onTurnStarted('k');
+    t.onCliExit(i => !i.noReplay);
+    expect(t.takeStartedCarryOver()).toEqual([]);
   });
 });

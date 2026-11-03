@@ -1,26 +1,63 @@
 import type { EventEmitter } from 'node:events';
+import { isOrdinaryImTurnId } from './core/ordinary-im-turn.js';
 
 export const WORKER_IPC_HANDLER_READY_EVENT = 'botmux:worker-ipc-handler-ready';
 
-type IpcHost = Pick<EventEmitter, 'emit' | 'prependListener' | 'removeListener' | 'once'> & {
+export type IpcHost = Pick<EventEmitter, 'emit' | 'prependListener' | 'removeListener' | 'once'> & {
   send?: (message: unknown) => unknown;
 };
+
+type PreloadState = {
+  firstMessageSeen: boolean;
+  waiters: Set<(seen: boolean) => void>;
+};
+
+const preloadStates = new WeakMap<object, PreloadState>();
+
+function preloadState(host: IpcHost): PreloadState {
+  const key = host as object;
+  let state = preloadStates.get(key);
+  if (!state) {
+    state = { firstMessageSeen: false, waiters: new Set() };
+    preloadStates.set(key, state);
+  }
+  return state;
+}
+
+export function waitForWorkerIpcPreloadMessage(
+  host: IpcHost,
+  timeoutMs: number,
+): Promise<boolean> {
+  const state = preloadState(host);
+  if (state.firstMessageSeen) return Promise.resolve(true);
+  return new Promise(resolve => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (seen: boolean): void => {
+      if (timer) clearTimeout(timer);
+      state.waiters.delete(finish);
+      resolve(seen);
+    };
+    state.waiters.add(finish);
+    timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+  });
+}
 
 function ordinaryColdStartTurnId(raw: unknown): string | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const message = raw as Record<string, unknown>;
+  const turnId = typeof message.turnId === 'string' ? message.turnId : undefined;
   if (
     message.type !== 'init'
     || message.adoptMode === true
     || message.dispatchAttempt !== undefined
     || typeof message.prompt !== 'string'
     || message.prompt.length === 0
-    || typeof message.turnId !== 'string'
-    || !message.turnId.startsWith('om_')
+    || !isOrdinaryImTurnId(turnId)
   ) {
     return undefined;
   }
-  return message.turnId;
+  return turnId;
 }
 
 /**
@@ -29,10 +66,21 @@ function ordinaryColdStartTurnId(raw: unknown): string | undefined {
  */
 export function installWorkerIpcPreload(host: IpcHost): void {
   const bufferedMessages: unknown[] = [];
+  const state = preloadState(host);
   let replaying = false;
 
   const bufferMessage = (raw: unknown): void => {
     if (replaying) return;
+    state.firstMessageSeen = true;
+    for (const waiter of [...state.waiters]) waiter(true);
+    if (
+      raw
+      && typeof raw === 'object'
+      && (raw as Record<string, unknown>).type === 'worker_ipc_probe'
+    ) {
+      host.send?.({ type: 'worker_ipc_ready' });
+      return;
+    }
     bufferedMessages.push(raw);
     const turnId = ordinaryColdStartTurnId(raw);
     if (turnId) host.send?.({ type: 'turn_input_received', turnId });

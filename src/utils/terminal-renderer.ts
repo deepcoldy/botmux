@@ -44,7 +44,7 @@ const SNAPSHOT_COLS = 320;
  */
 export function readViewportText(
   terminal: InstanceType<typeof Terminal>,
-  opts: { filter: boolean; readCols?: number; startY?: number; rows?: number },
+  opts: { filter: boolean; readCols?: number; startY?: number; rows?: number; preserveFormatting?: boolean },
 ): string {
   const buffer = terminal.buffer.active;
   const readCols = Math.min(opts.readCols ?? SNAPSHOT_COLS, terminal.cols);
@@ -56,7 +56,8 @@ export function readViewportText(
   for (let y = baseY; y < endY; y++) {
     const line = buffer.getLine(y);
     if (!line) continue;
-    const s = cleanBoxDrawing(line.translateToString(true, 0, readCols));
+    const text = line.translateToString(true, 0, readCols);
+    const s = opts.preserveFormatting ? text : cleanBoxDrawing(text);
     if (opts.filter && (BARE_PROMPT_RE.test(s) || INPUT_ECHO_RE.test(s))) continue;
     lines.push(s);
   }
@@ -114,9 +115,11 @@ export class TerminalRenderer {
   /**
    * Raw viewport snapshot — no line filtering. Used by usage-limit detection
    * and the CoCo picker, which need the full screen including ❯ cursor lines.
+   * preserveFormatting retains box borders and column spacing for structural
+   * recognizers; the default keeps the existing display-oriented cleanup.
    */
-  rawSnapshot(): string {
-    return this.readViewport(false);
+  rawSnapshot(opts: { preserveFormatting?: boolean } = {}): string {
+    return readViewportText(this.terminal, { filter: false, ...opts });
   }
 
   private readViewport(filter: boolean): string {

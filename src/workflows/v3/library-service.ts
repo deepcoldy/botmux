@@ -11,7 +11,7 @@
 
 import type { BotConfig } from '../../bot-registry.js';
 import { createHash } from 'node:crypto';
-import { existsSync, promises as fs, readFileSync } from 'node:fs';
+import { existsSync, promises as fs, readFileSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import type { RawParamInput } from '../shared/params.js';
@@ -55,10 +55,17 @@ import {
 import { isValidRunId } from './ops-projection.js';
 import { readJournal } from './journal.js';
 import { materialize } from './state.js';
-import { readGrillState } from './grill-state.js';
+import { readGrillState, type RunChatBinding } from './grill-state.js';
 import { loadDag } from './dag-loader.js';
 import { validateSpec } from './spec.js';
-import { parseFrozenBotSnapshots } from './bot-resolve.js';
+import { freezeDagBotSnapshots, parseFrozenBotSnapshots } from './bot-resolve.js';
+import type { V3Dag } from './dag.js';
+import {
+  resolveV3NodeExecutor,
+  v3BotExecutorTargets,
+  type V3NodeExecutorPolicy,
+  type V3NodeExecutorResolution,
+} from './node-executor-mode.js';
 
 export interface SavedWorkflowActorContext {
   actor: SavedWorkflowOwner;
@@ -72,16 +79,34 @@ export interface SavedWorkflowActorContext {
 export type SavedWorkflowServiceErrorCode =
   | 'invalid_context'
   | 'source_not_owned'
+  // A candidate that passed ownership but is not yet terminal (still running /
+  // cancelling / cancelled). Kept distinct from `invalid_context` so the `last`
+  // resolver can surface an owned-but-unfinished run without falling back to a
+  // misleading "not found", while malformed/no-runStarted candidates (which
+  // stay `invalid_context`) are still silently dropped.
+  | 'source_not_terminal'
   | 'scope_mismatch'
   | 'not_found'
   | 'ambiguous'
-  | 'not_published';
+  | 'not_published'
+  /** Bot execution is on but a node's bot fails §6.1 (design §6.3). */
+  | 'executor_ineligible';
+
+/** Structured detail for `source_not_terminal`, so callers never string-match
+ *  the message. `waitingNode` is set when the run is parked on a human gate. */
+export interface SourceNotTerminalDetail {
+  runId: string;
+  runStatus: string;
+  waitingNode?: string;
+  createdAt?: string;
+}
 
 export class SavedWorkflowServiceError extends Error {
   constructor(
     public readonly code: SavedWorkflowServiceErrorCode,
     message: string,
     public readonly matches: SavedWorkflowMetadata[] = [],
+    public readonly detail?: SourceNotTerminalDetail,
   ) {
     super(message);
     this.name = 'SavedWorkflowServiceError';
@@ -285,6 +310,9 @@ export interface InstantiatePublishedSavedWorkflowInput {
   baseDir: string;
   runId?: string;
   now?: Date;
+  /** Experimental node executor decision (design §6.3). Omitted = today's
+   *  ephemeral execution without consulting any switch. */
+  nodeExecutorPolicy?: V3NodeExecutorPolicy;
 }
 
 export interface ResolveOwnedTerminalRunInput {
@@ -304,14 +332,32 @@ function terminalSourceStatus(runDir: string, runId: string): TerminalSourceStat
       `Run '${runId}' has no single matching runStarted identity`,
     );
   }
-  const status = materialize(events).runStatus;
+  const snapshot = materialize(events);
+  const status = snapshot.runStatus;
   if (status !== 'succeeded' && status !== 'failed' && status !== 'blocked') {
+    // Owned-but-unfinished: distinct code + structured detail so the `last`
+    // resolver can report the real reason (and node-level gate) instead of a
+    // misleading "not found", and downstream never string-matches this message.
+    const waitingNode = firstGateWaitingNode(snapshot);
     throw new SavedWorkflowServiceError(
-      'invalid_context',
-      `Run '${runId}' is not terminal (status=${status})`,
+      'source_not_terminal',
+      waitingNode
+        ? `run ${runId} 还没结束，status=${status}（正在等待 ${waitingNode} 的人工审批），跑完后再 save`
+        : `run ${runId} 还没结束，status=${status}，跑完后再 save`,
+      [],
+      { runId, runStatus: status, ...(waitingNode ? { waitingNode } : {}) },
     );
   }
   return status;
+}
+
+/** First node parked on a human gate (`gateWaiting`), if any — surfaced so the
+ *  "not terminal" message can name what the run is waiting on. */
+function firstGateWaitingNode(snapshot: ReturnType<typeof materialize>): string | undefined {
+  for (const [nodeId, state] of snapshot.nodes) {
+    if (state.status === 'gateWaiting') return nodeId;
+  }
+  return undefined;
 }
 
 /**
@@ -441,6 +487,12 @@ export async function resolveOwnedTerminalRunDir(
     throw err;
   }
   const candidates: Array<{ runDir: string; createdAt: string; runId: string }> = [];
+  // Owned runs rejected *only* for being non-terminal. Kept separate so that
+  // when there is no saveable terminal run we can point at the real reason
+  // instead of a misleading "not found". Ownership is proven before this point
+  // (assertSourceOwnedByCaller runs before terminalSourceStatus), so nothing
+  // here belongs to another actor.
+  const nonTerminal: Array<{ mtimeMs: number; error: SavedWorkflowServiceError }> = [];
   for (const runId of names) {
     if (!isValidRunId(runId)) continue;
     const runDir = join(input.baseDir, runId);
@@ -449,12 +501,35 @@ export async function resolveOwnedTerminalRunDir(
       if (!stat.isDirectory()) continue;
       const candidate = loadOwnedTerminalRunForSave(runDir, context);
       candidates.push({ runDir, createdAt: candidate.loaded.envelope.createdAt, runId });
-    } catch { /* malformed/incomplete candidate is not "last terminal" */ }
+    } catch (err) {
+      // Only owned-but-non-terminal candidates may inform the error. Every other
+      // failure — malformed run.json, missing runStarted identity, and crucially
+      // `source_not_owned` — is silently dropped so we never leak another actor's
+      // runId in a shared chat.
+      if (err instanceof SavedWorkflowServiceError && err.code === 'source_not_terminal') {
+        nonTerminal.push({ mtimeMs: safeRunDirMtimeMs(runDir), error: err });
+      }
+      /* malformed/incomplete/foreign candidate is not "last terminal" */
+    }
   }
   candidates.sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt) || b.runId.localeCompare(a.runId));
-  if (candidates.length === 0) throw notFound('last run');
+  if (candidates.length === 0) {
+    // No saveable terminal run. If the only reason we have nothing is an owned
+    // run that simply hasn't finished, surface that (most recent first) rather
+    // than "not found" — but never mention a run that failed ownership.
+    if (nonTerminal.length > 0) {
+      nonTerminal.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      throw nonTerminal[0]!.error;
+    }
+    throw notFound('last run');
+  }
   return candidates[0]!.runDir;
+}
+
+/** Best-effort mtime for ordering non-terminal candidates; 0 if unreadable. */
+function safeRunDirMtimeMs(runDir: string): number {
+  try { return statSync(runDir).mtimeMs; } catch { return 0; }
 }
 
 /**
@@ -638,7 +713,7 @@ export async function loadVisibleSavedWorkflow(
 /** Resolve the active revision and atomically materialize a fresh authorized run. */
 export async function instantiatePublishedSavedWorkflow(
   input: InstantiatePublishedSavedWorkflowInput,
-): Promise<MaterializedSavedWorkflowRun> {
+): Promise<MaterializedSavedWorkflowRun & { executorNote?: string }> {
   const context = requireActorContext(input.context, { requireChat: true });
   const resolved = await resolveVisibleSavedWorkflow({
     dataDir: input.dataDir,
@@ -679,26 +754,47 @@ export async function instantiatePublishedSavedWorkflow(
     );
   }
 
-  return materializeSavedWorkflowRun({
+  const chatBinding: RunChatBinding = {
+    larkAppId: context.actor.larkAppId,
+    chatId: context.chatId!,
+    ...(context.chatType ? { chatType: context.chatType } : {}),
+    ...(context.rootMessageId ? { rootMessageId: context.rootMessageId } : {}),
+    ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+    ownerOpenId: context.actor.openId,
+  };
+  const executor: V3NodeExecutorResolution = input.nodeExecutorPolicy
+    ? await resolveV3NodeExecutor({
+        policy: input.nodeExecutorPolicy,
+        binding: chatBinding,
+        targetsFor: (binding) => {
+          // Same freeze the materializer applies for a bot run.
+          const templateDag = { runId: 'executor-plan', nodes: current.revision.payload.dagTemplate.nodes } as V3Dag;
+          return v3BotExecutorTargets(templateDag, freezeDagBotSnapshots(templateDag, input.bots, {
+            defaultSelector: binding.larkAppId,
+          }));
+        },
+      })
+    : { kind: 'ephemeral' };
+  if (executor.kind === 'refused') {
+    throw new SavedWorkflowServiceError('executor_ineligible', executor.message);
+  }
+
+  const materialized = materializeSavedWorkflowRun({
     metadata: current.metadata,
     revision: current.revision,
     rawParams: input.rawParams,
     context: {
       initiatorOpenId: context.actor.openId,
-      chatBinding: {
-        larkAppId: context.actor.larkAppId,
-        chatId: context.chatId!,
-        ...(context.chatType ? { chatType: context.chatType } : {}),
-        ...(context.rootMessageId ? { rootMessageId: context.rootMessageId } : {}),
-        ...(context.sessionId ? { sessionId: context.sessionId } : {}),
-        ownerOpenId: context.actor.openId,
-      },
+      chatBinding,
     },
     bots: input.bots,
     baseDir: input.baseDir,
     runId: input.runId,
     now: input.now,
+    ...(executor.kind === 'bot' ? { nodeExecutor: 'bot' as const } : {}),
   });
+  const executorNote = executor.kind === 'bot' ? executor.summary : executor.note;
+  return executorNote ? { ...materialized, executorNote } : materialized;
 }
 
 function requireActorContext(

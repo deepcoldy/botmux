@@ -6,7 +6,6 @@ import {
   maskAppSecret,
   parseSetupCommand,
   SETUP_CLI_USAGE,
-  cliSelectionKeys,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
 
@@ -92,6 +91,14 @@ describe('parseSetupCommand', () => {
       action: 'edit',
       selector: 'botmux-0',
       flags: { cliRuntime: '-' },
+    });
+  });
+
+  it('parses --lang flag', () => {
+    const res = parseSetupCommand(['add', '--app-id', 'cli_123', '--lang', 'en']);
+    expect(res).toMatchObject({
+      action: 'add',
+      flags: { lang: 'en' },
     });
   });
 
@@ -216,7 +223,6 @@ describe('buildBotFromAddFlags', () => {
   });
 
   it('accepts the documented traecli command name as TRAE CLI 2.0', () => {
-    expect(cliSelectionKeys()).toContain('traecli');
     expect(SETUP_CLI_USAGE).toContain('traecli 映射到 TRAE CLI 2.0');
     expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'traecli' })).toMatchObject({
       cliId: 'traex',
@@ -224,8 +230,24 @@ describe('buildBotFromAddFlags', () => {
     expect(editInputFromFlags({ cli: 'traecli' })).toEqual({
       cliChoice: 'traex',
       wrapperCli: null,
+      cliLaunchMode: null,
       cliRuntime: null,
     });
+  });
+
+  it('builds Forge x TraeX as TraeX plus a first-class launch mode', () => {
+    const bot = buildBotFromAddFlags({ ...REQUIRED, cli: 'forge-x-traex' });
+    expect(bot.cliId).toBe('traex');
+    expect(bot.cliLaunchMode).toBe('forge-traex');
+    expect(bot.wrapperCli).toBeUndefined();
+  });
+
+  it('rejects combining Forge x TraeX with an explicit wrapper in add', () => {
+    expect(() => buildBotFromAddFlags({
+      ...REQUIRED,
+      cli: 'forge-x-traex',
+      wrapperCli: 'aiden x traex',
+    })).toThrow(/不能与 --wrapper-cli 同时使用/);
   });
 
   it('builds a Codex-compatible runtime from --cli-runtime JSON', () => {
@@ -301,6 +323,11 @@ describe('buildBotFromAddFlags', () => {
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'false' }).showInTeam).toBe(false);
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'true' }).showInTeam).toBeUndefined();
   });
+
+  it('stores lang when specified', () => {
+    expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'en' }).lang).toBe('en');
+    expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'zh' }).lang).toBe('zh');
+  });
 });
 
 describe('editInputFromFlags', () => {
@@ -316,11 +343,30 @@ describe('editInputFromFlags', () => {
     });
   });
 
+  it('maps lang and handles clear', () => {
+    expect(editInputFromFlags({ lang: 'en' })).toEqual({ lang: 'en' });
+    expect(editInputFromFlags({ lang: '-' })).toEqual({ lang: '-' });
+    const bot = applyBotConfigEdits({ larkAppId: 'cli_1', larkAppSecret: 'sec', allowedUsers: ['a@b.com'], lang: 'en' }, { lang: '-' });
+    expect(bot.lang).toBeUndefined();
+  });
+
   it('clears wrapperCli when switching to a plain cli, keeps it for gateway keys', () => {
-    expect(editInputFromFlags({ cli: 'codex' })).toEqual({ cliChoice: 'codex', wrapperCli: null, cliRuntime: null });
+    expect(editInputFromFlags({ cli: 'codex' })).toEqual({
+      cliChoice: 'codex',
+      wrapperCli: null,
+      cliLaunchMode: null,
+      cliRuntime: null,
+    });
     expect(editInputFromFlags({ cli: 'ttadk-x-codex' })).toEqual({
       cliChoice: 'codex',
       wrapperCli: 'ttadk codex',
+      cliLaunchMode: null,
+      cliRuntime: null,
+    });
+    expect(editInputFromFlags({ cli: 'forge-x-traex' })).toEqual({
+      cliChoice: 'traex',
+      wrapperCli: null,
+      cliLaunchMode: 'forge-traex',
       cliRuntime: null,
     });
   });
@@ -329,8 +375,16 @@ describe('editInputFromFlags', () => {
     expect(editInputFromFlags({ cli: 'codex', wrapperCli: 'cjadk codex' })).toEqual({
       cliChoice: 'codex',
       wrapperCli: 'cjadk codex',
+      cliLaunchMode: null,
       cliRuntime: null,
     });
+  });
+
+  it('rejects combining Forge x TraeX with an explicit wrapper in edit', () => {
+    expect(() => editInputFromFlags({
+      cli: 'forge-x-traex',
+      wrapperCli: 'aiden x traex',
+    })).toThrow(/不能与 --wrapper-cli 同时使用/);
   });
 
   it('passes tri-state clears through and rejects brand on edit', () => {
@@ -368,6 +422,31 @@ describe('editInputFromFlags', () => {
     const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'claude-code' }));
     expect(updated.cliId).toBe('claude-code');
     expect(updated.cliRuntime).toBeUndefined();
+    expect(updated.cliPathOverride).toBeUndefined();
+  });
+
+  it('clears a stored Forge launch mode when an edit switches back to plain TraeX', () => {
+    const base = {
+      larkAppId: 'cli_x',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex' as const,
+    };
+    const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'traex' }));
+    expect(updated.cliId).toBe('traex');
+    expect(updated.cliLaunchMode).toBeUndefined();
+  });
+
+  it('clears a stale legacy cliPathOverride when switching to Forge x TraeX', () => {
+    const base = {
+      larkAppId: 'cli_x',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliPathOverride: '/opt/legacy/traex',
+    };
+    const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'forge-x-traex' }));
+    expect(updated.cliId).toBe('traex');
+    expect(updated.cliLaunchMode).toBe('forge-traex');
     expect(updated.cliPathOverride).toBeUndefined();
   });
 });

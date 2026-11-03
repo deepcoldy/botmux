@@ -14,6 +14,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   tenantRequest: vi.fn(),
+  getTenantAccessToken: vi.fn(),
   resolveUserToken: vi.fn(),
 }));
 
@@ -23,7 +24,15 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app-test', larkAppSecret: 'secret-test', brand: 'feishu' },
   })),
-  getBotClient: vi.fn(() => ({ request: mocks.tenantRequest })),
+  getBotClient: vi.fn(() => ({
+    tokenManager: { getTenantAccessToken: mocks.getTenantAccessToken },
+    request: async (payload: unknown, options?: { lark?: Record<PropertyKey, unknown> }) => {
+      const hasPresetSdkToken = options?.lark
+        && Reflect.ownKeys(options.lark).some(key => typeof key === 'symbol' && !!options.lark?.[key]);
+      if (!hasPresetSdkToken) await mocks.getTenantAccessToken();
+      return mocks.tenantRequest(payload, options);
+    },
+  })),
   loadBotConfigs: vi.fn(() => []),
 }));
 
@@ -35,7 +44,11 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), error: vi.fn(), info: vi.fn(), warn: vi.fn() },
 }));
 
-import { addCommentReaction, addCommentReactionChecked } from '../src/im/lark/doc-comment.js';
+import {
+  addCommentReaction,
+  addCommentReactionChecked,
+  removeCommentReaction,
+} from '../src/im/lark/doc-comment.js';
 
 const FILE = { fileToken: 'DocToken1234567890123456', fileType: 'docx' };
 const COMMENT_ID = '7681622822925421500';
@@ -44,6 +57,7 @@ const REPLY_ID = '7681633934731430857';
 describe('addCommentReaction 的身份选择', () => {
   beforeEach(() => {
     mocks.tenantRequest.mockReset();
+    mocks.getTenantAccessToken.mockReset().mockResolvedValue('tenant-token-live');
     // user token 存在且可用 —— 只有这样「有没有回退」才是可观测的：
     // 若代码真的回退，fetch 会被调用；tenantOnly 下它必须一次都不被调。
     mocks.resolveUserToken.mockReset().mockResolvedValue('u-token-live');
@@ -114,6 +128,7 @@ describe('addCommentReaction 的身份选择', () => {
 describe('driveApiCall: userOnly 与 tenantOnly 互斥', () => {
   beforeEach(() => {
     mocks.tenantRequest.mockReset();
+    mocks.getTenantAccessToken.mockReset().mockResolvedValue('tenant-token-live');
     mocks.resolveUserToken.mockReset().mockResolvedValue('u-token-live');
     vi.unstubAllGlobals();
   });
@@ -136,6 +151,117 @@ describe('driveApiCall: userOnly 与 tenantOnly 互斥', () => {
   });
 });
 
+describe('driveApiCall 的 provider 请求边界', () => {
+  beforeEach(() => {
+    mocks.tenantRequest.mockReset();
+    mocks.getTenantAccessToken.mockReset().mockResolvedValue('tenant-token-live');
+    mocks.resolveUserToken.mockReset().mockResolvedValue(null);
+    vi.unstubAllGlobals();
+  });
+
+  it('tenant token 获取失败发生在请求 checkpoint 之前', async () => {
+    const { __testOnly_driveApiCall } = await import('../src/im/lark/doc-comment.js') as any;
+    const started = vi.fn();
+    const notDelivered = vi.fn();
+    mocks.getTenantAccessToken.mockRejectedValue(new Error('tenant token unavailable'));
+
+    await expect(__testOnly_driveApiCall('app-test', {
+      method: 'POST',
+      path: '/open-apis/drive/v1/files/doc/comments/comment/replies',
+      preferTenant: true,
+      providerRequestStarted: started,
+      providerRequestNotDelivered: notDelivered,
+    })).rejects.toThrow('tenant token unavailable');
+
+    expect(started).not.toHaveBeenCalled();
+    expect(notDelivered).not.toHaveBeenCalled();
+    expect(mocks.tenantRequest).not.toHaveBeenCalled();
+  });
+
+  it('预取 tenant token 后 SDK request 不再二次获取 token', async () => {
+    const { __testOnly_driveApiCall } = await import('../src/im/lark/doc-comment.js') as any;
+    const started = vi.fn();
+    mocks.getTenantAccessToken
+      .mockResolvedValueOnce('tenant-token-prefetched')
+      .mockRejectedValueOnce(new Error('unexpected second token lookup'));
+    mocks.tenantRequest.mockResolvedValue({ code: 0, data: {} });
+
+    await expect(__testOnly_driveApiCall('app-test', {
+      method: 'POST',
+      path: '/open-apis/drive/v1/files/doc/comments/comment/replies',
+      preferTenant: true,
+      providerRequestStarted: started,
+    })).resolves.toMatchObject({ code: 0 });
+
+    expect(mocks.getTenantAccessToken).toHaveBeenCalledTimes(1);
+    expect(started).toHaveBeenCalledTimes(1);
+    expect(mocks.tenantRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('provider HTTP 5xx 不能证明请求未落地，保留未知 checkpoint', async () => {
+    const { __testOnly_driveApiCall } = await import('../src/im/lark/doc-comment.js') as any;
+    const started = vi.fn();
+    const notDelivered = vi.fn();
+    mocks.tenantRequest.mockRejectedValue({ response: { status: 500 } });
+
+    await expect(__testOnly_driveApiCall('app-test', {
+      method: 'POST',
+      path: '/open-apis/drive/v1/files/doc/comments/comment/replies',
+      tenantOnly: true,
+      providerRequestStarted: started,
+      providerRequestNotDelivered: notDelivered,
+    })).rejects.toMatchObject({ response: { status: 500 } });
+
+    expect(started).toHaveBeenCalledTimes(1);
+    expect(notDelivered).not.toHaveBeenCalled();
+  });
+
+  it('tenant-first 的 provider HTTP 5xx 不回退 user 发送', async () => {
+    const { __testOnly_driveApiCall } = await import('../src/im/lark/doc-comment.js') as any;
+    const started = vi.fn();
+    const notDelivered = vi.fn();
+    mocks.resolveUserToken.mockResolvedValue('user-token-live');
+    mocks.tenantRequest.mockRejectedValue({ response: { status: 500 } });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(__testOnly_driveApiCall('app-test', {
+      method: 'POST',
+      path: '/open-apis/drive/v1/files/doc/comments/comment/replies',
+      preferTenant: true,
+      providerRequestStarted: started,
+      providerRequestNotDelivered: notDelivered,
+    })).rejects.toMatchObject({ response: { status: 500 } });
+
+    expect(started).toHaveBeenCalledTimes(1);
+    expect(notDelivered).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('user provider HTTP 4xx 明确拒绝时清除 checkpoint', async () => {
+    const { __testOnly_driveApiCall } = await import('../src/im/lark/doc-comment.js') as any;
+    const started = vi.fn();
+    const notDelivered = vi.fn();
+    mocks.resolveUserToken.mockResolvedValue('user-token-live');
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      status: 422,
+      ok: false,
+      json: async () => ({ code: 123, msg: 'invalid request' }),
+    })));
+
+    await expect(__testOnly_driveApiCall('app-test', {
+      method: 'POST',
+      path: '/open-apis/drive/v1/files/doc/comments/comment/replies',
+      userOnly: true,
+      providerRequestStarted: started,
+      providerRequestNotDelivered: notDelivered,
+    })).rejects.toThrow('HTTP 422');
+
+    expect(started).toHaveBeenCalledTimes(1);
+    expect(notDelivered).toHaveBeenCalledTimes(1);
+  });
+});
+
 /**
  * `addCommentReactionChecked` 的 `ok` 必须反映**服务端真实结果**，不能用
  * `reactionId` 是否存在来推断 —— 飞书官方 `update_reaction` 的响应体是空对象、
@@ -145,6 +271,7 @@ describe('driveApiCall: userOnly 与 tenantOnly 互斥', () => {
 describe('addCommentReactionChecked: ok 反映真实服务端结果', () => {
   beforeEach(() => {
     mocks.tenantRequest.mockReset();
+    mocks.getTenantAccessToken.mockReset().mockResolvedValue('tenant-token-live');
     mocks.resolveUserToken.mockReset().mockResolvedValue(null);
     vi.unstubAllGlobals();
   });
@@ -152,14 +279,13 @@ describe('addCommentReactionChecked: ok 反映真实服务端结果', () => {
   it('code=0 但响应体不带 reaction_id ⇒ ok=true（官方 schema 就是空对象）', async () => {
     mocks.tenantRequest.mockResolvedValue({ code: 0, data: {} });
     const res = await addCommentReactionChecked('app-test', FILE, COMMENT_ID, REPLY_ID, 'ERROR', { tenantOnly: true });
-    expect(res.ok).toBe(true);
-    expect(res.reactionId).toBeUndefined();
+    expect(res).toEqual({ ok: true, reactionId: undefined, identity: 'tenant' });
   });
 
   it('code=0 且带 reaction_id ⇒ ok=true 并透出 id', async () => {
     mocks.tenantRequest.mockResolvedValue({ code: 0, data: { reaction_id: 'r-9' } });
     const res = await addCommentReactionChecked('app-test', FILE, COMMENT_ID, REPLY_ID, 'ERROR', { tenantOnly: true });
-    expect(res).toEqual({ ok: true, reactionId: 'r-9' });
+    expect(res).toEqual({ ok: true, reactionId: 'r-9', identity: 'tenant' });
   });
 
   it('请求抛错 ⇒ ok=false（tenantOnly 下 code!=0 也会抛）', async () => {
@@ -171,5 +297,76 @@ describe('addCommentReactionChecked: ok 反映真实服务端结果', () => {
   it('旧签名 addCommentReaction 行为不变（仍返回 reactionId | undefined）', async () => {
     mocks.tenantRequest.mockResolvedValue({ code: 0, data: { reaction_id: 'r-legacy' } });
     await expect(addCommentReaction('app-test', FILE, COMMENT_ID, REPLY_ID, 'Typing')).resolves.toBe('r-legacy');
+  });
+});
+
+describe('removeCommentReaction: 用 update_reaction 的 delete 语义清理', () => {
+  beforeEach(() => {
+    mocks.tenantRequest.mockReset().mockResolvedValue({ code: 0, data: {} });
+    mocks.getTenantAccessToken.mockReset().mockResolvedValue('tenant-token-live');
+    mocks.resolveUserToken.mockReset().mockResolvedValue('u-token-live');
+    vi.unstubAllGlobals();
+  });
+
+  it('tenant 创建的 Typing 用同一身份和 reaction_type 撤回，不依赖 reaction_id', async () => {
+    await removeCommentReaction(
+      'app-test',
+      FILE,
+      COMMENT_ID,
+      REPLY_ID,
+      'Typing',
+      { identity: 'tenant' },
+    );
+
+    expect(mocks.tenantRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'POST',
+        url: `/open-apis/drive/v2/files/${FILE.fileToken}/comments/reaction`,
+        params: { file_type: FILE.fileType },
+        data: { action: 'delete', reply_id: REPLY_ID, reaction_type: 'Typing' },
+      }),
+      undefined,
+    );
+  });
+
+  it('user fallback 创建的 Typing 用 user 身份撤回', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: async () => ({ code: 0, data: {} }),
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await removeCommentReaction(
+      'app-test',
+      FILE,
+      COMMENT_ID,
+      REPLY_ID,
+      'Typing',
+      { identity: 'user' },
+    );
+
+    expect(mocks.tenantRequest).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`/open-apis/drive/v2/files/${FILE.fileToken}/comments/reaction?file_type=docx`),
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ action: 'delete', reply_id: REPLY_ID, reaction_type: 'Typing' }),
+      }),
+    );
+  });
+
+  it('旧持久化目标没有身份时同时清理 tenant 和 user，避免遗留表情', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: async () => ({ code: 0, data: {} }),
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await removeCommentReaction('app-test', FILE, COMMENT_ID, REPLY_ID, 'Typing');
+
+    expect(mocks.tenantRequest).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });

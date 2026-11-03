@@ -18,6 +18,9 @@ import type {
   TurnTimelineTurn,
 } from '../../services/insight/types.js';
 import { botDisplayName, escapeHtml, relTime, t } from './ui.js';
+import { INSIGHT_TABS, INSIGHT_TAB_KEYS, type InsightTab } from './insight-tabs.js';
+
+export { INSIGHT_TABS, INSIGHT_TAB_KEYS, type InsightTab };
 
 export type InsightFilter = 'all' | 'review' | 'failed' | 'slow';
 
@@ -28,7 +31,6 @@ export type InsightRecord = {
 };
 
 export type ScopeOpts = { project?: string; sinceMs?: number; analyzableOnly?: boolean };
-export type InsightTab = 'overview' | 'sessions' | 'flow' | 'dist' | 'hot';
 export type SessSort = 'recent' | 'review' | 'spans' | 'fails' | 'slow' | 'agent';
 export type DetailTab = 'spans' | 'ledger' | 'convo';
 export type LedgerSender = 'all' | 'user' | 'a2a_agent' | 'system';
@@ -84,13 +86,6 @@ export type ConvoUnit =
 export const SEVERITY_RANK: Record<InsightSeverity, number> = { bad: 0, warn: 1, info: 2 };
 export const INSIGHT_PHASES: InsightPhase[] = ['research', 'edit', 'run', 'delegate', 'discuss'];
 export const FLOW_PHASES = ['research', 'edit', 'run', 'delegate', 'discuss'] as const;
-export const INSIGHT_TABS: Array<{ key: InsightTab; label: string }> = [
-  { key: 'overview', label: 'insights.tabOverview' },
-  { key: 'sessions', label: 'insights.tabSessions' },
-  { key: 'flow', label: 'insights.tabFlow' },
-  { key: 'dist', label: 'insights.tabDist' },
-  { key: 'hot', label: 'insights.tabHot' },
-];
 export const TIME_WINDOWS: Array<{ key: string; label: string; days: number }> = [
   { key: 'all', label: 'insights.timeAll', days: 0 },
   { key: '1d', label: 'insights.time1d', days: 1 },
@@ -98,7 +93,6 @@ export const TIME_WINDOWS: Array<{ key: string; label: string; days: number }> =
   { key: '30d', label: 'insights.time30d', days: 30 },
 ];
 export const INSIGHT_FILTERS: InsightFilter[] = ['all', 'review', 'failed', 'slow'];
-export const INSIGHT_TAB_KEYS: InsightTab[] = ['overview', 'sessions', 'flow', 'dist', 'hot'];
 export const SESS_SORTS: Array<{ key: SessSort; label: string }> = [
   { key: 'recent', label: 'insights.sortRecent' },
   { key: 'review', label: 'insights.sortReview' },
@@ -169,36 +163,6 @@ export function translatedOrFallback(key: string, fallback: string): string {
 
 export function suggestionTitle(s: Pick<SafeInsightSuggestion, 'id' | 'title'> | Pick<SafeInsightOverviewSuggestion, 'id' | 'title'>): string {
   return translatedOrFallback(`insights.suggestion.${s.id}.title`, s.title);
-}
-
-export function suggestionAction(s: Pick<SafeInsightSuggestion, 'id' | 'action'> | Pick<SafeInsightOverviewSuggestion, 'id' | 'action'>): string {
-  return translatedOrFallback(`insights.suggestion.${s.id}.action`, s.action);
-}
-
-export function localizeEvidence(text: string): string {
-  let m = text.match(/^(\d+) failed spans$/);
-  if (m) return t('insights.evidence.failedSpans', { count: m[1] });
-  m = text.match(/^(.+) failed (\d+) times$/);
-  if (m) return t('insights.evidence.toolFailedTimes', { tool: m[1], count: m[2] });
-  if (text === 'multiple tools failed') return t('insights.evidence.multipleToolsFailed');
-  m = text.match(/^(.+) ran for (\d+)s$/);
-  if (m) return t('insights.evidence.toolRanSeconds', { tool: m[1], seconds: m[2] });
-  m = text.match(/^read\/write ratio ([\d.]+)$/);
-  if (m) return t('insights.evidence.readWriteRatio', { ratio: m[1] });
-  m = text.match(/^compactions (\d+)$/);
-  if (m) return t('insights.evidence.compactions', { count: m[1] });
-  m = text.match(/^(\d+) spans analyzed$/);
-  if (m) return t('insights.evidence.spansAnalyzed', { count: m[1] });
-  return text;
-}
-
-export function localizeReason(reason: string): string {
-  return reason
-    .split(/\s*[;；]\s*/)
-    .map(c => c.trim().replace(/[.。]\s*$/, ''))
-    .filter(Boolean)
-    .map(localizeEvidence)
-    .join('；');
 }
 
 export function phaseLabel(phase: string): string {
@@ -464,6 +428,7 @@ export function cleanPromptText(raw: string): string {
   let s = raw
     .replace(/<(mentions|attachments|available_bots|system-reminder|quoted_messages|sender)\b[\s\S]*?<\/\1>/g, ' ')
     .replace(/<botmux_reminder>[\s\S]*?<\/botmux_reminder>/g, ' ')
+    .replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, ' ')
     .replace(/<\/?(user_message|local-command-[a-z]+)>/g, ' ')
     .replace(/<sender\b[^>]*\/?>/g, ' ')
     .replace(/<mention\b[^>]*\/?>/g, ' ')

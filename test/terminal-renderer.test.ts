@@ -52,6 +52,21 @@ describe('resolveRenderDimensions (worker init helper)', () => {
 });
 
 describe('TerminalRenderer width matches source pane', () => {
+  it('preserves cell boundaries only when requested by structural screen recognizers', async () => {
+    const r = new TerminalRenderer(80, 24);
+    try {
+      await r.writeAndFlush('│ model:    custom-model │\r\n❯\r\n❯ draft');
+      expect(r.rawSnapshot({ preserveFormatting: true }))
+        .toBe('│ model:    custom-model │\n❯\n❯ draft');
+      // Existing Claude/picker consumers still see the same cleaned prompt,
+      // and cards still hide prompt/input rows independently of this opt-in.
+      expect(r.rawSnapshot()).toBe(' model: custom-model\n❯\n❯ draft');
+      expect(r.snapshot().content).toBe(' model: custom-model');
+    } finally {
+      r.dispose();
+    }
+  });
+
   it('writeAndFlush resolves only after the xterm buffer contains the write', async () => {
     const r = new TerminalRenderer(80, 24);
     await r.writeAndFlush('FLUSHED_VIEWPORT');

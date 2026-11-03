@@ -35,6 +35,45 @@ export function resolveQuoteTarget(args: QuoteTargetArgs): string | null {
   return target && target.trim() ? target.trim() : null;
 }
 
+export interface ExplicitRecipientReplyArgs {
+  /** --quote is intentional routing and must always win. */
+  explicitQuote?: string;
+  /** Resolved real @ recipients for this outbound message. */
+  mentionOpenIds: Iterable<string>;
+  /** Sender of the inbound message this turn is replying to, when known. */
+  replyTargetSenderOpenId?: string;
+}
+
+/**
+ * An explicit recipient selection replaces the implicit reply addressee.
+ *
+ * This keeps a handoff or user-directed result from also notifying the bot (or
+ * human) that happened to trigger the turn. Explicitly mentioning that sender,
+ * or explicitly choosing --quote, preserves the reply relationship.
+ */
+export function shouldSuppressImplicitReplyTarget(args: ExplicitRecipientReplyArgs): boolean {
+  if (args.explicitQuote?.trim()) return false;
+  const recipients = new Set([...args.mentionOpenIds].filter(Boolean));
+  if (recipients.size === 0) return false;
+  return !args.replyTargetSenderOpenId || !recipients.has(args.replyTargetSenderOpenId);
+}
+
+export interface MentionableChatMember {
+  openId: string;
+  name?: string;
+}
+
+/** Resolve only an exact, unique display-name match inside the target chat. */
+export function matchUniqueChatMemberOpenId(
+  displayName: string,
+  members: Iterable<MentionableChatMember>,
+): string | undefined {
+  const wanted = displayName.trim();
+  if (!wanted) return undefined;
+  const matches = [...members].filter(member => member.name?.trim() === wanted);
+  return matches.length === 1 ? matches[0].openId : undefined;
+}
+
 export interface AfterTheFactTopicQuoteArgs {
   /** The message id this send would quote (null ⇒ nothing to decide). */
   quoteTargetId: string | null;
@@ -118,6 +157,7 @@ export interface ManagedVcSendControlArgs {
   overrideChatId?: string;
   sendInto?: string;
   attentionRequested: boolean;
+  urgentRequested?: boolean;
   explicitMentionCount: number;
   mentionBack: boolean;
   noMention: boolean;
@@ -133,6 +173,9 @@ export function managedVcSendControlError(args: ManagedVcSendControlArgs): strin
   }
   if (args.attentionRequested) {
     return '--attention 不属于受管 VC 主消息 action。';
+  }
+  if (args.urgentRequested) {
+    return '--urgent 不属于受管 VC 主消息 action。';
   }
   if (args.explicitMentionCount > 0 || args.mentionBack || !args.noMention) {
     return '受管 VC 回复必须显式使用 --no-mention，不能使用 --mention/--mention-back。';
@@ -382,6 +425,68 @@ export function parseAttentionFlag(args: string[]): { requested: boolean; kind: 
   return { requested: true, kind };
 }
 
+export const URGENT_MODES = ['app', 'sms', 'phone'] as const;
+
+export type UrgentMode = typeof URGENT_MODES[number];
+
+export interface UrgentFlagResult {
+  requested: boolean;
+  mode: UrgentMode;
+  error?: string;
+}
+
+/**
+ * Parse `botmux send --urgent[=app|sms|phone]`.
+ *
+ * A bare flag deliberately means in-app Buzz. SMS and phone are explicit
+ * because they consume tenant quota and are materially more disruptive.
+ * Multiple urgent flags are rejected rather than silently picking one.
+ */
+export function parseUrgentFlag(args: string[]): UrgentFlagResult {
+  const flags = args.filter(arg => arg === '--urgent' || arg.startsWith('--urgent='));
+  if (flags.length === 0) return { requested: false, mode: 'app' };
+  if (flags.length > 1) {
+    return { requested: true, mode: 'app', error: '--urgent 只能指定一次。' };
+  }
+  const flag = flags[0]!;
+  const raw = flag === '--urgent' ? 'app' : flag.slice('--urgent='.length);
+  if (!(URGENT_MODES as readonly string[]).includes(raw)) {
+    return {
+      requested: true,
+      mode: 'app',
+      error: '--urgent 仅支持 app|sms|phone；省略值时默认为 app。',
+    };
+  }
+  return { requested: true, mode: raw as UrgentMode };
+}
+
+export interface UrgentUsageArgs {
+  requested: boolean;
+  mentionBack: boolean;
+  sendTopLevel: boolean;
+  overrideChatId?: string;
+  sendInto?: string;
+  asVoice?: boolean;
+}
+
+/**
+ * Buzz is intentionally single-recipient and bound to the exact turn sender.
+ * This avoids accidentally buzzing every explicit @ (including peer bots).
+ */
+export function urgentUsageError(args: UrgentUsageArgs): string | null {
+  if (!args.requested) return null;
+  if (!args.mentionBack) {
+    return '--urgent 必须与 --mention-back 一起使用，只加急本轮触发者。';
+  }
+  if (args.sendTopLevel || args.overrideChatId || args.sendInto) {
+    return '--urgent 只能用于回复当前会话，不能与 --top-level / --chat-id / --into 混用。';
+  }
+  if (args.asVoice) {
+    return '--urgent 暂不支持 --voice。';
+  }
+  return null;
+}
+
 export interface AttentionUsageArgs {
   requested: boolean;
   /** --top-level */
@@ -414,5 +519,41 @@ export function attentionUsageError(args: AttentionUsageArgs): string | null {
   if (!args.hasText) {
     return '--attention 需要文本 reason（看板「需要你」列要显示原因，不能只发图片/文件）。';
   }
+  return null;
+}
+
+export interface DiffFlagResult {
+  requested: boolean;
+  path?: string;
+  error?: string;
+}
+
+/** Core display flag, parsed alongside --attention and --urgent. */
+export function parseDiffFlag(args: string[]): DiffFlagResult {
+  const flags = args.filter(arg => arg === '--diff' || arg.startsWith('--diff='));
+  if (flags.length === 0) return { requested: false };
+  if (flags.length > 1) return { requested: true, error: '--diff 只能指定一次。' };
+  const flag = flags[0]!;
+  const path = flag === '--diff' ? args[args.indexOf(flag) + 1] : flag.slice('--diff='.length);
+  if (!path?.trim() || path.startsWith('--')) return { requested: true, error: '--diff 需要 unified diff 文件路径。' };
+  if (['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'].includes(path)) {
+    return { requested: true, error: '--diff 需要已保存的文件；stdin 留给消息摘要。' };
+  }
+  return { requested: true, path };
+}
+
+export interface DiffUsageArgs {
+  requested: boolean;
+  customCardRequested: boolean;
+  mediaRequested: boolean;
+  voice: boolean;
+  slash: boolean;
+}
+
+export function diffUsageError(args: DiffUsageArgs): string | null {
+  if (!args.requested) return null;
+  if (args.customCardRequested) return '--diff 不能与 --card-file/--card-json 混用。';
+  if (args.mediaRequested) return '--diff 不能与图片/附件/视频混用；先发送完整文件，再发送 diff 最终卡片。';
+  if (args.voice || args.slash) return '--diff 不能与 --voice/--slash 混用。';
   return null;
 }

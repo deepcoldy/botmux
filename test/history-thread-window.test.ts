@@ -23,6 +23,7 @@
  * Run:  bun run vitest run test/history-thread-window.test.ts
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { decorateCliLinkRefResult } from '../src/core/link-ref-ipc.js';
 
 const hoisted = vi.hoisted(() => {
   const state = {
@@ -109,6 +110,18 @@ describe('botmux history — thread window endpoint', () => {
     expect(ids(out)).toEqual(['m10', 'm11', 'm12']);
   });
 
+  it('reports native-container evidence without certifying the root-only fallback', async () => {
+    const { listThreadMessagesWithContext } = await import('../src/im/lark/client.js');
+    const native = await listThreadMessagesWithContext('cli_x', 'oc_x', ROOT, 3);
+    expect(native).toMatchObject({ verifiedThread: true, threadId: 'omt_x' });
+    expect(ids(native.messages)).toEqual(['m10', 'm11', 'm12']);
+    state.threadIdResolvable = false;
+    const fallback = await listThreadMessagesWithContext('cli_x', 'oc_x', ROOT, 3);
+    expect(fallback.verifiedThread).toBe(false);
+    expect(fallback.threadId).toBeUndefined();
+    expect(ids(fallback.messages)).toEqual(ids(native.messages));
+  });
+
   it('fallback path (chat scan filtered by root_id) returns the same newest N', async () => {
     state.threadIdResolvable = false;
     const { listThreadMessages } = await import('../src/im/lark/client.js');
@@ -177,5 +190,63 @@ describe('botmux history — thread window endpoint', () => {
     const { listThreadMessages } = await import('../src/im/lark/client.js');
     const out = await listThreadMessages('cli_x', 'oc_x', ROOT, 0);
     expect(ids(out)).toEqual(ids(state.thread));
+  });
+});
+
+describe('botmux history — LinkRef result companion', () => {
+  const fullUrl = 'https://example.test/problem'
+    + '?id=1&state=ready#timeline';
+
+  it('keeps text/card/resource fields unchanged and adds only the top-level companion', async () => {
+    const result = {
+      sessionId: 'session',
+      messages: [{
+        content: `text ${fullUrl}`,
+        cardJson: { action: { url: fullUrl } },
+        resources: [{ key: 'file', url: fullUrl }],
+      }],
+      total: 1,
+    };
+    const original = structuredClone(result);
+    const register = vi.fn(async () => ({
+      companion: '<botmux_link_refs>\nlr_ref = exact\n</botmux_link_refs>',
+      stats: {},
+    }));
+
+    const decorated = await decorateCliLinkRefResult({
+      mode: 'enabled',
+      sourceType: 'history',
+      sourceId: 'history-result',
+      value: result,
+      register,
+    });
+
+    expect(result).toEqual(original);
+    expect(decorated).toEqual({
+      ...original,
+      linkRefs: { companion: '<botmux_link_refs>\nlr_ref = exact\n</botmux_link_refs>' },
+    });
+    expect(register).toHaveBeenCalledWith({
+      sourceType: 'history',
+      sourceId: 'history-result',
+      value: original,
+    });
+  });
+
+  it('keeps disabled output byte-compatible and performs no registration', async () => {
+    const result = { messages: [{ content: fullUrl }], total: 1 };
+    const before = JSON.stringify(result, null, 2);
+    const register = vi.fn();
+
+    const decorated = await decorateCliLinkRefResult({
+      mode: 'disabled',
+      sourceType: 'history',
+      value: result,
+      register,
+    });
+
+    expect(decorated).toBe(result);
+    expect(JSON.stringify(decorated, null, 2)).toBe(before);
+    expect(register).not.toHaveBeenCalled();
   });
 });

@@ -3,6 +3,7 @@ import {
   getBotAdminOpenIds,
   isBotAdmin,
   resolveGrantApprover,
+  resolveGrantRequestRoute,
   clearChatMemberCache,
 } from '../src/im/lark/grant-owner.js';
 import { registerBot, loadBotConfigs } from '../src/bot-registry.js';
@@ -271,6 +272,85 @@ describe('grant-owner', () => {
       const res4 = await resolveGrantApprover('b_cache', 'oc_chat_cache', {}, { listChatMemberOpenIds: listMembers });
       expect(res4).toBe('ou_dianjiang');
       expect(listMembers).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('resolveGrantRequestRoute', () => {
+    function registerAdmins(appId: string, admins: string[]) {
+      const bot = registerBot({ larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: admins });
+      bot.resolvedAllowedUsers = admins;
+    }
+
+    it('returns undefined if no admins exist', async () => {
+      registerBot({ larkAppId: 'r_empty', larkAppSecret: 's', cliId: 'claude-code' });
+      expect(await resolveGrantRequestRoute('r_empty', 'oc_chat', 'group')).toBeUndefined();
+    });
+
+    it('p2p always forwards to the primary owner DM without listing members', async () => {
+      registerAdmins('r_p2p', ['ou_owner_1', 'ou_owner_2']);
+      const listMembers = vi.fn(async () => ['ou_owner_2']);
+      const route = await resolveGrantRequestRoute('r_p2p', 'oc_p2p_chat', 'p2p', undefined, {
+        listChatMemberOpenIds: listMembers,
+      });
+      expect(route).toEqual({ approver: 'ou_owner_1', delivery: 'dm' });
+      expect(listMembers).not.toHaveBeenCalled();
+    });
+
+    it('single admin in the group → in_chat (membership is checked even with one admin)', async () => {
+      registerAdmins('r_single_in', ['ou_sole']);
+      const listMembers = vi.fn(async () => ['ou_sole', 'ou_stranger']);
+      const route = await resolveGrantRequestRoute('r_single_in', 'oc_g1', 'group', undefined, {
+        listChatMemberOpenIds: listMembers,
+      });
+      expect(route).toEqual({ approver: 'ou_sole', delivery: 'in_chat' });
+      expect(listMembers).toHaveBeenCalledTimes(1);
+    });
+
+    it('no admin in the group → dm to the primary owner', async () => {
+      registerAdmins('r_none_in', ['ou_owner_1', 'ou_owner_2']);
+      const listMembers = vi.fn(async () => ['ou_stranger']);
+      const route = await resolveGrantRequestRoute('r_none_in', 'oc_g2', 'group', undefined, {
+        listChatMemberOpenIds: listMembers,
+      });
+      expect(route).toEqual({ approver: 'ou_owner_1', delivery: 'dm' });
+    });
+
+    it('co-owner in the group → in_chat @ that co-owner', async () => {
+      registerAdmins('r_co_in', ['ou_owner_1', 'ou_owner_2']);
+      const listMembers = vi.fn(async () => ['ou_owner_2']);
+      const route = await resolveGrantRequestRoute('r_co_in', 'oc_g3', 'group', undefined, {
+        listChatMemberOpenIds: listMembers,
+      });
+      expect(route).toEqual({ approver: 'ou_owner_2', delivery: 'in_chat' });
+    });
+
+    it('explicitly @-mentioned admin → in_chat without listing members', async () => {
+      registerAdmins('r_mention', ['ou_owner_1', 'ou_owner_2']);
+      const listMembers = vi.fn(async () => []);
+      const route = await resolveGrantRequestRoute('r_mention', 'oc_g4', 'group', {
+        mentions: [{ id: { open_id: 'ou_owner_2' } }],
+      }, { listChatMemberOpenIds: listMembers });
+      expect(route).toEqual({ approver: 'ou_owner_2', delivery: 'in_chat' });
+      expect(listMembers).not.toHaveBeenCalled();
+    });
+
+    it('member lookup failure → in_chat fallback (unchanged legacy behavior)', async () => {
+      registerAdmins('r_fail', ['ou_owner_1']);
+      const listMembers = vi.fn(async () => { throw new Error('no scope'); });
+      const route = await resolveGrantRequestRoute('r_fail', 'oc_g5', 'group', undefined, {
+        listChatMemberOpenIds: listMembers,
+      });
+      expect(route).toEqual({ approver: 'ou_owner_1', delivery: 'in_chat' });
+    });
+
+    it('non-Lark group id → in_chat fallback without listing members', async () => {
+      registerAdmins('r_nonchat', ['ou_owner_1']);
+      const listMembers = vi.fn(async () => []);
+      const route = await resolveGrantRequestRoute('r_nonchat', 'not-a-chat', 'group', undefined, {
+        listChatMemberOpenIds: listMembers,
+      });
+      expect(route).toEqual({ approver: 'ou_owner_1', delivery: 'in_chat' });
+      expect(listMembers).not.toHaveBeenCalled();
     });
   });
 });

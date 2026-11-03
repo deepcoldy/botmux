@@ -1,0 +1,5 @@
+cases:
+  - name: TraeX ambient mode keeps accepting input across turns
+    tags: [traex, group, routing]
+    steps:
+      - feishu.runScenario: { scenario: traex-ambient-continuity }

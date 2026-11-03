@@ -17,7 +17,7 @@ Dashboard → 机器人默认设置 → 卡片 → **回答展示方式**提供�
 
 旧版 `final-only` 配置会兼容为“动态单卡、独立状态卡关闭”，不再作为独立模式提供。新轮次持续更新答复卡；升级前已经接受的轮次保留原投递状态，以便恢复。
 
-- 执行中显示状态、耗时和当前步骤；“展示执行过程”按接收顺序保留 CLI 已输出的思考文本或摘要、工具调用、公开进度与问答记录，结束后折叠。沿用 `thinkingCard`、`thinkingCardToolResult`、`/cot`，无需增加开关。关闭执行过程后，公开进度和问答记录仍保留；CLI 未输出的内部思考无法展示。
+- 执行中显示状态、耗时和当前步骤；“展示执行过程”按接收顺序保留 CLI 已输出的思考文本或摘要、工具调用、公开进度与问答记录，结束后折叠。统一由 `cotEnabled` 与群级 `/cot` 控制。关闭执行过程后，公开进度和问答记录仍保留；CLI 未输出的内部思考无法展示。其中工具节点、命令、结果与折叠区标题的工具次数另由 bot 级 `replyCardShowTools` 控制（默认开；可在 Dashboard「Bot 默认 → 卡片设置」切换，或 `/botconfig set replyCardShowTools off` 关闭）：关闭后思考摘要与公开进度仍显示，`/cot show` 也不会显示被隐藏的工具。仅动态单卡模式生效，`legacy` 模式下无效，切换回答模式保留该设置。
 - 状态以 💭 处理中、✅ 已完成、❌ 执行失败等图标区分；工具调用按命令、读写、搜索等类型显示图标，完成的工具保留 ✓ 标记。过程默认收在带 📋 图标、调用次数和浅灰背景的折叠区中。
 - 执行过程没有固定条数或独立字节配额，整卡未超限时完整展示。按[飞书卡片更新接口](https://open.feishu.cn/document/server-docs/im-v1/message-card/patch)的 30 KB 限制计算整卡发送体积（含 JSON 转义和回调信息），超限时才截断过程，并优先保留最终答复和待回答问题。工具与文字各保留最近记录，出现省略时明确提示并标明已展示的工具数；仅过程超限不会额外发送附件。本地已接收的记录不因展示截断而删除，不提供额外的完整过程页面。
 - 答复卡使用飞书的 `width_mode: fill`，宽度随聊天窗口自适应。飞书还提供默认宽度（桌面端上限 600px）和紧凑宽度（400px），没有按文字长度自动收缩的卡片宽度选项；这些是客户端宽度模式，不是任意像素宽度。参见[飞书卡片 JSON 2.0 配置](https://open.feishu.cn/document/feishu-cards/card-json-v2-structure)。
@@ -38,10 +38,49 @@ Dashboard → 机器人默认设置 → 卡片 → **回答展示方式**提供�
 ![实时流式卡片](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780419090587_img_v3_0212a_553ca347-4a93-491f-a2ef-30d00a374cdg.jpg)
 
 - **终端画面实时截图刷新到卡片**：xterm 无头渲染成图，**原样还原 CLI 的 TUI**（边框、配色都在），不再把输出转成 Markdown。可一键「显示 / 隐藏输出」「导出文字」「上 / 下半屏」。
-- **状态实时指示**：卡片头部颜色即状态（飞书卡片 template，不是正文里的 emoji 圆点）——**启动中…**（黄）→ **工作中**（蓝）→ **等待输入**（绿）；额度用满标 **限额已达**（红），可重试时变 **可重试**（绿）。
+- **状态实时指示**：卡片头部颜色即状态（飞书卡片 template，不是正文里的 emoji 圆点）——**启动中…**（黄）→ **工作中**（蓝）→ **等待输入**（绿）；额度用满标 **限额已达**（红），可重试时变 **可重试**（绿）。主回合已结束、但它派出的后台子任务（后台 agent、`run_in_background` 的 Bash、Monitor；Grok 的后台任务）还在跑时，显示 **⏳ 主回合已结束 · 后台子任务运行中（N）**（浅蓝），N 与 Web 终端里的后台任务数一致；子任务结束唤醒主 agent 后回到「工作中」，全部做完才显示已结束。
 - **卡片上直接操作**：打开 Web 终端、🔑 获取操作链接、关闭会话，额度可重试时还有「🔁 重发上一条任务」。
 - **每轮一张新卡片**：上一轮卡片冻结存档，对话历史清晰可回溯；会话用 [`/relay`](/relay) 搬到别的群后，原卡片也会自动冻结为存档（移除按钮）。
 - **关闭时给「可恢复」卡片**：带「▶️ 恢复会话」按钮随时点回来继续；**该 CLI 若支持原生 resume**（adapter 实现了 `buildResumeCommand` 且有原生 session id），还会附上原生命令（如 `claude --resume <id>`）方便手动恢复；不支持时只给 botmux 的恢复按钮 + 一句提示。
+
+## 自动恢复失败卡
+
+Claude 普通消息遇到暂态模型故障（连不上模型接口、DNS 故障、断流等）时，Botmux 会自动续跑，最多两次。自动恢复最终失败时，原群（原话题）里会出现一张失败卡，这是这条消息的唯一提示：
+
+- 先 @ 原发起人，再写原因（按错误码归类成一句话，不贴原始报错）、原消息摘要、时间、自动续跑了几次。
+- **🔁 重试**：重新投递这条原消息，以原发起人的身份重跑，回复仍回到原群 / 原话题。只有原发起人（仍有对话权限时）或 bot 管理员可以点；每张卡只能成功重试一次，点过后卡片原地改成「已由谁重试」。重投的消息前面会带一句说明，请 AI 先核对现场，尽量避免重复已完成的操作。
+- 续跑后迟迟收不到结果（终端已空闲约 1 分钟）也算失败，同样发卡，不会一直停在「进行中」。
+- 发卡时飞书接口如果也连不上，会持续补发（最长 24 小时），恢复后只发出一张；daemon 重启不会重发已发出的卡。
+- 定时任务的执行失败也发这张卡，但没有重试按钮，需要时在定时任务里手动再跑一次。
+
+## 一轮 turn 的四层展示
+
+botmux 在飞书里的「存在感」分四层，各自独立开关：
+
+| 层 | 是什么 | 关闭方式 |
+|----|--------|----------|
+| **流式状态卡** | 每轮一张、实时截图刷新的主卡片（本文主体） | bot 级 `disableStreamingCard`，或本群 `/card off` |
+| **思考气泡（CoT）** | CLI 工作过程中的中间叙述 / 思考消息 | bot 级 `cotEnabled: false`，或本群 `/cot off`；`/cot show` 临时看一次 |
+| **✋ → ✅ 反应** | 落在你**触发消息**上的进度反应：受理时 ✋、空闲时翻 ✅ | bot 级 `silentTurnReactions: true` |
+| **CLI 主动消息** | agent 通过 `botmux send` 主动发的富文本 / 图文消息 | 无开关，按需发送（见下） |
+
+反应与流式卡**互斥**：✋→✅ 只在「本群已关流式卡」时出现——关了卡就没有实时状态窗，反应是唯一的轻量进度信号；卡片开着的群不刷反应。
+
+## 卡片 / 思考开关：bot 级与按群
+
+| 显示层 | bot 级默认（Bot 配置 / Dashboard「Bot 默认」） | 本群覆盖（群内斜杠命令） | 默认 |
+|--------|-----------------------------------------------|--------------------------|------|
+| 流式状态卡 | `disableStreamingCard` | `/card off` / `/card on`（写入 `noCardChats`）；裸 `/card` 立即召唤一张；`/card pin …` 控制置顶 | 开 |
+| 思考气泡 | `cotEnabled` | `/cot off` / `/cot on`（写入 `noCotChats`）；`/cot show` 临时看一次；`/cot`（不带参数）查状态 | 开 |
+| ✋ → ✅ 反应 | `silentTurnReactions` | 无按群命令 | 关卡的群自动有反应；`silentTurnReactions: true` 后连反应也静默 |
+| 卡面控件 | `hiddenStreamingCardButtons`（选定要藏起的按钮） | — | 全部显示 |
+| 卡片置顶 | `pinStreamingCard`（默认关） | `/card pin off｜on｜status` | 关 |
+
+按群覆盖优先于 bot 级，且只影响当前群。
+
+**`/card`、`/cot` 只有管理员（`allowedUsers`，canOperate）能执行**，查询类子命令也一样。原因：飞书卡片没有「按人显示不同视图」的能力，这些开关是 bot 级 / 群级的，一改**全群所有人**看到的界面都变，因此只交给管理员；访客（有对话权、无操作权）执行会收到「仅授权用户可用」提示。
+
+**精简预设**（Dashboard「Bot 默认」页，本批次新增）：一键做**一次联动写入**——`cotEnabled:false` + `silentTurnReactions:true` + `disableStreamingCard:true`，适合只想安静看结论的群。注意它**不是持续绑定**：本质是把这三个已有开关一次性写成上述值并 toast 提示；之后关掉预设**不会**把三个值回改，想恢复哪一项就手动开哪一项。
 
 ## 置顶当前实时卡片
 
@@ -70,6 +109,45 @@ Dashboard → 机器人默认设置 → 卡片 → **回答展示方式**提供�
 
 > ⚠️ 原始卡片**只允许纯展示 + open_url 跳转按钮**：任何会触发回调的控件——回调按钮（带 `value`）、下拉 / 人员选择、日期时间选择、输入框、表单提交——都会被拒绝。这是防止自定义卡片伪造交互回调。
 
+## 卡片用量段自定义扩展
+
+用量段（`ctx 23% · 5h 18% · 7d 5%`）后面可以接上自己的内容，比如网关账号额度、构建状态、值班人。在 bots.json 里给 bot 配一个命令：
+
+```json
+"cardFooterExtension": {
+  "command": "~/.botmux/scripts/quota.sh",
+  "refreshSeconds": 60
+}
+```
+
+- daemon 在卡片渲染时**懒执行** `/bin/sh -c <command>`：没有独立定时器，只在有卡片渲染、且缓存已满 `refreshSeconds`（默认 60，范围 10–3600）时才在后台发起刷新——会话长时间不出卡命令就不跑，恢复后的第一张卡最多可能继续显示上一次的结果 10 分钟；同一 bot 的所有会话共用一份结果。渲染卡片只读缓存，从不等命令
+- 输出一行一段，或 JSON `{"segments": ["…", "…"]}`；最多 4 段，每段最多 40 字，按纯文本渲染（markdown 会被转义）
+- 环境变量带上 `BOTMUX_LARK_APP_ID`、`BOTMUX_CLI_ID`、`BOTMUX_BOT_NAME`（取 **bot 配置的** CLI，不随单个会话的临时 CLI 覆盖变化——结果按 bot 共享）；stdin 关闭，超时 3 秒，非 0 退出视为失败
+- 失败或超时沿用上次成功的结果；上次成功超过 10 分钟就不再显示
+- 与 CLI 无关，所有 CLI 的会话都会显示；显示位置跟随 `usageDisplay`（实时卡片或回复卡片页脚），`off` 时与其它用量一起隐藏。不配置时卡片与原来逐字节相同
+
+示例输出：
+
+```
+01 5h 2% 7d 2%
+02 5h 4% 7d 2%
+```
+
+卡片上显示为 `ctx 14% · 01 5h 2% 7d 2% · 02 5h 4% 7d 2%`。
+
+## 在消息里画图表（vega-lite）
+
+`botmux send` 正文中的 ` ```vega-lite ` 代码块会渲染成飞书 Card 2.0 原生图表；同一段 Vega-Lite 在 Web 等其它通道可直接渲染。支持的子集：
+
+- 数据只能用 `data.values` 内联，最多 500 行，值为字符串 / 数字 / 布尔 / null。
+- `mark`：`bar`（按哪个轴是数值自动识别横向条形）、`line`、`area`、`point`、`arc`（饼图；`innerRadius > 0` 为环图）。饼图只写 `theta`（数值）+ `color`（类别），带 `x`/`y` 会被拒绝，`theta` 也不支持 `title`。
+- 编码通道：`x`、`y`、`color`（分组）、`theta`（饼图数值）；每个通道只认 `field`、`type`、`title`。`x`/`y` 的 `title` 成为坐标轴标题，`color` 的 `title` 成为图例标题。`type: temporal` 不做日期解析，日期按给定顺序当作类别展示，请先排好序。
+- 每张卡片最多 5 个图表。真正的边界是飞书卡片消息的**整个请求体 ≤ 30KB**（含消息信封、`content` 二次序列化）：卡片组装完成后若超限，图表按"图表 → 50 行数据表 → 10 行数据表 → 只留说明"逐级降级，直到放得下。单个 spec 源码另有 30KB 的解析上限。
+
+安全规则：宿主只从认识的字段**重新组装** VChart spec，不透传原始 JSON。`data.url`、`transform`、`params`、`expr`、`signal`、`datasets`、`layer` 等一律拒绝。不支持或超限时降级为一行说明加原始数据表（纯文本单元格，不会渲染成链接或 @），并在 `botmux send` 的 stderr 给出原因，消息照常发出。
+
+`botmux send --dry-run` 可在发送前查看渲染结果：输出 `{dryRun, bytes, fits, diagnostics, card}`（`bytes` 按飞书真实请求体计算），不发送、不需要会话；只渲染正文，不上传图片/附件、不解析 @、不加页脚。
+
 ## 发送后更新卡片（card patch）
 
 `botmux send --card-file/--card-json` 成功后会输出 `{"success":true,"messageId":"om_...",...}`。用 `botmux card patch` 可以按这个 messageId **原地更新**同一张卡片——不发新消息、不换群/话题，适合做进度卡片：
@@ -91,3 +169,40 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"te
 - 示例中的 `send` 带 `--no-mention`：进度卡片不需要 @ 任何人，显式声明不提及可避免被 mention 策略门拦截（exit 2）。
 - Bot 身份从会话上下文解析（与 `send` 相同）；消息已撤回、无权限、目标不是卡片消息等错误会原样透出（exit 1）。
 - 成功输出 `{"success":true,"messageId":"om_xxx","sessionId":"..."}`（stdout 只有 JSON）；参数错误 exit 2。
+
+## 最终回复的耗时
+
+管理员可用 `/botconfig set showReplyTiming on` 在最终回复页脚显示「等待 3.2 秒 · 执行耗时 23.4 秒」。默认关闭，用 `off` 关闭；无需重启，从新接收的消息开始记录等待时间。
+
+- **等待**：从 Botmux 接受本轮消息，到输入实际交给 CLI；包含排队和冷启动准备，不包含飞书消息到达 Botmux 之前的时间。
+- **执行耗时**：从输入实际交给 CLI，到最终输出被观察到；Codex App 使用原生完成时间。两项都不包含飞书投递耗时。
+
+仅展示当前轮次和尝试的已知计时；缺失或无效的数值不显示。带独立 dispatch attempt 的重试不展示等待时间，以免把之前的执行也算进等待。旧 worker、恢复后无法确定起点的轮次，以及模型通过 `botmux send` 提前发出的消息不会补猜耗时。此配置不改变动态单卡已有的计时标题。
+
+## 签名按钮：以点击者身份开始一轮
+
+本机集成方可以让机器人往它所在的群里发一张一次性按钮。点击后，daemon 用**点击者**的 open_id 作为这一轮的 `senderOpenId` 开始会话，和这个人自己发了一条消息一样：若开启了 `triggerUserAuth`（`credentialSource: local`），凭证按这一轮的发送者签发，不会退回会话 owner 或创建者。
+
+按钮上的内容（提示词、目标群或会话、可选工作目录与会话类型、nonce、过期时间）由 daemon 用 HMAC 签名。密钥和 nonce 都按机器人分开，落在 `<dataDir>/card-click-turn/<larkAppId>/`（`secret` 与 `nonces.json`）。session data dir 是同一 fleet 里所有 bot daemon 共用的，所以不能再把这两份文件直接放在 data dir 根上。nonce 写入时持有跨进程锁，并在核销前重新读盘，避免一个 daemon 的整文件覆盖丢掉另一个 daemon 已经用过的按钮。篡改、过期、重放的点击会被拒绝。过期的令牌在核销 nonce 之前就拒绝，所以报的是过期而不是已使用。daemon 重启后未过期的按钮也不能再用第二次。
+
+点击者必须同时通过与发消息相同的 `evaluateTalk`（含 allowed users、blocked users、grant）、`canOperate`（会带上 `on_` 开头的 union id），以及 `grantCommandRestriction`。因此只有对话授权、没有操作权限的人点不了；`restrictGrantCommands` 打开时，对话来源是 chatGrant / globalGrant 的点击也会被拒绝。应用或机器人没有身份，不会开轮，也不会改用 owner。判定依据是：已知同机 peer、身份缓存类型为 `bot` / `app`，以及三张按 union id 锚定的表（`isTeamBot`、`isPlatformTeamBot`、`isTrustedSameOwnerSiblingBot`）。缓存里没有记录、也不在这三张表里的点击者仍按真人处理。卡片回调没有平台 `sender_type`，不要为了探测身份去 `resolveSender`（那会把未知 id 写成 user）。
+
+`cct_` 轮次有意不进入 `isOrdinaryImTurnId`，也不进入 `registryTurnMayAuthenticateHuman` 的 `om_` / `join_` 白名单。它没有普通消息那套投递收据、ACK 和冷启动补投。当前轮调用者靠 `session.lastCallerOpenId`：开轮时和 `quoteTarget*` 一起写成点击者，所以新建会话和命中已有会话都会把 CLI 侧的当前调用者解析成点击者，而不是上一位发言者。principal-lane 会话，以及打开了跨本人插话（`crossPrincipalInterruption`）时的任何点击，都会在核销 nonce 之前拒绝，并给出明确 toast，不会往会话里写入 `activeInteractiveTurn`。
+
+飞书回调先回「正在开始」。worker 真正收下输入之后，才会在群里发「已按你的身份开始」；投递失败会回滚这一轮写下的 quote / reply target / `lastCallerOpenId` / `activeInteractiveTurn`，并改发失败说明。新建会话的 `creationSource` 是 `ordinary-feishu`，这样开了 Codex 实例池的机器人不会把卡片会话落到 legacy 实例。
+
+目标必须是且只能是一个 `chatId` 或一个 `sessionId`。`sessionId` 只匹配本机器人当前活跃会话，找不到就拒绝，不会另开一条、也不会借用那条会话的 owner。`chatId` 在本群还没有 chat-scope 会话时会新建一条，owner 和创建者都是点击者，并且必须带一个已存在的绝对路径工作目录。已有会话如果工作目录和签名不一致，点击被拒绝。新建会话未签名 `chatType` 时按群聊鉴权；私聊要显式签 `p2p`，否则 `p2pOpen` 不会放行。
+
+发卡片的接口是 daemon IPC `POST /api/cards/click-turn`（与 `/api/sessions/spawn` 相同的本机 HMAC，且 daemon 已绑定当前机器人）。它不是 core-only 的公开路由。请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `prompt` | 必填，点下去之后原样作为这一轮的用户输入，最长 1500 字 |
+| `chatId` / `sessionId` | 二选一，轮次打到哪个群的 chat-scope 会话，或哪一个已有会话 |
+| `postChatId` | 卡片发到哪个群，默认同 `chatId`；只给了 `sessionId` 时必填 |
+| `workingDir` | 可选，必须是已存在的绝对路径。新建会话时必填 |
+| `chatType` | 可选，`group` 或 `p2p` |
+| `ttlMs` | 可选，1 分钟到 7 天，默认 1 小时 |
+| `buttonLabel` / `title` | 可选 |
+
+成功时返回 `{ ok, messageId, exp }`。机器人不在目标群时返回 403 `bot_not_in_chat`。

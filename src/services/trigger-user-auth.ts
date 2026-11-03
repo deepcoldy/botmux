@@ -36,16 +36,42 @@
  * not supported, this command only supports: user`). A hand-maintained list of
  * "commands needing a person" would go stale and grow holes.
  */
+import type { SandboxMode } from '../adapters/cli/sandbox-mode.js';
 
 /** Tools whose credentials botmux can inject per person. */
 export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
 export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
 
 /**
- * What happens when the current sender has not authorized this tool.
+ * Where a person's credentials come from.
  *
- * - `bot-identity` (default): let the tool run under the bot's own tenant
- *   identity where it can. Nothing personal is touched, nobody is interrupted.
+ * - `auto` (default): ask the central platform first when this machine is
+ *   bound to one; otherwise, or when the platform knows nothing about the
+ *   person, fall back to the per-person HOME on this machine. A bound machine
+ *   never STARTS a local device login on its own — the person is pointed at
+ *   the platform, so one authorization serves every machine.
+ * - `platform`: platform only. An unbound machine, or an unreachable platform,
+ *   refuses the call. For deployments that require central audit.
+ * - `local`: today's behaviour — per-person HOME on this machine only, the
+ *   platform is never consulted. The open-source default when unbound.
+ *
+ * Deliberately a separate field from `credentialsSourceDir` (the per-bot Claude
+ * login directory): that one is the BOT's model account, this one is the
+ * trigger PERSON's tool credentials.
+ */
+export const TRIGGER_USER_AUTH_CREDENTIAL_SOURCES = ['auto', 'platform', 'local'] as const;
+export type TriggerUserAuthCredentialSource = typeof TRIGGER_USER_AUTH_CREDENTIAL_SOURCES[number];
+
+/**
+ * Policy intent for a sender who has not authorized this tool.
+ *
+ * RETAINED FOR CONFIG COMPATIBILITY ONLY: neither governed tool currently
+ * degrades to a machine identity — bytedcli never had one, and lark-cli's
+ * bot-identity downgrade was removed with the per-person HOME model. Both
+ * values therefore resolve to a refusal (the refusal carries an authorization
+ * link), but the field is still parsed so stored configs keep validating.
+ *
+ * - `bot-identity` (default): legacy value; no longer degrades anything.
  * - `none`: the call fails and the sender is asked to authorize.
  *
  * Note there is no `device` / `machine-login` option — see the file header.
@@ -58,6 +84,20 @@ export interface TriggerUserAuthConfig {
   /** Tools this applies to. Empty means the policy is inert. */
   tools: TriggerUserAuthTool[];
   fallback: TriggerUserAuthFallback;
+  /** See {@link TRIGGER_USER_AUTH_CREDENTIAL_SOURCES}. The parser always fills
+   *  it; it is optional on the type only so hand-built configs (tests, legacy
+   *  callers) keep compiling — read it through {@link credentialSourceOf}. */
+  credentialSource?: TriggerUserAuthCredentialSource;
+  /**
+   * Whether `botmux send --mention <bot on this machine>` hands this turn's
+   * sender to that bot, the way `botmux dispatch` already does: the daemon
+   * signs a delegation for the exact handoff message, and the receiving bot
+   * runs its governed tools as the same human after its own talk-permission
+   * and chat-membership checks. Default ON; only an explicit `false` is
+   * stored. Cross-machine bots never receive it (the signed record and its
+   * key live on this machine).
+   */
+  delegateOnMention?: boolean;
   /**
    * Code host whose git pushes should carry the acting identity, e.g.
    * `code.example.com`. Absent → git is left alone.
@@ -75,50 +115,50 @@ export interface TriggerUserAuthConfig {
   gitTokenExchangeUrl?: string;
 }
 
-/** Per-tool facts that decide what "unauthorized" can degrade to. */
-export const TRIGGER_USER_AUTH_TOOL_CAPABILITIES: Record<
-  TriggerUserAuthTool,
-  { supportsBotIdentity: boolean }
-> = {
-  // `lark-cli --as bot` works with app credentials alone.
-  'lark-cli': { supportsBotIdentity: true },
-  // `bytedcli auth` offers only SSO personal login — no bot/tenant identity to
-  // degrade to. (Per-person authorization itself IS supported; see
-  // services/bytedcli-auth.ts.)
-  bytedcli: { supportsBotIdentity: false },
-};
-
 /**
  * How well the on-disk token store is actually protected for this session.
  *
  * An honest report, not a reassurance. Botmux stores each person's token as a
  * 0600 file owned by the OS user — but the agent's CLI runs as that same OS
- * user, so without the file sandbox it can simply read every token file in
- * `~/.botmux/data/`. The per-person storage still fixes attribution and the
+ * user, so it can simply read every token file in `~/.botmux/data/` unless
+ * the OS stops it. The per-person storage still fixes attribution and the
  * overwrite bug, and the wrapper still injects only the current sender's
  * credentials; what is missing is any barrier against an agent that goes
  * looking on its own.
  *
- * With the sandbox on, the whole data dir is deny-by-default and only this
- * session's own identity file is granted — the boundary is then enforced by the
- * OS rather than by convention.
+ * Only the allowlist sandbox ('oncall') is such a barrier: the whole data dir
+ * is deny-by-default and only this session's own identity file is granted.
+ * The scratch sandbox isolates WRITES only — it keeps the real disk readable,
+ * including other people's tokens and login state (lark-cli homes, tokens
+ * created after the session started), so it counts as unprotected.
  *
  * Callers surface this so an operator can decide; it deliberately does not gate
  * the feature. Refusing to run without a sandbox would push people away from a
  * change that is an improvement either way, and claiming isolation we do not
  * have would be worse than both.
  */
-export function tokenStoreProtection(sandboxEnabled: boolean): {
+export function tokenStoreProtection(mode: SandboxMode): {
   enforced: boolean;
   advisory?: string;
 } {
-  if (sandboxEnabled) return { enforced: true };
+  if (mode === 'oncall') return { enforced: true };
+  const where = 'Dashboard → Bot 配置 → 权限与安全 → 文件沙盒';
+  if (mode === 'scratch') {
+    return {
+      enforced: false,
+      advisory:
+        'token 文件按人隔离，但当前的 scratch 一次性沙盒只隔离写入、不隔离凭据：'
+        + 'agent 仍能读到这台机器上其他人的 token 和登录态。'
+        + `多人共用的 bot 要隔离凭据，请到 ${where} 改选「白名单隔离」。`,
+    };
+  }
   return {
     enforced: false,
     advisory:
-      'token 文件按人隔离，但未开启文件沙盒：agent 与 botmux 跑在同一个系统用户下，'
-      + '有能力直接读取 ~/.botmux/data/ 里其他人的 token 文件。'
-      + '归因与覆盖问题已解决；要让隔离由操作系统强制，请为本 bot 开启 sandbox。',
+      'token 文件按人隔离，但未开启白名单隔离：agent 与 botmux 跑在同一个系统用户下，'
+      + '能直接读到 ~/.botmux/data/ 里其他人的 token 和登录态。'
+      + `归因与覆盖问题已解决；要让隔离由操作系统强制，请到 ${where} 选「白名单隔离」`
+      + '（scratch 一次性只隔离写入，不算）。',
   };
 }
 
@@ -187,6 +227,22 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     fallback = rec.fallback as TriggerUserAuthFallback;
   }
 
+  let credentialSource: TriggerUserAuthCredentialSource = 'auto';
+  if (rec.credentialSource !== undefined && rec.credentialSource !== null) {
+    if (!(TRIGGER_USER_AUTH_CREDENTIAL_SOURCES as readonly unknown[]).includes(rec.credentialSource)) {
+      throw new TriggerUserAuthConfigError(
+        `triggerUserAuth.credentialSource must be one of ${TRIGGER_USER_AUTH_CREDENTIAL_SOURCES.join(' | ')}`
+        + ` (got ${JSON.stringify(rec.credentialSource)})`,
+      );
+    }
+    credentialSource = rec.credentialSource as TriggerUserAuthCredentialSource;
+  }
+
+  if (rec.delegateOnMention !== undefined && rec.delegateOnMention !== null
+    && typeof rec.delegateOnMention !== 'boolean') {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.delegateOnMention must be a boolean');
+  }
+
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
   const gitTokenExchangeUrl = optionalHttpsUrl(
     rec.gitTokenExchangeUrl,
@@ -197,6 +253,9 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     enabled,
     tools,
     fallback,
+    credentialSource,
+    // Equal to the default → not stored.
+    ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
@@ -233,6 +292,13 @@ function optionalHttpsUrl(value: unknown, field: string): string | undefined {
   return value;
 }
 
+/** The effective credential source; absent means `auto`. */
+export function credentialSourceOf(
+  config: Pick<TriggerUserAuthConfig, 'credentialSource'> | null | undefined,
+): TriggerUserAuthCredentialSource {
+  return config?.credentialSource ?? 'auto';
+}
+
 /** Whether this policy governs `tool` right now. */
 export function triggerUserAuthApplies(
   config: TriggerUserAuthConfig | null | undefined,
@@ -241,22 +307,11 @@ export function triggerUserAuthApplies(
   return !!config?.enabled && config.tools.includes(tool);
 }
 
-/** How a specific tool behaves when the sender has not authorized it. */
-export type UnauthorizedOutcome = 'bot-identity' | 'fail';
-
-/**
- * Resolve what to do for `tool` when the current sender has no credentials.
- *
- * `bytedcli` reports `fail` even under `fallback: 'bot-identity'` — not a
- * config violation, just the truth that it has no non-human identity to fall
- * back to. Reporting `bot-identity` there would produce a call that fails
- * anyway, with a misleading reason.
- */
-export function unauthorizedOutcomeFor(
+/** Whether a `--mention` handoff from this bot carries the turn's sender to a
+ *  bot on the same machine. Needs the policy itself to be on: a bot that does
+ *  not run its own tools as the sender has no verified sender to hand over. */
+export function delegatesOnMention(
   config: TriggerUserAuthConfig | null | undefined,
-  tool: TriggerUserAuthTool,
-): UnauthorizedOutcome {
-  if (!triggerUserAuthApplies(config, tool)) return 'bot-identity';
-  if (config!.fallback === 'none') return 'fail';
-  return TRIGGER_USER_AUTH_TOOL_CAPABILITIES[tool].supportsBotIdentity ? 'bot-identity' : 'fail';
+): boolean {
+  return !!config?.enabled && config.tools.length > 0 && config.delegateOnMention !== false;
 }

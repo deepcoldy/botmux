@@ -73,5 +73,3 @@ export function createKiroCliAdapter(pathOverride?: string): CliAdapter {
     skillsDir: '~/.kiro/skills',
   };
 }
-
-export const create = createKiroCliAdapter;

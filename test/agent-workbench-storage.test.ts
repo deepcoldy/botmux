@@ -8,7 +8,6 @@ import {
   type WorkbenchGroupDimension,
 } from '../src/dashboard/web/agent-workbench-model.js';
 import {
-  emptyWorkbenchSeenLedger,
   loadWorkbenchCollapsedGroups,
   loadWorkbenchGroupDimension,
   loadWorkbenchLayout,
@@ -149,7 +148,7 @@ describe('Agent Workbench 未读账本 seen.v1', () => {
     // 未读提示不需要标题、聊天内容或任何链接，落盘里也不许出现。
     expect(raw).not.toMatch(/title|url|token|grant|cookie|message|reason/i);
 
-    expect(saveWorkbenchSeenLedger(storage, emptyWorkbenchSeenLedger())).toBe(true);
+    expect(saveWorkbenchSeenLedger(storage, { seen: {}, unread: {} })).toBe(true);
     expect(loadWorkbenchSeenLedger(storage)).toEqual({ seen: {}, unread: {} });
   });
 
@@ -206,19 +205,19 @@ describe('Agent Workbench 未读账本 seen.v1', () => {
   it('缺失或会抛异常的 storage 当作没有账本', () => {
     expect(loadWorkbenchSeenLedger(null)).toBeNull();
     expect(loadWorkbenchSeenLedger(undefined)).toBeNull();
-    expect(saveWorkbenchSeenLedger(null, emptyWorkbenchSeenLedger())).toBe(false);
+    expect(saveWorkbenchSeenLedger(null, { seen: {}, unread: {} })).toBe(false);
     // Safari 无痕模式的 localStorage 直接抛，读写都不能把页面带崩。
     const hostile: WorkbenchStorage = {
       getItem() { throw new Error('SecurityError'); },
       setItem() { throw new Error('QuotaExceededError'); },
     };
     expect(loadWorkbenchSeenLedger(hostile)).toBeNull();
-    expect(saveWorkbenchSeenLedger(hostile, emptyWorkbenchSeenLedger())).toBe(false);
+    expect(saveWorkbenchSeenLedger(hostile, { seen: {}, unread: {} })).toBe(false);
   });
 });
 
 describe('Agent Workbench 分组维度 group-dim.v1', () => {
-  it('只接受白名单里的六个维度，脏值当没存过', () => {
+  it('只接受白名单里的七个维度，脏值当没存过', () => {
     const storage = new MemoryStorage();
     expect(loadWorkbenchGroupDimension(storage)).toBeNull();
 
@@ -229,13 +228,13 @@ describe('Agent Workbench 分组维度 group-dim.v1', () => {
     // 全局偏好，一条记录，不分会话。
     expect([...storage.values.keys()]).toEqual([GROUP_DIMENSION_KEY]);
     // 裸字符串存盘，不套 JSON —— 读的那头正是这么认的。
-    expect(storage.values.get(GROUP_DIMENSION_KEY)).toBe('time');
+    expect(storage.values.get(GROUP_DIMENSION_KEY)).toBe('worktree');
 
     // 白名单外的值不写盘，也不许把已存的选择覆盖掉。
     for (const bad of ['repo', '', 'STATUS', 'bot ']) {
       expect(saveWorkbenchGroupDimension(storage, bad as WorkbenchGroupDimension), bad).toBe(false);
     }
-    expect(loadWorkbenchGroupDimension(storage)).toBe('time');
+    expect(loadWorkbenchGroupDimension(storage)).toBe('worktree');
 
     // 别人写坏的存量记录读回 null，调用方回落到默认的 status。
     for (const raw of ['repo', '', 'STATUS', '{"dimension":"bot"}', '["bot"]', 'null']) {

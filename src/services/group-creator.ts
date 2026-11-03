@@ -6,8 +6,10 @@
  * This service only orchestrates the Lark API sequence:
  *
  *   1. createChat (creator + invited users), then synchronously announce chatId
- *   2. add peer bots / owners and fetch the share link
- *   3. transferChatOwner + notify + bindings/bootstrap (best-effort where noted)
+ *   2. add peer bots / owners and fetch the share link, then the owners' local
+ *      stewards (decision board; see steward-auto-join.ts — best-effort, silent)
+ *   3. transferChatOwner + notify + bindings, then the optional bot-collaboration
+ *      hook, then role bootstrap / kickoff (best-effort where noted)
  *
  * The progress hook is the durable side-effect boundary: once it fires, the
  * chat exists and retrying would create a duplicate even if a later API call
@@ -18,12 +20,24 @@
  * path may instead provide `transferOwnerUnionId`; this service resolves that
  * tenant-stable ID into the creator app's open_id before transfer.
  */
-import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat } from './groups-store.js';
-import { listChatBotMembers, resolveAllowedUsersWithMap, sendMessage } from '../im/lark/client.js';
+import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat, addChatManagers } from './groups-store.js';
+import type { ChatMode } from './groups-store.js';
+import type { GroupAvatarMode } from './group-creation-options.js';
+import { listChatBotMembers, resolveAllowedUsersWithMap, resolveUnionIdFromOpenIdStrict, sendMessage } from '../im/lark/client.js';
+import { loadBotConfigsCached } from '../bot-registry.js';
 import { bindOncall } from './oncall-store.js';
+import { readBotAdminUnions } from './bot-admin-unions-store.js';
+import {
+  clearStewardSilentJoin,
+  joinStewardsToNewChat,
+  markStewardSilentJoin,
+  type StewardJoinResult,
+} from './steward-auto-join.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
 import { writeRoleFile } from '../core/role-resolver.js';
+import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
+import { t, localeForBot } from '../i18n/index.js';
 
 export interface CreateGroupOpts {
   creatorLarkAppId: string;
@@ -31,6 +45,13 @@ export interface CreateGroupOpts {
    *  (Lark rejects self-invite). May be empty (creator-only chat). */
   larkAppIds: string[];
   name?: string;
+  /** Opt-in decorations; the personal tag requires the invoking user's open_id
+   * in this creator app's scope. Failures never discard an existing chat. */
+  customization?: { tag?: string; avatar?: GroupAvatarMode; userOpenId: string };
+  /** Chat topology at creation time. 'topic' creates a 话题群; omit to let
+   *  Feishu use its default 普通群 ('group'). Fixed for the chat's lifetime —
+   *  it cannot be changed afterwards through this API. */
+  chatMode?: ChatMode;
   userOpenIds?: string[];
   /** Users to add by union_id (tenant-stable) — used to pull bot OWNERS into a
    *  federated group regardless of which bot they paired through (open_id is
@@ -41,6 +62,8 @@ export interface CreateGroupOpts {
   transferOwnerUnionId?: string;
   transferOwnerTo?: string;
   notifyOwnerOpenId?: string;
+  /** Users to grant group manager permissions to. Added while the creator bot is owner. */
+  managerUserIds?: string[];
   /** Optional working directory to bind the newly created chat to oncall for
    *  every invited bot. The path is validated by callers; this service only
    *  persists the binding after chat.create succeeds. */
@@ -55,15 +78,13 @@ export interface CreateGroupOpts {
    *  having to @ it. The kickoff bot must be present in `larkAppIds`. */
   kickoffBotLarkAppId?: string;
   kickoffPrompt?: string;
-  /** Authorization-grade preflight run after peer invitations settle and
-   * before any role/kickoff bot message. CLI cold-group creation uses this to
-   * establish the exact talk-only grant matrix; rejection aborts initialization
-   * while preserving the already-announced chatId for controlled recovery. */
-  ensureBotCollaboration?: (
-    chatId: string,
-    joinedBotAppIds: string[],
-    rejectedBotAppIds: string[],
-  ) => Promise<void>;
+  /** Best-effort collaboration setup for the bots that actually joined. CLI
+   * cold-group creation uses it to write the talk-only grant matrix between
+   * them. Runs after owner transfer, notify and oncall binding, and before any
+   * role/kickoff bot message. A throw is reported as `collaborationError`; it
+   * never skips the remaining steps — the chat already exists, and an aborted
+   * initialization would leave the owner without the group. */
+  ensureBotCollaboration?: (chatId: string, joinedBotAppIds: string[]) => Promise<void>;
   /** Synchronous progress hook fired immediately after chat.create returns a
    *  chatId, before bot invites, share-link lookup, owner transfer, oncall
    *  binding, or role bootstrap. CLI callers use this as the durable
@@ -82,6 +103,8 @@ export interface CreateGroupResult {
   invalidOwnerUnionIds: string[];
   ownerTransferredTo: string | null;
   transferError: string | null;
+  managersAdded: string[];
+  managerError: string | null;
   notifyMessageId: string | null;
   notifyError: string | null;
   /** Shareable join link (others can click to *join*). null when the Lark
@@ -93,6 +116,14 @@ export interface CreateGroupResult {
   roleProfileBootstrapError: string | null;
   kickoffMessageId: string | null;
   kickoffError: string | null;
+  /** Present only when `ensureBotCollaboration` was supplied: null when it
+   * completed, otherwise the error it threw. */
+  collaborationError?: string | null;
+  customization?: { tagError?: string; avatarError?: string };
+  /** Local stewards (decision board) this chat belongs to, and whether each was
+   *  pulled in. Absent when no steward applied. Never part of invalidBotIds:
+   *  a steward that could not join does not make the group incomplete. */
+  stewardJoins?: StewardJoinResult[];
 }
 
 export interface TransferGroupOwnerOpts {
@@ -143,6 +174,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     name: opts.name,
     botIds: [],
     userIds: opts.userOpenIds ?? [],
+    chatMode: opts.chatMode,
   });
   opts.onChatCreated?.(r.chatId);
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
@@ -158,13 +190,23 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   const invalidBots = new Set(r.invalidBotIds);
   const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
     .filter(id => !invalidBots.has(id));
-  if (opts.ensureBotCollaboration) {
-    // Strict ordering boundary: invitations must have committed before the
-    // receiver-scoped live membership probes can succeed, while role/kickoff
-    // messages must not be emitted until the exact requested membership and
-    // grant matrix are ready. The callback also sees rejected invitees so a
-    // CLI caller cannot report a partially-created group as complete.
-    await opts.ensureBotCollaboration(r.chatId, joinedBotIds, [...invalidBots]);
+
+  // Optional decoration must never delay inviting the requested teammates.
+  // Avatar runs now (after invites, before owner transfer) so the chat already
+  // looks right by the time the sender becomes owner. The personal feed-group
+  // tag runs *after* the share-link fetch and owner transfer below so a slow
+  // user-token refresh cannot delay the hand-over.
+  const customization: CreateGroupResult['customization'] = opts.customization ? {} : undefined;
+  if (opts.customization?.avatar === 'name') {
+    try {
+      const { applyGroupNameAvatar } = await import('./group-name-avatar.js');
+      await applyGroupNameAvatar(opts.creatorLarkAppId, r.chatId, opts.name ?? '');
+    } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
+  } else if (opts.customization?.avatar === 'logo') {
+    try {
+      const { applyLogoGroupAvatar } = await import('./session-group-avatar.js');
+      await applyLogoGroupAvatar(opts.creatorLarkAppId, r.chatId);
+    } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
   }
 
   // Fetch the shareable join link BEFORE transferring ownership: the creator bot
@@ -188,6 +230,40 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     const ar = await addUsersToChatByUnionId(opts.creatorLarkAppId, r.chatId, opts.ownerUnionIds);
     invalidOwnerUnionIds = ar.invalidUserIds;
   }
+
+  // Stewards join after the requested bots and owners are in, and while the
+  // creator still owns the chat. They stay out of joinedBotIds on purpose: no
+  // collaboration grant, oncall binding, role bootstrap or kickoff for them.
+  // A chat that ends up with one person and one bot keeps that bot answering
+  // without an @ (solo-group bypass); a steward would make it two bots, so such
+  // chats only get stewards that opted in. Counted from who actually joined;
+  // open_id and union_id may be the same person, so the larger count is used.
+  const dataDir = config.session.dataDir;
+  const creatorLarkAppId = opts.creatorLarkAppId;
+  const memberOpenIds = (opts.userOpenIds ?? []).filter(id => !r.invalidUserIds.includes(id));
+  const memberUnionIds = (opts.ownerUnionIds ?? []).filter(id => !invalidOwnerUnionIds.includes(id));
+  const soloGroup = joinedBotIds.length <= 1 && Math.max(new Set(memberOpenIds).size, new Set(memberUnionIds).size) <= 1;
+  const stewardJoins = await joinStewardsToNewChat({
+    creatorLarkAppId,
+    requestedBotAppIds: opts.larkAppIds,
+    soloGroup,
+    memberOpenIds,
+    memberUnionIds,
+    initiatorOpenIds: [opts.transferOwnerTo, opts.notifyOwnerOpenId]
+      .filter((id): id is string => !!id && !r.invalidUserIds.includes(id)),
+    initiatorUnionIds: [opts.transferOwnerUnionId].filter((id): id is string => !!id && !invalidOwnerUnionIds.includes(id)),
+  }, {
+    loadConfigs: loadBotConfigsCached,
+    readAdminUnions: (appId, allowedUsers) => readBotAdminUnions(dataDir, appId, allowedUsers),
+    lookupUnion: async openId => {
+      const found = await resolveUnionIdFromOpenIdStrict(creatorLarkAppId, openId);
+      return found.status === 'resolved' ? found.unionId : undefined;
+    },
+    markSilentJoin: appId => markStewardSilentJoin(dataDir, appId, r.chatId),
+    clearSilentJoin: appId => clearStewardSilentJoin(dataDir, appId, r.chatId),
+    addBot: async appId => (await addBotToChat(creatorLarkAppId, r.chatId, [appId]))[0] ?? { ok: false, error: 'no_result' },
+    log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
+  });
 
   let transferOwnerTo = opts.transferOwnerTo?.trim() || null;
   const transferOwnerUnionId = opts.transferOwnerUnionId?.trim() || null;
@@ -223,6 +299,39 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
+  // Personal feed-group tag runs after ownership hand-over: tagging needs the
+  // invoking user's OAuth token, whose refresh can stall; keeping it here means
+  // the owner-transfer window is as short as the invite + avatar + share-link
+  // calls. Failure is independent — the chat is already handed over.
+  if (opts.customization?.tag) {
+    try {
+      const { addCreatedChatToFeedGroup } = await import('./feed-group-tagger.js');
+      await addCreatedChatToFeedGroup(opts.creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
+    } catch (err: any) { customization!.tagError = err?.message ?? String(err); }
+  }
+
+  // Grant group manager role to specified users in managerUserIds.
+  // Only the chat owner can add managers:
+  // - If ownership was transferred successfully, ownerTransferredTo is excluded (already owner).
+  // - If ownership transfer failed (and the target was not rejected by invalidUserIds),
+  //   the target can still be added as a manager fallback if included in managerUserIds.
+  // - Any user in invalidUserIds is skipped since they were rejected by Lark and are not in the chat.
+  let managersAdded: string[] = [];
+  let managerError: string | null = null;
+  const rawManagerIds = (opts.managerUserIds ?? []).map(id => id.trim()).filter(Boolean);
+  if (rawManagerIds.length > 0) {
+    const toAdd = rawManagerIds.filter(id => id !== ownerTransferredTo && !r.invalidUserIds.includes(id));
+    if (toAdd.length > 0) {
+      const mr = await addChatManagers(opts.creatorLarkAppId, r.chatId, toAdd);
+      if (mr.ok) {
+        managersAdded = mr.addedManagers;
+      } else {
+        managerError = mr.error;
+        logger.warn(`[group-creator] addChatManagers failed after retries for ${r.chatId.substring(0, 12)}: ${mr.error}`);
+      }
+    }
+  }
+
   const notifyOwnerOpenId = opts.notifyOwnerOpenId?.trim()
     || (transferOwnerUnionId ? transferOwnerTo : null);
   let notifyMessageId: string | null = null;
@@ -235,7 +344,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
         notifyMessageId = await sendMessage(
           opts.creatorLarkAppId,
           r.chatId,
-          `<at user_id="${notifyOwnerOpenId}"></at>`,
+          `<at user_id="${notifyOwnerOpenId}"></at> ${t('cmd.group.owner_notice', undefined, localeForBot(opts.creatorLarkAppId))}`,
           'text',
         );
       } catch (e: any) {
@@ -260,6 +369,19 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       } catch (e: any) {
         oncallBindings.push({ larkAppId, ok: false, error: e?.message ?? String(e) });
       }
+    }
+  }
+
+  // Bot collaboration setup goes after everything the owner is waiting for
+  // (ownership, the @ notice) and before the first bot-to-bot message, so its
+  // grants are in place when role bootstrap / kickoff arrive. The receivers'
+  // live membership checks also need the invitations above to have settled.
+  let collaborationError: string | null = null;
+  if (opts.ensureBotCollaboration) {
+    try {
+      await opts.ensureBotCollaboration(r.chatId, joinedBotIds);
+    } catch (e: any) {
+      collaborationError = e?.message ?? String(e);
     }
   }
 
@@ -359,6 +481,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     invalidOwnerUnionIds,
     ownerTransferredTo,
     transferError,
+    managersAdded,
+    managerError,
     notifyMessageId,
     notifyError,
     shareLink,
@@ -368,5 +492,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     roleProfileBootstrapError,
     kickoffMessageId,
     kickoffError,
+    ...(opts.ensureBotCollaboration ? { collaborationError } : {}),
+    ...(customization ? { customization } : {}),
+    ...(stewardJoins.length ? { stewardJoins } : {}),
   };
 }

@@ -1,30 +1,13 @@
-import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
+import { resolveRunnerPath } from './runner-path.js';
 import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
-
-function runnerPath(): string {
-  // Source-level worker integration tests execute through tsx and need the
-  // matching source runner rather than a possibly absent/stale ignored dist
-  // tree. Keep the override strictly test-scoped so production launch
-  // resolution remains canonical and cannot be redirected by ambient env.
-  const testOverride = process.env.NODE_ENV === 'test'
-    ? process.env.BOTMUX_TEST_DSH_RUNNER_PATH
-    : undefined;
-  if (testOverride) return resolve(testOverride);
-  const here = dirname(fileURLToPath(import.meta.url));
-  const compiledSibling = resolve(here, '..', '..', 'dsh-runner.js');
-  if (existsSync(compiledSibling)) return compiledSibling;
-  const builtFromSourceTree = resolve(here, '..', '..', '..', 'dist', 'dsh-runner.js');
-  if (existsSync(builtFromSourceTree)) return builtFromSourceTree;
-  return compiledSibling;
-}
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
@@ -51,8 +34,8 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
   const bridgePatch = () => (cachedBridge ??= ensureDshQuestionBridgePatch({ cliId: 'dsh' }));
   return {
     id: 'dsh',
-    // The runner reads ~/.dsh/settings.yaml + .credentials.yaml and writes
-    // its generated composition + sessions under ~/.dsh/botmux/ and
+    // The runner reads the composed profile + .credentials.yaml and writes
+    // its generated composition + sessions under ~/.dsh/profiles/ and
     // ~/.dsh/sessions/botmux/. Keep the whole native dsh home REAL under the
     // file sandbox so both survive (see adapters CLAUDE.md sandbox notes).
     // Pre-created in buildArgs so the sandbox's keepExisting filter doesn't
@@ -88,7 +71,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       mkdirSync(join(activeDshHome, 'profiles'), { recursive: true });
       mkdirSync(join(activeDshHome, 'sessions', 'botmux'), { recursive: true });
       const args = [
-        runnerArgv0('dsh-runner', runnerPath()),
+        runnerArgv0('dsh-runner', resolveRunnerPath('dsh-runner.js', { testOverrideEnv: 'BOTMUX_TEST_DSH_RUNNER_PATH' })),
         '--session-id', sessionId,
         '--dsh-bin', (cachedDshBin ??= resolveCommandReal(rawDshBin)),
       ];
@@ -104,7 +87,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       // present; custom profiles may intentionally carry their own provider.
       const bridge = profile === 'botmux' ? bridgePatch() : null;
       pushOpt(args, '--bridge-patch', bridge?.patchPath);
-      // Per-bot turn timeout override; undefined → runner default (10 min).
+      // No default turn timeout; admins may opt into an idle timeout per bot.
       pushOpt(args, '--turn-timeout-ms', typeof turnTimeoutMs === 'number' && turnTimeoutMs > 0
         ? String(turnTimeoutMs)
         : undefined);
@@ -137,5 +120,3 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['dsh'],
   };
 }
-
-export const create = createDshAdapter;

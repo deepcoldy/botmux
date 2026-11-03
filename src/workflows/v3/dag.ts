@@ -747,7 +747,7 @@ function validateHostInputShape(
       required: ['name', 'schedule', 'prompt', 'workingDir', 'chatId', 'chatType', 'larkAppId'],
       allowed: [
         'name', 'schedule', 'prompt', 'workingDir', 'chatId',
-        'chatType', 'rootMessageId', 'scope', 'larkAppId', 'repeat', 'deliver',
+        'chatType', 'rootMessageId', 'scope', 'larkAppId', 'ownerOpenId', 'repeat', 'deliver',
       ],
     },
   };
@@ -885,15 +885,6 @@ function parseUniqueStringList(
     values.push(item);
   }
   return problems.some((p) => p.startsWith(where)) ? undefined : values;
-}
-
-function normStringArray(v: unknown, where: string, problems: string[]): string[] {
-  if (v === undefined) return [];
-  if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
-    problems.push(`${where} must be an array of strings`);
-    return [];
-  }
-  return v as string[];
 }
 
 /** An edge predicate parked during the per-node pass: validated against the

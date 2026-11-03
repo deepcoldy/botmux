@@ -50,6 +50,7 @@ describe('daemon discovery', () => {
       ipcPort: 7956,
       bootInstanceId,
       workflowIpcProtocol: 'v1',
+      dispatchLaunchIpcProtocol: 'v1',
       botName: 'codex-loopy',
       cliId: 'codex',
       pid: 123,
@@ -61,6 +62,7 @@ describe('daemon discovery', () => {
       ipcPort: 7956,
       bootInstanceId,
       workflowIpcProtocol: 'v1',
+      dispatchLaunchIpcProtocol: 'v1',
       botName: 'codex-loopy',
       cliId: 'codex',
     })]);
@@ -79,6 +81,25 @@ describe('daemon discovery', () => {
     })]);
     expect(listOnlineDaemons()[0]).not.toHaveProperty('bootInstanceId');
     expect(listOnlineDaemons()[0]).not.toHaveProperty('workflowIpcProtocol');
+    expect(listOnlineDaemons()[0]).not.toHaveProperty('sessionStoreProtocol');
+    expect(listOnlineDaemons()[0]).not.toHaveProperty('botmuxVersion');
+  });
+
+  it('passes through sessionStoreProtocol and botmuxVersion without inventing them', () => {
+    writeFileSync(join(dir, 'dashboard-daemons', 'new.json'), JSON.stringify({
+      larkAppId: 'new',
+      ipcPort: 7959,
+      sessionStoreProtocol: 'occupancy-v1',
+      botmuxVersion: '3.20.0',
+      lastHeartbeat: Date.now(),
+    }));
+
+    expect(listOnlineDaemons()).toEqual([expect.objectContaining({
+      larkAppId: 'new',
+      ipcPort: 7959,
+      sessionStoreProtocol: 'occupancy-v1',
+      botmuxVersion: '3.20.0',
+    })]);
   });
 
   it('follows the canonical data-dir breadcrumb when SESSION_DATA_DIR is absent', () => {

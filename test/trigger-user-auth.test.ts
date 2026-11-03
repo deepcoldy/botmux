@@ -19,11 +19,10 @@ import { describe, it, expect } from 'vitest';
 import {
   parseTriggerUserAuthConfig,
   triggerUserAuthApplies,
-  unauthorizedOutcomeFor,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
-  tokenStoreProtection,
-} from '../src/services/trigger-user-auth.js';
+  tokenStoreProtection, credentialSourceOf, delegatesOnMention } from '../src/services/trigger-user-auth.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('parseTriggerUserAuthConfig', () => {
   it('treats an absent field as "not configured at all"', () => {
@@ -34,6 +33,7 @@ describe('parseTriggerUserAuthConfig', () => {
   it('defaults to disabled when the object omits `enabled`', () => {
     expect(parseTriggerUserAuthConfig({})).toEqual({
       enabled: false,
+      credentialSource: 'auto',
       tools: [...TRIGGER_USER_AUTH_TOOLS],
       fallback: 'bot-identity',
     });
@@ -112,50 +112,34 @@ describe('triggerUserAuthApplies', () => {
   });
 });
 
-describe('unauthorizedOutcomeFor', () => {
-  it('leaves ungoverned tools on their existing behavior', () => {
-    expect(unauthorizedOutcomeFor(null, 'bytedcli')).toBe('bot-identity');
-    const larkOnly = parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
-    expect(unauthorizedOutcomeFor(larkOnly, 'bytedcli')).toBe('bot-identity');
-  });
-
-  it('lets lark-cli degrade to the bot\'s own identity', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true });
-    expect(unauthorizedOutcomeFor(config, 'lark-cli')).toBe('bot-identity');
-  });
-
-  // bytedcli offers only SSO personal login: no service account, no AK/SK.
-  // Reporting `bot-identity` here would produce a call that fails anyway, with
-  // a misleading reason.
-  it('fails for bytedcli even under fallback: bot-identity', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'bot-identity' });
-    expect(unauthorizedOutcomeFor(config, 'bytedcli')).toBe('fail');
-  });
-
-  it('fails for every governed tool under fallback: none', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'none' });
-    for (const tool of TRIGGER_USER_AUTH_TOOLS) {
-      expect(unauthorizedOutcomeFor(config, tool)).toBe('fail');
-    }
-  });
-});
-
 // An honest report, not a reassurance. Botmux keeps each token 0600, but the
-// agent runs as the SAME OS user, so without the file sandbox it can read every
-// person's token file directly. Per-person storage still fixes attribution and
-// the overwrite bug; only the sandbox makes the isolation OS-enforced.
+// agent runs as the SAME OS user, so unless the OS stops it the agent can read
+// every person's token file directly. Only the allowlist sandbox stops it:
+// scratch isolates writes and keeps the disk (other people's tokens and login
+// state included) readable.
 describe('tokenStoreProtection', () => {
-  it('reports enforced only when the file sandbox is on', () => {
-    expect(tokenStoreProtection(true)).toEqual({ enforced: true });
+  it('counts only the allowlist sandbox as protecting the token store', () => {
+    expect(tokenStoreProtection('oncall')).toEqual({ enforced: true });
+    expect(tokenStoreProtection('scratch').enforced).toBe(false);
+    expect(tokenStoreProtection('off').enforced).toBe(false);
   });
 
-  it('admits the gap when there is no sandbox, and names the fix', () => {
-    const report = tokenStoreProtection(false);
-    expect(report.enforced).toBe(false);
-    expect(report.advisory).toContain('sandbox');
-    // It must say what an agent can actually do, not just that something is
-    // "less secure" — an operator cannot weigh a vague warning.
-    expect(report.advisory).toContain('同一个系统用户');
+  it('tells a scratch bot something different from a bot with no sandbox', () => {
+    expect(tokenStoreProtection('scratch').advisory).toBeTruthy();
+    expect(tokenStoreProtection('off').advisory).toBeTruthy();
+    expect(tokenStoreProtection('scratch').advisory).not.toBe(tokenStoreProtection('off').advisory);
+  });
+
+  it('points at the Dashboard entry and mode the operator actually sees', () => {
+    // Both sides come from real data: the advisory must name the labels the
+    // Dashboard renders, or an operator cannot find the switch it describes.
+    const tr = createDashboardTranslator('zh');
+    for (const mode of ['off', 'scratch'] as const) {
+      const advisory = tokenStoreProtection(mode).advisory!;
+      for (const label of [tr('nav.botDefaults'), tr('botDefaults.tabSecurity'), tr('botDefaults.sectionSandbox'), tr('botDefaults.sandboxModeOncall')]) {
+        expect(advisory, `${mode}: ${label}`).toContain(label);
+      }
+    }
   });
 });
 
@@ -197,5 +181,45 @@ describe('git attribution settings', () => {
     expect(() => parseTriggerUserAuthConfig({
       enabled: true, gitTokenExchangeUrl: 'not-a-url',
     })).toThrow(/absolute URL/);
+  });
+});
+
+describe('credentialSource', () => {
+  it('defaults to auto when absent', () => {
+    const cfg = parseTriggerUserAuthConfig({ enabled: true });
+    expect(cfg?.credentialSource).toBe('auto');
+    expect(credentialSourceOf(cfg)).toBe('auto');
+    expect(credentialSourceOf(null)).toBe('auto');
+    expect(credentialSourceOf({})).toBe('auto');
+  });
+
+  it.each(['auto', 'platform', 'local'] as const)('accepts %s', (source) => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, credentialSource: source })?.credentialSource).toBe(source);
+  });
+
+  it.each(['device', 'machine', 'owner', 1, true])('rejects %s', (bad) => {
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, credentialSource: bad }))
+      .toThrow(/credentialSource must be one of auto \| platform \| local/);
+  });
+});
+
+describe('delegateOnMention', () => {
+  it('is on by default and stored only when turned off', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true })).not.toHaveProperty('delegateOnMention');
+    expect(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: true })).not.toHaveProperty('delegateOnMention');
+    expect(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: false })?.delegateOnMention).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true }))).toBe(true);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: false }))).toBe(false);
+  });
+
+  it('needs the policy itself: there is no verified sender to hand over otherwise', () => {
+    expect(delegatesOnMention(null)).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: false }))).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true, tools: [] }))).toBe(false);
+  });
+
+  it.each(['yes', 1, {}])('rejects %j', bad => {
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: bad }))
+      .toThrow(/delegateOnMention must be a boolean/);
   });
 });

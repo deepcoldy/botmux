@@ -1,5 +1,5 @@
 import { execSync } from 'node:child_process';
-import { readdirSync, statSync, existsSync } from 'node:fs';
+import { readdirSync, statSync, existsSync, readFileSync } from 'node:fs';
 import { join, basename, resolve } from 'node:path';
 import { logger } from '../utils/logger.js';
 
@@ -112,8 +112,34 @@ function describeDetachedHead(_worktreePath: string, headSha: string): string {
 
 /** Sibling worktrees of one repo share a common-dir — used as the dedup
  *  key so the scanner doesn't double-register when main + linked sit
- *  side-by-side in the scan root. */
+ *  side-by-side in the scan root.
+ *
+ *  Fast path reads `.git` directly: for main repos it is a directory; for
+ *  worktrees it is a gitlink file whose `gitdir: <path>` points to
+ *  `<common-dir>/worktrees/<name>`. Reading this synchronously avoids spawning
+ *  hundreds of `git rev-parse` subprocesses over a large workspace. Falls back
+ *  to `git rev-parse --git-common-dir` on unusual or unreadable layouts. */
 function getGitCommonDir(dir: string): string {
+  const gitPath = join(dir, '.git');
+  try {
+    const st = statSync(gitPath);
+    if (st.isDirectory()) {
+      return gitPath;
+    }
+    if (st.isFile()) {
+      const line = readFileSync(gitPath, 'utf-8').trim();
+      if (line.startsWith('gitdir:')) {
+        let target = line.slice('gitdir:'.length).trim();
+        target = resolve(dir, target);
+        const idx = target.lastIndexOf('/worktrees/');
+        if (idx !== -1) {
+          return target.slice(0, idx);
+        }
+      }
+    }
+  } catch {
+    // fallback below
+  }
   const out = runGit('rev-parse --git-common-dir', dir);
   return out ? resolve(dir, out) : dir;
 }
@@ -121,7 +147,11 @@ function getGitCommonDir(dir: string): string {
 /** Index 0 of `git worktree list --porcelain` is always the main worktree.
  *  All entries share its basename as `name`, so display stays stable
  *  regardless of which sibling readdir hits first. */
-function scanRepoFromAnyWorktree(anyWorktreePath: string, options: ProjectScanOptions = {}): ProjectInfo[] {
+function scanRepoFromAnyWorktree(
+  anyWorktreePath: string,
+  options: ProjectScanOptions = {},
+  knownPaths?: Set<string>,
+): ProjectInfo[] {
   const fallback: ProjectInfo[] = [{
     name: basename(anyWorktreePath),
     path: anyWorktreePath,
@@ -143,6 +173,7 @@ function scanRepoFromAnyWorktree(anyWorktreePath: string, options: ProjectScanOp
   for (const line of lines) {
     if (line.startsWith('worktree ')) {
       currentPath = line.slice('worktree '.length);
+      knownPaths?.add(currentPath);
     } else if (line.startsWith('HEAD ')) {
       currentHead = line.slice('HEAD '.length);
     } else if (line.startsWith('branch ')) {
@@ -198,6 +229,7 @@ export function scanProjects(baseDir: string, maxDepth: number = 3, options: Pro
 
   function walk(dir: string, depth: number): void {
     if (depth > maxDepth) return;
+    if (seenPaths.has(dir)) return;
     if (overBudget()) return;
     dirsVisited++;
 
@@ -213,9 +245,12 @@ export function scanProjects(baseDir: string, maxDepth: number = 3, options: Pro
       if (seenRepos.has(commonDir)) return;
       seenRepos.add(commonDir);
 
-      for (const p of scanRepoFromAnyWorktree(dir, options)) {
+      for (const p of scanRepoFromAnyWorktree(dir, options, seenPaths)) {
         if (!seenPaths.has(p.path)) {
           seenPaths.add(p.path);
+          projects.push(p);
+        } else if (!projects.some(existing => existing.path === p.path)) {
+          // In case knownPaths already marked it but it's not yet in projects list
           projects.push(p);
         }
       }
@@ -224,8 +259,9 @@ export function scanProjects(baseDir: string, maxDepth: number = 3, options: Pro
 
     for (const entry of entries) {
       if (entry.startsWith('.') || entry === 'node_modules' || entry === 'vendor' || entry === 'dist') continue;
-      if (overBudget()) return;
       const fullPath = join(dir, entry);
+      if (seenPaths.has(fullPath)) continue;
+      if (overBudget()) return;
       try {
         if (statSync(fullPath).isDirectory()) {
           walk(fullPath, depth + 1);

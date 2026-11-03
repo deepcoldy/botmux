@@ -39,16 +39,13 @@ import { type Locale, t } from '../../i18n/index.js';
 
 import { resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import type { CardActionData } from './card-handler.js';
+import { BACK_TO_OVERVIEW_ACTION, ackToast, errorToast, type DashCardHandlerResult } from './dash-card-common.js';
 
 export const SETTINGS_ACTION_TOGGLE = 'dash_settings_toggle' as const;
 export const SETTINGS_ACTION_SET_TIME = 'dash_settings_set_time' as const;
 export const SETTINGS_ACTION_REFRESH = 'dash_settings_refresh' as const;
 /** Current-value segmented-control buttons send noop as a fail-safe. */
 export const SETTINGS_ACTION_NOOP = 'dash_settings_noop' as const;
-/** Action emitted by "🔙 返回总览" on overview-origin settings cards. Same
- *  string as overview-card's OVERVIEW_ACTION_REFRESH (kept in sync; we don't
- *  import to avoid a circular dep). */
-const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
 const TIME_REGEX = /^([01]\d|2[0-3]):[0-5]\d$/;
 const TOGGLE_FIELDS: ReadonlySet<string> = new Set([
@@ -342,29 +339,7 @@ async function resolveVerifiedOperatorUnionId(
   }
 }
 
-/**
- * Lark card-callback result envelope. event-dispatcher pass-through expects
- * either `{ toast }`, `{ card }`, or both — see `event-dispatcher.ts:390-395`.
- *
- * The handler awaits GET/PUT inline. On the success path it returns ONLY
- * `{ card }` (no toast). Why card-only:
- *  - Lark's client renders toast and card replacement as two separate passes;
- *    users briefly see the old card state between them.
- *  - Card-only collapses that to a single pass — the card body itself
- *    (`✓ 已开启` / `✓ 已关闭`) is the feedback signal; users learn the
- *    write succeeded from the new state, not from a toast.
- * Error / permission denial / noop still return `{ toast }` (no card to
- * render anyway). Round-trip Route B PUT + card rebuild fits in ~30-80ms;
- * well inside the `event-dispatcher` 2.5s handler timeout
- * (`event-dispatcher.ts:365`).
- */
-export interface SettingsCardHandlerResult {
-  /** Optional — success path now returns ONLY a `card` to avoid the
-   *  toast + card two-pass render that flashes the OLD state. Errors,
-   *  permission denials, and noop still return a toast. */
-  toast?: { type: 'info' | 'success' | 'error'; content: string };
-  card?: { type: 'raw'; data: Record<string, unknown> };
-}
+export type SettingsCardHandlerResult = DashCardHandlerResult;
 
 export type PatchBuildResult =
   | { ok: true; value: unknown }
@@ -412,14 +387,6 @@ export function buildPatchFromAction(
     default:
       return { ok: false, error: 'invalid_action' };
   }
-}
-
-function ackToast(textKey: string, locale: Locale): SettingsCardHandlerResult {
-  return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
-}
-
-function errorToast(textKey: string, params: Record<string, string> | undefined, locale: Locale): SettingsCardHandlerResult {
-  return { toast: { type: 'error', content: t(textKey, params, locale) } };
 }
 
 /**

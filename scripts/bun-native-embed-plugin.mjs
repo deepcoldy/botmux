@@ -131,6 +131,16 @@ export function makeNativeEmbedPlugin({ ptyNode, spawnHelper, skiaNode = null })
       // var (once, at process start) to its extracted path via a tiny shim that
       // js-binding imports first. Kept behind a flag so a build without canvas
       // native still compiles (card render just degrades).
+      //
+      // NOTE on the runtime path: js-binding's `requireNative()` is an
+      // `if (env) { … } else if (platform …)` chain, NOT if/else-if with a later
+      // static-require fallback. Once this env var is set, a failing `require`
+      // inside it only records a load error and the function returns undefined —
+      // it never retries the platform require. So the embed is authoritative and
+      // FAIL-CLOSED (a bad/unreadable embedded path surfaces as `Cannot find
+      // native binding`, it does not silently fall back). The real fallback is
+      // one level up: captureToPng is imported lazily so a missing canvas native
+      // fails just the screenshot, not worker module init.
       if (skiaNode) {
         build.onLoad({ filter: /@napi-rs[\\/]canvas[\\/]js-binding\.js$/ }, (args) => {
           const original = readFileSync(args.path, 'utf8');

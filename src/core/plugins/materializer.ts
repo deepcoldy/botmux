@@ -13,6 +13,7 @@ export const CLI_CAPABILITY_MATRIX: Record<string, { skills: CliCapabilityState;
   'claude-code': { skills: 'supported', mcpGateway: 'supported' },
   opencode: { skills: 'supported', mcpGateway: 'adapter-required' },
   opencode2: { skills: 'supported', mcpGateway: 'adapter-required' },
+  mimocode: { skills: 'supported', mcpGateway: 'adapter-required' },
 };
 
 export function readMaterializedPlugin(pluginId: string): PluginMaterializedFile | undefined {
@@ -73,6 +74,9 @@ export function materializePlugin(pluginId: string): PluginMaterializedFile {
   };
   if (record.contributions?.cardActions) {
     materialized.cardActions = record.contributions.cardActions;
+  }
+  if (record.contributions?.commands) {
+    materialized.commands = record.contributions.commands;
   }
   writeMaterialized(materialized);
   return materialized;

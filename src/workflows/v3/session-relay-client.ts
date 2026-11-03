@@ -49,6 +49,8 @@ export function readWorkflowSessionRelayContext(options: {
   env: NodeJS.ProcessEnv;
   dataDir: string;
   startPid?: number;
+  /** Also resolve a protected capability for host-visible ancestry; callers must still attest it. */
+  includeHostSession?: boolean;
   /** Test seams. */
   readClaim?: typeof readManagedOriginCapability;
   findMarker?: typeof findAncestorSessionContext;
@@ -57,7 +59,7 @@ export function readWorkflowSessionRelayContext(options: {
   if (!sessionId) return null;
   const findMarker = options.findMarker ?? findAncestorSessionContext;
   const marker = findMarker(options.dataDir, options.startPid ?? process.ppid, sessionId);
-  if (marker?.sessionId) return null;
+  if (marker?.sessionId && !options.includeHostSession) return null;
   const readClaim = options.readClaim ?? readManagedOriginCapability;
   const relayDir = options.env.BOTMUX_SEND_RELAY?.trim();
   const originChannelId = options.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();

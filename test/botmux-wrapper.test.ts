@@ -1,8 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir, resolveStableBotmuxWrapperPath } from '../src/core/botmux-wrapper.js';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from '../src/core/botmux-wrapper.js';
 
 describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isolation)', () => {
   it('core-only → dedicated <SESSION_DATA_DIR>/bin (never shared ~/.botmux/bin)', () => {
@@ -14,43 +11,6 @@ describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isola
   });
   it('core-only WITHOUT SESSION_DATA_DIR falls back to shared (defensive; entrypoint always sets it)', () => {
     expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', HOME: '/home/u' })).toBe('/home/u/.botmux/bin');
-  });
-});
-
-describe('resolveStableBotmuxWrapperPath', () => {
-  it('uses the same dedicated wrapper the daemon writes in core-only mode', () => {
-    expect(resolveStableBotmuxWrapperPath({
-      BOTMUX_CORE_ONLY: '1',
-      SESSION_DATA_DIR: '/srv/co/data',
-      HOME: '/home/u',
-    }, 'linux')).toBe('/srv/co/data/bin/botmux');
-  });
-
-  it('does not mistake the MCP gateway override for the daemon-written wrapper', () => {
-    expect(resolveStableBotmuxWrapperPath({
-      HOME: '/home/u',
-      BOTMUX_BIN_PATH: '/opt/custom/gateway',
-    }, 'linux')).toBe('/home/u/.botmux/bin/botmux');
-  });
-
-  it('uses the Windows wrapper filename', () => {
-    expect(resolveStableBotmuxWrapperPath({ HOME: 'C:\\Users\\bot' }, 'win32'))
-      .toMatch(/botmux\.cmd$/);
-  });
-
-  it('canonicalizes a materialized wrapper directory through a symlinked home', () => {
-    if (process.platform === 'win32') return;
-    const root = mkdtempSync(join(tmpdir(), 'botmux-wrapper-home-'));
-    const realHome = join(root, 'real');
-    const aliasHome = join(root, 'alias');
-    mkdirSync(join(realHome, '.botmux', 'bin'), { recursive: true });
-    symlinkSync(realHome, aliasHome, 'dir');
-    try {
-      expect(resolveStableBotmuxWrapperPath({ HOME: aliasHome }, 'linux'))
-        .toBe(join(realpathSync(join(realHome, '.botmux', 'bin')), 'botmux'));
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
   });
 });
 

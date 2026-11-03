@@ -1,4 +1,158 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo';
+import type {
+  RemoteRunnerBackendState,
+  RemoteRunnerOutboundMessage,
+  RemoteRunnerOutboundMessageResult,
+  RemoteRunnerSessionToolOperation,
+  RemoteRunnerSessionToolResult,
+  RemoteRunnerRecoveredTurn,
+  RemoteRunnerTrustedCaller,
+  RemoteRunnerUsageReport,
+} from './remote-runner-protocol.js';
+
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner' | 'orca';
+
+export type HerdrBackendPlacement = 'workspace' | 'tab' | 'split';
+
+export interface HerdrBackendConfig {
+  /**
+   * Named Herdr session to host Botmux-managed agents.
+   * Defaults to 'botmux'.
+   * When pointing to an external user session (e.g. 'default'), Botmux launches
+   * agents inside that session and never destroys or restarts the host session.
+   */
+  sessionName?: string;
+
+  /**
+   * Placement mode for new managed agent panes:
+   * - 'workspace' (default): creates a new workspace for each topic (herdr workspace create).
+   * - 'tab': creates a new tab inside the target workspace (herdr tab create).
+   * - 'split': splits an existing pane inside the target tab (herdr pane split).
+   */
+  placement?: HerdrBackendPlacement;
+
+  /**
+   * Target workspace id or label when placement is 'tab' or 'split'. Matched by
+   * exact id/label, then the label's first word, then prefix, then substring.
+   * Falls back to the focused workspace.
+   */
+  workspace?: string;
+
+  /**
+   * Target tab id or label when placement is 'split' (e.g. "3 其他" or "3"),
+   * matched like `workspace`; also the label of a tab Botmux creates.
+   */
+  tab?: string;
+
+  /**
+   * Split direction when placement is 'split'. Default 'right'.
+   */
+  splitDirection?: 'right' | 'down';
+
+  /**
+   * Chat types this placement applies to (e.g. ['group'] keeps DM sessions out
+   * of the user's session). Unset = every session. Sessions of other types use
+   * the default machine-wide 'botmux' host with workspace placement.
+   */
+  chatTypes?: Array<'group' | 'p2p'>;
+}
+
+/** `chatTypes` from bots.json or a comma-separated env value. Unknown entries
+ *  are dropped; nothing valid left means "unset" (applies to every session). */
+export function normalizeHerdrChatTypes(raw: unknown): Array<'group' | 'p2p'> | undefined {
+  const items = typeof raw === 'string' ? raw.split(',') : Array.isArray(raw) ? raw : [];
+  const types = [...new Set(items
+    .map(item => (typeof item === 'string' ? item.trim() : ''))
+    .filter((item): item is 'group' | 'p2p' => item === 'group' || item === 'p2p'))];
+  return types.length > 0 ? types : undefined;
+}
+
+/** Normalize a herdr block from bots.json or the BOTMUX_HERDR_* env, keeping
+ *  only the fields that are set so a bot block can be layered over the env
+ *  block field by field. Nothing set → undefined. */
+export function normalizeHerdrBackendConfig(raw: unknown): HerdrBackendConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
+  const config: HerdrBackendConfig = {
+    sessionName: text(r.sessionName),
+    placement: r.placement === 'workspace' || r.placement === 'tab' || r.placement === 'split' ? r.placement : undefined,
+    workspace: text(r.workspace),
+    tab: text(r.tab),
+    splitDirection: r.splitDirection === 'right' || r.splitDirection === 'down' ? r.splitDirection : undefined,
+    chatTypes: normalizeHerdrChatTypes(r.chatTypes),
+  };
+  for (const key of Object.keys(config) as Array<keyof HerdrBackendConfig>) {
+    if (config[key] === undefined) delete config[key];
+  }
+  return Object.keys(config).length > 0 ? config : undefined;
+}
+
+/** The herdr config a herdr-backed session spawns with: the bot's block layered
+ *  over the daemon-level BOTMUX_HERDR_* config field by field (an empty bot
+ *  block hides nothing). It only takes effect once it names a session or a
+ *  placement; otherwise the default 'botmux' host and workspace placement
+ *  apply, same as having no config. */
+export function resolveHerdrBackendConfig(
+  daemonConfig: HerdrBackendConfig | undefined,
+  botConfig: HerdrBackendConfig | undefined,
+): HerdrBackendConfig | undefined {
+  const merged: HerdrBackendConfig = { ...daemonConfig, ...botConfig };
+  return merged.sessionName || merged.placement ? merged : undefined;
+}
+
+/** The Herdr placement a worker applies, from its init `backendConfig`.
+ *  Undefined (default host and placement) when there is no herdr block or
+ *  `chatTypes` excludes this session's chat type. */
+export function herdrConfigForSession(
+  backendConfig: unknown,
+  chatType: 'group' | 'p2p' | undefined,
+): HerdrBackendConfig | undefined {
+  const config = backendConfig && typeof backendConfig === 'object'
+    && ('sessionName' in backendConfig || 'placement' in backendConfig)
+    ? backendConfig as HerdrBackendConfig
+    : undefined;
+  return herdrConfigForChatType(config, chatType);
+}
+
+/** The Herdr placement for one session, or undefined when `chatTypes` excludes
+ *  its chat type (the session then uses the default host). */
+export function herdrConfigForChatType(
+  config: HerdrBackendConfig | undefined,
+  chatType: 'group' | 'p2p' | undefined,
+): HerdrBackendConfig | undefined {
+  if (!config?.chatTypes) return config;
+  return chatType && config.chatTypes.includes(chatType) ? config : undefined;
+}
+
+export interface BackendTurnInput {
+  content: string;
+  turnId: string;
+  replyTurnId?: string;
+  dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
+  trustedCaller?: RemoteRunnerTrustedCaller;
+}
+
+/** Host-owned state frozen beside a Remote Runner turn. Providers never send
+ * or receive this context; it exists only on the backend → worker callbacks. */
+export interface RemoteRunnerTurnHostContext {
+  linkRefMode?: 'observe' | 'enabled';
+}
+
+export interface BackendTurnSubmission {
+  submitted: boolean;
+  failureReason?: string;
+  /** Whether a rejected submission provably stayed local or may have executed. */
+  submissionDisposition?: 'untouched' | 'dirty_unknown';
+}
+
+export interface BackendTurnFailure {
+  turnId: string;
+  code: string;
+  message: string;
+  status: 'failed' | 'ambiguous' | 'cancelled';
+  retryable: boolean;
+}
 
 /**
  * Durable identity of the backing resource owned by one Botmux session.
@@ -9,8 +163,23 @@ export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' |
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij' | 'zmx'; sessionName: string }
-  | { backendType: 'herdr'; sessionName: string; agentName?: string };
+  // New tmux targets freeze the server (`-L <socketName>`, see tmux-socket.ts);
+  // a tmux target without it lives on the default server (every older row).
+  | { backendType: 'tmux'; sessionName: string; socketName?: string }
+  | { backendType: 'zellij'; sessionName: string }
+  // New ZMX targets freeze the native socket directory; older rows may omit it.
+  | { backendType: 'zmx'; sessionName: string; socketDir?: string }
+  | {
+    backendType: 'herdr';
+    sessionName: string;
+    agentName?: string;
+    /**
+     * Full Botmux owner id attached by the lifecycle resolver. It is required
+     * before an agent-less legacy `bmx-<sid8>` target may be treated as an
+     * exclusive whole-session resource; persisted/shared targets may omit it.
+     */
+    sessionId?: string;
+  };
 
 /**
  * Tri-state result of probing whether a named backing session exists.
@@ -42,6 +211,41 @@ export interface SpawnOpts {
    */
   injectEnv?: Record<string, string>;
   /**
+   * Inherited variables the session env overlay removes (core/session-env.ts).
+   * The worker already deleted them from `env`; the shell-wrapped backends
+   * (tmux/zellij/zmx) additionally pass `-u KEY` to the pane's final
+   * `/usr/bin/env`, which runs after the rcfile and the terminal server's
+   * global env have been applied, so those sources cannot re-add them.
+   */
+  unsetEnv?: string[];
+  /**
+   * The git `-c` pairs (config KEY/VALUE contents) botmux authored for THIS
+   * turn, e.g. the trigger-user credential helper + URL rewrites from
+   * gitIdentityConfigPairs. Shell-wrapped backends publish exactly this set
+   * into the pane as numbered `GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>` with
+   * `GIT_CONFIG_COUNT` set to its length, renumbered from 0. The environment
+   * is NEVER scanned for numbered git config entries: ambient or per-bot
+   * `GIT_CONFIG_*` values (high indices, gaps, forged names, a stale or
+   * pushed-up count) cannot reach git in the pane this way. Empty/undefined
+   * with an ambient count present makes the pane publish `GIT_CONFIG_COUNT=0`.
+   * Direct-exec backends (PTY, env -i strict panes) ignore this and consume
+   * the encoded entries the worker already placed in `env`.
+   */
+  gitConfigPairs?: ReadonlyArray<readonly [string, string]>;
+  /**
+   * Botmux-owned per-session directory (pane-launch.ts paneLaunchDir) for the
+   * private file a tmux pane reads its launch argv from. Without it the tmux
+   * backend uses a fresh private temp directory.
+   */
+  paneLaunchDir?: string;
+  /** Strict panes launch with env -i and skip user shell startup profiles. */
+  strictEnv?: boolean;
+  /** Worker verified the surviving generation's policy stamp. */
+  strictEnvReattach?: boolean;
+  /** Why a Remote Runner state is being resumed. Explicit reactivation may
+   * require the provider to replace a resource that was previously cancelled. */
+  remoteResumeMode?: 'reattach' | 'rebuild';
+  /**
    * Per-bot shell override (BotConfig.launchShell). When set, the persistent
    * backends (tmux/zellij/zmx) launch the CLI under this shell instead of `$SHELL`
    * — the escape hatch for a login `$SHELL` whose rcfile `exec`-trampolines into
@@ -56,6 +260,14 @@ export interface SpawnOpts {
    * Backends that execute `bin` directly (pty/tmux/zellij/zmx) ignore it.
    */
   cliBin?: string;
+  /** Logical CLI identifier (e.g. 'claude', 'codex') for agent kind fallback. */
+  cliId?: string;
+  /** Provider-neutral model selection for structured remote runners. */
+  model?: string;
+  /** Provider-neutral model backend variant for structured remote runners. */
+  modelBackendVariant?: 'standard' | 'max';
+  /** Provider-neutral reasoning effort for structured remote runners. */
+  reasoningEffort?: string;
 }
 
 export type AmbiguousSubmissionRecoveryFailure =
@@ -77,6 +289,10 @@ export interface SessionBackend {
   /** Returns false only when the backend can prove the write was not accepted.
    * Legacy implementations may return void on success. */
   write(data: string): void | boolean;
+  /** Provider-native structured turn submission. Backends that implement this
+   * bypass terminal keystroke adapters and receive the daemon-authenticated
+   * turn envelope directly. */
+  submitTurn?(input: BackendTurnInput): Promise<BackendTurnSubmission>;
   /**
    * Begin one logical adapter submission and return its recovery fence.
    * Backends with a persistent ambiguity journal may arm it here so all
@@ -104,10 +320,10 @@ export interface SessionBackend {
   /**
    * Replace the worker's derived screen state with an authoritative snapshot.
    *
-   * Live-only observers use this after reconnecting: output may have been
-   * produced while the observer was offline, so replaying only subsequent
-   * chunks would leave idle detection and cards permanently stale. This is a
-   * reset/rebase signal, not another incremental PTY chunk.
+   * Snapshot-native backends use this for bounded viewport updates; live-only
+   * observers also use it after reconnecting, when output may have been
+   * produced while the observer was offline. This is a reset/rebase signal,
+   * not another incremental PTY chunk.
    */
   onScreenResync?(cb: (snapshot: string) => void): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
@@ -132,6 +348,9 @@ export interface SessionBackend {
    */
   settleCurrentScreen?(): Promise<boolean>;
   captureViewport?(): string;
+  /** Fresh, bounded viewport read without blocking the Worker event loop.
+   * Returns plain text; rejects or returns empty when the viewport is unknown. */
+  captureViewportAsync?(): Promise<string>;
   /**
    * Plain current viewport plus the real terminal cursor. Adopt-mode input
    * guards use this to detect an unsubmitted local composer draft before a
@@ -172,7 +391,45 @@ export interface SessionBackend {
    * a backend must not pre-filter it. Optional — backends whose output the user
    * can already read in a terminal never implement it.
    */
-  onTurnFinal?(cb: (text: string) => void): void;
+  onTurnFinal?(cb: (
+    text: string,
+    turnId?: string,
+    hostContext?: RemoteRunnerTurnHostContext,
+  ) => void): void;
+  /** Exact provider-reported terminal failure for a submitted turn. */
+  onTurnFailure?(cb: (failure: BackendTurnFailure) => void): void;
+  /** Provider-requested chat output for the active turn. A negotiated final
+   * may own terminal delivery; the worker remains the trusted routing and
+   * delivery authority, and providers never receive a destination override or
+   * platform credential. */
+  onOutboundMessage?(
+    cb: (
+      message: RemoteRunnerOutboundMessage,
+      hostContext: RemoteRunnerTurnHostContext,
+    ) => Promise<RemoteRunnerOutboundMessageResult>,
+  ): void;
+  /** Provider-requested access to the current BotMux session's allowlisted
+   * helper surface. The worker freezes session and turn authority before
+   * executing anything on the host; schedule mutations still cross daemon
+   * authorization. */
+  onSessionTool?(
+    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+  ): void;
+  /** A provider-owned turn survived the host/worker process and is now being
+   * observed without resubmitting its prompt. */
+  onTurnRecovered?(cb: (turn: RemoteRunnerRecoveredTurn) => void): void;
+  /** Install daemon-restored host-only state for an exact provider-owned turn.
+   * Until this succeeds, the backend must not release recovered output. */
+  setRecoveredTurnHostContext?(
+    turnId: string,
+    context: RemoteRunnerTurnHostContext,
+  ): boolean;
+  /** Provider handshake/startup is complete and turns may be accepted. */
+  onReady?(cb: () => void): void;
+  /** Durable, provider-neutral lineage/runtime state changed. */
+  onBackendState?(cb: (state: RemoteRunnerBackendState) => void): void;
+  /** Provider-native usage observed at a generation-fenced turn boundary. */
+  onUsageSnapshot?(cb: (usage: RemoteRunnerUsageReport) => void): void;
   /** Remote-session lineage updates — the worker forwards these to the daemon
    *  so the follow-up lineage survives daemon restarts. `null` clears the
    *  persisted lineage (follow-up failed → next message starts fresh). */
@@ -196,7 +453,7 @@ export interface SessionBackend {
    * writes, drain every write accepted before the fence, and return the exact
    * final lineage without cancelling it. The daemon persists that lineage
    * before telling the worker it may exit. */
-  prepareShutdownDetach?(): Promise<SessionShutdownDetachResult>;
+  prepareShutdownDetach?(drainTimeoutMs?: number): Promise<SessionShutdownDetachResult>;
   /** Restore admission/streaming when the daemon cannot complete a prepared
    * shutdown detach (for example, lineage persistence failed). */
   abortShutdownDetach?(): SessionShutdownDetachResult | Promise<SessionShutdownDetachResult>;
@@ -311,6 +568,8 @@ export interface ObserveBackend extends SessionBackend {
   captureViewport(): string;
   /** Live pane dimensions, or null if the pane is gone. */
   getPaneSize(): { cols: number; rows: number } | null;
+  /** Notify viewers when an external pane changes geometry after attach. */
+  onPaneSizeChange?(cb: (size: { cols: number; rows: number }) => void): void;
   /** Cheap liveness probe. */
   isPaneAlive(): boolean;
   /**

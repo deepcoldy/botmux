@@ -12,9 +12,10 @@ import {
   isStructuredBridgeAdoptIdleCli,
   isStructuredBridgeAdoptInputCli,
   isStructuredBridgeLifecycleBlockingCli,
+  supportsZeroPromptStructuredBridge,
+  supportsTranscriptReplyDelivery,
   STRUCTURED_BRIDGE_ALWAYS_CLI_IDS,
   STRUCTURED_BRIDGE_ADOPT_CLI_IDS,
-  STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS,
 } from '../src/services/structured-bridge-clis.js';
 import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
 
@@ -40,11 +41,33 @@ describe('structured-bridge-clis', () => {
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('ebsd');
   });
 
-  it('fallback treats cursor as adopt-only', () => {
-    expect(isStructuredBridgeFallbackActive('cursor')).toBe(false);
+  it('cursor is always-on and antigravity stays zero-prompt-only', () => {
+    // Plan B (#932): an ordinary botmux-spawned cursor gets the same
+    // send-marker-gated transcript harvest as codex.
+    expect(isStructuredBridgeFallbackActive('cursor')).toBe(true);
     expect(isStructuredBridgeFallbackActive('cursor', true)).toBe(true);
+    expect(isStructuredBridgeFallbackActive('cursor', false, true)).toBe(true);
+    expect(isStructuredBridgeFallbackActive('cursor', false, false)).toBe(true);
+    expect(isStructuredBridgeFallbackActive('antigravity')).toBe(false);
+    expect(isStructuredBridgeFallbackActive('antigravity', false, true)).toBe(true);
+    expect(isStructuredBridgeFallbackActive('antigravity', false, false)).toBe(false);
+    // antigravity has no /adopt bridge — adopt must win over the zero-prompt
+    // flag rather than silently routing an adopted pane through the spawn path.
+    expect(isStructuredBridgeFallbackActive('antigravity', true, true)).toBe(false);
+    expect(isStructuredBridgeFallbackActive('antigravity', true, false)).toBe(false);
     expect(isStructuredBridgeFallbackActive('grok')).toBe(true);
     expect(isStructuredBridgeFallbackActive('hermes')).toBe(true);
+  });
+
+  it('cursor supports ordinary transcript delivery; antigravity stays zero-prompt-only', () => {
+    expect(supportsZeroPromptStructuredBridge('cursor')).toBe(true);
+    expect(supportsTranscriptReplyDelivery('cursor')).toBe(true);
+    // antigravity: zero-prompt capability exists, ordinary delivery does not.
+    expect(supportsZeroPromptStructuredBridge('antigravity')).toBe(true);
+    expect(supportsTranscriptReplyDelivery('antigravity')).toBe(false);
+    expect(supportsZeroPromptStructuredBridge('codex')).toBe(true);
+    expect(supportsZeroPromptStructuredBridge('claude-code')).toBe(false);
+    expect(supportsTranscriptReplyDelivery('claude-code')).toBe(true);
   });
 
   it('adopt idle/input allowlists match historical worker behaviour', () => {
@@ -61,13 +84,13 @@ describe('structured-bridge-clis', () => {
     // started Pi turn may suppress the screen-ready heuristic (the custom-tool
     // terminate:true gap is accepted — next user turn HOL-drops the head).
     // grok: user_message_chunk → turn_completed with normalized stop reasons.
-    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex', 'pi', 'oh-my-pi', 'ebsd', 'grok']);
     expect(isStructuredBridgeLifecycleBlockingCli('codex')).toBe(true);
+    expect(isStructuredBridgeLifecycleBlockingCli('traex')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('pi')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('oh-my-pi')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('ebsd')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('grok')).toBe(true);
-    for (const id of ['traex', 'coco', 'hermes', 'mtr', 'cursor']) {
+    for (const id of ['coco', 'hermes', 'mtr', 'cursor', 'antigravity']) {
       expect(isStructuredBridgeLifecycleBlockingCli(id)).toBe(false);
     }
   });

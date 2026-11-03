@@ -5,10 +5,12 @@ import * as sessionStore from '../services/session-store.js';
 import { logger } from '../utils/logger.js';
 import type { DaemonSession } from './types.js';
 import { isRemoteBackendType } from './persistent-backend.js';
+import { waitForFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import {
   REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
   REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
   REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
 } from './shutdown-budgets.js';
 
@@ -80,6 +82,7 @@ export type RemoteShutdownPrepareResult =
 
 export type RemoteShutdownPrepareOptions = {
   drainTimeoutMs?: number;
+  finalOutputDrainTimeoutMs?: number;
   abortTimeoutMs?: number;
   /** Absolute transaction deadline. A worker is never asked to fence unless
    * phase-2 plus the configured admission-restore reserve remain after drain. */
@@ -206,7 +209,7 @@ function requestPhase(
     worker.on('message', onMessage);
     worker.once('exit', onExit);
     const message: DaemonToWorker = phase === 'prepare'
-      ? { type: 'remote_shutdown_prepare', requestId }
+      ? { type: 'remote_shutdown_prepare', requestId, drainTimeoutMs: timeoutMs }
       : { type: 'remote_shutdown_abort', requestId };
     if (!send(worker, message)) {
       finish({ ok: false, taskId: null, error: `remote_shutdown_${phase}_send_failed` });
@@ -220,6 +223,7 @@ function clearWorkerOwnership(ds: DaemonSession, worker: ChildProcess): void {
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
+  ds.workerCardViewToken = null;
   ds.managedTurnOrigin = undefined;
   ds.remoteShutdownState = undefined;
 }
@@ -463,6 +467,43 @@ export async function prepareRemoteSessionForShutdown(
       taskId: prepared.taskId,
       error: 'stale_worker_generation',
       worker,
+    };
+  }
+
+  // `turnSettled` proves the provider emitted final/failure, not that the
+  // daemon finished the corresponding user-visible IM reply. The worker sends
+  // final_output before its prepare ACK on the same ordered IPC channel; wait
+  // for that daemon-owned delivery while the exact worker generation remains
+  // fenced, otherwise commit can retire it before attempt 0 even starts.
+  const configuredFinalOutputDrainMs = options.finalOutputDrainTimeoutMs
+    ?? REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS;
+  const availableFinalOutputDrainMs = options.deadlineMs === undefined
+    ? configuredFinalOutputDrainMs
+    : Math.max(
+        0,
+        options.deadlineMs
+          - now()
+          - REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
+          - abortReserveMs,
+      );
+  const finalOutputDrainMs = Math.min(
+    configuredFinalOutputDrainMs,
+    availableFinalOutputDrainMs,
+  );
+  const finalOutputQuiesced = await waitForFinalOutputDeliveryDrain(
+    ds,
+    now() + finalOutputDrainMs,
+    now,
+  );
+  if (!finalOutputQuiesced) {
+    return {
+      ok: false,
+      fence: 'possible',
+      requestId,
+      taskId: prepared.taskId,
+      error: 'final_output_delivery_drain_timeout',
+      worker,
+      expectedAbortTaskId: prepared.taskId,
     };
   }
   ds.remoteShutdownState = { phase: 'prepared', requestId, taskId: prepared.taskId };

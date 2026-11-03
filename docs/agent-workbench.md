@@ -16,6 +16,14 @@ Agent Workbench（工作台）是 botmux Dashboard 里新增的一个全屏页�
 
 会话可按六个维度分组（状态/机器人/会话位置/类型/CLI/活跃时间），组可折叠，支持搜索和键盘导航；列表做了虚拟滚动，300+ 会话照样流畅。不管选哪个维度，「待你处理」永远置顶红色高亮——bot 举手求助的、等你选仓库的、刚回完话你还没看的，全在最上面。效果见上方主图：左侧「待你处理 9」置顶，下面是「进行中 189」。
 
+### 单聊话题：定位与跳转
+
+机器人单聊中的独立话题也提供「定位」「跳转」，类型徽标仍显示「单聊」。有定位权限时，点击「定位」会让机器人在原话题中通知会话拥有者；成功后冷却 30 秒，发送失败会显示原因。已获取原生话题链接时，「跳转」直接打开该话题，不发送通知，只读身份也可使用。
+
+整段连续单聊只保留「聊天」入口。旧话题缺少原生链接时不会显示「跳转」；后台补查成功后才出现，补查失败仍可使用已有的定位入口。
+
+![单聊话题、连续单聊与历史话题的操作示意](assets/workbench-p2p-topic-actions.png)
+
 ### 终端：默认只读围观，一键接管输入
 
 点会话行的「终端」按钮，右侧就出现该会话的实时终端，默认只读、随便看不怕误碰。要打字时点终端面板右上角的「接管输入」，拿到一个短时独占租约（默认 5 分钟，倒计时可见），期间只有你能输入；点「释放输入」、租约到期或断线都会自动回到只读。主图右侧终端标题栏的「◆可输入 · 11 分钟后到期」就是接管中的状态。
@@ -84,10 +92,12 @@ botmux dashboard
 工作台: http://<lan-ip>:7891/workbench?t=<token>
 
 # 已绑定中心平台 —— 不带 token，身份由平台注入 + SSO 认
-工作台: https://m-<machineId>.<平台域名>/#/agent-workbench
+工作台: https://m-<machineId>.<平台域名>/#/agent-workbench?botmuxWorkbenchShell=immersive
 ```
 
-两种形态浏览器打开都直达工作台（带 token 的 `/workbench` 会 302 到 `/#/agent-workbench`；不带 token 的直接就是 hash 路由，因为 `/workbench` 在无凭证时会被门禁 401）。
+两种形态浏览器打开都直达工作台（带 token 的 `/workbench` 会 302 到 `/#/agent-workbench?botmuxWorkbenchShell=immersive`；不带 token 的直接就是 hash 路由，因为 `/workbench` 在无凭证时会被门禁 401）。
+
+hash 里的 `botmuxWorkbenchShell=immersive` 是**沉浸式标记**：带着它进来的工作台是一整屏的无边框壳（没有 Dashboard 的顶栏和侧栏），`/dashboard` 卡片的「打开工作台」按钮、`botmux dashboard` 打印的链接、常驻链接和短票兑换这些直达入口都落在这种形态；从 Dashboard 侧边栏「驾驶舱」点进去的 `#/agent-workbench` 不带标记，保持正常壳，方便继续在侧栏间切换。页面加载后标记会被提升进查询串（`/?botmuxWorkbenchShell=immersive#/agent-workbench`），之后选中会话切换 hash 也不会丢。
 
 绑定平台后链接不再带 token 是有意的：走平台子域时 `?t=` 会被服务端压制成无效，token 对访问毫无贡献、只剩被转发截图的泄漏风险。注意判据是「**是否由中心平台托管**」而非「有没有远程基址」——自建反代与 Devbox 短链没有人注入身份，token 仍是唯一凭证，对它们摘 token 会摘成死链。那条带 token 的本地直连兜底链接默认不打印，需要时按命令输出里提示的参数取回（该参数不进 `--help`，避免 AI 顺手带上）。怀疑链接泄露时可用 `botmux dashboard rotate` 轮换 token，旧链接与已发出的卡片按钮立即作废。
 
@@ -97,10 +107,11 @@ botmux dashboard
 
 | 地址 | 打开什么 |
 |---|---|
-| `https://<dashboard>/#/agent-workbench` | 完整工作台 |
+| `https://<dashboard>/#/agent-workbench` | 完整工作台（带 Dashboard 侧栏，与侧边栏「驾驶舱」一致） |
+| `https://<dashboard>/#/agent-workbench?botmuxWorkbenchShell=immersive` | 完整工作台，沉浸式无边框壳 |
 | `https://<dashboard>/#/agent-workbench/<会话id>` | 完整工作台并定位到某个会话 |
 | `https://<dashboard>/#/agent-workbench-dock` | 会话坞（侧边栏形态） |
-| `https://<dashboard>/workbench`、`/workbench/dock` | 同上两个入口的无 `#` 跳板（自动 302） |
+| `https://<dashboard>/workbench`、`/workbench/dock` | 同上两个入口的无 `#` 跳板（自动 302 到沉浸式形态） |
 
 ### 3.4 手机加桌（PWA）
 
@@ -238,7 +249,7 @@ botmux preview <port>
 
 除了飞书卡片按钮，owner 还能在工作台里直接取到常驻链接本体，收藏进浏览器书签长期使用。
 
-**谁能取：** 只有本机完整管理身份（`botmux dashboard` 的 `?t=` 链接，或点 `/dashboard` 卡片按钮后种下的那枚 cookie）。飞书 H5 用户、平台 owner/teammate/guest 看不到这个入口——服务端对它们一律 404。
+**谁能取：** 只有本机完整管理身份（`botmux dashboard` 的 `?t=` 链接，或点 `/dashboard` 卡片按钮后种下的那枚 cookie）。从中心平台打开的机器 Dashboard（`m-` 子域）不带平台角色，同样按本机管理员处理（见 6.1），能取到。飞书 H5 用户、带平台角色的身份（owner/teammate/guest，如终端分享子域 `t-`）看不到这个入口——服务端对它们一律 404。
 
 **怎么取：**
 
@@ -290,8 +301,8 @@ botmux preview <port>
 
 | 身份 | 怎么来的 | 能干什么 |
 |---|---|---|
-| **本机管理员** | `botmux dashboard` 的 `?t=` 链接，或 `/dashboard` 卡片按钮（常驻链接） | 全功能：Dashboard 管理 + 工作台全部操作（含「定位」、「常驻链接」自取） |
-| **飞书 H5 用户** | H5 免登（白名单 open_id） | 工作台功能：看会话、只读终端、接管租约、预览解锁；碰不到设置/排程/调试终端等管理功能 |
+| **本机管理员** | `botmux dashboard` 的 `?t=` 链接，或 `/dashboard` 卡片按钮（常驻链接）；从中心平台打开的机器 Dashboard（`m-` 子域）也算——平台在这条反代上不注入角色，机器主人和协管者在本机都按本机管理员处理 | 全功能：Dashboard 管理 + 工作台全部操作（含「定位」、「常驻链接」自取） |
+| **飞书 H5 用户** | H5 免登（白名单 open_id） | 工作台功能：看会话、只读终端、接管租约、预览解锁；碰不到设置/排程/宿主终端（管理 → 终端）等管理功能 |
 | **平台身份** | 中心化平台注入（owner/teammate/guest） | owner 同 H5 用户的操作能力；teammate/guest 只读观看 |
 
 前端按服务端下发的能力集（定位/接管/解锁）画写操作按钮：没权限的操作连按钮都不出现，而不是点了才报错。「跳转」不是管理写操作，仅在话题会话拥有经校验的 `omt_` AppLink 时显示，不依赖 H5 或 JSAPI；非话题会话只保留「聊天」。窄身份访问管理接口被拒是预期行为，不会误弹「登录过期」。

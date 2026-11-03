@@ -14,7 +14,8 @@
  * ACK 预算：card.action.trigger 只有 3s（botmux 用 2500ms 抢答，见 event-dispatcher
  * 的 CARD_ACTION_ACK_TIMEOUT_MS），超时飞书会自己弹「未在线/超时未响应」盖掉我们的
  * toast。所以本模块**同步决策、异步发卡**：判定（配置/owner/节流）和 openPending 都是
- * 纯内存同步操作，取名字 + 发卡走 fire-and-forget，调用方拿到结论立刻 ACK。
+ * 同步操作（至多一次 grant-pending 小文件读写），取名字 + 发卡走 fire-and-forget，调用方
+ * 拿到结论立刻 ACK。卡发出去后 markPendingDelivered，授权卡才扛得过 daemon 重启。
  */
 import { getBot, getOwnerOpenId } from '../../bot-registry.js';
 import { config } from '../../config.js';
@@ -27,8 +28,9 @@ import { listObservedBots } from '../../services/observed-bots-store.js';
 import { logger } from '../../utils/logger.js';
 import { buildGrantCard } from './card-builder.js';
 import { getUserProfile, replyMessage, sendMessage } from './client.js';
-import { clearPending, openPending, throttleReason } from './grant-pending.js';
+import { clearPending, markPendingDelivered, openPending, throttleReason } from './grant-pending.js';
 import { resolveGrantApprover } from './grant-owner.js';
+import { evaluateTalk } from './event-dispatcher.js';
 
 /** 本次升级的结论。调用方据此选 toast 文案。 */
 export type AskGrantRequestOutcome =
@@ -58,6 +60,7 @@ export interface AskGrantRequestDeps {
   throttleReason?: typeof throttleReason;
   openPending?: typeof openPending;
   clearPending?: typeof clearPending;
+  markPendingDelivered?: typeof markPendingDelivered;
   /** 读 bot 配置（额度/有效期默认值 + autoGrantRequestCards 开关）。 */
   getBotConfig?: (larkAppId: string) => {
     autoGrantRequestCards?: boolean;
@@ -70,6 +73,13 @@ export interface AskGrantRequestDeps {
   deliverCard?: (target: AskGrantRequestTarget, cardJson: string) => Promise<void>;
   /** 群内审批人解析（异步，不在 ACK 路径上）。 */
   resolveGrantApprover?: typeof resolveGrantApprover;
+  /** talk 判定（黑名单否决用）。可注入：既有测试未注册真实 bot，注入假谓词即可，
+   *  不必为这条短路把整套 bot registry 拉进测试。生产缺省走 evaluateTalk 真源。 */
+  evaluateTalk?: (
+    larkAppId: string,
+    chatId: string | undefined,
+    openId: string | undefined,
+  ) => { allowed: boolean; reason: string };
 }
 
 /**
@@ -87,10 +97,12 @@ export function requestGrantForAskClicker(
   const reasonOf = deps.throttleReason ?? throttleReason;
   const open = deps.openPending ?? openPending;
   const clear = deps.clearPending ?? clearPending;
+  const markDelivered = deps.markPendingDelivered ?? markPendingDelivered;
   const readConfig = deps.getBotConfig ?? ((appId: string) => getBot(appId).config);
   const resolveName = deps.resolveTargetName ?? defaultResolveTargetName;
   const deliver = deps.deliverCard ?? defaultDeliverCard;
   const approverResolver = deps.resolveGrantApprover ?? resolveGrantApprover;
+  const evaluateTalkOf = deps.evaluateTalk ?? evaluateTalk;
 
   const { larkAppId, chatId } = ask;
   try {
@@ -100,6 +112,17 @@ export function requestGrantForAskClicker(
     const owner = ownerOf(larkAppId);
     // 开放模式（没配 owner）没人能处置这张卡 —— 不发，回落原 toast。
     if (!owner) return 'unavailable';
+    // 黑名单点击者静默：不弹授权卡、不开 pending（P1c），对外与「发不了」同款。
+    // best-effort：evaluateTalk 抛错（如测试/边缘场景 bot 未注册）绝不能把整个
+    // ask 点击链路打成 unavailable——黑名单只是「少发一张卡」的增量抑制，
+    // 真正的 talk 闸门在别处权威判定。
+    let blocked = false;
+    try {
+      blocked = evaluateTalkOf(larkAppId, chatId, clickerOpenId).reason === 'blocked';
+    } catch (err) {
+      logger.debug(`ask grant blocked-check skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (blocked) return 'unavailable';
     // 节流原因要如实透出：owner 已拒绝（denied 冷却）不能说成「等 owner 处理」。
     const throttled = reasonOf(larkAppId, chatId, clickerOpenId);
     if (throttled) return throttled;
@@ -132,7 +155,9 @@ export function requestGrantForAskClicker(
       } catch (err) {
         clear(larkAppId, chatId, clickerOpenId);
         logger.debug(`ask grant request card send failed: ${err}`);
+        return;
       }
+      markDelivered(larkAppId, chatId, [clickerOpenId], nonce);
     })();
 
     return 'sent';

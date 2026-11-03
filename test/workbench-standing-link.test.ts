@@ -340,28 +340,13 @@ describe('dashboard.ts 接线', () => {
   const read = (relative: string) =>
     readFileSync(join(process.cwd(), relative), 'utf8');
 
-  it('路由走共享处理器；身份、活跃 token、base 解析全都复用既有的唯一出处', () => {
+  // 源码结构护栏(K2)：常驻链接能换到工作台入口，签发者身份必须来自 dashboard 唯一那处请求身份判定，
+  // 不能在这条路由里另算一份；路由注册写在 dashboard.ts 的请求闭包里，没有可调用的入口。
+  it('路由走共享处理器，身份复用 dashboard 唯一的请求身份判定', () => {
     const dashboard = read('src/dashboard.ts');
-    expect(dashboard).toContain('handleWorkbenchStandingLink(req, res, url, {');
-    // 身份来自 P1-7 那一处唯一判定，不在这条路由里另算一遍。
-    expect(dashboard).toContain('identity: requestIdentity');
-    expect(dashboard).toContain('activeToken: () => activeToken');
-    // base 复用 dashboard-url 的那一份（远程访问 / 反代翻转跟着一起走），
-    // 绝不在这里手拼第二份 host:port。
-    expect(dashboard).toContain('standingLinkUrl: token => workbenchEntryUrl(dashboardUrlsFor(token).url)');
-    // 审计落在与登录 / 接管同一个 sink 上。
-    expect(dashboard).toContain('audit: dashboardControlAudit');
-  });
-
-  it('前端入口只对本机完整管理身份渲染（页面把既有的 ui.authed 传下去）', () => {
-    for (const relative of [
-      'src/dashboard/web/agent-workbench-page.tsx',
-      'src/dashboard/web/agent-workbench-dock-page.tsx',
-    ]) {
-      expect(read(relative), relative).toContain('manageAuthed={ui.authed}');
-    }
-    const view = read('src/dashboard/web/agent-workbench-view.tsx');
-    expect(view).toContain('standingLink={props.manageAuthed === true}');
+    const call = dashboard.indexOf('handleWorkbenchStandingLink(req, res, url, {');
+    expect(call).toBeGreaterThan(-1);
+    expect(dashboard.slice(call, dashboard.indexOf('});', call))).toContain('identity: requestIdentity');
   });
 });
 

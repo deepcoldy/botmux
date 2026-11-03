@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import { TurnReplyCardStore, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
-import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
+import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
+import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 import type { CotEntry } from '../src/types.js';
@@ -18,6 +19,15 @@ const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' }
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 const finalEvent = (text = '完整答复', source: 'explicit' | 'bridge' = 'explicit') => ({
   kind: 'final' as const, text, card: buildCanonicalFinalReplyCard({ markdown: text }), source,
+});
+
+it('reads the unified card tool visibility from bot config, defaulting to visible', () => {
+  const configs = parseBotConfigsFromText(JSON.stringify([
+    { larkAppId: 'app_hidden', larkAppSecret: 'secret', replyCardShowTools: false },
+    { larkAppId: 'app_default', larkAppSecret: 'secret' },
+  ]));
+  expect(replyCardPresentation(configs[0], 'oc_any').showTools).toBe(false);
+  expect(replyCardPresentation(configs[1], 'oc_any').showTools).toBe(true);
 });
 
 describe('one reply card per turn', () => {
@@ -38,6 +48,135 @@ describe('one reply card per turn', () => {
     await store.prepare(key, input);
   });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('settles a superseded turn after its in-flight initial POST is acknowledged', async () => {
+    let acknowledge!: () => void;
+    const send = io.send;
+    io.send = vi.fn(async (content, uuid) => {
+      await new Promise<void>(resolve => { acknowledge = resolve; });
+      return send(content, uuid);
+    });
+    const start = store.update(key, { kind: 'start' }, io);
+    await vi.waitFor(() => expect(io.send).toHaveBeenCalledTimes(1));
+    const supersede = store.update(key, { kind: 'terminal', phase: 'superseded' }, io);
+    acknowledge();
+    await start;
+    const retired = await supersede;
+    expect(retired.record.phase).toBe('superseded');
+    expect(cards.size).toBe(1);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(cards.get(retired.messageId!)).toContain('已由后续消息接续');
+  });
+
+  it('replays an unknown initial POST with its original UUID before marking it superseded', async () => {
+    const send = io.send;
+    io.send = vi.fn(async (content, uuid) => {
+      await send(content, uuid);
+      throw new Error('connection lost after acceptance');
+    });
+    await expect(store.update(key, { kind: 'start' }, io)).rejects.toThrow('connection lost');
+    const original = vi.mocked(io.send).mock.calls[0];
+    io.send = vi.fn(send);
+    const retired = await new TurnReplyCardStore(dir).update(key, { kind: 'terminal', phase: 'superseded' }, io);
+    expect(vi.mocked(io.send).mock.calls[0]).toEqual(original);
+    expect(cards.size).toBe(1);
+    expect(retired.record.pendingCreate).toBeUndefined();
+    expect(cards.get(retired.messageId!)).toContain('已由后续消息接续');
+  });
+
+  it.each([false, true])('persists an image-free final after provider rejection with an existing card=%s', async existing => {
+    if (existing) await store.update(key, { kind: 'start' }, io);
+    const send = io.send;
+    const patch = io.patch;
+    const rejectImages = (content: string) => {
+      if (content.includes('![Preview]')) {
+        throw new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      }
+    };
+    io.send = vi.fn(async (content, uuid) => { rejectImages(content); return send(content, uuid); });
+    io.patch = vi.fn(async (id, content) => { rejectImages(content); return patch(id, content); });
+    const final = await store.update(key, finalEvent('Answer. ![Preview](img_v3_rejected)', 'bridge'), io);
+    expect(final.delivered).toBe(true);
+    expect(final.card).toContain('Answer.');
+    expect(final.card).toContain('[Image omitted]');
+    expect(final.record.finalCard).not.toContain('![Preview]');
+    expect(final.record.lastCard).toBe(final.card);
+    expect(cards.size).toBe(1);
+    if (!existing) {
+      expect(vi.mocked(io.send).mock.calls.map(call => call[1])).toEqual([final.messageId, final.messageId]);
+      expect(io.patch).not.toHaveBeenCalled();
+    }
+    const recovered = new TurnReplyCardStore(dir);
+    const terminal = await recovered.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    expect(terminal.messageId).toBe(final.messageId);
+    expect(terminal.card).not.toContain('![Preview]');
+    expect(terminal.card).toContain('Answer.');
+    expect(terminal.record.finalDelivered).toBe(true);
+    expect(terminal.record.lastCard).toBe(cards.get(final.messageId ?? ''));
+    expect(cards.size).toBe(1);
+  });
+
+  it.each([false, true])('recovers an unknown image-free delivery result with an existing card=%s', async existing => {
+    if (existing) await store.update(key, { kind: 'start' }, io);
+    const send = io.send;
+    const patch = io.patch;
+    const requests: { content: string; identity: string }[] = [];
+    let disconnect = true;
+    const deliver = async (content: string, identity: string) => {
+      requests.push({ content, identity });
+      if (content.includes('![Preview]')) {
+        throw new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      }
+      if (existing) await patch(identity, content);
+      else await send(content, identity);
+      if (disconnect) { disconnect = false; throw new Error('connection reset after acceptance'); }
+      return identity;
+    };
+    io.send = (content, uuid) => deliver(content, uuid);
+    io.patch = async (id, content) => { await deliver(content, id); };
+    const event = finalEvent('Answer. ![Preview](img_v3_rejected)', 'bridge');
+    await expect(store.update(key, event, io)).rejects.toThrow('connection reset');
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    const recovered = new TurnReplyCardStore(dir);
+    const final = await recovered.update(key, event, io);
+    expect(requests).toHaveLength(3);
+    expect(requests[2].identity).toBe(requests[1].identity);
+    // POST retries freeze the exact body; PATCH may refresh elapsed time.
+    if (!existing) expect(requests[2]).toEqual(requests[1]);
+    expect(requests[2].content).not.toContain('![Preview]');
+    expect(requests[2].content).toContain('Answer.');
+    expect(final.record.finalCard).not.toContain('![Preview]');
+    expect(final.record.lastCard).toBe(requests[2].content);
+    expect(cards.size).toBe(1);
+    expect(final.record.finalDelivered).toBe(true);
+  });
+
+  it.each([false, true])('rechecks ownership before an image fallback with an existing card=%s', async existing => {
+    if (existing) await store.update(key, { kind: 'start' }, io);
+    let owned = true;
+    io.beforeEffect = () => { if (!owned) throw new Error('stale worker'); };
+    const reject = vi.fn(async () => {
+      owned = false;
+      throw new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+    });
+    io.send = reject;
+    io.patch = reject;
+    await expect(store.update(key, finalEvent('Answer. ![Preview](img_v3_rejected)'), io)).rejects.toThrow('stale worker');
+    expect(reject).toHaveBeenCalledOnce();
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+  });
+
+  it('keeps the exact pending body after an unrelated card rejection', async () => {
+    const send = io.send;
+    io.send = vi.fn().mockRejectedValueOnce(new Error('Invalid card schema (code: 230099)')).mockImplementation(send);
+    const event = finalEvent('Answer. ![Preview](img_v3_valid)');
+    await expect(store.update(key, event, io)).rejects.toThrow('Invalid card schema');
+    const pending = store.read(key)?.pendingCreate;
+    expect(pending?.content).toContain('![Preview](img_v3_valid)');
+    const final = await new TurnReplyCardStore(dir).update(key, event, io);
+    expect(vi.mocked(io.send).mock.calls[1]).toEqual(vi.mocked(io.send).mock.calls[0]);
+    expect(final.record.finalCard).toContain('![Preview](img_v3_valid)');
+  });
 
   it('updates tools, progress and final in the original message, then preserves it for the next turn', async () => {
     const start = await store.update(key, { kind: 'start' }, io);
@@ -61,6 +200,38 @@ describe('one reply card per turn', () => {
     await store.update(nextKey, { kind: 'start' }, io);
     expect(cards.size).toBe(2);
     expect(cards.get(start.messageId!)).toBe(body);
+  });
+
+  it('keeps thinking in unified cards while hiding tool calls and commands', async () => {
+    io.render = record => buildTurnReplyCard(record, { ...presentation, showTools: false });
+    const started = await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'tools',
+      tools: [{ id: 't1', name: 'ExecCommand', subject: 'SECRET_TOOL_COMMAND_MARKER', result: 'SECRET_RESULT_MARKER' }],
+      activity: [
+        { kind: 'thinking', id: 'thinking:1', text: 'VISIBLE_THINKING_MARKER' },
+        { kind: 'tool', id: 't1' },
+      ],
+    }, io);
+    const workingCard = cards.get(started.messageId!)!;
+    const finalCard = (await store.update(key, finalEvent(), io)).card!;
+    const completedCard = (await store.update(key, { kind: 'terminal', phase: 'completed' }, io)).card!;
+    for (const card of [workingCard, finalCard, completedCard]) {
+      expect(card).toContain('VISIBLE_THINKING_MARKER');
+      expect(card).not.toContain('SECRET_TOOL_COMMAND_MARKER');
+      expect(card).not.toContain('SECRET_RESULT_MARKER');
+      expect(card).not.toContain('ExecCommand');
+      // gate①: the panel title must not leak a tool count either.
+      expect(card).not.toContain('次工具调用');
+    }
+    expect(store.read(key)?.tools).toHaveLength(1);
+    // English rendering: singular "tool call" must be hidden too (covers both
+    // "tool call" and "tool calls"); positive assertions pin the fixture.
+    const hiddenEn = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: false, locale: 'en' });
+    expect(hiddenEn).not.toContain('tool call');
+    const shownZh = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: true });
+    expect(shownZh).toContain('次工具调用');
+    const shownEn = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: true, locale: 'en' });
+    expect(shownEn).toContain('tool call');
   });
 
   it('retains tools across a burst of progress patches without losing stored history or creating another message', async () => {
@@ -644,6 +815,19 @@ describe('public process and fallback compatibility', () => {
     expect(history).toContain('bun run test\n🔧');
   });
 
+  it('keeps final runtime identity in the footer without duplicating or replacing it on refresh', () => {
+    const finalCard = buildCanonicalFinalReplyCard({ markdown: 'Answer',
+      usage: { context: null, tokens: null, model: 'original-model', reasoningEffort: 'high' },
+    });
+    const card = JSON.parse(buildTurnReplyCard({
+      ...key, ...input, version: 1, phase: 'completed', createdAtMs: 0, progress: [], tools: [], finalCard,
+      usage: { context: null, tokens: null, model: 'later-model', reasoningEffort: 'low' },
+    }, { ...presentation, showLiveUsage: true }));
+    expect(JSON.stringify(card).match(/original-model/g)).toHaveLength(1);
+    expect(JSON.stringify(card)).not.toContain('later-model');
+    expect(card.body.elements.some((e: any) => e.element_id === 'botmux_turn_usage')).toBe(false);
+  });
+
   it('keeps the canonical final card and public progress while hiding tools and their counts', () => {
     const finalCard = buildCanonicalFinalReplyCard({ markdown: '完整答复' });
     const canonical = JSON.parse(finalCard);
@@ -654,7 +838,9 @@ describe('public process and fallback compatibility', () => {
     }, { ...presentation, showProcess: false }));
     expect(card.config).toEqual(canonical.config);
     expect(card.header).toEqual(canonical.header);
-    for (const element of canonical.body.elements) expect(card.body.elements).toContainEqual(element);
+    // The shared-context purpose extends the invisible footer signature only.
+    const visibleElements = JSON.parse(JSON.stringify(card.body.elements).replace(/\u2063/g, ''));
+    for (const element of canonical.body.elements) expect(visibleElements).toContainEqual(element);
     expect(card.body.elements[0].content).toBe('✅ **已完成 · 1.2s**');
     const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
     expect(panel.header.title.content).toBe('📋 本轮记录');

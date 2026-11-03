@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="510" viewBox="0 0 1100 510">
+  <rect width="1100" height="510" fill="#f4f6fa"/>
+  <g font-family="Arial, sans-serif" fill="#172b4d">
+    <text x="32" y="42" font-size="24" font-weight="bold">Nested code blocks in Lark reply cards</text>
+    <text x="32" y="72" font-size="14" fill="#526070">Sanitized layout illustration. The after panel shows the intended layout of locally verified card elements.</text>
+    <text x="32" y="94" font-size="14" fill="#526070">This is not a live Feishu screenshot; client rendering still needs verification.</text>
+    <g transform="translate(32 120)">
+      <rect width="500" height="335" rx="12" fill="white" stroke="#d9e1ee"/>
+      <text x="22" y="36" font-size="19" font-weight="bold">Before: reported missing content</text>
+      <text x="22" y="78" font-size="17">1. Read the value.</text>
+      <text x="22" y="110" font-size="17">2. When it is missing, run:</text>
+      <rect x="22" y="130" width="456" height="102" rx="6" fill="#fff5f5" stroke="#db5656" stroke-dasharray="6 4"/>
+      <text x="42" y="174" font-size="16" fill="#af3131">Nested code omitted by the client</text>
+      <text x="42" y="201" font-size="14" fill="#af3131">Source was present in the outbound Markdown.</text>
+      <text x="22" y="268" font-size="17">3. Continue processing.</text>
+      <text x="22" y="311" font-size="13" fill="#526070">One Markdown element containing the entire list</text>
+    </g>
+    <g transform="translate(564 120)">
+      <rect width="504" height="335" rx="12" fill="white" stroke="#d9e1ee"/>
+      <text x="22" y="36" font-size="19" font-weight="bold">After: code is a standalone element</text>
+      <text x="22" y="78" font-size="17">1. Read the value.</text>
+      <text x="22" y="110" font-size="17">2. When it is missing, run:</text>
+      <rect x="22" y="130" width="460" height="102" rx="6" fill="#eff5ff" stroke="#779cdb"/>
+      <g font-family="Menlo, Consolas, monospace" font-size="16">
+        <text x="42" y="170">values.assign(128, 0.f);</text>
+        <text x="42" y="201">return true;</text>
+      </g>
+      <text x="22" y="268" font-size="17">3. Continue processing.</text>
+      <text x="22" y="311" font-size="13" fill="#526070">Three elements: list prefix / fenced code / list suffix</text>
+    </g>
+    <text x="32" y="488" font-size="14" fill="#526070">The same extraction covers bullet lists, nested lists and blockquotes; code indentation and blank lines are preserved.</text>
+  </g>
+</svg>

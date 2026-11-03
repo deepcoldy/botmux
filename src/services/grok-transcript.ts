@@ -11,36 +11,43 @@
  * "Last contiguous run": grok streams progress narration between tool calls
  * as agent_message_chunks too (most real turns carry 2–5 such groups). Codex
  * parity is `phase=final_answer` only — the visible final reply — so any
- * agent-message group followed by a non-message event (tool_call / thought /
- * hook) is **dropped immediately** (buffer cleared, offset advanced). Only a
- * group that reaches `turn_completed` without an intervening non-message
- * event is emitted as visible text. The terminal event itself is emitted even
- * when that text is empty: durable delivery completion is keyed to Grok's
- * authoritative `turn_completed`, never to whether the model produced a
- * user-visible closing paragraph. This also keeps the 1s poller from rewinding across
- * long tool stretches (hundreds of tool_call_update lines).
+ * agent-message group followed by a tool call, thought, or tool hook is
+ * **dropped immediately** (buffer cleared, offset advanced). Only a group that
+ * reaches `turn_completed` without an intervening tool call / thought is
+ * emitted as visible text. Turn lifecycle hooks (such as `stop` or `stop_failure`)
+ * and passive background events (such as background tasks or memory dreams) do
+ * NOT indicate tool narration and must never discard buffered reply text.
+ * A `session_end` hook discards unfinished text and releases the cursor.
+ * The terminal event itself is emitted even when that text is empty: durable
+ * delivery completion is keyed to Grok's authoritative `turn_completed`, never
+ * to whether the model produced a user-visible closing paragraph. This also
+ * keeps the 1s poller from rewinding across long tool stretches (hundreds of
+ * tool_call_update lines).
  *
- * Mid-turn thoughts / tool calls are ignored so the queue never closes a
+ * Public narration and tools can additionally emit cosmetic `cot` events
+ * when includePublicActivity is enabled. Thoughts and hook payloads stay local.
+ * These events never close a turn, so the queue never closes a
  * Lark turn on narration. Type-ahead follow-ups park until the active turn
  * finishes (Grok queue semantics ≈ CoCo), so the transcript stays interleaved
  * user1 → assistant_final1 → user2 → assistant_final2 — CodexBridgeQueue's
  * HOL-block-drop still applies if a steer-like merge ever appears.
  */
 import {
-  existsSync, statSync, openSync, readSync, closeSync, readdirSync, readFileSync, readlinkSync,
+  existsSync, statSync, openSync, readSync, closeSync, readdirSync, readFileSync,
 } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { platform } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
+import type { BackgroundTaskSignals, CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
+import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import {
   encodeGrokCwd, grokSessionsRoot, grokUpdatesPath, grokSummaryPath,
   resolveGrokCwdBucketDir,
 } from './grok-paths.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import type { ResumableSession } from '../adapters/cli/types.js';
 
-const IS_LINUX = platform() === 'linux';
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const GROK_SESSIONS_ANCHOR = '/.grok/sessions/';
 const TITLE_MAX = 80;
@@ -182,37 +189,14 @@ export function findGrokSessionByPid(
     }
     return best?.hit;
   };
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        if (target.endsWith(' (deleted)')) continue;
-        const hit = matchGrokSessionPath(target);
-        if (hit && !hits.some((seen) => seen.sessionId === hit.sessionId)) hits.push(hit);
-      }
-      // During `/new` Grok can briefly retain descriptors for both session
-      // directories. Prefer the stream most recently appended instead of
-      // depending on /proc fd enumeration order (which could rotate the
-      // worker bridge backwards to the retired session).
-      return newestHit();
-    }
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const hit = matchGrokSessionPath(line.slice(1));
+  // During `/new` Grok can briefly retain descriptors for both session
+  // directories. Prefer the stream most recently appended instead of
+  // depending on fd enumeration order (which could rotate the worker bridge
+  // backwards to the retired session).
+  const targets = listProcessOpenFiles(pid, { skipDeleted: true });
+  if (!targets) return undefined;
+  for (const target of targets) {
+    const hit = matchGrokSessionPath(target);
     if (hit && !hits.some((seen) => seen.sessionId === hit.sessionId)) hits.push(hit);
   }
   return newestHit();
@@ -288,34 +272,55 @@ function grokTerminalOutcome(
   };
 }
 
+function activityPreview(text: string, maxChars: number): string {
+  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
+
+/**
+ * Test whether an ACP session update represents a tool execution, reasoning step,
+ * or session termination that interrupts an open agent reply group.
+ *
+ * Design rationale:
+ * We use an explicit whitelist of interruption events (tools, thoughts, plans,
+ * tool hooks, and session_end) rather than dropping on any unknown non-message event.
+ * This ensures turn-level lifecycle hooks (such as 'stop' / 'stop_failure' which run
+ * when generation finishes right before turn_completed) and passive background events
+ * (such as background_tasks, memory dreams, compaction) do NOT discard buffered reply text.
+ * Meanwhile, session_end explicitly drops any unfinished partial agent group so an
+ * aborted session does not pin newOffset or leak stale text into subsequent turns.
+ */
+export function isGrokNarrationInterruption(update: any): boolean {
+  const su = update?.sessionUpdate as string | undefined;
+  if (!su) return false;
+  if (su === 'tool_call' || su === 'tool_call_update' || su === 'agent_thought_chunk' || su === 'plan') {
+    return true;
+  }
+  if (su === 'hook_execution') {
+    const ev = typeof update.event_name === 'string' ? update.event_name.trim().toLowerCase() : '';
+    return ev === 'pre_tool_use' || ev === 'post_tool_use' || ev === 'post_tool_use_failure' || ev === 'session_end';
+  }
+  return false;
+}
+
 /**
  * Increment-read updates.jsonl. Agent chunks of the CURRENT contiguous group
- * are buffered. A non-message event (tool_call / thought / hook) while a
- * group is buffered **drops that group immediately** and advances the offset
- * (narration cannot become the final answer — codex final_answer parity).
- * The next agent chunk starts a fresh group; `turn_completed` always emits a
- * terminal `assistant_final` event, with whatever group is still buffered as
- * its (possibly empty) text. If the file ends mid-group, newOffset
- * rewinds to the group's first chunk so the next poll re-reads it (queue
- * dedups by uuid).
+ * are buffered. A tool call, thought, or tool hook while a group is buffered
+ * **drops that group immediately** and advances the offset (narration cannot
+ * become the final answer — codex final_answer parity). The next agent chunk
+ * starts a fresh group; `turn_completed` always emits a terminal
+ * `assistant_final` event, with whatever group is still buffered as its
+ * (possibly empty) text. If the file ends mid-group, newOffset rewinds to the
+ * group's first chunk so the next poll re-reads it (queue dedups by uuid).
+ * includePublicActivity preserves consumed narration and tool events in a
+ * separate cosmetic channel without changing final selection.
  */
-export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
-  if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
-
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
+export function drainGrokUpdates(
+  path: string, fromOffset: number, options: { includePublicActivity?: boolean } = {},
+): GrokDrainResult {
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  const start = step.start;
+  const { completeText, pendingTail } = step.window;
 
   // Pure partial-line window (writer mid-flush, no '\n' yet): never advance.
   // ''.split('\n') yields [''] — treating that as a bare newline would push
@@ -329,29 +334,13 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
   let agentParts: string[] = [];
   let openTurnStartOffset: number | null = null;
   let openTurnSessionId: string | undefined;
-  let cursor = start;
-  let lastFullyConsumedOffset = start;
+  let backgroundTasks: BackgroundTaskSignals | undefined;
 
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1; // bare \n
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
-    const lineStart = cursor;
-    const lineBytes = Buffer.byteLength(line, 'utf8') + 1; // + \n
-    cursor += lineBytes;
-
+  for (const { line, lineStart } of iterateJsonlLines(completeText, start)) {
     let obj: any;
-    try { obj = JSON.parse(line); } catch {
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
+    try { obj = JSON.parse(line); } catch { continue; }
     const update = obj?.params?.update ?? obj?.update;
-    if (!update || typeof update !== 'object') {
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
+    if (!update || typeof update !== 'object') continue;
     const su = update.sessionUpdate as string | undefined;
     const sessionId =
       (typeof obj?.params?.sessionId === 'string' && obj.params.sessionId)
@@ -375,7 +364,29 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
           sourceSessionId: sessionId,
         });
       }
-      lastFullyConsumedOffset = cursor;
+      continue;
+    }
+
+    // Background tasks (bash / monitor). Grok writes the launch, a full
+    // `background_tasks` list on every change, and `task_completed` when one
+    // stops; a task can outlive the turn and wake the agent later. Passive for
+    // the reply: these never touch the buffered agent group.
+    if (su === 'task_backgrounded' || su === 'background_tasks' || su === 'task_completed') {
+      const bg = (backgroundTasks ??= { launched: [], settled: [] });
+      if (su === 'task_backgrounded' && typeof update.task_id === 'string' && update.task_id) {
+        bg.launched.push({ taskId: update.task_id, kind: update.monitor_description ? 'monitor' : 'shell', atMs: timestampMs });
+      } else if (su === 'background_tasks' && Array.isArray(update.tasks)) {
+        for (const task of update.tasks) {
+          if (typeof task?.task_id !== 'string' || !task.task_id) continue;
+          if (task.status === 'running') {
+            bg.launched.push({ taskId: task.task_id, kind: task.kind === 'monitor' ? 'monitor' : 'shell', atMs: timestampMs });
+          } else {
+            bg.settled.push(task.task_id);
+          }
+        }
+      } else if (su === 'task_completed' && typeof update.task_snapshot?.task_id === 'string' && update.task_snapshot.task_id) {
+        bg.settled.push(update.task_snapshot.task_id);
+      }
       continue;
     }
 
@@ -386,7 +397,7 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
         if (sessionId) openTurnSessionId = sessionId;
         agentParts.push(chunk);
       }
-      // Do not advance lastFullyConsumedOffset past open group — handled at end.
+      // The offset must not move past an open group — handled at the end.
       continue;
     }
 
@@ -417,29 +428,72 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
         ...outcome,
       });
       openTurnSessionId = undefined;
-      lastFullyConsumedOffset = cursor;
       continue;
     }
 
-    // tool_call / thought / hooks / etc. — any buffered agent group is
-    // mid-turn narration and can never be the final answer. Drop it and
-    // advance past this line so the 1s poller does not rewind through
-    // hundreds of tool_call_update events every tick.
-    if (agentParts.length > 0) {
-      agentParts = [];
-      openTurnStartOffset = null;
-      openTurnSessionId = undefined;
+    // Only an interrupted group is public narration; stop hooks and passive
+    // events leave it buffered for the final reply or subsequent chunks.
+    // Use the group's first byte offset so re-reading an incomplete tail
+    // preserves the bridge queue's event deduplication identity.
+    if (options.includePublicActivity && isGrokNarrationInterruption(update) && agentParts.length > 0) {
+      events.push({
+        uuid: `${path}:${openTurnStartOffset}:narration`, timestampMs,
+        kind: 'cot', text: '', sourceSessionId: openTurnSessionId ?? sessionId,
+        cotEntries: [{ kind: 'text', text: agentParts.join('') }],
+      });
     }
-    lastFullyConsumedOffset = cursor;
+    if (options.includePublicActivity && typeof update.toolCallId === 'string' && update.toolCallId) {
+      const id = update.toolCallId;
+      if (su === 'tool_call') {
+        const input = update.rawInput;
+        const args = input === undefined ? '' : typeof input === 'string' ? input : JSON.stringify(input);
+        const subject = boundSubjectForTransport(subjectFromInputObject(input)
+          || (typeof input?.target_file === 'string' ? input.target_file : ''));
+        events.push({
+          uuid, timestampMs, kind: 'cot', text: '', sourceSessionId: sessionId,
+          cotEntries: [{ kind: 'tool_call', id,
+            name: typeof update.title === 'string' ? update.title : 'tool', args: activityPreview(args, 600),
+            ...(subject ? { subject } : {}),
+          }],
+        });
+      } else if (su === 'tool_call_update' && ['completed', 'failed'].includes(update.status)) {
+        const content = Array.isArray(update.content) ? update.content
+          .filter((item: any) => item?.type === 'content' && item.content?.type === 'text')
+          .map((item: any) => contentText(item.content)).join('\n') : '';
+        const output = update.rawOutput;
+        const result = content || (output === undefined ? '' : typeof output === 'string' ? output : JSON.stringify(output));
+        events.push({
+          uuid, timestampMs, kind: 'cot', text: '', sourceSessionId: sessionId,
+          // Match the existing Codex/Pi preview budget before IPC/storage.
+          // The shared accumulator checks its cap before appending an entry.
+          cotEntries: [{ kind: 'tool_result', id, result: activityPreview(result, 800) }],
+        });
+      }
+    }
+    // Do not publish agent_thought_chunk or hook payloads. Only public
+    // assistant narration and tool activity enter the reply card.
+    // tool_call / thought / tool hooks — any buffered agent group is
+    // mid-turn narration before a tool and can never be the final answer.
+    // Drop it and advance past this line so the 1s poller does not rewind
+    // through hundreds of tool_call_update events every tick.
+    // Turn lifecycle hooks (such as 'stop' / 'stop_failure') and passive background
+    // events must NOT drop buffered agent text.
+    if (isGrokNarrationInterruption(update)) {
+      if (agentParts.length > 0) {
+        agentParts = [];
+        openTurnStartOffset = null;
+        openTurnSessionId = undefined;
+      }
+    }
   }
 
   // Mid-group at EOF (final reply still streaming): rewind so agent chunks
   // are re-read next tick.
   const newOffset = openTurnStartOffset !== null
     ? openTurnStartOffset
-    : (completeText ? start + Buffer.byteLength(completeText, 'utf8') : lastFullyConsumedOffset);
+    : step.window.newOffset;
 
-  return { events, newOffset, pendingTail };
+  return { events, newOffset, pendingTail, ...(backgroundTasks ? { backgroundTasks } : {}) };
 }
 
 /** Current file size helper for submit-verify baseByte. */
@@ -452,6 +506,14 @@ function normaliseNewlines(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+/** The text Grok's composer submits for pasted `text` (measured identical on
+ *  1.0.5 / 1.0.13 / 1.0.67 / 1.0.70): every tab becomes four spaces and every
+ *  `\r` becomes `\n`, so a CRLF turns into a blank line. prompt_history stores
+ *  this trimmed; the `prompt.enqueue` log line counts its UTF-8 bytes untrimmed. */
+export function grokComposerText(text: string): string {
+  return text.replace(/\t/g, '    ').replace(/\r/g, '\n');
+}
+
 /**
  * Scan the bucket-level prompt_history.jsonl from `fromByte` for a submit
  * whose `prompt` equals `expectedText` (modulo newline normalisation — the
@@ -459,8 +521,9 @@ function normaliseNewlines(text: string): string {
  * written at submit time for an IDLE composer ("even while a turn is
  * running" was verified on 0.2.93 but no longer holds on 1.0.5: a mid-turn
  * submit parks in grok's queue and appends only at DEQUEUE, the instant the
- * previous turn completes — so busy-turn verifies miss until then). Returns
- * the owning session id when found.
+ * previous turn completes — so busy-turn verifies miss until then; see
+ * {@link matchGrokPromptEnqueue} for that receipt). Returns the owning session
+ * id when found.
  *
  * Concurrent safety: the file is cwd-bucket shared. Two workers in the same
  * repo can append identical prompt text under different session_ids. Callers
@@ -488,6 +551,7 @@ export function matchGrokPromptAppend(
   } catch { return { found: false }; }
   const expected = normaliseNewlines(expectedText);
   const expectedTrimmed = expected.trim();
+  const expectedComposer = grokComposerText(expectedText).trim();
   const matches: Array<{ cliSessionId?: string }> = [];
   for (const line of buf.toString('utf8').split('\n')) {
     if (!line) continue;
@@ -496,8 +560,10 @@ export function matchGrokPromptAppend(
     if (typeof obj?.prompt !== 'string') continue;
     const got = normaliseNewlines(obj.prompt);
     // Exact match modulo newline normalisation; trim fallback tolerates the
-    // composer stripping leading/trailing whitespace on submit.
-    if (obj.prompt === expectedText || got === expected || got.trim() === expectedTrimmed) {
+    // composer stripping leading/trailing whitespace on submit; the composer
+    // form covers a body with tabs or CRLF, which Grok rewrites before storing.
+    if (obj.prompt === expectedText || got === expected || got.trim() === expectedTrimmed
+      || obj.prompt.trim() === expectedComposer) {
       const sid = typeof obj.session_id === 'string' && SESSION_UUID_RE.test(obj.session_id)
         ? obj.session_id
         : undefined;
@@ -527,6 +593,55 @@ export function matchGrokPromptAppend(
   }
   // Matched text but no session_id fields — confirm submit without rotation.
   return { found: true };
+}
+
+/** Grok trims its unified log by rewriting it. Once the file is shorter than
+ *  a write's baseline only its tail can hold that write's line. */
+const UNIFIED_LOG_SHRUNK_TAIL_BYTES = 1024 * 1024;
+
+/**
+ * Scan Grok's unified log from `fromByte` for the composer accepting this
+ * submit: a `prompt.enqueue` line from `pid` whose `ctx.len` is the UTF-8 byte
+ * length of {@link grokComposerText}(`expectedText`) and whose `ts` is not
+ * before `sinceMs`.
+ *
+ * Grok writes that line when Enter lands, idle or mid-turn (measured 1.0.5 –
+ * 1.0.70), whereas prompt_history and updates.jsonl record a queued follow-up
+ * only at dequeue. It is therefore the receipt for a busy-turn submit.
+ *
+ * The file is shared by every Grok process under GROK_HOME, so only an exact
+ * `pid` counts. A PID-namespaced sandbox logs its inner pid, which can collide
+ * across sandboxes: it never matches and the caller keeps relying on
+ * prompt_history. `sinceMs` rejects an earlier same-length submit whose line
+ * was flushed late.
+ */
+export function matchGrokPromptEnqueue(
+  path: string,
+  fromByte: number,
+  expectedText: string,
+  opts: { pid: number; sinceMs: number },
+): boolean {
+  if (!expectedText || !existsSync(path)) return false;
+  let size: number;
+  try { size = statSync(path).size; } catch { return false; }
+  const start = size < fromByte ? Math.max(0, size - UNIFIED_LOG_SHRUNK_TAIL_BYTES) : fromByte;
+  if (size <= start) return false;
+  const buf = Buffer.alloc(size - start);
+  try {
+    const fd = openSync(path, 'r');
+    try { readSync(fd, buf, 0, buf.length, start); } finally { closeSync(fd); }
+  } catch { return false; }
+  const expectedBytes = Buffer.byteLength(grokComposerText(expectedText), 'utf8');
+  for (const line of buf.toString('utf8').split('\n')) {
+    if (!line.includes('"prompt.enqueue"')) continue;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; } // partial tail — later poll re-reads
+    if (obj?.msg !== 'prompt.enqueue' || obj.pid !== opts.pid) continue;
+    if (obj.ctx?.len !== expectedBytes) continue;
+    const atMs = typeof obj.ts === 'string' ? Date.parse(obj.ts) : NaN;
+    if (Number.isFinite(atMs) && atMs >= opts.sinceMs) return true;
+  }
+  return false;
 }
 
 function looksLikeBotmuxPrompt(text: string): boolean {
@@ -610,7 +725,11 @@ export async function discoverGrokSessions(
       const firstPrompt = existsSync(updatesPath) ? readFirstUserChunk(updatesPath) : undefined;
       if (firstPrompt) {
         if (looksLikeBotmuxPrompt(firstPrompt)) continue;
-        if (!title) title = truncateTitle(firstPrompt);
+        // grok has injectsSessionContext=true, so an envelope-less bare
+        // (replyDelivery=transcript + solo) follow-up is just the user text
+        // followed by <botmux_formatting>; strip that internal block (#2716)
+        // before it becomes the picker title.
+        if (!title) title = truncateTitle(stripBotmuxDisplayBlocks(firstPrompt));
       }
 
       cands.push({

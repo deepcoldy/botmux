@@ -1,0 +1,69 @@
+# Lane: Claude and Codex in the shared regular test group, per reply mode
+# (@bot /reply-mode) and @ policy (@bot /mention-mode). Every case holds the
+# group exclusively and restores the mode it changed. Assumes every bot in the
+# group requires an @ by default (as the no-mention routing case does).
+cases:
+  - name: Claude group reply mode chat-topic (default) answers inline, topics get their own session
+    tags: [mode, group, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: group-reply-chat-topic-claude }
+  - name: Claude group reply mode chat answers inline and folds topics into the group session
+    tags: [mode, group, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: group-reply-chat-claude }
+  - name: Claude group reply mode topic answers in topics that share one session
+    tags: [mode, group, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: group-reply-topic-claude }
+  - name: Claude group reply mode new-topic starts a session per topic
+    tags: [mode, group, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: group-reply-new-topic-claude }
+  - name: Codex group reply mode chat-topic (default) answers inline, topics get their own session
+    tags: [mode, group, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: group-reply-chat-topic-codex }
+  - name: Codex group reply mode chat answers inline and folds topics into the group session
+    tags: [mode, group, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: group-reply-chat-codex }
+  - name: Codex group reply mode topic answers in topics that share one session
+    tags: [mode, group, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: group-reply-topic-codex }
+  - name: Codex group reply mode new-topic starts a session per topic
+    tags: [mode, group, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: group-reply-new-topic-codex }
+  - name: Claude group @ mode always ignores messages without an @
+    tags: [mode, group, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: group-mention-always-claude }
+  - name: Claude group @ mode never answers without an @
+    tags: [mode, group, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: group-mention-never-claude }
+  - name: Claude group @ mode ambient answers without an @ but yields to others
+    tags: [mode, group, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: group-mention-ambient-claude }
+  - name: Claude group @ mode topic continues its own topic without an @
+    tags: [mode, group, claude, core]
+    steps:
+      - feishu.runScenario: { scenario: group-mention-topic-claude }
+  - name: Codex group @ mode always ignores messages without an @
+    tags: [mode, group, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: group-mention-always-codex }
+  - name: Codex group @ mode never answers without an @
+    tags: [mode, group, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: group-mention-never-codex }
+  - name: Codex group @ mode ambient answers without an @ but yields to others
+    tags: [mode, group, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: group-mention-ambient-codex }
+  - name: Codex group @ mode topic continues its own topic without an @
+    tags: [mode, group, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: group-mention-topic-codex }

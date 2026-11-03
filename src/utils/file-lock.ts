@@ -43,6 +43,7 @@ import {
   readProcessStartIdentity,
 } from './process-identity.js';
 import { logger } from './logger.js';
+import { pidIsSignalable } from './process-alive.js';
 
 const MAX_WAIT_MS = 5_000;
 const RETRY_BASE_MS = 25;
@@ -148,7 +149,7 @@ async function isHolderAlive(holder: LockHolder): Promise<boolean> {
   const pid = holder.pid;
   if (!pid) return false;
   if (pid === process.pid) return true;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  return pidIsSignalable(pid);
 }
 
 function isHolderAliveSync(holder: LockHolder): boolean {
@@ -164,7 +165,7 @@ function isHolderAliveSync(holder: LockHolder): boolean {
   const pid = holder.pid;
   if (!pid) return false;
   if (pid === process.pid) return true;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  return pidIsSignalable(pid);
 }
 
 function sleepSync(ms: number): void {

@@ -76,7 +76,8 @@ function fakeRl(answers: string[]) {
 /** 菜单标题 → 本次返回的下标；同一标题按出现顺序依次消费队列。 */
 function scriptChoices(script: Record<string, Array<number | null>>): string[] {
   const seen: string[] = [];
-  mocks.pickChoice.mockImplementation(async (_rl: unknown, opts: { title: string }) => {
+  mocks.pickChoice.mockImplementation(async (_rl: unknown, optsOrFactory: any) => {
+    const opts = typeof optsOrFactory === 'function' ? optsOrFactory() : optsOrFactory;
     seen.push(opts.title);
     const queue = script[opts.title];
     if (!queue || queue.length === 0) throw new Error(`没有为菜单「${opts.title}」准备答案`);

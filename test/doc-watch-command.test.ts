@@ -23,6 +23,26 @@ describe('parseDocWatchCommand', () => {
     });
   });
 
+  it('parses owner-mentions mode（替身）', () => {
+    expect(parseDocWatchCommand('/watch-comment AbCdEf12345678901234 --owner-mentions')).toEqual({
+      kind: 'watch',
+      docRef: 'AbCdEf12345678901234',
+      workingDir: undefined,
+      requestedMode: 'owner-mention',
+    });
+  });
+
+  it('rejects owner-mentions combined with any other mode flag', () => {
+    expect(parseDocWatchCommand('/watch-comment token123 --all --owner-mentions')).toEqual({
+      kind: 'invalid',
+      reason: 'conflicting_modes',
+    });
+    expect(parseDocWatchCommand('/watch-comment token123 --mentions-only --owner-mentions')).toEqual({
+      kind: 'invalid',
+      reason: 'conflicting_modes',
+    });
+  });
+
   it('parses list and off (no approval subcommands — notify-not-approve model)', () => {
     expect(parseDocWatchCommand('/watch-comment list')).toEqual({ kind: 'list' });
     expect(parseDocWatchCommand('/watch-comment off')).toEqual({ kind: 'off' });

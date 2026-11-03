@@ -66,6 +66,56 @@ function makeCfg(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe('meeting inviter configuration', () => {
+  it.each([
+    [{}, undefined, undefined],
+    [{ inviterManagementEnabled: false }, false, undefined],
+    [{ inviterManagementEnabled: true, inviterManagementEnabledAt: 123 }, true, 123],
+    [{ inviterManagementEnabled: 'true', inviterManagementEnabledAt: '123' }, undefined, undefined],
+    [{ inviterManagementEnabled: 1, inviterManagementEnabledAt: -1 }, undefined, undefined],
+  ])('normalizes policy strictly without enabling old configurations: %#', async (vcMeetingAgent, enabled, epoch) => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ vcMeetingAgent })]));
+    expect(config.vcMeetingAgent?.inviterManagementEnabled).toBe(enabled);
+    expect(config.vcMeetingAgent?.inviterManagementEnabledAt).toBe(epoch);
+  });
+});
+
+describe('voice configuration', () => {
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' } }, { volcengine: null }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { mode: 'standard' } }, { volcengine: { mode: 'standard' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides, row %#', async (voice, expected) => {
+    const mod = await freshImport();
+    const configs = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ voice })]));
+    expect(configs[0]?.voice).toEqual(expected);
+  });
+
+  it('preserves a MiniMax per-bot override', async () => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([
+      makeCfg({
+        voice: {
+          engine: 'minimax',
+          speaker: 'voice-id',
+          minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+        },
+      }),
+    ]));
+
+    expect(config.voice).toEqual({
+      engine: 'minimax',
+      speaker: 'voice-id',
+      minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+    });
+  });
+});
+
 // ─── registerBot ──────────────────────────────────────────────────────────
 
 describe('registerBot', () => {
@@ -270,6 +320,29 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('keeps a positive-integer idleSuspendMinutes TTL', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', idleSuspendMinutes: 30 },
+    ]));
+    expect(cfg.idleSuspendMinutes).toBe(30);
+  });
+
+  it('leaves idleSuspendMinutes undefined (TTL disabled) when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.idleSuspendMinutes).toBeUndefined();
+  });
+
+  it('drops 0 / negative / fractional / non-numeric idleSuspendMinutes to undefined', () => {
+    for (const bad of [0, -10, 2.5, '30', null] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', idleSuspendMinutes: bad },
+      ]));
+      expect(cfg.idleSuspendMinutes).toBeUndefined();
+    }
+  });
+
   // allowArbitraryMention is a SAFETY switch (gates whether an agent may @
   // arbitrary group members via email). Default MUST be off, and only a literal
   // boolean `true` may turn it on — a mutation that flips normalization to
@@ -413,7 +486,18 @@ describe('parseBotConfigsFromText — brand', () => {
     ]))).toThrow(/must exactly match cliRuntime\.executable/);
   });
 
-  it('rejects cliRuntime outside the plain Codex adapter contract', () => {
+  it('loads a named CodeM runtime with the Kimi adapter and exact path shadow', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codem-runtime-app', larkAppSecret: 's', cliId: 'kimi',
+      cliPathOverride: '/opt/bin/codem-wrapper',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper', update: { provider: 'none' } },
+    }]));
+    expect(cfg.cliId).toBe('kimi');
+    expect(cfg.cliRuntime).toMatchObject({ id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' });
+    expect(cfg.cliPathOverride).toBe('/opt/bin/codem-wrapper');
+  });
+
+  it('rejects cliRuntime outside supported adapter contracts', () => {
     const runtime = { id: 'vendor-codex', executable: 'vendor-codex' };
     expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'wrong-adapter-runtime-app',
@@ -428,6 +512,38 @@ describe('parseBotConfigsFromText — brand', () => {
       wrapperCli: 'gateway codex',
       cliRuntime: runtime,
     }]))).toThrow(/cannot be combined with wrapperCli/);
+  });
+
+  it('accepts Forge x TraeX only as a plain TraeX launch mode', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'forge-traex-app',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    }]));
+    expect(cfg.cliId).toBe('traex');
+    expect(cfg.cliLaunchMode).toBe('forge-traex');
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'forge-wrong-cli-app',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      cliLaunchMode: 'forge-traex',
+    }]))).toThrow(/supported only for cliId "traex"/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'forge-wrapper-app',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      wrapperCli: 'aiden x traex',
+      cliLaunchMode: 'forge-traex',
+    }]))).toThrow(/cannot be combined with wrapperCli/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'forge-sandbox-app',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+      readIsolation: true,
+    }]))).toThrow(/sandbox or readIsolation/);
   });
 
   it('accepts existingAppServer on a Codex App bot but rejects unrelated CLIs', () => {
@@ -491,6 +607,22 @@ describe('parseBotConfigsFromText — brand', () => {
     expect(mod.effectiveBotDisplayName(state)).toBe('Claude');
     state.config.displayName = '小助手';
     expect(mod.effectiveBotDisplayName(state)).toBe('小助手');
+  });
+
+  it('retains strict auto-close opt-in across listener config reloads', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'listener-close', larkAppSecret: 's',
+      globalMessageListener: { enabled: true, prompt: 'global', autoCloseAfterCompletion: true },
+      groupMessageListenerOverrides: {
+        oc_custom: { mode: 'custom', listener: { enabled: true, prompt: 'custom', autoCloseAfterCompletion: false } },
+      },
+      messageListeners: { oc_legacy: { enabled: true, prompt: 'legacy', autoCloseAfterCompletion: 'true' } },
+    }]));
+    expect(cfg.globalMessageListener?.autoCloseAfterCompletion).toBe(true);
+    expect(cfg.groupMessageListenerOverrides?.oc_custom).toMatchObject({ mode: 'custom' });
+    const custom = cfg.groupMessageListenerOverrides?.oc_custom;
+    if (custom?.mode === 'custom') expect(custom.listener.autoCloseAfterCompletion).toBeUndefined();
+    expect(cfg.messageListeners?.oc_legacy.autoCloseAfterCompletion).toBeUndefined();
   });
 
   it('normalizes per-chat messageListeners without enabling them by default', () => {
@@ -561,6 +693,12 @@ describe('parseBotConfigsFromText — brand', () => {
       ]));
       expect(cfg.startupCommands).toBeUndefined();
     }
+  });
+
+  it('preserves explicit false listener-policy overrides for future meetings', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'a', larkAppSecret: 's',
+      vcMeetingAgent: { listenerPolicy: { rawMessages: false, finalSummary: true, allowSummarySharing: false } } }]));
+    expect(cfg.vcMeetingAgent?.listenerPolicy).toEqual({ rawMessages: false, finalSummary: true, allowSummarySharing: false });
   });
 
   it('normalizes vcMeetingAgent.realtimeVoice without enabling it by default', () => {
@@ -1281,6 +1419,26 @@ describe('parseBotConfigsFromText — autoStartOnGroupJoinSeed', () => {
   });
 });
 
+describe('parseBotConfigsFromText — autoStartOnGroupJoinGateRequired', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves only an explicit true', () => {
+    const [enabled] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: true },
+    ]));
+    expect(enabled.autoStartOnGroupJoinGateRequired).toBe(true);
+
+    const [disabled] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: false },
+    ]));
+    expect(disabled.autoStartOnGroupJoinGateRequired).toBeUndefined();
+  });
+});
+
 describe('parseBotConfigsFromText — replyStyle', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
 
@@ -1330,6 +1488,66 @@ describe('parseBotConfigsFromText — replyStyle', () => {
       layoutColors: { progress: 'blue' },
       layoutTags: { risk: '需要你' },
     });
+  });
+});
+
+describe('parseBotConfigsFromText — envelopeInjection cold read', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves auto and treats unset, off, and invalid values as the default', () => {
+    const [auto, unset, off, invalid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'auto', larkAppSecret: 's', envelopeInjection: 'auto' },
+      { larkAppId: 'unset', larkAppSecret: 's' },
+      { larkAppId: 'off', larkAppSecret: 's', envelopeInjection: 'off' },
+      { larkAppId: 'invalid', larkAppSecret: 's', envelopeInjection: 'sideways' },
+    ]));
+
+    expect(auto.envelopeInjection).toBe('auto');
+    expect(unset.envelopeInjection).toBeUndefined();
+    expect(off.envelopeInjection).toBeUndefined();
+    expect(invalid.envelopeInjection).toBeUndefined();
+  });
+});
+
+describe('parseBotConfigsFromText — dshProfile cold read', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('trims valid dsh profiles, rejects unsafe names, and drops the field for other CLIs', () => {
+    const [dsh, invalid, otherCli] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'dsh', larkAppSecret: 's', cliId: 'dsh', dshProfile: '  custom_profile-1  ' },
+      { larkAppId: 'invalid', larkAppSecret: 's', cliId: 'dsh', dshProfile: '../outside' },
+      { larkAppId: 'other', larkAppSecret: 's', cliId: 'codex', dshProfile: 'custom' },
+    ]));
+
+    expect(dsh.dshProfile).toBe('custom_profile-1');
+    expect(invalid.dshProfile).toBeUndefined();
+    expect(otherCli.dshProfile).toBeUndefined();
+  });
+});
+
+describe('parseBotConfigsFromText — serviceTier cold read', () => {
+  it('keeps valid tiers only on codex-family CLIs and drops invalid values', async () => {
+    const mod = await freshImport();
+    const [tui, app, unset, invalid, nonCodex] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'tier-tui', larkAppSecret: 's', cliId: 'codex', serviceTier: 'priority' },
+      { larkAppId: 'tier-app', larkAppSecret: 's', cliId: 'codex-app', serviceTier: 'ultrafast' },
+      { larkAppId: 'tier-unset', larkAppSecret: 's', cliId: 'codex' },
+      { larkAppId: 'tier-invalid', larkAppSecret: 's', cliId: 'codex', serviceTier: 'flex' },
+      { larkAppId: 'tier-claude', larkAppSecret: 's', cliId: 'claude-code', serviceTier: 'priority' },
+    ]));
+    expect(tui.serviceTier).toBe('priority');
+    expect(app.serviceTier).toBe('ultrafast');
+    expect(unset.serviceTier).toBeUndefined();
+    expect(invalid.serviceTier).toBeUndefined();
+    expect(nonCodex.serviceTier).toBeUndefined();
   });
 });
 
@@ -1494,7 +1712,7 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
   const saved: Record<string, string | undefined> = {};
-  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL'];
+  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL', 'BOTMUX_CORE_BACKEND'];
 
   beforeEach(async () => {
     mod = await freshImport();
@@ -1557,6 +1775,23 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
     const [cfg] = mod.loadBotConfigs();
     expect(cfg.larkAppId).toBe('local_riff');
     expect(cfg.cliId).toBe('codex-app');
+    expect(cfg.backendType).toBeUndefined();
+  });
+
+  it('applies an explicit core-only PTY backend without changing the default', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_CORE_BACKEND = 'pty';
+    const [cfg] = mod.loadBotConfigs();
+    expect(cfg.apiOnly).toBe(true);
+    expect(cfg.backendType).toBe('pty');
+  });
+
+  it('rejects an invalid core-only backend instead of falling back to tmux', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_CORE_BACKEND = 'zellij';
+    expect(() => mod.loadBotConfigs()).toThrow('BOTMUX_CORE_BACKEND must be tmux or pty');
   });
 
   it('rejects a non-local_ synthetic id (identity must be a synthetic local slug)', () => {
@@ -1780,9 +2015,9 @@ describe('getAllBots', () => {
 });
 
 
-// ─── isChatOncallBoundForAnyBot ───────────────────────────────────────────
+// ─── findOncallChatForAnyBot ──────────────────────────────────────────────
 
-describe('isChatOncallBoundForAnyBot', () => {
+describe('findOncallChatForAnyBot', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
 
@@ -1813,9 +2048,8 @@ describe('isChatOncallBoundForAnyBot', () => {
     mod.registerBot(configs[0]);
 
     expect(mod.findOncallChat('app_a', 'oc_oncall')).toBeUndefined();
-    expect(mod.isChatOncallBoundForAnyBot('oc_oncall')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_oncall')).toEqual({ chatId: 'oc_oncall', workingDir: '/repo' });
-    expect(mod.isChatOncallBoundForAnyBot('oc_other')).toBe(false);
+    expect(mod.findOncallChatForAnyBot('oc_other')).toBeUndefined();
   });
 
   it('refreshes the sibling oncall cache when bots.json mtime changes', () => {
@@ -1832,14 +2066,13 @@ describe('isChatOncallBoundForAnyBot', () => {
 
     // First lookup builds a negative cache from the original file content.
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([{ larkAppId: 'app_a', larkAppSecret: 'sa' }]));
-    expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(false);
+    expect(mod.findOncallChatForAnyBot('oc_new')).toBeUndefined();
 
     // A later mtime causes the cache to refresh and pick up sibling bindings.
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
       { larkAppId: 'app_a', larkAppSecret: 'sa' },
       { larkAppId: 'app_b', larkAppSecret: 'sb', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo' }] },
     ]));
-    expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_new')?.workingDir).toBe('/repo');
   });
 });
@@ -1971,6 +2204,31 @@ describe('loadBotConfigs', () => {
     expect(configs[0].larkAppId).toBe('env_app');
     expect(configs[0].larkAppSecret).toBe('env_secret');
     expect(configs[0].cliId).toBe('claude-code'); // default
+  });
+
+  it('cold-reads envelopeInjection for the indexed daemon slot', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'daemon_app',
+      larkAppSecret: 'secret',
+      envelopeInjection: 'auto',
+    }]));
+
+    expect(mod.loadBotConfigAtIndex(0).envelopeInjection).toBe('auto');
+  });
+
+  it('cold-reads dshProfile for the indexed daemon slot', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'dsh_daemon',
+      larkAppSecret: 'secret',
+      cliId: 'dsh',
+      dshProfile: 'custom-profile',
+    }]));
+
+    expect(mod.loadBotConfigAtIndex(0).dshProfile).toBe('custom-profile');
   });
 
   it('does not register activation-pending bots before their critical scopes are ready', () => {
@@ -2172,8 +2430,8 @@ describe('loadBotConfigs', () => {
       larkAppId: 'app_full',
       larkAppSecret: 'secret_full',
       name: 'codex-main',
-      cliId: 'gemini',
-      cliPathOverride: '/usr/local/bin/gemini',
+      cliId: 'opencode',
+      cliPathOverride: '/usr/local/bin/opencode',
       disableCliBypass: true,
       sandbox: true,
       sandboxHidePaths: ['~/.ssh', '', 42, '/etc/secret'],
@@ -2189,8 +2447,8 @@ describe('loadBotConfigs', () => {
     expect(configs).toHaveLength(1);
     const c = configs[0];
     expect(c.name).toBe('codex-main');
-    expect(c.cliId).toBe('gemini');
-    expect(c.cliPathOverride).toBe('/usr/local/bin/gemini');
+    expect(c.cliId).toBe('opencode');
+    expect(c.cliPathOverride).toBe('/usr/local/bin/opencode');
     expect(c.disableCliBypass).toBe(true);
     expect(c.sandbox).toBe(true);
     expect(c.sandboxHidePaths).toEqual(['~/.ssh', '/etc/secret']);
@@ -2304,6 +2562,24 @@ describe('loadBotConfigs', () => {
 
     const configs = mod.loadBotConfigs();
     expect(configs).toEqual([]);
+  });
+
+  it.each([true, false, 'true', undefined])('signed chat defaults require boolean opt-in (%s)', (enabled) => {
+    const config = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'signed-default-app', larkAppSecret: 'test-secret',
+      signedChatDefaults: enabled,
+      signedChatDefaultsRegistryUrl: 'https://registry.example/lookup',
+    }]))[0];
+    expect(config.signedChatDefaults).toBe(enabled === true ? true : undefined);
+    expect(config.signedChatDefaultsRegistryUrl).toBe('https://registry.example/lookup');
+  });
+
+  it.each(['http://registry.example/lookup', 42, null, undefined])('ignores non-HTTPS registry configuration (%s)', (endpoint) => {
+    const config = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'signed-default-app', larkAppSecret: 'test-secret',
+      signedChatDefaultsRegistryUrl: endpoint,
+    }]))[0];
+    expect(config.signedChatDefaultsRegistryUrl).toBeUndefined();
   });
 
   // ── defaultOncall parsing ────────────────────────────────────────────────
@@ -2565,5 +2841,86 @@ describe('cardActionAckTimeoutMs bot config', () => {
       undefined,
       undefined,
     ]);
+  });
+});
+
+// ─── askOptionLayout 冷读线程化（PR #1587 评审阻断项回归） ─────────────────
+// 写侧（PUT → rmwBotEntry）与热更新早已走通；这里的断点是 parser：磁盘上的
+// 字段必须被 parseBotConfigsFromText / loadBotConfigAtIndex 读进 BotConfig，
+// 否则 daemon 重启后配置静默回退 compact，而 Dashboard 离线恢复行仍显示原值。
+describe('parseBotConfigsFromText — askOptionLayout 冷读', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
+
+  beforeEach(async () => {
+    mod = await freshImport();
+    const fs = await import('node:fs');
+    fsMock = {
+      existsSync: fs.existsSync as unknown as ReturnType<typeof vi.fn>,
+      readFileSync: fs.readFileSync as unknown as ReturnType<typeof vi.fn>,
+      statSync: fs.statSync as unknown as ReturnType<typeof vi.fn>,
+    };
+    fsMock.existsSync.mockReset();
+    fsMock.readFileSync.mockReset();
+    fsMock.statSync.mockReset();
+    fsMock.statSync.mockReturnValue({ mtimeMs: 0 });
+    delete process.env.BOTS_CONFIG;
+    delete process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
+    delete process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID;
+  });
+
+  it('bots.json 里的 vertical 被 parser 线程化进 BotConfig', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', askOptionLayout: 'vertical' },
+    ]));
+    expect(cfg.askOptionLayout).toBe('vertical');
+  });
+
+  it('未配置 / 显式 compact / 非法手改值均读为缺省（compact 行为）', () => {
+    const [unset, explicit, bogus] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+      { larkAppId: 'b', larkAppSecret: 's', askOptionLayout: 'compact' },
+      { larkAppId: 'c', larkAppSecret: 's', askOptionLayout: 'sideways' },
+    ]));
+    expect(unset.askOptionLayout).toBeUndefined();
+    expect(explicit.askOptionLayout).toBe('compact');
+    expect(bogus.askOptionLayout).toBeUndefined();
+  });
+
+  it('loadBotConfigAtIndex 路径（daemon 自身 slot）同样冷读该字段', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'slot_app',
+      larkAppSecret: 'slot_secret',
+      askOptionLayout: 'vertical',
+    }]));
+
+    expect(mod.loadBotConfigAtIndex(0).askOptionLayout).toBe('vertical');
+  });
+});
+
+
+describe('topic write policy configuration', () => {
+  it('enables source checks only for an explicit stop policy', async () => {
+    const mod = await freshImport();
+    const inputs = ['stop', 'legacy', undefined, 'STOP', true, null];
+    const parsed = mod.parseBotConfigsFromText(JSON.stringify(inputs.map((policy, i) =>
+      makeCfg({ larkAppId: `app_policy_${i}`, topicUnavailablePolicy: policy }))));
+    expect(parsed.map(config => config.topicUnavailablePolicy))
+      .toEqual(['stop', undefined, undefined, undefined, undefined, undefined]);
+  });
+});
+
+describe('network policy configuration loading', () => {
+  it('rejects invalid handwritten policy without dropping it', async () => {
+    const mod = await freshImport();
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandboxNetworkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'typo' } } })]))).toThrow();
+  });
+  it('normalizes a valid policy and preserves legacy false independently', async () => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandbox: true, sandboxNetwork: false, sandboxNetworkPolicy: { version: 1, public: { mode: 'allowlist', rules: [{ cidr: '8.8.8.8' }] }, private: { mode: 'block' } } })]));
+    expect(config.sandboxNetwork).toBe(false);
+    expect(config.sandboxNetworkPolicy!.public.rules![0]!.cidr).toBe('8.8.8.8/32');
   });
 });

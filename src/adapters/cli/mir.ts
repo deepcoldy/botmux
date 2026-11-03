@@ -1,9 +1,7 @@
-import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
+import { resolveRunnerPath } from './runner-path.js';
 import { resolveCommandReal } from './registry.js';
 
 /**
@@ -22,15 +20,6 @@ import { resolveCommandReal } from './registry.js';
  * BOTMUX_SESSION_ID. Conversation continuity across turns / resume is handled by
  * mircli itself via `--session-id` (the runner passes botmux's session id).
  */
-
-function runnerPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const compiledSibling = resolve(here, '..', '..', 'mir-runner.js');
-  if (existsSync(compiledSibling)) return compiledSibling;
-  const builtFromSourceTree = resolve(here, '..', '..', '..', 'dist', 'mir-runner.js');
-  if (existsSync(builtFromSourceTree)) return builtFromSourceTree;
-  return compiledSibling;
-}
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
@@ -68,7 +57,7 @@ export function createMirAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildArgs({ sessionId, botName, botOpenId, locale }) {
-      const args = [runnerArgv0('mir-runner', runnerPath()), '--session-id', sessionId];
+      const args = [runnerArgv0('mir-runner', resolveRunnerPath('mir-runner.js')), '--session-id', sessionId];
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
@@ -99,5 +88,3 @@ export function createMirAdapter(pathOverride?: string): CliAdapter {
     altScreen: false,
   };
 }
-
-export const create = createMirAdapter;

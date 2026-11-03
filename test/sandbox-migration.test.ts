@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { migrateSandboxConfigOnDisk } from '../src/services/sandbox-migration.js';
+import { migrateSandboxConfigAtStartup, migrateSandboxConfigOnDisk } from '../src/services/sandbox-migration.js';
+import { withFileLock } from '../src/utils/file-lock.js';
 
 let dir: string;
 let botsPath: string;
@@ -86,5 +87,83 @@ describe('migrateSandboxConfigOnDisk', () => {
     write(entries);
     await migrateSandboxConfigOnDisk(botsPath);
     expect(readFileSync(`${botsPath}.bak-sandbox-v1`, 'utf-8')).toBe(bakContent);
+  });
+});
+
+describe('migrateSandboxConfigAtStartup when the bots.json lock is busy', () => {
+  const legacy = [{ larkAppId: 'cli_busy', larkAppSecret: 's', sandbox: true, sandboxHidePaths: ['~/.ssh'] }];
+
+  /** Hold the bots.json lock until `release()` is called. */
+  function holdLock(): { held: Promise<void>; release: () => void; done: Promise<unknown> } {
+    let release!: () => void;
+    let markHeld!: () => void;
+    const held = new Promise<void>(r => { markHeld = r; });
+    const done = withFileLock(botsPath, () => new Promise<void>(r => { release = r; markHeld(); }));
+    return { held, release: () => release(), done };
+  }
+
+  it('retries in the background and migrates once the lock frees up', async () => {
+    write(legacy);
+    const lock = holdLock();
+    await lock.held;
+    const scheduled: Array<() => void> = [];
+    const prev = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = botsPath;
+    try {
+      await migrateSandboxConfigAtStartup({
+        retryDelaysMs: [1, 1],
+        schedule: fn => { scheduled.push(fn); },
+        lockOpts: { maxWaitMs: 50 },
+      });
+      expect(read()[0].sandboxPaths).toBeUndefined();
+      expect(scheduled).toHaveLength(1);
+      lock.release();
+      await lock.done;
+      scheduled.shift()!();
+      await vi.waitFor(() => expect(read()[0].sandboxPaths).toEqual({ deny: ['~/.ssh'] }));
+      expect(scheduled).toHaveLength(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = prev;
+      lock.release();
+    }
+  });
+
+  it('gives up after the last retry instead of rescheduling forever', async () => {
+    write(legacy);
+    const lock = holdLock();
+    await lock.held;
+    const scheduled: Array<() => void> = [];
+    const prev = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = botsPath;
+    try {
+      await migrateSandboxConfigAtStartup({
+        retryDelaysMs: [1],
+        schedule: fn => { scheduled.push(fn); },
+        lockOpts: { maxWaitMs: 50 },
+      });
+      expect(scheduled).toHaveLength(1);
+      scheduled.shift()!();
+      await new Promise(r => setTimeout(r, 300));
+      expect(scheduled).toHaveLength(0);
+      expect(read()[0].sandboxPaths).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = prev;
+      lock.release();
+      await lock.done;
+    }
+  });
+
+  it('does not reschedule after a successful migration', async () => {
+    write(legacy);
+    const scheduled: Array<() => void> = [];
+    const prev = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = botsPath;
+    try {
+      await migrateSandboxConfigAtStartup({ retryDelaysMs: [1], schedule: fn => { scheduled.push(fn); } });
+      expect(scheduled).toHaveLength(0);
+      expect(read()[0].sandboxPaths).toEqual({ deny: ['~/.ssh'] });
+    } finally {
+      if (prev === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = prev;
+    }
   });
 });

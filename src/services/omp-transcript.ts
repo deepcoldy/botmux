@@ -5,15 +5,13 @@
  * assistant `stop`. Therefore terminal assistant records remain provisional
  * until a decisive later record or the worker's guarded quiet-tick flush.
  */
-import {
-  closeSync,
-  existsSync,
-  openSync,
-  readSync,
-  statSync,
-} from 'node:fs';
-
 import type { CodexBridgeEvent } from './codex-transcript.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
+import {
+  contentHasToolCall as hasToolCall,
+  entryTimestampMs as timestampMs,
+  messageContentText,
+} from './pi-family-content.js';
 
 export interface OmpProvisionalFinal {
   event: CodexBridgeEvent;
@@ -43,24 +41,7 @@ type OmpTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
 
 /** Canonical text projection for OMP message content. */
 export function ompMessageText(content: unknown): string {
-  if (typeof content === 'string') return content.trim();
-  if (!Array.isArray(content)) return '';
-  const parts: string[] = [];
-  for (const item of content) {
-    if (!item || typeof item !== 'object') continue;
-    if ((item as { type?: unknown }).type === 'text'
-      && typeof (item as { text?: unknown }).text === 'string') {
-      parts.push((item as { text: string }).text);
-    }
-  }
-  return parts.join('\n').trim();
-}
-
-function hasToolCall(content: unknown): boolean {
-  return Array.isArray(content) && content.some(item =>
-    !!item
-    && typeof item === 'object'
-    && (item as { type?: unknown }).type === 'toolCall');
+  return messageContentText(content);
 }
 
 function terminalOutcome(stopReason: OmpTerminalStopReason): Pick<
@@ -76,17 +57,6 @@ function terminalOutcome(stopReason: OmpTerminalStopReason): Pick<
     case 'aborted':
       return { terminalStatus: 'ambiguous', terminalErrorCode: 'omp_turn_aborted' };
   }
-}
-
-function timestampMs(entry: Record<string, unknown>, message?: Record<string, unknown>): number {
-  if (typeof entry.timestamp === 'string') {
-    const parsed = Date.parse(entry.timestamp);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  if (typeof message?.timestamp === 'number' && Number.isFinite(message.timestamp)) {
-    return message.timestamp;
-  }
-  return Date.now();
 }
 
 function stringField(value: unknown): string | undefined {
@@ -132,50 +102,19 @@ export function drainOmpTranscript(
   previousState: OmpTranscriptState = {},
   options: OmpDrainOptions = {},
 ): OmpDrainResult {
-  if (!existsSync(path)) {
-    return { events: [], newOffset: 0, pendingTail: '', state: {} };
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind === 'skip') {
+    return step.reason === 'missing'
+      ? { events: [], newOffset: step.newOffset, pendingTail: '', state: {} }
+      : { events: [], newOffset: step.newOffset, pendingTail: '', state: cloneState(previousState) };
   }
 
-  let size: number;
-  try {
-    size = statSync(path).size;
-  } catch {
-    return { events: [], newOffset: fromOffset, pendingTail: '', state: cloneState(previousState) };
-  }
-
-  const truncated = size < fromOffset;
-  const start = truncated ? 0 : fromOffset;
-  let state = truncated ? {} : cloneState(previousState);
+  const start = step.start;
+  let state = step.reset ? {} : cloneState(previousState);
   const events: CodexBridgeEvent[] = [];
+  const { completeText, pendingTail, newOffset } = step.window;
 
-  let completeText = '';
-  let pendingTail = '';
-  let newOffset = start;
-  if (size > start) {
-    const length = size - start;
-    const buffer = Buffer.alloc(length);
-    const fd = openSync(path, 'r');
-    try {
-      readSync(fd, buffer, 0, length, start);
-    } finally {
-      closeSync(fd);
-    }
-    const text = buffer.toString('utf8');
-    const lastNewline = text.lastIndexOf('\n');
-    completeText = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : '';
-    pendingTail = lastNewline >= 0 ? text.slice(lastNewline + 1) : text;
-    newOffset = start + Buffer.byteLength(completeText, 'utf8');
-  }
-
-  let cursor = start;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1;
-      continue;
-    }
-    const lineStart = cursor;
-    cursor += Buffer.byteLength(line, 'utf8') + 1;
-
+  for (const { line, lineStart } of iterateJsonlLines(completeText, start)) {
     let entry: Record<string, unknown>;
     try {
       const parsed = JSON.parse(line);

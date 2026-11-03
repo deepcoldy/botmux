@@ -1,10 +1,12 @@
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   macOSBundledCodexCandidates,
   resolveCommand,
+  resolveCommandAsync,
 } from '../src/adapters/cli/registry.js';
 import { shellPathProbes } from '../src/desktop/shared/shell-path-probes.js';
 
@@ -121,4 +123,151 @@ describe('macOS bundled Codex CLI discovery', () => {
       '/Users/example/Applications/Codex.app/Contents/Resources/codex',
     ]);
   });
+});
+
+describe('asynchronous shell discovery', () => {
+  const dirs: string[] = [];
+  afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  function fixture() {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-async-shell-'));
+    dirs.push(dir);
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    const tool = join(bin, 'botmux-test-rc-only');
+    writeFileSync(tool, '#!/bin/sh\nexit 0\n');
+    chmodSync(tool, 0o755);
+    return { dir, bin, tool };
+  }
+  it.skipIf(!existsSync('/bin/zsh')).each(['.zprofile', '.zshrc'])('finds an executable installed only through %s', async rc => {
+    const { dir, bin, tool } = fixture();
+    writeFileSync(join(dir, rc), `export PATH="${bin}:$PATH"\n`);
+    const result = await resolveCommandAsync('botmux-test-rc-only', {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: '/bin/zsh', PATH: '/usr/bin:/bin' },
+    });
+    expect(result).toEqual({ resolved: tool, inconclusive: false });
+  });
+  it('finds a Bash rc-only install after the login lookup misses', async () => {
+    const { dir, bin, tool } = fixture();
+    const shell = join(dir, 'bash-shell');
+    writeFileSync(join(dir, 'bashrc'), `export PATH="${bin}:$PATH"\n`);
+    writeFileSync(shell, '#!/bin/sh\nexec /bin/bash --noprofile --rcfile "$TEST_RC" "$@"\n');
+    chmodSync(shell, 0o755);
+    expect(await resolveCommandAsync('botmux-test-rc-only', {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: shell, TEST_RC: join(dir, 'bashrc'), PATH: '/usr/bin:/bin' },
+    })).toEqual({ resolved: tool, inconclusive: false });
+  });
+  it('retains literal argv and never evaluates command substitutions', async () => {
+    const { dir } = fixture();
+    const command = `botmux-test-missing$(touch ${join(dir, 'marker')}); echo unsafe`;
+    const result = await resolveCommandAsync(command, {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: '/bin/sh', PATH: '/usr/bin:/bin' },
+    });
+    expect(result).toEqual({ resolved: command, inconclusive: false });
+    expect(existsSync(join(dir, 'marker'))).toBe(false);
+  });
+  it('keeps a timed-out shell inconclusive and releases the event loop', async () => {
+    const { dir } = fixture();
+    const shell = join(dir, 'slow-shell');
+    writeFileSync(shell, '#!/bin/sh\n/bin/sleep 10\n');
+    chmodSync(shell, 0o755);
+    const promise = resolveCommandAsync('botmux-test-never-installed', {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: shell, PATH: '/usr/bin:/bin' }, timeoutMs: 100,
+    });
+    let progressed = false;
+    await new Promise<void>(resolve => setImmediate(() => { progressed = true; resolve(); }));
+    expect(progressed).toBe(true);
+    expect(await promise).toEqual({ resolved: 'botmux-test-never-installed', inconclusive: true });
+  });
+  it('ignores an absolute banner when the lookup exits with an error', async () => {
+    const { dir, tool } = fixture();
+    const shell = join(dir, 'bad-shell');
+    writeFileSync(shell, `#!/bin/sh\nprintf '%s\\n' '${tool}'\nexit 3\n`);
+    chmodSync(shell, 0o755);
+    expect(await resolveCommandAsync('botmux-test-not-installed', {
+      env: { HOME: dir, ZDOTDIR: dir, SHELL: shell, PATH: '/usr/bin:/bin' },
+    })).toEqual({ resolved: 'botmux-test-not-installed', inconclusive: true });
+  });
+});
+
+
+describe('async shell process-group retirement', () => {
+  /** Still running? An exited process stays visible to kill(0) as a zombie (Z)
+   *  until its parent reaps it, and as dead (X) while that reap is in progress. */
+  function live(pid: number): boolean {
+    try { process.kill(pid, 0); } catch { return false; }
+    try {
+      const state = process.platform === 'linux'
+        ? readFileSync(`/proc/${pid}/status`, 'utf8').match(/^State:\s*(\w)/m)?.[1]
+        : execFileSync('ps', ['-o', 'state=', '-p', String(pid)], { encoding: 'utf8' }).trim()[0];
+      return state !== 'Z' && state !== 'X';
+    } catch { return false; }
+  }
+
+  it.each(['complete', 'timeout'] as const)('retires rc background children after %s with a positive control', async mode => {
+    const root = mkdtempSync(join(tmpdir(), 'probe-child-'));
+    const shell = join(root, 'shell');
+    const pidfile = join(root, 'children');
+    const tool = join(root, 'tool');
+    const env = { HOME: root, ZDOTDIR: root, SHELL: shell, PATH: '/usr/bin:/bin' };
+    const pids = () => existsSync(pidfile) ? readFileSync(pidfile, 'utf8').trim().split('\n').filter(Boolean).map(Number) : [];
+    const manual = new Set<number>();
+    try {
+      writeFileSync(tool, '#!/bin/sh\nexit 0\n'); chmodSync(tool, 0o755);
+      writeFileSync(shell, `#!/bin/sh\n/bin/sleep 45 >/dev/null 2>&1 &\necho $! >> '${pidfile}'\n` +
+        (mode === 'timeout' ? '/bin/sleep 5\n' : `echo '${tool}'\n`));
+      chmodSync(shell, 0o755);
+      // Same fixture outside the resolver proves rc really started a live child.
+      const control = spawn(shell, [], { env, detached: true, stdio: 'ignore' });
+      await new Promise<void>((resolve, reject) => { control.once('error', reject); const check = () => {
+        if (pids().length) resolve(); else setTimeout(check, 10);
+      }; check(); });
+      for (const pid of pids()) { manual.add(pid); expect(live(pid)).toBe(true); }
+      if (control.pid) { try { process.kill(-control.pid, 'SIGKILL'); } catch { /* exited */ } }
+      for (const pid of manual) { try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ } }
+      writeFileSync(pidfile, '');
+      // Spawn budget for BOTH modes: the rc must have wall time to START and
+      // record its background child before the resolver can retire its group.
+      // 100ms used to fire before /bin/sh was ever scheduled on a loaded
+      // bun-test runner (1823 files concurrent), so the resolver SIGKILLed the
+      // group before the fixture's `echo $!` ran and this positive control read
+      // an empty pidfile — the timeout variant failed in CI (run 41023870882,
+      // job 123957266873); the complete variant carries the identical startup
+      // window and fails the same way once the rc is delayed past the budget
+      // (verified by injecting a 150-250ms pre-echo stall locally: at 100ms
+      // BOTH variants fail, at 2s BOTH pass). 2s covers process spawn on a
+      // busy runner. It does not slow the complete variant (its rc exits on its
+      // own well before the budget), and the timeout variant's foreground
+      // `sleep 5` keeps its timeout outcome deterministic.
+      const result = await resolveCommandAsync('probe-child-tool', { env, timeoutMs: 2_000 });
+      // Bounded observation of the recorded child (the spawn budget above is
+      // what closes the startup race; this only absorbs read timing).
+      let spawned = pids();
+      const spawnedDeadline = Date.now() + 2_000;
+      while (!spawned.length && Date.now() < spawnedDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        spawned = pids();
+      }
+      expect(spawned.length).toBeGreaterThan(0);
+      if (mode === 'complete') expect(result.resolved).toBe(tool);
+      else expect(result.inconclusive).toBe(true);
+      // Having exited is final, so assert on the observation that ended the wait
+      // rather than on a second read taken after it.
+      const deadline = Date.now() + 2_000;
+      let running = pids().filter(live);
+      while (running.length && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        running = pids().filter(live);
+      }
+      expect(running).toEqual([]);
+    } finally {
+      for (const pid of [...manual, ...pids()]) { try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ } }
+      rmSync(root, { recursive: true, force: true });
+    }
+    // Per-test wall budget 30s: the timeout variant legitimately burns ~2 × the
+    // 2s resolver budget (probes run -lc then -ic) ≈ 4s. CI legs pass an explicit
+    // --timeout (180s bun leg, 60s vitest), but a bare `bun test <file>` uses
+    // Bun's 5000ms default and killed a passing variant at ~4.5-5.1s on a loaded
+    // 1-CPU host (4/8 rounds). This lifts only the runner ceiling; the timeout
+    // semantics themselves stay asserted (inconclusive / group retirement).
+  }, 30_000);
 });

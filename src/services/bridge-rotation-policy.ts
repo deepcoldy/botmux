@@ -98,6 +98,83 @@ export function evaluatePidResolverPullback(
   return { suppress: false, clearStale: true };
 }
 
+// ─── Pid-state switch history cutoff ───────────────────────────────────────
+
+/** Skew allowed between a Lark mark and Claude's write of that user line —
+ *  the same bound the fingerprint switch scans and splits with. */
+export const PENDING_MARK_SKEW_MS = 5_000;
+
+export interface PidRotationCutoffInput {
+  /** Last moment the bridge's current path was confirmed: bridge attach, the
+   *  previous switch, or a pid-resolver tick that reported `'same'`. */
+  confirmedAtMs: number;
+  /** Mark times of Lark turns whose user line has not been read yet. */
+  unstartedMarkTimesMs: readonly number[];
+}
+
+/**
+ * Where a pid-state switch splits the transcript it moves onto: events at or
+ * before the returned time are absorbed as history, later ones are ingested.
+ *
+ * The pid-state record names the transcript Claude writes NOW, not since when.
+ * The last confirmation of the previous path bounds that from below: whatever
+ * was written after it may belong to a turn the bridge has not read; whatever
+ * was written before was read from the previous path or predates this worker.
+ * The target is often not a new file — an in-pane `/resume` returns to an old
+ * conversation, and a daemon restart that missed a `/clear` finds hours of
+ * turns in the post-clear file — so reading it from offset 0 would replay them.
+ *
+ * A Lark mark still waiting for its user line pulls the cutoff earlier so that
+ * line stays live (strictly older than the fingerprint scan's floor).
+ */
+export function pidRotationHistoryCutoffMs(input: PidRotationCutoffInput): number {
+  let cutoff = input.confirmedAtMs;
+  for (const markMs of input.unstartedMarkTimesMs) {
+    cutoff = Math.min(cutoff, markMs - PENDING_MARK_SKEW_MS - 1);
+  }
+  return cutoff;
+}
+
+// ─── Recording the conversation Claude moved to ────────────────────────────
+
+export interface PidStateSessionRecordInput {
+  /** Session id Claude's pid-state record names, for the transcript the bridge
+   *  reads now. */
+  observedSessionId: string;
+  /** What a cold start would resume: the recorded CLI session id, else the
+   *  botmux session id the CLI was launched with. */
+  resumeSessionId: string;
+  /** An adopted CLI: botmux never relaunches it (the session closes when its
+   *  pane goes away), so there is no resume target to keep current. */
+  adopted: boolean;
+  /** Whether the observed session's transcript holds a conversation
+   *  `--resume` can open. Reads the file, so it is asked last. */
+  transcriptResumable: () => boolean;
+}
+
+/**
+ * Should the worker record the session id Claude's pid-state record names as
+ * the one to resume?
+ *
+ * Claude 2.1.305+ rewrites `sessions/<pid>.json` the moment it moves to
+ * another conversation — `/clear`, an in-pane `/resume`, `/branch` (`/compact`
+ * stays in the same one). Otherwise the id is reported only around a Lark
+ * message's submit, so after a `/clear` followed by local turns alone the next
+ * cold start (`--resume <recorded id>`) brought back the conversation the user
+ * had just cleared.
+ *
+ * Only once its transcript holds a conversation: `--resume` of an id without
+ * one makes Claude exit ("No conversation found"). A `--fork-session` launch
+ * names its new id before the file exists, and the file starts out as a few
+ * metadata records before the conversation lands in it (2.1.308). Until then
+ * the recorded id stays what it was — which is what the next start resumes, or
+ * forks from again.
+ */
+export function shouldRecordPidStateSessionId(input: PidStateSessionRecordInput): boolean {
+  if (input.adopted || input.observedSessionId === input.resumeSessionId) return false;
+  return input.transcriptResumable();
+}
+
 // ─── Two-phase fingerprint-fallback decision ───────────────────────────────
 
 /** UUID-shaped Claude jsonl filename (sessionId.jsonl). Duplicated from

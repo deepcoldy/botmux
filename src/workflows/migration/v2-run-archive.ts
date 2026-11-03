@@ -19,7 +19,6 @@ import {
   linkSync,
   mkdirSync,
   openSync,
-  readFileSync,
   readdirSync,
   readSync,
   realpathSync,

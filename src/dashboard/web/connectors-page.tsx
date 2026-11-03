@@ -3,10 +3,17 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { CreateActionButton, DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { jget, jsend } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
 import { copyText } from './clipboard.js';
 import { confirm } from './confirm-modal.js';
+import {
+  CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH,
+  isValidConnectorLifecycleGroupNameTemplate,
+} from '../../services/connector-lifecycle-group-name.js';
+import { SearchableGroupPicker } from './searchable-group-picker.js';
+import { BotPickerChips } from './bot-picker-chips.js';
 
 interface Connector {
   id: string;
@@ -31,6 +38,10 @@ interface Connector {
   suppressFinalOutput?: boolean;
   loggingPolicy?: { storePayload: boolean; storeHeaders: boolean; retentionDays: number };
   lifecycleExtractors?: { dedupKey: string } | null;
+  lifecycleGroupName?: {
+    mode: 'default' | 'fixed' | 'template';
+    text?: string;
+  };
 }
 
 interface ConnectorTopicMessageExtractor {
@@ -64,6 +75,8 @@ interface CreateForm {
   allowChats: string[];
   deduplicate: boolean;
   dedup: string;
+  groupNameMode: 'default' | 'fixed' | 'template';
+  groupNameText: string;
   instruction: string;
   topicMessageMode: 'default' | 'custom' | 'template' | 'none';
   topicMessageText: string;
@@ -105,6 +118,8 @@ const emptyForm: CreateForm = {
   allowChats: [],
   deduplicate: false,
   dedup: '',
+  groupNameMode: 'default',
+  groupNameText: '',
   instruction: '',
   topicMessageMode: 'default',
   topicMessageText: '',
@@ -114,18 +129,6 @@ const emptyForm: CreateForm = {
   secret: '',
   storePayload: true,
 };
-
-export function buildConnectorInstructionUpdateBody(
-  connector: { name: string; promptEnvelope?: { sourceName?: string } },
-  instruction: string,
-): { promptEnvelope: { sourceName: string; instruction: string } } {
-  return {
-    promptEnvelope: {
-      sourceName: connector.promptEnvelope?.sourceName || connector.name,
-      instruction,
-    },
-  };
-}
 
 export function buildConnectorTopicMessageConfig(
   mode: CreateForm['topicMessageMode'],
@@ -152,6 +155,25 @@ export function buildConnectorTopicMessageConfig(
   } catch {
     return { ok: false, error: 'connectors.errTopicExtractors' };
   }
+}
+
+export function trimConnectorLifecycleGroupNameInput(text: string): string {
+  return Array.from(text).slice(0, CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH).join('');
+}
+
+export function buildConnectorLifecycleGroupNameConfig(
+  mode: CreateForm['groupNameMode'],
+  rawText: string,
+):
+  | { ok: true; value: NonNullable<Connector['lifecycleGroupName']> }
+  | { ok: false; error: 'connectors.errGroupName' | 'connectors.errGroupNameTemplate' } {
+  const text = rawText.trim();
+  if (mode === 'default') return { ok: true, value: { mode } };
+  if (!text) return { ok: false, error: 'connectors.errGroupName' };
+  if (mode === 'template' && !isValidConnectorLifecycleGroupNameTemplate(text)) {
+    return { ok: false, error: 'connectors.errGroupNameTemplate' };
+  }
+  return { ok: true, value: { mode, text } };
 }
 
 export function buildConnectorKindOptions(
@@ -214,128 +236,6 @@ function ConnectorDropdown<T extends string>(props: {
   );
 }
 
-function SearchableGroupPicker(props: {
-  id: string;
-  className?: string;
-  label: string;
-  groups: GroupOpt[];
-  value: string | string[];
-  multiple?: boolean;
-  allLabel?: string;
-  placeholder: string;
-  selectedContent?: ReactNode;
-  searchPlaceholder: string;
-  emptyLabel: string;
-  selectedCountLabel(count: number): string;
-  onChange(value: string | string[]): void;
-}): React.JSX.Element {
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const values = Array.isArray(props.value) ? props.value : (props.value ? [props.value] : []);
-  const valueSet = useMemo(() => new Set(values), [values]);
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  const filteredGroups = useMemo(() => {
-    if (!normalizedQuery) return props.groups;
-    return props.groups.filter(group => `${group.name} ${group.chatId}`.toLocaleLowerCase().includes(normalizedQuery));
-  }, [normalizedQuery, props.groups]);
-  const selectedLabel = props.multiple
-    ? (values.length === 0 ? props.allLabel || props.placeholder : props.selectedCountLabel(values.length))
-    : (props.groups.find(group => group.chatId === values[0])?.name || values[0] || props.placeholder);
-  const rootClassName = ['connector-group-picker', props.className, open ? 'open' : ''].filter(Boolean).join(' ');
-
-  useEffect(() => {
-    if (!open) return undefined;
-    const closeOnOutsideClick = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    document.addEventListener('pointerdown', closeOnOutsideClick);
-    return () => document.removeEventListener('pointerdown', closeOnOutsideClick);
-  }, [open]);
-
-  function select(chatId: string): void {
-    if (!props.multiple) {
-      props.onChange(chatId);
-      setOpen(false);
-      setQuery('');
-      return;
-    }
-    props.onChange(valueSet.has(chatId) ? values.filter(id => id !== chatId) : [...values, chatId]);
-  }
-
-  return (
-    <div ref={rootRef} className={rootClassName}>
-      <button
-        id={props.id}
-        type="button"
-        className="connector-group-picker-trigger"
-        aria-label={props.label}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        onClick={() => setOpen(current => !current)}
-      >
-        {props.selectedContent ?? (
-          <span className={values.length || (props.multiple && props.allLabel) ? '' : 'muted'}>{selectedLabel}</span>
-        )}
-        <span className="connector-group-picker-chevron" aria-hidden="true" />
-      </button>
-      {open ? (
-        <div className="connector-group-picker-popover">
-          <label className="connector-group-search" htmlFor={`${props.id}-search`}>
-            <span className="connector-group-search-icon" aria-hidden="true" />
-            <input
-              id={`${props.id}-search`}
-              type="search"
-              autoComplete="off"
-              autoFocus
-              value={query}
-              placeholder={props.searchPlaceholder}
-              onChange={event => setQuery(event.currentTarget.value)}
-              onKeyDown={event => {
-                if (event.key === 'Escape') {
-                  event.preventDefault();
-                  setOpen(false);
-                }
-              }}
-            />
-          </label>
-          <div className="connector-group-options" role="listbox" aria-label={props.label} aria-multiselectable={props.multiple || undefined}>
-            {props.multiple && props.allLabel && !normalizedQuery ? (
-              <button
-                type="button"
-                className={`connector-group-option connector-group-option-all${values.length === 0 ? ' selected' : ''}`}
-                role="option"
-                aria-selected={values.length === 0}
-                onClick={() => props.onChange([])}
-              >
-                <span className="connector-group-check" aria-hidden="true" />
-                <span><b>{props.allLabel}</b><small>{props.placeholder}</small></span>
-              </button>
-            ) : null}
-            {filteredGroups.map(group => {
-              const selected = valueSet.has(group.chatId);
-              return (
-                <button
-                  type="button"
-                  className={`connector-group-option${selected ? ' selected' : ''}`}
-                  role="option"
-                  aria-selected={selected}
-                  key={group.chatId}
-                  onClick={() => select(group.chatId)}
-                >
-                  <span className="connector-group-check" aria-hidden="true" />
-                  <span><b>{group.name || group.chatId}</b>{group.name ? <small>{group.chatId}</small> : null}</span>
-                </button>
-              );
-            })}
-            {!filteredGroups.length ? <p className="connector-group-empty">{props.emptyLabel}</p> : null}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function botGroups(groups: GroupOpt[], botId: string): GroupOpt[] {
   return groups.filter(g => g.bots.includes(botId));
 }
@@ -356,6 +256,8 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     allowChats: connector.target.allowChats || [],
     deduplicate: Boolean(connector.lifecycleExtractors?.dedupKey),
     dedup: connector.lifecycleExtractors?.dedupKey || '',
+    groupNameMode: connector.lifecycleGroupName?.mode || 'default',
+    groupNameText: connector.lifecycleGroupName?.text || '',
     instruction: connector.promptEnvelope?.instruction || '',
     topicMessageMode: connector.topicMessage?.mode || 'default',
     topicMessageText: connector.topicMessage?.text || '',
@@ -383,7 +285,6 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   const tr = useT();
   const mountedRef = useRef(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const createDialogRef = useRef<HTMLDialogElement | null>(null);
   const [bots, setBots] = useState<BotOpt[]>([]);
   const [groups, setGroups] = useState<GroupOpt[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
@@ -408,39 +309,11 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       .map(id => additionalBotOptions.find(bot => bot.larkAppId === id))
       .filter((bot): bot is BotOpt => Boolean(bot));
     if (!selected.length) return undefined;
-    const visible = selected.slice(0, 4);
-    const overflow = selected.length - visible.length;
-    const botLabel = (bot: BotOpt) => bot.botName || bot.larkAppId;
-    const botTitle = (bot: BotOpt) => `${botLabel(bot)} (${bot.larkAppId})`;
-    const unselectBot = (event: React.MouseEvent, larkAppId: string) => {
-      event.preventDefault();
-      event.stopPropagation();
-      setForm(cur => ({ ...cur, additionalBotIds: cur.additionalBotIds.filter(id => id !== larkAppId) }));
-    };
     return (
-      <span className="connector-bot-picker-chips">
-        {visible.map(bot => (
-          <span key={bot.larkAppId} className="connector-bot-picker-chip" data-full={botTitle(bot)} title={botTitle(bot)}>
-            <span className="connector-bot-picker-chip-label">{botLabel(bot)}</span>
-            <span
-              className="connector-bot-picker-chip-remove"
-              aria-label={`取消选择 ${botLabel(bot)}`}
-              onClick={event => unselectBot(event, bot.larkAppId)}
-            >
-              &times;
-            </span>
-          </span>
-        ))}
-        {overflow > 0 ? (
-          <span
-            className="connector-bot-picker-chip connector-bot-picker-chip-overflow"
-            data-full={selected.slice(4).map(botTitle).join('\n')}
-            title={selected.slice(4).map(botTitle).join('\n')}
-          >
-            <span className="connector-bot-picker-chip-label">+{overflow}</span>
-          </span>
-        ) : null}
-      </span>
+      <BotPickerChips
+        bots={selected}
+        onRemove={larkAppId => setForm(cur => ({ ...cur, additionalBotIds: cur.additionalBotIds.filter(id => id !== larkAppId) }))}
+      />
     );
   }, [additionalBotOptions, form.additionalBotIds]);
   const botOptions = useMemo(
@@ -527,25 +400,6 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       allowChats: cur.allowChats.filter(id => valid.has(id)),
     }));
   }, [groupsForBot]);
-
-  useEffect(() => {
-    const dialog = createDialogRef.current;
-    if (!dialog) return;
-    if (createOpen) {
-      if (!dialog.open) {
-        try { dialog.showModal(); } catch { /* dialog already opening */ }
-      }
-      const body = dialog.querySelector<HTMLElement>('.connector-modal-body');
-      if (body) body.scrollTop = 0;
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [createOpen]);
-
-  useEffect(() => () => {
-    const dialog = createDialogRef.current;
-    if (dialog?.open) dialog.close();
-  }, []);
 
   function modeLabel(m: string): string {
     return m === 'fixed'
@@ -640,6 +494,15 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       const dedup = form.dedup.trim();
       if (form.deduplicate && !dedup) { setCreateMsg({ text: tr('connectors.errDedup'), error: true }); return; }
       body.lifecycleExtractors = form.deduplicate ? { dedupKey: dedup } : null;
+      const lifecycleGroupName = buildConnectorLifecycleGroupNameConfig(
+        form.groupNameMode,
+        form.groupNameText,
+      );
+      if (!lifecycleGroupName.ok) {
+        setCreateMsg({ text: tr(lifecycleGroupName.error), error: true });
+        return;
+      }
+      body.lifecycleGroupName = lifecycleGroupName.value;
     } else {
       body.lifecycleExtractors = null;
     }
@@ -715,6 +578,8 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           workflowId: '',
           manualChatId: '',
           dedup: '',
+          groupNameMode: 'default',
+          groupNameText: '',
           secret: '',
           instruction: '',
           additionalBotIds: [],
@@ -815,16 +680,14 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
 
       {props.tab === 'webhooks' ? (
         <>
-          <dialog
-            ref={createDialogRef}
+          <ModalDialog
+            open={createOpen}
             className="connector-create-modal"
-            onCancel={event => {
-              event.preventDefault();
-              closeCreateModal();
-            }}
             onClose={closeCreateModal}
-            onClick={event => {
-              if (event.target === event.currentTarget) closeCreateModal();
+            onRequestClose={closeCreateModal}
+            onOpen={dialog => {
+              const body = dialog.querySelector<HTMLElement>('.connector-modal-body');
+              if (body) body.scrollTop = 0;
             }}
           >
             <article className="connector-modal-card">
@@ -1012,6 +875,51 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
                   <input id="cn-dedup" value={form.dedup} onChange={e => patchForm({ dedup: e.currentTarget.value })} placeholder={tr('connectors.fDedupPh')} />
                 </label>
               ) : null}
+              <div className="connector-group-name-config">
+                <FieldTitle help={tr('connectors.groupNameHint')}>
+                  {tr('connectors.groupName')}
+                </FieldTitle>
+                <div className="connector-group-name-options" role="radiogroup" aria-label={tr('connectors.groupName')}>
+                  {(['default', 'fixed', 'template'] as const).map(mode => {
+                    const labelSuffix = mode === 'default' ? 'Default' : mode === 'fixed' ? 'Fixed' : 'Template';
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        role="radio"
+                        aria-checked={form.groupNameMode === mode}
+                        className={`connector-group-name-option${form.groupNameMode === mode ? ' selected' : ''}`}
+                        onClick={() => patchForm({ groupNameMode: mode })}
+                      >
+                        <span className="connector-strategy-radio" aria-hidden="true" />
+                        <span>
+                          <b>{tr(`connectors.groupName${labelSuffix}`)}</b>
+                          <small>{tr(`connectors.groupName${labelSuffix}Hint`)}</small>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {form.groupNameMode === 'fixed' || form.groupNameMode === 'template' ? (
+                  <label className="connector-group-name-input" htmlFor="cn-group-name">
+                    <input
+                      id="cn-group-name"
+                      type="text"
+                      value={form.groupNameText}
+                      onChange={event => patchForm({ groupNameText: trimConnectorLifecycleGroupNameInput(event.currentTarget.value) })}
+                      placeholder={tr(form.groupNameMode === 'template'
+                        ? 'connectors.groupNameTemplatePh'
+                        : 'connectors.groupNameFixedPh')}
+                    />
+                    <small>
+                      {tr(form.groupNameMode === 'template'
+                        ? 'connectors.groupNameTemplateHelp'
+                        : 'connectors.groupNameFixedHelp')}
+                      <span>{Array.from(form.groupNameText).length}/{CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH}</span>
+                    </small>
+                  </label>
+                ) : null}
+              </div>
               <p className="connector-new-group-note">{tr('connectors.newGroupNotice')}</p>
             </div>
           ) : null}
@@ -1159,7 +1067,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
                 )}
               </footer>
             </article>
-          </dialog>
+          </ModalDialog>
 
           <section className="overview-block connector-section connector-list-section">
             <div className="card connector-list-card">
@@ -1215,6 +1123,12 @@ function CreatedPanel(props: { created: CreatedConnector; groupName(chatId: stri
             <p className="muted connector-created-help">{tr('connectors.usageDynamicLede', { gn: dynamicGroupName })}</p>
             <pre><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
             <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageDynamicNote') }} />
+          </>
+        ) : c.isToken && c.mode === 'new-group' ? (
+          <>
+            <p className="muted connector-created-help">{tr('connectors.usageNewGroupLede')}</p>
+            <pre><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
+            <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageNewGroupNote') }} />
           </>
         ) : c.isToken ? (
           <>
@@ -1287,6 +1201,13 @@ function ConnectorList(props: {
             {isToken ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.tokenHint') }} /> : null}
             {c.target.kind === 'workflow' ? <div className="muted connector-item-note">{tr('connectors.legacyWorkflowNote')}</div> : null}
             {c.target.mode === 'dynamic' ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
+            {c.target.mode === 'new-group' && c.lifecycleGroupName?.mode && c.lifecycleGroupName.mode !== 'default' ? (
+              <div className="muted connector-item-note">
+                {tr(c.lifecycleGroupName.mode === 'template'
+                  ? 'connectors.groupNameListTemplate'
+                  : 'connectors.groupNameListFixed', { text: c.lifecycleGroupName.text || '' })}
+              </div>
+            ) : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
             <div className="muted connector-item-note">
               {c.topicMessage?.mode === 'none'

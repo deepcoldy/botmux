@@ -24,7 +24,6 @@ import { buildFederatedRoster } from '../services/federation-roster.js';
 import { getDeploymentIdentity, setDeploymentName } from '../services/deployment-identity.js';
 import { addMembership, listMemberships, removeMembership } from '../services/federation-membership-store.js';
 import type { FederatedBot } from '../services/federation-store.js';
-import { listFederatedDeployments } from '../services/federation-store.js';
 import { ensureDefaultTeam, DEFAULT_TEAM_ID, listTeams, createTeam, deleteTeam, getTeam, setTeamFeedbackPolicy } from '../services/team-store.js';
 import { listTeamGroups, recordTeamGroup } from '../services/team-groups-store.js';
 import { createInvite, deleteInvitesForTeam } from '../services/invite-store.js';

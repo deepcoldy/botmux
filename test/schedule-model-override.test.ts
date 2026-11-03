@@ -68,16 +68,16 @@ describe('resolveScheduleModelOverride — codex', () => {
 
 describe('resolveScheduleModelOverride — CLI gate', () => {
   it('drops both on a CLI without the per-turn model contract', () => {
-    // Mirrors the trigger API gate: a codex model id must never reach a Gemini
+    // Mirrors the trigger API gate: a codex model id must never reach an OpenCode
     // bot just because someone re-pointed the task's bot.
     const resolved = resolveScheduleModelOverride(
       { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
-      { cliId: 'gemini' },
+      { cliId: 'opencode' },
     );
     expect(resolved.model).toBeUndefined();
     expect(resolved.reasoningEffort).toBeUndefined();
     expect(resolved.warnings).toHaveLength(1);
-    expect(resolved.warnings[0]).toContain('gemini');
+    expect(resolved.warnings[0]).toContain('opencode');
   });
 
   it('says so explicitly when the bot has no cliId at all', () => {
@@ -87,7 +87,7 @@ describe('resolveScheduleModelOverride — CLI gate', () => {
   });
 
   it('a task with no override stays silent even on an unsupported CLI', () => {
-    expect(resolveScheduleModelOverride({}, { cliId: 'gemini' })).toEqual({ warnings: [] });
+    expect(resolveScheduleModelOverride({}, { cliId: 'opencode' })).toEqual({ warnings: [] });
   });
 
   it('claude-code takes an override too, but not codex-only ultra', () => {

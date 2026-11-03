@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
+import MarkdownIt from 'markdown-it';
 
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
@@ -24,6 +25,25 @@ function event(action: Record<string, unknown>, operator = 'ou_user', formValue?
 }
 
 describe('feedback callback state machine', () => {
+  it('rejects requester-only feedback when the delivery has no requester identity', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'requester' });
+    const response = store.createResponse({ interactionId: 'int-ownerless-requester', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard });
+
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_anyone'),
+      'app',
+      { store },
+    );
+
+    expect(result).toEqual({ toast: { type: 'error', content: '无法验证本次提问者，无法提交反馈' } });
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_anyone')).toHaveLength(0);
+    store.close();
+  });
+
   it('rebuilds a callback card from the platform card while the persisted template contains no answer', async () => {
     const { store } = await setup();
     const delivery = store.findDeliveryByPlatformMessage('lark', 'app', 'om')!;
@@ -52,6 +72,122 @@ describe('feedback callback state machine', () => {
     expect(JSON.stringify(result.card.data)).toContain('已选择：**结论可用**');
     expect(JSON.stringify(result.card.data)).not.toContain('answer');
     store.close();
+  });
+
+  it.each(['conclusive_usable', 'effective_progress', 'incorrect'])(
+    'returns sendable readback table cells and records %s once across a duplicate callback',
+    async (verdict) => {
+      const { store, delivery } = await setup();
+      const platformCard = { schema: '2.0', body: { elements: [
+        { tag: 'markdown', content: 'answer from platform' },
+        { tag: 'table', columns: [{ name: 'qps', display_name: 'QPS', data_type: 'lark_md' }],
+          rows: [{ qps: { tag: 'markdown', property: {
+            elements: [{ tag: 'plain_text', property: { content: '348,265.76' } }],
+            markdownElements: [], originTag: 'lark_md',
+          } } }] },
+        { tag: 'column_set', element_id: 'botmux_feedback' },
+      ] } };
+      const input = event({ action: 'feedback_submit', result: verdict });
+      try {
+        const first = await handleSkillFeedbackCardAction(input, 'app', {
+          store, loadBaseCard: async () => platformCard,
+        });
+        const duplicate = await handleSkillFeedbackCardAction(input, 'app', {
+          store, loadBaseCard: async () => platformCard,
+        });
+        const card = (first.card ?? first.deferredCard).data;
+        expect(card.body.elements.find((element: any) => element.tag === 'table').rows)
+          .toEqual([{ qps: '348,265.76' }]);
+        expect(card.body.elements[0]).toEqual({ tag: 'markdown', content: 'answer from platform' });
+        expect((duplicate.card ?? duplicate.deferredCard).data).toEqual(card);
+        expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user'))
+          .toHaveLength(1);
+        expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user'))
+          .toMatchObject({ result: verdict, revision: 1 });
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  it('rebuilds real CardKit lists, links, and styled text across feedback re-selection', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const reselectPolicy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true });
+    const response = store.createResponse({ interactionId: 'int-cardkit', content: 'answer' });
+    const platformCard = { schema: '2.0', body: { elements: [
+      { tag: 'markdown', content: 'answer from platform' },
+      { tag: 'table', columns: [{ name: 'detail', data_type: 'lark_md' }],
+        rows: [{ detail: { tag: 'markdown', property: { elements: [
+          { tag: 'list', property: { items: [
+            { elements: [{ tag: 'link', property: {
+              content: 'PR 925', url: { url: 'https://example.com/pr/925' },
+            } }], level: 0, order: 1, type: 'ol' },
+            { elements: [{ tag: 'plain_text', property: {
+              content: 'verify', textStyle: { attributes: ['bold'] },
+            } }], level: 0, order: 2, type: 'ol' },
+          ] } },
+        ], markdownElements: [], originTag: 'lark_md' } } },
+        { detail: { tag: 'markdown', property: { elements: [
+          { tag: 'plain_text', property: { content: 'total ' } },
+          { tag: 'plain_text', property: { content: '19', textStyle: { attributes: ['bold'] } } },
+          { tag: 'plain_text', property: { content: ' affected' } },
+        ] } } },
+        { detail: { tag: 'list', property: { items: [
+          { elements: [
+            { tag: 'plain_text', property: { content: 'parent' } },
+            { tag: 'list', property: { items: [
+              { elements: [{ tag: 'plain_text', property: { content: 'child' } }], level: 0, type: 'ul' },
+            ] } },
+          ], level: 0, order: 1, type: 'ol' },
+        ] } } },
+        { detail: { tag: 'list', property: { items: [
+          { elements: [{ tag: 'plain_text', property: { content: 'parent' } }], level: 0, order: 1, type: 'ol' },
+          { elements: [{ tag: 'plain_text', property: { content: 'child' } }], level: 2, type: 'ul' },
+        ] } } }] },
+      { tag: 'column_set', element_id: 'botmux_feedback' },
+    ] } };
+    const delivery = store.createDelivery({
+      responseId: response.responseId, platform: 'lark', platformAppId: 'app',
+      platformMessageId: 'om', policy: reselectPolicy, baseCard: platformCard,
+      requesterSubjectId: 'ou_user',
+    });
+    try {
+      const first = await handleSkillFeedbackCardAction(
+        event({ action: 'feedback_submit', result: 'conclusive_usable' }),
+        'app', { store, loadBaseCard: async () => platformCard },
+      );
+      const expectedFeedbackId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+      const changedInput = event({ action: 'feedback_submit', result: 'effective_progress', expected_feedback_id: expectedFeedbackId });
+      const changed = await handleSkillFeedbackCardAction(changedInput, 'app', {
+        store, loadBaseCard: async () => platformCard,
+      });
+      const duplicate = await handleSkillFeedbackCardAction(changedInput, 'app', {
+        store, loadBaseCard: async () => platformCard,
+      });
+      for (const result of [first, changed, duplicate]) {
+        const rows = result.card.data.body.elements.find((element: any) => element.tag === 'table').rows;
+        expect(rows).toHaveLength(4);
+        expect(rows.slice(0, 2))
+          .toEqual([
+            { detail: '1. [PR 925](https://example.com/pr/925)\n2. **verify**' },
+            { detail: 'total **19** affected' },
+          ]);
+        for (const row of rows.slice(2)) {
+          const tokens = new MarkdownIt().parse(row.detail, {});
+          expect(tokens.filter(token => token.type === 'list_item_open').map(token => token.level))
+            .toEqual([1, 3]);
+          expect(tokens.filter(token => token.type === 'inline').map(token => token.content))
+            .toEqual(['parent', 'child']);
+        }
+        expect(result.card.data.body.elements[0]).toEqual({ tag: 'markdown', content: 'answer from platform' });
+      }
+      expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(2);
+      expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user'))
+        .toMatchObject({ result: 'effective_progress', revision: 2 });
+    } finally {
+      store.close();
+    }
   });
 
   it('records a negative primary choice and defers the complex card update', async () => {
@@ -88,7 +224,8 @@ describe('feedback callback state machine', () => {
   it('records reason against latest negative result and renders selection', async () => {
     const { store, delivery } = await setup();
     await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
-    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_reason', reason_key: 'wrong_result' }), 'app', { store });
+    const feedbackId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_reason', reason_key: 'wrong_result', expected_feedback_id: feedbackId }), 'app', { store });
     expect(JSON.stringify(result.card.data)).toContain('✓ 结论错误');
     expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'incorrect', reasonKey: 'wrong_result' });
     store.close();
@@ -97,12 +234,13 @@ describe('feedback callback state machine', () => {
   it('validates required comments and never coerces non-string values', async () => {
     const { store, delivery } = await setup({ required: true, maxLength: 5 });
     await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
+    const feedbackId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
     for (const value of [{ comment: '   ' }, { comment: {} }, { comment: '123456' }]) {
-      const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment' }, 'ou_user', value), 'app', { store });
+      const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment', expected_feedback_id: feedbackId }, 'ou_user', value), 'app', { store });
       expect(result.toast.type).toBe('warning');
     }
     expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(1);
-    const ok = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment' }, 'ou_user', { comment: ' ok ' }), 'app', { store });
+    const ok = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment', expected_feedback_id: feedbackId }, 'ou_user', { comment: ' ok ' }), 'app', { store });
     expect(JSON.stringify(ok.card.data)).toContain('已补充说明');
     expect(JSON.stringify(ok.card.data)).not.toContain('ok');
     expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ comment: 'ok' });
@@ -126,11 +264,95 @@ describe('feedback callback state machine', () => {
     const response = store.createResponse({ interactionId: 'int-reselect', content: 'answer' });
     const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
     const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_user' });
-    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
-    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
-    const back = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    const first = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    const firstId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    expect(JSON.stringify(first.card.data)).toContain(`"expected_feedback_id":"${firstId}"`);
+    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect', expected_feedback_id: firstId }), 'app', { store });
+    const secondId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    const back = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable', expected_feedback_id: secondId }), 'app', { store });
     expect(JSON.stringify(back.card.data)).toContain('已选择：**结论可用**');
     expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'conclusive_usable', revision: 3 });
+    store.close();
+  });
+
+  it('does not let a redelivered old choice overwrite a newer selection', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true });
+    const response = store.createResponse({ interactionId: 'int-stale-replay', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_user' });
+
+    const oldLike = event({ action: 'feedback_submit', result: 'conclusive_usable' });
+    await handleSkillFeedbackCardAction(oldLike, 'app', { store });
+    const firstId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'incorrect', expected_feedback_id: firstId }),
+      'app',
+      { store },
+    );
+
+    const replay = await handleSkillFeedbackCardAction(oldLike, 'app', { store });
+    expect(JSON.stringify(replay.deferredCard.data)).toContain('已选择：**结论有误**');
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'incorrect', revision: 2 });
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(2);
+    store.close();
+  });
+
+  it('warns on a stale version while repainting the latest selection', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true });
+    const response = store.createResponse({ interactionId: 'int-stale-version', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_user' });
+
+    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    const firstId = store.getLatestFeedback(delivery.deliveryId, 'ou_user')!.feedbackId;
+    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect', expected_feedback_id: firstId }), 'app', { store });
+    const stale = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable', expected_feedback_id: firstId }),
+      'app',
+      { store },
+    );
+
+    expect(stale.toast).toMatchObject({ type: 'warning' });
+    expect(JSON.stringify(stale.deferredCard.data)).toContain('已选择：**结论有误**');
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(2);
+    store.close();
+  });
+
+  it('keeps deferred updates for legacy negative feedback without a stored semantic', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+    let store = await SkillFeedbackStore.open(dataDir);
+    const policy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true });
+    const response = store.createResponse({ interactionId: 'int-legacy-semantic', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_user' });
+    const oldNegative = event({ action: 'feedback_submit', result: 'incorrect' });
+    await handleSkillFeedbackCardAction(oldNegative, 'app', { store });
+    store.close();
+    const { DatabaseSync } = await import('node:sqlite');
+    const legacy = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
+    legacy.prepare('UPDATE feedback_revisions SET semantic=NULL').run();
+    legacy.close();
+    store = await SkillFeedbackStore.open(dataDir);
+
+    const replay = await handleSkillFeedbackCardAction(oldNegative, 'app', { store });
+
+    expect(replay.card).toBeUndefined();
+    expect(replay.deferredCard).toMatchObject({ type: 'raw' });
+    store.close();
+  });
+
+  it('returns a toast instead of throwing when a card version has no matching revision', async () => {
+    const { store } = await setup();
+
+    await expect(handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable', expected_feedback_id: 'fb_missing' }),
+      'app',
+      { store },
+    )).resolves.toMatchObject({ toast: { type: 'error' } });
     store.close();
   });
 
@@ -172,12 +394,36 @@ describe('feedback callback reviewers audience', () => {
     store.close();
   });
 
+  it('accepts each reviewer clicking the original shared card', async () => {
+    const reviewers = ['ou_r1', 'ou_r2', 'ou_r3'];
+    const { store, delivery } = await reviewersSetup(reviewers);
+
+    for (const reviewer of reviewers) {
+      const result = await handleSkillFeedbackCardAction(
+        event({ action: 'feedback_submit', result: 'conclusive_usable' }, reviewer),
+        'app',
+        { store },
+      );
+      expect(result.toast).toBeUndefined();
+      expect(store.getLatestFeedback(delivery.deliveryId, reviewer)).toMatchObject({ result: 'conclusive_usable' });
+    }
+    store.close();
+  });
+
   it('rejects a non-listed operator with the reviewers toast and mutates nothing', async () => {
     const { store, delivery } = await reviewersSetup(['ou_reviewer']);
     const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_intruder'), 'app', { store });
     expect(result.toast).toMatchObject({ type: 'error', content: '仅指定的反馈人可反馈' });
     expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_intruder')).toHaveLength(0);
     expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_reviewer')).toHaveLength(0);
+    store.close();
+  });
+
+  it('rejects every operator when the reviewers allowlist is empty', async () => {
+    const { store, delivery } = await reviewersSetup([]);
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_anyone'), 'app', { store });
+    expect(result.toast).toMatchObject({ type: 'error', content: '仅指定的反馈人可反馈' });
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_anyone')).toHaveLength(0);
     store.close();
   });
 });

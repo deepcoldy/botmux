@@ -16,7 +16,6 @@ const ROUTE_RENDER_EXPORTS = [
   'renderMonitoringPage',
   'renderSessionsPage',
   'renderMonitorRoomPage',
-  'renderOfficePage',
   'renderInsightsPage',
   'renderOverviewPage',
 ] as const;

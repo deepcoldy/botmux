@@ -6,8 +6,6 @@ import {
   activateWebhookLifecycleGroup,
   beginWebhookLifecycleFiring,
   failWebhookLifecycleGroup,
-  listWebhookLifecycleRecords,
-  resolveWebhookLifecycleGroup,
 } from '../src/services/webhook-lifecycle-store.js';
 
 describe('webhook-lifecycle-store', () => {
@@ -24,24 +22,11 @@ describe('webhook-lifecycle-store', () => {
     expect((await beginWebhookLifecycleFiring('conn_1', 'alert_1', dir)).action).toBe('reuse');
   });
 
-  it('marks creating records as pending resolved and resolves after activation', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-life-'));
-    const create = await beginWebhookLifecycleFiring('conn_1', 'alert_2', dir);
-    expect(create.action).toBe('create');
-    const resolved = await resolveWebhookLifecycleGroup('conn_1', 'alert_2', dir);
-    expect(resolved.action).toBe('pending');
-
-    const activated = await activateWebhookLifecycleGroup('conn_1', 'alert_2', create.record.lifecycleId, 'oc_2', {}, dir);
-    expect(activated.status).toBe('pending_resolved');
-    expect(listWebhookLifecycleRecords({}, dir)[0]).toMatchObject({ status: 'resolved', chatId: 'oc_2' });
-  });
-
   it('removes failed creating records so a later firing can retry', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-life-'));
     const create = await beginWebhookLifecycleFiring('conn_1', 'alert_3', dir);
     expect(create.action).toBe('create');
     await failWebhookLifecycleGroup('conn_1', 'alert_3', create.record.lifecycleId, dir);
-    expect(listWebhookLifecycleRecords({}, dir)).toEqual([]);
     expect((await beginWebhookLifecycleFiring('conn_1', 'alert_3', dir)).action).toBe('create');
   });
 

@@ -15,6 +15,7 @@ import {
   MAX_SCHEDULE_RUN_LOG_ENTRIES,
   MAX_SCHEDULE_RUN_LOG_ERROR_BYTES,
   appendScheduleRunLog,
+  markScheduleRunLogFailed,
   queryScheduleRunLogs,
   removeScheduleRunLogs,
   scheduleRunLogDirectory,
@@ -236,5 +237,49 @@ describe('schedule-run-log-store', () => {
       dataDir,
     )).toThrow('entry failed schema validation');
     expect(queryScheduleRunLogs(TASK_ID, { limit: 20 }, APP_ID, dataDir).total).toBe(0);
+  });
+
+  it('turns one dispatched run into an error after the fact, leaving the others as recorded', () => {
+    appendScheduleRunLog(entry('run-1'), APP_ID, dataDir);
+    appendScheduleRunLog(entry('run-2'), APP_ID, dataDir);
+
+    expect(markScheduleRunLogFailed(TASK_ID, 'run-1', {
+      errorCode: 'schedule_prompt_undelivered',
+      error: 'never took the prompt',
+    }, APP_ID, dataDir)).toBe(true);
+
+    const logs = queryScheduleRunLogs(TASK_ID, {}, APP_ID, dataDir).logs;
+    expect(logs.find(log => log.id === 'run-1')).toMatchObject({
+      outcome: 'error', errorCode: 'schedule_prompt_undelivered', error: 'never took the prompt',
+      precondition: 'passed', startedAt: '2026-08-31T00:00:00.000Z',
+    });
+    expect(logs.find(log => log.id === 'run-2')).toEqual(entry('run-2'));
+    expect(logs.map(log => log.id)).toEqual(['run-2', 'run-1']);
+  });
+
+  it('marks only the failing chat of a multi-chat run', () => {
+    appendScheduleRunLog(entry('run-multi', {
+      targetResults: [
+        { chatId: 'oc_a', outcome: 'model_dispatched' },
+        { chatId: 'oc_b', outcome: 'model_dispatched' },
+      ],
+    }), APP_ID, dataDir);
+
+    markScheduleRunLogFailed(TASK_ID, 'run-multi', {
+      errorCode: 'schedule_prompt_undelivered', error: 'never took the prompt', chatId: 'oc_b',
+    }, APP_ID, dataDir);
+
+    expect(queryScheduleRunLogs(TASK_ID, {}, APP_ID, dataDir).logs[0]!.targetResults).toEqual([
+      { chatId: 'oc_a', outcome: 'model_dispatched' },
+      { chatId: 'oc_b', outcome: 'error', error: 'never took the prompt' },
+    ]);
+  });
+
+  it('reports a run it no longer holds instead of inventing one', () => {
+    const failure = { errorCode: 'schedule_prompt_undelivered', error: 'x' };
+    expect(markScheduleRunLogFailed(TASK_ID, 'run-gone', failure, APP_ID, dataDir)).toBe(false);
+    appendScheduleRunLog(entry('run-1'), APP_ID, dataDir);
+    expect(markScheduleRunLogFailed(TASK_ID, 'run-gone', failure, APP_ID, dataDir)).toBe(false);
+    expect(queryScheduleRunLogs(TASK_ID, {}, APP_ID, dataDir).logs).toEqual([entry('run-1')]);
   });
 });

@@ -78,7 +78,7 @@
 | `requestId` | | 调用方请求 id，写进调用日志 |
 | `receivedAt` | | 上游收到事件的时间 |
 
-> ⚠️ **`source.type` 不做任何校验**——任意字符串都能通过。真正影响行为的只有两个值：`headless`（走本机 CLI 的 headless 分支，渲染另一套提示块）与 `vc_meeting`（事件 JSON 紧凑渲染）。普通外部调用**一律填 `"webhook"`**，别指望其它值带来差异。
+> ⚠️ **`source.type` 按枚举校验**：只接受上表六个值（`webhook` / `ui` / `workflow` / `schedule` / `vc_meeting` / `headless`），其它字符串（包括笔误）在入口直接返回 400 `bad_request`。真正影响行为的只有两个值：`headless`（走本机 CLI 的 headless 分支，渲染另一套提示块）与 `vc_meeting`（事件 JSON 紧凑渲染）。普通外部调用**一律填 `"webhook"`**。
 
 ### 3.2 `target`
 
@@ -111,7 +111,7 @@
 | `topicMessage` | 1–200 字符，或 `null` | `外部事件触发：{sourceName}` |
 
 - `title` 是**会话标题**（dashboard/飞书话题名），最终截断到 50 字符。
-- `topicMessage` 是**新开话题时发的那条引子消息**。传 `null` 显式表示「不要发引子」——话题会直接落在群的 chat 层级。
+- `topicMessage` 是**新开话题时发的那条引子消息**。显式非空文案会要求独立话题；普通群 `shared` 模式仍复用共享会话。指定 `sessionId`/`rootMessageId` 或使用 HTTP/headless 虚拟会话时保持原目标。传 `null` 显式表示「不要发引子」——话题会直接落在群的 chat 层级。
 - ⚠️ 两者**只在真正新开话题时有意义**：虚拟会话不发任何飞书消息，`rootMessageId` 落已有话题、折叠进已有会话也都不发引子。
 - 越界（空串 / >200 字符 / 类型不对）→ 400 `bad_request`。
 
@@ -124,6 +124,7 @@
 | `waitForFinalOutput` | 严格布尔 | 同步模式。仅 `kind:"turn"`；与 `asyncReturnSessionId` 同传 → 400 |
 | `asyncReturnSessionId` | 严格布尔 | 异步模式 |
 | `dryRun` | 严格布尔 | 只渲染不派发，见 §5.4 |
+| `steer` | 严格布尔 | 授权原生 `turn/steer` 注入运行中的 turn（仅 codex-app），见 §5.5；与 `dryRun` 互斥，同传 400 |
 | `timeoutMs` | `[1000, 300000]` | 同步模式等待上限，默认 `120000`。越界 400 |
 | `idempotencyKey` | 非空 ≤200 字符 | 新建会话幂等，见 §7.1 |
 | `turnIdempotencyKey` | 非空 ≤200 字符 | 续轮幂等，见 §7.2。与上一项互斥 |
@@ -135,7 +136,7 @@
 - `model` 是该 CLI 的模型 id；`reasoningEffort` 按 CLI/模型能力校验，未配置或未知模型只开放公共安全档位，明确不支持时 400。
 - **仅新建会话生效**：折叠进已有 worker 的续轮不改写。
 - `model` **只驻内存、不落盘**：daemon 重启后按机器人配置的模型启动；`reasoningEffort` 仍随会话持久化。
-- 目标机器人不是 codex/codex-app/traex/grok 时这两个字段被忽略（不会改动 Claude/Gemini/CoCo 等的模型）。
+- 目标机器人不是 codex/codex-app/traex/grok 时这两个字段被忽略（不会改动 Claude/Antigravity/CoCo 等的模型）。
 
 **⚠️ 三个陷阱字段（类型里有，但和你想的不一样）**
 
@@ -167,7 +168,8 @@
 
 - 会先校验机器人是否在该群，不在 → **403 `bot_not_in_chat`**。
 - **话题群**（或普通群配置成 `new-topic` 模式）会新开一个话题：先发一条引子消息（`presentation.topicMessage`，可自定义、可传 `null` 抑制），会话锚在这条消息上。
-- **普通群的 `chat` 模式**：不新开话题，折叠进该群那个唯一的 chat-scope 会话（已有会话就续轮）。
+- **显式非空 `topicMessage`**：普通群的 `chat`、默认 `chat-topic`、`new-topic` 模式均开独立话题；`shared` 模式保持共享 session、worker 和工作目录。
+- **未传显式文案的普通群**：按原回复模式路由；已有共享会话可续轮，`new-topic` 新开话题。
 
 ### 4.3 `chatId` + `rootMessageId` → 落到已有话题
 
@@ -291,6 +293,25 @@ curl -X POST "http://<host>:7891/api/trigger" \
 `promptPreview` 是**实际会喂给模型的完整提示词**（超过 4000 字符会截断并追加 `\n...[truncated]`）。`message` 区分两种落点：命中已有会话是 `would inject into existing session`，否则是 `would create or deliver a new session turn`。
 
 > 注意：`dry_run` 是一个 **`action`，不是错误码**。错误码枚举里虽然有 `dry_run` 这个值，但代码里从不发出。
+
+### 5.5 `steer`：把追问注入正在运行的 turn（codex-app 原生 `turn/steer`）
+
+`options.steer=true` 授权 daemon 把一条新消息**合并进当前活跃的 codex-app turn**，而不是作为串行 follow-up 排队——适合 headless 调用方在任务运行中追加调整（"顺便再处理 X"、"别做那个了改成 Y"）。
+
+它是 **best-effort 授权，不保证一定注入**：
+
+- **首轮也要带**：首条请求就传 `steer:true` 会把 opening turn 标记为 steerable；codex 的 `canSteer` 契约要求 root 与后续插话轮**都**显式授权。
+- **运行中追问**：runner 通过原生 `turn/steer` 把消息注入活跃 turn。若此刻无法注入（无活跃 turn / turn 正在 closing / 处于 review 或 compaction turn / worker 冷启中），请求会**静默降级为普通排队 follow-up**——受理绝不会仅因 `steer` 而失败。
+- **非 codex-app CLI**：该 flag 为 no-op，沿用既有 type-ahead 队列语义。
+
+响应只在请求被实际受理派发时回显 `steer: true`（幂等复用不回显）。回显只说明 daemon 携带了该授权，**不代表 runner 已经受理了某个 `turn/steer` RPC**。
+
+**合并组的结果归因。**多条 steer 消息合并后，codex 对整组只产出**一条合并 final**：较早的成员收到空的 `steer_superseded` 标记，只有最新 trigger 持有真正的 final 与 token 用量。daemon 会让每个较早的 HTTP 成员都拿到**同一份合并正文**：
+
+- `http_async`：被 park 的成员轮询 `trigger-result` 最终返回 `completed` + 合并后的 `output.content`，**不带 `usage`**（用量只记在最新 trigger 上）。park 关系同时持久化，daemon 若在合并窗口重启，会沿后继链找到组终态记录完成镜像。
+- `http_wait`：被 park 的同步请求在真 final 落盘时以合并正文 resolve。wait 模式仍是纯内存（既有契约）；若 daemon 在组中途重启，被 park 的 wait 只会走到自己的 timeout。
+
+`steer` 与 `dryRun` 互斥（dry run 没有可注入的派发），同传返回 400 `bad_request`。它不新增任何路由或能力：`/api/trigger` 仍是 loopback 的「驱动自己 turn」面，steer 只会注入**同一租户自己的** turn。
 
 ---
 
@@ -686,7 +707,7 @@ async function getTriggerResult(sessionId: string) {
 
 - **`chat_not_allowed` 在本端点映射成 500**（§11.3），与 webhook 接入点的 403 不一致。
 
-- **`source.type` 不校验**（§3.1）；`envelope.format`、`options.dedupKey`、`options.status` 均无读取方（§3.5）。
+- **`envelope.format`、`options.dedupKey`、`options.status` 均无读取方**（§3.5）。`source.type` 不在此列：它已按枚举校验，非法值 400（§3.1）。
 
 ---
 

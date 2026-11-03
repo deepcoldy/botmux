@@ -36,7 +36,10 @@
  * gate is only valid when a SessionStart hook will actually fire — i.e. a FRESH
  * ready-gated spawn whose hook/transport preflight succeeded:
  *
- *   - `injectsReadyHook`        — the adapter injects the hook (claude / seed).
+ *   - `injectsReadyHook`        — the adapter injects the hook: the Claude
+ *                                 family (claude-code / seed / relay, via the
+ *                                 settings.json SessionStart hook) or dsh-tui
+ *                                 (a direct ready command, no config hook).
  *   - `readySignalAvailable`    — the effective config contains the hook (or the
  *                                 CLI has a direct ready-command integration),
  *                                 and an isolated child has a usable callback

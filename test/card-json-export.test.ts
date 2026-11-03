@@ -16,6 +16,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   parseApiMessage,
   createImgNumberer,
+  extractResources,
   resolveMergedCardContent,
 } from '../src/im/lark/message-parser.js';
 import { renderQuotedMessage } from '../src/cli/quoted-render.js';
@@ -203,6 +204,33 @@ describe('resolveMergedCardContent: returns resources aligned with [图片 N]', 
     expect(merged!.text).toContain('[图片 1: 同比曲线]');
   });
 
+  it('surfaces Markdown image tokens as resources while ignoring code examples', async () => {
+    const markdownCard = JSON.stringify({
+      config: {},
+      elements: [{
+        tag: 'markdown',
+        content: [
+          '测试图片：',
+          '![E2E attachment](img_v3_real_key)',
+          '`![inline example](img_v3_inline_fake)`',
+          '```md',
+          '![fenced example](img_v3_fenced_fake)',
+          '```',
+        ].join('\n'),
+      }],
+    });
+    vi.mocked(getMessageDetail).mockImplementation(async () => ({
+      items: [{ body: { content: markdownCard } }],
+    }));
+
+    const merged = await resolveMergedCardContent('app', 'om_card');
+    expect(merged).not.toBeNull();
+    expect(merged!.resources).toEqual([
+      { type: 'image', key: 'img_v3_real_key', name: 'img_v3_real_key.jpg' },
+    ]);
+    expect(extractResources('interactive', markdownCard)).toEqual(merged!.resources);
+  });
+
   it('returns null when both representations fail', async () => {
     vi.mocked(getMessageDetail).mockRejectedValue(new Error('boom'));
     expect(await resolveMergedCardContent('app', 'om_card')).toBeNull();
@@ -279,7 +307,12 @@ describe('renderQuotedMessage: interactive merge replaces content AND resources'
 
 // ─── insights cleanPromptText tolerates the alt suffix ────────────────────
 
-describe('cleanPromptText: strips [图片 N: alt] placeholder lines', () => {
+describe('cleanPromptText: strips internal prompt metadata', () => {
+  it('removes botmux formatting guidance from bare transcript prompts', () => {
+    const out = cleanPromptText('继续\n\n<botmux_formatting>internal formatting guidance</botmux_formatting>');
+    expect(out).toBe('继续');
+  });
+
   it('placeholder with alt suffix is removed like the bare form', () => {
     const out = cleanPromptText('看这个\n[图片 1: 报警前30分钟今(红)昨(蓝)同比] 其余\n[文件 2: spec.pdf] x\n正文');
     expect(out).not.toContain('图片 1');

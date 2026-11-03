@@ -33,10 +33,11 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 
 ## 功能
 
+- **全局搜索（⌘K）**：任意页面按 `⌘K`（macOS）/ `Ctrl+K`（其它平台），或点顶栏搜索框，搜会话（含已关闭）、Skill、Agent、全局设置（可直达具体配置项）、Bot 配置及其分类（常用 / 会话 / 权限与安全 / 消息卡片 / 高级）、分类里的区块和配置项（如「普通群」会话模式，直达并定位到那一行；当前 Bot 不显示该项时停在所属分类并提示）、机器人（按名字或 app id 直达该 Bot 的配置）、页面（含会话监控室、调用日志、团队管理、角色 Profiles、数据洞察各 tab 和插件页）与快捷操作，中英文叫法都能搜。`↑↓` 选择、`↵` 打开、`⌘↵` / `Ctrl+↵` 走次要动作（活跃会话在驾驶舱打开、已关闭会话跳飞书话题）、`Tab` 切换分类，空查询时显示最近使用。Skill / Agent / 机器人只对已认证管理员出现。
 - **Sessions**：跨所有 bot 列出活跃 + 已关闭会话，可按 CLI / 状态 / adopt / 文本过滤。点进 detail 可复制各种 ID、关闭会话、多选批量关闭；「定位话题」会让机器人在原话题发一条 **@会话 owner** 的提醒（纯 @、无其它正文）帮你跳回上下文。chat-scope 的会话行还带一个飞书群 AppLink 直达群聊。
 - **Schedules**：新建、编辑和管理定时任务，支持立即运行、暂停/恢复、多个目标群、执行日志，以及可测试的 [Bash 前置条件](/schedule#bash-前置条件dashboard)。
-- **Groups**：一键拉新群（自动 @ 通知被邀请人）、拉 bot 入群、自动转让群主；解散群聊、bot 退群（关联会话自动清理）。
-- **团队 / Roles / Bot Defaults**：团队面板做[跨部署协作](/roles)（邀请别人的部署进团队、跨部署拉群）；Roles 管理各 bot 按群人设；Bot Defaults（Bot 配置）配默认行为（新群 oncall、卡片签名、**默认角色**等）。
+- **Groups**：一键拉新群（自动 @ 通知被邀请人）、拉 bot 入群、自动转让群主；解散群聊、bot 退群（关联会话自动清理）。群「管理」弹层还能做**授权管理**：多选成员**批量授权**（一次最多 50 人，写入前实时校验仍在群，可选消息额度与有效期）、**整群一键授权**（裸 `/grant` 的 Dashboard 版）、对单个成员**拉黑**，以及按 bot 开关 oncall。
+- **团队 / Roles / Bot Defaults**：团队面板做[跨部署协作](/roles)（邀请别人的部署进团队、跨部署拉群）；Roles 管理各 bot 按群人设；Bot Defaults（Bot 配置）配默认行为（新群 oncall、群聊 @ 策略、**黑名单 `blockedUsers`**、**精简预设**——一次写入关流式卡 / 关思考气泡 / 静默 ✋✅ 反应，非持续绑定、卡片签名、**默认角色**等）。
 - **Workflows 管控面**：Run List 轮询；Run Detail 看 summary / dangling 红区 / node-activity / event timeline / 并发执行 timeline；可直接 **cancel run**。
 - **设置 / 系统与维护**：已认证管理员可管理「开机启动 botmux 后台服务」。
 
@@ -151,4 +152,4 @@ Content-Type: application/json
 
 ## 部署细节
 
-dashboard 走单独 pm2 进程 `botmux-dashboard`，跟 daemon 一起起停。每个 daemon 在 `127.0.0.1` 暴露内部 IPC（仅本机），dashboard 进程做反向代理 + HMAC 鉴权：密钥文件 `~/.botmux/.dashboard-secret`（mode 0600），是 daemon↔dashboard 的内部签名密钥，**不下发给浏览器**（浏览器侧走上面的轮换登录 token）。
+dashboard 是内置 supervisor 托管的独立进程 `botmux-dashboard`，跟 daemon 一起起停。每个 daemon 在 `127.0.0.1` 暴露内部 IPC（仅本机），dashboard 进程做反向代理 + HMAC 鉴权：密钥文件 `~/.botmux/.dashboard-secret`（mode 0600），是 daemon↔dashboard 的内部签名密钥，**不下发给浏览器**（浏览器侧走上面的轮换登录 token）。

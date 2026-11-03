@@ -1,5 +1,5 @@
 /**
- * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost, formatNumber.
+ * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost.
  *
  * Run:  pnpm vitest run test/cost-calculator.test.ts
  */
@@ -109,6 +109,12 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
   createCliAdapterSync: vi.fn(() => ({ claudeDataDir: FORK_DATA_DIR })),
 }));
 
+// resolveSessionTranscriptPath() 的 codex 分支会查会话库里的实例绑定。
+// 本套件整体 mock 了 node:fs，真实 store 会读到合成文件系统；stub 掉它需要的这一个入口。
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
+}));
+
 import { existsSync, readFileSync } from 'node:fs';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../src/services/aiden-checkpoints.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
@@ -119,7 +125,6 @@ import {
   getSessionCost,
   getSessionUsageSnapshot,
   getSessionTokenUsage,
-  formatNumber,
   __resetSessionUsageCachesForTest,
   type SessionCost,
 } from '../src/core/cost-calculator.js';
@@ -583,7 +588,7 @@ describe('getSessionTokenUsage', () => {
     vi.mocked(existsSync).mockReturnValue(false);
 
     expect(getSessionTokenUsage({
-      cliId: 'gemini',
+      cliId: 'opencode',
       sessionId: 's1',
       cwd: '/tmp',
     })).toBeNull();
@@ -800,6 +805,19 @@ describe('getSessionTokenUsage', () => {
     })).toMatchObject({
       context: { usedTokens: 90, windowTokens: 1_000, percentUsed: 9 },
       tokens: { in: 120, out: 12 },
+    });
+  });
+
+  it('requires trusted native cliSessionId for Antigravity and refuses workspace fallback', () => {
+    expect(getSessionUsageSnapshot({
+      cliId: 'antigravity',
+      sessionId: 'botmux-sid',
+      cwd: '/workspace/unrelated',
+      fresh: true,
+    })).toEqual({
+      context: null,
+      tokens: null,
+      turnTokens: null,
     });
   });
 
@@ -1495,25 +1513,5 @@ describe('getSessionTokenUsage', () => {
       turns: 2,
       model: 'claude-sonnet-4-20250514',
     });
-  });
-});
-
-// ── formatNumber ────────────────────────────────────────────────────────
-
-describe('formatNumber', () => {
-  it('formats small numbers without commas', () => {
-    expect(formatNumber(42)).toBe('42');
-  });
-
-  it('formats thousands with commas', () => {
-    expect(formatNumber(1_234)).toBe('1,234');
-  });
-
-  it('formats millions with commas', () => {
-    expect(formatNumber(1_234_567)).toBe('1,234,567');
-  });
-
-  it('formats zero', () => {
-    expect(formatNumber(0)).toBe('0');
   });
 });

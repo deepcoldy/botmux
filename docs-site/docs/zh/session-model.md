@@ -29,15 +29,32 @@
 
 每次回复创建**新的**流式卡片，上一轮卡片冻结在最后状态，便于回看历史。
 
+## 会话的四个名字
+
+「改了名怎么飞书里没变？」——一个会话同时挂着四层名字，各管各的：
+
+| 层 | 是什么 | 谁能改 / 怎么改 |
+|----|--------|-----------------|
+| **飞书群名**（`oc_` 群） | 群本身的名字，群里所有人可见 | 会话内执行 `botmux chat rename "新群名"`（对应 `botmux-chat-rename` 技能；agent 因阶段变化主动改名加 `--proactive`，带 10 分钟防抖）。**改的是整个群**：话题群里所有话题、全部成员都看到新群名 |
+| **飞书话题名**（`omt`） | 话题在飞书话题列表里显示的名字 | **改不了**：飞书开放平台没有话题标题接口，话题列表始终显示**话题首条消息**。这是平台限制，不要期待 botmux 能改 |
+| **botmux 规范标题**（canonical title） | Dashboard 各视图、`/sessions` 列表里显示的会话标题 | 人在群里发 `/rename <标题>`（有对话权即可）；agent 在会话内用 `botmux session rename "<标题>"`（见下）。最长 200 字符，Dashboard 与列表即时更新 |
+| **CLI 原生会话名** | Claude Code / Codex 等 CLI 自己的 resume 列表名 | botmux 改名时 **best-effort 同步**；CLI 不在线或不支持原生改名时不同步，不影响 botmux 标题 |
+
+`botmux session rename` 是本批次新增的会话内原语：
+
+- 只能在**会话内**执行，会话 id 只从会话环境自动识别，**不接受 `--session-id` 等参数**——改不了别人的会话。
+- 标题建议「类型｜具体事项」，如 `排障｜支付链路超时`（对应 `botmux-session-rename` 技能）。
+- 它**只改 botmux/Dashboard 标题**：飞书群名不变（那是 `botmux chat rename`），飞书 omt 话题名平台侧不可改。
+
 ## 权限模型（三层）
 
 | 层级 | 能力 | 由谁控制 |
 |------|------|---------|
-| **对话权（canTalk）** | 提问、查日志、读代码 | `allowedChatGroups`（群内全员）/ `globalGrants`（全局名单）/ `/grant` |
-| **操作权（canOperate）** | 切目录 `/cd`、`/restart`、`/close`、点卡片按钮 | `allowedUsers`（owner 名单） |
-| **owner 专属** | `/grant` `/revoke` 授权他人 | owner |
+| **对话权（canTalk）** | 提问、查日志、读代码 | `allowedUsers` / `allowedChatGroups`（群内全员）/ `chatGrants`、`globalGrants`（带额度的访客）/ oncall / 开放模式等多条放行腿；另有 `blockedUsers` 黑名单全局否决 |
+| **操作权（canOperate）** | 切目录 `/cd`、`/restart`、`/close`、`/card`、`/cot`、`/mention-mode`、点卡片按钮 | `allowedUsers`（owner 与管理员名单）；开放模式下人人有 |
+| **管理命令** | `/grant` `/revoke` 授权他人、oncall 开关 | owner / 管理员（`allowedUsers`） |
 
-这套分层让你能放心把机器人拉进值班群：所有人能问，但只有 owner 能改会话状态，外部成员误点也不会把会话搞乱。
+这套分层让你能放心把机器人拉进值班群：所有人能问，但只有管理员能改会话状态，外部成员误点也不会把会话搞乱。完整分层（额度、有效期、入群≠授权、黑名单、授权申请卡）见 [权限与授权](/permissions)。
 
 ## 常见困惑
 
@@ -45,4 +62,4 @@
 - **新群 / 新话题拉不到之前的聊天**：新会话默认从干净状态起。要它读群历史，直接说「看下之前的聊天记录」（需机器人有群消息读取权限，见 [FAQ](/faq)）。
 - **想换底层 CLI 又保留上下文**：目前**做不到跨 CLI 无损热切**——原生会话历史不会翻译到另一种 CLI。要换 CLI 就开新 bot / 新 session，并让原 bot 输出一份 handoff 摘要交接。（[`/relay`](/relay) 是把**同一个会话**整体搬到另一个群、不换 CLI；[`/adopt`](/adopt) 是把本机已有 tmux/zellij / 可恢复会话接进飞书，也不换 CLI。）
 
-**下一步**：权限细节见 [FAQ · 权限怎么分](/faq)；把会话搬到别的群见 [会话接力](/relay)。
+**下一步**：权限细节见 [权限与授权](/permissions) 与 [FAQ](/faq)；@ 策略见 [@ 策略](/mention-mode)；把会话搬到别的群见 [会话接力](/relay)。

@@ -1,10 +1,13 @@
 import { createHash } from 'node:crypto';
 import type {
   CrossPrincipalInterruption,
+  CrossPrincipalInterruptionCancellation,
   CrossPrincipalInterruptionMessage,
   Session,
   TrustedCaller,
 } from '../types.js';
+
+const MAX_XPI_CANCELLATION_AUDIT = 50;
 
 /** Logical idempotency key for one rejected inbound message. Worker generation
  * and delivery attempt are deliberately excluded: both may change while the
@@ -17,6 +20,7 @@ export function stageCrossPrincipalInterruptionRecord(args: {
   session: Session;
   ownerTurnId: string;
   owner: TrustedCaller;
+  ownerUserPrompt?: string;
   proposer: TrustedCaller;
   message: CrossPrincipalInterruptionMessage;
 }): { record: CrossPrincipalInterruption; inserted: boolean } {
@@ -31,6 +35,7 @@ export function stageCrossPrincipalInterruptionRecord(args: {
     id,
     ownerTurnId: args.ownerTurnId,
     owner: { ...args.owner },
+    ...(args.ownerUserPrompt?.trim() ? { ownerUserPrompt: args.ownerUserPrompt } : {}),
     proposer: { ...args.proposer },
     // Human and bot proposers follow the same explicit classification protocol.
     // No deadline starts here: the proposer cannot act until the card/protocol
@@ -70,4 +75,32 @@ export function continueCrossPrincipalOwnerWait(
 ): void {
   record.ownerWaitDeadlineAt = now + waitMs;
   record.waitDecisionRound = (record.waitDecisionRound ?? 0) + 1;
+}
+
+/**
+ * Permanently terminalise every staged XPI item when the feature is disabled.
+ * The active queue is removed in the same in-memory mutation, so neither a
+ * daemon restart nor a later re-enable can resume historical business input.
+ */
+export function cancelCrossPrincipalInterruptionsForFeatureDisable(
+  session: Session,
+  cancelledAt = new Date().toISOString(),
+): CrossPrincipalInterruptionCancellation[] {
+  const queue = session.crossPrincipalInterruptions ?? [];
+  if (queue.length === 0) return [];
+  const cancelled = queue.map((record): CrossPrincipalInterruptionCancellation => ({
+    version: 1,
+    id: record.id,
+    ownerTurnId: record.ownerTurnId,
+    proposer: { ...record.proposer },
+    messageTurnIds: record.messages.map(message => message.turnId),
+    cancelledAt,
+    reason: 'feature_disabled',
+  }));
+  session.crossPrincipalInterruptions = undefined;
+  session.crossPrincipalInterruptionCancellations = [
+    ...(session.crossPrincipalInterruptionCancellations ?? []),
+    ...cancelled,
+  ].slice(-MAX_XPI_CANCELLATION_AUDIT);
+  return cancelled;
 }

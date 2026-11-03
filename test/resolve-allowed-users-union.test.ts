@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { resolveAllowedUsersWithMap } from '../src/im/lark/client.js';
+import { resolveAllowedUsersWithMap, resolveTargetAppOpenId } from '../src/im/lark/client.js';
 import { applyAllowedUsersResolve } from '../src/utils/allowed-users-apply.js';
 import { registerBot } from '../src/bot-registry.js';
 import { logger } from '../src/utils/logger.js';
@@ -86,6 +86,33 @@ describe('resolveAllowedUsersWithMap — on_ union_id entries (PR#72 lockout fix
     expect(map.get('ou_other_app')).toBe('ou_other_app');
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('open_id ou_other_app belongs to another app'));
     warn.mockRestore();
+  });
+});
+
+describe('resolveTargetAppOpenId — XPI cross-app human identity', () => {
+  it('returns the open_id issued by the receiving bot app', async () => {
+    stubClient(async ({ path, params }: any) => {
+      expect(path.user_id).toBe('on_cross_app_human');
+      expect(params.user_id_type).toBe('union_id');
+      return { code: 0, data: { user: { open_id: 'ou_target_app_human' } } };
+    });
+
+    await expect(resolveTargetAppOpenId(APP, 'on_cross_app_human')).resolves.toEqual({
+      status: 'resolved',
+      openId: 'ou_target_app_human',
+    });
+  });
+
+  it('separates definitive visibility misses from transient failures', async () => {
+    stubClient(async () => ({ code: 41050, msg: 'not visible' }));
+    await expect(resolveTargetAppOpenId(APP, 'on_hidden_human')).resolves.toEqual({
+      status: 'definitive',
+    });
+
+    stubClient(async () => ({ code: 500, msg: 'temporary' }));
+    await expect(resolveTargetAppOpenId(APP, 'on_flaky_human')).resolves.toEqual({
+      status: 'transient',
+    });
   });
 });
 
@@ -194,6 +221,118 @@ describe('resolveAllowedUsersWithMap — entryStatus classification (PR#590)', (
     expect(network.entryStatus.get('flaky@corp.com')).toBe('transient');
     expect(network.errored).toBe(true);
   });
+
+  it('email batch transient failure retries and succeeds on subsequent attempt', async () => {
+    let callCount = 0;
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error('timeout of 15000ms exceeded');
+        }
+        return {
+          code: 0,
+          data: {
+            user_list: [{ email: 'owner@corp.com', user_id: 'ou_recovered_owner' }],
+          },
+        };
+      },
+    );
+    const result = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    expect(callCount).toBe(2);
+    expect(result.resolved).toEqual(['ou_recovered_owner']);
+    expect(result.map.get('owner@corp.com')).toBe('ou_recovered_owner');
+    expect(result.entryStatus.get('owner@corp.com')).toBe('resolved');
+    expect(result.errored).toBeFalsy();
+  });
+});
+
+// 确定性 miss（code-0 批量响应缺条目：账号不存在 / 对本应用不可见）此前连 WARN
+// 都没有，条目静默从运行时名单消失。resolver 现在必须：(a) 在 definitiveMisses
+// 里按配置顺序列出原始条目（literal ou_ 永不列入）；(b) 打 WARN 点名条目与 app。
+// 瞬态失败不能进 definitiveMisses（重试仍可能恢复）。
+describe('resolveAllowedUsersWithMap — definitiveMisses surfacing', () => {
+  it('email code-0 batch omitting an entry → definitiveMisses contains it + WARN names entry and app', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_alice', email: 'alice@corp.com' }] } }),
+    );
+
+    const { definitiveMisses, resolved, entryStatus, errored } = await resolveAllowedUsersWithMap(
+      APP, ['alice@corp.com', 'ghost@corp.com'],
+    );
+
+    expect(definitiveMisses).toEqual(['ghost@corp.com']);
+    expect(resolved).toEqual(['ou_alice']);
+    expect(entryStatus.get('ghost@corp.com')).toBe('definitive');
+    expect(errored).toBeFalsy(); // 确定性，不是瞬态
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ghost@corp.com'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(APP));
+    warn.mockRestore();
+  });
+
+  it('mobile code-0 batch omitting an entry → definitiveMisses contains the RAW config entry', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_bob', mobile: '13800000000' }] } }),
+    );
+
+    const { definitiveMisses, resolved } = await resolveAllowedUsersWithMap(
+      APP, ['13800000000', '13900000000'],
+    );
+
+    expect(definitiveMisses).toEqual(['13900000000']);
+    expect(resolved).toEqual(['ou_bob']);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('13900000000'));
+    warn.mockRestore();
+  });
+
+  it('union_id code-0 without open_id → definitiveMisses contains the on_ entry', async () => {
+    stubClient(async ({ path }: any) => ({ code: 0, data: { user: { union_id: path.user_id } } }));
+
+    const { definitiveMisses } = await resolveAllowedUsersWithMap(APP, ['on_ghost']);
+
+    expect(definitiveMisses).toEqual(['on_ghost']);
+  });
+
+  it('literal ou_ entries NEVER appear in definitiveMisses (always kept as resolved)', async () => {
+    // 跨 app ou_（99992361）按设计原样保留；写入路径的身份校验另由
+    // detectUnusableOwnerEntries 负责，resolver 不把它列为 miss。
+    stubClient(async () => ({ code: 99992361, msg: 'cross app' }));
+
+    const { definitiveMisses, resolved } = await resolveAllowedUsersWithMap(APP, ['ou_other_app']);
+
+    expect(definitiveMisses).toEqual([]);
+    expect(resolved).toEqual(['ou_other_app']);
+  });
+
+  it('transient batch failure (code!=0) → definitiveMisses stays empty (entries are transient, retry-eligible)', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 500, msg: 'batch down' }),
+    );
+
+    const { definitiveMisses, errored } = await resolveAllowedUsersWithMap(APP, ['a@corp.com', 'b@corp.com']);
+
+    expect(definitiveMisses).toEqual([]);
+    expect(errored).toBe(true);
+  });
+
+  it('definitiveMisses preserves raw config order and excludes resolved entries', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_keep', email: 'keep@corp.com' }] } }),
+    );
+
+    const { definitiveMisses } = await resolveAllowedUsersWithMap(
+      APP, ['gone1@corp.com', 'keep@corp.com', 'gone2@corp.com'],
+    );
+
+    expect(definitiveMisses).toEqual(['gone1@corp.com', 'gone2@corp.com']);
+  });
 });
 
 // End-to-end: resolver → applyAllowedUsersResolve → cache decision, for the exact
@@ -221,6 +360,8 @@ describe('resolve → apply end-to-end: email-only owner + batch error keeps own
     // key is NOT in the definitive set, so a caller pruning definitives keeps it.
     expect(applied.resolved).toEqual(['ou_owner']);
     expect(applied.usedFallback).toBe(true);
+    expect(applied.fullyRecovered).toBe(true);
+    expect(applied.hasPermanentBatchError).toBe(true);
     expect(applied.failed).toBe(true);
     expect(applied.map.get('owner@corp.com')).toBe('ou_owner');
     const definitives = [...resolveResult.entryStatus.entries()]
@@ -242,5 +383,109 @@ describe('resolve → apply end-to-end: email-only owner + batch error keeps own
     expect(applied.resolved).toEqual([]);
     expect(applied.failed).toBe(true); // NOT a silent success — owner-lockout is surfaced + retried
     expect(applied.notice).toBeTruthy();
+  });
+
+  it('permanent batch error (99991672 missing scope) does not retry in-place and sets hasPermanentBatchError', async () => {
+    let callCount = 0;
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => {
+        callCount++;
+        return { code: 99991672, msg: 'Access denied: missing scope' };
+      },
+    );
+    const resolveResult = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    expect(callCount).toBe(1); // permanent error: no useless immediate retry
+    expect(resolveResult.hasPermanentBatchError).toBe(true);
+    expect(resolveResult.entryStatus.get('owner@corp.com')).toBe('transient');
+
+    const applied = applyAllowedUsersResolve({
+      rawEntries: ['owner@corp.com'],
+      previousResolvedMap: { 'owner@corp.com': 'ou_cached_owner' },
+      resolveResult,
+    });
+    expect(applied.resolved).toEqual(['ou_cached_owner']);
+    expect(applied.fullyRecovered).toBe(true);
+    expect(applied.hasPermanentBatchError).toBe(true); // daemon will NOT silence DM for permanent errors
+  });
+
+  it('pure transient error with cached owner sets fullyRecovered=true and hasPermanentBatchError=false', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => { throw new Error('timeout of 15000ms exceeded'); },
+    );
+    const resolveResult = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    expect(resolveResult.hasPermanentBatchError).toBeFalsy();
+    expect(resolveResult.entryStatus.get('owner@corp.com')).toBe('transient');
+
+    const applied = applyAllowedUsersResolve({
+      rawEntries: ['owner@corp.com'],
+      previousResolvedMap: { 'owner@corp.com': 'ou_cached_owner' },
+      resolveResult,
+    });
+    expect(applied.resolved).toEqual(['ou_cached_owner']);
+    expect(applied.fullyRecovered).toBe(true);
+    expect(applied.hasPermanentBatchError).toBe(false); // daemon can safely silence initial DM
+  });
+});
+
+// PR#1559 refined: per-entry union GET only flags hasPermanentBatchError for
+// APP-LEVEL capability codes (99991672/99991679 missing scope). Per-entry
+// identity verdicts (41050 not-visible / 41012 / 40001 / 99992361) are not
+// batch-wide signals — flagging them would reintroduce the startup false alarm
+// when a stale on_ entry coexists with a transient email/mobile batch.
+describe('resolveAllowedUsersWithMap — union scope-vs-identity flag split (PR#1559 refined)', () => {
+  it('union-only 99991672 (app missing scope): flags permanent so a fully-cached boot still DMs', async () => {
+    stubClient(async () => ({ code: 99991672, msg: 'Access denied: missing scope' }));
+    const rr = await resolveAllowedUsersWithMap(APP, ['on_scope']);
+    expect(rr.hasPermanentBatchError).toBe(true);
+    expect(rr.errored).toBe(true);
+    expect(rr.entryStatus.get('on_scope')).toBe('transient'); // still cache-fallback eligible
+
+    const applied = applyAllowedUsersResolve({
+      rawEntries: ['on_scope'],
+      previousResolvedMap: { on_scope: 'ou_cached' },
+      resolveResult: rr,
+    });
+    expect(applied.fullyRecovered).toBe(true);
+    expect(applied.hasPermanentBatchError).toBe(true); // owner must NOT be silenced
+  });
+
+  it('union-only 99991679 (structured missing-scopes): same app-level treatment', async () => {
+    stubClient(async () => ({ code: 99991679, msg: 'missing scopes' }));
+    const rr = await resolveAllowedUsersWithMap(APP, ['on_scope']);
+    expect(rr.hasPermanentBatchError).toBe(true);
+    expect(rr.entryStatus.get('on_scope')).toBe('transient');
+  });
+
+  it('union-only 41050 (member gone / not visible): definitive drop, no permanent flag', async () => {
+    stubClient(async () => ({ code: 41050, msg: 'not visible' }));
+    const rr = await resolveAllowedUsersWithMap(APP, ['on_departed']);
+    expect(rr.hasPermanentBatchError).toBeFalsy();
+    expect(rr.errored).toBeFalsy();
+    expect(rr.entryStatus.get('on_departed')).toBe('definitive');
+  });
+
+  it('mixed: stale on_ (41050 definitive) + email batch timeout (transient, cached) → no flag → startup can silence', async () => {
+    stubClient(
+      async ({ path }: any) => (path.user_id === 'on_departed'
+        ? { code: 41050, msg: 'not visible' }
+        : { code: 0, data: { user: {} } }),
+      async () => { throw new Error('timeout of 15000ms exceeded'); },
+    );
+    const rr = await resolveAllowedUsersWithMap(APP, ['on_departed', 'owner@corp.com']);
+    expect(rr.entryStatus.get('on_departed')).toBe('definitive');
+    expect(rr.entryStatus.get('owner@corp.com')).toBe('transient');
+    expect(rr.hasPermanentBatchError).toBeFalsy();
+    expect(rr.errored).toBe(true);
+
+    const applied = applyAllowedUsersResolve({
+      rawEntries: ['on_departed', 'owner@corp.com'],
+      previousResolvedMap: { 'owner@corp.com': 'ou_owner' },
+      resolveResult: rr,
+    });
+    expect(applied.resolved).toEqual(['ou_owner']);
+    expect(applied.fullyRecovered).toBe(true);
+    expect(applied.hasPermanentBatchError).toBe(false);
   });
 });

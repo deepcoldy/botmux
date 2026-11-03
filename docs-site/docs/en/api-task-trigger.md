@@ -78,7 +78,7 @@ Calls go through the dashboard (default `http://<daemon-host>:7891`), authentica
 | `requestId` | | Your request id; recorded in the trigger audit log |
 | `receivedAt` | | When the upstream received the event |
 
-> ⚠️ **`source.type` is not validated at all** — any string passes. Only two values change behavior: `headless` (the local-CLI headless branch, which renders a different prompt block) and `vc_meeting` (compact event-JSON rendering). For ordinary external callers, **always send `"webhook"`**; do not expect other values to do anything.
+> ⚠️ **`source.type` is enum-validated**: only the six values in the table above are accepted (`webhook` / `ui` / `workflow` / `schedule` / `vc_meeting` / `headless`); any other string, including a typo, is rejected at the edge with 400 `bad_request`. Only two values change behavior: `headless` (the local-CLI headless branch, which renders a different prompt block) and `vc_meeting` (compact event-JSON rendering). Ordinary external callers should **always send `"webhook"`**.
 
 ### 3.2 `target`
 
@@ -111,7 +111,7 @@ Calls go through the dashboard (default `http://<daemon-host>:7891`), authentica
 | `topicMessage` | 1–200 chars, or `null` | `External event: {sourceName}` |
 
 - `title` is the **session title** (dashboard / Feishu thread name), truncated to 50 chars.
-- `topicMessage` is the **seed message posted when a new thread is opened**. Pass `null` to say explicitly "do not post a seed" — the session then sits at the group's chat scope.
+- `topicMessage` is the **seed message posted when a new thread is opened**. Explicit non-empty text requests a separate thread, except that regular groups in `shared` mode keep their shared session. Explicit `sessionId`/`rootMessageId` targets and HTTP/headless virtual sessions retain their routing. Pass `null` to say explicitly "do not post a seed" — the session then sits at the group's chat scope.
 - ⚠️ Both matter **only when a new thread is actually opened**: a virtual session posts nothing at all, and neither a `rootMessageId` delivery into an existing thread nor a fold-in to an existing session posts a seed.
 - Out of range (empty string / >200 chars / wrong type) → 400 `bad_request`.
 
@@ -124,6 +124,7 @@ Calls go through the dashboard (default `http://<daemon-host>:7891`), authentica
 | `waitForFinalOutput` | strict boolean | Sync mode. `kind:"turn"` only; combined with `asyncReturnSessionId` → 400 |
 | `asyncReturnSessionId` | strict boolean | Async mode |
 | `dryRun` | strict boolean | Render without dispatching, see §5.4 |
+| `steer` | strict boolean | Authorize native in-flight `turn/steer` (codex-app only), see §5.5. Mutually exclusive with `dryRun` → 400 |
 | `timeoutMs` | `[1000, 300000]` | Sync wait cap, default `120000`. Out of range → 400 |
 | `idempotencyKey` | non-empty ≤200 chars | Fresh-session idempotency, see §7.1 |
 | `turnIdempotencyKey` | non-empty ≤200 chars | Follow-up-turn idempotency, see §7.2. Mutually exclusive with the above |
@@ -135,7 +136,7 @@ Details for `model` / `reasoningEffort`:
 - `model` is that CLI's model id. `reasoningEffort` is validated against the CLI/model capability; when unconfigured or unknown only the common safe tiers are allowed, and an explicitly unsupported value is a 400.
 - **New sessions only**: a follow-up turn folded into a live worker does not rewrite them.
 - `model` **lives in memory only, never on disk**: after a daemon restart the session starts on the bot's configured model. `reasoningEffort` is still persisted with the session.
-- Both fields are ignored when the target bot is not codex / codex-app / traex / grok (they never change the model of Claude / Gemini / CoCo and friends).
+- Both fields are ignored when the target bot is not codex / codex-app / traex / grok (they never change the model of Claude / Antigravity / CoCo and friends).
 
 **⚠️ Three trap fields (present in the type, but not what you think)**
 
@@ -167,7 +168,8 @@ Whenever `target.chatId` is a real group id, this is **never** a virtual session
 
 - The bot's membership in that group is checked first; if it is not a member → **403 `bot_not_in_chat`**.
 - **Topic groups** (or regular groups configured in `new-topic` mode) open a new thread: a seed message is posted first (`presentation.topicMessage`, customizable, or `null` to suppress), and the session is anchored to it.
-- **Regular groups in `chat` mode**: no new thread; the turn folds into that group's single chat-scope session (appending a turn if one already exists).
+- **Explicit non-empty `topicMessage`** opens a separate thread in regular-group `chat`, default `chat-topic`, and `new-topic` modes. `shared` preserves its session, worker, and working directory.
+- **Without explicit text**, regular groups retain their configured routing: an existing shared session can receive another turn; `new-topic` opens a thread.
 
 ### 4.3 `chatId` + `rootMessageId` → into an existing thread
 
@@ -291,6 +293,25 @@ With `options.dryRun=true` nothing is created and nothing is dispatched:
 `promptPreview` is the **exact prompt that would be fed to the model** (truncated past 4000 chars with `\n...[truncated]` appended). `message` distinguishes the two landing shapes: an existing session gives `would inject into existing session`, otherwise `would create or deliver a new session turn`.
 
 > Note: `dry_run` is an **`action`, not an error code**. The error-code enum does contain a `dry_run` value, but nothing ever emits it.
+
+### 5.5 `steer`: inject a follow-up into the running turn (codex-app native `turn/steer`)
+
+`options.steer=true` authorizes the daemon to merge a new message INTO the currently active codex-app turn instead of queueing it as a serial follow-up — useful for headless callers that want to adjust a task while it is still running ("also handle X", "stop that and do Y").
+
+It is a **best-effort authorization, not a guarantee**:
+
+- **Fresh turn**: pass it on the first request too. The opening turn is marked steerable; the codex `canSteer` contract requires BOTH the root and the follow-up head to be explicitly authorized.
+- **Follow-up while a turn is live**: the runner injects the message into the active turn via native `turn/steer`. If injection is not possible at that instant (no active turn / turn already closing / review or compaction turn / worker cold-starting), the request **silently degrades to an ordinary queued follow-up** — acceptance never fails because of `steer` alone.
+- **Non-codex-app CLIs**: the flag is a no-op; the existing type-ahead queue semantics apply.
+
+The response echoes `steer: true` only when the request was actually accepted for dispatch (not on an idempotent reuse). The echo confirms the daemon carried the authorization — it does NOT mean a `turn/steer` RPC was already admitted by the runner.
+
+**Result attribution for a merged group.** When several steered messages merge, codex produces ONE merged final for the whole group: earlier members receive an empty `steer_superseded` marker and only the newest trigger owns the real final + token usage. The daemon makes every earlier HTTP member resolve with the SAME merged content:
+
+- `http_async`: the parked member's `trigger-result` eventually reports `completed` with the merged `output.content` and **no `usage`** (usage is recorded against the newest trigger only). The park relation is also persisted, so a daemon restart in the merge window resolves the parked member by walking to the group's terminal record.
+- `http_wait`: the parked sync request resolves with the merged content as soon as the real final lands. Wait mode remains in-memory only (its existing contract); if the daemon restarts mid-group the parked wait simply hits its own timeout.
+
+`steer` is mutually exclusive with `dryRun` (there is no dispatch to steer into) → 400 `bad_request`. It adds no route or capability: `/api/trigger` stays the loopback, drive-your-own-turn surface, and steering only ever injects into the SAME tenant's own turn.
 
 ---
 
@@ -688,7 +709,7 @@ Robustness notes (all straight from the measured contract):
 
 - **`chat_not_allowed` maps to 500 on this endpoint** (§11.3), inconsistent with the webhook connector's 403.
 
-- **`source.type` is not validated** (§3.1); `envelope.format`, `options.dedupKey` and `options.status` have no readers (§3.5).
+- **`envelope.format`, `options.dedupKey` and `options.status` have no readers** (§3.5). `source.type` is no longer in this category: it is enum-validated and an unknown value gets 400 (§3.1).
 
 ---
 

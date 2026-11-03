@@ -8,6 +8,7 @@ vi.mock('../src/global-config.js', () => ({
 }));
 vi.mock('../src/platform/binding.js', () => ({
   platformMachineBaseUrl: vi.fn(() => null),
+  platformTerminalBaseUrl: vi.fn(() => null),
   publicReverseProxyBaseUrl: vi.fn(() => null),
   readPlatformBinding: vi.fn(() => null),
 }));
@@ -18,6 +19,7 @@ vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
 import {
   buildDashboardUrl,
   buildDashboardUrls,
+  buildReplyConsoleUrl,
   buildPlatformDashboardLoginUrl,
   buildV3RunDetailUrl,
   buildV3TerminalUrl,
@@ -30,6 +32,7 @@ import {
 import { isRemoteAccessEnabled } from '../src/global-config.js';
 import {
   platformMachineBaseUrl,
+  platformTerminalBaseUrl,
   publicReverseProxyBaseUrl,
   readPlatformBinding,
 } from '../src/platform/binding.js';
@@ -37,6 +40,7 @@ import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.
 
 const setRemote = (on: boolean) => vi.mocked(isRemoteAccessEnabled).mockReturnValue(on);
 const setPlatform = (base: string | null) => vi.mocked(platformMachineBaseUrl).mockReturnValue(base);
+const setPlatformTerminal = (base: string | null) => vi.mocked(platformTerminalBaseUrl).mockReturnValue(base);
 const setPublic = (base: string | null) => vi.mocked(publicReverseProxyBaseUrl).mockReturnValue(base);
 const setBinding = (binding: ReturnType<typeof readPlatformBinding>) => (
   vi.mocked(readPlatformBinding).mockReturnValue(binding)
@@ -47,6 +51,7 @@ describe('buildDashboardUrl', () => {
   beforeEach(() => {
     setRemote(false);
     setPlatform(null);
+    setPlatformTerminal(null);
     setPublic(null);
     setBinding(null);
     setDevbox(null);
@@ -142,6 +147,7 @@ describe('buildDashboardUrls', () => {
   beforeEach(() => {
     setRemote(false);
     setPlatform(null);
+    setPlatformTerminal(null);
     setPublic(null);
     setDevbox(null);
   });
@@ -363,14 +369,15 @@ describe('buildV3TerminalUrl', () => {
     })).toBe('http://[::1]:8765/?viewToken=view%20token%261');
   });
 
-  it('builds a central /s link carrying the same read capability', () => {
+  it('builds a central terminal-subdomain /s link carrying the same read capability', () => {
     setRemote(true);
     setPlatform('https://m-deadbeef.botmux.example');
+    setPlatformTerminal('https://t-deadbeef.botmux.example');
     expect(buildV3TerminalUrl('sess/with space', {
       host: '10.0.0.8',
       viewToken: 'view token&1',
     })).toBe(
-      'https://m-deadbeef.botmux.example/s/sess%2Fwith%20space/?viewToken=view%20token%261',
+      'https://t-deadbeef.botmux.example/s/sess%2Fwith%20space/?viewToken=view%20token%261',
     );
   });
 
@@ -378,6 +385,7 @@ describe('buildV3TerminalUrl', () => {
     expect(buildV3TerminalUrl('sess-1', { host: '10.0.0.8', webPort: 8765 })).toBeNull();
     setRemote(true);
     setPlatform('https://m-deadbeef.botmux.example');
+    setPlatformTerminal('https://t-deadbeef.botmux.example');
     expect(buildV3TerminalUrl('sess-1', { host: '10.0.0.8' })).toBeNull();
   });
 });
@@ -396,7 +404,7 @@ describe('workbench entry URL shapes', () => {
   });
 
   it('workbenchSpaUrl keeps the ?t= token and adds the SPA hash route', () => {
-    expect(workbenchSpaUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/?t=abc#/agent-workbench');
+    expect(workbenchSpaUrl(dashboardUrl)).toBe('http://1.2.3.4:7891/?t=abc#/agent-workbench?botmuxWorkbenchShell=immersive');
   });
 
   it('workbenchEntryUrl swaps the path and drops the fragment', () => {
@@ -410,12 +418,12 @@ describe('workbench entry URL shapes', () => {
     setRemote(true);
     setPlatform('https://m-deadbeef.botmux.example');
     const { url } = buildDashboardUrls({ host: '1.2.3.4', port: 7891, token: 'abc' });
-    expect(workbenchSpaUrl(url)).toBe('https://m-deadbeef.botmux.example/?t=abc#/agent-workbench');
+    expect(workbenchSpaUrl(url)).toBe('https://m-deadbeef.botmux.example/?t=abc#/agent-workbench?botmuxWorkbenchShell=immersive');
     expect(workbenchEntryUrl(url)).toBe('https://m-deadbeef.botmux.example/workbench?t=abc');
   });
 
   it('tolerates a token-less dashboard URL (user logs in on arrival)', () => {
-    expect(workbenchSpaUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/#/agent-workbench');
+    expect(workbenchSpaUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/#/agent-workbench?botmuxWorkbenchShell=immersive');
     expect(workbenchEntryUrl('http://1.2.3.4:7891/')).toBe('http://1.2.3.4:7891/workbench');
   });
 
@@ -523,5 +531,31 @@ describe('buildDashboardUrls: the wire URL always keeps its token', () => {
     // 摘 token 是消费端的决定，不是协议的决定。
     expect(urls.url).toContain('?t=abc');
     expect(urls.localUrl).toContain('?t=abc');
+  });
+});
+
+describe('permanent reply console URLs', () => {
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+    setPublic(null);
+    setDevbox(null);
+  });
+
+  it('uses the bound SSO machine entry without reading or publishing a token', () => {
+    setRemote(true);
+    setPlatform('https://m-example.botmux.example');
+    expect(buildReplyConsoleUrl()).toBe('https://m-example.botmux.example/');
+  });
+
+  it('does not advertise routes that require dashboard owner credentials', () => {
+    setPublic('https://proxy.example.com');
+    setDevbox('https://devbox.example.com');
+    expect(buildReplyConsoleUrl()).toBeUndefined();
+    setPlatform('https://m-example.botmux.example');
+    expect(buildReplyConsoleUrl()).toBeUndefined();
+    setRemote(true);
+    setPlatform(null);
+    expect(buildReplyConsoleUrl()).toBeUndefined();
   });
 });
