@@ -238,6 +238,25 @@ describe('botmux send per-turn final idempotency', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
 
+  it('refuses an image-only final retried with different bytes instead of replaying success', () => {
+    const f = createFixture();
+    const firstImage = join(f.root, 'relay-attempt-1.png');
+    const otherImage = join(f.root, 'relay-attempt-2.png');
+    writeFileSync(firstImage, 'first-image-bytes');
+    writeFileSync(otherImage, 'other-image-bytes');
+    try {
+      expect(f.run('final', '', ['--images', firstImage]).result.status).toBe(0);
+
+      // Byte identity is what makes a restaged retry replayable; it must not
+      // degrade into "any image replays", which would silently drop a genuinely
+      // different picture a second final attempt was trying to deliver.
+      const changed = f.run('final', '', ['--images', otherImage]);
+      expect(changed.result.status).toBe(2);
+      expect(String(changed.result.stderr)).toContain('本次请求的目标、提及或附件与已投递请求不同');
+      expect(changed.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
   it('refuses the same final body with a new attachment instead of silently dropping it', () => {
     const f = createFixture();
     const attachment = join(f.root, 'supplement.md');
