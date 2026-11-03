@@ -92,7 +92,7 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
   (input, legacy, next) => legacy.kind === 'forward'
     && legacy.reason === 'unknown_slash'
     && next.kind === 'daemon' && next.cmd === '/models'
-    && next.sessionPolicy === 'existing_only',
+    && next.sessionPolicy === 'sessionless',
   // Valid Codex effort headers may include a literal task body on later lines.
   (input, legacy, next) => ['codex', 'codex-app'].includes(input.cliId ?? '')
     && /^\s*\/effort\s+(?:low|medium|high|xhigh|max|ultra)(?:\s|$)/i.test(input.text)

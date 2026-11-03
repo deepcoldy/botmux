@@ -1,6 +1,8 @@
 /** Model catalogue and picker shared by /models and the optional reply menu. */
 import type { DaemonSession } from '../../core/types.js';
-import { getBot } from '../../bot-registry.js';
+import { getBot, type BotConfig } from '../../bot-registry.js';
+import { CONFIG_UNSET } from './card-builder.js';
+import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { staticModelChoices, detectModels, mergeModelChoices } from '../../services/model-catalog.js';
 import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.js';
@@ -25,14 +27,12 @@ export const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
  * derived through the same helper as the dashboard endpoint so the menu sees
  * exactly the runtime the session is running.
  */
-function resolveSessionModelCatalogue(ds: DaemonSession): {
+function resolveModelCatalogue(key: string, botConfig: BotConfig): {
   key: string;
   staticChoices: readonly string[];
   detect: () => Promise<readonly string[] | null>;
 } {
-  const cliId = sessionCliId(ds);
-  const key = selectionKeyForBot(cliId, ds.session.wrapperCli, ds.session.cliLaunchMode);
-  const probe = modelCatalogProbeContext(key, getBot(ds.larkAppId).config, process.env);
+  const probe = modelCatalogProbeContext(key, botConfig, process.env);
   return {
     key,
     staticChoices: staticModelChoices(key),
@@ -52,7 +52,8 @@ function resolveSessionModelCatalogue(ds: DaemonSession): {
  * live non-empty wins, otherwise the curated static list. Building both from
  * this keeps the offered options and the inject whitelist on identical terms. */
 export async function sessionModelChoices(ds: DaemonSession): Promise<readonly string[]> {
-  const catalogue = resolveSessionModelCatalogue(ds);
+  const key = selectionKeyForBot(sessionCliId(ds), ds.session.wrapperCli, ds.session.cliLaunchMode);
+  const catalogue = resolveModelCatalogue(key, getBot(ds.larkAppId).config);
   const live = await catalogue.detect().catch(() => null);
   return mergeModelChoices(catalogue.staticChoices, live).models;
 }
@@ -122,4 +123,77 @@ export async function showSessionModelPicker(
       { tag: 'markdown', content: t('card.reply_actions.model_empty', undefined, loc) },
     ] });
   await deliverEphemeralOrReply(ds, operatorOpenId, card, 'interactive', () => reply(rootId, card, 'interactive'));
+}
+
+export function defaultModelSelectionKey(appId: string): string {
+  const cfg = getBot(appId).config;
+  return selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode);
+}
+
+export async function defaultModelChoices(appId: string): Promise<readonly string[]> {
+  const cfg = getBot(appId).config;
+  const key = selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode);
+  const catalogue = resolveModelCatalogue(key, cfg);
+  const live = await catalogue.detect().catch(() => null);
+  return mergeModelChoices(catalogue.staticChoices, live).models;
+}
+
+export function buildDefaultModelPickerCard(
+  appId: string,
+  models: readonly string[],
+  currentModel: string | undefined,
+  loc: Locale,
+  selectionKey: string,
+): string {
+  const safe = [...new Set(models)].filter(model => MODEL_SLUG_PATTERN.test(model));
+  if (currentModel && MODEL_SLUG_PATTERN.test(currentModel)) {
+    const existing = safe.indexOf(currentModel);
+    if (existing >= 0) safe.splice(existing, 1);
+    safe.unshift(currentModel);
+  }
+  const choices = [{ text: t('card.models.cli_default', undefined, loc), value: CONFIG_UNSET },
+    ...safe.slice(0, 49).map(model => ({ text: model, value: model }))];
+  const initial = currentModel && choices.some(c => c.value === currentModel) ? currentModel : CONFIG_UNSET;
+  return JSON.stringify({ config: { wide_screen_mode: true }, elements: [
+    { tag: 'markdown', content: t('card.models.default_title', undefined, loc) },
+    { tag: 'div', text: { tag: 'plain_text', content: t('card.models.default_effect', undefined, loc) } },
+    { tag: 'action', actions: [{ tag: 'select_static',
+      initial_option: initial,
+      placeholder: { tag: 'plain_text', content: currentModel || t('card.models.cli_default', undefined, loc) },
+      options: choices.map(c => ({ text: { tag: 'plain_text', content: c.text }, value: c.value })),
+      value: { action: 'models_default_pick', lark_app_id: appId, selection_key: selectionKey, loc },
+    }] },
+  ] });
+}
+
+/** Bot defaults use the same strict admin gate as /botconfig, not chat grants. */
+export async function showDefaultModelPicker(
+  appId: string,
+  rootId: string,
+  operatorOpenId: string,
+  reply: (rootId: string, content: string, msgType?: string) => Promise<string>,
+  loc: Locale,
+): Promise<void> {
+  const bot = getBot(appId);
+  if (!bot.resolvedAllowedUsers.length || !bot.resolvedAllowedUsers.includes(operatorOpenId)) {
+    await reply(rootId, t('cmd.config.not_admin', undefined, loc));
+    return;
+  }
+  if (!botAcceptsLaunchModel(bot.config)) {
+    await reply(rootId, t('card.models.default_unsupported', undefined, loc));
+    return;
+  }
+  const selectionKey = defaultModelSelectionKey(appId);
+  const models = await defaultModelChoices(appId);
+  // Reading the catalogue can yield; re-read defaults and permission for display.
+  const current = getBot(appId);
+  if (!current.resolvedAllowedUsers.includes(operatorOpenId)) {
+    await reply(rootId, t('cmd.config.not_admin', undefined, loc));
+    return;
+  }
+  if (defaultModelSelectionKey(appId) !== selectionKey || !botAcceptsLaunchModel(current.config)) {
+    await reply(rootId, t('card.models.changed', undefined, loc));
+    return;
+  }
+  await reply(rootId, buildDefaultModelPickerCard(appId, models, current.config.model, loc, selectionKey), 'interactive');
 }

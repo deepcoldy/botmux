@@ -159,12 +159,13 @@ vi.mock('../src/services/model-catalog.js', () => ({
   runtimeExecutableForBotSelection: () => undefined,
 }));
 
-import { showSessionModelPicker } from '../src/im/lark/session-model-picker.js';
+import { buildDefaultModelPickerCard, showSessionModelPicker } from '../src/im/lark/session-model-picker.js';
 import { handleCommand } from '../src/core/command-handler.js';
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { setTerminalProxyPort, resetTerminalProxy } from '../src/core/terminal-url.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
+import { findConfigField, applyConfigField, coerceConfigValue } from '../src/services/bot-config-store.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 
@@ -262,6 +263,9 @@ beforeEach(() => {
     botName: 'testbot',
     botOpenId: 'ou_bot',
   } as any);
+  vi.mocked(findConfigField).mockReset();
+  vi.mocked(applyConfigField).mockReset();
+  vi.mocked(coerceConfigValue).mockReset();
   isSessionTransferringMock.mockReset().mockReturnValue(false);
   readableTerminalUrlMock.mockReset().mockReturnValue('https://example.com/term');
   liveReadableTerminalUrlMock.mockReset().mockReturnValue('https://example.com/term');
@@ -621,6 +625,138 @@ describe('/models shortcut', () => {
     const deliver = vi.fn();
     await handleCardAction(shortcutPick(reason === 'invalid' ? 'sonnet\n/clear' : 'sonnet'), depsWith(ds, deliver), LARK_APP_ID);
     expect(deliver).not.toHaveBeenCalled();
+  });
+});
+
+describe('/models bot defaults at top level', () => {
+  function adminBot() {
+    const bot = getBot(LARK_APP_ID) as any;
+    bot.resolvedAllowedUsers = [OWNER];
+    bot.config.model = 'opus';
+    return bot;
+  }
+  function defaultPick(model = 'haiku', extra = {}) {
+    return { operator: { open_id: OWNER },
+      action: { value: { action: 'models_default_pick', lark_app_id: LARK_APP_ID, selection_key: 'claude-code', ...extra }, option: model },
+      context: { open_message_id: 'om_defaults' } };
+  }
+  const modelSpec = { key: 'model', kind: 'string', configKey: 'model', clearable: true } as any;
+
+  it.each([false, true])('top-level /models shows bot defaults with an existing flat session: %s', async existing => {
+    adminBot();
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { model: 'session-model' } });
+    const deps = depsWith(existing ? ds : undefined);
+    deps.invocationContext = 'new-topic';
+    await handleCommand('/models', ROOT, { messageId: 'om_top', chatId: 'oc_chat', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    const card = JSON.parse(deps.sessionReply.mock.calls[0][1]);
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.value).toMatchObject({ action: 'models_default_pick', lark_app_id: LARK_APP_ID, selection_key: 'claude-code' });
+    expect(select.initial_option).toBe('opus');
+    expect(select.value.session_id).toBeUndefined();
+    expect(ds.session.model).toBe('session-model');
+    expect(deliverEphemeralOrReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('topic replies keep selecting the session model', async () => {
+    adminBot();
+    const deps = depsWith(makeDs());
+    deps.invocationContext = 'thread';
+    await handleCommand('/models', ROOT, { messageId: 'om_in_topic', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
+    expect(card.elements.find((e: any) => e.tag === 'action').actions[0].value.action).toBe('session_model_pick');
+  });
+
+  it('chat-level operate permission does not allow opening bot defaults', async () => {
+    vi.mocked(canOperate).mockReturnValue(true);
+    const deps = depsWith(undefined);
+    deps.invocationContext = 'new-topic';
+    await handleCommand('/models', ROOT, { messageId: 'om_top', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+    expect(detectModelsMock).not.toHaveBeenCalled();
+    expect(deps.sessionReply.mock.calls[0][2]).not.toBe('interactive');
+  });
+
+  it('updates only this bot model default through the existing config store', async () => {
+    const bot = adminBot();
+    const ds = makeDs({ activeModel: 'session-model', sessionOverrides: { model: 'session-model' } });
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'haiku' } as any);
+    vi.mocked(applyConfigField).mockImplementation(async (_app, _spec, model) => {
+      bot.config.model = model;
+      return { ok: true, newText: 'haiku', effect: 'next-session' } as any;
+    });
+    const result = await handleCardAction(defaultPick('haiku', { field: 'cli' }), depsWith(ds), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, 'haiku');
+    expect(bot.config.model).toBe('haiku');
+    expect(ds.session.model).toBe('session-model');
+    expect(ds.activeModel).toBe('session-model');
+    expect(result.toast.type).toBe('success');
+    expect(result.card.data.elements.find((e: any) => e.tag === 'action').actions[0].initial_option).toBe('haiku');
+  });
+
+  it.each(['permission', 'wrong-app', 'changed-cli', 'bad-model', 'unsupported'])('rejects a default model selection: %s', async reason => {
+    const bot = adminBot();
+    const data = defaultPick();
+    if (reason === 'permission') bot.resolvedAllowedUsers = [];
+    if (reason === 'wrong-app') data.action.value.lark_app_id = 'other-app';
+    if (reason === 'changed-cli') bot.config.cliId = 'codex';
+    if (reason === 'bad-model') data.action.option = 'haiku\n/clear';
+    if (reason === 'unsupported') bot.config.backendType = 'riff';
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    const result = await handleCardAction(data, depsWith(makeDs()), LARK_APP_ID);
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(result.toast.type).not.toBe('success');
+  });
+
+  it.each(['cli', 'backend'])('does not stamp old model choices with changed defaults after saving: %s', async change => {
+    const bot = adminBot();
+    let resolve!: (models: string[] | null) => void;
+    let started!: () => void;
+    const detectionStarted = new Promise<void>(r => { started = r; });
+    detectModelsMock.mockImplementation(() => { started(); return new Promise(r => { resolve = r; }); });
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'haiku' } as any);
+    vi.mocked(applyConfigField).mockImplementation(async () => { bot.config.model = 'haiku'; return { ok: true, newText: 'haiku', effect: 'next-session' } as any; });
+    const pending = handleCardAction(defaultPick(), depsWith(undefined), LARK_APP_ID);
+    await detectionStarted;
+    if (change === 'cli') bot.config.cliId = 'codex';
+    else bot.config.backendType = 'riff';
+    resolve(['opus', 'sonnet']);
+    const result = await pending;
+    expect(result.toast.type).toBe('success');
+    expect(result.card).toBeUndefined();
+    expect(bot.config.model).toBe('haiku');
+  });
+
+  it('keeps the current default selectable when the catalogue exceeds the Lark option limit', () => {
+    const models = Array.from({ length: 75 }, (_, i) => `model-${i}`);
+    const card = JSON.parse(buildDefaultModelPickerCard(LARK_APP_ID, models, 'model-74', 'zh', 'claude-code'));
+    const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.length).toBeLessThanOrEqual(50);
+    expect(select.initial_option).toBe('model-74');
+    expect(select.options.map((o: any) => o.value)).toContain('model-74');
+  });
+
+  it('clears the default through the same model field', async () => {
+    const bot = adminBot();
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(applyConfigField).mockImplementation(async (_app, _spec, model) => {
+      bot.config.model = model ?? undefined;
+      return { ok: true, newText: 'default', effect: 'next-session' } as any;
+    });
+    const result = await handleCardAction(defaultPick('__unset__'), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, null);
+    expect(result.toast.type).toBe('success');
+  });
+
+  it('reports default persistence failure without changing the active session', async () => {
+    adminBot();
+    const ds = makeDs({ sessionOverrides: { model: 'session-model' } });
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'haiku' } as any);
+    vi.mocked(applyConfigField).mockResolvedValue({ ok: false, reason: 'disk full' } as any);
+    const result = await handleCardAction(defaultPick(), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('error');
+    expect(ds.session.model).toBe('session-model');
   });
 });
 

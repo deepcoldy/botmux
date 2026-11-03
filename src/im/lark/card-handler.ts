@@ -1,5 +1,6 @@
+import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
-import { MODEL_SLUG_PATTERN, sessionModelChoices, buildSessionModelPickerCard } from './session-model-picker.js';
+import { MODEL_SLUG_PATTERN, sessionModelChoices, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelChoices, defaultModelSelectionKey } from './session-model-picker.js';
 /**
  * Lark card action handler — processes button clicks and dropdown selections
  * from Feishu interactive cards.
@@ -2426,7 +2427,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
   // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 编辑自由输入项 ──
   const CONFIG_CARD_ACTIONS = [
-    'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
+    'config_toggle', 'config_set', 'models_default_pick', 'config_quota', 'config_quota_open',
     'config_quota_save', 'config_text_open', 'config_text_save',
   ];
   if (value?.action && larkAppId && CONFIG_CARD_ACTIONS.includes(value.action)) {
@@ -2440,6 +2441,16 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     if (admins.length === 0 || !operatorOpenId || !admins.includes(operatorOpenId)) {
       return { toast: { type: 'error', content: t('cmd.config.not_admin', undefined, loc) } };
     }
+    const defaultPicker = value.action === 'models_default_pick';
+    if (defaultPicker && value.lark_app_id !== larkAppId) {
+      return { toast: { type: 'error', content: t('cmd.config.no_bot', undefined, loc) } };
+    }
+    if (defaultPicker && !botAcceptsLaunchModel(cbot.config)) {
+      return { toast: { type: 'warning', content: t('card.models.default_unsupported', undefined, loc) } };
+    }
+    if (defaultPicker && value.selection_key !== defaultModelSelectionKey(larkAppId)) {
+      return { toast: { type: 'warning', content: t('card.models.changed', undefined, loc) } };
+    }
     // ttadk 网关 bot 用 ttadk 网关模型候选（glm-5.1…），非底层适配器的 opus/gpt-5
     // （否则被 worker 注入成 `ttadk -m opus` 用错模型启动失败）；CoCo 无候选。
     const modelChoices = (() => {
@@ -2448,6 +2459,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try { return createCliAdapterSync(cbot.config.cliId, cbot.config.cliPathOverride).modelChoices ?? []; } catch { return []; }
     })();
     const reRender = () => {
+      if (defaultPicker) return { card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, modelChoices, cbot.config.model, loc, defaultModelSelectionKey(larkAppId))) } };
       const d = getConfigCardData(larkAppId, modelChoices);
       return d ? { card: { type: 'raw' as const, data: JSON.parse(buildConfigCard(d, loc)) } } : {};
     };
@@ -2549,7 +2561,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'success', content: `✓ quota = ${limit ?? 'off'}` }, ...reRender() };
     }
 
-    const field = value.field as string | undefined;
+    const field = defaultPicker ? 'model' : value.field as string | undefined;
     const spec = field ? findConfigField(field) : undefined;
     if (!spec || spec.kind === 'allowedUsers') {
       return { toast: { type: 'error', content: t('cmd.config.unknown_field', { field: field ?? '?', fields: '' }, loc) } };
@@ -2562,6 +2574,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       r = await applyConfigField(larkAppId, spec, !cur);
     } else {
       const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';
+      if (defaultPicker && raw !== CONFIG_UNSET && !MODEL_SLUG_PATTERN.test(raw)) {
+        return { toast: { type: 'error', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
+      }
       if (raw === CONFIG_UNSET) {
         if (!spec.clearable) return { toast: { type: 'error', content: t('cmd.config.not_clearable', { field: spec.key }, loc) }, ...reRender() };
         r = await applyConfigField(larkAppId, spec, null);
@@ -2572,6 +2587,17 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
     }
     if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+    if (defaultPicker) {
+      const refreshKey = defaultModelSelectionKey(larkAppId);
+      const choices = await defaultModelChoices(larkAppId).catch(() => modelChoices);
+      const current = getBot(larkAppId);
+      if (defaultModelSelectionKey(larkAppId) !== refreshKey || !botAcceptsLaunchModel(current.config)
+        || !current.resolvedAllowedUsers.includes(operatorOpenId)) {
+        return { toast: { type: 'success', content: `✓ model = ${r.newText} · ${t('card.models.changed', undefined, loc)}` } };
+      }
+      return { toast: { type: 'success', content: `✓ model = ${r.newText}` },
+        card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, choices, current.config.model, loc, refreshKey)) } };
+    }
     return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...reRender() };
   }
 

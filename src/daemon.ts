@@ -6523,6 +6523,7 @@ const commandDeps: CommandHandlerDeps = {
  * replace their session before replying, so mutable session state cannot be
  * the authority for placement here. */
 function commandDepsForInvocation(input: {
+  context?: 'new-topic' | 'thread';
   scope: 'chat' | 'thread';
   chatId: string;
   anchor: string;
@@ -6537,6 +6538,7 @@ function commandDepsForInvocation(input: {
   });
   return {
     ...commandDeps,
+    invocationContext: input.context,
     invocationReplyTarget: replyTarget,
     sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
       sessionReply(
@@ -26178,6 +26180,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
   if (isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
+      context: 'new-topic',
       scope,
       chatId,
       anchor,
@@ -29909,6 +29912,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   if (slashDecision && isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
+      context: 'thread',
       scope,
       chatId: routingChatId,
       anchor,
