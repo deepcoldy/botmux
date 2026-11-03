@@ -82,6 +82,21 @@ export type V3RunEditTurnClass = 'initiator' | 'runEvent' | 'other';
 
 /** M1: only the initiator's own turns and turns this run's events woke may
  *  change the flow directly; every other turn's edit becomes a proposal. */
+/**
+ * M2 乙: which of a plan's §13.5 reasons still need the initiator's card in
+ * this turn. The initiator's own turn applies everything directly except an
+ * external action (host node); a turn the main bot opened for the run's own
+ * events keeps the whole list; anyone else's turn always proposes.
+ */
+export function v3ConfirmReasonsForTurn(
+  turn: V3RunEditTurnClass,
+  planReasons: readonly V3RevisionConfirmReason[],
+): V3RevisionConfirmReason[] {
+  if (turn === 'initiator') return planReasons.filter((reason) => reason === 'hostNode');
+  if (turn === 'other') return ['callerNotInitiator', ...planReasons];
+  return [...planReasons];
+}
+
 export function classifyV3RunEditTurn(
   initiatorOpenId: string | undefined,
   caller: V3RunEditCaller,
@@ -466,12 +481,26 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
       snap,
       patch,
       knownBots,
+      // The initiator's own edit lifts a spent rerun budget itself (M2 乙).
+      liftSpentRerunBudget: turn === 'initiator',
     });
     if (!planned.ok) {
       return { kind: 'invalid', problems: planned.problems, ...(planned.rerunBudget ? { rerunBudget: planned.rerunBudget } : {}) };
     }
     const plan = planned.plan;
     if (!hasChanges(plan.changes)) return { kind: 'invalid', problems: ['the patch changes nothing'] };
+    const reasons = v3ConfirmReasonsForTurn(turn, plan.reasons);
+    const direct = reasons.length === 0;
+    if (!direct && plan.budgetGrants.length > 0) {
+      // Only a change that takes effect now lifts the budget; one that waits
+      // for the card goes through the grant card like any other.
+      const spent = plan.budgetGrants[0]!;
+      return {
+        kind: 'invalid',
+        problems: [`ops rerunNode: 节点 "${spent.nodeId}" 的重做额度已用完；这次修改需要发起人确认，请先在「追加重做额度」卡上追加后再提交`],
+        rerunBudget: { ...spent, epoch: v3RevisitBudgetEpoch(events, spent.nodeId, spent.tier) },
+      };
+    }
 
     const newBots = new Map<string, BotSnapshot>();
     const problems: string[] = [];
@@ -484,9 +513,6 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
     }
     if (problems.length > 0) return { kind: 'invalid', problems };
 
-    const reasons: V3RevisionConfirmReason[] = [...plan.reasons];
-    if (turn === 'other') reasons.unshift('callerNotInitiator');
-    const direct = reasons.length === 0;
     // Only the initiator (or a turn acting for them) may replace a pending
     // proposal; another member's proposal must not void it.
     if (!direct && turn === 'other' && effective.history.pending) {
@@ -508,6 +534,17 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
     const pending = effective.history.pending;
     const voidedRevisions: Array<{ revision: number; reason: V3VoidedProposal['reason'] }> = [];
     if (direct) {
+      // Rerun budget the initiator's own edit lifted: one more revisit each,
+      // recorded as theirs and tied to this revision (no grant card).
+      for (const grant of plan.budgetGrants) {
+        append({
+          type: 'revisitBudgetGranted',
+          ...(grant.tier === 'pair' ? { sourceNodeId: grant.nodeId, toNodeId: grant.nodeId } : {}),
+          by: actor,
+          reason: 'rerunNode',
+          revision,
+        }, { durable: true });
+      }
       append({
         type: 'dagRevised',
         revision,

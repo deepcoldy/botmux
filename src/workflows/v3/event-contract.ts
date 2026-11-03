@@ -429,6 +429,10 @@ export type V3Event =
       toNodeId?: string;
       by: string;
       reason?: string;
+      /** Granted by the initiator inside their own runtime edit that took
+       *  effect as this revision (its `rerunNode` found the budget spent,
+       *  M2 乙) — not on a grant card. */
+      revision?: number;
     }
   | { type: 'loopStarted'; loopId: string }
   | { type: 'loopIterationStarted'; loopId: string; iteration: number }

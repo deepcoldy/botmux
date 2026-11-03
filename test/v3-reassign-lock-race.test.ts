@@ -31,7 +31,7 @@ import { artifactRef, makeAdHocRunEnvelope, publishRunEnvelopeOnce } from '../sr
 import { createV3GateRunner } from '../src/workflows/v3/daemon-run.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { reassignNode } from '../src/workflows/v3/external-control.js';
-import { applyV3RunEdit, decideV3RevisionProposal } from '../src/workflows/v3/run-edit.js';
+import { applyV3RunEdit } from '../src/workflows/v3/run-edit.js';
 import { FakeExecutor } from './helpers/v3-external-harness.js';
 
 const OWNER = 'ou_owner';
@@ -97,7 +97,7 @@ async function runWithIdleSpare(runId: string) {
 describe('a reassignment planned while idle refuses an attempt dispatched before its lock (M17)', () => {
   it.each([
     ['the approval\'s bot set only', false],
-    ['a bot added by a confirmed flow revision', true],
+    ['a bot a flow revision added', true],
   ])('on a run with %s', async (_label, withAddedBot) => {
     const run = await runWithIdleSpare(withAddedBot ? 'race-added' : 'race-frozen');
     let target = 'cli_a';
@@ -107,9 +107,7 @@ describe('a reassignment planned while idle refuses an attempt dispatched before
         patch: [{ op: 'addNode', node: { id: 'publish', type: 'goal', goal: 'publish', bot: 'cli_x', depends: ['spare'], inputs: [] } }],
         caller: { openId: OWNER, origin: 'human' },
         resolveNewBotSnapshot: (selector) => ({ larkAppId: selector, cliId: 'claude-code', workingDir: '/tmp' }),
-      })).toMatchObject({ kind: 'proposed', reasons: ['newBot'] });
-      expect(decideV3RevisionProposal({ baseDir: run.base, runId: 'race-added', revision: 2, decision: 'approve', by: OWNER }))
-        .toMatchObject({ kind: 'approved' });
+      })).toMatchObject({ kind: 'applied' });
       target = 'cli_x';
     }
     // A concurrent drive dispatches `spare` after the engine planned, before it locks.

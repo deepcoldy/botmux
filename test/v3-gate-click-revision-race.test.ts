@@ -118,7 +118,8 @@ describe('gate click racing the removal of its node', () => {
     expect(applyV3RunEdit({
       baseDir: base, runId: 'run-race-rm', baseRevision: 1,
       patch: [{ op: 'removeNode', nodeId: 'g' }, { op: 'setDepends', nodeId: 'z', depends: [] }],
-      caller: { openId: INITIATOR, origin: 'human' },
+      // The main bot's own turn: deleting an unpassed gate still needs the card.
+      caller: { openId: INITIATOR, origin: 'runEvent' },
       resolveNewBotSnapshot: () => { throw new Error('no new bots'); },
     })).toMatchObject({ kind: 'proposed' });
     hooks.afterCas = () => {

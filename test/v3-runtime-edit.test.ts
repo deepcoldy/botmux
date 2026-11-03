@@ -110,6 +110,9 @@ const BOTS = {
   cli_other: { larkAppId: 'cli_other', cliId: 'claude-code', workingDir: '/frozen/work' },
 };
 const initiator: V3RunEditCaller = { openId: INITIATOR, origin: 'human' };
+/** A turn the main bot opened for this run's own events: acts for the
+ *  initiator but keeps the full M2 confirmation list (M2 乙). */
+const mainBot: V3RunEditCaller = { openId: INITIATOR, origin: 'runEvent' };
 const other: V3RunEditCaller = { openId: OTHER, origin: 'human' };
 
 const bases: string[] = [];
@@ -486,10 +489,10 @@ describe('M1 turn classes and M2 confirmation', () => {
     expect(projectV3RunStatus(base, 'run-rej').revision).toBe(1);
   });
 
-  it('even the initiator\'s confirmation-list change goes through the card', () => {
+  it('a turn the main bot opened for the run\'s events sends a confirmation-list change through the card', () => {
     const base = freshBase();
     seedRun(base, 'run-list', [goal('a', { humanGate: { prompt: 'ok?' } })]);
-    expect(edit(base, 'run-list', [{ op: 'updateNode', nodeId: 'a', set: { humanGate: null } }], 1))
+    expect(edit(base, 'run-list', [{ op: 'updateNode', nodeId: 'a', set: { humanGate: null } }], 1, mainBot))
       .toMatchObject({ kind: 'proposed', reasons: ['gateRelaxed'] });
   });
 
@@ -501,7 +504,7 @@ describe('M1 turn classes and M2 confirmation', () => {
       runId: 'run-newbot',
       patch: [{ op: 'reassign', nodeId: 'a', bot: 'cli_fresh' }],
       baseRevision: 1,
-      caller: initiator,
+      caller: mainBot,
       resolveNewBotSnapshot: (selector) => ({ larkAppId: selector, cliId: 'codex', workingDir: '/fresh' }) as never,
     });
     expect(out).toMatchObject({ kind: 'proposed', reasons: ['newBot'] });
@@ -828,7 +831,7 @@ describe('P1 — a passed gate never covers a changed blocked node', () => {
   it('a confirmed approver change asks the new approvers before the retry runs', async () => {
     const base = freshBase();
     const { runDir, driver } = await blockedAfterApprovedGate(base, 'run-p1b');
-    expect(edit(base, 'run-p1b', [{ op: 'updateNode', nodeId: 'g', set: { humanGate: { prompt: 'ship?', approvers: ['ou_security'] } } }], 1))
+    expect(edit(base, 'run-p1b', [{ op: 'updateNode', nodeId: 'g', set: { humanGate: { prompt: 'ship?', approvers: ['ou_security'] } } }], 1, mainBot))
       .toMatchObject({ kind: 'proposed', reasons: ['gateRelaxed'] });
     expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-p1b', revision: 2, decision: 'approve', by: INITIATOR }))
       .toMatchObject({ kind: 'approved' });
@@ -894,7 +897,8 @@ describe('P2 — a rerun refused for revisit budget can be unlocked by the initi
     appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'b', instanceId: 'b#001', attemptId: 'b#001/attempts/001' });
     expect(edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 1)).toMatchObject({ kind: 'applied', revision: 2 });
     finish('a#002');
-    const refused = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2);
+    // A turn the main bot opened itself does not lift a spent budget.
+    const refused = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2, mainBot);
     expect(refused).toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
     const block = refused.kind === 'invalid' ? refused.rerunBudget! : undefined!;
     const { epoch, tier } = block;
@@ -902,7 +906,7 @@ describe('P2 — a rerun refused for revisit budget can be unlocked by the initi
     const posts: string[] = [];
     const post = async () => { posts.push('card'); return `om_card_${posts.length}`; };
     expect(await postV3RerunGrantCardOnce({ baseDir: base, runId: 'run-budget', block, post })).toBe('posted');
-    const again = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2);
+    const again = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 2, mainBot);
     expect(again.kind === 'invalid' && again.rerunBudget).toEqual(block);
     expect(await postV3RerunGrantCardOnce({ baseDir: base, runId: 'run-budget', block, post })).toBe('already');
     expect(posts).toHaveLength(1);
@@ -928,7 +932,7 @@ describe('P2 — a rerun refused for revisit budget can be unlocked by the initi
     // Spent again → a NEW exhaustion. Until its card is out, the old card says
     // to have the bot re-submit; once posted, the old card points at it.
     finish('a#003');
-    const second = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 3);
+    const second = edit(base, 'run-budget', [{ op: 'rerunNode', nodeId: 'a' }], 3, mainBot);
     const secondBlock = second.kind === 'invalid' ? second.rerunBudget! : undefined!;
     expect(secondBlock.epoch).not.toBe(epoch);
     expect(grantV3RerunBudget({ baseDir: base, runId: 'run-budget', nodeId: 'a', tier, epoch, by: INITIATOR }))
@@ -946,7 +950,7 @@ describe('P3-1 — deleting a node waiting at its gate voids that gate', () => {
     const runDir = seedRun(base, 'run-del-gate', [goal('g', { humanGate: { prompt: 'ok?' } }), goal('z')]);
     await runner(base, fakeWorkers().runNode).drive('run-del-gate');
     recordWaitCardMessage(runDir, 'g#001-gate', 'om_gate_card');
-    expect(edit(base, 'run-del-gate', [{ op: 'removeNode', nodeId: 'g' }], 1)).toMatchObject({ kind: 'proposed', reasons: ['gateRelaxed'] });
+    expect(edit(base, 'run-del-gate', [{ op: 'removeNode', nodeId: 'g' }], 1, mainBot)).toMatchObject({ kind: 'proposed', reasons: ['gateRelaxed'] });
     expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-del-gate', revision: 2, decision: 'approve', by: INITIATOR }))
       .toMatchObject({ kind: 'approved', voidedGates: [{ waitId: 'g#001-gate', cardMessageIds: ['om_gate_card'] }] });
     expect(readWait(runDir, 'g#001-gate')?.status).toBe('voided');
@@ -1009,8 +1013,12 @@ describe('P3-5 / P3-6 — who may leave a proposal pending', () => {
     expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'second idea' } }], 1, other))
       .toMatchObject({ kind: 'rejected', reason: 'proposal-pending' });
     expect(projectV3RunStatus(base, 'run-pending').pendingProposal?.revision).toBe(2);
-    expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'a', set: { humanGate: null } }], 1))
+    // The main bot (event turn) proposes in its place …
+    expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'a', set: { humanGate: null } }], 1, mainBot))
       .toMatchObject({ kind: 'proposed', revision: 3, voidedProposals: [{ revision: 2, reason: 'superseded' }] });
+    // … and the initiator's own change takes effect, voiding what was pending.
+    expect(edit(base, 'run-pending', [{ op: 'updateNode', nodeId: 'b', set: { goal: 'the initiator decides' } }], 1))
+      .toMatchObject({ kind: 'applied', revision: 4, voidedProposals: [{ revision: 3, reason: 'stale' }] });
   });
 });
 
@@ -1264,7 +1272,7 @@ function exhaustPair(base: string, runId: string, extra: string[] = []): { runDi
   for (const id of extra) finish(id, `${id}#001`);
   expect(edit(base, runId, [{ op: 'rerunNode', nodeId: 'a' }], 1)).toMatchObject({ kind: 'applied' });
   finish('a', 'a#002');
-  const refused = edit(base, runId, [{ op: 'rerunNode', nodeId: 'a' }], 2);
+  const refused = edit(base, runId, [{ op: 'rerunNode', nodeId: 'a' }], 2, mainBot);
   if (refused.kind !== 'invalid' || !refused.rerunBudget) throw new Error(JSON.stringify(refused));
   return { runDir, block: refused.rerunBudget };
 }
@@ -1323,8 +1331,8 @@ describe('round 3 — a grant that cannot lift this exhaustion leaves its card v
     }
     expect(edit(base, runId, [{ op: 'rerunNode', nodeId: 'n1' }], rev)).toMatchObject({ kind: 'applied' });
     rev++;
-    const refA = edit(base, runId, [{ op: 'rerunNode', nodeId: 'a' }], rev);
-    const refB = edit(base, runId, [{ op: 'rerunNode', nodeId: 'b' }], rev);
+    const refA = edit(base, runId, [{ op: 'rerunNode', nodeId: 'a' }], rev, mainBot);
+    const refB = edit(base, runId, [{ op: 'rerunNode', nodeId: 'b' }], rev, mainBot);
     if (refA.kind !== 'invalid' || refB.kind !== 'invalid') throw new Error('expected both refused');
     expect(refA.rerunBudget).toMatchObject({ tier: 'pair' });
     expect(refB.rerunBudget).toMatchObject({ tier: 'run' });
@@ -1336,7 +1344,7 @@ describe('round 3 — a grant that cannot lift this exhaustion leaves its card v
     expect(await handleV3RevisionAction(cardOf(refB.rerunBudget!), INITIATOR, { baseDir: base, driveRun: () => {} }))
       .toMatchObject({ header: expect.anything() });
     // … a is still refused on its own budget, for the SAME exhaustion …
-    const stillA = edit(base, runId, [{ op: 'rerunNode', nodeId: 'a' }], rev);
+    const stillA = edit(base, runId, [{ op: 'rerunNode', nodeId: 'a' }], rev, mainBot);
     expect(stillA.kind === 'invalid' && stillA.rerunBudget).toEqual(refA.rerunBudget);
     // … so a's only card still grants.
     const before = journal(runDir).length;
@@ -1384,7 +1392,7 @@ describe('round 3 — a grant card grants only the tier and exhaustion it was po
       rev++;
     }
     const refuse = (nodeId: string) => {
-      const out = edit(base, runId, [{ op: 'rerunNode', nodeId }], rev);
+      const out = edit(base, runId, [{ op: 'rerunNode', nodeId }], rev, mainBot);
       if (out.kind !== 'invalid' || !out.rerunBudget) throw new Error(JSON.stringify(out));
       return out.rerunBudget;
     };
@@ -1548,5 +1556,129 @@ describe('round 3 — follow-up reconciliation never acts on an outdated flow', 
     for (const runDir of [withProposal, followUpsOnly]) {
       expect(journal(runDir).some((event) => event.type === 'nodeReassigned')).toBe(false);
     }
+  });
+});
+
+// ─── M2 乙: the initiator's own turn applies directly, except external actions ─
+
+describe('M2 乙 — which turn needs the confirmation card', () => {
+  const HOST = {
+    id: 'send', type: 'host', executor: 'feishu-send', depends: [], inputs: [],
+    input: { larkAppId: { $ref: 'context.larkAppId' }, chatId: { $ref: 'context.chatId' }, content: 'hi' },
+    humanGate: { prompt: 'send?', options: ['approve', 'reject'], approveOptions: ['approve'] },
+  };
+  const newBotEdit = (base: string, runId: string, caller: V3RunEditCaller, revision = 1) => applyV3RunEdit({
+    baseDir: base, runId, baseRevision: revision, caller,
+    patch: [{ op: 'reassign', nodeId: 'a', bot: 'cli_fresh' }],
+    resolveNewBotSnapshot: (selector) => ({ larkAppId: selector, cliId: 'codex', workingDir: '/fresh' }) as never,
+  });
+  /** Each confirmation-list change except the external action, on its own run. */
+  const cases: Array<[string, unknown[], (base: string, runId: string, caller: V3RunEditCaller) => ReturnType<typeof edit>, string]> = [
+    ['a bot outside the approved set', [goal('a')], (base, runId, caller) => newBotEdit(base, runId, caller), 'newBot'],
+    ['removing a gate', [goal('a', { humanGate: { prompt: 'ok?' } })],
+      (base, runId, caller) => edit(base, runId, [{ op: 'updateNode', nodeId: 'a', set: { humanGate: null } }], 1, caller), 'gateRelaxed'],
+    ['a longer timeout', [goal('a', { timeoutSec: 600 })],
+      (base, runId, caller) => edit(base, runId, [{ op: 'updateNode', nodeId: 'a', set: { timeoutSec: 3600 } }], 1, caller), 'budgetExpanded'],
+    ['more than twice the approved nodes', [goal('a')],
+      (base, runId, caller) => edit(base, runId, [
+        { op: 'addNode', node: goal('b') }, { op: 'addNode', node: goal('c') },
+      ], 1, caller), 'budgetExpanded'],
+  ];
+
+  it.each(cases)('the initiator\'s own turn: %s takes effect directly', (_label, nodes, apply) => {
+    const base = freshBase();
+    seedRun(base, 'run-direct', nodes);
+    expect(apply(base, 'run-direct', initiator)).toMatchObject({ kind: 'applied' });
+  });
+
+  it.each(cases)('a turn the main bot opened for the run\'s events: %s still needs the card', (_label, nodes, apply, reason) => {
+    const base = freshBase();
+    seedRun(base, 'run-event-card', nodes);
+    expect(apply(base, 'run-event-card', mainBot)).toMatchObject({ kind: 'proposed', reasons: [reason] });
+  });
+
+  it.each(cases)('anyone else\'s turn: %s is a proposal', (_label, nodes, apply, reason) => {
+    const base = freshBase();
+    seedRun(base, 'run-other-card', nodes);
+    expect(apply(base, 'run-other-card', other)).toMatchObject({ kind: 'proposed', reasons: ['callerNotInitiator', reason] });
+  });
+
+  it('a bot the initiator brought in directly joins the approved scope and runs the node', async () => {
+    const base = freshBase();
+    const runDir = seedRun(base, 'run-direct-bot', [goal('a')]);
+    expect(newBotEdit(base, 'run-direct-bot', initiator)).toMatchObject({ kind: 'applied', revision: 2 });
+    expect(existsSync(v3RevisionFilePaths(runDir, 2).bots)).toBe(true);
+    // Already approved now: the main bot's own turn may use it without a card.
+    expect(edit(base, 'run-direct-bot', [{ op: 'addNode', node: goal('b', { bot: 'cli_fresh' }) }], 2, mainBot))
+      .toMatchObject({ kind: 'applied' });
+    const seen: string[] = [];
+    await runner(base, async (req) => { seen.push(req.botSnapshot.larkAppId); return fakeWorkers().runNode(req); }).drive('run-direct-bot');
+    expect(seen).toEqual(['cli_fresh', 'cli_fresh']);
+  });
+
+  it('an external action still needs the card, even in the initiator\'s own turn — and only it is listed', () => {
+    const base = freshBase();
+    seedRun(base, 'run-host', [goal('a')]);
+    expect(edit(base, 'run-host', [{ op: 'addNode', node: HOST }], 1))
+      .toMatchObject({ kind: 'proposed', reasons: ['hostNode'] });
+    expect(projectV3RunStatus(base, 'run-host').pendingProposal?.reasons).toEqual(['hostNode']);
+    // Together with a change that would otherwise apply directly.
+    const both = applyV3RunEdit({
+      baseDir: base, runId: 'run-host', baseRevision: 1, caller: initiator,
+      patch: [{ op: 'addNode', node: HOST }, { op: 'reassign', nodeId: 'a', bot: 'cli_fresh' }],
+      resolveNewBotSnapshot: (selector) => ({ larkAppId: selector, cliId: 'codex', workingDir: '/fresh' }) as never,
+    });
+    expect(both).toMatchObject({ kind: 'proposed', reasons: ['hostNode'] });
+  });
+
+  it('changing an existing external action in the initiator\'s own turn needs the card', () => {
+    const base = freshBase();
+    seedRun(base, 'run-host-change', [goal('a'), HOST]);
+    expect(edit(base, 'run-host-change', [{ op: 'updateNode', nodeId: 'send', set: { input: { ...HOST.input, content: 'bye' } } }], 1))
+      .toMatchObject({ kind: 'proposed', reasons: ['hostNode'] });
+  });
+
+  describe('redoing a finished node whose budget is spent', () => {
+    function spentRun(base: string, runId: string, extra: unknown[] = []) {
+      const runDir = seedRun(base, runId, [goal('a'), ...extra]);
+      const journalPath = join(runDir, 'journal.ndjson');
+      const finish = (instanceId: string) => {
+        const attemptId = `${instanceId}/attempts/001`;
+        appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'a', instanceId, attemptId });
+        appendEvent(journalPath, { type: 'nodeSucceeded', nodeId: 'a', instanceId, attemptId, manifestPath: join(runDir, 'm.json') });
+      };
+      finish('a#001');
+      expect(edit(base, runId, [{ op: 'rerunNode', nodeId: 'a' }], 1)).toMatchObject({ kind: 'applied', revision: 2 });
+      finish('a#002');
+      return runDir;
+    }
+
+    it('the initiator\'s own turn adds one more and applies — recorded as theirs, with no grant card', () => {
+      const base = freshBase();
+      const runDir = spentRun(base, 'run-lift');
+      const out = edit(base, 'run-lift', [{ op: 'rerunNode', nodeId: 'a' }], 2);
+      expect(out).toMatchObject({ kind: 'applied', revision: 3 });
+      expect(out).not.toHaveProperty('rerunBudget');
+      const events = journal(runDir);
+      const granted = events.findIndex((event) => event.type === 'revisitBudgetGranted');
+      expect(events[granted]).toMatchObject({ sourceNodeId: 'a', toNodeId: 'a', by: INITIATOR, reason: 'rerunNode', revision: 3 });
+      expect(events[granted + 1]).toMatchObject({ type: 'dagRevised', revision: 3, effects: { rerun: ['a'] } });
+    });
+
+    it('the main bot\'s own turn is refused with the grant card instead', () => {
+      const base = freshBase();
+      const runDir = spentRun(base, 'run-lift-event');
+      expect(edit(base, 'run-lift-event', [{ op: 'rerunNode', nodeId: 'a' }], 2, mainBot))
+        .toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
+      expect(journal(runDir).some((event) => event.type === 'revisitBudgetGranted')).toBe(false);
+    });
+
+    it('a change of the initiator that waits for the card does not lift the budget', () => {
+      const base = freshBase();
+      const runDir = spentRun(base, 'run-lift-host');
+      expect(edit(base, 'run-lift-host', [{ op: 'rerunNode', nodeId: 'a' }, { op: 'addNode', node: HOST }], 2))
+        .toMatchObject({ kind: 'invalid', rerunBudget: { nodeId: 'a', tier: 'pair' } });
+      expect(journal(runDir).some((event) => event.type === 'revisitBudgetGranted')).toBe(false);
+    });
   });
 });

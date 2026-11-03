@@ -720,6 +720,10 @@ export interface V3RevisionPlan {
   effects: V3RevisionEffects;
   /** Conditional edges from already-done sources, resolved once now. */
   edges: Array<Extract<V3Event, { type: 'edgeResolved' }>>;
+  /** Rerun budget this revision lifts by itself (only when the planner was
+   *  allowed to — the initiator's own edit, M2 乙): one more revisit for
+   *  each, journaled as `revisitBudgetGranted` with the revision. */
+  budgetGrants: Array<{ nodeId: string; tier: 'pair' | 'run' }>;
   /** Blocked nodes to re-run: journaled as `nodeRetryRequested` right after
    *  the revision (attempt ids are allocated under the journal lock). */
   retries: Array<{
@@ -740,6 +744,10 @@ export interface PlanV3DagRevisionInput {
   patch: V3DagPatch;
   /** Every bot snapshot already approved for this run (frozen + revisions). */
   knownBots: ReadonlyMap<string, BotSnapshot>;
+  /** A `rerunNode` whose revisit budget is spent adds one more instead of
+   *  being refused (`plan.budgetGrants`). Set only for the initiator's own
+   *  turn, whose edits take effect without a confirmation card (M2 乙). */
+  liftSpentRerunBudget?: boolean;
   /** Injected for tests; defaults to reading the done node's manifest. */
   readProducts?: (nodeId: string) => V3DoneNodeProducts | undefined;
 }
@@ -922,6 +930,9 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
   const reassigned = new Map<string, { from?: string; to: string }>();
   const rerun = new Set<string>();
   let rerunBudget: V3RerunBudgetBlock | undefined;
+  const budgetGrants: V3RevisionPlan['budgetGrants'] = [];
+  /** The grants above, as events, so later ops of this patch see them. */
+  const liftedBudget: StoredEvent[] = [];
   /** Blocked nodes the patch asks to run again (rerunNode, or a reassign). */
   const retryBlocked = new Set<string>();
   const rerunBlockedOps = new Set<string>();
@@ -1093,8 +1104,15 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
           problems.push(`${where}: only goal nodes can be re-run (re-running a ${original.type} node would replay it)`);
           return;
         }
-        const budget = revisitBudgetStatus([...events], op.nodeId, op.nodeId);
-        if (!budget.ok) {
+        const budget = revisitBudgetStatus([...events, ...liftedBudget], op.nodeId, op.nodeId);
+        if (!budget.ok && input.liftSpentRerunBudget) {
+          budgetGrants.push({ nodeId: op.nodeId, tier: budget.tier });
+          liftedBudget.push({
+            type: 'revisitBudgetGranted',
+            ...(budget.tier === 'pair' ? { sourceNodeId: op.nodeId, toNodeId: op.nodeId } : {}),
+            by: 'planned',
+          } as StoredEvent);
+        } else if (!budget.ok) {
           problems.push(
             `${where}: 节点 "${op.nodeId}" 的重做额度已用完（${budget.tier === 'pair' ? '本节点' : '整个 run'}的 Revisit 额度）；` +
             '需要发起人在「追加重做额度」卡上同意后再提交这次修改',
@@ -1404,6 +1422,7 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
       touched: [...touched].filter((nodeId) => originalById.has(nodeId)),
       effects,
       edges,
+      budgetGrants,
       retries,
     },
   };

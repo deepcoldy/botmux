@@ -572,15 +572,13 @@ async function customBotRun(runId: string, nodes: unknown[], reject: (req: { nod
 }
 
 describe('the approved bot scope is the same for flow edits and 改派', () => {
-  it('a bot the initiator approved on a revision card can be picked on the blocked card, and the move goes through', async () => {
+  it('a bot a flow revision brought in can be picked on the blocked card, and the move goes through', async () => {
     const run = await blockedBotRun('rs-scope');
     expect(optionsOf(run.cards[0]!)).not.toContain('cli_x');
-    // A new bot needs the initiator's confirmation (M2) …
+    // The initiator's own change brings in a new bot directly (M2 乙) …
     expect(editRun(run.base, run.runId, [
       { op: 'addNode', node: { id: 'publish', type: 'goal', goal: 'publish', bot: 'cli_x', depends: ['write'], inputs: [] } },
-    ], 1)).toMatchObject({ kind: 'proposed', reasons: ['newBot'] });
-    expect(decideV3RevisionProposal({ baseDir: run.base, runId: run.runId, revision: 2, decision: 'approve', by: OWNER }))
-      .toMatchObject({ kind: 'approved' });
+    ], 1)).toMatchObject({ kind: 'applied' });
     // … after which it is part of the run's approved scope everywhere.
     const card = await cardFor(run, 'write');
     expect(optionsOf(card)).toContain('cli_x');
