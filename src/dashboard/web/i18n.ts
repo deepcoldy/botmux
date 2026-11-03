@@ -5,6 +5,17 @@ type DashboardMessages = Record<string, string>;
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
 const zh = {
+  "botDefaults.sgNaming": "专属群命名方式",
+  "botDefaults.sgNamingAi": "AI 摘要（默认）",
+  "botDefaults.sgNamingReuse": "复用 Agent 会话标题",
+  "botDefaults.sgNamingTruncate": "仅截断原文",
+  "botDefaults.sgNamingReuseHelp": "使用当前 Agent 发布的会话标题，不额外调用模型。标题未就绪时保留占位名；自动命名成功后不再追随修改。",
+  "botDefaults.sgNamingTruncateHelp": "只用首条消息的截断内容作为群名，不自动生成标题。",
+  "botDefaults.sgNamingAiHelp": "先创建占位群名，再独立生成简短摘要。Codex 使用隔离的标题调用。",
+  "botDefaults.sgNamingModel": "摘要模型（Codex）",
+  "botDefaults.sgNamingModelPlaceholder": "留空沿用 Bot 模型",
+  "botDefaults.sgNamingModelHelp": "填写该账号可用的轻量模型 ID，仅用于 AI 摘要。固定 low 推理，不加载用户 hooks、插件、MCP 或项目指令。",
+
   'app.name': 'botmux',
   'app.subtitle': '飞书 AI CLI 控制台',
   'nav.docs': '文档',
@@ -1741,6 +1752,8 @@ const zh = {
   'settings.sectionMultiTopic': '多话题协作',
   'settings.multiTopicEnable': '启用多话题协作',
   'settings.multiTopicEnableHelp': '默认开启。关闭后不再向 Agent 提供 botmux-orchestrate，并拒绝 botmux dispatch 新建子项目话题；向已有话题追加的 dispatch --into 仍可使用。下一个会话即生效，无需重启。',
+  'settings.multiTopicTaskTreeCard': '派发子任务时发送任务树卡片',
+  'settings.multiTopicTaskTreeCardHelp': '默认关闭。开启后，编排会话首次 botmux dispatch 会在本话题发一张任务树卡片，子话题接手、回报、完成、失败时原地更新；关闭则不发卡片、不写卡片记录，dispatch 行为与开启前一致。需先启用多话题协作。daemon 侧发卡/改卡约 2 秒内生效、无需重启；已在运行的会话内，沙箱 CLI 的派发时间戳判定自下一个新会话生效。',
   'settings.sectionGroupCreation': '群聊创建',
   'settings.groupNamePrefix': '/group 默认群名前缀',
   'settings.groupNamePrefixHelp': '仅作用于飞书斜杠命令 /group 和别名 /g；其他建群入口不受影响。清空并保存即可关闭，跨进程最多约 2 秒生效。',
@@ -4097,6 +4110,17 @@ const zh = {
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
+  'botDefaults.sgNaming': 'Dedicated group naming',
+  'botDefaults.sgNamingAi': 'AI summary (default)',
+  'botDefaults.sgNamingReuse': 'Reuse Agent session title',
+  'botDefaults.sgNamingTruncate': 'Truncate first message',
+  'botDefaults.sgNamingReuseHelp': 'Use the title published by the active Agent without another model call. Keep the placeholder until ready; stop after the first successful rename.',
+  'botDefaults.sgNamingTruncateHelp': 'Keep the truncated first message as the group name without generating a title.',
+  'botDefaults.sgNamingAiHelp': 'Create a placeholder, then generate a short summary. Codex uses an isolated title call.',
+  'botDefaults.sgNamingModel': 'Summary model (Codex)',
+  'botDefaults.sgNamingModelPlaceholder': 'Leave blank to use the Bot model',
+  'botDefaults.sgNamingModelHelp': 'Enter an available lightweight model ID for AI summaries. Uses low reasoning without user hooks, plugins, MCP or project instructions.',
+
   'app.name': 'botmux',
   'app.subtitle': 'Feishu AI CLI Control',
   'nav.docs': 'Docs',
@@ -5832,6 +5856,8 @@ const en: Record<keyof typeof zh, string> = {
   'settings.sectionMultiTopic': 'Multi-topic collaboration',
   'settings.multiTopicEnable': 'Enable multi-topic collaboration',
   'settings.multiTopicEnableHelp': 'On by default. Turning it off hides botmux-orchestrate from agents and refuses botmux dispatch when it would create a new sub-project topic. dispatch --into remains available for existing topics. Takes effect for the next session without a restart.',
+  'settings.multiTopicTaskTreeCard': 'Send a task-tree card when dispatching subtasks',
+  'settings.multiTopicTaskTreeCardHelp': 'Off by default. When on, an orchestrating session posts one task-tree card in its own topic on the first botmux dispatch and updates it in place as child topics are accepted, report, finish or fail. When off, no card and no card record are written and dispatch behaves as before. Requires multi-topic collaboration. Daemon-side card posting/patching follows the toggle within about 2 seconds, no restart; inside an already-running session, the sandboxed CLI dispatch-timestamp decision applies from the next new session.',
   'settings.sectionGroupCreation': 'Group Creation',
   'settings.groupNamePrefix': 'Default /group name prefix',
   'settings.groupNamePrefixHelp': 'Applies only to the Feishu /group slash command and its /g alias. Other creation paths are unchanged. Clear and save to disable; cross-process updates take up to about 2 seconds.',

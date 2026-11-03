@@ -73,6 +73,10 @@ export interface V3RunSnapshot {
   /** nodeId → larkAppId the node was reassigned to (latest `nodeReassigned`).
    *  Absent = the frozen bot snapshot's larkAppId. External executor only. */
   assignments: Map<string, string>;
+  /** Blocked instances a revision changed after their gate was passed: the
+   *  next retry runs as a fresh instance that must pass the gate again
+   *  (dagRevised effects.regate). Not persisted in STATE. */
+  regatePending?: ReadonlySet<string>;
 }
 
 // ─── Materialize (replay) ────────────────────────────────────────────────
@@ -99,6 +103,13 @@ export interface V3RunSnapshot {
  *                        current running attempt, that attempt's node goes
  *                        pending (gate approval kept) so the next attempt
  *                        dispatches to the new bot
+ *   dagRevised         → its effects: supersede (as nodeInstanceSuperseded,
+ *                        voided gate waits can no longer resolve), cancel
+ *                        (removed nodes; a cancelled blocked node unblocks
+ *                        the run), regate (drop a blocked node's approval:
+ *                        its next nodeRetryRequested becomes a fresh
+ *                        instance). retry / assign are records only — the
+ *                        nodeRetryRequested / nodeReassigned beside it apply
  *   nodeHandoffPrepared / Sent / Accepted / nodeStalled
  *                      → no node-status change: an external attempt is
  *                        `running` from its nodeDispatched; phase/deadlines
@@ -120,6 +131,8 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
   let blockedNodeId: string | undefined;
   let uncertainHostEffects: V3UncertainHostEffect[] | undefined;
   const cancelledAttempts = new Map<string, string | undefined>();
+  /** Instances whose gate approval a revision voided (effects.regate). */
+  const regateInstances = new Set<string>();
   const resolvedWaitIds = new Set<string>();
 
   const set = (id: string, status: V3NodeStatus, gateCleared?: boolean): void => {
@@ -151,6 +164,26 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
       // settle of the CURRENT effective instance → reflect on the node view.
       const prev = nodes.get(nodeId)!;
       nodes.set(nodeId, { ...prev, status });
+    }
+  };
+
+  /** Revisit refresh and flow-revision invalidation share one rule: the
+   *  instance is frozen, the node re-dispatches a fresh instance (gate
+   *  approval dropped), and a blocked run on that node re-opens. */
+  const supersedeInstance = (nodeId: string, instanceId: string): void => {
+    instances.set(instanceId, { status: 'superseded' });
+    // If the superseded instance was the node's live one, the node re-
+    // dispatches a fresh instance: drop effectiveInstanceId + gateCleared
+    // (constraint 6: the fresh instance must re-approve its gate) and go
+    // pending so decideNext re-dispatches.
+    if (nodes.get(nodeId)?.effectiveInstanceId === instanceId) {
+      nodes.set(nodeId, { status: 'pending' });
+    }
+    // A refresh during a blocked run re-opens scheduling (analogue of
+    // nodeRetryRequested / loopIterationGranted).
+    if (runStatus === 'blocked' && blockedNodeId === nodeId) {
+      runStatus = 'running';
+      blockedNodeId = undefined;
     }
   };
 
@@ -213,6 +246,9 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         attempts.set(e.instanceId ?? e.nodeId, e.attemptId); // constraint 3: key by instance when present
         break;
       case 'hostInputPrepared':
+        // A flow revision may supersede a host instance while its input is
+        // still being prepared; the late preparation must not revive it.
+        if (instances.get(e.instanceId)?.status === 'superseded') break;
         // Preparation reserves an attempt id but is not execution: no provider
         // call can start before hostEffectIntent. It DOES establish the
         // instance as the node's effective pending instance so a preparation
@@ -227,6 +263,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         break;
       case 'hostEffectIntent':
         if (instances.get(e.instanceId)?.status === 'cancelled') break;
+        if (instances.get(e.instanceId)?.status === 'superseded') break;
         recordInstance(e.nodeId, e.instanceId, 'running', true);
         attempts.set(e.instanceId, e.attemptId);
         break;
@@ -275,6 +312,19 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         else set(e.nodeId, 'blocked');
         break;
       case 'nodeRetryRequested':
+        if (e.instanceId && regateInstances.has(e.instanceId)) {
+          // A revision changed this blocked node after its gate was passed:
+          // whatever triggers the retry, it runs as a fresh instance that must
+          // pass the gate again (a gate is per instance), never on the old
+          // approval.
+          regateInstances.delete(e.instanceId);
+          supersedeInstance(e.nodeId, e.instanceId);
+          if (runStatus === 'blocked') {
+            runStatus = 'running';
+            blockedNodeId = undefined;
+          }
+          break;
+        }
         // Replay-correct unblock (codex blocker #1 of the blocked design):
         // the retry is a journal event, so a fresh materialize() yields
         // pending — NOT a memory-only patch that evaporates on next replay.
@@ -302,21 +352,59 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         // right after do the actual state change.  Recorded for replay /
         // dashboard "why did this node refresh".
         break;
-      case 'nodeInstanceSuperseded': {
-        instances.set(e.instanceId, { status: 'superseded' });
-        // If the superseded instance was the node's live one, the node re-
-        // dispatches a fresh instance: drop effectiveInstanceId + gateCleared
-        // (constraint 6: the fresh instance must re-approve its gate) and go
-        // pending so decideNext re-dispatches.
-        if (nodes.get(e.nodeId)?.effectiveInstanceId === e.instanceId) {
-          nodes.set(e.nodeId, { status: 'pending' });
+      case 'nodeInstanceSuperseded':
+        supersedeInstance(e.nodeId, e.instanceId);
+        break;
+      case 'dagRevised': {
+        // One journal line carries the new definition AND its invalidations
+        // (design §13.3/§13.4), so replay can never see one without the other.
+        const effects = e.effects;
+        for (const item of effects?.supersede ?? []) {
+          // A voided gate wait must never be resolved by a late card click.
+          if (item.waitId) resolvedWaitIds.add(item.waitId);
+          supersedeInstance(item.nodeId, item.instanceId);
         }
-        // A refresh during a blocked run re-opens scheduling (analogue of
-        // nodeRetryRequested / loopIterationGranted).
-        if (runStatus === 'blocked' && blockedNodeId === e.nodeId) {
+        for (const item of effects?.cancel ?? []) {
+          // Removed from the flow: neutral-cancel the exact live instance /
+          // attempt; its late settle stays audit-only (cancelledCovers) and a
+          // late gate click is ignored because the node is cancelled.
+          cancelledAttempts.set(item.instanceId ?? item.nodeId, item.attemptId);
+          if (item.instanceId) instances.set(item.instanceId, { status: 'cancelled' });
+          const prev = nodes.get(item.nodeId);
+          nodes.set(item.nodeId, {
+            status: 'cancelled',
+            ...(item.instanceId ?? prev?.effectiveInstanceId
+              ? { effectiveInstanceId: item.instanceId ?? prev?.effectiveInstanceId }
+              : {}),
+          });
+        }
+        // Removing the node the run is blocked on unblocks it (like a retry,
+        // so the next drive applies the downstream skip / fail rules, §13.3);
+        // removing some OTHER blocked node keeps the run blocked on the one
+        // still in the way — unblocking would only re-block and re-announce.
+        if (
+          runStatus === 'blocked' &&
+          (effects?.cancel ?? []).length > 0 &&
+          ((effects?.cancel ?? []).some((item) => item.nodeId === blockedNodeId) ||
+            ![...nodes.values()].some((state) => state.status === 'blocked'))
+        ) {
           runStatus = 'running';
           blockedNodeId = undefined;
         }
+        for (const item of effects?.regate ?? []) {
+          const prev = nodes.get(item.nodeId);
+          if (prev?.effectiveInstanceId !== item.instanceId) continue;
+          const { gateCleared: _dropped, ...rest } = prev;
+          nodes.set(item.nodeId, rest);
+          const instance = instances.get(item.instanceId);
+          if (instance) {
+            const { gateCleared: _instanceDropped, ...instanceRest } = instance;
+            instances.set(item.instanceId, instanceRest);
+          }
+          regateInstances.add(item.instanceId);
+        }
+        // `retry` / `assign` are records: their nodeRetryRequested /
+        // nodeReassigned (same lock) advance state.
         break;
       }
       case 'gateDispatched':
@@ -537,6 +625,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     loops,
     edges,
     assignments,
+    ...(regateInstances.size > 0 ? { regatePending: regateInstances } : {}),
   };
 }
 

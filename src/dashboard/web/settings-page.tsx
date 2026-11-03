@@ -114,7 +114,7 @@ interface DashboardSettings {
   workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   promptCache: PromptCacheConfig | null;
-  multiTopic: { enabled: boolean };
+  multiTopic: { enabled: boolean; taskTreeCard: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -299,7 +299,7 @@ function parseSettings(s: any): DashboardSettings {
         : 60,
     },
     promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
-    multiTopic: { enabled: s?.multiTopic?.enabled !== false },
+    multiTopic: { enabled: s?.multiTopic?.enabled !== false, taskTreeCard: s?.multiTopic?.taskTreeCard === true },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
@@ -1184,7 +1184,16 @@ export function SettingsBody(props: {
             checked={settings.multiTopic.enabled}
             disabled={dis || savingKey === 'multiTopic'}
             onChange={value => {
-              void props.onSave('multiTopic', { multiTopic: { enabled: value } }, s => ({ ...s, multiTopic: { enabled: value } }));
+              void props.onSave('multiTopic', { multiTopic: { enabled: value, taskTreeCard: settings.multiTopic.taskTreeCard } }, s => ({ ...s, multiTopic: { enabled: value, taskTreeCard: s.multiTopic.taskTreeCard } }));
+            }}
+          />
+          <ToggleRow
+            title={tr('settings.multiTopicTaskTreeCard')}
+            help={tr('settings.multiTopicTaskTreeCardHelp')}
+            checked={settings.multiTopic.taskTreeCard}
+            disabled={dis || !settings.multiTopic.enabled || savingKey === 'multiTopicTaskTreeCard'}
+            onChange={value => {
+              void props.onSave('multiTopicTaskTreeCard', { multiTopic: { enabled: settings.multiTopic.enabled, taskTreeCard: value } }, s => ({ ...s, multiTopic: { ...s.multiTopic, taskTreeCard: value } }));
             }}
           />
         </SettingsBlock>

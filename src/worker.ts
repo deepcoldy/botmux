@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
@@ -284,8 +285,7 @@ import {
 import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
-  isMultiTopicOrchestrationEnabled,
-  isWorkflowFeatureEnabled,
+  paneSwitchEnv,
   isRemoteAccessEnabled,
 } from './global-config.js';
 import { WORKFLOW_NODE_SESSION_ENV } from './workflows/session-kind.js';
@@ -1363,7 +1363,12 @@ async function syncFreshCodexNativeSessionTitle(
     }
 
     const semanticTitle = buildBotmuxLarkNativeSessionTitle(semanticCore);
-    if (semanticTitle === fallbackTitle) return;
+    if (semanticTitle === fallbackTitle) {
+      // The model confirmed the placeholder as a semantic title. Consumers
+      // such as session-group naming still need that successful result.
+      send({ type: 'native_session_title_generated', title: semanticTitle });
+      return;
+    }
     const semanticApplied = await applyCodexNativeSessionTitle(
       threadId,
       semanticTitle,
@@ -2555,6 +2560,7 @@ let busyPatternIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
 let persistCodexRunnerBuildOnReady = false;
+let pendingTopicEffortRestart: { attemptId: string; requested: TraexTopicEffortRestart; variant: 'standard' | 'max' } | undefined;
 let activeRestartAttemptId: string | undefined;
 /** Launch settings (cwd / env / model / larkToolBinding) the current restart
  *  window's replacement is built from. Reset when a window (owned restart or
@@ -7554,6 +7560,7 @@ const deploymentCancellationReceipts = new Map<string, (ok: boolean) => void>();
 /** Web terminal writes bypass daemon input routing. Persist withdrawal before
  * forwarding operator bytes through any terminal transport. */
 async function cancelDeploymentForTerminalInput(): Promise<boolean> {
+  if (nativeSessionForkPending()) return false;
   if (lastInitConfig?.cliId !== 'codex' || effectiveBackendType !== 'tmux'
     || lastInitConfig.adoptMode || lastInitConfig.codexRpcInput) return true;
   discardDeploymentContinuation();
@@ -10759,6 +10766,10 @@ function codexBridgeStartTimer(): void {
             resolveBySid: sid => resolveFileBridgePath('antigravity', { sessionId: sid }),
             resolveByPid: () => {
               const pid = currentAntigravityObservedPid();
+              const activeId = cliAdapter?.resolveActiveSessionId?.({ cliPid: pid });
+              // /fork retains the parent's fd. An active child with a lazy
+              // brain file must wait for that file, never bind the parent.
+              if (activeId) return resolveFileBridgePath('antigravity', { sessionId: activeId });
               return pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
             },
           });
@@ -10950,6 +10961,7 @@ function mtrBridgeIngest(): void {
 }
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
+  if (nativeSessionForkPending()) return;
   structuredBridgeDriverState = undefined;
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
@@ -11302,7 +11314,9 @@ function ensureAntigravityCotReader(cliSessionId: string): void {
 
 function armAntigravityCotForTurn(): void {
   if (lastInitConfig?.cliId !== 'antigravity') return;
-  let cid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  if (nativeSessionForkPending()) return;
+  let cid = cliAdapter?.resolveActiveSessionId?.({ cliPid: backend?.getChildPid?.() ?? undefined, cliCwd: lastInitConfig.workingDir })
+    ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
   if (!cid) {
     const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
     const effectivePid = pid ? (findLaunchedCliPid(pid, 'antigravity') ?? pid) : undefined;
@@ -14482,6 +14496,7 @@ function retireDoubaoBridgeTurnOnInterrupt(turnId: string | undefined, dispatchA
 }
 
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
+  if (nativeSessionForkPending()) return;
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
   // 中断类键按适配器归一。卡片「⏹ 停止」与 `/stop` 都硬编码发 ctrlc，但 ZCode
   // 单个 Ctrl+C 会退出整个进程（0.16.9 实测）——用户点「停止这一轮」却丢掉会话
@@ -14503,7 +14518,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
-  if (backend !== targetBackend || cliLifetimeNonce !== lifetime) return;
+  if (backend !== targetBackend || cliLifetimeNonce !== lifetime || nativeSessionForkPending()) return;
   const isHalfPage = key === 'half_page_up' || key === 'half_page_down';
 
   // Tmux copy-mode scroll (works around alternate-buffer scrollback limitation)
@@ -14539,10 +14554,11 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
     delivered = await runAfterAmbiguousSubmissionWrites(
       targetBackend,
       async () => {
+        if (nativeSessionForkPending()) return false;
         if (criticalInterrupt) {
           return sendCriticalControlKey(key, () => {
             // Never retry an old interrupt into a replacement CLI generation.
-            if (backend !== targetBackend) return true;
+            if (backend !== targetBackend || nativeSessionForkPending()) return true;
             return sendTermActionOnce(targetBackend, key);
           });
         }
@@ -14613,6 +14629,16 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
 async function handleExactTurnInterrupt(requestId: string, turnId: string): Promise<void> {
   if (turnId !== currentBotmuxTurnId) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
+    return;
+  }
+  // An interactive native fork has resumed the source conversation inside this
+  // process but the child identity is not confirmed yet. Every other human
+  // write entry is held in this window; an exact-turn interrupt is the
+  // dashboard route's sibling to term_action and must not inject Ctrl+C into
+  // the resumed source pane either. Report undelivered so the caller can retry
+  // after the fork settles (the queued turn itself stays intact).
+  if (nativeSessionForkPending()) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'fork_pending' });
     return;
   }
   // Codex App and codexRpcInput use the pane as a viewer while actual work is
@@ -14809,13 +14835,13 @@ async function handleTuiKeysDirect(
   keys: string[],
   isFinal: boolean,
 ): Promise<boolean> {
-  if (keys.length === 0) return false;
+  if (keys.length === 0 || nativeSessionForkPending()) return false;
   try {
     const delivered = await sendTuiKeySequence(
       targetBackend,
       keys,
       KEY_TO_ANSI,
-      { isCurrent: () => backend === targetBackend },
+      { isCurrent: () => backend === targetBackend && !nativeSessionForkPending() },
     );
     if (!delivered) {
       logError('handleTuiKeys write rejected or backend replaced');
@@ -14839,7 +14865,7 @@ async function handleTuiKeysDirect(
 }
 
 async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean> {
-  if (!backend || keys.length === 0) return false;
+  if (!backend || keys.length === 0 || nativeSessionForkPending()) return false;
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
@@ -14872,6 +14898,7 @@ let injectionFlushing = false;
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (nativeSessionForkPending()) return;
   if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (idleDetector?.isStartupPending()) return;
   // 不跨 restart 边界写入（与 flushPending 同款守卫）：destroySession 异步期间
@@ -14948,7 +14975,7 @@ async function flushPendingInjections(): Promise<void> {
  * auto-switches to text input mode as soon as a character is typed.
  */
 async function handleTuiTextInput(keys: string[], text: string): Promise<boolean> {
-  if (!backend || !cliAdapter) return false;
+  if (!backend || !cliAdapter || nativeSessionForkPending()) return false;
   const targetBackend = backend;
   const targetAdapter = cliAdapter;
   const lifetime = cliLifetimeNonce;
@@ -14965,7 +14992,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
         keys,
         text,
         keyToAnsi: KEY_TO_ANSI,
-        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter,
+        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter && !nativeSessionForkPending(),
         writeInput: async (target, content) => {
           const result = await targetAdapter.writeInput(target, content);
           if (targetBackend.captureAmbiguousSubmissionFence) {
@@ -17794,12 +17821,28 @@ function settleRestartAttemptOnReady(
     upgradeInFlight: !!codexAutoUpgrade,
   });
   if (receipt === 'emit') {
+    let topicEffort: Extract<WorkerToDaemon, { type: 'restart_result' }>['topicEffort'];
+    if (pendingTopicEffortRestart?.attemptId === activeRestartAttemptId) {
+      let current;
+      try { current = backend ? readTraexEffortComposer(captureBackendScreen(backend)) : undefined; } catch { current = undefined; }
+      const requested = pendingTopicEffortRestart.requested;
+      if (!current || current.model.toLowerCase() !== requested.model.toLowerCase() || current.effort !== requested.effort || current.variant !== pendingTopicEffortRestart.variant) {
+        send({ type: 'restart_result', attemptId: activeRestartAttemptId!, status: 'failed', category: 'spawn_failed' });
+        activeRestartAttemptId = undefined;
+        pendingTopicEffortRestart = undefined;
+        return;
+      }
+      topicEffort = { model: requested.model, effort: requested.effort, variant: current.variant };
+      pendingTopicEffortRestart = undefined;
+    }
+
     if (opts.republishPromptReady) send({ type: 'prompt_ready' });
     send({
       type: 'restart_result',
       attemptId: activeRestartAttemptId,
       status: 'succeeded',
       category: 'prompt_ready',
+      ...(topicEffort ? { topicEffort } : {}),
     });
     activeRestartAttemptId = undefined;
     return;
@@ -17809,6 +17852,46 @@ function settleRestartAttemptOnReady(
   } else {
     log(`${trigger} with no backend installed — deferring restart success receipt`);
   }
+}
+
+let nativeSessionForkInFlight: { backend: SessionBackend; generation: number } | undefined;
+
+function nativeSessionForkPending(): boolean {
+  return lastInitConfig?.forkSession === true && !!cliAdapter?.forkSessionAfterReady;
+}
+
+function holdForNativeSessionFork(): boolean {
+  if (!nativeSessionForkPending()) return false;
+  const target = backend;
+  const cfg = lastInitConfig;
+  const fork = cliAdapter?.forkSessionAfterReady;
+  if (!target || !cfg || !fork) return true;
+  const generation = cliSpawnGeneration;
+  if (nativeSessionForkInFlight?.backend === target && nativeSessionForkInFlight.generation === generation) return true;
+  nativeSessionForkInFlight = { backend: target, generation };
+  const current = () => backend === target && cliSpawnGeneration === generation && lastInitConfig === cfg
+    && (!cliRestartInProgress || replacementSpawnInProgress);
+  void Promise.resolve().then(async () => {
+    if (!cfg.cliSessionId) throw new Error('Cannot fork Antigravity without an exact source conversation');
+    const childId = await fork({
+      sourceSessionId: cfg.cliSessionId,
+      sendCommand: command => sendRawCommandLineWithRecoveryFence(target, command),
+      captureScreen: () => captureBackendScreen(target),
+      isCurrent: current,
+    });
+    if (!current()) return;
+    if (!childId || childId === cfg.cliSessionId) throw new Error('Native fork did not create an independent conversation');
+    cfg.forkSession = false;
+    lastSpawnEffectiveCliSessionId = childId;
+    persistCliSessionId(childId);
+    if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(childId);
+    nativeSessionForkInFlight = undefined;
+    log(`Native session fork confirmed: ${childId}`);
+    markPromptReady();
+  }).catch(error => {
+    if (current()) void sendFatalWorkerErrorAndExit(error);
+  });
+  return true;
 }
 
 function markPromptReady(): void {
@@ -17882,6 +17965,7 @@ function markPromptReady(): void {
     idleDetector?.reset();
     return;
   }
+  if (holdForNativeSessionFork()) return;
   stopBusyPatternIdleProbe();
   // Ready-gate: a startup selector's ❯ (cjadk et al.) falsely matches
   // readyPattern → the IdleDetector fires idle while the CLI is NOT actually at
@@ -18173,6 +18257,9 @@ function markPromptReady(): void {
 }
 
 function persistCliSessionId(cliSessionId: string): void {
+  // During an interactive fork the CLI temporarily resumes the parent. Its
+  // early PID/transcript observations must never acknowledge the pending fork.
+  if (nativeSessionForkPending()) return;
   const published = publishCliSessionIdToDaemon({
     cliSessionId,
     // Snapshot only worker-owned, durable local Codex roots. Never infer an
@@ -18282,12 +18369,14 @@ function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
   const maxAttempts = 60;
   const tick = () => {
     if (!backend || lastInitConfig?.cliId !== 'antigravity') return;
+    if (nativeSessionForkPending()) return;
     if (backend !== backendAtSpawn) return;
     const currentPid = backend.getChildPid?.();
     if (currentPid && currentPid !== pid) return;
 
     const realPid = findLaunchedCliPid(pid, 'antigravity') ?? pid;
-    const cid = findAntigravityConversationIdByPid(realPid);
+    const cid = cliAdapter?.resolveActiveSessionId?.({ cliPid: realPid })
+      ?? findAntigravityConversationIdByPid(realPid);
     if (cid) {
       if (lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid) {
         log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
@@ -18955,6 +19044,7 @@ function directRpcTurnBlocksTypeAhead(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  if (nativeSessionForkPending()) return;
   // Codex model-migration picker guard (startup only): the single admission
   // point runs before every other guard, so they are all evaluated after its
   // renderer drain; concurrent calls still serialize on isFlushing (no other
@@ -21763,8 +21853,13 @@ async function spawnCli(
     // BOTMUX_WORKFLOW_ENABLED and desync the remote CLI-side gate from the
     // daemon's authoritative decision. The daemon-side gate is unaffected either
     // way; this keeps the in-pane defense-in-depth honest on the riff path too.
-    mergedEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
-    mergedEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
+    // Host-resolved machine-wide switches (workflow / multi-topic / task-tree
+    // card) projected into the pane AFTER the merge so a stale/forged
+    // backendConfig.env cannot desync the CLI-side gates from the daemon.
+    // K2: the config→'true'/'false' mapping this applies is pinned by
+    // paneSwitchEnv's unit test (test/global-config.test.ts); these two
+    // Object.assign call sites are mechanical wiring with no spawn-level test.
+    Object.assign(mergedEnv, paneSwitchEnv());
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
@@ -23112,6 +23207,10 @@ async function spawnCli(
   if (fallBackToFresh && cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
     throw new Error(`Codex instance ${cfg.cliInstanceBinding.instanceId}: exact resume target unavailable; refusing fresh-session fallback`);
   }
+  if (cfg.forkSession && cliAdapter.forkSessionAfterReady
+    && (fallBackToFresh || !effectiveResume || !effectiveCliSessionId)) {
+    throw new Error('Antigravity fork source is unavailable; refusing to start an unrelated fresh conversation');
+  }
   if (fallBackToFresh) {
     const reason = tier2ForceFresh
       ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
@@ -23801,11 +23900,11 @@ async function spawnCli(
   const chatBotDiscovery = resolveChatBotDiscoveryConfig();
   childEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
   childEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
-  // Inject the resolved workflow kill-switch so a pane's `botmux workflow …`
-  // subcommand agrees with the daemon that spawned it, independent of stale
-  // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
-  childEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
-  childEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
+  // Inject the resolved workflow/multi-topic/task-tree-card kill-switches so a
+  // pane's subcommands agree with the daemon that spawned it, independent of
+  // stale rcfile/tmux env (mirrors the chatBotDiscovery injection above).
+  // K2: mapping pinned by paneSwitchEnv's unit test; this apply is wiring.
+  Object.assign(childEnv, paneSwitchEnv());
   if (cfg.workflowNodeSession === true) childEnv[WORKFLOW_NODE_SESSION_ENV] = '1';
   else delete childEnv[WORKFLOW_NODE_SESSION_ENV];
   if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
@@ -27848,7 +27947,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           });
 
           // Replay any input that arrived during the spawn window.
-          for (const data of pendingInput) cp.write(data);
+          if (!nativeSessionForkPending()) for (const data of pendingInput) cp.write(data);
           pendingInput.length = 0;
         };
 
@@ -27874,12 +27973,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
@@ -27943,7 +28042,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             clientPtys.delete(ws);
             if (ws.readyState === WebSocket.OPEN) ws.close();
           });
-          for (const data of pendingInput) cp.write(data);
+          if (!nativeSessionForkPending()) for (const data of pendingInput) cp.write(data);
           pendingInput.length = 0;
         };
 
@@ -27960,12 +28059,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
@@ -28072,12 +28171,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               lastWebTerminalInputAtMs = Date.now();
@@ -28088,7 +28187,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               }
               backend?.write(msg.data);
             } else if (msg.type === 'scroll' && typeof msg.data === 'string') {
-              if (!allowReadOnlyRemoteScroll || authedClients.has(ws)) return;
+              if (!allowReadOnlyRemoteScroll || authedClients.has(ws) || nativeSessionForkPending()) return;
               const parsed = parseReadOnlyRemoteScrollPayload(msg.data);
               if (!parsed) return;
               if (!readOnlyRemoteScrollLimiter.tryConsume(parsed.eventCount)) return;
@@ -31270,7 +31369,7 @@ process.on('message', async (raw: unknown) => {
       // start it can arrive while the CLI is still booting — before any flush
       // has proven the input box.
       const startupInputGateHolds = !firstWriteLivenessConfirmed
-        || startupCommandsInProgress || startupCommandAckHold !== null;
+        || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
@@ -31322,6 +31421,24 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
+      if (msg.topicEffort) {
+        let current;
+        try {
+          current = lastInitConfig && backend && isPromptReady && !cliRestartInProgress && !tmuxRestartTimer
+            && !isFlushing && !injectionFlushing && !commandLineWritesPending && !pendingMessages.length && !pendingRawInputs.length
+            && !sandboxBoolValue(lastInitConfig.sandbox) && !sandboxEnabled() && !lastInitConfig.readIsolation
+            && ['pty', 'tmux'].includes(lastInitConfig.backendType)
+            ? validateTraexTopicEffortRestart(lastInitConfig, msg.topicEffort, captureBackendScreen(backend)) : undefined;
+        } catch { current = undefined; }
+        if (!current || !msg.attemptId) {
+          if (msg.attemptId) send({ type: 'restart_result', attemptId: msg.attemptId, status: 'failed', category: 'spawn_failed', untouched: true });
+          break;
+        }
+        lastInitConfig!.reasoningEffort = msg.topicEffort.effort;
+        lastInitConfig!.modelBackendVariant = current.variant;
+        pendingTopicEffortRestart = { attemptId: msg.attemptId, requested: msg.topicEffort, variant: current.variant };
+      }
+
       if (codexAutoUpgrade?.stage === 'failed') {
         codexAutoUpgrade = undefined;
         cliRestartInProgress = false;
@@ -31442,7 +31559,7 @@ process.on('message', async (raw: unknown) => {
         // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
         // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
         // auto-restart 那条裸 restart 的计数兜底。
-        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir },
+        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort, ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}) },
       );
       break;
     }

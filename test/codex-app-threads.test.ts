@@ -3,6 +3,7 @@ import { freezeCodexCleanupLaunch } from '../src/core/codex-cleanup-launch.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync, realpathSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { parse } from 'smol-toml';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { waitForPidFile } from './helpers/pid-file.js';
 import {
@@ -33,7 +34,7 @@ function fakeCodexEnv(
 }
 
 describe('generateCodexAppThreadTitle', () => {
-  it('generates a structured semantic title in an isolated ephemeral thread', async () => {
+  it('generates an isolated semantic title through a launcher prefix', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-title-generate-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
@@ -41,7 +42,8 @@ describe('generateCodexAppThreadTitle', () => {
 
     const title = await generateCodexAppThreadTitle({
       sourceText: '请排查 image_safety 为什么没有返回错误码 12008',
-      codexBin: FAKE_CODEX,
+      codexBin: process.execPath,
+      codexArgs: [FAKE_CODEX],
       env: fakeCodexEnv(dir, {
         FAKE_CODEX_LOG: logPath,
         FAKE_CODEX_ENV_LOG: envLogPath,
@@ -130,7 +132,92 @@ describe('generateCodexAppThreadTitle', () => {
     const isolatedEnv = JSON.parse(readFileSync(envLogPath, 'utf8'));
     expect(isolatedEnv.codexHome).not.toBe(join(dir, 'source-codex-home'));
     expect(isolatedEnv.authExists).toBe(true);
+    // The source config here holds ONLY an `mcp_servers` entry — never
+    // whitelisted — so the isolated home must still have no config.toml.
     expect(isolatedEnv.configExists).toBe(false);
+    expect(isolatedEnv.configText).toBeNull();
+  });
+
+  it('inherits only the provider wiring from the Bot config and nothing else', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-title-provider-'));
+    tempDirs.push(dir);
+    const envLogPath = join(dir, 'env.json');
+    const sourceCodexHome = join(dir, 'source-codex-home');
+    mkdirSync(sourceCodexHome, { recursive: true });
+    writeFileSync(join(sourceCodexHome, 'auth.json'), '{}');
+    writeFileSync(join(sourceCodexHome, 'config.toml'), [
+      'model = "house-model-1"',
+      'model_reasoning_effort = "xhigh"',
+      'model_provider = "housegw"',
+      'approvals_reviewer = "user"',
+      'notify = ["echo", "hook"]',
+      '',
+      '[projects."/root/secret"]',
+      'trust_level = "trusted"',
+      '',
+      '[mcp_servers.dangerous]',
+      'command = "false"',
+      '',
+      '[model_providers.housegw]',
+      'name = "House"',
+      'base_url = "https://gw.example/v1"',
+      'wire_api = "responses"',
+      'requires_openai_auth = false',
+      '',
+      '[model_providers.housegw.http_headers]',
+      '"x-gw-key" = "inline-secret"',
+      '',
+      '[features]',
+      'hooks = true',
+    ].join('\n'));
+
+    const title = await generateCodexAppThreadTitle({
+      sourceText: '请排查支付链路超时',
+      codexBin: process.execPath,
+      codexArgs: [FAKE_CODEX],
+      env: { ...process.env, CODEX_HOME: sourceCodexHome, FAKE_CODEX_ENV_LOG: envLogPath },
+      timeoutMs: 5000,
+    });
+
+    expect(title).toBe('排查图片安全错误码');
+    const isolated = JSON.parse(readFileSync(envLogPath, 'utf8')) as { configText: string | null };
+    expect(isolated.configText).not.toBeNull();
+    const inherited = parse(isolated.configText!) as Record<string, unknown>;
+    // Exactly the three provider-wiring keys — no hooks, projects, trust,
+    // mcp_servers, features, notify or reasoning effort.
+    expect(Object.keys(inherited).sort()).toEqual(['model', 'model_provider', 'model_providers']);
+    expect(inherited.model).toBe('house-model-1');
+    expect(inherited.model_provider).toBe('housegw');
+    expect(inherited.model_providers).toEqual({
+      housegw: {
+        name: 'House',
+        base_url: 'https://gw.example/v1',
+        wire_api: 'responses',
+        requires_openai_auth: false,
+        http_headers: { 'x-gw-key': 'inline-secret' },
+      },
+    });
+  });
+
+  it('refuses to generate under codex defaults when the source config is unusable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-title-badtoml-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+    const sourceCodexHome = join(dir, 'source-codex-home');
+    mkdirSync(sourceCodexHome, { recursive: true });
+    writeFileSync(join(sourceCodexHome, 'auth.json'), '{}');
+    writeFileSync(join(sourceCodexHome, 'config.toml'), 'model = "unterminated\n[mcp_servers\n');
+
+    const title = await generateCodexAppThreadTitle({
+      sourceText: '排查登录失败',
+      codexBin: FAKE_CODEX,
+      env: { ...process.env, CODEX_HOME: sourceCodexHome, FAKE_CODEX_LOG: logPath },
+      timeoutMs: 5000,
+    });
+
+    expect(title).toBeUndefined();
+    // Fail closed BEFORE spawning: no app-server ran under the default provider.
+    expect(existsSync(logPath)).toBe(false);
   });
 
   it('returns undefined for invalid structured output', async () => {

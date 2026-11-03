@@ -238,7 +238,7 @@ import { DEFERRED_TOPIC_CLAIM_ROUTE, type DeferredTopicClaimResponse } from './c
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
-import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled } from './global-config.js';
+import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled, isDispatchTaskTreeCardEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
   DASHBOARD_READY_WAIT_MS,
@@ -436,7 +436,10 @@ import {
   describePluginDependencyError,
   enabledPluginDependents,
 } from './core/plugins/dependencies.js';
-import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
+import {
+  authorizeV3DaemonCommand,
+  authorizeV3RunEditCommand,
+} from './workflows/v3/cli-daemon-command-authority.js';
 import {
   findOnlineDaemon,
   listOnlineDaemons as listOnlineDaemonsIn,
@@ -6946,7 +6949,7 @@ function authorizeWorkflowDaemonCommand(runId: string, rest: string[]): string {
  */
 async function tryWorkflowSessionRelayMutation(
   runId: string,
-  mutation: WorkflowDaemonMutation,
+  mutation: WorkflowDaemonMutation | 'status',
   body?: Record<string, unknown>,
 ): Promise<WorkflowDaemonMutationResponse | null> {
   const context = readWorkflowSessionRelayContext({
@@ -7181,6 +7184,112 @@ async function cmdWorkflowStart(runId: string | undefined, rest: string[]): Prom
     process.exit(1);
   }
   console.log(`✅ v3 run "${runId}" 已交 daemon 驱动；humanGate 会在话题里弹审批卡，点了才继续。`);
+}
+
+/** `botmux workflow status <runId>` — the main bot reads the run's effective
+ *  flow revision, node states, attempts and pending proposal (design §13.1).
+ *  Same main-session turn authentication as `workflow edit`. */
+async function cmdWorkflowStatusV3(runId: string | undefined, rest: string[]): Promise<void> {
+  const { V3_RUN_STATUS_USAGE } = await import('./cli/v3-run-edit.js');
+  if (!runId) {
+    console.error(V3_RUN_STATUS_USAGE);
+    process.exit(1);
+  }
+  const { projectV3RunStatus, formatV3RunStatus } = await import('./workflows/v3/run-edit.js');
+  const { defaultBaseDir: defaultV3BaseDir } = await import('./workflows/v3/grill-state.js');
+  // An isolated main session cannot read the run directory: ask the daemon,
+  // which authenticates the session from its own live record.
+  const relayed = await tryWorkflowSessionRelayMutation(runId, 'status');
+  if (relayed) {
+    let body: { ok?: boolean; status?: Parameters<typeof formatV3RunStatus>[0] } = {};
+    try { body = JSON.parse(relayed.bodyRaw) as typeof body; } catch { /* reported below */ }
+    if (!relayed.ok || !body.status) {
+      console.error(`❌ status 失败 (HTTP ${relayed.status}): ${relayed.bodyRaw}`);
+      process.exit(1);
+    }
+    console.log(rest.includes('--json') ? JSON.stringify(body.status, null, 2) : formatV3RunStatus(body.status));
+    return;
+  }
+  try {
+    authorizeV3RunEditCommand({
+      runId,
+      dataDir: resolveDataDir(),
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+    const view = projectV3RunStatus(defaultV3BaseDir(), runId);
+    console.log(rest.includes('--json') ? JSON.stringify(view, null, 2) : formatV3RunStatus(view));
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+/** `botmux workflow edit <runId> --patch-file <f|-> --base <N>` — one atomic
+ *  list of ops (design §13.2). The CLI authenticates the current turn against
+ *  the run's main session; the owning daemon decides (under the journal lock)
+ *  whether it applies directly or waits for the initiator (M1/M2). */
+async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Promise<void> {
+  const {
+    V3_RUN_EDIT_USAGE,
+    formatV3RunEditResponse,
+    parseV3RunEditCliOptions,
+    readV3RunEditPatch,
+  } = await import('./cli/v3-run-edit.js');
+  if (!runId) {
+    console.error(V3_RUN_EDIT_USAGE);
+    process.exit(1);
+  }
+  const parsed = parseV3RunEditCliOptions(rest);
+  if (!parsed.ok) {
+    console.error(`❌ ${parsed.error}`);
+    console.error(V3_RUN_EDIT_USAGE);
+    process.exit(1);
+  }
+  let response: WorkflowDaemonMutationResponse;
+  let patch: unknown;
+  try {
+    patch = readV3RunEditPatch(parsed.patchFile);
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  // Isolated main session → session relay (the daemon derives the caller).
+  const relayed = await tryWorkflowSessionRelayMutation(runId, 'edit', { patch, base: parsed.base });
+  if (relayed) {
+    response = relayed;
+  } else try {
+    const authority = authorizeV3RunEditCommand({
+      runId,
+      dataDir: resolveDataDir(),
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+    const daemon = findDaemon(authority.larkAppId);
+    if (!daemon) {
+      console.error('❌ 没有在线 daemon；运行中修改需要拥有该 run 的 daemon 执行。');
+      process.exit(1);
+    }
+    response = await postWorkflowDaemonMutation({
+      daemon,
+      runId,
+      mutation: 'edit',
+      body: {
+        patch,
+        base: parsed.base,
+        caller: { openId: authority.callerOpenId, origin: authority.origin },
+      },
+    });
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  if (parsed.json) {
+    console.log(response.bodyRaw);
+    if (!response.ok) process.exit(1);
+    return;
+  }
+  const out = formatV3RunEditResponse(runId, response);
+  (out.exitCode === 0 ? console.log : console.error)(out.text);
+  if (out.exitCode !== 0) process.exit(out.exitCode);
 }
 
 /** `botmux workflow retry <runId> [--node <id>]` — blocked 节点重试入口（CLI 侧）。
@@ -7724,6 +7833,9 @@ ${SEND_HELP_BODY}
   workflow cancel <runId> [--reason <text>] [--bot <larkAppId>]
                                        持久化取消 v3 run 并中断活动节点
   workflow retry|grant [...]           处理受阻节点 / loop
+  workflow status <runId> [--json]     查看运行中流程的当前版本、节点状态和待确认修改
+  workflow edit <runId> --patch-file <文件|-> --base <版本>
+                                       运行中按版本修改流程（越界修改转发起人确认）
   template migrate-v3 [id|path ...] [--all] [--commit ...]
                                        v2 定义迁移：默认 dry-run，写入需显式 owner/app/scope
   template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]
@@ -14657,7 +14769,7 @@ async function trySyncDispatchTaskTree(input: {
   taskId?: string;
   taskUrl?: string;
   originClaim?: ManagedOriginCapabilityClaim | null;
-}): Promise<{ ok: boolean; text?: string; messageId?: string | null; error?: string }> {
+}): Promise<{ ok: boolean; enabled?: boolean; hint?: string; text?: string; messageId?: string | null; error?: string }> {
   try {
     const response = await postCurrentSessionDaemonRoute({
       path: `/api/sessions/${encodeURIComponent(input.sessionId)}/dispatch-tree`,
@@ -14671,8 +14783,19 @@ async function trySyncDispatchTaskTree(input: {
       },
       ...(input.originClaim !== undefined ? { originClaim: input.originClaim } : {}),
     });
-    const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; text?: string; messageId?: string | null };
-    if (response.ok && body.ok) return { ok: true, ...(body.text !== undefined ? { text: body.text } : {}), messageId: body.messageId ?? null };
+    const body = await response.json().catch(() => ({})) as {
+      ok?: boolean; enabled?: boolean; hint?: string;
+      error?: string; text?: string; messageId?: string | null;
+    };
+    if (response.ok && body.ok) {
+      return {
+        ok: true,
+        ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+        ...(body.hint ? { hint: body.hint } : {}),
+        ...(body.text !== undefined ? { text: body.text } : {}),
+        messageId: body.messageId ?? null,
+      };
+    }
     return { ok: false, error: body.error ?? `HTTP ${response.status}` };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -14681,6 +14804,10 @@ async function trySyncDispatchTaskTree(input: {
 
 /** Best effort after a dispatch: the task tree is a view, never a reason to fail it. */
 async function syncDispatchTaskTreeAfterDispatch(input: Parameters<typeof trySyncDispatchTaskTree>[0]): Promise<void> {
+  // Default-off: skip even the local best-effort IPC so a disabled feature
+  // adds no dispatch-time call at all (the daemon gate is authoritative; this
+  // runs host-side or in a pane with the spawn-time env value).
+  if (!isDispatchTaskTreeCardEnabled()) return;
   const result = await trySyncDispatchTaskTree(input);
   if (!result.ok) console.error(`⚠️  子任务已派发，但任务树卡片更新失败: ${result.error}`);
 }
@@ -14693,7 +14820,8 @@ async function cmdDispatchTree(rest: string[]): Promise<void> {
   botmux dispatch tree [--task-id <需求id>] [--task-url <需求链接>] [--session-id <id>]
 
 说明:
-  首次 dispatch 后卡片会自动发到本会话所在话题，子话题接手、回报、完成、失败时原地更新；
+  任务树卡片默认关闭，先在 Dashboard「全局设置 → 多话题编排 → 任务树卡片」开启。
+  开启后首次 dispatch 卡片会自动发到本会话所在话题，子话题接手、回报、完成、失败时原地更新；
   这个命令只用于手动刷新。--task-id / --task-url 会记到卡片头部（之后的刷新沿用）。`);
     return;
   }
@@ -14735,6 +14863,13 @@ async function cmdDispatchTree(rest: string[]): Promise<void> {
   if (!result.ok) {
     console.error(`任务树刷新失败: ${result.error}`);
     process.exit(1);
+  }
+  // Default-off: the daemon (the only side that can read the host config in a
+  // sandbox) tells the CLI what to say; exit 0 so orchestration scripts that
+  // call this for a refresh do not treat "feature off" as a failure.
+  if (result.enabled === false) {
+    console.log(result.hint ?? '任务树卡片当前未开启。');
+    return;
   }
   console.log(result.text ?? '');
   console.log(result.messageId ? `\n卡片: ${result.messageId}` : '\n还没有派发记录，没有发卡片。');
@@ -14986,6 +15121,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const dispatchOriginClaim = freezeDispatchOriginClaim(sid);
   // Taken before anything is sent: a child's report from this attempt is never older.
   const dispatchAttemptStartedAt = new Date().toISOString();
+  // attemptAt only feeds the task-tree card (reportIsCurrent). With the card
+  // off (the default) skip writing it so dispatch registry entries stay
+  // byte-identical to the pre-card build. These persist sites run on the host
+  // re-exec (sandboxed --bot-app / credential-only dispatch is re-launched by
+  // the watcher before reaching them), where the global config is readable.
+  const taskTreeAttemptStartedAt = isDispatchTaskTreeCardEnabled()
+    ? dispatchAttemptStartedAt
+    : undefined;
   const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
@@ -15331,7 +15474,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       const receiptState = await persistDispatchLifecycle({
         dispatchRoot: intoRoot,
         sourceSessionId: sid,
-        attemptStartedAt: dispatchAttemptStartedAt,
+        attemptStartedAt: taskTreeAttemptStartedAt,
         status: lifecycleStatus,
         transportState: 'dispatched',
         acceptanceState,
@@ -15469,7 +15612,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const receiptState = await persistDispatchLifecycle({
       dispatchRoot: seedId,
       sourceSessionId: sid,
-      attemptStartedAt: dispatchAttemptStartedAt,
+      attemptStartedAt: taskTreeAttemptStartedAt,
       status: lifecycleStatus,
       transportState: 'dispatched',
       acceptanceState,
@@ -15539,7 +15682,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       receiptState = await persistDispatchLifecycle({
         dispatchRoot: dispatchRootForLifecycle,
         sourceSessionId: sid,
-        attemptStartedAt: dispatchAttemptStartedAt,
+        attemptStartedAt: taskTreeAttemptStartedAt,
         status: 'failed',
         transportState: 'failed',
         acceptanceState: 'failed',
@@ -19017,6 +19160,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'retry',
     'grant',
     'cancel',
+    'edit',
   ]);
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
   const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
@@ -20308,6 +20452,16 @@ switch (command) {
     if (wfSub === 'grant') {
       // v3 exhausted-loop grant (+1 iteration).
       await cmdWorkflowGrant(process.argv[4], process.argv.slice(5));
+      break;
+    }
+    if (wfSub === 'status') {
+      // v3 runtime flow status for the main bot (design §13.1).
+      await cmdWorkflowStatusV3(process.argv[4], process.argv.slice(5));
+      break;
+    }
+    if (wfSub === 'edit') {
+      // v3 runtime flow edit (design §13.2).
+      await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
       break;
     }
     const { cmdWorkflow } = await import('./cli/workflow.js');

@@ -1271,37 +1271,9 @@ describe('external goal nodes — review regressions', () => {
     expect(run.events()).toHaveLength(before);
   });
 
-  it('M17: a reassignment planned while idle refuses an attempt dispatched before its lock', async () => {
-    const run = new BotRun(twoBotDag('rv-reassign-idle-open'));
-    const executor = new FakeExecutor();
-    await run.drive(executor);
-    await run.submit(run.openAttempt('write').attemptId, { files: [{ key: 'report', data: Buffer.from('ok') }] });
-    // `spare` is pending; a concurrent drive dispatches it mid-reassignment.
-    const frozen = new Map([
-      ['cli_a', { larkAppId: 'cli_a', cliId: 'claude-code' as const, workingDir: '/tmp' }],
-      ['cli_b', { larkAppId: 'cli_b', cliId: 'claude-code' as const, workingDir: '/tmp' }],
-    ]);
-    let concurrentDispatch: (() => void) | undefined = () => {
-      appendEvent(run.journalPath, {
-        type: 'nodeDispatched', nodeId: 'spare', instanceId: 'spare#001', attemptId: 'spare#001/attempts/001', nodeExecutor: 'bot',
-      });
-    };
-    const racing = new Map(frozen);
-    racing.get = (key: string) => {
-      const write = concurrentDispatch;
-      concurrentDispatch = undefined;
-      write?.();
-      return frozen.get(key);
-    };
-    const outcome = await reassignNode(run.runDir, { nodeId: 'spare', toLarkAppId: 'cli_a', by: 'ou' }, {
-      ...run.ctx(),
-      botSnapshots: racing,
-      executor,
-    });
-    expect(outcome).toEqual({ kind: 'rejected', reason: 'stale-attempt' });
-    expect(run.of('nodeReassigned')).toEqual([]);
-    expect(executor.stops).toEqual([]);
-  });
+  // M17 (a reassignment planned while idle vs. a dispatch landing before its
+  // lock) lives in v3-reassign-lock-race.test.ts: it injects the race at the
+  // journal lock, so it also covers runs whose bot set a flow revision grew.
 
   it('M15: an acceptance time in the future is clamped to now', async () => {
     const run = new BotRun(reportDag('rv-accept-clamp'));

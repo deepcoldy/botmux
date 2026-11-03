@@ -211,7 +211,7 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig } from '../global-config.js';
+import { readGlobalConfig, isDispatchTaskTreeCardEnabled } from '../global-config.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -3874,6 +3874,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
 
 // ─── 编排任务树卡片 ──────────────────────────────────────────────────────────
 
+/** Shown (via the CLI) when the default-off task-tree card is invoked while
+ *  disabled. Produced by the daemon because sandboxed/read-isolated CLIs cannot
+ *  read the host global config themselves. */
+const DISPATCH_TASK_TREE_DISABLED_HINT = '任务树卡片默认关闭：在 Dashboard「全局设置 → 多话题编排 → 任务树卡片」开启，或设 BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=true。';
+
 const dispatchTaskTreeCards = createDispatchTaskTreeCards({
   dataDir: () => config.session.dataDir,
   listSessions: roots => listDispatchTreeSessionRows(roots, config.session.dataDir),
@@ -3915,6 +3920,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/dispatch-tree', async (req, res, para
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
   if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  // Default-off feature gate (3.2(c)): when off, behave exactly as the
+  // pre-card build — no entry label write, no card record file, no post/patch.
+  if (!isDispatchTaskTreeCardEnabled()) {
+    return jsonRes(res, 200, { ok: true, enabled: false, hint: DISPATCH_TASK_TREE_DISABLED_HINT, text: '', messageId: null, posted: false, nodes: 0 });
+  }
   const requirement = taskTreeRequirement(body);
   try {
     const dispatchRoot = typeof body?.dispatchRoot === 'string' ? body.dispatchRoot : '';
@@ -3926,7 +3936,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/dispatch-tree', async (req, res, para
       });
     }
     const result = await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds), requirement ? { requirement } : {});
-    return jsonRes(res, 200, { ok: true, text: result.text, messageId: result.messageId ?? null, posted: result.posted, nodes: result.tree.nodes.length });
+    return jsonRes(res, 200, { ok: true, enabled: true, text: result.text, messageId: result.messageId ?? null, posted: result.posted, nodes: result.tree.nodes.length });
   } catch (error) {
     return jsonRes(res, 502, { ok: false, error: ipcErrorText(error) });
   }
@@ -3941,9 +3951,13 @@ ipcRoute('POST', '/api/dispatch-tree/refresh', async (req, res) => {
   const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
   if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  // Default-off: no card refresh (and no card record write) when disabled.
+  if (!isDispatchTaskTreeCardEnabled()) {
+    return jsonRes(res, 200, { ok: true, enabled: false, hint: DISPATCH_TASK_TREE_DISABLED_HINT, messageId: null, posted: false });
+  }
   try {
     const result = await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds));
-    return jsonRes(res, 200, { ok: true, messageId: result.messageId ?? null, posted: result.posted });
+    return jsonRes(res, 200, { ok: true, enabled: true, messageId: result.messageId ?? null, posted: result.posted });
   } catch (error) {
     return jsonRes(res, 502, { ok: false, error: ipcErrorText(error) });
   }
@@ -9924,6 +9938,43 @@ ipcRoute('POST', '/api/session-group-tag-auth', requireBoundBot(async (_req, res
 // GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）+ 标签名。
 // tagName = 用户配置的自定义名（没配就是空串）；defaultTagName = 留空时实际生效的
 // 默认名「<bot 显示名>会话」，Dashboard 拿它做输入框 placeholder。
+/** Read the per-bot group naming policy; absence retains the existing AI-summary default. */
+ipcRoute('GET', '/api/session-group-naming-config', requireBoundBot(async (_req, res) => {
+  const naming = getBot(cachedLarkAppId).config.sessionGroup?.naming;
+  jsonRes(res, 200, { ok: true, mode: naming?.mode ?? 'ai-summary', model: naming?.model ?? '' });
+}));
+
+/** Persist a validated naming mode/model while retaining unrelated session-group settings. */
+ipcRoute('PUT', '/api/session-group-naming-config', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ mode?: unknown; model?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  if (!body || Array.isArray(body) || typeof body.mode !== 'string' || !['ai-summary', 'session-title', 'truncate'].includes(body.mode)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  }
+  const mode = body.mode as 'ai-summary' | 'session-title' | 'truncate';
+  if (body.model !== undefined && (typeof body.model !== 'string' || body.model.length > 200 || /[\u0000-\u001f]/.test(body.model))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_model' });
+  }
+  try {
+    const bot = getBot(cachedLarkAppId);
+    const result = await rmwBotEntry(cachedLarkAppId, entry => {
+      const group = (entry.sessionGroup ?? {}) as import('../bot-registry.js').SessionGroupConfig;
+      const naming = { ...group.naming, mode };
+      if (typeof body.model === 'string') {
+        if (body.model.trim()) naming.model = body.model.trim();
+        else delete naming.model;
+      }
+      entry.sessionGroup = { ...group, naming };
+      return { write: true, result: naming };
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    bot.config.sessionGroup = { ...bot.config.sessionGroup, naming: result.result };
+    jsonRes(res, 200, { ok: true, mode: result.result.mode, model: result.result.model ?? '' });
+  } catch (error: unknown) {
+    jsonRes(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}));
+
 ipcRoute('GET', '/api/session-group-tag-status', requireBoundBot(async (_req, res) => {
   try {
     const cfg = getBot(cachedLarkAppId).config;

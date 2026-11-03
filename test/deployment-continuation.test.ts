@@ -190,6 +190,7 @@ it.each(['ok', 'failed', 'timeout'])('Web terminal waits for durable cancellatio
     inflightInputs: { retireTurn: vi.fn() }, deploymentCancellationReceipts: new Map(),
     randomBytes: () => ({ toString: () => 'request-fixture' }), send };
   scope.discardDeploymentContinuation = loadWorkerFunction('discardDeploymentContinuation', scope);
+  scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
   const cancel = loadWorkerFunction<() => Promise<boolean>>('cancelDeploymentForTerminalInput', scope);
   const result = cancel().then(ok => { if (ok) writes(); });
   expect(writes).not.toHaveBeenCalled(); expect(scope.pendingMessages).toEqual([]);

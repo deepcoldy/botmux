@@ -80,6 +80,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
+  { name: '/models', sessionPolicy: 'sessionless', help: ['help.models'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
   {
     name: '/rewind', sessionPolicy: 'existingOnly', help: ['help.rewind'],

@@ -113,7 +113,7 @@ v2 资产离线处理: botmux template <migrate-v3|archive-runs>
 `);
     return;
   }
-  console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|cancel|retry|grant> [...]
+  console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|cancel|retry|grant|status|edit> [...]
 
 Saved Workflow:
   save [last|runId] [名称] [--workflow-id <chat-scope-id>]
@@ -124,6 +124,10 @@ Saved Workflow:
 即兴 Workflow:
   new / spec-finalize / approve-spec / architect / approve-dag / start
   cancel <runId> [--reason <text>] [--bot <larkAppId>]
+
+运行中修改（仅 run 主会话）:
+  status <runId> [--json]
+  edit <runId> --patch-file <文件|-> --base <版本> [--json]
 
 v2 资产离线处理: botmux template <migrate-v3|archive-runs>
 `);

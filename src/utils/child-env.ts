@@ -476,6 +476,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Host-resolved multi-topic orchestration switch. Managed panes must not
   // inherit a stale value from a co-tenant tmux server.
   'BOTMUX_MULTI_TOPIC_ENABLED',
+  // Same for the dispatch task-tree card switch: a file-sandboxed CLI cannot
+  // read ~/.botmux/config.json, so the daemon must project the resolved value.
+  'BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED',
   'BOTMUX_READY_COMMAND',
   // Structured end-of-turn idle report command, injected per session for
   // adapters that opt in (dsh-tui). Not a credential and not fatal when absent.

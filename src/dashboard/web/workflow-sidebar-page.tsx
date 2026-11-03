@@ -193,7 +193,7 @@ function VerticalDag(props: {
         {layout.edges.map((edge) => (
           <path
             key={`${edge.fromId}->${edge.toId}`}
-            className={`v3r-edge${edge.live ? ' live' : ''}`}
+            className={`v3r-edge${edge.live ? ' live' : ''}${edge.pending ? ' pending' : ''}`}
             d={`M${edge.x1},${edge.y1} C${edge.x1},${edge.my} ${edge.x2},${edge.my} ${edge.x2},${edge.y2}`}
             markerEnd="url(#wfs-arrow)"
           />
