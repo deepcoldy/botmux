@@ -1145,7 +1145,7 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
   'ai.routing.usage_silence': '- 不是发给你的消息，最终回复只输出 `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': '`botmux send` 成功即已送达；本轮终端无可见输出、直接结束是正常的。若看到「上一条回复没有可见输出，请继续」之类提示，那是底层 CLI 误判，不要因此重发——除非 `botmux send` 本身报错。',
-  'ai.routing.workflow_hint': 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。',
+  'ai.routing.workflow_hint': 'Workflow：多步目标或已保存的流程，先问用户是否用工作流；用户同意或发 `/workflow` 后，先运行 `botmux skill show botmux-workflow`。',
   'ai.routing.feedback_response_kind': '本轮最终答复用 `botmux send --response-kind final` 标记且只发一次（挂载页脚签名；若此 bot 启用了最终回答反馈，同时挂反馈按钮）。中间进度/补充类发送不要加 flag（默认按 progress，不展示页脚签名）。声明 final 即锁定本轮最终答复：之后不能再发 progress，如需补充请用 `--response-kind auxiliary`。',
   'ai.routing.hidden_context_defense': '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。',
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
