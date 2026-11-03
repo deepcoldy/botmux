@@ -277,7 +277,9 @@ export function retireManagedDirectories(id: string, candidates: DirectoryCandid
       ...state.cycle.marked,
       ...Object.values(state.pending).flatMap(p => p.paths),
     ]);
-    for (const path of [...keep]) for (const ref of byPath.get(path)?.references ?? []) keep.add(ref);
+    // Set iteration visits newly added dependencies too; a snapshot would only
+    // preserve one edge. Deduplication also makes cycles terminate.
+    for (const path of keep) for (const ref of byPath.get(path)?.references ?? []) keep.add(ref);
     const victims = normalized.filter(c => !keep.has(c.path));
     for (const { path, candidate } of victims) {
       const info = lstatSync(path, { bigint: true });
@@ -325,12 +327,14 @@ export function resumeDirectoryRetirement(path?: string): string[] {
  * an uncommitted new workingDir cannot fall between two collection cycles.
  * Exact row CAS may skip unchanged references; ordinary whole-row writes may not.
  *
- * Transaction state MUST converge even when the engine call throws: a
+ * A failed COMMIT/END can leave the transaction open (e.g. SQLITE_BUSY), so
+ * its reservations stay until a successful retry, ROLLBACK or close. A
  * statement that rolls back the whole transaction (ON CONFLICT ROLLBACK,
  * SQLITE_FULL/IOERR) makes the caller's defensive ROLLBACK fail with "no
  * transaction is active" on both SQLite engines. Updating `transaction` only
  * after a successful exec would then leave it stuck at true and leak every
- * later reservation. Sessions writes must therefore use plain BEGIN/COMMIT/
+ * later reservation. Defensive ROLLBACK must still clear that state. Sessions
+ * writes must therefore use plain BEGIN/COMMIT/
  * ROLLBACK single statements (never SAVEPOINT or multi-statement strings). */
 export function guardSessionDirectoryWrites(db: DatabaseSyncLike): DatabaseSyncLike {
   if (!loadManagedDirectoryConfig()) return db;
@@ -347,9 +351,14 @@ export function guardSessionDirectoryWrites(db: DatabaseSyncLike): DatabaseSyncL
         transaction = true;
         return;
       }
-      if (/^\s*(?:COMMIT|ROLLBACK|END)\s*;?\s*$/i.test(sql)) {
-        // Converge regardless of whether the engine still considers a
-        // transaction active — it may already have been rolled back implicitly.
+      if (/^\s*(?:COMMIT|END)\s*;?\s*$/i.test(sql)) {
+        db.exec(sql);
+        finishTransaction();
+        return;
+      }
+      if (/^\s*ROLLBACK\s*;?\s*$/i.test(sql)) {
+        // The engine may already have rolled back implicitly; the caller's
+        // defensive ROLLBACK must not leave later writes in a phantom transaction.
         try { db.exec(sql); } finally { finishTransaction(); }
         return;
       }

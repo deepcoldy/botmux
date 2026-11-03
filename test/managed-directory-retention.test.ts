@@ -71,6 +71,19 @@ describe('managed directory write barrier', () => {
     expect(existsSync(a) && existsSync(b)).toBe(true);
   });
 
+  it('retains the full dependency closure including cycles regardless of candidate order', () => {
+    const c = join(assets, 'c'.repeat(40)); mkdirSync(c);
+    const unused = join(assets, 'd'.repeat(40)); mkdirSync(unused);
+    const id = beginDirectoryCollection();
+    const done = reserveManagedDirectories({ workingDir: a }); done();
+    const retired = retireManagedDirectories(id, [
+      candidate(unused), candidate(c, [a]), candidate(b, [c]), candidate(a, [b]),
+    ], []);
+    expect(retired).toHaveLength(1);
+    expect(existsSync(unused)).toBe(false);
+    expect([a, b, c].every(path => existsSync(path))).toBe(true);
+  });
+
   it('registers authoritative schedule DB commits and edit-time reference deltas', () => {
     const APP = 'cli_app_retention';
     const store = ScheduleAuthorityStore.open(join(root, 'data'));
@@ -236,6 +249,31 @@ describe('managed directory write barrier', () => {
     expect(retireManagedDirectories(beginDirectoryCollection(), [candidate(a)], [])).toHaveLength(1);
   });
 
+  it.each(['COMMIT', 'END'])('keeps uncommitted references protected when %s is busy and then retried', (end) => {
+    const path = join(root, 'busy-commit.db');
+    const db = guardSessionDirectoryWrites(openDatabaseSyncOrThrow(path));
+    const reader = openDatabaseSyncOrThrow(path);
+    try {
+      db.exec('PRAGMA journal_mode = DELETE');
+      db.exec('PRAGMA busy_timeout = 0');
+      db.exec('CREATE TABLE sessions(session_id TEXT PRIMARY KEY, status TEXT, row TEXT)');
+      reader.exec('BEGIN');
+      reader.prepare('SELECT * FROM sessions').all();
+      db.exec('BEGIN IMMEDIATE');
+      db.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run('s1', 'active', JSON.stringify({ workingDir: a }));
+      expect(() => db.exec(end)).toThrow();
+      expect(Object.keys(state().pending)).toHaveLength(1);
+      // Start AFTER the failed commit so cycle.marked cannot hide early release.
+      const id = beginDirectoryCollection();
+      reader.exec('ROLLBACK');
+      db.exec(end);
+      expect(Object.keys(state().pending)).toHaveLength(0);
+      expect(retireManagedDirectories(id, [candidate(a)], [])).toEqual([]);
+      expect(reader.prepare('SELECT * FROM sessions').all()).toHaveLength(1);
+      expect(existsSync(a)).toBe(true);
+    } finally { reader.close(); db.close(); }
+  });
+
   it('does not leak reservations after a statement rolls the transaction back implicitly', () => {
     const db = guardSessionDirectoryWrites(openDatabaseSyncOrThrow(join(root, 'implicit.db')));
     try {
@@ -333,6 +371,34 @@ describe('managed directory write barrier', () => {
     expect(output).toContain('IMPORT_VISIBLE=0'); // load failed closed
     expect(existsSync(join(probeData, 'session-stores', 'appA', 'sessions.db'))).toBe(false);
     rmSync(probeRoot, { recursive: true, force: true });
+  });
+
+  it('releases import reservations when opening the staging database fails', async () => {
+    const data = join(root, 'data');
+    const staging = join(data, 'session-stores', 'appA', 'sessions.db.tmp');
+    mkdirSync(staging, { recursive: true }); // real SQLite open fails on a directory
+    writeFileSync(join(data, 'sessions-appA.json'), JSON.stringify({
+      s1: { sessionId: 's1', chatId: 'oc', status: 'active', workingDir: a },
+    }));
+    const child = spawnTsEvalWithRepoImports(`
+      import { readFileSync } from 'node:fs';
+      const store = await import('./src/services/session-store.js');
+      store.init('appA');
+      const visible = store.listSessions().length;
+      const state = JSON.parse(readFileSync(process.env.RETENTION_TEST_STATE, 'utf8'));
+      console.log(JSON.stringify({ visible, pending: Object.keys(state.pending).length }));
+    `, { cwd: process.cwd(), env: {
+      ...process.env, HOME: root, SESSION_DATA_DIR: data, RETENTION_TEST_STATE: statePath,
+    }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let errors = '';
+    child.stdout?.on('data', chunk => { output += String(chunk); });
+    child.stderr?.on('data', chunk => { errors += String(chunk); });
+    const [code] = await once(child, 'exit');
+    expect({ code, errors: code === 0 ? '' : errors + output }).toEqual({ code: 0, errors: '' });
+    // Inspect while the failed writer is alive, before dead-PID cleanup can mask a leak.
+    expect(output).toContain(JSON.stringify({ visible: 0, pending: 0 }));
+    expect(existsSync(join(data, 'session-stores', 'appA', 'sessions.db'))).toBe(false);
   });
 
   it('protects initializeApp backfill and commitDelegated publications', () => {

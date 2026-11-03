@@ -22,10 +22,12 @@
 未配置的普通安装不参与该协议。声明配置后解析或写入错误会明确失败，不忽略引用。
 
 Botmux 的以下持久写入均参与屏障，新引用在发布前持久登记，未提交事务在
-COMMIT/ROLLBACK 前保持登记；扫描开始时继承在途登记：
+成功 COMMIT 或 ROLLBACK 前保持登记；COMMIT/END 失败仍保留登记，直到重试成功、
+回滚或连接关闭。扫描开始时继承在途登记：
 
 - 会话主库 `sessions.db`（全部 `sessions` 表 INSERT/UPDATE 路径，含离线 CAS 与恢复回填）
-- 首次启动的 JSON→SQLite 导入：登记覆盖 staging 库构建到 `rename` 发布的全程
+- 首次启动的 JSON→SQLite 导入：登记覆盖 staging 库打开、构建到 `rename` 发布的全程，
+  打开失败也释放登记
 - 权威定时任务库 `schedule-authority.sqlite`（direct/delegated 新建、编辑、legacy 回填）
   及其 JSON 投影 `schedules.json`
 - Bot 配置 `bots.json`（setup、daemon、dashboard 全部原子写路径）

@@ -1214,8 +1214,9 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
   // so a collection begun during the JSON→SQLite upgrade cannot retire a
   // version a restored session is about to name.
   const releaseImport = reserveManagedDirectories(entries.map(([, value]) => value));
-  const tmp = openDatabaseSyncOrThrow(tmpFp);
+  let tmp: SqliteDatabaseLike | undefined;
   try {
+    tmp = openDatabaseSyncOrThrow(tmpFp);
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     // The staging database is deliberately NOT in WAL mode. `renameSync` below
     // publishes ONE file, so every imported row has to live inside it by the
@@ -1253,7 +1254,7 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     renameSync(tmpFp, dbFp);
     return entries.length;
   } catch (err) {
-    try { tmp.close(); } catch { /* already closed */ }
+    try { tmp?.close(); } catch { /* already closed or open failed */ }
     for (const suffix of ['', '-journal', '-wal', '-shm']) {
       try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* best-effort orphan cleanup */ }
     }
