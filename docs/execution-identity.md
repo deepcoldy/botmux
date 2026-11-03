@@ -69,6 +69,16 @@ Direct 定时任务沿用持久化的可信创建者。模型翻转后的重发�
 - **审计**：每次点击记一行 `[schedule-claim] action=… outcome=… task=… chat=… operator_union=… operator_open=… at=…`；`/schedule list` 的 runAs 显示认领人与认领时间。
 - Delegated 任务不发卡（身份来自委托）。认领后改提示词不会让认领失效，与创建人语义一致。
 
+### 宿主终端创建任务时的 `--run-as`
+
+宿主终端（持有 daemon HMAC、没有对话轮次的调用方）创建的 direct 任务历史上没有创建人，到点必发认领卡。`botmux schedule add --run-as <ou_|邮箱>` 让宿主显式提名一个执行身份，但**提名不等于信任**：
+
+- 只在 CLI 处于宿主形态（检测不到当前会话）时接受，会话内（含 `--run-as=x` 等号形式）一律拒绝——agent 不能自报身份，会话任务的创建人仍从当前 live turn 推导。
+- daemon 的 `SCHEDULE_DELEGATED_ADD_ROUTE` 宿主分支在执行 bot 自己的 app 视角下解析：邮箱先经 `resolveAllowedUsersWithMap` 换成本 app 的 `open_id`，再经 `resolveUnionIdFromOpenId` 取 `union_id`；两道解析任一失败即 403 `schedule_run_as_unresolved`（跨 app 的 `ou_`、缺 scope、飞书瞬时失败都落在这里，fail-closed）。
+- 解析成功后仍要求 `canOperate(appId, chatId, openId, unionId)` 通过，否则 403 `schedule_run_as_not_allowed`，任务不创建。
+- 请求体自带的 `ownerOpenId` / `ownerUnionId` 在宿主分支一律解构剥离，身份只来自上述校验结果；`creatorLarkAppId` 恒为执行 bot 自己。
+- 到点由 `resolveScheduledRunIdentity` 用同一个 `canOperate` 复核：通过则按该人发布凭证、不发卡；失权则照常进入 `creator_revoked` 认领流程（direct 任务可被认领）。
+
 ### Dashboard 新建 / 编辑定时任务时的创建人
 
 Dashboard 有两种进入方式，记的创建人不同：
