@@ -9898,6 +9898,9 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   const allowedFlags = new Set([
     '--title', '--bot-app', '--chat-id', '--into', '--steer',
     '--brief', '--brief-file', '--session-id', '--delegate', '--no-delegate',
+    // Task-tree card metadata, relayed verbatim; the host re-exec's cmdDispatch
+    // validates --kind's enum and --task-url's https itself.
+    '--kind', '--task-id', '--task-url',
   ]);
   const unsupportedFlags = [...new Set(rest
     .filter(token => token.startsWith('--'))
@@ -9950,6 +9953,12 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   }
   if (intoRoot) flags.push('--into', intoRoot);
   if (rest.includes('--steer')) flags.push('--steer');
+  // Task-tree metadata is single-value (cmdDispatch keeps the first occurrence);
+  // forward only that one so the host re-exec sees the same effective argv.
+  for (const flag of ['--kind', '--task-id', '--task-url'] as const) {
+    const value = argValue(rest, flag);
+    if (value !== undefined) flags.push(flag, value);
+  }
   const id = randomBytes(8).toString('hex');
   const contentBase = `${id}.content`;
   const contentPath = join(relayDir, contentBase);

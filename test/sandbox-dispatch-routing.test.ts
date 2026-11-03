@@ -123,6 +123,64 @@ describe('sandbox dispatch CLI routing', () => {
     }
   });
 
+  it('relays sandbox dispatch task-tree flags (--kind/--task-id/--task-url) to the host child', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-dispatch-cli-tree-flags-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const outbox = join(root, 'outbox');
+    mkdirSync(dataDir);
+    mkdirSync(outbox);
+    const capability = 'cd'.repeat(32);
+    replaceManagedOriginCapabilityFile(
+      join(outbox, RELAY_ORIGIN_CAPABILITY_BASENAME),
+      JSON.stringify({ token: capability, turnId: 'turn-live', dispatchAttempt: 1 }),
+    );
+    const calls = join(root, 'calls.jsonl');
+    const fixture = join(root, 'dispatch-host.mjs');
+    writeFileSync(fixture, `
+      import { appendFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      const value = flag => argv[argv.indexOf(flag) + 1];
+      const result = {
+        command: argv[0],
+        kind: value('--kind'),
+        taskId: value('--task-id'),
+        taskUrl: value('--task-url'),
+      };
+      appendFileSync(${JSON.stringify(calls)}, JSON.stringify(result) + '\\n');
+      process.stdout.write(JSON.stringify(result));
+    `);
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'source-session', {
+      cliPath: fixture,
+      authorize: claim => claim.capability === capability
+        ? { ok: true, origin: { turnId: 'turn-live', dispatchAttempt: 1 } }
+        : { ok: false, error: 'stale capability' },
+    });
+    try {
+      const result = await runCli([
+        'dispatch', '--session-id', 'source-session', '--title', 'review',
+        '--bot-app', 'cli_target', '--chat-id', 'oc_target', '--brief', 'review it',
+        '--kind', 'review', '--task-id', 'REQ-7', '--task-url', 'https://example.com/req/7',
+      ], {
+        ...process.env,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'source-session',
+        BOTMUX_SEND_RELAY: outbox,
+        BOTMUX_WORKFLOW: '',
+      });
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stderr).not.toContain('ROUTING_NOT_SUPPORTED');
+      expect(JSON.parse(result.stdout)).toEqual({
+        command: 'dispatch',
+        kind: 'review',
+        taskId: 'REQ-7',
+        taskUrl: 'https://example.com/req/7',
+      });
+    } finally {
+      stop();
+    }
+  });
+
   it('rejects a forged source session before writing an outbox request', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-dispatch-cli-source-'));
     roots.push(root);

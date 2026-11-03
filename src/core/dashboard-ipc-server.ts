@@ -1163,7 +1163,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -3754,7 +3754,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
 
 const dispatchTaskTreeCards = createDispatchTaskTreeCards({
   dataDir: () => config.session.dataDir,
-  listSessions: () => [...sessionStore.loadAllSessionsSnapshot().values()].map(s => ({
+  listSessions: roots => sessionStore.readSessionsByRoots(roots, { dataDir: config.session.dataDir }).map(s => ({
     sessionId: s.sessionId, larkAppId: s.larkAppId, rootMessageId: s.rootMessageId, status: s.status,
   })),
   localAppIds: () => knownBotAppIds({ dataDir: config.session.dataDir }),

@@ -55,6 +55,7 @@ import {
   readSessionRowCopiesAcrossStores,
   listActiveSessionIdsAcrossStores,
   listSessionsStrict,
+  readSessionsByRoots,
   SessionStoreSqliteUnavailableError,
   SessionStoreUnmigratedError,
 } from '../src/services/session-store.js';
@@ -598,5 +599,34 @@ describe('listActiveSessionIdsAcrossStores', () => {
 
     expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots }))
       .toThrow(SessionStoreSqliteUnavailableError);
+  });
+});
+
+describe('readSessionsByRoots (dispatch task-tree narrow read)', () => {
+  it('returns active AND closed rows for the given roots across stores, never unrelated roots', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      aActive: row('aActive', { rootMessageId: 'om_r1' }),
+      aClosed: row('aClosed', { rootMessageId: 'om_r1', status: 'closed', closedAt: '2026-02-01T00:00:00.000Z' }),
+      aTwo: row('aTwo', { rootMessageId: 'om_r2' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      bClosed: row('bClosed', { rootMessageId: 'om_r3', status: 'closed', closedAt: '2026-02-02T00:00:00.000Z' }),
+      bOther: row('bOther', { rootMessageId: 'om_other' }),
+    });
+    const got = readSessionsByRoots(new Set(['om_r1', 'om_r2', 'om_r3']), { dataDir: tempDir });
+    const byId = Object.fromEntries(got.map(s => [s.sessionId, s.status]));
+    expect(byId).toEqual({
+      aActive: 'active',
+      aClosed: 'closed',
+      aTwo: 'active',
+      bClosed: 'closed',
+    });
+    expect(got.some(s => s.rootMessageId === 'om_other')).toBe(false);
+  });
+
+  it('returns nothing for an empty root set or unknown roots', () => {
+    seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { rootMessageId: 'om_r1' }) });
+    expect(readSessionsByRoots(new Set(), { dataDir: tempDir })).toEqual([]);
+    expect(readSessionsByRoots(new Set(['om_nope']), { dataDir: tempDir })).toEqual([]);
   });
 });

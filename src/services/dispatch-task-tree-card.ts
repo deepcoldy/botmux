@@ -45,7 +45,9 @@ export interface DispatchTaskTreeCardDeps {
   /** Accepted as a getter so daemon wiring is not forced to read config at
    *  module-load time just by constructing this service. */
   dataDir: string | (() => string);
-  listSessions(): Iterable<TaskTreeSessionRow>;
+  /** Rows for the given dispatch roots only — a narrow indexed read, never a
+   *  full cross-store snapshot (a report-driven refresh is a hot path). */
+  listSessions(roots: ReadonlySet<string>): Iterable<TaskTreeSessionRow>;
   localAppIds(): ReadonlySet<string>;
   resolveThreadId(larkAppId: string, messageId: string): Promise<string | null>;
   /** Post the card into the orchestrator's topic (or chat); returns the message id. */
@@ -110,14 +112,21 @@ export function createDispatchTaskTreeCards(deps: DispatchTaskTreeCardDeps) {
     const threadIds = { ...(record.threadIds ?? {}) };
     let threadsChanged = false;
     const nowMs = (deps.now?.() ?? new Date()).getTime();
-    const unresolved = Object.entries(registry).filter(([root, raw]) => {
-      const entry = raw as Record<string, unknown> | null;
-      if (!entry || entry.orchSessionId !== orch.sessionId || threadIds[root]) return false;
+    // Every dispatch root owned by this orchestrating session. The session
+    // lookup is narrowed to exactly these roots so a refresh never scans all
+    // stores' full session tables on the report hot path.
+    const orchRoots = new Set(Object.entries(registry)
+      .filter(([, raw]) => !!raw && typeof raw === 'object' && !Array.isArray(raw)
+        && (raw as Record<string, unknown>).orchSessionId === orch.sessionId)
+      .map(([root]) => root));
+    const unresolved = [...orchRoots].filter(root => {
+      if (threadIds[root]) return false;
+      const entry = registry[root] as Record<string, unknown> | null;
       // A seed that never went out has no topic to link to.
-      if (entry.transportState === 'failed') return false;
+      if (entry?.transportState === 'failed') return false;
       const missedAt = threadMisses.get(root);
       return missedAt === undefined || nowMs - missedAt >= THREAD_ID_RETRY_MS;
-    }).map(([root]) => root);
+    });
     // The seed is sent by the orchestrating bot, so its app can read it.
     const resolved = await Promise.all(unresolved.map(root => deps.resolveThreadId(orch.larkAppId, root).catch(() => null)));
     unresolved.forEach((root, i) => {
@@ -128,7 +137,7 @@ export function createDispatchTaskTreeCards(deps: DispatchTaskTreeCardDeps) {
     const tree = buildDispatchTaskTree({
       registry, orchSessionId: orch.sessionId, title: orch.title,
       ...(requirement ? { requirement } : {}),
-      sessions: deps.listSessions(), localAppIds: deps.localAppIds(), threadIds,
+      sessions: deps.listSessions(orchRoots), localAppIds: deps.localAppIds(), threadIds,
     });
     const text = renderDispatchTaskTreeText(tree);
     const cardJson = JSON.stringify(renderDispatchTaskTreeCard(tree, {
