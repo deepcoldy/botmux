@@ -3315,9 +3315,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     if (typeof token !== 'string' || !token) {
       return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
     }
+    const validHeadlessSessionAfterToken = !!ds?.session.headless
+      && ds.session.headless.source === 'cli'
+      && isHeadlessId(ds.session.headless.id)
+      && headlessChatId(ds.session.headless.id) === ds.chatId;
     const stillValidSession = ds
       ? (findActiveBySessionId(params.sessionId) === ds && ds.session.status === 'active'
-        && !sessionTransportDisabled(ds) && ds.larkAppId === bot.larkAppId)
+        && (validHeadlessSessionAfterToken || !sessionTransportDisabled(ds))
+        && ds.larkAppId === bot.larkAppId)
       : (!!backgroundInput && !!detachedScheduled && backgroundContextStillValid(backgroundInput, detachedScheduled)
         && !sessionTransportDisabled({ chatId: targetChatId, larkAppId: bot.larkAppId }));
     if (!stillValidSession || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
