@@ -3,6 +3,8 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'feedback.storage.choose': '反馈存储：SQLite [默认] / PostgreSQL (sqlite/postgresql)：',
+  'feedback.storage.configPath': 'PostgreSQL 配置 JSON 路径（仅凭据引用，不填明文密码）：',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
   'cmd.effort.task_not_submitted': '附带任务未投递：推理强度修改未确认、会话已变化或输入通道不可用。任务已保留在原消息，请重试本条任务。任务：{task}',
   'cmd.effort.cli_next_turn': '当前会话的推理强度已设为 {effort}，从下一轮生效；正在执行的这一轮保持原强度。',

@@ -102,7 +102,7 @@ export async function getFeedbackStorage(dataDir: string): Promise<FeedbackStora
 }
 
 export async function closeFeedbackStorage(dataDir: string): Promise<void> {
-  const key = await realpath(dataDir);
+  const key = await realpath(dataDir).catch(() => resolve(dataDir));
   await serialized(key, async () => {
     const entry = entries.get(key);
     entries.delete(key);

@@ -347,7 +347,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledOnce();
     expect(sessionReply.mock.calls[0][1]).toContain(fullUrl);
     expect(sessionReply.mock.calls[0][1]).not.toContain('{{botmux_link:');
-    expect(clearPendingDraft).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(clearPendingDraft).toHaveBeenCalledOnce());
     expect(msg.content).toBe(unresolved);
   });
 
@@ -724,7 +724,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(call[5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
     }
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
-    expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_reply');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_reply'));
   });
 
   it.each([
@@ -839,7 +839,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       msgType: 'interactive',
     }));
     expect(sessionReply).not.toHaveBeenCalled();
-    expect(onComplete).toHaveBeenCalledWith(true, 'om_durable');
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_durable'));
   });
 
   it('keeps the reply-card write fence on the non-primary final path', async () => {
@@ -1293,7 +1293,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
     expect(ds.completedIdleTurnId).toBe('turn-1');
-    expect(onComplete).toHaveBeenCalledWith(true, 'om_reply');
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_reply'));
   });
 
   it('commits dedup uuid only after a successful sessionReply', async () => {
@@ -1971,6 +1971,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
     expect(sessionReply.mock.calls[0][5]?.replyTarget)
       .toEqual({ mode: 'thread', rootMessageId: 'om_topic_a' });
+    await vi.waitFor(() => expect(ds.finalOutputDeliveriesInFlight?.size ?? 0).toBe(0));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-b'));
 
     (ds.worker as any).emit('message', {
       type: 'codex_app_dispatch_transition',
