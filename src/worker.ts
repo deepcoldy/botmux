@@ -10011,9 +10011,8 @@ function performBridgeIngestAndScheduleQuietEmit(): void {
   }
 }
 
-function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string; mode?: 'baseline-existing' | 'fresh-empty'; dataDir?: string; liveCliPid?: number }): void {
-  claimRetiredGenerationJournalEntries();
-  bridgeLiveCliStartedAtMs = opts?.liveCliPid ? readProcessStartTime(opts.liveCliPid) : undefined;
+function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string; mode?: 'baseline-existing' | 'fresh-empty'; dataDir?: string; liveCliStartedAtMs?: number }): void {
+  bridgeLiveCliStartedAtMs = opts?.liveCliStartedAtMs;
   bridgeJsonlPath = jsonlPath;
   bridgeJsonlDir = dirname(jsonlPath);
   bridgeCliPid = opts?.cliPid;
@@ -26409,6 +26408,12 @@ async function spawnCli(
     const bridgeCwd = scratchChdirInSandbox ?? cfg.workingDir;
     const claudeJsonl = resolveClaudeJsonlPath(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir)
       ?? claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
+    // A new CLI generation of this worker: take over what the retired one left
+    // in the journal before this generation's watcher (and its restore) runs.
+    claimRetiredGenerationJournalEntries();
+    // The pane's outermost process started with the CLI generation the
+    // previous worker drove, before any of that generation's marks.
+    const liveCliStartedAtMs = actuallyReattachedPersistent && cliPid ? readProcessStartTime(cliPid) : undefined;
     startBridgeWatcher(claudeJsonl, {
       // A re-attached pane already has every launch layer, so the bridge reads
       // Claude's pid-state record BEFORE its baseline and starts on the
@@ -26418,9 +26423,7 @@ async function spawnCli(
       cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
       dataDir: bridgeClaudeDataDir,
-      // The pane's outermost process: it started with the CLI generation the
-      // previous worker drove, before any of that generation's marks.
-      ...(actuallyReattachedPersistent && cliPid ? { liveCliPid: cliPid } : {}),
+      ...(liveCliStartedAtMs !== undefined ? { liveCliStartedAtMs } : {}),
     });
   }
 
