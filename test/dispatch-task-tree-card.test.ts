@@ -139,6 +139,17 @@ describe('task-tree card service', () => {
     expect(s.posts).toEqual(['om_card_1']);
   });
 
+  it('reads a getter dataDir lazily on refresh, not at construction', async () => {
+    const s = setup();
+    let dataDir: string | undefined;
+    const cards = createDispatchTaskTreeCards({ ...s.deps, dataDir: () => {
+      if (!dataDir) throw new Error('data dir bound later');
+      return dataDir;
+    } });
+    dataDir = s.dataDir;
+    expect(await cards.refresh(ORCH)).toMatchObject({ posted: true, messageId: 'om_card_1' });
+  });
+
   it('treats withdrawn, expired and stop-policy-blocked cards as gone; other errors as transient', () => {
     expect(isTaskTreeCardGone(new MessageWithdrawnError('om_x'))).toBe(true);
     expect(isTaskTreeCardGone(new MessageUpdateExpiredError('om_x'))).toBe(true);

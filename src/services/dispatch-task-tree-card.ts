@@ -42,7 +42,9 @@ export interface TaskTreeOrchestrator {
 }
 
 export interface DispatchTaskTreeCardDeps {
-  dataDir: string;
+  /** Accepted as a getter so daemon wiring is not forced to read config at
+   *  module-load time just by constructing this service. */
+  dataDir: string | (() => string);
   listSessions(): Iterable<TaskTreeSessionRow>;
   localAppIds(): ReadonlySet<string>;
   resolveThreadId(larkAppId: string, messageId: string): Promise<string | null>;
@@ -83,13 +85,12 @@ export function isTaskTreeCardGone(error: unknown): boolean {
 }
 
 export function createDispatchTaskTreeCards(deps: DispatchTaskTreeCardDeps) {
-  const cardsPath = join(deps.dataDir, DISPATCH_TASK_TREE_CARDS_FILE);
-  const registryPath = join(deps.dataDir, 'orchestrate-dispatch.json');
+  const resolveDataDir = () => (typeof deps.dataDir === 'function' ? deps.dataDir() : deps.dataDir);
   const chains = new Map<string, Promise<unknown>>();
   const threadMisses = new Map<string, number>();
 
   const writeRecord = (sessionId: string, patch: Partial<CardRecord>) =>
-    updateDispatchRegistry(cardsPath, (store: DispatchRegistry) => {
+    updateDispatchRegistry(join(resolveDataDir(), DISPATCH_TASK_TREE_CARDS_FILE), (store: DispatchRegistry) => {
       const current = (store[sessionId] && typeof store[sessionId] === 'object' ? store[sessionId] : {}) as CardRecord;
       store[sessionId] = { ...current, ...patch };
     });
@@ -99,6 +100,9 @@ export function createDispatchTaskTreeCards(deps: DispatchTaskTreeCardDeps) {
     /** Post a card when none exists yet. Off for a report that arrives with no card. */
     allowPost?: boolean;
   }): Promise<TaskTreeRefreshResult> {
+    const dataDir = resolveDataDir();
+    const cardsPath = join(dataDir, DISPATCH_TASK_TREE_CARDS_FILE);
+    const registryPath = join(dataDir, 'orchestrate-dispatch.json');
     const record = (readJsonObject(cardsPath)[orch.sessionId] ?? {}) as CardRecord;
     const requirement = opts.requirement && (opts.requirement.id || opts.requirement.url)
       ? opts.requirement : record.requirement;

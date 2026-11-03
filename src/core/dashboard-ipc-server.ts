@@ -3753,7 +3753,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
 // ─── 编排任务树卡片 ──────────────────────────────────────────────────────────
 
 const dispatchTaskTreeCards = createDispatchTaskTreeCards({
-  dataDir: config.session.dataDir,
+  dataDir: () => config.session.dataDir,
   listSessions: () => [...sessionStore.loadAllSessionsSnapshot().values()].map(s => ({
     sessionId: s.sessionId, larkAppId: s.larkAppId, rootMessageId: s.rootMessageId, status: s.status,
   })),
