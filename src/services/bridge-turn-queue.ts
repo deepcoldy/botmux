@@ -150,6 +150,14 @@ export interface BridgePendingTurn {
    *  the turn — short fingerprints ("hello", "test") would otherwise risk
    *  matching pre-existing user lines in unrelated sibling jsonls. */
   markTimeMs?: number;
+  /** When Claude's own transcript recorded this input entering its type-ahead
+   *  queue (`queue-operation enqueue`). While it sits there the mark is not
+   *  stranded: see {@link isHeldInCliQueue}. */
+  cliQueuedAtMs?: number;
+  /** When the input left that queue (`dequeue` / `remove`), or the queue stopped
+   *  being observable. The record that binds the mark follows right behind, so
+   *  the normal TTL runs again from here. */
+  cliQueueReleasedAtMs?: number;
   /** Set when this mark was re-created from the durable turn journal after a
    *  worker/daemon restart interrupted the turn. The emit path prefixes the
    *  delivered fallback with an "interrupted by restart" notice so the user
@@ -176,6 +184,34 @@ export interface BridgePendingTurn {
   /** Lark turns folded into this one. They leave the queue right behind it and
    *  share its terminal, so each still gets the end signal its card waits for. */
   absorbedTurns?: BridgePendingTurn[];
+}
+
+/** Upper bound on holding a mark for an input in Claude's own queue. The queue
+ *  normally lets go at the next tool boundary or turn end (longest seen: 27
+ *  minutes), and the hold also ends when Claude returns to its prompt. The bound
+ *  covers an input dropped without any record while Claude stays busy: a stale
+ *  mark at the queue head keeps later Lark turns from binding. */
+export const CLI_QUEUE_HOLD_MAX_MS = 30 * 60_000;
+/** Same allowance as the fingerprint scan's floor: an enqueue record is written
+ *  after the mark, but clocks and write order can differ slightly. */
+const CLI_QUEUE_MARK_SKEW_MS = 5_000;
+
+/** Minimum gap between the worker's sibling-jsonl fingerprint fallback scans
+ *  for one mark. 10s is far wider than the milliseconds Claude needs to write
+ *  a normal user line, and the fallback only runs after the primary jsonl scan
+ *  already missed the line — i.e. Claude rotated via `/clear` / `/resume`,
+ *  which happens hours apart, so the delay is invisible. */
+export const BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 10_000;
+/** A held mark is proven to wait inside Claude's queue, so its fallback runs
+ *  even less often — but not never: an in-pane `/clear` while the input waits
+ *  moves it to another file. Must stay strictly larger than the normal gap. */
+export const BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 60_000;
+
+/** Claude's own transcript proves this input is waiting in its queue. There is
+ *  nothing to search other transcripts for, and no reason to expire the mark:
+ *  the record that binds it arrives when Claude takes the input. */
+export function isHeldInCliQueue(turn: BridgePendingTurn): boolean {
+  return turn.cliQueuedAtMs !== undefined && turn.cliQueueReleasedAtMs === undefined;
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -251,6 +287,11 @@ export class BridgeTurnQueue {
     private readonly onLarkTurnStarted?: (turn: BridgePendingTurn, evidence: BridgeTurnStartEvidence) => void,
   ) {}
   private seen = new Set<string>();
+  /** Mirror of Claude's type-ahead queue, in order, from the queue-operation
+   *  records read so far. `dequeue` records carry no content, so only the order
+   *  says which input left. A mirror that started mid-queue can release a mark
+   *  early, which falls back to the normal TTL. */
+  private cliQueue: Array<{ text: string; turn?: BridgePendingTurn }> = [];
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
   private lastLocalTurnId?: string;
@@ -310,6 +351,22 @@ export class BridgeTurnQueue {
   resetDurationMarkerVerdicts(): void {
     this.durationMarkerSeen = false;
     this.durationMarkerWaitExpired = false;
+  }
+
+  /** Claude's queue is not observable from another transcript or CLI process:
+   *  the dequeue may land where we are not reading. */
+  forgetCliQueue(now: number = Date.now()): void {
+    this.cliQueue = [];
+    for (const turn of this.queue) {
+      if (isHeldInCliQueue(turn)) turn.cliQueueReleasedAtMs = now;
+    }
+  }
+
+  /** Claude is back at its prompt, so its queue should be empty: an input
+   *  still held left without a record we could match. The normal TTL runs from
+   *  here, which also covers an idle edge seen while input was still queued. */
+  cliQueueDrained(now: number = Date.now()): void {
+    this.forgetCliQueue(now);
   }
 
   /** Mark turns already STARTED in the generation that is ending as carried
@@ -416,6 +473,7 @@ export class BridgeTurnQueue {
    *  already in flight) and wants to clear the slate. */
   clearPending(): BridgePendingTurn[] {
     this.lastLocalTurnId = undefined;
+    this.cliQueue = [];
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     return dropped;
@@ -448,13 +506,15 @@ export class BridgeTurnQueue {
    *  scans every poll tick until the worker restarts. Started turns are
    *  never expired here: once Claude actually wrote the user line, the
    *  turn is collecting assistant text and we want to wait however long
-   *  the model takes. */
+   *  the model takes. The same goes for a mark whose input Claude holds in its
+   *  own queue, up to {@link CLI_QUEUE_HOLD_MAX_MS}. */
   pruneExpired(maxAgeMs: number, now: number = Date.now()): BridgePendingTurn[] {
     const dropped: BridgePendingTurn[] = [];
     this.queue = this.queue.filter(t => {
       if (t.started) return true;
       if (t.markTimeMs === undefined) return true;
-      if (now - t.markTimeMs <= maxAgeMs) return true;
+      if (isHeldInCliQueue(t) && now - t.cliQueuedAtMs! <= CLI_QUEUE_HOLD_MAX_MS) return true;
+      if (now - Math.max(t.markTimeMs, t.cliQueueReleasedAtMs ?? 0) <= maxAgeMs) return true;
       dropped.push(t);
       return false;
     });
@@ -483,6 +543,10 @@ export class BridgeTurnQueue {
     onAssistantAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
   ): void {
     for (const ev of events) {
+      if (ev.type === 'queue-operation') {
+        this.observeCliQueueOperation(ev);
+        continue;
+      }
       const uuid = ev.uuid;
       if (!uuid || this.seen.has(uuid)) continue;
       this.seen.add(uuid);
@@ -798,6 +862,43 @@ export class BridgeTurnQueue {
     this.collecting = scheduledTurn;
     this.lastLocalTurnId = scheduledTurn.turnId;
     this.onLocalTurnStarted?.(scheduledTurn);
+  }
+
+  /** Queue records have no uuid, so they are deduped on their own identity: a
+   *  transcript switch can replay them. They never start a turn. */
+  private observeCliQueueOperation(ev: TranscriptEvent): void {
+    const atMs = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
+    if (!Number.isFinite(atMs)) return;
+    const text = typeof ev.content === 'string' ? normaliseForFingerprint(ev.content) : '';
+    // Several dequeues can share one millisecond; replaying them is harmless
+    // because a transcript switch empties the mirror first.
+    if (ev.operation !== 'dequeue') {
+      // Same-millisecond records of equal length but DIFFERENT content really
+      // occur (same-ms removes carrying distinct commandUuid: 14 groups in
+      // fleet transcripts), so the identity is the record's own id, falling
+      // back to the full normalised text — never the text's length.
+      const identity = ev.commandUuid ?? ev.deliveryId ?? text;
+      const key = `queue:${ev.operation}:${ev.timestamp}:${identity}`;
+      if (this.seen.has(key)) return;
+      this.seen.add(key);
+    }
+    if (ev.operation === 'enqueue') {
+      const turn = this.queue.find(t => !t.started && t.cliQueuedAtMs === undefined
+        && t.markTimeMs !== undefined && atMs >= t.markTimeMs - CLI_QUEUE_MARK_SKEW_MS
+        && !!t.contentNormalized && t.contentNormalized.length >= TRUNCATION_MATCH_MIN_CHARS
+        && (text.includes(t.contentNormalized) || isTruncatedMatch(text, t.contentNormalized)));
+      if (turn) turn.cliQueuedAtMs = atMs;
+      this.cliQueue.push({ text, ...(turn ? { turn } : {}) });
+      return;
+    }
+    // A content-less remove (e.g. dropped by a hook) cannot say which input left.
+    if (ev.operation !== 'dequeue' && text.length === 0) {
+      this.forgetCliQueue(atMs);
+      return;
+    }
+    const idx = ev.operation === 'dequeue' ? 0 : this.cliQueue.findIndex(item => item.text === text);
+    const [left] = idx >= 0 ? this.cliQueue.splice(idx, 1) : [];
+    if (left?.turn) left.turn.cliQueueReleasedAtMs = atMs;
   }
 
   /** A message typed while a turn ran, which Claude Code folded into that turn

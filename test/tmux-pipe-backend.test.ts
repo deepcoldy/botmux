@@ -180,14 +180,14 @@ describe('TmuxPipeBackend.spawn', () => {
     // Step 1: mkfifo via spawnSync
     expect(mockedSpawnSync).toHaveBeenCalledWith('mkfifo', expect.arrayContaining([expect.stringMatching(/botmux-pipe-/)]), expect.any(Object));
 
-    // Step 2: tmux pipe-pane -O -t 0:2.0 'cat > <fifo>'
+    // Step 2: subscribe a copier that writes into the fifo.
     const pipeCalls = mockedExecSync.mock.calls
       .map(c => String(c[0]))
       .filter(c => c.includes('pipe-pane'));
     expect(pipeCalls.length).toBe(1);
     expect(pipeCalls[0]).toContain('-O');
     expect(pipeCalls[0]).toContain("'0:2.0'");
-    expect(pipeCalls[0]).toMatch(/cat > '.*botmux-pipe-.*\.fifo'/);
+    expect(pipeCalls[0]).toMatch(/exec >.*botmux-pipe-.*\.fifo/);
   });
 
   it('retries pipe-pane after a transient connect failure instead of failing the session start', () => {
@@ -1873,7 +1873,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
         .find(c => c.includes('pipe-pane'));
       expect(cancelCall).toBeDefined();
       expect(cancelCall).toContain("'0:2.0'");
-      expect(cancelCall).not.toContain('cat >');
+      expect(cancelCall).not.toContain('botmux-pipe-');
     } finally {
       errSpy.mockRestore();
       killSpy.mockRestore();
@@ -2103,7 +2103,7 @@ describe('TmuxPipeBackend.kill', () => {
       .map(c => String(c[0]))
       .find(c => c.includes('pipe-pane'));
     expect(pipeCall).toBeDefined();
-    expect(pipeCall).not.toContain('cat >');  // no command = cancel
+    expect(pipeCall).not.toContain('botmux-pipe-');  // no command = cancel
     expect(pipeCall).toContain("'0:2.0'");
 
     expect(mockedUnlinkSync).toHaveBeenCalledWith(expect.stringMatching(/botmux-pipe-.*\.fifo/));

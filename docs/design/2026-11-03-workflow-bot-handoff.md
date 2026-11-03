@@ -7,6 +7,7 @@
 - 现状：[`workflow-v3-current-implementation.md`](workflow-v3-current-implementation.md)
 - 派发委托：[`docs/adr/dispatch-user-delegation.md`](../adr/dispatch-user-delegation.md)、[`docs/adr/schedule-dispatch-delegation.md`](../adr/schedule-dispatch-delegation.md)
 - 侧边栏先例：[`2026-10-24-decision-board-steward.md`](2026-10-24-decision-board-steward.md)
+- Dashboard 上编排、复用和复制工作流：[`2026-11-03-workflow-dashboard-orchestration.md`](2026-11-03-workflow-dashboard-orchestration.md)
 
 ---
 
@@ -559,7 +560,7 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 
 - **成员的身份来源**：飞书 H5 免登的会话，或平台登录透传的身份。H5 现在对非白名单用户只签发 `resultOnly` 会话；这里扩展成按路径限定的只读会话，只能访问 `/workflow/...` 和对应的只读接口。
 - **成员检查**：用主 Bot 的应用实时检查是否在群里，复用委托校验里已有的群成员检查，短时缓存；查询失败按拒绝处理。
-- **平台部署**：非 owner 能不能经 `m-` 到达这个页面，取决于平台侧是否像 `/plugin-result` 那样放行；这需要平台侧另行跟进。botmux 侧按「拿不到身份就 403」实现。
+- **平台部署**：平台 m- 域名上 Dashboard 页面的请求只带 actor 和 scopes、不带 role，机器端会把它当成本机管理身份，所以经 m- 到达的人看到的是完整视图。非 owner 的群友能否经 m- 到达这个页面，取决于平台侧是否按路径放行（`/plugin-result` 的非 owner 访问依赖同一前提），需要平台侧确认并跟进；如果平台不放行，群友精简视图在平台部署下到不了，只能走飞书 H5 免登。botmux 侧按「拿不到身份就 403」实现。
 
 ### 11.4 侧边栏页面
 

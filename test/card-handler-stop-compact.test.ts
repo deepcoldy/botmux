@@ -234,6 +234,13 @@ beforeEach(() => {
 // ─── stop_turn ────────────────────────────────────────────────────────────
 
 describe('stop_turn card action', () => {
+  it.each(['stop_turn', 'term_action'])('refuses %s while a native Antigravity fork is pending', async action => {
+    const ds = makeDs({ sessionOverrides: { cliId: 'antigravity', pendingForkSession: true } });
+    const result = await handleCardAction(actionData(action), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(result.toast.content).toContain('/close');
+    expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+  });
   it('stops the verified reply-card turn without replacing its answer with a terminal card', async () => {
     const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
     const replyCards = await import('../src/core/turn-reply-card.js');

@@ -1,3 +1,4 @@
+import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -598,6 +599,8 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface CommandHandlerDeps {
+  /** Source entry, independent of a shared session or newly created topic. */
+  invocationContext?: 'new-topic' | 'thread';
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
   getActiveCount: () => number;
@@ -1869,6 +1872,20 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/models': {
+        const atTopLevel = deps.invocationContext === 'new-topic' || (!deps.invocationContext && !ds);
+        if (atTopLevel && larkAppId) {
+          await showDefaultModelPicker(larkAppId, rootId, message.senderId, sessionReply, loc);
+          break;
+        }
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
+        await showSessionModelPicker(ds, rootId, message.senderId, message.senderUnionId, sessionReply, loc);
+        break;
+      }
+
       case '/queue': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -2927,6 +2944,10 @@ export async function handleCommand(
           break;
         }
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        if (ds.session.pendingForkSession && effectiveCliId === 'antigravity') {
+          await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
+          break;
+        }
         if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
@@ -6760,6 +6781,7 @@ export async function handleCommand(
           t('help.repo_wt', undefined, loc),
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.models', undefined, loc),
           t('help.retry', undefined, loc),
           t('help.rewind', undefined, loc),
           t('help.idlecompact', undefined, loc),

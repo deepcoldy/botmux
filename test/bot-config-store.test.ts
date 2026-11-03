@@ -87,6 +87,106 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange, sessionGroups };
   }
 
+  it('checks a picker model snapshot inside the file lock before writing effort', async () => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce();
+      await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].model = 'sonnet';
+      writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus' });
+    release();
+    await holder;
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ model: 'sonnet' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('checks a picker CLI snapshot inside the file lock before writing a model', async () => {
+    const { store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].cliId = 'codex'; writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('model')!, 'sonnet', { selectionKey: 'claude-code' });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ cliId: 'codex', model: 'opus' });
+  });
+
+  it('refuses a picker write when the backend loses launch-model support while waiting for the lock', async () => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].backendType = 'riff'; writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus', requireLaunchModelSupport: true });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ backendType: 'riff', model: 'opus' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it.each([false, true])('rechecks picker admin authorization under the lock (registry updated: %s)', async updateRegistry => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].allowedUsers = []; writeFileSync(configPath, JSON.stringify(raw));
+      if (updateRegistry) {
+        registry.getBot('app_default').config.allowedUsers = [];
+        registry.getBot('app_default').resolvedAllowedUsers = [];
+      }
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus', actorOpenId: 'ou_owner' });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('accepts and clears effort for the CLI default model with an exact picker snapshot', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('reasoningEffort')!;
+    const precondition = { selectionKey: 'claude-code', model: null };
+    expect((await store.applyConfigField('app_default', spec, 'high', precondition)).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('high');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('high');
+    expect((await store.applyConfigField('app_default', spec, null, precondition)).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+  });
+
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
     const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
     const spec = store.findConfigField('envPolicy')!;

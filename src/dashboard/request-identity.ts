@@ -220,7 +220,9 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
       canManageHost: true,
     };
   }
-  return input.h5 && !input.h5.resultOnly ? {
+  // Path-scoped H5 sessions (owner-bound results, the workflow sidebar) are no
+  // Dashboard identity at all: every other route sees an anonymous request.
+  return input.h5 && !input.h5.resultOnly && !input.h5.workflowViewOnly ? {
     ...input.h5,
     ...(input.h5.unionId ? { principalUnionId: input.h5.unionId } : {}),
     terminalCapability: 'controlled',
