@@ -95,7 +95,7 @@ async function runCase(name: string, options: Record<string, any> = {}) {
     config:{session:{dataDir:'/not-used'}},senderOpenId:'ou_real_sender',isBotSenderType:false,
     botSteerDirective:{requested:false},newTopicGrill:undefined,messageListener:undefined,ctx:{},
     ownerOpenIdForSession:'ou_real_sender',initialTurnTitle:'test',topicSpec:undefined,
-    trustedCaller:verifiedCaller,
+    trustedCaller:verifiedCaller,lifecycleRawOpening:undefined,lifecycleDaemonCommand:undefined,
   });
   assert.equal(gatewayCaller(ds,turnId),'ou_real_sender','exact reply target knows sender before worker publication');
   // Caller must come from the real initializer, never from the fixture.
