@@ -508,10 +508,15 @@ describe('M1 turn classes and M2 confirmation', () => {
     expect(existsSync(v3RevisionFilePaths(runDir, 2).bots)).toBe(true);
     expect(decideV3RevisionProposal({ baseDir: base, runId: 'run-newbot', revision: 2, decision: 'approve', by: INITIATOR }))
       .toMatchObject({ kind: 'approved' });
+    // Approved once, it is in the run's scope: using it again needs no confirmation.
+    expect(edit(base, 'run-newbot', [{ op: 'addNode', node: goal('b', { bot: 'cli_fresh' }) }], 2))
+      .toMatchObject({ kind: 'applied' });
     const workers = fakeWorkers();
     const seen: string[] = [];
     await runner(base, async (req) => { seen.push(req.botSnapshot.larkAppId); return workers.runNode(req); }).drive('run-newbot');
-    expect(seen).toEqual(['cli_fresh']);
+    expect(seen).toEqual(['cli_fresh', 'cli_fresh']);
+    // Saving the run keeps the bot the revision approved.
+    expect(compileSavedWorkflowFromRun(runDir).runtimeRevisions).toBe(2);
   });
 
   it('a turn woken by this run\'s own events edits directly, recorded as the main bot', () => {
