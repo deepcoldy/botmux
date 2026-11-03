@@ -562,6 +562,12 @@ export class DecisionBoardStore {
     if (patch.key) {
       const existing = this.resolveSeq(appId, { key: patch.key });
       if (existing !== undefined) {
+        // 已结束的不借 add 改：巡检按来源反复 add，误判一次就会把关掉的旧事改回待拍板。重开走 set。
+        // 放在写入这一步判断：调用方在前面可能等过查群，期间事项可能刚被关掉。
+        const state = this.getItem(appId, existing)!.state;
+        if (state === 'done' || state === 'closed') {
+          throw new BoardError('item_ended', `#${existing} ${BOARD_STATE_LABELS.zh[state]}，add 不改已结束的事项`);
+        }
         return { item: this.updateItem(appId, existing, patch, actorRef, now, locale), created: false };
       }
     }

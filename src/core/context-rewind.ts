@@ -20,6 +20,7 @@ import {
   isScheduledTurnStartEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 
 export interface RewindCheckpoint {
   /** 1 = 最近一轮；仅在一次扫描结果内稳定。 */
@@ -55,7 +56,10 @@ export function summarizeUserText(text: string): string {
   let body = text;
   const m = /<user_message>([\s\S]*?)<\/user_message>/i.exec(body);
   if (m) body = m[1] ?? '';
-  body = body
+  body = stripBotmuxDisplayBlocks(body)
+    // bare（transcript + solo）续轮没有 <user_message> 壳；上面整块剥掉追加
+    // 在用户正文后的 <botmux_formatting>（含块体），再清掉其余残留标签，
+    // 否则内部提示会混进预览文案。
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();

@@ -18,6 +18,8 @@ import { SPEC_SCHEMA_VERSION, type Spec, type SpecNodeSketch } from './contract.
 
 /** Path-safe id (same shape as dag.ts node ids / runId). */
 const SKETCH_ID_RE = /^[A-Za-z0-9._-]+$/;
+/** A bot name or larkAppId; anything longer is not a name. */
+const MAX_ASSIGNEE_CHARS = 128;
 
 export class SpecValidationError extends Error {
   constructor(public readonly problems: string[]) {
@@ -129,6 +131,17 @@ export function validateSpec(raw: unknown): Spec {
     if (expected_outputs.length === 0) {
       problems.push(`${where}.expected_outputs 至少要有 1 个`);
     }
+    // A user-named executing bot (design 2026-11-03 §6.2). Optional, and kept
+    // out of the normalized node when absent so specs that never name a bot
+    // serialize exactly as before.
+    let assignee: string | undefined;
+    if (n.assignee !== undefined) {
+      if (typeof n.assignee !== 'string' || n.assignee.trim() === '' || n.assignee.trim().length > MAX_ASSIGNEE_CHARS) {
+        problems.push(`${where}.assignee 必须是 1–${MAX_ASSIGNEE_CHARS} 个字符的 Bot 名或 larkAppId，或省略`);
+      } else {
+        assignee = n.assignee.trim();
+      }
+    }
 
     nodes.push({
       sketchId: typeof sketchId === 'string' ? sketchId : '',
@@ -138,6 +151,7 @@ export function validateSpec(raw: unknown): Spec {
       acceptance: typeof n.acceptance === 'string' ? n.acceptance.trim() : '',
       risk_gate: n.risk_gate === true,
       unknowns,
+      ...(assignee !== undefined ? { assignee } : {}),
     });
   });
 

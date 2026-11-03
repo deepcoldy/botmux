@@ -13,7 +13,7 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
   botmux board guide                                    打印管家规则（预置 + owner 自定义）
   botmux board list [--view decide|active|all] [--json] 列事项（默认 all），每行带主群和飞书里打开的链接；缺群的标出来
   botmux board show <编号|key> [--json]                  一项的全部字段、关联、最近历史、未执行的决定
-  botmux board add <标题> --link chat=oc_… [字段…]        新建，必须带群（或 --no-chat "<原因>"）；带 --key 且已存在时按 set 更新
+  botmux board add <标题> --link chat=oc_… [字段…]        新建，必须带群（或 --no-chat "<原因>"）；带 --key 且已存在时按 set 更新（已完成 / 已关闭的不改，重开用 set）
   botmux board set <编号|key> [字段…] [--clear-ask]      改字段；改状态和待拍板内容会自动进历史
   botmux board history <编号|key> <一句话> [--handled]   追加历史；--handled = 这项最近一批决定已执行
   botmux board attach <编号|key> <图片>... [--note 说明] 附截图（png / jpg / gif / webp）

@@ -70,6 +70,7 @@ import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
 import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
@@ -253,8 +254,18 @@ function normalizeTraexThreadDetails(row: TraexThreadRow | undefined): TraexThre
   const botmuxOrigin = firstUserMessage !== undefined && isBotmuxShapedText(firstUserMessage);
   // Display safety, not origin: a title that is itself an envelope / the goal
   // objective (≤0.207 defaulted the title to the first prompt) is never shown.
-  const title = [nonEmptyString(row?.name), nonEmptyString(row?.title)]
+  // An envelope-less bare (transcript + solo) follow-up also defaults to the
+  // first prompt on ≤0.207 DBs; structural origin detection can't see that
+  // shape, so strip botmux's appended internal <botmux_formatting> block from
+  // the display title here (#2716). This one normalizer feeds both the picker
+  // resume row (RolloutSessionMetadata.title) and readTraexThreadTitle.
+  const rawTitle = [nonEmptyString(row?.name), nonEmptyString(row?.title)]
     .find(text => text !== undefined && !isBotmuxShapedText(text));
+  // Consumers (readTraexThreadTitle, discovery truncateTitle) already collapse
+  // whitespace, so keep the strip block-only here. A title that consisted
+  // entirely of internal blocks drops to undefined (same as an empty title).
+  const strippedTitle = rawTitle === undefined ? undefined : stripBotmuxDisplayBlocks(rawTitle);
+  const title = strippedTitle !== undefined && strippedTitle.trim() ? strippedTitle : undefined;
   return {
     id,
     ...(title ? { title } : {}),
@@ -1027,6 +1038,32 @@ export function drainTraexRollout(
       events.push({ ...base, kind: 'turn_started', text: '', sourceTurnId });
       continue;
     }
+    // New TraeX rollouts persist genuine user input only in history_mutation.
+    // Require the runtime's user.text provenance and matching native turn ID:
+    // plain role=user also includes AGENTS/environment/runtime injections.
+    if (obj.type === 'history_mutation' && payload.operation === 'append'
+      && sourceTurnId && Array.isArray(payload.items)) {
+      for (const item of payload.items) {
+        const meta = item?.internal_chat_message_metadata_passthrough;
+        if (item?.type !== 'message' || item.role !== 'user'
+          || meta?.turn_id !== sourceTurnId || !Array.isArray(meta.content_item_kinds)
+          || !meta.content_item_kinds.includes('user.text') || !Array.isArray(item.content)) continue;
+        const text = item.content.flatMap((block: any) => block?.type === 'input_text'
+          && typeof block.text === 'string' ? [block.text] : []).join('');
+        if (text && claimUserTurn(sourceTurnId)) {
+          events.push({ ...base, kind: 'user', text, sourceTurnId });
+          if (!probe) {
+            // Forward the no-turn-id pending bucket to this turn, mirroring the
+            // legacy user_message / item_completed user edges. Do NOT delete any
+            // pending bucket: assistant evidence for this same turn can already
+            // be buffered (item_completed AgentMessage observed before the user
+            // edge), and a type-ahead next turn's edge must not discard the
+            // previous turn's pending final either.
+            traexPendingAgentTurns(path).activeKey = sourceTurnId;
+          }
+        }
+      }
+    }
     // The append-only history is TraeX's canonical model/tool timeline. Its
     // event_msg records mirror reasoning and tool completion, so consuming
     // those too would duplicate nodes. One mutation can carry parallel calls
@@ -1570,7 +1607,12 @@ export function findTraexThreadByPid(
       .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
     const selected = candidates.find(row => row.source === 'user') ?? candidates[0];
     if (!selected?.id) return undefined;
-    const title = String(selected.title || selected.firstMessage || '').replace(/\s+/g, ' ').trim();
+    // Both columns can mirror the first prompt on ≤0.207/0.210 DBs; an
+    // envelope-less bare (transcript + solo) follow-up there carries the
+    // appended <botmux_formatting> block — strip before it reaches the orca
+    // live /adopt card title (#2716).
+    const rawTitleSource = String(selected.title || selected.firstMessage || '');
+    const title = stripBotmuxDisplayBlocks(rawTitleSource).replace(/\s+/g, ' ').trim();
     const titleChars = Array.from(title);
     return {
       cliSessionId: selected.id,
