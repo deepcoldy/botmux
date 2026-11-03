@@ -476,6 +476,7 @@ journal 仍是唯一事实源。新模式下，goal 节点新增以下事件：
 | 写了 `Accepted` | 按截止时间重挂超时定时器 |
 | 提交区有文件，journal 里没有结果 | 复核后补写 |
 | 有待确认的流程修改（13.5） | 和待审批的 Gate 一样，重发确认卡 |
+| 有 `nodeHandedToHuman`，没有随后的 `nodeBlocked`（13.6 的两次写入之间崩溃） | 补写 `nodeBlocked(HANDED_TO_HUMAN)`，原因取 `nodeHandedToHuman` 里的理由；不等运行期限 |
 | 有等待中的 Gate、阻塞卡 | 和现在一样重发 |
 
 ### 9.6 子 Bot 的 daemon 重启，或会话没了
@@ -630,11 +631,12 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
   - **事件唤醒的回合**：
     - 现有的合成触发 turnId 是 `trg_…`，`resolveCurrentTurnProvenance` 只认 `om_` / `join_` / `schedule:` 三类，会拒绝它（`src/core/reply-target.ts`）。
     - 做法：照 `schedule:` 的先例（`src/core/current-turn-provenance.ts` 与 `session-relay.ts` 的 scheduled 分支）新增一类 turn 来源 `workflow-event:<runId>:<事件序号>`。它只能由拥有该 run 的 daemon 签发，并与主会话绑定，daemon 侧认它为「本 run 事件唤醒的回合」。
+    - 身份：这类回合的调用者身份取 `run.json` 里冻结的发起人（`authorization.authorizedByOpenId`）。所以 `retry`、`ask-human` 等命令现有的「调用者等于发起人」校验不用改，语义就是「主 Bot 以发起人的名义处理本 run」。
     - 其它合成 turnId 仍然一律拒绝。
   - **其他人的回合**：
     - 现在 `authorizeV3RunMutationForCurrentTuple` 要求调用者等于 run 的 owner，非发起人会被直接拒绝。
     - 做法：只对 `edit`，把校验放宽为「应用、群、主会话一致」，调用者身份只用来决定直接生效还是转待确认。
-    - `retry` / `grant` / `cancel` 的鉴权不变。
+    - `retry` / `grant` / `cancel` 的鉴权不变。新命令 `ask-human` 与 `retry` 一样严格校验：只在发起人本人触发的回合，或本 run 事件唤醒的回合可用。
 - **人**：在主话题里跟主 Bot 说，由主 Bot 转成修改。第一版不在 Dashboard 上做编辑。
 - **子 Bot**：不能改流程。可以 `botmux report --status blocked` 说明做不了、给出建议，触发主 Bot 被唤醒。
 
@@ -671,7 +673,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
 |---|---|---|
 | 未开始 | 全部 | 直接按新定义调度 |
 | 等人工确认（Gate 等待中） | 改定义、改派、删除 | 作废等待中的 Gate，卡片冻结为「流程已修改，本次审批作废」，再按新定义重新走 Gate |
-| 受阻（`blocked`，含 `NODE_TIMEOUT`、`BOT_REPORTED_BLOCKED`、`HANDED_TO_HUMAN`） | 改定义、改派、删除 | 效果与「进行中」相同，但此时没有在跑的尝试，不需要停轮 |
+| 受阻（`blocked`，含 `NODE_TIMEOUT`、`BOT_REPORTED_BLOCKED`、`HANDED_TO_HUMAN`） | 改定义、改派、删除 | 此时没有在跑的尝试，不需要停轮。<br>改派、改定义并要求重跑：与现有改派同一路径，一并写 `nodeRetryRequested`，把 run 从 blocked 恢复为 running 后再发新交接；只写新定义的话，run 处于 blocked 时派不出交接。<br>只改定义、不要求重跑：节点保持受阻，等人或主 Bot 之后重试。<br>删除：写 `nodeCancelled`，下游按现有规则跳过或失败 |
 | 进行中 | 改定义、改派、删除 | 作废当前尝试（停掉子 Bot 这一轮、作废登记）。改定义和改派会在原落点发新的交接，注明「要求已修改」；删除则写 `nodeCancelled`。依赖不能改（已经开始了） |
 | 已完成 | 只能 `rerunNode`，或在它下游加节点 | 不能删、不能改定义（产出可能已被下游用了）。`rerunNode` 按 Revisit 的方式建新实例，已经用过旧产出的下游节点一起标为已替代并重跑。这走 Revisit 预算，不另开额度 |
 | 跳过 / 已取消 / 已替代 | 不能改 | 需要的话加新节点 |
@@ -715,7 +717,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
   - **必须写明理由**：主 Bot 每次自动处理都要带上理由，命令为 `botmux workflow retry|edit … --reason "<为什么自动处理>"`；交给人时运行 `botmux workflow ask-human <runId> --node <id> --reason "<为什么交给人>"`。理由记进运行记录：自动处理在 `nodeRetryRequested` / `nodeReassigned` / `dagRevised` 事件上新增独立字段 `auto: { by: 'main_bot', reason }`。`nodeRetryRequested` 已有的 `reason`（闭集取值 `blockedRetry`）不复用、不改；交给人写一条新事件 `nodeHandedToHuman`。
   - **由事件唤醒的回合缺理由就拒绝**：CLI 在这类回合里不带 `--reason` 时直接报错。人本人触发的回合可以不填。
   - **交给人之后节点处于什么状态**：
-    - `ask-human` 在同一把 journal 锁内依次做三件事：先停掉该节点正在进行的尝试（与超时同一条关闭路径），再写 `nodeHandedToHuman`（只作记录），然后写 `nodeBlocked { errorCode: 'HANDED_TO_HUMAN' }`，理由原样展示。尝试的关账和节点状态都由这条 `nodeBlocked` 决定，与其它受阻原因一致；只写 `nodeHandedToHuman` 不会关闭尝试。
+    - `ask-human` 在同一把 journal 锁内依次做三件事：先停掉该节点正在进行的尝试（与超时同一条关闭路径），再写 `nodeHandedToHuman`（只作记录），然后写 `nodeBlocked { errorClass: 'workerError', recovery: 'retry', errorCode: 'HANDED_TO_HUMAN' }`（与其它外部受阻原因相同的取值，不新增错误类别），理由原样展示。尝试的关账和节点状态都由这条 `nodeBlocked` 决定，与其它受阻原因一致；只写 `nodeHandedToHuman` 不会关闭尝试。
     - 之后沿用现有阻塞卡（重试、改派、取消），不另设超时，等人处理。
     - 人在主话题里回复，算发起人或其他人触发的普通回合，按 M1 区分能否直接改流程；处理完由人点卡片，或由主 Bot 在发起人回合里 `retry` / `edit`。
   - **在哪里展示**：节点卡上显示最近一次的「主 Bot 自动重试 / 改派 / 重做：<理由>」或「交给人决定：<理由>」；看板节点详情列出全部记录；交给人时节点状态显示为「等人工确认」。
