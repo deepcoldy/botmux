@@ -35,6 +35,38 @@ export function resolveQuoteTarget(args: QuoteTargetArgs): string | null {
   return target && target.trim() ? target.trim() : null;
 }
 
+/** 群秘书回合里 `botmux send` 必须声明的动作类型（见 services/group-secretary-*）。 */
+export const SECRETARY_SEND_ACTIONS = ['nudge', 'ask', 'dispatch', 'deliver', 'alert'] as const;
+export type SecretarySendAction = typeof SECRETARY_SEND_ACTIONS[number];
+
+/** 群秘书摘要回合的 turn id 前缀（group-secretary-runtime 生成）。 */
+export const SECRETARY_TURN_PREFIX = 'secretary:';
+
+/**
+ * 群秘书回合的发送闸：秘书回合（turn id 以 `secretary:` 开头）里的每一条 send 都必须用
+ * `--secretary-action` 声明动作；没有声明 = 模型在写旁白，直接拒发。非秘书回合不受影响，
+ * 但带了该参数也只接受合法值，免得拼错被静默忽略。
+ */
+export function validateSecretaryAction(args: {
+  turnId?: string;
+  action?: string;
+}): { ok: true; action?: SecretarySendAction } | { ok: false; error: string } {
+  const action = args.action?.trim().toLowerCase();
+  if (action !== undefined && action !== '' && !(SECRETARY_SEND_ACTIONS as readonly string[]).includes(action)) {
+    return { ok: false, error: `--secretary-action 只接受 ${SECRETARY_SEND_ACTIONS.join(' | ')}，收到 "${args.action}"` };
+  }
+  const isSecretaryTurn = !!args.turnId?.startsWith(SECRETARY_TURN_PREFIX);
+  if (!isSecretaryTurn) return { ok: true, ...(action ? { action: action as SecretarySendAction } : {}) };
+  if (!action) {
+    return {
+      ok: false,
+      error: 'botmux send refused: 这是群秘书回合，每条消息都必须用 --secretary-action 声明动作'
+        + `（${SECRETARY_SEND_ACTIONS.join(' | ')}）。没有需要催办 / 请示 / 派活 / 交付 / 告警的事就不要发消息，直接结束本轮。`,
+    };
+  }
+  return { ok: true, action: action as SecretarySendAction };
+}
+
 export interface ExplicitRecipientReplyArgs {
   /** --quote is intentional routing and must always win. */
   explicitQuote?: string;

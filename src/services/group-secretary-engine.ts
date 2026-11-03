@@ -67,6 +67,11 @@ export interface SecretaryEvent {
   /** stuck 时的 turn、attention 时的原因等。 */
   detail?: string;
   message?: SecretaryMessage;
+  /**
+   * 秘书自己在该会话话题里、最近一条真人消息之后已经发过几条（催办 / 传话）。由引擎按群消息
+   * 数出来，不靠模型记忆，会话轮换、压缩都不丢；达到上限时模型只能改为请示真人。
+   */
+  ownMessagesSinceHuman?: number;
   /** 投递前由 runtime 补上的会话最近对话（本机 daemon insight，已脱敏）；拿不到就缺省。 */
   transcript?: Array<{ role: string; text: string }>;
 }
@@ -76,8 +81,12 @@ export interface SecretaryDigest {
   /** 已投递失败的次数（requeue 时累加）。 */
   attempts?: number;
   events: SecretaryEvent[];
-  /** 与事件相关的近期消息（按时间升序），供模型判断上下文。 */
+  /** 与事件相关的近期消息（按时间升序），供模型判断上下文；包含事件之后的新消息。 */
   context: SecretaryMessage[];
+  /** 本机各 bot 在本群的在跑 / 近期会话（传话、催办要发进对方所在的话题）。 */
+  activeSessions?: SecretarySessionView[];
+  /** 秘书自己最近在本群发过的消息（避免重复请示 / 重复催）。 */
+  ownRecent?: SecretaryMessage[];
 }
 
 export interface GroupSecretaryEngineOptions {
@@ -102,6 +111,8 @@ export interface GroupSecretaryEngineOptions {
   maxDeliveryAttempts?: number;
   /** 每个群积压事件上限（超出丢最旧的），防止投递持续失败时 prompt 无限变长。 */
   maxPendingPerChat?: number;
+  /** 会话事件超过这个年龄就视为过期丢弃（如网关故障期间攒下、恢复后才投递的事件）。 */
+  staleEventMs?: number;
 }
 
 const WORKING_TURNS = new Set(['working', 'starting', 'analyzing']);
@@ -129,6 +140,8 @@ export class GroupSecretaryEngine {
   private readonly chats = new Map<string, ChatState>();
   private readonly sessions = new Map<string, SessionMemo>();
   private readonly sessionEventTimes = new Map<string, number[]>();
+  /** 每个会话最近一次快照（投递前复核事件是否仍然成立、列出在跑会话）。 */
+  private readonly latest = new Map<string, SecretarySessionView>();
 
   constructor(options: GroupSecretaryEngineOptions) {
     this.opts = {
@@ -139,11 +152,12 @@ export class GroupSecretaryEngine {
       minFlushIntervalMs: options.minFlushIntervalMs ?? 20_000,
       unaddressedGraceMs: options.unaddressedGraceMs ?? 20_000,
       perSessionEventsPerHour: options.perSessionEventsPerHour ?? 3,
-      contextMessagesPerChat: options.contextMessagesPerChat ?? 60,
-      contextPerEvent: options.contextPerEvent ?? 6,
+      contextMessagesPerChat: options.contextMessagesPerChat ?? 200,
+      contextPerEvent: options.contextPerEvent ?? 8,
       isTrustedHuman: options.isTrustedHuman ?? (() => true),
       maxDeliveryAttempts: options.maxDeliveryAttempts ?? 3,
       maxPendingPerChat: options.maxPendingPerChat ?? 20,
+      staleEventMs: options.staleEventMs ?? 10 * 60_000,
     };
   }
 
@@ -206,6 +220,7 @@ export class GroupSecretaryEngine {
       // 摘要落点（秘书自己的群级会话）不观察，避免自激。
       if (row.larkAppId === this.opts.selfAppId && row.scope === 'chat') continue;
       seen.add(row.sessionId);
+      this.latest.set(row.sessionId, row);
       const prev = this.sessions.get(row.sessionId);
       this.sessions.set(row.sessionId, {
         liveness: row.liveness,
@@ -231,6 +246,9 @@ export class GroupSecretaryEngine {
     }
     for (const id of [...this.sessions.keys()]) {
       if (!seen.has(id)) this.sessions.delete(id);
+    }
+    for (const id of [...this.latest.keys()]) {
+      if (!seen.has(id)) this.latest.delete(id);
     }
     // 限流计数与会话记忆分开过期：会话因探测失败暂时从快照里消失时，计数不能被清零，
     // 否则「催 → 停 → 再催」的循环会绕过每小时上限。
@@ -273,6 +291,9 @@ export class GroupSecretaryEngine {
         }
         state.lastEventAt = Math.max(state.lastEventAt, ...due.map(u => u.dueAt));
       }
+      // 投递前复核：过期的、会话状态已经变了的事件直接丢弃（网关故障期间攒下的事件恢复后
+      // 不会原样重放，避免去催一个早就做完、或者已经重新开工的任务）。
+      if (state.pending.length > 0) state.pending = state.pending.filter(e => this.stillValid(e, now));
       if (state.pending.length === 0) continue;
       if (now - state.lastEventAt < this.opts.debounceMs) continue;
       if (now - state.lastFlushAt < this.opts.minFlushIntervalMs) continue;
@@ -281,7 +302,24 @@ export class GroupSecretaryEngine {
       state.pending = [];
       state.pendingAttempts = 0;
       state.lastFlushAt = now;
-      out.push({ chatId, events, context: this.contextFor(state, events), ...(attempts ? { attempts } : {}) });
+      for (const event of events) {
+        const root = event.session?.scope === 'thread' ? event.session.rootMessageId : undefined;
+        if (root) event.ownMessagesSinceHuman = this.ownMessagesSinceHuman(state, root);
+      }
+      const activeSessions = [...this.latest.values()]
+        .filter(v => v.chatId === chatId
+          && (v.liveness === 'alive' || (v.lastActivityAt !== undefined && now - v.lastActivityAt < 24 * HOUR_MS)))
+        .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
+        .slice(0, 15);
+      const ownRecent = state.messages.filter(m => m.fromSelf).slice(-6);
+      out.push({
+        chatId,
+        events,
+        context: this.contextFor(state, events),
+        ...(activeSessions.length ? { activeSessions } : {}),
+        ...(ownRecent.length ? { ownRecent } : {}),
+        ...(attempts ? { attempts } : {}),
+      });
     }
     return out;
   }
@@ -299,6 +337,38 @@ export class GroupSecretaryEngine {
     this.trimPending(state);
     state.pendingAttempts = Math.max(state.pendingAttempts, attempts);
     return true;
+  }
+
+  /** 会话事件在投递时是否仍然成立。拿不到当前快照（探测失败）时只按年龄判断。 */
+  private stillValid(event: SecretaryEvent, now: number): boolean {
+    if (!event.session) return true;
+    if (now - event.at > this.opts.staleEventMs) return false;
+    const cur = this.latest.get(event.session.sessionId);
+    if (!cur) return true;
+    switch (event.kind) {
+      case 'turn_ended':
+        return cur.liveness === 'alive' && cur.turn === 'idle';
+      case 'stuck':
+        return cur.turn === event.session.turn;
+      case 'attention':
+        return !!cur.attention && cur.attention.at === event.session.attention?.at;
+      case 'stopped':
+        return cur.liveness !== 'alive';
+      default:
+        return true;
+    }
+  }
+
+  /** 话题里最近一条真人消息之后，秘书自己发了几条。 */
+  private ownMessagesSinceHuman(state: ChatState, root: string): number {
+    let count = 0;
+    for (let i = state.messages.length - 1; i >= 0; i--) {
+      const m = state.messages[i];
+      if (m.messageId !== root && m.rootId !== root) continue;
+      if (m.fromSelf) count++;
+      else if (m.senderType === 'user') break;
+    }
+    return count;
   }
 
   private contextFor(state: ChatState, events: SecretaryEvent[]): SecretaryMessage[] {

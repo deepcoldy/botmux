@@ -9624,6 +9624,7 @@ import {
   managedVcSendPayloadError,
   containsLarkAtTag,
   matchUniqueChatMemberOpenId,
+  validateSecretaryAction,
 } from './services/send-policy.js';
 import { normalizePositionalSendContent } from './services/send-content.js';
 import { describeScheduleState } from './services/schedule-until-done.js';
@@ -9827,7 +9828,7 @@ async function relaySend(
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -12438,6 +12439,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     hasQuoteTargetSender: !!replyTargetSenderOpenId,
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
+  // 群秘书回合发送闸：秘书回合里每条消息都要声明动作，旁白式发送直接拒绝。
+  const secretaryGate = validateSecretaryAction({
+    turnId: currentTurnId,
+    action: argValue(rest, '--secretary-action'),
+  });
+  if (!secretaryGate.ok) { console.error(secretaryGate.error); process.exit(2); }
 
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
 

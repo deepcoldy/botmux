@@ -269,3 +269,68 @@ describe('GroupSecretaryEngine — hardening', () => {
   });
 });
 
+
+describe('GroupSecretaryEngine — delivery-time revalidation and context', () => {
+  it('drops a turn_ended whose session went back to work before delivery', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    e.observeSessions([session('s1')]);
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    e.observeSessions([session('s1', { turn: 'working' })]);
+    expect(advance(e, 5_000)).toEqual([]);
+  });
+
+  it('drops events that went stale while delivery was failing (gateway outage replay)', () => {
+    const e = engine({ minFlushIntervalMs: 0, staleEventMs: 10 * 60_000, maxDeliveryAttempts: 10 });
+    e.observeSessions([session('s1')]);
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    const [digest] = advance(e, 5_000);
+    e.requeue(digest);
+    expect(advance(e, 11 * 60_000)).toEqual([]);
+  });
+
+  it('drops attention once it is cleared and stuck once it recovered', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    e.observeSessions([session('a'), session('b')]);
+    e.observeSessions([session('a', { attention: { kind: 'blocked', reason: 'x', at: 7 } }), session('b', { turn: 'stalled' })]);
+    e.observeSessions([session('a'), session('b', { turn: 'working' })]);
+    expect(advance(e, 5_000)).toEqual([]);
+  });
+
+  it('counts the secretary\'s own messages in a thread since the last human message', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    const root = 'om_root_s1';
+    e.observeMessage(msg(root, { mentionCount: 1 }));
+    e.observeMessage(msg('om_n1', { fromSelf: true, senderType: 'bot', rootId: root }));
+    e.observeMessage(msg('om_b', { senderType: 'bot', rootId: root, text: '好的' }));
+    e.observeMessage(msg('om_n2', { fromSelf: true, senderType: 'bot', rootId: root }));
+    e.observeSessions([session('s1')]);
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    const [digest] = advance(e, 5_000);
+    expect(digest.events[0].ownMessagesSinceHuman).toBe(2);
+    expect(digest.ownRecent?.map(m => m.messageId)).toEqual(['om_n1', 'om_n2']);
+  });
+
+  it('a human reply in the thread resets the secretary\'s message count', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    const root = 'om_root_s1';
+    e.observeMessage(msg(root, { mentionCount: 1 }));
+    e.observeMessage(msg('om_n1', { fromSelf: true, senderType: 'bot', rootId: root }));
+    e.observeMessage(msg('om_n2', { fromSelf: true, senderType: 'bot', rootId: root }));
+    e.observeMessage(msg('om_h', { rootId: root, text: '我看到了' }));
+    e.observeMessage(msg('om_n3', { fromSelf: true, senderType: 'bot', rootId: root }));
+    e.observeSessions([session('s1')]);
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    expect(advance(e, 5_000)[0].events[0].ownMessagesSinceHuman).toBe(1);
+  });
+
+  it('lists active local sessions in the chat so relays can target the right thread', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    e.observeSessions([session('s1'), session('s2', { botName: 'E', scope: 'thread', rootMessageId: 'om_e', turn: 'idle' }), session('x', { chatId: OTHER_CHAT })]);
+    e.observeSessions([session('s1', { turn: 'idle' }), session('s2', { botName: 'E', scope: 'thread', rootMessageId: 'om_e', turn: 'idle' })]);
+    const [digest] = advance(e, 5_000);
+    expect(digest.activeSessions?.map(v => v.sessionId).sort()).toEqual(['s1', 's2']);
+    const prompt = renderGroupSecretaryPrompt(digest, { enabledByOpenId: 'ou_owner' });
+    expect(prompt).toContain('<active_sessions>');
+    expect(prompt).toContain('thread_root="om_e"');
+  });
+});
