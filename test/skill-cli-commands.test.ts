@@ -122,6 +122,24 @@ describe('botmux skill session command', () => {
     expect(res.stderr).not.toContain('not found');
   });
 
+  it.each([
+    [['--help']],
+    [['-h']],
+    [['help']],
+    [['list', '--help']],
+    [['show', '--help']],
+    [['show', '-h']],
+    [['resources', '--help']],
+    [['read', 'deploy', '--help']],
+  ])('prints usage for %j without needing a session id or manifest', (args) => {
+    for (const env of [{}, { BOTMUX_SESSION_ID: 'absent' }, { BOTMUX_SESSION_ID: 's1' }]) {
+      const res = runSkillSessionCommand(args, env);
+      expect(res.code).toBe(0);
+      expect(res.stderr).toBe('');
+      expect(res.stdout).toMatch(/^usage:/);
+    }
+  });
+
   it('still reports a genuinely absent manifest as not found', () => {
     const res = runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 'absent' });
     expect(res.code).toBe(2);
