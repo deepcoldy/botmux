@@ -257,7 +257,7 @@ class PostgresFeedbackStore implements FeedbackStore {
   }
   async tryRescheduleFeedbackOutbox(...args: Parameters<FeedbackStore['rescheduleFeedbackOutbox']>): Promise<Output<'tryRescheduleFeedbackOutbox'>> { return { done: true, changed: await this.rescheduleFeedbackOutbox(...args) }; }
   async resetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): Promise<number> {
-    return (await this.pool.query("UPDATE feedback_outbox SET status='pending',claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=$1", [now - staleAfterMs])).rowCount ?? 0;
+    return (await this.pool.query("UPDATE feedback_outbox SET status='pending',last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE 'webhook_outcome_unknown:' || COALESCE(claim_token,outbox_id) END,claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=$1", [now - staleAfterMs])).rowCount ?? 0;
   }
   async tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): Promise<Output<'tryResetExpiredFeedbackOutboxClaims'>> { return { done: true, changed: await this.resetExpiredFeedbackOutboxClaims(now, staleAfterMs) }; }
 }

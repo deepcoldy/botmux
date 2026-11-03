@@ -780,7 +780,7 @@ export class SkillFeedbackStore {
   }
 
   resetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): number {
-    return Number(this.db.prepare(`UPDATE feedback_outbox SET status='pending',claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=?`).run(now - staleAfterMs).changes);
+    return Number(this.db.prepare(`UPDATE feedback_outbox SET status='pending',last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE 'webhook_outcome_unknown:' || COALESCE(claim_token,outbox_id) END,claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=?`).run(now - staleAfterMs).changes);
   }
   tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): { done: true; changed: number } | { done: false; busy: true } {
     return this.withNonblockingBusy(
