@@ -1183,6 +1183,25 @@ export function isDispatchTaskTreeCardEnabled(env: NodeJS.ProcessEnv = process.e
   return readGlobalConfig().multiTopic?.taskTreeCard === true;
 }
 
+/**
+ * Host-resolved machine-wide on/off switches the daemon projects into spawned
+ * panes as `'true'`/`'false'` strings. This is the single step that turns the
+ * daemon-side config value into the env a file-sandboxed CLI reads (the child-env
+ * allowlist alone only forwards whatever stale value is already present). Pass
+ * the resolved env explicitly so tests can stub it instead of process.env.
+ * Covers the workflow feature, multi-topic orchestration and dispatch
+ * task-tree card switches (the latter two default the opposite way: multiTopic
+ * is on unless false, the card is off unless true — the readers already encode
+ * that, so this only stringifies their result).
+ */
+export function paneSwitchEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  return {
+    BOTMUX_WORKFLOW_ENABLED: isWorkflowFeatureEnabled(env) ? 'true' : 'false',
+    BOTMUX_MULTI_TOPIC_ENABLED: isMultiTopicOrchestrationEnabled(env) ? 'true' : 'false',
+    BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: isDispatchTaskTreeCardEnabled(env) ? 'true' : 'false',
+  };
+}
+
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.
  *  'repos' hides linked worktrees from selection cards; anything else
  *  (default 'all') lists repos + their worktrees. Shared by every scan
