@@ -858,7 +858,12 @@ async function handleWebhookRouteImpl(
         format: 'botmux.webhook.v1',
         sourceName: connector.promptEnvelope.sourceName || connector.name,
         trusted: false,
-        headers: pickAllowedHeaders(req, connector.promptEnvelope.headerAllowlist),
+        // Durable retries must hash identically at the daemon. Allowlisted
+        // headers are connector-owner configured for tracing and can vary on
+        // every delivery (x-request-id, gateway delivery ids), which would make
+        // the same-key retry collide as idempotency_conflict there; the edge
+        // dedup gate is intentionally off in this mode, so it cannot fold them.
+        headers: durableAsync ? {} : pickAllowedHeaders(req, connector.promptEnvelope.headerAllowlist),
         payload: parsed.payload,
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
