@@ -111,7 +111,8 @@ function readLandings(run: WorkflowSidebarRun, brand: Brand): Map<string, Workfl
 export interface WorkflowSidebarRunMeta {
   runId: string;
   title: string;
-  mainBot: { larkAppId: string; name?: string };
+  /** The app id is for admins only; members get the display name. */
+  mainBot: { larkAppId?: string; name?: string };
   /** 打开 run 所在的群。 */
   chatUrl?: string;
 }
@@ -168,12 +169,12 @@ export interface WorkflowSidebarProjectOptions {
   now?: () => number;
 }
 
-function runMeta(run: WorkflowSidebarRun, opts: WorkflowSidebarProjectOptions): WorkflowSidebarRunMeta {
+function runMeta(run: WorkflowSidebarRun, opts: WorkflowSidebarProjectOptions, audience: 'admin' | 'member'): WorkflowSidebarRunMeta {
   const name = opts.botName?.(run.mainLarkAppId);
   return {
     runId: run.runId,
     title: run.title,
-    mainBot: { larkAppId: run.mainLarkAppId, ...(name ? { name } : {}) },
+    mainBot: { ...(audience === 'admin' ? { larkAppId: run.mainLarkAppId } : {}), ...(name ? { name } : {}) },
     ...(run.chatId ? { chatUrl: chatAppLink(run.chatId, opts.brand) } : {}),
   };
 }
@@ -194,7 +195,7 @@ export function projectWorkflowSidebarAdmin(
   return {
     ok: true,
     audience: 'admin',
-    run: runMeta(run, opts),
+    run: runMeta(run, opts, 'admin'),
     view,
     landings: Object.fromEntries(readLandings(run, opts.brand)),
   };
@@ -251,7 +252,7 @@ export function projectWorkflowSidebarMember(
   return {
     ok: true,
     audience: 'member',
-    run: runMeta(run, opts),
+    run: runMeta(run, opts, 'member'),
     view: { runId: full.runId, runStatus: full.runStatus, nodes, generatedAt: full.generatedAt },
   };
 }

@@ -95,6 +95,7 @@ import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { handleWorkflowSidebar } from './dashboard/workflow-sidebar-api.js';
+import { publishDashboardH5Presence } from './core/dashboard-h5-presence.js';
 import {
   WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
   WorkflowSidebarMembershipCache,
@@ -142,6 +143,7 @@ import {
   createDashboardH5AuthController,
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
+  dashboardH5LoginUsable,
 } from './dashboard/h5-auth.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import { listLatestDiagnosticFiles } from './core/plugins/mcp/diagnostics-files.js';
@@ -494,6 +496,7 @@ const dashboardH5Auth = createDashboardH5AuthController({
 });
 const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
 const workflowSidebarMembership = new WorkflowSidebarMembershipCache();
+const WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS = 10_000;
 
 /** Ask the run's main bot daemon (its own app) whether the viewer is in the
  *  run's chat. Offline daemon / any error → unavailable (the sidebar denies). */
@@ -506,6 +509,8 @@ async function askWorkflowSidebarMembership(
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ chatId: request.chatId, ...request.principal }),
+      // The daemon makes up to one contact call plus the chat's member pages.
+      signal: AbortSignal.timeout(WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS),
     });
     if (!response.ok) return 'unavailable';
     const body = await response.json().catch(() => null) as { ok?: unknown; member?: unknown } | null;
@@ -8239,6 +8244,11 @@ listenWithProbe({
   boundDashboardPort = port;
   try { atomicWriteFileSync(PORT_PATH, String(port)); } catch (e) {
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
+  }
+  // Card builders (daemons / CLIs never see the H5 config) read this to pick
+  // the「工作流 ›」link: the Feishu sidebar only when H5 login can work there.
+  try { publishDashboardH5Presence(dashboardH5LoginUsable(dashboardH5AuthConfig)); } catch (e) {
+    logger.warn(`[dashboard] Failed to record H5 login availability: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
   // Reclaim any `.trash-*` skill trees left by an interrupted background unlink

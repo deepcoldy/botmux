@@ -84,47 +84,89 @@ export async function checkWorkflowViewerChatMembership(
 /** Same horizon the grant-approver member cache uses (`grant-owner.ts`): a
  *  person removed from the chat loses the sidebar within a minute. */
 export const WORKFLOW_SIDEBAR_MEMBERSHIP_TTL_MS = 60_000;
+/** A failed lookup is remembered (and denied) this long, so a page that keeps
+ *  retrying, or a burst of requests, cannot turn a struggling main bot into a
+ *  stream of Feishu contact / member-list calls. */
+export const WORKFLOW_SIDEBAR_MEMBERSHIP_UNAVAILABLE_TTL_MS = 5_000;
 const MAX_CACHED_VERDICTS = 1_000;
 
 /**
- * Short-lived cache of definitive verdicts (member / not member) per
- * (main bot, chat, principal). `unavailable` is never cached: the next request
- * asks again, and meanwhile the caller denies.
+ * Short-lived cache of verdicts per (main bot, chat, principal), with one
+ * lookup in flight per key: concurrent requests for the same key share it.
+ * Definitive verdicts live {@link WORKFLOW_SIDEBAR_MEMBERSHIP_TTL_MS};
+ * `unavailable` only {@link WORKFLOW_SIDEBAR_MEMBERSHIP_UNAVAILABLE_TTL_MS}
+ * (and the caller denies either way).
  */
 export class WorkflowSidebarMembershipCache {
-  private readonly verdicts = new Map<string, { member: boolean; at: number }>();
+  private readonly verdicts = new Map<string, { verdict: WorkflowViewerMembership; at: number }>();
+  private readonly inFlight = new Map<string, Promise<WorkflowViewerMembership>>();
   private readonly now: () => number;
   private readonly ttlMs: number;
+  private readonly unavailableTtlMs: number;
 
-  constructor(opts: { now?: () => number; ttlMs?: number } = {}) {
+  constructor(opts: { now?: () => number; ttlMs?: number; unavailableTtlMs?: number } = {}) {
     this.now = opts.now ?? Date.now;
     this.ttlMs = opts.ttlMs ?? WORKFLOW_SIDEBAR_MEMBERSHIP_TTL_MS;
+    this.unavailableTtlMs = opts.unavailableTtlMs ?? WORKFLOW_SIDEBAR_MEMBERSHIP_UNAVAILABLE_TTL_MS;
   }
 
-  async check(
+  check(
     key: { mainLarkAppId: string; chatId: string; principal: WorkflowViewerPrincipal },
     ask: () => Promise<WorkflowViewerMembership>,
   ): Promise<WorkflowViewerMembership> {
     const id = 'openId' in key.principal ? `o:${key.principal.openId}` : `u:${key.principal.unionId}`;
     const cacheKey = `${key.mainLarkAppId}\0${key.chatId}\0${id}`;
     const cached = this.verdicts.get(cacheKey);
-    if (cached && this.now() - cached.at < this.ttlMs) return cached.member ? 'member' : 'not_member';
-    let verdict: WorkflowViewerMembership;
-    try {
-      verdict = await ask();
-    } catch {
-      verdict = 'unavailable';
-    }
-    if (verdict === 'unavailable') {
+    if (cached) {
+      const ttl = cached.verdict === 'unavailable' ? this.unavailableTtlMs : this.ttlMs;
+      if (this.now() - cached.at < ttl) return Promise.resolve(cached.verdict);
       this.verdicts.delete(cacheKey);
+    }
+    const running = this.inFlight.get(cacheKey);
+    if (running) return running;
+    const lookup = (async (): Promise<WorkflowViewerMembership> => {
+      let verdict: WorkflowViewerMembership;
+      try {
+        verdict = await ask();
+      } catch {
+        verdict = 'unavailable';
+      }
+      this.verdicts.delete(cacheKey);
+      if (this.verdicts.size >= MAX_CACHED_VERDICTS) {
+        const oldest = this.verdicts.keys().next();
+        if (!oldest.done) this.verdicts.delete(oldest.value);
+      }
+      this.verdicts.set(cacheKey, { verdict, at: this.now() });
       return verdict;
-    }
-    this.verdicts.delete(cacheKey);
-    if (this.verdicts.size >= MAX_CACHED_VERDICTS) {
-      const oldest = this.verdicts.keys().next();
-      if (!oldest.done) this.verdicts.delete(oldest.value);
-    }
-    this.verdicts.set(cacheKey, { member: verdict === 'member', at: this.now() });
-    return verdict;
+    })();
+    this.inFlight.set(cacheKey, lookup);
+    const release = () => { if (this.inFlight.get(cacheKey) === lookup) this.inFlight.delete(cacheKey); };
+    lookup.then(release, release);
+    return lookup;
   }
+}
+
+/** What the daemon's membership IPC route answers (status + JSON body). */
+export interface WorkflowSidebarMembershipRouteResult {
+  status: number;
+  body: { ok: true; member: boolean } | { ok: false; error: string };
+}
+
+/**
+ * The daemon side of `POST {@link WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE}`: only a
+ * trusted host (the Dashboard, holding the host secret) may ask, only once the
+ * daemon knows its own app, and only with a well-formed request. A lookup that
+ * fails answers 503 so the Dashboard denies.
+ */
+export async function workflowSidebarMembershipRoute(
+  input: { trustedHost: boolean; selfLarkAppId: string | undefined; body: unknown },
+  deps: (selfLarkAppId: string) => WorkflowSidebarMembershipDeps,
+): Promise<WorkflowSidebarMembershipRouteResult> {
+  if (!input.trustedHost) return { status: 403, body: { ok: false, error: 'trusted_host_required' } };
+  if (!input.selfLarkAppId) return { status: 503, body: { ok: false, error: 'larkAppId_not_set' } };
+  const request = parseWorkflowSidebarMembershipRequest(input.body);
+  if (!request) return { status: 400, body: { ok: false, error: 'invalid_request' } };
+  const verdict = await checkWorkflowViewerChatMembership(request, deps(input.selfLarkAppId));
+  if (verdict === 'unavailable') return { status: 503, body: { ok: false, error: 'membership_unavailable' } };
+  return { status: 200, body: { ok: true, member: verdict === 'member' } };
 }

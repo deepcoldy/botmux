@@ -15,6 +15,10 @@ export const REPLY_CARD_FOOTER_MARKER = '\u2063\u2063\u2063\u2063';
  * becomes part of the text bots read from each other's cards (a handoff card
  * IS the executing bot's turn input). */
 export const WORKFLOW_SIDEBAR_ENTRY_ELEMENT_ID = 'botmux_wf_entry';
+/** Its label per locale. Kept here, beside the id, because the parser also
+ * recognizes it by label in Feishu's simplified card rendering, which may
+ * drop element ids. */
+export const WORKFLOW_SIDEBAR_ENTRY_LABEL = { zh: '工作流 ›', en: 'Workflow ›' } as const;
 
 /** Promoted H1/H2 heading widgets encode their original ATX level in the
  * element id. Lark strips `text_size` when a message is read back, so the id

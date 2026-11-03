@@ -33,6 +33,7 @@ import type {
 import type { Brand } from '../im/lark/lark-hosts.js';
 import type { DashboardAuthIdentity } from './h5-auth.js';
 import type { DashboardRequestIdentity } from './request-identity.js';
+import { logger } from '../utils/logger.js';
 import {
   projectWorkflowSidebarAdmin,
   projectWorkflowSidebarMember,
@@ -55,7 +56,20 @@ export interface WorkflowSidebarApiDeps {
   brand(larkAppId: string): Brand;
   botName?(larkAppId: string): string | undefined;
   now?(): number;
+  /** Monotonic clock + sleep for the denial floor (injectable for tests). */
+  monotonicNow?(): number;
+  sleep?(ms: number): Promise<void>;
 }
+
+/**
+ * Every member-path refusal answers the same body no sooner than this after
+ * the request arrived, so a non-member cannot tell "no such run" (answered
+ * from disk) from "exists, you are not in its chat" (answered after asking the
+ * main bot's daemon, which asks Feishu). One uncached lookup — a contact call
+ * plus the chat's member pages — normally finishes well inside it; chats so
+ * large that it does not still leak timing, which is all a guessed run id buys.
+ */
+export const WORKFLOW_SIDEBAR_DENY_FLOOR_MS = 1_000;
 
 export function workflowSidebarIsAdmin(identity: DashboardRequestIdentity | null): boolean {
   return identity?.canManageHost === true;
@@ -185,20 +199,26 @@ export async function handleWorkflowSidebar(
     return true;
   }
 
-  const forbidden = (error: string) => json(res, 403, { ok: false, error });
+  const monotonic = deps.monotonicNow ?? (() => performance.now());
+  const startedAt = monotonic();
+  // One outward answer for every refusal below; the reason stays in the log.
+  const forbidden = async (reason: string) => {
+    logger.info(`[workflow-sidebar] member view refused (${reason}) app=${target.appId} run=${target.runId}`);
+    const wait = WORKFLOW_SIDEBAR_DENY_FLOOR_MS - (monotonic() - startedAt);
+    if (wait > 0) await (deps.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms))))(wait);
+    json(res, 403, { ok: false, error: 'forbidden' });
+  };
   const found = readWorkflowSidebarRun(deps.runsDir, target.runId);
-  if (found.kind !== 'ok' || found.run.mainLarkAppId !== target.appId
-    || found.run.nodeExecutor !== 'bot' || !found.run.chatId) {
-    forbidden('forbidden');
-    return true;
-  }
+  if (found.kind !== 'ok') { await forbidden(`run ${found.kind}`); return true; }
+  if (found.run.mainLarkAppId !== target.appId) { await forbidden('main bot mismatch'); return true; }
+  if (found.run.nodeExecutor !== 'bot' || !found.run.chatId) { await forbidden('not a bot-executed run'); return true; }
   const run = found.run;
   const verdict = await deps.membership.check(
     { mainLarkAppId: run.mainLarkAppId, chatId: run.chatId!, principal },
     () => deps.askMembership(run.mainLarkAppId, { chatId: run.chatId!, principal }),
   );
-  if (verdict === 'unavailable') { forbidden('membership_unavailable'); return true; }
-  if (verdict !== 'member') { forbidden('forbidden'); return true; }
+  if (verdict === 'unavailable') { await forbidden('membership lookup failed'); return true; }
+  if (verdict !== 'member') { await forbidden('not a current chat member'); return true; }
   json(res, 200, projectWorkflowSidebarMember(run, opts));
   return true;
 }

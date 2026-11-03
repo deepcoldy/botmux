@@ -19,15 +19,17 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { parseCookie } from '../src/dashboard/auth.js';
 import {
   createDashboardH5AuthController,
+  dashboardH5LoginUsable,
   DashboardSessionStore,
   safeDashboardH5ReturnTo,
   type DashboardH5AuthConfig,
 } from '../src/dashboard/h5-auth.js';
+import { dashboardH5LoginAvailable, publishDashboardH5Presence } from '../src/core/dashboard-h5-presence.js';
 import { resolveDashboardIdentity, resolveDashboardRequestGate } from '../src/dashboard/request-identity.js';
 import { handleV3RunsApi } from '../src/dashboard/v3-runs-api.js';
 import { handlePluginResultAccess, resolvePluginResultViewerIdentity } from '../src/dashboard/plugin-result-access.js';
 import { PluginResultArtifactStore } from '../src/core/plugins/mcp/result-artifact-store.js';
-import { handleWorkflowSidebar } from '../src/dashboard/workflow-sidebar-api.js';
+import { handleWorkflowSidebar, WORKFLOW_SIDEBAR_DENY_FLOOR_MS } from '../src/dashboard/workflow-sidebar-api.js';
 import {
   WorkflowSidebarMembershipCache,
   type WorkflowSidebarMembershipRequest,
@@ -49,6 +51,11 @@ interface World {
   /** Verdict per principal key (`u:<union>` / `o:<open>`); default not_member. */
   verdicts: Map<string, WorkflowViewerMembership>;
   clock: { t: number };
+  /** Monotonic ms the handler measures its refusal floor with; an ask can
+   *  advance it to stand for the time the main bot's daemon took. */
+  mono: { t: number; askMs: number; askGate?: Promise<void> };
+  /** Every refusal-floor wait the handler requested, in ms. */
+  slept: number[];
   resultStore: PluginResultArtifactStore;
 }
 
@@ -88,7 +95,7 @@ async function start(runsDir: string, h5Overrides: Partial<DashboardH5AuthConfig
   });
   const resultRoot = trackTempDir(mkdtempSync(join(tmpdir(), 'wfs-results-')));
   const world: World = {
-    base: '', asks: [], verdicts: new Map(), clock,
+    base: '', asks: [], verdicts: new Map(), clock, mono: { t: 0, askMs: 0 }, slept: [],
     resultStore: new PluginResultArtifactStore({ dataDir: resultRoot }),
   };
   const membership = new WorkflowSidebarMembershipCache({ now: () => clock.t });
@@ -120,12 +127,16 @@ async function start(runsDir: string, h5Overrides: Partial<DashboardH5AuthConfig
         askMembership: async (mainLarkAppId, request) => {
           expect(mainLarkAppId).toBe(SIDEBAR_MAIN);
           world.asks.push(request);
+          await world.mono.askGate;
+          world.mono.t += world.mono.askMs;
           const key = 'unionId' in request.principal ? `u:${request.principal.unionId}` : `o:${request.principal.openId}`;
           return world.verdicts.get(key) ?? 'not_member';
         },
         brand: () => 'feishu',
         botName: (appId) => `bot(${appId})`,
         now: () => clock.t,
+        monotonicNow: () => world.mono.t,
+        sleep: async (ms) => { world.slept.push(ms); },
       })) return;
       const identity = identityOf(req);
       const cookie = parseCookie(req.headers.cookie);
@@ -193,7 +204,22 @@ describe('H5 sessions for people outside the allowlist are scoped to the workflo
     }
   });
 
-  it('a session scoped to plugin results does not open the sidebar: the entry sends it through H5 login again', async () => {
+  it('the H5 session endpoint answers a workflow-sidebar session exactly like no session', async () => {
+    const world = await start((await sidebarRun('wfs-scope-session')).runsDir);
+    const { cookie } = await login(world, 'code-member');
+    const scoped = await get(world, '/auth/feishu/session', { cookie: cookie! });
+    const anonymous = await get(world, '/auth/feishu/session');
+    expect([scoped.status, await scoped.text()]).toEqual([anonymous.status, await anonymous.text()]);
+    expect(scoped.status).toBe(401);
+  });
+
+  it('asking for both narrow scopes at once is refused without minting a session', async () => {
+    const world = await start((await sidebarRun('wfs-scope-both')).runsDir);
+    expect(await login(world, 'code-member', { workflowView: true, resultOnly: true })).toEqual({ status: 400 });
+    expect(await login(world, 'code-allowed', { workflowView: true, resultOnly: true })).toEqual({ status: 400 });
+  });
+
+    it('a session scoped to plugin results does not open the sidebar: the entry sends it through H5 login again', async () => {
     const { runsDir, runId } = await sidebarRun('wfs-scope-result');
     const world = await start(runsDir);
     world.verdicts.set('u:on_member_union', 'member');
@@ -241,6 +267,9 @@ describe('who sees what (D6)', () => {
       expect(memberText).not.toContain(leaked);
     }
     expect(world.asks).toEqual([{ chatId: SIDEBAR_CHAT, principal: { unionId: 'on_member_union' } }]);
+    // The main bot is named, not identified: its app id is for admins.
+    expect(member.run.mainBot).toEqual({ name: `bot(${SIDEBAR_MAIN})` });
+    expect(full.run.mainBot).toEqual({ larkAppId: SIDEBAR_MAIN, name: `bot(${SIDEBAR_MAIN})` });
   });
 
   it('a member sees the goal only of nodes already handed off in the chat; the admin sees every goal', async () => {
@@ -257,7 +286,7 @@ describe('who sees what (D6)', () => {
     expect(JSON.stringify(full)).toContain(PENDING_GOAL);
   });
 
-    it('someone not in the chat gets 403; nobody signed in gets 401 with the H5 login entry', async () => {
+  it('someone not in the chat gets 403; nobody signed in gets 401 with the H5 login entry', async () => {
     const { runsDir, runId } = await sidebarRun('wfs-outsider');
     const world = await start(runsDir);
     const { cookie } = await login(world, 'code-outsider');
@@ -276,7 +305,7 @@ describe('who sees what (D6)', () => {
     expect((await get(world, api(runId), admin)).status).toBe(200);
   });
 
-  it('members only see bot-executed runs of the app named in the link; non-admins cannot tell a missing run from a forbidden one', async () => {
+  it('members only see bot-executed runs of the app named in the link', async () => {
     const bot = await sidebarRun('wfs-gate-bot');
     const legacy = await sidebarRun('wfs-gate-legacy', {});
     const runsDir = bot.runsDir;
@@ -296,20 +325,61 @@ describe('who sees what (D6)', () => {
     expect((await get(world, api(bot.runId, 'cli_other_app'), admin)).status).toBe(404);
     expect((await get(world, api('wfs-no-such-run'), admin)).status).toBe(404);
   });
+
+  it('a non-member cannot tell a missing / foreign / non-bot run from one they are not allowed into: same body, same time', async () => {
+    const bot = await sidebarRun('wfs-oracle-bot');
+    const legacy = await sidebarRun('wfs-oracle-legacy', {});
+    const { cpSync } = await import('node:fs');
+    cpSync(legacy.run.runDir, join(bot.runsDir, legacy.runId), { recursive: true });
+    const world = await start(bot.runsDir);
+    const { cookie } = await login(world, 'code-member');
+    const headers = { cookie: cookie! };
+    // Asking the main bot's daemon takes a while; answering "no such run" does not.
+    world.mono.askMs = 150;
+    const answers: Array<[string, number, string, number]> = [];
+    const probe = async (label: string, path: string, verdict?: WorkflowViewerMembership) => {
+      if (verdict) world.verdicts.set('u:on_member_union', verdict);
+      world.clock.t += 120_000; // past every cached verdict
+      const before = world.mono.t;
+      world.slept.length = 0;
+      const response = await get(world, path, headers);
+      const elapsed = world.mono.t - before + world.slept.reduce((sum, ms) => sum + ms, 0);
+      answers.push([label, response.status, await response.text(), elapsed]);
+    };
+    await probe('missing run', api('wfs-oracle-missing'));
+    await probe('another main bot', api(bot.runId, 'cli_other_app'));
+    await probe('not bot-executed', api(legacy.runId));
+    await probe('exists, not a member', api(bot.runId), 'not_member');
+    await probe('exists, lookup failed', api(bot.runId), 'unavailable');
+    for (const [label, status, body, elapsed] of answers) {
+      expect([label, status, body, elapsed]).toEqual([label, 403, '{"ok":false,"error":"forbidden"}', WORKFLOW_SIDEBAR_DENY_FLOOR_MS]);
+    }
+    // Members are never slowed down.
+    world.verdicts.set('u:on_member_union', 'member');
+    world.clock.t += 120_000;
+    world.slept.length = 0;
+    expect((await get(world, api(bot.runId), headers)).status).toBe(200);
+    expect(world.slept).toEqual([]);
+  });
 });
 
 describe('membership is checked in the main bot\'s app, briefly cached, and fails closed', () => {
-  it('an unavailable lookup denies and is asked again next time; a definitive verdict is cached for a minute', async () => {
+  it('a failed lookup denies and is remembered for 5s; a definitive verdict is cached for a minute', async () => {
     const { runsDir, runId } = await sidebarRun('wfs-cache');
     const world = await start(runsDir);
     const { cookie } = await login(world, 'code-member');
     const headers = { cookie: cookie! };
     world.verdicts.set('u:on_member_union', 'unavailable');
     expect((await get(world, api(runId), headers)).status).toBe(403);
+    world.clock.t += 4_000;
+    expect((await get(world, api(runId), headers)).status).toBe(403);
+    expect(world.asks).toHaveLength(1);
+    world.clock.t += 1_500;
     expect((await get(world, api(runId), headers)).status).toBe(403);
     expect(world.asks).toHaveLength(2);
 
     world.verdicts.set('u:on_member_union', 'member');
+    world.clock.t += 5_000;
     expect((await get(world, api(runId), headers)).status).toBe(200);
     world.verdicts.set('u:on_member_union', 'not_member'); // removed from the chat
     world.clock.t += 30_000;
@@ -318,6 +388,21 @@ describe('membership is checked in the main bot\'s app, briefly cached, and fail
     world.clock.t += 31_000;
     expect((await get(world, api(runId), headers)).status).toBe(403);
     expect(world.asks).toHaveLength(4);
+  });
+
+  it('a burst of requests from one person shares one lookup', async () => {
+    const { runsDir, runId } = await sidebarRun('wfs-burst');
+    const world = await start(runsDir);
+    const { cookie } = await login(world, 'code-member');
+    world.verdicts.set('u:on_member_union', 'member');
+    let open!: () => void;
+    world.mono.askGate = new Promise<void>((resolve) => { open = resolve; });
+    const burst = Array.from({ length: 25 }, () => get(world, api(runId), { cookie: cookie! }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    open();
+    const statuses = await Promise.all(burst.map(async (response) => (await response).status));
+    expect(new Set(statuses)).toEqual(new Set([200]));
+    expect(world.asks).toHaveLength(1);
   });
 
   it('an open_id issued by another app is never used; the H5 app\'s own open_id is used only when it IS the main bot', async () => {
@@ -404,5 +489,34 @@ describe('the /workflow/<app>/<run> entry', () => {
       '/workflow/cli_a/r1?next=https://evil.example', '/workflow/cli_a/r1/extra', '/workflow//r1', '/workflow/cli_a/.hidden',
       '/workflow/cli_a/r1#x', '/\\evil.example/workflow/cli_a/r1',
     ]) expect([hostile, safeDashboardH5ReturnTo(hostile)]).toEqual([hostile, '/']);
+  });
+});
+
+describe('which link the cards use: the Dashboard publishes whether H5 login can work', () => {
+  it('"usable" is exactly when the H5 entry page can start a login', async () => {
+    const { runsDir } = await sidebarRun('wfs-h5-usable');
+    for (const [overrides, usable] of [
+      [{}, true],
+      [{ enabled: false }, false],
+      [{ appSecret: '' }, false],
+      [{ allowedOpenIds: [] }, false],
+    ] as Array<[Partial<DashboardH5AuthConfig>, boolean]>) {
+      const world = await start(runsDir, overrides);
+      const entry = await get(world, '/auth/feishu');
+      const config = { enabled: true, appId: H5_APP, appSecret: 'h5-secret', allowedOpenIds: ['ou_allowed'], ...overrides };
+      expect([overrides, dashboardH5LoginUsable(config), entry.status === 200]).toEqual([overrides, usable, usable]);
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+      server = null;
+    }
+  });
+
+  it('readers see the published fact; nothing published (or unreadable) means no H5 login', () => {
+    const dir = trackTempDir(mkdtempSync(join(tmpdir(), 'wfs-h5-presence-')));
+    const path = join(dir, '.dashboard-h5-login');
+    expect(dashboardH5LoginAvailable(path)).toBe(false);
+    publishDashboardH5Presence(true, path);
+    expect(dashboardH5LoginAvailable(path)).toBe(true);
+    publishDashboardH5Presence(false, path);
+    expect(dashboardH5LoginAvailable(path)).toBe(false);
   });
 });

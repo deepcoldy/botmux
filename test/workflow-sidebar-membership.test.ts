@@ -10,6 +10,7 @@ import {
   checkWorkflowViewerChatMembership,
   parseWorkflowSidebarMembershipRequest,
   WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+  workflowSidebarMembershipRoute,
   type WorkflowSidebarMembershipDeps,
 } from '../src/core/workflow-sidebar-membership.js';
 import { routeHasNarrowUntrustedAuth } from '../src/core/dashboard-ipc-server.js';
@@ -79,5 +80,31 @@ describe('the daemon route', () => {
   it('is not one of the IPC routes a sandboxed session may call without the host secret', () => {
     // Only the Dashboard (holding the host secret) may ask whether someone is in a chat.
     expect(routeHasNarrowUntrustedAuth('POST', WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE)).toBe(false);
+  });
+
+  const body = { chatId: 'oc_c', unionId: 'on_union1' };
+
+  it('answers only a trusted host, and asks Feishu only then', async () => {
+    const asked: string[] = [];
+    const factory = (app: string) => { asked.push(app); return deps().d; };
+    expect(await workflowSidebarMembershipRoute({ trustedHost: false, selfLarkAppId: 'cli_main', body }, factory))
+      .toEqual({ status: 403, body: { ok: false, error: 'trusted_host_required' } });
+    expect(asked).toEqual([]);
+    expect(await workflowSidebarMembershipRoute({ trustedHost: true, selfLarkAppId: 'cli_main', body }, factory))
+      .toEqual({ status: 200, body: { ok: true, member: true } });
+    expect(asked).toEqual(['cli_main']);
+  });
+
+  it('checks in the daemon\'s own app, rejects malformed requests, and answers a failed lookup with 503', async () => {
+    expect(await workflowSidebarMembershipRoute({ trustedHost: true, selfLarkAppId: undefined, body }, () => deps().d))
+      .toMatchObject({ status: 503 });
+    expect(await workflowSidebarMembershipRoute({ trustedHost: true, selfLarkAppId: 'cli_main', body: { chatId: 'oc_c' } }, () => deps().d))
+      .toEqual({ status: 400, body: { ok: false, error: 'invalid_request' } });
+    const failing = deps({ listChatMemberOpenIds: async () => { throw new Error('rate limited'); } }).d;
+    expect(await workflowSidebarMembershipRoute({ trustedHost: true, selfLarkAppId: 'cli_main', body }, () => failing))
+      .toEqual({ status: 503, body: { ok: false, error: 'membership_unavailable' } });
+    const outsider = deps({ listChatMemberOpenIds: async () => ['ou_someone'] }).d;
+    expect(await workflowSidebarMembershipRoute({ trustedHost: true, selfLarkAppId: 'cli_main', body }, () => outsider))
+      .toEqual({ status: 200, body: { ok: true, member: false } });
   });
 });

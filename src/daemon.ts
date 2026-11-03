@@ -777,10 +777,9 @@ import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
 import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
 import { buildV3ProgressCard, v3ProgressWorkflowEntry } from './im/lark/v3-progress-card.js';
-import { workflowSidebarEntryLink } from './im/lark/workflow-sidebar-entry.js';
+import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
 import {
-  checkWorkflowViewerChatMembership,
-  parseWorkflowSidebarMembershipRequest,
+  workflowSidebarMembershipRoute,
   WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
 } from './core/workflow-sidebar-membership.js';
 import { V3ProgressCardManager } from './im/lark/v3-progress-card-manager.js';
@@ -6675,12 +6674,7 @@ async function executePluginSlashCommand(input: {
  *  daemon's bot (cards in one chat share its brand). No Dashboard address →
  *  no entry; callers pass undefined and the card keeps its old shape. */
 function daemonWorkflowSidebarEntry(mainLarkAppId: string, runId: string) {
-  return workflowSidebarEntryLink({
-    dashboardOrigin: resolveDashboardOrigin(),
-    mainLarkAppId,
-    runId,
-    brand: getBotBrand(selfDaemonLarkAppId ?? mainLarkAppId),
-  });
+  return resolveWorkflowEntryLink({ mainLarkAppId, runId, brand: getBotBrand(selfDaemonLarkAppId ?? mainLarkAppId) });
 }
 
 // Dependencies passed to card-handler
@@ -9188,23 +9182,23 @@ ipcRoute('POST', WORKFLOW_HANDOFF_STOP_ROUTE, async (req, res) => {
 // host only — the Dashboard asks on behalf of an H5 / platform identity it has
 // already authenticated; a failed lookup answers 503 and the Dashboard denies.
 ipcRoute('POST', WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, async (req, res) => {
-  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
-  if (!selfDaemonLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
-  const appId = selfDaemonLarkAppId;
+  const trustedHost = isTrustedHostIpcRequest(req);
   let raw: unknown;
-  try {
-    raw = await readJsonBody<unknown>(req, 4 * 1024);
-  } catch {
-    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  if (trustedHost) {
+    try {
+      raw = await readJsonBody<unknown>(req, 4 * 1024);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    }
   }
-  const request = parseWorkflowSidebarMembershipRequest(raw);
-  if (!request) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
-  const verdict = await checkWorkflowViewerChatMembership(request, {
-    resolveOpenIdByUnionId: (unionId) => resolveTargetAppOpenId(appId, unionId),
-    listChatMemberOpenIds: (chatId) => listChatMemberOpenIds(appId, chatId),
-  });
-  if (verdict === 'unavailable') return jsonRes(res, 503, { ok: false, error: 'membership_unavailable' });
-  return jsonRes(res, 200, { ok: true, member: verdict === 'member' });
+  const result = await workflowSidebarMembershipRoute(
+    { trustedHost, selfLarkAppId: selfDaemonLarkAppId, body: raw },
+    (appId) => ({
+      resolveOpenIdByUnionId: (unionId) => resolveTargetAppOpenId(appId, unionId),
+      listChatMemberOpenIds: (chatId) => listChatMemberOpenIds(appId, chatId),
+    }),
+  );
+  return jsonRes(res, result.status, result.body);
 });
 
 // Executing bot's daemon ← its own CLI (`botmux report --dispatch-root

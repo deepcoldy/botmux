@@ -59,6 +59,12 @@ export interface DashboardAuthIdentity {
   expiresAt: number;
 }
 
+/** H5 login works only with an app, its secret and an allowlist; the
+ *  controller answers 404 / 503 otherwise. */
+export function dashboardH5LoginUsable(config: Pick<DashboardH5AuthConfig, 'enabled' | 'appId' | 'appSecret' | 'allowedOpenIds'>): boolean {
+  return config.enabled && !!config.appId && !!config.appSecret && config.allowedOpenIds.length > 0;
+}
+
 export interface FeishuH5CodeExchanger {
   exchange(code: string, signal?: AbortSignal): Promise<{ openId: string; unionId?: string }>;
 }
@@ -940,7 +946,9 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
 
     if (req.method === 'GET' && url.pathname === sessionPath) {
       const identity = resolve(req);
-      if (!identity) {
+      // A workflow-sidebar session is no Dashboard login: answer exactly what
+      // an anonymous request gets (its owner's open_id is not echoed either).
+      if (!identity || identity.workflowViewOnly) {
         json(res, 401, { ok: false, error: 'authentication_required' });
       } else {
         json(res, 200, { ok: true, user: { openId: identity.userId }, expiresAt: identity.expiresAt });

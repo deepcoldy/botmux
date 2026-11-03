@@ -75,7 +75,9 @@ The link carries no credential; what you see depends on who you are:
 - **Current members of the chat**: a reduced view — node names, goals, executing bot, status, duration and where each node landed; no terminals, logs, product contents, parameter values or error details. Membership is checked live through the main bot; someone who leaves the chat loses access within a minute.
 - **Everyone else**: no access.
 
-Members are identified through the existing Feishu H5 passwordless login, with no extra switch: with H5 login configured (`BOTMUX_DASHBOARD_FEISHU_H5_*`), members outside its allowlist can open the sidebar too, but only get a session limited to the workflow sidebar and cannot reach any other Dashboard page. **Without H5 login only admins can view it.**
+Members are identified through the existing Feishu H5 passwordless login, with no extra switch: with H5 login configured (`BOTMUX_DASHBOARD_FEISHU_H5_*`), members outside its allowlist can open the sidebar too, but only get a session limited to the workflow sidebar and cannot reach any other Dashboard page. People on the H5 allowlist cannot see run details in the Dashboard either, so the sidebar gives them the member view too.
+
+**Without H5 login only admins can view it**: the sidebar is a separate browser context that cannot carry your Dashboard login, so the button then opens the run's Dashboard page in the browser instead (like the progress card's former "Web 详情"), where your existing Dashboard login applies.
 
 ### Limits
 

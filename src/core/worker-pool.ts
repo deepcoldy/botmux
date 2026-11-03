@@ -203,8 +203,8 @@ import { removeSessionMcpGatewayDir } from './plugins/mcp/socket-dir.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { materializeFeedbackPolicyForDelivery } from '../services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
-import { attachWorkflowSidebarEntry, workflowNodeSessionEntry, workflowSidebarEntryLink } from '../im/lark/workflow-sidebar-entry.js';
-import { resolveDashboardOrigin } from './workbench-link.js';
+import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark/workflow-sidebar-entry.js';
+import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
 import { TurnResultStore } from '../services/turn-result-store.js';
@@ -21775,8 +21775,7 @@ function deliverFinalOutput(
       // at the signature row's right end (after the on-call button).
       cardJson = attachWorkflowSidebarEntry(cardJson, workflowNodeSessionEntry(
         ds.session.workflowNode,
-        (mainLarkAppId, runId) => workflowSidebarEntryLink({
-          dashboardOrigin: resolveDashboardOrigin(),
+        (mainLarkAppId, runId) => resolveWorkflowEntryLink({
           mainLarkAppId,
           runId,
           brand: getBotBrand(ds.larkAppId),

@@ -9580,8 +9580,8 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { materializeFeedbackPolicyForDelivery } from './services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
-import { attachWorkflowSidebarEntry, workflowNodeSessionEntry, workflowSidebarEntryLink } from './im/lark/workflow-sidebar-entry.js';
-import { resolveDashboardOrigin } from './core/workbench-link.js';
+import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from './im/lark/workflow-sidebar-entry.js';
+import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
 import { applyInlineMentions, applyInlineMentionsToCard } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import {
@@ -12596,8 +12596,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
     return attachWorkflowSidebarEntry(card, workflowNodeSessionEntry(
       s.workflowNode,
-      (mainLarkAppId, runId) => workflowSidebarEntryLink({
-        dashboardOrigin: resolveDashboardOrigin(),
+      (mainLarkAppId, runId) => resolveWorkflowEntryLink({
         mainLarkAppId,
         runId,
         brand: getBotBrand(s.larkAppId),

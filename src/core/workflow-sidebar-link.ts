@@ -76,3 +76,17 @@ export function parseWorkflowSidebarHash(search: string, hash: string): Workflow
   const appId = hashParams.get('app') ?? '';
   return isWorkflowSidebarTarget(appId, runId) ? { appId, runId } : null;
 }
+
+/**
+ * Does this link point at a workflow entry — the `/workflow/<app>/<run>`
+ * sidebar entry, the Dashboard's `#/workflows/<run>` page, or a Feishu AppLink
+ * wrapping either (its target travels in the `url` query parameter)?
+ */
+export function isWorkflowSidebarEntryUrl(href: string): boolean {
+  let url: URL;
+  try { url = new URL(href); } catch { return false; }
+  if (parseWorkflowSidebarEntryPath(url.pathname)) return true;
+  if (/^#\/workflows\/[^/?#]+/.test(url.hash)) return true;
+  const wrapped = url.searchParams.get('url');
+  return wrapped !== null && wrapped !== href && !wrapped.includes('url=') && isWorkflowSidebarEntryUrl(wrapped);
+}
