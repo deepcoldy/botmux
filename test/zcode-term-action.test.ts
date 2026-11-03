@@ -38,6 +38,7 @@ function harness(interruptKey?: 'esc', backendType: 'pty' | 'tmux' = 'pty', adap
     backend,
     effectiveBackendType: backendType,
     isRemoteBackendType: () => false,
+    nativeSessionForkPending: () => false,
     cliLifetimeNonce: 1,
     codexCliEffortOperation: undefined,
     currentBotmuxTurnId: 'om_turn',
