@@ -7,7 +7,7 @@ import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
 import { FEEDBACK_TABLES } from './feedback-postgres-schema.js';
-import { closeFeedbackStorage } from './feedback-storage.js';
+import { closeFeedbackStorage, getFeedbackStorage } from './feedback-storage.js';
 
 export interface MaintenanceReport {
   migrationId: string;
@@ -94,6 +94,7 @@ export function startFeedbackMaintenanceParticipant(
           await stopOutbox();
           stoppedOutbox = true;
           await closeFeedbackStorage(dataDir);
+          if (config.active.backend === 'postgresql') await getFeedbackStorage(dataDir);
           ready = true;
         }
       } else if (stoppedOutbox) {

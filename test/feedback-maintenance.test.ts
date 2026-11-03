@@ -1,6 +1,8 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { once } from 'node:events';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import {
@@ -23,6 +25,18 @@ async function fixture() {
   return { directory, store };
 }
 describe('feedback maintenance', () => {
+  it('fences a connection already open in another process', async () => {
+    const { directory } = await fixture();
+    const child = spawnTsScript('test/helpers/feedback-maintenance-child.ts', [directory], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    try {
+      await once(child, 'message');
+      await beginFeedbackMaintenance(directory, 'child-freeze');
+      await freezeFeedbackSource(directory, 'child-freeze');
+      const result = once(child, 'message');
+      child.send('write');
+      expect((await result)[0]).toMatchObject({ error: 'feedback_source_frozen' });
+    } finally { child.kill(); }
+  });
   it('waits for a sending process before freezing', async () => {
     const { directory } = await fixture();
     let finish!: () => void;
