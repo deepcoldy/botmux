@@ -745,13 +745,22 @@ describe('findJsonlContainingFingerprint', () => {
     })).toBeNull();
   });
 
-  it('respects minMtimeMs for subagent transcripts', () => {
+  it('respects minMtimeMs for otherwise eligible forwarded subagent messages', () => {
     const sid = '11111111-2222-3333-4444-555555555555';
     const subDir = join(projectDir, sid, 'subagents');
     mkdirSync(subDir, { recursive: true });
     const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
-    writeFileSync(subagent, '{"type":"user","message":{"role":"user","content":"repeatable short prompt"}}\n');
+    writeFileSync(subagent, JSON.stringify({
+      type: 'user',
+      isMeta: true,
+      message: { role: 'user', content: 'repeatable short prompt' },
+    }) + '\n');
     utimesSync(subagent, 1_000_000, 1_000_000);
+
+    // Positive control: without the mtime floor, this forwarded event matches.
+    expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
+      includeSubagentTranscripts: true,
+    })).toBe(subagent);
     expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
       includeSubagentTranscripts: true,
       minMtimeMs: 1_500_000_000,
@@ -759,11 +768,29 @@ describe('findJsonlContainingFingerprint', () => {
   });
 
   it('does not descend into non-session-named subdirectories', () => {
+    const forwardedEvent = (content: string) => JSON.stringify({
+      type: 'user',
+      isMeta: true,
+      message: { role: 'user', content },
+    }) + '\n';
     const rogue = join(projectDir, 'some-other-folder', 'subagents');
     mkdirSync(rogue, { recursive: true });
     const rogueFile = join(rogue, 'agent-x.jsonl');
-    writeFileSync(rogueFile, '{"type":"user","message":{"role":"user","content":"fingerprint-in-nested-folder"}}\n');
+    writeFileSync(rogueFile, forwardedEvent('fingerprint-in-nested-folder'));
     utimesSync(rogueFile, 2_000_000, 2_000_000);
+
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const validSubDir = join(projectDir, sid, 'subagents');
+    mkdirSync(validSubDir, { recursive: true });
+    const validFile = join(validSubDir, 'agent-control.jsonl');
+    writeFileSync(validFile, forwardedEvent('valid-session-folder-control'));
+    utimesSync(validFile, 2_000_000, 2_000_000);
+
+    // Positive control: the same forwarded-event shape is eligible under a
+    // UUID-named session directory.
+    expect(findJsonlContainingFingerprint(projectDir, 'valid-session-folder-control', {
+      includeSubagentTranscripts: true,
+    })).toBe(validFile);
     expect(findJsonlContainingFingerprint(projectDir, 'fingerprint-in-nested-folder', {
       includeSubagentTranscripts: true,
     })).toBeNull();
