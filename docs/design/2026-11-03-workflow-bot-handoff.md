@@ -666,6 +666,7 @@ Dashboard 页面和 `/api/v3/*` 保持现有规则（登录即管理员）。侧
     - effects 与专用事件的分工：
       - 取消：只由 effects 生效，不再另写 `nodeCancelled`；
       - 重跑、指派：仍由专用事件 `nodeRetryRequested` / `nodeReassigned` 推进状态，在同一把锁里与 `dagRevised` 一起写，effects 里只做记录、重放时不重复推进。
+      - 作废（13.4「进行中」节点的「作废当前尝试、作废登记」）：在同一把锁里写 `nodeAttemptDrained { reason: 'obsoleteAttempt' }` 关闭旧尝试，effects 里只记录，不额外写 `nodeCancelled`。只写 `nodeRetryRequested` 关不掉旧尝试：它不带 attemptId，旧绑定会一直留在 open 状态，占用全局并发名额，还挡住 run 的终态发布。
     - 取消的节点中如果有受阻节点，`dagRevised` 生效时同时解除 run 的 blocked：`runStatus` 恢复为 running，清空 `blockedNodeId`，与 `nodeRetryRequested` 的现有做法一致。否则驱动循环在 run 级 blocked 时直接退出，下游的跳过动作不会执行，run 会一直停在 blocked。
   - `dagRevisionProposed { revision, sha256, reasons[] }` 加一个等待记录（与 Gate 一样放在 `waits/`）：需要确认的修改；
   - `dagRevisionApproved`、`dagRevisionRejected`：确认结果。
