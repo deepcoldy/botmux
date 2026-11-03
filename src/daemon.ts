@@ -749,7 +749,6 @@ import {
 } from './im/lark/v3-saved-workflow-handler.js';
 import { liveV3NodeExecutorPolicy, v3BotDisplayNameResolver } from './im/lark/v3-bot-eligibility.js';
 import { v3OpensTopicSessions } from './workflows/v3/node-executor-mode.js';
-import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { createWorkflowNodeDaemon } from './core/workflow-node-daemon.js';
 import { ensureBotChatGrantMatrix } from './cli/exact-chat-grant-client.js';
 import { isProcessAlive as isWorkflowWorkerAlive } from './core/session-liveness.js';
@@ -6717,36 +6716,41 @@ function workflowLoadBotRun(runDir: string) {
 
 /** The "停止" path (^C to the session's CLI, session kept), with the same
  *  refusals as `/stop`. */
-function interruptWorkflowNodeTurn(ds: DaemonSession): boolean {
+function interruptWorkflowNodeTurn(ds: DaemonSession, opts: { evenIfIdle?: boolean } = {}): boolean {
   if (isSessionTransferring(ds)) return false;
   const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   if (ds.initConfig?.codexRpcInput === true || isCodexAppCliId(cliId) || isRemoteCliId(cliId) || isRemoteBackendSession(ds)) return false;
   if (!ds.worker || ds.worker.killed) return false;
   // Nothing is running: a ^C to an idle prompt stops nothing and a second one
   // could make some CLIs exit, so an idle session is left alone.
-  if (ds.lastScreenStatus === 'idle') return false;
+  if (ds.lastScreenStatus === 'idle' && !opts.evenIfIdle) return false;
   sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
   logger.info(`[workflow] node turn stopped (session ${ds.session.sessionId.slice(0, 8)}, kept alive)`);
   return true;
 }
 
-/** The sibling bot app (same host) a bot sender's union_id proves, if any —
- *  used only to refuse a handoff nonce echoed by a different app. */
-function workflowSiblingAppByUnionId(receiverLarkAppId: string, senderUnionId: string | undefined): string | undefined {
-  const unionId = senderUnionId?.trim();
-  if (!unionId) return undefined;
-  let found: string | undefined;
-  try {
-    for (const bot of loadBotConfigs()) {
-      if (bot.larkAppId === receiverLarkAppId) continue;
-      if (getBotUnionId(config.session.dataDir, bot.larkAppId) !== unionId) continue;
-      if (found) return undefined;
-      found = bot.larkAppId;
-    }
-  } catch {
-    return undefined;
-  }
-  return found;
+/** Positive sender proof for a workflow handoff seen before its message id
+ *  was linked: the sender must be the orchestrator app's own bot in this chat
+ *  as the receiving app sees it (app-scoped open_id, resolved by the strict
+ *  live resolver `botmux dispatch --bot-app` uses). Cached briefly per chat;
+ *  any failure proves nothing. */
+const workflowSenderProofCache = new Map<string, { openId: string; at: number }>();
+async function proveWorkflowBotSender(input: {
+  receiverLarkAppId: string;
+  chatId: string;
+  senderOpenId: string | undefined;
+  sourceLarkAppId: string;
+}): Promise<boolean> {
+  if (!input.senderOpenId) return false;
+  const key = `${input.receiverLarkAppId}\0${input.chatId}\0${input.sourceLarkAppId}`;
+  const cached = workflowSenderProofCache.get(key);
+  if (cached && Date.now() - cached.at < 10 * 60_000) return cached.openId === input.senderOpenId;
+  const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(input.receiverLarkAppId, input.chatId, [input.sourceLarkAppId]);
+  if (!resolved.ok) return false;
+  const openId = resolved.mappings.find((mapping) => mapping.larkAppId === input.sourceLarkAppId)?.subjectOpenId;
+  if (!openId) return false;
+  workflowSenderProofCache.set(key, { openId, at: Date.now() });
+  return openId === input.senderOpenId;
 }
 
 function workflowSelfAppId(): string {
@@ -6800,6 +6804,7 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   activeSessions: () => activeSessions.values(),
   updateSession: (ds) => sessionStore.updateSession(ds.session),
   interruptTurn: interruptWorkflowNodeTurn,
+  proveBotSender: proveWorkflowBotSender,
   deliverSelfTurn: (input) => withBotTurnAdmission(input.larkAppId,
     () => deliverWorkflowNodeTurn(input, activeSessions, refreshCliVersion)),
   attachmentsDir: getAttachmentsDir,
@@ -27640,13 +27645,13 @@ async function handleThreadReplyAdmitted(
   // marks the session as a node session, stages the node's inputs and shows
   // the CLI the handoff's real id in the `botmux report` commands.
   const inboundHandoff = isForeignBot && scope === 'thread' && !ctx.completionProposalContinuation && ctxChatId
-    ? workflowNodeDaemon.resolveInbound({
+    ? await workflowNodeDaemon.resolveInbound({
         receiverLarkAppId: larkAppId,
         messageId: parsed.messageId,
         content: parsed.content,
         chatId: ctxChatId,
         threadRootId: anchor,
-        senderLarkAppId: workflowSiblingAppByUnionId(larkAppId, parsed.senderUnionId || data?.sender?.sender_id?.union_id),
+        senderOpenId: parsed.senderId || data?.sender?.sender_id?.open_id,
       })
     : undefined;
   if (inboundHandoff?.kind === 'revoked') {
@@ -28034,6 +28039,12 @@ async function handleThreadReplyAdmitted(
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // A retry / later round handed off into a node topic this bot already has
   // a session in: the session now reports to the new handoff.
+  if (workflowHandoff && workflowNodeDaemon.isRevoked(workflowHandoff.nonce)) {
+    // Stopped after it was recognized above: never start its turn.
+    logger.info(`[${larkAppId}] dropped workflow handoff ${parsed.messageId}: revoked before its turn started`);
+    markIngressAdmitted(ctx);
+    return;
+  }
   if (ds && workflowHandoff) {
     ds.session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff, parsed.messageId);
     sessionStore.updateSession(ds.session);

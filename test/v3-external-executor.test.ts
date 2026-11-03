@@ -1390,6 +1390,19 @@ describe('external goal nodes — staged submission while the run owner is offli
     expect(run.of('nodeBlocked')).toEqual([]);
   });
 
+  it('M17: an attempt that closes while the submission is being validated is not staged', async () => {
+    const run = new BotRun(reportDag('rv-stage-race'));
+    const executor = new FakeExecutor();
+    await run.drive(executor);
+    const attemptId = run.openAttempt('write').attemptId;
+    run.accept(attemptId, 'sess-1');
+    const staging = stageExternalSubmissionForInstall(run.runDir, { attemptId, sessionId: 'sess-1', ...reportFiles(), summary: 's' }, run.ctx());
+    // Lands after the cheap pre-check, before the locked commit of the intent.
+    appendEvent(run.journalPath, { type: 'runCancelRequested', cancelRequestId: 'c-race', by: 'ou' });
+    expect(await staging).toEqual({ ok: false, reason: 'cancelled' });
+    expect(existsSync(join(run.runDir, attemptId, 'submission.intent.json'))).toBe(false);
+  });
+
   it('a staged submission for an attempt that closed meanwhile is discarded on install', async () => {
     const run = new BotRun(reportDag('rv-stage-late'));
     const executor = new FakeExecutor();

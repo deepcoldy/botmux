@@ -24,6 +24,7 @@ import {
   lookupWorkflowHandoffByNonce,
   readDispatchRegistryLoose,
   resolveInboundWorkflowHandoff,
+  revokeWorkflowHandoff,
 } from '../src/core/workflow-handoff-binding.js';
 import { V3_HANDOFF_CARD_MAX_BYTES } from '../src/im/lark/v3-node-card.js';
 import { readWorkflowAttemptInputs } from '../src/core/workflow-node-session.js';
@@ -235,13 +236,14 @@ describe('review regressions (PR 5a adversarial review)', () => {
     const reply = world.lark.replies.at(-1)!;
     const attempt = [...readJournalAttempts(run)].at(-1)!;
     return resolveInboundWorkflowHandoff({
-      registry: readDispatchRegistryLoose(world.dataDir),
+      readRegistry: () => readDispatchRegistryLoose(world.dataDir),
       secret: () => SECRET,
       messageId: reply.id,
       content: cardText(reply.card),
       chatId: CHAT,
       threadRootId: reply.root,
       selfLarkAppId: attempt.targetLarkAppId!,
+      proveSender: (source) => source === MAIN,
       ...overrides,
     });
   };
@@ -250,11 +252,11 @@ describe('review regressions (PR 5a adversarial review)', () => {
     const run = new BotRun(reportDag('rv-p21a'));
     const world = handoffWorld();
     await drive(run, world);
-    expect(receiverView(world, run)).toMatchObject({ kind: 'handoff' });
+    expect(await receiverView(world, run)).toMatchObject({ kind: 'handoff' });
     requestV3RunCancel(run.base, run.dag.runId, { by: 'ou_owner' });
     expect(expectTerminal(await drive(run, world)).runStatus).toBe('cancelled');
     expect(world.stops).toEqual([expect.objectContaining({ reason: 'runCancelled' })]);
-    expect(receiverView(world, run)).toMatchObject({ kind: 'revoked' });
+    expect(await receiverView(world, run)).toMatchObject({ kind: 'revoked' });
   });
 
   it('P2-1b: HANDOFF_NOT_ACCEPTED revokes the handoff', async () => {
@@ -264,7 +266,7 @@ describe('review regressions (PR 5a adversarial review)', () => {
     run.clock.t = run.openAttempt('write').acceptDeadlineAt!;
     expect(expectTerminal(await drive(run, world)).runStatus).toBe('blocked');
     expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'HANDOFF_NOT_ACCEPTED' })]);
-    expect(receiverView(world, run)).toMatchObject({ kind: 'revoked' });
+    expect(await receiverView(world, run)).toMatchObject({ kind: 'revoked' });
   });
 
   it('P2-1c: a cancel landing during the self handoff send never starts the turn', async () => {
@@ -351,3 +353,31 @@ async function firstDispatchRequest(run: BotRun, dag: ReturnType<typeof validate
   expect(req.node.id).toBe(dag.nodes[0]!.id);
   return req;
 }
+
+describe('second review pass', () => {
+  it('M7: a stop landing while the node card is sent keeps the handoff from being sent at all', async () => {
+    const run = new BotRun(reportDag('rv2-m7'));
+    const world = handoffWorld();
+    world.lark.onSend = async () => {
+      world.lark.onSend = undefined;
+      await revokeWorkflowHandoff(world.dataDir, SECRET, nonceOf(run.openAttempt('write')), 'runCancelled');
+    };
+    await drive(run, world);
+    expect(world.lark.sent).toHaveLength(1);
+    expect(world.lark.replies).toEqual([]);
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'COLLABORATION_DENIED' })]);
+  });
+
+  it('M8: a revocation landing during the self handoff send stops the turn even with a live journal and signal', async () => {
+    const dag = validateDag({ schemaVersion: 2, runId: 'rv2-m8', nodes: [{ id: 'sum', type: 'goal', goal: 'g', timeoutSec: 600 }] });
+    const run = new BotRun(dag);
+    const world = handoffWorld();
+    world.lark.onReply = async () => {
+      world.lark.onReply = undefined;
+      await revokeWorkflowHandoff(world.dataDir, SECRET, nonceOf(run.openAttempt('sum')), 'reassigned');
+    };
+    await drive(run, world);
+    expect(world.lark.replies).toHaveLength(1);
+    expect(world.selfTurns).toEqual([]);
+  });
+});

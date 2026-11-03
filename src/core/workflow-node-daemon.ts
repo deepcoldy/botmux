@@ -21,6 +21,7 @@ import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import type { LarkAttachment, WorkflowNodeSessionMarker } from '../types.js';
 import type { DaemonSession } from './types.js';
 import {
+  isWorkflowHandoffRevoked,
   readDispatchRegistryLoose,
   resolveInboundWorkflowHandoff,
   type InboundWorkflowHandoff,
@@ -74,8 +75,16 @@ export interface WorkflowNodeDaemonDeps {
   isProcessAlive(pid: number): boolean;
   activeSessions(): Iterable<DaemonSession>;
   updateSession(ds: DaemonSession): void;
-  /** Send ^C to the session's CLI (the "停止" path); false = not possible. */
-  interruptTurn(ds: DaemonSession): boolean;
+  /** Send ^C to the session's CLI (the "停止" path); false = not possible.
+   *  `evenIfIdle`: the turn is known to have just been handed in (its screen
+   *  may not show it yet) — used only for a handoff revoked under it. */
+  interruptTurn(ds: DaemonSession, opts?: { evenIfIdle?: boolean }): boolean;
+  /** Positive proof that an inbound message's sender is `sourceLarkAppId`'s
+   *  bot in this chat, as seen by `receiverLarkAppId` (app-scoped open_id).
+   *  Unknown / failed lookups must answer false. */
+  proveBotSender(input: { receiverLarkAppId: string; chatId: string; senderOpenId: string | undefined; sourceLarkAppId: string }): Promise<boolean>;
+  /** Re-try a best-effort notice once after this many ms (default 3 s). */
+  noticeRetryMs?: number;
   deliverSelfTurn(input: {
     larkAppId: string;
     chatId: string;
@@ -108,11 +117,15 @@ export interface WorkflowNodeDaemon {
     content: string;
     chatId: string;
     threadRootId: string | undefined;
-    senderLarkAppId?: string;
-  }): InboundWorkflowHandoff | undefined;
+    senderOpenId: string | undefined;
+  }): Promise<InboundWorkflowHandoff | undefined>;
+  /** The handoff was stopped (revoked) — checked again right before a turn
+   *  for it starts. */
+  isRevoked(nonce: string): boolean;
   /** Copy the node's upstream products into this turn's attachment dir. */
   stageInbound(binding: WorkflowHandoffBindingPayload, messageId: string): LarkAttachment[];
-  /** A session just registered a verified handoff: the node is accepted. */
+  /** A session just registered a verified handoff: the node is accepted
+   *  (unless it was revoked meanwhile — then its turn is stopped). */
   onRegistered(sessionId: string, marker: WorkflowNodeSessionMarker): void;
   onInputCommitted(ds: DaemonSession, context: { turnId: string; committedAt: number }): void;
   onTurnSettled(ds: DaemonSession, context: { turnId?: string; at: number }): void;
@@ -146,14 +159,18 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     });
   }
 
-  function stopHandoffTurn(nonce: string, sessionId: string | undefined): boolean {
+  function stopHandoffTurn(nonce: string, sessionId: string | undefined, opts?: { evenIfIdle?: boolean }): boolean {
     for (const ds of deps.activeSessions()) {
       const marker = ds.session.workflowNode;
       if (!marker || marker.nonce !== nonce) continue;
       if (sessionId && ds.session.sessionId !== sessionId) continue;
-      return deps.interruptTurn(ds);
+      return deps.interruptTurn(ds, opts);
     }
     return false;
+  }
+
+  function isRevoked(nonce: string): boolean {
+    return isWorkflowHandoffRevoked(readDispatchRegistryLoose(deps.dataDir()), nonce, deps.bindingSecret());
   }
 
   const executor = createV3BotHandoffExecutor({
@@ -239,15 +256,33 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     topicCards: readV3HandoffTopics,
   });
 
-  function notify(event: WorkflowHandoffEvent, orchestratorAppId: string): void {
+  function notify(
+    event: WorkflowHandoffEvent,
+    orchestratorAppId: string,
+    onResult?: (result: RouteResult) => void,
+  ): void {
     void forward(orchestratorAppId, event).then((result) => {
+      onResult?.(result);
       if (result.status >= 400 && result.status !== 409) {
         deps.warn(`[workflow] ${event.kind} notice for ${event.nonce} failed: ${String(result.body.error ?? result.status)}`);
       }
     }).catch((err) => deps.warn(`[workflow] ${event.kind} notice for ${event.nonce} failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
+  /** The main bot says this handoff was stopped: stop its turn here too. */
+  function stopIfRevoked(result: RouteResult, sessionId: string, nonce: string): void {
+    if (result.status === 409 && result.body.error === 'handoff_revoked') {
+      stopHandoffTurn(nonce, sessionId, { evenIfIdle: true });
+    }
+  }
+
   function registered(sessionId: string, marker: WorkflowNodeSessionMarker): void {
+    // A stop may have landed between recognizing the handoff and registering
+    // it: then the turn must not run.
+    if (isRevoked(marker.nonce)) {
+      stopHandoffTurn(marker.nonce, sessionId, { evenIfIdle: true });
+      return;
+    }
     const acceptedAt = Date.parse(marker.registeredAt);
     notify({
       kind: 'accepted',
@@ -255,12 +290,26 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       dispatchRoot: marker.handoffMessageId,
       sessionId,
       ...(Number.isFinite(acceptedAt) ? { acceptedAt } : {}),
-    }, marker.orchestratorAppId);
+    }, marker.orchestratorAppId, (result) => stopIfRevoked(result, sessionId, marker.nonce));
   }
 
   function openMarker(ds: DaemonSession): WorkflowNodeSessionMarker | undefined {
     const marker = ds.session.workflowNode;
     return marker && !marker.submittedAt ? marker : undefined;
+  }
+
+  const MAX_TRACKED_TURNS = 32;
+
+  function wake(binding: WorkflowHandoffBindingPayload, sessionId: string): void {
+    const event: WorkflowHandoffEvent = { kind: 'wake', nonce: binding.nonce, sessionId };
+    const attempt = (retry: boolean) => {
+      void forward(binding.sourceLarkAppId, event).then((result) => {
+        if (result.status === 200 || !retry) return;
+        const timer = setTimeout(() => attempt(false), deps.noticeRetryMs ?? 3_000);
+        timer.unref?.();
+      }).catch(() => undefined);
+    };
+    attempt(true);
   }
 
   return {
@@ -294,6 +343,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         if (!run) return { status: 409, body: { ok: false, error: 'run_not_bot_executed' } };
         return stageWorkflowNodeSubmission(deps.baseDir(), binding, run.dag, input);
       },
+      wake,
       markSubmitted: (sessionId, nonce) => {
         for (const ds of deps.activeSessions()) {
           if (ds.session.sessionId !== sessionId || ds.session.workflowNode?.nonce !== nonce) continue;
@@ -316,15 +366,27 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       stopHandoffTurn,
     }),
     resolveInbound: (input) => resolveInboundWorkflowHandoff({
-      registry: readDispatchRegistryLoose(deps.dataDir()),
+      readRegistry: () => readDispatchRegistryLoose(deps.dataDir()),
       secret: deps.bindingSecret,
       messageId: input.messageId,
       content: input.content,
       chatId: input.chatId,
       threadRootId: input.threadRootId,
       selfLarkAppId: input.receiverLarkAppId,
-      ...(input.senderLarkAppId ? { senderLarkAppId: input.senderLarkAppId } : {}),
+      proveSender: async (sourceLarkAppId) => {
+        try {
+          return await deps.proveBotSender({
+            receiverLarkAppId: input.receiverLarkAppId,
+            chatId: input.chatId,
+            senderOpenId: input.senderOpenId,
+            sourceLarkAppId,
+          });
+        } catch {
+          return false;
+        }
+      },
     }),
+    isRevoked,
     stageInbound: (binding, messageId) => {
       const runDir = runDirOf(binding.workflow.runId);
       const inputs = runDir ? readWorkflowAttemptInputs(runDir, binding.workflow.attemptId) : undefined;
@@ -344,18 +406,31 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     onInputCommitted: (ds, context) => {
       const marker = openMarker(ds);
       if (!marker) return;
+      const sessionId = ds.session.sessionId;
+      if (isRevoked(marker.nonce)) {
+        // Stopped while this turn was being handed in: stop it now.
+        stopHandoffTurn(marker.nonce, sessionId, { evenIfIdle: true });
+        return;
+      }
+      // Remember every turn started under this handoff: any of them ending
+      // without a submission shows the node as stopped.
+      if (!marker.turnIds?.includes(context.turnId)) {
+        ds.session.workflowNode = { ...marker, turnIds: [...(marker.turnIds ?? []), context.turnId].slice(-MAX_TRACKED_TURNS) };
+        deps.updateSession(ds);
+      }
       // The handoff's own turn is the acceptance; any later turn (a human
       // replied in the topic) means the bot works again after a stall.
       notify(marker.handoffMessageId === context.turnId
-        ? { kind: 'accepted', nonce: marker.nonce, dispatchRoot: marker.handoffMessageId, sessionId: ds.session.sessionId, acceptedAt: context.committedAt }
-        : { kind: 'active', nonce: marker.nonce, dispatchRoot: marker.handoffMessageId, sessionId: ds.session.sessionId, at: context.committedAt },
-      marker.orchestratorAppId);
+        ? { kind: 'accepted', nonce: marker.nonce, dispatchRoot: marker.handoffMessageId, sessionId, acceptedAt: context.committedAt }
+        : { kind: 'active', nonce: marker.nonce, dispatchRoot: marker.handoffMessageId, sessionId, at: context.committedAt },
+      marker.orchestratorAppId, (result) => stopIfRevoked(result, sessionId, marker.nonce));
     },
     onTurnSettled: (ds, context) => {
       const marker = openMarker(ds);
-      // Only the handoff's own turn: an idle edge of an older turn must not
-      // stall a newer attempt handed into a busy session.
-      if (!marker || context.turnId !== marker.handoffMessageId) return;
+      if (!marker || !context.turnId) return;
+      // Only turns started under this handoff: an idle edge of a turn that
+      // was already in flight before it was registered must not stall it.
+      if (context.turnId !== marker.handoffMessageId && !marker.turnIds?.includes(context.turnId)) return;
       notify({ kind: 'stalled', nonce: marker.nonce, dispatchRoot: marker.handoffMessageId, sessionId: ds.session.sessionId, at: context.at },
         marker.orchestratorAppId);
     },

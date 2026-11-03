@@ -16,6 +16,7 @@ import { BotRun, cleanupBotRuns, expectTerminal, reportDag, trackTempDir } from 
 import { CHAT, MAIN, SECRET, handoffWorld, nonceOf } from './helpers/workflow-handoff-harness.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkflowNodeSessionMarker } from '../src/types.js';
+import { readDispatchRegistryLoose, revokeWorkflowHandoff } from '../src/core/workflow-handoff-binding.js';
 
 afterEach(() => cleanupBotRuns());
 
@@ -47,7 +48,9 @@ function daemon(self: string, dataDir: string, baseDir: string, run: BotRun, ove
     isProcessAlive: () => true,
     activeSessions: () => sessions,
     updateSession: () => {},
-    interruptTurn: (ds) => { interrupted.push(ds.session.sessionId); return true; },
+    interruptTurn: (ds, opts) => { interrupted.push(`${ds.session.sessionId}${opts?.evenIfIdle ? ':force' : ''}`); return true; },
+    proveBotSender: async () => true,
+    noticeRetryMs: 5,
     deliverSelfTurn: async () => ({ sessionId: 'self-session' }),
     attachmentsDir: (appId, messageId) => join(dataDir, 'attachments', appId, messageId),
     loadRun: () => ({ dag: run.dag, nodeExecutor: 'bot', chatId: CHAT, title: 't' }),
@@ -186,5 +189,111 @@ describe('workflow node daemon wiring', () => {
     await main.wiring.syncNodeCards('wd-sync');
     await main.wiring.syncNodeCards('../escape');
     expect(loads).toBe(0);
+  });
+});
+
+describe('workflow node daemon wiring — second review pass', () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  it('P2-a: after accepted → stalled → active, the next turn ending without a submission stalls again', async () => {
+    const { run, world, marker } = await handedOff('wd2-stall-again');
+    const target = daemon('cli_a', world.dataDir, run.base, run);
+    const ds = fakeSession('sess-a', marker);
+    target.wiring.onInputCommitted(ds, { turnId: marker.handoffMessageId, committedAt: 1 });
+    target.wiring.onTurnSettled(ds, { turnId: marker.handoffMessageId, at: 2 }); // asked a human
+    target.wiring.onInputCommitted(ds, { turnId: 'om_human_answer', committedAt: 3 }); // the answer
+    target.wiring.onTurnSettled(ds, { turnId: 'om_human_answer', at: 4 }); // forgot to submit
+    await settle();
+    expect(target.posted.map((post) => post.body.kind)).toEqual(['accepted', 'stalled', 'active', 'stalled']);
+  });
+
+  it('P3-b: a handoff revoked before its session registered it is never accepted and its turn is stopped', async () => {
+    const { run, world, marker } = await handedOff('wd2-revoked-register');
+    await revokeWorkflowHandoff(world.dataDir, SECRET, marker.nonce, 'runCancelled');
+    const target = daemon('cli_a', world.dataDir, run.base, run);
+    target.sessions.push(fakeSession('sess-a', marker));
+    expect(target.wiring.isRevoked(marker.nonce)).toBe(true);
+    target.wiring.onRegistered('sess-a', marker);
+    target.wiring.onInputCommitted(target.sessions[0]!, { turnId: marker.handoffMessageId, committedAt: 1 });
+    await settle();
+    expect(target.posted).toEqual([]);
+    expect(target.interrupted).toEqual(['sess-a:force', 'sess-a:force']);
+  });
+
+  it('P3-b: the main bot answering "handoff_revoked" to the acceptance stops the turn', async () => {
+    const { run, world, marker } = await handedOff('wd2-revoked-409');
+    const target = daemon('cli_a', world.dataDir, run.base, run, {
+      postDaemon: async () => ({ status: 409, body: { ok: false, error: 'handoff_revoked' } }),
+    });
+    target.sessions.push(fakeSession('sess-a', marker));
+    target.wiring.onRegistered('sess-a', marker);
+    await settle();
+    expect(target.interrupted).toEqual(['sess-a:force']);
+  });
+
+  it('M5: the target\'s stop route accepts the (always revoked) binding of a remote stop', async () => {
+    const { run, world, marker } = await handedOff('wd2-remote-stop');
+    await revokeWorkflowHandoff(world.dataDir, SECRET, marker.nonce, 'timeout');
+    const target = daemon('cli_a', world.dataDir, run.base, run);
+    target.sessions.push(fakeSession('sess-a', marker));
+    expect(target.wiring.stopRoute({ nonce: marker.nonce, sessionId: 'sess-a', reason: 'timeout' }))
+      .toEqual({ status: 200, body: { ok: true, stopped: true } });
+    expect(target.interrupted).toEqual(['sess-a']);
+  });
+
+  it('P3-d: after staging, the main bot is asked to drive once (retried when it looked offline)', async () => {
+    const { run, world, attempt } = await handedOff('wd2-wake');
+    run.accept(attempt.attemptId, 'sess-a');
+    let online = false;
+    const target = daemon('cli_a', world.dataDir, run.base, run, {
+      daemonPort: (appId) => (appId === MAIN && online ? 4100 : undefined),
+    });
+    const staged = await target.wiring.reportRoute(
+      {
+        dispatchRoot: attempt.handoffMessageId, status: 'completed', content: 'x',
+        files: [{ key: 'report', name: 'report.md', data: Buffer.from('# r').toString('base64') }], resultText: '{"message":"ok"}',
+      },
+      authorize({ sessionId: 'sess-a', rootMessageId: attempt.nodeCardMessageId!, larkAppId: 'cli_a' }),
+    );
+    expect(staged.status).toBe(202);
+    online = true; // the main bot was only missed for a moment
+    await settle();
+    expect(target.posted.map((post) => [post.path, post.body.kind])).toEqual([['/api/workflow/handoff-event', 'wake']]);
+  });
+
+  it('P3-c: before its id is linked, a handoff counts only when the sender is proven to be the main bot', async () => {
+    const run = new BotRun(reportDag('wd2-prove'));
+    const world = handoffWorld();
+    const verdicts: unknown[] = [];
+    const asked: unknown[] = [];
+    world.lark.onReply = async () => {
+      // The handoff reaches the target before the main bot linked its id.
+      const key = Object.keys(readDispatchRegistryLoose(world.dataDir)).find((k) => k.startsWith('workflow-handoff:'))!;
+      const inbound = {
+        receiverLarkAppId: 'cli_a', messageId: 'om_incoming', chatId: CHAT,
+        threadRootId: world.lark.sent[0]!.id, senderOpenId: 'ou_main_seen_by_a',
+        content: `交接编号：${key.slice('workflow-handoff:'.length)}`,
+      };
+      for (const proveBotSender of [
+        async () => { throw new Error('chat members lookup failed'); },
+        async () => false,
+        async (input: unknown) => { asked.push(input); return true; },
+      ]) {
+        const target = daemon('cli_a', world.dataDir, run.base, run, { proveBotSender });
+        verdicts.push((await target.wiring.resolveInbound(inbound))?.kind);
+      }
+    };
+    await run.drive(world.executor, { opts: { chatBinding: BINDING } });
+    expect(verdicts).toEqual([undefined, undefined, 'handoff']);
+    expect(asked).toEqual([{ receiverLarkAppId: 'cli_a', chatId: CHAT, senderOpenId: 'ou_main_seen_by_a', sourceLarkAppId: MAIN }]);
+  });
+
+  it('P3-d: the wake event drives the run once', async () => {
+    const { run, world, attempt } = await handedOff('wd2-wake-route');
+    const drives: string[] = [];
+    const main = daemon(MAIN, world.dataDir, run.base, run, { drive: (runId) => { drives.push(runId); } });
+    expect(await main.wiring.eventRoute({ kind: 'wake', nonce: nonceOf(attempt), sessionId: 'sess-a' }))
+      .toMatchObject({ status: 200 });
+    expect(drives).toEqual(['wd2-wake-route']);
   });
 });

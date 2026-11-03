@@ -19,7 +19,9 @@ import {
   readWorkflowSubmissionFiles,
 } from '../src/core/workflow-node-report.js';
 import { BotRun, cleanupBotRuns, expectTerminal, reportDag } from './helpers/v3-external-harness.js';
-import { CHAT, MAIN, SECRET, handoffWorld, orchestratorEvent, targetReport } from './helpers/workflow-handoff-harness.js';
+import { CHAT, MAIN, SECRET, handoffWorld, nonceOf, orchestratorEvent, targetReport } from './helpers/workflow-handoff-harness.js';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { handleWorkflowHandoffEvent } from '../src/core/workflow-handoff-routes.js';
 import { readDispatchRegistryLoose } from '../src/core/workflow-handoff-binding.js';
 import { requestV3RunCancel } from '../src/workflows/v3/daemon-run.js';
@@ -229,6 +231,24 @@ describe('end-to-end submission through the main bot\'s daemon', () => {
       dispatchRoot: attempt.handoffMessageId, status: 'completed', content: 'x', files: [file('report', 'x')], resultText: '{"message":"ok"}',
     }, session)).toMatchObject({ status: 409, body: { error: 'handoff_revoked' } });
     expect(run.events()).toHaveLength(before);
+  });
+
+  it('M6: a session that registered the handoff by its nonce can report even if the id link was never written', async () => {
+    const { run, attempt, world, orchestrator } = await acceptedRun('rep-nonce-fallback');
+    // Simulate a main bot that crashed between the send and the link write.
+    const registry = readDispatchRegistryLoose(world.dataDir) as Record<string, any>;
+    delete registry[attempt.handoffMessageId!];
+    delete registry[`workflow-handoff:${nonceOf(attempt)}`].message;
+    writeFileSync(join(world.dataDir, 'orchestrate-dispatch.json'), JSON.stringify(registry));
+    const target = targetReport(world, 'cli_a', orchestrator.route);
+    const session = { sessionId: 'sess-a', rootMessageId: attempt.nodeCardMessageId!, workflowNode: { handoffMessageId: attempt.handoffMessageId!, nonce: nonceOf(attempt) } };
+    expect(await target.report({
+      dispatchRoot: attempt.handoffMessageId, status: 'completed', content: 'x', files: [file('report', 'x')], resultText: '{"message":"ok"}',
+    }, session)).toMatchObject({ status: 200, body: { outcome: 'succeeded' } });
+    // Without the marker the unlinked id is not a workflow handoff.
+    expect(await target.report({ dispatchRoot: attempt.handoffMessageId, status: 'blocked', content: 'x' }, { ...session, workflowNode: undefined }))
+      .toMatchObject({ status: 404 });
+    void run;
   });
 
   it('M8: the event route refuses a run that is not bot-executed', async () => {

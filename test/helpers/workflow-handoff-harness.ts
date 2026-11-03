@@ -38,7 +38,11 @@ export class FakeLark {
     return { id, fresh: true };
   }
 
+  /** Optional hook run inside sendCard (the node card). */
+  onSend?: () => void | Promise<void>;
+
   sendCard = async (chatId: string, card: string, uuid: string): Promise<string> => {
+    await this.onSend?.();
     const { id, fresh } = this.idFor(uuid, 'card');
     if (fresh) this.sent.push({ chatId, card, uuid, id });
     return id;

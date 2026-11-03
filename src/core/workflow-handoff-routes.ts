@@ -104,6 +104,9 @@ export type WorkflowHandoffEvent =
   | (EventKey & { kind: 'active'; at?: number })
   | (EventKey & { kind: 'blocked'; reason: string })
   | (EventKey & { kind: 'progress' })
+  /** A submission was staged while this daemon looked offline: drive once
+   *  so the staged install is committed now rather than at the next wake. */
+  | (EventKey & { kind: 'wake' })
   | (EventKey & {
       kind: 'submit';
       summary: string;
@@ -212,6 +215,9 @@ export async function handleWorkflowHandoffEvent(raw: unknown, deps: WorkflowHan
     }
     case 'progress':
       return { status: 200, body: { ok: true, outcome: 'progress' } };
+    case 'wake':
+      deps.drive(runId);
+      return { status: 200, body: { ok: true } };
     case 'submit': {
       const decoded = decodeWorkflowSubmission(raw);
       if (!decoded.ok) return { status: 400, body: { ok: false, error: decoded.error } };
@@ -297,6 +303,9 @@ export interface WorkflowNodeReportDeps {
   }): Promise<RouteResult>;
   /** Remember that this session's handoff was submitted (no stall notice). */
   markSubmitted(sessionId: string, nonce: string): void;
+  /** Best-effort: ask the main bot to drive once after a staged submission
+   *  (it may have been online all along). Never awaited for the reply. */
+  wake?(binding: WorkflowHandoffBindingPayload, sessionId: string): void;
   /** Publish the report card in the node topic (best-effort). */
   postReportCard(binding: WorkflowHandoffBindingPayload, input: {
     summary: string;
@@ -409,7 +418,10 @@ export async function handleWorkflowNodeReport(raw: unknown, deps: WorkflowNodeR
       ...(parsed.result !== undefined ? { result: parsed.result } : {}),
       summary: content,
     });
-    if (staged.status === 202) deps.markSubmitted(session.sessionId, binding.nonce);
+    if (staged.status === 202) {
+      deps.markSubmitted(session.sessionId, binding.nonce);
+      deps.wake?.(binding, session.sessionId);
+    }
     return staged;
   }
   if (forwarded.status === 200 && forwarded.body.ok === true && forwarded.body.outcome !== 'progress') {

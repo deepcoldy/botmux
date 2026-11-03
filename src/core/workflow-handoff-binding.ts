@@ -30,6 +30,12 @@ import { updateDispatchRegistry } from './dispatch-registry.js';
 const DOMAIN = 'botmux.workflow-handoff-binding.v1';
 const NONCE_KEY_PREFIX = 'workflow-handoff:';
 
+/** Workflow entries older than this are pruned on the next workflow write.
+ *  An attempt lives at most hours (50 min send window, 15 s acceptance, node
+ *  timeout ≤ 4 h); a staged submission no longer needs the registry. Keeping
+ *  revocations for two days still drops any late-delivered handoff. */
+export const WORKFLOW_HANDOFF_ENTRY_TTL_MS = 48 * 3600_000;
+
 const MESSAGE_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
 const CHAT_ID_RE = /^oc_[A-Za-z0-9_-]{1,128}$/;
 export const WORKFLOW_HANDOFF_NONCE_RE = /^wfh_[A-Za-z0-9_-]{24}$/;
@@ -202,6 +208,27 @@ function linkedMessage(secret: string, nonce: string, entry: NonceEntry | undefi
   return sameMac(message.signature, messageMac(secret, nonce, message.id)) ? message.id : undefined;
 }
 
+/** Drop workflow nonce entries (and their message aliases) older than the
+ *  TTL. Runs inside every workflow registry write, so the file stays bounded
+ *  by the handoffs of the last two days. */
+function pruneExpiredWorkflowEntries(registry: Record<string, unknown>, now: number): void {
+  for (const [key, value] of Object.entries(registry)) {
+    if (!key.startsWith(NONCE_KEY_PREFIX)) continue;
+    const entry = value as NonceEntry | undefined;
+    const stamps = [entry?.workflowHandoff?.payload?.issuedAt, entry?.revoked?.at]
+      .map((stamp) => (typeof stamp === 'string' ? Date.parse(stamp) : NaN))
+      .filter((ms) => Number.isFinite(ms));
+    const newest = stamps.length > 0 ? Math.max(...stamps) : NaN;
+    if (Number.isFinite(newest) && now - newest <= WORKFLOW_HANDOFF_ENTRY_TTL_MS) continue;
+    const messageId = entry?.message?.id;
+    delete registry[key];
+    if (typeof messageId === 'string') {
+      const alias = registry[messageId] as { kind?: unknown } | undefined;
+      if (alias?.kind === 'workflow-handoff-message') delete registry[messageId];
+    }
+  }
+}
+
 /** Register the binding before the handoff is sent. Re-recording the same
  *  binding is a no-op; a different binding under an existing nonce is
  *  refused. Returns whether the handoff was already revoked. */
@@ -209,9 +236,11 @@ export async function recordWorkflowHandoffBinding(
   dataDir: string,
   secret: string,
   binding: SignedWorkflowHandoffBinding,
+  now: number = Date.now(),
 ): Promise<{ revoked: boolean }> {
   let revoked = false;
   await updateDispatchRegistry(registryPath(dataDir), (registry) => {
+    pruneExpiredWorkflowEntries(registry, now);
     const key = `${NONCE_KEY_PREFIX}${binding.payload.nonce}`;
     const entry: NonceEntry = nonceEntry(registry, binding.payload.nonce) ?? { kind: 'workflow-handoff' };
     if (entry.workflowHandoff) {
@@ -237,9 +266,11 @@ export async function linkWorkflowHandoffMessage(
   secret: string,
   nonce: string,
   messageId: string,
+  now: number = Date.now(),
 ): Promise<void> {
   if (!MESSAGE_ID_RE.test(messageId)) throw new Error('invalid handoff message id');
   await updateDispatchRegistry(registryPath(dataDir), (registry) => {
+    pruneExpiredWorkflowEntries(registry, now);
     const entry = nonceEntry(registry, nonce);
     if (!entry?.workflowHandoff) throw new Error(`workflow handoff ${nonce} is not registered`);
     const prior = linkedMessage(secret, nonce, entry);
@@ -266,6 +297,7 @@ export async function revokeWorkflowHandoff(
 ): Promise<void> {
   if (!WORKFLOW_HANDOFF_NONCE_RE.test(nonce)) throw new Error('invalid handoff nonce');
   await updateDispatchRegistry(registryPath(dataDir), (registry) => {
+    pruneExpiredWorkflowEntries(registry, now);
     const entry: NonceEntry = nonceEntry(registry, nonce) ?? { kind: 'workflow-handoff' };
     if (validRevocation(secret, nonce, entry)) return;
     const at = new Date(now).toISOString();
@@ -336,39 +368,43 @@ export type InboundWorkflowHandoff =
 
 /**
  * Receiver side: decide whether an inbound bot message is a workflow handoff
- * addressed to this bot, in this chat, in its node topic. The message id link
- * is used when it already exists; otherwise the nonce the card carries
- * (registered before sending) decides — no waiting. A nonce whose handoff is
- * already linked to ANOTHER message, or a sender known to be a different app,
- * is not this handoff.
+ * addressed to this bot, in this chat, in its node topic. Every handoff card
+ * prints its nonce, so a message without one is decided without reading the
+ * registry at all (the ordinary path costs nothing).
+ *
+ * - A message whose exact id is linked to the nonce is the handoff (only the
+ *   orchestrator could have produced that id).
+ * - Before the link exists, the nonce alone is not enough — anyone in the
+ *   chat can echo a printed card. The sender must then be PROVEN to be the
+ *   orchestrator's own bot (`proveSender`); anything unproven is an ordinary
+ *   message (fail closed; acceptance timeout / retry handle a lost handoff).
+ * - A nonce already linked to another message is never this handoff.
  */
-export function resolveInboundWorkflowHandoff(input: {
-  registry: Record<string, unknown>;
+export async function resolveInboundWorkflowHandoff(input: {
+  readRegistry: () => Record<string, unknown>;
   secret: () => string;
   messageId: string;
   content: string;
   chatId: string;
   threadRootId: string | undefined;
   selfLarkAppId: string;
-  /** The sender's app id when the receiver can prove it (else undefined). */
-  senderLarkAppId?: string;
-}): InboundWorkflowHandoff | undefined {
+  /** Whether the message's sender is `sourceLarkAppId`'s bot in this chat. */
+  proveSender: (sourceLarkAppId: string) => boolean | Promise<boolean>;
+}): Promise<InboundWorkflowHandoff | undefined> {
   if (!MESSAGE_ID_RE.test(input.messageId) || !input.threadRootId) return undefined;
-  const candidates: WorkflowHandoffLookup[] = [];
-  const hasAlias = input.registry[input.messageId] !== undefined;
   const nonces = extractWorkflowHandoffNonces(input.content);
-  if (!hasAlias && nonces.length === 0) return undefined; // the common, ordinary case
+  if (nonces.length === 0) return undefined; // the common, ordinary case
+  const registry = input.readRegistry();
   const secret = input.secret();
-  if (hasAlias) candidates.push(lookupWorkflowHandoff({ registry: input.registry, dispatchRoot: input.messageId, secret }));
-  for (const nonce of nonces) candidates.push(lookupWorkflowHandoffByNonce({ registry: input.registry, nonce, secret }));
-  for (const found of candidates) {
+  for (const nonce of nonces) {
+    const found = lookupWorkflowHandoffByNonce({ registry, nonce, secret });
     if (found.kind !== 'workflow') continue;
     const binding = found.binding;
     if (binding.targetLarkAppId !== input.selfLarkAppId
       || binding.targetChatId !== input.chatId
       || binding.publishRoot !== input.threadRootId) continue;
     if (found.messageId && found.messageId !== input.messageId) continue;
-    if (input.senderLarkAppId && input.senderLarkAppId !== binding.sourceLarkAppId) continue;
+    if (!found.messageId && !(await input.proveSender(binding.sourceLarkAppId))) continue;
     return found.revoked ? { kind: 'revoked', binding } : { kind: 'handoff', binding };
   }
   return undefined;

@@ -507,6 +507,10 @@ export interface WorkflowNodeSessionMarker {
   registeredAt: string;
   /** Set once the orchestrator accepted a submission for this handoff. */
   submittedAt?: string;
+  /** Turns committed to the CLI after this handoff was registered (bounded).
+   *  Any of them ending without a submission shows the node as stopped; a
+   *  turn already in flight before registration never does. */
+  turnIds?: string[];
 }
 
 export interface Session {
