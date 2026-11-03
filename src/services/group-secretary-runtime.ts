@@ -16,6 +16,8 @@ export interface GroupSecretaryRuntimeDeps {
   selfOpenId: () => string | undefined;
   fetchSnapshot: () => Promise<ObserveSnapshot>;
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
+  /** 拉某群最近的消息（飞书 REST 形态，新→旧或旧→新均可），用于启动时补上下文。 */
+  fetchRecentMessages?: (chatId: string) => Promise<any[]>;
   /** 读某会话最近几条对话（本机 daemon insight）；拿不到返回 undefined。 */
   fetchTranscript?: (larkAppId: string | undefined, sessionId: string) => Promise<Array<{ role: string; text: string }> | undefined>;
   log: (level: 'info' | 'warn', message: string) => void;
@@ -59,7 +61,41 @@ export function snapshotToSessionViews(snapshot: ObserveSnapshot): SecretarySess
   return out;
 }
 
-export function larkEventToSecretaryMessage(data: any, selfOpenId: string | undefined) {
+/** 新版卡片经 REST 拉回来只剩「请升级客户端」占位：明确告诉模型去 quoted 读全文，别当成空消息。 */
+function readableText(text: string, messageId: string): string {
+  if (/请升级至最新版本客户端|upgrade to the latest version/i.test(text)) {
+    return `[卡片消息，正文需用 botmux quoted ${messageId} 查看]`;
+  }
+  return text;
+}
+
+/** 飞书 REST 消息（im/v1/messages 列表项）→ 事件形态，复用同一套解析。 */
+export function restMessageToEventData(item: any, chatId: string): any {
+  const sender = item?.sender ?? {};
+  const senderId = typeof sender.id === 'string' ? sender.id : undefined;
+  const idType = sender.id_type;
+  return {
+    sender: {
+      sender_type: sender.sender_type,
+      sender_id: idType === 'app_id' ? { app_id: senderId } : { open_id: senderId },
+    },
+    message: {
+      chat_id: item?.chat_id ?? chatId,
+      chat_type: 'group',
+      message_id: item?.message_id,
+      ...(item?.root_id ? { root_id: item.root_id } : {}),
+      ...(item?.parent_id ? { parent_id: item.parent_id } : {}),
+      create_time: item?.create_time,
+      message_type: item?.msg_type,
+      content: item?.body?.content,
+      mentions: Array.isArray(item?.mentions)
+        ? item.mentions.map((m: any) => ({ id: { open_id: typeof m?.id === 'string' ? m.id : m?.id?.open_id }, name: m?.name }))
+        : [],
+    },
+  };
+}
+
+export function larkEventToSecretaryMessage(data: any, selfOpenId: string | undefined, selfAppId?: string) {
   const message = data?.message;
   if (!message || typeof message !== 'object') return undefined;
   if (message.chat_type === 'p2p') return undefined;
@@ -76,10 +112,11 @@ export function larkEventToSecretaryMessage(data: any, selfOpenId: string | unde
     ...(typeof message.parent_id === 'string' && message.parent_id ? { parentId: message.parent_id } : {}),
     senderType: listenerSenderType(data?.sender?.sender_type),
     ...(senderOpenId ? { senderOpenId } : {}),
-    text: extractListenerMessageText(message),
+    text: readableText(extractListenerMessageText(message), messageId),
     mentionCount: mentions.length,
     mentionsSelf: !!selfOpenId && mentions.some(m => m?.id?.open_id === selfOpenId),
-    fromSelf: !!selfOpenId && senderOpenId === selfOpenId,
+    fromSelf: (!!selfOpenId && senderOpenId === selfOpenId)
+      || (!!selfAppId && data?.sender?.sender_id?.app_id === selfAppId),
     createTime: Number.isFinite(createTime) && createTime > 0 ? createTime : Date.now(),
   };
 }
@@ -107,6 +144,29 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
   const deliverTimeoutMs = deps.deliverTimeoutMs ?? 90_000;
   const sessionPollMs = deps.sessionPollMs ?? 10_000;
   let lastPollAt = 0;
+  const backfilled = new Set<string>();
+  /** 每个开启的群首次检查时补拉最近消息（daemon 重启 / 刚开启时内存里没有上下文）。 */
+  const backfill = async (): Promise<void> => {
+    if (!deps.fetchRecentMessages) return;
+    for (const { chatId, enabledAt } of listGroupSecretaryChats(deps.larkAppId)) {
+      if (backfilled.has(chatId)) continue;
+      backfilled.add(chatId);
+      try {
+        const items = await deps.fetchRecentMessages(chatId);
+        let n = 0;
+        for (const item of items) {
+          const m = larkEventToSecretaryMessage(restMessageToEventData(item, chatId), deps.selfOpenId(), deps.larkAppId);
+          if (!m || m.createTime < enabledAt) continue;
+          engine.observeMessage(m, { backfill: true });
+          n++;
+        }
+        deps.log('info', `[group-secretary] backfilled ${n} message(s) chat=${chatId.slice(0, 12)}`);
+      } catch (err) {
+        backfilled.delete(chatId);
+        deps.log('warn', `[group-secretary] backfill failed chat=${chatId.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  };
   let inFlight = false;
   let seq = 0;
 
@@ -158,6 +218,7 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
     if (listGroupSecretaryChats(deps.larkAppId).length === 0) return;
     inFlight = true;
     try {
+      await backfill();
       if (now() - lastPollAt >= sessionPollMs) {
         lastPollAt = now();
         try {
@@ -182,7 +243,7 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
       try {
         const chatId = data?.message?.chat_id;
         if (!isGroupSecretaryChat(deps.larkAppId, chatId)) return;
-        const message = larkEventToSecretaryMessage(data, deps.selfOpenId());
+        const message = larkEventToSecretaryMessage(data, deps.selfOpenId(), deps.larkAppId);
         if (!message) return;
         // 开启之前的消息（重放 / 补拉）不进秘书视野。
         const entry = getGroupSecretaryChat(deps.larkAppId, chatId);

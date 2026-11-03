@@ -236,3 +236,37 @@ describe('larkEventToSecretaryMessage', () => {
     expect(larkEventToSecretaryMessage({ message: { chat_type: 'p2p', chat_id: 'oc', message_id: 'om' } }, undefined)).toBeUndefined();
   });
 });
+
+describe('group secretary runtime — startup backfill', () => {
+  it('backfills recent chat messages as context only, flags own messages, skips pre-enable history', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1_000 });
+    const items = [
+      { message_id: 'om_old', create_time: '500', msg_type: 'text', sender: { id: 'ou_u', id_type: 'open_id', sender_type: 'user' }, body: { content: JSON.stringify({ text: '开启前' }) } },
+      { message_id: 'om_mine', root_id: 'om_root', create_time: String(clock - 5_000), msg_type: 'interactive', sender: { id: APP, id_type: 'app_id', sender_type: 'app' }, body: { content: JSON.stringify({ title: null, elements: [[{ tag: 'text', text: '请升级至最新版本客户端，以查看内容' }]] }) } },
+      { message_id: 'om_task', create_time: String(clock - 1_000), msg_type: 'text', sender: { id: 'ou_u', id_type: 'open_id', sender_type: 'user' }, body: { content: JSON.stringify({ text: '帮我整理一下周报' }) } },
+    ];
+    const deliver = vi.fn(async () => undefined);
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => 'ou_self', fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+      fetchRecentMessages: async () => items, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
+    });
+    await rt.tick();
+    clock += 120_000;
+    await rt.tick();
+    // 补拉的消息不产生「无人认领」事件
+    expect(deliver).not.toHaveBeenCalled();
+    // 但会作为上下文出现在下一次摘要里
+    rt.observeMessageEvent({
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_new', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '新任务：查一下日志' }), mentions: [] },
+    });
+    clock += 60_000;
+    await rt.tick();
+    const prompt = (deliver.mock.calls[0] as any[])[0].prompt as string;
+    expect(prompt).toContain('om_task');
+    expect(prompt).not.toContain('开启前');
+    expect(prompt).toContain('from_you="true"');
+    expect(prompt).toContain('botmux quoted om_mine');
+    rt.stop();
+  });
+});

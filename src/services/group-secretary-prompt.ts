@@ -95,6 +95,7 @@ export function renderGroupSecretaryPrompt(digest: SecretaryDigest, options: { e
     '',
     '【会话事件 turn_ended / stopped / stuck / attention】',
     '1. 看事件里的 recent_transcript（role=agent 是 bot 自己说的）和 context 判断任务是否真的完成。已完成、或明确在等真人回答 / 确认：不要打扰。',
+    '   注意：bot 是用 botmux send 工具往群里发消息的，recent_transcript 里 agent 最后一句是 BOTMUX_NOTHING_TO_SEND 很正常，不代表它没回复。有没有回复、回了什么，以 context 里该 bot 的群消息为准；context 里找不到时先用 botmux history / botmux quoted 查，确认真的没有再说。',
     '2. 明显只做了一部分就停了（说了「接下来我做 X」却结束了、报错中断、进程没了）才催，--secretary-action nudge 或用 dispatch 命令：',
     '   话题会话（有 thread_root）：botmux dispatch --into <thread_root> --bot-app <bot_app_id> --brief "<催办内容>"',
     '   群级会话（scope=chat）：botmux bots list 查到 open_id 后 botmux send --secretary-action nudge --top-level --mention <open_id> "<催办内容>"',

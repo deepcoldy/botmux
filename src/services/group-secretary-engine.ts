@@ -183,11 +183,21 @@ export class GroupSecretaryEngine {
     }
   }
 
-  observeMessage(message: SecretaryMessage): void {
+  /**
+   * @param options.backfill 启动补拉的历史消息：只进上下文，不成为「无人认领」候选，也不撤销候选。
+   */
+  observeMessage(message: SecretaryMessage, options: { backfill?: boolean } = {}): void {
     if (!this.opts.isEnabledChat(message.chatId)) return;
     const state = this.chat(message.chatId);
     if (state.messages.some(m => m.messageId === message.messageId)) return;
     state.messages.push(message);
+    if (options.backfill) {
+      state.messages.sort((a, b) => a.createTime - b.createTime);
+      if (state.messages.length > this.opts.contextMessagesPerChat) {
+        state.messages.splice(0, state.messages.length - this.opts.contextMessagesPerChat);
+      }
+      return;
+    }
     if (state.messages.length > this.opts.contextMessagesPerChat) {
       state.messages.splice(0, state.messages.length - this.opts.contextMessagesPerChat);
     }

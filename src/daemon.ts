@@ -33663,6 +33663,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     canTalk: (chatId, openId) => evaluateTalk(cfg.larkAppId, chatId, openId, undefined, undefined, 'group').allowed,
     fetchSnapshot: () => fetchObserveSnapshot(),
     fetchTranscript: (appId, sessionId) => fetchSessionRecentTranscript(appId, sessionId),
+    fetchRecentMessages: chatId => listChatMessages(cfg.larkAppId, chatId, 50),
     deliver: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
       larkAppId: cfg.larkAppId,
       chatId: input.chatId,
