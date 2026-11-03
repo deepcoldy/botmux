@@ -255,10 +255,13 @@ export function MessageListenersPage() {
 
   const ready = !!botId && loadState.botId === botId && !loadState.error;
   const selected = listenerGroups.find(group => group.chatId === expanded);
+  // Keep custom rules (including paused ones) easy to find. Stable sorting
+  // preserves /api/groups' newest-first firstSeenAt order within each tier;
+  // daemon-only fallback chats retain their existing order at the end.
   const visibleGroups = listenerGroups.filter(group => {
     const query = groupQuery.trim().toLowerCase();
     return !query || (group.name ?? group.chatId).toLowerCase().includes(query) || group.chatId.toLowerCase().includes(query);
-  });
+  }).sort((a, b) => Number(b.mode === 'custom') - Number(a.mode === 'custom'));
   const visibleBots = bots.filter(bot => {
     const query = botQuery.trim().toLowerCase();
     return !query || bot.botName.toLowerCase().includes(query) || bot.larkAppId.toLowerCase().includes(query);
