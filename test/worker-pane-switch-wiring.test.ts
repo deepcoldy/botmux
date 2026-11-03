@@ -24,10 +24,11 @@ describe('worker pane-switch env wiring (K3)', () => {
     expect(matches).toHaveLength(2);
     expect(matches.filter(m => m.includes('mergedEnv'))).toHaveLength(1);
     expect(matches.filter(m => m.includes('childEnv'))).toHaveLength(1);
-    // Each matched text must be a fully closed call: if the regex's closing
-    // paren were dropped, match() could return a truncated `…paneSwitchEnv(`
-    // fragment and the per-env filters above would still pass.
-    expect(matches.every(m => m.trim().endsWith(')'))).toBe(true);
+    // Each matched text must contain BOTH closing parens (the inner
+    // paneSwitchEnv(...) call and the outer Object.assign(...)); allowing only
+    // whitespace between them. An endsWith(')') check alone cannot do this — a
+    // fragment truncated right after the inner call's paren also ends in ')'.
+    expect(matches.every(m => /\)\s*\)$/.test(m.trim()))).toBe(true);
     // Presence check stops at the opening paren so paneSwitchEnv(process.env)
     // (an equivalent explicit-arg rewrite) stays green; the regex above still
     // requires the call to close and the two target env objects to be present.
