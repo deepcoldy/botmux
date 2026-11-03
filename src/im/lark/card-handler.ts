@@ -1,3 +1,4 @@
+import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
 import { MODEL_SLUG_PATTERN, sessionModelChoices, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelChoices, defaultModelSelectionKey } from './session-model-picker.js';
@@ -2427,7 +2428,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
   // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 编辑自由输入项 ──
   const CONFIG_CARD_ACTIONS = [
-    'config_toggle', 'config_set', 'models_default_pick', 'config_quota', 'config_quota_open',
+    'config_toggle', 'config_set', 'models_default_pick', 'models_default_effort_pick', 'config_quota', 'config_quota_open',
     'config_quota_save', 'config_text_open', 'config_text_save',
   ];
   if (value?.action && larkAppId && CONFIG_CARD_ACTIONS.includes(value.action)) {
@@ -2441,7 +2442,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     if (admins.length === 0 || !operatorOpenId || !admins.includes(operatorOpenId)) {
       return { toast: { type: 'error', content: t('cmd.config.not_admin', undefined, loc) } };
     }
-    const defaultPicker = value.action === 'models_default_pick';
+    const effortPicker = value.action === 'models_default_effort_pick';
+    const defaultPicker = value.action === 'models_default_pick' || effortPicker;
     if (defaultPicker && value.lark_app_id !== larkAppId) {
       return { toast: { type: 'error', content: t('cmd.config.no_bot', undefined, loc) } };
     }
@@ -2449,6 +2451,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'warning', content: t('card.models.default_unsupported', undefined, loc) } };
     }
     if (defaultPicker && value.selection_key !== defaultModelSelectionKey(larkAppId)) {
+      return { toast: { type: 'warning', content: t('card.models.changed', undefined, loc) } };
+    }
+    if (effortPicker && value.expected_model !== (cbot.config.model?.trim() || '')) {
       return { toast: { type: 'warning', content: t('card.models.changed', undefined, loc) } };
     }
     // ttadk 网关 bot 用 ttadk 网关模型候选（glm-5.1…），非底层适配器的 opus/gpt-5
@@ -2459,7 +2464,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try { return createCliAdapterSync(cbot.config.cliId, cbot.config.cliPathOverride).modelChoices ?? []; } catch { return []; }
     })();
     const reRender = () => {
-      if (defaultPicker) return { card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, modelChoices, cbot.config.model, loc, defaultModelSelectionKey(larkAppId))) } };
+      if (defaultPicker) return { card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, modelChoices, cbot.config.model, loc, defaultModelSelectionKey(larkAppId), { cliId: cbot.config.cliId, effort: cbot.config.reasoningEffort })) } };
       const d = getConfigCardData(larkAppId, modelChoices);
       return d ? { card: { type: 'raw' as const, data: JSON.parse(buildConfigCard(d, loc)) } } : {};
     };
@@ -2561,12 +2566,20 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'success', content: `✓ quota = ${limit ?? 'off'}` }, ...reRender() };
     }
 
-    const field = defaultPicker ? 'model' : value.field as string | undefined;
+    const field = defaultPicker ? (effortPicker ? 'reasoningEffort' : 'model') : value.field as string | undefined;
     const spec = field ? findConfigField(field) : undefined;
     if (!spec || spec.kind === 'allowedUsers') {
       return { toast: { type: 'error', content: t('cmd.config.unknown_field', { field: field ?? '?', fields: '' }, loc) } };
     }
 
+    const commitValue = (fieldValue: unknown) => defaultPicker
+      ? applyConfigField(larkAppId, spec, fieldValue, {
+          selectionKey: String(value.selection_key),
+          requireLaunchModelSupport: true,
+          actorOpenId: operatorOpenId,
+          ...(effortPicker ? { model: typeof value.expected_model === 'string' && value.expected_model ? value.expected_model : null } : {}),
+        })
+      : applyConfigField(larkAppId, spec, fieldValue);
     let r;
     if (value.action === 'config_toggle') {
       if (spec.kind !== 'boolean') return { toast: { type: 'error', content: t('cmd.config.invalid_bool', { field: spec.key, value: '' }, loc) } };
@@ -2574,29 +2587,37 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       r = await applyConfigField(larkAppId, spec, !cur);
     } else {
       const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';
-      if (defaultPicker && raw !== CONFIG_UNSET && !MODEL_SLUG_PATTERN.test(raw)) {
-        return { toast: { type: 'error', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
+      if (defaultPicker && raw !== CONFIG_UNSET && (effortPicker ? !isCodexReasoningEffort(raw) : !MODEL_SLUG_PATTERN.test(raw))) {
+        return { toast: { type: 'error', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.reply_actions.model_unsupported', undefined, loc) } };
       }
       if (raw === CONFIG_UNSET) {
         if (!spec.clearable) return { toast: { type: 'error', content: t('cmd.config.not_clearable', { field: spec.key }, loc) }, ...reRender() };
-        r = await applyConfigField(larkAppId, spec, null);
+        r = await commitValue(null);
       } else {
         const coerced = coerceConfigValue(spec, raw);
         if (!coerced.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: coerced.reason }, loc) }, ...reRender() };
-        r = await applyConfigField(larkAppId, spec, coerced.value);
+        r = await commitValue(coerced.value);
       }
     }
-    if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+    if (!r.ok) {
+      if (defaultPicker && r.reason === 'config_selection_changed') {
+        return { toast: { type: 'warning', content: t('card.models.changed', undefined, loc) } };
+      }
+      if (defaultPicker && r.reason === 'reasoning_effort_not_supported_by_model') {
+        return { toast: { type: 'warning', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.models.effort_incompatible', undefined, loc) }, ...reRender() };
+      }
+      return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+    }
     if (defaultPicker) {
       const refreshKey = defaultModelSelectionKey(larkAppId);
       const choices = await defaultModelChoices(larkAppId).catch(() => modelChoices);
       const current = getBot(larkAppId);
       if (defaultModelSelectionKey(larkAppId) !== refreshKey || !botAcceptsLaunchModel(current.config)
         || !current.resolvedAllowedUsers.includes(operatorOpenId)) {
-        return { toast: { type: 'success', content: `✓ model = ${r.newText} · ${t('card.models.changed', undefined, loc)}` } };
+        return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText} · ${t('card.models.changed', undefined, loc)}` } };
       }
-      return { toast: { type: 'success', content: `✓ model = ${r.newText}` },
-        card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, choices, current.config.model, loc, refreshKey)) } };
+      return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` },
+        card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, choices, current.config.model, loc, refreshKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort })) } };
     }
     return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...reRender() };
   }

@@ -11,7 +11,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/repo <path\|project name>` | Directly specify a path or a top-level project name under workingDir |
 | `/cd <path>` | Switch the working directory and restart the CLI process |
 | `/status` | View session info (uptime, terminal address, etc.) |
-| `/models` | Top-level messages select the bot default model for new sessions (admins only). Within an existing topic, select the current session model when idle. No reply-card menu required. |
+| `/models` | Top-level messages select the bot default model and supported reasoning effort for new sessions (admins only). Effort follows the model and can be reset to the CLI default. Incompatible pairs preserve the previous settings. Within an existing topic, select the current session model when idle. |
 | `/lane status` | Inspect your isolated principal lane, including its branch, worktree, dirty state, and unpushed commit count (available when the existing bot-level XPI switch enables principal lanes) |
 | `/lane close` | Safely close your isolated principal lane: refuses while work is running/queued or files are uncommitted, pushes unpublished commits before cleanup, and never auto-merges or deletes the branch |
 | `/retry` | Retry the most recent failed or interrupted turn (10s cooldown) |

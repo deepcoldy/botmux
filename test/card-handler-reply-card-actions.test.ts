@@ -685,7 +685,7 @@ describe('/models bot defaults at top level', () => {
       return { ok: true, newText: 'haiku', effect: 'next-session' } as any;
     });
     const result = await handleCardAction(defaultPick('haiku', { field: 'cli' }), depsWith(ds), LARK_APP_ID);
-    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, 'haiku');
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, 'haiku', { selectionKey: 'claude-code', requireLaunchModelSupport: true, actorOpenId: OWNER });
     expect(bot.config.model).toBe('haiku');
     expect(ds.session.model).toBe('session-model');
     expect(ds.activeModel).toBe('session-model');
@@ -727,6 +727,84 @@ describe('/models bot defaults at top level', () => {
     expect(bot.config.model).toBe('haiku');
   });
 
+  it.each([
+    ['traex', 'GPT-6.1-Sol', ['low', 'medium', 'high', 'xhigh']],
+    ['claude-code', 'sonnet', ['low', 'medium', 'high', 'xhigh', 'max']],
+    ['claude-code', 'haiku', []],
+  ])('offers model-supported effort choices for %s / %s', (cliId, model, expected) => {
+    const card = JSON.parse(buildDefaultModelPickerCard(LARK_APP_ID, [model as string], model as string, 'zh', cliId as string, { cliId: cliId as string, effort: 'high' }));
+    const select = card.elements.filter((e: any) => e.tag === 'action')[1].actions[0];
+    expect(select.value).toMatchObject({ action: 'models_default_effort_pick', expected_model: model, selection_key: cliId });
+    expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', ...expected as string[]]);
+    expect(select.initial_option).toBe((expected as string[]).includes('high') ? 'high' : '__unset__');
+  });
+
+  function effortPick(effort = 'high', model = 'opus') {
+    const data = defaultPick(effort, { field: 'model' });
+    data.action.value.action = 'models_default_effort_pick';
+    (data.action.value as any).expected_model = model;
+    return data;
+  }
+  const effortSpec = { key: 'reasoningEffort', kind: 'enum', configKey: 'reasoningEffort', clearable: true } as any;
+
+  it('writes default effort with a model precondition and keeps active session effort', async () => {
+    const bot = adminBot();
+    const ds = makeDs({ sessionOverrides: { reasoningEffort: 'low' } });
+    vi.mocked(findConfigField).mockReturnValue(effortSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'high' } as any);
+    vi.mocked(applyConfigField).mockImplementation(async (_app, _spec, effort) => {
+      bot.config.reasoningEffort = effort;
+      return { ok: true, newText: 'high', effect: 'next-session' } as any;
+    });
+    const result = await handleCardAction(effortPick(), depsWith(ds), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, effortSpec, 'high', { selectionKey: 'claude-code', model: 'opus', requireLaunchModelSupport: true, actorOpenId: OWNER });
+    expect(ds.session.reasoningEffort).toBe('low');
+    const select = result.card.data.elements.filter((e: any) => e.tag === 'action')[1].actions[0];
+    expect(select.initial_option).toBe('high');
+  });
+
+  it('clears default effort without changing the model', async () => {
+    const bot = adminBot();
+    bot.config.reasoningEffort = 'high';
+    vi.mocked(findConfigField).mockReturnValue(effortSpec);
+    vi.mocked(applyConfigField).mockImplementation(async () => { bot.config.reasoningEffort = undefined; return { ok: true, newText: 'default' } as any; });
+    const result = await handleCardAction(effortPick('__unset__'), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, effortSpec, null, { selectionKey: 'claude-code', model: 'opus', requireLaunchModelSupport: true, actorOpenId: OWNER });
+    expect(bot.config.model).toBe('opus');
+    expect(result.toast.type).toBe('success');
+  });
+
+  it('rejects an effort card after the default model changed', async () => {
+    const bot = adminBot();
+    bot.config.model = 'sonnet';
+    const result = await handleCardAction(effortPick('high', 'opus'), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(result.toast.type).toBe('warning');
+  });
+
+  it('turns a locked selection conflict into a refresh prompt without a success card', async () => {
+    adminBot();
+    vi.mocked(findConfigField).mockReturnValue(effortSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'high' } as any);
+    vi.mocked(applyConfigField).mockResolvedValue({ ok: false, reason: 'config_selection_changed' } as any);
+    const result = await handleCardAction(effortPick(), depsWith(undefined), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(result.card).toBeUndefined();
+  });
+
+  it('keeps the old model and exposes an effort reset when a model pairing is incompatible', async () => {
+    const bot = adminBot();
+    bot.config.reasoningEffort = 'max';
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: 'haiku' } as any);
+    vi.mocked(applyConfigField).mockResolvedValue({ ok: false, reason: 'reasoning_effort_not_supported_by_model' } as any);
+    const result = await handleCardAction(defaultPick(), depsWith(undefined), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(bot.config.model).toBe('opus');
+    const effort = result.card.data.elements.filter((e: any) => e.tag === 'action')[1].actions[0];
+    expect(effort.options[0].value).toBe('__unset__');
+  });
+
   it('keeps the current default selectable when the catalogue exceeds the Lark option limit', () => {
     const models = Array.from({ length: 75 }, (_, i) => `model-${i}`);
     const card = JSON.parse(buildDefaultModelPickerCard(LARK_APP_ID, models, 'model-74', 'zh', 'claude-code'));
@@ -744,7 +822,7 @@ describe('/models bot defaults at top level', () => {
       return { ok: true, newText: 'default', effect: 'next-session' } as any;
     });
     const result = await handleCardAction(defaultPick('__unset__'), depsWith(undefined), LARK_APP_ID);
-    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, null);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, null, { selectionKey: 'claude-code', requireLaunchModelSupport: true, actorOpenId: OWNER });
     expect(result.toast.type).toBe('success');
   });
 

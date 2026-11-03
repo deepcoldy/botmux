@@ -1,3 +1,4 @@
+import { isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 /** Model catalogue and picker shared by /models and the optional reply menu. */
 import type { DaemonSession } from '../../core/types.js';
 import { getBot, type BotConfig } from '../../bot-registry.js';
@@ -144,6 +145,7 @@ export function buildDefaultModelPickerCard(
   currentModel: string | undefined,
   loc: Locale,
   selectionKey: string,
+  reasoning?: { cliId: string; effort?: string },
 ): string {
   const safe = [...new Set(models)].filter(model => MODEL_SLUG_PATTERN.test(model));
   if (currentModel && MODEL_SLUG_PATTERN.test(currentModel)) {
@@ -154,6 +156,20 @@ export function buildDefaultModelPickerCard(
   const choices = [{ text: t('card.models.cli_default', undefined, loc), value: CONFIG_UNSET },
     ...safe.slice(0, 49).map(model => ({ text: model, value: model }))];
   const initial = currentModel && choices.some(c => c.value === currentModel) ? currentModel : CONFIG_UNSET;
+  const efforts = reasoning ? reasoningEffortsForCliModel(reasoning.cliId, currentModel) : [];
+  const effortControls = reasoning && isConfigurableReasoningCliId(reasoning.cliId) ? [
+    { tag: 'div', text: { tag: 'plain_text', content: t('card.models.effort_title', undefined, loc) } },
+    { tag: 'action', actions: [{ tag: 'select_static',
+      initial_option: efforts.some(effort => effort === reasoning.effort) ? reasoning.effort : CONFIG_UNSET,
+      placeholder: { tag: 'plain_text', content: reasoning.effort || t('card.models.effort_default', undefined, loc) },
+      options: [{ text: { tag: 'plain_text', content: t('card.models.effort_default', undefined, loc) }, value: CONFIG_UNSET },
+        ...efforts.map(effort => ({ text: { tag: 'plain_text', content: effort }, value: effort }))],
+      value: { action: 'models_default_effort_pick', lark_app_id: appId,
+        selection_key: selectionKey, expected_model: currentModel?.trim() || '', loc },
+    }] },
+    ...(efforts.length ? [] : [{ tag: 'div', text: { tag: 'plain_text', content: t('card.models.effort_unavailable', undefined, loc) } }]),
+  ] : [];
+
   return JSON.stringify({ config: { wide_screen_mode: true }, elements: [
     { tag: 'markdown', content: t('card.models.default_title', undefined, loc) },
     { tag: 'div', text: { tag: 'plain_text', content: t('card.models.default_effect', undefined, loc) } },
@@ -163,6 +179,7 @@ export function buildDefaultModelPickerCard(
       options: choices.map(c => ({ text: { tag: 'plain_text', content: c.text }, value: c.value })),
       value: { action: 'models_default_pick', lark_app_id: appId, selection_key: selectionKey, loc },
     }] },
+    ...effortControls,
   ] });
 }
 
@@ -195,5 +212,5 @@ export async function showDefaultModelPicker(
     await reply(rootId, t('card.models.changed', undefined, loc));
     return;
   }
-  await reply(rootId, buildDefaultModelPickerCard(appId, models, current.config.model, loc, selectionKey), 'interactive');
+  await reply(rootId, buildDefaultModelPickerCard(appId, models, current.config.model, loc, selectionKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }), 'interactive');
 }
