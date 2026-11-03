@@ -34,6 +34,7 @@ import {
   offTopicSubBotTopic,
   foldableChatSessionAppIds,
   recordDispatchInputCommit,
+  unboundInputCommitLogLevel,
   resolveReportPlacement,
   resolveReportRecipientForSession,
   resolveSendTarget,
@@ -1065,6 +1066,19 @@ describe('acceptedDispatchBotAppIds', () => {
       notBeforeMs: sentAt,
       isWorkerAlive,
     })).toEqual(['cli_repo']);
+  });
+
+  it('warns only for unbound Lark message turns; synthetic scheduled turns stay at debug', () => {
+    const chatSession = {
+      larkAppId: 'cli_repo', chatId: 'oc_target', scope: 'chat' as const,
+      status: 'active', pid: workerPid, workerGeneration,
+    };
+    const scheduled = 'schedule:5d7e581a:0b1c2d3e-0000-4000-8000-000000000000';
+    expect(recordDispatchInputCommit(chatSession, scheduled, workerGeneration)).toBe(false);
+    expect(unboundInputCommitLogLevel(scheduled)).toBe('debug');
+    expect(unboundInputCommitLogLevel('bmx-recovery-0b1c2d3e')).toBe('debug');
+    expect(recordDispatchInputCommit(chatSession, 'om_unbound', workerGeneration)).toBe(false);
+    expect(unboundInputCommitLogLevel('om_unbound')).toBe('warn');
   });
 
   it('keeps a rootless ordinary chat-scope turn unbound instead of falling back to a stale session root', () => {

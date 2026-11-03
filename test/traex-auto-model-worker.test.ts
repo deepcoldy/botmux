@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
-import { TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime } from '../src/services/traex-auto-model.js';
+import {
+  TraexAutoModelController,
+  resolveTraexAutoModelRuntimeSettings,
+  resolveTraexAutoModelSettings,
+  traexAutoModelPreflightEnabled,
+  validTraexAutoModelRuntime,
+} from '../src/services/traex-auto-model.js';
 import { knownTraexReasoningEffortsForModel } from '../src/services/codex-reasoning-effort.js';
 import { buildSessionChildEnv, botInjectedEnv } from '../src/core/env-policy.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
@@ -13,6 +19,31 @@ import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible } from '../src/adapters/cli/traex.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { restartInterruptionNote, restartInterruptionNotice, restartNoteMayPrefix, prefixRestartNote } from '../src/services/restart-interruption.js';
+
+function wireAutoModelSettings(scope: Record<string, any>): Record<string, any> {
+  Object.assign(scope, {
+    resolveTraexAutoModelRuntimeSettings,
+    traexAutoModelPreflightEnabled,
+    traexAutoModelReasoningEfforts: scope.traexAutoModelReasoningEfforts ?? new Map(),
+    log: scope.log ?? vi.fn(),
+  });
+  scope.applyTraexAutoModelSettings = loadWorkerFunction('applyTraexAutoModelSettings', scope);
+  return scope;
+}
+
+function loadAutoModelReset(scope: Record<string, any>): () => boolean {
+  Object.assign(scope, {
+    traexAutoModelPreflightEnabled,
+    traexQuotaPending: scope.traexQuotaPending,
+    traexAutoModelPreflightPending: scope.traexAutoModelPreflightPending,
+  });
+  return loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+}
+
+function configureAutoModel(scope: Record<string, any>, cfg: any): void {
+  wireAutoModelSettings(scope);
+  loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+}
 
 function harness(extra: Record<string, unknown> = {}) {
   const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000, reselectPerTurn: true });
@@ -33,6 +64,7 @@ function harness(extra: Record<string, unknown> = {}) {
     restartCliProcess: vi.fn(async () => {}), t: (key: string) => key,
     ...extra,
   };
+  wireAutoModelSettings(scope);
   scope.enqueueTraexAutoModelRecovery = loadWorkerFunction('enqueueTraexAutoModelRecovery', scope);
   return { scope, controller, tracker, switchModel: loadWorkerFunction<(action: any, options: any) => boolean>('executeTraexAutoModelSwitch', scope) };
 }
@@ -69,7 +101,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
       currentTraexQuotas: vi.fn(), executeTraexAutoModelSwitch: vi.fn(),
     });
     h.scope.selectTraexQuotaModelBeforeTurn = loadWorkerFunction('selectTraexQuotaModelBeforeTurn', h.scope);
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', h.scope);
+    const reset = loadAutoModelReset(h.scope);
     // The real flush clears readiness before its asynchronous viewport read.
     expect(reset()).toBe(false);
     h.scope.isPromptReady = false;
@@ -249,7 +281,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
         sessionRenamePhase: 'sent', sessionRenameIdleTimer: null, SESSION_RENAME_IDLE_TIMEOUT_MS: 5_000,
         executeTraexAutoModelSwitch: h.switchModel,
       });
-      const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', h.scope);
+      const reset = loadAutoModelReset(h.scope);
       h.scope.flushPending = vi.fn(() => reset());
       expect(h.scope.activeTurnAuthority.snapshot()).toMatchObject({ turnId: 'turn', started: true });
       loadWorkerFunction<() => void>('armSessionRenameIdleTimeout', h.scope)();
@@ -569,7 +601,7 @@ describe('Auto live follow-up input policy', () => {
       isPromptReady: false, traexAutoModelInputHold: () => false, activeTurnAuthority,
       queuedTypeAheadTurns: [],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    const reset = loadAutoModelReset(scope);
     expect(reset()).toBe(false);
     expect(controller.currentModel()).toBe('backup');
     expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
@@ -591,7 +623,7 @@ describe('Auto live follow-up input policy', () => {
       isPromptReady: false, traexAutoModelInputHold: () => false, activeTurnAuthority,
       queuedTypeAheadTurns: [],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    const reset = loadAutoModelReset(scope);
     expect(reset()).toBe(true);
     expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
     // Once the composer is observed, the normal switch branch restarts core.
@@ -613,7 +645,7 @@ describe('Auto live follow-up input policy', () => {
       isPromptReady: false, traexAutoModelInputHold: () => false,
       activeTurnAuthority: new ActiveTurnAuthority(), queuedTypeAheadTurns: [],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    const reset = loadAutoModelReset(scope);
     expect(reset()).toBe(true);
     expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
     // With reselection off, the composer edge releases the write without a switch.
@@ -638,7 +670,7 @@ describe('Auto live follow-up input policy', () => {
       activeTurnAuthority: new ActiveTurnAuthority(),
       queuedTypeAheadTurns: [{ turnId: 'successor-turn' }],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    const reset = loadAutoModelReset(scope);
     expect(reset()).toBe(false);
     expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
   });
@@ -651,7 +683,7 @@ describe('Worker Auto configuration boundary', () => {
     const cfg: any = { cliId: 'traex', model: 'auto', codexRpcInput: true, traexAutoModel: pool, prompt: '', ...extra };
     const scope: Record<string, any> = { lastInitConfig: { ...cfg }, TraexAutoModelController,
       resolveTraexAutoModelSettings, validTraexAutoModelRuntime: () => false };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    configureAutoModel(scope, cfg);
     return { cfg, scope };
   }
   it('selects a concrete managed model and adapts the old RPC preference before launch', () => {
@@ -679,9 +711,11 @@ describe('Worker read-only capacity query', () => {
     controller.beginTurn('turn');
     const authority = new ActiveTurnAuthority();
     authority.reserve({ turnId: 'turn' }); authority.markStarted({ turnId: 'turn' });
-    let resolveLoads!: (loads: Map<string, number>) => void;
-    const loads = new Promise<Map<string, number>>(resolve => { resolveLoads = resolve; });
-    const read = vi.fn((_options: any) => loads);
+    let resolveSnapshot!: (snapshot: { loads: Map<string, number>; reasoningEfforts: Map<string, readonly string[]> }) => void;
+    const snapshot = new Promise<{ loads: Map<string, number>; reasoningEfforts: Map<string, readonly string[]> }>(
+      resolve => { resolveSnapshot = resolve; },
+    );
+    const read = vi.fn((_options: any) => snapshot);
     const scope: Record<string, any> = {
       traexAutoModelController: controller, traexAutoModelRuntimeEligible: () => true,
       traexAutoModelSwitching: false, cliRestartInProgress: false, isFlushing: false,
@@ -692,13 +726,16 @@ describe('Worker read-only capacity query', () => {
       cliAdapter: { resolvedBin: 'traex' }, buildSessionChildEnv, botInjectedEnv,
       process: { env: { HTTP_PROXY: 'host-proxy', API_TOKEN: 'host-token', KEEP: 'yes' } },
       traexCapacityQueueVisible: () => true, traexCapacityQueuePosition: () => undefined,
-      traexModelProgressVisible: () => false, traexQueuedTypeAheadVisible: () => false, readTraexModelLoads: read,
+      traexModelProgressVisible: () => false, traexQueuedTypeAheadVisible: () => false,
+      readTraexModelLoadSnapshot: read, rememberTraexModelLoadSnapshot: vi.fn(),
       executeTraexAutoModelSwitch: vi.fn(), publishActiveRuntime: vi.fn(), send: vi.fn(), log: vi.fn(),
     };
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', scope);
     vi.useFakeTimers(); vi.setSystemTime(0); observe('queue');
     vi.setSystemTime(5_000); observe('queue'); vi.useRealTimers();
-    return { scope, read, resolveLoads, observe };
+    return { scope, read,
+      resolveLoads: (loads: Map<string, number>) => resolveSnapshot({ loads, reasoningEfforts: new Map() }),
+      observe };
   }
   it('uses the composed set and unset layers for the read-only helper', async () => {
     const h = query();
@@ -818,7 +855,7 @@ describe('Auto input and shared-setting continuity', () => {
       } };
     h.scope.lastInitConfig = cfg;
     h.scope.TraexAutoModelController = TraexAutoModelController;
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', h.scope)(cfg);
+    configureAutoModel(h.scope, cfg);
     expect(cfg).toMatchObject({ model: 'core', reasoningEffort: 'high', modelBackendVariant: 'max' });
     h.scope.traexAutoModelController.beginTurn('turn');
     expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(true);
@@ -826,7 +863,7 @@ describe('Auto input and shared-setting continuity', () => {
     // A fresh first init has resume=false; /restart still starts from the
     // last resolved model rather than the original daemon shared settings.
     cfg.traexAutoModel = { ...cfg.traexAutoModel, models: ['core', 'backup', 'new-backup'] };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', h.scope)(cfg);
+    configureAutoModel(h.scope, cfg);
     expect(cfg).toMatchObject({ model: 'core', reasoningEffort: 'high', modelBackendVariant: 'max' });
     h.scope.traexAutoModelController.beginTurn('turn'); h.scope.traexAutoModelSwitching = false;
     expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(true);
@@ -873,7 +910,7 @@ describe('same-worker Auto restart model continuity', () => {
       traexAutoModel: pool, traexAutoModelRuntime: runtime };
     const scope: Record<string, any> = { lastInitConfig: { ...cfg }, traexAutoModelController: null,
       TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    configureAutoModel(scope, cfg);
     expect(cfg).toMatchObject({ model: 'backup', reasoningEffort: 'low', modelBackendVariant: 'standard' });
     expect(scope.lastInitConfig.model).toBe('backup');
     expect(scope.traexAutoModelController.runtimeState('native')).toMatchObject({ waitingOnFinalModel: true });
@@ -890,7 +927,7 @@ describe('same-worker Auto restart model continuity', () => {
     const scope: Record<string, any> = { lastInitConfig, traexAutoModelController: waitingController(),
       deliveredPluginSkillCatalogFingerprint: 'new-catalog',
       TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)({ ...lastInitConfig, prompt: '' });
+    configureAutoModel(scope, { ...lastInitConfig, prompt: '' });
     expect(lastInitConfig.model).toBe('backup');
     expect(scope.traexAutoModelController.runtimeState('native')).toMatchObject({ model: 'backup', waitingOnFinalModel: true });
     expect(scope.deliveredPluginSkillCatalogFingerprint).toBe('new-catalog');
@@ -903,7 +940,7 @@ describe('same-worker Auto restart model continuity', () => {
       traexAutoModelRuntime: { ...waitingController().runtimeState('native'), skillCatalogFingerprint: 'unrelated', ...changed } };
     const scope: Record<string, any> = { lastInitConfig: cfg, traexAutoModelController: null,
       TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    configureAutoModel(scope, cfg);
     expect(cfg.model).toBe('core');
     expect(scope.traexAutoModelController.runtimeState('native').waitingOnFinalModel).toBe(false);
     expect(scope.deliveredPluginSkillCatalogFingerprint).toBeUndefined();
@@ -918,7 +955,7 @@ describe('same-worker Auto restart model continuity', () => {
       traexAutoModelRuntime: persisted };
     const scope: Record<string, any> = { traexAutoModelController: controller, lastInitConfig: cfg,
       TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    configureAutoModel(scope, cfg);
     expect(cfg.model).toBe('backup');
     expect(scope.traexAutoModelController.currentModel()).toBe('backup');
   });

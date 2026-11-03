@@ -18,7 +18,6 @@ export const modelOnlyAssessments: Readonly<Record<CliId, ModelOnlyAssessment>> 
   codex: { group: 'codex-app-server', status: 'implemented', reason: null, detail: '独立 app-server、空工具和临时线程；原生合成服务测试及 Linux 真实订阅外部 loop 通过。' },
   'codex-app': { group: 'codex-app-server', status: 'implemented', reason: null, detail: '复用同一 Codex 可执行文件和隔离 app-server 通道；独立 IPC 路由测试通过，不连接既有服务或实例池。' },
   cursor: { group: 'native-print', status: 'interface_gap', reason: 'read_only_is_not_model_only', detail: '原生 help 的 ask/plan 仍是只读 Agent，print 明确保留工具；本次核查未发现可验证的空工具目录接口。' },
-  gemini: { group: 'policy-headless', status: 'implemented', reason: null, detail: 'headless stream-json、空 core 工具和全部拒绝策略；原生合成服务测试通过，OAuth 登录待真实账号验证。' },
   genius: { group: 'claude-print', status: 'verification_required', reason: 'fork_auth_and_protocol_unverified', detail: '使用 Genius 自己的凭证和状态目录；缺少原生程序，未验证 Claude 风格参数是否提供相同隔离保证。' },
   opencode: { group: 'policy-headless', status: 'implemented', reason: null, detail: 'run/json、pure 模式、全部工具拒绝，关闭标题与压缩子调用；原生合成服务测试通过。' },
   opencode2: { group: 'policy-headless', status: 'verification_required', reason: 'fork_protocol_unverified', detail: '仓库适配器明确使用 V2 插件、配置和服务接口；缺少 opencode2 原生程序，不能以 OpenCode 的测试替代。' },

@@ -37,6 +37,7 @@ import type { ChatBotMember } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
 import { parseTargetsAfterCommand, isCommandTargetOnly, stripAllMentions } from './mention-targets.js';
+import { normalizeBotsInfoRouteEntries } from '../../services/bots-info-shape.js';
 
 const INVITE_CMD_PATTERN = /\/invite\b/i;
 
@@ -53,9 +54,8 @@ export function readBotsInfoEntries(): BotsInfoEntry[] {
   try {
     const p = join(config.session.dataDir, 'bots-info.json');
     if (!existsSync(p)) return [];
-    const raw = JSON.parse(readFileSync(p, 'utf-8'));
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((e: any) => typeof e?.larkAppId === 'string' && e.larkAppId);
+    return normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(p, 'utf-8')))
+      .map(e => ({ larkAppId: e.larkAppId, botName: e.botName }));
   } catch {
     return [];
   }

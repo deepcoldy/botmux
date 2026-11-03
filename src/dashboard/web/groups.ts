@@ -124,10 +124,53 @@ export function filterGroupChats(chats: GroupChat[], filters: GroupFilters): Gro
     .filter(chat => !q ||
       (chat.name ?? '').toLowerCase().includes(q) ||
       chat.chatId.toLowerCase().includes(q) ||
-      (chat.ownerId ?? '').toLowerCase().includes(q)
+      (chat.ownerId ?? '').toLowerCase().includes(q) ||
+      inChatMembers(chat).some(member => (member.botName ?? '').toLowerCase().includes(q))
     )
     .filter(chat => !filters.botId
       || (chat.memberBots ?? []).some(member => member.inChat && member.larkAppId === filters.botId));
+}
+
+/** 群组页的两个视图：常驻的普通群，和私聊里自动创建的会话群。 */
+export type GroupView = 'standard' | 'session';
+
+export type SessionGroupSort = 'active' | 'created';
+
+export function isGroupView(value: unknown): value is GroupView {
+  return value === 'standard' || value === 'session';
+}
+
+/**
+ * 会话群按最近活跃（或创建时间）倒序。拿不到摘要的群（比如注册它的 bot 不在线）
+ * 排在最后，彼此保持原顺序。
+ */
+export function sortSessionGroups(chats: GroupChat[], sort: SessionGroupSort): GroupChat[] {
+  const key = (chat: GroupChat): number => {
+    const meta = chat.sessionGroupMeta;
+    const value = sort === 'created' ? meta?.createdAt : meta?.lastActiveAt;
+    return typeof value === 'number' && Number.isFinite(value) ? value : -Infinity;
+  };
+  return chats
+    .map((chat, index) => ({ chat, index, key: key(chat) }))
+    .sort((a, b) => (b.key - a.key) || (a.index - b.index))
+    .map(item => item.chat);
+}
+
+/** 会话群行里的时间：一周内用相对时间，再早显示日期（跨年带年份）。 */
+export function formatSessionGroupTime(
+  ms: number | undefined,
+  now: number,
+  tr: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '—';
+  const diff = Math.max(0, now - ms);
+  if (diff < 60_000) return tr('groups.time.justNow');
+  if (diff < 3_600_000) return tr('groups.time.minutesAgo', { n: Math.floor(diff / 60_000) });
+  if (diff < 86_400_000) return tr('groups.time.hoursAgo', { n: Math.floor(diff / 3_600_000) });
+  if (diff < 7 * 86_400_000) return tr('groups.time.daysAgo', { n: Math.floor(diff / 86_400_000) });
+  const date = new Date(ms);
+  const md = `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  return date.getFullYear() === new Date(now).getFullYear() ? md : `${date.getFullYear()}-${md}`;
 }
 
 /** 群里实际在群的 bot，保持快照（roster）顺序。 */

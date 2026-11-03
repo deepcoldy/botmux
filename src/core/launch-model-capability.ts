@@ -5,7 +5,7 @@
  *   - `isConfigurableReasoningCliId`（services/codex-reasoning-effort.ts）是**策略**门：
  *     trigger API / 定时任务只让「有显式推理控制」的 CLI 接受每次触发的模型覆盖。
  *     它比这里窄得多（只有 codex / codex-app / grok / traex / claude-code），拿它当能力门
- *     会把 gemini、cursor、opencode 这些明明吃 `--model` 的 CLI 一并拒掉。
+ *     会把 cursor、opencode 这些明明吃 `--model` 的 CLI 一并拒掉。
  *   - `CliAdapter.modelChoices` 是 **UI 策展**：`botmux setup` / dashboard / 配置卡要不要
  *     渲染模型下拉。它两头都不准 —— `pi` / `oh-my-pi` 吃 `--model` 却没有候选列表，
  *     而 `dsh-tui` 列了候选却在注释里写明「模型由 TUI 自己的 profile 决定，不注入」。
@@ -25,7 +25,7 @@ import type { CliId } from '../adapters/cli/types.js';
 
 /** 启动参数（或远端后端配置）里真的会带上 model 的 CLI。 */
 export const LAUNCH_MODEL_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'coco', 'codex', 'codex-app', 'cursor', 'gemini',
+  'claude-code', 'seed', 'relay', 'coco', 'codex', 'codex-app', 'cursor',
   'genius', 'opencode', 'mimocode', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'codem', 'grok',
   'reasonix', 'dsh', 'minimax', 'antigravity', 'remote-runner',
   // PTY 之外：MojoBackend 把 botmux 解析出的 model 拼进 `mojo -p --model`。

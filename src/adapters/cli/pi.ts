@@ -16,6 +16,7 @@ import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 import { delay } from '../../utils/timing.js';
 import { logger } from '../../utils/logger.js';
 import { drainPiTranscript, findPiTranscriptBySessionId, findPiTranscriptByPid, piBotmuxSessionTranscript } from '../../services/pi-transcript.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
 
 /** botmux ships its built-in skills for Pi here and injects it per-session via
  *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
@@ -407,7 +408,7 @@ export function createPiAdapter(
         nativeSessionTitle,
         model: resolvedModel,
         turnBoundaryExtension: turnBoundaryExt,
-        builtinSkillsDir: promptInjection === 'none' ? undefined : PI_BUILTIN_SKILLS_DIR,
+        builtinSkillsDir: promptInjection === 'none' ? undefined : join(builtinPluginDirForSession(PI_PLUGIN_DIR), 'skills'),
         skillPluginDir: promptInjection === 'none' ? undefined : skillPluginDir,
       });
     },

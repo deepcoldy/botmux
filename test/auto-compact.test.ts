@@ -262,7 +262,7 @@ describe('supportsNativeAutoCompact', () => {
     expect(supportsNativeAutoCompact('grok')).toBe(false);
     expect(supportsNativeAutoCompact('seed')).toBe(false);
     expect(supportsNativeAutoCompact('relay')).toBe(false);
-    expect(supportsNativeAutoCompact('gemini')).toBe(false);
+    expect(supportsNativeAutoCompact('opencode')).toBe(false);
     expect(supportsNativeAutoCompact('cursor')).toBe(false);
   });
 

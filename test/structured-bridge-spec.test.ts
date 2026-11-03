@@ -26,7 +26,7 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
   });
 
   it('SQLite-backed hermes / mtr and non-bridge CLIs declare no spec', () => {
-    for (const id of ['hermes', 'mtr', 'claude-code', 'gemini', 'codex-app', 'mira'] as CliId[]) {
+    for (const id of ['hermes', 'mtr', 'claude-code', 'opencode', 'codex-app', 'mira'] as CliId[]) {
       expect(bridgeSpecFor(id)).toBeUndefined();
       expect(createCliAdapterSync(id, FAKE_BIN).bridgeSpec).toBeUndefined();
     }

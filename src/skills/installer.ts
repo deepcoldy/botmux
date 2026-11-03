@@ -150,41 +150,27 @@ export function ensureWhiteboardSkill(cliId: string, skillsDir: string | undefin
 }
 
 /**
- * 条件管理 v3 Workflow skill 家族（`botmux-workflow` / `botmux-workflow-create` /
- * `botmux-goal-ask`）—— 跟随机器级 workflow 开关（与 {@link ensureWhiteboardSkill}
- * 同构）。这三个 skill 不进 `BUILTIN_SKILLS`（那会被无条件安装），而是按开关动态
- * 写入 / 删除：
+ * 清理 v3 Workflow skill 家族（`botmux-workflow` / `botmux-workflow-create` /
+ * `botmux-goal-ask`）的落盘副本。
  *
- * - `install=true`（workflow 功能开启，默认）：写入每个 SKILL.md，让 agent 看得到
- *   并能用 `/workflow` / botmux-workflow 能力。
- * - `install=false`（workflow 功能关闭）：删除这三个 skill 目录，避免给 agent 暴露
- *   一个当前会被 daemon/CLI 拒绝的能力；也清理旧版本无条件装下的残留。
- *
- * `botmux-orchestrate` 不在此列——它是独立的多 bot 长期编排能力，不随本开关关闭。
- *
- * 由 worker-pool 的 `ensureCliSkills` 在每次 spawn 时按 `isWorkflowFeatureEnabled()`
- * 调用（不走一次性缓存），所以运行时切换开关下一个会话即生效，无需重启 daemon。
- * 幂等：install 时内容相同则跳过；remove 时不存在则跳过。
+ * 这三个 skill 不再常驻在任何会话里（不写 Claude 家族的插件目录、不写 global 模式
+ * 的共享 skills 目录、也不进 prompt 模式的目录）：只有确定要用工作流时，agent 才用
+ * `botmux skill show <name>` 按需读取（workflow 开关关闭时 show 也取不到）。
+ * 旧版本在开关打开时会把它们写进这些共享目录，所以每次起会话都清一次残留；
+ * 已不存在时跳过，幂等。`botmux-orchestrate` 不在此列，不会被动到。
+ * 设计见 docs/design/2026-11-03-workflow-bot-handoff.md §4。
  */
-export function ensureWorkflowSkills(cliId: string, skillsDir: string | undefined, install: boolean): void {
+export function removeWorkflowSkills(cliId: string, skillsDir: string | undefined): void {
   if (!skillsDir) return;
   const base = expandHome(skillsDir);
   for (const skill of WORKFLOW_FEATURE_SKILLS) {
     const skillDir = join(base, skill.name);
-    const skillFile = join(skillDir, 'SKILL.md');
     try {
-      if (install) {
-        if (existsSync(skillFile) && readFileSync(skillFile, 'utf-8') === skill.content) continue;
-        mkdirSync(skillDir, { recursive: true });
-        atomicWriteFileSync(skillFile, skill.content);
-        logger.info(`[skills] Installed ${skill.name} (workflow enabled) for ${cliId} → ${skillFile}`);
-      } else {
-        if (!existsSync(skillDir)) continue;
-        rmSync(skillDir, { recursive: true, force: true });
-        logger.info(`[skills] Removed ${skill.name} (workflow disabled) for ${cliId}`);
-      }
+      if (!existsSync(skillDir)) continue;
+      rmSync(skillDir, { recursive: true, force: true });
+      logger.info(`[skills] Removed resident ${skill.name} for ${cliId} (workflow skills are read on demand)`);
     } catch (err: any) {
-      logger.warn(`[skills] ensureWorkflowSkills(${install}) failed for ${skill.name} on ${cliId}: ${err.message}`);
+      logger.warn(`[skills] removeWorkflowSkills failed for ${skill.name} on ${cliId}: ${err.message}`);
     }
   }
 }
@@ -224,7 +210,7 @@ export function ensureChatManagerSkill(cliId: string, skillsDir: string | undefi
  * directory. Idempotent — only writes when content differs.
  *
  * Each skill becomes {skillsDir}/<name>/SKILL.md. Sub-directory layout
- * matches Claude Code / Gemini / OpenCode convention. Retired skills (renamed
+ * matches Claude Code / OpenCode convention. Retired skills (renamed
  * or removed in a later version) are deleted from the directory so the CLI
  * doesn't keep surfacing stale entries alongside their replacements.
  */

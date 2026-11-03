@@ -77,6 +77,32 @@ describe('publish-gh-pages.sh', () => {
     expect(listed).toEqual(['botmux-midscene/master-run-10', 'botmux-midscene/master-run-100', 'botmux-midscene/pr-1']);
   });
 
+  it('removes reports of PRs that are not open, but keeps open ones, the target and other directories', () => {
+    const { remote, site } = setup();
+    for (const key of ['pr-3', 'pr-4', 'pr-x', 'manual', 'master-run-7']) publish(remote, site, `botmux-midscene/${key}`);
+    // pr-1 and pr-4 are closed; pr-5 is the target and is published even though it is not listed.
+    publish(remote, site, 'botmux-midscene/pr-5', { PAGES_OPEN_PRS: '3 12' });
+    const check = join(root!, 'check');
+    git(root!, 'clone', '-q', '--branch', 'gh-pages', remote, check);
+    const listed = git(check, 'ls-tree', '--name-only', 'HEAD', 'botmux-midscene/').split('\n').sort();
+    expect(listed).toEqual([
+      'botmux-midscene/manual',
+      'botmux-midscene/master-run-7',
+      'botmux-midscene/pr-3',
+      'botmux-midscene/pr-5',
+      'botmux-midscene/pr-x',
+    ]);
+    expect(readFileSync(join(check, 'blog', 'index.html'), 'utf8')).toBe('blog');
+  });
+
+  it('treats an empty open-PR list as "no PR is open"', () => {
+    const { remote, site } = setup();
+    publish(remote, site, 'botmux-midscene/manual', { PAGES_OPEN_PRS: '' });
+    const check = join(root!, 'check');
+    git(root!, 'clone', '-q', '--branch', 'gh-pages', remote, check);
+    expect(git(check, 'ls-tree', '--name-only', 'HEAD', 'botmux-midscene/')).toBe('botmux-midscene/manual');
+  });
+
   it('refuses target paths outside the branch', () => {
     const { remote, site } = setup();
     for (const target of ['', '/etc', '../x', '.git']) {

@@ -20,8 +20,8 @@ import {
  * Adapter for Google Antigravity CLI (`agy`).
  *
  *  Binary: `agy` (default install path: `~/.local/bin/agy`).
- *  State dir: `~/.gemini/antigravity-cli/` (Antigravity reuses Gemini CLI's
- *  home, namespaced under that subdir).
+ *  State dir: `~/.gemini/antigravity-cli/` (Antigravity reuses the ~/.gemini
+ *  home that Gemini CLI used, namespaced under that subdir).
  *
  *  Empirical findings (validated against agy 1.0.0 — May 2026 build):
  *
@@ -359,7 +359,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // NOTE: we deliberately do NOT pass `-i` / `--prompt-interactive`.
       // Despite the flag's existence in `agy --help`, empirical testing
       // shows that:
-      //   (a) -i prompts do NOT auto-submit (unlike Gemini's -i)
+      //   (a) -i prompts do NOT auto-submit (unlike other CLIs' -i)
       //   (b) -i prompts do NOT appear in history.jsonl, so we can't even
       //       confirm submission through our usual marker channel
       //   (c) a follow-up Enter does not finish the deposit either

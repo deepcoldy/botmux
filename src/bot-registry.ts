@@ -10,6 +10,7 @@ import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanc
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
+import { retiredCli, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
   normalizeSandboxMode,
   normalizeScratchStorage,
@@ -1941,7 +1942,7 @@ export interface BotConfig {
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
   lang?: Locale;
   /** How this bot's built-in botmux bridge skills reach its CLI (only meaningful
-   *  for CLIs with a global `skillsDir` — codex/gemini/opencode/…):
+   *  for CLIs with a global `skillsDir` — codex/opencode/…):
    *   - `global`: install into the CLI's shared global skills dir (leaks into the
    *     user's own standalone CLI). For users who never run the CLI by hand.
    *   - `prompt`: inject a session-scoped skill catalog into the prompt +
@@ -3415,6 +3416,14 @@ function resolveBotConfigPath(): string {
   );
 }
 
+const warnedRetiredCliApps = new Set<string>();
+/** Once per process and Bot: the loader runs on every bots.json read. */
+function warnRetiredCliOnce(cliId: string, appId: string): void {
+  if (warnedRetiredCliApps.has(appId)) return;
+  warnedRetiredCliApps.add(appId);
+  logger.warn(`[bot-registry] ${retiredCliNotice(cliId, appId)}`);
+}
+
 /** Warn once per relevant cycle and identify only the Bot rows whose handoff must be disabled. */
 function warnAndCollectCyclicQuotaFallbackIds(
   entries: any[],
@@ -3461,6 +3470,10 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   }
   const selectedAppId = String((entry as Record<string, unknown>).larkAppId ?? '');
   const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed, selectedAppId);
+  const entryCliId = (entry as Record<string, unknown>).cliId;
+  if (retiredCli(entryCliId)) {
+    throw new Error(`Bot config [${index}]: ${retiredCliNotice(entryCliId as string, selectedAppId)} (file: ${filePath})`);
+  }
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
@@ -3670,6 +3683,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       || entry.activationStarting !== undefined
       || entry.activationCommitted !== undefined
     ) {
+      continue;
+    }
+    // A removed CLI (gemini): the row stays in bots.json for the owner to fix,
+    // but the Bot is not loaded, so nothing builds an adapter for it. The
+    // fleet skips it the same way (fleet-runtime) and start/restart/Dashboard
+    // show the notice.
+    if (retiredCli(entry.cliId)) {
+      warnRetiredCliOnce(entry.cliId, entry.larkAppId);
       continue;
     }
 

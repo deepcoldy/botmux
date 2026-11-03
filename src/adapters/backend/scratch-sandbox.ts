@@ -136,6 +136,24 @@ function canonical(p: string): string {
   try { return realpathSync(p); } catch { return resolve(p); }
 }
 
+/** Like canonical, but a path that does not exist (yet) keeps its missing tail
+ *  under the realpath of its deepest existing ancestor. A lexical path through
+ *  a symlink (a ~/.botmux moved to another disk and linked back) can be neither
+ *  a bwrap mount target nor a safe mkdir target in the merged tree: an
+ *  absolute symlink there resolves on the HOST. */
+export function canonicalAllowMissing(p: string): string {
+  const abs = resolve(p);
+  let head = abs;
+  const tail: string[] = [];
+  for (;;) {
+    try { return join(realpathSync(head), ...tail.reverse()); } catch { /* missing: go up */ }
+    const parent = dirname(head);
+    if (parent === head) return abs;
+    tail.push(basename(head));
+    head = parent;
+  }
+}
+
 function hasCmd(cmd: string): boolean {
   return spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
 }
@@ -900,7 +918,7 @@ export function prepareScratchSandboxDetailed(opts: PrepareScratchOpts): Scratch
   for (const raw of opts.denyPaths ?? []) {
     if (typeof raw !== 'string' || !raw) continue;
     let p: string;
-    try { p = canonical(raw); } catch { continue; }
+    try { p = canonicalAllowMissing(raw); } catch { continue; }
     if (!isAbsolute(p) || p === '/' || seen.has(p)) continue;
     seen.add(p);
     denies.push(p);

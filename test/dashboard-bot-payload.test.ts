@@ -55,7 +55,7 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType', 'defaultBackendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'codexBrowser', 'writableTerminalLinkInCard', 'privateCard',
+      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'privateCard',
       'cotEnabled', 'replyCardShowTools', 'senderTag', 'senderTagHideEmail', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
@@ -82,6 +82,35 @@ describe('dashboard bot payload helpers', () => {
     // 旧 daemon 不回 oncallChatCount：不能补成 0（会被读成「已全部解绑」），也不能拿累计数顶上。
     expect(botDefaultsPayload({ larkAppId: 'app' }, { autoboundChatCount: 1052 }))
       .toMatchObject({ autoboundChatCount: 1052, oncallChatCount: null });
+  });
+
+  it('passes the shared-bot sandbox advice inputs through, degrading missing/malformed values to null', () => {
+    const row = botDefaultsPayload({ larkAppId: 'app' }, {
+      allowedUsersCount: 3,
+      oncallSharedChatCount: 2,
+      allowedChatGroupsCount: 1,
+      localSandboxApplies: false, sandboxCapable: false,
+      effectiveSandboxMode: 'oncall',
+    });
+    // Deleting the daemon-side field must surface as null here, not undefined:
+    // the advice component treats null as "old daemon" and falls back safely.
+    expect(row).toMatchObject({
+      allowedUsersCount: 3, oncallSharedChatCount: 2,
+      allowedChatGroupsCount: 1, localSandboxApplies: false, sandboxCapable: false, effectiveSandboxMode: 'oncall',
+    });
+    const old = botDefaultsPayload({ larkAppId: 'app' }, {});
+    expect(old).toMatchObject({
+      allowedUsersCount: null, oncallSharedChatCount: null,
+      allowedChatGroupsCount: null, localSandboxApplies: null, sandboxCapable: null, effectiveSandboxMode: null,
+    });
+    const bad = botDefaultsPayload({ larkAppId: 'app' }, {
+      allowedUsersCount: '3', oncallSharedChatCount: {},
+      allowedChatGroupsCount: [1], localSandboxApplies: 'no', sandboxCapable: 0, effectiveSandboxMode: 'bwrap',
+    });
+    expect(bad).toMatchObject({
+      allowedUsersCount: null, oncallSharedChatCount: null,
+      allowedChatGroupsCount: null, localSandboxApplies: null, sandboxCapable: null, effectiveSandboxMode: null,
+    });
   });
 
   it('passes the herdr placement block through to the browser, degrading non-objects to null', () => {

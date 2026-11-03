@@ -28,14 +28,16 @@ function parseHelp(text: string): CommandHelp {
     else if (/^\S/.test(line)) section = '';
     // Typed API commands group flags under API Parameters/Execution/Output,
     // while shortcuts use Flags. Both use the same declaration grammar.
+    // Some shortcuts declare snake_case flags (whiteboard +query --output_as).
     if (section !== 'commands') {
-      const match = /^\s+(?:(-[A-Za-z0-9]),\s+)?(--[A-Za-z0-9-]+)(?: ([^\s]+))?\s{2,}/.exec(line);
+      const match = /^\s+(?:(-[A-Za-z0-9]),\s+)?(--[A-Za-z0-9][A-Za-z0-9_-]*)(?: ([^\s]+))?\s{2,}/.exec(line);
       if (!match) continue;
       const flag = { name: match[2], takesValue: !!match[3] && !match[3].startsWith('[') };
       flags.set(match[2], flag);
       if (match[1]) flags.set(match[1], flag);
     } else if (section === 'commands') {
-      const match = /^\s+([+\w][\w.+-]*)\s{2,}/.exec(line);
+      // Cobra pads names to the longest one, which then has a single space.
+      const match = /^\s+([+\w][\w.+-]*)(?:\s|$)/.exec(line);
       if (match) commands.add(match[1]);
     }
   }

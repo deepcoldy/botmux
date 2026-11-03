@@ -20,7 +20,7 @@ export function resumeStartsFresh(session: { cliId?: string; cliSessionId?: stri
   try {
     const adapter = createCliAdapterSync(session.cliId as CliId);
     if (adapter.resumeRequiresCliSessionId === true) return true;
-    // The adapter finds its own session (Kimi / Gemini): the same probe the
+    // The adapter finds its own session (Kimi): the same probe the
     // worker runs before resuming decides, so the copy matches the launch.
     if (adapter.resumeFindsOwnSession === true && session.sessionId) {
       return adapter.checkResumeTargetExists?.({ sessionId: session.sessionId, workingDir: session.workingDir }) === false;

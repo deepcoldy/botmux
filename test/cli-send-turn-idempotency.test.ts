@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,7 +45,8 @@ function createFixture(
       cwd: repo,
       env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir,
         BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: sessionId, BOTMUX_TURN_ID: turnId,
-        BOTMUX_LARK_APP_ID: 'cli_test', ...(topicUnavailablePolicy ? { BOTMUX_TEST_TOPIC_STATE: topicState } : {}) },
+        BOTMUX_LARK_APP_ID: 'cli_test', BOTMUX_TEST_ALLOW_IMAGE_UPLOAD: '1',
+        ...(topicUnavailablePolicy ? { BOTMUX_TEST_TOPIC_STATE: topicState } : {}) },
       encoding: 'utf8', timeout: 30_000,
     });
     const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='));
@@ -216,6 +218,82 @@ describe('botmux send per-turn final idempotency', () => {
       expect(changed.requests).toHaveLength(0);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
+
+  it('replays an image-only final after the relay restages identical bytes', () => {
+    const f = createFixture();
+    const firstImage = join(f.root, 'relay-attempt-1.png');
+    const retryImage = join(f.root, 'relay-attempt-2.png');
+    writeFileSync(firstImage, 'same-image-bytes');
+    writeFileSync(retryImage, 'same-image-bytes');
+    try {
+      const first = f.run('final', '', ['--images', firstImage]);
+      expect(first.result.status, String(first.result.stderr)).toBe(0);
+      expect(first.requests).toHaveLength(1);
+
+      const retry = f.run('final', '', ['--images', retryImage]);
+      expect(retry.result.status, String(retry.result.stderr)).toBe(0);
+      expect(JSON.parse(String(retry.result.stdout).trim())).toMatchObject({
+        messageId: 'om_separate_message', replayed: true,
+      });
+      expect(retry.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it('refuses an image-only final retried with different bytes instead of replaying success', () => {
+    const f = createFixture();
+    const firstImage = join(f.root, 'relay-attempt-1.png');
+    const otherImage = join(f.root, 'relay-attempt-2.png');
+    writeFileSync(firstImage, 'first-image-bytes');
+    writeFileSync(otherImage, 'other-image-bytes');
+    try {
+      expect(f.run('final', '', ['--images', firstImage]).result.status).toBe(0);
+
+      // Byte identity is what makes a restaged retry replayable; it must not
+      // degrade into "any image replays", which would silently drop a genuinely
+      // different picture a second final attempt was trying to deliver.
+      const changed = f.run('final', '', ['--images', otherImage]);
+      expect(changed.result.status).toBe(2);
+      expect(String(changed.result.stderr)).toContain('本次请求的目标、提及或附件与已投递请求不同');
+      expect(changed.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it('rejects a FIFO passed as --images on a durable final instead of hanging on the second read', () => {
+    const f = createFixture();
+    const fifo = join(f.root, 'pipe.png');
+    try { execFileSync('mkfifo', [fifo], { stdio: 'ignore' }); }
+    catch { rmSync(f.root, { recursive: true, force: true }); return; } // mkfifo unavailable — skip
+    // One-shot writer blocks until the reader opens the FIFO — the same shape
+    // as shell process substitution <(...). It is killed if send never opens it.
+    const writer = spawn('sh', ['-c', `printf png-bytes > '${fifo}'`], { stdio: 'ignore' });
+    try {
+      const start = Date.now();
+      const r = f.run('final', '', ['--images', fifo]);
+      const ms = Date.now() - start;
+      expect(r.result.status, String(r.result.stderr)).toBe(1);
+      expect(String(r.result.stderr)).toContain('不是普通文件');
+      expect(r.requests).toHaveLength(0);
+      // Without the regular-file gate send blocks in uploadImage's second read
+      // of the one-shot FIFO and only dies on the spawn timeout (30s).
+      expect(ms).toBeLessThan(10_000);
+    } finally {
+      writer.kill('SIGKILL');
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it('reports a directory passed as --images with the regular-file error instead of an uncaught stack', () => {
+    const f = createFixture();
+    const dir = join(f.root, 'adir.png');
+    mkdirSync(dir);
+    try {
+      const r = f.run('final', '', ['--images', dir]);
+      expect(r.result.status, String(r.result.stderr)).toBe(1);
+      expect(String(r.result.stderr)).toContain('不是普通文件');
+      expect(String(r.result.stderr)).not.toContain('triggerUncaughtException');
+      expect(r.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
 
   it('refuses the same final body with a new attachment instead of silently dropping it', () => {
     const f = createFixture();

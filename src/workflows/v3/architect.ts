@@ -22,8 +22,10 @@ import {
   type ValidateManifest,
   type WorkerSessionInfo,
 } from './contract.js';
+import type { V3ArchitectBotAssignment, V3RosterBot, V3SketchAssignee } from './bot-assignment.js';
 
 const ARCHITECT_NODE_ID = 'architect';
+const MAX_UNAVAILABLE_CHARS = 200;
 const ARCHITECT_ATTEMPT_ID = 'architect/attempts/001';
 
 export interface RunArchitectInput {
@@ -41,6 +43,10 @@ export interface RunArchitectInput {
   runNode?: RunNode;
   resolveLarkAppSecret?: EphemeralPoolDeps['resolveLarkAppSecret'];
   validateManifest?: ValidateManifest;
+  /** Present only when the run's goal nodes will be handed to bots in the
+   *  group chat (design 2026-11-03 §6): the roster to assign from. Absent =
+   *  today's prompt, unchanged. */
+  botAssignment?: V3ArchitectBotAssignment;
 }
 
 export interface RunArchitectResult {
@@ -52,7 +58,11 @@ export interface RunArchitectResult {
   sessionInfo?: WorkerSessionInfo;
 }
 
-export function buildArchitectGoal(specPath: string, specJsonPath: string): string {
+export function buildArchitectGoal(
+  specPath: string,
+  specJsonPath: string,
+  botAssignment?: V3ArchitectBotAssignment,
+): string {
   const sketchFields = [
     'sketchId',
     'goal',
@@ -61,6 +71,7 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     'acceptance',
     'risk_gate',
     'unknowns',
+    ...(botAssignment ? ['assignee'] : []),
   ].join(', ');
   return [
     'You are the botmux v3 workflow architect.',
@@ -137,7 +148,54 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     '- For each conditional branch: the decision field + its enum, which path each value takes, and confirmation that every value reaches some sink (no allSinksSkipped hole).',
     '- Include an artifact contract table listing producer node, output key, path, kind, and every consumer.',
     '- List any assumptions or unresolved risks for human review.',
+    ...(botAssignment ? architectBotAssignmentLines(botAssignment) : []),
   ].join('\n');
+}
+
+function rosterEntry(bot: V3RosterBot): Record<string, unknown> {
+  return {
+    larkAppId: bot.larkAppId,
+    name: bot.name,
+    cli: bot.cli,
+    ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.role ? { role: bot.role } : {}),
+    ...(bot.main ? { main: true } : {}),
+  };
+}
+
+function assigneeLine(entry: V3SketchAssignee): string {
+  const sketch = `sketch ${JSON.stringify(entry.sketchId)}`;
+  const named = `the user named ${JSON.stringify(entry.assignee)}`;
+  const fallback = 'assign that node like any other and say so in its reason';
+  if (entry.target.kind === 'bot' && !entry.unavailable) return `  - ${sketch} → ${entry.target.larkAppId} (${named})`;
+  if (entry.target.kind === 'bot') {
+    // The reason may carry probe / Lark error text: keep it one quoted value.
+    const why = JSON.stringify((entry.unavailable ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_UNAVAILABLE_CHARS));
+    return `  - ${sketch}: ${named} (${entry.target.larkAppId}), which cannot execute nodes here (${why}); ${fallback}.`;
+  }
+  if (entry.target.kind === 'ambiguous') {
+    return `  - ${sketch}: ${named}, which matches several bots (${entry.target.larkAppIds.join(', ')}); ${fallback}.`;
+  }
+  return `  - ${sketch}: ${named}, which matches no bot on this host; ${fallback}.`;
+}
+
+/** The bot-run-only part of the prompt (design 2026-11-03 §6.1/§6.2). */
+function architectBotAssignmentLines(assignment: V3ArchitectBotAssignment): string[] {
+  const main = assignment.roster.mainLarkAppId;
+  return [
+    '',
+    'Bot assignment (each goal node of this run is executed by one bot in the group chat, in its own session):',
+    '- Roster — the ONLY bots that may execute a node (one JSON object per line; "main": true is the bot running this workflow):',
+    ...assignment.roster.bots.map((bot) => `  ${JSON.stringify(rosterEntry(bot))}`),
+    '- Set `"bot": "<larkAppId>"` on every goal node (loop body nodes included), using only roster larkAppIds; the host rejects any other value.',
+    '- Keep each sketch\'s sketchId as the id of the goal node that implements it.',
+    ...(assignment.assignees.length > 0
+      ? ['- The user named bots for these sketches (`assignee`, already resolved by the host); a resolved assignment is binding:',
+        ...assignment.assignees.map(assigneeLine)]
+      : []),
+    `- Otherwise pick the roster bot whose CLI, model and role best fit the node; when unsure, use the main bot (${main}).`,
+    '- architect-notes.md MUST contain a `## Bot assignments` section with exactly one line per goal node: `- <nodeId> → <larkAppId>: <one-line reason>` (a loop body node as `<loopId>.<bodyNodeId>`).',
+  ];
 }
 
 export async function runArchitect(input: RunArchitectInput): Promise<RunArchitectResult> {
@@ -154,7 +212,7 @@ export async function runArchitect(input: RunArchitectInput): Promise<RunArchite
   rmSync(attemptDir, { recursive: true, force: true });
   mkdirSync(outputDir, { recursive: true });
 
-  const goal = buildArchitectGoal(input.specPath, input.specJsonPath);
+  const goal = buildArchitectGoal(input.specPath, input.specJsonPath, input.botAssignment);
   const inputs = {
     inputs: [
       { from: 'grill', name: 'spec.json', path: input.specJsonPath, kind: 'json' },

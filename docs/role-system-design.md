@@ -343,7 +343,7 @@ bot 每条回复卡片左下角的 brand 位（现为蓝色「botmux」链接）
 # 13. 后续演进（非本期）
 
 - **v1 飞书卡片层**：daemon 加「角色」关键词触发 + 角色选择卡片，点击回调直接调本期新增的 IPC cd 路由；角色列表由 daemon 按 open_id 生成，权限升级为硬约束。存储与 v0 完全兼容，纯增量
-- **多 CLI 支持（如 codex）**：C 骨架 CLI 无关（角色=目录、botmux cd、脚注、沉淀全通用），按 CLI 替换三支柱——人设文件（CLAUDE.md→AGENTS.md/GEMINI.md，脚手架多生成一份）、记忆分桶（codex 记忆是否按 cwd 分桶待验证，否则回退协议管理的角色内 memory/）、切换体验（无会话内 /cd 的 CLI 由能力位 supportsSessionCwdMove=false 自动走冷启动兜底，丢上下文但功能完整）。能力位已在本期预埋，故 codex/gemini 支持无需改 botmux 代码，只需脚手架模板（AGENTS.md/GEMINI.md）、协议文本与 bots.json 配置层面的兼容
+- **多 CLI 支持（如 codex）**：C 骨架 CLI 无关（角色=目录、botmux cd、脚注、沉淀全通用），按 CLI 替换三支柱——人设文件（CLAUDE.md→AGENTS.md，脚手架多生成一份）、记忆分桶（codex 记忆是否按 cwd 分桶待验证，否则回退协议管理的角色内 memory/）、切换体验（无会话内 /cd 的 CLI 由能力位 supportsSessionCwdMove=false 自动走冷启动兜底，丢上下文但功能完整）。能力位已在本期预埋，故 codex 支持无需改 botmux 代码，只需脚手架模板（AGENTS.md）、协议文本与 bots.json 配置层面的兼容
 - **知识文档变更自动同步**：接入现有 /subscribe-lark-doc 订阅机制，用户改完知识文档自动拉回，免说「同步知识」
 - **角色改名工具**：改目录名 + 搬迁 projects/<slug>/ 记忆桶一步完成
 - **沉淀增强**：蒸馏时扫描近期话题 transcript，补录对话中漏记的记忆
@@ -359,7 +359,7 @@ bot 每条回复卡片左下角的 brand 位（现为蓝色「botmux」链接）
 | 报废 | botmux cd 的角色用法（命令本身可留作通用能力）；（v0.3 起 handoff 已退役，无需处理） |
 | 数据搬家（\~200 行脚本） | ① 记忆搬桶：projects/<角色目录slug>/memory/\* 搬进角色目录 memory/（slug↔目录可推导；隔离 bot 在 BOT_HOME、非隔离在 \~/.claude，两处都扫；§13 的「角色改名工具」即此脚本雏形）；② 人设转换：CLAUDE.md 剥掉 @import 协议行变 role.md；③ 存量话题可不迁（新话题走 A、老话题自然老化） |
 
-**迁移触发条件**（痛点驱动，出现再动）：角色 bot 需要同时在代码仓库干活（cwd 不可被角色占用）；要支持 Codex/Gemini 等多 CLI；软权限不够用。均未出现时，停在 C 是健康终态——C 阶段的 .botmux-dir.json、目录归属结构、协议单源文件本就是给 A 预埋的兼容层。
+**迁移触发条件**（痛点驱动，出现再动）：角色 bot 需要同时在代码仓库干活（cwd 不可被角色占用）；要支持 Codex 等多 CLI；软权限不够用。均未出现时，停在 C 是健康终态——C 阶段的 .botmux-dir.json、目录归属结构、协议单源文件本就是给 A 预埋的兼容层。
 
 # 14. 待你确认的问题
 

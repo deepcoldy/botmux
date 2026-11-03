@@ -14,6 +14,29 @@ describe('lark-cli argv metadata', () => {
     expect(invocation.args).toContain('--dry-run');
   });
 
+  it('reads snake_case flags declared by shortcut help', () => {
+    const readHelp = (cmd: readonly string[]) => {
+      const help = readLarkToolHelp(cmd);
+      return cmd.join(' ') === 'docs +fetch' ? help.replace('      --dry-run', '      --output_as string   format\n      --dry-run') : help;
+    };
+    for (const args of [['docs', '+fetch', '--output_as', 'image', '--dry-run'], ['docs', '+fetch', '--output_as=image', '--dry-run']]) {
+      const invocation = parseLarkToolInvocation(args, binding, readHelp);
+      expect(larkToolExecutionArgs(invocation)).toEqual([...args, '--as', 'bot']);
+    }
+  });
+
+  it('resolves a lone subcommand listed with Cobra single-space padding', () => {
+    const readHelp = (cmd: readonly string[]) => {
+      const key = cmd.join(' ');
+      if (key === 'docs') return readLarkToolHelp(cmd).replace('+fetch      command', 'metas command');
+      if (key === 'docs metas') return 'Usage:\n  lark-cli docs metas [command]\nAvailable Commands:\n  batch_query 获取文件元数据\nFlags:\n  -h, --help   help\n';
+      if (key === 'docs metas batch_query') return 'Usage:\n  lark-cli docs metas batch_query [flags]\nRequest Body:\n      --data string   body\nExecution:\n      --as string   identity\nOther:\n  -h, --help   help\n      --json   json\n';
+      return readLarkToolHelp(cmd);
+    };
+    const args = ['docs', 'metas', 'batch_query', '--json', '--data', '{}'];
+    expect(larkToolExecutionArgs(parseLarkToolInvocation(args, binding, readHelp))).toEqual([...args, '--as', 'bot']);
+  });
+
   it.each([
     ['docs', '+fetch', '--doc', 'doc-fixture', '--scope', 'keyword', '--keyword', '--as=user', '--dry-run'],
     ['sheets', '+cells-replace', '--replacement', '--as=user', '--dry-run'],

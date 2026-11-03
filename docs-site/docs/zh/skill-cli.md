@@ -32,7 +32,7 @@ session 信息通过**祖先进程标记**自动推断：worker 启动 CLI 时�
 
 - **Claude 家族（claude-code / seed / relay）**：路由 / 身份走 `--append-system-prompt`；Skill 走 `--plugin-dir`（不是塞进 system prompt）。
 - **genius**：路由 + Skill 目录都走 `--append-system-prompt`；**grok** 用它的等价开关 `--rules`。
-- **其余大多数 CLI**（codex / gemini / opencode / cursor / coco / traex 等）：默认 `skillInjection=prompt` 模式下，路由与 Skill 目录**内联进首条 prompt**，不占任何 system-prompt 旗标。
+- **其余大多数 CLI**（codex / opencode / cursor / coco / traex 等）：默认 `skillInjection=prompt` 模式下，路由与 Skill 目录**内联进首条 prompt**，不占任何 system-prompt 旗标。
 
 > Skill catalog 的注入受 per-bot `skillInjection` 模式影响（genius/grok 同样）：`prompt`（默认）内联精简目录进 prompt、按需 `botmux skill show <name>` 拉全文；`global` 把 skill 文件装进 CLI 共享 skills 目录（你手跑的 CLI 也会看到）；`off` 则不装目录、只留路由指引 + `botmux --help`。配过 `global`/`off` 的机制与上面「内联」不同。
 >
@@ -43,6 +43,6 @@ session 信息通过**祖先进程标记**自动推断：worker 启动 CLI 时�
 相比基于 MCP 的方案，Skill + CLI 组合：
 
 - CLI 启动**不用做 MCP 握手**，核心的 `botmux send` / `history` 等通道零 MCP 依赖，也不占用工具列表 token（仅当 adapter 显式开启且插件真的贡献了 MCP server 时才起网关）。
-- **shell / 路由这一层通用**——只要 CLI 能读 system prompt、能跑 shell 命令，`~/.botmux/bin/botmux` + PATH 就能用，覆盖 Claude Code / Codex / Cursor / Gemini / OpenCode 等。
+- **shell / 路由这一层通用**——只要 CLI 能读 system prompt、能跑 shell 命令，`~/.botmux/bin/botmux` + PATH 就能用，覆盖 Claude Code / Codex / Cursor / OpenCode / Antigravity 等。
 
 > ⚠️ 但**开箱 Skill 这一层并非对所有 CLI 均等**：少数 CLI（如 Antigravity，只认插件包内的 SKILL.md、不认扁平 `skills/` 目录）只拿到路由指引、不装 Skill 目录。所以「通用」对 shell/路由通道成立，对 Skill 目录是「大多数」而非「全部」。

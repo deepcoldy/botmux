@@ -72,6 +72,14 @@ export const DAEMON_ENV_KEYS = [
   'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS',
   'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS',
   'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS',
+  // Per-step sender display-name lookup budget. Must ride the file snapshot:
+  // unlike a shell start, a restart issued from inside a session (or a
+  // detached self-upgrade restart) inherits the old daemon's value through the
+  // CLI pane, which unsets neither this key nor its peers, and the daemon's
+  // dotenv load never overrides an inherited key. Without this entry a changed
+  // value would be ignored on those paths, and deleting the key from
+  // ~/.botmux/.env could never restore the default budget.
+  'BOTMUX_SENDER_RESOLVE_TIMEOUT_MS',
   // Extra source addresses accepted by the local-peer ring of the internal
   // HMAC endpoints (utils/loopback-peers.ts): hosts whose kernel reports a
   // same-machine loopback peer as a LAN IP. Consumed by both the daemons
