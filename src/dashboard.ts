@@ -138,6 +138,7 @@ import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
 import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { readBotsInfoJson } from './services/bots-info-cache.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -378,7 +379,7 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
-import { handleWorkflowDraftsApi } from './dashboard/workflow-drafts-api.js';
+import { handleWorkflowDraftsApi, handleWorkflowOrchestratorBotsApi, workflowOrchestratorBotOptions } from './dashboard/workflow-drafts-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -6814,6 +6815,29 @@ const server = createServer(async (req, res) => {
       featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
       runsDir: v3RunsDir(),
       proxyToDaemon,
+    })) {
+      return;
+    }
+
+    // The orchestrator picker of 「新建工作流」 (design 2026-11-03 §4.1, D3):
+    // bots.json + the daemon registry, read only.
+    if (handleWorkflowOrchestratorBotsApi(req, res, url, {
+      canManageHost: authed,
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      listBots: () => {
+        // Offline bots have no registry row: their name comes from bots-info.json.
+        const fileNames = new Map<string, string>();
+        try {
+          for (const entry of normalizeBotsInfoRouteEntries(readBotsInfoJson(config.session.dataDir))) {
+            if (entry.botName) fileNames.set(entry.larkAppId, entry.botName);
+          }
+        } catch { /* unreadable: ids */ }
+        return workflowOrchestratorBotOptions(
+          loadBotConfigs(),
+          (larkAppId) => !!registry.getByAppId(larkAppId),
+          (larkAppId) => registry.getByAppId(larkAppId)?.botName || fileNames.get(larkAppId) || larkAppId,
+        );
+      },
     })) {
       return;
     }

@@ -6,6 +6,7 @@
  *   POST /api/v3/orchestration/drafts            {larkAppId, goal} → 该 Bot 的 daemon
  *   GET  /api/v3/orchestration/drafts/:runId     → 草稿属主 daemon
  *   POST /api/v3/orchestration/drafts/:runId/…   → 草稿属主 daemon（写）
+ *   GET  /api/v3/orchestration/bots              编排 Bot 下拉框（D3，只读）
  *
  * The Dashboard only classifies the login (D1 `classifyDashboardInitiator`)
  * and routes; the orchestrating bot's daemon resolves the person, applies the
@@ -25,6 +26,9 @@ import {
 } from '../core/workflow-initiator.js';
 import { listWorkflowDrafts, workflowDraftOwner } from '../workflows/v3/draft-store.js';
 import { logger } from '../utils/logger.js';
+import type { BotConfig } from '../bot-registry.js';
+import { v3BotStaticExclusion } from '../workflows/v3/bot-assignment.js';
+import { isV3SupportedCli } from '../workflows/v3/contract.js';
 
 export const WORKFLOW_DRAFTS_API_PATH = '/api/v3/orchestration/drafts';
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -190,5 +194,92 @@ export async function handleWorkflowDraftsApi(
     return true;
   }
   await relay(res, upstream);
+  return true;
+}
+
+// ─── 编排 Bot 下拉框（§4.1，D3）─────────────────────────────────────────────
+
+export const WORKFLOW_ORCHESTRATOR_BOTS_PATH = '/api/v3/orchestration/bots';
+
+/**
+ * Why a configured bot cannot orchestrate, as far as the Dashboard can tell
+ * without asking its daemon. `cannot_operate` (I1) is not here: it depends on
+ * the person and is answered by the initiator route of the chosen bot.
+ */
+export type WorkflowOrchestratorUnavailableCode =
+  | 'cli_unsupported'
+  | 'bypass_disabled'
+  | 'codex_profile'
+  | 'daemon_offline';
+
+export interface WorkflowOrchestratorBotOption {
+  larkAppId: string;
+  name: string;
+  cliId: string;
+  online: boolean;
+  unavailable?: { code: WorkflowOrchestratorUnavailableCode; why: string };
+}
+
+/**
+ * The orchestrator picker rows: every bot in bots.json, in file order. The
+ * static rule is the one draft creation enforces on the daemon
+ * (`v3BotStaticExclusion`); the code only picks the label.
+ */
+export function workflowOrchestratorBotOptions(
+  bots: readonly BotConfig[],
+  isOnline: (larkAppId: string) => boolean,
+  nameOf: (larkAppId: string) => string,
+): WorkflowOrchestratorBotOption[] {
+  return bots.map((bot) => {
+    const online = isOnline(bot.larkAppId);
+    const why = v3BotStaticExclusion(bot);
+    const code: WorkflowOrchestratorUnavailableCode | undefined = why
+      ? (!isV3SupportedCli(bot.cliId) ? 'cli_unsupported' : bot.disableCliBypass === true ? 'bypass_disabled' : 'codex_profile')
+      : online ? undefined : 'daemon_offline';
+    return {
+      larkAppId: bot.larkAppId,
+      name: nameOf(bot.larkAppId),
+      cliId: bot.cliId,
+      online,
+      ...(code ? { unavailable: { code, why: why ?? 'daemon 不在线' } } : {}),
+    };
+  });
+}
+
+export interface WorkflowOrchestratorBotsApiDeps {
+  canManageHost: boolean;
+  featureEnabled: () => boolean;
+  listBots: () => WorkflowOrchestratorBotOption[];
+}
+
+/** GET /api/v3/orchestration/bots — read only, management login. */
+export function handleWorkflowOrchestratorBotsApi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: WorkflowOrchestratorBotsApiDeps,
+): boolean {
+  if (url.pathname !== WORKFLOW_ORCHESTRATOR_BOTS_PATH) return false;
+  if (req.method !== 'GET') {
+    jsonRes(res, 405, { ok: false, error: 'method_not_allowed', retryable: false });
+    return true;
+  }
+  if (!deps.canManageHost) {
+    jsonRes(res, 401, { ok: false, error: 'auth_required', retryable: false });
+    return true;
+  }
+  if (!deps.featureEnabled()) {
+    jsonRes(res, 409, { ok: false, error: 'feature_disabled', retryable: false });
+    return true;
+  }
+  let bots: WorkflowOrchestratorBotOption[];
+  try {
+    bots = deps.listBots();
+  } catch (error) {
+    logger.warn(`[workflow-drafts] listing orchestrator bots failed: ${error instanceof Error ? error.message : String(error)}`);
+    jsonRes(res, 500, { ok: false, error: 'bots_unavailable', retryable: true });
+    return true;
+  }
+  jsonRes(res, 200, { ok: true, bots });
   return true;
 }
