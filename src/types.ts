@@ -1292,6 +1292,14 @@ export interface Session {
   sandboxNetwork?: boolean;
   sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /**
+   * Protected plugin HTTP egress decision frozen for this session before its
+   * first worker starts. `undefined` is a legacy row that has not reached a
+   * post-upgrade fork boundary; `null` records that no protected egress policy
+   * applied at creation; an object is the complete DNS-frozen worker policy.
+   * Restores consume this snapshot instead of current plugin configuration.
+   */
+  protectedHttpEgressPolicy?: import('./core/protected-http-egress.js').ProtectedHttpEgressWorkerPolicy | null;
+  /**
    * Set when the auto-worktree gate let this session DEGRADE to the real
    * default dir (worktree creation failed and the gate judged that no local
    * oncall sandbox would apply). The worker refuses to start an oncall sandbox

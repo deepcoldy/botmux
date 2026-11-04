@@ -14364,6 +14364,46 @@ function protectedHttpEgressForkTurn(
   };
 }
 
+function protectedHttpEgressForkIsResume(resumeOrTurnId: ForkResumeOrTurnId): boolean {
+  if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
+    return resumeOrTurnId.resume === true;
+  }
+  return resumeOrTurnId === true;
+}
+
+function freezeSessionProtectedHttpEgressPolicy(
+  ds: DaemonSession,
+  policy: ProtectedHttpEgressWorkerPolicy | undefined,
+): ProtectedHttpEgressWorkerPolicy | undefined {
+  if (ds.session.protectedHttpEgressPolicy !== undefined) {
+    return ds.session.protectedHttpEgressPolicy ?? undefined;
+  }
+  const candidate = policy ? structuredClone(policy) : null;
+  ds.session.protectedHttpEgressPolicy = candidate;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    if (ds.session.protectedHttpEgressPolicy === candidate) {
+      let durablePolicy: DaemonSession['session']['protectedHttpEgressPolicy'];
+      try {
+        durablePolicy = sessionStore.getSessionFresh(ds.session.sessionId)
+          ?.protectedHttpEgressPolicy;
+      } catch {
+        durablePolicy = undefined;
+      }
+      if (durablePolicy !== undefined) {
+        ds.session.protectedHttpEgressPolicy = durablePolicy === null
+          ? null
+          : structuredClone(durablePolicy);
+      } else {
+        delete ds.session.protectedHttpEgressPolicy;
+      }
+    }
+    throw error;
+  }
+  return ds.session.protectedHttpEgressPolicy ?? undefined;
+}
+
 function reportProtectedHttpEgressForkFailure(
   ds: DaemonSession,
   bot: ReturnType<typeof getBot>,
@@ -14371,6 +14411,7 @@ function reportProtectedHttpEgressForkFailure(
   opts: ForkWorkerOptions,
   error: unknown,
   phase: 'dns' | 'preparation',
+  reportAdmission = true,
 ): void {
   const rawReason = error instanceof Error ? error.message : String(error);
   const reason = phase === 'preparation'
@@ -14421,7 +14462,7 @@ function reportProtectedHttpEgressForkFailure(
       }
     }
   }
-  opts.onAdmission?.('rejected');
+  if (reportAdmission) opts.onAdmission?.('rejected');
 }
 
 function reportProtectedHttpEgressAbortCleanupFailure(
@@ -14564,7 +14605,6 @@ export function forkWorker(
   }
 
   const bot = getBot(ds.larkAppId);
-  const globalConfig = readGlobalConfig();
   let pending = pendingProtectedHttpEgressForks.get(ds.session.sessionId);
   if (pending?.abortCleanupPending) {
     const cleanupRetried = pending.retryAbortCleanup?.() === true;
@@ -14580,6 +14620,36 @@ export function forkWorker(
     }
     pending = undefined;
   }
+  const frozenSessionPolicy = ds.session.protectedHttpEgressPolicy;
+  if (frozenSessionPolicy !== undefined) {
+    if (pending) {
+      if (frozenSessionPolicy === null
+        || pending.pluginId !== frozenSessionPolicy.pluginId
+        || pending.policyDigest !== frozenSessionPolicy.policyDigest) {
+        throw new Error('protected_http_egress_policy_changed_during_freeze');
+      }
+      return queueBehindPendingProtectedHttpEgressFork(
+        pending,
+        ds,
+        promptInput,
+        resumeOrTurnId,
+        opts,
+      );
+    }
+    return forkWorkerPrepared(
+      ds,
+      promptInput,
+      resumeOrTurnId,
+      opts,
+      frozenSessionPolicy ?? undefined,
+      bot,
+    );
+  }
+  if (protectedHttpEgressForkIsResume(resumeOrTurnId)) {
+    return forkWorkerPrepared(ds, promptInput, resumeOrTurnId, opts, undefined, bot);
+  }
+
+  const globalConfig = readGlobalConfig();
   const collected = collectProtectedHttpEgressPolicies(
     resolveEffectivePluginIds(bot.config, globalConfig),
   );
@@ -14651,6 +14721,33 @@ export function forkWorker(
     return true;
   };
   activePending.retryAbortCleanup = abortActivePending;
+  const failActivePending = (
+    error: unknown,
+    phase: 'dns' | 'preparation',
+  ): void => {
+    const waiters = [...activePending.waiters];
+    const cleaned = abortActivePending();
+    reportProtectedHttpEgressForkFailure(
+      ds,
+      bot,
+      resumeOrTurnId,
+      opts,
+      error,
+      phase,
+    );
+    if (!cleaned) return;
+    for (const waiter of waiters) {
+      reportProtectedHttpEgressForkFailure(
+        ds,
+        bot,
+        waiter.resumeOrTurnId,
+        waiter.opts,
+        error,
+        phase,
+        false,
+      );
+    }
+  };
   void resolveProtectedHttpEgressTargets(collectedPolicy.policy).then(
     frozenAddresses => {
       const policy: ProtectedHttpEgressWorkerPolicy = {
@@ -14700,47 +14797,11 @@ export function forkWorker(
           abortActivePending();
         }
       } catch (error) {
-        reportProtectedHttpEgressForkFailure(
-          ds,
-          bot,
-          resumeOrTurnId,
-          opts,
-          error,
-          'preparation',
-        );
-        for (const waiter of activePending.waiters) {
-          reportProtectedHttpEgressForkFailure(
-            ds,
-            bot,
-            waiter.resumeOrTurnId,
-            waiter.opts,
-            error,
-            'preparation',
-          );
-        }
-        clearActivePending();
+        failActivePending(error, 'preparation');
       }
     },
     error => {
-      reportProtectedHttpEgressForkFailure(
-        ds,
-        bot,
-        resumeOrTurnId,
-        opts,
-        error,
-        'dns',
-      );
-      for (const waiter of activePending.waiters) {
-        reportProtectedHttpEgressForkFailure(
-          ds,
-          bot,
-          waiter.resumeOrTurnId,
-          waiter.opts,
-          error,
-          'dns',
-        );
-      }
-      clearActivePending();
+      failActivePending(error, 'dns');
     },
   );
   return true;
@@ -15307,6 +15368,17 @@ function forkWorkerPrepared(
     ds.session.workingDir = cwd;
     sessionStore.updateSession(ds.session);
   }
+
+  // Freeze the complete target-address policy (or its explicit absence) on
+  // the session after every side-effect-free refusal/defer gate, but before a
+  // worker generation is reserved or an existing worker can be terminated. A
+  // legacy resume reaches this point with no supplied policy and is durably
+  // marked null, so enabling a plugin later cannot retrofit restrictions onto
+  // its old backend.
+  protectedHttpEgressPolicy = freezeSessionProtectedHttpEgressPolicy(
+    ds,
+    protectedHttpEgressPolicy,
+  );
 
   // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a

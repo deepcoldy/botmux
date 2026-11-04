@@ -153,6 +153,7 @@ vi.mock('../src/services/session-store.js', () => ({
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
+  getSessionFresh: vi.fn(),
   updateSession: vi.fn(),
   updateSessionPid: vi.fn(),
 }));
@@ -364,6 +365,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
+  vi.mocked(sessionStore.getSessionFresh).mockReturnValue(undefined);
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
   vi.mocked(sessionStore.updateSessionPid).mockImplementation(() => undefined);
   tmuxProbeMock.mockReturnValue('exists');
@@ -472,6 +474,184 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     expect(init.protectedMcpPolicy.capabilities).toEqual([]);
   });
 
+  it('does not retrofit a newly enabled protected egress policy onto a legacy resumed session', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    const ds = makeDs({ hasHistory: true });
+
+    expect(forkWorker(ds, 'legacy resume', true)).toBe(true);
+
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: undefined,
+    }));
+  });
+
+  it('freezes the absence of protected egress on a fresh session', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([]);
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'fresh unprotected session', { turnId: 'om_unprotected' })).toBe(true);
+
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: undefined,
+    }));
+  });
+
+  it('persists the frozen protected egress policy on a fresh session', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'fresh protected session', { turnId: 'om_fresh' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    expect(ds.session.protectedHttpEgressPolicy).toEqual({
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    });
+  });
+
+  it('reuses a session-frozen protected egress policy without resolving DNS again', () => {
+    const frozen = {
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    };
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'replacement-plugin',
+      capabilityId: 'replacement.actor-write.v1',
+      policy: { ...policy, id: 'replacement.write.v1' },
+      policyDigest: 'e'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.99.99.99']]);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.protectedHttpEgressPolicy = structuredClone(frozen);
+
+    expect(forkWorker(ds, 'protected resume', true)).toBe(true);
+
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: frozen,
+    }));
+  });
+
+  it('fails closed before child creation when the protected egress freeze cannot be persisted', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.protectedHttpEgressPolicy !== undefined) {
+        throw new Error('protected egress disk full');
+      }
+    });
+    const ds = makeDs();
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'protected persistence failure', { turnId: 'om_persist_fail' }, {
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmissionBlocked).toHaveBeenCalled());
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('protected egress disk full'),
+      turnId: 'om_persist_fail',
+    }));
+    expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a durable protected egress policy reloaded after a concurrent freeze conflict', async () => {
+    const currentPolicy = {
+      pluginId: 'current-plugin',
+      capabilityId: 'current.actor-write.v1',
+      policy: { ...policy, id: 'current.write.v1' },
+      policyDigest: 'c'.repeat(64),
+    };
+    const durablePolicy = {
+      pluginId: 'durable-plugin',
+      capabilityId: 'durable.actor-write.v1',
+      policy: { ...policy, id: 'durable.write.v1' },
+      policyDigest: 'a'.repeat(64),
+      frozenAddresses: [['10.10.10.10']],
+    };
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([currentPolicy]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['current-plugin'] }));
+    const ds = makeDs();
+    const blocked = vi.fn();
+    let firstFreeze = true;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (firstFreeze && session.protectedHttpEgressPolicy !== undefined) {
+        firstFreeze = false;
+        session.protectedHttpEgressPolicy = structuredClone(durablePolicy);
+        throw new Error('Session changed concurrently; routing write refused');
+      }
+    });
+
+    expect(forkWorker(ds, 'first', { turnId: 'om_first' }, {
+      onAdmissionBlocked: blocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(blocked).toHaveBeenCalled());
+    expect(ds.session.protectedHttpEgressPolicy).toEqual(durablePolicy);
+
+    expect(forkWorker(ds, 'retry', { turnId: 'om_retry' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(forkMock.mock.results[0]!.value.send).mock.calls[0][0])
+      .toEqual(expect.objectContaining({ protectedHttpEgressPolicy: durablePolicy }));
+  });
+
+  it('keeps a durable frozen absence reloaded after a concurrent freeze conflict', () => {
+    const ds = makeDs();
+    vi.mocked(sessionStore.getSessionFresh).mockImplementation(() => ({
+      ...structuredClone(ds.session),
+      protectedHttpEgressPolicy: null,
+    }));
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.protectedHttpEgressPolicy === null) {
+        throw new Error('Session changed concurrently; routing write refused');
+      }
+    });
+
+    expect(() => forkWorker(ds, 'concurrent unprotected freeze', { turnId: 'om_null_conflict' }))
+      .toThrow('Session changed concurrently; routing write refused');
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
   it('fails closed before forking when more than one enabled plugin declares a policy', () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([
       {
@@ -516,6 +696,51 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
       content: expect.stringContaining('dns unavailable'),
       turnId: 'om_egress_dns',
+    }));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('removes DNS followers before rejecting them when target resolution fails', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let failLookup!: (error: Error) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise((_, reject) => {
+      failLookup = reject;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const durabilityEvents: string[] = [];
+    const followerBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'opening', { turnId: 'om_dns_opening' })).toBe(true);
+    expect(forkWorker(ds, 'follower', { turnId: 'om_dns_follower' }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (!session.queuedActivationTail?.some(entry => entry.id === followerTailId)) {
+        durabilityEvents.push('cleanup persisted');
+      }
+    });
+
+    failLookup(new Error('dns unavailable'));
+    await vi.waitFor(() => expect(followerAdmissions).toEqual(['deferred', 'rejected']));
+
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'),
+      turnId: 'om_dns_follower',
     }));
     expect(forkMock).not.toHaveBeenCalled();
   });
@@ -633,8 +858,8 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     ]);
 
     expect(forkWorker(ds, 'retry protected turn', { turnId: 'om_egress_retry' })).toBe(true);
-    await vi.waitFor(() => expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
     const retryWorker = forkMock.mock.results[1]!.value;
     retryWorker.emit('message', { type: 'worker_ipc_ready' });
   });
@@ -701,8 +926,8 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     expect(forkWorker(ds, 'retry after cleanup failure', {
       turnId: 'om_egress_persist_retry',
     })).toBe(true);
-    await vi.waitFor(() => expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
     expect(cleanupWriteAttempts).toBeGreaterThanOrEqual(2);
     expect(followerAdmissions).toEqual(['deferred', 'rejected']);
     expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
@@ -744,6 +969,69 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
       'Protected HTTP egress target freeze failed',
     ));
     expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('removes DNS followers before rejecting them when post-freeze preparation fails', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const durabilityEvents: string[] = [];
+    const followerBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'opening', { turnId: 'om_opening' })).toBe(true);
+    expect(forkWorker(ds, 'follower', { turnId: 'om_follower' }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    expect(followerAdmissions).toEqual(['deferred']);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+
+    let preparationFailed = false;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (!session.queuedActivationTail?.some(entry => entry.id === followerTailId)) {
+        durabilityEvents.push('cleanup persisted');
+      }
+      if (!preparationFailed
+        && session.protectedHttpEgressPolicy !== undefined
+        && session.sandbox !== undefined) {
+        preparationFailed = true;
+        throw new Error('post-policy preparation write failed');
+      }
+    });
+    finishLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(followerAdmissions).toEqual(['deferred', 'rejected']));
+
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('post-policy preparation write failed'),
+      turnId: 'om_follower',
+    }));
+
+    expect(forkWorker(ds, 'retry opening', { turnId: 'om_retry' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+    const retryWorker = forkMock.mock.results[0]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+    await Promise.resolve();
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(retryWorker.send).mock.calls
+      .map(call => call[0])
+      .some(message => message.type === 'message' && message.turnId === 'om_follower'))
+      .toBe(false);
   });
 });
 
