@@ -10,8 +10,10 @@ function elementView(element: any, index: number): ReactNode {
   return <div key={index} role="alert">不支持的预览组件：{String(element.tag)}</div>;
 }
 export function FeedbackTemplatePreview(props: { card: any; width: number }) {
+  const colors: Record<string, string> = { blue: '#e7efff', green: '#e4f5e6', red: '#ffe5e5', orange: '#fff0da',
+    purple: '#f2e7ff', grey: '#eeeeee', indigo: '#e8e7ff', turquoise: '#dcf7f5' };
   return <div aria-label="反馈卡片渲染预览" style={{ width: props.width, maxWidth: '100%', border: '1px solid #bbb', borderRadius: 8, overflow: 'hidden' }}>
-    <div style={{ padding: 12, background: props.card.header?.template === 'red' ? '#ffe5e5' : '#e7efff' }}>{props.card.header?.title?.content}</div>
+    <div style={{ padding: 12, background: colors[props.card.header?.template] ?? colors.blue }}>{props.card.header?.title?.content}</div>
     <div style={{ padding: props.card.body?.padding ?? 12 }}>{props.card.body?.elements?.map(elementView)}</div>
   </div>;
 }

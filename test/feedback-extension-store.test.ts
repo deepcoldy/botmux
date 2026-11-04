@@ -5,6 +5,30 @@ import { describe, expect, it } from 'vitest';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 
 describe('feedback extension durability', () => {
+  it('pins subject metadata to the exact bot session and turn', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-extension-'));
+    const store = await FeedbackExtensionStore.open(directory);
+    try {
+      store.bindSubject('app', 'session', 'turn', { sourceMessageId: 'om_question', answerKind: 'substantive' });
+      expect(store.subject('app', 'session', 'turn')).toEqual({ sourceMessageId: 'om_question', answerKind: 'substantive' });
+      expect(store.subject('other', 'session', 'turn')).toBeUndefined();
+      expect(() => store.bindSubject('app', 'session', 'turn', { sourceMessageId: 'om_other', answerKind: 'substantive' })).toThrow();
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('records manual evidence without re-executing unknown operations', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-extension-'));
+    const store = await FeedbackExtensionStore.open(directory);
+    try {
+      store.requestAction({ requestId: 'request', actor: 'user', job: { id: 'job', kind: 'hook', payload: {} } });
+      store.claim('hook', 100, 100);
+      store.expire(201);
+      expect(() => store.reconcileUnknown('job', 'succeeded', 'admin', '')).toThrow();
+      expect(store.reconcileUnknown('job', 'succeeded', 'admin', 'Provider receipt verified: example')).toBe(true);
+      expect(store.job('job')).toMatchObject({ status: 'succeeded', result: { reconciled: true } });
+      expect(store.claim('hook', 300, 100)).toBeUndefined();
+      expect(store.reconcileUnknown('job', 'failed_before_effect', 'admin', 'contradictory')).toBe(false);
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it('requires a one-use confirmation token before retrying a confirmed pre-effect failure', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-extension-'));
     const store = await FeedbackExtensionStore.open(directory);

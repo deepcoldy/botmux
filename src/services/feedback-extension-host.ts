@@ -9,8 +9,8 @@ import { reconcileFeedbackSurfaces } from './feedback-extension-runtime.js';
 import { runFeedbackHook, type HookEvent } from './feedback-hook-runner.js';
 import { getBotBrand, getBot } from '../bot-registry.js';
 import { resolveFeedbackPolicyForDelivery } from './feedback-policy-resolver.js';
-import { larkHosts } from '../im/lark/lark-hosts.js';
-import { getMessageDetail, replyMessage, updateMessage } from '../im/lark/client.js';
+import { chatAppLink, threadAppLink } from '../im/lark/lark-hosts.js';
+import { getMessageDetail, getMessageThreadId, replyMessage, updateMessage } from '../im/lark/client.js';
 import { normalizeCardActionData } from '../im/lark/card-action-data.js';
 import { resolveCardOperatorUnionId } from '../im/lark/card-handler.js';
 import { handleSkillFeedbackCardAction, renderFeedbackCard } from '../im/lark/skill-feedback-card.js';
@@ -38,7 +38,10 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
         try { return await replyMessage(appId, subjectId, JSON.stringify(card), 'interactive', true, operationId); }
         finally { release(); }
       },
-      answerUrl: messageId => `https://${larkHosts(getBotBrand(appId)).applink}/client/message/open?message_id=${encodeURIComponent(messageId)}`,
+      answerUrl: async (messageId, chatId) => {
+        const threadId = await getMessageThreadId(appId, messageId);
+        return threadId ? threadAppLink(chatId, threadId, getBotBrand(appId)) : chatAppLink(chatId, getBotBrand(appId));
+      },
       removeInline: async messageId => {
         const detail = await getMessageDetail(appId, messageId);
         const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
@@ -145,7 +148,7 @@ export async function handleFeedbackExtensionCard(input: unknown, appId: string,
       schemaVersion: 1, eventId: jobId, executionId: jobId, idempotencyKey: jobId, type: 'action.requested',
       occurredAt: new Date().toISOString(), bot: { appId },
       scope: { chatId: String(binding.chatId), topicId: binding.subjectId, subjectId: binding.subjectId, sourceMessageId: binding.subjectId },
-      answer: { answerGroupId: binding.answerId, deliveryId: binding.deliveryId, messageIds: [binding.answerMessageId], round: binding.round },
+      answer: { answerGroupId: binding.answerId, deliveryId: binding.deliveryId, messageIds: binding.messageIds ?? [binding.answerMessageId], round: binding.round },
       surface: { messageId, templateId: binding.templateId }, actor: { openId: actor, appId },
       action: { id: action.id }, feedback: null, contextRef: null,
     };

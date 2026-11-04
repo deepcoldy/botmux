@@ -43,6 +43,16 @@ export async function handleFeedbackExtensionApi(req: IncomingMessage, res: Serv
       if (Buffer.byteLength(raw) > 65536) throw new Error('feedback_extension_request_too_large');
     }
     const body = JSON.parse(raw || '{}') as Record<string, any>;
+    if (url.pathname === '/api/feedback/extensions/reconcile') {
+      authorizeFeedbackExtensionChange(deps, 'hooks');
+      if (body.confirmed !== true || !['succeeded', 'failed_before_effect'].includes(body.outcome)
+        || typeof body.evidence !== 'string' || typeof body.jobId !== 'string') throw new Error('feedback_reconciliation_invalid');
+      const store = await FeedbackExtensionStore.open(deps.dataDir);
+      try {
+        const changed = store.reconcileUnknown(body.jobId, body.outcome, 'dashboard:host-admin', body.evidence);
+        return respond(changed ? 200 : 409, { changed });
+      } finally { store.close(); }
+    }
     if (url.pathname === '/api/feedback/extensions/preview') {
       const bot = loadBotConfigs().find(item => item.larkAppId === body.appId);
       if (!bot) throw new Error('feedback_bot_not_found');

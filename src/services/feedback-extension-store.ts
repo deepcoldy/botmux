@@ -26,6 +26,10 @@ export class FeedbackExtensionStore {
       CREATE TABLE IF NOT EXISTS activation(app_id TEXT PRIMARY KEY,started_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS dirty_surfaces(app_id TEXT NOT NULL,message_id TEXT NOT NULL,state TEXT NOT NULL,
         revision INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(app_id,message_id));
+      CREATE TABLE IF NOT EXISTS reconciliations(id INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL,
+        actor TEXT NOT NULL,evidence TEXT NOT NULL,outcome TEXT NOT NULL,created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS subject_bindings(app_id TEXT NOT NULL,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,
+        binding TEXT NOT NULL,PRIMARY KEY(app_id,session_id,turn_id));
       PRAGMA user_version=1;
     `);
   }
@@ -34,6 +38,20 @@ export class FeedbackExtensionStore {
     return new FeedbackExtensionStore(await openDatabaseSync(join(dataDir, 'feedback-extensions.sqlite')));
   }
   close(): void { this.database.close(); }
+  bindSubject(appId: string, sessionId: string, turnId: string, binding: {
+    sourceMessageId: string; answerKind: 'substantive' | 'clarification' | 'progress' | 'failed';
+  }): void {
+    this.transaction(() => {
+      const previous = this.subject(appId, sessionId, turnId);
+      if (previous && JSON.stringify(previous) !== JSON.stringify(binding)) throw new Error('feedback_subject_binding_conflict');
+      this.database.prepare('INSERT OR IGNORE INTO subject_bindings VALUES(?,?,?,?)').run(appId, sessionId, turnId, JSON.stringify(binding));
+    });
+  }
+  subject(appId: string, sessionId: string, turnId: string): { sourceMessageId: string; answerKind: string } | undefined {
+    const row = this.database.prepare('SELECT binding FROM subject_bindings WHERE app_id=? AND session_id=? AND turn_id=?')
+      .get(appId, sessionId, turnId) as { binding: string } | undefined;
+    return row ? JSON.parse(row.binding) : undefined;
+  }
   activate(appId: string, startedAt: string): string {
     this.database.prepare('INSERT OR IGNORE INTO activation VALUES(?,?)').run(appId, startedAt);
     return (this.database.prepare('SELECT started_at FROM activation WHERE app_id=?').get(appId) as { started_at: string }).started_at;
@@ -45,6 +63,19 @@ export class FeedbackExtensionStore {
   jobsForApp(appId: string, limit = 50): ExtensionJob[] {
     return (this.database.prepare("SELECT id FROM jobs WHERE json_extract(payload,'$.appId')=? ORDER BY rowid DESC LIMIT ?")
       .all(appId, Math.max(1, Math.min(limit, 100))) as Array<{ id: string }>).map(row => this.job(row.id)!);
+  }
+  reconcileUnknown(id: string, outcome: 'succeeded' | 'failed_before_effect', actor: string, evidence: string): boolean {
+    if (!actor.trim() || !evidence.trim() || evidence.length > 2000) throw new Error('feedback_reconciliation_evidence_required');
+    return this.transaction(() => {
+      const job = this.job(id);
+      if (job?.status !== 'unknown' || job.kind !== 'hook') return false;
+      const result = { reconciled: true, actor, evidence, publicMessage: '操作结果已经人工核对',
+        ...(outcome === 'failed_before_effect' ? { retryToken: randomUUID() } : {}) };
+      this.database.prepare('INSERT INTO reconciliations(job_id,actor,evidence,outcome,created_at) VALUES(?,?,?,?,?)')
+        .run(id, actor, evidence, outcome, new Date().toISOString());
+      this.database.prepare("UPDATE jobs SET status=?,result=? WHERE id=? AND status='unknown'").run(outcome, JSON.stringify(result), id);
+      return true;
+    });
   }
   recordAnswer(input: { appId: string; chatId: string; subjectId: string; answerId: string; deliveryId: string }): number {
     return this.transaction(() => {

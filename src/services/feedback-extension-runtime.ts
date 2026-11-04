@@ -13,7 +13,7 @@ export async function reconcileFeedbackSurfaces(input: {
   config: FeedbackExtensionConfig; now: () => number;
   startedAt?: string;
   send: (subjectId: string, card: Record<string, unknown>, operationId: string) => Promise<string>;
-  answerUrl: (messageId: string, chatId: string) => string;
+  answerUrl: (messageId: string, chatId: string) => string | Promise<string>;
   removeInline: (messageId: string) => Promise<void>;
 }): Promise<void> {
   const { extensions, source } = input;
@@ -55,23 +55,34 @@ export async function reconcileFeedbackSurfaces(input: {
       const eventDelivery = await source.findDeliveryByPlatformMessage('lark', input.appId, data.platformMessageId);
       const presentation = input.config.presentations[input.appId];
       if (eventDelivery?.chatId && eventDelivery.topicRootId && presentation) {
-        const groups = feedbackAnswerGroups(await source.listSubjectDeliveries(input.appId, eventDelivery.chatId, eventDelivery.topicRootId));
+        const sourceDeliveries = await source.listSubjectDeliveries(input.appId, eventDelivery.chatId, eventDelivery.topicRootId);
+        const sourceBinding = extensions.subject(input.appId, eventDelivery.sessionId ?? '', eventDelivery.turnId ?? '');
+        const subjectId = sourceBinding?.sourceMessageId ?? eventDelivery.topicRootId;
+        const groups = feedbackAnswerGroups(sourceDeliveries.filter(delivery => {
+          const binding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
+          return (binding?.sourceMessageId ?? delivery.topicRootId) === subjectId && (!binding || binding.answerKind === 'substantive');
+        }));
         for (const group of groups) {
           const { delivery, id: answerId, round } = group;
           if (!delivery.policy || !delivery.chatId || !delivery.topicRootId
             || (input.startedAt && delivery.createdAt < input.startedAt)) continue;
-          const effectiveAt = input.config.presentationEffectiveAt?.[input.appId];
-          if (effectiveAt && (delivery.completedAt ?? delivery.createdAt) < effectiveAt) continue;
           const rule = resolveFeedbackPresentation(presentation, { botAppId: input.appId, chatId: delivery.chatId,
-            sourceMessageId: delivery.topicRootId, round });
+            sourceMessageId: subjectId, round });
+          const layers = [['default', presentation.default] as const,
+            ...presentation.rules.filter(item => rule.ruleIds.includes(item.id)).map(item => [item.id, item] as const)];
+          const effectiveAt = layers.map(([key, value]) => input.config.ruleEffectiveAt?.[JSON.stringify([
+            input.appId, key, createHash('sha256').update(JSON.stringify(value)).digest('hex'),
+          ])]).filter((value): value is string => !!value).sort().at(-1)
+            ?? input.config.presentationEffectiveAt?.[input.appId];
+          if (effectiveAt && (delivery.completedAt ?? delivery.createdAt) < effectiveAt) continue;
           if (rule.matched && rule.mode !== 'inline') {
             const template = input.config.templates.find(item => item.id === rule.templateId);
             if (!template) throw new Error('feedback_template_not_found');
             const actions = input.config.actions.filter(action => rule.actionIds.includes(action.id));
             const card = buildFeedbackSurface({ template, policy: delivery.policy, round,
-              answerUrl: input.answerUrl(delivery.platformMessageId, delivery.chatId), preview: false, actions });
+              answerUrl: await input.answerUrl(delivery.platformMessageId, delivery.chatId), preview: false, actions });
             jobs.push({ id: identity(['surface', answerId]), kind: 'surface', payload: {
-              appId: input.appId, subjectId: delivery.topicRootId, chatId: delivery.chatId, answerId,
+              appId: input.appId, subjectId, topicId: delivery.topicRootId, chatId: delivery.chatId, answerId,
               deliveryId: delivery.deliveryId, answerMessageId: delivery.platformMessageId, messageIds: group.messageIds, round, card, actions,
               mode: rule.mode, templateId: template.id, template,
             } });

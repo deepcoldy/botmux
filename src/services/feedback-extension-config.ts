@@ -1,4 +1,5 @@
 import { readFile, mkdir, lstat, appendFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
 import { atomicWriteFile } from '../utils/atomic-write.js';
@@ -18,6 +19,7 @@ export interface FeedbackExtensionConfig {
   presentations: Record<string, FeedbackPresentationConfig>;
   updatedBy?: string;
   presentationEffectiveAt?: Record<string, string>;
+  ruleEffectiveAt?: Record<string, string>;
   subscriptions?: Array<{ id: string; appId: string; chatId: string; buttonKey: string; hookId: string }>;
 }
 function normalize(input: unknown): FeedbackExtensionConfig {
@@ -60,8 +62,10 @@ function normalize(input: unknown): FeedbackExtensionConfig {
     }
     presentations[appId] = normalized;
   }
+  if (hooks.some(hook => hook.hostId !== raw.hostId)) throw new Error('feedback_hook_host_mismatch');
   return { version: raw.version, hostId: raw.hostId, templates, hooks, actions, presentations, subscriptions,
     ...(raw.presentationEffectiveAt ? { presentationEffectiveAt: { ...raw.presentationEffectiveAt } } : {}),
+    ...(raw.ruleEffectiveAt ? { ruleEffectiveAt: { ...raw.ruleEffectiveAt } } : {}),
     ...(typeof raw.updatedBy === 'string' ? { updatedBy: raw.updatedBy } : {}) };
 }
 export async function readFeedbackExtensionConfig(dataDir: string): Promise<FeedbackExtensionConfig> {
@@ -89,10 +93,18 @@ export async function saveFeedbackExtensionConfig(dataDir: string, expectedVersi
       if (previous && JSON.stringify(previous) !== JSON.stringify(hook) && hook.version <= previous.version) throw new Error('feedback_hook_version_conflict');
     }
     const presentationEffectiveAt = { ...current.presentationEffectiveAt };
+    const ruleEffectiveAt = { ...current.ruleEffectiveAt };
     for (const [appId, presentation] of Object.entries(normalized.presentations)) {
       if (JSON.stringify(presentation) !== JSON.stringify(current.presentations[appId])) presentationEffectiveAt[appId] = new Date().toISOString();
+      for (const [key, value] of [['default', presentation.default] as const, ...presentation.rules.map(rule => [rule.id, rule] as const)]) {
+        const hash = createHash('sha256').update(JSON.stringify(value)).digest('hex');
+        const identity = JSON.stringify([appId, key, hash]);
+        const previous = key === 'default' ? current.presentations[appId]?.default
+          : current.presentations[appId]?.rules.find(rule => rule.id === key);
+        if (!ruleEffectiveAt[identity] || JSON.stringify(previous) !== JSON.stringify(value)) ruleEffectiveAt[identity] = new Date().toISOString();
+      }
     }
-    const next = { ...normalized, version: current.version + 1, updatedBy: actor, presentationEffectiveAt };
+    const next = { ...normalized, version: current.version + 1, updatedBy: actor, presentationEffectiveAt, ruleEffectiveAt };
     const serialized = JSON.stringify(next);
     if (Buffer.byteLength(serialized) > 65536) throw new Error('feedback_extension_config_too_large');
     await appendFile(join(dataDir, 'feedback-extension-audit.jsonl'), JSON.stringify({
