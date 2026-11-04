@@ -150,6 +150,17 @@ export interface GroupSecretaryEngineOptions {
   manualWatches?: () => SecretaryManualWatch[];
 }
 
+/**
+ * 重启恢复补跑的一轮：会话进入工作态之前很久就没有任何新活动（没有新消息 / 输入），
+ * 说明这轮是 daemon 恢复会话时自己补跑的，回到空闲不算「一轮任务结束」。
+ * 拿不到活动时间时按真实一轮处理。
+ */
+const RECOVERY_SLACK_MS = 2 * 60_000;
+function isRecoveryEpisode(prev: { workingSince?: number }, row: { lastActivityAt?: number }): boolean {
+  if (prev.workingSince === undefined || row.lastActivityAt === undefined) return false;
+  return row.lastActivityAt < prev.workingSince - RECOVERY_SLACK_MS;
+}
+
 /** 卡片状态、定时任务提示这类机器噪音：只进上下文，不叫醒秘书。 */
 export function isSecretaryNoiseMessage(m: SecretaryMessage): boolean {
   if (m.senderType !== 'bot') return false;
@@ -168,6 +179,8 @@ interface SessionMemo {
   liveness: SecretaryLiveness;
   turn: string;
   attentionAt?: number;
+  /** 本次进入工作态的时间（用于判断这一轮有没有新的输入）。 */
+  workingSince?: number;
 }
 
 interface WatchState {
@@ -312,10 +325,14 @@ export class GroupSecretaryEngine {
       this.latest.set(row.sessionId, row);
       const prev = this.sessions.get(row.sessionId);
       this.trackWatch(row, prev, now);
+      const workingNow = row.liveness === 'alive' && (row.turn === 'working' || row.turn === 'analyzing');
+      const prevWorking = !!prev && prev.liveness === 'alive' && (prev.turn === 'working' || prev.turn === 'analyzing');
+      const workingSince = workingNow ? (prevWorking && prev!.workingSince !== undefined ? prev!.workingSince : now) : undefined;
       this.sessions.set(row.sessionId, {
         liveness: row.liveness,
         turn: row.turn,
         attentionAt: row.attention?.at,
+        ...(workingSince !== undefined ? { workingSince } : {}),
       });
       if (!prev) continue;
       const events: SecretaryEvent[] = [];
@@ -328,7 +345,7 @@ export class GroupSecretaryEngine {
         events.push({ kind: 'stuck', at: now, session: row, detail: row.turn });
       } else if (wasWorking && (row.liveness === 'not_running' || row.liveness === 'closed')) {
         events.push({ kind: 'stopped', at: now, session: row, detail: row.liveness });
-      } else if (wasWorking && row.liveness === 'alive' && row.turn === 'idle') {
+      } else if (wasWorking && row.liveness === 'alive' && row.turn === 'idle' && !isRecoveryEpisode(prev, row)) {
         events.push({ kind: 'turn_ended', at: now, session: row });
       }
       for (const event of events) {

@@ -479,3 +479,18 @@ describe('GroupSecretaryEngine — review fixes', () => {
   });
 });
 
+describe('GroupSecretaryEngine — recovery turns', () => {
+  it('a working→idle episode with no new activity since long before it started (restart recovery) is not a finished turn', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    const stale = clock - 4 * 3_600_000;
+    e.observeSessions([session('s1', { turn: 'idle', lastActivityAt: stale })]);
+    e.observeSessions([session('s1', { turn: 'working', lastActivityAt: stale })]);
+    clock += 20_000;
+    e.observeSessions([session('s1', { turn: 'idle', lastActivityAt: stale })]);
+    expect(only('turn_ended', advance(e, 5_000))).toEqual([]);
+    e.observeSessions([session('s1', { turn: 'working', lastActivityAt: clock })]);
+    clock += 20_000;
+    e.observeSessions([session('s1', { turn: 'idle', lastActivityAt: clock })]);
+    expect(only('turn_ended', advance(e, 5_000))).toHaveLength(1);
+  });
+});
