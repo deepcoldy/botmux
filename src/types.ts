@@ -1153,6 +1153,9 @@ export interface Session {
    * live config applies, which is what keeps a config change effective.
    */
   model?: string;
+  /** Confirmed native Codex selection and the launch baseline used to detect it.
+   * Separate from model so inherited defaults and one-shot choices stay live. */
+  codexModelSelection?: import('./services/codex-model-selection.js').CodexModelSelection;
   /** Retained Auto-model selection for the exact native conversation. */
   traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
   /** Group defaults at topic creation; absent on legacy sessions. */
@@ -2383,6 +2386,8 @@ export type WorkerToDaemon =
    *  the session is no longer quietly idle (pending input, prompt not ready…). */
   | { type: 'prompt_cache_keepalive_result'; injected: boolean; reason?: string }
   | { type: 'cli_runtime_version'; version: string }
+  /** Fresh local Codex process, never a reattachment to an existing pane. */
+  | ({ type: 'codex_model_launch' } & import('./services/codex-model-selection.js').CodexModelLaunchObservation)
   /** The CLI said its own install changed under the running process (Pi after
    *  a global upgrade: on-demand modules then fail with "Cannot find module").
    *  The daemon retires the worker once the current turn settles, so the next

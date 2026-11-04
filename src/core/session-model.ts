@@ -1,6 +1,7 @@
 import { reasoningEffortsForCliModel, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from './group-default-models.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import {
   TRAEX_AUTO_MODEL_ID,
   validTraexAutoModelRuntime,
@@ -13,12 +14,15 @@ export type LaunchModelSession = {
   session: {
     cliId?: CliId;
     model?: string;
+    codexModelSelection?: import('../services/codex-model-selection.js').CodexModelSelection;
     cliSessionId?: string;
     traexAutoModelRuntime?: TraexAutoModelRuntimeState;
     groupDefaultModels?: GroupDefaultModels;
     scope?: 'thread' | 'chat';
     chatType?: 'group' | 'p2p';
     adoptedFrom?: unknown;
+    backendType?: string;
+    existingAppServerEndpoint?: string;
     dispatchLaunchSpec?: { effective: { model: string } };
   };
   spawnModelOverride?: string;
@@ -61,6 +65,9 @@ export function resolveSessionLaunchModelChoice(
     logicalModel = ds.session.dispatchLaunchSpec.effective.model;
   } else if (ds.spawnModelOverride) {
     logicalModel = ds.spawnModelOverride;
+  } else if (supportsCodexModelSelection(ds.session) && ds.session.codexModelSelection?.override
+    && ds.session.codexModelSelection.nativeSessionId === ds.session.cliSessionId) {
+    logicalModel = ds.session.codexModelSelection.override;
   } else {
     const groupModel = resolveSessionGroupSettings(ds, cliId).model;
     if (groupModel) {
@@ -99,16 +106,18 @@ export function resolveSessionLaunchModelChoice(
  * its original model.
  *
  * Precedence:
- *   1. `spawnModelOverride` — an explicit per-trigger choice (trigger API
+ *   1. a persisted dispatch launch specification.
+ *   2. `spawnModelOverride` — an explicit per-trigger choice (trigger API
  *      `options.model`), in-memory only, see DaemonSession.
- *   2. the group default captured at topic creation, for the selected CLI.
+ *   3. a confirmed native Codex model override, bound to this conversation.
+ *   4. the group default captured at topic creation, for the selected CLI.
  *      Later group edits never alter this snapshot.
- *   3. the live bot config, **only when the session's frozen `cliId` still
+ *   5. the live bot config, **only when the session's frozen `cliId` still
  *      matches the bot's** — a session pinned to another CLI (a bot that
  *      switched CLI later, or a Codex App thread takeover that forces
  *      `codex-app`) must not be handed a model string meant for a different
  *      CLI.
- *   4. the model this session was last launched with (`session.model`, stamped
+ *   6. the model this session was last launched with (`session.model`, stamped
  *      by sessionAgentConfig on every spawn), as a last resort for exactly that
  *      mismatch case: it is the value that CLI actually ran with. Never
  *      consulted while the live config applies, which is what makes a dashboard

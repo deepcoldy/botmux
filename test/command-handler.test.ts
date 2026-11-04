@@ -413,6 +413,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  resetSessionCodexModelSelection: vi.fn(() => true),
   killWorker: vi.fn(),
   teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
   suspendWorker: vi.fn(() => false),
@@ -720,6 +721,7 @@ import { isTeamBot } from '../src/services/team-bots-store.js';
 import { isPlatformTeamBot } from '../src/services/platform-team-store.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, resumeSession } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { resetSessionCodexModelSelection } from '../src/core/worker-pool.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
@@ -890,6 +892,41 @@ function mockCodexAppBot(): void {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+describe('/models inherit', () => {
+  it('delegates the Codex preference reset without replacing the current worker', async () => {
+    const ds = makeDaemonSession({ session: makeSession({
+      cliId: 'codex', cliSessionId: 'native-1', model: 'B',
+      codexModelSelection: { nativeSessionId: 'native-1', launchModel: 'B', launchStartedAtMs: 1, override: 'B' },
+    }) });
+    const deps = makeDeps(ds);
+    const worker = ds.worker;
+    await handleCommand('/models', ROOT_ID, makeLarkMessage('/models inherit'), deps, LARK_APP_ID);
+    expect(resetSessionCodexModelSelection).toHaveBeenCalledWith(ds);
+    expect(ds.session.model).toBe('B');
+    expect(ds.worker).toBe(worker);
+  });
+
+  it('requires operator permission before mutating the preference', async () => {
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    const ds = makeDaemonSession({ session: makeSession({
+      cliId: 'codex', cliSessionId: 'native-1',
+      codexModelSelection: { nativeSessionId: 'native-1', launchStartedAtMs: 1, override: 'B' },
+    }) });
+    const saved = structuredClone(ds.session);
+    await handleCommand('/models', ROOT_ID, makeLarkMessage('/models inherit'), makeDeps(ds), LARK_APP_ID);
+    expect(ds.session).toEqual(saved);
+  });
+
+  it('does not mutate another CLI or an external session', async () => {
+    for (const extra of [{ cliId: 'claude-code' as const }, { cliId: 'codex' as const, existingAppServerEndpoint: 'external' }]) {
+      const ds = makeDaemonSession({ session: makeSession(extra) });
+      const saved = structuredClone(ds.session);
+      await handleCommand('/models', ROOT_ID, makeLarkMessage('/models inherit'), makeDeps(ds), LARK_APP_ID);
+      expect(ds.session).toEqual(saved);
+    }
+  });
+});
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {

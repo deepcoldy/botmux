@@ -1,4 +1,6 @@
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
+import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
+import { resetSessionCodexModelSelection } from './worker-pool.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -1874,6 +1876,26 @@ export async function handleCommand(
   try {
     switch (cmd) {
       case '/models': {
+        if (message.content.trim().toLowerCase() === '/models inherit') {
+          if (!ds) {
+            await replyNoSession(replyHere, loc);
+            break;
+          }
+          if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+            await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
+            break;
+          }
+          if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode) {
+            await sessionReply(rootId, t('cmd.models.inherit_unsupported', undefined, loc));
+            break;
+          }
+          if (!resetSessionCodexModelSelection(ds)) {
+            await sessionReply(rootId, t('cmd.models.inherit_unavailable', undefined, loc));
+            break;
+          }
+          await sessionReply(rootId, t('cmd.models.inherit_saved', undefined, loc));
+          break;
+        }
         const atTopLevel = deps.invocationContext === 'new-topic' || (!deps.invocationContext && !ds);
         if (atTopLevel && larkAppId) {
           await showDefaultModelPicker(larkAppId, rootId, message.senderId, sessionReply, loc);
