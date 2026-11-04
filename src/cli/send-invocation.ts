@@ -278,7 +278,7 @@ function looksLikePathToken(token: string): boolean {
     || value.startsWith('../')
     || value.startsWith('~/')
     || /^[A-Za-z]:[\\/]/.test(value)
-    || value.startsWith('\\\\');
+    || value.startsWith('\\');
   if (value === '.' || value === '..') return true;
   // An explicit prefix proves path shape, but a normal sentence can also start
   // with one (`/help 是命令`, `./build.sh 跑过了`). Keep those as prose unless

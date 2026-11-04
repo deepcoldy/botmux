@@ -108,6 +108,8 @@ describe('validateClientSendInvocation', () => {
     expect(client(['--files', 'a', './报告.sql'], ['a'])).toMatchObject({ ok: false });
     expect(client(['--files', 'a', 'C:\\my dir\\x.sql'], ['a'])).toMatchObject({ ok: false });
     expect(client(['--files', 'a', '\\\\srv\\my share\\x.sql'], ['a'])).toMatchObject({ ok: false });
+    expect(client(['--files', 'a', '\\srv\\my share\\x.sql'], ['a'])).toMatchObject({ ok: false });
+    expect(client(['--files', 'a', '\\my dir\\x.sql'], ['a'])).toMatchObject({ ok: false });
     expect(client(['--files', 'a', '详见 ./out.sql 第 3 行'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'see report.sql'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', '/help 是命令'], ['a'])).toMatchObject({ ok: true });
