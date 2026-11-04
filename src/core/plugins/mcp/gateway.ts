@@ -83,6 +83,7 @@ import {
   type TrustedTurnPrincipal,
 } from '../../protected-mcp-capabilities.js';
 import { ProtectedSecretClientTransport } from './protected-secret-transport.js';
+import { PROTECTED_HTTP_EGRESS_SOCKET_ENV } from '../../protected-http-egress-host.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -469,6 +470,10 @@ export class PluginMcpGateway {
           BOTMUX_PLUGIN_DIR: descriptor.pluginDir,
           BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
           ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
+          ...(descriptor.server.protectedEgressPolicy
+            && this.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV]
+            ? { [PROTECTED_HTTP_EGRESS_SOCKET_ENV]: this.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] }
+            : {}),
         };
         for (const key of protectedMcpRedactedEnvKeys(this.protectedMcpPolicy)) {
           delete downstreamEnv[key];

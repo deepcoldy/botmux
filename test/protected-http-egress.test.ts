@@ -1,10 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
+  collectProtectedHttpEgressPolicies,
   normalizeProtectedHttpEgressPolicy,
   normalizeProtectedHttpPath,
   protectedHttpEgressDecision,
   protectedHttpEgressPolicyDigest,
+  resolveProtectedHttpEgressTargets,
 } from '../src/core/protected-http-egress.js';
+import { installLocalPlugin } from '../src/core/plugins/install.js';
+import { pluginMcpPrivatePath } from '../src/core/plugins/paths.js';
 
 const validPolicy = {
   id: 'fixture.write.v1',
@@ -90,6 +97,108 @@ describe('protected HTTP egress policy schema', () => {
     ] }] }],
   ])('rejects %s', (_label, raw) => {
     expect(normalizeProtectedHttpEgressPolicy(raw)).toBeUndefined();
+  });
+});
+
+describe('protected HTTP egress worker policy collection', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-egress-policy-'));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function installPolicyPlugin(pluginId: string, policy = validPolicy): void {
+    const source = join(home, `${pluginId}-source`);
+    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: `@botmux-ai/plugin-${pluginId}`,
+      version: '0.1.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: { schemaVersion: 1, id: pluginId },
+    }));
+    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+      transport: 'stdio',
+      command: [process.execPath, '--version'],
+      protectedCapability: policy.id,
+      protectedEgressPolicy: policy,
+    }));
+    installLocalPlugin(source);
+  }
+
+  it('collects enabled plugin policies independently of protected capability enablement', () => {
+    installPolicyPlugin('fixture-plugin');
+
+    const collected = collectProtectedHttpEgressPolicies(['fixture-plugin']);
+
+    expect(collected).toEqual([{
+      pluginId: 'fixture-plugin',
+      policy: validPolicy,
+      policyDigest: protectedHttpEgressPolicyDigest(validPolicy),
+    }]);
+    expect(collectProtectedHttpEgressPolicies([])).toEqual([]);
+    expect(collectProtectedHttpEgressPolicies(['not-enabled'])).toEqual([]);
+  });
+
+  it('aborts collection when an enabled plugin private descriptor is missing or invalid', () => {
+    installPolicyPlugin('fixture-plugin');
+    rmSync(pluginMcpPrivatePath('fixture-plugin'));
+    expect(() => collectProtectedHttpEgressPolicies(['fixture-plugin']))
+      .toThrow('plugin_mcp_private_descriptor_missing:fixture-plugin');
+
+    installPolicyPlugin('fixture-plugin');
+    writeFileSync(pluginMcpPrivatePath('fixture-plugin'), '{not-json');
+    expect(() => collectProtectedHttpEgressPolicies(['fixture-plugin'])).toThrow();
+  });
+
+  it('freezes unique A and AAAA results once per target and caps each target at 32 addresses', async () => {
+    const policy = normalizeProtectedHttpEgressPolicy({
+      id: 'fixture.resolve.v1',
+      targets: [
+        { ...validPolicy.targets[0], host: 'one.internal.example' },
+        { ...validPolicy.targets[0], host: 'two.internal.example' },
+      ],
+    })!;
+    const calls: Array<{ host: string; options: unknown }> = [];
+    const lookup = async (host: string, options: { all: true; verbatim: true }) => {
+      calls.push({ host, options });
+      if (host === 'one.internal.example') {
+        return [
+          { address: '10.20.30.40', family: 4 as const },
+          { address: '2001:db8::40', family: 6 as const },
+          { address: '10.20.30.40', family: 4 as const },
+        ];
+      }
+      return Array.from({ length: 40 }, (_, index) => ({
+        address: `2001:db8::${(index + 1).toString(16)}`,
+        family: 6 as const,
+      }));
+    };
+
+    const frozen = await resolveProtectedHttpEgressTargets(policy, lookup);
+
+    expect(calls).toEqual([
+      { host: 'one.internal.example', options: { all: true, verbatim: true } },
+      { host: 'two.internal.example', options: { all: true, verbatim: true } },
+    ]);
+    expect(frozen[0]).toEqual(['10.20.30.40', '2001:db8::40']);
+    expect(frozen[1]).toHaveLength(32);
+    expect(frozen[1][0]).toBe('2001:db8::1');
+    expect(frozen[1][31]).toBe('2001:db8::20');
+  });
+
+  it('fails closed when a target resolves to no usable address', async () => {
+    await expect(resolveProtectedHttpEgressTargets(
+      validPolicy,
+      async () => [],
+    )).rejects.toThrow('protected_http_egress_target_not_frozen');
   });
 });
 

@@ -11,11 +11,16 @@ import {
   privateBrokerContainmentEnabled,
   type SandboxNetworkPolicy,
 } from './sandbox-network-policy.js';
+import type { ProtectedHttpEgressWorkerPolicy } from './protected-http-egress.js';
 
 const PROTECTED_MCP_CAPABILITY_ID = /^[a-z][a-z0-9._:-]{0,127}$/;
 const ENVIRONMENT_VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export const PROTECTED_MCP_CONTAINMENT_PROFILE = 'local-stdio-secret-v1' as const;
+export const PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE = 'local-stdio-secret-egress-guard-v1' as const;
+export type ProtectedMcpContainmentProfile =
+  | typeof PROTECTED_MCP_CONTAINMENT_PROFILE
+  | typeof PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE;
 export const PROTECTED_MCP_SECRET_FD_ENV = 'BOTMUX_PROTECTED_SECRET_FD' as const;
 export const PROTECTED_MCP_CHILD_SECRET_FD = 3;
 
@@ -47,7 +52,7 @@ export interface ProtectedMcpWorkerPolicy {
     id: string;
     allowedPluginIds: string[];
     principal?: 'verified-human-email';
-    containmentProfile: typeof PROTECTED_MCP_CONTAINMENT_PROFILE;
+    containmentProfile: ProtectedMcpContainmentProfile;
   }>;
   protectedHomePaths: string[];
   redactEnv: string[];
@@ -327,6 +332,7 @@ export function prepareProtectedMcpWorkerProvisioning(
   env: ProtectedMcpSecretEnvironment,
   config: ProtectedMcpCapabilityConfigMap | undefined,
   containmentConfigured: boolean,
+  containmentProfile: ProtectedMcpContainmentProfile = PROTECTED_MCP_CONTAINMENT_PROFILE,
 ): ProtectedMcpWorkerProvisioning {
   const isolation = protectedMcpIsolationPolicy(pluginIds, config);
   const workerPolicy: ProtectedMcpWorkerPolicy = {
@@ -350,7 +356,7 @@ export function prepareProtectedMcpWorkerProvisioning(
       id,
       allowedPluginIds: [...capability.allowedPluginIds],
       ...(capability.principal ? { principal: capability.principal } : {}),
-      containmentProfile: capability.containmentProfile,
+      containmentProfile,
     });
     secrets.set(id, secret);
   }
@@ -362,29 +368,51 @@ export function protectedMcpContainmentConfigured(input: {
   backendType: string;
   sandboxMode: 'off' | 'oncall' | 'scratch';
   networkPolicy: SandboxNetworkPolicy | undefined;
+  protectedHttpEgressPolicy?: ProtectedHttpEgressWorkerPolicy;
   adopt: boolean;
 }): boolean {
-  return input.platform === 'linux'
+  const structural = input.platform === 'linux'
     && input.backendType === 'pty'
     && input.sandboxMode === 'oncall'
-    && !input.adopt
-    && privateBrokerContainmentEnabled(input.networkPolicy);
+    && !input.adopt;
+  if (!structural) return false;
+  if (input.protectedHttpEgressPolicy) {
+    return input.protectedHttpEgressPolicy.policy.targets.length > 0
+      && input.protectedHttpEgressPolicy.policy.targets.length
+        === input.protectedHttpEgressPolicy.frozenAddresses.length
+      && input.protectedHttpEgressPolicy.frozenAddresses.every(addresses => addresses.length > 0);
+  }
+  return privateBrokerContainmentEnabled(input.networkPolicy);
 }
 
 export function protectedMcpContainmentActive(input: {
   platform: string;
+  containmentProfile?: ProtectedMcpContainmentProfile;
   provisionedCapabilityCount: number;
   sandboxEngaged: boolean;
   mcpSocketMounted: boolean;
+  egressSocketMounted?: boolean;
+  directTargetDenyRulesInstalled?: boolean;
+  guardLive?: boolean;
+  expectedPolicyDigest?: string;
+  guardPolicyDigest?: string;
   pidNamespaceRetained: boolean;
   networkPolicy: SandboxNetworkPolicy | undefined;
 }): boolean {
-  return input.platform === 'linux'
+  const common = input.platform === 'linux'
     && input.provisionedCapabilityCount > 0
     && input.sandboxEngaged
     && input.mcpSocketMounted
-    && input.pidNamespaceRetained
-    && privateBrokerContainmentEnabled(input.networkPolicy);
+    && input.pidNamespaceRetained;
+  if (!common) return false;
+  if (input.containmentProfile === PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE) {
+    return input.egressSocketMounted === true
+      && input.directTargetDenyRulesInstalled === true
+      && input.guardLive === true
+      && !!input.expectedPolicyDigest
+      && input.guardPolicyDigest === input.expectedPolicyDigest;
+  }
+  return privateBrokerContainmentEnabled(input.networkPolicy);
 }
 
 export function serveProtectedMcpSecrets(

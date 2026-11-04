@@ -9,6 +9,8 @@ const {
   checkWorkerAdmissionMock,
   standaloneBinaryMock,
   tmuxProbeMock,
+  collectProtectedHttpEgressPoliciesMock,
+  resolveProtectedHttpEgressTargetsMock,
 } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
@@ -16,7 +18,18 @@ const {
   checkWorkerAdmissionMock: vi.fn(),
   standaloneBinaryMock: vi.fn(() => false),
   tmuxProbeMock: vi.fn(() => 'exists' as const),
+  collectProtectedHttpEgressPoliciesMock: vi.fn(() => [] as any[]),
+  resolveProtectedHttpEgressTargetsMock: vi.fn(),
 }));
+
+vi.mock('../src/core/protected-http-egress.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/protected-http-egress.js')>();
+  return {
+    ...actual,
+    collectProtectedHttpEgressPolicies: (...args: unknown[]) => collectProtectedHttpEgressPoliciesMock(...args),
+    resolveProtectedHttpEgressTargets: (...args: unknown[]) => resolveProtectedHttpEgressTargetsMock(...args),
+  };
+});
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -358,6 +371,8 @@ beforeEach(() => {
   restartCounts.clear();
   standaloneBinaryMock.mockReturnValue(false);
   forkMock.mockImplementation(() => makeFakeWorker());
+  collectProtectedHttpEgressPoliciesMock.mockReturnValue([]);
+  resolveProtectedHttpEgressTargetsMock.mockReset();
   checkWorkerAdmissionMock.mockReturnValue({
     allowed: true,
     reasons: [],
@@ -415,6 +430,79 @@ describe('protected MCP env stays out of ordinary worker IPC', () => {
     expect(init.env).toEqual({ SAFE_VISIBLE_VALUE: 'visible' });
     expect(JSON.stringify(init)).not.toContain('reintroduced-secret');
     expect(JSON.stringify(init)).not.toContain('reintroduced-token');
+  });
+});
+
+describe('protected HTTP egress policy freezing at worker preparation', () => {
+  const policy = {
+    id: 'fixture.write.v1',
+    targets: [{
+      scheme: 'https' as const,
+      host: 'fixture.internal.example',
+      port: 443,
+      denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+    }],
+  };
+
+  it('freezes the enabled plugin policy into worker init even when no actor capability is enabled', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40', '2001:db8::40']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'protected egress', { turnId: 'om_egress_init' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.protectedHttpEgressPolicy).toEqual({
+      pluginId: 'fixture-plugin',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40', '2001:db8::40']],
+    });
+    expect(init.protectedMcpPolicy.capabilities).toEqual([]);
+  });
+
+  it('fails closed before forking when more than one enabled plugin declares a policy', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([
+      { pluginId: 'fixture-one', policy, policyDigest: '1'.repeat(64) },
+      { pluginId: 'fixture-two', policy: { ...policy, id: 'fixture.other.v1' }, policyDigest: '2'.repeat(64) },
+    ]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-one', 'fixture-two'] }));
+
+    expect(() => forkWorker(makeDs(), 'ambiguous egress', { turnId: 'om_egress_many' }))
+      .toThrow('multiple_protected_http_egress_policies');
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+  });
+
+  it('surfaces DNS freeze failure through the caller-owned admission notice lane', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockRejectedValue(new Error('dns unavailable'));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const onAdmission = vi.fn();
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(makeDs(), 'protected egress', { turnId: 'om_egress_dns' }, {
+      onAdmission,
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmission).toHaveBeenCalledWith('rejected'));
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'),
+      turnId: 'om_egress_dns',
+    }));
+    expect(forkMock).not.toHaveBeenCalled();
   });
 });
 
@@ -6666,6 +6754,31 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
     expect(emitHookEventMock).toHaveBeenCalledWith('session.start', expect.objectContaining({
       reason: 'adopt',
     }));
+  });
+
+  it('protected HTTP egress policy → refuses adopt because an existing process cannot receive the frozen network boundary', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      policy: {
+        id: 'fixture.write.v1',
+        targets: [{
+          scheme: 'https',
+          host: 'fixture.internal.example',
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+        }],
+      },
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = adopt();
+    ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
+
+    expect(forkAdoptWorker(ds)).toBe('rejected');
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    expect(ds.adoptedFrom).toBeUndefined();
+    expect(ds.session.adoptedFrom).toBeUndefined();
   });
 });
 

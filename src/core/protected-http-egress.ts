@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { isValidProtectedMcpCapabilityId } from './protected-mcp-capabilities.js';
+import { readPluginRegistry } from '../services/plugin-registry-store.js';
+import { readPluginMcpDescriptor } from './plugins/mcp/private-store.js';
 
 export const MAX_PROTECTED_EGRESS_TARGETS = 8;
 export const MAX_PROTECTED_EGRESS_ROUTES = 128;
@@ -22,6 +25,21 @@ export interface ProtectedHttpEgressPolicy {
   id: string;
   targets: ProtectedHttpEgressTarget[];
 }
+
+export interface CollectedProtectedHttpEgressPolicy {
+  pluginId: string;
+  policy: ProtectedHttpEgressPolicy;
+  policyDigest: string;
+}
+
+export interface ProtectedHttpEgressWorkerPolicy extends CollectedProtectedHttpEgressPolicy {
+  frozenAddresses: string[][];
+}
+
+export type ProtectedHttpEgressLookup = (
+  host: string,
+  options: { all: true; verbatim: true },
+) => Promise<readonly { address: string; family: number }[]>;
 
 const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Z]+$/;
 const HTTP_PATH_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -130,6 +148,60 @@ export function protectedHttpEgressPolicyDigest(policy: ProtectedHttpEgressPolic
   const normalized = normalizeProtectedHttpEgressPolicy(policy);
   if (!normalized) throw new Error('invalid_protected_http_egress_policy');
   return createHash('sha256').update(JSON.stringify(keySorted(normalized))).digest('hex');
+}
+
+/** Read protected policies only for the session's effective enabled plugins.
+ * Private descriptor failures are launch failures: silently dropping a policy
+ * would restore the direct-network bypass the descriptor exists to close. */
+export function collectProtectedHttpEgressPolicies(
+  pluginIds: readonly string[] | undefined,
+): CollectedProtectedHttpEgressPolicy[] {
+  const registry = readPluginRegistry();
+  const collected: CollectedProtectedHttpEgressPolicy[] = [];
+  for (const pluginId of [...new Set(pluginIds ?? [])]) {
+    const contribution = registry.plugins[pluginId]?.contributions?.mcp;
+    if (!contribution) continue;
+    const descriptor = readPluginMcpDescriptor(pluginId, contribution);
+    if (descriptor.transport !== 'stdio' || !descriptor.protectedEgressPolicy) continue;
+    const policy = normalizeProtectedHttpEgressPolicy(descriptor.protectedEgressPolicy);
+    if (!policy) throw new Error(`invalid_plugin_mcp_protected_egress_policy:${pluginId}`);
+    collected.push({
+      pluginId,
+      policy,
+      policyDigest: protectedHttpEgressPolicyDigest(policy),
+    });
+  }
+  return collected;
+}
+
+/** Resolve every target exactly once for one worker generation. The frozen
+ * addresses are the single source for both the host forwarder and kernel deny
+ * rules, preventing DNS re-resolution from splitting those decisions. */
+export async function resolveProtectedHttpEgressTargets(
+  policy: ProtectedHttpEgressPolicy,
+  lookup: ProtectedHttpEgressLookup = dnsLookup,
+): Promise<string[][]> {
+  const normalized = normalizeProtectedHttpEgressPolicy(policy);
+  if (!normalized) throw new Error('invalid_protected_http_egress_policy');
+  const frozen: string[][] = [];
+  for (const target of normalized.targets) {
+    const results = await lookup(target.host, { all: true, verbatim: true });
+    const addresses: string[] = [];
+    const seen = new Set<string>();
+    for (const result of results) {
+      const family = isIP(result.address);
+      if ((family !== 4 && family !== 6) || family !== result.family) {
+        throw new Error('protected_http_egress_target_not_frozen');
+      }
+      if (seen.has(result.address)) continue;
+      seen.add(result.address);
+      addresses.push(result.address);
+      if (addresses.length === 32) break;
+    }
+    if (addresses.length === 0) throw new Error('protected_http_egress_target_not_frozen');
+    frozen.push(addresses);
+  }
+  return frozen;
 }
 
 function normalizeProtectedHttpMethod(raw: string): string {

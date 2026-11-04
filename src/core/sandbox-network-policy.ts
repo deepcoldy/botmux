@@ -1,8 +1,15 @@
 /** Opt-in destination-address policy. Pure validation and nftables compilation. */
 import { isIP } from 'node:net';
+import type { ProtectedHttpEgressWorkerPolicy } from './protected-http-egress.js';
 
 export type NetworkMode = 'allow' | 'block' | 'allowlist' | 'denylist';
-export interface NetworkRule { cidr: string; protocol?: 'tcp' | 'udp'; ports?: number[] }
+export interface NetworkRule {
+  cidr: string;
+  protocol?: 'tcp' | 'udp';
+  ports?: number[];
+  /** Explicit fail-closed exception used ahead of allowlist grants. */
+  action?: 'drop';
+}
 export interface NetworkZone { mode: NetworkMode; rules?: NetworkRule[] }
 export interface SandboxNetworkPolicy {
   version: 1;
@@ -88,12 +95,18 @@ export function parseSandboxNetworkPolicy(raw: unknown): SandboxNetworkPolicy {
     if (z.rules !== undefined && (!Array.isArray(z.rules) || z.rules.length > 256)) throw new Error(`${label}: rules must be an array (max 256)`);
     if ((mode === 'allow' || mode === 'block') && z.rules !== undefined) throw new Error(`${label}: rules require a list mode`);
     const rules = (z.rules as unknown[] | undefined)?.map(rawRule => {
-      const r = object(rawRule, ['cidr', 'protocol', 'ports'], `${label}.rule`);
+      const r = object(rawRule, ['cidr', 'protocol', 'ports', 'action'], `${label}.rule`);
       if (typeof r.cidr !== 'string') throw new Error('rule.cidr must be IP/CIDR');
       const cidr = parseAddress(r.cidr).cidr;
       if (r.protocol !== undefined && r.protocol !== 'tcp' && r.protocol !== 'udp') throw new Error('protocol must be tcp or udp');
       if (r.ports !== undefined && (!r.protocol || !Array.isArray(r.ports) || !r.ports.length || r.ports.length > 256 || !r.ports.every(p => Number.isInteger(p) && Number(p) >= 1 && Number(p) <= 65535))) throw new Error('ports require tcp/udp and integers 1..65535');
-      return { cidr, ...(r.protocol ? { protocol: r.protocol as 'tcp' | 'udp' } : {}), ...(r.ports ? { ports: [...new Set(r.ports as number[])] } : {}) };
+      if (r.action !== undefined && r.action !== 'drop') throw new Error('rule.action must be drop');
+      return {
+        cidr,
+        ...(r.protocol ? { protocol: r.protocol as 'tcp' | 'udp' } : {}),
+        ...(r.ports ? { ports: [...new Set(r.ports as number[])] } : {}),
+        ...(r.action === 'drop' ? { action: 'drop' as const } : {}),
+      };
     });
     return { mode, ...(rules ? { rules } : {}) };
   };
@@ -116,7 +129,7 @@ export function compileNetworkNft(raw: SandboxNetworkPolicy): string {
       const family = parseAddress(r.cidr).family === 4 ? 'ip' : 'ip6';
       const proto = r.protocol ? ` meta l4proto ${r.protocol}` : '';
       const ports = r.ports ? ` ${r.protocol} dport { ${r.ports.join(', ')} }` : '';
-      lines.push(`  ${family} daddr ${r.cidr}${proto}${ports} ${z.mode === 'allowlist' ? 'accept' : 'drop'}`);
+      lines.push(`  ${family} daddr ${r.cidr}${proto}${ports} ${r.action === 'drop' || z.mode !== 'allowlist' ? 'drop' : 'accept'}`);
     }
     lines.push(`  ${z.mode === 'allow' || z.mode === 'denylist' ? 'accept' : 'drop'}`, ' }');
     return lines;
@@ -141,6 +154,62 @@ export function compileNetworkNft(raw: SandboxNetworkPolicy): string {
     '  meta l4proto ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept',
     ' }', '}', '',
   ].join('\n');
+}
+
+function sameNetworkRule(left: NetworkRule, right: NetworkRule): boolean {
+  return left.cidr === right.cidr
+    && left.protocol === right.protocol
+    && left.action === right.action
+    && JSON.stringify(left.ports ?? []) === JSON.stringify(right.ports ?? []);
+}
+
+/** Add exact frozen target denies without widening any operator policy. Public
+ * and private zones remain independent; block stays block, allow becomes a
+ * denylist, and allowlists receive an ordered explicit drop before grants. */
+export function mergeProtectedHttpEgressNetworkPolicy(
+  base: SandboxNetworkPolicy | undefined,
+  workerPolicy: ProtectedHttpEgressWorkerPolicy,
+  dnsServers: readonly string[],
+): SandboxNetworkPolicy {
+  const parsed = base
+    ? parseSandboxNetworkPolicy(base)
+    : parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'allow' },
+      ...(dnsServers.length > 0 ? { dnsServers: [...dnsServers] } : {}),
+    });
+  if (workerPolicy.policy.targets.length !== workerPolicy.frozenAddresses.length) {
+    throw new Error('protected_http_egress_target_not_frozen');
+  }
+  const merged: SandboxNetworkPolicy = structuredClone(parsed);
+  if (merged.proxyMode === 'trusted-egress') merged.proxyMode = 'reject';
+  workerPolicy.policy.targets.forEach((target, targetIndex) => {
+    const addresses = workerPolicy.frozenAddresses[targetIndex];
+    if (!addresses?.length) throw new Error('protected_http_egress_target_not_frozen');
+    for (const address of addresses) {
+      const cidr = parseAddress(address).cidr;
+      const zoneName = networkZone(address);
+      const zone = merged[zoneName];
+      if (zone.mode === 'block') continue;
+      const directDeny: NetworkRule = {
+        cidr,
+        protocol: 'tcp',
+        ports: [target.port],
+        ...(zone.mode === 'allowlist' ? { action: 'drop' as const } : {}),
+      };
+      if (zone.mode === 'allow') {
+        zone.mode = 'denylist';
+        zone.rules = [directDeny];
+        continue;
+      }
+      zone.rules ??= [];
+      if (zone.rules.some(rule => sameNetworkRule(rule, directDeny))) continue;
+      if (zone.mode === 'allowlist') zone.rules.unshift(directDeny);
+      else zone.rules.push(directDeny);
+    }
+  });
+  return parseSandboxNetworkPolicy(merged);
 }
 
 function sandboxModeLabel(sandbox: unknown): string {

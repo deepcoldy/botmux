@@ -128,6 +128,14 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       }],
     };
   }
+  if (serverName === 'egress-env') {
+    return {
+      content: [{
+        type: 'text',
+        text: `egress=${process.env.BOTMUX_PROTECTED_EGRESS_SOCKET || ''}`,
+      }],
+    };
+  }
   return {
     content: [{
       type: 'text',

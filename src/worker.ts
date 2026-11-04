@@ -3,13 +3,19 @@ import { deploymentContinuationTemplate } from './services/deployment-continuati
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
-import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
+import { FROZEN_NETWORK_POLICY_HINT, hostDnsServers, mergeProtectedHttpEgressNetworkPolicy, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
 import {
+  PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE,
   protectedMcpContainmentActive,
   protectedMcpHomeDenyPaths,
   protectedMcpHomePaths,
   protectedMcpRedactedEnvKeys,
 } from './core/protected-mcp-capabilities.js';
+import {
+  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+  startSessionProtectedHttpEgressHost,
+  type SessionProtectedHttpEgressHost,
+} from './core/protected-http-egress-host.js';
 import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
@@ -1928,6 +1934,7 @@ let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
+let sessionProtectedHttpEgressHost: SessionProtectedHttpEgressHost | null = null;
 let localProtectedMcpContainmentActive = false;
 const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
@@ -2243,7 +2250,21 @@ function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
   log('Attached refreshed plugin Skill catalog at the CLI write edge');
 }
 
+function stopSessionProtectedHttpEgressHost(): void {
+  const host = sessionProtectedHttpEgressHost;
+  sessionProtectedHttpEgressHost = null;
+  delete process.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
+  if (!host) return;
+  // close() unlinks the listener synchronously before draining connections.
+  // The sandbox child's frozen network namespace continues enforcing direct
+  // target denies until that child exits.
+  void host.close().catch((error) => {
+    log(`[protected-egress] host shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+}
+
 function stopSessionMcpGatewayHost(): void {
+  stopSessionProtectedHttpEgressHost();
   const host = sessionMcpGatewayHost;
   sessionMcpGatewayHost = null;
   localProtectedMcpContainmentActive = false;
@@ -2375,6 +2396,26 @@ async function prepareCliPluginGenerationAndGateway(
   refreshCliPluginGeneration(cfg, adapter, preserveUnchangedCatalog);
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
   stopSessionMcpGatewayHost();
+  if (cfg.protectedHttpEgressPolicy) {
+    try {
+      sessionProtectedHttpEgressHost = await startSessionProtectedHttpEgressHost({
+        sessionId: cfg.sessionId,
+        dataDir: config.session.dataDir,
+        policy: cfg.protectedHttpEgressPolicy.policy,
+        policyDigest: cfg.protectedHttpEgressPolicy.policyDigest,
+        frozenAddresses: cfg.protectedHttpEgressPolicy.frozenAddresses,
+        onError: error => log(`[protected-egress] host error: ${error.message}`),
+      });
+      process.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] = sessionProtectedHttpEgressHost.socketPath;
+      log(`[protected-egress] guard listening for ${cfg.protectedHttpEgressPolicy.pluginId}`);
+    } catch (error) {
+      sessionProtectedHttpEgressHost = null;
+      delete process.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
+      // The child may continue only behind the already-frozen direct target
+      // denies. Active actor authorization remains false without this host.
+      log(`[protected-egress] guard unavailable; continuing deny-only: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   if (adapter.mcpGateway && manifest?.entries.length) {
     await startAndRecordSessionMcpGatewayHost(cfg.sessionId);
     log(`[mcp-gateway] trusted host listening for ${manifest.entries.length} plugin server(s)`);
@@ -21003,6 +21044,16 @@ async function spawnCli(
 ): Promise<void> {
   followBotTraeHome(cfg);
   const protectedMcpEnvKeys = protectedMcpRedactedEnvKeys(cfg.protectedMcpPolicy);
+  // Freeze protected-target denies before ANY support/proxy/sandbox decision.
+  // The exact worker-init addresses also feed the egress host, so DNS cannot
+  // split the user-space forwarder from the kernel boundary.
+  const effectiveSandboxNetworkPolicy = cfg.protectedHttpEgressPolicy
+    ? mergeProtectedHttpEgressNetworkPolicy(
+      cfg.sandboxNetworkPolicy,
+      cfg.protectedHttpEgressPolicy,
+      hostDnsServers(path => readFileSync(path, 'utf8')),
+    )
+    : cfg.sandboxNetworkPolicy;
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
   // Probed once at the early gate and reused at the final child-env gate so a
@@ -21035,11 +21086,11 @@ async function spawnCli(
   }
   const networkError = networkPolicySupportError({
     platform: process.platform, backendType: cfg.backendType, sandbox: cfg.sandbox,
-    adopt: cfg.adoptMode, existingEndpoint: cfg.existingAppServerEndpoint, policy: cfg.sandboxNetworkPolicy,
+    adopt: cfg.adoptMode, existingEndpoint: cfg.existingAppServerEndpoint, policy: effectiveSandboxNetworkPolicy,
   });
   // cfg.sandboxNetworkPolicy is the session's creation-time snapshot.
   if (networkError) throw new Error(networkError + FROZEN_NETWORK_POLICY_HINT);
-  const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
+  const proxyError = networkProxyError(effectiveSandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
   localProtectedMcpContainmentActive = false;
@@ -21888,7 +21939,7 @@ async function spawnCli(
     // locally, so the local sandbox stays on rather than being skipped.
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
-  const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: cfg.sandboxNetworkPolicy });
+  const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: effectiveSandboxNetworkPolicy });
   if (effectiveNetworkError) throw new Error(effectiveNetworkError + FROZEN_NETWORK_POLICY_HINT);
   // Single-source network facts for THIS spawn. These same values feed the
   // bwrap/Seatbelt constructors below (netEnabled) and the identity storage
@@ -21898,7 +21949,7 @@ async function spawnCli(
   const spawnNetworkShape = resolveSpawnNetworkShape({
     mode: sandboxMode,
     sandboxNetwork: cfg.sandboxNetwork,
-    sandboxNetworkPolicy: cfg.sandboxNetworkPolicy,
+    sandboxNetworkPolicy: effectiveSandboxNetworkPolicy,
   });
   const scratchRequested = sandboxMode === 'scratch';
   const sandboxRequested = sandboxMode !== 'off';
@@ -24761,7 +24812,7 @@ async function spawnCli(
           + `use the default store. The real keystore is still denied/carve-out'd by policy (no leak).`);
       }
       const sbx = prepareDirectSandbox({
-        networkPolicy: cfg.sandboxNetworkPolicy,
+        networkPolicy: effectiveSandboxNetworkPolicy,
         sessionId: cfg.sessionId,
         dataDir,
         policy,
@@ -24775,6 +24826,9 @@ async function spawnCli(
         identityBin: childEnv.BOTMUX_IDENTITY_BIN,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        protectedEgressSocketPath: sessionMcpGatewayHost
+          ? sessionProtectedHttpEgressHost?.socketPath
+          : undefined,
         larkCliDataDir: childLarkDataRoot,
         useBwrapArgsFile: effectiveBackendType === 'tmux',
         minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,
@@ -24795,13 +24849,22 @@ async function spawnCli(
       sandboxRelayOutbox = sbx.outbox;
       localProtectedMcpContainmentActive = protectedMcpContainmentActive({
         platform: process.platform,
+        containmentProfile: cfg.protectedHttpEgressPolicy
+          ? PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE
+          : undefined,
         provisionedCapabilityCount: cfg.protectedMcpPolicy?.capabilities.length ?? 0,
         sandboxEngaged: true,
         mcpSocketMounted: !!sessionMcpGatewayHost?.socketPath,
+        egressSocketMounted: !!sessionMcpGatewayHost?.socketPath
+          && !!sessionProtectedHttpEgressHost?.socketPath,
+        directTargetDenyRulesInstalled: !!cfg.protectedHttpEgressPolicy,
+        guardLive: !!sessionProtectedHttpEgressHost,
+        expectedPolicyDigest: cfg.protectedHttpEgressPolicy?.policyDigest,
+        guardPolicyDigest: sessionProtectedHttpEgressHost?.policyDigest,
         pidNamespaceRetained: !coreOnlyPidNamespaceDegrade({
           credentialBearingMcp: !!sessionMcpGatewayHost?.socketPath,
         }),
-        networkPolicy: cfg.sandboxNetworkPolicy,
+        networkPolicy: effectiveSandboxNetworkPolicy,
       });
       // session-id is FORCED here so a relayed send can't target another session.
       sandboxStopWatcher = startOutboxWatcher(

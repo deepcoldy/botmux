@@ -11,11 +11,14 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, lstatSync, chmodSync, utimesSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
+import { once } from 'node:events';
 import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
 import { protectedMcpHomeDenyPaths, protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
+import { PROTECTED_HTTP_EGRESS_SOCKET_ENV } from '../src/core/protected-http-egress-host.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -41,6 +44,88 @@ describe('prepareDirectSandbox platform gate', () => {
       chdir: '/x', home: '/home/u', cliBin: '/usr/bin/true', cliArgs: [],
     });
     expect(r).toBeNull();
+  });
+});
+
+describe('prepareDirectSandbox protected egress socket mount', () => {
+  async function listen(path: string): Promise<Server> {
+    const server = createServer();
+    server.listen(path);
+    await once(server, 'listening');
+    return server;
+  }
+
+  it('mounts the shared private socket directory once and exposes only sandbox socket paths', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-protected-egress-'));
+    const socketDir = join(root, 'sockets');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const gatewayPath = join(socketDir, 'g.sock');
+    const egressPath = join(socketDir, 'e.sock');
+    const gateway = await listen(gatewayPath);
+    const egress = await listen(egressPath);
+    writeFileSync(join(socketDir, 'egress-auth'), 'host-auth-token-fixture\n', { mode: 0o600 });
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'protected-egress',
+        dataDir,
+        policy: { rules: [], net: true, writeRegexes: [] },
+        chdir: root,
+        home: root,
+        cliBin: '/bin/true',
+        cliArgs: [],
+        mcpGatewaySocketPath: gatewayPath,
+        protectedEgressSocketPath: egressPath,
+      });
+      expect(plan).not.toBeNull();
+      const args = plan!.args;
+      const mounts = args.filter((value, index) => value === '--ro-bind'
+        && args[index + 1] === realpathSync(socketDir)
+        && args[index + 2] === '/run/botmux-mcp');
+      expect(mounts).toHaveLength(1);
+      expect(plan!.env.BOTMUX_MCP_GATEWAY_SOCKET).toBe('/run/botmux-mcp/g.sock');
+      expect(plan!.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV]).toBe('/run/botmux-mcp/e.sock');
+      const childArgv = args.slice(args.lastIndexOf('--') + 1);
+      expect(JSON.stringify({ childArgv, env: plan!.env })).not.toContain(socketDir);
+      expect(JSON.stringify({ args, env: plan!.env })).not.toContain('host-auth-token-fixture');
+    } finally {
+      plan?.cleanup();
+      await Promise.all([new Promise<void>(resolve => gateway.close(() => resolve())), new Promise<void>(resolve => egress.close(() => resolve()))]);
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('rejects an egress socket outside the MCP directory or a non-socket leaf', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-protected-egress-invalid-'));
+    const socketDir = join(root, 'sockets');
+    const otherDir = join(root, 'other');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(otherDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const gatewayPath = join(socketDir, 'g.sock');
+    const outsidePath = join(otherDir, 'e.sock');
+    const gateway = await listen(gatewayPath);
+    const outside = await listen(outsidePath);
+    const nonSocket = join(socketDir, 'not-a-socket');
+    writeFileSync(nonSocket, 'x');
+    const common = {
+      sessionId: 'protected-egress-invalid', dataDir,
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: root, home: root, cliBin: '/bin/true', cliArgs: [],
+      mcpGatewaySocketPath: gatewayPath,
+    };
+    try {
+      expect(prepareDirectSandbox({ ...common, protectedEgressSocketPath: outsidePath })).toBeNull();
+      expect(prepareDirectSandbox({ ...common, protectedEgressSocketPath: nonSocket })).toBeNull();
+    } finally {
+      await Promise.all([new Promise<void>(resolve => gateway.close(() => resolve())), new Promise<void>(resolve => outside.close(() => resolve()))]);
+      rmSandboxScratch(root);
+    }
   });
 });
 

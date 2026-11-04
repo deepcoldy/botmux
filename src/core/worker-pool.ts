@@ -107,6 +107,7 @@ import { sanitizePerBotEnv } from './per-bot-env.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { buildBotWorkerEnv, type EnvPolicy } from './env-policy.js';
 import {
+  PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE,
   PROTECTED_MCP_SECRET_FD_ENV,
   prepareProtectedMcpWorkerProvisioning,
   protectedMcpDaemonRedactedEnvKeys,
@@ -114,6 +115,11 @@ import {
   protectedMcpContainmentConfigured,
   serveProtectedMcpSecrets,
 } from './protected-mcp-capabilities.js';
+import {
+  collectProtectedHttpEgressPolicies,
+  resolveProtectedHttpEgressTargets,
+  type ProtectedHttpEgressWorkerPolicy,
+} from './protected-http-egress.js';
 import { resolveSessionEnv, type ResolvedSessionEnv } from './session-env-resolve.js';
 import { sessionEnvFingerprint } from '../services/session-env-stamp.js';
 import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
@@ -14308,11 +14314,124 @@ export function freezeSessionSandboxDecision(
  * staged behind an ACK, routed through a live owner, or spawn-deferred during
  * device isolation — returns `true`.
  */
+const pendingProtectedHttpEgressFreezes = new Map<string, Promise<ProtectedHttpEgressWorkerPolicy>>();
+
 export function forkWorker(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
   resumeOrTurnId: ForkResumeOrTurnId = false,
   opts: ForkWorkerOptions = {},
+): boolean {
+  // Preserve the original first external fork boundary before asynchronous DNS
+  // freezing. Device activation must be able to defer a spawn without reading
+  // live Bot/plugin configuration or starting any resolver work. The prepared
+  // continuation repeats this gate after DNS so a freeze that begins while the
+  // lease is inactive still cannot race a newly-started activation.
+  if (opts.deferDuringDeviceIsolation === false && currentDeviceIsolationFreezeLease()) {
+    logger.info(`[${tag(ds)}] worker spawn left retryable during device credential activation`);
+    opts.onAdmission?.('rejected');
+    return true;
+  }
+  if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
+    if (findActiveBySessionId(ds.session.sessionId) === ds) {
+      forkWorker(ds, promptInput, resumeOrTurnId);
+    }
+  })) {
+    logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
+    opts.onAdmission?.('deferred');
+    return true;
+  }
+
+  const bot = getBot(ds.larkAppId);
+  const globalConfig = readGlobalConfig();
+  const collected = collectProtectedHttpEgressPolicies(
+    resolveEffectivePluginIds(bot.config, globalConfig),
+  );
+  if (collected.length > 1) throw new Error('multiple_protected_http_egress_policies');
+  if (collected.length === 0) {
+    return forkWorkerPrepared(ds, promptInput, resumeOrTurnId, opts, undefined, bot);
+  }
+
+  const collectedPolicy = collected[0]!;
+  let freeze = pendingProtectedHttpEgressFreezes.get(ds.session.sessionId);
+  if (!freeze) {
+    freeze = resolveProtectedHttpEgressTargets(collectedPolicy.policy).then(frozenAddresses => ({
+      ...collectedPolicy,
+      frozenAddresses,
+    }));
+    pendingProtectedHttpEgressFreezes.set(ds.session.sessionId, freeze);
+    void freeze.finally(() => {
+      if (pendingProtectedHttpEgressFreezes.get(ds.session.sessionId) === freeze) {
+        pendingProtectedHttpEgressFreezes.delete(ds.session.sessionId);
+      }
+    }).catch(() => undefined);
+  }
+  void freeze.then(policy => {
+    forkWorkerPrepared(ds, promptInput, resumeOrTurnId, opts, policy, bot);
+  }).catch(error => {
+    const reason = error instanceof Error ? error.message : String(error);
+    logger.error(`[${tag(ds)}] Protected HTTP egress target freeze failed: ${reason}`);
+    if (canForkRegisteredSession(ds)) {
+      const turnId = typeof resumeOrTurnId === 'string'
+        ? resumeOrTurnId
+        : typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+          ? resumeOrTurnId.turnId
+          : undefined;
+      const dispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.dispatchAttempt
+        : undefined;
+      const blockedTurnId = fallbackTurnId(ds, turnId);
+      const message = startupFailureNotice(
+        ds,
+        sessionCliDisplayName(ds, bot.config),
+        reason,
+        botLocale(bot.config),
+      );
+      emitSessionLifecycleHook(ds, 'session.requires_attention', {
+        reason: 'worker_fork_error',
+        message: reason,
+      });
+      if (opts.onAdmissionBlocked) {
+        opts.onAdmissionBlocked({
+          content: message,
+          ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
+        });
+      } else {
+        const meetingDriven = !!ds.session.vcMeetingReceiver
+          && (dispatchAttempt !== undefined
+            || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
+        if (meetingDriven || isSilentScheduledTurn(ds, turnId)) {
+          logger.info(
+            `[${tag(ds)}] Managed/silent protected egress freeze failure kept out of auxiliary Lark UI: ${reason}`,
+          );
+        } else {
+          const cb = requireCallbacks();
+          void cb.sessionReply(
+            sessionAnchorId(ds),
+            message,
+            'text',
+            ds.larkAppId,
+            blockedTurnId,
+            { sourceSessionId: ds.session.sessionId },
+          ).catch(replyError => logger.error(
+            `[${tag(ds)}] Failed to report protected egress freeze failure: `
+            + `${replyError instanceof Error ? replyError.message : String(replyError)}`,
+          ));
+        }
+      }
+    }
+    opts.onAdmission?.('rejected');
+  });
+  return true;
+}
+
+function forkWorkerPrepared(
+  ds: DaemonSession,
+  promptInput: string | CliTurnPayload,
+  resumeOrTurnId: ForkResumeOrTurnId = false,
+  opts: ForkWorkerOptions = {},
+  protectedHttpEgressPolicy?: ProtectedHttpEgressWorkerPolicy,
+  preparedBot?: ReturnType<typeof getBot>,
 ): boolean {
   let admissionReported = false;
   const reportAdmission = (admission: WorkerForkAdmission): void => {
@@ -14581,7 +14700,7 @@ export function forkWorker(
   }
 
   const cb = requireCallbacks();
-  const bot = getBot(ds.larkAppId);
+  const bot = preparedBot ?? getBot(ds.larkAppId);
   const botCfg = bot.config;
   const admission = checkWorkerAdmission(readGlobalConfig().worker);
   for (const warning of admission.pressure.warnings) {
@@ -15019,8 +15138,12 @@ export function forkWorker(
       backendType: resolvedBackendType,
       sandboxMode: frozenSessionSandboxMode(ds.session.sandbox),
       networkPolicy: ds.session.sandboxNetworkPolicy,
+      protectedHttpEgressPolicy,
       adopt: false,
     }),
+    protectedHttpEgressPolicy
+      ? PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE
+      : undefined,
   );
   const forkEnv = workerForkEnv(
     buildBotWorkerEnv(process.env, botCfg.envPolicy, protectedMcpProvisioning.workerPolicy),
@@ -15564,6 +15687,7 @@ export function forkWorker(
     ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     pluginBindings: botCfg.plugins,
     protectedMcpPolicy: protectedMcpProvisioning.workerPolicy,
+    protectedHttpEgressPolicy,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
       ? { runnerBuildId: runtimeIdentity.id }
@@ -22380,6 +22504,9 @@ export function forkAdoptWorker(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const agentCfg = sessionAgentConfig(ds, botCfg);
+  const globalConfig = readGlobalConfig();
+  const effectivePluginIds = resolveEffectivePluginIds(botCfg, globalConfig);
+  const protectedHttpEgressPolicies = collectProtectedHttpEgressPolicies(effectivePluginIds);
 
   // A file sandbox cannot be applied to an already-running CLI: adopt ATTACHES
   // to an existing host pane/process, and confinement (bwrap wrap on Linux /
@@ -22391,8 +22518,10 @@ export function forkAdoptWorker(
   // session-manager restore branch converts a sandbox adopt to a cold-start
   // before it ever reaches here; this is the last-line fail-closed backstop,
   // which also strips any stale adopt metadata it is handed.
-  if (adoptSandboxBlocked(botCfg, ds.session)) {
-    logger.warn(`[${t}] sandbox-enabled session: refusing to adopt existing CLI (would run unsandboxed)`);
+  if (adoptSandboxBlocked(botCfg, ds.session) || protectedHttpEgressPolicies.length > 0) {
+    logger.warn(protectedHttpEgressPolicies.length > 0
+      ? `[${t}] protected HTTP egress policy: refusing to adopt existing CLI (cannot install frozen network boundary)`
+      : `[${t}] sandbox-enabled session: refusing to adopt existing CLI (would run unsandboxed)`);
     // Strip stale adopt state so the session doesn't linger as a worker=null
     // pseudo-adopt whose NEXT message
     // would still be routed as a bridge/adopt session. It cold-starts sandboxed
@@ -22434,9 +22563,8 @@ export function forkAdoptWorker(
   const rawAdoptCwd = adopted.cwd ?? ds.workingDir ?? process.cwd();
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
-  const globalConfig = readGlobalConfig();
   const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
-    resolveEffectivePluginIds(botCfg, globalConfig),
+    effectivePluginIds,
     protectedMcpDaemonSecretEnvironment(),
     globalConfig.protectedMcpCapabilities,
     false,

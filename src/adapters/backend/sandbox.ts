@@ -37,6 +37,7 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import { PROTECTED_HTTP_EGRESS_SOCKET_ENV } from '../../core/protected-http-egress-host.js';
 import { isValidPluginId } from '../../core/plugins/ids.js';
 import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
@@ -1164,6 +1165,8 @@ export function prepareDirectSandbox(opts: {
   trustedBotmuxCommandPaths?: readonly string[];
   /** Worker-owned Unix socket for the credential-bearing MCP Gateway. */
   mcpGatewaySocketPath?: string;
+  /** Worker-owned protected HTTP egress guard socket beside the MCP socket. */
+  protectedEgressSocketPath?: string;
   /** CANONICAL lark-cli data root (the parent of the frozen keystore dir, i.e.
    *  `dirname(larkCliLinuxStore)`) the worker resolved + nearest-ancestor-canonicalized.
    *  Pinned into the child as LARKSUITE_CLI_DATA_DIR so the in-sandbox lark-cli resolves
@@ -1393,14 +1396,31 @@ export function prepareDirectSandbox(opts: {
   }
 
   let sandboxMcpGatewaySocketPath: string | undefined;
-  if (opts.mcpGatewaySocketPath) {
+  let sandboxProtectedEgressSocketPath: string | undefined;
+  if (opts.mcpGatewaySocketPath || opts.protectedEgressSocketPath) {
     try {
-      const socketPath = resolve(opts.mcpGatewaySocketPath);
-      if (!lstatSync(socketPath).isSocket()) { rollbackSandboxSetup(sessionRoot, createdMasks); return null; }
-      const hostDir = realpathSync(dirname(socketPath));
+      if (!opts.mcpGatewaySocketPath) {
+        rollbackSandboxSetup(sessionRoot, createdMasks);
+        return null;
+      }
+      const mcpSocketPath = resolve(opts.mcpGatewaySocketPath);
+      if (!lstatSync(mcpSocketPath).isSocket()) {
+        rollbackSandboxSetup(sessionRoot, createdMasks);
+        return null;
+      }
+      const hostDir = realpathSync(dirname(mcpSocketPath));
       const sandboxDir = '/run/botmux-mcp';
       args.push('--dir', sandboxDir, '--ro-bind', hostDir, sandboxDir);
-      sandboxMcpGatewaySocketPath = join(sandboxDir, basename(socketPath));
+      sandboxMcpGatewaySocketPath = join(sandboxDir, basename(mcpSocketPath));
+      if (opts.protectedEgressSocketPath) {
+        const egressSocketPath = resolve(opts.protectedEgressSocketPath);
+        if (!lstatSync(egressSocketPath).isSocket()
+          || realpathSync(dirname(egressSocketPath)) !== hostDir) {
+          rollbackSandboxSetup(sessionRoot, createdMasks);
+          return null;
+        }
+        sandboxProtectedEgressSocketPath = join(sandboxDir, basename(egressSocketPath));
+      }
     } catch {
       // Spawn-setup failure AFTER mask mountpoints were pre-created: reclaim the
       // empty ones (from the in-memory list) and drop the tree so nothing leaks.
@@ -1457,6 +1477,9 @@ export function prepareDirectSandbox(opts: {
   if (sandboxMcpGatewaySocketPath) {
     env[MCP_GATEWAY_SOCKET_ENV] = sandboxMcpGatewaySocketPath;
     env[MCP_GATEWAY_REQUIRED_ENV] = '1';
+  }
+  if (sandboxProtectedEgressSocketPath) {
+    env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] = sandboxProtectedEgressSocketPath;
   }
   for (const k of PROXY_ENV_KEYS) {
     const v = process.env[k];

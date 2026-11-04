@@ -185,11 +185,39 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
+  it('passes the host-side protected egress socket only to the protected stdio plugin process', async () => {
+    installFixturePlugin('plugin-egress', 'egress-env', undefined, undefined, {
+      id: 'fixture.write.v1',
+      targets: [{
+        scheme: 'https',
+        host: 'fixture.internal.example',
+        port: 443,
+        denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+      }],
+    });
+    const gateway = new PluginMcpGateway(
+      ['plugin-egress'],
+      { ...process.env, BOTMUX_PROTECTED_EGRESS_SOCKET: '/host/private/e.sock' },
+    );
+    const client = new Client({ name: 'gateway-egress-env-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const result = await client.callTool({ name: 'echo', arguments: {} });
+      expect((result.content[0] as { text: string }).text)
+        .toBe('egress=/host/private/e.sock');
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
   function installFixturePlugin(
     pluginId: string,
     fixtureName: string,
     env?: Record<string, string>,
     protectedCapability?: string,
+    protectedEgressPolicy?: Record<string, unknown>,
   ) {
     const source = join(home, `${pluginId}-src`);
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
@@ -205,6 +233,7 @@ describe('plugin MCP Gateway', () => {
       command: [process.execPath, fixture, fixtureName],
       ...(env ? { env } : {}),
       ...(protectedCapability ? { protectedCapability } : {}),
+      ...(protectedEgressPolicy ? { protectedEgressPolicy } : {}),
     }));
     installLocalPlugin(source);
   }

@@ -1,9 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys, privateBrokerContainmentEnabled } from '../src/core/sandbox-network-policy.js';
+import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys, privateBrokerContainmentEnabled, mergeProtectedHttpEgressNetworkPolicy } from '../src/core/sandbox-network-policy.js';
 import { networkSocketFilter } from '../src/core/sandbox-network-launch.js';
 import { workflowSandboxInitFields } from '../src/workflows/shared/sandbox-policy.js';
+import type { ProtectedHttpEgressWorkerPolicy } from '../src/core/protected-http-egress.js';
 
 const base = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+const frozenEgress: ProtectedHttpEgressWorkerPolicy = {
+  pluginId: 'fixture-plugin',
+  policy: {
+    id: 'fixture.write.v1',
+    targets: [{
+      scheme: 'https',
+      host: 'fixture.internal.example',
+      port: 443,
+      denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+    }],
+  },
+  policyDigest: 'a'.repeat(64),
+  frozenAddresses: [['10.20.30.40', '2606:4700::40', '10.20.30.40']],
+};
 describe('network policy', () => {
   it.each(['10.0.0.1','127.0.0.1','169.254.0.1','100.64.0.1','192.168.1.1','198.18.0.1','224.0.0.1','0.0.0.0','255.255.255.255','::1','::','fe80::1','fc00::1','ff02::1','2001:db8::1','2002::1','64:ff9b::a00:1','::ffff:127.0.0.1','3fff::1'])('special/private %s', ip => expect(networkZone(ip)).toBe('private'));
   it.each(['8.8.8.8','1.1.1.1','2606:4700:4700::1111','::ffff:8.8.8.8'])('public %s', ip => expect(networkZone(ip)).toBe('public'));
@@ -84,6 +99,78 @@ describe('network policy', () => {
       private: { mode: 'allow' },
     }))).toBe(false);
     expect(privateBrokerContainmentEnabled(undefined)).toBe(false);
+  });
+  it('adds exact frozen target denies while leaving unrelated destinations on their existing path', () => {
+    const merged = mergeProtectedHttpEgressNetworkPolicy(undefined, frozenEgress, ['10.1.2.3']);
+    expect(merged.private.mode).toBe('denylist');
+    expect(merged.private.rules).toContainEqual({
+      cidr: '10.20.30.40/32', protocol: 'tcp', ports: [443],
+    });
+    expect(merged.public.mode).toBe('denylist');
+    expect(merged.public.rules).toContainEqual({
+      cidr: '2606:4700:0:0:0:0:0:40/128', protocol: 'tcp', ports: [443],
+    });
+    expect(merged.dnsServers).toEqual(['10.1.2.3']);
+    const nft = compileNetworkNft(merged);
+    expect(nft).toContain('ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport { 443 } drop');
+    expect(nft).toContain('ip6 daddr 2606:4700:0:0:0:0:0:40/128 meta l4proto tcp tcp dport { 443 } drop');
+    expect(nft).toContain('accept');
+    expect(merged.private.rules?.filter(rule => rule.cidr === '10.20.30.40/32')).toHaveLength(1);
+  });
+  it.each([
+    ['allow', { mode: 'allow' }],
+    ['denylist', { mode: 'denylist', rules: [{ cidr: '10.99.0.0/16', protocol: 'tcp', ports: [8443] }] }],
+  ] as const)('preserves unrelated operator rules when merging a %s zone', (_label, privateZone) => {
+    const operator = parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: privateZone,
+      dnsServers: ['192.168.1.53'],
+      proxyMode: 'reject',
+    });
+    const merged = mergeProtectedHttpEgressNetworkPolicy(operator, frozenEgress, ['10.1.2.3']);
+    expect(merged.dnsServers).toEqual(['192.168.1.53']);
+    expect(merged.proxyMode).toBe('reject');
+    if (privateZone.mode === 'denylist') {
+      expect(merged.private.rules).toContainEqual({
+        cidr: '10.99.0.0/16', protocol: 'tcp', ports: [8443],
+      });
+    }
+    expect(merged.private.rules).toContainEqual({
+      cidr: '10.20.30.40/32', protocol: 'tcp', ports: [443],
+    });
+  });
+  it('keeps block restrictive and inserts an ordered drop ahead of allowlist grants', () => {
+    const blocked = mergeProtectedHttpEgressNetworkPolicy(parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'block' },
+    }), frozenEgress, []);
+    expect(blocked.private).toEqual({ mode: 'block' });
+
+    const allowlisted = mergeProtectedHttpEgressNetworkPolicy(parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/8' }] },
+    }), frozenEgress, []);
+    expect(allowlisted.private.mode).toBe('allowlist');
+    expect(allowlisted.private.rules?.[0]).toEqual({
+      cidr: '10.20.30.40/32', protocol: 'tcp', ports: [443], action: 'drop',
+    });
+    expect(allowlisted.private.rules).toContainEqual({ cidr: '10.0.0.0/8' });
+    const nft = compileNetworkNft(allowlisted);
+    expect(nft.indexOf('ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport { 443 } drop'))
+      .toBeLessThan(nft.indexOf('ip daddr 10.0.0.0/8 accept'));
+  });
+  it('revokes delegated proxy egress because a proxy could bypass destination-IP denies', () => {
+    const merged = mergeProtectedHttpEgressNetworkPolicy(parseSandboxNetworkPolicy({
+      version: 1,
+      public: { mode: 'allow' },
+      private: { mode: 'allow' },
+      proxyMode: 'trusted-egress',
+    }), frozenEgress, []);
+    expect(merged.proxyMode).toBe('reject');
+    expect(networkProxyError(merged, { HTTPS_PROXY: 'http://proxy.internal:8080' })).toBeTruthy();
   });
   it('proxy re-resolution configurations fail closed without changing environment', () => {
     const p = parseSandboxNetworkPolicy(base); const env = { HTTPS_PROXY: 'http://example.org:8080', NO_PROXY: '*' };
