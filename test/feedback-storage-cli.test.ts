@@ -1,5 +1,5 @@
 import { Readable, Writable } from 'node:stream';
-import { mkdtemp, rm, readdir } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -57,9 +57,20 @@ describe('feedback storage CLI', () => {
       expect(await runFeedbackStorageCommand(['migrate', '--to', 'postgresql'], io, directory)).toBe(1);
       expect(errors).toContain('confirmation');
       expect(await runFeedbackStorageCommand(['configure', '--password', 'hidden-password'], io, directory)).toBe(1);
+      expect(errors).toContain('feedback_storage_use_secret_reference');
       expect(errors).not.toContain('hidden-password');
-      expect(await runFeedbackStorageCommand(['configure', '--token=hidden-token'], io, directory)).toBe(1);
-      expect(errors).not.toContain('hidden-token');
+      for (const tokenArgs of [['--token', 'hidden-token'], ['--token=hidden-token-2']]) {
+        expect(await runFeedbackStorageCommand(['configure', ...tokenArgs], io, directory)).toBe(1);
+        expect(errors).toContain('feedback_storage_use_secret_reference');
+        expect(errors).not.toContain('hidden-token');
+      }
+      // With a usable config file the guard must still reject before applying it:
+      // a missing guard would make the command succeed (exit 0), not fail later.
+      const configFile = join(directory, 'sqlite.json');
+      await writeFile(configFile, JSON.stringify({ backend: 'sqlite' }), 'utf8');
+      expect(await runFeedbackStorageCommand(['configure', '--config-file', configFile, '--token=hidden-token-3'], io, directory)).toBe(1);
+      expect(errors).toContain('feedback_storage_use_secret_reference');
+      expect(errors).not.toContain('hidden-token-3');
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });
