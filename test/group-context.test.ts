@@ -135,6 +135,12 @@ describe('automatic group context preparation', () => {
     expect(result?.body).toContain('scan_limit');
   });
 
+  it('prepares background for a bare @mention with an empty query', async () => {
+    const f = fixture();
+    const result = await f.prepare({ ...request, query: '' });
+    expect(result?.body).toContain('取消蒸汽火车，保留瀑布');
+  });
+
   it('isolates already delivered sequences by the requested consumer and epoch', async () => {
     const deliveredSeqs = vi.fn(() => [1]);
     const f = fixture({ deliveredSeqs });
@@ -242,6 +248,9 @@ describe('automatic group context preparation', () => {
     expect(groupContextQuery('/topic 整理刚才的讨论')).toBe('整理刚才的讨论');
     expect(groupContextQuery('/solve 整理刚才的讨论', { configuredTrigger: true, renderedPrompt: '请整理刚才的讨论' })).toBe('请整理刚才的讨论');
     expect(groupContextQuery('/compact')).toBeUndefined();
+    // A bare @mention still prepares background (empty query), unlike a command.
+    expect(groupContextQuery('')).toBe('');
+    expect(groupContextQuery('   ')).toBe('');
     expect(groupContextQuery('/context-sharing off')).toBeUndefined();
   });
 });

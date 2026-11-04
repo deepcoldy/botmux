@@ -24658,7 +24658,7 @@ async function prepareGroupBackground(data: any, ctx: RoutingContext): Promise<v
       configuredTrigger: !!ctx.commandTrigger,
       renderedPrompt: ctx.commandTrigger ? renderCommandTriggerPrompt(ctx.commandTrigger) : undefined,
     });
-    if (!query) return;
+    if (query === undefined) return;
     void ensureGroupContextRecallHealth(ctx.larkAppId, () => ensureMessageRecalledEventSubscribed(ctx.larkAppId));
     const ds = activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.larkAppId));
     if (ds && sessionPromptInjection(ds) === 'none') return;

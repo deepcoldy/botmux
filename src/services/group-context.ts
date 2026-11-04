@@ -9,7 +9,10 @@ export function groupContextQuery(content: string, options?: { configuredTrigger
   const header = parseTopicHeader(content);
   if (header !== null) return isTopicHeader(header) ? header.prompt.trim() || undefined : undefined;
   const query = content.trim();
-  return !query || /^[/!]/.test(query) ? undefined : query;
+  // A bare @mention (nothing left after stripping mentions) asks the bot to
+  // look at the conversation above: background is the whole point, so prepare
+  // it with an empty query. Only commands skip preparation.
+  return /^[/!]/.test(query) ? undefined : query;
 }
 
 export interface GroupContextTurnRequest {
