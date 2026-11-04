@@ -70,6 +70,7 @@ import {
   buildPipePaneStartupError,
   __testOnly_liveFifoReaderCount,
   resolveReportedExitCode,
+  literalSendKeysArgs,
 } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { resetTmuxVersionCacheForTests, getTmuxVersionCached } from '../src/setup/ensure-tmux.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
@@ -844,6 +845,38 @@ describe('TmuxPipeBackend server selection (dedicated socket)', () => {
     const calls = everyTmuxCall();
     expect(calls.length).toBeGreaterThan(0);
     expect(calls.filter(call => call.includes('-L '))).toEqual([]);
+  });
+});
+
+describe('literalSendKeysArgs (tmux eats a trailing ";")', () => {
+  it('keeps plain text as one literal send-keys', () => {
+    expect(literalSendKeysArgs('0:1.0', 'mid;dle')).toEqual(['send-keys', '-t', '0:1.0', '-l', '--', 'mid;dle']);
+  });
+
+  it('sends trailing semicolons as hex keys in the same invocation', () => {
+    expect(literalSendKeysArgs('0:1.0', '93&#47;')).toEqual([
+      'send-keys', '-t', '0:1.0', '-l', '--', '93&#47', ';', 'send-keys', '-t', '0:1.0', '-H', '3b',
+    ]);
+    expect(literalSendKeysArgs('p', 'E;;')).toEqual(['send-keys', '-t', 'p', '-l', '--', 'E', ';', 'send-keys', '-t', 'p', '-H', '3b', '3b']);
+  });
+
+  it('never leaves a literal argument ending in ";" or a backslash-escaped one', () => {
+    expect(literalSendKeysArgs('p', ';')).toEqual(['send-keys', '-t', 'p', '-H', '3b']);
+    expect(literalSendKeysArgs('p', 'B\\;')).toEqual(['send-keys', '-t', 'p', '-l', '--', 'B\\', ';', 'send-keys', '-t', 'p', '-H', '3b']);
+  });
+
+  it('sendText and sendLines route through it', () => {
+    const be = new TmuxPipeBackend('0:3.1');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    be.sendText('&#10;');
+    be.sendLines(['a;', 'b'], 'S-Enter');
+    const [text, lines] = getExecFileCalls().map(call => call[1] as string[]);
+    expect(text.slice(-5)).toEqual(['send-keys', '-t', '0:3.1', '-H', '3b']);
+    expect(text).toContain('&#10');
+    expect(text).not.toContain('&#10;');
+    expect(lines).toContain('3b');
+    expect(lines.filter(arg => arg !== ';' && arg.endsWith(';'))).toEqual([]);
   });
 });
 
