@@ -98,6 +98,12 @@ describe('repairCardStrongPunctuation: leaves everything else byte-identical', (
     ['only punctuation inside', '文**：**字'],
     ['feishu font tag', "**<font color='red'>注意：</font>**正文"],
     ['strikethrough inside', '**~~旧~~：**正文'],
+    // The moved punctuation can change how underscore emphasis pairs elsewhere
+    // on the same line: moving `/` (or '，') across the delimiter turns these
+    // into a bold span and the existing `_…_` italic disappears. The markdown-it
+    // gate's em-count invariance check rejects such a rewrite.
+    ['underscore em adjacent (lead punct)', 'b**/_**_'],
+    ['underscore em adjacent (trail punct)', '**_，**p_'],
     ['no asterisks', '标签：正文'],
   ])('%s', (_label, input) => {
     expect(repairCardStrongPunctuation(input)).toBe(input);
