@@ -193,7 +193,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
     process.env.BOTMUX_SESSION_ID = 'sess-123';
     process.env.TMUX = '/tmp/tmux-socket';
     try {
-      const env = buildOneShotEnv(undefined);
+      const env = buildOneShotEnv();
       expect(env.LARK_APP_SECRET).toBeUndefined();
       expect(env.GITHUB_TOKEN).toBeUndefined();
       expect(env.BOTMUX_SESSION_ID).toBeUndefined();
@@ -207,7 +207,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
   });
 
   it('layers the per-bot provider env on top (multi-provider correctness)', () => {
-    const env = buildOneShotEnv({ ANTHROPIC_BASE_URL: 'https://proxy.example', ANTHROPIC_AUTH_TOKEN: 'bot-token' });
+    const env = buildOneShotEnv({ env: { ANTHROPIC_BASE_URL: 'https://proxy.example', ANTHROPIC_AUTH_TOKEN: 'bot-token' } });
     expect(env.ANTHROPIC_BASE_URL).toBe('https://proxy.example');
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('bot-token');
     // Inherited harmless vars still flow through (PATH etc.).
@@ -217,7 +217,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
   it('per-bot env cannot smuggle reserved botmux keys past the sanitizer', () => {
     // PATH deliberately IS overridable per bot (same as the worker path);
     // reserved BOTMUX_* identity keys are not.
-    const env = buildOneShotEnv({ BOTMUX_SESSION_ID: 'evil' } as any);
+    const env = buildOneShotEnv({ env: { BOTMUX_SESSION_ID: 'evil' } });
     expect(env.BOTMUX_SESSION_ID).toBeUndefined();
   });
 });
@@ -282,6 +282,22 @@ describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', ()
     expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.grok)).toEqual({ argv: ['grok', '-p'] });
     expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/grok' }, ONE_SHOT_ARGV.grok)).toEqual({
       argv: ['/custom/bin/grok', '-p'],
+    });
+  });
+
+  it('supports pi in ONE_SHOT_ARGV with pi -p', () => {
+    expect(ONE_SHOT_ARGV.pi).toEqual(['pi', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.pi)).toEqual({ argv: ['pi', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/pi' }, ONE_SHOT_ARGV.pi)).toEqual({
+      argv: ['/custom/bin/pi', '-p'],
+    });
+  });
+
+  it('supports oh-my-pi in ONE_SHOT_ARGV with omp -p', () => {
+    expect(ONE_SHOT_ARGV['oh-my-pi']).toEqual(['omp', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV['oh-my-pi'])).toEqual({ argv: ['omp', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/omp' }, ONE_SHOT_ARGV['oh-my-pi'])).toEqual({
+      argv: ['/custom/bin/omp', '-p'],
     });
   });
 });

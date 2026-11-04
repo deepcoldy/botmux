@@ -286,6 +286,73 @@ describe('listAuthorizedUsers', () => {
   });
 });
 
+describe('userTokenAuthState — one person, no token contents', () => {
+  beforeEach(() => { files.clear(); });
+
+  it('reports a live token as authorized with both expiry times and no secrets', async () => {
+    const accessAt = new Date(Date.now() + 3_600_000).toISOString();
+    const refreshAt = new Date(Date.now() + 30 * 86_400_000).toISOString();
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'TOK_ALICE', refresh_token: 'REFRESH_ALICE',
+      appId: APP, brand: 'feishu', openId: ALICE, userName: 'Fixture',
+      expires_at: accessAt, refresh_expires_at: refreshAt,
+    }));
+    files.set(perUserPath(APP, BOB), tokenFor({
+      access_token: 'TOK_BOB', appId: APP, brand: 'feishu', openId: BOB,
+      expires_at: '2099-02-02T00:00:00.000Z', refresh_expires_at: '2099-03-03T00:00:00.000Z',
+    }));
+
+    const { userTokenAuthState } = await fresh();
+    const alice = userTokenAuthState(APP, 'feishu', ALICE);
+    expect(alice).toEqual({ state: 'authorized', expiresAt: accessAt, refreshExpiresAt: refreshAt });
+    expect(JSON.stringify(alice)).not.toContain('TOK_');
+    expect(JSON.stringify(alice)).not.toContain('REFRESH_');
+    expect(JSON.stringify(alice)).not.toContain('Fixture');
+    expect(userTokenAuthState(APP, 'feishu', BOB).expiresAt).toBe('2099-02-02T00:00:00.000Z');
+  });
+
+  it('stays authorized while the access token is expired but the refresh token is not', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'TOK_ALICE', refresh_token: 'REFRESH_ALICE',
+      appId: APP, brand: 'feishu', openId: ALICE,
+      expires_at: '2000-01-01T00:00:00.000Z',
+      refresh_expires_at: '2099-01-01T00:00:00.000Z',
+    }));
+    const { userTokenAuthState } = await fresh();
+    expect(userTokenAuthState(APP, 'feishu', ALICE)).toEqual({
+      state: 'authorized',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      refreshExpiresAt: '2099-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('needs a new login once both expiries are past, and still reports those times', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'TOK_DEAD', refresh_token: 'REFRESH_DEAD',
+      appId: APP, brand: 'feishu', openId: ALICE,
+      expires_at: '2000-01-01T00:00:00.000Z',
+      refresh_expires_at: '2000-02-01T00:00:00.000Z',
+    }));
+    const { userTokenAuthState } = await fresh();
+    expect(userTokenAuthState(APP, 'feishu', ALICE)).toEqual({
+      state: 'needs-login',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      refreshExpiresAt: '2000-02-01T00:00:00.000Z',
+    });
+    expect(userTokenAuthState(APP, 'feishu', BOB)).toEqual({ state: 'needs-login' });
+  });
+
+  it('does not treat another person or an unattributed file as this person', async () => {
+    files.set(perUserPath(APP, BOB), tokenFor({ access_token: 'TOK_BOB', appId: APP, brand: 'feishu', openId: BOB }));
+    files.set(perAppPath(APP), tokenFor({ access_token: 'TOK_APP', appId: APP, brand: 'feishu' }));
+    files.set(perUserPath(APP, ALICE), tokenFor({ access_token: 'TOK_MISFILED', appId: APP, brand: 'feishu', openId: BOB }));
+    const { userTokenAuthState } = await fresh();
+    expect(userTokenAuthState(APP, 'feishu', ALICE)).toEqual({ state: 'needs-login' });
+    expect(userTokenAuthState(APP, 'feishu', '../../etc/passwd')).toEqual({ state: 'unknown' });
+    expect(JSON.stringify(userTokenAuthState(APP, 'feishu', ALICE))).not.toContain('TOK_');
+  });
+});
+
 describe('resolveOwnerUserToken — the one narrow fallback', () => {
   beforeEach(() => { files.clear(); });
 

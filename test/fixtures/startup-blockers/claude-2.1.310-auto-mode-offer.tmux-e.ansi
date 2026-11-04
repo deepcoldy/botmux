@@ -1,0 +1,14 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m[39m[49m [38;5;246mv2.1.310
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 · API Usage Billing
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/e2309/work
+
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mMake auto mode your default permission mode?
+
+[0m[39m[49m   Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and prompt injection before executing, runs
+   the ones it assesses as lower-risk, and blocks the rest.
+
+   [38;5;153m❯[39m [38;5;153mYes, set auto mode as my default permission mode
+[39m     No, keep bypass permissions

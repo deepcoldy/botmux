@@ -48,4 +48,27 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
     expect(botConfigInvariantError({ cliId: 'codex', codexBrowser: true }))
       .toBe('codex_browser_requires_codex_app');
   });
+
+  it('flags cursor transcript delivery under scratch (host bridge cannot read the merged overlay mirror)', () => {
+    // 变异护栏：三个条件缺一不可——少任何一个都不该拦（codex scratch 合法、
+    // cursor oncall 合法、cursor scratch 下 send 合法）。
+    expect(botConfigInvariantError({
+      cliId: 'cursor', sandbox: 'scratch', replyDelivery: 'transcript',
+    })).toBe('reply_delivery_unsupported');
+    expect(botConfigInvariantError({
+      cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript',
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'cursor', sandbox: 'oncall', replyDelivery: 'transcript',
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'cursor', sandbox: true, replyDelivery: 'transcript',
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'cursor', sandbox: 'scratch', replyDelivery: 'send',
+    })).toBeUndefined();
+    expect(botConfigInvariantError({
+      cliId: 'cursor', sandbox: 'scratch',
+    })).toBeUndefined();
+  });
 });

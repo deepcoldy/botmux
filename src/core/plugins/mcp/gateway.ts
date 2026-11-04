@@ -41,6 +41,7 @@ import { resolveBotmuxDataDir } from '../../data-dir.js';
 import { readGlobalConfig } from '../../../global-config.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
+import { pruneFilesByAge } from '../../../utils/prune-by-age.js';
 import { resolveSessionContext } from '../../session-marker.js';
 import { normalizePluginIdList } from '../ids.js';
 import { pluginHome, pluginRuntimeDir, resolvePluginPath } from '../paths.js';
@@ -49,6 +50,7 @@ import {
   readSessionMcpRuntimeManifest,
   type SessionMcpRuntimeManifest,
 } from './session-runtime.js';
+import { pluginMcpToolTimeoutOptions } from './runtime-options.js';
 import { readPluginMcpDescriptor } from './private-store.js';
 import type { PluginMcpServer } from '../types.js';
 import type { TrustedCaller } from '../../../types.js';
@@ -94,6 +96,7 @@ interface GatewayDescriptor {
   pluginId: string;
   server: PluginMcpServer;
   pluginDir: string;
+  toolTimeoutMs?: number;
 }
 
 interface GatewayConnection extends GatewayDescriptor {
@@ -230,6 +233,7 @@ function snapshotGatewayDescriptors(snapshot: SessionMcpRuntimeManifest): Gatewa
     pluginId: entry.pluginId,
     server: entry.server,
     pluginDir: entry.pluginDir,
+    ...(entry.toolTimeoutMs === undefined ? {} : { toolTimeoutMs: entry.toolTimeoutMs }),
   }));
 }
 
@@ -264,6 +268,9 @@ function writeDiagnostics(file: McpGatewayDiagnosticsFile, dataDir: string): voi
   const path = diagnosticsPath(file.sessionId, dataDir);
   mkdirSync(dirname(path), { recursive: true });
   atomicWriteFileSync(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  // 诊断快照每会话一个、只写不删；dashboard 只读最新 50 个。写入时顺手回收
+  // 7 天前的旧快照（至少保留最新 50 个），避免随会话数无限累积。
+  pruneFilesByAge({ dir: dirname(path), suffix: '.json', maxAgeMs: 7 * 24 * 60 * 60_000, retainMin: 50 });
 }
 
 function resolveStdioCommand(descriptor: GatewayDescriptor): { command: string; args: string[] } {
@@ -529,11 +536,16 @@ export class PluginMcpGateway {
     }
   }
 
-  private requestOptions(request: { params?: { _meta?: { progressToken?: string | number } } }, extra: { signal: AbortSignal }) {
+  private requestOptions(
+    request: { params?: { _meta?: { progressToken?: string | number } } },
+    extra: { signal: AbortSignal },
+    timeout?: number,
+  ) {
     const token = request.params?._meta?.progressToken;
     return {
       signal: extra.signal,
       resetTimeoutOnProgress: true,
+      ...pluginMcpToolTimeoutOptions(timeout),
       ...(token === undefined ? {} : {
         onprogress: (progress: { progress: number; total?: number; message?: string }) => {
           void this.server.notification({ method: 'notifications/progress', params: { progressToken: token, ...progress } });
@@ -754,7 +766,7 @@ export class PluginMcpGateway {
       const result = await this.toolCallIdentity.run({ identity }, () => route.connection.client.callTool(
         this.withTrustedTurnMeta({ ...request.params, name: route.originalName }, identity),
         undefined,
-        this.requestOptions(request, extra),
+        this.requestOptions(request, extra, route.connection.toolTimeoutMs),
       ));
       const deliveryValue = isRecord(result._meta)
         ? result._meta[BOTMUX_HOST_DELIVERY_META_KEY]

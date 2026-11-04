@@ -3,6 +3,7 @@ import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
 } from '../src/core/cli-runtime-display.js';
+import { resolveCliRuntime, snapshotCliRuntime } from '../src/adapters/cli/runtime.js';
 
 const configuredSnapshot = {
   id: 'vendor-codex',
@@ -19,6 +20,17 @@ const liveRuntime = {
 };
 
 describe('CLI runtime display identity', () => {
+  it('freezes CodeM display identity independently of the Kimi adapter and later bot changes', () => {
+    const runtime = resolveCliRuntime({
+      cliId: 'kimi',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: 'codem-wrapper', update: { provider: 'none' } },
+    });
+    expect(sessionConfiguredRuntimeDisplayName({
+      agentFrozen: true, cliRuntime: snapshotCliRuntime(runtime), cliPathOverride: 'codem-wrapper',
+    }, liveRuntime)).toBe('CodeM');
+    expect(configuredRuntimeDisplayName(resolveCliRuntime({ cliId: 'kimi' }))).toBeUndefined();
+  });
+
   it('uses a configured snapshot and ignores a later bot-level switch', () => {
     expect(sessionConfiguredRuntimeDisplayName({
       agentFrozen: true,

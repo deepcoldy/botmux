@@ -78,6 +78,8 @@ export function isCodexAppTurnInput(value: unknown): value is CodexAppTurnInput 
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const input = value as Record<string, unknown>;
   if (typeof input.text !== 'string') return false;
+  if (input.steerTargetTurnId !== undefined && (typeof input.steerTargetTurnId !== 'string'
+    || !input.steerTargetTurnId.trim() || input.steerTargetTurnId.length > 128)) return false;
   if (input.clientUserMessageId !== undefined && typeof input.clientUserMessageId !== 'string') return false;
   if (input.additionalContext !== undefined) {
     if (!input.additionalContext || typeof input.additionalContext !== 'object' || Array.isArray(input.additionalContext)) return false;

@@ -14,7 +14,6 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `claude-code` | Claude Code（默认） | 本地进程 | ✅ |
 | `codex` | Codex CLI | 本地进程 | ✅ |
 | `codex-app` | Codex App | 本地进程（app-server 协议） | |
-| `gemini` | Gemini | 本地进程 | ✅ |
 | `cursor` | Cursor（cursor-agent） | 本地进程 | ✅ |
 | `opencode` | OpenCode | 本地进程 | ✅ |
 | `opencode2` | OpenCode 2（beta，`opencode2`） | 本地进程 | |
@@ -30,15 +29,28 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `traex` | TRAE CLI（traex） | 本地进程 | ✅ |
 | `mtr` | MTR | 本地进程 | |
 | `hermes` | Hermes | 本地进程 | |
+| `ebsd` | EBSD（需配置文件凭证，见 [配置说明](https://github.com/deepcoldy/botmux/blob/master/docs/ebsd.md)） | 本地进程 | |
+| `codem` | CodeM（见 [CodeM 说明](https://github.com/deepcoldy/botmux/blob/master/docs/codem.md)） | 本地进程 | ✅ |
+| `minimax` | MiniMax Code / mcode（见 [MiniMax Code 说明](https://github.com/deepcoldy/botmux/blob/master/docs/minimax-code.md)） | 本地进程 | ✅ |
 | `genius` | Genius | 本地进程 | ✅ |
 | `seed` | Seed（Claude Code fork） | 本地进程 | ✅ |
 | `relay` | Relay（Seed 新版） | 本地进程 | ✅ |
 | `mira` | Mira APP | API / 远端 | |
 | `mir` | Mir CLI（本地 mircli + MCP bridge） | 本地进程 | |
 | `riff` | riff | 云 Agent（API） | |
+| `mojo` | Mojo | API 驱动（宿主机执行/云沙箱） | |
+| `remote-runner` | 通用远端 Runner（见 [Remote Runner 说明](https://github.com/deepcoldy/botmux/blob/master/docs/remote-runner.md)） | 远端协议 | |
 | `dsh` | DeepSeek Harness（dsh CLI） | 本地进程（SDK JSON-RPC） | ✅ |
 
 > `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。
+
+### Gemini CLI 已下线
+
+上游已停止维护 Gemini CLI，botmux 移除了 `gemini` 适配器，Dashboard 与 `botmux setup` 不再提供该选项（`botmux setup` 的旧序号 6 现在会报错，不会改选别的 CLI）；替代品是 `antigravity`（Antigravity，`agy`）。
+
+- `bots.json` 里仍写着 `cliId: "gemini"` 的 bot 会**拒绝启动**，并给出中文提示：Gemini CLI 已下线，请把 `cliId` 改成 `"antigravity"`。其它 bot 不受影响。
+- 迁移：装好 `agy` 并用 Google 账号登录；或不登录、改用 Gemini API key——在 `~/.gemini/antigravity-cli/settings.json` 里设 `modelProvider: "gemini"`，并提供 `GEMINI_API_KEY`。然后把 `cliId` 改成 `"antigravity"`（直接改 `bots.json`，或用 `botmux setup` 修改这个 bot 的 CLI），再 `botmux restart`。该 bot 未启动时，Dashboard 只显示原因，不能在那里保存配置。
+- 原来的 Gemini 专属配置不会沿用：`cliPathOverride` / `wrapperCli`（如 `ttadk gemini`）、Gemini 的 `model` 名、`GEMINI_CLI_HOME` 都需要删掉或按新 CLI 重配。
 
 ## Pi 执行过程气泡
 
@@ -149,7 +161,7 @@ Botmux 管理的 `codex-app` 会话，以及启用 app-server RPC 的 `codex` �
 
 验证时，在普通 Codex App 会话中让模型用原生 `request_user_input` 问一个选择题，确认飞书卡片能收到问题，提交后同一轮继续并能复述所选答案。原生工具是否可用仍由 Codex 的版本和运行模式决定。
 
-Codex App 的 `request_user_input_async` 会从带 `delivery: async` / `questions` 的消息事件生成独立飞书问答卡片。模型可以继续处理其他工作；原轮次正常结束后，卡片仍可作答。答案保留原调用 ID 和问题序号，经现有会话投递队列进入同一原生线程，开始后续轮次。重复事件只发一张卡片，推荐选项必须主动提交。
+Codex App 的 `request_user_input_async` 会从带 `delivery: async` / `questions` 的消息事件生成独立飞书问答卡片。模型可以继续处理其他工作；原轮次正常结束后，卡片仍可作答。答案保留原调用 ID 和问题序号。当已开启 `codexAppCleanInput`、原轮仍在执行且支持原生定向输入时，经认证的原提问对象的答复会通过现有投递账本并入原轮，无需等待任务结束。原轮已结束时仍在同一线程开始后续轮次；旧卡片缺少原生轮次标记、结构化输入不可用或来源不适用时沿用串行投递。迟到答案不会并入其他原生任务。重复事件只发一张卡片，推荐选项必须主动提交。 卡片显示“已结束”表示问答已收集完成，不代表原生模型已读取答案；仍在执行的旧版 runner 会在空闲边界升级，新投递策略适用于支持定向输入的新提问。
 
 异步提问支持单选项、重复标签与任意非空题数组。真人轮按现有 canTalk 权限发卡，注册时冻结唯一答复人，后来插话或来源记录淘汰不改变答复权；定时/自治轮通过来源授权后允许 canTalk 成员代答，定时任务创建者仍需 canOperate 权限，silent 定时任务不弹卡。文档评论轮沿用经校验的原评论人私信投递，只有原评论人可答；答案产生的新轮次保留原文档评论回复位置，不借用后来的评论或会话 owner。
 

@@ -78,7 +78,7 @@
 | `requestId` | | 调用方请求 id，写进调用日志 |
 | `receivedAt` | | 上游收到事件的时间 |
 
-> ⚠️ **`source.type` 不做任何校验**——任意字符串都能通过。真正影响行为的只有两个值：`headless`（走本机 CLI 的 headless 分支，渲染另一套提示块）与 `vc_meeting`（事件 JSON 紧凑渲染）。普通外部调用**一律填 `"webhook"`**，别指望其它值带来差异。
+> ⚠️ **`source.type` 按枚举校验**：只接受上表六个值（`webhook` / `ui` / `workflow` / `schedule` / `vc_meeting` / `headless`），其它字符串（包括笔误）在入口直接返回 400 `bad_request`。真正影响行为的只有两个值：`headless`（走本机 CLI 的 headless 分支，渲染另一套提示块）与 `vc_meeting`（事件 JSON 紧凑渲染）。普通外部调用**一律填 `"webhook"`**。
 
 ### 3.2 `target`
 
@@ -136,7 +136,7 @@
 - `model` 是该 CLI 的模型 id；`reasoningEffort` 按 CLI/模型能力校验，未配置或未知模型只开放公共安全档位，明确不支持时 400。
 - **仅新建会话生效**：折叠进已有 worker 的续轮不改写。
 - `model` **只驻内存、不落盘**：daemon 重启后按机器人配置的模型启动；`reasoningEffort` 仍随会话持久化。
-- 目标机器人不是 codex/codex-app/traex/grok 时这两个字段被忽略（不会改动 Claude/Gemini/CoCo 等的模型）。
+- 目标机器人不是 codex/codex-app/traex/grok 时这两个字段被忽略（不会改动 Claude/Antigravity/CoCo 等的模型）。
 
 **⚠️ 三个陷阱字段（类型里有，但和你想的不一样）**
 
@@ -707,7 +707,7 @@ async function getTriggerResult(sessionId: string) {
 
 - **`chat_not_allowed` 在本端点映射成 500**（§11.3），与 webhook 接入点的 403 不一致。
 
-- **`source.type` 不校验**（§3.1）；`envelope.format`、`options.dedupKey`、`options.status` 均无读取方（§3.5）。
+- **`envelope.format`、`options.dedupKey`、`options.status` 均无读取方**（§3.5）。`source.type` 不在此列：它已按枚举校验，非法值 400（§3.1）。
 
 ---
 

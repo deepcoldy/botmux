@@ -34,8 +34,8 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
   const bridgePatch = () => (cachedBridge ??= ensureDshQuestionBridgePatch({ cliId: 'dsh' }));
   return {
     id: 'dsh',
-    // The runner reads ~/.dsh/settings.yaml + .credentials.yaml and writes
-    // its generated composition + sessions under ~/.dsh/botmux/ and
+    // The runner reads the composed profile + .credentials.yaml and writes
+    // its generated composition + sessions under ~/.dsh/profiles/ and
     // ~/.dsh/sessions/botmux/. Keep the whole native dsh home REAL under the
     // file sandbox so both survive (see adapters CLAUDE.md sandbox notes).
     // Pre-created in buildArgs so the sandbox's keepExisting filter doesn't

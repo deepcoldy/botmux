@@ -95,6 +95,9 @@ export interface RemoteRunnerUsageSnapshot {
   tokens: {
     in: number;
     out: number;
+    /** Optional cumulative cache reads / writes, both subsets of `in`. */
+    cacheReadTokens?: number;
+    cacheCreateTokens?: number;
   } | null;
   turnTokens?: {
     in: number;
@@ -122,7 +125,7 @@ export interface RemoteRunnerTrustedCaller {
     openId: string;
     unionId: string;
     email: string;
-    source: 'platform_team';
+    source: 'bot_config';
   };
 }
 
@@ -406,6 +409,12 @@ const PROVIDER_RE = /^[a-z][a-z0-9._-]{0,63}$/;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ERROR_CODE_RE = /^[a-z][a-z0-9._-]{0,127}$/;
+const CLI_FLAG_SHAPED_VALUE_RE = /^--?\w/;
+
+export function isCliFlagShapedRemoteRunnerValue(value: string): boolean {
+  return CLI_FLAG_SHAPED_VALUE_RE.test(value.trim());
+}
+
 export const MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES = 32 * 1024;
 export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGES = 4;
 export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -512,8 +521,8 @@ function normalizeBotOwner(value: unknown): RemoteRunnerTrustedCaller['botOwner'
   const unionId = nonEmptyString(raw?.unionId, 256);
   const email = nonEmptyString(raw?.email, 320)?.toLowerCase();
   if (!raw || !openId?.startsWith('ou_') || !unionId?.startsWith('on_')
-      || !email || !email.includes('@') || raw.source !== 'platform_team') return null;
-  return { openId, unionId, email, source: 'platform_team' };
+      || !email || !email.includes('@') || raw.source !== 'bot_config') return null;
+  return { openId, unionId, email, source: 'bot_config' };
 }
 
 function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | undefined {
@@ -571,6 +580,22 @@ function normalizeTokenPair(value: unknown): { in: number; out: number } | undef
   return { in: input, out: output };
 }
 
+/** Cumulative tokens: the in/out pair plus optional cache counters. A cache
+ *  counter that is present must be a non-negative integer no larger than `in`;
+ *  otherwise the whole snapshot is rejected, like any other malformed metric. */
+function normalizeCumulativeTokens(value: unknown): RemoteRunnerUsageSnapshot['tokens'] | undefined {
+  const tokens: RemoteRunnerUsageSnapshot['tokens'] | undefined = normalizeTokenPair(value);
+  if (!tokens) return undefined;
+  const raw = record(value)!;
+  for (const key of ['cacheReadTokens', 'cacheCreateTokens'] as const) {
+    if (raw[key] === undefined) continue;
+    const count = nonNegativeInteger(raw[key]);
+    if (count === undefined || count > tokens.in) return undefined;
+    tokens[key] = count;
+  }
+  return tokens;
+}
+
 export function normalizeRemoteRunnerUsageReport(
   value: unknown,
 ): RemoteRunnerUsageReport | undefined {
@@ -609,7 +634,7 @@ export function normalizeRemoteRunnerUsageReport(
   if (snapshotRaw.tokens === null) {
     tokens = null;
   } else {
-    tokens = normalizeTokenPair(snapshotRaw.tokens) ?? null;
+    tokens = normalizeCumulativeTokens(snapshotRaw.tokens) ?? null;
     if (tokens === null) return undefined;
   }
 
@@ -969,7 +994,10 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       : (Array.isArray(raw.mentions)
         && raw.mentions.length > 0
         && raw.mentions.every(value => (
-          typeof value === 'string' && value.trim() !== '' && !value.includes('\0')
+          typeof value === 'string'
+          && value.trim() !== ''
+          && !value.includes('\0')
+          && !isCliFlagShapedRemoteRunnerValue(value)
         ))
         && Buffer.byteLength(raw.mentions.join('\0'), 'utf8')
           <= MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES

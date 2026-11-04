@@ -84,12 +84,14 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 const sessionReplyMock = vi.fn(async () => 'om_reply');
 const recordCompletedMock = vi.fn();
 const recordTerminalFailureStrictMock = vi.fn(() => 'written_failed');
+const recordInterruptedStrictMock = vi.fn(() => 'written_failed');
 vi.mock('../src/services/async-trigger-store.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/services/async-trigger-store.js')>();
   return {
     ...actual,
     recordCompleted: (...args: any[]) => recordCompletedMock(...args),
     recordTerminalFailureStrict: (...args: any[]) => recordTerminalFailureStrictMock(...args),
+    recordInterruptedStrict: (...args: any[]) => recordInterruptedStrictMock(...args),
   };
 });
 
@@ -188,6 +190,21 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     } as any);
   });
   afterEach(() => { vi.clearAllMocks(); });
+
+  it('settles a native cancellation as interrupted without fabricating completed output', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['turn-cancelled', { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([['turn-cancelled', { workerGeneration: 1 } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', terminalMsg('turn-cancelled', { status: 'cancelled', errorCode: 'cancelled' }));
+    await vi.waitFor(() => expect(recordInterruptedStrictMock).toHaveBeenCalledWith(
+      'sid-async-settle', 'turn-cancelled', expect.any(Number), 'app_test',
+    ));
+    expect(ds.asyncTriggerResults.get('turn-cancelled')).toMatchObject({ status: 'interrupted', interruptedAt: expect.any(Number) });
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(recordTerminalFailureStrictMock).not.toHaveBeenCalled();
+    expect(ds.idempotentAsyncTurns.has('turn-cancelled')).toBe(false);
+  });
 
   it('settles a pending async result to completed+empty on a nothing_to_send terminal', async () => {
     const ds = makeDs();

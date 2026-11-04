@@ -163,7 +163,10 @@ export interface BackendTurnFailure {
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  // New tmux targets freeze the server (`-L <socketName>`, see tmux-socket.ts);
+  // a tmux target without it lives on the default server (every older row).
+  | { backendType: 'tmux'; sessionName: string; socketName?: string }
+  | { backendType: 'zellij'; sessionName: string }
   // New ZMX targets freeze the native socket directory; older rows may omit it.
   | { backendType: 'zmx'; sessionName: string; socketDir?: string }
   | {
@@ -207,6 +210,34 @@ export interface SpawnOpts {
    * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
    */
   injectEnv?: Record<string, string>;
+  /**
+   * Inherited variables the session env overlay removes (core/session-env.ts).
+   * The worker already deleted them from `env`; the shell-wrapped backends
+   * (tmux/zellij/zmx) additionally pass `-u KEY` to the pane's final
+   * `/usr/bin/env`, which runs after the rcfile and the terminal server's
+   * global env have been applied, so those sources cannot re-add them.
+   */
+  unsetEnv?: string[];
+  /**
+   * The git `-c` pairs (config KEY/VALUE contents) botmux authored for THIS
+   * turn, e.g. the trigger-user credential helper + URL rewrites from
+   * gitIdentityConfigPairs. Shell-wrapped backends publish exactly this set
+   * into the pane as numbered `GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>` with
+   * `GIT_CONFIG_COUNT` set to its length, renumbered from 0. The environment
+   * is NEVER scanned for numbered git config entries: ambient or per-bot
+   * `GIT_CONFIG_*` values (high indices, gaps, forged names, a stale or
+   * pushed-up count) cannot reach git in the pane this way. Empty/undefined
+   * with an ambient count present makes the pane publish `GIT_CONFIG_COUNT=0`.
+   * Direct-exec backends (PTY, env -i strict panes) ignore this and consume
+   * the encoded entries the worker already placed in `env`.
+   */
+  gitConfigPairs?: ReadonlyArray<readonly [string, string]>;
+  /**
+   * Botmux-owned per-session directory (pane-launch.ts paneLaunchDir) for the
+   * private file a tmux pane reads its launch argv from. Without it the tmux
+   * backend uses a fresh private temp directory.
+   */
+  paneLaunchDir?: string;
   /** Strict panes launch with env -i and skip user shell startup profiles. */
   strictEnv?: boolean;
   /** Worker verified the surviving generation's policy stamp. */
@@ -317,6 +348,9 @@ export interface SessionBackend {
    */
   settleCurrentScreen?(): Promise<boolean>;
   captureViewport?(): string;
+  /** Fresh, bounded viewport read without blocking the Worker event loop.
+   * Returns plain text; rejects or returns empty when the viewport is unknown. */
+  captureViewportAsync?(): Promise<string>;
   /**
    * Plain current viewport plus the real terminal cursor. Adopt-mode input
    * guards use this to detect an unsubmitted local composer draft before a

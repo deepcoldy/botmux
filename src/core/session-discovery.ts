@@ -2,7 +2,7 @@
  * Session Discovery — scans tmux panes for running CLI processes that can be adopted.
  *
  * Discovers non-botmux tmux sessions running known CLI binaries (Claude Code,
- * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
+ * Codex, Aiden, CoCo, Cursor, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
  */
 import { execFileSync, execSync } from 'node:child_process';
 import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
@@ -13,11 +13,13 @@ import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
 import { readClaudeSessionMeta } from '../services/claude-transcript.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
+import { isZombieProcess } from './session-scope.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 import { herdrExecutable } from '../utils/herdr-executable.js';
 import { herdrPaneGrid } from '../utils/herdr-pane-grid.js';
+import { cleanLiveAdoptTitle } from '../utils/live-title.js';
 import { LSOF_EXEC_OPTIONS } from '../utils/process-open-files.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../utils/proc-stat.js';
@@ -50,6 +52,25 @@ export interface AdoptableSession {
    *  title from its state DB, same cleaning, unless the thread is botmux-origin
    *  (see traexLiveTitle). Absent → callers show the cwd basename. */
   title?: string;
+  /** Herdr workspace / tab holding the pane, copied from the `agent list` /
+   *  `pane list` records discovery already reads (no extra herdr call). */
+  herdrWorkspaceId?: string;
+  herdrTabId?: string;
+  /** Herdr: the manual pane label alone, cleaned like `title`. */
+  herdrPaneLabel?: string;
+  /** Herdr: the CLI's own title alone — the filtered Claude terminal title (it
+   *  already carries a `/rename` name or Claude's auto title) or the TraeX
+   *  thread title — cleaned like `title`. `title` = herdrPaneLabel ?? this. */
+  herdrNativeTitle?: string;
+  /** Herdr names resolved by the /adopt picker's live enrichment
+   *  (services/adopt-live-enrich), never by discovery. The tab pair is set
+   *  together, only when the tab was found. */
+  herdrWorkspaceLabel?: string;
+  herdrTabLabel?: string;
+  /** The tab label is herdr's position number, not a name the user gave it. */
+  herdrTabAutoNamed?: boolean;
+  /** Claude: the first real user prompt of the transcript, cleaned like `title`. */
+  herdrFirstPrompt?: string;
 }
 
 // ─── CLI process name → CliId mapping ────────────────────────────────────────
@@ -76,7 +97,6 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // TRAE（traex）是另一套 Codex 系 CLI，可执行就叫 `traex`，与上面 CoCo 的
   // traecli 别名是两个不同的二进制（traecli 是 coco 的软链）。
   traex: 'traex',
-  gemini: 'gemini',
   opencode: 'opencode',
   opencode2: 'opencode2',
   mimo: 'mimocode',
@@ -269,10 +289,14 @@ export function cliIdForComm(
 }
 
 /** /proc/<pid>/cmdline → argv (Linux fast path; ps fallback for macOS). */
-export function readCmdline(pid: number): string[] {
+export function readCmdline(pid: number, options: { exact?: boolean } = {}): string[] {
   try {
     return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').split('\0').filter(Boolean);
   } catch {
+    // `ps args` loses argv boundaries. It remains useful for executable
+    // discovery, but cannot distinguish a command from words inside a prompt
+    // or an option value (macOS and procfs-denied Linux).
+    if (options.exact) return [];
     try {
       const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], {
         encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
@@ -281,6 +305,37 @@ export function readCmdline(pid: number): string[] {
       return out.trim().split(/\s+/).filter(Boolean);
     } catch { return []; }
   }
+}
+
+const CODEX_VALUE_OPTIONS = new Set([
+  '-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox',
+  '-a', '--ask-for-approval', '-C', '--cd', '-i', '--image', '--add-dir',
+  '--enable', '--disable', '--local-provider', '--remote', '--remote-auth-token-env',
+]);
+const CODEX_NONINTERACTIVE_COMMANDS = new Set([
+  'debug', 'completion', 'exec', 'e', 'review', 'login', 'logout', 'mcp',
+  'mcp-server', 'app-server', 'exec-server', 'app', 'sandbox', 'apply', 'a',
+  'cloud', 'features', 'help', 'update', 'doctor', 'plugin', 'remote-control',
+  'queue', 'archive', 'unarchive', 'delete', 'migrate-rollouts', 'migrate-nfs-db',
+]);
+
+/** A wrapper may run a Codex metadata command before starting the actual TUI.
+ *  Inspect only the root command, skipping known option values: a model/profile
+ *  called "debug", or a prompt after `--`, must not look like a probe. Missing
+ *  argv retains the comm-based contract used when process inspection is denied. */
+export function isNonInteractiveCodexArgv(argv: string[]): boolean {
+  let interactiveSubcommand = false;
+  for (let index = 1; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') return false;
+    if (CODEX_VALUE_OPTIONS.has(arg)) { index++; continue; }
+    if (arg === '--help' || arg === '-h' || arg === '--version' || arg === '-V') return true;
+    if (arg.startsWith('-')) continue;
+    if (interactiveSubcommand) continue;
+    if (arg === 'resume' || arg === 'fork') { interactiveSubcommand = true; continue; }
+    return CODEX_NONINTERACTIVE_COMMANDS.has(arg);
+  }
+  return false;
 }
 
 /**
@@ -419,7 +474,7 @@ function clockTicksPerSecond(): number {
 /**
  * 进程启动时间（epoch ms），best-effort。让 /adopt 选择卡片能为**任意** CLI 显示
  * 真实运行时长，而不是只有 Claude（Claude 另有 ~/.claude/sessions/<pid>.json 带
- * startedAt）。其它 CLI（cursor/codex/coco/gemini…）之前一律落 "未知" 就是因为
+ * startedAt）。其它 CLI（cursor/codex/coco…）之前一律落 "未知" 就是因为
  * 这里没有兜底。
  *
  * Linux 走 /proc/<pid>/stat（字段 22 = starttime，单位时钟滴答，自开机起算）+
@@ -468,13 +523,24 @@ export function readProcessStartTime(pid: number): number | undefined {
  * 低频操作（只在用户 /adopt 时跑一遍）。
  */
 export function getChildPids(pid: number): number[] {
+  return snapshotChildPids()(pid);
+}
+
+/**
+ * Read the process table ONCE and answer "children of pid" from that copy.
+ * A BFS over a deep launch chain (sandbox launchers stack 7+ levels) calling
+ * {@link getChildPids} per node would fork `ps` once per visited process on
+ * every retry tick; a snapshot keeps it at one fork per walk. An unreadable
+ * table yields no children (same as getChildPids' failure mode).
+ */
+export function snapshotChildPids(): (pid: number) => number[] {
+  const byParent = new Map<number, number[]>();
   try {
     const out = execSync('ps -A -o pid= -o ppid=', {
       encoding: 'utf-8',
       maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const children: number[] = [];
     for (const line of out.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -482,21 +548,22 @@ export function getChildPids(pid: number): number[] {
       if (parts.length < 2) continue;
       const childPid = Number(parts[0]);
       const parentPid = Number(parts[1]);
-      if (!isNaN(childPid) && !isNaN(parentPid) && parentPid === pid) {
-        children.push(childPid);
-      }
+      if (isNaN(childPid) || isNaN(parentPid)) continue;
+      const siblings = byParent.get(parentPid);
+      if (siblings) siblings.push(childPid);
+      else byParent.set(parentPid, [childPid]);
     }
-    return children;
   } catch {
-    return [];
+    // ps unavailable: every lookup answers "no children".
   }
+  return pid => [...(byParent.get(pid) ?? [])];
 }
 
 /**
  * Recursively search the process tree (up to `maxDepth` levels) for a known CLI binary.
  * Returns { pid, cliId } of the first match, or undefined.
  */
-function findCliProcess(
+export function findCliProcess(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,
@@ -564,11 +631,12 @@ function hasCliProcess(
  * session-id discovery and leaves the JSONL bridge watching a path the real CLI
  * never writes. This walks the launcher's DESCENDANTS to find the actual CLI.
  *
- * Matching is by process `comm` ONLY — deliberately NOT argv. The launcher's own
+ * Executable matching is by process `comm`, not by searching argv. The launcher's own
  * argv carries the target name as a literal token (`aiden x claude` → "claude"
  * is in argv), so argv-scanning (cliIdFromCommArgv) would misidentify the
  * launcher itself as the CLI. The real CLI process has the binary as its comm
- * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`).
+ * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`). Codex
+ * additionally excludes noninteractive commands such as `debug models`.
  *
  * BFS starts at the launcher's children (never the launcher node) and returns
  * the shallowest descendant recognized as `targetCliId`, or null if none exists
@@ -579,11 +647,18 @@ export function findLaunchedCliPid(
   targetCliId: CliId,
   maxDepth = 6,
   // Injectable process probes (defaults hit the real OS); tests pass fakes.
-  probes: { childrenOf?: (pid: number) => number[]; commOf?: (pid: number) => string | undefined } = {},
+  probes: {
+    childrenOf?: (pid: number) => number[];
+    commOf?: (pid: number) => string | undefined;
+    cmdlineOf?: (pid: number) => string[];
+    isZombie?: (pid: number) => boolean;
+  } = {},
   filterExecutable?: string,
 ): number | null {
   const childrenOf = probes.childrenOf ?? getChildPids;
   const commOf = probes.commOf ?? readComm;
+  const cmdlineOf = probes.cmdlineOf ?? (pid => readCmdline(pid, { exact: true }));
+  const isZombie = probes.isZombie ?? isZombieProcess;
   let frontier = childrenOf(launcherPid);
   const seen = new Set<number>([launcherPid]);
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
@@ -592,7 +667,11 @@ export function findLaunchedCliPid(
       if (seen.has(pid)) continue;
       seen.add(pid);
       const comm = commOf(pid);
-      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) return pid;
+      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
+        if (targetCliId === 'codex'
+          && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
+        return pid;
+      }
       next.push(...childrenOf(pid));
     }
     frontier = next;
@@ -833,26 +912,6 @@ function herdrAgentSessionId(agent: any): string | undefined {
   return HERDR_SESSION_UUID_RE.exec(value)?.[1];
 }
 
-/** Same cap as resume (history) entry titles. */
-const LIVE_TITLE_MAX = 80;
-
-/** One line, no control characters or `<` / `>` (no tag-like text reaches any
- * downstream surface), at most 80 code points with a trailing `…` when cut.
- * Cuts by code point so a surrogate pair is never split. Shared by every live
- * display name (herdr label / Claude terminal title / TraeX native title). */
-function cleanLiveAdoptTitle(raw: unknown): string | undefined {
-  if (typeof raw !== 'string') return undefined;
-  const text = raw
-    .replace(/[\u0000-\u0008\u000e-\u001f\u007f-\u009f<>]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!text) return undefined;
-  const chars = Array.from(text);
-  return chars.length > LIVE_TITLE_MAX
-    ? `${chars.slice(0, LIVE_TITLE_MAX - 1).join('')}…`
-    : text;
-}
-
 /** Live display name for a TraeX pane: its native thread title from the state
  * DB — already origin-filtered by readTraexThreadTitle, so a botmux-spawned
  * thread yields undefined (cwd basename) instead of its Lark envelope — cleaned
@@ -862,20 +921,42 @@ export function traexLiveTitle(sessionId: string | undefined): string | undefine
   return sessionId ? cleanLiveAdoptTitle(readTraexThreadTitle(sessionId)) : undefined;
 }
 
-/** Display name for a herdr pane: the manual pane label (any CLI), else the
- * Claude terminal title unless it is generic (`Claude Code`, the CLI display
- * name, the herdr agent kind) or path-like. Other CLIs' terminal titles have
- * no known shape, so they never contribute. Missing fields (older herdr) →
- * undefined, and callers fall back to the cwd basename. */
-function herdrLiveTitle(label: unknown, terminalTitle: unknown, cliId: CliId, agentKind: unknown): string | undefined {
-  const fromLabel = cleanLiveAdoptTitle(label);
-  if (fromLabel) return fromLabel;
+/** The Claude terminal title unless it is generic (`Claude Code`, the CLI
+ * display name, the herdr agent kind) or path-like. Other CLIs' terminal titles
+ * have no known shape, so they never contribute. */
+function claudeTerminalTitle(terminalTitle: unknown, cliId: CliId, agentKind: unknown): string | undefined {
   if (cliId !== 'claude-code') return undefined;
   const title = cleanLiveAdoptTitle(terminalTitle);
   if (!title || title.startsWith('/') || title.startsWith('~')) return undefined;
   const generic = ['claude code', CLI_DISPLAY_NAMES[cliId].toLowerCase()];
   if (typeof agentKind === 'string') generic.push(agentKind.toLowerCase());
   return generic.includes(title.toLowerCase()) ? undefined : title;
+}
+
+/** Display fields for a herdr pane: the manual pane label (any CLI), the native
+ * title (Claude terminal title; TraeX thread title, only looked up when no label
+ * would win over it) and `title` = label ?? native title. Missing fields (older
+ * herdr) → no keys, and callers fall back to the cwd basename. */
+function herdrLiveTitleFields(
+  label: unknown,
+  terminalTitle: unknown,
+  cliId: CliId,
+  agentKind: unknown,
+  sessionId: string | undefined,
+): Pick<AdoptableSession, 'title' | 'herdrPaneLabel' | 'herdrNativeTitle'> {
+  const paneLabel = cleanLiveAdoptTitle(label);
+  const nativeTitle = claudeTerminalTitle(terminalTitle, cliId, agentKind)
+    ?? (!paneLabel && cliId === 'traex' ? traexLiveTitle(sessionId) : undefined);
+  const title = paneLabel ?? nativeTitle;
+  return {
+    ...(title ? { title } : {}),
+    ...(paneLabel ? { herdrPaneLabel: paneLabel } : {}),
+    ...(nativeTitle ? { herdrNativeTitle: nativeTitle } : {}),
+  };
+}
+
+function herdrIdField(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined;
 }
 
 function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: string): AdoptableSession[] {
@@ -926,12 +1007,15 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         : undefined;
       const grid = herdrPaneGrid(rawInfo);
       const pane = paneById.get(paneId);
-      const title = herdrLiveTitle(
+      const workspaceId = herdrIdField(agent?.workspace_id) ?? herdrIdField(pane?.workspace_id);
+      const tabId = herdrIdField(agent?.tab_id) ?? herdrIdField(pane?.tab_id);
+      const titleFields = herdrLiveTitleFields(
         pane?.label,
         typeof agent?.terminal_title_stripped === 'string' ? agent.terminal_title_stripped : pane?.terminal_title_stripped,
         cliId,
         agent?.agent,
-      ) ?? (cliId === 'traex' ? traexLiveTitle(sessionId) : undefined);
+        sessionId,
+      );
       discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
@@ -948,7 +1032,9 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         // Herdr's CLI reports no terminal width; the pane PTY is the source.
         paneCols: grid?.cols ?? 200,
         paneRows: grid?.rows ?? 50,
-        ...(title ? { title } : {}),
+        ...(workspaceId ? { herdrWorkspaceId: workspaceId } : {}),
+        ...(tabId ? { herdrTabId: tabId } : {}),
+        ...titleFields,
       });
     }
 
@@ -972,8 +1058,9 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       else if (process.cliId === 'coco') sessionId = findCocoSessionByPid(process.pid)?.sessionId;
       const claudeMeta = process.cliId === 'claude-code' ? readClaudeSessionMeta(process.pid) : undefined;
       const grid = herdrPaneGrid(rawInfo);
-      const title = herdrLiveTitle(pane?.label, pane?.terminal_title_stripped, process.cliId, pane?.agent)
-        ?? (process.cliId === 'traex' ? traexLiveTitle(sessionId) : undefined);
+      const workspaceId = herdrIdField(pane?.workspace_id);
+      const tabId = herdrIdField(pane?.tab_id);
+      const titleFields = herdrLiveTitleFields(pane?.label, pane?.terminal_title_stripped, process.cliId, pane?.agent, sessionId);
       results.push({
         source: 'herdr',
         herdrSessionName: sessionName,
@@ -988,7 +1075,9 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         startedAt: claudeMeta?.startedAt ?? readProcessStartTime(process.pid),
         paneCols: grid?.cols ?? 200,
         paneRows: grid?.rows ?? 50,
-        ...(title ? { title } : {}),
+        ...(workspaceId ? { herdrWorkspaceId: workspaceId } : {}),
+        ...(tabId ? { herdrTabId: tabId } : {}),
+        ...titleFields,
       });
     }
   }
@@ -1114,7 +1203,7 @@ function resolveAdoptableSessionForPane(
 
   // 5b. Fall back to the CLI process's own start time for uptime. Without
   // this only Claude (which has a session JSON with startedAt) shows a real
-  // uptime; every other CLI — cursor/codex/coco/gemini… — rendered "未知".
+  // uptime; every other CLI — cursor/codex/coco… — rendered "未知".
   if (startedAt === undefined) {
     startedAt = readProcessStartTime(cliPid);
   }

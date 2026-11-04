@@ -53,6 +53,8 @@ function usage(): void {
 Commands:
   tat-gate   Verify bot identity can read real transcript/chat items from a meeting
   poll       Run the P0 polling bridge and print stable meeting-state JSON
+  share-summary
+             Share minutes to the destination authorized by the current human IM command
   request-output
              Ask the daemon to review/send a meeting agent text or voice output
   speak      Speak one TTS utterance into an active meeting via realtime voice
@@ -89,6 +91,26 @@ function resolveMeetingId(args: string[], opts: { allowJoin?: boolean } = {}): {
     profile: argValue(args, '--profile'),
   });
   return { meetingId: joined.meetingId, joined: true };
+}
+
+async function cmdShareSummary(args: string[]): Promise<void> {
+  const content = argValue(args, '--content');
+  if (!content || argValue(args, '--chat-id')) throw new Error('use --content only; destination is frozen by the human sharing command');
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  const appId = process.env.BOTMUX_LARK_APP_ID;
+  if (!sessionId || !appId) throw new Error('human receiver turn required');
+  const proof = readManagedOriginCapability(config.session.dataDir, sessionId,
+    process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID);
+  if (!proof?.capability) throw new Error('live origin capability unavailable');
+  const daemon = findOnlineDaemon(appId);
+  if (!daemon) throw new Error('receiver daemon offline');
+  const response = await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}/api/vc-meetings/share-summary`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ receiverSessionId: sessionId, originCapability: proof.capability, content }),
+  });
+  const result = await response.json();
+  console.log(JSON.stringify(result, null, 2));
+  if (!response.ok) process.exit(2);
 }
 
 async function cmdTatGate(args: string[]): Promise<void> {
@@ -399,6 +421,10 @@ export async function cmdVcAgent(command: string, args: string[]): Promise<void>
     }
     if (command === 'poll') {
       await cmdPoll(args);
+      return;
+    }
+    if (command === 'share-summary') {
+      await cmdShareSummary(args);
       return;
     }
     if (command === 'request-output') {

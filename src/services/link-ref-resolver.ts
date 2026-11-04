@@ -1,9 +1,10 @@
 import type { LinkRefLedger } from './link-ref-ledger.js';
+import { enforceFinalLinkIntegrity, type LinkIntegrityResponseKind } from './final-link-integrity.js';
+import { markdownLiteralRanges } from './markdown-literal-ranges.js';
 import { LinkRefError, type LinkRefTurnKey } from './link-ref-types.js';
 
 const LINK_REF_SOURCE = String.raw`\{\{botmux_link:(lr_[0-9a-f]{32})\}\}`;
 const LINK_REF_PATTERN = new RegExp(LINK_REF_SOURCE, 'g');
-const FENCE_PATTERN = /^( {0,3})(`{3,}|~{3,})(.*)$/u;
 
 interface RefSpan {
   start: number;
@@ -29,126 +30,9 @@ export interface ResolvedOutboundLinkRefs extends OutboundLinkRefPayload {
   refCount: number;
 }
 
-function countRun(text: string, index: number, char: '`'): number {
-  let end = index;
-  while (text[end] === char) end += 1;
-  return end - index;
-}
-
-function lineEnd(text: string, index: number): number {
-  const newline = text.indexOf('\n', index);
-  return newline < 0 ? text.length : newline;
-}
-
-interface LiteralRange {
-  start: number;
-  end: number;
-}
-
-interface FenceLine {
-  start: number;
-  end: number;
-  char: '`' | '~';
-  runLength: number;
-  canClose: boolean;
-}
-
-function fencedLiteralRanges(text: string): LiteralRange[] {
-  const fences: FenceLine[] = [];
-  for (let offset = 0; offset < text.length;) {
-    const end = lineEnd(text, offset);
-    const contentEnd = end > offset && text[end - 1] === '\r' ? end - 1 : end;
-    const fence = FENCE_PATTERN.exec(text.slice(offset, contentEnd));
-    if (fence) {
-      const run = fence[2]!;
-      fences.push({
-        start: offset,
-        end,
-        char: run[0] as '`' | '~',
-        runLength: run.length,
-        canClose: fence[3]!.trim() === '',
-      });
-    }
-    offset = end < text.length ? end + 1 : end;
-  }
-
-  const closerByFence = new Array<number | undefined>(fences.length);
-  const nearestCloser = {
-    '`': [] as Array<number | undefined>,
-    '~': [] as Array<number | undefined>,
-  };
-  for (let index = fences.length - 1; index >= 0; index -= 1) {
-    const fence = fences[index]!;
-    const nearestForChar = nearestCloser[fence.char];
-    closerByFence[index] = nearestForChar[fence.runLength];
-    if (fence.canClose) {
-      for (let runLength = 3; runLength <= fence.runLength; runLength += 1) {
-        nearestForChar[runLength] = index;
-      }
-    }
-  }
-
-  const ranges: LiteralRange[] = [];
-  for (let index = 0; index < fences.length;) {
-    const closeIndex = closerByFence[index];
-    if (closeIndex === undefined) {
-      // An unmatched opener is ordinary model output, not a license to hide
-      // every LinkRef that follows it.
-      index += 1;
-      continue;
-    }
-    ranges.push({ start: fences[index]!.start, end: fences[closeIndex]!.end });
-    index = closeIndex + 1;
-  }
-  return ranges;
-}
-
-function inlineLiteralRanges(text: string, fenced: readonly LiteralRange[]): LiteralRange[] {
-  const ranges: LiteralRange[] = [];
-  let fenceIndex = 0;
-  for (let offset = 0; offset < text.length;) {
-    const end = lineEnd(text, offset);
-    while (fenceIndex < fenced.length && fenced[fenceIndex]!.end < offset) fenceIndex += 1;
-    if (fenced[fenceIndex]?.start === offset) {
-      offset = fenced[fenceIndex]!.end < text.length ? fenced[fenceIndex]!.end + 1 : text.length;
-      fenceIndex += 1;
-      continue;
-    }
-    for (let index = offset; index < end;) {
-      if (text[index] !== '`') {
-        index += 1;
-        continue;
-      }
-      const run = countRun(text, index, '`');
-      let close = index + run;
-      while (close < end) {
-        if (text[close] !== '`') {
-          close += 1;
-          continue;
-        }
-        const closeRun = countRun(text, close, '`');
-        if (closeRun === run) break;
-        close += closeRun;
-      }
-      if (close >= end) {
-        // CommonMark code spans do not cross a line. Leave an unmatched run
-        // unprotected so a later LinkRef is still executable.
-        index += run;
-        continue;
-      }
-      ranges.push({ start: index, end: close + run });
-      index = close + run;
-    }
-    offset = end < text.length ? end + 1 : end;
-  }
-  return ranges;
-}
-
 function tokenize(text: string): RefSpan[] {
   const spans: RefSpan[] = [];
-  const fenced = fencedLiteralRanges(text);
-  const literals = [...fenced, ...inlineLiteralRanges(text, fenced)]
-    .sort((left, right) => left.start - right.start);
+  const literals = markdownLiteralRanges(text);
   let literalIndex = 0;
   LINK_REF_PATTERN.lastIndex = 0;
   for (let match = LINK_REF_PATTERN.exec(text); match; match = LINK_REF_PATTERN.exec(text)) {
@@ -262,8 +146,26 @@ export function resolveOutboundLinkRefs(
   ledger: LinkRefLedger,
   key: LinkRefTurnKey,
   payload: OutboundLinkRefPayload,
+  responseKind?: LinkIntegrityResponseKind,
 ): ResolvedOutboundLinkRefs {
   const refIds = findOutboundExecutableLinkRefs(payload);
   const resolved = refIds.length === 0 ? new Map<string, string>() : ledger.resolveBatch(key, refIds);
-  return expandOutboundLinkRefs(payload, resolved);
+  const expanded = expandOutboundLinkRefs(payload, resolved);
+  enforceFinalLinkIntegrity({
+    payload: expanded,
+    responseKind,
+    registeredUrls: () => {
+      try {
+        return ledger.listRegistered(key).map(entry => entry.originalUrl);
+      } catch (error) {
+        // Registration is deliberately fail-open. Missing and expired rows
+        // mean there are no usable registered source URLs to compare, while a
+        // genuinely unavailable ledger still fails closed.
+        if (error instanceof LinkRefError
+          && (error.code === 'link_ref_turn_missing' || error.code === 'link_ref_expired')) return [];
+        throw error;
+      }
+    },
+  });
+  return expanded;
 }

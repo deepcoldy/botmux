@@ -55,10 +55,17 @@ import {
 import { isValidRunId } from './ops-projection.js';
 import { readJournal } from './journal.js';
 import { materialize } from './state.js';
-import { readGrillState } from './grill-state.js';
+import { readGrillState, type RunChatBinding } from './grill-state.js';
 import { loadDag } from './dag-loader.js';
 import { validateSpec } from './spec.js';
-import { parseFrozenBotSnapshots } from './bot-resolve.js';
+import { freezeDagBotSnapshots, parseFrozenBotSnapshots } from './bot-resolve.js';
+import type { V3Dag } from './dag.js';
+import {
+  resolveV3NodeExecutor,
+  v3BotExecutorTargets,
+  type V3NodeExecutorPolicy,
+  type V3NodeExecutorResolution,
+} from './node-executor-mode.js';
 
 export interface SavedWorkflowActorContext {
   actor: SavedWorkflowOwner;
@@ -67,6 +74,10 @@ export interface SavedWorkflowActorContext {
   chatType?: 'group' | 'p2p';
   rootMessageId?: string;
   sessionId?: string;
+  /** The current turn was opened by `actor`'s own message (not a scheduled
+   *  task or another synthetic turn). Only such a turn may freeze the actor
+   *  as a run initiator for 交接带发起人身份 (design §10.2). */
+  humanTurn?: boolean;
 }
 
 export type SavedWorkflowServiceErrorCode =
@@ -81,7 +92,9 @@ export type SavedWorkflowServiceErrorCode =
   | 'scope_mismatch'
   | 'not_found'
   | 'ambiguous'
-  | 'not_published';
+  | 'not_published'
+  /** Bot execution is on but a node's bot fails §6.1 (design §6.3). */
+  | 'executor_ineligible';
 
 /** Structured detail for `source_not_terminal`, so callers never string-match
  *  the message. `waitingNode` is set when the run is parked on a human gate. */
@@ -141,6 +154,9 @@ export type SaveTerminalRunAsWorkflowIdempotentInput =
 export interface SaveTerminalRunAsWorkflowResult extends SavedWorkflowWriteResult {
   sourceStatus: 'succeeded' | 'failed' | 'blocked';
   created: boolean;
+  /** Runtime flow revisions in the source run; the saved definition is its
+   *  final effective flow (design §13.8). */
+  runtimeRevisions: number;
 }
 
 /**
@@ -301,6 +317,9 @@ export interface InstantiatePublishedSavedWorkflowInput {
   baseDir: string;
   runId?: string;
   now?: Date;
+  /** Experimental node executor decision (design §6.3). Omitted = today's
+   *  ephemeral execution without consulting any switch. */
+  nodeExecutorPolicy?: V3NodeExecutorPolicy;
 }
 
 export interface ResolveOwnedTerminalRunInput {
@@ -560,7 +579,7 @@ export async function saveTerminalRunAsWorkflow(
       expectedLatestRevision: input.expectedLatestRevision,
       now: input.now,
     });
-    return { ...written, sourceStatus: compiled.sourceStatus, created: false };
+    return { ...written, sourceStatus: compiled.sourceStatus, created: false, runtimeRevisions: compiled.runtimeRevisions };
   }
 
   const scope: SavedWorkflowScope = input.scope === 'global'
@@ -575,7 +594,7 @@ export async function saveTerminalRunAsWorkflow(
     publish: compiled.publish,
     now: input.now,
   });
-  return { ...written, sourceStatus: compiled.sourceStatus, created: true };
+  return { ...written, sourceStatus: compiled.sourceStatus, created: true, runtimeRevisions: compiled.runtimeRevisions };
 }
 
 /**
@@ -611,7 +630,12 @@ export async function saveTerminalRunAsWorkflowIdempotent(
     context,
     now: input.now,
   });
-  return { ...written, sourceStatus: compiled.sourceStatus, created: written.created };
+  return {
+    ...written,
+    sourceStatus: compiled.sourceStatus,
+    created: written.created,
+    runtimeRevisions: compiled.runtimeRevisions,
+  };
 }
 
 /** List the current chat's workflows plus global workflows. */
@@ -701,7 +725,7 @@ export async function loadVisibleSavedWorkflow(
 /** Resolve the active revision and atomically materialize a fresh authorized run. */
 export async function instantiatePublishedSavedWorkflow(
   input: InstantiatePublishedSavedWorkflowInput,
-): Promise<MaterializedSavedWorkflowRun> {
+): Promise<MaterializedSavedWorkflowRun & { executorNote?: string }> {
   const context = requireActorContext(input.context, { requireChat: true });
   const resolved = await resolveVisibleSavedWorkflow({
     dataDir: input.dataDir,
@@ -742,26 +766,49 @@ export async function instantiatePublishedSavedWorkflow(
     );
   }
 
-  return materializeSavedWorkflowRun({
+  const chatBinding: RunChatBinding = {
+    larkAppId: context.actor.larkAppId,
+    chatId: context.chatId!,
+    ...(context.chatType ? { chatType: context.chatType } : {}),
+    ...(context.rootMessageId ? { rootMessageId: context.rootMessageId } : {}),
+    ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+    ownerOpenId: context.actor.openId,
+  };
+  const executor: V3NodeExecutorResolution = input.nodeExecutorPolicy
+    ? await resolveV3NodeExecutor({
+        policy: input.nodeExecutorPolicy,
+        binding: chatBinding,
+        humanTurn: context.humanTurn === true,
+        targetsFor: (binding) => {
+          // Same freeze the materializer applies for a bot run.
+          const templateDag = { runId: 'executor-plan', nodes: current.revision.payload.dagTemplate.nodes } as V3Dag;
+          return v3BotExecutorTargets(templateDag, freezeDagBotSnapshots(templateDag, input.bots, {
+            defaultSelector: binding.larkAppId,
+          }));
+        },
+      })
+    : { kind: 'ephemeral' };
+  if (executor.kind === 'refused') {
+    throw new SavedWorkflowServiceError('executor_ineligible', executor.message);
+  }
+
+  const materialized = materializeSavedWorkflowRun({
     metadata: current.metadata,
     revision: current.revision,
     rawParams: input.rawParams,
     context: {
       initiatorOpenId: context.actor.openId,
-      chatBinding: {
-        larkAppId: context.actor.larkAppId,
-        chatId: context.chatId!,
-        ...(context.chatType ? { chatType: context.chatType } : {}),
-        ...(context.rootMessageId ? { rootMessageId: context.rootMessageId } : {}),
-        ...(context.sessionId ? { sessionId: context.sessionId } : {}),
-        ownerOpenId: context.actor.openId,
-      },
+      chatBinding,
     },
     bots: input.bots,
     baseDir: input.baseDir,
     runId: input.runId,
     now: input.now,
+    ...(executor.kind === 'bot' ? { nodeExecutor: 'bot' as const } : {}),
+    ...(executor.kind === 'bot' && executor.handoffIdentity ? { handoffIdentity: executor.handoffIdentity } : {}),
   });
+  const executorNote = executor.kind === 'bot' ? executor.summary : executor.note;
+  return executorNote ? { ...materialized, executorNote } : materialized;
 }
 
 function requireActorContext(

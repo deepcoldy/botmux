@@ -13,6 +13,7 @@ import {
   isValidConnectorLifecycleGroupNameTemplate,
 } from '../../services/connector-lifecycle-group-name.js';
 import { SearchableGroupPicker } from './searchable-group-picker.js';
+import { BotPickerChips } from './bot-picker-chips.js';
 
 interface Connector {
   id: string;
@@ -308,39 +309,11 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       .map(id => additionalBotOptions.find(bot => bot.larkAppId === id))
       .filter((bot): bot is BotOpt => Boolean(bot));
     if (!selected.length) return undefined;
-    const visible = selected.slice(0, 4);
-    const overflow = selected.length - visible.length;
-    const botLabel = (bot: BotOpt) => bot.botName || bot.larkAppId;
-    const botTitle = (bot: BotOpt) => `${botLabel(bot)} (${bot.larkAppId})`;
-    const unselectBot = (event: React.MouseEvent, larkAppId: string) => {
-      event.preventDefault();
-      event.stopPropagation();
-      setForm(cur => ({ ...cur, additionalBotIds: cur.additionalBotIds.filter(id => id !== larkAppId) }));
-    };
     return (
-      <span className="connector-bot-picker-chips">
-        {visible.map(bot => (
-          <span key={bot.larkAppId} className="connector-bot-picker-chip" data-full={botTitle(bot)} title={botTitle(bot)}>
-            <span className="connector-bot-picker-chip-label">{botLabel(bot)}</span>
-            <span
-              className="connector-bot-picker-chip-remove"
-              aria-label={`取消选择 ${botLabel(bot)}`}
-              onClick={event => unselectBot(event, bot.larkAppId)}
-            >
-              &times;
-            </span>
-          </span>
-        ))}
-        {overflow > 0 ? (
-          <span
-            className="connector-bot-picker-chip connector-bot-picker-chip-overflow"
-            data-full={selected.slice(4).map(botTitle).join('\n')}
-            title={selected.slice(4).map(botTitle).join('\n')}
-          >
-            <span className="connector-bot-picker-chip-label">+{overflow}</span>
-          </span>
-        ) : null}
-      </span>
+      <BotPickerChips
+        bots={selected}
+        onRemove={larkAppId => setForm(cur => ({ ...cur, additionalBotIds: cur.additionalBotIds.filter(id => id !== larkAppId) }))}
+      />
     );
   }, [additionalBotOptions, form.additionalBotIds]);
   const botOptions = useMemo(

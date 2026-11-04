@@ -154,12 +154,117 @@ export function getTmuxVersionCached(): TmuxVersion | null {
   return version;
 }
 
+/**
+ * Force a fresh `tmux -V` probe, bypassing the short null-result TTL.
+ *
+ * The cached getter deliberately serves `null` for a few seconds after a failed
+ * probe; that is right for hot paths, but session creation is a once-per-session
+ * decision — without a re-probe, a single transient `tmux -V` timeout on a
+ * modern host would downgrade that ENTIRE session's crash exit-code channel
+ * even though the binary is fine (`tmux -V` answers in ~2ms normally). At a
+ * session-start boundary it is worth re-asking once. Never throws.
+ */
+export function refreshTmuxVersion(): TmuxVersion | null {
+  cachedTmuxVersion = undefined;
+  cachedTmuxVersionNullAt = 0;
+  return getTmuxVersionCached();
+}
+
 /** Version comparison: true iff `version` is a known release >= major.minor.
  *  Deliberately false for null (unknown) — callers keep legacy behaviour on an
  *  unknown version rather than silently skipping commands. */
 export function tmuxVersionAtLeast(version: TmuxVersion | null, major: number, minor: number): boolean {
   if (!version) return false;
   return version.major > major || (version.major === major && version.minor >= minor);
+}
+
+/**
+ * Minimum tmux that accepts the `failed` value for the `remain-on-exit` window
+ * option. CHANGES (3.1c → 3.2 block): "Add a value for remain-on-exit that
+ * only keeps the pane if the program failed". tmux 3.1c and older reject it
+ * with `bad value: failed`, which (because we chain it atomically into
+ * new-session) makes every new session fail to start — a v3.53.0 regression on
+ * Debian's tmux 3.1c.
+ */
+export const TMUX_REMAIN_ON_EXIT_FAILED: TmuxVersion = { major: 3, minor: 2 };
+
+/** Whether this tmux supports `set-option remain-on-exit failed`. Unknown
+ *  version is false on purpose: skipping the option keeps the pre-#2164 default
+ *  (sessions always start; crash exit-code semantics just degrade), while
+ *  sending it to an old tmux blocks session creation entirely. */
+export function tmuxSupportsRemainOnExitFailed(version: TmuxVersion | null): boolean {
+  return tmuxVersionAtLeast(version, TMUX_REMAIN_ON_EXIT_FAILED.major, TMUX_REMAIN_ON_EXIT_FAILED.minor);
+}
+
+/**
+ * Resolve the tmux version for a ONCE-PER-SESSION decision boundary (new-session
+ * argv, reattached-session option reapply, the worker startup self-check):
+ * serve the process-lifetime cache; when it holds a recent failed probe (null
+ * inside its short TTL), force exactly one fresh `tmux -V` before deciding, so a
+ * single transient probe timeout on a modern host does not downgrade that whole
+ * session's exit-code channel. The guarantee is scoped to THIS call: it does not
+ * pin two separate boundaries to the same answer — two consecutive unreadable
+ * probes followed by a successful one still let a later boundary decide
+ * differently than an earlier one (e.g. the one-shot startup log can read
+ * "degraded" while a subsequent session starts with the breaker enabled). A
+ * version that is still unreadable after the re-probe stays null and every
+ * caller fails closed (see tmuxSupportsRemainOnExitFailed). Never throws.
+ */
+export function resolveTmuxVersionAtSessionBoundary(): TmuxVersion | null {
+  const cached = getTmuxVersionCached();
+  return cached === null ? refreshTmuxVersion() : cached;
+}
+
+/**
+ * Version of the tmux SERVER currently answering `socketArgs` (`[]` = the
+ * default server), as reported by `display-message -p '#{version}'`. Commands
+ * and option values are parsed by that server, which can be older than the
+ * `tmux` binary on PATH: a package upgrade leaves the shared server running the
+ * old process until it restarts (a daemon restart only reattaches).
+ *
+ * When no server is running on the socket, the command FAILS rather than
+ * starting one (non-new-session commands carry an implicit -N since tmux 2.5);
+ * the next server is spawned from this client binary, so the caller-supplied
+ * client version stands in that case.
+ *
+ * Resolution order on a throwing call:
+ *  - a version already present in the error's stdout is rescued and trusted —
+ *    a NEWER client vs an OLDER server can print the answer and exit 0 while an
+ *    inherited stdout pipe stays open, so execFileSync waits out the timeout
+ *    and THROWS (ETIMEDOUT, status 0) despite holding the real version
+ *    (reproduced 3.3a client against a 3.1c server);
+ *  - a TIMEOUT with nothing readable fails CLOSED (null): the server might be
+ *    old, and trusting the newer client would re-send values it rejects
+ *    (`remain-on-exit failed`, `new-session -e`) and block session creation;
+ *  - only a FAST non-timeout failure (no server on the socket yet) stands down
+ *    to the client, since that client is what spawns the next server.
+ * Never throws.
+ */
+export function serverTmuxVersion(socketArgs: readonly string[], clientVersion: TmuxVersion | null): TmuxVersion | null {
+  try {
+    const out = execFileSync('tmux', [...socketArgs, 'display-message', '-p', '#{version}'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      // Same budget as the other version probes (TMUX_VERSION_PROBE_TIMEOUT_MS):
+      // a loaded host delays a SAME-version server's answer by seconds (the
+      // gate's own measurements saw 0.93–4.45s at load ~4 and a blown 3s
+      // budget at load ~70). A shorter budget here would time out on a modern
+      // but busy server, and the fail-closed branch would then silence the
+      // 77/127 crash-exit-code channel on exactly those hosts.
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
+      env: tmuxEnv(),
+    });
+    const parsed = parseTmuxVersion(String(out ?? ''));
+    return parsed ?? clientVersion;
+  } catch (err: any) {
+    // Answer already captured despite the throw (version/client pipe mismatch).
+    const captured = parseTmuxVersion(String(err?.stdout ?? ''));
+    if (captured) return captured;
+    // Bounded timeout, nothing readable: the server may be old — fail closed.
+    if (err?.code === 'ETIMEDOUT' || err?.signal || err?.killed) return null;
+    // Fast failure with no server: the next server comes from this client.
+    return clientVersion;
+  }
 }
 
 /**

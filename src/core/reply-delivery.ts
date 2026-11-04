@@ -13,16 +13,18 @@
  * `transcript` 才切换，写 `send` 亦持久化。所有判定 fail-closed：
  * 拿不准就回到 `send` / 非 solo。
  */
-import { getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
+import { getBot, getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
+import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 import { logger } from '../utils/logger.js';
 import { zeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
+import { isScratchSandbox, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
 
 /** claude-code 走 `claudeDataDir` 转写桥（worker.ts bridge fallback），其余按
- *  结构化转写白名单（codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok）。
- *  cursor 只在 adopt 下有转写，不算；codex-app 天然是转写模式，不需要本开关。 */
+ *  结构化转写白名单（codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor）。
+ *  antigravity 只有零注入转写，不算；codex-app 天然是转写模式，不需要本开关。 */
 export { supportsTranscriptReplyDelivery };
 
 /**
@@ -41,23 +43,94 @@ export function defaultReplyDeliveryFor(_cliId: string | undefined): ReplyDelive
   return 'send';
 }
 
+/** Per-bot options that can make transcript delivery unusable even when the
+ *  CLI itself harvests transcripts. */
+export interface TranscriptDeliveryCapabilityOpts {
+  sandbox?: ZeroPromptSandboxValue;
+}
+
+/** Whether `replyDelivery: transcript` works for this bot's CLI under its
+ *  sandbox configuration. The plain `supportsTranscriptReplyDelivery` predicate
+ *  is CLI-only; callers that know the bot config (config write validation,
+ *  dashboard switch gating, the runtime envelope decision) must go through
+ *  this so an unusable combination is rejected at write time rather than
+ *  accepted and silently degraded at runtime.
+ *
+ *  Full-root COW scratch: cursor's agent-transcript mirror lives in the merged
+ *  overlay, which the host-side bridge cannot read. Enabling the transcript
+ *  envelope there would strip the `botmux send` instructions from the prompt
+ *  while harvest produced nothing — a fully silent turn, the exact shape the
+ *  fallback exists to prevent. Reject it (same scratch boundary zero-injection
+ *  already enforces). */
+export function supportsTranscriptReplyDeliveryForBot(
+  cliId: string | undefined,
+  opts?: TranscriptDeliveryCapabilityOpts,
+): boolean {
+  if (!supportsTranscriptReplyDelivery(cliId)) return false;
+  if (cliId === 'cursor' && isScratchSandbox(opts)) return false;
+  return true;
+}
+
 const warnedUnsupported = new Set<string>();
 
 /** 运行时生效值：显式配置（send / transcript）优先，未配置按 CLI 缺省；结果为
  *  transcript 但当前 CLI 不支持时回落 send（每个 bot+cli 组合只 warn 一次，避免
- *  每轮刷日志）。无 larkAppId / registry 异常 → send（fail-closed）。 */
-export function effectiveReplyDelivery(larkAppId: string | undefined, cliId: string | undefined, promptInjection?: PromptInjection): ReplyDelivery {
+ *  每轮刷日志）。无 larkAppId / registry 异常 → send（fail-closed）。
+ *
+ * opts.sessionSandbox：为**已存活会话的续轮**传该会话 spawn 时冻结的沙箱
+ * （session.sandbox）。信封判定必须按「这个会话的 worker 实际有没有采集」来，
+ * 而不是 live bot config——sandbox 改动 next-session-only：会话以 scratch 起、
+ * 运维随后关掉 sandbox 再开 transcript 时，live 解析会放 transcript（改口不
+ * send），但该会话的 worker 仍在 COW overlay 里采集关闭 = 静默轮。新会话/首轮
+ * 不传，走 live config + BOTMUX_SANDBOX env 的实时解析。 */
+export function effectiveReplyDelivery(
+  larkAppId: string | undefined,
+  cliId: string | undefined,
+  promptInjection?: PromptInjection,
+  opts?: { sessionSandbox?: ZeroPromptSandboxValue },
+): ReplyDelivery {
   if (!larkAppId) return 'send';
   if (zeroPromptInjectionForBot(larkAppId, cliId, promptInjection)) return 'transcript';
   let configured: ReplyDelivery | undefined;
-  try { configured = resolveReplyDelivery(larkAppId); } catch { return 'send'; }
+  let sandbox: ZeroPromptSandboxValue | undefined;
+  try {
+    configured = resolveReplyDelivery(larkAppId);
+    if (opts?.sessionSandbox !== undefined) {
+      // 冻结值是该会话 spawn 时的 config 侧决策，但 worker 实际跑的沙盒还要
+      // 并上进程级 BOTMUX_SANDBOX：freezeSessionSandboxDecision 只看 cfg 不看
+      // env，所以全局 =scratch 时 session.sandbox 会冻成 false、而 worker 经
+      // resolveLocalSandboxMode 实际跑在 scratch（采集关闭）。只信冻结值会在
+      // 续轮把 transcript 错放回去（改口不 send + 采集关 = 静默）。任一源为
+      // scratch 即按 scratch 降级；env=0 不追溯翻案已冻成 scratch 的会话
+      // （spawn 时它确实在 scratch 里）。oncall 不收窄（authPaths bind 宿主
+      // 目录，桥可读）。env 非法值由 envSandboxMode throw，落到外层 catch
+      // fail-closed → send。
+      const frozen = opts.sessionSandbox;
+      const envResolved = resolveSandboxMode({ configSandbox: undefined, envValue: process.env.BOTMUX_SANDBOX });
+      sandbox = frozen === 'scratch' || envResolved === 'scratch' ? 'scratch' : frozen;
+    } else {
+      const cfg = getBot(larkAppId).config;
+      // 机器级 BOTMUX_SANDBOX 开关不会 materialise 进 cfg（与零注入同一约定，见
+      // zero-prompt-support.ts 的 resolveLocalSandboxMode 说明）：只看 cfg.sandbox
+      // 会在 BOTMUX_SANDBOX=scratch 时把 transcript 下发给一个采集已关的 cursor，
+      // 系统提示改口「不用 send」而转写桥在 merged overlay 外读不到 = 整轮静默。
+      // 用与 spawnCli 同一个 resolveSandboxMode 把 env / readIsolation 一并解析，
+      // 让 init 冻结值在 daemon 这一处就判死（worker spawnCli 另有 resolved-mode
+      // 权威复核兜底）。
+      sandbox = resolveSandboxMode({
+        configSandbox: cfg.sandbox,
+        readIsolation: cfg.readIsolation === true,
+        envValue: process.env.BOTMUX_SANDBOX,
+      });
+    }
+  } catch { return 'send'; }
   const wanted: ReplyDelivery = configured ?? defaultReplyDeliveryFor(cliId);
   if (wanted !== 'transcript') return 'send';
-  if (supportsTranscriptReplyDelivery(cliId)) return 'transcript';
+  if (supportsTranscriptReplyDeliveryForBot(cliId, { sandbox })) return 'transcript';
   const key = `${larkAppId}:${cliId ?? ''}`;
   if (!warnedUnsupported.has(key)) {
     warnedUnsupported.add(key);
-    logger.warn(`[reply-delivery] bot ${larkAppId} 配置 replyDelivery=transcript，但 cliId=${cliId ?? '(none)'} 没有转写采集，回落 send`);
+    logger.warn(`[reply-delivery] bot ${larkAppId} 配置 replyDelivery=transcript，但 cliId=${cliId ?? '(none)'} 在当前沙盒配置下没有转写采集，回落 send`);
   }
   return 'send';
 }

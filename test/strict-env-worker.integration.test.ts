@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, cpSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findMissingAskEnv } from '../src/core/ask-args.js';
@@ -13,6 +13,34 @@ let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional native tool */ }
 const cases = ['codex', 'claude-code'].flatMap(cliId => ['thread', 'chat'].map(scope => ({ cliId, scope, restore: false })));
 if (realTmux) cases.push({ cliId: 'claude-code', scope: 'chat', restore: true });
+
+/**
+ * Wait for the probe CLI to PUBLISH a parseable report, not merely for the
+ * file to exist: the fake CLI writes with fs.writeFileSync, which truncate-
+ * creates the file a beat before the bytes land. Returning on existence let the
+ * next synchronous readFileSync+JSON.parse hit the empty create-vs-write window
+ * under CI contention (observed bun-test flake: `SyntaxError: JSON Parse error:
+ * Unexpected EOF`; the same class #1934 fixed in credential-only-send-authority
+ * but this site was missed). A body that is merely non-empty can still be a
+ * partial write, so require JSON.parse to succeed. Field-level truthiness stays
+ * in the caller's assertions — only the empty/partial window is ridden out.
+ * Returns null on timeout so the caller fails with diagnostics instead of
+ * hanging.
+ */
+function waitForJsonReport(path: string, timeoutMs: number): Record<string, unknown> | null {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const body = readFileSync(path, 'utf8');
+      if (body.length > 0) return JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      // Not created yet / empty truncate window / partially written JSON — keep polling.
+    }
+    if (Date.now() >= deadline) return null;
+    spawnSync('sleep', ['0.05']);
+  }
+}
+
 describe('strict worker IPC to real CLI child', () => {
   it.each(cases)('$cliId enforces $scope policy and identity (unstamped tmux restore=$restore)', async ({ cliId, scope, restore }) => {
     const sessionId = randomUUID();
@@ -72,8 +100,9 @@ console.log('Ready >'); setTimeout(() => {}, 30000);
         envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] }, env: { MODEL_AUTH: 'bot-sentinel', OPENAI_API_KEY: 'own-model-auth' },
         ...(cliId === 'codex' ? { codexAuthSync: 'isolated' } : {}),
         loadedBotsConfigPath: bots, loadedBotsConfigProvenance: 'loaded', promptInjection: 'none' });
-      await vi.waitFor(() => expect(existsSync(report), diagnostics).toBe(true), { timeout: 20000 });
-      const { askEnv, ...checks } = JSON.parse(readFileSync(report, 'utf8'));
+      const reportJson = waitForJsonReport(report, 20000);
+      expect(reportJson, diagnostics).not.toBeNull();
+      const { askEnv, ...checks } = reportJson as { askEnv: NodeJS.ProcessEnv } & Record<string, unknown>;
       expect(findMissingAskEnv(askEnv)).toBeNull();
       for (const [key, ok] of Object.entries(checks)) expect(ok, `${key}\n${diagnostics}`).toBe(true);
       if (restore) {

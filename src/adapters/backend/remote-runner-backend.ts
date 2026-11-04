@@ -32,6 +32,7 @@ import {
   type RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from './remote-runner-config.js';
+import { sessionChildEnvWithInject } from '../../core/session-env.js';
 
 type PendingRequest = {
   command: RemoteRunnerCommand;
@@ -185,7 +186,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     if (this.killed) throw new Error('remote runner backend is closed');
     const child = spawnProcess(bin, args, {
       cwd: opts.cwd,
-      env: { ...opts.env, ...(opts.injectEnv ?? {}) },
+      env: sessionChildEnvWithInject(opts),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;
@@ -197,6 +198,14 @@ export class RemoteRunnerBackend implements SessionBackend {
       );
     });
     child.stdout.on('data', chunk => this.consumeStdout(String(chunk)));
+    // A provider that stops reading (crashed, closed stdin) makes the next
+    // write fail asynchronously with EPIPE. Each write callback already rejects
+    // its own command and its caller decides the outcome, but the stream also
+    // emits 'error'; unhandled, that is thrown at process level. Only record it
+    // here so the failure is not escalated past the command that hit it.
+    child.stdin.on('error', error => {
+      logger.warn(`[remote-runner] provider stdin error: ${error.message}`);
+    });
     child.on('error', error => this.failProtocol(`provider process error: ${error.message}`));
     child.on('exit', (code, signal) => {
       this.child = null;

@@ -22,6 +22,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import { setScheduleAuthorityStore } from '../src/core/scheduler.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -589,6 +594,21 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     expect(ds.silentScheduledTurns?.has(secondTurn)).toBe(true);
   });
 
+  it('a hidden run keeps the scheduler run it executes, and a re-fire hands it over with the turn', async () => {
+    // A hidden run that later proves undelivered rewrites exactly this run's
+    // execution-log record (#1607).
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion, undefined, { runId: 'run-first' });
+    const ds = active.get(sessionKey(taskAnchor, APP))!;
+    expect(ds.session.deferredScheduleRun?.runId).toBe('run-first');
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion, undefined, { runId: 'run-second' });
+    expect(ds.session.deferredScheduleRun?.runId).toBe('run-second');
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
+    expect(ds.session.deferredScheduleRun?.runId).toBeUndefined();
+  });
+
   it('live re-fire on the hidden session injects and re-hands materialization ownership', async () => {
     const active = new Map<string, DaemonSession>();
     const session: Session = {
@@ -642,6 +662,33 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     expect(ds.session.rootMessageId).toBe('om_banner_123');
     expect(ds.session.deferredScheduleRun).toBeUndefined();
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a root forged into schedules.json does not steer the first fire: the root comes from the host authority', async () => {
+    // Sandboxed agent writes `rootMessageId` into its BOT_HOME projection; the
+    // authority row (the only thing the daemon executes) has no root yet.
+    const task = baseTask({ executionPosition: 'task', chatType: 'group' });
+    const root = mkdtempSync(join(tmpdir(), 'botmux-sched-authority-'));
+    const authority = ScheduleAuthorityStore.open(root);
+    authority.initializeApp(APP, [task]);
+    setScheduleAuthorityStore(authority);
+    scheduleStoreGetTaskMock.mockImplementation((id: string) => (
+      id === task.id ? { ...task, rootMessageId: 'om_attacker_chosen' } : undefined
+    ));
+    try {
+      const active = new Map<string, DaemonSession>();
+      await executeScheduledTask(task, active, refreshCliVersion);
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+      expect(active.has(sessionKey('om_attacker_chosen', APP))).toBe(false);
+      expect(active.get(sessionKey('om_banner_123', APP))?.session.rootMessageId).toBe('om_banner_123');
+      expect(authority.getRecord(APP, task.id)?.task.rootMessageId).toBe('om_banner_123');
+    } finally {
+      setScheduleAuthorityStore(null);
+      scheduleStoreGetTaskMock.mockReset();
+      authority.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('renders dynamic date and owner placeholders for the dedicated task root', async () => {
@@ -1602,7 +1649,7 @@ describe('executeScheduledTask — per-task model / reasoning effort', () => {
   });
 
   it('drops both when the bot now runs a CLI without the override contract', async () => {
-    cliOf('gemini');
+    cliOf('opencode');
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(
       baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'high' }),

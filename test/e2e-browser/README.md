@@ -26,7 +26,8 @@ Every `cases/*.yaml` file is a lane, run as the Midscene project
 `feishu-<file stem>`. Lanes run concurrently (`FEISHU_E2E_CONCURRENCY`,
 default 4); cases inside one lane run in order. A lane groups cases that must
 not overlap — `full-group.yaml` stays serial because its no-mention case
-asserts that no bot answered.
+asserts that no bot answered. The longest lane, `core-group-modes`, starts
+first (`LONG_LANES_FIRST` in `lanes.ts`); on CI a failed case runs once more.
 
 | Lane | Covers |
 |:--|:--|
@@ -36,7 +37,9 @@ asserts that no bot answered.
 | `core-queue` | Three back-to-back messages are all answered |
 | `core-dm-modes-claude` / `core-dm-modes-codex` | Private-chat modes `chat`, `thread` (topic), `group` (session group) |
 | `core-group-modes` | Claude and Codex in the test group: reply modes `chat-topic` / `chat` / `topic` / `new-topic`, @ policies `always` / `never` / `ambient` / `topic` |
-| `full-bots` | Aiden, CoCo, OpenCode, reply smoke |
+| `core-clis` | Public CLIs in their private chats: OpenCode, Pi, Oh My Pi (`OhMyPi`), Kimi, Antigravity, Grok |
+| `core-sandbox` | `ClaudeSandbox` (Claude Code, `sandbox: true`): from inside the session's shell, home and harness secrets are hidden, writes stay in the working directory |
+| `full-bots` | Internal CLIs Aiden and CoCo (not installed on CI), reply smoke |
 | `full-group` | Group @mention routing, group topic replies, bot collaboration |
 | `full-claude-ui` | Card lifecycle, private topic mode, image/text mix, web terminal |
 | `full-schedule` | Scheduled task stays in its source thread |
@@ -91,24 +94,32 @@ so each phase keeps its own Midscene snapshots. Other cases use
 
 ## GitHub Actions
 
-The `Midscene E2E` workflow runs two jobs in parallel. The Dashboard job needs
-no Feishu login state, but it does need the configured Midscene visual model.
-The Feishu job runs the `core` lanes concurrently. Manual runs can pick
-`feishu_cases` (`all` or a lane list) and `feishu_concurrency`. A third job
-merges both uploads (`botmux-midscene-dashboard-data`,
-`botmux-midscene-feishu-data`), publishes the HTML report to GitHub Pages, and
-writes the per-case result to the workflow Summary page. Without the live-test
-secrets, only the Feishu lanes are skipped; the Dashboard run and its report
-are still required.
+The `Midscene E2E` workflow runs after merge: on every push to `master`, and
+on manual dispatch. Pull requests do not run it. It runs two jobs in parallel.
+The Dashboard job needs no Feishu login state, but it does need the configured
+Midscene visual model. The Feishu job runs the `core` lanes concurrently.
+Manual runs can pick `feishu_cases` (`all` or a lane list) and
+`feishu_concurrency`. A third job merges both uploads
+(`botmux-midscene-dashboard-data`, `botmux-midscene-feishu-data`), publishes
+the HTML report to GitHub Pages, and writes the per-case result to the workflow
+Summary page. Without the live-test secrets, only the Feishu lanes are
+skipped; the Dashboard run and its report are still required.
+
+Master runs never cancel each other. While one runs, GitHub keeps only the
+newest pending one, so a run can cover several merges. Each master run
+publishes its report under `master-run-<run id>` (the newest five are kept).
+When a master run fails, `scripts/midscene-notify-failure.mjs` comments on every
+pull request merged since the last master run that reached a result,
+mentioning its author and the repository owner, with the failed cases, the
+report link and the run link. A push without a pull request gets a commit
+comment instead. To check a branch before merging, dispatch the workflow on it.
 
 Every run drives the same Feishu bots, so only one Feishu job runs at a time.
 The `Wait for the Feishu live slot` job (`scripts/feishu-live-queue.mjs`) hands
 out the slot first come first served: it waits while another run holds the slot
-or started waiting earlier, then lets this run's Feishu job start. Nothing is
-cancelled across branches — a GitHub `concurrency` group would cancel its
-pending job whenever a newer run arrived. A newer push to the same pull request
-does cancel that pull request's older run. A run that waits longer than the
-queue budget reports its Feishu cases as not run.
+or started waiting earlier, then lets this run's Feishu job start. A run that
+waits longer than the queue budget reports its Feishu cases as not run, and on
+master that counts as a failure.
 
 Reports are published with `scripts/publish-gh-pages.sh`, shared with the docs
 deploy: each publish replaces its own directory and pushes the branch as a
@@ -127,13 +138,13 @@ Configure these repository secrets before running the workflow:
 - `PAGES_DEPLOY_KEY`
 
 The stored Feishu account must be a member of the test group and have access
-to the Aiden, Claude, CoCo, Codex, and OpenCode bot conversations. An unrelated
+to the private chats of every bot in `BOT_NAMES` (`helpers.ts`). The bots are
+named after their CLI; the older `[Botmux]<Name>` names are still recognised. An unrelated
 Feishu account can sign in successfully but cannot run these live cases.
 
 The optional chat-name overrides use `FEISHU_TEST_GROUP_CHAT_NAME` and
-`FEISHU_TEST_TOPIC_GROUP_NAME`. GitHub withholds repository secrets from forked
-pull requests, so the live job is intentionally limited to same-repository
-branches and manual runs.
+`FEISHU_TEST_TOPIC_GROUP_NAME`. Manual runs on forks get no repository secrets,
+so their Feishu lanes are skipped.
 
 Useful validation commands:
 

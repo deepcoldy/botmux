@@ -14,6 +14,7 @@ const STATUS_KINDS: TerminalStatusKind[] = [
   'not-found',
   'forbidden',
   'unavailable',
+  'suspended',
 ];
 
 const STATUS_KEYS = [
@@ -27,6 +28,8 @@ const STATUS_KEYS = [
   'terminal.status.forbidden.detail',
   'terminal.status.unavailable.title',
   'terminal.status.unavailable.detail',
+  'terminal.status.suspended.title',
+  'terminal.status.suspended.detail',
 ];
 
 afterEach(() => {

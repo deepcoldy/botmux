@@ -24,6 +24,7 @@ vi.mock('../src/bot-registry.js', () => ({
 import { finalizeCotMessage, handleCotThinkingUpdate, handleCotThinkingSuperseded } from '../src/im/lark/cot-message.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
+import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 
 let child: ChildProcess | undefined;
 let root: string | undefined;
@@ -40,7 +41,7 @@ afterEach(async () => {
   }
   child = undefined;
   if (tmuxSession) {
-    try { execFileSync('tmux', ['kill-session', '-t', tmuxSession], { stdio: 'ignore' }); } catch { /* already stopped */ }
+    killWorkerTmuxSession(tmuxSession);
   }
   tmuxSession = undefined;
   if (root) rmSync(root, { recursive: true, force: true });
@@ -110,11 +111,12 @@ setInterval(() => {
       });
       child.stdout?.on('data', chunk => logs.push(chunk.toString()));
       child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-      if (backendType === 'tmux') tmuxSession = `pi-cot-${process.pid}-${Date.now()}`;
+      // The worker names its pane after the session id; clean up that one.
+      if (backendType === 'tmux') tmuxSession = `bmx-${'sid-pi-cot'.slice(0, 8)}`;
       child.send({
         type: 'init', sessionId: 'sid-pi-cot', chatId: 'oc_test', rootMessageId: 'om_root',
         workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, cliSessionId,
-        backendType, ...(tmuxSession ? { tmuxSessionName: tmuxSession } : {}),
+        backendType,
         prompt: 'inspect the entry point', larkAppId: 'app_test', larkAppSecret: 'test-only',
         turnId: 'om_pi_turn',
       } satisfies DaemonToWorker);
@@ -216,11 +218,10 @@ setInterval(() => {}, 1000);
       });
       child.stdout?.on('data', chunk => logs.push(chunk.toString()));
       child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-      if (backendType === 'tmux') tmuxSession = `pi-steer-${process.pid}-${Date.now()}`;
+      if (backendType === 'tmux') tmuxSession = `bmx-${'sid-pi-steer'.slice(0, 8)}`;
       child.send({
         type: 'init', sessionId: 'sid-pi-steer', chatId: 'oc_test', rootMessageId: 'om_root',
         workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, cliSessionId, backendType,
-        ...(tmuxSession ? { tmuxSessionName: tmuxSession } : {}),
         prompt: 'warmup', larkAppId: 'app_test', larkAppSecret: 'test-only', turnId: 'om_warmup',
       } satisfies DaemonToWorker);
       await waitUntil(() => logs.some(line => line.includes('Codex bridge fresh-empty:')), logs);

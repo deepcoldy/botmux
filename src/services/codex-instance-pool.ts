@@ -39,6 +39,7 @@ export function normalizeCodexInstancePool(raw: unknown, bot: Partial<BotConfig>
   if (raw === undefined) return undefined;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) invalid('expected an object');
   const p = raw as CodexInstancePool;
+  if (p.enabled && bot.codexProfile) invalid('random instance selection cannot be combined with codexProfile');
   if (process.platform === 'win32' || bot.cliId !== 'codex' || bot.backendType !== 'tmux'
       || bot.wrapperCli || bot.sandbox || bot.readIsolation || bot.existingAppServer
       || (bot.env && Object.keys(bot.env).length)) invalid('requires local Codex + tmux, without wrapper, env, sandbox, readIsolation or external app server');

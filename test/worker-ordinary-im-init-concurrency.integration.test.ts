@@ -1,5 +1,6 @@
 import { type ChildProcess } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,6 +10,29 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
+const cliPidDirs = new Set<string>();
+// A normal close also stops the OS session scope. Concurrent test invocations
+// must never share its identity.
+const runId = randomUUID();
+
+function writeFakeCli(file: string, script: string): string {
+  const pidDir = `${file}.pids`;
+  mkdirSync(pidDir);
+  cliPidDirs.add(pidDir);
+  // Record every invocation: Codex can start both a TUI and an app-server.
+  const headerEnd = script.indexOf('\n') + 1;
+  writeFileSync(file, script.slice(0, headerEnd)
+    + `require('node:fs').writeFileSync(${JSON.stringify(pidDir)} + '/' + process.pid, '');\n`
+    + script.slice(headerEnd));
+  return pidDir;
+}
+
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    throw error;
+  }
+}
 
 async function waitFor(
   predicate: () => boolean,
@@ -23,13 +47,132 @@ async function waitFor(
   throw new Error(`worker condition timed out\n${logs.join('')}`);
 }
 
-afterEach(() => {
-  for (const child of children) {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-  }
+async function stopChildren(): Promise<void> {
+  await Promise.all([...children].map(async child => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise<void>((done, reject) => {
+      const forceKill = setTimeout(() => child.kill('SIGKILL'), 3_000);
+      const deadline = setTimeout(() => {
+        child.off('exit', onExit);
+        reject(new Error(`Worker ${child.pid} did not exit during fixture cleanup`));
+      }, 8_000);
+      const onExit = () => {
+        clearTimeout(forceKill);
+        clearTimeout(deadline);
+        done();
+      };
+      child.once('exit', onExit);
+      // Let the worker stop its watchers and PTY. Ignore only a concurrent IPC
+      // disconnect; the exit deadline still detects a failed shutdown.
+      if (child.connected) child.send({ type: 'close' } satisfies DaemonToWorker, () => {});
+      else child.kill('SIGTERM');
+    });
+  }));
   children.clear();
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+
+  // PTYs have their own process group: killing the worker (or its group) does
+  // not prove that its fake CLI stopped writing. Record all invocations and
+  // reap only those fixture PIDs, including after an already-dead worker.
+  const pids = [...cliPidDirs].filter(existsSync).flatMap(dir => readdirSync(dir).map(Number));
+  for (const pid of pids) {
+    if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(`Invalid fixture CLI PID: ${pid}`);
+    if (processAlive(pid)) {
+      try { process.kill(pid, 'SIGKILL'); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      }
+    }
+  }
+  await waitFor(() => pids.every(pid => !processAlive(pid)), ['Waiting for fixture CLI processes to exit'], 5_000);
+  cliPidDirs.clear();
+}
+
+afterEach(async () => {
+  await stopChildren();
+  for (const dir of tempDirs) {
+    // Re-walk the tree after a transient race. Retrying just the final rmdir
+    // cannot remove directory entries created after the original readdir.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (attempt >= 4 || (code !== 'ENOTEMPTY' && code !== 'EBUSY')) throw error;
+        await new Promise(done => setTimeout(done, 100));
+      }
+    }
+  }
   tempDirs.clear();
+});
+
+describe('worker init fixture cleanup', () => {
+  it.each([false, true])('stops the PTY writer before removing its home (worker already killed: %s)', async alreadyKilled => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-cleanup-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir);
+    const request = join(root, 'write-request');
+    const receipt = join(root, 'write-receipt');
+    const fakeCli = join(root, 'fake-pi');
+    const pidDir = writeFakeCli(fakeCli, `#!/usr/bin/env node
+const fs = require('node:fs');
+// Keep the independent PTY process alive after its worker exits. A file
+// handshake proves it can still create directory entries; no timing guess.
+process.on('SIGHUP', () => {});
+process.on('SIGTERM', () => {});
+setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(request)})) {
+    fs.renameSync(${JSON.stringify(request)}, ${JSON.stringify(receipt)});
+  }
+}, 10);
+`);
+    chmodSync(fakeCli, 0o755);
+    const sessionId = `worker-cleanup-${randomUUID()}`;
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
+      workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty',
+      prompt: '', larkAppId: 'app_test', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    const writeReceipt = async (value: string) => {
+      writeFileSync(request, value);
+      await waitFor(() => existsSync(receipt) && readFileSync(receipt, 'utf8') === value, logs);
+    };
+    await writeReceipt('started');
+    const cliPid = Number(readdirSync(pidDir)[0]);
+    expect(Number.isSafeInteger(cliPid) && cliPid > 1).toBe(true);
+    try {
+      if (alreadyKilled) {
+        const exited = new Promise<void>(done => child.once('exit', () => done()));
+        child.kill('SIGKILL');
+        await exited;
+        await writeReceipt('writer survived worker exit');
+      }
+      expect(processAlive(cliPid)).toBe(true);
+      await stopChildren();
+      expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+      expect(processAlive(cliPid)).toBe(false);
+      expect(existsSync(root)).toBe(true);
+    } finally {
+      // Keep a broken/mutated stopChildren implementation from leaking the
+      // deliberately stubborn writer while demonstrating the regression.
+      if (processAlive(cliPid)) process.kill(cliPid, 'SIGKILL');
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await waitFor(() => !processAlive(cliPid)
+        && (child.exitCode !== null || child.signalCode !== null), logs);
+    }
+  }, 20_000);
 });
 
 describe('ordinary IM during real worker init', () => {
@@ -39,7 +182,7 @@ describe('ordinary IM during real worker init', () => {
     const dataDir = join(root, 'session');
     mkdirSync(dataDir, { recursive: true });
     const fakePi = join(root, 'fake-pi');
-    writeFileSync(fakePi, `#!/usr/bin/env node
+    writeFakeCli(fakePi, `#!/usr/bin/env node
 setTimeout(() => process.stdout.write('Ready\\n'), 500);
 setInterval(() => {}, 1_000);
 `);
@@ -53,7 +196,7 @@ setInterval(() => {}, 1_000);
         ...process.env,
         HOME: root,
         SESSION_DATA_DIR: dataDir,
-        BOTMUX_SESSION_ID: 'sid-worker-init-concurrency',
+        BOTMUX_SESSION_ID: `sid-worker-init-concurrency-${runId}`,
         LARK_APP_ID: 'app_test',
         LARK_APP_SECRET: 'secret',
       },
@@ -69,7 +212,7 @@ setInterval(() => {}, 1_000);
 
     child.send({
       type: 'init',
-      sessionId: 'sid-worker-init-concurrency',
+      sessionId: `sid-worker-init-concurrency-${runId}`,
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,
@@ -113,7 +256,7 @@ setInterval(() => {}, 1_000);
     mkdirSync(dataDir, { recursive: true });
     const inputLog = join(root, 'stdin.log');
     const fakePi = join(root, 'fake-pi');
-    writeFileSync(fakePi, `#!/usr/bin/env node
+    writeFakeCli(fakePi, `#!/usr/bin/env node
 const fs = require('node:fs');
 const inputLog = process.env.FAKE_INPUT_LOG;
 let firstSeen = false;
@@ -150,7 +293,7 @@ setInterval(() => {}, 1_000);
         ...process.env,
         HOME: root,
         SESSION_DATA_DIR: dataDir,
-        BOTMUX_SESSION_ID: 'sid-worker-principal-queue',
+        BOTMUX_SESSION_ID: `sid-worker-principal-queue-${runId}`,
         BOTMUX_XPI_ENABLED: 'true',
         BOTMUX_TIME_SCALE: '0.05',
         LARK_APP_ID: 'app_test',
@@ -169,7 +312,7 @@ setInterval(() => {}, 1_000);
 
     child.send({
       type: 'init',
-      sessionId: 'sid-worker-principal-queue',
+      sessionId: `sid-worker-principal-queue-${runId}`,
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,
@@ -293,7 +436,7 @@ setInterval(() => {}, 1_000);
     mkdirSync(dataDir, { recursive: true });
     const inputLog = join(root, 'stdin.log');
     const fakePi = join(root, 'fake-pi');
-    writeFileSync(fakePi, `#!/usr/bin/env node
+    writeFakeCli(fakePi, `#!/usr/bin/env node
 const fs = require('node:fs');
 const inputLog = process.env.FAKE_INPUT_LOG;
 let firstSeen = false;
@@ -323,7 +466,7 @@ setInterval(() => {}, 1_000);
         ...process.env,
         HOME: root,
         SESSION_DATA_DIR: dataDir,
-        BOTMUX_SESSION_ID: 'sid-worker-principal-xpi-off',
+        BOTMUX_SESSION_ID: `sid-worker-principal-xpi-off-${runId}`,
         // The switch under test. Set explicitly so the case does not depend on
         // the ambient default staying off.
         BOTMUX_XPI_ENABLED: 'false',
@@ -344,7 +487,7 @@ setInterval(() => {}, 1_000);
 
     child.send({
       type: 'init',
-      sessionId: 'sid-worker-principal-xpi-off',
+      sessionId: `sid-worker-principal-xpi-off-${runId}`,
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,
@@ -413,7 +556,7 @@ setInterval(() => {}, 1_000);
     mkdirSync(dataDir, { recursive: true });
     const inputLog = join(root, 'stdin.log');
     const fakeCodex = join(root, 'fake-codex');
-    writeFileSync(fakeCodex, `#!/usr/bin/env node
+    writeFakeCli(fakeCodex, `#!/usr/bin/env node
 const fs = require('node:fs');
 if (process.argv.includes('app-server')) {
   setInterval(() => {}, 1_000);
@@ -442,7 +585,7 @@ if (process.argv.includes('app-server')) {
         ...process.env,
         HOME: root,
         SESSION_DATA_DIR: dataDir,
-        BOTMUX_SESSION_ID: 'sid-worker-init-order',
+        BOTMUX_SESSION_ID: `sid-worker-init-order-${runId}`,
         // Keep the real 7s title-metadata await that opens the race window,
         // but collapse Codex's unrelated history.jsonl submit polling so this
         // ordering probe stays deterministic under full-suite contention.
@@ -459,7 +602,7 @@ if (process.argv.includes('app-server')) {
 
     child.send({
       type: 'init',
-      sessionId: 'sid-worker-init-order',
+      sessionId: `sid-worker-init-order-${runId}`,
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,
@@ -503,7 +646,7 @@ if (process.argv.includes('app-server')) {
     const dbDir = join(xdgDataDir, 'opencode');
     mkdirSync(dataDir, { recursive: true });
     mkdirSync(dbDir, { recursive: true });
-    const prompt = '<session_id>sid-opencode-activation</session_id>\n<user_message>OPEN_CODE_TOKEN_ONLY</user_message>';
+    const prompt = `<session_id>sid-opencode-activation-${runId}</session_id>\n<user_message>OPEN_CODE_TOKEN_ONLY</user_message>`;
     const db = new DatabaseSync(join(dbDir, 'opencode.db'));
     db.exec(`
       CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER, time_archived INTEGER);
@@ -520,7 +663,7 @@ if (process.argv.includes('app-server')) {
     db.close();
 
     const fakeOpenCode = join(root, 'fake-opencode');
-    writeFileSync(fakeOpenCode, `#!/usr/bin/env node
+    writeFakeCli(fakeOpenCode, `#!/usr/bin/env node
 const fs = require('node:fs');
 const { DatabaseSync } = require('node:sqlite');
 const args = process.argv.slice(2);
@@ -543,7 +686,7 @@ setInterval(() => {}, 1_000);
         XDG_DATA_HOME: xdgDataDir,
         OPENCODE_DB_PATH: join(dbDir, 'opencode.db'),
         SESSION_DATA_DIR: dataDir,
-        BOTMUX_SESSION_ID: 'sid-opencode-activation',
+        BOTMUX_SESSION_ID: `sid-opencode-activation-${runId}`,
         // This starts a real Node process: shrinking the 2.4s confirmation
         // window to 120ms races its SQLite write, then the 20s deferred
         // recheck falls outside this test's 8s acknowledgement deadline.
@@ -563,7 +706,7 @@ setInterval(() => {}, 1_000);
 
     child.send({
       type: 'init',
-      sessionId: 'sid-opencode-activation',
+      sessionId: `sid-opencode-activation-${runId}`,
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,
@@ -583,7 +726,7 @@ setInterval(() => {}, 1_000);
 
     expect(messages).toContainEqual({
       type: 'queued_activation_submitted',
-      sessionId: 'sid-opencode-activation',
+      sessionId: `sid-opencode-activation-${runId}`,
       activationToken: 'opencode-token-only',
     });
   }, 12_000);
@@ -602,7 +745,7 @@ setInterval(() => {}, 1_000);
     writeFileSync(rolloutPath, '');
     const firstPrompt = '<botmux_routing>hidden</botmux_routing>\n<user_message>@TestBot 排查标题问题</user_message>';
     const fakeTraex = join(root, 'fake-traex');
-    writeFileSync(fakeTraex, `#!/usr/bin/env node
+    writeFakeCli(fakeTraex, `#!/usr/bin/env node
 const fs = require('node:fs');
 const inputLog = ${JSON.stringify(inputLog)};
 const historyPath = ${JSON.stringify(join(traeHome, 'cli', 'history.jsonl'))};
@@ -646,7 +789,7 @@ setInterval(() => {}, 1_000);
         HOME: root,
         TRAE_HOME: traeHome,
         SESSION_DATA_DIR: dataDir,
-        BOTMUX_SESSION_ID: 'sid-traex-native-title',
+        BOTMUX_SESSION_ID: `sid-traex-native-title-${runId}`,
         BOTMUX_TIME_SCALE: '0.05',
         LARK_APP_ID: 'app_test',
         LARK_APP_SECRET: 'secret',
@@ -663,7 +806,7 @@ setInterval(() => {}, 1_000);
 
     child.send({
       type: 'init',
-      sessionId: 'sid-traex-native-title',
+      sessionId: `sid-traex-native-title-${runId}`,
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,
@@ -702,7 +845,7 @@ setInterval(() => {}, 1_000);
       .toBeLessThan(input.indexOf('/rename [BotMux·Lark] 排查标题问题'));
     expect(messages).toContainEqual({
       type: 'queued_activation_submitted',
-      sessionId: 'sid-traex-native-title',
+      sessionId: `sid-traex-native-title-${runId}`,
       activationToken: 'activation-title-token',
     });
     expect(messages).toContainEqual({ type: 'turn_input_committed', turnId: 'om_initial' });
@@ -722,7 +865,7 @@ setInterval(() => {}, 1_000);
     mkdirSync(join(traeHome, 'cli'), { recursive: true });
     const firstPrompt = '<botmux_routing>hidden</botmux_routing>\n<user_message>@TestBot 排查失败提交</user_message>';
     const fakeTraex = join(root, 'fake-traex-fail');
-    writeFileSync(fakeTraex, `#!/usr/bin/env node
+    writeFakeCli(fakeTraex, `#!/usr/bin/env node
 const fs = require('node:fs');
 const inputLog = ${JSON.stringify(inputLog)};
 setTimeout(() => process.stdout.write('›\\n'), 200);
@@ -750,7 +893,7 @@ setInterval(() => {}, 1_000);
         HOME: root,
         TRAE_HOME: traeHome,
         SESSION_DATA_DIR: dataDir,
-        BOTMUX_SESSION_ID: 'sid-traex-native-title-fail',
+        BOTMUX_SESSION_ID: `sid-traex-native-title-fail-${runId}`,
         BOTMUX_TIME_SCALE: '0.05',
         LARK_APP_ID: 'app_test',
         LARK_APP_SECRET: 'secret',
@@ -767,7 +910,7 @@ setInterval(() => {}, 1_000);
 
     child.send({
       type: 'init',
-      sessionId: 'sid-traex-native-title-fail',
+      sessionId: `sid-traex-native-title-fail-${runId}`,
       chatId: 'oc_test',
       rootMessageId: 'om_root',
       workingDir: dataDir,

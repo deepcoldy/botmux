@@ -1,4 +1,5 @@
 import type { CliAdapter, CliId } from '../../adapters/cli/types.js';
+import { createHash } from 'node:crypto';
 import type { BotConfig } from '../../bot-registry.js';
 import type { GlobalConfig } from '../../global-config.js';
 import { prepareSkillDelivery } from '../skills/delivery.js';
@@ -16,6 +17,8 @@ export interface CliPluginGenerationResult {
   /** Catalog bytes appended to prompt (or deferred when prompt is empty).
    * Structured transports use this copy as hidden application context. */
   skillCatalog?: string;
+  /** Hash of the canonical catalog, independent of its refresh wrapper. */
+  skillCatalogFingerprint?: string;
   skillPluginDir?: string;
   skillReadonlyRoots?: string[];
   deferredSkillCatalog?: string;
@@ -37,8 +40,8 @@ function renderReplacementCatalog(manifest: SessionSkillManifest | null): string
 /** Prepare the shared Skills/MCP snapshot immediately before a real CLI spawn. */
 export function prepareCliPluginGeneration(opts: {
   sessionId: string;
-  bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'>;
-  global?: Pick<GlobalConfig, 'plugins'>;
+  bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills' | 'pluginRuntime'>;
+  global?: Pick<GlobalConfig, 'plugins' | 'mcpGatewayMaxToolTimeoutMs'>;
   dataDir?: string;
   cliId: CliId;
   adapter: CliAdapter;
@@ -46,6 +49,8 @@ export function prepareCliPluginGeneration(opts: {
   prompt: string;
   replacesPriorGeneration: boolean;
   promptInjection?: 'default' | 'none';
+  /** Only the host's admitted Auto resume passes its last delivered catalog. */
+  previousSkillCatalogFingerprint?: string;
   now?: () => string;
 }): CliPluginGenerationResult {
   const pluginManifest = refreshSessionPluginManifest({
@@ -58,6 +63,8 @@ export function prepareCliPluginGeneration(opts: {
   refreshSessionMcpRuntimeManifest({
     sessionId: opts.sessionId,
     pluginIds: pluginManifest.pluginIds,
+    pluginRuntime: opts.bot.pluginRuntime,
+    maxToolTimeoutMs: opts.global?.mcpGatewayMaxToolTimeoutMs,
     dataDir: opts.dataDir,
     now: opts.now,
   });
@@ -83,10 +90,13 @@ export function prepareCliPluginGeneration(opts: {
     preparedSkills.manifest,
     preparedSkills.manifest?.delivery ?? 'auto',
   );
-  const catalog = opts.replacesPriorGeneration
-    ? renderReplacementCatalog(preparedSkills.manifest)
-    : renderSkillCatalogBlock(preparedSkills.manifest);
-  const prompt = opts.replacesPriorGeneration && opts.prompt.trim().length > 0
+  const canonicalCatalog = renderSkillCatalogBlock(preparedSkills.manifest);
+  const fingerprint = createHash('sha256').update(canonicalCatalog).digest('hex');
+  const unchanged = opts.replacesPriorGeneration
+    && opts.previousSkillCatalogFingerprint === fingerprint;
+  const catalog = unchanged ? '' : opts.replacesPriorGeneration
+    ? renderReplacementCatalog(preparedSkills.manifest) : canonicalCatalog;
+  const prompt = unchanged ? opts.prompt : opts.replacesPriorGeneration && opts.prompt.trim().length > 0
     ? `${opts.prompt}\n\n${catalog}`
     : preparedSkills.prompt;
 
@@ -94,6 +104,7 @@ export function prepareCliPluginGeneration(opts: {
     pluginManifest,
     prompt,
     skillCatalog: catalog || undefined,
+    skillCatalogFingerprint: fingerprint,
     skillPluginDir: delivery.pluginDir,
     skillReadonlyRoots: delivery.readonlyRoots.length > 0 ? delivery.readonlyRoots : undefined,
     deferredSkillCatalog: prompt.trim().length === 0 && catalog ? catalog : undefined,

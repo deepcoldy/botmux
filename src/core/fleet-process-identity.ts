@@ -28,6 +28,8 @@ const BUILTIN_FLEET_ENTRY_MARKERS = {
   daemon: { token: '__daemon', script: 'index-daemon.js' },
   dashboard: { token: '__dashboard', script: 'index-dashboard.js' },
   supervisor: { token: '__supervisor', script: 'index-supervisor.js' },
+  // Session workers: `fork(<dist>/worker.js)`, or `<binary> __worker` compiled.
+  worker: { token: '__worker', script: 'worker.js' },
 } as const;
 
 function commandLineHasArg(commandLine: string, arg: string): boolean {

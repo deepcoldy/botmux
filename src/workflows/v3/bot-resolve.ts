@@ -65,6 +65,7 @@ function sandboxPathsSnapshot(
 
 /** BotConfig → BotSnapshot (the runtime-frozen, secret-free per-node identity). */
 export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotSnapshot {
+  if (bot.codexProfile) throw new Error('Codex profile is not supported by v3 workflow; choose a Bot without a profile');
   if (bot.disableCliBypass === true) {
     throw new Error(
       `v3 workflow requires CLI bypass permissions, but bot "${bot.name ?? bot.larkAppId}" ` +

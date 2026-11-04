@@ -24,7 +24,6 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
   'codex': CODEX_MODEL_CHOICES,
   'codex-app': CODEX_MODEL_CHOICES,
   'cursor': ['auto', 'claude-4-sonnet', 'claude-4-opus', 'gpt-5'],
-  'gemini': ['gemini-2.5-pro', 'gemini-2.5-flash'],
   'genius': ['gpt-5.5'],
   'opencode': [
     'anthropic/claude-sonnet-4',
@@ -96,4 +95,10 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'minimax/MiniMax-M2.7-highspeed',
   ],
   'remote-runner': undefined,
+  'codem': undefined,
+  // Personal providers are discovered on demand; never perform I/O here.
+  zcode: undefined,
+  // Display names accepted by `doubao --model` (2.31). The live list is
+  // account-dependent; detectModels() reads it from the CLI on demand.
+  doubao: ['Auto', 'Doubao 2.1 Pro', 'Doubao 2.1 Turbo', 'Doubao 2.1 Lite'],
 };

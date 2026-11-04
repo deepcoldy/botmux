@@ -6,8 +6,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import {
   checkCliAvailability,
+  checkCliAvailabilityAsync,
   cliUnavailableMessage,
   hasAgentLaunchConfigChanged,
+  preliminaryCliAvailability,
 } from '../src/setup/cli-availability.js';
 
 // Pass-through spies: every process the availability check could start (the
@@ -40,6 +42,73 @@ function executable(dir: string, name: string): string {
 }
 
 describe('CLI launch availability', () => {
+  it('keeps PATH misses and untested Forge readiness preliminary', () => {
+    process.env.PATH = '';
+    for (const cliId of ALL_CLI_IDS) {
+      const result = preliminaryCliAvailability({ cliId });
+      expect(result.status).toBe(result.available ? 'available' : 'unknown');
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      executable(dir, 'traex');
+      executable(dir, 'forge');
+      process.env.PATH = dir;
+      expect(preliminaryCliAvailability({ cliId: 'traex', cliLaunchMode: 'forge-traex' }).status).toBe('unknown');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('checks asynchronous PATH/override/wrapper/remote dependencies without global env changes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      const traex = executable(dir, 'traex');
+      const wrapper = executable(dir, 'gateway');
+      const env = { PATH: dir };
+      expect(await checkCliAvailabilityAsync({ cliId: 'traex' }, { env })).toMatchObject({
+        status: 'available', resolvedPath: traex,
+      });
+      expect(await checkCliAvailabilityAsync({ cliId: 'codex', cliPathOverride: traex }, { env })).toMatchObject({
+        status: 'available', resolvedPath: traex,
+      });
+      expect(await checkCliAvailabilityAsync({ cliId: 'codex', wrapperCli: 'gateway codex' }, { env })).toMatchObject({
+        status: 'available', resolvedPath: wrapper,
+      });
+      expect(await checkCliAvailabilityAsync({ cliId: 'codex', cliPathOverride: '/missing/codex' }, { env })).toMatchObject({
+        status: 'unavailable', command: '/missing/codex',
+      });
+      for (const cliId of ['mira', 'riff'] as const) {
+        expect(await checkCliAvailabilityAsync({ cliId }, { env })).toMatchObject({
+          status: 'available', localExecutableRequired: false,
+        });
+      }
+      expect(process.env.PATH).toBe(originalPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs asynchronous Forge doctor and checks both executables', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      executable(dir, 'traex');
+      const forge = executable(dir, 'forge');
+      const input = { cliId: 'traex' as const, cliLaunchMode: 'forge-traex' as const };
+      const opts = { env: { PATH: dir }, shellFallback: false };
+      expect((await checkCliAvailabilityAsync(input, opts)).status).toBe('available');
+      writeFileSync(forge, '#!/bin/sh\nexit 7\n');
+      expect((await checkCliAvailabilityAsync(input, opts)).status).toBe('unavailable');
+      rmSync(forge);
+      expect(await checkCliAvailabilityAsync(input, opts)).toMatchObject({
+        status: 'unavailable', command: 'forge',
+      });
+      expect((await checkCliAvailabilityAsync({ cliId: 'codex', cliLaunchMode: 'forge-traex' }, opts)).status)
+        .toBe('unavailable');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('only treats actual Agent launch-field changes as a new availability gate', () => {
     const current = {
       cliId: 'codex' as const,

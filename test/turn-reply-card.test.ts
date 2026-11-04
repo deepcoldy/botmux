@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import { TurnReplyCardStore, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
-import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
+import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
+import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 import type { CotEntry } from '../src/types.js';
@@ -18,6 +19,15 @@ const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' }
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 const finalEvent = (text = '完整答复', source: 'explicit' | 'bridge' = 'explicit') => ({
   kind: 'final' as const, text, card: buildCanonicalFinalReplyCard({ markdown: text }), source,
+});
+
+it('reads the unified card tool visibility from bot config, defaulting to visible', () => {
+  const configs = parseBotConfigsFromText(JSON.stringify([
+    { larkAppId: 'app_hidden', larkAppSecret: 'secret', replyCardShowTools: false },
+    { larkAppId: 'app_default', larkAppSecret: 'secret' },
+  ]));
+  expect(replyCardPresentation(configs[0], 'oc_any').showTools).toBe(false);
+  expect(replyCardPresentation(configs[1], 'oc_any').showTools).toBe(true);
 });
 
 describe('one reply card per turn', () => {
@@ -38,6 +48,173 @@ describe('one reply card per turn', () => {
     await store.prepare(key, input);
   });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it.each(['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'] as const)(
+    'replays an unacknowledged %s PATCH without changing terminal facts or creating a card', async phase => {
+      await store.update(key, { kind: 'start' }, io);
+      vi.mocked(io.patch).mockRejectedValueOnce(new Error('PATCH unavailable'));
+      await expect(store.update(key, { kind: 'terminal', phase, durationMs: 1234, completedAtMs: 5678 }, io))
+        .rejects.toThrow('PATCH unavailable');
+      const before = store.read(key)!;
+      expect(before.pendingPatch).toMatchObject({ final: false });
+      expect(before.pendingPatch?.content).not.toBe(before.lastCard);
+      await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+      const after = store.read(key)!;
+      expect(after).toMatchObject({ phase, durationMs: 1234, completedAtMs: 5678,
+        messageId: before.messageId, lastCard: before.pendingPatch!.content });
+      expect(after.pendingPatch).toBeUndefined();
+      expect(io.send).toHaveBeenCalledTimes(1);
+      expect(cards.get(after.messageId!)).toBe(before.pendingPatch!.content);
+      const patches = vi.mocked(io.patch).mock.calls.length;
+      await store.update(key, { kind: 'recover' }, io);
+      expect(io.patch).toHaveBeenCalledTimes(patches);
+    },
+  );
+
+  it('replays the same PATCH after its remote acceptance was not acknowledged', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    const patch = io.patch;
+    io.patch = vi.fn(async (id, content) => { await patch(id, content); throw new Error('ACK lost'); });
+    await expect(store.update(key, { kind: 'terminal', phase: 'cancelled' }, io)).rejects.toThrow('ACK lost');
+    const pending = store.read(key)!.pendingPatch!;
+    io.patch = vi.fn(patch);
+    vi.mocked(io.patch).mockClear();
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(io.patch).toHaveBeenCalledExactlyOnceWith(store.read(key)!.messageId, pending.content);
+    expect(cards.size).toBe(1);
+  });
+
+  it('recovers an undelivered final and its existing overflow attachment without uploading again', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    io.sendOverflow = vi.fn(async () => 'om_file');
+    vi.mocked(io.patch).mockRejectedValue(new Error('PATCH unavailable'));
+    await expect(store.update(key, finalEvent('Long answer '.repeat(8000)), io)).rejects.toThrow('PATCH unavailable');
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed' }, io)).rejects.toThrow('PATCH unavailable');
+    expect(store.read(key)).toMatchObject({ phase: 'completed', overflowMessageId: 'om_file', pendingPatch: { final: true } });
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    vi.mocked(io.patch).mockImplementation(async (id, content) => { cards.set(id, content); });
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(store.read(key)).toMatchObject({ phase: 'completed', finalDelivered: true, overflowMessageId: 'om_file' });
+    expect(store.read(key)?.pendingPatch).toBeUndefined();
+    expect(io.sendOverflow).toHaveBeenCalledTimes(1);
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains a failed recovery for another attempt and never recreates a withdrawn card', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValue(new Error('PATCH unavailable'));
+    await expect(store.update(key, { kind: 'terminal', phase: 'cancelled' }, io)).rejects.toThrow();
+    await expect(store.update(key, { kind: 'recover' }, io)).rejects.toThrow('PATCH unavailable');
+    expect(store.read(key)?.pendingPatch).toBeDefined();
+    vi.mocked(io.patch).mockRejectedValue(new Error('withdrawn'));
+    await expect(store.update(key, { kind: 'recover' }, io)).rejects.toThrow('withdrawn');
+    expect(store.read(key)?.withdrawn).toBe(true);
+    vi.mocked(io.patch).mockClear();
+    await store.update(key, { kind: 'recover' }, io);
+    expect(io.patch).not.toHaveBeenCalled();
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('persists image fallback during recovery before an unknown PATCH result', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValue(new Error('PATCH unavailable'));
+    await expect(store.update(key, finalEvent('Answer. ![Preview](img_v3_rejected)'), io)).rejects.toThrow();
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed' }, io)).rejects.toThrow();
+    vi.mocked(io.patch).mockImplementation(async (id, content) => {
+      if (content.includes('![Preview]')) throw new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      cards.set(id, content);
+      throw new Error('ACK lost');
+    });
+    await expect(store.update(key, { kind: 'recover' }, io)).rejects.toThrow('ACK lost');
+    const pending = store.read(key)!.pendingPatch!;
+    expect(pending.content).toContain('[Image omitted]');
+    expect(pending.content).not.toContain('![Preview]');
+    vi.mocked(io.patch).mockImplementation(async (id, content) => { cards.set(id, content); });
+    await store.update(key, { kind: 'recover' }, io);
+    expect(store.read(key)).toMatchObject({ phase: 'completed', omitImages: true, finalDelivered: true, lastCard: pending.content });
+    expect(cards.size).toBe(1);
+  });
+
+  it('does not replay an obsolete payload when a newer revision fails before rendering', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValueOnce(new Error('PATCH unavailable'));
+    await expect(store.update(key, { kind: 'progress', text: 'Old progress' }, io)).rejects.toThrow();
+    const render = io.render;
+    io.render = () => { throw new Error('render failed'); };
+    await expect(store.update(key, { kind: 'terminal', phase: 'cancelled' }, io)).rejects.toThrow('render failed');
+    io.render = render;
+    vi.mocked(io.patch).mockClear();
+    await store.update(key, { kind: 'recover' }, io);
+    expect(io.patch).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(io.patch).mock.calls[0][1]).toContain('已停止');
+    expect(store.read(key)).toMatchObject({ phase: 'cancelled' });
+    expect(store.read(key)?.pendingPatch).toBeUndefined();
+  });
+
+  it('keeps an undelivered final hidden when recovering a legacy ambiguous record', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValue(new Error('PATCH unavailable'));
+    await expect(store.update(key, finalEvent('LEGACY-UNDELIVERED-ANSWER'), io)).rejects.toThrow();
+    await expect(store.update(key, { kind: 'terminal', phase: 'ambiguous' }, io)).rejects.toThrow();
+    const legacy = store.read(key)!;
+    delete legacy.pendingPatch;
+    delete legacy.publishPending;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(legacy));
+    vi.mocked(io.patch).mockImplementation(async (id, content) => { cards.set(id, content); });
+    await store.update(key, { kind: 'recover' }, io);
+    expect(store.read(key)?.phase).toBe('ambiguous');
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    expect(cards.get(legacy.messageId!)).not.toContain('LEGACY-UNDELIVERED-ANSWER');
+  });
+
+  it.each(['render', 'journal'] as const)('preserves legacy final visibility after a recovery %s failure', async failure => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValue(new Error('PATCH unavailable'));
+    await expect(store.update(key, finalEvent('LEGACY-UNDELIVERED-ANSWER'), io)).rejects.toThrow();
+    await expect(store.update(key, { kind: 'terminal', phase: 'ambiguous' }, io)).rejects.toThrow();
+    const legacy = store.read(key)!;
+    delete legacy.pendingPatch;
+    delete legacy.publishPending;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(legacy));
+    const render = io.render;
+    const write = (store as any).write.bind(store);
+    let restore: () => void;
+    if (failure === 'render') {
+      io.render = () => { throw new Error('recovery interrupted'); };
+      restore = () => { io.render = render; };
+    } else {
+      const fault = vi.spyOn(store as any, 'write').mockImplementation((k: any, record: any) => {
+        if (record.pendingPatch) throw new Error('recovery interrupted');
+        return write(k, record);
+      });
+      restore = () => fault.mockRestore();
+    }
+    await expect(store.update(key, { kind: 'recover' }, io)).rejects.toThrow('recovery interrupted');
+    expect(store.read(key)).toMatchObject({ publishPending: true, recoveryHideFinal: true });
+    restore();
+    vi.mocked(io.patch).mockImplementation(async (id, content) => { cards.set(id, content); });
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    expect(cards.get(legacy.messageId!)).not.toContain('LEGACY-UNDELIVERED-ANSWER');
+    expect(store.read(key)?.publishPending).toBeUndefined();
+    expect(store.read(key)?.recoveryHideFinal).toBeUndefined();
+  });
+
+  it('replaying the ambiguous settle card never marks an unseen final as delivered', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValue(new Error('PATCH unavailable'));
+    // A non-terminal turn whose final PATCH was never acknowledged; the process
+    // dies before the terminal event, so startup recovery settles the still-
+    // working card as ambiguous and hides the unproven final.
+    await expect(store.update(key, finalEvent('UNSEEN-ANSWER-PROBE'), io)).rejects.toThrow();
+    expect(store.read(key)?.phase).toBe('working');
+    await expect(store.update(key, { kind: 'recover' }, io)).rejects.toThrow();
+    expect(store.read(key)).toMatchObject({ phase: 'ambiguous', pendingPatch: { final: false } });
+    vi.mocked(io.patch).mockImplementation(async (id, content) => { cards.set(id, content); });
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    expect(cards.get(store.read(key)!.messageId!)).not.toContain('UNSEEN-ANSWER-PROBE');
+  });
 
   it('settles a superseded turn after its in-flight initial POST is acknowledged', async () => {
     let acknowledge!: () => void;
@@ -190,6 +367,38 @@ describe('one reply card per turn', () => {
     await store.update(nextKey, { kind: 'start' }, io);
     expect(cards.size).toBe(2);
     expect(cards.get(start.messageId!)).toBe(body);
+  });
+
+  it('keeps thinking in unified cards while hiding tool calls and commands', async () => {
+    io.render = record => buildTurnReplyCard(record, { ...presentation, showTools: false });
+    const started = await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'tools',
+      tools: [{ id: 't1', name: 'ExecCommand', subject: 'SECRET_TOOL_COMMAND_MARKER', result: 'SECRET_RESULT_MARKER' }],
+      activity: [
+        { kind: 'thinking', id: 'thinking:1', text: 'VISIBLE_THINKING_MARKER' },
+        { kind: 'tool', id: 't1' },
+      ],
+    }, io);
+    const workingCard = cards.get(started.messageId!)!;
+    const finalCard = (await store.update(key, finalEvent(), io)).card!;
+    const completedCard = (await store.update(key, { kind: 'terminal', phase: 'completed' }, io)).card!;
+    for (const card of [workingCard, finalCard, completedCard]) {
+      expect(card).toContain('VISIBLE_THINKING_MARKER');
+      expect(card).not.toContain('SECRET_TOOL_COMMAND_MARKER');
+      expect(card).not.toContain('SECRET_RESULT_MARKER');
+      expect(card).not.toContain('ExecCommand');
+      // gate①: the panel title must not leak a tool count either.
+      expect(card).not.toContain('次工具调用');
+    }
+    expect(store.read(key)?.tools).toHaveLength(1);
+    // English rendering: singular "tool call" must be hidden too (covers both
+    // "tool call" and "tool calls"); positive assertions pin the fixture.
+    const hiddenEn = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: false, locale: 'en' });
+    expect(hiddenEn).not.toContain('tool call');
+    const shownZh = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: true });
+    expect(shownZh).toContain('次工具调用');
+    const shownEn = buildTurnReplyCard(store.read(key)!, { ...presentation, showTools: true, locale: 'en' });
+    expect(shownEn).toContain('tool call');
   });
 
   it('retains tools across a burst of progress patches without losing stored history or creating another message', async () => {

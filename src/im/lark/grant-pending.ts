@@ -49,6 +49,10 @@ type Entry = {
   messageData?: any;
   /** 卡片已确认送达。只有送达的 pending 才落盘（denied 不看这个字段）。 */
   delivered?: boolean;
+  /** 卡片作为申请人那条消息的回复发在原会话里：卡片本身就写着在等管理员处理，申请人看得见，
+   *  待处理期间再来找 bot 不另发「还在等」文字。转投管理员私聊的卡申请人看不见，不带这个标记。
+   *  随 pending 落盘，daemon 重启后照样生效；旧版本读文件时忽略这个字段。 */
+  shownToRequester?: boolean;
 };
 type PersistedFile = { version: unknown; entries: Record<string, unknown> };
 
@@ -78,7 +82,7 @@ function isPersisted(e: Entry): boolean {
 /** 磁盘条目 → 内存条目；形状不对返回 null（整条丢弃）。 */
 function parseEntry(raw: unknown): Entry | null {
   if (!isJsonObject(raw)) return null;
-  const { state, nonce, ts, quota, durationMs, messageData } = raw;
+  const { state, nonce, ts, quota, durationMs, messageData, shownToRequester } = raw;
   if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
   if (state === 'denied') return { state, ts };
   if (state !== 'pending' || typeof nonce !== 'string' || !nonce) return null;
@@ -90,6 +94,7 @@ function parseEntry(raw: unknown): Entry | null {
   const e: Entry = { state, nonce, ts, delivered: true };
   if (quota !== undefined) e.quota = quota;
   if (durationMs !== undefined) e.durationMs = durationMs;
+  if (shownToRequester === true) e.shownToRequester = true;
   // 重放用的原始消息只是锦上添花：坏了就不重放，卡片照样能点。
   if (isJsonObject(messageData)) e.messageData = messageData;
   return e;
@@ -141,6 +146,7 @@ function serialize(map: Map<string, Entry>, withMessageData: boolean): string {
           ts: e.ts,
           quota: e.quota,
           durationMs: e.durationMs,
+          ...(e.shownToRequester ? { shownToRequester: true } : {}),
           ...(withMessageData && e.messageData !== undefined ? { messageData: e.messageData } : {}),
         };
   }
@@ -277,13 +283,17 @@ export function openPendingMulti(
 
 /** 卡片已送达（发卡 API 成功）→ 标记并落盘，从此这张卡能扛过 daemon 重启。
  *  只认 nonce 仍匹配的 pending：发卡期间已被处置 / 被新卡覆盖的条目不会被复活。 */
-export function markPendingDelivered(larkAppId: string, chatId: string, targets: string[], nonce: string): void {
+export function markPendingDelivered(
+  larkAppId: string, chatId: string, targets: string[], nonce: string,
+  opts: { shownToRequester?: boolean } = {},
+): void {
   const map = tableFor(larkAppId);
   let changed = false;
   for (const target of targets) {
     const e = map.get(key(chatId, target));
     if (e && e.state === 'pending' && e.nonce === nonce && !e.delivered) {
       e.delivered = true;
+      if (opts.shownToRequester) e.shownToRequester = true;
       changed = true;
     }
   }
@@ -499,7 +509,8 @@ export function claimThrottleNotice(
   const reason = throttleReason(larkAppId, chatId, target);
   if (!reason) return null;
   const e = tableFor(larkAppId).get(key(chatId, target));
-  if (!e || (e.state === 'pending' && e.delivered !== true)) return null;
+  // 卡还没确认送达（可能失败被撤）或申请人自己就看得见那张卡：都不另发提示。
+  if (!e || (e.state === 'pending' && (e.delivered !== true || e.shownToRequester === true))) return null;
   const mark = e.state === 'pending' ? `pending:${e.nonce}` : `denied:${e.ts}`;
   const markKey = `${larkAppId}:${key(chatId, target)}`;
   if (throttleNoticeMarks.get(markKey) === mark) return null;

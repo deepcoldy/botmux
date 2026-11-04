@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -324,6 +324,29 @@ describe('daemon current actor attestation', () => {
     expect(resolveIdentity).not.toHaveBeenCalled();
   });
 
+  it('fails closed when a mid-ancestor stat between peer and trusted root is unreadable', async () => {
+    // Lineage: peer 101 -> 102 -> trusted CLI root 100. The walk must not skip
+    // an unreadable hop to "find" the root above it; the peer's own stat stays
+    // readable so this exercises the in-walk catch, not peer resolution.
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 102, 100, '1200');
+    writeProc(procRoot, 101, 102, '1100');
+    const input = {
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '1100' },
+      findSession: () => activeSession(),
+      procRoot,
+    };
+    // Positive control: the same chain is attested while the hop is readable.
+    expect(resolveDaemonCurrentExecution(input)).toMatchObject({
+      schema: 'botmux.current-execution.v1', status: 'verified', sessionId: 's1', turnId: 'om_turn',
+    });
+    rmSync(join(procRoot, '102', 'stat'), { force: true });
+    expect(resolveDaemonCurrentExecution(input)).toBeNull();
+  });
+
   it('rejects a new descendant reached through an old-turn child', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
     writeProc(procRoot, 90, 1, '900');
@@ -375,6 +398,27 @@ describe('daemon current actor attestation', () => {
       expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: 'om_turn' });
       // Incremental auth uses this same proof before creating a user grant.
       expect(attestCurrentTurnLoopbackPeer(input)).toMatchObject({ callerOpenId: 'ou_current', turnId: 'om_turn' });
+    });
+
+    it('requires the App runner to attest its nested app-server before new tools can cross turns', async () => {
+      const { procRoot, ds, check, input } = fixture();
+      writeProc(procRoot, 95, 1, '950');
+      writeProc(procRoot, 100, 95, '1000');
+      ds.localProcessAttestation.cliPid = 95;
+      ds.localProcessAttestation.cliProcStart = '950';
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('95:950');
+      // The runner is the CLI entry; the persistent native engine below it
+      // must not be mistaken for a previous-turn tool.
+      expect(resolveDaemonCurrentExecution(input)).toBeNull();
+      ds.localProcessAttestation.enginePid = 100;
+      ds.localProcessAttestation.engineProcStart = '1000';
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified' });
+      await expect(check()).resolves.toMatchObject({ ok: true });
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('102:2000');
+      writeProc(procRoot, 103, 102, '3000');
+      await expect(check(103, '3000')).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      writeProc(procRoot, 100, 95, 'recycled');
+      expect(resolveDaemonCurrentExecution(input)).toBeNull();
     });
 
     it.each([

@@ -21,10 +21,14 @@ let session: any;
 
 beforeEach(async () => {
   session = {
-    session: { sessionId: 'auth-session', status: 'active' },
+    session: { sessionId: 'auth-session', status: 'active', backendType: 'pty' },
     larkAppId: 'cli_test', chatId: 'oc_test',
-    worker: { killed: false }, workerGeneration: 4,
+    worker: { killed: false, pid: process.pid }, workerGeneration: 4,
     managedTurnOrigin: { capability: CAP, turnId: 'om_turn', callerOpenId: 'ou_sender' },
+    // F3: the worker spawn report is the daemon's only identity-model input.
+    reportedIdentityModel: { model: process.platform === 'linux' ? 'proven' : 'single',
+      sandboxEngaged: false, loopbackShared: true,
+      workerPid: process.pid, workerGeneration: 4, reportedAt: 1 },
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'auth-session' ? session : undefined);
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
@@ -35,6 +39,7 @@ beforeEach(async () => {
     authUrl: AUTH_URL, scopes: ['offline_access', 'im:chat:read'], expiresIn: 600, poll,
   });
   vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(true);
+  vi.spyOn(cliIdentity, 'sessionIdentityMaterialPresent').mockReturnValue(true);
   setIpcAuthSecret(SECRET);
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
@@ -78,7 +83,26 @@ describe('agent authorization', () => {
     expect(await (await post('auth-status', { requestId: request.requestId })).json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_turn', openId: 'ou_target_human',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
+  });
+
+  it('authorizes an actorless scheduled delegation through its execution identity', async () => {
+    delegate();
+    delete session.managedTurnOrigin.callerOpenId;
+    session.managedTurnOrigin.identityTurnId = 'om_turn';
+    session.managedTurnOrigin.turnId = 'om_envelope';
+    const request = await (await post('auth-request', { originTurnId: 'om_envelope' })).json();
+    expect(request).toMatchObject({ ok: true, authUrl: AUTH_URL });
+    poll.mockResolvedValue({ status: 'ready', token: 'target-app-grant' });
+    expect(await (await post('auth-status', { requestId: request.requestId, originTurnId: 'om_envelope' })).json())
+      .toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_turn', openId: 'ou_target_human',
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it.each([
@@ -125,7 +149,9 @@ describe('agent authorization', () => {
     expect((await post('auth-status', { requestId: request.requestId, originTurnId: 'om_next' })).status).toBe(200);
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_next', openId: 'ou_target_human',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('rejects another human behind the same dispatch bot before polling', async () => {
@@ -243,7 +269,9 @@ describe('agent authorization', () => {
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token',
       turnId: 'om_next', openId: 'ou_sender',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('refuses to hand the token to a different human’s live turn', async () => {
@@ -278,21 +306,50 @@ describe('agent authorization', () => {
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_turn',
       openId: 'ou_sender',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
-  it('preserves newer queued credentials and refuses a rotated worker', async () => {
+  it('waits for the matching identity marker and completes after a same-person worker restart', async () => {
     requestId = (await (await post()).json()).requestId;
     poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
     vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
-    expect((await post('auth-status', { requestId })).status).toBe(409);
+    expect(await (await post('auth-status', { requestId })).json()).toEqual({ ok: true, status: 'pending' });
     vi.mocked(cliIdentity.refreshSessionIdentity).mockClear();
     session.workerGeneration++;
     const response = await post('auth-status', { requestId });
-    // Still refused: the live turn file does not line up, so refresh fails
-    // closed and the fresh token is never published to a queued identity.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, status: 'pending' });
+    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(true);
+    expect(await (await post('auth-status', { requestId })).json()).toEqual({ ok: true, status: 'ready' });
+  });
+
+  it('terminates the wait with 409 when the current turn material is gone for good', async () => {
+    // Branch 1: originating turn still live. A failed refresh means the
+    // material vanished (GC / never prepared / daemon restart) — polling until
+    // the deadline could never succeed, so the CLI must stop waiting.
+    requestId = (await (await post()).json()).requestId;
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
+    vi.mocked(cliIdentity.sessionIdentityMaterialPresent).mockReturnValue(false);
+    const response = await post('auth-status', { requestId });
     expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
+    expect(await response.json()).toMatchObject({ ok: false, error: 'auth_identity_snapshot_missing' });
+  });
+
+  it('terminates the wait with 409 when a rotated same-person turn has no material', async () => {
+    // Branch 2: the turn rotated to a same-principal follow-up while the human
+    // was authorizing; the live turn's material is missing, so neither a
+    // perpetual pending poll nor publication into a dead turn is acceptable.
+    requestId = (await (await post()).json()).requestId;
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
+    vi.mocked(cliIdentity.sessionIdentityMaterialPresent).mockReturnValue(false);
+    session.managedTurnOrigin = { capability: CAP, turnId: 'om_next', callerOpenId: 'ou_sender' };
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'auth_identity_snapshot_missing' });
   });
 
   it('daemon-side polling completes the grant after the Agent turn ends without a wait call', async () => {
@@ -310,7 +367,9 @@ describe('agent authorization', () => {
     expect(await response.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_next', openId: 'ou_sender',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('reuses a pending link across turns without extending its deadline', async () => {
@@ -379,9 +438,12 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
   function hostSession(): any {
     const start = readProcessStartIdentity(process.pid);
     return {
-      session: { sessionId: 'host-session', status: 'active' },
+      session: { sessionId: 'host-session', status: 'active', backendType: 'pty' },
       larkAppId: 'cli_test', chatId: 'oc_test',
       worker: { pid: process.pid, killed: false }, workerGeneration: 9,
+      // F3: identity model comes from the worker spawn report.
+      reportedIdentityModel: { model: 'proven', sandboxEngaged: false, loopbackShared: true,
+        workerPid: process.pid, workerGeneration: 9, reportedAt: 1 },
       localProcessAttestation: {
         backendType: 'pty', credentialIsolated: false,
         cliPid: process.pid, cliProcStart: start, workerGeneration: 9,
@@ -451,7 +513,9 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     expect(await (await hostPost('auth-status', { requestId: request.requestId })).json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'target-app-grant', turnId: 'om_host', openId: 'ou_target_human',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 
   it('authorizes an RPC client through the independently attested engine root', async () => {
@@ -502,6 +566,8 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'host-user-token', turnId: 'om_host',
       openId: 'ou_host',
-    });
+    },
+    process.platform === 'linux' ? 'proven' : 'single',
+  );
   });
 });

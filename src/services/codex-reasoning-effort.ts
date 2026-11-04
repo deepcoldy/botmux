@@ -43,6 +43,8 @@ const SIX_LEVEL_MODELS = new Set([
 const FIVE_LEVEL_MODELS = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
 const GROK_XHIGH_MODELS = new Set(['grok-4.6']);
 const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoningEffort[]>([
+  ['gpt-6-astra', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-6.1-sol', CODEX_COMMON_REASONING_EFFORTS],
   ['seed-evolving', []],
   ['seed-2.1-pro', []],
   ['seed-2.1-turbo', []],
@@ -79,7 +81,12 @@ export function isBackendVariantCliId(cliId: string | undefined): boolean {
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
   return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
-    || cliId === 'claude-code' || cliId === 'kimi';
+    || cliId === 'claude-code' || cliId === 'kimi'
+    // ZCode's per-model levels are declared in its own provider catalog and can
+    // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
+    // a switch). The launch path resolves the closest supported level, so the
+    // whole vocabulary is offered here instead of a per-model subset.
+    || cliId === 'zcode';
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -105,6 +112,10 @@ export function grokReasoningEffortsForModel(model: string | undefined): readonl
   return GROK_COMMON_REASONING_EFFORTS;
 }
 
+export function knownTraexReasoningEffortsForModel(model: string): readonly CodexReasoningEffort[] | undefined {
+  return TRAEX_REASONING_EFFORTS_BY_MODEL.get(model.trim().toLowerCase());
+}
+
 export function traexReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {
   const normalized = model?.trim().toLowerCase() ?? '';
   if (!normalized) return TRAEX_COMMON_REASONING_EFFORTS;
@@ -121,6 +132,10 @@ export function reasoningEffortsForCliModel(
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);
   if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
   if (cliId === 'claude-code') return claudeReasoningEffortsForModel(model);
+  // ZCode: every level is accepted here and narrowed to the model's real
+  // capability at launch (services/zcode-model-config.ts), which keeps the
+  // chooser model-independent while the card still shows what actually ran.
+  if (cliId === 'zcode') return CODEX_REASONING_EFFORTS;
   if (cliId === 'kimi') {
     // Kimi 的 effort 环境变量只作用于 kimi provider，不猜测自定义别名的能力。
     return model?.trim() === 'kimi-code/k3' || model?.trim() === 'kimi-code/k3-256k'

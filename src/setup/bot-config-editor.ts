@@ -1,7 +1,10 @@
 import type { CliId } from '../adapters/cli/types.js';
 import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
+import { RETIRED_CLIS, retiredCliNotice } from '../adapters/cli/retired-cli.js';
 import {
+  dropConfiguredCliRuntime,
   normalizeCliRuntimeConfig,
+  supportsConfiguredCliRuntime,
   type CliRuntimeConfig,
 } from '../adapters/cli/runtime.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
@@ -17,7 +20,8 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '3': 'coco',
   '4': 'codex',
   '5': 'cursor',
-  '6': 'gemini',
+  // '6' 是已移除的 gemini（见 adapters/cli/retired-cli.ts），留空不复用：
+  // 老脚本喂 6 应当报错，而不是静默选中别的 CLI。
   '7': 'opencode',
   '8': 'antigravity',
   '9': 'mtr',
@@ -54,6 +58,9 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // 插位会让老脚本静默选错 CLI。
   '31': 'mimocode',
   '32': 'remote-runner',
+  '33': 'codem',
+  '34': 'zcode',
+  '35': 'doubao',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -80,8 +87,10 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   const mapped = CLI_ID_CHOICES[raw];
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
+  const retiredId = Object.keys(RETIRED_CLIS).find(id => id === raw || RETIRED_CLIS[id]!.setupChoice === raw);
+  if (retiredId) throw new Error(retiredCliNotice(retiredId));
   // 序号上界从 CLI_ID_CHOICES 派生, 新增 CLI 时自动跟随, 不再手写硬编码区间.
-  const maxChoice = Object.keys(CLI_ID_CHOICES).length;
+  const maxChoice = Math.max(...Object.keys(CLI_ID_CHOICES).map(Number));
   throw new Error(
     `Unknown CLI 适配器 "${raw}"。请输入序号 1-${maxChoice} 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
@@ -546,6 +555,7 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   const appSecret = trimmed(input.larkAppSecret);
   if (appSecret) out.larkAppSecret = appSecret;
 
+  const previousCliId = out.cliId;
   const cliId = resolveCliId(input.cliChoice);
   if (cliId) out.cliId = cliId;
 
@@ -577,16 +587,13 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     delete out.cliRuntime;
   }
 
-  // The first supported custom-runtime family is Codex. Switching a bot to a
-  // different adapter must not strand a stale Codex distribution descriptor
-  // that a later edit or old client could accidentally revive.
-  if (out.cliId !== 'codex') {
-    if (explicitlySettingRuntime) throw new Error('cliRuntime is currently supported only for cliId "codex"');
-    const oldRuntimeExecutable = out.cliRuntime && typeof out.cliRuntime === 'object'
-      ? out.cliRuntime.executable
-      : undefined;
-    delete out.cliRuntime;
-    if (oldRuntimeExecutable && out.cliPathOverride === oldRuntimeExecutable) delete out.cliPathOverride;
+  // A distribution implements one adapter contract. Changing adapters must
+  // clear the old descriptor even when both families support custom runtimes.
+  const supportsRuntime = supportsConfiguredCliRuntime(out.cliId);
+  const adapterChanged = !!cliId && cliId !== previousCliId;
+  if (!supportsRuntime || (adapterChanged && !explicitlySettingRuntime)) {
+    if (explicitlySettingRuntime) throw new Error('cliRuntime is currently supported only for cliId "codex" or "kimi"');
+    dropConfiguredCliRuntime(out, true);
   }
 
   if (out.cliRuntime) {

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const confirmMock = vi.hoisted(() => vi.fn(async () => true));
 vi.mock('../src/dashboard/web/confirm-modal.js', () => ({ confirm: confirmMock }));
 
-const { createHashChangeHandler, holdHashNavigation, pendingLeavePrompt, setLeaveGuard } = await import('../src/dashboard/web/leave-guard.js');
+const { createHashChangeHandler, holdHashNavigation, navigateToHash, pendingLeavePrompt, setLeaveGuard } = await import('../src/dashboard/web/leave-guard.js');
 
 const PROMPT = { title: 'Unsaved', message: 'Leave anyway?' };
 
@@ -138,5 +138,53 @@ describe('shell hashchange handler', () => {
     location.hash = '#/sessions';
     onHashChange();
     expect(location.hash).toBe('#/message-listeners');
+  });
+});
+
+describe('in-app navigation (⌘K palette)', () => {
+  let release: (() => void) | undefined;
+  const dispatchEvent = vi.fn();
+  const location = { hash: '#/message-listeners' };
+
+  beforeEach(() => {
+    confirmMock.mockReset();
+    dispatchEvent.mockReset();
+    location.hash = '#/message-listeners';
+    vi.stubGlobal('location', location);
+    vi.stubGlobal('window', { dispatchEvent });
+    vi.stubGlobal('HashChangeEvent', class { constructor(readonly type: string) {} });
+  });
+  afterEach(() => {
+    release?.();
+    release = undefined;
+    vi.unstubAllGlobals();
+  });
+
+  it('changes the hash for a different target and leaves guarding to the hashchange handler', () => {
+    release = setLeaveGuard(() => PROMPT);
+    navigateToHash('#/roles');
+    expect(location.hash).toBe('#/roles');
+    expect(confirmMock).not.toHaveBeenCalled();
+    expect(dispatchEvent).not.toHaveBeenCalled();
+  });
+
+  it('replays the same hash right away when nothing is unsaved', () => {
+    release = setLeaveGuard(() => null);
+    navigateToHash('#/message-listeners');
+    expect(dispatchEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'hashchange' }));
+  });
+
+  it('asks before replaying the same hash over unsaved edits (the shell handler does not guard same-hash events)', async () => {
+    release = setLeaveGuard(() => PROMPT);
+    confirmMock.mockResolvedValueOnce(false);
+    navigateToHash('#/message-listeners');
+    await Promise.resolve();
+    expect(confirmMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Unsaved', danger: true }));
+    expect(dispatchEvent).not.toHaveBeenCalled();
+
+    confirmMock.mockResolvedValueOnce(true);
+    navigateToHash('#/message-listeners');
+    await Promise.resolve();
+    expect(dispatchEvent).toHaveBeenCalledTimes(1);
   });
 });

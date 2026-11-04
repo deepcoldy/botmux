@@ -9,9 +9,13 @@
  * Run: bun x vitest run test/stale-program-status.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import {
   ClaudeTranscriptTurnEnd,
+  claudeTranscriptLatestTurnState,
   STALE_PROGRAM_STATUS_QUIET_MS,
   staleProgramStatusVerdict,
 } from '../src/utils/stale-program-status.js';
@@ -140,6 +144,40 @@ describe('ClaudeTranscriptTurnEnd', () => {
     expect(end.endedForMs(5_000)).toBe(4_000);
     end.reset();
     expect(end.endedForMs(5_000)).toBeUndefined();
+  });
+});
+
+describe('claudeTranscriptLatestTurnState (re-attach: is the turn still running?)', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'bmx-turn-state-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  const write = (name: string, rows: unknown[], tail = '') => {
+    const path = join(dir, name);
+    writeFileSync(path, rows.map(row => `${JSON.stringify(row)}\n`).join('') + tail);
+    return path;
+  };
+
+  it('a tool call with no result yet leaves the turn open; its closing record closes it', () => {
+    const path = write('t.jsonl', [userLine('u1'), toolUse('a1')]);
+    expect(claudeTranscriptLatestTurnState(path)).toBe('open');
+    appendFileSync(path, [finalAnswer('a2'), turnDuration('d1')].map(r => `${JSON.stringify(r)}\n`).join(''));
+    expect(claudeTranscriptLatestTurnState(path)).toBe('closed');
+  });
+
+  it('looks past metadata and sidechain records to the latest main-thread one', () => {
+    const path = write('t.jsonl', [
+      userLine('u1'), finalAnswer('a1'),
+      { type: 'file-history-snapshot', uuid: 's1' },
+      { ...userLine('side'), isSidechain: true },
+    ]);
+    expect(claudeTranscriptLatestTurnState(path)).toBe('closed');
+  });
+
+  it('ignores a record still being written and answers nothing for a missing or empty file', () => {
+    const path = write('t.jsonl', [userLine('u1'), finalAnswer('a1')], '{"type":"user","message":{"role":"us');
+    expect(claudeTranscriptLatestTurnState(path)).toBe('closed');
+    expect(claudeTranscriptLatestTurnState(join(dir, 'missing.jsonl'))).toBeUndefined();
+    expect(claudeTranscriptLatestTurnState(write('empty.jsonl', []))).toBeUndefined();
   });
 });
 

@@ -17,7 +17,7 @@ jobs:
       github.actor == 'deepcoldy' &&
       github.triggering_actor == 'deepcoldy' &&
       (github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-'))
-    runs-on: macos-14
+    runs-on: macos-15
     environment: macos-signing
     permissions:
       contents: read
@@ -664,7 +664,8 @@ jobs:
     # cross-compile the JS + runtime, but the embedded `.node` has to be the one
     # `bun install` compiled ON that OS. So we build each OS's binaries on its
     # own native architecture. Linux compiles inside manylinux_2_28 so the embedded
-    # native stays compatible with Node 22's glibc floor; darwin uses macos-14.
+    # native stays compatible with Node 22's glibc floor; darwin uses macos-15
+    # (arm64; macos-14 images were retired on 2026-11-02).
     needs: [preflight]
     # WHY a per-OS **and per-arch** matrix: node-pty's native `pty.node` (and
     # macOS `spawn-helper`) must match the target. Bun can cross-compile the JS +
@@ -696,7 +697,7 @@ jobs:
             targets: bun-linux-arm64
             artifact: linux-arm64
             glibc_baseline: '2.28'
-          - os: macos-14
+          - os: macos-15
             targets: bun-darwin-x64 bun-darwin-arm64
             artifact: darwin
             glibc_baseline: ''
@@ -1013,7 +1014,7 @@ jobs:
     # canary/beta/rc builds without access to the repository owner's certificate.
     if: github.event_name == 'push' && needs.preflight.outputs.tag == 'latest'
     needs: [preflight, bun-binaries]
-    runs-on: macos-14
+    runs-on: macos-15
     environment: macos-signing
     permissions:
       contents: read

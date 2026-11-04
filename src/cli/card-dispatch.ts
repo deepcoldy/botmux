@@ -1,6 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { normalizeInteractiveCardInput } from './send-dispatch.js';
 
+/** Remote content cannot select cards in another session's chat. */
+export async function assertCardPatchChat(
+  appId: string, messageId: string, chatId: string,
+  lookup: (appId: string, messageId: string) => Promise<string | null>,
+): Promise<void> {
+  if (!chatId || await lookup(appId, messageId) !== chatId) throw new Error('riff_host_message_outside_session');
+}
+
 /**
  * `botmux card patch` — patch a previously-sent custom interactive card in
  * place by its messageId (no new message, same chat/topic).

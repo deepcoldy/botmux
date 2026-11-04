@@ -24,7 +24,7 @@ export async function resolveDispatchLaunchSpec(input: {
   if (!catalog?.includes(effectiveModel)) return { ok: false, error: `目标 Bot 的实时 model catalog 不包含 ${effectiveModel}。` };
   const requestedEffort = effort as CodexReasoningEffort | undefined;
   const effectiveEffort = requestedEffort ?? input.target.reasoningEffort;
-  if (effectiveEffort && !cliModelSupportsReasoningEffort(input.target.cliId, effectiveModel, effectiveEffort)) {
+  if (effectiveEffort && input.target.cliId !== 'traex' && !cliModelSupportsReasoningEffort(input.target.cliId, effectiveModel, effectiveEffort)) {
     return { ok: false, error: `模型 ${effectiveModel} 不支持 reasoning effort ${effectiveEffort}。` };
   }
   return {

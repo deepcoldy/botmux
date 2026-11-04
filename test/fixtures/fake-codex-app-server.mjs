@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -23,11 +23,23 @@ const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
 const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
 const threadNotLoadedReads = Number(process.env.FAKE_CODEX_THREAD_NOT_LOADED_READS ?? '0');
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
+// 前 N 次 thread/read 成功响应延迟 M 毫秒——模拟繁忙机器上慢的 app-server，
+// 让单次响应耗时超过调用方的整段等待预算（waitForThreadPreview 的 deadline
+// 超时容错只在这种条件下可复现）。只影响成功响应，不影响错误分支。
+const threadReadDelayMs = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_MS ?? '0');
+const threadReadDelayReads = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_READS ?? '1');
+// Slow every thread/name/set reply, as a loaded runner slows a local round trip.
+const nameSetDelayMs = Number(process.env.FAKE_CODEX_NAME_SET_DELAY_MS ?? '0');
+// Same for the thread/read that verifies a written name (reads after name/set).
+const verifyReadDelayMs = Number(process.env.FAKE_CODEX_VERIFY_READ_DELAY_MS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
 const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
-if (pidPath) writeFileSync(pidPath, String(process.pid));
+// 结尾换行表示 PID 已写完整（test/helpers/pid-file.ts 据此判断）：writeFileSync
+// 先建空文件再写入，轮询方在这个窗口读到 ''，Number('') 是 0，而 process.kill(0, 0)
+// 探测的是测试自己的进程组，永远成功，「已回收」就永远等不到。
+if (pidPath) writeFileSync(pidPath, `${process.pid}\n`);
 if (process.env.FAKE_CODEX_INHERITED_STDIO) {
   // 后代持有 stdio，让父进程 exit 后仍无法触发 close。
   spawn(process.execPath, ['-e', `
@@ -46,15 +58,19 @@ if (process.env.FAKE_CODEX_INHERITED_STDIO) {
 }
 if (envLogPath) {
   const codexHome = process.env.CODEX_HOME ?? '';
+  const configPath = join(codexHome, 'config.toml');
   writeFileSync(envLogPath, JSON.stringify({
     codexHome,
     authExists: existsSync(join(codexHome, 'auth.json')),
-    configExists: existsSync(join(codexHome, 'config.toml')),
+    configExists: existsSync(configPath),
+    // 隔离 home 的实际落盘内容，用来断言白名单：只允许 provider 接线进来。
+    configText: existsSync(configPath) ? readFileSync(configPath, 'utf8') : null,
   }));
 }
 let inputBuffer = '';
 let turnAttempt = 0;
 let threadReadAttempt = 0;
+let nameSetSeen = false;
 let currentThreadName;
 let goalTurn = null;
 let reconciledTurn = null;
@@ -141,6 +157,18 @@ function completeTurn(request) {
   // Exercise duplicate pre-response lifecycle notifications: the runner must
   // buffer one edge and must not misclassify a duplicate as autonomous work.
   if (responseLast) notify('turn/started', { threadId, turn: { id: turnId } });
+  if (behavior === 'capacity-error') {
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed',
+      error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } } });
+    return;
+  }
+  if (behavior === 'failed-no-error') {
+    // Protocol variant: terminal failure that omits the error object entirely.
+    // The runner must settle it as a generic failure, never crash the process
+    // (JSON.stringify(undefined) returns undefined → toLowerCase TypeError).
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed' } });
+    return;
+  }
   if (request.params.outputSchema) {
     write({
       id: 9000 + turnAttempt,
@@ -166,6 +194,10 @@ function completeTurn(request) {
     return;
   }
   if (behavior.startsWith('async-user-input') && turnAttempt === 1) {
+    if (behavior === 'async-user-input-live-steer') {
+      activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+      groupClientIds = [request.params.clientUserMessageId ?? null];
+    }
     const item = { type: 'agentMessage', id: 'call_async_question', delivery: 'async', phase: 'final_answer',
       text: 'Which environment?\nPPE (Recommended) / Production', questions: [
         { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
@@ -190,6 +222,7 @@ function completeTurn(request) {
     }
     if (responseLast) respond(request.id, { turn: { id: turnId } });
     if (behavior === 'async-user-input-exit') { setTimeout(() => process.exit(1), 400); return; }
+    if (behavior === 'async-user-input-live-steer') return;
     setTimeout(() => {
       const status = behavior === 'async-user-input-interrupted' ? 'interrupted' : 'completed';
       notify('item/completed', { threadId, turnId,
@@ -312,7 +345,13 @@ function completeTurn(request) {
     }
     if (responseLast) respond(request.id, { turn: { id: turnId } });
   };
-  if (behavior === 'delayed-first' && turnAttempt === 1) setTimeout(finish, 300);
+  if (process.env.FAKE_CODEX_FINISH_GATE) {
+    const gate = setInterval(() => {
+      if (!existsSync(process.env.FAKE_CODEX_FINISH_GATE)) return;
+      clearInterval(gate);
+      finish();
+    }, 10);
+  } else if (behavior === 'delayed-first' && turnAttempt === 1) setTimeout(finish, 300);
   else finish();
 }
 
@@ -462,6 +501,14 @@ function handle(request) {
 
   if (request.method === 'initialize') {
     if (behavior === 'hang-initialize') return;
+    if (behavior === 'close-stdin-after-initialize') {
+      // 先关读端再回响应：client 收到响应时管道已无人读，它接下来的任何写入都是
+      // EPIPE。libuv 不会替 stdin.destroy() 关掉 0 号 fd，所以显式 closeSync(0)。
+      // 进程本身保持存活，由 client 负责回收。
+      process.stdin.destroy();
+      closeSync(0);
+      setTimeout(() => {}, 60_000);
+    }
     respond(request.id, { userAgent: 'fake-codex-app-server' });
     return;
   }
@@ -530,7 +577,7 @@ function handle(request) {
       reject(request.id, -32600, `thread not loaded: ${request.params.threadId}`);
       return;
     }
-    respond(request.id, {
+    const sendThreadRead = () => respond(request.id, {
       thread: {
         id: request.params.threadId,
         ...(process.env.FAKE_CODEX_THREAD_PATH ? { path: process.env.FAKE_CODEX_THREAD_PATH } : {}),
@@ -539,6 +586,18 @@ function handle(request) {
         updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
       },
     });
+    // 慢响应只作用在「第一次 thread/name/set 之前」的等待阶段；写入后的
+    // 校验 thread/read 必须保持即时，否则调用方短预算会卡在校验环节而不
+    // 是待测的等待环节。
+    if (threadReadDelayMs > 0 && threadReadAttempt <= threadReadDelayReads && !nameSetSeen) {
+      setTimeout(sendThreadRead, threadReadDelayMs);
+      return;
+    }
+    if (verifyReadDelayMs > 0 && nameSetSeen) {
+      setTimeout(sendThreadRead, verifyReadDelayMs);
+      return;
+    }
+    sendThreadRead();
     return;
   }
   if (request.method === 'thread/archive' || request.method === 'thread/unarchive') {
@@ -549,7 +608,9 @@ function handle(request) {
   if (request.method === 'thread/name/set') {
     if (behavior === 'hang-name') return;
     currentThreadName = request.params.name;
-    respond(request.id, {});
+    nameSetSeen = true;
+    if (nameSetDelayMs > 0) setTimeout(() => respond(request.id, {}), nameSetDelayMs);
+    else respond(request.id, {});
     return;
   }
   if (request.method === 'turn/interrupt' || request.method === 'thread/unsubscribe') {
@@ -570,6 +631,21 @@ function handle(request) {
     return;
   }
   if (request.method === 'turn/steer') {
+    if (behavior === 'async-user-input-live-steer') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expected turn is not active'); return;
+      }
+      const { threadId, turnId } = activeTurn;
+      groupClientIds.push(request.params.clientUserMessageId);
+      respond(request.id, { turnId });
+      notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed', itemsView: 'full', error: null,
+        items: [
+          ...groupClientIds.map((clientId, i) => ({ id: `user-${i}`, type: 'userMessage', clientId, content: [] })),
+          { id: 'answered-final', type: 'agentMessage', phase: 'final_answer', text: 'Answer incorporated before task finished' },
+        ] } });
+      activeTurn = undefined;
+      return;
+    }
     // THEIRS: explicit steer scenario drives a pending turn/start (activeTurn)
     // to completion after the 2nd steer. steer-started-first completes after 1.
     if (behavior === 'steer' || behavior === 'steer-started-first') {
@@ -626,6 +702,43 @@ function handle(request) {
         completion,
         { id: request.id, error: { code: -32601, message: 'active turn not steerable' } },
       ]);
+      activeTurn = undefined;
+      return;
+    }
+    if (behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      steerCount += 1;
+      groupClientIds.push(request.params.clientUserMessageId ?? null);
+      respond(request.id, { turnId: activeTurn.turnId });
+      const { threadId, turnId } = activeTurn;
+      const failedGroupTurn = {
+        id: turnId,
+        status: 'failed',
+        itemsView: 'full',
+        // steer-failed-no-error: protocol variant with NO error key at all.
+        ...(behavior === 'steer-failed-no-error'
+          ? {}
+          : { error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } }),
+        items: [
+          { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+          { id: 'user-follow', type: 'userMessage', clientId: groupClientIds[1], content: [] },
+        ],
+      };
+      if (behavior === 'steer-capacity-history') {
+        // Non-canonical completion id; the authoritative failed full-group turn
+        // is reachable only via thread/turns/list, exercising the runner's
+        // reconcileSteeredGroupFromHistory group settle path.
+        reconciledTurn = failedGroupTurn;
+        notify('turn/completed', {
+          threadId,
+          turn: { id: 'turn-foreign-noncanonical', status: 'completed' },
+        });
+      } else {
+        notify('turn/completed', { threadId, turn: failedGroupTurn });
+      }
       activeTurn = undefined;
       return;
     }
@@ -826,11 +939,11 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
-    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+    if (behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
       groupClientIds = [request.params.clientUserMessageId ?? null];
     }
     respond(request.id, { turn: { id: turnId } });

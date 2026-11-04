@@ -24,6 +24,7 @@ import {
   isRiffBackendSession,
   killPersistentBackendTarget,
   probePersistentBackendTarget,
+  probePersistentBackendTargetAfterKill,
   killPersistentSession,
   probePersistentSessions,
   probePersistentBackendTargets,
@@ -305,6 +306,54 @@ describe('persistent post-kill probe policy', () => {
       expect(shouldRejectPersistentPostKillProbe(backendType, probe)).toBe(reject);
     },
   );
+});
+
+describe('probePersistentBackendTargetAfterKill', () => {
+  const target = { backendType: 'tmux', sessionName: 'bmx-abcdef12' } as const;
+  const run = (answers: Array<'exists' | 'missing' | 'unknown'>, attempts?: number) => {
+    const seen: string[] = [];
+    const slept: number[] = [];
+    const result = probePersistentBackendTargetAfterKill(target, {
+      ...(attempts !== undefined ? { attempts } : {}),
+      probe: probed => { seen.push(probed.sessionName); return answers[seen.length - 1] ?? 'unknown'; },
+      sleep: ms => { slept.push(ms); },
+    });
+    return { result, probes: seen.length, slept };
+  };
+
+  it('re-probes an unknown answer until tmux answers for itself', () => {
+    expect(run(['unknown', 'missing'])).toMatchObject({ result: 'missing', probes: 2 });
+    expect(run(['unknown', 'unknown', 'exists'])).toMatchObject({ result: 'exists', probes: 3 });
+  });
+
+  it('returns an authoritative answer at once, without waiting', () => {
+    for (const answer of ['exists', 'missing'] as const) {
+      expect(run([answer, 'missing'])).toEqual({ result: answer, probes: 1, slept: [] });
+    }
+  });
+
+  it('probes once without waiting when no retry is allowed', () => {
+    for (const attempts of [1, 0]) {
+      expect(run(['unknown', 'missing'], attempts)).toEqual({ result: 'unknown', probes: 1, slept: [] });
+    }
+  });
+
+  it('does not wait on a herdr target that is unknown by construction', () => {
+    const probe = vi.fn(() => 'missing' as const);
+    const sleep = vi.fn();
+    const shared = { backendType: 'herdr', sessionName: 'shared-host' } as const;
+    expect(probePersistentBackendTargetAfterKill(shared, { probe, sleep })).toBe('unknown');
+    expect(probe).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('stays unknown once the bounded attempts are used up, waiting between them', () => {
+    const { result, probes, slept } = run(['unknown', 'unknown', 'unknown', 'missing'], 3);
+    expect(result).toBe('unknown');
+    expect(probes).toBe(3);
+    expect(slept).toHaveLength(2);
+    expect(slept[1]!).toBeGreaterThan(slept[0]!);
+  });
 });
 
 describe('killPersistentSession ZMX ownership fence', () => {

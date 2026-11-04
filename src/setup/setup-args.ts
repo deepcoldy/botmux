@@ -129,7 +129,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
                              traecli / forge-x-traex / aiden-x-claude / ttadk-x-codex …；
                              traecli 映射到 TRAE CLI 2.0（内部 cliId=traex）
   --cli-path <path>          CLI 可执行文件路径覆盖
-  --cli-runtime <JSON|->     Codex-compatible runtime 描述；JSON 含 id、
+  --cli-runtime <JSON|->     Codex/Kimi-compatible runtime 描述；JSON 含 id、
                              displayName、executable、update，传 - 清空
   --wrapper-cli <prefix>     通用启动前缀（如 "aiden x claude"），覆盖 --cli 推导值
   --model <m>                CLI 模型名

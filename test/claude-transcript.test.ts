@@ -34,6 +34,8 @@ import {
   classifyClaudeTerminalEvent,
   isSyntheticNoModelReplyEvent,
   apiErrorMessageText,
+  transcriptShowsTurnDurationMarker,
+  transcriptHoldsConversation,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -111,6 +113,26 @@ describe('drainTranscript', () => {
     appendLine({ type: 'assistant', uuid: 'u2', message: { role: 'assistant', content: [{ type: 'text', text: 'short' }] } });
     const r2 = drainTranscript(path, r1.newOffset);
     expect(r2.events.find(e => e.uuid === 'u2')).toBeDefined();
+  });
+});
+
+describe('transcriptShowsTurnDurationMarker', () => {
+  it('finds a main-thread turn_duration in the history behind the baseline', () => {
+    appendLine({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hi' } });
+    appendLine({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }], stop_reason: 'end_turn' } });
+    appendLine({ type: 'system', subtype: 'turn_duration', uuid: 'd1', durationMs: 1200 });
+    appendLine({ type: 'last-prompt', leafUuid: 'a1' });
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(true);
+  });
+
+  it('is false for a transcript that never wrote one, a sidechain one, or only a half-written one', () => {
+    appendLine({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'turn_duration is just a word here' }], stop_reason: 'end_turn' } });
+    appendLine({ type: 'system', subtype: 'turn_duration', uuid: 'side-d', isSidechain: true });
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(false);
+    // A record still being written sits past the baseline cursor.
+    appendFileSync(path, '{"type":"system","subtype":"turn_duration","uuid":"d-partial"', 'utf8');
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(false);
+    expect(transcriptShowsTurnDurationMarker(join(dir, 'missing.jsonl'))).toBe(false);
   });
 });
 
@@ -1047,6 +1069,66 @@ describe('fingerprint fallback: /clear rotation + short fingerprint guard', () =
   });
 });
 
+describe('time floor: records without a timestamp cannot pass it', () => {
+  const floorMs = Date.parse('2026-10-29T10:35:00.000Z');
+  // Shape Claude Code writes next to a prompt: role:user content, no timestamp, no uuid.
+  const blob = (text: string) => JSON.stringify({
+    type: 'api-request-blob',
+    hash: 'abc',
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  }) + '\n';
+  const stalePrompt = (text: string) => JSON.stringify({
+    type: 'user',
+    timestamp: '2026-10-29T10:08:04.933Z',
+    message: { role: 'user', content: text },
+  }) + '\n';
+
+  it('a stale prompt and its blob copy in another session do not match a new turn', () => {
+    const closed = join(dir, 'closed-session.jsonl');
+    appendFileSync(closed, stalePrompt('run the daily report') + blob('run the daily report'), 'utf8');
+    const options = { minEventTimestampMs: floorMs, includeQueueOperations: true };
+    expect(findJsonlsContainingExactContent(dir, 'run the daily report', options)).toEqual([]);
+    expect(findJsonlContainingFingerprint(dir, 'run the daily', options)).toBeNull();
+    expect(jsonlContainsFingerprint(closed, 'run the daily', options)).toBe(false);
+  });
+
+  it('a record with an unparseable timestamp does not pass either', () => {
+    const path = join(dir, 'bad-ts.jsonl');
+    appendFileSync(path, JSON.stringify({
+      type: 'user',
+      timestamp: 'not-a-date',
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily', { minEventTimestampMs: floorMs })).toBe(false);
+  });
+
+  it('a fresh prompt still matches when the file also holds blob copies', () => {
+    const live = join(dir, 'live-session.jsonl');
+    appendFileSync(live, blob('run the daily report') + JSON.stringify({
+      type: 'user',
+      timestamp: '2026-10-29T10:35:43.733Z',
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(findJsonlsContainingExactContent(dir, 'run the daily report', { minEventTimestampMs: floorMs })).toEqual([live]);
+  });
+
+  it('a record exactly at the floor passes (the floor is inclusive)', () => {
+    const path = join(dir, 'at-floor.jsonl');
+    appendFileSync(path, JSON.stringify({
+      type: 'user',
+      timestamp: new Date(floorMs).toISOString(),
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily', { minEventTimestampMs: floorMs })).toBe(true);
+  });
+
+  it('without a floor, the blob copy still counts (behaviour unchanged)', () => {
+    const path = join(dir, 'no-floor.jsonl');
+    appendFileSync(path, blob('run the daily report'), 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily')).toBe(true);
+  });
+});
+
 // ─── isMeaningfulUserEvent / extractLastAssistantTurn ──────────────────────
 //
 // Powers the /adopt preamble: when /adopt fires, the bridge baselines the
@@ -1840,5 +1922,38 @@ describe('trailingAssistantText across memory writes', () => {
     expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: `cat ${mem}-backup/a.md` } }, homePath)).toBe(false);
     expect(isClaudeMemoryToolUse({ name: 'Read', input: { file_path: `${mem}/a.md` } }, homePath)).toBe(false);
     expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${mem}/a.md` } }, undefined)).toBe(false);
+  });
+});
+
+describe('transcriptHoldsConversation', () => {
+  // The records a Claude 2.1.308 transcript opens with before any conversation.
+  const preamble = [
+    { type: 'mode', mode: 'normal', sessionId: 's' },
+    { type: 'permission-mode', permissionMode: 'bypassPermissions', sessionId: 's' },
+    { type: 'file-history-snapshot', messageId: 'm', snapshot: { messageId: 'm', trackedFileBackups: {}, timestamp: '2026-10-22T00:00:00.000Z' }, isSnapshotUpdate: false },
+  ];
+
+  it('is false while the file holds only the metadata a fork child starts with', () => {
+    for (const record of preamble) appendLine(record);
+    expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+
+  it('is true from the first user record — the /clear command Claude writes counts', () => {
+    for (const record of preamble) appendLine(record);
+    appendLine({ type: 'user', isMeta: true, message: { role: 'user', content: '<local-command-caveat>…</local-command-caveat>' } });
+    expect(transcriptHoldsConversation(path)).toBe(true);
+  });
+
+  it('is true for an assistant record, and false for a missing file or a half-written first line', () => {
+    appendLine({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } });
+    expect(transcriptHoldsConversation(path)).toBe(true);
+    expect(transcriptHoldsConversation(join(dir, 'missing.jsonl'))).toBe(false);
+    writeFileSync(path, JSON.stringify({ type: 'user', message: { role: 'user', content: 'still being written' } }));
+    expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+
+  it('does not take a nested "type":"user" for a conversation record', () => {
+    appendLine({ type: 'file-history-snapshot', snapshot: { note: { type: 'user' } } });
+    expect(transcriptHoldsConversation(path)).toBe(false);
   });
 });

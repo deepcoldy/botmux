@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { isWebTerminalDashboardHash } from '../../src/dashboard/web/client-shell.js';
+import { NAV_ITEMS } from '../../src/dashboard/web/nav-items.js';
 
 const electron = vi.hoisted(() => ({
   exposed: new Map<string, Record<string, (...args: any[]) => unknown>>(),
@@ -39,22 +40,16 @@ describe('desktop dashboard embed', () => {
     electron.invoke.mockClear();
   });
 
-  // 源码结构护栏(K4)：桌面壳侧边栏（静态 index.html）必须镜像浏览器 Dashboard 的 NAV_ITEMS
-  // （app.tsx 内未导出的入口模块常量）；两边都是不可 import 的入口脚本，只能读文本对齐。
-  // 守的是「Dashboard 新增页面后桌面端漏加入口」。
+  // 源码结构护栏(K4)：桌面壳侧边栏是静态 index.html，必须镜像浏览器 Dashboard 的 NAV_ITEMS；
+  // HTML 不能 import，只能读文本对齐。守的是「Dashboard 新增页面后桌面端漏加入口」。
   it('mirrors the browser dashboard navigation routes', () => {
-    const dashboardSource = readFileSync(
-      fileURLToPath(new URL('../../src/dashboard/web/app.tsx', import.meta.url)),
-      'utf-8',
-    );
     const desktopHtml = readFileSync(
       fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
       'utf-8',
     );
     const nav = /<nav class="sidebar-nav"[\s\S]*?<\/nav>/.exec(desktopHtml)?.[0] ?? '';
     const sidebarRoutes = [...nav.matchAll(/\bdata-route="([^"]+)"/g)].map(match => match[1]);
-    const navItems = /const NAV_ITEMS: NavItem\[] = \[([\s\S]*?)\];/.exec(dashboardSource)?.[1] ?? '';
-    const dashboardRoutes = [...navItems.matchAll(/\bid: '([^']+)'/g)].map(match => match[1]);
+    const dashboardRoutes = NAV_ITEMS.map(item => item.id);
 
     expect(dashboardRoutes.length).toBeGreaterThan(0);
     // Web-terminal surfaces (the host Terminal page) belong to the native client:

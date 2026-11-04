@@ -400,8 +400,8 @@ export const config = {
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
   // Live getter (like chatBotDiscovery): re-reads the experimental global toggle
   // so a Settings change enables/disables RPC input mode for new codex-family
-  // sessions without a daemon restart. The daemon ORs this with each bot's own
-  // `codexRpcInput` flag when building the worker init message.
+  // sessions without a daemon restart. A bot's explicit true/false overrides
+  // this default; only an absent bot setting inherits it.
   // Default OFF (absent ⇒ disabled): the hybrid RPC pane lifecycle (resume
   // respawn + ready-gate) must be live-verified before the fleet default flips
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
@@ -419,6 +419,14 @@ export const config = {
   // thinking-only nudge as a send failure; it is harmless but unnecessary for the
   // common all-Claude setup, so operators opt in explicitly.
   get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter (like noVisibleOutputHint): the experimental switch for reaping
+  // tmux SERVERS orphaned by a previous daemon generation (see
+  // core/orphan-tmux-reaper.ts). This performs automatic process kills, so it is
+  // default OFF and an operator enables it explicitly from the Dashboard
+  // experimental settings; read live so a flip applies to the next daemon restart
+  // without a rebuild. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1 remains an emergency
+  // kill-switch checked inside the reaper itself.
+  get reapOrphanTmuxServers(): boolean { return readGlobalConfig().dashboard?.reapOrphanTmuxServers === true; },
   // Live getter (like noVisibleOutputHint): the experimental cross-principal
   // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
   // daemon delivers another principal's message normally instead of diverting it

@@ -17,6 +17,8 @@ botmux schedule add "0 18 * * *" "check deployment status" --topic
 
 `--topic` can infer the anchor from the current topic session. Use `--root-msg-id <om_...>` to specify a target topic explicitly.
 
+Existing-task operations use the current bot's live operator allowlist and the human caller attested for the current turn. They do not require an additional `union_id` mapping. The bot, session, turn and permissions must still match; a bot-authored message, old turn, another app's `open_id`, or caller-supplied identity does not grant access. New-task ownership and cross-bot delegation keep their existing identity requirements. Upgrade the CLI and owning daemon together; a missing operator attestation is rejected rather than treated as standalone authority.
+
 ## Cross-bot delegated creation
 
 When a human explicitly asks Bot A to have Bot B create a schedule, A must request the persistent capability on the managed dispatch:
@@ -70,7 +72,7 @@ Use `--no-delegate schedule:create` to opt out for one dispatch.
 
 `runScopes` is empty by default. Setting it to `["bytedcli"]` lets delegated tasks use the original human's bytedcli authorization on each future fire. Both source and target bots must enable `triggerUserAuth`, and the target must govern both `lark-cli` and `bytedcli`, so a reused session cannot inherit an earlier identity; creation or execution otherwise fails closed. This does not turn the scheduled turn into a general human current actor and never persists lark-cli authority.
 
-A direct task created from the current human turn may stop itself with `botmux schedule pause self` or `botmux schedule remove self`. Cross-bot delegated tasks still require `selfManageEnabled:true`. Both forms are limited to the exact current task: they cannot change the prompt or target, resume or force-run a task, manage another task, or create a successor. `createEnabled:false` stops new grants, `runEnabled:false` revokes future runs of existing delegated tasks, and removing `runScopes` or disabling self-management revokes the delegated task capabilities independently.
+A direct task created from the current human turn may stop itself with `botmux schedule pause self` or `botmux schedule remove self`; each time, BotMux re-checks that the person who created it is still an administrator of the bot and still in the current chat. A direct task that records no human creator (structurally: neither controller field is recorded — for example one added from the host terminal with `botmux schedule add`, whose creator is the host administrator) may stop itself the same way without that human re-check. Cross-bot delegated tasks still require `selfManageEnabled:true`. All of these are limited to the exact current task: they cannot change the prompt or target, resume or force-run a task, manage another task, or create a successor. `createEnabled:false` stops new grants, `runEnabled:false` revokes future runs of existing delegated tasks, and removing `runScopes` or disabling self-management revokes the delegated task capabilities independently.
 
 When a task must deliver its final result and then remove itself, use one terminal operation:
 
@@ -250,6 +252,45 @@ The Dashboard "Schedules" page has both fields too; empty means "follow the bot 
 Use `--new-topic` when it must apply on every run. Both the CLI and the Dashboard say which case you are in when you save.
 
 Supported CLIs are Codex, Claude Code, Grok and TraeX (the same gate as the trigger API's `options.model`); a task on any other CLI ignores both fields at fire time and logs a warning. Which effort levels exist depends on the model (`gpt-5.6-sol` goes up to `ultra`, `gpt-5.5` stops at `xhigh`), and the Dashboard rejects an unsupported pairing on save. If the bot later switches CLI, or the model stops offering the level, the fire **drops that field and runs anyway** with a warning — stale configuration never skips a run.
+
+## Follow-ups: run until done
+
+For "once PR #123 is merged, switch back to upstream" or "after Oct 30, delete the backup", create a **stateful** task with `--until-done`: it keeps running on schedule until the session executing it confirms the work is done and marks it complete.
+
+```bash
+# Check daily at 10:07, no later than Nov 20
+botmux schedule add "7 10 * * *" "once PR #123 is merged, switch the fleet back to upstream and remove the temp worktree" \
+  --until-done --deadline 2026-11-20 --silent
+
+# Do it after a date; retry every 6h until it succeeds (one-shot default: 1 day)
+botmux schedule add "2026-10-30T10:00" "delete the pre-upgrade backup directory" --until-done --retry-every 6h
+
+# From the executing session, once the work is done (mark first, then send the final reply)
+botmux schedule done self --note "switched back to upstream, worktree removed"
+```
+
+| Situation | Plain task | `--until-done` task |
+| --- | --- | --- |
+| Run dispatched | A one-shot is disabled | Stays enabled; a one-shot runs again after `--retry-every` |
+| Run failed / interrupted by a daemon restart | A one-shot is disabled | Stays enabled; a one-shot retries within 1 hour, a recurring task at its next occurrence |
+| Missed its time (daemon down, etc.) | Skips ahead to the next occurrence | Catches up once right away, then resumes its normal cadence |
+| `--deadline` reached | — | One final closing run right away (the prompt says so), then closed as expired. A failed closing run retries every 60 minutes (up to 3 times, then still closes as expired), and the regular schedule pauses during the retry window |
+| `botmux schedule done` | Not applicable | Closed as done, with the result note recorded |
+
+Every run's prompt automatically ends with the attempt number, the deadline and how to mark the task done, so the task prompt only needs to say what to wait for and what to do. Done or expired tasks cannot be resumed; create a new task to keep following up. Bot-delegated tasks do not support `--until-done` yet.
+
+**Run ledger**: every scheduled task now records how many runs were dispatched, skipped (precondition / work calendar), failed and missed, plus the current failure streak. `botmux schedule list` shows two more lines per task:
+
+```
+   状态: 直到完成 · 进行中 · 已执行 3 次 · 截止 2026/11/20 00:00:00
+   账本: 执行 3 · 跳过 0 · 失败 1 · 错过 1（最近 2026/10/26 10:07:00）
+```
+
+A calendar read failure (e.g. a corrupted calendar file) is recorded as a failed run — "skipped" only covers unsatisfied preconditions or calendar-marked rest days — so 3 in a row count toward the failure streak and can trigger a `--notify failing` notification.
+
+**Opt-in notifications**: `--notify failing,expired` @-mentions the task creator in the topic where the task was created (or the execution chat when there is none) — `failing` after 3 consecutive failed runs (once per streak), `expired` when the task expires and closes. Off by default.
+
+**Admin fallback alert**: independent of the opt-in notifications above — any scheduled task (whether or not `--notify` is set) that fails 3 times in a row also triggers a one-off DM to an admin (auto-cleared by the next successful run); consecutive calendar read failures count toward the same failure streak and trigger it too.
 
 ## Management
 

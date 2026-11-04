@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { HEADLESS_CHAT_PREFIX, isHeadlessSessionChatId } from '../core/types.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { withManagedDirectories } from './managed-directory-retention.js';
 
 export const HEADLESS_ID_PREFIX = 'hl_';
 const HEADLESS_ID_RE = /^hl_[A-Za-z0-9_-]{8,128}$/;
@@ -112,10 +113,10 @@ function parseRecord(raw: unknown): HeadlessSessionRecord | null {
 
 export function saveHeadlessSession(record: HeadlessSessionRecord): void {
   ensureDir();
-  atomicWriteFileSync(fileFor(record.id), `${JSON.stringify(record, null, 2)}\n`, {
+  withManagedDirectories(record, () => atomicWriteFileSync(fileFor(record.id), `${JSON.stringify(record, null, 2)}\n`, {
     durable: true,
     followTargetSymlink: false,
-  });
+  }));
 }
 
 export function createHeadlessRecord(input: NewHeadlessSessionRecordInput): HeadlessSessionRecord {

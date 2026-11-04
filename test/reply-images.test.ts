@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { vol } from 'memfs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { resolveReplyImages, type ReplyImageState } from '../src/im/lark/reply-images.js';
 
 vi.mock('node:fs', () => {
@@ -57,6 +57,50 @@ describe('automatic reply image upload', () => {
       '[File](tmp/preview.png)',
     ].join('\n\n');
     expect(await resolveReplyImages(markdown, options)).toBe(markdown);
+    expect(options.upload).not.toHaveBeenCalled();
+  });
+
+  it.each(['/tmp', tmpdir()])('uploads an owned temporary screenshot only when enabled: %s', async dir => {
+    vol.mkdirSync(dir, { recursive: true });
+    const path = `${dir}/receipt.png`;
+    vol.writeFileSync(path, png);
+    vol.chownSync(path, process.getuid?.() ?? 0, 0);
+    const markdown = `![Receipt](${path})`;
+    const options = fixture();
+    expect(await resolveReplyImages(markdown, options)).toBe(markdown);
+    expect(options.upload).not.toHaveBeenCalled();
+    expect(await resolveReplyImages(markdown, { ...options, state: { omitImages: false }, allowTemporaryImages: true }))
+      .toBe('![Receipt](img_v3_test_upload)');
+    expect(options.upload).toHaveBeenCalledExactlyOnceWith(png);
+  });
+
+  it('supports the macOS /tmp alias without following links outside temporary storage', async () => {
+    // Build the alias tree deterministically instead of assuming /tmp is absent.
+    // The shared setup fences HOME under os.tmpdir(), and the file-level
+    // beforeEach materialises it; when os.tmpdir() === '/tmp' that already
+    // created /tmp, so a plain symlinkSync would EEXIST. Clear it, recreate it
+    // as the macOS-style symlink, and rematerialise the (possibly /tmp-rooted)
+    // fenced home through the alias so the resolver's realpath(homedir()) works.
+    vol.rmSync('/tmp', { recursive: true, force: true });
+    vol.mkdirSync('/private/tmp', { recursive: true });
+    vol.symlinkSync('/private/tmp', '/tmp');
+    vol.mkdirSync(homedir(), { recursive: true });
+    vol.writeFileSync('/private/tmp/receipt.png', png);
+    vol.chownSync('/private/tmp/receipt.png', process.getuid?.() ?? 0, 0);
+    vol.symlinkSync('/outside/private.png', '/private/tmp/escape.png');
+    vol.linkSync('/outside/private.png', '/private/tmp/hardlink.png');
+    const options = { ...fixture(), allowTemporaryImages: true };
+    const output = await resolveReplyImages('![Receipt](/tmp/receipt.png) ![Escape](/tmp/escape.png) ![Hardlink](/tmp/hardlink.png)', options);
+    expect(output).toBe('![Receipt](img_v3_test_upload) ![Escape](/tmp/escape.png) ![Hardlink](/tmp/hardlink.png)');
+    expect(options.upload).toHaveBeenCalledOnce();
+  });
+
+  it.skipIf(!process.getuid)('does not upload another user\'s temporary image', async () => {
+    vol.mkdirSync('/tmp', { recursive: true });
+    vol.writeFileSync('/tmp/foreign.png', png);
+    vol.chownSync('/tmp/foreign.png', (process.getuid?.() ?? 0) + 1, 0);
+    const options = { ...fixture(), allowTemporaryImages: true };
+    expect(await resolveReplyImages('![Foreign](/tmp/foreign.png)', options)).toBe('![Foreign](/tmp/foreign.png)');
     expect(options.upload).not.toHaveBeenCalled();
   });
 

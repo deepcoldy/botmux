@@ -139,7 +139,7 @@ describe('remote runner protocol', () => {
             openId: 'ou_owner',
             unionId: 'on_owner',
             email: 'owner@bytedance.com',
-            source: 'platform_team',
+            source: 'bot_config',
           },
         },
       },
@@ -181,7 +181,7 @@ describe('remote runner protocol', () => {
             openId: 'ou_owner',
             unionId: 'on_owner',
             email: 'owner@bytedance.com',
-            source: 'platform_team',
+            source: 'bot_config',
           },
         },
       },
@@ -210,6 +210,36 @@ describe('remote runner protocol', () => {
         },
       },
     }))).toBeUndefined();
+  });
+
+  it('rejects the whole recovered turn when a provider echoes the legacy platform_team owner source', () => {
+    // The host mints botOwner only with source 'bot_config' (#2100 replaced the
+    // platform_team resolver). A provider echoing the legacy tag must not be
+    // normalized into the recovered caller at all: the whole event is rejected,
+    // not merely stripped.
+    const parsed = parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-legacy-platform-team',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        trustedCaller: {
+          requestUserOpenId: 'ou_bot',
+          requestLarkAppId: 'cli_app',
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'platform_team',
+          },
+        },
+      },
+    }));
+    expect(parsed).toBeUndefined();
   });
 
   it('validates generation-fenced terminal screen snapshots', () => {
@@ -291,6 +321,10 @@ describe('remote runner protocol', () => {
       { mention: 'explicit', mentions: ['   '] },
       { mention: 'explicit', mentions: ['ou_target:Target', ''] },
       { mention: 'explicit', mentions: ['ou_target\0Target'] },
+      { mention: 'explicit', mentions: ['--help'] },
+      { mention: 'explicit', mentions: [' --help'] },
+      { mention: 'explicit', mentions: ['-h'] },
+      { mention: 'explicit', mentions: ['--dry-run'] },
       { mention: 'explicit', mentions: ['x'.repeat(33 * 1024)] },
     ]) {
       expect(parseRemoteRunnerEventLine(JSON.stringify({
@@ -580,6 +614,28 @@ describe('remote runner protocol', () => {
         snapshot: { context: { usedTokens: -1 }, tokens: null },
       },
     }))).toBeUndefined();
+  });
+
+  it('passes optional cumulative cache counters and rejects malformed ones', () => {
+    const base = {
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'final',
+      turnId: 'turn-usage',
+      content: 'done',
+    } as const;
+    const withTokens = (tokens: unknown) => parseRemoteRunnerEventLine(JSON.stringify({
+      ...base,
+      usage: { generation: 3, snapshot: { context: null, tokens } },
+    }));
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 6100, cacheCreateTokens: 1000 })).toMatchObject({
+      usage: { snapshot: { tokens: { in: 7230, out: 44, cacheReadTokens: 6100, cacheCreateTokens: 1000 } } },
+    });
+    const withoutCache = withTokens({ in: 7230, out: 44 }) as any;
+    expect(withoutCache.usage.snapshot.tokens).toEqual({ in: 7230, out: 44 });
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 7231 })).toBeUndefined();
+    expect(withTokens({ in: 7230, out: 44, cacheCreateTokens: -1 })).toBeUndefined();
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 1.5 })).toBeUndefined();
   });
 
   it('ships a runnable reference provider covering hello/start/turn/status/detach', async () => {

@@ -69,12 +69,22 @@ describe('resolveGroupJoinPrompt (场景① D8)', () => {
     expect(resolveGroupJoinPrompt('  先做代码审查 ')).toBe('先做代码审查');
   });
 
-  it('returns empty string when unset', () => {
-    expect(resolveGroupJoinPrompt(undefined)).toBe('');
+  it('preserves a custom multiline task for either locale', () => {
+    const task = '先读上下文\n再汇报进度';
+    expect(resolveGroupJoinPrompt(` \n${task}\n `, 'zh')).toBe(task);
+    expect(resolveGroupJoinPrompt(` \n${task}\n `, 'en')).toBe(task);
   });
 
-  it('returns empty string for a blank prompt', () => {
-    expect(resolveGroupJoinPrompt('   ')).toBe('');
+  it.each([[undefined], [''], [' \n\t ']])('provides a first-turn task for an unset or blank prompt (%j)', (configured) => {
+    expect(resolveGroupJoinPrompt(configured).trim()).not.toBe('');
+  });
+
+  it('localizes the built-in task', () => {
+    const chinese = resolveGroupJoinPrompt(undefined, 'zh');
+    const english = resolveGroupJoinPrompt(undefined, 'en');
+    expect(chinese).toMatch(/[\u4e00-\u9fff]/);
+    expect(english).toMatch(/[A-Za-z]/);
+    expect(english).not.toMatch(/[\u4e00-\u9fff]/);
   });
 });
 

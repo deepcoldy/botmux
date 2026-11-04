@@ -14,7 +14,6 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `claude-code` | Claude Code (default) | local process | ✅ |
 | `codex` | Codex CLI | local process | ✅ |
 | `codex-app` | Codex App | local process (app-server protocol) | |
-| `gemini` | Gemini | local process | ✅ |
 | `cursor` | Cursor (cursor-agent) | local process | ✅ |
 | `opencode` | OpenCode | local process | ✅ |
 | `opencode2` | OpenCode 2 (beta, `opencode2`) | local process | |
@@ -30,15 +29,28 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `traex` | TRAE CLI (traex) | local process | ✅ |
 | `mtr` | MTR | local process | |
 | `hermes` | Hermes | local process | |
+| `ebsd` | EBSD (requires credential files, see [guide](https://github.com/deepcoldy/botmux/blob/master/docs/ebsd.md)) | local process | |
+| `codem` | CodeM (see [CodeM guide](https://github.com/deepcoldy/botmux/blob/master/docs/codem.md)) | local process | ✅ |
+| `minimax` | MiniMax Code / mcode (see [MiniMax guide](https://github.com/deepcoldy/botmux/blob/master/docs/minimax-code.md)) | local process | ✅ |
 | `genius` | Genius | local process | ✅ |
 | `seed` | Seed (Claude Code fork) | local process | ✅ |
 | `relay` | Relay (new release of Seed) | local process | ✅ |
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
+| `mojo` | Mojo | API-driven (host execution / cloud sandbox) | |
+| `remote-runner` | Generic Remote Runner (see [protocol](https://github.com/deepcoldy/botmux/blob/master/docs/remote-runner.md)) | Remote protocol | |
 | `dsh` | DeepSeek Harness (dsh CLI) | local process (SDK JSON-RPC) | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
+
+### Gemini CLI has been removed
+
+Gemini CLI is no longer maintained upstream, so botmux removed the `gemini` adapter, and the Dashboard and `botmux setup` no longer offer it (the old setup menu number 6 now reports an error instead of selecting another CLI). The replacement is `antigravity` (Antigravity, `agy`).
+
+- A bot whose `bots.json` entry still says `cliId: "gemini"` **refuses to start**, with a (Chinese) hint that Gemini CLI is retired and that `cliId` should be changed to `"antigravity"`. Other bots are unaffected.
+- To migrate: install `agy` and sign in with a Google account, or skip the sign-in and use a Gemini API key — set `modelProvider: "gemini"` in `~/.gemini/antigravity-cli/settings.json` and provide `GEMINI_API_KEY`. Then change `cliId` to `"antigravity"` (edit `bots.json` directly, or change the bot's CLI with `botmux setup`) and run `botmux restart`. While the bot is not started, the Dashboard shows the reason but cannot save its settings.
+- Gemini-specific settings do not carry over: `cliPathOverride` / `wrapperCli` (e.g. `ttadk gemini`), Gemini `model` names and `GEMINI_CLI_HOME` must be removed or reconfigured for the new CLI.
 
 ## Pi execution progress
 
@@ -148,7 +160,7 @@ Choice questions require at least two options. Secret inputs and malformed batch
 
 To verify, ask a model in an ordinary Codex App session to use native `request_user_input` for a choice question. Confirm the Lark card appears, then submit and confirm the same turn continues with your answer. Native tool availability still depends on the Codex version and execution mode.
 
-In `codex-app`, `request_user_input_async` messages carrying `delivery: async` and `questions` create standalone Lark ask cards while the model continues independent work. Cards remain answerable after normal turn completion. Answers preserve the native call ID and question index and use the existing session delivery queue to start a follow-up turn in the same native thread. Duplicate events create one card; recommended options require explicit submission.
+In `codex-app`, `request_user_input_async` messages carrying `delivery: async` and `questions` create standalone Lark ask cards while the model continues independent work. Cards remain answerable after normal turn completion. Answers preserve the native call ID and question index. With `codexAppCleanInput` enabled and native targeted input available, an authenticated answer from the original question recipient can join its still-running native turn through the existing delivery ledger. Once that turn ends, the answer starts a follow-up in the same thread. Legacy cards without a native turn marker, unavailable structured input, and ineligible origins retain serial delivery. Late answers never steer another native task. Duplicate events create one card; recommended options require explicit submission. An ended card confirms answer collection, not native model consumption. Older active runners upgrade at an idle boundary; targeted delivery applies to new questions with native routing metadata.
 
 Async questions accept nonempty native batches, one option, and duplicate labels. Human-origin cards use the existing canTalk registration policy and freeze the initiating answerer at registration; later speakers or reply-target eviction cannot retarget them. Authorized scheduled/autonomous cards use the existing canTalk responder policy; scheduled task creators still require canOperate permission and silent schedules never post cards. Document-comment turns privately deliver cards to the verified original author, who alone may answer. The answer's follow-up turn retains the original document-comment reply route instead of inheriting a later comment or the session owner.
 

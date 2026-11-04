@@ -20,7 +20,7 @@
  */
 
 import { resolveReplyFooterPolicy } from '../../services/reply-footer.js';
-import type { ReplyCardPresentation } from '../../services/reply-card-render.js';
+import { normalizeReplyConsoleUrl, type ReplyCardPresentation } from '../../services/reply-card-render.js';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -36,6 +36,7 @@ import {
   replyCardHeadingElementId,
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
+import { buildReplyCardActionOverflow, buildReplyCardChromeRow, type ReplyCardActionBinding } from './reply-card-actions.js';
 import { buildCompletionProposalElement } from './completion-proposal-card.js';
 import { composeFinalCardSections } from './final-card-sections.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
@@ -60,8 +61,10 @@ import {
 
 /** Room kept for chrome that callers attach *after* a card is built and
  * fitted — today the on-call group button (≈483B of request body), added by
- * `attachOncallGroupButton` in both `botmux send` and the daemon. Reserved
- * unconditionally; it costs nothing when no button is attached. */
+ * `attachOncallGroupButton` in both `botmux send` and the daemon, and a
+ * workflow node session's「工作流 ›」entry (≈0.8KB raw, ≈1KB escaped, with a
+ * 128-char run id; `attachWorkflowSidebarEntry`). Reserved unconditionally;
+ * it costs nothing when no button is attached. */
 export const CARD_LATE_CHROME_RESERVE_BYTES = 2_000;
 
 export type { CardRenderDiagnostic } from './vega-lite-chart.js';
@@ -138,6 +141,258 @@ export function createReplyCard(
   };
 }
 
+// Unified diff previews share the ordinary Markdown reply-card envelope.
+// Keep diff parsing, colored body elements and preview budgeting beside the
+// existing body builder; do not construct a parallel schema/config shell.
+export interface DiffRow {
+  kind: string;
+  text: string;
+  truncated?: boolean;
+}
+
+export interface DiffFile {
+  path: string;
+  oldPath: string;
+  newPath: string;
+  rows: DiffRow[];
+  notes: string[];
+  added: number;
+  removed: number;
+  header: boolean;
+  binary: boolean;
+}
+
+export interface DiffCardResult {
+  card: ReplyCardV2;
+  bytes: number;
+  statsScope: 'full' | 'preview';
+  stats: { files: number | null; added: number | null; removed: number | null };
+  preview: { files: number; rows: number; truncated: boolean; omittedFiles: number | null; reason?: 'input_too_large'; inputBytes?: number };
+}
+
+export const MAX_DIFF_INPUT_BYTES = 2 * 1024 * 1024;
+export const DIFF_PREVIEW_BUDGET_BYTES = 18_000;
+
+function failDiffLine(line: number, detail: string): never {
+  throw new Error(`diff 第 ${line} 行：${detail}`);
+}
+
+function decodeDiffPath(raw: string): string {
+  if (!raw.startsWith('"')) return raw.split('\t')[0];
+  const bytes: number[] = [];
+  const escapes: Record<string, number> = {n: 10, r: 13, t: 9, b: 8, f: 12, v: 11, a: 7, '\\': 92, '"': 34};
+  for (let i = 1; i < raw.length; i++) {
+    if (raw[i] === '"') return new TextDecoder('utf-8', {fatal: true}).decode(Uint8Array.from(bytes));
+    if (raw[i] === '\\') {
+      const char = raw[++i];
+      if (/[0-7]/.test(char ?? '')) {
+        const octal = raw.slice(i).match(/^[0-7]{1,3}/)![0];
+        const value = parseInt(octal, 8);
+        if (value > 255) throw new Error('Git 路径的八进制转义无效');
+        bytes.push(value);
+        i += octal.length - 1;
+      } else if (Object.hasOwn(escapes, char)) bytes.push(escapes[char]);
+      else throw new Error('Git 路径的转义无效');
+    } else {
+      const point = raw.codePointAt(i)!;
+      bytes.push(...Buffer.from(String.fromCodePoint(point)));
+      if (point > 0xffff) i++;
+    }
+  }
+  throw new Error('Git 路径引号未闭合');
+}
+
+function diffPathLabel(raw: string): string {
+  const decoded = decodeDiffPath(raw);
+  return decoded === '/dev/null' ? decoded : decoded.replace(/^[ab]\//, '');
+}
+
+export function parseUnifiedDiff(input: string, { allowIncomplete = false }: { allowIncomplete?: boolean } = {}): DiffFile[] {
+  if (Buffer.byteLength(input, 'utf8') > MAX_DIFF_INPUT_BYTES) throw new Error('diff 输入超过 2MiB');
+  const lines = input.replace(/\r\n/g, '\n').split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  const files: DiffFile[] = [];
+  let file: DiffFile | undefined;
+  let pendingOld: string | undefined;
+  let oldRemaining = 0;
+  let newRemaining = 0;
+
+  const createFile = (): DiffFile => {
+    const next: DiffFile = {path: '文件', oldPath: '', newPath: '', rows: [], notes: [], added: 0, removed: 0, header: false, binary: false};
+    files.push(next);
+    return next;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const partialTail = allowIncomplete && i === lines.length - 1 && !input.endsWith('\n');
+    // A byte-bounded prefix may stop in a header. Keep preceding visible rows
+    // without inventing the trailing file/path/hunk. Content rows are retained.
+    if (partialTail && (pendingOld !== undefined || (!(oldRemaining || newRemaining)
+      && (line.startsWith('diff ') || line.startsWith('--- ') || line.startsWith('@@'))))) break;
+    if (pendingOld !== undefined) {
+      if (!file) failDiffLine(i + 1, '文件头缺少旧路径');
+      if (!line.startsWith('+++ ')) failDiffLine(i + 1, '缺少 +++ 文件头');
+      file.oldPath = diffPathLabel(pendingOld);
+      file.newPath = diffPathLabel(line.slice(4));
+      file.path = file.newPath === '/dev/null' ? file.oldPath : file.newPath;
+      file.header = true;
+      if (file.oldPath === '/dev/null') file.notes.push('新增文件');
+      if (file.newPath === '/dev/null') file.notes.push('删除文件');
+      pendingOld = undefined;
+      continue;
+    }
+    if (line === '\\ No newline at end of file') {
+      if (!file?.rows.length || file.rows.at(-1)!.kind === '@') failDiffLine(i + 1, '换行标记缺少对应内容行');
+      file.rows.push({kind: '\\', text: line});
+      continue;
+    }
+    if (oldRemaining || newRemaining) {
+      if (!file) failDiffLine(i + 1, 'hunk 缺少文件');
+      const kind = line[0];
+      if (!['+', '-', ' '].includes(kind)) failDiffLine(i + 1, 'hunk 内容行缺少 +、- 或空格前缀');
+      if (kind !== '+' && oldRemaining-- <= 0) failDiffLine(i + 1, '旧版本行数超出 hunk 声明');
+      if (kind !== '-' && newRemaining-- <= 0) failDiffLine(i + 1, '新版本行数超出 hunk 声明');
+      file.rows.push({kind, text: line.slice(1), ...(partialTail ? { truncated: true } : {})});
+      if (kind === '+') file.added++;
+      if (kind === '-') file.removed++;
+      continue;
+    }
+    if (line.startsWith('diff --git ')) {
+      file = createFile();
+      const match = line.match(/^diff --git ("(?:\\.|[^"\\])*"|\S+) ("(?:\\.|[^"\\])*"|\S+)$/);
+      if (match) file.path = diffPathLabel(match[2]);
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      if (!file || file.header || file.rows.length) file = createFile();
+      pendingOld = line.slice(4);
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      if (!file?.header) failDiffLine(i + 1, 'hunk 缺少文件头');
+      const match = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/);
+      if (!match) failDiffLine(i + 1, 'hunk 头格式无效');
+      const values = [match[1], match[2] ?? '1', match[3], match[4] ?? '1'].map(Number);
+      if (!values.every(Number.isSafeInteger)) failDiffLine(i + 1, 'hunk 数字超出范围');
+      oldRemaining = values[1];
+      newRemaining = values[3];
+      file.rows.push({kind: '@', text: line});
+      continue;
+    }
+    if (line.startsWith('rename from ') || line.startsWith('copy from ')) {
+      if (!file) failDiffLine(i + 1, '重命名元数据缺少文件');
+      file.oldPath = decodeDiffPath(line.replace(/^(rename|copy) from /, ''));
+      file.notes.push(`原路径：${file.oldPath}`);
+      continue;
+    }
+    if (line.startsWith('rename to ') || line.startsWith('copy to ')) {
+      if (!file) failDiffLine(i + 1, '重命名元数据缺少文件');
+      file.path = file.newPath = decodeDiffPath(line.replace(/^(rename|copy) to /, ''));
+      file.notes.push(line.startsWith('rename') ? '重命名文件' : '复制文件');
+      continue;
+    }
+    if (/^(Binary files |GIT binary patch)/.test(line)) {
+      if (!file) failDiffLine(i + 1, '二进制标记缺少文件');
+      file.binary = true;
+      file.notes.push('二进制变更，无法显示文本 diff');
+      continue;
+    }
+    if (file?.binary) continue;
+    if (/^(new file mode|deleted file mode|old mode|new mode) /.test(line)) {
+      if (!file) failDiffLine(i + 1, '模式元数据缺少文件');
+      file.notes.push(line);
+      continue;
+    }
+    if (line === '' || line.startsWith('diff ') || /^index |^(dis)?similarity index /.test(line)) continue;
+    failDiffLine(i + 1, '不支持的 unified diff 内容');
+  }
+  if (!allowIncomplete && (pendingOld !== undefined || oldRemaining || newRemaining)) failDiffLine(lines.length, '文件头或 hunk 不完整');
+  if (!files.length && input.trim() && !allowIncomplete) throw new Error('输入没有 unified diff 文件头');
+  return allowIncomplete ? files.filter(file => (file.header && file.rows.length > 0) || file.notes.length > 0) : files;
+}
+
+function escapeDiffMarkdown(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/\\/g, '\\\\').replace(/([*_`\[\]~<>])/g, '\\$1');
+}
+
+function displayDiffPath(value: string): string {
+  const controls: Record<string, string> = {'\r': '\\r', '\n': '\\n', '\t': '\\t', '\0': '\\0'};
+  return value.replace(/[\r\n\t\0]/g, char => controls[char]!);
+}
+
+function renderDiffRow(row: DiffRow): string {
+  const color = row.kind === '+' ? 'green' : row.kind === '-' ? 'red' : 'grey';
+  const prefix = ['+', '-'].includes(row.kind) ? row.kind : row.kind === ' ' ? '·' : '';
+  let text = row.text.slice(0, 1024);
+  const last = text.charCodeAt(text.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) text = text.slice(0, -1);
+  if (row.truncated || row.text.length > 1024) text += '…';
+  let content = escapeDiffMarkdown(text);
+  const indent = content.match(/^[ \t]*/)![0].replace(/\t/g, '    ');
+  content = '&nbsp;'.repeat(indent.length) + content.slice(content.match(/^[ \t]*/)![0].length);
+  return `<font color='${color}'>${prefix}${content}</font>`;
+}
+
+export function buildDiffCard(files: DiffFile[], {summary = '', maxLines = 60, inputBytes, inputName}: { summary?: string; maxLines?: number; inputBytes?: number; inputName?: string } = {}): DiffCardResult {
+  if (Buffer.byteLength(summary, 'utf8') > 4_000) throw new Error('摘要过长');
+  if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 200) throw new Error('max-lines 需要为 1–200');
+  // The custom final validator reserves botmux_* IDs for host sections.
+  // Preserve the shared heading presentation without carrying those IDs.
+  const summaryElements = summary
+    ? buildCardBodyElements(summary).map(({ element_id: _elementId, ...element }) => element)
+    : [];
+  const partial = inputBytes !== undefined && inputBytes > MAX_DIFF_INPUT_BYTES;
+  const stats = {files: files.length, added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0)};
+  let count = Math.min(files.length, 20);
+  let limit = maxLines;
+  function assemble(): DiffCardResult {
+    const elements: Record<string, unknown>[] = [];
+    elements.push(...summaryElements);
+    if (!partial) elements.push({tag: 'markdown', content: files.length ? `共 ${stats.files} 个文件，+${stats.added} / -${stats.removed}。完整内容请查看原始 diff 文件。` : '未检测到内容差异。'});
+    else if (count === 0) elements.push({tag: 'markdown', text_size: 'notation', content: `<font color='grey'>diff 超限，${inputName ? escapeDiffMarkdown(displayDiffPath(inputName)) + '的' : ''}当前片段暂无可展示行，完整差异请查看原始文件。</font>`});
+    let truncated = partial || count < files.length;
+    const previewStats = { files: count, added: 0, removed: 0 };
+    let shownRows = 0;
+    for (const f of files.slice(0, count)) {
+      const shown = f.rows.slice(0, limit);
+      shownRows += shown.length;
+      const lines = [...f.notes.map(note => `<font color='grey'>${escapeDiffMarkdown(displayDiffPath(note))}</font>`), ...shown.map(renderDiffRow)];
+      const added = partial ? shown.filter(row => row.kind === '+').length : f.added;
+      const removed = partial ? shown.filter(row => row.kind === '-').length : f.removed;
+      previewStats.added += added; previewStats.removed += removed;
+      const longLine = shown.some(row => row.truncated || row.text.length > 1024);
+      const limited = partial || shown.length < f.rows.length || longLine;
+      truncated ||= limited;
+      const caption = limited ? `diff 超限，仅显示前${shown.length}行${partial ? '（计数仅预览）' : ''}${longLine ? '，长行已截断' : ''}。` : '';
+      if (!lines.length) lines.push("<font color='grey'>无文本内容变化。</font>");
+      elements.push({
+        tag: 'collapsible_panel', expanded: false,
+        header: {
+          title: {tag: 'markdown', content: `**${escapeDiffMarkdown(displayDiffPath(f.path))}** <font color='green'>+${added}</font> <font color='red'>-${removed}</font>`},
+          icon: {tag: 'standard_icon', token: 'down-small-ccm_outlined'},
+          icon_position: 'right', icon_expanded_angle: -180,
+        },
+        border: {color: 'grey', corner_radius: '5px'}, padding: '8px 8px 8px 8px',
+        elements: [
+          {tag: 'markdown', content: lines.join('\n')},
+          ...(caption ? [{tag: 'markdown', text_size: 'notation', content: `<font color='grey'>${caption}</font>`}] : []),
+        ],
+      });
+    }
+    if (count < files.length) elements.push({tag: 'markdown', text_size: 'notation', content: `<font color='grey'>另有 ${files.length - count} 个已读取文件未展开预览，完整内容请查看原始 diff 文件。</font>`});
+    const card = createReplyCard(elements);
+    return {card, bytes: Buffer.byteLength(JSON.stringify(card), 'utf8'), statsScope: partial ? 'preview' : 'full', stats: partial ? previewStats : stats, preview: {files: count, rows: shownRows, truncated, omittedFiles: partial ? null : files.length - count, ...(partial ? { reason: 'input_too_large' as const, inputBytes } : {})}};
+  }
+  let result = assemble();
+  while (result.bytes > DIFF_PREVIEW_BUDGET_BYTES && (limit > 1 || count > 0)) {
+    if (limit > 1) limit = Math.max(1, Math.floor(limit / 2));
+    else count = Math.floor(count / 2);
+    result = assemble();
+  }
+  if (result.bytes > DIFF_PREVIEW_BUDGET_BYTES) throw new Error('卡片摘要超过预览预算');
+  return result;
+}
+
 export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
 
 /** Native usage facts rendered in a Bot reply-card footer. Context is the
@@ -152,6 +407,9 @@ export interface CardUsageSnapshot {
   tokens: {
     in: number;
     out: number;
+    /** Optional cumulative cache reads / writes, both subsets of `in`. */
+    cacheReadTokens?: number;
+    cacheCreateTokens?: number;
   } | null;
   /** Delta for the latest user turn (small, matches the CLI TUI's per-turn
    *  ↑↓). Null for dialects without per-turn tracking. Rendered on the live
@@ -184,6 +442,10 @@ export interface CardUsageSnapshot {
    *  上下文段改渲染纯百分比 `ctx N%`，并追加 `5h N%` / `7d N%` 账号配额段。
    *  缺省 / null ⇒ 与无 statusline 时逐字节相同（只看 `context`）。 */
   quota?: StatuslineQuota | null;
+  /** Per-session idle auto-compact toggle (core/idle-auto-compact.ts). Rides
+   *  this snapshot for the same reason as `modelFallback`: every live-card call
+   *  site already forwards it. Absent ⇒ unsupported here, toggle not rendered. */
+  idleAutoCompact?: { enabled: boolean; minutes: number };
   /** bots.json `cardFooterExtension` 命令给出的自定义段（已收成短单行纯文本），
    *  渲染时转义并接在用量段末尾。缺省 ⇒ 与未配置时逐字节相同。 */
   extensionSegments?: string[];
@@ -460,7 +722,8 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
 
 /** Format usage as one segment shared by reply-card footers and the live
  * streaming card. The caller supplies native facts; this module only formats
- * them and never infers a context window or token count. Returns null when no
+ * them (it may derive ratios between supplied counts) and never infers a
+ * context window or token count. Returns null when no
  * valid native metric is available.
  *
  * `variant`:
@@ -469,7 +732,8 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
  *     dropped here (it lives on the streaming card / usage ledger). 上下文占用
  *     is the one glanceable "how full am I" metric worth keeping.
  *   - `'streaming'`: rich — context + `本轮 ↑X ↓Y`(per-turn delta, matches the
- *     CLI TUI) + `累计 ↑A ↓B`(session total). The live card has room and
+ *     CLI TUI) + `累计 ↑A ↓B`(session total) + `缓存命中 N%`(session cache
+ *     reads over the cache-inclusive prompt total). The live card has room and
  *     refreshes during execution. */
 /**
  * True when a context snapshot is at/over the compact threshold — the single
@@ -497,7 +761,7 @@ export function contextOverCompactThreshold(
 /** Rounded, clamped context percentage, or undefined when the CLI reports no
  *  window (⇒ no percentage to show). Shared so the footer text and
  *  {@link contextOverCompactThreshold} can never disagree on the value. */
-function contextPercentUsed(usage: CardUsageSnapshot): number | undefined {
+export function contextPercentUsed(usage: CardUsageSnapshot): number | undefined {
   // statusline 给的 contextPercent 优先（Claude Code 的 transcript 本身没有窗口字段，
   // 这是它唯一的百分比来源）；其余 CLI 仍走 transcript 的 percentUsed。
   const pct = usage.quota?.contextPercent ?? usage.context?.percentUsed;
@@ -590,6 +854,26 @@ export function cardUsageFooterSegment(
       `${t('card.usage.total', undefined, locale)} `
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
+    // Session cache hit rate: cache reads over the cache-inclusive prompt total.
+    // Dialects without cache fields still fold to 0/0, which is "unknown", not
+    // "0% hit" — so require one of the counters to be present and non-negative,
+    // and some cache activity. A session whose cache is only written (a remote
+    // provider reporting cacheCreate alone, or a first-turn Claude prompt) thus
+    // honestly renders 0%.
+    const cacheReadRaw = usage.tokens.cacheReadTokens;
+    const cacheCreateRaw = usage.tokens.cacheCreateTokens;
+    const cacheRead = isNonNegativeFinite(cacheReadRaw) ? cacheReadRaw : undefined;
+    const cacheCreate = isNonNegativeFinite(cacheCreateRaw) ? cacheCreateRaw : undefined;
+    if (usage.tokens.in > 0
+      && (cacheRead !== undefined || cacheCreate !== undefined)
+      && ((cacheRead ?? 0) > 0 || (cacheCreate ?? 0) > 0)) {
+      // floor, not round: 99.6% must not read as "100%" (everything cached).
+      // Multiply before dividing: (read / in) * 100 lands at x.99999… in
+      // floating point for exact integer percentages (290000 / 1e6 → 28).
+      // Token counts are integers far below 2^53 / 100, so read * 100 is exact.
+      const pct = Math.min(100, Math.floor((cacheRead ?? 0) * 100 / usage.tokens.in));
+      parts.push(`${t('card.usage.cache_hit', undefined, locale)} ${pct}%`);
+    }
   }
   // Runtime identity is formatted separately by cardUsageRuntimeSegment. Keep
   // this function metric-only so callers can also render identity without usage.
@@ -699,6 +983,37 @@ export function cardModelFallbackNotice(
   }, locale);
 }
 
+function formatReplyDuration(durationMs: number, locale?: Locale): string {
+  // Round before splitting units so seconds never overflow into 60.0.
+  const tenths = Math.round(durationMs / 100);
+  if (tenths < 600) {
+    return t('card.duration_seconds', { seconds: (tenths / 10).toFixed(1) }, locale);
+  }
+  const hours = Math.floor(tenths / 36000);
+  const minutes = Math.floor((tenths % 36000) / 600);
+  const seconds = (tenths % 600) / 10;
+  const parts: string[] = [];
+  if (hours > 0) parts.push(t('card.duration_hours', { hours }, locale));
+  if (minutes > 0) parts.push(t('card.duration_minutes', { minutes }, locale));
+  if (seconds > 0) {
+    parts.push(t('card.duration_seconds', { seconds: seconds.toFixed(1) }, locale));
+  }
+  return parts.join(' ');
+}
+
+/** Whether a custom brand already carries this machine's console entry.
+ *  Compare normalized markdown-link targets rather than a raw substring: a
+ *  hand-written brand may spell the same entry with an uppercase host or no
+ *  trailing slash, and an exact-substring check then renders two links. */
+function brandSegmentHasConsoleEntry(brandSeg: string, consoleUrl: string): boolean {
+  const entry = consoleUrl.replace(/\/+$/, '');
+  for (const match of brandSeg.matchAll(/\]\(([^()\s]+)\)/gu)) {
+    const href = normalizeReplyConsoleUrl(match[1]);
+    if (href && href.replace(/\/+$/, '') === entry) return true;
+  }
+  return false;
+}
+
 /** Build the one canonical footer shared by all Bot Session reply cards.
  * Ordering, i18n, the parser marker, grey styling, and recipient rendering live
  * here so direct sends and daemon fallbacks cannot drift apart. */
@@ -716,6 +1031,10 @@ export function buildReplyCardFooter(opts: {
   const parts: string[] = [];
   const brandSeg = !policy.brand ? null : brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
+  const consoleUrl = normalizeReplyConsoleUrl(opts.presentation?.consoleUrl);
+  if (brandSeg && consoleUrl && !brandSegmentHasConsoleEntry(brandSeg, consoleUrl)) {
+    parts.push(`[${t('card.reply_console', undefined, opts.locale)}](${consoleUrl})`);
+  }
   let hasUsage = false;
   if (opts.usage) {
     const usageSeg = !policy.usage ? null : cardUsageFooterSegment(opts.usage, opts.locale);
@@ -728,10 +1047,10 @@ export function buildReplyCardFooter(opts: {
   const waitingMs = opts.presentation?.timing?.waitingDurationMs ?? opts.waitingDurationMs;
   const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
   if (hasWaiting) {
-    parts.push(t('card.waiting_duration', { seconds: (waitingMs / 1000).toFixed(1) }, opts.locale));
+    parts.push(t('card.waiting_duration', { duration: formatReplyDuration(waitingMs, opts.locale) }, opts.locale));
   }
   if (hasDuration) {
-    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
+    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { duration: formatReplyDuration(durationMs, opts.locale) }, opts.locale));
   }
   const recipientOpenIds = !policy.recipients ? [] : [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
@@ -758,7 +1077,7 @@ export function buildReplyCardFooter(opts: {
   const signMarker = hasUsage || hasDuration || hasWaiting || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
-    signedContent = parts[0]; // brand-only — no marker
+    signedContent = parts.join(' · '); // brand/console only — no marker
   } else if (parts.length > 1) {
     signedContent = `${parts[0]} ·${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
   } else {
@@ -777,21 +1096,26 @@ export function buildReplyCardFooter(opts: {
   };
 }
 
-/** Compose the entire footer once: text, divider and optional voice action. */
+/** Compose the entire footer once: text, divider and optional voice/menu
+ * actions. Footer, voice and the per-bot reply-card action menu share one
+ * chrome row (stable id `botmux_reply_actions`) so the on-call button, long
+ * card degradation and group-context projection can locate them. */
 export function buildReplyCardFooterElements(
-  opts: Parameters<typeof buildReplyCardFooter>[0] & { voiceButton?: Record<string, unknown> },
+  opts: Parameters<typeof buildReplyCardFooter>[0] & {
+    voiceButton?: Record<string, unknown>;
+    actionMenu?: Record<string, unknown>;
+  },
 ): any[] {
   const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
   if (!policy.enabled) return [];
   const footer = buildReplyCardFooter(opts);
-  const voice = policy.voice ? opts.voiceButton : undefined;
-  if (!footer && !voice) return [];
-  return [{ tag: 'hr' }, ...(voice ? [{
-    tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'default', columns: [
-      { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [footer?.element ?? { tag: 'markdown', text_size: 'notation', content: ' ' }] },
-      { tag: 'column', width: 'auto', vertical_align: 'center', elements: [voice] },
-    ],
-  }] : [footer!.element])];
+  const controls: Array<Record<string, unknown>> = [];
+  if (policy.voice && opts.voiceButton) controls.push(opts.voiceButton);
+  if (opts.actionMenu) controls.push(opts.actionMenu);
+  if (!footer && controls.length === 0) return [];
+  return [{ tag: 'hr' }, ...(controls.length > 0
+    ? [buildReplyCardChromeRow({ footer, controls })]
+    : [footer!.element])];
 }
 
 /** Clone a caller-supplied schema-2 card and append the canonical reply
@@ -1583,6 +1907,8 @@ export function buildCanonicalFinalReplyCard(opts: {
   executionDurationMs?: number;
   waitingDurationMs?: number;
   presentation?: ReplyCardPresentation;
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
@@ -1595,6 +1921,9 @@ export function buildCanonicalFinalReplyCard(opts: {
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
+    ...(opts.cardActions
+      ? { actionMenu: buildReplyCardActionOverflow(opts.cardActions, opts.locale) }
+      : {}),
   });
   elements.push(...footerElements);
   const card = createReplyCard(elements);
@@ -1647,6 +1976,8 @@ export function buildContextualReplyCard(opts: {
   waitingDurationMs?: number;
   presentation?: ReplyCardPresentation;
   feedback?: { policy: FeedbackPolicy };
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const {
     title,
@@ -1697,6 +2028,9 @@ export function buildContextualReplyCard(opts: {
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     presentation: opts.presentation,
+    ...(opts.cardActions
+      ? { actionMenu: buildReplyCardActionOverflow(opts.cardActions, locale) }
+      : {}),
   });
   elements.push(...footerElements);
 

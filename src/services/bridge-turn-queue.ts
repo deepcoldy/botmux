@@ -39,6 +39,8 @@ import {
   isPureToolResultUserEvent,
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
+  isClaudeTurnDurationEvent,
+  eventTimeMs,
   isTranscriptRateLimitEvent,
   isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
@@ -49,6 +51,13 @@ import {
 // Re-export so existing callers (worker.ts, tests) don't need to change
 // their import path now that these helpers live in claude-transcript.ts.
 export { normaliseForFingerprint };
+
+/** How long the worker's provisional-exit watchdog waits for a fresh turn's
+ *  closing records when NO idle edge ever fires (a background task can keep
+ *  program-status `working`, and stale status keeps waiting). Same bound as
+ *  the idle-edge settle: closing records normally land ~90-140ms after the
+ *  terminal record. */
+export const PROVISIONAL_EXIT_WATCH_MS = 2_000;
 
 function assistantHasVisibleText(content: unknown): boolean {
   if (typeof content === 'string') return content.length > 0;
@@ -66,9 +75,22 @@ export interface BridgePendingTurn {
    * never settle from screen-idle alone; worker terminal emission requires
    * this bit (or an explicit failure/exit path outside the queue). */
   terminalObserved?: boolean;
+  /** The latest terminal evidence is an assistant record's stop_reason that no
+   * `system/turn_duration` has confirmed yet. Claude Code stamps EVERY content
+   * block record with its message's stop reason, so the thinking block of a
+   * final message reads `end_turn` while the text block, an API error that cut
+   * the stream and the Stop hooks may all still follow. See drainEmittable. */
+  awaitingDurationMarker?: boolean;
+  /** Its `system/turn_duration` was read: the turn's last record. Anything the
+   *  assistant writes after it belongs to the next turn. */
+  closedByDurationMarker?: boolean;
   /** Structured execution result. This is independent from whether transcript
    * fallback text is visible or suppressed by a prior `botmux send`. */
   terminalOutcome?: Exclude<ClaudeTerminalOutcome, { status: 'rate_limited' }>;
+  /** Transcript timestamp of the record that set a non-completed
+   * terminalOutcome. Tells a failure the worker watched happen from one it is
+   * replaying out of an earlier generation's history. */
+  terminalOutcomeAtMs?: number;
   /** Structured 429 observed for this turn. It remains owned by the existing
    * limited/reset path and must not be converted into ordinary ambiguity when
    * the following turn_duration closes the transcript boundary. */
@@ -99,6 +121,9 @@ export interface BridgePendingTurn {
   /** A late text block after an empty terminal still belongs to the same
    * native local input; reuse its captured reply address. */
   replyContextTurnId?: string;
+  /** Local turns only: the Lark turn that most recently started before this
+   * one was synthesised — where a failure notice for it is anchored. */
+  precedingLarkTurnId?: string;
   /** A short substring of the Lark message that we expect to find inside
    *  the next matching `user` event's content. When set, only a user event
    *  whose stringified content contains this fingerprint is allowed to
@@ -125,13 +150,33 @@ export interface BridgePendingTurn {
    *  the turn — short fingerprints ("hello", "test") would otherwise risk
    *  matching pre-existing user lines in unrelated sibling jsonls. */
   markTimeMs?: number;
+  /** When Claude's own transcript recorded this input entering its type-ahead
+   *  queue (`queue-operation enqueue`). While it sits there the mark is not
+   *  stranded: see {@link isHeldInCliQueue}. */
+  cliQueuedAtMs?: number;
+  /** When the input left that queue (`dequeue` / `remove`), or the queue stopped
+   *  being observable. The record that binds the mark follows right behind, so
+   *  the normal TTL runs again from here. */
+  cliQueueReleasedAtMs?: number;
   /** Set when this mark was re-created from the durable turn journal after a
    *  worker/daemon restart interrupted the turn. The emit path prefixes the
    *  delivered fallback with an "interrupted by restart" notice so the user
    *  can tell a recovered partial answer from a live one. */
   restoredFromJournal?: boolean;
+  /** A turn carried out of an older transcript when an in-process rotation
+   *  was discovered (/clear, /resume, pid/fingerprint switch). Its missing
+   *  marker belongs to the old writer and can never arrive on the new file,
+   *  so releasing it must not teach the CURRENT generation it is marker-less. */
+  carriedAcrossGeneration?: boolean;
   /** Observed at least one non-error assistant event (including tool calls). */
   hasAssistantActivity?: boolean;
+  /** Per-turn monotonic counter bumped whenever a non-sidechain, non-error
+   *  assistant record is attributed to the turn while it is collecting. The
+   *  worker's no-idle watchdog snapshots it when arming and restarts its bound
+   *  whenever it grows: a final message flushed block-by-block seconds apart
+   *  (every block stamped with the terminal stop_reason) must be measured from
+   *  the LAST block ("transcript quiet 2s"), not from the first one. */
+  attributedActivitySeq?: number;
   /** Set on a Lark turn whose input Claude Code folded into the turn already
    *  running (a mid-turn system reminder) instead of starting its own. It has
    *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
@@ -139,6 +184,34 @@ export interface BridgePendingTurn {
   /** Lark turns folded into this one. They leave the queue right behind it and
    *  share its terminal, so each still gets the end signal its card waits for. */
   absorbedTurns?: BridgePendingTurn[];
+}
+
+/** Upper bound on holding a mark for an input in Claude's own queue. The queue
+ *  normally lets go at the next tool boundary or turn end (longest seen: 27
+ *  minutes), and the hold also ends when Claude returns to its prompt. The bound
+ *  covers an input dropped without any record while Claude stays busy: a stale
+ *  mark at the queue head keeps later Lark turns from binding. */
+export const CLI_QUEUE_HOLD_MAX_MS = 30 * 60_000;
+/** Same allowance as the fingerprint scan's floor: an enqueue record is written
+ *  after the mark, but clocks and write order can differ slightly. */
+const CLI_QUEUE_MARK_SKEW_MS = 5_000;
+
+/** Minimum gap between the worker's sibling-jsonl fingerprint fallback scans
+ *  for one mark. 10s is far wider than the milliseconds Claude needs to write
+ *  a normal user line, and the fallback only runs after the primary jsonl scan
+ *  already missed the line — i.e. Claude rotated via `/clear` / `/resume`,
+ *  which happens hours apart, so the delay is invisible. */
+export const BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 10_000;
+/** A held mark is proven to wait inside Claude's queue, so its fallback runs
+ *  even less often — but not never: an in-pane `/clear` while the input waits
+ *  moves it to another file. Must stay strictly larger than the normal gap. */
+export const BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 60_000;
+
+/** Claude's own transcript proves this input is waiting in its queue. There is
+ *  nothing to search other transcripts for, and no reason to expire the mark:
+ *  the record that binds it arrives when Claude takes the input. */
+export function isHeldInCliQueue(turn: BridgePendingTurn): boolean {
+  return turn.cliQueuedAtMs !== undefined && turn.cliQueueReleasedAtMs === undefined;
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -214,6 +287,11 @@ export class BridgeTurnQueue {
     private readonly onLarkTurnStarted?: (turn: BridgePendingTurn, evidence: BridgeTurnStartEvidence) => void,
   ) {}
   private seen = new Set<string>();
+  /** Mirror of Claude's type-ahead queue, in order, from the queue-operation
+   *  records read so far. `dequeue` records carry no content, so only the order
+   *  says which input left. A mirror that started mid-queue can release a mark
+   *  early, which falls back to the normal TTL. */
+  private cliQueue: Array<{ text: string; turn?: BridgePendingTurn }> = [];
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
   private lastLocalTurnId?: string;
@@ -242,6 +320,105 @@ export class BridgeTurnQueue {
    *  `pruneExpired`'s return value, just accumulated because the drop happens
    *  deep inside ingest() rather than at an explicit call boundary. */
   private droppedNeedingJournalClear: BridgePendingTurn[] = [];
+  /** This transcript has shown it ends turns with `system/turn_duration`
+   *  (seen live, in absorbed history, or by the worker's baseline probe).
+   *  Survives clearPending: it describes the CLI, not one generation's turns. */
+  private durationMarkerSeen = false;
+  /** An idle-edge wait for a turn's duration marker ran out before this
+   *  transcript ever showed one: the CLI most likely never writes it (older
+   *  Claude JSONL), so later turns settle on the stop_reason again instead of
+   *  each waiting out the bound. A marker read afterwards outranks this.
+   *  Survives clearPending for the same reason as durationMarkerSeen. */
+  private durationMarkerWaitExpired = false;
+
+  /** Record that this transcript writes `system/turn_duration` markers. */
+  noteDurationMarkerObserved(): void {
+    this.durationMarkerSeen = true;
+  }
+
+  /** The worker's bounded idle-edge wait for the head turn's close ran out. */
+  noteDurationMarkerWaitExpired(): void {
+    if (!this.durationMarkerSeen) this.durationMarkerWaitExpired = true;
+  }
+
+  /** Forget both verdicts for a NEW writer/transcript. clearPending() within
+   *  one CLI generation intentionally keeps them (the CLI did not change),
+   *  but a watcher teardown/fresh-empty start and an in-process transcript
+   *  rotation (/clear, /resume, pid-state, fingerprint switch) begin a new
+   *  generation: an `absent` learned from the old writer must not strip the
+   *  next session's first-turn protection. The baseline probe then re-proves
+   *  `seen` from the new file. */
+  resetDurationMarkerVerdicts(): void {
+    this.durationMarkerSeen = false;
+    this.durationMarkerWaitExpired = false;
+  }
+
+  /** Claude's queue is not observable from another transcript or CLI process:
+   *  the dequeue may land where we are not reading. */
+  forgetCliQueue(now: number = Date.now()): void {
+    this.cliQueue = [];
+    for (const turn of this.queue) {
+      if (isHeldInCliQueue(turn)) turn.cliQueueReleasedAtMs = now;
+    }
+  }
+
+  /** Claude is back at its prompt, so its queue should be empty: an input
+   *  still held left without a record we could match. The normal TTL runs from
+   *  here, which also covers an idle edge seen while input was still queued. */
+  cliQueueDrained(now: number = Date.now()): void {
+    this.forgetCliQueue(now);
+  }
+
+  /** Mark turns already STARTED in the generation that is ending as carried
+   *  across the rotation, so releasing them on the new file never teaches a
+   *  negative marker verdict. UNSTARTED marks are deliberately left untagged:
+   *  they have not bound a user record in the old file, so when the new file's
+   *  own user event starts them they are live turns of the new writer and must
+   *  keep its normal marker hold (including after a proven marker-present
+   *  history), not inherit the old writer's terminal-boundary exception. */
+  markPendingTurnsCarriedAcrossGeneration(): void {
+    for (const turn of this.queue) {
+      if (turn.started) turn.carriedAcrossGeneration = true;
+    }
+  }
+
+  /** True when a head turn is waiting for a duration marker while this
+   *  transcript has no marker verdict yet (a session's first turn). This is
+   *  the ONLY state the worker's provisional-exit watchdog may time out: a
+   *  transcript proven to write markers keeps waiting for the marker (an API
+   *  error can still follow a text record), and an idle-expired verdict
+   *  already settles on the stop_reason. */
+  isFreshHeadAwaitingMarker(turn: BridgePendingTurn): boolean {
+    // `!durationMarkerWaitExpired` needs no term of its own: with no marker
+    // seen yet, isAwaitingDurationMarker's (durationMarkerSeen || !waitExpired)
+    // gate reduces exactly to !durationMarkerWaitExpired.
+    return !this.durationMarkerSeen
+      && this.isAwaitingDurationMarker(turn);
+  }
+  /** True while `turn` is held for its duration marker: its terminal so far is
+   *  a block-level stop_reason and no later turn has started collecting (a new
+   *  turn start is itself the boundary, and must never leave the head blocked
+   *  behind it). The hold does not need the marker to have been seen before:
+   *  the first turn of a session is cut by an API error as easily as any other.
+   *  Only a CLI shown not to write the marker (see durationMarkerWaitExpired)
+   *  settles on the stop_reason. */
+  isAwaitingDurationMarker(turn: BridgePendingTurn): boolean {
+    return (this.durationMarkerSeen || !this.durationMarkerWaitExpired)
+      && turn.awaitingDurationMarker === true
+      && turn === this.collecting;
+  }
+
+  /** True while the transcript is still writing `turn`: it started, it is the
+   *  turn collecting records, and nothing has closed it yet — no terminal
+   *  record was read, or it is held for its duration marker. Claude shows its
+   *  prompt (and its hooks report done) before the records that close a turn —
+   *  its final blocks, an API error that cut the stream, the marker — reach the
+   *  file, so the worker waits (bounded) on this at an idle edge before
+   *  settling from it. */
+  isTurnOpenAtIdle(turn: BridgePendingTurn): boolean {
+    if (!turn.started || turn !== this.collecting || turn.closedByDurationMarker) return false;
+    return !turn.terminalObserved || this.isAwaitingDurationMarker(turn);
+  }
 
   /** Hand over (and forget) the turns dropped head-of-line since the last
    *  call. The worker drains this after every ingest and clears each one's
@@ -257,6 +434,7 @@ export class BridgeTurnQueue {
   absorb(events: TranscriptEvent[]): void {
     for (const ev of events) {
       if (ev.uuid) this.seen.add(ev.uuid);
+      if (isClaudeTurnDurationEvent(ev)) this.durationMarkerSeen = true;
     }
   }
 
@@ -295,6 +473,7 @@ export class BridgeTurnQueue {
    *  already in flight) and wants to clear the slate. */
   clearPending(): BridgePendingTurn[] {
     this.lastLocalTurnId = undefined;
+    this.cliQueue = [];
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     return dropped;
@@ -327,13 +506,15 @@ export class BridgeTurnQueue {
    *  scans every poll tick until the worker restarts. Started turns are
    *  never expired here: once Claude actually wrote the user line, the
    *  turn is collecting assistant text and we want to wait however long
-   *  the model takes. */
+   *  the model takes. The same goes for a mark whose input Claude holds in its
+   *  own queue, up to {@link CLI_QUEUE_HOLD_MAX_MS}. */
   pruneExpired(maxAgeMs: number, now: number = Date.now()): BridgePendingTurn[] {
     const dropped: BridgePendingTurn[] = [];
     this.queue = this.queue.filter(t => {
       if (t.started) return true;
       if (t.markTimeMs === undefined) return true;
-      if (now - t.markTimeMs <= maxAgeMs) return true;
+      if (isHeldInCliQueue(t) && now - t.cliQueuedAtMs! <= CLI_QUEUE_HOLD_MAX_MS) return true;
+      if (now - Math.max(t.markTimeMs, t.cliQueueReleasedAtMs ?? 0) <= maxAgeMs) return true;
       dropped.push(t);
       return false;
     });
@@ -362,6 +543,10 @@ export class BridgeTurnQueue {
     onAssistantAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
   ): void {
     for (const ev of events) {
+      if (ev.type === 'queue-operation') {
+        this.observeCliQueueOperation(ev);
+        continue;
+      }
       const uuid = ev.uuid;
       if (!uuid || this.seen.has(uuid)) continue;
       this.seen.add(uuid);
@@ -424,6 +609,13 @@ export class BridgeTurnQueue {
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
+        // An assistant record after the collecting turn's duration marker opens
+        // the next turn, one that began without a meaningful user line (a
+        // `<task-notification>` wake-up). A live drain has emitted the closed
+        // turn by then; a batch spanning several turns — a rotation switch
+        // replaying what the bridge did not read — must not fold the next
+        // turn's reply into it.
+        if (this.collecting?.closedByDurationMarker) this.collecting = null;
         // Capture CronCreate calls with the topic anchor of the turn that is
         // running them: when the ack returns the task id, fires of that task
         // route back to THIS topic even if other topics receive messages
@@ -477,6 +669,7 @@ export class BridgeTurnQueue {
               // on (`status !== 'failed' || retryable !== true` → no
               // continuation). Unconditional assignment, therefore.
               this.collecting.terminalOutcome = terminalOutcome;
+              this.collecting.terminalOutcomeAtMs = eventTimeMs(ev);
             } else {
               // The `<synthetic>` placeholder is the WEAKEST terminal signal
               // there is - no model call happened at all (no requestId, usage
@@ -485,7 +678,10 @@ export class BridgeTurnQueue {
               // then withhold the real answer text AND let the daemon post a
               // failure card for a turn that had in fact been answered. With no
               // earlier terminal outcome it still records the failure.
-              this.collecting.terminalOutcome ??= terminalOutcome;
+              if (this.collecting.terminalOutcome === undefined) {
+                this.collecting.terminalOutcome = terminalOutcome;
+                this.collecting.terminalOutcomeAtMs = eventTimeMs(ev);
+              }
             }
             this.collecting.terminalObserved = true;
           }
@@ -508,6 +704,7 @@ export class BridgeTurnQueue {
             isLocal: true,
             userUuid: undefined,
             replyContextTurnId: this.lastLocalTurnId,
+            precedingLarkTurnId: this.lastLarkTurnId,
             assistantUuids: [],
             sourceJsonlPath,
             markTimeMs: Date.now(),
@@ -520,6 +717,8 @@ export class BridgeTurnQueue {
         }
         if (this.collecting) {
           this.collecting.hasAssistantActivity = true;
+          this.collecting.attributedActivitySeq
+            = (this.collecting.attributedActivitySeq ?? 0) + 1;
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
@@ -527,6 +726,10 @@ export class BridgeTurnQueue {
         }
         if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
           this.collecting.terminalObserved = true;
+          // Provisional: this may be any block of the final message, not its
+          // last one. Records that follow stay attributed here because the turn
+          // keeps `collecting`; drainEmittable holds it for the duration marker.
+          this.collecting.awaitingDurationMarker = true;
           if (terminalOutcome?.status !== 'rate_limited') {
             this.collecting.terminalOutcome ??= terminalOutcome;
           }
@@ -538,8 +741,11 @@ export class BridgeTurnQueue {
         // still authoritative proof that the turn completed. Keep a previously
         // classified API failure, but otherwise use the same completed default
         // as the next-turn-start compatibility boundary below.
+        if (isClaudeTurnDurationEvent(ev)) this.durationMarkerSeen = true;
         if (this.collecting) {
           this.collecting.terminalObserved = true;
+          this.collecting.awaitingDurationMarker = false;
+          if (isClaudeTurnDurationEvent(ev)) this.collecting.closedByDurationMarker = true;
           if (!this.collecting.rateLimited) {
             this.collecting.terminalOutcome ??= { status: 'completed' };
           }
@@ -656,6 +862,43 @@ export class BridgeTurnQueue {
     this.collecting = scheduledTurn;
     this.lastLocalTurnId = scheduledTurn.turnId;
     this.onLocalTurnStarted?.(scheduledTurn);
+  }
+
+  /** Queue records have no uuid, so they are deduped on their own identity: a
+   *  transcript switch can replay them. They never start a turn. */
+  private observeCliQueueOperation(ev: TranscriptEvent): void {
+    const atMs = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
+    if (!Number.isFinite(atMs)) return;
+    const text = typeof ev.content === 'string' ? normaliseForFingerprint(ev.content) : '';
+    // Several dequeues can share one millisecond; replaying them is harmless
+    // because a transcript switch empties the mirror first.
+    if (ev.operation !== 'dequeue') {
+      // Same-millisecond records of equal length but DIFFERENT content really
+      // occur (same-ms removes carrying distinct commandUuid: 14 groups in
+      // fleet transcripts), so the identity is the record's own id, falling
+      // back to the full normalised text — never the text's length.
+      const identity = ev.commandUuid ?? ev.deliveryId ?? text;
+      const key = `queue:${ev.operation}:${ev.timestamp}:${identity}`;
+      if (this.seen.has(key)) return;
+      this.seen.add(key);
+    }
+    if (ev.operation === 'enqueue') {
+      const turn = this.queue.find(t => !t.started && t.cliQueuedAtMs === undefined
+        && t.markTimeMs !== undefined && atMs >= t.markTimeMs - CLI_QUEUE_MARK_SKEW_MS
+        && !!t.contentNormalized && t.contentNormalized.length >= TRUNCATION_MATCH_MIN_CHARS
+        && (text.includes(t.contentNormalized) || isTruncatedMatch(text, t.contentNormalized)));
+      if (turn) turn.cliQueuedAtMs = atMs;
+      this.cliQueue.push({ text, ...(turn ? { turn } : {}) });
+      return;
+    }
+    // A content-less remove (e.g. dropped by a hook) cannot say which input left.
+    if (ev.operation !== 'dequeue' && text.length === 0) {
+      this.forgetCliQueue(atMs);
+      return;
+    }
+    const idx = ev.operation === 'dequeue' ? 0 : this.cliQueue.findIndex(item => item.text === text);
+    const [left] = idx >= 0 ? this.cliQueue.splice(idx, 1) : [];
+    if (left?.turn) left.turn.cliQueueReleasedAtMs = atMs;
   }
 
   /** A message typed while a turn ran, which Claude Code folded into that turn
@@ -818,6 +1061,7 @@ export class BridgeTurnQueue {
         turnId: `local-${uuid}`,
         started: true,
         isLocal: true,
+        precedingLarkTurnId: this.lastLarkTurnId,
         userUuid: uuid,
         assistantUuids: [],
         sourceJsonlPath,
@@ -851,15 +1095,42 @@ export class BridgeTurnQueue {
     /** Screen idle may release ordinary fallback turns, but never a durable
      * receiver turn whose receipt depends on an exact terminal contract. */
     requireExplicitTerminalForDurable?: boolean;
+    /** The CLI generation is ending (exit, kill, teardown): a duration marker
+     *  still due will never be written, so a turn held for it is final now. */
+    releaseHeldTerminals?: boolean;
+    /** Release ONLY the turn with this identity; stop before any other head.
+     *  Used by the no-idle watchdog, which has no idle guarantee and must not
+     *  settle a type-ahead turn that merely follows the bound one (a global
+     *  terminal-boundary drain would pop that follower even mid-tool). */
+    onlyTurn?: { turnId: string; dispatchAttempt?: number };
   } = {}): BridgePendingTurn[] {
     const out: BridgePendingTurn[] = [];
     while (this.queue.length > 0) {
       const head = this.queue[0];
       if (!head.started) break;
+      // Identity gate: a bounded caller (the no-idle watchdog) may release its
+      // own turn only, never a follower that became the head.
+      if (opts.onlyTurn
+        && (head.turnId !== opts.onlyTurn.turnId
+          || head.dispatchAttempt !== opts.onlyTurn.dispatchAttempt)) break;
       if (opts.explicitTerminalOnly && !head.terminalObserved) break;
       if (opts.requireExplicitTerminalForDurable
         && head.dispatchAttempt !== undefined
         && !head.terminalObserved) break;
+      // Neither the per-read drain nor the idle edge may settle a turn on a
+      // block-level stop_reason when its duration marker is due: the reader can
+      // stop between two records of one message (the idle edge, too, can beat
+      // the transcript flush). The rest of the turn would then arrive with
+      // nothing collecting, be synthesised as a local turn, and a stream that
+      // died there would fail that local turn instead of this one — answer
+      // text gone, failure unreported.
+      if (!opts.releaseHeldTerminals
+        && this.isAwaitingDurationMarker(head)
+        // A journal-restored turn's writer generation has ended: its marker is
+        // never coming, so an idle/terminal boundary releases it (a per-read
+        // drain still waits). It is settled without learning the wait-expired
+        // verdict, which belongs to a live CLI only.
+        && !(opts.terminalBoundary && (head.restoredFromJournal || head.carriedAcrossGeneration))) break;
       if (!opts.terminalBoundary && !head.terminalObserved && head.assistantUuids.length === 0) break;
       this.queue.shift();
       if (this.collecting === head) this.collecting = null;

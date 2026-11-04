@@ -2,15 +2,13 @@
  * Per-turn publication of the acting CLI identity.
  *
  * This is where the three pieces meet: the bot's {@link TriggerUserAuthConfig}
- * policy, the per-person token store, and the session identity file a wrapper
- * sources. It runs once per turn, just before the turn reaches the CLI.
+ * policy, the per-person token store, and the per-turn identity snapshot a
+ * wrapper sources when that turn executes.
  *
  * The single rule it enforces: **the credentials published for a turn belong to
  * the person who sent that turn, or nothing is published.** There is no path
  * here that reads another person's token — the sender's open_id is the only key
- * ever used, and when it yields nothing the previous file is DELETED rather than
- * left in place. A stale file would mean the next command silently runs as the
- * previous person, which is the exact failure the feature exists to remove.
+ * ever used. Missing credentials produce a denial in that turn's snapshot.
  */
 import { logger } from '../utils/logger.js';
 import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.js';
@@ -22,12 +20,14 @@ import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-c
 import type { BotConfig } from '../bot-registry.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
+import { registerActiveIdentityTurn } from './active-identity-turns.js';
 import {
   triggerUserAuthApplies,
   credentialSourceOf,
   TRIGGER_USER_AUTH_TOOLS,
   type TriggerUserAuthTool,
 } from '../services/trigger-user-auth.js';
+import type { IdentityStorageModel } from './lark-tool-binding.js';
 import {
   resolvePlatformIdentity,
   platformAuthorizeUrl,
@@ -38,6 +38,7 @@ import {
   clearSessionIdentity,
   type CliIdentity,
 } from './cli-identity.js';
+import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 
 /** What was published for one tool this turn — drives the user-visible notice. */
 export interface ToolIdentityOutcome {
@@ -57,10 +58,48 @@ export interface ToolIdentityOutcome {
  * its stable user identity in the receiving app. Never accepted from CLI input. */
 export interface DelegatedCliIdentity {
   targetOpenId?: string;
+  /** The requester as seen by the ISSUING app: the key of their local
+   *  credential stores on this machine. Never valid inside the receiving app. */
   credentialOpenId: string;
+  /** Tenant-stable id of the same human, from the verified dispatch record.
+   *  The platform key: it needs no lookup in either app. */
+  unionId: string;
   tools: TriggerUserAuthTool[];
   dispatchRoot: string;
-  denialReason?: 'target_access_denied' | 'target_validation_unavailable';
+  /** `delegation_inactive`: a workflow handoff's delegation whose run attempt
+   *  ended, or whose handoff was withdrawn (design 2026-11-03 §10.3). */
+  denialReason?: 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
+    /** A workflow delegation passed on from a node session into a session
+     *  that keeps identities on disk: it could not be re-checked per use. */
+    | 'passed_on_unsupported';
+  /** A workflow handoff's delegation (design 2026-11-03 §10). */
+  workflowHandoff?: true;
+  /** Workflow handoff only: re-run its run / attempt / revocation checks
+   *  (local reads) and say why it no longer holds. Consulted on every use,
+   *  so a stop that never reached this daemon still ends it. Daemon memory
+   *  only; never serialized. */
+  recheck?: () => string | undefined;
+}
+
+/** Replace one tool's published identity for `turnId` with the refusal for
+ *  `delegated` (its `denialReason` explains it). Used when a workflow
+ *  delegation stops holding while its turn is still running. */
+export function publishDelegationRefusal(args: {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  tool: TriggerUserAuthTool;
+  delegated: DelegatedCliIdentity;
+  storageModel: IdentityStorageModel;
+}): void {
+  denyDelegated(args.tool, {
+    botConfig: {} as BotConfig,
+    sessionDataDir: args.sessionDataDir,
+    sessionId: args.sessionId,
+    senderOpenId: undefined,
+    turnId: args.turnId,
+    storageModel: args.storageModel,
+  }, args.delegated);
 }
 
 export interface PublishTurnIdentityArgs {
@@ -78,6 +117,10 @@ export interface PublishTurnIdentityArgs {
    * a newer message's credentials can land while an older turn is still going.
    */
   turnId?: string;
+  /** Whether publication keeps the identity in daemon memory (proven) or in the
+   *  legacy single-snapshot file (single). The caller derives this with the
+   *  same predicate the worker uses to render the wrapper. */
+  storageModel: IdentityStorageModel;
 }
 
 /**
@@ -90,12 +133,16 @@ export interface PublishTurnIdentityArgs {
 export async function publishTurnCliIdentity(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
-  const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId } = args;
+  const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel } = args;
   const policy = botConfig.triggerUserAuth;
   const outcomes: ToolIdentityOutcome[] = [];
   // Record before the new-entry shortcut (and before first worker spawn).
   // The daemon has already verified the signed dispatch and target access.
   rememberLarkToolDelegation(sessionDataDir, sessionId, turnId, args.delegatedIdentity);
+  // Anchor the published turn in the terminal-GC retention ledger for the whole
+  // accept→queue→execute window. The worker's own queue marker is CLI-writable
+  // and cannot serve as that anchor.
+  if (turnId) registerActiveIdentityTurn(sessionDataDir, sessionId, turnId);
 
   for (const tool of TRIGGER_USER_AUTH_TOOLS) {
     if (tool === 'lark-cli' && isLarkToolBound(botConfig, sessionDataDir, sessionId)) {
@@ -109,13 +156,11 @@ export async function publishTurnCliIdentity(
     try {
       outcomes.push(args.delegatedIdentity
         ? await publishDelegated(tool, args, args.delegatedIdentity)
-        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel));
     } catch (e) {
       // Fail closed through the SAME policy as an ordinary missing token, so a
       // credential-store outage and "this person never authorized" cannot end
-      // up with different identities in force. Overwriting matters as much as
-      // the policy: leaving the previous person's file would keep running as
-      // them with no signal at all.
+      // up with different identities in force.
       logger.warn(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
@@ -127,14 +172,14 @@ export async function publishTurnCliIdentity(
             message: locale === 'en'
               ? 'botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.'
               : 'botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。',
-          });
-        } catch { clearSessionIdentity(sessionDataDir, sessionId, tool); }
+          }, storageModel);
+        } catch { clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, storageModel); }
         outcomes.push({ tool, state: 'unavailable' });
         continue;
       }
       outcomes.push(args.delegatedIdentity
         ? denyDelegated(tool, args, args.delegatedIdentity)
-        : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+        : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel));
     }
   }
   return outcomes;
@@ -145,16 +190,20 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
     ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
     : user.denialReason === 'target_access_denied'
       ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
-      : 'The source must ask the original human to authorize.';
+      : user.denialReason === 'delegation_inactive'
+        ? 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn), so the requester\'s identity no longer applies; do not request another login.'
+        : user.denialReason === 'passed_on_unsupported'
+          ? 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call, and this session does not. Tools that need the person\'s authorization refuse here; do not request another login.'
+          : 'The source must ask the original human to authorize.';
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
       message: `botmux: delegated ${tool} execution refused for the requesting user. `
         + `Report this blocker with botmux report --dispatch-root ${user.dispatchRoot}; `
         + reason + ' Do not ask a bot to log in or use another identity.',
-    });
+    }, args.storageModel);
   } catch {
-    clearSessionIdentity(args.sessionDataDir, args.sessionId, tool);
+    clearSessionIdentity(args.sessionDataDir, args.sessionId, tool, args.turnId, args.storageModel);
   }
   return { tool, state: 'needs-authorization' };
 }
@@ -162,23 +211,28 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
 async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): Promise<ToolIdentityOutcome> {
   if (!user.tools.includes(tool)) return denyDelegated(tool, args, user);
   let identity: CliIdentity | null = null;
-  // Platform first (same person, keyed by the issuer-scoped open_id the daemon
-  // verified). In strict `platform` mode a non-grant is final; in `auto` an
+  // Platform first, keyed by the union_id in the verified dispatch record. The
+  // issuer-scoped credentialOpenId means nothing to this bot's app, and
+  // re-deriving the union_id from targetOpenId would hang the grant on a
+  // contact lookup that need not be reachable. In strict `platform` mode a
+  // non-grant is final and local stores are never read; in `auto` an
   // already-provisioned local HOME is still honoured below.
   const source = credentialSourceOf(args.botConfig.triggerUserAuth);
   if (source !== 'local') {
     const platform = await resolvePlatformIdentity({
-      botConfig: args.botConfig, tool, openId: user.credentialOpenId,
+      botConfig: args.botConfig, tool, unionId: user.unionId,
       sessionId: args.sessionId, ...(args.turnId ? { turnId: args.turnId } : {}),
     });
     if (platform.state === 'granted') identity = platform.identity;
     else if (source === 'platform') return denyDelegated(tool, args, user);
   }
+  let localMint = false;
   if (!identity && tool === 'bytedcli') {
     // Keep the issuer-scoped credential key; do not copy a source open_id into
     // the target app or duplicate/extend the lifetime of the user's login.
     const jwt = await mintBytedcliJwts(user.credentialOpenId);
-    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
+    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}), ...(jwt.regionalCloudJwts ? { regionalCloudJwts: jwt.regionalCloudJwts } : {}) };
+    localMint = !!jwt;
   } else if (!identity && tool === 'lark-cli') {
     const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
     if (home) identity = { tool, mode: 'user-home', home };
@@ -191,7 +245,18 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     }
   }
   if (!identity) return denyDelegated(tool, args, user);
-  writeSessionIdentity(args.sessionDataDir, args.sessionId, { ...identity, ...(args.turnId ? { turnId: args.turnId } : {}) });
+  const stamped = {
+    ...identity,
+    ...(args.turnId ? { turnId: args.turnId } : {}),
+    ...(user.targetOpenId ? { openId: user.targetOpenId } : {}),
+  };
+  writeSessionIdentity(args.sessionDataDir, args.sessionId, stamped, args.storageModel);
+  if (localMint && args.turnId && args.storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+    trackBytedcliIdentityRenewal({
+      sessionDataDir: args.sessionDataDir, sessionId: args.sessionId,
+      credentialOpenId: user.credentialOpenId, identity: { ...stamped, turnId: args.turnId },
+    });
+  }
   return { tool, state: 'user' };
 }
 
@@ -203,21 +268,24 @@ async function publishOne(
   senderOpenId: string | undefined,
   locale: Locale | undefined,
   turnId: string | undefined,
+  storageModel: IdentityStorageModel,
 ): Promise<ToolIdentityOutcome> {
   const withheld = async () =>
-    withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId);
+    withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel);
 
   // No human sender (scheduled run, hook, meeting event, bot-to-bot handoff):
   // there is no "trigger user" to act as. Withhold — never reach for the session
   // creator's or the owner's credentials to fill the gap.
   if (!senderOpenId) return await withheld();
 
-  const publish = (identity: CliIdentity): ToolIdentityOutcome => {
-    writeSessionIdentity(sessionDataDir, sessionId, {
-      ...identity,
-      ...(turnId ? { turnId } : {}),
-      openId: senderOpenId,
-    });
+  const publish = (identity: CliIdentity, localMint = false): ToolIdentityOutcome => {
+    const stamped = { ...identity, ...(turnId ? { turnId } : {}), openId: senderOpenId };
+    writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
+    if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+      trackBytedcliIdentityRenewal({
+        sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId },
+      });
+    }
     return { tool, state: 'user' };
   };
 
@@ -237,15 +305,15 @@ async function publishOne(
     if (source === 'platform' || platform.state !== 'unbound') {
       if (source === 'auto') {
         const local = await resolveIdentityFor(tool, botConfig, senderOpenId);
-        if (local) return publish(local);
+        if (local) return publish(local, true);
       }
-      return refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, platform);
+      return refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform);
     }
   }
 
   const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
   if (!identity) return await withheld();
-  return publish(identity);
+  return publish(identity, true);
 }
 
 /**
@@ -261,6 +329,7 @@ function refuseViaPlatform(
   senderOpenId: string,
   locale: Locale | undefined,
   turnId: string | undefined,
+  storageModel: IdentityStorageModel,
   platform: Exclude<PlatformIdentityResolution, { state: 'granted' }>,
 ): ToolIdentityOutcome {
   const provider = tool === 'bytedcli' ? 'ByteCloud' : t('trigger_user_auth.provider_lark', undefined, locale);
@@ -290,7 +359,7 @@ function refuseViaPlatform(
       state = 'unavailable';
       break;
   }
-  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, undefined, tail);
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, undefined, tail);
   return { tool, state };
 }
 
@@ -314,6 +383,7 @@ async function withholdIdentity(
   senderOpenId: string | undefined,
   locale: Locale | undefined,
   turnId: string | undefined,
+  storageModel: IdentityStorageModel,
 ): Promise<ToolIdentityOutcome> {
   // Pre-fetch a ready, valid authorization link for either tool so the moment a
   // governed command is actually refused, the agent has a link to relay instead
@@ -335,7 +405,7 @@ async function withholdIdentity(
       );
     }
   }
-  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, authUrl);
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, storageModel, authUrl);
   return { tool, state: 'needs-authorization' };
 }
 
@@ -359,6 +429,7 @@ function writeDenial(
   botConfig: BotConfig,
   locale: Locale | undefined,
   turnId: string | undefined,
+  storageModel: IdentityStorageModel,
   authUrl?: string,
   /** Replaces the local-login tail (auto-link or /login how-to) when the
    *  authorization lives elsewhere — e.g. on the central platform. */
@@ -409,9 +480,9 @@ function writeDenial(
             ),
             t('trigger_user_auth.denied_howto_status', undefined, locale)]),
       ].join('\n'),
-    });
+    }, storageModel);
   } catch (e) {
-    clearSessionIdentity(sessionDataDir, sessionId, tool);
+    clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, storageModel);
     logger.debug(
       `[trigger-user-auth] could not publish the ${tool} denial (absent file denies too): `
       + `${e instanceof Error ? e.message : String(e)}`,
@@ -464,5 +535,10 @@ async function resolveIdentityFor(
   // falling back to the machine's own SSO session.
   const jwts = await mintBytedcliJwts(senderOpenId);
   if (!jwts) return null;
-  return { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) };
+  return {
+    tool: 'bytedcli',
+    cloudJwt: jwts.cloudJwt,
+    ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}),
+    ...(jwts.regionalCloudJwts ? { regionalCloudJwts: jwts.regionalCloudJwts } : {}),
+  };
 }

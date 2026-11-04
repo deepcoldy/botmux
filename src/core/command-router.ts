@@ -19,11 +19,13 @@ import {
   DAEMON_COMMANDS,
   commandSpec,
   commandCliIdMatches,
+  isBuiltinSlashCommandName,
   MULTILINE_COMMANDS,
   ROUTE_SPECIAL_COMMANDS,
   SESSIONLESS_DAEMON_COMMANDS,
   type CommandSpecialHandler,
 } from './command-schema.js';
+import { PASSTHROUGH_COMMANDS } from './passthrough-commands.js';
 import { docWatchCommandNeedsSession } from './doc-watch-command.js';
 import { phaseHasLiveWorker, phaseHasSession, type SessionPhase } from './session-phase.js';
 
@@ -37,7 +39,7 @@ export interface SlashCommandInvocation {
  *  are intentionally left for the CLI instead of being intercepted by the
  *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
  *  trigger real daemon actions. */
-export function parseSlashCommandInvocation(content: string): SlashCommandInvocation | null {
+export function parseSlashCommandInvocation(content: string, cliId?: string): SlashCommandInvocation | null {
   // trim BOTH ends: a trailing newline/space rides into the returned `content`
   // and, for a passthrough command relayed verbatim to the CLI (raw_input), gets
   // typed as a literal trailing newline — which breaks the CLI's slash-command
@@ -53,15 +55,19 @@ export function parseSlashCommandInvocation(content: string): SlashCommandInvoca
   if (!cmd) return null;
 
   // Explicit payload commands keep their entire body, including examples.
-  const literalBody = commandSpec(cmd)?.literalBody === true;
+  const spec = commandSpec(cmd);
+  const cliPayload = !!spec?.cliId && commandCliIdMatches(spec.cliId, cliId) && spec.multiline === true
+    && /^\/effort\s+(?:low|medium|high|xhigh|max|ultra)(?:\s|$)/i.test(trimmed);
+  const literalBody = spec?.literalBody === true && (!spec.cliId || cliPayload);
   // Treat angle-bracket placeholders as documentation, not an invocation.
-  if (!literalBody && /<[^>\r\n]+>/.test(firstLine)) return null;
+  const invocationPrefix = cliPayload ? firstLine.split(/\s+/).slice(0, 2).join(' ') : firstLine;
+  if ((!literalBody || cliPayload) && /<[^>\r\n]+>/.test(invocationPrefix)) return null;
 
   const restNonBlank = lines.slice(1).map(l => l.trim()).filter(Boolean);
   if (restNonBlank.length > 0) {
     // A list of slash commands is almost certainly discussion / planning text.
     if (!literalBody && restNonBlank.some(l => l.startsWith('/'))) return null;
-    if (!MULTILINE_COMMANDS.has(cmd)) return null;
+    if (!MULTILINE_COMMANDS.has(cmd) && !cliPayload) return null;
   }
 
   return { cmd, content: trimmed };
@@ -102,6 +108,9 @@ export interface SlashRouteInput {
    *  与 isDisposableCommandScratch 不同）。只影响「仅无会话时认领」的命令（`/resume`）：空壳不算
    *  会话。缺省 = 不是空壳。 */
   sessionIsCommandScratch?: boolean;
+  /** 当前 bot 有效插件声明的飞书指令：指令名 → pluginId（两个插件同名时为 null，执行段 fail closed）。
+   *  缺省 = 无插件指令，判定与改造前逐字一致。 */
+  pluginCommands?: ReadonlyMap<string, string | null>;
 }
 
 /** runtime 级联的一项：透传命令行，或最后的正文。 */
@@ -121,6 +130,8 @@ export type SlashRouteDecision =
   | { kind: 'passthrough'; cmd: string; content: string; delivery: 'cold_start' | 'to_session' }
   /** botmux 自己的命令，带无会话时的会话政策。 */
   | { kind: 'daemon'; cmd: string; content: string; sessionPolicy: 'sessionless' | 'existing_only' | 'precreate' | 'existing' }
+  /** 插件声明的飞书指令：不建会话、不进 CLI，由入口转给插件服务。pluginId 为 null = 同名冲突。 */
+  | { kind: 'plugin'; cmd: string; content: string; pluginId: string | null }
   /** runtime 级联（PR-3）：≥1 条透传命令行 + 可选正文，按书写顺序逐条等 CLI 空闲后送出（§6）。 */
   | { kind: 'cascade'; items: CascadeItem[] }
   /** 级联形状成立，但该会话跑不了（riff / mojo / adopt）：fail closed，回一句"请分条发送"。 */
@@ -171,7 +182,7 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   }
 
   // ② parse：不以 `/` 开头是"没有命令"；占位符/多行是"讨论文本"。
-  const invocation = parseSlashCommandInvocation(input.text);
+  const invocation = parseSlashCommandInvocation(input.text, input.cliId);
   if (!invocation) {
     if (!input.text.trim().startsWith('/')) return { kind: 'forward', reason: 'no_slash' };
     // 多行被今天的解析器判成"讨论文本"的，只在「thread + 活 worker + 无附件」下再试一次
@@ -216,6 +227,15 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
     }
     return { kind: 'daemon', cmd, content, sessionPolicy: phaseHasSession(input.phase) ? 'existing' : 'precreate' };
   }
+
+  // ⑤½ 插件声明的指令。排在内置与透传之后：插件永远盖不住 botmux 自己的命令，
+  //    bot 显式配置的 customPassthroughCommands 同名时也以透传为准。
+  //    运行时栅栏同安装期 scanner：内置名与固定透传名即使出现在（旧版/被篡改的）registry 里也不归插件——
+  //    codex-app 这类无 raw 面的 CLI 透传集为空，没有这道栅栏 `/compact` 会落到插件手里。
+  const pluginId = isBuiltinSlashCommandName(cmd) || PASSTHROUGH_COMMANDS.has(cmd)
+    ? undefined
+    : input.pluginCommands?.get(cmd);
+  if (pluginId !== undefined) return { kind: 'plugin', cmd, content, pluginId };
 
   // ⑥ 认出是 `/xxx` 但不属于任何集合 → 当普通消息转发（cmd 留给入口的 grant 限制闸）。
   return { kind: 'forward', reason: 'unknown_slash', cmd };

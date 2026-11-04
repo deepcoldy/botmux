@@ -29,6 +29,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-cantalk-daemon-commands', LEGACY],
   ['/api/bot-launch-shell', LEGACY],
   ['/api/bot-oncall-group', LEGACY],
+  ['/api/bot-actor-owner-bindings', LEGACY],
   ['/api/bot-no-progress-notify', OK_FALSE],
   ['/api/bot-feedback', LEGACY],
   ['/api/bot-env', LEGACY],
@@ -70,7 +71,17 @@ const CASES: readonly Case[] = [
   ['/api/bot-launch-shell', '{"launchShell":"bash"}', 200, { ok: true, launchShell: 'bash' }, { launchShell: 'bash' }],
   ['/api/bot-launch-shell', '{"launchShell":"  "}', 200, { ok: true, launchShell: '' }, { launchShell: undefined }],
   ['/api/bot-oncall-group', '{"oncallGroup":"x"}', 400, { ok: false, error: 'invalid_json' }],
+  ['/api/bot-actor-owner-bindings', '{"botActorOwnerBindings":[{"sourceBotOpenId":"ou_source","sourceBotUnionId":"on_source","ownerUnionId":"on_owner","ownerEmail":"owner@bytedance.com"}]}', 200, {
+    ok: true,
+    botActorOwnerBindings: [{ sourceBotOpenId: 'ou_source', sourceBotUnionId: 'on_source', ownerUnionId: 'on_owner', ownerEmail: 'owner@bytedance.com' }],
+  }, {
+    botActorOwnerBindings: [{ sourceBotOpenId: 'ou_source', sourceBotUnionId: 'on_source', ownerUnionId: 'on_owner', ownerEmail: 'owner@bytedance.com' }],
+  }],
+  ['/api/bot-actor-owner-bindings', '{"botActorOwnerBindings":[{"sourceBotOpenId":"ou_source","sourceBotUnionId":"on_source","ownerUnionId":"on_owner","ownerEmail":"owner@bytedance.com","source":"forged"}]}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":{"timeoutMs":300000}}', 200, { ok: true, noProgressNotify: { enabled: true, timeoutMs: 300000 } }, { noProgressNotify: { enabled: true, timeoutMs: 300000 } }],
+  ['/api/bot-no-progress-notify', '{"noProgressNotify":{"enabled":true,"cliEnabled":true,"timeoutMs":300000}}', 200, { ok: true, noProgressNotify: { enabled: true, cliEnabled: true, timeoutMs: 300000 } }, { noProgressNotify: { enabled: true, cliEnabled: true, timeoutMs: 300000 } }],
+  ['/api/bot-no-progress-notify', '{"noProgressNotify":{"cliEnabled":false}}', 200, { ok: true, noProgressNotify: { enabled: true, cliEnabled: false } }, { noProgressNotify: { enabled: true, cliEnabled: false } }],
+  ['/api/bot-no-progress-notify', '{"noProgressNotify":{"cliEnabled":"yes"}}', 400, { ok: false, error: expect.stringContaining('invalid_no_progress_notify') }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":null}', 200, { ok: true, noProgressNotify: null }, { noProgressNotify: undefined }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":{"timeoutMs":5}}', 400, { ok: false, error: expect.stringContaining('invalid_no_progress_notify') }],
   ['/api/bot-feedback', '{"feedback":"{bad"}', 400, { ok: false, error: 'invalid_json' }],
@@ -86,7 +97,7 @@ const CASES: readonly Case[] = [
   ['/api/bot-idle-suspend-minutes', '{"idleSuspendMinutes":null}', 200, { ok: true, idleSuspendMinutes: null }, { idleSuspendMinutes: undefined }],
   ['/api/bot-idle-suspend-minutes', '{"idleSuspendMinutes":"x"}', 400, { ok: false, error: 'invalid_number' }],
   ['/api/bot-idle-suspend-minutes', '{}', 200, { ok: true, idleSuspendMinutes: null }, { idleSuspendMinutes: undefined }],
-  ['/api/bot-sandbox-network-policy', '{"policy":null}', 200, { ok: true, sandboxNetworkPolicy: null }],
+  ['/api/bot-sandbox-network-policy', '{"policy":null}', 200, { ok: true, sandboxNetworkPolicy: null, warnings: [] }],
   ['/api/bot-sandbox-network-policy', '{"policy":1,"x":2}', 400, { ok: false, error: 'policy_required' }],
   // 校验通过后由 applyConfigField 拒绝：reason 原样作为 400 的 error。
   ['/api/bot-sandbox-network-policy', '{"policy":"allow"}', 400, { ok: false, error: 'sandboxNetworkPolicy must be an object' }],
@@ -133,6 +144,7 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
   let configPath: string;
   let handle: IpcServerHandle | null = null;
   let previousBotsConfig: string | undefined;
+  let previousGlobalConfig: string | undefined;
 
   const persistedBot = () => JSON.parse(readFileSync(configPath, 'utf8'))[0] as Record<string, unknown>;
   const put = (path: string, body?: string) => fetch(`http://127.0.0.1:${handle!.port}${path}`, {
@@ -146,6 +158,10 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     configPath = join(dir, 'bots.json');
     previousBotsConfig = process.env.BOTS_CONFIG;
     process.env.BOTS_CONFIG = configPath;
+    // The network-policy warnings route composes the global sessionEnv layer;
+    // isolate it so results never depend on the developer's live config.json.
+    previousGlobalConfig = process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    process.env.BOTMUX_GLOBAL_CONFIG_FILE = join(dir, 'global-config.json');
     writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
     __testOnly_resetBotRegistry();
     loadBotConfigs().forEach((c: any) => registerBot(c));
@@ -160,6 +176,8 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     setLarkAppId('');
     if (previousBotsConfig === undefined) delete process.env.BOTS_CONFIG;
     else process.env.BOTS_CONFIG = previousBotsConfig;
+    if (previousGlobalConfig === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    else process.env.BOTMUX_GLOBAL_CONFIG_FILE = previousGlobalConfig;
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -196,6 +214,35 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     if (status !== 200) {
       expect(persistedBot()).toEqual({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' });
     }
+  });
+
+  it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy saves with DNS and proxy warnings', async () => {
+    // The bot's own env layer counts: its sessions inherit it.
+    writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'pty', env: { HTTPS_PROXY: 'http://proxy.example:8080' } }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    const bare = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+    const res = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: bare }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, sandboxNetworkPolicy: bare, warnings: ['dns_servers_missing', 'proxy_requires_trusted_egress'] });
+    // Saved despite the warnings: the launch env can differ from the daemon's.
+    expect(persistedBot().sandboxNetworkPolicy).toEqual(bare);
+    const ready = { ...bare, dnsServers: ['10.0.0.53'], proxyMode: 'trusted-egress' };
+    const fixed = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: ready }));
+    expect(await fixed.json()).toEqual({ ok: true, sandboxNetworkPolicy: ready, warnings: [] });
+  });
+
+  it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy warns about a proxy in the global sessionEnv layer', async () => {
+    writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'pty' }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    // Proxy configured only in the global layer (Dashboard global env editor):
+    // every new session inherits it, so the save warning must see it too.
+    writeFileSync(join(dir, 'global-config.json'), JSON.stringify({ sessionEnv: { set: { HTTPS_PROXY: 'http://global-proxy.example:8080' }, unset: [] } }));
+    const bare = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] };
+    const res = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: bare }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, warnings: ['proxy_requires_trusted_egress'] });
   });
 
   it('/api/bot-env merges and removes keys, then clears an empty merge result', async () => {

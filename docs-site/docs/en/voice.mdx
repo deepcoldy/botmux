@@ -15,7 +15,7 @@ Turn the AI's text reply into a **voice message** in your Lark group with one cl
 
 Configure interactively with the dedicated command `botmux voice` (deliberately kept separate from `botmux setup`). The configuration is written to the `voice` block of the global `~/.botmux/config.json`, and takes effect after `botmux restart`.
 
-Three engines are supported — **pick one based on your identity / the service you have**:
+Four engines are supported. Choose one for your credentials and service:
 
 ### ByteDance tenant: SAMI (large-model speech synthesis)
 
@@ -74,6 +74,48 @@ botmux restart        # Take effect
 ```
 
 The model defaults to `speech-2.8-hd` and the voice to `female-shaonv`; both can be overridden during configuration or in the config file. If the default voice isn't available on your account (voices can differ across regions / models), just fill in a system voice id listed in the MiniMax console.
+
+### Volcengine / Doubao V3
+
+Run `botmux voice`, select `[4]`, explicitly choose `standard` or `agent-plan`, and enter that mode's dedicated API key. The default speaker is `zh_female_vv_uranus_bigtts` and the default rate is `1`. Positive rates are clamped to `0.5` through `2` in the request.
+
+For a standard account, use this global configuration:
+
+```json
+{
+  "voice": {
+    "engine": "volcengine",
+    "volcengine": {
+      "mode": "standard",
+      "apiKey": "<STANDARD_API_KEY>"
+    },
+    "speaker": "zh_female_vv_uranus_bigtts",
+    "rate": 1
+  }
+}
+```
+
+To select a dedicated Agent Plan account for one bot, add this `voice` block to that bot's existing entry in `bots.json`:
+
+```json
+{
+  "voice": {
+    "engine": "volcengine",
+    "volcengine": {
+      "mode": "agent-plan",
+      "apiKey": "<AGENT_PLAN_API_KEY>"
+    }
+  }
+}
+```
+
+Set both `engine` and `mode` explicitly. `standard` uses `/api/v3/tts/unidirectional`; `agent-plan` uses `/api/v3/plan/tts/unidirectional`. Both use the fixed host `openspeech.bytedance.com` and resource `seed-tts-2.0`. Chat API URLs and legacy app ID authentication are unsupported. Replace the key placeholders with credentials; they are not environment variable references.
+
+Switching modes requires an explicit new key. A bot cannot inherit the global key from another mode. Within the same mode, a bot can inherit the key or override just `speaker` or `rate`. `"volcengine": null` or an explicit empty key disables account inheritance. A missing or invalid mode makes the configuration unusable. Failures never retry, follow redirects, or fall back to a standard paid endpoint. The provider determines account billing.
+
+`botmux voice status` shows only whether the new account's key is set. Saving any TTS engine interactively preserves the existing `voice.asr` block. Volcengine returns 24 kHz mono signed 16-bit PCM; Lark voice messages still require the Opus encoder described below.
+
+Synthesis buffers the complete response and returns audio after normal HTTP EOF. Playback is not streamed. The default 60-second deadline covers headers and body reads, including a connection that stays open after the completion record. Client limits are 16 MiB of response bytes, 8 MiB of PCM, and 10000 JSON records. Truncation, malformed data, nonempty audio in the completion record, or exceeded limits fail without returning partial audio.
 
 ## System dependencies
 

@@ -142,12 +142,12 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
     // TUI; later cycles return to the normal 2s window.
     firstPromptQuiescenceMs: 4_000,
     busyPattern: undefined,
-    isSessionBusy({ sessionId, cliSessionId }) {
+    isSessionBusy({ sessionId, cliSessionId, isCliProcessAlive }) {
       const sid = isOpenCodeSessionId(cliSessionId)
         ? cliSessionId
         : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
       if (!sid) return false;
-      return isOpenCodeSessionBusy(sid, 'v2');
+      return isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, isCliProcessAlive);
     },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // V2 TUI 仍渲染在 alternate screen buffer（实测 \x1b[?1049h）

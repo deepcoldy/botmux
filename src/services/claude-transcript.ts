@@ -14,7 +14,7 @@
 import { existsSync, openSync, readSync, closeSync, statSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward } from './jsonl-cursor.js';
+import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward, scanJsonlFromOffset } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
@@ -133,9 +133,13 @@ export interface TranscriptEvent {
    *  Background launches are read from here — see {@link backgroundTaskLaunches}. */
   toolUseResult?: unknown;
   /** `type:"queue-operation"` lines: `enqueue` / `dequeue` / `remove` on Claude
-   *  Code's input queue, with the queued text in the top-level `content`. */
+   *  Code's input queue, with the queued text in the top-level `content`.
+   *  `remove` records additionally carry the queued item's `commandUuid`
+   *  (and often its `deliveryId`); `enqueue` / `dequeue` carry neither. */
   operation?: string;
   content?: unknown;
+  commandUuid?: string;
+  deliveryId?: string;
 }
 
 /**
@@ -644,10 +648,17 @@ export function classifyClaudeTerminalEvent(
  * Both may be present for the same turn, so consumers must deduplicate by the
  * durable turn identity. `tool_use` and `pause_turn` are explicitly excluded:
  * Claude is waiting on a tool/continuation and has not returned to a new turn.
+ *
+ * The two are not equally final. Claude Code writes one record per content
+ * block and stamps every record with the MESSAGE's stop reason, so the thinking
+ * block of a final message already carries `end_turn` while its text block, a
+ * trailing API-error record and the Stop hooks are still to come. Only
+ * `turn_duration` (see {@link isClaudeTurnDurationEvent}) is written after all
+ * of them.
  */
 export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
   if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
-  if (ev.type === 'system' && ev.subtype === 'turn_duration') return true;
+  if (isClaudeTurnDurationEvent(ev)) return true;
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return false;
   const reason = ev.message?.stop_reason;
@@ -655,6 +666,69 @@ export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
     && reason.length > 0
     && reason !== 'tool_use'
     && reason !== 'pause_turn';
+}
+
+/** Claude Code's main-thread `system/turn_duration` record: the last record of
+ *  a turn, written after its final content block, any API-error record and the
+ *  Stop hooks. */
+export function isClaudeTurnDurationEvent(ev: TranscriptEvent): boolean {
+  return !!ev && typeof ev === 'object' && (ev as any).isSidechain !== true
+    && ev.type === 'system' && ev.subtype === 'turn_duration';
+}
+
+/** Same bound and rationale as CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES: the probe
+ *  below runs synchronously at bridge baseline and must stay bounded. Only
+ *  lines mentioning the marker are parsed. */
+const TURN_DURATION_MARKER_PROBE_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Whether a transcript's recent history holds a `turn_duration` record, i.e.
+ *  the CLI writing it closes every turn with that marker. Baseline cursors
+ *  straight to EOF without parsing history, so without this probe the bridge
+ *  queue would only learn it at the end of the first turn after a restart. */
+export function transcriptShowsTurnDurationMarker(path: string): boolean {
+  if (!path || !existsSync(path)) return false;
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return false; }
+  if (completeEnd <= 0) return false;
+  try {
+    return scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - TURN_DURATION_MARKER_PROBE_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line) => {
+        const text = line.toString('utf8');
+        if (!text.includes('turn_duration')) return false;
+        try { return isClaudeTurnDurationEvent(JSON.parse(text) as TranscriptEvent); } catch { return false; }
+      },
+    });
+  } catch {
+    return false;
+  }
+}
+
+/** How much of a transcript's head transcriptHoldsConversation reads. Claude
+ *  opens a file with a handful of small metadata records (mode,
+ *  permission-mode, title, a file-history snapshot); the first conversation
+ *  record follows within a few KB. */
+const CONVERSATION_PROBE_MAX_BYTES = 256 * 1024;
+
+/** Does the transcript hold a conversation `claude --resume` can open? Claude
+ *  answers "No conversation found" for a file of metadata records alone — what
+ *  a `--fork-session` child's file holds for its first moments (2.1.308) — and
+ *  resumes one with a single user or assistant record. */
+export function transcriptHoldsConversation(path: string): boolean {
+  let found = false;
+  scanJsonlFromOffset(path, 0, {
+    endOffset: CONVERSATION_PROBE_MAX_BYTES,
+    onLine: (line) => {
+      if (found || !/"type":"(user|assistant)"/.test(line)) return;
+      try {
+        const type = (JSON.parse(line) as TranscriptEvent).type;
+        found = type === 'user' || type === 'assistant';
+      } catch { /* a foreign line */ }
+    },
+  });
+  return found;
 }
 
 /** The launch-ack a background Agent/Task tool_result carries the moment it is
@@ -774,7 +848,7 @@ export interface BackgroundTaskLaunch {
   expiresAtMs?: number;
 }
 
-function eventTimeMs(ev: TranscriptEvent): number | undefined {
+export function eventTimeMs(ev: TranscriptEvent): number | undefined {
   const ms = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
   return Number.isFinite(ms) ? ms : undefined;
 }
@@ -1757,7 +1831,9 @@ export interface JsonlFingerprintSearchOptions {
   /** Drop events whose `timestamp` field is older than this (millis since
    *  epoch). Defends against short fingerprints ("hello", "test") matching
    *  old user lines in unrelated sibling jsonls — file mtime alone isn't
-   *  enough since a sibling Claude pane could be actively writing. */
+   *  enough since a sibling Claude pane could be actively writing. Events
+   *  with no parseable timestamp are dropped as well (see
+   *  {@link eventAtOrAfter}). */
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
@@ -1769,6 +1845,18 @@ export interface JsonlFingerprintSearchOptions {
    *  under a busier sibling. Default (no callback): accept the first
    *  fingerprint match like the original behaviour. */
   acceptCandidate?: (path: string) => boolean;
+}
+
+/** True when the event carries a parseable timestamp at or after `floorMs`.
+ *  An event without one cannot be placed after the floor: Claude Code writes
+ *  `api-request-blob` records (a copy of a request's user content, no
+ *  timestamp) next to the original prompt, so letting them through matched a
+ *  new Lark turn against an hours-old identical prompt in another session's
+ *  file. */
+function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
+  if (typeof ev.timestamp !== 'string') return false;
+  const evMs = Date.parse(ev.timestamp);
+  return Number.isFinite(evMs) && evMs >= floorMs;
 }
 
 /** Scan a single jsonl file's tail for a Lark message fingerprint. Same
@@ -1816,10 +1904,7 @@ export function jsonlContainsFingerprint(
     // mtime can be recent if a sibling Claude pane is actively writing
     // its own turns). We compare against `event.timestamp` rather than
     // file mtime to be precise.
-    if (minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-      const evMs = Date.parse(ev.timestamp);
-      if (Number.isFinite(evMs) && evMs < minEventTimestampMs) continue;
-    }
+    if (minEventTimestampMs !== undefined && !eventAtOrAfter(ev, minEventTimestampMs)) continue;
     const role = ev.message?.role ?? ev.type;
     let lineText = '';
     if (role === 'user') {
@@ -1908,10 +1993,7 @@ export function findJsonlContainingFingerprint(
           // the full rationale. Required to keep short fingerprints
           // ("hello", "test") from matching old user lines in unrelated
           // sibling jsonls.
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
+          if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
           const role = ev.message?.role ?? ev.type;
           let text = '';
           if (role === 'user') {
@@ -2021,10 +2103,7 @@ export function findJsonlsContainingExactContent(
           let ev: any;
           try { ev = JSON.parse(line); } catch { continue; }
           if (!ev || typeof ev !== 'object') continue;
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
+          if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
           const role = ev.message?.role ?? ev.type;
           let raw = '';
           if (role === 'user') {

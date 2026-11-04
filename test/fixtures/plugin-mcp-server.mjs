@@ -43,7 +43,28 @@ server.setRequestHandler(ListToolsRequestSchema, request => {
       };
 });
 
-server.setRequestHandler(CallToolRequestSchema, request => {
+server.setRequestHandler(CallToolRequestSchema, async request => {
+  if (serverName === 'slow') {
+    const delayMs = Number(request.params.arguments?.delayMs ?? 0);
+    if (Number.isFinite(delayMs) && delayMs > 0) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, delayMs));
+    }
+  }
+  if (serverName === 'progress') {
+    // Progress resets the SDK's idle timeout. Keep emitting it long enough to
+    // prove the gateway's maxTotalTimeout remains an absolute upper bound.
+    const token = request.params?._meta?.progressToken;
+    const startedAt = Date.now();
+    for (let tick = 1; Date.now() - startedAt < 1_900; tick += 1) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 100));
+      if (token !== undefined) {
+        await server.notification({
+          method: 'notifications/progress',
+          params: { progressToken: token, progress: tick },
+        });
+      }
+    }
+  }
   if (serverName === 'link-ref') {
     const authorizationUrl = 'https://auth.example.test/authorize'
       + '?code=code-value&token=token-value&signature=sig-value&state=state-value'

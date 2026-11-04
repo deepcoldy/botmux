@@ -36,4 +36,11 @@ describe('card runtime identity', () => {
     expect(withCardRuntimeIdentity(session({}, 'configured-model'), rawSnapshot, 'codex').model)
       .toBe('configured-model');
   });
+  it('shows the current Auto context variant and clears the previous variant on native defaults', () => {
+    const subject = session({ activeModel: 'gpt-6-astra', activeModelBackendVariant: 'max' });
+    subject.session.modelBackendVariant = 'standard';
+    expect(withCardRuntimeIdentity(subject, rawSnapshot, 'traex').modelBackendVariant).toBe('max');
+    subject.activeModelBackendVariant = null;
+    expect(withCardRuntimeIdentity(subject, { ...rawSnapshot, modelBackendVariant: 'max' }, 'traex').modelBackendVariant).toBeUndefined();
+  });
 });

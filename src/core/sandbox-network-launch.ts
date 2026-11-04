@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveEntrySpawn } from './self-spawn.js';
+import { bwrapExecutable } from './system-bwrap.js';
 import { compileNetworkNft, parseSandboxNetworkPolicy, type SandboxNetworkPolicy } from './sandbox-network-policy.js';
 
 export interface NetworkLaunchPlan { nft: string; ip: string; unshare: string; slirp: string; nftRules: string; command: string; args: string[] }
@@ -17,7 +18,11 @@ export function sandboxNetworkLaunch(policy: SandboxNetworkPolicy, command: stri
   const slirp = executable('slirp4netns'), nft = executable('nft'), ip = executable('ip'), unshare = executable('unshare');
   const help = spawnSync(slirp, ['--help'], { encoding: 'utf8' });
   if (!help.stdout?.includes('--disable-host-loopback') || !help.stdout.includes('--disable-dns')) throw new Error('sandboxNetworkPolicy requires slirp4netns with --disable-host-loopback and --disable-dns');
-  const bwrapHelp = spawnSync('bwrap', ['--help'], { encoding: 'utf8' });
+  const bwrap = bwrapExecutable();
+  if (!bwrap) throw new Error('sandboxNetworkPolicy requires bubblewrap (bwrap)');
+  // Probe the same executable the launch command names (resolved by the caller
+  // through the same bwrapExecutable()).
+  const bwrapHelp = spawnSync(bwrap, ['--help'], { encoding: 'utf8' });
   if (!bwrapHelp.stdout?.includes('--add-seccomp-fd') || !bwrapHelp.stdout.includes('--disable-userns')) throw new Error('sandboxNetworkPolicy requires bwrap with --add-seccomp-fd and --disable-userns');
   const unshareHelp = spawnSync(unshare, ['--help'], { encoding: 'utf8' });
   if (!unshareHelp.stdout?.includes('--kill-child') || !unshareHelp.stdout.includes('--mount-proc')) throw new Error('sandboxNetworkPolicy requires unshare with --kill-child and --mount-proc');

@@ -7,6 +7,60 @@ import {
   writeManagedOriginAttestationProof,
 } from '../../src/core/managed-origin-attestation.js';
 import { findExecutableLinkRefs } from '../../src/services/link-ref-resolver.js';
+import { enforceFinalLinkIntegrity } from '../../src/services/final-link-integrity.js';
+
+// Opt-in file policies exercise the CLI's pre-read limit and the second limit
+// after a file grows. Other fixture callers retain the actual fs behavior.
+const forbiddenDiffRead = process.env.BOTMUX_TEST_FORBID_DIFF_READ;
+if (forbiddenDiffRead) {
+  const originalRead = fs.readFileSync.bind(fs);
+  fs.readFileSync = ((path: fs.PathOrFileDescriptor, options?: unknown) => {
+    if (String(path) === forbiddenDiffRead) throw new Error('large diff must not be read in full');
+    return originalRead(path, options as never);
+  }) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+}
+const growingDiff = process.env.BOTMUX_TEST_GROW_DIFF_AFTER_STAT;
+if (growingDiff || forbiddenDiffRead) {
+  const watched = new Map<number, number>();
+  const originalOpen = fs.openSync.bind(fs);
+  const originalFstat = fs.fstatSync.bind(fs);
+  const originalRead = fs.readSync.bind(fs);
+  const originalClose = fs.closeSync.bind(fs);
+  let grown = false;
+  fs.openSync = ((...args: any[]) => {
+    const fd = (originalOpen as (...args: any[]) => number)(...args);
+    if (String(args[0]) === growingDiff || String(args[0]) === forbiddenDiffRead) watched.set(fd, 0);
+    return fd;
+  }) as typeof fs.openSync;
+  fs.fstatSync = ((...args: any[]) => {
+    const stat = (originalFstat as (...args: any[]) => fs.Stats)(...args);
+    if (watched.has(args[0]) && growingDiff && !grown) {
+      grown = true;
+      fs.writeFileSync(growingDiff, '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(3 * 1024 * 1024) + '\n');
+    }
+    return stat;
+  }) as typeof fs.fstatSync;
+  fs.readSync = ((...args: any[]) => {
+    const alreadyRead = watched.get(args[0]);
+    if (alreadyRead !== undefined && args[3] > 2 * 1024 * 1024 + 1 - alreadyRead) {
+      throw new Error('diff prefix read exceeded its byte budget');
+    }
+    const bytes = (originalRead as (...args: any[]) => number)(...args);
+    if (alreadyRead !== undefined) watched.set(args[0], alreadyRead + bytes);
+    return bytes;
+  }) as typeof fs.readSync;
+  fs.closeSync = ((fd: number) => { watched.delete(fd); return originalClose(fd); }) as typeof fs.closeSync;
+  syncBuiltinESMExports();
+}
+if ((globalThis as { Bun?: unknown }).Bun && (forbiddenDiffRead || growingDiff)) {
+  // Bun does not synchronize named fs imports with syncBuiltinESMExports.
+  // Register the same opt-in fs surface using its actual module-mock API.
+  const bunTestModule = 'bun:test';
+  const { mock } = await import(bunTestModule);
+  const mockedFs = { ...fs, default: fs };
+  mock.module('node:fs', () => mockedFs);
+}
 
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
@@ -46,6 +100,10 @@ const topicLookups = new Map<string, number>();
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
     data = { code: 0, data: {} };
+  } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_PATCH_CHAT_ID) {
+    const chatId = process.env.BOTMUX_TEST_PATCH_CHAT_ID;
+    data = { code: 0, data: { items: [{ message_id: 'om_patch',
+      ...(chatId === '__missing__' ? {} : { chat_id: chatId }), body: { content: '{}' } }] } };
   } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_TOPIC_STATE) {
     const state = process.env.BOTMUX_TEST_TOPIC_STATE;
     data = { code: 0, data: { items: state === 'missing' ? [] : [{
@@ -120,18 +178,26 @@ if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK
       };
       try {
         const payload = body?.payload ?? {};
+        const expanded = {
+          ...(payload.text === undefined ? {} : { text: expand(payload.text) }),
+          ...(payload.preparedText === undefined ? {} : { preparedText: expand(payload.preparedText) }),
+          ...(payload.card === undefined ? {} : { card: walk(payload.card) }),
+          ...(payload.completionProposal === undefined
+            ? {}
+            : { completionProposal: walk(payload.completionProposal) }),
+          ...(payload.expectedLinks === undefined
+            ? {}
+            : { expectedLinks: payload.expectedLinks.map(expand) }),
+        };
+        enforceFinalLinkIntegrity({
+          payload: expanded,
+          responseKind: body?.responseKind,
+          registeredUrls: exactUrl ? [exactUrl] : [],
+        });
         return new Response(JSON.stringify({
           ok: true,
           payload: {
-            ...(payload.text === undefined ? {} : { text: expand(payload.text) }),
-            ...(payload.preparedText === undefined ? {} : { preparedText: expand(payload.preparedText) }),
-            ...(payload.card === undefined ? {} : { card: walk(payload.card) }),
-            ...(payload.completionProposal === undefined
-              ? {}
-              : { completionProposal: walk(payload.completionProposal) }),
-            ...(payload.expectedLinks === undefined
-              ? {}
-              : { expectedLinks: payload.expectedLinks.map(expand) }),
+            ...expanded,
             refCount: 1,
           },
         }), { status: 200, headers: { 'content-type': 'application/json' } });

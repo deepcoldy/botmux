@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,8 @@ import {
   type AntigravityCotEntry,
 } from '../src/services/antigravity-cot.js';
 import { isAntigravityTranscriptBusy } from '../src/adapters/cli/antigravity.js';
+import * as jsonlCursor from '../src/services/jsonl-cursor.js';
+import { jsonl, writeAntigravityTwoLogs } from './helpers/antigravity-two-logs.js';
 
 describe('antigravity-cot', () => {
   let tmpDir: string;
@@ -21,6 +23,7 @@ describe('antigravity-cot', () => {
 
   afterEach(() => {
     stopAllAntigravityCot();
+    vi.useRealTimers();
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   });
 
@@ -119,6 +122,55 @@ describe('antigravity-cot', () => {
       expect(resultRes[0].result.length).toBeLessThanOrEqual(801);
       expect(resultRes[0].result.endsWith('…')).toBe(true);
     }
+  });
+
+  it('correlates a resumed tool result without replaying earlier display entries', async () => {
+    vi.useFakeTimers();
+    const transcriptPath = join(tmpDir, 'resume.jsonl');
+    writeFileSync(transcriptPath, jsonl([
+      { type: 'USER_INPUT', content: 'old user input' },
+      { step_index: 1, type: 'PLANNER_RESPONSE', thinking: 'old thinking',
+        tool_calls: [{ id: 'call_pending', name: 'run_command', args: { CommandLine: 'git status' } }] },
+    ]));
+    const received: AntigravityCotEntry[] = [];
+    startAntigravityCot('conv-resumed', entries => received.push(...entries), { transcriptPath, pollIntervalMs: 20 });
+    await vi.advanceTimersByTimeAsync(40);
+    expect(received).toEqual([]);
+    appendFileSync(transcriptPath, jsonl([{ step_index: 2, source: 'MODEL', type: 'GENERIC', content: 'result after restore' }]));
+    await vi.advanceTimersByTimeAsync(40);
+    expect(received).toEqual([{ kind: 'tool_result', id: 'call_pending', result: 'result after restore' }]);
+  });
+
+  it('restores pending tools from the latest input instead of replaying old turns', async () => {
+    vi.useFakeTimers();
+    const transcriptPath = join(tmpDir, 'long-history.jsonl');
+    const history = jsonl(Array.from({ length: 500 }, (_, step_index) => ({ type: 'PLANNER_RESPONSE', step_index, thinking: 'old'.repeat(1000) })));
+    const live = jsonl([{ type: 'USER_INPUT', content: 'current turn' },
+      { type: 'PLANNER_RESPONSE', step_index: 501, tool_calls: [{ id: 'current-tool', name: 'run_command', args: {} }] }]);
+    writeFileSync(transcriptPath, history + live);
+    const forward = vi.spyOn(jsonlCursor, 'scanJsonlFromFd'); const entries = vi.fn();
+    try {
+      startAntigravityCot('conv-long-history', entries, { transcriptPath, pollIntervalMs: 20 });
+      expect(forward).toHaveBeenCalled(); expect(forward.mock.calls[0][1]).toBe(Buffer.byteLength(history));
+      expect(entries).not.toHaveBeenCalled();
+      appendFileSync(transcriptPath, jsonl([{ type: 'GENERIC', source: 'MODEL', step_index: 502, content: 'current result' }]));
+      await vi.advanceTimersByTimeAsync(40);
+      expect(entries).toHaveBeenCalledWith([{ kind: 'tool_result', id: 'current-tool', result: 'current result' }]);
+    } finally { forward.mockRestore(); }
+  });
+
+  it('keeps the last incomplete transcript line for a later append', async () => {
+    vi.useFakeTimers();
+    const transcriptPath = join(tmpDir, 'partial-resume.jsonl');
+    const record = JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', thinking: 'completed after attachment' });
+    const split = record.length - 4;
+    writeFileSync(transcriptPath, jsonl([{ type: 'USER_INPUT', content: 'old input' }]) + record.slice(0, split));
+    const received: AntigravityCotEntry[] = [];
+    startAntigravityCot('conv-partial', entries => received.push(...entries), { transcriptPath, pollIntervalMs: 20 });
+    await vi.advanceTimersByTimeAsync(40); expect(received).toEqual([]);
+    appendFileSync(transcriptPath, record.slice(split) + '\n');
+    await vi.advanceTimersByTimeAsync(40);
+    expect(received).toEqual([{ kind: 'thinking', text: 'completed after attachment' }]);
   });
 
   it('streams incremental entries from transcript file', async () => {
@@ -235,6 +287,59 @@ describe('antigravity-cot', () => {
     );
     expect(res).toEqual([]);
     expect(pending.length).toBe(0);
+  });
+
+  describe('transcript_full.jsonl vs the compact transcript.jsonl', () => {
+    const CID = '00000000-0000-4000-8000-0000000000c0';
+
+    async function waitFor(cond: () => boolean, timeoutMs = 3_000): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (!cond()) {
+        if (Date.now() > deadline) throw new Error('condition not met in time');
+        await delay(20);
+      }
+    }
+
+    const finalTextOf = (entries: readonly AntigravityCotEntry[]): string | undefined =>
+      entries.filter(e => e.kind === 'text').at(-1)?.text;
+
+    it('streams the untruncated final text and thinking from the full log', async () => {
+      const logs = writeAntigravityTwoLogs(tmpDir, CID);
+      const received: AntigravityCotEntry[] = [];
+      startAntigravityCot(CID, entries => { received.push(...entries); }, { brainDir: tmpDir, mode: 'fresh', pollIntervalMs: 50 });
+      await waitFor(() => finalTextOf(received) !== undefined);
+      expect(finalTextOf(received)).toBe(logs.finalText);
+      expect(received.filter(e => e.kind === 'thinking').map(e => e.text)).toEqual(['合成思考 1', '合成思考 23', '合成的收尾思考']);
+    });
+
+    it('moves a compact read to the full log once agy creates it, without repeating or skipping records', async () => {
+      const logs = writeAntigravityTwoLogs(tmpDir, CID);
+      // Reader starts in the few ms where only the compact log exists, with
+      // records 0–11 already on disk (baselined as history).
+      writeFileSync(logs.compactPath, jsonl(logs.compactRecords.slice(0, 12)));
+      rmSync(logs.fullPath);
+      const received: AntigravityCotEntry[] = [];
+      startAntigravityCot(CID, entries => { received.push(...entries); }, { brainDir: tmpDir, pollIntervalMs: 50 });
+      writeFileSync(logs.fullPath, jsonl(logs.fullRecords.slice(0, 12)));
+      await delay(150);
+      expect(received).toEqual([]);
+      appendFileSync(logs.compactPath, jsonl(logs.compactRecords.slice(12)));
+      appendFileSync(logs.fullPath, jsonl(logs.fullRecords.slice(12)));
+      await waitFor(() => finalTextOf(received) !== undefined);
+      expect(finalTextOf(received)).toBe(logs.finalText);
+      // Records 12–25: tool calls on odd steps 13–23, results on even 12–24.
+      expect(received.filter(e => e.kind === 'tool_call').map(e => (e as { id: string }).id))
+        .toEqual(['call-13', 'call-15', 'call-17', 'call-19', 'call-21', 'call-23']);
+      expect(received.filter(e => e.kind === 'tool_result')).toHaveLength(7);
+    });
+
+    it('keeps reading the compact log when agy writes no full log', async () => {
+      const logs = writeAntigravityTwoLogs(tmpDir, CID, { withFull: false });
+      const received: AntigravityCotEntry[] = [];
+      startAntigravityCot(CID, entries => { received.push(...entries); }, { brainDir: tmpDir, mode: 'fresh', pollIntervalMs: 50 });
+      await waitFor(() => finalTextOf(received) !== undefined);
+      expect(finalTextOf(received)).toBe(logs.compactRecords[25].content);
+    });
   });
 
   describe('isAntigravityTranscriptBusy', () => {

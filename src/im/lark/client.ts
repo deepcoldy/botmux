@@ -14,6 +14,7 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { getGroupContextSettings } from '../../services/group-context-settings-store.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from '../../services/bots-info-shape.js';
 import type { GroupContextDeliveryBinding } from '../../services/group-context-delivery-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
@@ -32,6 +33,8 @@ import {
   LARK_CODE_USER_SCOPE_MISSING,
   larkApiError,
   structuredLarkCode,
+  classifyContactErrorCode,
+  type DefinitiveContactErrorCode,
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
 import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
@@ -664,22 +667,11 @@ export async function resolveUnionIdFromOpenIdStrict(
 /** 用户资料（名字+头像）查询缓存：key = appId:idType:id。字符串值 = 确定性
  *  负结果的类别（跨应用/不可见/无效 id），每次查都会失败，别反复打 API。
  *  瞬时失败（网络/频控/服务端 40003）不缓存——下次调用应当重试，负缓存瞬时
- *  错误会把合法用户长期钉成「查不到」。 */
-type DefinitiveProfileMiss = 'cross_app' | 'not_visible' | 'invalid_id';
+ *  错误会把合法用户长期钉成「查不到」。分类器在零依赖的 lark-errors.ts，
+ *  body 与 throw 两种返回形状共用同一口径。 */
+type DefinitiveProfileMiss = DefinitiveContactErrorCode;
 const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | DefinitiveProfileMiss>();
 const USER_PROFILE_CACHE_MAX = 1000;
-
-/** Contact API 确定性失败码 → 类别（重试也不会变）：99992361 open_id 属其他
- *  应用；41050 无权限看该用户（不在通讯录可见范围）；41012 user id 无效 /
- *  40001 参数无效。其余非零码（如 40003 internal error）与网络异常视为瞬时。
- *  SDK 基于 Axios，非 2xx 以异常抛出、业务码在 response.data.code——调用方
- *  的 catch 也要走这里（getLarkErrorCode 提取）。 */
-function classifyContactErrorCode(code: number | undefined): DefinitiveProfileMiss | undefined {
-  if (code === LARK_CODE_CROSS_APP_OPEN_ID) return 'cross_app';
-  if (code === LARK_CODE_CONTACT_NOT_VISIBLE) return 'not_visible';
-  if (code === LARK_CODE_CONTACT_NO_SUCH_USER || code === LARK_CODE_CONTACT_INVALID_PARAM) return 'invalid_id';
-  return undefined;
-}
 
 export type UserProfileLookup =
   | { status: 'ok'; profile: { name: string; avatarUrl?: string } }
@@ -1531,6 +1523,48 @@ export async function getMessageDetail(
   return res.data;
 }
 
+/** Parse the sender union_id from an IM message fetched with
+ * `user_id_type=union_id`. Kept pure so malformed provider responses can be
+ * tested without mocking the Lark SDK. */
+export function messageSenderUnionIdFromDetail(detail: unknown): string | null {
+  const item = (detail as { items?: unknown[] } | null)?.items?.[0] as {
+    sender?: { sender_type?: unknown; id_type?: unknown; id?: unknown };
+  } | undefined;
+  const sender = item?.sender;
+  const unionId = typeof sender?.id === 'string' ? sender.id.trim() : '';
+  if (sender?.sender_type !== 'user'
+    || sender.id_type !== 'union_id'
+    || !/^on_[A-Za-z0-9_-]{4,128}$/.test(unionId)) return null;
+  return unionId;
+}
+
+/**
+ * Recover the tenant-stable sender identity for one exact inbound message.
+ * Lark sometimes omits union_id from the event envelope while the message API
+ * can still return the same sender directly in union-id form.
+ */
+export async function resolveMessageSenderUnionId(
+  larkAppId: string,
+  messageId: string,
+): Promise<string | null> {
+  if (!messageId.startsWith('om_')) return null;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      user_id_type: 'union_id',
+      with_sender_name: 'false',
+    }, { timeoutMs: 2_000 });
+    if (res?.code !== 0) return null;
+    return messageSenderUnionIdFromDetail(res.data);
+  } catch (err) {
+    logger.debug(
+      `[union_id] message sender resolve failed for ${messageId.substring(0, 12)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
 /** Resolve a message's chat without collapsing provider failures into absence.
  * Authorization gates must distinguish unavailable evidence from a mismatch. */
 export async function lookupMessageChatId(
@@ -1609,13 +1643,15 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
   // raw user-token fetch — bypassing the boundary. A core-only bot has no
   // Feishu resource to download; refuse up front.
   assertLarkTransport(larkAppId, 'downloadMessageResource');
+  // Feishu downloads video bodies through the file endpoint.
+  const apiType = type === 'video' ? 'file' : type;
   const dir = dirname(savePath);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -1623,7 +1659,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
 
   // Try App Token first
   try {
-    await downloadWithAppToken(larkAppId, messageId, fileKey, type, savePath);
+    await downloadWithAppToken(larkAppId, messageId, fileKey, apiType, savePath);
     logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
     return;
   } catch (appErr: any) {
@@ -1675,7 +1711,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     );
   }
 
-  await downloadWithUserToken(userToken, messageId, fileKey, type, savePath, brand);
+  await downloadWithUserToken(userToken, messageId, fileKey, apiType, savePath, brand);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
@@ -2998,9 +3034,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries = botsInfoObjectEntries(JSON.parse(readFileSync(infoPath, 'utf-8')))
+        .filter(isBotsInfoRouteEntry);
       for (const e of entries) {
-        appIdToInfo.set(e.larkAppId, { botOpenId: e.botOpenId, botName: e.botName });
+        appIdToInfo.set(e.larkAppId, {
+          botOpenId: typeof e.botOpenId === 'string' ? e.botOpenId : null,
+          botName: e.botName ?? null,
+        });
       }
     }
   } catch { /* ignore corrupt file */ }
@@ -3123,4 +3163,27 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   }
 
   return configured;
+}
+
+/** Current application only. Throws on missing scope/unknown membership. */
+/** Strict chat facts for an authorization gate: throws on any provider failure
+ *  or an unclassifiable chat, never guesses a default. */
+export async function getChatRoutingFacts(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ external: boolean; mode: 'group' | 'p2p' }> {
+  const res: any = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+  if (res.code !== 0) throw larkApiError('get chat', res);
+  const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+  const mode = rawMode === 'p2p' ? 'p2p' : rawMode === 'group' || rawMode === 'topic' ? 'group' : null;
+  if (!mode || typeof res.data?.external !== 'boolean') throw new Error('chat_facts_unknown');
+  return { external: res.data.external, mode };
+}
+
+export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  const response: any = await larkGet(getBotClient(larkAppId),
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+  if (response.code !== 0 && response.code !== undefined) throw larkApiError('check bot chat membership', response);
+  if (typeof response.data?.is_in_chat !== 'boolean') throw new Error('chat_membership_unknown');
+  return response.data.is_in_chat;
 }

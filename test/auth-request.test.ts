@@ -237,7 +237,7 @@ describe('auth request CLI', () => {
     expect(requests[0].body).toMatchObject({ scopes: [] });
   });
 
-  it('waits through pending status with the same turn claim and returns ready', async () => {
+  it('refreshes the turn claim while retaining the authorization request during wait', async () => {
     env.BOTMUX_SEND_RELAY = join(root, 'relay');
     writeClaim('turn-current');
     responseQueue = [{ ok: true, status: 'pending' }, { ok: true, status: 'ready' }];
@@ -246,12 +246,12 @@ describe('auth request CLI', () => {
     expect(result.code, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({ ok: true, status: 'ready' });
     expect(requests).toHaveLength(2);
-    for (const request of requests) {
+    for (const [index, request] of requests.entries()) {
       expect(request).toMatchObject({
         method: 'POST', url: '/api/sessions/session/auth-status',
         body: {
           requestId: 'request-1', originCapability: capability,
-          originTurnId: 'turn-current', originDispatchAttempt: 3,
+          originTurnId: index === 0 ? 'turn-current' : 'turn-later', originDispatchAttempt: 3,
         },
       });
     }

@@ -21,6 +21,20 @@ export function responseErrorText(res: DashboardJsonResponse): string {
   return String(reason || res.body?.error || res.status);
 }
 
+/** Shared bots.json invariant codes that a save of ANOTHER field can trip
+ *  (sandbox mode, backend type) — the raw code tells the operator nothing. */
+const CONFIG_INVARIANT_TEXT_KEYS: Record<string, string> = {
+  sandbox_network_policy_requires_local_pty_oncall: 'botDefaults.networkPolicyBlocksChange',
+  invalid_sandbox_network_policy: 'botDefaults.networkPolicyStoredInvalid',
+};
+
+/** {@link responseErrorText}, with known config-invariant codes translated. */
+export function configErrorText(res: DashboardJsonResponse, tr: (key: string) => string): string {
+  const code = res.body?.reason ?? res.body?.error;
+  const key = typeof code === 'string' ? CONFIG_INVARIANT_TEXT_KEYS[code] : undefined;
+  return key ? tr(key) : responseErrorText(res);
+}
+
 export function caughtErrorText(e: any): string {
   return e?.message ?? String(e);
 }

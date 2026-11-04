@@ -13,17 +13,66 @@ import {
   restartInterruptionNotice,
   restartNoteInput,
   restartNoteMayPrefix,
+  shouldSuppressRestartInterruptionScan,
+  shouldSynthesizeJournalInterruption,
   structuredTurnOpen,
   transcriptTailOffset,
   withoutReportedTasks,
 } from '../src/services/restart-interruption.js';
 import { setDefaultLocale, t } from '../src/i18n/index.js';
 
+describe('shouldSuppressRestartInterruptionScan', () => {
+  // Full truth table: cause, CLI, requested-id presence and id equality.
+  // Both ids undefined satisfy equality but must still leave scanning enabled.
+  it.each([
+    [true, 'traex-auto-model', 'traex', 'native', 'native'],
+    [false, 'traex-auto-model', 'traex', 'native', 'other'],
+    [false, 'traex-auto-model', 'traex', undefined, undefined],
+    [false, 'traex-auto-model', 'traex', undefined, 'native'],
+    [false, 'traex-auto-model', 'codex', 'native', 'native'],
+    [false, 'traex-auto-model', 'codex', 'native', 'other'],
+    [false, 'traex-auto-model', 'codex', undefined, undefined],
+    [false, 'traex-auto-model', 'codex', undefined, 'native'],
+    [false, undefined, 'traex', 'native', 'native'],
+    [false, undefined, 'traex', 'native', 'other'],
+    [false, undefined, 'traex', undefined, undefined],
+    [false, undefined, 'traex', undefined, 'native'],
+    [false, undefined, 'codex', 'native', 'native'],
+    [false, undefined, 'codex', 'native', 'other'],
+    [false, undefined, 'codex', undefined, undefined],
+    [false, undefined, 'codex', undefined, 'native'],
+    [false, 'traex-auto-model', 'traex', 'native', undefined],
+  ] as const)('suppress=%s with cause=%s, CLI=%s, requested=%s, effective=%s',
+    (suppress, restartCause, cliId, exactResumeSessionId, effectiveCliSessionId) => {
+      expect(shouldSuppressRestartInterruptionScan({
+        restartCause, cliId, exactResumeSessionId, effectiveCliSessionId,
+      })).toBe(suppress);
+    });
+});
+
+describe('shouldSynthesizeJournalInterruption', () => {
+  const base = {
+    scanEligible: true,
+    existingAppServerEndpoint: false,
+    pendingWork: undefined,
+    hasStaleTurn: true,
+  } as const;
+  it('synthesises only in the narrow journal-proof window', () => {
+    expect(shouldSynthesizeJournalInterruption(base)).toBe(true);
+  });
+  it.each([
+    ['scan ineligible (e.g. TraeX auto-model rotation keeps the native turn)', { scanEligible: false }],
+    ['shared external app-server owns turn recovery', { existingAppServerEndpoint: true }],
+    ['tail scan already found the interruption', { pendingWork: { turnOpen: true, tasks: [] } }],
+    ['replay produced no started restored mark', { hasStaleTurn: false }],
+  ] as const)('does not synthesise when %s', (_label, overrides) => {
+    expect(shouldSynthesizeJournalInterruption({ ...base, ...overrides })).toBe(false);
+  });
+});
+
 // Record shapes follow Claude Code 2.1.305 transcripts from the 10-21 tmux
 // server loss (ids and texts are synthetic).
-const at = (hhmmss: string): string => `2026-10-20T${hhmmss}.000Z`;
-
-function prompt(uuid: string, ts: string, text = 'please watch CI'): TranscriptEvent {
+const at = (hhmmss: string): string => `2026-10-20T${hhmmss}.000Z`;function prompt(uuid: string, ts: string, text = 'please watch CI'): TranscriptEvent {
   return { type: 'user', uuid, timestamp: at(ts), message: { role: 'user', content: text } } as TranscriptEvent;
 }
 

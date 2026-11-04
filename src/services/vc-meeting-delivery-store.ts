@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, vcMeetingListenerPoliciesEqual, type VcMeetingListenerPolicy } from './vc-meeting-listener-policy.js';
 /**
  * vc-meeting-delivery-store.ts — MA-P0 receiver 侧耐久状态：
  * membership projection（hub 下发的成员投影 + fencing 高水位）与
@@ -52,6 +53,7 @@ export type VcMeetingMembershipStatus = 'active' | 'paused' | 'removed';
 export type VcMeetingResponseMode = 'silent' | 'listener_thread';
 
 export interface VcMeetingMemberProjectionInput {
+  listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   listenerAppId: string;
   meetingId: string;
   ownerBootId: string;
@@ -405,7 +407,8 @@ function projectionContentEquals(
   a: VcMeetingMemberProjectionInput,
   b: VcMeetingMemberProjectionInput,
 ): boolean {
-  return a.agentAppId === b.agentAppId
+  return vcMeetingListenerPoliciesEqual(a.listenerPolicy, b.listenerPolicy)
+    && a.agentAppId === b.agentAppId
     && a.role === b.role
     && a.instructions === b.instructions
     && a.status === b.status
@@ -431,7 +434,8 @@ function projectionStreamIdentityEquals(
   a: VcMeetingMemberProjectionInput,
   b: VcMeetingMemberProjectionInput,
 ): boolean {
-  return a.agentAppId === b.agentAppId
+  return vcMeetingListenerPoliciesEqual(a.listenerPolicy, b.listenerPolicy)
+    && a.agentAppId === b.agentAppId
     && a.role === b.role
     && a.instructions === b.instructions
     && vcMeetingMemberFilterEquals(a.filter, b.filter)
@@ -449,6 +453,8 @@ export function applyVcMeetingMemberProjection(
 ): VcMeetingProjectionResult {
   const normalizedInstructions = normalizeVcMeetingProfileInstructions(input.instructions);
   if (!normalizedInstructions.ok) return { ok: false, reason: 'invalid' };
+  try { normalizeVcMeetingListenerPolicy(input.listenerPolicy); }
+  catch { return { ok: false, reason: 'invalid' }; }
   input = { ...input, outputPlacement: input.outputPlacement ?? 'auto' };
   const policy = normalizeVcMeetingMemberPolicy({
     memberId: input.memberId,
@@ -671,7 +677,8 @@ export function acceptVcMeetingDelivery(
       && !(['auto', 'chat', 'topic'] as const).includes(input.outputPlacement))
     || (input.listenerOutputProtocol !== undefined
       && input.listenerOutputProtocol !== 'plain'
-      && input.listenerOutputProtocol !== 'decision_v1')
+      && input.listenerOutputProtocol !== 'decision_v1'
+      && input.listenerOutputProtocol !== 'final_summary_v1')
   ) {
     return { kind: 'conflict', reason: 'invalid' };
   }

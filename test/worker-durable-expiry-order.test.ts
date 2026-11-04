@@ -12,8 +12,10 @@ import { classifyRestartTeardown } from '../src/adapters/backend/destroy-result.
 import { isRemoteBackendType } from '../src/core/persistent-backend.js';
 import { decideRestartFollowup, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
+import { join } from 'node:path';
 
-type Restart = (reason: string, opts?: { immediate?: boolean; preservePending?: boolean }) => Promise<void>;
+type Restart = (reason: string, opts?: { immediate?: boolean; preservePending?: boolean; restartCause?: 'traex-auto-model' }) => Promise<void>;
 
 function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
   const timers: Array<() => unknown> = [];
@@ -23,6 +25,7 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
     lastInitConfig: { cliId: 'claude-code', sessionId: 'sid', workingDir: '/project', resume: false },
     cliSpawnGeneration: 1,
     submitFailureChains: { clear: vi.fn() },
+    inputDeliveryEvidence: new InputDeliveryEvidenceTracker(),
     queuedActivationReceipts: { clear: vi.fn() },
     cliRestartInProgress: false,
     replacementSpawnInProgress: false,
@@ -44,11 +47,14 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
     CliSpawnSupersededError: class extends Error {},
     log: vi.fn(),
     revokeManagedTurnOriginForRestart: vi.fn(),
+    traexAutoModelController: { noteProcessExited: vi.fn() },
     stopOwnedSessionScope: vi.fn(),
     startScreenUpdates: vi.fn(),
     startStuckDetector: vi.fn(),
     adoptPendingLaunchConvergence: vi.fn(),
     codexRpcEligible: () => false,
+    traexAutoModelRuntimeEligible: () => false,
+    traexAutoModelSwitching: false,
     sandboxEnabled: () => false,
     prepareCodexNativeTitleGeneration: vi.fn(async () => {}),
     settleRestartAttemptOnReady: vi.fn(),
@@ -78,6 +84,64 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
 }
 
 describe('worker restart input fence', () => {
+  it('forgets old input and terminal evidence before restarting the CLI', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const old = { turnId: 'old-turn', dispatchAttempt: 2, cliGeneration: 1 };
+    h.scope.inputDeliveryEvidence.start(old, 100);
+    h.scope.inputDeliveryEvidence.observeStructuredTerminal(old);
+    expect(h.scope.inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(true);
+
+    await h.restart('daemon request', { preservePending: true });
+
+    expect(h.scope.inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(false);
+    expect(h.scope.inputDeliveryEvidence.writeStartedAtMs(old)).toBeUndefined();
+    await h.runSpawnTimer();
+  });
+
+  it('forgets old evidence when a new spawn fails before creating a replacement', async () => {
+    const inputDeliveryEvidence = new InputDeliveryEvidenceTracker();
+    const old = { turnId: 'old-turn', dispatchAttempt: 2, cliGeneration: 7 };
+    inputDeliveryEvidence.start(old, 100);
+    inputDeliveryEvidence.observeStructuredTerminal(old);
+    const scope = {
+      cliSpawnGeneration: 7,
+      inputDeliveryEvidence,
+      networkPolicySupportError: () => undefined,
+      networkProxyError: () => undefined,
+      resetCodexModelMigrationState: vi.fn(),
+      backgroundTaskTracker: { reset: vi.fn() },
+      join,
+      homedir: () => '/fixture',
+      tmpdir: () => '/fixture/tmp',
+      ensureSessionTempDir: () => '/fixture/session',
+      pinSessionMcpGatewaySocketRoot: vi.fn(),
+      applySessionTempEnv: vi.fn(),
+      process: { platform: process.platform, env: {} },
+      submitFailureChains: { clear: vi.fn() },
+      queuedActivationReceipts: { clear: vi.fn() },
+      // spawnCli's entry points the worker's TRAE readers at the bot's
+      // TRAE_HOME before any of the gates below run. It is a no-op for this
+      // non-traex assertion, but the real worker global must be present or the
+      // harness throws a TypeError before reaching the expected rejection.
+      followBotTraeHome: vi.fn(),
+    };
+    const spawn = loadWorkerFunction<(cfg: unknown) => Promise<void>>('spawnCli', scope);
+
+    await expect(spawn({ sessionId: 'sid', cliId: 'traex', existingAppServerEndpoint: 'ws://localhost' }))
+      .rejects.toThrow('existing App Server attachment requires cliId');
+
+    expect(scope.cliSpawnGeneration).toBe(8);
+    expect(inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(false);
+    expect(inputDeliveryEvidence.writeStartedAtMs(old)).toBeUndefined();
+  });
+
+  it('preserves the activity latch only for a capacity-model rotation', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    await h.restart('capacity rotation', { preservePending: true, restartCause: 'traex-auto-model' });
+    await h.runSpawnTimer();
+    expect(h.scope.traexAutoModelController.noteProcessExited).toHaveBeenCalledWith(true);
+  });
+
   it('keeps the input fence armed through teardown and spawn, then leaves the first flush to markPromptReady', async () => {
     const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
 
@@ -89,6 +153,7 @@ describe('worker restart input fence', () => {
 
     await h.runSpawnTimer();
     expect(h.scope.spawnCli).toHaveBeenCalledTimes(1);
+    expect(h.scope.traexAutoModelController.noteProcessExited).toHaveBeenCalledWith(false);
     expect(h.observed.fenceArmedDuringSpawn).toBe(true);
     expect(h.scope.cliRestartInProgress).toBe(false);
     // The replacement process exists but its prompt is not ready: no

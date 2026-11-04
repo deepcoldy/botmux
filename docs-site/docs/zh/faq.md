@@ -38,7 +38,7 @@ botmux 权限分两层（完整分层见 [权限与授权](/permissions)，速�
 
 ### C. 终端有输出但没发飞书
 
-**这条只针对需要显式发送的终端 CLI 会话**（Claude Code / Codex CLI / Gemini / CoCo 等）：终端 stdout ≠ 已发飞书，模型必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。只 `echo`/`print` 或忘调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
+**这条只针对需要显式发送的终端 CLI 会话**（Claude Code / Codex CLI / Antigravity / CoCo 等）：终端 stdout ≠ 已发飞书，模型必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。只 `echo`/`print` 或忘调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
 
 > ⚠️ **例外：`codex-app`（Codex App app-server 协议）**——它的最终 assistant message 由 botmux **自动转发**回飞书，**常规回复不要调 `botmux send`**（否则会重复发送），仅在中途主动推送 / 发附件 / 跨 bot @ 时才用。
 
@@ -194,6 +194,10 @@ curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh 
 ### 为什么 v3.18.0 之前的老版本不能用 npm 升级？
 
 v3.18.0 起 npm 包从「Node + `dist/` 源码」改成**平台二进制子包**，`node-pty` 移出了依赖。老版本自带的 `botmux upgrade` 当时就是交回 npm；npm 跨这个边界安装时会把旧目录里的 `node-pty` 清掉，而旧 daemon 重启的第一步仍是 `node …/dist/cli.js restart`——该文件仍静态 import `node-pty`，于是 `ERR_MODULE_NOT_FOUND`、重启驱动死掉、整个 daemon 舰队起不回来（输出里却可能已经提示「正在重启以应用更新」）。curl 直接落新二进制并让启动器指向它，不经过旧目录、也不看 npm 怎么剪依赖，是跨这个边界唯一稳妥的方式。≥3.18 的二进制安装上 `botmux upgrade` 与重跑 curl 等价；不确定自己是什么安装形态时，统一用 curl 即可。
+
+## 原来 `cliId: "gemini"` 的 bot 起不来？
+
+Gemini CLI 已下线，`gemini` 适配器已移除。这个 bot 会拒绝启动并提示改用 Antigravity，其它 bot 照常运行。装好 `agy` 并用 Google 账号登录（或在 `~/.gemini/antigravity-cli/settings.json` 设 `modelProvider: "gemini"` 并提供 `GEMINI_API_KEY`），再把 `cliId` 改成 `"antigravity"`（改 `bots.json` 或用 `botmux setup`），然后 `botmux restart`。原来的 `cliPathOverride` / `wrapperCli`（如 `ttadk gemini`）、Gemini `model` 名、`GEMINI_CLI_HOME` 不会沿用。详见 [Gemini CLI 已下线](/adapters#gemini-cli-已下线)。
 
 ## CoCo 忙时发消息丢失？
 

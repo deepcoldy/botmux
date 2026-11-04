@@ -560,7 +560,15 @@ export async function addUsersToChatByUnionId(
   chatId: string,
   unionIds: string[],
 ): Promise<{ invalidUserIds: string[] }> {
-  const ids = Array.from(new Set(unionIds.filter(Boolean)));
+  return addUsersToChatById(proxyLarkAppId, chatId, unionIds, 'union_id');
+}
+
+export async function addUsersToChatByOpenId(proxyLarkAppId: string, chatId: string, ids: string[]): Promise<{ invalidUserIds: string[] }> {
+  return addUsersToChatById(proxyLarkAppId, chatId, ids, 'open_id');
+}
+
+async function addUsersToChatById(proxyLarkAppId: string, chatId: string, userIds: string[], memberIdType: 'open_id' | 'union_id'): Promise<{ invalidUserIds: string[] }> {
+  const ids = Array.from(new Set(userIds.filter(Boolean)));
   if (ids.length === 0) return { invalidUserIds: [] };
   const client = getBotClient(proxyLarkAppId);
   // Add ONE id per call: Lark fails the WHOLE batch (HTTP 400, code 232024) if any
@@ -571,7 +579,7 @@ export async function addUsersToChatByUnionId(
     try {
       const res: any = await (client as any).im.v1.chatMembers.create({
         path: { chat_id: chatId },
-        params: { member_id_type: 'union_id' },
+        params: { member_id_type: memberIdType },
         data: { id_list: [id] },
       });
       if (res.code !== 0 && res.code !== undefined) {

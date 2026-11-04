@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
 import { reapLegacyPm2, liveGodAt } from '../src/core/legacy-pm2-reaper.js';
-import { spinMs, waitForPidCmdline } from './helpers/proc-ready.js';
+import { spinMs, waitForPidCmdline, readPidFileWhenReady } from './helpers/proc-ready.js';
 import { resolveNodeExecutable } from './helpers/ts-runner.js';
 
 const dirs: string[] = [];
@@ -723,11 +723,10 @@ describe('reapLegacyPm2', () => {
     `;
     // detached:true → new process group, so teardown can signal the whole family.
     const god = spawnTagged(1, 'PM2 v6.0.14: God Daemon (/fake)', godScript, { group: true })[0];
-    // Wait for the God to publish its first child.
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline && !existsSync(pidFile)) spinMs(50);
-    expect(existsSync(pidFile)).toBe(true);
-    const firstChild = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+    // Wait for the God to publish its first child. Existence is not readiness:
+    // the pidfile is visible at open() but empty until write() lands, and under
+    // load a one-shot read there returns NaN. Wait for a complete valid pid.
+    const firstChild = readPidFileWhenReady(pidFile, 5_000);
     // pidfile is written at spawn(); cmdline can still be empty — same race as
     // spawnTagged, and the reaper fail-closes the child if we reap too early.
     waitForPidCmdline(firstChild, '/fake/dist/index-daemon.js');
@@ -741,8 +740,10 @@ describe('reapLegacyPm2', () => {
     expect(r.killed).toBe(true);
     expect(alive(god)).toBe(false);
     expect(r.unresolved).toBe(false);
-    // Whatever child the pidfile now names must be down and stay down.
-    const lastChild = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+    // Whatever child the pidfile now names must be down and stay down. The God
+    // is dead, so no rewrite is pending; read the settled pid with the same
+    // validated reader (a clearer failure than alive(NaN) if the file is off).
+    const lastChild = readPidFileWhenReady(pidFile, 2_000);
     expect(alive(lastChild)).toBe(false);
   });
 

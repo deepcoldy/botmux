@@ -12,7 +12,7 @@ import { config } from '../config.js';
 import { scratchViewPath, persistedScratchMappings, type ScratchPathMapping } from './scratch-host-view.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
-import { antigravityTranscriptPath } from './antigravity-transcript.js';
+import { resolveAntigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
@@ -315,6 +315,8 @@ function codexRolloutInHome(
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
   'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity', 'minimax',
+  // ZCode reports usage from its own ledger (services/zcode-usage.ts), not a transcript.
+  'zcode',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).
@@ -461,11 +463,11 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
     case 'antigravity': {
       // The conversation id is interpolated into the brain path; the helper
       // validates the charset (traversal / separators). Read it through the
-      // per-session scratch overlay like every other host-derived root, and
-      // existsSync keeps the null-when-absent contract every branch honors.
-      const pReal = antigravityTranscriptPath(q.cliSessionId);
-      const p = pReal ? v(pReal) : null;
-      return p && existsSync(p) ? { path: p, kind: 'antigravity' } : null;
+      // per-session scratch overlay like every other host-derived root; the
+      // untruncated transcript_full.jsonl wins over the compact log, and the
+      // existence check keeps the null-when-absent contract every branch honors.
+      const p = resolveAntigravityTranscriptPath(q.cliSessionId, { mapPath: v });
+      return p ? { path: p, kind: 'antigravity' } : null;
     }
     default:
       return null;

@@ -101,6 +101,71 @@ export function isReservedPerBotEnvKey(key: string): boolean {
   return RESERVED_ENV_PREFIXES.some((p) => key.startsWith(p));
 }
 
+/** The reserved list for display (Dashboard「botmux 保留」group). */
+export function reservedSessionEnvKeys(): { keys: string[]; prefixes: string[] } {
+  return { keys: [...RESERVED_ENV_KEYS].sort(), prefixes: [...RESERVED_ENV_PREFIXES] };
+}
+
+/**
+ * Login-shell shim the worker points the pane at when the lark tool binding or
+ * trigger-user identity wraps CLI tools (core/cli-identity.ts). With either
+ * feature on, the worker overwrites these per session, so a configured value
+ * can never take effect there; with both off they are ordinary user variables.
+ */
+const IDENTITY_SHELL_ENV_KEYS: ReadonlySet<string> = new Set(['ZDOTDIR', 'BASH_ENV']);
+/** Git attribution for the acting person (gitIdentityConfigPairs emits three
+ *  pairs, so the numbered keys are exactly 0..2). Injected only by trigger-user
+ *  auth. Note this is NOT the pane forwarding list: pane forwarding is driven
+ *  by the SpawnOpts.gitConfigPairs carrier, not by any env allowlist. A
+ *  bots.json `env` entry named GIT_CONFIG_KEY_<n> (sanitizePerBotEnv does not
+ *  reserve it) is therefore silently inert — every backend drops it rather
+ *  than mixing operator-configured entries into the turn-authored git config
+ *  block. */
+const IDENTITY_GIT_ENV_KEYS: ReadonlySet<string> = new Set([
+  'GIT_ASKPASS', 'GIT_CONFIG_COUNT',
+  'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+  'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
+  'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2',
+]);
+/** May be overridden but never removed: botmux resolves the CLI binary and
+ *  its own wrapper dir through them, so a session without them cannot start. */
+const UNSET_FORBIDDEN_ENV_KEYS: ReadonlySet<string> = new Set(['PATH', 'HOME']);
+
+/** Which identity wrappers are active for a bot (see {@link sessionEnvLock}). */
+export interface SessionEnvLockContext {
+  /** Lark tool binding or trigger-user auth: ZDOTDIR / BASH_ENV are botmux's. */
+  identityShell?: boolean;
+  /** Trigger-user auth: GIT_ASKPASS / GIT_CONFIG_* are botmux's. */
+  identityGit?: boolean;
+}
+
+/**
+ * - `reserved`  botmux-owned in every session: cannot be set or removed.
+ * - `identity`  owned by an identity wrapper that is ON for this bot: same.
+ * - `no-unset`  may be set, may not be removed.
+ */
+export type SessionEnvLock = 'reserved' | 'identity' | 'no-unset';
+
+/** Names an active identity wrapper owns for a bot with `ctx` (display). */
+export function identityWrapperEnvKeys(ctx: SessionEnvLockContext): string[] {
+  return [
+    ...(ctx.identityShell || ctx.identityGit ? [...IDENTITY_SHELL_ENV_KEYS] : []),
+    ...(ctx.identityGit ? [...IDENTITY_GIT_ENV_KEYS] : []),
+  ];
+}
+
+/**
+ * The single lock rule for the session environment (global + per-bot layers,
+ * the Dashboard editor and the spawn-time composition all ask this function).
+ */
+export function sessionEnvLock(key: string, ctx: SessionEnvLockContext = {}): SessionEnvLock | null {
+  if (isReservedPerBotEnvKey(key)) return 'reserved';
+  if (ctx.identityShell && IDENTITY_SHELL_ENV_KEYS.has(key)) return 'identity';
+  if (ctx.identityGit && (IDENTITY_SHELL_ENV_KEYS.has(key) || IDENTITY_GIT_ENV_KEYS.has(key))) return 'identity';
+  if (UNSET_FORBIDDEN_ENV_KEYS.has(key)) return 'no-unset';
+  return null;
+}
+
 /**
  * Sanitize a raw `env` value (from bots.json / dashboard / a config command)
  * into a clean `KEY -> string` map: drops anything that isn't a plain object,
@@ -109,10 +174,7 @@ export function isReservedPerBotEnvKey(key: string): boolean {
  * always returns an object, never throws.
  */
 export function sanitizePerBotEnv(raw: unknown): Record<string, string> {
-  const obj =
-    raw && typeof raw === 'object' && !Array.isArray(raw)
-      ? (raw as Record<string, unknown>)
-      : {};
+  const obj = perBotEnvObject(raw);
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(obj)) {
     if (!ENV_KEY_RE.test(key)) continue;
@@ -121,6 +183,33 @@ export function sanitizePerBotEnv(raw: unknown): Record<string, string> {
     else if (typeof value === 'number' || typeof value === 'boolean') out[key] = String(value);
   }
   return out;
+}
+
+/** Coerce the raw `env` field to a plain object (non-object input → {}). */
+function perBotEnvObject(raw: unknown): Record<string, unknown> {
+  return raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Keys a raw `env` object carries that {@link sanitizePerBotEnv} drops because
+ * they are botmux-reserved (valid env-var name + reserved). Lets config loaders
+ * emit an actionable warning instead of silently deleting operator config.
+ *
+ * Deliberately CLI-agnostic: it only reports WHICH keys were dropped. Whether a
+ * dropped key has a supported top-level replacement depends on the bot's
+ * `cliId` (only `claude-code`'s `CLAUDE_CONFIG_DIR` maps to `cliConfigDir`), so
+ * that hint belongs to the caller, not here. Invalid names are excluded (a
+ * separate problem); only reserved-but-otherwise-valid keys are returned, in
+ * object order (Object.keys is already unique — no de-dup needed).
+ */
+export function droppedReservedPerBotEnvKeys(raw: unknown): string[] {
+  const keys: string[] = [];
+  for (const key of Object.keys(perBotEnvObject(raw))) {
+    if (ENV_KEY_RE.test(key) && isReservedPerBotEnvKey(key)) keys.push(key);
+  }
+  return keys;
 }
 
 /**

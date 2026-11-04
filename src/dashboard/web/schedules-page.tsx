@@ -2155,6 +2155,7 @@ export function ScheduleFormModal(props: {
       // 打开后聚焦首个输入（Esc/遮罩点击走 onClose）
       onOpen={dialog => dialog.querySelector<HTMLElement>('input[name="name"]')?.focus()}
     >
+      <div className="schedule-form-dialog-content">
       <h2>{editing ? tr('schedules.edit') : tr('schedules.create')}</h2>
       <form onSubmit={handleSubmit} className="schedule-form" noValidate>
         {!editing ? (
@@ -2835,6 +2836,7 @@ export function ScheduleFormModal(props: {
           </button>
         </div>
       </form>
+      </div>
     </ModalDialog>
     <SchedulePreconditionHelpDialog
       open={open && preconditionHelpSource !== null}

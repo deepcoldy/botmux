@@ -31,6 +31,24 @@ import type { CodexBridgeEvent } from './codex-transcript.js';
 import type { PendingCliInput } from '../utils/pending-input-queue.js';
 import { t } from '../i18n/index.js';
 
+/** Transient reason for one CLI restart; never stored in session config. */
+export type CliRestartCause = 'traex-auto-model';
+
+/** Only a planned TraeX continuation resuming the requested native session
+ *  may skip interruption scanning. Preferred-model resets without a queued
+ *  continuation and later crash recovery leave restartCause unset. */
+export function shouldSuppressRestartInterruptionScan(input: {
+  restartCause?: CliRestartCause;
+  cliId: string;
+  exactResumeSessionId?: string;
+  effectiveCliSessionId?: string;
+}): boolean {
+  return input.restartCause === 'traex-auto-model'
+    && input.cliId === 'traex'
+    && input.exactResumeSessionId !== undefined
+    && input.effectiveCliSessionId === input.exactResumeSessionId;
+}
+
 /** Bytes of transcript tail read at a resume. The scan only needs the end of
  *  the old process's life; a cut mid-turn still shows as an open turn (any
  *  non-final assistant record opens it). Bounded so a resume of a very long
@@ -75,6 +93,27 @@ export interface InterruptedWork {
 
 export function hasInterruptedWork(work: InterruptedWork | undefined): work is InterruptedWork {
   return !!work && (work.turnOpen || work.tasks.length > 0);
+}
+
+/** Whether journal-replayed activity may substitute for a missed tail scan:
+ *  the 16MB restart-interruption scan can see no open turn when the dead
+ *  turn's boundary lies outside its window, while the durable journal proves
+ *  the previous process started one. Synthesis is allowed only for a spawn
+ *  the scan itself was eligible for — a TraeX auto-model rotation
+ *  intentionally keeps the native turn running, and adopt / Codex App /
+ *  remote / shared-app-server sessions own recovery elsewhere — and only
+ *  when the scan did not already produce interruption work. `hasStaleTurn`
+ *  is the caller's check that the replay produced a started restored mark. */
+export function shouldSynthesizeJournalInterruption(input: {
+  scanEligible: boolean;
+  existingAppServerEndpoint: boolean;
+  pendingWork: InterruptedWork | undefined;
+  hasStaleTurn: boolean;
+}): boolean {
+  return input.scanEligible
+    && !input.existingAppServerEndpoint
+    && input.pendingWork === undefined
+    && input.hasStaleTurn;
 }
 
 function eventTimeMs(ev: TranscriptEvent): number | undefined {

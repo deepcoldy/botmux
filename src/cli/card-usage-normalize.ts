@@ -90,6 +90,11 @@ export function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | 
       && Number.isFinite(u.out)
       && u.out >= 0) {
       tokens = { in: u.in, out: u.out };
+      // 缓存计数是 in 的子集：不合法或超过 in 只丢弃该字段。
+      for (const key of ['cacheReadTokens', 'cacheCreateTokens'] as const) {
+        const v = u[key];
+        if (nonNegativeFinite(v) && v <= u.in) tokens[key] = v;
+      }
     }
   }
 

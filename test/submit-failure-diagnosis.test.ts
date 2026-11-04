@@ -4,6 +4,7 @@ import {
   diagnoseSubmitFailure,
   diagnoseBackendSubmitFailure,
   SUBMIT_FAILURE_ACTIVE_WINDOW_MS,
+  shouldWaitThroughBusyTurn,
 } from '../src/services/submit-failure-diagnosis.js';
 import { messages as enMessages } from '../src/i18n/en.js';
 import { messages as zhMessages } from '../src/i18n/zh.js';
@@ -398,5 +399,38 @@ describe('decideSessionStartGatedSubmitWarning (2026-10-20 incident timelines)',
     expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs: undefined, waitingSinceMs, nowMs: at('12:09:59') }).warn).toBe(false);
     expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs: undefined, waitingSinceMs, nowMs: at('12:10:00') }))
       .toEqual({ warn: true, reason: 'session-start-never-reported' });
+  });
+});
+
+describe('shouldWaitThroughBusyTurn', () => {
+  const base = {
+    busy: true,
+    diagnosisReason: 'unknown' as const,
+    waitsSoFar: 0,
+  };
+
+  it('extends the wait while the CLI is positively mid-turn', () => {
+    expect(shouldWaitThroughBusyTurn(base)).toBe(true);
+  });
+
+  it('does not extend without positive busy evidence', () => {
+    expect(shouldWaitThroughBusyTurn({ ...base, busy: false })).toBe(false);
+  });
+
+  // 关卡屏幕说明 CLI 停在提问/菜单上，不是在执行；此时继续等只会把真问题藏起来。
+  it('never extends over a login gate or an interactive menu', () => {
+    expect(shouldWaitThroughBusyTurn({ ...base, diagnosisReason: 'logged_out' })).toBe(false);
+    expect(shouldWaitThroughBusyTurn({ ...base, diagnosisReason: 'interactive_menu' })).toBe(false);
+  });
+
+  it('still extends when a draft is parked, because that alone proves nothing either way', () => {
+    expect(shouldWaitThroughBusyTurn({ ...base, diagnosisReason: 'draft_parked' })).toBe(true);
+  });
+
+  // 有界：永不结束的 CLI 不能把告警永久静音。
+  it('is bounded by maxWaits', () => {
+    expect(shouldWaitThroughBusyTurn({ ...base, waitsSoFar: 11, maxWaits: 12 })).toBe(true);
+    expect(shouldWaitThroughBusyTurn({ ...base, waitsSoFar: 12, maxWaits: 12 })).toBe(false);
+    expect(shouldWaitThroughBusyTurn({ ...base, waitsSoFar: 99 })).toBe(false);
   });
 });

@@ -1,7 +1,16 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 
 import {
+  authorizeReportRelayFallbackPublication,
   authorizeReportSessionRelayRequest,
+  buildRelayFallbackReportMarkdown,
+  classifyUndeliveredReportRelay,
+  describeReportRelayFallback,
+  isReportRelayConnectionRefused,
+  UNDELIVERED_REPORT_RELAY_REASON_TEXT,
+  wantsReportRelayFallbackOnMissingTarget,
   prepareAutomaticDispatchReport,
   buildOrchestratorReportTrigger,
   deliverReportSessionRelay,
@@ -12,6 +21,7 @@ import {
 } from '../src/core/report-session-relay.js';
 import { createDispatchReportBinding, DISPATCH_REPORT_REGISTER_ROUTE } from '../src/core/dispatch-report-binding.js';
 import { routeHasNarrowUntrustedAuth } from '../src/core/dashboard-ipc-server.js';
+import { loopbackFetch } from '../src/core/loopback-fetch.js';
 
 const CAPABILITY = 'c'.repeat(64);
 const BINDING_SECRET = 'binding-secret';
@@ -712,5 +722,161 @@ describe('automatic zero-injection dispatch report', () => {
     expect(prepareAutomaticDispatchReport({ ...input, bindingSecret: 'forged' })).toBeUndefined();
     expect(prepareAutomaticDispatchReport({ ...input, dispatchRoot: undefined })).toBeUndefined();
     expect(prepareAutomaticDispatchReport({ ...input, sourceSessionId: 'session-orchestrator' })).toBeUndefined();
+  });
+});
+
+describe('report relay fallback (#2262)', () => {
+  const fallbackRaw = (overrides: Record<string, unknown> = {}) => ({
+    sessionId: 'session-source', dispatchRoot: 'om_dispatch', content: '子项目完成',
+    originCapability: CAPABILITY, relayFallback: 'publish', ...overrides,
+  });
+  const authorizeFallback = (
+    overrides: Partial<Parameters<typeof authorizeReportRelayFallbackPublication>[0]> = {},
+  ) => authorizeReportRelayFallbackPublication({
+    raw: fallbackRaw(), trustedHost: false, session: session(), selfLarkAppId: 'cli_source',
+    registry: REGISTRY, bindingSecret: BINDING_SECRET, ...overrides,
+  });
+  const scopedRegistry = (targetScope: 'thread' | 'chat') => ({
+    om_dispatch: { reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+      dispatchRoot: 'om_dispatch', targetLarkAppId: 'cli_orchestrator', targetSessionId: 'session-orchestrator',
+      targetChatId: 'oc_original', targetScope, sourceName: '指标页修复', issuedAt: '2026-08-07T07:00:00.000Z',
+    }) },
+  });
+  /** Run the real relay against scripted target-daemon answers, then classify it. */
+  async function relayThenClassify(input: {
+    targetScope?: 'thread' | 'chat';
+    triggers: Array<{ status: number; body: Record<string, unknown> }>;
+    sessions?: { status: number; body: unknown };
+  }) {
+    const decision = authorize(input.targetScope ? { registry: scopedRegistry(input.targetScope) } : {});
+    if (!decision.ok) throw new Error('invalid fixture');
+    const triggers = [...input.triggers];
+    const delivered = await deliverReportSessionRelay({
+      decision,
+      triggerMeta: { requestId: 'report:1', receivedAt: '2026-08-07T07:00:00.000Z' },
+      fetchTarget: async path => {
+        const answer = path === '/api/trigger' ? triggers.shift()! : input.sessions ?? { status: 200, body: { sessions: [] } };
+        return { ok: answer.status >= 200 && answer.status < 300, status: answer.status, json: async () => answer.body };
+      },
+      postProjectUpdate: async () => ({ projectSynced: false }),
+    });
+    return classifyUndeliveredReportRelay(delivered);
+  }
+  const notFound = { status: 404, body: { ok: false, errorCode: 'session_not_found' } };
+  const notRunnable = { status: 500, body: { ok: false, errorCode: 'session_not_runnable', error: 'not runnable (pending_repo)' } };
+
+  it.each([
+    { name: 'closed thread orchestrator', targetScope: 'thread' as const, triggers: [notFound],
+      expected: 'orchestrator_session_closed' },
+    { name: 'closed chat orchestrator without successor', targetScope: 'chat' as const, triggers: [notFound],
+      expected: 'orchestrator_session_closed' },
+    { name: 'closed chat orchestrator with unreadable sessions', targetScope: 'chat' as const, triggers: [notFound],
+      sessions: { status: 500, body: { ok: false } }, expected: 'orchestrator_session_closed' },
+    { name: 'closed orchestrator whose successor vanished', targetScope: 'chat' as const, triggers: [notFound, notFound],
+      sessions: { status: 200, body: { sessions: [{ sessionId: 'session-next', larkAppId: 'cli_orchestrator',
+        chatId: 'oc_original', scope: 'chat', status: 'idle' }] } }, expected: 'orchestrator_session_closed' },
+    { name: 'orchestrator still starting', triggers: [notRunnable], expected: 'orchestrator_session_not_ready' },
+    { name: 'successor still starting', targetScope: 'chat' as const, triggers: [notFound, notRunnable],
+      sessions: { status: 200, body: { sessions: [{ sessionId: 'session-next', larkAppId: 'cli_orchestrator',
+        chatId: 'oc_original', scope: 'chat', status: 'starting' }] } }, expected: 'orchestrator_session_not_ready' },
+    { name: 'delivered', triggers: [{ status: 200, body: { ok: true } }], expected: undefined },
+    { name: 'generic 500 trigger_failed (possibly post-delivery)', triggers: [
+      { status: 500, body: { ok: false, errorCode: 'trigger_failed' } }], expected: undefined },
+    { name: 'bot left the orchestrator chat', triggers: [{ status: 403, body: { ok: false, errorCode: 'bot_not_in_chat' } }],
+      expected: undefined },
+    { name: 'wait timeout', triggers: [{ status: 504, body: { ok: false, errorCode: 'wait_timeout' } }], expected: undefined },
+    { name: 'untyped 404', triggers: [{ status: 404, body: { ok: false, error: 'gone' } }], expected: undefined },
+  ])('classifies a real relay result: $name', async ({ expected, ...input }) => {
+    expect(await relayThenClassify(input)).toBe(expected);
+  });
+
+  it('classifies the route-level offline answer and nothing from source authorization', () => {
+    expect(classifyUndeliveredReportRelay({ status: 503, body: { ok: false, error: 'orchestrator_daemon_offline' } }))
+      .toBe('orchestrator_offline');
+    for (const error of ['turn_provenance_stale', 'origin_unproven', 'dispatch_route_mismatch',
+      'dispatch_binding_unproven', 'session_identity_incomplete']) {
+      expect(classifyUndeliveredReportRelay({ status: 403, body: { ok: false, error } })).toBeUndefined();
+    }
+  });
+
+  it('recognizes a real refused loopback connection as a daemon that is gone', async () => {
+    const closed = createServer();
+    await new Promise<void>(done => closed.listen(0, '127.0.0.1', done));
+    const port = (closed.address() as AddressInfo).port;
+    await new Promise<void>(done => closed.close(() => done()));
+    const refused = await loopbackFetch(`http://127.0.0.1:${port}/api/trigger`, { method: 'POST', body: '{}' })
+      .then(() => undefined, (error: unknown) => error);
+    expect(isReportRelayConnectionRefused(refused)).toBe(true);
+    expect(isReportRelayConnectionRefused(new Error('socket hang up'))).toBe(false);
+    expect(isReportRelayConnectionRefused(Object.assign(new Error('reset'), { code: 'ECONNRESET' }))).toBe(false);
+  });
+
+  it('authorizes the fallback from the live turn alone, without a registry entry', () => {
+    const withEntry = authorizeFallback();
+    const withoutEntry = authorizeFallback({ registry: {} });
+    expect(withEntry).toMatchObject({ ok: true, dispatchRoot: 'om_dispatch', content: '子项目完成',
+      chatId: 'oc_delivery_group', deliveryKey: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(withoutEntry).toEqual(withEntry);
+  });
+
+  it('keys the fallback on the report, apart from explicit publication', () => {
+    const fallback = authorizeFallback();
+    const changed = authorizeFallback({ raw: fallbackRaw({ content: '修正后的结果' }) });
+    const published = authorize({ raw: { ...fallbackRaw({ delivery: 'publish' }), relayFallback: undefined } });
+    if (!fallback.ok || !changed.ok || !published.ok) throw new Error('authorization failed');
+    expect(changed.deliveryKey).not.toBe(fallback.deliveryKey);
+    expect(published.deliveryKey).not.toBe(fallback.deliveryKey);
+  });
+
+  it('refuses the fallback without the opt-in, for zero-prompt sessions, or for a stale turn', () => {
+    expect(authorizeFallback({ raw: fallbackRaw({ relayFallback: undefined }) }))
+      .toEqual({ ok: false, status: 400, error: 'relay_fallback_not_requested' });
+    expect(authorizeFallback({ session: session({ promptInjection: 'none' }) })).toEqual({
+      ok: false, status: 409, error: 'report_publication_unavailable', blockedBy: 'prompt_injection',
+    });
+    expect(authorizeFallback({ raw: fallbackRaw({ originCapability: 'd'.repeat(64) }) }))
+      .toEqual({ ok: false, status: 403, error: 'origin_unproven' });
+    expect(authorizeFallback({ raw: fallbackRaw({ dispatchRoot: 'om_other' }) }))
+      .toEqual({ ok: false, status: 403, error: 'dispatch_route_mismatch' });
+    expect(authorizeFallback({ session: session({ chatId: undefined }) }))
+      .toEqual({ ok: false, status: 403, error: 'session_identity_incomplete' });
+  });
+
+  it('accepts the opt-in only for relay delivery', () => {
+    expect(authorize({ raw: fallbackRaw() })).toMatchObject({ ok: true, delivery: 'relay', relayFallback: true });
+    expect(authorize()).not.toHaveProperty('relayFallback');
+    expect(authorize({ raw: fallbackRaw({ relayFallback: 'chat' }) }))
+      .toEqual({ ok: false, status: 400, error: 'bad_relay_fallback' });
+    expect(authorize({ raw: fallbackRaw({ delivery: 'publish' }) }))
+      .toEqual({ ok: false, status: 400, error: 'relay_fallback_requires_relay' });
+  });
+
+  it('treats a registry miss as a failure only for a named dispatch root', () => {
+    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw({ explicitDispatchRoot: true }))).toBe(true);
+    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw())).toBe(false);
+    expect(wantsReportRelayFallbackOnMissingTarget(fallbackRaw({ relayFallback: undefined, explicitDispatchRoot: true })))
+      .toBe(false);
+  });
+
+  it('leads the visible report with the undelivered reason and keeps the report intact', () => {
+    for (const [reason, text] of Object.entries(UNDELIVERED_REPORT_RELAY_REASON_TEXT)) {
+      const markdown = buildRelayFallbackReportMarkdown(reason as keyof typeof UNDELIVERED_REPORT_RELAY_REASON_TEXT, '## 结果\n完成');
+      expect(markdown.split('\n')[0]).toContain(`未送达主编排：${text}`);
+      expect(markdown.endsWith('\n\n## 结果\n完成')).toBe(true);
+    }
+  });
+
+  it('tells the reporting agent the reason and whether the report became visible', () => {
+    const published = describeReportRelayFallback({ reason: 'orchestrator_offline', published: true })!;
+    const refused = describeReportRelayFallback({ reason: 'orchestrator_offline', published: false,
+      publicationError: 'report_publication_unavailable', blockedBy: 'private_card' })!;
+    expect(published).toContain(UNDELIVERED_REPORT_RELAY_REASON_TEXT.orchestrator_offline);
+    expect(refused).toContain(UNDELIVERED_REPORT_RELAY_REASON_TEXT.orchestrator_offline);
+    expect(refused).not.toBe(published);
+    const blocked = ['prompt_injection', 'private_card', 'no_lark_transport'].map(blockedBy =>
+      describeReportRelayFallback({ reason: 'orchestrator_offline', published: false,
+        publicationError: 'report_publication_unavailable', blockedBy }));
+    expect(new Set([...blocked, published]).size).toBe(4);
+    expect(describeReportRelayFallback(undefined)).toBeUndefined();
   });
 });

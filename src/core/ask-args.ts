@@ -165,5 +165,5 @@ export function parseAskQuestionsFile(raw: string) {
   catch { throw new AskArgsError('questions_invalid', '--questions-file 必须是有效 JSON 问题数组'); }
   const questions = parseAskQuestions(input);
   if (typeof questions === 'string') throw new AskArgsError('questions_invalid', `--questions-file: ${questions}`);
-  return questions.map(q => ({ ...q, defaultSelectedKeys: q.defaultSelectedKeys ?? [] }));
+  return questions.map(q => q.input || q.inputMode === 'text' ? q : ({ ...q, defaultSelectedKeys: q.defaultSelectedKeys ?? [] }));
 }

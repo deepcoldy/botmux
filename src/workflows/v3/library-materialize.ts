@@ -32,6 +32,7 @@ import {
   serializeFrozenBotSnapshots,
 } from './bot-resolve.js';
 import { readJournal } from './journal.js';
+import { loadEffectiveV3Dag, v3ApprovedBotScope } from './dag-revision.js';
 import { materialize } from './state.js';
 import { validateSpec } from './spec.js';
 import { mintV3RunId, type RunChatBinding } from './grill-state.js';
@@ -55,6 +56,7 @@ import {
   makeSavedDefinitionRunEnvelope,
   publishRunEnvelopeOnce,
   type LoadedAuthorizedV3Run,
+  type V3HandoffIdentityRecord,
   type V3SavedDefinitionRunEnvelope,
 } from './run-envelope.js';
 import type { BotSnapshot, Spec } from './contract.js';
@@ -69,6 +71,9 @@ export interface CompiledSavedWorkflowFromRun {
   sourceStatus: 'succeeded' | 'failed' | 'blocked';
   publish: boolean;
   lintWarnings: string[];
+  /** Runtime flow revisions that took effect in the source run (design
+   *  §13.8): the saved definition is the FINAL effective flow. */
+  runtimeRevisions: number;
 }
 
 /**
@@ -228,7 +233,8 @@ export function compileSavedWorkflowFromRun(
   });
   const journalPath = join(runDir, 'journal.ndjson');
   if (!existsSync(journalPath)) throw new Error('cannot save workflow: source run has not started');
-  const status = materialize(readJournal(journalPath)).runStatus;
+  const events = readJournal(journalPath);
+  const status = materialize(events).runStatus;
   if (status !== 'succeeded' && status !== 'failed' && status !== 'blocked') {
     throw new Error(`cannot save workflow: source run is not terminal (status=${status})`);
   }
@@ -236,7 +242,20 @@ export function compileSavedWorkflowFromRun(
     throw new Error(`cannot publish workflow from a ${status} run; pass allowDraft to save it as draft`);
   }
 
-  const built = buildSavedWorkflowRevisionBaseline(loaded, opts);
+  // Save what actually ran: the final effective flow (authorized DAG plus
+  // every applied runtime revision, digest-verified) and the bots it used.
+  const effective = loadEffectiveV3Dag(runDir, loaded.dag, events);
+  const source: LoadedAuthorizedV3Run = effective.revision === 1
+    ? loaded
+    : {
+        ...loaded,
+        dag: effective.dag,
+        botSnapshots: Object.fromEntries(v3ApprovedBotScope(
+          new Map(Object.entries(loaded.botSnapshots as Record<string, BotSnapshot>)),
+          effective.botAdditions,
+        )),
+      };
+  const built = buildSavedWorkflowRevisionBaseline(source, opts);
   const { lintWarnings } = built;
   if (lintWarnings.length > 0 && opts.acknowledgeUnsafeLiterals !== true) {
     throw new SavedWorkflowUnsafeLiteralError(lintWarnings);
@@ -247,6 +266,7 @@ export function compileSavedWorkflowFromRun(
     sourceStatus: status,
     publish: status === 'succeeded',
     lintWarnings,
+    runtimeRevisions: effective.history.applied.length,
   };
 }
 
@@ -264,6 +284,13 @@ export interface MaterializeSavedWorkflowRunInput {
   baseDir: string;
   runId?: string;
   now?: Date;
+  /** Frozen into run.json (design §6.3). With `bot`, a node without its own
+   *  `bot` is executed by the run's own bot rather than the first configured
+   *  supported bot. Absent = today's ephemeral execution, unchanged. */
+  nodeExecutor?: 'bot';
+  /** The initiator frozen for 交接带发起人身份 (design §10.2); only with
+   *  `nodeExecutor: 'bot'`. The initiator is `context.chatBinding.ownerOpenId`. */
+  handoffIdentity?: V3HandoffIdentityRecord;
 }
 
 export interface MaterializedSavedWorkflowRun {
@@ -365,7 +392,9 @@ export function materializeSavedWorkflowRun(
     nodes: cloneNodes(input.revision.payload.dagTemplate.nodes),
   });
   const spec = validateSpec({ ...input.revision.payload.specTemplate, runId });
-  const botSnapshots = freezeDagBotSnapshots(dag, input.bots);
+  const botSnapshots = freezeDagBotSnapshots(dag, input.bots, input.nodeExecutor === 'bot'
+    ? { defaultSelector: input.context?.chatBinding?.larkAppId }
+    : {});
 
   // Reserve the final run id across cooperating CLI/daemon processes. A plain
   // exists+rename sequence can replace an empty directory on POSIX when two
@@ -415,6 +444,8 @@ export function materializeSavedWorkflowRun(
         createdAt: now.toISOString(),
         authorizedAt: now.toISOString(),
         ...(input.context?.chatBinding ? { chatBinding: input.context.chatBinding } : {}),
+        ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
+        ...(input.nodeExecutor && input.handoffIdentity ? { handoffIdentity: input.handoffIdentity } : {}),
         artifacts,
       });
       publishRunEnvelopeOnce(stagedRunDir, envelope);

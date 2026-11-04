@@ -1,123 +1,158 @@
-# File Sandbox
+# File & Network Sandbox
 
-A write-isolation mechanism for safely opening an AI coding CLI to **semi-trusted** users — typically paired with [On-Call Mode](/en/oncall).
+Botmux provides multi-layered runtime isolation to safeguard your host development machine from accidental file modification and sensitive credential leakage.
 
-With the sandbox on, when people in a topic ask the bot to change code or run commands, **every write is isolated**: not a single byte of your real files is modified. Yet the bot still reads the **real** project / config / login state and works natively (it has no idea it's sandboxed). When it's done, the **owner reviews a diff card** and either applies the changeset back to the real repo or discards it.
+The file sandbox is **one switch with three positions**, configured per bot, fully supporting both **Linux** and **macOS**:
 
-Ideal for exposing an on-call bot to not-fully-trusted group members or external collaborators: let them use AI to make changes without risking your real repo getting clobbered.
+| Mode (config value) | Core Objective | Readable Scope | Write Behavior | Best Suited For | Supported Platforms |
+|---|---|---|---|---|---|
+| Off (`off`, the default) | No isolation | All host files | Directly writes to real host files | Fully trusted personal local environment | All platforms |
+| Allowlist isolation (`oncall`, formerly "oncall (shared)"; `sandbox: true` means this mode) | **Confidentiality & leak prevention** | Only allowlisted paths are visible; nothing else exists (apart from a few read-only runtime mounts, see below) | Only writable allowlisted paths can be written, and writes go straight to the host | Exposing bots to group members / external collaborators | Linux + macOS |
+| Scratch (`scratch`) | **Write-pollution prevention (fully disposable)** | Entire real host filesystem is natively readable (only botmux's own credentials are masked; **credentials are not isolated**: other people's tokens and login state stay readable) | Linux: full-root Copy-on-Write (COW), **zero writes to host**; macOS: COW over cloned trees with read-only system paths, but cache / preference dirs such as `~/Library/Caches` and the system temp dirs still write to the real disk | High-risk experiments, building untrusted code, disposable refactoring | Linux + macOS |
 
-## What it does / doesn't do
+Leaving `sandbox` out of `bots.json` (or setting `false`) means off; `true` is the same as `"oncall"`. The legacy field `readIsolation: true` is now treated as allowlist isolation and is migrated automatically at daemon startup.
 
-| | |
-|---|---|
-| ✅ **Write isolation** | Every write the bot makes (edit / create / delete files, run a build) lands in an isolated layer — your real files are **never modified** |
-| ✅ **Native reads** | The bot reads the **real** filesystem — real project, real CLI config / proxy env — so deps and toolchain all work; the CLI "just works" |
-| ✅ **Login persists** | The CLI's auth directory is **bound for real** — logging in or refreshing tokens inside the sandbox sticks (you won't lose your login); project edits stay isolated |
-| ✅ **Zero-copy, disk-light** | Built on overlayfs — **no project clone**; only the files actually changed use extra disk |
-| ✅ **Review before landing** | The owner reviews the diff + a patch file, then `git apply`s it back to the real repo — or discards it |
-| ✅ **Extra read-only inputs** | Optional `sandboxReadonlyPaths` can expose sibling repos, generated docs, or shared source snapshots read-only |
-| ❌ **Reads are NOT isolated** | By default the bot can read **every local file** (incl. `bots.json`, `~/.ssh`, any credentials). Masking sensitive paths requires explicit per-bot config (see "Privacy masking" below) |
-| ⚠️ **Network defaults open** | The sandbox can reach the network / proxy normally by default; set `sandboxNetwork: false` to run it in a separate network namespace |
+> 💡 **Which mode should you choose?**
+> - **Exposing your bot to semi-trusted group members** → choose **allowlist isolation**. SSH keys, tokens, credentials, and other projects are invisible by default, preventing reconnaissance and data leakage.
+> - **Using the bot yourself for complex builds, scripts, or risky commands** → choose **`scratch`**. No allowlist configuration needed; all dependencies and global tools just work, while any modification can be discarded cleanly without touching your real host disk. Scratch isolates writes, not credentials: the agent can still read the secrets on this machine, including other people's tokens and login state (`user-token-*`, `lark-cli-home/` and the like under `~/.botmux/data/`), so it is **not suitable** for untrusted users. For a bot several people use, choose allowlist isolation to isolate credentials.
 
-> **In one line**: this is "**prevent accidental writes + make every change reviewable**" isolation, not a "block everything" security jail. It guarantees your real repo is never polluted by writes inside the sandbox, and every change needs the owner's sign-off before landing. It does **not** stop the bot from reading local files or hitting the network — mask sensitive content with the mechanism below.
+---
 
-## Enabling it
+## 1. Allowlist Isolation (config value `oncall`)
 
-> **Prerequisite**: **Linux** (relies on bubblewrap + overlayfs). **Both root and non-root work** — root uses the faster kernel overlayfs, non-root automatically falls back to fuse-overlayfs. **Dependencies (bubblewrap / fuse-overlayfs) are auto-installed when you turn the sandbox on** — no need to pre-install; if the environment lacks auto-install permission, it prints a one-line manual command. Mac (sandbox-exec) is on the roadmap, not yet supported.
+Confines the CLI to a **per-session file allowlist** that governs both reads and writes, typically paired with [On-Call Mode](/en/oncall). Group members interacting with the bot cannot reach private keys, other repositories, or Lark app secrets on your host machine.
 
-### Option 1: bots.json
+### How It Works
 
-Add to a bot's config:
+- **Fresh filesystem root**: The sandbox root is an empty `tmpfs`; `/proc` and `/dev` are mounted fresh, and `/tmp`, `/run`, `/var/tmp`, `/dev/shm` are session-private `tmpfs` mounts. On Linux, the private `/run` holds a few read-only runtime mounts: the command relay directory `/run/sbxbin`, the MCP plugin gateway socket directory when the gateway is enabled, the host's resolver file when `/etc/resolv.conf` links into `/run` (skipped if the policy denies it), and CLI / interpreter executable directories that live under `/run` (such as fnm or nvm multishell directories). `$HOME` is **never mounted wholesale**.
+- **Deny-by-default allowlist**: Only explicitly declared paths are mounted into the sandbox, each with its own access level (writable bind / read-only bind / empty mask):
+  - The working directory (`workingDir`) is writable; essential system binaries and shared libraries are read-only;
+  - `~/.ssh`, `~/.aws`, and shared `~/.lark-cli` are strictly masked by default;
+  - `~/.botmux` (and a custom botmux data directory) always stays on the allowlist model: even when `workingDir` is `~` (the default) or a parent of it, the sandbox only reaches what the session needs (the bot's own `bots/<appId>/`, the `botmux` command and plugin directories, the session's own records); `bots.json`, the Dashboard secret and other bots' directories can be neither read nor written. A working directory inside the botmux data directory (other than the bot's own `bots/<appId>/`) is refused at session start;
+  - The botmux install directory is mounted read-only so the `botmux` command runs. When it is a git checkout, files git does not track (such as `.env`, bot configs, login state, `data/`) and `.git` are masked, while build outputs `dist/` and `node_modules/` stay readable. When the working directory itself is inside the install directory, nothing under the working directory is masked; granting the install directory or a parent of it in `sandboxPaths` does not lift the masks.
+  - `workingDir` defaults to `~`, which leaves the rest of the unmasked home directory writable; pointing the working directory at a specific project (e.g. `~/proj`) is recommended.
+- **CLI data directory redirected per bot (Claude family and Codex)**: Claude Code (and Seed, built on it) and Codex keep their config, transcripts, and memory in the bot's own directory `<BOTMUX_HOME>/bots/<appId>/` (`.../claude`, `.../codex`) instead of your global `~/.claude` or `~/.codex`; this is what the legacy `readIsolation` field means in practice. Other CLIs (Cursor, Antigravity, Grok, Kimi, …) are not redirected: they keep using their global data directory on the host, mounted into the sandbox as each adapter declares (some writable as a whole directory, some only their credential files).
+- **Network is not isolated by default**: The allowlist covers files only. Without `sandboxNetwork: false` or `sandboxNetworkPolicy`, the network inside the sandbox is the same as on the host. See [Network Sandbox](#4-network-sandbox).
+- **Underlying implementation**:
+  - **Linux**: Powered by bubblewrap (bwrap) user namespaces with granular read-only / read-write binds;
+  - **macOS**: Powered by Seatbelt (`sandbox-exec`) enforcing the compiled allowlist rules.
+
+### Custom Paths (`sandboxPaths`)
+
+Extend the allowlist or add masks per bot in `bots.json`:
 
 ```jsonc
 {
-  "name": "oncall-bot",
-  "cliId": "claude-code",
-  "sandbox": true,                          // enable the file sandbox
-  // optional: mask sensitive paths the bot shouldn't read (default empty = all readable)
-  "sandboxHidePaths": ["~/.ssh", "~/.botmux/bots.json"],
-  // optional: expose extra existing paths read-only
-  "sandboxReadonlyPaths": ["/srv/source-snapshots/service-a"],
-  // optional: disable network egress inside the sandbox
-  "sandboxNetwork": false
+  "sandbox": "oncall", // or true
+  "sandboxPaths": {
+    // Existing paths mounted writable
+    "readWrite": ["~/shared-output"],
+    // Existing paths mounted read-only (shared source snapshots, runbooks, docs)
+    "readOnly": ["/srv/shared-libs", "~/docs/runbooks"],
+    // Sensitive paths masked with empty nodes inside the sandbox
+    "deny": ["~/.kube", "/opt/confidential"]
+  }
 }
 ```
 
-See [bots.json reference](/en/bots-json).
+`readWrite` / `readOnly` paths that do not exist yet are filtered out at spawn; to allow a file that has not been created, allow its existing parent directory. The legacy fields `sandboxHidePaths` and `sandboxReadonlyPaths` are still read and are migrated to `sandboxPaths.deny` / `sandboxPaths.readOnly` at daemon startup.
 
-### Option 2: Dashboard
+### Multi-Account & Credential Isolation
 
-Go to the Dashboard **Bot Config** page, toggle **File Sandbox** on, and save.
+- **Codex Isolated Login (`codexAuthSync`)**:
+  When set to `"isolated"`, the bot directs `CODEX_HOME` to a private `<BOTMUX_HOME>/bots/<appId>/codex` directory, never reading or contaminating the global `~/.codex`. This applies with the sandbox off or in allowlist isolation; it cannot be combined with `scratch` or `wrapperCli` (both combinations refuse to start the session). When a session is bound to a non-legacy Codex instance (`cliInstanceBinding`), the `bots.json` value is ignored and the binding's own auth mode applies; the session starts normally.
+- **Claude Per-Bot Accounts (`credentialsSourceDir`)**:
+  Points a sandboxed bot at its own OAuth credential directory, copied into the bot's private directory on every cold spawn so sandboxed bots never share an account by accident. It has no effect on bots without a sandbox and cannot be combined with `codexAuthSync: "isolated"`.
+- **Per-bot lark-cli config**: The sandbox denies the shared `~/.lark-cli`. To use lark-cli inside the sandbox, the machine must first split lark-cli config per bot; see [lark-cli per-bot config](https://github.com/deepcoldy/botmux/blob/master/docs/lark-cli-per-bot.md) (Chinese).
 
-> **Decided per session**: toggling the sandbox on/off only affects **new topics**. Sessions already running keep their original decision — restarting the daemon will **not** retroactively drag historical sessions into the sandbox.
+---
 
-## Landing changes (`/land`)
+## 2. Scratch Mode (Disposable Draft Sandbox)
 
-After the bot has made its changes in the sandbox, the **owner** sends in the topic:
+**Introduced in September 2026**. Provides a completely isolated, disposable execution environment for the machine owner.
 
-```
-/land
-```
+### Key Highlights
 
-You get a **"Sandbox changes → land"** card:
+1. **Native Reads, Zero Setup**: The bot sees the **full real filesystem**. Compilers, global npm/pip packages, `~/.gitconfig`, and project configs are natively accessible.
+2. **Full-Root Copy-on-Write (COW)**:
+   - Any write operation inside the container (editing `/etc`, installing global packages, writing to `$HOME` or the project) is redirected to an isolated upper layer;
+   - On Linux, **zero writes hit the host disk**, eliminating accidental clobbering or environment pollution; on macOS, `~/Library/{Caches,Application Support,Logs}` and system temp dirs such as `/private/tmp` and `/private/var/folders` still write to the real disk and are outside the throwaway guarantee.
+3. **Platform Implementations**:
+   - **Linux**: Based on overlayfs (`lowerdir=/`). Uses kernel overlayfs when running as root, and automatically falls back to `fuse-overlayfs` for non-root users. Nested mount points (such as secondary data disks) receive recursive overlays.
+   - **macOS**: Based on APFS clonefile symlink farms + Seatbelt. Core CLI state directories and the working directory are instantly cloned via native APFS COW; heavy dependency trees and system directories are protected via symlinks + write-seals.
 
-- **Change summary**: N files (+x / −y), plus the target repo path
-- **Diff preview**: project-relative paths + real added/removed lines; truncated if long
-- **A full `.patch` attachment**: `git apply`-able, good for large changesets / line-by-line offline review
-- **"Apply to disk" / "Discard" buttons**: **owner-only**
-
-Click **Apply to disk** → the isolated changeset is `git apply`'d back to the real repo; **Discard** → the change is thrown away. **Until you apply, the real repo is completely untouched.**
-
-> Verified against the hardest case: a sandboxed bot edited botmux's **own running source** and rebuilt it — the live production processes were completely unaffected; all changes stayed in the isolated layer until `/land`.
-
-## Privacy masking (`sandboxHidePaths`)
-
-By default the sandbox does **not** restrict reads — the bot can see every local file. If some paths shouldn't be readable by a semi-trusted on-call bot (private keys, secret configs, other projects), configure per-bot in `bots.json`:
+### Storage Modes & Configuration
 
 ```jsonc
-"sandboxHidePaths": ["~/.ssh", "~/.aws/credentials", "/etc/some-secret"]
+{
+  "sandbox": "scratch",
+  // Storage backend: "tmpfs" (default, ephemeral in-memory) or "disk" (persists across daemon restarts)
+  "scratchStorage": "tmpfs",
+  // tmpfs size limit in MB (0 = kernel default, roughly half of RAM)
+  "scratchTmpfsSizeMb": 4096,
+  // Additional masked paths (botmux credentials are fixed-masked by default)
+  "scratchDenyPaths": ["~/.ssh"]
+}
 ```
 
-Listed paths are masked with an **empty dir / empty file** inside the sandbox. **There is no default** — without config, everything is readable (including `bots.json`). Decide what to mask based on how much you trust the group members.
+- **`scratchStorage: "tmpfs"`**: In-memory storage destroyed instantly upon session teardown or host reboot. On Linux, mounting the tmpfs **requires the daemon to run as root**; use `disk` on non-root hosts.
+- **`scratchStorage: "disk"`**: Upper layer stored in disk cache. Survives daemon restarts and resumes via cold restore; cleaned up automatically on clean session close.
 
-## Extra read-only paths (`sandboxReadonlyPaths`)
+---
 
-Use `sandboxReadonlyPaths` when the bot needs to inspect extra local inputs without editing them:
+## 3. Configuration
 
-```jsonc
-"sandboxReadonlyPaths": ["/srv/source-snapshots/service-a", "~/docs/runbooks"]
+### Option 1: Dashboard
+
+Under Dashboard → **Bot Config** → Select Bot → **File Sandbox**, select from the 3-state segmented control:
+- **Off**
+- **Allowlist isolation** (config value `oncall`; shown as "oncall (shared)" before the rename)
+- **Scratch (throwaway)** (with options for tmpfs or disk storage)
+
+> 💡 **Session-Frozen**: Sandbox configuration changes apply to **new sessions**. Existing sessions retain their frozen execution mode; restarting the daemon will not alter existing sandboxes.
+
+### Option 2: `bots.json`
+
+Configure in `~/.botmux/bots.json`:
+
+```json
+[
+  {
+    "name": "worker-bot",
+    "cliId": "claude-code",
+    "sandbox": "scratch",
+    "scratchStorage": "tmpfs"
+  },
+  {
+    "name": "public-oncall",
+    "cliId": "codex",
+    "sandbox": "oncall",
+    "sandboxPaths": { "deny": ["~/.kube"] }
+  }
+]
 ```
 
-Each existing path is mounted read-only at the same path inside the sandbox (`~` expands to the home dir). Missing entries are ignored. This is useful for shared source snapshots, reference repos, generated docs, or other context that should not be part of the `/land` changeset.
+Environment variable overrides (useful for testing; applies to every bot on the machine): `BOTMUX_SANDBOX=1` (allowlist isolation) or `BOTMUX_SANDBOX=scratch`.
 
-Two guardrails: `sandboxHidePaths` masks always take precedence — a read-only path overlapping a masked path can never re-expose the hidden content. And entries equal to or containing the home dir or the session working dir are ignored with a warning (they would replace the entire write-isolated overlay); paths *under* the working dir are fine.
+Precedence: when `BOTMUX_SANDBOX` is `1` / `oncall` / `scratch`, every bot is forced into that mode. Unset, empty, `0` or `false` means no force: each bot follows its own `sandbox` setting (the legacy `readIsolation: true` counts as allowlist isolation), and **a sandbox the bot enables itself is never turned off**. Any other value is rejected at startup. The variable can only force the sandbox on, never turn it off globally.
 
-## Network policy (`sandboxNetwork`)
+---
 
-By default, the sandbox keeps network access for package installs, API calls, and normal CLI behavior. Set:
+## 4. Network Sandbox
+
+The file sandbox **does not restrict networking by default**: the CLI inside the sandbox has the same network and proxy access as the host. To restrict it, add one of the following.
+
+### Full Egress Block (`sandboxNetwork`)
 
 ```jsonc
 "sandboxNetwork": false
 ```
 
-to add `--unshare-net` and run the CLI without host network access. This is a blunt switch: model/API access, package managers, git remotes, and proxies inside the sandbox may stop working unless the CLI can run entirely from already-mounted local inputs.
+Adds `--unshare-net` so the CLI runs in an unrouted network namespace. Ideal for local offline tasks.
 
-## Caveats
+### Destination IP Policy (`sandboxNetworkPolicy`)
 
-1. **Linux only**: needs bwrap + overlayfs (non-root automatically uses fuse-overlayfs, deps auto-installed when you enable the sandbox); Mac (sandbox-exec) not yet supported.
-2. **Reads aren't isolated**: everything is readable by default — mask sensitive credentials with `sandboxHidePaths` (above).
-3. **Network is open by default**: set `sandboxNetwork: false` only for bots that can tolerate losing network / proxy access.
-4. **Build artifacts join the changeset**: if the bot runs `pnpm build` / compiles inside the sandbox, the artifacts (e.g. `dist/`) also show up in the `/land` changeset. **Read the diff** before landing — don't `apply` build output over your real repo.
-5. **The bot is unaware**: it sees the merged overlay view and believes it edited real files; the isolation is fully transparent to it.
-6. **`botmux send` still works**: inside the sandbox, `botmux send` relays messages / images / files / custom card JSON normally via the daemon (app credentials never enter the sandbox env).
-
-## Pairs with On-Call
-
-The file sandbox + [On-Call Mode](/en/oncall) is the standard combo: on-call opens the bot to a whole group to @ at will, and the sandbox guarantees their changes **never touch the real repo** and **only land after the owner reviews each one**. The default pairing for semi-trusted, many-people, change-anytime on-call scenarios.
-
-## Destination IP policy (explicit opt-in)
-
-`sandboxNetworkPolicy` independently configures public and private address space. Without it, existing `sandboxNetwork` values and historical sessions keep their behavior. An explicit policy takes precedence over the boolean. Supported only for **Linux x64/arm64, local PTY, oncall file sandbox**. Docker must permit user/network/PID namespaces and namespace-local nftables. macOS, scratch, persistent terminals, remote backends, adopt and external App Servers are rejected. **This defines policy support, not deployment readiness. Standalone Bun + native Codex must pass fresh/restored model-turn acceptance below before an existing tmux deployment is advised to switch to PTY.**
+For selective access to internal APIs or proxy endpoints (allowlist isolation + Linux + PTY backend only):
 
 ```json
 {
@@ -126,75 +161,124 @@ The file sandbox + [On-Call Mode](/en/oncall) is the standard combo: on-call ope
   "sandboxNetworkPolicy": {
     "version": 1,
     "public": { "mode": "allow" },
-    "private": { "mode": "allowlist", "rules": [{ "cidr": "10.20.0.0/16", "protocol": "tcp", "ports": [443] }] },
+    "private": {
+      "mode": "allowlist",
+      "rules": [{ "cidr": "10.20.0.0/16", "protocol": "tcp", "ports": [443] }]
+    },
     "dnsServers": ["1.1.1.1"]
   }
 }
 ```
 
-Each zone supports `allow` (all destinations), `block` (none), `allowlist` (any matching rule; empty blocks all), or `denylist` (deny any matching rule; empty permits all). Classify the actual address first, then evaluate that zone. Rules have union semantics, with no longest-prefix or last-rule overrides. A cross-zone CIDR only matches within its containing zone.
+- **Zone-Based Control**: Independently configure `public` and `private` address ranges with `allow`, `block`, `allowlist`, or `denylist`.
+- **Kernel-Level Filtering**: Enforced via nftables + slirp4netns within the network namespace.
+- **Trusted Proxy Egress (`proxyMode: "trusted-egress"`)**: Limits client egress strictly to authorized proxy endpoints.
+- **Host requirements**: `slirp4netns` (with `--disable-host-loopback` and `--disable-dns`), `nft`, `ip`, and `unshare` (with `--kill-child` and `--mount-proc`) must be on `PATH`, and bwrap must support `--add-seccomp-fd` and `--disable-userns`. Nothing is installed automatically; if any piece is missing, the session refuses to start.
 
-Rules accept IP/CIDR only; host bits normalize. IPv4-mapped IPv6 addresses share IPv4 rules. Omitted protocol/ports matches all protocols/ports; optional protocol accepts TCP/UDP, and optional ports requires protocol and an integer list 1–65535. Domains, URLs, wildcards, port ranges and other protocol selectors are rejected.
+Check two prerequisites first, otherwise sessions either start without working network access or do not start at all:
 
-Private means conservative non-public space: RFC1918, IPv4 loopback, link-local, CGNAT, unspecified, reserved, documentation/test and multicast ranges (full list: `PRIVATE_V4` in `src/core/sandbox-network-policy.ts`); IPv6 outside `2000::/3`, plus `2001::/23`, `2001:db8::/32`, `2002::/16` and `3fff::/20`. This includes ULA, loopback, link-local, multicast and translation/transition space. Classification is static, independent of DNS suffix or current routing.
+1. **Set `dnsServers` explicitly.** With a policy, the sandbox's `/etc/resolv.conf` contains only the `dnsServers` addresses and slirp4netns' built-in DNS forwarder is disabled. Without them there is no DNS and every lookup fails (`getaddrinfo EAI_AGAIN`) — an allow-all policy included. Use the nameservers from the host's `/etc/resolv.conf` (with systemd-resolved that file says `127.0.0.53`, which the sandbox cannot reach; use the upstream servers in `/run/systemd/resolve/resolv.conf`). Only port 53 is opened to them, even inside a blocked `private` zone. The Dashboard's starting template fills in the host's current nameservers.
+2. **Set `proxyMode` when the host or bot env has proxy variables.** If the daemon or the bot's `env` sets `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (any case), a policy that is not allow-all refuses to start sessions: the proxy resolves and forwards destinations, so the kernel rules only see the proxy. Once the proxy exit is trusted, add `"proxyMode": "trusted-egress"` (kernel rules still only allow the proxy's own IP), or remove the proxy variables.
 
-The boundary filters **actual destination IP packets** using nftables in a fresh namespace before connecting a generic slirp4netns link. Direct sockets, changed/deleted proxy variables, IPv4 mappings, changed DNS answers and redirected connections receive the same kernel filtering. Model endpoints and DNS must be explicitly permitted. It does not modify the host firewall, Docker or any proxy product configuration.
+Other limits:
 
-Restricted policies reject inherited HTTP/HTTPS/ALL proxy configuration by default without rewriting environment variables. Explicit `proxyMode: "trusted-egress"` delegates business destination control to an approved exit. `proxyMode: "reject"` rejects proxy environment variables even when both zones allow all traffic. An omitted field keeps the previous behavior, including proxy compatibility when both zones use `allow`.
+- Linux, the **pty backend** and the oncall sandbox only. A bot without its own backend setting uses the daemon default (tmux) for new sessions; set it to pty under "Session backend" in the Dashboard. With a policy configured, changing the sandbox mode or backend is rejected until you "Clear network policy".
+- The policy is frozen into each topic when it is created. After clearing or changing it, existing topics (including ones restored after a daemon restart) still start with their original policy; start a new topic.
 
-**Trusting an exit does not restrict destinations behind it.** Kernel rules still filter the actual proxy IP/port: unauthorized exits and direct private connections remain blocked. An approved proxy can reach any address it can access, including private addresses blocked for the client. Final model destinations, domain/CONNECT/HTTP rules and proxy-side DNS belong to the deployment-layer proxy ACL. This option does not create or configure a proxy, inject environment variables, or guarantee a CLI uses it. `NO_PROXY` and deleted/changed proxy variables do not change actual IP enforcement.
+---
 
-For a deployment-provided proxy, a new local PTY session can use:
+## 5. Security Architecture & Boundaries
 
-```json
-{
-  "sandbox": true,
-  "backendType": "pty",
-  "sandboxNetworkPolicy": {
-    "version": 1,
-    "proxyMode": "trusted-egress",
-    "public": { "mode": "block" },
-    "private": { "mode": "allowlist", "rules": [{ "cidr": "10.20.0.10", "protocol": "tcp", "ports": [8080] }] }
-  }
-}
-```
+1. **Zero-Credential Outbox Relay for `botmux send`**:
+   CLIs running inside the sandbox never hold Lark App Secrets. When invoking `botmux send`, payloads are written to a session-private `outbox` directory. The host daemon watches this directory and dispatches messages with host-managed credentials.
+2. **Zero Prompt Injection Compatibility**:
+   - Allowlist isolation is fully compatible with Zero Prompt Injection (`promptInjection: "none"`), with transcript directories mounted directly;
+   - `scratch` mode currently excludes Cursor and Antigravity under zero-injection due to transcript bridge limitations in full-root merged views (other CLIs are supported).
+3. **Backend Boundaries**:
+   - Supports the local PTY and tmux backends;
+   - Other local persistent backends (zellij, herdr, zmx, …) cannot establish the same file boundary, so a sandbox **refuses to start** the session;
+   - Remote backends (Riff, remote-runner) execute on the remote machine, so the local sandbox switch **has no effect** (the session starts normally and isolation is up to the remote environment); such a backend combined with `sandboxNetworkPolicy` refuses to start, though.
+   - mojo depends on its configuration: when it provably runs entirely remote it behaves like the above and the local sandbox has no effect; when it executes locally it is treated as a local backend and a sandbox refuses to start.
 
-Authorize client DNS separately if the proxy hostname requires resolution. The proxy must have a routable endpoint; host loopback, Unix sockets and slirp gateway aliases remain blocked. To restrict final business destinations, configure the proxy's own ACL or use direct egress.
+---
 
-Namespace-local loopback remains available for local IPC, distinct from host loopback. Host loopback aliases and slirp DNS forwarding are always disabled. Only required IPv6 neighbor discovery control packets are exempted. Task socket creation is restricted to Internet families; host Unix sockets, setns/unshare, compat syscall ABI and io_uring are blocked, while process-local socketpair IPC remains. Host MCP Gateway/Unix IPC combinations fail closed; the file outbox relay remains available.
+## 6. Common Limits Under Any Sandbox
 
-Optional `dnsServers` grants explicit TCP/UDP port 53 access before zone evaluation (max 8 IPs, excluding loopback and slirp aliases). Default is empty, without host DNS delegation. DNS queries are themselves an authorized capability; resulting application connections still receive destination filtering. Omit DNS capability to block all external communication.
+These apply to both allowlist isolation and scratch:
 
-Provide iproute2 `ip`, nft, slirp4netns supporting `--disable-host-loopback`/`--disable-dns`, and bwrap supporting `--disable-userns`/`--add-seccomp-fd`. No network dependency auto-install occurs. Initialization failures abort launch; a link failure terminates the task lifetime. There is no unfiltered fallback.
+- **No adopt**: A sandbox can only wrap a CLI started from scratch, not a process that is already running, so `/adopt` is refused for sandboxed bots. Start a new session instead.
+- **No Codex RPC input**: Under any sandbox, Codex uses normal terminal input rather than the RPC input channel (`codexRpcInput`).
+- **No dynamic single card**: Sandboxed sessions keep the default card mode; a dynamic reply card is never created even if the bot is configured for it. See [Cards](/en/cards).
+- **Skills are a snapshot taken at spawn**: When a session starts, botmux copies the enabled managed skills (from the skill store and plugins) for that session. Skill updates made later are not visible to running sessions; use `/restart` or start a new session. Skills installed as links (`local-link`) or living in a CLI's native skill directory are not copied and are unavailable under allowlist isolation; `botmux skill show` suggests a copy install instead.
+- **Installs inside the sandbox do not reach the host**: If the CLI installs a global skill, a global package, or edits global config from inside a session, those directories are either not writable or redirected to the bot's own directory under allowlist isolation, and land in the throwaway upper layer under scratch. Do installs that should apply globally on the host (Dashboard or a host shell).
+- **Sub-agents are sandboxed too**: Sub-agents and child processes spawned by the CLI are descendants of the same sandboxed process and inherit the same file and network limits.
 
-Dashboard Security saves JSON and shows configured-for-new-sessions status. Host CLI supports `botmux sandbox-network-policy check <file>`, `set <appId> <file>` and `clear <appId>`. Mutations require an online authenticated owning daemon; isolated/session CLIs cannot modify host policy. IM `/config sandboxNetworkPolicy <JSON>` shares validation and atomic persistence. Session/workflow snapshots are deep copies; fork/restart/restore retains the frozen policy. Clearing affects new sessions and restores the legacy boolean behavior.
+---
 
-### Persistent sessions and migration
+## 7. Prerequisites in Containers / Restricted Hosts {#linux-namespace}
 
-Existing tmux sessions cannot gain the boundary by setting policy JSON. The tmux server creates new pane processes, while restore only attaches to a surviving pane without rerunning CLI arguments. The current namespace/link supervisor belongs to a local PTY worker lifetime; worker loss terminates that task, unlike a persistent pane. Opening the backend gate or persisting a JSON field would not prove enforcement. tmux/zellij/herdr/zmx, adopt and existing external App Servers remain explicitly unsupported; no automatic backend switch or policy downgrade occurs.
+The Linux sandbox relies on kernel namespaces, which Docker-style containers and hardened hosts often block by default. Check per mode:
 
-Keep the legacy configuration to retain an existing persistent session without claiming the new boundary, or, only after the target image passes native PTY fresh/restored model-turn acceptance, explicitly select local `backendType: "pty"` with `sandbox: true` and create a new session. Deployment-provided proxies can then use explicit trusted-egress and endpoint rules, delegating final destinations to the proxy. PTY is the permitted policy backend, not proof of standalone Bun + native Codex model-turn readiness; a running tmux pane cannot migrate in place. Bot edits affect new sessions only; existing/fork/restored snapshots stay frozen. Resuming CLI history in a newly launched process is distinct from reattaching a live pane and must establish a fresh boundary.
+- **Which bwrap**: the distro binary at `/usr/bin/bwrap` or `/bin/bwrap` is always preferred. Only when neither exists is a bwrap from PATH used, with a one-time warning in the daemon log. Codex installs its own build at `~/.local/bin/bwrap`; when that comes first on PATH, sandboxed sessions exit right after launch, and the warning names it. Install the distro `bubblewrap` package to fix it.
+- **Symlinked system directories**: when a baseline directory such as `/opt` is itself a symlink, the sandbox recreates the same symlink inside and binds the real path read-only.
+- **No PID-namespace downgrade in normal deployments**: even when procfs cannot be mounted in a new PID namespace, a normal deployment refuses to start (only the core-only deployment `BOTMUX_CORE_ONLY=1` may drop `--unshare-pid`) — sibling bot workers on the same host hold plaintext credentials in their environment, which a sandbox without PID isolation could read through /proc.
 
-Restored Codex history also needs actual tool-cwd acceptance. `src/adapters/cli/codex.ts` passes `-C workingDir` for fresh launches but builds resume/fork from base arguments without `-C`; Codex may retain its saved cwd. Updating BotConfig or the frozen Session workingDir does not prove a migrated tool root. Network address filtering does not validate cwd; verify consistency with the workspace root, tool context and oncall filesystem policy.
+| Required capability | Allowlist isolation | Scratch | Network policy |
+|---|---|---|---|
+| bwrap + unprivileged user namespaces + mount / PID namespaces | ✅ | ✅ | ✅ |
+| root: kernel overlayfs; non-root: `fuse-overlayfs` + `/dev/fuse` | | ✅ | |
+| root (for `scratchStorage: "tmpfs"`; use `"disk"` when non-root) | | ✅ | |
+| bwrap with `--add-seccomp-fd` and `--disable-userns`, plus the network tools above | | | ✅ |
 
-A migration report used Codex 0.159.3 native app-server `thread/resume` with `cwd` to migrate nine old-cwd records, preserving transcript prefixes and model/approval/sandbox settings. An actual Python tool after cold resume with the same Codex ID confirmed the new cwd. This is reported external evidence, not a migration performed on this branch or a guarantee for other versions. This PR neither fixes the adapter nor rewrites Codex history or live deployments.
+botmux **never** falls back to running the CLI unsandboxed; it refuses to start the session instead. Common log messages:
 
-#### Native runner acceptance before deployment (independent blocker)
+- `sandbox requested but could not be established (bwrap missing or setup failed)`: allowlist isolation could not start.
+- `scratch 沙箱没能建立：<reason>。<fix>` (scratch sandbox could not be established): the chat names the reason and the matching fix (missing dependencies, RAM storage on a non-root daemon, /dev/fuse unavailable, a storage setting that no longer matches the session, …). Only a RAM upper lost in a machine reboot needs a new session. When you pick scratch, the Dashboard also warns up front whether this machine cannot run scratch or can only use disk storage.
+- `[scratch-sandbox] tmpfs upper slot mount failed (non-root host? use scratchStorage "disk")`: tmpfs storage on a non-root host.
+- `[scratch-sandbox] missing deps (...)`: bubblewrap or fuse-overlayfs is missing and could not be auto-installed (only attempted as root or with passwordless sudo).
+- `bubblewrap cannot establish the required user/mount/PID namespaces`: the host probe failed, typically inside a container.
+- `[device-credential-isolation] ... credential-only bubblewrap could not be established`: machines enrolled with a managed platform and holding a device credential mask credentials with bwrap whether or not the bot has a sandbox; this means bwrap is not usable on that machine.
 
-A migration report observed Botmux 3.20.0 native Bun standalone + Codex 0.159.3 in a shared image, with `sandbox: false` and `backendType: "pty"`: a fresh HTTP virtual turn received `exitCode: 0 / signal: 1 (SIGHUP)` about 15 ms after `pty.spawn` returned a PID, before input submission. Python PTY kept native Codex alive with the same arguments. **This is reported migration evidence, not an independent reproduction on this PR's branch with the same image/versions. This PR neither fixes nor establishes the cause.** Retain native tmux until the runner passes acceptance; disabling network policy or relaxing access does not prove PTY compatibility.
+### Troubleshooting
 
-A separate report concerns HTTP virtual/noTransport tmux without a server returning `probe: unknown`. Code inspection verifies that the policy-off guard applies to noTransport tmux and rejects an unknown probe. Ordinary transport-enabled, policy-off sessions without stale provenance are outside that noTransport arm; other explicit isolation/provenance gates still apply. Do not generalize this to all tmux sessions or bypass tri-state checks.
+1. Try bwrap directly:
 
-The network CI tests a real PTY under an ordinary runtime and tests standalone network-runner reexec separately, not the complete standalone-worker Codex turn. The native release smoke deliberately bypasses `tty.ReadStream` construction (`test/pty-native-smoke.test.ts`, `src/cli/pty-smoke.ts`), so it cannot establish production `PtyBackend` lifetime/submission behavior.
+   ```bash
+   bwrap --unshare-user --unshare-pid --bind / / --proc /proc true && echo ok
+   ```
 
-Before enabling the policy, pin the actual target image and Botmux/Bun/Codex versions and pass these checks:
+   If this fails, namespaces are blocked; fix that first, nothing on the botmux side needs to change.
+2. Check whether unprivileged user namespaces are disabled:
+   - `cat /proc/sys/user/max_user_namespaces`; `0` means disabled;
+   - some distributions also have `/proc/sys/kernel/unprivileged_userns_clone`; `0` means disabled;
+   - newer Ubuntu releases may restrict unprivileged user namespaces through AppArmor (`kernel.apparmor_restrict_unprivileged_userns`).
+3. Inside a container, the default seccomp profile may block `clone` / `unshare` from creating user namespaces, and AppArmor / SELinux may block `mount`. Relax this through your container runtime, e.g. a seccomp profile that allows these syscalls (`--security-opt seccomp=...`) and, if needed, a looser AppArmor profile.
+4. Scratch as non-root: make sure `ls -l /dev/fuse` shows the device and `fuse-overlayfs` is installed; containers need `/dev/fuse` passed through (e.g. `--device /dev/fuse`). Scratch as root uses kernel overlayfs / tmpfs, so the container also needs mount capability (e.g. `--cap-add SYS_ADMIN`).
+5. Network policy: `bwrap --help` must list `--add-seccomp-fd` and `--disable-userns`; upgrade bubblewrap if it is too old.
 
-1. Use the native standalone worker and production `PtyBackend`, first with `sandbox: false`, then oncall + network policy. Python PTY, custom runtimes and ReadStream-bypassing helpers are controls, not replacements.
-2. Fresh sessions must survive to prompt ready, submit real input, finish a complete model turn and read back the result. Record PID, ready/submit/response times and exit code/signal; a PID, brief survival or exit 0 is insufficient.
-3. Restore saved Codex history in a newly launched worker/CLI PTY and finish the next model turn, verifying identity, submission and result. Have an actual model tool return `pwd` or Python `os.getcwd()` without first changing directories or overriding tool cwd; preserve its execution result and compare canonical paths against the expected workspace, Session snapshot and filesystem policy root. Botmux JSON, model prose and prompts are insufficient. A directory migration must also preserve the intended Codex ID, transcript prefix and model/approval/sandbox settings. A cwd mismatch fails acceptance and requires a separate migration fix. PTY does not promise a live process surviving worker restart or tmux-style reattach.
-4. Test HTTP virtual/noTransport and ordinary transport shapes in isolated harnesses, with IM send calls rejected by test doubles and counted as zero. Protocol-compatible local model fixtures are useful but must be distinguished from actual provider acceptance. Verify client DNS, deployment proxy and final destination ACL separately.
-5. Test tmux no-server/unknown and existing-server paths separately without treating unknown as missing or pretending transport is enabled. If acceptance fails, retain the existing tmux deployment and track runner/noTransport fixes separately.
+Relaxing container isolation weakens the container's own security boundary, so weigh it for your environment.
 
-Persistent boundary support needs a separate change: enforcement before shell/CLI launch; an authenticated policy digest, namespace identity and supervisor generation tied to the actual pane/CLI PID; verification of live evidence on worker/daemon restore with missing/mismatched evidence rejected; a supervisor lifetime independent of the worker, with link death terminating associated tasks; safe cleanup, pane replacement, concurrent restore and adopt handling. Acceptance must exercise real tmux fresh/reattach, worker/daemon restart, link failure, tampered/stale evidence, cross-session isolation and IPv4/IPv6. Stored configuration or session names are insufficient proof.
+---
 
-See the Chinese page's isolated Linux test command. `test/sandbox-network-linux.test.ts` is opt-in (`BOTMUX_NETWORK_POLICY_INTEGRATION=1`); explicit runs fail if dependencies or kernel capabilities are unavailable. A skipped run is not boundary validation. Set `BOTMUX_NETWORK_TEST_BINARY` to the absolute compiled binary path to include the self-reexec case. The Sandbox network boundary CI runs the complete matrix and binary test for relevant PRs. Model requests use an isolated HTTP fixture rather than a live provider.
+## 8. Three Things That Are Easy to Mix Up
+
+- **An Oncall directory is not a sandbox**: `/oncall bind <dir>` anchors the bot to a working directory in this group and lets members talk to it directly; it **does not restrict** which files the CLI can read or write. Enable allowlist isolation for that.
+- **CLI auto-approval is not "sandbox off"**: The auto-approval flags botmux adds to the CLI by default (`--dangerously-*`, `--yolo`, etc.; turn them off with `disableCliBypass`) only disable the CLI's **own** approvals / sandbox. The botmux file sandbox wraps the CLI from outside and still applies.
+- **`/grant` only grants talk access**: `/grant` lets members talk to the bot; it does not give operate rights such as `/cd` or `/restart`, and it does not change the bot's sandbox or credentials. See [Permissions](/en/permissions).
+
+---
+
+## 9. Isolation Layers When Several People Share a Bot
+
+When several people use one bot, isolation is stacked; no single layer covers everything.
+
+| Layer | Isolates | Does not isolate | Where to configure |
+|---|---|---|---|
+| Session | One CLI process per topic, with its own context and transcript | Files: all sessions see the same host files, and sessions pointed at the same directory see each other's changes; accounts: they share the bot's model account and credentials | Automatic (one session per new topic) |
+| Worktree | Each topic edits code in its own git worktree / branch, so topics do not overwrite each other | File access is unchanged; host files outside the worktree are still readable and writable | `/tw`, `/repo wt <repo> [branch]`; see [Slash Commands](/en/slash-commands) |
+| File sandbox: off | Nothing | Everything | `sandbox` unset / `false` |
+| File sandbox: allowlist isolation | Reads and writes outside the allowlist; credentials, other repositories, other bots' data; CLI data directory split per bot for the Claude family and Codex | Writes to allowlisted paths (including the working directory) reach the host directly, and with `workingDir` at its default `~` the whole home directory is allowlisted; other CLIs keep their global host data directory; network is not isolated by default; sessions of the same bot share its model account and CLI data directory (one session can see the same bot's other session records) | `sandbox: "oncall"` + `sandboxPaths` |
+| File sandbox: scratch | Writes (kept in a throwaway COW layer); botmux credentials | Reads: most host files are readable; on macOS, cache / preference and system temp dirs still write to the real disk; network is not isolated by default | `sandbox: "scratch"` + `scratchStorage` |
+| Per-person tool credentials | lark-cli and other managed tools run with the **current message sender's** own authorization and are refused when that person has not authorized, never borrowing the owner's or anyone else's login | Model account, file access, and other unmanaged tools still use the machine / bot identity | `triggerUserAuth`; personal Lark authorization via `/login`, other managed tools reply with an authorization link when needed |
+| Model account | Different bots use different model accounts (Claude: `credentialsSourceDir`, sandbox required; Codex: `codexAuthSync: "isolated"`) | Split per bot, not per person: everyone using the same bot shares one model account | The corresponding `bots.json` fields |
+| OS user | System-level file permissions, processes, and home directories are fully separate | botmux does not provide this layer: every bot and session under one daemon runs as the same system user | Deploy a separate botmux per system user (each with its own `~/.botmux`) |

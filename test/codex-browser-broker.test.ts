@@ -134,7 +134,7 @@ describe.sequential('CodexBrowserBroker', () => {
     const reconnected = await broker.handleToolCall(call({ operation: 'list_tabs' }));
     expect(reconnected.success).toBe(true);
     expect(get).toHaveBeenCalledTimes(2);
-    expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledOnce();
   });
 
   it('bridges app-server turn completion into the browser runtime hook', async () => {

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildFooterAddressing,
   hasKnownBotMention,
+  mentionedBotAppIds,
   orderedFooterRecipients,
   stripCodeSpans,
   codeSpanRanges,
@@ -240,5 +241,34 @@ describe('codeSpanRanges', () => {
   it('returns sorted [start, end) offsets for inline spans and fences', () => {
     const text = 'a `x` b\n```\ny\n```\nc';
     expect(codeSpanRanges(text)).toEqual([[2, 5], [8, 17]]);
+  });
+});
+
+describe('mentionedBotAppIds', () => {
+  const entries = [
+    { larkAppId: 'cli_self', botName: 'Ayla', botOpenId: 'ou_self_own' },
+    { larkAppId: 'cli_claude', botName: 'Claude', botOpenId: 'ou_claude_own' },
+    { larkAppId: 'cli_codex', botName: 'Codex' },
+  ];
+  const crossRef = { Claude: 'ou_claude_seen_by_self', Codex: 'ou_codex_seen_by_self', Ayla: 'ou_self_seen' };
+
+  it('resolves mentioned bots by the open_id this app sees them as', () => {
+    expect(mentionedBotAppIds([
+      { open_id: 'ou_codex_seen_by_self' }, { open_id: 'ou_claude_own' }, { open_id: 'ou_codex_seen_by_self' },
+    ], entries, crossRef, 'cli_self')).toEqual(['cli_codex', 'cli_claude']);
+  });
+
+  it('does not guess between two bots that share a name', () => {
+    // Either listing order: neither bot may claim the name's open_id.
+    const twins = [{ larkAppId: 'cli_codex_2', botName: 'Codex', botOpenId: 'ou_codex2_own' }, ...entries];
+    expect(mentionedBotAppIds([{ open_id: 'ou_codex_seen_by_self' }], [...entries, twins[0]], crossRef, 'cli_self')).toEqual([]);
+    expect(mentionedBotAppIds([{ open_id: 'ou_codex_seen_by_self' }, { open_id: 'ou_codex2_own' }],
+      twins, crossRef, 'cli_self')).toEqual(['cli_codex_2']);
+  });
+
+  it('never trusts a display name, a human, or this bot itself', () => {
+    expect(mentionedBotAppIds([
+      { open_id: 'ou_human', name: 'Claude' }, { open_id: 'ou_self_seen' }, { open_id: 'ou_self_own' },
+    ], entries, crossRef, 'cli_self')).toEqual([]);
   });
 });

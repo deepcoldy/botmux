@@ -12,14 +12,26 @@ type Resolution =
 const bindings = new WeakMap<PtyHandle, { pid: number; sessionId: string }>();
 const pending = new WeakMap<PtyHandle, Promise<Resolution>>();
 
+/** Called only after an exact history match containing this write's random
+ * marker. Pin the proof to the submitting backend and its original process;
+ * a delayed receipt from a replaced process must not bind its successor. */
+export function bindCodexSessionFromCorrelatedInput(
+  terminal: PtyHandle, pid: number, sessionId: string,
+): boolean {
+  if (terminal.cliPid !== pid) return false;
+  bindings.set(terminal, { pid, sessionId: sessionId.toLowerCase() });
+  return true;
+}
+
 export function codexTerminalSessionIsBound(terminal: PtyHandle, sessionId: string): boolean {
   const binding = bindings.get(terminal);
   return binding !== undefined && binding.pid === terminal.cliPid
     && binding.sessionId === sessionId.toLowerCase();
 }
 
-function emptyComposerFooter(terminal: PtyHandle): string | undefined {
-  const state = terminal.captureInputState?.();
+export function codexEmptyComposerFooter(
+  state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
+): string | undefined {
   if (!state) return undefined;
   const lines = stripAnsiScreenText(state.viewport).split(/\r?\n/);
   if (detectCodexComposerState({ ...state, viewport: lines.join('\n') }) !== 'empty') return undefined;
@@ -35,8 +47,40 @@ function emptyComposerFooter(terminal: PtyHandle): string | undefined {
   // Both layouts are native: an inline status/hints row, or a separate status
   // row followed by hints. Stay in the adjacent footer band, never scrollback.
   const footer = below.slice(0, 4).filter(row => row.trim());
+  // Busy/loading evidence is meaningful only next to the live composer. The
+  // same words can remain in scrollback after capacity recovers (or appear in
+  // ordinary transcript prose); scanning the whole viewport would then make a
+  // healthy empty composer fail closed forever.
+  const composerNeighborhood = lines.slice(
+    Math.max(0, state.cursor.y - 3),
+    Math.min(lines.length, state.cursor.y + 5),
+  ).join('\n');
   if (footer.length < 1 || footer.length > 2 || below.slice(4).some(row => row.trim())
-    || /^\s*(?:(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b|│\s*(?:model|directory):\s*loading\b)/im.test(lines.join('\n'))) return undefined;
+    || /^\s*(?:(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b|│\s*(?:model|directory):\s*loading\b)/im.test(composerNeighborhood)) return undefined;
+  return codexNativeFooterRows(footer);
+}
+
+/** Positive, fail-closed evidence for unattended writes into Codex.
+ *
+ * Cursor position catches the common draft case while the exact native
+ * placeholder + bounded footer check catches a draft whose cursor was moved
+ * back to Home, stale scrollback prompts, pickers, and startup/loading screens.
+ */
+export function codexNativeComposerState(
+  state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
+): 'empty' | 'draft' | 'unknown' {
+  const coarse = detectCodexComposerState(state);
+  if (coarse !== 'empty') return coarse;
+  return codexEmptyComposerFooter(state) !== undefined ? 'empty' : 'unknown';
+}
+
+function emptyComposerFooter(terminal: PtyHandle): string | undefined {
+  return codexEmptyComposerFooter(terminal.captureInputState?.());
+}
+
+/** Validate the native one/two-row footer after the caller bounds its location. */
+export function codexNativeFooterRows(footer: string[]): string | undefined {
+  if (footer.length < 1 || footer.length > 2) return undefined;
   // The second footer row is the native hints/warning row. A warning-only row
   // is native too: when hints are hidden the warning is the only thing left in
   // that row. Codex degrades the notice by width: `\u26a0 N warnings \u00b7 f2
@@ -64,7 +108,8 @@ const THREAD_ID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 const THREAD_ID_OPENING_SEGMENT = new RegExp(`^(${THREAD_ID_PATTERN})(?:\\s([\\s\\S]*))?$`, 'i');
 const THREAD_ID_ANYWHERE = new RegExp(THREAD_ID_PATTERN, 'i');
 
-function statusLineSession(footer: string): string | undefined {
+/** Parse one complete native thread-id segment from an already bounded footer. */
+export function codexFooterSessionId(footer: string): string | undefined {
   // Read only the live footer: UUIDs in scrollback, pasted drafts, and old
   // /status cards are not evidence.
   const ids = footer
@@ -108,7 +153,7 @@ async function refresh(terminal: PtyHandle): Promise<Resolution> {
   try {
     const footer = emptyComposerFooter(terminal);
     if (footer !== undefined) {
-      const footerSessionId = statusLineSession(footer);
+      const footerSessionId = codexFooterSessionId(footer);
       if (footerSessionId && terminal.cliPid === pid) {
         bindings.set(terminal, { pid, sessionId: footerSessionId });
         return { kind: 'terminal', sessionId: footerSessionId };

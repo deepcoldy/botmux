@@ -62,21 +62,29 @@ import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
 const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
 
-/** Extract the cliSessionId encoded in a rollout filename. Codex's session
- *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
- *  the UUID alone — the `<ts>` segment between "rollout-" and the sid
- *  contains its own dashes that would otherwise let a greedy match swallow
- *  parts of the sid.
+/** STRICT, cross-CLI parser for the cliSessionId encoded in a rollout
+ *  filename. Codex's session id is UUID-shaped (8-4-4-4-12 hex), which lets
+ *  us anchor the regex on the UUID alone — the `<ts>` segment between
+ *  "rollout-" and the sid contains its own dashes that would otherwise let a
+ *  greedy match swallow parts of the sid.
  *
- *  This is deliberately STRICT: the canonical Codex name is
- *  `rollout-<ts>-<sid>.jsonl`. The byte-identical `-<sid>_<uuid>.jsonl`
- *  shape means a resumed SEGMENT for TRAE X; a shared parser accepting that
- *  suffix could let TRAE pid-probe adopt persist the wrong native session
- *  id (#1854). Codex resumed GENERATION files use that shape too, but are
- *  read only through Codex-scoped paths (a Codex pid's open fds /
- *  CODEX_HOME index+scan / an already-bound Codex bridge) — those use
- *  {@link codexGenerationSessionIdFromRolloutPath}, never this shared one.
- *  Returns undefined for paths that don't match. */
+ *  Deliberately STRICT — it matches only the canonical
+ *  `rollout-<ts>-<sid>.jsonl` name and returns undefined for the
+ *  byte-identical `-<sid>_<uuid>.jsonl` shape. That suffix is ambiguous: for
+ *  Codex it is a resumed GENERATION file, but for TRAE X it is a resumed
+ *  SEGMENT. A shared/ambiguous caller that accepted the suffix could let a
+ *  TRAE pid-probe adopt persist the wrong native session id (#1854).
+ *
+ *  This exported function currently has ZERO production callers by design:
+ *  Codex's own generation-aware reads all go through the Codex-scoped
+ *  {@link codexGenerationSessionIdFromRolloutPath} (a Codex pid's open fds /
+ *  CODEX_HOME index+scan / an already-bound Codex bridge — the only places a
+ *  `_<uuid>` suffix is known to mean a Codex generation). Do NOT treat this
+ *  parser as dead code under the "remove test-only exports" rule: it is the
+ *  load-bearing body of the cross-CLI invariant pinned by
+ *  `test/structured-bridge-spec.test.ts > pins the per-CLI differences`
+ *  (mutating the regex to accept the suffix makes that guard fail). Keep the
+ *  strict parser and the Codex-scoped parser separate. */
 export function codexSessionIdFromRolloutPath(path: string): string | undefined {
   return CODEX_ROLLOUT_SESSION_RE.exec(path)?.[1];
 }
@@ -122,7 +130,10 @@ type CodexRolloutRef = { path: string; cliSessionId: string };
  *  transcripts open in the same process, so choosing the first fd can bind
  *  an adopted pane to the wrong conversation.
  *
- *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
+ *  两种平台（Linux /proc 与 macOS lsof 兜底）都用同一套进程打开文件枚举
+ *  与 `codexGenerationSessionIdFromRolloutPath` 提取 sid：这些 fd 已确定属于
+ *  一个 Codex 进程，所以这里可以识别 Codex 的 generation 后缀；严格的
+ *  {@link codexSessionIdFromRolloutPath} 只服务跨 CLI 歧义守卫，不在此链路。 */
 export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined {
   const targets = listProcessOpenFiles(pid);
   if (!targets) return undefined;
@@ -193,9 +204,11 @@ function matchCodexRolloutPath(target: string): CodexRolloutRef | undefined {
   // env-independent structural shape: a `sessions/` path segment plus the
   // distinctive `rollout-<ts>-<uuid>.jsonl` filename (validated below).
   if (!/(^|\/)sessions\//.test(target)) return undefined;
-  // These fds belong to a Codex process, so a resumed-generation suffix is a
-  // real Codex rollout, not the same-shaped TRAE segment (#1854 keeps the
-  // shared strict parser used by ambiguous/non-Codex callers).
+  // These fds belong to a Codex process, so a `_<uuid>` suffix here is a real
+  // Codex resumed generation — use the Codex-scoped parser. The strict
+  // codexSessionIdFromRolloutPath (which rejects that suffix because the same
+  // shape is a TRAE segment, #1854) is intentionally not used on this
+  // Codex-owned path; it exists only to pin the cross-CLI guard in tests.
   const sid = codexGenerationSessionIdFromRolloutPath(target);
   if (!sid) return undefined;
   return { path: target, cliSessionId: sid };
@@ -226,8 +239,13 @@ export interface CodexBridgeEvent {
    *     without starting, closing, or otherwise advancing the queue
    *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
    *     output) attributed to the collecting turn for the CoT message; it
-   *     never starts or closes a turn */
-  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
+   *     never starts or closes a turn
+   *   - 'input_queued' (Pi) says the CLI accepted the next input while busy
+   *     and holds it until its current work ends; the head keeps its place
+   *     instead of expiring, but is NOT started (the running work is not it)
+   *   - 'cli_settled' (Pi) says the CLI finished all queued work; a head
+   *     still held by it was not taken up and resumes its normal lease */
+  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot' | 'input_queued' | 'cli_settled';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
@@ -252,6 +270,10 @@ export interface CodexBridgeEvent {
    *  can use it to bind cosmetic/terminal events to the exact started turn
    *  instead of relying solely on whichever turn is currently collecting. */
   sourceTurnId?: string;
+  /** Identity of a genuine native user message. TRAE can accept several
+   * messages into one running turn; different message ids are real steering
+   * inputs, while mirrors of the same message must remain idempotent. */
+  sourceMessageId?: string;
   /** The transcript parser has positive evidence that this user record starts
    * a distinct native turn while an older id-less turn remains open. */
   preserveCollecting?: boolean;
@@ -907,6 +929,9 @@ export interface BackgroundTaskSignals {
 export interface CodexDrainState {
   nextOffset: number;
   turnStartOffset: number;
+  activeNativeTurnId?: string;
+  sourceSessionId?: string;
+  sourcePath?: string;
 }
 
 /** Model / reasoning-effort pair read from a rollout's `turn_context` record. */
@@ -1276,6 +1301,35 @@ function precedingTurnStartOffset(path: string, beforeOffset: number): number {
   return result;
 }
 
+/** Recover native execution context for a cold seek into a running rollout.
+ * Live drains carry it in their cursor state, so ordinary polling never
+ * rescans a growing transcript. Missing bounded evidence stays unattributed. */
+function precedingNativeTurn(path: string, beforeOffset: number): { turnId: string; offset: number } | undefined {
+  let result: { turnId: string; offset: number } | undefined;
+  try {
+    scanJsonlBackward(path, {
+      endOffset: beforeOffset,
+      floor: Math.max(0, beforeOffset - CODEX_RUNTIME_SCAN_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line, offset) => {
+        let obj: any;
+        try { obj = JSON.parse(line.toString('utf8')); } catch { return false; }
+        const p = obj?.payload;
+        if (obj?.type !== 'event_msg') return false;
+        if (p?.type === 'task_complete' || p?.type === 'turn_aborted') {
+          // Any terminal ends the preceding execution, even when Codex
+          // abandoned its start id and completed under a replacement id.
+          return true;
+        }
+        if (p?.type !== 'task_started' || typeof p.turn_id !== 'string' || !p.turn_id) return false;
+        result = { turnId: p.turn_id, offset };
+        return true;
+      },
+    });
+  } catch { /* no native proof */ }
+  return result;
+}
+
 /** Resolve a custom tool output against the rollout itself. Outputs can land
  * in a later incremental drain than their calls, so the byte offset alone is
  * insufficient; a backward chunk scan keeps the parser stateless without
@@ -1633,6 +1687,7 @@ export function drainCodexRollout(
   const reusableState = !step.reset && previousState?.nextOffset === start
     && previousState.turnStartOffset >= 0
     && previousState.turnStartOffset <= start
+    && (previousState.sourcePath === undefined || previousState.sourcePath === path)
     ? previousState
     : undefined;
   if (step.kind === 'idle') {
@@ -1662,6 +1717,9 @@ export function drainCodexRollout(
     return turnStartOffset;
   };
   const turnExecEntries: TerminalExecEntry[] = [];
+  let activeNativeTurnId = reusableState?.activeNativeTurnId;
+  let nativeContextKnown = start === 0 || reusableState?.activeNativeTurnId !== undefined;
+  let sourceSessionId = reusableState?.sourceSessionId;
   // Walk lines with their byte offsets so synthetic uuids are stable across
   // re-drains.
   for (const { line, lineStart, lineEnd } of iterateJsonlLines(completeText, start)) {
@@ -1683,6 +1741,7 @@ export function drainCodexRollout(
     }
     const p = obj?.payload;
     if (!p || typeof p !== 'object') continue;
+    if (obj.type === 'session_meta' && typeof p.id === 'string' && p.id) sourceSessionId = p.id;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const lineId = codexRolloutLineId(line);
@@ -1696,12 +1755,20 @@ export function drainCodexRollout(
       && p.type === 'task_started'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
+      activeNativeTurnId = p.turn_id;
+      nativeContextKnown = true;
+      turnStartOffset ??= lineStart;
+      if (!sourceSessionId && start > 0) {
+        const header = rolloutHeaderCheck(path);
+        if (header.verified && header.sid) sourceSessionId = header.sid;
+      }
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'turn_started',
         text: '',
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
         rawId: lineId,
       });
       continue;
@@ -1720,7 +1787,22 @@ export function drainCodexRollout(
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       if (isCodexEnvironmentUpdate(p.internal_chat_message_metadata_passthrough, text)) continue;
-      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'user', text });
+      if (!nativeContextKnown) {
+        const native = precedingNativeTurn(path, start);
+        activeNativeTurnId = native?.turnId;
+        // Keep the proof in incremental cursor state even when this cold
+        // range contains only user records and no terminal/tool output.
+        if (native) turnStartOffset ??= native.offset;
+        nativeContextKnown = true;
+      }
+      if (activeNativeTurnId && !sourceSessionId && start > 0) {
+        const header = rolloutHeaderCheck(path);
+        if (header.verified && header.sid) sourceSessionId = header.sid;
+      }
+      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'user', text,
+        ...(activeNativeTurnId ? { sourceTurnId: activeNativeTurnId, sourceMessageId: lineId } : {}),
+        ...(sourceSessionId ? { sourceSessionId } : {}),
+      });
       continue;
     }
     // Mid-turn thinking timeline: reasoning summaries and tool calls/outputs
@@ -1767,6 +1849,20 @@ export function drainCodexRollout(
       events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries });
       continue;
     }
+    // A terminal without native identity cannot safely settle a queued turn.
+    // It still ends the parser's attribution evidence, matching cold seeks:
+    // later id-less inputs must not borrow the preceding execution's receipt.
+    if (obj.type === 'event_msg'
+      && (p.type === 'task_complete' || p.type === 'turn_aborted')
+      && (typeof p.turn_id !== 'string' || p.turn_id.length === 0)) {
+      activeNativeTurnId = undefined;
+      nativeContextKnown = true;
+      turnStartOffset = lineEnd;
+      turnFullyCovered = true;
+      turnExecEntries.length = 0;
+      toolCallDeferralById.clear();
+      continue;
+    }
     // Turn terminal: event_msg `task_complete` carries the final visible text
     // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
     // This is the SOLE assistant_final source. Codex assistant `response_item`
@@ -1805,7 +1901,10 @@ export function drainCodexRollout(
           ...(failureLimitKind ? { terminalLimitKind: failureLimitKind } : {}),
         } : {}),
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
       });
+      activeNativeTurnId = undefined;
+      nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
       turnExecEntries.length = 0;
@@ -1837,7 +1936,10 @@ export function drainCodexRollout(
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
       });
+      activeNativeTurnId = undefined;
+      nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
       turnExecEntries.length = 0;
@@ -1858,7 +1960,11 @@ export function drainCodexRollout(
     latestReasoningEffort,
     ...(spawnedSubagents.length > 0 ? { spawnedSubagents } : {}),
     ...(turnStartOffset !== undefined ? {
-      state: { nextOffset: newOffset, turnStartOffset },
+      state: { nextOffset: newOffset, turnStartOffset,
+        ...(activeNativeTurnId ? { activeNativeTurnId } : {}),
+        ...(sourceSessionId ? { sourceSessionId } : {}),
+        ...(activeNativeTurnId || sourceSessionId ? { sourcePath: path } : {}),
+      },
     } : {}),
   };
 }

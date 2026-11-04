@@ -4,6 +4,7 @@ export type BotConfigInvariantError =
   | 'codex_browser_config_conflict'
   | 'existing_app_server_sandbox_conflict'
   | 'invalid_sandbox_network_policy'
+  | 'reply_delivery_unsupported'
   | 'sandbox_network_policy_requires_local_pty_oncall';
 
 function codexBrowserEnabled(entry: any): boolean {
@@ -32,6 +33,19 @@ export function botConfigInvariantError(entry: any): BotConfigInvariantError | u
   }
   if (entry.existingAppServer && (sandboxEngaged(entry) || entry.readIsolation === true)) {
     return 'existing_app_server_sandbox_conflict';
+  }
+  // replyDelivery=transcript × cursor × scratch：host 侧转写桥读不到 scratch 全根
+  // COW 的 merged overlay mirror，开 transcript 信封会让模型不调 send 而整轮静默。
+  // 放全局不变量（而非只在 replyDelivery 写入门禁）是因为这条边还能从另外两个写者
+  // 进入：cliId 切换（codex+transcript+scratch 合法 → 切到 cursor）与 sandbox 切换
+  // （cursor+transcript → scratch），两者都经 rmwBotEntry 落盘，在此一处判死。
+  // 注意：这里只能看持久化字段——机器级 BOTMUX_SANDBOX 不 materialize 进 entry，
+  // 那条边由 core/reply-delivery 的运行时回落与 worker spawnCli 的 resolved-mode
+  // 复核负责。
+  if (entry.replyDelivery === 'transcript'
+      && entry.cliId === 'cursor'
+      && entry.sandbox === 'scratch') {
+    return 'reply_delivery_unsupported';
   }
   return undefined;
 }

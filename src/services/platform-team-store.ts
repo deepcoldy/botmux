@@ -37,8 +37,6 @@ export interface PlatformTeamBot {
   appId: string;
   unionId?: string;
   name?: string;
-  /** Platform-attested owner of the machine that hosts this bot. */
-  ownerUnionId?: string;
 }
 
 export interface PlatformTeamSyncTeam {
@@ -96,14 +94,10 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       if (!appId) continue;
       const unionId = typeof (b as Record<string, unknown>).unionId === 'string' ? String((b as Record<string, unknown>).unionId).trim() : '';
       const name = typeof (b as Record<string, unknown>).name === 'string' ? String((b as Record<string, unknown>).name) : undefined;
-      const ownerUnionId = typeof (b as Record<string, unknown>).ownerUnionId === 'string'
-        ? String((b as Record<string, unknown>).ownerUnionId).trim()
-        : '';
       bots.push({
         appId,
         unionId: unionId || undefined,
         name,
-        ownerUnionId: /^on_[A-Za-z0-9]+$/.test(ownerUnionId) ? ownerUnionId : undefined,
       });
     }
   }
@@ -175,40 +169,6 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
     for (const b of t.bots) if (b.unionId === id) return true;
   }
   return false;
-}
-
-export type PlatformTeamBotOwnerResolution =
-  | { status: 'resolved'; ownerUnionId: string }
-  | { status: 'missing' | 'conflict' };
-
-/**
- * Resolve the owner of one authenticated peer bot inside the target bot's
- * platform-team trust domain.
- *
- * `sourceBotUnionId` comes from the Lark event, never message content. A roster
- * owner is accepted only when source bot, target bot and owner are members of
- * the same team. Multiple teams may repeat the same pair; conflicting owners
- * fail closed instead of picking one by order.
- */
-export function resolvePlatformTeamBotOwner(
-  dataDir: string,
-  targetAppId: string,
-  sourceBotUnionId: string | undefined,
-): PlatformTeamBotOwnerResolution {
-  const target = targetAppId.trim();
-  const source = (sourceBotUnionId ?? '').trim();
-  if (!target.startsWith('cli_') || !source.startsWith('on_')) return { status: 'missing' };
-  const owners = new Set<string>();
-  for (const team of readFile(dataDir)?.teams ?? []) {
-    if (!team.bots.some(bot => bot.appId === target)) continue;
-    for (const bot of team.bots) {
-      if (bot.unionId !== source || !bot.ownerUnionId) continue;
-      if (!team.memberUnionIds.includes(bot.ownerUnionId)) continue;
-      owners.add(bot.ownerUnionId);
-    }
-  }
-  if (owners.size === 1) return { status: 'resolved', ownerUnionId: [...owners][0]! };
-  return { status: owners.size > 1 ? 'conflict' : 'missing' };
 }
 
 /** Is `unionId` a HUMAN member of a platform team that THIS bot (`botAppId`)

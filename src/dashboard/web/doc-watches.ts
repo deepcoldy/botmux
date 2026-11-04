@@ -6,6 +6,9 @@
  */
 
 import { readJson } from './dashboard-api.js';
+// 类型直接复用后端定义：曾在本地复制了一份联合类型，后端新增 outcome 时
+// tsc 不会报错、UI 却落进 default 显示成「尚无记录」（poll-circuit-open 即此漏网）。
+import type { DocWatchOutcome } from '../../services/doc-subs-store.js';
 
 export type DocWatchMode = 'mention-only' | 'owner-mention' | 'all';
 
@@ -13,17 +16,6 @@ export type DocWatchMode = 'mention-only' | 'owner-mention' | 'all';
 export function isPollingMode(mode: string | undefined): boolean {
   return mode === 'all' || mode === 'owner-mention';
 }
-
-/** 与后端 `DocWatchOutcome` 一一对应，见 doc-subs-store.ts。 */
-export type DocWatchOutcome =
-  | 'dispatched'
-  | 'no-comment'
-  | 'trigger-missing'
-  | 'empty-text'
-  | 'not-mentioned'
-  | 'self-authored'
-  | 'audit-rejected'
-  | 'poll-failed';
 
 export interface DocWatchRow {
   fileToken: string;
@@ -58,6 +50,31 @@ export interface DocWatchBotResult {
   botName?: string;
   watches: DocWatchRow[];
   error?: string;
+}
+
+/** 会话创建之前的失败也必须可见；这些记录仍属于文档监听，不伪造会话行。 */
+export function failedDocWatches(results: readonly DocWatchBotResult[]): Array<DocWatchRow & { botName: string }> {
+  return results.flatMap(result => result.error ? [] : result.watches
+    .filter(row => row.lastOutcome === 'no-comment' || row.lastOutcome === 'trigger-missing'
+      || outcomeMeta(row.lastOutcome).kind === 'error')
+    .map(row => ({ ...row, larkAppId: result.larkAppId, botName: result.botName ?? result.larkAppId })))
+    .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+}
+
+export async function loadDocWatchResults(): Promise<DocWatchBotResult[]> {
+  const response = await fetch('/api/bots');
+  const body = await readJson(response);
+  if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`);
+  const bots: Array<{ larkAppId: string; botName?: string }> = Array.isArray(body?.bots) ? body.bots : [];
+  return Promise.all(bots.map(async bot => ({ ...bot, ...await loadDocWatches(bot.larkAppId) })));
+}
+
+export function docWatchUrl(row: DocWatchRow): string | null {
+  const paths: Record<string, string> = {
+    docx: 'docx', doc: 'docs', sheet: 'sheets', bitable: 'base', slides: 'slides', mindnote: 'mindnote',
+  };
+  const path = Object.hasOwn(paths, row.fileType) ? paths[row.fileType] : undefined;
+  return path ? `https://feishu.cn/${path}/${encodeURIComponent(row.fileToken)}` : null;
 }
 
 export async function loadDocWatches(larkAppId: string): Promise<{ watches: DocWatchRow[]; error?: string }> {
@@ -155,13 +172,19 @@ export function outcomeMeta(o: DocWatchOutcome | undefined): {
     case 'empty-text':
       return { kind: 'warn', label: '纯 @ 无正文', hint: '有人 @ 了 bot 但一个字没打；文档里已留 ❌ 标记' };
     case 'no-comment':
-      return { kind: 'warn', label: '读不到评论正文', hint: '拉取评论失败（权限/网络）；文档里已留 ❌ 标记' };
+      return { kind: 'error', label: '读不到评论正文', hint: '评论未投递给会话；请查看具体错误并检查文档权限、授权或网络' };
     case 'trigger-missing':
       return { kind: 'warn', label: '回复串未补全', hint: '飞书分页未补全，这条评论的正文读不到' };
     case 'audit-rejected':
       return { kind: 'error', label: '审计门拒绝', hint: '非 owner 触发且通知 owner 失败 —— 已拒绝回复' };
     case 'poll-failed':
       return { kind: 'error', label: '轮询失败', hint: '应用身份读该文档失败：功能配着但不会再触发，需要处理' };
+    case 'poll-circuit-open':
+      return {
+        kind: 'error',
+        label: '监听已熔断',
+        hint: '连续返回永久错误（失权/删除）：已停止高频空轮询，转为 10 分钟慢探测；恢复授权或重新拉回后自动回岗',
+      };
     default:
       return { kind: 'normal', label: '尚无记录', hint: '自升级以来还没有评论事件命中这篇文档' };
   }

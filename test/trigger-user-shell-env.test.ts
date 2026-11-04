@@ -11,6 +11,7 @@ import {
   GIT_ASKPASS_BASENAME,
   IDENTITY_DENIED_EXIT_CODE,
   installIdentityWrapper,
+  prepareTriggerUserCliEnv,
   publishActiveTurn,
   sessionIdentityBinDir,
   writeSessionIdentity,
@@ -85,6 +86,41 @@ describe('worker trigger-user shell contract', () => {
   });
 });
 
+describe('wrapper rendering model (review gate: no resolver argv on legacy paths)', () => {
+  function install(model: 'single' | 'proven', execution?: { appId: string; ipcPort?: number }): string {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-wrapper-model-'));
+    const realTool = join(dataDir, 'bytedcli');
+    writeFileSync(realTool, '#!/bin/sh\nprintf ok\n', { mode: 0o755 });
+    const shellEnv: Record<string, string> = { PATH: dataDir };
+    const log = () => {};
+    prepareTriggerUserCliEnv(
+      shellEnv, dataDir, 'gate-session',
+      { enabled: true, tools: ['bytedcli'] } as any, log, model, execution,
+    );
+    const wrapper = join(shellEnv.BOTMUX_IDENTITY_BIN!, 'bytedcli');
+    return readFileSync(wrapper, 'utf8');
+  }
+
+  it('renders NO cli-identity-runner argv and NO --ipc-port for the single model', () => {
+    const text = install('single');
+    expect(text).not.toContain('cli-identity-runner');
+    expect(text).not.toContain('--ipc-port');
+    // It uses the legacy single-file source block instead.
+    expect(text).toContain('.data"');
+  });
+
+  it('renders the runner argv and eval block for the proven model', () => {
+    const text = install('proven', { appId: 'cli_app', ipcPort: 12345 });
+    expect(text).toContain('cli-identity-runner');
+    expect(text).toContain('--ipc-port');
+    expect(text).toContain('12345');
+    expect(text).toContain('eval "$__botmux_cred_body"');
+    // Proven wrapper must never name a turns/ path or source a disk file.
+    expect(text).not.toContain('turns/');
+    expect(text).not.toContain('. "$__botmux_cred"');
+  });
+});
+
 describe.each([
   ['traex', createTraexAdapter],
   ['codex', createCodexAdapter],
@@ -114,7 +150,7 @@ describe.each([
       const shellEnv = workerShellEnv(dataDir);
       const realTool = join(dataDir, 'real-tool');
       writeFileSync(realTool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n', { mode: 0o755 });
-      const wrapper = installIdentityWrapper(shellEnv.BOTMUX_IDENTITY_BIN, 'bytedcli', realTool)!;
+      const wrapper = installIdentityWrapper(shellEnv.BOTMUX_IDENTITY_BIN, 'bytedcli', realTool, 'single')!;
       const args = createAdapter('/bin/cli').buildArgs({
         sessionId: 'native-session',
         resume,
@@ -143,6 +179,11 @@ describe.each([
         expect(run(missing)).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
       }
       publishActiveTurn(dataDir, 'botmux-session', 'turn-a');
+      // Single-snapshot model: B's publication overwrote the only file (stamped
+      // turn-b), so pointing the marker back at turn-a is a mismatch and denies.
+      // Per-turn tail access across overwrite is the proven model's contract.
+      expect(run()).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
+      publishActiveTurn(dataDir, 'botmux-session', 'turn-unprepared');
       expect(run()).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, stdout: '' });
     } finally {
       rmSync(dataDir, { recursive: true, force: true });

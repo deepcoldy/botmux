@@ -44,7 +44,9 @@ import {
   statSync,
   type Dirent,
 } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
+import { isTraexQuotaError, TRAEX_QUOTA_ERROR_CODE } from './traex-quota.js';
 import {
   splitCodexEventsByCutoff,
   extractLastCodexTurn,
@@ -68,8 +70,9 @@ import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
 import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
-import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
+import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
@@ -95,6 +98,9 @@ export interface TraexDrainOptions {
    *  different offset and must not disturb the production drainer's pending
    *  turn state. */
   probe?: boolean;
+  /** Restart scans need activity from a bounded tail that can start mid-turn.
+   *  Submit-confirmation probes keep their existing user/terminal-only output. */
+  includeHistoryCot?: boolean;
 }
 
 export interface TraexRuntimeSnapshot {
@@ -248,8 +254,18 @@ function normalizeTraexThreadDetails(row: TraexThreadRow | undefined): TraexThre
   const botmuxOrigin = firstUserMessage !== undefined && isBotmuxShapedText(firstUserMessage);
   // Display safety, not origin: a title that is itself an envelope / the goal
   // objective (≤0.207 defaulted the title to the first prompt) is never shown.
-  const title = [nonEmptyString(row?.name), nonEmptyString(row?.title)]
+  // An envelope-less bare (transcript + solo) follow-up also defaults to the
+  // first prompt on ≤0.207 DBs; structural origin detection can't see that
+  // shape, so strip botmux's appended internal <botmux_formatting> block from
+  // the display title here (#2716). This one normalizer feeds both the picker
+  // resume row (RolloutSessionMetadata.title) and readTraexThreadTitle.
+  const rawTitle = [nonEmptyString(row?.name), nonEmptyString(row?.title)]
     .find(text => text !== undefined && !isBotmuxShapedText(text));
+  // Consumers (readTraexThreadTitle, discovery truncateTitle) already collapse
+  // whitespace, so keep the strip block-only here. A title that consisted
+  // entirely of internal blocks drops to undefined (same as an empty title).
+  const strippedTitle = rawTitle === undefined ? undefined : stripBotmuxDisplayBlocks(rawTitle);
+  const title = strippedTitle !== undefined && strippedTitle.trim() ? strippedTitle : undefined;
   return {
     id,
     ...(title ? { title } : {}),
@@ -414,6 +430,13 @@ const TRAEX_PENDING_AGENT_ITEMS_PER_TURN_MAX = 64;
  * rollout. Keep de-duplication scoped to a rollout and its stable turn id:
  * identical prompts in distinct turns must remain distinct local turns. */
 const traexSeenUserTurns = new Map<string, Map<string, string | undefined>>();
+/** One native turn may contain several real UserMessage items. Track their
+ * ids separately from the legacy turn-level mirror claim. */
+interface TraexSeenUserItems {
+  messages: Map<string, string>;
+  turnCounts: Map<string, number>;
+}
+const traexSeenUserItems = new Map<string, TraexSeenUserItems>();
 /** TraeX can write the legacy and item_completed user records in either order.
  * Remember the one missing counterpart across incremental drains. The state
  * belongs only to the currently open native turn and is cleared at its
@@ -439,6 +462,27 @@ const TRAEX_SEEN_USER_TURN_PATHS_MAX = 512;
 const TRAEX_SEEN_USER_TURNS_PER_PATH_MAX = 4096;
 const TRAEX_PENDING_USER_MIRRORS_PER_PATH_MAX = 64;
 const TRAEX_LEGACY_USER_MIRROR_WINDOW_MS = 5_000;
+
+function claimTraexUserItem(
+  seen: TraexSeenUserItems,
+  turnId: string | undefined,
+  itemId: string | undefined,
+): 'first' | 'additional' | 'duplicate' | undefined {
+  if (!turnId || !itemId) return undefined;
+  const key = JSON.stringify([turnId, itemId]);
+  if (seen.messages.has(key)) return 'duplicate';
+  const count = seen.turnCounts.get(turnId) ?? 0;
+  seen.messages.set(key, turnId);
+  seen.turnCounts.set(turnId, count + 1);
+  if (seen.messages.size > TRAEX_SEEN_USER_TURNS_PER_PATH_MAX) {
+    const [oldestKey, oldestTurn] = seen.messages.entries().next().value!;
+    seen.messages.delete(oldestKey);
+    const remaining = seen.turnCounts.get(oldestTurn)! - 1;
+    if (remaining > 0) seen.turnCounts.set(oldestTurn, remaining);
+    else seen.turnCounts.delete(oldestTurn);
+  }
+  return count > 0 ? 'additional' : 'first';
+}
 
 function claimTraexUserTurn(path: string, turnId: unknown, legacyStateKey?: string): boolean {
   if (typeof turnId !== 'string' || turnId.length === 0) return true;
@@ -531,7 +575,14 @@ function takeTraexUserMirrorAtTerminal(
   // cannot consume a source-less candidate belonging to a typed-ahead turn.
   const exactIndex = pending.findIndex(candidate => candidate.sourceTurnId === sourceTurnId);
   if (exactIndex >= 0) {
-    return pending.splice(exactIndex, 1)[0];
+    const exact = pending[exactIndex];
+    // Every item in a merged turn shares this one terminal. Leaving another
+    // item's legacy mirror behind can swallow a same-text input in the next
+    // native turn while the short mirror window is still open.
+    for (let i = pending.length - 1; i >= 0; i--) {
+      if (pending[i].sourceTurnId === sourceTurnId) pending.splice(i, 1);
+    }
+    return exact;
   }
   if (legacyStateKey !== undefined) {
     const replayIndex = pending.findIndex(candidate => candidate.agentStateKey === legacyStateKey);
@@ -919,6 +970,15 @@ export function drainTraexRollout(
 
   const events: CodexBridgeEvent[] = [];
   const seenUserTurns = new Set<string>();
+  const freshUserItems = (): TraexSeenUserItems => ({ messages: new Map(), turnCounts: new Map() });
+  const seenUserItems = probe ? freshUserItems()
+    : (traexSeenUserItems.get(path) ?? freshUserItems());
+  if (!probe && !traexSeenUserItems.has(path)) {
+    traexSeenUserItems.set(path, seenUserItems);
+    if (traexSeenUserItems.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
+      traexSeenUserItems.delete(traexSeenUserItems.keys().next().value!);
+    }
+  }
   const pendingUserMirrors: TraexDrainUserMirror[] = probe
     ? []
     : (traexPendingUserMirrors.get(path) ?? []).map(candidate => ({ ...candidate }));
@@ -966,14 +1026,52 @@ export function drainTraexRollout(
     const sourceTurnId = typeof payload.turn_id === 'string' && payload.turn_id.length > 0
       ? payload.turn_id
       : undefined;
+    // A cold or MCP-heavy first turn can persist task_started long before the
+    // UserMessage display completion (observed gaps of 90-117s). Surface the
+    // native lifecycle edge so the queue holds a provisional claim instead of
+    // expiring the short pre-start lease while TraeX is running the turn.
+    // Nested turns (root_turn_id differs) never start a Lark turn.
+    if (obj.type === 'event_msg'
+      && payload.type === 'task_started'
+      && sourceTurnId
+      && (payload.root_turn_id === undefined || payload.root_turn_id === sourceTurnId)) {
+      events.push({ ...base, kind: 'turn_started', text: '', sourceTurnId });
+      continue;
+    }
+    // New TraeX rollouts persist genuine user input only in history_mutation.
+    // Require the runtime's user.text provenance and matching native turn ID:
+    // plain role=user also includes AGENTS/environment/runtime injections.
+    if (obj.type === 'history_mutation' && payload.operation === 'append'
+      && sourceTurnId && Array.isArray(payload.items)) {
+      for (const item of payload.items) {
+        const meta = item?.internal_chat_message_metadata_passthrough;
+        if (item?.type !== 'message' || item.role !== 'user'
+          || meta?.turn_id !== sourceTurnId || !Array.isArray(meta.content_item_kinds)
+          || !meta.content_item_kinds.includes('user.text') || !Array.isArray(item.content)) continue;
+        const text = item.content.flatMap((block: any) => block?.type === 'input_text'
+          && typeof block.text === 'string' ? [block.text] : []).join('');
+        if (text && claimUserTurn(sourceTurnId)) {
+          events.push({ ...base, kind: 'user', text, sourceTurnId });
+          if (!probe) {
+            // Forward the no-turn-id pending bucket to this turn, mirroring the
+            // legacy user_message / item_completed user edges. Do NOT delete any
+            // pending bucket: assistant evidence for this same turn can already
+            // be buffered (item_completed AgentMessage observed before the user
+            // edge), and a type-ahead next turn's edge must not discard the
+            // previous turn's pending final either.
+            traexPendingAgentTurns(path).activeKey = sourceTurnId;
+          }
+        }
+      }
+    }
     // The append-only history is TraeX's canonical model/tool timeline. Its
     // event_msg records mirror reasoning and tool completion, so consuming
     // those too would duplicate nodes. One mutation can carry parallel calls
     // or results; preserve their item order in one cosmetic event.
-    if (!probe && obj.type === 'history_mutation') {
+    if ((!probe || opts?.includeHistoryCot === true) && obj.type === 'history_mutation') {
       const cotEntries = traexHistoryCotEntries(payload, sourceSessionId);
       if (cotEntries && cotEntries.length > 0) {
-        if (sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
+        if (!probe && sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
         events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });
       }
       continue;
@@ -1013,7 +1111,13 @@ export function drainTraexRollout(
       && payload.type === 'item_completed') {
       const userText = itemCompletedUserText(payload.item);
       if (userText) {
-        if (claimUserTurn(payload.turn_id)) {
+        const sourceMessageId = typeof payload.item.id === 'string' && payload.item.id
+          ? payload.item.id : undefined;
+        const itemClaim = claimTraexUserItem(seenUserItems, sourceTurnId, sourceMessageId);
+        // A duplicate can still bind a replayed id-less legacy record's
+        // assistant bucket below; suppress its user edge, not that hydration.
+        const firstUserInTurn = itemClaim !== 'duplicate' && claimUserTurn(payload.turn_id);
+        if (firstUserInTurn || itemClaim === 'additional') {
           // Legacy user_message records did not always carry a turn id. When
           // the same drain also contains their 0.201.4 UserMessage mirror,
           // replace the uncorrelatable legacy event with the turn-addressable
@@ -1026,9 +1130,11 @@ export function drainTraexRollout(
             events[legacyIndex] = {
               ...events[legacyIndex],
               ...(sourceTurnId ? { sourceTurnId } : {}),
+              ...(sourceMessageId ? { sourceMessageId } : {}),
             };
           } else if (expectedMirror?.expected === 'item' && sourceTurnId) {
-            events.push({ ...base, kind: 'turn_bind', text: '', sourceTurnId });
+            events.push({ ...base, kind: 'turn_bind', text: '', sourceTurnId,
+              ...(sourceMessageId ? { sourceMessageId } : {}) });
           } else if (!expectedMirror) {
             const preserveCollecting = shouldPreserveUnboundLegacyPredecessor(
               pendingUserMirrors, sourceTurnId, base.timestampMs,
@@ -1038,6 +1144,7 @@ export function drainTraexRollout(
               kind: 'user',
               text: userText,
               ...(sourceTurnId ? { sourceTurnId } : {}),
+              ...(sourceMessageId ? { sourceMessageId } : {}),
               ...(preserveCollecting ? { preserveCollecting: true } : {}),
             });
           }
@@ -1171,7 +1278,9 @@ export function drainTraexRollout(
         // the real reason instead of an empty-final alert.
         ...(failed ? {
           terminalStatus: 'failed' as const,
-          terminalErrorCode: isExactCodexOutputLimitError(payload.error)
+          terminalErrorCode: isTraexQuotaError(payload.error)
+            ? TRAEX_QUOTA_ERROR_CODE
+            : isExactCodexOutputLimitError(payload.error)
             ? CODEX_OUTPUT_LIMIT_ERROR_CODE
             : codexTaskFailureCode(payload.error),
           terminalErrorSummary: safeFailureSummary(payload.error),
@@ -1498,7 +1607,12 @@ export function findTraexThreadByPid(
       .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
     const selected = candidates.find(row => row.source === 'user') ?? candidates[0];
     if (!selected?.id) return undefined;
-    const title = String(selected.title || selected.firstMessage || '').replace(/\s+/g, ' ').trim();
+    // Both columns can mirror the first prompt on ≤0.207/0.210 DBs; an
+    // envelope-less bare (transcript + solo) follow-up there carries the
+    // appended <botmux_formatting> block — strip before it reaches the orca
+    // live /adopt card title (#2716).
+    const rawTitleSource = String(selected.title || selected.firstMessage || '');
+    const title = stripBotmuxDisplayBlocks(rawTitleSource).replace(/\s+/g, ' ').trim();
     const titleChars = Array.from(title);
     return {
       cliSessionId: selected.id,
@@ -1566,10 +1680,11 @@ function isCanonicalTraexRolloutPath(
 function findIndexedTraexRollout(
   cliSessionId: string,
   sessionsRoot: string,
+  dbPath?: string,
 ): string | undefined {
   const rows = withTraeDb((db) => db.prepare(
     'SELECT rollout_path AS rolloutPath FROM threads WHERE id = ? LIMIT 1',
-  ).all(cliSessionId) as { rolloutPath?: string }[]) ?? [];
+  ).all(cliSessionId) as { rolloutPath?: string }[], dbPath) ?? [];
   const path = rows[0]?.rolloutPath;
   if (typeof path !== 'string'
     || !isCanonicalTraexRolloutPath(path, sessionsRoot)
@@ -1632,6 +1747,12 @@ function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
 
 /** Locate the rollout file for a given TRAE session UUID.
  *
+ * `traeHomePath` optionally overrides the TRAE data root for THIS lookup
+ * (sessions root + state DB both derive from it); callers that need to probe
+ * the default root while a different TRAE_HOME is in effect pass it explicitly
+ * instead of mutating process.env — the finders are re-entrant and the worker
+ * has async bridge readers that share process.env.
+ *
  * TRAE's `threads` table is the authoritative session→path index. Older TRAE
  * versions may not expose `rollout_path`, so lookup degrades to the documented
  * `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl` tree. Newer releases may
@@ -1641,12 +1762,13 @@ function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
  * `rollout-blobs`), whose contents cannot be top-level sessions and may span
  * gigabytes. Repeated fallback misses are backed off, while the cheap indexed
  * lookup remains live on every late-attach tick. */
-export function findTraexRolloutBySessionId(cliSessionId: string): string | undefined {
+export function findTraexRolloutBySessionId(cliSessionId: string, traeHomePath?: string): string | undefined {
   if (!cliSessionId) return undefined;
-  const sessionsRoot = traeSessionsRoot();
+  const sessionsRoot = traeHomePath ? join(traeHomePath, 'cli', 'sessions') : traeSessionsRoot();
+  const dbPath = traeHomePath ? join(traeHomePath, 'cli', 'state_5.sqlite') : traeStateDbPath();
   const missKey = `${sessionsRoot}\0${cliSessionId.toLowerCase()}`;
 
-  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot);
+  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot, dbPath);
   if (indexed) {
     traexRolloutLookupMisses.delete(missKey);
     return indexed;
@@ -1666,6 +1788,21 @@ export function findTraexRolloutBySessionId(cliSessionId: string): string | unde
   return undefined;
 }
 
+
+/**
+ * The default-root path when `cliSessionId` has a rollout under the default
+ * ~/.trae but none under the TRAE_HOME in effect (a bot that got its own
+ * TRAE_HOME after the session started there); undefined otherwise, including
+ * when no TRAE_HOME override is in effect. The default-root lookup passes the
+ * root as an argument — never temporarily rewrites process.env, which async
+ * bridge readers share.
+ */
+export function traexResumeTargetLeftInDefaultHome(cliSessionId: string): string | undefined {
+  const defaultHome = join(homedir(), '.trae');
+  if (!cliSessionId || traeHome() === defaultHome) return undefined;
+  if (findTraexRolloutBySessionId(cliSessionId)) return undefined;
+  return findTraexRolloutBySessionId(cliSessionId, defaultHome) ? defaultHome : undefined;
+}
 
 /** Find the newest TRAE native session whose first prompt contains Botmux's
  *  session id. This mirrors Codex's history.jsonl bridge, but TRAE keeps the

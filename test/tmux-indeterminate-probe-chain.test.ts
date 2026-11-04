@@ -68,6 +68,7 @@ import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import type { SessionProbe } from '../src/adapters/backend/types.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
+import { takePaneLaunchFile } from './helpers/pane-launch.js';
 
 setStartupTmuxRetrySleepForTests(() => {});
 
@@ -251,7 +252,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
     expect(backend.isReattach).toBe(true);
 
     const willReattachPersistent = selected.isReattach === true;
-    backend.spawn('gemini', ['-i', 'first user message'], {
+    backend.spawn('opencode', ['-i', 'first user message'], {
       cwd: '/tmp', cols: 200, rows: 50,
       env: process.env as Record<string, string>,
       strictEnvReattach: willReattachPersistent,
@@ -313,7 +314,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
       const { selected } = runChain();
       const exits: unknown[] = [];
       selected.backend.onExit((code, signal) => exits.push([code, signal]));
-      expect(() => selected.backend.spawn('gemini', ['-i', 'first user message'], {
+      expect(() => selected.backend.spawn('opencode', ['-i', 'first user message'], {
         cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
         strictEnvReattach: true,
       })).toThrow();
@@ -332,12 +333,13 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
     expect(gate.action).toBe('spawn');
     expect(reconciled).toBe('missing');
     expect(selected.isReattach).toBe(false);
-    selected.backend.spawn('gemini', ['-i', 'first user message'], {
+    selected.backend.spawn('opencode', ['-i', 'first user message'], {
       cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
     });
     const newSession = mockedExecFileSync.mock.calls.find(c => (c[1] as string[]).includes('new-session'));
     expect(newSession).toBeDefined();
-    expect((newSession![1] as string[]).join(' ')).toContain('first user message');
+    // The CLI argv reaches the pane through its launch file, not the tmux command.
+    expect(takePaneLaunchFile(newSession![1] as string[]).body).toContain(`'first user message'`);
   });
 
   it('keeps the fresh-path invariant: a predicted-fresh create that collides throws (no duplicate swallowing)', () => {
@@ -352,7 +354,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
       return Buffer.from('') as any;
     }) as any);
     const selected = selectSessionBackend({ sessionId: SESSION_ID, backendType: 'tmux', hasExistingSession: false });
-    expect(() => selected.backend.spawn('gemini', [], {
+    expect(() => selected.backend.spawn('opencode', [], {
       cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
     })).toThrow(/duplicate/);
   });

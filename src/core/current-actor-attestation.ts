@@ -299,8 +299,8 @@ export function attestCurrentExecutionLoopbackPeer(
   };
 }
 
-/** Human identity remains a separate requirement for actor and authorization
- * callers. Machine-triggered executions can prove their lineage without it. */
+/** Human identity remains a separate requirement for actor callers.
+ * Machine-triggered executions can prove their lineage without it. */
 export function attestCurrentTurnLoopbackPeer(
   input: CurrentTurnPeerAttestationInput,
 ): CurrentTurnPeerAttestation | null {
@@ -313,10 +313,10 @@ export function attestCurrentTurnLoopbackPeer(
  *  one an earlier attestation froze, so an await in between cannot smuggle in a
  *  rotated turn, replaced worker, or changed sender. */
 export function currentTurnPeerAttestationStable(
-  frozen: CurrentTurnPeerAttestation,
+  frozen: CurrentExecutionPeerAttestation,
   input: CurrentTurnPeerAttestationInput,
 ): boolean {
-  const again = attestCurrentTurnLoopbackPeer(input);
+  const again = attestCurrentExecutionLoopbackPeer(input);
   return !!again
     && again.ds === frozen.ds && again.turnId === frozen.turnId
     && again.generation === frozen.generation && again.callerOpenId === frozen.callerOpenId

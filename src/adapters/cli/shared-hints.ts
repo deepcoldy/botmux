@@ -6,7 +6,7 @@
  * push `buildBotmuxSystemPromptText` via that flag instead:
  *   - Claude Code / genius: `--append-system-prompt`
  *   - Grok: `--rules` (docs: Claude's append alias)
- * This constant is only for CLIs without such a flag (coco / codex / gemini /
+ * This constant is only for CLIs without such a flag (coco / codex /
  * opencode / aiden / mtr / hermes / …).
  *
  * Each array element becomes one line inside the `<botmux_routing>` XML block
@@ -15,6 +15,7 @@
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
+import { workflowSessionKind, workflowSessionPolicy, type WorkflowSessionKind } from '../../workflows/session-kind.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
@@ -49,9 +50,13 @@ function workflowDiscoveryHintText(locale?: Locale): string {
 
 /** Keep Workflow discoverable even when the full skill catalog is not injected.
  *  Gated by the machine-wide workflow switch (isWorkflowFeatureEnabled) so a
- *  disabled host never advertises `/workflow`; returns undefined when off. */
-function workflowDiscoveryHint(locale?: Locale): string | undefined {
+ *  disabled host never advertises `/workflow`; returns undefined when off.
+ *  A session executing a workflow node (either kind, workflows/session-kind.ts)
+ *  must not be told to offer starting one, so it never gets it. In-worker
+ *  callers read the kind from env; daemon-side builders pass the session's. */
+function workflowDiscoveryHint(locale?: Locale, opts: { sessionKind?: WorkflowSessionKind } = {}): string | undefined {
   if (!isWorkflowFeatureEnabled()) return undefined;
+  if (!workflowSessionPolicy(opts.sessionKind ?? workflowSessionKind()).discoveryHint) return undefined;
   return workflowDiscoveryHintText(locale);
 }
 
@@ -99,11 +104,24 @@ function cursorBackgroundTaskNote(cliId: CliId | undefined, transcript: boolean,
   return [t(transcript ? 'ai.cursor.background_task_note_transcript' : 'ai.cursor.background_task_note', undefined, locale)];
 }
 
+/** ZCode-only interim-report line. ZCode emits nothing of its own mid-turn, so
+ *  a long task is indistinguishable from a hang unless the model says
+ *  something. The equivalent line used to live in the adapter's `systemHints`
+ *  array, which nothing reads — `buildBotmuxShellHints` is the only channel
+ *  that actually reaches the model, so the instruction has to be here.
+ *  Deliberately not transcript-only: in `send` mode the model needs `botmux
+ *  send` for the update, and in transcript mode the wording still holds. */
+function zcodeProgressReportNote(cliId: CliId | undefined, locale?: Locale): string[] {
+  if (cliId !== 'zcode') return [];
+  return [t('ai.zcode.progress_report', undefined, locale)];
+}
+
 export function buildBotmuxShellHints(
   locale?: Locale,
   noTransport?: boolean,
   replyDelivery?: ReplyDelivery,
   cliId?: CliId,
+  opts: { sessionKind?: WorkflowSessionKind } = {},
 ): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
@@ -122,7 +140,7 @@ export function buildBotmuxShellHints(
   // mention_gate / feedback / 反重发提示全部不注入（附件、跨 bot @ 等场景模型可经
   // 内置 botmux-send skill 自行发现）。缺省 / 'send' 时下面每一行与改动前逐字相同。
   const transcript = replyDelivery === 'transcript';
-  const workflowHint = workflowDiscoveryHint(locale);
+  const workflowHint = workflowDiscoveryHint(locale, opts);
   const hints = (transcript
     ? [
       t('ai.shell.intro_transcript', undefined, locale),
@@ -133,6 +151,7 @@ export function buildBotmuxShellHints(
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       ...cursorBackgroundTaskNote(cliId, true, locale),
+      ...zcodeProgressReportNote(cliId, locale),
       hiddenContextDefense(locale),
     ]
     : [
@@ -154,6 +173,7 @@ export function buildBotmuxShellHints(
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       ...cursorBackgroundTaskNote(cliId, false, locale),
+      ...zcodeProgressReportNote(cliId, locale),
       hiddenContextDefense(locale),
     ]).map(escapeXmlTagLikeTokens);
   if (whiteboardEnabled()) {

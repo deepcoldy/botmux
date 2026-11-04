@@ -68,6 +68,9 @@ export function decideSubmitConfirmationAction(input: SubmitConfirmationDecision
 
 export interface StructuredSubmitLifecycleController {
   hasPendingTurn(turnId: string, dispatchAttempt?: number): boolean;
+  /** The exact attempt is still queued but already closed by its native
+   *  terminal (e.g. FIFO-held behind an unfinished predecessor). */
+  hasTerminalTurn(turnId: string, dispatchAttempt?: number): boolean;
   confirmPendingTurn(turnId: string, confirmedAtMs?: number, dispatchAttempt?: number): boolean;
   finishSubmitVerification(turnId: string, finishedAtMs?: number, dispatchAttempt?: number): boolean;
 }
@@ -93,6 +96,8 @@ export interface CurrentDeferredSubmitConfirmationSettlement {
   cliSessionId?: string;
   /** Positive native ownership reported by the recheck, when the adapter can prove it. */
   ownershipProven?: boolean;
+  /** Not-yet-owned session id candidate reported by the recheck (see SubmitRecheckResult). */
+  unprovenCliSessionId?: string;
   recheckError?: unknown;
   lifecycle: 'confirmed' | 'verification-finished' | 'unchanged';
 }
@@ -136,13 +141,21 @@ export async function settleDeferredSubmitConfirmation(
   controller: StructuredSubmitLifecycleController,
   input: DeferredSubmitConfirmationInput,
 ): Promise<DeferredSubmitConfirmationSettlement> {
+  const closedButUndrained = (): boolean => !!input.structuredTarget && !!input.turnId
+    && controller.hasTerminalTurn(input.turnId, input.dispatchAttempt);
   const targetStillCurrent = (): StaleDeferredSubmitConfirmationSettlement | undefined => {
     if (input.isCurrent && !input.isCurrent()) {
       return { stale: true, staleReason: 'generation', lifecycle: 'unchanged' };
     }
+    // Only a missing exact attempt (pruned, or replaced by attempt N+1) is
+    // stale. A closed-but-undrained attempt is the same delivery with a native
+    // terminal: discarding its recheck would drop the input-delivery
+    // quarantine's only release while that terminal waits behind its FIFO
+    // predecessor, holding every later input in BotMux (#2642).
     if (input.structuredTarget
       && input.turnId
-      && !controller.hasPendingTurn(input.turnId, input.dispatchAttempt)) {
+      && !controller.hasPendingTurn(input.turnId, input.dispatchAttempt)
+      && !closedButUndrained()) {
       return { stale: true, staleReason: 'attempt', lifecycle: 'unchanged' };
     }
     return undefined;
@@ -152,9 +165,21 @@ export async function settleDeferredSubmitConfirmation(
   // function is called. Never run its old adapter closure against a new CLI.
   const staleBeforeRecheck = targetStillCurrent();
   if (staleBeforeRecheck) return staleBeforeRecheck;
+  // Its native terminal already proves the submit, and the FIFO drain owns its
+  // final/terminal. Settle as structured success without the adapter recheck:
+  // a missed receipt plus usage-limit/no-activity must not fail or drop a
+  // turn that has already answered.
+  if (closedButUndrained()) {
+    return {
+      stale: false,
+      action: { kind: 'suppress-active', evidence: 'structured-transcript' },
+      lifecycle: 'unchanged',
+    };
+  }
 
   let recheckSubmitted = false;
   let cliSessionId: string | undefined;
+  let unprovenCliSessionId: string | undefined;
   let ownershipProven = false;
   let recheckError: unknown;
   if (input.recheck) {
@@ -164,6 +189,9 @@ export async function settleDeferredSubmitConfirmation(
       ownershipProven = typeof result === 'object' && !!result && result.ownershipProven === true;
       cliSessionId = typeof result === 'object' && result && typeof result.cliSessionId === 'string'
         ? result.cliSessionId
+        : undefined;
+      unprovenCliSessionId = typeof result === 'object' && result && typeof result.unprovenCliSessionId === 'string'
+        ? result.unprovenCliSessionId
         : undefined;
     } catch (err) {
       recheckError = err;
@@ -199,6 +227,7 @@ export async function settleDeferredSubmitConfirmation(
     action,
     ...(cliSessionId ? { cliSessionId } : {}),
     ...(ownershipProven ? { ownershipProven: true } : {}),
+    ...(unprovenCliSessionId ? { unprovenCliSessionId } : {}),
     ...(recheckError !== undefined ? { recheckError } : {}),
     lifecycle,
   };

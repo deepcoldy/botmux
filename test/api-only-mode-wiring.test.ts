@@ -344,26 +344,44 @@ describe('source-structure guards (no injectable seam)', () => {
   });
 
   // 源码结构护栏(K2)：trusted caller 的 senderType 是消费方区分「真人」与「bot 自触发」的唯一依据（数据库账号映射、
-  // 审批门、审计归属都靠它）；五个 IM 入口（三个 inline + queue + ask）经 #2039 的 trustedCallerForInboundTurn
+  // 审批门、审计归属都靠它）；五个 IM 入口（三个 inline + queue + ask）加卡片点击入口，经 trustedCallerForInboundTurn
   // 包装、dispatch launch 仍走 trustedCallerForTurn，都在 daemon 闭包里没有 seam。不变量：inline IM 入口一律经
   // senderIsBotTriState（含 cross-ref 外部 bot 信号）推导，绝不用裸 sender_type 比较把 peer bot 写成 'user'；
   // queue/ask 只能转发同帧早先算好的三态局部量；dispatch launch 把直接触发者标成 bot，且 callerUnionId 证词绝不喂给
   // evaluateBotTalk。来历：#1145、#2039。
   it('every trusted caller stamps a tri-state sender type and never vouches for a bot as a person', () => {
     const inbound = callArgs(daemonSource, 'trustedCallerForInboundTurn');
-    expect(inbound).toHaveLength(5);
+    expect(inbound).toHaveLength(6);
+    // The card-click entry has no platform sender_type. It must pass the
+    // card-click predicate (peer cross-ref, identity-cache bot/app, and the
+    // three union-id bot tables) rather than a literal false, which would
+    // vouch a team bot as a person.
+    const cardEntries = inbound.filter(args => /cardClickOperatorIsBotOrApp\(/.test(args[3] ?? ''));
+    expect(cardEntries).toHaveLength(1);
+    expect(cardEntries[0]![3]).not.toMatch(/\bfalse\b/);
+    const cardPredicate = read('src/services/card-click-turn-bind.ts');
+    const predicateStart = cardPredicate.indexOf('export function cardClickOperatorIsBotOrApp');
+    const predicate = cardPredicate.slice(predicateStart, cardPredicate.indexOf('export function createCardClickTurnBinder', predicateStart));
+    expect(predicate).toContain('isKnownPeerBot(');
+    expect(predicate).toContain("type === 'bot'");
+    expect(predicate).toContain("type === 'app'");
+    expect(predicate).toContain('isTeamBot(');
+    expect(predicate).toContain('isPlatformTeamBot(');
+    expect(predicate).toContain('isTrustedSameOwnerSiblingBot(');
+    const humanEntries = inbound.filter(args => !/cardClickOperatorIsBotOrApp\(/.test(args[3] ?? ''));
+    expect(humanEntries).toHaveLength(5);
     // Three inline IM entries (new topic, principal-lane proposer, thread
     // reply) name parsed.senderType and the cross-ref foreign-bot leg at the
     // call site. The (?!false) lookahead rejects downgrading any single site
     // to a literal, which would vouch a peer bot as a person.
-    const inlineEntries = inbound.filter(args => args.some(a => /\bparsed\.senderType\b/.test(a)));
+    const inlineEntries = humanEntries.filter(args => args.some(a => /\bparsed\.senderType\b/.test(a)));
     expect(inlineEntries).toHaveLength(3);
     for (const args of inlineEntries) {
       expect(args[3], args.join(', ')).toMatch(/^senderIsBotTriState\(\s*parsed\.senderType\s*,\s*(?!false\b)\w+/);
     }
     // The queue and ask sites forward a tri-state value computed earlier in
     // the same frame; pin the local names so a boolean literal goes red.
-    const precomputedEntries = inbound.filter(args => !args.some(a => /\bparsed\.senderType\b/.test(a)));
+    const precomputedEntries = humanEntries.filter(args => !args.some(a => /\bparsed\.senderType\b/.test(a)));
     expect(precomputedEntries).toHaveLength(2);
     for (const args of precomputedEntries) {
       expect(args[3], args.join(', ')).toMatch(/^(?:senderIsBot|byType)$/);

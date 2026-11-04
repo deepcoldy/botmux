@@ -8,15 +8,22 @@
  * writes must complete first or a large response is silently truncated at the
  * sandbox boundary.
  *
- * This test acts as the mock host watcher: it waits for `<id>.req.json`, then
- * writes a `<id>.res.json` whose stdout/stderr are far past the ~146 KiB
- * partial-flush ceiling, and asserts the child delivers every byte and the
- * host's exit code. Both relay call sites (send + dispatch) share
- * `mirrorRelayResponseAndExit`, so this covers the shared mirror path.
+ * This file acts as the mock host watcher and pins three independent cases:
+ *   1. a large stdout AND stderr — the primary write-then-exit regression;
+ *   2. an EMPTY stdout with a large stderr — pins the stderr flush on its own;
+ *   3. a large stdout with an EMPTY stderr — pins the stdout flush on its own.
+ *      Cases 2 and 3 exist because awaiting one stream's drain keeps the whole
+ *      process alive, so a half-regression that leaves only the OTHER stream
+ *      fire-and-forget can ride that awaited drain to completion on Bun and
+ *      escape a combined-payload test. Each stream needs an empty partner: with
+ *      nothing else awaited, dropping its own await truncates deterministically.
  *
- * The child's stdout/stderr are kept paused until the response is on disk (see
- * `DRAIN_DELAY_MS`): without real pipe backpressure a write-then-exit
- * regression is not observed on every runtime.
+ * The child's stdout/stderr are paused before any 'data' listener is attached
+ * and only resumed `drainDelayMs` after the response lands on disk (see
+ * `DRAIN_DELAY_MS` / `SINGLE_STREAM_DRAIN_DELAY_MS`): without real pipe
+ * backpressure a write-then-exit regression is not observed on every runtime.
+ * Both relay call sites (send + dispatch) share `mirrorRelayResponseAndExit`,
+ * so the dispatch path covers the shared mirror logic.
  */
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -26,6 +33,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
+const DISPATCH_ARGS = ['--title', 'test', '--bot-app', 'cli_test', '--brief', 'hello'];
 
 /**
  * LOAD-BEARING — do not remove or shrink as a "magic number". The readers stay
@@ -39,6 +47,18 @@ const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
  */
 const DRAIN_DELAY_MS = 600;
 
+/**
+ * LOAD-BEARING for the single-large-stream cases (2 and 3) — larger than
+ * `DRAIN_DELAY_MS`. With only one oversized stream and the other empty, the
+ * child has no second stream's awaited drain keeping it alive, so under heavy
+ * host load (late 150 ms poll + scheduling) 600 ms can occasionally elapse
+ * before the child even reads the response, letting a fire-and-forget mutant
+ * of the sole stream exit only after the pipes resumed.
+ * 1500 ms = ten poll intervals; measured 20/20 caught on both runtimes on a
+ * contended box where 600 ms missed once on Node.
+ */
+const SINGLE_STREAM_DRAIN_DELAY_MS = 1500;
+
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -47,13 +67,14 @@ afterEach(() => {
   }
 });
 
+/** Spawn the dispatch relay child with both readers paused until the gate. */
 function runDispatchRelay(
   relayDir: string,
-  args: string[],
   responseWritten: Promise<void>,
+  drainDelayMs: number,
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawnTsScript(CLI_PATH, ['dispatch', ...args], {
+    const child = spawnTsScript(CLI_PATH, ['dispatch', ...DISPATCH_ARGS], {
       env: {
         ...process.env,
         SESSION_DATA_DIR: join(relayDir, 'data'),
@@ -67,16 +88,17 @@ function runDispatchRelay(
     let stderr = '';
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
-    // Pause before attaching 'data' listeners; the gate below resumes only
-    // after the host response is on disk plus DRAIN_DELAY_MS. Backpressure is
-    // what makes a missing pre-exit flush observable on both runtimes.
+    // Pause BEFORE attaching 'data' listeners (on Bun pausing after a listener
+    // is attached does not stop reads). The gate resumes only after the host
+    // response is on disk plus the load-bearing delay. Backpressure is what
+    // makes a missing pre-exit flush observable on both runtimes.
     child.stdout.pause();
     child.stderr.pause();
     responseWritten.then(() => {
       setTimeout(() => {
         child.stdout.resume();
         child.stderr.resume();
-      }, DRAIN_DELAY_MS);
+      }, drainDelayMs);
     });
     child.stdout.on('data', (chunk: string) => { stdout += chunk; });
     child.stderr.on('data', (chunk: string) => { stderr += chunk; });
@@ -85,47 +107,83 @@ function runDispatchRelay(
   });
 }
 
+/**
+ * Mock host watcher: resolve `responseWritten` once the first request is
+ * answered with an oversized `<id>.res.json`; the returned promise settles when
+ * the response file has been written.
+ */
+function mockHostWatcher(
+  relayDir: string,
+  stdout: string,
+  stderr: string,
+): { responseWritten: Promise<void>; watcher: Promise<void> } {
+  let releaseDrain!: () => void;
+  const responseWritten = new Promise<void>(resolve => { releaseDrain = resolve; });
+  const watcher = (async () => {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const req = readdirSync(relayDir).find(f => f.endsWith('.req.json'));
+      if (req) {
+        const id = req.slice(0, -'.req.json'.length);
+        writeFileSync(join(relayDir, `${id}.res.json`), JSON.stringify({
+          code: 7,
+          stdout,
+          stderr,
+        }));
+        releaseDrain();
+        return;
+      }
+      await new Promise(r => setTimeout(r, 20));
+    }
+    throw new Error('mock watcher timed out waiting for req.json');
+  })();
+  return { responseWritten, watcher };
+}
+
 describe('sandbox relay response mirror', () => {
   it('mirrors a host response past the flush ceiling without truncation', async () => {
     const relayDir = mkdtempSync(join(tmpdir(), 'botmux-relay-mirror-'));
     tempDirs.push(relayDir);
 
     const bigStdout = 'x'.repeat(300_000);
-    const bigStderr = 'y'.repeat(200_000);
+    const bigStderr = 'y'.repeat(300_000);
+    const { responseWritten, watcher } = mockHostWatcher(relayDir, bigStdout, bigStderr);
 
-    // Resolved by the mock watcher once the response file is complete on disk.
-    let releaseDrain!: () => void;
-    const responseWritten = new Promise<void>(resolve => { releaseDrain = resolve; });
-
-    // Mock host watcher: answer the first request with an oversized response.
-    const watcher = (async () => {
-      const deadline = Date.now() + 15_000;
-      while (Date.now() < deadline) {
-        const req = readdirSync(relayDir).find(f => f.endsWith('.req.json'));
-        if (req) {
-          const id = req.slice(0, -'.req.json'.length);
-          writeFileSync(join(relayDir, `${id}.res.json`), JSON.stringify({
-            code: 7,
-            stdout: bigStdout,
-            stderr: bigStderr,
-          }));
-          releaseDrain();
-          return;
-        }
-        await new Promise(r => setTimeout(r, 20));
-      }
-      throw new Error('mock watcher timed out waiting for req.json');
-    })();
-
-    const result = await runDispatchRelay(
-      relayDir,
-      ['--title', 'test', '--bot-app', 'cli_test', '--brief', 'hello'],
-      responseWritten,
-    );
+    const result = await runDispatchRelay(relayDir, responseWritten, DRAIN_DELAY_MS);
     await watcher;
 
     expect(result.status).toBe(7);
     expect(result.stdout).toBe(bigStdout);
     expect(result.stderr).toBe(bigStderr);
+  }, 30_000);
+
+  it('flushes a large stderr even when stdout carries no body', async () => {
+    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-relay-mirror-'));
+    tempDirs.push(relayDir);
+
+    const bigStderr = 'y'.repeat(300_000);
+    const { responseWritten, watcher } = mockHostWatcher(relayDir, '', bigStderr);
+
+    const result = await runDispatchRelay(relayDir, responseWritten, SINGLE_STREAM_DRAIN_DELAY_MS);
+    await watcher;
+
+    expect(result.status).toBe(7);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe(bigStderr);
+  }, 30_000);
+
+  it('flushes a large stdout even when stderr carries no body', async () => {
+    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-relay-mirror-'));
+    tempDirs.push(relayDir);
+
+    const bigStdout = 'x'.repeat(300_000);
+    const { responseWritten, watcher } = mockHostWatcher(relayDir, bigStdout, '');
+
+    const result = await runDispatchRelay(relayDir, responseWritten, SINGLE_STREAM_DRAIN_DELAY_MS);
+    await watcher;
+
+    expect(result.status).toBe(7);
+    expect(result.stdout).toBe(bigStdout);
+    expect(result.stderr).toBe('');
   }, 30_000);
 });

@@ -2,24 +2,16 @@ import { createBotTest } from './bot-test-factory.js';
 import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { existsSync } from 'node:fs';
 import {
-  createBrowser,
-  createPage,
-  createAgent,
-  checkPrerequisites,
-  STORAGE_STATE_PATH,
   testMessage,
   sendMessage,
-  navigateToMessenger,
   openChat,
   openThreadForMessage,
   clickDirectStartIfPresent,
   scrollThreadToBottom,
   waitForCodexSideResponse,
-  closeSession,
 } from './helpers.js';
-import { publishLabeledPageVideo } from './e2e-video.js';
+import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
 
 export function registerMidsceneSuites(): void {
   createBotTest('Codex', { allowCodexUsageLimitResponse: true });
@@ -31,30 +23,11 @@ export function registerMidsceneSuites(): void {
     let agent: PlaywrightAgent;
 
     beforeAll(async () => {
-      checkPrerequisites();
-      if (!existsSync(STORAGE_STATE_PATH)) {
-        throw new Error(
-          'storageState.json not found. Run: pnpm test:e2e-browser:setup',
-        );
-      }
-      browser = await createBrowser();
-      ({ context, page } = await createPage(browser));
-      agent = createAgent(page);
-
-      await navigateToMessenger(page);
-      await openChat(page, agent, 'Codex');
+      ({ browser, context, page, agent } = await openFeishuSession((p, a) => openChat(p, a, 'Codex')));
     });
 
     afterAll(async () => {
-      await closeSession(agent, page);
-      await agent?.destroy();
-      await context?.close();
-      try {
-        await publishLabeledPageVideo(page);
-      } catch (error) {
-        console.error('Feishu video publish failed:', error);
-      }
-      await browser?.close();
+      await releaseFeishuSession({ browser, context, page, agent }, { closeBotSession: true, publishVideo: true });
     });
 
     it('submits the wrapped Codex prompt and receives a Codex-side response', async () => {

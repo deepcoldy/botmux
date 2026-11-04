@@ -69,7 +69,18 @@ vi.mock('../src/services/session-store.js', () => ({
 const sendWorkerSessionInputMock = vi.fn();
 const isSessionTransferringMock = vi.fn(() => false);
 
-vi.mock('../src/core/worker-pool.js', () => ({
+vi.mock('../src/core/worker-pool.js', async () => {
+  const { supportsIdleAutoCompact } = await vi.importActual<typeof import('../src/core/idle-auto-compact.js')>('../src/core/idle-auto-compact.js');
+  return {
+  // Same projection as the real helper, over the pure support predicate.
+  sessionSupportsIdleAutoCompact: (ds: any) => supportsIdleAutoCompact({
+    cliId: ds.session.cliId ?? 'claude-code',
+    backendType: ds.initConfig?.backendType ?? ds.session.backendType,
+    codexRpcInput: ds.initConfig?.codexRpcInput === true,
+    adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom,
+    headless: !!ds.session.headless,
+    vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+  }),
   setSessionReasoningEffort: vi.fn(() => 'saved'),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
@@ -85,6 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   workerHasInitialized: vi.fn(() => true),
   sessionSupportsWebTerminal: vi.fn(() => true),
   readableTerminalUrlFor: vi.fn(() => 'https://example.com/term'),
+  liveReadableTerminalUrlFor: vi.fn(() => 'https://example.com/term'),
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: vi.fn(),
   deliverEphemeralOrReply: vi.fn(),
@@ -98,7 +110,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
   idleCardLabel: vi.fn(() => undefined),
   streamCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
-}));
+  };
+});
 
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
@@ -221,6 +234,13 @@ beforeEach(() => {
 // ─── stop_turn ────────────────────────────────────────────────────────────
 
 describe('stop_turn card action', () => {
+  it.each(['stop_turn', 'term_action'])('refuses %s while a native Antigravity fork is pending', async action => {
+    const ds = makeDs({ sessionOverrides: { cliId: 'antigravity', pendingForkSession: true } });
+    const result = await handleCardAction(actionData(action), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(result.toast.content).toContain('/close');
+    expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+  });
   it('stops the verified reply-card turn without replacing its answer with a terminal card', async () => {
     const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
     const replyCards = await import('../src/core/turn-reply-card.js');
@@ -390,7 +410,7 @@ describe('compact_session card action', () => {
   // mira/mir 把它当**普通用户消息**发给模型白烧一个 turn。router
   // （resolvePassthroughCommands）对这些 CLI 返回空集，handler 也必须拒——否则
   // 卡片侧闸门一旦再漏，这条路又会被打开（本次缺陷正是这么发生的）。
-  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app'])(
+  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app', 'minimax'])(
     'refuses for %s (no raw passthrough surface) instead of writing a literal /compact',
     async (cliId) => {
       const ds = makeDs({ sessionOverrides: { cliId } as any });
@@ -470,5 +490,81 @@ describe('reasoning selector card callback', () => {
     if (field === 'operator') vi.mocked(canOperate).mockReturnValue(false);
     await handleCardAction(data, depsWith(ds), LARK_APP_ID);
     expect(setSessionReasoningEffort).not.toHaveBeenCalled();
+  });
+});
+
+// ─── toggle_idle_compact ──────────────────────────────────────────────────
+
+describe('toggle_idle_compact card action', () => {
+  function toggle(desired?: 'on' | 'off', clicked = 'om_clicked'): any {
+    const data = actionData('toggle_idle_compact');
+    if (desired) data.action.value.desired = desired;
+    data.context.open_message_id = clicked;
+    return data;
+  }
+
+  it('turns the session on, persists it, and re-renders the clicked live card', async () => {
+    const store = await import('../src/services/session-store.js');
+    vi.mocked(store.updateSession).mockClear();
+    const ds = makeDs({ streamCardId: 'om_clicked' });
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.idleAutoCompact).toEqual({ enabled: true });
+    expect(store.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(result.toast.type).toBe('success');
+    expect(result.toast.content).toContain('55');
+    expect(result.card.type).toBe('raw');
+  });
+
+  it('turns it off; desired state makes stale-card double clicks idempotent', async () => {
+    const ds = makeDs();
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.idleAutoCompact?.enabled).toBe(true);
+    const result = await handleCardAction(toggle('off'), depsWith(ds), LARK_APP_ID);
+    expect(ds.session.idleAutoCompact?.enabled).toBe(false);
+    expect(result.toast.type).toBe('success');
+    // A frozen (non-live) card only gets a toast.
+    expect(result.card).toBeUndefined();
+  });
+
+  it('only changes the clicked session', async () => {
+    const ds = makeDs();
+    const other = makeDs({ sessionOverrides: { sessionId: 'sess-other' } });
+    await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(other.session.idleAutoCompact).toBeUndefined();
+  });
+
+  it('refuses unsupported CLIs without touching the session', async () => {
+    for (const cliId of ['gemini', 'codex-app']) {
+      const ds = makeDs({ sessionOverrides: { cliId } as any });
+      const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+      expect(result.toast.type, cliId).toBe('warning');
+      expect(ds.session.idleAutoCompact, cliId).toBeUndefined();
+    }
+  });
+
+  it('refuses adopted sessions', async () => {
+    const ds = makeDs({ adoptedFrom: { cliId: 'claude-code' } as any });
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.session.idleAutoCompact).toBeUndefined();
+  });
+
+  it('rolls back the in-memory setting when the save fails', async () => {
+    const store = await import('../src/services/session-store.js');
+    vi.mocked(store.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    const ds = makeDs();
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.session.idleAutoCompact).toBeUndefined();
+  });
+
+  it('non-operators are refused with a toast and nothing changes', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const ds = makeDs();
+    const result = await handleCardAction(toggle('on'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.session.idleAutoCompact).toBeUndefined();
+    expect(sensitiveCardActionMeta('toggle_idle_compact')).toBeDefined();
   });
 });

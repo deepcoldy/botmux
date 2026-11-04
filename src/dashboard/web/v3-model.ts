@@ -14,6 +14,141 @@ export const V3_NODE_LABEL: Record<RunNodeView['status'], string> = {
   failed: '失败',
 };
 
+/**
+ * The five states people read a workflow by, plus the three "this path did
+ * not run" states. Gate waits and blocked nodes both need a person, so they
+ * share one bucket; the node panel still names the precise raw state.
+ */
+export type V3DisplayStatus =
+  | 'waiting'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'needsHuman'
+  | 'skipped'
+  | 'cancelled'
+  | 'superseded';
+
+export const V3_DISPLAY_STATUS: Record<RunNodeView['status'], V3DisplayStatus> = {
+  pending: 'waiting',
+  running: 'running',
+  done: 'done',
+  failed: 'failed',
+  gateWaiting: 'needsHuman',
+  blocked: 'needsHuman',
+  skipped: 'skipped',
+  cancelled: 'cancelled',
+  superseded: 'superseded',
+};
+
+export const V3_DISPLAY_LABEL: Record<V3DisplayStatus, string> = {
+  waiting: '等待',
+  running: '进行中',
+  done: '完成',
+  failed: '失败',
+  needsHuman: '等人工确认',
+  skipped: '已跳过',
+  cancelled: '已取消',
+  superseded: '已替代',
+};
+
+/** Legend order: the five states first, then the not-run states. */
+export const V3_DISPLAY_LEGEND: V3DisplayStatus[] = [
+  'waiting', 'running', 'done', 'failed', 'needsHuman', 'skipped', 'cancelled',
+];
+
+export const V3_ATTEMPT_OUTCOME_LABEL: Record<string, string> = {
+  succeeded: '完成',
+  failed: '失败',
+  blocked: '受阻',
+  cancelled: '已取消',
+  interrupted: '中断',
+  superseded: '已替代',
+};
+
+/** Compact duration for an SVG node row: 45秒 / 6分 / 1时20分 / 2天3时. */
+export function formatV3Duration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}秒`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}分`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) {
+    const minutes = totalMinutes % 60;
+    return minutes ? `${totalHours}时${minutes}分` : `${totalHours}时`;
+  }
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours ? `${days}天${hours}时` : `${days}天`;
+}
+
+/** How long the node has been working (running) or worked (finished), measured
+ *  on the server clock carried by the view. Undefined when it never started. */
+export function nodeElapsedMs(node: RunNodeView, generatedAt: number): number | undefined {
+  if (node.startedAt === undefined) return undefined;
+  const end = node.endedAt ?? (node.status === 'running' ? generatedAt : undefined);
+  return end === undefined ? undefined : Math.max(0, end - node.startedAt);
+}
+
+/** How long a person has been needed: gate wait, or time since it blocked. */
+export function nodeWaitingMs(node: RunNodeView, generatedAt: number): number | undefined {
+  const since = node.status === 'gateWaiting'
+    ? node.gateSince
+    : node.status === 'blocked' ? node.endedAt : undefined;
+  return since === undefined ? undefined : Math.max(0, generatedAt - since);
+}
+
+/** A blocked node the main bot handed to a human (design §13.6). */
+export function nodeHandedToHuman(node: RunNodeView): boolean {
+  return node.status === 'blocked' && node.errorCode === 'HANDED_TO_HUMAN';
+}
+
+export const V3_INTERVENTION_LABEL: Record<NonNullable<RunNodeView['interventions']>[number]['kind'], string> = {
+  retry: '主 Bot 自动重试',
+  reassign: '主 Bot 自动改派',
+  rerun: '主 Bot 自动重做',
+  handedToHuman: '交给人决定',
+};
+
+export const V3_CHECKPOINT_LABEL: Record<NonNullable<RunNodeView['checkpoint']>, string> = {
+  holding: '检查点：等主 Bot 看完结果，后续节点暂停',
+  reviewed: '检查点：主 Bot 已看过结果',
+  notReviewed: '检查点：没等到主 Bot 看结果，已按原流程继续',
+};
+
+export const V3_INTERVENTION_ROLE_LABEL: Record<NonNullable<RunNodeView['interventions']>[number]['by'], string> = {
+  mainBot: '主 Bot',
+  initiator: '发起人',
+  other: '其他成员',
+};
+
+/** Third row of a graph node: display state, then elapsed / attempt count. */
+export function nodeStatusLine(node: RunNodeView, generatedAt: number | undefined): string {
+  const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
+  const parts = [label];
+  if (node.status === 'gateWaiting') parts.push('审批');
+  else if (node.status === 'pending' && node.waitingOnCheckpoint?.length) parts.push('等检查点');
+  else if (nodeHandedToHuman(node)) parts.push('交给人决定');
+  else if (node.status === 'blocked') parts.push('受阻');
+  if (generatedAt !== undefined) {
+    const elapsed = nodeElapsedMs(node, generatedAt);
+    if (elapsed !== undefined && (node.status === 'running' || node.status === 'done' || node.status === 'failed')) {
+      parts.push(formatV3Duration(elapsed));
+    }
+  }
+  if (node.attempts.length > 1 && node.status !== 'pending') parts.push(`第${node.attempts.length}次`);
+  return parts.join(' · ');
+}
+
+/** Second row of a graph node: who executes it. */
+export function nodeBotLine(node: RunNodeView): string {
+  if (node.host) return `宿主动作 · ${node.host.executor}`;
+  const bot = node.bot;
+  if (!bot) return '';
+  const who = bot.name ?? bot.larkAppId ?? bot.selector ?? '默认 Bot';
+  return bot.cliId ? `${who} · ${bot.cliId}` : who;
+}
+
 export const V3_DECISION_LABEL: Record<string, string> = {
   exit: '✓ 通过',
   continue: '↻ 继续返工',
@@ -21,10 +156,10 @@ export const V3_DECISION_LABEL: Record<string, string> = {
 };
 
 export const V3_GRAPH = {
-  nodeWidth: 168,
-  plainHeight: 48,
+  nodeWidth: 196,
+  plainHeight: 66,
   loopHeight: 70,
-  columnGap: 226,
+  columnGap: 254,
   verticalGap: 30,
   padding: 26,
   maxDots: 8,
@@ -80,7 +215,11 @@ export interface V3GraphEdgeLayout {
   x2: number;
   y2: number;
   mx: number;
+  /** Vertical layouts only: the curve's vertical midpoint (edges run top → bottom). */
+  my?: number;
   live: boolean;
+  /** Edge exists only in a pending (unconfirmed) flow revision. */
+  pending: boolean;
 }
 
 export interface V3GraphLayout {
@@ -146,10 +285,82 @@ export function buildGraphLayout(view: RunView): V3GraphLayout {
         y2,
         mx: (x1 + x2) / 2,
         live: node.status === 'running',
+        pending: node.pendingChange === 'add',
       });
     }
   }
 
+  return { width, height, nodes: laidOutNodes, edges };
+}
+
+/** Spacing of the sidebar's top-to-bottom layout (design §11.4, 350–800px). */
+export const V3_VERTICAL_GRAPH = {
+  padding: 10,
+  horizontalGap: 10,
+  verticalGap: 34,
+  /** Three parallel nodes still fit the narrowest (350px) sidebar's graph area. */
+  minNodeWidth: 88,
+} as const;
+
+/**
+ * Top-to-bottom variant of {@link buildGraphLayout} for the Feishu sidebar
+ * (350–800px wide): one row per depth, rows centered, a uniform box width that
+ * shrinks to fit the widest row into `containerWidth` (never below
+ * `minNodeWidth` — a wider row scrolls sideways instead of becoming unreadable).
+ */
+export function buildVerticalGraphLayout(view: RunView, containerWidth: number): V3GraphLayout {
+  const nodes = graphNodes(view);
+  const depthOf = computeDepth(nodes);
+  const byDepth = new Map<number, RunNodeView[]>();
+  for (const node of nodes) {
+    const depth = depthOf.get(node.id) ?? 0;
+    const bucket = byDepth.get(depth);
+    if (bucket) bucket.push(node);
+    else byDepth.set(depth, [node]);
+  }
+  const depths = [...byDepth.keys()].sort((a, b) => a - b);
+  const G = V3_VERTICAL_GRAPH;
+  const widest = Math.max(1, ...depths.map((depth) => byDepth.get(depth)!.length));
+  const avail = Math.max(G.minNodeWidth, Math.floor(containerWidth) - G.padding * 2);
+  const nodeWidth = Math.max(
+    G.minNodeWidth,
+    Math.min(V3_GRAPH.nodeWidth, Math.floor((avail - (widest - 1) * G.horizontalGap) / widest)),
+  );
+  const rowWidth = (count: number) => count * nodeWidth + Math.max(0, count - 1) * G.horizontalGap;
+  const width = Math.max(Math.floor(containerWidth), G.padding * 2 + rowWidth(widest));
+
+  const laidOutNodes: V3GraphNodeLayout[] = [];
+  const pos = new Map<string, V3GraphNodeLayout>();
+  let y = G.padding;
+  for (const depth of depths) {
+    const row = byDepth.get(depth)!;
+    let x = Math.round((width - rowWidth(row.length)) / 2);
+    let rowHeight = 0;
+    for (const node of row) {
+      const box = { node, x, y, width: nodeWidth, height: nodeHeight(node) };
+      laidOutNodes.push(box);
+      pos.set(node.id, box);
+      x += nodeWidth + G.horizontalGap;
+      rowHeight = Math.max(rowHeight, box.height);
+    }
+    y += rowHeight + G.verticalGap;
+  }
+  const height = depths.length ? y - G.verticalGap + G.padding : G.padding * 2;
+
+  const edges: V3GraphEdgeLayout[] = [];
+  for (const node of nodes) {
+    const to = pos.get(node.id);
+    if (!to) continue;
+    for (const dep of node.depends) {
+      const from = pos.get(dep);
+      if (!from) continue;
+      const x1 = from.x + from.width / 2;
+      const y1 = from.y + from.height;
+      const x2 = to.x + to.width / 2;
+      const y2 = to.y;
+      edges.push({ fromId: dep, toId: node.id, x1, y1, x2, y2, mx: (x1 + x2) / 2, my: (y1 + y2) / 2, live: node.status === 'running', pending: node.pendingChange === 'add' });
+    }
+  }
   return { width, height, nodes: laidOutNodes, edges };
 }
 
@@ -309,3 +520,78 @@ export function buildRoundMiniDagLayout(
     edges,
   };
 }
+
+/** Graph badge for a node a runtime flow revision added / changed, or one a
+ *  pending proposal would add / remove / change (design §13.7). */
+export function nodeRevisionBadge(node: RunNodeView): string | undefined {
+  if (node.pendingChange === 'add') return '待确认 · 新增';
+  if (node.pendingChange === 'remove') return '待确认 · 删除';
+  if (node.pendingChange === 'change') return '待确认 · 修改';
+  if (node.revisionMark === 'added') return '新增';
+  if (node.revisionMark === 'changed') return '已修改';
+  return undefined;
+}
+
+/** One-character form of {@link nodeRevisionBadge} for a box too narrow for
+ *  the full badge (the box styling still tells add / remove / change apart). */
+function nodeRevisionMark(node: RunNodeView): string | undefined {
+  if (node.pendingChange) return '待';
+  if (node.revisionMark === 'added') return '新';
+  if (node.revisionMark === 'changed') return '改';
+  return undefined;
+}
+
+/** Text geometry of a plain node box's first line: the id at `inset`, the
+ *  badge right-aligned `badgeInset` from the edge. Width estimates are upper
+ *  bounds: the id is 12px monospace (0.6em per character); the badge is 10px,
+ *  CJK at 1em and anything else at most 0.6em. */
+export const V3_NODE_HEADING = {
+  inset: 14,
+  badgeInset: 10,
+  gap: 6,
+  idCharPx: 7.2,
+  /** Below this many id characters beside the full badge, use the short one. */
+  minIdChars: 8,
+} as const;
+
+function badgeWidthPx(text: string): number {
+  let px = 0;
+  for (const ch of text) px += /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/.test(ch) ? 10 : 6;
+  return px;
+}
+
+/**
+ * The first line of a node box: how many id characters fit, and which badge
+ * goes beside them. The id gets whatever the box width leaves after the
+ * badge, so the two never overlap; when the full badge would squeeze the id
+ * below a readable share, a one-character mark replaces it and the full text
+ * moves to the node's tooltip. `plainIdChars` is the id budget without a badge.
+ */
+export function nodeBoxHeading(
+  node: RunNodeView,
+  boxWidth: number,
+  plainIdChars: number,
+): { idChars: number; badge?: string; badgeTitle?: string } {
+  const full = nodeRevisionBadge(node);
+  if (!full) return { idChars: plainIdChars };
+  const H = V3_NODE_HEADING;
+  const room = (badge: string) =>
+    Math.floor((boxWidth - H.inset - H.badgeInset - H.gap - badgeWidthPx(badge)) / H.idCharPx);
+  if (room(full) >= Math.min(node.id.length, H.minIdChars)) {
+    return { idChars: Math.max(1, Math.min(plainIdChars, room(full))), badge: full };
+  }
+  const short = nodeRevisionMark(node) ?? full;
+  return { idChars: Math.max(1, Math.min(plainIdChars, room(short))), badge: short, badgeTitle: full };
+}
+
+export const V3_REVISION_ROLE_LABEL: Record<NonNullable<RunView['revision']>['history'][number]['by'], string> = {
+  mainBot: '主 Bot',
+  initiator: '发起人',
+  other: '其他成员',
+};
+
+export const V3_REVISION_STATE_LABEL: Record<NonNullable<RunView['revision']>['history'][number]['state'], string> = {
+  applied: '已生效',
+  pending: '待确认',
+  rejected: '未生效',
+};

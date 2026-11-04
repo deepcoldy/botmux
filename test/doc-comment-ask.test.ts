@@ -62,9 +62,19 @@ it('does not send invalid virtual ids and reports delivery failure rather than a
   expect(() => codexUserInputAnswer(questions, result)).not.toThrow(/ask not answered/);
 });
 
-it('rejects client-supplied delivery targets and answerer locks at the Ask HTTP input boundary', () => {
-  expect(parseAskBody({ ...input, deliveryTarget: { kind: 'document-author', openId: 'ou_attacker' } })).toEqual({ error: 'unsupported_fields' });
-  expect(parseAskBody({ ...input, answererOpenId: 'ou_attacker' })).toEqual({ error: 'unsupported_fields' });
+it('rejects client-supplied delivery targets and native answerer locks at the Ask HTTP input boundary', () => {
+  // chatType is resolved by the HTTP handler, not accepted from a client body.
+  const { chatType: _chatType, ...body } = input;
+  expect(parseAskBody(body)).toMatchObject({ originKind: 'native-user-input' });
+  expect(parseAskBody({ ...body, deliveryTarget: { kind: 'document-author', openId: 'ou_attacker' } })).toEqual({ error: 'unsupported_fields' });
+  expect(parseAskBody({ ...body, answererOpenId: 'ou_attacker' })).toEqual({ error: 'bad_answererOpenId' });
+});
+
+it('accepts an explicit answerer lock without accepting a client-supplied delivery target', () => {
+  const { chatType: _chatType, ...body } = input;
+  const explicit = { ...body, originKind: 'explicit', answererOpenId: 'ou_requester' };
+  expect(parseAskBody(explicit)).toEqual(explicit);
+  expect(parseAskBody({ ...explicit, deliveryTarget: { kind: 'document-author', openId: 'ou_attacker' } })).toEqual({ error: 'unsupported_fields' });
 });
 
 it('routes only an exact private reply to the delivered card back to the originating document task', async () => {

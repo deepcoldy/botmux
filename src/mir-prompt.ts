@@ -4,13 +4,15 @@
  * Mir drives mircli in non-interactive Print Mode and can't consume botmux's
  * XML envelope directly, so `normalizeMircliPrompt` unwraps `<user_message>`
  * and flattens the surrounding context blocks (routing / role / sender /
- * mentions / available_bots / attachments) into plain prose.
+ * mentions / available_bots / attachments / formatting) into plain prose.
  *
  * This module is intentionally side-effect-free (no argv parsing, no process
  * wiring) — split out of `mir-runner.ts`, whose entrypoint runs `main()` on
  * import — so the transformation can be unit-tested. See mir-runner.ts for the
  * runtime that consumes it.
  */
+
+import { stripBotmuxDisplayBlocks } from './utils/prompt-display-strip.js';
 
 function decodeXmlEntities(text: string): string {
   return text
@@ -142,9 +144,24 @@ function summarizeSender(content: string): string | undefined {
   return lines.join('\n');
 }
 
+/** Follow-up-only `<botmux_formatting>` (#2716): mircli never sees botmux's XML
+ *  envelope (the runner flattens it), so pass the guidance through as a plain
+ *  prose line, the same shape the EBSD service-user envelope uses. */
+function summarizeFormatting(content: string): string | undefined {
+  const block = extractTaggedBlock(content, 'botmux_formatting');
+  if (!block) return undefined;
+  const guidance = decodeXmlEntities(block).trim();
+  if (!guidance) return undefined;
+  return `Response formatting: ${guidance}`;
+}
+
 export function normalizeMircliPrompt(content: string): string {
   const userMessage = extractTaggedBlock(content, 'user_message');
-  if (!userMessage) return content;
+  if (!userMessage) {
+    // Envelope-less input (zero-prompt, or a future bare transcript shape):
+    // never surface internal botmux blocks raw — drop them and keep the prose.
+    return stripBotmuxDisplayBlocks(content).replace(/\s+/g, ' ').trim();
+  }
 
   const context = [
     summarizeBotmuxRouting(content),
@@ -158,6 +175,8 @@ export function normalizeMircliPrompt(content: string): string {
   if (context.length > 0) {
     sections.push(['BotMux context:', ...context].join('\n\n'));
   }
+  const formatting = summarizeFormatting(content);
+  if (formatting) sections.push(formatting);
   sections.push(['User request:', decodeXmlEntities(userMessage)].join('\n'));
 
   const attachments = summarizeAttachments(content);

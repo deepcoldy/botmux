@@ -89,6 +89,12 @@ describe('native Lark slash-command catalog', () => {
     expect(buildAppSlashCommandCatalog().some(command => command.command === 'effort')).toBe(false);
   });
 
+  it('offers the model picker in the native menu without registering raw /model passthrough', () => {
+    const catalog = buildAppSlashCommandCatalog({ cliId: 'traex' });
+    expect(catalog.find(c => c.command === 'models')).toMatchObject({ source: 'botmux' });
+    expect(catalog.some(c => c.command === 'model')).toBe(false);
+  });
+
   it('builds short bilingual descriptions from the /help i18n lines, marking aliases', () => {
     const catalog = buildAppSlashCommandCatalog();
     for (const command of catalog) {
@@ -109,6 +115,20 @@ describe('native Lark slash-command catalog', () => {
     expect(catalog.find(command => command.command === 'g')?.description.i18n?.zh_cn).toMatch(/（同 \/group）$/);
     expect(buildAppSlashCommandCatalog({ locale: 'en' }).find(command => command.command === 'close')?.description.default_value)
       .toBe('Close current session, kill CLI');
+  });
+
+  it('appends enabled plugin commands after built-ins, skipping conflicts and built-in names', () => {
+    const catalog = buildAppSlashCommandCatalog({
+      pluginCommands: [
+        { name: '/work-bind', description: '查看/绑定本群的工作项', pluginId: 'work-ledger' },
+        { name: '/clash', description: '两个插件同名', pluginId: null },
+        { name: '/help', description: '插件抢内置名', pluginId: 'other' },
+      ],
+    });
+    const plugin = catalog.find(c => c.command === 'work-bind');
+    expect(plugin).toMatchObject({ source: 'botmux', description: { default_value: '查看/绑定本群的工作项' } });
+    expect(catalog.some(c => c.command === 'clash')).toBe(false);
+    expect(catalog.find(c => c.command === 'help')?.description.default_value).not.toBe('插件抢内置名');
   });
 
   it('summarizes help lines defensively', () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { withPlatformBotOwner } from '../src/core/bot-owner-attribution.js';
+import { withConfiguredBotOwner } from '../src/core/bot-owner-attribution.js';
+import type { BotActorOwnerBinding } from '../src/core/bot-actor-owner-binding.js';
 import type { TrustedCaller } from '../src/types.js';
 
 const botCaller: TrustedCaller = {
@@ -10,10 +11,16 @@ const botCaller: TrustedCaller = {
   senderType: 'bot',
 };
 
-describe('withPlatformBotOwner', () => {
-  it('keeps the bot caller and attaches a separately verified owner', async () => {
-    const result = await withPlatformBotOwner(botCaller, '/tmp/data', {
-      resolveOwnerUnionId: () => ({ status: 'resolved', ownerUnionId: 'on_owner' }),
+const binding: BotActorOwnerBinding = {
+  sourceBotOpenId: 'ou_source_bot',
+  sourceBotUnionId: 'on_source_bot',
+  ownerUnionId: 'on_owner',
+  ownerEmail: 'owner@bytedance.com',
+};
+
+describe('withConfiguredBotOwner', () => {
+  it('keeps the Bot caller and attaches a separately verified configured owner', async () => {
+    const result = await withConfiguredBotOwner(botCaller, [binding], {
       resolveOwnerIdentity: vi.fn(async () => ({
         openId: 'ou_owner_target_scope',
         unionId: 'on_owner',
@@ -28,35 +35,47 @@ describe('withPlatformBotOwner', () => {
         openId: 'ou_owner_target_scope',
         unionId: 'on_owner',
         email: 'owner@bytedance.com',
-        source: 'platform_team',
+        source: 'bot_config',
       },
     });
   });
 
-  it('never attributes a human turn or an unresolved bot', async () => {
+  it('never attributes a human turn or an unbound Bot', async () => {
     const resolveOwnerIdentity = vi.fn();
     const human = { ...botCaller, senderType: 'user' as const };
-    await expect(withPlatformBotOwner(human, '/tmp/data', {
-      resolveOwnerUnionId: () => ({ status: 'resolved', ownerUnionId: 'on_owner' }),
-      resolveOwnerIdentity,
-    })).resolves.toBe(human);
-    await expect(withPlatformBotOwner(botCaller, '/tmp/data', {
-      resolveOwnerUnionId: () => ({ status: 'conflict' }),
-      resolveOwnerIdentity,
-    })).resolves.toBe(botCaller);
+    await expect(withConfiguredBotOwner(human, [binding], { resolveOwnerIdentity }))
+      .resolves.toBe(human);
+    await expect(withConfiguredBotOwner(
+      { ...botCaller, requestUserUnionId: 'on_other_bot' },
+      [binding],
+      { resolveOwnerIdentity },
+    )).resolves.toEqual({ ...botCaller, requestUserUnionId: 'on_other_bot' });
+    expect(resolveOwnerIdentity).not.toHaveBeenCalled();
+  });
+
+  it('requires both Lark-attested source Bot ids to match one binding', async () => {
+    const resolveOwnerIdentity = vi.fn();
+    await expect(withConfiguredBotOwner(
+      { ...botCaller, requestUserOpenId: 'ou_other_bot' },
+      [binding],
+      { resolveOwnerIdentity },
+    )).resolves.not.toHaveProperty('botOwner');
+    await expect(withConfiguredBotOwner(
+      { ...botCaller, requestUserUnionId: undefined },
+      [binding],
+      { resolveOwnerIdentity },
+    )).resolves.not.toHaveProperty('botOwner');
     expect(resolveOwnerIdentity).not.toHaveBeenCalled();
   });
 
   it('fails closed when the target app cannot verify owner identity', async () => {
-    await expect(withPlatformBotOwner(botCaller, '/tmp/data', {
-      resolveOwnerUnionId: () => ({ status: 'resolved', ownerUnionId: 'on_owner' }),
+    await expect(withConfiguredBotOwner(botCaller, [binding], {
       resolveOwnerIdentity: vi.fn(async () => undefined),
     })).resolves.toBe(botCaller);
   });
 
   it('attaches no owner when the Contact API omits a usable email', async () => {
-    await expect(withPlatformBotOwner(botCaller, '/tmp/data', {
-      resolveOwnerUnionId: () => ({ status: 'resolved', ownerUnionId: 'on_owner' }),
+    await expect(withConfiguredBotOwner(botCaller, [binding], {
       resolveOwnerIdentity: vi.fn(async () => ({
         openId: 'ou_owner_target_scope',
         unionId: 'on_owner',
@@ -65,26 +84,36 @@ describe('withPlatformBotOwner', () => {
     })).resolves.toBe(botCaller);
   });
 
-  it('attaches no owner when the Contact API resolves a different union_id', async () => {
-    await expect(withPlatformBotOwner(botCaller, '/tmp/data', {
-      resolveOwnerUnionId: () => ({ status: 'resolved', ownerUnionId: 'on_owner' }),
+  it('attaches no owner when Contact resolves a different union_id or email', async () => {
+    await expect(withConfiguredBotOwner(botCaller, [binding], {
       resolveOwnerIdentity: vi.fn(async () => ({
         openId: 'ou_other_target_scope',
         unionId: 'on_other',
         type: 'user' as const,
+        email: 'owner@bytedance.com',
+      })),
+    })).resolves.toBe(botCaller);
+    await expect(withConfiguredBotOwner(botCaller, [binding], {
+      resolveOwnerIdentity: vi.fn(async () => ({
+        openId: 'ou_owner_target_scope',
+        unionId: 'on_owner',
+        type: 'user' as const,
         email: 'other@bytedance.com',
+      })),
+    })).resolves.toBe(botCaller);
+    await expect(withConfiguredBotOwner(botCaller, [binding], {
+      resolveOwnerIdentity: vi.fn(async () => ({
+        openId: 'on_wrong_kind',
+        unionId: 'on_owner',
+        type: 'user' as const,
+        email: 'owner@bytedance.com',
       })),
     })).resolves.toBe(botCaller);
   });
 
-  it('looks up the roster owner with (dataDir, target appId, source bot unionId) in that order', async () => {
-    const resolveOwnerUnionId = vi.fn(() => ({ status: 'missing' as const }));
-    await withPlatformBotOwner(botCaller, '/tmp/data', {
-      resolveOwnerUnionId,
-      resolveOwnerIdentity: vi.fn(),
-    });
-    // A swapped argument order passes the bot union as the app id and silently
-    // disables the whole feature (it then always returns 'missing').
-    expect(resolveOwnerUnionId).toHaveBeenCalledWith('/tmp/data', 'cli_target', 'on_source_bot');
+  it('resolves the configured owner through the receiving app', async () => {
+    const resolveOwnerIdentity = vi.fn(async () => undefined);
+    await withConfiguredBotOwner(botCaller, [binding], { resolveOwnerIdentity });
+    expect(resolveOwnerIdentity).toHaveBeenCalledWith('cli_target', 'on_owner');
   });
 });

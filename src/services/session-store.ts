@@ -1,3 +1,5 @@
+import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
+import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -11,6 +13,7 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
@@ -502,7 +505,7 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   ensurePrincipalLaneWorktreeCommonDirColumns(db);
   ensureMessageProvenanceTrustFenceIdentityColumns(db);
   db.exec(OCCUPANCY_SCHEMA_SQL);
-  return db;
+  return guardSessionDirectoryWrites(db);
 }
 
 /** `0d6ab50d1` could create this sidecar before the common-dir proof columns
@@ -940,6 +943,81 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
   }
 }
 
+/** Rows (active OR closed) of every store whose root_message_id is in the set,
+ *  in one IN-scan per store. Unlike findActiveSessionsByRoot this keeps closed
+ *  rows (the dispatch task tree renders a ⚫ closed node) and batches all roots
+ *  so N roots cost one scan per store, not N — and never parses unrelated rows
+ *  the way loadAllSessionsSnapshot does. Best-effort: an unreadable store is
+ *  skipped, but a missing SQLite engine still throws. */
+export function readSessionsByRoots(
+  rootMessageIds: ReadonlySet<string>,
+  options: { dataDir?: string } = {},
+): Session[] {
+  const roots = [...rootMessageIds].filter(id => typeof id === 'string' && id.length > 0);
+  if (roots.length === 0) return [];
+  const rootSet = new Set(roots);
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const out: Session[] = [];
+  const seen = new Set<string>();
+  // This app's live in-memory rows are freshest than its store (closed rows are
+  // evicted from memory, so they come only from disk below).
+  load();
+  for (const session of sessions.values()) {
+    if (session.rootMessageId && rootSet.has(session.rootMessageId) && !seen.has(session.sessionId)) {
+      // readOwnStoreAllRows only JSON.parses rows (no column backfill), so a
+      // live row missing the copy must inherit this process's own app id. This
+      // branch wins the dedup, so without it it would mask the corrected disk
+      // value. Project a copy: a read API must not mutate the live registry row.
+      seen.add(session.sessionId);
+      out.push(session.larkAppId ? session : { ...session, larkAppId: currentAppId });
+    }
+  }
+  let refs: StoreFileRef[];
+  try {
+    refs = listStoreRefs(dataDir);
+  } catch {
+    return out;
+  }
+  const CHUNK = 400; // stay well under SQLite's bound-parameter limit
+  for (const ref of refs) {
+    for (let start = 0; start < roots.length; start += CHUNK) {
+      const batch = roots.slice(start, start + CHUNK);
+      let rows: { row: string }[];
+      try {
+        const db = openDbForRead(ref.path);
+        try {
+          const placeholders = batch.map(() => '?').join(',');
+          rows = db.prepare(`SELECT row FROM sessions WHERE root_message_id IN (${placeholders})`).all(...batch) as { row: string }[];
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+        continue; /* absent/old-schema/unreadable store → skip for this view */
+      }
+      for (const r of rows) {
+        try {
+          const session = JSON.parse(r.row) as Session;
+          if (session && typeof session === 'object' && typeof session.sessionId === 'string'
+            && !seen.has(session.sessionId)) {
+            // Backfill the owning bot from the store directory, exactly like
+            // loadAllSessionsSnapshot's readInto: rows written before the
+            // column copy existed omit larkAppId, and the task tree matches
+            // child sessions by it (a missing value drops a cross-bot closed
+            // child back to dispatched/running). No repairMissingChatScope
+            // here: it only repairs chat-scope rows (rootMessageId === chatId),
+            // these are always thread rows, and the task tree never reads scope.
+            if (!session.larkAppId) session.larkAppId = ref.appId;
+            seen.add(session.sessionId);
+            out.push(session);
+          }
+        } catch { /* skip malformed row */ }
+      }
+    }
+  }
+  return out;
+}
+
 /** The active rows of one store, optionally narrowed by an indexed hint. */
 function readStoreActiveRows(
   ref: StoreFileRef,
@@ -1205,8 +1283,15 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* no leftover from a crashed import */ }
   }
   const entries = readJsonEntriesForImport(jsonFp);
-  const tmp = openDatabaseSyncOrThrow(tmpFp);
+  // The rename below is the first moment every historical row becomes visible
+  // in a SQLite store (the staging db is a private tmp path no scanner reads).
+  // Register all rows' managed references for the staging-and-rename sequence,
+  // so a collection begun during the JSON→SQLite upgrade cannot retire a
+  // version a restored session is about to name.
+  const releaseImport = reserveManagedDirectories(entries.map(([, value]) => value));
+  let tmp: SqliteDatabaseLike | undefined;
   try {
+    tmp = openDatabaseSyncOrThrow(tmpFp);
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     // The staging database is deliberately NOT in WAL mode. `renameSync` below
     // publishes ONE file, so every imported row has to live inside it by the
@@ -1244,11 +1329,13 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     renameSync(tmpFp, dbFp);
     return entries.length;
   } catch (err) {
-    try { tmp.close(); } catch { /* already closed */ }
+    try { tmp?.close(); } catch { /* already closed or open failed */ }
     for (const suffix of ['', '-journal', '-wal', '-shm']) {
       try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* best-effort orphan cleanup */ }
     }
     throw err;
+  } finally {
+    releaseImport();
   }
 }
 
@@ -2087,9 +2174,15 @@ function persistRow(session: Session): void {
       // be erased by a stale metadata write or by changing workingDir.
       session = { ...session, workspaceRetirement: durable.workspaceRetirement };
     }
+    // Task continuation has its own compare-and-set writer. Metadata writers
+    // holding an old row must neither erase a live task nor resurrect a stop.
+    session = { ...session, deploymentContinuation: durable.deploymentContinuation };
     // Pre-migration whole-row writers must not erase the frozen input policy.
     if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
       session = { ...session, promptInjection: durable.promptInjection };
+    }
+    if (durable.codexProfile !== undefined) {
+      session = { ...session, codexProfile: durable.codexProfile, codexProfileHome: durable.codexProfileHome };
     }
     if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
       session = { ...session, serviceTier: durable.serviceTier };
@@ -2140,6 +2233,8 @@ function buildNewSession(
     status: 'active',
     createdAt: new Date().toISOString(),
     creationSource: source,
+    codexProfile: intent.inherit ? intent.inherit.codexProfile ?? null : source === 'external' ? null : bot?.codexProfile ?? null,
+    codexProfileHome: intent.inherit ? intent.inherit.codexProfileHome : source !== 'external' && bot?.codexProfile ? resolveCodexProfileHome(bot) : undefined,
     promptInjection: intent.inherit ? intent.inherit.promptInjection ?? 'default'
       : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
@@ -2654,6 +2749,7 @@ export function markMojoCloseUnresolved(
 export function closeSession(
   sessionId: string,
   opts: {
+    backgroundExecutionCleanup?: boolean;
     cleanupBridgeMarkers?: boolean;
     workspaceRetirement?: Session['workspaceRetirement'];
     clearRiffParentTaskId?: boolean;
@@ -2712,6 +2808,7 @@ export function closeSession(
     const next: Session = { ...session };
     const applied = applySessionRowCommand(next, {
       type: 'close',
+      ...(opts.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
       ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
       ...(opts.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
@@ -2741,6 +2838,9 @@ export function closeSession(
     removePromptContextDir(sessionId);
     // Claude statusline 快照目录同生命周期（best-effort，内部吞错）。
     removeStatuslineDir(config.session.dataDir, sessionId);
+    // tmux 启动文件目录（pane-launch.ts）：正常情况下 pane 读完即删，这里兜住
+    // 一个 shell 没来得及读的文件——它带着该 bot 注入的环境变量值。
+    removePaneLaunchDir(config.session.dataDir, sessionId);
     // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
     // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
     removeSessionSkillRuntime(sessionId, config.session.dataDir);
@@ -2777,6 +2877,7 @@ export function reactivateClosedSession(
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
+  next.backgroundExecutionCleanupClosedAt = undefined;
   next.lastMessageAt = new Date().toISOString();
   next.codexAppDispatchLedger = undefined;
   next.codexAppGenerationCommits = undefined;
@@ -2805,13 +2906,41 @@ export function reactivateClosedSession(
 }
 
 
-export function updateSessionPid(sessionId: string, pid: number | null): void {
+export function updateSessionPid(sessionId: string, pid: number | null, procStart?: string): void {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
     session.pid = pid ?? undefined;
+    session.pidProcStart = pid === null ? undefined : procStart;
     persistRow(session);
   }
+}
+
+/**
+ * Clear recorded worker pids in one transaction, each only if its row still
+ * records exactly that pid/identity pair — a worker forked for the session
+ * since the caller's snapshot keeps its fresh record. Only `pid` and
+ * `pidProcStart` change. Returns the number of rows cleared.
+ */
+export function clearSessionPidsIfUnchanged(
+  expected: ReadonlyArray<{ sessionId: string; pid: number; procStart: string | undefined }>,
+): number {
+  loadForWrite();
+  const targets = expected.flatMap(e => {
+    const session = sessions.get(e.sessionId);
+    return session && session.pid === e.pid && session.pidProcStart === e.procStart ? [session] : [];
+  });
+  if (targets.length === 0 || !ownStore) return 0;
+  ownStore.db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const session of targets) persistRow({ ...session, pid: undefined, pidProcStart: undefined });
+    ownStore.db.exec('COMMIT');
+  } catch (error) { ownStore.db.exec('ROLLBACK'); throw error; }
+  for (const session of targets) {
+    session.pid = undefined;
+    session.pidProcStart = undefined;
+  }
+  return targets.length;
 }
 
 export function updateSession(session: Session): void {
@@ -2832,6 +2961,28 @@ export function updateSession(session: Session): void {
   const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (durable) Object.assign(session, JSON.parse(durable.row));
   sessions.set(session.sessionId, session);
+}
+
+/** Exact task authority mutation; ordinary metadata updates cannot write it. */
+export function updateDeploymentContinuation(
+  session: Session,
+  expected: Session['deploymentContinuation'],
+): void {
+  loadForWrite();
+  const db = ownStore;
+  if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  const hit = db.selectRow.get(session.sessionId) as { row: string } | undefined;
+  if (!hit) throw new Error('continuation session is missing');
+  const durable = JSON.parse(hit.row) as Session;
+  if (durable.status !== 'active'
+    || JSON.stringify(durable.deploymentContinuation) !== JSON.stringify(expected)) {
+    throw new Error('continuation authority changed');
+  }
+  durable.deploymentContinuation = structuredClone(session.deploymentContinuation);
+  const result = db.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), session.sessionId, hit.row);
+  if (Number(result.changes) !== 1) throw new Error('continuation session changed concurrently');
+  const cached = sessions.get(session.sessionId);
+  if (cached) cached.deploymentContinuation = structuredClone(durable.deploymentContinuation);
 }
 
 /**
@@ -3778,7 +3929,7 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
-  'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
@@ -5871,6 +6022,47 @@ export function loadAllSessionsStrict(dataDir = config.session.dataDir): Session
     }
   }
   return result;
+}
+
+/**
+ * Session ids of every ACTIVE row in every per-bot SQLite store under
+ * `dataDir`, closed rows excluded. This is the protection set for sweeps over
+ * trees that every bot on the machine shares (sandbox trees, session scratch):
+ * all daemons run on one dataDir, so a suspended session of ANOTHER bot is as
+ * live as one of ours. Reads only the indexed `status` column.
+ *
+ * Fail-closed for destructive callers: an unlistable store dir, any unreadable
+ * store, or a not-yet-imported `sessions-<appId>.json` of a bot that still
+ * exists THROWS — the caller must skip its round rather than treat a partial
+ * set as complete. A leftover JSON of a bot removed from this machine is
+ * abandoned data (no daemon will ever import or serve it), see
+ * `services/known-bot-app-ids.ts`; the shared pre-1.13 `sessions.json` is only a
+ * first-import rescue source and never held rows a daemon serves.
+ */
+export function listActiveSessionIdsAcrossStores(
+  dataDir: string = config.session.dataDir,
+  opts: { knownAppIds?: () => ReadonlySet<string> } = {},
+): Set<string> {
+  const refs = listStoreRefs(dataDir, { strict: true });
+  const unmigrated = listUnmigratedAppIds(dataDir, { strict: true });
+  if (unmigrated.length > 0) {
+    const known = (opts.knownAppIds ?? (() => knownBotAppIds({ dataDir, strict: true })))();
+    const pending = unmigrated.filter(appId => known.has(appId));
+    if (pending.length > 0) {
+      throw new SessionStoreUnmigratedError(`Unmigrated session stores: ${pending.join(', ')}`);
+    }
+  }
+  const ids = new Set<string>();
+  for (const ref of refs) {
+    const db = openDbForRead(ref.path);
+    try {
+      const rows = db.prepare("SELECT session_id FROM sessions WHERE status = 'active'").all() as { session_id: string }[];
+      for (const r of rows) ids.add(r.session_id);
+    } finally {
+      db.close();
+    }
+  }
+  return ids;
 }
 
 /**

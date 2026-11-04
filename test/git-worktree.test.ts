@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, symlinkSync, 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeRepoWorktree, resolveDeletedWorktreeOrigin, restoreDeletedWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeCleanWorktree, removeRepoWorktree, resolveDeletedWorktreeOrigin, restoreDeletedWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -166,7 +166,8 @@ describe('createRepoWorktree', () => {
       reuseExisting: true,
     });
 
-    expect(reused).toEqual({ path: target, branch: 'feat/shared', baseRef: 'feat/shared' });
+    expect(first.reused).toBeUndefined();
+    expect(reused).toEqual({ path: target, branch: 'feat/shared', baseRef: 'feat/shared', reused: true });
     expect(git(repo, 'worktree', 'list').split('\n').filter(line => line.includes(target))).toHaveLength(1);
     expect(first.path).toBe(reused.path);
   });
@@ -182,6 +183,27 @@ describe('createRepoWorktree', () => {
       worktreePath: target,
       reuseExisting: true,
     })).rejects.toThrow('not feat/shared in the expected repository');
+  });
+
+  it('removeCleanWorktree removes a clean worktree but keeps its branch', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const res = await createRepoWorktree(repo, { branch: 'feat/clean' });
+
+    await removeCleanWorktree(repo, res.path);
+
+    expect(existsSync(res.path)).toBe(false);
+    expect(git(repo, 'branch', '--list', 'feat/clean')).toContain('feat/clean');
+  });
+
+  it('removeCleanWorktree lets git refuse a worktree with untracked files instead of forcing', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const res = await createRepoWorktree(repo, { branch: 'feat/dirty' });
+    writeFileSync(join(res.path, 'draft.txt'), 'keep me\n');
+
+    await expect(removeCleanWorktree(repo, res.path)).rejects.toThrow();
+    expect(existsSync(join(res.path, 'draft.txt'))).toBe(true);
   });
 
   it('removeRepoWorktree detaches the worktree dir so the slot is reusable (rollback)', async () => {

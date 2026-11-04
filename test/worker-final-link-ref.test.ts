@@ -44,6 +44,91 @@ describe('automatic final LinkRef drafts', () => {
     expect(ledger.readPendingDraft(key)).toBeUndefined();
   });
 
+  it('rejects a truncated direct URL in an automatic final without a LinkRef placeholder', () => {
+    const { runtime, key, fullUrl } = setup();
+    const baseUrl = fullUrl.slice(0, fullUrl.indexOf('?'));
+    expect(() => runtime.prepareFinalDraft({ key, mode: 'enabled', content: `授权：${baseUrl}` }))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('rejects malformed Markdown in an automatic final without a LinkRef placeholder', () => {
+    const { runtime, key, fullUrl } = setup();
+    expect(() => runtime.prepareFinalDraft({
+      key,
+      mode: 'enabled',
+      content: `[授权](${fullUrl}`,
+    })).toThrowError(expect.objectContaining({ code: 'link_ref_malformed_markdown' }));
+  });
+
+  it.each([
+    ['ordered-list fence', [
+      '1. 改成这样：', '', '    ```js', '    observers[name](', '      value,', '    );', '    ```',
+    ].join('\n')],
+    ['bullet-list fence', [
+      '- 改成这样：', '', '    ```js', '    a](', '    ```',
+    ].join('\n')],
+    ['blockquote fence', [
+      '> 示例：', '>', '> ```js', '> observers[name](', '>   value,', '> );', '> ```',
+    ].join('\n')],
+    ['nested-blockquote fence', [
+      '> > 说明：', '> >', '> > ```js', '> > a](', '> > ```',
+    ].join('\n')],
+  ])('delivers an automatic final containing a closed %s', (_label, content) => {
+    const { runtime, key } = setup();
+
+    expect(runtime.prepareFinalDraft({ key, mode: 'enabled', content }))
+      .toEqual({ content, draftPending: false });
+  });
+
+  it('validates a direct same-endpoint URL after expanding a LinkRef draft', () => {
+    const { runtime, key, fullUrl, refId } = setup();
+    const baseUrl = fullUrl.slice(0, fullUrl.indexOf('?'));
+
+    expect(() => runtime.prepareFinalDraft({
+      key,
+      mode: 'enabled',
+      content: `完整：{{botmux_link:${refId}}}\n截断：${baseUrl}`,
+    })).toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('delivers plain automatic finals when registration failed before opening a turn', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-final-link-ref-missing-turn-'));
+    roots.push(root);
+    const ledger = new LinkRefLedger(root);
+    const runtime = createLinkRefRuntime(root, { ledger: () => ledger });
+    const key = { appId: 'app', sessionId: 'session', turnId: 'missing', dispatchAttempt: 2 };
+
+    expect(runtime.prepareFinalDraft({ key, mode: 'enabled', content: '纯文本回答' }))
+      .toEqual({ content: '纯文本回答', draftPending: false });
+  });
+
+  it('delivers plain automatic finals after their registration turn expires', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-final-link-ref-expired-turn-'));
+    roots.push(root);
+    let now = Date.now();
+    const ledger = new LinkRefLedger(root, { now: () => now });
+    const runtime = createLinkRefRuntime(root, { ledger: () => ledger });
+    const key = { appId: 'app', sessionId: 'session', turnId: 'expired', dispatchAttempt: 2 };
+    ledger.openTurn(key);
+    expect(runtime.restoreMode(key)).toBe('enabled');
+    now += 8 * 24 * 60 * 60_000;
+
+    expect(runtime.prepareFinalDraft({ key, mode: 'enabled', content: '纯文本回答' }))
+      .toEqual({ content: '纯文本回答', draftPending: false });
+  });
+
+  it('keeps an unavailable ledger fail-closed for automatic finals', () => {
+    const runtime = createLinkRefRuntime('/unused', {
+      ledger: () => { throw new Error('database unavailable'); },
+    });
+
+    expect(() => runtime.prepareFinalDraft({
+      key: { appId: 'app', sessionId: 'session', turnId: 'turn' },
+      mode: 'enabled',
+      content: '纯文本回答',
+    })).toThrowError(expect.objectContaining({ code: 'link_ref_ledger_unavailable' }));
+  });
+
   it('prefers an exact persisted draft after restart and never replaces it with replay text', () => {
     const { root, ledger, runtime, key, fullUrl, refId } = setup();
     const unresolved = `授权：{{botmux_link:${refId}}}`;

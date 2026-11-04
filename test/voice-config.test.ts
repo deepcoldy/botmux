@@ -5,6 +5,53 @@
 import { describe, it, expect } from 'vitest';
 import { DEFAULT_SAMI_SPEAKER, evaluateVoiceConfig } from '../src/services/voice/index.js';
 import { toSpoken, pcmDurationMs, pcmToWav } from '../src/services/voice/audio.js';
+import { parseVolcengineConfig, mergeVolcengineConfig } from '../src/services/voice/volcengine-config.js';
+import type { VoiceConfig } from '../src/services/voice/types.js';
+
+describe('Volcengine credentials', () => {
+  const standard = { mode: 'standard', apiKey: 'S' } satisfies VoiceConfig['volcengine'];
+  const plan = { mode: 'agent-plan', apiKey: 'P' } satisfies VoiceConfig['volcengine'];
+  const rows: Array<[VoiceConfig['volcengine'], VoiceConfig['volcengine'], VoiceConfig['volcengine']]> = [
+    [standard, undefined, standard],
+    [standard, {}, standard],
+    [standard, { apiKey: 'S2' }, { mode: 'standard', apiKey: 'S2' }],
+    [standard, { mode: 'standard' }, standard],
+    [standard, { mode: 'agent-plan' }, { mode: 'agent-plan' }],
+    [standard, plan, plan],
+    [plan, standard, standard],
+    [plan, { mode: 'standard' }, { mode: 'standard' }],
+    [standard, { apiKey: '' }, { mode: 'standard', apiKey: '' }],
+    [standard, null, null],
+    [null, plan, plan],
+    [undefined, { mode: 'standard' }, { mode: 'standard' }],
+    [{ apiKey: 'unscoped' }, { mode: 'agent-plan' }, { mode: 'agent-plan' }],
+    [{ apiKey: 'unscoped' }, undefined, { apiKey: 'unscoped' }],
+  ];
+  it.each(rows)('merges mode and account safely, row %#', (base, over, expected) => {
+    expect(mergeVolcengineConfig(base, over)).toEqual(expected);
+    const result = evaluateVoiceConfig({ engine: 'volcengine', volcengine: base }, { volcengine: over });
+    if (expected?.mode && expected.apiKey) expect(result?.volcengine).toEqual(expected);
+    else expect(result).toBeNull();
+  });
+
+  it.each([[null], [[]], [true], [1], ['standard'], [{ mode: '' }], [{ mode: null }], [{ mode: 'STANDARD' }],
+    [{ mode: 'typo' }], [{ apiKey: 1 }], [{ apiKey: null }], [{ apiKey: 'key\ninjected' }]])('keeps malformed blocks disabled, row %#', (raw) => {
+    expect(parseVolcengineConfig(raw)).toBeNull();
+    expect(evaluateVoiceConfig({ engine: 'volcengine', volcengine: standard }, {
+      volcengine: parseVolcengineConfig(raw),
+    })).toBeNull();
+  });
+  it('normalizes partial storage without inventing credentials', () => {
+    expect(parseVolcengineConfig(undefined)).toBeUndefined();
+    expect(parseVolcengineConfig({ apiKey: '  ' })).toEqual({ apiKey: '' });
+    expect(parseVolcengineConfig({ mode: 'standard', other: 1 })).toEqual({ mode: 'standard' });
+  });
+  it('requires explicit engine and never falls through from an invalid selected engine', () => {
+    expect(evaluateVoiceConfig({ volcengine: standard })).toBeNull();
+    expect(evaluateVoiceConfig({ engine: 'volcengine', volcengine: null, minimax: { apiKey: 'M' } })).toBeNull();
+    expect(evaluateVoiceConfig({ volcengine: standard, minimax: { apiKey: 'M' } })?.engine).toBe('minimax');
+  });
+});
 
 describe('evaluateVoiceConfig — button gating', () => {
   it('returns null when nothing configured', () => {

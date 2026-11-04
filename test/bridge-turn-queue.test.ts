@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -433,6 +433,25 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].assistantUuids).toEqual(['a1', 'a2', 'a3']);
   });
 
+  it('a turn read in the same batch after another turn\'s duration marker stays its own turn', () => {
+    // A rotation switch replays every turn the bridge did not read at once:
+    // two background-task wake-ups, then one after a Lark turn.
+    const notification = (uuid: string) => user(uuid, `<task-notification>\n<task-id>${uuid}</task-id>\n</task-notification>`);
+    const done = (uuid: string): TranscriptEvent => ({ type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent);
+    const q = new BridgeTurnQueue();
+    q.mark('t1', makeFingerprint('lark question'));
+    q.ingest([
+      notification('n1'), assistant('a1', 'first wake-up reply'), done('d1'),
+      notification('n2'), assistant('a2', 'second wake-up reply'), done('d2'),
+      user('u1', 'lark question'), assistant('a3', 'lark answer'), done('d3'),
+      notification('n3'), assistant('a4', 'third wake-up reply'), done('d4'),
+    ]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(ready.map(turn => [turn.isLocal === true, turn.assistantUuids])).toEqual([
+      [true, ['a1']], [true, ['a2']], [false, ['a3']], [true, ['a4']],
+    ]);
+  });
+
   it('headless local turn does not block a Lark turn that arrives next', () => {
     const q = new BridgeTurnQueue();
     // In-flight assistant text after a daemon restart — synthesises a headless turn.
@@ -662,6 +681,10 @@ describe('BridgeTurnQueue', () => {
         message: { role: 'user', content: [{ type: 'text', text: 'Continue from where you left off.' }] },
       } as TranscriptEvent;
     }
+    /** Claude Code's last record of a turn: a reply's `end_turn` alone is held for it. */
+    function turnDurationMarker(uuid: string): TranscriptEvent {
+      return { type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent;
+    }
     function syntheticNoReply(uuid: string, model = '<synthetic>'): TranscriptEvent {
       return {
         type: 'assistant', uuid, isApiErrorMessage: false,
@@ -686,7 +709,7 @@ describe('BridgeTurnQueue', () => {
     it('control: the same record served by a real model is the completed reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['s1']);
@@ -725,7 +748,7 @@ describe('BridgeTurnQueue', () => {
     it('does not downgrade a turn that already completed with a real reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1')]);
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);
@@ -741,7 +764,7 @@ describe('BridgeTurnQueue', () => {
     it('lets an API-error line override an earlier completed outcome (recovery must still fire)', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1')]);
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);
@@ -1967,5 +1990,216 @@ describe('onLarkTurnStarted evidence', () => {
     q.mark('om_legacy');
     q.ingest([user('u1', marked)]);
     expect(seen).toEqual([false]);
+  });
+});
+
+describe('input held in Claude\'s own queue', () => {
+  const TTL = 120_000;
+  const markAt = Date.parse('2026-10-31T12:20:38.866Z');
+  const iso = (offsetMs: number) => new Date(markAt + offsetMs).toISOString();
+  const text = '<botmux_reminder>r</botmux_reminder> <user_message>do it in parallel</user_message>';
+  const queueOp = (operation: string, offsetMs: number, content?: string, reason?: string, extra?: Record<string, unknown>) => ({
+    type: 'queue-operation', operation, timestamp: iso(offsetMs),
+    ...(content === undefined ? {} : { content }), ...(reason ? { reason } : {}), ...extra,
+  }) as unknown as TranscriptEvent;
+  const absorbed = (uuid: string, prompt: string, offsetMs: number) => ({
+    type: 'attachment', uuid, timestamp: iso(offsetMs),
+    attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+    renderedRole: 'system',
+    rendered: [{ content: `<system-reminder>${prompt}</system-reminder>` }],
+  }) as unknown as TranscriptEvent;
+  function marked(content = text, turnId = 't1', atMs = markAt): BridgeTurnQueue {
+    const q = new BridgeTurnQueue();
+    q.mark(turnId, makeFingerprint(content), atMs, normaliseForFingerprint(content));
+    return q;
+  }
+
+  it('keeps the mark past the TTL and binds it when Claude absorbs the input mid-turn', () => {
+    const started: string[] = [];
+    const q = new BridgeTurnQueue(undefined, undefined, turn => { started.push(turn.turnId); });
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 3_500, text)]);
+    expect(q.pruneExpired(TTL, markAt + TTL + 1)).toEqual([]);
+    q.ingest([
+      queueOp('remove', 137_400, text, 'absorbed_mid_turn'),
+      absorbed('q1', text, 3_000),
+    ]);
+    expect(started).toEqual(['t1']);
+  });
+
+  it('expires a mark with no enqueue record at the TTL, as before', () => {
+    const q = marked();
+    expect(q.pruneExpired(TTL, markAt + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('does not treat another input or an older identical input as this mark being queued', () => {
+    const other = marked();
+    other.ingest([queueOp('enqueue', 1_000, '<task-notification>done</task-notification>')]);
+    expect(isHeldInCliQueue(other.peek()[0])).toBe(false);
+    const older = marked();
+    older.ingest([queueOp('enqueue', -60_000, text)]);
+    expect(isHeldInCliQueue(older.peek()[0])).toBe(false);
+  });
+
+  it('runs the normal TTL from the moment the input leaves the queue unbound', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.ingest([queueOp('remove', 600_000, text, 'cancelled')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('follows queue order for content-less dequeues, past items that are not marks', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 500, '<task-notification>done</task-notification>'),
+      queueOp('enqueue', 1_000, text),
+      queueOp('dequeue', 5_000),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+    q.ingest([queueOp('dequeue', 6_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('pairs identical inputs with their marks in order', () => {
+    const q = marked();
+    q.mark('t2', makeFingerprint(text), markAt + 100, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, false]);
+    q.ingest([queueOp('enqueue', 1_000, text)]); // same record replayed by a transcript switch
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, false]);
+    q.ingest([queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+  });
+
+  it('stops holding at the upper bound, so a dropped input cannot block the queue for good', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    expect(q.pruneExpired(TTL, markAt + 1_000 + CLI_QUEUE_HOLD_MAX_MS)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 1_000 + CLI_QUEUE_HOLD_MAX_MS + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('stops holding when Claude returns to its prompt, then runs the normal TTL from there', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.cliQueueDrained(markAt + 600_000);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('stops holding when a remove carries no content to match', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('remove', 50_000, undefined, 'dropped_by_hook')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('does not hold a mark too short to identify its own enqueue', () => {
+    const q = marked('test');
+    q.ingest([queueOp('enqueue', 1_000, 'please run tests for the bridge module')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('counts dequeues that share a millisecond', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 500, '<task-notification>done</task-notification>'),
+      queueOp('enqueue', 1_000, text),
+      queueOp('dequeue', 5_000),
+      queueOp('dequeue', 5_000),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('matches a remove to its input by content, not by queue position', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 1_000, text),
+      queueOp('enqueue', 1_500, '<task-notification>second in line</task-notification>'),
+      queueOp('remove', 5_000, '<task-notification>second in line</task-notification>', 'absorbed_mid_turn'),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+  });
+
+  it('a new mark is not held by an enqueue that a cleared queue left behind', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.clearPending();
+    q.mark('t2', makeFingerprint(text), markAt + 2_000, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 4_000, text)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+    q.ingest([queueOp('dequeue', 5_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('holds the next unstarted mark, not one that already started with the same text', () => {
+    const q = marked();
+    q.ingest([{ type: 'user', uuid: 'u1', timestamp: iso(500), message: { role: 'user', content: text } } as unknown as TranscriptEvent]);
+    q.mark('t2', makeFingerprint(text), markAt + 1_000, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().filter(t => !t.isLocal).map(t => [t.turnId, t.started, isHeldInCliQueue(t)]))
+      .toEqual([['t1', true, false], ['t2', false, true]]);
+  });
+
+  it('stops holding once the queue is no longer observable', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.forgetCliQueue(markAt + 10_000);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 10_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('does not fold same-millisecond equal-length records with different content or command ids', () => {
+    // Fleet transcripts contain 14 groups of same-ms records whose texts are
+    // equal length but different (each remove carries its own commandUuid).
+    // A length-based dedup key discarded the second record and drifted the
+    // queue mirror: the second mark never held, or its release never applied.
+    const A = 'please alpha the bridge module now';
+    const B = 'please bravo the bridge module now';
+    expect(A).not.toBe(B);
+    expect(A.length).toBe(B.length);
+    const q = new BridgeTurnQueue();
+    q.mark('t1', makeFingerprint(A), markAt, normaliseForFingerprint(A));
+    q.mark('t2', makeFingerprint(B), markAt, normaliseForFingerprint(B));
+    q.ingest([
+      queueOp('enqueue', 1_000, A, undefined, { commandUuid: 'u-A' }),
+      queueOp('enqueue', 1_000, B, undefined, { commandUuid: 'u-B' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+    q.ingest([
+      queueOp('remove', 2_000, A, 'cancelled', { commandUuid: 'u-A', deliveryId: 'd-A' }),
+      queueOp('remove', 2_000, B, 'cancelled', { commandUuid: 'u-B', deliveryId: 'd-B' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+  });
+
+  it('distinguishes same-ms same-content removes of distinct commands by commandUuid', () => {
+    // Fleet transcripts also contain 5 groups of same-ms removes with IDENTICAL
+    // text but different commandUuid (separate commands), vs 1 group sharing a
+    // commandUuid (a genuine replay). A text-only key would fold the former.
+    const q = marked();
+    q.mark('t2', makeFingerprint(text), markAt + 100, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+    q.ingest([
+      queueOp('remove', 3_000, text, 'absorbed_mid_turn', { commandUuid: 'u-1', deliveryId: 'd-1' }),
+      queueOp('remove', 3_000, text, 'absorbed_mid_turn', { commandUuid: 'u-2', deliveryId: 'd-2' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+  });
+
+  it('treats a same-ms same-content enqueue with no command id as a replay, leaving no ghost slot', () => {
+    // enqueues carry no commandUuid: the same ms+text record replayed across a
+    // transcript switch must fold to ONE mirror slot, or a later dequeue order
+    // shifts and the next mark's release lands on the wrong item.
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('enqueue', 1_000, text)]);
+    q.ingest([queueOp('dequeue', 2_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    q.mark('t2', makeFingerprint(text), markAt + 2_500, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 3_000, text), queueOp('dequeue', 3_500)]);
+    expect(q.peek().map(turn => [turn.turnId, isHeldInCliQueue(turn)]))
+      .toEqual([['t1', false], ['t2', false]]);
   });
 });

@@ -23,24 +23,26 @@ import {
   type SandboxTreeFlavour,
 } from '../src/adapters/backend/sandbox-tree-teardown.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { detachTestMount, unmountTestMount } from './helpers/unmount-test-mount.js';
+import { onTestProcessExit } from './helpers/exit-cleanup.js';
 
 const linux = process.platform === 'linux';
 const isRoot = process.getuid?.() === 0;
 
-function unmount(target: string): void {
-  if (!isMountpoint(target)) return;
-  if (spawnSync('umount', [target], { stdio: 'ignore' }).status === 0) return;
-  spawnSync('fusermount', ['-u', target], { stdio: 'ignore' });
-}
-
 function mountSmallFs(target: string, scratch: string): boolean {
   mkdirSync(target, { recursive: true });
+  let mounted: boolean;
   if (isRoot) {
-    return spawnSync('mount', ['-t', 'tmpfs', '-o', 'mode=700,size=1m', 'tmpfs', target], { stdio: 'ignore' }).status === 0;
+    mounted = spawnSync('mount', ['-t', 'tmpfs', '-o', 'mode=700,size=1m', 'tmpfs', target], { stdio: 'ignore' }).status === 0;
+  } else {
+    const dirs = ['lower', 'upper', 'work'].map(d => join(scratch, d));
+    for (const d of dirs) mkdirSync(d, { recursive: true });
+    mounted = spawnSync('fuse-overlayfs', ['-o', `lowerdir=${dirs[0]},upperdir=${dirs[1]},workdir=${dirs[2]}`, target], { stdio: 'ignore' }).status === 0;
   }
-  const dirs = ['lower', 'upper', 'work'].map(d => join(scratch, d));
-  for (const d of dirs) mkdirSync(d, { recursive: true });
-  return spawnSync('fuse-overlayfs', ['-o', `lowerdir=${dirs[0]},upperdir=${dirs[1]},workdir=${dirs[2]}`, target], { stdio: 'ignore' }).status === 0;
+  // An interrupted run never reaches the `finally` that unmounts a fixture:
+  // detach it on the way out (a no-op once the test unmounted it itself).
+  if (mounted) onTestProcessExit(() => { detachTestMount(target); });
+  return mounted;
 }
 
 const mountsAvailable = linux && (() => {
@@ -48,8 +50,7 @@ const mountsAvailable = linux && (() => {
   try {
     const target = join(dir, 'm');
     const ok = mountSmallFs(target, join(dir, 'fs'));
-    if (ok) unmount(target);
-    return ok && !isMountpoint(target);
+    return ok && unmountTestMount(target);
   } catch {
     return false;
   } finally {
@@ -110,7 +111,7 @@ describe.skipIf(!linux)('reconcileSandboxTreeFlavour', () => {
         if (merged) expect(isMountpoint(merged)).toBe(false);
       }
     } finally {
-      if (merged) unmount(merged);
+      if (merged) unmountTestMount(merged);
       rmSandboxScratch(dataDir);
     }
   });
@@ -133,7 +134,7 @@ describe.skipIf(!linux)('reconcileSandboxTreeFlavour', () => {
       })).toBe('kept');
       expect(recordedSandboxTreeFlavour(sessionId, dataDir)).toBe(recorded);
     } finally {
-      if (merged) unmount(merged);
+      if (merged) unmountTestMount(merged);
       rmSandboxScratch(dataDir);
     }
   });
@@ -151,8 +152,8 @@ describe.skipIf(!linux)('reconcileSandboxTreeFlavour', () => {
       })).toThrow(/could not tear down its previous scratch sandbox tree/);
       expect(mountsAtOrUnder(join(dataDir, 'sandboxes', sessionId))).toEqual([stray]);
     } finally {
-      unmount(stray);
-      if (merged) unmount(merged);
+      unmountTestMount(stray);
+      if (merged) unmountTestMount(merged);
       rmSandboxScratch(dataDir);
     }
   });

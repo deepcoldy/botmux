@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -126,11 +127,8 @@ setInterval(() => {}, 1000);
     expect(submitted.match(/(?:first|second|third)-task/g)).toEqual(['first-task', 'second-task', 'third-task']);
     expect(submitted).not.toContain('must-not-run');
   } finally {
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>(r => child!.once('exit', () => r()));
-      child.kill('SIGKILL');
-      await Promise.race([exited, new Promise(r => setTimeout(r, 2_000))]);
-    }
+    // Together with any tmux call it still has in flight: TMUX_TMPDIR goes below.
+    if (child) await killProcessTree(child);
     if (existsSync(cliPidFile)) {
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }

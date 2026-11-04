@@ -38,14 +38,19 @@ export type PlatformIdentityResolution =
   /** Transient: platform unreachable / degraded / answered nonsense. */
   | { state: 'unavailable'; detail: string };
 
-export interface ResolvePlatformIdentityArgs {
+export type ResolvePlatformIdentityArgs = {
   botConfig: Pick<BotConfig, 'larkAppId'>;
   tool: TriggerUserAuthTool;
-  /** The turn's sender, app-scoped. */
-  openId: string;
   sessionId: string;
   turnId?: string;
-}
+} & (
+  /** The turn's own sender, scoped to this bot's app; its union_id is looked up. */
+  | { openId: string; unionId?: undefined }
+  /** A union_id the daemon already verified (the signed cross-bot dispatch), used
+   *  as-is. A delegated turn's open_ids belong to two different apps, so looking
+   *  either one up again from this bot's app could only lose the person. */
+  | { unionId: string; openId?: undefined }
+);
 
 interface Deps {
   readBinding: () => { platformUrl: string; machineToken: string; machineId: string } | null;
@@ -181,7 +186,9 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
   const binding = deps.readBinding();
   if (!binding) return { state: 'unbound' };
 
-  const unionId = await unionIdFor(args.botConfig.larkAppId, args.openId);
+  const unionId = args.unionId !== undefined
+    ? (UNION_ID_RE.test(args.unionId) && !args.unionId.startsWith('ou_') ? args.unionId : null)
+    : await unionIdFor(args.botConfig.larkAppId, args.openId);
   if (!unionId) {
     logger.warn(`[trigger-user-auth] platform grant skipped for ${args.tool}: could not resolve union_id for sender`);
     return { state: 'unavailable', detail: 'sender union_id unresolved' };

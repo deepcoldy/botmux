@@ -66,7 +66,36 @@ function makeCfg(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe('meeting inviter configuration', () => {
+  it.each([
+    [{}, undefined, undefined],
+    [{ inviterManagementEnabled: false }, false, undefined],
+    [{ inviterManagementEnabled: true, inviterManagementEnabledAt: 123 }, true, 123],
+    [{ inviterManagementEnabled: 'true', inviterManagementEnabledAt: '123' }, undefined, undefined],
+    [{ inviterManagementEnabled: 1, inviterManagementEnabledAt: -1 }, undefined, undefined],
+  ])('normalizes policy strictly without enabling old configurations: %#', async (vcMeetingAgent, enabled, epoch) => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ vcMeetingAgent })]));
+    expect(config.vcMeetingAgent?.inviterManagementEnabled).toBe(enabled);
+    expect(config.vcMeetingAgent?.inviterManagementEnabledAt).toBe(epoch);
+  });
+});
+
 describe('voice configuration', () => {
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' } }, { volcengine: null }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { mode: 'standard' } }, { volcengine: { mode: 'standard' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides, row %#', async (voice, expected) => {
+    const mod = await freshImport();
+    const configs = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ voice })]));
+    expect(configs[0]?.voice).toEqual(expected);
+  });
+
   it('preserves a MiniMax per-bot override', async () => {
     const mod = await freshImport();
     const [config] = mod.parseBotConfigsFromText(JSON.stringify([
@@ -457,7 +486,18 @@ describe('parseBotConfigsFromText — brand', () => {
     ]))).toThrow(/must exactly match cliRuntime\.executable/);
   });
 
-  it('rejects cliRuntime outside the plain Codex adapter contract', () => {
+  it('loads a named CodeM runtime with the Kimi adapter and exact path shadow', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codem-runtime-app', larkAppSecret: 's', cliId: 'kimi',
+      cliPathOverride: '/opt/bin/codem-wrapper',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper', update: { provider: 'none' } },
+    }]));
+    expect(cfg.cliId).toBe('kimi');
+    expect(cfg.cliRuntime).toMatchObject({ id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' });
+    expect(cfg.cliPathOverride).toBe('/opt/bin/codem-wrapper');
+  });
+
+  it('rejects cliRuntime outside supported adapter contracts', () => {
     const runtime = { id: 'vendor-codex', executable: 'vendor-codex' };
     expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'wrong-adapter-runtime-app',
@@ -585,6 +625,22 @@ describe('parseBotConfigsFromText — brand', () => {
     expect(cfg.messageListeners?.oc_legacy.autoCloseAfterCompletion).toBeUndefined();
   });
 
+  it('retains identity keyword semantics across global, custom and legacy config reloads', () => {
+    const listener = { enabled: true, prompt: 'triage', contentPolicy: { includeMentionedOpenIds: ['ou_member'], matchMode: 'all' } };
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({
+      globalMessageListener: listener,
+      groupMessageListenerOverrides: { oc_custom: { mode: 'custom', listener } },
+      messageListeners: { oc_legacy: listener },
+    })]));
+    expect(cfg.globalMessageListener?.contentPolicy).toEqual(listener.contentPolicy);
+    expect(cfg.groupMessageListenerOverrides?.oc_custom).toMatchObject({ mode: 'custom', listener: { contentPolicy: listener.contentPolicy } });
+    expect(cfg.messageListeners?.oc_legacy.contentPolicy).toEqual(listener.contentPolicy);
+    const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({
+      globalMessageListener: { ...listener, contentPolicy: { includeKeywords: ['ask'], includeMentionedOpenIds: ['bad'], matchMode: 'all' } },
+    })]));
+    expect(invalid.globalMessageListener?.contentPolicy).toEqual({ includeKeywords: ['ask'], includeMentionedOpenIds: [], matchMode: 'all' });
+  });
+
   it('normalizes per-chat messageListeners without enabling them by default', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
@@ -653,6 +709,12 @@ describe('parseBotConfigsFromText — brand', () => {
       ]));
       expect(cfg.startupCommands).toBeUndefined();
     }
+  });
+
+  it('preserves explicit false listener-policy overrides for future meetings', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'a', larkAppSecret: 's',
+      vcMeetingAgent: { listenerPolicy: { rawMessages: false, finalSummary: true, allowSummarySharing: false } } }]));
+    expect(cfg.vcMeetingAgent?.listenerPolicy).toEqual({ rawMessages: false, finalSummary: true, allowSummarySharing: false });
   });
 
   it('normalizes vcMeetingAgent.realtimeVoice without enabling it by default', () => {
@@ -2384,8 +2446,8 @@ describe('loadBotConfigs', () => {
       larkAppId: 'app_full',
       larkAppSecret: 'secret_full',
       name: 'codex-main',
-      cliId: 'gemini',
-      cliPathOverride: '/usr/local/bin/gemini',
+      cliId: 'opencode',
+      cliPathOverride: '/usr/local/bin/opencode',
       disableCliBypass: true,
       sandbox: true,
       sandboxHidePaths: ['~/.ssh', '', 42, '/etc/secret'],
@@ -2401,8 +2463,8 @@ describe('loadBotConfigs', () => {
     expect(configs).toHaveLength(1);
     const c = configs[0];
     expect(c.name).toBe('codex-main');
-    expect(c.cliId).toBe('gemini');
-    expect(c.cliPathOverride).toBe('/usr/local/bin/gemini');
+    expect(c.cliId).toBe('opencode');
+    expect(c.cliPathOverride).toBe('/usr/local/bin/opencode');
     expect(c.disableCliBypass).toBe(true);
     expect(c.sandbox).toBe(true);
     expect(c.sandboxHidePaths).toEqual(['~/.ssh', '/etc/secret']);

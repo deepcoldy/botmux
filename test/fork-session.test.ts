@@ -162,11 +162,15 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex / traex / grok (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok'] as const) {
+  it('accepts native fork-capable CLIs on a local terminal', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok', 'antigravity'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
+  });
+
+  it('refuses Antigravity on a remote backend without a local native terminal', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', backendType: 'remote-runner' }))).toBe(false);
   });
 
   it('refuses aiden because its adapter has no native fork contract', () => {
@@ -212,8 +216,8 @@ describe('isForkCapableSession', () => {
     expect(isForkCapableSession(ds)).toBe(false);
   });
 
-  it('refuses a non-forkable CLI (e.g. gemini)', () => {
-    const ds = makeSourceDs({ cliId: 'gemini' });
+  it('refuses a non-forkable CLI (e.g. opencode)', () => {
+    const ds = makeSourceDs({ cliId: 'opencode' });
     expect(isForkCapableSession(ds)).toBe(false);
   });
 });
@@ -236,6 +240,33 @@ describe('turnStartingCardStatus', () => {
       usageLimit: { retryLabel: 'later' } as DaemonSession['usageLimit'],
     });
     expect(turnStartingCardStatus(limited, 'grok')).toBe('limited');
+  });
+
+  // Repro: a Lark message steered into a RUNNING Codex App turn posts a fresh
+  // status card. Same-turn screen_updates only PATCH on a status edge
+  // (prevStatus !== lastScreenStatus), and the worker is already `working`, so
+  // working→working never edges and a card posted as `starting` stays at
+  // 「启动中…」 for the rest of the turn.
+  it('starts a steered Codex App turn as working when the worker is already working', () => {
+    const steered = makeSourceDs({ cliId: 'codex-app' }, { workerReady: true, lastScreenStatus: 'working' });
+    expect(turnStartingCardStatus(steered, 'codex-app')).toBe('working');
+  });
+
+  // Unlike Grok (which projects working after init regardless of status),
+  // Codex App must additionally observe `working`: a fresh turn on an
+  // initialized-but-idle worker is a real cold turn and stays `starting` until
+  // its first status edge.
+  it('keeps an initialized but idle Codex App turn on starting', () => {
+    const initializedIdle = makeSourceDs({ cliId: 'codex-app' }, { workerReady: true, lastScreenStatus: 'idle' });
+    expect(turnStartingCardStatus(initializedIdle, 'codex-app')).toBe('starting');
+  });
+
+  // A cached `working` status left by a previous generation must not project
+  // onto a card before the worker has initialized.
+  it('keeps Codex App on starting before worker init even with a cached working status', () => {
+    const coldCachedWorking = makeSourceDs({ cliId: 'codex-app' }, { workerReady: false, lastScreenStatus: 'working' });
+    expect(coldCachedWorking.workerReady).toBe(false);
+    expect(turnStartingCardStatus(coldCachedWorking, 'codex-app')).toBe('starting');
   });
 });
 

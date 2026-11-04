@@ -247,4 +247,38 @@ describe('linked plugin service watcher', () => {
     })]);
     expect(supervisor.run).not.toHaveBeenCalled();
   });
+
+  it('injects protected commands-only service env and rejects a missing fixed port', async () => {
+    rmSync(join(source, 'dist', 'card-actions'), { recursive: true });
+    mkdirSync(join(source, 'dist', 'commands'));
+    writeFileSync(join(source, 'dist', 'commands', 'index.json'), JSON.stringify({
+      schemaVersion: 1, endpoint: '/botmux/commands/v1', commands: [{ name: '/linked-command' }],
+    }));
+    const servicePath = join(source, 'dist', 'service', 'index.js');
+    writeFileSync(servicePath, `module.exports = {
+      mode: 'manual', port: 43210, pm2: { script: './service/server.js', env: {
+        PORT: '1234', BOTMUX_PLUGIN_CARD_ACTION_TOKEN: 'forged-token', BOTMUX_PLUGIN_COMMANDS_ENDPOINT: '/forged'
+      } }
+    };`);
+    installLocalPlugin(source, { link: true });
+    const reports = await startPluginServices(['linked-service']);
+    expect(reports[0].action).toBe('started');
+    const env = supervisor.run.mock.calls[0][2].external.env;
+    expect(env).toMatchObject({ PORT: '43210', BOTMUX_PLUGIN_COMMANDS_ENDPOINT: '/botmux/commands/v1' });
+    expect(env.BOTMUX_PLUGIN_CARD_ACTION_TOKEN).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(env.BOTMUX_PLUGIN_CARD_ACTION_TOKEN).not.toBe('forged-token');
+    expect(env.BOTMUX_PLUGIN_CARD_ACTION_ENDPOINT).toBeUndefined();
+
+    const invalidSource = join(home, 'commands-no-port');
+    writeInvalidPortPluginSource(invalidSource);
+    rmSync(join(invalidSource, 'dist', 'card-actions'), { recursive: true });
+    mkdirSync(join(invalidSource, 'dist', 'commands'));
+    writeFileSync(join(invalidSource, 'dist', 'commands', 'index.json'), readFileSync(join(source, 'dist', 'commands', 'index.json')));
+    installLocalPlugin(invalidSource);
+    supervisor.run.mockClear();
+    expect(await startPluginServices(['invalid-port-service'])).toEqual([expect.objectContaining({
+      action: 'failed', warning: 'plugin_commands_fixed_port_required:invalid-port-service',
+    })]);
+    expect(supervisor.run).not.toHaveBeenCalled();
+  });
 });

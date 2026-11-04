@@ -8,6 +8,11 @@
  *   node scripts/scratch-sandbox-probe.mjs --disk    # disk-backed upper
  *
  * Exit 0 = every expectation held; 1 = at least one failure (printed).
+ *
+ * Mounts for real in THIS mount namespace (a full-root overlay plus one per
+ * host submount). Run it under `isolate-run` (or another private mount + PID
+ * namespace) where you can: Ctrl-C / SIGTERM is cleaned up below, SIGKILL
+ * would leave the overlay mounted on the host.
  */
 import { prepareScratchSandbox, sweepOrphanScratchSandboxes, remapIntoMerged } from '../dist/adapters/backend/scratch-sandbox.js';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
@@ -55,6 +60,9 @@ const script = [
 ].join('; ');
 
 let sbx = null;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => { try { sbx?.cleanup(); } catch { /* */ } process.exit(signal === 'SIGINT' ? 130 : 143); });
+}
 try {
   sbx = prepareScratchSandbox({
     sessionId: sid,

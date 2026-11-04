@@ -93,3 +93,23 @@ describe('normalizeCardUsageSnapshot — runtime identity', () => {
       .toEqual({ context: null, tokens: null });
   });
 });
+
+describe('normalizeCardUsageSnapshot — tokens 缓存字段', () => {
+  it('放行合法的 cacheReadTokens / cacheCreateTokens', () => {
+    expect(normalizeCardUsageSnapshot({
+      context: null,
+      tokens: { in: 100, out: 2, cacheReadTokens: 80, cacheCreateTokens: 15, inputTokens: 5 },
+    })).toEqual({ context: null, tokens: { in: 100, out: 2, cacheReadTokens: 80, cacheCreateTokens: 15 } });
+  });
+
+  it('非法或超过 in 的缓存字段单独丢弃，in/out 保留', () => {
+    expect(normalizeCardUsageSnapshot({
+      context: null,
+      tokens: { in: 100, out: 2, cacheReadTokens: 101, cacheCreateTokens: -1 },
+    })).toEqual({ context: null, tokens: { in: 100, out: 2 } });
+    expect(normalizeCardUsageSnapshot({
+      context: null,
+      tokens: { in: 100, out: 2, cacheReadTokens: '50' },
+    })).toEqual({ context: null, tokens: { in: 100, out: 2 } });
+  });
+});

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { TriggerRequest } from '../src/services/trigger-types.js';
+import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { resolveTurnOrigin } from '../src/core/turn-origin.js';
 
 const mockGetMessageChatId = vi.fn();
 const mockGetChatMode = vi.fn(async () => 'topic');
@@ -13,10 +14,13 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 const mockGetBot = vi.fn();
-vi.mock('../src/bot-registry.js', () => ({
-  getBot: (...args: any[]) => mockGetBot(...args),
-  effectiveDefaultWorkingDir: vi.fn(() => '/tmp'),
-}));
+vi.mock('../src/bot-registry.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/bot-registry.js')>();
+  return { ...actual,
+    getBot: (id: string) => mockGetBot(id) ?? actual.getBot(id),
+    effectiveDefaultWorkingDir: vi.fn(() => '/tmp'),
+  };
+});
 
 const mockIsInChat = vi.fn(async () => true);
 vi.mock('../src/services/groups-store.js', () => ({
@@ -134,9 +138,12 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
 }));
 
 import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
+import { parseBotConfigsFromText, registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
 import { admitQueuedActivationTail, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { authorizeReportSessionRelayRequest } from '../src/core/report-session-relay.js';
+import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 
 const APP = 'app1';
 const CHAT = 'oc_root_chat';
@@ -176,6 +183,7 @@ function existingDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
 describe('triggerSessionTurn rootMessageId target', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __testOnly_resetBotRegistry();
     routeQuarantine.keys.clear();
     mockGetChatMode.mockReset().mockResolvedValue('topic');
     mockBotAutoWorktreeEnabled.mockReturnValue(false);
@@ -228,6 +236,14 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+  });
+
+  it('registers the minted turn as a trigger turn of its connector kind (execution current origin)', async () => {
+    const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
+    const triggerId = (res as { triggerId?: string }).triggerId!;
+    expect(triggerId).toMatch(/^trg_/);
+    expect(resolveTurnOrigin({ session: {} } as any, triggerId)).toEqual({ origin: 'trigger', triggerSource: 'webhook' });
+    expect(resolveTurnOrigin({ session: {} } as any, 'trg_never_admitted')).toEqual({ origin: 'unknown' });
   });
 
   it('keeps the localized topic seed by default', () => {
@@ -301,7 +317,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.session.reasoningEffort).toBe('medium');
   });
 
-  it('rejects an unsupported TraeX reasoning effort pair', async () => {
+  it('preserves a syntactically valid TraeX reasoning effort override', async () => {
     mockGetBot.mockReturnValue({
       config: { larkAppId: APP, cliId: 'traex', workingDir: '/tmp', model: 'DeepSeek-V4-Pro' },
       botName: 'TraeX', botOpenId: 'ou_bot',
@@ -312,7 +328,44 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
-    expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+    expect(res).toMatchObject({ ok: true, action: 'queued' });
+    expect(mockCreateSession).toHaveBeenCalledOnce();
+    expect(activeSessions.get(sessionKey(ROOT, APP))?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it.each([
+    { model: 'DeepSeek-V4-Pro', reasoningEffort: 'xhigh' },
+    { model: 'auto', reasoningEffort: 'ultra', traexAutoModel: { enabled: true, models: ['DeepSeek-V4-Pro'] } },
+  ])('creates a new turn with parse-loaded TraeX $model and inherited $reasoningEffort', async config => {
+    const parsed = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: APP, larkAppSecret: 'fixture', cliId: 'traex', workingDir: '/tmp', ...config,
+    }]))[0]!;
+    registerBot(parsed);
+    mockGetBot.mockReturnValue(undefined); // Use the actual registered config in triggerSessionTurn.
+    expect(parsed.reasoningEffort).toBe(config.reasoningEffort);
+    const activeSessions = new Map<string, DaemonSession>();
+    const req = request();
+    req.options = {};
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(result).toMatchObject({ ok: true, action: 'queued' });
+    expect(mockCreateSession).toHaveBeenCalledOnce();
+    expect(mockForkWorker).toHaveBeenCalledOnce();
+    expect(activeSessions.get(sessionKey(ROOT, APP))?.session.sessionId).toBe('sess_new');
+  });
+
+  it('rejects malformed TraeX effort before creating a session', async () => {
+    const parsed = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: APP, larkAppSecret: 'fixture', cliId: 'traex', workingDir: '/tmp', model: 'DeepSeek-V4-Pro', reasoningEffort: 'xhigh',
+    }]))[0]!;
+    registerBot(parsed);
+    mockGetBot.mockReturnValue(undefined);
+    const req = request();
+    req.options = { reasoningEffort: 'extreme' as any };
+    const activeSessions = new Map<string, DaemonSession>();
+    const validated = validateTriggerRequest(req);
+    expect(validated).toMatchObject({ ok: false, status: 400,
+      body: { errorCode: 'bad_request', error: expect.stringContaining('options.reasoningEffort') } });
+    if (validated.ok) await triggerSessionTurn(validated.request, { larkAppId: APP, activeSessions });
     expect(mockCreateSession).not.toHaveBeenCalled();
     expect(activeSessions.size).toBe(0);
   });
@@ -358,14 +411,14 @@ describe('triggerSessionTurn rootMessageId target', () => {
   });
 
   it('does NOT stamp model/effort onto a CLI without reasoning support', async () => {
-    // gemini has no configurable reasoning effort (claude-code now does), so the
+    // opencode has no configurable reasoning effort (claude-code now does), so the
     // gate must keep the override from silently changing such a bot's model.
     mockGetBot.mockReturnValue({
-      config: { larkAppId: APP, cliId: 'gemini', workingDir: '/tmp' },
-      botName: 'Gemini', botOpenId: 'ou_bot',
+      config: { larkAppId: APP, cliId: 'opencode', workingDir: '/tmp' },
+      botName: 'OpenCode', botOpenId: 'ou_bot',
     });
     const req = request();
-    (req.options as any) = { model: 'gemini-3-pro', reasoningEffort: 'high' };
+    (req.options as any) = { model: 'anthropic/claude-sonnet-4', reasoningEffort: 'high' };
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
@@ -594,6 +647,50 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).not.toHaveBeenCalled();
   });
 
+  it.each(['codex', 'claude-code'])('keeps a default report trigger reportable on a live %s worker', async (cliId) => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId, workingDir: '/tmp' } });
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any });
+    const req = request({ sessionId: ds.session.sessionId });
+    req.source = { type: 'ui', connectorId: 'botmux-report', requestId: 'report-mock' };
+    req.envelope = { format: 'botmux-report/v1', sourceName: 'dependency', trusted: false, rawText: 'dependency verified' };
+    const result = await triggerSessionTurn(req, {
+      larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+    const turnId = send.mock.calls[0][0].turnId;
+    expect(turnId).toBe(result.triggerId);
+    const secret = 'test-binding-secret';
+    const capability = 'a'.repeat(64);
+    const relay = authorizeReportSessionRelayRequest({
+      raw: { sessionId: ds.session.sessionId, dispatchRoot: ROOT, content: 'verified result', originCapability: capability },
+      trustedHost: false,
+      session: { sessionId: ds.session.sessionId, larkAppId: APP, chatId: CHAT,
+        receiver: false, scope: 'thread', rootMessageId: ROOT,
+        liveOrigin: { capability, turnId } },
+      selfLarkAppId: APP,
+      registry: { [ROOT]: { reportBinding: createDispatchReportBinding(secret, {
+        dispatchRoot: ROOT, targetLarkAppId: 'app_parent', targetSessionId: 'parent',
+        sourceName: 'task', issuedAt: new Date().toISOString(),
+      }) } },
+      bindingSecret: secret,
+    });
+    expect(relay).toMatchObject({ ok: true, target: { sessionId: 'parent' } });
+    expect(ds.suppressedTriggerFinalTurns?.size ?? 0).toBe(0);
+  });
+
+  it('preserves the shared topic anchor for a default external trigger with its own turn id', async () => {
+    const send = vi.fn();
+    const ds = existingDs({ scope: 'chat', worker: { killed: false, send } as any,
+      currentReplyTarget: { turnId: 'om_previous', rootMessageId: ROOT } });
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = CHAT;
+    const result = await triggerSessionTurn(request({ sessionId: ds.session.sessionId }), {
+      larkAppId: APP, activeSessions: new Map([[sessionKey(CHAT, APP), ds]]),
+    });
+    expect(send.mock.calls[0][0].turnId).toBe(result.triggerId);
+    expect(resolveSessionReplyTarget(ds, result.triggerId)).toMatchObject({ mode: 'thread', rootMessageId: ROOT });
+  });
+
   it('reuses an existing root session whose worker is live', async () => {
     const send = vi.fn();
     const ds = existingDs({ worker: { killed: false, send } as any });
@@ -603,7 +700,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'delivered', target: { sessionId: 'sess_existing', chatId: CHAT } });
     expect(mockCreateSession).not.toHaveBeenCalled();
     expect(mockForkWorker).not.toHaveBeenCalled();
-    expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:') });
+    expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:'), turnId: res.triggerId });
   });
 
   it.each([
@@ -829,7 +926,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     expect(res).toMatchObject({
       ok: false,
-      errorCode: 'trigger_failed',
+      errorCode: 'session_not_runnable',
       error: expect.stringContaining('durable_owner'),
     });
     expect(mockForkWorker).not.toHaveBeenCalled();
@@ -1118,6 +1215,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
 describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __testOnly_resetBotRegistry();
     mockBotAutoWorktreeEnabled.mockReturnValue(false);
     mockGetBot.mockReturnValue({
       config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp' },

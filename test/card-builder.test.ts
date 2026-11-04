@@ -28,13 +28,17 @@ import {
   buildSlashListCard,
   getCliDisplayName,
   frozenIdleLabel,
+  buildAdoptEntries,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
-import type { AdoptableSession } from '../src/core/session-discovery.js';
+import { excludeOwnedHerdrAdoptTargets, type AdoptableSession } from '../src/core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../src/core/zellij-adopt-discovery.js';
+import type { OrcaAdoptableSession } from '../src/core/orca-adopt-discovery.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
 import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
+import { resolveCliRuntime } from '../src/adapters/cli/runtime.js';
+import { configuredRuntimeDisplayName } from '../src/core/cli-runtime-display.js';
 
 // The terminal button's URL wrapping now depends on the global dashboard
 // setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
@@ -71,6 +75,30 @@ function buttonTexts(actions: any[]): string[] {
     .filter((a: any) => a.tag === 'button')
     .map((a: any) => a.text.content);
 }
+
+describe('Kimi-compatible CodeM runtime cards', () => {
+  it('uses the configured distribution name for waiting, streaming and closed cards', () => {
+    const runtime = resolveCliRuntime({
+      cliId: 'kimi',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: 'codem-wrapper', update: { provider: 'none' } },
+    });
+    const name = configuredRuntimeDisplayName(runtime);
+    const session = parse(buildSessionCard('session', 'root', 'https://terminal.example', 'Review', 'kimi', false, false, 'en', false, name));
+    const streaming = parse(buildStreamingCard(
+      'session', 'root', 'https://terminal.example', 'Review', '', 'idle', 'kimi',
+      'hidden', undefined, undefined, false, false, 'en', undefined, undefined, false, undefined, name,
+    ));
+    for (const card of [session, streaming]) {
+      expect(card.header.title.content).toContain('CodeM');
+      expect(card.header.title.content).not.toContain('Kimi');
+    }
+    const closed = buildSessionClosedCard('session', 'root', 'Review', 'kimi', '/work', null, 'en', name);
+    expect(closed).toContain('CodeM');
+    expect(closed).not.toContain('Kimi');
+    const plain = parse(buildSessionCard('plain', 'root', '', 'Review', 'kimi', false, false, 'en'));
+    expect(plain.header.title.content).toContain('Kimi');
+  });
+});
 
 describe('buildTuiPromptFailedCard', () => {
   it('renders an explicit red terminal state for unconfirmed TUI delivery', () => {
@@ -319,6 +347,15 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(md).not.toContain('![x](');
   });
 
+  it('offers a clear-search button on no match that re-fires adopt_search', () => {
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'ja' }));
+    const buttons = (card.body.elements ?? []).filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].behaviors[0].value.action).toBe('adopt_search');
+    expect(buttons[0].behaviors[0].value.selected).toBe('');
+  });
+
   const herdrLive = (extra: Partial<AdoptableSession> = {}): AdoptableSession => ({
     source: 'herdr',
     herdrSessionName: 'collie',
@@ -384,6 +421,194 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts).toHaveLength(1);
     expect(texts[0]!.split('\n')[0]).toBe('**回复确认收到**');
     expect(texts[0]).toContain('Path: `/work/gamma`');
+  });
+
+  describe('live herdr entries named after their tab / workspace', () => {
+    /** A herdr entry whose tab the picker's enrichment found (given name 整理笔记). */
+    const tabbed = (extra: Partial<AdoptableSession> = {}): AdoptableSession => herdrLive({
+      herdrSessionName: 'default',
+      herdrPaneId: 'w1:p2',
+      herdrTabId: 'w1:t1',
+      herdrTabLabel: '整理笔记',
+      herdrTabAutoNamed: false,
+      ...extra,
+    });
+    const defaultTab = { herdrTabLabel: '1', herdrTabAutoNamed: true };
+    const lines = (sessions: AdoptableSession[], locale: 'zh' | 'en' = 'en', resumable: any[] = []) =>
+      cardTexts(parse(buildAdoptSelectCard(sessions, 'om_root', locale, resumable))).map(text => text.split('\n'));
+    const titles = (sessions: AdoptableSession[], locale: 'zh' | 'en' = 'en') => lines(sessions, locale).map(l => l[0]);
+
+    it('alone in its tab: pane label > given tab name > native title > default tab name', () => {
+      const native = { herdrNativeTitle: '示例标题', title: '示例标题' };
+      expect([
+        tabbed({ herdrPaneLabel: '修复登录页样式', title: '修复登录页样式', herdrNativeTitle: '示例标题' }),
+        tabbed(native),
+        tabbed({ ...defaultTab, ...native }),
+        // Claude without a usable terminal title: the first prompt stands in for it.
+        tabbed({ ...defaultTab, herdrFirstPrompt: '帮我整理示例数据' }),
+        tabbed(defaultTab),
+      ].map(s => titles([s])[0])).toEqual([
+        '**修复登录页样式**',
+        '**整理笔记**',
+        '**示例标题**',
+        '**帮我整理示例数据**',
+        '**1**',
+      ]);
+    });
+
+    it('without complete tab info keeps the pre-change title (discovery title, else directory name)', () => {
+      expect(titles([herdrLive({ herdrTabId: 'w1:t1', title: '示例标题', herdrNativeTitle: '示例标题' })])).toEqual(['**示例标题**']);
+      expect(titles([herdrLive({ herdrTabId: 'w1:t1', herdrFirstPrompt: '帮我整理示例数据' })])).toEqual(['**demo**']);
+      // A label without the default-name verdict is not complete tab info either.
+      expect(titles([herdrLive({ herdrTabId: 'w1:t1', herdrTabLabel: '整理笔记' })])).toEqual(['**demo**']);
+    });
+
+    it('sharing a tab: <tab> · pane label / native title / untitled, in zh and en, default tab name included', () => {
+      const shared = [
+        tabbed({ herdrPaneId: 'w1:p1', herdrPaneLabel: '修复登录页样式', title: '修复登录页样式' }),
+        tabbed({ herdrPaneId: 'w1:p2', herdrNativeTitle: '示例标题', title: '示例标题' }),
+        tabbed({ herdrPaneId: 'w1:p3', herdrFirstPrompt: '帮我整理示例数据' }),
+        tabbed({ herdrPaneId: 'w1:p4' }),
+      ];
+      expect(titles(shared, 'zh')).toEqual([
+        '**整理笔记 · 修复登录页样式**',
+        '**整理笔记 · 示例标题**',
+        '**整理笔记 · 帮我整理示例数据**',
+        '**整理笔记 · 新会话**',
+      ]);
+      expect(titles(shared, 'en')[3]).toBe('**整理笔记 · New session**');
+      expect(titles(shared.map(s => ({ ...s, ...defaultTab })), 'en')).toEqual([
+        '**1 · 修复登录页样式**',
+        '**1 · 示例标题**',
+        '**1 · 帮我整理示例数据**',
+        '**1 · New session**',
+      ]);
+    });
+
+    it('groups only by (herdr session, tab id): the same tab id in another session or a missing tab id stays alone', () => {
+      const here = tabbed({ herdrPaneId: 'w1:p1' });
+      const otherServer = tabbed({ herdrSessionName: 'side', herdrPaneId: 'w1:p1' });
+      const noTabId = herdrLive({ herdrSessionName: 'default', herdrPaneId: 'w1:p3', cwd: '/work/other' });
+      expect(titles([here, otherServer, noTabId])).toEqual(['**整理笔记**', '**整理笔记**', '**other**']);
+    });
+
+    it('counts only the entries the card shows: an excluded owned pane does not make its tab shared', () => {
+      const mine = tabbed({ herdrPaneId: 'w1:p1', herdrAgentName: 'demo-agent' });
+      const owned = tabbed({ herdrPaneId: 'w1:p2', herdrAgentName: 'botmux-owned' });
+      expect(titles([mine, owned])).toEqual(['**整理笔记 · New session**', '**整理笔记 · New session**']);
+      const shown = excludeOwnedHerdrAdoptTargets([mine, owned], [{ sessionName: 'default', agentName: 'botmux-owned' }]);
+      expect(titles(shown)).toEqual(['**整理笔记**']);
+    });
+
+    it('cuts a long shared tab name to 30 code points so the part that tells entries apart survives', () => {
+      const longTab = '长'.repeat(80);
+      const [a, b] = buildAdoptEntries([
+        tabbed({ herdrPaneId: 'w1:p1', herdrTabLabel: longTab, herdrPaneLabel: `😀修复${'页'.repeat(70)}` }),
+        tabbed({ herdrPaneId: 'w1:p2', herdrTabLabel: longTab, herdrPaneLabel: `${'x'.repeat(45)}😀😀😀` }),
+      ], [], undefined, undefined, 'zh').map(e => e.title);
+      expect(a).not.toBe(b);
+      for (const title of [a!, b!]) {
+        const [prefix] = title.split(' · ');
+        expect(Array.from(prefix!).length).toBeLessThanOrEqual(30);
+        expect(prefix).toBe(`${'长'.repeat(29)}…`);
+        expect(Array.from(title).length).toBeLessThanOrEqual(80);
+        expect(title).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/);
+      }
+      expect(b).toBe(`${'长'.repeat(29)}… · ${'x'.repeat(45)}😀…`);
+    });
+
+    it('puts the workspace name ahead of the location (zh full-width, en half-width brackets), escaped', () => {
+      const s = tabbed({ herdrWorkspaceLabel: '示例空间' });
+      expect(lines([s], 'zh')[0]).toContain('位置: 示例空间（`default:w1:p2`）');
+      expect(lines([s], 'en')[0]).toContain('Location: 示例空间 (`default:w1:p2`)');
+      expect(lines([tabbed({ herdrWorkspaceLabel: 'demo*space_[x]' })])[0])
+        .toContain('Location: demo\\*space\\_\\[x\\] (`default:w1:p2`)');
+    });
+
+    it('keeps the location line unchanged without a workspace name', () => {
+      expect(lines([tabbed()])[0]).toContain('Location: `default:w1:p2`');
+      expect(lines([tabbed()])[0].slice(1)).toEqual(lines([herdrLive({ herdrSessionName: 'default', herdrPaneId: 'w1:p2' })])[0].slice(1));
+    });
+
+    it('finds entries by workspace name and by a tab name the title does not show', () => {
+      const named = tabbed({
+        herdrPaneId: 'w1:p1', herdrWorkspaceLabel: '示例空间', herdrPaneLabel: '修复登录页样式', title: '修复登录页样式',
+      });
+      const other = herdrLive({ herdrSessionName: 'default', herdrPaneId: 'w2:p1', cwd: '/work/other' });
+      const keysFor = (searchQuery: string) => parse(buildAdoptSelectCard([named, other], 'om_root', 'en', [], { searchQuery }))
+        .body.elements
+        .filter((e: any) => e.tag === 'interactive_container')
+        .map((e: any) => e.behaviors[0].value.entry_key);
+      expect(titles([named])).toEqual(['**修复登录页样式**']);
+      expect(keysFor('示例空间')).toEqual([adoptLiveKey(named)]);
+      expect(keysFor('整理笔记')).toEqual([adoptLiveKey(named)]);
+    });
+
+    it('leaves tmux, zellij and history entries byte-identical beside a named herdr entry', () => {
+      const tmux: AdoptableSession = {
+        source: 'tmux', tmuxTarget: 'dev:0.0', cliPid: 42, cliId: 'codex', cwd: '/work/alpha', paneCols: 80, paneRows: 24,
+      };
+      const zellij: ZellijAdoptableSession = {
+        zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid: 7, cliId: 'codex',
+        cwd: '/work/beta', paneCols: 80, paneRows: 24,
+      };
+      const history = [
+        { cliSessionId: 'h1', cwd: '/work/gamma', title: '示例会话', lastActivityAt: 1 },
+        { cliSessionId: 'h2', cwd: '/work/delta', title: 'old task', lastActivityAt: 2 },
+      ];
+      const named = tabbed({ herdrWorkspaceLabel: '示例空间', herdrPaneLabel: '修复登录页样式' });
+      for (const locale of ['zh', 'en'] as const) {
+        const without = lines([tmux, zellij as any], locale, history);
+        const withHerdr = lines([named, tmux, zellij as any], locale, history);
+        expect(withHerdr).toHaveLength(5);
+        expect(withHerdr.slice(1)).toEqual(without);
+      }
+    });
+
+    it('leaves an Orca entry as it renders alone and keeps it out of herdr tab groups', () => {
+      const orca: OrcaAdoptableSession = {
+        source: 'orca',
+        orcaInstance: 'server',
+        orcaTerminalHandle: 'term_demo',
+        orcaWorktreeId: 'repo::/work',
+        orcaAgentIdentity: 'claude',
+        orcaTerminalTitle: '整理示例数据',
+        cliId: 'claude-code',
+        cwd: '/work/orca',
+        paneCols: 100,
+        paneRows: 40,
+        paneSizeVerified: true,
+      };
+      const shared = [
+        tabbed({ herdrPaneId: 'w1:p1', herdrWorkspaceLabel: '示例空间', herdrPaneLabel: '修复登录页样式' }),
+        tabbed({ herdrPaneId: 'w1:p2', herdrWorkspaceLabel: '示例空间' }),
+      ];
+      // Alone in a tab it was given a name: the tab name, not `<tab> · …`.
+      const solo = tabbed({ herdrPaneId: 'w1:p3', herdrTabId: 'w1:t2', herdrTabLabel: '示例分组' });
+      const mixed = [shared[0]!, orca as any, shared[1]!, solo];
+      const keysFor = (searchQuery: string) => parse(buildAdoptSelectCard(mixed, 'om_root', 'en', [], { searchQuery }))
+        .body.elements
+        .filter((e: any) => e.tag === 'interactive_container')
+        .map((e: any) => e.behaviors[0].value.entry_key);
+
+      for (const locale of ['zh', 'en'] as const) {
+        const rendered = lines(mixed, locale);
+        expect(rendered[1]).toEqual(lines([orca as any], locale)[0]);
+        expect(rendered[1]![0]).toBe('**整理示例数据**');
+        expect(rendered[1]!.some(l => l.startsWith(locale === 'zh' ? '位置:' : 'Location:'))).toBe(false);
+      }
+      const en = lines(mixed, 'en');
+      expect([en[0]![0], en[2]![0], en[3]![0]]).toEqual([
+        '**整理笔记 · 修复登录页样式**',
+        '**整理笔记 · New session**',
+        '**示例分组**',
+      ]);
+      expect(en[0]).toContain('Location: 示例空间 (`default:w1:p1`)');
+      // Workspace / tab names find only the herdr entries; the Orca title finds only Orca.
+      expect(keysFor('示例空间')).toEqual([adoptLiveKey(shared[0]!), adoptLiveKey(shared[1]!)]);
+      expect(keysFor('整理笔记')).toEqual([adoptLiveKey(shared[0]!), adoptLiveKey(shared[1]!)]);
+      expect(keysFor('整理示例数据')).toEqual([adoptLiveKey(orca as any)]);
+    });
   });
 });
 
@@ -481,10 +706,6 @@ describe('getCliDisplayName', () => {
 
   it('should return "Codex" for codex', () => {
     expect(getCliDisplayName('codex')).toBe('Codex');
-  });
-
-  it('should return "Gemini" for gemini', () => {
-    expect(getCliDisplayName('gemini')).toBe('Gemini');
   });
 
   it('should return "OpenCode" for opencode', () => {
@@ -587,6 +808,72 @@ describe('buildConfigCard', () => {
         { key: 'p2pOpen', on: true },
       ],
     });
+
+  it('offers the reasoning-effort selector when the bot CLI supports it', () => {
+    const without = parse(buildConfigCard(configData(null), 'zh'));
+    expect(allActions(without).some((a: any) => a.value?.field === 'reasoningEffort')).toBe(false);
+
+    const card = parse(buildConfigCard({
+      ...configData(null), reasoningEfforts: ['low', 'high', 'max'], reasoningEffort: 'max',
+    }, 'zh'));
+    const select = allActions(card).find((a: any) => a.value?.field === 'reasoningEffort');
+    expect(select).toBeTruthy();
+    expect(select.value).toMatchObject({ action: 'config_set', field: 'reasoningEffort' });
+    // Sentinel first = "clear and follow the CLI/model default".
+    expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', 'low', 'high', 'max']);
+    expect(select.initial_option).toBe('max');
+  });
+
+  it('shows the shared-bot sandbox advice only when the data carries it, as short lines plus a folded CLI list', () => {
+    const texts = (card: any) => JSON.stringify(card.elements ?? card.body?.elements ?? card);
+    const plain = parse(buildConfigCard(configData(null), 'zh'));
+    // CLI display names legitimately appear in the CLI dropdown; the advice
+    // block has its own markers that must be absent without sandboxAdvice.
+    expect(texts(plain)).not.toContain('建议开启白名单隔离');
+    expect(texts(plain)).not.toContain('已验证可用的 CLI');
+
+    const card = (cliSupport: 'verified' | 'unverified' | 'unsupported' | 'wrapper' | 'blocked', cliId: string, reasons: string[] = ['oncall']) =>
+      parse(buildConfigCard({ ...configData(null), sandboxAdvice: { reasons, cliSupport, cliId } }, 'zh'));
+    const elementsOf = (c: any): any[] => c.elements ?? c.body?.elements ?? [];
+    const adviceBlock = (c: any) => elementsOf(c).find((e: any) => e.tag === 'markdown' && String(e.content).includes('建议开启白名单隔离'));
+    const fold = (c: any) => elementsOf(c).find((e: any) => e.tag === 'collapsible_panel');
+
+    const verified = card('verified', 'codex', ['oncall', 'allowedUsers']);
+    // One fact per line: headline, why, the reasons, where to turn it on, the current CLI.
+    expect(String(adviceBlock(verified).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式、allowedUsers 有多人',
+      '开启：Dashboard → Bot 配置 → 文件沙盒，新会话生效',
+      '当前 CLI：Codex，已验证可用',
+    ]);
+    // The verified list sits in a folded panel, not in the advice text.
+    // Literal list, not derived from the table: it must be the matrix result in table order.
+    expect(fold(verified).expanded).toBe(false);
+    expect(fold(verified).header.title.content).toBe('已验证可用的 CLI（Linux 实测）');
+    expect(fold(verified).elements[0].content).toBe('Claude、Codex、Antigravity、OpenCode、Pi、Oh My Pi、Grok Build、Kimi');
+    expect(String(adviceBlock(verified).content)).not.toContain('Grok Build');
+
+    // Each support state gets its own CLI line; the dynamic keys resolve to text.
+    const cliLine = (c: any) => String(adviceBlock(c).content).split('\n').at(-1);
+    expect(cliLine(card('unsupported', 'codex-app'))).toBe('当前 CLI：Codex App，暂不支持白名单隔离，请改用 Codex');
+    expect(cliLine(card('unverified', 'relay'))).toBe('当前 CLI：Relay，还没验证过，开启前先在测试会话里试一下');
+    expect(cliLine(card('wrapper', 'claude-code'))).toBe('当前 CLI：Claude，通过 wrapper 启动。开启白名单隔离后 wrapper 仍在沙盒内运行；若 wrapper 依赖的路径不在白名单内会明确报错拒绝启动，把这些路径加进沙盒白名单（只读/读写）即可');
+    expect(String(adviceBlock(card('verified', 'codex', ['allowedChatGroups'])).content)).toContain('原因：allowedChatGroups 授权了整群发言');
+    expect(texts(card('wrapper', 'claude-code'))).not.toContain('card.config.sandbox_advice');
+
+    // A local-but-sandbox-refusing backend (herdr/zellij/zmx/orca): no "turn it
+    // on" action line and no verified-list fold — they would brick sessions.
+    const backendBlocked = card('blocked', 'claude-code');
+    expect(String(adviceBlock(backendBlocked).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式',
+      '当前会话后端不支持文件沙盒（开启后新会话会起不来）；请先把后端切换为 tmux 或 pty，再回来开启',
+    ]);
+    expect(fold(backendBlocked)).toBeUndefined();
+    expect(String(adviceBlock(backendBlocked).content)).not.toContain('开启：Dashboard');
+  });
 
   it('renders card-behaviour toggles', () => {
     const card = parse(buildConfigCard(configData(null), 'en'));
@@ -905,16 +1192,16 @@ describe('buildSessionCard', () => {
 
     it('can include local attach buttons for non-resume CLIs when mode-aware readiness is true', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', false, false, 'en', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'mimocode', false, false, 'en', true));
       const actions = findActions(card);
       const btn = actions.find((a: any) => a.value?.action === 'open_local_cli');
-      expect(btn?.value.cli_id).toBe('gemini');
-      expect(btn?.text.content).toBe('💻 Open Gemini');
+      expect(btn?.value.cli_id).toBe('mimocode');
+      expect(btn?.text.content).toBe('💻 Open MiMoCode');
     });
 
     it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
       enableLocalCliOpen();
-      for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
+      for (const cli of ['codex-app', 'mimocode', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
         expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
@@ -964,11 +1251,11 @@ describe('buildSessionCard', () => {
     });
 
     it('should include restart button with CLI display name', () => {
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'opencode', true));
       const actions = findActions(card);
       const restartBtn = actions.find((a: any) => a.value?.action === 'restart');
       expect(restartBtn).toBeDefined();
-      expect(restartBtn.text.content).toContain('Gemini');
+      expect(restartBtn.text.content).toContain('OpenCode');
       expect(restartBtn.value.root_id).toBe(ROOT);
       expect(restartBtn.value.session_id).toBe(SID);
     });
@@ -1502,7 +1789,7 @@ describe('buildStreamingCard', () => {
 
     it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
       const card = parse(buildStreamingCard(
-        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'opencode', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         { context: null, tokens: null },
       ));
@@ -2234,7 +2521,7 @@ describe('buildSessionClosedCard', () => {
     expect(findMarkdownContent(card)).toContain('/proj/x');
   });
 
-  it('shows a fallback note when the CLI cannot resume from CLI args (gemini/opencode)', () => {
+  it('shows a fallback note when the CLI cannot resume from CLI args (e.g. opencode)', () => {
     const card = parse(buildSessionClosedCard(
       'sess-3', 'om_root', 'topic', 'opencode', undefined, null,
     ));
@@ -2459,6 +2746,32 @@ describe('buildRelayPickerCard', () => {
     expect(containers(card)).toHaveLength(0);
     const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
     expect(allMd).toMatch(/没有匹配|No sessions match/);
+  });
+
+  // Regression: the no-match card used to dead-end — the only way back was to
+  // clear the input and submit '', which Lark doesn't fire. A clear-search
+  // button re-fires relay_search without input_value, so the handler resolves
+  // the query to '' and re-renders the full list.
+  it('offers a clear-search button on no match that re-fires relay_search', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'ja' }));
+    const buttons = card.body.elements.filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    const v = buttons[0].behaviors[0].value;
+    expect(v.action).toBe('relay_search');
+    expect(v.target_chat_id).toBe('oc_t');
+    expect(v.root_id).toBe('om_r');
+    expect(v.invoker_open_id).toBe('ou_invoker_test');
+    expect(v.selected).toBe('');
+    // Not shown when the search has hits.
+    const hit = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'session 1' }));
+    expect(hit.body.elements.filter((e: any) => e.tag === 'button')).toHaveLength(0);
+  });
+
+  it('escapes the echoed search query in the no-match message', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: '![x](http://evil/b)' }));
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toContain('\\[x\\]');
+    expect(allMd).not.toContain('![x](');
   });
 
   // Regression (申晗现场): a p2p entry's chatLabel is the raw DM chatId while

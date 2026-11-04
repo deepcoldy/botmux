@@ -19,7 +19,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "bun scripts/check-bun-version.mjs && bun run audit:domains && node scripts/generate-app-icon-data.mjs && node scripts/generate-pi-initial-prompt-extension.mjs && node scripts/generate-pi-turn-boundary-extension.mjs && node scripts/clean-dist.mjs && tsc && bun run typecheck:scripts && bun run typecheck:test-mocks && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && bun run dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs && node scripts/audit-embedded-assets.mjs --require-dist",
+    "build": "bun scripts/check-bun-version.mjs && bun run audit:domains && node scripts/generate-app-icon-data.mjs && node scripts/generate-pi-initial-prompt-extension.mjs && node scripts/generate-zcode-provider-helper-data.mjs && node scripts/generate-pi-turn-boundary-extension.mjs && node scripts/clean-dist.mjs && tsc && bun run typecheck:scripts && bun run typecheck:test-mocks && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && bun run dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs && node scripts/audit-embedded-assets.mjs --require-dist",
     "verify:binary": "bun scripts/verify-binary.mjs",
     "typecheck:scripts": "tsc -p tsconfig.scripts.json",
     "typecheck:test-mocks": "tsc -p tsconfig.test-mocks.json",
@@ -53,7 +53,6 @@
     "test:bun:self-check": "node scripts/run-bun-tests.mjs --self-check",
     "test:bench": "tsx scripts/bench-tests.ts",
     "test:codex": "vitest run --project e2e test/codex-input.e2e.ts",
-    "test:gemini": "vitest run --project e2e test/gemini-input.e2e.ts",
     "test:agy": "vitest run --project e2e test/agy-input.e2e.ts",
     "bench:resource": "node --expose-gc --import tsx scripts/bench-resource.ts",
     "test:e2e-browser:setup": "tsx test/e2e-browser/setup-login.ts",
@@ -71,6 +70,8 @@
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
   "dependencies": {
+    "pg": "8.23.1",
+    "@base-ui/react": "1.9.0",
     "@larksuiteoapi/node-sdk": "^1.64.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@xterm/headless": "^6.0.0",
@@ -83,6 +84,7 @@
     "qrcode-terminal": "^0.12.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
+    "smol-toml": "^1.9.1",
     "ws": "^8.19.0",
     "yaml": "^2.9.0",
     "zod": "^3.23.0"
@@ -91,6 +93,7 @@
     "@napi-rs/canvas": "^0.1.65"
   },
   "devDependencies": {
+    "@types/pg": "8.23.1",
     "@midscene/test": "1.13.1",
     "@midscene/web": "1.13.1",
     "@playwright/test": "^1.58.2",

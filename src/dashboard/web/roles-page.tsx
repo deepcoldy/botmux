@@ -138,6 +138,7 @@ export function cloneListener(listener: MessageListenerData | null | undefined):
     ...(listener?.contentPolicy ? {
       contentPolicy: {
         ...(listener.contentPolicy.includeKeywords ? { includeKeywords: [...listener.contentPolicy.includeKeywords] } : {}),
+        ...(listener.contentPolicy.includeMentionedOpenIds ? { includeMentionedOpenIds: [...listener.contentPolicy.includeMentionedOpenIds] } : {}),
         ...(listener.contentPolicy.matchMode ? { matchMode: listener.contentPolicy.matchMode } : {}),
         ...(listener.contentPolicy.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
       },
@@ -1115,6 +1116,7 @@ export function MessageListenerEditor(props: {
   // equals what we just patched upward, so the inequality check never resets.
   const [keywordsText, setKeywordsText] = useState(() => (listener.contentPolicy?.includeKeywords ?? []).join('\n'));
   const policyKeywords = listener.contentPolicy?.includeKeywords ?? [];
+  const identityKeywords = listener.contentPolicy?.includeMentionedOpenIds ?? [];
   useEffect(() => {
     if (!sameStringList(parseListenerKeywords(keywordsText), policyKeywords)) {
       setKeywordsText(policyKeywords.join('\n'));
@@ -1338,6 +1340,46 @@ export function MessageListenerEditor(props: {
             }}
           />
         </label>
+        <label className="roles-listener-field">
+          <span className="roles-field-label">{tr('roles.listenerIdentityKeywords')}</span>
+          <select
+            aria-label={tr('roles.listenerAddIdentityKeyword')}
+            value=""
+            disabled={props.membersLoading}
+            onChange={ev => {
+              const openId = ev.currentTarget.value;
+              if (!props.membersLoading && props.members.some(member => member.openId === openId && member.memberType !== 'bot')) {
+                props.onContentPolicyPatch({ includeMentionedOpenIds: [...new Set([...identityKeywords, openId])] });
+              }
+            }}
+          >
+            <option value="" disabled>{tr('roles.listenerAddIdentityKeyword')}</option>
+            {props.members.filter(member => member.memberType !== 'bot' && !identityKeywords.includes(member.openId)).map(member => (
+              <option key={member.openId} value={member.openId}>{member.name}</option>
+            ))}
+          </select>
+        </label>
+        <div className="roles-listener-identity-keywords">
+          {identityKeywords.map(openId => {
+            const name = props.memberById.get(openId)?.name ?? openId;
+            return (
+              <button
+                type="button"
+                className="roles-listener-identity-keyword"
+                key={openId}
+                title={openId}
+                aria-label={tr('roles.listenerRemoveIdentityKeyword', { name })}
+                onClick={() => {
+                  const remaining = identityKeywords.filter(value => value !== openId);
+                  props.onContentPolicyPatch({ includeMentionedOpenIds: remaining.length ? remaining : undefined });
+                }}
+              >
+                <span>@{name}</span><span aria-hidden="true"> ×</span>
+              </button>
+            );
+          })}
+        </div>
+        <small className="roles-listener-scope-help">{tr('roles.listenerIdentityKeywordsHelp')}</small>
         <div className="roles-listener-policy-row">
           <label className="roles-listener-field" style={{ minWidth: 180 }}>
             <span className="roles-field-label">{tr('roles.listenerMatchMode')}</span>

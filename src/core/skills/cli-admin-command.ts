@@ -197,7 +197,7 @@ function runDelivery(args: string[]): AdminCommandResult {
 
 /**
  * Get/set the machine-wide default for built-in bridge-skill injection into
- * global-skillsDir CLIs (codex/gemini/opencode/…). No arg → print the current
+ * global-skillsDir CLIs (codex/opencode/…). No arg → print the current
  * effective default; `global|prompt|off` → persist it; `unset` → clear it so the
  * built-in `prompt` default applies. Per-bot overrides live in bots.json
  * (`skillInjection`) and win over this. Mirrors `botmux skills delivery`.

@@ -3,6 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { realpathSync } from 'node:fs';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { ensureGatewayEntry, inspectGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
   MCP_GATEWAY_FORWARDED_ENV_KEYS,
@@ -15,6 +17,7 @@ describe('plugin MCP Gateway installer', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-gateway-installer-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('TRAE_HOME', '');
     vi.stubEnv('BOTMUX_BIN_PATH', join(home, '.botmux', 'bin', 'botmux'));
   });
 
@@ -70,12 +73,24 @@ describe('plugin MCP Gateway installer', () => {
     expect(text).toContain('[mcp_servers.keep]');
     expect(text).toContain('[mcp_servers.botmux]');
     expect(text).toContain(`command = ${JSON.stringify(join(home, '.botmux', 'bin', 'botmux'))}`);
+    expect(text).toContain('tool_timeout_sec = 600');
     expect(text).toContain(
       `env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`,
     );
     expect(text.match(/\[mcp_servers\.botmux\]/g)).toHaveLength(1);
     expect(text).not.toContain('botmux plugin demo');
     expect(text).not.toContain('legacy-without-leading-marker');
+  });
+
+  it('writes the configured Gateway ceiling as the Codex outer timeout', () => {
+    const path = join(home, '.codex', 'config.toml');
+    const adapter = { id: 'codex', mcpGateway: { format: 'codex-toml' as const, configPath: path } };
+    expect(ensureGatewayEntry(adapter, {
+      command: join(home, '.botmux', 'bin', 'botmux'),
+      args: ['mcp', 'serve'],
+      maxToolTimeoutMs: 900_001,
+    }).state).toBe('installed');
+    expect(readFileSync(path, 'utf8')).toContain('tool_timeout_sec = 901');
   });
 
   it.each(['\n', '\r\n'])('preserves tables inserted before the gateway end marker (%j)', (newline) => {
@@ -191,6 +206,7 @@ describe('plugin MCP Gateway installer', () => {
       type: 'stdio',
       command: join(home, '.botmux', 'bin', 'botmux'),
       args: ['mcp', 'serve'],
+      timeout: 600_000,
       env: {
         [MCP_GATEWAY_OWNER_ENV]: '1',
         BOTMUX_SESSION_ID: '${BOTMUX_SESSION_ID:-}',
@@ -222,4 +238,39 @@ describe('plugin MCP Gateway installer', () => {
     expect(report.warning).toBeTruthy();
     expect(readFileSync(path, 'utf8')).toBe('{broken');
   });
+  it('keeps one shared gateway entry for TraeX and CoCo', () => {
+    const path = join(home, '.trae', 'traecli.toml');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, 'model = "test-model"\n\n[mcp_servers.keep]\ncommand = "keep"\n');
+    const traex = createTraexAdapter('/bin/traex');
+    const coco = createCocoAdapter('/bin/coco');
+
+    expect(ensureGatewayEntry(traex).state).toBe('installed');
+    expect(ensureGatewayEntry(coco).state).toBe('unchanged');
+    expect(inspectGatewayEntry(traex).state).toBe('configured');
+    const text = readFileSync(path, 'utf8');
+    expect(text).toContain('model = "test-model"');
+    expect(text).toContain('[mcp_servers.keep]\ncommand = "keep"');
+    expect(text).toContain(`env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`);
+    expect(text.match(/\[mcp_servers\.botmux\]/g)).toHaveLength(1);
+    expect(coco.sandboxReadonlyPaths?.()).toContain(path);
+    expect(traex.sandboxReadonlyPaths?.()).toContain(path);
+  });
+
+  it.each([createTraexAdapter, createCocoAdapter])('resolves TRAE_HOME dynamically for config installation and sandbox reads (%#)', (createAdapter) => {
+    const adapter = createAdapter('/bin/traecli');
+    for (const configured of ['~/custom-trae', join(home, 'absolute-trae')]) {
+      vi.stubEnv('TRAE_HOME', `  ${configured}  `);
+      const path = configured.startsWith('~')
+        ? join(home, configured.slice(1), 'traecli.toml')
+        : join(configured, 'traecli.toml');
+      expect(adapter.mcpGateway?.configPath).toBe(path);
+      expect(adapter.sandboxReadonlyPaths?.()).toContain(path);
+      expect(adapter.authPaths).not.toContain(path);
+      expect(ensureGatewayEntry(adapter).state).toBe('installed');
+      expect(ensureGatewayEntry(adapter).state).toBe('unchanged');
+      expect(inspectGatewayEntry(adapter).state).toBe('configured');
+    }
+  });
+
 });

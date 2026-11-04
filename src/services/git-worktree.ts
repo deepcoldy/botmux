@@ -26,6 +26,9 @@ export interface WorktreeCreation {
   /** Ref the branch was created from (e.g. `origin/master`); equals `branch`
    *  when an existing local branch was checked out instead. */
   baseRef: string;
+  /** Set when `reuseExisting` handed back a worktree that was already on disk
+   *  instead of creating one — botmux did not create that directory. */
+  reused?: true;
 }
 
 export interface CreateRepoWorktreeOptions {
@@ -151,7 +154,7 @@ async function reuseCompatibleWorktree(
     );
   }
   logger.info(`[git-worktree] reusing existing worktree ${worktreePath} on branch ${branch}`);
-  return { path: worktreePath, branch, baseRef: branch };
+  return { path: worktreePath, branch, baseRef: branch, reused: true };
 }
 
 async function addWorktreeOrReuseAfterRace(
@@ -711,6 +714,14 @@ export async function isLinkedWorktree(dir: string): Promise<boolean> {
 export async function removeRepoWorktree(repo: string, worktreePath: string): Promise<void> {
   await git(['worktree', 'remove', '--force', worktreePath], repo, 30_000);
   logger.info(`[git-worktree] removed worktree ${worktreePath}`);
+}
+
+/** `git worktree remove` WITHOUT `--force`: git itself still refuses a worktree
+ *  with modified or untracked files, a locked one, or one holding submodules.
+ *  Ignored content goes with the directory; the branch is always kept. */
+export async function removeCleanWorktree(repo: string, worktreePath: string): Promise<void> {
+  await git(['worktree', 'remove', worktreePath], repo, 30_000);
+  logger.info(`[git-worktree] removed clean worktree ${worktreePath}`);
 }
 
 /**

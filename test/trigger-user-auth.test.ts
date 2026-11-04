@@ -21,7 +21,8 @@ import {
   triggerUserAuthApplies,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
-  tokenStoreProtection, credentialSourceOf } from '../src/services/trigger-user-auth.js';
+  tokenStoreProtection, credentialSourceOf, delegatesOnMention } from '../src/services/trigger-user-auth.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('parseTriggerUserAuthConfig', () => {
   it('treats an absent field as "not configured at all"', () => {
@@ -112,21 +113,33 @@ describe('triggerUserAuthApplies', () => {
 });
 
 // An honest report, not a reassurance. Botmux keeps each token 0600, but the
-// agent runs as the SAME OS user, so without the file sandbox it can read every
-// person's token file directly. Per-person storage still fixes attribution and
-// the overwrite bug; only the sandbox makes the isolation OS-enforced.
+// agent runs as the SAME OS user, so unless the OS stops it the agent can read
+// every person's token file directly. Only the allowlist sandbox stops it:
+// scratch isolates writes and keeps the disk (other people's tokens and login
+// state included) readable.
 describe('tokenStoreProtection', () => {
-  it('reports enforced only when the file sandbox is on', () => {
-    expect(tokenStoreProtection(true)).toEqual({ enforced: true });
+  it('counts only the allowlist sandbox as protecting the token store', () => {
+    expect(tokenStoreProtection('oncall')).toEqual({ enforced: true });
+    expect(tokenStoreProtection('scratch').enforced).toBe(false);
+    expect(tokenStoreProtection('off').enforced).toBe(false);
   });
 
-  it('admits the gap when there is no sandbox, and names the fix', () => {
-    const report = tokenStoreProtection(false);
-    expect(report.enforced).toBe(false);
-    expect(report.advisory).toContain('sandbox');
-    // It must say what an agent can actually do, not just that something is
-    // "less secure" — an operator cannot weigh a vague warning.
-    expect(report.advisory).toContain('同一个系统用户');
+  it('tells a scratch bot something different from a bot with no sandbox', () => {
+    expect(tokenStoreProtection('scratch').advisory).toBeTruthy();
+    expect(tokenStoreProtection('off').advisory).toBeTruthy();
+    expect(tokenStoreProtection('scratch').advisory).not.toBe(tokenStoreProtection('off').advisory);
+  });
+
+  it('points at the Dashboard entry and mode the operator actually sees', () => {
+    // Both sides come from real data: the advisory must name the labels the
+    // Dashboard renders, or an operator cannot find the switch it describes.
+    const tr = createDashboardTranslator('zh');
+    for (const mode of ['off', 'scratch'] as const) {
+      const advisory = tokenStoreProtection(mode).advisory!;
+      for (const label of [tr('nav.botDefaults'), tr('botDefaults.tabSecurity'), tr('botDefaults.sectionSandbox'), tr('botDefaults.sandboxModeOncall')]) {
+        expect(advisory, `${mode}: ${label}`).toContain(label);
+      }
+    }
   });
 });
 
@@ -187,5 +200,26 @@ describe('credentialSource', () => {
   it.each(['device', 'machine', 'owner', 1, true])('rejects %s', (bad) => {
     expect(() => parseTriggerUserAuthConfig({ enabled: true, credentialSource: bad }))
       .toThrow(/credentialSource must be one of auto \| platform \| local/);
+  });
+});
+
+describe('delegateOnMention', () => {
+  it('is on by default and stored only when turned off', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true })).not.toHaveProperty('delegateOnMention');
+    expect(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: true })).not.toHaveProperty('delegateOnMention');
+    expect(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: false })?.delegateOnMention).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true }))).toBe(true);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: false }))).toBe(false);
+  });
+
+  it('needs the policy itself: there is no verified sender to hand over otherwise', () => {
+    expect(delegatesOnMention(null)).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: false }))).toBe(false);
+    expect(delegatesOnMention(parseTriggerUserAuthConfig({ enabled: true, tools: [] }))).toBe(false);
+  });
+
+  it.each(['yes', 1, {}])('rejects %j', bad => {
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, delegateOnMention: bad }))
+      .toThrow(/delegateOnMention must be a boolean/);
   });
 });

@@ -38,8 +38,9 @@ describe('trusted plugin result delivery', () => {
     const resolved = await resolveTrustedResultDeliveryLinkRefs({
       delivery,
       mode: 'enabled',
-      resolve: async payload => {
+      resolve: async (payload, responseKind) => {
         order.push('resolve');
+        expect(responseKind).toBe('final');
         return {
           ...payload,
           text: `授权：${resolvedUrl}`,

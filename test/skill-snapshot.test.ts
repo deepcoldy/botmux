@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   chmodSync,
+  constants as fsConstants,
   existsSync,
   linkSync,
   mkdirSync,
@@ -19,6 +20,7 @@ import { tmpdir } from 'node:os';
 
 import {
   __testOnly_snapshotNofollowFlags,
+  snapshotNofollowFlags,
   __testOnly_setSnapshotRaceHook,
   defaultSkillSnapshotTrust,
   plausibleConfiguredBotmuxHome,
@@ -92,6 +94,12 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
 
   it('uses the macOS all-components no-follow flag without the incompatible final-only flag', () => {
     expect(__testOnly_snapshotNofollowFlags('darwin')).toBe(0x20000000);
+    expect(__testOnly_snapshotNofollowFlags('linux')).toBe(fsConstants.O_NOFOLLOW);
+    expect(__testOnly_snapshotNofollowFlags('win32')).toBe(fsConstants.O_NOFOLLOW);
+    expect(snapshotNofollowFlags('darwin')).toBe(0x20000000);
+    expect(snapshotNofollowFlags('linux')).toBe(fsConstants.O_NOFOLLOW);
+    expect(snapshotNofollowFlags('win32')).toBe(fsConstants.O_NOFOLLOW);
+    expect(__testOnly_snapshotNofollowFlags).toBe(snapshotNofollowFlags);
   });
 
   it('copies exactly the enabled store skills (content, nesting, exec bit) and points the manifest at the snapshot', () => {

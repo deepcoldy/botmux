@@ -220,6 +220,126 @@ describe('remote runner explicit close', () => {
     expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
   });
 
+  it('retires an exited provider so the next close can reconcile through a fresh control worker', async () => {
+    const { ds, worker } = createFixture(true);
+
+    worker!.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(ds.worker).toBeNull();
+    expect(worker!.kill).toHaveBeenCalledWith('SIGTERM');
+
+    const wake = vi.fn(async (target: DaemonSession) => {
+      const replacement = createFakeWorker();
+      target.worker = replacement as never;
+      target.workerReady = true;
+      __testOnly_setupWorkerHandlers(target, replacement as never);
+      return true;
+    });
+    __testOnly_setRemoteRunnerExplicitCloseWake(wake);
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    expect(wake).toHaveBeenCalledOnce();
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
+  });
+
+  it('clears an uncertain close fence when the provider exit arrives after the close result', async () => {
+    const { ds, worker } = createFixture(true);
+    worker!.send.mockImplementation((message: { type: string; requestId?: string }) => {
+      if (message.type === 'close' && message.requestId) {
+        queueMicrotask(() => worker!.emit('message', {
+          type: 'close_result',
+          requestId: message.requestId,
+          ok: false,
+          error: 'provider exited during close',
+          recovery: 'uncertain',
+        }));
+      }
+    });
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: false,
+      error: 'remote_runner_close_reconciliation_required',
+      retryable: false,
+      recovery: 'uncertain',
+    });
+    expect(ds.remoteCloseState?.phase).toBe('uncertain');
+
+    worker!.emit('message', { type: 'claude_exit', code: 1, signal: null });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(ds.worker).toBeNull();
+    expect(ds.remoteCloseState).toBeUndefined();
+
+    const wake = vi.fn(async (target: DaemonSession) => {
+      const replacement = createFakeWorker();
+      target.worker = replacement as never;
+      target.workerReady = true;
+      __testOnly_setupWorkerHandlers(target, replacement as never);
+      return true;
+    });
+    __testOnly_setRemoteRunnerExplicitCloseWake(wake);
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    expect(wake).toHaveBeenCalledOnce();
+  });
+
+  it('does not relatch uncertainty when the provider exits while close is preparing', async () => {
+    const { ds, worker } = createFixture(true);
+    worker!.send.mockImplementation((message: { type: string; requestId?: string }) => {
+      if (message.type === 'close' && message.requestId) {
+        expect(ds.remoteCloseState).toMatchObject({
+          phase: 'preparing',
+          requestId: message.requestId,
+        });
+        queueMicrotask(() => worker!.emit('message', {
+          type: 'claude_exit',
+          code: 1,
+          signal: null,
+        }));
+      }
+    });
+    worker!.kill.mockImplementation(() => {
+      queueMicrotask(() => worker!.emit('exit', 1, null));
+      return true;
+    });
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: false,
+      error: 'remote_runner_close_reconciliation_required',
+      retryable: false,
+      recovery: 'uncertain',
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(ds.worker).toBeNull();
+    expect(ds.remoteCloseState).toBeUndefined();
+
+    const wake = vi.fn(async (target: DaemonSession) => {
+      const replacement = createFakeWorker();
+      target.worker = replacement as never;
+      target.workerReady = true;
+      __testOnly_setupWorkerHandlers(target, replacement as never);
+      return true;
+    });
+    __testOnly_setRemoteRunnerExplicitCloseWake(wake);
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    expect(wake).toHaveBeenCalledOnce();
+  });
+
   it('keeps a provider-proven retryable close active without latching a fence', async () => {
     const { ds, worker } = createFixture(true);
     worker!.send.mockImplementation((message: { type: string; requestId?: string }) => {

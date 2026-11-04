@@ -12,8 +12,11 @@ cases:
             timeout: 1_800_000
       - feishu.waitForStreamingCard:
           scenario: bot-claude-basic
+          # Opening the topic, the session card (with one reopen of a view that
+          # stopped updating) and the final check. 300s ran out twice in a row
+          # while Messenger loaded slowly (runs 40257129089, 40271295593).
           $:
-            timeout: 300_000
+            timeout: 480_000
       - feishu.waitForBotResponse:
           scenario: bot-claude-basic
           $:

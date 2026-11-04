@@ -1,110 +1,158 @@
-# 文件沙盒（Sandbox）
+# 文件与网络沙盒（Sandbox）
 
-把 AI 编程 CLI 安全地开放给**半可信**用户的隔离机制——常配合 [Oncall 模式](/oncall) 一起用。
+Botmux 提供多层次的运行隔离机制，保护你的宿主开发机免受意外写污染与敏感数据泄露。
 
-开了沙盒后，话题里的人让机器人改代码、跑命令，**所有写操作都被隔离**：真实文件一个字节都不会被改动；机器人却照常读取真实的项目 / 配置 / 登录态、原生干活（它根本不知道自己在沙盒里）。改完之后由 **owner 审阅 diff 卡片**，确认无误再「应用到磁盘」落回真实仓库，或直接丢弃。
+文件沙盒是**一个开关三档**，每个 Bot 单独配置，同时支持 **Linux** 与 **macOS**：
 
-适合把 oncall / 值班机器人开放给不完全信任的群成员、外部协作者：既让他们用 AI 改东西，又不怕真实仓库被误改、搞乱。
+| 模式（配置值） | 核心目标 | 可读范围 | 写入行为 | 典型场景 | 支持平台 |
+|---|---|---|---|---|---|
+| 关闭（`off`，缺省） | 不隔离 | 全部宿主文件 | 直达宿主真实文件 | 完全信任的个人本地环境 | 全平台 |
+| 白名单隔离（`oncall`，原「oncall 分享」；`sandbox: true` 即此档） | **保密防泄露** | 只有白名单路径可见，其余不存在（另有少量运行必需的只读挂载，见下） | 只有白名单里的可写路径能写，写入直达宿主 | 把 Bot 开放给群成员、外部协作者 | Linux + macOS |
+| 一次性草稿（`scratch`） | **防写污染（完全可弃）** | 宿主真实文件系统原生可读（只遮 botmux 自身凭证；**不隔离凭据**，其他人的 token 和登录态仍可读） | Linux：全根 Copy-on-Write（COW），**宿主零写入**；macOS：克隆树 COW、系统路径只读，但 `~/Library/Caches` 等缓存 / 偏好目录和系统临时目录仍写真实磁盘 | 自己做高风险实验、编译构建、防误操作 | Linux + macOS |
 
-## 它做什么 / 不做什么
+`bots.json` 里不写 `sandbox`（或写 `false`）就是关闭；写 `true` 等价于 `"oncall"`。旧字段 `readIsolation: true` 现在也按白名单隔离处理，daemon 启动时会自动迁移。
 
-| | |
-|---|---|
-| ✅ **写隔离** | 机器人的所有写入（改 / 建 / 删文件、跑 build）都落到一个隔离层，真实文件**永不被修改** |
-| ✅ **原生读** | 机器人读到的是**真实**文件系统——真实项目、真实 CLI 配置 / 代理 env，所以依赖、工具链全部照常，CLI「开箱即用」 |
-| ✅ **登录态持久** | CLI 的鉴权目录是**真实绑定**的——在沙盒里登录、刷新 token 都对真实生效、不会丢登录；项目改动依旧隔离 |
-| ✅ **零拷贝、省磁盘** | 基于 overlayfs，**不 clone 项目**；只有被改动的文件才占额外磁盘 |
-| ✅ **审阅后落盘** | owner 审 diff + patch 文件，确认再 `git apply` 回真实仓库，或丢弃 |
-| ✅ **额外只读输入** | 可用 `sandboxReadonlyPaths` 把兄弟仓库、生成文档、共享源码快照等只读暴露给机器人 |
-| ❌ **不隔离读** | 默认机器人能读**本机所有文件**（含 `bots.json`、`~/.ssh`、各种凭证）。要挡敏感路径需 per-bot 显式配置（见下「隐私屏蔽」） |
-| ⚠️ **默认不隔离网络** | 沙盒内默认可访问网络 / 代理；设 `sandboxNetwork: false` 可让会话进入独立网络命名空间 |
+> 💡 **如何选择？**
+> - **要把机器人分享给半信任的人（比如飞书群里所有人）** → 用**白名单隔离**。私钥、Token、凭证与其它代码库默认不可见，防探针与信息泄露。
+> - **你自己用，但要执行复杂构建、跑未验证脚本或重构** → 用 **`scratch`**。无需配置白名单，所有工具和依赖原生可用；改坏随时丢弃，宿主磁盘毫发无损。scratch 只隔离写入、不隔离凭据：agent 仍能读到这台机器上的密钥，以及其他人的 token 和登录态（`~/.botmux/data/` 下的 `user-token-*`、`lark-cli-home/` 等），**不适合**开放给不信任的人。多人共用的 bot 要隔离凭据，请用白名单隔离。
 
-> **一句话定位**：这是「**防误改 + 改动可审**」的隔离，不是「防一切」的安全沙箱。它保证真实仓库不被沙盒里的写操作污染、且每一笔改动都要 owner 点头才落盘；它**不**阻止机器人读取本机文件或访问网络——敏感内容请用下面的屏蔽机制挡住。
+---
 
-## 开启方式
+## 1. 白名单隔离（配置值 `oncall`）
 
-> **前置要求**：**Linux**（依赖 bubblewrap + overlayfs）。**root / 非 root 都支持**——root 用更快的内核 overlayfs，非 root 自动回退到 fuse-overlayfs。**依赖（bubblewrap / fuse-overlayfs）在开启沙盒时自动安装**，无需提前装；环境缺自动安装权限时会提示一条手动安装命令。Mac（sandbox-exec）在路线图上、暂未支持。
+将 CLI 限制在一个**按会话编译的文件白名单**中，读和写都走白名单，常与 [Oncall 模式](/oncall) 配合使用。群成员无论如何诱导模型，都只能访问项目所需的文件，**碰不到你的磁盘私钥、其它代码库或飞书应用凭证**。
 
-### 方式一：bots.json
+### 工作原理
 
-给某个 bot 加配置：
+- **全新文件系统根**：沙盒根是一个空的 `tmpfs`，`/proc`、`/dev` 重新挂载，`/tmp`、`/run`、`/var/tmp`、`/dev/shm` 都是会话私有的 `tmpfs`。Linux 上私有 `/run` 里另有少量运行必需的只读挂载：命令中转目录 `/run/sbxbin`、启用 MCP 插件网关时的 socket 目录、`/etc/resolv.conf` 软链到 `/run` 下时宿主的 resolver 文件（策略 deny 时不挂），以及位于 `/run` 下的 CLI / 解释器可执行目录（如 fnm、nvm 的 multishell 目录）。**不将 `$HOME` 整体挂入**。
+- **deny-by-default 白名单**：只有策略显式声明的路径才会挂进沙盒，读写档位逐条区分（可写 bind / 只读 bind / 空遮罩）：
+  - 项目工作目录（`workingDir`）可写，CLI 运行必需的工具与动态库只读；
+  - 默认硬阻断 `~/.ssh`、`~/.aws` 以及共享的 `~/.lark-cli`；
+  - `~/.botmux`（以及自定义的 botmux 数据目录）始终按白名单处理：即使 `workingDir` 是 `~`（缺省值）或更上层的目录，沙盒里也只能访问本会话需要的那部分（本 Bot 自己的 `bots/<appId>/`、`botmux` 命令和插件目录、本会话的记录文件），`bots.json`、Dashboard 密钥、其它 Bot 的目录都不可读写。工作目录不能设在 botmux 数据目录里面（本 Bot 自己的 `bots/<appId>/` 除外），否则会话拒绝启动；
+  - botmux 安装目录只读挂入，用来运行 `botmux` 命令。安装目录是 git 仓库时，其中没被 git 跟踪的文件（如 `.env`、Bot 配置、登录态、`data/`）和 `.git` 会被遮住，构建产物 `dist/`、`node_modules/` 照常可读；工作目录本身就在安装目录里时，工作目录下面的部分不遮；`sandboxPaths` 里授予安装目录或其上层目录不会解除遮罩。
+  - `workingDir` 缺省是 `~`，此时家目录里其它未遮罩的内容都可写，建议把工作目录指到具体项目目录（如 `~/proj`）。
+- **CLI 数据目录按 Bot 重定向（Claude 家族与 Codex）**：Claude Code（含同源的 Seed）和 Codex 的配置、会话记录、记忆写到该 Bot 的专属目录 `<BOTMUX_HOME>/bots/<appId>/`（`.../claude`、`.../codex`），不读写你全局的 `~/.claude`、`~/.codex`，这也是旧字段 `readIsolation` 的实际含义。其它 CLI（Cursor、Antigravity、Grok、Kimi 等）不做重定向，仍用宿主上的全局数据目录，按各自适配器声明的路径挂进沙盒（有的整目录可写，有的只挂凭证文件）。
+- **网络默认不隔离**：白名单只管文件。不配 `sandboxNetwork: false` 或 `sandboxNetworkPolicy` 时，沙盒内网络与宿主一致，见[网络沙盒](#4-网络沙盒network-sandbox)。
+- **底层实现**：
+  - **Linux**：基于 bubblewrap（bwrap）用户命名空间 + 细粒度只读/读写挂载；
+  - **macOS**：基于 Seatbelt（`sandbox-exec`）统一编译落地白名单规则。
+
+### 自定义路径（`sandboxPaths`）
+
+在 `bots.json` 中可针对特定 Bot 增加白名单或遮罩：
 
 ```jsonc
 {
-  "name": "oncall-bot",
-  "cliId": "claude-code",
-  "sandbox": true,                          // 开启文件沙盒
-  // 可选：屏蔽不想让机器人读到的敏感路径（默认空 = 全部可读）
-  "sandboxHidePaths": ["~/.ssh", "~/.botmux/bots.json"],
-  // 可选：额外暴露只读路径
-  "sandboxReadonlyPaths": ["/srv/source-snapshots/service-a"],
-  // 可选：关闭沙盒内网络出口
-  "sandboxNetwork": false
+  "sandbox": "oncall", // 或 true
+  "sandboxPaths": {
+    // 额外可写挂载的已存在路径
+    "readWrite": ["~/shared-output"],
+    // 额外只读挂载的已存在路径（共享源码快照、只读文档等）
+    "readOnly": ["/srv/shared-libs", "~/docs/runbooks"],
+    // 额外在沙盒内遮罩的敏感路径（空源挂载）
+    "deny": ["~/.kube", "/opt/confidential"]
+  }
 }
 ```
 
-详见 [bots.json 配置](/bots-json)。
+尚不存在的 `readWrite` / `readOnly` 路径会在启动时被过滤掉；要放行一个还没创建的文件，请放行它已存在的父目录。旧字段 `sandboxHidePaths`、`sandboxReadonlyPaths` 仍可读，daemon 启动时会自动迁移到 `sandboxPaths.deny` / `sandboxPaths.readOnly`。
 
-### 方式二：Dashboard
+### 多账号与凭证隔离
 
-进 Dashboard 的「**Bot 配置**」页，打开「**文件沙盒**」开关、保存即可。
+- **Codex 独立登录态（`codexAuthSync`）**：
+  设置为 `"isolated"` 时，Bot 会将 `CODEX_HOME` 指向独立的 `<BOTMUX_HOME>/bots/<appId>/codex`，从不读取或污染全局 `~/.codex`。这一项在关闭沙盒和白名单隔离下生效；不能与 `scratch`、`wrapperCli` 同时配置（这两种组合会拒绝启动会话）。会话绑定了非旧式 Codex 实例（`cliInstanceBinding`）时，`bots.json` 里的这一项不参与，以实例自身的认证方式为准，会话照常启动。
+- **Claude per-bot 账号（`credentialsSourceDir`）**：
+  配置凭证来源目录后，沙盒 Bot 每次冷启动都从该目录为自己注入 OAuth 凭证，多个沙盒 Bot 互不串号。对未开沙盒的 Bot 无效；不能与 `codexAuthSync: "isolated"` 同时配置。
+- **lark-cli 按 Bot 配置**：沙盒 deny 了共享的 `~/.lark-cli`，沙盒里要用 lark-cli，机器需先做按 Bot 拆分配置，见 [lark-cli 按 bot 隔离配置](https://github.com/deepcoldy/botmux/blob/master/docs/lark-cli-per-bot.md)。
 
-> **按会话固化**：开 / 关沙盒只对**新话题**生效。已经在跑的老会话保持原样——重启 daemon **不会**把历史会话无脑拖进沙盒模式。
+---
 
-## 落盘（`/land`）
+## 2. Scratch 模式（一次性草稿沙盒）
 
-机器人在沙盒里改完后，由 **owner** 在话题里发：
+**2026-09 引入**。为开发者自己提供的一个完全独立、可随时丢弃的轻量执行沙盒。
 
-```
-/land
-```
+### 核心特性
 
-会收到一张「**沙盒改动落盘**」卡片：
+1. **原生读、零额外配置**：机器人看到的是**完整的真实文件系统**。所有编译器、全局 npm/pip 包、`~/.gitconfig` 等照常读取，CLI 开箱即用。
+2. **全根 COW（Copy-on-Write）**：
+   - 容器内无论修改 `/etc`、安装全局软件包、修改 `$HOME` 还是改动项目文件，所有写操作都会被重定向到专用的 upper 隔离层；
+   - Linux 上**真实宿主磁盘零修改**，彻底消除环境污染和误删误改风险；macOS 上 `~/Library/{Caches,Application Support,Logs}` 与 `/private/tmp`、`/private/var/folders` 等系统临时目录仍写真实磁盘，不在「即焚」保证内。
+3. **实现机制**：
+   - **Linux**：基于 overlayfs（`lowerdir=/`）。root 采用内核 overlayfs，非 root 自动采用 `fuse-overlayfs`；子挂载点（如独立挂载的数据盘）递归创建专属 overlay 视图。
+   - **macOS**：基于 APFS clonefile 软链农场 + Seatbelt。核心 CLI 配置与项目目录通过 APFS COW 秒级克隆；大体积依赖与系统目录以符号链接 + write-seal 保护，保证即焚且秒级启动。
 
-- **改动统计**：N 个文件（+x / −y），以及落盘目标仓库路径
-- **diff 预览**：项目相对路径 + 真实增删行；过长自动截断
-- **完整 `.patch` 文件附件**：可 `git apply`，适合大改动离线 / 逐行审阅
-- **「应用到磁盘」/「丢弃」按钮**：**仅 owner 可点**
-
-点「**应用到磁盘**」→ 把隔离层里的改动集 `git apply` 回真实仓库；点「**丢弃**」→ 扔掉这次改动。**应用之前真实仓库不受任何影响**。
-
-> 实测过最硬的场景：让沙盒里的机器人改了 botmux **自己的运行源码**并重新编译，线上正在跑的进程毫发无损——改动全在隔离层，`/land` 后才落回。
-
-## 隐私屏蔽（`sandboxHidePaths`）
-
-默认沙盒**不限制读**——机器人能看到本机所有文件。如果某些路径不想让半可信的 oncall 机器人读到（私钥、密钥配置、其它项目等），在 `bots.json` 里 per-bot 配置：
+### 存储模式与参数配置
 
 ```jsonc
-"sandboxHidePaths": ["~/.ssh", "~/.aws/credentials", "/etc/some-secret"]
+{
+  "sandbox": "scratch",
+  // 存储模式：tmpfs（默认，内存即焚）或 disk（磁盘持久，跨重启可冷恢复）
+  "scratchStorage": "tmpfs",
+  // tmpfs 最大容量限制（MB，0 = 内核默认约半内存）
+  "scratchTmpfsSizeMb": 4096,
+  // 额外遮罩路径（botmux 凭证已默认强制遮罩）
+  "scratchDenyPaths": ["~/.ssh"]
+}
 ```
 
-被列的路径在沙盒里会被**空目录 / 空文件**遮罩。**没有默认值**——不配就是全可读（包括 `bots.json`）。按你对群成员的信任级别自行决定要挡哪些。
+- **`scratchStorage: "tmpfs"`**：数据完全驻留内存，关盒或系统重启后瞬间清空，极致干净。Linux 上要挂 tmpfs，**需要 daemon 以 root 运行**；非 root 主机请用 `disk`。
+- **`scratchStorage: "disk"`**：upper 层落在磁盘缓存中，daemon 重启后仍能通过冷恢复重新挂载续跑；会话正常关闭时自动清扫释放空间。
 
-## 额外只读路径（`sandboxReadonlyPaths`）
+---
 
-当机器人需要查看额外本地上下文、但不应该修改这些内容时，配置 `sandboxReadonlyPaths`：
+## 3. 配置方式
 
-```jsonc
-"sandboxReadonlyPaths": ["/srv/source-snapshots/service-a", "~/docs/runbooks"]
+### 方式一：Dashboard 一键切换
+
+在 Dashboard「**Bot 配置**」→ 选中 Bot →「**文件沙盒**」，提供三选一分段控件：
+- **关闭**
+- **白名单隔离**（配置值是 `oncall`；更名前的界面显示为「oncall 分享」）
+- **Scratch 一次性**（可进一步选内存即焚或磁盘持久）
+
+> 💡 **按会话固化**：修改沙盒配置对**新创建的会话**生效，存量运行中的会话保持原配置运行，重启 daemon 不会强制变更已有会话的沙盒形态。
+
+### 方式二：`bots.json`
+
+在 `~/.botmux/bots.json` 中配置：
+
+```json
+[
+  {
+    "name": "worker-bot",
+    "cliId": "claude-code",
+    "sandbox": "scratch",
+    "scratchStorage": "tmpfs"
+  },
+  {
+    "name": "public-oncall",
+    "cliId": "codex",
+    "sandbox": "oncall",
+    "sandboxPaths": { "deny": ["~/.kube"] }
+  }
+]
 ```
 
-每个已存在路径会以只读方式挂到沙盒里的同一路径（`~` 会展开为家目录）；不存在的项会被忽略。适合共享源码快照、参考仓库、生成文档、运行手册等不应进入 `/land` 改动集的输入。
+环境变量覆盖（适合测试或全局守护，对本机所有 Bot 生效）：`BOTMUX_SANDBOX=1`（白名单隔离）或 `BOTMUX_SANDBOX=scratch`。
 
-两条护栏：`sandboxHidePaths` 遮罩永远优先——与遮罩路径重叠的只读项不会重新暴露被隐藏的内容；等于或包含家目录 / 会话工作目录的项会被忽略并告警（否则会整体顶掉写隔离 overlay），工作目录*之下*的子路径不受影响。
+优先级：`BOTMUX_SANDBOX` 取 `1` / `oncall` / `scratch` 时强制所有 Bot 用该模式；未设、空、`0`、`false` 表示不强制，各 Bot 按自己的 `sandbox` 配置（旧配置 `readIsolation: true` 按白名单隔离），**不会关掉 Bot 自己开的沙盒**；其它取值报错拒绝启动。这个环境变量只能强制开，不能全局关。
 
-## 网络策略（`sandboxNetwork`）
+---
 
-默认沙盒保留网络访问，用于包安装、API 调用和 CLI 正常联网。配置：
+## 4. 网络沙盒（Network Sandbox）
+
+文件沙盒默认**不限制网络**：沙盒内 CLI 的网络与代理访问和宿主一致。需要限制时，额外配置以下任一项。
+
+### 基础完全阻断（`sandboxNetwork`）
 
 ```jsonc
 "sandboxNetwork": false
 ```
 
-会添加 `--unshare-net`，让 CLI 在无宿主网络的命名空间里运行。这个开关很硬：模型/API 访问、包管理器、git remote、代理都可能不可用，除非该 CLI 能完全依赖已经挂载好的本地输入工作。
+为沙盒添加 `--unshare-net`，CLI 将在没有外部网络接口的命名空间中运行。适合纯本地离线任务。
 
-## 分区目标 IP 网络策略（显式启用）
+### 分区目标 IP 过滤（`sandboxNetworkPolicy`）
 
-`sandboxNetworkPolicy` 将公网与内网分开管理。未配置时，`sandboxNetwork` 布尔值和历史会话行为保持不变；显式策略优先于该布尔值。新策略仅适用于 **Linux x64/arm64、本地 PTY、oncall 文件沙箱**。Docker 容器还必须允许创建用户/网络/PID 命名空间及命名空间内 nftables。macOS、scratch、持久终端、远程后端、adopt 和外部 App Server 均拒绝启动，不能给已有进程补装边界。**这是策略支持范围，不等于部署运行器已验收；standalone Bun + 原生 Codex 必须先通过下述新建/恢复模型回合验收，不能只因网络测试通过就迁移现有 tmux 部署。**
+为支持访问特定内网 API 或可信代理，可配置高级目标 IP 策略（仅白名单隔离 + Linux + PTY 后端）：
 
 ```json
 {
@@ -122,122 +170,115 @@
 }
 ```
 
-| 模式 | 行为 |
-|---|---|
-| `allow` | 放行该区域全部目标地址 |
-| `block` | 阻断该区域全部目标地址 |
-| `allowlist` | 仅放行任一规则匹配的目标；空列表全部阻断 |
-| `denylist` | 阻断任一规则匹配的目标，其余放行；空列表全部放行 |
+- **公网（public）与内网（private）分区控制**：每区支持 `allow`（全部放行）、`block`（全部阻断）、`allowlist`（白名单）、`denylist`（黑名单）。
+- **内核级 IP 过滤**：基于网络命名空间内的 nftables + slirp4netns，直接过滤实际数据包目标 IP，不依赖脆弱的环境变量。
+- **可信代理出口（`proxyMode: "trusted-egress"`）**：仅允许向已授权的代理地址发送流量。
+- **主机依赖**：`PATH` 上需要 `slirp4netns`（支持 `--disable-host-loopback`、`--disable-dns`）、`nft`、`ip`、`unshare`（支持 `--kill-child`、`--mount-proc`），且 bwrap 需支持 `--add-seccomp-fd` 与 `--disable-userns`。不会自动安装，缺任何一项会话都拒绝启动。
 
-两个区域可独立组合。先按实际目标地址分区，再执行该区域规则；规则之间为“任一匹配”，没有最长前缀覆盖或后项反转。跨区域 CIDR（如 `0.0.0.0/0`）只在所属区域内匹配。只接受 IP 和 CIDR，主机位会规范化；IPv4 映射 IPv6 地址与对应 IPv4 共用规则。规则省略 `protocol`/`ports` 时匹配全部协议/端口；`protocol` 仅接受 `tcp`/`udp`，`ports` 为 1–65535 整数列表，必须同时指定协议。域名、URL、通配符、端口范围及其它协议选择器会报错。
+启用前确认两个前提，否则会话「能启动但上不了网」或「直接起不来」：
 
-“内网”采用保守的非公网分类：IPv4 的 RFC1918、回环、链路本地、CGNAT、未指定、文档/测试、保留、组播空间；IPv6 的 `2000::/3` 之外全部空间，以及 `2001::/23`、`2001:db8::/32`、`2002::/16`、`3fff::/20`。这包含 ULA、回环、链路本地、组播、IPv4 翻译/过渡地址。IPv4 的完整集合见 `src/core/sandbox-network-policy.ts` 的 `PRIVATE_V4`；此静态分类保守处理特殊用途，不实时推导路由或 DNS 后缀。
+1. **DNS 必须显式填 `dnsServers`。** 配了策略后，沙盒里的 `/etc/resolv.conf` 只包含 `dnsServers` 里的地址，slirp4netns 自带的 DNS 转发也关闭；不填就没有任何 DNS，所有域名解析失败（`getaddrinfo EAI_AGAIN`），**全放行的策略也一样**。填宿主 `/etc/resolv.conf` 里的 nameserver 即可（宿主用 systemd-resolved 时那里是 `127.0.0.53`，沙盒访问不到，要填 `/run/systemd/resolve/resolv.conf` 里的上游地址）；这些地址即使在 `private` 段被阻断，也只放行它们的 53 端口。Dashboard 未配置时的默认模板会自动带上宿主当前的 nameserver。
+2. **宿主或 Bot 环境有代理变量时要设 `proxyMode`。** daemon 或 Bot 的 `env` 里有 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（含小写）时，非全放行的策略默认拒绝启动会话：代理会替 CLI 解析并转发目标，内核规则看到的只是代理地址。确认代理出口本身可信后加 `"proxyMode": "trusted-egress"`，内核规则仍只放行到代理自身的 IP；或者去掉这些代理变量。
 
-执行边界是任务实际发出的 **IP 数据包目标地址**。nftables 安装在新的网络命名空间中，随后才用通用 `slirp4netns` 接通网络；不依赖 HTTP_PROXY，也不修改宿主防火墙、Docker 或任何代理产品配置。直接 socket、改写/删除代理变量、IPv4 映射地址均受同一规则约束；DNS 结果变化、HTTP 重定向到另一个地址会重新受目标规则约束。模型 API 需要的目标 CIDR、端口和 DNS 必须获准。
+其它限制：
 
-该策略不解释加密流量或允许地址提供的应用功能。受限策略默认拒绝继承的 HTTP/HTTPS/ALL proxy 配置，环境变量不会被悄悄改写。可显式设置 `proxyMode: "trusted-egress"`，将代理后的业务目标控制委托给获准出口；`proxyMode: "reject"` 则明确拒绝这些代理环境变量，包括公网和内网全部放行的策略。字段缺省时保留原行为（两区均 `allow` 不拒绝代理）。
+- 只支持 Linux、**pty 后端**、oncall 沙盒。Bot 没单独设后端时，新会话用 daemon 的默认后端（tmux），需要在 Dashboard「会话后端」里显式改成 pty。配了策略后切换沙盒模式或后端会被拒绝，要先「清除网络策略」。
+- 策略在话题创建时随会话冻结。清除或修改后，已有话题（包括 daemon 重启后恢复的话题）仍按创建时的策略启动，需要新开话题才生效。
 
-**信任出口不等于限制代理后的目标**：内核仍过滤客户端实际连接的代理 IP/端口，未经授权的代理出口和直接内网连接继续被拒绝；但获准代理可以替客户端访问任何它能访问的地址，包括客户端策略禁止的内网。最终模型地址、域名、CONNECT/HTTP 请求及代理端 DNS 由部署层代理自身控制。本字段不创建代理、不填入环境变量、不修改具体代理产品配置，也不保证 CLI 会使用代理。`NO_PROXY` 和任务自行删改代理变量均不改变实际 IP 边界。
+---
 
-例如，代理环境变量由部署层提供，Botmux 仅信任已批准的内网出口：
+## 5. 安全设计与关键边界
 
-```json
-{
-  "sandbox": true,
-  "backendType": "pty",
-  "sandboxNetworkPolicy": {
-    "version": 1,
-    "proxyMode": "trusted-egress",
-    "public": { "mode": "block" },
-    "private": {
-      "mode": "allowlist",
-      "rules": [{ "cidr": "10.20.0.10", "protocol": "tcp", "ports": [8080] }]
-    }
-  }
-}
-```
+1. **`botmux send` 零凭证安全中转（Outbox 机制）**：
+   沙盒内的 CLI 调用 `botmux send` 发送卡片、文字或附件时，不会直接读取飞书凭据，而是将载荷写入每会话专用的 `outbox` 目录；宿主 daemon 监听该目录并在**沙盒外部**代为完成鉴权和投递。**飞书 App Secret 全程不注入沙盒环境**。
+2. **零注入模式兼容性**：
+   - 白名单隔离与零注入（`promptInjection: "none"`）完全兼容，Cursor 和 Antigravity 的转写目录以目录级 bind 穿透直挂；
+   - `scratch` 模式因结构化转写桥与全根 merged 视图的限制，暂不支持 Cursor 与 Antigravity 的零注入转写（其余 CLI 均正常支持）。
+3. **后端支持边界**：
+   - 支持 PTY、tmux 两种本地后端；
+   - zellij、herdr、zmx 等其它本地持久后端无法建立同样的文件边界，开沙盒会**拒绝启动**会话；
+   - Riff、remote-runner 等远端后端在远端机器上执行，本地沙盒开关**不生效**（会话照常启动，隔离由远端环境自己负责）；但这类后端如果同时配了 `sandboxNetworkPolicy`，会拒绝启动。
+   - mojo 视配置而定：能确认整个在远端执行时同上，本地沙盒不生效；会在本机执行时按本地后端处理，开沙盒拒绝启动。
 
-示例只有代理端点可连接；如果代理域名需要客户端解析，应另外显式授权 DNS。代理必须是命名空间可路由的 IP，宿主 `127.0.0.1`、Unix socket 和 slirp 网关别名不能借此开放。要求最终业务目标也受约束时，必须先在部署层限制代理转发范围，或选择直接出口。
+---
 
-命名空间自己的 `127.0.0.1`/`::1` 为本地进程通信保留，与宿主回环不同。宿主回环映射、转发器网关别名及宿主 DNS 转发始终关闭；IPv6 邻居发现只开放必要的链路控制报文。任务不能创建宿主 Unix socket，不能调用 setns/unshare 或 io_uring 绕过过滤，也没有网络管理能力；`socketpair` 等进程内部 IPC 保留。宿主 MCP Gateway/Unix IPC 无法同时兑现该边界时，启动会明确拒绝；文件 outbox 中转仍保留。
+## 6. 开启沙盒后的通用限制
 
-`dnsServers` 是独立、显式的 DNS 能力：这些 IP 的 TCP/UDP 53 优先于区域规则放行，最多 8 个；不能使用回环或转发器别名。缺省为空，不委托宿主 DNS。DNS 服务收到查询本身属于获准访问；最终业务连接仍按解析出的实际地址过滤。阻断所有外部通信时不要配置此能力。
+以下限制对白名单隔离和 scratch 都适用：
 
-需自行提供 iproute2 的 `ip`、`nft`、带 `--disable-host-loopback` 和 `--disable-dns` 的 `slirp4netns`，以及支持 `--disable-userns`/`--add-seccomp-fd` 的 bwrap。不会自动安装新网络工具。依赖缺失、命名空间/nft/转发器初始化失败均拒绝任务；转发器退出会终止该任务生命周期。无未过滤的回退路径。
+- **不能 adopt**：沙盒只能包住一个从头启动的 CLI，套不到已经在跑的进程上，沙盒 Bot 的 `/adopt` 会被拒绝，请改用新会话。
+- **Codex RPC 输入不启用**：任何沙盒下，Codex 都走普通终端输入，不走 RPC 输入通道（`codexRpcInput`）。
+- **动态单卡不启用**：沙盒会话沿用默认卡片模式，即使 Bot 配置了动态单卡也不会创建动态答复卡，详见[卡片](/cards)。
+- **Skill 是启动时的快照**：会话启动时，botmux 把已启用的受管 skill（skill 商店、插件里的）复制一份给该会话。之后更新 skill，正在运行的会话看不到，需要 `/restart` 或新开会话。链接安装（`local-link`）和 CLI 原生 skill 目录里的 skill 不会复制，在白名单隔离下不可用，`botmux skill show` 会提示改用复制安装。
+- **沙盒里装的东西不落到宿主**：在会话里让 CLI 安装全局 skill、全局包或改全局配置，白名单隔离下这些目录不可写或写到 Bot 专属目录，scratch 下写进一次性的 upper 层。需要全局生效的安装请在宿主上做（Dashboard 或宿主 shell）。
+- **子代理同样在沙盒里**：CLI 自己派生的子代理和子进程都是同一个沙盒进程的后代，继承同一套文件与网络限制。
 
-Dashboard 的安全页可保存 JSON 策略；状态表示“已配置，下个新会话采用”，不代表正在运行的会话已经切换。也可在宿主 CLI 使用：
+---
 
-```bash
-botmux sandbox-network-policy check policy.json
-botmux sandbox-network-policy set <appId> policy.json
-botmux sandbox-network-policy clear <appId>
-```
+## 7. 容器 / 受限主机上的前置条件 {#linux-namespace}
 
-`set`/`clear` 经目标在线 daemon 的认证配置接口原子写入；沙箱/会话内不得修改宿主策略。IM 的 `/config sandboxNetworkPolicy <JSON>` 使用同一校验/持久化入口。策略深拷贝到会话和 workflow 快照，fork/重启/恢复继续使用原策略；编辑机器人配置只影响新会话。清除后新会话回到原 `sandboxNetwork` 行为。
+Linux 沙盒依赖内核命名空间，在 Docker 等容器或加固过的主机里经常被默认策略挡住。按模式核对：
 
-### 持久会话的兼容边界与迁移
+- **用哪个 bwrap**：优先用系统包的 `/usr/bin/bwrap`、`/bin/bwrap`；两者都没有时才用 PATH 上的 bwrap，并在 daemon 日志里打一次警告。Codex 会在 `~/.local/bin/bwrap` 放一份自带定制版，它排在 PATH 前面时会让沙盒会话一启动就退出，警告里会点名；用系统包管理器装 `bubblewrap` 即可。
+- **软链的系统目录**：`/opt` 等基线目录本身是软链时，沙盒会在内部重建同样的软链，并把真实路径只读挂进去。
+- **不会靠去掉 PID namespace 降级运行**：普通部署即使新 PID namespace 里挂不上 procfs 也拒绝启动（仅核心专用部署 `BOTMUX_CORE_ONLY=1` 允许去掉 `--unshare-pid`）——同机其它 bot worker 的环境变量里有明文凭据，去掉 PID 隔离后沙盒内可经 /proc 读到。
 
-现有 tmux 会话不能通过填入新策略直接收紧。`TmuxBackend.spawn` 创建 pane 时由 tmux server 启动进程；恢复时只 attach 存活 pane，不重跑 CLI 的启动参数。当前 namespace/link 监督器随本地 PTY 的 worker 生命周期运行；worker 消失会关闭链路并终止任务，这与持久 pane 跨 worker 重启存活的约定不同。仅放开后端校验或保存一个 policy JSON，无法证明存活进程真的处于原边界中。因此本 PR 保持 tmux/zellij/herdr/zmx、adopt 和已有外部 App Server 的显式拒绝，不静默切换后端或取消策略。
+| 需要的能力 | 白名单隔离 | scratch | 网络策略 |
+|---|---|---|---|
+| bwrap + 非特权 user namespace + mount / PID namespace | ✅ | ✅ | ✅ |
+| root：内核 overlayfs；非 root：`fuse-overlayfs` + `/dev/fuse` | | ✅ | |
+| root（`scratchStorage: "tmpfs"` 时；非 root 用 `"disk"`） | | ✅ | |
+| bwrap 支持 `--add-seccomp-fd`、`--disable-userns`，及上节的网络工具 | | | ✅ |
 
-| 当前需要 | 可选择的迁移方式 | 实际结果 |
-|---|---|---|
-| 保留现有持久会话 | 暂不配置 `sandboxNetworkPolicy` | 保留旧运行方式；不能宣称已启用新边界 |
-| 计划启用客户端 IP 边界 | 先通过目标镜像的原生 PTY 新建/恢复模型回合验收，再配置 `backendType: "pty"` 与 `sandbox: true` 并创建新会话 | 运行器验收未完成前，不能建议现有部署切 PTY；边界随后在启动前建立 |
-| 已验收的 PTY 必须经部署层代理到模型服务 | 上述验收后的新会话 + 显式 `trusted-egress` + 代理实际 IP/端口规则 | 客户端出口受约束；代理后的业务目标由代理控制 |
-| 持久会话与最终代理目标都需限制 | 等待独立的持久边界支持，并部署代理自身 ACL | 本 PR 尚不能兑现；不移除拒绝门禁 |
+botmux **不会**在沙盒起不来时裸跑 CLI，而是拒绝启动会话。日志里常见的报错：
 
-PTY 是当前新策略允许的后端，不代表 standalone Bun + 原生 Codex 的部署模型回合已经跑通；已有 tmux pane 也不能原地迁移。编辑 Bot 配置只作用于新会话，旧会话/fork/恢复仍使用冻结快照。CLI 自身持久化的历史恢复与 tmux 活进程恢复是两回事；启动新 CLI 恢复历史时仍须重新建立新边界。
+- `sandbox requested but could not be established (bwrap missing or setup failed)`：白名单隔离起不来。
+- `scratch 沙箱没能建立：<原因>。<修法>`：scratch 起不来，话题里会直接给出原因和对应修法（缺依赖、非 root 用了内存存储、/dev/fuse 不可用、存储设置与会话不一致等）。只有机器重启后内存存储丢失这一种情况需要新开会话。选 scratch 时 Dashboard 也会先按本机条件提示「不能用 scratch」或「只能用磁盘存储」。
+- `[scratch-sandbox] tmpfs upper slot mount failed (non-root host? use scratchStorage "disk")`：非 root 主机用了 tmpfs 存储。
+- `[scratch-sandbox] missing deps (...)`：缺 bubblewrap 或 fuse-overlayfs，且无法自动安装（只在 root 或免密 sudo 时尝试）。
+- `bubblewrap cannot establish the required user/mount/PID namespaces`：主机探测失败，常见于容器。
+- `[device-credential-isolation] ... credential-only bubblewrap could not be established`：已接入托管平台、持有设备凭据的机器，无论 Bot 是否开沙盒都会用 bwrap 遮罩凭据；这条说明 bwrap 在这台机器上不可用。
 
-旧 Codex 会话还需单独验收实际工具目录。当前 `src/adapters/cli/codex.ts` 为新建会话传 `-C workingDir`，resume/fork 则复用不含 `-C` 的基础参数，可能继续使用 Codex 自己保存的原 cwd。只更新 BotConfig 或冻结 Session 的 `workingDir`，不能证明模型工具根目录已迁移。网络目标过滤本身不验证 cwd；与 oncall 文件边界、工作区根及工具上下文组合时，必须核对它们是否一致。
+### 排查步骤
 
-迁移方报告曾以 Codex 0.159.3 原生 app-server `thread/resume` 的 `cwd` 参数完成一次性目录迁移：9 条旧 cwd 记录保留 transcript 前缀、模型、审批及 sandbox 参数，同一 Codex ID 冷恢复后的实际 Python 工具验证了新 cwd。这是外部实跑证据，本分支未执行该迁移，也不据此保证其它版本行为；本 PR 不修复 adapter、不自动改写 Codex 历史或在线部署。
+1. 直接试 bwrap：
 
-#### 部署前运行器验收（当前存在独立阻塞）
+   ```bash
+   bwrap --unshare-user --unshare-pid --bind / / --proc /proc true && echo ok
+   ```
 
-迁移方报告了网络策略尚未参与的运行器失败：共享镜像中 Botmux 3.20.0 原生 Bun standalone + Codex 0.159.3，在 `sandbox: false`、`backendType: "pty"` 的新 HTTP virtual turn 中，`pty.spawn` 返回 PID 后约 15 ms 收到 `exitCode: 0 / signal: 1 (SIGHUP)`，输入尚未提交；相同参数经 Python PTY 启动 Codex 则保持存活。**这是迁移方的实跑报告，本 PR 未在同一镜像/版本组合独立复现，也没有修复或归因该运行器问题。** 短期保留原生 tmux，不以关闭网络策略或放宽权限冒充 PTY 兼容修复。
+   失败就说明命名空间被挡，先解决这一步，botmux 侧不用动。
+2. 检查非特权 user namespace 是否被关：
+   - `cat /proc/sys/user/max_user_namespaces`，为 `0` 表示禁用；
+   - 部分发行版还有 `/proc/sys/kernel/unprivileged_userns_clone`，为 `0` 表示禁用；
+   - 较新的 Ubuntu 可能由 AppArmor（`kernel.apparmor_restrict_unprivileged_userns`）限制非特权 user namespace。
+3. 在容器里时，容器的 seccomp 默认配置可能拦截 `clone` / `unshare` 创建 user namespace，AppArmor / SELinux 也可能拦截 `mount`。按你的容器运行时放宽：例如为容器指定允许这些系统调用的 seccomp 配置（`--security-opt seccomp=...`），必要时放宽 AppArmor 配置。
+4. scratch 非 root：确认 `ls -l /dev/fuse` 存在且 `fuse-overlayfs` 已安装；容器需要把 `/dev/fuse` 设备传进去（如 `--device /dev/fuse`）。scratch 以 root 用内核 overlayfs / tmpfs 时，容器还需要挂载能力（如 `--cap-add SYS_ADMIN`）。
+5. 网络策略：`bwrap --help` 里要能找到 `--add-seccomp-fd` 和 `--disable-userns`，版本太旧请升级 bubblewrap。
 
-另一个独立报告是 HTTP virtual/noTransport tmux 在无 server 时产生 `probe: unknown` 而被原生门禁拒绝。当前代码可验证：`worker.ts` 的 policy-off 迁移分支对 `noTransportSession && tmux` 生效，`unknown` 经状态机拒绝，不能当作已证明缺失而跳过；普通 transport-enabled、策略关闭且无旧 provenance 的会话不受这条 noTransport 分支约束（其它显式隔离或旧 provenance 仍可能触发门禁）。这不是新网络策略导致的失败，也不能推广为全部 tmux 会话不可用；本 PR 不绕过原门禁。
+放宽容器隔离会降低容器本身的安全边界，请按你的环境评估。
 
-现有网络 CI 的 PTY 用例用普通运行时管理真实 PTY，standalone 用例另行验证网络 runner 自重执行；两者组合不等于 standalone worker 的 Codex 回合测试。`test/pty-native-smoke.test.ts` / `src/cli/pty-smoke.ts` 还刻意不构建 `tty.ReadStream` 包装，不能代替生产 `PtyBackend` 的存活及提交验收。本 PR 的本地/内核绿不能解除上述部署阻塞。
+---
 
-启用网络策略前，目标镜像必须完成以下前置验收并保存结果：
+## 8. 容易混淆的三件事
 
-1. 固定镜像及 Botmux/Bun/Codex 实际版本，使用原生 standalone worker 和生产 `PtyBackend`，不以 Python PTY、自定义 runtime 或绕过 ReadStream 的 helper 代替。先在 `sandbox: false` 下验证原生运行器，再在 oncall + 网络策略下验证。
-2. 新建会话须保持存活直到 prompt ready，实际提交输入并得到完整模型回合及可回读结果；记录 PID、ready/submit/response 时间及退出 code/signal。spawn 返回 PID、短暂存活或退出 0 均不构成成功。
-3. 恢复已保存的 Codex 历史，由新 worker/CLI 建立新 PTY 并完成下一模型回合；验证恢复身份、提交与结果回读。要求模型实际工具在未先执行 `cd`、未覆盖工具 cwd 的情况下回读 `pwd` 或 Python `os.getcwd()`，保存工具执行结果，按规范化路径核对预期工作根、Session 快照及文件策略根；不能只检查 Botmux JSON、模型文字回答或提示词。目录迁移还须确认原 Codex ID、transcript 前缀、模型/审批/sandbox 参数保持预期；cwd 不符时验收失败，目录修复作为独立迁移处理。PTY 不承诺活进程跨 worker 重启存活，不把它写成 tmux reattach。
-4. HTTP virtual/noTransport 与正常 transport 形状分别用隔离测试装配验收；IM 发送调用用测试替身拒绝并计数为 0，不发真实消息。模型可先使用协议兼容的本地 fixture，但须标明 fixture 与实际模型验收的区别；DNS、部署层代理及最终目标 ACL 应另行验证。
-5. 单独验证 tmux 无 server/探测 unknown 的失败与已有 server 的路径，保留 tri-state 门禁语义；不得通过把 unknown 强制当 missing 或改成虚假 transport-enabled 来消除阻塞。未通过时继续保留原 tmux 部署，将运行器和 noTransport 问题作为独立修复需求。
+- **Oncall 目录 ≠ 沙盒**：`/oncall bind <目录>` 只是把 Bot 在本群锚定到一个工作目录，并让群成员能直接对话；它**不限制** CLI 能读写哪些文件。要限制文件访问，另开白名单隔离。
+- **CLI 免审批 ≠ 关闭沙盒**：botmux 默认给 CLI 追加的免审批参数（`--dangerously-*`、`--yolo` 等，可用 `disableCliBypass` 关掉）只关掉 CLI **自带**的审批 / 沙盒；botmux 的文件沙盒在 CLI 外层，照样生效。
+- **`/grant` 只给对话权**：`/grant` 让成员能和 Bot 对话，不给 `/cd`、`/restart` 等操作权，也不改变 Bot 的沙盒与凭证。详见[权限与授权](/permissions)。
 
-后续持久后端需求应独立实现并验收：在启动 shell/CLI 前建立边界；为每代 pane/真实 CLI PID 绑定不可由任务改写的策略摘要、namespace 身份与监督器代际；daemon/worker 重启后核验这些证据及实际存活状态，缺失或不符时拒绝附着；由独立监督器管理 namespace/nft/link 的持久生命周期，转发器死亡必须终止关联任务；清理、pane 替换、并发恢复与 adopt 均不能复用过期证明。验收需真实 tmux、新建/重附着、worker/daemon 重启、转发器死亡、篡改/旧证明、跨会话与 IPv4/IPv6 回归，不能以存储字段或 session 名称代替边界证明。
+---
 
-### 隔离 Linux 验证
+## 9. 多人共用时的隔离分层
 
-先 `bun run build`，然后在专用测试目录的外层网络命名空间中准备测试地址。网关测试在外层 loopback 的 `10.0.2.3` 及主机 loopback 地址监听服务，确保删除网关拒绝规则时能观察到实际连接。下面只修改新命名空间，不修改宿主网络：
+一个 Bot 给多人用时，隔离是叠出来的，没有单独一项能全包。
 
-```bash
-unshare -Urn sh -c '
-  set -e
-  ip link set lo up
-  ip addr add 93.184.216.34/32 dev lo
-  ip addr add 10.77.0.1/32 dev lo
-  ip addr add 10.0.2.3/32 dev lo
-  ip -6 addr add 2606:4700::100/128 dev lo nodad
-  ip -6 addr add fd55::1/128 dev lo nodad
-  BOTMUX_NETWORK_POLICY_INTEGRATION=1 bun run test test/sandbox-network-linux.test.ts
-'
-```
-
-测试默认跳过；显式启用后，依赖或内核能力缺失会失败，不能把跳过当作边界验证通过。设置 `BOTMUX_NETWORK_TEST_BINARY` 为 `build:bun` 产物的绝对路径后，还会验证单文件自重执行；未设置时仅该编译态用例跳过。`Sandbox network boundary` CI 在相关 PR 中构建真实二进制并执行全部边界用例。模型请求用隔离 HTTP 测试服务，不调用真实供应商。
-
-## 注意事项
-
-1. **仅 Linux**：依赖 bwrap + overlayfs（非 root 自动用 fuse-overlayfs，依赖开沙盒时自动装）；Mac（sandbox-exec）暂未支持。
-2. **读不隔离**：默认全可读，挡敏感凭证要主动配 `sandboxHidePaths`（见上）。
-3. **网络默认开放**：只有确认机器人能接受无网络 / 无代理时，才设置 `sandboxNetwork: false`。
-4. **build 产物会进改动集**：如果机器人在沙盒里跑了 `pnpm build` / 编译，产物（如 `dist/`）也会出现在 `/land` 的改动集里。落盘前**看清 diff**，别把编译产物 `apply` 覆盖真实仓库。
-5. **机器人无感**：它看到的是 overlay 合并视图，以为改的就是真文件、照常工作；「隔离」对它完全透明。
-6. **`botmux send` 照常**：沙盒里 `botmux send` 通过 daemon 中转正常发消息、附图、附件、自定义卡片 JSON（应用凭证不进沙盒环境）。
-
-## 配合 Oncall 起飞
-
-文件沙盒 + [Oncall 模式](/oncall) 是绝配：oncall 把机器人开放给一群人随时 @，沙盒保证这群人的改动**不会动到真实仓库**、且**每笔改动 owner 审阅后才落盘**。半可信、多人、随时改的 oncall 场景的标准搭配。
+| 层 | 隔离什么 | 不隔离什么 | 在哪配 |
+|---|---|---|---|
+| 会话 | 每个话题一个独立 CLI 进程、独立上下文与会话记录 | 文件：各会话看到的是同一份宿主文件，指向同一目录时互相能看到对方的改动；账号：共用 Bot 的模型账号与凭证 | 自动（每个新话题一个会话） |
+| worktree | 每个话题在独立 git worktree / 分支上改代码，互不覆盖 | 文件访问范围不变，仍能读写 worktree 之外的宿主文件 | `/tw`、`/repo wt <仓库> [分支]`，见[斜杠命令](/slash-commands) |
+| 文件沙盒：关闭 | 无 | 全部 | `sandbox` 缺省 / `false` |
+| 文件沙盒：白名单隔离 | 白名单之外的文件读写；凭证、其它仓库、其它 Bot 的数据；Claude 家族与 Codex 的 CLI 数据目录按 Bot 分开 | 白名单内的文件（包括工作目录）写入直达宿主，`workingDir` 缺省为 `~` 时整个家目录都在白名单内；其它 CLI 仍用宿主全局数据目录；网络默认不隔离；同一 Bot 的会话共用 Bot 的模型账号和 CLI 数据目录（能看到同一 Bot 其它会话的记录） | `sandbox: "oncall"` + `sandboxPaths` |
+| 文件沙盒：scratch | 写入（落在一次性 COW 层），botmux 凭证 | 读：宿主大部分文件可读；macOS 上缓存 / 偏好与系统临时目录仍写真实磁盘；网络默认不隔离 | `sandbox: "scratch"` + `scratchStorage` |
+| 按人工具凭据 | lark-cli 等受管工具按**本轮发送者**的个人授权执行，未授权时拒绝，不借用 owner 或他人的登录 | 模型账号、文件访问和其它未受管工具仍是机器 / Bot 身份 | `triggerUserAuth`；飞书侧个人授权用 `/login`，其它受管工具未授权时会收到授权链接 |
+| 模型账号 | 不同 Bot 用不同模型账号（Claude：`credentialsSourceDir`，需开沙盒；Codex：`codexAuthSync: "isolated"`） | 按 Bot 分，不按人分：同一 Bot 的所有使用者共用一个模型账号 | `bots.json` 对应字段 |
+| OS 用户 | 系统级文件权限、进程、家目录完全分开 | botmux 不提供这一层：一个 daemon 下所有 Bot 和会话都以同一个系统用户运行 | 每个系统用户各自部署一套 botmux（各自的 `~/.botmux`） |

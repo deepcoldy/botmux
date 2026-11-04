@@ -104,6 +104,7 @@ vi.mock('../src/config.js', async () => {
 
 vi.mock('../src/core/cost-calculator.js', () => ({
   getSessionTokenUsage: vi.fn(() => null),
+  getSessionUsageWithContext: vi.fn(() => ({ snapshot: { context: null, tokens: null, turnTokens: null } })),
   getSessionUsageSnapshot: vi.fn(() => ({
     context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
     tokens: { in: 67_890, out: 123 },
@@ -346,7 +347,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledOnce();
     expect(sessionReply.mock.calls[0][1]).toContain(fullUrl);
     expect(sessionReply.mock.calls[0][1]).not.toContain('{{botmux_link:');
-    expect(clearPendingDraft).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(clearPendingDraft).toHaveBeenCalledOnce());
     expect(msg.content).toBe(unresolved);
   });
 
@@ -511,13 +512,40 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     });
   });
 
-  it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
-    'does not add host image uploads to %s sessions', async mode => {
+  it.each(['workspace', 'temporary'])('uploads a local Codex App %s screenshot before replying', async location => {
+    const dir = mkdtempSync(join(location === 'workspace' ? config.session.dataDir : tmpdir(), 'codex-reply-image-'));
+    try {
+      const png = Buffer.from('89504e470d0a1a0a', 'hex');
+      const path = join(dir, 'receipt.png');
+      writeFileSync(path, png);
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'codex-app';
+      ds.workingDir = config.session.dataDir;
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), content: `Submitted. ![Receipt](${path})` }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toContain('![Receipt](img_v3_uploaded_preview)');
+      expect(sessionReply.mock.calls[0][1]).not.toContain(path);
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'].flatMap(mode =>
+    (mode === 'non-adopted' ? ['claude-code'] : ['claude-code', 'codex-app']).map(cliId => ({ mode, cliId }))))(
+    'does not add host image uploads to $mode $cliId sessions', async ({ mode, cliId }) => {
       writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
       const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = makeDs();
       ds.workingDir = config.session.dataDir;
+      ds.session.cliId = cliId;
       if (mode === 'non-adopted') ds.adoptedFrom = undefined;
       if (mode === 'sandbox') ds.session.sandbox = true;
       if (mode === 'remote') ds.session.backendType = 'remote-runner';
@@ -533,6 +561,50 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
     },
   );
+
+  it('does not upload workspace images when the bot-level sandbox is the oncall string mode', async () => {
+    // The explicit sandboxBoolValue(...) gate (not only the lexical home-link
+    // mode) must reject the 'oncall' string configured at the bot level even
+    // when the per-session sandbox boolean is left unset.
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    ds.session.cliId = 'codex-app';
+    ds.adoptedFrom = undefined;
+    const bot = getBot('app_test');
+    bot.config.sandbox = 'oncall';
+    vi.mocked(getBot).mockReturnValue(bot);
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).not.toHaveBeenCalled();
+  });
+
+  it('never treats the system temp dir as an upload root for a non-codex-app adopted session', async () => {
+    // allowTemporaryImages is codex-app-only: an adopted Claude Code session may
+    // auto-upload workspace images, but a screenshot living under the system
+    // temp dir (outside its workspace) must not be read by the host.
+    const dir = mkdtempSync(join(tmpdir(), 'adopt-reply-image-'));
+    try {
+      const png = Buffer.from('89504e470d0a1a0a', 'hex');
+      const path = join(dir, 'receipt.png');
+      writeFileSync(path, png);
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.workingDir = config.session.dataDir;
+      ds.session.cliId = 'claude-code';
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), content: `Submitted. ![Receipt](${path})` }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(uploadImageMock).not.toHaveBeenCalled();
+      expect(sessionReply.mock.calls[0][1]).toContain(path);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('reuses the uploaded key and UUID after a final-output send failure', async () => {
     writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
@@ -652,13 +724,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(call[5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
     }
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
-    expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_reply');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_reply'));
   });
 
   it.each([
-    { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } },
     { response: { status: 400, data: { code: 230001, msg: 'Invalid request' } } },
-    { response: { status: 400, data: { code: 230099, msg: 'ErrCode: 200571; card contains invalid image keys' } } },
     new Error('Request failed with status code 400'),
     new Error('card contains invalid image keys'),
   ])('does not treat an unrelated rejection as permission to downgrade images: %j', async error => {
@@ -769,7 +839,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       msgType: 'interactive',
     }));
     expect(sessionReply).not.toHaveBeenCalled();
-    expect(onComplete).toHaveBeenCalledWith(true, 'om_durable');
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_durable'));
   });
 
   it('keeps the reply-card write fence on the non-primary final path', async () => {
@@ -1223,7 +1293,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
     expect(ds.completedIdleTurnId).toBe('turn-1');
-    expect(onComplete).toHaveBeenCalledWith(true, 'om_reply');
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_reply'));
   });
 
   it('commits dedup uuid only after a successful sessionReply', async () => {
@@ -1374,7 +1444,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
     expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+    const delivery = await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_oncall_answer');
     expect(delivery).toMatchObject({ cardMode: 'card' });
     expect(delivery?.policy).toBeUndefined();
@@ -1401,13 +1471,15 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toBeUndefined();
+    expect(await feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toBeUndefined();
     await vi.advanceTimersByTimeAsync(10);
 
-    expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toMatchObject({
-      platformMessageId: 'om_feedback_answer',
-      policy: expect.objectContaining({ enabled: true }),
-      baseCard: expect.objectContaining({ schema: '2.0' }),
+    await vi.waitFor(async () => {
+      expect(await feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toMatchObject({
+        platformMessageId: 'om_feedback_answer',
+        policy: expect.objectContaining({ enabled: true }),
+        baseCard: expect.objectContaining({ schema: '2.0' }),
+      });
     });
   });
 
@@ -1474,7 +1546,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    expect((await getSkillFeedbackStore(config.session.dataDir))
+    expect(await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_everyone_feedback'))
       .toMatchObject({ policy: { audience: 'everyone', reviewers: [] } });
   });
@@ -1501,7 +1573,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(resolveAllowedUsersWithMapMock).toHaveBeenCalledWith('app_test', ['reviewer@example.com']);
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+    const delivery = await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_email_feedback');
     expect(delivery?.policy?.reviewers).toEqual(['ou_email_reviewer']);
     expect(JSON.stringify(delivery?.policy)).not.toContain('reviewer@example.com');
@@ -1560,7 +1632,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // The card still ships (control visible) and the snapshot keeps the cached
     // id, so the configured real reviewer is not rejected.
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+    const delivery = await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_transient_feedback');
     expect(delivery?.policy?.reviewers).toEqual(['ou_oncall_cached']);
   });
@@ -1600,7 +1672,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    expect((await getSkillFeedbackStore(config.session.dataDir))
+    expect(await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_empty_reviewers_feedback'))
       .toMatchObject({ policy: { audience: 'reviewers', reviewers: [] } });
   });
@@ -1617,7 +1689,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // But the delivery is still recorded so a later turn_terminal correlates to
     // a turn.completed event — feedback is independent of completion bookkeeping.
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+    const delivery = await (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_plain_answer');
     expect(delivery).toMatchObject({ cardMode: 'card' });
     expect(delivery?.policy).toBeUndefined();
@@ -1899,6 +1971,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
     expect(sessionReply.mock.calls[0][5]?.replyTarget)
       .toEqual({ mode: 'thread', rootMessageId: 'om_topic_a' });
+    await vi.waitFor(() => expect(ds.finalOutputDeliveriesInFlight?.size ?? 0).toBe(0));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-b'));
 
     (ds.worker as any).emit('message', {
       type: 'codex_app_dispatch_transition',
@@ -1919,6 +1993,186 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
     expect(sessionReply.mock.calls[1][5]?.replyTarget)
       .toEqual({ mode: 'thread', rootMessageId: 'om_topic_b' });
+  });
+
+  it.each([
+    { imageRejected: false, noticeFails: false },
+    { imageRejected: true, noticeFails: false },
+    { imageRejected: false, noticeFails: true },
+  ])('settles permanent card rejection without replay or blocking the next turn: %j', async ({ imageRejected, noticeFails }) => {
+    const rejection = imageRejected
+      ? new Error('Failed to reply message: ErrCode: 200570; card contains invalid image keys (code: 230099)')
+      : { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } };
+    const sessionReply = vi.fn().mockRejectedValueOnce(rejection);
+    if (imageRejected) sessionReply.mockRejectedValueOnce(rejection);
+    if (noticeFails) sessionReply.mockRejectedValueOnce(new Error('notice unavailable'));
+    sessionReply.mockResolvedValue('om_reply');
+    const closeSession = vi.fn();
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-a', turnId: 'turn-a', state: 'prepared', content: 'A',
+        replyTarget: { mode: 'thread', rootMessageId: 'om_topic_a' } },
+      { dispatchId: 'dispatch-b', turnId: 'turn-b', state: 'accepted', content: 'B' },
+    ];
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const final = {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: imageRejected ? 'Answer A. ![Preview](img_v3_rejected)' : 'Answer A.',
+      lastUuid: 'uuid-a', turnId: 'turn-a',
+      codexAppSettlement: {
+        requestId: 'settle-a', generation: 'generation-1', seq: 1, dispatchId: 'dispatch-a',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>;
+    worker.emit('message', final);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toHaveLength(1));
+    const expectedCalls = imageRejected ? 3 : 2;
+    expect(sessionReply).toHaveBeenCalledTimes(expectedCalls);
+    const notice = sessionReply.mock.calls.at(-1)!;
+    expect(notice[2]).toBe('text');
+    expect(notice[1]).toContain('230099');
+    expect(notice[1]).not.toContain('Answer A.');
+    expect(notice[5].replyTarget).toEqual({ mode: 'thread', rootMessageId: 'om_topic_a' });
+    expect(notice[5].uuid).toHaveLength(50);
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: 'card content 230099' });
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'codex_app_dispatch_persisted', requestId: 'settle-a', ok: true,
+    }));
+    expect(updateSessionMock).toHaveBeenCalled();
+
+    worker.emit('message', { ...final, codexAppSettlement: { ...final.codexAppSettlement, requestId: 'replay-a' } });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(expectedCalls);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'codex_app_dispatch_persisted', requestId: 'replay-a', ok: true,
+    }));
+
+    worker.emit('message', {
+      type: 'codex_app_dispatch_transition', sessionId: ds.session.sessionId,
+      requestId: 'prepare-b', operation: 'submit', entries: [{ dispatchId: 'dispatch-b', turnId: 'turn-b' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+    worker.emit('message', {
+      ...final, content: 'Answer B.', turnId: 'turn-b', lastUuid: 'uuid-b',
+      codexAppSettlement: { requestId: 'settle-b', generation: 'generation-1', seq: 2, dispatchId: 'dispatch-b' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toHaveLength(0));
+    expect(sessionReply).toHaveBeenCalledTimes(expectedCalls + 1);
+    expect(sessionReply.mock.calls.at(-1)?.[1]).toContain('Answer B.');
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
+  it('retries a 230099 reply for a meeting receiver instead of sending the permanent-rejection notice', async () => {
+    // A 230099 on a managed VC-meeting receiver is NOT a permanent card
+    // rejection for this delivery path: the original card must be retried and
+    // the fixed text notice (and attention row) must never fire.
+    const cardRejection = { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } };
+    const sessionReply = vi.fn()
+      .mockRejectedValueOnce(cardRejection)
+      .mockResolvedValueOnce('om_vc_retry');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-230099',
+      memberId: 'member-230099', memberEpoch: 1,
+    };
+    const origin = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-230099', memberId: 'member-230099',
+      memberEpoch: 1, agentAppId: 'app_test', ownerBootId: 'owner-boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_230099',
+      replyTargetSenderOpenId: 'ou_human_a',
+    };
+    expect(applyVcMeetingMemberProjection(config.session.dataDir, {
+      listenerAppId: origin.listenerAppId,
+      meetingId: origin.meetingId,
+      memberId: origin.memberId,
+      memberEpoch: origin.memberEpoch,
+      agentAppId: origin.agentAppId,
+      ownerBootId: origin.ownerBootId,
+      ownerEpoch: origin.ownerEpoch,
+      role: 'minutes',
+      membershipGeneration: origin.membershipGeneration,
+      status: 'active',
+      responseMode: 'silent',
+      capabilities: ['meeting.read'],
+      ownedSinks: [],
+      sinkOwnerGeneration: origin.sinkOwnerGeneration,
+      joinedAtIngestSeq: 0,
+      receiverSessionId: origin.receiverSessionId,
+      outputChatId: ds.chatId,
+    })).toMatchObject({ ok: true });
+    ds.session.vcMeetingImTurnOrigins = { om_human_230099: origin };
+    const msg = {
+      ...finalOutputMsg(),
+      content: 'Meeting answer after the card rejection.',
+      turnId: 'om_human_230099',
+      lastUuid: 'bridge-230099',
+    };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // Same card retried exactly once; neither send is the fixed text notice.
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(call[2]).not.toBe('text');
+      expect(call[1]).toContain('Meeting answer after the card rejection.');
+    }
+    expect(ds.agentAttention).not.toMatchObject({ kind: 'blocked' });
+  });
+
+  it('retries a 230099 doc-comment reply instead of sending the permanent-rejection notice', async () => {
+    // The document-comment channel delivers via replyToDocComment, not an
+    // interactive Lark card; a 230099 there must retry the comment and must not
+    // post the ordinary-Lark fixed text notice (which would go to the wrong
+    // surface) or settle the turn as permanently rejected.
+    const cardRejection = { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } };
+    replyToDocCommentMock
+      .mockReset()
+      .mockRejectedValueOnce(cardRejection)
+      .mockResolvedValueOnce(undefined);
+    const sessionReply = vi.fn(async () => 'om_doc');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const target = {
+      fileToken: 'doc-token-230099',
+      fileType: 'docx',
+      commentId: 'comment-230099',
+      replyId: 'reply-230099',
+      reactionId: 'reaction-230099',
+    };
+    ds.docCommentTurns = new Map([['turn-1', target]]);
+    ds.session.docCommentTargets = {
+      'turn-1': { ...target, turnId: 'turn-1' },
+    };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // The comment is retried on the document surface; no IM notice is posted.
+    expect(replyToDocCommentMock).toHaveBeenCalledTimes(2);
+    expect(replyToDocCommentMock.mock.calls[0][0]).toBe('app_test');
+    expect(replyToDocCommentMock.mock.calls[1][0]).toBe('app_test');
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.agentAttention).not.toMatchObject({ kind: 'blocked' });
   });
 
   it.each(['doc_comment', 'http_wait', 'http_async', 'suppressed'] as const)(
@@ -3884,7 +4138,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       targetChatId: ds.chatId,
     })).toEqual(['om_meeting_fallback']);
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    expect((await getSkillFeedbackStore(config.session.dataDir)).findDeliveryByPlatformMessage(
+    expect(await (await getSkillFeedbackStore(config.session.dataDir)).findDeliveryByPlatformMessage(
       'lark', ds.larkAppId, 'om_meeting_fallback',
     )).toBeUndefined();
   });
@@ -4665,6 +4919,40 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       'session.requires_attention',
       expect.objectContaining({ reason: 'content_audit_blocked', turnId: productionMsg.turnId }),
     );
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
+  it('treats an over-length final card (230025) as permanent: rejection notice, settled, no silent give-up', async () => {
+    // A long transcript final (e.g. an Antigravity reply read from its
+    // untruncated log) can exceed Feishu's message length cap. The same
+    // payload can never fit, so retrying only ended in a log-only give-up.
+    const tooLong = {
+      isAxiosError: true,
+      name: 'AxiosError',
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: { status: 400, data: { code: 230025, msg: 'The length of the message content reaches its limit.' } },
+    };
+    const sessionReply = vi.fn().mockRejectedValueOnce(tooLong).mockResolvedValueOnce('om_notice');
+    const closeSession = vi.fn();
+    const complete = vi.fn();
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(15000);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const notice = sessionReply.mock.calls[1];
+    expect(notice[2]).toBe('text');
+    expect(String(notice[1])).toContain('230025');
+    expect(String(notice[1])).not.toContain('final answer');
+    expect(complete).toHaveBeenCalledWith(true);
+    expect(ds.lastBridgeEmittedUuid).toBe('sid-final-out:uuid-1');
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: 'card content 230025' });
     expect(closeSession).not.toHaveBeenCalled();
   });
 

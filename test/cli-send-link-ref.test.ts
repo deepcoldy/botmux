@@ -206,6 +206,49 @@ describe('botmux send LinkRef expansion', () => {
     } finally { rmSync(output.root, { recursive: true, force: true }); }
   });
 
+  it.each([
+    ['a truncated query', baseUrl],
+    ['a reordered query', `${baseUrl}?a=1&a=&b=2&redirect=%2Ffoo%3Fx%3D1#timeline`],
+    ['a changed query', fullUrl.replace('a=1', 'a=9')],
+  ])('rejects final direct URLs with %s before provider dispatch', (_label, candidate) => {
+    const output = run({ args: [
+      'send', '--no-mention', '--response-kind', 'final', `问题详情：${candidate}`,
+      '--expected-link', candidate,
+    ] });
+    try {
+      expect(output.result.status).toBe(2);
+      expect(String(output.result.stderr)).toContain('link_ref_final_url_mismatch');
+      expect(output.resolves).toHaveLength(1);
+      expect(output.requests).toHaveLength(0);
+    } finally { rmSync(output.root, { recursive: true, force: true }); }
+  });
+
+  it('rejects an unclosed final Markdown link before provider dispatch', () => {
+    const output = run({ args: [
+      'send', '--no-mention', '--response-kind', 'final', `[查看问题](${fullUrl}`,
+      '--expected-link', fullUrl,
+    ] });
+    try {
+      expect(output.result.status).toBe(2);
+      expect(String(output.result.stderr)).toContain('link_ref_malformed_markdown');
+      expect(output.resolves).toHaveLength(1);
+      expect(output.requests).toHaveLength(0);
+    } finally { rmSync(output.root, { recursive: true, force: true }); }
+  });
+
+  it('permits an exact direct URL in a final after daemon validation', () => {
+    const output = run({ args: [
+      'send', '--no-mention', '--response-kind', 'final', `问题详情：${fullUrl}`,
+      '--expected-link', fullUrl,
+    ] });
+    try {
+      expect(output.result.status, String(output.result.stderr)).toBe(0);
+      expect(output.resolves).toHaveLength(1);
+      expect(output.requests).toHaveLength(1);
+      expect(output.requests[0]).toContain(fullUrl);
+    } finally { rmSync(output.root, { recursive: true, force: true }); }
+  });
+
   it('fails closed before provider dispatch for an unknown LinkRef', () => {
     const output = run({ args: [
       'send', '--no-mention', '--response-kind', 'auxiliary', `授权：${unknownPlaceholder}`,

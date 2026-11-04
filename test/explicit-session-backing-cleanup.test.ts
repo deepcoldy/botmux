@@ -40,6 +40,25 @@ describe('offline explicit session backing cleanup', () => {
     expect(killPersistent).toHaveBeenCalledWith('zmx', 'bmx-abcd1234', SID);
   });
 
+  it('destroys a tmux row on the server its pane was frozen onto', async () => {
+    const target = { backendType: 'tmux' as const, sessionName: 'bmx-abcd1234', socketName: 'botmux' };
+    const killPersistent = vi.fn();
+    const probePersistent = vi.fn(() => 'missing' as const);
+    const killTarget = vi.fn();
+    // Alive on the dedicated socket: a name-only probe of the default server
+    // would have read 'missing' and reported a live pane as destroyed.
+    const probeTarget = vi.fn(() => 'exists' as const);
+    const result = await cleanupExplicitSessionBacking(
+      { sessionId: SID, backendType: 'tmux', persistentBackendTarget: target },
+      { killPersistent, probePersistent, killTarget, probeTarget },
+    );
+    expect(result).toMatchObject({ ok: false, kind: 'persistent_destroy_failed', error: 'backing_session_still_exists' });
+    expect(killTarget).toHaveBeenCalledWith(target, SID);
+    expect(probeTarget).toHaveBeenCalledWith(target);
+    expect(killPersistent).not.toHaveBeenCalled();
+    expect(probePersistent).not.toHaveBeenCalled();
+  });
+
   it('does not report success when a persistent backend still exists after kill', async () => {
     const result = await cleanupExplicitSessionBacking(
       { sessionId: SID, backendType: 'tmux' },

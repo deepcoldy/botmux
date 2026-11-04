@@ -26,6 +26,7 @@ function extractIsVisible(): (target: unknown) => boolean {
 function scroller(ancestorAttrs: string[]) {
   return {
     isConnected: true,
+    parentElement: null,
     closest: (selector: string) => {
       const wanted = selector.split(',').map(s => s.trim().replace(/^\[|\]$/g, ''));
       return wanted.some(attr => ancestorAttrs.includes(attr)) ? {} : null;
@@ -44,6 +45,15 @@ describe('floating scrollbars behind an inert overlay', () => {
   it('drops scrollers inside an inert or hidden subtree', () => {
     expect(isVisible(scroller(['inert']))).toBe(false);
     expect(isVisible(scroller(['hidden']))).toBe(false);
+  });
+  it('does not retain popup scrollbars after a details menu closes, even with a stale nonzero layout rect', () => {
+    const target = scroller([]) as any;
+    const details = { tagName: 'DETAILS', parentElement: null, hasAttribute: () => false,
+      querySelector: () => ({ contains: () => false }) };
+    target.parentElement = details;
+    expect(isVisible(target)).toBe(false);
+    details.hasAttribute = () => true;
+    expect(isVisible(target)).toBe(true);
   });
 
   afterEach(() => vi.unstubAllGlobals());

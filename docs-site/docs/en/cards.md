@@ -10,6 +10,12 @@ Every conversation turn produces a live-updating Lark card, your primary window 
 - **A fresh card per turn**: the previous card freezes as an archive, keeping conversation history clear and traceable; after a session is moved to another group with [`/relay`](/en/relay), the original card also automatically freezes as an archive (buttons removed).
 - **A "recoverable" card on close**: it carries a "▶️ Resume session" button to click back in anytime; **if the CLI supports native resume** (the adapter implements `buildResumeCommand` and a native session id exists), it also includes the native command (e.g. `claude --resume <id>`) for manual recovery; when unsupported, only botmux's resume button plus a short note is shown.
 
+## Dynamic single reply cards
+
+Set `/botconfig set replyCardMode unified` to update public progress, tool activity and the final answer in one card per turn; the next turn creates a new card. This supports ordinary Claude Code / Codex / Grok / TraeX / Pi Feishu conversations without a file sandbox, including group and topic sessions. Changes take effect from the next turn. `/botconfig set replyCardMode legacy` restores separate messages. The terminal status card remains independently controlled by `disableStreamingCard` and `/card off`.
+
+TraeX and Pi reuse their structured transcript bridges for turn attribution. A retriable Pi error keeps the card working until a native settlement marker or the existing error timeout resolves it. A custom tool that returns `terminate:true` without persisting a terminal record can leave the card working until a later input supersedes it. Sandboxed sessions and other unsupported entry points retain their existing delivery behavior.
+
 ## The four display layers of a turn
 
 botmux's "presence" in Lark has four independently switched layers:
@@ -65,6 +71,16 @@ To stop or correct it mid-turn, **don't wait for it to finish**: in screenshot m
 The card body is a **live screenshot (image)** of the terminal, not text rendering. Messages the CLI proactively sends (via `botmux send`) are separate rich-text / image-and-text messages that can carry images, files, and @mentions; for fully custom display, `--card-file` / `--card-json` can send raw interactive card JSON.
 
 > ⚠️ Raw cards allow **display-only elements + open_url buttons only**: any callback-firing control — callback buttons (with a `value`), dropdown / person selects, date-time pickers, inputs, form submits — is rejected. This prevents custom cards from forging interactive callbacks.
+
+## Automatic-recovery failure card
+
+When an ordinary Claude message hits a transient model failure (model API unreachable, DNS outage, dropped connection, ...), Botmux continues it automatically, at most twice. If automatic recovery finally fails, one failure card is posted in the original chat (or topic). It is the only notice for that message:
+
+- It @-mentions the original sender, then states the cause in one sentence (classified from the error code; no raw error text), an excerpt of the message, the time, and how many automatic continuations ran.
+- **🔁 Retry** delivers the original message again, running as the original sender; the answer still goes to the original chat or topic. Only the original sender (while they may still talk to the bot) or a bot admin can press it. A card can be retried successfully once; afterwards it shows who retried. The re-delivered message carries one line asking the AI to check the current state first and to try to avoid repeating work that already completed.
+- A continuation whose result never arrives (the terminal has been idle for about a minute) also counts as failed and gets the card, instead of staying "in progress" forever.
+- If the Feishu API is also unreachable when the card is due, it keeps retrying (up to 24 hours) and lands exactly once; a daemon restart does not re-send a delivered card.
+- Scheduled-task runs get the card too, without a retry button; run the task again manually if needed.
 
 ## Custom card usage segments
 
@@ -126,3 +142,31 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"te
 - The `send` examples pass `--no-mention`: a progress card doesn't need to @ anyone, and explicitly opting out avoids the mention-policy gate (exit 2).
 - Bot identity is resolved from the session context (same as `send`); errors such as a withdrawn message, missing permission, or a non-card target are surfaced as-is (exit 1).
 - Success prints `{"success":true,"messageId":"om_xxx","sessionId":"..."}` (JSON only on stdout); usage errors exit 2.
+
+## Signed button: start a turn as the clicker
+
+A local integrator can ask the bot to post a single-use button into a chat it belongs to. The click starts a session turn whose `senderOpenId` is the **clicker**, the same way a message from that person would. When `triggerUserAuth` is on (`credentialSource: local`), credentials are issued for that turn sender. The session owner and creator are never a fallback.
+
+The daemon HMAC-signs the prompt, the target chat or session, the optional working directory and chat type, a nonce, and an expiry. The secret and the nonce file are per bot, under `<dataDir>/card-click-turn/<larkAppId>/` (`secret` and `nonces.json`). The session data directory is shared by every bot daemon in a fleet, so those files do not live at the data-dir root. A consume takes a cross-process lock and reloads the file first, so one daemon's rewrite cannot drop a nonce another daemon already used. Tampered, expired, and replayed clicks are rejected. Expiry is checked before the nonce is consumed, so the error is expiry rather than replay. A restart cannot reuse an unexpired button.
+
+The clicker must pass the same `evaluateTalk` checks as a message sender (allowed users, blocked users, grants), plus `canOperate` (with an `on_` union id when the callback has one) and `grantCommandRestriction`. A grant-only talker cannot use the button. While `restrictGrantCommands` is on, a click whose talk reason is `chatGrant` or `globalGrant` is rejected too. An app or bot gets no identity and does not start a turn. The evidence is a same-host peer, an identity-cache type of `bot` or `app`, or any of the three union-id tables (`isTeamBot`, `isPlatformTeamBot`, `isTrustedSameOwnerSiblingBot`). An operator with none of that evidence is still treated as a human. Card callbacks carry no platform `sender_type`; do not call `resolveSender` just to probe, because a missing type is written into the cache as `user`.
+
+A `cct_` turn is intentionally outside `isOrdinaryImTurnId` and outside the `om_` / `join_` human-registry whitelist. It has no ordinary-message delivery receipt, ACK, or cold-start retry. Current-turn provenance uses `session.lastCallerOpenId`, written with the quote target at the start of the turn, so both a new session and an existing session resolve the CLI caller as the clicker rather than the previous speaker. A principal-lane session, and any click while cross-principal interruption is enabled, is rejected before the nonce is consumed. The toast says so, and the click does not write `activeInteractiveTurn`.
+
+The card callback's immediate toast only says the click is starting. After the worker accepts the input, the chat gets "Started this turn as you". A failed delivery rolls back the quote target, reply target, `lastCallerOpenId`, and `activeInteractiveTurn` written for that attempt, then posts the failure instead. A session created by the button uses `creationSource: ordinary-feishu`, so a bot with a Codex instance pool does not leave the new session on the legacy instance.
+
+The signed target is exactly one of `chatId` or `sessionId`. A `sessionId` must already be an active session for this bot; a miss does not spawn a replacement and does not borrow that session's owner. A `chatId` with no chat-scope session creates one whose owner and creator are the clicker, and it requires an existing absolute working directory. An existing session whose working directory differs from the signed path is rejected. A new session with no signed `chatType` is authorized as a group; a private chat must be signed `p2p` or `p2pOpen` will not apply.
+
+The posting endpoint is the daemon IPC `POST /api/cards/click-turn` (same local HMAC as `POST /api/sessions/spawn`, and the daemon must already be bound to this bot). It is not a core-only public route.
+
+| Field | Meaning |
+| --- | --- |
+| `prompt` | Required. Sent as this turn's user text, at most 1500 characters |
+| `chatId` / `sessionId` | Exactly one. A chat-scope session for that chat, or one existing session |
+| `postChatId` | Where to post the card. Defaults to `chatId`. Required when only `sessionId` is set |
+| `workingDir` | Optional existing absolute path. Required when the click would create a session |
+| `chatType` | Optional `group` or `p2p` |
+| `ttlMs` | Optional, from 1 minute to 7 days. Default 1 hour |
+| `buttonLabel` / `title` | Optional |
+
+Success returns `{ ok, messageId, exp }`. If the bot is not in the destination chat the response is 403 `bot_not_in_chat`.

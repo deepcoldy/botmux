@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -215,6 +215,47 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
       expect(r.args[index + 1]).toBe(join(dir, 'session-temp'));
     }
     r.cleanup();
+  });
+});
+
+// Root daemon + --unshare-user maps only uid 0, so GNU tar's default
+// --same-owner chown of a foreign-owned archive fails inside the sandbox.
+describe('sandbox TAR_OPTIONS', () => {
+  it('adds --no-same-owner for a root worker and keeps an operator value', () => {
+    expect(sandboxTarOptions(undefined, 0)).toBe('--no-same-owner');
+    expect(sandboxTarOptions('  ', 0)).toBe('--no-same-owner');
+    expect(sandboxTarOptions('--warning=no-timestamp', 0)).toBe('--warning=no-timestamp --no-same-owner');
+  });
+
+  it('leaves an explicit owner choice and non-root workers alone', () => {
+    expect(sandboxTarOptions('--same-owner', 0)).toBeUndefined();
+    expect(sandboxTarOptions('-v --no-same-owner', 0)).toBeUndefined();
+    expect(sandboxTarOptions(undefined, 1000)).toBeUndefined();
+    expect(sandboxTarOptions(undefined, undefined)).toBeUndefined();
+  });
+
+  it('reaches the bwrap child of a root worker', () => {
+    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-tar-'));
+    const r = prepareDirectSandbox({
+      sessionId: 'taropts', dataDir: tmp(),
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
+    });
+    if (!r) return; // bwrap unavailable on this host
+    const index = r.args.indexOf('TAR_OPTIONS');
+    expect(r.args[index - 1]).toBe('--setenv');
+    expect(r.args[index + 1]).toContain('--no-same-owner');
+    r.cleanup();
+    // The bot's own value is the base, not the daemon's.
+    const own = prepareDirectSandbox({
+      sessionId: 'taropts2', dataDir: tmp(),
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
+      childTarOptions: '--warning=no-timestamp',
+    })!;
+    expect(own.args[own.args.indexOf('TAR_OPTIONS') + 1]).toBe('--warning=no-timestamp --no-same-owner');
+    own.cleanup();
   });
 });
 
@@ -472,6 +513,25 @@ describe('sandbox tree cleanup', () => {
 // blocker: only plain outbox basenames + allowlisted flags pass; raw argv /
 // path flags / sandbox-chosen session-id are rejected.
 describe('validateRelayRequest', () => {
+  it('rebuilds relayed images and files with their original media flags', () => {
+    expect(buildRelayHostArgs({
+      command: 'send',
+      flags: ['--no-mention'],
+      contentPath: '/stage/content',
+      imagePaths: ['/stage/preview.png'],
+      attachmentPaths: ['/stage/report.pdf'],
+      videoPaths: [],
+      videoCoverPaths: [],
+      sessionId: 'session-1',
+    })).toEqual([
+      '--no-mention',
+      '--content-file', '/stage/content',
+      '--images', '/stage/preview.png',
+      '--files', '/stage/report.pdf',
+      '--session-id', 'session-1',
+    ]);
+  });
+
   it('forces host-relayed cards to use probe-free lexical link repair', () => {
     expect(buildRelayHostEnv({
       BOTMUX_SEND_RELAY: '/sandbox/outbox',
@@ -495,7 +555,8 @@ describe('validateRelayRequest', () => {
       contentFile: 'c.content',
       preparedContentFile: 'c.card-content',
       completionProposalFile: 'c.completion-proposal.json',
-      attachments: ['a.png'],
+      images: ['preview.png'],
+      attachments: ['report.pdf'],
       videos: ['replay.mp4'],
       videoCovers: ['cover.png'],
       flags: ['--mention-back', '--mention', 'ou:X', '--voice'],
@@ -505,7 +566,8 @@ describe('validateRelayRequest', () => {
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.preparedContentName).toBe('c.card-content');
     expect(r.value.completionProposalName).toBe('c.completion-proposal.json');
-    expect(r.value.attachmentNames).toEqual(['a.png']);
+    expect(r.value.imageNames).toEqual(['preview.png']);
+    expect(r.value.attachmentNames).toEqual(['report.pdf']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
@@ -698,6 +760,7 @@ describe('validateRelayRequest', () => {
   it('rejects non-basename content / attachment names (../ traversal)', () => {
     expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', preparedContentFile: '../prepared' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', images: ['../preview.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', completionProposalFile: '../proposal.json' }).ok).toBe(false);
@@ -705,6 +768,17 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
     expect(validateRelayRequest({ /* missing contentFile */ flags: [] }).ok).toBe(false);
+  });
+
+  it('rejects cards and every media field on a dispatch relay (send-only payloads)', () => {
+    const dispatchBase = { command: 'dispatch' as const, contentFile: 'c.brief', flags: [] };
+    expect(validateRelayRequest({ ...dispatchBase, images: ['preview.png'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, attachments: ['report.pdf'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, videos: ['replay.mp4'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, videoCovers: ['cover.png'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, preparedContentFile: 'c.card-content' }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, cardFile: 'c.card.json' }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, completionProposalFile: 'c.proposal.json' }).ok).toBe(false);
   });
 });
 

@@ -12,9 +12,9 @@
  * otherwise (no privilege needed). Skips when neither is available.
  */
 import { describe, expect, it } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -28,26 +28,36 @@ import {
 import { isMountpoint, sweepOrphanScratchSandboxes, teardownScratchSession } from '../src/adapters/backend/scratch-sandbox.js';
 import { teardownSessionSandboxTree } from '../src/adapters/backend/sandbox-tree-teardown.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { detachTestMount, unmountTestMount } from './helpers/unmount-test-mount.js';
+import { onTestProcessExit } from './helpers/exit-cleanup.js';
 
 const isRoot = process.getuid?.() === 0;
 
-function unmount(target: string): void {
-  if (!isMountpoint(target)) return;
-  if (spawnSync('umount', [target], { stdio: 'ignore' }).status === 0) return;
-  spawnSync('fusermount', ['-u', target], { stdio: 'ignore' });
-}
-
-/** Mount a small writable filesystem at `target`; null when impossible here. */
-function mountSmallFs(target: string, scratch: string): boolean {
+/** fuse-overlayfs over a tiny lower dir at `target` (no privilege needed). */
+function mountFuseOverlay(target: string, scratch: string): boolean {
   mkdirSync(target, { recursive: true });
-  if (isRoot) {
-    return spawnSync('mount', ['-t', 'tmpfs', '-o', 'mode=700,size=1m', 'tmpfs', target], { stdio: 'ignore' }).status === 0;
-  }
   const lower = join(scratch, 'lower');
   const upper = join(scratch, 'upper');
   const work = join(scratch, 'work');
   for (const d of [lower, upper, work]) mkdirSync(d, { recursive: true });
-  return spawnSync('fuse-overlayfs', ['-o', `lowerdir=${lower},upperdir=${upper},workdir=${work}`, target], { stdio: 'ignore' }).status === 0;
+  return detachedOnInterrupt(target,
+    spawnSync('fuse-overlayfs', ['-o', `lowerdir=${lower},upperdir=${upper},workdir=${work}`, target], { stdio: 'ignore' }).status === 0);
+}
+
+/** An interrupted run never reaches the `finally` that unmounts a fixture: a
+ *  mount left in the session TMPDIR is one more submount every scratch
+ *  session would wrap. A no-op once the test unmounted it itself. */
+function detachedOnInterrupt(target: string, mounted: boolean): boolean {
+  if (mounted) onTestProcessExit(() => { detachTestMount(target); });
+  return mounted;
+}
+
+/** Mount a small writable filesystem at `target`; null when impossible here. */
+function mountSmallFs(target: string, scratch: string): boolean {
+  if (!isRoot) return mountFuseOverlay(target, scratch);
+  mkdirSync(target, { recursive: true });
+  return detachedOnInterrupt(target,
+    spawnSync('mount', ['-t', 'tmpfs', '-o', 'mode=700,size=1m', 'tmpfs', target], { stdio: 'ignore' }).status === 0);
 }
 
 const mountsAvailable = process.platform === 'linux' && (() => {
@@ -55,8 +65,19 @@ const mountsAvailable = process.platform === 'linux' && (() => {
   try {
     const target = join(dir, 'm');
     const ok = mountSmallFs(target, join(dir, 'fs'));
-    if (ok) unmount(target);
-    return ok && !isMountpoint(target);
+    return ok && unmountTestMount(target);
+  } catch {
+    return false;
+  } finally {
+    rmSandboxScratch(dir);
+  }
+})();
+
+const fuseOverlayAvailable = process.platform === 'linux' && (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'sbx-fuse-probe-'));
+  try {
+    const target = join(dir, 'm');
+    return mountFuseOverlay(target, join(dir, 'fs')) && unmountTestMount(target);
   } catch {
     return false;
   } finally {
@@ -65,7 +86,9 @@ const mountsAvailable = process.platform === 'linux' && (() => {
 })();
 
 /** A session tree under a fresh data dir, old enough for the orphan sweep. */
-function sessionTree(sessionId = 'sid-mounted') {
+// Random sid: the orphan sweep treats any process whose argv names
+// `sandboxes/<sid>` (e.g. another test file's FUSE server) as holding that sid.
+function sessionTree(sessionId = `sid-mounted-${randomBytes(4).toString('hex')}`) {
   const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'sbx-mount-guard-')));
   const sessionRoot = join(dataDir, 'sandboxes', sessionId);
   mkdirSync(join(sessionRoot, 'outbox'), { recursive: true });
@@ -88,7 +111,7 @@ describe.skipIf(!mountsAvailable)('sandbox tree removal never recurses into a mo
       // A sibling with the same prefix is not "below".
       expect(mountsAtOrUnder(`${tree.sessionRoot}-other`)).toEqual([]);
     } finally {
-      unmount(target);
+      unmountTestMount(target);
       rmSandboxScratch(tree.dataDir);
     }
   });
@@ -105,12 +128,52 @@ describe.skipIf(!mountsAvailable)('sandbox tree removal never recurses into a mo
       expect(readFileSync(join(target, 'canary'), 'utf8')).toBe('kept');
       expect(existsSync(tree.sessionRoot)).toBe(true);
       // Once nothing is mounted any more, the same sweep reclaims it.
-      unmount(target);
+      expect(unmountTestMount(target)).toBe(true);
       tree.age();
       sweepOrphanSandboxes(tree.dataDir, new Set());
       expect(existsSync(tree.sessionRoot)).toBe(false);
     } finally {
-      unmount(target);
+      unmountTestMount(target);
+      rmSandboxScratch(tree.dataDir);
+    }
+  });
+
+  // FUSE on purpose, also as root: unlike a kernel mount it has a server
+  // process whose argv names the tree, and the sweep reads the tree as in use
+  // for as long as that server runs — which is past the unmount itself.
+  it.skipIf(!fuseOverlayAvailable)('reclaims a busy FUSE tree only once it is detached and its server has exited', () => {
+    const tree = sessionTree();
+    const target = join(tree.sessionRoot, 'root');
+    let holder: ChildProcess | undefined;
+    try {
+      expect(mountFuseOverlay(target, join(tree.dataDir, 'fs'))).toBe(true);
+      writeFileSync(join(target, 'canary'), 'kept');
+      // A process outside the tree keeps a file on the mount open: a plain
+      // unmount is refused (busy), only a lazy detach takes it off the table.
+      const fd = openSync(join(target, 'canary'), 'r');
+      try {
+        holder = spawn('sleep', ['30'], { stdio: [fd, 'ignore', 'ignore'] });
+      } finally {
+        closeSync(fd);
+      }
+      tree.age();
+      sweepOrphanSandboxes(tree.dataDir, new Set());
+      expect(existsSync(tree.sessionRoot)).toBe(true);
+      expect(detachTestMount(target)).toBe(true);
+      // Off the table, but the server lives on while the file is held: not
+      // unmounted for good yet, and the sweep still keeps the tree.
+      expect(unmountTestMount(target, 100)).toBe(false);
+      tree.age();
+      sweepOrphanSandboxes(tree.dataDir, new Set());
+      expect(existsSync(tree.sessionRoot)).toBe(true);
+      holder.kill('SIGKILL');
+      expect(unmountTestMount(target)).toBe(true);
+      tree.age();
+      sweepOrphanSandboxes(tree.dataDir, new Set());
+      expect(existsSync(tree.sessionRoot)).toBe(false);
+    } finally {
+      holder?.kill('SIGKILL');
+      unmountTestMount(target);
       rmSandboxScratch(tree.dataDir);
     }
   });
@@ -130,7 +193,7 @@ describe.skipIf(!mountsAvailable)('sandbox tree removal never recurses into a mo
       expect(readFileSync(join(target, 'canary'), 'utf8')).toBe('kept');
       expect(existsSync(join(tree.sessionRoot, 'outbox'))).toBe(true);
     } finally {
-      unmount(target);
+      unmountTestMount(target);
       rmSandboxScratch(tree.dataDir);
     }
   });
@@ -150,12 +213,12 @@ describe.skipIf(!mountsAvailable)('sandbox tree removal never recurses into a mo
       expect(isMountpoint(merged)).toBe(false);
       expect(readFileSync(join(stray, 'canary'), 'utf8')).toBe('kept');
       expect(existsSync(tree.sessionRoot)).toBe(true);
-      unmount(stray);
+      expect(unmountTestMount(stray)).toBe(true);
       teardownScratchSession(tree.sessionId, tree.dataDir);
       expect(existsSync(tree.sessionRoot)).toBe(false);
     } finally {
-      unmount(stray);
-      unmount(merged);
+      unmountTestMount(stray);
+      unmountTestMount(merged);
       rmSandboxScratch(tree.dataDir);
     }
   });
@@ -171,7 +234,7 @@ describe.skipIf(!mountsAvailable)('sandbox tree removal never recurses into a mo
       expect(isMountpoint(merged)).toBe(false);
       expect(existsSync(tree.sessionRoot)).toBe(false);
     } finally {
-      unmount(merged);
+      unmountTestMount(merged);
       rmSandboxScratch(tree.dataDir);
     }
   });
@@ -208,7 +271,7 @@ describe.skipIf(!mountsAvailable)('scratch sweep with a truncated marker', () =>
       expect(isMountpoint(merged)).toBe(false);
       expect(existsSync(tree.sessionRoot)).toBe(false);
     } finally {
-      unmount(merged);
+      unmountTestMount(merged);
       rmSandboxScratch(tree.dataDir);
     }
   });
@@ -224,7 +287,7 @@ describe.skipIf(!mountsAvailable)('scratch sweep with a truncated marker', () =>
       expect(readFileSync(join(stray, 'canary'), 'utf8')).toBe('kept');
       expect(existsSync(join(tree.sessionRoot, 'scratch.json'))).toBe(true);
     } finally {
-      unmount(stray);
+      unmountTestMount(stray);
       rmSandboxScratch(tree.dataDir);
     }
   });
@@ -241,7 +304,7 @@ describe.skipIf(!mountsAvailable)('test cleanup never deletes through a mount', 
       expect(readFileSync(join(target, 'canary'), 'utf8')).toBe('kept');
       expect(existsSync(dir)).toBe(true);
     } finally {
-      unmount(target);
+      unmountTestMount(target);
       rmSandboxScratch(dir);
     }
     expect(existsSync(dir)).toBe(false);

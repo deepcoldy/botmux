@@ -2318,6 +2318,96 @@ describe('isPlaceholderOnlyText', () => {
   });
 });
 
+
+describe('video resources and shared numbering', () => {
+  function parseWithResources(type: string, content: object) {
+    const msg = makeMsg(type, content);
+    const numberer = createImgNumberer();
+    const resources = extractResources(type, msg.body.content, numberer);
+    return { resources, text: parseApiMessage(msg, numberer).content };
+  }
+
+  it('downloads a top-level media body instead of its poster', () => {
+    const result = parseWithResources('media', { file_key: 'body_a', image_key: 'poster', duration: 4000 });
+    expect(result.resources).toEqual([{ type: 'video', key: 'body_a', name: 'body_a.mp4' }]);
+    expect(result.text).toBe('[视频 1]');
+  });
+
+  it.each(['media', 'post'])('keeps poster-only %s media as an image', (type) => {
+    const node = { tag: 'media', image_key: 'poster' };
+    const content = type === 'post' ? { content: [[node]] } : node;
+    const result = parseWithResources(type, content);
+    expect(result.resources).toEqual([{ type: 'image', key: 'poster', name: 'poster.jpg' }]);
+    expect(result.text).toBe('[图片 1]');
+  });
+
+  it('numbers distinct video bodies sharing a poster, deduplicates repeated bodies, and preserves image/file counters', () => {
+    const result = parseWithResources('post', { zh_cn: { title: '', content: [[
+      { tag: 'media', file_key: 'body_a', image_key: 'poster' },
+      { tag: 'media', file_key: 'body_b', image_key: 'poster' },
+      { tag: 'media', file_key: 'body_a', image_key: 'another_poster' },
+      { tag: 'img', image_key: 'poster' },
+      { tag: 'file', file_key: 'pdf', file_name: 'spec.pdf' },
+      { tag: 'file', file_key: 'body_a', file_name: 'again.MP4' },
+    ]] } });
+    expect(result.resources).toEqual([
+      { type: 'video', key: 'body_a', name: 'body_a.mp4' },
+      { type: 'video', key: 'body_b', name: 'body_b.mp4' },
+      { type: 'image', key: 'poster', name: 'poster.jpg' },
+      { type: 'file', key: 'pdf', name: 'spec.pdf' },
+    ]);
+    expect(result.text).toBe('[视频 1][视频 2][视频 1][图片 1][文件 1: spec.pdf][视频 1: again.MP4]');
+  });
+
+  it.each(['clip.MOV', '记录.mp4', 'recording.webm'])('classifies file upload %s as video with the matching placeholder', (file_name) => {
+    const result = parseWithResources('file', { file_key: 'movie', file_name });
+    expect(result.resources).toEqual([{ type: 'video', key: 'movie', name: file_name }]);
+    expect(result.text).toBe(`[视频 1: ${file_name}]`);
+  });
+
+  it('leaves ordinary files and images unchanged', () => {
+    const file = parseWithResources('file', { file_key: 'doc', file_name: 'notes.mp4.txt' });
+    expect(file.resources).toEqual([{ type: 'file', key: 'doc', name: 'notes.mp4.txt' }]);
+    expect(file.text).toBe('[文件 1: notes.mp4.txt]');
+    const image = parseWithResources('image', { image_key: 'img' });
+    expect(image.resources).toEqual([{ type: 'image', key: 'img', name: 'img.jpg' }]);
+    expect(image.text).toBe('[图片 1]');
+  });
+
+  it('deduplicates a video file represented in both post nodes and sibling uploads', () => {
+    const result = parseWithResources('post', {
+      content: [[{ tag: 'file', file_key: 'movie', file_name: 'clip.mp4' }]],
+      files: [{ file_key: 'movie', file_name: 'clip.mp4' }],
+    });
+    expect(result.resources).toEqual([{ type: 'video', key: 'movie', name: 'clip.mp4' }]);
+    expect(result.text).toBe('[视频 1: clip.mp4]');
+  });
+
+  it('uses the video body identity for live events as well as history', () => {
+    const { parsed, resources } = parseEventMessage({
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: { message_id: 'om_video', message_type: 'media',
+        content: JSON.stringify({ file_key: 'movie', image_key: 'poster' }),
+        chat_id: 'oc_chat', chat_type: 'group', create_time: '1000' },
+    });
+    expect(resources).toEqual([{ type: 'video', key: 'movie', name: 'movie.mp4' }]);
+    expect(parsed.content).toBe('[视频 1]');
+  });
+});
+
+
+describe('video placeholder and ambiguous file extensions', () => {
+  it('does not use a video-only placeholder as an authored topic title', () => {
+    expect(isPlaceholderOnlyText('[视频]')).toBe(true);
+    expect(isPlaceholderOnlyText('[视频 1][图片 1]')).toBe(true);
+    expect(isPlaceholderOnlyText('分析视频 [视频 1]')).toBe(false);
+  });
+  it('keeps TypeScript source uploads as files rather than guessing an MPEG stream', () => {
+    expect(extractResources('file', JSON.stringify({ file_key: 'source', file_name: 'main.ts' })))
+      .toEqual([{ type: 'file', key: 'source', name: 'main.ts' }]);
+  });
+});
+
 describe('resolveMentions & card <at id=...> tags', () => {
   it('resolves <at id=ou_xxx></at> to @Name with exact openId match', () => {
     const text = '<at id=ou_pure></at> 请看一下这个 PR';

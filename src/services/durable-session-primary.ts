@@ -68,6 +68,14 @@ export type DurableLarkSessionAdmissionResult =
     }
   | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
 
+export type DurableLarkSessionCheckpointResult =
+  | {
+      kind: 'checkpointed';
+      lease: SessionLease;
+      record: DurableSessionRecord;
+    }
+  | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
+
 export type DurableLarkSessionControlCommitResult =
   | {
       kind: 'committed';
@@ -399,6 +407,66 @@ export async function commitDurableLarkSessionControl(input: {
 }
 
 /**
+ * Save pre-admission Session state under the existing active canonical identity.
+ * This never admits the pending message or creates an input-acceptance receipt.
+ * The caller may guard its Inbox claim/lifecycle again when the FIFO builder
+ * actually runs and after the fenced write returns.
+ */
+export async function checkpointDurableLarkSession(input: {
+  facade: DurableSessionFacade;
+  message: DurableLarkMessageClaim;
+  session: Session;
+  assertCurrent?: () => void;
+}): Promise<DurableLarkSessionCheckpointResult> {
+  input.assertCurrent?.();
+  const sessionValue = cloneSession(input.session);
+  const nextSession = sessionValue as unknown as Session;
+  const messageAppId = boundedText(input.message.larkAppId, 'durable checkpoint larkAppId', 256);
+  const identity = primarySessionIdentity(nextSession, messageAppId);
+  if (identity.larkAppId !== input.message.larkAppId) {
+    throw new Error('durable checkpoint Session does not belong to the inbox application');
+  }
+  if (nextSession.status !== 'active') {
+    throw new Error('durable pre-admission checkpoint requires an active Session');
+  }
+  const written = await input.facade.writeExactFromCurrent(identity.sessionKey, current => {
+    input.assertCurrent?.();
+    if (!current) throw new Error('durable checkpoint canonical Session is missing');
+    const parsed = parseDurablePrimarySessionRecord(current);
+    if (current.sessionKey !== identity.sessionKey
+        || parsed.session.sessionId !== nextSession.sessionId
+        || parsed.session.larkAppId !== identity.larkAppId
+        || parsed.session.status !== 'active') {
+      throw new Error('durable checkpoint canonical Session changed before write');
+    }
+    input.assertCurrent?.();
+    // Preserve the exact admission/control envelope, including legacy optional
+    // fields. Only this frozen Session snapshot belongs to the checkpoint.
+    const confirmations = [...(parsed.session.codexEffortTaskConfirmations ?? [])];
+    for (const item of nextSession.codexEffortTaskConfirmations ?? []) {
+      const index = confirmations.findIndex(saved => saved.messageId === item.messageId);
+      const canonical = confirmations[index];
+      if (canonical && canonical.inputHash !== item.inputHash) throw new Error('canonical effort task identity changed');
+      if (index < 0) confirmations.push(item);
+      else confirmations[index] = canonical?.terminal ? { ...item, terminal: canonical.terminal } : item;
+    }
+    const pending = confirmations.filter(item => !item.terminal && !nextSession.durablePrimaryInputCommits?.some(proof => proof.turnId === item.messageId));
+    if (pending.length > 64) throw new Error('canonical pending effort task capacity is exhausted');
+    const terminal = confirmations.filter(item => !pending.includes(item));
+    const retained = [...(pending.length < 64 ? terminal.slice(-(64 - pending.length)) : []), ...pending];
+    const value = retained.length ? { ...nextSession, codexEffortTaskConfirmations: retained } : nextSession;
+    return { ...object(current.value)!, session: cloneSession(value) } as DurableJson;
+  });
+  input.assertCurrent?.();
+  if (written.kind !== 'written' && written.kind !== 'unchanged') return written;
+  if (written.coalescedCount !== 1) {
+    throw new Error('durable pre-admission checkpoint was unexpectedly coalesced');
+  }
+  input.session.codexEffortTaskConfirmations = parseDurablePrimarySessionRecord(written.record).session.codexEffortTaskConfirmations;
+  return { kind: 'checkpointed', lease: written.lease, record: written.record };
+}
+
+/**
  * Persist one exact canonical Session snapshot and mint the only committed
  * result accepted by the primary inbox consumer.
  */
@@ -407,7 +475,10 @@ export async function admitDurableLarkSession(input: {
   message: DurableLarkMessageClaim;
   session: Session;
 }): Promise<DurableLarkSessionAdmissionResult> {
-  const projection = durablePrimarySessionProjection(input.session, input.message);
+  const confirmation = input.session.codexEffortTaskConfirmations?.find(item => item.messageId === input.message.messageId);
+  const snapshot = confirmation ? { ...input.session, codexEffortTaskConfirmations:
+    input.session.codexEffortTaskConfirmations!.map(item => item === confirmation ? { ...item, terminal: 'admitted' as const } : item) } : input.session;
+  const projection = durablePrimarySessionProjection(snapshot, input.message);
   const next = projection.value as unknown as DurablePrimarySessionProjection;
   const written = await input.facade.writeExactFromCurrent(
     projection.sessionKey,
@@ -417,6 +488,7 @@ export async function admitDurableLarkSession(input: {
   if (written.coalescedCount !== 1) {
     throw new Error('durable primary admission was unexpectedly coalesced');
   }
+  if (confirmation) confirmation.terminal = 'admitted';
   return {
     kind: 'committed',
     receipt: durableLarkAdmissionReceipt({

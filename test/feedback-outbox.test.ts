@@ -27,6 +27,16 @@ function deliveryInput(destinations: FeedbackWebhookDestination[] = []) {
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('feedback schema v5 durable event outbox', () => {
+  it('retains an expired in-flight attempt as unknown when scheduling its retry', async () => {
+    const db = await store();
+    try {
+      db.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
+      db.recordTurnDelivery(deliveryInput([destination('one')]));
+      db.claimFeedbackOutbox({ now: Date.now(), limit: 1, claimToken: 'crashed-attempt' });
+      db.resetExpiredFeedbackOutboxClaims(Date.now() + 1000, 0);
+      expect(db.listFeedbackOutbox()[0]).toMatchObject({ status: 'pending', lastError: 'webhook_outcome_unknown:crashed-attempt' });
+    } finally { db.close(); }
+  });
   it('migrates to v5 and atomically fans out a deterministic turn.completed event', async () => {
     const db = await store();
     db.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed', completedAt: '2026-08-11T00:00:00.000Z' });

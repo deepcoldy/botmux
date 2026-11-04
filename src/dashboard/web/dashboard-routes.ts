@@ -18,6 +18,40 @@ export function hashQueryParam(name: string, hash = typeof location === 'undefin
   return new URLSearchParams(hash.slice(queryIndex + 1)).get(name) || null;
 }
 
+/**
+ * 去掉当前 hash 上的某个查询参数：一次性深链（打开抽屉 / 滚到区块）消费完就清掉，
+ * 免得刷新页面又触发一次。走 replaceState，不产生 hashchange，也就不会重挂载页面。
+ */
+export function clearHashQueryParam(name: string): void {
+  if (typeof location === 'undefined' || typeof history === 'undefined') return;
+  const hash = location.hash;
+  const queryIndex = hash.indexOf('?');
+  if (queryIndex < 0) return;
+  const params = new URLSearchParams(hash.slice(queryIndex + 1));
+  if (!params.has(name)) return;
+  params.delete(name);
+  const query = params.toString();
+  history.replaceState(history.state, '', `${location.pathname}${location.search}${hash.slice(0, queryIndex)}${query ? `?${query}` : ''}`);
+}
+
+/**
+ * 设置 / 去掉（value 为 null）当前 hash 上的某个查询参数，用于把页面内的视图状态
+ * 写进地址（刷新、分享都能还原）。同样走 replaceState，不会重挂载页面。
+ */
+export function setHashQueryParam(name: string, value: string | null): void {
+  if (typeof location === 'undefined' || typeof history === 'undefined') return;
+  const hash = location.hash;
+  // 没有 hash 路由时无处可写（拼到地址上会变成 ?query 而不是 #/page?query）。
+  if (!hash.startsWith('#')) return;
+  const queryIndex = hash.indexOf('?');
+  const params = new URLSearchParams(queryIndex < 0 ? '' : hash.slice(queryIndex + 1));
+  if (value === null) params.delete(name);
+  else params.set(name, value);
+  const query = params.toString();
+  const base = queryIndex < 0 ? hash : hash.slice(0, queryIndex);
+  history.replaceState(history.state, '', `${location.pathname}${location.search}${base}${query ? `?${query}` : ''}`);
+}
+
 function pageRoute<T extends Record<K, DashboardRouteRenderer>, K extends keyof T & string>(
   id: string,
   routePrefix: string,
@@ -70,12 +104,12 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('connectors-logs', '#/connectors/logs', () => import('./connectors-page.js'), 'renderConnectorsLogsPage'),
   pageRoute('webhook-logs', '#/webhook-logs', () => import('./connectors-page.js'), 'renderConnectorsLogsPage'),
   pageRoute('connectors', '#/connectors', () => import('./connectors-page.js'), 'renderConnectorsPage'),
-  pageRoute('team-manage', '#/team/manage', () => import('./team-federation-page.js'), 'renderTeamManagePage'),
-  pageRoute('team', '#/team', () => import('./team-federation-page.js'), 'renderTeamFederationPage'),
   pageRoute('roles-profile', '#/roles/profile', () => import('./roles-page.js'), 'renderRoleProfilesPage'),
   pageRoute('roles', '#/roles', () => import('./roles-page.js'), 'renderRolesPage'),
   pageRoute('schedules', '#/schedules', () => import('./schedules-page.js'), 'renderSchedulesPage'),
   pageRoute('whiteboards', '#/whiteboards', () => import('./whiteboards-page.js'), 'renderWhiteboardsPage'),
+  // 决策看板：`#/board`（汇总）、`#/board/<app>`、`#/board/<app>/<seq>`（详情）。没有别的路由以 `#/board` 开头。
+  pageRoute('decision-board', '#/board', () => import('./decision-board-page.js'), 'renderDecisionBoardPage'),
   pageRoute('doc-watches', '#/doc-watches', () => import('./doc-watches-page.js'), 'renderDocWatchesPage'),
   pageRoute('monitoring', '#/monitoring', () => import('./monitoring-page.js'), 'renderMonitoringPage'),
   pageRoute('sessions', '#/sessions', () => import('./sessions-page.js'), 'renderSessionsPage'),

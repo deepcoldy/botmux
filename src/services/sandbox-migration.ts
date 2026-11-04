@@ -14,7 +14,7 @@
 import { promises as fsp, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { withFileLock } from '../utils/file-lock.js';
+import { FileLockTimeoutError, withFileLock, type FileLockOptions } from '../utils/file-lock.js';
 import { writeRawConfigAtomic } from './config-store.js';
 import { migrateLegacySandboxFields } from '../adapters/cli/fs-policy.js';
 import { logger } from '../utils/logger.js';
@@ -36,7 +36,10 @@ export function resolveBotsConfigPath(): string | null {
  * file — migration must not brick daemon startup; loadBotConfigs surfaces
  * parse errors with better context right after.
  */
-export async function migrateSandboxConfigOnDisk(path: string): Promise<{ migrated: string[] }> {
+export async function migrateSandboxConfigOnDisk(
+  path: string,
+  lockOpts?: FileLockOptions,
+): Promise<{ migrated: string[]; lockBusy?: true }> {
   try {
     return await withFileLock(path, async () => {
       let raw: unknown;
@@ -60,16 +63,46 @@ export async function migrateSandboxConfigOnDisk(path: string): Promise<{ migrat
       await writeRawConfigAtomic(path, raw);
       logger.info(`[sandbox-migration] migrated legacy sandbox fields for ${migrated.length} bot(s): ${migrated.join(', ')} (backup: ${bak})`);
       return { migrated };
-    });
+    }, lockOpts);
   } catch (err) {
     logger.warn(`[sandbox-migration] skipped (${err instanceof Error ? err.message : String(err)})`);
-    return { migrated: [] };
+    return err instanceof FileLockTimeoutError ? { migrated: [], lockBusy: true } : { migrated: [] };
   }
 }
 
-/** Startup convenience: resolve the config path and migrate if present. */
-export async function migrateSandboxConfigAtStartup(): Promise<void> {
+/** Delays of the background retries after the startup attempt found the
+ *  bots.json lock busy (dozens of per-bot daemons boot at once, and every
+ *  other bots.json writer shares the lock). */
+export const SANDBOX_MIGRATION_RETRY_DELAYS_MS = [15_000, 60_000, 300_000] as const;
+
+/**
+ * Startup convenience: resolve the config path and migrate if present. A busy
+ * lock is retried in the background instead of being skipped until the next
+ * restart; the migration is idempotent, so whichever daemon gets the lock first
+ * writes and the rest find nothing to do. The legacy fields stay honoured
+ * meanwhile (they are kept on disk and frozen into sessions as before).
+ */
+export async function migrateSandboxConfigAtStartup(
+  opts: {
+    retryDelaysMs?: readonly number[];
+    schedule?: (fn: () => void, ms: number) => void;
+    lockOpts?: FileLockOptions;
+  } = {},
+): Promise<void> {
   const path = resolveBotsConfigPath();
   if (!path) return;
-  await migrateSandboxConfigOnDisk(path);
+  const delays = opts.retryDelaysMs ?? SANDBOX_MIGRATION_RETRY_DELAYS_MS;
+  const schedule = opts.schedule ?? ((fn, ms) => { setTimeout(fn, ms).unref?.(); });
+  const attempt = async (retry: number): Promise<void> => {
+    const result = await migrateSandboxConfigOnDisk(path, opts.lockOpts);
+    if (!result.lockBusy) return;
+    const delay = delays[retry];
+    if (delay === undefined) {
+      logger.warn(`[sandbox-migration] bots.json lock still busy after ${retry} background retr${retry === 1 ? 'y' : 'ies'}; will try again on the next daemon start`);
+      return;
+    }
+    logger.info(`[sandbox-migration] bots.json lock busy; retrying in ${Math.round(delay / 1000)}s`);
+    schedule(() => { void attempt(retry + 1); }, delay);
+  };
+  await attempt(0);
 }

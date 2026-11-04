@@ -122,4 +122,81 @@ describe('botmux observe real daemon IPC', () => {
 
     process.stdout.write(`OBSERVE_CLI_TRANSCRIPT ${JSON.stringify(snapshot)}\n`);
   });
+  it('prints the daemon-computed context block for a single-session probe, and none for a listing', async () => {
+    root = mkdtempSync(join(tmpdir(), 'botmux-observe-ctx-'));
+    const home = join(root, 'home');
+    const dataDir = join(root, 'data');
+    const configDir = join(home, '.botmux');
+    const registryDir = join(dataDir, 'dashboard-daemons');
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    mkdirSync(registryDir, { recursive: true });
+    const secretPath = join(configDir, '.dashboard-secret');
+    writeFileSync(secretPath, SECRET, { mode: 0o600 });
+    chmodSync(secretPath, 0o600);
+
+    const measured = {
+      usedTokens: 161_240, windowTokens: 1_000_000, compactions: 2,
+      measuredAt: 1_790_000_000_000, source: 'claude-transcript',
+    };
+    const baseRow = {
+      sessionId: 'session-ctx-1', larkAppId: 'cli_observe_ctx', chatId: 'oc_observe', rootMessageId: 'om_observe',
+      scope: 'thread', botName: 'observe-ctx', cliId: 'claude-code', backendType: 'pty', adopt: false,
+      status: 'idle', queued: false, workingDir: '/workspace/demo',
+    };
+    // Mirrors the daemon: the bulk listing skips transcript scans, the
+    // single-session route computes the block.
+    server = createServer((req, res) => {
+      const port = (server!.address() as { port: number }).port;
+      const pathname = new URL(req.url ?? '/', `http://127.0.0.1:${port}`).pathname;
+      const ok = verifyHmac(
+        SECRET,
+        {
+          ts: String(req.headers['x-botmux-cli-ts'] ?? ''),
+          nonce: String(req.headers['x-botmux-cli-nonce'] ?? ''),
+          sig: String(req.headers['x-botmux-cli-auth'] ?? ''),
+        },
+        req.socket.remoteAddress ?? '',
+        cliAuthBind(req.method ?? 'GET', pathname, port),
+      ).ok;
+      if (!ok) { res.writeHead(401).end('unauthorized'); return; }
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(pathname === '/api/sessions'
+        ? { sessions: [baseRow] }
+        : { session: { ...baseRow, contextUsage: measured } }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server!.once('error', reject);
+      server!.listen(0, '127.0.0.1', resolve);
+    });
+    const port = (server.address() as { port: number }).port;
+    writeFileSync(join(registryDir, 'cli_observe_ctx.json'), JSON.stringify({
+      larkAppId: 'cli_observe_ctx', ipcPort: port, pid: process.pid, lastHeartbeat: Date.now(),
+    }));
+
+    const run = async (args: string[]) => {
+      const child = spawnTsEvalWithRepoImports(
+        `import { runObserveCommand } from './src/cli/observe-command.js';
+         process.exitCode = await runObserveCommand(${JSON.stringify(args)});`,
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, SESSION_DATA_DIR: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout!.setEncoding('utf8');
+      child.stderr!.setEncoding('utf8');
+      child.stdout!.on('data', chunk => { stdout += chunk; });
+      child.stderr!.on('data', chunk => { stderr += chunk; });
+      const status = await new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', resolve);
+      });
+      expect(status, stderr).toBe(0);
+      return JSON.parse(stdout);
+    };
+
+    const single = await run(['--session', 'session-ctx-1', '--lark-app', 'cli_observe_ctx']);
+    expect(single.context).toEqual(measured);
+
+    const listing = await run(['--lark-app', 'cli_observe_ctx']);
+    expect(listing.daemons[0].sessions[0]).not.toHaveProperty('context');
+  });
 });

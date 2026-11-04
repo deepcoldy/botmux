@@ -19,7 +19,7 @@
  *   message in the input box. Submit is verified via CoCo's platform-specific
  *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
- * - Other adapters (Aiden/Gemini): use plain sendText + Enter
+ * - Other adapters (Aiden/Genius/MTR): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
  *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
  * - Hermes: single pasteText with the whole content + delayed Enter. Its
@@ -78,7 +78,6 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
@@ -215,7 +214,7 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, Genius, MTR. (Codex moved to PASTE_BUFFER_ADAPTERS; its
+ *  Genius, MTR. (Codex moved to PASTE_BUFFER_ADAPTERS; its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
  *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.
  *  Hermes moved to PASTE_BUFFER_ADAPTERS too: on a cold start its prompt_toolkit
@@ -224,7 +223,6 @@ type AdapterEntry = [string, CliAdapter];
  *  newline, stranding the opening prompt until a manual Enter.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
-  ['gemini', createGeminiAdapter('/bin/gemini')],
   ['genius', createGeniusAdapter('/bin/genius')],
   ['mtr', createMtrAdapter('/bin/mtr')],
 ];
@@ -351,7 +349,7 @@ describe('writeInput: single-line, non-tmux mode', () => {
 //    - CLAUDE_CODE / CoCo / Codex / Kimi / Pi / Hermes: bracketed paste
 //      (pasteText) with the whole string — the embedded \n stay content, only
 //      the trailing Enter submits.
-//    - PLAIN adapters (Aiden/Gemini/MTR): sendText with the
+//    - PLAIN adapters (Aiden/Genius/MTR): sendText with the
 //      whole string (including \n) — those CLIs treat literal LF as a newline,
 //      not a submit, so only the trailing Enter submits.
 //    - OpenCode: pasteText for multiline/large prompts so its TUI receives
@@ -989,7 +987,7 @@ describe('claude-code writeInput submission confirmation', () => {
         wroteNewTranscript = true;
         writeFileSync(
           newPath,
-          JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello from the moved session' } }) + '\n',
+          JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'hello from the moved session' } }) + '\n',
         );
       }),
     };
@@ -1017,6 +1015,7 @@ describe('claude-code writeInput submission confirmation', () => {
           JSON.stringify({
             type: 'queue-operation',
             operation: 'enqueue',
+            timestamp: new Date().toISOString(),
             content: 'queued prompt after session switch',
           }) + '\n',
         );
@@ -1206,7 +1205,7 @@ describe('claude-code writeInput submission confirmation', () => {
         writeClaudePidFile(9999, { sessionId: rotatedSessionId, cwd });
         appendFileSync(
           rotatedPath,
-          JSON.stringify({ type: 'user', message: { role: 'user', content: 'sent during rotation' } }) + '\n',
+          JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'sent during rotation' } }) + '\n',
         );
       }),
     };
@@ -1255,7 +1254,7 @@ describe('claude-code writeInput submission confirmation', () => {
           setTimeout(() => {
             appendFileSync(
               rotatedPath,
-              JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
+              JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
             );
           }, 850 * TIME_SCALE);
         }),
@@ -1288,7 +1287,7 @@ describe('claude-code writeInput submission confirmation', () => {
         wroteNewTranscript = true;
         writeFileSync(
           newPath,
-          JSON.stringify({ type: 'user', message: { role: 'user', content: 'fallback by fingerprint' } }) + '\n',
+          JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'fallback by fingerprint' } }) + '\n',
         );
       }),
     };
@@ -1328,7 +1327,7 @@ describe('claude-code writeInput submission confirmation', () => {
     // Hook eventually lets the user line land in the pinned path.
     appendFileSync(
       pinnedPath,
-      JSON.stringify({ type: 'user', message: { role: 'user', content: 'slow hook still running' } }) + '\n',
+      JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'slow hook still running' } }) + '\n',
     );
     expect(recheck()).toBe(true);  // Now the worker suppresses the warning
   });
@@ -1400,6 +1399,19 @@ Fix the test suite failure on CI
     const elapsed = Date.now() - t0;
     expect(elapsed).toBeLessThan(100);
     expect(res).toContain('safe content');
+  });
+
+  it('extractMessageContentForFingerprint strips the follow-up <botmux_formatting> block without an envelope', () => {
+    // #2716: bare transcript / hook fallback shapes carry no <user_message>;
+    // the new follow-up-only block must be isolated from the user payload just
+    // like <botmux_reminder>, instead of taking over the 30-char fingerprint of
+    // a short message.
+    const bare = '继续\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    expect(extractMessageContentForFingerprint(bare)).toBe('继续');
+    expect(makeSubmitFingerprint(bare, 30)).toBe('继续');
+
+    const ledByFormatting = '<botmux_formatting>短进度优先纯文本。</botmux_formatting>\n\n<user_message>\n继续看一下\n</user_message>';
+    expect(extractMessageContentForFingerprint(ledByFormatting)).toBe('继续看一下');
   });
 
   it('stripBotmuxEnvelopeBlocks stays linear and preserves later blocks on malformed tag soup', () => {
@@ -1800,7 +1812,8 @@ describe('codex writeInput submission confirmation', () => {
       captureCurrentScreen: () => '', captureInputState: () => null,
     };
     const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
-    expect(result).toEqual({ submitted: true });
+    // The unproven id is only a candidate, never the session.
+    expect(result).toEqual({ submitted: true, unprovenCliSessionId: 'foreign-session' });
     expect(sendText).not.toHaveBeenCalled();
     expect(pasteText).toHaveBeenCalledExactlyOnceWith('hi');
     expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');

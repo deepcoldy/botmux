@@ -17,6 +17,7 @@ const sessionToolRunner = resolve('test/fixtures/remote-runner-session-tool.mjs'
 const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
 const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
 const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.mjs');
+const stdinClosedRunner = resolve('test/fixtures/remote-runner-stdin-closed.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -70,7 +71,7 @@ describe('RemoteRunnerBackend', () => {
           openId: 'ou_owner',
           unionId: 'on_owner',
           email: 'owner@bytedance.com',
-          source: 'platform_team',
+          source: 'bot_config',
         },
       },
     })).resolves.toEqual({ submitted: true });
@@ -804,6 +805,47 @@ describe('RemoteRunnerBackend', () => {
       turnId: 'turn-stalled',
       status: 'ambiguous',
     });
+  });
+
+  it('fails a turn the provider can no longer read without crashing the host process', async () => {
+    const escaped: unknown[] = [];
+    const onUncaught = (error: unknown) => escaped.push(error);
+    process.on('uncaughtException', onUncaught);
+    try {
+      const backend = new RemoteRunnerBackend({
+        expectedProvider: 'stdin-closed',
+        requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'status'],
+      }, 'session-stdin-closed');
+      children.push(backend);
+      const ready = once<void>(cb => backend.onReady(cb));
+      const failure = once<{ status: string; turnId: string }>(cb => {
+        backend.onTurnFailure(value => cb(value));
+      });
+      const exited = once<void>(cb => backend.onExit(() => cb()));
+      spawnBackend(backend, stdinClosedRunner);
+      await ready;
+
+      // The provider closed its stdin before reporting ready, so the turn hits
+      // a pipe nobody reads: EPIPE. The write callback fails the turn, but the
+      // stream also emits 'error'; without a listener that is thrown at process
+      // level. Bun only reports EPIPE for writes the pipe buffer cannot absorb,
+      // so the turn is made larger than that.
+      await expect(backend.submitTurn({
+        turnId: 'turn-stdin-closed',
+        content: 'x'.repeat(256 * 1024),
+      })).resolves.toMatchObject({
+        submitted: false,
+        submissionDisposition: 'dirty_unknown',
+      });
+      await expect(failure).resolves.toMatchObject({
+        turnId: 'turn-stdin-closed',
+        status: 'ambiguous',
+      });
+      await exited;
+      expect(escaped).toEqual([]);
+    } finally {
+      process.removeListener('uncaughtException', onUncaught);
+    }
   });
 
   it('correlates a provider failure before the busy ACK and keeps the generation usable', async () => {

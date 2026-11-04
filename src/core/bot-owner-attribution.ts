@@ -1,14 +1,15 @@
 import type { TrustedCaller } from '../types.js';
 import { resolveVerifiedUserIdentityByUnionId } from '../im/lark/identity-cache.js';
-import { resolvePlatformTeamBotOwner } from '../services/platform-team-store.js';
+import {
+  findBotActorOwnerBinding,
+  type BotActorOwnerBinding,
+} from './bot-actor-owner-binding.js';
 
 export interface BotOwnerAttributionDeps {
-  resolveOwnerUnionId: typeof resolvePlatformTeamBotOwner;
   resolveOwnerIdentity: typeof resolveVerifiedUserIdentityByUnionId;
 }
 
 const DEFAULT_DEPS: BotOwnerAttributionDeps = {
-  resolveOwnerUnionId: resolvePlatformTeamBotOwner,
   resolveOwnerIdentity: resolveVerifiedUserIdentityByUnionId,
 };
 
@@ -18,30 +19,31 @@ const DEFAULT_DEPS: BotOwnerAttributionDeps = {
  * narrowly sourced credential choice for consumers that explicitly implement
  * developer_default.
  */
-export async function withPlatformBotOwner(
+export async function withConfiguredBotOwner(
   caller: TrustedCaller | undefined,
-  dataDir: string,
+  bindings: readonly BotActorOwnerBinding[] | undefined,
   deps: BotOwnerAttributionDeps = DEFAULT_DEPS,
 ): Promise<TrustedCaller | undefined> {
-  if (caller?.senderType !== 'bot' || !caller.requestLarkAppId || !caller.requestUserUnionId) {
+  if (caller?.senderType !== 'bot' || !caller.requestLarkAppId) {
     return caller;
   }
-  const owner = deps.resolveOwnerUnionId(
-    dataDir,
-    caller.requestLarkAppId,
+  const binding = findBotActorOwnerBinding(
+    bindings,
+    caller.requestUserOpenId,
     caller.requestUserUnionId,
   );
-  if (owner.status !== 'resolved') return caller;
-  const identity = await deps.resolveOwnerIdentity(caller.requestLarkAppId, owner.ownerUnionId);
+  if (!binding) return caller;
+  const identity = await deps.resolveOwnerIdentity(caller.requestLarkAppId, binding.ownerUnionId);
   const email = identity?.email?.trim().toLowerCase();
-  if (!identity || identity.unionId !== owner.ownerUnionId || !email || !email.includes('@')) return caller;
+  if (!identity || !identity.openId.startsWith('ou_')
+      || identity.unionId !== binding.ownerUnionId || email !== binding.ownerEmail) return caller;
   return {
     ...caller,
     botOwner: {
       openId: identity.openId,
       unionId: identity.unionId,
       email,
-      source: 'platform_team',
+      source: 'bot_config',
     },
   };
 }

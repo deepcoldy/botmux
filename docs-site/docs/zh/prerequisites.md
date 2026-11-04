@@ -9,9 +9,9 @@
 
 - **botmux 本身：不需要 Node**。默认的 [curl 安装方式](/quickstart)装的是自包含单文件二进制，运行时已嵌在里面。**只有走 npm 安装路径时才要 Node ≥ 22**——那是执行 `npm i -g` 本身的要求，不是跑 botmux 的要求。（`botmux plugin init` 这类插件开发命令会调用 npm，也需要 Node。）
 - **AI 编程 CLI / 本地 Agent 应用**：至少一种**已安装并完成认证**、可执行文件在 `PATH` 中：
-  - `claude`（Claude Code）、`codex`、`cursor-agent`（Cursor）、`gemini`、`opencode`、`coco`（Trae / CoCo）、`agy`（Antigravity）、`hermes` 等（完整 `cliId` 见 [多 CLI 适配器](/adapters)）。
+  - `claude`（Claude Code）、`codex`、`cursor-agent`（Cursor）、`opencode`、`coco`（Trae / CoCo）、`agy`（Antigravity）、`hermes` 等（完整 `cliId` 见 [多 CLI 适配器](/adapters)）。
   - ⚠️ botmux 只是桥接层，不代管登录——**先在终端里手动跑一次该 CLI 确认能对话**，再接 botmux。
-  - ⚠️ 这些 CLI 自己的运行时要求另算：不少是 npm 包（`claude` / `codex` / `gemini` 等），装它们仍然要 Node。「botmux 不需要 Node」说的是 botmux 自己。
+  - ⚠️ 这些 CLI 自己的运行时要求另算：不少是 npm 包（`claude` / `codex` 等），装它们仍然要 Node。「botmux 不需要 Node」说的是 botmux 自己。
 - **tmux ≥ 3.x**（**默认后端，强烈建议装**）：**默认配置下**会话后端就是 tmux，装了才能起会话——tmux 不可用时 botmux **不再静默降级 pty**，而是硬拦截并弹卡提示装 tmux（见 [tmux 会话常驻](/tmux)）。要跑无 tmux 环境，可显式选别的后端：`BACKEND_TYPE=pty` / per-bot `backendType`（`pty`/`herdr`/`zellij`）——pty 不跨 daemon 重启存活；herdr/zellij 需各自二进制。（riff 是云 Agent，不占本地后端。）
 
 ## 推荐部署形态

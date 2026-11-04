@@ -60,6 +60,21 @@ export interface ObserveProbe {
   error?: string;
 }
 
+/** How full the session's context is right now. The whole block is absent
+ *  when it cannot be proven — never 0, never inferred from a model name.
+ *  - `usedTokens`: prompt size of the LATEST request (not a cumulative total).
+ *  - `windowTokens`: the CLI's own reported window; null when unknown.
+ *  - `compactions`: how many times the context was compacted; null = unknown.
+ *  - `measuredAt`: epoch ms of the transcript entry `usedTokens` came from.
+ *  - `source`: 'claude-transcript' | 'codex-rollout'. */
+export interface ObserveContext {
+  usedTokens: number;
+  windowTokens: number | null;
+  compactions: number | null;
+  measuredAt: number;
+  source: string;
+}
+
 export interface ObserveSession {
   schemaVersion: typeof OBSERVE_SCHEMA_VERSION;
   observedAt: number;
@@ -104,6 +119,10 @@ export interface ObserveSession {
   parkedOrSuspended: ObserveBoolean;
   /** boolean | 'unknown'; use strict equality, never truthiness. */
   closed: ObserveBoolean;
+  /** Present only for a single-session probe (`--session`) of a Claude Code or
+   *  Codex session whose transcript has a usable measurement; bulk listings skip
+   *  transcript scans and therefore never carry it. */
+  context?: ObserveContext;
   rawStatus?: string;
   raw?: unknown;
 }
@@ -135,6 +154,26 @@ const ROW_RUNTIME_STATUSES = new Set<string>([
   'dormant',
   'closed',
 ]);
+
+function positiveFinite(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** Validate the daemon-computed `contextUsage` field. Anything short of a fully
+ *  well-formed measurement drops the whole block (no partial/zeroed fallback). */
+function normalizeContext(raw: unknown): ObserveContext | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const c = raw as Record<string, unknown>;
+  const usedTokens = positiveFinite(c.usedTokens);
+  const measuredAt = positiveFinite(c.measuredAt);
+  if (usedTokens === undefined || measuredAt === undefined) return undefined;
+  if (typeof c.source !== 'string' || !c.source) return undefined;
+  const windowTokens = positiveFinite(c.windowTokens) ?? null;
+  const compactions = typeof c.compactions === 'number' && Number.isInteger(c.compactions) && c.compactions >= 0
+    ? c.compactions
+    : null;
+  return { usedTokens, windowTokens, compactions, measuredAt, source: c.source };
+}
 
 /**
  * Normalize a raw daemon SessionRow (whatever shape `GET /api/sessions` emits)
@@ -255,6 +294,10 @@ export function normalizeSessionRow(
   if (typeof row.workingDir === 'string' && row.workingDir) {
     observe.workingDirectory = row.workingDir;
   }
+  if (hasRuntimeFacts) {
+    const context = normalizeContext(row.contextUsage);
+    if (context) observe.context = context;
+  }
   if (hasRuntimeFacts && status) observe.rawStatus = status;
   if (hasRuntimeFacts && options.includeRaw) observe.raw = row;
 
@@ -289,5 +332,6 @@ export interface RawSessionRow {
   agentAttention?: unknown;
   lastMessageAt?: unknown;
   workingDir?: unknown;
+  contextUsage?: unknown;
   [key: string]: unknown;
 }

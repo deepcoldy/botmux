@@ -350,6 +350,7 @@ describe('plugin MCP daemon LinkRef authority', () => {
         turnId: 'om_link_ref',
         dispatchAttempt: 3,
         linkRefMode: 'enabled',
+        responseKind: 'final',
         payload: { text: '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}' },
       },
     });
@@ -360,6 +361,17 @@ describe('plugin MCP daemon LinkRef authority', () => {
         refCount: 1,
       },
     });
+    expect(linkRefs.resolveForDaemon).toHaveBeenCalledWith(
+      {
+        appId: 'app-host-owned',
+        sessionId: 'session-link-ref',
+        turnId: 'om_link_ref',
+        dispatchAttempt: 3,
+      },
+      'enabled',
+      { text: '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}' },
+      'final',
+    );
   });
 
   it('rejects a stale host-delivery turn before probing the ledger', () => {
@@ -391,9 +403,28 @@ describe('plugin MCP daemon LinkRef authority', () => {
       runtime: linkRefs,
       request: {
         sessionId: 'session-link-ref', turnId: 'om_link_ref', dispatchAttempt: 3,
-        linkRefMode: 'enabled', payload: { text: 'plain' },
+        linkRefMode: 'enabled', responseKind: 'final', payload: { text: 'plain' },
       },
     });
     expect(result).toEqual({ ok: false, error: 'link_ref_ledger_unavailable' });
+  });
+
+  it('fails closed when a host-delivery resolve request omits responseKind', () => {
+    const linkRefs = runtime();
+    const result = resolveMcpHostDeliveryLinkRefsFromWorker({
+      ownsWorkerSession: true,
+      daemonSession: {
+        appId: 'app-host-owned', sessionId: 'session-link-ref',
+        managedTurnOrigin: { turnId: 'om_link_ref', dispatchAttempt: 3, linkRefMode: 'enabled' },
+      },
+      runtime: linkRefs,
+      request: {
+        sessionId: 'session-link-ref', turnId: 'om_link_ref', dispatchAttempt: 3,
+        linkRefMode: 'enabled', payload: { text: 'plain' },
+      } as never,
+    });
+    expect(result).toEqual({ ok: false, error: 'link_ref_identity_mismatch' });
+    expect(linkRefs.restoreMode).not.toHaveBeenCalled();
+    expect(linkRefs.resolveForDaemon).not.toHaveBeenCalled();
   });
 });

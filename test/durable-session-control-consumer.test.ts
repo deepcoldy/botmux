@@ -11,6 +11,7 @@ import {
   durableLarkSessionControlPartitionPrefix,
 } from '../src/services/durable-lark-session-control.js';
 import { startDurableSessionControlConsumer } from '../src/services/durable-session-control-consumer.js';
+import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
 
 const tempDirs: string[] = [];
 
@@ -161,6 +162,7 @@ describe('durable session control consumer', () => {
       workerId: 'control-failover',
       ownedPartitionKeys: () => [],
       partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 0,
       dispatch: async control => {
         dispatched.push(control.sessionId);
         return { kind: 'settled' };
@@ -171,6 +173,46 @@ describe('durable session control consumer', () => {
     await consumer.ready;
     expect(dispatched).toEqual(['session-a']);
     await consumer.stop();
+    await store.close();
+  });
+
+  it('gives the exact owner one interval before prefix failover can steal a fresh control', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const standbyDispatch = vi.fn();
+    const standby = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-standby',
+      ownedPartitionKeys: () => [],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      dispatch: standbyDispatch,
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await standby.ready;
+    expect(standbyDispatch).not.toHaveBeenCalled();
+
+    const ownerDispatch = vi.fn(async () => ({ kind: 'settled' as const }));
+    const owner = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-owner',
+      ownedPartitionKeys: () => [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      dispatch: ownerDispatch,
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await owner.ready;
+    expect(ownerDispatch).toHaveBeenCalledOnce();
+    expect(standbyDispatch).not.toHaveBeenCalled();
+
+    now += 1_000;
+    await owner.stop();
+    await standby.stop();
     await store.close();
   });
 
@@ -238,6 +280,52 @@ describe('durable session control consumer', () => {
     now = 510;
     expect(await store.claimNextInbox({
       workerId: 'retry-owner',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      leaseDurationMs: 100,
+    })).toMatchObject({ attempts: 2 });
+    await store.close();
+  });
+
+  it('requeues an owner handoff quickly instead of paying the backend retry delay', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const retryInboxClaim = vi.spyOn(store, 'retryInboxClaim');
+    const errors: unknown[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-standby',
+      ownedPartitionKeys: () => [],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 0,
+      ownerHandoffRetryDelayMs: 100,
+      retryDelayMs: 5_000,
+      intervalMs: 60_000,
+      concurrency: 1,
+      now: () => now,
+      onError: error => errors.push(error),
+      dispatch: async () => {
+        throw new DurableSessionControlOwnerHandoffError('exact owner still holds the lease');
+      },
+    });
+    await consumer.ready;
+    await consumer.stop();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    expect(retryInboxClaim).toHaveBeenCalledOnce();
+    expect(retryInboxClaim).toHaveBeenCalledWith(expect.objectContaining({ visibleAt: 110 }));
+
+    now = 109;
+    expect(await store.claimNextInbox({
+      workerId: 'too-early',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      leaseDurationMs: 100,
+    })).toBeUndefined();
+    now = 110;
+    expect(await store.claimNextInbox({
+      workerId: 'exact-owner',
       lane: 'session-control',
       partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
       leaseDurationMs: 100,

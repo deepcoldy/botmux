@@ -24,9 +24,11 @@ export function isScratchSandbox(opts?: {
  * Two harvest channels qualify:
  *  - the ordinary transcript-reply CLIs (claude-code via its own bridge + the
  *    structured ALWAYS set), which deliver finals in every injection mode;
- *  - the zero-prompt-only structured CLIs (cursor / antigravity), whose bridge
- *    activates ONLY while promptInjection:'none' — default mode they answer via
- *    `botmux send` instead.
+ *  - the zero-prompt-only structured CLI (antigravity), whose bridge activates
+ *    ONLY while promptInjection:'none' — in default mode it answers via
+ *    `botmux send` instead. (cursor used to be listed here; since #932 its
+ *    bridge is part of the ALWAYS set — default mode harvests send-less turns
+ *    with the send-marker gate, though it is still suppressed under scratch.)
  *
  * Sandbox: cursor/antigravity are supported under the oncall bwrap sandbox
  * (and read isolation / the BOTMUX_SANDBOX switch) — their adapters declare
@@ -53,23 +55,41 @@ export function isScratchSandbox(opts?: {
  * final immediately rather than through that gate). */
 const ZERO_PROMPT_LOCAL_BACKENDS = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'] as const;
 
-export function supportsZeroPromptInjection(cliId: string | undefined, opts?: {
+export type ZeroPromptUnsupportedReason =
+  | 'cli_unsupported'
+  | 'backend_unsupported'
+  | 'scratch_unsupported_for_cli'
+  | 'zmx_unsupported_for_antigravity';
+
+export interface ZeroPromptSupportOpts {
   backendType?: string; codexRpcInput?: boolean;
   sandbox?: ZeroPromptSandboxValue;
   readIsolation?: boolean;
-}): boolean {
+}
+
+/** Why zero injection is unavailable for this CLI / backend / sandbox combo,
+ *  checked in the order below; null = supported. The Dashboard uses the reason
+ *  to say WHAT to change instead of one generic "unsupported" line. */
+export function zeroPromptInjectionUnsupportedReason(
+  cliId: string | undefined,
+  opts?: ZeroPromptSupportOpts,
+): ZeroPromptUnsupportedReason | null {
   const localTranscript = supportsTranscriptReplyDelivery(cliId)
     || supportsZeroPromptStructuredBridge(cliId);
-  if (!localTranscript) return false;
+  if (!localTranscript) return 'cli_unsupported';
   if (opts?.backendType
     && !ZERO_PROMPT_LOCAL_BACKENDS.includes(opts.backendType as typeof ZERO_PROMPT_LOCAL_BACKENDS[number])) {
-    return false;
+    return 'backend_unsupported';
   }
   if ((cliId === 'cursor' || cliId === 'antigravity') && isScratchSandbox(opts)) {
-    return false;
+    return 'scratch_unsupported_for_cli';
   }
   if (cliId === 'antigravity' && opts?.backendType === 'zmx') {
-    return false;
+    return 'zmx_unsupported_for_antigravity';
   }
-  return true;
+  return null;
+}
+
+export function supportsZeroPromptInjection(cliId: string | undefined, opts?: ZeroPromptSupportOpts): boolean {
+  return zeroPromptInjectionUnsupportedReason(cliId, opts) === null;
 }

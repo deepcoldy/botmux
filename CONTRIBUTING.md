@@ -77,7 +77,7 @@ Daemon (daemon.ts → core/ modules)
     |-- core/scheduler: cron scheduling
     |
 Worker (worker.ts) -- forked per session
-    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / Gemini / OpenCode)
+    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / OpenCode / Antigravity / ...)
     |-- adapters/backend: PtyBackend or TmuxBackend
     |-- utils/idle-detector: idle detection
     |-- HTTP + WebSocket: xterm.js web terminal
@@ -85,7 +85,7 @@ Worker (worker.ts) -- forked per session
     |-- IPC: daemon communication
     |
 AI Coding CLI (interactive TTY)
-    |-- Auto-installed Skills (~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/)
+    |-- Auto-installed Skills (~/.claude/skills/, ~/.config/opencode/skills/, ...)
     |-- ~/.botmux/bin/botmux wrapper on PATH → `botmux send/schedule/bots/thread` subcommands
     |
 Lark API
@@ -108,7 +108,7 @@ src/
       registry.ts           # Adapter factory + resolveCommand
       claude-code.ts        # Claude Code adapter
       codex.ts              # Codex adapter
-      gemini.ts             # Gemini CLI adapter
+      antigravity.ts        # Antigravity adapter
     backend/
       types.ts              # SessionBackend interface
       pty-backend.ts        # node-pty backend
@@ -153,8 +153,8 @@ teach the agent when/how to use them.
 **Runtime setup per CLI worker spawn** (see `src/core/worker-pool.ts`):
 
 1. `ensureCliSkills(cliId)` — writes `src/skills/definitions.ts` content
-   into the CLI's native skill dir (`~/.claude/skills/`, `~/.gemini/skills/`,
-   `~/.config/opencode/skills/`). Synchronous, idempotent per lifecycle.
+   into the CLI's native skill dir (`~/.claude/skills/`,
+   `~/.config/opencode/skills/`, ...). Synchronous, idempotent per lifecycle.
 2. Worker `PATH` is prepended with `~/.botmux/bin`, which contains a
    `botmux` shell wrapper written by the daemon at startup (points at the
    running daemon's `dist/cli.js` — always in sync).
@@ -213,8 +213,9 @@ Tests are split into two Vitest projects with different execution profiles
 - **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
   Runs with **file parallelism on** (one process per file). This is what
   `bun run test` runs; it needs no real CLI binary or browser. The full project
-  takes minutes, not seconds (CI splits it into three shards), so while iterating
-  run only the files you touched: `bun run test -- test/<name>.test.ts`.
+  takes minutes, not seconds (CI splits it into four shards balanced by recorded
+  per-file duration, see `scripts/duration-shards.mjs`), so while iterating run
+  only the files you touched: `bun run test -- test/<name>.test.ts`.
 - **`e2e`** (`*.e2e.ts`, excluding `test/e2e-browser/`) — spawns real CLIs and
   runs sequentially. Opt-in only.
 - **Feishu browser E2E** (`test/e2e-browser/cases/*.yaml`) — runs through
@@ -226,7 +227,6 @@ bun run test:all            # Unit + E2E (needs real CLIs / browser session)
 bun run test:e2e            # All *.e2e.ts (sequential)
 bun run test:e2e-browser    # Feishu browser cases through Midscene Test
 bun run test:codex          # Codex input E2E
-bun run test:gemini         # Gemini CLI input E2E
 bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
 bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```

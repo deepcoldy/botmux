@@ -191,9 +191,15 @@ describe('codex writeInput history ownership filter', () => {
     expect((result as any)?.submitted).toBe(true);
     expect((result as any)?.ownershipProven).toBeUndefined();
     expect((result as any)?.cliSessionId).toBeUndefined();
+    // Only a candidate the caller must prove before using.
+    expect((result as any)?.unprovenCliSessionId).toBe(SID_A);
   });
 
-  it.each(['immediate', 'late'])('confirms %s history with an empty rollout set without exposing a session ID', async (timing) => {
+  // Codex creates the rollout at the first submit, and its history line can be
+  // readable before the pid holds that rollout (#2363). The id must not become
+  // the session, but it must reach the caller as a candidate: dropping it left
+  // a fresh spawn with no way to find its rollout.
+  it.each(['immediate', 'late'])('confirms %s history with an empty rollout set, returning the id only as a candidate', async (timing) => {
     expect(findCodexRolloutSetByPid(process.pid)).toEqual(new Set());
     const pty = fakePty(process.pid, () => {
       if (timing === 'immediate') {
@@ -210,9 +216,9 @@ describe('codex writeInput history ownership filter', () => {
     if (timing === 'late') {
       if (!result || result.submitted !== false) throw new Error('Expected a pending submission');
       appendFileSync(join(home, 'history.jsonl'), historyLine(SID_A, 'shared submit'));
-      expect(result.recheck?.()).toEqual({ submitted: true });
+      expect(result.recheck?.()).toEqual({ submitted: true, unprovenCliSessionId: SID_A });
     } else {
-      expect(result).toEqual({ submitted: true });
+      expect(result).toEqual({ submitted: true, unprovenCliSessionId: SID_A });
     }
     expect(codexHistorySidIsOwned(SID_A, findCodexRolloutSetByPid(process.pid))).toBe(false);
   });
@@ -246,8 +252,8 @@ describe('codex writeInput history ownership filter', () => {
     // CLI missing from it (as codex once was) submits fine but never proves.
     expect(cliAdapterBindsOwnershipPid('codex', undefined)).toBe(true);
     expect(cliAdapterBindsOwnershipPid('traex', undefined)).toBe(true);
-    expect(cliAdapterBindsOwnershipPid('gemini', undefined)).toBe(false);
-    expect(cliAdapterBindsOwnershipPid('gemini', '/tmp/claude-data')).toBe(true);
+    expect(cliAdapterBindsOwnershipPid('opencode', undefined)).toBe(false);
+    expect(cliAdapterBindsOwnershipPid('opencode', '/tmp/claude-data')).toBe(true);
     // A real tmux backend handle that never touches tmux: every input path is
     // redirected to the temporary history, as the managed worker would see it.
     const handle = new TmuxPipeBackend('review-do-not-connect', { isReattach: true, ownsSession: true }) as TmuxPipeBackend & PtyHandle;

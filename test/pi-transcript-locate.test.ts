@@ -15,8 +15,10 @@ import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  adoptPiTranscriptIntoBotmuxDir,
   drainPiTranscript,
   findPiTranscriptBySessionId,
+  piBotmuxSessionDirIn,
   piSessionDirName,
   resetPiPendingTurnState,
 } from '../src/services/pi-transcript.js';
@@ -122,6 +124,68 @@ describe('findPiTranscriptBySessionId after the session moved to another cwd', (
   });
 });
 
+// The oncall file sandbox gives each Pi session its own dir
+// (`sessions/botmux/<sid>`, passed as --session-dir); without it Pi files the
+// session in its cwd bucket. A session can cross between the two when the
+// sandbox is switched on or off between restarts: its history and the bridge
+// must follow the session, not the current setting.
+describe('Pi transcript layout follows the session across a sandbox switch', () => {
+  const ownDir = () => piBotmuxSessionDirIn(SESSIONS, SID);
+
+  it('off → on: the resume copies the cwd-bucket history into the own dir and the bridge follows it', () => {
+    const cwd = join(ROOT, 'wt');
+    mkdirSync(cwd, { recursive: true });
+    const native = writeSession(piSessionDirName(cwd), `2026-10-01T00-00-00-000Z_${SID}.jsonl`, [header(cwd)]);
+    const adopted = adoptPiTranscriptIntoBotmuxDir(SID, cwd, SESSIONS);
+    expect(adopted).toEqual({ status: 'copied', from: native, to: join(ownDir(), `2026-10-01T00-00-00-000Z_${SID}.jsonl`) });
+    // Pi resumes (and appends to) the copy; the bridge must read the same file.
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS)).toBe(adopted.status === 'copied' ? adopted.to : '');
+    // A second sandboxed restart leaves the own copy alone.
+    expect(adoptPiTranscriptIntoBotmuxDir(SID, cwd, SESSIONS)).toEqual({ status: 'skipped', reason: 'already-own' });
+  });
+
+  it('on → off: the own dir keeps winning over a stale or missing cwd-bucket file', () => {
+    const cwd = join(ROOT, 'wt');
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(ownDir(), { recursive: true });
+    const own = join(ownDir(), `2026-10-02T00-00-00-000Z_${SID}.jsonl`);
+    writeFileSync(own, JSON.stringify(header(cwd)) + '\n');
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS)).toBe(own);
+    writeSession(piSessionDirName(cwd), `2026-10-01T00-00-00-000Z_${SID}.jsonl`, [header(cwd)]);
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS)).toBe(own);
+  });
+
+  it('after a /cd: the own dir is the only place the bridge looks, and the new cwd\'s history is copied in', () => {
+    const cwdA = join(ROOT, 'a');
+    const cwdB = join(ROOT, 'b');
+    mkdirSync(cwdA, { recursive: true });
+    mkdirSync(cwdB, { recursive: true });
+    // Unsandboxed run in A, `/cd` to B: one native file per cwd.
+    writeSession(piSessionDirName(cwdA), `2026-10-01T00-00-00-000Z_${SID}.jsonl`, [header(cwdA)]);
+    const nativeB = writeSession(piSessionDirName(cwdB), `2026-10-02T00-00-00-000Z_${SID}.jsonl`, [header(cwdB)]);
+    // Sandboxed resume in A adopts A's file only.
+    expect(adoptPiTranscriptIntoBotmuxDir(SID, cwdA, SESSIONS).status).toBe('copied');
+    // Pi now only reads and writes the own dir: the stale native B file must not be picked.
+    expect(findPiTranscriptBySessionId(SID, cwdB, SESSIONS)).toBeUndefined();
+    // Resume in B copies B's native history in, and the bridge follows that copy.
+    const adopted = adoptPiTranscriptIntoBotmuxDir(SID, cwdB, SESSIONS);
+    expect(adopted).toMatchObject({ status: 'copied', from: nativeB });
+    expect(findPiTranscriptBySessionId(SID, cwdB, SESSIONS)).toBe(adopted.status === 'copied' ? adopted.to : '');
+  });
+
+  it('a file in the own dir without a cwd header is not adopted, as Pi skips it too', () => {
+    const cwd = join(ROOT, 'wt');
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(ownDir(), { recursive: true });
+    writeFileSync(join(ownDir(), `2026-10-04T00-00-00-000Z_${SID}.jsonl`), JSON.stringify({ type: 'session', version: 3, id: SID }) + '\n');
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS)).toBeUndefined();
+  });
+
+  it('a fresh session with no history anywhere is not adopted', () => {
+    expect(adoptPiTranscriptIntoBotmuxDir(SID, join(ROOT, 'wt'), SESSIONS)).toEqual({ status: 'skipped', reason: 'not-found' });
+  });
+});
+
 describe('findPiTranscriptBySessionId: header longer than one read block', () => {
   it('reads the whole first line when judging a fallback candidate', () => {
     const cwd = join(ROOT, 'wt');
@@ -141,9 +205,11 @@ describe('Pi 1.3.0 transcript: one turn read by the late-attached bridge', () =>
     const answer = '已跑完，结论先给：**head 64b84e46 可以直接合**。';
     const path = writeSession('--root--', `2026-10-20T17-03-23-621Z_${SID}.jsonl`, pi130Turn('/root', '@Pure(pi) #1809 复审', answer));
     const events = drainPiTranscript(path, 0).events;
-    // The system prompt record, model/thinking changes, context_edit and the
-    // markers are not turn events; the retried error is not a failure.
-    expect(events.filter(ev => ev.kind !== 'cot').map(ev => ev.kind)).toEqual(['user', 'assistant_final']);
+    // The system prompt record, model/thinking changes and context_edit are
+    // not turn events, and the markers surface only as `cli_settled`
+    // lifecycle edges; the retried error is not a failure.
+    expect(events.filter(ev => ev.kind !== 'cot' && ev.kind !== 'cli_settled').map(ev => ev.kind))
+      .toEqual(['user', 'assistant_final']);
     const final = events.find(ev => ev.kind === 'assistant_final')!;
     expect(final.text).toBe(answer);
     expect(final.terminalStatus).toBeUndefined();

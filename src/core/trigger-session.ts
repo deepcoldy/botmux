@@ -1,4 +1,5 @@
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
+import { rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
 import * as sessionStore from '../services/session-store.js';
@@ -66,6 +67,14 @@ export interface TriggerSessionInternalOptions {
    *  of botmux's persisted Session.lastUserPrompt/lastCliInput fields; receipt
    *  recovery asks the hub to resend the frozen envelope instead. */
   persistInputHistory?: boolean;
+  /** A live worker queues this turn behind one that is running instead of
+   *  folding it into that turn (type-ahead). Used by turns that must start
+   *  as their own turn (workflow wake-ups). */
+  queueAfterActiveTurn?: true;
+  /** Called when the live worker refused the input synchronously, before
+   *  accepting it — after `beforeDispatch` ran, so its caller can undo what
+   *  it prepared for a turn that provably never reached the worker. */
+  onDispatchRefused?: () => void;
 }
 
 function triggerTitle(req: TriggerRequest): string {
@@ -779,6 +788,7 @@ async function triggerSessionTurnAdmitted(
 ): Promise<TriggerResponse> {
   const stableTurnId = internal?.stableTurnId?.trim();
   const triggerId = stableTurnId || `trg_${randomUUID()}`;
+  rememberTriggerTurn(triggerId, req.source.type);
   // HTTP opt-in for codex-app native in-flight steer (turn/steer). The flag is
   // pure AUTHORIZATION forwarded to the worker — the live runner decides whether
   // it can actually merge into an active turn (canSteer); when it cannot, the
@@ -806,8 +816,10 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
-    prepareTriggerPresentation(target, willFork || !!(stableTurnId || loudTurnId
-      || req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId));
+    // Every accepted external input owns its generated turn, including quiet
+    // report follow-ups on an already-running worker. Keep its reply anchor
+    // independent of presentation and final-output suppression options.
+    prepareTriggerPresentation(target, true);
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
     const currentWorkerGeneration = Math.max(
       target.workerGeneration ?? 0,
@@ -1298,7 +1310,12 @@ async function triggerSessionTurnAdmitted(
       return {
         ok: false,
         triggerId,
-        errorCode: 'trigger_failed',
+        // Pre-delivery rejection: the session exists but cannot accept input
+        // yet (directory choice, first start, worktree setup, queue). A
+        // distinct code keeps this apart from the catch-all `trigger_failed`,
+        // which can also surface POST-delivery bookkeeping faults — callers
+        // use this code to prove input never reached a worker.
+        errorCode: 'session_not_runnable',
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
@@ -1569,12 +1586,14 @@ async function triggerSessionTurnAdmitted(
       const dispatchAttempt = prepareStableDispatch(target, false);
       armFinalOutputSuppression(target, dispatchAttempt);
       armLoudFinalSuppression(target);
-      const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
+      const accepted = sendWorkerInput(target, content, triggerId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+        ...(internal?.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       });
       if (!accepted) {
+        internal?.onDispatchRefused?.();
         disarmLoudFinalSuppression(target);
         return {
           ok: false,
@@ -1722,6 +1741,7 @@ async function triggerSessionTurnAdmitted(
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
   if (hasReasoningControl && effectiveReasoningEffort
+      && bot.config.cliId !== 'traex'
       && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
     return {
       ok: false,
@@ -1787,7 +1807,7 @@ async function triggerSessionTurnAdmitted(
     // Per-turn model / reasoning-effort override — scoped to CLIs with an
     // explicit reasoning control and to a freshly-created trigger session.
     // Gating on cliId keeps the contract honest and bounded: it never silently
-    // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
+    // changes the model of a Claude/Kimi/CoCo bot, and a fold-in to an existing
     // worker never reaches here. Model is gated here so it cannot leak to
     // other CLIs whose adapters do not implement this contract.
     //

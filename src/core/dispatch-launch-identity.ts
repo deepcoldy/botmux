@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import type { BotConfig } from '../bot-registry.js';
 import { config } from '../config.js';
+import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { canonicalJson } from '../utils/canonical-input-hash.js';
 import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
@@ -15,7 +16,8 @@ function digest(value: unknown): string {
 export function resolveDispatchLaunchIdentity(bot: BotConfig): DispatchLaunchIdentityV1 {
   const policy = bot.dispatchLaunchPolicy;
   if (!policy) throw new Error('dispatch launch policy is unavailable');
-  if (bot.cliId !== 'codex' || bot.codexRpcInput === true || bot.existingAppServer !== undefined) {
+  if (bot.cliId !== 'codex' || resolveCodexRpcInput(bot.cliId, bot.codexRpcInput, config.codexRpcInputDefault)
+    || bot.existingAppServer !== undefined) {
     throw new Error('dispatch launch v1 supports only the official Codex TUI');
   }
   const runtime = resolveCliRuntime({
