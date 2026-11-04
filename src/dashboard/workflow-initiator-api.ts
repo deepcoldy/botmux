@@ -4,11 +4,17 @@
  * D1). The Dashboard only classifies the login; the bot's own daemon resolves
  * the person and applies the I1 entry gate (core/workflow-initiator).
  *
- *   GET /api/v3/orchestration/initiator?larkAppId=<app>
+ *   POST /api/v3/orchestration/initiator   body { larkAppId }
  *     200 { ok: true, initiator: { openId, unionId?, source } }
  *     4xx/5xx { ok: false, error, retryable }
  *
- * Read-only: nothing is created. The draft write routes (D2) forward the same
+ * ⚠️ POST with a JSON body although nothing is written: the platform proxies
+ * body-less requests over its direct LAN path, where the person it names
+ * cannot be believed (refused as `platform_direct_unsupported`, see
+ * core/workflow-initiator). Every orchestration route that identifies the
+ * initiator must carry a request body so platform traffic takes the tunnel.
+ *
+ * Nothing is created. The draft write routes (D2) forward the same
  * headers and the daemon re-runs the same resolution on every write.
  */
 
@@ -16,6 +22,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { jsonRes } from './http.js';
 import type { DashboardRequestIdentity } from './request-identity.js';
 import { readDashboardPlatformActor } from '../core/dashboard-platform-actor.js';
+import { readJsonBodyWithLimit } from './trigger-api.js';
 import {
   WORKFLOW_INITIATOR_PATH,
   classifyDashboardInitiator,
@@ -61,7 +68,7 @@ export async function handleWorkflowInitiatorApi(
   deps: WorkflowInitiatorApiDeps,
 ): Promise<boolean> {
   if (!isWorkflowInitiatorPath(url.pathname)) return false;
-  if (req.method !== 'GET') {
+  if (req.method !== 'POST') {
     jsonRes(res, 405, { ok: false, error: 'method_not_allowed', retryable: false });
     return true;
   }
@@ -71,8 +78,16 @@ export async function handleWorkflowInitiatorApi(
     canManageHost: deps.canManageHost,
     viaPlatformTunnel: actor.viaPlatformTunnel,
     platformUnionId: actor.unionId,
+    directActorHeader: actor.ignoredActorHeader,
   });
   if (!claim.ok) {
+    if (claim.error === 'platform_direct_unsupported') {
+      logger.warn(
+        `[workflow-initiator] refused: X-Botmux-Actor on a non-tunnel connection of a platform-bound machine `
+        + `(peer=${req.socket?.remoteAddress ?? '?'}:${req.socket?.remotePort ?? '?'}); the platform's direct path `
+        + 'cannot vouch for a person, and treating it as a local login would record the bot owner',
+      );
+    }
     jsonRes(res, claim.status, initiatorFailureBody(claim));
     return true;
   }
@@ -80,42 +95,46 @@ export async function handleWorkflowInitiatorApi(
     jsonRes(res, 409, { ok: false, error: 'feature_disabled', retryable: false });
     return true;
   }
-  const larkAppId = url.searchParams.get('larkAppId')?.trim() ?? '';
+  let body: unknown;
+  try {
+    body = await readJsonBodyWithLimit(req, 16 * 1024);
+  } catch {
+    jsonRes(res, 400, { ok: false, error: 'bad_json', retryable: false });
+    return true;
+  }
+  const rawAppId = body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as Record<string, unknown>).larkAppId
+    : undefined;
+  const larkAppId = typeof rawAppId === 'string' ? rawAppId.trim() : '';
   if (!larkAppId) {
     jsonRes(res, 400, { ok: false, error: 'larkAppId_required', retryable: false });
     return true;
-  }
-  if (actor.ignoredActorHeader) {
-    logger.info(
-      `[workflow-initiator] X-Botmux-Actor ignored: not a platform tunnel connection `
-      + `(peer=${req.socket?.remoteAddress ?? '?'}:${req.socket?.remotePort ?? '?'}); treated as the local token login`,
-    );
   }
   let upstream: Response;
   try {
     upstream = await deps.proxyToDaemon(
       larkAppId,
-      `${WORKFLOW_INITIATOR_PATH}?larkAppId=${encodeURIComponent(larkAppId)}`,
-      { method: 'GET', headers: dashboardInitiatorHeaders(claim) },
+      WORKFLOW_INITIATOR_PATH,
+      { method: 'POST', headers: dashboardInitiatorHeaders(claim), body: JSON.stringify({ larkAppId }) },
     );
   } catch {
     jsonRes(res, 502, { ok: false, error: 'daemon_proxy_failed', retryable: true });
     return true;
   }
   const text = await upstream.text();
-  let body: unknown;
-  try { body = JSON.parse(text); } catch { body = undefined; }
-  if (!body || typeof body !== 'object') {
+  let answer: unknown;
+  try { answer = JSON.parse(text); } catch { answer = undefined; }
+  if (!answer || typeof answer !== 'object') {
     jsonRes(res, 502, { ok: false, error: 'daemon_bad_response', retryable: true });
     return true;
   }
-  const record = body as Record<string, unknown>;
+  const record = answer as Record<string, unknown>;
   // An offline daemon answers through proxyToDaemon's own 503 without the
   // `retryable` bit; the bot may come back, so say it can be retried.
   if (record.ok === false && typeof record.retryable !== 'boolean') {
     jsonRes(res, upstream.status, { ok: false, error: record.error ?? 'daemon_error', retryable: upstream.status >= 500 });
     return true;
   }
-  jsonRes(res, upstream.status, body);
+  jsonRes(res, upstream.status, answer);
   return true;
 }

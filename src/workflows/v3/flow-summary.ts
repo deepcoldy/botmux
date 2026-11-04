@@ -22,6 +22,17 @@
  *
  * Shared by Gate-2 `approve-dag` (D1), Dashboard drafts (D2), 拉群开始's
  * pre-write check (D4) and template saves (D5).
+ *
+ * ⚠️ Coverage: the summary is what a person reads and what templates compare.
+ * It does NOT cover the whole flow — topology (depends), node goals, host
+ * action inputs and overrides are outside it. Invalidating a confirmation and
+ * the check before writing run.json MUST also compare dagSha256 / specSha256
+ * (or the draft revision); never treat an equal summary digest alone as
+ * "the confirmed flow is unchanged".
+ *
+ * String fields carry no length caps beyond the upstream DAG/spec validation
+ * (node ids, loop `<loop>.<body>` ids and sketch ids are unbounded there): a
+ * flow that validates must always be confirmable.
  */
 
 import { createHash } from 'node:crypto';
@@ -35,31 +46,31 @@ import { computeSavedWorkflowGateDigest, computeSavedWorkflowSideEffects } from 
 export const V3_FLOW_SUMMARY_VERSION = 1 as const;
 
 const SHA256_RE = /^sha256:[0-9a-f]{64}$/;
-const text = (max: number) => z.string().min(1).max(max);
+const text = () => z.string().min(1);
 
 const flowSummaryNodeSchema = z.object({
-  nodeId: text(256),
-  larkAppId: text(128),
-  cli: text(64).optional(),
-  reason: text(2000).optional(),
+  nodeId: text(),
+  larkAppId: text(),
+  cli: text().optional(),
+  reason: text().optional(),
   /** ⚠️ the named bot this node was meant for is not honoured. */
-  missedAssignee: text(256).optional(),
+  missedAssignee: text().optional(),
 }).strict();
 
 const flowSummaryUnplacedSchema = z.object({
   /** `unresolved`: the name matches no / several bots; `no-node`: no node
    *  was given to the named bot. */
   kind: z.enum(['unresolved', 'no-node']),
-  sketchId: text(256),
-  assignee: text(256),
-  larkAppId: text(128).optional(),
+  sketchId: text(),
+  assignee: text(),
+  larkAppId: text().optional(),
 }).strict();
 
 export const V3FlowSummarySchema = z.object({
   version: z.literal(V3_FLOW_SUMMARY_VERSION),
-  nodes: z.array(flowSummaryNodeSchema).max(1000),
-  unplacedAssignees: z.array(flowSummaryUnplacedSchema).max(1000),
-  sideEffects: z.array(z.object({ nodeId: text(256), kind: text(128) }).strict()).max(1000),
+  nodes: z.array(flowSummaryNodeSchema),
+  unplacedAssignees: z.array(flowSummaryUnplacedSchema),
+  sideEffects: z.array(z.object({ nodeId: text(), kind: text() }).strict()),
   gateDigest: z.string().regex(SHA256_RE, 'must be sha256:<64 lowercase hex>'),
 }).strict();
 

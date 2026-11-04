@@ -131,6 +131,30 @@ export function currentTurnIdFromEnv(
   })?.turnId;
 }
 
+/**
+ * The person who confirms by running this command: the caller of the current
+ * turn, only when a human message opened it (`om_…` / `join_…`) AND the
+ * provenance proves that caller is a human (a peer bot's message opens an
+ * `om_` turn too). A wake-up the main bot acted on by itself — even one a
+ * newer message overtook — has no confirmer. Undefined = unknown; callers
+ * record nothing rather than guess. May throw like the provenance resolver.
+ */
+export function currentTurnConfirmerFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  startPid: number = process.ppid,
+): string | undefined {
+  if (!env.SESSION_DATA_DIR) return undefined;
+  const provenance = resolveCurrentTurnProvenance({
+    dataDir: env.SESSION_DATA_DIR,
+    envSessionId: env.BOTMUX_SESSION_ID,
+    startPid,
+  });
+  if (!provenance || !isHumanInboundTurnId(provenance.turnId)) return undefined;
+  if (provenance.callerProvenHuman !== true) return undefined;
+  if (provenance.workflowRunEvent || provenance.overtakenWorkflowRunEvent) return undefined;
+  return provenance.callerOpenId;
+}
+
 export function chatBindingFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   startPid: number = process.ppid,
@@ -945,6 +969,9 @@ export interface WorkflowHostCommandDeps {
   /** The current turn's id (default: fresh current-turn provenance). Read
    *  only to freeze the initiator: only a human-opened turn may. */
   resolveCurrentTurnId?: () => string | undefined;
+  /** The person confirming Gate-2 in this turn (default:
+   *  {@link currentTurnConfirmerFromEnv}). Undefined / throwing = unknown. */
+  resolveCurrentTurnConfirmer?: () => string | undefined;
   /** Capability labels for the Architect roster (default: bot profiles). */
   botRole?: () => (larkAppId: string) => string | undefined;
   /** Test seam for the architect worker (default: the real ephemeral pool). */
@@ -1217,11 +1244,14 @@ export async function cmdWorkflowHost(
             // when the turn cannot be proven) the confirmer is unknown and not
             // written, never guessed, and the approval goes on.
             initiator = feishuRunInitiator(plan.binding.ownerOpenId, handoffIdentity);
-            let humanTurn = false;
+            let confirmer: string | undefined;
             try {
-              humanTurn = isHumanInboundTurnId((deps.resolveCurrentTurnId ?? currentTurnIdFromEnv)());
+              confirmer = (deps.resolveCurrentTurnConfirmer ?? currentTurnConfirmerFromEnv)();
             } catch { /* unproven turn: no confirmer */ }
-            const confirmedByOpenId = humanTurn && isOpenId(currentCaller?.ownerOpenId) ? currentCaller!.ownerOpenId : undefined;
+            // The caller guard above already pinned this turn's caller to the
+            // grill's initiator; anything else is not recorded as a confirmer.
+            const confirmedByOpenId = isOpenId(confirmer) && confirmer === initiator?.openId
+              && confirmer === currentCaller?.ownerOpenId ? confirmer : undefined;
             const orchestratorAppId = plan.binding.larkAppId;
             flowConfirmation = ({ dag, targets }) => adHocFlowConfirmation({
               runDir, dag, targets, orchestratorAppId, bots, nameOf, confirmedAt: now,

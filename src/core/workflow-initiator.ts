@@ -10,6 +10,8 @@
  *              - local management token          → `dashboard-local`
  *              - platform tunnel + X-Botmux-Actor → `dashboard-platform` (union_id)
  *              - Feishu H5 免登                    → refused (I5)
+ *              - platform direct (non-tunnel) request carrying
+ *                X-Botmux-Actor                    → refused (see below)
  *              - anything else that names nobody  → refused, never "the owner"
  *   daemon     {@link resolveDashboardWorkflowInitiator}: who that is on the
  *              main bot, with the main bot's own credentials only.
@@ -22,6 +24,17 @@
  * initiator holds exclusive rights on the run (reassignment, edit approval,
  * delegated identity), so recording the owner for somebody else would be
  * impersonation (design §11 I1/I3).
+ *
+ * Platform direct path: the platform proxies a request WITHOUT a body to the
+ * machine's LAN dashboard port (`directHosts`) instead of the tunnel. Such a
+ * request carries the injected management cookie and X-Botmux-Actor but no
+ * role, so it looks exactly like a local token login — and would be recorded
+ * as the bot owner. On a platform-bound machine, a non-tunnel request that
+ * carries X-Botmux-Actor in any shape is therefore refused outright; a local
+ * token browser never sends that header. ⚠️ Hence every orchestration route
+ * that identifies the initiator MUST be a request with a body (POST + JSON):
+ * the platform then goes through the tunnel; without one it goes direct and
+ * is refused here.
  *
  * The daemon half is pure over injected lookups so the draft write routes (D2)
  * reuse exactly this decision for every write that names an initiator.
@@ -54,6 +67,10 @@ export type WorkflowInitiatorErrorCode =
   | 'h5_login_unsupported'
   /** A Dashboard login without the management capability (workflow pages are admin-only). */
   | 'admin_required'
+  /** The platform reached this machine directly (not through its tunnel):
+   *  the person it names cannot be believed, and treating the request as a
+   *  local login would record them as the bot owner. */
+  | 'platform_direct_unsupported'
   /** The request came through the platform but names no person, or a platform
    *  role login reached the Dashboard outside the tunnel: nobody to record. */
   | 'platform_actor_missing'
@@ -113,12 +130,16 @@ export function classifyDashboardInitiator(input: {
   canManageHost: boolean;
   viaPlatformTunnel: boolean;
   platformUnionId: string | undefined;
+  /** Bound machine, non-tunnel connection, X-Botmux-Actor present in any
+   *  shape (`readDashboardPlatformActor().ignoredActorHeader`). */
+  directActorHeader: boolean;
 }): DashboardInitiatorClaim {
   const kind = input.identity?.kind;
   if (!kind) return fail('login_required', 401);
   // Feishu H5 免登 (the only other identity kind) cannot initiate in v1 (I5).
   if (kind !== 'legacy-dashboard' && kind !== 'platform-dashboard') return fail('h5_login_unsupported', 403);
   if (!input.canManageHost) return fail('admin_required', 403);
+  if (input.directActorHeader) return fail('platform_direct_unsupported', 403);
   if (input.viaPlatformTunnel) {
     return input.platformUnionId
       ? { ok: true, source: 'dashboard-platform', unionId: input.platformUnionId }

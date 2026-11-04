@@ -353,12 +353,21 @@ export const V3RunEnvelopeSchema = z.union([
     }
   }
   if (authorization.initiator) {
+    // The authenticated anchor must exist and name the same person: an
+    // initiator is never recorded on a run that authenticated nobody.
     const authenticated = initiatorOpenIdOf(envelope);
-    if (authenticated !== undefined && authenticated !== authorization.initiator.openId) {
+    if (authenticated !== authorization.initiator.openId) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['authorization', 'initiator', 'openId'],
         message: 'must match the authenticated initiator (authorizedByOpenId / chatBinding.ownerOpenId)',
+      });
+    }
+    if (authorization.initiator.source === 'dashboard-local' && authorization.initiator.unionId !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['authorization', 'initiator', 'unionId'],
+        message: 'must be absent for a dashboard-local initiator (a local token login names no person)',
       });
     }
     const frozen = authorization.handoffIdentity;
@@ -370,6 +379,21 @@ export const V3RunEnvelopeSchema = z.union([
         message: 'must match authorization.handoffIdentity.unionId',
       });
     }
+  }
+  if (authorization.flowConfirmation && !authorization.initiator) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['authorization', 'flowConfirmation'],
+      message: 'requires authorization.initiator',
+    });
+  }
+  const confirmer = authorization.flowConfirmation?.confirmedByOpenId;
+  if (confirmer !== undefined && confirmer !== authorization.initiator?.openId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['authorization', 'flowConfirmation', 'confirmedByOpenId'],
+      message: 'must match authorization.initiator.openId (only the initiator confirms the flow)',
+    });
   }
   if (authorization.flowConfirmation
     && v3FlowSummarySha256(authorization.flowConfirmation.flowSummary) !== authorization.flowConfirmation.flowSummarySha256) {

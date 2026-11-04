@@ -12,7 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, request, type Server } from 'node:http';
-import { createServer as createNetServer } from 'node:net';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -40,14 +40,6 @@ const OWNER = 'ou_bot_owner';
 const ALICE = { open: 'ou_alice_in_orchestrator', union: 'on_alice' };
 
 const identity = (kind: DashboardRequestIdentity['kind']) => ({ kind }) as DashboardRequestIdentity;
-
-async function freePort(): Promise<number> {
-  const probe = createNetServer();
-  await new Promise<void>(resolve => probe.listen(0, '127.0.0.1', () => resolve()));
-  const port = (probe.address() as { port: number }).port;
-  await new Promise<void>(resolve => probe.close(() => resolve()));
-  return port;
-}
 
 describe('Dashboard → daemon workflow initiator', () => {
   let dir: string;
@@ -124,23 +116,31 @@ describe('Dashboard → daemon workflow initiator', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  /** GET the Dashboard route from a real socket; `viaTunnel` registers that
+  /** POST the Dashboard route from a real socket; `viaTunnel` registers that
    *  socket's local port as a platform tunnel bridge first. */
-  async function ask(opts: { viaTunnel?: boolean; actor?: string } = {}): Promise<{ status: number; body: any }> {
-    const localPort = await freePort();
-    if (opts.viaTunnel) forgetBridges.push(registerPlatformTunnelBridge(localPort));
+  async function ask(opts: { viaTunnel?: boolean; actor?: string | string[]; body?: string } = {}): Promise<{ status: number; body: any }> {
+    // Connect first (the OS picks the client port), register that port as a
+    // tunnel bridge, then speak HTTP over the same socket: no port race.
+    const socket = connect(dashboardPort, '127.0.0.1');
+    await new Promise<void>((resolve, reject) => { socket.once('connect', () => resolve()); socket.once('error', reject); });
+    if (opts.viaTunnel) forgetBridges.push(registerPlatformTunnelBridge(socket.localPort));
+    const payload = opts.body ?? JSON.stringify({ larkAppId: APP });
     return new Promise((resolve, reject) => {
       const req = request({
-        host: '127.0.0.1', port: dashboardPort, localPort, agent: false, method: 'GET',
-        path: `${WORKFLOW_INITIATOR_PATH}?larkAppId=${APP}`,
-        headers: opts.actor ? { 'x-botmux-actor': opts.actor } : {},
+        host: '127.0.0.1', port: dashboardPort, createConnection: () => socket, method: 'POST',
+        path: WORKFLOW_INITIATOR_PATH,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(payload),
+          ...(opts.actor !== undefined ? { 'x-botmux-actor': opts.actor } : {}),
+        },
       }, (res) => {
         let text = '';
         res.on('data', (chunk) => { text += chunk; });
         res.on('end', () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(text) }));
       });
       req.on('error', reject);
-      req.end();
+      req.end(payload);
     });
   }
 
@@ -156,11 +156,20 @@ describe('Dashboard → daemon workflow initiator', () => {
     expect((await ask()).body.initiator).toEqual({ openId: 'ou_second_admin', source: 'dashboard-local' });
   });
 
-  it('an X-Botmux-Actor on a direct (non-tunnel) connection is not believed', async () => {
-    const answer = await ask({ actor: ALICE.union });
-    expect(answer.body.initiator).toEqual({ openId: OWNER, source: 'dashboard-local' });
+  it.each([
+    ['a well-formed union_id', ALICE.union],
+    ['a malformed value', 'not-a-union-id'],
+    ['an empty value', ''],
+    ['a repeated header', [ALICE.union, 'on_bob']],
+  ])('the platform direct path (non-tunnel, X-Botmux-Actor: %s) is refused, never recorded as the owner', async (_label, actor) => {
+    expect(await ask({ actor })).toEqual({ status: 403, body: { ok: false, error: 'platform_direct_unsupported', retryable: false } });
+    expect(proxied).toEqual([]);
     expect(resolveOpenId).not.toHaveBeenCalled();
-    expect(proxied[0]!.headers).not.toHaveProperty(DASHBOARD_INITIATOR_UNION_HEADER);
+  });
+
+  it('a request without the body the route requires is refused', async () => {
+    expect(await ask({ body: '' })).toEqual({ status: 400, body: { ok: false, error: 'larkAppId_required', retryable: false } });
+    expect(await ask({ body: '{' })).toEqual({ status: 400, body: { ok: false, error: 'bad_json', retryable: false } });
   });
 
   it('platform tunnel login initiates as that person, resolved through the orchestrating bot only', async () => {
@@ -197,6 +206,11 @@ describe('Dashboard → daemon workflow initiator', () => {
     expect(proxied).toEqual([]);
   });
 
+  it('the local token login on a platform-bound machine (no actor header) still initiates as the owner', async () => {
+    deps.platformBound = true;
+    expect(await ask()).toEqual({ status: 200, body: { ok: true, initiator: { openId: OWNER, source: 'dashboard-local' } } });
+  });
+
   it('a machine not bound to the platform treats every login as local', async () => {
     deps.platformBound = false;
     expect((await ask({ viaTunnel: true, actor: ALICE.union })).body.initiator).toEqual({ openId: OWNER, source: 'dashboard-local' });
@@ -210,7 +224,7 @@ describe('Dashboard → daemon workflow initiator', () => {
     ['a platform viewer without the management scope', () => { deps.identity = identity('platform-dashboard'); deps.canManageHost = false; }, 403, 'admin_required'],
   ])('%s cannot initiate', async (_label, arrange, status, error) => {
     arrange();
-    expect(await ask({ actor: ALICE.union })).toEqual({ status, body: { ok: false, error, retryable: false } });
+    expect(await ask()).toEqual({ status, body: { ok: false, error, retryable: false } });
     expect(proxied).toEqual([]);
   });
 
@@ -228,17 +242,20 @@ describe('Dashboard → daemon workflow initiator', () => {
     expect(await ask()).toEqual({ status: 409, body: { ok: false, error: 'feature_disabled', retryable: false } });
   });
 
-  function signed(path: string, headers: Record<string, string>) {
+  function signed(path: string, headers: Record<string, string>, body: unknown = { larkAppId: APP }) {
     return fetch(`http://127.0.0.1:${ipc!.port}${path}`, {
-      method: 'GET',
-      headers: daemonIpcAuthHeaders({ secret: SECRET, port: ipc!.port, method: 'GET', path, headers }),
+      method: 'POST',
+      headers: daemonIpcAuthHeaders({ secret: SECRET, port: ipc!.port, method: 'POST', path, headers: { 'content-type': 'application/json', ...headers } }),
+      body: JSON.stringify(body),
     });
   }
 
   it('the daemon answers only for its own bot', async () => {
-    const response = await signed(`${WORKFLOW_INITIATOR_PATH}?larkAppId=cli_other`, { [DASHBOARD_INITIATOR_SOURCE_HEADER]: 'dashboard-local' });
-    expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({ ok: false, error: 'bot_mismatch', retryable: false });
+    for (const body of [{ larkAppId: 'cli_other' }, {}]) {
+      const response = await signed(WORKFLOW_INITIATOR_PATH, { [DASHBOARD_INITIATOR_SOURCE_HEADER]: 'dashboard-local' }, body);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ ok: false, error: 'bot_mismatch', retryable: false });
+    }
   });
 
   it('the daemon rejects a missing or unknown source instead of assuming the owner', async () => {
@@ -253,7 +270,9 @@ describe('Dashboard → daemon workflow initiator', () => {
     const lightweight = await startIpcServer({ port: 0, host: '127.0.0.1' });
     try {
       const response = await fetch(`http://127.0.0.1:${lightweight.port}${WORKFLOW_INITIATOR_PATH}`, {
-        headers: { [DASHBOARD_INITIATOR_SOURCE_HEADER]: 'dashboard-platform', [DASHBOARD_INITIATOR_UNION_HEADER]: ALICE.union },
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [DASHBOARD_INITIATOR_SOURCE_HEADER]: 'dashboard-platform', [DASHBOARD_INITIATOR_UNION_HEADER]: ALICE.union },
+        body: JSON.stringify({ larkAppId: APP }),
       });
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ ok: false, error: 'untrusted_caller', retryable: false });
@@ -337,13 +356,13 @@ describe('resolveDashboardWorkflowInitiator', () => {
 describe('classifyDashboardInitiator', () => {
   it('a tunnel request is a platform login even on the injected management cookie', () => {
     expect(classifyDashboardInitiator({
-      identity: identity('legacy-dashboard'), canManageHost: true, viaPlatformTunnel: true, platformUnionId: ALICE.union,
+      identity: identity('legacy-dashboard'), canManageHost: true, viaPlatformTunnel: true, platformUnionId: ALICE.union, directActorHeader: false,
     })).toEqual({ ok: true, source: 'dashboard-platform', unionId: ALICE.union });
   });
 
   it('a platform co-manager on the tunnel is that person', () => {
     expect(classifyDashboardInitiator({
-      identity: identity('platform-dashboard'), canManageHost: true, viaPlatformTunnel: true, platformUnionId: ALICE.union,
+      identity: identity('platform-dashboard'), canManageHost: true, viaPlatformTunnel: true, platformUnionId: ALICE.union, directActorHeader: false,
     })).toEqual({ ok: true, source: 'dashboard-platform', unionId: ALICE.union });
   });
 });

@@ -42,6 +42,8 @@ import {
   type V3FlowSummary,
 } from '../src/workflows/v3/flow-summary.js';
 import type { V3Gate2BotPlan } from '../src/workflows/v3/bot-assignment.js';
+import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import type { V3Node } from '../src/workflows/v3/dag.js';
 import type { V3HandoffIdentityPolicy, V3InitiatorUnionLookup, V3NodeExecutorPolicy } from '../src/workflows/v3/node-executor-mode.js';
 import {
@@ -56,6 +58,7 @@ const dirs: string[] = [];
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 const MAIN = 'cli_main';
@@ -71,13 +74,13 @@ const DAG_NODES: V3Node[] = [
   { id: 'write', type: 'goal', goal: 'write', bot: 'cli_doc', depends: ['inspect'], inputs: [], humanGate: { approvers: 'initiator' } } as unknown as V3Node,
 ];
 
-async function dagReadyRun() {
+async function dagReadyRun(opts: { dagNodes?: unknown[]; specNodes?: unknown[]; binding?: RunChatBinding } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'wf-confirm-'));
   dirs.push(base);
-  const { runDir, runId } = hostNew({ goal: 'g', baseDir: base, runId: 'r', chatBinding: GROUP_TOPIC });
+  const { runDir, runId } = hostNew({ goal: 'g', baseDir: base, runId: 'r', chatBinding: opts.binding ?? GROUP_TOPIC });
   writeFileSync(join(runDir, 'spec.md'), `# Spec\n\`\`\`json\n${JSON.stringify({
     schemaVersion: SPEC_SCHEMA_VERSION, runId, title: 't', requirement: 'r',
-    nodes: [{ sketchId: 'write', goal: 'write', input_needs: [], expected_outputs: ['r.md'], acceptance: 'ok', risk_gate: false, unknowns: [], assignee: 'main' }],
+    nodes: opts.specNodes ?? [{ sketchId: 'write', goal: 'write', input_needs: [], expected_outputs: ['r.md'], acceptance: 'ok', risk_gate: false, unknowns: [], assignee: 'main' }],
   })}\n\`\`\`\n`);
   hostSpecFinalize(runDir);
   hostApproveSpec(runDir);
@@ -95,7 +98,7 @@ async function dagReadyRun() {
   await hostArchitect(runDir, architect);
   const state = readGrillState(runDir)!;
   mkdirSync(dirname(state.dagPath!), { recursive: true });
-  writeFileSync(state.dagPath!, JSON.stringify({ schemaVersion: 2, runId: 'r', nodes: [
+  writeFileSync(state.dagPath!, JSON.stringify({ schemaVersion: 2, runId: 'r', nodes: opts.dagNodes ?? [
     { id: 'inspect', type: 'goal', goal: 'inspect', depends: [], inputs: [] },
     { id: 'write', type: 'goal', goal: 'write', bot: 'cli_doc', depends: ['inspect'], inputs: [] },
   ] }));
@@ -108,6 +111,9 @@ async function approve(base: string, opts: {
   handoffIdentity?: boolean;
   turnId?: string;
   caller?: RunChatBinding;
+  /** The confirmer seam; 'live' = the production resolver over the seeded
+   *  provenance (see seedTurn). Default: nobody. */
+  confirmer?: (() => string | undefined) | 'live';
 }) {
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
   const policy: V3HandoffIdentityPolicy = {
@@ -128,6 +134,7 @@ async function approve(base: string, opts: {
       handoffIdentitySwitch: () => opts.handoffIdentity === true,
       handoffIdentityPolicy: () => policy,
       resolveCurrentTurnId: () => opts.turnId ?? 'om_owner_approves',
+      ...(opts.confirmer === 'live' ? {} : { resolveCurrentTurnConfirmer: opts.confirmer ?? (() => undefined) }),
     });
   } finally {
     log.mockRestore();
@@ -143,7 +150,7 @@ function envelopeOf(runDir: string) {
 describe('Gate-2 approve-dag records initiator and confirmation', () => {
   it('bot run, human turn: initiator (feishu), confirmer, time and the summary of what was frozen', async () => {
     const { base, runDir } = await dagReadyRun();
-    await approve(base, { nodeExecutor: 'bot' });
+    await approve(base, { nodeExecutor: 'bot', confirmer: () => OWNER });
     const auth = envelopeOf(runDir).authorization as any;
     expect(auth.initiator).toEqual({ openId: OWNER, source: 'feishu' });
     expect(auth.flowConfirmation).toMatchObject({ confirmedByOpenId: OWNER, confirmedAt: auth.authorizedAt });
@@ -166,17 +173,40 @@ describe('Gate-2 approve-dag records initiator and confirmation', () => {
     expect((envelopeOf(runDir).authorization as any).initiator).toEqual({ openId: OWNER, unionId: 'on_owner', source: 'feishu' });
   });
 
-  it.each([
-    ['a scheduled task', 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc'],
-    ['a workflow event wake-up', 'workflow-event:r:7'],
-    ['no authenticated turn', ''],
-  ])('approval in %s: no confirmer is written (not guessed)', async (_label, turnId) => {
+  it.each<[string, () => string | undefined]>([
+    ['the turn is unknown', () => undefined],
+    ['resolving the turn throws', () => { throw new Error('当前命令已脱离 botmux CLI 进程树'); }],
+    ['the turn names someone other than the initiator', () => 'ou_someone_else'],
+  ])('when %s: approved, no confirmer written (not guessed)', async (_label, confirmer) => {
     const { base, runDir } = await dagReadyRun();
-    await approve(base, { nodeExecutor: 'bot', turnId });
+    await approve(base, { nodeExecutor: 'bot', confirmer });
     const auth = envelopeOf(runDir).authorization as any;
+    expect(readGrillState(runDir)!.status).toBe('dag_approved');
     expect(auth.flowConfirmation).toBeDefined();
     expect(auth.flowConfirmation).not.toHaveProperty('confirmedByOpenId');
     expect(auth.initiator).toEqual({ openId: OWNER, source: 'feishu' });
+  });
+
+  it('long ids the DAG/spec allow (loop `<loop>.<body>`, sketch ids) are still approved in bot mode', async () => {
+    const loop = 'L'.repeat(130);
+    const body = 'b'.repeat(130);
+    const sketch = 's'.repeat(300);
+    const sketchOf = (sketchId: string, extra: Record<string, unknown> = {}) => ({
+      sketchId, goal: sketchId, input_needs: [], expected_outputs: ['r.md'], acceptance: 'ok', risk_gate: false, unknowns: [], ...extra,
+    });
+    const { base, runDir } = await dagReadyRun({
+      specNodes: [sketchOf(body), sketchOf(sketch, { assignee: 'ghost' })],
+      dagNodes: [{
+        id: loop, type: 'loop', depends: [], inputs: [], bot: 'cli_doc', maxIterations: 2,
+        exit: { node: body, when: { path: 'result.ok', equals: true } }, output: { from: body },
+        body: { nodes: [{ id: body, type: 'goal', goal: 'x', depends: [], inputs: [], resultSchema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } }] },
+      }],
+    });
+    await approve(base, { nodeExecutor: 'bot', confirmer: () => OWNER });
+    expect(readGrillState(runDir)!.status).toBe('dag_approved');
+    const summary = (envelopeOf(runDir).authorization as any).flowConfirmation.flowSummary;
+    expect(summary.nodes.map((node: { nodeId: string }) => node.nodeId)).toEqual([`${loop}.${body}`]);
+    expect(summary.unplacedAssignees).toEqual([{ kind: 'unresolved', sketchId: sketch, assignee: 'ghost' }]);
   });
 
   it('switch off: the authorization has exactly the pre-feature keys', async () => {
@@ -187,6 +217,71 @@ describe('Gate-2 approve-dag records initiator and confirmation', () => {
     expect(Object.keys(envelope.authorization).sort())
       .toEqual(['authorizedAt', 'authorizedByOpenId', 'dagSha256', 'kind', 'specSha256']);
     expect(readFileSync(join(runDir, 'run.json'), 'utf-8')).not.toMatch(/initiator|flowConfirmation/);
+  });
+});
+
+/**
+ * The production confirmer resolver over a real process marker and a real
+ * persisted session: who opened the approving turn decides.
+ */
+describe('Gate-2 confirmer from the real turn provenance', () => {
+  const PEER_BOT = 'ou_peer_bot_in_main';
+
+  function seedTurn(dataDir: string, turnId: string, session: Record<string, unknown>): void {
+    mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+    const procStart = readProcessStartIdentity(process.ppid);
+    if (!procStart) throw new Error('cannot read the parent process start identity');
+    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.ppid)), JSON.stringify({ sessionId: 'sess', turnId, procStart }));
+    seedPersistedSessionRows(dataDir, MAIN, {
+      sess: { sessionId: 'sess', status: 'active', scope: 'thread', larkAppId: MAIN, chatId: 'oc_group', chatType: 'group', rootMessageId: 'om_root', ...session },
+    });
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+    vi.stubEnv('BOTMUX_SESSION_ID', 'sess');
+  }
+
+  async function approveAs(owner: string, turnId: string, session: Record<string, unknown>) {
+    const binding: RunChatBinding = { ...GROUP_TOPIC, sessionId: 'sess', ownerOpenId: owner };
+    const { base, runDir } = await dagReadyRun({ binding });
+    const dataDir = join(base, 'data');
+    seedTurn(dataDir, turnId, session);
+    await approve(base, { nodeExecutor: 'bot', caller: binding, confirmer: 'live' });
+    return envelopeOf(runDir).authorization as any;
+  }
+
+  it('a human message: the sender is recorded as confirmer', async () => {
+    const auth = await approveAs('ou_alice', 'om_alice_msg', {
+      lastCallerOpenId: 'ou_alice', quoteTargetId: 'om_alice_msg', quoteTargetSenderOpenId: 'ou_alice', quoteTargetSenderIsBot: false,
+    });
+    expect(auth.flowConfirmation.confirmedByOpenId).toBe('ou_alice');
+  });
+
+  it('a human message proven by the per-turn registry after the quote chain moved on', async () => {
+    const auth = await approveAs('ou_alice', 'om_alice_msg', {
+      lastCallerOpenId: 'ou_bob', quoteTargetId: 'om_bob_later', quoteTargetSenderOpenId: 'ou_bob', quoteTargetSenderIsBot: false,
+      replyTargets: { om_alice_msg: { senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: false }] } },
+    });
+    expect(auth.flowConfirmation.confirmedByOpenId).toBe('ou_alice');
+  });
+
+  it.each([
+    ['a peer bot\'s message (om_ turn, sender is a bot)', {
+      lastCallerOpenId: PEER_BOT, quoteTargetId: 'om_bot_msg', quoteTargetSenderOpenId: PEER_BOT, quoteTargetSenderIsBot: true,
+      replyTargets: { om_bot_msg: { senderOpenId: PEER_BOT, participants: [{ openId: PEER_BOT, isBot: true }] } },
+    }],
+    ['a message whose sender kind was never recorded', {
+      lastCallerOpenId: PEER_BOT, quoteTargetId: 'om_bot_msg',
+    }],
+  ])('%s: approved, no confirmer', async (_label, session) => {
+    const auth = await approveAs(PEER_BOT, 'om_bot_msg', session);
+    expect(auth.initiator).toEqual({ openId: PEER_BOT, source: 'feishu' });
+    expect(auth.flowConfirmation).not.toHaveProperty('confirmedByOpenId');
+  });
+
+  it('a synthetic turn id with a human-looking quote chain: no confirmer', async () => {
+    const auth = await approveAs('ou_alice', 'trg_0123456789', {
+      lastCallerOpenId: 'ou_alice', quoteTargetId: 'trg_0123456789', quoteTargetSenderOpenId: 'ou_alice', quoteTargetSenderIsBot: false,
+    });
+    expect(auth.flowConfirmation).not.toHaveProperty('confirmedByOpenId');
   });
 });
 
@@ -223,11 +318,32 @@ describe('run.json schema', () => {
     }))).toEqual([]);
   });
 
+
   it.each([
     ['initiator', { initiator: { openId: OWNER, source: 'feishu' } }],
     ['flowConfirmation', { flowConfirmation: confirmation }],
   ])('rejects %s on a run that is not bot-executed', (key, over) => {
     expect(problems(adHoc(over))).toContain(`authorization.${key}: requires nodeExecutor "bot"`);
+  });
+
+  it('rejects an initiator on a run that authenticated nobody', () => {
+    expect(problems(adHoc({ nodeExecutor: 'bot', authorizedByOpenId: undefined, initiator: { openId: 'ou_mallory', source: 'dashboard-platform' } })))
+      .toEqual([expect.stringContaining('authorization.initiator.openId: must match the authenticated initiator')]);
+  });
+
+  it('rejects a confirmer who is not the initiator, and a confirmation without an initiator', () => {
+    const initiator = { openId: OWNER, source: 'feishu' };
+    expect(problems(adHoc({ nodeExecutor: 'bot', initiator, flowConfirmation: { ...confirmation, confirmedByOpenId: 'ou_mallory' } })))
+      .toEqual(['authorization.flowConfirmation.confirmedByOpenId: must match authorization.initiator.openId (only the initiator confirms the flow)']);
+    const { confirmedByOpenId: _drop, ...anonymous } = confirmation;
+    expect(problems(adHoc({ nodeExecutor: 'bot', flowConfirmation: anonymous })))
+      .toEqual(['authorization.flowConfirmation: requires authorization.initiator']);
+    expect(problems(adHoc({ nodeExecutor: 'bot', initiator, flowConfirmation: anonymous }))).toEqual([]);
+  });
+
+  it('rejects a union_id on a dashboard-local initiator', () => {
+    expect(problems(adHoc({ nodeExecutor: 'bot', initiator: { openId: OWNER, unionId: 'on_owner', source: 'dashboard-local' } })))
+      .toEqual(['authorization.initiator.unionId: must be absent for a dashboard-local initiator (a local token login names no person)']);
   });
 
   it('rejects an initiator who is not the run\'s authenticated initiator', () => {
@@ -244,7 +360,7 @@ describe('run.json schema', () => {
   });
 
   it('rejects a confirmation whose digest is not that of its summary', () => {
-    expect(problems(adHoc({ nodeExecutor: 'bot', flowConfirmation: { ...confirmation, flowSummarySha256: sha('d') } })))
+    expect(problems(adHoc({ nodeExecutor: 'bot', initiator: { openId: OWNER, source: 'feishu' }, flowConfirmation: { ...confirmation, flowSummarySha256: sha('d') } })))
       .toEqual(['authorization.flowConfirmation.flowSummarySha256: must be the sha256 of the canonical flowSummary']);
   });
 
@@ -268,6 +384,9 @@ describe('run.json schema', () => {
     expect(problems(saved({ initiator: { openId: OWNER, source: 'dashboard-local' } })))
       .toContain('authorization.initiator: requires nodeExecutor "bot"');
     expect(problems(saved({ nodeExecutor: 'bot', initiator: { openId: OWNER, source: 'dashboard-local' } }))).toEqual([]);
+    expect(problems(saved({
+      nodeExecutor: 'bot', chatBinding: { larkAppId: MAIN, chatId: 'oc' }, initiator: { openId: OWNER, source: 'feishu' },
+    }))).toEqual([expect.stringContaining('authorization.initiator.openId: must match the authenticated initiator')]);
   });
 });
 

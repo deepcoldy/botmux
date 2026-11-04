@@ -6525,12 +6525,17 @@ async function dashboardWorkflowInitiator(req: IncomingMessage): Promise<Workflo
 }
 
 // Who the Dashboard login initiates a workflow as on this bot, or why nobody.
-// `?larkAppId=` is the bot the Dashboard routed to; answering for another one
-// would let a mis-routed request pass the gate under the wrong app.
-ipcRoute('GET', WORKFLOW_INITIATOR_PATH, requireBoundBot(async (req, res) => {
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  const asked = url.searchParams.get('larkAppId');
-  if (asked !== null && asked !== cachedLarkAppId) {
+// Body `{ larkAppId }` is the bot the Dashboard routed to; answering for
+// another one would let a mis-routed request pass the gate under the wrong
+// app. POST with a body for the platform-routing reason in
+// core/workflow-initiator.
+ipcRoute('POST', WORKFLOW_INITIATOR_PATH, requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson(req, res);
+  if (body === BAD_JSON) return;
+  const asked = body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as Record<string, unknown>).larkAppId
+    : undefined;
+  if (asked !== cachedLarkAppId) {
     return jsonRes(res, 409, { ok: false, error: 'bot_mismatch', retryable: false });
   }
   const result = await dashboardWorkflowInitiator(req);
