@@ -184,6 +184,11 @@ describe('BytePG feedback authentication', () => {
       expect(inspect(pool, { depth: 5 })).not.toContain(token);
       expect(inspect(client, { depth: 5 })).not.toContain(token);
       expect(JSON.stringify((client as any).connectionParameters)).not.toContain(token);
+      // The pool must never hold the token itself: the password slot is a thunk
+      // returning the empty string, so a gateway that unexpectedly issues a
+      // password challenge gets '', and pool introspection cannot reveal it.
+      const passwordSlot = (pool as unknown as { options: { password: unknown } }).options.password;
+      expect(typeof passwordSlot === 'function' ? (passwordSlot as () => unknown)() : passwordSlot).toBe('');
     } finally { client?.release(); await pool.end(); await server.close(); }
   });
   it('does not leak tokens when a gateway echoes startup options in connection errors', async () => {
@@ -227,6 +232,14 @@ describe('BytePG feedback authentication', () => {
     const current = await readFeedbackStorageConfig(directory);
     await expect(configureFeedbackStorageCandidate(directory, {
       expectedGeneration: current.generation, candidate: { backend: 'postgresql', postgres: { ...target(4432), passwordRef: 'env:PASSWORD' } },
+    })).rejects.toThrow('feedback_storage_auth_invalid');
+    // A token supplied alongside a password-mode candidate is rejected too,
+    // even when the candidate already carries a usable password reference.
+    await expect(configureFeedbackStorageCandidate(directory, {
+      expectedGeneration: current.generation,
+      candidate: { backend: 'postgresql', postgres: { host: '127.0.0.1', port: 4432, database: 'aidb', user: 'botmux', schema: 'feedback',
+        passwordRef: 'env:PASSWORD', tls: { mode: 'disable' }, connectTimeoutMs: 1000 } },
+      token: 'mixed-mode-token',
     })).rejects.toThrow('feedback_storage_auth_invalid');
   });
 });
