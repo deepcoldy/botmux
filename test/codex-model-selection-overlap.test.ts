@@ -23,13 +23,13 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import * as store from '../src/services/session-store.js';
 import {
-  readCodexModelLaunchReceipt, readCodexModelSettingsCursor, recordCodexModelLaunch,
-  spawnWithCodexModelLaunch,
+  confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSettingsCursor,
+  recordCodexModelLaunch, spawnWithCodexModelLaunch,
 } from '../src/services/codex-model-selection.js';
 import { resolveSessionLaunchModel } from '../src/core/session-model.js';
 import {
-  __testOnly_resetRestartCoordinator, latestModelForRespawn, requestSessionRestart,
-  resetSessionCodexModelSelection,
+  __testOnly_resetRestartCoordinator, isSessionRestartInFlight, latestModelForRespawn,
+  requestSessionRestart, resetSessionCodexModelSelection,
   initWorkerPool, setActiveSessionsRegistry, __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey } from '../src/core/types.js';
@@ -147,6 +147,40 @@ describe('Codex model selection across interrupted and overlapping launches', ()
     expect(latestModelForRespawn(ds)).toBe('D');
   });
 
+  it('refuses inherit while a restart is in flight, so the pending launch confirmation is not consumed', () => {
+    const ds = subject();
+    appendFileSync(path, settings('A', 10));
+    now(100);
+    expect(latestModelForRespawn(ds)).toBe('A');
+    bot.config.model = 'C';
+    now(200);
+    requestSessionRestart(ds, observer());
+    const startedAtMs = Date.now();
+    const preSpawnCursor = readCodexModelSettingsCursor(path)?.cursor;
+    const durable = readPersistedSessionRows(dataDir, appId)[ds.session.sessionId];
+
+    // The restart is already carrying C to the worker. Clearing the preference
+    // here would checkpoint a baseline for a launch that does not exist yet and
+    // consume the pending confirmation, so the real spawn's receipt could no
+    // longer establish the new generation's baseline.
+    expect(isSessionRestartInFlight(ds)).toBe(true);
+    expect(resetSessionCodexModelSelection(ds)).toBe(false);
+    expect(ds.session).toEqual(durable);
+    expect(readPersistedSessionRows(dataDir, appId)[ds.session.sessionId]).toEqual(durable);
+
+    // Once the restart settles, the same spawn's confirmation is still accepted
+    // and the checkpointed baseline is the model this process really runs.
+    __testOnly_resetRestartCoordinator();
+    now(300);
+    expect(resetSessionCodexModelSelection(ds)).toBe(true);
+    expect(ds.session.codexModelSelection?.launchStartedAtMs).toBe(t0 + 300);
+    expect(confirmCodexModelLaunch(ds.session, { model: 'A', startedAtMs, nativeSessionId: sid,
+      settingsCursor: preSpawnCursor })).toBe(false);
+    bot.config.model = 'D';
+    now(400);
+    expect(latestModelForRespawn(ds)).toBe('D');
+  });
+
   it('a failed launch handoff does not label the still-running old model as a new native preference', () => {
     const ds = subject();
     appendFileSync(path, settings('A', 10));
@@ -200,6 +234,29 @@ describe('Codex model selection across interrupted and overlapping launches', ()
     now(300);
     const recovered = latestModelForRespawn(ds);
     expect(recovered).toBe('B');
+  });
+
+  it('follows later default changes again once the user returns to the inherited model', () => {
+    const ds = subject();
+    appendFileSync(path, settings('A', 10) + settings('B', 100));
+    now(200);
+    expect(latestModelForRespawn(ds)).toBe('B');
+    expect(ds.session.codexModelSelection?.override).toBe('B');
+
+    // The user switches the native CLI back to the model this session inherits.
+    // Detecting "no longer different from the default" is the ONLY way the
+    // preference is ever released without an explicit /models inherit. Comparing
+    // the newest snapshot against a launch model that still carries the override
+    // makes the answer "B", so the override survives and the session is pinned to
+    // B forever — every later default change is silently ignored.
+    appendFileSync(path, settings('A', 300, { reasoning_effort: 'high' }));
+    now(400);
+    expect(latestModelForRespawn(ds)).toBe('A');
+    expect(ds.session.codexModelSelection?.override).toBeUndefined();
+
+    bot.config.model = 'D';
+    now(500);
+    expect(latestModelForRespawn(ds)).toBe('D');
   });
 
   it('a partial native line completed after a restart boundary remains available for recovery', () => {
