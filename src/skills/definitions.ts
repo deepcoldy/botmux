@@ -1789,6 +1789,25 @@ botmux workflow architect <runId>
 
 用户确认 → \`botmux workflow approve-dag <runId> [--working-dir <任务目录>]\`。可选 \`--working-dir\` 在首次 Gate-2 批准时冻结所有节点的工作目录；省略时使用各机器人的配置目录。已发布 run 重试复用原快照，后传目录不覆盖已有运行。然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
 
+## 运行中修改
+run 开跑后要调整流程（加/删/改节点、改依赖、改派、重做），只在本 run 的主话题里做：
+1. \`botmux workflow status <runId> --json\` 读当前版本（\`revision\`）、各节点状态、尝试次数和待确认的修改。
+2. 写 patch 文件（一组操作，整体生效或整体拒绝）：\`{"ops":[...],"note":"为什么改"}\`。操作：
+   - \`{"op":"addNode","node":{...完整节点，同 dag.json}}\` · \`{"op":"removeNode","nodeId":"x"}\`
+   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改）
+   - \`{"op":"setDepends","nodeId":"x","depends":[...],"inputs":[...]}\` · \`{"op":"reassign","nodeId":"x","bot":"<larkAppId>"}\` · \`{"op":"rerunNode","nodeId":"x"}\`
+3. \`botmux workflow edit <runId> --patch-file <文件> --base <revision>\`。版本冲突就重新 status 再改，不要硬重试。
+
+规则：已完成的节点只能 rerunNode（走 Revisit 额度）或在下游加节点；已开始的节点不能改依赖；运行中的 Loop 只能改轮数上限；跳过/取消的节点不能改，要就加新节点；删节点前先把下游依赖改掉。改正在跑或等审批的节点会作废当前这次执行/审批，按新定义重来。受阻的节点只改定义不会重跑——要重跑就在同一次 edit 里加 rerunNode；改派会直接重试。
+
+哪些修改要等发起人在主话题的「流程修改确认」卡上点同意，看这一回合是谁触发的：
+- 发起人本人发消息触发的回合：只有新增或修改对外动作（host 节点，含改它的输入）要等确认；其余直接生效，包括用到未批准的 Bot（生效后算进本 run 的批准范围）、去掉或放宽人工确认（含删掉还没过审批的节点）、扩大超时/轮数/节点总数。rerunNode 遇到重做额度用完时自动补足所需额度并生效，记为发起人本人追加。
+- 由 run 事件唤醒或定时任务触发、你自己决定的回合（处理中发起人插话也算这类）：用到未批准的 Bot、新增或修改对外动作、去掉或放宽人工确认、扩大超时/轮数/节点总数，都要等确认；rerunNode 报重做额度用完时，主话题会出现「追加重做额度」卡，发起人点了之后用同样的 patch 重新提交。
+- 其他人触发的回合：任何修改都要等确认；已有待确认的修改时不能再提新修改。
+等确认期间涉及的节点暂停，其余照常跑；把这个情况如实告诉用户。直接生效的修改会作废和它冲突的待确认修改（涉及同一批节点，或套到新版本后内容变了、无法生效），不冲突的顺延成新版本继续等确认；edit 输出逐条写了原因和确认卡的去向，照实告诉用户，作废的需要的话重新提。
+
+由 run 事件唤醒或定时任务触发、你自己决定重试/改派/重做时，必须在 \`note\` 里写明理由；拿不准、反复失败或需要人取舍时，停下来问发起人。
+
 ## 关键纪律
 - 全程飞书一问一答，用 botmux send 对话。
 - \`runId\` 是贯穿全程的钥匙，每个命令都带对。

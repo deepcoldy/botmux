@@ -271,6 +271,9 @@ export async function executeV3SavedWorkflowCommand(
           `revision: v${result.revision.payload.humanVersion} (${result.revision.revisionId})`,
           `scope: ${savedWorkflowScopeLabel(result.metadata.scope)}`,
           `status: ${result.metadata.status}`,
+          ...(result.runtimeRevisions > 0
+            ? [`本流程在运行中修改过 ${result.runtimeRevisions} 次，保存的是最终生效的版本，请核对节点与审批设置。`]
+            : []),
         ].join('\n'),
       };
     }

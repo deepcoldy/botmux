@@ -120,6 +120,16 @@ export function buildV3ProgressCard(
     );
   }
 
+  if (view.revision) {
+    const latest = view.revision.edits > 0
+      ? `第 ${view.revision.current} 版 · 最近修改：${escapeMd(view.revision.lastSummary ?? '')}`
+      : `第 ${view.revision.current} 版`;
+    const pending = view.revision.pending !== undefined
+      ? `\n第 ${view.revision.pending} 版待发起人确认，涉及的节点暂停派发`
+      : '';
+    appendSection(elements, '📝 流程版本', `${latest}${pending}`);
+  }
+
   if (view.revisit.count > 0) {
     const refreshed = view.revisit.refreshedNodeIds.length > 0
       ? ` · 刷新 ${formatIdList(view.revisit.refreshedNodeIds)}`

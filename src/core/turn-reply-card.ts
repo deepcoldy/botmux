@@ -16,7 +16,7 @@ import { MessageWithdrawnError, uploadFile, replyMessage, sendMessage } from '..
 import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import {
-  normalizeReplyCardMode, replyCardIsTerminal, TurnReplyCardStore,
+  normalizeReplyCardMode, replyCardIsTerminal, supportsUnifiedReplyCardCli, TurnReplyCardStore,
   type TurnReplyCardMode, type TurnReplyCardEvent, type TurnReplyCardKey,
 } from '../services/turn-reply-card.js';
 import { isSubstituteTurn } from './reply-target.js';
@@ -69,7 +69,7 @@ export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): 
   const cli = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
   const existing = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, turnId));
   let mode: TurnReplyCardMode = existing?.mode ?? normalizeReplyCardMode(cfg.replyCardMode);
-  if (!turnId.startsWith('om_') || !ds.chatId.startsWith('oc_') || !['claude-code', 'codex', 'grok'].includes(cli)
+  if (!turnId.startsWith('om_') || !ds.chatId.startsWith('oc_') || !supportsUnifiedReplyCardCli(cli)
     || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: cfg.apiOnly })
     || isDocNativeSession(ds) || ds.session.vcMeetingReceiver || ds.session.deferredScheduleRun
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.session.headless

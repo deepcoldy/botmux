@@ -192,6 +192,8 @@ export interface V3GraphEdgeLayout {
   /** Vertical layouts only: the curve's vertical midpoint (edges run top → bottom). */
   my?: number;
   live: boolean;
+  /** Edge exists only in a pending (unconfirmed) flow revision. */
+  pending: boolean;
 }
 
 export interface V3GraphLayout {
@@ -257,6 +259,7 @@ export function buildGraphLayout(view: RunView): V3GraphLayout {
         y2,
         mx: (x1 + x2) / 2,
         live: node.status === 'running',
+        pending: node.pendingChange === 'add',
       });
     }
   }
@@ -329,7 +332,7 @@ export function buildVerticalGraphLayout(view: RunView, containerWidth: number):
       const y1 = from.y + from.height;
       const x2 = to.x + to.width / 2;
       const y2 = to.y;
-      edges.push({ fromId: dep, toId: node.id, x1, y1, x2, y2, mx: (x1 + x2) / 2, my: (y1 + y2) / 2, live: node.status === 'running' });
+      edges.push({ fromId: dep, toId: node.id, x1, y1, x2, y2, mx: (x1 + x2) / 2, my: (y1 + y2) / 2, live: node.status === 'running', pending: node.pendingChange === 'add' });
     }
   }
   return { width, height, nodes: laidOutNodes, edges };
@@ -491,3 +494,78 @@ export function buildRoundMiniDagLayout(
     edges,
   };
 }
+
+/** Graph badge for a node a runtime flow revision added / changed, or one a
+ *  pending proposal would add / remove / change (design §13.7). */
+export function nodeRevisionBadge(node: RunNodeView): string | undefined {
+  if (node.pendingChange === 'add') return '待确认 · 新增';
+  if (node.pendingChange === 'remove') return '待确认 · 删除';
+  if (node.pendingChange === 'change') return '待确认 · 修改';
+  if (node.revisionMark === 'added') return '新增';
+  if (node.revisionMark === 'changed') return '已修改';
+  return undefined;
+}
+
+/** One-character form of {@link nodeRevisionBadge} for a box too narrow for
+ *  the full badge (the box styling still tells add / remove / change apart). */
+function nodeRevisionMark(node: RunNodeView): string | undefined {
+  if (node.pendingChange) return '待';
+  if (node.revisionMark === 'added') return '新';
+  if (node.revisionMark === 'changed') return '改';
+  return undefined;
+}
+
+/** Text geometry of a plain node box's first line: the id at `inset`, the
+ *  badge right-aligned `badgeInset` from the edge. Width estimates are upper
+ *  bounds: the id is 12px monospace (0.6em per character); the badge is 10px,
+ *  CJK at 1em and anything else at most 0.6em. */
+export const V3_NODE_HEADING = {
+  inset: 14,
+  badgeInset: 10,
+  gap: 6,
+  idCharPx: 7.2,
+  /** Below this many id characters beside the full badge, use the short one. */
+  minIdChars: 8,
+} as const;
+
+function badgeWidthPx(text: string): number {
+  let px = 0;
+  for (const ch of text) px += /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/.test(ch) ? 10 : 6;
+  return px;
+}
+
+/**
+ * The first line of a node box: how many id characters fit, and which badge
+ * goes beside them. The id gets whatever the box width leaves after the
+ * badge, so the two never overlap; when the full badge would squeeze the id
+ * below a readable share, a one-character mark replaces it and the full text
+ * moves to the node's tooltip. `plainIdChars` is the id budget without a badge.
+ */
+export function nodeBoxHeading(
+  node: RunNodeView,
+  boxWidth: number,
+  plainIdChars: number,
+): { idChars: number; badge?: string; badgeTitle?: string } {
+  const full = nodeRevisionBadge(node);
+  if (!full) return { idChars: plainIdChars };
+  const H = V3_NODE_HEADING;
+  const room = (badge: string) =>
+    Math.floor((boxWidth - H.inset - H.badgeInset - H.gap - badgeWidthPx(badge)) / H.idCharPx);
+  if (room(full) >= Math.min(node.id.length, H.minIdChars)) {
+    return { idChars: Math.max(1, Math.min(plainIdChars, room(full))), badge: full };
+  }
+  const short = nodeRevisionMark(node) ?? full;
+  return { idChars: Math.max(1, Math.min(plainIdChars, room(short))), badge: short, badgeTitle: full };
+}
+
+export const V3_REVISION_ROLE_LABEL: Record<NonNullable<RunView['revision']>['history'][number]['by'], string> = {
+  mainBot: '主 Bot',
+  initiator: '发起人',
+  other: '其他成员',
+};
+
+export const V3_REVISION_STATE_LABEL: Record<NonNullable<RunView['revision']>['history'][number]['state'], string> = {
+  applied: '已生效',
+  pending: '待确认',
+  rejected: '未生效',
+};

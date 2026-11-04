@@ -20039,6 +20039,21 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 
 /* edges: quiet by default, marching-ants into live nodes */
 .v3r-edge { fill: none; stroke: color-mix(in srgb, var(--fg) 26%, transparent); stroke-width: 1.5; }
+.v3r-edge.pending { stroke-dasharray: 4 4; }
+
+/* runtime flow revisions (design §13.7): marks + dashed pending proposal */
+.v3r-node .v3r-nrev { fill: var(--accent-strong); font-size: 10px; font-weight: 600; }
+.v3r-node.pending .v3r-box { stroke-dasharray: 5 4; fill-opacity: 0.55; }
+.v3r-node.pending-remove .v3r-nid { text-decoration: line-through; }
+.v3r-rev-note { color: var(--accent-strong); font-size: 12px; margin: 0 0 .4rem; }
+.v3r-revisions { margin-top: .75rem; font-size: 12px; }
+.v3r-revisions-title { margin: 0 0 .35rem; font-weight: 600; }
+.v3r-rev-pending { color: var(--v3r-blocked); font-weight: 500; }
+.v3r-rev-error { color: var(--v3r-failed, #d14343); font-weight: 500; }
+.v3r-revisions-list { margin: 0; padding-left: 1.1rem; display: grid; gap: .2rem; }
+.v3r-rev-entry { display: flex; flex-wrap: wrap; gap: .5rem; color: var(--muted); }
+.v3r-rev-entry .v3r-rev-num { color: var(--fg); font-weight: 600; }
+.v3r-rev-entry.rev-rejected { opacity: .65; }
 .v3r-edge.live {
   stroke: var(--v3r-running); stroke-width: 1.8;
   stroke-dasharray: 6 5; animation: v3r-flow 0.9s linear infinite;
@@ -35519,3 +35534,13 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfs-detail .v3r-nodeid { font-size: 14px; }
 .wfs-hint { margin: 0; font-size: 12px; }
 .wfs-denied { margin: 48px auto; max-width: 420px; text-align: center; color: var(--muted); font-size: 14px; line-height: 1.7; }
+
+/* Dedicated-group naming keeps mode, model and feedback readable at narrow widths. */
+.bd-sg-naming > .bd-field { display: grid; gap: 10px; min-width: 0; width: 100%; }
+.bd-sg-naming .bd-field-menu { width: min(280px, 100%); }
+.bd-sg-naming p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.bd-sg-naming label.bd-field { display: grid; gap: 6px; }
+.bd-sg-naming input[type=text] { max-width: 380px; box-sizing: border-box; }
+.bd-sg-naming small { color: var(--muted); line-height: 1.6; }
+.bd-sg-naming button.primary { justify-self: start; }
+.bd-sg-naming .bd-sg-naming-status:empty { display: none; }

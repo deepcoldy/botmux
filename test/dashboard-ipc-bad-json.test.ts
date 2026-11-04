@@ -44,6 +44,7 @@ const ROUTES: ReadonlyArray<readonly [string, string]> = [
   ['PUT', '/api/bot-agent'],
   ['POST', '/api/oauth-callback'],
   ['PUT', '/api/session-group-tag-config'],
+  ['PUT', '/api/session-group-naming-config'],
   ['PUT', '/api/chat-feedback/:chatId'],
   ['PUT', '/api/chat-pin-streaming-card/:chatId'],
   ['PUT', '/api/bot-session-owner-reminder'],

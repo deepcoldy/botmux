@@ -2,8 +2,8 @@
  * Async AI title for session groups (p2pMode='group', naming.mode='ai-summary').
  *
  * Two-phase naming: the group is created instantly with a truncated
- * placeholder name; this module then runs ONE headless single-turn call
- * through the bot's own CLI to produce a short title and renames the chat
+ * placeholder name. AI-summary (default) generates a short title; the opt-in
+ * session-title mode reuses a published Agent title. Rename the chat
  * when it lands. Fire-and-forget — every failure path simply keeps the
  * placeholder, never blocks or breaks the conversation.
  *
@@ -30,12 +30,17 @@ import {
   getSessionGroup,
   markSessionGroupTitleFailed,
   markSessionGroupTitled,
+  rememberSessionGroupNativeTitle,
+  recordSessionGroupAutoName,
   touchSessionGroup,
 } from './session-groups-store.js';
 import * as sessionStore from './session-store.js';
 import { updateSessionTitle } from '../core/session-title.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
+import { dashboardEventBus } from '../core/dashboard-events.js';
+import { generateCodexAppThreadTitle } from './codex-app-threads.js';
+import type { Session } from '../types.js';
 
 // Generous: one-shot CLIs pay cold-start + API latency (codex regularly
 // exceeds 15s); the rename is async so a slow title costs nothing visible.
@@ -161,6 +166,19 @@ export function sanitizeTitleOutput(stdout: string, maxLen: number): string | nu
   return capped || null;
 }
 
+/** Reused Agent titles are already single-line display strings (the worker
+ *  parser rejects newlines; canonical session renames normalise to one line),
+ *  so they must NOT pass through the CLI-stdout sanitizer: its log-line
+ *  heuristics reject legitimate names such as "42" or "---". Apply the
+ *  configured maxLen exactly, unlike one-shot output whose loose 2x ceiling
+ *  compensates for a model that ignores the length instruction. */
+export function reuseTitleForChat(raw: string, maxLen: number): string | null {
+  const core = raw.replace(/\s+/g, ' ').trim();
+  const limit = Math.max(1, Math.floor(maxLen));
+  const capped = Array.from(core).slice(0, limit).join('');
+  return capped || null;
+}
+
 /** Whether this CLI has a one-shot print mode the title generator can drive. */
 export function supportsOneShotTitle(cliId: string): boolean {
   return Object.prototype.hasOwnProperty.call(ONE_SHOT_ARGV, cliId);
@@ -243,9 +261,24 @@ export async function generateOneShotTitle(opts: {
   userText: string;
   maxLen: number;
   logTag: string;
+  model?: string;
 }): Promise<string | null> {
   const { larkAppId, chatId, userText, maxLen, logTag } = opts;
   const cfg = getBot(larkAppId).config;
+  if (cfg.cliId === 'codex') {
+    const model = opts.model?.trim() || cfg.model;
+    const { argv, env: wrapperEnv } = resolveOneShotCommand({ ...cfg, model }, ['codex']);
+    const title = await generateCodexAppThreadTitle({
+      sourceText: userText,
+      codexBin: argv[0],
+      codexArgs: argv.slice(1),
+      env: { ...buildOneShotEnv(cfg), ...wrapperEnv },
+      model,
+      timeoutMs: TITLE_TIMEOUT_MS,
+      detached: true,
+    });
+    return title ? sanitizeTitleOutput(title, maxLen) : null;
+  }
   const template = ONE_SHOT_ARGV[cfg.cliId];
   if (!template) {
     logger.info(`[${logTag}] no one-shot template for cliId=${cfg.cliId}; keeping placeholder title`);
@@ -298,7 +331,34 @@ export async function generateOneShotTitle(opts: {
   return title;
 }
 
-/** Fire-and-forget: generate an AI title for a freshly-born session group and
+/** Accept a published Agent title only from the active chat-scope resident. */
+export function acceptSessionGroupTitle(larkAppId: string, session: Session, title: string, source: 'native' | 'session' = 'native'): void {
+  if (session.chatType !== 'group' || session.scope !== 'chat' || session.status !== 'active'
+    || (source === 'native' && session.nativeSessionTitleUserDefined) || session.larkAppId !== larkAppId) return;
+  const cfg = getBot(larkAppId).config;
+  if (cfg.sessionGroup?.naming?.mode !== 'session-title') return;
+  const core = title.replace(/^\[BotMux·Lark\]\s*/, '').trim();
+  if (!core) return;
+  if (!rememberSessionGroupNativeTitle(session.chatId, {
+    sessionId: session.sessionId,
+    title: core,
+    source,
+    sourceTitle: title,
+  })) return;
+  scheduleSessionGroupTitle({ larkAppId, chatId: session.chatId, userText: '' });
+}
+
+/** Subscribe to titles published by any Agent through the canonical session rename path. */
+export function subscribeSessionGroupTitles(): () => void {
+  return dashboardEventBus.subscribe(event => {
+    if (event.type !== 'session.update' || typeof event.body.patch.title !== 'string') return;
+    const session = sessionStore.getSession(event.body.sessionId);
+    if (!session?.larkAppId || !['agent', 'user', 'dashboard', 'cli'].includes(session.titleSource ?? '')) return;
+    acceptSessionGroupTitle(session.larkAppId, session, session.title, 'session');
+  });
+}
+
+/** Fire-and-forget: reuse or generate an AI title for a freshly-born session group and
  *  rename the chat (+ session record) when it lands. */
 export function scheduleSessionGroupTitle(opts: {
   larkAppId: string;
@@ -312,35 +372,71 @@ export function scheduleSessionGroupTitle(opts: {
   // persisted backoff deadline (survives daemon restarts).
   const current = getSessionGroup(chatId);
   if (!current || current.titled) return;
+  const cfg = getBot(larkAppId).config;
+  const sg = cfg.sessionGroup ?? {};
+  const mode = sg.naming?.mode ?? 'ai-summary';
+  if (mode === 'truncate') return;
+  const candidate = current.pendingNativeTitle;
+  const reuseNative = mode === 'session-title';
+  const expectedName = current.autoTitleBaseName;
+  // Birth can precede the worker's semantic title. Waiting is not a failed round.
+  if (reuseNative && (!candidate || candidate.sessionId !== current.lastSessionId || !expectedName)) return;
+  if (!reuseNative && !userText.trim()) return;
+  const residentId = current.lastSessionId;
+  /** Recheck live policy and provenance across async work and immediately before the API write. */
+  const eligible = (): boolean => {
+    const entry = getSessionGroup(chatId);
+    if (!entry || entry.titled || (reuseNative && entry.lastSessionId !== residentId)
+      || (getBot(larkAppId).config.sessionGroup?.naming?.mode ?? 'ai-summary') !== mode) return false;
+    if (!reuseNative) return true;
+    const live = sessionStore.getSession(residentId);
+    return entry.pendingNativeTitle === candidate && live?.status === 'active'
+      && live.chatType === 'group' && live.scope === 'chat' && live.chatId === chatId
+      && live.larkAppId === larkAppId
+      && (candidate?.source === 'session'
+        ? live.title === candidate.sourceTitle
+        : !live.nativeSessionTitleUserDefined && live.nativeSessionTitle === candidate?.sourceTitle);
+  };
+  if (!eligible()) return;
   if ((current.titleAttempts ?? 0) >= MAX_SESSION_GROUP_TITLE_ROUNDS) return;
   if ((current.titleRetryAt ?? 0) > Date.now()) return;
   inFlightTitles.add(chatId);
   let succeeded = false;
   void (async () => {
     try {
-      const cfg = getBot(larkAppId).config;
-      const sg = cfg.sessionGroup ?? {};
-      if ((sg.naming?.mode ?? 'ai-summary') !== 'ai-summary') return;
-      if (!userText.trim()) return;
       const maxLen = sg.naming?.maxLen && sg.naming.maxLen > 0 ? sg.naming.maxLen : DEFAULT_TITLE_MAX_LEN;
 
-      const title = await generateOneShotTitle({ larkAppId, chatId, userText, maxLen, logTag: 'session-group' });
-      if (!title) return;
+      const title = reuseNative
+        ? reuseTitleForChat(candidate!.title, maxLen)
+        : await generateOneShotTitle({ larkAppId, chatId, userText, maxLen, logTag: 'session-group', model: sg.naming?.model });
+      if (!title || !eligible()) return;
       const prefix = sg.namePrefix ?? '';
       const finalName = `${prefix}${title}`;
       // Reuse the shared renameChat wrapper (membership precheck + error
       // classification) instead of a bespoke chat.update call.
-      const r = await renameChat(larkAppId, chatId, finalName);
-      if (!r.ok) {
+      const r = await renameChat(larkAppId, chatId, finalName, {
+        ...(reuseNative ? { expectedOldName: expectedName } : {}),
+        beforeUpdate: () => {
+          if (!eligible()) throw new Error('Session group naming no longer eligible');
+          return { ok: true };
+        },
+      });
+      // A prior remote rename may have succeeded before the local success
+      // marker was saved. Reconcile that exact name without another write.
+      if (!r.ok && !(reuseNative && r.error === 'name_changed' && r.oldName === finalName)) {
         logger.warn(`[session-group] rename chat=${chatId.substring(0, 12)} failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`);
         return;
       }
+      if (expectedName && (reuseNative || (r.ok && r.oldName === expectedName))) {
+        recordSessionGroupAutoName(chatId, expectedName, finalName);
+      }
+      if (!eligible()) return;
       markSessionGroupTitled(chatId);
       succeeded = true;
       // Best-effort: keep the botmux session title in sync so `botmux list` /
       // dashboard show the same name as the chat (same path as /rename).
       const entry = getSessionGroup(chatId);
-      if (entry?.lastSessionId) {
+      if (!reuseNative && entry?.lastSessionId) {
         const session = sessionStore.getSession(entry.lastSessionId);
         if (session) updateSessionTitle(session, title, 'system');
         touchSessionGroup(chatId);
@@ -349,8 +445,15 @@ export function scheduleSessionGroupTitle(opts: {
     } catch (err) {
       logger.info(`[session-group] AI title failed for chat=${chatId.substring(0, 12)} (placeholder kept): ${err}`);
     } finally {
-      if (!succeeded) markSessionGroupTitleFailed(chatId);
+      if (!succeeded && eligible()) markSessionGroupTitleFailed(chatId);
       inFlightTitles.delete(chatId);
+      // A title from a replacement resident may have arrived while the old
+      // remote write was in flight. Apply it against our confirmed new baseline.
+      const next = getSessionGroup(chatId);
+      if (getBot(larkAppId).config.sessionGroup?.naming?.mode === 'session-title'
+        && next?.pendingNativeTitle && next.pendingNativeTitle !== candidate && !next.titled) {
+        scheduleSessionGroupTitle({ larkAppId, chatId, userText: '' });
+      }
     }
   })();
 }

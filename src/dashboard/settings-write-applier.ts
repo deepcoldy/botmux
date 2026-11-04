@@ -138,8 +138,9 @@ export interface ResolvedDashboardSettingsView {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON. The nested
+   *  task-tree card switch is default OFF and optional. */
+  multiTopic: { enabled: boolean; taskTreeCard?: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Proxy for binary self-update downloads, null/absent = unset. */
@@ -821,8 +822,17 @@ export async function applySettingsWrite(
     if (typeof multiTopic.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_multiTopic_enabled' };
     }
+    if (multiTopic.taskTreeCard !== undefined && typeof multiTopic.taskTreeCard !== 'boolean') {
+      return { ok: false, error: 'invalid_multiTopic_taskTreeCard' };
+    }
     const current = deps.readGlobalConfig().multiTopic ?? {};
-    deps.mergeGlobalConfig({ multiTopic: { ...current, enabled: multiTopic.enabled } });
+    deps.mergeGlobalConfig({
+      multiTopic: {
+        ...current,
+        enabled: multiTopic.enabled,
+        ...(typeof multiTopic.taskTreeCard === 'boolean' ? { taskTreeCard: multiTopic.taskTreeCard } : {}),
+      },
+    });
     touched = true;
   }
 

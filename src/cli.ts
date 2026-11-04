@@ -148,6 +148,7 @@ import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
+import { safeRequirementUrl } from './core/dispatch-task-tree.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { isCodexReasoningEffort, type CodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import { resolveDispatchLaunchSpec } from './core/dispatch-launch-spec.js';
@@ -237,7 +238,7 @@ import { DEFERRED_TOPIC_CLAIM_ROUTE, type DeferredTopicClaimResponse } from './c
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
-import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled } from './global-config.js';
+import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled, isDispatchTaskTreeCardEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
   DASHBOARD_READY_WAIT_MS,
@@ -435,7 +436,10 @@ import {
   describePluginDependencyError,
   enabledPluginDependents,
 } from './core/plugins/dependencies.js';
-import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
+import {
+  authorizeV3DaemonCommand,
+  authorizeV3RunEditCommand,
+} from './workflows/v3/cli-daemon-command-authority.js';
 import {
   findOnlineDaemon,
   listOnlineDaemons as listOnlineDaemonsIn,
@@ -6945,7 +6949,7 @@ function authorizeWorkflowDaemonCommand(runId: string, rest: string[]): string {
  */
 async function tryWorkflowSessionRelayMutation(
   runId: string,
-  mutation: WorkflowDaemonMutation,
+  mutation: WorkflowDaemonMutation | 'status',
   body?: Record<string, unknown>,
 ): Promise<WorkflowDaemonMutationResponse | null> {
   const context = readWorkflowSessionRelayContext({
@@ -7180,6 +7184,112 @@ async function cmdWorkflowStart(runId: string | undefined, rest: string[]): Prom
     process.exit(1);
   }
   console.log(`✅ v3 run "${runId}" 已交 daemon 驱动；humanGate 会在话题里弹审批卡，点了才继续。`);
+}
+
+/** `botmux workflow status <runId>` — the main bot reads the run's effective
+ *  flow revision, node states, attempts and pending proposal (design §13.1).
+ *  Same main-session turn authentication as `workflow edit`. */
+async function cmdWorkflowStatusV3(runId: string | undefined, rest: string[]): Promise<void> {
+  const { V3_RUN_STATUS_USAGE } = await import('./cli/v3-run-edit.js');
+  if (!runId) {
+    console.error(V3_RUN_STATUS_USAGE);
+    process.exit(1);
+  }
+  const { projectV3RunStatus, formatV3RunStatus } = await import('./workflows/v3/run-edit.js');
+  const { defaultBaseDir: defaultV3BaseDir } = await import('./workflows/v3/grill-state.js');
+  // An isolated main session cannot read the run directory: ask the daemon,
+  // which authenticates the session from its own live record.
+  const relayed = await tryWorkflowSessionRelayMutation(runId, 'status');
+  if (relayed) {
+    let body: { ok?: boolean; status?: Parameters<typeof formatV3RunStatus>[0] } = {};
+    try { body = JSON.parse(relayed.bodyRaw) as typeof body; } catch { /* reported below */ }
+    if (!relayed.ok || !body.status) {
+      console.error(`❌ status 失败 (HTTP ${relayed.status}): ${relayed.bodyRaw}`);
+      process.exit(1);
+    }
+    console.log(rest.includes('--json') ? JSON.stringify(body.status, null, 2) : formatV3RunStatus(body.status));
+    return;
+  }
+  try {
+    authorizeV3RunEditCommand({
+      runId,
+      dataDir: resolveDataDir(),
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+    const view = projectV3RunStatus(defaultV3BaseDir(), runId);
+    console.log(rest.includes('--json') ? JSON.stringify(view, null, 2) : formatV3RunStatus(view));
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+/** `botmux workflow edit <runId> --patch-file <f|-> --base <N>` — one atomic
+ *  list of ops (design §13.2). The CLI authenticates the current turn against
+ *  the run's main session; the owning daemon decides (under the journal lock)
+ *  whether it applies directly or waits for the initiator (M1/M2). */
+async function cmdWorkflowEditV3(runId: string | undefined, rest: string[]): Promise<void> {
+  const {
+    V3_RUN_EDIT_USAGE,
+    formatV3RunEditResponse,
+    parseV3RunEditCliOptions,
+    readV3RunEditPatch,
+  } = await import('./cli/v3-run-edit.js');
+  if (!runId) {
+    console.error(V3_RUN_EDIT_USAGE);
+    process.exit(1);
+  }
+  const parsed = parseV3RunEditCliOptions(rest);
+  if (!parsed.ok) {
+    console.error(`❌ ${parsed.error}`);
+    console.error(V3_RUN_EDIT_USAGE);
+    process.exit(1);
+  }
+  let response: WorkflowDaemonMutationResponse;
+  let patch: unknown;
+  try {
+    patch = readV3RunEditPatch(parsed.patchFile);
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  // Isolated main session → session relay (the daemon derives the caller).
+  const relayed = await tryWorkflowSessionRelayMutation(runId, 'edit', { patch, base: parsed.base });
+  if (relayed) {
+    response = relayed;
+  } else try {
+    const authority = authorizeV3RunEditCommand({
+      runId,
+      dataDir: resolveDataDir(),
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+    const daemon = findDaemon(authority.larkAppId);
+    if (!daemon) {
+      console.error('❌ 没有在线 daemon；运行中修改需要拥有该 run 的 daemon 执行。');
+      process.exit(1);
+    }
+    response = await postWorkflowDaemonMutation({
+      daemon,
+      runId,
+      mutation: 'edit',
+      body: {
+        patch,
+        base: parsed.base,
+        caller: { openId: authority.callerOpenId, origin: authority.origin },
+      },
+    });
+  } catch (err) {
+    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  if (parsed.json) {
+    console.log(response.bodyRaw);
+    if (!response.ok) process.exit(1);
+    return;
+  }
+  const out = formatV3RunEditResponse(runId, response);
+  (out.exitCode === 0 ? console.log : console.error)(out.text);
+  if (out.exitCode !== 0) process.exit(out.exitCode);
 }
 
 /** `botmux workflow retry <runId> [--node <id>]` — blocked 节点重试入口（CLI 侧）。
@@ -7723,6 +7833,9 @@ ${SEND_HELP_BODY}
   workflow cancel <runId> [--reason <text>] [--bot <larkAppId>]
                                        持久化取消 v3 run 并中断活动节点
   workflow retry|grant [...]           处理受阻节点 / loop
+  workflow status <runId> [--json]     查看运行中流程的当前版本、节点状态和待确认修改
+  workflow edit <runId> --patch-file <文件|-> --base <版本>
+                                       运行中按版本修改流程（越界修改转发起人确认）
   template migrate-v3 [id|path ...] [--all] [--commit ...]
                                        v2 定义迁移：默认 dry-run，写入需显式 owner/app/scope
   template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]
@@ -9950,6 +10063,9 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   const allowedFlags = new Set([
     '--title', '--bot-app', '--chat-id', '--into', '--steer',
     '--brief', '--brief-file', '--session-id', '--delegate', '--no-delegate',
+    // Task-tree card metadata, relayed verbatim; the host re-exec's cmdDispatch
+    // validates --kind's enum and --task-url's https itself.
+    '--kind', '--task-id', '--task-url',
   ]);
   const unsupportedFlags = [...new Set(rest
     .filter(token => token.startsWith('--'))
@@ -10002,6 +10118,12 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   }
   if (intoRoot) flags.push('--into', intoRoot);
   if (rest.includes('--steer')) flags.push('--steer');
+  // Task-tree metadata is single-value (cmdDispatch keeps the first occurrence);
+  // forward only that one so the host re-exec sees the same effective argv.
+  for (const flag of ['--kind', '--task-id', '--task-url'] as const) {
+    const value = argValue(rest, flag);
+    if (value !== undefined) flags.push(flag, value);
+  }
   const id = randomBytes(8).toString('hex');
   const contentBase = `${id}.content`;
   const contentPath = join(relayDir, contentBase);
@@ -10048,6 +10170,7 @@ async function persistDispatchLifecycle(input: {
   errorCode?: string | null;
   acceptedBotAppIds?: readonly string[];
   missingBotAppIds?: readonly string[];
+  attemptStartedAt?: string;
 }): Promise<DispatchReceiptState> {
   try {
     return await persistDispatchLifecycleRecord({ dataDir: resolveDataDir(), ...input });
@@ -14638,7 +14761,122 @@ function credentialOnlyDirectDispatchOptions(args: {
   ];
 }
 
+async function trySyncDispatchTaskTree(input: {
+  sessionId: string;
+  larkAppId: string;
+  dispatchRoot?: string;
+  kind?: 'task' | 'review';
+  taskId?: string;
+  taskUrl?: string;
+  originClaim?: ManagedOriginCapabilityClaim | null;
+}): Promise<{ ok: boolean; enabled?: boolean; hint?: string; text?: string; messageId?: string | null; error?: string }> {
+  try {
+    const response = await postCurrentSessionDaemonRoute({
+      path: `/api/sessions/${encodeURIComponent(input.sessionId)}/dispatch-tree`,
+      sessionId: input.sessionId,
+      larkAppId: input.larkAppId,
+      body: {
+        ...(input.dispatchRoot ? { dispatchRoot: input.dispatchRoot } : {}),
+        ...(input.kind ? { kind: input.kind } : {}),
+        ...(input.taskId ? { taskId: input.taskId } : {}),
+        ...(input.taskUrl ? { taskUrl: input.taskUrl } : {}),
+      },
+      ...(input.originClaim !== undefined ? { originClaim: input.originClaim } : {}),
+    });
+    const body = await response.json().catch(() => ({})) as {
+      ok?: boolean; enabled?: boolean; hint?: string;
+      error?: string; text?: string; messageId?: string | null;
+    };
+    if (response.ok && body.ok) {
+      return {
+        ok: true,
+        ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+        ...(body.hint ? { hint: body.hint } : {}),
+        ...(body.text !== undefined ? { text: body.text } : {}),
+        messageId: body.messageId ?? null,
+      };
+    }
+    return { ok: false, error: body.error ?? `HTTP ${response.status}` };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Best effort after a dispatch: the task tree is a view, never a reason to fail it. */
+async function syncDispatchTaskTreeAfterDispatch(input: Parameters<typeof trySyncDispatchTaskTree>[0]): Promise<void> {
+  // Default-off: skip even the local best-effort IPC so a disabled feature
+  // adds no dispatch-time call at all (the daemon gate is authoritative; this
+  // runs host-side or in a pane with the spawn-time env value).
+  if (!isDispatchTaskTreeCardEnabled()) return;
+  const result = await trySyncDispatchTaskTree(input);
+  if (!result.ok) console.error(`⚠️  子任务已派发，但任务树卡片更新失败: ${result.error}`);
+}
+
+async function cmdDispatchTree(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`botmux dispatch tree — 刷新当前编排会话的任务树卡片，并打印文字版
+
+用法:
+  botmux dispatch tree [--task-id <需求id>] [--task-url <需求链接>] [--session-id <id>]
+
+说明:
+  任务树卡片默认关闭，先在 Dashboard「全局设置 → 多话题编排 → 任务树卡片」开启。
+  开启后首次 dispatch 卡片会自动发到本会话所在话题，子话题接手、回报、完成、失败时原地更新；
+  这个命令只用于手动刷新。--task-id / --task-url 会记到卡片头部（之后的刷新沿用）。`);
+    return;
+  }
+  const flags = new Map<string, string>();
+  for (let i = 0; i < rest.length; i += 1) {
+    const token = rest[i]!;
+    const eq = token.indexOf('=');
+    const flag = eq >= 0 ? token.slice(0, eq) : token;
+    if (!['--task-id', '--task-url', '--session-id'].includes(flag)) {
+      console.error(`未知参数: ${token}。用法见 botmux dispatch tree --help`);
+      process.exit(2);
+    }
+    const value = eq >= 0 ? token.slice(eq + 1) : rest[++i];
+    if (value === undefined) { console.error(`${flag} 需要一个值`); process.exit(2); }
+    flags.set(flag, value);
+  }
+  const taskUrl = flags.get('--task-url');
+  if (taskUrl !== undefined && !safeRequirementUrl(taskUrl)) {
+    console.error('--task-url 需要 https:// 链接。');
+    process.exit(2);
+  }
+  assertTurnTransportOrExit('dispatch');
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const sid = flags.get('--session-id') ?? resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID)?.sessionId;
+  if (!sid) {
+    console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+  const originClaim = freezeDispatchOriginClaim(sid);
+  const s = await requireSessionById(sid);
+  if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  const result = await trySyncDispatchTaskTree({
+    originClaim,
+    sessionId: sid,
+    larkAppId: s.larkAppId,
+    ...(flags.get('--task-id') ? { taskId: flags.get('--task-id') } : {}),
+    ...(taskUrl ? { taskUrl: taskUrl.trim() } : {}),
+  });
+  if (!result.ok) {
+    console.error(`任务树刷新失败: ${result.error}`);
+    process.exit(1);
+  }
+  // Default-off: the daemon (the only side that can read the host config in a
+  // sandbox) tells the CLI what to say; exit 0 so orchestration scripts that
+  // call this for a refresh do not treat "feature off" as a failure.
+  if (result.enabled === false) {
+    console.log(result.hint ?? '任务树卡片当前未开启。');
+    return;
+  }
+  console.log(result.text ?? '');
+  console.log(result.messageId ? `\n卡片: ${result.messageId}` : '\n还没有派发记录，没有发卡片。');
+}
+
 async function cmdDispatch(rest: string[]): Promise<void> {
+  if (rest[0] === 'tree') return cmdDispatchTree(rest.slice(1));
   const parsedArgs = parseDispatchArgs(rest);
   if (!parsedArgs.ok) {
     console.error(JSON.stringify({
@@ -14698,7 +14936,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
-  --session-id <id>     指定来源会话（默认自动推断）`);
+  --session-id <id>     指定来源会话（默认自动推断）
+  --kind <task|review>  任务树里把这个子话题标成「任务」或「审查」（默认 task）
+  --task-id <id>        需求 id，显示在任务树卡片头部（之后的派发沿用）
+  --task-url <url>      需求链接（https），卡片头部可点开
+
+任务树卡片:
+  首次派发后，本会话所在话题会出现一张任务树卡片（每个子话题一行：状态、最后一句进展、话题链接）；
+  子话题接手、回报、完成、失败时原地更新。手动刷新: botmux dispatch tree`);
     return;
   }
   if (!dispatchArgs.into && !isMultiTopicOrchestrationEnabled()) {
@@ -14838,6 +15083,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('--result-delivery 必须是 relay|publish|publish-and-relay。');
     process.exit(1);
   }
+  if (dispatchArgs.kind !== undefined && !['task', 'review'].includes(dispatchArgs.kind)) {
+    console.error('--kind 只接受 task|review。');
+    process.exit(1);
+  }
+  if (dispatchArgs.taskUrl !== undefined && !safeRequirementUrl(dispatchArgs.taskUrl)) {
+    console.error('--task-url 需要 https:// 链接。');
+    process.exit(1);
+  }
   if (steer) brief = withBotSteerDirective(brief);
   if (!intoRoot && !title.trim()) {
     console.error('新开话题需要 --title。往已有话题追加请用 --into <root_id>。');
@@ -14866,6 +15119,16 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   // refuses every request after a rotation (claim ≠ live capability). Hosts
   // read no claim (null) and keep their trusted-host authentication.
   const dispatchOriginClaim = freezeDispatchOriginClaim(sid);
+  // Taken before anything is sent: a child's report from this attempt is never older.
+  const dispatchAttemptStartedAt = new Date().toISOString();
+  // attemptAt only feeds the task-tree card (reportIsCurrent). With the card
+  // off (the default) skip writing it so dispatch registry entries stay
+  // byte-identical to the pre-card build. These persist sites run on the host
+  // re-exec (sandboxed --bot-app / credential-only dispatch is re-launched by
+  // the watcher before reaching them), where the global config is readable.
+  const taskTreeAttemptStartedAt = isDispatchTaskTreeCardEnabled()
+    ? dispatchAttemptStartedAt
+    : undefined;
   const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
@@ -15211,12 +15474,22 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       const receiptState = await persistDispatchLifecycle({
         dispatchRoot: intoRoot,
         sourceSessionId: sid,
+        attemptStartedAt: taskTreeAttemptStartedAt,
         status: lifecycleStatus,
         transportState: 'dispatched',
         acceptanceState,
         errorCode,
         acceptedBotAppIds: acceptance?.acceptedBotAppIds,
         missingBotAppIds: acceptance?.missingBotAppIds,
+      });
+      await syncDispatchTaskTreeAfterDispatch({
+        originClaim: dispatchOriginClaim,
+        sessionId: sid,
+        larkAppId: s.larkAppId,
+        dispatchRoot: intoRoot,
+        ...(dispatchArgs.kind === 'review' || dispatchArgs.kind === 'task' ? { kind: dispatchArgs.kind } : {}),
+        ...(dispatchArgs.taskId ? { taskId: dispatchArgs.taskId } : {}),
+        ...(dispatchArgs.taskUrl ? { taskUrl: dispatchArgs.taskUrl } : {}),
       });
       const projectSynced = await trySyncProjectDispatch({
         originClaim: dispatchOriginClaim,
@@ -15339,12 +15612,22 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const receiptState = await persistDispatchLifecycle({
       dispatchRoot: seedId,
       sourceSessionId: sid,
+      attemptStartedAt: taskTreeAttemptStartedAt,
       status: lifecycleStatus,
       transportState: 'dispatched',
       acceptanceState,
       errorCode,
       acceptedBotAppIds: acceptance?.acceptedBotAppIds,
       missingBotAppIds: acceptance?.missingBotAppIds,
+    });
+    await syncDispatchTaskTreeAfterDispatch({
+      originClaim: dispatchOriginClaim,
+      sessionId: sid,
+      larkAppId: s.larkAppId,
+      dispatchRoot: seedId,
+      ...(dispatchArgs.kind === 'review' || dispatchArgs.kind === 'task' ? { kind: dispatchArgs.kind } : {}),
+      ...(dispatchArgs.taskId ? { taskId: dispatchArgs.taskId } : {}),
+      ...(dispatchArgs.taskUrl ? { taskUrl: dispatchArgs.taskUrl } : {}),
     });
     const projectSynced = await trySyncProjectDispatch({
         originClaim: dispatchOriginClaim,
@@ -15399,10 +15682,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       receiptState = await persistDispatchLifecycle({
         dispatchRoot: dispatchRootForLifecycle,
         sourceSessionId: sid,
+        attemptStartedAt: taskTreeAttemptStartedAt,
         status: 'failed',
         transportState: 'failed',
         acceptanceState: 'failed',
         errorCode: 'TRANSPORT_FAILED',
+      });
+      await syncDispatchTaskTreeAfterDispatch({
+        originClaim: dispatchOriginClaim,
+        sessionId: sid,
+        larkAppId: s.larkAppId,
+        dispatchRoot: dispatchRootForLifecycle,
+        ...(dispatchArgs.kind === 'review' || dispatchArgs.kind === 'task' ? { kind: dispatchArgs.kind } : {}),
+        ...(dispatchArgs.taskId ? { taskId: dispatchArgs.taskId } : {}),
+        ...(dispatchArgs.taskUrl ? { taskUrl: dispatchArgs.taskUrl } : {}),
       });
       await trySyncProjectDispatch({
         originClaim: dispatchOriginClaim,
@@ -18867,6 +19160,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'retry',
     'grant',
     'cancel',
+    'edit',
   ]);
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
   const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
@@ -20158,6 +20452,16 @@ switch (command) {
     if (wfSub === 'grant') {
       // v3 exhausted-loop grant (+1 iteration).
       await cmdWorkflowGrant(process.argv[4], process.argv.slice(5));
+      break;
+    }
+    if (wfSub === 'status') {
+      // v3 runtime flow status for the main bot (design §13.1).
+      await cmdWorkflowStatusV3(process.argv[4], process.argv.slice(5));
+      break;
+    }
+    if (wfSub === 'edit') {
+      // v3 runtime flow edit (design §13.2).
+      await cmdWorkflowEditV3(process.argv[4], process.argv.slice(5));
       break;
     }
     const { cmdWorkflow } = await import('./cli/workflow.js');

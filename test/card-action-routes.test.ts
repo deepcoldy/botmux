@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => ({
   issueDeps: { marker: 'issue-deps' },
   createDaemonClientFor: vi.fn((appId: string) => ({ client: appId })),
   v3: {
-    gate: vi.fn(), blocked: vi.fn(), revisit: vi.fn(), loop: vi.fn(), runSave: vi.fn(), distill: vi.fn(),
+    gate: vi.fn(), blocked: vi.fn(), revisit: vi.fn(), loop: vi.fn(), revision: vi.fn(), runSave: vi.fn(), distill: vi.fn(),
   },
 }));
 
@@ -45,6 +45,7 @@ vi.mock('../src/im/lark/v3-gate-card-handler.js', async (orig) => ({ ...(await o
 vi.mock('../src/im/lark/v3-blocked-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3BlockedAction: mocks.v3.blocked }));
 vi.mock('../src/im/lark/v3-revisit-grant-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3RevisitGrantAction: mocks.v3.revisit }));
 vi.mock('../src/im/lark/v3-loop-grant-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3LoopGrantAction: mocks.v3.loop }));
+vi.mock('../src/im/lark/v3-revision-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3RevisionAction: mocks.v3.revision }));
 vi.mock('../src/im/lark/v3-run-save-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3RunSaveAction: mocks.v3.runSave }));
 vi.mock('../src/im/lark/v3-distillation-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3DistillationAction: mocks.v3.distill }));
 
@@ -133,8 +134,8 @@ describe('前缀路由表', () => {
 });
 
 describe('v3 路由表', () => {
-  it('表序钉死：gate → blocked → revisitGrant → loopGrant → runSave → distillation', () => {
-    expect(V3_CARD_ROUTES.map(r => r.name)).toEqual(['gate', 'blocked', 'revisitGrant', 'loopGrant', 'runSave', 'distillation']);
+  it('表序钉死：gate → blocked → revisitGrant → loopGrant → revision → runSave → distillation', () => {
+    expect(V3_CARD_ROUTES.map(r => r.name)).toEqual(['gate', 'blocked', 'revisitGrant', 'loopGrant', 'revision', 'runSave', 'distillation']);
   });
 
   const v3Cases: Array<[string, string, () => ReturnType<typeof vi.fn>, string]> = [
@@ -143,6 +144,8 @@ describe('v3 路由表', () => {
     ['blocked', 'v3_blocked_ask_answer', () => mocks.v3.blocked, 'v3BlockedDeps'],
     ['revisitGrant', 'v3_revisit_grant', () => mocks.v3.revisit, 'v3RevisitGrantDeps'],
     ['loopGrant', 'v3_loop_grant', () => mocks.v3.loop, 'v3LoopGrantDeps'],
+    ['revision', 'v3_revision_approve', () => mocks.v3.revision, 'v3RevisionDeps'],
+    ['revision', 'v3_revision_reject', () => mocks.v3.revision, 'v3RevisionDeps'],
     ['runSave', 'v3_run_save', () => mocks.v3.runSave, 'v3RunSaveDeps'],
     ['distillation', 'v3_distill_accept', () => mocks.v3.distill, 'v3DistillationDeps'],
   ];
@@ -198,7 +201,7 @@ describe('敏感动作清单', () => {
     'cleanup_session_worktree', 'close', 'compact_session', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli', 'open_local_terminal',
     'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
     'repo_manual_submit', 'repo_rebuild_worktree', 'repo_worktree_submit', 'restart', 'resume',
-    'retry_last_task', 'retry_turn', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
+    'retry_last_task', 'retry_turn', 'session_effort_apply', 'session_effort_pick', 'session_model_pick', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
     'toggle_display', 'toggle_idle_compact', 'toggle_stream', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
     'worktree_toggle_mode',
   ];

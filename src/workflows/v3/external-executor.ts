@@ -69,7 +69,8 @@ export interface V3ExternalAttemptRef {
   nodeId: string;
   instanceId?: string;
   attemptId: string;
-  /** Flow revision (design §13.3); always 1 until runtime edits land. */
+  /** Flow revision the attempt was dispatched under (design §13.3; 1 = the
+   *  approved DAG). */
   revision: number;
   targetLarkAppId: string;
   placement: V3ExternalPlacement;
@@ -96,6 +97,9 @@ export interface V3ExternalDispatchRequest extends V3ExternalAttemptRef {
   retryOf?: { attemptId: string; errorCode?: string; message?: string };
   /** Present when the node was reassigned before this attempt. */
   reassignedFrom?: string;
+  /** Present when this attempt replaces work a runtime flow revision
+   *  invalidated (the handoff should say the requirements changed). */
+  revisedBy?: { revision: number; summary: string };
   /** Aborted when the run is cancelled while the send is in flight. */
   signal: AbortSignal;
 }

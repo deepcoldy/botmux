@@ -1,3 +1,4 @@
+import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
@@ -149,7 +150,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=logo(默认)|name|off；unset 恢复默认' },
   { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
-  { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex/Grok 普通飞书对话' },
+  { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex/Grok/TraeX/Pi 普通飞书对话' },
   { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close；unset 恢复全部' },
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
   { key: 'cotEnabled', configKey: 'cotEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；支持 claude-code / codex / traex / pi 等适配器）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
@@ -422,28 +423,40 @@ export async function applyBotSessionEnvOps(
  * 调用方负责按 kind 校验后再传值；本函数只负责落盘 + 同步内存。
  * 不处理 allowedUsers（异步，见 {@link setBotAllowedUsers}）。
  */
+/** Optional picker snapshot, checked inside the same file lock as the write. */
+export interface ConfigSelectionPrecondition {
+  selectionKey: string;
+  /** null means the CLI default model; omitted means no model condition. */
+  model?: string | null;
+  requireLaunchModelSupport?: boolean;
+  actorOpenId?: string;
+}
+
 export async function applyConfigField(
   larkAppId: string,
   spec: ConfigFieldSpec,
   value: unknown,
+  precondition?: ConfigSelectionPrecondition,
 ): Promise<ApplyFieldResult> {
   if (spec.configKey === 'pinStreamingCard') {
     return serializePinStreamingCardConfigChange(
       larkAppId,
-      () => applyConfigFieldInternal(larkAppId, spec, value),
+      () => applyConfigFieldInternal(larkAppId, spec, value, precondition),
     );
   }
-  return applyConfigFieldInternal(larkAppId, spec, value);
+  return applyConfigFieldInternal(larkAppId, spec, value, precondition);
 }
 
 async function applyConfigFieldInternal(
   larkAppId: string,
   spec: ConfigFieldSpec,
   value: unknown,
+  precondition?: ConfigSelectionPrecondition,
 ): Promise<ApplyFieldResult> {
   if (spec.kind === 'allowedUsers') return { ok: false, reason: 'use_setBotAllowedUsers' };
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const expectedAllowedUsers = precondition?.actorOpenId ? JSON.stringify(bot.config.allowedUsers ?? []) : undefined;
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
   }
@@ -523,6 +536,21 @@ async function applyConfigFieldInternal(
     const currentModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
       : undefined;
+    if (precondition) {
+      if (precondition.actorOpenId && (!bot.resolvedAllowedUsers.length
+        || !bot.resolvedAllowedUsers.includes(precondition.actorOpenId)
+        || JSON.stringify(entry.allowedUsers ?? []) !== expectedAllowedUsers)) {
+        return { write: false, result: 'config_selection_changed' };
+      }
+      const currentSelectionKey = selectionKeyForBot(currentCliId,
+        typeof entry.wrapperCli === 'string' ? entry.wrapperCli : undefined,
+        entry.cliLaunchMode as BotConfig['cliLaunchMode']);
+      if (currentSelectionKey !== precondition.selectionKey
+        || (Object.hasOwn(precondition, 'model') && (currentModel ?? null) !== precondition.model)
+        || (precondition.requireLaunchModelSupport && !botAcceptsLaunchModel({ cliId: currentCliId as BotConfig['cliId'], backendType: entry.backendType }))) {
+        return { write: false, result: 'config_selection_changed' };
+      }
+    }
     const zeroPrompt = spec.configKey === 'promptInjection'
       ? effective === 'none'
       : entry.promptInjection === 'none';

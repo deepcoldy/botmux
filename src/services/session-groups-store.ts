@@ -66,6 +66,10 @@ export interface SessionGroupEntry {
   originChatId?: string;
   /** True once the async AI title has been applied to the chat name. */
   titled?: boolean;
+  /** Published Agent title awaiting application; bound to the resident session. */
+  pendingNativeTitle?: { sessionId: string; title: string; source: 'native' | 'session'; sourceTitle: string };
+  /** Original placeholder, advanced only by confirmed automatic renames. */
+  autoTitleBaseName?: string;
   /** Actual automatic feed group joined by this chat, scoped to ownerOpenId. */
   feedGroupId?: string;
   /** Failed scheduling rounds (each round contains the service's bounded
@@ -135,6 +139,8 @@ export function registerSessionGroup(chatId: string, entry: Omit<SessionGroupEnt
     originQuotaKey: entry.originQuotaKey,
     originChatId: entry.originChatId,
     titled: entry.titled,
+    pendingNativeTitle: entry.pendingNativeTitle,
+    autoTitleBaseName: entry.autoTitleBaseName,
     feedGroupId: entry.feedGroupId,
     titleAttempts: entry.titleAttempts,
     titleRetryAt: entry.titleRetryAt,
@@ -192,7 +198,14 @@ export function touchSessionGroup(chatId: string, lastSessionId?: string): void 
   load();
   const cur = entries.get(chatId);
   if (!cur) return;
-  if (lastSessionId) cur.lastSessionId = lastSessionId;
+  if (lastSessionId) {
+    if (lastSessionId !== cur.lastSessionId && cur.pendingNativeTitle) {
+      cur.pendingNativeTitle = undefined;
+      cur.titleAttempts = undefined;
+      cur.titleRetryAt = undefined;
+    }
+    cur.lastSessionId = lastSessionId;
+  }
   cur.lastActiveAt = Date.now();
   persist();
 }
@@ -203,7 +216,34 @@ export function markSessionGroupTitled(chatId: string): void {
   const cur = entries.get(chatId);
   if (!cur || cur.titled) return;
   cur.titled = true;
+  cur.pendingNativeTitle = undefined;
   cur.titleRetryAt = undefined;
+  persist();
+}
+
+/** Persist one generated title for the current resident without resetting duplicate-event backoff. */
+export function rememberSessionGroupNativeTitle(
+  chatId: string,
+  candidate: NonNullable<SessionGroupEntry['pendingNativeTitle']>,
+): boolean {
+  const cur = getSessionGroup(chatId);
+  if (!cur || cur.titled || cur.lastSessionId !== candidate.sessionId || !candidate.title.trim()) return false;
+  if (cur.pendingNativeTitle?.sessionId === candidate.sessionId
+    && cur.pendingNativeTitle.source === candidate.source
+    && cur.pendingNativeTitle.sourceTitle === candidate.sourceTitle) return true;
+  cur.pendingNativeTitle = candidate;
+  // Old one-shot failures must not prevent the first generated title from being applied.
+  cur.titleAttempts = undefined;
+  cur.titleRetryAt = undefined;
+  persist();
+  return true;
+}
+
+/** Advance only the automatic name that this process actually replaced, including a stale request's success. */
+export function recordSessionGroupAutoName(chatId: string, previousName: string, newName: string): void {
+  const cur = getSessionGroup(chatId);
+  if (!cur || cur.autoTitleBaseName !== previousName) return;
+  cur.autoTitleBaseName = newName;
   persist();
 }
 

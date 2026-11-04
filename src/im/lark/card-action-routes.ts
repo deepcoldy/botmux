@@ -43,6 +43,11 @@ import {
   handleV3RunSaveAction,
   isV3RunSaveAction,
 } from './v3-run-save-card-handler.js';
+import {
+  handleV3RevisionAction,
+  isV3RevisionAction,
+} from './v3-revision-card-handler.js';
+import type { V3RevisionActionValue } from './v3-revision-card.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
 import {
   handleV3DistillationAction,
@@ -138,7 +143,7 @@ export interface V3CardRoute {
   run(ctx: V3CardActionContext): Promise<any> | undefined;
 }
 
-/** 原 if 链顺序：gate → blocked → revisit → loop → runSave → distillation。 */
+/** 原 if 链顺序：gate → blocked → revisit → loop → revision → runSave → distillation。 */
 export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
   {
     name: 'gate',
@@ -169,6 +174,12 @@ export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
     matches: isV3LoopGrantAction,
     run: ctx => ctx.deps.v3LoopGrantDeps
       && handleV3LoopGrantAction(ctx.value as unknown as V3LoopGrantActionValue, ctx.operatorOpenId, ctx.deps.v3LoopGrantDeps),
+  },
+  {
+    name: 'revision',
+    matches: isV3RevisionAction,
+    run: ctx => ctx.deps.v3RevisionDeps
+      && handleV3RevisionAction(ctx.value as unknown as V3RevisionActionValue, ctx.operatorOpenId, ctx.deps.v3RevisionDeps),
   },
   {
     name: 'runSave',
@@ -262,6 +273,9 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   // 普通回复卡右下角操作菜单（#1877）：展开菜单与模型选择注入都必须过 canOperate。
   ['reply_card_menu', NO_META],
   ['reply_model_pick', NO_META],
+  ['session_model_pick', NO_META],
+  ['session_effort_pick', NO_META],
+  ['session_effort_apply', NO_META],
 ]);
 
 /** 该 action 是否过 canOperate 门；非字符串 / 未登记一律 undefined。 */

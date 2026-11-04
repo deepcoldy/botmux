@@ -86,6 +86,7 @@ export function workerSubmitHarness() {
     emitTurnTerminal: vi.fn(),
     shouldStopPendingBatch: () => true,
   };
+  scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   scope.scheduleSubmitFailureNotify = schedule;
   const flush = loadWorkerFunction<() => Promise<void>>('flushPending', scope);
