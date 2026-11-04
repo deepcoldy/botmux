@@ -14,7 +14,7 @@
 2. **Gate-1 确认需求**：bot 给一份需求摘要（做哪几步、各自产出、验收标准、明确不做什么），你确认。
 3. **自动编排 DAG**：系统把需求编译成一张可执行的依赖图。
 4. **Gate-2 确认流程**：bot 讲清楚节点、依赖顺序、哪些节点执行期要停下等审批，你确认就开跑。
-5. **并发执行**：节点按依赖顺序并发跑（默认最多 4 个并发），过程中按需在本话题弹卡片（见下）。
+5. **并发执行**：节点按依赖顺序并发跑（默认上限见下文「并发上限」），过程中按需在本话题弹卡片（见下）。
 
 ### 运行起来后会遇到什么（人机协作）
 
@@ -153,6 +153,38 @@ run 跑起来以后，流程还能改：加节点、删节点、改节点的目�
 
 **没配 H5 免登时只有管理员能看**：侧边栏是独立的浏览器环境，带不过去 Dashboard 的登录态，所以这时按钮改为在浏览器里打开 Dashboard 的运行详情页（和原来进度卡上的「Web 详情」一样），用已有的 Dashboard 登录查看。
 
+### 并发上限
+
+一个 run 里同时跑的节点数受三层上限约束，三层同时生效，取最紧的那层：
+
+| 层 | 含义 | 默认 |
+|---|---|---|
+| `global` | 整个 run 同时在跑的节点数 | 4 |
+| `perBot` | 同一个 bot（飞书应用）同时在跑的节点数 | 1 |
+| `perCli` | 同一种 CLI（claude-code / codex…）同时在跑的节点数 | 2 |
+
+默认值偏保守：每个节点都会起一个完整的 CLI 进程，同一种 CLI 通常也共用一个订阅账号，容易撞限流。按默认值，同一个 bot 上的节点是串行的。注意上限是按 run 计算的，两个 run 同时在跑时，各自都能用满自己的上限。如果你的 CLI 走按量计费的 API、机器内存也够，可以在 `~/.botmux/config.json` 里放开：
+
+```json
+{
+  "workflow": {
+    "enabled": true,
+    "concurrency": {
+      "global": 16,
+      "perBot": 4,
+      "perCli": 2,
+      "perCliById": { "claude-code": 8 }
+    }
+  }
+}
+```
+
+- ⚠️ 同一个 bot 的节点都在这个 bot 的工作目录（`workingDir`）里执行。`perBot` 大于 1 时，多个节点会同时读写同一个目录。如果节点会改代码或文件，请确认它们改的不是同一批文件，或者给不同节点分配不同的 bot。
+- 每个字段都可选，没写的字段保持默认值；取值为 1–64 的整数。非法值读取时会被忽略，之后在 Dashboard 改 workflow 设置时会被清掉。
+- `perCliById` 按 CLI 类型单独设置，没列出的 CLI 用 `perCli`。
+- 每次驱动 run 时都会重新读取配置，改完对下一次启动或续跑生效，不需要重启 daemon。
+- 节点交给群里的 Bot 执行时（`nodeExecutor: "bot"`），只受 `global` 和 `perBot` 约束，`perCli` 不生效。
+
 ### 限制
 
 - 即兴 workflow 的节点目前只能用 **claude-code / codex / seed** 三种 CLI 的 bot；编排到其它 CLI 的 bot 会在启动时报错。
@@ -196,6 +228,6 @@ v2 模板 runtime 已下线：`/template run`、`botmux workflow ls / tail / res
 
 ## 开发 / 自测：`botmux v3 run`
 
-`botmux v3 run <dag.json> [--max-parallel <n>]` 在本地真实 ephemeral worker 池上跑一张**手写的** v3 dag.json，humanGate 走终端 y/N，**无飞书卡片**。仅用于开发 / 调试 v3 编排；正式跑即兴 workflow 请走飞书 `/workflow` + `start`。
+`botmux v3 run <dag.json> [--max-parallel <n>] [--max-per-bot <n>] [--max-per-cli <n>]` 在本地真实 ephemeral worker 池上跑一张**手写的** v3 dag.json，humanGate 走终端 y/N，**无飞书卡片**。仅用于开发 / 调试 v3 编排；正式跑即兴 workflow 请走飞书 `/workflow` + `start`。三个参数单次覆盖上面的并发配置，`--max-per-cli` 对所有 CLI 生效，会盖过 `perCliById`。
 
 > Workflow 是实验性能力，仍在演进。日常用法在飞书里 `/workflow <目标>` 即可；本页其余命令面向运维 / 排障与编排开发。
