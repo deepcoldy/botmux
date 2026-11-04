@@ -64,6 +64,32 @@ export interface LocalConversationRender {
   alreadyDeliveredSeqs: number[];
 }
 
+/** A later revision of a covered message whose platform `update_time` equals
+ * the covered revision's is a re-observation, not an edit: e.g. a bot reply
+ * recorded locally at send time and later read back through the API, where
+ * the card projection differs only in whitespace or sender name. Treat it as
+ * covered too, otherwise the session's own reply returns as fresh background.
+ * Without a known `update_time` on both sides nothing is inferred. */
+export function withReobservedRevisions(
+  messages: readonly GroupContextRenderMessage[], delivered: readonly number[],
+): number[] {
+  if (!delivered.length) return [...delivered];
+  const covered = new Set(delivered);
+  const coveredUpdates = new Map<string, Set<number>>();
+  for (const message of messages) {
+    if (!covered.has(message.seq) || message.deleted || message.updateTime === undefined) continue;
+    let times = coveredUpdates.get(message.messageId);
+    if (!times) coveredUpdates.set(message.messageId, times = new Set());
+    times.add(message.updateTime);
+  }
+  const out = [...delivered];
+  for (const message of messages) {
+    if (covered.has(message.seq) || message.deleted || message.updateTime === undefined) continue;
+    if (coveredUpdates.get(message.messageId)?.has(message.updateTime)) { out.push(message.seq); covered.add(message.seq); }
+  }
+  return out;
+}
+
 /** Render the conversation window for one turn from local records only.
  * Preparation renders once; dispatch never re-renders, it only subtracts the
  * frozen fragments of sources covered in the meantime. */
@@ -117,6 +143,7 @@ export function renderLocalConversation(
       alreadyDeliveredSeqs = deps.deliveredSeqs(request.appId, request.chatId, request.sessionId, request.epoch);
     } catch { /* An uncertain receipt repeats history instead of skipping it. */ }
   }
+  alreadyDeliveredSeqs = withReobservedRevisions(messages, alreadyDeliveredSeqs);
   // Deduplicate before coverage filtering: an older uncovered revision must
   // not revive text/resources when its latest version was already supplied.
   const latest = new Map<string, GroupContextRenderMessage>();

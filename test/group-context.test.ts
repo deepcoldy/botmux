@@ -165,6 +165,36 @@ describe('automatic group context preparation', () => {
     expect(result?.body).not.toContain('edited after native capture');
   });
 
+  it('treats a re-observed revision with the same update_time as already covered', async () => {
+    const f = fixture({
+      backfill: async () => ({ messages: [], incomplete: false }),
+      readLocal: () => ({ messages: [
+        { ...row('om_reply', 'own reply as sent', 1), senderType: 'bot' as const, updateTime: 120 },
+        { ...row('om_reply', 'own reply  as read back', 2), senderType: 'bot' as const, revision: 1, updateTime: 120, observedAt: 190 },
+        { ...row('om_edit', 'before edit', 3), updateTime: 130 },
+        { ...row('om_edit', 'after edit', 4), revision: 1, updateTime: 160, observedAt: 170 },
+      ], incomplete: false }),
+      deliveredSeqs: () => [1, 3],
+    });
+    const result = await f.prepare({ ...request, sessionId: 'session_b', epoch: 'native_one' });
+    expect(result?.body).not.toContain('own reply');
+    expect(result?.body).toContain('after edit');
+    expect(result?.includedSeqs).toEqual([4]);
+  });
+
+  it('does not infer coverage when update_time is unknown', async () => {
+    const f = fixture({
+      backfill: async () => ({ messages: [], incomplete: false }),
+      readLocal: () => ({ messages: [
+        row('om_reply', 'first record', 1),
+        { ...row('om_reply', 'second record', 2), revision: 1, observedAt: 150 },
+      ], incomplete: false }),
+      deliveredSeqs: () => [1],
+    });
+    const result = await f.prepare({ ...request, sessionId: 'session_b', epoch: 'native_one' });
+    expect(result?.includedSeqs).toEqual([2]);
+  });
+
   it('does not let an old message edited after this request introduce a future decision', async () => {
     const f = fixture({
       backfill: async () => ({ messages: [], incomplete: false }),
