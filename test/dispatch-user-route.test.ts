@@ -107,6 +107,10 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
     structuredRejectedReadyEvidenceGeneration: undefined, log: vi.fn(),
     scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
+    // These cases all run AFTER the first prompt was admitted
+    // (awaitingFirstPrompt:false below), so the cold-resume stale-turn release
+    // is inert by its first guard; stub it like the other module boundaries.
+    releaseInterruptedStructuredBridgeOnFirstPrompt: vi.fn(),
     durableTurnInFlight: false, preserveActiveTurnAuthorityForReady: false,
     releaseActiveTurnAuthority: release,
     queuedTurnAdvanceConsumedForPrompt: undefined, queuedTypeAheadTurns: [],
