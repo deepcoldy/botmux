@@ -865,6 +865,11 @@ describe('literalSendKeysArgs (tmux eats a trailing ";")', () => {
     expect(literalSendKeysArgs('p', 'B\\;')).toEqual(['send-keys', '-t', 'p', '-l', '--', 'B\\', ';', 'send-keys', '-t', 'p', '-H', '3b']);
   });
 
+  it('keeps the old argv on tmux without -H (< 3.0)', () => {
+    expect(literalSendKeysArgs('p', 'X;', { major: 2, minor: 9 })).toEqual(['send-keys', '-t', 'p', '-l', '--', 'X;']);
+    expect(literalSendKeysArgs('p', 'X;', { major: 3, minor: 0 })).toContain('-H');
+  });
+
   it('sendText and sendLines route through it', () => {
     const be = new TmuxPipeBackend('0:3.1');
     be.spawn('', [], spawnOpts());

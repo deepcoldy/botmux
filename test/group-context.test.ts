@@ -169,8 +169,8 @@ describe('automatic group context preparation', () => {
     const f = fixture({
       backfill: async () => ({ messages: [], incomplete: false }),
       readLocal: () => ({ messages: [
-        { ...row('om_reply', 'own reply as sent', 1), senderType: 'bot' as const, updateTime: 120 },
-        { ...row('om_reply', 'own reply  as read back', 2), senderType: 'bot' as const, revision: 1, updateTime: 120, observedAt: 190 },
+        { ...row('om_reply', 'own reply\n\n- as sent', 1), senderType: 'bot' as const, updateTime: 120 },
+        { ...row('om_reply', 'own reply\n- as sent', 2), senderType: 'bot' as const, revision: 1, updateTime: 120, observedAt: 190 },
         { ...row('om_edit', 'before edit', 3), updateTime: 130 },
         { ...row('om_edit', 'after edit', 4), revision: 1, updateTime: 160, observedAt: 170 },
       ], incomplete: false }),
@@ -180,6 +180,22 @@ describe('automatic group context preparation', () => {
     expect(result?.body).not.toContain('own reply');
     expect(result?.body).toContain('after edit');
     expect(result?.includedSeqs).toEqual([4]);
+  });
+
+  it('keeps a fuller body of the same platform version as unseen content', async () => {
+    const f = fixture({
+      backfill: async () => ({ messages: [], incomplete: false }),
+      readLocal: () => ({ messages: [
+        { ...row('om_card', '部署报告', 1), msgType: 'interactive', updateTime: 120 },
+        { ...row('om_card', '部署报告\n第3步失败', 2), msgType: 'interactive', revision: 1, updateTime: 120, observedAt: 190 },
+        { ...row('om_img', '日志', 3), updateTime: 130 },
+        { ...row('om_img', '日志', 4), revision: 1, updateTime: 130, observedAt: 190, resourceRefs: [{ type: 'image', key: 'img_log' }] },
+      ], incomplete: false }),
+      deliveredSeqs: () => [1, 3],
+    });
+    const result = await f.prepare({ ...request, sessionId: 'session_b', epoch: 'native_one' });
+    expect(result?.body).toContain('第3步失败');
+    expect(result?.includedSeqs).toEqual([2, 4]);
   });
 
   it('does not infer coverage when update_time is unknown', async () => {

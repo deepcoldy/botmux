@@ -64,28 +64,35 @@ export interface LocalConversationRender {
   alreadyDeliveredSeqs: number[];
 }
 
-/** A later revision of a covered message whose platform `update_time` equals
- * the covered revision's is a re-observation, not an edit: e.g. a bot reply
- * recorded locally at send time and later read back through the API, where
- * the card projection differs only in whitespace or sender name. Treat it as
- * covered too, otherwise the session's own reply returns as fresh background.
- * Without a known `update_time` on both sides nothing is inferred. */
+/** A later revision of a covered message is a re-observation, not new
+ * content, when it carries the same platform `update_time`, message type and
+ * resources and its text differs only in whitespace: e.g. a bot reply recorded
+ * locally at send time and later read back through the API as a card
+ * projection with different blank lines. Treat it as covered too, otherwise
+ * the session's own reply returns as fresh background. A same-version body
+ * that is fuller than the covered one (a degraded card fallback later
+ * resolved) is real unseen content and stays uncovered. Without a known
+ * `update_time` on both sides nothing is inferred. */
 export function withReobservedRevisions(
   messages: readonly GroupContextRenderMessage[], delivered: readonly number[],
 ): number[] {
   if (!delivered.length) return [...delivered];
   const covered = new Set(delivered);
-  const coveredUpdates = new Map<string, Set<number>>();
+  const fingerprint = (message: GroupContextRenderMessage) => JSON.stringify([
+    message.updateTime, message.msgType, message.text.replace(/\s+/g, ''),
+    (message.resourceRefs ?? []).map(ref => `${ref.type}:${ref.key ?? ''}`).sort(),
+  ]);
+  const coveredVersions = new Map<string, Set<string>>();
   for (const message of messages) {
     if (!covered.has(message.seq) || message.deleted || message.updateTime === undefined) continue;
-    let times = coveredUpdates.get(message.messageId);
-    if (!times) coveredUpdates.set(message.messageId, times = new Set());
-    times.add(message.updateTime);
+    let versions = coveredVersions.get(message.messageId);
+    if (!versions) coveredVersions.set(message.messageId, versions = new Set());
+    versions.add(fingerprint(message));
   }
   const out = [...delivered];
   for (const message of messages) {
     if (covered.has(message.seq) || message.deleted || message.updateTime === undefined) continue;
-    if (coveredUpdates.get(message.messageId)?.has(message.updateTime)) { out.push(message.seq); covered.add(message.seq); }
+    if (coveredVersions.get(message.messageId)?.has(fingerprint(message))) { out.push(message.seq); covered.add(message.seq); }
   }
   return out;
 }
