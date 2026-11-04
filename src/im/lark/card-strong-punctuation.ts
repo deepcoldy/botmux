@@ -28,7 +28,13 @@ const { isWhiteSpace, isPunctChar, isMdAsciiPunct } = md.utils;
  * whose meaning depends on their position (escapes, emphasis, code, links,
  * `<font>`/`<at>` tags, strikethrough, table pipes, entities). */
 const UNMOVABLE = new Set(['\\', '*', '_', '`', '[', ']', '<', '>', '|', '~', '&']);
-const MAX_ATTEMPTS = 64;
+/** How many rewrites are verified per probe parse in the fallback path. A
+ * candidate that cannot pair as predicted (bold inside link text, a stray
+ * trailing run) makes the whole-document gate fail; verifying in chunks keeps
+ * the cost proportional to the number of bad candidates instead of to the
+ * reply length, and — unlike a per-candidate budget — does not abandon the
+ * candidates in the tail of a long reply. */
+const FALLBACK_CHUNK = 32;
 
 type CharClass = 'space' | 'punct' | 'other';
 
@@ -127,6 +133,16 @@ function strongRuns(line: string): number[] {
   return runs;
 }
 
+function insideInlineLink(line: string, start: number, end: number): boolean {
+  for (let open = line.indexOf('['); open >= 0 && open < end; open = line.indexOf('[', open + 1)) {
+    const closeBracket = line.indexOf(']', open + 1);
+    if (closeBracket < 0) break;
+    if (line[closeBracket + 1] !== '(') continue;
+    if (start > open && end <= closeBracket) return true;
+  }
+  return false;
+}
+
 function lineCandidates(line: string, lineStart: number, ranges: readonly MarkdownLiteralRange[]): Candidate[] {
   const candidates: Candidate[] = [];
   const runs = strongRuns(line);
@@ -139,6 +155,7 @@ function lineCandidates(line: string, lineStart: number, ranges: readonly Markdo
     // is fine (`**用 `bun`：**`), the moved punctuation sits next to them.
     if (insideLiteral(ranges, lineStart + open, lineStart + open + 2)
       || insideLiteral(ranges, lineStart + close, lineStart + close + 2)) continue;
+    if (insideInlineLink(line, open, close + 2)) continue;
     // Bare URLs may be autolinked by Feishu; their bytes are not prose.
     const word = line.slice(0, close).split(/\s/).at(-1) ?? '';
     if (/:\/\/|www\./i.test(word)) continue;
@@ -202,16 +219,25 @@ export function repairCardStrongPunctuation(input: string): string {
   if (improvedBy(baseline, metrics(batched), candidates.length)) return batched;
 
   // Some rewrite did not pair as expected (nesting across lines, link text,
-  // unusual delimiter interplay). Fall back to one verified rewrite at a time.
+  // unusual delimiter interplay). Fall back to verifying chunks, degrading the
+  // offending chunk to one rewrite at a time.
   let output = input;
   let current = baseline;
-  for (const candidate of candidates.slice(0, MAX_ATTEMPTS)) {
-    if (output.slice(candidate.start, candidate.start + candidate.before.length) !== candidate.before) continue;
-    const next = apply(output, [candidate]);
+  for (let index = 0; index < candidates.length; index += FALLBACK_CHUNK) {
+    const chunk = candidates.slice(index, index + FALLBACK_CHUNK)
+      .filter(candidate => output.slice(candidate.start, candidate.start + candidate.before.length) === candidate.before);
+    if (!chunk.length) continue;
+    const next = apply(output, chunk);
     const nextMetrics = metrics(next);
-    if (!improvedBy(current, nextMetrics, 1)) continue;
-    output = next;
-    current = nextMetrics;
+    if (improvedBy(current, nextMetrics, chunk.length)) { output = next; current = nextMetrics; continue; }
+    for (const candidate of chunk) {
+      if (output.slice(candidate.start, candidate.start + candidate.before.length) !== candidate.before) continue;
+      const single = apply(output, [candidate]);
+      const singleMetrics = metrics(single);
+      if (!improvedBy(current, singleMetrics, 1)) continue;
+      output = single;
+      current = singleMetrics;
+    }
   }
   return output;
 }

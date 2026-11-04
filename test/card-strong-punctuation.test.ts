@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import MarkdownIt from 'markdown-it';
+import type Token from 'markdown-it/lib/token.mjs';
 import { repairCardStrongPunctuation } from '../src/im/lark/card-strong-punctuation.js';
 import { buildCanonicalFinalReplyCard, buildCardBodyElements } from '../src/im/lark/md-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
@@ -12,8 +13,19 @@ function strongTexts(text: string): string[] {
   return [...html.matchAll(/<strong>(.*?)<\/strong>/g)].map(match => match[1]!);
 }
 
+/** Visible prose from the token stream, so the assertion never has to re-strip
+ *  rendered HTML with a tag regex. */
 function visibleText(text: string): string {
-  return md.render(text).replace(/<[^>]+>/g, '');
+  let out = '';
+  const walk = (tokens: readonly Token[]): void => {
+    for (const token of tokens) {
+      if (token.children) walk(token.children);
+      else if (token.type === 'text' || token.type === 'code_inline') out += token.content;
+      else if (token.type === 'softbreak' || token.type === 'hardbreak') out += '\n';
+    }
+  };
+  walk(md.parse(text, {}));
+  return out;
 }
 
 describe('repairCardStrongPunctuation: pairs CommonMark would reject', () => {
@@ -66,6 +78,22 @@ describe('repairCardStrongPunctuation: pairs CommonMark would reject', () => {
 
   it('keeps a following already-valid pair on the same line intact', () => {
     expect(repairCardStrongPunctuation('**a：**b **c**')).toBe('**a**：b **c**');
+  });
+
+  it('still repairs the tail of a long reply when one candidate cannot pair', () => {
+    // `[**文档：**说明](url)` can never be accepted — pairing it would create a
+    // strong span *inside* a link, which the gate rejects — so the batch attempt
+    // fails for the whole reply and everything goes through the fallback. That
+    // one candidate must not stop the labels after it from being repaired.
+    const input = ['详见 [**文档：**说明](https://example.com/doc)。', '',
+      ...Array.from({ length: 100 }, (_, i) => `- **要点${i}：**说明文字`)].join('\n');
+    const repaired = repairCardStrongPunctuation(input);
+    expect(repaired).toContain('**要点99**：说明文字');
+    expect(repaired).not.toContain('：**说明文字');
+    // The unrepairable candidate itself keeps the author's bytes.
+    expect(repaired).toContain('[**文档：**说明](https://example.com/doc)');
+    // Repaired output is stable: a second pass must not find more work.
+    expect(repairCardStrongPunctuation(repaired)).toBe(repaired);
   });
 });
 
