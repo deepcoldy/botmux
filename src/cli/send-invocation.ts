@@ -271,20 +271,22 @@ export function parseSendInvocation(argv: string[]): SendInvocation {
 function looksLikePathToken(token: string): boolean {
   const value = token.trim();
   if (!value) return false;
-  // URL before the path prefixes: `https://x/y.md` is not a local path.
-  if (value.includes('://')) return false;
+  const hasCommonExt = /\.(?:sql|csv|tsv|jsonl?|md|txt|log|ya?ml|toml|ini|png|jpe?g|gif|webp|bmp|svg|pdf|zip|tar|gz|tgz|bz2|xz|mp4|mov|avi|webm|m4v|xlsx?|docx?|pptx?|html?|sh|py|ts|js|go|rs|java|c|cc|cpp|h)$/i.test(value);
+  const prose = /[\s\u3000-\u9fff\uff00-\uffef]/.test(value) || value.includes('://');
+  const explicitPrefix = value.startsWith('/')
+    || value.startsWith('./')
+    || value.startsWith('../')
+    || value.startsWith('~/')
+    || /^[A-Za-z]:[\\/]/.test(value)
+    || value.startsWith('\\\\');
   if (value === '.' || value === '..') return true;
-  // Strong path prefixes win over the prose guards below: a real path may
-  // contain spaces or CJK (`/tmp/my report.sql`, `./报告.sql`, `C:\my dir\x.sql`,
-  // `\\srv\share\x.sql`). Prose that merely *mentions* a path
-  // (`详见 ./out.sql 第 3 行`) does not START with one and still falls through.
-  if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../') || value.startsWith('~/')) return true;
-  if (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\')) return true;
-  // Remaining tokens with whitespace/CJK/full-width punctuation are prose, not
-  // a mistyped attachment path. This keeps `see report.sql` as body while the
-  // explicit-prefix cases above are already rejected.
-  if (/[\s\u3000-\u9fff\uff00-\uffef]/.test(value)) return false;
-  return /\.(?:sql|csv|tsv|jsonl?|md|txt|log|ya?ml|toml|ini|png|jpe?g|gif|webp|bmp|svg|pdf|zip|tar|gz|tgz|bz2|xz|mp4|mov|avi|webm|m4v|xlsx?|docx?|pptx?|html?|sh|py|ts|js|go|rs|java|c|cc|cpp|h)$/i.test(value);
+  // An explicit prefix proves path shape, but a normal sentence can also start
+  // with one (`/help 是命令`, `./build.sh 跑过了`). Keep those as prose unless
+  // the token also carries a file extension; the explicit-prefix + extension
+  // case is exactly the missing/spaced path this guard must reject.
+  if (explicitPrefix) return !prose || hasCommonExt;
+  if (prose) return false;
+  return hasCommonExt;
 }
 
 function findClientRiffPlaceholder(invocation: SendInvocation): string | undefined {

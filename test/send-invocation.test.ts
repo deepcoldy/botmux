@@ -110,6 +110,11 @@ describe('validateClientSendInvocation', () => {
     expect(client(['--files', 'a', '\\\\srv\\my share\\x.sql'], ['a'])).toMatchObject({ ok: false });
     expect(client(['--files', 'a', '详见 ./out.sql 第 3 行'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'see report.sql'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', '/help 是命令'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', './build.sh 跑过了'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', '~/ 是 home 目录'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', 'C:\\ 是系统盘'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', '\\srv 是共享根'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', '见 https://x.y/z.md'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', '结论：a/b 两种方案'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'https://x.y/z.md'], ['a'])).toMatchObject({ ok: true });
