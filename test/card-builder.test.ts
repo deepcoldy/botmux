@@ -1896,6 +1896,29 @@ describe('buildStreamingCard', () => {
     });
   });
 
+  // #2062: the idempotent display target exists only for the primary
+  // multi-replica control lane; single-replica cards keep the old payload
+  // (byte-for-byte, see card-builder-wire-golden).
+  describe('display toggle target mode', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+    const toggleValue = (mode: 'hidden' | 'screenshot') => findActions(
+      parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, mode)),
+    ).find((a: any) => a.value?.action === 'toggle_display').value;
+
+    it('carries the visible target in primary coordination mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+      expect(toggleValue('hidden').target_display_mode).toBe('screenshot');
+      expect(toggleValue('screenshot').target_display_mode).toBe('hidden');
+    });
+
+    it('omits it outside primary mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'disabled');
+      expect(toggleValue('hidden')).not.toHaveProperty('target_display_mode');
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', '');
+      expect(toggleValue('screenshot')).not.toHaveProperty('target_display_mode');
+    });
+  });
+
   // ── Action buttons ─────────────────────────────────────────────────────
 
   describe('action buttons', () => {

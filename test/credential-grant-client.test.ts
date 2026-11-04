@@ -4,7 +4,9 @@
  *
  * Run:  npx vitest run --project unit test/credential-grant-client.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { createServer, type Server, type ServerResponse } from 'node:http';
+import type { Socket } from 'node:net';
 import {
   requestCredentialGrant,
   platformCredentialsUrl,
@@ -162,8 +164,176 @@ describe('requestCredentialGrant', () => {
   });
 
   it('turns a thrown transport error into network, not an exception', async () => {
-    const { http } = fakeHttp([new Error('ECONNREFUSED')]);
+    const { calls, http } = fakeHttp([new Error('ECONNREFUSED'), new Error('ECONNREFUSED')]);
     const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
-    expect(r).toEqual({ ok: false, reason: 'network', error: 'ECONNREFUSED' });
+    expect(r).toEqual({ ok: false, reason: 'network', error: 'ECONNREFUSED (after retry)' });
+    expect(calls).toHaveLength(2);
+  });
+});
+
+const GRANT_200 = { status: 200, json: {
+  ok: true, tool: 'lark-cli', unionId: 'on_alice', expiresAt: future(),
+  variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'u-at' },
+} };
+
+describe('requestCredentialGrant transport failures', () => {
+  it('retries once on a new connection after a reset, and every attempt asks for its own connection', async () => {
+    const { calls, http } = fakeHttp([Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), GRANT_200]);
+    const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect(r.ok).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls.every(c => c.opts.freshConnection === true)).toBe(true);
+    expect(calls[1]!.body).toEqual(calls[0]!.body);
+  });
+
+  it.each([
+    [403, { error: 'forbidden' }, 'forbidden'],
+    [403, { error: 'not_teammate' }, 'not_teammate'],
+    [404, { error: 'credential_not_found' }, 'not_authorized'],
+    [503, { error: 'store_unavailable' }, 'unavailable'],
+    [429, { error: 'rate_limited' }, 'rate_limited'],
+  ])('an HTTP %s answer is the platform\'s verdict and is not retried', async (status, json, reason) => {
+    const { calls, http } = fakeHttp([{ status, json }, GRANT_200]);
+    const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect(!r.ok && r.reason).toBe(reason);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('caps the whole call, retry included, at the total budget even when the transport never settles', async () => {
+    const calls: number[] = [];
+    const http = { post: (_u: string, _b: unknown, opts: any) => { calls.push(opts.timeoutMs); return new Promise<never>(() => {}); } };
+    const t0 = Date.now();
+    const r = await requestCredentialGrant(REQ, { binding: BINDING, http: http as any, timeoutMs: 200, totalBudgetMs: 1_400 });
+    const elapsed = Date.now() - t0;
+    expect(!r.ok && r.reason).toBe('network');
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toBe(200);
+    expect(calls[0]! + calls[1]!).toBeLessThanOrEqual(1_400);
+    expect(elapsed).toBeLessThan(1_400 + 300);
+  });
+
+  // A transport may throw BEFORE returning its promise: `postJson` parses the
+  // URL and serializes the body ahead of its own `new Promise`, so a malformed
+  // binding (`platform.json` hand-edited or from an older build) throws
+  // synchronously. The retry itself was never the defect — the throw reaches
+  // the attempt's catch either way, so `calls` is 2 before and after the fix;
+  // that assertion is documentary. What the fix buys is the second half: with
+  // `run` raced directly, the race is never built, so the attempt's timeout
+  // promise has no consumer and its timer fires as an unhandledRejection. The
+  // unhandledRejection check below is the guard that actually bites.
+  it.each([
+    ['through the real postJson with an unusable platform URL', undefined],
+    ['through an injected transport that throws synchronously', 'sync'],
+  ] as const)('leaves no unhandled timeout rejection when the transport throws synchronously %s', async (_label, mode) => {
+    const unhandled: string[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason instanceof Error ? reason.message : String(reason)); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      let calls = 0;
+      const http = mode === 'sync'
+        ? { post: (() => { calls++; throw new Error('sync-throw'); }) as any }
+        : undefined;
+      const binding = mode === 'sync'
+        ? { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }
+        : { platformUrl: 'not-a-url', machineToken: 'mt', machineId: 'm-1' };
+      const r = await requestCredentialGrant(REQ, { binding, ...(http ? { http } : {}), timeoutMs: 200, totalBudgetMs: 3_000 });
+      expect(!r.ok && r.reason).toBe('network');
+      // Documentary: the retry happens with or without the fix (the throw is
+      // caught by the attempt loop). The unhandledRejection assertion is the guard.
+      if (http) expect(calls).toBe(2);
+      // Give the abandoned attempt's timer a chance to fire (timeoutMs is 200).
+      await new Promise(resolve => setTimeout(resolve, 500));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  }, 10_000);
+});
+
+describe('requestCredentialGrant against a real server (postJson transport)', () => {
+  const servers: Server[] = [];
+  const sockets = new Set<Socket>();
+  afterEach(async () => {
+    for (const s of sockets) s.destroy();
+    sockets.clear();
+    await Promise.all(servers.splice(0).map(s => new Promise(r => s.close(r))));
+  });
+
+  async function platform(handler: (n: number, res: ServerResponse, remotePort: number) => void) {
+    let n = 0;
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => handler(++n, res, req.socket.remotePort ?? 0));
+    });
+    server.on('connection', s => { sockets.add(s); s.on('close', () => sockets.delete(s)); });
+    server.keepAliveTimeout = 60_000;
+    servers.push(server);
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as { port: number }).port;
+    return { platformUrl: `http://127.0.0.1:${port}`, machineToken: 'mt', machineId: 'm-1' };
+  }
+  const answer = (res: ServerResponse) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(GRANT_200.json));
+  };
+
+  it('first request gets no response at all, the retry on a new connection succeeds', async () => {
+    const ports: number[] = [];
+    const binding = await platform((n, res, port) => {
+      ports.push(port);
+      if (n === 1) return; // silent: never answers
+      answer(res);
+    });
+    const t0 = Date.now();
+    const r = await requestCredentialGrant(REQ, { binding, timeoutMs: 300, totalBudgetMs: 2_000 });
+    expect(r.ok).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(ports).toHaveLength(2);
+    expect(ports[1]).not.toBe(ports[0]);
+  });
+
+  it('does not ride the previous grant\'s keep-alive connection', async () => {
+    const ports: number[] = [];
+    const binding = await platform((_n, res, port) => { ports.push(port); answer(res); });
+    expect((await requestCredentialGrant(REQ, { binding })).ok).toBe(true);
+    expect((await requestCredentialGrant(REQ, { binding })).ok).toBe(true);
+    expect(ports).toHaveLength(2);
+    expect(ports[1]).not.toBe(ports[0]);
+  });
+
+  it('a peer that trickles bytes is cut at the hard timeout: the first request does not linger', async () => {
+    const closedAt: number[] = [];
+    let first: ServerResponse | undefined;
+    const binding = await platform((n, res) => {
+      if (n === 1) {
+        first = res;
+        res.socket?.on('close', () => closedAt.push(Date.now()));
+        res.writeHead(200, { 'content-type': 'application/json' });
+        const tick = setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write(' '); else clearInterval(tick); }, 50);
+        res.on('close', () => clearInterval(tick));
+        return;
+      }
+      answer(res);
+    });
+    const t0 = Date.now();
+    const r = await requestCredentialGrant(REQ, { binding, timeoutMs: 300, totalBudgetMs: 2_000 });
+    expect(r.ok).toBe(true);
+    // Idle timeout alone never fires on a trickle; the abort must have closed it.
+    await new Promise(res => setTimeout(res, 100));
+    expect(first).toBeDefined();
+    expect(closedAt).toHaveLength(1);
+    expect(closedAt[0]! - t0).toBeLessThan(1_000);
+  });
+
+  it('a real 403 is returned after one request', async () => {
+    let hits = 0;
+    const binding = await platform((_n, res) => {
+      hits++;
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'machine_ownership_mismatch' }));
+    });
+    const r = await requestCredentialGrant(REQ, { binding });
+    expect(!r.ok && r.reason).toBe('forbidden');
+    expect(hits).toBe(1);
   });
 });

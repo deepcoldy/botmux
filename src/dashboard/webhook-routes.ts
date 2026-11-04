@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { getConnector, listConnectors, type ConnectorDefinition } from '../services/connector-store.js';
+import { connectorPayloadTrustBlocker, getConnector, listConnectors, type ConnectorDefinition } from '../services/connector-store.js';
 import { getWebhookSecret } from '../services/webhook-key.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import {
@@ -39,6 +39,17 @@ import { dispatchTriggerRequest, newTriggerId, queryTriggerResult, type TriggerA
 const replayNonces = new Map<string, number>();
 const rateBuckets = new Map<string, { windowStart: number; count: number }>();
 let lastRetentionPruneAt = 0;
+
+
+/** `payloadTrusted` for a turn this connector fires. Re-checks the
+ *  verification precondition at dispatch (not only at save) so a hand-edited
+ *  store cannot trust bytes from an unverified connector; workflow targets
+ *  never render through the turn prompt and stay untrusted. */
+export function payloadTrustFields(connector: ConnectorDefinition): { payloadTrusted?: true } {
+  if (connector.promptEnvelope.trustPayload !== true || connector.target.kind !== 'turn') return {};
+  if (connectorPayloadTrustBlocker(connector, !!getWebhookSecret(connector.verify.secretRef))) return {};
+  return { payloadTrusted: true };
+}
 
 function pruneExpiredWebhookLogs(): void {
   const now = Date.now();
@@ -868,6 +879,7 @@ async function handleWebhookRouteImpl(
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
       ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      ...payloadTrustFields(connector),
       ...(presentation ? { presentation } : {}),
       options: { ...responseOptions, ...(durableKey ? { idempotencyKey: durableKey } : {}) },
     };
@@ -1007,6 +1019,7 @@ async function handleWebhookRouteImpl(
         ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
       },
       ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+      ...payloadTrustFields(connector),
       ...(presentation ? { presentation } : {}),
       options: {
         ...(dedupKey ? { dedupKey } : {}),
@@ -1062,6 +1075,7 @@ async function handleWebhookRouteImpl(
       ...(connector.promptEnvelope.includeRawText ? { rawText: parsed.rawText } : {}),
     },
     ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
+    ...payloadTrustFields(connector),
     ...(presentation ? { presentation } : {}),
     options: {
       ...responseOptions,

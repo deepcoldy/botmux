@@ -591,6 +591,8 @@ import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
 import {
   appendDurablePrimaryInputCommit,
   durablePrimaryExistingTurnDisposition,
+  durablePrimaryLiveWorkerProgressToken,
+  durablePrimaryRejectedLiveSendDisposition,
 } from './services/durable-primary-turn-admission.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
@@ -25437,10 +25439,18 @@ function hasDurablePrimaryInputCommit(ds: DaemonSession, turnId: string): boolea
   return ds.session.durablePrimaryInputCommits?.some(item => item.turnId === turnId) === true;
 }
 
-function retryDurablePrimaryIngress(ctx: RoutingContext, reason: string): boolean {
+function retryDurablePrimaryIngress(
+  ctx: RoutingContext,
+  reason: string,
+  /** Identity of the state this retry waits on; see
+   *  DurableInboxPrimaryDispatchResult.progressToken. Omit for wait-states. */
+  progressToken?: string,
+): boolean {
   if (!ctx.durablePrimaryDispatch) return false;
   ctx.ingressAdmission ??= { admitted: false };
   ctx.ingressAdmission.retryReason = reason;
+  if (progressToken) ctx.ingressAdmission.retryProgressToken = progressToken;
+  else delete ctx.ingressAdmission.retryProgressToken;
   return true;
 }
 
@@ -29911,7 +29921,20 @@ async function handleThreadReplyAdmitted(
           }
         }
       }
-      else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
+      else {
+        logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
+        if (durablePrimaryRejectedLiveSendDisposition(!!ctx.durablePrimaryDispatch) === 'retry') {
+          // A refusal by the same worker generation will not heal by itself:
+          // the token lets the Inbox stop after a few unchanged retries instead
+          // of blocking this chat's FIFO forever (#2062 F7). A respawned or
+          // replaced worker carries a new token and gets a fresh budget.
+          retryDurablePrimaryIngress(
+            ctx,
+            'live worker did not accept input',
+            durablePrimaryLiveWorkerProgressToken(ds),
+          );
+        }
+      }
     } finally {
       if (!accepted) rollbackXpiSharedCwdAdmission(ds, xpiAdmission, parsed.messageId);
       // The opening is one-shot: give it back when the worker died / refused,
@@ -30650,7 +30673,14 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       }
       ctx.ingressAdmission ??= { admitted: false };
       ctx.ingressAdmission.admitted ||= taskCtx.ingressAdmission?.admitted === true;
-      if (taskCtx.ingressAdmission?.retryReason) ctx.ingressAdmission.retryReason = taskCtx.ingressAdmission.retryReason;
+      if (taskCtx.ingressAdmission?.retryReason) {
+        ctx.ingressAdmission.retryReason = taskCtx.ingressAdmission.retryReason;
+        if (taskCtx.ingressAdmission.retryProgressToken) {
+          ctx.ingressAdmission.retryProgressToken = taskCtx.ingressAdmission.retryProgressToken;
+        } else {
+          delete ctx.ingressAdmission.retryProgressToken;
+        }
+      }
       // Post-admission persistence/notification failures must never invite a
       // retry of an input already owned by a worker or a durable FIFO.
       return taskCtx.ingressAdmission?.admitted === true || !!taskCtx.ingressAdmission?.retryReason;
@@ -33947,6 +33977,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               cardVisibility: 'public',
             }),
             resumeSession: sessionId => resumeSession(sessionId, activeSessions),
+            handlePresentationControl: data => botEventHandlers.handleCardAction(
+              data,
+              cfg.larkAppId,
+            ),
             isResumeReady: ds => !!ds.worker && !ds.worker.killed && ds.workerReady === true,
             buildClosedCard: ds => buildClosedSessionCard(ds, localeForBot(cfg.larkAppId)),
             buildActiveCard: ds => buildStreamingCardJson(
