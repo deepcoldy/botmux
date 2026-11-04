@@ -91,6 +91,12 @@ describe('send --dry-run', () => {
     expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({ tag: 'markdown', content: 'REAL BODY' });
   });
 
+  it('reads stdin for a lone dash even when attachment flags are present', () => {
+    const result = run(['send', '--dry-run', '--no-mention', '--images', '/tmp/not-used.png', '-'], undefined, 'REAL BODY');
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({ tag: 'markdown', content: 'REAL BODY' });
+  });
+
   it('rejects a dash mixed with other body tokens', () => {
     const result = run(['send', '--dry-run', '--no-mention', '-', 'extra'], undefined, 'REAL BODY');
     expect(result.status).toBe(2);
