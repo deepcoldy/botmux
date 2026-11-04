@@ -3,10 +3,12 @@ import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { SkillFeedbackStore } from './skill-feedback-store.js';
 import { FeedbackAnalyticsService } from './feedback-analytics.js';
-import { readFeedbackStorageConfig, readFeedbackStorageSecret } from './feedback-storage-config.js';
-import { openPostgresFeedbackStore } from './feedback-postgres-store.js';
-import { openPostgresFeedbackAnalytics } from './feedback-postgres-analytics.js';
+import { readFeedbackStorageConfig, readFeedbackStorageSecret, readPostgresCredential } from './feedback-storage-config.js';
 import type { FeedbackAnalytics, FeedbackStore, FeedbackStorageConfig } from './feedback-storage-types.js';
+// The PostgreSQL-backed modules value-import `pg`. They are loaded lazily
+// inside openStorage's postgresql branch so this selector — used by every
+// SQLite write and by daemon/dashboard startup — works in installs where the
+// optional pg dependency is absent.
 
 export interface FeedbackStorage {
   store: FeedbackStore;
@@ -30,8 +32,12 @@ function serialized<Result>(key: string, operation: () => Promise<Result>): Prom
 async function openStorage(dataDir: string, config: FeedbackStorageConfig): Promise<FeedbackStorage> {
   if (config.active.backend === 'postgresql') {
     const target = config.active.postgres;
-    const password = await readFeedbackStorageSecret(dataDir, target.passwordRef);
+    const password = await readPostgresCredential(dataDir, target);
     const ca = target.tls.caRef ? await readFeedbackStorageSecret(dataDir, target.tls.caRef) : undefined;
+    const [{ openPostgresFeedbackStore }, { openPostgresFeedbackAnalytics }] = await Promise.all([
+      import('./feedback-postgres-store.js'),
+      import('./feedback-postgres-analytics.js'),
+    ]);
     const store = await openPostgresFeedbackStore(target, password, config.instanceId, ca);
     try {
       const analytics = await openPostgresFeedbackAnalytics(target, password, ca);
