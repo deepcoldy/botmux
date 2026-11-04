@@ -1,19 +1,92 @@
-import { Pool, type PoolClient } from 'pg';
+import { Pool, Client, type PoolClient, type ClientConfig } from 'pg';
 import type { PostgresTarget } from './feedback-storage-types.js';
+import { userInfo } from 'node:os';
+import type { PostgresCredential, DynamicToken } from './feedback-doas-token.js';
 // Re-export for the PostgreSQL/migration path. SQLite-only hot paths must
 // import FEEDBACK_TABLES from ./feedback-tables.js instead, since importing
 // this module pulls in `pg` at module load time.
 export { FEEDBACK_TABLES } from './feedback-tables.js';
 
-export function feedbackPostgresPool(target: PostgresTarget, password: string, ca?: string): Pool {
+export function feedbackPostgresPool(target: PostgresTarget, password: PostgresCredential, ca?: string): Pool {
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(target.schema)) throw new Error('feedback_storage_schema_invalid');
   if (target.tls.caRef && !ca) throw new Error('feedback_storage_ca_missing');
+  const tokenMode = target.bytepg;
+  if (tokenMode && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(tokenMode.computeId)) throw new Error('feedback_bytepg_credentials_invalid');
+  if (!tokenMode && typeof password !== 'string') throw new Error('feedback_storage_auth_invalid');
+  const validateToken = (value: string) => {
+    if (!value || value.length > 65536 || /[\0\r\n]/.test(value)) throw new Error('feedback_bytepg_credentials_invalid');
+    return value.replace(/\\/g, '\\\\').replace(/\s/g, character => `\\${character}`);
+  };
+  const options = `-c search_path=${target.schema},pg_catalog`;
+  let credential: DynamicToken = { value: typeof password === 'string' ? password : '', generation: 0 };
+  if (tokenMode && typeof password === 'string') validateToken(password);
+  const rejectedGeneration = Symbol('bytepgRejectedGeneration');
+  let effectiveUser = target.user;
+  if (tokenMode && !effectiveUser) {
+    effectiveUser = process.env.PGUSER || process.env.USER || process.env.USERNAME;
+    if (!effectiveUser) {
+      try { effectiveUser = userInfo().username; }
+      catch { throw new Error('feedback_bytepg_user_required'); }
+    }
+    if (!effectiveUser) throw new Error('feedback_bytepg_user_required');
+  }
+  class BytePgClient extends Client {
+    constructor(config?: ClientConfig) {
+      super(config);
+      const current = credential;
+      const wireOptions = `bytepg_compute_id=${tokenMode!.computeId} bytepg_auth_token=${validateToken(current.value)} ${options}`;
+      const sanitize = (value: unknown): Error => {
+        const error = new Error('feedback_bytepg_connection_or_query_failed');
+        const code = (value as { code?: unknown } | undefined)?.code;
+        if (code === '28000' || code === '28P01') {
+          Object.defineProperty(error, rejectedGeneration, { value: current.generation });
+        }
+        return error;
+      };
+      const parameters = (this as unknown as { connectionParameters: Record<string, unknown> }).connectionParameters;
+      Object.defineProperty(parameters, 'options', { configurable: true, enumerable: false, get: () => wireOptions });
+      const connection = (this as unknown as { connection: { on: (...args: any[]) => unknown; emit: (...args: any[]) => boolean } }).connection;
+      const emit = connection.emit.bind(connection);
+      connection.emit = (event: string, ...args: unknown[]) => {
+        if (event === 'message') {
+          const value = args[0] as { name?: string; length?: number } | undefined;
+          if (value?.name === 'error' || value?.name === 'notice') {
+            return emit(event, Object.assign(sanitize(value), { name: value.name, length: value.length }));
+          }
+        }
+        if (event === 'error' || event === 'errorMessage' || event === 'notice') return emit(event, sanitize(args[0]));
+        return emit(event, ...args);
+      };
+    }
+  }
   const pool = new Pool({
-    host: target.host, port: target.port, database: target.database, user: target.user, password,
+    host: target.host, port: target.port, database: target.database, user: effectiveUser,
+    password: tokenMode ? () => '' : password as string,
     ssl: target.tls.mode === 'disable' ? false : { rejectUnauthorized: true, ...(ca ? { ca } : {}) },
     connectionTimeoutMillis: target.connectTimeoutMs, idleTimeoutMillis: 10000, max: 5,
-    statement_timeout: 30000, options: `-c search_path=${target.schema},pg_catalog`,
+    statement_timeout: 30000, options,
+    ...(tokenMode ? { Client: BytePgClient } : {}),
   });
+  if (tokenMode && typeof password !== 'string') {
+    const originalConnect = pool.connect.bind(pool);
+    const connect = async (): Promise<PoolClient> => {
+      credential = await password.get();
+      validateToken(credential.value);
+      try { return await originalConnect(); }
+      catch (error) {
+        const generation = (error as { [rejectedGeneration]?: number })[rejectedGeneration];
+        if (generation === undefined) throw error;
+        credential = await password.refresh(generation);
+        validateToken(credential.value);
+        return originalConnect();
+      }
+    };
+    pool.connect = ((callback?: (error: Error | undefined, client: PoolClient | undefined, release: (error?: Error | boolean) => void) => void) => {
+      if (!callback) return connect();
+      void connect().then(client => callback(undefined, client, client.release.bind(client)),
+        error => callback(error, undefined, () => {}));
+    }) as Pool['connect'];
+  }
   pool.on('error', () => {
     process.stderr.write('[feedback] PostgreSQL idle connection lost; reconnecting on next operation\n');
   });

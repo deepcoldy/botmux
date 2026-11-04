@@ -5,6 +5,17 @@ type DashboardMessages = Record<string, string>;
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
 const zh = {
+  'feedback.storage.tokenSource': 'Token 来源',
+  'feedback.storage.staticToken': '静态 Token / 引用',
+  'feedback.storage.doasToken': 'doas 动态获取',
+  'feedback.storage.doasEnvironment': 'doas 环境',
+  'feedback.storage.doasHelp': '专用缓存隔离。仅建连认证失败时清理并重新获取一次，不重放 SQL。需要宿主已安装 doas 并具备非交互授权。',
+  'feedback.storage.authentication': '认证方式',
+  'feedback.storage.passwordAuth': '用户名 / 密码',
+  'feedback.storage.bytepgAuth': 'BytePG Token',
+  'feedback.storage.computeId': 'BytePG Compute ID',
+  'feedback.storage.token': '认证 Token',
+  'feedback.storage.keepToken': '留空保留已保存 Token；不回显',
   'feedback.storage.recovery': '人工恢复与裁决',
   'feedback.storage.recoveryHelp': '取消仅恢复尚未退役的 SQLite，不删除 PG 数据。裁决前核对目标端事件/幂等键和发送记录；裁决不触发重发，也不撤销维护窗口。请勿填写密码或令牌。',
   'feedback.storage.reason': '操作原因',
@@ -4148,6 +4159,17 @@ const zh = {
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
+  'feedback.storage.tokenSource': 'Token source',
+  'feedback.storage.staticToken': 'Static token / reference',
+  'feedback.storage.doasToken': 'Dynamic doas',
+  'feedback.storage.doasEnvironment': 'doas environment',
+  'feedback.storage.doasHelp': 'Uses an isolated cache. Cleans and fetches once only after handshake authentication failure; never replays SQL. Requires installed doas and noninteractive authorization.',
+  'feedback.storage.authentication': 'Authentication',
+  'feedback.storage.passwordAuth': 'Username / password',
+  'feedback.storage.bytepgAuth': 'BytePG token',
+  'feedback.storage.computeId': 'BytePG compute ID',
+  'feedback.storage.token': 'Authentication token',
+  'feedback.storage.keepToken': 'Leave blank to keep saved token; never displayed',
   'feedback.storage.recovery': 'Manual recovery and resolution',
   'feedback.storage.recoveryHelp': 'Cancel restores only a non-retired SQLite source and never deletes PostgreSQL data. Verify destination event/idempotency keys and send receipts before acknowledging. Acknowledgement never resends or ends maintenance. Do not enter passwords or tokens.',
   'feedback.storage.reason': 'Reason',

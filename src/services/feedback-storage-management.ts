@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { readFeedbackStorageConfig, saveFeedbackStorageCandidate, putFeedbackStorageSecret, readFeedbackStorageSecret, activateFeedbackStorageCandidate } from './feedback-storage-config.js';
+import { readFeedbackStorageConfig, saveFeedbackStorageCandidate, putFeedbackStorageSecret, readFeedbackStorageSecret, readPostgresCredential, activateFeedbackStorageCandidate } from './feedback-storage-config.js';
 import type { FeedbackStorageConfig, FeedbackStorageTarget } from './feedback-storage-types.js';
 import { FEEDBACK_TABLES } from './feedback-tables.js';
 import { SkillFeedbackStore } from './skill-feedback-store.js';
@@ -18,7 +18,9 @@ export function feedbackStorageView(config: FeedbackStorageConfig) {
     backend: target.backend,
     postgres: { host: target.postgres.host, port: target.postgres.port, database: target.postgres.database,
       user: target.postgres.user, schema: target.postgres.schema, tls: { mode: target.postgres.tls.mode, hasCa: !!target.postgres.tls.caRef },
-      connectTimeoutMs: target.postgres.connectTimeoutMs, hasPassword: !!target.postgres.passwordRef },
+      connectTimeoutMs: target.postgres.connectTimeoutMs, hasPassword: !!target.postgres.passwordRef,
+      ...(target.postgres.bytepg ? { bytepg: { computeId: target.postgres.bytepg.computeId, hasToken: !!target.postgres.bytepg.tokenRef,
+        ...(target.postgres.bytepg.doas ? { doas: target.postgres.bytepg.doas } : {}) } } : {}) },
   };
   return { generation: config.generation, active: redact(config.active), candidate: config.candidate ? redact(config.candidate) : undefined };
 }
@@ -30,7 +32,7 @@ export async function feedbackStorageStatus(dataDir: string) {
     migrations: jobs.map(job => ({ migrationId: job.migrationId, phase: job.phase, blockers: job.blockers })) };
 }
 export async function configureFeedbackStorageCandidate(dataDir: string, request: {
-  expectedGeneration: number; candidate: FeedbackStorageTarget; password?: string; ca?: string;
+  expectedGeneration: number; candidate: FeedbackStorageTarget; password?: string; token?: string; ca?: string;
 }): Promise<FeedbackStorageConfig> {
   const current = await readFeedbackStorageConfig(dataDir);
   if (current.generation !== request.expectedGeneration) throw new Error('feedback_storage_generation_conflict');
@@ -39,9 +41,22 @@ export async function configureFeedbackStorageCandidate(dataDir: string, request
   if (candidate.backend === 'postgresql') {
     if (!candidate.postgres) throw new Error('feedback_storage_target_invalid');
     const previous = current.candidate?.backend === 'postgresql' ? current.candidate.postgres : current.active.backend === 'postgresql' ? current.active.postgres : undefined;
-    candidate.postgres.passwordRef = request.password
-      ? await putFeedbackStorageSecret(dataDir, request.password)
-      : candidate.postgres.passwordRef || previous?.passwordRef || '';
+    if (candidate.postgres.bytepg) {
+      if (request.password || candidate.postgres.passwordRef) throw new Error('feedback_storage_auth_invalid');
+      if (candidate.postgres.bytepg.doas) {
+        if (request.token || candidate.postgres.bytepg.tokenRef) throw new Error('feedback_storage_auth_invalid');
+        delete candidate.postgres.bytepg.tokenRef;
+      } else {
+        candidate.postgres.bytepg.tokenRef = request.token
+          ? await putFeedbackStorageSecret(dataDir, request.token)
+          : candidate.postgres.bytepg.tokenRef || previous?.bytepg?.tokenRef || '';
+      }
+    } else {
+      if (request.token) throw new Error('feedback_storage_auth_invalid');
+      candidate.postgres.passwordRef = request.password
+        ? await putFeedbackStorageSecret(dataDir, request.password)
+        : candidate.postgres.passwordRef || previous?.passwordRef || '';
+    }
     if (!request.ca && !candidate.postgres.tls.caRef && previous?.tls.caRef) {
       candidate.postgres.tls = { ...candidate.postgres.tls, caRef: previous.tls.caRef };
     }
@@ -55,7 +70,7 @@ export async function testFeedbackStorageConnection(dataDir: string): Promise<{ 
   if (selected.backend === 'sqlite') return { ok: true, backend: 'sqlite' };
   const target = selected.postgres;
   const { feedbackPostgresPool } = await import('./feedback-postgres-schema.js');
-  const pool = feedbackPostgresPool(target, await readFeedbackStorageSecret(dataDir, target.passwordRef), target.tls.caRef ? await readFeedbackStorageSecret(dataDir, target.tls.caRef) : undefined);
+  const pool = feedbackPostgresPool(target, await readPostgresCredential(dataDir, target), target.tls.caRef ? await readFeedbackStorageSecret(dataDir, target.tls.caRef) : undefined);
   try {
     const client = await pool.connect();
     try {
