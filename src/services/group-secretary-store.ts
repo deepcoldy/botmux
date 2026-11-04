@@ -26,6 +26,11 @@ export interface GroupSecretaryChatEntry {
   enabledBy: string;
   /** 开启时间（epoch ms）。 */
   enabledAt: number;
+  /**
+   * 群描述标记最近一次确认指向本 bot 的时间。缺省 = 旧版本只在本机登记（迁移对象）；
+   * 有值之后标记若消失 / 指向别人，说明被关闭或接管，本机登记随之清除，不会再「复活」。
+   */
+  markerConfirmedAt?: number;
 }
 
 interface GroupSecretaryFile {
@@ -55,6 +60,7 @@ function parse(raw: any): GroupSecretaryFile {
         ...(typeof entry.botName === 'string' && entry.botName ? { botName: entry.botName } : {}),
         enabledBy: entry.enabledBy,
         enabledAt: Number.isFinite(entry.enabledAt) ? entry.enabledAt : 0,
+        ...(Number.isFinite(entry.markerConfirmedAt) ? { markerConfirmedAt: entry.markerConfirmedAt } : {}),
       };
     }
   }

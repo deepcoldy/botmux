@@ -11,6 +11,7 @@ import type { SecretaryManualWatch } from './group-secretary-engine.js';
 
 export const MIN_WATCH_INTERVAL_MS = 2 * 60_000;
 export const MAX_WATCHES_PER_APP = 50;
+export const DEFAULT_WATCH_TTL_MS = 24 * 3_600_000;
 
 function filePath(larkAppId: string, dataDir = config.session.dataDir): string {
   return join(dataDir, `group-secretary-watches-${larkAppId}.json`);
@@ -28,8 +29,11 @@ export function listSecretaryWatches(larkAppId: string, dataDir?: string): Secre
       && Number.isFinite(w?.createdAt))
       .map((w: any) => ({
         chatId: w.chatId, threadRoot: w.threadRoot, everyMs: w.everyMs, createdAt: w.createdAt,
+        // 旧登记没有到期时间：按登记后 24 小时到期。
+        expiresAt: Number.isFinite(w.expiresAt) ? w.expiresAt : w.createdAt + DEFAULT_WATCH_TTL_MS,
         ...(typeof w.note === 'string' && w.note ? { note: w.note.slice(0, 500) } : {}),
-      }));
+      }))
+      .filter((w: SecretaryManualWatch) => w.expiresAt! > Date.now());
   } catch {
     return [];
   }

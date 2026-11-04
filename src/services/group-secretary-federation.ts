@@ -103,10 +103,11 @@ export async function fetchRemoteSecretaryTranscript(
   peer: SecretaryPeer,
   larkAppId: string,
   sessionId: string,
+  chatId: string,
   opts: { fetcher?: Fetcher; timeoutMs?: number } = {},
 ): Promise<SecretaryTranscriptLine[] | undefined> {
   const j = await getJson(opts.fetcher ?? fetch,
-    `${peer.baseUrl}/api/federation/secretary/transcript?appId=${encodeURIComponent(larkAppId)}&sessionId=${encodeURIComponent(sessionId)}`,
+    `${peer.baseUrl}/api/federation/secretary/transcript?appId=${encodeURIComponent(larkAppId)}&sessionId=${encodeURIComponent(sessionId)}&chatId=${encodeURIComponent(chatId)}`,
     peer.token, opts.timeoutMs ?? 6_000);
   if (!j?.ok || !Array.isArray(j.lines)) return undefined;
   return j.lines

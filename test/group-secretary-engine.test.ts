@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { GroupSecretaryEngine, type SecretaryMessage, type SecretarySessionView } from '../src/services/group-secretary-engine.js';
 import { renderGroupSecretaryPrompt } from '../src/services/group-secretary-prompt.js';
+import { parseSecretaryMarker } from '../src/services/group-secretary-marker.js';
 
 const SELF = 'cli_self';
 const CHAT = 'oc_chat';
@@ -137,13 +138,17 @@ describe('GroupSecretaryEngine — session transitions', () => {
     expect(advance(e, 5_000).flatMap(d => d.events)).toHaveLength(1);
   });
 
-  it('forgets sessions missing from a snapshot, so a failed probe never fabricates transitions', () => {
-    const e = engine();
+  it('forgets sessions only after several consecutive missing snapshots; one miss keeps the baseline', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
     e.observeSessions([session('s1', { turn: 'working' })]);
     e.observeSessions([]);
     e.observeSessions([session('s1', { turn: 'idle' })]);
-    expect(advance(e, 60_000)).toEqual([]);
-  });
+    expect(only('turn_ended', advance(e, 5_000))).toHaveLength(1);
+    e.observeSessions([session('s2', { turn: 'working' })]);
+    e.observeSessions([]); e.observeSessions([]); e.observeSessions([]);
+    e.observeSessions([session('s2', { turn: 'idle' })]);
+    expect(only('turn_ended', advance(e, 60_000))).toEqual([]);
+  });;
 
   it('enforces the per-chat minimum interval between deliveries and batches events', () => {
     const e = engine();
@@ -168,16 +173,13 @@ describe('GroupSecretaryEngine — session transitions', () => {
 });
 
 describe('GroupSecretaryEngine — unaddressed messages', () => {
-  it('a top-level human message with no @ becomes a task candidate after the grace period', () => {
+  it('a top-level human message with no @ is perceived once in a batch, not again as an unaddressed task', () => {
     const e = engine({ minFlushIntervalMs: 0 });
     e.observeMessage(msg('om_1'));
-    expect(only('unaddressed_task', advance(e, 19_000))).toEqual([]);
-    const digests = advance(e, 6_000);
-    const ev = only('unaddressed_task', digests);
-    expect(ev).toHaveLength(1);
-    expect(ev[0].message?.messageId).toBe('om_1');
-    expect(digests[0].context.map(m => m.messageId)).toContain('om_1');
-  });;
+    const first = advance(e, 6_000);
+    expect(only('new_messages', first)[0].messages?.map(m => m.messageId)).toEqual(['om_1']);
+    expect(only('unaddressed_task', advance(e, 60_000))).toEqual([]);
+  });;;
 
   it('a bot reply under the message during the grace period cancels the candidate', () => {
     const e = engine();
@@ -435,6 +437,45 @@ describe('GroupSecretaryEngine — restart noise', () => {
     e.observeSessions([session('s1', { turn: 'working' })]);
     e.observeSessions([session('s1', { turn: 'idle' })]);
     expect(only('turn_ended', advance(e, 5_000))).toHaveLength(1);
+  });
+});
+
+describe('GroupSecretaryEngine — review fixes', () => {
+  it('a missed poll does not reset the check-in timer', () => {
+    const e = engine({ minFlushIntervalMs: 0, checkInIntervalsMs: [5 * 60_000] });
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    e.observeSessions([session('s1', { turn: 'working' })]);
+    clock += 4 * 60_000; e.observeSessions([]);
+    clock += 60_000; e.observeSessions([session('s1', { turn: 'working' })]);
+    expect(only('check_in', advance(e, 5_000))).toHaveLength(1);
+  });
+  it('drops a check-in whose session stopped working before delivery', () => {
+    let busy = true;
+    const e = engine({ minFlushIntervalMs: 0, checkInIntervalsMs: [5 * 60_000], isSecretaryBusy: () => busy, maxBusyHoldMs: 10 * 60_000 });
+    e.observeSessions([session('s1', { turn: 'idle' })]);
+    e.observeSessions([session('s1', { turn: 'working' })]);
+    clock += 5 * 60_000; e.observeSessions([session('s1', { turn: 'working' })]);
+    e.observeSessions([session('s1', { turn: 'error' })]);
+    busy = false;
+    expect(only('check_in', advance(e, 5_000))).toEqual([]);
+  });
+  it('messages that @ the secretary are not re-sent in a silent batch', () => {
+    const e = engine({ minFlushIntervalMs: 0 });
+    e.observeMessage(msg('om_at', { mentionsSelf: true, mentionCount: 1 }));
+    expect(advance(e, 60_000)).toEqual([]);
+  });
+  it('manual watches do not fire at startup and stop at expiresAt', () => {
+    const watches = [{ chatId: CHAT, threadRoot: 'om_root_s1', everyMs: 10 * 60_000, createdAt: clock - 3 * 3_600_000, expiresAt: clock + 15 * 60_000 }];
+    const e = engine({ minFlushIntervalMs: 0, manualWatches: () => watches, checkInIntervalsMs: [999 * 60_000] });
+    e.observeSessions([session('s1', { turn: 'working' })]);
+    expect(only('check_in', advance(e, 5_000))).toEqual([]);
+    clock += 10 * 60_000; e.observeSessions([session('s1', { turn: 'working' })]);
+    expect(only('check_in', advance(e, 5_000))).toHaveLength(1);
+    clock += 10 * 60_000; e.observeSessions([session('s1', { turn: 'working' })]);
+    expect(only('check_in', advance(e, 5_000))).toEqual([]);
+  });
+  it('duplicate markers resolve to the last line', () => {
+    expect(parseSecretaryMarker('[botmux:secretary=cli_a]\nx\n[botmux:secretary=cli_b]').appId).toBe('cli_b');
   });
 });
 

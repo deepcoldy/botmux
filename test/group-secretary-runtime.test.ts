@@ -10,7 +10,7 @@ vi.mock('../src/config.js', () => ({ config: { session: { dataDir } } }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
 import { createGroupSecretaryRuntime, larkEventToSecretaryMessage, setGroupSecretaryRuntime, forgetGroupSecretaryChat, observeGroupSecretaryMessage, staggeredGraceMs } from '../src/services/group-secretary-runtime.js';
-import { setGroupSecretaryChat, resetGroupSecretaryStoreCache } from '../src/services/group-secretary-store.js';
+import { setGroupSecretaryChat, getGroupSecretaryChat, resetGroupSecretaryStoreCache } from '../src/services/group-secretary-store.js';
 import type { ObserveSnapshot } from '../src/services/session-observe.js';
 
 const APP = 'cli_self';
@@ -86,13 +86,14 @@ describe('group secretary runtime', () => {
     rt.stop();
   });
 
-  it('a failed probe in between does not fabricate a transition', async () => {
+  it('a single failed probe keeps the working baseline, so the real working→idle transition is still reported', async () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     const { rt, deliver } = runtime([snapshot('working'), snapshot('idle', 'unreachable'), snapshot('idle')]);
     for (let i = 0; i < 4; i++) { await rt.tick(); clock += 10_000; }
-    expect(deliver).not.toHaveBeenCalled();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect((deliver.mock.calls[0] as any[])[0].prompt).toContain('turn_ended');
     rt.stop();
-  });
+  });;
 
   it('requeues and retries when delivery fails', async () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
@@ -198,7 +199,7 @@ describe('group secretary runtime — evidence and ownership', () => {
       fetchTranscript, deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
     });
     await rt.tick(); clock += 10_000; await rt.tick(); clock += 5_000; await rt.tick();
-    expect(fetchTranscript).toHaveBeenCalledWith('cli_a', 's1');
+    expect(fetchTranscript).toHaveBeenCalledWith('cli_a', 's1', CHAT);
     const prompt = (deliver.mock.calls[0] as any[])[0].prompt as string;
     expect(prompt).toContain('<recent_transcript trusted="false">');
     expect(prompt).toContain('接下来我做第二步');
@@ -272,28 +273,81 @@ describe('group secretary runtime — startup backfill', () => {
 });
 
 describe('group secretary runtime — group marker and federation', () => {
-  it('stands down when the group marker points at another bot, and resumes when it comes back', async () => {
-    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+  it('stands down and clears its local registration when the marker points at another bot (no resurrection)', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1, markerConfirmedAt: 1 });
     let marker: string | undefined = 'cli_other';
+    const writeMarker = vi.fn(async () => ({ ok: true }));
     const deliver = vi.fn(async () => undefined);
     const rt = createGroupSecretaryRuntime({
       larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
-      readMarker: async () => marker, writeMarker: vi.fn(async () => ({ ok: true })),
+      readMarker: async () => marker, writeMarker,
+      deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
+    });
+    await rt.tick();
+    expect(getGroupSecretaryChat(APP, CHAT)).toBeUndefined();
+    marker = undefined;
+    clock += 61_000; await rt.tick();
+    rt.observeMessageEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_2', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '现在呢' }), mentions: [] } });
+    clock += 30_000; await rt.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(writeMarker).not.toHaveBeenCalled();
+    rt.stop();
+  });
+
+  it('a confirmed registration whose marker disappeared (turned off elsewhere) is cleared, not re-written', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1, markerConfirmedAt: 5 });
+    const writeMarker = vi.fn(async () => ({ ok: true }));
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+      readMarker: async () => undefined, writeMarker,
+      deliver: vi.fn(), log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9,
+    });
+    await rt.tick();
+    expect(writeMarker).not.toHaveBeenCalled();
+    expect(getGroupSecretaryChat(APP, CHAT)).toBeUndefined();
+    rt.stop();
+  });
+
+  it('legacy migration retries after a failed marker write and keeps working meanwhile', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const writeMarker = vi.fn().mockResolvedValueOnce({ ok: false, reason: 'description_too_long' }).mockResolvedValue({ ok: true });
+    const deliver = vi.fn(async () => undefined);
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+      readMarker: async () => undefined, writeMarker: writeMarker as any,
       deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, markerRefreshMs: 60_000,
     });
     await rt.tick();
     rt.observeMessageEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
-      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_1', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '有人吗' }), mentions: [] } });
-    clock += 30_000; await rt.tick();
-    expect(deliver).not.toHaveBeenCalled();
-    marker = APP;
-    clock += 60_000; await rt.tick();
-    rt.observeMessageEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
-      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_2', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '现在呢' }), mentions: [] } });
+      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_3', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '有人吗' }), mentions: [] } });
     clock += 30_000; await rt.tick();
     expect(deliver).toHaveBeenCalledTimes(1);
+    clock += 61_000; await rt.tick();
+    expect(writeMarker).toHaveBeenCalledTimes(2);
+    expect(getGroupSecretaryChat(APP, CHAT)?.markerConfirmedAt).toBeDefined();
     rt.stop();
   });
+
+  it('a hanging marker read times out instead of freezing the loop', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1, markerConfirmedAt: 1 });
+    vi.useFakeTimers();
+    try {
+      const rt = createGroupSecretaryRuntime({
+        larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => ({ schemaVersion: 1, observedAt: 0, daemons: [] }),
+        readMarker: () => new Promise(() => {}), deliver: vi.fn(), log: () => {}, canTalk: () => true,
+        now: () => clock, tickMs: 1e9, markerTimeoutMs: 1_000,
+      });
+      const t = rt.tick();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await t;
+      clock += 61_000;
+      const t2 = rt.tick();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await t2;
+      rt.stop();
+    } finally { vi.useRealTimers(); }
+  });;
 
   it('migrates a legacy local-only registration by writing the marker once', async () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
@@ -327,3 +381,33 @@ describe('group secretary runtime — group marker and federation', () => {
     rt.stop();
   });
 });
+
+describe('group secretary runtime — busy detection', () => {
+  it('holds message batches while its own chat session is working, then delivers when it is idle', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    let ownTurn = 'working';
+    const own = () => ({
+      schemaVersion: 1 as const, observedAt: 0,
+      daemons: [{ larkAppId: APP, probe: { status: 'ok' as const, source: 'daemon-ipc' as const }, sessions: [{
+        schemaVersion: 1 as const, observedAt: 0, probe: { status: 'ok' as const, source: 'daemon-ipc' as const },
+        identity: { sessionId: 'own', larkAppId: APP, chatId: CHAT, scope: 'chat' as const },
+        cli: {}, backend: { adopted: false }, liveness: 'alive' as const, turn: ownTurn as any, phase: 'unknown' as const, queued: false, parkedOrSuspended: false, closed: false,
+      }] }],
+    });
+    const deliver = vi.fn(async () => undefined);
+    const rt = createGroupSecretaryRuntime({
+      larkAppId: APP, selfOpenId: () => undefined, fetchSnapshot: async () => own(),
+      deliver, log: () => {}, canTalk: () => true, now: () => clock, tickMs: 1e9, sessionPollMs: 0,
+    });
+    await rt.tick();
+    rt.observeMessageEvent({ sender: { sender_type: 'user', sender_id: { open_id: 'ou_u' } },
+      message: { chat_id: CHAT, chat_type: 'group', message_id: 'om_b', create_time: String(clock), message_type: 'text', content: JSON.stringify({ text: '有新情况' }), mentions: [] } });
+    clock += 30_000; await rt.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    ownTurn = 'idle';
+    clock += 5_000; await rt.tick();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    rt.stop();
+  });
+});
+

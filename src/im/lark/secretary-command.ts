@@ -10,7 +10,7 @@ import { localeForBot, t } from '../../i18n/index.js';
 import { isSessionGroup } from '../../services/session-groups-store.js';
 import { getGroupSecretaryOwner, setGroupSecretaryChat } from '../../services/group-secretary-store.js';
 import { getBot, effectiveBotDisplayName } from '../../bot-registry.js';
-import { forgetGroupSecretaryChat } from '../../services/group-secretary-runtime.js';
+import { forgetGroupSecretaryChat, noteSecretaryMarker } from '../../services/group-secretary-runtime.js';
 import { readSecretaryMarker, writeSecretaryMarker } from '../../services/group-secretary-marker.js';
 import { logger } from '../../utils/logger.js';
 
@@ -82,7 +82,7 @@ export async function tryHandleSecretaryCommand(
   }
   let selfName: string | undefined;
   try { selfName = effectiveBotDisplayName(getBot(larkAppId)); } catch { selfName = undefined; }
-  const localEntry = { larkAppId, ...(selfName ? { botName: selfName } : {}), enabledBy: senderOpenId, enabledAt: Date.now() };
+  const localEntry = { larkAppId, ...(selfName ? { botName: selfName } : {}), enabledBy: senderOpenId, enabledAt: Date.now(), markerConfirmedAt: Date.now() };
 
   if (enable || takeover) {
     if (isMine) {
@@ -103,9 +103,12 @@ export async function tryHandleSecretaryCommand(
     }
     const res = setGroupSecretaryChat(chatId, localEntry);
     if (!res.ok) {
+      // 标记已写成自己但本机登记失败：回滚标记，避免出现「群里登记了秘书、却没有任何进程在当」。
+      await writeSecretaryMarker(larkAppId, chatId, markerAppId ?? null);
       await reply(t('cmd.secretary.failed', { reason: res.reason }, loc));
       return true;
     }
+    noteSecretaryMarker(chatId, larkAppId);
     logger.info(`[secretary] ${markerAppId ? `took over from ${markerAppId}` : 'enabled'} chat=${chatId.slice(0, 12)} by=${senderOpenId.slice(0, 12)}`);
     await reply(markerAppId
       ? t('cmd.secretary.took_over', { name: ownerName }, loc)

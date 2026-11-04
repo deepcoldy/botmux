@@ -33666,11 +33666,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     selfOpenId: () => getBot(cfg.larkAppId).botOpenId,
     canTalk: (chatId, openId) => evaluateTalk(cfg.larkAppId, chatId, openId, undefined, undefined, 'group').allowed,
     fetchSnapshot: () => fetchObserveSnapshot(),
-    fetchTranscript: async (appId, sessionId) => {
+    fetchTranscript: async (appId, sessionId, chatId) => {
       const local = await fetchSessionRecentTranscript(appId, sessionId);
       if (local) return local;
       const peer = appId ? secretaryRemoteAppPeer.get(appId) : undefined;
-      return peer && appId ? fetchRemoteSecretaryTranscript(peer, appId, sessionId) : undefined;
+      return peer && appId ? fetchRemoteSecretaryTranscript(peer, appId, sessionId, chatId) : undefined;
     },
     readMarker: chatId => readSecretaryMarker(cfg.larkAppId, chatId),
     writeMarker: (chatId, appId) => writeSecretaryMarker(cfg.larkAppId, chatId, appId),

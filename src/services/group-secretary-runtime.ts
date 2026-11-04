@@ -8,7 +8,7 @@
 import { createHash } from 'node:crypto';
 import { GroupSecretaryEngine, type SecretaryDigest, type SecretaryManualWatch, type SecretarySessionView } from './group-secretary-engine.js';
 import { renderGroupSecretaryPrompt } from './group-secretary-prompt.js';
-import { getGroupSecretaryChat, isGroupSecretaryChat, listGroupSecretaryChats } from './group-secretary-store.js';
+import { getGroupSecretaryChat, isGroupSecretaryChat, listGroupSecretaryChats, setGroupSecretaryChat } from './group-secretary-store.js';
 import { extractListenerMessageText, listenerSenderType } from './message-listener.js';
 import type { ObserveSnapshot } from './session-observe.js';
 
@@ -19,7 +19,9 @@ export interface GroupSecretaryRuntimeDeps {
   deliver: (input: { chatId: string; turnId: string; prompt: string; ownerOpenId: string }) => Promise<unknown>;
   /** 读 / 写群描述里的秘书标记（全群唯一登记）。不提供时只按本机登记判断。 */
   readMarker?: (chatId: string) => Promise<string | undefined>;
-  writeMarker?: (chatId: string, appId: string) => Promise<{ ok: boolean }>;
+  writeMarker?: (chatId: string, appId: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** 读 / 写标记的单次超时（飞书接口挂住时不拖死整个秘书循环）。 */
+  markerTimeoutMs?: number;
   markerRefreshMs?: number;
   /** 其它机器（federation 对端）上 bot 在这些群的会话；拿不到返回空数组。 */
   fetchRemoteViews?: (chatIds: string[]) => Promise<SecretarySessionView[]>;
@@ -30,7 +32,7 @@ export interface GroupSecretaryRuntimeDeps {
   /** 拉某群最近的消息（飞书 REST 形态，新→旧或旧→新均可），用于启动时补上下文。 */
   fetchRecentMessages?: (chatId: string) => Promise<any[]>;
   /** 读某会话最近几条对话（本机 daemon insight）；拿不到返回 undefined。 */
-  fetchTranscript?: (larkAppId: string | undefined, sessionId: string) => Promise<Array<{ role: string; text: string }> | undefined>;
+  fetchTranscript?: (larkAppId: string | undefined, sessionId: string, chatId: string) => Promise<Array<{ role: string; text: string }> | undefined>;
   log: (level: 'info' | 'warn', message: string) => void;
   /** 发送方在该群能否和本 bot 对话（canTalk）。 */
   canTalk: (chatId: string, senderOpenId: string | undefined) => boolean;
@@ -43,6 +45,7 @@ export interface GroupSecretaryRuntimeDeps {
 
 export interface GroupSecretaryRuntime {
   observeMessageEvent(data: any): void;
+  noteMarker(chatId: string, appId: string | undefined): void;
   /** 立即跑一拍（测试与开关切换后用）。 */
   tick(): Promise<void>;
   stop(): void;
@@ -152,8 +155,17 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
   /** 群描述标记的最近读数：chatId → 标记里的 appId（undefined = 无标记）。缺项 = 还没读到。 */
   const markers = new Map<string, string | undefined>();
   const markerReadAt = new Map<string, number>();
-  const migrated = new Set<string>();
   const markerRefreshMs = deps.markerRefreshMs ?? 60_000;
+  const markerTimeoutMs = deps.markerTimeoutMs ?? 8_000;
+  const withTimeout = async <T>(p: Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([p, new Promise<T>((_, rej) => {
+        timer = setTimeout(() => rej(new Error('marker_timeout')), markerTimeoutMs);
+        timer.unref?.();
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
+  };
   /** 本机登记是自己，且群描述标记没有指向别的 bot（读不到时按本机登记继续，不因网络抖动停手）。 */
   const isActiveChat = (chatId: string | undefined): boolean => {
     if (!isGroupSecretaryChat(deps.larkAppId, chatId)) return false;
@@ -166,19 +178,35 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
       if (now() - (markerReadAt.get(chatId) ?? 0) < markerRefreshMs) continue;
       markerReadAt.set(chatId, now());
       try {
-        let marker = await deps.readMarker(chatId);
-        // 旧版本只在本机登记、群描述里没有标记：本进程首次看到时补写一次（迁移）。
-        if (marker === undefined && !migrated.has(chatId) && deps.writeMarker) {
-          migrated.add(chatId);
-          if ((await deps.writeMarker(chatId, deps.larkAppId)).ok) marker = deps.larkAppId;
+        const marker = await withTimeout(deps.readMarker(chatId));
+        const entry = getGroupSecretaryChat(deps.larkAppId, chatId);
+        if (!entry) continue;
+        if (marker === deps.larkAppId) {
+          markers.set(chatId, marker);
+          if (!entry.markerConfirmedAt) setGroupSecretaryChat(chatId, { ...entry, markerConfirmedAt: now() });
+          continue;
         }
-        migrated.add(chatId);
-        const before = markers.get(chatId);
+        if (marker === undefined && !entry.markerConfirmedAt) {
+          // 旧版本只在本机登记：补写标记（迁移）。失败下次刷新再试，期间按本机登记继续工作。
+          if (!deps.writeMarker) continue;
+          const wrote = await withTimeout(deps.writeMarker(chatId, deps.larkAppId));
+          if (wrote.ok) {
+            markers.set(chatId, deps.larkAppId);
+            setGroupSecretaryChat(chatId, { ...entry, markerConfirmedAt: now() });
+            deps.log('info', `[group-secretary] wrote marker for legacy registration chat=${chatId.slice(0, 12)}`);
+          } else {
+            deps.log('warn', `[group-secretary] marker migration failed chat=${chatId.slice(0, 12)}: ${wrote.reason ?? 'unknown'}; will retry`);
+          }
+          continue;
+        }
+        // 确认过的登记，标记却不见了或指向别人：已被关闭 / 接管。清掉本机登记，彻底停手（不会重启后复活）。
         markers.set(chatId, marker);
-        if (marker !== deps.larkAppId && before !== marker) {
-          deps.log('info', `[group-secretary] marker for chat=${chatId.slice(0, 12)} is ${marker ?? 'absent'}; standing down`);
-        }
-      } catch { /* 读失败：保留上一次读数 */ }
+        setGroupSecretaryChat(chatId, null);
+        engine.forgetChat(chatId);
+        deps.log('info', `[group-secretary] marker for chat=${chatId.slice(0, 12)} is ${marker ?? 'absent'}; cleared local registration and stood down`);
+      } catch (err) {
+        deps.log('warn', `[group-secretary] marker refresh failed chat=${chatId.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   };
   const engine = new GroupSecretaryEngine({
@@ -229,7 +257,7 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
       await Promise.all(digest.events.map(async event => {
         if (!event.session || event.transcript) return;
         try {
-          const lines = await deps.fetchTranscript!(event.session.larkAppId, event.session.sessionId);
+          const lines = await deps.fetchTranscript!(event.session.larkAppId, event.session.sessionId, digest.chatId);
           if (lines?.length) event.transcript = lines;
           if (event.kind === 'check_in' && lines?.length) {
             const sig = createHash('sha1').update(JSON.stringify(lines)).digest('hex');
@@ -314,6 +342,10 @@ export function createGroupSecretaryRuntime(deps: GroupSecretaryRuntimeDeps): Gr
 
   return {
     engine,
+    noteMarker(chatId: string, appId: string | undefined): void {
+      markers.set(chatId, appId);
+      markerReadAt.set(chatId, now());
+    },
     observeMessageEvent(data: any): void {
       try {
         const chatId = data?.message?.chat_id;
@@ -340,6 +372,11 @@ let current: GroupSecretaryRuntime | undefined;
 export function setGroupSecretaryRuntime(runtime: GroupSecretaryRuntime | undefined): void {
   current?.stop();
   current = runtime;
+}
+
+/** /secretary on|takeover 成功后立刻更新标记缓存，不用等下一次刷新（否则接管后最多 60s 静默）。 */
+export function noteSecretaryMarker(chatId: string, appId: string | undefined): void {
+  current?.noteMarker(chatId, appId);
 }
 
 /** /secretary off 时清掉该群的积压，免得关了又开时投递关之前的旧事件。 */

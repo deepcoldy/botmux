@@ -74,6 +74,8 @@ export interface SecretaryManualWatch {
   everyMs: number;
   note?: string;
   createdAt: number;
+  /** 到期不再回访（缺省由登记方给 24 小时）。 */
+  expiresAt?: number;
 }
 
 export interface SecretaryEvent {
@@ -159,6 +161,8 @@ export function isSecretaryNoiseMessage(m: SecretaryMessage): boolean {
 const WORKING_TURNS = new Set(['working', 'starting', 'analyzing']);
 const STUCK_TURNS = new Set(['stalled', 'interrupted', 'limited']);
 const HOUR_MS = 60 * 60_000;
+/** 会话连续多少次不在快照里才遗忘（10s 一拍 ≈ 30s）。 */
+const MISSING_GRACE = 3;
 
 interface SessionMemo {
   liveness: SecretaryLiveness;
@@ -194,6 +198,10 @@ export class GroupSecretaryEngine {
   private readonly sessionEventTimes = new Map<string, number[]>();
   /** 每个会话最近一次快照（投递前复核事件是否仍然成立、列出在跑会话）。 */
   private readonly latest = new Map<string, SecretarySessionView>();
+  /** 会话连续缺席快照的次数。 */
+  private readonly missing = new Map<string, number>();
+  /** 引擎启动时间：手动盯的话题重启后从这里起算，不在启动瞬间集中回访。 */
+  private readonly startedAt: number;
   /** 跟进清单：在跑会话 → 下次回访时间。 */
   private readonly watches = new Map<string, WatchState>();
   /** 手动盯的话题上次回访时间（key = chatId + threadRoot）。 */
@@ -220,6 +228,7 @@ export class GroupSecretaryEngine {
       checkInIntervalsMs: options.checkInIntervalsMs ?? [5 * 60_000, 10 * 60_000, 20 * 60_000],
       manualWatches: options.manualWatches ?? (() => []),
     };
+    this.startedAt = this.opts.now();
   }
 
   private chat(chatId: string): ChatState {
@@ -264,7 +273,8 @@ export class GroupSecretaryEngine {
       state.messages.splice(0, state.messages.length - this.opts.contextMessagesPerChat);
     }
     // 感知：除了秘书自己发的和机器噪音，每条新消息都进本批，攒够了叫醒秘书。
-    if (!message.fromSelf && !isSecretaryNoiseMessage(message)) {
+    // @ 秘书的消息走普通对话回合处理，不再进静默批次（否则同一条会被处理两次）。
+    if (!message.fromSelf && !message.mentionsSelf && !isSecretaryNoiseMessage(message)) {
       state.newMessages.push(message);
       if (state.newMessages.length > this.opts.contextMessagesPerChat) state.newMessages.shift();
       state.lastEventAt = this.opts.now();
@@ -327,14 +337,16 @@ export class GroupSecretaryEngine {
       }
     }
     this.dueManualWatches(now);
+    // 快照里暂时缺席的会话（对端超时、探测失败）先保留记忆，连续缺席 MISSING_GRACE 次才遗忘：
+    // 一次抖动不能丢掉「工作中」的基线（否则 turn_ended 丢失、回访计时被重置）。
     for (const id of [...this.sessions.keys()]) {
-      if (!seen.has(id)) this.sessions.delete(id);
-    }
-    for (const id of [...this.latest.keys()]) {
-      if (!seen.has(id)) this.latest.delete(id);
-    }
-    for (const id of [...this.watches.keys()]) {
-      if (!seen.has(id)) this.watches.delete(id);
+      if (seen.has(id)) { this.missing.delete(id); continue; }
+      const n = (this.missing.get(id) ?? 0) + 1;
+      if (n < MISSING_GRACE) { this.missing.set(id, n); continue; }
+      this.missing.delete(id);
+      this.sessions.delete(id);
+      this.latest.delete(id);
+      this.watches.delete(id);
     }
     // 限流计数与会话记忆分开过期：会话因探测失败暂时从快照里消失时，计数不能被清零，
     // 否则「催 → 停 → 再催」的循环会绕过每小时上限。
@@ -374,7 +386,8 @@ export class GroupSecretaryEngine {
     for (const w of this.opts.manualWatches()) {
       if (!this.opts.isEnabledChat(w.chatId)) continue;
       const key = `${w.chatId}\u0000${w.threadRoot}`;
-      const last = this.manualLastCheck.get(key) ?? w.createdAt;
+      if (w.expiresAt !== undefined && now >= w.expiresAt) continue;
+      const last = this.manualLastCheck.get(key) ?? Math.max(w.createdAt, this.startedAt);
       if (now - last < w.everyMs) continue;
       this.manualLastCheck.set(key, now);
       const session = [...this.latest.values()]
@@ -436,6 +449,9 @@ export class GroupSecretaryEngine {
       const events = state.pending;
       if (state.newMessages.length > 0) {
         events.unshift({ kind: 'new_messages', at: now, messages: state.newMessages });
+        // 已随本批送达的消息不再作为「无人认领」二次叫醒。
+        const delivered = new Set(state.newMessages.map(m => m.messageId));
+        state.unaddressed = state.unaddressed.filter(u => !delivered.has(u.message.messageId));
       }
       const attempts = state.pendingAttempts;
       state.pending = [];

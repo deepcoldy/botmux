@@ -8,11 +8,14 @@ import { selectGroupContextConversation } from '../src/services/group-context-sc
 describe('secretary watch store', () => {
   it('upserts per (chat, thread), removes, and rejects too-short intervals', () => {
     const dir = mkdtempSync(join(tmpdir(), 'sec-watch-'));
-    upsertSecretaryWatch('cli_a', { chatId: 'oc_1', threadRoot: 'om_t', everyMs: 600_000, createdAt: 1, note: 'x' }, dir);
-    upsertSecretaryWatch('cli_a', { chatId: 'oc_1', threadRoot: 'om_t', everyMs: 1_200_000, createdAt: 2 }, dir);
-    expect(listSecretaryWatches('cli_a', dir)).toEqual([{ chatId: 'oc_1', threadRoot: 'om_t', everyMs: 1_200_000, createdAt: 2 }]);
+    const t0 = Date.now();
+    upsertSecretaryWatch('cli_a', { chatId: 'oc_1', threadRoot: 'om_t', everyMs: 600_000, createdAt: t0, note: 'x' }, dir);
+    upsertSecretaryWatch('cli_a', { chatId: 'oc_1', threadRoot: 'om_t', everyMs: 1_200_000, createdAt: t0, expiresAt: t0 + 3_600_000 }, dir);
+    expect(listSecretaryWatches('cli_a', dir)).toEqual([{ chatId: 'oc_1', threadRoot: 'om_t', everyMs: 1_200_000, createdAt: t0, expiresAt: t0 + 3_600_000 }]);
+    upsertSecretaryWatch('cli_a', { chatId: 'oc_1', threadRoot: 'om_old', everyMs: 600_000, createdAt: t0 - 2 * 86_400_000 }, dir);
+    expect(listSecretaryWatches('cli_a', dir).map(w => w.threadRoot)).toEqual(['om_t']);
     expect(listSecretaryWatches('cli_b', dir)).toEqual([]);
-    expect(() => upsertSecretaryWatch('cli_a', { chatId: 'oc_1', threadRoot: 'om_u', everyMs: 30_000, createdAt: 3 }, dir)).toThrow();
+    expect(() => upsertSecretaryWatch('cli_a', { chatId: 'oc_1', threadRoot: 'om_u', everyMs: 30_000, createdAt: Date.now() }, dir)).toThrow();
     expect(removeSecretaryWatch('cli_a', 'oc_1', 'om_t', dir)).toBe(true);
     expect(removeSecretaryWatch('cli_a', 'oc_1', 'om_t', dir)).toBe(false);
   });

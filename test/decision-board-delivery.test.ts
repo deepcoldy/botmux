@@ -285,6 +285,15 @@ describe('静默回合（群秘书摘要）', () => {
     expect(isSilentScheduledTurn(ds as any, 'other-turn')).toBe(false);
   });
 
+  it('silent turns carry no reply reminder; ordinary batch turns still do', async () => {
+    const map = new Map<string, any>();
+    liveSession(map);
+    await deliverOwnerBatchTurn(SILENT, map, () => false);
+    expect(JSON.stringify((wp.sendWorkerInput.mock.calls.at(-1) as any[])[1])).not.toContain('botmux_reminder');
+    await deliverOwnerBatchTurn({ ...INPUT, turnId: 'board:app_s:2' }, map, () => false);
+    expect(JSON.stringify((wp.sendWorkerInput.mock.calls.at(-1) as any[])[1])).toContain('botmux_reminder');
+  });
+
   it('注入失败且冷启动也抛错：撤销静默登记', async () => {
     const map = new Map<string, any>();
     const ds = liveSession(map);

@@ -7,10 +7,11 @@ import {
   parseWatchInterval,
   removeSecretaryWatch,
   upsertSecretaryWatch,
+  DEFAULT_WATCH_TTL_MS,
 } from '../services/group-secretary-watch-store.js';
 
 const USAGE = `用法：
-  botmux secretary watch <话题根消息 om_...> [--every 10m] [--note "要盯什么"]
+  botmux secretary watch <话题根消息 om_...> [--every 10m] [--for 24h] [--note "要盯什么"]
   botmux secretary unwatch <话题根消息 om_...>
   botmux secretary watches`;
 
@@ -44,7 +45,9 @@ export async function runSecretaryCommand(argv: string[]): Promise<number> {
     if (sub === 'watch') {
       const everyMs = parseWatchInterval(flag(argv, '--every'));
       const note = flag(argv, '--note');
-      upsertSecretaryWatch(appId, { chatId, threadRoot: target, everyMs, createdAt: Date.now(), ...(note ? { note } : {}) });
+      const forMs = parseWatchInterval(flag(argv, '--for'), DEFAULT_WATCH_TTL_MS);
+      const createdAt = Date.now();
+      upsertSecretaryWatch(appId, { chatId, threadRoot: target, everyMs, createdAt, expiresAt: createdAt + forMs, ...(note ? { note } : {}) });
       process.stdout.write(`${JSON.stringify({ ok: true, watching: target, everyMinutes: Math.round(everyMs / 60_000) })}\n`);
       return 0;
     }

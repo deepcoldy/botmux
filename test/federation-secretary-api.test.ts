@@ -14,10 +14,10 @@ vi.mock('../src/services/session-observe-command-fetch.js', () => ({
     state.observed++;
     const s = (id: string, chatId: string) => ({
       schemaVersion: 1, observedAt: 0, probe: { status: 'ok', source: 'daemon-ipc' },
-      identity: { sessionId: id, larkAppId: 'cli_fox', botName: 'fox', chatId, scope: 'thread', rootMessageId: 'om_t' },
+      identity: { sessionId: id, larkAppId: 'cli_fox', botName: 'fox', chatId, chatType: chatId === 'oc_dm' ? 'p2p' : 'group', scope: 'thread', rootMessageId: 'om_t' },
       cli: {}, backend: { adopted: false }, liveness: 'alive', turn: 'working', phase: 'unknown', queued: false, parkedOrSuspended: false, closed: false,
     });
-    return { schemaVersion: 1, observedAt: 0, daemons: [{ larkAppId: 'cli_fox', probe: { status: 'ok', source: 'daemon-ipc' }, sessions: [s('s1', 'oc_1'), s('s2', 'oc_2')] }] };
+    return { schemaVersion: 1, observedAt: 0, daemons: [{ larkAppId: 'cli_fox', probe: { status: 'ok', source: 'daemon-ipc' }, sessions: [s('s1', 'oc_1'), s('s2', 'oc_2'), s('s3', 'oc_dm')] }] };
   },
 }));
 vi.mock('../src/services/group-secretary-transcript.js', () => ({
@@ -54,7 +54,7 @@ describe('/api/federation/secretary/*', () => {
   it('rejects missing or unknown tokens without reading local sessions', async () => {
     expect((await get('/api/federation/secretary/sessions?chatId=oc_1')).status).toBe(403);
     expect((await get('/api/federation/secretary/sessions?chatId=oc_1', 'nope')).status).toBe(403);
-    expect((await get('/api/federation/secretary/transcript?appId=a&sessionId=s', 'nope')).status).toBe(403);
+    expect((await get('/api/federation/secretary/transcript?appId=a&sessionId=s&chatId=oc_1', 'nope')).status).toBe(403);
     expect(state.observed).toBe(0);
   });
 
@@ -67,8 +67,16 @@ describe('/api/federation/secretary/*', () => {
 
   it('serves a hub presenting the delegationToken this spoke issued (spoke side)', async () => {
     addMembership(state.dataDir, { hubUrl: 'http://hub', teamId: 't', teamName: 'T', syncToken: 'st', deploymentId: 'me', delegationToken: 'dt-123' });
-    const r = await get('/api/federation/secretary/transcript?appId=cli_fox&sessionId=s1', 'dt-123');
+    const r = await get('/api/federation/secretary/transcript?appId=cli_fox&sessionId=s1&chatId=oc_1', 'dt-123');
     expect(r.status).toBe(200);
     expect(r.body.lines[0].text).toBe('做到第二步了');
+  });
+
+  it('never serves DM sessions or sessions of another chat, even with a valid token', async () => {
+    addMembership(state.dataDir, { hubUrl: 'http://hub', teamId: 't', teamName: 'T', syncToken: 'st', deploymentId: 'me', delegationToken: 'dt-9' });
+    expect((await get('/api/federation/secretary/transcript?appId=cli_fox&sessionId=s3&chatId=oc_dm', 'dt-9')).status).toBe(404);
+    expect((await get('/api/federation/secretary/transcript?appId=cli_fox&sessionId=s1&chatId=oc_2', 'dt-9')).status).toBe(404);
+    expect((await get('/api/federation/secretary/transcript?appId=cli_fox&sessionId=s1', 'dt-9')).status).toBe(400);
+    expect((await get('/api/federation/secretary/sessions?chatId=oc_dm', 'dt-9')).body.sessions).toEqual([]);
   });
 });

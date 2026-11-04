@@ -44,7 +44,7 @@ vi.mock('../src/services/group-secretary-marker.js', () => ({
   writeSecretaryMarker: (...a: any[]) => (mockWriteMarker as any)(...a),
 }));
 const mockForget = vi.fn();
-vi.mock('../src/services/group-secretary-runtime.js', () => ({ forgetGroupSecretaryChat: (...a: any[]) => mockForget(...a) }));
+vi.mock('../src/services/group-secretary-runtime.js', () => ({ forgetGroupSecretaryChat: (...a: any[]) => mockForget(...a), noteSecretaryMarker: () => {} }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
 import { tryHandleSecretaryCommand } from '../src/im/lark/secretary-command.js';
