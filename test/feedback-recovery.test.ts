@@ -129,6 +129,13 @@ describe('manual feedback recovery', () => {
     await acknowledgeFeedbackRecovery(directory, { ...decision, kind: item.kind, id: item.id, fingerprint: item.fingerprint });
     await acknowledgeFeedbackRecovery(directory, { ...decision, kind: item.kind, id: item.id, fingerprint: item.fingerprint });
     expect(store.listFeedbackOutbox()[0].lastError).toBe('webhook_outcome_unknown:unknown-attempt');
+    const database = await (await import('../src/services/sqlite-compat.js')).openDatabaseSync(join(directory, 'botmux-feedback.sqlite'));
+    database.prepare("UPDATE feedback_outbox SET status='pending',attempts=attempts+1 WHERE outbox_id=?").run(claimed.outboxId);
+    database.close();
+    await expect(freezeFeedbackSource(directory, job.migrationId)).rejects.toThrow('feedback_outbox_unsettled');
+    await expect(acknowledgeFeedbackRecovery(directory, { ...decision, kind: item.kind, id: item.id, fingerprint: item.fingerprint })).rejects.toThrow('feedback_recovery_stale');
+    const newer = (await inspectFeedbackRecovery(directory)).find(value => value.kind === 'webhook')!;
+    await acknowledgeFeedbackRecovery(directory, { ...decision, kind: newer.kind, id: newer.id, fingerprint: newer.fingerprint });
     await freezeFeedbackSource(directory, job.migrationId);
   });
   it('rejects stale acknowledgement and any acknowledgement for a live send lease', async () => {
