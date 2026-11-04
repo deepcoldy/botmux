@@ -78,13 +78,15 @@ Instead of `tokenRef`, configure a structured doas source:
 }
 ```
 
-The host must have `doas` installed and noninteractive authorization for the selected PSM/environment. BotMux executes fixed arguments equivalent to `doas --type gdpr -p <psm> --print-env -e <environment> --no-interaction`, with an explicit private identity directory. It accepts a single bare token line, never evaluates shell output, and does not expose stdout/stderr.
+The host must have `doas`, Perl with the standard Fcntl/POSIX modules, and noninteractive authorization for the selected PSM/environment. BotMux executes fixed arguments equivalent to `doas --type gdpr -p <psm> --print-env -e <environment> --no-interaction`, with an explicit private identity directory. It accepts a single bare token line, never evaluates shell output, and does not expose stdout/stderr.
 
 Both acquisition and `doas clean` use the same 0700 cache root under `<dataDir>/feedback-doas/<source-hash>`, with `TMPDIR`, `TMP`, `TEMP` and `DOAS_IDENTITY_DIR` explicitly scoped. The cross-process refresh lock lives outside the cache entries removed by clean. Shared user doas caches are not copied or cleaned; a fresh private cache may require an administrator to establish noninteractive authentication.
 
-No TTL is assumed and there is no periodic clean. Only a new-connection authentication rejection (`28000` or `28P01`) triggers one serialized clean/refetch and one reconnect. Other callers that rejected the same generation reuse the replacement rather than cleaning again. Network/TLS errors and SQL/transaction errors never trigger this recovery, and SQL is never replayed. If recovery fails, the rejected generation is marked unusable instead of being served indefinitely.
+No TTL is assumed and there is no periodic clean. Only a new-connection authentication rejection (`28000` or `28P01`) triggers one serialized clean/refetch and one reconnect. Other callers that rejected the same generation reuse the replacement rather than cleaning again. Network/TLS errors and SQL/transaction errors never trigger this recovery, and SQL is never replayed. The cleanup attempt is recorded before execution, so failed or interrupted cleanup is not blindly repeated. Later connection attempts may retry acquisition; a hash of the rejected credential prevents returning that same token. If doas continues returning it, an administrator must restore authentication in the private cache.
 
-Dashboard provides **Token source → Dynamic doas**, PSM and environment. Token values remain in process memory; BotMux persists only a nonsecret generation marker (doas itself manages its private credential cache). Acquisition/cleanup commands have time and output bounds. No arbitrary command string can be supplied through this configuration.
+A child-held kernel lock and independent command timeout keep private-cache operations serialized even if the calling BotMux process dies. The lock remains held by the credential command until it exits; it is separate from the parent-process metadata lock.
+
+Dashboard provides **Token source → Dynamic doas**, PSM and environment. Token values remain in process memory; BotMux persists only generation metadata and credential hashes (doas itself manages its private credential cache). Acquisition/cleanup commands have time and output bounds. No arbitrary command string can be supplied through this configuration.
 
 Local tests exercise startup-packet encoding (including IPv6), escaping, error/notice redaction and existing PostgreSQL 17 storage/migration behavior. They do not certify authorization against a production BytePG gateway; use **Test saved connection** in an authorized environment before migration, without sharing tokens in chat or logs.
 
