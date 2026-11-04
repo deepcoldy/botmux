@@ -267,6 +267,12 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
   let end = feedbackIndex + 1;
   while (end < elements.length && FEEDBACK_ELEMENT_IDS.has(String((elements[end] as any)?.element_id ?? ''))) end++;
   const updated = feedbackStateElements(policy, state);
+  const originalColumns = (elements[feedbackIndex] as { columns?: Array<{ width?: string; elements?: unknown[] }> }).columns;
+  if (originalColumns?.length === 1 && originalColumns[0].width === 'weighted') {
+    const columns = updated[0].columns as Array<{ elements: unknown[] }>;
+    updated[0].columns = [{ tag: 'column', width: 'weighted', weight: 1, elements: columns.flatMap(column => column.elements) }];
+    updated[0].flex_mode = 'none';
+  }
   const oncall = (elements[feedbackIndex] as any).columns?.find((column: any) => column.element_id === 'botmux_oncall_group_column');
   // Lark's message read API omits behaviors, so restore the callback definition.
   if (oncall) { (updated[0] as any).columns.push(buildOncallGroupColumn()); updated[0].flex_mode = 'flow'; }

@@ -1,0 +1,172 @@
+import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+
+export interface ExtensionJobInput { id: string; kind: 'hook' | 'surface'; payload: Record<string, unknown> }
+export interface ExtensionJob extends ExtensionJobInput {
+  status: 'pending' | 'running' | 'succeeded' | 'blocked' | 'failed_before_effect' | 'unknown';
+  token?: string;
+  result?: Record<string, unknown>;
+}
+
+export class FeedbackExtensionStore {
+  private constructor(private readonly database: DatabaseSyncLike) {
+    const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+    if (version > 1) { database.close(); throw new Error('feedback_extension_schema_newer'); }
+    database.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+      CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS received(source TEXT NOT NULL,event_id TEXT NOT NULL,PRIMARY KEY(source,event_id));
+      CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,
+        token TEXT,deadline INTEGER,result TEXT);
+      CREATE TABLE IF NOT EXISTS action_requests(request_id TEXT PRIMARY KEY,actor TEXT NOT NULL,job_id TEXT NOT NULL REFERENCES jobs(id));
+      CREATE TABLE IF NOT EXISTS answers(app_id TEXT NOT NULL,chat_id TEXT NOT NULL,subject_id TEXT NOT NULL,
+        answer_id TEXT NOT NULL,delivery_id TEXT NOT NULL,round INTEGER NOT NULL,PRIMARY KEY(app_id,answer_id));
+      CREATE TABLE IF NOT EXISTS surfaces(app_id TEXT NOT NULL,message_id TEXT NOT NULL,binding TEXT NOT NULL,PRIMARY KEY(app_id,message_id));
+      CREATE TABLE IF NOT EXISTS activation(app_id TEXT PRIMARY KEY,started_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS dirty_surfaces(app_id TEXT NOT NULL,message_id TEXT NOT NULL,state TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(app_id,message_id));
+      PRAGMA user_version=1;
+    `);
+  }
+  static async open(dataDir: string): Promise<FeedbackExtensionStore> {
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    return new FeedbackExtensionStore(await openDatabaseSync(join(dataDir, 'feedback-extensions.sqlite')));
+  }
+  close(): void { this.database.close(); }
+  activate(appId: string, startedAt: string): string {
+    this.database.prepare('INSERT OR IGNORE INTO activation VALUES(?,?)').run(appId, startedAt);
+    return (this.database.prepare('SELECT started_at FROM activation WHERE app_id=?').get(appId) as { started_at: string }).started_at;
+  }
+  unsettledHookIds(): string[] {
+    const rows = this.database.prepare("SELECT DISTINCT json_extract(payload,'$.hookId') AS id FROM jobs WHERE kind='hook' AND status IN ('pending','running','unknown')").all() as Array<{ id: string }>;
+    return rows.map(row => row.id).filter(Boolean);
+  }
+  jobsForApp(appId: string, limit = 50): ExtensionJob[] {
+    return (this.database.prepare("SELECT id FROM jobs WHERE json_extract(payload,'$.appId')=? ORDER BY rowid DESC LIMIT ?")
+      .all(appId, Math.max(1, Math.min(limit, 100))) as Array<{ id: string }>).map(row => this.job(row.id)!);
+  }
+  recordAnswer(input: { appId: string; chatId: string; subjectId: string; answerId: string; deliveryId: string }): number {
+    return this.transaction(() => {
+      const previous = this.database.prepare('SELECT * FROM answers WHERE app_id=? AND answer_id=?').get(input.appId, input.answerId) as {
+        chat_id: string; subject_id: string; delivery_id: string; round: number;
+      } | undefined;
+      if (previous) {
+        if (previous.chat_id !== input.chatId || previous.subject_id !== input.subjectId || previous.delivery_id !== input.deliveryId) throw new Error('feedback_answer_binding_conflict');
+        return previous.round;
+      }
+      const next = Number((this.database.prepare('SELECT COALESCE(MAX(round),0)+1 AS next FROM answers WHERE app_id=? AND chat_id=? AND subject_id=?')
+        .get(input.appId, input.chatId, input.subjectId) as { next: number }).next);
+      this.database.prepare('INSERT INTO answers VALUES(?,?,?,?,?,?)').run(input.appId, input.chatId, input.subjectId, input.answerId, input.deliveryId, next);
+      return next;
+    });
+  }
+  bindSurface(appId: string, messageId: string, binding: Record<string, unknown>): void {
+    const serialized = JSON.stringify(binding);
+    this.transaction(() => {
+      const previous = this.surface(appId, messageId);
+      if (previous && JSON.stringify(previous) !== serialized) throw new Error('feedback_surface_binding_conflict');
+      this.database.prepare('INSERT OR IGNORE INTO surfaces VALUES(?,?,?)').run(appId, messageId, serialized);
+    });
+  }
+  surface(appId: string, messageId: string): Record<string, unknown> | undefined {
+    const row = this.database.prepare('SELECT binding FROM surfaces WHERE app_id=? AND message_id=?').get(appId, messageId) as { binding: string } | undefined;
+    return row ? JSON.parse(row.binding) : undefined;
+  }
+  surfacesForDelivery(appId: string, deliveryId: string): Array<{ messageId: string; binding: Record<string, unknown> }> {
+    const rows = this.database.prepare("SELECT message_id,binding FROM surfaces WHERE app_id=? AND json_extract(binding,'$.deliveryId')=?")
+      .all(appId, deliveryId) as Array<{ message_id: string; binding: string }>;
+    return rows.map(row => ({ messageId: row.message_id, binding: JSON.parse(row.binding) }));
+  }
+  dirtySurface(appId: string, messageId: string, state: Record<string, unknown>): void {
+    this.database.prepare(`INSERT INTO dirty_surfaces(app_id,message_id,state) VALUES(?,?,?)
+      ON CONFLICT(app_id,message_id) DO UPDATE SET state=excluded.state,revision=dirty_surfaces.revision+1`)
+      .run(appId, messageId, JSON.stringify(state));
+  }
+  dirtySurfaces(appId: string): Array<{ messageId: string; state: Record<string, unknown>; revision: number }> {
+    const rows = this.database.prepare('SELECT message_id,state,revision FROM dirty_surfaces WHERE app_id=?').all(appId) as Array<{ message_id: string; state: string; revision: number }>;
+    return rows.map(row => ({ messageId: row.message_id, state: JSON.parse(row.state), revision: row.revision }));
+  }
+  clearDirtySurface(appId: string, messageId: string, revision: number): void {
+    this.database.prepare('DELETE FROM dirty_surfaces WHERE app_id=? AND message_id=? AND revision=?').run(appId, messageId, revision);
+  }
+  private transaction<Result>(operation: () => Result): Result {
+    this.database.exec('BEGIN IMMEDIATE');
+    try { const result = operation(); this.database.exec('COMMIT'); return result; }
+    catch (error) { this.database.exec('ROLLBACK'); throw error; }
+  }
+  cursor(source: string): number {
+    return Number((this.database.prepare('SELECT sequence FROM cursors WHERE source=?').get(source) as { sequence: number } | undefined)?.sequence ?? 0);
+  }
+  private insertJob(job: ExtensionJobInput): void {
+    this.database.prepare("INSERT OR IGNORE INTO jobs(id,kind,payload,status) VALUES(?,?,?,'pending')")
+      .run(job.id, job.kind, JSON.stringify(job.payload));
+  }
+  ingest(source: string, expected: number, entries: Array<{ sequence: number; eventId: string; jobs: ExtensionJobInput[] }>): void {
+    this.transaction(() => {
+      if (this.cursor(source) !== expected) throw new Error('feedback_extension_cursor_conflict');
+      let sequence = expected;
+      for (const entry of entries) {
+        if (!Number.isSafeInteger(entry.sequence) || entry.sequence <= sequence) throw new Error('feedback_extension_sequence_invalid');
+        sequence = entry.sequence;
+        const inserted = this.database.prepare('INSERT OR IGNORE INTO received VALUES(?,?)').run(source, entry.eventId);
+        if (Number(inserted.changes)) for (const job of entry.jobs) this.insertJob(job);
+      }
+      this.database.prepare('INSERT INTO cursors VALUES(?,?) ON CONFLICT(source) DO UPDATE SET sequence=excluded.sequence').run(source, sequence);
+    });
+  }
+  requestAction(input: { requestId: string; actor: string; job: ExtensionJobInput }): void {
+    this.transaction(() => {
+      this.insertJob(input.job);
+      const previous = this.database.prepare('SELECT actor,job_id FROM action_requests WHERE request_id=?').get(input.requestId) as { actor: string; job_id: string } | undefined;
+      if (previous && (previous.actor !== input.actor || previous.job_id !== input.job.id)) throw new Error('feedback_action_request_conflict');
+      this.database.prepare('INSERT OR IGNORE INTO action_requests VALUES(?,?,?)').run(input.requestId, input.actor, input.job.id);
+    });
+  }
+  retryBeforeEffect(id: string, expectedToken: string, requestId: string, actor: string): boolean {
+    return this.transaction(() => {
+      if (this.database.prepare('SELECT request_id FROM action_requests WHERE request_id=?').get(requestId)) return false;
+      const row = this.database.prepare("SELECT result FROM jobs WHERE id=? AND status='failed_before_effect'").get(id) as { result: string } | undefined;
+      if (!row || JSON.parse(row.result ?? '{}').retryToken !== expectedToken) return false;
+      this.database.prepare('INSERT INTO action_requests VALUES(?,?,?)').run(requestId, actor, id);
+      this.database.prepare("UPDATE jobs SET status='pending',result=NULL,token=NULL,deadline=NULL WHERE id=? AND status='failed_before_effect'").run(id);
+      return true;
+    });
+  }
+  actionRequests(jobId: string): Array<{ requestId: string; actor: string }> {
+    return this.database.prepare('SELECT request_id AS requestId,actor FROM action_requests WHERE job_id=? ORDER BY rowid').all(jobId) as Array<{ requestId: string; actor: string }>;
+  }
+  job(id: string): ExtensionJob | undefined {
+    const row = this.database.prepare('SELECT * FROM jobs WHERE id=?').get(id) as {
+      id: string; kind: ExtensionJob['kind']; payload: string; status: ExtensionJob['status']; token: string | null; result: string | null;
+    } | undefined;
+    return row ? { id: row.id, kind: row.kind, status: row.status, payload: JSON.parse(row.payload),
+      ...(row.token ? { token: row.token } : {}), ...(row.result ? { result: JSON.parse(row.result) } : {}) } : undefined;
+  }
+  claim(kind: ExtensionJob['kind'], now: number, timeoutMs: number, appId?: string, limits?: Record<string, number>): ExtensionJob | undefined {
+    return this.transaction(() => {
+      const candidates = (appId
+        ? this.database.prepare("SELECT id,payload FROM jobs WHERE kind=? AND status='pending' AND json_extract(payload,'$.appId')=? ORDER BY rowid").all(kind, appId)
+        : this.database.prepare("SELECT id,payload FROM jobs WHERE kind=? AND status='pending' ORDER BY rowid").all(kind)) as Array<{ id: string; payload: string }>;
+      const row = candidates.find(candidate => {
+        if (kind !== 'hook') return true;
+        const hookId = JSON.parse(candidate.payload).hookId;
+        const running = this.database.prepare("SELECT COUNT(*) AS count FROM jobs WHERE kind='hook' AND status='running' AND json_extract(payload,'$.hookId') IS ?")
+          .get(hookId ?? null) as { count: number };
+        return running.count < (limits?.[hookId] ?? 1);
+      });
+      if (!row) return undefined;
+      this.database.prepare("UPDATE jobs SET status='running',token=?,deadline=? WHERE id=? AND status='pending'")
+        .run(randomUUID(), now + timeoutMs, row.id);
+      return this.job(row.id);
+    });
+  }
+  settle(id: string, token: string, status: Exclude<ExtensionJob['status'], 'pending' | 'running'>, result: Record<string, unknown>, now = Date.now()): boolean {
+    if (status === 'failed_before_effect') result = { ...result, retryToken: randomUUID() };
+    return Number(this.database.prepare("UPDATE jobs SET status=?,result=?,token=NULL WHERE id=? AND status='running' AND token=? AND deadline>=?")
+      .run(status, JSON.stringify(result), id, token, now).changes) === 1;
+  }
+  expire(now: number): void {
+    this.database.prepare("UPDATE jobs SET status='unknown',token=NULL WHERE status='running' AND deadline<?").run(now);
+  }
+}

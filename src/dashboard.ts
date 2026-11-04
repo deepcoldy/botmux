@@ -133,6 +133,7 @@ import {
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
 import { handleFeedbackStorageApi } from './dashboard/feedback-storage-api.js';
+import { handleFeedbackExtensionApi } from './dashboard/feedback-extension-api.js';
 import { getFeedbackStorage, closeFeedbackStorage } from './services/feedback-storage.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
@@ -4690,6 +4691,15 @@ const server = createServer(async (req, res) => {
       if (!legacyAuthed || requestIdentity?.kind !== 'legacy-dashboard') return jsonRes(res, 403, { error: 'feedback_storage_admin_required' });
       if (req.method !== 'GET' && !enforceControlCsrf(req, res, requestIdentity)) return;
       await handleFeedbackStorageApi(req, res, url, { dataDir: config.session.dataDir, isHostAdmin: true, csrfValid: true });
+      return;
+    }
+    if (url.pathname.startsWith('/api/feedback/extensions')) {
+      if (!authed || !requestIdentity) return jsonRes(res, 403, { error: 'feedback_extension_forbidden' });
+      if (req.method !== 'GET' && !enforceControlCsrf(req, res, requestIdentity)) return;
+      await handleFeedbackExtensionApi(req, res, url, {
+        dataDir: config.session.dataDir, hostAdmin: legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
+        manager: authed, csrf: true,
+      });
       return;
     }
 

@@ -25,6 +25,18 @@ async function fixture() {
   return { directory, store };
 }
 describe('feedback maintenance', () => {
+  it('freezes and restores a source with an installed feedback stream without losing sequence state', async () => {
+    const { directory, store } = await fixture();
+    store.readFeedbackEventsAfter({ after: 0, limit: 10 });
+    await beginFeedbackMaintenance(directory, 'stream-migration');
+    await freezeFeedbackSource(directory, 'stream-migration');
+    expect(() => store.createResponse({ interactionId: 'frozen', content: 'blocked' })).toThrow('feedback_source_frozen');
+    await restoreFeedbackSource(directory, 'stream-migration');
+    store.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
+    store.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'turn', platform: 'lark',
+      platformAppId: 'app', platformMessageId: 'message', content: 'answer', status: 'delivered', cardMode: 'card' });
+    expect(store.readFeedbackEventsAfter({ after: 0, limit: 10 })).toHaveLength(1);
+  });
   it('rejects unknown business tables before freezing known tables', async () => {
     const { directory, store } = await fixture();
     const { openDatabaseSync } = await import('../src/services/sqlite-compat.js');
