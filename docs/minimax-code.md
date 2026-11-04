@@ -41,6 +41,20 @@ mcode 的 OAuth 账号键包含数据目录的原始路径。Linux 上 HOME 或�
 
 默认权限对应 ACP 的 `bypassPermissions`，`disableCliBypass: true` 时对应原生 `auto`（与原 exec 的 `full` / `smart` 一致）。模型和思考等级通过原生 `session/set_config_option` 配置，只接受 CLI 实际提供的选项，不支持时明确失败。Botmux 会话 fork 仍明确拒绝。
 
+### MCP 配置
+
+每次新建或恢复 ACP 会话时，读取当前账号的 `<data-dir>/mcp.json` 和当前工作目录的 `.mcp.json`。两者均使用 `mcpServers` 对象；项目同名条目整体覆盖账号条目，禁用或无效的项目条目不会回退启用账号配置。不会修改配置文件，也不跨账号或项目缓存。无配置时仍传空列表，正常对话不受影响。
+
+可通过 ACP 传递 stdio 的 `command`、`args`、`env`，以及 HTTP／streamable-http、SSE 的 `url`、`headers`；远程传输须由 mcode 在初始化时声明支持。名称和值按协议转换为列表。账号配置中的字符串保持原值；项目配置按 mcode 规则从当前 bot 的环境展开 `${NAME}` 和 `${NAME:-fallback}`，不执行 shell。`enabled: false` 不会被重新启用；账号的 `configured: false` 和 `builtin: true` 交由原生管理。
+
+ACP 无法表达原生的 `auth`、`timeout`、`metadata`、`tools`、`description`。包含这些字段的条目保留在 mcode 的原生文件配置中，不用缺少字段的会话覆盖替代。带请求头的项目 HTTP/SSE 配置也由原生加载，保留跨来源重定向时移除配置请求头的保护。日志以 `native_only_options` 或 `native_only_project_headers` 标明未通过 ACP 覆盖；实际支持取决于 mcode 原生版本。Botmux 不读取 OAuth token 来拼装新认证方式。
+
+项目配置解析保持在工作目录内，拒绝指向目录外的软链接、非普通文件和超过 1 MiB 的文件。无效 JSON、条目、未声明的传输和缺少的环境变量有脱敏诊断；不输出 URL、请求头、命令参数、变量值或解析异常中的配置片段。跳过一个无效条目不会丢弃其余有效配置。
+
+Linux 上使用 mcode 0.7.4、本地合成模型 Provider 和测试 MCP 服务验证账号／项目 HTTP、stdio 的工具发现、实际调用及新进程按精确 Session ID 恢复后的再次调用，并覆盖原生超时配置保留路径。SSE 的 ACP 映射由协议测试覆盖，未作真实服务验收；没有使用真实模型服务或生产 MCP 凭证。这项验收独立于下文较早的 mcode 0.6.5 验收记录。
+
+同版本对照中，传空 ACP 列表仍能由 mcode 原生读取配置并通过上述场景；本改动补齐显式 ACP 透传，不代表这些配置在 mcode 0.7.4 的旧接入中全部不可用。历史版本的工具不可见问题须单独复现，不能从参数为空直接归因。
+
 ### 单轮预算与压缩
 
 Dashboard 的机器人 Agent 设置支持 MiniMax Code 的「单轮总预算（分钟）」，保存到 `turnTimeoutMs` 并传入 runner 的 `--turn-timeout-ms`。**缺省不设置整轮时长上限**，正常长任务不再被 Botmux 在 10 分钟时中止；需要主动限制成本时可设为 60 分钟（`3600000`ms）。合法范围为 `1..2147483647` 毫秒，清空取消上限，修改其他设置保留原值。保存后在下一次会话拉起时生效，不会更新已运行 runner 的参数。
@@ -99,8 +113,10 @@ MiniMax 的 final `errorCode` 会进入 worker 的真实终态：`turn_budget_ex
 
 ```bash
 bun run test -- test/minimax-acp.test.ts test/minimax-user-input.test.ts test/minimax-acp-continuation.test.ts test/minimax-usage.test.ts test/sandbox.test.ts test/fs-policy.test.ts
+bun run test -- test/minimax-acp-mcp.test.ts
 bun x vitest run --project unit test/minimax-runner.test.ts test/cli-adapters.test.ts test/cli-runner-compiled-entries.test.ts test/cli-id-roster-derivation.test.ts test/ipc-constrained-invocation.test.ts test/worker-app-runner-control-wiring.test.ts test/worker-pipe-initial-screen-order.test.ts test/runner-control-channel.test.ts test/constrained-invocation.test.ts test/model-only-print.test.ts
 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
+BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun run test:e2e -- test/minimax-mcp.e2e.ts
 # 本地显式运行：真实 exec 默认预算的 610 秒边界探针
 BOTMUX_MCODE_LONG_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-exec-long.e2e.ts
 BOTMUX_MCODE_SANDBOX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts

@@ -4,6 +4,7 @@ import { spawnOwnedModelProcess } from './constrained-invocation/native-process.
 import { applySessionOwnerEnv } from '../utils/child-env.js';
 import { readMinimaxUsage } from './minimax-usage.js';
 import { minimaxDataDir } from './minimax-paths.js';
+import { loadAcpMcpServers } from './minimax-acp-mcp.js';
 import type { McodeExecOptions, McodeExecResult } from './mcode-exec.js';
 import { minimaxQuestionnaireCursor, pendingMinimaxQuestionnaires, readMinimaxContinuation } from './minimax-acp-continuation.js';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -166,15 +167,17 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
       clientInfo: { name: 'botmux', version: '1' }, clientCapabilities: { elicitation: { form: {} } } });
     if (init.protocolVersion !== 1) throw new Error('mcode_acp_version_unsupported');
     nativeRuntime = init.agentInfo?.name === 'minimax-code';
+    const mcpServers = loadAcpMcpServers({ cwd: opts.cwd, dataDir: minimaxDataDir(env), env,
+      capabilities: init.agentCapabilities?.mcpCapabilities });
     let control: Json;
     if (opts.nativeSessionId) {
       sessionId = opts.nativeSessionId;
       if (!init.agentCapabilities?.loadSession) throw new Error('mcode_acp_resume_unsupported');
       const method = object(init.agentCapabilities?.sessionCapabilities?.resume) ? 'session/resume' : 'session/load';
-      control = await request(method, { sessionId, cwd: opts.cwd, mcpServers: [] });
+      control = await request(method, { sessionId, cwd: opts.cwd, mcpServers });
       if (control.sessionId !== undefined && control.sessionId !== sessionId) throw new Error('mcode_acp_resume_mismatch');
     } else {
-      control = await request('session/new', { cwd: opts.cwd, mcpServers: [] });
+      control = await request('session/new', { cwd: opts.cwd, mcpServers });
       if (typeof control.sessionId !== 'string' || !control.sessionId) throw new Error('mcode_acp_session_invalid');
       sessionId = control.sessionId;
     }
