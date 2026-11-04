@@ -1,5 +1,6 @@
 import { isAbsolute } from 'node:path';
 import type { FeedbackHookRegistration } from './feedback-extension-types.js';
+import { feedbackExtensionId } from './feedback-extension-id.js';
 
 function text(value: unknown, path: string): string {
   if (typeof value !== 'string' || !value.trim() || value.includes('\0') || value.length > 4096) {
@@ -16,9 +17,7 @@ function positive(value: unknown, path: string): number {
 function identifiers(value: unknown, path: string): string[] {
   if (!Array.isArray(value) || !value.length) throw new Error(`feedbackHook.${path}: expected nonempty array`);
   const result = value.map((entry, index) => {
-    const normalized = text(entry, `${path}[${index}]`);
-    if (!/^[a-zA-Z0-9_-]+$/.test(normalized)) throw new Error(`feedbackHook.${path}: invalid identifier`);
-    return normalized;
+    return feedbackExtensionId(entry, `feedbackHook.${path}[${index}]`);
   });
   if (new Set(result).size !== result.length) throw new Error(`feedbackHook.${path}: duplicate`);
   return result;
@@ -35,14 +34,18 @@ export function normalizeFeedbackHook(input: unknown): FeedbackHookRegistration 
   if (raw.protocolVersion !== 1) throw new Error('feedbackHook.protocolVersion: unsupported');
   if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') throw new Error('feedbackHook.enabled: expected boolean');
   if (!Array.isArray(raw.command) || !raw.command.length) throw new Error('feedbackHook.command: expected argument array');
-  const command = raw.command.map((entry, index) => text(entry, `command[${index}]`));
+  const command = raw.command.map((entry, index) => {
+    if (index === 0) return text(entry, 'command[0]');
+    if (typeof entry !== 'string' || entry.includes('\0') || entry.length > 4096) throw new Error(`feedbackHook.command[${index}]: invalid argument`);
+    return entry;
+  });
   const cwd = text(raw.cwd, 'cwd');
   if (!isAbsolute(command[0]) || !isAbsolute(cwd)) throw new Error('feedbackHook.command/cwd: absolute paths required');
   const envRefs: Record<string, string> = {};
   if (raw.envRefs !== undefined) {
     if (!raw.envRefs || typeof raw.envRefs !== 'object' || Array.isArray(raw.envRefs)) throw new Error('feedbackHook.envRefs: expected object');
     for (const [name, value] of Object.entries(raw.envRefs)) {
-      if (!/^[A-Z][A-Z0-9_]*$/.test(name) || /^(PATH|HOME|SHELL|BASH_ENV|ENV|NODE_OPTIONS|NODE_PATH|PYTHONPATH|PYTHONHOME|LD_.+|DYLD_.+|BOTMUX_.+|__OWNER_OPEN_ID)$/.test(name)) {
+      if (!/^[A-Z][A-Z0-9_]*$/.test(name) || /^(PATH|HOME|SHELL|BASH_ENV|ENV|NODE_OPTIONS|NODE_PATH|BUN_.+|BOTS_CONFIG|LARK_.+|SESSION_DATA_DIR|PYTHONPATH|PYTHONHOME|LD_.+|DYLD_.+|BOTMUX_.+|__OWNER_OPEN_ID)$/.test(name)) {
         throw new Error(`feedbackHook.envRefs.${name}: reserved environment variable`);
       }
       const reference = text(value, `envRefs.${name}`);

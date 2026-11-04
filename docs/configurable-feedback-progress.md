@@ -33,4 +33,4 @@
 bun run test test/bot-config-store.test.ts test/feedback-presentation.test.ts test/feedback-hook-config.test.ts
 ```
 
-当前基础测试 188 项通过；仅证明上述配置行为，不代表剩余功能或真实客户端已验收。
+当前基础测试覆盖配置写入和重载、规则继承、动作 ID 一致性、保留环境变量及空 argv；仅证明上述配置行为，不代表剩余功能或真实客户端已验收。

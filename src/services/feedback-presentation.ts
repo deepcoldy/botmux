@@ -2,6 +2,7 @@ import type {
   EffectivePresentation, FeedbackPresentationConfig, FeedbackPresentationLayer,
   FeedbackPresentationRule, FeedbackScope,
 } from './feedback-extension-types.js';
+import { feedbackExtensionId } from './feedback-extension-id.js';
 
 function record(value: unknown, path: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${path}: expected object`);
@@ -43,7 +44,7 @@ function layer(value: unknown, path: string): FeedbackPresentationLayer {
   if (raw.templateId !== undefined) result.templateId = identifier(raw.templateId, `${path}.templateId`);
   if (raw.actionIds !== undefined) {
     if (!Array.isArray(raw.actionIds)) throw new Error(`${path}.actionIds: expected array`);
-    result.actionIds = raw.actionIds.map((entry, index) => identifier(entry, `${path}.actionIds[${index}]`));
+    result.actionIds = raw.actionIds.map((entry, index) => feedbackExtensionId(entry, `${path}.actionIds[${index}]`));
     if (new Set(result.actionIds).size !== result.actionIds.length) throw new Error(`${path}.actionIds: duplicate`);
   }
   return result;

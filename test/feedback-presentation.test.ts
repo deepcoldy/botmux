@@ -37,6 +37,8 @@ describe('feedback presentation rules', () => {
     { default: { rounds: [1.2] } },
     { default: { enabled: 'false' } },
     { default: { buttons: [] } },
+    { default: { actionIds: ['review.v1'] } },
+    { default: { actionIds: ['review\u0000admin'] } },
     { rules: [{ id: 'bad', match: { sourceMessageId: 'question' } }] },
     { rules: [{ id: 'bad', match: { chatId: 'chat' }, mode: 'popup' }] },
     { rules: [{ id: 'a', match: { chatId: 'chat' } }, { id: 'b', match: { chatId: 'chat' } }] },

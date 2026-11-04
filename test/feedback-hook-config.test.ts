@@ -18,6 +18,9 @@ describe('host feedback hook registration', () => {
     { allowedChatIds: [] }, { allowedBotAppIds: ['*'] }, { allowedActionIds: ['review', 'review'] },
     { envRefs: { PATH: '/tmp/bin' } }, { envRefs: { LD_PRELOAD: 'library' } },
     { envRefs: { NODE_OPTIONS: 'options' } }, { envRefs: { EXAMPLE_TOKEN: '../secret' } },
+    { envRefs: { BUN_OPTIONS: 'options' } }, { envRefs: { BOTS_CONFIG: 'other-config' } },
+    { envRefs: { LARK_APP_ID: 'other-app' } }, { envRefs: { LARK_APP_SECRET: 'other-secret' } },
+    { envRefs: { SESSION_DATA_DIR: 'other-dir' } },
     { env: { TOKEN: 'plaintext' } }, { protocolVersion: 2 }, { version: 0 },
   ])('rejects unsafe or ambiguous registration %j', change => {
     expect(() => normalizeFeedbackHook({ ...input, ...change })).toThrow(/feedbackHook/);
@@ -28,5 +31,9 @@ describe('host feedback hook registration', () => {
     normalized.allowedChatIds.push('other');
     expect(input.command).toHaveLength(3);
     expect(input.allowedChatIds).toEqual(['chat-example']);
+  });
+  it('preserves empty and whitespace arguments', () => {
+    expect(normalizeFeedbackHook({ ...input, command: ['/usr/bin/printf', '%s', '', ' '] }).command)
+      .toEqual(['/usr/bin/printf', '%s', '', ' ']);
   });
 });
