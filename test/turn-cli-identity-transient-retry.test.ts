@@ -89,8 +89,11 @@ const prepare = () => publishTurnCliIdentity({
   botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE, turnId: TURN, storageModel: 'proven',
 });
 const current = (tool: 'bytedcli' | 'codebase' = 'bytedcli') => recallProvenIdentityContent(dir, SESSION, TURN, tool) ?? '';
-const retry = (botConfig: any = config) =>
-  retryTransientTurnIdentity({ sessionDataDir: dir, sessionId: SESSION, turnId: TURN, tool: 'bytedcli', botConfig });
+const retry = (botConfig: any = config, currentPolicy?: () => any) =>
+  retryTransientTurnIdentity({
+    sessionDataDir: dir, sessionId: SESSION, turnId: TURN, tool: 'bytedcli', botConfig,
+    ...(currentPolicy ? { currentPolicy } : {}),
+  });
 const hangingGrants = () => {
   let release!: (v: unknown) => void;
   __setPlatformCredentialDepsForTest({
@@ -264,6 +267,98 @@ describe('transient platform refusal within a turn', () => {
     release(GRANTED);
     await pending;
     expect(current()).not.toContain('cloud-jwt');
+  });
+
+  // ─── The in-flight window: the policy is re-read AFTER the platform answers ───
+  //
+  // Dashboard replaces the whole bot config object, so a snapshot cannot observe
+  // an edit made while an attempt is waiting on the platform. These cases hold
+  // the platform request open, change the policy, then release it.
+
+  /** Prepare a turn, start a re-ask and hold it in flight; returns the release. */
+  const startHeldRetry = async (opts: { botConfig?: any; currentPolicy: () => any }) => {
+    responses = [NETWORK_DOWN];
+    await prepare();
+    const release = hangingGrants();
+    const pending = retry(opts.botConfig ?? config, opts.currentPolicy);
+    await vi.waitFor(() => expect(grantCalls).toBe(2));
+    return { release, pending };
+  };
+  const localPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' });
+  const autoPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'auto' });
+  const platformPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
+  const toolOffPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' });
+
+  it('does not write a grant acquired while the bot was switched to local credentials', async () => {
+    let policy = platformPolicy();
+    const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
+    policy = localPolicy();     // operator switches the bot mid-flight
+    const before = current();
+    release(GRANTED);
+    await pending;
+    expect(current()).not.toContain('cloud-jwt');
+    expect(current()).toBe(before);   // the turn keeps the refusal it had
+  });
+
+  it('does not write a grant acquired while the tool was taken out of the policy', async () => {
+    let policy = platformPolicy();
+    const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
+    policy = toolOffPolicy();   // bytedcli no longer governed
+    const before = current();
+    release(GRANTED);
+    await pending;
+    expect(current()).not.toContain('cloud-jwt');
+    expect(current()).toBe(before);
+  });
+
+  it('does not write a grant acquired while the whole policy was switched off', async () => {
+    let policy: any = platformPolicy();
+    const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
+    policy = undefined;         // triggerUserAuth.enabled = false
+    const before = current();
+    release(GRANTED);
+    await pending;
+    expect(current()).not.toContain('cloud-jwt');
+    expect(current()).toBe(before);
+  });
+
+  it('stops asking (and drops the entry) when the bot no longer governs the tool', async () => {
+    let policy: any = platformPolicy();
+    const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
+    policy = localPolicy();
+    release(GRANTED);
+    await pending;
+    // The entry is gone: a later call must not re-ask at all.
+    const callsBefore = grantCalls;
+    later();
+    await retry(config, () => policy);
+    expect(grantCalls).toBe(callsBefore);
+  });
+
+  it('a bot config reader that throws (bot removed) is treated as no longer governed', async () => {
+    // Both windows refuse. Before an attempt: no platform call is made at all.
+    responses = [NETWORK_DOWN, GRANTED];
+    await prepare();
+    const before = current();
+    const throwing = () => { throw new Error('Bot not registered: cli_bot'); };
+    await retry(config, throwing);
+    expect(grantCalls).toBe(1);
+    expect(current()).toBe(before);
+    // And a later call cannot revive it: the entry was dropped.
+    await retry(config, () => platformPolicy());
+    expect(grantCalls).toBe(1);
+    expect(current()).toBe(before);
+  });
+
+  it('still writes the grant when the source was switched to auto mid-flight', async () => {
+    // auto still takes credentials from the platform, so this is NOT a change of
+    // intent: blocking it would be the opposite bug (a needless refusal).
+    let policy = platformPolicy();
+    const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
+    policy = autoPolicy();
+    release(GRANTED);
+    await pending;
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
   });
 
   it('an older attempt finishing does not erase the entry of a republished refusal', async () => {

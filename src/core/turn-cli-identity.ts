@@ -26,6 +26,7 @@ import {
   triggerUserAuthApplies,
   credentialSourceOf,
   TRIGGER_USER_AUTH_TOOLS,
+  type TriggerUserAuthConfig,
   type TriggerUserAuthTool,
 } from '../services/trigger-user-auth.js';
 import type { IdentityStorageModel } from './lark-tool-binding.js';
@@ -404,9 +405,11 @@ function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'authEp
  * refusal is still the one in force. Concurrent callers share one attempt; no
  * caller waits longer than {@link TRANSIENT_REFUSAL_WAIT_CAP_MS}. Never throws.
  *
- * `botConfig` is the bot's CURRENT config, checked for its policy only: a
- * policy changed mid-turn (tool no longer governed, source switched to local)
- * ends the re-asks instead of fetching under the policy the turn started with.
+ * `currentPolicy` — not `botConfig` — is what decides whether a re-ask may run
+ * and whether its answer may be written: a bot policy changed mid-turn (tool no
+ * longer governed, source switched to local) ends the re-asks instead of
+ * publishing under the policy the turn started with. `botConfig` is only the
+ * fallback for a caller with no registry reader.
  */
 export async function retryTransientTurnIdentity(args: {
   sessionDataDir: string;
@@ -414,25 +417,28 @@ export async function retryTransientTurnIdentity(args: {
   turnId: string;
   tool: TriggerUserAuthTool;
   botConfig?: BotConfig;
+  /** Reads the LIVE policy for this bot. Must be supplied by whoever holds the
+   *  bot registry: a mid-turn Dashboard edit replaces the whole config object,
+   *  so any snapshot (including `botConfig`) stays stale and would let an
+   *  in-flight attempt publish under a policy the operator already left. */
+  currentPolicy?: () => TriggerUserAuthConfig | undefined;
 }): Promise<void> {
   const key = transientKey(args.sessionDataDir, args.sessionId, args.turnId, args.tool);
   const entry = transientRefusals.get(key);
   if (!entry) return;
   if (!entry.inFlight) {
     const now = Date.now();
-    const policy = (args.botConfig ?? entry.botConfig).triggerUserAuth;
     if (!stillInForce(entry)
       || now - entry.createdAt > TRANSIENT_REFUSAL_TTL_MS
       || entry.retries >= TRANSIENT_REFUSAL_MAX_RETRIES
-      || !triggerUserAuthApplies(policy, entry.tool)
-      || credentialSourceOf(policy) === 'local') {
+      || !policyStillWants(args.currentPolicy, entry, args.botConfig)) {
       transientRefusals.delete(key);
       return;
     }
     if (now - entry.lastAttemptAt < TRANSIENT_REFUSAL_RETRY_INTERVAL_MS) return;
     entry.lastAttemptAt = now;
     entry.retries++;
-    entry.inFlight = runTransientRetry(key, entry)
+    entry.inFlight = runTransientRetry(key, entry, args.currentPolicy, args.botConfig)
       .finally(() => { entry.inFlight = undefined; });
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -450,7 +456,36 @@ function stillInForce(entry: TransientRefusal): boolean {
     && readCliAuthEpoch(entry.senderOpenId) === entry.authEpoch;
 }
 
-async function runTransientRetry(key: string, entry: TransientRefusal): Promise<void> {
+/** Does the bot's policy — read NOW, not when the refusal was published — still
+ *  take this tool's credentials from the platform?
+ *
+ *  Dashboard writes replace the whole bot config object
+ *  (`bots.set(appId, { config: cfg, … })`), so a snapshot taken at publication
+ *  time (the entry's `botConfig`) can never observe a mid-turn edit: only a
+ *  reader supplied by whoever holds the registry can.
+ *
+ *  A reader that throws means the bot is gone; that is "no longer governed", so
+ *  the re-ask stops rather than publishing under a policy nobody stated. */
+function policyStillWants(
+  live: (() => TriggerUserAuthConfig | undefined) | undefined,
+  entry: TransientRefusal,
+  fallbackConfig: BotConfig | undefined,
+): boolean {
+  let policy: TriggerUserAuthConfig | undefined;
+  if (live) {
+    try { policy = live(); } catch { return false; }
+  } else {
+    policy = (fallbackConfig ?? entry.botConfig).triggerUserAuth;
+  }
+  return triggerUserAuthApplies(policy, entry.tool) && credentialSourceOf(policy) !== 'local';
+}
+
+async function runTransientRetry(
+  key: string,
+  entry: TransientRefusal,
+  live: (() => TriggerUserAuthConfig | undefined) | undefined,
+  fallbackConfig: BotConfig | undefined,
+): Promise<void> {
   // Only ever drop THIS entry: a republication of the same turn registers a
   // fresh one under the same key, which an older attempt must not erase.
   const drop = () => { if (transientRefusals.get(key) === entry) transientRefusals.delete(key); };
@@ -459,8 +494,13 @@ async function runTransientRetry(key: string, entry: TransientRefusal): Promise<
       botConfig: entry.botConfig, tool: entry.tool, openId: entry.senderOpenId,
       sessionId: entry.sessionId, turnId: entry.turnId,
     });
-    // Compare-and-set: synchronous from here to the write.
-    if (transientRefusals.get(key) !== entry || !stillInForce(entry)) {
+    // Compare-and-set: synchronous from here to the write. The policy check
+    // belongs INSIDE this window: the attempt took a whole grant budget, and an
+    // operator switching this bot to local credentials (or turning the tool off)
+    // during it must not end with platform credentials on disk.
+    if (transientRefusals.get(key) !== entry
+      || !stillInForce(entry)
+      || !policyStillWants(live, entry, fallbackConfig)) {
       drop();
       return;
     }
