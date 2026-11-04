@@ -5,22 +5,27 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
-import type { FeedbackStorageConfig, FeedbackStorageTarget } from './feedback-storage-types.js';
+import type { FeedbackStorageConfig, FeedbackStorageTarget, PostgresTarget } from './feedback-storage-types.js';
 
 const secretReference = z.string().regex(/^(env:[A-Za-z_][A-Za-z0-9_]*|file:[0-9a-f-]{36})$/);
 const postgresSchema = z.object({
   host: z.string().min(1).max(253),
   port: z.number().int().min(1).max(65535),
   database: z.string().min(1).max(63),
-  user: z.string().min(1).max(63),
+  user: z.string().min(1).max(63).optional(),
   schema: z.string().regex(/^[a-z_][a-z0-9_]{0,62}$/),
-  passwordRef: secretReference,
+  passwordRef: secretReference.optional(),
+  bytepg: z.object({ computeId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/), tokenRef: secretReference }).strict().optional(),
   tls: z.object({
     mode: z.enum(['verify-full', 'disable']),
     caRef: secretReference.optional(),
   }).strict(),
   connectTimeoutMs: z.number().int().min(100).max(60000),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.bytepg ? value.passwordRef !== undefined : !value.passwordRef || !value.user) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'feedback_storage_auth_invalid' });
+  }
+});
 const targetSchema = z.discriminatedUnion('backend', [
   z.object({ backend: z.literal('sqlite') }).strict(),
   z.object({ backend: z.literal('postgresql'), postgres: postgresSchema }).strict(),
@@ -133,6 +138,12 @@ export async function readFeedbackStorageSecret(dataDir: string, reference: stri
   } catch {
     throw new Error('feedback_storage_secret_missing');
   }
+}
+
+export async function readPostgresCredential(dataDir: string, target: PostgresTarget): Promise<string> {
+  const reference = target.bytepg?.tokenRef ?? target.passwordRef;
+  if (!reference) throw new Error('feedback_storage_secret_missing');
+  return readFeedbackStorageSecret(dataDir, reference);
 }
 
 export async function activateFeedbackStorageCandidate(

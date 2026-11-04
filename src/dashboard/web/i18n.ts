@@ -5,6 +5,12 @@ type DashboardMessages = Record<string, string>;
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
 const zh = {
+  'feedback.storage.authentication': '认证方式',
+  'feedback.storage.passwordAuth': '用户名 / 密码',
+  'feedback.storage.bytepgAuth': 'BytePG Token',
+  'feedback.storage.computeId': 'BytePG Compute ID',
+  'feedback.storage.token': '认证 Token',
+  'feedback.storage.keepToken': '留空保留已保存 Token；不回显',
   'feedback.storage.recovery': '人工恢复与裁决',
   'feedback.storage.recoveryHelp': '取消仅恢复尚未退役的 SQLite，不删除 PG 数据。裁决前核对目标端事件/幂等键和发送记录；裁决不触发重发，也不撤销维护窗口。请勿填写密码或令牌。',
   'feedback.storage.reason': '操作原因',
@@ -4143,6 +4149,12 @@ const zh = {
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
+  'feedback.storage.authentication': 'Authentication',
+  'feedback.storage.passwordAuth': 'Username / password',
+  'feedback.storage.bytepgAuth': 'BytePG token',
+  'feedback.storage.computeId': 'BytePG compute ID',
+  'feedback.storage.token': 'Authentication token',
+  'feedback.storage.keepToken': 'Leave blank to keep saved token; never displayed',
   'feedback.storage.recovery': 'Manual recovery and resolution',
   'feedback.storage.recoveryHelp': 'Cancel restores only a non-retired SQLite source and never deletes PostgreSQL data. Verify destination event/idempotency keys and send receipts before acknowledging. Acknowledgement never resends or ends maintenance. Do not enter passwords or tokens.',
   'feedback.storage.reason': 'Reason',

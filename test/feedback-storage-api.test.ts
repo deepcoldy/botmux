@@ -22,6 +22,19 @@ async function request(path: string, method = 'GET', body?: unknown, admin = tru
   return { status, result, directory };
 }
 describe('feedback storage administration', () => {
+  it('stores BytePG token privately and returns only configured status', async () => {
+    const response = await request('/api/feedback/storage/configure', 'POST', {
+      expectedGeneration: 0, token: 'synthetic-api-token',
+      candidate: { backend: 'postgresql', postgres: {
+        host: '::1', port: 4432, database: 'aidb', schema: 'feedback', tls: { mode: 'verify-full' }, connectTimeoutMs: 3000,
+        bytepg: { computeId: 'cp-api-test', tokenRef: '' },
+      } },
+    });
+    expect(response.status).toBe(200);
+    expect(response.result.candidate.postgres.bytepg).toEqual({ computeId: 'cp-api-test', hasToken: true });
+    expect(JSON.stringify(response.result)).not.toContain('synthetic-api-token');
+    expect(response.result.candidate.postgres.hasPassword).toBe(false);
+  });
   it('cancels through the authenticated API and ignores a forged audit actor', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'feedback-api-cancel-'));
     directories.push(directory);

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { Pool, PoolClient } from 'pg';
 import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
-import { readFeedbackStorageConfig, readFeedbackStorageSecret, activateFeedbackStorageCandidate } from './feedback-storage-config.js';
+import { readFeedbackStorageConfig, readFeedbackStorageSecret, readPostgresCredential, activateFeedbackStorageCandidate } from './feedback-storage-config.js';
 import type { PostgresTarget } from './feedback-storage-types.js';
 import { feedbackPostgresPool, ensurePostgresFeedbackSchema, FEEDBACK_TABLES } from './feedback-postgres-schema.js';
 import { beginFeedbackMaintenance, freezeFeedbackSource, retireFeedbackSource, releaseFeedbackMaintenance, inspectFeedbackMaintenance } from './feedback-maintenance.js';
@@ -49,7 +49,7 @@ export async function listFeedbackMigrations(dataDir: string): Promise<Migration
   return Promise.all(names.filter(name => name.endsWith('.json')).map(name => getFeedbackMigration(dataDir, name.slice(0, -5))));
 }
 async function poolFor(dataDir: string, target: PostgresTarget): Promise<Pool> {
-  const password = await readFeedbackStorageSecret(dataDir, target.passwordRef);
+  const password = await readPostgresCredential(dataDir, target);
   const ca = target.tls.caRef ? await readFeedbackStorageSecret(dataDir, target.tls.caRef) : undefined;
   return feedbackPostgresPool(target, password, ca);
 }

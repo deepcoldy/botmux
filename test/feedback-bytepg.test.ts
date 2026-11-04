@@ -1,0 +1,147 @@
+import { createServer, type Socket } from 'node:net';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { inspect } from 'node:util';
+import { afterEach, describe, expect, it } from 'vitest';
+import { feedbackPostgresPool } from '../src/services/feedback-postgres-schema.js';
+import { configureFeedbackStorageCandidate, feedbackStorageView } from '../src/services/feedback-storage-management.js';
+import { readFeedbackStorageConfig, readPostgresCredential } from '../src/services/feedback-storage-config.js';
+import type { PostgresTarget } from '../src/services/feedback-storage-types.js';
+import type { PoolClient } from 'pg';
+
+const directories: string[] = [];
+afterEach(async () => {
+  for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
+  delete process.env.BYTEPG_TEST_TOKEN;
+});
+function message(type: string, payload: Buffer) {
+  const header = Buffer.alloc(5); header.write(type); header.writeInt32BE(payload.length + 4, 1);
+  return Buffer.concat([header, payload]);
+}
+async function gateway(reject: boolean | 'query' = false, host = '127.0.0.1') {
+  const startups: Record<string, string>[] = [];
+  const sockets = new Set<Socket>();
+  const server = createServer(socket => {
+    sockets.add(socket); socket.on('close', () => sockets.delete(socket));
+    let buffer = Buffer.alloc(0), started = false;
+    socket.on('data', data => {
+      buffer = Buffer.concat([buffer, data]);
+      if (!started) {
+        if (buffer.length < 4 || buffer.length < buffer.readInt32BE(0)) return;
+        const length = buffer.readInt32BE(0);
+        const fields = buffer.subarray(8, length).toString().split('\0');
+        const values: Record<string, string> = {};
+        for (let index = 0; index < fields.length - 1 && fields[index]; index += 2) values[fields[index]] = fields[index + 1];
+        startups.push(values); buffer = buffer.subarray(length); started = true;
+        if (reject === true) {
+          const text = `SERROR\0C28000\0Mrejected ${values.options}\0D${values.options}\0\0`;
+          socket.end(message('E', Buffer.from(text))); return;
+        }
+        socket.write(Buffer.concat([message('R', Buffer.alloc(4)), message('Z', Buffer.from('I'))]));
+      }
+      while (buffer.length >= 5 && buffer.length >= 1 + buffer.readInt32BE(1)) {
+        const type = String.fromCharCode(buffer[0]), length = buffer.readInt32BE(1);
+        buffer = buffer.subarray(1 + length);
+        if (type === 'X') { socket.end(); return; }
+        if (type === 'Q') {
+          if (reject === 'query') {
+            const text = `SERROR\0CXX000\0Mfailed ${startups[0].options}\0D${startups[0].options}\0\0`;
+            socket.write(Buffer.concat([message('N', Buffer.from(text)), message('E', Buffer.from(text)), message('Z', Buffer.from('I'))]));
+          } else socket.write(Buffer.concat([message('C', Buffer.from('SELECT 1\0')), message('Z', Buffer.from('I'))]));
+        }
+      }
+    });
+    socket.on('error', () => {});
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, host, resolve); });
+  const port = (server.address() as { port: number }).port;
+  return { port, startups, close: async () => { sockets.forEach(socket => socket.destroy()); await new Promise<void>(resolve => server.close(() => resolve())); } };
+}
+const target = (port: number): PostgresTarget => ({
+  host: '127.0.0.1', port, database: 'aidb', schema: 'feedback',
+  bytepg: { computeId: 'cp-test-compute', tokenRef: 'env:BYTEPG_TEST_TOKEN' },
+  tls: { mode: 'disable' }, connectTimeoutMs: 1000,
+});
+describe('BytePG feedback authentication', () => {
+  it('supports IPv6 hosts and redacts query errors and notices echoed by a gateway', async () => {
+    const server = await gateway('query', '::1'), token = 'synthetic-ipv6-query-token';
+    const pool = feedbackPostgresPool({ ...target(server.port), host: '::1' }, token);
+    let client: PoolClient | undefined;
+    try {
+      client = await pool.connect();
+      const notices: unknown[] = [];
+      client.on('notice', notice => notices.push(notice));
+      let error: unknown;
+      try { await client.query('SELECT 1'); } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      expect(notices).toHaveLength(1);
+      expect(inspect([error, notices], { depth: 10 })).not.toContain(token);
+      expect(server.startups[0].options).toContain('bytepg_compute_id=cp-test-compute');
+    } finally { client?.release(); await pool.end(); await server.close(); }
+  });
+  it('escapes whitespace and backslashes as one startup option value', async () => {
+    const server = await gateway();
+    const pool = feedbackPostgresPool(target(server.port), 'token\\segment -c injected=1');
+    try {
+      const client = await pool.connect(); client.release();
+      expect(server.startups[0].options).toBe('bytepg_compute_id=cp-test-compute bytepg_auth_token=token\\\\segment\\ -c\\ injected=1 -c search_path=feedback,pg_catalog');
+    } finally { await pool.end(); await server.close(); }
+  });
+  it('sends BytePG startup options together with the schema and never puts the token in inspectable client options', async () => {
+    const server = await gateway();
+    const token = 'synthetic+token/with=padding';
+    const pool = feedbackPostgresPool(target(server.port), token);
+    let client: PoolClient | undefined;
+    try {
+      client = await pool.connect();
+      expect(server.startups[0].options).toBe(`bytepg_compute_id=cp-test-compute bytepg_auth_token=${token} -c search_path=feedback,pg_catalog`);
+      expect(inspect(pool, { depth: 5 })).not.toContain(token);
+      expect(inspect(client, { depth: 5 })).not.toContain(token);
+      expect(JSON.stringify((client as any).connectionParameters)).not.toContain(token);
+    } finally { client?.release(); await pool.end(); await server.close(); }
+  });
+  it('does not leak tokens when a gateway echoes startup options in connection errors', async () => {
+    const server = await gateway(true), token = 'synthetic-secret-rejected';
+    const pool = feedbackPostgresPool(target(server.port), token);
+    try {
+      let error: unknown;
+      try { await pool.connect(); } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain('bytepg');
+      expect(inspect(error, { depth: 10 })).not.toContain(token);
+      expect(JSON.stringify(error)).not.toContain(token);
+    } finally { await pool.end(); await server.close(); }
+  });
+  it('stores token references without requiring password or username and redacts configuration views', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'bytepg-config-')); directories.push(directory);
+    const initial = await readFeedbackStorageConfig(directory);
+    const saved = await configureFeedbackStorageCandidate(directory, {
+      expectedGeneration: initial.generation, candidate: { backend: 'postgresql', postgres: target(4432) }, token: 'synthetic-token-input',
+    });
+    const configured = saved.candidate!;
+    expect(configured.backend).toBe('postgresql');
+    if (configured.backend !== 'postgresql') throw new Error();
+    expect(await readPostgresCredential(directory, configured.postgres)).toBe('synthetic-token-input');
+    expect(configured.postgres.passwordRef).toBeUndefined();
+    expect(JSON.stringify(feedbackStorageView(saved))).not.toContain('synthetic-token-input');
+    expect(await readFile(join(directory, 'feedback-storage.json'), 'utf8')).not.toContain('synthetic-token-input');
+    const retained = await configureFeedbackStorageCandidate(directory, {
+      expectedGeneration: saved.generation, candidate: { backend: 'postgresql', postgres: { ...configured.postgres, bytepg: { computeId: 'cp-test-compute', tokenRef: '' } } }, token: '',
+    });
+    expect(retained.candidate).toEqual(saved.candidate);
+  });
+  it('rejects injected compute IDs and control characters in tokens before opening a connection', () => {
+    expect(() => feedbackPostgresPool({ ...target(1), bytepg: { computeId: 'cp-x bytepg_auth_token=other', tokenRef: 'env:TOKEN' } }, 'secret')).toThrow();
+    expect(() => feedbackPostgresPool(target(1), 'bad\0token')).toThrow();
+  });
+  it('rejects mixed credentials and reads only the selected protected token reference', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'bytepg-reference-')); directories.push(directory);
+    process.env.BYTEPG_TEST_TOKEN = 'rotated-token';
+    expect(await readPostgresCredential(directory, target(4432))).toBe('rotated-token');
+    const current = await readFeedbackStorageConfig(directory);
+    await expect(configureFeedbackStorageCandidate(directory, {
+      expectedGeneration: current.generation, candidate: { backend: 'postgresql', postgres: { ...target(4432), passwordRef: 'env:PASSWORD' } },
+    })).rejects.toThrow('feedback_storage_auth_invalid');
+  });
+});

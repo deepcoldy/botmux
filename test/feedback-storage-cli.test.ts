@@ -58,6 +58,8 @@ describe('feedback storage CLI', () => {
       expect(errors).toContain('confirmation');
       expect(await runFeedbackStorageCommand(['configure', '--password', 'hidden-password'], io, directory)).toBe(1);
       expect(errors).not.toContain('hidden-password');
+      expect(await runFeedbackStorageCommand(['configure', '--token=hidden-token'], io, directory)).toBe(1);
+      expect(errors).not.toContain('hidden-token');
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });

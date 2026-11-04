@@ -14,6 +14,8 @@ The backend version selection is independent of production credentials and schem
 
 On a new interactive `botmux start`, select SQLite or PostgreSQL. Existing installations continue without a prompt. PostgreSQL accepts a JSON configuration file containing a credential reference:
 
+### Username and password
+
 ```json
 {
   "backend": "postgresql",
@@ -31,6 +33,38 @@ On a new interactive `botmux start`, select SQLite or PostgreSQL. Existing insta
 ```
 
 Provision the password environment variable securely to all BotMux processes; never put passwords in command arguments. The role needs database CREATE permission to initialize the dedicated schema and access to its tables afterward. Independent data directories must not share a schema.
+
+### BytePG compute ID and token
+
+For a gateway accepting `options=bytepg_compute_id=... bytepg_auth_token=...`, use structured authentication rather than putting a complete credential-bearing URL in `host`:
+
+```json
+{
+  "backend": "postgresql",
+  "postgres": {
+    "host": "2001:db8::1",
+    "port": 4432,
+    "database": "aidb",
+    "schema": "botmux_feedback",
+    "bytepg": {
+      "computeId": "cp-example",
+      "tokenRef": "env:BOTMUX_BYTEPG_TOKEN"
+    },
+    "tls": { "mode": "verify-full" },
+    "connectTimeoutMs": 5000
+  }
+}
+```
+
+Replace the example address/compute ID with your endpoint. An IPv6 `host` is the address without URI brackets. The client sends `bytepg_compute_id` and `bytepg_auth_token` in PostgreSQL startup `options`, together with BotMux's schema `search_path`; do not URL-encode the token stored in the referenced environment variable.
+
+BytePG mode does not require `passwordRef`. `user` is optional, using the PostgreSQL driver's default when omitted; specify it if the gateway requires a role. Do not configure both password and BytePG token authentication. The gateway must accept the startup options and the role must retain the schema privileges described above.
+
+Dashboard provides **Authentication → BytePG token**, Compute ID and a write-only token field. Leave the token blank to preserve its reference. CLI configuration accepts `tokenRef`; `--token` and `--password` credential arguments are rejected. Regular configuration, API views, migration metadata and recovery records contain only references, not token values.
+
+TLS defaults to certificate verification. Set a trusted CA when required; never disable verification to hide a certificate failure. BytePG server errors/notices are deliberately reported as generic errors because gateways may echo startup options containing the token. Token expiry does not fall back to password authentication or SQLite. After rotating the referenced token, restart the affected BotMux processes so existing pools load the new credential; automatic token issuance/refresh is not implemented.
+
+Local tests exercise startup-packet encoding (including IPv6), escaping, error/notice redaction and existing PostgreSQL 17 storage/migration behavior. They do not certify authorization against a production BytePG gateway; use **Test saved connection** in an authorized environment before migration, without sharing tokens in chat or logs.
 
 ```bash
 botmux feedback storage configure --config-file /secure/feedback.json

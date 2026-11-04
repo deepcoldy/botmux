@@ -1,14 +1,36 @@
-import { Pool, type PoolClient } from 'pg';
+import { Pool, Client, type PoolClient, type ClientConfig } from 'pg';
 import type { PostgresTarget } from './feedback-storage-types.js';
 
 export function feedbackPostgresPool(target: PostgresTarget, password: string, ca?: string): Pool {
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(target.schema)) throw new Error('feedback_storage_schema_invalid');
   if (target.tls.caRef && !ca) throw new Error('feedback_storage_ca_missing');
+  const tokenMode = target.bytepg;
+  if (tokenMode && (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(tokenMode.computeId)
+    || !password || password.length > 65536 || /[\0\r\n]/.test(password))) throw new Error('feedback_bytepg_credentials_invalid');
+  const options = `-c search_path=${target.schema},pg_catalog`;
+  const escapedToken = password.replace(/\\/g, '\\\\').replace(/\s/g, value => `\\${value}`);
+  const wireOptions = tokenMode ? `bytepg_compute_id=${tokenMode.computeId} bytepg_auth_token=${escapedToken} ${options}` : options;
+  const sanitize = (): Error => new Error('feedback_bytepg_connection_or_query_failed');
+  class BytePgClient extends Client {
+    constructor(config?: ClientConfig) {
+      super(config);
+      const parameters = (this as unknown as { connectionParameters: Record<string, unknown> }).connectionParameters;
+      Object.defineProperty(parameters, 'options', { configurable: true, enumerable: false, get: () => wireOptions });
+      const connection = (this as unknown as { connection: { on: (...args: any[]) => unknown; emit: (...args: any[]) => boolean } }).connection;
+      const emit = connection.emit.bind(connection);
+      connection.emit = (event: string, ...args: unknown[]) => {
+        if (event === 'error' || event === 'errorMessage' || event === 'notice') return emit(event, sanitize());
+        return emit(event, ...args);
+      };
+    }
+  }
   const pool = new Pool({
-    host: target.host, port: target.port, database: target.database, user: target.user, password,
+    host: target.host, port: target.port, database: target.database, user: target.user,
+    password: tokenMode ? () => '' : password,
     ssl: target.tls.mode === 'disable' ? false : { rejectUnauthorized: true, ...(ca ? { ca } : {}) },
     connectionTimeoutMillis: target.connectTimeoutMs, idleTimeoutMillis: 10000, max: 5,
-    statement_timeout: 30000, options: `-c search_path=${target.schema},pg_catalog`,
+    statement_timeout: 30000, options,
+    ...(tokenMode ? { Client: BytePgClient } : {}),
   });
   pool.on('error', () => {
     process.stderr.write('[feedback] PostgreSQL idle connection lost; reconnecting on next operation\n');
