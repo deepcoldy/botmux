@@ -19,6 +19,7 @@ import {
   isValidProtectedMcpCapabilityId,
   PROTECTED_MCP_SECRET_FD_ENV,
 } from '../protected-mcp-capabilities.js';
+import { normalizeProtectedHttpEgressPolicy } from '../protected-http-egress.js';
 
 function isFile(path: string): boolean {
   try {
@@ -90,6 +91,9 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
     if (record.protectedCapability !== undefined) {
       throw new Error(`protected_capability_requires_stdio:${name}`);
     }
+    if (record.protectedEgressPolicy !== undefined) {
+      throw new Error(`protected_egress_policy_requires_stdio:${name}`);
+    }
     const url = optionalString(record.url);
     if (!url) throw new Error(`invalid_plugin_mcp_url:${name}`);
     let parsed: URL;
@@ -110,6 +114,12 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
   if (protectedCapability !== undefined && !isValidProtectedMcpCapabilityId(protectedCapability)) {
     throw new Error(`invalid_plugin_mcp_protected_capability:${name}`);
   }
+  const protectedEgressPolicy = record.protectedEgressPolicy === undefined
+    ? undefined
+    : normalizeProtectedHttpEgressPolicy(record.protectedEgressPolicy);
+  if (record.protectedEgressPolicy !== undefined && !protectedEgressPolicy) {
+    throw new Error(`invalid_plugin_mcp_protected_egress_policy:${name}`);
+  }
   const templated = [...command, ...Object.values(env ?? {})].find(value => /\$\{[^}]+\}/.test(value));
   if (templated) throw new Error(`unsupported_plugin_mcp_runtime_template:${name}`);
   for (const part of command) {
@@ -123,6 +133,7 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
     command,
     ...(env ? { env } : {}),
     ...(protectedCapability ? { protectedCapability } : {}),
+    ...(protectedEgressPolicy ? { protectedEgressPolicy } : {}),
   };
 }
 
