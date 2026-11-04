@@ -118,6 +118,28 @@ describe('network policy', () => {
     expect(merged.private.rules?.filter(rule => rule.cidr === '10.20.30.40/32')).toHaveLength(1);
   });
   it.each([
+    ['IPv4 loopback', '127.0.0.1'],
+    ['IPv6 loopback', '::1'],
+  ])('rejects a frozen %s target before loopback output can bypass a blocked zone', (_label, address) => {
+    const loopback = structuredClone(frozenEgress);
+    loopback.frozenAddresses = [[address]];
+    expect(() => mergeProtectedHttpEgressNetworkPolicy(
+      parseSandboxNetworkPolicy(base),
+      loopback,
+      ['10.1.2.3'],
+    )).toThrow('protected_http_egress_target_collides_with_loopback');
+  });
+  it('rejects a frozen DNS port target before the DNS exception can bypass a blocked zone', () => {
+    const dnsTarget = structuredClone(frozenEgress);
+    dnsTarget.policy.targets[0]!.port = 53;
+    dnsTarget.frozenAddresses = [['10.1.2.3']];
+    expect(() => mergeProtectedHttpEgressNetworkPolicy(
+      parseSandboxNetworkPolicy({ ...base, dnsServers: ['10.1.2.3'] }),
+      dnsTarget,
+      ['10.1.2.3'],
+    )).toThrow('protected_http_egress_target_collides_with_dns');
+  });
+  it.each([
     ['allow', { mode: 'allow' }],
     ['denylist', { mode: 'denylist', rules: [{ cidr: '10.99.0.0/16', protocol: 'tcp', ports: [8443] }] }],
   ] as const)('preserves unrelated operator rules when merging a %s zone', (_label, privateZone) => {

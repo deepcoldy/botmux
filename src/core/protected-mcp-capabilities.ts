@@ -332,7 +332,7 @@ export function prepareProtectedMcpWorkerProvisioning(
   env: ProtectedMcpSecretEnvironment,
   config: ProtectedMcpCapabilityConfigMap | undefined,
   containmentConfigured: boolean,
-  containmentProfile: ProtectedMcpContainmentProfile = PROTECTED_MCP_CONTAINMENT_PROFILE,
+  protectedHttpEgressPolicy?: ProtectedHttpEgressWorkerPolicy,
 ): ProtectedMcpWorkerProvisioning {
   const isolation = protectedMcpIsolationPolicy(pluginIds, config);
   const workerPolicy: ProtectedMcpWorkerPolicy = {
@@ -350,13 +350,22 @@ export function prepareProtectedMcpWorkerProvisioning(
   for (const [id, capability] of Object.entries(config ?? {})) {
     if (!capability.enabled) continue;
     if (!capability.allowedPluginIds.some(pluginId => enabledPlugins.has(pluginId))) continue;
+    if (protectedHttpEgressPolicy && (
+      id !== protectedHttpEgressPolicy.policy.id
+      || !capability.allowedPluginIds.includes(protectedHttpEgressPolicy.pluginId)
+      || !enabledPlugins.has(protectedHttpEgressPolicy.pluginId)
+    )) continue;
     const secret = protectedSecretValue(env, capability.secret.name);
     if (!secret) continue;
     workerPolicy.capabilities.push({
       id,
-      allowedPluginIds: [...capability.allowedPluginIds],
+      allowedPluginIds: protectedHttpEgressPolicy
+        ? [protectedHttpEgressPolicy.pluginId]
+        : [...capability.allowedPluginIds],
       ...(capability.principal ? { principal: capability.principal } : {}),
-      containmentProfile,
+      containmentProfile: protectedHttpEgressPolicy
+        ? PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE
+        : PROTECTED_MCP_CONTAINMENT_PROFILE,
     });
     secrets.set(id, secret);
   }

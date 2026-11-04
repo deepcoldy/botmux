@@ -191,19 +191,33 @@ describe('protected MCP worker provisioning', () => {
     const enabled = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
       { FIXTURE_SECRET: 'fixture-value' },
-      { 'fixture.secret.v1': fixtureCapability({ enabled: true }) },
+      {
+        'fixture.secret.v1': fixtureCapability({
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin', 'unrelated-plugin'],
+        }),
+        'fixture.unrelated.v1': fixtureCapability({
+          enabled: true,
+          allowedPluginIds: ['unrelated-plugin'],
+        }),
+      },
       true,
-      'local-stdio-secret-egress-guard-v1',
+      frozenEgress,
     );
-    expect(enabled.workerPolicy.capabilities[0]?.containmentProfile)
-      .toBe('local-stdio-secret-egress-guard-v1');
+    expect(enabled.workerPolicy.capabilities).toEqual([{
+      id: 'fixture.secret.v1',
+      allowedPluginIds: ['fixture-plugin'],
+      principal: 'verified-human-email',
+      containmentProfile: 'local-stdio-secret-egress-guard-v1',
+    }]);
+    expect([...enabled.secrets.keys()]).toEqual(['fixture.secret.v1']);
 
     const disabled = prepareProtectedMcpWorkerProvisioning(
       ['fixture-plugin'],
       { FIXTURE_SECRET: 'fixture-value' },
       { 'fixture.secret.v1': fixtureCapability({ enabled: false }) },
       true,
-      'local-stdio-secret-egress-guard-v1',
+      frozenEgress,
     );
     expect(disabled.workerPolicy.capabilities).toEqual([]);
     expect(disabled.secrets.size).toBe(0);

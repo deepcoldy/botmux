@@ -114,7 +114,11 @@ describe('protected HTTP egress worker policy collection', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  function installPolicyPlugin(pluginId: string, policy = validPolicy): void {
+  function installPolicyPlugin(
+    pluginId: string,
+    policy = validPolicy,
+    protectedCapability = policy.id,
+  ): void {
     const source = join(home, `${pluginId}-source`);
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
     writeFileSync(join(source, 'package.json'), JSON.stringify({
@@ -127,7 +131,7 @@ describe('protected HTTP egress worker policy collection', () => {
     writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
       transport: 'stdio',
       command: [process.execPath, '--version'],
-      protectedCapability: policy.id,
+      protectedCapability,
       protectedEgressPolicy: policy,
     }));
     installLocalPlugin(source);
@@ -156,6 +160,13 @@ describe('protected HTTP egress worker policy collection', () => {
     installPolicyPlugin('fixture-plugin');
     writeFileSync(pluginMcpPrivatePath('fixture-plugin'), '{not-json');
     expect(() => collectProtectedHttpEgressPolicies(['fixture-plugin'])).toThrow();
+  });
+
+  it('rejects a policy whose id is not bound to the same plugin protected capability', () => {
+    installPolicyPlugin('fixture-plugin', validPolicy, 'fixture.unrelated.v1');
+
+    expect(() => collectProtectedHttpEgressPolicies(['fixture-plugin']))
+      .toThrow('plugin_mcp_protected_egress_capability_mismatch:fixture-plugin');
   });
 
   it('freezes unique A and AAAA results once per target and caps each target at 32 addresses', async () => {

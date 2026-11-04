@@ -67,6 +67,7 @@ export async function startSessionMcpGatewayHost(opts: {
   linkRefRegistration?: GatewayLinkRefRegistrationHandler;
   requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
   protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
+  protectedEgressSocketPath?: string;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -103,6 +104,7 @@ export async function startSessionMcpGatewayHost(opts: {
         linkRefRegistration: opts.linkRefRegistration,
         requestProtectedSecretChannel: opts.requestProtectedSecretChannel,
         protectedMcpPolicy: opts.protectedMcpPolicy,
+        protectedEgressSocketPath: opts.protectedEgressSocketPath,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

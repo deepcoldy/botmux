@@ -11,6 +11,7 @@ const {
   tmuxProbeMock,
   collectProtectedHttpEgressPoliciesMock,
   resolveProtectedHttpEgressTargetsMock,
+  loggerErrorMock,
 } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
@@ -20,6 +21,7 @@ const {
   tmuxProbeMock: vi.fn(() => 'exists' as const),
   collectProtectedHttpEgressPoliciesMock: vi.fn(() => [] as any[]),
   resolveProtectedHttpEgressTargetsMock: vi.fn(),
+  loggerErrorMock: vi.fn(),
 }));
 
 vi.mock('../src/core/protected-http-egress.js', async (importOriginal) => {
@@ -200,7 +202,7 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: loggerErrorMock },
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -504,6 +506,94 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     }));
     expect(forkMock).not.toHaveBeenCalled();
   });
+
+  it('durably queues a concurrent input behind one pending DNS freeze and forks exactly once', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const firstAdmission = vi.fn();
+    const secondAdmission = vi.fn();
+
+    expect(forkWorker(ds, 'first protected turn', { turnId: 'om_egress_first' }, {
+      onAdmission: firstAdmission,
+    })).toBe(true);
+    expect(forkWorker(ds, 'second protected turn', {
+      turnId: 'om_egress_second',
+    }, { onAdmission: secondAdmission })).toBe(true);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        userPrompt: 'second protected turn',
+        turnId: 'om_egress_second',
+        cliInput: expect.objectContaining({ content: 'second protected turn' }),
+      }),
+    ]);
+    expect(secondAdmission).toHaveBeenCalledWith('deferred');
+
+    finishLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const worker = forkMock.mock.results[0]!.value;
+    expect(secondAdmission).toHaveBeenLastCalledWith('deferred');
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    await vi.waitFor(() => expect(secondAdmission).toHaveBeenLastCalledWith('accepted'));
+    const businessMessages = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message.type !== 'worker_ipc_probe');
+    expect(businessMessages[0]).toMatchObject({
+      type: 'init',
+      prompt: 'first protected turn',
+      turnId: 'om_egress_first',
+    });
+    expect(businessMessages[1]).toMatchObject({
+      type: 'message',
+      content: 'second protected turn',
+      turnId: 'om_egress_second',
+    });
+  });
+
+  it('reports a post-freeze preparation exception as preparation failure rather than DNS failure', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    checkWorkerAdmissionMock.mockImplementation(() => {
+      throw new Error('late preparation boom');
+    });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(makeDs(), 'protected egress', { turnId: 'om_egress_late' }, {
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmissionBlocked).toHaveBeenCalled());
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining(
+        'Worker preparation failed after protected egress freeze: late preparation boom',
+      ),
+      turnId: 'om_egress_late',
+    }));
+    expect(loggerErrorMock).toHaveBeenCalledWith(expect.stringContaining(
+      'Worker preparation after protected HTTP egress freeze failed',
+    ));
+    expect(loggerErrorMock).not.toHaveBeenCalledWith(expect.stringContaining(
+      'Protected HTTP egress target freeze failed',
+    ));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('LinkRef turn admission mode freeze', () => {
@@ -752,10 +842,15 @@ describe('host memory pressure worker admission', () => {
     expect(admissions).toEqual(['accepted']);
   });
 
-  it('forks the worker without the pm2 graceful-exit sentinel or the bot GitHub tokens', () => {
+  it('forks the worker without daemon-only sentinels, bot tokens, or the egress socket locator', () => {
     // The sentinel is the daemon/dashboard cores' private exit code: a worker
     // that inherited it would exit 90 on a clean stop, read as a crash.
-    const keys = ['BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'GITHUB_TOKEN', 'GH_TOKEN'] as const;
+    const keys = [
+      'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
+      'GITHUB_TOKEN',
+      'GH_TOKEN',
+      'BOTMUX_PROTECTED_EGRESS_SOCKET',
+    ] as const;
     const prev = keys.map(key => process.env[key]);
     keys.forEach(key => { process.env[key] = 'leaked'; });
     try {

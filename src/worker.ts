@@ -5,14 +5,12 @@ import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/c
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
 import { FROZEN_NETWORK_POLICY_HINT, hostDnsServers, mergeProtectedHttpEgressNetworkPolicy, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
 import {
-  PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE,
   protectedMcpContainmentActive,
   protectedMcpHomeDenyPaths,
   protectedMcpHomePaths,
   protectedMcpRedactedEnvKeys,
 } from './core/protected-mcp-capabilities.js';
 import {
-  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
   startSessionProtectedHttpEgressHost,
   type SessionProtectedHttpEgressHost,
 } from './core/protected-http-egress-host.js';
@@ -1935,7 +1933,7 @@ let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
 let sessionProtectedHttpEgressHost: SessionProtectedHttpEgressHost | null = null;
-let localProtectedMcpContainmentActive = false;
+let localProtectedMcpContainmentActiveCapabilityIds: string[] = [];
 const pendingPluginResultDeliveries = new Map<string, {
   resolve: (value: { messageIds: string[] }) => void;
   reject: (error: Error) => void;
@@ -2253,7 +2251,6 @@ function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
 function stopSessionProtectedHttpEgressHost(): void {
   const host = sessionProtectedHttpEgressHost;
   sessionProtectedHttpEgressHost = null;
-  delete process.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
   if (!host) return;
   // close() unlinks the listener synchronously before draining connections.
   // The sandbox child's frozen network namespace continues enforcing direct
@@ -2267,7 +2264,7 @@ function stopSessionMcpGatewayHost(): void {
   stopSessionProtectedHttpEgressHost();
   const host = sessionMcpGatewayHost;
   sessionMcpGatewayHost = null;
-  localProtectedMcpContainmentActive = false;
+  localProtectedMcpContainmentActiveCapabilityIds = [];
   if (!host) return;
   void host.close().catch((error) => {
     log(`[mcp-gateway] host shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -2406,11 +2403,9 @@ async function prepareCliPluginGenerationAndGateway(
         frozenAddresses: cfg.protectedHttpEgressPolicy.frozenAddresses,
         onError: error => log(`[protected-egress] host error: ${error.message}`),
       });
-      process.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] = sessionProtectedHttpEgressHost.socketPath;
       log(`[protected-egress] guard listening for ${cfg.protectedHttpEgressPolicy.pluginId}`);
     } catch (error) {
       sessionProtectedHttpEgressHost = null;
-      delete process.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
       // The child may continue only behind the already-frozen direct target
       // denies. Active actor authorization remains false without this host.
       log(`[protected-egress] guard unavailable; continuing deny-only: ${error instanceof Error ? error.message : String(error)}`);
@@ -2446,6 +2441,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     linkRefRegistration: registerMcpLinkRefsThroughHost,
     requestProtectedSecretChannel: requestProtectedSecretChannel,
     protectedMcpPolicy: lastInitConfig?.protectedMcpPolicy,
+    protectedEgressSocketPath: sessionProtectedHttpEgressHost?.socketPath,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -5601,7 +5597,9 @@ function currentGatewayTrustedTurnIdentity(): GatewayTrustedTurnIdentity {
   const identity = activeTurnAuthority.identity();
   return {
     ...identity,
-    protectedMcpContainmentActive: localProtectedMcpContainmentActive,
+    protectedMcpContainmentActiveCapabilityIds: [
+      ...localProtectedMcpContainmentActiveCapabilityIds,
+    ],
     ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
   };
 }
@@ -21093,7 +21091,7 @@ async function spawnCli(
   const proxyError = networkProxyError(effectiveSandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
-  localProtectedMcpContainmentActive = false;
+  localProtectedMcpContainmentActiveCapabilityIds = [];
   const spawnStartedAtMs = Date.now();
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
@@ -24847,25 +24845,26 @@ async function spawnCli(
       if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
-      localProtectedMcpContainmentActive = protectedMcpContainmentActive({
-        platform: process.platform,
-        containmentProfile: cfg.protectedHttpEgressPolicy
-          ? PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE
-          : undefined,
-        provisionedCapabilityCount: cfg.protectedMcpPolicy?.capabilities.length ?? 0,
-        sandboxEngaged: true,
-        mcpSocketMounted: !!sessionMcpGatewayHost?.socketPath,
-        egressSocketMounted: !!sessionMcpGatewayHost?.socketPath
-          && !!sessionProtectedHttpEgressHost?.socketPath,
-        directTargetDenyRulesInstalled: !!cfg.protectedHttpEgressPolicy,
-        guardLive: !!sessionProtectedHttpEgressHost,
-        expectedPolicyDigest: cfg.protectedHttpEgressPolicy?.policyDigest,
-        guardPolicyDigest: sessionProtectedHttpEgressHost?.policyDigest,
-        pidNamespaceRetained: !coreOnlyPidNamespaceDegrade({
-          credentialBearingMcp: !!sessionMcpGatewayHost?.socketPath,
-        }),
-        networkPolicy: effectiveSandboxNetworkPolicy,
-      });
+      localProtectedMcpContainmentActiveCapabilityIds = (
+        cfg.protectedMcpPolicy?.capabilities ?? []
+      ).filter(capability => protectedMcpContainmentActive({
+          platform: process.platform,
+          containmentProfile: capability.containmentProfile,
+          provisionedCapabilityCount: 1,
+          sandboxEngaged: true,
+          mcpSocketMounted: !!sessionMcpGatewayHost?.socketPath,
+          egressSocketMounted: !!sessionMcpGatewayHost?.socketPath
+            && !!sessionProtectedHttpEgressHost?.socketPath,
+          directTargetDenyRulesInstalled: !!cfg.protectedHttpEgressPolicy,
+          guardLive: !!sessionProtectedHttpEgressHost,
+          expectedPolicyDigest: cfg.protectedHttpEgressPolicy?.policyDigest,
+          guardPolicyDigest: sessionProtectedHttpEgressHost?.policyDigest,
+          pidNamespaceRetained: !coreOnlyPidNamespaceDegrade({
+            credentialBearingMcp: !!sessionMcpGatewayHost?.socketPath,
+          }),
+          networkPolicy: effectiveSandboxNetworkPolicy,
+        }))
+        .map(capability => capability.id);
       // session-id is FORCED here so a relayed send can't target another session.
       sandboxStopWatcher = startOutboxWatcher(
         sbx.outbox,

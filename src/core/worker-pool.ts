@@ -107,7 +107,6 @@ import { sanitizePerBotEnv } from './per-bot-env.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { buildBotWorkerEnv, type EnvPolicy } from './env-policy.js';
 import {
-  PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE,
   PROTECTED_MCP_SECRET_FD_ENV,
   prepareProtectedMcpWorkerProvisioning,
   protectedMcpDaemonRedactedEnvKeys,
@@ -976,7 +975,7 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', PROTECTED_MCP_SECRET_FD_ENV] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', 'BOTMUX_PROTECTED_EGRESS_SOCKET', PROTECTED_MCP_SECRET_FD_ENV] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv, protectedEnvKeys: readonly string[] = []): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -14314,7 +14313,137 @@ export function freezeSessionSandboxDecision(
  * staged behind an ACK, routed through a live owner, or spawn-deferred during
  * device isolation — returns `true`.
  */
-const pendingProtectedHttpEgressFreezes = new Map<string, Promise<ProtectedHttpEgressWorkerPolicy>>();
+interface PendingProtectedHttpEgressFork {
+  pluginId: string;
+  policyDigest: string;
+  waiters: Array<{
+    resumeOrTurnId: ForkResumeOrTurnId;
+    opts: ForkWorkerOptions;
+  }>;
+}
+
+const pendingProtectedHttpEgressForks = new Map<string, PendingProtectedHttpEgressFork>();
+
+function protectedHttpEgressForkTurn(
+  resumeOrTurnId: ForkResumeOrTurnId,
+): { turnId?: string; dispatchAttempt?: number } {
+  if (typeof resumeOrTurnId === 'string') return { turnId: resumeOrTurnId };
+  if (typeof resumeOrTurnId !== 'object' || resumeOrTurnId === null) return {};
+  return {
+    ...(resumeOrTurnId.turnId ? { turnId: resumeOrTurnId.turnId } : {}),
+    ...(resumeOrTurnId.dispatchAttempt !== undefined
+      ? { dispatchAttempt: resumeOrTurnId.dispatchAttempt }
+      : {}),
+  };
+}
+
+function reportProtectedHttpEgressForkFailure(
+  ds: DaemonSession,
+  bot: ReturnType<typeof getBot>,
+  resumeOrTurnId: ForkResumeOrTurnId,
+  opts: ForkWorkerOptions,
+  error: unknown,
+  phase: 'dns' | 'preparation',
+): void {
+  const rawReason = error instanceof Error ? error.message : String(error);
+  const reason = phase === 'preparation'
+    ? `Worker preparation failed after protected egress freeze: ${rawReason}`
+    : rawReason;
+  logger.error(phase === 'preparation'
+    ? `[${tag(ds)}] Worker preparation after protected HTTP egress freeze failed: ${rawReason}`
+    : `[${tag(ds)}] Protected HTTP egress target freeze failed: ${rawReason}`);
+  if (canForkRegisteredSession(ds)) {
+    const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
+    const blockedTurnId = fallbackTurnId(ds, turnId);
+    const message = startupFailureNotice(
+      ds,
+      sessionCliDisplayName(ds, bot.config),
+      reason,
+      botLocale(bot.config),
+    );
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_fork_error',
+      message: reason,
+    });
+    if (opts.onAdmissionBlocked) {
+      opts.onAdmissionBlocked({
+        content: message,
+        ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
+      });
+    } else {
+      const meetingDriven = !!ds.session.vcMeetingReceiver
+        && (dispatchAttempt !== undefined
+          || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
+      if (meetingDriven || isSilentScheduledTurn(ds, turnId)) {
+        logger.info(
+          `[${tag(ds)}] Managed/silent protected egress ${phase} failure kept out of auxiliary Lark UI: ${rawReason}`,
+        );
+      } else {
+        const cb = requireCallbacks();
+        void cb.sessionReply(
+          sessionAnchorId(ds),
+          message,
+          'text',
+          ds.larkAppId,
+          blockedTurnId,
+          { sourceSessionId: ds.session.sessionId },
+        ).catch(replyError => logger.error(
+          `[${tag(ds)}] Failed to report protected egress ${phase} failure: `
+          + `${replyError instanceof Error ? replyError.message : String(replyError)}`,
+        ));
+      }
+    }
+  }
+  opts.onAdmission?.('rejected');
+}
+
+function queueBehindPendingProtectedHttpEgressFork(
+  pending: PendingProtectedHttpEgressFork,
+  ds: DaemonSession,
+  promptInput: string | CliTurnPayload,
+  resumeOrTurnId: ForkResumeOrTurnId,
+  opts: ForkWorkerOptions,
+): boolean {
+  const payload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
+  const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
+  if (payload.content.length > 0) {
+    const queuedTurnId = turnId ?? `queued-protected-egress-${randomUUID()}`;
+    const trustedCaller = payload.trustedCaller
+      ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.trustedCaller
+        : undefined);
+    const trustedController = trustedSessionController(ds);
+    try {
+      admitQueuedActivationTail(ds, {
+        userPrompt: payload.content,
+        cliInput: {
+          content: payload.content,
+          ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
+          ...(payload.linkRefs ? { linkRefs: payload.linkRefs } : {}),
+          ...(payload.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+          ...(trustedCaller ? { trustedCaller } : {}),
+          ...(trustedController ? { trustedController } : {}),
+        },
+        turnId: queuedTurnId,
+        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      }, undefined, {
+        codexAppInputGateFrozen: typeof resumeOrTurnId === 'object'
+          && resumeOrTurnId !== null
+          && resumeOrTurnId.codexAppInputGateFrozen === true,
+      });
+    } catch (error) {
+      logger.error(
+        `[${tag(ds)}] Failed to durably queue input behind protected egress DNS freeze: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+      opts.onAdmission?.('rejected');
+      return true;
+    }
+  }
+  pending.waiters.push({ resumeOrTurnId, opts });
+  opts.onAdmission?.('deferred');
+  return true;
+}
 
 export function forkWorker(
   ds: DaemonSession,
@@ -14353,75 +14482,121 @@ export function forkWorker(
   }
 
   const collectedPolicy = collected[0]!;
-  let freeze = pendingProtectedHttpEgressFreezes.get(ds.session.sessionId);
-  if (!freeze) {
-    freeze = resolveProtectedHttpEgressTargets(collectedPolicy.policy).then(frozenAddresses => ({
-      ...collectedPolicy,
-      frozenAddresses,
-    }));
-    pendingProtectedHttpEgressFreezes.set(ds.session.sessionId, freeze);
-    void freeze.finally(() => {
-      if (pendingProtectedHttpEgressFreezes.get(ds.session.sessionId) === freeze) {
-        pendingProtectedHttpEgressFreezes.delete(ds.session.sessionId);
-      }
-    }).catch(() => undefined);
-  }
-  void freeze.then(policy => {
-    forkWorkerPrepared(ds, promptInput, resumeOrTurnId, opts, policy, bot);
-  }).catch(error => {
-    const reason = error instanceof Error ? error.message : String(error);
-    logger.error(`[${tag(ds)}] Protected HTTP egress target freeze failed: ${reason}`);
-    if (canForkRegisteredSession(ds)) {
-      const turnId = typeof resumeOrTurnId === 'string'
-        ? resumeOrTurnId
-        : typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
-          ? resumeOrTurnId.turnId
-          : undefined;
-      const dispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
-        ? resumeOrTurnId.dispatchAttempt
-        : undefined;
-      const blockedTurnId = fallbackTurnId(ds, turnId);
-      const message = startupFailureNotice(
-        ds,
-        sessionCliDisplayName(ds, bot.config),
-        reason,
-        botLocale(bot.config),
-      );
-      emitSessionLifecycleHook(ds, 'session.requires_attention', {
-        reason: 'worker_fork_error',
-        message: reason,
-      });
-      if (opts.onAdmissionBlocked) {
-        opts.onAdmissionBlocked({
-          content: message,
-          ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
-        });
-      } else {
-        const meetingDriven = !!ds.session.vcMeetingReceiver
-          && (dispatchAttempt !== undefined
-            || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
-        if (meetingDriven || isSilentScheduledTurn(ds, turnId)) {
-          logger.info(
-            `[${tag(ds)}] Managed/silent protected egress freeze failure kept out of auxiliary Lark UI: ${reason}`,
-          );
-        } else {
-          const cb = requireCallbacks();
-          void cb.sessionReply(
-            sessionAnchorId(ds),
-            message,
-            'text',
-            ds.larkAppId,
-            blockedTurnId,
-            { sourceSessionId: ds.session.sessionId },
-          ).catch(replyError => logger.error(
-            `[${tag(ds)}] Failed to report protected egress freeze failure: `
-            + `${replyError instanceof Error ? replyError.message : String(replyError)}`,
-          ));
-        }
-      }
+  const pending = pendingProtectedHttpEgressForks.get(ds.session.sessionId);
+  if (pending) {
+    if (pending.pluginId !== collectedPolicy.pluginId
+      || pending.policyDigest !== collectedPolicy.policyDigest) {
+      throw new Error('protected_http_egress_policy_changed_during_freeze');
     }
-    opts.onAdmission?.('rejected');
-  });
+    return queueBehindPendingProtectedHttpEgressFork(
+      pending,
+      ds,
+      promptInput,
+      resumeOrTurnId,
+      opts,
+    );
+  }
+  const activePending: PendingProtectedHttpEgressFork = {
+    pluginId: collectedPolicy.pluginId,
+    policyDigest: collectedPolicy.policyDigest,
+    waiters: [],
+  };
+  pendingProtectedHttpEgressForks.set(ds.session.sessionId, activePending);
+  const clearActivePending = () => {
+    if (pendingProtectedHttpEgressForks.get(ds.session.sessionId) === activePending) {
+      pendingProtectedHttpEgressForks.delete(ds.session.sessionId);
+    }
+  };
+  void resolveProtectedHttpEgressTargets(collectedPolicy.policy).then(
+    frozenAddresses => {
+      const policy: ProtectedHttpEgressWorkerPolicy = {
+        ...collectedPolicy,
+        frozenAddresses,
+      };
+      try {
+        const started = forkWorkerPrepared(
+          ds,
+          promptInput,
+          resumeOrTurnId,
+          opts,
+          policy,
+          bot,
+        );
+        if (started) {
+          const worker = ds.worker;
+          const promoteAfterOpeningInit = () => {
+            try {
+              const promoted = activePending.waiters.length === 0
+                || promoteQueuedActivationTail(ds);
+              for (const waiter of activePending.waiters) {
+                waiter.opts.onAdmission?.(promoted ? 'accepted' : 'rejected');
+              }
+            } catch (error) {
+              logger.error(
+                `[${tag(ds)}] Failed to promote protected egress DNS waiters after opening init: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+              );
+              for (const waiter of activePending.waiters) {
+                waiter.opts.onAdmission?.('rejected');
+              }
+            } finally {
+              clearActivePending();
+            }
+          };
+          if (!worker || !afterWorkerIpcBootstrap(worker, promoteAfterOpeningInit)) {
+            for (const waiter of activePending.waiters) {
+              waiter.opts.onAdmission?.('rejected');
+            }
+            clearActivePending();
+          }
+        } else if (!started) {
+          for (const waiter of activePending.waiters) waiter.opts.onAdmission?.('rejected');
+          clearActivePending();
+        }
+      } catch (error) {
+        reportProtectedHttpEgressForkFailure(
+          ds,
+          bot,
+          resumeOrTurnId,
+          opts,
+          error,
+          'preparation',
+        );
+        for (const waiter of activePending.waiters) {
+          reportProtectedHttpEgressForkFailure(
+            ds,
+            bot,
+            waiter.resumeOrTurnId,
+            waiter.opts,
+            error,
+            'preparation',
+          );
+        }
+        clearActivePending();
+      }
+    },
+    error => {
+      reportProtectedHttpEgressForkFailure(
+        ds,
+        bot,
+        resumeOrTurnId,
+        opts,
+        error,
+        'dns',
+      );
+      for (const waiter of activePending.waiters) {
+        reportProtectedHttpEgressForkFailure(
+          ds,
+          bot,
+          waiter.resumeOrTurnId,
+          waiter.opts,
+          error,
+          'dns',
+        );
+      }
+      clearActivePending();
+    },
+  );
   return true;
 }
 
@@ -15141,9 +15316,7 @@ function forkWorkerPrepared(
       protectedHttpEgressPolicy,
       adopt: false,
     }),
-    protectedHttpEgressPolicy
-      ? PROTECTED_MCP_EGRESS_GUARD_CONTAINMENT_PROFILE
-      : undefined,
+    protectedHttpEgressPolicy,
   );
   const forkEnv = workerForkEnv(
     buildBotWorkerEnv(process.env, botCfg.envPolicy, protectedMcpProvisioning.workerPolicy),

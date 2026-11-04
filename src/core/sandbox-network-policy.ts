@@ -189,6 +189,14 @@ export function mergeProtectedHttpEgressNetworkPolicy(
     if (!addresses?.length) throw new Error('protected_http_egress_target_not_frozen');
     for (const address of addresses) {
       const cidr = parseAddress(address).cidr;
+      if (addressMatches(address, '127.0.0.0/8') || addressMatches(address, '::1/128')) {
+        throw new Error('protected_http_egress_target_collides_with_loopback');
+      }
+      if (target.port === 53 && (merged.dnsServers ?? []).some(server => (
+        parseAddress(server).cidr === cidr
+      ))) {
+        throw new Error('protected_http_egress_target_collides_with_dns');
+      }
       const zoneName = networkZone(address);
       const zone = merged[zoneName];
       if (zone.mode === 'block') continue;

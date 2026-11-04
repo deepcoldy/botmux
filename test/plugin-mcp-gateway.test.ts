@@ -185,8 +185,8 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
-  it('passes the host-side protected egress socket only to the protected stdio plugin process', async () => {
-    installFixturePlugin('plugin-egress', 'egress-env', undefined, undefined, {
+  it('passes an explicit host-side egress socket only to the protected stdio plugin without ambient env mutation', async () => {
+    installFixturePlugin('plugin-egress', 'egress-env', undefined, 'fixture.write.v1', {
       id: 'fixture.write.v1',
       targets: [{
         scheme: 'https',
@@ -195,20 +195,29 @@ describe('plugin MCP Gateway', () => {
         denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
       }],
     });
+    installFixturePlugin('plugin-plain', 'egress-env');
+    const priorProcessSocket = process.env.BOTMUX_PROTECTED_EGRESS_SOCKET;
+    delete process.env.BOTMUX_PROTECTED_EGRESS_SOCKET;
     const gateway = new PluginMcpGateway(
-      ['plugin-egress'],
-      { ...process.env, BOTMUX_PROTECTED_EGRESS_SOCKET: '/host/private/e.sock' },
+      ['plugin-egress', 'plugin-plain'],
+      { ...process.env, BOTMUX_PROTECTED_EGRESS_SOCKET: '/ambient/must-not-be-used.sock' },
+      { protectedEgressSocketPath: '/host/private/e.sock' },
     );
     const client = new Client({ name: 'gateway-egress-env-test', version: '1.0.0' });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
     try {
-      const result = await client.callTool({ name: 'echo', arguments: {} });
+      const result = await client.callTool({ name: 'plugin-egress__echo', arguments: {} });
       expect((result.content[0] as { text: string }).text)
         .toBe('egress=/host/private/e.sock');
+      const plain = await client.callTool({ name: 'plugin-plain__echo', arguments: {} });
+      expect((plain.content[0] as { text: string }).text).toBe('egress=');
+      expect(process.env.BOTMUX_PROTECTED_EGRESS_SOCKET).toBeUndefined();
     } finally {
       await client.close();
       await gateway.close();
+      if (priorProcessSocket === undefined) delete process.env.BOTMUX_PROTECTED_EGRESS_SOCKET;
+      else process.env.BOTMUX_PROTECTED_EGRESS_SOCKET = priorProcessSocket;
     }
   });
 
@@ -503,7 +512,7 @@ describe('plugin MCP Gateway', () => {
             senderType: 'user',
           },
           turnId: 'om_readonly',
-          protectedMcpContainmentActive: true,
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
         }),
       },
     );
@@ -551,7 +560,7 @@ describe('plugin MCP Gateway', () => {
             senderType: 'user',
           },
           turnId: 'om_readonly',
-          protectedMcpContainmentActive: true,
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
         }),
       },
     );
@@ -588,7 +597,7 @@ describe('plugin MCP Gateway', () => {
           },
           turnId: 'om_turn',
           dispatchAttempt: 2,
-          protectedMcpContainmentActive: true,
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
         }),
         requestProtectedSecretChannel: async () => openProtectedFixtureChannel(),
         protectedMcpPolicy: {
@@ -660,6 +669,63 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
+  it('uses capability-specific containment evidence instead of granting every provisioned capability', async () => {
+    installFixturePlugin('plugin-egress', 'alpha', undefined, 'fixture.write.v1');
+    installFixturePlugin('plugin-unrelated', 'beta', undefined, 'fixture.unrelated.v1');
+    const gateway = new PluginMcpGateway(
+      ['plugin-egress', 'plugin-unrelated'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-capability-specific' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_trusted',
+            verifiedEmail: 'alice@bytedance.com',
+            requestLarkAppId: 'cli_trusted',
+            senderType: 'user',
+          },
+          turnId: 'om_capability_specific',
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.write.v1'],
+        }),
+        requestProtectedSecretChannel: async () => openProtectedFixtureChannel(),
+        protectedMcpPolicy: {
+          capabilities: [
+            {
+              id: 'fixture.write.v1',
+              allowedPluginIds: ['plugin-egress'],
+              principal: 'verified-human-email',
+              containmentProfile: 'local-stdio-secret-egress-guard-v1',
+            },
+            {
+              id: 'fixture.unrelated.v1',
+              allowedPluginIds: ['plugin-unrelated'],
+              principal: 'verified-human-email',
+              containmentProfile: 'local-stdio-secret-v1',
+            },
+          ],
+          protectedHomePaths: [],
+          redactEnv: [],
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-capability-specific-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const guarded = await client.callTool({ name: 'plugin-egress__echo', arguments: {} });
+      expect((guarded.content[0] as { text: string }).text)
+        .toContain('"botmuxGrantedCapabilities":["fixture.write.v1"]');
+
+      const unrelated = await client.callTool({ name: 'plugin-unrelated__echo', arguments: {} });
+      expect((unrelated.content[0] as { text: string }).text)
+        .not.toContain('botmuxGrantedCapabilities');
+      expect((unrelated.content[0] as { text: string }).text)
+        .not.toContain('botmuxTrustedPrincipal');
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
   it('withholds protected principal metadata when the turn envelope belongs to another caller', async () => {
     installFixturePlugin('plugin-a', 'alpha', undefined, 'fixture.secret.v1');
     const gateway = new PluginMcpGateway(
@@ -675,7 +741,7 @@ describe('plugin MCP Gateway', () => {
           },
           turnId: 'om_bob',
           identityTurnId: 'om_alice',
-          protectedMcpContainmentActive: true,
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
         }),
         requestProtectedSecretChannel: async () => openProtectedFixtureChannel(),
         protectedMcpPolicy: {
@@ -723,7 +789,7 @@ describe('plugin MCP Gateway', () => {
             ...callerFields,
           },
           turnId: 'om_turn',
-          protectedMcpContainmentActive: true,
+          protectedMcpContainmentActiveCapabilityIds: ['fixture.secret.v1'],
         }),
         requestProtectedSecretChannel: async () => openProtectedFixtureChannel(),
         protectedMcpPolicy: {

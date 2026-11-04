@@ -165,6 +165,9 @@ export function collectProtectedHttpEgressPolicies(
     if (descriptor.transport !== 'stdio' || !descriptor.protectedEgressPolicy) continue;
     const policy = normalizeProtectedHttpEgressPolicy(descriptor.protectedEgressPolicy);
     if (!policy) throw new Error(`invalid_plugin_mcp_protected_egress_policy:${pluginId}`);
+    if (descriptor.protectedCapability !== policy.id) {
+      throw new Error(`plugin_mcp_protected_egress_capability_mismatch:${pluginId}`);
+    }
     collected.push({
       pluginId,
       policy,

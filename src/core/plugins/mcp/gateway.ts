@@ -135,7 +135,7 @@ export interface GatewayTrustedTurnIdentity {
   identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
-  protectedMcpContainmentActive?: boolean;
+  protectedMcpContainmentActiveCapabilityIds?: string[];
 }
 
 export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
@@ -353,6 +353,7 @@ export class PluginMcpGateway {
   private readonly linkRefRegistration?: GatewayLinkRefRegistrationHandler;
   private readonly requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
   private readonly protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
+  private readonly protectedEgressSocketPath?: string;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -374,6 +375,7 @@ export class PluginMcpGateway {
       linkRefRegistration?: GatewayLinkRefRegistrationHandler;
       requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
       protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
+      protectedEgressSocketPath?: string;
     } = {},
   ) {
     this.env = env;
@@ -382,6 +384,7 @@ export class PluginMcpGateway {
     this.linkRefRegistration = opts.linkRefRegistration;
     this.requestProtectedSecretChannel = opts.requestProtectedSecretChannel;
     this.protectedMcpPolicy = opts.protectedMcpPolicy;
+    this.protectedEgressSocketPath = opts.protectedEgressSocketPath;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -471,8 +474,8 @@ export class PluginMcpGateway {
           BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
           ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
           ...(descriptor.server.protectedEgressPolicy
-            && this.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV]
-            ? { [PROTECTED_HTTP_EGRESS_SOCKET_ENV]: this.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV] }
+            && this.protectedEgressSocketPath
+            ? { [PROTECTED_HTTP_EGRESS_SOCKET_ENV]: this.protectedEgressSocketPath }
             : {}),
         };
         for (const key of protectedMcpRedactedEnvKeys(this.protectedMcpPolicy)) {
@@ -652,7 +655,9 @@ export class PluginMcpGateway {
     if (server.transport !== 'stdio'
       || !server.protectedCapability
       || connection.protectedCapabilityId !== server.protectedCapability
-      || identity?.protectedMcpContainmentActive !== true) return undefined;
+      || !identity?.protectedMcpContainmentActiveCapabilityIds?.includes(server.protectedCapability)) {
+      return undefined;
+    }
     const capability = this.provisionedProtectedCapability(
       connection.pluginId,
       server.protectedCapability,
