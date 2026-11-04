@@ -27,7 +27,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 
 import {
@@ -101,6 +101,19 @@ const baseShape = {
  */
 const nodeExecutorSchema = z.literal('bot').optional();
 
+/**
+ * Gate-2 `approve-dag --working-dir` for a bot-executed ad-hoc run (design
+ * §15.4): the absolute directory every goal node's session starts in. It is
+ * frozen into each bot snapshot's `workingDir` exactly as an ephemeral run
+ * freezes it; this key additionally marks it as an explicit choice that the
+ * executing bot's daemon checks against its configured directory range — and
+ * applies — when it starts the node session (in a bot run the snapshots'
+ * `workingDir` is otherwise display-only, the bot's own default applies).
+ * Only with `nodeExecutor: "bot"`; older readers reject the key (`.strict()`).
+ */
+const nodeWorkingDirSchema = z.string().min(1).max(4096)
+  .refine((path) => isAbsolute(path) && !path.includes('\0'), 'must be an absolute path');
+
 /** Tools the initiator could run as themselves on the main bot (mirrors
  *  `TRIGGER_USER_AUTH_TOOLS`; kept literal so this module stays host-neutral). */
 export const V3_HANDOFF_IDENTITY_TOOLS = ['lark-cli', 'bytedcli'] as const;
@@ -152,6 +165,7 @@ export type V3HandoffIdentityRecord = z.infer<typeof handoffIdentitySchema>;
 const adHocEnvelopeSchema = z.object({
   ...baseShape,
   nodeExecutor: nodeExecutorSchema,
+  nodeWorkingDir: nodeWorkingDirSchema.optional(),
   source: z.object({
     kind: z.literal('ad_hoc'),
     grillStatePath: z.literal('grill.state.json'),
@@ -272,6 +286,14 @@ export const V3RunEnvelopeSchema = z.union([
     }
   }
 
+  if ('nodeWorkingDir' in envelope && envelope.nodeWorkingDir !== undefined && envelope.nodeExecutor !== 'bot') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['nodeWorkingDir'],
+      message: 'requires nodeExecutor "bot"',
+    });
+  }
+
   if (envelope.authorization.kind === 'gate2') {
     const artifacts = envelope.artifacts as z.infer<typeof adHocEnvelopeSchema>['artifacts'];
     if (envelope.authorization.specSha256 !== artifacts.spec.sha256) {
@@ -377,6 +399,13 @@ export function frozenHandoffIdentity(envelope: V3RunEnvelope): V3FrozenHandoffI
   const openId = initiatorOpenIdOf(envelope);
   if (!frozen || !('unionId' in frozen) || !openId) return undefined;
   return { openId, unionId: frozen.unionId, tools: [...frozen.tools] };
+}
+
+/** The Gate-2 working dir of a bot-executed run (design §15.4), or
+ *  undefined: then every node runs in its executing bot's own default. */
+export function frozenNodeWorkingDir(envelope: V3RunEnvelope): string | undefined {
+  if (!('nodeWorkingDir' in envelope) || envelope.nodeExecutor !== 'bot') return undefined;
+  return envelope.nodeWorkingDir;
 }
 
 /** The run's 交接带发起人身份 record (frozen or why not), or undefined when
@@ -920,6 +949,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
   authorizedByOpenId?: string;
   artifacts: V3AdHocRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
+  nodeWorkingDir?: string;
   handoffIdentity?: V3HandoffIdentityRecord;
 }): V3AdHocRunEnvelope {
   return validateRunEnvelope({
@@ -929,6 +959,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
     createdAt: input.createdAt,
     ...(input.chatBinding ? { chatBinding: input.chatBinding } : {}),
     ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
+    ...(input.nodeWorkingDir !== undefined ? { nodeWorkingDir: input.nodeWorkingDir } : {}),
     source: { kind: 'ad_hoc', grillStatePath: 'grill.state.json' },
     artifacts: input.artifacts,
     authorization: {

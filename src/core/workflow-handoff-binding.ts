@@ -180,6 +180,9 @@ interface NonceEntry {
   workflowHandoff?: SignedWorkflowHandoffBinding;
   message?: { id: string; signature: string };
   revoked?: { at: string; reason: string; signature: string };
+  /** The executing bot's daemon would not start a session for it (design
+   *  §15.4), recorded where the main bot's acceptance check reads. */
+  refused?: { at: string; reason: string; signature: string };
 }
 
 function nonceEntry(registry: Record<string, unknown>, nonce: string): NonceEntry | undefined {
@@ -193,6 +196,18 @@ function messageMac(secret: string, nonce: string, messageId: string): string {
 
 function revocationMac(secret: string, nonce: string, at: string, reason: string): string {
   return hmac(secret, `${DOMAIN}|revoked|${nonce}|${at}|${reason}`);
+}
+
+function refusalMac(secret: string, nonce: string, at: string, reason: string): string {
+  return hmac(secret, `${DOMAIN}|refused|${nonce}|${at}|${reason}`);
+}
+
+function validRefusal(secret: string, nonce: string, entry: NonceEntry | undefined): string | undefined {
+  const refused = entry?.refused;
+  if (!refused || typeof refused.at !== 'string' || typeof refused.reason !== 'string' || typeof refused.signature !== 'string') {
+    return undefined;
+  }
+  return sameMac(refused.signature, refusalMac(secret, nonce, refused.at, refused.reason)) ? refused.reason : undefined;
 }
 
 function validRevocation(secret: string, nonce: string, entry: NonceEntry | undefined): boolean {
@@ -215,7 +230,7 @@ function pruneExpiredWorkflowEntries(registry: Record<string, unknown>, now: num
   for (const [key, value] of Object.entries(registry)) {
     if (!key.startsWith(NONCE_KEY_PREFIX)) continue;
     const entry = value as NonceEntry | undefined;
-    const stamps = [entry?.workflowHandoff?.payload?.issuedAt, entry?.revoked?.at]
+    const stamps = [entry?.workflowHandoff?.payload?.issuedAt, entry?.revoked?.at, entry?.refused?.at]
       .map((stamp) => (typeof stamp === 'string' ? Date.parse(stamp) : NaN))
       .filter((ms) => Number.isFinite(ms));
     const newest = stamps.length > 0 ? Math.max(...stamps) : NaN;
@@ -306,6 +321,28 @@ export async function revokeWorkflowHandoff(
   });
 }
 
+/** The executing bot refused to start this handoff's session (design
+ *  §15.4): durable, so the main bot's acceptance check still learns why when
+ *  the direct notice could not reach it. The first reason is kept. */
+export async function recordWorkflowHandoffRefusal(
+  dataDir: string,
+  secret: string,
+  nonce: string,
+  reason: string,
+  now: number = Date.now(),
+): Promise<void> {
+  if (!WORKFLOW_HANDOFF_NONCE_RE.test(nonce)) throw new Error('invalid handoff nonce');
+  const text = reason.slice(0, 2000);
+  await updateDispatchRegistry(registryPath(dataDir), (registry) => {
+    pruneExpiredWorkflowEntries(registry, now);
+    const entry = nonceEntry(registry, nonce);
+    if (!entry?.workflowHandoff || validRefusal(secret, nonce, entry) !== undefined) return;
+    const at = new Date(now).toISOString();
+    entry.refused = { at, reason: text, signature: refusalMac(secret, nonce, at, text) };
+    registry[`${NONCE_KEY_PREFIX}${nonce}`] = entry;
+  });
+}
+
 /** Whether `nonce` carries a valid revocation (with or without a binding). */
 export function isWorkflowHandoffRevoked(registry: Record<string, unknown>, nonce: string, secret: string): boolean {
   return WORKFLOW_HANDOFF_NONCE_RE.test(nonce) && validRevocation(secret, nonce, nonceEntry(registry, nonce));
@@ -318,6 +355,8 @@ export type WorkflowHandoffLookup =
       /** The linked handoff message id, once sent. */
       messageId?: string;
       revoked: boolean;
+      /** Why the executing bot would not start it, when it said so. */
+      refusal?: string;
     }
   /** An entry claims to be a workflow handoff but does not verify. Fail
    *  closed — never treat it as an ordinary dispatch. */
@@ -337,11 +376,13 @@ export function lookupWorkflowHandoffByNonce(input: {
   const binding = verifyWorkflowHandoffBinding(input.secret, input.nonce, entry.workflowHandoff);
   if (!binding) return { kind: 'unproven' };
   const messageId = linkedMessage(input.secret, input.nonce, entry);
+  const refusal = validRefusal(input.secret, input.nonce, entry);
   return {
     kind: 'workflow',
     binding,
     ...(messageId ? { messageId } : {}),
     revoked: validRevocation(input.secret, input.nonce, entry),
+    ...(refusal !== undefined ? { refusal } : {}),
   };
 }
 

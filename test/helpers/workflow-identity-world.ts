@@ -61,6 +61,8 @@ export function authorizeRun(run: BotRun, opts: {
   identity: V3HandoffIdentityRecord | null;
   selectors?: string[];
   chatBinding?: typeof BINDING;
+  /** Gate-2 `--working-dir` (design §15.4). */
+  nodeWorkingDir?: string;
 }): Map<string, BotSnapshot> {
   const runDir = run.runDir;
   mkdirSync(runDir, { recursive: true });
@@ -83,6 +85,7 @@ export function authorizeRun(run: BotRun, opts: {
     chatBinding: binding,
     authorizedByOpenId: binding.ownerOpenId,
     nodeExecutor: 'bot',
+    ...(opts.nodeWorkingDir ? { nodeWorkingDir: opts.nodeWorkingDir } : {}),
     ...(opts.identity ? { handoffIdentity: opts.identity } : {}),
     artifacts: {
       dag: artifactRef(runDir, 'dag.json'),
@@ -175,6 +178,8 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
     isProcessAlive: () => true,
     activeSessions: () => [],
     updateSession: () => {},
+    getSessionWorkingDir: (ds) => ds.workingDir ?? ds.session.workingDir ?? '',
+    findNodeSession: () => undefined,
     interruptTurn: () => true,
     proveBotSender: async () => true,
     deliverSelfTurn: async (input) => {
@@ -183,6 +188,8 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
     },
     attachmentsDir: (appId, messageId) => join(dataDir, 'attachments', appId, messageId),
     loadRun: () => undefined,
+    botWorkingDirConfig: () => ({}),
+    daemonAppliesNodeWorkingDir: () => true,
     drive: () => {},
     botName: (appId) => `bot(${appId})`,
     warn: () => {},

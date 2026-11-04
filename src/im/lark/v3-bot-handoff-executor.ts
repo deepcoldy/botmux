@@ -138,8 +138,15 @@ export interface V3BotHandoffExecutorDeps {
     sessionId?: string;
     reason: V3ExternalStopReason;
   }): Promise<void>;
-  /** §6.5: open the main bot's own node session; idempotent per handoff. */
-  startSelfTurn(input: V3SelfTurnRequest): Promise<{ sessionId: string }>;
+  /** §15.4, checked before anything is posted: why this attempt cannot be
+   *  handed off in the run's Gate-2 working dir (the main bot's own range
+   *  for its own node, or a target daemon that would not apply it), or
+   *  undefined. A reason blocks the node with WORKING_DIR_REFUSED. */
+  workingDirPreflight?(request: V3ExternalDispatchRequest): string | undefined;
+  /** §6.5: open the main bot's own node session; idempotent per handoff.
+   *  `refused`: nothing was started and the node was blocked with the reason
+   *  (the run's working dir is not in the main bot's range, §15.4). */
+  startSelfTurn(input: V3SelfTurnRequest): Promise<{ sessionId: string } | { refused: true }>;
   handoffIdentity?: V3HandoffIdentityDeps;
   /** §11: this run's「工作流 ›」sidebar entry (the main bot is this daemon's
    *  bot); undefined = no Dashboard address, the cards carry no entry. */
@@ -353,11 +360,13 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
     }
 
     // §6.3: re-check the target right before sending anything.
+    if (!selfExecuted && !deps.isDaemonOnline(target)) {
+      return { kind: 'rejected', code: 'BOT_OFFLINE', message: `${deps.botName(target)} 的 daemon 不在线` };
+    }
+    const dirRefusal = deps.workingDirPreflight?.(request);
+    if (dirRefusal) return { kind: 'rejected', code: 'WORKING_DIR_REFUSED', message: dirRefusal };
     let mention: V3HandoffCardInput['target'] = { kind: 'self' };
     if (!selfExecuted) {
-      if (!deps.isDaemonOnline(target)) {
-        return { kind: 'rejected', code: 'BOT_OFFLINE', message: `${deps.botName(target)} 的 daemon 不在线` };
-      }
       const inChat = await deps.resolveTargetInChat(chatId, target);
       if (!inChat.ok) {
         if (inChat.code === 'UNKNOWN') throw new Error(`target membership unknown: ${inChat.message}`);
@@ -542,9 +551,12 @@ export function createV3BotHandoffExecutor(deps: V3BotHandoffExecutorDeps): V3Ex
       publishRoot: found.binding.publishRoot,
       handoffMessageId: ref.handoffMessageId,
     });
-    return accepted
-      ? { status: 'accepted', sessionId: accepted.sessionId, ...(accepted.acceptedAt !== undefined ? { acceptedAt: accepted.acceptedAt } : {}) }
-      : { status: 'notAccepted' };
+    if (accepted) {
+      return { status: 'accepted', sessionId: accepted.sessionId, ...(accepted.acceptedAt !== undefined ? { acceptedAt: accepted.acceptedAt } : {}) };
+    }
+    // The target's daemon refused it (its direct notice may never have
+    // arrived): keep its reason in the not-accepted verdict.
+    return found.refusal ? { status: 'notAccepted', detail: found.refusal } : { status: 'notAccepted' };
   }
 
   async function stop(request: V3ExternalStopRequest): Promise<void> {
