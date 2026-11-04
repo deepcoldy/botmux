@@ -198,7 +198,7 @@ import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { applyGlobalSessionEnvOps, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { applyGlobalSessionEnvOps, isWorkflowFeatureEnabled, workflowNodeExecutorMode, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -377,6 +377,7 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
+import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -4458,6 +4459,10 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Workflow orchestration refuses Feishu H5 免登 with its own code (design
+    // 2026-11-03 workflow-dashboard-orchestration I5) instead of the generic 401.
+    if (workflowInitiatorPreGateDenial(res, url.pathname, requestIdentity, canManageHost)) return;
+
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
@@ -6782,6 +6787,19 @@ const server = createServer(async (req, res) => {
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}`, { method: 'DELETE' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
+      return;
+    }
+
+    // Workflow initiator (design 2026-11-03 workflow-dashboard-orchestration
+    // §7.1): classify the login here, resolve the person and gate on the
+    // orchestrating bot's own daemon.
+    if (await handleWorkflowInitiatorApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      proxyToDaemon,
+    })) {
       return;
     }
 

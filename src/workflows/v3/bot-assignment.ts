@@ -332,48 +332,109 @@ export function checkV3Assignees(input: {
   });
 }
 
+/** One node of the Gate-2 bot plan (§6.2/§6.3), structured. */
+export interface V3Gate2BotPlanRow {
+  nodeId: string;
+  larkAppId: string;
+  /** Display name at the time of projection (not part of the flow summary). */
+  name: string;
+  cli?: string;
+  /** The node runs on the orchestrating bot itself. */
+  main: boolean;
+  /** The Architect's reason, when it names this very bot. */
+  reason?: string;
+  /** ⚠️ a named bot (`assignee`) this node was meant for is not honoured. */
+  missedAssignee?: { assignee: string; why?: string };
+}
+
+/** ⚠️ lines not attached to a node: an unresolvable name, or a named bot no
+ *  node was given to. */
+export type V3Gate2UnplacedAssignee =
+  | { kind: 'unresolved'; sketchId: string; assignee: string; why: string }
+  | { kind: 'no-node'; sketchId: string; assignee: string; larkAppId: string; why?: string };
+
+export interface V3Gate2BotPlan {
+  rows: V3Gate2BotPlanRow[];
+  unplaced: V3Gate2UnplacedAssignee[];
+  /** Named bots not honoured, counted once per spec sketch. */
+  flagged: number;
+}
+
 /**
- * The Gate-2 "node → executing bot" lines of a bot run (§6.2/§6.3): bot name
- * and CLI, the Architect's reason, and a ⚠️ on every named bot that is not
- * honoured.
+ * The Gate-2 "node → executing bot" facts of a bot run: bot and CLI, the
+ * Architect's reason, and every named bot that is not honoured. The text
+ * summary ({@link formatV3Gate2BotPlan}) and the flow summary digest
+ * (flow-summary.ts) are both read off this one projection.
  */
-export function formatV3Gate2BotPlan(input: {
+export function projectV3Gate2BotPlan(input: {
   targets: readonly V3NodeExecutorTarget[];
   orchestratorAppId: string;
   nameOf: (larkAppId: string) => string;
   cliOf: (larkAppId: string) => string | undefined;
   reasons: ReadonlyMap<string, { bot: string; reason: string }>;
   assignees: readonly V3AssigneeCheck[];
-}): string {
+}): V3Gate2BotPlan {
   const notHonouredByNode = new Map<string, Extract<V3AssigneeCheck, { status: 'not-honoured' }>>();
   for (const check of input.assignees) {
     if (check.status !== 'not-honoured') continue;
     for (const nodeId of check.nodeIds) notHonouredByNode.set(nodeId, check);
   }
-  const named = (check: { assignee: string }) => `点名「${check.assignee}」`;
-  const lines = ['执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）'];
-  for (const target of input.targets) {
+  const rows = input.targets.map((target): V3Gate2BotPlanRow => {
     const name = input.nameOf(target.larkAppId);
     const cli = input.cliOf(target.larkAppId);
-    const detail = [cli, target.larkAppId === input.orchestratorAppId ? '主 Bot 自己' : undefined].filter(Boolean).join('，');
     const written = input.reasons.get(target.nodeId);
     const reasonMatches = written
       && [target.larkAppId, name].some((candidate) => normalName(candidate) === normalName(written.bot));
     const missed = notHonouredByNode.get(target.nodeId);
+    return {
+      nodeId: target.nodeId,
+      larkAppId: target.larkAppId,
+      name,
+      ...(cli ? { cli } : {}),
+      main: target.larkAppId === input.orchestratorAppId,
+      ...(reasonMatches ? { reason: written.reason } : {}),
+      ...(missed ? { missedAssignee: { assignee: missed.assignee, ...(missed.why ? { why: missed.why } : {}) } } : {}),
+    };
+  });
+  const unplaced: V3Gate2UnplacedAssignee[] = [];
+  for (const check of input.assignees) {
+    if (check.status === 'unresolved') {
+      unplaced.push({ kind: 'unresolved', sketchId: check.sketchId, assignee: check.assignee, why: check.why });
+    } else if (check.status === 'not-honoured' && check.nodeIds.length === 0) {
+      unplaced.push({
+        kind: 'no-node', sketchId: check.sketchId, assignee: check.assignee, larkAppId: check.larkAppId,
+        ...(check.why ? { why: check.why } : {}),
+      });
+    }
+  }
+  return { rows, unplaced, flagged: input.assignees.filter((check) => check.status !== 'honoured').length };
+}
+
+/**
+ * The Gate-2 "node → executing bot" lines of a bot run (§6.2/§6.3): bot name
+ * and CLI, the Architect's reason, and a ⚠️ on every named bot that is not
+ * honoured.
+ */
+export function formatV3Gate2BotPlan(input: Parameters<typeof projectV3Gate2BotPlan>[0]): string {
+  const plan = projectV3Gate2BotPlan(input);
+  const named = (check: { assignee: string }) => `点名「${check.assignee}」`;
+  const lines = ['执行方式：节点交给群里的 Bot 执行（每个节点开一个节点话题）'];
+  for (const row of plan.rows) {
+    const detail = [row.cli, row.main ? '主 Bot 自己' : undefined].filter(Boolean).join('，');
+    const missed = row.missedAssignee;
     lines.push(
-      `- ${missed ? '⚠️ ' : ''}${target.nodeId} → ${name}${detail ? `（${detail}）` : ''}` +
-      (reasonMatches ? `：${written.reason}` : '') +
+      `- ${missed ? '⚠️ ' : ''}${row.nodeId} → ${row.name}${detail ? `（${detail}）` : ''}` +
+      (row.reason ? `：${row.reason}` : '') +
       (missed ? ` —— ${named(missed)}未满足${missed.why ? `：${missed.why}` : ''}` : ''),
     );
   }
-  for (const check of input.assignees) {
-    if (check.status === 'unresolved') {
-      lines.push(`- ⚠️ ${check.sketchId}：${named(check)}未生效：${check.why}`);
-    } else if (check.status === 'not-honoured' && check.nodeIds.length === 0) {
-      lines.push(`- ⚠️ ${check.sketchId}：${named(check)}未满足：没有节点交给 ${input.nameOf(check.larkAppId)}${check.why ? `（${check.why}）` : ''}`);
+  for (const entry of plan.unplaced) {
+    if (entry.kind === 'unresolved') {
+      lines.push(`- ⚠️ ${entry.sketchId}：${named(entry)}未生效：${entry.why}`);
+    } else {
+      lines.push(`- ⚠️ ${entry.sketchId}：${named(entry)}未满足：没有节点交给 ${input.nameOf(entry.larkAppId)}${entry.why ? `（${entry.why}）` : ''}`);
     }
   }
-  const flagged = input.assignees.filter((check) => check.status !== 'honoured').length;
-  if (flagged > 0) lines.push(`⚠️ 有 ${flagged} 处点名没有满足（见上方 ⚠️），批准前请向用户说明。`);
+  if (plan.flagged > 0) lines.push(`⚠️ 有 ${plan.flagged} 处点名没有满足（见上方 ⚠️），批准前请向用户说明。`);
   return lines.join('\n');
 }

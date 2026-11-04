@@ -58,8 +58,11 @@ import {
   readRunEnvelope,
   type PublishRunEnvelopeResult,
   type V3AdHocRunEnvelope,
+  type V3FlowConfirmation,
   type V3HandoffIdentityRecord,
+  type V3RunInitiator,
 } from './run-envelope.js';
+import { buildV3FlowSummary, v3FlowSummarySha256 } from './flow-summary.js';
 import { V3_SUPPORTED_CLIS, isV3SupportedCli, type BotSnapshot } from './contract.js';
 import { isMultiTopicOrchestrationEnabled, workflowHandoffIdentityEnabled, workflowNodeExecutorMode } from '../../global-config.js';
 import {
@@ -67,6 +70,7 @@ import {
   checkV3Assignees,
   formatV3Gate2BotPlan,
   parseV3AssignmentReasons,
+  projectV3Gate2BotPlan,
   planV3SketchAssignees,
   v3AssigneeProblems,
   v3RosterSelectorProblems,
@@ -503,7 +507,16 @@ export function authorizeAdHocRun(
   runDir: string,
   bots: BotConfig[],
   now: Date = new Date(),
-  opts: { workingDirOverride?: string; nodeExecutor?: 'bot'; handoffIdentity?: V3HandoffIdentityRecord } = {},
+  opts: {
+    workingDirOverride?: string;
+    nodeExecutor?: 'bot';
+    handoffIdentity?: V3HandoffIdentityRecord;
+    /** Bot runs only (design 2026-11-03 workflow-dashboard-orchestration §7.3). */
+    initiator?: V3RunInitiator;
+    /** Bot runs only: the second-gate record, built inside the lock from the
+     *  exact DAG and executing bots being frozen. */
+    flowConfirmation?: (frozen: { dag: V3Dag; targets: V3NodeExecutorTarget[] }) => V3FlowConfirmation;
+  } = {},
 ): AdHocRunAuthorizationResult {
   // A bot-executed run freezes the directory exactly as an ephemeral one does
   // (every snapshot's workingDir) and also records it in run.json, where the
@@ -590,6 +603,10 @@ export function authorizeAdHocRun(
       ...(opts.nodeExecutor ? { nodeExecutor: opts.nodeExecutor } : {}),
       ...(nodeWorkingDir !== undefined ? { nodeWorkingDir } : {}),
       ...(opts.nodeExecutor && opts.handoffIdentity ? { handoffIdentity: opts.handoffIdentity } : {}),
+      ...(opts.nodeExecutor && opts.initiator ? { initiator: opts.initiator } : {}),
+      ...(opts.nodeExecutor && opts.flowConfirmation
+        ? { flowConfirmation: opts.flowConfirmation({ dag, targets: v3BotExecutorTargets(dag, snapshots) }) }
+        : {}),
       artifacts: {
         dag: artifactRef(runDir, 'dag.json'),
         spec: artifactRef(runDir, 'spec.json'),
@@ -746,6 +763,18 @@ export function describeAdHocBotPlan(
   nameOf: (larkAppId: string) => string,
   roster?: V3BotRoster,
 ): string {
+  return formatV3Gate2BotPlan(adHocBotPlanInput(runDir, targets, orchestratorAppId, bots, nameOf, roster));
+}
+
+/** The facts {@link describeAdHocBotPlan} prints, for the flow summary. */
+function adHocBotPlanInput(
+  runDir: string,
+  targets: readonly V3NodeExecutorTarget[],
+  orchestratorAppId: string,
+  bots: readonly BotConfig[],
+  nameOf: (larkAppId: string) => string,
+  roster?: V3BotRoster,
+): Parameters<typeof formatV3Gate2BotPlan>[0] {
   const cur = readGrillState(runDir);
   let reasons = new Map<string, { bot: string; reason: string }>();
   try {
@@ -759,14 +788,41 @@ export function describeAdHocBotPlan(
       assignees = checkV3Assignees({ spec, targets, bots, nameOf, unavailableWhy: (appId) => excluded.get(appId) });
     }
   } catch { /* no checks */ }
-  return formatV3Gate2BotPlan({
+  return {
     targets,
     orchestratorAppId,
     nameOf,
     cliOf: (appId) => bots.find((bot) => bot.larkAppId === appId)?.cliId,
     reasons,
     assignees,
-  });
+  };
+}
+
+/**
+ * Gate-2's second-confirmation record for a bot run (design 2026-11-03
+ * workflow-dashboard-orchestration §4.4 / §7.3): the flow summary of exactly
+ * what is being frozen, who confirmed (when known) and when.
+ */
+function adHocFlowConfirmation(input: {
+  runDir: string;
+  dag: V3Dag;
+  targets: readonly V3NodeExecutorTarget[];
+  orchestratorAppId: string;
+  bots: readonly BotConfig[];
+  nameOf: (larkAppId: string) => string;
+  confirmedByOpenId?: string;
+  confirmedAt: Date;
+}): V3FlowConfirmation {
+  const plan = projectV3Gate2BotPlan(
+    adHocBotPlanInput(input.runDir, input.targets, input.orchestratorAppId, input.bots, input.nameOf),
+  );
+  const flowSummary = buildV3FlowSummary({ dagNodes: input.dag.nodes, plan });
+  return {
+    ...(input.confirmedByOpenId ? { confirmedByOpenId: input.confirmedByOpenId } : {}),
+    confirmedAt: input.confirmedAt.toISOString(),
+    flowSummary,
+    flowSummarySha256: v3FlowSummarySha256(flowSummary),
+  };
 }
 
 /**
@@ -943,6 +999,25 @@ async function liveBotRole(): Promise<(larkAppId: string) => string | undefined>
   return (larkAppId) => getBotCapability(config.session.dataDir, larkAppId) ?? undefined;
 }
 
+const OPEN_ID_RE = /^ou_[A-Za-z0-9_-]{1,128}$/;
+function isOpenId(value: string | undefined): value is string {
+  return typeof value === 'string' && OPEN_ID_RE.test(value);
+}
+
+/** A Feishu-born run's initiator: the grill's authenticated caller, with the
+ *  union_id when 交接带发起人身份 already resolved it (no extra lookup). */
+function feishuRunInitiator(
+  binding: RunChatBinding,
+  handoffIdentity: V3HandoffIdentityRecord | undefined,
+): V3RunInitiator | undefined {
+  if (!isOpenId(binding.ownerOpenId)) return undefined;
+  return {
+    openId: binding.ownerOpenId,
+    ...(handoffIdentity && 'unionId' in handoffIdentity ? { unionId: handoffIdentity.unionId } : {}),
+    source: 'feishu',
+  };
+}
+
 export async function cmdWorkflowHost(
   sub: string,
   rest: string[],
@@ -1086,7 +1161,11 @@ export async function cmdWorkflowHost(
     }
     case 'approve-dag': {
       const runId = requireRunId(rest);
-      const runDir = guardedRunDir(runId);
+      const runDir = runDirFor(runId, baseDir);
+      // Kept (not just checked): the person of this turn is the confirmer the
+      // run records (design 2026-11-03 workflow-dashboard-orchestration §7.3).
+      const currentCaller = (deps.resolveChatBinding ?? chatBindingFromEnv)();
+      assertWorkflowHostCaller(runDir, currentCaller);
       const workingDirOverride = argValue(rest, '--working-dir');
       if (rest.includes('--working-dir') && (!workingDirOverride?.trim() || workingDirOverride.startsWith('--'))) {
         throw new Error('--working-dir requires a non-empty path');
@@ -1102,6 +1181,8 @@ export async function cmdWorkflowHost(
       const summary: string[] = [];
       let nodeExecutor: 'bot' | undefined;
       let handoffIdentity: V3HandoffIdentityRecord | undefined;
+      let initiator: V3RunInitiator | undefined;
+      let flowConfirmation: ((frozen: { dag: V3Dag; targets: V3NodeExecutorTarget[] }) => V3FlowConfirmation) | undefined;
       /** Bot mode: the absolute, range-checked `--working-dir`. */
       let botWorkingDir: string | undefined;
       if (before.kind === 'missing') {
@@ -1142,6 +1223,23 @@ export async function cmdWorkflowHost(
               summary.push(describeAdHocBotPlan(runDir, plan.targets, plan.binding.larkAppId, bots, nameOf));
             }
             if (botWorkingDir !== undefined) summary.push(describeV3NodeWorkingDir(botWorkingDir));
+            // Initiator and second confirmation (design 2026-11-03
+            // workflow-dashboard-orchestration §7.3, I11): the grill's
+            // authenticated initiator, and the person of THIS turn as the
+            // confirmer — only when a human message opened it; otherwise (or
+            // when the turn cannot be proven) the confirmer is unknown and not
+            // written, never guessed, and the approval goes on.
+            initiator = feishuRunInitiator(plan.binding, handoffIdentity);
+            let humanTurn = false;
+            try {
+              humanTurn = isHumanInboundTurnId((deps.resolveCurrentTurnId ?? currentTurnIdFromEnv)());
+            } catch { /* unproven turn: no confirmer */ }
+            const confirmedByOpenId = humanTurn && isOpenId(currentCaller?.ownerOpenId) ? currentCaller!.ownerOpenId : undefined;
+            const orchestratorAppId = plan.binding.larkAppId;
+            flowConfirmation = ({ dag, targets }) => adHocFlowConfirmation({
+              runDir, dag, targets, orchestratorAppId, bots, nameOf, confirmedAt: now,
+              ...(confirmedByOpenId ? { confirmedByOpenId } : {}),
+            });
             nodeExecutor = 'bot';
           }
         } else {
@@ -1158,6 +1256,8 @@ export async function cmdWorkflowHost(
         workingDirOverride: nodeExecutor === 'bot' ? botWorkingDir : workingDirOverride,
         ...(nodeExecutor ? { nodeExecutor } : {}),
         ...(handoffIdentity ? { handoffIdentity } : {}),
+        ...(initiator ? { initiator } : {}),
+        ...(flowConfirmation ? { flowConfirmation } : {}),
       });
       const { state } = hostApproveDag(runDir, now);
       const dagPath = authorized.dagPath;
