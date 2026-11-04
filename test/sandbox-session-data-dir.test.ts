@@ -369,8 +369,9 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
       plan = prepareDirectSandbox({
         sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
         chdir: repoRoot, home: f.home, cliBin: command,
-        // A valueless flag is rejected at the start of relaySend, proving that
-        // the normal relay path was reached without issuing any real request.
+        // A syntactically valid proposal path whose file is missing is rejected
+        // INSIDE relaySend, proving the normal relay path was reached without
+        // issuing any real request (send's argv preflight accepts it first).
         cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--completion-proposal-file', '/tmp/unused.json'],
       });
       expect(plan).not.toBeNull();
