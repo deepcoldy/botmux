@@ -1,11 +1,21 @@
 import { createHash } from 'node:crypto';
+import { basename } from 'node:path';
 import type { WorkerFinalOutput } from '../types.js';
 
-/** Filesystem key for per-app journals/stores. The app id is config-controlled
- *  (production ids look like `cli_…`) and these stores must stay constructible
- *  for any safe basename; path containment is the security boundary, not the
- *  `cli_` prefix, which is validated at Feishu protocol edges instead. */
-export const OUTPUT_JOURNAL_APP_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+/** Filesystem key for per-app journals/stores. Containment, not an id-shape
+ *  whitelist, is the security boundary here: the configured app id space is
+ *  owned by the registry/Feishu protocol edges (`cli_…`, synthesized
+ *  `local_<slug>` where the slug permits dots), and these stores must stay
+ *  constructible for every safe basename. Rejects path traversal, leading
+ *  dots (`.`/`..`), whitespace and control characters in either direction. */
+export function isOutputJournalAppId(appId: unknown): appId is string {
+  return typeof appId === 'string'
+    && appId.length > 0 && appId.length <= 128
+    && appId === basename(appId)
+    && !appId.includes('\\')
+    && !appId.startsWith('.')
+    && !/[\s\0]/.test(appId);
+}
 
 export interface OutputHandoffClaim {
   version: 2;

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
 import { validateFinalOutputSnapshot, type FinalOutputSnapshot } from './final-output-handoff.js';
-import { OUTPUT_JOURNAL_APP_ID_RE } from './universal-output-handoff.js';
+import { isOutputJournalAppId } from './universal-output-handoff.js';
 import type { FrozenSessionReplyTarget } from '../types.js';
 
 export type FinalHandoffState = 'prepared' | 'attempting' | 'delivered' | 'suppressed' | 'cancelled' | 'ambiguous' | 'rejected';
@@ -26,10 +26,10 @@ export interface StoredFinalOutput extends FinalOutputSnapshot {
 export class FinalOutputHandoffStore {
   private readonly db: DatabaseSyncLike;
   static path(dataDir: string, appId: string): string {
-    if (!OUTPUT_JOURNAL_APP_ID_RE.test(appId)) throw new Error('invalid_handoff_app');
+    if (!isOutputJournalAppId(appId)) throw new Error('invalid_handoff_app');
     return join(dataDir, 'final-output-handoffs', `${appId}.db`);
   }
-  static exists(dataDir: string, appId: string): boolean { return OUTPUT_JOURNAL_APP_ID_RE.test(appId) && existsSync(this.path(dataDir, appId)); }
+  static exists(dataDir: string, appId: string): boolean { return isOutputJournalAppId(appId) && existsSync(this.path(dataDir, appId)); }
   constructor(dataDir: string, readonly appId: string) {
     const path = FinalOutputHandoffStore.path(dataDir, appId);
     const directory = join(dataDir, 'final-output-handoffs');

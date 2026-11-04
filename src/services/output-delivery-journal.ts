@@ -2,7 +2,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
-import { mergeOutputReplay, validateOutputSnapshot, OUTPUT_JOURNAL_APP_ID_RE, type OutputSnapshot } from './universal-output-handoff.js';
+import { mergeOutputReplay, validateOutputSnapshot, isOutputJournalAppId, type OutputSnapshot } from './universal-output-handoff.js';
 import type { FrozenSessionReplyContext } from '../types.js';
 
 export type OutputSink =
@@ -25,7 +25,10 @@ export interface OutputReceipt {
 }
 export interface OutputDeliveryRecord extends OutputSnapshot {
   sink: OutputSink;
-  state: 'pending' | 'processing' | 'settled' | 'blocked';
+  /** rejected = terminal: the frozen destination structurally cannot accept
+   *  this output (original chat/type/private-reply policy changed, HTTP owner
+   *  gone). Never retried or re-settled; retained for human inspection. */
+  state: 'pending' | 'processing' | 'settled' | 'blocked' | 'rejected';
   receipt?: OutputReceipt;
   reason?: string;
 }
@@ -37,7 +40,7 @@ export class OutputDeliveryJournal {
   private readonly scanCursors = new Map<string, { after: { createdAt: number; id: string }; upperRowId: number }>();
   readonly filename: string;
   constructor(dataDir: string, readonly appId: string) {
-    if (!OUTPUT_JOURNAL_APP_ID_RE.test(appId)) throw new Error('invalid_output_app');
+    if (!isOutputJournalAppId(appId)) throw new Error('invalid_output_app');
     const directory = join(dataDir, 'output-delivery-journals');
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.filename = join(directory, `${appId}.db`);
@@ -88,7 +91,7 @@ export class OutputDeliveryJournal {
     });
   }
   claim(id: string, owner: string, now = Date.now(), leaseMs = 60_000): boolean {
-    return Number(this.db.prepare("UPDATE outputs SET state='processing',owner=?,lease_until=?,updated_at=? WHERE id=? AND state!='settled' AND lease_until<=?")
+    return Number(this.db.prepare("UPDATE outputs SET state='processing',owner=?,lease_until=?,updated_at=? WHERE id=? AND state!='settled' AND state!='rejected' AND lease_until<=?")
       .run(owner, now + leaseMs, now, id, now).changes) === 1;
   }
   newOwner(): string { return randomUUID(); }
@@ -117,15 +120,29 @@ export class OutputDeliveryJournal {
         .run(JSON.stringify(record), Date.now() + 5_000, Date.now(), id, owner);
     });
   }
+  /** Terminal rejection for a frozen destination that can NEVER accept the
+   *  output (original channel/policy changed, HTTP owner gone). The row leaves
+   *  the retry loop permanently and is retained as human-inspection evidence;
+   *  the worker copy is never ACKed. Only the live processing owner can file
+   *  it, so a stale/late owner cannot terminalise a row a newer owner holds. */
+  rejectTerminal(id: string, owner: string, reason: string): boolean {
+    return this.transaction(() => {
+      const record = this.read(id);
+      if (!record || record.state === 'settled' || record.state === 'rejected') return false;
+      record.reason = reason.slice(0, 256);
+      return Number(this.db.prepare("UPDATE outputs SET value=?,state='rejected',owner=NULL,lease_until=0,updated_at=? WHERE id=? AND owner=?")
+        .run(JSON.stringify(record), Date.now(), id, owner).changes) === 1;
+    });
+  }
   pending(sessionId?: string): OutputDeliveryRecord[] {
     const key = sessionId ?? '';
     const scope = sessionId ?? null;
     const captureUpper = (): number | undefined => {
-      const row = this.db.prepare("SELECT MAX(rowid) AS upper FROM outputs WHERE state!='settled' AND (? IS NULL OR session_id=?)").get(scope, scope) as { upper: number | null };
+      const row = this.db.prepare("SELECT MAX(rowid) AS upper FROM outputs WHERE state!='settled' AND state!='rejected' AND (? IS NULL OR session_id=?)").get(scope, scope) as { upper: number | null };
       return row.upper === null ? undefined : Number(row.upper);
     };
     const select = (upper: number, after?: { createdAt: number; id: string }) => this.db.prepare(
-      "SELECT id,created_at FROM outputs WHERE state!='settled' AND lease_until<=? AND (? IS NULL OR session_id=?) AND rowid<=? AND (? IS NULL OR created_at>? OR (created_at=? AND id>?)) ORDER BY created_at,id LIMIT 128",
+      "SELECT id,created_at FROM outputs WHERE state!='settled' AND state!='rejected' AND lease_until<=? AND (? IS NULL OR session_id=?) AND rowid<=? AND (? IS NULL OR created_at>? OR (created_at=? AND id>?)) ORDER BY created_at,id LIMIT 128",
     ).all(Date.now(), scope, scope, upper, after?.createdAt ?? null, after?.createdAt ?? null, after?.createdAt ?? null, after?.id ?? null) as Array<{ id: string; created_at: number }>;
     const cursor = this.scanCursors.get(key);
     let upper = cursor?.upperRowId ?? captureUpper();
@@ -207,10 +224,18 @@ export class OutputDeliveryJournal {
     return (this.db.prepare("SELECT id FROM outputs WHERE session_id=? AND turn_id=? AND state='settled' ORDER BY created_at")
       .all(sessionId, turnId) as Array<{ id: string }>).map(row => this.read(row.id)!);
   }
-  /** Any unsettled row (pending/processing/blocked) for a session. Does not
-   *  advance the recovery scan watermark. */
+  /** A still-self-healing row (pending/processing/blocked) for a session.
+   *  Terminal `rejected` rows are NOT counted: their answer can never be
+   *  delivered to the frozen target and they no longer churn recovery; they
+   *  await a human resolve path and are reported separately. Does not advance
+   *  the recovery scan watermark. */
   hasUnsettled(sessionId: string): boolean {
-    return !!this.db.prepare("SELECT 1 FROM outputs WHERE session_id=? AND state!='settled' LIMIT 1").get(sessionId);
+    return !!this.db.prepare("SELECT 1 FROM outputs WHERE session_id=? AND state IN ('pending','processing','blocked') LIMIT 1").get(sessionId);
+  }
+  /** A terminal rejected row for a session — evidence of an answer that
+   *  structurally cannot reach its frozen target, held for human inspection. */
+  hasTerminalRejection(sessionId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM outputs WHERE session_id=? AND state='rejected' LIMIT 1").get(sessionId);
   }
 }
 

@@ -7,7 +7,8 @@ import { WorkerOutputJournal } from '../src/services/worker-output-journal.js';
 import { OutputDeliveryJournal, type OutputDeliveryRecord } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
 import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
-import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
+import { TurnSendLedger, FinalPublicationUnknownError } from '../src/services/turn-send-ledger.js';
+import { OutputDeliveryTerminalError } from '../src/services/output-delivery-coordinator.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { committedCodexAppSequence, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
 import { FINAL_HANDOFF_DELIVERY_REASON, FINAL_HANDOFF_WAIT_REASON } from '../src/core/worker-pool.js';
@@ -31,7 +32,9 @@ describe('journal app identity', () => {
     expect(() => new OutputDeliveryJournal(dir, 'app_test')).not.toThrow();
     expect(() => new WorkerOutputJournal(dir, 'app_test', output.sessionId!)).not.toThrow();
     expect(() => FinalOutputHandoffStore.exists(dir, 'app_test')).not.toThrow();
-    for (const bad of ['../x', 'a/b', String.raw`cli_x\y`, '.', '..', '', 'x'.repeat(129), 'a b', 'a.b']) {
+    // core-only synthesizes `local_<slug>` and the slug permits dots.
+    expect(() => new OutputDeliveryJournal(dir, 'local_my.bot')).not.toThrow();
+    for (const bad of ['../x', 'a/b', String.raw`cli_x\y`, '.', '..', '', 'x'.repeat(129), 'a b']) {
       expect(() => new OutputDeliveryJournal(dir, bad)).toThrow('invalid_output_app');
       expect(() => new WorkerOutputJournal(dir, bad, output.sessionId!)).toThrow('invalid_output_journal_identity');
       expect(() => FinalOutputHandoffStore.path(dir, bad)).toThrow('invalid_handoff_app');
@@ -42,20 +45,44 @@ describe('journal app identity', () => {
 describe('attention lifecycle', () => {
   const loadRunOutput = (scope: Record<string, any>) =>
     loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope);
-  const scopeFor = (db: OutputDeliveryJournal, record: OutputDeliveryRecord, dir: string) => {
+  const scopeFor = (
+    db: OutputDeliveryJournal,
+    record: OutputDeliveryRecord,
+    dir: string,
+    options: {
+      sink?: OutputDeliveryRecord['sink'];
+      processFinalOutput?: any;
+      v1Exists?: boolean;
+      v1Attention?: boolean;
+      bridgeEntries?: any[];
+      chatId?: string; chatType?: 'group' | 'p2p'; privateReplyOn?: boolean;
+      asyncResults?: Map<string, unknown>;
+    } = {},
+  ) => {
     const worker = { send: vi.fn() };
-    const ds: any = { larkAppId: app, chatId: 'oc', chatType: 'group', session: { sessionId: output.sessionId! },
-      worker, initConfig: { finalOutputHandoff: { version: 2, token: 'tok' } }, agentAttention: { kind: 'blocked' as const, reason: FINAL_HANDOFF_DELIVERY_REASON } };
+    const sink = options.sink ?? record.sink;
+    const ds: any = { larkAppId: app, chatId: options.chatId ?? 'oc', chatType: options.chatType ?? 'group',
+      session: { sessionId: output.sessionId! },
+      worker, initConfig: { finalOutputHandoff: { version: 2, token: 'tok' } },
+      agentAttention: { kind: 'blocked' as const, reason: FINAL_HANDOFF_DELIVERY_REASON } };
+    if (options.asyncResults) ds.asyncTriggerResults = options.asyncResults;
     const publishAttentionPatch = vi.fn();
     const coordinator = new OutputDeliveryCoordinator(db);
     const scope: any = {
       ds, worker, t: 'probe', journal: db, coordinator, config: { session: { dataDir: dir } },
-      ownsLifecycleMutation: () => true, processFinalOutput: vi.fn(async () => ({ status: 'suppressed' as const })),
-      FinalOutputHandoffStore: { exists: () => false }, finalOutputHandoffHost: () => { throw new Error('should not construct V1 store'); },
-      readBridgeTurnJournal: () => [], publishAttentionPatch, join,
+      ownsLifecycleMutation: () => true,
+      processFinalOutput: options.processFinalOutput ?? vi.fn(async () => ({ status: 'suppressed' as const })),
+      canTalk: () => true,
+      FinalOutputHandoffStore: { exists: () => options.v1Exists ?? false },
+      finalOutputHandoffHost: () => ({ store: { attentionPending: () => options.v1Attention ? {} : undefined } }),
+      readBridgeTurnJournal: () => options.bridgeEntries ?? [], publishAttentionPatch, join,
       FINAL_HANDOFF_WAIT_REASON, FINAL_HANDOFF_DELIVERY_REASON,
+      privateReplyEnabled: () => options.privateReplyOn ?? false,
+      asyncTriggerStore: { lookupStrict: () => undefined },
+      FinalPublicationUnknownError, OutputDeliveryTerminalError,
       logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     };
+    record = { ...record, sink };
     return { scope, ds, publishAttentionPatch, run: () => loadRunOutput(scope)(record) };
   };
   it('clears the durable-output attention after a replacement delivery settles', async () => {
@@ -75,6 +102,71 @@ describe('attention lifecycle', () => {
     await ctx.run();
     expect(ctx.ds.agentAttention).toBeDefined();
     expect(ctx.publishAttentionPatch).not.toHaveBeenCalled();
+  });
+  it('keeps the attention while a V1 ambiguous/rejected handoff still requires inspection', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output), { kind: 'suppressed', reason: 'probe' });
+    const ctx = scopeFor(db, record, dir, { v1Exists: true, v1Attention: true });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.ds.agentAttention).toBeDefined();
+    expect(ctx.publishAttentionPatch).not.toHaveBeenCalled();
+  });
+  it('keeps the attention while a legacy bridge mark still carries a pending final snapshot', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output), { kind: 'suppressed', reason: 'probe' });
+    const ctx = scopeFor(db, record, dir, { bridgeEntries: [{ pendingFinal: { intentId: 'x' } }] });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.ds.agentAttention).toBeDefined();
+    expect(ctx.publishAttentionPatch).not.toHaveBeenCalled();
+  });
+  it('files a structurally undeliverable output as terminal rejected and never retries it', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    // Session has been rehomed into a different chat: the frozen IM target can
+    // never come back; no provider call must ever happen.
+    const ctx = scopeFor(db, record, dir, { chatId: 'oc_new_chat' });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('rejected');
+    expect(ctx.scope.processFinalOutput).not.toHaveBeenCalled();
+    expect(ctx.ds.agentAttention).toBeDefined();
+    // A second pump (worker retransmission / restart recovery) does nothing:
+    // no retry, no settled receipt, no worker ACK.
+    ctx.scope.processFinalOutput.mockClear?.();
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('rejected');
+    expect(ctx.scope.processFinalOutput).not.toHaveBeenCalled();
+    expect(ctx.scope.worker.send).not.toHaveBeenCalled();
+  });
+  it('files the expired publication window as terminal rejected instead of looping blocked', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => { throw new FinalPublicationUnknownError(); }),
+    });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('rejected');
+  });
+  it('keeps a transient failure in blocked so the next pump retries the same record', async () => {
+    vi.useFakeTimers();
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    let attempts = 0;
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => { if (++attempts === 1) throw new Error('feishu 502'); return { status: 'delivered' as const, messageId: 'om_ok' }; }),
+    });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('blocked');
+    // Expire the short blocked cooldown and pump again: same record settles.
+    await vi.advanceTimersByTimeAsync(5_001);
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(attempts).toBe(2);
+    vi.useRealTimers();
   });
 });
 

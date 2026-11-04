@@ -214,8 +214,8 @@ import { readBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { setFinalOutputOriginRecorder } from './reply-target.js';
 import { outputSnapshot } from '../services/universal-output-handoff.js';
 import { outputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt, type OutputSink } from '../services/output-delivery-journal.js';
-import { OutputDeliveryCoordinator, type OutputDeliveryControl } from '../services/output-delivery-coordinator.js';
-import { TurnSendLedger } from '../services/turn-send-ledger.js';
+import { OutputDeliveryCoordinator, OutputDeliveryTerminalError, type OutputDeliveryControl } from '../services/output-delivery-coordinator.js';
+import { TurnSendLedger, FinalPublicationUnknownError } from '../services/turn-send-ledger.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
 import { TurnResultStore } from '../services/turn-result-store.js';
 import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
@@ -16738,28 +16738,26 @@ function setupWorkerHandlers(
   const coordinator = journal ? new OutputDeliveryCoordinator(journal) : undefined;
   const runOutput = async (record: OutputDeliveryRecord): Promise<void> => {
     if (!journal || !coordinator) return;
-    const authority = (): boolean => {
-      if (!ownsLifecycleMutation()) return false;
-      const sink = record.sink;
-      if (sink.kind !== 'im') return true;
-      const actor = sink.context.requesterOpenId ?? sink.context.replyTargetSenderOpenId;
-      return ds.chatId === sink.chatId && ds.chatType === sink.chatType && privateReplyEnabled(ds.session) === !!sink.privateReply
-        && (!actor || canTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType));
-    };
+    // Claim authority tracks live worker generation only. Structural sink
+    // mismatches (channel/private-reply policy/HTTP owner gone) must be
+    // classified INSIDE process so they become terminal `rejected`, instead of
+    // leaving the row in pending where a permanently-false owns() predicate
+    // silently parks it (and the session attention) forever.
+    const authority = (): boolean => ownsLifecycleMutation();
     await coordinator.deliver(record, {
       owns: authority,
       process: async (record, control) => {
         const sink = record.sink;
         if (sink.kind === 'im') {
-          if (ds.chatId !== sink.chatId || ds.chatType !== sink.chatType || privateReplyEnabled(ds.session) !== !!sink.privateReply) throw new Error('output_original_channel_changed');
+          if (ds.chatId !== sink.chatId || ds.chatType !== sink.chatType || privateReplyEnabled(ds.session) !== !!sink.privateReply) throw new OutputDeliveryTerminalError('output_original_channel_changed');
           const actor = sink.context.requesterOpenId ?? sink.context.replyTargetSenderOpenId;
-          if (actor && !canTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType)) throw new Error('output_permission_revoked');
+          if (actor && !canTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType)) throw new OutputDeliveryTerminalError('output_permission_revoked');
         }
         if (sink.kind === 'http') {
           if (sink.mode === 'wait' && !ds.pendingWaitPromises?.has(record.output.turnId) && !record.output.codexAppSettlement) return { status: 'captured', owner: 'expired_http_wait' };
           if (sink.mode === 'async' && !ds.asyncTriggerResults?.has(record.output.turnId)) {
             const saved = asyncTriggerStore.lookupStrict(ds.session.sessionId, record.output.turnId);
-            if ((!saved || saved.ownerLarkAppId !== ds.larkAppId) && !record.output.codexAppSettlement) throw new Error('output_http_owner_unavailable');
+            if ((!saved || saved.ownerLarkAppId !== ds.larkAppId) && !record.output.codexAppSettlement) throw new OutputDeliveryTerminalError('output_http_owner_unavailable');
             if (saved && saved.ownerLarkAppId === ds.larkAppId) { ds.asyncTriggerResults ??= new Map(); ds.asyncTriggerResults.set(record.output.turnId, { ...saved.result, errorCode: saved.result.errorCode ? 'trigger_failed' as const : undefined }); }
           }
         }
@@ -16768,7 +16766,17 @@ function setupWorkerHandlers(
           ds.docCommentTurns.set(record.output.turnId, sink.context as unknown as NonNullable<DaemonSession['docCommentTurns']> extends Map<string, infer T> ? T : never);
         }
         if (sink.kind === 'suppressed' && !record.output.codexAppSettlement) return { status: 'suppressed' };
-        const receipt = await processFinalOutput(record.output, control);
+        let receipt: OutputReceipt | undefined;
+        try {
+          receipt = await processFinalOutput(record.output, control);
+        } catch (error) {
+          // Past the provider UUID dedupe window the ledger forbids any retry:
+          // the answer is permanently human-to-verify, not a transient block.
+          if (error instanceof FinalPublicationUnknownError || String((error as Error)?.message).includes('final_publication_ambiguous')) {
+            throw new OutputDeliveryTerminalError(String((error as Error)?.message ?? 'final_publication_ambiguous'));
+          }
+          throw error;
+        }
         if (record.output.codexAppSettlement && receipt?.owner !== 'codex_app_dispatch_persisted') return undefined;
         return receipt;
       },
@@ -16781,8 +16789,10 @@ function setupWorkerHandlers(
         // A transient failure sets FINAL_HANDOFF_* attention; the replacement
         // delivery that settles must release it again, otherwise the session is
         // permanently pinned out of idle reclaim/auto-close/auto-compact even
-        // though the answer actually landed. Clear only when no other durable
-        // output (V2 journal, V1 store or legacy bridge mark) is still pending.
+        // though the answer actually landed. Clear only when nothing still
+        // needs attention: no self-healing V2 row, no terminal rejected row
+        // (an answer that can never reach its frozen target stays visible for
+        // human inspection), no V1 ambiguous/rejected row, no bridge mark.
         if ([FINAL_HANDOFF_WAIT_REASON, FINAL_HANDOFF_DELIVERY_REASON].includes(ds.agentAttention?.reason ?? '')) {
           try {
             const sessionId = record.output.sessionId;
@@ -16790,16 +16800,18 @@ function setupWorkerHandlers(
             const v1Attention = FinalOutputHandoffStore.exists(config.session.dataDir, ds.larkAppId)
               ? finalOutputHandoffHost(ds.larkAppId).store.attentionPending(sessionId) !== undefined
               : false;
+            const bridgePending = readBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${sessionId}.json`)).some(entry => !!entry.pendingFinal);
             const stillPending = journal.hasUnsettled(sessionId)
+              || journal.hasTerminalRejection(sessionId)
               || v1Attention
-              || readBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${sessionId}.json`)).some(entry => !!entry.pendingFinal);
+              || bridgePending;
             if (!stillPending) { ds.agentAttention = undefined; publishAttentionPatch(ds); }
           } catch (error) { logger.warn(`[${t}] Final output attention clear deferred: ${String(error)}`); }
         }
       },
-      error: error => {
+      error: (error, terminal) => {
         ds.agentAttention = { kind: 'blocked', reason: FINAL_HANDOFF_DELIVERY_REASON, at: Date.now() };
-        logger.warn(`[${t}] Universal output remains durable: ${String(error)}`);
+        logger.warn(`[${t}] Universal output ${terminal ? 'terminally rejected' : 'remains durable'}: ${String(error)}`);
       },
     });
   };

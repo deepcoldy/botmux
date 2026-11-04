@@ -1,5 +1,12 @@
 import type { OutputDeliveryJournal, OutputDeliveryRecord, OutputReceipt, OutputProviderEffectHooks } from './output-delivery-journal.js';
 
+/** Structural, non-transient failure: the frozen destination can never accept
+ *  this output (channel/private-reply policy changed, HTTP owner gone). The
+ *  row is filed as terminal `rejected` instead of retried forever. */
+export class OutputDeliveryTerminalError extends Error {
+  constructor(message: string) { super(message); this.name = 'OutputDeliveryTerminalError'; }
+}
+
 export interface OutputDeliveryControl {
   record: OutputDeliveryRecord;
   publicationUuid?: string;
@@ -17,10 +24,14 @@ export class OutputDeliveryCoordinator {
     owns(): boolean;
     process(record: OutputDeliveryRecord, control: OutputDeliveryControl): Promise<OutputReceipt | undefined>;
     settled(record: OutputDeliveryRecord): void;
-    error(error: unknown): void;
+    /** terminal=true means the row is now in the permanent rejected state. */
+    error(error: unknown, terminal?: boolean): void;
   }): Promise<void> {
     const current = this.journal.read(record.id)!;
     if (current.state === 'settled') { deps.settled(current); return; }
+    // Terminal rejection is a durable human-inspection state, not a delivery
+    // success: never invoke the settled callback (no worker ACK) and never retry.
+    if (current.state === 'rejected') return;
     if (!deps.owns()) return;
     const owner = this.journal.newOwner();
     if (!this.journal.claim(record.id, owner)) return;
@@ -47,8 +58,14 @@ export class OutputDeliveryCoordinator {
       // Persist that evidence before ACK; a replacement can finish cleanup.
       if (this.journal.complete(record.id, owner, receipt)) deps.settled(this.journal.read(record.id)!);
     } catch (error) {
-      this.journal.block(record.id, owner, String(error));
-      deps.error(error);
+      if (error instanceof OutputDeliveryTerminalError) {
+        // A structurally impossible delivery leaves the retry loop for good;
+        // the error dep surfaces a stable attention (no 5s re-publish churn).
+        if (this.journal.rejectTerminal(record.id, owner, error.message)) deps.error(error, true);
+      } else {
+        this.journal.block(record.id, owner, String(error));
+        deps.error(error, false);
+      }
     } finally { clearInterval(heartbeat); }
   }
 }
