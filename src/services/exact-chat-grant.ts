@@ -57,7 +57,7 @@ export interface ExactChatGrantSubjectResult {
 
 export interface ExactChatGrantSuccess {
   ok: true;
-  operation: ExactChatGrantOperation;
+  operation: ExactChatGrantOperation | 'resolve';
   permissionSource: 'chatGrant';
   talkOnly: true;
   receiverLarkAppId: string;
@@ -399,7 +399,7 @@ export async function applyExactChatGrantByLarkAppIds(
   if (operation === 'resolve') {
     return {
       ok: true,
-      operation: 'readback',
+      operation: 'resolve',
       permissionSource: 'chatGrant',
       talkOnly: true,
       receiverLarkAppId: input.receiverLarkAppId,

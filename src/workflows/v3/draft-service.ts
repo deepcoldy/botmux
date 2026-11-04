@@ -649,7 +649,11 @@ export class WorkflowDraftService {
         const refreshed = this.refreshClarifyInPlace(draft);
         const healed = this.healStaleArchitect(runId, draft, grill);
         const out = fn({ runDir, draft, grill, healed });
-        if (out.changed || refreshed || healed) this.persist(runDir, draft, { keepUpdatedAt: !!opts.keepUpdatedAt && !refreshed && !healed });
+        // Self-healing (a dead reservation dropped, a lost Architect outcome)
+        // is not activity: it leaves the staleness clock alone (§4.6). A
+        // reply landing, or the operation's own change, is activity.
+        const active = (out.changed && !opts.keepUpdatedAt) || refreshed === 'activity';
+        if (out.changed || refreshed || healed) this.persist(runDir, draft, { keepUpdatedAt: !active });
         return out.result;
       });
     } catch (error) {
@@ -725,7 +729,9 @@ export class WorkflowDraftService {
   // ── clarify session ──
 
   /** Commit a finished pending turn; true when draft changed. Never awaits. */
-  private refreshClarifyInPlace(draft: WorkflowDraftRecord): boolean {
+  /** `healed`: a left-over reservation dropped, or a lost session noted
+   *  (bookkeeping); `activity`: a reply or a failed turn landed. */
+  private refreshClarifyInPlace(draft: WorkflowDraftRecord): false | 'healed' | 'activity' {
     const pending = draft.clarify.pending;
     if (!pending) return false;
     if (pending.triggerId.startsWith(RESERVATION_PREFIX)) {
@@ -740,7 +746,7 @@ export class WorkflowDraftService {
         if (alive) return false;
       }
       delete draft.clarify.pending;
-      return true;
+      return 'healed';
     }
     const sessionId = draft.clarify.sessionId;
     let result: DraftClarifyResult;
@@ -781,8 +787,9 @@ export class WorkflowDraftService {
     } else {
       draft.clarify.state = 'disconnected';
       draft.clarify.error = '会话已断开';
+      return 'healed';
     }
-    return true;
+    return 'activity';
   }
 
   private reserve(): string {
@@ -2471,10 +2478,13 @@ export class WorkflowDraftService {
       if (!before.held) return undefined;
       if (!before.result) continue;
       try {
-        const mainOpenId = grant.mainSide ?? grant.mainPending;
-        const peerOpenId = grant.peerSide ?? grant.peerPending;
-        if (mainOpenId) await deps.revoke(chatId, this.deps.appId, mainOpenId);
-        if (peerOpenId) await deps.revoke(chatId, appId, peerOpenId);
+        // Every open_id recorded for a side, each only with its own receiver.
+        for (const openIdOf of new Set([grant.mainSide, grant.mainPending].filter((id): id is string => !!id))) {
+          await deps.revoke(chatId, this.deps.appId, openIdOf);
+        }
+        for (const openIdOf of new Set([grant.peerSide, grant.peerPending].filter((id): id is string => !!id))) {
+          await deps.revoke(chatId, appId, openIdOf);
+        }
       } catch (error) {
         return `撤销 ${this.deps.nameOf()(appId)} 在这个群的协作授权失败（${errorText(error)}）；`
           + '撤销不要求它还在群里，但需要接收方的 daemon 在线：确认主 Bot 和它的 daemon 都在线后点「继续」';
@@ -2561,7 +2571,10 @@ export class WorkflowDraftService {
         }
         const recorded = this.launchTx(runId, token, ({ launch }) => {
           const current = { ...(launch.grants?.[appId] ?? { at: this.now().toISOString() }) };
-          delete current[pendingKey];
+          // Normally the same open_id; if the receiver answered another one,
+          // both stay recorded (same receiver's namespace) and a revoke
+          // removes both.
+          if (current[pendingKey] === written.subjectOpenId) delete current[pendingKey];
           launch.grants = { ...(launch.grants ?? {}), [appId]: { ...current, [side]: written.subjectOpenId } };
           return { changed: true, result: undefined };
         });
@@ -2771,7 +2784,7 @@ export class WorkflowDraftService {
         const loaded = this.loadLocked(runId, runDir, undefined, { allowAbandoned: true, launched: true });
         const refreshed = this.refreshClarifyInPlace(loaded.draft);
         const healed = this.healStaleArchitect(runId, loaded.draft, loaded.grill);
-        if (refreshed || healed) this.persist(runDir, loaded.draft);
+        if (refreshed || healed) this.persist(runDir, loaded.draft, { keepUpdatedAt: refreshed !== 'activity' });
         // Taken with the record: the view awaits below, and a launch step may
         // finish meanwhile — this record is then still the one it ran on.
         return { ...loaded, launchRunning: this.launchRunning(loaded.draft) };
@@ -2960,7 +2973,7 @@ export class WorkflowDraftService {
           }
           if (draft.abandonedAt) return;
           const refreshed = this.refreshClarifyInPlace(draft);
-          if (refreshed) this.persist(runDir, draft);
+          if (refreshed) this.persist(runDir, draft, { keepUpdatedAt: refreshed !== 'activity' });
           // 拉群开始 began: the clarify session is about to move (or moved)
           // into the main topic — its lifetime is the topic's now (§4.2).
           if (draft.launch || clarifySessionInTopic(draft)) return;

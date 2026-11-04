@@ -597,3 +597,101 @@ describe('第二轮：手动重发摘要中途崩溃、删除时改卡后崩溃'
     expect(launch.onlyChat().messages[0]!.updates).toHaveLength(1);
   });
 });
+
+describe('第三轮', () => {
+  it('M4: a manual summary resend on a started launch left paused puts it back to started', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.hangBefore('postSummary');
+    await h.service.launch(runId, OWNER, {});
+    await until(() => launch.count('postSummary') === 1);
+    const next = restart(h);
+    h.advance(LAUNCH_UUID_DEDUP_SAFE_MS + 60_000);
+    await next.continueLaunch(runId, OWNER);
+    await settled(next, runId);
+    const draft = record(runId);
+    draft.launch!.state = 'paused';
+    writeWorkflowDraft(join(base, runId), draft);
+    const view = await next.resendSummary(runId, OWNER, { confirmedAbsent: true });
+    expect(view.launch).toMatchObject({ state: 'started', running: false });
+  });
+
+  it('M13: a resolved open_id that is not an ou_ id stops the grant step before any grant', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    launch.deps.resolveSubject = async () => 'cli_not_an_open_id';
+    await h.service.launch(runId, OWNER, {});
+    expect((await settled(h.service, runId)).launch).toMatchObject({ error: { step: 'grant', code: 'grant_failed' } });
+    expect(launch.count('grant')).toBe(0);
+    expect(record(runId).launch!.grants).toBeUndefined();
+  });
+
+  it('P3-3: the receiver answered another open_id than it resolved: both are kept and both revoked, on that receiver only', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    const realGrant = launch.deps.grant;
+    let first = true;
+    launch.deps.grant = async (chatId, receiver, subject) => {
+      const answer = await realGrant(chatId, receiver, subject);
+      if (first) { first = false; return { subjectOpenId: 'ou_answered_differently' }; }
+      return answer;
+    };
+    launch.beforeGrantReturn = () => { if (launch.count('grant') === 2) touchDag(runId); };
+    await h.service.launch(runId, OWNER, {});
+    await settled(h.service, runId);
+    launch.beforeGrantReturn = undefined;
+    expect(record(runId).launch!.grants?.[DOC]).toMatchObject({ mainSide: 'ou_answered_differently', mainPending: seenBy(MAIN, DOC) });
+    const chat = launch.onlyChat();
+    await h.service.setNodeBot(runId, OWNER, 'write', { larkAppId: REVIEW });
+    const revoked = launch.calls.filter((c) => c.op === 'revoke').map((c) => c.args.slice(1));
+    expect(revoked).toEqual(expect.arrayContaining([[MAIN, 'ou_answered_differently'], [MAIN, seenBy(MAIN, DOC)], [DOC, seenBy(DOC, MAIN)]]));
+    expect(revoked).toHaveLength(3);
+    expect(launch.granted(chat.chatId, MAIN)).toEqual([]);
+  });
+});
+
+describe('P3-2: self-healing is not activity', () => {
+  it('a draft whose only write in 31 days was dropping a dead reservation is deletable; on day 29 it is not', async () => {
+    const { h } = setup();
+    const created = await h.service.create(OWNER, { goal: 'g' });
+    h.clarify.reply('先确认范围。');
+    await h.service.view(created.runId);
+    const draft = record(created.runId);
+    draft.clarify.pending = { triggerId: 'reserve:dead-one', sentAt: draft.updatedAt };
+    writeWorkflowDraft(join(base, created.runId), draft);
+    const before = record(created.runId).updatedAt;
+    h.advance(29 * 24 * 3600_000);
+    const next = restart(h);
+    await next.view(created.runId);
+    expect(record(created.runId).clarify.pending).toBeUndefined();
+    expect(record(created.runId).updatedAt).toBe(before);
+    expect(await code(next.delete(created.runId, OWNER))).toBe('draft_not_stale');
+    h.advance(2 * 24 * 3600_000);
+    await next.delete(created.runId, OWNER);
+    expect(existsSync(join(base, created.runId))).toBe(false);
+  });
+
+  it('day 31, deleted directly (the dead reservation is dropped inside the delete itself): deletable', async () => {
+    const { h } = setup();
+    const created = await h.service.create(OWNER, { goal: 'g' });
+    h.clarify.reply('先确认范围。');
+    await h.service.view(created.runId);
+    const draft = record(created.runId);
+    draft.clarify.pending = { triggerId: 'reserve:dead-one', sentAt: draft.updatedAt };
+    writeWorkflowDraft(join(base, created.runId), draft);
+    h.advance(31 * 24 * 3600_000);
+    const next = restart(h);
+    await next.delete(created.runId, OWNER);
+    expect(existsSync(join(base, created.runId))).toBe(false);
+  });
+
+  it('a reply landing is activity', async () => {
+    const { h } = setup();
+    const created = await h.service.create(OWNER, { goal: 'g' });
+    const before = record(created.runId).updatedAt;
+    h.advance(60_000);
+    h.clarify.reply('一个问题');
+    await h.service.view(created.runId);
+    expect(record(created.runId).updatedAt).not.toBe(before);
+  });
+});

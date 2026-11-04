@@ -328,10 +328,23 @@ export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInpu
       // so every candidate — the main bot's own top-level interactive
       // message — is read in full and matched on its signature row.
       const sinceMs = Date.parse(sinceIso) - 60_000;
+      if (!Number.isFinite(sinceMs)) throw new Error('inconclusive: 首次尝试时间不合法');
+      const timeOf = (message: any) => Number(message?.create_time);
       const scanned = await listChatMessagesUntil(appId, chatId, {
         pageSize: 50,
-        stopAfter: (message: any, seen: number) => Number(message?.create_time) < sinceMs || seen >= ROOT_CARD_SCAN_MAX,
+        stopAfter: (message: any, seen: number) => !(timeOf(message) >= sinceMs) || seen >= ROOT_CARD_SCAN_MAX,
       });
+      // Anything that makes "not found" unprovable is inconclusive — the
+      // caller then stops as for a failed lookup, never as "not there":
+      //   a time that is not a millisecond timestamp (missing, or seconds),
+      //   a scan cut by its cap before reaching the first try.
+      const oldest = scanned[0];
+      if (scanned.some((message: any) => !Number.isFinite(timeOf(message)) || timeOf(message) < 1e12)) {
+        throw new Error('inconclusive: 群消息的时间无法判断');
+      }
+      if (scanned.length >= ROOT_CARD_SCAN_MAX && oldest && timeOf(oldest) >= sinceMs) {
+        throw new Error(`inconclusive: 首次尝试之后的群消息超过 ${ROOT_CARD_SCAN_MAX} 条`);
+      }
       const selfOpenId = getBotOpenId(appId);
       const candidates = scanned
         .filter((message: any) => message?.msg_type === 'interactive' && message.deleted !== true
@@ -340,8 +353,10 @@ export function createProductionDraftLaunchDeps(input: ProductionDraftLaunchInpu
           && !message.root_id && !message.parent_id
           && Number(message.create_time) >= sinceMs
           && /^om_[A-Za-z0-9_-]{1,128}$/.test(String(message.message_id)))
-        .map((message: any) => String(message.message_id))
-        .slice(-ROOT_CARD_DETAIL_MAX);
+        .map((message: any) => String(message.message_id));
+      if (candidates.length > ROOT_CARD_DETAIL_MAX) {
+        throw new Error(`inconclusive: 首次尝试之后主 Bot 发的卡片超过 ${ROOT_CARD_DETAIL_MAX} 张`);
+      }
       const found: string[] = [];
       for (const messageId of candidates) {
         const detail = await getMessageDetail(appId, messageId, { userCardContent: true });

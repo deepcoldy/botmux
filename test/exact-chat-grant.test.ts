@@ -291,7 +291,7 @@ describe('exact chat grant service', () => {
       subjectLarkAppIds: ['cli_pm'],
     }, fixture.deps);
     expect(fixture.deps.resolveCurrentChatBotOpenIdsByLarkAppIds).toHaveBeenCalledWith('cli_receiver', 'oc_chat', ['cli_pm']);
-    expect(result).toMatchObject({ ok: true, grantsTalk: false, subjects: [], subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_peer_a' }] });
+    expect(result).toMatchObject({ ok: true, operation: 'resolve', grantsTalk: false, subjects: [], subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_peer_a' }] });
     expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
     expect(fixture.deps.removeChatGrant).not.toHaveBeenCalled();
     expect(await applyExactChatGrantByLarkAppIds({

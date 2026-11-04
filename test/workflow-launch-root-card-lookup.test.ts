@@ -29,6 +29,16 @@ vi.mock('../src/im/lark/client.js', async (orig) => ({
   }),
 }));
 vi.mock('../src/bot-registry.js', async (orig) => ({ ...(await orig() as any), getBotOpenId: () => 'ou_main_self' }));
+const grantIpc = vi.hoisted(() => ({ calls: [] as any[], answer: {} as Record<string, unknown> }));
+vi.mock('../src/cli/exact-chat-grant-client.js', async (orig) => ({
+  ...(await orig() as any),
+  requestExactChatGrant: vi.fn(async (input: any) => { grantIpc.calls.push(input); return grantIpc.answer; }),
+}));
+vi.mock('../src/utils/daemon-discovery.js', async (orig) => ({
+  ...(await orig() as any),
+  findOnlineDaemon: (larkAppId: string) => ({ larkAppId, ipcPort: 1 }),
+}));
+vi.mock('../src/core/daemon-ipc-auth.js', async (orig) => ({ ...(await orig() as any), loadDaemonIpcSecret: () => 'secret' }));
 
 import { createProductionDraftLaunchDeps } from '../src/core/workflow-draft-daemon.js';
 import { buildV3LaunchRootCard, isLaunchRootCardOf } from '../src/im/lark/v3-launch-card.js';
@@ -87,5 +97,50 @@ describe('production findRootCards', () => {
     lark.details.set('om_root', rootOf(RUN));
     expect(await deps().findRootCards('oc_x', RUN, SINCE)).toEqual(['om_root']);
     expect(lark.scanned).toBeLessThan(10);
+  });
+});
+
+describe('production findRootCards: inconclusive is not "not there"', () => {
+  it('more than 500 messages since the first try: throws (inconclusive)', async () => {
+    lark.messages = [card('om_root', T0 + 1_000), ...Array.from({ length: 500 }, (_, i) => ({ message_id: `om_t${i}`, msg_type: 'text', create_time: String(T0 + 2_000 + i), sender: { sender_type: 'user', id: 'ou_u' } }))];
+    lark.details.set('om_root', rootOf(RUN));
+    await expect(deps().findRootCards('oc_x', RUN, SINCE)).rejects.toThrow(/inconclusive/);
+  });
+
+  it('a long chat that reaches back past the first try within the cap is conclusive', async () => {
+    lark.messages = [card('om_old', T0 - 3_600_000), ...Array.from({ length: 400 }, (_, i) => ({ message_id: `om_t${i}`, msg_type: 'text', create_time: String(T0 + 2_000 + i), sender: { sender_type: 'user', id: 'ou_u' } }))];
+    expect(await deps().findRootCards('oc_x', RUN, SINCE)).toEqual([]);
+  });
+
+  it('more than 30 candidate cards: throws, no card is dropped silently', async () => {
+    lark.messages = [card('om_root', T0 + 1_000), ...Array.from({ length: 30 }, (_, i) => card(`om_c${i}`, T0 + 2_000 + i))];
+    lark.details.set('om_root', rootOf(RUN));
+    await expect(deps().findRootCards('oc_x', RUN, SINCE)).rejects.toThrow(/inconclusive/);
+  });
+
+  it('a create_time that is missing or in seconds: throws', async () => {
+    lark.messages = [card('om_root', Math.floor((T0 + 1_000) / 1000))];
+    lark.details.set('om_root', rootOf(RUN));
+    await expect(deps().findRootCards('oc_x', RUN, SINCE)).rejects.toThrow(/inconclusive/);
+    lark.messages = [card('om_root', T0 + 1_000, { create_time: undefined })];
+    await expect(deps().findRootCards('oc_x', RUN, SINCE)).rejects.toThrow(/inconclusive/);
+  });
+
+  it('M16: a withdrawn card does not count', async () => {
+    lark.messages = [card('om_gone', T0 + 1_000, { deleted: true }), card('om_root', T0 + 2_000)];
+    lark.details.set('om_gone', rootOf(RUN));
+    lark.details.set('om_root', rootOf(RUN));
+    expect(await deps().findRootCards('oc_x', RUN, SINCE)).toEqual(['om_root']);
+  });
+});
+
+describe('production resolveSubject', () => {
+  it('M14: asks the receiver\'s daemon to resolve (read only) and takes the mapping of exactly that app', async () => {
+    grantIpc.calls = [];
+    grantIpc.answer = { ok: true, subjectMappings: [{ larkAppId: 'cli_other', subjectOpenId: 'ou_wrong' }, { larkAppId: 'cli_doc', subjectOpenId: 'ou_doc_seen_by_main' }] };
+    expect(await deps().resolveSubject('oc_x', 'cli_main', 'cli_doc')).toBe('ou_doc_seen_by_main');
+    expect(grantIpc.calls).toEqual([expect.objectContaining({ operation: 'resolve', receiverLarkAppId: 'cli_main', chatId: 'oc_x', subjectLarkAppIds: ['cli_doc'] })]);
+    grantIpc.answer = { ok: true, subjectMappings: [{ larkAppId: 'cli_other', subjectOpenId: 'ou_wrong' }] };
+    await expect(deps().resolveSubject('oc_x', 'cli_main', 'cli_doc')).rejects.toThrow();
   });
 });
