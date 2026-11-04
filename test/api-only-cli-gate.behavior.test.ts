@@ -91,7 +91,10 @@ d('root-dispatch transport gate — behavioral, tamper-resistant (built CLI)', (
 
   it('managed virtual turn (honest env): every Lark-facing command exits 2', () => {
     for (const cmd of LARK_FACING) {
-      const { code, out } = runCli([cmd], {
+      // `send` needs valid argv so the transport gate — not the body preflight
+      // — is the first refusal this test proves.
+      const args = cmd === 'send' ? ['send', 'hello'] : [cmd];
+      const { code, out } = runCli(args, {
         BOTMUX_SESSION_ID: VIRTUAL_SID, BOTMUX_CHAT_ID: 'http_async_behaviorzero', BOTMUX_LARK_APP_ID: 'cli_test_bot',
       });
       expect(code, `${cmd} honest exit`).toBe(2);
@@ -102,7 +105,8 @@ d('root-dispatch transport gate — behavioral, tamper-resistant (built CLI)', (
   it('managed headless turn: every Lark-facing command exits 2', () => {
     writeAncestryMarker(HEADLESS_SID);
     for (const cmd of LARK_FACING) {
-      const { code, out } = runCli([cmd], {
+      const args = cmd === 'send' ? ['send', 'hello'] : [cmd];
+      const { code, out } = runCli(args, {
         BOTMUX_SESSION_ID: HEADLESS_SID, BOTMUX_CHAT_ID: 'headless_hl_behaviorzero', BOTMUX_LARK_APP_ID: 'cli_test_bot',
       });
       expect(code, `${cmd} headless exit`).toBe(2);
