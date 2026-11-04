@@ -189,7 +189,18 @@ function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number
       reject(new Error(`连接超时（${ms}ms）`));
     }, ms);
   });
-  return Promise.race([run(controller.signal), timeout]).finally(() => clearTimeout(timer));
+  // Start `run` in its own microtask. `postJson` parses the URL and serializes
+  // the body BEFORE its own `new Promise`, so a malformed binding (a hand-edited
+  // or stale `platform.json`) throws SYNCHRONOUSLY. Racing that directly still
+  // fails the attempt — the throw reaches the caller's catch, so the retry runs
+  // as usual — but the race itself is never built, so `timeout` has no consumer:
+  // its timer fires later as an unhandledRejection (which the daemon's guard
+  // reports as a bug in this very code), the accompanying `.finally` never runs
+  // so `clearTimeout` never happens, and the abort lands on an attempt that
+  // already ended. Deferring `run` by one microtask turns the throw into an
+  // ordinary rejection: the race consumes it and the timer is always cleared.
+  const started = Promise.resolve().then(() => run(controller.signal));
+  return Promise.race([started, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
