@@ -28,6 +28,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import type { BotConfig } from '../../bot-registry.js';
+import { isStewardBot } from '../../core/decision-board/model.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { birthRun, readGrillState, transition, type GrillState } from './grill-state.js';
 import {
@@ -855,6 +856,8 @@ export class WorkflowDraftService {
     if (!bot) throw err('orchestrator_ineligible', '编排 Bot 不在本机 bots.json 里');
     const why = v3BotStaticExclusion(bot);
     if (why) throw err('orchestrator_ineligible', `这个 Bot 不能编排工作流：${why}`);
+    // The same rule that keeps the steward off the Architect roster.
+    if (isStewardBot(bot.steward)) throw err('orchestrator_ineligible', '管家 Bot 不能当编排 Bot');
 
     const now = this.now();
     const { runId, runDir } = birthRun({

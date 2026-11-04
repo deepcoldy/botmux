@@ -92,6 +92,14 @@ describe('draft birth and listing', () => {
     expect(await code(h.service.abandon(view.runId, OWNER))).toBe('unknown_draft');
   });
 
+  it('the steward bot cannot be the orchestrator', async () => {
+    const h = makeService(base, { appId: STEWARD });
+    const refused = h.service.create(OWNER, { goal: 'g' });
+    await expect(refused).rejects.toMatchObject({ code: 'orchestrator_ineligible', message: '管家 Bot 不能当编排 Bot' });
+    expect(listWorkflowDrafts(base)).toEqual([]);
+    expect(h.clarify.sessions.size).toBe(0);
+  });
+
   it('an orchestrator that cannot run workflow nodes cannot orchestrate', async () => {
     const h = makeService(base, { appId: PI });
     expect(await code(h.service.create(OWNER, { goal: 'g' }))).toBe('orchestrator_ineligible');
