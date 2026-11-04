@@ -57,6 +57,20 @@ if (resumed && !holdsConversation(resumed)) {
   console.error('No conversation found with session ID: ' + resumed);
   process.exit(1);
 }
+// The latest main-thread record of a transcript leaves its turn open: a prompt
+// or tool result, or an assistant tool_use, with nothing closing it after.
+const lastTurnOpen = id => {
+  const rows = fs.readFileSync(transcriptOf(id), 'utf8').split('\\n').filter(Boolean).map(line => {
+    try { return JSON.parse(line); } catch { return undefined; }
+  }).filter(row => row && !row.isSidechain);
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    if (row.type === 'system' && row.subtype === 'turn_duration') return false;
+    if (row.type === 'assistant') return !!row.message && row.message.stop_reason === 'tool_use';
+    if (row.type === 'user') return true;
+  }
+  return false;
+};
 // A fork child's file opens with metadata records before the conversation lands
 // in it — tens of ms on 2.1.308. The fake stays in that state until its first
 // turn, so that bridge ticks see it.
@@ -99,15 +113,26 @@ const holdTasksDir = () => {
 pidState();
 holdTasksDir();
 setInterval(pidState, 200);
+// Claude Code resuming a conversation whose last turn was cut off (its process
+// died mid-turn) closes that turn with a synthetic no-reply record — seen on
+// 2.1.316 at the 2026-11-02 tmux server loss.
+if (resumed && !forkFrom && lastTurnOpen(sid)) {
+  record({ type: 'assistant', message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'No response requested.' }], stop_reason: 'stop_sequence' } });
+}
 process.stdin.setRawMode(true);
 let composer = '';
 let busy = false;
+let toolRunning = false;
+// OSC 7501 the way Claude Code reports it when the terminal answered its
+// probe: working while a turn runs, idle once it ends.
+const programStatus = state => { if (cfg.programStatus) process.stdout.write('\\x1b]7501;state=' + state + '\\x1b\\\\'); };
 let spin = 0;
 const rule = '─'.repeat(48);
 const render = () => {
   process.stdout.write('\\x1b[2J\\x1b[H Fake Claude Code ' + (busy ? '|/-+'[spin++ % 4] : '') + '\\r\\n\\r\\n' + rule
+    + (toolRunning ? '\\r\\n     (ctrl+b ctrl+b (twice) to run in background)' : '')
     + '\\r\\n❯ ' + composer + '\\r\\n' + rule + '\\r\\n  ⏵⏵ bypass permissions on (shift+tab to cycle)'
-    + (busy ? ' · esc to interrupt' : '') + '\\r\\n');
+    + (busy && !toolRunning ? ' · esc to interrupt' : '') + '\\r\\n');
 };
 // A status clock ticking until the first turn: the screen never goes quiet, so
 // the worker never sees the prompt settle and falls back to its first-prompt
@@ -118,6 +143,7 @@ let startupTicker = cfg.startupTicker
 const runTurn = (prompt, reply) => {
   if (startupTicker) { clearInterval(startupTicker); startupTicker = undefined; }
   busy = true;
+  programStatus('working');
   record({ type: 'user', message: { role: 'user', content: prompt } });
   render();
   const spinner = setInterval(render, 300);
@@ -127,6 +153,7 @@ const runTurn = (prompt, reply) => {
     record({ type: 'system', subtype: 'turn_duration', durationMs: cfg.turnMs });
     busy = false;
     render();
+    programStatus('idle');
     ev({ kind: 'turn', reply });
   }, cfg.turnMs);
 };
@@ -159,6 +186,43 @@ const failTurn = (prompt, quietMs) => {
     }, quietMs || 0);
   }, cfg.turnMs);
 };
+// A turn running a foreground Bash tool, the way Claude Code draws it: the
+// spinner keeps redrawing, but the footer has no 「esc to interrupt」 segment.
+// 'done' ends it after holdMs with its result and answer; 'hang' never ends;
+// 'interrupted' stops after holdMs with Claude's cancel note and no closing
+// record, then sits at its prompt.
+const toolTurn = (prompt, holdMs, outcome) => {
+  if (startupTicker) { clearInterval(startupTicker); startupTicker = undefined; }
+  busy = true;
+  toolRunning = true;
+  programStatus('working');
+  record({ type: 'user', message: { role: 'user', content: prompt } });
+  record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'tool_use', id: 'toolu_long', name: 'Bash', input: { command: 'make' } }], stop_reason: 'tool_use' } });
+  ev({ kind: 'tool-start', prompt });
+  render();
+  const spinner = setInterval(render, 300);
+  if (outcome === 'hang') return;
+  setTimeout(() => {
+    clearInterval(spinner);
+    toolRunning = false;
+    if (outcome === 'interrupted') {
+      record({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }] } });
+      busy = false;
+      render();
+      programStatus('idle');
+      ev({ kind: 'interrupted', prompt });
+      return;
+    }
+    const reply = 'reply: ' + prompt;
+    record({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_long', content: 'ok' }] } });
+    record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'text', text: reply }], stop_reason: 'end_turn' } });
+    record({ type: 'system', subtype: 'turn_duration', durationMs: holdMs });
+    busy = false;
+    render();
+    programStatus('idle');
+    ev({ kind: 'turn', reply });
+  }, holdMs);
+};
 const command = (name, value) => {
   record({ type: 'user', message: { role: 'user', content: '<command-name>' + name + '</command-name>\\n<command-args>' + (value || '') + '</command-args>' } });
   record({ type: 'user', message: { role: 'user', content: '<local-command-stdout></local-command-stdout>' } });
@@ -175,12 +239,17 @@ const submit = () => {
     record({ type: 'system', subtype: 'compact_boundary', compactMetadata: { trigger: 'manual' } });
     record({ type: 'user', isCompactSummary: true, message: { role: 'user', content: 'This session is being continued from a previous conversation.' } });
   } else if (m) command('/' + m[1], m[2]);
+  else if (text.startsWith('LONGTOOL')) { toolTurn(text, Number(text.split(/\\s+/)[1]) || 20000, 'done'); return; }
+  else if (text.startsWith('HANG')) { toolTurn(text, 0, 'hang'); return; }
+  else if (text.startsWith('INTERRUPTED')) { toolTurn(text, 500, 'interrupted'); return; }
   else if (text.startsWith('FAIL_AFTER_QUIET')) { failTurn(text, 4000); return; }
   else if (text.startsWith('FAIL')) { failTurn(text, 0); return; }
   else { runTurn(text, 'reply: ' + text); return; }
   ev({ kind: 'command', text });
   render();
 };
+// A resumed launch can be held back from drawing its prompt, so nothing can be
+// written into it for that long.
 setTimeout(() => {
   render();
   process.stdin.on('data', buf => {
@@ -189,7 +258,7 @@ setTimeout(() => {
     composer += s.replace(/\\r/g, '\\n');
     render();
   });
-}, 300);
+}, resumed && cfg.resumeReadyDelayMs ? cfg.resumeReadyDelayMs : 300);
 // A background task finishing: Claude wakes up on its own and answers — a
 // terminal-local turn with no Lark message behind it.
 setInterval(() => {
@@ -225,6 +294,14 @@ export interface Harness {
   doneAt: (kind: 'command' | 'turn', text: string) => number | undefined;
   /** When a turn started with a FAIL… prompt ended on its API error. */
   failedAt: (prompt: string) => number | undefined;
+  /** When a LONGTOOL / HANG / INTERRUPTED turn started its tool, and when an
+   *  INTERRUPTED one was cancelled. */
+  toolStartedAt: (prompt: string) => number | undefined;
+  interruptedAt: (prompt: string) => number | undefined;
+  /** SIGKILL only the newest fake CLI process: the pane's relay exits with it
+   *  and the worker sees its CLI die, while the tmux server and the worker
+   *  stay up — an in-worker CLI crash. */
+  crashCli: () => void;
   startWorker: (init?: Partial<Extract<DaemonToWorker, { type: 'init' }>>) => Generation;
 }
 
@@ -266,6 +343,11 @@ export function setupFakeClaude(opts: {
   /** Keep the screen busy with a status clock until the first turn, so the
    *  worker only finds the prompt through its first-prompt timeout. */
   startupTicker?: boolean;
+  /** Report turns over OSC 7501 (working / idle), as Claude Code does once
+   *  the terminal answered its program-status probe. */
+  programStatus?: boolean;
+  /** How long a `--resume` launch waits before drawing its prompt. */
+  resumeReadyDelayMs?: number;
 }): Harness {
   mkdirSync(join(homedir(), '.botmux'), { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(tmpdir(), 'bmx-clear-restore-'));
@@ -298,6 +380,8 @@ export function setupFakeClaude(opts: {
     ...(opts.stalePidState ? { stalePidState: true, holdTasksDir: true } : {}),
     ...(opts.unknownLayer === 'cli-named-launcher' ? { commAsClaude: true } : {}),
     ...(opts.startupTicker ? { startupTicker: true } : {}),
+    ...(opts.programStatus ? { programStatus: true } : {}),
+    ...(opts.resumeReadyDelayMs ? { resumeReadyDelayMs: opts.resumeReadyDelayMs } : {}),
   }));
   // An extensionless script follows the nearest package.json; never inherit a
   // stray `"type": "module"` from a parent directory.
@@ -347,6 +431,12 @@ child.on('exit', code => process.exit(code ?? 1));
     launches: () => readEvents().filter(e => e.kind === 'start').map(e => ({ sid: e.sid as string, args: e.args as string[] })),
     doneAt: (kind, text) => readEvents().find(e => e.kind === kind && (kind === 'command' ? e.text === text : e.reply === text))?.t,
     failedAt: prompt => readEvents().find(e => e.kind === 'turn-failed' && e.prompt === prompt)?.t,
+    toolStartedAt: prompt => readEvents().find(e => e.kind === 'tool-start' && e.prompt === prompt)?.t,
+    interruptedAt: prompt => readEvents().find(e => e.kind === 'interrupted' && e.prompt === prompt)?.t,
+    crashCli: () => {
+      const pid = readEvents().filter(e => e.kind === 'start').at(-1)?.pid as number | undefined;
+      if (pid) try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
+    },
     startWorker: (init = {}) => {
       const messages: WorkerToDaemon[] = [];
       const logs: string[] = [];

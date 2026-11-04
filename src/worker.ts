@@ -216,7 +216,9 @@ import { InputDeliveryEvidenceTracker } from './services/input-delivery-evidence
 import {
   appendBridgeTurnJournalEntry,
   BridgeRestoreGate,
+  claimRetiredGenerationEntries,
   clearBridgeTurnJournal,
+  entriesStillOwned,
   planBridgeTurnRecovery,
   readBridgeTurnJournal,
   removeBridgeTurnJournalEntry,
@@ -455,6 +457,7 @@ import {
   bareShellLaunchKind,
   bareShellLaunchGuidance,
   settleLaunchComm,
+  readProcessStartTime,
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
@@ -594,6 +597,7 @@ import { programStatusRelayLaunch } from './core/program-status-relay-launch.js'
 import { busyProbeRegion } from './utils/busy-probe.js';
 import {
   ClaudeTranscriptTurnEnd,
+  claudeTranscriptLatestTurnState,
   STALE_PROGRAM_STATUS_CHECK_MS,
   staleProgramStatusVerdict,
 } from './utils/stale-program-status.js';
@@ -2559,6 +2563,11 @@ function seedAndTrustClaudeState(
 const IDLE_PROBE_INTERVAL_MS = 3_500;
 let busyPatternIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
+/** This worker re-attached a CLI that survived the previous worker, and that
+ *  CLI has not reached a prompt under this worker yet. While set, an absent
+ *  busy marker alone does not make it idle — see reattachedTurnStillOpen. */
+let reattachOpenTurnGate = false;
+let reattachOpenTurnLogged = false;
 let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
 let persistCodexRunnerBuildOnReady = false;
 let pendingTopicEffortRestart: { attemptId: string; requested: TraexTopicEffortRestart; variant: 'standard' | 'max' } | undefined;
@@ -4438,6 +4447,7 @@ function armSessionRenameIdleTimeout(): void {
     // only queued work and flushPending would keep waiting for the very signal
     // this timer exists to replace.
     isPromptReady = true;
+    reattachOpenTurnGate = false;
     log(`Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`);
     void flushPending();
   }, SESSION_RENAME_IDLE_TIMEOUT_MS);
@@ -7698,6 +7708,17 @@ function releaseInterruptedStructuredBridgeOnFirstPrompt(): void {
  *  teardown so restore is confined to the one baseline with no competing
  *  recovery owner. */
 const bridgeRestoreGate = new BridgeRestoreGate();
+/** When this worker process last retired a CLI generation's bridge watcher
+ *  (undefined until one has run). The next generation's watcher claims the
+ *  journal entries that generation left behind — see
+ *  claimRetiredGenerationJournalEntries. */
+let bridgeGenerationRetiredAtMs: number | undefined;
+/** The journal holds entries this worker claimed for the current generation
+ *  that its writes have not settled yet — see settleJournalTakeoverClaims. */
+let journalHasTakeoverClaims = false;
+/** Start time of the CLI the current bridge generation re-attached to (it
+ *  survived the previous worker); undefined when this worker launched it. */
+let bridgeLiveCliStartedAtMs: number | undefined;
 /** uuids of structured transcript rate-limit records already turned into a
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
@@ -8342,6 +8363,49 @@ function journalBridgeTurnClear(turnId: string, dispatchAttempt?: number): void 
   }
 }
 
+/** A new CLI generation is starting in this worker process. The entries the
+ *  retired one journaled are now this generation's to settle: its carryover
+ *  or restart note re-delivers an interrupted turn (and marks it again) once
+ *  the CLI is ready. Claim them instead of dropping them — until that write
+ *  the entry is the turn's only durable record, and a worker killed in
+ *  between must leave it to the next process (#2727). */
+function claimRetiredGenerationJournalEntries(): void {
+  const retiredAtMs = bridgeGenerationRetiredAtMs;
+  const path = bridgeTurnJournalFilePath();
+  if (retiredAtMs === undefined || !path) return;
+  try {
+    const { entries, claimed } = claimRetiredGenerationEntries(readBridgeTurnJournal(path), retiredAtMs, Date.now());
+    if (claimed === 0) return;
+    writeBridgeTurnJournal(path, entries);
+    journalHasTakeoverClaims = true;
+    log(`Bridge turn journal: this CLI generation took over ${claimed} entr(ies) of the one retired in this worker`);
+  } catch (err: any) {
+    log(`Bridge turn journal takeover claim failed (${err.message})`);
+  }
+}
+
+/** This generation is writing an input. Claimed entries whose
+ *  turn is no longer queued here were either taken over (the re-mark replaced
+ *  them) or never will be (no carryover, no restart note under their id) —
+ *  left on disk, the next worker process would restore them as turns IT
+ *  interrupted and rewind its replay to their old marks (#2727). Claims whose
+ *  turn is still queued stay until that turn is written. */
+function settleJournalTakeoverClaims(path: string): void {
+  if (!journalHasTakeoverClaims) return;
+  try {
+    const entries = readBridgeTurnJournal(path);
+    const queued = new Set(pendingMessages.flatMap(item => (item.turnId ? [item.turnId] : [])));
+    const owned = entriesStillOwned(entries, queued);
+    if (!owned.some(entry => entry.claimedAtMs !== undefined)) journalHasTakeoverClaims = false;
+    if (owned.length === entries.length) return;
+    if (owned.length === 0) clearBridgeTurnJournal(path);
+    else writeBridgeTurnJournal(path, owned);
+    log(`Bridge turn journal: released ${entries.length - owned.length} taken-over entr(ies) the new CLI generation no longer owes an answer for`);
+  } catch (err: any) {
+    log(`Bridge turn journal takeover settle failed (${err.message})`);
+  }
+}
+
 function clearBridgeTurnJournalFile(): void {
   const path = bridgeTurnJournalFilePath();
   if (!path) return;
@@ -8814,7 +8878,16 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   if (!journalPath || !bridgeJsonlPath) return false;
   const entries = readBridgeTurnJournal(journalPath);
   if (entries.length === 0) return false;
-  const restorable = selectRestorableBridgeTurns(entries, { currentJsonlPath: bridgeJsonlPath });
+  const restorable = selectRestorableBridgeTurns(entries, {
+    currentJsonlPath: bridgeJsonlPath,
+    liveCliStartedAtMs: bridgeLiveCliStartedAtMs,
+  });
+  if (bridgeLiveCliStartedAtMs !== undefined) {
+    const predatesLiveCli = selectRestorableBridgeTurns(entries, { currentJsonlPath: bridgeJsonlPath }).length - restorable.length;
+    if (predatesLiveCli > 0) {
+      log(`Bridge recovery dropped ${predatesLiveCli} journal entr(ies) marked before the re-attached CLI started (an earlier CLI generation's turns)`);
+    }
+  }
   if (restorable.length !== entries.length) {
     // Entries for rotated-away files or beyond the age cap can never restore —
     // drop them now so they don't linger across future generations.
@@ -9972,7 +10045,8 @@ function performBridgeIngestAndScheduleQuietEmit(): void {
   }
 }
 
-function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string; mode?: 'baseline-existing' | 'fresh-empty'; dataDir?: string }): void {
+function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string; mode?: 'baseline-existing' | 'fresh-empty'; dataDir?: string; liveCliStartedAtMs?: number }): void {
+  bridgeLiveCliStartedAtMs = opts?.liveCliStartedAtMs;
   bridgeJsonlPath = jsonlPath;
   bridgeJsonlDir = dirname(jsonlPath);
   bridgeCliPid = opts?.cliPid;
@@ -10093,6 +10167,11 @@ function stopBridgeWatcher(): void {
     clearInterval(bridgeFallbackTimer);
     bridgeFallbackTimer = null;
   }
+  // Entries journaled for this generation's turns are now owned by the
+  // carryover (in-worker restart) or by the next worker process (shutdown);
+  // which one is decided by whether a new generation starts here.
+  if (bridgeJsonlPath) bridgeGenerationRetiredAtMs = Date.now();
+  bridgeLiveCliStartedAtMs = undefined;
   bridgeCliPid = undefined;
   bridgeCliCwd = undefined;
   bridgeObservedCliSessionId = undefined;
@@ -10208,6 +10287,10 @@ function bridgeMarkPendingTurn(
       offsetAtMark: bridgeOffset,
     });
   }
+  // Any input this generation writes — durable ones too, which are not
+  // journaled — means the takeover queue has started draining.
+  const journalPath = bridgeTurnJournalFilePath();
+  if (journalPath) settleJournalTakeoverClaims(journalPath);
   return turnId;
 }
 
@@ -18156,6 +18239,7 @@ function markPromptReady(): void {
   // idle throughout. Before any flush below: a submit's reset() disarms it.
   idleDetector?.adoptPromptReady();
   isPromptReady = true;
+  reattachOpenTurnGate = false;
   promptReadyEdges++;
   judgeClaudeBridgeTurn();
   bridgeQueue.cliQueueDrained();
@@ -21035,6 +21119,27 @@ function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean 
   }
 }
 
+/** A re-attached Claude pane can be mid-turn with no busy marker on screen:
+ *  while a foreground Bash tool runs, Claude Code's footer drops its
+ *  「· esc to interrupt」 segment (it shows the run-in-background hint
+ *  instead), and OSC 7501 does not re-report the state to a new worker.
+ *  Marking that prompt ready released the restored turn's authority — its
+ *  trigger-user identity included — while the turn was still running (#2727).
+ *  The transcript is the deterministic signal: its latest main-thread record
+ *  still leaves the turn open. Only this probe defers; readiness then comes
+ *  from the idle detector once the pane goes quiet or reports idle — when the
+ *  turn ends, or at once for a turn cancelled without a closing record — the
+ *  same path a turn that never saw a restart takes. */
+function reattachedTurnStillOpen(source: string): boolean {
+  if (!reattachOpenTurnGate || isPromptReady || !bridgeJsonlPath) return false;
+  if (claudeTranscriptLatestTurnState(bridgeJsonlPath) !== 'open') return false;
+  if (!reattachOpenTurnLogged) {
+    reattachOpenTurnLogged = true;
+    log(`${source} idle probe: busy marker absent but the transcript turn is still open; leaving readiness to the idle detector`);
+  }
+  return true;
+}
+
 function probeBusyPatternIdle(
   source: string,
   be: SessionBackend,
@@ -21067,6 +21172,7 @@ function probeBusyPatternIdle(
         log(`${source} idle probe: input prompt not on screen yet; not marking ready`);
         return false;
       }
+      if (reattachedTurnStillOpen(source)) return false;
       if (!be.settleCurrentScreen) {
         log(`${source} idle probe: busy marker absent, marking prompt ready`);
         markPromptReady();
@@ -26364,6 +26470,12 @@ async function spawnCli(
     const bridgeCwd = scratchChdirInSandbox ?? cfg.workingDir;
     const claudeJsonl = resolveClaudeJsonlPath(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir)
       ?? claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
+    // A new CLI generation of this worker: take over what the retired one left
+    // in the journal before this generation's watcher (and its restore) runs.
+    claimRetiredGenerationJournalEntries();
+    // The pane's outermost process started with the CLI generation the
+    // previous worker drove, before any of that generation's marks.
+    const liveCliStartedAtMs = actuallyReattachedPersistent && cliPid ? readProcessStartTime(cliPid) : undefined;
     startBridgeWatcher(claudeJsonl, {
       // A re-attached pane already has every launch layer, so the bridge reads
       // Claude's pid-state record BEFORE its baseline and starts on the
@@ -26373,6 +26485,7 @@ async function spawnCli(
       cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
       dataDir: bridgeClaudeDataDir,
+      ...(liveCliStartedAtMs !== undefined ? { liveCliStartedAtMs } : {}),
     });
   }
 
@@ -27105,6 +27218,8 @@ async function spawnCli(
     // Keep those operations pipe-only; the liveness slot above is backend-
     // independent and Zellij receives its screen through normal PTY output.
     seedBackendScreen(`${effectiveBackendType} reattach`, backend);
+    reattachOpenTurnGate = true;
+    reattachOpenTurnLogged = false;
     scheduleReattachIdleProbe(`${effectiveBackendType} reattach`, backend);
   }
 
@@ -27417,6 +27532,7 @@ function killCli(opts: {
   // restart with the proper mode based on the new cfg. Leaving it running
   // would dangle a watcher pinned to a stale jsonl path.
   stopBridgeWatcher();
+  reattachOpenTurnGate = false;
   stopCodexBridge();
   // Clean up CLI PID marker
   if (cliPidMarker) {
