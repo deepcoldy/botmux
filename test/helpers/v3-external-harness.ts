@@ -82,9 +82,12 @@ export class FakeExecutor implements V3ExternalNodeExecutor {
 }
 
 const bases: string[] = [];
-/** Call from afterEach: removes every run dir created since the last call. */
+/** Call from afterEach: removes every run dir created since the last call.
+ *  A refusal the node daemon records fire-and-forget (registry write) can
+ *  still be landing when the test body returns; retry the removal instead of
+ *  failing with ENOTEMPTY. */
 export function cleanupBotRuns(): void {
-  for (const base of bases.splice(0)) rmSync(base, { recursive: true, force: true });
+  for (const base of bases.splice(0)) rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
 /** Register an extra temp dir for cleanupBotRuns. */
