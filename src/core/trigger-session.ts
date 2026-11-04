@@ -1,3 +1,5 @@
+import { config } from '../config.js';
+import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
@@ -676,6 +678,7 @@ function waitForSessionFinalOutput(
       },
     });
     try {
+      if (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1') outputDeliveryJournal(config.session.dataDir, ds.larkAppId).rememberSink(ds.session.sessionId, triggerId, { kind: 'http', mode: 'wait' });
       dispatchTurn();
     } catch (err) {
       clearTimeout(timer);
@@ -691,6 +694,7 @@ function waitForSessionFinalOutput(
 }
 
 function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
+  if (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1') outputDeliveryJournal(config.session.dataDir, ds.larkAppId).rememberSink(ds.session.sessionId, triggerId, { kind: 'http', mode: 'async' });
   const createdAt = Date.now();
   ds.asyncTriggerResults ??= new Map();
   ds.asyncTriggerResults.set(triggerId, {

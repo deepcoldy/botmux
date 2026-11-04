@@ -3,6 +3,13 @@ import { DAEMON_ENV_KEYS, resolveDaemonEnv } from '../src/cli/daemon-lifecycle-e
 import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX } from '../src/utils/child-env.js';
 import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
 
+it('reloads final-output handoff and clears a removed switch on managed restart', () => {
+  expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '0' }, 'BOTMUX_FINAL_OUTPUT_HANDOFF=1'))
+    .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '1' });
+  expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '1' }, 'WEB_HOST=0.0.0.0'))
+    .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '' });
+});
+
 /**
  * Every key resolves to '' unless a source sets it, except the terminal and
  * dashboard bind hosts whose historical defaults land in resolveDaemonEnv. Built from

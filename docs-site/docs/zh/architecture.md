@@ -48,4 +48,6 @@ botmux 是一个薄编排层，把"飞书事件"翻译成"CLI 进程的输入/�
 4. worker 持续读 PTY 输出，经 terminal-renderer 转成 Markdown，更新流式卡片。
 5. CLI 通过注入的 `botmux send` 等 Skill / 命令主动往话题发消息。
 
+所有 worker 最终输出共用持久交接入口（`BOTMUX_FINAL_OUTPUT_HANDOFF=1`）：发 IPC 前保存完整快照，daemon 固定各通道目标并持久结算后 ACK。原生 Codex、远端工具、HTTP、文档、私聊和 managed 输出保留自身权限与回执协议，详见仓库 `docs/final-output-handoff.md`。
+
 关键点：**worker 与 CLI 通过后端（PTY 或 tmux）解耦**。tmux 后端下，daemon/worker 重启时 CLI 进程仍在 tmux 里活着，下次消息自动 re-attach，无需 `--resume` 重载上下文。详见 [tmux 会话常驻](/tmux)。

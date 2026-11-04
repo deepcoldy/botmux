@@ -4895,7 +4895,10 @@ async function sessionReply(
       [opts?.replyTarget?.mode === 'thread' ? opts.replyTarget.rootMessageId : anchor],
       opts?.topicMessageLookup ?? getTopicMessageDetail, getBot(appId).config.topicUnavailablePolicy);
     const privateMessageId = await sendPrivateReply(ds.session,
-      turnId, content, msgType, opts?.uuid);
+      turnId, content, msgType, opts?.uuid, {
+        senderOpenId: opts?.replyContext?.requesterOpenId ?? opts?.replyContext?.replyTargetSenderOpenId ?? ds.session.turnReplyContexts?.[turnId ?? '']?.requesterOpenId ?? ds.session.turnReplyContexts?.[turnId ?? '']?.replyTargetSenderOpenId,
+        senderIsBot: opts?.replyContext?.requesterIsBot ?? (opts?.replyContext?.requesterOpenId ? false : opts?.replyContext?.replyTargetSenderIsBot) ?? ds.session.turnReplyContexts?.[turnId ?? '']?.replyTargetSenderIsBot, beforeWrite: opts?.beforeWrite, failClosed: !!opts?.replyContext,
+      });
     if (privateMessageId !== undefined) return privateMessageId;
   }
   const hookContext = ds ? {
@@ -32486,6 +32489,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
+    larkAppId: cfg.larkAppId,
     sessionReply,
     onZeroPromptFinal: reportZeroPromptFinal,
     getSessionWorkingDir,
