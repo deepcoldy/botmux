@@ -24,8 +24,9 @@ function message(type: string, payload: Buffer) {
   const header = Buffer.alloc(5); header.write(type); header.writeInt32BE(payload.length + 4, 1);
   return Buffer.concat([header, payload]);
 }
-async function gateway(reject: boolean | 'query' | 'expired' | 'network' = false, host = '127.0.0.1') {
+async function gateway(reject: boolean | 'query' | 'query-auth' | 'expired' | 'network' = false, host = '127.0.0.1') {
   const startups: Record<string, string>[] = [];
+  const queries: string[] = [];
   const sockets = new Set<Socket>();
   const server = createServer(socket => {
     sockets.add(socket); socket.on('close', () => sockets.delete(socket));
@@ -48,11 +49,14 @@ async function gateway(reject: boolean | 'query' | 'expired' | 'network' = false
       }
       while (buffer.length >= 5 && buffer.length >= 1 + buffer.readInt32BE(1)) {
         const type = String.fromCharCode(buffer[0]), length = buffer.readInt32BE(1);
+        const payload = buffer.subarray(5, 1 + length).toString().replace(/\0$/, '');
         buffer = buffer.subarray(1 + length);
         if (type === 'X') { socket.end(); return; }
         if (type === 'Q') {
-          if (reject === 'query') {
-            const text = `SERROR\0CXX000\0Mfailed ${startups[0].options}\0D${startups[0].options}\0\0`;
+          queries.push(payload);
+          if (reject === 'query' || reject === 'query-auth') {
+            const code = reject === 'query-auth' ? '28000' : 'XX000';
+            const text = `SERROR\0C${code}\0Mfailed ${startups[0].options}\0D${startups[0].options}\0\0`;
             socket.write(Buffer.concat([message('N', Buffer.from(text)), message('E', Buffer.from(text)), message('Z', Buffer.from('I'))]));
           } else socket.write(Buffer.concat([message('C', Buffer.from('SELECT 1\0')), message('Z', Buffer.from('I'))]));
         }
@@ -62,7 +66,7 @@ async function gateway(reject: boolean | 'query' | 'expired' | 'network' = false
   });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, host, resolve); });
   const port = (server.address() as { port: number }).port;
-  return { port, startups, close: async () => { sockets.forEach(socket => socket.destroy()); await new Promise<void>(resolve => server.close(() => resolve())); } };
+  return { port, startups, queries, close: async () => { sockets.forEach(socket => socket.destroy()); await new Promise<void>(resolve => server.close(() => resolve())); } };
 }
 const target = (port: number): PostgresTarget => ({
   host: '127.0.0.1', port, database: 'aidb', schema: 'feedback',
@@ -82,10 +86,11 @@ describe('BytePG feedback authentication', () => {
       await pool.query('SELECT 1');
       expect(refreshes).toBe(1);
       expect(server.startups).toHaveLength(2);
+      expect(server.queries).toEqual(['SELECT 1']);
       expect(server.startups[1].options).toContain('bytepg_auth_token=new-token ');
     } finally { await pool.end(); await server.close(); }
   });
-  it.each(['network', 'query'] as const)('never cleans or retries SQL on %s failure', async failure => {
+  it.each(['network', 'query', 'query-auth'] as const)('never cleans or retries SQL on %s failure', async failure => {
     const server = await gateway(failure);
     let refreshes = 0;
     const pool = feedbackPostgresPool(target(server.port), {
@@ -96,6 +101,7 @@ describe('BytePG feedback authentication', () => {
       await expect(pool.query('SELECT 1')).rejects.toThrow();
       expect(refreshes).toBe(0);
       expect(server.startups).toHaveLength(1);
+      expect(server.queries).toHaveLength(failure === 'network' ? 0 : 1);
     } finally { await pool.end(); await server.close(); }
   });
   it('bounds authentication recovery to one reconnect', async () => {
