@@ -215,12 +215,12 @@ describe('protected HTTP egress worker policy collection', () => {
 
 describe('protected HTTP egress route decisions', () => {
   const policy = normalizeProtectedHttpEgressPolicy({
-    id: 'fixture.catalog.write.v1',
+    id: 'fixture.items.write.v1',
     targets: [{
       scheme: 'https',
       host: 'fixture.internal.example',
       port: 443,
-      denyRoutes: [{ methods: ['POST'], path: '/api/v2/catalog/info' }],
+      denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
     }],
   })!;
 
@@ -229,37 +229,37 @@ describe('protected HTTP egress route decisions', () => {
   );
 
   it('denies exact registered method/path pairs without treating reads or sibling routes as writes', () => {
-    expect(decide('POST', '/api/v2/catalog/info')).toBe('deny');
-    expect(decide('post', '/api/v2/catalog/info?x=1')).toBe('deny');
-    expect(decide('GET', '/api/v2/catalog/info')).toBe('allow');
-    expect(decide('POST', '/api/v2/catalog/list')).toBe('allow');
+    expect(decide('POST', '/v1/items/update')).toBe('deny');
+    expect(decide('post', '/v1/items/update?x=1')).toBe('deny');
+    expect(decide('GET', '/v1/items/update')).toBe('allow');
+    expect(decide('POST', '/v1/items/list')).toBe('allow');
   });
 
   it.each([
-    ['/api/v2/catalog/%69nfo', 'encoded unreserved character'],
-    ['/api/v2/catalog/../catalog/info', 'dot segment'],
-    ['/api/v2/catalog/./info', 'single-dot segment'],
-    ['//api/v2/catalog/info', 'scheme-relative path'],
-    ['https://fixture.internal.example/api/v2/catalog/info', 'absolute URL'],
-    ['/api/v2/catalog\\info', 'backslash'],
-    ['/api/v2/catalog/%2finfo', 'encoded slash'],
-    ['/api/v2/catalog/%5Cinfo', 'encoded backslash'],
-    ['/api/v2/catalog/%2e%2e/info', 'encoded dot segment'],
-    ['/api/v2/catalog/info/', 'trailing separator'],
-    ['/api/v2/catalog//info', 'repeated separator'],
-    ['/api/v2/catalog/%2569nfo', 'encoded percent alias'],
-    ['/api/v2/catalog/%252e%252e/info', 'double-encoded dot segment'],
-    ['/api/v2/catalog/%', 'invalid percent escape'],
-    ['/api/v2/catalog/%0ainfo', 'encoded control character'],
-    ['/api/v2/catalog/info\u0000', 'literal control character'],
-    ['/api/v2/catalog/info#fragment', 'fragment'],
+    ['/v1/items/%75pdate', 'encoded unreserved character'],
+    ['/v1/items/../items/update', 'dot segment'],
+    ['/v1/items/./update', 'single-dot segment'],
+    ['//v1/items/update', 'scheme-relative path'],
+    ['https://fixture.internal.example/v1/items/update', 'absolute URL'],
+    ['/v1/items\\update', 'backslash'],
+    ['/v1/items/%2fupdate', 'encoded slash'],
+    ['/v1/items/%5Cupdate', 'encoded backslash'],
+    ['/v1/items/%2e%2e/update', 'encoded dot segment'],
+    ['/v1/items/update/', 'trailing separator'],
+    ['/v1/items//update', 'repeated separator'],
+    ['/v1/items/%2575pdate', 'encoded percent alias'],
+    ['/v1/items/%252e%252e/update', 'double-encoded dot segment'],
+    ['/v1/items/%', 'invalid percent escape'],
+    ['/v1/items/%0aupdate', 'encoded control character'],
+    ['/v1/items/update\u0000', 'literal control character'],
+    ['/v1/items/update#fragment', 'fragment'],
   ])('rejects ambiguous or unsafe path spelling: %s (%s)', (path) => {
     expect(() => decide('POST', path)).toThrow('invalid_protected_http_path');
   });
 
   it('preserves query semantics while canonicalizing percent hex case', () => {
-    expect(normalizeProtectedHttpPath('/api/v2/catalog/list?cursor=%aa%2f&view=all'))
-      .toBe('/api/v2/catalog/list?cursor=%AA%2F&view=all');
+    expect(normalizeProtectedHttpPath('/v1/items/list?cursor=%aa%2f&view=all'))
+      .toBe('/v1/items/list?cursor=%AA%2F&view=all');
   });
 
   it('fails closed on a policy identifier mismatch or malformed method', () => {
@@ -267,9 +267,9 @@ describe('protected HTTP egress route decisions', () => {
       policy,
       'fixture.other.write.v1',
       'POST',
-      '/api/v2/catalog/info',
+      '/v1/items/update',
     )).toThrow('protected_http_egress_policy_mismatch');
-    expect(() => decide('POST GET', '/api/v2/catalog/info'))
+    expect(() => decide('POST GET', '/v1/items/update'))
       .toThrow('invalid_protected_http_method');
   });
 });

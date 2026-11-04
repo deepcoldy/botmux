@@ -18,12 +18,12 @@ import {
 } from '../src/core/protected-http-egress.js';
 
 const policy = normalizeProtectedHttpEgressPolicy({
-  id: 'fixture.catalog.write.v1',
+  id: 'fixture.items.write.v1',
   targets: [{
     scheme: 'https',
     host: 'fixture.internal.example',
     port: 443,
-    denyRoutes: [{ methods: ['POST'], path: '/api/v2/catalog/info' }],
+    denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
   }],
 })!;
 
@@ -132,7 +132,7 @@ describe('session protected HTTP egress host', () => {
       ...(presented ? { 'x-botmux-egress-auth': presented } : {}),
     };
 
-    const response = await unixHttpRequest(host.socketPath, 'GET', '/api/v2/catalog/list', headers);
+    const response = await unixHttpRequest(host.socketPath, 'GET', '/v1/items/list', headers);
 
     expect(response.status).toBe(403);
     expect(forwarded).toHaveLength(0);
@@ -144,7 +144,7 @@ describe('session protected HTTP egress host', () => {
     const response = await unixHttpRequest(
       host.socketPath,
       'POST',
-      '/api/v2/catalog/info?ignored=1',
+      '/v1/items/update?ignored=1',
       routingHeaders(auth),
       Buffer.from('secret-body'),
     );
@@ -158,7 +158,7 @@ describe('session protected HTTP egress host', () => {
     expect(logs[0]).toMatchObject({
       policyId: policy.id,
       method: 'POST',
-      path: '/api/v2/catalog/info',
+      path: '/v1/items/update',
       decision: 'deny',
       status: 403,
     });
@@ -171,7 +171,7 @@ describe('session protected HTTP egress host', () => {
     const response = await unixHttpRequest(
       host.socketPath,
       'POST',
-      '/api/v2/catalog/search?cursor=%aa%2f',
+      '/v1/items/search?cursor=%aa%2f',
       {
         ...routingHeaders(auth),
         host: 'attacker.invalid',
@@ -196,7 +196,7 @@ describe('session protected HTTP egress host', () => {
       targetIndex: 0,
       target: policy.targets[0],
       method: 'POST',
-      path: '/api/v2/catalog/search?cursor=%AA%2F',
+      path: '/v1/items/search?cursor=%AA%2F',
       headers: {
         authorization: 'Bearer machine-jwt-fixture',
         'content-type': 'application/json',
@@ -224,7 +224,7 @@ describe('session protected HTTP egress host', () => {
     expect(logs[0]).toMatchObject({
       policyId: policy.id,
       method: 'POST',
-      path: '/api/v2/catalog/search',
+      path: '/v1/items/search',
       decision: 'allow',
       status: 200,
       upstreamRequestId: 'upstream-request-1',
@@ -234,7 +234,7 @@ describe('session protected HTTP egress host', () => {
       type: 'unregistered_mutating_candidate',
       policyId: policy.id,
       method: 'POST',
-      path: '/api/v2/catalog/search',
+      path: '/v1/items/search',
       status: 200,
     });
     expect(Object.keys(warnings[0]).sort()).toEqual([
@@ -250,7 +250,7 @@ describe('session protected HTTP egress host', () => {
   it('rejects conflicting content lengths at the HTTP boundary without forwarding', async () => {
     const { host, auth, forwarded } = await start();
     const response = await rawUnixHttpRequest(host.socketPath, [
-      'POST /api/v2/catalog/search HTTP/1.1',
+      'POST /v1/items/search HTTP/1.1',
       'Host: localhost',
       `x-botmux-egress-auth: ${auth}`,
       `x-botmux-egress-policy: ${policy.id}`,
@@ -269,7 +269,7 @@ describe('session protected HTTP egress host', () => {
   it('rejects duplicate authorization headers instead of merging credentials', async () => {
     const { host, auth, forwarded } = await start();
     const response = await rawUnixHttpRequest(host.socketPath, [
-      'GET /api/v2/catalog/list HTTP/1.1',
+      'GET /v1/items/list HTTP/1.1',
       'Host: localhost',
       `x-botmux-egress-auth: ${auth}`,
       `x-botmux-egress-policy: ${policy.id}`,
@@ -288,15 +288,15 @@ describe('session protected HTTP egress host', () => {
   it.each([
     ['x-http-method-override', 'POST'],
     ['x-method-override', 'POST'],
-    ['x-original-url', '/api/v2/catalog/info'],
-    ['x-rewrite-url', '/api/v2/catalog/info'],
+    ['x-original-url', '/v1/items/update'],
+    ['x-rewrite-url', '/v1/items/update'],
   ])('rejects the routing override header %s before forwarding', async (name, value) => {
     const { host, auth, forwarded } = await start();
 
     const response = await unixHttpRequest(
       host.socketPath,
       'GET',
-      '/api/v2/catalog/list',
+      '/v1/items/list',
       { ...routingHeaders(auth), [name]: value },
     );
 
@@ -320,7 +320,7 @@ describe('session protected HTTP egress host', () => {
     const response = await unixHttpRequest(
       host.socketPath,
       'GET',
-      '/api/v2/catalog/list',
+      '/v1/items/list',
       routingHeaders(auth),
     );
 
@@ -344,7 +344,7 @@ describe('session protected HTTP egress host', () => {
     const oversizedRequest = await unixHttpRequest(
       host.socketPath,
       'POST',
-      '/api/v2/catalog/search',
+      '/v1/items/search',
       {
         ...routingHeaders(auth),
         'content-length': String(MAX_PROTECTED_HTTP_BODY_BYTES + 1),
@@ -356,7 +356,7 @@ describe('session protected HTTP egress host', () => {
     const oversizedResponse = await unixHttpRequest(
       host.socketPath,
       'GET',
-      '/api/v2/catalog/list',
+      '/v1/items/list',
       routingHeaders(auth),
     );
     expect(oversizedResponse.status).toBe(502);
@@ -458,7 +458,7 @@ describe('session protected HTTP egress host', () => {
     const response = await unixHttpRequest(
       host.socketPath,
       'POST',
-      '/api/v2/catalog/search?token=query-secret',
+      '/v1/items/search?token=query-secret',
       routingHeaders(auth),
       Buffer.from('request-secret'),
     );
@@ -482,7 +482,7 @@ describe('session protected HTTP egress host', () => {
     const response = await unixHttpRequest(
       host.socketPath,
       'GET',
-      '/api/v2/catalog/list',
+      '/v1/items/list',
       routingHeaders(auth),
     );
 
