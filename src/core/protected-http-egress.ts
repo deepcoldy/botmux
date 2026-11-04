@@ -24,6 +24,9 @@ export interface ProtectedHttpEgressPolicy {
 }
 
 const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Z]+$/;
+const HTTP_PATH_CONTROL = /[\u0000-\u001f\u007f]/;
+const HTTP_PATH_PERCENT = /%([0-9a-fA-F]{2})/g;
+const HTTP_UNRESERVED_BYTE = /[A-Za-z0-9\-._~]/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -127,4 +130,80 @@ export function protectedHttpEgressPolicyDigest(policy: ProtectedHttpEgressPolic
   const normalized = normalizeProtectedHttpEgressPolicy(policy);
   if (!normalized) throw new Error('invalid_protected_http_egress_policy');
   return createHash('sha256').update(JSON.stringify(keySorted(normalized))).digest('hex');
+}
+
+function normalizeProtectedHttpMethod(raw: string): string {
+  const method = raw.toUpperCase();
+  if (!HTTP_TOKEN.test(method)) throw new Error('invalid_protected_http_method');
+  return method;
+}
+
+/**
+ * Canonicalize a worker-supplied origin-form request target without ever
+ * accepting an alternate spelling of a protected path. Query ordering and
+ * contents are preserved; deny-route matching uses only the pathname.
+ */
+export function normalizeProtectedHttpPath(raw: string): string {
+  if (typeof raw !== 'string'
+    || !raw.startsWith('/')
+    || raw.startsWith('//')
+    || raw.includes('\\')
+    || raw.includes('#')
+    || HTTP_PATH_CONTROL.test(raw)) {
+    throw new Error('invalid_protected_http_path');
+  }
+
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] !== '%') continue;
+    if (!/^[0-9a-fA-F]{2}$/.test(raw.slice(index + 1, index + 3))) {
+      throw new Error('invalid_protected_http_path');
+    }
+    index += 2;
+  }
+
+  const queryAt = raw.indexOf('?');
+  const pathname = queryAt < 0 ? raw : raw.slice(0, queryAt);
+  const query = queryAt < 0 ? '' : raw.slice(queryAt);
+  try {
+    decodeURIComponent(pathname);
+  } catch {
+    throw new Error('invalid_protected_http_path');
+  }
+  for (const match of pathname.matchAll(HTTP_PATH_PERCENT)) {
+    const byte = Number.parseInt(match[1], 16);
+    const character = String.fromCharCode(byte);
+    if (byte === 0x2f
+      || byte === 0x5c
+      || byte <= 0x1f
+      || byte === 0x7f
+      || HTTP_UNRESERVED_BYTE.test(character)) {
+      throw new Error('invalid_protected_http_path');
+    }
+  }
+  if (pathname.split('/').some(segment => segment === '.' || segment === '..')) {
+    throw new Error('invalid_protected_http_path');
+  }
+
+  return `${pathname.replace(HTTP_PATH_PERCENT, (_escape, hex: string) => `%${hex.toUpperCase()}`)}${
+    query.replace(HTTP_PATH_PERCENT, (_escape, hex: string) => `%${hex.toUpperCase()}`)
+  }`;
+}
+
+export function protectedHttpEgressDecision(
+  policy: ProtectedHttpEgressPolicy,
+  policyId: string,
+  method: string,
+  path: string,
+): 'allow' | 'deny' {
+  if (policyId !== policy.id) throw new Error('protected_http_egress_policy_mismatch');
+  const normalizedMethod = normalizeProtectedHttpMethod(method);
+  const normalizedPath = normalizeProtectedHttpPath(path);
+  const requestPathname = normalizedPath.split('?', 1)[0];
+  for (const target of policy.targets) {
+    for (const route of target.denyRoutes) {
+      const routePath = normalizeProtectedHttpPath(route.path).split('?', 1)[0];
+      if (route.methods.includes(normalizedMethod) && routePath === requestPathname) return 'deny';
+    }
+  }
+  return 'allow';
 }
