@@ -47,6 +47,8 @@ export const WORKFLOW_DRAFT_STALE_MS = 30 * 24 * 60 * 60_000;
 export const WORKFLOW_DRAFT_MAX_TURNS = 200;
 /** One turn's text is cut here; a spec candidate has its own field. */
 export const WORKFLOW_DRAFT_MAX_TURN_CHARS = 64_000;
+/** Clarify sessions whose close failed, kept for the sweep to retry. */
+export const WORKFLOW_DRAFT_MAX_ORPHANS = 20;
 
 const SHA256_RE = /^sha256:[0-9a-f]{64}$/;
 const iso = z.string().min(1).max(64);
@@ -82,8 +84,12 @@ const clarifySchema = z.object({
    *  resumed — 「继续」 starts a new one; closed: abandoned/deleted. */
   state: z.enum(['active', 'suspended', 'disconnected', 'closed']),
   pending: z.object({ triggerId: z.string().min(1).max(256), sentAt: iso }).strict().optional(),
+  /** Last activity: a message sent or a reply landed (idle clock, §4.2). */
   lastMessageAt: iso.optional(),
   suspendedAt: iso.optional(),
+  /** The process could not be released (non-suspendable backend); not
+   *  retried until the next message. */
+  suspendRefusedAt: iso.optional(),
   error: z.string().max(2000).optional(),
   turns: z.array(turnSchema).max(WORKFLOW_DRAFT_MAX_TURNS),
   /** The latest spec the model wrote (spec.md format), not yet finalized. */
@@ -149,6 +155,10 @@ export const WorkflowDraftRecordSchema = z.object({
   flowConfirmation: flowConfirmationSchema.optional(),
   abandonedAt: iso.optional(),
   deletedAt: iso.optional(),
+  orphanSessions: z.array(z.object({
+    sessionId: z.string().min(1).max(256),
+    headlessId: z.string().min(1).max(256).optional(),
+  }).strict()).max(WORKFLOW_DRAFT_MAX_ORPHANS).optional(),
 }).strict();
 
 export type WorkflowDraftRecord = z.infer<typeof WorkflowDraftRecordSchema>;
@@ -359,5 +369,6 @@ export function workflowDraftOwner(baseDir: string, runId: string): string | und
   const runDir = workflowDraftRunDir(baseDir, runId);
   if (!runDir || !isWorkflowDraftDir(runDir)) return undefined;
   const draft = readWorkflowDraft(runDir);
-  return draft && !draft.deletedAt && draft.runId === runId ? draft.orchestratorAppId : undefined;
+  // A marked-deleted draft still routes, so a repeated delete can finish it.
+  return draft && draft.runId === runId ? draft.orchestratorAppId : undefined;
 }

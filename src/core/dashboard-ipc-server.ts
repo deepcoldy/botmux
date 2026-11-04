@@ -356,6 +356,7 @@ import {
   sessionWakeAcquireTimeoutMs,
 } from './session-wake-deadline.js';
 import {
+  hasProtectedSessionMutationOwnership,
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
@@ -6568,6 +6569,9 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
     lookupTriggerResult: buildAsyncTriggerLookupResponse,
     sessionStatus: (sessionId) => (findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId))?.status,
     suspendWorker,
+    isSuspendable: (ds) => isSuspendableBackendType(ds.initConfig?.backendType),
+    canRetireWorker: (ds) => !isRemoteBackendSession(ds) && !isSessionTransferring(ds) && !hasProtectedSessionMutationOwnership(ds),
+    killWorker: (ds) => killWorker(ds),
     closeSession: (sessionId) => closeSessionForBackgroundCleanup(sessionId, 'workflow draft clarify session'),
     deleteHeadlessRecord: (headlessId) => { deleteHeadlessSession(headlessId); },
   });

@@ -66,6 +66,7 @@ import {
   type V3NodeExecutorTarget,
 } from './node-executor-mode.js';
 import {
+  WORKFLOW_DRAFT_MAX_ORPHANS,
   WORKFLOW_DRAFT_MAX_TURNS,
   WORKFLOW_DRAFT_MAX_TURN_CHARS,
   WORKFLOW_DRAFT_SCHEMA_VERSION,
@@ -96,8 +97,6 @@ export const DRAFT_ARCHITECT_TIMEOUT_MS = 10 * 60_000;
 /** §4.2: a draft whose clarify session got no message for this long has its
  *  CLI process closed; the session record stays for a later resume. */
 export const DRAFT_CLARIFY_IDLE_MS = 30 * 60_000;
-/** A send reservation older than this was left by a crash; drop it. */
-const SEND_RESERVATION_TTL_MS = 2 * 60_000;
 const RESERVATION_PREFIX = 'reserve:';
 const MAX_GOAL_CHARS = 4_000;
 const MAX_MESSAGE_CHARS = 16_000;
@@ -174,7 +173,8 @@ const err = (code: WorkflowDraftErrorCode, message: string, details?: Record<str
 
 export type DraftClarifyResult =
   | { state: 'running' }
-  | { state: 'completed'; content: string }
+  /** `finishedAt`: when the turn ended, if known (the idle clock). */
+  | { state: 'completed'; content: string; finishedAt?: string }
   | { state: 'failed'; error?: string }
   /** The session or turn no longer exists. */
   | { state: 'not_found' };
@@ -189,9 +189,9 @@ export interface DraftClarifier {
     { ok: true; triggerId: string } | { ok: false; error: string; disconnected: boolean }
   >;
   result(sessionId: string, triggerId: string): DraftClarifyResult;
-  /** Close the CLI process, keep the session record (idle, §4.2).
-   *  Synchronous: called inside the draft lock. */
-  suspend(sessionId: string): boolean;
+  /** Close the CLI process, keep the session record (idle, §4.2). False:
+   *  this session's process cannot be released now. Called outside the lock. */
+  suspend(sessionId: string): boolean | Promise<boolean>;
   /** Close the session and delete its record (abandon / delete). */
   close(input: { sessionId: string; headlessId?: string }): Promise<void>;
 }
@@ -283,8 +283,9 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** At most `max` characters, the ellipsis included (schema limits are hard). */
 function clip(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max)}…`;
+  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
 function pushTurn(draft: WorkflowDraftRecord, turn: WorkflowDraftTurn): void {
@@ -292,6 +293,19 @@ function pushTurn(draft: WorkflowDraftRecord, turn: WorkflowDraftTurn): void {
   if (draft.clarify.turns.length > WORKFLOW_DRAFT_MAX_TURNS) {
     draft.clarify.turns.splice(0, draft.clarify.turns.length - WORKFLOW_DRAFT_MAX_TURNS);
   }
+}
+
+/** Every clarify session a draft knows of (current + ones whose close failed). */
+function draftSessions(draft: WorkflowDraftRecord): Array<{ sessionId: string; headlessId?: string }> {
+  const out = new Map<string, { sessionId: string; headlessId?: string }>();
+  for (const item of draft.orphanSessions ?? []) out.set(item.sessionId, item);
+  if (draft.clarify.sessionId) {
+    out.set(draft.clarify.sessionId, {
+      sessionId: draft.clarify.sessionId,
+      ...(draft.clarify.headlessId ? { headlessId: draft.clarify.headlessId } : {}),
+    });
+  }
+  return [...out.values()];
 }
 
 function readTextOrUndefined(path: string): string | undefined {
@@ -334,6 +348,15 @@ function findGoalNode(dag: Record<string, unknown>, nodeId: string): Record<stri
 
 export class WorkflowDraftService {
   private readonly tasks = new Map<string, ArchitectTask>();
+  /** Send / session-start reservations held by an operation of THIS process.
+   *  A reservation on disk that is not here was left by a previous boot or a
+   *  failed second step, and is dropped; one that is here is never timed out
+   *  (a slow send must not be overtaken by a second tab). */
+  private readonly inflight = new Set<string>();
+  /** Clarify sessions being suspended right now (outside the lock). */
+  private readonly suspending = new Set<string>();
+  /** Clarify sessions whose close failed; the sweep retries them. */
+  private readonly orphans = new Map<string, { sessionId: string; headlessId?: string }>();
   private readonly now: () => Date;
   private readonly setTimer: (fn: () => void, ms: number) => () => void;
   private readonly loadDag: (path: string) => unknown;
@@ -367,12 +390,13 @@ export class WorkflowDraftService {
     runId: string,
     runDir: string,
     initiator: WorkflowDraftInitiator | undefined,
-    opts: { baseVersion?: number; allowAbandoned?: boolean },
+    opts: { baseVersion?: number; allowAbandoned?: boolean; allowDeleted?: boolean },
   ): { draft: WorkflowDraftRecord; grill: GrillState } {
     if (!isWorkflowDraftDir(runDir)) throw err('unknown_draft', `没有这个草稿：${runId}`);
     const draft = readWorkflowDraft(runDir);
     const grill = readGrillState(runDir);
-    if (!draft || !grill || draft.deletedAt || draft.runId !== runId || grill.runId !== runId || grill.chatBinding) {
+    if (!draft || !grill || (draft.deletedAt && !opts.allowDeleted)
+      || draft.runId !== runId || grill.runId !== runId || grill.chatBinding) {
       throw err('unknown_draft', `没有这个草稿：${runId}`);
     }
     if (draft.orchestratorAppId !== this.deps.appId) {
@@ -396,16 +420,17 @@ export class WorkflowDraftService {
   private mutate<T>(
     runId: string,
     initiator: WorkflowDraftInitiator | undefined,
-    opts: { baseVersion?: number; allowAbandoned?: boolean },
-    fn: (ctx: { runDir: string; draft: WorkflowDraftRecord; grill: GrillState }) => { changed: boolean; result: T },
+    opts: { baseVersion?: number; allowAbandoned?: boolean; allowDeleted?: boolean },
+    fn: (ctx: { runDir: string; draft: WorkflowDraftRecord; grill: GrillState; healed: boolean }) => { changed: boolean; result: T },
   ): T {
     const runDir = this.runDirOf(runId);
     try {
       return withWorkflowDraftLock(runDir, runId, () => {
         const { draft, grill } = this.loadLocked(runId, runDir, initiator, opts);
         const refreshed = this.refreshClarifyInPlace(draft);
-        const out = fn({ runDir, draft, grill });
-        if (out.changed || refreshed) this.persist(runDir, draft);
+        const healed = this.healStaleArchitect(runId, draft, grill);
+        const out = fn({ runDir, draft, grill, healed });
+        if (out.changed || refreshed || healed) this.persist(runDir, draft);
         return out.result;
       });
     } catch (error) {
@@ -428,6 +453,25 @@ export class WorkflowDraftService {
         : err('state_conflict', error.message);
     }
     return error;
+  }
+
+  /**
+   * A draft recorded 编排中 that nothing runs any more — no task in this
+   * process and the grill not in architect_running (whose own lock still
+   * guards a run elsewhere) — is a lost outcome (e.g. its record could not be
+   * written). It becomes 编排中断 in place instead of blocking every write
+   * until the next restart. Never awaits; caller holds the draft lock.
+   */
+  private healStaleArchitect(runId: string, draft: WorkflowDraftRecord, grill: GrillState): boolean {
+    if (draft.architect?.state !== 'running' || this.tasks.has(runId) || grill.status === 'architect_running') return false;
+    const { problems: _old, ...rest } = draft.architect;
+    draft.architect = {
+      ...rest,
+      state: 'interrupted',
+      finishedAt: this.now().toISOString(),
+      problems: ['编排的结果没能记录下来，请重新编排'],
+    };
+    return true;
   }
 
   private assertNotArchitecting(runId: string, draft: WorkflowDraftRecord, grill: GrillState): void {
@@ -461,7 +505,7 @@ export class WorkflowDraftService {
     const pending = draft.clarify.pending;
     if (!pending) return false;
     if (pending.triggerId.startsWith(RESERVATION_PREFIX)) {
-      if (this.now().getTime() - Date.parse(pending.sentAt) < SEND_RESERVATION_TTL_MS) return false;
+      if (this.inflight.has(pending.triggerId)) return false;
       delete draft.clarify.pending;
       return true;
     }
@@ -475,6 +519,14 @@ export class WorkflowDraftService {
     if (result.state === 'running') return false;
     const at = this.now().toISOString();
     delete draft.clarify.pending;
+    // Idle time counts from the last activity: a reply landing is one (when
+    // it ended, if known — it may be committed later by a read or the sweep).
+    if (result.state !== 'not_found') {
+      const ended = result.state === 'completed' && result.finishedAt && Date.parse(result.finishedAt) <= Date.parse(at)
+        ? new Date(Date.parse(result.finishedAt)).toISOString()
+        : at;
+      draft.clarify.lastMessageAt = ended;
+    }
     if (result.state === 'completed') {
       const parsed = parseDraftClarifyOutput(result.content);
       pushTurn(draft, {
@@ -500,6 +552,12 @@ export class WorkflowDraftService {
     return true;
   }
 
+  private reserve(): string {
+    const reservation = `${RESERVATION_PREFIX}${randomUUID()}`;
+    this.inflight.add(reservation);
+    return reservation;
+  }
+
   /**
    * Send one turn into the clarify session. Reserved under the lock first so
    * two tabs cannot both send; the reservation is replaced by the real turn
@@ -510,112 +568,162 @@ export class WorkflowDraftService {
     initiator: WorkflowDraftInitiator,
     input: { text: string; display: string; role: 'user' | 'system'; baseVersion?: number },
   ): Promise<WorkflowDraftView> {
-    const reservation = `${RESERVATION_PREFIX}${randomUUID()}`;
-    const target = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
-      this.assertNotArchitecting(runId, draft, grill);
-      this.assertStatus(grill, ['grilling', 'spec_ready'], '对话');
-      if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
-      if (draft.clarify.state === 'disconnected' || draft.clarify.state === 'closed'
-        || !draft.clarify.sessionId || !draft.clarify.headlessId) {
-        throw err('session_disconnected', '会话已断开，点「继续」重新起会话');
-      }
-      draft.clarify.pending = { triggerId: reservation, sentAt: this.now().toISOString() };
-      return { changed: true, result: { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId } };
-    });
-    let sent: Awaited<ReturnType<DraftClarifier['send']>>;
+    const reservation = this.reserve();
     try {
-      sent = await this.deps.clarifier.send({
-        larkAppId: this.deps.appId, ...target, prompt: input.text, requestId: `${runId}:${reservation}`,
+      const target = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
+        this.assertNotArchitecting(runId, draft, grill);
+        this.assertStatus(grill, ['grilling', 'spec_ready'], '对话');
+        if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
+        if (draft.clarify.state === 'disconnected' || draft.clarify.state === 'closed'
+          || !draft.clarify.sessionId || !draft.clarify.headlessId) {
+          throw err('session_disconnected', '会话已断开，点「继续」重新起会话');
+        }
+        if (this.suspending.has(draft.clarify.sessionId)) throw err('busy', '会话正在释放空闲进程，请稍后重试');
+        draft.clarify.pending = { triggerId: reservation, sentAt: this.now().toISOString() };
+        return { changed: true, result: { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId } };
       });
-    } catch (error) {
-      sent = { ok: false, error: errorText(error), disconnected: false };
-    }
-    this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
-      if (draft.clarify.pending?.triggerId !== reservation) return { changed: false, result: undefined };
-      delete draft.clarify.pending;
-      const at = this.now().toISOString();
-      if (sent.ok) {
-        draft.clarify.pending = { triggerId: sent.triggerId, sentAt: at };
-        draft.clarify.state = 'active';
-        draft.clarify.lastMessageAt = at;
-        delete draft.clarify.suspendedAt;
-        delete draft.clarify.error;
-        pushTurn(draft, { role: input.role, text: input.display, at, triggerId: sent.triggerId });
-      } else if (sent.disconnected) {
-        draft.clarify.state = 'disconnected';
-        draft.clarify.error = '会话已断开';
-      } else {
-        draft.clarify.error = clip(sent.error, 1000);
-      }
-      return { changed: true, result: undefined };
-    });
-    if (!sent.ok) {
-      throw sent.disconnected
-        ? err('session_disconnected', '会话已断开，点「继续」重新起会话')
-        : err('clarify_unavailable', `没能把消息发给编排 Bot：${clip(sent.error, 300)}`);
-    }
-    return this.view(runId);
-  }
-
-  /** Start a fresh clarify session with `prompt` and record it on the draft. */
-  private async startSession(runId: string, prompt: string, title: string): Promise<void> {
-    let created: Awaited<ReturnType<DraftClarifier['create']>>;
-    try {
-      created = await this.deps.clarifier.create({ larkAppId: this.deps.appId, title });
-    } catch (error) {
-      created = { ok: false, error: errorText(error) };
-    }
-    let sent: Awaited<ReturnType<DraftClarifier['send']>> | undefined;
-    if (created.ok) {
+      let sent: Awaited<ReturnType<DraftClarifier['send']>>;
       try {
         sent = await this.deps.clarifier.send({
-          larkAppId: this.deps.appId,
-          sessionId: created.sessionId,
-          headlessId: created.headlessId,
-          prompt,
-          requestId: `${runId}:${randomUUID()}`,
+          larkAppId: this.deps.appId, ...target, prompt: input.text, requestId: `${runId}:${reservation}`,
         });
       } catch (error) {
         sent = { ok: false, error: errorText(error), disconnected: false };
       }
-    }
-    let orphan: { sessionId: string; headlessId: string } | undefined;
-    this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
-      const at = this.now().toISOString();
-      if (!created.ok) {
-        draft.clarify = { ...draft.clarify, state: 'disconnected', error: clip(created.error, 1000) };
+      let displaced = false;
+      this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
+        const at = this.now().toISOString();
+        if (draft.clarify.pending?.triggerId !== reservation) {
+          // Someone else changed the draft meanwhile (abandon / continue):
+          // this turn is not tracked, so say so instead of reporting success.
+          displaced = true;
+          if (!sent.ok || draft.abandonedAt) return { changed: false, result: undefined };
+          pushTurn(draft, {
+            role: 'system',
+            text: `这条消息发出时草稿已被另一个操作更新，它的回复不会显示：${clip(input.display, 200)}`,
+            at,
+          });
+          return { changed: true, result: undefined };
+        }
         delete draft.clarify.pending;
+        if (sent.ok) {
+          draft.clarify.pending = { triggerId: sent.triggerId, sentAt: at };
+          draft.clarify.state = 'active';
+          draft.clarify.lastMessageAt = at;
+          delete draft.clarify.suspendedAt;
+          delete draft.clarify.suspendRefusedAt;
+          delete draft.clarify.error;
+          pushTurn(draft, { role: input.role, text: input.display, at, triggerId: sent.triggerId });
+        } else if (sent.disconnected) {
+          draft.clarify.state = 'disconnected';
+          draft.clarify.error = '会话已断开';
+        } else {
+          draft.clarify.error = clip(sent.error, 1000);
+        }
         return { changed: true, result: undefined };
+      });
+      if (displaced) {
+        throw err('state_conflict', '消息发出时草稿已被另一个操作更新，这条消息的回复不会显示，请刷新后再发');
       }
-      if (draft.abandonedAt) {
-        // Abandoned while the session was being created: do not keep it.
-        orphan = { sessionId: created.sessionId, headlessId: created.headlessId };
-        return { changed: false, result: undefined };
+      if (!sent.ok) {
+        throw sent.disconnected
+          ? err('session_disconnected', '会话已断开，点「继续」重新起会话')
+          : err('clarify_unavailable', `没能把消息发给编排 Bot：${clip(sent.error, 300)}`);
       }
-      draft.clarify.headlessId = created.headlessId;
-      draft.clarify.sessionId = created.sessionId;
-      delete draft.clarify.pending;
-      delete draft.clarify.suspendedAt;
-      if (sent?.ok) {
-        draft.clarify.state = 'active';
-        draft.clarify.pending = { triggerId: sent.triggerId, sentAt: at };
-        draft.clarify.lastMessageAt = at;
-        delete draft.clarify.error;
-      } else {
-        draft.clarify.state = 'disconnected';
-        draft.clarify.error = clip(sent?.error ?? '会话没有接受第一轮', 1000);
-      }
-      return { changed: true, result: undefined };
-    });
-    if (orphan) await this.closeQuietly(orphan);
+    } finally {
+      this.inflight.delete(reservation);
+    }
+    return this.view(runId);
   }
 
-  private async closeQuietly(session: { sessionId?: string; headlessId?: string }): Promise<void> {
-    if (!session.sessionId) return;
+  /**
+   * Start a fresh clarify session with `prompt` and record it on the draft —
+   * only while `reservation` (taken by the caller under the lock) is still
+   * the draft's: otherwise, or when the draft was abandoned / deleted
+   * meanwhile, the session just created is closed, never left running.
+   * Releases the reservation.
+   */
+  private async startSession(runId: string, prompt: string, title: string, reservation: string): Promise<void> {
+    let created: Awaited<ReturnType<DraftClarifier['create']>> = { ok: false, error: 'not started' };
+    let keep = false;
     try {
-      await this.deps.clarifier.close({ sessionId: session.sessionId, ...(session.headlessId ? { headlessId: session.headlessId } : {}) });
+      try {
+        created = await this.deps.clarifier.create({ larkAppId: this.deps.appId, title });
+      } catch (error) {
+        created = { ok: false, error: errorText(error) };
+      }
+      let sent: Awaited<ReturnType<DraftClarifier['send']>> | undefined;
+      if (created.ok) {
+        try {
+          sent = await this.deps.clarifier.send({
+            larkAppId: this.deps.appId,
+            sessionId: created.sessionId,
+            headlessId: created.headlessId,
+            prompt,
+            requestId: `${runId}:${reservation}`,
+          });
+        } catch (error) {
+          sent = { ok: false, error: errorText(error), disconnected: false };
+        }
+      }
+      const made = created;
+      keep = this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
+        // Abandoned meanwhile, or another operation owns the draft's session
+        // slot now: this session is not the draft's.
+        if (draft.abandonedAt || draft.clarify.pending?.triggerId !== reservation) return { changed: false, result: false };
+        const at = this.now().toISOString();
+        delete draft.clarify.pending;
+        if (!made.ok) {
+          draft.clarify.state = 'disconnected';
+          draft.clarify.error = clip(made.error, 1000);
+          return { changed: true, result: false };
+        }
+        draft.clarify.headlessId = made.headlessId;
+        draft.clarify.sessionId = made.sessionId;
+        delete draft.clarify.suspendedAt;
+        delete draft.clarify.suspendRefusedAt;
+        if (sent?.ok) {
+          draft.clarify.state = 'active';
+          draft.clarify.pending = { triggerId: sent.triggerId, sentAt: at };
+          draft.clarify.lastMessageAt = at;
+          delete draft.clarify.error;
+        } else {
+          draft.clarify.state = 'disconnected';
+          draft.clarify.error = clip(sent?.error ?? '会话没有接受第一轮', 1000);
+        }
+        return { changed: true, result: true };
+      });
+    } finally {
+      this.inflight.delete(reservation);
+      // Not recorded on the draft (refused, abandoned, deleted, or the commit
+      // threw): close it here — nothing else knows this session exists.
+      if (created.ok && !keep) await this.closeOrRemember(runId, { sessionId: created.sessionId, headlessId: created.headlessId });
+    }
+  }
+
+  /** Close a clarify session; on failure remember it (in memory, and on the
+   *  draft when it still exists) so the sweep retries. */
+  private async closeOrRemember(runId: string | undefined, session: { sessionId?: string; headlessId?: string }): Promise<boolean> {
+    if (!session.sessionId) return true;
+    const entry = { sessionId: session.sessionId, ...(session.headlessId ? { headlessId: session.headlessId } : {}) };
+    try {
+      await this.deps.clarifier.close(entry);
+      this.orphans.delete(entry.sessionId);
+      return true;
     } catch (error) {
-      this.log(`[workflow-draft] closing clarify session ${session.sessionId} failed: ${errorText(error)}`);
+      this.log(`[workflow-draft] closing clarify session ${entry.sessionId} failed (will retry): ${errorText(error)}`);
+      this.orphans.set(entry.sessionId, entry);
+      if (runId) {
+        try {
+          this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
+            const list = draft.orphanSessions ?? [];
+            if (list.some((item) => item.sessionId === entry.sessionId)) return { changed: false, result: undefined };
+            draft.orphanSessions = [...list, entry].slice(-WORKFLOW_DRAFT_MAX_ORPHANS);
+            return { changed: true, result: undefined };
+          });
+        } catch { /* in memory still */ }
+      }
+      return false;
     }
   }
 
@@ -639,6 +747,7 @@ export class WorkflowDraftService {
       ...(this.deps.randomSuffix ? { randomSuffix: this.deps.randomSuffix() } : {}),
     });
     const at = now.toISOString();
+    const reservation = this.reserve();
     const record: WorkflowDraftRecord = {
       schemaVersion: WORKFLOW_DRAFT_SCHEMA_VERSION,
       runId,
@@ -648,11 +757,18 @@ export class WorkflowDraftService {
       createdAt: at,
       updatedAt: at,
       version: 1,
-      clarify: { state: 'active', turns: [{ role: 'user', text: goal, at }] },
+      // The session slot is reserved from birth: a second tab's 「继续」 or
+      // message waits for this create instead of starting a second session.
+      clarify: { state: 'active', turns: [{ role: 'user', text: goal, at }], pending: { triggerId: reservation, sentAt: at } },
     };
-    withWorkflowDraftLock(runDir, runId, () => writeWorkflowDraft(runDir, record));
+    try {
+      withWorkflowDraftLock(runDir, runId, () => writeWorkflowDraft(runDir, record));
+    } catch (error) {
+      this.inflight.delete(reservation);
+      throw error;
+    }
     this.log(`[workflow-draft] created ${runId} app=${this.deps.appId} initiator=${initiator.openId} source=${initiator.source}`);
-    await this.startSession(runId, buildDraftClarifyKickoff({ runId, goal }), clip(goal.replace(/\s+/g, ' '), 80));
+    await this.startSession(runId, buildDraftClarifyKickoff({ runId, goal }), clip(goal.replace(/\s+/g, ' '), 80), reservation);
     return this.view(runId);
   }
 
@@ -667,21 +783,29 @@ export class WorkflowDraftService {
   /** 「继续」(§9): replace a session that cannot be resumed with a new one,
    *  carrying the spec so far and the last turns. */
   async continueClarify(runId: string, initiator: WorkflowDraftInitiator, input: { baseVersion?: number } = {}): Promise<WorkflowDraftView> {
-    const prior = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
-      this.assertNotArchitecting(runId, draft, grill);
-      this.assertStatus(grill, ['grilling', 'spec_ready'], '继续对话');
-      if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
-      const old = { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId };
-      const specMarkdown = readTextOrUndefined(grill.specPath) ?? draft.clarify.specCandidate?.markdown;
-      const prompt = buildDraftClarifyResume({ runId, goal: draft.goal, specMarkdown, turns: draft.clarify.turns });
-      // Reserve so a second 「继续」 cannot start a second session.
-      draft.clarify.pending = { triggerId: `${RESERVATION_PREFIX}${randomUUID()}`, sentAt: this.now().toISOString() };
-      delete draft.clarify.sessionId;
-      delete draft.clarify.headlessId;
-      return { changed: true, result: { old, prompt, title: clip(draft.goal.replace(/\s+/g, ' '), 80) } };
-    });
-    await this.closeQuietly(prior.old);
-    await this.startSession(runId, prior.prompt, prior.title);
+    const reservation = this.reserve();
+    let prior: { old: { sessionId?: string; headlessId?: string }; prompt: string; title: string };
+    try {
+      prior = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
+        this.assertNotArchitecting(runId, draft, grill);
+        this.assertStatus(grill, ['grilling', 'spec_ready'], '继续对话');
+        if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
+        if (draft.clarify.sessionId && this.suspending.has(draft.clarify.sessionId)) throw err('busy', '会话正在释放空闲进程，请稍后重试');
+        const old = { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId };
+        const specMarkdown = readTextOrUndefined(grill.specPath) ?? draft.clarify.specCandidate?.markdown;
+        const prompt = buildDraftClarifyResume({ runId, goal: draft.goal, specMarkdown, turns: draft.clarify.turns });
+        // Reserve so a second 「继续」 cannot start a second session.
+        draft.clarify.pending = { triggerId: reservation, sentAt: this.now().toISOString() };
+        delete draft.clarify.sessionId;
+        delete draft.clarify.headlessId;
+        return { changed: true, result: { old, prompt, title: clip(draft.goal.replace(/\s+/g, ' '), 80) } };
+      });
+    } catch (error) {
+      this.inflight.delete(reservation);
+      throw error;
+    }
+    await this.closeOrRemember(runId, prior.old);
+    await this.startSession(runId, prior.prompt, prior.title, reservation);
     return this.view(runId);
   }
 
@@ -846,26 +970,38 @@ export class WorkflowDraftService {
         this.retreatIfStuck(runDir, problems);
       } finally {
         cancelTimer();
-        this.tasks.delete(runId);
       }
       const state = ok ? 'succeeded' : task.timedOut ? 'timed_out' : task.cancelled ? 'cancelled' : 'failed';
       const why = state === 'timed_out'
         ? [`编排超时（${Math.round(timeoutMs / 60_000)} 分钟）`, ...(problems ?? [])]
         : state === 'cancelled' ? ['编排已取消'] : problems;
+      // The task stays registered until its outcome is recorded, so no write
+      // in between mistakes it for a lost one. Recording is tried with the
+      // problems, then without them; if both fail, the next write or read
+      // finds 编排中 with no task and heals it to 编排中断.
+      const record = (problemsToKeep: string[] | undefined) => this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
+        if (draft.architect?.state !== 'running') return { changed: false, result: undefined };
+        const { problems: _old, ...rest } = draft.architect;
+        draft.architect = {
+          ...rest,
+          state,
+          finishedAt: this.now().toISOString(),
+          ...(problemsToKeep && problemsToKeep.length > 0 && !ok ? { problems: problemsToKeep } : {}),
+        };
+        if (ok) this.flowChanged(draft, { nodeBots: true });
+        return { changed: true, result: undefined };
+      });
       try {
-        this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
-          if (draft.architect?.state !== 'running') return { changed: false, result: undefined };
-          draft.architect = {
-            ...draft.architect,
-            state,
-            finishedAt: this.now().toISOString(),
-            ...(why && why.length > 0 && !ok ? { problems: why.map((problem) => clip(problem, 4000)).slice(0, 200) } : {}),
-          };
-          if (ok) this.flowChanged(draft, { nodeBots: true });
-          return { changed: true, result: undefined };
-        });
+        try {
+          record(why?.map((problem) => clip(problem, 4000)).slice(0, 200));
+        } catch (error) {
+          this.log(`[workflow-draft] recording architect outcome for ${runId} failed, retrying without details: ${errorText(error).slice(0, 300)}`);
+          record(ok ? undefined : ['编排失败，详细原因没能记录']);
+        }
       } catch (error) {
-        this.log(`[workflow-draft] recording architect outcome for ${runId} failed: ${errorText(error)}`);
+        this.log(`[workflow-draft] recording architect outcome for ${runId} failed: ${errorText(error).slice(0, 300)}`);
+      } finally {
+        this.tasks.delete(runId);
       }
       this.log(`[workflow-draft] architect ${runId} → ${state}`);
     })();
@@ -887,8 +1023,10 @@ export class WorkflowDraftService {
 
   /** 取消编排. The worker is aborted; hostArchitect retreats to 待编排. */
   async cancelArchitect(runId: string, initiator: WorkflowDraftInitiator): Promise<WorkflowDraftView> {
-    this.mutate(runId, initiator, {}, ({ draft }) => {
+    this.mutate(runId, initiator, {}, ({ draft, healed }) => {
       const task = this.tasks.get(runId);
+      // A lost run was just healed to 编排中断: the cancel has its effect.
+      if (healed) return { changed: true, result: undefined };
       if (!task || draft.architect?.state !== 'running') throw err('state_conflict', '当前没有在编排');
       task.cancelled = true;
       task.controller.abort();
@@ -1069,32 +1207,52 @@ export class WorkflowDraftService {
       delete draft.clarify.headlessId;
       return { changed: true, result: old };
     });
-    await this.closeQuietly(session);
+    await this.closeOrRemember(runId, session);
     return this.view(runId);
   }
 
   /**
    * 删除 (§4.6): an abandoned draft, or one without activity for 30 days.
-   * The run dir goes; the clarify session is closed and its record deleted.
+   * Three steps, each safe to repeat: mark deletedAt (from here no other write
+   * succeeds and the draft is not listed), remove the run dir, close the
+   * clarify sessions. A crash after the mark leaves a marked dir that the
+   * next delete, the boot recovery or the sweep finishes.
    */
   async delete(runId: string, initiator: WorkflowDraftInitiator): Promise<void> {
-    const session = this.mutate(runId, initiator, { allowAbandoned: true }, ({ draft, grill }) => {
-      this.assertNotArchitecting(runId, draft, grill);
-      const last = Math.max(Date.parse(draft.updatedAt), Date.parse(grill.updatedAt));
-      if (!draft.abandonedAt && this.now().getTime() - last < WORKFLOW_DRAFT_STALE_MS) {
-        throw err('draft_not_stale', '只能删除已放弃或 30 天没有动静的草稿');
+    const sessions = this.mutate(runId, initiator, { allowAbandoned: true, allowDeleted: true }, ({ draft, grill }) => {
+      if (!draft.deletedAt) {
+        this.assertNotArchitecting(runId, draft, grill);
+        const last = Math.max(Date.parse(draft.updatedAt), Date.parse(grill.updatedAt));
+        if (!draft.abandonedAt && this.now().getTime() - last < WORKFLOW_DRAFT_STALE_MS) {
+          throw err('draft_not_stale', '只能删除已放弃或 30 天没有动静的草稿');
+        }
+        draft.deletedAt = this.now().toISOString();
       }
-      draft.deletedAt = this.now().toISOString();
-      const old = { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId };
+      const out = draftSessions(draft);
       draft.clarify.state = 'closed';
       delete draft.clarify.pending;
-      return { changed: true, result: old };
+      return { changed: true, result: out };
     });
-    await this.closeQuietly(session);
-    const runDir = this.runDirOf(runId);
-    // Marked deleted under the lock first: from here no write can succeed.
+    await this.finishDelete(runId, this.runDirOf(runId), sessions);
+  }
+
+  /** Steps 2 and 3 of a delete. */
+  private async finishDelete(runId: string, runDir: string, sessions: Array<{ sessionId: string; headlessId?: string }>): Promise<void> {
     if (!existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) rmSync(runDir, { recursive: true, force: true, maxRetries: 3 });
+    for (const session of sessions) await this.closeOrRemember(undefined, session);
     this.log(`[workflow-draft] deleted ${runId}`);
+  }
+
+  /** Marked-deleted drafts of this bot whose dir is still there (a delete
+   *  interrupted after its first step). */
+  private interruptedDeletes(): Array<{ runId: string; runDir: string; sessions: Array<{ sessionId: string; headlessId?: string }> }> {
+    const out: Array<{ runId: string; runDir: string; sessions: Array<{ sessionId: string; headlessId?: string }> }> = [];
+    for (const { runId, runDir } of listWorkflowDraftDirs(this.deps.baseDir)) {
+      const draft = readWorkflowDraft(runDir);
+      if (!draft?.deletedAt || draft.orchestratorAppId !== this.deps.appId || draft.runId !== runId) continue;
+      out.push({ runId, runDir, sessions: draftSessions(draft) });
+    }
+    return out;
   }
 
   // ── reads ──
@@ -1107,7 +1265,9 @@ export class WorkflowDraftService {
     try {
       snapshot = withWorkflowDraftLock(runDir, runId, () => {
         const loaded = this.loadLocked(runId, runDir, undefined, { allowAbandoned: true });
-        if (this.refreshClarifyInPlace(loaded.draft)) this.persist(runDir, loaded.draft);
+        const refreshed = this.refreshClarifyInPlace(loaded.draft);
+        const healed = this.healStaleArchitect(runId, loaded.draft, loaded.grill);
+        if (refreshed || healed) this.persist(runDir, loaded.draft);
         return loaded;
       });
     } catch (error) {
@@ -1236,40 +1396,100 @@ export class WorkflowDraftService {
       }
     }
     if (recovered.length > 0) this.log(`[workflow-draft] interrupted architect → 待编排: ${recovered.join(', ')}`);
+    // Deletes interrupted after their first step are finished now (the
+    // session closes run in the background).
+    for (const entry of this.interruptedDeletes()) {
+      void this.finishDelete(entry.runId, entry.runDir, entry.sessions).catch((error) => {
+        this.log(`[workflow-draft] finishing delete of ${entry.runId} failed: ${errorText(error)}`);
+      });
+    }
     return recovered;
   }
 
   /**
-   * §4.2: close the CLI process of a clarify session that got no message for
-   * 30 minutes (the session record stays; the next message resumes it by its
-   * CLI session id). Returns the drafts suspended.
+   * §4.2: release the CLI process of a clarify session idle for 30 minutes
+   * (since its last message or reply); the session record stays and the next
+   * message resumes it by its CLI session id. Decided under the lock, done
+   * outside it (a send meanwhile is refused as busy), recorded under it
+   * again. A session whose process cannot be released is not retried until
+   * its next message. Also retries failed session closes and finishes
+   * interrupted deletes. Returns the drafts suspended.
    */
   async sweepIdleClarify(): Promise<string[]> {
-    const suspended: string[] = [];
+    const due: Array<{ runId: string; sessionId: string }> = [];
     for (const { runId, runDir } of listWorkflowDraftDirs(this.deps.baseDir)) {
       try {
         withWorkflowDraftLock(runDir, runId, () => {
           const draft = readWorkflowDraft(runDir);
-          if (!draft || draft.deletedAt || draft.abandonedAt || draft.orchestratorAppId !== this.deps.appId) return;
+          if (!draft || draft.deletedAt || draft.orchestratorAppId !== this.deps.appId) return;
+          for (const orphan of draft.orphanSessions ?? []) {
+            if (!this.orphans.has(orphan.sessionId)) this.orphans.set(orphan.sessionId, orphan);
+          }
+          if (draft.abandonedAt) return;
           const refreshed = this.refreshClarifyInPlace(draft);
+          if (refreshed) this.persist(runDir, draft);
           const { clarify } = draft;
-          const due = clarify.state === 'active' && !clarify.pending && !!clarify.sessionId && !!clarify.lastMessageAt
-            && this.now().getTime() - Date.parse(clarify.lastMessageAt) >= DRAFT_CLARIFY_IDLE_MS;
-          // Checked and suspended in one critical section: a message sent in
-          // between would otherwise have its turn killed under it.
-          let ok = false;
-          if (due) {
-            try { ok = this.deps.clarifier.suspend(clarify.sessionId!); } catch { ok = false; }
+          if (clarify.state !== 'active' || clarify.pending || !clarify.sessionId || !clarify.lastMessageAt) return;
+          if (this.suspending.has(clarify.sessionId)) return;
+          if (clarify.suspendRefusedAt && clarify.suspendRefusedAt >= clarify.lastMessageAt) return;
+          if (this.now().getTime() - Date.parse(clarify.lastMessageAt) < DRAFT_CLARIFY_IDLE_MS) return;
+          this.suspending.add(clarify.sessionId);
+          due.push({ runId, sessionId: clarify.sessionId });
+        });
+      } catch { /* next sweep */ }
+    }
+    await this.retryOrphanCloses();
+    const suspended: string[] = [];
+    for (const entry of due) {
+      let ok = false;
+      try {
+        try { ok = await this.deps.clarifier.suspend(entry.sessionId); } catch { ok = false; }
+        this.mutate(entry.runId, undefined, { allowAbandoned: true }, ({ draft }) => {
+          if (draft.clarify.sessionId !== entry.sessionId || draft.clarify.state !== 'active' || draft.clarify.pending) {
+            return { changed: false, result: undefined };
           }
           if (ok) {
             draft.clarify.state = 'suspended';
             draft.clarify.suspendedAt = this.now().toISOString();
-            suspended.push(runId);
+            delete draft.clarify.suspendRefusedAt;
+          } else {
+            draft.clarify.suspendRefusedAt = this.now().toISOString();
           }
-          if (ok || refreshed) this.persist(runDir, draft);
+          return { changed: true, result: undefined };
         });
-      } catch { /* next sweep */ }
+        if (ok) suspended.push(entry.runId);
+        else this.log(`[workflow-draft] clarify session ${entry.sessionId} of ${entry.runId} could not release its process; not retried until its next message`);
+      } catch { /* recorded next sweep */ } finally {
+        this.suspending.delete(entry.sessionId);
+      }
+    }
+    for (const entry of this.interruptedDeletes()) {
+      try { await this.finishDelete(entry.runId, entry.runDir, entry.sessions); } catch { /* next sweep */ }
     }
     return suspended;
+  }
+
+  /** Retry clarify-session closes that failed (abandon / delete / replace). */
+  private async retryOrphanCloses(): Promise<void> {
+    for (const entry of [...this.orphans.values()]) {
+      try {
+        await this.deps.clarifier.close(entry);
+      } catch {
+        continue;
+      }
+      this.orphans.delete(entry.sessionId);
+      for (const { runId, runDir } of listWorkflowDraftDirs(this.deps.baseDir)) {
+        const draft = readWorkflowDraft(runDir);
+        if (!draft?.orphanSessions?.some((item) => item.sessionId === entry.sessionId) || draft.deletedAt) continue;
+        try {
+          this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft: current }) => {
+            const rest = (current.orphanSessions ?? []).filter((item) => item.sessionId !== entry.sessionId);
+            if (rest.length === (current.orphanSessions ?? []).length) return { changed: false, result: undefined };
+            if (rest.length > 0) current.orphanSessions = rest; else delete current.orphanSessions;
+            return { changed: true, result: undefined };
+          });
+        } catch { /* stays listed; closing again is harmless */ }
+      }
+    }
   }
 }

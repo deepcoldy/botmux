@@ -218,6 +218,11 @@ export interface ProductionDraftClarifierDeps {
   lookupTriggerResult: (sessionId: string, triggerId: string) => TriggerResponse;
   sessionStatus: (sessionId: string) => string | undefined;
   suspendWorker: (ds: DaemonSession, reason: string) => boolean;
+  /** tmux / herdr / zellij / zmx: the process can go dormant. */
+  isSuspendable: (ds: DaemonSession) => boolean;
+  /** Not remote, not in transfer, no protected dispatch ownership. */
+  canRetireWorker: (ds: DaemonSession) => boolean;
+  killWorker: (ds: DaemonSession) => void;
   closeSession: (sessionId: string) => Promise<unknown>;
   deleteHeadlessRecord: (headlessId: string) => void;
 }
@@ -273,7 +278,9 @@ export function createProductionDraftClarifier(deps: ProductionDraftClarifierDep
     },
     result(sessionId, triggerId): DraftClarifyResult {
       const response = deps.lookupTriggerResult(sessionId, triggerId);
-      if (response.state === 'completed') return { state: 'completed', content: response.output?.content ?? '' };
+      if (response.state === 'completed') {
+        return { state: 'completed', content: response.output?.content ?? '', ...(response.finishedAt ? { finishedAt: response.finishedAt } : {}) };
+      }
       if (response.state === 'running') return { state: 'running' };
       if (response.state === 'failed') return { state: 'failed', ...(response.error ? { error: response.error } : {}) };
       return { state: 'not_found' };
@@ -282,11 +289,24 @@ export function createProductionDraftClarifier(deps: ProductionDraftClarifierDep
       const ds = findActive(sessionId);
       if (!ds) return true; // nothing live: the goal state already holds
       if (!ds.worker || ds.worker.killed) return true;
-      return deps.suspendWorker(ds, 'workflow_draft_idle');
+      if (deps.isSuspendable(ds)) return deps.suspendWorker(ds, 'workflow_draft_idle');
+      // A pty-like backend cannot go dormant: retire the worker as /cd does
+      // there — the session record stays and the next message cold-starts the
+      // CLI with resume. A remote backend (riff / mojo) is never retired this
+      // way, nor a session in transfer or holding dispatch ownership.
+      if (!deps.canRetireWorker(ds)) return false;
+      ds.hasHistory = true;
+      deps.killWorker(ds);
+      return true;
     },
     async close({ sessionId, headlessId }) {
       if (deps.sessionStatus(sessionId) && deps.sessionStatus(sessionId) !== 'closed') {
-        await deps.closeSession(sessionId);
+        const result = await deps.closeSession(sessionId);
+        // A refused close leaves the session active: report it so the draft
+        // keeps the id and the sweep retries.
+        if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) {
+          throw new Error(`close refused: ${String((result as { error?: unknown }).error ?? 'unknown')}`);
+        }
       }
       if (headlessId) deps.deleteHeadlessRecord(headlessId);
     },
