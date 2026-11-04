@@ -8,7 +8,7 @@
  * runner), timers and the daemon registry.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -96,6 +96,10 @@ describe('draft birth and listing', () => {
     const h = makeService(base, { appId: STEWARD });
     const refused = h.service.create(OWNER, { goal: 'g' });
     await expect(refused).rejects.toMatchObject({ code: 'orchestrator_ineligible', message: '管家 Bot 不能当编排 Bot' });
+    // The refusal is side-effect free: birthRun is never called, so not even a
+    // grill-only dir appears (such a dir is invisible to both lists, so the
+    // list assertions alone would not pin the guard's position).
+    expect(readdirSync(base)).toEqual([]);
     expect(listWorkflowDrafts(base)).toEqual([]);
     expect(h.clarify.sessions.size).toBe(0);
   });
@@ -103,6 +107,7 @@ describe('draft birth and listing', () => {
   it('an orchestrator that cannot run workflow nodes cannot orchestrate', async () => {
     const h = makeService(base, { appId: PI });
     expect(await code(h.service.create(OWNER, { goal: 'g' }))).toBe('orchestrator_ineligible');
+    expect(readdirSync(base)).toEqual([]);
     expect(listWorkflowDrafts(base)).toEqual([]);
   });
 
