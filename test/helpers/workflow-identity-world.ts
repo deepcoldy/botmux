@@ -61,6 +61,8 @@ export function authorizeRun(run: BotRun, opts: {
   identity: V3HandoffIdentityRecord | null;
   selectors?: string[];
   chatBinding?: typeof BINDING;
+  /** Gate-2 `--working-dir` (design §15.4). */
+  nodeWorkingDir?: string;
 }): Map<string, BotSnapshot> {
   const runDir = run.runDir;
   mkdirSync(runDir, { recursive: true });
@@ -83,6 +85,7 @@ export function authorizeRun(run: BotRun, opts: {
     chatBinding: binding,
     authorizedByOpenId: binding.ownerOpenId,
     nodeExecutor: 'bot',
+    ...(opts.nodeWorkingDir ? { nodeWorkingDir: opts.nodeWorkingDir } : {}),
     ...(opts.identity ? { handoffIdentity: opts.identity } : {}),
     artifacts: {
       dag: artifactRef(runDir, 'dag.json'),

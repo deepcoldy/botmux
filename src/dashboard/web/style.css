@@ -35533,6 +35533,11 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfs-detail-head { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .35rem; }
 .wfs-detail .v3r-nodeid { font-size: 14px; }
 .wfs-hint { margin: 0; font-size: 12px; }
+.wfs-revisions {
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: .6rem .75rem; background: var(--surface);
+}
+.wfs-revisions .v3r-revisions { margin-top: 0; }
 .wfs-denied { margin: 48px auto; max-width: 420px; text-align: center; color: var(--muted); font-size: 14px; line-height: 1.7; }
 
 /* Dedicated-group naming keeps mode, model and feedback readable at narrow widths. */

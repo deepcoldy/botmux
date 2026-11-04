@@ -588,8 +588,9 @@ function NodePanel(props: {
   );
 }
 
-/** Revision history (design §13.7): time, who, summary, confirmed or not. */
-function RevisionHistory(props: { revision: NonNullable<RunView['revision']> }): React.JSX.Element {
+/** Revision history (design §13.7): time, who, summary, confirmed or not.
+ *  Also the workflow sidebar's version panel (§11.3). */
+export function RevisionHistory(props: { revision: NonNullable<RunView['revision']> }): React.JSX.Element {
   const { revision } = props;
   return (
     <div className="v3r-revisions">

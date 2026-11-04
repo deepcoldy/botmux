@@ -807,7 +807,7 @@ import {
 import { recordWaitCardMessage } from './workflows/v3/human-gate.js';
 import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
 import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
-import { buildV3ProgressCard, v3ProgressWorkflowEntry } from './im/lark/v3-progress-card.js';
+import { buildV3ProgressCard, v3ProgressWorkflowEntry, v3RunWorkflowEntry } from './im/lark/v3-progress-card.js';
 import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
 import {
   workflowSidebarMembershipRoute,
@@ -6810,6 +6810,12 @@ function daemonWorkflowSidebarEntry(mainLarkAppId: string, runId: string) {
   return resolveWorkflowEntryLink({ mainLarkAppId, runId, brand: getBotBrand(selfDaemonLarkAppId ?? mainLarkAppId) });
 }
 
+/** The same entry for the main-topic cards built from a run id alone (flow
+ *  revision confirmation, rerun grant): only bot-executed runs get one. */
+function daemonRunWorkflowEntry(runId: string) {
+  return v3RunWorkflowEntry(join(v3DefaultBaseDir(), runId), runId, daemonWorkflowSidebarEntry);
+}
+
 // Dependencies passed to card-handler
 // v3 run-level progress is a best-effort IM projection. journal.ndjson remains
 // the only execution truth; the manager persists only Lark delivery state.
@@ -6948,6 +6954,11 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
   prepareTurnIdentity: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   attachmentsDir: getAttachmentsDir,
   loadRun: workflowLoadBotRun,
+  // The executing bot's directory configuration as this daemon runs it now
+  // (design §15.4); a bot this daemon does not host has none to offer.
+  botWorkingDirConfig: (appId) => {
+    try { return getBot(appId).config; } catch { return undefined; }
+  },
   drive: (runId) => v3GateRunner.driveDetached(runId),
   botName: (appId) => v3BotDisplayNameResolver()(appId),
   workflowEntry: daemonWorkflowSidebarEntry,
@@ -7716,6 +7727,7 @@ const cardDeps: CardHandlerDeps = {
   },
   v3RevisionDeps: {
     baseDir: v3DefaultBaseDir(),
+    workflowEntry: daemonRunWorkflowEntry,
     canResolve: (binding, operatorOpenId) =>
       binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
     driveRun: (runId) => {
@@ -8240,7 +8252,11 @@ workflowDaemonMutationRoute('edit', async (reply, params, body, identity) => {
           runId,
           block,
           post: async () => {
-            const card = buildV3RerunGrantCard({ runId, nodeId: block.nodeId, tier: block.tier, epoch: block.epoch });
+            const workflowEntry = daemonRunWorkflowEntry(runId);
+            const card = buildV3RerunGrantCard({
+              runId, nodeId: block.nodeId, tier: block.tier, epoch: block.epoch,
+              ...(workflowEntry ? { workflowEntry } : {}),
+            });
             try {
               return binding.rootMessageId
                 ? await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId)
@@ -8324,7 +8340,8 @@ async function postV3RevisionCard(
   view: V3RevisionCardView,
   runId: string,
 ): Promise<void> {
-  const card = buildV3RevisionCard({ runId, view });
+  const workflowEntry = daemonRunWorkflowEntry(runId);
+  const card = buildV3RevisionCard({ runId, view, ...(workflowEntry ? { workflowEntry } : {}) });
   const messageId = binding.rootMessageId
     ? await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId)
     : await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
@@ -8342,6 +8359,7 @@ function v3RevisionCardSync(): ReturnType<typeof createV3RevisionCardSync> {
     runDir: (runId) => join(v3DefaultBaseDir(), runId),
     updateMessage: (larkAppId, messageId, card) => updateMessage(larkAppId, messageId, card),
     warn: (message) => logger.warn(message),
+    workflowEntry: daemonRunWorkflowEntry,
   });
 }
 
@@ -28622,6 +28640,18 @@ async function handleThreadReplyAdmitted(
     markIngressAdmitted(ctx);
     return;
   }
+  // Design §15.4: a run approved with --working-dir runs its node only inside
+  // this bot's configured directory range as it stands now. Out of range, the
+  // node blocks with the reason — never a silent fall back to the default dir.
+  const workflowAdmission = workflowHandoff
+    ? workflowNodeDaemon.admitInbound(workflowHandoff, parsed.messageId, larkAppId)
+    : undefined;
+  if (workflowHandoff && workflowAdmission && !workflowAdmission.start) {
+    logger.info(`[${larkAppId}] workflow handoff ${parsed.messageId} not started (run ${workflowHandoff.workflow.runId}): ${workflowAdmission.reason}`);
+    markIngressAdmitted(ctx);
+    return;
+  }
+  const workflowWorkingDir = workflowAdmission?.start ? workflowAdmission.workingDir : undefined;
   if (ds && workflowHandoff) {
     ds.session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff, parsed.messageId);
     sessionStore.updateSession(ds.session);
@@ -29267,13 +29297,17 @@ async function handleThreadReplyAdmitted(
 
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
-      scope,
-      anchor,
-      chatId: autoCreateChatId,
-      chatType: autoCreateChatType,
-      larkAppId,
-    });
+    // A workflow node of a run approved with --working-dir starts exactly in
+    // that (just range-checked) directory instead (design §15.4).
+    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = workflowWorkingDir !== undefined
+      ? { pinnedWorkingDir: workflowWorkingDir, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false }
+      : await resolvePinnedWorkingDir({
+        scope,
+        anchor,
+        chatId: autoCreateChatId,
+        chatType: autoCreateChatType,
+        larkAppId,
+      });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     // Now we know the message will spawn or pend a real session — resolve
     // sender (may await contact API budget) since every downstream branch
@@ -29397,6 +29431,8 @@ async function handleThreadReplyAdmitted(
         ? `oncall-bound chat ${autoCreateChatId}`
         : inheritedFrom
         ? `inherited from peer session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
+        : workflowWorkingDir !== undefined
+        ? `workflow run ${workflowHandoff!.workflow.runId} working dir`
         : `bot defaultWorkingDir`;
       logger.info(`[${tag(newDs)}] ${reason} → workingDir=${pinnedWorkingDir}, skipped repo select`);
       return;

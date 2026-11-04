@@ -7,7 +7,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,6 +17,7 @@ import { CHAT, MAIN, SECRET, handoffWorld, nonceOf } from './helpers/workflow-ha
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkflowNodeSessionMarker } from '../src/types.js';
 import { readDispatchRegistryLoose, revokeWorkflowHandoff } from '../src/core/workflow-handoff-binding.js';
+import { authorizeRun } from './helpers/workflow-identity-world.js';
 
 afterEach(() => cleanupBotRuns());
 
@@ -55,6 +56,7 @@ function daemon(self: string, dataDir: string, baseDir: string, run: BotRun, ove
     prepareTurnIdentity: async () => {},
     attachmentsDir: (appId, messageId) => join(dataDir, 'attachments', appId, messageId),
     loadRun: () => ({ dag: run.dag, nodeExecutor: 'bot', chatId: CHAT, title: 't' }),
+    botWorkingDirConfig: () => ({}),
     drive: () => {},
     botName: (appId) => appId,
     warn: () => {},
@@ -329,5 +331,112 @@ describe('workflow node daemon wiring — second review pass', () => {
     expect(await main.wiring.eventRoute({ kind: 'wake', nonce: nonceOf(attempt), sessionId: 'sess-a' }))
       .toMatchObject({ status: 200 });
     expect(drives).toEqual(['wd2-wake-route']);
+  });
+});
+
+describe('workflow node daemon wiring — the run\'s working dir (design §15.4)', () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  /** `repos/project` is the Gate-2 directory; `lab` is somewhere else. */
+  function dirs() {
+    const root = trackTempDir(mkdtempSync(join(tmpdir(), 'wd-dir-')));
+    const repos = join(root, 'repos');
+    const project = join(repos, 'project');
+    const lab = join(root, 'lab');
+    mkdirSync(project, { recursive: true });
+    mkdirSync(lab, { recursive: true });
+    return { repos, project, lab };
+  }
+
+  /** A real authorized bot run (run.json as Gate-2 writes it), handed off. */
+  async function handedOffPinned(runId: string, nodeWorkingDir: string | undefined) {
+    const run = new BotRun(reportDag(runId));
+    authorizeRun(run, { identity: null, ...(nodeWorkingDir ? { nodeWorkingDir } : {}) });
+    const world = handoffWorld();
+    await run.drive(world.executor, { opts: { chatBinding: BINDING } });
+    const attempt = run.openAttempt('write');
+    const binding = { nonce: nonceOf(attempt), sourceLarkAppId: MAIN, workflow: { runId } } as never;
+    return { run, world, attempt, binding };
+  }
+
+  it('the executing bot\'s daemon decides from run.json and its configuration now: in range → that directory, out of range → refused', async () => {
+    const d = dirs();
+    const { run, world, attempt, binding } = await handedOffPinned('wdd-decide', d.project);
+    let config: Record<string, unknown> = { workingDirs: [d.repos] };
+    const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => config });
+    const admit = () => target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
+    expect(admit()).toEqual({ start: true, workingDir: d.project });
+    // Narrowed after approval: the current configuration decides.
+    config = { workingDirs: [d.lab] };
+    const refused = admit();
+    expect(refused).toMatchObject({ start: false });
+    expect((refused as { reason: string }).reason).toContain(d.project);
+    config = {};
+    expect(admit()).toMatchObject({ start: false });
+  });
+
+  it('a run approved without --working-dir keeps the bot\'s own default; an unreadable approval record is never guessed', async () => {
+    const { run, world, attempt, binding } = await handedOffPinned('wdd-default', undefined);
+    const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => ({}) });
+    expect(target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toEqual({ start: true });
+    const elsewhere = daemon('cli_a', world.dataDir, trackTempDir(mkdtempSync(join(tmpdir(), 'wdd-empty-'))), run);
+    expect(elsewhere.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a')).toMatchObject({ start: false });
+    await settle();
+    expect(target.posted).toEqual([]);
+  });
+
+  it('a refusal reaches the main bot, which blocks the node with the reason (no session involved)', async () => {
+    const d = dirs();
+    const { run, world, attempt, binding } = await handedOffPinned('wdd-refuse', d.project);
+    const target = daemon('cli_a', world.dataDir, run.base, run, { botWorkingDirConfig: () => ({ workingDirs: [d.lab] }) });
+    const decision = target.wiring.admitInbound(binding, attempt.handoffMessageId!, 'cli_a');
+    if (decision.start) throw new Error('expected a refusal');
+    await settle();
+    expect(target.posted).toEqual([{
+      port: 4100,
+      path: '/api/workflow/handoff-event',
+      body: { kind: 'refused', nonce: nonceOf(attempt), dispatchRoot: attempt.handoffMessageId, reason: decision.reason },
+    }]);
+    const drives: string[] = [];
+    const main = daemon(MAIN, world.dataDir, run.base, run, { drive: (runId) => { drives.push(runId); } });
+    expect(await main.wiring.eventRoute(target.posted[0]!.body)).toMatchObject({ status: 200, body: { outcome: 'blocked' } });
+    expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({
+      attemptId: attempt.attemptId, errorCode: 'WORKING_DIR_REFUSED', message: decision.reason,
+    })]);
+    expect(drives).toEqual(['wdd-refuse']);
+  });
+
+  it('a refusal never closes an attempt a session has already accepted', async () => {
+    const { run, world, attempt } = await handedOff('wdd-accepted');
+    run.accept(attempt.attemptId, 'sess-a');
+    const main = daemon(MAIN, world.dataDir, run.base, run);
+    expect(await main.wiring.eventRoute({ kind: 'refused', nonce: nonceOf(attempt), reason: 'x' }))
+      .toMatchObject({ status: 409, body: { error: 'session-mismatch' } });
+    expect(run.of('nodeBlocked')).toEqual([]);
+  });
+
+  it('the main bot\'s own node: out of its range nothing is started and the node blocks; in range the session starts there', async () => {
+    const d = dirs();
+    for (const [config, expectStarted] of [[{ defaultWorkingDir: d.lab }, false], [{ defaultWorkingDir: d.repos }, true]] as const) {
+      const run = new BotRun(reportDag(`wdd-self-${expectStarted}`, { bot: undefined }));
+      authorizeRun(run, { identity: null, selectors: [''], nodeWorkingDir: d.project });
+      const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdd-self-data-')));
+      const delivered: Array<{ workingDir?: string }> = [];
+      const main = daemon(MAIN, dataDir, run.base, run, {
+        botWorkingDirConfig: () => config,
+        sendCard: async () => 'om_node_card',
+        replyCard: async () => 'om_handoff_card',
+        deliverSelfTurn: async (input) => { delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) }); return { sessionId: 'self-session' }; },
+      });
+      await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+      await settle();
+      if (expectStarted) {
+        expect(delivered).toEqual([{ workingDir: d.project }]);
+        expect(run.of('nodeBlocked')).toEqual([]);
+      } else {
+        expect(delivered).toEqual([]);
+        expect(run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED' })]);
+      }
+    }
   });
 });

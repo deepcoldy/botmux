@@ -32,6 +32,9 @@ export const V3_EXTERNAL_ERROR_CODES = {
   HANDOFF_NOT_ACCEPTED: 'HANDOFF_NOT_ACCEPTED',
   HANDOFF_UNCERTAIN: 'HANDOFF_UNCERTAIN',
   BOT_REPORTED_BLOCKED: 'BOT_REPORTED_BLOCKED',
+  /** The executing bot's daemon would not start the node session in the
+   *  run's Gate-2 working dir: not inside its configured range (design §15.4). */
+  WORKING_DIR_REFUSED: 'WORKING_DIR_REFUSED',
   NODE_TIMEOUT: 'NODE_TIMEOUT',
 } as const;
 

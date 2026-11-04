@@ -138,8 +138,10 @@ export interface V3BotHandoffExecutorDeps {
     sessionId?: string;
     reason: V3ExternalStopReason;
   }): Promise<void>;
-  /** §6.5: open the main bot's own node session; idempotent per handoff. */
-  startSelfTurn(input: V3SelfTurnRequest): Promise<{ sessionId: string }>;
+  /** §6.5: open the main bot's own node session; idempotent per handoff.
+   *  `refused`: nothing was started and the node was blocked with the reason
+   *  (the run's working dir is not in the main bot's range, §15.4). */
+  startSelfTurn(input: V3SelfTurnRequest): Promise<{ sessionId: string } | { refused: true }>;
   handoffIdentity?: V3HandoffIdentityDeps;
   /** §11: this run's「工作流 ›」sidebar entry (the main bot is this daemon's
    *  bot); undefined = no Dashboard address, the cards carry no entry. */

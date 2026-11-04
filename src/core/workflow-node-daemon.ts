@@ -13,7 +13,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { V3_RUN_ENVELOPE_FILE } from '../workflows/v3/run-envelope.js';
+import { V3_RUN_ENVELOPE_FILE, frozenNodeWorkingDir, readRunEnvelope } from '../workflows/v3/run-envelope.js';
 import type { V3Dag } from '../workflows/v3/dag.js';
 import type { V3ExternalNodeExecutor } from '../workflows/v3/external-executor.js';
 import { v3AcceptanceProbeUnknownSince } from '../workflows/v3/runtime.js';
@@ -63,6 +63,18 @@ import { createV3BotHandoffExecutor, readV3HandoffTopics, type V3SelfTurnRequest
 import { createV3NodeCardSync } from '../im/lark/v3-node-card-sync.js';
 import { buildV3NodeReportCard } from '../im/lark/v3-node-card.js';
 import type { WorkflowSidebarEntryLink } from '../im/lark/workflow-sidebar-entry.js';
+import { checkBotWorkingDir, describeBotWorkingDirRefusal, type BotWorkingDirConfig } from './working-dir-range.js';
+
+/** Where a node session for one handoff starts on the executing bot
+ *  (design §15.4). */
+type WorkflowNodeWorkingDir =
+  /** No Gate-2 directory: the bot's own default resolution, as for any
+   *  message it receives. */
+  | { kind: 'default' }
+  /** Start the session in exactly this absolute directory. */
+  | { kind: 'pinned'; dir: string }
+  /** Do not start (or continue) the node here; the node blocks with `reason`. */
+  | { kind: 'refused'; reason: string };
 
 export interface WorkflowNodeDaemonDeps {
   selfLarkAppId(): string;
@@ -116,9 +128,15 @@ export interface WorkflowNodeDaemonDeps {
     /** Present only when the handoff carries the initiator's delegation:
      *  publish the turn's tool identity before the CLI gets the turn. */
     prepareTurnIdentity?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+    /** The run's Gate-2 directory, already checked: start a new node
+     *  session there (an existing one keeps its directory). */
+    workingDir?: string;
   }): Promise<{ sessionId: string }>;
   attachmentsDir(larkAppId: string, messageId: string): string;
   loadRun(runDir: string): { dag: V3Dag; nodeExecutor?: 'bot'; chatId?: string; title: string } | undefined;
+  /** A bot's directory configuration as this daemon runs it right now
+   *  (§15.4: checked when the node session starts, not as approved). */
+  botWorkingDirConfig(larkAppId: string): BotWorkingDirConfig | undefined;
   drive(runId: string): void;
   botName(larkAppId: string): string;
   /** §11: a run's「工作流 ›」sidebar entry, keyed by its main bot; undefined
@@ -162,6 +180,15 @@ export interface WorkflowNodeDaemon {
   /** The handoff was stopped (revoked) — checked again right before a turn
    *  for it starts. */
   isRevoked(nonce: string): boolean;
+  /** Gate for an inbound handoff on the executing bot (design §15.4): the
+   *  run's Gate-2 directory checked against `executingLarkAppId`'s configured
+   *  range now. `start: false` = refused (the main bot is told, so the node
+   *  blocks with `reason`; nothing may be registered or started for it);
+   *  otherwise start / continue the node, a NEW session in `workingDir` when
+   *  the run pinned one. */
+  admitInbound(binding: WorkflowHandoffBindingPayload, handoffMessageId: string, executingLarkAppId: string):
+    | { start: false; reason: string }
+    | { start: true; workingDir?: string };
   /** Copy the node's upstream products into this turn's attachment dir. */
   stageInbound(binding: WorkflowHandoffBindingPayload, messageId: string): LarkAttachment[];
   /** A session just registered a verified handoff: the node is accepted
@@ -219,6 +246,42 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
 
   function isRevoked(nonce: string): boolean {
     return isWorkflowHandoffRevoked(readDispatchRegistryLoose(deps.dataDir()), nonce, deps.bindingSecret());
+  }
+
+  function nodeWorkingDir(runDir: string | undefined, runId: string, executingLarkAppId: string): WorkflowNodeWorkingDir {
+    // The directory lives in run.json itself (the Gate-2 commit); only that
+    // file is read here. Without it, whether a directory was chosen is
+    // unknown: never start the node somewhere else on a guess.
+    const read = runDir ? readRunEnvelope(runDir, runId) : undefined;
+    if (read?.kind !== 'ok') return { kind: 'refused', reason: '读不到这个工作流 run 的批准记录，无法确认节点该在哪个目录执行' };
+    const workingDir = frozenNodeWorkingDir(read.envelope);
+    if (workingDir === undefined) return { kind: 'default' };
+    const botName = deps.botName(executingLarkAppId);
+    const config = deps.botWorkingDirConfig(executingLarkAppId);
+    if (!config) return { kind: 'refused', reason: `指定的工作目录 ${workingDir}：读不到 ${botName} 的配置，无法核对目录范围` };
+    const verdict = checkBotWorkingDir(config, workingDir);
+    if (verdict.ok) return { kind: 'pinned', dir: verdict.path };
+    return {
+      kind: 'refused',
+      reason: `指定的工作目录 ${verdict.path}：${describeBotWorkingDirRefusal(verdict)}。`
+        + `以 ${botName} 现在的配置为准（批准后可能改过）；把这个目录加进它的默认工作目录或仓库目录后重试，或改派。`,
+    };
+  }
+
+  /** Tell the main bot this handoff's node session was not started. One
+   *  retry: a missed notice only degrades to the acceptance deadline. */
+  function refuse(binding: { nonce: string; sourceLarkAppId: string }, handoffMessageId: string, reason: string): Promise<void> {
+    const event: WorkflowHandoffEvent = { kind: 'refused', nonce: binding.nonce, dispatchRoot: handoffMessageId, reason };
+    const attempt = (retry: boolean): Promise<void> => forward(binding.sourceLarkAppId, event).then(async (result) => {
+      if (result.status < 400 || result.status === 409) return;
+      if (!retry) {
+        deps.warn(`[workflow] refused notice for ${binding.nonce} failed: ${String(result.body.error ?? result.status)}`);
+        return;
+      }
+      await new Promise((resolve) => { const timer = setTimeout(resolve, deps.noticeRetryMs ?? 3_000); timer.unref?.(); });
+      await attempt(false);
+    }).catch((err) => deps.warn(`[workflow] refused notice for ${binding.nonce} failed: ${err instanceof Error ? err.message : String(err)}`));
+    return attempt(true);
   }
 
   /** The target bot's own check, in-process for the main bot itself, else
@@ -319,6 +382,14 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
     workflowEntry: (runId) => deps.workflowEntry?.(deps.selfLarkAppId(), runId),
     startSelfTurn: async (input: V3SelfTurnRequest) => {
       const runDir = input.runDir;
+      // §15.4 for the main bot's own nodes too: its current configuration
+      // decides, and a refusal blocks the node (nothing is started).
+      const dir = nodeWorkingDir(runDir, input.marker.runId, deps.selfLarkAppId());
+      if (dir.kind === 'refused') {
+        deps.warn(`[workflow] node ${input.marker.nodeId} of ${input.marker.runId} not started: ${dir.reason}`);
+        await refuse({ nonce: input.marker.nonce, sourceLarkAppId: deps.selfLarkAppId() }, input.handoffMessageId, dir.reason);
+        return { refused: true as const };
+      }
       const inputs = readWorkflowAttemptInputs(runDir, input.marker.attemptId) ?? input.inputs;
       const staged = stageWorkflowNodeInputs({
         runDir,
@@ -338,6 +409,7 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
         attachments: staged.attachments,
         sessionTitle: input.sessionTitle,
         ...(input.identityDelegated ? { prepareTurnIdentity: deps.prepareTurnIdentity } : {}),
+        ...(dir.kind === 'pinned' ? { workingDir: dir.dir } : {}),
       });
       // The session registered the handoff: record acceptance now rather than
       // at the acceptance deadline's probe (which would find the same marker).
@@ -494,6 +566,14 @@ export function createWorkflowNodeDaemon(deps: WorkflowNodeDaemonDeps): Workflow
       },
     }),
     isRevoked,
+    admitInbound: (binding, handoffMessageId, executingLarkAppId) => {
+      const dir = nodeWorkingDir(runDirOf(binding.workflow.runId), binding.workflow.runId, executingLarkAppId);
+      if (dir.kind === 'refused') {
+        void refuse(binding, handoffMessageId, dir.reason);
+        return { start: false, reason: dir.reason };
+      }
+      return dir.kind === 'pinned' ? { start: true, workingDir: dir.dir } : { start: true };
+    },
     stageInbound: (binding, messageId) => {
       const runDir = runDirOf(binding.workflow.runId);
       const inputs = runDir ? readWorkflowAttemptInputs(runDir, binding.workflow.attemptId) : undefined;
