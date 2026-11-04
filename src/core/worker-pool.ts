@@ -14335,6 +14335,9 @@ export function freezeSessionSandboxDecision(
 interface PendingProtectedHttpEgressFork {
   pluginId: string;
   policyDigest: string;
+  abortCleanupPending?: boolean;
+  abortCleanupError?: unknown;
+  retryAbortCleanup?: () => boolean;
   waiters: Array<{
     resumeOrTurnId: ForkResumeOrTurnId;
     opts: ForkWorkerOptions;
@@ -14417,6 +14420,69 @@ function reportProtectedHttpEgressForkFailure(
   opts.onAdmission?.('rejected');
 }
 
+function reportProtectedHttpEgressAbortCleanupFailure(
+  ds: DaemonSession,
+  bot: ReturnType<typeof getBot>,
+  waiters: PendingProtectedHttpEgressFork['waiters'],
+  error: unknown,
+  opts: { rejectAdmissions?: boolean } = {},
+): void {
+  const rawReason = error instanceof Error ? error.message : String(error);
+  const reason = `Protected egress follower cleanup persistence failed: ${rawReason}`;
+  logger.error(
+    `[${tag(ds)}] Protected HTTP egress follower cleanup persistence failed; `
+    + `admission remains blocked: ${rawReason}`,
+  );
+  if (canForkRegisteredSession(ds)) {
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_fork_error',
+      message: reason,
+    });
+    for (const waiter of waiters) {
+      const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(waiter.resumeOrTurnId);
+      const blockedTurnId = fallbackTurnId(ds, turnId);
+      const message = startupFailureNotice(
+        ds,
+        sessionCliDisplayName(ds, bot.config),
+        reason,
+        botLocale(bot.config),
+      );
+      if (waiter.opts.onAdmissionBlocked) {
+        waiter.opts.onAdmissionBlocked({
+          content: message,
+          ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
+        });
+      } else {
+        const meetingDriven = !!ds.session.vcMeetingReceiver
+          && (dispatchAttempt !== undefined
+            || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
+        if (meetingDriven || isSilentScheduledTurn(ds, turnId)) {
+          logger.info(
+            `[${tag(ds)}] Managed/silent protected egress cleanup persistence failure kept out `
+            + `of auxiliary Lark UI: ${rawReason}`,
+          );
+        } else {
+          const cb = requireCallbacks();
+          void cb.sessionReply(
+            sessionAnchorId(ds),
+            message,
+            'text',
+            ds.larkAppId,
+            blockedTurnId,
+            { sourceSessionId: ds.session.sessionId },
+          ).catch(replyError => logger.error(
+            `[${tag(ds)}] Failed to report protected egress cleanup persistence failure: `
+            + `${replyError instanceof Error ? replyError.message : String(replyError)}`,
+          ));
+        }
+      }
+      if (opts.rejectAdmissions) waiter.opts.onAdmission?.('rejected');
+    }
+  } else if (opts.rejectAdmissions) {
+    for (const waiter of waiters) waiter.opts.onAdmission?.('rejected');
+  }
+}
+
 function queueBehindPendingProtectedHttpEgressFork(
   pending: PendingProtectedHttpEgressFork,
   ds: DaemonSession,
@@ -14495,6 +14561,21 @@ export function forkWorker(
 
   const bot = getBot(ds.larkAppId);
   const globalConfig = readGlobalConfig();
+  let pending = pendingProtectedHttpEgressForks.get(ds.session.sessionId);
+  if (pending?.abortCleanupPending) {
+    const cleanupRetried = pending.retryAbortCleanup?.() === true;
+    if (!cleanupRetried) {
+      reportProtectedHttpEgressAbortCleanupFailure(
+        ds,
+        bot,
+        [{ resumeOrTurnId, opts }],
+        pending.abortCleanupError ?? new Error('protected egress cleanup retry unavailable'),
+        { rejectAdmissions: true },
+      );
+      return true;
+    }
+    pending = undefined;
+  }
   const collected = collectProtectedHttpEgressPolicies(
     resolveEffectivePluginIds(bot.config, globalConfig),
   );
@@ -14504,7 +14585,6 @@ export function forkWorker(
   }
 
   const collectedPolicy = collected[0]!;
-  const pending = pendingProtectedHttpEgressForks.get(ds.session.sessionId);
   if (pending) {
     if (pending.pluginId !== collectedPolicy.pluginId
       || pending.policyDigest !== collectedPolicy.policyDigest) {
@@ -14530,29 +14610,43 @@ export function forkWorker(
       pendingProtectedHttpEgressForks.delete(ds.session.sessionId);
     }
   };
-  const abortActivePending = () => {
-    if (activePendingSettled) return;
-    activePendingSettled = true;
+  const abortActivePending = (): boolean => {
+    if (activePendingSettled) return true;
     const queuedTailIds = new Set(activePending.waiters.flatMap(waiter =>
       waiter.queuedActivationTailId ? [waiter.queuedActivationTailId] : []));
     if (queuedTailIds.size > 0) {
+      const priorTail = ds.session.queuedActivationTail;
       const retainedTail = (ds.session.queuedActivationTail ?? [])
         .filter(entry => !queuedTailIds.has(entry.id));
       ds.session.queuedActivationTail = retainedTail.length > 0 ? retainedTail : undefined;
       try {
         sessionStore.updateSession(ds.session);
       } catch (error) {
-        logger.error(
-          `[${tag(ds)}] Failed to persist protected egress follower cleanup after pre-ready exit: `
-          + `${error instanceof Error ? error.message : String(error)}`,
-        );
+        ds.session.queuedActivationTail = priorTail;
+        const firstFailure = activePending.abortCleanupPending !== true;
+        activePending.abortCleanupPending = true;
+        activePending.abortCleanupError = error;
+        if (firstFailure) {
+          reportProtectedHttpEgressAbortCleanupFailure(ds, bot, activePending.waiters, error);
+        } else {
+          logger.error(
+            `[${tag(ds)}] Protected HTTP egress follower cleanup persistence retry failed; `
+            + `admission remains blocked: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return false;
       }
     }
+    activePendingSettled = true;
+    activePending.abortCleanupPending = undefined;
+    activePending.abortCleanupError = undefined;
+    clearActivePending();
     for (const waiter of activePending.waiters) {
       waiter.opts.onAdmission?.('rejected');
     }
-    clearActivePending();
+    return true;
   };
+  activePending.retryAbortCleanup = abortActivePending;
   void resolveProtectedHttpEgressTargets(collectedPolicy.policy).then(
     frozenAddresses => {
       const policy: ProtectedHttpEgressWorkerPolicy = {

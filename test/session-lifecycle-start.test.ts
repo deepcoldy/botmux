@@ -624,6 +624,78 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     retryWorker.emit('message', { type: 'worker_ipc_ready' });
   });
 
+  it('keeps a failed pre-ready follower cleanup pending until a later fork persists it', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishFirstLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock
+      .mockReturnValueOnce(new Promise(resolve => {
+        finishFirstLookup = resolve;
+      }))
+      .mockResolvedValueOnce([['10.20.30.41']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const followerBlocked = vi.fn();
+    const durabilityEvents: string[] = [];
+
+    expect(forkWorker(ds, 'opening protected turn', { turnId: 'om_egress_persist_opening' })).toBe(true);
+    expect(forkWorker(ds, 'queued protected follower', {
+      turnId: 'om_egress_persist_follower',
+    }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    expect(followerAdmissions).toEqual(['deferred']);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+
+    finishFirstLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    let cleanupWriteAttempts = 0;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.queuedActivationTail !== undefined) return;
+      cleanupWriteAttempts += 1;
+      if (cleanupWriteAttempts === 1) throw new Error('cleanup disk full');
+      durabilityEvents.push('cleanup persisted');
+    });
+    const firstWorker = forkMock.mock.results[0]!.value;
+    firstWorker.emit('exit', 1, null);
+
+    expect(cleanupWriteAttempts).toBe(1);
+    expect(followerAdmissions).toEqual(['deferred']);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ id: followerTailId, turnId: 'om_egress_persist_follower' }),
+    ]);
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('cleanup persistence failed'),
+      turnId: 'om_egress_persist_follower',
+    }));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(forkMock).toHaveBeenCalledTimes(1);
+
+    expect(forkWorker(ds, 'retry after cleanup failure', {
+      turnId: 'om_egress_persist_retry',
+    })).toBe(true);
+    await vi.waitFor(() => expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    expect(cleanupWriteAttempts).toBeGreaterThanOrEqual(2);
+    expect(followerAdmissions).toEqual(['deferred', 'rejected']);
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+
+    const retryWorker = forkMock.mock.results[1]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+  });
+
   it('reports a post-freeze preparation exception as preparation failure rather than DNS failure', async () => {
     collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
       pluginId: 'fixture-plugin',
