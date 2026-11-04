@@ -26,6 +26,12 @@ import {
   type V3RevisionActionValue,
 } from './v3-revision-card.js';
 import { V3_DAG_SEGMENT_RE } from '../../workflows/v3/dag.js';
+import type { WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
+
+function entryOf(deps: V3RevisionCardHandlerDeps, runId: string): { workflowEntry?: WorkflowSidebarEntryLink } {
+  const entry = deps.workflowEntry?.(runId);
+  return entry ? { workflowEntry: entry } : {};
+}
 
 export function isV3RevisionAction(action: unknown): boolean {
   return action === V3_REVISION_APPROVE_ACTION ||
@@ -42,6 +48,9 @@ export interface V3RevisionCardHandlerDeps {
   canResolve?: (binding: RunChatBinding | undefined, operatorOpenId: string | undefined) => boolean;
   /** Freeze the cards of gates the approved revision voided (best effort). */
   onVoidedGates?: (runId: string, gates: V3VoidedGate[]) => void;
+  /** §11.1: the run's「工作流 ›」entry (bot-executed runs only); the cards a
+   *  click renders carry it exactly as the posted card does. */
+  workflowEntry?: (runId: string) => WorkflowSidebarEntryLink | undefined;
   /** Test seam. */
   decide?: typeof decideV3RevisionProposal;
 }
@@ -98,10 +107,12 @@ async function handleRerunGrant(
     case 'stale':
       return JSON.parse(buildV3RerunGrantCard({
         runId: value.runId, nodeId: value.nodeId, tier: value.tier, epoch: value.epoch, resolution: { kind: 'void', detail: outcome.detail },
+        ...entryOf(deps, value.runId),
       }));
     case 'granted':
       return JSON.parse(buildV3RerunGrantCard({
         runId: value.runId, nodeId: value.nodeId, tier: outcome.tier, epoch: value.epoch, resolution: { kind: 'granted', by: operatorOpenId },
+        ...entryOf(deps, value.runId),
       }));
   }
 }
@@ -149,6 +160,7 @@ async function handleDecision(
           resolution: outcome.status === 'approved' ? { kind: 'approved' }
             : outcome.status === 'rejected' ? { kind: 'rejected' }
             : { kind: 'void' },
+          ...entryOf(deps, value.runId),
         }));
       }
       return { toast: { type: 'info', content: '这条修改已经处理过了' } };
@@ -156,18 +168,18 @@ async function handleDecision(
       if (outcome.voidedGates.length > 0) deps.onVoidedGates?.(value.runId, outcome.voidedGates);
       deps.driveRun(value.runId);
       return outcome.view
-        ? JSON.parse(buildV3RevisionCard({ runId: value.runId, view: outcome.view, resolution: { kind: 'approved', by: operatorOpenId } }))
+        ? JSON.parse(buildV3RevisionCard({ runId: value.runId, view: outcome.view, resolution: { kind: 'approved', by: operatorOpenId }, ...entryOf(deps, value.runId) }))
         : { toast: { type: 'success', content: `第 ${outcome.revision} 版已生效` } };
     case 'rejected':
       // Held nodes are released: drive so they dispatch on the old flow.
       deps.driveRun(value.runId);
       return outcome.view
-        ? JSON.parse(buildV3RevisionCard({ runId: value.runId, view: outcome.view, resolution: { kind: 'rejected', by: operatorOpenId } }))
+        ? JSON.parse(buildV3RevisionCard({ runId: value.runId, view: outcome.view, resolution: { kind: 'rejected', by: operatorOpenId }, ...entryOf(deps, value.runId) }))
         : { toast: { type: 'info', content: '已拒绝' } };
     case 'stale':
       deps.driveRun(value.runId);
       return outcome.view
-        ? JSON.parse(buildV3RevisionCard({ runId: value.runId, view: outcome.view, resolution: { kind: 'void', detail: outcome.detail } }))
+        ? JSON.parse(buildV3RevisionCard({ runId: value.runId, view: outcome.view, resolution: { kind: 'void', detail: outcome.detail }, ...entryOf(deps, value.runId) }))
         : { toast: { type: 'warning', content: `流程已变化，本次确认作废：${outcome.detail}` } };
   }
 }

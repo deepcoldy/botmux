@@ -22,6 +22,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
+import { workflowConcurrencyConfig, type WorkflowConcurrencyConfig } from '../../global-config.js';
+import { resolveV3Concurrency } from './concurrency-config.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { isHostNode, isLoopNode, type V3Dag } from './dag.js';
@@ -612,7 +614,7 @@ export function loadV3RunDagForRecovery(runDir: string): V3Dag | undefined {
  * failing its digest check makes the run unloadable (fail closed).
  */
 export function loadV3BotExecutedRun(runDir: string):
-  | { dag: V3Dag; nodeExecutor: 'bot'; chatId?: string; title: string }
+  | { dag: V3Dag; authorizedDag: V3Dag; nodeExecutor: 'bot'; chatId?: string; title: string }
   | undefined {
   try {
     const read = readRunEnvelope(runDir);
@@ -622,6 +624,7 @@ export function loadV3BotExecutedRun(runDir: string):
     const effective = loadEffectiveV3Dag(runDir, loaded.dag, existsSync(journalPath) ? readJournal(journalPath) : []);
     return {
       dag: effective.dag,
+      authorizedDag: loaded.dag,
       nodeExecutor: 'bot',
       ...(loaded.envelope.chatBinding?.chatId ? { chatId: loaded.envelope.chatBinding.chatId } : {}),
       title: loaded.spec?.title?.trim() || basename(runDir),
@@ -868,7 +871,11 @@ export interface V3DaemonRunDeps {
   postRevisitGrantCard?: (binding: RunChatBinding, info: V3RevisitBudgetBlockedInfo, runId: string) => Promise<void>;
   /** Report a terminal run (final card / message).  Optional. */
   onTerminal?: (runId: string, outcome: V3TerminalOutcome, binding?: RunChatBinding) => Promise<void>;
+  /** Explicit global cap; wins over `workflow.concurrency.global`. */
   maxParallel?: number;
+  /** Host concurrency config source (default: `workflow.concurrency` in
+   *  `~/.botmux/config.json`, read on every drive). Tests inject. */
+  concurrencyConfig?: () => WorkflowConcurrencyConfig | undefined;
   /** Low-latency interrupt delivery. Durable intent always lives in journal. */
   cancelSignal?: AbortSignal;
   /**
@@ -973,7 +980,10 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     ...(context.botSnapshots ? { frozenBotSnapshots: context.botSnapshots } : {}),
     ...(context.authorizedArtifacts ? { authorizedArtifacts: true } : {}),
     ...(context.resolvedWorkflowData ? { resolvedWorkflowData: context.resolvedWorkflowData } : {}),
-    ...(deps.maxParallel ? { globalConcurrency: deps.maxParallel } : {}),
+    ...resolveV3Concurrency(
+      (deps.concurrencyConfig ?? workflowConcurrencyConfig)(),
+      deps.maxParallel ? { global: deps.maxParallel } : {},
+    ),
     ...(deps.cancelSignal ? { cancelSignal: deps.cancelSignal } : {}),
     // Real BOTMUX_* identity env for worker CLI children (see RunNodeRequest.chatBinding).
     ...(binding ? { chatBinding: binding } : {}),
@@ -1280,7 +1290,14 @@ function answerPreview(s: string): string {
 export function requestV3Retry(
   baseDir: string,
   runId: string,
-  input: { nodeId?: string; expectedAttemptId?: string; answer?: V3RetryAnswerInput } = {},
+  input: {
+    nodeId?: string;
+    expectedAttemptId?: string;
+    answer?: V3RetryAnswerInput;
+    /** Who decided the retry and why (`v3ActionRecord`); absent = the
+     *  event keeps its original shape (card clicks, human turns). */
+    record?: { by?: string; auto?: { reason: string }; note?: string };
+  } = {},
 ): V3RetryOutcome {
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
@@ -1402,6 +1419,9 @@ export function requestV3Retry(
     previousErrorCode: info.errorCode,
     ...(resetGate ? { resetGate: true } : {}),
     ...(answer ? { answer } : {}),
+    ...(input.record?.by ? { by: input.record.by } : {}),
+    ...(input.record?.auto ? { auto: input.record.auto } : {}),
+    ...(input.record?.note ? { note: input.record.note } : {}),
   });
   return { kind: 'requested', nodeId, previousAttemptId, nextAttemptId };
 }

@@ -58,6 +58,7 @@ import type { StoredEvent, V3ErrorClass, V3LoopRef } from './event-contract.js';
 import {
   foldV3ExternalAttempts,
   type V3ExternalAttempt,
+  type V3ExternalAttemptClosure,
 } from './external-attempt-ledger.js';
 import {
   V3_EXTERNAL_CALL_TIMEOUT_MS,
@@ -90,7 +91,9 @@ export type V3ExternalAttemptRejection =
   /** Closed for another recorded reason (blocked / failed / run boundary). */
   | 'closed'
   /** The caller's session is not the one that accepted the handoff. */
-  | 'session-mismatch';
+  | 'session-mismatch'
+  /** The node was handed to a person; the attempt is being closed. */
+  | 'handed-to-human';
 
 export type V3CurrentExternalAttempt =
   | { ok: true; attempt: V3ExternalAttempt; snap: V3RunSnapshot }
@@ -146,6 +149,13 @@ export function classifyExternalAttempt(
     expect.sessionId !== attempt.sessionId
   ) {
     return { ok: false, reason: 'session-mismatch', attempt };
+  }
+  // Handed to a person and being closed (§13.6): the decision is durable, so
+  // nothing the bot sends for this attempt counts any more. Engine-internal
+  // checks (no `expect.sessionId`) still see it open — the close itself, or
+  // the reconciliation finishing it, needs exactly that.
+  if (attempt.handedToHuman && expect.sessionId !== undefined) {
+    return { ok: false, reason: 'handed-to-human', attempt };
   }
   return { ok: true, attempt, snap };
 }
@@ -381,10 +391,19 @@ export function recordExternalStalled(
 const BOT_REPORT_MESSAGE_MAX_CHARS = 2000;
 
 /** The target bot said it cannot complete the node (`--status blocked|failed`).
- *  Both settle as `nodeBlocked(BOT_REPORTED_BLOCKED)` with the bot's reason. */
+ *  Both settle as `nodeBlocked(BOT_REPORTED_BLOCKED)` with the bot's reason.
+ *  `WORKING_DIR_REFUSED`: its daemon refused to start the node session in the
+ *  run's working dir (§15.4) — sent without a session, so an attempt some
+ *  session has already accepted is never closed by it (session-mismatch). */
 export function reportExternalBlocked(
   runDir: string,
-  input: { attemptId: string; instanceId?: string; sessionId?: string; reason: string },
+  input: {
+    attemptId: string;
+    instanceId?: string;
+    sessionId?: string;
+    reason: string;
+    errorCode?: typeof V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED | typeof V3_EXTERNAL_ERROR_CODES.WORKING_DIR_REFUSED;
+  },
 ): V3ExternalRecordOutcome {
   const message = input.reason.trim().slice(0, BOT_REPORT_MESSAGE_MAX_CHARS) || 'bot reported blocked';
   return withJournalMutationSync(journalPathOf(runDir), ({ events, append }) => {
@@ -396,7 +415,7 @@ export function reportExternalBlocked(
       ...(current.attempt.instanceId ? { instanceId: current.attempt.instanceId } : {}),
       attemptId: current.attempt.attemptId,
       errorClass: 'workerError',
-      errorCode: V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED,
+      errorCode: input.errorCode ?? V3_EXTERNAL_ERROR_CODES.BOT_REPORTED_BLOCKED,
       message,
     }, { durable: true });
     return { ok: true };
@@ -1230,6 +1249,166 @@ export async function reassignNode(
       ...(locked.kind === 'open' ? { closedAttemptId: locked.attempt.attemptId } : {}),
       ...(locked.kind === 'blocked' ? { nextAttemptId: locked.nextAttemptId } : {}),
       ...(stopError !== undefined ? { stopError } : {}),
+    };
+  });
+}
+
+// ─── Handing a node to a human (design §13.6) ─────────────────────────────
+
+/** Longest `--reason` kept on a hand-over (also the IPC bound). */
+export const V3_HAND_TO_HUMAN_REASON_MAX = 500;
+
+export type V3HandToHumanOutcome =
+  | {
+      kind: 'handed';
+      nodeId: string;
+      /** The attempt it was handed over on. */
+      attemptId: string;
+      /** True when an open attempt was stopped and closed by this hand-over;
+       *  false when the node was already blocked (recorded only). */
+      closedOpenAttempt: boolean;
+      /** The attempt was closed some other way while its turn was being
+       *  stopped (a reassignment, a cancel, a timeout): that close stands;
+       *  the hand-over stays on record. */
+      settledMeanwhile?: V3ExternalAttemptClosure['kind'];
+      stopError?: unknown;
+    }
+  | {
+      kind: 'rejected';
+      reason:
+        | 'missing'
+        | 'not-bot-run'
+        | 'run-not-running'
+        | 'unknown-node'
+        /** Never dispatched: nothing to hand over (change its definition). */
+        | 'never-dispatched'
+        /** Not running and not blocked (done, waiting, skipped, …). */
+        | 'not-handable'
+        /** The attempt settled while it was being stopped. */
+        | 'stale-attempt'
+        | 'revision-pending';
+    };
+
+type HandPlan =
+  | { kind: 'open'; attempt: V3ExternalAttempt }
+  | { kind: 'blocked'; attemptId: string; instanceId?: string }
+  | { kind: 'rejected'; reason: Extract<V3HandToHumanOutcome, { kind: 'rejected' }>['reason'] };
+
+function planHandToHuman(events: readonly StoredEvent[], nodeId: string, inFlow: (nodeId: string) => boolean): HandPlan {
+  const snap = materialize([...events]);
+  if (snap.runStatus !== 'running' && snap.runStatus !== 'blocked') return { kind: 'rejected', reason: 'run-not-running' };
+  const state = snap.nodes.get(nodeId);
+  const key = state?.effectiveInstanceId ?? nodeId;
+  const latest = latestAttemptIdFor([...events], key);
+  if (!state || !latest) return { kind: 'rejected', reason: state || inFlow(nodeId) ? 'never-dispatched' : 'unknown-node' };
+  if (state.status === 'running') {
+    const attempt = foldV3ExternalAttempts(events).get(snap.attempts.get(key) ?? '');
+    // Only a bot-executed goal attempt can be stopped and handed over here.
+    if (!attempt || attempt.closed) return { kind: 'rejected', reason: 'not-handable' };
+    return { kind: 'open', attempt };
+  }
+  if (state.status === 'blocked') {
+    return { kind: 'blocked', attemptId: latest, ...(state.effectiveInstanceId ? { instanceId: state.effectiveInstanceId } : {}) };
+  }
+  return { kind: 'rejected', reason: 'not-handable' };
+}
+
+/**
+ * `botmux workflow ask-human`: hand a node to a human, with the reason shown
+ * as is (design §13.6). Only a node with a running or a latest attempt:
+ *
+ * - running: three steps. (1) In one journal lock — re-checking that this is
+ *   still the current open attempt and that no pending proposal holds the
+ *   node — `nodeHandedToHuman` is recorded: from then on the decision is
+ *   durable and a submission for the attempt is refused
+ *   (`handed-to-human`). (2) The bot's turn is stopped (the timeout close
+ *   path). (3) `nodeBlocked{ workerError, retry, HANDED_TO_HUMAN }` closes
+ *   the attempt. A crash between (1) and (3) is finished by the runtime's
+ *   reconciliation, which writes the same block on its next drive. A
+ *   submission that lands BEFORE (1) wins (the hand-over is refused as
+ *   `stale-attempt`); anything that closes the attempt between (1) and (3) —
+ *   a reassignment, a cancel, the reconciliation itself — stands, and (3)
+ *   writes nothing.
+ * - blocked: its attempt is already stopped and closed; only the record is
+ *   written, the block it has (and its recovery) stays.
+ *
+ * Either way the existing blocked card handles it from there (retry,
+ * reassign, cancel); no extra deadline.
+ */
+export async function handNodeToHuman(
+  runDir: string,
+  input: { nodeId: string; reason: string; by: string; turnId?: string },
+  ctx: Pick<V3ReassignContext, 'executor' | 'nodeExecutor' | 'dag'> = {},
+): Promise<V3HandToHumanOutcome> {
+  const journalPath = journalPathOf(runDir);
+  if (!existsSync(journalPath)) return { kind: 'rejected', reason: 'missing' };
+  const before = readJournal(journalPath);
+  if (!isBotExecutedRun(before, ctx.nodeExecutor)) return { kind: 'rejected', reason: 'not-bot-run' };
+  const reason = input.reason.trim().slice(0, V3_HAND_TO_HUMAN_REASON_MAX);
+  // Only to tell "not started yet" from "no such node" in the refusal.
+  const inFlow = (nodeId: string): boolean => {
+    try {
+      return dagFor(runDir, ctx, before).nodes.some((node) => node.id === nodeId);
+    } catch {
+      return false;
+    }
+  };
+  // (1) The decision, durably, before anything is stopped — planned on the
+  // journal as it is inside the lock (no earlier read to go stale).
+  const recorded = withJournalMutationSync(journalPath, ({ events, append }):
+    | { kind: 'open'; attempt: V3ExternalAttempt }
+    | Extract<V3HandToHumanOutcome, { kind: 'handed' | 'rejected' }> => {
+    const locked = planHandToHuman(events, input.nodeId, inFlow);
+    if (locked.kind === 'rejected') return locked;
+    if (v3PendingProposalHolds(events, input.nodeId)) return { kind: 'rejected', reason: 'revision-pending' };
+    const attemptId = locked.kind === 'open' ? locked.attempt.attemptId : locked.attemptId;
+    const instanceId = locked.kind === 'open' ? locked.attempt.instanceId : locked.instanceId;
+    append({
+      type: 'nodeHandedToHuman',
+      nodeId: input.nodeId,
+      ...(instanceId ? { instanceId } : {}),
+      attemptId,
+      reason,
+      by: input.by,
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+    }, { durable: true });
+    return locked.kind === 'open'
+      ? { kind: 'open', attempt: locked.attempt }
+      : { kind: 'handed', nodeId: input.nodeId, attemptId, closedOpenAttempt: false };
+  });
+  if (recorded.kind !== 'open') return recorded;
+
+  // (2) Stop the bot's turn (best effort; the journal close is what counts).
+  const attempt = recorded.attempt;
+  const stopped = await stopExternalAttempt(ctx.executor, basename(runDir), attempt, 'handedToHuman');
+
+  // (3) Close the attempt — unless something else closed it meanwhile.
+  return withJournalMutationSync(journalPath, ({ events, append }): V3HandToHumanOutcome => {
+    const latest = foldV3ExternalAttempts(events).get(attempt.attemptId);
+    const closedHere = !!latest && !latest.closed && classifyExternalAttempt(events, attempt.attemptId).ok;
+    if (closedHere) {
+      append({
+        type: 'nodeBlocked',
+        nodeId: input.nodeId,
+        ...(attempt.instanceId ? { instanceId: attempt.instanceId } : {}),
+        attemptId: attempt.attemptId,
+        errorClass: 'workerError',
+        errorCode: V3_EXTERNAL_ERROR_CODES.HANDED_TO_HUMAN,
+        message: reason,
+        recovery: 'retry',
+      }, { durable: true });
+    }
+    const closure = closedHere ? undefined : latest?.closed;
+    return {
+      kind: 'handed',
+      nodeId: input.nodeId,
+      attemptId: attempt.attemptId,
+      // Closed as a hand-over by this call or by the runtime's reconciliation.
+      closedOpenAttempt: closedHere || (closure?.kind === 'blocked' && closure.errorCode === V3_EXTERNAL_ERROR_CODES.HANDED_TO_HUMAN),
+      ...(!closedHere && closure && !(closure.kind === 'blocked' && closure.errorCode === V3_EXTERNAL_ERROR_CODES.HANDED_TO_HUMAN)
+        ? { settledMeanwhile: closure.kind }
+        : {}),
+      ...(!stopped.ok ? { stopError: stopped.error } : {}),
     };
   });
 }

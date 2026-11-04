@@ -34,6 +34,9 @@ import {
   V3_NODE_HEADING,
   V3_REVISION_ROLE_LABEL,
   V3_REVISION_STATE_LABEL,
+  V3_INTERVENTION_LABEL,
+  V3_INTERVENTION_ROLE_LABEL,
+  V3_CHECKPOINT_LABEL,
 } from './v3-model.js';
 import { nodeTerminalSignature, renderNodeTerminal } from './v3-terminal.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
@@ -561,6 +564,11 @@ function NodePanel(props: {
         ) : null}
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
         <NodeExecution node={node} generatedAt={props.view?.generatedAt} />
+        {node.checkpoint ? <p className="v3r-checkpoint">{V3_CHECKPOINT_LABEL[node.checkpoint]}</p> : null}
+        {node.waitingOnCheckpoint?.length ? (
+          <p className="v3r-checkpoint">等检查点 {node.waitingOnCheckpoint.join('、')} 由主 Bot 看完结果后再开始</p>
+        ) : null}
+        <NodeInterventions node={node} />
         {node.depends.length ? (
           <p className="v3r-deps">
             <span>依赖</span>
@@ -588,8 +596,9 @@ function NodePanel(props: {
   );
 }
 
-/** Revision history (design §13.7): time, who, summary, confirmed or not. */
-function RevisionHistory(props: { revision: NonNullable<RunView['revision']> }): React.JSX.Element {
+/** Revision history (design §13.7): time, who, summary, confirmed or not.
+ *  Also the workflow sidebar's version panel (§11.3). */
+export function RevisionHistory(props: { revision: NonNullable<RunView['revision']> }): React.JSX.Element {
   const { revision } = props;
   return (
     <div className="v3r-revisions">
@@ -661,6 +670,30 @@ export function NodeExecution(props: { node: RunNodeView; generatedAt: number | 
           })}
         </ol>
       ) : null}
+    </div>
+  );
+}
+
+/** Every automatic handling by the main bot and every hand-over to a
+ *  person, with the reason as given (design §13.6). */
+export function NodeInterventions(props: { node: RunNodeView }): React.JSX.Element | null {
+  const items = props.node.interventions ?? [];
+  if (items.length === 0) return null;
+  return (
+    <div className="v3r-interventions">
+      <p className="v3r-interventions-title">自动处理与交给人</p>
+      <ol className="v3r-interventions-list">
+        {items.map((item, index) => (
+          <li key={`${item.at}-${index}`} className={`v3r-intervention kind-${item.kind}`}>
+            <span className="t">{formatClock(item.at)}</span>
+            <span className="k">{V3_INTERVENTION_LABEL[item.kind]}</span>
+            {item.kind === 'handedToHuman' && item.by !== 'mainBot' ? (
+              <span className="b">（{V3_INTERVENTION_ROLE_LABEL[item.by]}）</span>
+            ) : null}
+            {item.reason ? <span className="r">{item.reason}</span> : null}
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }

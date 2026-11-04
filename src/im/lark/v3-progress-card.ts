@@ -11,6 +11,7 @@
 import { config } from '../../config.js';
 import { buildV3RunDetailUrl, buildV3TerminalUrl } from '../../core/dashboard-url.js';
 import type { V3ProgressView } from '../../workflows/v3/progress-projection.js';
+import { readRunEnvelope } from '../../workflows/v3/run-envelope.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
 import { buildWorkflowSidebarEntryV1Button, type WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
@@ -43,6 +44,21 @@ export function v3ProgressWorkflowEntry(
 ): WorkflowSidebarEntryLink | undefined {
   if (envelope.nodeExecutor !== 'bot' || !envelope.chatBinding?.larkAppId) return undefined;
   return entryFor(envelope.chatBinding.larkAppId, envelope.runId);
+}
+
+/**
+ * The same entry for the other main-topic cards of a run known only by its
+ * directory — the flow-revision confirmation and rerun-grant cards (§11.1):
+ * read from its run.json, so again only a run pinned to `nodeExecutor: "bot"`
+ * gets one. Unreadable run.json → no entry (the card keeps its old shape).
+ */
+export function v3RunWorkflowEntry(
+  runDir: string,
+  runId: string,
+  entryFor: (mainLarkAppId: string, runId: string) => WorkflowSidebarEntryLink | undefined,
+): WorkflowSidebarEntryLink | undefined {
+  const read = readRunEnvelope(runDir, runId);
+  return read.kind === 'ok' ? v3ProgressWorkflowEntry(read.envelope, entryFor) : undefined;
 }
 
 const MAX_INLINE_IDS = 5;

@@ -9,12 +9,13 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { botmuxCliInvocation, buildRelayHostEnv } from '../adapters/backend/sandbox.js';
 import { quotedAttachments } from './remote-runner-session-tool.js';
 import { isStandaloneBinary } from '../core/self-spawn.js';
+import { parseRiffUploadIndex } from './riff-upload-placeholder.js';
+import { parseSendInvocation, validateHostSendInvocation } from '../cli/send-invocation.js';
 
 export const RIFF_HOST_TOOLS_ROUTE = '/api/riff-host-tools';
 export const RIFF_HOST_BINDING_ENV = 'BOTMUX_RIFF_HOST_BINDING';
 export const RIFF_HOST_MAX_BYTES = 48 * 1024 * 1024;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
-const UPLOAD_PREFIX = 'riff-upload:';
 const RECEIPT_LIMIT = 1000;
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60_000;
 let cliSha256: string | undefined;
@@ -115,22 +116,32 @@ export function parseRiffHostRequest(raw: unknown): RiffHostRequest {
   }
   const used = new Set<number>();
   for (const i of paths) {
-    const index = Number(r.argv[i]!.slice(UPLOAD_PREFIX.length));
-    if (!r.argv[i]!.startsWith(UPLOAD_PREFIX) || !Number.isSafeInteger(index) || index < 0 || !r.files?.[index]) throw new Error('riff_host_upload_missing');
+    const index = parseRiffUploadIndex(r.argv[i]!);
+    if (index === undefined || !r.files?.[index]) throw new Error('riff_host_upload_missing');
     used.add(index);
   }
   if (used.size !== (r.files?.length ?? 0)) throw new Error('riff_host_upload_unreferenced');
   return { operationId: r.operationId, argv: r.argv, stdin: r.stdin, files: r.files };
 }
 
+function validateRiffHostSendRequest(request: RiffHostRequest): string | null {
+  if (request.argv[0] !== 'send') return null;
+  const invocation = parseSendInvocation(request.argv.slice(1));
+  const validated = validateHostSendInvocation(invocation, { uploads: request.files ?? [] });
+  return validated.ok ? null : validated.message;
+}
+
 export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHostContext): Promise<RiffHostResult> {
   parseRiffHostRequest(request);
+  const sendError = validateRiffHostSendRequest(request);
+  if (sendError) throw new Error(sendError);
   if (!ctx.isCurrent()) throw new Error('riff_host_turn_stale');
   const dir = mkdtempSync(join(tmpdir(), 'botmux-riff-tool-'));
   try {
     const argv = [...request.argv];
     for (const i of riffHostFileArguments(argv)) {
-      const index = Number(argv[i]!.slice(UPLOAD_PREFIX.length));
+      const index = parseRiffUploadIndex(argv[i]!);
+      if (index === undefined) throw new Error('riff_host_upload_missing');
       const file = request.files![index]!;
       const path = join(dir, `${index}-${basename(file.name)}`);
       writeFileSync(path, Buffer.from(file.dataBase64, 'base64'), { mode: 0o600 });
@@ -263,6 +274,8 @@ export class RiffHostTools {
         let length = 0; const chunks: Buffer[] = [];
         for await (const chunk of req) { length += chunk.length; if (length > RIFF_HOST_MAX_BYTES) throw new Error('riff_host_request_too_large'); chunks.push(chunk); }
         request = parseRiffHostRequest(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        const sendError = validateRiffHostSendRequest(request);
+        if (sendError) { json(400, { error: sendError }); return; }
         req.setTimeout(0);
         operationId = request.operationId;
       } else if (req.method === 'GET') {

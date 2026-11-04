@@ -770,7 +770,7 @@ export class SkillFeedbackStore {
   }
 
   rescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): boolean {
-    return this.db.prepare(`UPDATE feedback_outbox SET status=?,next_attempt_at=?,last_error=?,last_http_status=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(input.permanent ? 'failed' : 'pending', input.nextAttemptAt, input.error.slice(0, 500), input.httpStatus ?? null, outboxId, claimToken).changes === 1;
+    return this.db.prepare(`UPDATE feedback_outbox SET status=?,next_attempt_at=?,last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE ? END,last_http_status=?,claim_token=NULL,claimed_at=NULL WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(input.permanent ? 'failed' : 'pending', input.nextAttemptAt, input.error.slice(0, 500), input.httpStatus ?? null, outboxId, claimToken).changes === 1;
   }
   tryRescheduleFeedbackOutbox(outboxId: string, claimToken: string, input: { now: number; nextAttemptAt: number; error: string; httpStatus?: number; permanent?: boolean }): { done: true; changed: boolean } | { done: false; busy: true } {
     return this.withNonblockingBusy(
@@ -780,7 +780,7 @@ export class SkillFeedbackStore {
   }
 
   resetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): number {
-    return Number(this.db.prepare(`UPDATE feedback_outbox SET status='pending',claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=?`).run(now - staleAfterMs).changes);
+    return Number(this.db.prepare(`UPDATE feedback_outbox SET status='pending',last_error=CASE WHEN last_error LIKE 'webhook_outcome_unknown:%' THEN last_error ELSE 'webhook_outcome_unknown:' || COALESCE(claim_token,outbox_id) END,claim_token=NULL,claimed_at=NULL WHERE status='inflight' AND claimed_at<=?`).run(now - staleAfterMs).changes);
   }
   tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): { done: true; changed: number } | { done: false; busy: true } {
     return this.withNonblockingBusy(
@@ -1051,28 +1051,12 @@ export class SkillFeedbackStore {
   }
 }
 
-const stores = new Map<string, Promise<SkillFeedbackStore>>();
-
-export function getSkillFeedbackStore(dataDir: string): Promise<SkillFeedbackStore> {
-  let store = stores.get(dataDir);
-  if (!store) {
-    // Evict on rejection so a transient first-open failure (disk full, a
-    // concurrent cold-start lock that outlasted retries, corruption later
-    // repaired) is retried on the next call instead of poisoning the cache and
-    // silently disabling all feedback persistence for the rest of the process.
-    store = SkillFeedbackStore.open(dataDir).catch(error => {
-      if (stores.get(dataDir) === store) stores.delete(dataDir);
-      throw error;
-    });
-    stores.set(dataDir, store);
-  }
-  return store;
+export async function getSkillFeedbackStore(dataDir: string): Promise<import('./feedback-storage-types.js').FeedbackStore> {
+  const { getFeedbackStorage } = await import('./feedback-storage.js');
+  return (await getFeedbackStorage(dataDir)).store;
 }
 
 export async function __testOnly_closeSkillFeedbackStores(): Promise<void> {
-  const pending = [...stores.values()];
-  stores.clear();
-  for (const store of pending) {
-    try { (await store).close(); } catch { /* test cleanup only */ }
-  }
+  const { closeAllFeedbackStorage } = await import('./feedback-storage.js');
+  await closeAllFeedbackStorage();
 }

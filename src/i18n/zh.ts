@@ -3,6 +3,8 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'feedback.storage.choose': '反馈存储：SQLite [默认] / PostgreSQL (sqlite/postgresql)：',
+  'feedback.storage.configPath': 'PostgreSQL 配置 JSON 路径（仅凭据引用，不填明文密码）：',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
   'cmd.effort.task_not_submitted': '附带任务未投递：推理强度修改未确认、会话已变化或输入通道不可用。任务已保留在原消息，请重试本条任务。任务：{task}',
   'cmd.effort.cli_next_turn': '当前会话的推理强度已设为 {effort}，从下一轮生效；正在执行的这一轮保持原强度。',
@@ -657,6 +659,7 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_platform_consent': 'botmux: 你已在中心化平台授权过 {tool}（{provider}），但还没允许本机所在的团队使用。请在平台凭据页为该团队开启后重试：',
   'trigger_user_auth.denied_platform_retry': '完成后直接让我重试刚才的操作即可，不用再发任何命令。不授权 = 这一步不会执行（也不会用机器人或别人的身份代跑）。',
   'trigger_user_auth.denied_platform_unavailable': 'botmux: 中心化平台暂时不可达，拿不到你的 {tool}（{provider}）授权，命令未执行。请停止自动重试和重复要求用户登录，稍后再试；已有授权会保留。',
+  'trigger_user_auth.denied_platform_unavailable_retryable': 'botmux: 中心化平台暂时不可达，拿不到你的 {tool}（{provider}）授权，命令未执行。botmux 会在本轮之后的调用里自动重新获取，不用让用户重新登录；不要连续反复重试，隔十几秒再试一次即可。已有授权会保留。',
   'trigger_user_auth.denied_platform_unbound': 'botmux: 本机尚未绑定中心化平台，而本 bot 要求 {tool} 凭据只能来自平台，命令未执行。请管理员在宿主终端执行 botmux bind，或把 triggerUserAuth.credentialSource 改为 auto / local。',
   'trigger_user_auth.denied_platform_not_teammate': 'botmux: 中心化平台拒绝签发 {tool}（{provider}）授权：你与本机所有者不在同一个团队。命令未执行，也不会用别人的身份代跑。',
   'trigger_user_auth.denied_platform_forbidden': 'botmux: 中心化平台拒绝了本机的 {tool} 授权请求（{detail}），命令未执行。请管理员检查本机的平台绑定状态。',

@@ -1,5 +1,7 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'feedback.storage.choose': 'Feedback storage: SQLite [default] / PostgreSQL (sqlite/postgresql): ',
+  'feedback.storage.configPath': 'PostgreSQL config JSON path (credential reference only, no plaintext password): ',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [task] — Change Codex reasoning effort; a task may follow on the same or subsequent lines and is submitted after confirmation. CLI affects future turns; App active-turn updates require step_model_switching (off by default; levels depend on the model)',
   'cmd.effort.task_not_submitted': 'The attached task was not submitted: the effort change was unconfirmed, the session changed, or input is unavailable. The task remains in the original message; retry the task. Task: {task}',
   'cmd.effort.cli_next_turn': 'This session will use {effort} starting with the next turn; the running turn keeps its original effort.',
@@ -660,6 +662,7 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_platform_consent': 'botmux: you have authorized {tool} ({provider}) on the central platform, but not for the team this machine belongs to. Enable that team on the platform credentials page, then retry:',
   'trigger_user_auth.denied_platform_retry': 'Then just ask me to retry — no command to type. Not authorizing means this step will not run (nor as the bot or anyone else).',
   'trigger_user_auth.denied_platform_unavailable': 'botmux: the central platform is unreachable, so your {tool} ({provider}) authorization could not be obtained. Command not run. Stop automatic retries and repeated login requests; retry later. Existing authorization is retained.',
+  'trigger_user_auth.denied_platform_unavailable_retryable': 'botmux: the central platform is unreachable, so your {tool} ({provider}) authorization could not be obtained. Command not run. botmux fetches it again on later calls in this turn, so do not ask the user to log in again; do not retry in a tight loop, try once more after ten seconds or so. Existing authorization is retained.',
   'trigger_user_auth.denied_platform_unbound': 'botmux: this machine is not bound to the central platform, but this bot requires {tool} credentials from the platform only. Command not run. Ask the operator to run botmux bind on the host, or set triggerUserAuth.credentialSource to auto / local.',
   'trigger_user_auth.denied_platform_not_teammate': 'botmux: the central platform refused to issue your {tool} ({provider}) authorization: you and this machine\'s owner share no team. Command not run, and nobody else\'s identity is used instead.',
   'trigger_user_auth.denied_platform_forbidden': 'botmux: the central platform refused this machine\'s {tool} grant request ({detail}). Command not run. Ask the operator to check this machine\'s platform binding.',

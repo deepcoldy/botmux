@@ -11,7 +11,7 @@ import {
   type WorkflowDaemonIpcTarget,
 } from './daemon-ipc-auth.js';
 
-export type WorkflowDaemonMutation = 'start' | 'cancel' | 'retry' | 'grant' | 'edit';
+export type WorkflowDaemonMutation = 'start' | 'cancel' | 'retry' | 'grant' | 'edit' | 'ask-human';
 
 export interface WorkflowDaemonMutationResponse {
   ok: boolean;

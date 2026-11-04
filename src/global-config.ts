@@ -154,6 +154,26 @@ export interface WorkflowFeatureGlobalConfig {
    *  bot runs as itself). Frozen into `run.json` at authorization; only `true`
    *  is ever stored. */
   handoffIdentity?: true;
+  /** v3 runtime concurrency caps, per run (design 2026-06-01 Q5/R3:
+   *  "conservative defaults, configurable"). Every field is optional; a
+   *  missing field keeps the code default (V3_DEFAULT_CONCURRENCY). Read
+   *  when a run is driven, so a change applies to the next drive. Invalid
+   *  values are dropped on read, so a later Dashboard write of the workflow
+   *  block does not keep them. */
+  concurrency?: WorkflowConcurrencyConfig;
+}
+
+export interface WorkflowConcurrencyConfig {
+  /** Max nodes (goal, gate and host) in flight for one run. */
+  global?: number;
+  /** Max nodes in flight on the same bot (Lark app). */
+  perBot?: number;
+  /** Max nodes in flight on the same CLI type, for any CLI not listed in
+   *  `perCliById`. */
+  perCli?: number;
+  /** Per-CLI override keyed by cliId (e.g. `{ "claude-code": 8 }`) — an
+   *  API-billed CLI can run wide while a subscription CLI stays at 2. */
+  perCliById?: Record<string, number>;
 }
 
 export type WorkflowNodeExecutorMode = 'ephemeral' | 'bot';
@@ -882,6 +902,39 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   if (v.nodeExecutor === 'bot') out.nodeExecutor = 'bot';
   if (v.handoffIdentity === true) out.handoffIdentity = true;
+  const concurrency = readWorkflowConcurrency(v.concurrency);
+  if (concurrency) out.concurrency = concurrency;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Upper bound for any single concurrency cap: a typo like 1000 must not fork
+ *  a thousand CLI workers. */
+export const WORKFLOW_CONCURRENCY_MAX = 64;
+
+function readConcurrencyCap(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 && raw <= WORKFLOW_CONCURRENCY_MAX
+    ? raw
+    : undefined;
+}
+
+function readWorkflowConcurrency(raw: unknown): WorkflowConcurrencyConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: WorkflowConcurrencyConfig = {};
+  const global = readConcurrencyCap(v.global);
+  if (global !== undefined) out.global = global;
+  const perBot = readConcurrencyCap(v.perBot);
+  if (perBot !== undefined) out.perBot = perBot;
+  const perCli = readConcurrencyCap(v.perCli);
+  if (perCli !== undefined) out.perCli = perCli;
+  if (v.perCliById && typeof v.perCliById === 'object' && !Array.isArray(v.perCliById)) {
+    const byId: Record<string, number> = {};
+    for (const [cliId, cap] of Object.entries(v.perCliById as Record<string, unknown>)) {
+      const n = readConcurrencyCap(cap);
+      if (cliId && n !== undefined) byId[cliId] = n;
+    }
+    if (Object.keys(byId).length > 0) out.perCliById = byId;
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1157,6 +1210,12 @@ export function isCrossPrincipalInterruptionEnabled(
  *  is frozen into `run.json`. */
 export function workflowNodeExecutorMode(): WorkflowNodeExecutorMode {
   return readGlobalConfig().workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral';
+}
+
+/** Configured v3 concurrency caps (`workflow.concurrency`), or undefined when
+ *  none are set — callers then keep the runtime's code defaults. */
+export function workflowConcurrencyConfig(): WorkflowConcurrencyConfig | undefined {
+  return readGlobalConfig().workflow?.concurrency;
 }
 
 /** Experimental Workflow switch (Dashboard 全局设置 → 实验性配置 → Workflow):

@@ -114,6 +114,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/workflows/v3/artifact-contract-declarations.ts',
     'src/workflows/v3/attempt-ledger.ts',
     'src/workflows/v3/attempt-numbering.ts',          // leaf: journal-derived attempt ids
+    'src/workflows/v3/checkpoint-hold.ts',            // pure journal fold + allowlisted v3 modules
     'src/workflows/v3/contract.ts',
     'src/workflows/v3/core-control.ts',
     'src/workflows/v3/dag.ts',

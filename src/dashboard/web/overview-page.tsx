@@ -15,6 +15,7 @@ import {
 } from './ui.js';
 import { buildBotCards, loadGroupsSnapshot, type BotCard } from './overview.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
+import { DocCommentFailures } from './doc-comment-failures.js';
 import {
   CreateActionButton,
   HeaderAction,
@@ -458,6 +459,8 @@ function OverviewPage() {
         <StatChip tone="active" label={tr('overview.activeSessions')} value={active.length} />
         <StatChip tone="online" label={tr('overview.onlineBots')} value={onlineBots} suffix={`/ ${cards.length}`} />
       </div>
+
+      <DocCommentFailures />
 
       <section className="overview-block attention-section">
         <SectionHeader

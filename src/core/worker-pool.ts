@@ -13363,9 +13363,13 @@ export function sendWorkerInput(
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
     trustedCaller?: TrustedCaller;
+    /** Queue behind a running turn instead of folding into it (type-ahead):
+     *  the input must start as a turn of its own. */
+    queueAfterActiveTurn?: true;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+  if (feedbackMaintenanceActive(config.session.dataDir)) return false;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
@@ -13535,9 +13539,9 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined
+    ...(opts.queueAfterActiveTurn || (opts.dispatchAttempt === undefined
       && (opts.trustedCaller?.source === 'schedule_creator'
-        || isSerialGroupInput(ds, opts.trustedCaller))
+        || isSerialGroupInput(ds, opts.trustedCaller)))
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
@@ -14349,6 +14353,10 @@ export function forkWorker(
   resumeOrTurnId: ForkResumeOrTurnId = false,
   opts: ForkWorkerOptions = {},
 ): boolean {
+  if (feedbackMaintenanceActive(config.session.dataDir)) {
+    opts.onAdmission?.('rejected');
+    return false;
+  }
   let admissionReported = false;
   const reportAdmission = (admission: WorkerForkAdmission): void => {
     if (admissionReported) return;
@@ -21199,8 +21207,8 @@ async function persistFinalOutputDelivery(
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    if (feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
-    feedbackStore.recordTurnDelivery({
+    if (await feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
+    await feedbackStore.recordTurnDelivery({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
       turnId: msg.turnId,
@@ -23418,3 +23426,4 @@ export function setCurrentCliVersion(v: string, runtimeKey?: string): void {
 export function getCurrentCliVersion(runtimeKey?: string): string {
   return runtimeKey ? currentCliVersions.get(runtimeKey) ?? 'unknown' : currentCliVersion;
 }
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
