@@ -293,11 +293,11 @@ Streamable HTTP MCP 服务不能申请 `protectedCapability`，同时声明两�
 }
 ```
 
-省略 `enabled` 时默认关闭，JSON 布尔值 `true` 启用绑定，布尔值 `false` 关闭绑定。字符串 `"true"`、数字 `1` 等任何非布尔值都会使整条能力记录被拒绝，不会被强制转换成关闭状态。密钥值只存在于 daemon 启动环境，配置中只写环境变量名。无论当前 Bot 是否启用匹配插件，Botmux 都会从全部 daemon 子进程、worker、模型进程和插件通用环境删除所有已配置的 secret source 与 `redactEnv` 变量；能力授权与受保护 Home 路径仍按插件范围生效。
+省略 `enabled` 时默认关闭，JSON 布尔值 `true` 启用绑定，布尔值 `false` 关闭绑定。字符串 `"true"`、数字 `1` 等任何非布尔值都会使整条能力记录被拒绝，不会被强制转换成关闭状态。密钥值只存在于 daemon 启动环境，配置中只写环境变量名。无论当前 Bot 是否启用匹配插件，Botmux 都会从全部 daemon 子进程、worker、模型进程和插件通用环境删除所有已配置的 secret source 与 `redactEnv` 变量；能力授权与受保护 Home 路径仍按插件范围生效。受保护密钥及其清理名单在 daemon 启动时捕获；新增、轮转或更名密钥环境变量后必须重启 daemon 才能完整生效。热加载期间会保持安全方向：旧进程不会获得新密钥，新进程也不会绕过已有清理规则。
 
 MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allowedPluginIds` 中、配置的隔离前提不满足，或 daemon 无法提供一次性通道，Botmux 会改用不带受保护密钥文件描述符的普通 stdio transport 启动服务。服务仍可启动并提供只读工具；该连接上的 `tools/call` 不会收到 `botmuxTrustedPrincipal` 或 `botmuxGrantedCapabilities`，插件必须对受保护写入失败关闭。
 
-`principal` 是每次 `tools/call` 的授权条件，不是 MCP 进程启动条件。如果全局绑定、插件 allowlist、隔离前提和 daemon 通道在启动时均已成功，长驻 MCP 进程可能已持有一次性密钥，即使后续某次调用缺少所需的已验证真人主体或其它调用级授权条件。Botmux 会在该次调用中省略 `botmuxTrustedPrincipal` 和 `botmuxGrantedCapabilities`，插件必须拒绝受保护写入。只要匹配的插件已启用，即使能力本身关闭，配置的隔离路径和环境变量清理仍然生效。
+`principal` 是每次 `tools/call` 的授权条件，不是 MCP 进程启动条件。如果全局绑定、插件 allowlist、隔离前提和 daemon 通道在启动时均已成功，长驻 MCP 进程可能已持有一次性密钥，即使后续某次调用缺少所需的已验证真人主体或其它调用级授权条件。Botmux 会在该次调用中省略 `botmuxTrustedPrincipal` 和 `botmuxGrantedCapabilities`，插件必须拒绝受保护写入。插件必须在**每一次**受保护写操作中重新校验 `botmuxTrustedPrincipal` 以及 `botmuxGrantedCapabilities` 是否包含当前能力 ID，不得把上一轮主体、能力或授权结果缓存到进程级状态后复用；任一字段缺失、不匹配或过期都必须失败关闭。只要匹配的插件已启用，即使能力本身关闭，配置的隔离路径和环境变量清理仍然生效。
 
 ## 卡片与终端
 

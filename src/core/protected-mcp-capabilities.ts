@@ -1,9 +1,12 @@
 import type { ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { lstatSync, realpathSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { createConnection, createServer, type Socket } from 'node:net';
+import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { isValidPluginId } from './plugins/ids.js';
+import { acceptMcpGatewayHandshake, sendMcpGatewayHandshake } from './plugins/mcp/socket-auth.js';
 import {
   privateBrokerContainmentEnabled,
   type SandboxNetworkPolicy,
@@ -454,23 +457,42 @@ async function createProtectedSecretSocketPair(): Promise<{
   daemonSocket: Socket;
   workerSocket: Socket;
 }> {
+  // Authenticate the daemon-created connector before transferring its peer to
+  // the worker. A same-UID process may discover and reach the short-lived Unix
+  // listener first, but it cannot obtain this in-memory nonce; rejected peers
+  // do not consume the listener, so they can neither steal the secret nor win
+  // the accept race and strand the legitimate fd.
+  const socketDir = mkdtempSync(join(tmpdir(), 'bmx-ps-'));
+  chmodSync(socketDir, 0o700);
+  const socketPath = join(socketDir, 's');
+  const authToken = randomBytes(32).toString('base64url');
   const server = createServer();
+  let workerSocket: Socket | undefined;
   try {
-    server.listen(0, '127.0.0.1');
+    const accepted = new Promise<Socket>((resolveAccepted) => {
+      server.on('connection', socket => {
+        void acceptMcpGatewayHandshake(socket, authToken).then(authenticated => {
+          if (authenticated) resolveAccepted(socket);
+        });
+      });
+    });
+    server.listen(socketPath);
     await once(server, 'listening');
-    const address = server.address();
-    if (!address || typeof address === 'string') {
-      throw new Error('protected MCP channel address unavailable');
-    }
-    const accepted = once(server, 'connection') as Promise<[Socket]>;
-    const workerSocket = createConnection({ host: '127.0.0.1', port: address.port });
+    workerSocket = createConnection({ path: socketPath });
     await once(workerSocket, 'connect');
-    const [daemonSocket] = await accepted;
+    await sendMcpGatewayHandshake(workerSocket, authToken);
+    const daemonSocket = await accepted;
+    workerSocket.pause();
+    daemonSocket.resume();
     daemonSocket.setNoDelay(true);
     workerSocket.setNoDelay(true);
     return { daemonSocket, workerSocket };
+  } catch (error) {
+    workerSocket?.destroy();
+    throw error;
   } finally {
     if (server.listening) server.close();
+    rmSync(socketDir, { recursive: true, force: true });
   }
 }
 
