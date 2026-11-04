@@ -1,5 +1,6 @@
 import { Pool, Client, type PoolClient, type ClientConfig } from 'pg';
 import type { PostgresTarget } from './feedback-storage-types.js';
+import { userInfo } from 'node:os';
 
 export function feedbackPostgresPool(target: PostgresTarget, password: string, ca?: string): Pool {
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(target.schema)) throw new Error('feedback_storage_schema_invalid');
@@ -11,6 +12,15 @@ export function feedbackPostgresPool(target: PostgresTarget, password: string, c
   const escapedToken = password.replace(/\\/g, '\\\\').replace(/\s/g, value => `\\${value}`);
   const wireOptions = tokenMode ? `bytepg_compute_id=${tokenMode.computeId} bytepg_auth_token=${escapedToken} ${options}` : options;
   const sanitize = (): Error => new Error('feedback_bytepg_connection_or_query_failed');
+  let effectiveUser = target.user;
+  if (tokenMode && !effectiveUser) {
+    effectiveUser = process.env.PGUSER || process.env.USER || process.env.USERNAME;
+    if (!effectiveUser) {
+      try { effectiveUser = userInfo().username; }
+      catch { throw new Error('feedback_bytepg_user_required'); }
+    }
+    if (!effectiveUser) throw new Error('feedback_bytepg_user_required');
+  }
   class BytePgClient extends Client {
     constructor(config?: ClientConfig) {
       super(config);
@@ -19,13 +29,19 @@ export function feedbackPostgresPool(target: PostgresTarget, password: string, c
       const connection = (this as unknown as { connection: { on: (...args: any[]) => unknown; emit: (...args: any[]) => boolean } }).connection;
       const emit = connection.emit.bind(connection);
       connection.emit = (event: string, ...args: unknown[]) => {
+        if (event === 'message') {
+          const value = args[0] as { name?: string; length?: number } | undefined;
+          if (value?.name === 'error' || value?.name === 'notice') {
+            return emit(event, Object.assign(sanitize(), { name: value.name, length: value.length }));
+          }
+        }
         if (event === 'error' || event === 'errorMessage' || event === 'notice') return emit(event, sanitize());
         return emit(event, ...args);
       };
     }
   }
   const pool = new Pool({
-    host: target.host, port: target.port, database: target.database, user: target.user,
+    host: target.host, port: target.port, database: target.database, user: effectiveUser,
     password: tokenMode ? () => '' : password,
     ssl: target.tls.mode === 'disable' ? false : { rejectUnauthorized: true, ...(ca ? { ca } : {}) },
     connectionTimeoutMillis: target.connectTimeoutMs, idleTimeoutMillis: 10000, max: 5,

@@ -58,7 +58,7 @@ For a gateway accepting `options=bytepg_compute_id=... bytepg_auth_token=...`, u
 
 Replace the example address/compute ID with your endpoint. An IPv6 `host` is the address without URI brackets. The client sends `bytepg_compute_id` and `bytepg_auth_token` in PostgreSQL startup `options`, together with BotMux's schema `search_path`; do not URL-encode the token stored in the referenced environment variable.
 
-BytePG mode does not require `passwordRef`. `user` is optional, using the PostgreSQL driver's default when omitted; specify it if the gateway requires a role. Do not configure both password and BytePG token authentication. The gateway must accept the startup options and the role must retain the schema privileges described above.
+BytePG mode does not require `passwordRef`. `user` is optional: when omitted, BotMux resolves `PGUSER`, `USER`, `USERNAME`, then the operating-system account; it fails before connecting if none can supply an identity. Specify `user` if the gateway requires a particular role. Do not configure both password and BytePG token authentication. The gateway must accept the startup options and the role must retain the schema privileges described above.
 
 Dashboard provides **Authentication → BytePG token**, Compute ID and a write-only token field. Leave the token blank to preserve its reference. CLI configuration accepts `tokenRef`; `--token` and `--password` credential arguments are rejected. Regular configuration, API views, migration metadata and recovery records contain only references, not token values.
 

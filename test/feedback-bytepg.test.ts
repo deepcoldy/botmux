@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspect } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { feedbackPostgresPool } from '../src/services/feedback-postgres-schema.js';
 import { configureFeedbackStorageCandidate, feedbackStorageView, testFeedbackStorageConnection } from '../src/services/feedback-storage-management.js';
 import { readFeedbackStorageConfig, readPostgresCredential } from '../src/services/feedback-storage-config.js';
@@ -18,6 +18,7 @@ afterEach(async () => {
   await closeAllFeedbackStorage();
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
   delete process.env.BYTEPG_TEST_TOKEN;
+  vi.unstubAllEnvs();
 });
 function message(type: string, payload: Buffer) {
   const header = Buffer.alloc(5); header.write(type); header.writeInt32BE(payload.length + 4, 1);
@@ -95,14 +96,26 @@ describe('BytePG feedback authentication', () => {
     try {
       client = await pool.connect();
       const notices: unknown[] = [];
+      const rawMessages: unknown[] = [];
       client.on('notice', notice => notices.push(notice));
+      (client as any).connection.on('message', (value: unknown) => rawMessages.push(value));
       let error: unknown;
       try { await client.query('SELECT 1'); } catch (caught) { error = caught; }
       expect(error).toBeInstanceOf(Error);
       expect(notices).toHaveLength(1);
       expect(inspect([error, notices], { depth: 10 })).not.toContain(token);
+      expect(inspect(rawMessages, { depth: 10 })).not.toContain(token);
       expect(server.startups[0].options).toContain('bytepg_compute_id=cp-test-compute');
     } finally { client?.release(); await pool.end(); await server.close(); }
+  });
+  it('resolves a nonempty operating-system username when all username environment variables are absent', async () => {
+    vi.stubEnv('PGUSER', undefined); vi.stubEnv('USER', undefined); vi.stubEnv('USERNAME', undefined);
+    const server = await gateway();
+    const pool = feedbackPostgresPool(target(server.port), 'synthetic-user-token');
+    try {
+      const client = await pool.connect(); client.release();
+      expect(server.startups[0].user).toBeTruthy();
+    } finally { await pool.end(); await server.close(); }
   });
   it('escapes whitespace and backslashes as one startup option value', async () => {
     const server = await gateway();
