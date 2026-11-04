@@ -61,6 +61,10 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
       if (!response.ok) throw new Error(result.error ?? 'feedback_storage_operation_failed');
       setMessage(t('feedback.storage.success'));
       if (path === 'configure') { setPassword(''); setCa(''); setRequestId(undefined); }
+      // A cancelled job is terminal: the panel must mint a fresh requestId for
+      // the next migration attempt, or prepareFeedbackMigration would keep
+      // returning the old cancelled job (its resume is a permanent no-op).
+      if (path.endsWith('/cancel')) setRequestId(undefined);
       await reload();
       if (path.startsWith('recovery/')) await loadRecovery();
     } catch (error) { setMessage(error instanceof Error ? error.message : 'feedback_storage_operation_failed'); }
@@ -108,7 +112,7 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
     <p>{t('feedback.storage.current')}: {status.active.backend}; {t('feedback.storage.candidate')}: {status.candidate?.backend ?? '—'}</p>
     <label><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} /> {t('feedback.storage.confirm')}</label>
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
-      <button disabled={busy || !confirmed || !status.candidate || !!migrating} onClick={() => {
+      <button id="feedback-storage-migrate" disabled={busy || !confirmed || !status.candidate || !!migrating} onClick={() => {
         const identity = requestId ?? crypto.randomUUID();
         setRequestId(identity);
         void action('migrate', { requestId: identity, expectedGeneration: status.generation, maintenanceConfirmed: true });

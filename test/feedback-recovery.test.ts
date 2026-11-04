@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { readFeedbackStorageConfig, saveFeedbackStorageCandidate } from '../src/services/feedback-storage-config.js';
 import { prepareFeedbackMigration, cancelFeedbackMigration, resumeFeedbackMigration } from '../src/services/feedback-migration.js';
-import { beginFeedbackMaintenance, assertFeedbackAdmission, freezeFeedbackSource, retireFeedbackSource, acquireFeedbackSendLease } from '../src/services/feedback-maintenance.js';
+import { beginFeedbackMaintenance, assertFeedbackAdmission, currentFeedbackMaintenance, freezeFeedbackSource, retireFeedbackSource, acquireFeedbackSendLease } from '../src/services/feedback-maintenance.js';
 import { inspectFeedbackRecovery, acknowledgeFeedbackRecovery } from '../src/services/feedback-recovery.js';
 import { closeAllFeedbackStorage } from '../src/services/feedback-storage.js';
 import { writeFile } from 'node:fs/promises';
@@ -36,6 +36,15 @@ async function fixture() {
   return { directory, store, candidate, saved, job };
 }
 describe('manual feedback recovery', () => {
+  it('cancels a prepared migration before maintenance begins without a control file or PG access', async () => {
+    const { directory, job } = await fixture();
+    const cancelled = await cancelFeedbackMigration(directory, job.migrationId, decision);
+    expect(cancelled.phase).toBe('cancelled');
+    // No maintenance control was ever created, so admission was never gated.
+    expect(currentFeedbackMaintenance(directory)).toBeUndefined();
+    expect(() => assertFeedbackAdmission(directory)).not.toThrow();
+    expect((await resumeFeedbackMigration(directory, job.migrationId)).phase).toBe('cancelled');
+  });
   it('refuses overlapping cancellation and reports an actionable busy error', async () => {
     const { directory, job } = await fixture();
     let release!: () => void;
