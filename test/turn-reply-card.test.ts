@@ -1210,6 +1210,54 @@ describe('public process and fallback compatibility', () => {
       expect(audit.nativeImgKeys).toEqual([]);
     });
 
+    it('strips images that a display PREFIX makes live again by un-fencing the first line', () => {
+      // Every process entry is rendered as `💬 `/`💭 ` + text, and tool lines are
+      // joined with `\n`. That composition shifts line starts, so a leading
+      // fence stops opening a block and image syntax that was inert inside it
+      // becomes a live token AFTER the per-fragment strip already ran. Feishu
+      // validates the composed card, so the assembled markdown must be clean.
+      const alienKey = 'img_v3_02k_prefix_alien_key';
+      const fenced = ['```markdown', `![架构图](${alienKey})`, '```'].join('\n');
+
+      const panel = imageRecord();
+      panel.progress = [fenced, '第二条'];
+      panel.activity = [{ kind: 'progress', id: 'p0', text: fenced }, { kind: 'progress', id: 'p1', text: '第二条' }];
+      const panelAudit = auditCard(buildTurnReplyCard(panel, presentation));
+      expect(panelAudit.panelImageSources).toEqual([]);
+      expect(panelAudit.invalidMarkdownImageSources).toEqual([]);
+      expect(panelAudit.validBodyImageRefs).toEqual([bodyKey]);
+
+      // Live thinking line has its own `💭 ` prefix in the body.
+      const thinking = imageRecord('working', false);
+      thinking.progress = ['处理中'];
+      thinking.tools = [];
+      thinking.activity = [{ kind: 'thinking', id: 'th0', text: fenced }];
+      expect(auditCard(buildTurnReplyCard(thinking, presentation)).markdownImageSources).toEqual([]);
+
+      // Tool lines are joined into one markdown element.
+      const tools = imageRecord('working', false);
+      tools.progress = ['处理中'];
+      tools.tools = [{ id: 't0', name: 'bash', subject: fenced, result: fenced, completed: true }];
+      tools.activity = [{ kind: 'tool', id: 't0' }];
+      expect(auditCard(buildTurnReplyCard(tools, presentation)).markdownImageSources).toEqual([]);
+    });
+
+    it('strips images that the renderer’s own escaped-fence repair exposes on the live branch', () => {
+      // The live branch feeds text to the BODY renderer, which first runs
+      // `unescapeFenceLines`. A line of over-escaped backticks becomes a real
+      // fence there, so image syntax that the sanitizer saw as inert code ends
+      // up in prose and is rendered as a live image.
+      const alienKey = 'img_v3_02k_escaped_fence_alien';
+      const escaped = ['```', '\\`\\`\\`', `![架构图](${alienKey})`, '```'].join('\n');
+      const record = imageRecord('working', false);
+      record.progress = [escaped];
+      record.tools = [];
+      record.activity = [{ kind: 'progress', id: 'p0', text: escaped }];
+      const audit = auditCard(buildTurnReplyCard(record, presentation));
+      expect(audit.markdownImageSources).toEqual([]);
+      expect(audit.nativeImgKeys).toEqual([]);
+    });
+
     it('leaves fenced code, inline code, escaped syntax and ordinary links untouched in the process panel', () => {
       const text = [
         '围栏代码：',
