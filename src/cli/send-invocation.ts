@@ -271,10 +271,15 @@ export function parseSendInvocation(argv: string[]): SendInvocation {
 function looksLikePathToken(token: string): boolean {
   const value = token.trim();
   if (!value) return false;
+  // Prose often contains slashes (`a/b`, `详见 ./out.sql 第 3 行`) or URLs.
+  // Treat whitespace/CJK/full-width punctuation as prose before looking for
+  // path syntax; a real path containing spaces will normally still stat as a
+  // file and hit the existing-file branch above.
+  if (/[\s\u3000-\u9fff\uff00-\uffef]/.test(value)) return false;
+  if (value.includes('://')) return false;
   if (value === '.' || value === '..') return true;
   if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../') || value.startsWith('~/')) return true;
   if (/^[A-Za-z]:[\\/]/.test(value)) return true;
-  if (/[\\/]/.test(value)) return true;
   return /\.(?:sql|csv|tsv|jsonl?|md|txt|log|ya?ml|toml|ini|png|jpe?g|gif|webp|bmp|svg|pdf|zip|tar|gz|tgz|bz2|xz|mp4|mov|avi|webm|m4v|xlsx?|docx?|pptx?|html?|sh|py|ts|js|go|rs|java|c|cc|cpp|h)$/i.test(value);
 }
 
@@ -328,12 +333,6 @@ export function validateClientSendInvocation(
     return {
       ok: false,
       message: "botmux send: --content-file 不支持 '-'；多行正文请直接用 botmux send <<'EOF' … EOF，或用裸 '-' 作为唯一位置参数。",
-    };
-  }
-  if (contentFile !== undefined && invocation.positionals.length > 0) {
-    return {
-      ok: false,
-      message: `botmux send: --content-file 与位置参数正文不能混用；多余的参数：${invocation.positionals.join(' ')}。正文请只保留一种来源。`,
     };
   }
 

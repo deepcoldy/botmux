@@ -104,6 +104,11 @@ describe('validateClientSendInvocation', () => {
     expect(client(['--files', 'a', '正文'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'missing'], ['a'])).toMatchObject({ ok: true });
     expect(client(['--files', 'a', 'missing.sql'], ['a'])).toMatchObject({ ok: false });
+    expect(client(['--files', 'a', '详见 ./out.sql 第 3 行'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', '见 https://x.y/z.md'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', '结论：a/b 两种方案'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', 'https://x.y/z.md'], ['a'])).toMatchObject({ ok: true });
+    expect(client(['--files', 'a', 'a/b'], ['a'])).toMatchObject({ ok: true });
   });
 
   it('rejects --content-file - and card positional arguments before reading files', () => {
@@ -114,10 +119,6 @@ describe('validateClientSendInvocation', () => {
     expect(client(['--card-file', 'card.json', 'extra'])).toMatchObject({
       ok: false,
       message: expect.stringContaining('不接受正文参数'),
-    });
-    expect(client(['--content-file', 'body.md', 'extra'])).toMatchObject({
-      ok: false,
-      message: expect.stringContaining('不能混用'),
     });
   });
 
