@@ -549,7 +549,7 @@ describe('webhook token mode', () => {
         verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
         target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_fixed' },
         promptEnvelope: {
-          sourceName: 'agentmesh', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024,
+          sourceName: 'agent-platform', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024,
           ...(input.trustPayload === undefined ? {} : { trustPayload: input.trustPayload }),
         },
         loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
