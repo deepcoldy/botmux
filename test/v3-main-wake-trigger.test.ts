@@ -150,7 +150,7 @@ import { sessionKey } from '../src/core/types.js';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createWorkflowMainWake } from '../src/core/workflow-main-wake.js';
+import { createWorkflowMainWake, workflowMainWakeSessionState } from '../src/core/workflow-main-wake.js';
 import { readV3MainWakeIssued } from '../src/workflows/v3/main-wake-ledger.js';
 import { validateDag } from '../src/workflows/v3/dag.js';
 import { appendEvent } from '../src/workflows/v3/journal.js';
@@ -204,11 +204,10 @@ function issuerOver(activeSessions: Map<string, DaemonSession>, clock = { t: 1_0
         ...(ds.initialStartPending ? { opening: true } : {}),
       };
     },
-    sessionBusy: (sessionId) => {
-      const ds = [...activeSessions.values()].find((s) => s.session.sessionId === sessionId);
-      if (!ds?.worker || ds.worker.killed) return false;
-      return !ds.cliReady || !(ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'idle');
-    },
+    sessionState: (sessionId) => workflowMainWakeSessionState(
+      [...activeSessions.values()].find((s) => s.session.sessionId === sessionId),
+      { sessionsRestored: true },
+    ),
     deliver: (request, internal) => triggerSessionTurn(request, { larkAppId: APP, activeSessions }, internal),
     drive: () => {},
     listRunIds: () => [RUN],
@@ -253,7 +252,7 @@ describe('main-bot wake through the real trigger', () => {
     expect(readV3MainWakeIssued(runDir, 3)).toBeUndefined();
     // The running turn ends.
     (ds as any).lastScreenStatus = 'idle';
-    wake.onSessionIdle('sess_main', { afterWork: true });
+    wake.onScreenStatus('sess_main', { status: 'idle', prevStatus: 'working', turnId: 'om_member_running' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(send).toHaveBeenCalledTimes(1);
     expect(sentInputs.calls).toEqual([{ turnId: 'workflow-event:wake-trig-run:3', opts: expect.objectContaining({ queueAfterActiveTurn: true }) }]);

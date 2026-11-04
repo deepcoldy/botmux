@@ -786,7 +786,7 @@ import {
 } from './workflows/v3/daemon-run.js';
 import { v3ActionActor, v3ActionRecord, v3ReasonRequiredProblem } from './workflows/v3/action-provenance.js';
 import { handNodeToHuman } from './workflows/v3/external-control.js';
-import { createWorkflowMainWake } from './core/workflow-main-wake.js';
+import { createWorkflowMainWake, workflowMainWakeSessionState } from './core/workflow-main-wake.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3RerunGrantCard, buildV3RevisionCard } from './im/lark/v3-revision-card.js';
 import {
@@ -7031,14 +7031,9 @@ const workflowMainWake = createWorkflowMainWake({
       ...(ds.initialStartPending ? { opening: true } : {}),
     };
   },
-  // The cascade's idle evidence (cli-idle-wait): a live CLI is free only once
-  // its prompt was ready and its screen is idle. No live worker: the trigger
-  // forks a fresh CLI whose first turn is the wake.
-  sessionBusy: (sessionId) => {
-    const ds = findActiveBySessionId(sessionId);
-    if (!ds?.worker || ds.worker.killed) return false;
-    return !ds.cliReady || !(ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'idle');
-  },
+  // The cascade's idle evidence (cli-idle-wait); until restore re-attached
+  // the CLIs that survived a restart, every session counts as busy.
+  sessionState: (sessionId) => workflowMainWakeSessionState(findActiveBySessionId(sessionId), { sessionsRestored }),
   deliver: (request, internal) => triggerSessionTurn(request, { larkAppId: workflowSelfAppId(), activeSessions }, internal),
   drive: (runId) => v3GateRunner.driveDetached(runId),
   listRunIds: () => {
@@ -32586,12 +32581,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onScreenStatus(ds, context) {
       observeAutoCompact(ds, context.status);
       // A main-bot wake waits for its main session to be idle; the end of a
-      // turn there also ends a checkpoint's review (bot-executed runs only).
-      if (context.status === 'idle' && context.prevStatus !== 'idle') {
-        workflowMainWake.onSessionIdle(ds.session.sessionId, {
-          afterWork: context.prevStatus === 'working' || context.prevStatus === 'analyzing',
-        });
-      }
+      // wake turn there also ends a checkpoint's review (bot-executed runs only).
+      workflowMainWake.onScreenStatus(ds.session.sessionId, {
+        status: context.status,
+        ...(context.prevStatus !== undefined ? { prevStatus: context.prevStatus } : {}),
+        ...(context.turnId ? { turnId: context.turnId } : {}),
+      });
       if (context.status === 'idle') scheduleMessageListenerAutoClose(ds);
       try {
         if (context.status === 'limited') recordLimitedFailedTurn(ds, context.turnId);

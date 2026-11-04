@@ -11,7 +11,11 @@
  *     the latest attempt of its effective instance, recorded after the mark
  *     took effect (a node marked while running counts; one marked after it
  *     had already completed does not wake anybody about that old result);
- *   - it holds its dependants until a `checkpointReleased` names its attempt.
+ *   - it holds its dependants until a `checkpointReleased` names its attempt;
+ *   - a run that is no longer running (succeeded, failed, cancelled or being
+ *     cancelled) holds nothing: an unreleased success there is left out, so
+ *     nothing polls it, releases it into an ended journal, or shows it as
+ *     holding.
  *
  * A revisit or re-run of the node makes a new instance whose completion is a
  * new success (new result, downstream re-runs on it): it holds again. Those
@@ -98,7 +102,8 @@ export function v3CheckpointMarkedSince(
 }
 
 /** The current success of every marked node of `dag` (see the module doc),
- *  with its release when there is one. */
+ *  with its release when there is one. In a run that is not running or
+ *  blocked only the released ones are listed: nothing is held there. */
 export function v3CheckpointSuccesses(input: {
   events: readonly StoredEvent[];
   dag: V3Dag;
@@ -106,6 +111,7 @@ export function v3CheckpointSuccesses(input: {
 }): V3CheckpointSuccess[] {
   const events = [...input.events];
   const snap = materialize(events);
+  const live = snap.runStatus === 'running' || snap.runStatus === 'blocked';
   const releases = new Map<string, { reason: V3CheckpointReleaseReason; at: number }>();
   for (const event of events) {
     if (event.type === 'checkpointReleased' && !releases.has(event.attemptId)) {
@@ -133,6 +139,7 @@ export function v3CheckpointSuccesses(input: {
     // Completed before the mark took effect: nobody asked to look at that.
     if (since === undefined || index < since) continue;
     const released = releases.get(attemptId);
+    if (!released && !live) continue;
     out.push({
       nodeId: node.id,
       ...(state.effectiveInstanceId ? { instanceId: state.effectiveInstanceId } : {}),

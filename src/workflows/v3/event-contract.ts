@@ -125,9 +125,11 @@ export interface V3AutoProvenance {
 /** Why a checkpoint's dependants may go on (design §13.6):
  *  `wakeTurnEnded` — the main bot's turn for its wake-up ended (it may have
  *  changed the flow in it); `wakeNotDelivered` — the wake-up could not be
- *  delivered after its retries; `holdTimeout` — the safety cap on how long a
- *  checkpoint may hold its dependants ran out. */
-export type V3CheckpointReleaseReason = 'wakeTurnEnded' | 'wakeNotDelivered' | 'holdTimeout';
+ *  delivered after its retries; `wakeSessionEnded` — the session that took
+ *  the wake-up was closed, or its CLI stopped, before that turn was seen to
+ *  end; `holdTimeout` — the safety cap on how long a checkpoint may hold its
+ *  dependants ran out. */
+export type V3CheckpointReleaseReason = 'wakeTurnEnded' | 'wakeNotDelivered' | 'wakeSessionEnded' | 'holdTimeout';
 
 export type V3Event =
   | {

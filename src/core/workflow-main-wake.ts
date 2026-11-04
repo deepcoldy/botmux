@@ -12,15 +12,16 @@
  * topic — exactly what a message to the topic would do — rather than reviving
  * a session someone closed (see `deliveryTarget`).
  *
- * Only to an idle session, as a turn of its own. A CLI with type-ahead
- * (Claude Code and others) folds input that arrives mid-turn into the turn
- * that is running, and the process marker keeps naming that turn: the event
- * would then be handled under that person's identity. So a wake waits here,
- * in the daemon, while the main session is busy (`sessionBusy`, checked again
- * synchronously right before the hand-over) and goes out when it is idle
- * again (`onSessionIdle`, plus a slow poll). The hand-over also asks the
- * worker to queue it behind any turn that starts in the same instant
- * (`queueAfterActiveTurn`) instead of folding it in.
+ * Only to an idle session, as a turn of its own, one at a time. A CLI with
+ * type-ahead (Claude Code and others) folds input that arrives mid-turn into
+ * the turn that is running, and the process marker keeps naming that turn:
+ * the event would then be handled under that person's identity. So a wake
+ * waits here, in the daemon, while the main session is busy (`sessionState`,
+ * checked again synchronously right before the hand-over) or still has a
+ * wake handed to it whose turn was not seen to end, and goes out when it is
+ * idle again (`onScreenStatus`, `onTurnEnded`, plus a slow poll). The
+ * hand-over also asks the worker to queue it behind any turn that starts in
+ * the same instant (`queueAfterActiveTurn`) instead of folding it in.
  *
  * Exactly once per event: the issuance record (main-wake-ledger.ts) is
  * written in the trigger's write-ahead hook — the last moment before the turn
@@ -34,16 +35,21 @@
  *
  * Checkpoints (checkpoint-hold.ts): the dependants of a checkpoint success
  * wait until it is released — when the wake turn ends (its terminal, or the
- * session's next working→idle edge), when the wake cannot be delivered
- * (retries used up), or at the safety cap {@link WORKFLOW_CHECKPOINT_HOLD_MAX_MS}.
- * After a restart a hold whose wake already went out is released as soon as
- * the session that took it is idle.
+ * session going idle after a working screen of that very turn), when the
+ * session that took it is closed or its CLI stops (`wakeSessionEnded`), when
+ * the wake cannot be delivered (retries used up), or at the safety cap
+ * {@link WORKFLOW_CHECKPOINT_HOLD_MAX_MS}. A wake queued behind another turn
+ * is not released by that turn's end. After a restart (nothing of the turn
+ * in memory) a hold whose wake already went out is released as soon as the
+ * session that took it is proven idle — looked at on every scan, poll and
+ * idle edge, whatever came before it.
  *
  * Runs that are not bot-executed are never read past their envelope.
  */
 
 import { join } from 'node:path';
 
+import type { DaemonSession } from './types.js';
 import type { V3Dag } from '../workflows/v3/dag.js';
 import type { RunChatBinding } from '../workflows/v3/grill-state.js';
 import { readJournal } from '../workflows/v3/journal.js';
@@ -67,6 +73,35 @@ import {
 import { isValidRunId } from '../workflows/v3/ops-projection.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import { mintWorkflowEventTurnId, parseWorkflowEventTurnId } from './workflow-event-turn.js';
+
+/** How a wake sees a session ({@link workflowMainWakeSessionState}). */
+export type WorkflowMainWakeSessionState = 'idle' | 'busy' | 'starting' | 'stopped' | 'gone';
+
+/**
+ * The daemon's own evidence about a session, as a wake needs it
+ * (cli-idle-wait's idle proof):
+ *  - `gone`: closed, or not known;
+ *  - `busy`: a live CLI in a turn or not ready for one (prompt not ready,
+ *    screen not idle) — or the daemon still restoring after a restart: a CLI
+ *    that survived it (tmux and the other persistent backends) may be in the
+ *    middle of a turn in a pane no worker watches yet;
+ *  - `starting`: no CLI yet, its first start on its way (opening input, repo
+ *    choice): a wake handed to it is that start's turn;
+ *  - `stopped`: active, but no CLI runs for it: a turn handed to it is over;
+ *    a new hand-over starts a fresh CLI whose first turn it is;
+ *  - `idle`: a live CLI, prompt ready, screen idle.
+ */
+export function workflowMainWakeSessionState(
+  ds: DaemonSession | undefined,
+  opts: { sessionsRestored: boolean },
+): WorkflowMainWakeSessionState {
+  if (!ds || ds.session.status !== 'active') return 'gone';
+  if (!opts.sessionsRestored) return 'busy';
+  if (!ds.worker || ds.worker.killed) {
+    return ds.initialStartPending || ds.pendingRepo || ds.pendingRepoCommitInFlight ? 'starting' : 'stopped';
+  }
+  return ds.cliReady && (ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'idle') ? 'idle' : 'busy';
+}
 
 export interface WorkflowMainWakeSessionView {
   sessionId: string;
@@ -101,10 +136,10 @@ export interface WorkflowMainWakeDeps {
   mainSessionAt(binding: RunChatBinding): { sessionId: string } | undefined;
   /** Live view of a session (read inside the write-ahead hook). */
   sessionView(sessionId: string): WorkflowMainWakeSessionView | undefined;
-  /** The session's CLI is in a turn (or not ready for one): a wake must not
-   *  be handed over now. A session without a live worker is not busy (the
-   *  trigger starts a fresh CLI whose first turn is the wake). */
-  sessionBusy(sessionId: string): boolean;
+  /** {@link workflowMainWakeSessionState} of a session. A wake is handed
+   *  over to anything but a `busy` one (with no live CLI the trigger starts
+   *  one whose first turn is the wake). */
+  sessionState(sessionId: string): WorkflowMainWakeSessionState;
   /** `triggerSessionTurn` with daemon-internal controls. */
   deliver(request: TriggerRequest, internal: WorkflowMainWakeDeliveryControls): Promise<TriggerResponse>;
   /** Re-drive a run after a checkpoint was released. */
@@ -137,8 +172,9 @@ export interface WorkflowMainWake {
   scan(runId: string): Promise<void>;
   /** After a restart: scan every run this daemon owns. */
   coldAttach(): Promise<void>;
-  /** A session went idle (`afterWork`: from working — the end of a turn). */
-  onSessionIdle(sessionId: string, opts: { afterWork: boolean }): void;
+  /** Every screen update of a session: its status, the one before, and the
+   *  turn its worker is on. */
+  onScreenStatus(sessionId: string, update: { status: string; prevStatus?: string; turnId?: string }): void;
   /** A turn of a session reached its terminal. */
   onTurnEnded(sessionId: string, turnId: string): void;
 }
@@ -196,6 +232,21 @@ export function buildWorkflowMainWakeRequest(input: {
  *  last moment: nothing was handed over, the wake waits. */
 class WakeDeferred extends Error {}
 
+/** A wake this process handed to a session (or, after a restart, found
+ *  issued for a checkpoint that still holds), until its turn is seen to end. */
+interface HandedOverWake {
+  runId: string;
+  eventSeq: number;
+  turnId: string;
+  checkpoint: boolean;
+  /** A working screen of this very turn was seen: its worker was on it. */
+  seenRunning?: boolean;
+  /** Found after a restart: this process never saw it start. */
+  restored?: boolean;
+  /** When this process took it on. */
+  at: number;
+}
+
 export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMainWake {
   const now = deps.now ?? Date.now;
   const retryMs = deps.retryMs ?? 60_000;
@@ -212,9 +263,10 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
   const gaveUp = new Set<string>();
   /** Runs with a wake waiting for this session to be idle. */
   const waitingOn = new Map<string, Set<string>>();
-  /** Checkpoint wake turns delivered by this process, per session: their end
-   *  releases the checkpoint. */
-  const awaitingTurnEnd = new Map<string, Array<{ runId: string; eventSeq: number; turnId: string }>>();
+  /** Wakes handed to each session whose turn was not seen to end: the next
+   *  wake for that session waits for them, and a checkpoint's end releases
+   *  it. */
+  const handedOver = new Map<string, HandedOverWake[]>();
   /** One pending poll per run. */
   const polls = new Set<string>();
   /** Scans of one run never overlap. */
@@ -261,6 +313,59 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
     deps.drive(runId);
   }
 
+  function track(sessionId: string, entry: HandedOverWake): void {
+    const list = handedOver.get(sessionId) ?? [];
+    list.push(entry);
+    handedOver.set(sessionId, list);
+    if (entry.checkpoint) ensurePoll(entry.runId);
+  }
+
+  function untrack(sessionId: string, entry: HandedOverWake): void {
+    const rest = (handedOver.get(sessionId) ?? []).filter((candidate) => candidate !== entry);
+    if (rest.length > 0) handedOver.set(sessionId, rest);
+    else handedOver.delete(sessionId);
+    rescanWaiting(sessionId);
+  }
+
+  /** Runs waiting for `sessionId` are looked at again. */
+  function rescanWaiting(sessionId: string): void {
+    const runs = waitingOn.get(sessionId);
+    if (!runs) return;
+    waitingOn.delete(sessionId);
+    for (const runId of runs) void scan(runId);
+  }
+
+  /** Wakes of `sessionId` whose turn ended: out of the way of the next
+   *  wake, checkpoints released. */
+  function endWakes(sessionId: string, match: (entry: HandedOverWake) => boolean, reason: V3CheckpointReleaseReason): void {
+    const list = handedOver.get(sessionId);
+    if (!list) return;
+    const ended = list.filter(match);
+    if (ended.length === 0) return;
+    const rest = list.filter((entry) => !match(entry));
+    if (rest.length > 0) handedOver.set(sessionId, rest);
+    else handedOver.delete(sessionId);
+    for (const entry of ended) {
+      if (entry.checkpoint) release(entry.runId, entry.eventSeq, reason);
+    }
+    rescanWaiting(sessionId);
+  }
+
+  /** What the session's state alone proves about the wakes handed to it:
+   *  closed or no CLI — over; idle — over for the ones found after a restart
+   *  (nothing else tells which turn is running there). Never in the way of
+   *  later wakes for longer than the hold cap. */
+  function settle(sessionId: string): void {
+    if (!handedOver.has(sessionId)) return;
+    const state = deps.sessionState(sessionId);
+    if (state === 'gone' || state === 'stopped') {
+      endWakes(sessionId, () => true, 'wakeSessionEnded');
+      return;
+    }
+    if (state === 'idle') endWakes(sessionId, (entry) => entry.restored === true, 'wakeTurnEnded');
+    endWakes(sessionId, (entry) => now() - entry.at >= WORKFLOW_CHECKPOINT_HOLD_MAX_MS, 'holdTimeout');
+  }
+
   /** A failed delivery: schedule the next try, or give up (and let a
    *  checkpoint go) once the timed retries are used up. */
   function failed(runId: string, event: V3MainWakeEvent, why: string): void {
@@ -287,10 +392,14 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
   ): Promise<void> {
     const key = keyOf(runId, event.eventSeq);
     const live = deps.mainSessionAt(binding);
-    // Busy now: wait in the daemon rather than type into a running turn.
-    if (live && deps.sessionBusy(live.sessionId)) {
-      waitFor(live.sessionId, runId);
-      return;
+    // Busy now, or another wake handed to it not seen to end: wait in the
+    // daemon rather than type into a running turn or queue behind one.
+    if (live) {
+      settle(live.sessionId);
+      if (handedOver.has(live.sessionId) || deps.sessionState(live.sessionId) === 'busy') {
+        waitFor(live.sessionId, runId);
+        return;
+      }
     }
     const turnId = mintWorkflowEventTurnId(runId, event.eventSeq);
     const request = buildWorkflowMainWakeRequest({
@@ -305,6 +414,7 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
     let refused = false;
     let deliveredTo: string | undefined;
     let deferredOn: string | undefined;
+    let inFlightEntry: HandedOverWake | undefined;
     let result: TriggerResponse;
     try {
       result = await deps.deliver(request, {
@@ -314,15 +424,20 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
         // the last moment before the worker of an idle session gets the turn
         // — with the session's turn pointers as they are now
         // (V3MainWakeRecord). Throwing here aborts the hand-over before the
-        // worker sees anything: when the session turned busy meanwhile (the
-        // wake waits), or when the record cannot be written (an event already
-        // issued). A session the trigger just opened would be left
-        // half-started by a throw, so that turn goes ahead without its record
-        // instead: every run command in it is refused (fail closed), and it is
-        // never delivered again.
+        // worker sees anything: when the session turned busy or got another
+        // wake meanwhile (the wake waits), or when the record cannot be
+        // written (an event already issued). A session the trigger just
+        // opened would be left half-started by a throw, so that turn goes
+        // ahead without its record instead: every run command in it is
+        // refused (fail closed), and it is never delivered again. A wake that
+        // goes ahead is the session's wake in flight from here on — before
+        // the trigger returns, so a wake of another run reaching its own hook
+        // meanwhile waits.
         beforeDispatch: ({ sessionId }) => {
           const view = deps.sessionView(sessionId);
-          if (!view?.opening && deps.sessionBusy(sessionId)) {
+          // A session with a wake in flight existed before this trigger (it
+          // did not open it): no half-started session to leave behind.
+          if (handedOver.has(sessionId) || (!view?.opening && deps.sessionState(sessionId) === 'busy')) {
             deferredOn = sessionId;
             throw new WakeDeferred(`session ${sessionId} is busy`);
           }
@@ -347,6 +462,8 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
             if (!view?.opening) throw err;
             recordError = err;
           }
+          inFlightEntry = { runId, eventSeq: event.eventSeq, turnId, checkpoint: event.kind === 'checkpoint', at: now() };
+          track(sessionId, inFlightEntry);
         },
         onDispatchRefused: () => { refused = true; },
       });
@@ -355,6 +472,7 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
         waitFor(deferredOn, runId);
         return;
       }
+      if (deliveredTo && inFlightEntry) untrack(deliveredTo, inFlightEntry);
       throw err;
     }
     if (result.ok && !refused) {
@@ -363,14 +481,10 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
         deliveredUnrecorded.add(key);
         deps.warn(`[workflow-wake:${runId}] wake ${event.eventSeq} started in a new session without its issuance record (its run commands will be refused; it is not delivered again): ${recordError instanceof Error ? recordError.message : String(recordError)}`);
       }
-      if (event.kind === 'checkpoint' && deliveredTo) {
-        const list = awaitingTurnEnd.get(deliveredTo) ?? [];
-        list.push({ runId, eventSeq: event.eventSeq, turnId });
-        awaitingTurnEnd.set(deliveredTo, list);
-        ensurePoll(runId);
-      }
       return;
     }
+    // Not handed over after all: out of the way of the session's next wake.
+    if (deliveredTo && inFlightEntry) untrack(deliveredTo, inFlightEntry);
     // The worker provably never had it: take the record back and retry.
     if (refused && recorded) {
       try {
@@ -408,36 +522,40 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
     // Never hold forever: the safety cap, and a run that cannot be woken at
     // all (no main topic to wake it in) lets its checkpoints go at once.
     const wakeable = !!binding.chatId && !!binding.rootMessageId;
-    for (const success of unreleased) {
+    const holding = unreleased.filter((success) => {
       if (!wakeable) release(runId, success.eventSeq, 'wakeNotDelivered');
       else if (now() - success.at >= WORKFLOW_CHECKPOINT_HOLD_MAX_MS) release(runId, success.eventSeq, 'holdTimeout');
-    }
+      else return true;
+      return false;
+    });
     if (!wakeable) return;
     const anchored = binding as RunChatBinding & { rootMessageId: string };
     // After a restart (nothing of this in memory): a checkpoint whose wake
-    // already went out is released once the session that took it is idle —
-    // its turn has ended, or was lost with the old process.
-    for (const success of unreleased) {
+    // already went out waits for the session that took it to be proven idle
+    // — its turn has ended, or was lost with the old process.
+    for (const success of holding) {
       const issued = readV3MainWakeIssued(runDir, success.eventSeq);
       if (!issued) continue;
-      const tracked = awaitingTurnEnd.get(issued.sessionId)?.some((entry) => entry.runId === runId && entry.eventSeq === success.eventSeq);
+      const tracked = [...handedOver.values()].some((list) =>
+        list.some((entry) => entry.runId === runId && entry.eventSeq === success.eventSeq));
       if (tracked) continue;
-      if (deps.sessionBusy(issued.sessionId)) {
-        const list = awaitingTurnEnd.get(issued.sessionId) ?? [];
-        list.push({ runId, eventSeq: success.eventSeq, turnId: issued.turnId });
-        awaitingTurnEnd.set(issued.sessionId, list);
-        ensurePoll(runId);
-      } else {
-        release(runId, success.eventSeq, 'wakeTurnEnded');
-      }
+      track(issued.sessionId, {
+        runId, eventSeq: success.eventSeq, turnId: issued.turnId, checkpoint: true, restored: true, at: now(),
+      });
     }
+    // Every look at the run looks at the sessions holding its wakes again:
+    // closed, CLI stopped, or (after a restart) idle by now.
+    const sessionsHolding = [...handedOver].filter(([, list]) => list.some((entry) => entry.runId === runId)).map(([id]) => id);
+    for (const sessionId of sessionsHolding) settle(sessionId);
     const pending = pendingV3MainWakes({
       events,
       dag: run.dag,
       markedSince,
       isIssued: (seq) => readV3MainWakeIssued(runDir, seq) !== undefined,
     });
-    // In journal order, one at a time: the main session sees them in order.
+    // In journal order: the main session sees them in order, each as its own
+    // turn — once one is handed over the session has a wake in flight, so the
+    // next waits (deliverOne) until that turn ended.
     for (const event of pending) {
       const key = keyOf(runId, event.eventSeq);
       if (inFlight.has(key)) continue;
@@ -471,7 +589,7 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
       }
     }
     // Keep looking while a checkpoint still holds (the cap above).
-    if (unreleased.length > 0) ensurePoll(runId);
+    if (holding.length > 0) ensurePoll(runId);
   }
 
   function scan(runId: string, opts: { timed?: boolean } = {}): Promise<void> {
@@ -481,16 +599,6 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
     chains.set(runId, tail);
     void tail.then(() => { if (chains.get(runId) === tail) chains.delete(runId); });
     return run;
-  }
-
-  function releaseTurns(sessionId: string, match: (entry: { turnId: string }) => boolean): void {
-    const list = awaitingTurnEnd.get(sessionId);
-    if (!list) return;
-    const ended = list.filter(match);
-    const rest = list.filter((entry) => !match(entry));
-    if (rest.length > 0) awaitingTurnEnd.set(sessionId, rest);
-    else awaitingTurnEnd.delete(sessionId);
-    for (const entry of ended) release(entry.runId, entry.eventSeq, 'wakeTurnEnded');
   }
 
   return {
@@ -504,18 +612,22 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
         }
       }
     },
-    onSessionIdle: (sessionId, opts) => {
-      // The end of a turn in a session holding a checkpoint wake: the
-      // compatibility fallback for CLIs without a turn terminal.
-      if (opts.afterWork) releaseTurns(sessionId, () => true);
-      const runs = waitingOn.get(sessionId);
-      if (!runs) return;
-      waitingOn.delete(sessionId);
-      for (const runId of runs) void scan(runId);
+    onScreenStatus: (sessionId, { status, prevStatus, turnId }) => {
+      const list = handedOver.get(sessionId);
+      if (list && turnId && (status === 'working' || status === 'analyzing')) {
+        for (const entry of list) if (entry.turnId === turnId) entry.seenRunning = true;
+      }
+      if (status !== 'idle' || prevStatus === 'idle') return;
+      // Went idle: the end of a wake turn seen running (the fallback for CLIs
+      // without a turn terminal) — not of one still queued behind the turn
+      // that just ended; after a restart, idle proven now.
+      endWakes(sessionId, (entry) => entry.seenRunning === true, 'wakeTurnEnded');
+      settle(sessionId);
+      rescanWaiting(sessionId);
     },
     onTurnEnded: (sessionId, turnId) => {
       if (!parseWorkflowEventTurnId(turnId)) return;
-      releaseTurns(sessionId, (entry) => entry.turnId === turnId);
+      endWakes(sessionId, (entry) => entry.turnId === turnId, 'wakeTurnEnded');
     },
   };
 }

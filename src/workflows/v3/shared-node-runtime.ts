@@ -1203,8 +1203,11 @@ export async function runWorkflow(
       }
     }
 
+    // Cancelling an early-release loser is a decision of the node it lost
+    // to: while that node waits behind a checkpoint, the loser keeps running
+    // (the main bot may still want it once it has seen the result).
     const cancels = actions.filter((a): a is Extract<V3Action, { kind: 'cancelNode' }> =>
-      a.kind === 'cancelNode' && !heldByProposal(a.nodeId));
+      a.kind === 'cancelNode' && !heldByProposal(a.nodeId) && !checkpointHeld.has(a.byNodeId));
     let cancelledThisTick = false;
     for (const a of cancels) {
       cancelledThisTick = applyCancelNode(a) || cancelledThisTick;

@@ -94,10 +94,12 @@ export function v3NodeCardStatusFor(
 export function checkpointLine(success: V3CheckpointSuccess | undefined): string | undefined {
   if (!success) return undefined;
   if (!success.released) return '检查点：等主 Bot 看完结果，后续节点暂停';
-  if (success.released.reason === 'wakeTurnEnded') return '检查点：主 Bot 已看过结果，后续节点继续';
-  return success.released.reason === 'holdTimeout'
-    ? '检查点：等主 Bot 看结果超时，已按原流程继续'
-    : '检查点：没能唤醒主 Bot 看结果，已按原流程继续';
+  switch (success.released.reason) {
+    case 'wakeTurnEnded': return '检查点：主 Bot 已看过结果，后续节点继续';
+    case 'holdTimeout': return '检查点：等主 Bot 看结果超时，已按原流程继续';
+    case 'wakeSessionEnded': return '检查点：主 Bot 的会话中途结束，已按原流程继续';
+    default: return '检查点：没能唤醒主 Bot 看结果，已按原流程继续';
+  }
 }
 
 export interface V3NodeCardSyncDeps {
