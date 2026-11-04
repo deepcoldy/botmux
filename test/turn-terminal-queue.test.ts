@@ -38,15 +38,44 @@ function delivery(store: Awaited<ReturnType<typeof getSkillFeedbackStore>>, dir:
 }
 
 describe('turn-terminal nonblocking queue', () => {
-  it('reports a failed persistence even when the pending queue is empty', async () => {
+  it('does not count a same-turn status conflict as a persistence failure', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
     await store.recordTurnTerminal({ botAppId: 'app', sessionId: 'sess', turnId: 'conflict', status: 'completed' });
+    const errors: unknown[] = [];
     await enqueueTurnTerminal({
       dataDir: dir, botAppId: 'app', sessionId: 'sess',
       terminal: { turnId: 'conflict', status: 'failed' }, maxAttempts: 1,
+      onError: e => errors.push(e),
     });
+    // The conflict is surfaced (the existing completed row wins), but nothing
+    // was lost: the maintenance health counter must stay clear.
+    expect(String(errors[0])).toContain('turn_terminal_status_conflict');
+    expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 0 });
+  });
+  it('counts a genuine busy give-up as failed and clears on the next successful write', async () => {
+    const dir = freshDir();
+    const store = await getSkillFeedbackStore(dir);
+    await delivery(store, dir);
+    // Exhaust the retry budget against a lock held by a second connection.
+    const blocker = await SkillFeedbackStore.open(dir);
+    (blocker as any).db.exec('BEGIN IMMEDIATE;');
+    await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' },
+      retryBaseMs: 5, maxAttempts: 1,
+    });
+    (blocker as any).db.exec('COMMIT;');
+    blocker.close();
     expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 1 });
+    // Storage is healthy again: a subsequent successful write clears the tally
+    // so a historical give-up cannot seal every later maintenance window.
+    await delivery(store, dir, { turnId: 'turn-2', platformMessageId: 'om_b' });
+    await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-2', dispatchAttempt: 0, status: 'completed' },
+    });
+    expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 0 });
   });
   it('persists a terminal via the queue and resolves', async () => {
     const dir = freshDir();
@@ -173,6 +202,7 @@ describe('turn-terminal nonblocking queue', () => {
     });
     expect(__testOnly_pendingTurnTerminalCount()).toBe(0);
     expect(String(errors[0])).toContain('turn_terminal_persist_refused_shutdown');
+    expect(getTurnTerminalPersistenceHealth()).toMatchObject({ pending: 0, failed: 0 });
   });
 
   it('retries a transient store-open failure instead of permanently losing the terminal', async () => {
@@ -226,9 +256,15 @@ describe('turn-terminal nonblocking queue', () => {
     });
     expect(second).toBe(first); // dedup still returns the in-flight promise
     expect(String(errors[0])).toContain('turn_terminal_status_conflict_enqueue');
-    (blocker as any).db.exec('COMMIT;');
-    await first;
-    blocker.close();
+    // While the first write is still blocked: the disagreement must not taint
+    // health even before any later success could reset the counter.
+    try {
+      expect(getTurnTerminalPersistenceHealth().failed).toBe(0);
+    } finally {
+      (blocker as any).db.exec('COMMIT;');
+      await first;
+      blocker.close();
+    }
   });
 
   it('shutdown ordering: a terminal enqueued while producers are still up is persisted through drain; only post-drain enqueues are refused', async () => {

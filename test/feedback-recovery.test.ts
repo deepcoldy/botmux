@@ -1,14 +1,13 @@
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { readFeedbackStorageConfig, saveFeedbackStorageCandidate } from '../src/services/feedback-storage-config.js';
 import { prepareFeedbackMigration, cancelFeedbackMigration, resumeFeedbackMigration } from '../src/services/feedback-migration.js';
-import { beginFeedbackMaintenance, assertFeedbackAdmission, currentFeedbackMaintenance, freezeFeedbackSource, retireFeedbackSource, acquireFeedbackSendLease } from '../src/services/feedback-maintenance.js';
+import { beginFeedbackMaintenance, assertFeedbackAdmission, currentFeedbackMaintenance, freezeFeedbackSource, inspectFeedbackMaintenance, retireFeedbackSource, acquireFeedbackSendLease } from '../src/services/feedback-maintenance.js';
 import { inspectFeedbackRecovery, acknowledgeFeedbackRecovery } from '../src/services/feedback-recovery.js';
 import { closeAllFeedbackStorage } from '../src/services/feedback-storage.js';
-import { writeFile } from 'node:fs/promises';
 import { withFeedbackRecoveryLock } from '../src/services/feedback-recovery.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { once } from 'node:events';
@@ -153,6 +152,29 @@ describe('manual feedback recovery', () => {
     const newer = (await inspectFeedbackRecovery(directory)).find(value => value.kind === 'webhook')!;
     await acknowledgeFeedbackRecovery(directory, { ...decision, kind: newer.kind, id: newer.id, fingerprint: newer.fingerprint });
     await freezeFeedbackSource(directory, job.migrationId);
+  });
+  it('lists an orphaned inflight outbox claim so freeze blockers are visible, but refuses to acknowledge it while claimed', async () => {
+    const { directory, store, job } = await fixture();
+    store.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    store.recordTurnDelivery({ botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'message', content: 'x', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://example.com', secretRef: 'secret', eventTypes: ['turn.completed'] }] });
+    const claimed = store.claimFeedbackOutbox({ now: Date.now(), limit: 1, claimToken: 'dead-claimer' })[0];
+    // Row stays inflight with NO unknown marker (claimer died before reset).
+    const items = await inspectFeedbackRecovery(directory);
+    const item = items.find(value => value.kind === 'webhook' && value.id === claimed.outboxId)!;
+    expect(item).toMatchObject({ status: 'inflight', live: true });
+    await beginFeedbackMaintenance(directory, job.migrationId);
+    await expect(acknowledgeFeedbackRecovery(directory, { ...decision, ...item })).rejects.toThrow('feedback_recovery_operation_live');
+  });
+  it('ignores atomic-write .tmp siblings in lease and participant directories', async () => {
+    const { directory, job } = await fixture();
+    await beginFeedbackMaintenance(directory, job.migrationId);
+    await mkdir(join(directory, 'feedback-send-leases'), { recursive: true });
+    await writeFile(join(directory, 'feedback-send-leases', '1234-uuid.json.99.ab.tmp'), 'partial', { mode: 0o600 });
+    await mkdir(join(directory, 'feedback-participants'), { recursive: true });
+    await writeFile(join(directory, 'feedback-participants', '5678.json.99.cd.tmp'), '{partial', { mode: 0o600 });
+    expect((await inspectFeedbackRecovery(directory)).filter(item => item.kind === 'send')).toEqual([]);
+    expect((await inspectFeedbackMaintenance(directory, job.migrationId)).blockers).not.toContainEqual(expect.stringContaining('feedback_send_lease_invalid'));
   });
   it('rejects stale acknowledgement and any acknowledgement for a live send lease', async () => {
     const { directory } = await fixture();

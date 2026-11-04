@@ -92,6 +92,15 @@ const pending = new Map<string, PendingItem>();
 // stopped yet and onTurnTerminal could enqueue AFTER the snapshot, so the drain
 // could report 0 while a just-enqueued terminal is silently skipped.
 let admissionClosed = false;
+// Count of failure-class terminal writes (write gave up / permanent storage
+// error) with NO subsequent successful write in this process. It is a HEALTH
+// signal for the maintenance drain gate ("is persistence currently settling?"),
+// not a lifetime error tally: a later successful write proves the pipeline
+// recovered and resets it, so one historical failure cannot permanently seal
+// every future migration window. Non-loss events must NOT increment it:
+//  - a same-key different-status conflict loses nothing (the first status is
+//    already persisting; the conflict is reported separately via onError),
+//  - a shutdown-admission refusal is by design (next-boot reconcile covers it).
 let failedPersistence = 0;
 
 export function getTurnTerminalPersistenceHealth(): { pending: number; failed: number; admissionClosed: boolean } {
@@ -122,7 +131,9 @@ export function enqueueTurnTerminal(input: EnqueueTurnTerminalInput): Promise<vo
   const existing = pending.get(key);
   if (existing) {
     if (existing.input.terminal.status !== input.terminal.status) {
-      failedPersistence += 1;
+      // Not a persistence failure: the first status is already being written
+      // and the write is idempotent. Surface the disagreement, do not count it
+      // as lost persistence (that would seal future maintenance windows).
       input.onError?.(new Error(
         `turn_terminal_status_conflict_enqueue:${input.terminal.turnId.slice(0, 12)}:`
         + `${existing.input.terminal.status}!=${input.terminal.status}`,
@@ -131,7 +142,8 @@ export function enqueueTurnTerminal(input: EnqueueTurnTerminalInput): Promise<vo
     return existing.promise;
   }
   if (admissionClosed) {
-    failedPersistence += 1;
+    // Shutdown refusal is intentional (drain must reach quiescence); next-boot
+    // reconcile owns the terminal. It is not a pipeline failure, so no counter.
     input.onError?.(new Error(`turn_terminal_persist_refused_shutdown:${input.terminal.turnId.slice(0, 12)}`));
     return Promise.resolve();
   }
@@ -174,7 +186,14 @@ async function attempt(key: string): Promise<void> {
       status: input.terminal.status,
       ...turnTerminalTiming(input.terminal),
     });
-    if (result.done) { finish(key); return; }
+    if (result.done) {
+      // A successful write proves the persistence pipeline is healthy again;
+      // clear any failure-class tally so a past give-up cannot block a later
+      // maintenance window for the rest of this process's lifetime.
+      failedPersistence = 0;
+      finish(key);
+      return;
+    }
     // Write lock busy: reschedule with capped backoff, yielding the loop.
     if (item.attempts >= maxAttempts) {
       failedPersistence += 1;
@@ -188,10 +207,13 @@ async function attempt(key: string): Promise<void> {
     // often recoverable: getSkillFeedbackStore evicts the rejected promise so
     // the next attempt reopens, and "next turn" will NOT re-enqueue this key —
     // so finishing here would permanently lose this terminal. Retry within
-    // bounds; only a provably permanent error (schema newer, status conflict,
-    // corruption) or exhausting the bound gives up.
+    // bounds; only a provably permanent error (schema newer, corruption) or
+    // exhausting the bound gives up. A status CONFLICT is permanent for this
+    // write but not a data loss (a terminal row with another status already
+    // exists), so it is surfaced without tainting the health counter.
+    const conflict = String((error as { message?: unknown })?.message ?? error).toLowerCase().includes('turn_terminal_status_conflict');
     if (isPermanentPersistError(error) || item.attempts >= maxAttempts) {
-      failedPersistence += 1;
+      if (!conflict) failedPersistence += 1;
       input.onError?.(error);
       finish(key);
       return;

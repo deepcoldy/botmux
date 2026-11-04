@@ -60,7 +60,12 @@ export function webhookRecoveryFingerprint(instanceId: string, active: unknown, 
 }
 export function inspectSendRecovery(dataDir: string): RecoveryItem[] {
   const directory = join(dataDir, 'feedback-send-leases');
-  return (existsSync(directory) ? readdirSync(directory) : []).map(name => {
+  return (existsSync(directory) ? readdirSync(directory) : []).flatMap(name => {
+    // atomicWriteFileSync's open→rename window (or a SIGKILL inside it) leaves
+    // `*.json.<pid>.<hex>.tmp` siblings. They are not leases: ignore them
+    // instead of failing the whole inspection (which would be unlistable and
+    // unacknowledgeable, requiring manual cleanup).
+    if (name.endsWith('.tmp')) return [];
     if (!/^\d+-[0-9a-f-]+\.json$/.test(name)) throw new Error('feedback_send_lease_invalid');
     let lease: { processId: number; processStartId: string };
     try { lease = JSON.parse(readFileSync(join(directory, name), 'utf8')); }
@@ -81,7 +86,19 @@ export async function inspectFeedbackRecovery(dataDir: string): Promise<Recovery
   const items = inspectSendRecovery(dataDir);
   const { store } = await getFeedbackStorage(dataDir);
   for (const row of await store.listFeedbackOutbox()) {
-    if (!row.lastError?.startsWith('webhook_outcome_unknown:')) continue;
+    // List both rows carrying an unknown-outcome marker and claims still marked
+    // inflight. An inflight row cannot be acknowledged (it is reported live —
+    // the claim must first be reset, e.g. by cancelling and reopening the
+    // window so the dispatcher's stale-claim sweep converts it to an unknown
+    // marker), but it must be VISIBLE: freeze refuses on it and an operator
+    // otherwise only sees a bare `feedback_outbox_unsettled` with zero items.
+    // List both rows carrying an unknown-outcome marker and claims still marked
+    // inflight. An inflight row cannot be acknowledged (it is reported live —
+    // the claim must first be reset, e.g. by cancelling and reopening the
+    // window so the dispatcher's stale-claim sweep converts it to an unknown
+    // marker), but it must be VISIBLE: freeze refuses on it and an operator
+    // otherwise only sees a bare `feedback_outbox_unsettled` with zero items.
+    if (row.status !== 'inflight' && !row.lastError?.startsWith('webhook_outcome_unknown:')) continue;
     const fingerprint = webhookRecoveryFingerprint(config.instanceId, config.active, {
       outbox_id: row.outboxId, event_id: row.eventId, destination_id: row.destinationId,
       last_error: row.lastError, status: row.status, attempts: row.attempts,

@@ -135,7 +135,11 @@ export async function inspectFeedbackMaintenance(dataDir: string, migrationId: s
   const participants: Participant[] = [];
   const directory = join(dataDir, 'feedback-participants');
   for (const name of existsSync(directory) ? readdirSync(directory) : []) {
-    const participant: Participant = JSON.parse(readFileSync(join(directory, name), 'utf8'));
+    // Ignore atomic-write rename intermediates (see inspectSendRecovery).
+    if (name.endsWith('.tmp')) continue;
+    let participant: Participant;
+    try { participant = JSON.parse(readFileSync(join(directory, name), 'utf8')); }
+    catch { throw new Error('feedback_participant_state_invalid'); }
     const current = readDurableProcessIdentity(participant.processId);
     if (!current || current !== participant.processStartId) continue;
     participants.push(participant);
