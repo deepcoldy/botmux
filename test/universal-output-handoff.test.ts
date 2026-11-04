@@ -57,6 +57,7 @@ describe('attention lifecycle', () => {
       bridgeEntries?: any[];
       chatId?: string; chatType?: 'group' | 'p2p'; privateReplyOn?: boolean;
       asyncResults?: Map<string, unknown>;
+      canTalk?: boolean | (() => boolean);
     } = {},
   ) => {
     const worker = { send: vi.fn() };
@@ -72,7 +73,7 @@ describe('attention lifecycle', () => {
       ds, worker, t: 'probe', journal: db, coordinator, config: { session: { dataDir: dir } },
       ownsLifecycleMutation: () => true,
       processFinalOutput: options.processFinalOutput ?? vi.fn(async () => ({ status: 'suppressed' as const })),
-      canTalk: () => true,
+      canTalk: typeof options.canTalk === 'function' ? options.canTalk : () => options.canTalk ?? true,
       FinalOutputHandoffStore: { exists: () => options.v1Exists ?? false },
       finalOutputHandoffHost: () => ({ store: { attentionPending: () => options.v1Attention ? {} : undefined } }),
       readBridgeTurnJournal: () => options.bridgeEntries ?? [], publishAttentionPatch, join,
@@ -167,6 +168,102 @@ describe('attention lifecycle', () => {
     expect(db.read(record.id)?.state).toBe('settled');
     expect(attempts).toBe(2);
     vi.useRealTimers();
+  });
+  it('treats a startup-window canTalk=false as recoverable: blocked, then settles once the allowlist resolves', async () => {
+    vi.useFakeTimers();
+    const dir = directory(); const db = database();
+    // requesterOpenId present so the canTalk gate actually runs.
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', context: { target: { mode: 'plain', chatId: 'oc' }, requesterOpenId: 'ou_actor' }, chatId: 'oc', chatType: 'group' });
+    let allowed = false; // allowlist/sidecar still unresolved during startup
+    let attempts = 0;
+    const ctx = scopeFor(db, record, dir, {
+      canTalk: () => allowed,
+      processFinalOutput: vi.fn(async () => { attempts++; return { status: 'delivered' as const, messageId: 'om_ok' }; }),
+    });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('blocked');
+    expect(attempts).toBe(0); // rejected before any provider effect
+    expect(ctx.ds.agentAttention).toBeDefined();
+    // Allowlist resolves (sidecar load / /grant persist / API recovery).
+    allowed = true;
+    await vi.advanceTimersByTimeAsync(5_001);
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(attempts).toBe(1);
+    // The startup blip must NOT latch the attention after a later success.
+    expect(ctx.ds.agentAttention).toBeUndefined();
+    vi.useRealTimers();
+  });
+  it('files a deterministic non-native drop (undefined receipt) as terminal rejected', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    // processFinalOutput returns undefined for a session/Hermes mismatch:
+    // a definite "this output will never be posted", not an in-flight write.
+    const ctx = scopeFor(db, record, dir, { processFinalOutput: vi.fn(async () => undefined) });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('rejected');
+    expect(db.read(record.id)?.reason).toContain('output_dropped_without_receipt');
+  });
+  it('keeps a native final without its codex ACK in blocked (in flight, never terminal)', async () => {
+    vi.useFakeTimers();
+    const dir = directory(); const db = database();
+    const native: WorkerFinalOutput = { ...output, codexAppSettlement: { requestId: 'r1', generation: 'g', seq: 1, dispatchId: 'd' } };
+    const record = db.accept(outputSnapshot(app, native), { kind: 'managed' });
+    let attempts = 0;
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => { if (++attempts === 1) return undefined; return { status: 'delegated' as const, owner: 'codex_app_dispatch_persisted' }; }),
+    });
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('blocked');
+    await vi.advanceTimersByTimeAsync(5_001);
+    await ctx.run();
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(attempts).toBe(2);
+    vi.useRealTimers();
+  });
+});
+
+describe('rejected terminal state guards', () => {
+  it('excludes rejected rows from claim, pending scan and coordinator delivery', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output), { kind: 'managed' });
+    const firstOwner = db.newOwner();
+    expect(db.claim(record.id, firstOwner)).toBe(true);
+    expect(db.rejectTerminal(record.id, firstOwner, 'output_original_channel_changed')).toBe(true);
+    // Guard 1: a rejected row can never be claimed again by any owner.
+    expect(db.claim(record.id, db.newOwner())).toBe(false);
+    // Guard 2: rejected rows never enter the recovery scan (global + per-session).
+    expect(db.pending()).toEqual([]);
+    expect(db.pending(output.sessionId!)).toEqual([]);
+    expect(db.hasUnsettled(output.sessionId!)).toBe(false);
+    expect(db.hasTerminalRejection(output.sessionId!)).toBe(true);
+    // With a later live row bounding the watermark above the rejected row, the
+    // scan must still skip the rejected row (exercises the SELECT predicate,
+    // not only the watermark's MAX aggregation).
+    const later = db.accept(outputSnapshot(app, { ...output, turnId: 'om_later', lastUuid: 'later' }, Date.now() + 1), { kind: 'managed' });
+    const scanned = db.pending(output.sessionId!);
+    expect(scanned.map(r => r.id)).toEqual([later.id]);
+    // Guard 3: coordinator delivery early-returns without invoking process,
+    // settled or error — the row is a inert inspection record.
+    const coordinator = new OutputDeliveryCoordinator(db);
+    const process = vi.fn(async () => ({ status: 'delivered' as const }));
+    const settled = vi.fn(); const error = vi.fn();
+    await coordinator.deliver(db.read(record.id)!, { owns: () => true, process, settled, error });
+    expect(process).not.toHaveBeenCalled();
+    expect(settled).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  });
+  it('rejectTerminal refuses a non-owner and a settled row', () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output), { kind: 'managed' });
+    const owner = db.newOwner();
+    db.claim(record.id, owner);
+    expect(db.rejectTerminal(record.id, db.newOwner(), 'x')).toBe(false); // stale owner
+    expect(db.read(record.id)?.state).toBe('processing');
+    expect(db.complete(record.id, owner, { status: 'suppressed' })).toBe(true);
+    expect(db.rejectTerminal(record.id, owner, 'x')).toBe(false); // already settled
   });
 });
 

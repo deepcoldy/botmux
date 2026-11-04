@@ -16751,7 +16751,13 @@ function setupWorkerHandlers(
         if (sink.kind === 'im') {
           if (ds.chatId !== sink.chatId || ds.chatType !== sink.chatType || privateReplyEnabled(ds.session) !== !!sink.privateReply) throw new OutputDeliveryTerminalError('output_original_channel_changed');
           const actor = sink.context.requesterOpenId ?? sink.context.replyTargetSenderOpenId;
-          if (actor && !canTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType)) throw new OutputDeliveryTerminalError('output_permission_revoked');
+          // canTalk depends on resolvedAllowedUsers/grant sidecar which load
+          // asynchronously and are briefly empty during the startup window.
+          // A false here is therefore RECOVERABLE (allowlist API hiccup,
+          // sidecar not loaded, /grant not yet persisted) — keep the row in
+          // blocked and re-check on the next pump; never make it a one-way
+          // terminal rejection that latches the session's attention forever.
+          if (actor && !canTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType)) throw new Error('output_permission_pending');
         }
         if (sink.kind === 'http') {
           if (sink.mode === 'wait' && !ds.pendingWaitPromises?.has(record.output.turnId) && !record.output.codexAppSettlement) return { status: 'captured', owner: 'expired_http_wait' };
@@ -16772,12 +16778,22 @@ function setupWorkerHandlers(
         } catch (error) {
           // Past the provider UUID dedupe window the ledger forbids any retry:
           // the answer is permanently human-to-verify, not a transient block.
-          if (error instanceof FinalPublicationUnknownError || String((error as Error)?.message).includes('final_publication_ambiguous')) {
+          if (error instanceof FinalPublicationUnknownError
+            || String((error as Error)?.message).includes('final_publication_ambiguous')) {
             throw new OutputDeliveryTerminalError(String((error as Error)?.message ?? 'final_publication_ambiguous'));
           }
           throw error;
         }
-        if (record.output.codexAppSettlement && receipt?.owner !== 'codex_app_dispatch_persisted') return undefined;
+        if (record.output.codexAppSettlement) {
+          // Native FIFO ACK still pending: genuinely in flight, never terminal.
+          if (receipt?.owner !== 'codex_app_dispatch_persisted') return undefined;
+          return receipt;
+        }
+        // Non-native undefined receipt means a deterministic drop (session/
+        // Hermes mismatch), not an in-flight write: IM is receipt-gated by the
+        // ledger, doc by the effect table, HTTP by the strict store. File it
+        // terminal instead of looping blocked forever.
+        if (!receipt) throw new OutputDeliveryTerminalError('output_dropped_without_receipt');
         return receipt;
       },
       settled: record => {
